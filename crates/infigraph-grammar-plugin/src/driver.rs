@@ -2,7 +2,7 @@ use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 
 pub struct GrammarDriver {
     inner: Mutex<DriverInner>,
@@ -28,9 +28,11 @@ impl GrammarDriver {
         let mut reader = BufReader::new(stdout);
 
         let mut line = String::new();
-        reader.read_line(&mut line).context("No ready signal from JVM driver")?;
-        let ready: serde_json::Value = serde_json::from_str(line.trim())
-            .context("Invalid ready signal from JVM driver")?;
+        reader
+            .read_line(&mut line)
+            .context("No ready signal from JVM driver")?;
+        let ready: serde_json::Value =
+            serde_json::from_str(line.trim()).context("Invalid ready signal from JVM driver")?;
         if ready.get("ready") != Some(&serde_json::Value::Bool(true)) {
             bail!("JVM driver did not send ready signal: {}", line.trim());
         }
@@ -61,14 +63,22 @@ impl GrammarDriver {
             "entry_rule": entry_rule,
         });
         if let Some(pp) = preprocessor {
-            req.as_object_mut().unwrap().insert("preprocessor".into(), serde_json::json!(pp));
+            req.as_object_mut()
+                .unwrap()
+                .insert("preprocessor".into(), serde_json::json!(pp));
         }
         if emit_referenced_form_imports {
-            req.as_object_mut().unwrap().insert("emit_referenced_form_imports".into(), serde_json::json!("true"));
+            req.as_object_mut().unwrap().insert(
+                "emit_referenced_form_imports".into(),
+                serde_json::json!("true"),
+            );
         }
         let resp = self.send_request(&req)?;
         if resp.get("ok") != Some(&serde_json::Value::Bool(true)) {
-            let err = resp.get("error").and_then(|v| v.as_str()).unwrap_or("unknown error");
+            let err = resp
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown error");
             bail!("Failed to load grammar '{}': {}", id, err);
         }
         Ok(())
@@ -82,7 +92,10 @@ impl GrammarDriver {
         });
         let resp = self.send_request(&req)?;
         if resp.get("ok") != Some(&serde_json::Value::Bool(true)) {
-            let err = resp.get("error").and_then(|v| v.as_str()).unwrap_or("unknown error");
+            let err = resp
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown error");
             bail!("Failed to set extractor '{}': {}", class_name, err);
         }
         Ok(())
@@ -103,20 +116,32 @@ impl GrammarDriver {
             "source": source,
         });
         if let Some(d) = defines {
-            req.as_object_mut().unwrap().insert("defines".into(), serde_json::json!(d));
+            req.as_object_mut()
+                .unwrap()
+                .insert("defines".into(), serde_json::json!(d));
         }
         if let Some(ip) = include_paths {
-            req.as_object_mut().unwrap().insert("include_paths".into(), serde_json::json!(ip));
+            req.as_object_mut()
+                .unwrap()
+                .insert("include_paths".into(), serde_json::json!(ip));
         }
         let resp = self.send_request(&req)?;
         if resp.get("ok") != Some(&serde_json::Value::Bool(true)) {
-            let err = resp.get("error").and_then(|v| v.as_str()).unwrap_or("unknown error");
+            let err = resp
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown error");
             bail!("Extract failed for '{}': {}", file_path, err);
         }
         Ok(resp)
     }
 
-    pub fn parse(&self, grammar_id: &str, file_path: &str, source: &str) -> Result<serde_json::Value> {
+    pub fn parse(
+        &self,
+        grammar_id: &str,
+        file_path: &str,
+        source: &str,
+    ) -> Result<serde_json::Value> {
         let req = serde_json::json!({
             "cmd": "parse",
             "id": grammar_id,
@@ -125,15 +150,27 @@ impl GrammarDriver {
         });
         let resp = self.send_request(&req)?;
         if resp.get("ok") != Some(&serde_json::Value::Bool(true)) {
-            let err = resp.get("error").and_then(|v| v.as_str()).unwrap_or("unknown error");
+            let err = resp
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown error");
             bail!("Parse failed for '{}': {}", file_path, err);
         }
-        resp.get("tree").cloned().context("No tree in parse response")
+        resp.get("tree")
+            .cloned()
+            .context("No tree in parse response")
     }
 
     fn send_request(&self, req: &serde_json::Value) -> Result<serde_json::Value> {
-        let mut inner = self.inner.lock().map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
-        let DriverInner { ref mut child, ref mut reader, ref mut line_buf } = *inner;
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
+        let DriverInner {
+            ref mut child,
+            ref mut reader,
+            ref mut line_buf,
+        } = *inner;
         let stdin = child.stdin.as_mut().context("No stdin")?;
 
         let mut payload = serde_json::to_string(req)?;
@@ -151,7 +188,10 @@ impl GrammarDriver {
     pub fn shutdown(&self) -> Result<()> {
         let req = serde_json::json!({"cmd": "shutdown"});
         let _ = self.send_request(&req);
-        let mut inner = self.inner.lock().map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
+        let mut inner = self
+            .inner
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
         let _ = inner.child.wait();
         Ok(())
     }

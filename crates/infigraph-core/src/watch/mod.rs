@@ -31,7 +31,11 @@ impl std::fmt::Display for WatchEvent {
             WatchEventKind::Removed => "removed",
         };
         if self.has_cross_file_calls {
-            write!(f, "{kind}: {} [cross-file calls detected — full reindex recommended]", self.path.display())
+            write!(
+                f,
+                "{kind}: {} [cross-file calls detected — full reindex recommended]",
+                self.path.display()
+            )
         } else {
             write!(f, "{kind}: {}", self.path.display())
         }
@@ -53,15 +57,22 @@ pub fn watch_project(
 ) -> Result<()> {
     let (tx, rx) = mpsc::channel::<notify::Result<Event>>();
 
-    let config = Config::default()
-        .with_poll_interval(Duration::from_millis(debounce_ms));
+    let config = Config::default().with_poll_interval(Duration::from_millis(debounce_ms));
 
     let mut watcher = RecommendedWatcher::new(tx, config)?;
     watcher.watch(prism.root(), RecursiveMode::Recursive)?;
 
     let ignore_dirs = [
-        ".infigraph", ".git", "node_modules", "__pycache__",
-        ".venv", "venv", "target", "build", "dist", ".tox",
+        ".infigraph",
+        ".git",
+        "node_modules",
+        "__pycache__",
+        ".venv",
+        "venv",
+        "target",
+        "build",
+        "dist",
+        ".tox",
     ];
 
     loop {
@@ -103,8 +114,14 @@ pub fn watch_project(
                                     Ok(_) => {
                                         if let Some(store) = prism.store() {
                                             let changed = [rel.as_str()];
-                                            if let Err(e) = crate::embed::update_embeddings(store, prism.root(), &changed) {
-                                                eprintln!("watch: embedding update failed for {rel}: {e}");
+                                            if let Err(e) = crate::embed::update_embeddings(
+                                                store,
+                                                prism.root(),
+                                                &changed,
+                                            ) {
+                                                eprintln!(
+                                                    "watch: embedding update failed for {rel}: {e}"
+                                                );
                                             }
                                         }
                                         let cross = has_cross_file_calls(prism, &rel);
@@ -152,12 +169,22 @@ pub fn watch_project_auto_resolve(
                         if p.init().is_ok() {
                             match p.index() {
                                 Ok(r) => {
-                                    eprintln!("[watch {prefix}] auto full reindex: {}/{} files", r.indexed_files, r.total_files);
+                                    eprintln!(
+                                        "[watch {prefix}] auto full reindex: {}/{} files",
+                                        r.indexed_files, r.total_files
+                                    );
                                     if let Some(store) = p.store() {
-                                        let changed: Vec<&str> = r.extractions.iter().map(|e| e.file.as_str()).collect();
-                                        match crate::embed::update_embeddings(store, &root, &changed) {
-                                            Ok(n) => eprintln!("[watch {prefix}] updated {n} embeddings"),
-                                            Err(e) => eprintln!("[watch {prefix}] embedding update failed: {e}"),
+                                        let changed: Vec<&str> =
+                                            r.extractions.iter().map(|e| e.file.as_str()).collect();
+                                        match crate::embed::update_embeddings(
+                                            store, &root, &changed,
+                                        ) {
+                                            Ok(n) => {
+                                                eprintln!("[watch {prefix}] updated {n} embeddings")
+                                            }
+                                            Err(e) => eprintln!(
+                                                "[watch {prefix}] embedding update failed: {e}"
+                                            ),
                                         }
                                     }
                                 }

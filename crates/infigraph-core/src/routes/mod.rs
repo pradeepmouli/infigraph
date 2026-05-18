@@ -116,8 +116,8 @@ fn detect_from_docstring(id: &str, name: &str, file: &str, doc_lower: &str) -> O
         .unwrap_or_else(|| "GET".to_string());
 
     // Try to extract a path from the docstring (look for /something patterns)
-    let path = extract_path_from_text(doc_lower)
-        .unwrap_or_else(|| format!("/{}", name.to_lowercase()));
+    let path =
+        extract_path_from_text(doc_lower).unwrap_or_else(|| format!("/{}", name.to_lowercase()));
 
     Some(Route {
         method,
@@ -154,8 +154,7 @@ fn detect_python_route(
     ];
 
     for (prefix, method) in &method_prefixes {
-        if name_lower.starts_with(prefix) {
-            let path_part = &name_lower[prefix.len()..];
+        if let Some(path_part) = name_lower.strip_prefix(prefix) {
             let path = if path_part.is_empty() {
                 "/".to_string()
             } else {
@@ -208,7 +207,8 @@ fn detect_python_route(
     }
 
     // Docstring mentions flask/fastapi/django route keywords
-    if doc_lower.contains("flask") || doc_lower.contains("fastapi") || doc_lower.contains("django") {
+    if doc_lower.contains("flask") || doc_lower.contains("fastapi") || doc_lower.contains("django")
+    {
         return Some(Route {
             method: "UNKNOWN".to_string(),
             path: format!("/{}", name_lower.replace('_', "/")),
@@ -303,7 +303,11 @@ fn detect_js_ts_route(
             path,
             handler_id: id.to_string(),
             file: file.to_string(),
-            framework: if file.contains("/api/") || file.contains("pages/") { "nextjs".to_string() } else { detect_js_framework(file, doc_lower) },
+            framework: if file.contains("/api/") || file.contains("pages/") {
+                "nextjs".to_string()
+            } else {
+                detect_js_framework(file, doc_lower)
+            },
         });
     }
 
@@ -335,9 +339,7 @@ fn detect_js_ts_route(
             if name_lower.starts_with(prefix) && name_lower.len() > prefix.len() {
                 let rest = &name_lower[prefix.len()..];
                 // Ensure it's camelCase boundary (next char should be uppercase in original)
-                if name.len() > prefix.len()
-                    && name.as_bytes()[prefix.len()].is_ascii_uppercase()
-                {
+                if name.len() > prefix.len() && name.as_bytes()[prefix.len()].is_ascii_uppercase() {
                     let path = format!("/{}", camel_to_path(rest));
                     return Some(Route {
                         method: method.to_string(),
@@ -392,9 +394,7 @@ fn detect_go_route(
         let parent_name = parent.rsplit("::").next().unwrap_or(parent);
         let path = format!(
             "/{}",
-            parent_name
-                .to_lowercase()
-                .trim_end_matches("handler")
+            parent_name.to_lowercase().trim_end_matches("handler")
         );
         return Some(Route {
             method: "UNKNOWN".to_string(),
@@ -521,7 +521,10 @@ fn detect_java_route(
     }
 
     // JAX-RS: @GET, @POST, @Path
-    if doc_lower.contains("@path") || doc_lower.contains("jax-rs") || doc_lower.contains("javax.ws.rs") {
+    if doc_lower.contains("@path")
+        || doc_lower.contains("jax-rs")
+        || doc_lower.contains("javax.ws.rs")
+    {
         let method = infer_method_from_name(name_lower);
         let path = extract_path_from_text(doc_lower)
             .unwrap_or_else(|| format!("/{}", camel_to_path(name_lower)));
@@ -554,17 +557,21 @@ fn detect_java_route(
         ];
 
         for (prefix, method) in &method_prefixes {
-            if name_lower.starts_with(prefix) && name.len() > prefix.len() {
-                if name.as_bytes().get(prefix.len()).is_some_and(|b| b.is_ascii_uppercase()) {
-                    let rest = &name[prefix.len()..];
-                    return Some(Route {
-                        method: method.to_string(),
-                        path: format!("/{}", camel_to_path(&rest.to_lowercase())),
-                        handler_id: id.to_string(),
-                        file: file.to_string(),
-                        framework: detect_java_framework(doc_lower),
-                    });
-                }
+            if name_lower.starts_with(prefix)
+                && name.len() > prefix.len()
+                && name
+                    .as_bytes()
+                    .get(prefix.len())
+                    .is_some_and(|b| b.is_ascii_uppercase())
+            {
+                let rest = &name[prefix.len()..];
+                return Some(Route {
+                    method: method.to_string(),
+                    path: format!("/{}", camel_to_path(&rest.to_lowercase())),
+                    handler_id: id.to_string(),
+                    file: file.to_string(),
+                    framework: detect_java_framework(doc_lower),
+                });
             }
         }
     }
@@ -584,10 +591,14 @@ fn detect_rust_route(
     doc_lower: &str,
 ) -> Option<Route> {
     // Docstring/attribute-based: #[get], #[post], etc.
-    if doc_lower.contains("#[get") || doc_lower.contains("#[post")
-        || doc_lower.contains("#[put") || doc_lower.contains("#[delete")
-        || doc_lower.contains("#[patch") || doc_lower.contains("actix")
-        || doc_lower.contains("axum") || doc_lower.contains("rocket")
+    if doc_lower.contains("#[get")
+        || doc_lower.contains("#[post")
+        || doc_lower.contains("#[put")
+        || doc_lower.contains("#[delete")
+        || doc_lower.contains("#[patch")
+        || doc_lower.contains("actix")
+        || doc_lower.contains("axum")
+        || doc_lower.contains("rocket")
     {
         let method = if doc_lower.contains("#[post") || doc_lower.contains("post") {
             "POST"
@@ -633,8 +644,7 @@ fn detect_rust_route(
         ];
 
         for (prefix, method) in &method_prefixes {
-            if name_lower.starts_with(prefix) {
-                let rest = &name_lower[prefix.len()..];
+            if let Some(rest) = name_lower.strip_prefix(prefix) {
                 return Some(Route {
                     method: method.to_string(),
                     path: format!("/{}", rest.replace('_', "/")),
@@ -682,8 +692,7 @@ fn detect_generic_route(
     ];
 
     for (prefix, method) in &method_prefixes {
-        if name_lower.starts_with(prefix) {
-            let rest = &name_lower[prefix.len()..];
+        if let Some(rest) = name_lower.strip_prefix(prefix) {
             return Some(Route {
                 method: method.to_string(),
                 path: format!("/{}", rest.replace('_', "/")),
@@ -696,9 +705,7 @@ fn detect_generic_route(
 
     // Ends with Handler/handler
     if name.ends_with("Handler") || name.ends_with("handler") {
-        let base = name
-            .trim_end_matches("Handler")
-            .trim_end_matches("handler");
+        let base = name.trim_end_matches("Handler").trim_end_matches("handler");
         if !base.is_empty() {
             return Some(Route {
                 method: "UNKNOWN".to_string(),
@@ -726,8 +733,8 @@ fn detect_ruby_route(
 ) -> Option<Route> {
     // Rails controller: file in app/controllers/, methods index/show/create/update/destroy
     let file_lower = file.to_lowercase();
-    let is_rails_controller = file_lower.contains("app/controllers/")
-        || file_lower.contains("app\\controllers\\");
+    let is_rails_controller =
+        file_lower.contains("app/controllers/") || file_lower.contains("app\\controllers\\");
 
     let rails_actions = [
         ("index", "GET"),
@@ -750,7 +757,13 @@ fn detect_ruby_route(
                     .trim_end_matches(".rb");
                 return Some(Route {
                     method: method.to_string(),
-                    path: format!("/{}/{}", controller, if *action == "index" { "" } else { action }).trim_end_matches('/').to_string(),
+                    path: format!(
+                        "/{}/{}",
+                        controller,
+                        if *action == "index" { "" } else { action }
+                    )
+                    .trim_end_matches('/')
+                    .to_string(),
                     handler_id: id.to_string(),
                     file: file.to_string(),
                     framework: "rails".to_string(),
@@ -772,11 +785,11 @@ fn detect_ruby_route(
     }
 
     // Generic Ruby: _handler/_action/_endpoint suffix in route/api files
-    if file_lower.contains("route") || file_lower.contains("api") || file_lower.contains("endpoint") {
+    if file_lower.contains("route") || file_lower.contains("api") || file_lower.contains("endpoint")
+    {
         let suffixes = ["_handler", "_action", "_endpoint"];
         for suffix in &suffixes {
-            if name_lower.ends_with(suffix) {
-                let base = &name_lower[..name_lower.len() - suffix.len()];
+            if let Some(base) = name_lower.strip_suffix(suffix) {
                 return Some(Route {
                     method: infer_method_from_name(base),
                     path: format!("/{}", base.replace('_', "/")),
@@ -806,8 +819,8 @@ fn detect_php_route(
     let file_lower = file.to_lowercase();
 
     // Laravel: app/Http/Controllers/, RESTful resource methods
-    let is_laravel_controller = file_lower.contains("http/controllers")
-        || file_lower.contains("http\\controllers");
+    let is_laravel_controller =
+        file_lower.contains("http/controllers") || file_lower.contains("http\\controllers");
 
     let laravel_actions = [
         ("index", "GET"),
@@ -834,7 +847,10 @@ fn detect_php_route(
     }
 
     // Symfony: docstring contains @Route or #[Route
-    if doc_lower.contains("@route") || doc_lower.contains("#[route") || doc_lower.contains("symfony") {
+    if doc_lower.contains("@route")
+        || doc_lower.contains("#[route")
+        || doc_lower.contains("symfony")
+    {
         let method = infer_method_from_name(name_lower);
         let path = extract_path_from_text(doc_lower)
             .unwrap_or_else(|| format!("/{}", name_lower.replace('_', "/")));
@@ -885,11 +901,17 @@ fn detect_csharp_route(
         || doc_lower.contains("[route(")
         || doc_lower.contains("apicontroller")
     {
-        let method = if doc_lower.contains("[httppost") { "POST".to_string() }
-            else if doc_lower.contains("[httpput") { "PUT".to_string() }
-            else if doc_lower.contains("[httpdelete") { "DELETE".to_string() }
-            else if doc_lower.contains("[httppatch") { "PATCH".to_string() }
-            else { "GET".to_string() };
+        let method = if doc_lower.contains("[httppost") {
+            "POST".to_string()
+        } else if doc_lower.contains("[httpput") {
+            "PUT".to_string()
+        } else if doc_lower.contains("[httpdelete") {
+            "DELETE".to_string()
+        } else if doc_lower.contains("[httppatch") {
+            "PATCH".to_string()
+        } else {
+            "GET".to_string()
+        };
         let path = extract_path_from_text(doc_lower)
             .unwrap_or_else(|| format!("/{}", camel_to_path(name_lower)));
         return Some(Route {
@@ -902,12 +924,21 @@ fn detect_csharp_route(
     }
 
     // Controller file: file ends with Controller.cs
-    if file_lower.ends_with("controller.cs") || file_lower.contains("controllers/") || file_lower.contains("controllers\\") {
+    if file_lower.ends_with("controller.cs")
+        || file_lower.contains("controllers/")
+        || file_lower.contains("controllers\\")
+    {
         let method_prefixes = [
-            ("Get", "GET"), ("List", "GET"), ("Find", "GET"),
-            ("Post", "POST"), ("Create", "POST"), ("Add", "POST"),
-            ("Put", "PUT"), ("Update", "PUT"),
-            ("Delete", "DELETE"), ("Remove", "DELETE"),
+            ("Get", "GET"),
+            ("List", "GET"),
+            ("Find", "GET"),
+            ("Post", "POST"),
+            ("Create", "POST"),
+            ("Add", "POST"),
+            ("Put", "PUT"),
+            ("Update", "PUT"),
+            ("Delete", "DELETE"),
+            ("Remove", "DELETE"),
             ("Patch", "PATCH"),
         ];
         for (prefix, method) in &method_prefixes {
@@ -977,7 +1008,11 @@ fn detect_elixir_route(
             path: format!("/{}", name_lower.replace('_', "/")),
             handler_id: id.to_string(),
             file: file.to_string(),
-            framework: if doc_lower.contains("phoenix") { "phoenix".to_string() } else { "plug".to_string() },
+            framework: if doc_lower.contains("phoenix") {
+                "phoenix".to_string()
+            } else {
+                "plug".to_string()
+            },
         });
     }
 
@@ -1031,71 +1066,141 @@ fn language_from_file(file: &str) -> Lang {
 }
 
 fn detect_python_framework(doc_lower: &str) -> String {
-    if doc_lower.contains("fastapi") { "fastapi".to_string() }
-    else if doc_lower.contains("flask") || doc_lower.contains("@app.") || doc_lower.contains("@blueprint.") { "flask".to_string() }
-    else if doc_lower.contains("django") { "django".to_string() }
-    else if doc_lower.contains("starlette") { "starlette".to_string() }
-    else if doc_lower.contains("tornado") { "tornado".to_string() }
-    else if doc_lower.contains("aiohttp") { "aiohttp".to_string() }
-    else { "generic_python".to_string() }
+    if doc_lower.contains("fastapi") {
+        "fastapi".to_string()
+    } else if doc_lower.contains("flask")
+        || doc_lower.contains("@app.")
+        || doc_lower.contains("@blueprint.")
+    {
+        "flask".to_string()
+    } else if doc_lower.contains("django") {
+        "django".to_string()
+    } else if doc_lower.contains("starlette") {
+        "starlette".to_string()
+    } else if doc_lower.contains("tornado") {
+        "tornado".to_string()
+    } else if doc_lower.contains("aiohttp") {
+        "aiohttp".to_string()
+    } else {
+        "generic_python".to_string()
+    }
 }
 
 fn detect_js_framework(file: &str, doc_lower: &str) -> String {
     let file_lower = file.to_lowercase();
-    if doc_lower.contains("nestjs") || doc_lower.contains("@controller") || doc_lower.contains("@get(") || doc_lower.contains("@post(") { "nestjs".to_string() }
-    else if file_lower.contains("pages/api/") || file_lower.contains("app/api/") { "nextjs".to_string() }
-    else if doc_lower.contains("fastify") { "fastify".to_string() }
-    else if doc_lower.contains("koa") { "koa".to_string() }
-    else if doc_lower.contains("hapi") { "hapi".to_string() }
-    else if doc_lower.contains("express") { "express".to_string() }
-    else { "generic_js".to_string() }
+    if doc_lower.contains("nestjs")
+        || doc_lower.contains("@controller")
+        || doc_lower.contains("@get(")
+        || doc_lower.contains("@post(")
+    {
+        "nestjs".to_string()
+    } else if file_lower.contains("pages/api/") || file_lower.contains("app/api/") {
+        "nextjs".to_string()
+    } else if doc_lower.contains("fastify") {
+        "fastify".to_string()
+    } else if doc_lower.contains("koa") {
+        "koa".to_string()
+    } else if doc_lower.contains("hapi") {
+        "hapi".to_string()
+    } else if doc_lower.contains("express") {
+        "express".to_string()
+    } else {
+        "generic_js".to_string()
+    }
 }
 
 fn detect_go_framework(doc_lower: &str) -> String {
-    if doc_lower.contains("gin.") || doc_lower.contains("gin ") { "gin".to_string() }
-    else if doc_lower.contains("echo.") { "echo".to_string() }
-    else if doc_lower.contains("chi.") { "chi".to_string() }
-    else if doc_lower.contains("fiber") { "fiber".to_string() }
-    else if doc_lower.contains("mux") || doc_lower.contains("gorilla") { "gorilla/mux".to_string() }
-    else { "net/http".to_string() }
+    if doc_lower.contains("gin.") || doc_lower.contains("gin ") {
+        "gin".to_string()
+    } else if doc_lower.contains("echo.") {
+        "echo".to_string()
+    } else if doc_lower.contains("chi.") {
+        "chi".to_string()
+    } else if doc_lower.contains("fiber") {
+        "fiber".to_string()
+    } else if doc_lower.contains("mux") || doc_lower.contains("gorilla") {
+        "gorilla/mux".to_string()
+    } else {
+        "net/http".to_string()
+    }
 }
 
 fn detect_java_framework(doc_lower: &str) -> String {
-    if doc_lower.contains("@getmapping") || doc_lower.contains("@postmapping")
-        || doc_lower.contains("@requestmapping") || doc_lower.contains("@putmapping")
-        || doc_lower.contains("@deletemapping") || doc_lower.contains("@patchmapping") { "spring".to_string() }
-    else if doc_lower.contains("@path") || doc_lower.contains("jax-rs") || doc_lower.contains("javax.ws.rs") { "jaxrs".to_string() }
-    else if doc_lower.contains("micronaut") { "micronaut".to_string() }
-    else if doc_lower.contains("quarkus") { "quarkus".to_string() }
-    else if doc_lower.contains("ktor") { "ktor".to_string() }
-    else { "spring".to_string() }
+    if doc_lower.contains("@getmapping")
+        || doc_lower.contains("@postmapping")
+        || doc_lower.contains("@requestmapping")
+        || doc_lower.contains("@putmapping")
+        || doc_lower.contains("@deletemapping")
+        || doc_lower.contains("@patchmapping")
+    {
+        "spring".to_string()
+    } else if doc_lower.contains("@path")
+        || doc_lower.contains("jax-rs")
+        || doc_lower.contains("javax.ws.rs")
+    {
+        "jaxrs".to_string()
+    } else if doc_lower.contains("micronaut") {
+        "micronaut".to_string()
+    } else if doc_lower.contains("quarkus") {
+        "quarkus".to_string()
+    } else if doc_lower.contains("ktor") {
+        "ktor".to_string()
+    } else {
+        "spring".to_string()
+    }
 }
 
 fn detect_rust_framework(doc_lower: &str) -> String {
-    if doc_lower.contains("actix") { "actix".to_string() }
-    else if doc_lower.contains("axum") { "axum".to_string() }
-    else if doc_lower.contains("rocket") || doc_lower.contains("#[get") || doc_lower.contains("#[post") { "rocket".to_string() }
-    else if doc_lower.contains("warp") { "warp".to_string() }
-    else if doc_lower.contains("tide") { "tide".to_string() }
-    else { "generic_rust".to_string() }
+    if doc_lower.contains("actix") {
+        "actix".to_string()
+    } else if doc_lower.contains("axum") {
+        "axum".to_string()
+    } else if doc_lower.contains("rocket")
+        || doc_lower.contains("#[get")
+        || doc_lower.contains("#[post")
+    {
+        "rocket".to_string()
+    } else if doc_lower.contains("warp") {
+        "warp".to_string()
+    } else if doc_lower.contains("tide") {
+        "tide".to_string()
+    } else {
+        "generic_rust".to_string()
+    }
 }
 
 fn detect_framework_from_docstring(doc_lower: &str) -> String {
-    if doc_lower.contains("flask") || doc_lower.contains("@app.") { "flask".to_string() }
-    else if doc_lower.contains("fastapi") { "fastapi".to_string() }
-    else if doc_lower.contains("django") { "django".to_string() }
-    else if doc_lower.contains("express") { "express".to_string() }
-    else if doc_lower.contains("nestjs") { "nestjs".to_string() }
-    else if doc_lower.contains("spring") || doc_lower.contains("mapping") { "spring".to_string() }
-    else if doc_lower.contains("actix") { "actix".to_string() }
-    else if doc_lower.contains("axum") { "axum".to_string() }
-    else if doc_lower.contains("rocket") { "rocket".to_string() }
-    else if doc_lower.contains("gin.") { "gin".to_string() }
-    else if doc_lower.contains("rails") { "rails".to_string() }
-    else if doc_lower.contains("laravel") { "laravel".to_string() }
-    else if doc_lower.contains("phoenix") { "phoenix".to_string() }
-    else if doc_lower.contains("handlefunc") || doc_lower.contains("http.handle") { "net/http".to_string() }
-    else { "generic".to_string() }
+    if doc_lower.contains("flask") || doc_lower.contains("@app.") {
+        "flask".to_string()
+    } else if doc_lower.contains("fastapi") {
+        "fastapi".to_string()
+    } else if doc_lower.contains("django") {
+        "django".to_string()
+    } else if doc_lower.contains("express") {
+        "express".to_string()
+    } else if doc_lower.contains("nestjs") {
+        "nestjs".to_string()
+    } else if doc_lower.contains("spring") || doc_lower.contains("mapping") {
+        "spring".to_string()
+    } else if doc_lower.contains("actix") {
+        "actix".to_string()
+    } else if doc_lower.contains("axum") {
+        "axum".to_string()
+    } else if doc_lower.contains("rocket") {
+        "rocket".to_string()
+    } else if doc_lower.contains("gin.") {
+        "gin".to_string()
+    } else if doc_lower.contains("rails") {
+        "rails".to_string()
+    } else if doc_lower.contains("laravel") {
+        "laravel".to_string()
+    } else if doc_lower.contains("phoenix") {
+        "phoenix".to_string()
+    } else if doc_lower.contains("handlefunc") || doc_lower.contains("http.handle") {
+        "net/http".to_string()
+    } else {
+        "generic".to_string()
+    }
 }
 
 /// Try to extract a URL path (e.g., /users/{id}) from text.
@@ -1178,9 +1283,7 @@ fn camel_to_path(s: &str) -> String {
 fn infer_path_from_file(file: &str) -> String {
     // Next.js: pages/api/users/[id].ts -> /api/users/:id
     // Also: app/api/users/route.ts -> /api/users
-    let normalized = file
-        .replace('\\', "/")
-        .to_lowercase();
+    let normalized = file.replace('\\', "/").to_lowercase();
 
     // Try to extract the API route part
     if let Some(api_idx) = normalized.find("/api/") {
@@ -1193,9 +1296,7 @@ fn infer_path_from_file(file: &str) -> String {
             .trim_end_matches("/route")
             .trim_end_matches("/index");
         // Convert [param] to :param
-        let result = cleaned
-            .replace('[', ":")
-            .replace(']', "");
+        let result = cleaned.replace('[', ":").replace(']', "");
         return result;
     }
 
@@ -1244,12 +1345,7 @@ mod tests {
 
     #[test]
     fn test_python_get_prefix() {
-        let route = detect_route_from_symbol(
-            "views.py::get_users",
-            "get_users",
-            "views.py",
-            "",
-        );
+        let route = detect_route_from_symbol("views.py::get_users", "get_users", "views.py", "");
         assert!(route.is_some());
         let r = route.unwrap();
         assert_eq!(r.method, "GET");
@@ -1258,12 +1354,7 @@ mod tests {
 
     #[test]
     fn test_python_post_prefix() {
-        let route = detect_route_from_symbol(
-            "views.py::post_order",
-            "post_order",
-            "views.py",
-            "",
-        );
+        let route = detect_route_from_symbol("views.py::post_order", "post_order", "views.py", "");
         assert!(route.is_some());
         let r = route.unwrap();
         assert_eq!(r.method, "POST");
@@ -1272,12 +1363,8 @@ mod tests {
 
     #[test]
     fn test_python_handler_suffix() {
-        let route = detect_route_from_symbol(
-            "views.py::user_handler",
-            "user_handler",
-            "views.py",
-            "",
-        );
+        let route =
+            detect_route_from_symbol("views.py::user_handler", "user_handler", "views.py", "");
         assert!(route.is_some());
         let r = route.unwrap();
         assert_eq!(r.path, "/user");
@@ -1285,12 +1372,7 @@ mod tests {
 
     #[test]
     fn test_go_handler_suffix() {
-        let route = detect_route_from_symbol(
-            "api.go::UsersHandler",
-            "UsersHandler",
-            "api.go",
-            "",
-        );
+        let route = detect_route_from_symbol("api.go::UsersHandler", "UsersHandler", "api.go", "");
         assert!(route.is_some());
         let r = route.unwrap();
         assert!(r.path.contains("users"));
@@ -1309,12 +1391,8 @@ mod tests {
 
     #[test]
     fn test_js_handler() {
-        let route = detect_route_from_symbol(
-            "api/users.ts::handler",
-            "handler",
-            "api/users.ts",
-            "",
-        );
+        let route =
+            detect_route_from_symbol("api/users.ts::handler", "handler", "api/users.ts", "");
         assert!(route.is_some());
     }
 
@@ -1347,12 +1425,8 @@ mod tests {
 
     #[test]
     fn test_no_false_positive_regular_function() {
-        let route = detect_route_from_symbol(
-            "utils.py::format_string",
-            "format_string",
-            "utils.py",
-            "",
-        );
+        let route =
+            detect_route_from_symbol("utils.py::format_string", "format_string", "utils.py", "");
         assert!(route.is_none());
     }
 

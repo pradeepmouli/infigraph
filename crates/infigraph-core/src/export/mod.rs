@@ -41,9 +41,7 @@ pub fn export_cypher<W: Write>(gq: &GraphQuery, writer: &mut W) -> Result<()> {
     writeln!(writer)?;
 
     // ── Module nodes ──
-    let modules = gq.raw_query(
-        "MATCH (m:Module) RETURN m.id, m.name, m.file, m.language",
-    )?;
+    let modules = gq.raw_query("MATCH (m:Module) RETURN m.id, m.name, m.file, m.language")?;
     writeln!(writer, "// Modules ({} nodes)", modules.len())?;
     for row in &modules {
         let id = cypher_escape(&row[0]);
@@ -82,9 +80,7 @@ pub fn export_cypher<W: Write>(gq: &GraphQuery, writer: &mut W) -> Result<()> {
 
     // ── Edges ──
     // CONTAINS (Module -> Symbol)
-    let contains = gq.raw_query(
-        "MATCH (m:Module)-[:CONTAINS]->(s:Symbol) RETURN m.id, s.id",
-    )?;
+    let contains = gq.raw_query("MATCH (m:Module)-[:CONTAINS]->(s:Symbol) RETURN m.id, s.id")?;
     writeln!(writer, "// CONTAINS edges ({} edges)", contains.len())?;
     for row in &contains {
         let src = cypher_escape(&row[0]);
@@ -97,9 +93,7 @@ pub fn export_cypher<W: Write>(gq: &GraphQuery, writer: &mut W) -> Result<()> {
     writeln!(writer)?;
 
     // CALLS (Symbol -> Symbol)
-    let calls = gq.raw_query(
-        "MATCH (a:Symbol)-[:CALLS]->(b:Symbol) RETURN a.id, b.id",
-    )?;
+    let calls = gq.raw_query("MATCH (a:Symbol)-[:CALLS]->(b:Symbol) RETURN a.id, b.id")?;
     writeln!(writer, "// CALLS edges ({} edges)", calls.len())?;
     for row in &calls {
         let src = cypher_escape(&row[0]);
@@ -112,9 +106,7 @@ pub fn export_cypher<W: Write>(gq: &GraphQuery, writer: &mut W) -> Result<()> {
     writeln!(writer)?;
 
     // INHERITS (Symbol -> Symbol)
-    let inherits = gq.raw_query(
-        "MATCH (a:Symbol)-[:INHERITS]->(b:Symbol) RETURN a.id, b.id",
-    )?;
+    let inherits = gq.raw_query("MATCH (a:Symbol)-[:INHERITS]->(b:Symbol) RETURN a.id, b.id")?;
     writeln!(writer, "// INHERITS edges ({} edges)", inherits.len())?;
     for row in &inherits {
         let src = cypher_escape(&row[0]);
@@ -127,9 +119,7 @@ pub fn export_cypher<W: Write>(gq: &GraphQuery, writer: &mut W) -> Result<()> {
     writeln!(writer)?;
 
     // TESTED_BY (Symbol -> Symbol)
-    let tested_by = gq.raw_query(
-        "MATCH (a:Symbol)-[:TESTED_BY]->(b:Symbol) RETURN a.id, b.id",
-    )?;
+    let tested_by = gq.raw_query("MATCH (a:Symbol)-[:TESTED_BY]->(b:Symbol) RETURN a.id, b.id")?;
     writeln!(writer, "// TESTED_BY edges ({} edges)", tested_by.len())?;
     for row in &tested_by {
         let src = cypher_escape(&row[0]);
@@ -156,26 +146,57 @@ pub fn export_graphml<W: Write>(gq: &GraphQuery, writer: &mut W) -> Result<()> {
     )?;
 
     // Key definitions for node properties
-    writeln!(writer, r#"  <key id="d_name" for="node" attr.name="name" attr.type="string"/>"#)?;
-    writeln!(writer, r#"  <key id="d_kind" for="node" attr.name="kind" attr.type="string"/>"#)?;
-    writeln!(writer, r#"  <key id="d_file" for="node" attr.name="file" attr.type="string"/>"#)?;
-    writeln!(writer, r#"  <key id="d_language" for="node" attr.name="language" attr.type="string"/>"#)?;
-    writeln!(writer, r#"  <key id="d_start_line" for="node" attr.name="start_line" attr.type="int"/>"#)?;
-    writeln!(writer, r#"  <key id="d_end_line" for="node" attr.name="end_line" attr.type="int"/>"#)?;
-    writeln!(writer, r#"  <key id="d_visibility" for="node" attr.name="visibility" attr.type="string"/>"#)?;
-    writeln!(writer, r#"  <key id="d_parent" for="node" attr.name="parent" attr.type="string"/>"#)?;
-    writeln!(writer, r#"  <key id="d_docstring" for="node" attr.name="docstring" attr.type="string"/>"#)?;
-    writeln!(writer, r#"  <key id="d_node_type" for="node" attr.name="node_type" attr.type="string"/>"#)?;
+    writeln!(
+        writer,
+        r#"  <key id="d_name" for="node" attr.name="name" attr.type="string"/>"#
+    )?;
+    writeln!(
+        writer,
+        r#"  <key id="d_kind" for="node" attr.name="kind" attr.type="string"/>"#
+    )?;
+    writeln!(
+        writer,
+        r#"  <key id="d_file" for="node" attr.name="file" attr.type="string"/>"#
+    )?;
+    writeln!(
+        writer,
+        r#"  <key id="d_language" for="node" attr.name="language" attr.type="string"/>"#
+    )?;
+    writeln!(
+        writer,
+        r#"  <key id="d_start_line" for="node" attr.name="start_line" attr.type="int"/>"#
+    )?;
+    writeln!(
+        writer,
+        r#"  <key id="d_end_line" for="node" attr.name="end_line" attr.type="int"/>"#
+    )?;
+    writeln!(
+        writer,
+        r#"  <key id="d_visibility" for="node" attr.name="visibility" attr.type="string"/>"#
+    )?;
+    writeln!(
+        writer,
+        r#"  <key id="d_parent" for="node" attr.name="parent" attr.type="string"/>"#
+    )?;
+    writeln!(
+        writer,
+        r#"  <key id="d_docstring" for="node" attr.name="docstring" attr.type="string"/>"#
+    )?;
+    writeln!(
+        writer,
+        r#"  <key id="d_node_type" for="node" attr.name="node_type" attr.type="string"/>"#
+    )?;
 
     // Key definition for edge label
-    writeln!(writer, r#"  <key id="d_label" for="edge" attr.name="label" attr.type="string"/>"#)?;
+    writeln!(
+        writer,
+        r#"  <key id="d_label" for="edge" attr.name="label" attr.type="string"/>"#
+    )?;
     writeln!(writer)?;
     writeln!(writer, r#"  <graph id="infigraph" edgedefault="directed">"#)?;
 
     // ── Module nodes ──
-    let modules = gq.raw_query(
-        "MATCH (m:Module) RETURN m.id, m.name, m.file, m.language",
-    )?;
+    let modules = gq.raw_query("MATCH (m:Module) RETURN m.id, m.name, m.file, m.language")?;
     for row in &modules {
         let id = xml_escape(&row[0]);
         let name = xml_escape(&row[1]);
@@ -209,17 +230,26 @@ pub fn export_graphml<W: Write>(gq: &GraphQuery, writer: &mut W) -> Result<()> {
         writeln!(writer, r#"      <data key="d_name">{name}</data>"#)?;
         writeln!(writer, r#"      <data key="d_kind">{kind}</data>"#)?;
         writeln!(writer, r#"      <data key="d_file">{file}</data>"#)?;
-        writeln!(writer, r#"      <data key="d_start_line">{start_line}</data>"#)?;
+        writeln!(
+            writer,
+            r#"      <data key="d_start_line">{start_line}</data>"#
+        )?;
         writeln!(writer, r#"      <data key="d_end_line">{end_line}</data>"#)?;
         writeln!(writer, r#"      <data key="d_language">{language}</data>"#)?;
         if !visibility.is_empty() {
-            writeln!(writer, r#"      <data key="d_visibility">{visibility}</data>"#)?;
+            writeln!(
+                writer,
+                r#"      <data key="d_visibility">{visibility}</data>"#
+            )?;
         }
         if !parent.is_empty() {
             writeln!(writer, r#"      <data key="d_parent">{parent}</data>"#)?;
         }
         if !docstring.is_empty() {
-            writeln!(writer, r#"      <data key="d_docstring">{docstring}</data>"#)?;
+            writeln!(
+                writer,
+                r#"      <data key="d_docstring">{docstring}</data>"#
+            )?;
         }
         writeln!(writer, r#"    </node>"#)?;
     }
@@ -227,9 +257,7 @@ pub fn export_graphml<W: Write>(gq: &GraphQuery, writer: &mut W) -> Result<()> {
     // ── Edges ──
     let mut edge_id: u64 = 0;
 
-    let contains = gq.raw_query(
-        "MATCH (m:Module)-[:CONTAINS]->(s:Symbol) RETURN m.id, s.id",
-    )?;
+    let contains = gq.raw_query("MATCH (m:Module)-[:CONTAINS]->(s:Symbol) RETURN m.id, s.id")?;
     for row in &contains {
         let src = xml_escape(&row[0]);
         let dst = xml_escape(&row[1]);
@@ -240,9 +268,7 @@ pub fn export_graphml<W: Write>(gq: &GraphQuery, writer: &mut W) -> Result<()> {
         edge_id += 1;
     }
 
-    let calls = gq.raw_query(
-        "MATCH (a:Symbol)-[:CALLS]->(b:Symbol) RETURN a.id, b.id",
-    )?;
+    let calls = gq.raw_query("MATCH (a:Symbol)-[:CALLS]->(b:Symbol) RETURN a.id, b.id")?;
     for row in &calls {
         let src = xml_escape(&row[0]);
         let dst = xml_escape(&row[1]);
@@ -253,9 +279,7 @@ pub fn export_graphml<W: Write>(gq: &GraphQuery, writer: &mut W) -> Result<()> {
         edge_id += 1;
     }
 
-    let inherits = gq.raw_query(
-        "MATCH (a:Symbol)-[:INHERITS]->(b:Symbol) RETURN a.id, b.id",
-    )?;
+    let inherits = gq.raw_query("MATCH (a:Symbol)-[:INHERITS]->(b:Symbol) RETURN a.id, b.id")?;
     for row in &inherits {
         let src = xml_escape(&row[0]);
         let dst = xml_escape(&row[1]);
@@ -266,9 +290,7 @@ pub fn export_graphml<W: Write>(gq: &GraphQuery, writer: &mut W) -> Result<()> {
         edge_id += 1;
     }
 
-    let tested_by = gq.raw_query(
-        "MATCH (a:Symbol)-[:TESTED_BY]->(b:Symbol) RETURN a.id, b.id",
-    )?;
+    let tested_by = gq.raw_query("MATCH (a:Symbol)-[:TESTED_BY]->(b:Symbol) RETURN a.id, b.id")?;
     for row in &tested_by {
         let src = xml_escape(&row[0]);
         let dst = xml_escape(&row[1]);
@@ -291,26 +313,16 @@ pub fn export_graphml<W: Write>(gq: &GraphQuery, writer: &mut W) -> Result<()> {
 /// Each edge has `source`, `target`, and `label`.
 pub fn export_json<W: Write>(gq: &GraphQuery, writer: &mut W) -> Result<()> {
     // ── Collect nodes ──
-    let modules = gq.raw_query(
-        "MATCH (m:Module) RETURN m.id, m.name, m.file, m.language",
-    )?;
+    let modules = gq.raw_query("MATCH (m:Module) RETURN m.id, m.name, m.file, m.language")?;
     let symbols = gq.raw_query(
         "MATCH (s:Symbol) RETURN s.id, s.name, s.kind, s.file, s.start_line, s.end_line, s.language, s.visibility, s.parent, s.docstring",
     )?;
 
     // ── Collect edges ──
-    let contains = gq.raw_query(
-        "MATCH (m:Module)-[:CONTAINS]->(s:Symbol) RETURN m.id, s.id",
-    )?;
-    let calls = gq.raw_query(
-        "MATCH (a:Symbol)-[:CALLS]->(b:Symbol) RETURN a.id, b.id",
-    )?;
-    let inherits = gq.raw_query(
-        "MATCH (a:Symbol)-[:INHERITS]->(b:Symbol) RETURN a.id, b.id",
-    )?;
-    let tested_by = gq.raw_query(
-        "MATCH (a:Symbol)-[:TESTED_BY]->(b:Symbol) RETURN a.id, b.id",
-    )?;
+    let contains = gq.raw_query("MATCH (m:Module)-[:CONTAINS]->(s:Symbol) RETURN m.id, s.id")?;
+    let calls = gq.raw_query("MATCH (a:Symbol)-[:CALLS]->(b:Symbol) RETURN a.id, b.id")?;
+    let inherits = gq.raw_query("MATCH (a:Symbol)-[:INHERITS]->(b:Symbol) RETURN a.id, b.id")?;
+    let tested_by = gq.raw_query("MATCH (a:Symbol)-[:TESTED_BY]->(b:Symbol) RETURN a.id, b.id")?;
 
     // Build output using manual JSON to avoid adding serde_json as a dependency
     // (infigraph-core already has serde_json)

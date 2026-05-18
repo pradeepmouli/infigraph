@@ -64,14 +64,21 @@ pub struct SymbolDiff {
 
 impl SymbolDiff {
     pub fn added(&self) -> impl Iterator<Item = &SymbolChange> {
-        self.changes.iter().filter(|c| c.change == ChangeKind::Added)
+        self.changes
+            .iter()
+            .filter(|c| c.change == ChangeKind::Added)
     }
     pub fn removed(&self) -> impl Iterator<Item = &SymbolChange> {
-        self.changes.iter().filter(|c| c.change == ChangeKind::Removed)
+        self.changes
+            .iter()
+            .filter(|c| c.change == ChangeKind::Removed)
     }
     pub fn modified(&self) -> impl Iterator<Item = &SymbolChange> {
         self.changes.iter().filter(|c| {
-            matches!(c.change, ChangeKind::Modified | ChangeKind::SignatureChanged | ChangeKind::Moved { .. })
+            matches!(
+                c.change,
+                ChangeKind::Modified | ChangeKind::SignatureChanged | ChangeKind::Moved { .. }
+            )
         })
     }
 }
@@ -166,8 +173,16 @@ fn extract_dir_symbols(
 }
 
 static SKIP_DIRS: &[&str] = &[
-    ".git", "node_modules", ".venv", "venv", "target", "build",
-    "dist", "__pycache__", ".tox", ".infigraph",
+    ".git",
+    "node_modules",
+    ".venv",
+    "venv",
+    "target",
+    "build",
+    "dist",
+    "__pycache__",
+    ".tox",
+    ".infigraph",
 ];
 
 fn collect_symbols(
@@ -187,21 +202,34 @@ fn collect_symbols(
                 collect_symbols(root, &path, registry, map)?;
             }
         } else if path.is_file() {
-            let rel = path.strip_prefix(root).unwrap_or(&path).to_string_lossy().replace('\\', "/");
-            let Ok(source) = std::fs::read(&path) else { continue };
-            let Some(pack) = registry.for_file_with_content(&rel, &source) else { continue };
-            let Ok(extraction) = extract::extract_file(&rel, &source, pack) else { continue };
+            let rel = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let Ok(source) = std::fs::read(&path) else {
+                continue;
+            };
+            let Some(pack) = registry.for_file_with_content(&rel, &source) else {
+                continue;
+            };
+            let Ok(extraction) = extract::extract_file(&rel, &source, pack) else {
+                continue;
+            };
             let file = extraction.file.clone();
             for sym in &extraction.symbols {
                 let kind_str = sym.kind.as_str().to_string();
                 // Key: "file::name::kind" — stable across refs
                 let key = format!("{}::{}::{}", file, sym.name, kind_str);
-                map.insert(key, FlatSym {
-                    file: file.clone(),
-                    name: sym.name.clone(),
-                    kind: kind_str,
-                    sig_hash: sym.signature_hash.clone(),
-                });
+                map.insert(
+                    key,
+                    FlatSym {
+                        file: file.clone(),
+                        name: sym.name.clone(),
+                        kind: kind_str,
+                        sig_hash: sym.signature_hash.clone(),
+                    },
+                );
             }
         }
     }
@@ -251,7 +279,9 @@ fn diff_symbol_maps(
                         name: new_sym.name.clone(),
                         kind: new_sym.kind.clone(),
                         file: new_sym.file.clone(),
-                        change: ChangeKind::Moved { from_file: old_sym.file.clone() },
+                        change: ChangeKind::Moved {
+                            from_file: old_sym.file.clone(),
+                        },
                         caller_count: 0,
                     });
                     continue;
@@ -271,10 +301,12 @@ fn diff_symbol_maps(
     // Removed: in old but not in new (excluding moves already captured)
     let moved_names: std::collections::HashSet<String> = changes
         .iter()
-        .filter_map(|c| if matches!(c.change, ChangeKind::Moved { .. }) {
-            Some(format!("{}::{}", c.name, c.kind))
-        } else {
-            None
+        .filter_map(|c| {
+            if matches!(c.change, ChangeKind::Moved { .. }) {
+                Some(format!("{}::{}", c.name, c.kind))
+            } else {
+                None
+            }
         })
         .collect();
 
@@ -343,7 +375,10 @@ pub fn format_diff(diff: &SymbolDiff) -> String {
         };
         out.push_str(&format!(
             "    {:>20}  {:<10} {}{}\n",
-            c.change.to_string(), c.kind, c.name, callers
+            c.change.to_string(),
+            c.kind,
+            c.name,
+            callers
         ));
     }
 

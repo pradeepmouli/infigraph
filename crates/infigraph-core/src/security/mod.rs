@@ -85,16 +85,28 @@ pub struct ScanStats {
 
 impl ScanStats {
     pub fn critical_count(&self) -> usize {
-        self.findings.iter().filter(|f| f.severity == Severity::Critical).count()
+        self.findings
+            .iter()
+            .filter(|f| f.severity == Severity::Critical)
+            .count()
     }
     pub fn high_count(&self) -> usize {
-        self.findings.iter().filter(|f| f.severity == Severity::High).count()
+        self.findings
+            .iter()
+            .filter(|f| f.severity == Severity::High)
+            .count()
     }
     pub fn medium_count(&self) -> usize {
-        self.findings.iter().filter(|f| f.severity == Severity::Medium).count()
+        self.findings
+            .iter()
+            .filter(|f| f.severity == Severity::Medium)
+            .count()
     }
     pub fn low_count(&self) -> usize {
-        self.findings.iter().filter(|f| f.severity == Severity::Low).count()
+        self.findings
+            .iter()
+            .filter(|f| f.severity == Severity::Low)
+            .count()
     }
 }
 
@@ -124,7 +136,8 @@ static RULES: &[Rule] = &[
         extensions: Some(&["py", "js", "ts", "java", "go", "rb", "php", "cs", "rs"]),
         pattern: "execute(",
         exclude_if: Some("# nosec"),
-        message: "Possible SQL injection: raw string passed to execute(). Use parameterized queries.",
+        message:
+            "Possible SQL injection: raw string passed to execute(). Use parameterized queries.",
     },
     Rule {
         id: "SEC002",
@@ -538,15 +551,32 @@ pub fn scan_project(root: &Path) -> Result<ScanStats> {
 
     walk_and_scan(root, root, &mut stats)?;
     // Sort findings: Critical first, then High, etc.
-    stats.findings.sort_by(|a, b| a.severity.cmp(&b.severity).then(a.file.cmp(&b.file)).then(a.line.cmp(&b.line)));
+    stats.findings.sort_by(|a, b| {
+        a.severity
+            .cmp(&b.severity)
+            .then(a.file.cmp(&b.file))
+            .then(a.line.cmp(&b.line))
+    });
 
     Ok(stats)
 }
 
 static IGNORE_DIRS: &[&str] = &[
-    ".git", "node_modules", ".venv", "venv", "target", "build", "dist",
-    "__pycache__", ".tox", ".infigraph", "vendor", ".idea", ".mypy_cache",
-    "coverage", ".pytest_cache",
+    ".git",
+    "node_modules",
+    ".venv",
+    "venv",
+    "target",
+    "build",
+    "dist",
+    "__pycache__",
+    ".tox",
+    ".infigraph",
+    "vendor",
+    ".idea",
+    ".mypy_cache",
+    "coverage",
+    ".pytest_cache",
 ];
 
 fn walk_and_scan(root: &Path, dir: &Path, stats: &mut ScanStats) -> Result<()> {
@@ -562,7 +592,11 @@ fn walk_and_scan(root: &Path, dir: &Path, stats: &mut ScanStats) -> Result<()> {
             }
         } else if path.is_file() {
             if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                let rel = path.strip_prefix(root).unwrap_or(&path).to_string_lossy().replace('\\', "/");
+                let rel = path
+                    .strip_prefix(root)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .replace('\\', "/");
                 scan_file(&path, &rel, ext, stats)?;
             }
         }

@@ -37,7 +37,9 @@ fn init_watchers() {
 
 fn is_watching(path: &str) -> bool {
     let guard = WATCHERS.lock().unwrap();
-    guard.as_ref().map_or(false, |map| map.values().any(|e| e.path == path))
+    guard
+        .as_ref()
+        .is_some_and(|map| map.values().any(|e| e.path == path))
 }
 
 fn auto_start_watch(path: &str) -> Option<String> {
@@ -74,8 +76,11 @@ fn main() -> Result<()> {
 
     // Check for --ui flag
     let args: Vec<String> = std::env::args().collect();
-    let ui_enabled = args.iter().any(|a| a == "--ui" || a.starts_with("--ui=") || a == "--mcp");
-    let port: u16 = args.iter()
+    let ui_enabled = args
+        .iter()
+        .any(|a| a == "--ui" || a.starts_with("--ui=") || a == "--mcp");
+    let port: u16 = args
+        .iter()
         .find(|a| a.starts_with("--port="))
         .and_then(|a| a.strip_prefix("--port="))
         .and_then(|p| p.parse().ok())
@@ -88,10 +93,15 @@ fn main() -> Result<()> {
             eprintln!("Infigraph UI running at http://localhost:{}", port);
             eprintln!("Open: http://localhost:{}/?path=/your/project", port);
         } else {
-            eprintln!("Infigraph UI port {} already in use — skipping UI (MCP active)", port);
+            eprintln!(
+                "Infigraph UI port {} already in use — skipping UI (MCP active)",
+                port
+            );
         }
         if !mcp_mode {
-            loop { std::thread::sleep(std::time::Duration::from_secs(3600)); }
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(3600));
+            }
         }
     }
 
@@ -110,20 +120,20 @@ fn main() -> Result<()> {
         let request: Value = match serde_json::from_str(&line) {
             Ok(v) => v,
             Err(e) => {
-                write_response(&stdout, json!({
-                    "jsonrpc": "2.0",
-                    "id": null,
-                    "error": { "code": -32700, "message": format!("Parse error: {e}") }
-                }))?;
+                write_response(
+                    &stdout,
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": null,
+                        "error": { "code": -32700, "message": format!("Parse error: {e}") }
+                    }),
+                )?;
                 continue;
             }
         };
 
         let id = request.get("id").cloned().unwrap_or(Value::Null);
-        let method = request
-            .get("method")
-            .and_then(|m| m.as_str())
-            .unwrap_or("");
+        let method = request.get("method").and_then(|m| m.as_str()).unwrap_or("");
 
         let response = match method {
             "initialize" => handle_initialize(&id),
@@ -142,7 +152,9 @@ fn main() -> Result<()> {
 
     // If UI mode is active, keep process alive after stdin EOF (web server still serving)
     if ui_enabled {
-        loop { std::thread::sleep(std::time::Duration::from_secs(3600)); }
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(3600));
+        }
     }
 
     Ok(())
@@ -188,11 +200,28 @@ fn tool_def(name: &str, description: &str, props: Value, required: &[&str]) -> V
 
 fn p(path: bool, symbol: bool, file: bool, extra: Value) -> Value {
     let mut obj = serde_json::Map::new();
-    if path { obj.insert("path".into(), json!({"type":"string","description":"Project root path"})); }
-    if symbol { obj.insert("symbol_id".into(), json!({"type":"string","description":"Symbol ID (e.g. 'auth.py::authenticate')"})); }
-    if file { obj.insert("file".into(), json!({"type":"string","description":"Relative file path"})); }
+    if path {
+        obj.insert(
+            "path".into(),
+            json!({"type":"string","description":"Project root path"}),
+        );
+    }
+    if symbol {
+        obj.insert(
+            "symbol_id".into(),
+            json!({"type":"string","description":"Symbol ID (e.g. 'auth.py::authenticate')"}),
+        );
+    }
+    if file {
+        obj.insert(
+            "file".into(),
+            json!({"type":"string","description":"Relative file path"}),
+        );
+    }
     if let Some(extra_obj) = extra.as_object() {
-        for (k, v) in extra_obj { obj.insert(k.clone(), v.clone()); }
+        for (k, v) in extra_obj {
+            obj.insert(k.clone(), v.clone());
+        }
     }
     Value::Object(obj)
 }
@@ -347,10 +376,7 @@ fn handle_tools_list(id: &Value) -> Value {
 
 fn handle_tools_call(id: &Value, request: &Value) -> Value {
     let params = request.get("params").cloned().unwrap_or(Value::Null);
-    let tool_name = params
-        .get("name")
-        .and_then(|n| n.as_str())
-        .unwrap_or("");
+    let tool_name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
     let args = params.get("arguments").cloned().unwrap_or(json!({}));
 
     log_activity(tool_name, &args);
@@ -465,7 +491,10 @@ fn find_infigraph_cli() -> Option<std::path::PathBuf> {
         }
     }
     // Fall back to PATH
-    if let Ok(out) = std::process::Command::new("which").arg("infigraph").output() {
+    if let Ok(out) = std::process::Command::new("which")
+        .arg("infigraph")
+        .output()
+    {
         if out.status.success() {
             let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
             if !path.is_empty() {
@@ -483,9 +512,12 @@ fn tool_index_project(args: &Value) -> Result<String> {
     if let Some(cli) = find_infigraph_cli() {
         let mut cmd = std::process::Command::new(&cli);
         cmd.arg("index").current_dir(path);
-        if full { cmd.arg("--full"); }
+        if full {
+            cmd.arg("--full");
+        }
 
-        let output = cmd.output()
+        let output = cmd
+            .output()
             .with_context(|| format!("Failed to run {}", cli.display()))?;
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -506,15 +538,22 @@ fn tool_index_project(args: &Value) -> Result<String> {
     let prism = open_prism(args)?;
     let result = prism.index()?;
 
-    let mut out = format!("Indexed {}/{} files\n", result.indexed_files, result.total_files);
-    let mut by_lang: std::collections::HashMap<&str, (usize, usize)> = std::collections::HashMap::new();
+    let mut out = format!(
+        "Indexed {}/{} files\n",
+        result.indexed_files, result.total_files
+    );
+    let mut by_lang: std::collections::HashMap<&str, (usize, usize)> =
+        std::collections::HashMap::new();
     for ext in &result.extractions {
         let entry = by_lang.entry(&ext.language).or_insert((0, 0));
         entry.0 += 1;
         entry.1 += ext.symbols.len();
     }
     for (lang, (files, symbols)) in &by_lang {
-        out.push_str(&format!("  {}: {} files, {} symbols\n", lang, files, symbols));
+        out.push_str(&format!(
+            "  {}: {} files, {} symbols\n",
+            lang, files, symbols
+        ));
     }
     if result.resolve_stats.total_calls > 0 {
         out.push_str(&format!("{}\n", result.resolve_stats));
@@ -556,7 +595,10 @@ fn tool_search(args: &Value) -> Result<String> {
         .and_then(|q| q.as_str())
         .context("missing 'query'")?;
     let limit = args.get("limit").and_then(|l| l.as_u64()).unwrap_or(20) as usize;
-    let kind_filter = args.get("kind").and_then(|v| v.as_str()).map(str::to_lowercase);
+    let kind_filter = args
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .map(str::to_lowercase);
     let file_pattern = args.get("file_pattern").and_then(|f| f.as_str());
     let path = args.get("path").and_then(|p| p.as_str()).unwrap_or(".");
 
@@ -573,7 +615,10 @@ fn tool_search(args: &Value) -> Result<String> {
     }
 
     let filtered_rows: Vec<&Vec<String>> = match &kind_filter {
-        Some(k) => rows.iter().filter(|row| row[2].to_lowercase() == *k).collect(),
+        Some(k) => rows
+            .iter()
+            .filter(|row| row[2].to_lowercase() == *k)
+            .collect(),
         None => rows.iter().collect(),
     };
 
@@ -604,7 +649,9 @@ fn tool_search(args: &Value) -> Result<String> {
         .join("embeddings.bin");
     let symbol_embeddings: Vec<(String, Vec<f32>)> = if emb_path.exists() {
         let all: std::collections::HashMap<String, Vec<f32>> =
-            embed::load_embeddings_cached(&emb_path)?.into_iter().collect();
+            embed::load_embeddings_cached(&emb_path)?
+                .into_iter()
+                .collect();
         docs.iter()
             .filter_map(|(id, text)| {
                 all.get(id)
@@ -679,8 +726,10 @@ fn tool_search(args: &Value) -> Result<String> {
         .collect();
 
     // Correlate grep matches to symbols
-    let mut grep_by_symbol: std::collections::HashMap<String, Vec<&infigraph_core::search::GrepMatch>> =
-        std::collections::HashMap::new();
+    let mut grep_by_symbol: std::collections::HashMap<
+        String,
+        Vec<&infigraph_core::search::GrepMatch>,
+    > = std::collections::HashMap::new();
     let mut grep_standalone: Vec<&infigraph_core::search::GrepMatch> = Vec::new();
     for gm in &grep_results {
         if let Some(sym_id) = find_containing_symbol(&intervals, &gm.file, gm.line_number) {
@@ -699,7 +748,11 @@ fn tool_search(args: &Value) -> Result<String> {
     // Sort merged results
     let mut symbol_results: Vec<infigraph_core::search::SearchResult> =
         merged.into_values().collect();
-    symbol_results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    symbol_results.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     // Auto-escalate if results are weak
     let top_score = symbol_results.first().map(|r| r.score).unwrap_or(0.0);
@@ -718,11 +771,13 @@ fn tool_search(args: &Value) -> Result<String> {
         let kw2 = infigraph_core::search::combine_scores(&raw2, 0.3, esc_limit);
         let sem2 = infigraph_core::search::combine_scores(&raw2, 0.85, esc_limit);
 
-        let mut esc_merged: std::collections::HashMap<String, infigraph_core::search::SearchResult> =
-            symbol_results
-                .into_iter()
-                .map(|r| (r.symbol_id.clone(), r))
-                .collect();
+        let mut esc_merged: std::collections::HashMap<
+            String,
+            infigraph_core::search::SearchResult,
+        > = symbol_results
+            .into_iter()
+            .map(|r| (r.symbol_id.clone(), r))
+            .collect();
         for r in kw2.into_iter().chain(sem2) {
             esc_merged
                 .entry(r.symbol_id.clone())
@@ -734,7 +789,11 @@ fn tool_search(args: &Value) -> Result<String> {
                 .or_insert(r);
         }
         symbol_results = esc_merged.into_values().collect();
-        symbol_results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        symbol_results.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
     }
 
     symbol_results.truncate(limit);
@@ -773,7 +832,9 @@ fn tool_search(args: &Value) -> Result<String> {
                 for gm in gms.iter().take(3) {
                     out.push_str(&format!(
                         "       grep: {}:{}: {}\n",
-                        gm.file, gm.line_number, gm.line_text.trim()
+                        gm.file,
+                        gm.line_number,
+                        gm.line_text.trim()
                     ));
                 }
             }
@@ -785,7 +846,9 @@ fn tool_search(args: &Value) -> Result<String> {
         for gm in grep_standalone.iter().take(limit) {
             out.push_str(&format!(
                 "{}:{}: {}\n",
-                gm.file, gm.line_number, gm.line_text.trim()
+                gm.file,
+                gm.line_number,
+                gm.line_text.trim()
             ));
         }
     }
@@ -833,7 +896,9 @@ fn tool_search_symbols(args: &Value) -> Result<String> {
     let bm25_index = infigraph_core::search::BM25Index::build(docs.clone());
     let embedder = embed::best_embedder();
     let path = args.get("path").and_then(|p| p.as_str()).unwrap_or(".");
-    let emb_path = std::path::PathBuf::from(path).join(".infigraph").join("embeddings.bin");
+    let emb_path = std::path::PathBuf::from(path)
+        .join(".infigraph")
+        .join("embeddings.bin");
     let symbol_embeddings: Vec<(String, Vec<f32>)> = if emb_path.exists() {
         embed::load_embeddings_cached(&emb_path)?
     } else {
@@ -842,16 +907,27 @@ fn tool_search_symbols(args: &Value) -> Result<String> {
             .collect()
     };
 
-    let hnsw_path = std::path::PathBuf::from(path).join(".infigraph").join("hnsw_index.usearch");
+    let hnsw_path = std::path::PathBuf::from(path)
+        .join(".infigraph")
+        .join("hnsw_index.usearch");
     let results = infigraph_core::search::hybrid_search(
-        query, &bm25_index, embedder.as_ref(), &symbol_embeddings, limit, 0.3,
-        Some(&hnsw_path), Some(&emb_path),
+        query,
+        &bm25_index,
+        embedder.as_ref(),
+        &symbol_embeddings,
+        limit,
+        0.3,
+        Some(&hnsw_path),
+        Some(&emb_path),
     )?;
 
     let mut out = String::new();
     for r in &results {
         if let Some(row) = rows.iter().find(|row| row[0] == r.symbol_id) {
-            let lines = match (row.get(5).filter(|s| !s.is_empty()), row.get(6).filter(|s| !s.is_empty())) {
+            let lines = match (
+                row.get(5).filter(|s| !s.is_empty()),
+                row.get(6).filter(|s| !s.is_empty()),
+            ) {
                 (Some(s), Some(e)) => format!(":L{}-{}", s, e),
                 (Some(s), None) => format!(":L{}", s),
                 _ => String::new(),
@@ -1004,10 +1080,7 @@ fn tool_transitive_impact(args: &Value) -> Result<String> {
 
     let impacted = gq.transitive_impact(symbol_id, depth)?;
     if impacted.is_empty() {
-        return Ok(format!(
-            "No symbols affected by changes to '{}'",
-            symbol_id
-        ));
+        return Ok(format!("No symbols affected by changes to '{}'", symbol_id));
     }
 
     let mut out = String::new();
@@ -1027,17 +1100,11 @@ fn tool_search_code(args: &Value) -> Result<String> {
         .and_then(|p| p.as_str())
         .context("missing 'pattern'")?;
     let file_pattern = args.get("file_pattern").and_then(|f| f.as_str());
-    let limit = args
-        .get("limit")
-        .and_then(|l| l.as_u64())
-        .unwrap_or(50) as usize;
+    let limit = args.get("limit").and_then(|l| l.as_u64()).unwrap_or(50) as usize;
 
-    let root = PathBuf::from(path)
-        .canonicalize()
-        .context("invalid path")?;
+    let root = PathBuf::from(path).canonicalize().context("invalid path")?;
 
-    let matches =
-        infigraph_core::search::grep_search(&root, pattern, file_pattern, limit)?;
+    let matches = infigraph_core::search::grep_search(&root, pattern, file_pattern, limit)?;
 
     if matches.is_empty() {
         return Ok(format!("No matches for '{}'", pattern));
@@ -1094,9 +1161,8 @@ fn build_architecture_report(gq: &infigraph_core::graph::GraphQuery) -> Result<S
 
     // 1. Language breakdown
     out.push_str("=== Language Breakdown ===\n");
-    let lang_rows = gq.raw_query(
-        "MATCH (m:Module) RETURN m.language, count(m) ORDER BY count(m) DESC",
-    )?;
+    let lang_rows =
+        gq.raw_query("MATCH (m:Module) RETURN m.language, count(m) ORDER BY count(m) DESC")?;
     if lang_rows.is_empty() {
         out.push_str("  (no modules indexed)\n");
     } else {
@@ -1107,9 +1173,8 @@ fn build_architecture_report(gq: &infigraph_core::graph::GraphQuery) -> Result<S
 
     // 2. Total symbols by kind
     out.push_str("\n=== Symbols by Kind ===\n");
-    let kind_rows = gq.raw_query(
-        "MATCH (s:Symbol) RETURN s.kind, count(s) ORDER BY count(s) DESC",
-    )?;
+    let kind_rows =
+        gq.raw_query("MATCH (s:Symbol) RETURN s.kind, count(s) ORDER BY count(s) DESC")?;
     if kind_rows.is_empty() {
         out.push_str("  (no symbols indexed)\n");
     } else {
@@ -1120,14 +1185,18 @@ fn build_architecture_report(gq: &infigraph_core::graph::GraphQuery) -> Result<S
 
     // 3. Hotspots: files with most symbols
     out.push_str("\n=== Hotspot Files (most symbols) ===\n");
-    let hotspot_rows = gq.raw_query(
-        "MATCH (s:Symbol) RETURN s.file, count(s) AS cnt ORDER BY cnt DESC LIMIT 10",
-    )?;
+    let hotspot_rows =
+        gq.raw_query("MATCH (s:Symbol) RETURN s.file, count(s) AS cnt ORDER BY cnt DESC LIMIT 10")?;
     if hotspot_rows.is_empty() {
         out.push_str("  (no symbols indexed)\n");
     } else {
         for (i, row) in hotspot_rows.iter().enumerate() {
-            out.push_str(&format!("  {:>2}. {:60} {} symbols\n", i + 1, row[0], row[1]));
+            out.push_str(&format!(
+                "  {:>2}. {:60} {} symbols\n",
+                i + 1,
+                row[0],
+                row[1]
+            ));
         }
     }
 
@@ -1142,7 +1211,10 @@ fn build_architecture_report(gq: &infigraph_core::graph::GraphQuery) -> Result<S
         for (i, row) in hub_rows.iter().enumerate() {
             out.push_str(&format!(
                 "  {:>2}. {:30} {:40} {} callers\n",
-                i + 1, row[0], row[1], row[2]
+                i + 1,
+                row[0],
+                row[1],
+                row[2]
             ));
         }
     }
@@ -1165,14 +1237,8 @@ fn build_architecture_report(gq: &infigraph_core::graph::GraphQuery) -> Result<S
 
 fn tool_detect_changes(args: &Value) -> Result<String> {
     let prism = open_prism(args)?;
-    let base = args
-        .get("base")
-        .and_then(|b| b.as_str())
-        .unwrap_or("HEAD");
-    let depth = args
-        .get("depth")
-        .and_then(|d| d.as_u64())
-        .unwrap_or(3) as u32;
+    let base = args.get("base").and_then(|b| b.as_str()).unwrap_or("HEAD");
+    let depth = args.get("depth").and_then(|d| d.as_u64()).unwrap_or(3) as u32;
 
     let store = prism.store().context("not initialized")?;
     let conn = store.connection()?;
@@ -1236,10 +1302,7 @@ fn build_detect_changes_report(
     }
 
     let mut out = String::new();
-    out.push_str(&format!(
-        "=== Change Detection (base: {}) ===\n\n",
-        base
-    ));
+    out.push_str(&format!("=== Change Detection (base: {}) ===\n\n", base));
     out.push_str(&format!("Changed files: {}\n", changed_files.len()));
     for f in &changed_files {
         out.push_str(&format!("  {}\n", f));
@@ -1253,10 +1316,7 @@ fn build_detect_changes_report(
         out.push_str("  (no indexed symbols overlap with changed lines)\n");
     } else {
         for (_, name, file, start, end) in &directly_changed {
-            out.push_str(&format!(
-                "  {:30} {} L{}-{}\n",
-                name, file, start, end
-            ));
+            out.push_str(&format!("  {:30} {} L{}-{}\n", name, file, start, end));
         }
     }
 
@@ -1357,8 +1417,7 @@ fn tool_delete_project(args: &Value) -> Result<String> {
     // Remove the .infigraph directory within the project
     let infigraph_dir = project_path.join(".infigraph");
     if infigraph_dir.exists() {
-        std::fs::remove_dir_all(&infigraph_dir)
-            .context("failed to remove .infigraph directory")?;
+        std::fs::remove_dir_all(&infigraph_dir).context("failed to remove .infigraph directory")?;
     }
 
     // Unregister from the global registry
@@ -1447,9 +1506,8 @@ fn tool_get_graph_schema(args: &Value) -> Result<String> {
 
     // Show symbol kinds present in the graph
     out.push_str("\n=== Symbol Kinds ===\n");
-    let kind_rows = gq.raw_query(
-        "MATCH (s:Symbol) RETURN s.kind, count(s) ORDER BY count(s) DESC",
-    )?;
+    let kind_rows =
+        gq.raw_query("MATCH (s:Symbol) RETURN s.kind, count(s) ORDER BY count(s) DESC")?;
     for row in &kind_rows {
         out.push_str(&format!("  {:>20}: {}\n", row[0], row[1]));
     }
@@ -1478,7 +1536,10 @@ fn tool_symbol_context(args: &Value) -> Result<String> {
     out.push_str(&format!("  Name:       {}\n", detail.name));
     out.push_str(&format!("  Kind:       {}\n", detail.kind));
     out.push_str(&format!("  File:       {}\n", detail.file));
-    out.push_str(&format!("  Lines:      {}-{}\n", detail.start_line, detail.end_line));
+    out.push_str(&format!(
+        "  Lines:      {}-{}\n",
+        detail.start_line, detail.end_line
+    ));
 
     // Docstring
     let doc_rows = gq.raw_query(&format!(
@@ -1608,7 +1669,7 @@ fn tool_group_query(args: &Value) -> Result<String> {
         .context("missing 'cypher' argument")?;
 
     let registry = Registry::load()?;
-    let results = registry.group_query(group_name, cypher, || bundled_registry())?;
+    let results = registry.group_query(group_name, cypher, bundled_registry)?;
 
     if results.is_empty() {
         return Ok(format!(
@@ -1634,7 +1695,7 @@ fn tool_group_sync(args: &Value) -> Result<String> {
         .context("missing 'group_name' argument")?;
 
     let mut registry = Registry::load()?;
-    let count = multi::sync_group_contracts(&mut registry, group_name, || bundled_registry())?;
+    let count = multi::sync_group_contracts(&mut registry, group_name, bundled_registry)?;
 
     Ok(format!(
         "Extracted {} contracts from group '{}'.",
@@ -1703,7 +1764,12 @@ fn tool_group_deps(args: &Value) -> Result<String> {
     for d in &deps {
         out.push_str(&format!(
             "  {} ({}) → {} {} {} [{}]\n",
-            d.caller_service, d.caller_symbol, d.target_service, d.target_method, d.target_path, d.caller_file
+            d.caller_service,
+            d.caller_symbol,
+            d.target_service,
+            d.target_method,
+            d.target_path,
+            d.caller_file
         ));
     }
     Ok(out)
@@ -1714,10 +1780,7 @@ fn tool_group_index(args: &Value) -> Result<String> {
         .get("group_name")
         .and_then(|g| g.as_str())
         .context("missing 'group_name' argument")?;
-    let full = args
-        .get("full")
-        .and_then(|f| f.as_bool())
-        .unwrap_or(false);
+    let full = args.get("full").and_then(|f| f.as_bool()).unwrap_or(false);
 
     let mut registry = Registry::load()?;
     let results = infigraph_core::multi::index_group(
@@ -1727,7 +1790,11 @@ fn tool_group_index(args: &Value) -> Result<String> {
         infigraph_languages::bundled_registry,
     )?;
 
-    let mut out = format!("Indexed {} repos in group '{}':\n", results.len(), group_name);
+    let mut out = format!(
+        "Indexed {} repos in group '{}':\n",
+        results.len(),
+        group_name
+    );
     for (repo, indexed, total) in &results {
         out.push_str(&format!("  {}: {}/{} files\n", repo, indexed, total));
     }
@@ -1811,15 +1878,30 @@ fn tool_visualize(args: &Value) -> Result<String> {
 
 fn tool_visualize_symbol(args: &Value) -> Result<String> {
     let prism = open_prism(args)?;
-    let symbol_id = args.get("symbol_id").and_then(|v| v.as_str()).context("missing 'symbol_id'")?;
+    let symbol_id = args
+        .get("symbol_id")
+        .and_then(|v| v.as_str())
+        .context("missing 'symbol_id'")?;
     let depth = args.get("depth").and_then(|v| v.as_u64()).unwrap_or(2) as u32;
 
     let store = prism.store().context("not initialized")?;
     let conn = store.connection()?;
     let gq = infigraph_core::graph::GraphQuery::new(&conn);
 
-    let safe_name: String = symbol_id.chars().map(|c| if c.is_alphanumeric() || c == '-' { c } else { '_' }).collect();
-    let output_path = prism.root().join(".infigraph").join(format!("symbol-{safe_name}.html"));
+    let safe_name: String = symbol_id
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let output_path = prism
+        .root()
+        .join(".infigraph")
+        .join(format!("symbol-{safe_name}.html"));
     let path = infigraph_core::viz::generate_symbol_html(&gq, symbol_id, depth, &output_path)?;
     Ok(format!("Symbol subgraph visualization written to: {path}"))
 }
@@ -1839,12 +1921,23 @@ fn tool_index_manifests(args: &Value) -> Result<String> {
     let store = prism.store().context("not initialized")?;
     let results = infigraph_core::manifest::index_manifests(prism.root(), store)?;
     if results.is_empty() {
-        return Ok("No manifests found (package.json, Cargo.toml, go.mod, pom.xml, etc.)".to_string());
+        return Ok(
+            "No manifests found (package.json, Cargo.toml, go.mod, pom.xml, etc.)".to_string(),
+        );
     }
     let total: usize = results.iter().map(|r| r.deps.len()).sum();
-    let mut out = format!("Indexed {} manifests, {} dependencies total:\n\n", results.len(), total);
+    let mut out = format!(
+        "Indexed {} manifests, {} dependencies total:\n\n",
+        results.len(),
+        total
+    );
     for r in &results {
-        out.push_str(&format!("  {} [{}]: {} deps\n", r.manifest_file, r.ecosystem, r.deps.len()));
+        out.push_str(&format!(
+            "  {} [{}]: {} deps\n",
+            r.manifest_file,
+            r.ecosystem,
+            r.deps.len()
+        ));
     }
     Ok(out)
 }
@@ -1882,7 +1975,9 @@ fn tool_find_all_references(args: &Value) -> Result<String> {
     let conn = store.connection()?;
     let gq = infigraph_core::graph::GraphQuery::new(&conn);
 
-    let symbol_id = args.get("symbol_id").and_then(|v| v.as_str())
+    let symbol_id = args
+        .get("symbol_id")
+        .and_then(|v| v.as_str())
         .context("missing 'symbol_id'")?;
 
     let refs = gq.find_all_references(symbol_id)?;
@@ -1920,10 +2015,25 @@ fn tool_get_api_surface(args: &Value) -> Result<String> {
             out.push_str(&format!("## {}\n", s.file));
             cur_file = s.file.clone();
         }
-        let doc = if s.docstring.is_empty() || s.docstring == "''" { String::new() }
-                  else { format!(" — {}", s.docstring.trim_matches('\'').chars().take(80).collect::<String>()) };
-        out.push_str(&format!("  [{kind}] {name} (L{line}){doc}\n",
-            kind = s.kind, name = s.name, line = s.line, doc = doc));
+        let doc = if s.docstring.is_empty() || s.docstring == "''" {
+            String::new()
+        } else {
+            format!(
+                " — {}",
+                s.docstring
+                    .trim_matches('\'')
+                    .chars()
+                    .take(80)
+                    .collect::<String>()
+            )
+        };
+        out.push_str(&format!(
+            "  [{kind}] {name} (L{line}){doc}\n",
+            kind = s.kind,
+            name = s.name,
+            line = s.line,
+            doc = doc
+        ));
     }
     Ok(out)
 }
@@ -1934,19 +2044,29 @@ fn tool_get_file_deps(args: &Value) -> Result<String> {
     let conn = store.connection()?;
     let gq = infigraph_core::graph::GraphQuery::new(&conn);
 
-    let file = args.get("file").and_then(|v| v.as_str())
+    let file = args
+        .get("file")
+        .and_then(|v| v.as_str())
         .context("missing 'file'")?;
 
     let deps = gq.get_file_deps(file)?;
     let mut out = format!("File dependencies for '{}':\n\n", file);
 
     out.push_str(&format!("Imports ({}):\n", deps.imports.len()));
-    for f in &deps.imports { out.push_str(&format!("  → {}\n", f)); }
-    if deps.imports.is_empty() { out.push_str("  (none)\n"); }
+    for f in &deps.imports {
+        out.push_str(&format!("  → {}\n", f));
+    }
+    if deps.imports.is_empty() {
+        out.push_str("  (none)\n");
+    }
 
     out.push_str(&format!("\nImported by ({}):\n", deps.imported_by.len()));
-    for f in &deps.imported_by { out.push_str(&format!("  ← {}\n", f)); }
-    if deps.imported_by.is_empty() { out.push_str("  (none)\n"); }
+    for f in &deps.imported_by {
+        out.push_str(&format!("  ← {}\n", f));
+    }
+    if deps.imported_by.is_empty() {
+        out.push_str("  (none)\n");
+    }
 
     Ok(out)
 }
@@ -1957,7 +2077,9 @@ fn tool_get_type_hierarchy(args: &Value) -> Result<String> {
     let conn = store.connection()?;
     let gq = infigraph_core::graph::GraphQuery::new(&conn);
 
-    let symbol_id = args.get("symbol_id").and_then(|v| v.as_str())
+    let symbol_id = args
+        .get("symbol_id")
+        .and_then(|v| v.as_str())
         .context("missing 'symbol_id'")?;
     let depth = args.get("depth").and_then(|v| v.as_u64()).unwrap_or(5) as u32;
 
@@ -1968,13 +2090,17 @@ fn tool_get_type_hierarchy(args: &Value) -> Result<String> {
     for a in &hier.ancestors {
         out.push_str(&format!("  ↑ {} [{}] ({})\n", a.name, a.kind, a.file));
     }
-    if hier.ancestors.is_empty() { out.push_str("  (none — root type)\n"); }
+    if hier.ancestors.is_empty() {
+        out.push_str("  (none — root type)\n");
+    }
 
     out.push_str(&format!("\nDescendants ({}):\n", hier.descendants.len()));
     for d in &hier.descendants {
         out.push_str(&format!("  ↓ {} [{}] ({})\n", d.name, d.kind, d.file));
     }
-    if hier.descendants.is_empty() { out.push_str("  (none — leaf type)\n"); }
+    if hier.descendants.is_empty() {
+        out.push_str("  (none — leaf type)\n");
+    }
 
     Ok(out)
 }
@@ -1992,7 +2118,7 @@ fn tool_get_test_coverage(args: &Value) -> Result<String> {
         cov.covered.retain(|s| s.file.contains(f));
         cov.uncovered.retain(|s| s.file.contains(f));
         let total = cov.covered.len() + cov.uncovered.len();
-        cov.coverage_pct = if total > 0 { cov.covered.len() * 100 / total } else { 0 };
+        cov.coverage_pct = (cov.covered.len() * 100).checked_div(total).unwrap_or(0);
         cov.covered_count = cov.covered.len();
         cov.uncovered_count = cov.uncovered.len();
     }
@@ -2005,7 +2131,10 @@ fn tool_get_test_coverage(args: &Value) -> Result<String> {
     if !cov.uncovered.is_empty() {
         out.push_str("Uncovered symbols:\n");
         for s in cov.uncovered.iter().take(50) {
-            out.push_str(&format!("  ✗ {} [{}] — {}\n", s.symbol_name, s.kind, s.file));
+            out.push_str(&format!(
+                "  ✗ {} [{}] — {}\n",
+                s.symbol_name, s.kind, s.file
+            ));
         }
         if cov.uncovered.len() > 50 {
             out.push_str(&format!("  ... and {} more\n", cov.uncovered.len() - 50));
@@ -2080,25 +2209,34 @@ fn tool_get_complexity(args: &Value) -> Result<String> {
         return Ok("No function/method symbols found. Run index_project first.".to_string());
     }
 
-    let total: u32 = rows.iter()
+    let total: u32 = rows
+        .iter()
         .filter_map(|r| r.get(3).and_then(|v| v.parse::<u32>().ok()))
         .sum();
     let count = rows.len();
-    let avg = if count > 0 { total as f64 / count as f64 } else { 0.0 };
+    let avg = if count > 0 {
+        total as f64 / count as f64
+    } else {
+        0.0
+    };
 
-    let hotspots: Vec<_> = rows.iter()
+    let hotspots: Vec<_> = rows
+        .iter()
         .filter(|r| r.get(3).and_then(|v| v.parse::<u32>().ok()).unwrap_or(0) >= threshold)
         .collect();
 
     let mut out = format!(
         "Complexity Analysis: {} symbols, avg {:.1}, {} hotspots (>= {})\n\n",
-        count, avg, hotspots.len(), threshold
+        count,
+        avg,
+        hotspots.len(),
+        threshold
     );
 
     if !hotspots.is_empty() {
         out.push_str(&format!("Hotspots (complexity >= {}):\n", threshold));
         for row in &hotspots {
-            let name = row.get(0).map(|s| s.as_str()).unwrap_or("?");
+            let name = row.first().map(|s| s.as_str()).unwrap_or("?");
             let file = row.get(1).map(|s| s.as_str()).unwrap_or("?");
             let line = row.get(2).map(|s| s.as_str()).unwrap_or("?");
             let cplx = row.get(3).map(|s| s.as_str()).unwrap_or("?");
@@ -2109,11 +2247,15 @@ fn tool_get_complexity(args: &Value) -> Result<String> {
 
     out.push_str("Top 20 by complexity:\n");
     for row in rows.iter().take(20) {
-        let name = row.get(0).map(|s| s.as_str()).unwrap_or("?");
+        let name = row.first().map(|s| s.as_str()).unwrap_or("?");
         let file = row.get(1).map(|s| s.as_str()).unwrap_or("?");
         let line = row.get(2).map(|s| s.as_str()).unwrap_or("?");
         let cplx = row.get(3).map(|s| s.as_str()).unwrap_or("?");
-        let flag = if cplx.parse::<u32>().unwrap_or(0) >= threshold { " ⚠" } else { "" };
+        let flag = if cplx.parse::<u32>().unwrap_or(0) >= threshold {
+            " ⚠"
+        } else {
+            ""
+        };
         out.push_str(&format!("  [{cplx:>3}] {name}  ({file}:{line}){flag}\n"));
     }
 
@@ -2121,11 +2263,22 @@ fn tool_get_complexity(args: &Value) -> Result<String> {
 }
 
 fn tool_detect_security_issues(args: &Value) -> Result<String> {
-    let path = args.get("path").and_then(|p| p.as_str()).context("missing 'path'")?;
-    let root = std::path::PathBuf::from(path).canonicalize().context("invalid path")?;
+    let path = args
+        .get("path")
+        .and_then(|p| p.as_str())
+        .context("missing 'path'")?;
+    let root = std::path::PathBuf::from(path)
+        .canonicalize()
+        .context("invalid path")?;
 
-    let sev_filter = args.get("severity").and_then(|v| v.as_str()).map(|s| s.to_uppercase());
-    let cat_filter = args.get("category").and_then(|v| v.as_str()).map(|s| s.to_lowercase());
+    let sev_filter = args
+        .get("severity")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_uppercase());
+    let cat_filter = args
+        .get("category")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_lowercase());
 
     let mut scan = infigraph_core::security::scan_project(&root)?;
 
@@ -2134,18 +2287,31 @@ fn tool_detect_security_issues(args: &Value) -> Result<String> {
         scan.findings.retain(|f| f.severity.to_string() == *sev);
     }
     if let Some(ref cat) = cat_filter {
-        scan.findings.retain(|f| f.category.to_string().to_lowercase().replace(' ', "") == cat.replace(' ', ""));
+        scan.findings.retain(|f| {
+            f.category.to_string().to_lowercase().replace(' ', "") == cat.replace(' ', "")
+        });
     }
 
     Ok(infigraph_core::security::format_scan_results(&scan))
 }
 
 fn tool_semantic_diff(args: &Value) -> Result<String> {
-    let path = args.get("path").and_then(|p| p.as_str()).context("missing 'path'")?;
-    let old_ref = args.get("old_ref").and_then(|v| v.as_str()).unwrap_or("HEAD~1");
-    let new_ref = args.get("new_ref").and_then(|v| v.as_str()).unwrap_or("HEAD");
+    let path = args
+        .get("path")
+        .and_then(|p| p.as_str())
+        .context("missing 'path'")?;
+    let old_ref = args
+        .get("old_ref")
+        .and_then(|v| v.as_str())
+        .unwrap_or("HEAD~1");
+    let new_ref = args
+        .get("new_ref")
+        .and_then(|v| v.as_str())
+        .unwrap_or("HEAD");
 
-    let root = std::path::PathBuf::from(path).canonicalize().context("invalid path")?;
+    let root = std::path::PathBuf::from(path)
+        .canonicalize()
+        .context("invalid path")?;
     let registry = bundled_registry()?;
     let diff = infigraph_core::diff::semantic_diff(&root, old_ref, new_ref, &registry)?;
     Ok(infigraph_core::diff::format_diff(&diff))
@@ -2154,11 +2320,22 @@ fn tool_semantic_diff(args: &Value) -> Result<String> {
 fn tool_watch_project(args: &Value) -> Result<String> {
     init_watchers();
 
-    let path = args.get("path").and_then(|p| p.as_str()).context("missing 'path'")?;
-    let debounce_ms = args.get("debounce_ms").and_then(|v| v.as_u64()).unwrap_or(500);
-    let auto_resolve = args.get("auto_resolve").and_then(|v| v.as_bool()).unwrap_or(false);
+    let path = args
+        .get("path")
+        .and_then(|p| p.as_str())
+        .context("missing 'path'")?;
+    let debounce_ms = args
+        .get("debounce_ms")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(500);
+    let auto_resolve = args
+        .get("auto_resolve")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
-    let root = std::path::PathBuf::from(path).canonicalize().context("invalid path")?;
+    let root = std::path::PathBuf::from(path)
+        .canonicalize()
+        .context("invalid path")?;
     let root_str = root.to_string_lossy().replace('\\', "/");
 
     let registry = bundled_registry()?;
@@ -2166,10 +2343,13 @@ fn tool_watch_project(args: &Value) -> Result<String> {
     prism.init()?;
 
     let (stop_tx, stop_rx) = mpsc::channel::<()>();
-    let watcher_id = format!("watch-{}", std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis());
+    let watcher_id = format!(
+        "watch-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+    );
 
     let pending_reindex: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let pending_clone = Arc::clone(&pending_reindex);
@@ -2177,11 +2357,14 @@ fn tool_watch_project(args: &Value) -> Result<String> {
     {
         let mut guard = get_watchers();
         if let Some(map) = guard.as_mut() {
-            map.insert(watcher_id.clone(), WatcherEntry {
-                stop_tx,
-                path: root_str.clone(),
-                pending_reindex,
-            });
+            map.insert(
+                watcher_id.clone(),
+                WatcherEntry {
+                    stop_tx,
+                    path: root_str.clone(),
+                    pending_reindex,
+                },
+            );
         }
     }
 
@@ -2208,10 +2391,18 @@ fn tool_watch_project(args: &Value) -> Result<String> {
         };
         if auto_resolve {
             // Use auto-resolve variant that runs full reindex on cross-file changes
-            if let Err(e) = infigraph_core::watch::watch_project_auto_resolve(&prism, debounce_ms, stop_rx, &id_short, bundled_registry) {
+            if let Err(e) = infigraph_core::watch::watch_project_auto_resolve(
+                &prism,
+                debounce_ms,
+                stop_rx,
+                &id_short,
+                bundled_registry,
+            ) {
                 eprintln!("[watch] error: {e}");
             }
-        } else if let Err(e) = infigraph_core::watch::watch_project(&prism, debounce_ms, stop_rx, on_event) {
+        } else if let Err(e) =
+            infigraph_core::watch::watch_project(&prism, debounce_ms, stop_rx, on_event)
+        {
             eprintln!("[watch] error: {e}");
         }
         let mut guard = WATCHERS.lock().unwrap();
@@ -2232,7 +2423,10 @@ fn tool_watch_project(args: &Value) -> Result<String> {
 }
 
 fn tool_stop_watch(args: &Value) -> Result<String> {
-    let watcher_id = args.get("watcher_id").and_then(|v| v.as_str()).context("missing 'watcher_id'")?;
+    let watcher_id = args
+        .get("watcher_id")
+        .and_then(|v| v.as_str())
+        .context("missing 'watcher_id'")?;
 
     let mut guard = get_watchers();
     if let Some(map) = guard.as_mut() {
@@ -2283,7 +2477,11 @@ fn tool_get_watch_status(args: &Value) -> Result<String> {
     let mut out = format!("{} watcher(s) running:\n", map.len());
     for (id, entry) in map.iter() {
         let pending_count = entry.pending_reindex.lock().unwrap().len();
-        let warn = if pending_count > 0 { format!(" ⚠ {pending_count} pending reindex") } else { String::new() };
+        let warn = if pending_count > 0 {
+            format!(" ⚠ {pending_count} pending reindex")
+        } else {
+            String::new()
+        };
         out.push_str(&format!("  {id} — {}{warn}\n", entry.path));
     }
     Ok(out)
@@ -2303,7 +2501,9 @@ fn tool_detect_bridges(args: &Value) -> Result<String> {
     let bridges: Vec<_> = match kind_filter {
         Some(k) => {
             let k_upper = k.to_uppercase();
-            result.bridges.iter()
+            result
+                .bridges
+                .iter()
                 .filter(|b| b.kind.as_str() == k_upper)
                 .collect()
         }
@@ -2311,7 +2511,9 @@ fn tool_detect_bridges(args: &Value) -> Result<String> {
     };
 
     if bridges.is_empty() {
-        let filter_note = kind_filter.map(|k| format!(" (filter: {k})")).unwrap_or_default();
+        let filter_note = kind_filter
+            .map(|k| format!(" (filter: {k})"))
+            .unwrap_or_default();
         return Ok(format!("No cross-language bridges detected{filter_note}."));
     }
 
@@ -2319,9 +2521,21 @@ fn tool_detect_bridges(args: &Value) -> Result<String> {
     let jni = result.jni_count();
     let grpc = result.grpc_count();
     let pinvoke = result.pinvoke_count();
-    let cgo = result.bridges.iter().filter(|b| b.kind == BridgeKind::Cgo).count();
-    let ctypes = result.bridges.iter().filter(|b| b.kind == BridgeKind::Ctypes).count();
-    let wasm = result.bridges.iter().filter(|b| b.kind == BridgeKind::Wasm).count();
+    let cgo = result
+        .bridges
+        .iter()
+        .filter(|b| b.kind == BridgeKind::Cgo)
+        .count();
+    let ctypes = result
+        .bridges
+        .iter()
+        .filter(|b| b.kind == BridgeKind::Ctypes)
+        .count();
+    let wasm = result
+        .bridges
+        .iter()
+        .filter(|b| b.kind == BridgeKind::Wasm)
+        .count();
     let com = result.com_count();
 
     let mut out = format!(
@@ -2365,7 +2579,10 @@ fn tool_semantic_search(args: &Value) -> Result<String> {
         .and_then(|q| q.as_str())
         .context("missing 'query'")?;
     let limit = args.get("limit").and_then(|l| l.as_u64()).unwrap_or(10) as usize;
-    let kind_filter = args.get("kind").and_then(|v| v.as_str()).map(str::to_lowercase);
+    let kind_filter = args
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .map(str::to_lowercase);
 
     let store = prism.store().context("not initialized")?;
     let conn = store.connection()?;
@@ -2381,12 +2598,18 @@ fn tool_semantic_search(args: &Value) -> Result<String> {
 
     // Apply kind filter before building index
     let filtered_rows: Vec<&Vec<String>> = match &kind_filter {
-        Some(k) => rows.iter().filter(|row| row[2].to_lowercase() == *k).collect(),
+        Some(k) => rows
+            .iter()
+            .filter(|row| row[2].to_lowercase() == *k)
+            .collect(),
         None => rows.iter().collect(),
     };
 
     if filtered_rows.is_empty() {
-        return Ok(format!("No symbols found with kind '{}'.", kind_filter.unwrap_or_default()));
+        return Ok(format!(
+            "No symbols found with kind '{}'.",
+            kind_filter.unwrap_or_default()
+        ));
     }
 
     let docs: Vec<(String, String)> = filtered_rows
@@ -2407,7 +2630,9 @@ fn tool_semantic_search(args: &Value) -> Result<String> {
     let embedder = embed::best_embedder();
 
     let path = args.get("path").and_then(|p| p.as_str()).unwrap_or(".");
-    let emb_path = std::path::PathBuf::from(path).join(".infigraph").join("embeddings.bin");
+    let emb_path = std::path::PathBuf::from(path)
+        .join(".infigraph")
+        .join("embeddings.bin");
 
     // Load or compute embeddings for filtered set
     let all_embeddings: std::collections::HashMap<String, Vec<f32>> = if emb_path.exists() {
@@ -2423,7 +2648,8 @@ fn tool_semantic_search(args: &Value) -> Result<String> {
     let symbol_embeddings: Vec<(String, Vec<f32>)> = docs
         .iter()
         .filter_map(|(id, text)| {
-            all_embeddings.get(id)
+            all_embeddings
+                .get(id)
                 .cloned()
                 .or_else(|| embedder.embed(text).ok())
                 .map(|emb| (id.clone(), emb))
@@ -2431,20 +2657,32 @@ fn tool_semantic_search(args: &Value) -> Result<String> {
         .collect();
 
     // alpha=0.85: heavily vector-weighted for semantic meaning
-    let hnsw_path = std::path::PathBuf::from(path).join(".infigraph").join("hnsw_index.usearch");
+    let hnsw_path = std::path::PathBuf::from(path)
+        .join(".infigraph")
+        .join("hnsw_index.usearch");
     let results = infigraph_core::search::hybrid_search(
-        query, &bm25_index, embedder.as_ref(), &symbol_embeddings, limit, 0.85,
-        Some(&hnsw_path), Some(&emb_path),
+        query,
+        &bm25_index,
+        embedder.as_ref(),
+        &symbol_embeddings,
+        limit,
+        0.85,
+        Some(&hnsw_path),
+        Some(&emb_path),
     )?;
 
-    let row_map: std::collections::HashMap<&str, &Vec<String>> =
-        filtered_rows.iter().map(|row| (row[0].as_str(), *row)).collect();
+    let row_map: std::collections::HashMap<&str, &Vec<String>> = filtered_rows
+        .iter()
+        .map(|row| (row[0].as_str(), *row))
+        .collect();
 
     let mut out = format!("Semantic search: '{}'\n\n", query);
     for r in &results {
         if let Some(row) = row_map.get(r.symbol_id.as_str()) {
             let line = row.get(5).map(|s| s.as_str()).unwrap_or("?");
-            let doc = row.get(4).filter(|s| !s.is_empty())
+            let doc = row
+                .get(4)
+                .filter(|s| !s.is_empty())
                 .map(|s| format!("\n     {}", s.chars().take(120).collect::<String>()))
                 .unwrap_or_default();
             out.push_str(&format!(
@@ -2475,7 +2713,10 @@ fn tool_get_doc_context(args: &Value) -> Result<String> {
         .context(format!("symbol '{}' not found", symbol_id))?;
 
     let mut out = format!("=== {} {} ===\n", detail.kind, detail.name);
-    out.push_str(&format!("File:  {}:{}-{}\n", detail.file, detail.start_line, detail.end_line));
+    out.push_str(&format!(
+        "File:  {}:{}-{}\n",
+        detail.file, detail.start_line, detail.end_line
+    ));
 
     // Docstring
     let doc_rows = gq.raw_query(&format!(
@@ -2533,10 +2774,19 @@ fn tool_get_doc_context(args: &Value) -> Result<String> {
 
 fn tool_detect_clones(args: &Value) -> Result<String> {
     let prism = open_prism(args)?;
-    let threshold = args.get("threshold").and_then(|v| v.as_f64()).unwrap_or(0.92) as f32;
+    let threshold = args
+        .get("threshold")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.92) as f32;
     let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
-    let store_edges = args.get("store_edges").and_then(|v| v.as_bool()).unwrap_or(true);
-    let kinds_str = args.get("kinds").and_then(|v| v.as_str()).unwrap_or("Function,Method");
+    let store_edges = args
+        .get("store_edges")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let kinds_str = args
+        .get("kinds")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Function,Method");
     let kinds: Vec<&str> = kinds_str.split(',').map(str::trim).collect();
 
     let store = prism.store().context("not initialized")?;
@@ -2544,7 +2794,8 @@ fn tool_detect_clones(args: &Value) -> Result<String> {
     let gq = infigraph_core::graph::GraphQuery::new(&conn);
 
     // Fetch symbols to check
-    let kind_filter = kinds.iter()
+    let kind_filter = kinds
+        .iter()
         .map(|k| format!("s.kind = '{}'", k))
         .collect::<Vec<_>>()
         .join(" OR ");
@@ -2560,15 +2811,20 @@ fn tool_detect_clones(args: &Value) -> Result<String> {
     // Build embeddings
     let embedder = embed::best_embedder();
     let path = args.get("path").and_then(|p| p.as_str()).unwrap_or(".");
-    let emb_path = std::path::PathBuf::from(path).join(".infigraph").join("embeddings.bin");
+    let emb_path = std::path::PathBuf::from(path)
+        .join(".infigraph")
+        .join("embeddings.bin");
 
     let cached: std::collections::HashMap<String, Vec<f32>> = if emb_path.exists() {
-        infigraph_core::embed::load_embeddings_cached(&emb_path)?.into_iter().collect()
+        infigraph_core::embed::load_embeddings_cached(&emb_path)?
+            .into_iter()
+            .collect()
     } else {
         std::collections::HashMap::new()
     };
 
-    let symbol_vecs: Vec<(String, String, String, Vec<f32>)> = rows.iter()
+    let symbol_vecs: Vec<(String, String, String, Vec<f32>)> = rows
+        .iter()
         .map(|row| {
             let id = row[0].clone();
             let text = if row.get(4).is_some_and(|s| !s.is_empty()) {
@@ -2576,7 +2832,8 @@ fn tool_detect_clones(args: &Value) -> Result<String> {
             } else {
                 format!("{} {}", row[2], row[1])
             };
-            let emb = cached.get(&id)
+            let emb = cached
+                .get(&id)
                 .cloned()
                 .unwrap_or_else(|| embedder.embed(&text).unwrap_or_default());
             (id, row[1].clone(), row[3].clone(), emb)
@@ -2594,10 +2851,8 @@ fn tool_detect_clones(args: &Value) -> Result<String> {
             if symbol_vecs[i].2 == symbol_vecs[j].2 {
                 continue;
             }
-            let sim = infigraph_core::embed::cosine_similarity(
-                &symbol_vecs[i].3,
-                &symbol_vecs[j].3,
-            );
+            let sim =
+                infigraph_core::embed::cosine_similarity(&symbol_vecs[i].3, &symbol_vecs[j].3);
             if sim >= threshold {
                 pairs.push((sim, i, j));
             }
@@ -2624,14 +2879,19 @@ fn tool_detect_clones(args: &Value) -> Result<String> {
             let _ = write_conn.query(&format!(
                 "MATCH (a:Symbol), (b:Symbol) WHERE a.id = '{}' AND b.id = '{}' \
                  MERGE (a)-[r:SIMILAR_TO]->(b) SET r.score = {}",
-                escape(id_a), escape(id_b), score
+                escape(id_a),
+                escape(id_b),
+                score
             ));
         }
     }
 
     let mut out = format!(
         "Clone detection: {} pairs found (threshold={:.2}, symbols={}, kinds={})\n\n",
-        pairs.len(), threshold, n, kinds_str
+        pairs.len(),
+        threshold,
+        n,
+        kinds_str
     );
 
     for (score, i, j) in &pairs {
@@ -2653,15 +2913,23 @@ fn tool_refactor(args: &Value) -> Result<String> {
 
     let target = args.get("target").and_then(|v| v.as_str());
     let focus_str = args.get("focus").and_then(|v| v.as_str()).unwrap_or("all");
-    let focus = infigraph_core::refactor::Focus::from_str(focus_str);
+    let focus = infigraph_core::refactor::Focus::parse(focus_str);
     let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
 
     let path = args.get("path").and_then(|p| p.as_str()).unwrap_or(".");
-    let emb_path = std::path::PathBuf::from(path).join(".infigraph").join("embeddings.bin");
-    let emb_ref = if emb_path.exists() { Some(emb_path.as_path()) } else { None };
+    let emb_path = std::path::PathBuf::from(path)
+        .join(".infigraph")
+        .join("embeddings.bin");
+    let emb_ref = if emb_path.exists() {
+        Some(emb_path.as_path())
+    } else {
+        None
+    };
 
     let recs = infigraph_core::refactor::analyze(&conn, emb_ref, target, focus, limit)?;
-    Ok(infigraph_core::refactor::format_recommendations(&recs, target))
+    Ok(infigraph_core::refactor::format_recommendations(
+        &recs, target,
+    ))
 }
 
 fn tool_git_summary(args: &Value) -> Result<String> {
@@ -2755,7 +3023,10 @@ fn tool_git_summary(args: &Value) -> Result<String> {
         for (file, start, end) in &hunks {
             if let Ok(syms) = gq.symbols_in_range(file, *start, *end) {
                 for s in syms {
-                    touched.insert(format!("{} {} ({}:{})", s.kind, s.name, s.file, s.start_line));
+                    touched.insert(format!(
+                        "{} {} ({}:{})",
+                        s.kind, s.name, s.file, s.start_line
+                    ));
                 }
             }
         }
@@ -2778,7 +3049,10 @@ fn tool_git_summary(args: &Value) -> Result<String> {
         // Date: just the date part (drop time zone)
         let date_short = date.get(..10).unwrap_or(date);
 
-        out.push_str(&format!("━━ {} {} — {} — {}\n", short, date_short, author, subject));
+        out.push_str(&format!(
+            "━━ {} {} — {} — {}\n",
+            short, date_short, author, subject
+        ));
         out.push_str(&format!("   Files changed: {}\n", changed_files.len()));
         for f in &changed_files {
             out.push_str(&format!("     {}\n", f));
@@ -2812,7 +3086,8 @@ fn tool_list_files(args: &Value) -> Result<String> {
 
     let glob = args.get("glob").and_then(|g| g.as_str()).unwrap_or("");
 
-    let mut files: Vec<&str> = rows.iter()
+    let mut files: Vec<&str> = rows
+        .iter()
         .filter_map(|row| row.first().map(|s| s.as_str()))
         .filter(|f| glob.is_empty() || glob_matches(glob, f))
         .collect();
@@ -2835,7 +3110,10 @@ fn tool_generate_sequence_diagram(args: &Value) -> Result<String> {
 }
 
 fn escape_cypher(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('\'', "\\'").replace('\n', " ").replace('\r', "")
+    s.replace('\\', "\\\\")
+        .replace('\'', "\\'")
+        .replace('\n', " ")
+        .replace('\r', "")
 }
 
 fn save_analysis(path: &str, tool_name: &str, content: &str) -> Result<String> {
@@ -2860,7 +3138,14 @@ fn save_analysis(path: &str, tool_name: &str, content: &str) -> Result<String> {
 }
 
 fn log_activity(tool_name: &str, args: &Value) {
-    if matches!(tool_name, "get_latest_session" | "save_session" | "search_sessions" | "purge_sessions" | "list_projects") {
+    if matches!(
+        tool_name,
+        "get_latest_session"
+            | "save_session"
+            | "search_sessions"
+            | "purge_sessions"
+            | "list_projects"
+    ) {
         return;
     }
     let path = args.get("path").and_then(|p| p.as_str()).unwrap_or("");
@@ -2877,7 +3162,9 @@ fn log_activity(tool_name: &str, args: &Value) {
     let mut key_args = serde_json::Map::new();
     if let Some(obj) = args.as_object() {
         for (k, v) in obj {
-            if k == "path" { continue; }
+            if k == "path" {
+                continue;
+            }
             if let Some(s) = v.as_str() {
                 let truncated = if s.len() > 120 { &s[..120] } else { s };
                 key_args.insert(k.clone(), json!(truncated));
@@ -2887,7 +3174,11 @@ fn log_activity(tool_name: &str, args: &Value) {
     let entry = json!({"ts": ts, "tool": tool_name, "args": key_args});
     if let Ok(line) = serde_json::to_string(&entry) {
         use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+        {
             let _ = writeln!(f, "{line}");
         }
     }
@@ -2906,16 +3197,38 @@ fn session_date_id() -> String {
     let mut y = 1970i64;
     let mut remaining = days;
     loop {
-        let dy = if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) { 366 } else { 365 };
-        if remaining < dy { break; }
+        let dy = if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) {
+            366
+        } else {
+            365
+        };
+        if remaining < dy {
+            break;
+        }
         remaining -= dy;
         y += 1;
     }
     let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
-    let md = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let md = [
+        31,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
     let mut mo = 0usize;
     for (i, &d) in md.iter().enumerate() {
-        if remaining < d { mo = i; break; }
+        if remaining < d {
+            mo = i;
+            break;
+        }
         remaining -= d;
     }
     format!("session_{y:04}-{:02}-{:02}", mo + 1, remaining + 1)
@@ -2923,13 +3236,31 @@ fn session_date_id() -> String {
 
 fn tool_save_session(args: &Value) -> Result<String> {
     let ss = open_session_store(args)?;
-    let path = args.get("path").and_then(|p| p.as_str()).context("missing 'path'")?;
-    let summary = args.get("summary").and_then(|s| s.as_str()).context("missing 'summary'")?;
-    let pending_tasks = args.get("pending_tasks").and_then(|s| s.as_str()).unwrap_or("");
+    let path = args
+        .get("path")
+        .and_then(|p| p.as_str())
+        .context("missing 'path'")?;
+    let summary = args
+        .get("summary")
+        .and_then(|s| s.as_str())
+        .context("missing 'summary'")?;
+    let pending_tasks = args
+        .get("pending_tasks")
+        .and_then(|s| s.as_str())
+        .unwrap_or("");
     let decisions = args.get("decisions").and_then(|s| s.as_str()).unwrap_or("");
-    let files_touched = args.get("files_touched").and_then(|s| s.as_str()).unwrap_or("");
-    let constraints = args.get("constraints").and_then(|s| s.as_str()).unwrap_or("");
-    let assumptions = args.get("assumptions").and_then(|s| s.as_str()).unwrap_or("");
+    let files_touched = args
+        .get("files_touched")
+        .and_then(|s| s.as_str())
+        .unwrap_or("");
+    let constraints = args
+        .get("constraints")
+        .and_then(|s| s.as_str())
+        .unwrap_or("");
+    let assumptions = args
+        .get("assumptions")
+        .and_then(|s| s.as_str())
+        .unwrap_or("");
     let blockers = args.get("blockers").and_then(|s| s.as_str()).unwrap_or("");
     let narrative = args.get("narrative").and_then(|s| s.as_str()).unwrap_or("");
     let conn = ss.connection()?;
@@ -2937,12 +3268,18 @@ fn tool_save_session(args: &Value) -> Result<String> {
     let now = session_epoch();
     let session_id = session_date_id();
 
-    let new_files: Vec<&str> = files_touched.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+    let new_files: Vec<&str> = files_touched
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect();
 
-    let existing = ss.raw_query(&format!(
-        "MATCH (s:Session) WHERE s.id = '{}' RETURN s.decisions, s.files_touched",
-        escape_cypher(&session_id)
-    )).unwrap_or_default();
+    let existing = ss
+        .raw_query(&format!(
+            "MATCH (s:Session) WHERE s.id = '{}' RETURN s.decisions, s.files_touched",
+            escape_cypher(&session_id)
+        ))
+        .unwrap_or_default();
 
     if existing.is_empty() {
         let files_str = new_files.join(", ");
@@ -2969,7 +3306,8 @@ fn tool_save_session(args: &Value) -> Result<String> {
             format!("{prev_decisions} | {decisions}")
         };
 
-        let mut all_files: Vec<String> = prev_files.split(", ")
+        let mut all_files: Vec<String> = prev_files
+            .split(", ")
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
             .collect();
@@ -3014,7 +3352,8 @@ fn tool_save_session(args: &Value) -> Result<String> {
 
     // Generate embedding for full session text (includes narrative for semantic search)
     let emb_path = sessions_dir.join("embeddings.bin");
-    let embed_text = format!("{summary} {pending_tasks} {decisions} {constraints} {assumptions} {narrative}");
+    let embed_text =
+        format!("{summary} {pending_tasks} {decisions} {constraints} {assumptions} {narrative}");
     let embedder = embed::best_embedder();
     let vec = embedder.embed(&embed_text)?;
     let mut emb_store = embed::load_embeddings(&emb_path).unwrap_or_default();
@@ -3067,11 +3406,15 @@ fn tool_get_latest_session(args: &Value) -> Result<String> {
         }
         let constraints = get(7);
         if !constraints.is_empty() {
-            out.push_str(&format!("**Constraints (do not retry):** {constraints}\n\n"));
+            out.push_str(&format!(
+                "**Constraints (do not retry):** {constraints}\n\n"
+            ));
         }
         let assumptions = get(8);
         if !assumptions.is_empty() {
-            out.push_str(&format!("**Assumptions (do not break):** {assumptions}\n\n"));
+            out.push_str(&format!(
+                "**Assumptions (do not break):** {assumptions}\n\n"
+            ));
         }
         let blockers = get(9);
         if !blockers.is_empty() {
@@ -3079,9 +3422,15 @@ fn tool_get_latest_session(args: &Value) -> Result<String> {
         }
 
         let session_id = get(0);
-        let narrative_path = PathBuf::from(path).join(".infigraph").join("sessions").join(format!("{session_id}.md"));
+        let narrative_path = PathBuf::from(path)
+            .join(".infigraph")
+            .join("sessions")
+            .join(format!("{session_id}.md"));
         if narrative_path.exists() {
-            out.push_str(&format!("**Narrative log:** `{}` (read for full session context)\n\n", narrative_path.display()));
+            out.push_str(&format!(
+                "**Narrative log:** `{}` (read for full session context)\n\n",
+                narrative_path.display()
+            ));
         }
 
         if idx < rows.len() - 1 {
@@ -3091,20 +3440,35 @@ fn tool_get_latest_session(args: &Value) -> Result<String> {
 
     // Show recent activity log (breadcrumbs from tool calls)
     let today_date = session_date_id().replace("session_", "");
-    let activity_path = PathBuf::from(path).join(".infigraph").join("sessions").join(format!("activity_{today_date}.jsonl"));
+    let activity_path = PathBuf::from(path)
+        .join(".infigraph")
+        .join("sessions")
+        .join(format!("activity_{today_date}.jsonl"));
     if activity_path.exists() {
         if let Ok(content) = std::fs::read_to_string(&activity_path) {
             let lines: Vec<&str> = content.lines().collect();
             let total = lines.len();
-            let tail = if total > 20 { &lines[total-20..] } else { &lines[..] };
+            let tail = if total > 20 {
+                &lines[total - 20..]
+            } else {
+                &lines[..]
+            };
             if !tail.is_empty() {
-                out.push_str(&format!("## Activity Log (today, last {} of {} calls)\n\n", tail.len(), total));
+                out.push_str(&format!(
+                    "## Activity Log (today, last {} of {} calls)\n\n",
+                    tail.len(),
+                    total
+                ));
                 for line in tail {
                     if let Ok(entry) = serde_json::from_str::<Value>(line) {
                         let tool = entry.get("tool").and_then(|t| t.as_str()).unwrap_or("?");
                         let args_obj = entry.get("args").cloned().unwrap_or(json!({}));
                         let args_str = serde_json::to_string(&args_obj).unwrap_or_default();
-                        let preview = if args_str.len() > 80 { &args_str[..80] } else { &args_str };
+                        let preview = if args_str.len() > 80 {
+                            &args_str[..80]
+                        } else {
+                            &args_str
+                        };
                         out.push_str(&format!("- `{tool}` {preview}\n"));
                     }
                 }
@@ -3116,10 +3480,13 @@ fn tool_get_latest_session(args: &Value) -> Result<String> {
     // Check for old sessions and suggest purge
     let now = session_epoch();
     let cutoff_30d = now - (30 * 86400);
-    let old_count = ss.raw_query(&format!(
-        "MATCH (s:Session) WHERE s.created_at < {cutoff_30d} RETURN count(*)"
-    )).unwrap_or_default();
-    let old_n: u64 = old_count.first()
+    let old_count = ss
+        .raw_query(&format!(
+            "MATCH (s:Session) WHERE s.created_at < {cutoff_30d} RETURN count(*)"
+        ))
+        .unwrap_or_default();
+    let old_n: u64 = old_count
+        .first()
         .and_then(|r| r.first())
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
@@ -3132,32 +3499,47 @@ fn tool_get_latest_session(args: &Value) -> Result<String> {
 
 fn tool_purge_sessions(args: &Value) -> Result<String> {
     let ss = open_session_store(args)?;
-    let path = args.get("path").and_then(|p| p.as_str()).context("missing 'path'")?;
-    let older_than_days = args.get("older_than_days").and_then(|v| v.as_u64()).unwrap_or(30);
+    let path = args
+        .get("path")
+        .and_then(|p| p.as_str())
+        .context("missing 'path'")?;
+    let older_than_days = args
+        .get("older_than_days")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(30);
     let conn = ss.connection()?;
 
     let now = session_epoch();
     let cutoff = now - (older_than_days as i64 * 86400);
 
-    let to_purge = ss.raw_query(&format!(
-        "MATCH (s:Session) WHERE s.created_at < {cutoff} RETURN s.id, s.summary"
-    )).unwrap_or_default();
+    let to_purge = ss
+        .raw_query(&format!(
+            "MATCH (s:Session) WHERE s.created_at < {cutoff} RETURN s.id, s.summary"
+        ))
+        .unwrap_or_default();
 
     if to_purge.is_empty() {
-        return Ok(format!("No sessions older than {older_than_days} days found."));
+        return Ok(format!(
+            "No sessions older than {older_than_days} days found."
+        ));
     }
 
-    let purged_ids: Vec<String> = to_purge.iter()
+    let purged_ids: Vec<String> = to_purge
+        .iter()
         .filter_map(|r| r.first().map(|s| s.to_string()))
         .collect();
 
     conn.query(&format!(
         "MATCH (s:Session) WHERE s.created_at < {cutoff} DETACH DELETE s"
-    )).map_err(|e| anyhow::anyhow!("purge failed: {e}"))?;
+    ))
+    .map_err(|e| anyhow::anyhow!("purge failed: {e}"))?;
 
     // Clean embeddings
     let root = PathBuf::from(path);
-    let emb_path = root.join(".infigraph").join("sessions").join("embeddings.bin");
+    let emb_path = root
+        .join(".infigraph")
+        .join("sessions")
+        .join("embeddings.bin");
     if emb_path.exists() {
         let mut emb_store = embed::load_embeddings(&emb_path).unwrap_or_default();
         let before = emb_store.len();
@@ -3167,11 +3549,19 @@ fn tool_purge_sessions(args: &Value) -> Result<String> {
         }
     }
 
-    let mut out = format!("Purged {} session(s) older than {} days:\n", to_purge.len(), older_than_days);
+    let mut out = format!(
+        "Purged {} session(s) older than {} days:\n",
+        to_purge.len(),
+        older_than_days
+    );
     for row in &to_purge {
         let id = row.first().map(|s| s.as_str()).unwrap_or("");
         let summary = row.get(1).map(|s| s.as_str()).unwrap_or("");
-        let preview = if summary.len() > 60 { &summary[..60] } else { summary };
+        let preview = if summary.len() > 60 {
+            &summary[..60]
+        } else {
+            summary
+        };
         out.push_str(&format!("- {id}: {preview}\n"));
     }
     Ok(out)
@@ -3179,15 +3569,27 @@ fn tool_purge_sessions(args: &Value) -> Result<String> {
 
 fn tool_search_sessions(args: &Value) -> Result<String> {
     let ss = open_session_store(args)?;
-    let path = args.get("path").and_then(|p| p.as_str()).context("missing 'path'")?;
-    let query = args.get("query").and_then(|s| s.as_str()).context("missing 'query'")?;
+    let path = args
+        .get("path")
+        .and_then(|p| p.as_str())
+        .context("missing 'path'")?;
+    let query = args
+        .get("query")
+        .and_then(|s| s.as_str())
+        .context("missing 'query'")?;
     let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
 
     let root = PathBuf::from(path);
-    let emb_path = root.join(".infigraph").join("sessions").join("embeddings.bin");
+    let emb_path = root
+        .join(".infigraph")
+        .join("sessions")
+        .join("embeddings.bin");
 
     if !emb_path.exists() {
-        return Ok("No session embeddings found. Save at least one session with `save_session` first.".to_string());
+        return Ok(
+            "No session embeddings found. Save at least one session with `save_session` first."
+                .to_string(),
+        );
     }
 
     let emb_store = embed::load_embeddings(&emb_path)?;
@@ -3201,7 +3603,8 @@ fn tool_search_sessions(args: &Value) -> Result<String> {
         return Ok("Failed to embed query.".to_string());
     }
 
-    let mut scored: Vec<(f32, &str)> = emb_store.iter()
+    let mut scored: Vec<(f32, &str)> = emb_store
+        .iter()
         .map(|(id, vec)| (embed::cosine_similarity(&query_vec, vec), id.as_str()))
         .collect();
     scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
@@ -3235,9 +3638,15 @@ fn tool_search_sessions(args: &Value) -> Result<String> {
             if !files.is_empty() {
                 out.push_str(&format!("**Files Touched:** {files}\n\n"));
             }
-            let narrative_path = root.join(".infigraph").join("sessions").join(format!("{session_id}.md"));
+            let narrative_path = root
+                .join(".infigraph")
+                .join("sessions")
+                .join(format!("{session_id}.md"));
             if narrative_path.exists() {
-                out.push_str(&format!("**Narrative log:** `{}` (read for full context)\n\n", narrative_path.display()));
+                out.push_str(&format!(
+                    "**Narrative log:** `{}` (read for full context)\n\n",
+                    narrative_path.display()
+                ));
             }
             out.push_str("---\n\n");
         }
@@ -3250,7 +3659,7 @@ fn glob_matches(glob: &str, path: &str) -> bool {
     // Simple glob: * matches any sequence, ? matches one char
     let gi = glob.chars().peekable();
     let pi = path.chars().peekable();
-    glob_match_inner(&mut gi.collect::<Vec<_>>(), &mut pi.collect::<Vec<_>>())
+    glob_match_inner(&gi.collect::<Vec<_>>(), &pi.collect::<Vec<_>>())
 }
 
 fn glob_match_inner(glob: &[char], path: &[char]) -> bool {
@@ -3262,21 +3671,25 @@ fn glob_match_inner(glob: &[char], path: &[char]) -> bool {
             if greedy {
                 // try consuming 0..=n chars including /
                 for i in 0..=path.len() {
-                    if glob_match_inner(&glob[2..], &path[i..]) { return true; }
+                    if glob_match_inner(&glob[2..], &path[i..]) {
+                        return true;
+                    }
                 }
                 false
             } else {
                 for i in 0..=path.len() {
-                    if path.get(i) == Some(&'/') && i > 0 { break; }
-                    if glob_match_inner(&glob[1..], &path[i..]) { return true; }
+                    if path.get(i) == Some(&'/') && i > 0 {
+                        break;
+                    }
+                    if glob_match_inner(&glob[1..], &path[i..]) {
+                        return true;
+                    }
                 }
                 false
             }
         }
         (Some('?'), Some(_)) => glob_match_inner(&glob[1..], &path[1..]),
-        (Some(g), Some(p)) if g.to_ascii_lowercase() == p.to_ascii_lowercase() =>
-            glob_match_inner(&glob[1..], &path[1..]),
+        (Some(g), Some(p)) if g.eq_ignore_ascii_case(p) => glob_match_inner(&glob[1..], &path[1..]),
         _ => false,
     }
 }
-

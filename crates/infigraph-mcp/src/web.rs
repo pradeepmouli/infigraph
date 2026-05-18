@@ -39,7 +39,9 @@ pub fn start_ui_server(port: u16) -> bool {
                 ("POST", "/api/architecture") => handle_api_post(&mut request, api_architecture),
                 ("POST", "/api/dead-code") => handle_api_post(&mut request, api_dead_code),
                 ("POST", "/api/symbols") => handle_api_post(&mut request, api_symbols),
-                ("POST", "/api/symbol-context") => handle_api_post(&mut request, api_symbol_context),
+                ("POST", "/api/symbol-context") => {
+                    handle_api_post(&mut request, api_symbol_context)
+                }
                 ("POST", "/api/snippet") => handle_api_post(&mut request, api_snippet),
                 ("POST", "/api/graph-data") => handle_api_post(&mut request, api_graph_data),
                 ("POST", "/api/stats") => handle_api_post(&mut request, api_stats),
@@ -90,10 +92,7 @@ fn handle_api_post(
 }
 
 fn open_prism(params: &Value) -> Result<Infigraph> {
-    let path = params
-        .get("path")
-        .and_then(|p| p.as_str())
-        .unwrap_or(".");
+    let path = params.get("path").and_then(|p| p.as_str()).unwrap_or(".");
     let registry = bundled_registry()?;
     let mut prism = Infigraph::open(&PathBuf::from(path), registry)?;
     prism.init()?;
@@ -131,9 +130,9 @@ fn api_search(params: &Value) -> Value {
             };
             let gq = GraphQuery::new(&conn);
 
-            let rows = match gq.raw_query(
-                "MATCH (s:Symbol) RETURN s.id, s.name, s.kind, s.file, s.docstring",
-            ) {
+            let rows = match gq
+                .raw_query("MATCH (s:Symbol) RETURN s.id, s.name, s.kind, s.file, s.docstring")
+            {
                 Ok(r) => r,
                 Err(e) => return json!({"error": e.to_string()}),
             };
@@ -157,7 +156,8 @@ fn api_search(params: &Value) -> Value {
             let embs: Vec<(String, Vec<f32>)> = if emb_path.exists() {
                 match embed::load_embeddings_cached(&emb_path) {
                     Ok(e) => e,
-                    Err(_) => docs.iter()
+                    Err(_) => docs
+                        .iter()
                         .map(|(id, text)| (id.clone(), embedder.embed(text).unwrap_or_default()))
                         .collect(),
                 }
@@ -240,9 +240,17 @@ fn api_architecture(params: &Value) -> Value {
             };
             let gq = GraphQuery::new(&conn);
 
-            let langs = gq.raw_query("MATCH (m:Module) RETURN m.language, count(m)").unwrap_or_default();
-            let kinds = gq.raw_query("MATCH (s:Symbol) RETURN s.kind, count(s)").unwrap_or_default();
-            let hotspots = gq.raw_query("MATCH (s:Symbol) RETURN s.file, count(s) AS cnt ORDER BY cnt DESC LIMIT 10").unwrap_or_default();
+            let langs = gq
+                .raw_query("MATCH (m:Module) RETURN m.language, count(m)")
+                .unwrap_or_default();
+            let kinds = gq
+                .raw_query("MATCH (s:Symbol) RETURN s.kind, count(s)")
+                .unwrap_or_default();
+            let hotspots = gq
+                .raw_query(
+                    "MATCH (s:Symbol) RETURN s.file, count(s) AS cnt ORDER BY cnt DESC LIMIT 10",
+                )
+                .unwrap_or_default();
             let hubs = gq.raw_query("MATCH ()-[:CALLS]->(s:Symbol) RETURN s.name, s.file, count(*) AS calls ORDER BY calls DESC LIMIT 10").unwrap_or_default();
             let stats = prism.stats().ok();
 
@@ -321,7 +329,10 @@ fn api_symbols(params: &Value) -> Value {
 }
 
 fn api_symbol_context(params: &Value) -> Value {
-    let symbol_id = params.get("symbol_id").and_then(|s| s.as_str()).unwrap_or("");
+    let symbol_id = params
+        .get("symbol_id")
+        .and_then(|s| s.as_str())
+        .unwrap_or("");
 
     match open_prism(params) {
         Ok(prism) => {
@@ -353,7 +364,10 @@ fn api_symbol_context(params: &Value) -> Value {
 }
 
 fn api_snippet(params: &Value) -> Value {
-    let symbol_id = params.get("symbol_id").and_then(|s| s.as_str()).unwrap_or("");
+    let symbol_id = params
+        .get("symbol_id")
+        .and_then(|s| s.as_str())
+        .unwrap_or("");
 
     match open_prism(params) {
         Ok(prism) => {
@@ -483,10 +497,16 @@ fn api_chat(params: &Value) -> Value {
     if msg_lower.contains("dead code") || msg_lower.contains("unused") {
         return api_dead_code(params);
     }
-    if msg_lower.contains("architecture") || msg_lower.contains("overview") || msg_lower.contains("summary") {
+    if msg_lower.contains("architecture")
+        || msg_lower.contains("overview")
+        || msg_lower.contains("summary")
+    {
         return api_architecture(params);
     }
-    if msg_lower.contains("cluster") || msg_lower.contains("module") || msg_lower.contains("community") {
+    if msg_lower.contains("cluster")
+        || msg_lower.contains("module")
+        || msg_lower.contains("community")
+    {
         return api_cluster(params);
     }
     if msg_lower.contains("who calls") || msg_lower.contains("callers of") {
@@ -503,7 +523,8 @@ fn api_chat(params: &Value) -> Value {
             return api_search(&p);
         }
     }
-    if msg_lower.contains("stats") || msg_lower.contains("how many") || msg_lower.contains("count") {
+    if msg_lower.contains("stats") || msg_lower.contains("how many") || msg_lower.contains("count")
+    {
         return api_stats(params);
     }
 
@@ -529,12 +550,14 @@ fn api_routes(params: &Value) -> Value {
                 Ok(routes) => {
                     let items: Vec<Value> = routes
                         .iter()
-                        .map(|r| json!({
-                            "method": r.method,
-                            "path": r.path,
-                            "handler": r.handler_id,
-                            "file": r.file,
-                        }))
+                        .map(|r| {
+                            json!({
+                                "method": r.method,
+                                "path": r.path,
+                                "handler": r.handler_id,
+                                "file": r.file,
+                            })
+                        })
                         .collect();
                     json!({"routes": items, "count": items.len()})
                 }
@@ -610,25 +633,48 @@ fn api_contracts(params: &Value) -> Value {
 }
 
 fn api_complexity(params: &Value) -> Value {
-    let threshold = params.get("threshold").and_then(|v| v.as_u64()).unwrap_or(5) as i64;
+    let threshold = params
+        .get("threshold")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(5) as i64;
     match open_prism(params) {
         Ok(prism) => {
-            let store = match prism.store() { Some(s) => s, None => return json!({"error":"not initialized"}) };
-            let conn = match store.connection() { Ok(c) => c, Err(e) => return json!({"error":e.to_string()}) };
+            let store = match prism.store() {
+                Some(s) => s,
+                None => return json!({"error":"not initialized"}),
+            };
+            let conn = match store.connection() {
+                Ok(c) => c,
+                Err(e) => return json!({"error":e.to_string()}),
+            };
             let gq = GraphQuery::new(&conn);
             let rows = gq.raw_query(
                 "MATCH (s:Symbol) WHERE s.kind IN ['Function','Method','Test'] AND s.complexity IS NOT NULL RETURN s.id, s.name, s.kind, s.file, s.start_line, s.complexity ORDER BY s.complexity DESC"
             ).unwrap_or_default();
 
-            let items: Vec<Value> = rows.iter().map(|r| json!({
-                "id": r[0], "name": r[1], "kind": r[2], "file": r[3],
-                "line": r[4].parse::<u32>().unwrap_or(0),
-                "complexity": r[5].parse::<i64>().unwrap_or(1),
-            })).collect();
+            let items: Vec<Value> = rows
+                .iter()
+                .map(|r| {
+                    json!({
+                        "id": r[0], "name": r[1], "kind": r[2], "file": r[3],
+                        "line": r[4].parse::<u32>().unwrap_or(0),
+                        "complexity": r[5].parse::<i64>().unwrap_or(1),
+                    })
+                })
+                .collect();
 
-            let hotspots: Vec<&Value> = items.iter().filter(|v| v["complexity"].as_i64().unwrap_or(0) >= threshold).collect();
-            let avg = if items.is_empty() { 0.0 } else {
-                items.iter().map(|v| v["complexity"].as_f64().unwrap_or(1.0)).sum::<f64>() / items.len() as f64
+            let hotspots: Vec<&Value> = items
+                .iter()
+                .filter(|v| v["complexity"].as_i64().unwrap_or(0) >= threshold)
+                .collect();
+            let avg = if items.is_empty() {
+                0.0
+            } else {
+                items
+                    .iter()
+                    .map(|v| v["complexity"].as_f64().unwrap_or(1.0))
+                    .sum::<f64>()
+                    / items.len() as f64
             };
             json!({"symbols": items, "hotspots": hotspots, "avg": avg, "threshold": threshold})
         }
@@ -638,94 +684,132 @@ fn api_complexity(params: &Value) -> Value {
 
 fn api_security(params: &Value) -> Value {
     match open_prism(params) {
-        Ok(prism) => {
-            match infigraph_core::security::scan_project(prism.root()) {
-                Ok(stats) => {
-                    let findings: Vec<Value> = stats.findings.iter().map(|f| json!({
-                        "file": f.file, "line": f.line, "col": f.col,
-                        "severity": f.severity.to_string(),
-                        "category": f.category.to_string(),
-                        "rule_id": f.rule_id,
-                        "message": f.message,
-                        "snippet": f.snippet,
-                    })).collect();
-                    json!({
-                        "findings": findings,
-                        "total": findings.len(),
-                        "critical": stats.critical_count(),
-                        "high": stats.high_count(),
-                        "medium": stats.medium_count(),
-                        "low": stats.low_count(),
+        Ok(prism) => match infigraph_core::security::scan_project(prism.root()) {
+            Ok(stats) => {
+                let findings: Vec<Value> = stats
+                    .findings
+                    .iter()
+                    .map(|f| {
+                        json!({
+                            "file": f.file, "line": f.line, "col": f.col,
+                            "severity": f.severity.to_string(),
+                            "category": f.category.to_string(),
+                            "rule_id": f.rule_id,
+                            "message": f.message,
+                            "snippet": f.snippet,
+                        })
                     })
-                }
-                Err(e) => json!({"error": e.to_string()}),
+                    .collect();
+                json!({
+                    "findings": findings,
+                    "total": findings.len(),
+                    "critical": stats.critical_count(),
+                    "high": stats.high_count(),
+                    "medium": stats.medium_count(),
+                    "low": stats.low_count(),
+                })
             }
-        }
+            Err(e) => json!({"error": e.to_string()}),
+        },
         Err(e) => json!({"error": e.to_string()}),
     }
 }
 
 fn api_bridges(params: &Value) -> Value {
     match open_prism(params) {
-        Ok(prism) => {
-            match infigraph_core::bridges::detect_bridges(prism.root()) {
-                Ok(result) => {
-                    let items: Vec<Value> = result.bridges.iter().map(|b| json!({
-                        "file": b.file, "line": b.line,
-                        "kind": b.kind.as_str(),
-                        "foreign_symbol": b.foreign_symbol,
-                        "source_language": b.source_language,
-                        "target_language": b.target_language,
-                        "detail": b.detail,
-                    })).collect();
-                    json!({"bridges": items, "total": items.len()})
-                }
-                Err(e) => json!({"error": e.to_string()}),
+        Ok(prism) => match infigraph_core::bridges::detect_bridges(prism.root()) {
+            Ok(result) => {
+                let items: Vec<Value> = result
+                    .bridges
+                    .iter()
+                    .map(|b| {
+                        json!({
+                            "file": b.file, "line": b.line,
+                            "kind": b.kind.as_str(),
+                            "foreign_symbol": b.foreign_symbol,
+                            "source_language": b.source_language,
+                            "target_language": b.target_language,
+                            "detail": b.detail,
+                        })
+                    })
+                    .collect();
+                json!({"bridges": items, "total": items.len()})
             }
-        }
+            Err(e) => json!({"error": e.to_string()}),
+        },
         Err(e) => json!({"error": e.to_string()}),
     }
 }
 
 fn api_clones(params: &Value) -> Value {
-    let threshold = params.get("threshold").and_then(|v| v.as_f64()).unwrap_or(0.92) as f32;
+    let threshold = params
+        .get("threshold")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.92) as f32;
     match open_prism(params) {
         Ok(prism) => {
-            let store = match prism.store() { Some(s) => s, None => return json!({"error":"not initialized"}) };
-            let conn = match store.connection() { Ok(c) => c, Err(e) => return json!({"error":e.to_string()}) };
+            let store = match prism.store() {
+                Some(s) => s,
+                None => return json!({"error":"not initialized"}),
+            };
+            let conn = match store.connection() {
+                Ok(c) => c,
+                Err(e) => return json!({"error":e.to_string()}),
+            };
             let gq = GraphQuery::new(&conn);
 
             let rows = gq.raw_query(
                 "MATCH (s:Symbol) WHERE s.kind IN ['Function','Method'] RETURN s.id, s.name, s.kind, s.file, s.docstring"
             ).unwrap_or_default();
 
-            if rows.len() < 2 { return json!({"pairs": [], "total": 0}); }
+            if rows.len() < 2 {
+                return json!({"pairs": [], "total": 0});
+            }
 
             let embedder = embed::best_embedder();
-            let docs: Vec<(String, String)> = rows.iter().map(|row| {
-                let id = row[0].clone();
-                let text = if row.get(4).is_some_and(|s| !s.is_empty()) {
-                    format!("{} {}: {}", row[2], row[1], row[4])
-                } else { format!("{} {}", row[2], row[1]) };
-                (id, text)
-            }).collect();
+            let docs: Vec<(String, String)> = rows
+                .iter()
+                .map(|row| {
+                    let id = row[0].clone();
+                    let text = if row.get(4).is_some_and(|s| !s.is_empty()) {
+                        format!("{} {}: {}", row[2], row[1], row[4])
+                    } else {
+                        format!("{} {}", row[2], row[1])
+                    };
+                    (id, text)
+                })
+                .collect();
 
             let emb_path = prism.root().join(".infigraph").join("embeddings.bin");
-            let cached: std::collections::HashMap<String,Vec<f32>> = if emb_path.exists() {
-                infigraph_core::embed::load_embeddings_cached(&emb_path).unwrap_or_default().into_iter().collect()
-            } else { std::collections::HashMap::new() };
+            let cached: std::collections::HashMap<String, Vec<f32>> = if emb_path.exists() {
+                infigraph_core::embed::load_embeddings_cached(&emb_path)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect()
+            } else {
+                std::collections::HashMap::new()
+            };
 
-            let vecs: Vec<(String,String,String,Vec<f32>)> = docs.iter().map(|(id,text)| {
-                let emb = cached.get(id).cloned().unwrap_or_else(|| embedder.embed(text).unwrap_or_default());
-                let row = rows.iter().find(|r| &r[0]==id).unwrap();
-                (id.clone(), row[1].clone(), row[3].clone(), emb)
-            }).filter(|(_,_,_,e)| !e.is_empty()).collect();
+            let vecs: Vec<(String, String, String, Vec<f32>)> = docs
+                .iter()
+                .map(|(id, text)| {
+                    let emb = cached
+                        .get(id)
+                        .cloned()
+                        .unwrap_or_else(|| embedder.embed(text).unwrap_or_default());
+                    let row = rows.iter().find(|r| &r[0] == id).unwrap();
+                    (id.clone(), row[1].clone(), row[3].clone(), emb)
+                })
+                .filter(|(_, _, _, e)| !e.is_empty())
+                .collect();
 
             let n = vecs.len();
             let mut pairs: Vec<Value> = Vec::new();
             for i in 0..n {
-                for j in (i+1)..n {
-                    if vecs[i].2 == vecs[j].2 { continue; }
+                for j in (i + 1)..n {
+                    if vecs[i].2 == vecs[j].2 {
+                        continue;
+                    }
                     let sim = infigraph_core::embed::cosine_similarity(&vecs[i].3, &vecs[j].3);
                     if sim >= threshold {
                         pairs.push(json!({
@@ -736,7 +820,13 @@ fn api_clones(params: &Value) -> Value {
                     }
                 }
             }
-            pairs.sort_by(|a,b| b["score"].as_f64().unwrap_or(0.0).partial_cmp(&a["score"].as_f64().unwrap_or(0.0)).unwrap_or(std::cmp::Ordering::Equal));
+            pairs.sort_by(|a, b| {
+                b["score"]
+                    .as_f64()
+                    .unwrap_or(0.0)
+                    .partial_cmp(&a["score"].as_f64().unwrap_or(0.0))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
             pairs.truncate(50);
             json!({"pairs": pairs, "total": pairs.len(), "checked": n})
         }
@@ -745,18 +835,28 @@ fn api_clones(params: &Value) -> Value {
 }
 
 fn api_git_summary(params: &Value) -> Value {
-    let n = params.get("n_commits").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
+    let n = params
+        .get("n_commits")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(10) as usize;
     match open_prism(params) {
         Ok(prism) => {
             let root = prism.root().to_path_buf();
-            let store = match prism.store() { Some(s) => s, None => return json!({"error":"not initialized"}) };
-            let conn = match store.connection() { Ok(c) => c, Err(e) => return json!({"error":e.to_string()}) };
+            let store = match prism.store() {
+                Some(s) => s,
+                None => return json!({"error":"not initialized"}),
+            };
+            let conn = match store.connection() {
+                Ok(c) => c,
+                Err(e) => return json!({"error":e.to_string()}),
+            };
             let gq = GraphQuery::new(&conn);
 
             let n_arg = format!("-{}", n);
             let log_out = std::process::Command::new("git")
                 .args(["log", "--format=%H\x1f%an\x1f%ai\x1f%s", &n_arg])
-                .current_dir(&root).output();
+                .current_dir(&root)
+                .output();
 
             let log_text = match log_out {
                 Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
@@ -766,7 +866,9 @@ fn api_git_summary(params: &Value) -> Value {
             let mut commits: Vec<Value> = Vec::new();
             for line in log_text.lines() {
                 let parts: Vec<&str> = line.splitn(4, '\x1f').collect();
-                if parts.len() < 4 { continue; }
+                if parts.len() < 4 {
+                    continue;
+                }
                 let hash = parts[0];
                 let author = parts[1];
                 let date = &parts[2][..10.min(parts[2].len())];
@@ -776,7 +878,8 @@ fn api_git_summary(params: &Value) -> Value {
                 let parent_ref = format!("{}^", hash);
                 let diff_out = std::process::Command::new("git")
                     .args(["diff", "--unified=0", &parent_ref, hash])
-                    .current_dir(&root).output();
+                    .current_dir(&root)
+                    .output();
 
                 let hunks = match diff_out {
                     Ok(o) if o.status.success() => {
@@ -801,9 +904,14 @@ fn api_git_summary(params: &Value) -> Value {
                 let files_ref = format!("{}^", hash);
                 let files_out = std::process::Command::new("git")
                     .args(["diff", "--name-only", &files_ref, hash])
-                    .current_dir(&root).output();
+                    .current_dir(&root)
+                    .output();
                 let changed_files: Vec<String> = match files_out {
-                    Ok(o) => String::from_utf8_lossy(&o.stdout).lines().filter(|l|!l.is_empty()).map(String::from).collect(),
+                    Ok(o) => String::from_utf8_lossy(&o.stdout)
+                        .lines()
+                        .filter(|l| !l.is_empty())
+                        .map(String::from)
+                        .collect(),
                     _ => vec![],
                 };
 
@@ -822,15 +930,17 @@ fn parse_web_diff_hunks(diff: &str) -> Vec<(String, u32, u32)> {
     let mut hunks = Vec::new();
     let mut current_file = String::new();
     for line in diff.lines() {
-        if line.starts_with("+++ b/") {
-            current_file = line[6..].to_string();
+        if let Some(stripped) = line.strip_prefix("+++ b/") {
+            current_file = stripped.to_string();
         } else if line.starts_with("@@ ") {
             // @@ -old +new,count @@
             if let Some(plus_part) = line.split('+').nth(1) {
                 let range = plus_part.split(' ').next().unwrap_or("");
                 let (start_str, count_str) = if let Some(comma) = range.find(',') {
-                    (&range[..comma], &range[comma+1..])
-                } else { (range, "1") };
+                    (&range[..comma], &range[comma + 1..])
+                } else {
+                    (range, "1")
+                };
                 let start: u32 = start_str.parse().unwrap_or(1);
                 let count: u32 = count_str.parse().unwrap_or(1);
                 if !current_file.is_empty() {

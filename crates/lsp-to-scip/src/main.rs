@@ -19,10 +19,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
-use scip::types::{
-    Document, Index, Occurrence, SymbolInformation, SymbolRole,
-    symbol_information,
-};
+use scip::types::{symbol_information, Document, Index, Occurrence, SymbolInformation, SymbolRole};
 
 mod lsp_types;
 use lsp_types::*;
@@ -63,17 +60,27 @@ fn main() -> Result<()> {
 
     let extensions = lang_extensions(&cli.lang);
     if extensions.is_empty() {
-        bail!("unknown language '{}'. Use --lang with a known language code.", cli.lang);
+        bail!(
+            "unknown language '{}'. Use --lang with a known language code.",
+            cli.lang
+        );
     }
 
     eprintln!("[lsp-to-scip] lang={} root={}", cli.lang, root.display());
-    eprintln!("[lsp-to-scip] collecting files with extensions: {:?}", extensions);
+    eprintln!(
+        "[lsp-to-scip] collecting files with extensions: {:?}",
+        extensions
+    );
 
     let files = collect_files(&root, &extensions, cli.max_files);
     eprintln!("[lsp-to-scip] found {} files", files.len());
 
     if files.is_empty() {
-        bail!("no source files found for lang={} in {}", cli.lang, root.display());
+        bail!(
+            "no source files found for lang={} in {}",
+            cli.lang,
+            root.display()
+        );
     }
 
     // Parse server command
@@ -97,7 +104,10 @@ fn main() -> Result<()> {
     let root_uri = path_to_uri(&root);
     let init_result = conn.initialize(&root_uri, &cli.lang)?;
     if cli.verbose {
-        eprintln!("[lsp-to-scip] initialized: {}", serde_json::to_string(&init_result)?);
+        eprintln!(
+            "[lsp-to-scip] initialized: {}",
+            serde_json::to_string(&init_result)?
+        );
     }
     conn.initialized()?;
 
@@ -132,8 +142,12 @@ fn main() -> Result<()> {
             let mut occ = Occurrence::new();
             occ.symbol = scip_sym.clone();
             occ.symbol_roles = SymbolRole::Definition as i32;
-            occ.range = vec![sym.range.start.line as i32, sym.range.start.character as i32,
-                             sym.range.end.line as i32, sym.range.end.character as i32];
+            occ.range = vec![
+                sym.range.start.line as i32,
+                sym.range.start.character as i32,
+                sym.range.end.line as i32,
+                sym.range.end.character as i32,
+            ];
             doc.occurrences.push(occ);
 
             let mut si = SymbolInformation::new();
@@ -150,11 +164,13 @@ fn main() -> Result<()> {
         // Skip for now on large files (>500 symbols) to avoid hanging
         if syms.len() < 500 {
             for sym in &syms {
-                let refs = conn.find_references(
-                    &uri,
-                    sym.selection_range.start.line,
-                    sym.selection_range.start.character,
-                ).unwrap_or_default();
+                let refs = conn
+                    .find_references(
+                        &uri,
+                        sym.selection_range.start.line,
+                        sym.selection_range.start.character,
+                    )
+                    .unwrap_or_default();
 
                 let src_scip_sym = symbol_string(&rel_str, &sym.name, &sym.kind);
                 for ref_loc in refs {
@@ -164,8 +180,12 @@ fn main() -> Result<()> {
                         let mut occ = Occurrence::new();
                         occ.symbol = src_scip_sym.clone();
                         occ.symbol_roles = 0; // reference
-                        occ.range = vec![ref_loc.range.start.line as i32, ref_loc.range.start.character as i32,
-                                         ref_loc.range.end.line as i32, ref_loc.range.end.character as i32];
+                        occ.range = vec![
+                            ref_loc.range.start.line as i32,
+                            ref_loc.range.start.character as i32,
+                            ref_loc.range.end.line as i32,
+                            ref_loc.range.end.character as i32,
+                        ];
                         doc.occurrences.push(occ);
                     }
                     // Cross-file references are handled when processing the referencing file
@@ -264,19 +284,22 @@ impl LspConnection {
     }
 
     fn initialize(&mut self, root_uri: &str, _lang: &str) -> Result<serde_json::Value> {
-        let resp = self.request("initialize", serde_json::json!({
-            "processId": std::process::id(),
-            "rootUri": root_uri,
-            "capabilities": {
-                "textDocument": {
-                    "documentSymbol": {
-                        "hierarchicalDocumentSymbolSupport": false
-                    },
-                    "references": {}
-                }
-            },
-            "initializationOptions": {}
-        }))?;
+        let resp = self.request(
+            "initialize",
+            serde_json::json!({
+                "processId": std::process::id(),
+                "rootUri": root_uri,
+                "capabilities": {
+                    "textDocument": {
+                        "documentSymbol": {
+                            "hierarchicalDocumentSymbolSupport": false
+                        },
+                        "references": {}
+                    }
+                },
+                "initializationOptions": {}
+            }),
+        )?;
         Ok(resp["result"].clone())
     }
 
@@ -285,20 +308,26 @@ impl LspConnection {
     }
 
     fn did_open(&mut self, uri: &str, lang: &str, text: &str) -> Result<()> {
-        self.notify("textDocument/didOpen", serde_json::json!({
-            "textDocument": {
-                "uri": uri,
-                "languageId": lang,
-                "version": 1,
-                "text": text
-            }
-        }))
+        self.notify(
+            "textDocument/didOpen",
+            serde_json::json!({
+                "textDocument": {
+                    "uri": uri,
+                    "languageId": lang,
+                    "version": 1,
+                    "text": text
+                }
+            }),
+        )
     }
 
     fn document_symbols(&mut self, uri: &str) -> Result<Vec<LspSymbol>> {
-        let resp = self.request("textDocument/documentSymbol", serde_json::json!({
-            "textDocument": { "uri": uri }
-        }))?;
+        let resp = self.request(
+            "textDocument/documentSymbol",
+            serde_json::json!({
+                "textDocument": { "uri": uri }
+            }),
+        )?;
 
         let result = &resp["result"];
         if result.is_null() {
@@ -307,21 +336,27 @@ impl LspConnection {
 
         // Handle both SymbolInformation[] and DocumentSymbol[]
         let syms: Vec<LspSymbol> = if let Some(arr) = result.as_array() {
-            arr.iter()
-                .filter_map(parse_symbol)
-                .collect()
+            arr.iter().filter_map(parse_symbol).collect()
         } else {
             vec![]
         };
         Ok(syms)
     }
 
-    fn find_references(&mut self, uri: &str, line: u32, character: u32) -> Result<Vec<LspLocation>> {
-        let resp = self.request("textDocument/references", serde_json::json!({
-            "textDocument": { "uri": uri },
-            "position": { "line": line, "character": character },
-            "context": { "includeDeclaration": false }
-        }))?;
+    fn find_references(
+        &mut self,
+        uri: &str,
+        line: u32,
+        character: u32,
+    ) -> Result<Vec<LspLocation>> {
+        let resp = self.request(
+            "textDocument/references",
+            serde_json::json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": line, "character": character },
+                "context": { "includeDeclaration": false }
+            }),
+        )?;
 
         let result = &resp["result"];
         if result.is_null() {
@@ -368,9 +403,22 @@ fn collect_files(root: &Path, extensions: &[&str], max: usize) -> Vec<PathBuf> {
 }
 
 fn collect_files_rec(dir: &Path, extensions: &[&str], files: &mut Vec<PathBuf>) {
-    let ignore = [".git", "node_modules", "target", "build", "dist", ".infigraph",
-                  "__pycache__", ".venv", "venv", "_build", "deps"];
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let ignore = [
+        ".git",
+        "node_modules",
+        "target",
+        "build",
+        "dist",
+        ".infigraph",
+        "__pycache__",
+        ".venv",
+        "venv",
+        "_build",
+        "deps",
+    ];
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
     for entry in entries.flatten() {
         let path = entry.path();
         let name = entry.file_name();
@@ -449,7 +497,10 @@ fn parse_symbol(v: &serde_json::Value) -> Option<LspSymbol> {
     // SymbolInformation has location.range
     let (range, sel_range) = if let Some(r) = v.get("range") {
         let range = parse_range(r)?;
-        let sel = v.get("selectionRange").and_then(parse_range).unwrap_or(range.clone());
+        let sel = v
+            .get("selectionRange")
+            .and_then(parse_range)
+            .unwrap_or(range.clone());
         (range, sel)
     } else if let Some(loc) = v.get("location") {
         let range = parse_range(&loc["range"])?;
@@ -458,7 +509,13 @@ fn parse_symbol(v: &serde_json::Value) -> Option<LspSymbol> {
         return None;
     };
 
-    Some(LspSymbol { name, kind, detail, range, selection_range: sel_range })
+    Some(LspSymbol {
+        name,
+        kind,
+        detail,
+        range,
+        selection_range: sel_range,
+    })
 }
 
 fn parse_range(v: &serde_json::Value) -> Option<LspRange> {
@@ -476,12 +533,32 @@ fn parse_range(v: &serde_json::Value) -> Option<LspRange> {
 
 fn lsp_kind_num_to_str(n: u32) -> &'static str {
     match n {
-        1 => "File", 2 => "Module", 3 => "Namespace", 4 => "Package",
-        5 => "Class", 6 => "Method", 7 => "Property", 8 => "Field",
-        9 => "Constructor", 10 => "Enum", 11 => "Interface", 12 => "Function",
-        13 => "Variable", 14 => "Constant", 15 => "String", 16 => "Number",
-        17 => "Boolean", 18 => "Array", 19 => "Object", 20 => "Key",
-        21 => "Null", 22 => "EnumMember", 23 => "Struct", 24 => "Event",
-        25 => "Operator", 26 => "TypeParameter", _ => "Unknown",
+        1 => "File",
+        2 => "Module",
+        3 => "Namespace",
+        4 => "Package",
+        5 => "Class",
+        6 => "Method",
+        7 => "Property",
+        8 => "Field",
+        9 => "Constructor",
+        10 => "Enum",
+        11 => "Interface",
+        12 => "Function",
+        13 => "Variable",
+        14 => "Constant",
+        15 => "String",
+        16 => "Number",
+        17 => "Boolean",
+        18 => "Array",
+        19 => "Object",
+        20 => "Key",
+        21 => "Null",
+        22 => "EnumMember",
+        23 => "Struct",
+        24 => "Event",
+        25 => "Operator",
+        26 => "TypeParameter",
+        _ => "Unknown",
     }
 }

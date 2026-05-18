@@ -13,7 +13,11 @@ pub fn resolve_calls_incremental(
     extractions: &[FileExtraction],
 ) -> Result<ResolveStats> {
     if extractions.is_empty() {
-        return Ok(ResolveStats { total_calls: 0, resolved: 0, unresolved: 0 });
+        return Ok(ResolveStats {
+            total_calls: 0,
+            resolved: 0,
+            unresolved: 0,
+        });
     }
 
     let conn = store.connection()?;
@@ -37,20 +41,18 @@ pub fn resolve_calls_incremental(
 /// 2. For each CALLS relation where the target doesn't exist locally,
 ///    searches the global symbol table by name
 /// 3. Creates the resolved CALLS edge in the graph
-pub fn resolve_calls(
-    store: &GraphStore,
-    extractions: &[FileExtraction],
-) -> Result<ResolveStats> {
+pub fn resolve_calls(store: &GraphStore, extractions: &[FileExtraction]) -> Result<ResolveStats> {
     let conn = store.connection()?;
 
     // Build global symbol table: name -> list of (id, file, kind)
     let mut symbol_map: HashMap<String, Vec<(String, String, String)>> = HashMap::new();
     for ext in extractions {
         for sym in &ext.symbols {
-            symbol_map
-                .entry(sym.name.clone())
-                .or_default()
-                .push((sym.id.clone(), ext.file.clone(), sym.kind.as_str().to_string()));
+            symbol_map.entry(sym.name.clone()).or_default().push((
+                sym.id.clone(),
+                ext.file.clone(),
+                sym.kind.as_str().to_string(),
+            ));
         }
     }
 
@@ -74,11 +76,14 @@ fn resolve_with_map(
             .map(|s| (s.name.as_str(), s.id.as_str()))
             .collect();
 
-        let imported_stems: std::collections::HashSet<String> = ext.relations.iter()
+        let imported_stems: std::collections::HashSet<String> = ext
+            .relations
+            .iter()
             .filter(|r| r.kind == RelationKind::Imports)
             .map(|r| {
-                let raw = r.target_id
-                    .rsplit(|c| c == '/' || c == '\\' || c == '.')
+                let raw = r
+                    .target_id
+                    .rsplit(['/', '\\', '.'])
                     .next()
                     .unwrap_or(&r.target_id);
                 raw.to_lowercase()
@@ -92,11 +97,7 @@ fn resolve_with_map(
                 continue;
             }
 
-            let target_name = rel
-                .target_id
-                .rsplit("::")
-                .next()
-                .unwrap_or(&rel.target_id);
+            let target_name = rel.target_id.rsplit("::").next().unwrap_or(&rel.target_id);
 
             if local_symbols.contains_key(target_name) {
                 continue;
@@ -125,7 +126,8 @@ fn resolve_with_map(
                     Some(cross_file[0].0.clone())
                 } else if cross_file.len() > 1 {
                     let in_scope: Vec<_> = if !imported_stems.is_empty() {
-                        cross_file.iter()
+                        cross_file
+                            .iter()
                             .filter(|(_, f, _)| {
                                 let stem = std::path::Path::new(f)
                                     .file_stem()
@@ -142,7 +144,8 @@ fn resolve_with_map(
                         Some(in_scope[0].0.clone())
                     } else if source_is_sql {
                         // SQL tables are project-global — pick first Class candidate
-                        cross_file.iter()
+                        cross_file
+                            .iter()
                             .find(|(_, _, k)| k == "Class")
                             .map(|(id, _, _)| id.clone())
                     } else {
@@ -166,7 +169,6 @@ fn resolve_with_map(
 
     // Batch insert resolved CALLS edges via COPY FROM parquet
     if !resolved_pairs.is_empty() {
-
         // Build set of known symbol IDs to filter out dangling references.
         // Includes all symbols from the global map plus all from current extractions
         // (source_ids may reference symbols not yet in symbol_map during incremental).
@@ -181,10 +183,15 @@ fn resolve_with_map(
         }
         let valid_pairs: Vec<&(String, String)> = resolved_pairs
             .iter()
-            .filter(|(src, tgt)| known_ids.contains(src.as_str()) && known_ids.contains(tgt.as_str()))
+            .filter(|(src, tgt)| {
+                known_ids.contains(src.as_str()) && known_ids.contains(tgt.as_str())
+            })
             .collect();
 
-        let refs: Vec<(&str, &str)> = valid_pairs.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+        let refs: Vec<(&str, &str)> = valid_pairs
+            .iter()
+            .map(|(a, b)| (a.as_str(), b.as_str()))
+            .collect();
         let pq_path = std::env::temp_dir().join("infigraph_resolve_calls.parquet");
         crate::graph::parquet_loader::write_edge_parquet(&pq_path, &refs)?;
         let copy_result = conn.query(&format!(
@@ -195,9 +202,10 @@ fn resolve_with_map(
             eprintln!("[resolve] COPY FROM parquet failed ({e}), falling back to UNWIND");
             const CHUNK_SIZE: usize = 500;
             for chunk in refs.chunks(CHUNK_SIZE) {
-                let pair_list: Vec<String> = chunk.iter().map(|(a, b)| {
-                    format!("{{a: '{}', b: '{}'}}", escape(a), escape(b))
-                }).collect();
+                let pair_list: Vec<String> = chunk
+                    .iter()
+                    .map(|(a, b)| format!("{{a: '{}', b: '{}'}}", escape(a), escape(b)))
+                    .collect();
                 let _ = conn.query(&format!(
                     "UNWIND [{}] AS p MATCH (a:Symbol), (b:Symbol) WHERE a.id = p.a AND b.id = p.b CREATE (a)-[:CALLS]->(b)",
                     pair_list.join(", ")

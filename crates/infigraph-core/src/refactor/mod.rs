@@ -109,7 +109,7 @@ pub enum Focus {
 }
 
 impl Focus {
-    pub fn from_str(s: &str) -> Self {
+    pub fn parse(s: &str) -> Self {
         match s.to_lowercase().as_str() {
             "complexity" => Self::Complexity,
             "duplication" | "clones" => Self::Duplication,
@@ -168,7 +168,7 @@ pub fn analyze(
         analyze_dead_code(&gq, &symbols, &mut recommendations)?;
     }
 
-    recommendations.sort_by(|a, b| b.priority().cmp(&a.priority()));
+    recommendations.sort_by_key(|r| std::cmp::Reverse(r.priority()));
     recommendations.truncate(limit);
 
     Ok(recommendations)
@@ -246,7 +246,7 @@ fn analyze_complexity(symbols: &[SymbolInfo], recs: &mut Vec<Recommendation>) {
         })
         .collect();
 
-    hotspots.sort_by(|a, b| b.complexity.cmp(&a.complexity));
+    hotspots.sort_by_key(|s| std::cmp::Reverse(s.complexity));
 
     for sym in hotspots.iter().take(10) {
         let loc = sym.end_line.saturating_sub(sym.start_line);
@@ -368,9 +368,7 @@ fn analyze_duplication(
 
     let cached: HashMap<String, Vec<f32>> = if let Some(path) = embeddings_path {
         if path.exists() {
-            embed::load_embeddings_cached(path)?
-                .into_iter()
-                .collect()
+            embed::load_embeddings_cached(path)?.into_iter().collect()
         } else {
             HashMap::new()
         }
@@ -443,7 +441,8 @@ fn analyze_dead_code(
     )?;
 
     let entry_points = ["main", "__init__", "setUp", "tearDown", "setup", "teardown"];
-    let target_files: HashMap<&str, bool> = symbols.iter().map(|s| (s.file.as_str(), true)).collect();
+    let target_files: HashMap<&str, bool> =
+        symbols.iter().map(|s| (s.file.as_str(), true)).collect();
 
     let dead: Vec<&Vec<String>> = rows
         .iter()
@@ -461,7 +460,10 @@ fn analyze_dead_code(
 
     let mut by_file: HashMap<&str, Vec<&str>> = HashMap::new();
     for row in &dead {
-        by_file.entry(row[2].as_str()).or_default().push(row[1].as_str());
+        by_file
+            .entry(row[2].as_str())
+            .or_default()
+            .push(row[1].as_str());
     }
 
     for (file, names) in &by_file {
@@ -484,7 +486,8 @@ fn analyze_dead_code(
                     target: format!("{} ({})", name, file),
                     impact: Impact::Low,
                     effort: Effort::Low,
-                    rationale: "Zero callers. Safe to remove (verify no dynamic dispatch).".to_string(),
+                    rationale: "Zero callers. Safe to remove (verify no dynamic dispatch)."
+                        .to_string(),
                 });
             }
         }

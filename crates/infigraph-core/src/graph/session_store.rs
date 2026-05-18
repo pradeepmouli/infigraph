@@ -1,9 +1,8 @@
-use std::path::Path;
 use anyhow::Result;
 use kuzu::{Connection, Database, SystemConfig};
+use std::path::Path;
 
-const SESSION_SCHEMA: &[&str] = &[
-    "CREATE NODE TABLE IF NOT EXISTS Session(
+const SESSION_SCHEMA: &[&str] = &["CREATE NODE TABLE IF NOT EXISTS Session(
         id STRING,
         summary STRING,
         pending_tasks STRING,
@@ -15,8 +14,7 @@ const SESSION_SCHEMA: &[&str] = &[
         created_at INT64,
         updated_at INT64,
         PRIMARY KEY(id)
-    )",
-];
+    )"];
 
 const SESSION_MIGRATIONS: &[&str] = &[
     "ALTER TABLE Session ADD constraints STRING DEFAULT ''",
@@ -60,10 +58,11 @@ impl SessionStore {
 
     pub fn raw_query(&self, cypher: &str) -> Result<Vec<Vec<String>>> {
         let conn = self.connection()?;
-        let mut result = conn.query(cypher)
+        let result = conn
+            .query(cypher)
             .map_err(|e| anyhow::anyhow!("session query failed: {e}"))?;
         let mut rows = Vec::new();
-        while let Some(row) = result.next() {
+        for row in result {
             rows.push(row.iter().map(|v| v.to_string()).collect());
         }
         Ok(rows)

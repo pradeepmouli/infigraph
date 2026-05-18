@@ -2,14 +2,15 @@ mod driver;
 mod plugin;
 
 pub use driver::GrammarDriver;
-pub use plugin::{GrammarPlugin, GrammarPluginConfig, ProjectConfig, ProjectPreprocessorConfig, discover_plugins};
-
+pub use plugin::{
+    discover_plugins, GrammarPlugin, GrammarPluginConfig, ProjectConfig, ProjectPreprocessorConfig,
+};
 
 use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Result;
-use infigraph_core::lang::{LanguageRegistry, LanguagePack};
+use infigraph_core::lang::{LanguagePack, LanguageRegistry};
 
 /// Find the infigraph-driver.jar bundled with the binary.
 /// Searches: next to the binary, in ../driver/, in the workspace root.
@@ -18,15 +19,21 @@ fn find_driver_jar() -> Option<std::path::PathBuf> {
     if let Ok(exe) = std::env::current_exe() {
         let dir = exe.parent()?;
         let candidate = dir.join("infigraph-driver.jar");
-        if candidate.exists() { return Some(candidate); }
+        if candidate.exists() {
+            return Some(candidate);
+        }
         // ../driver/
         let candidate = dir.parent()?.join("driver").join("infigraph-driver.jar");
-        if candidate.exists() { return Some(candidate); }
+        if candidate.exists() {
+            return Some(candidate);
+        }
     }
     // INFIGRAPH_DRIVER_JAR env var
     if let Ok(path) = std::env::var("INFIGRAPH_DRIVER_JAR") {
         let p = std::path::PathBuf::from(path);
-        if p.exists() { return Some(p); }
+        if p.exists() {
+            return Some(p);
+        }
     }
     None
 }
@@ -85,7 +92,9 @@ pub fn register_grammar_plugins(
             let content = std::fs::read_to_string(&p).ok()?;
             let config: ProjectConfig = toml::from_str(&content).ok()?;
             let mut pp = config.preprocessor?;
-            pp.include_paths = pp.include_paths.iter()
+            pp.include_paths = pp
+                .include_paths
+                .iter()
                 .map(|ip| root.join(ip).to_string_lossy().to_string())
                 .collect();
             Some(pp)
@@ -103,7 +112,10 @@ pub fn register_grammar_plugins(
         let plugin = GrammarPlugin::new(config, dir, Arc::clone(&driver), project_pp.clone());
 
         if let Err(e) = plugin.load() {
-            eprintln!("[infigraph] Failed to load grammar plugin '{}': {}", name, e);
+            eprintln!(
+                "[infigraph] Failed to load grammar plugin '{}': {}",
+                name, e
+            );
             continue;
         }
 

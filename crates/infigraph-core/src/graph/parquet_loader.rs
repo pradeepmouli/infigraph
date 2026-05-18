@@ -23,9 +23,16 @@ pub fn write_edge_parquet(path: &Path, pairs: &[(&str, &str)]) -> Result<()> {
     Ok(())
 }
 
-pub fn write_node_parquet(path: &Path, fields: &[(&str, DataType)], columns: Vec<Arc<dyn arrow::array::Array>>) -> Result<()> {
+pub fn write_node_parquet(
+    path: &Path,
+    fields: &[(&str, DataType)],
+    columns: Vec<Arc<dyn arrow::array::Array>>,
+) -> Result<()> {
     let schema = Arc::new(Schema::new(
-        fields.iter().map(|(name, dtype)| Field::new(*name, dtype.clone(), true)).collect::<Vec<_>>()
+        fields
+            .iter()
+            .map(|(name, dtype)| Field::new(*name, dtype.clone(), true))
+            .collect::<Vec<_>>(),
     ));
 
     let batch = RecordBatch::try_new(schema.clone(), columns)?;

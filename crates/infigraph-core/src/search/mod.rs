@@ -50,10 +50,7 @@ impl BM25Index {
             }
 
             for (term, tf) in tf_map {
-                inverted
-                    .entry(term.to_string())
-                    .or_default()
-                    .push((i, tf));
+                inverted.entry(term.to_string()).or_default().push((i, tf));
             }
         }
 
@@ -83,8 +80,8 @@ impl BM25Index {
 
                 for &(doc_idx, tf) in postings {
                     let doc_len = tokenize(&self.docs[doc_idx].1).len() as f32;
-                    let tf_norm = (tf * (K1 + 1.0))
-                        / (tf + K1 * (1.0 - B + B * doc_len / self.avg_doc_len));
+                    let tf_norm =
+                        (tf * (K1 + 1.0)) / (tf + K1 * (1.0 - B + B * doc_len / self.avg_doc_len));
                     scores[doc_idx] += idf * tf_norm;
                 }
             }
@@ -153,26 +150,28 @@ pub fn compute_raw_scores(
     let use_hnsw = symbol_embeddings.len() >= HNSW_THRESHOLD;
     let vec_scores = if use_hnsw {
         if let (Some(idx_path), Some(emb_path)) = (hnsw_index_path, embeddings_path) {
-        match embed::search_hnsw(idx_path, emb_path, &query_embedding, oversample) {
-            Ok(Some(candidates)) => {
-                let emb_lookup: HashMap<&str, &[f32]> = symbol_embeddings
-                    .iter()
-                    .map(|(id, v)| (id.as_str(), v.as_slice()))
-                    .collect();
-                let mut reranked: Vec<(String, f32)> = candidates
-                    .into_iter()
-                    .filter_map(|r| {
-                        emb_lookup.get(r.id.as_str()).map(|emb| {
-                            (r.id, embed::cosine_similarity(&query_embedding, emb))
+            match embed::search_hnsw(idx_path, emb_path, &query_embedding, oversample) {
+                Ok(Some(candidates)) => {
+                    let emb_lookup: HashMap<&str, &[f32]> = symbol_embeddings
+                        .iter()
+                        .map(|(id, v)| (id.as_str(), v.as_slice()))
+                        .collect();
+                    let mut reranked: Vec<(String, f32)> = candidates
+                        .into_iter()
+                        .filter_map(|r| {
+                            emb_lookup
+                                .get(r.id.as_str())
+                                .map(|emb| (r.id, embed::cosine_similarity(&query_embedding, emb)))
                         })
-                    })
-                    .collect();
-                reranked.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-                reranked.truncate(oversample);
-                reranked
+                        .collect();
+                    reranked.sort_unstable_by(|a, b| {
+                        b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                    reranked.truncate(oversample);
+                    reranked
+                }
+                _ => brute_force_vector_scores(&query_embedding, symbol_embeddings, oversample),
             }
-            _ => brute_force_vector_scores(&query_embedding, symbol_embeddings, oversample),
-        }
         } else {
             brute_force_vector_scores(&query_embedding, symbol_embeddings, oversample)
         }
@@ -238,12 +237,17 @@ pub fn combine_scores(raw: &RawScores, alpha: f32, limit: usize) -> Vec<SearchRe
         })
         .collect();
 
-    results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    results.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     results.truncate(limit);
     results
 }
 
 /// Hybrid search combining BM25 text relevance with vector similarity.
+#[allow(clippy::too_many_arguments)]
 pub fn hybrid_search(
     query: &str,
     bm25_index: &BM25Index,
@@ -255,8 +259,13 @@ pub fn hybrid_search(
     embeddings_path: Option<&Path>,
 ) -> Result<Vec<SearchResult>> {
     let raw = compute_raw_scores(
-        query, bm25_index, embedder, symbol_embeddings, limit * 2,
-        hnsw_index_path, embeddings_path,
+        query,
+        bm25_index,
+        embedder,
+        symbol_embeddings,
+        limit * 2,
+        hnsw_index_path,
+        embeddings_path,
     )?;
     Ok(combine_scores(&raw, alpha, limit))
 }
@@ -293,10 +302,12 @@ pub fn grep_search(
     file_pattern: Option<&str>,
     limit: usize,
 ) -> Result<Vec<GrepMatch>> {
-    let re = Regex::new(pattern)
-        .map_err(|e| anyhow::anyhow!("invalid regex '{}': {}", pattern, e))?;
+    let re =
+        Regex::new(pattern).map_err(|e| anyhow::anyhow!("invalid regex '{}': {}", pattern, e))?;
 
-    let glob_pat = file_pattern.map(|fp| glob::Pattern::new(fp)).transpose()
+    let glob_pat = file_pattern
+        .map(glob::Pattern::new)
+        .transpose()
         .map_err(|e| anyhow::anyhow!("invalid file pattern: {}", e))?;
 
     let mut matches = Vec::new();

@@ -12,7 +12,11 @@ use crate::model::{FileExtraction, Relation, RelationKind, Span, SymbolKind};
 /// Parse a source file and extract all symbols and relationships.
 pub fn extract_file(path: &str, source: &[u8], pack: &LanguagePack) -> Result<FileExtraction> {
     let (symbols, mut relations) = match &pack.backend {
-        ParserBackend::TreeSitter { grammar, entity_query, relation_query } => {
+        ParserBackend::TreeSitter {
+            grammar,
+            entity_query,
+            relation_query,
+        } => {
             let mut parser = tree_sitter::Parser::new();
             parser.set_language(grammar)?;
 
@@ -26,9 +30,7 @@ pub fn extract_file(path: &str, source: &[u8], pack: &LanguagePack) -> Result<Fi
             let relations = extract_relations(path, source, root, relation_query);
             (symbols, relations)
         }
-        ParserBackend::Custom(extractor) => {
-            extractor.extract(path, source, &pack.name)?
-        }
+        ParserBackend::Custom(extractor) => extractor.extract(path, source, &pack.name)?,
     };
 
     // Generate CALLS edges from Route symbols to their handler functions
@@ -51,10 +53,17 @@ pub fn extract_file(path: &str, source: &[u8], pack: &LanguagePack) -> Result<Fi
 
 /// Create CALLS relations from Route symbols to handler functions in the same file.
 /// Matches route handler names from docstrings OR route names containing function names.
-fn generate_route_handler_edges(file: &str, symbols: &[crate::model::Symbol], relations: &mut Vec<Relation>) {
+fn generate_route_handler_edges(
+    file: &str,
+    symbols: &[crate::model::Symbol],
+    relations: &mut Vec<Relation>,
+) {
     // Collect function/method names for matching
-    let functions: Vec<(&str, &str)> = symbols.iter()
-        .filter(|s| (s.kind == SymbolKind::Function || s.kind == SymbolKind::Method) && s.span.file == file)
+    let functions: Vec<(&str, &str)> = symbols
+        .iter()
+        .filter(|s| {
+            (s.kind == SymbolKind::Function || s.kind == SymbolKind::Method) && s.span.file == file
+        })
         .map(|s| (s.name.as_str(), s.id.as_str()))
         .collect();
 
@@ -68,7 +77,8 @@ fn generate_route_handler_edges(file: &str, symbols: &[crate::model::Symbol], re
         // Method 1: explicit handler= in docstring
         if let Some(doc) = &sym.docstring {
             if let Some(handler_name) = doc.split("handler=").nth(1).map(|h| h.trim()) {
-                target_id = functions.iter()
+                target_id = functions
+                    .iter()
                     .find(|(name, _)| *name == handler_name)
                     .map(|(_, id)| id.to_string());
             }
@@ -76,7 +86,8 @@ fn generate_route_handler_edges(file: &str, symbols: &[crate::model::Symbol], re
 
         // Method 2: Route is on the same line range as a function — check for overlap
         if target_id.is_none() {
-            target_id = symbols.iter()
+            target_id = symbols
+                .iter()
                 .find(|s| {
                     (s.kind == SymbolKind::Function || s.kind == SymbolKind::Method)
                         && s.span.file == file

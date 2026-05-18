@@ -426,7 +426,13 @@ pub fn bundled_registry() -> Result<LanguageRegistry> {
 
 fn python_pack() -> Result<LanguagePack> {
     let grammar = tree_sitter_python::LANGUAGE.into();
-    LanguagePack::new("python", vec![".py"], grammar, PYTHON_ENTITIES, PYTHON_RELATIONS)
+    LanguagePack::new(
+        "python",
+        vec![".py"],
+        grammar,
+        PYTHON_ENTITIES,
+        PYTHON_RELATIONS,
+    )
 }
 
 fn rust_pack() -> Result<LanguagePack> {
@@ -436,12 +442,24 @@ fn rust_pack() -> Result<LanguagePack> {
 
 fn typescript_pack() -> Result<LanguagePack> {
     let grammar = tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into();
-    LanguagePack::new("typescript", vec![".ts"], grammar, TYPESCRIPT_ENTITIES, TYPESCRIPT_RELATIONS)
+    LanguagePack::new(
+        "typescript",
+        vec![".ts"],
+        grammar,
+        TYPESCRIPT_ENTITIES,
+        TYPESCRIPT_RELATIONS,
+    )
 }
 
 fn javascript_pack() -> Result<LanguagePack> {
     let grammar = tree_sitter_javascript::LANGUAGE.into();
-    LanguagePack::new("javascript", vec![".js", ".jsx", ".mjs"], grammar, JAVASCRIPT_ENTITIES, JAVASCRIPT_RELATIONS)
+    LanguagePack::new(
+        "javascript",
+        vec![".js", ".jsx", ".mjs"],
+        grammar,
+        JAVASCRIPT_ENTITIES,
+        JAVASCRIPT_RELATIONS,
+    )
 }
 
 fn go_pack() -> Result<LanguagePack> {
@@ -451,7 +469,13 @@ fn go_pack() -> Result<LanguagePack> {
 
 fn java_pack() -> Result<LanguagePack> {
     let grammar = tree_sitter_java::LANGUAGE.into();
-    LanguagePack::new("java", vec![".java"], grammar, JAVA_ENTITIES, JAVA_RELATIONS)
+    LanguagePack::new(
+        "java",
+        vec![".java"],
+        grammar,
+        JAVA_ENTITIES,
+        JAVA_RELATIONS,
+    )
 }
 
 fn c_pack() -> Result<LanguagePack> {
@@ -461,12 +485,24 @@ fn c_pack() -> Result<LanguagePack> {
 
 fn cpp_pack() -> Result<LanguagePack> {
     let grammar = tree_sitter_cpp::LANGUAGE.into();
-    LanguagePack::new("cpp", vec![".cpp", ".cc", ".cxx", ".hpp", ".hxx", ".hh"], grammar, CPP_ENTITIES, CPP_RELATIONS)
+    LanguagePack::new(
+        "cpp",
+        vec![".cpp", ".cc", ".cxx", ".hpp", ".hxx", ".hh"],
+        grammar,
+        CPP_ENTITIES,
+        CPP_RELATIONS,
+    )
 }
 
 fn ruby_pack() -> Result<LanguagePack> {
     let grammar = tree_sitter_ruby::LANGUAGE.into();
-    LanguagePack::new("ruby", vec![".rb", ".rake", ".gemspec"], grammar, RUBY_ENTITIES, RUBY_RELATIONS)
+    LanguagePack::new(
+        "ruby",
+        vec![".rb", ".rake", ".gemspec"],
+        grammar,
+        RUBY_ENTITIES,
+        RUBY_RELATIONS,
+    )
 }
 
 fn php_pack() -> Result<LanguagePack> {
@@ -476,22 +512,46 @@ fn php_pack() -> Result<LanguagePack> {
 
 fn swift_pack() -> Result<LanguagePack> {
     let grammar = tree_sitter_swift::LANGUAGE.into();
-    LanguagePack::new("swift", vec![".swift"], grammar, SWIFT_ENTITIES, SWIFT_RELATIONS)
+    LanguagePack::new(
+        "swift",
+        vec![".swift"],
+        grammar,
+        SWIFT_ENTITIES,
+        SWIFT_RELATIONS,
+    )
 }
 
 fn kotlin_pack() -> Result<LanguagePack> {
     let grammar = tree_sitter_kotlin_ng::LANGUAGE.into();
-    LanguagePack::new("kotlin", vec![".kt", ".kts"], grammar, KOTLIN_ENTITIES, KOTLIN_RELATIONS)
+    LanguagePack::new(
+        "kotlin",
+        vec![".kt", ".kts"],
+        grammar,
+        KOTLIN_ENTITIES,
+        KOTLIN_RELATIONS,
+    )
 }
 
 fn csharp_pack() -> Result<LanguagePack> {
     let grammar = tree_sitter_c_sharp::LANGUAGE.into();
-    LanguagePack::new("csharp", vec![".cs"], grammar, CSHARP_ENTITIES, CSHARP_RELATIONS)
+    LanguagePack::new(
+        "csharp",
+        vec![".cs"],
+        grammar,
+        CSHARP_ENTITIES,
+        CSHARP_RELATIONS,
+    )
 }
 
 fn scala_pack() -> Result<LanguagePack> {
     let grammar = tree_sitter_scala::LANGUAGE.into();
-    LanguagePack::new("scala", vec![".scala", ".sc"], grammar, SCALA_ENTITIES, SCALA_RELATIONS)
+    LanguagePack::new(
+        "scala",
+        vec![".scala", ".sc"],
+        grammar,
+        SCALA_ENTITIES,
+        SCALA_RELATIONS,
+    )
 }
 
 fn lua_pack() -> Result<LanguagePack> {
@@ -506,42 +566,90 @@ fn zig_pack() -> Result<LanguagePack> {
 
 fn elixir_pack() -> Result<LanguagePack> {
     let grammar = tree_sitter_elixir::LANGUAGE.into();
-    LanguagePack::new("elixir", vec![".ex", ".exs"], grammar, ELIXIR_ENTITIES, ELIXIR_RELATIONS)
+    LanguagePack::new(
+        "elixir",
+        vec![".ex", ".exs"],
+        grammar,
+        ELIXIR_ENTITIES,
+        ELIXIR_RELATIONS,
+    )
 }
 
 fn dart_pack() -> Result<LanguagePack> {
     let grammar = tree_sitter_dart::LANGUAGE.into();
-    LanguagePack::new("dart", vec![".dart"], grammar, DART_ENTITIES, DART_RELATIONS)
+    LanguagePack::new(
+        "dart",
+        vec![".dart"],
+        grammar,
+        DART_ENTITIES,
+        DART_RELATIONS,
+    )
 }
 
 fn objc_pack() -> Result<LanguagePack> {
     let grammar = tree_sitter_objc::LANGUAGE.into();
-    LanguagePack::new("objc", vec![".m", ".mm"], grammar, OBJC_ENTITIES, OBJC_RELATIONS)
+    LanguagePack::new(
+        "objc",
+        vec![".m", ".mm"],
+        grammar,
+        OBJC_ENTITIES,
+        OBJC_RELATIONS,
+    )
 }
 
 fn haskell_pack() -> Result<LanguagePack> {
     let grammar = tree_sitter_haskell::LANGUAGE.into();
-    LanguagePack::new("haskell", vec![".hs", ".lhs"], grammar, HASKELL_ENTITIES, HASKELL_RELATIONS)
+    LanguagePack::new(
+        "haskell",
+        vec![".hs", ".lhs"],
+        grammar,
+        HASKELL_ENTITIES,
+        HASKELL_RELATIONS,
+    )
 }
 
 fn perl_pack() -> Result<LanguagePack> {
     let grammar = tree_sitter_perl::LANGUAGE.into();
-    LanguagePack::new("perl", vec![".pl", ".pm", ".t"], grammar, PERL_ENTITIES, PERL_RELATIONS)
+    LanguagePack::new(
+        "perl",
+        vec![".pl", ".pm", ".t"],
+        grammar,
+        PERL_ENTITIES,
+        PERL_RELATIONS,
+    )
 }
 
 fn r_pack() -> Result<LanguagePack> {
     let grammar = tree_sitter_r::LANGUAGE.into();
-    LanguagePack::new("r", vec![".r", ".R", ".Rmd"], grammar, R_ENTITIES, R_RELATIONS)
+    LanguagePack::new(
+        "r",
+        vec![".r", ".R", ".Rmd"],
+        grammar,
+        R_ENTITIES,
+        R_RELATIONS,
+    )
 }
 
 fn ocaml_pack() -> Result<LanguagePack> {
     let grammar = tree_sitter_ocaml::LANGUAGE_OCAML.into();
-    LanguagePack::new("ocaml", vec![".ml", ".mli"], grammar, OCAML_ENTITIES, OCAML_RELATIONS)
+    LanguagePack::new(
+        "ocaml",
+        vec![".ml", ".mli"],
+        grammar,
+        OCAML_ENTITIES,
+        OCAML_RELATIONS,
+    )
 }
 
 fn bash_pack() -> Result<LanguagePack> {
     let grammar = tree_sitter_bash::LANGUAGE.into();
-    LanguagePack::new("bash", vec![".sh", ".bash", ".zsh"], grammar, BASH_ENTITIES, BASH_RELATIONS)
+    LanguagePack::new(
+        "bash",
+        vec![".sh", ".bash", ".zsh"],
+        grammar,
+        BASH_ENTITIES,
+        BASH_RELATIONS,
+    )
 }
 
 fn sql_pack() -> Result<LanguagePack> {
@@ -551,52 +659,112 @@ fn sql_pack() -> Result<LanguagePack> {
 
 fn julia_pack() -> Result<LanguagePack> {
     let grammar = tree_sitter_julia::LANGUAGE.into();
-    LanguagePack::new("julia", vec![".jl"], grammar, JULIA_ENTITIES, JULIA_RELATIONS)
+    LanguagePack::new(
+        "julia",
+        vec![".jl"],
+        grammar,
+        JULIA_ENTITIES,
+        JULIA_RELATIONS,
+    )
 }
 
 fn proto_pack() -> Result<LanguagePack> {
     let grammar = tree_sitter_proto::LANGUAGE.into();
-    LanguagePack::new("proto", vec![".proto"], grammar, PROTO_ENTITIES, PROTO_RELATIONS)
+    LanguagePack::new(
+        "proto",
+        vec![".proto"],
+        grammar,
+        PROTO_ENTITIES,
+        PROTO_RELATIONS,
+    )
 }
 
 fn powershell_pack() -> Result<LanguagePack> {
     let grammar = tree_sitter_powershell::LANGUAGE.into();
-    LanguagePack::new("powershell", vec![".ps1", ".psm1", ".psd1"], grammar, POWERSHELL_ENTITIES, POWERSHELL_RELATIONS)
+    LanguagePack::new(
+        "powershell",
+        vec![".ps1", ".psm1", ".psd1"],
+        grammar,
+        POWERSHELL_ENTITIES,
+        POWERSHELL_RELATIONS,
+    )
 }
 
 fn verilog_pack() -> Result<LanguagePack> {
     let grammar = tree_sitter_verilog::LANGUAGE.into();
-    LanguagePack::new("verilog", vec![".v", ".sv", ".svh", ".vh"], grammar, VERILOG_ENTITIES, VERILOG_RELATIONS)
+    LanguagePack::new(
+        "verilog",
+        vec![".v", ".sv", ".svh", ".vh"],
+        grammar,
+        VERILOG_ENTITIES,
+        VERILOG_RELATIONS,
+    )
 }
 
 fn hcl_pack() -> Result<LanguagePack> {
     let grammar = tree_sitter_hcl::LANGUAGE.into();
-    LanguagePack::new("hcl", vec![".hcl", ".tf", ".tfvars"], grammar, HCL_ENTITIES, HCL_RELATIONS)
+    LanguagePack::new(
+        "hcl",
+        vec![".hcl", ".tf", ".tfvars"],
+        grammar,
+        HCL_ENTITIES,
+        HCL_RELATIONS,
+    )
 }
 
 fn toml_pack() -> Result<LanguagePack> {
     let grammar = tree_sitter_toml_ng::LANGUAGE.into();
-    LanguagePack::new("toml", vec![".toml"], grammar, TOML_ENTITIES, TOML_RELATIONS)
+    LanguagePack::new(
+        "toml",
+        vec![".toml"],
+        grammar,
+        TOML_ENTITIES,
+        TOML_RELATIONS,
+    )
 }
 
 fn yaml_pack() -> Result<LanguagePack> {
     let grammar = tree_sitter_yaml::LANGUAGE.into();
-    LanguagePack::new("yaml", vec![".yml", ".yaml"], grammar, YAML_ENTITIES, YAML_RELATIONS)
+    LanguagePack::new(
+        "yaml",
+        vec![".yml", ".yaml"],
+        grammar,
+        YAML_ENTITIES,
+        YAML_RELATIONS,
+    )
 }
 
 fn erlang_pack() -> Result<LanguagePack> {
     let grammar = tree_sitter_erlang::LANGUAGE.into();
-    LanguagePack::new("erlang", vec![".erl", ".hrl"], grammar, ERLANG_ENTITIES, ERLANG_RELATIONS)
+    LanguagePack::new(
+        "erlang",
+        vec![".erl", ".hrl"],
+        grammar,
+        ERLANG_ENTITIES,
+        ERLANG_RELATIONS,
+    )
 }
 
 fn dockerfile_pack() -> Result<LanguagePack> {
     let grammar = tree_sitter_containerfile::LANGUAGE.into();
-    LanguagePack::new("dockerfile", vec!["Dockerfile", "Containerfile", ".dockerfile"], grammar, DOCKERFILE_ENTITIES, DOCKERFILE_RELATIONS)
+    LanguagePack::new(
+        "dockerfile",
+        vec!["Dockerfile", "Containerfile", ".dockerfile"],
+        grammar,
+        DOCKERFILE_ENTITIES,
+        DOCKERFILE_RELATIONS,
+    )
 }
 
 fn fortran_pack() -> Result<LanguagePack> {
     let grammar = tree_sitter_fortran::LANGUAGE.into();
-    LanguagePack::new("fortran", vec![".f90", ".f95", ".f03", ".f08", ".f", ".for"], grammar, FORTRAN_ENTITIES, FORTRAN_RELATIONS)
+    LanguagePack::new(
+        "fortran",
+        vec![".f90", ".f95", ".f03", ".f08", ".f", ".for"],
+        grammar,
+        FORTRAN_ENTITIES,
+        FORTRAN_RELATIONS,
+    )
 }
 
 fn nix_pack() -> Result<LanguagePack> {
@@ -606,17 +774,35 @@ fn nix_pack() -> Result<LanguagePack> {
 
 fn svelte_pack() -> Result<LanguagePack> {
     let grammar = tree_sitter_svelte_ng::LANGUAGE.into();
-    LanguagePack::new("svelte", vec![".svelte"], grammar, SVELTE_ENTITIES, SVELTE_RELATIONS)
+    LanguagePack::new(
+        "svelte",
+        vec![".svelte"],
+        grammar,
+        SVELTE_ENTITIES,
+        SVELTE_RELATIONS,
+    )
 }
 
 fn fsharp_pack() -> Result<LanguagePack> {
     let grammar = tree_sitter_fsharp::LANGUAGE_FSHARP.into();
-    LanguagePack::new("fsharp", vec![".fs", ".fsi", ".fsx"], grammar, FSHARP_ENTITIES, FSHARP_RELATIONS)
+    LanguagePack::new(
+        "fsharp",
+        vec![".fs", ".fsi", ".fsx"],
+        grammar,
+        FSHARP_ENTITIES,
+        FSHARP_RELATIONS,
+    )
 }
 
 fn groovy_pack() -> Result<LanguagePack> {
     let grammar = tree_sitter_groovy::LANGUAGE.into();
-    LanguagePack::new("groovy", vec![".groovy", ".gradle"], grammar, GROOVY_ENTITIES, GROOVY_RELATIONS)
+    LanguagePack::new(
+        "groovy",
+        vec![".groovy", ".gradle"],
+        grammar,
+        GROOVY_ENTITIES,
+        GROOVY_RELATIONS,
+    )
 }
 
 fn css_pack() -> Result<LanguagePack> {
@@ -626,42 +812,90 @@ fn css_pack() -> Result<LanguagePack> {
 
 fn html_pack() -> Result<LanguagePack> {
     let grammar = tree_sitter_html::LANGUAGE.into();
-    LanguagePack::new("html", vec![".html", ".htm"], grammar, HTML_ENTITIES, HTML_RELATIONS)
+    LanguagePack::new(
+        "html",
+        vec![".html", ".htm"],
+        grammar,
+        HTML_ENTITIES,
+        HTML_RELATIONS,
+    )
 }
 
 fn json_pack() -> Result<LanguagePack> {
     let grammar = tree_sitter_json::LANGUAGE.into();
-    LanguagePack::new("json", vec![".json"], grammar, JSON_ENTITIES, JSON_RELATIONS)
+    LanguagePack::new(
+        "json",
+        vec![".json"],
+        grammar,
+        JSON_ENTITIES,
+        JSON_RELATIONS,
+    )
 }
 
 fn xml_pack() -> Result<LanguagePack> {
     let grammar = tree_sitter_xml::LANGUAGE_XML.into();
-    LanguagePack::new("xml", vec![".xml", ".xsl", ".xsd", ".svg", ".plist"], grammar, XML_ENTITIES, XML_RELATIONS)
+    LanguagePack::new(
+        "xml",
+        vec![".xml", ".xsl", ".xsd", ".svg", ".plist"],
+        grammar,
+        XML_ENTITIES,
+        XML_RELATIONS,
+    )
 }
 
 fn makefile_pack() -> Result<LanguagePack> {
     let grammar = tree_sitter_make::LANGUAGE.into();
-    LanguagePack::new("makefile", vec!["Makefile", "makefile", "GNUmakefile", ".mk"], grammar, MAKEFILE_ENTITIES, MAKEFILE_RELATIONS)
+    LanguagePack::new(
+        "makefile",
+        vec!["Makefile", "makefile", "GNUmakefile", ".mk"],
+        grammar,
+        MAKEFILE_ENTITIES,
+        MAKEFILE_RELATIONS,
+    )
 }
 
 fn cmake_pack() -> Result<LanguagePack> {
     let grammar = tree_sitter_cmake::LANGUAGE.into();
-    LanguagePack::new("cmake", vec!["CMakeLists.txt", ".cmake"], grammar, CMAKE_ENTITIES, CMAKE_RELATIONS)
+    LanguagePack::new(
+        "cmake",
+        vec!["CMakeLists.txt", ".cmake"],
+        grammar,
+        CMAKE_ENTITIES,
+        CMAKE_RELATIONS,
+    )
 }
 
 fn graphql_pack() -> Result<LanguagePack> {
     let grammar = tree_sitter_graphql::LANGUAGE.into();
-    LanguagePack::new("graphql", vec![".graphql", ".gql"], grammar, GRAPHQL_ENTITIES, GRAPHQL_RELATIONS)
+    LanguagePack::new(
+        "graphql",
+        vec![".graphql", ".gql"],
+        grammar,
+        GRAPHQL_ENTITIES,
+        GRAPHQL_RELATIONS,
+    )
 }
 
 fn glsl_pack() -> Result<LanguagePack> {
     let grammar = tree_sitter_glsl::LANGUAGE_GLSL.into();
-    LanguagePack::new("glsl", vec![".glsl", ".vert", ".frag", ".geom", ".comp"], grammar, GLSL_ENTITIES, GLSL_RELATIONS)
+    LanguagePack::new(
+        "glsl",
+        vec![".glsl", ".vert", ".frag", ".geom", ".comp"],
+        grammar,
+        GLSL_ENTITIES,
+        GLSL_RELATIONS,
+    )
 }
 
 fn commonlisp_pack() -> Result<LanguagePack> {
     let grammar = tree_sitter_commonlisp::LANGUAGE_COMMONLISP.into();
-    LanguagePack::new("commonlisp", vec![".lisp", ".lsp", ".cl", ".asd"], grammar, COMMONLISP_ENTITIES, COMMONLISP_RELATIONS)
+    LanguagePack::new(
+        "commonlisp",
+        vec![".lisp", ".lsp", ".cl", ".asd"],
+        grammar,
+        COMMONLISP_ENTITIES,
+        COMMONLISP_RELATIONS,
+    )
 }
 
 fn elm_pack() -> Result<LanguagePack> {
@@ -671,12 +905,24 @@ fn elm_pack() -> Result<LanguagePack> {
 
 fn elisp_pack() -> Result<LanguagePack> {
     let grammar = tree_sitter_elisp::LANGUAGE.into();
-    LanguagePack::new("elisp", vec![".el"], grammar, ELISP_ENTITIES, ELISP_RELATIONS)
+    LanguagePack::new(
+        "elisp",
+        vec![".el"],
+        grammar,
+        ELISP_ENTITIES,
+        ELISP_RELATIONS,
+    )
 }
 
 fn ini_pack() -> Result<LanguagePack> {
     let grammar = tree_sitter_ini::LANGUAGE.into();
-    LanguagePack::new("ini", vec![".ini", ".cfg", ".conf"], grammar, INI_ENTITIES, INI_RELATIONS)
+    LanguagePack::new(
+        "ini",
+        vec![".ini", ".cfg", ".conf"],
+        grammar,
+        INI_ENTITIES,
+        INI_RELATIONS,
+    )
 }
 
 fn tsx_pack() -> Result<LanguagePack> {
@@ -686,37 +932,79 @@ fn tsx_pack() -> Result<LanguagePack> {
 
 fn starlark_pack() -> Result<LanguagePack> {
     let grammar = tree_sitter_starlark::LANGUAGE.into();
-    LanguagePack::new("starlark", vec![".bzl", ".star", "BUILD", "BUILD.bazel", "WORKSPACE"], grammar, STARLARK_ENTITIES, STARLARK_RELATIONS)
+    LanguagePack::new(
+        "starlark",
+        vec![".bzl", ".star", "BUILD", "BUILD.bazel", "WORKSPACE"],
+        grammar,
+        STARLARK_ENTITIES,
+        STARLARK_RELATIONS,
+    )
 }
 
 fn matlab_pack() -> Result<LanguagePack> {
     let grammar = tree_sitter_matlab::LANGUAGE.into();
-    LanguagePack::new("matlab", vec![".mlx", ".mat"], grammar, MATLAB_ENTITIES, MATLAB_RELATIONS)
+    LanguagePack::new(
+        "matlab",
+        vec![".mlx", ".mat"],
+        grammar,
+        MATLAB_ENTITIES,
+        MATLAB_RELATIONS,
+    )
 }
 
 fn markdown_pack() -> Result<LanguagePack> {
     let grammar = tree_sitter_md::LANGUAGE.into();
-    LanguagePack::new("markdown", vec![".md", ".markdown"], grammar, MARKDOWN_ENTITIES, MARKDOWN_RELATIONS)
+    LanguagePack::new(
+        "markdown",
+        vec![".md", ".markdown"],
+        grammar,
+        MARKDOWN_ENTITIES,
+        MARKDOWN_RELATIONS,
+    )
 }
 
 fn clojure_pack() -> Result<LanguagePack> {
     let grammar = tree_sitter_clojure_orchard::LANGUAGE.into();
-    LanguagePack::new("clojure", vec![".clj", ".cljs", ".cljc", ".edn"], grammar, CLOJURE_ENTITIES, CLOJURE_RELATIONS)
+    LanguagePack::new(
+        "clojure",
+        vec![".clj", ".cljs", ".cljc", ".edn"],
+        grammar,
+        CLOJURE_ENTITIES,
+        CLOJURE_RELATIONS,
+    )
 }
 
 fn cuda_pack() -> Result<LanguagePack> {
     let grammar = tree_sitter_cuda::LANGUAGE.into();
-    LanguagePack::new("cuda", vec![".cu", ".cuh"], grammar, CUDA_ENTITIES, CUDA_RELATIONS)
+    LanguagePack::new(
+        "cuda",
+        vec![".cu", ".cuh"],
+        grammar,
+        CUDA_ENTITIES,
+        CUDA_RELATIONS,
+    )
 }
 
 fn pascal_pack() -> Result<LanguagePack> {
     let grammar = tree_sitter_pascal::LANGUAGE.into();
-    LanguagePack::new("pascal", vec![".pas", ".pp", ".dpr", ".dpk", ".inc", ".lpr"], grammar, PASCAL_ENTITIES, PASCAL_RELATIONS)
+    LanguagePack::new(
+        "pascal",
+        vec![".pas", ".pp", ".dpr", ".dpk", ".inc", ".lpr"],
+        grammar,
+        PASCAL_ENTITIES,
+        PASCAL_RELATIONS,
+    )
 }
 
 fn vb6_pack() -> Result<LanguagePack> {
     let grammar = tree_sitter_vb6::language();
-    LanguagePack::new("vb6", vec![".bas", ".cls", ".frm"], grammar, VB6_ENTITIES, VB6_RELATIONS)
+    LanguagePack::new(
+        "vb6",
+        vec![".bas", ".cls", ".frm"],
+        grammar,
+        VB6_ENTITIES,
+        VB6_RELATIONS,
+    )
 }
 
 #[cfg(test)]
@@ -727,98 +1015,161 @@ mod tests {
     fn test_all_packs_load() {
         // Verify bundled_registry succeeds (individual packs may warn but shouldn't panic)
         let registry = bundled_registry().expect("bundled_registry should succeed");
-        assert!(registry.languages().count() > 0, "registry should have at least one language");
+        assert!(
+            registry.languages().count() > 0,
+            "registry should have at least one language"
+        );
     }
 
     #[test]
-    fn test_powershell_pack() { powershell_pack().expect("PowerShell pack should load"); }
+    fn test_powershell_pack() {
+        powershell_pack().expect("PowerShell pack should load");
+    }
 
     #[test]
-    fn test_verilog_pack() { verilog_pack().expect("Verilog pack should load"); }
+    fn test_verilog_pack() {
+        verilog_pack().expect("Verilog pack should load");
+    }
 
     #[test]
-    fn test_hcl_pack() { hcl_pack().expect("HCL pack should load"); }
+    fn test_hcl_pack() {
+        hcl_pack().expect("HCL pack should load");
+    }
 
     #[test]
-    fn test_toml_pack() { toml_pack().expect("TOML pack should load"); }
+    fn test_toml_pack() {
+        toml_pack().expect("TOML pack should load");
+    }
 
     #[test]
-    fn test_yaml_pack() { yaml_pack().expect("YAML pack should load"); }
+    fn test_yaml_pack() {
+        yaml_pack().expect("YAML pack should load");
+    }
 
     #[test]
-    fn test_erlang_pack() { erlang_pack().expect("Erlang pack should load"); }
+    fn test_erlang_pack() {
+        erlang_pack().expect("Erlang pack should load");
+    }
 
     #[test]
-    fn test_dockerfile_pack() { dockerfile_pack().expect("Dockerfile pack should load"); }
+    fn test_dockerfile_pack() {
+        dockerfile_pack().expect("Dockerfile pack should load");
+    }
 
     #[test]
-    fn test_fortran_pack() { fortran_pack().expect("Fortran pack should load"); }
+    fn test_fortran_pack() {
+        fortran_pack().expect("Fortran pack should load");
+    }
 
     #[test]
-    fn test_nix_pack() { nix_pack().expect("Nix pack should load"); }
+    fn test_nix_pack() {
+        nix_pack().expect("Nix pack should load");
+    }
 
     #[test]
-    fn test_svelte_pack() { svelte_pack().expect("Svelte pack should load"); }
+    fn test_svelte_pack() {
+        svelte_pack().expect("Svelte pack should load");
+    }
 
     #[test]
-    fn test_fsharp_pack() { fsharp_pack().expect("F# pack should load"); }
+    fn test_fsharp_pack() {
+        fsharp_pack().expect("F# pack should load");
+    }
 
     #[test]
-    fn test_groovy_pack() { groovy_pack().expect("Groovy pack should load"); }
+    fn test_groovy_pack() {
+        groovy_pack().expect("Groovy pack should load");
+    }
 
     #[test]
-    fn test_css_pack() { css_pack().expect("CSS pack should load"); }
+    fn test_css_pack() {
+        css_pack().expect("CSS pack should load");
+    }
 
     #[test]
-    fn test_html_pack() { html_pack().expect("HTML pack should load"); }
+    fn test_html_pack() {
+        html_pack().expect("HTML pack should load");
+    }
 
     #[test]
-    fn test_json_pack() { json_pack().expect("JSON pack should load"); }
+    fn test_json_pack() {
+        json_pack().expect("JSON pack should load");
+    }
 
     #[test]
-    fn test_xml_pack() { xml_pack().expect("XML pack should load"); }
+    fn test_xml_pack() {
+        xml_pack().expect("XML pack should load");
+    }
 
     #[test]
-    fn test_makefile_pack() { makefile_pack().expect("Makefile pack should load"); }
+    fn test_makefile_pack() {
+        makefile_pack().expect("Makefile pack should load");
+    }
 
     #[test]
-    fn test_cmake_pack() { cmake_pack().expect("CMake pack should load"); }
+    fn test_cmake_pack() {
+        cmake_pack().expect("CMake pack should load");
+    }
 
     #[test]
-    fn test_graphql_pack() { graphql_pack().expect("GraphQL pack should load"); }
+    fn test_graphql_pack() {
+        graphql_pack().expect("GraphQL pack should load");
+    }
 
     #[test]
-    fn test_glsl_pack() { glsl_pack().expect("GLSL pack should load"); }
+    fn test_glsl_pack() {
+        glsl_pack().expect("GLSL pack should load");
+    }
 
     #[test]
-    fn test_commonlisp_pack() { commonlisp_pack().expect("Common Lisp pack should load"); }
+    fn test_commonlisp_pack() {
+        commonlisp_pack().expect("Common Lisp pack should load");
+    }
 
     #[test]
-    fn test_elm_pack() { elm_pack().expect("Elm pack should load"); }
+    fn test_elm_pack() {
+        elm_pack().expect("Elm pack should load");
+    }
 
     #[test]
-    fn test_elisp_pack() { elisp_pack().expect("Emacs Lisp pack should load"); }
+    fn test_elisp_pack() {
+        elisp_pack().expect("Emacs Lisp pack should load");
+    }
 
     #[test]
-    fn test_ini_pack() { ini_pack().expect("INI pack should load"); }
+    fn test_ini_pack() {
+        ini_pack().expect("INI pack should load");
+    }
 
     #[test]
-    fn test_tsx_pack() { tsx_pack().expect("TSX pack should load"); }
+    fn test_tsx_pack() {
+        tsx_pack().expect("TSX pack should load");
+    }
 
     #[test]
-    fn test_matlab_pack() { matlab_pack().expect("MATLAB pack should load"); }
+    fn test_matlab_pack() {
+        matlab_pack().expect("MATLAB pack should load");
+    }
 
     #[test]
-    fn test_markdown_pack() { markdown_pack().expect("Markdown pack should load"); }
+    fn test_markdown_pack() {
+        markdown_pack().expect("Markdown pack should load");
+    }
 
     #[test]
-    fn test_clojure_pack() { clojure_pack().expect("Clojure pack should load"); }
+    fn test_clojure_pack() {
+        clojure_pack().expect("Clojure pack should load");
+    }
 
     #[test]
-    fn test_cuda_pack() { cuda_pack().expect("CUDA pack should load"); }
+    fn test_cuda_pack() {
+        cuda_pack().expect("CUDA pack should load");
+    }
 
     #[test]
-    fn test_vb6_pack() { vb6_pack().expect("VB6 pack should load"); }
+    fn test_vb6_pack() {
+        vb6_pack().expect("VB6 pack should load");
+    }
 
     #[test]
     fn test_vb6_e2e_smoke() {
@@ -848,24 +1199,46 @@ Private Sub Helper()
     Initialize(result)
 End Sub
 "#;
-        let extraction = infigraph_core::extract::extract_file(
-            "TestClass.cls",
-            src.as_bytes(),
-            &pack,
-        ).expect("extract_file should succeed");
+        let extraction =
+            infigraph_core::extract::extract_file("TestClass.cls", src.as_bytes(), &pack)
+                .expect("extract_file should succeed");
 
         let symbol_names: Vec<&str> = extraction.symbols.iter().map(|s| s.name.as_str()).collect();
         println!("Symbols: {:?}", symbol_names);
-        println!("Symbol kinds: {:?}", extraction.symbols.iter().map(|s| format!("{} ({:?})", s.name, s.kind)).collect::<Vec<_>>());
-        println!("Relations: {:?}", extraction.relations.iter().map(|r| format!("{} -> {}", r.source_id, r.target_id)).collect::<Vec<_>>());
+        println!(
+            "Symbol kinds: {:?}",
+            extraction
+                .symbols
+                .iter()
+                .map(|s| format!("{} ({:?})", s.name, s.kind))
+                .collect::<Vec<_>>()
+        );
+        println!(
+            "Relations: {:?}",
+            extraction
+                .relations
+                .iter()
+                .map(|r| format!("{} -> {}", r.source_id, r.target_id))
+                .collect::<Vec<_>>()
+        );
 
         // Verify module symbol
         let module = extraction.symbols.iter().find(|s| s.name == "TestClass");
-        assert!(module.is_some(), "Expected Module symbol 'TestClass', got: {:?}", symbol_names);
-        assert_eq!(module.unwrap().kind, infigraph_core::model::SymbolKind::Module);
+        assert!(
+            module.is_some(),
+            "Expected Module symbol 'TestClass', got: {:?}",
+            symbol_names
+        );
+        assert_eq!(
+            module.unwrap().kind,
+            infigraph_core::model::SymbolKind::Module
+        );
 
         // Verify functions/subs
-        assert!(symbol_names.contains(&"Initialize"), "Expected 'Initialize'");
+        assert!(
+            symbol_names.contains(&"Initialize"),
+            "Expected 'Initialize'"
+        );
         assert!(symbol_names.contains(&"GetName"), "Expected 'GetName'");
         assert!(symbol_names.contains(&"Helper"), "Expected 'Helper'");
 
@@ -873,22 +1246,37 @@ End Sub
         assert!(symbol_names.contains(&"mName"), "Expected 'mName'");
 
         // Verify call relations exist — Helper calls GetName and Initialize
-        assert!(!extraction.relations.is_empty(), "Expected call relations from Helper");
+        assert!(
+            !extraction.relations.is_empty(),
+            "Expected call relations from Helper"
+        );
 
-        let relation_pairs: Vec<(&str, &str)> = extraction.relations.iter()
+        let relation_pairs: Vec<(&str, &str)> = extraction
+            .relations
+            .iter()
             .map(|r| (r.source_id.as_str(), r.target_id.as_str()))
             .collect();
         println!("Relation pairs: {:?}", relation_pairs);
 
-        let helper_calls_getname = extraction.relations.iter().any(|r| {
-            r.source_id.ends_with("::Helper") && r.target_id.ends_with("::GetName")
-        });
-        let helper_calls_initialize = extraction.relations.iter().any(|r| {
-            r.source_id.ends_with("::Helper") && r.target_id.ends_with("::Initialize")
-        });
+        let helper_calls_getname = extraction
+            .relations
+            .iter()
+            .any(|r| r.source_id.ends_with("::Helper") && r.target_id.ends_with("::GetName"));
+        let helper_calls_initialize = extraction
+            .relations
+            .iter()
+            .any(|r| r.source_id.ends_with("::Helper") && r.target_id.ends_with("::Initialize"));
 
-        assert!(helper_calls_getname, "Expected Helper -> GetName call edge, got: {:?}", relation_pairs);
-        assert!(helper_calls_initialize, "Expected Helper -> Initialize call edge, got: {:?}", relation_pairs);
+        assert!(
+            helper_calls_getname,
+            "Expected Helper -> GetName call edge, got: {:?}",
+            relation_pairs
+        );
+        assert!(
+            helper_calls_initialize,
+            "Expected Helper -> Initialize call edge, got: {:?}",
+            relation_pairs
+        );
     }
 
     #[test]
@@ -901,34 +1289,60 @@ INSERT INTO target_table SELECT * FROM input_table;";
         let extraction = infigraph_core::extract::extract_file("test.sql", sql, &pack).unwrap();
 
         let sym_names: Vec<&str> = extraction.symbols.iter().map(|s| s.name.as_str()).collect();
-        assert!(sym_names.contains(&"output"), "expected CREATE TABLE output");
+        assert!(
+            sym_names.contains(&"output"),
+            "expected CREATE TABLE output"
+        );
         assert!(sym_names.contains(&"cte1"), "expected CTE cte1");
         assert!(sym_names.contains(&"cte2"), "expected CTE cte2");
 
         let has_edge = |src_suffix: &str, tgt_suffix: &str| {
-            extraction.relations.iter().any(|r| {
-                r.source_id.ends_with(src_suffix) && r.target_id.ends_with(tgt_suffix)
-            })
+            extraction
+                .relations
+                .iter()
+                .any(|r| r.source_id.ends_with(src_suffix) && r.target_id.ends_with(tgt_suffix))
         };
-        assert!(has_edge("::output", "::source_a"), "expected output -> source_a");
-        assert!(has_edge("::output", "::source_b"), "expected output -> source_b");
-        assert!(has_edge("::cte1", "::base_table"), "expected cte1 -> base_table");
+        assert!(
+            has_edge("::output", "::source_a"),
+            "expected output -> source_a"
+        );
+        assert!(
+            has_edge("::output", "::source_b"),
+            "expected output -> source_b"
+        );
+        assert!(
+            has_edge("::cte1", "::base_table"),
+            "expected cte1 -> base_table"
+        );
         assert!(has_edge("::cte2", "::cte1"), "expected cte2 -> cte1");
     }
 
     #[test]
     fn test_sql_spark_extraction_real() {
         let sample_dir = std::path::Path::new("/tmp/efp-group-sql-samples");
-        if !sample_dir.exists() { println!("skipping — samples not found"); return; }
+        if !sample_dir.exists() {
+            println!("skipping — samples not found");
+            return;
+        }
         let pack = sql_pack().unwrap();
         for entry in std::fs::read_dir(sample_dir).unwrap().flatten() {
             let p = entry.path();
-            if p.extension().and_then(|e| e.to_str()) != Some("sql") { continue; }
-            let Ok(src) = std::fs::read(&p) else { continue; };
-            if src.is_empty() { continue; }
+            if p.extension().and_then(|e| e.to_str()) != Some("sql") {
+                continue;
+            }
+            let Ok(src) = std::fs::read(&p) else {
+                continue;
+            };
+            if src.is_empty() {
+                continue;
+            }
             let fname = p.file_name().unwrap().to_string_lossy().to_string();
             match infigraph_core::extract::extract_file(&fname, &src, &pack) {
-                Ok(e) => println!("{fname}: {} symbols, {} relations", e.symbols.len(), e.relations.len()),
+                Ok(e) => println!(
+                    "{fname}: {} symbols, {} relations",
+                    e.symbols.len(),
+                    e.relations.len()
+                ),
                 Err(err) => println!("{fname}: EXTRACT ERROR: {err}"),
             }
         }
@@ -947,94 +1361,160 @@ LEFT JOIN risk_rules b ON a.id = b.assessment_id;";
 
         let extraction = infigraph_core::extract::extract_file("notebook.sql", sql, &pack).unwrap();
 
-        assert!(!extraction.relations.is_empty(), "expected file-level relations from notebook SQL");
+        assert!(
+            !extraction.relations.is_empty(),
+            "expected file-level relations from notebook SQL"
+        );
         let has_edge = |tgt: &str| {
-            extraction.relations.iter().any(|r| r.target_id.ends_with(tgt))
+            extraction
+                .relations
+                .iter()
+                .any(|r| r.target_id.ends_with(tgt))
         };
         assert!(has_edge("::fraud_360_rpt"), "expected ref to fraud_360_rpt");
-        assert!(has_edge("::risk_assessment"), "expected ref to risk_assessment");
+        assert!(
+            has_edge("::risk_assessment"),
+            "expected ref to risk_assessment"
+        );
         assert!(has_edge("::risk_rules"), "expected ref to risk_rules");
 
-        let file_sourced = extraction.relations.iter().any(|r| r.source_id.contains("notebook.sql"));
-        assert!(file_sourced, "expected file-level source for notebook relations");
+        let file_sourced = extraction
+            .relations
+            .iter()
+            .any(|r| r.source_id.contains("notebook.sql"));
+        assert!(
+            file_sourced,
+            "expected file-level source for notebook relations"
+        );
     }
 
     #[test]
     fn test_sql_dialect_coverage() {
         let pack = sql_pack().unwrap();
 
+        #[allow(clippy::type_complexity)]
         let cases: Vec<(&str, &[u8], &[&str], &[(&str, &str)])> = vec![
             // (label, sql, expected_targets, expected_edges as (src_suffix, tgt_suffix))
 
             // Spark SQL
-            ("spark_ctas", b"CREATE TABLE output AS SELECT * FROM src_a JOIN src_b ON a.id = b.id;" as &[u8],
-             &["src_a", "src_b"], &[("::output", "::src_a"), ("::output", "::src_b")]),
-            ("spark_insert_overwrite",
-             b"INSERT OVERWRITE TABLE target SELECT * FROM source;",
-             &["source"], &[]),
-            ("spark_cte",
-             b"WITH stg AS (SELECT * FROM raw_events) SELECT * FROM stg;",
-             &["raw_events", "stg"], &[("::stg", "::raw_events")]),
-
+            (
+                "spark_ctas",
+                b"CREATE TABLE output AS SELECT * FROM src_a JOIN src_b ON a.id = b.id;" as &[u8],
+                &["src_a", "src_b"],
+                &[("::output", "::src_a"), ("::output", "::src_b")],
+            ),
+            (
+                "spark_insert_overwrite",
+                b"INSERT OVERWRITE TABLE target SELECT * FROM source;",
+                &["source"],
+                &[],
+            ),
+            (
+                "spark_cte",
+                b"WITH stg AS (SELECT * FROM raw_events) SELECT * FROM stg;",
+                &["raw_events", "stg"],
+                &[("::stg", "::raw_events")],
+            ),
             // T-SQL / SQL Server
-            ("tsql_select_into",
-             b"SELECT * INTO new_table FROM old_table;",
-             &["old_table"], &[]),
-            ("tsql_cte_insert",
-             b"WITH cte AS (SELECT * FROM src) INSERT INTO tgt SELECT * FROM cte;",
-             &["src", "cte"], &[("::cte", "::src")]),
-
+            (
+                "tsql_select_into",
+                b"SELECT * INTO new_table FROM old_table;",
+                &["old_table"],
+                &[],
+            ),
+            (
+                "tsql_cte_insert",
+                b"WITH cte AS (SELECT * FROM src) INSERT INTO tgt SELECT * FROM cte;",
+                &["src", "cte"],
+                &[("::cte", "::src")],
+            ),
             // PostgreSQL
-            ("pg_ctas",
-             b"CREATE TABLE summary AS SELECT dept, count(*) FROM employees GROUP BY dept;",
-             &["employees"], &[("::summary", "::employees")]),
-            ("pg_with_insert",
-             b"WITH src AS (SELECT * FROM raw) INSERT INTO clean SELECT * FROM src;",
-             &["raw", "src"], &[("::src", "::raw")]),
-
+            (
+                "pg_ctas",
+                b"CREATE TABLE summary AS SELECT dept, count(*) FROM employees GROUP BY dept;",
+                &["employees"],
+                &[("::summary", "::employees")],
+            ),
+            (
+                "pg_with_insert",
+                b"WITH src AS (SELECT * FROM raw) INSERT INTO clean SELECT * FROM src;",
+                &["raw", "src"],
+                &[("::src", "::raw")],
+            ),
             // MySQL
-            ("mysql_insert_ignore",
-             b"INSERT IGNORE INTO users SELECT * FROM staging_users;",
-             &["staging_users"], &[]),
-
+            (
+                "mysql_insert_ignore",
+                b"INSERT IGNORE INTO users SELECT * FROM staging_users;",
+                &["staging_users"],
+                &[],
+            ),
             // BigQuery style
-            ("bq_create_or_replace",
-             b"CREATE OR REPLACE TABLE output AS SELECT * FROM input;",
-             &["input"], &[]),
-
+            (
+                "bq_create_or_replace",
+                b"CREATE OR REPLACE TABLE output AS SELECT * FROM input;",
+                &["input"],
+                &[],
+            ),
             // Common patterns
-            ("subquery",
-             b"SELECT * FROM (SELECT id FROM raw_data) sub;",
-             &["raw_data"], &[]),
-            ("multi_join",
-             b"SELECT * FROM a JOIN b ON a.id = b.id LEFT JOIN c ON b.id = c.id;",
-             &["a", "b", "c"], &[]),
-            ("union_all",
-             b"SELECT * FROM t1 UNION ALL SELECT * FROM t2;",
-             &["t1", "t2"], &[]),
+            (
+                "subquery",
+                b"SELECT * FROM (SELECT id FROM raw_data) sub;",
+                &["raw_data"],
+                &[],
+            ),
+            (
+                "multi_join",
+                b"SELECT * FROM a JOIN b ON a.id = b.id LEFT JOIN c ON b.id = c.id;",
+                &["a", "b", "c"],
+                &[],
+            ),
+            (
+                "union_all",
+                b"SELECT * FROM t1 UNION ALL SELECT * FROM t2;",
+                &["t1", "t2"],
+                &[],
+            ),
         ];
 
         let mut failures = Vec::new();
 
         for (label, sql, expected_targets, expected_edges) in &cases {
             let extraction = infigraph_core::extract::extract_file("test.sql", sql, &pack).unwrap();
-            let all_targets: Vec<&str> = extraction.relations.iter()
+            let all_targets: Vec<&str> = extraction
+                .relations
+                .iter()
                 .map(|r| r.target_id.as_str())
                 .collect();
 
             for tgt in *expected_targets {
                 let suffix = format!("::{}", tgt);
-                if !extraction.relations.iter().any(|r| r.target_id.ends_with(&suffix)) {
-                    failures.push(format!("{}: missing target ref to {}, got {:?}", label, tgt, all_targets));
+                if !extraction
+                    .relations
+                    .iter()
+                    .any(|r| r.target_id.ends_with(&suffix))
+                {
+                    failures.push(format!(
+                        "{}: missing target ref to {}, got {:?}",
+                        label, tgt, all_targets
+                    ));
                 }
             }
 
             for (src_suf, tgt_suf) in *expected_edges {
-                if !extraction.relations.iter().any(|r| r.source_id.ends_with(src_suf) && r.target_id.ends_with(tgt_suf)) {
-                    let edges: Vec<_> = extraction.relations.iter()
+                if !extraction
+                    .relations
+                    .iter()
+                    .any(|r| r.source_id.ends_with(src_suf) && r.target_id.ends_with(tgt_suf))
+                {
+                    let edges: Vec<_> = extraction
+                        .relations
+                        .iter()
                         .map(|r| format!("{} -> {}", r.source_id, r.target_id))
                         .collect();
-                    failures.push(format!("{}: missing edge {} -> {}, got {:?}", label, src_suf, tgt_suf, edges));
+                    failures.push(format!(
+                        "{}: missing edge {} -> {}, got {:?}",
+                        label, src_suf, tgt_suf, edges
+                    ));
                 }
             }
         }
@@ -1073,28 +1553,46 @@ LEFT JOIN risk_rules b ON a.id = b.assessment_id;";
         let mut failures = Vec::new();
 
         for (label, sql, expected_targets) in &cases {
-            let extraction = infigraph_core::extract::extract_file("notebook.sql", sql, &pack).unwrap();
-            let all_targets: Vec<String> = extraction.relations.iter()
+            let extraction =
+                infigraph_core::extract::extract_file("notebook.sql", sql, &pack).unwrap();
+            let all_targets: Vec<String> = extraction
+                .relations
+                .iter()
                 .map(|r| r.target_id.clone())
                 .collect();
 
             for tgt in *expected_targets {
                 let suffix = format!("::{}", tgt);
-                if !extraction.relations.iter().any(|r| r.target_id.ends_with(&suffix)) {
-                    failures.push(format!("{}: missing target ref to {}, got {:?}", label, tgt, all_targets));
+                if !extraction
+                    .relations
+                    .iter()
+                    .any(|r| r.target_id.ends_with(&suffix))
+                {
+                    failures.push(format!(
+                        "{}: missing target ref to {}, got {:?}",
+                        label, tgt, all_targets
+                    ));
                 }
             }
 
-            let all_file_sourced = extraction.relations.iter()
+            let all_file_sourced = extraction
+                .relations
+                .iter()
                 .filter(|r| !r.source_id.contains("::"))
-                .count() == 0;
+                .count()
+                == 0;
             if !all_file_sourced {
-                let non_qualified: Vec<_> = extraction.relations.iter()
+                let non_qualified: Vec<_> = extraction
+                    .relations
+                    .iter()
                     .filter(|r| !r.source_id.contains("::"))
                     .map(|r| r.source_id.as_str())
                     .collect();
                 if !non_qualified.is_empty() {
-                    failures.push(format!("{}: source_ids without '::': {:?}", label, non_qualified));
+                    failures.push(format!(
+                        "{}: source_ids without '::': {:?}",
+                        label, non_qualified
+                    ));
                 }
             }
         }
@@ -1108,6 +1606,7 @@ LEFT JOIN risk_rules b ON a.id = b.assessment_id;";
     fn test_sql_complex_nested_and_dml() {
         let pack = sql_pack().unwrap();
 
+        #[allow(clippy::type_complexity)]
         let cases: Vec<(&str, &[u8], &[&str], &[(&str, &str)])> = vec![
             // Nested subqueries in FROM
             ("nested_subquery",
@@ -1197,23 +1696,41 @@ LEFT JOIN risk_rules b ON a.id = b.assessment_id;";
 
         for (label, sql, expected_targets, expected_edges) in &cases {
             let extraction = infigraph_core::extract::extract_file("test.sql", sql, &pack).unwrap();
-            let all_targets: Vec<String> = extraction.relations.iter()
+            let all_targets: Vec<String> = extraction
+                .relations
+                .iter()
                 .map(|r| r.target_id.clone())
                 .collect();
-            let all_edges: Vec<String> = extraction.relations.iter()
+            let all_edges: Vec<String> = extraction
+                .relations
+                .iter()
                 .map(|r| format!("{} -> {}", r.source_id, r.target_id))
                 .collect();
 
             for tgt in *expected_targets {
                 let suffix = format!("::{}", tgt);
-                if !extraction.relations.iter().any(|r| r.target_id.ends_with(&suffix)) {
-                    failures.push(format!("{}: missing target ref to '{}', targets: {:?}", label, tgt, all_targets));
+                if !extraction
+                    .relations
+                    .iter()
+                    .any(|r| r.target_id.ends_with(&suffix))
+                {
+                    failures.push(format!(
+                        "{}: missing target ref to '{}', targets: {:?}",
+                        label, tgt, all_targets
+                    ));
                 }
             }
 
             for (src_suf, tgt_suf) in *expected_edges {
-                if !extraction.relations.iter().any(|r| r.source_id.ends_with(src_suf) && r.target_id.ends_with(tgt_suf)) {
-                    failures.push(format!("{}: missing edge {} -> {}, edges: {:?}", label, src_suf, tgt_suf, all_edges));
+                if !extraction
+                    .relations
+                    .iter()
+                    .any(|r| r.source_id.ends_with(src_suf) && r.target_id.ends_with(tgt_suf))
+                {
+                    failures.push(format!(
+                        "{}: missing edge {} -> {}, edges: {:?}",
+                        label, src_suf, tgt_suf, all_edges
+                    ));
                 }
             }
         }
@@ -1222,5 +1739,4 @@ LEFT JOIN risk_rules b ON a.id = b.assessment_id;";
             panic!("Complex nested/DML failures:\n{}", failures.join("\n"));
         }
     }
-
 }

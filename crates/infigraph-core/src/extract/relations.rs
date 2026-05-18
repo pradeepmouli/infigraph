@@ -8,12 +8,7 @@ use crate::model::{Relation, RelationKind, Span};
 ///   @call.func / @call.site          — function calls
 ///   @import.module / @import.name    — imports
 ///   @inherit.child / @inherit.parent — inheritance
-pub fn extract_relations(
-    file: &str,
-    source: &[u8],
-    root: Node,
-    query: &Query,
-) -> Vec<Relation> {
+pub fn extract_relations(file: &str, source: &[u8], root: Node, query: &Query) -> Vec<Relation> {
     let mut cursor = QueryCursor::new();
     let mut matches = cursor.matches(query, root, source);
 
@@ -75,8 +70,8 @@ pub fn extract_relations(
         // Fall back to file path so top-level references (e.g. SQL SELECT without DDL) still produce edges.
         if rel_kind == Some(RelationKind::Calls) && source_name.is_none() {
             if let Some(site) = site_node {
-                source_name = find_enclosing_function(site, source)
-                    .or_else(|| Some(file.to_string()));
+                source_name =
+                    find_enclosing_function(site, source).or_else(|| Some(file.to_string()));
             }
         }
 

@@ -6,7 +6,7 @@
 ///            packages.config, *.csproj, pubspec.yaml
 use std::path::Path;
 
-use anyhow::{Result};
+use anyhow::Result;
 
 use crate::graph::GraphStore;
 
@@ -30,10 +30,18 @@ pub fn index_manifests(root: &Path, store: &GraphStore) -> Result<Vec<ManifestRe
     let mut results = Vec::new();
 
     let candidates = [
-        "package.json", "Cargo.toml", "go.mod", "pom.xml",
-        "build.gradle", "build.gradle.kts", "requirements.txt",
-        "pyproject.toml", "Gemfile", "composer.json",
-        "packages.config", "pubspec.yaml",
+        "package.json",
+        "Cargo.toml",
+        "go.mod",
+        "pom.xml",
+        "build.gradle",
+        "build.gradle.kts",
+        "requirements.txt",
+        "pyproject.toml",
+        "Gemfile",
+        "composer.json",
+        "packages.config",
+        "pubspec.yaml",
     ];
 
     for name in &candidates {
@@ -56,11 +64,12 @@ pub fn index_manifests(root: &Path, store: &GraphStore) -> Result<Vec<ManifestRe
 pub fn query_deps(store: &GraphStore) -> Result<Vec<DepEntry>> {
     let conn = store.connection()?;
     let q = "MATCH (d:Dependency) RETURN d.name, d.version, d.ecosystem, d.is_dev ORDER BY d.ecosystem, d.name";
-    let mut result = conn.query(q)
+    let result = conn
+        .query(q)
         .map_err(|e| anyhow::anyhow!("query failed: {e}"))?;
 
     let mut deps = Vec::new();
-    while let Some(row) = result.next() {
+    for row in result {
         if row.len() >= 4 {
             deps.push(DepEntry {
                 name: row[0].to_string().trim_matches('"').to_string(),
@@ -139,12 +148,17 @@ fn parse_cargo_toml(content: &str, path: &Path) -> Result<ManifestResult> {
     let v: toml::Value = content.parse()?;
     let mut deps = Vec::new();
 
-    for (section, is_dev) in &[("dependencies", false), ("dev-dependencies", true), ("build-dependencies", true)] {
+    for (section, is_dev) in &[
+        ("dependencies", false),
+        ("dev-dependencies", true),
+        ("build-dependencies", true),
+    ] {
         if let Some(table) = v.get(section).and_then(|d| d.as_table()) {
             for (name, val) in table {
                 let version = match val {
                     toml::Value::String(s) => s.clone(),
-                    toml::Value::Table(t) => t.get("version")
+                    toml::Value::Table(t) => t
+                        .get("version")
                         .and_then(|v| v.as_str())
                         .unwrap_or("*")
                         .to_string(),
@@ -188,14 +202,17 @@ fn parse_go_mod(content: &str, path: &Path) -> Result<ManifestResult> {
         // Single-line: require module v1.2.3
         let parts: Vec<&str> = if in_require {
             line.split_whitespace().collect()
-        } else if line.starts_with("require ") {
-            line["require ".len()..].split_whitespace().collect()
+        } else if let Some(stripped) = line.strip_prefix("require ") {
+            stripped.split_whitespace().collect()
         } else {
-            continue
+            continue;
         };
 
         if parts.len() >= 2 {
-            let is_indirect = parts.get(2).map(|s| s.contains("indirect")).unwrap_or(false);
+            let is_indirect = parts
+                .get(2)
+                .map(|s| s.contains("indirect"))
+                .unwrap_or(false);
             deps.push(DepEntry {
                 name: parts[0].to_string(),
                 version: parts[1].to_string(),
@@ -249,11 +266,23 @@ fn parse_gradle(content: &str, path: &Path) -> Result<ManifestResult> {
     let mut deps = Vec::new();
     for cap in re.captures_iter(content) {
         let spec = cap.get(1).map(|m| m.as_str()).unwrap_or("");
-        let is_dev = cap.get(0).map(|m| m.as_str().starts_with("test")).unwrap_or(false);
+        let is_dev = cap
+            .get(0)
+            .map(|m| m.as_str().starts_with("test"))
+            .unwrap_or(false);
         let parts: Vec<&str> = spec.split(':').collect();
-        let name = if parts.len() >= 2 { format!("{}:{}", parts[0], parts[1]) } else { spec.to_string() };
+        let name = if parts.len() >= 2 {
+            format!("{}:{}", parts[0], parts[1])
+        } else {
+            spec.to_string()
+        };
         let version = parts.get(2).unwrap_or(&"*").to_string();
-        deps.push(DepEntry { name, version, ecosystem: "gradle".to_string(), is_dev });
+        deps.push(DepEntry {
+            name,
+            version,
+            ecosystem: "gradle".to_string(),
+            is_dev,
+        });
     }
 
     Ok(ManifestResult {
@@ -267,15 +296,25 @@ fn parse_requirements_txt(content: &str, path: &Path) -> Result<ManifestResult> 
     let mut deps = Vec::new();
     for line in content.lines() {
         let line = line.trim();
-        if line.is_empty() || line.starts_with('#') || line.starts_with('-') { continue; }
+        if line.is_empty() || line.starts_with('#') || line.starts_with('-') {
+            continue;
+        }
         // Handle: name==1.0, name>=1.0, name~=1.0, name
-        let (name, version) = if let Some(idx) = line.find(|c| c == '=' || c == '>' || c == '<' || c == '~' || c == '!') {
-            (line[..idx].trim().to_string(), line[idx..].trim().to_string())
+        let (name, version) = if let Some(idx) = line.find(['=', '>', '<', '~', '!']) {
+            (
+                line[..idx].trim().to_string(),
+                line[idx..].trim().to_string(),
+            )
         } else {
             (line.to_string(), "*".to_string())
         };
         if !name.is_empty() {
-            deps.push(DepEntry { name, version, ecosystem: "pip".to_string(), is_dev: false });
+            deps.push(DepEntry {
+                name,
+                version,
+                ecosystem: "pip".to_string(),
+                is_dev: false,
+            });
         }
     }
 
@@ -291,33 +330,68 @@ fn parse_pyproject_toml(content: &str, path: &Path) -> Result<ManifestResult> {
     let mut deps = Vec::new();
 
     // PEP 621: [project] dependencies
-    if let Some(arr) = v.get("project").and_then(|p| p.get("dependencies")).and_then(|d| d.as_array()) {
+    if let Some(arr) = v
+        .get("project")
+        .and_then(|p| p.get("dependencies"))
+        .and_then(|d| d.as_array())
+    {
         for dep in arr {
             if let Some(s) = dep.as_str() {
                 let (name, ver) = split_pep508(s);
-                deps.push(DepEntry { name, version: ver, ecosystem: "pip".to_string(), is_dev: false });
+                deps.push(DepEntry {
+                    name,
+                    version: ver,
+                    ecosystem: "pip".to_string(),
+                    is_dev: false,
+                });
             }
         }
     }
     // Poetry: [tool.poetry.dependencies]
-    if let Some(table) = v.get("tool").and_then(|t| t.get("poetry")).and_then(|p| p.get("dependencies")).and_then(|d| d.as_table()) {
+    if let Some(table) = v
+        .get("tool")
+        .and_then(|t| t.get("poetry"))
+        .and_then(|p| p.get("dependencies"))
+        .and_then(|d| d.as_table())
+    {
         for (name, val) in table {
-            if name == "python" { continue; }
+            if name == "python" {
+                continue;
+            }
             let version = match val {
                 toml::Value::String(s) => s.clone(),
-                toml::Value::Table(t) => t.get("version").and_then(|v| v.as_str()).unwrap_or("*").to_string(),
+                toml::Value::Table(t) => t
+                    .get("version")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("*")
+                    .to_string(),
                 _ => "*".to_string(),
             };
-            deps.push(DepEntry { name: name.clone(), version, ecosystem: "pip".to_string(), is_dev: false });
+            deps.push(DepEntry {
+                name: name.clone(),
+                version,
+                ecosystem: "pip".to_string(),
+                is_dev: false,
+            });
         }
     }
-    if let Some(table) = v.get("tool").and_then(|t| t.get("poetry")).and_then(|p| p.get("dev-dependencies")).and_then(|d| d.as_table()) {
+    if let Some(table) = v
+        .get("tool")
+        .and_then(|t| t.get("poetry"))
+        .and_then(|p| p.get("dev-dependencies"))
+        .and_then(|d| d.as_table())
+    {
         for (name, val) in table {
             let version = match val {
                 toml::Value::String(s) => s.clone(),
                 _ => "*".to_string(),
             };
-            deps.push(DepEntry { name: name.clone(), version, ecosystem: "pip".to_string(), is_dev: true });
+            deps.push(DepEntry {
+                name: name.clone(),
+                version,
+                ecosystem: "pip".to_string(),
+                is_dev: true,
+            });
         }
     }
 
@@ -338,11 +412,18 @@ fn parse_gemfile(content: &str, path: &Path) -> Result<ManifestResult> {
         if trimmed.starts_with("group :test") || trimmed.starts_with("group :development") {
             in_test_group = true;
         }
-        if trimmed == "end" { in_test_group = false; }
+        if trimmed == "end" {
+            in_test_group = false;
+        }
         if let Some(cap) = re.captures(trimmed) {
             let name = cap.get(1).map(|m| m.as_str()).unwrap_or("").to_string();
             let version = cap.get(2).map(|m| m.as_str()).unwrap_or("*").to_string();
-            deps.push(DepEntry { name, version, ecosystem: "gem".to_string(), is_dev: in_test_group });
+            deps.push(DepEntry {
+                name,
+                version,
+                ecosystem: "gem".to_string(),
+                is_dev: in_test_group,
+            });
         }
     }
 
@@ -360,7 +441,9 @@ fn parse_composer_json(content: &str, path: &Path) -> Result<ManifestResult> {
     for (key, is_dev) in &[("require", false), ("require-dev", true)] {
         if let Some(obj) = v.get(*key).and_then(|d| d.as_object()) {
             for (name, ver) in obj {
-                if name == "php" { continue; }
+                if name == "php" {
+                    continue;
+                }
                 deps.push(DepEntry {
                     name: name.clone(),
                     version: ver.as_str().unwrap_or("*").to_string(),
@@ -410,17 +493,37 @@ fn parse_pubspec_yaml(content: &str, path: &Path) -> Result<ManifestResult> {
     let dep_re = regex::Regex::new(r"^\s{2}(\w[\w_-]*):\s*(.*)$").unwrap();
 
     for line in content.lines() {
-        if line.starts_with("dependencies:") { in_deps = true; in_dev_deps = false; continue; }
-        if line.starts_with("dev_dependencies:") { in_dev_deps = true; in_deps = false; continue; }
-        if !line.starts_with(' ') && !line.is_empty() { in_deps = false; in_dev_deps = false; }
+        if line.starts_with("dependencies:") {
+            in_deps = true;
+            in_dev_deps = false;
+            continue;
+        }
+        if line.starts_with("dev_dependencies:") {
+            in_dev_deps = true;
+            in_deps = false;
+            continue;
+        }
+        if !line.starts_with(' ') && !line.is_empty() {
+            in_deps = false;
+            in_dev_deps = false;
+        }
 
         if in_deps || in_dev_deps {
             if let Some(cap) = dep_re.captures(line) {
                 let name = cap[1].to_string();
                 let raw_ver = cap[2].trim().to_string();
-                let version = if raw_ver.is_empty() || raw_ver == "any" { "*".to_string() } else { raw_ver };
+                let version = if raw_ver.is_empty() || raw_ver == "any" {
+                    "*".to_string()
+                } else {
+                    raw_ver
+                };
                 if name != "flutter" && name != "sdk" {
-                    deps.push(DepEntry { name, version, ecosystem: "pub".to_string(), is_dev: in_dev_deps });
+                    deps.push(DepEntry {
+                        name,
+                        version,
+                        ecosystem: "pub".to_string(),
+                        is_dev: in_dev_deps,
+                    });
                 }
             }
         }
@@ -434,20 +537,32 @@ fn parse_pubspec_yaml(content: &str, path: &Path) -> Result<ManifestResult> {
 }
 
 fn scan_csproj(root: &Path, store: &GraphStore, results: &mut Vec<ManifestResult>) -> Result<()> {
-    let re = regex::Regex::new(r#"<PackageReference\s+Include="([^"]+)"\s+Version="([^"]+)""#).unwrap();
+    let re =
+        regex::Regex::new(r#"<PackageReference\s+Include="([^"]+)"\s+Version="([^"]+)""#).unwrap();
     scan_csproj_dir(root, &re, store, results)
 }
 
-fn scan_csproj_dir(dir: &Path, re: &regex::Regex, store: &GraphStore, results: &mut Vec<ManifestResult>) -> Result<()> {
+fn scan_csproj_dir(
+    dir: &Path,
+    re: &regex::Regex,
+    store: &GraphStore,
+    results: &mut Vec<ManifestResult>,
+) -> Result<()> {
     let ignore = [".git", "node_modules", "target", "bin", "obj"];
-    let Ok(entries) = std::fs::read_dir(dir) else { return Ok(()) };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Ok(());
+    };
     for entry in entries.flatten() {
         let path = entry.path();
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
         if path.is_dir() && !ignore.contains(&name_str.as_ref()) {
             scan_csproj_dir(&path, re, store, results)?;
-        } else if path.extension().map(|e| e == "csproj" || e == "fsproj" || e == "vbproj").unwrap_or(false) {
+        } else if path
+            .extension()
+            .map(|e| e == "csproj" || e == "fsproj" || e == "vbproj")
+            .unwrap_or(false)
+        {
             if let Ok(content) = std::fs::read_to_string(&path) {
                 let mut deps = Vec::new();
                 for cap in re.captures_iter(&content) {
@@ -479,7 +594,10 @@ fn store_manifest(store: &GraphStore, result: &ManifestResult) -> Result<()> {
     for dep in &result.deps {
         let id = format!("{}::{}", dep.ecosystem, dep.name);
         // Upsert Dependency node
-        let check = format!("MATCH (d:Dependency) WHERE d.id = '{}' RETURN d.id", escape(&id));
+        let check = format!(
+            "MATCH (d:Dependency) WHERE d.id = '{}' RETURN d.id",
+            escape(&id)
+        );
         let mut r = conn.query(&check).map_err(|e| anyhow::anyhow!("{e}"))?;
         if r.next().is_none() {
             let insert = format!(
@@ -494,7 +612,7 @@ fn store_manifest(store: &GraphStore, result: &ManifestResult) -> Result<()> {
         let rel = format!(
             "MATCH (m:Module), (d:Dependency) WHERE m.file CONTAINS '{}' AND d.id = '{}' \
              CREATE (m)-[:DEPENDS_ON {{is_dev: {}}}]->(d)",
-            escape(&result.manifest_file.rsplit('/').next().unwrap_or("")),
+            escape(result.manifest_file.rsplit('/').next().unwrap_or("")),
             escape(&id),
             dep.is_dev
         );
@@ -505,7 +623,7 @@ fn store_manifest(store: &GraphStore, result: &ManifestResult) -> Result<()> {
 }
 
 fn split_pep508(s: &str) -> (String, String) {
-    if let Some(idx) = s.find(|c: char| c == '=' || c == '>' || c == '<' || c == '~' || c == '!' || c == '[' || c == ';') {
+    if let Some(idx) = s.find(['=', '>', '<', '~', '!', '[', ';']) {
         (s[..idx].trim().to_string(), s[idx..].trim().to_string())
     } else {
         (s.trim().to_string(), "*".to_string())

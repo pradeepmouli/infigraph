@@ -54,9 +54,7 @@ pub fn detect_clusters(conn: &Connection) -> Result<ClusterStats> {
     let gq = GraphQuery::new(conn);
 
     // Step 1: Fetch all CALLS edges as (source_id, target_id) pairs.
-    let edge_rows = gq.raw_query(
-        "MATCH (a:Symbol)-[:CALLS]->(b:Symbol) RETURN a.id, b.id",
-    )?;
+    let edge_rows = gq.raw_query("MATCH (a:Symbol)-[:CALLS]->(b:Symbol) RETURN a.id, b.id")?;
 
     // Build node index: map symbol ID -> dense integer index.
     let mut id_to_idx: HashMap<String, usize> = HashMap::new();
@@ -251,9 +249,8 @@ fn store_clusters(
     }
 
     let mut cluster_sizes = Vec::new();
-    let mut cluster_idx = 0;
 
-    for (_comm_label, members) in &comm_members {
+    for (cluster_idx, members) in comm_members.values().enumerate() {
         let cluster_id = format!("cluster_{}", cluster_idx);
         let cluster_name = format!("Cluster {}", cluster_idx);
 
@@ -297,7 +294,6 @@ fn store_clusters(
         }
 
         cluster_sizes.push(members.len());
-        cluster_idx += 1;
     }
 
     Ok(ClusterStats {

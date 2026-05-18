@@ -103,9 +103,7 @@ fn query_edges(gq: &GraphQuery) -> Result<Vec<VizEdge>> {
     let mut edges = Vec::new();
 
     // CALLS edges
-    let call_rows = gq.raw_query(
-        "MATCH (a:Symbol)-[:CALLS]->(b:Symbol) RETURN a.id, b.id",
-    )?;
+    let call_rows = gq.raw_query("MATCH (a:Symbol)-[:CALLS]->(b:Symbol) RETURN a.id, b.id")?;
     for row in &call_rows {
         if row.len() >= 2 {
             edges.push(VizEdge {
@@ -117,9 +115,8 @@ fn query_edges(gq: &GraphQuery) -> Result<Vec<VizEdge>> {
     }
 
     // INHERITS edges
-    let inherit_rows = gq.raw_query(
-        "MATCH (a:Symbol)-[:INHERITS]->(b:Symbol) RETURN a.id, b.id",
-    )?;
+    let inherit_rows =
+        gq.raw_query("MATCH (a:Symbol)-[:INHERITS]->(b:Symbol) RETURN a.id, b.id")?;
     for row in &inherit_rows {
         if row.len() >= 2 {
             edges.push(VizEdge {
@@ -131,9 +128,8 @@ fn query_edges(gq: &GraphQuery) -> Result<Vec<VizEdge>> {
     }
 
     // CONTAINS edges (Module -> Symbol)
-    let contains_rows = gq.raw_query(
-        "MATCH (m:Module)-[:CONTAINS]->(s:Symbol) RETURN m.id, s.id",
-    )?;
+    let contains_rows =
+        gq.raw_query("MATCH (m:Module)-[:CONTAINS]->(s:Symbol) RETURN m.id, s.id")?;
     for row in &contains_rows {
         if row.len() >= 2 {
             edges.push(VizEdge {
@@ -232,13 +228,22 @@ fn query_symbol_subgraph(
     let call_rows = gq.raw_query("MATCH (a:Symbol)-[:CALLS]->(b:Symbol) RETURN a.id, b.id")?;
     for row in &call_rows {
         if row.len() >= 2 && id_set.contains(row[0].as_str()) && id_set.contains(row[1].as_str()) {
-            edges.push(VizEdge { from: row[0].clone(), to: row[1].clone(), rel_type: "CALLS".to_string() });
+            edges.push(VizEdge {
+                from: row[0].clone(),
+                to: row[1].clone(),
+                rel_type: "CALLS".to_string(),
+            });
         }
     }
-    let inherit_rows = gq.raw_query("MATCH (a:Symbol)-[:INHERITS]->(b:Symbol) RETURN a.id, b.id")?;
+    let inherit_rows =
+        gq.raw_query("MATCH (a:Symbol)-[:INHERITS]->(b:Symbol) RETURN a.id, b.id")?;
     for row in &inherit_rows {
         if row.len() >= 2 && id_set.contains(row[0].as_str()) && id_set.contains(row[1].as_str()) {
-            edges.push(VizEdge { from: row[0].clone(), to: row[1].clone(), rel_type: "INHERITS".to_string() });
+            edges.push(VizEdge {
+                from: row[0].clone(),
+                to: row[1].clone(),
+                rel_type: "INHERITS".to_string(),
+            });
         }
     }
 

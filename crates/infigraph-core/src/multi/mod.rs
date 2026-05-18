@@ -5,8 +5,8 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::graph::GraphQuery;
-use crate::Infigraph;
 use crate::lang::LanguageRegistry;
+use crate::Infigraph;
 
 /// Global registry stored at ~/.infigraph/registry.json
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -186,10 +186,7 @@ impl Registry {
 /// 1. Route symbols (kind='Route') — from call-expression routing (Express, Gin, etc.)
 /// 2. Decorated functions — docstring contains route decorator (@app.route, #[get], etc.)
 /// 3. Heuristic detect_routes fallback
-pub fn extract_contracts(
-    prism: &Infigraph,
-    service_name: &str,
-) -> Result<Vec<Contract>> {
+pub fn extract_contracts(prism: &Infigraph, service_name: &str) -> Result<Vec<Contract>> {
     let store = prism.store().context("graph not initialized")?;
     let conn = store.connection()?;
     let gq = GraphQuery::new(&conn);
@@ -267,7 +264,8 @@ fn parse_route_from_docstring(doc: &str) -> (String, String) {
     let doc_lower = doc.to_lowercase();
 
     // Extract path from quotes
-    let path = doc.split('"')
+    let path = doc
+        .split('"')
         .chain(doc.split('\''))
         .find(|s| s.starts_with('/'))
         .unwrap_or("")
@@ -276,21 +274,48 @@ fn parse_route_from_docstring(doc: &str) -> (String, String) {
     // Extract method
     let method = if doc_lower.contains("methods") {
         // methods=["GET", "POST"] — take first
-        if doc_lower.contains("\"get\"") || doc_lower.contains("'get'") { "GET" }
-        else if doc_lower.contains("\"post\"") || doc_lower.contains("'post'") { "POST" }
-        else if doc_lower.contains("\"put\"") || doc_lower.contains("'put'") { "PUT" }
-        else if doc_lower.contains("\"delete\"") || doc_lower.contains("'delete'") { "DELETE" }
-        else if doc_lower.contains("\"patch\"") || doc_lower.contains("'patch'") { "PATCH" }
-        else { "UNKNOWN" }
-    } else if doc_lower.contains("@app.get") || doc_lower.contains("#[get") || doc_lower.contains("getmapping") || doc_lower.contains("mapget") {
+        if doc_lower.contains("\"get\"") || doc_lower.contains("'get'") {
+            "GET"
+        } else if doc_lower.contains("\"post\"") || doc_lower.contains("'post'") {
+            "POST"
+        } else if doc_lower.contains("\"put\"") || doc_lower.contains("'put'") {
+            "PUT"
+        } else if doc_lower.contains("\"delete\"") || doc_lower.contains("'delete'") {
+            "DELETE"
+        } else if doc_lower.contains("\"patch\"") || doc_lower.contains("'patch'") {
+            "PATCH"
+        } else {
+            "UNKNOWN"
+        }
+    } else if doc_lower.contains("@app.get")
+        || doc_lower.contains("#[get")
+        || doc_lower.contains("getmapping")
+        || doc_lower.contains("mapget")
+    {
         "GET"
-    } else if doc_lower.contains("@app.post") || doc_lower.contains("#[post") || doc_lower.contains("postmapping") || doc_lower.contains("mappost") {
+    } else if doc_lower.contains("@app.post")
+        || doc_lower.contains("#[post")
+        || doc_lower.contains("postmapping")
+        || doc_lower.contains("mappost")
+    {
         "POST"
-    } else if doc_lower.contains("@app.put") || doc_lower.contains("#[put") || doc_lower.contains("putmapping") || doc_lower.contains("mapput") {
+    } else if doc_lower.contains("@app.put")
+        || doc_lower.contains("#[put")
+        || doc_lower.contains("putmapping")
+        || doc_lower.contains("mapput")
+    {
         "PUT"
-    } else if doc_lower.contains("@app.delete") || doc_lower.contains("#[delete") || doc_lower.contains("deletemapping") || doc_lower.contains("mapdelete") {
+    } else if doc_lower.contains("@app.delete")
+        || doc_lower.contains("#[delete")
+        || doc_lower.contains("deletemapping")
+        || doc_lower.contains("mapdelete")
+    {
         "DELETE"
-    } else if doc_lower.contains("@app.patch") || doc_lower.contains("#[patch") || doc_lower.contains("patchmapping") || doc_lower.contains("mappatch") {
+    } else if doc_lower.contains("@app.patch")
+        || doc_lower.contains("#[patch")
+        || doc_lower.contains("patchmapping")
+        || doc_lower.contains("mappatch")
+    {
         "PATCH"
     } else {
         "UNKNOWN"
@@ -370,7 +395,10 @@ pub fn detect_cross_service_deps(
         if contract.kind == ContractKind::HttpRoute {
             // Normalize path for matching (strip params)
             let normalized = normalize_route_path(&contract.path);
-            route_lookup.insert(normalized, (contract.service.clone(), contract.method.clone()));
+            route_lookup.insert(
+                normalized,
+                (contract.service.clone(), contract.method.clone()),
+            );
         }
     }
 
@@ -429,14 +457,15 @@ pub fn detect_cross_service_deps(
             if let Some((target_svc, target_method)) = route_lookup.get(&normalized) {
                 if target_svc != repo_name {
                     // Try to resolve line hint to enclosing symbol ID
-                    let caller_id = if symbol_hint.starts_with("line:") {
-                        let line_num: i32 = symbol_hint[5..].parse().unwrap_or(0);
+                    let caller_id = if let Some(stripped) = symbol_hint.strip_prefix("line:") {
+                        let line_num: i32 = stripped.parse().unwrap_or(0);
                         let escaped_file = file.replace('\'', "\\'");
                         let q = format!(
                             "MATCH (s:Symbol) WHERE s.file = '{}' AND s.start_line <= {} AND s.end_line >= {} RETURN s.id ORDER BY (s.end_line - s.start_line) ASC LIMIT 1",
                             escaped_file, line_num, line_num
                         );
-                        gq.raw_query(&q).ok()
+                        gq.raw_query(&q)
+                            .ok()
                             .and_then(|rows| rows.into_iter().next())
                             .and_then(|row| row.into_iter().next())
                             .unwrap_or_else(|| format!("{}:{}", file, symbol_hint))
@@ -467,7 +496,8 @@ fn normalize_route_path(path: &str) -> String {
     let path = if let Some(idx) = path.find("/api/") {
         &path[idx..]
     } else if path.starts_with("http") {
-        path.split("//").nth(1)
+        path.split("//")
+            .nth(1)
             .and_then(|s| s.find('/').map(|i| &s[i..]))
             .unwrap_or(path)
     } else {
@@ -475,24 +505,31 @@ fn normalize_route_path(path: &str) -> String {
     };
     // Normalize path params: /users/:id → /users/{id} → /users/*
     let segments: Vec<&str> = path.split('/').collect();
-    segments.iter().map(|s| {
-        if s.starts_with(':') || s.starts_with('{') || s.starts_with('<') {
-            "*"
-        } else {
-            s
-        }
-    }).collect::<Vec<_>>().join("/")
+    segments
+        .iter()
+        .map(|s| {
+            if s.starts_with(':') || s.starts_with('{') || s.starts_with('<') {
+                "*"
+            } else {
+                s
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// Extract API paths from a string (URL literals in code).
 fn extract_api_paths(text: &str) -> Vec<String> {
     let mut paths = Vec::new();
-    for part in text.split('"').chain(text.split('\'').chain(text.split('`'))) {
+    for part in text
+        .split('"')
+        .chain(text.split('\'').chain(text.split('`')))
+    {
         let trimmed = part.trim();
-        if trimmed.starts_with("/api/") || trimmed.starts_with("http") {
-            if trimmed.contains("/api/") {
-                paths.push(trimmed.to_string());
-            }
+        if (trimmed.starts_with("/api/") || trimmed.starts_with("http"))
+            && trimmed.contains("/api/")
+        {
+            paths.push(trimmed.to_string());
         }
     }
     paths
@@ -500,13 +537,27 @@ fn extract_api_paths(text: &str) -> Vec<String> {
 
 /// Scan source files for URL strings containing /api/ patterns.
 fn scan_source_for_urls(root: &Path) -> Vec<(String, String, String)> {
-    const SKIP_DIRS: &[&str] = &[".infigraph", ".git", "node_modules", "target", "build", "dist", "__pycache__", ".venv"];
+    const SKIP_DIRS: &[&str] = &[
+        ".infigraph",
+        ".git",
+        "node_modules",
+        "target",
+        "build",
+        "dist",
+        "__pycache__",
+        ".venv",
+    ];
     let mut results = Vec::new();
     walk_for_urls(root, root, SKIP_DIRS, &mut results);
     results
 }
 
-fn walk_for_urls(base: &Path, dir: &Path, skip: &[&str], results: &mut Vec<(String, String, String)>) {
+fn walk_for_urls(
+    base: &Path,
+    dir: &Path,
+    skip: &[&str],
+    results: &mut Vec<(String, String, String)>,
+) {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(_) => return,
@@ -521,7 +572,11 @@ fn walk_for_urls(base: &Path, dir: &Path, skip: &[&str], results: &mut Vec<(Stri
                 walk_for_urls(base, &path, skip, results);
             }
         } else if path.is_file() {
-            let rel = path.strip_prefix(base).unwrap_or(&path).to_string_lossy().replace('\\', "/");
+            let rel = path
+                .strip_prefix(base)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
             let content = match std::fs::read_to_string(&path) {
                 Ok(c) => c,
                 Err(_) => continue,
@@ -530,9 +585,14 @@ fn walk_for_urls(base: &Path, dir: &Path, skip: &[&str], results: &mut Vec<(Stri
                 for delim in ['"', '\'', '`'] {
                     for part in line.split(delim) {
                         let trimmed = part.trim();
-                        if trimmed.contains("/api/") && trimmed.len() < 200 && !trimmed.contains(' ') {
+                        if trimmed.contains("/api/")
+                            && trimmed.len() < 200
+                            && !trimmed.contains(' ')
+                        {
                             let path_part = if trimmed.starts_with("http") {
-                                trimmed.split("//").nth(1)
+                                trimmed
+                                    .split("//")
+                                    .nth(1)
                                     .and_then(|s| s.find('/').map(|i| &s[i..]))
                                     .unwrap_or(trimmed)
                             } else {
@@ -568,7 +628,10 @@ pub fn link_cross_service_calls(
     // Group deps by caller service
     let mut by_caller: HashMap<String, Vec<&CrossServiceDep>> = HashMap::new();
     for dep in &deps {
-        by_caller.entry(dep.caller_service.clone()).or_default().push(dep);
+        by_caller
+            .entry(dep.caller_service.clone())
+            .or_default()
+            .push(dep);
     }
 
     let mut total = 0;
@@ -596,13 +659,15 @@ pub fn link_cross_service_calls(
         for dep in svc_deps {
             let target_id = format!(
                 "xsvc::{}::{}::{}",
-                dep.target_service, dep.target_method,
+                dep.target_service,
+                dep.target_method,
                 dep.target_path.replace('\'', "\\'")
             );
             let target_name = format!(
                 "{} {} {}",
                 dep.target_service, dep.target_method, dep.target_path
-            ).replace('\'', "\\'");
+            )
+            .replace('\'', "\\'");
             let caller_sym = dep.caller_symbol.replace('\'', "\\'");
             let target_svc = dep.target_service.replace('\'', "\\'");
             let target_method = dep.target_method.replace('\'', "\\'");

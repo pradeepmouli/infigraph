@@ -2,7 +2,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use protobuf::Message;
-use scip::types::{Index, SymbolRole, symbol_information};
+use scip::types::{symbol_information, Index, SymbolRole};
 
 use crate::graph::GraphStore;
 use crate::model::{Span, SymbolKind};
@@ -66,7 +66,8 @@ pub fn import_scip_index(index_path: &Path, store: &GraphStore) -> Result<Import
                 "MATCH (s:Symbol) WHERE s.id = '{}' RETURN s.id",
                 escape(&sym_id)
             );
-            let mut result = conn.query(&q)
+            let mut result = conn
+                .query(&q)
                 .map_err(|e| anyhow::anyhow!("query failed: {e}"))?;
 
             if result.next().is_none() {
@@ -207,7 +208,7 @@ fn scip_sym_to_name(scip_sym: &str) -> String {
     scip_sym
         .rsplit_once('`')
         .map(|(_, n)| n)
-        .or_else(|| scip_sym.rsplit(|c| c == '#' || c == '.' || c == '/').next())
+        .or_else(|| scip_sym.rsplit(['#', '.', '/']).next())
         .unwrap_or(scip_sym)
         .trim_matches(|c| c == '(' || c == ')' || c == '`')
         .to_string()

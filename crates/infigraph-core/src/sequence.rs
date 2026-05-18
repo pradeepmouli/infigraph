@@ -27,9 +27,7 @@ pub fn generate_sequence_mermaid(
             continue;
         }
         let esc = id.replace('\'', "\\'");
-        let q = format!(
-            "MATCH (a:Symbol)-[:CALLS]->(b:Symbol) WHERE a.id = '{esc}' RETURN b.id"
-        );
+        let q = format!("MATCH (a:Symbol)-[:CALLS]->(b:Symbol) WHERE a.id = '{esc}' RETURN b.id");
         if let Ok(rows) = gq.raw_query(&q) {
             for row in &rows {
                 if let Some(callee_id) = row.first() {
@@ -53,9 +51,7 @@ pub fn generate_sequence_mermaid(
     let mut sym_info: HashMap<String, (String, String)> = HashMap::new(); // id -> (name, file)
     for id in &visited {
         let esc = id.replace('\'', "\\'");
-        let q = format!(
-            "MATCH (s:Symbol) WHERE s.id = '{esc}' RETURN s.name, s.file"
-        );
+        let q = format!("MATCH (s:Symbol) WHERE s.id = '{esc}' RETURN s.name, s.file");
         if let Ok(rows) = gq.raw_query(&q) {
             if let Some(row) = rows.first() {
                 if row.len() >= 2 {
@@ -94,11 +90,20 @@ pub fn generate_sequence_mermaid(
     out.push('\n');
 
     for (caller_id, callee_id) in &edges {
-        let caller_file = sym_info.get(caller_id).map(|(_, f)| f.as_str()).unwrap_or(caller_id);
-        let callee_file = sym_info.get(callee_id).map(|(_, f)| f.as_str()).unwrap_or(callee_id);
+        let caller_file = sym_info
+            .get(caller_id)
+            .map(|(_, f)| f.as_str())
+            .unwrap_or(caller_id);
+        let callee_file = sym_info
+            .get(callee_id)
+            .map(|(_, f)| f.as_str())
+            .unwrap_or(callee_id);
         let caller_part = file_to_participant(caller_file);
         let callee_part = file_to_participant(callee_file);
-        let callee_name = sym_info.get(callee_id).map(|(n, _)| n.as_str()).unwrap_or(callee_id);
+        let callee_name = sym_info
+            .get(callee_id)
+            .map(|(n, _)| n.as_str())
+            .unwrap_or(callee_id);
         out.push_str(&format!(
             "    {caller_part}->>{callee_part}: {callee_name}()\n"
         ));

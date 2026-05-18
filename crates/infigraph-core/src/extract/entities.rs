@@ -199,8 +199,9 @@ pub fn extract_entities(
             let parent = parent_class.map(|cls| format!("{}::{}", file, cls));
 
             let complexity = match sym_kind {
-                SymbolKind::Function | SymbolKind::Method | SymbolKind::Test =>
-                    cyclomatic_complexity(node),
+                SymbolKind::Function | SymbolKind::Method | SymbolKind::Test => {
+                    cyclomatic_complexity(node)
+                }
                 _ => 1,
             };
 
@@ -235,7 +236,7 @@ pub fn extract_entities(
                 end_line: node.end_position().row as u32 + 1,
                 end_col: node.end_position().column as u32,
             };
-            let id = format!("{}::{}", file, route_name.replace(' ', "_").replace('/', "_"));
+            let id = format!("{}::{}", file, route_name.replace([' ', '/'], "_"));
             let docstring = if handler.is_empty() {
                 Some(format!("route {} {}", method, path))
             } else {
@@ -277,7 +278,9 @@ fn find_parent_class(node: Node, source: &[u8]) -> Option<String> {
     while let Some(n) = current {
         if n.kind() == "class_definition" {
             // The name child of a class_definition is the class name
-            return n.child_by_field_name("name").map(|name_node| node_text(name_node, source));
+            return n
+                .child_by_field_name("name")
+                .map(|name_node| node_text(name_node, source));
         }
         current = n.parent();
     }
@@ -290,11 +293,11 @@ fn find_parent_class(node: Node, source: &[u8]) -> Option<String> {
 fn find_preceding_attributes(node: Node, source: &[u8]) -> Option<String> {
     // Node kinds that represent decorators/attributes across languages
     const ATTR_KINDS: &[&str] = &[
-        "attribute_item",   // Rust: #[get("/path")]
-        "attribute_list",   // C#: [HttpGet], PHP 8: #[Route("/path")]
-        "attribute",        // C# inner, PHP inner
-        "annotation",       // Kotlin, Scala, Java (fallback)
-        "decorator",        // TypeScript/JS (NestJS @Controller, @Get)
+        "attribute_item",    // Rust: #[get("/path")]
+        "attribute_list",    // C#: [HttpGet], PHP 8: #[Route("/path")]
+        "attribute",         // C# inner, PHP inner
+        "annotation",        // Kotlin, Scala, Java (fallback)
+        "decorator",         // TypeScript/JS (NestJS @Controller, @Get)
         "marker_annotation", // Java @Override, @GetMapping
     ];
 
@@ -337,8 +340,11 @@ fn collect_attrs(
         } else if comment_kinds.contains(&sib.kind()) {
             // Only capture annotation-like comments: // @Router, /// @route, # @app.route
             let text = node_text(sib, source);
-            if text.contains("@") || text.contains("route") || text.contains("endpoint")
-                || text.contains("handler") || text.contains("API")
+            if text.contains("@")
+                || text.contains("route")
+                || text.contains("endpoint")
+                || text.contains("handler")
+                || text.contains("API")
             {
                 attrs.push(text);
             }
@@ -375,8 +381,14 @@ fn strip_string_delimiters(s: &str) -> String {
 /// Strip triple-quote delimiters and leading whitespace from a docstring.
 fn strip_docstring(raw: &str) -> String {
     let s = raw.trim();
-    let s = s.strip_prefix("\"\"\"").or_else(|| s.strip_prefix("'''")).unwrap_or(s);
-    let s = s.strip_suffix("\"\"\"").or_else(|| s.strip_suffix("'''")).unwrap_or(s);
+    let s = s
+        .strip_prefix("\"\"\"")
+        .or_else(|| s.strip_prefix("'''"))
+        .unwrap_or(s);
+    let s = s
+        .strip_suffix("\"\"\"")
+        .or_else(|| s.strip_suffix("'''"))
+        .unwrap_or(s);
     // Dedent: find minimum indentation and strip it
     let lines: Vec<&str> = s.lines().collect();
     if lines.len() <= 1 {
@@ -427,7 +439,8 @@ mod tests {
         let query = tree_sitter::Query::new(
             &grammar,
             r#"(assignment left: (identifier) @module.name) @module.def"#,
-        ).unwrap();
+        )
+        .unwrap();
 
         let symbols = extract_entities("test.bas", src, root, &query, "vb6");
         assert_eq!(symbols.len(), 1);

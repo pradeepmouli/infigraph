@@ -39,8 +39,7 @@ impl GraphStore {
     }
 
     pub fn connection(&self) -> Result<Connection<'_>> {
-        Connection::new(&self.db)
-            .map_err(|e| anyhow::anyhow!("failed to create connection: {e}"))
+        Connection::new(&self.db).map_err(|e| anyhow::anyhow!("failed to create connection: {e}"))
     }
 
     /// Insert a file extraction into the graph.
@@ -50,15 +49,32 @@ impl GraphStore {
         self.upsert_file_conn(&conn, extraction)
     }
 
-    pub fn upsert_file_conn(&self, conn: &Connection<'_>, extraction: &FileExtraction) -> Result<()> {
+    pub fn upsert_file_conn(
+        &self,
+        conn: &Connection<'_>,
+        extraction: &FileExtraction,
+    ) -> Result<()> {
         // Remove old symbols for this file
-        let _ = conn.query(&format!("MATCH (s:Symbol) WHERE s.file = '{}' DETACH DELETE s", escape(&extraction.file)));
-        let _ = conn.query(&format!("MATCH (m:Module) WHERE m.file = '{}' DETACH DELETE m", escape(&extraction.file)));
-        let _ = conn.query(&format!("MATCH (f:File) WHERE f.id = '{}' DETACH DELETE f", escape(&extraction.file)));
+        let _ = conn.query(&format!(
+            "MATCH (s:Symbol) WHERE s.file = '{}' DETACH DELETE s",
+            escape(&extraction.file)
+        ));
+        let _ = conn.query(&format!(
+            "MATCH (m:Module) WHERE m.file = '{}' DETACH DELETE m",
+            escape(&extraction.file)
+        ));
+        let _ = conn.query(&format!(
+            "MATCH (f:File) WHERE f.id = '{}' DETACH DELETE f",
+            escape(&extraction.file)
+        ));
         self.upsert_file_conn_no_delete(conn, extraction)
     }
 
-    pub fn upsert_file_conn_no_delete(&self, conn: &Connection<'_>, extraction: &FileExtraction) -> Result<()> {
+    pub fn upsert_file_conn_no_delete(
+        &self,
+        conn: &Connection<'_>,
+        extraction: &FileExtraction,
+    ) -> Result<()> {
         // Insert module node
         let module_id = &extraction.file;
         let module_name = extraction
@@ -120,10 +136,15 @@ impl GraphStore {
                 "UNWIND [{}] AS s CREATE (:Symbol {{id: s.id, name: s.name, kind: s.kind, file: s.file, start_line: s.start_line, end_line: s.end_line, signature_hash: s.signature_hash, language: s.language, visibility: s.visibility, parent: s.parent, docstring: s.docstring, complexity: s.complexity}})",
                 sym_rows.join(", ")
             );
-            conn.query(&batch_insert).context("failed to batch insert symbols")?;
+            conn.query(&batch_insert)
+                .context("failed to batch insert symbols")?;
 
             // Batch CONTAINS edges: module -> symbols
-            let sym_ids: Vec<String> = extraction.symbols.iter().map(|s| format!("'{}'", escape(&s.id))).collect();
+            let sym_ids: Vec<String> = extraction
+                .symbols
+                .iter()
+                .map(|s| format!("'{}'", escape(&s.id)))
+                .collect();
             let contains_batch = format!(
                 "MATCH (m:Module), (s:Symbol) WHERE m.id = '{}' AND s.id IN [{}] CREATE (m)-[:CONTAINS]->(s)",
                 escape(module_id),
@@ -149,10 +170,18 @@ impl GraphStore {
         let mut writes_pairs: Vec<(&str, &str)> = Vec::new();
         for rel in &extraction.relations {
             match rel.kind {
-                RelationKind::Calls | RelationKind::CalledBy => calls_pairs.push((&rel.source_id, &rel.target_id)),
-                RelationKind::Inherits | RelationKind::InheritedBy => inherits_pairs.push((&rel.source_id, &rel.target_id)),
-                RelationKind::TestedBy | RelationKind::Tests => tested_by_pairs.push((&rel.source_id, &rel.target_id)),
-                RelationKind::Imports | RelationKind::ImportedBy => imports_pairs.push((&rel.source_id, &rel.target_id)),
+                RelationKind::Calls | RelationKind::CalledBy => {
+                    calls_pairs.push((&rel.source_id, &rel.target_id))
+                }
+                RelationKind::Inherits | RelationKind::InheritedBy => {
+                    inherits_pairs.push((&rel.source_id, &rel.target_id))
+                }
+                RelationKind::TestedBy | RelationKind::Tests => {
+                    tested_by_pairs.push((&rel.source_id, &rel.target_id))
+                }
+                RelationKind::Imports | RelationKind::ImportedBy => {
+                    imports_pairs.push((&rel.source_id, &rel.target_id))
+                }
                 RelationKind::Reads => reads_pairs.push((&rel.source_id, &rel.target_id)),
                 RelationKind::Writes => writes_pairs.push((&rel.source_id, &rel.target_id)),
                 _ => {}
@@ -165,10 +194,13 @@ impl GraphStore {
             (&reads_pairs, "READS"),
             (&writes_pairs, "WRITES"),
         ] {
-            if pairs.is_empty() { continue; }
-            let pair_list: Vec<String> = pairs.iter().map(|(a, b)| {
-                format!("{{a: '{}', b: '{}'}}", escape(a), escape(b))
-            }).collect();
+            if pairs.is_empty() {
+                continue;
+            }
+            let pair_list: Vec<String> = pairs
+                .iter()
+                .map(|(a, b)| format!("{{a: '{}', b: '{}'}}", escape(a), escape(b)))
+                .collect();
             let batch_rel = format!(
                 "UNWIND [{}] AS p MATCH (a:Symbol), (b:Symbol) WHERE a.id = p.a AND b.id = p.b CREATE (a)-[:{}]->(b)",
                 pair_list.join(", "),
@@ -177,9 +209,10 @@ impl GraphStore {
             let _ = conn.query(&batch_rel);
         }
         if !imports_pairs.is_empty() {
-            let pair_list: Vec<String> = imports_pairs.iter().map(|(a, b)| {
-                format!("{{a: '{}', b: '{}'}}", escape(a), escape(b))
-            }).collect();
+            let pair_list: Vec<String> = imports_pairs
+                .iter()
+                .map(|(a, b)| format!("{{a: '{}', b: '{}'}}", escape(a), escape(b)))
+                .collect();
             let _ = conn.query(&format!(
                 "UNWIND [{}] AS p MATCH (a:Module), (b:Module) WHERE a.id = p.a AND b.id = p.b CREATE (a)-[:IMPORTS]->(b)",
                 pair_list.join(", ")
@@ -191,24 +224,48 @@ impl GraphStore {
 
     /// Bulk insert all extractions in minimal queries — one UNWIND per node/edge type.
     /// Much faster than calling upsert_file_conn_no_delete per file.
-    pub fn upsert_all_bulk(&self, conn: &Connection<'_>, extractions: &[FileExtraction]) -> Result<()> {
-        if extractions.is_empty() { return Ok(()); }
+    pub fn upsert_all_bulk(
+        &self,
+        conn: &Connection<'_>,
+        extractions: &[FileExtraction],
+    ) -> Result<()> {
+        if extractions.is_empty() {
+            return Ok(());
+        }
 
         // 1. All Module nodes
-        let module_rows: Vec<String> = extractions.iter().map(|e| {
-            let name = e.file.rsplit_once('/').map(|(_, f)| f).unwrap_or(&e.file);
-            format!("{{id: '{}', name: '{}', file: '{}', language: '{}', content_hash: '{}'}}",
-                escape(&e.file), escape(name), escape(&e.file), escape(&e.language), escape(&e.content_hash))
-        }).collect();
+        let module_rows: Vec<String> = extractions
+            .iter()
+            .map(|e| {
+                let name = e.file.rsplit_once('/').map(|(_, f)| f).unwrap_or(&e.file);
+                format!(
+                    "{{id: '{}', name: '{}', file: '{}', language: '{}', content_hash: '{}'}}",
+                    escape(&e.file),
+                    escape(name),
+                    escape(&e.file),
+                    escape(&e.language),
+                    escape(&e.content_hash)
+                )
+            })
+            .collect();
         conn.query(&format!("UNWIND [{}] AS m CREATE (:Module {{id: m.id, name: m.name, file: m.file, language: m.language, content_hash: m.content_hash}})", module_rows.join(", ")))
             .context("bulk module insert")?;
 
         // 2. All File nodes
-        let file_rows: Vec<String> = extractions.iter().map(|e| {
-            let name = e.file.rsplit_once('/').map(|(_, f)| f).unwrap_or(&e.file);
-            format!("{{id: '{}', name: '{}', path: '{}', language: '{}', symbol_count: {}}}",
-                escape(&e.file), escape(name), escape(&e.file), escape(&e.language), e.symbols.len())
-        }).collect();
+        let file_rows: Vec<String> = extractions
+            .iter()
+            .map(|e| {
+                let name = e.file.rsplit_once('/').map(|(_, f)| f).unwrap_or(&e.file);
+                format!(
+                    "{{id: '{}', name: '{}', path: '{}', language: '{}', symbol_count: {}}}",
+                    escape(&e.file),
+                    escape(name),
+                    escape(&e.file),
+                    escape(&e.language),
+                    e.symbols.len()
+                )
+            })
+            .collect();
         conn.query(&format!("UNWIND [{}] AS f CREATE (:File {{id: f.id, name: f.name, path: f.path, language: f.language, symbol_count: f.symbol_count}})", file_rows.join(", ")))
             .context("bulk file insert")?;
 
@@ -232,9 +289,14 @@ impl GraphStore {
         }
 
         // 4. CONTAINS edges (module -> symbols) in chunks
-        let contains_pairs: Vec<String> = extractions.iter().flat_map(|e| {
-            e.symbols.iter().map(move |sym| format!("{{m: '{}', s: '{}'}}", escape(&e.file), escape(&sym.id)))
-        }).collect();
+        let contains_pairs: Vec<String> = extractions
+            .iter()
+            .flat_map(|e| {
+                e.symbols.iter().map(move |sym| {
+                    format!("{{m: '{}', s: '{}'}}", escape(&e.file), escape(&sym.id))
+                })
+            })
+            .collect();
         for chunk in contains_pairs.chunks(SYM_CHUNK) {
             let _ = conn.query(&format!(
                 "UNWIND [{}] AS p MATCH (m:Module), (s:Symbol) WHERE m.id = p.m AND s.id = p.s CREATE (m)-[:CONTAINS]->(s)",
@@ -243,9 +305,14 @@ impl GraphStore {
         }
 
         // 5. DEFINES edges (file -> symbols) in chunks
-        let defines_pairs: Vec<String> = extractions.iter().flat_map(|e| {
-            e.symbols.iter().map(move |sym| format!("{{f: '{}', s: '{}'}}", escape(&e.file), escape(&sym.id)))
-        }).collect();
+        let defines_pairs: Vec<String> = extractions
+            .iter()
+            .flat_map(|e| {
+                e.symbols.iter().map(move |sym| {
+                    format!("{{f: '{}', s: '{}'}}", escape(&e.file), escape(&sym.id))
+                })
+            })
+            .collect();
         for chunk in defines_pairs.chunks(SYM_CHUNK) {
             let _ = conn.query(&format!(
                 "UNWIND [{}] AS p MATCH (f:File), (s:Symbol) WHERE f.id = p.f AND s.id = p.s CREATE (f)-[:DEFINES]->(s)",
@@ -262,7 +329,11 @@ impl GraphStore {
         let mut writes_pairs: Vec<String> = Vec::new();
         for e in extractions {
             for rel in &e.relations {
-                let pair = format!("{{a: '{}', b: '{}'}}", escape(&rel.source_id), escape(&rel.target_id));
+                let pair = format!(
+                    "{{a: '{}', b: '{}'}}",
+                    escape(&rel.source_id),
+                    escape(&rel.target_id)
+                );
                 match rel.kind {
                     RelationKind::Calls | RelationKind::CalledBy => calls_pairs.push(pair),
                     RelationKind::Inherits | RelationKind::InheritedBy => inherits_pairs.push(pair),
@@ -274,7 +345,13 @@ impl GraphStore {
                 }
             }
         }
-        for (pairs, rel_type) in [(&calls_pairs, "CALLS"), (&inherits_pairs, "INHERITS"), (&tested_by_pairs, "TESTED_BY"), (&reads_pairs, "READS"), (&writes_pairs, "WRITES")] {
+        for (pairs, rel_type) in [
+            (&calls_pairs, "CALLS"),
+            (&inherits_pairs, "INHERITS"),
+            (&tested_by_pairs, "TESTED_BY"),
+            (&reads_pairs, "READS"),
+            (&writes_pairs, "WRITES"),
+        ] {
             for chunk in pairs.chunks(SYM_CHUNK) {
                 let _ = conn.query(&format!(
                     "UNWIND [{}] AS p MATCH (a:Symbol), (b:Symbol) WHERE a.id = p.a AND b.id = p.b CREATE (a)-[:{rel_type}]->(b)",
@@ -298,7 +375,11 @@ impl GraphStore {
     fn upsert_folder_hierarchy(&self, conn: &Connection<'_>, file_path: &str) -> Result<()> {
         // Split the file path into components: "src/graph/store.rs" -> ["src", "graph"]
         let parts: Vec<&str> = file_path.rsplitn(2, '/').collect();
-        let dir_path = if parts.len() == 2 { parts[1] } else { return Ok(()) };
+        let dir_path = if parts.len() == 2 {
+            parts[1]
+        } else {
+            return Ok(());
+        };
 
         // Collect all ancestor folders: "src/graph" -> ["src", "src/graph"]
         let segments: Vec<&str> = dir_path.split('/').collect();
@@ -314,10 +395,7 @@ impl GraphStore {
                 .rsplit_once('/')
                 .map(|(_, n)| n)
                 .unwrap_or(folder_path);
-            let merge_folder = format!(
-                "MERGE (d:Folder {{id: '{}'}})",
-                escape(folder_path),
-            );
+            let merge_folder = format!("MERGE (d:Folder {{id: '{}'}})", escape(folder_path),);
             // Try MERGE first; if Kuzu doesn't support MERGE, fall back to conditional create
             if conn.query(&merge_folder).is_err() {
                 // Check if it already exists
@@ -325,7 +403,8 @@ impl GraphStore {
                     "MATCH (d:Folder) WHERE d.id = '{}' RETURN d.id",
                     escape(folder_path)
                 );
-                let mut result = conn.query(&check)
+                let mut result = conn
+                    .query(&check)
                     .map_err(|e| anyhow::anyhow!("folder check failed: {e}"))?;
                 if result.next().is_none() {
                     let create = format!(
@@ -358,7 +437,8 @@ impl GraphStore {
                 escape(parent),
                 escape(child),
             );
-            let mut result = conn.query(&check_edge)
+            let mut result = conn
+                .query(&check_edge)
                 .map_err(|e| anyhow::anyhow!("edge check failed: {e}"))?;
             if result.next().is_none() {
                 let create_edge = format!(
@@ -377,7 +457,8 @@ impl GraphStore {
                 escape(leaf_folder),
                 escape(file_path),
             );
-            let mut result = conn.query(&check_edge)
+            let mut result = conn
+                .query(&check_edge)
                 .map_err(|e| anyhow::anyhow!("edge check failed: {e}"))?;
             if result.next().is_none() {
                 let create_edge = format!(
@@ -414,11 +495,11 @@ impl GraphStore {
     /// Used by incremental indexing to skip unchanged files.
     pub fn get_file_hashes(&self) -> Result<HashMap<String, String>> {
         let conn = self.connection()?;
-        let mut result = conn
+        let result = conn
             .query("MATCH (m:Module) RETURN m.file, m.content_hash")
             .map_err(|e| anyhow::anyhow!("get_file_hashes failed: {e}"))?;
         let mut map = HashMap::new();
-        while let Some(row) = result.next() {
+        for row in result {
             if row.len() >= 2 {
                 map.insert(row[0].to_string(), row[1].to_string());
             }
@@ -429,13 +510,18 @@ impl GraphStore {
     /// Return all symbols as (name, id, file, kind) tuples — used by resolve_calls.
     pub fn get_all_symbols(&self) -> Result<Vec<(String, String, String, String)>> {
         let conn = self.connection()?;
-        let mut result = conn
+        let result = conn
             .query("MATCH (s:Symbol) RETURN s.name, s.id, s.file, s.kind")
             .map_err(|e| anyhow::anyhow!("get_all_symbols failed: {e}"))?;
         let mut symbols = Vec::new();
-        while let Some(row) = result.next() {
+        for row in result {
             if row.len() >= 4 {
-                symbols.push((row[0].to_string(), row[1].to_string(), row[2].to_string(), row[3].to_string()));
+                symbols.push((
+                    row[0].to_string(),
+                    row[1].to_string(),
+                    row[2].to_string(),
+                    row[3].to_string(),
+                ));
             }
         }
         Ok(symbols)
@@ -448,11 +534,17 @@ impl GraphStore {
         self.upsert_folders_bulk_conn(&conn, file_paths)
     }
 
-    pub fn upsert_folders_bulk_conn(&self, conn: &Connection<'_>, file_paths: &[&str]) -> Result<()> {
+    pub fn upsert_folders_bulk_conn(
+        &self,
+        conn: &Connection<'_>,
+        file_paths: &[&str],
+    ) -> Result<()> {
         let mut all_folders: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         for file_path in file_paths {
             let parts: Vec<&str> = file_path.rsplitn(2, '/').collect();
-            if parts.len() < 2 { continue; }
+            if parts.len() < 2 {
+                continue;
+            }
             let dir_path = parts[1];
             let segments: Vec<&str> = dir_path.split('/').collect();
             for i in 0..segments.len() {
@@ -460,53 +552,96 @@ impl GraphStore {
             }
         }
 
-        if all_folders.is_empty() { return Ok(()); }
+        if all_folders.is_empty() {
+            return Ok(());
+        }
 
         // Write Folder nodes to parquet
         let folder_pq = std::env::temp_dir().join("infigraph_folders.parquet");
         {
             let ids: Vec<&str> = all_folders.iter().map(|s| s.as_str()).collect();
-            let names: Vec<&str> = all_folders.iter().map(|fp| fp.rsplit_once('/').map(|(_, n)| n).unwrap_or(fp.as_str())).collect();
+            let names: Vec<&str> = all_folders
+                .iter()
+                .map(|fp| fp.rsplit_once('/').map(|(_, n)| n).unwrap_or(fp.as_str()))
+                .collect();
             let paths: Vec<&str> = all_folders.iter().map(|s| s.as_str()).collect();
             parquet_loader::write_node_parquet(
                 &folder_pq,
-                &[("id", DataType::Utf8), ("name", DataType::Utf8), ("path", DataType::Utf8)],
-                vec![Arc::new(StringArray::from(ids)), Arc::new(StringArray::from(names)), Arc::new(StringArray::from(paths))],
+                &[
+                    ("id", DataType::Utf8),
+                    ("name", DataType::Utf8),
+                    ("path", DataType::Utf8),
+                ],
+                vec![
+                    Arc::new(StringArray::from(ids)),
+                    Arc::new(StringArray::from(names)),
+                    Arc::new(StringArray::from(paths)),
+                ],
             )?;
         }
 
         // Collect edge pairs in memory
-        let cf_pairs: Vec<(String, String)> = all_folders.iter()
+        let cf_pairs: Vec<(String, String)> = all_folders
+            .iter()
             .filter_map(|child| {
-                child.rsplit_once('/').map(|(p, _)| p).and_then(|parent_path| {
-                    if all_folders.contains(parent_path) { Some((parent_path.to_string(), child.clone())) } else { None }
-                })
-            }).collect();
+                child
+                    .rsplit_once('/')
+                    .map(|(p, _)| p)
+                    .and_then(|parent_path| {
+                        if all_folders.contains(parent_path) {
+                            Some((parent_path.to_string(), child.clone()))
+                        } else {
+                            None
+                        }
+                    })
+            })
+            .collect();
 
-        let cfile_pairs: Vec<(String, String)> = file_paths.iter()
+        let cfile_pairs: Vec<(String, String)> = file_paths
+            .iter()
             .filter_map(|fp| {
                 let parts: Vec<&str> = fp.rsplitn(2, '/').collect();
-                if parts.len() < 2 { return None; }
+                if parts.len() < 2 {
+                    return None;
+                }
                 Some((parts[1].to_string(), fp.to_string()))
-            }).collect();
+            })
+            .collect();
 
-        let copy_ok = conn.query(&format!("COPY Folder FROM '{}'", fwd_slash_path(&folder_pq))).is_ok();
+        let copy_ok = conn
+            .query(&format!(
+                "COPY Folder FROM '{}'",
+                fwd_slash_path(&folder_pq)
+            ))
+            .is_ok();
 
         if copy_ok {
             // Write edge parquet files and COPY FROM
             let cf_pq = std::env::temp_dir().join("infigraph_contains_folder.parquet");
-            let cf_refs: Vec<(&str, &str)> = cf_pairs.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+            let cf_refs: Vec<(&str, &str)> = cf_pairs
+                .iter()
+                .map(|(a, b)| (a.as_str(), b.as_str()))
+                .collect();
             parquet_loader::write_edge_parquet(&cf_pq, &cf_refs)?;
-            if let Err(e) = conn.query(&format!("COPY CONTAINS_FOLDER FROM '{}'", fwd_slash_path(&cf_pq))) {
+            if let Err(e) = conn.query(&format!(
+                "COPY CONTAINS_FOLDER FROM '{}'",
+                fwd_slash_path(&cf_pq)
+            )) {
                 eprintln!("warn: COPY CONTAINS_FOLDER failed ({e}), using UNWIND fallback");
                 unwind_edges_from_pairs(conn, &cf_refs, "CONTAINS_FOLDER", "Folder", "Folder");
             }
             let _ = std::fs::remove_file(&cf_pq);
 
             let cfile_pq = std::env::temp_dir().join("infigraph_contains_file.parquet");
-            let cfile_refs: Vec<(&str, &str)> = cfile_pairs.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+            let cfile_refs: Vec<(&str, &str)> = cfile_pairs
+                .iter()
+                .map(|(a, b)| (a.as_str(), b.as_str()))
+                .collect();
             parquet_loader::write_edge_parquet(&cfile_pq, &cfile_refs)?;
-            if let Err(e) = conn.query(&format!("COPY CONTAINS_FILE FROM '{}'", fwd_slash_path(&cfile_pq))) {
+            if let Err(e) = conn.query(&format!(
+                "COPY CONTAINS_FILE FROM '{}'",
+                fwd_slash_path(&cfile_pq)
+            )) {
                 eprintln!("warn: COPY CONTAINS_FILE failed ({e}), using UNWIND fallback");
                 unwind_edges_from_pairs(conn, &cfile_refs, "CONTAINS_FILE", "Folder", "File");
             }
@@ -515,18 +650,32 @@ impl GraphStore {
             // Incremental path: some folders may already exist. Use UNWIND with MERGE semantics.
             const CHUNK: usize = 500;
             for chunk in all_folders.iter().collect::<Vec<_>>().chunks(CHUNK) {
-                let items: Vec<String> = chunk.iter().map(|fp| {
-                    let name = fp.rsplit_once('/').map(|(_, n)| n).unwrap_or(fp);
-                    format!("{{id: '{}', name: '{}', path: '{}'}}", escape(fp), escape(name), escape(fp))
-                }).collect();
+                let items: Vec<String> = chunk
+                    .iter()
+                    .map(|fp| {
+                        let name = fp.rsplit_once('/').map(|(_, n)| n).unwrap_or(fp);
+                        format!(
+                            "{{id: '{}', name: '{}', path: '{}'}}",
+                            escape(fp),
+                            escape(name),
+                            escape(fp)
+                        )
+                    })
+                    .collect();
                 let _ = conn.query(&format!(
                     "UNWIND [{}] AS f MERGE (d:Folder {{id: f.id}}) ON CREATE SET d.name = f.name, d.path = f.path ON MATCH SET d.name = f.name, d.path = f.path",
                     items.join(", ")
                 ));
             }
-            let cf_refs: Vec<(&str, &str)> = cf_pairs.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+            let cf_refs: Vec<(&str, &str)> = cf_pairs
+                .iter()
+                .map(|(a, b)| (a.as_str(), b.as_str()))
+                .collect();
             unwind_edges_from_pairs(conn, &cf_refs, "CONTAINS_FOLDER", "Folder", "Folder");
-            let cfile_refs: Vec<(&str, &str)> = cfile_pairs.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+            let cfile_refs: Vec<(&str, &str)> = cfile_pairs
+                .iter()
+                .map(|(a, b)| (a.as_str(), b.as_str()))
+                .collect();
             unwind_edges_from_pairs(conn, &cfile_refs, "CONTAINS_FILE", "Folder", "File");
         }
 
@@ -566,6 +715,7 @@ impl GraphStore {
 
         // Edge case test data — every known problematic pattern
         let long_doc = "A".repeat(10000);
+        #[allow(clippy::type_complexity)]
         let test_rows: Vec<(&str, &str, &str, &str, i64, i64, &str, &str, &str, &str, &str, i64)> = vec![
             ("t1", "normal_func", "Function", "src/main.rs", 1, 10, "abc", "rust", "public", "", "Normal docstring", 3),
             ("t2", "angle_brackets", "Function", "src/lib.rs", 5, 20, "def", "java", "", "", "Returns List<String> from <code>parse</code>", 1),
@@ -620,7 +770,10 @@ impl GraphStore {
             ("t35", "triple_quote", "Function", "doc.py", 1, 5, "trpl", "python", "", "", "\"\"\"This is a '''triple quoted''' \"docstring\" with 'mixed' quotes\"\"\"", 1),
         ];
 
-        println!("=== Parquet Quality Test ({} edge cases) ===\n", test_rows.len());
+        println!(
+            "=== Parquet Quality Test ({} edge cases) ===\n",
+            test_rows.len()
+        );
 
         // === Method A: Direct parquet COPY FROM (proposed new path) ===
         let _ = conn.query("DROP TABLE IF EXISTS QualParquet");
@@ -644,19 +797,32 @@ impl GraphStore {
             parquet_loader::write_node_parquet(
                 &pq_path,
                 &[
-                    ("id", DataType::Utf8), ("name", DataType::Utf8), ("kind", DataType::Utf8),
-                    ("file", DataType::Utf8), ("start_line", DataType::Int64), ("end_line", DataType::Int64),
-                    ("signature_hash", DataType::Utf8), ("language", DataType::Utf8),
-                    ("visibility", DataType::Utf8), ("parent", DataType::Utf8),
-                    ("docstring", DataType::Utf8), ("complexity", DataType::Int64),
+                    ("id", DataType::Utf8),
+                    ("name", DataType::Utf8),
+                    ("kind", DataType::Utf8),
+                    ("file", DataType::Utf8),
+                    ("start_line", DataType::Int64),
+                    ("end_line", DataType::Int64),
+                    ("signature_hash", DataType::Utf8),
+                    ("language", DataType::Utf8),
+                    ("visibility", DataType::Utf8),
+                    ("parent", DataType::Utf8),
+                    ("docstring", DataType::Utf8),
+                    ("complexity", DataType::Int64),
                 ],
                 vec![
-                    Arc::new(StringArray::from(ids)), Arc::new(StringArray::from(names)),
-                    Arc::new(StringArray::from(kinds)), Arc::new(StringArray::from(files)),
-                    Arc::new(Int64Array::from(sls)), Arc::new(Int64Array::from(els)),
-                    Arc::new(StringArray::from(sigs)), Arc::new(StringArray::from(langs)),
-                    Arc::new(StringArray::from(viss)), Arc::new(StringArray::from(pars)),
-                    Arc::new(StringArray::from(docs)), Arc::new(Int64Array::from(comps)),
+                    Arc::new(StringArray::from(ids)),
+                    Arc::new(StringArray::from(names)),
+                    Arc::new(StringArray::from(kinds)),
+                    Arc::new(StringArray::from(files)),
+                    Arc::new(Int64Array::from(sls)),
+                    Arc::new(Int64Array::from(els)),
+                    Arc::new(StringArray::from(sigs)),
+                    Arc::new(StringArray::from(langs)),
+                    Arc::new(StringArray::from(viss)),
+                    Arc::new(StringArray::from(pars)),
+                    Arc::new(StringArray::from(docs)),
+                    Arc::new(Int64Array::from(comps)),
                 ],
             )?;
         }
@@ -675,13 +841,32 @@ impl GraphStore {
         conn.query(&format!("COPY QualDeleteCopy (id, name, kind, file, start_line, end_line, signature_hash, language, visibility, parent, docstring, complexity) FROM '{}'", fwd_slash_path(&pq_path)))?;
 
         // === Read back and compare ===
-        let fields = ["id","name","kind","file","start_line","end_line","signature_hash","language","visibility","parent","docstring","complexity"];
-        let field_list = fields.iter().map(|f| format!("s.{f}")).collect::<Vec<_>>().join(", ");
+        let fields = [
+            "id",
+            "name",
+            "kind",
+            "file",
+            "start_line",
+            "end_line",
+            "signature_hash",
+            "language",
+            "visibility",
+            "parent",
+            "docstring",
+            "complexity",
+        ];
+        let field_list = fields
+            .iter()
+            .map(|f| format!("s.{f}"))
+            .collect::<Vec<_>>()
+            .join(", ");
 
         let read_all = |table: &str| -> Result<Vec<Vec<String>>> {
-            let mut r = conn.query(&format!("MATCH (s:{table}) RETURN {field_list} ORDER BY s.id"))?;
+            let r = conn.query(&format!(
+                "MATCH (s:{table}) RETURN {field_list} ORDER BY s.id"
+            ))?;
             let mut out = Vec::new();
-            while let Some(row) = r.next() {
+            for row in r {
                 out.push(row.iter().map(|v| v.to_string()).collect());
             }
             Ok(out)
@@ -713,14 +898,24 @@ impl GraphStore {
         println!("\n--- Parquet vs Ground Truth ---");
         let mut gt_pass = 0;
         let mut gt_fail = 0;
-        let stored_by_id: HashMap<&str, &Vec<String>> = pq_rows.iter()
+        let stored_by_id: HashMap<&str, &Vec<String>> = pq_rows
+            .iter()
             .filter_map(|r| r.first().map(|id| (id.as_str(), r)))
             .collect();
         for row in &test_rows {
             let expected = vec![
-                row.0.to_string(), row.1.to_string(), row.2.to_string(), row.3.to_string(),
-                row.4.to_string(), row.5.to_string(), row.6.to_string(), row.7.to_string(),
-                row.8.to_string(), row.9.to_string(), row.10.to_string(), row.11.to_string(),
+                row.0.to_string(),
+                row.1.to_string(),
+                row.2.to_string(),
+                row.3.to_string(),
+                row.4.to_string(),
+                row.5.to_string(),
+                row.6.to_string(),
+                row.7.to_string(),
+                row.8.to_string(),
+                row.9.to_string(),
+                row.10.to_string(),
+                row.11.to_string(),
             ];
             if let Some(stored) = stored_by_id.get(row.0) {
                 for (fi, field) in fields.iter().enumerate() {
@@ -777,13 +972,20 @@ impl GraphStore {
             }
         }
         let t0 = std::time::Instant::now();
-        conn.query(&format!("COPY BenchSymbolCopy FROM '{}' (header=true)", fwd_slash_path(&csv_path)))?;
+        conn.query(&format!(
+            "COPY BenchSymbolCopy FROM '{}' (header=true)",
+            fwd_slash_path(&csv_path)
+        ))?;
         let copy_ms = t0.elapsed().as_millis();
 
         // --- UNWIND ---
         const CHUNK: usize = 2000;
         let rows: Vec<String> = (0..n)
-            .map(|i| format!("{{id: 'unwind_{i}', name: 'func_{i}', kind: 'Function', file: 'bench.rs'}}"))
+            .map(|i| {
+                format!(
+                    "{{id: 'unwind_{i}', name: 'func_{i}', kind: 'Function', file: 'bench.rs'}}"
+                )
+            })
             .collect();
         let t1 = std::time::Instant::now();
         for chunk in rows.chunks(CHUNK) {
@@ -797,7 +999,10 @@ impl GraphStore {
         println!("Bulk write benchmark ({n} symbols):");
         println!("  COPY FROM CSV : {}ms", copy_ms);
         println!("  UNWIND chunks : {}ms", unwind_ms);
-        println!("  Speedup       : {:.1}x", unwind_ms as f64 / copy_ms.max(1) as f64);
+        println!(
+            "  Speedup       : {:.1}x",
+            unwind_ms as f64 / copy_ms.max(1) as f64
+        );
 
         // Cleanup
         let _ = conn.query("DROP TABLE BenchSymbolCopy");
@@ -810,36 +1015,62 @@ impl GraphStore {
     /// Bulk write all extractions using COPY FROM Parquet — binary format eliminates escaping issues.
     /// Used for --full index. Incremental index still uses upsert_file_conn_no_delete.
     pub fn upsert_all_parquet(&self, extractions: &[FileExtraction]) -> Result<()> {
-        if extractions.is_empty() { return Ok(()); }
+        if extractions.is_empty() {
+            return Ok(());
+        }
 
         let conn = self.connection()?;
         let tmp = std::env::temp_dir();
 
         let mut known_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
         for e in extractions {
-            for sym in &e.symbols { known_ids.insert(sym.id.clone()); }
+            for sym in &e.symbols {
+                known_ids.insert(sym.id.clone());
+            }
         }
         let mut sym_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let known_module_ids: std::collections::HashSet<String> = extractions.iter().map(|e| e.file.clone()).collect();
+        let known_module_ids: std::collections::HashSet<String> =
+            extractions.iter().map(|e| e.file.clone()).collect();
 
         // Collect all data into vecs
-        let mut mod_ids = Vec::new(); let mut mod_names = Vec::new(); let mut mod_files = Vec::new();
-        let mut mod_langs = Vec::new(); let mut mod_hashes = Vec::new(); let mut mod_summaries = Vec::new();
-        let mut file_ids = Vec::new(); let mut file_names = Vec::new(); let mut file_paths = Vec::new();
-        let mut file_langs = Vec::new(); let mut file_symcounts: Vec<i64> = Vec::new();
-        let mut sym_ids = Vec::new(); let mut sym_names = Vec::new(); let mut sym_kinds = Vec::new();
-        let mut sym_files = Vec::new(); let mut sym_slines: Vec<i64> = Vec::new(); let mut sym_elines: Vec<i64> = Vec::new();
-        let mut sym_sighashes = Vec::new(); let mut sym_languages = Vec::new(); let mut sym_visibilities = Vec::new();
-        let mut sym_parents = Vec::new(); let mut sym_docstrings = Vec::new(); let mut sym_complexities: Vec<i64> = Vec::new();
+        let mut mod_ids = Vec::new();
+        let mut mod_names = Vec::new();
+        let mut mod_files = Vec::new();
+        let mut mod_langs = Vec::new();
+        let mut mod_hashes = Vec::new();
+        let mut mod_summaries = Vec::new();
+        let mut file_ids = Vec::new();
+        let mut file_names = Vec::new();
+        let mut file_paths = Vec::new();
+        let mut file_langs = Vec::new();
+        let mut file_symcounts: Vec<i64> = Vec::new();
+        let mut sym_ids = Vec::new();
+        let mut sym_names = Vec::new();
+        let mut sym_kinds = Vec::new();
+        let mut sym_files = Vec::new();
+        let mut sym_slines: Vec<i64> = Vec::new();
+        let mut sym_elines: Vec<i64> = Vec::new();
+        let mut sym_sighashes = Vec::new();
+        let mut sym_languages = Vec::new();
+        let mut sym_visibilities = Vec::new();
+        let mut sym_parents = Vec::new();
+        let mut sym_docstrings = Vec::new();
+        let mut sym_complexities: Vec<i64> = Vec::new();
         let mut contains_pairs: Vec<(String, String)> = Vec::new();
         let mut defines_pairs: Vec<(String, String)> = Vec::new();
 
-        let mut calls_seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
-        let mut inh_seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
-        let mut test_seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
-        let mut imp_seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
-        let mut reads_seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
-        let mut writes_seen: std::collections::HashSet<(String, String)> = std::collections::HashSet::new();
+        let mut calls_seen: std::collections::HashSet<(String, String)> =
+            std::collections::HashSet::new();
+        let mut inh_seen: std::collections::HashSet<(String, String)> =
+            std::collections::HashSet::new();
+        let mut test_seen: std::collections::HashSet<(String, String)> =
+            std::collections::HashSet::new();
+        let mut imp_seen: std::collections::HashSet<(String, String)> =
+            std::collections::HashSet::new();
+        let mut reads_seen: std::collections::HashSet<(String, String)> =
+            std::collections::HashSet::new();
+        let mut writes_seen: std::collections::HashSet<(String, String)> =
+            std::collections::HashSet::new();
         let mut calls_pairs: Vec<(String, String)> = Vec::new();
         let mut inh_pairs: Vec<(String, String)> = Vec::new();
         let mut test_pairs: Vec<(String, String)> = Vec::new();
@@ -849,18 +1080,29 @@ impl GraphStore {
 
         for e in extractions {
             let mod_name = e.file.rsplit_once('/').map(|(_, f)| f).unwrap_or(&e.file);
-            mod_ids.push(e.file.clone()); mod_names.push(mod_name.to_string()); mod_files.push(e.file.clone());
-            mod_langs.push(e.language.clone()); mod_hashes.push(e.content_hash.clone()); mod_summaries.push(String::new());
+            mod_ids.push(e.file.clone());
+            mod_names.push(mod_name.to_string());
+            mod_files.push(e.file.clone());
+            mod_langs.push(e.language.clone());
+            mod_hashes.push(e.content_hash.clone());
+            mod_summaries.push(String::new());
 
-            file_ids.push(e.file.clone()); file_names.push(mod_name.to_string()); file_paths.push(e.file.clone());
-            file_langs.push(e.language.clone()); file_symcounts.push(e.symbols.len() as i64);
+            file_ids.push(e.file.clone());
+            file_names.push(mod_name.to_string());
+            file_paths.push(e.file.clone());
+            file_langs.push(e.language.clone());
+            file_symcounts.push(e.symbols.len() as i64);
 
             for sym in &e.symbols {
                 if sym_seen.insert(sym.id.clone()) {
-                    sym_ids.push(sym.id.clone()); sym_names.push(sym.name.clone());
-                    sym_kinds.push(sym.kind.as_str().to_string()); sym_files.push(e.file.clone());
-                    sym_slines.push(sym.span.start_line as i64); sym_elines.push(sym.span.end_line as i64);
-                    sym_sighashes.push(sym.signature_hash.clone()); sym_languages.push(sym.language.clone());
+                    sym_ids.push(sym.id.clone());
+                    sym_names.push(sym.name.clone());
+                    sym_kinds.push(sym.kind.as_str().to_string());
+                    sym_files.push(e.file.clone());
+                    sym_slines.push(sym.span.start_line as i64);
+                    sym_elines.push(sym.span.end_line as i64);
+                    sym_sighashes.push(sym.signature_hash.clone());
+                    sym_languages.push(sym.language.clone());
                     sym_visibilities.push(sym.visibility.as_deref().unwrap_or("").to_string());
                     sym_parents.push(sym.parent.as_deref().unwrap_or("").to_string());
                     sym_docstrings.push(sym.docstring.as_deref().unwrap_or("").to_string());
@@ -875,27 +1117,42 @@ impl GraphStore {
                 let tgt = rel.target_id.clone();
                 match rel.kind {
                     RelationKind::Imports | RelationKind::ImportedBy => {
-                        if known_module_ids.contains(&src) && known_module_ids.contains(&tgt) {
-                            if imp_seen.insert((src.clone(), tgt.clone())) { imp_pairs.push((src, tgt)); }
+                        if known_module_ids.contains(&src)
+                            && known_module_ids.contains(&tgt)
+                            && imp_seen.insert((src.clone(), tgt.clone()))
+                        {
+                            imp_pairs.push((src, tgt));
                         }
                     }
                     _ => {
-                        if !known_ids.contains(&src) || !known_ids.contains(&tgt) { continue; }
+                        if !known_ids.contains(&src) || !known_ids.contains(&tgt) {
+                            continue;
+                        }
                         match rel.kind {
-                            RelationKind::Calls | RelationKind::CalledBy => {
-                                if calls_seen.insert((src.clone(), tgt.clone())) { calls_pairs.push((src, tgt)); }
+                            RelationKind::Calls | RelationKind::CalledBy
+                                if calls_seen.insert((src.clone(), tgt.clone())) =>
+                            {
+                                calls_pairs.push((src, tgt));
                             }
-                            RelationKind::Inherits | RelationKind::InheritedBy => {
-                                if inh_seen.insert((src.clone(), tgt.clone())) { inh_pairs.push((src, tgt)); }
+                            RelationKind::Inherits | RelationKind::InheritedBy
+                                if inh_seen.insert((src.clone(), tgt.clone())) =>
+                            {
+                                inh_pairs.push((src, tgt));
                             }
-                            RelationKind::TestedBy | RelationKind::Tests => {
-                                if test_seen.insert((src.clone(), tgt.clone())) { test_pairs.push((src, tgt)); }
+                            RelationKind::TestedBy | RelationKind::Tests
+                                if test_seen.insert((src.clone(), tgt.clone())) =>
+                            {
+                                test_pairs.push((src, tgt));
                             }
-                            RelationKind::Reads => {
-                                if reads_seen.insert((src.clone(), tgt.clone())) { reads_pairs.push((src, tgt)); }
+                            RelationKind::Reads
+                                if reads_seen.insert((src.clone(), tgt.clone())) =>
+                            {
+                                reads_pairs.push((src, tgt));
                             }
-                            RelationKind::Writes => {
-                                if writes_seen.insert((src.clone(), tgt.clone())) { writes_pairs.push((src, tgt)); }
+                            RelationKind::Writes
+                                if writes_seen.insert((src.clone(), tgt.clone())) =>
+                            {
+                                writes_pairs.push((src, tgt));
                             }
                             _ => {}
                         }
@@ -906,40 +1163,77 @@ impl GraphStore {
 
         // Write node parquet files
         let mod_pq = tmp.join("infigraph_index_modules.parquet");
-        parquet_loader::write_node_parquet(&mod_pq, &[
-            ("id", DataType::Utf8), ("name", DataType::Utf8), ("file", DataType::Utf8),
-            ("language", DataType::Utf8), ("content_hash", DataType::Utf8), ("summary", DataType::Utf8),
-        ], vec![
-            Arc::new(StringArray::from(mod_ids)), Arc::new(StringArray::from(mod_names)),
-            Arc::new(StringArray::from(mod_files)), Arc::new(StringArray::from(mod_langs)),
-            Arc::new(StringArray::from(mod_hashes)), Arc::new(StringArray::from(mod_summaries)),
-        ])?;
+        parquet_loader::write_node_parquet(
+            &mod_pq,
+            &[
+                ("id", DataType::Utf8),
+                ("name", DataType::Utf8),
+                ("file", DataType::Utf8),
+                ("language", DataType::Utf8),
+                ("content_hash", DataType::Utf8),
+                ("summary", DataType::Utf8),
+            ],
+            vec![
+                Arc::new(StringArray::from(mod_ids)),
+                Arc::new(StringArray::from(mod_names)),
+                Arc::new(StringArray::from(mod_files)),
+                Arc::new(StringArray::from(mod_langs)),
+                Arc::new(StringArray::from(mod_hashes)),
+                Arc::new(StringArray::from(mod_summaries)),
+            ],
+        )?;
 
         let file_pq = tmp.join("infigraph_index_files.parquet");
-        parquet_loader::write_node_parquet(&file_pq, &[
-            ("id", DataType::Utf8), ("name", DataType::Utf8), ("path", DataType::Utf8),
-            ("language", DataType::Utf8), ("symbol_count", DataType::Int64),
-        ], vec![
-            Arc::new(StringArray::from(file_ids)), Arc::new(StringArray::from(file_names)),
-            Arc::new(StringArray::from(file_paths)), Arc::new(StringArray::from(file_langs)),
-            Arc::new(Int64Array::from(file_symcounts)),
-        ])?;
+        parquet_loader::write_node_parquet(
+            &file_pq,
+            &[
+                ("id", DataType::Utf8),
+                ("name", DataType::Utf8),
+                ("path", DataType::Utf8),
+                ("language", DataType::Utf8),
+                ("symbol_count", DataType::Int64),
+            ],
+            vec![
+                Arc::new(StringArray::from(file_ids)),
+                Arc::new(StringArray::from(file_names)),
+                Arc::new(StringArray::from(file_paths)),
+                Arc::new(StringArray::from(file_langs)),
+                Arc::new(Int64Array::from(file_symcounts)),
+            ],
+        )?;
 
         let sym_pq = tmp.join("infigraph_index_symbols.parquet");
-        parquet_loader::write_node_parquet(&sym_pq, &[
-            ("id", DataType::Utf8), ("name", DataType::Utf8), ("kind", DataType::Utf8),
-            ("file", DataType::Utf8), ("start_line", DataType::Int64), ("end_line", DataType::Int64),
-            ("signature_hash", DataType::Utf8), ("language", DataType::Utf8),
-            ("visibility", DataType::Utf8), ("parent", DataType::Utf8),
-            ("docstring", DataType::Utf8), ("complexity", DataType::Int64),
-        ], vec![
-            Arc::new(StringArray::from(sym_ids)), Arc::new(StringArray::from(sym_names)),
-            Arc::new(StringArray::from(sym_kinds)), Arc::new(StringArray::from(sym_files)),
-            Arc::new(Int64Array::from(sym_slines)), Arc::new(Int64Array::from(sym_elines)),
-            Arc::new(StringArray::from(sym_sighashes)), Arc::new(StringArray::from(sym_languages)),
-            Arc::new(StringArray::from(sym_visibilities)), Arc::new(StringArray::from(sym_parents)),
-            Arc::new(StringArray::from(sym_docstrings)), Arc::new(Int64Array::from(sym_complexities)),
-        ])?;
+        parquet_loader::write_node_parquet(
+            &sym_pq,
+            &[
+                ("id", DataType::Utf8),
+                ("name", DataType::Utf8),
+                ("kind", DataType::Utf8),
+                ("file", DataType::Utf8),
+                ("start_line", DataType::Int64),
+                ("end_line", DataType::Int64),
+                ("signature_hash", DataType::Utf8),
+                ("language", DataType::Utf8),
+                ("visibility", DataType::Utf8),
+                ("parent", DataType::Utf8),
+                ("docstring", DataType::Utf8),
+                ("complexity", DataType::Int64),
+            ],
+            vec![
+                Arc::new(StringArray::from(sym_ids)),
+                Arc::new(StringArray::from(sym_names)),
+                Arc::new(StringArray::from(sym_kinds)),
+                Arc::new(StringArray::from(sym_files)),
+                Arc::new(Int64Array::from(sym_slines)),
+                Arc::new(Int64Array::from(sym_elines)),
+                Arc::new(StringArray::from(sym_sighashes)),
+                Arc::new(StringArray::from(sym_languages)),
+                Arc::new(StringArray::from(sym_visibilities)),
+                Arc::new(StringArray::from(sym_parents)),
+                Arc::new(StringArray::from(sym_docstrings)),
+                Arc::new(Int64Array::from(sym_complexities)),
+            ],
+        )?;
 
         // COPY FROM parquet — node tables first
         conn.query(&format!("COPY Module FROM '{}'", fwd_slash_path(&mod_pq)))
@@ -952,6 +1246,7 @@ impl GraphStore {
         )).map_err(|e| anyhow::anyhow!("COPY Symbol failed: {e}"))?;
 
         // Edge tables — write parquet and COPY FROM with in-memory UNWIND fallback
+        #[allow(clippy::type_complexity)]
         let edge_tables: Vec<(&str, &[(String, String)], &str, &str)> = vec![
             ("CONTAINS", &contains_pairs, "Module", "Symbol"),
             ("DEFINES", &defines_pairs, "File", "Symbol"),
@@ -964,11 +1259,17 @@ impl GraphStore {
         ];
 
         for (table, pairs, src_label, dst_label) in &edge_tables {
-            if pairs.is_empty() { continue; }
+            if pairs.is_empty() {
+                continue;
+            }
             let edge_pq = tmp.join(format!("infigraph_index_{}.parquet", table.to_lowercase()));
-            let refs: Vec<(&str, &str)> = pairs.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+            let refs: Vec<(&str, &str)> = pairs
+                .iter()
+                .map(|(a, b)| (a.as_str(), b.as_str()))
+                .collect();
             parquet_loader::write_edge_parquet(&edge_pq, &refs)?;
-            if let Err(e) = conn.query(&format!("COPY {table} FROM '{}'", fwd_slash_path(&edge_pq))) {
+            if let Err(e) = conn.query(&format!("COPY {table} FROM '{}'", fwd_slash_path(&edge_pq)))
+            {
                 eprintln!("warn: COPY {table} via parquet failed ({e}), falling back to UNWIND");
                 unwind_edges_from_pairs(&conn, &refs, table, src_label, dst_label);
             }
@@ -988,11 +1289,11 @@ impl GraphStore {
     pub fn benchmark_parquet_vs_csv(&self) -> Result<()> {
         let conn = self.connection()?;
 
-        let mut result = conn.query(
+        let result = conn.query(
             "MATCH (s:Symbol) RETURN s.id, s.name, s.kind, s.file, s.start_line, s.end_line, s.signature_hash, s.language, s.visibility, s.parent, s.docstring, s.complexity"
         )?;
         let mut rows: Vec<Vec<String>> = Vec::new();
-        while let Some(row) = result.next() {
+        for row in result {
             rows.push(row.iter().map(|v| v.to_string()).collect());
         }
         let n = rows.len();
@@ -1010,20 +1311,32 @@ impl GraphStore {
             use std::io::Write;
             let mut f = std::fs::File::create(&csv_path)?;
             writeln!(f, "id\tname\tkind\tfile\tstart_line\tend_line\tsignature_hash\tlanguage\tvisibility\tparent\tdocstring\tcomplexity")?;
-            let tsv_field = |s: &str| -> String {
-                s.replace('\t', " ").replace('\n', " ").replace('\r', " ")
-            };
+            let tsv_field = |s: &str| -> String { s.replace(['\t', '\n', '\r'], " ") };
             for row in &rows {
-                writeln!(f, "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-                    tsv_field(&row[0]), tsv_field(&row[1]), tsv_field(&row[2]), tsv_field(&row[3]),
-                    row[4], row[5],
-                    tsv_field(&row[6]), tsv_field(&row[7]), tsv_field(&row[8]),
-                    tsv_field(&row[9]), tsv_field(&row[10]), row[11])?;
+                writeln!(
+                    f,
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                    tsv_field(&row[0]),
+                    tsv_field(&row[1]),
+                    tsv_field(&row[2]),
+                    tsv_field(&row[3]),
+                    row[4],
+                    row[5],
+                    tsv_field(&row[6]),
+                    tsv_field(&row[7]),
+                    tsv_field(&row[8]),
+                    tsv_field(&row[9]),
+                    tsv_field(&row[10]),
+                    row[11]
+                )?;
             }
         }
         let csv_size = std::fs::metadata(&csv_path).map(|m| m.len()).unwrap_or(0);
         let t0 = std::time::Instant::now();
-        conn.query(&format!("COPY BenchCSV FROM '{}' (header=true, delim='\\t')", fwd_slash_path(&csv_path)))?;
+        conn.query(&format!(
+            "COPY BenchCSV FROM '{}' (header=true, delim='\\t')",
+            fwd_slash_path(&csv_path)
+        ))?;
         let csv_ms = t0.elapsed().as_millis();
 
         // ===== 2. COPY FROM Parquet =====
@@ -1048,11 +1361,18 @@ impl GraphStore {
             parquet_loader::write_node_parquet(
                 &pq_path,
                 &[
-                    ("id", DataType::Utf8), ("name", DataType::Utf8), ("kind", DataType::Utf8),
-                    ("file", DataType::Utf8), ("start_line", DataType::Int64), ("end_line", DataType::Int64),
-                    ("signature_hash", DataType::Utf8), ("language", DataType::Utf8),
-                    ("visibility", DataType::Utf8), ("parent", DataType::Utf8),
-                    ("docstring", DataType::Utf8), ("complexity", DataType::Int64),
+                    ("id", DataType::Utf8),
+                    ("name", DataType::Utf8),
+                    ("kind", DataType::Utf8),
+                    ("file", DataType::Utf8),
+                    ("start_line", DataType::Int64),
+                    ("end_line", DataType::Int64),
+                    ("signature_hash", DataType::Utf8),
+                    ("language", DataType::Utf8),
+                    ("visibility", DataType::Utf8),
+                    ("parent", DataType::Utf8),
+                    ("docstring", DataType::Utf8),
+                    ("complexity", DataType::Int64),
                 ],
                 vec![
                     Arc::new(StringArray::from(ids)),
@@ -1072,7 +1392,10 @@ impl GraphStore {
         }
         let pq_size = std::fs::metadata(&pq_path).map(|m| m.len()).unwrap_or(0);
         let t1 = std::time::Instant::now();
-        conn.query(&format!("COPY BenchParquet ({fields_list}) FROM '{}'", fwd_slash_path(&pq_path)))?;
+        conn.query(&format!(
+            "COPY BenchParquet ({fields_list}) FROM '{}'",
+            fwd_slash_path(&pq_path)
+        ))?;
         let pq_ms = t1.elapsed().as_millis();
 
         // ===== 3. UNWIND =====
@@ -1098,26 +1421,72 @@ impl GraphStore {
 
         // ===== Results =====
         println!("\n=== Bulk Write Benchmark ({n} symbols) ===\n");
-        println!("  {:20} {:>8} {:>12} {:>10}", "Method", "Time", "Throughput", "File Size");
-        println!("  {:20} {:>8} {:>12} {:>10}", "------", "----", "----------", "---------");
-        println!("  {:20} {:>7}ms {:>9.0}/sec {:>9}KB",
-            "COPY FROM CSV (TSV)", csv_ms, n as f64 / csv_ms.max(1) as f64 * 1000.0, csv_size / 1024);
-        println!("  {:20} {:>7}ms {:>9.0}/sec {:>9}KB",
-            "COPY FROM Parquet", pq_ms, n as f64 / pq_ms.max(1) as f64 * 1000.0, pq_size / 1024);
-        println!("  {:20} {:>7}ms {:>9.0}/sec {:>10}",
-            "UNWIND chunks", unwind_ms, n as f64 / unwind_ms.max(1) as f64 * 1000.0, "N/A");
-        println!("\n  CSV vs Parquet     : {:.2}x", csv_ms as f64 / pq_ms.max(1) as f64);
-        println!("  Parquet vs UNWIND  : {:.1}x", unwind_ms as f64 / pq_ms.max(1) as f64);
+        println!(
+            "  {:20} {:>8} {:>12} {:>10}",
+            "Method", "Time", "Throughput", "File Size"
+        );
+        println!(
+            "  {:20} {:>8} {:>12} {:>10}",
+            "------", "----", "----------", "---------"
+        );
+        println!(
+            "  {:20} {:>7}ms {:>9.0}/sec {:>9}KB",
+            "COPY FROM CSV (TSV)",
+            csv_ms,
+            n as f64 / csv_ms.max(1) as f64 * 1000.0,
+            csv_size / 1024
+        );
+        println!(
+            "  {:20} {:>7}ms {:>9.0}/sec {:>9}KB",
+            "COPY FROM Parquet",
+            pq_ms,
+            n as f64 / pq_ms.max(1) as f64 * 1000.0,
+            pq_size / 1024
+        );
+        println!(
+            "  {:20} {:>7}ms {:>9.0}/sec {:>10}",
+            "UNWIND chunks",
+            unwind_ms,
+            n as f64 / unwind_ms.max(1) as f64 * 1000.0,
+            "N/A"
+        );
+        println!(
+            "\n  CSV vs Parquet     : {:.2}x",
+            csv_ms as f64 / pq_ms.max(1) as f64
+        );
+        println!(
+            "  Parquet vs UNWIND  : {:.1}x",
+            unwind_ms as f64 / pq_ms.max(1) as f64
+        );
 
         // ===== Data Integrity =====
         println!("\n=== Data Integrity Check ===\n");
-        let fields = ["id","name","kind","file","start_line","end_line","signature_hash","language","visibility","parent","docstring","complexity"];
-        let field_list = fields.iter().map(|f| format!("s.{f}")).collect::<Vec<_>>().join(", ");
+        let fields = [
+            "id",
+            "name",
+            "kind",
+            "file",
+            "start_line",
+            "end_line",
+            "signature_hash",
+            "language",
+            "visibility",
+            "parent",
+            "docstring",
+            "complexity",
+        ];
+        let field_list = fields
+            .iter()
+            .map(|f| format!("s.{f}"))
+            .collect::<Vec<_>>()
+            .join(", ");
 
         let read_all = |table: &str| -> Result<Vec<Vec<String>>> {
-            let mut r = conn.query(&format!("MATCH (s:{table}) RETURN {field_list} ORDER BY s.id"))?;
+            let r = conn.query(&format!(
+                "MATCH (s:{table}) RETURN {field_list} ORDER BY s.id"
+            ))?;
             let mut out = Vec::new();
-            while let Some(row) = r.next() {
+            for row in r {
                 out.push(row.iter().map(|v| v.to_string()).collect());
             }
             Ok(out)
@@ -1146,7 +1515,10 @@ impl GraphStore {
                 }
             }
             if mismatches == 0 {
-                println!("  {name}: PASS — all {n} symbols × {} fields match", fields.len());
+                println!(
+                    "  {name}: PASS — all {n} symbols × {} fields match",
+                    fields.len()
+                );
             } else {
                 println!("  {name}: FAIL — {mismatches} mismatches");
             }
@@ -1215,10 +1587,17 @@ fn fwd_slash_path(p: &std::path::Path) -> String {
     p.to_string_lossy().replace('\\', "/")
 }
 
-fn unwind_edges_from_pairs(conn: &Connection, pairs: &[(&str, &str)], rel_type: &str, src_label: &str, dst_label: &str) {
+fn unwind_edges_from_pairs(
+    conn: &Connection,
+    pairs: &[(&str, &str)],
+    rel_type: &str,
+    src_label: &str,
+    dst_label: &str,
+) {
     const CHUNK: usize = 500;
     for chunk in pairs.chunks(CHUNK) {
-        let pair_list: Vec<String> = chunk.iter()
+        let pair_list: Vec<String> = chunk
+            .iter()
             .map(|(a, b)| format!("{{a: '{}', b: '{}'}}", escape(a), escape(b)))
             .collect();
         let _ = conn.query(&format!(

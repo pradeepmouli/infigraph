@@ -9,7 +9,12 @@ use crate::model::{Relation, Symbol};
 
 /// Trait for custom extraction backends (e.g., JVM grammar plugins).
 pub trait CustomExtractor: Send + Sync {
-    fn extract(&self, path: &str, source: &[u8], language: &str) -> Result<(Vec<Symbol>, Vec<Relation>)>;
+    fn extract(
+        &self,
+        path: &str,
+        source: &[u8],
+        language: &str,
+    ) -> Result<(Vec<Symbol>, Vec<Relation>)>;
 }
 
 /// Parser backend — tree-sitter or runtime-loaded custom extractor.

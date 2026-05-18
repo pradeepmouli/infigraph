@@ -171,12 +171,7 @@ impl Model2VecEmbedder {
     pub fn new() -> Result<Self> {
         // Walk up from the executable or manifest dir to find the models/ folder
         let model_dir = Self::find_model_dir()?;
-        let model = model2vec_rs::model::StaticModel::from_pretrained(
-            model_dir,
-            None,
-            None,
-            None,
-        )?;
+        let model = model2vec_rs::model::StaticModel::from_pretrained(model_dir, None, None, None)?;
         Ok(Self { model })
     }
 
@@ -190,14 +185,17 @@ impl Model2VecEmbedder {
         }
         // 2. Check ~/.infigraph/models/ (installed by `infigraph install`)
         if let Some(home) = dirs_next::home_dir() {
-            let installed = home.join(".infigraph").join("models").join("potion-base-8M");
+            let installed = home
+                .join(".infigraph")
+                .join("models")
+                .join("potion-base-8M");
             if installed.join("model.safetensors").exists() {
                 return Ok(installed);
             }
         }
         // 3. Walk up from current exe to find models/potion-base-8M/
-        let start = std::env::current_exe()
-            .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default());
+        let start =
+            std::env::current_exe().unwrap_or_else(|_| std::env::current_dir().unwrap_or_default());
         let mut dir = start.as_path();
         loop {
             let candidate = dir.join("models/potion-base-8M");
@@ -222,7 +220,9 @@ impl Model2VecEmbedder {
                 None => break,
             }
         }
-        anyhow::bail!("models/potion-base-8M not found; set INFIGRAPH_MODEL_DIR or run from repo root")
+        anyhow::bail!(
+            "models/potion-base-8M not found; set INFIGRAPH_MODEL_DIR or run from repo root"
+        )
     }
 }
 
@@ -308,19 +308,18 @@ pub fn update_embeddings(
 
     let conn = store.connection()?;
     let gq = crate::graph::GraphQuery::new(&conn);
-    let rows = gq.raw_query(
-        "MATCH (s:Symbol) RETURN s.id, s.name, s.kind, s.file, s.docstring",
-    )?;
+    let rows = gq.raw_query("MATCH (s:Symbol) RETURN s.id, s.name, s.kind, s.file, s.docstring")?;
     if rows.is_empty() {
         return Ok(0);
     }
 
     let emb_path = root.join(".infigraph").join("embeddings.bin");
-    let mut existing: std::collections::HashMap<String, Vec<f32>> =
-        load_embeddings(&emb_path).unwrap_or_default().into_iter().collect();
+    let mut existing: std::collections::HashMap<String, Vec<f32>> = load_embeddings(&emb_path)
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
 
-    let changed_set: std::collections::HashSet<&str> =
-        changed_files.iter().copied().collect();
+    let changed_set: std::collections::HashSet<&str> = changed_files.iter().copied().collect();
 
     let to_embed: Vec<(String, String)> = rows
         .iter()
@@ -351,7 +350,9 @@ pub fn update_embeddings(
                 let emb = Arc::clone(&embedder);
                 let texts: Vec<&str> = chunk.iter().map(|(_, t)| t.as_str()).collect();
                 let vecs = emb.embed_batch(&texts).unwrap_or_default();
-                chunk.iter().enumerate()
+                chunk
+                    .iter()
+                    .enumerate()
                     .filter_map(|(i, (id, _))| vecs.get(i).map(|v| (id.clone(), v.clone())))
                     .collect()
             })
@@ -363,8 +364,7 @@ pub fn update_embeddings(
         }
     }
 
-    let all_ids: std::collections::HashSet<String> =
-        rows.iter().map(|r| r[0].clone()).collect();
+    let all_ids: std::collections::HashSet<String> = rows.iter().map(|r| r[0].clone()).collect();
     existing.retain(|id, _| all_ids.contains(id));
 
     let symbol_embeddings: Vec<(String, Vec<f32>)> = existing.into_iter().collect();
@@ -412,13 +412,14 @@ fn hnsw_cache_lock() -> &'static Mutex<Option<CachedHnsw>> {
 }
 
 fn hnsw_opts(dim: usize) -> IndexOptions {
-    let mut opts = IndexOptions::default();
-    opts.dimensions = dim;
-    opts.metric = MetricKind::IP;
-    opts.quantization = ScalarKind::F32;
-    opts.connectivity = HNSW_CONNECTIVITY;
-    opts.expansion_add = HNSW_EXPANSION_ADD;
-    opts
+    IndexOptions {
+        dimensions: dim,
+        metric: MetricKind::IP,
+        quantization: ScalarKind::F32,
+        connectivity: HNSW_CONNECTIVITY,
+        expansion_add: HNSW_EXPANSION_ADD,
+        ..IndexOptions::default()
+    }
 }
 
 /// Build an HNSW index from embeddings and save to disk.
@@ -438,14 +439,14 @@ pub fn build_hnsw_index(
         .map(|t| t.get())
         .unwrap_or(4);
 
-    let index = UsearchIndex::new(&hnsw_opts(dim))
-        .map_err(|e| anyhow::anyhow!("usearch create: {e}"))?;
+    let index =
+        UsearchIndex::new(&hnsw_opts(dim)).map_err(|e| anyhow::anyhow!("usearch create: {e}"))?;
     index
         .reserve(n)
         .map_err(|e| anyhow::anyhow!("usearch reserve: {e}"))?;
 
     let index = std::sync::Arc::new(index);
-    let chunk_size = (n + threads - 1) / threads;
+    let chunk_size = n.div_ceil(threads);
     std::thread::scope(|s| {
         for (chunk_idx, chunk) in embeddings.chunks(chunk_size).enumerate() {
             let idx = std::sync::Arc::clone(&index);
@@ -476,8 +477,7 @@ pub fn build_hnsw_index(
         "dim": dim,
         "ids": ids,
     });
-    std::fs::write(&sidecar_path, serde_json::to_vec(&sidecar)?)
-        .context("write hnsw sidecar")?;
+    std::fs::write(&sidecar_path, serde_json::to_vec(&sidecar)?).context("write hnsw sidecar")?;
 
     invalidate_hnsw_cache();
     Ok(n)
@@ -496,7 +496,12 @@ pub struct HnswResult {
     pub score: f32,
 }
 
-fn query_index(index: &UsearchIndex, id_map: &[String], query: &[f32], top_k: usize) -> Result<Vec<HnswResult>> {
+fn query_index(
+    index: &UsearchIndex,
+    id_map: &[String],
+    query: &[f32],
+    top_k: usize,
+) -> Result<Vec<HnswResult>> {
     let fetch_k = top_k * HNSW_OVERSAMPLE;
     let results = index
         .search(query, fetch_k)
@@ -547,7 +552,12 @@ pub fn search_hnsw(
     let guard = hnsw_cache_lock().lock().unwrap();
     if let Some(cached) = guard.as_ref() {
         if cached.path == canon && cached.modified == idx_mtime {
-            return Ok(Some(query_index(&cached.index, &cached.id_map, query, top_k)?));
+            return Ok(Some(query_index(
+                &cached.index,
+                &cached.id_map,
+                query,
+                top_k,
+            )?));
         }
     }
     drop(guard);

@@ -17,19 +17,34 @@ impl BridgeScanResult {
     }
 
     pub fn ffi_count(&self) -> usize {
-        self.bridges.iter().filter(|b| b.kind == BridgeKind::Ffi).count()
+        self.bridges
+            .iter()
+            .filter(|b| b.kind == BridgeKind::Ffi)
+            .count()
     }
     pub fn jni_count(&self) -> usize {
-        self.bridges.iter().filter(|b| b.kind == BridgeKind::Jni).count()
+        self.bridges
+            .iter()
+            .filter(|b| b.kind == BridgeKind::Jni)
+            .count()
     }
     pub fn grpc_count(&self) -> usize {
-        self.bridges.iter().filter(|b| b.kind == BridgeKind::Grpc).count()
+        self.bridges
+            .iter()
+            .filter(|b| b.kind == BridgeKind::Grpc)
+            .count()
     }
     pub fn pinvoke_count(&self) -> usize {
-        self.bridges.iter().filter(|b| b.kind == BridgeKind::PInvoke).count()
+        self.bridges
+            .iter()
+            .filter(|b| b.kind == BridgeKind::PInvoke)
+            .count()
     }
     pub fn com_count(&self) -> usize {
-        self.bridges.iter().filter(|b| b.kind == BridgeKind::Com).count()
+        self.bridges
+            .iter()
+            .filter(|b| b.kind == BridgeKind::Com)
+            .count()
     }
 }
 
@@ -52,8 +67,7 @@ struct BridgeRule {
 }
 
 fn extract_after_last_space(line: &str) -> String {
-    line.trim()
-        .split_whitespace()
+    line.split_whitespace()
         .last()
         .unwrap_or("")
         .trim_matches(|c: char| !c.is_alphanumeric() && c != '_' && c != ':')
@@ -83,13 +97,8 @@ fn extract_paren_arg(line: &str) -> String {
     // Grab first argument inside parentheses (before first comma or close paren)
     if let Some(open) = line.find('(') {
         let after = line[open + 1..].trim_start();
-        let end = after
-            .find(|c| c == ',' || c == ')')
-            .unwrap_or(after.len());
-        return after[..end]
-            .trim()
-            .trim_matches('"')
-            .to_string();
+        let end = after.find([',', ')']).unwrap_or(after.len());
+        return after[..end].trim().trim_matches('"').to_string();
     }
     line.trim().to_string()
 }
@@ -342,7 +351,13 @@ pub fn detect_bridges(root: &Path) -> Result<BridgeScanResult> {
 
 fn scan_dir(root: &Path, dir: &Path, result: &mut BridgeScanResult) -> Result<()> {
     const SKIP_DIRS: &[&str] = &[
-        ".git", ".infigraph", "node_modules", "__pycache__", "target", "build", "dist",
+        ".git",
+        ".infigraph",
+        "node_modules",
+        "__pycache__",
+        "target",
+        "build",
+        "dist",
     ];
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
@@ -361,11 +376,12 @@ fn scan_dir(root: &Path, dir: &Path, result: &mut BridgeScanResult) -> Result<()
 }
 
 fn scan_file(root: &Path, path: &Path, result: &mut BridgeScanResult) {
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("");
-    let rel = path.strip_prefix(root).unwrap_or(path).to_string_lossy().replace('\\', "/");
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+    let rel = path
+        .strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/");
 
     // Only scan rules whose extensions match
     let applicable: Vec<&BridgeRule> = BRIDGE_RULES
@@ -377,7 +393,9 @@ fn scan_file(root: &Path, path: &Path, result: &mut BridgeScanResult) {
         return;
     }
 
-    let Ok(source) = std::fs::read_to_string(path) else { return };
+    let Ok(source) = std::fs::read_to_string(path) else {
+        return;
+    };
 
     for (line_no, line) in source.lines().enumerate() {
         for rule in &applicable {

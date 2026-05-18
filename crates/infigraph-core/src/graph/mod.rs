@@ -1,13 +1,12 @@
-mod schema;
-pub mod store;
-mod queries;
-mod session_store;
 pub mod parquet_loader;
+mod queries;
+mod schema;
+mod session_store;
+pub mod store;
 
-pub use store::{GraphStore, GraphStats};
 pub use queries::{
-    GraphQuery, SymbolRow, SymbolDetail, ImpactRow,
-    ReferenceRow, ApiSymbol, FileDeps, HierarchyNode, TypeHierarchy,
-    CoverageRow, TestCoverage,
+    ApiSymbol, CoverageRow, FileDeps, GraphQuery, HierarchyNode, ImpactRow, ReferenceRow,
+    SymbolDetail, SymbolRow, TestCoverage, TypeHierarchy,
 };
 pub use session_store::SessionStore;
+pub use store::{GraphStats, GraphStore};

@@ -1,25 +1,25 @@
-pub mod model;
-pub mod lang;
+mod analysis;
+pub mod bridges;
+pub mod cluster;
+pub mod diff;
+pub mod embed;
+pub mod export;
 pub mod extract;
 pub mod graph;
-pub mod embed;
-pub mod search;
+pub mod lang;
+pub mod manifest;
+pub mod model;
 pub mod multi;
+pub mod refactor;
+mod report;
 pub mod resolve;
 pub mod routes;
-pub mod cluster;
-pub mod viz;
-pub mod export;
 pub mod scip;
-pub mod manifest;
+pub mod search;
 pub mod security;
-pub mod diff;
 pub mod sequence;
+pub mod viz;
 pub mod watch;
-pub mod bridges;
-pub mod refactor;
-mod analysis;
-mod report;
 
 use std::path::{Path, PathBuf};
 
@@ -115,28 +115,56 @@ impl Infigraph {
                 if !existing_hashes.is_empty() {
                     // Incremental bulk: delete old data for changed files before CSV load
                     let conn = store.connection()?;
-                    conn.query("BEGIN TRANSACTION").context("failed to begin delete transaction")?;
-                    let file_list: Vec<String> = extractions.iter().map(|e| format!("'{}'", escape_str(&e.file))).collect();
+                    conn.query("BEGIN TRANSACTION")
+                        .context("failed to begin delete transaction")?;
+                    let file_list: Vec<String> = extractions
+                        .iter()
+                        .map(|e| format!("'{}'", escape_str(&e.file)))
+                        .collect();
                     let files_in = file_list.join(", ");
-                    let _ = conn.query(&format!("MATCH (s:Symbol) WHERE s.file IN [{}] DETACH DELETE s", files_in));
-                    let _ = conn.query(&format!("MATCH (m:Module) WHERE m.file IN [{}] DETACH DELETE m", files_in));
-                    let _ = conn.query(&format!("MATCH (f:File) WHERE f.id IN [{}] DETACH DELETE f", files_in));
-                    conn.query("COMMIT").context("failed to commit delete transaction")?;
+                    let _ = conn.query(&format!(
+                        "MATCH (s:Symbol) WHERE s.file IN [{}] DETACH DELETE s",
+                        files_in
+                    ));
+                    let _ = conn.query(&format!(
+                        "MATCH (m:Module) WHERE m.file IN [{}] DETACH DELETE m",
+                        files_in
+                    ));
+                    let _ = conn.query(&format!(
+                        "MATCH (f:File) WHERE f.id IN [{}] DETACH DELETE f",
+                        files_in
+                    ));
+                    conn.query("COMMIT")
+                        .context("failed to commit delete transaction")?;
                 }
                 store.upsert_all_parquet(&extractions)?;
             } else {
                 // Small incremental: per-file UNWIND (overhead acceptable for <100 files)
                 let conn = store.connection()?;
-                conn.query("BEGIN TRANSACTION").context("failed to begin index transaction")?;
-                let file_list: Vec<String> = extractions.iter().map(|e| format!("'{}'", escape_str(&e.file))).collect();
+                conn.query("BEGIN TRANSACTION")
+                    .context("failed to begin index transaction")?;
+                let file_list: Vec<String> = extractions
+                    .iter()
+                    .map(|e| format!("'{}'", escape_str(&e.file)))
+                    .collect();
                 let files_in = file_list.join(", ");
-                let _ = conn.query(&format!("MATCH (s:Symbol) WHERE s.file IN [{}] DETACH DELETE s", files_in));
-                let _ = conn.query(&format!("MATCH (m:Module) WHERE m.file IN [{}] DETACH DELETE m", files_in));
-                let _ = conn.query(&format!("MATCH (f:File) WHERE f.id IN [{}] DETACH DELETE f", files_in));
+                let _ = conn.query(&format!(
+                    "MATCH (s:Symbol) WHERE s.file IN [{}] DETACH DELETE s",
+                    files_in
+                ));
+                let _ = conn.query(&format!(
+                    "MATCH (m:Module) WHERE m.file IN [{}] DETACH DELETE m",
+                    files_in
+                ));
+                let _ = conn.query(&format!(
+                    "MATCH (f:File) WHERE f.id IN [{}] DETACH DELETE f",
+                    files_in
+                ));
                 for extraction in &extractions {
                     store.upsert_file_conn_no_delete(&conn, extraction)?;
                 }
-                conn.query("COMMIT").context("failed to commit index transaction")?;
+                conn.query("COMMIT")
+                    .context("failed to commit index transaction")?;
                 // Folder upsert outside transaction — COPY FROM can't run inside explicit txn
                 let file_paths: Vec<&str> = extractions.iter().map(|e| e.file.as_str()).collect();
                 store.upsert_folders_bulk_conn(&conn, &file_paths)?;
@@ -152,10 +180,15 @@ impl Infigraph {
         }
 
         // Post-indexing: resolve cross-file call targets using full graph symbol table
-        let resolve_stats = resolve::resolve_calls_incremental(store, &extractions).unwrap_or_else(|e| {
-            eprintln!("warning: call resolution failed: {e}");
-            resolve::ResolveStats { total_calls: 0, resolved: 0, unresolved: 0 }
-        });
+        let resolve_stats =
+            resolve::resolve_calls_incremental(store, &extractions).unwrap_or_else(|e| {
+                eprintln!("warning: call resolution failed: {e}");
+                resolve::ResolveStats {
+                    total_calls: 0,
+                    resolved: 0,
+                    unresolved: 0,
+                }
+            });
 
         Ok(IndexResult {
             total_files: total,

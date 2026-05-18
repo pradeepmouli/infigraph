@@ -54,7 +54,12 @@ impl GrammarPlugin {
         driver: Arc<GrammarDriver>,
         project_preprocessor: Option<ProjectPreprocessorConfig>,
     ) -> Self {
-        Self { config, plugin_dir, driver, project_preprocessor }
+        Self {
+            config,
+            plugin_dir,
+            driver,
+            project_preprocessor,
+        }
     }
 
     pub fn load(&self) -> Result<()> {
@@ -69,10 +74,8 @@ impl GrammarPlugin {
             self.config.language.emit_referenced_form_imports,
         )?;
 
-        self.driver.set_extractor(
-            &self.config.language.name,
-            &self.config.language.extractor,
-        )?;
+        self.driver
+            .set_extractor(&self.config.language.name, &self.config.language.extractor)?;
 
         Ok(())
     }
@@ -102,52 +105,62 @@ impl GrammarPlugin {
         )?;
         let language = &self.config.language.name;
 
-        let symbols = resp.get("symbols")
+        let symbols = resp
+            .get("symbols")
             .and_then(|v| v.as_array())
             .map(|arr| {
-                arr.iter().filter_map(|s| {
-                    Some(Symbol {
-                        id: s.get("id")?.as_str()?.to_string(),
-                        name: s.get("name")?.as_str()?.to_string(),
-                        kind: parse_symbol_kind(s.get("kind")?.as_str()?),
-                        span: Span {
-                            file: s.get("file")?.as_str()?.to_string(),
-                            start_line: s.get("start_line")?.as_u64()? as u32,
-                            start_col: s.get("start_col")?.as_u64()? as u32,
-                            end_line: s.get("end_line")?.as_u64()? as u32,
-                            end_col: s.get("end_col")?.as_u64()? as u32,
-                        },
-                        signature_hash: s.get("signature_hash")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("0000000000000000")
-                            .to_string(),
-                        parent: s.get("parent").and_then(|v| v.as_str()).map(|s| s.to_string()),
-                        language: language.clone(),
-                        visibility: None,
-                        docstring: None,
-                        complexity: 0,
+                arr.iter()
+                    .filter_map(|s| {
+                        Some(Symbol {
+                            id: s.get("id")?.as_str()?.to_string(),
+                            name: s.get("name")?.as_str()?.to_string(),
+                            kind: parse_symbol_kind(s.get("kind")?.as_str()?),
+                            span: Span {
+                                file: s.get("file")?.as_str()?.to_string(),
+                                start_line: s.get("start_line")?.as_u64()? as u32,
+                                start_col: s.get("start_col")?.as_u64()? as u32,
+                                end_line: s.get("end_line")?.as_u64()? as u32,
+                                end_col: s.get("end_col")?.as_u64()? as u32,
+                            },
+                            signature_hash: s
+                                .get("signature_hash")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("0000000000000000")
+                                .to_string(),
+                            parent: s
+                                .get("parent")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string()),
+                            language: language.clone(),
+                            visibility: None,
+                            docstring: None,
+                            complexity: 0,
+                        })
                     })
-                }).collect()
+                    .collect()
             })
             .unwrap_or_default();
 
-        let relations = resp.get("relations")
+        let relations = resp
+            .get("relations")
             .and_then(|v| v.as_array())
             .map(|arr| {
-                arr.iter().filter_map(|r| {
-                    Some(Relation {
-                        source_id: r.get("source_id")?.as_str()?.to_string(),
-                        target_id: r.get("target_id")?.as_str()?.to_string(),
-                        kind: parse_relation_kind(r.get("kind")?.as_str()?),
-                        span: Some(Span {
-                            file: r.get("file")?.as_str()?.to_string(),
-                            start_line: r.get("start_line")?.as_u64()? as u32,
-                            start_col: r.get("start_col")?.as_u64()? as u32,
-                            end_line: r.get("end_line")?.as_u64()? as u32,
-                            end_col: r.get("end_col")?.as_u64()? as u32,
-                        }),
+                arr.iter()
+                    .filter_map(|r| {
+                        Some(Relation {
+                            source_id: r.get("source_id")?.as_str()?.to_string(),
+                            target_id: r.get("target_id")?.as_str()?.to_string(),
+                            kind: parse_relation_kind(r.get("kind")?.as_str()?),
+                            span: Some(Span {
+                                file: r.get("file")?.as_str()?.to_string(),
+                                start_line: r.get("start_line")?.as_u64()? as u32,
+                                start_col: r.get("start_col")?.as_u64()? as u32,
+                                end_line: r.get("end_line")?.as_u64()? as u32,
+                                end_col: r.get("end_col")?.as_u64()? as u32,
+                            }),
+                        })
                     })
-                }).collect()
+                    .collect()
             })
             .unwrap_or_default();
 
@@ -156,7 +169,12 @@ impl GrammarPlugin {
 }
 
 impl CustomExtractor for GrammarPlugin {
-    fn extract(&self, path: &str, source: &[u8], _language: &str) -> Result<(Vec<Symbol>, Vec<Relation>)> {
+    fn extract(
+        &self,
+        path: &str,
+        source: &[u8],
+        _language: &str,
+    ) -> Result<(Vec<Symbol>, Vec<Relation>)> {
         self.extract(path, source)
     }
 }
