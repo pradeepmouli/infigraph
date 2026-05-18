@@ -1,0 +1,5 @@
+[target.x86_64-pc-windows-gnu]
+image = "mstorsjo/llvm-mingw:latest"
+
+[target.x86_64-pc-windows-gnu.env]
+passthrough = ["INFIGRAPH_MODEL_DIR"]

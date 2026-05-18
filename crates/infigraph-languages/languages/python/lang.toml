@@ -1,0 +1,4 @@
+[language]
+name = "python"
+extensions = [".py"]
+grammar = "tree-sitter-python"

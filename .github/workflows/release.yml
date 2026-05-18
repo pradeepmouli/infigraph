@@ -1,0 +1,84 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            archive: tar.gz
+          - os: macos-13
+            target: x86_64-apple-darwin
+            archive: tar.gz
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive: zip
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install cmake (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y cmake
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }} -p infigraph-cli -p infigraph-mcp
+
+      - name: Sign (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          codesign --force --deep --sign - target/${{ matrix.target }}/release/infigraph
+          codesign --force --deep --sign - target/${{ matrix.target }}/release/infigraph-mcp
+
+      - name: Package (unix)
+        if: matrix.archive == 'tar.gz'
+        run: |
+          cp target/${{ matrix.target }}/release/infigraph .
+          cp target/${{ matrix.target }}/release/infigraph-mcp .
+          tar -czf infigraph-${{ matrix.target }}.tar.gz infigraph infigraph-mcp models/
+
+      - name: Package (windows)
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          Copy-Item target/${{ matrix.target }}/release/infigraph.exe .
+          Copy-Item target/${{ matrix.target }}/release/infigraph-mcp.exe .
+          Compress-Archive -Path infigraph.exe, infigraph-mcp.exe, models/ -DestinationPath infigraph-${{ matrix.target }}.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: infigraph-${{ matrix.target }}
+          path: infigraph-${{ matrix.target }}.*
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: infigraph-*
+          generate_release_notes: true

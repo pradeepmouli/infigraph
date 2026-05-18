@@ -1,0 +1,18 @@
+version: "2.0.0"
+
+name: infigraph
+description: Code graph MCP server — exposes symbol search, call tracing, architecture analysis, dead code detection, and 40+ code intelligence tools to AI agents.
+language: rust
+index: crates/infigraph-mcp/src/main.rs
+
+support:
+  github: https://github.com/intuit/infigraph/issues
+
+args:
+  - name: "--ui"
+    description: Start web UI alongside MCP server
+  - name: "--mcp"
+    description: Run MCP stdio transport with web UI
+  - name: "--port"
+    default: "9749"
+    description: Port for web UI server

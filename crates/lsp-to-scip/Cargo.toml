@@ -1,0 +1,18 @@
+[package]
+name = "lsp-to-scip"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Generic LSP → SCIP bridge: spawn any LSP server and generate index.scip"
+
+[[bin]]
+name = "lsp-to-scip"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+scip = "0.7.1"
+protobuf = "3"
+clap = { version = "4", features = ["derive"] }

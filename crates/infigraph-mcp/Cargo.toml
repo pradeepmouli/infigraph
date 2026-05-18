@@ -1,0 +1,19 @@
+[package]
+name = "infigraph-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "MCP server for infigraph — exposes code graph tools to AI agents"
+
+[[bin]]
+name = "infigraph-mcp"
+path = "src/main.rs"
+
+[dependencies]
+infigraph-core.workspace = true
+infigraph-languages = { path = "../infigraph-languages" }
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+rayon = "1"
+tiny_http = "0.12"

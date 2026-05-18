@@ -1,0 +1,15 @@
+Infigraph
+Copyright 2024-2026 Intuit Inc.
+
+This product includes software developed at Intuit Inc. (https://www.intuit.com/).
+
+Licensed under the Apache License, Version 2.0.
+
+---
+
+Bundled third-party components:
+
+potion-base-8M (models/potion-base-8M/)
+  License: MIT
+  Source: https://huggingface.co/minishlab/potion-base-8M
+  Copyright: MinishLab

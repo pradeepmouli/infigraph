@@ -1,0 +1,6 @@
+/target
+*.jar
+index.scip
+.infigraph/
+driver/target/
+driver/lib/
