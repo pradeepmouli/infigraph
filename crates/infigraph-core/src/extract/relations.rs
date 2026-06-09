@@ -96,6 +96,7 @@ pub fn extract_relations(file: &str, source: &[u8], root: Node, query: &Query) -
                 target_id,
                 kind,
                 span,
+                receiver: None,
             });
         }
     }

@@ -120,6 +120,8 @@ pub struct Relation {
     pub target_id: String,
     pub kind: RelationKind,
     pub span: Option<Span>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receiver: Option<String>,
 }
 
 /// Kind of cross-language bridge detected.

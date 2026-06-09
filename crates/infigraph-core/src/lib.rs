@@ -1,5 +1,6 @@
 mod analysis;
 pub mod bridges;
+pub mod check;
 pub mod cluster;
 pub mod diff;
 pub mod embed;
@@ -7,18 +8,22 @@ pub mod export;
 pub mod extract;
 pub mod graph;
 pub mod lang;
+pub mod learned;
 pub mod manifest;
 pub mod model;
 pub mod multi;
+pub mod patterns;
 pub mod refactor;
 mod report;
 pub mod resolve;
+pub mod review;
 pub mod routes;
 pub mod scip;
 pub mod search;
 pub mod security;
 pub mod sequence;
 pub mod viz;
+pub mod vuln;
 pub mod watch;
 
 use std::path::{Path, PathBuf};
@@ -181,12 +186,14 @@ impl Infigraph {
 
         // Post-indexing: resolve cross-file call targets using full graph symbol table
         let resolve_stats =
-            resolve::resolve_calls_incremental(store, &extractions).unwrap_or_else(|e| {
+            resolve::resolve_calls_incremental(store, &extractions, None).unwrap_or_else(|e| {
                 eprintln!("warning: call resolution failed: {e}");
                 resolve::ResolveStats {
                     total_calls: 0,
                     resolved: 0,
                     unresolved: 0,
+                    learned_resolved: 0,
+                    inherits_resolved: 0,
                 }
             });
 

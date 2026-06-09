@@ -1,6 +1,6 @@
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Context, Result};
 
@@ -74,6 +74,73 @@ pub fn symbol_text(sym: &Symbol) -> String {
         }
     }
     text
+}
+
+/// Build a rich text representation of a symbol for embedding, including file context.
+pub fn rich_symbol_text(kind: &str, name: &str, file: &str, language: &str, doc: &str) -> String {
+    rich_symbol_text_full(kind, name, file, language, doc, "", "")
+}
+
+/// Extended rich text representation with parameter and return type info.
+pub fn rich_symbol_text_full(
+    kind: &str,
+    name: &str,
+    file: &str,
+    language: &str,
+    doc: &str,
+    params: &str,
+    ret: &str,
+) -> String {
+    let path_context = path_to_context(file);
+    let mut text = format!("{kind} {name}");
+    if !params.is_empty() {
+        text.push_str(params);
+    }
+    if !ret.is_empty() {
+        text.push_str(" -> ");
+        text.push_str(ret);
+    }
+    text.push_str(" in ");
+    text.push_str(&path_context);
+    if !language.is_empty() {
+        text.push(' ');
+        text.push_str(language);
+    }
+    if !doc.is_empty() {
+        text.push_str(": ");
+        text.push_str(doc);
+    }
+    text
+}
+
+/// Extract meaningful context from a file path by filtering out common directory names.
+pub fn path_to_context(file: &str) -> String {
+    let parts: Vec<&str> = file.split('/').collect();
+    if parts.len() <= 3 {
+        return file.to_string();
+    }
+    let filename = parts.last().unwrap_or(&"");
+    let meaningful: Vec<&str> = parts
+        .iter()
+        .filter(|p| {
+            let lower = p.to_lowercase();
+            !matches!(
+                lower.as_str(),
+                "src" | "source" | "lib" | "include" | "_h" | "test" | "tests" | "benchmark"
+            )
+        })
+        .copied()
+        .collect();
+    if meaningful.len() <= 4 {
+        meaningful.join("/")
+    } else {
+        let last4 = &meaningful[meaningful.len() - 4..];
+        if last4.contains(filename) {
+            last4.join("/")
+        } else {
+            format!("{}/{}", last4[1..].join("/"), filename)
+        }
+    }
 }
 
 /// Dot-product similarity — equivalent to cosine when vectors are L2-normalized.
@@ -237,6 +304,30 @@ impl EmbedProvider for Model2VecEmbedder {
     }
 }
 
+static CODE_EMBEDDER: OnceLock<Arc<dyn EmbedProvider>> = OnceLock::new();
+static DOC_EMBEDDER: OnceLock<Arc<dyn EmbedProvider>> = OnceLock::new();
+
+/// Factory: select Model2Vec if available, otherwise fall back to TrigramEmbedder.
+pub fn init_embedder() -> Arc<dyn EmbedProvider> {
+    match Model2VecEmbedder::new() {
+        Ok(m) => Arc::new(m),
+        Err(e) => {
+            eprintln!("warning: Model2Vec unavailable ({e}), using trigram fallback");
+            Arc::new(TrigramEmbedder::default())
+        }
+    }
+}
+
+/// Singleton lazy-init code embedder (Arc-based, shared across threads).
+pub fn code_embedder() -> Arc<dyn EmbedProvider> {
+    Arc::clone(CODE_EMBEDDER.get_or_init(init_embedder))
+}
+
+/// Singleton lazy-init doc embedder (Arc-based, shared across threads).
+pub fn doc_embedder() -> Arc<dyn EmbedProvider> {
+    Arc::clone(DOC_EMBEDDER.get_or_init(init_embedder))
+}
+
 /// Create the best available embedder: Model2Vec if possible, fallback to trigram.
 pub fn best_embedder() -> Box<dyn EmbedProvider> {
     match Model2VecEmbedder::new() {
@@ -246,6 +337,20 @@ pub fn best_embedder() -> Box<dyn EmbedProvider> {
             Box::new(TrigramEmbedder::default())
         }
     }
+}
+
+/// Count the number of embeddings in the binary file at `root/.infigraph/embeddings.bin`.
+pub fn embedding_count(root: &Path) -> usize {
+    let path = root.join(".infigraph").join("embeddings.bin");
+    let Ok(file) = std::fs::File::open(&path) else {
+        return 0;
+    };
+    let mut r = BufReader::new(file);
+    let mut buf4 = [0u8; 4];
+    if r.read_exact(&mut buf4).is_err() {
+        return 0;
+    }
+    u32::from_le_bytes(buf4) as usize
 }
 
 /// Save symbol embeddings to a binary file.

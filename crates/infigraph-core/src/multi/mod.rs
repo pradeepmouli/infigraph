@@ -1,3 +1,6 @@
+pub mod combined;
+pub mod grpc;
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 

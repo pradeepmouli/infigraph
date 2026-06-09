@@ -110,6 +110,7 @@ fn generate_route_handler_edges(
                         end_line: sym.span.end_line,
                         end_col: sym.span.end_col,
                     }),
+                    receiver: None,
                 });
             }
         }

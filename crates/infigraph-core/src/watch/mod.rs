@@ -1,3 +1,5 @@
+pub mod batch;
+
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Duration;

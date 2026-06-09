@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use serde_json::{json, Value};
 
 use infigraph_core::embed;
-use infigraph_core::graph::SessionStore;
+use infigraph_core::graph::{SessionStore, SessionData};
 use infigraph_core::multi::{self, Registry};
 use infigraph_core::Infigraph;
 use infigraph_languages::bundled_registry;
@@ -3109,13 +3109,6 @@ fn tool_generate_sequence_diagram(args: &Value) -> Result<String> {
     infigraph_core::sequence::generate_sequence_mermaid(&gq, symbol_id, depth)
 }
 
-fn escape_cypher(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace('\'', "\\'")
-        .replace('\n', " ")
-        .replace('\r', "")
-}
-
 fn save_analysis(path: &str, tool_name: &str, content: &str) -> Result<String> {
     let root = PathBuf::from(path);
     let dir = root.join(".infigraph").join("sessions").join("analysis");
@@ -3235,78 +3228,32 @@ fn session_date_id() -> String {
 }
 
 fn tool_save_session(args: &Value) -> Result<String> {
-    let ss = open_session_store(args)?;
-    let path = args
-        .get("path")
-        .and_then(|p| p.as_str())
-        .context("missing 'path'")?;
-    let summary = args
-        .get("summary")
-        .and_then(|s| s.as_str())
-        .context("missing 'summary'")?;
-    let pending_tasks = args
-        .get("pending_tasks")
-        .and_then(|s| s.as_str())
-        .unwrap_or("");
+    let store = open_session_store(args)?;
+    let path = args.get("path").and_then(|p| p.as_str()).context("missing 'path'")?;
+    let summary = args.get("summary").and_then(|s| s.as_str()).context("missing 'summary'")?;
+    let pending_tasks = args.get("pending_tasks").and_then(|s| s.as_str()).unwrap_or("");
     let decisions = args.get("decisions").and_then(|s| s.as_str()).unwrap_or("");
-    let files_touched = args
-        .get("files_touched")
-        .and_then(|s| s.as_str())
-        .unwrap_or("");
-    let constraints = args
-        .get("constraints")
-        .and_then(|s| s.as_str())
-        .unwrap_or("");
-    let assumptions = args
-        .get("assumptions")
-        .and_then(|s| s.as_str())
-        .unwrap_or("");
+    let files_touched = args.get("files_touched").and_then(|s| s.as_str()).unwrap_or("");
+    let constraints = args.get("constraints").and_then(|s| s.as_str()).unwrap_or("");
+    let assumptions = args.get("assumptions").and_then(|s| s.as_str()).unwrap_or("");
     let blockers = args.get("blockers").and_then(|s| s.as_str()).unwrap_or("");
     let narrative = args.get("narrative").and_then(|s| s.as_str()).unwrap_or("");
-    let conn = ss.connection()?;
 
     let now = session_epoch();
     let session_id = session_date_id();
 
-    let new_files: Vec<&str> = files_touched
-        .split(',')
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .collect();
+    let new_files: Vec<&str> = files_touched.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
 
-    let existing = ss
-        .raw_query(&format!(
-            "MATCH (s:Session) WHERE s.id = '{}' RETURN s.decisions, s.files_touched",
-            escape_cypher(&session_id)
-        ))
-        .unwrap_or_default();
-
-    if existing.is_empty() {
-        let files_str = new_files.join(", ");
-        conn.query(&format!(
-            "CREATE (s:Session {{id: '{id}', summary: '{sum}', pending_tasks: '{pt}', decisions: '{dec}', files_touched: '{ft}', constraints: '{con}', assumptions: '{asm}', blockers: '{blk}', created_at: {now}, updated_at: {now}}})",
-            id = escape_cypher(&session_id),
-            sum = escape_cypher(summary),
-            pt = escape_cypher(pending_tasks),
-            dec = escape_cypher(decisions),
-            ft = escape_cypher(&files_str),
-            con = escape_cypher(constraints),
-            asm = escape_cypher(assumptions),
-            blk = escape_cypher(blockers),
-        )).map_err(|e| anyhow::anyhow!("save session node: {e}"))?;
-    } else {
-        let prev_decisions = existing[0].first().map(|s| s.as_str()).unwrap_or("");
-        let prev_files = existing[0].get(1).map(|s| s.as_str()).unwrap_or("");
-
+    let session = if let Some(existing) = store.load(&session_id)? {
         let merged_decisions = if decisions.is_empty() {
-            prev_decisions.to_string()
-        } else if prev_decisions.is_empty() {
+            existing.decisions.clone()
+        } else if existing.decisions.is_empty() {
             decisions.to_string()
         } else {
-            format!("{prev_decisions} | {decisions}")
+            format!("{} | {}", existing.decisions, decisions)
         };
 
-        let mut all_files: Vec<String> = prev_files
+        let mut all_files: Vec<String> = existing.files_touched
             .split(", ")
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
@@ -3316,25 +3263,38 @@ fn tool_save_session(args: &Value) -> Result<String> {
                 all_files.push(f.to_string());
             }
         }
-        let merged_files = all_files.join(", ");
 
-        conn.query(&format!(
-            "MATCH (s:Session) WHERE s.id = '{id}' SET s.summary = '{sum}', s.pending_tasks = '{pt}', s.decisions = '{dec}', s.files_touched = '{ft}', s.constraints = '{con}', s.assumptions = '{asm}', s.blockers = '{blk}', s.updated_at = {now}",
-            id = escape_cypher(&session_id),
-            sum = escape_cypher(summary),
-            pt = escape_cypher(pending_tasks),
-            dec = escape_cypher(&merged_decisions),
-            ft = escape_cypher(&merged_files),
-            con = escape_cypher(constraints),
-            asm = escape_cypher(assumptions),
-            blk = escape_cypher(blockers),
-        )).map_err(|e| anyhow::anyhow!("update session node: {e}"))?;
-    }
+        SessionData {
+            id: session_id.clone(),
+            summary: summary.to_string(),
+            pending_tasks: pending_tasks.to_string(),
+            decisions: merged_decisions,
+            files_touched: all_files.join(", "),
+            constraints: constraints.to_string(),
+            assumptions: assumptions.to_string(),
+            blockers: blockers.to_string(),
+            created_at: existing.created_at,
+            updated_at: now,
+        }
+    } else {
+        SessionData {
+            id: session_id.clone(),
+            summary: summary.to_string(),
+            pending_tasks: pending_tasks.to_string(),
+            decisions: decisions.to_string(),
+            files_touched: new_files.join(", "),
+            constraints: constraints.to_string(),
+            assumptions: assumptions.to_string(),
+            blockers: blockers.to_string(),
+            created_at: now,
+            updated_at: now,
+        }
+    };
 
-    // Write narrative to markdown file if provided
+    store.save(&session)?;
+
     let root = PathBuf::from(path);
     let sessions_dir = root.join(".infigraph").join("sessions");
-    std::fs::create_dir_all(&sessions_dir)?;
 
     if !narrative.is_empty() {
         let md_path = sessions_dir.join(format!("{session_id}.md"));
@@ -3350,11 +3310,9 @@ fn tool_save_session(args: &Value) -> Result<String> {
         writeln!(f, "{narrative}")?;
     }
 
-    // Generate embedding for full session text (includes narrative for semantic search)
     let emb_path = sessions_dir.join("embeddings.bin");
-    let embed_text =
-        format!("{summary} {pending_tasks} {decisions} {constraints} {assumptions} {narrative}");
-    let embedder = embed::best_embedder();
+    let embed_text = format!("{summary} {pending_tasks} {decisions} {constraints} {assumptions} {narrative}");
+    let embedder = embed::code_embedder();
     let vec = embedder.embed(&embed_text)?;
     let mut emb_store = embed::load_embeddings(&emb_path).unwrap_or_default();
     emb_store.retain(|(id, _)| id != &session_id);
@@ -3364,182 +3322,165 @@ fn tool_save_session(args: &Value) -> Result<String> {
     Ok(format!("Session saved: {session_id}"))
 }
 
-fn tool_get_latest_session(args: &Value) -> Result<String> {
-    let ss = open_session_store(args)?;
-    let path = args.get("path").and_then(|p| p.as_str()).unwrap_or(".");
-    let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
+const CLUSTER_GAP_SECS: i64 = 72 * 3600;
 
-    let rows = ss.raw_query(&format!(
-        "MATCH (s:Session) RETURN s.id, s.summary, s.pending_tasks, s.decisions, s.files_touched, s.created_at, s.updated_at, s.constraints, s.assumptions, s.blockers ORDER BY s.created_at DESC LIMIT {limit}"
-    ))?;
-
-    if rows.is_empty() {
-        return Ok("No previous sessions found. This is a fresh start.".to_string());
+fn detect_session_cluster(store: &SessionStore) -> Result<Vec<SessionData>> {
+    let sorted = store.list_by_updated()?;
+    if sorted.len() <= 1 {
+        return Ok(sorted);
     }
 
+    let mut cluster = vec![sorted[0].clone()];
+    for session in &sorted[1..] {
+        let prev_updated = cluster.last().unwrap().updated_at;
+        if prev_updated - session.updated_at <= CLUSTER_GAP_SECS {
+            cluster.push(session.clone());
+        } else {
+            break;
+        }
+    }
+    Ok(cluster)
+}
+
+fn date_from_session_id(id: &str) -> &str {
+    id.strip_prefix("session_").unwrap_or(id)
+}
+
+fn format_session_output(session: &SessionData, idx: usize, total: usize, path: &str) -> String {
     let mut out = String::new();
 
-    for (idx, row) in rows.iter().enumerate() {
-        let get = |i: usize| row.get(i).map(|s| s.as_str()).unwrap_or("");
-
-        if rows.len() == 1 {
-            out.push_str("## Last Session Context\n\n");
-        } else {
-            out.push_str(&format!("## Session {} of {}\n\n", idx + 1, rows.len()));
-        }
-        out.push_str(&format!("**Session:** {}\n\n", get(0)));
-        let summary = get(1);
-        if !summary.is_empty() {
-            out.push_str(&format!("**Summary:** {summary}\n\n"));
-        }
-        let pending = get(2);
-        if !pending.is_empty() {
-            out.push_str(&format!("**Pending Tasks:** {pending}\n\n"));
-        }
-        let decisions = get(3);
-        if !decisions.is_empty() {
-            out.push_str(&format!("**Decisions:** {decisions}\n\n"));
-        }
-        let files = get(4);
-        if !files.is_empty() {
-            out.push_str(&format!("**Files Touched:** {files}\n\n"));
-        }
-        let constraints = get(7);
-        if !constraints.is_empty() {
-            out.push_str(&format!(
-                "**Constraints (do not retry):** {constraints}\n\n"
-            ));
-        }
-        let assumptions = get(8);
-        if !assumptions.is_empty() {
-            out.push_str(&format!(
-                "**Assumptions (do not break):** {assumptions}\n\n"
-            ));
-        }
-        let blockers = get(9);
-        if !blockers.is_empty() {
-            out.push_str(&format!("**Blockers (needs human):** {blockers}\n\n"));
-        }
-
-        let session_id = get(0);
-        let narrative_path = PathBuf::from(path)
-            .join(".infigraph")
-            .join("sessions")
-            .join(format!("{session_id}.md"));
-        if narrative_path.exists() {
-            out.push_str(&format!(
-                "**Narrative log:** `{}` (read for full session context)\n\n",
-                narrative_path.display()
-            ));
-        }
-
-        if idx < rows.len() - 1 {
-            out.push_str("\n---\n\n");
-        }
+    if total == 1 {
+        out.push_str("## Last Session Context\n\n");
+    } else {
+        out.push_str(&format!("## Session {} of {}\n\n", idx + 1, total));
     }
+    out.push_str(&format!("**Session:** {}\n\n", session.id));
+    if !session.summary.is_empty() { out.push_str(&format!("**Summary:** {}\n\n", session.summary)); }
+    if !session.pending_tasks.is_empty() { out.push_str(&format!("**Pending Tasks:** {}\n\n", session.pending_tasks)); }
+    if !session.decisions.is_empty() { out.push_str(&format!("**Decisions:** {}\n\n", session.decisions)); }
+    if !session.files_touched.is_empty() { out.push_str(&format!("**Files Touched:** {}\n\n", session.files_touched)); }
+    if !session.constraints.is_empty() { out.push_str(&format!("**Constraints (do not retry):** {}\n\n", session.constraints)); }
+    if !session.assumptions.is_empty() { out.push_str(&format!("**Assumptions (do not break):** {}\n\n", session.assumptions)); }
+    if !session.blockers.is_empty() { out.push_str(&format!("**Blockers (needs human):** {}\n\n", session.blockers)); }
 
-    // Show recent activity log (breadcrumbs from tool calls)
+    let narrative_path = PathBuf::from(path).join(".infigraph").join("sessions").join(format!("{}.md", session.id));
+    if narrative_path.exists() {
+        out.push_str(&format!("**Narrative log:** `{}` (read for full session context)\n\n", narrative_path.display()));
+    }
+    out
+}
+
+fn append_activity_log(out: &mut String, path: &str) {
     let today_date = session_date_id().replace("session_", "");
-    let activity_path = PathBuf::from(path)
-        .join(".infigraph")
-        .join("sessions")
-        .join(format!("activity_{today_date}.jsonl"));
+    let activity_path = PathBuf::from(path).join(".infigraph").join("sessions").join(format!("activity_{today_date}.jsonl"));
     if activity_path.exists() {
         if let Ok(content) = std::fs::read_to_string(&activity_path) {
             let lines: Vec<&str> = content.lines().collect();
             let total = lines.len();
-            let tail = if total > 20 {
-                &lines[total - 20..]
-            } else {
-                &lines[..]
-            };
+            let tail = if total > 20 { &lines[total-20..] } else { &lines[..] };
             if !tail.is_empty() {
-                out.push_str(&format!(
-                    "## Activity Log (today, last {} of {} calls)\n\n",
-                    tail.len(),
-                    total
-                ));
+                out.push_str(&format!("## Activity Log (today, last {} of {} calls)\n\n", tail.len(), total));
                 for line in tail {
                     if let Ok(entry) = serde_json::from_str::<Value>(line) {
                         let tool = entry.get("tool").and_then(|t| t.as_str()).unwrap_or("?");
+                        let status = entry.get("status").and_then(|s| s.as_str()).unwrap_or("ok");
+                        let marker = if status == "ok" { "" } else { " FAILED" };
                         let args_obj = entry.get("args").cloned().unwrap_or(json!({}));
                         let args_str = serde_json::to_string(&args_obj).unwrap_or_default();
-                        let preview = if args_str.len() > 80 {
-                            &args_str[..80]
-                        } else {
-                            &args_str
-                        };
-                        out.push_str(&format!("- `{tool}` {preview}\n"));
+                        let preview = if args_str.len() > 80 { &args_str[..80] } else { &args_str };
+                        out.push_str(&format!("- `{tool}`{marker} {preview}\n"));
                     }
                 }
                 out.push('\n');
             }
         }
     }
+}
 
-    // Check for old sessions and suggest purge
-    let now = session_epoch();
-    let cutoff_30d = now - (30 * 86400);
-    let old_count = ss
-        .raw_query(&format!(
-            "MATCH (s:Session) WHERE s.created_at < {cutoff_30d} RETURN count(*)"
-        ))
-        .unwrap_or_default();
-    let old_n: u64 = old_count
-        .first()
-        .and_then(|r| r.first())
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
-    if old_n > 0 {
-        out.push_str(&format!("\n> {old_n} session(s) older than 30 days. Ask user if they want to run `purge_sessions` to clean up.\n"));
+fn append_old_session_hint(sessions_dir: &std::path::Path, out: &mut String) {
+    if let Ok(entries) = std::fs::read_dir(sessions_dir) {
+        let session_files: Vec<_> = entries
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                let name = e.file_name();
+                let s = name.to_string_lossy();
+                s.starts_with("session_") && s.ends_with(".json")
+            })
+            .collect();
+        if session_files.len() > 30 {
+            out.push_str(&format!(
+                "\n> {} session files found. Consider running `purge_sessions` to clean up old sessions.\n",
+                session_files.len()
+            ));
+        }
     }
+}
+
+fn tool_get_latest_session(args: &Value) -> Result<String> {
+    let path = args.get("path").and_then(|p| p.as_str()).unwrap_or(".");
+    let explicit_limit = args.get("limit").and_then(|v| v.as_u64());
+    let store = open_session_store(args)?;
+
+    let sessions = if explicit_limit.is_some() {
+        let limit = explicit_limit.unwrap() as usize;
+        store.list_recent(limit)?
+    } else {
+        detect_session_cluster(&store)?
+    };
+
+    if sessions.is_empty() {
+        return Ok("No previous sessions found. This is a fresh start.".to_string());
+    }
+
+    let mut out = String::new();
+    let total = sessions.len();
+
+    if total > 1 {
+        let newest_date = date_from_session_id(&sessions[0].id);
+        let oldest_date = date_from_session_id(&sessions[total - 1].id);
+        out.push_str(&format!(
+            "## {} parallel sessions detected ({} — {})\n\n\
+             **Ask the user which session to resume before proceeding.**\n\n",
+            total, oldest_date, newest_date
+        ));
+    }
+
+    for (idx, session) in sessions.iter().enumerate() {
+        out.push_str(&format_session_output(session, idx, total, path));
+        if idx < total - 1 {
+            out.push_str("\n---\n\n");
+        }
+    }
+
+    append_activity_log(&mut out, path);
+    append_old_session_hint(store.sessions_dir(), &mut out);
 
     Ok(out)
 }
 
 fn tool_purge_sessions(args: &Value) -> Result<String> {
-    let ss = open_session_store(args)?;
-    let path = args
-        .get("path")
-        .and_then(|p| p.as_str())
-        .context("missing 'path'")?;
-    let older_than_days = args
-        .get("older_than_days")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(30);
-    let conn = ss.connection()?;
+    let store = open_session_store(args)?;
+    let path = args.get("path").and_then(|p| p.as_str()).context("missing 'path'")?;
+    let older_than_days = args.get("older_than_days").and_then(|v| v.as_u64()).unwrap_or(30);
 
     let now = session_epoch();
     let cutoff = now - (older_than_days as i64 * 86400);
 
-    let to_purge = ss
-        .raw_query(&format!(
-            "MATCH (s:Session) WHERE s.created_at < {cutoff} RETURN s.id, s.summary"
-        ))
-        .unwrap_or_default();
+    let all = store.list_all()?;
+    let to_purge: Vec<&SessionData> = all.iter().filter(|s| s.created_at < cutoff).collect();
 
     if to_purge.is_empty() {
-        return Ok(format!(
-            "No sessions older than {older_than_days} days found."
-        ));
+        return Ok(format!("No sessions older than {older_than_days} days found."));
     }
 
-    let purged_ids: Vec<String> = to_purge
-        .iter()
-        .filter_map(|r| r.first().map(|s| s.to_string()))
-        .collect();
+    let purged_ids: Vec<String> = to_purge.iter().map(|s| s.id.clone()).collect();
 
-    conn.query(&format!(
-        "MATCH (s:Session) WHERE s.created_at < {cutoff} DETACH DELETE s"
-    ))
-    .map_err(|e| anyhow::anyhow!("purge failed: {e}"))?;
+    for id in &purged_ids {
+        store.delete(id)?;
+    }
 
-    // Clean embeddings
     let root = PathBuf::from(path);
-    let emb_path = root
-        .join(".infigraph")
-        .join("sessions")
-        .join("embeddings.bin");
+    let emb_path = root.join(".infigraph").join("sessions").join("embeddings.bin");
     if emb_path.exists() {
         let mut emb_store = embed::load_embeddings(&emb_path).unwrap_or_default();
         let before = emb_store.len();
@@ -3549,47 +3490,25 @@ fn tool_purge_sessions(args: &Value) -> Result<String> {
         }
     }
 
-    let mut out = format!(
-        "Purged {} session(s) older than {} days:\n",
-        to_purge.len(),
-        older_than_days
-    );
-    for row in &to_purge {
-        let id = row.first().map(|s| s.as_str()).unwrap_or("");
-        let summary = row.get(1).map(|s| s.as_str()).unwrap_or("");
-        let preview = if summary.len() > 60 {
-            &summary[..60]
-        } else {
-            summary
-        };
-        out.push_str(&format!("- {id}: {preview}\n"));
+    let mut out = format!("Purged {} session(s) older than {} days:\n", to_purge.len(), older_than_days);
+    for s in &to_purge {
+        let preview = if s.summary.len() > 60 { &s.summary[..60] } else { &s.summary };
+        out.push_str(&format!("- {}: {preview}\n", s.id));
     }
     Ok(out)
 }
 
 fn tool_search_sessions(args: &Value) -> Result<String> {
-    let ss = open_session_store(args)?;
-    let path = args
-        .get("path")
-        .and_then(|p| p.as_str())
-        .context("missing 'path'")?;
-    let query = args
-        .get("query")
-        .and_then(|s| s.as_str())
-        .context("missing 'query'")?;
+    let store = open_session_store(args)?;
+    let path = args.get("path").and_then(|p| p.as_str()).context("missing 'path'")?;
+    let query = args.get("query").and_then(|s| s.as_str()).context("missing 'query'")?;
     let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
 
     let root = PathBuf::from(path);
-    let emb_path = root
-        .join(".infigraph")
-        .join("sessions")
-        .join("embeddings.bin");
+    let emb_path = root.join(".infigraph").join("sessions").join("embeddings.bin");
 
     if !emb_path.exists() {
-        return Ok(
-            "No session embeddings found. Save at least one session with `save_session` first."
-                .to_string(),
-        );
+        return Ok("No session embeddings found. Save at least one session with `save_session` first.".to_string());
     }
 
     let emb_store = embed::load_embeddings(&emb_path)?;
@@ -3597,56 +3516,38 @@ fn tool_search_sessions(args: &Value) -> Result<String> {
         return Ok("No session embeddings found.".to_string());
     }
 
-    let embedder = embed::best_embedder();
+    let embedder = embed::code_embedder();
     let query_vec = embedder.embed(query)?;
     if query_vec.is_empty() {
         return Ok("Failed to embed query.".to_string());
     }
 
-    let mut scored: Vec<(f32, &str)> = emb_store
-        .iter()
+    let mut scored: Vec<(f32, &str)> = emb_store.iter()
         .map(|(id, vec)| (embed::cosine_similarity(&query_vec, vec), id.as_str()))
         .collect();
     scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
     scored.truncate(limit);
 
-    // Fetch session details from graph for matched IDs
     let mut out = format!("## Session Search: \"{query}\"\n\n");
 
     for (score, session_id) in &scored {
-        let rows = ss.raw_query(&format!(
-            "MATCH (s:Session) WHERE s.id = '{}' RETURN s.id, s.summary, s.pending_tasks, s.decisions, s.files_touched",
-            escape_cypher(session_id)
-        )).unwrap_or_default();
-
-        if let Some(row) = rows.first() {
-            let get = |i: usize| row.get(i).map(|s| s.as_str()).unwrap_or("");
-            out.push_str(&format!("### {} (relevance: {:.3})\n\n", get(0), score));
-            let summary = get(1);
-            if !summary.is_empty() {
-                out.push_str(&format!("**Summary:** {summary}\n\n"));
+        if let Some(session) = store.load(session_id)? {
+            out.push_str(&format!("### {} (relevance: {:.3})\n\n", session.id, score));
+            if !session.summary.is_empty() {
+                out.push_str(&format!("**Summary:** {}\n\n", session.summary));
             }
-            let pending = get(2);
-            if !pending.is_empty() {
-                out.push_str(&format!("**Pending Tasks:** {pending}\n\n"));
+            if !session.pending_tasks.is_empty() {
+                out.push_str(&format!("**Pending Tasks:** {}\n\n", session.pending_tasks));
             }
-            let decisions = get(3);
-            if !decisions.is_empty() {
-                out.push_str(&format!("**Decisions:** {decisions}\n\n"));
+            if !session.decisions.is_empty() {
+                out.push_str(&format!("**Decisions:** {}\n\n", session.decisions));
             }
-            let files = get(4);
-            if !files.is_empty() {
-                out.push_str(&format!("**Files Touched:** {files}\n\n"));
+            if !session.files_touched.is_empty() {
+                out.push_str(&format!("**Files Touched:** {}\n\n", session.files_touched));
             }
-            let narrative_path = root
-                .join(".infigraph")
-                .join("sessions")
-                .join(format!("{session_id}.md"));
+            let narrative_path = root.join(".infigraph").join("sessions").join(format!("{session_id}.md"));
             if narrative_path.exists() {
-                out.push_str(&format!(
-                    "**Narrative log:** `{}` (read for full context)\n\n",
-                    narrative_path.display()
-                ));
+                out.push_str(&format!("**Narrative log:** `{}` (read for full context)\n\n", narrative_path.display()));
             }
             out.push_str("---\n\n");
         }

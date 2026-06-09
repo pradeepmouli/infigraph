@@ -26,6 +26,7 @@ protobuf = "3"
 tempfile = "3"
 # macos_kqueue enables the kqueue backend on macOS; notify selects inotify on Linux automatically.
 notify = { version = "6", features = ["macos_kqueue"] }
+ureq = "2"
 usearch = "2.18"
 parquet = "58.3"
 arrow = { version = "58.3", features = ["prettyprint"] }
