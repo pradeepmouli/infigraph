@@ -707,6 +707,7 @@ infigraph/
 │   │       ├── scip/            # SCIP index import (compiler-grade enrichment)
 │   │       ├── refactor/        # Refactoring analysis (complexity, coupling, clones, dead code)
 │   │       ├── watch/           # File watcher with auto-start after indexing + change batching
+│   │       ├── session/         # Session context persistence across AI sessions
 │   │       ├── review/          # PR review engine with optional LLM enrichment
 │   │       ├── check/           # CI check runner (security, complexity, dead code gates)
 │   │       ├── vuln/            # OSV vulnerability scanning
