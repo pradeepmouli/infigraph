@@ -16,7 +16,8 @@ Built in Rust. Zero LLM dependency. Runs locally.
 - **OSV Vulnerability Scanning:** Scans dependencies against the OSV database for known vulnerabilities.
 - **Design Pattern Detection:** Identifies Singleton, Factory, Observer, Strategy, Builder, and other patterns.
 - **Refactor Analysis:** Complexity hotspots, coupling, near-duplicate detection, dead code — ranked by impact/effort.
-- **Document Indexing:** Index PDF, DOCX, PPTX, HTML, Markdown. Confluence wiki crawler with incremental sync.
+- **Document Indexing:** Index PDF, DOCX, PPTX, HTML, Markdown with hybrid search.
+- **Confluence Wiki Crawler:** BFS wiki crawl with incremental sync — indexes pages into the same search pipeline as code.
 - **Auto-Watch:** File watcher auto-starts after indexing. Index stays fresh without manual intervention.
 - **HNSW Vector Index:** Approximate nearest neighbor search for fast similarity queries at scale (~2ms for 500K symbols).
 - **Session Continuity:** Persists context across AI agent sessions — summary, pending tasks, decisions, touched files.
