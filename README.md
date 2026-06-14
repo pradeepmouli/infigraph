@@ -16,6 +16,41 @@ AI agents are **structurally blind** to your codebase. When they need to answer 
 
 **The cost:** 60–80% of AI agent tokens spent on code rediscovery instead of solving your problem.
 
+## Why Infigraph (What Makes It Unique)
+
+The market has two categories of solutions — neither solves this:
+
+**Cloud-based tools** (GitHub Copilot, Sourcegraph, Codeium, Tabnine):
+- ❌ Require sending your code to external APIs
+- ❌ Expensive per-query (token costs compound)
+- ❌ Latency-bound by network round-trips
+- ❌ Privacy concerns for proprietary code
+- ✅ Good AI integration
+
+**Local analysis tools** (ctags, Language Servers, ripgrep, CodeQL):
+- ✅ Run locally, offline-capable
+- ✅ No privacy/security concerns
+- ❌ No persistent knowledge graph
+- ❌ Limited language support (1-3 languages)
+- ❌ Not designed for AI agents
+- ❌ Scattered results, high token overhead for agents
+
+**The gap Infigraph fills:**
+| Feature | Cloud Tools | Local Tools | Infigraph |
+|---------|-------------|------------|-----------|
+| **Local-first operation** | ❌ | ✅ | ✅ |
+| **Persistent knowledge graph** | ❌ | ❌ | ✅ |
+| **62 language support** | ❌ | ❌ | ✅ |
+| **AI agent integration** (MCP) | Limited | ❌ | ✅ |
+| **Offline operation** | ❌ | ✅ | ✅ |
+| **No external APIs** | ❌ | ✅ | ✅ |
+| **Cypher queries on code** | ❌ | ❌ | ✅ |
+| **Cross-file resolution** | ❌ | Limited | ✅ |
+
+**No other product or OSS combines all of these.** Infigraph is the first AI-native, local-first knowledge graph engine for code.
+
+---
+
 ## The Solution
 
 Infigraph builds a **persistent knowledge graph** of your codebase before the agent runs. Structural questions that would cost hundreds of tokens to answer with raw file reads now resolve in milliseconds:
@@ -39,6 +74,7 @@ Examples:
 
 ## Table of Contents
 
+- [Why Infigraph](#why-infigraph-what-makes-it-unique) — What's unique in the market
 - [Key Highlights](#key-highlights) — Core capabilities at a glance
 - [Quick Start](#quick-start) — Install and run in 2 minutes
 - [How It Works](#how-it-works) — Integration with AI coding agents

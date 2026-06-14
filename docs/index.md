@@ -1,6 +1,6 @@
 ---
 layout: default
-title: Infigraph — AST-powered Code Intelligence
+title: Infigraph — AST-powered Local-first Code Intelligence
 ---
 
 <style>
@@ -74,6 +74,21 @@ Source Code → Index → Knowledge Graph → AI Agent → Instant Answers
 ```
 
 **Result:** 10–100x fewer tokens. 1ms instead of 5s file reads. Complete call graphs in milliseconds.
+
+---
+
+## Why Infigraph (Unique in the Market)
+
+**No other tool combines all of this:**
+- ✅ **Local-first** — Everything runs offline, no APIs
+- ✅ **Persistent knowledge graph** — Query once, reuse forever
+- ✅ **62 languages** — Tree-sitter + grammar plugins
+- ✅ **AI-native** — Built for MCP agents (Claude Code, Cursor, etc.)
+- ✅ **No LLM dependency** — Pure code analysis
+
+Cloud tools (GitHub Copilot, Sourcegraph) require sending code to external APIs. Local tools (ctags, LSP, CodeQL) don't persist a knowledge graph. **Infigraph is the first AI-native, local-first knowledge graph for code.**
+
+[Read the full comparison →](/infigraph#why-infigraph-what-makes-it-unique)
 
 ---
 
