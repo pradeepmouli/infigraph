@@ -28,6 +28,16 @@ Built in Rust. Zero LLM dependency. Runs locally.
 - **Web UI:** Built-in graph explorer, search, route map at localhost:9749.
 - **Export:** Neo4j Cypher, GraphML, JSON — take your graph anywhere.
 
+## Offline-First Design
+
+Infigraph is **built for offline operation** — everything runs locally, no cloud APIs or network access needed. The ML embedding model (`potion-base-8M`, 29MB) is bundled in this repository for immediate use without additional downloads.
+
+This means:
+- Semantic search works out of the box after cloning
+- No external dependencies or API keys required
+- Your codebase never leaves your machine
+- Works on air-gapped systems
+
 ## Install
 
 ### macOS / Linux

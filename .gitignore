@@ -1,6 +1,55 @@
+# Rust
 /target
+Cargo.lock
+*.rlib
+*.rmeta
+**/*.rs.bk
+
+# Build artifacts
 *.jar
-index.scip
+*.so
+*.dylib
+*.dll
+*.exe
+*.o
+*.a
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+*.iml
+.eclipse
+.project
+.classpath
+.c9/
+*.sublime-project
+*.sublime-workspace
+.vim/
+
+# Runtime
 .infigraph/
+index.scip
 driver/target/
 driver/lib/
+*.log
+*.pid
+
+# Environment
+.env
+.env.local
+.env.*.local
+.envrc
+
+# OS
+.DS_Store
+Thumbs.db
+*.tmp
+*.bak
+
+# Auto-generated Jekyll docs (synced from root sources)
+docs/architecture.md
+docs/contributing.md
