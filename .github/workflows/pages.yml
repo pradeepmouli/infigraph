@@ -1,0 +1,104 @@
+name: Deploy GitHub Pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - docs/**
+      - ARCHITECTURE.md
+      - CONTRIBUTING.md
+      - .github/workflows/pages.yml
+  pull_request:
+    branches: [main]
+    paths:
+      - docs/**
+      - ARCHITECTURE.md
+      - CONTRIBUTING.md
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: 3.2
+          bundler-cache: true
+          working-directory: ./docs
+
+      - name: Generate Jekyll docs from root sources
+        run: |
+          #!/bin/bash
+          set -e
+
+          # Function to extract title from markdown (first # heading)
+          extract_title() {
+            grep "^# " "$1" | head -1 | sed 's/^# //'
+          }
+
+          # Generate architecture.md
+          {
+            echo "---"
+            echo "layout: default"
+            echo "title: $(extract_title ARCHITECTURE.md)"
+            echo "---"
+            echo ""
+            cat ARCHITECTURE.md
+          } > docs/architecture.md
+
+          # Generate contributing.md
+          {
+            echo "---"
+            echo "layout: default"
+            echo "title: $(extract_title CONTRIBUTING.md)"
+            echo "---"
+            echo ""
+            cat CONTRIBUTING.md
+          } > docs/contributing.md
+
+          # Generate getting-started.md from README (extract Quick Start + Installation + How It Works)
+          {
+            echo "---"
+            echo "layout: default"
+            echo "title: Getting Started"
+            echo "---"
+            echo ""
+            echo "# Getting Started with Infigraph"
+            echo ""
+            # Extract from Quick Start section to before Usage Examples (remove the last line which is the ## Usage Examples header)
+            sed -n '/^## Quick Start/,/^## Usage Examples/p' README.md | sed '$d'
+          } > docs/getting-started.md
+
+          echo "✓ Generated Jekyll docs from root sources"
+
+      - name: Build site
+        working-directory: ./docs
+        run: bundle exec jekyll build --strict_front_matter
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ./docs/_site
+
+  deploy:
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    needs: build
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

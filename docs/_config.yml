@@ -1,0 +1,39 @@
+title: Infigraph
+description: AST-powered code intelligence engine
+url: https://intuit.github.io/infigraph
+baseurl: /infigraph
+
+theme: jekyll-theme-minimal
+plugins:
+  - jekyll-seo-tag
+
+# Navigation
+nav:
+  - text: Home
+    url: /
+  - text: Getting Started
+    url: /getting-started
+  - text: Architecture
+    url: /architecture
+  - text: Contributing
+    url: /contributing
+  - text: GitHub
+    url: https://github.com/intuit/infigraph
+
+# Site metadata
+author:
+  name: Intuit
+  url: https://intuit.com
+
+repository: intuit/infigraph
+
+# Build settings
+markdown: kramdown
+kramdown:
+  syntax_highlighter: rouge
+
+# Exclude from build
+exclude:
+  - .github
+  - Gemfile
+  - Gemfile.lock
