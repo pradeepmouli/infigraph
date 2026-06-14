@@ -1,24 +1,27 @@
 title: Infigraph
-description: AST-powered code intelligence engine
+description: AST-powered Local-first Code Intelligence Engine
 url: https://intuit.github.io/infigraph
 baseurl: /infigraph
 
-theme: jekyll-theme-minimal
+# Theme: Just the Docs (professional documentation theme)
+theme: just-the-docs
 plugins:
   - jekyll-seo-tag
 
-# Navigation
-nav:
-  - text: Home
-    url: /
-  - text: Getting Started
-    url: /getting-started
-  - text: Architecture
-    url: /architecture
-  - text: Contributing
-    url: /contributing
-  - text: GitHub
-    url: https://github.com/intuit/infigraph
+# Just the Docs configuration
+color_scheme: light
+search_enabled: true
+search_tokenizer_separator: /[\s/]+/
+heading_anchors: true
+
+# Navigation (sidebar)
+aux_links:
+  "GitHub": https://github.com/intuit/infigraph
+  "License": https://github.com/intuit/infigraph/blob/main/LICENSE
+aux_links_new_tab: true
+
+# Footer
+footer_content: "Built with ❤️ by <a href=\"https://intuit.com\">Intuit</a> • <a href=\"https://github.com/intuit/infigraph/blob/main/LICENSE\">Apache 2.0</a>"
 
 # Site metadata
 author:
@@ -31,6 +34,8 @@ repository: intuit/infigraph
 markdown: kramdown
 kramdown:
   syntax_highlighter: rouge
+  input: GFM
+  hard_wrap: false
 
 # Exclude from build
 exclude:

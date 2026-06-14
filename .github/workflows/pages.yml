@@ -52,6 +52,7 @@ jobs:
             echo "---"
             echo "layout: default"
             echo "title: $(extract_title ARCHITECTURE.md)"
+            echo "nav_order: 3"
             echo "---"
             echo ""
             cat ARCHITECTURE.md
@@ -62,6 +63,7 @@ jobs:
             echo "---"
             echo "layout: default"
             echo "title: $(extract_title CONTRIBUTING.md)"
+            echo "nav_order: 4"
             echo "---"
             echo ""
             cat CONTRIBUTING.md
@@ -72,6 +74,7 @@ jobs:
             echo "---"
             echo "layout: default"
             echo "title: Getting Started"
+            echo "nav_order: 2"
             echo "---"
             echo ""
             echo "# Getting Started with Infigraph"
