@@ -6,6 +6,7 @@ members = [
     "crates/infigraph-confluence",
 
     "crates/infigraph-grammar-plugin",
+    "crates/infigraph-pipeline-plugin",
     "crates/infigraph-cli",
     "crates/infigraph-mcp",
     "crates/lsp-to-scip",

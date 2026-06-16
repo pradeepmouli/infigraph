@@ -2336,12 +2336,26 @@ dependencies = [
  "infigraph-core",
  "infigraph-docs",
  "infigraph-languages",
+ "infigraph-pipeline-plugin",
  "rayon",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
  "tiny_http",
+]
+
+[[package]]
+name = "infigraph-pipeline-plugin"
+version = "1.0.0"
+dependencies = [
+ "anyhow",
+ "dirs-next",
+ "log",
+ "regex",
+ "serde",
+ "serde_json",
+ "toml",
 ]
 
 [[package]]

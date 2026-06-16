@@ -67,6 +67,10 @@ const CREATE_SCHEMA: &[&str] = &[
     )",
     "CREATE REL TABLE IF NOT EXISTS DEFINED_IN(FROM Pipeline TO Document)",
     "CREATE REL TABLE IF NOT EXISTS DEPENDS_ON(FROM Pipeline TO Pipeline, dep_type STRING)",
+    // PipelineCore (Phase A — plugin pipeline system)
+    "CREATE NODE TABLE IF NOT EXISTS PipelineCore(id STRING, name STRING, doc_id STRING, plugin_id STRING, inputs STRING[], outputs STRING[], PRIMARY KEY(id))",
+    "CREATE REL TABLE IF NOT EXISTS PIPELINE_DEFINED_IN(FROM PipelineCore TO Document, ONE_MANY)",
+    "CREATE REL TABLE IF NOT EXISTS PIPELINE_DEPENDS_ON(FROM PipelineCore TO PipelineCore, dep_type STRING, MANY_MANY)",
 ];
 
 pub struct DocStore {
@@ -746,6 +750,324 @@ impl DocStore {
         Ok(docs)
     }
 
+    // ── PipelineCore methods (Phase A — plugin pipeline system) ──────────
+
+    /// Create a per-plugin node table from schema definition.
+    pub fn ensure_plugin_table(&self, plugin_id: &str, columns: &[(String, String)]) -> Result<()> {
+        let conn = self.connection()?;
+        let mut col_defs = String::from("id STRING");
+        for (name, col_type) in columns {
+            col_defs.push_str(&format!(", {} {}", name, col_type));
+        }
+        let ddl = format!(
+            "CREATE NODE TABLE IF NOT EXISTS Pipeline_{}({}, PRIMARY KEY(id))",
+            plugin_id, col_defs
+        );
+        conn.query(&ddl)
+            .map_err(|e| anyhow::anyhow!("ensure_plugin_table DDL: {e}"))?;
+        Ok(())
+    }
+
+    /// Upsert a pipeline core record.
+    pub fn upsert_pipeline_core(&self, record: &PipelineCoreRecord) -> Result<()> {
+        let conn = self.connection()?;
+        // Delete existing if present
+        let _ = conn.query(&format!(
+            "MATCH (p:PipelineCore) WHERE p.id = '{}' DETACH DELETE p",
+            escape_str(&record.id)
+        ));
+        // Build list literals
+        let inputs_str = record
+            .inputs
+            .iter()
+            .map(|s| format!("'{}'", escape_str(s)))
+            .collect::<Vec<_>>()
+            .join(",");
+        let outputs_str = record
+            .outputs
+            .iter()
+            .map(|s| format!("'{}'", escape_str(s)))
+            .collect::<Vec<_>>()
+            .join(",");
+        conn.query(&format!(
+            "CREATE (p:PipelineCore {{id: '{}', name: '{}', doc_id: '{}', plugin_id: '{}', inputs: [{}], outputs: [{}]}})",
+            escape_str(&record.id),
+            escape_str(&record.name),
+            escape_str(&record.doc_id),
+            escape_str(&record.plugin_id),
+            inputs_str,
+            outputs_str,
+        ))
+        .map_err(|e| anyhow::anyhow!("create PipelineCore: {e}"))?;
+        Ok(())
+    }
+
+    /// Upsert plugin-specific properties into Pipeline_<plugin_id> table.
+    pub fn upsert_plugin_properties(
+        &self,
+        pipeline_id: &str,
+        plugin_id: &str,
+        properties: &serde_json::Map<String, serde_json::Value>,
+        schema: &[(String, String)],
+    ) -> Result<()> {
+        let conn = self.connection()?;
+        let table = format!("Pipeline_{}", plugin_id);
+        let esc_id = escape_str(pipeline_id);
+        // Delete existing
+        let _ = conn.query(&format!(
+            "MATCH (p:{}) WHERE p.id = '{}' DELETE p",
+            table, esc_id
+        ));
+        // Build property assignments
+        let mut props = format!("id: '{}'", esc_id);
+        for (col_name, _col_type) in schema {
+            if let Some(val) = properties.get(col_name.as_str()) {
+                let s = match val {
+                    serde_json::Value::String(s) => escape_str(s),
+                    other => escape_str(&other.to_string()),
+                };
+                props.push_str(&format!(", {}: '{}'", col_name, s));
+            }
+        }
+        conn.query(&format!("CREATE (p:{} {{{}}})", table, props))
+            .map_err(|e| anyhow::anyhow!("upsert plugin properties: {e}"))?;
+        Ok(())
+    }
+
+    /// Link a pipeline core to a document via PIPELINE_DEFINED_IN edge.
+    pub fn link_pipeline_core_to_doc(&self, pipeline_id: &str, doc_id: &str) -> Result<()> {
+        let conn = self.connection()?;
+        conn.query(&format!(
+            "MATCH (p:PipelineCore), (d:Document) WHERE p.id = '{}' AND d.id = '{}' CREATE (p)-[:PIPELINE_DEFINED_IN]->(d)",
+            escape_str(pipeline_id),
+            escape_str(doc_id),
+        ))
+        .map_err(|e| anyhow::anyhow!("link PIPELINE_DEFINED_IN: {e}"))?;
+        Ok(())
+    }
+
+    /// Link pipeline dependencies using PipelineCore inputs/outputs matching.
+    /// Cross-plugin: if plugin A's output matches plugin B's input, creates PIPELINE_DEPENDS_ON edge.
+    pub fn link_pipeline_dependencies_v2(&self) -> Result<usize> {
+        let cores = self.get_all_pipeline_cores(None)?;
+        if cores.len() < 2 {
+            return Ok(0);
+        }
+
+        let conn = self.connection()?;
+        // Clear old edges
+        let _ = conn.query("MATCH ()-[r:PIPELINE_DEPENDS_ON]->() DELETE r");
+
+        let mut count = 0;
+        for producer in &cores {
+            if producer.outputs.is_empty() {
+                continue;
+            }
+            for consumer in &cores {
+                if consumer.id == producer.id || consumer.inputs.is_empty() {
+                    continue;
+                }
+                // Check if any output of producer matches any input of consumer
+                let has_match = producer
+                    .outputs
+                    .iter()
+                    .any(|out| consumer.inputs.iter().any(|inp| inp == out));
+                if has_match {
+                    conn.query(&format!(
+                        "MATCH (a:PipelineCore), (b:PipelineCore) WHERE a.id = '{}' AND b.id = '{}' CREATE (a)-[:PIPELINE_DEPENDS_ON {{dep_type: 'data'}}]->(b)",
+                        escape_str(&consumer.id),
+                        escape_str(&producer.id),
+                    ))
+                    .map_err(|e| anyhow::anyhow!("create PIPELINE_DEPENDS_ON: {e}"))?;
+                    count += 1;
+                }
+            }
+        }
+        Ok(count)
+    }
+
+    /// Get all PipelineCore records, optionally filtered by plugin_id.
+    pub fn get_all_pipeline_cores(
+        &self,
+        plugin_id: Option<&str>,
+    ) -> Result<Vec<PipelineCoreRecord>> {
+        let conn = self.connection()?;
+        let query = match plugin_id {
+            Some(pid) => format!(
+                "MATCH (p:PipelineCore) WHERE p.plugin_id = '{}' RETURN p.id, p.name, p.doc_id, p.plugin_id, p.inputs, p.outputs",
+                escape_str(pid)
+            ),
+            None => "MATCH (p:PipelineCore) RETURN p.id, p.name, p.doc_id, p.plugin_id, p.inputs, p.outputs".to_string(),
+        };
+        let mut result = conn
+            .query(&query)
+            .map_err(|e| anyhow::anyhow!("query pipeline cores: {e}"))?;
+        let mut records = Vec::new();
+        while let Some(row) = result.next() {
+            if row.len() >= 6 {
+                records.push(PipelineCoreRecord {
+                    id: row[0].to_string(),
+                    name: row[1].to_string(),
+                    doc_id: row[2].to_string(),
+                    plugin_id: row[3].to_string(),
+                    inputs: parse_string_list(&row[4].to_string()),
+                    outputs: parse_string_list(&row[5].to_string()),
+                });
+            }
+        }
+        Ok(records)
+    }
+
+    /// Get a PipelineCore record by id.
+    pub fn get_pipeline_core(&self, pipeline_id: &str) -> Result<Option<PipelineCoreRecord>> {
+        let conn = self.connection()?;
+        let mut result = conn
+            .query(&format!(
+                "MATCH (p:PipelineCore) WHERE p.id = '{}' RETURN p.id, p.name, p.doc_id, p.plugin_id, p.inputs, p.outputs",
+                escape_str(pipeline_id)
+            ))
+            .map_err(|e| anyhow::anyhow!("query pipeline core: {e}"))?;
+        if let Some(row) = result.next() {
+            if row.len() >= 6 {
+                return Ok(Some(PipelineCoreRecord {
+                    id: row[0].to_string(),
+                    name: row[1].to_string(),
+                    doc_id: row[2].to_string(),
+                    plugin_id: row[3].to_string(),
+                    inputs: parse_string_list(&row[4].to_string()),
+                    outputs: parse_string_list(&row[5].to_string()),
+                }));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Impact analysis using PipelineCore inputs/outputs.
+    pub fn impact_analysis_v2(
+        &self,
+        table_name: &str,
+        max_depth: u32,
+    ) -> Result<Vec<ImpactResult>> {
+        let conn = self.connection()?;
+        let esc = escape_str(table_name);
+        let mut results = Vec::new();
+
+        // Direct impact: pipelines that consume this table
+        let mut direct = conn
+            .query(&format!(
+                "MATCH (p:PipelineCore) WHERE list_contains(p.inputs, '{}') RETURN p.id, p.name",
+                esc
+            ))
+            .map_err(|e| anyhow::anyhow!("impact_analysis_v2 direct: {e}"))?;
+        let mut affected_ids: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        while let Some(row) = direct.next() {
+            if row.len() >= 2 {
+                let id = row[0].to_string();
+                let name = row[1].to_string();
+                affected_ids.insert(id.clone());
+                results.push(ImpactResult {
+                    pipeline_id: id,
+                    pipeline_name: name,
+                    impact_type: "direct".to_string(),
+                    depth: 1,
+                    path: table_name.to_string(),
+                });
+            }
+        }
+
+        // Transitive impact via PIPELINE_DEPENDS_ON edges
+        if max_depth > 1 && !affected_ids.is_empty() {
+            for depth in 2..=max_depth {
+                let current_ids: Vec<String> = affected_ids.iter().cloned().collect();
+                let mut new_ids = Vec::new();
+
+                for src_id in &current_ids {
+                    let mut trans = conn
+                        .query(&format!(
+                            "MATCH (a:PipelineCore)-[:PIPELINE_DEPENDS_ON]->(b:PipelineCore) WHERE b.id = '{}' RETURN a.id, a.name",
+                            escape_str(src_id)
+                        ))
+                        .map_err(|e| anyhow::anyhow!("impact_analysis_v2 transitive: {e}"))?;
+
+                    while let Some(row) = trans.next() {
+                        if row.len() >= 2 {
+                            let id = row[0].to_string();
+                            if !affected_ids.contains(&id) {
+                                results.push(ImpactResult {
+                                    pipeline_id: id.clone(),
+                                    pipeline_name: row[1].to_string(),
+                                    impact_type: "transitive".to_string(),
+                                    depth,
+                                    path: format!("{} → ... (depth {})", table_name, depth),
+                                });
+                                new_ids.push(id);
+                            }
+                        }
+                    }
+                }
+
+                if new_ids.is_empty() {
+                    break;
+                }
+                affected_ids.extend(new_ids);
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// Get all PIPELINE_DEPENDS_ON edges as (from_name, to_name, dep_type) tuples.
+    pub fn get_pipeline_deps_v2(&self) -> Result<Vec<(String, String, String)>> {
+        let conn = self.connection()?;
+        let mut result = conn
+            .query(
+                "MATCH (c:PipelineCore)-[r:PIPELINE_DEPENDS_ON]->(p:PipelineCore) \
+                 RETURN c.name, p.name, r.dep_type",
+            )
+            .map_err(|e| anyhow::anyhow!("query pipeline deps v2: {e}"))?;
+        let mut deps = Vec::new();
+        while let Some(row) = result.next() {
+            if row.len() >= 3 {
+                deps.push((row[0].to_string(), row[1].to_string(), row[2].to_string()));
+            }
+        }
+        Ok(deps)
+    }
+
+    /// Query a plugin-specific table by field value.
+    pub fn query_plugin_table(
+        &self,
+        plugin_id: &str,
+        field: &str,
+        value: &str,
+    ) -> Result<Vec<serde_json::Value>> {
+        let conn = self.connection()?;
+        let table = format!("Pipeline_{}", plugin_id);
+        let esc_val = escape_str(value);
+        let mut result = conn
+            .query(&format!(
+                "MATCH (p:{}) WHERE lower(p.{}) CONTAINS lower('{}') RETURN p.*",
+                table, field, esc_val
+            ))
+            .map_err(|e| anyhow::anyhow!("query plugin table: {e}"))?;
+        let mut rows = Vec::new();
+        while let Some(row) = result.next() {
+            let vals: Vec<serde_json::Value> = row
+                .iter()
+                .map(|v| serde_json::Value::String(v.to_string()))
+                .collect();
+            rows.push(serde_json::Value::Array(vals));
+        }
+        Ok(rows)
+    }
+
+    /// Pipeline count for stats (using PipelineCore).
+    pub fn pipeline_core_count(&self) -> Result<usize> {
+        let conn = self.connection()?;
+        Ok(count_query(&conn, "MATCH (p:PipelineCore) RETURN count(p)"))
+    }
+
     pub fn get_all_chunks(&self) -> Result<Vec<(String, String)>> {
         let conn = self.connection()?;
         let result = conn
@@ -856,6 +1178,16 @@ pub struct PipelineRecord {
 }
 
 #[derive(Debug, Clone)]
+pub struct PipelineCoreRecord {
+    pub id: String,
+    pub name: String,
+    pub doc_id: String,
+    pub plugin_id: String,
+    pub inputs: Vec<String>,
+    pub outputs: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
 pub struct ImpactResult {
     pub pipeline_id: String,
     pub pipeline_name: String,
@@ -873,4 +1205,18 @@ fn count_query(conn: &Connection<'_>, query: &str) -> usize {
 
 fn escape_str(s: &str) -> String {
     s.replace('\'', "\\'")
+}
+
+/// Parse a Kuzu STRING[] column rendered via `.to_string()`.
+/// Kuzu returns STRING[] as "[val1,val2,val3]".
+fn parse_string_list(s: &str) -> Vec<String> {
+    let trimmed = s.trim_matches(|c| c == '[' || c == ']');
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    trimmed
+        .split(',')
+        .map(|s| s.trim().trim_matches('\'').trim_matches('"').to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
 }

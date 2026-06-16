@@ -6,4 +6,5 @@ pub mod helpers;
 pub mod index;
 pub mod search;
 pub mod session;
+pub mod pipelines;
 pub mod watch;

@@ -317,6 +317,17 @@ fn build_tools_list() -> Vec<Value> {
             json!({"path": {"type": "string"}, "debounce_ms": {"type": "integer"}}), &["path"]),
         tool_def("stop_watch_docs", "Stop a running document file watcher.",
             json!({"watcher_id": {"type": "string"}}), &["watcher_id"]),
+        // Pipeline plugin tools
+        tool_def("pipeline_plugins", "List loaded pipeline plugins and their configuration.",
+            p(true,false,false,json!({})), &["path"]),
+        tool_def("pipeline_deps", "List pipeline dependency edges (which pipelines feed into which).",
+            p(true,false,false,json!({})), &["path"]),
+        tool_def("pipeline_impact", "Transitive impact analysis: what pipelines are affected if a table/dataset changes.",
+            p(true,false,false,json!({"table_name":{"type":"string","description":"Table or dataset name to analyze impact for"},"max_depth":{"type":"integer","default":3,"description":"Max traversal depth for transitive impact"}})), &["path","table_name"]),
+        tool_def("pipeline_compliance", "Query pipelines by compliance scope (e.g. 'IRS 7216', 'PII', 'SOX').",
+            p(true,false,false,json!({"scope":{"type":"string","description":"Compliance scope to search for"},"plugin_id":{"type":"string","description":"Plugin ID to query (default: 'intuit')"}})), &["path","scope"]),
+        tool_def("pipeline_query", "Query a plugin-specific pipeline table by field value. Generic escape hatch for plugin-specific queries.",
+            p(true,false,false,json!({"plugin_id":{"type":"string","description":"Pipeline plugin ID (e.g. 'intuit', 'dbt')"},"field":{"type":"string","description":"Column name to search"},"value":{"type":"string","description":"Value to match (case-insensitive contains)"}})), &["path","plugin_id","field","value"]),
     ]
 }
 
@@ -408,6 +419,11 @@ fn handle_tools_call(id: &Value, request: &Value) -> Value {
         "index_confluence_pages" => tools::docs::tool_index_confluence_pages(&args),
         "watch_docs" => tools::docs::tool_watch_docs(&args),
         "stop_watch_docs" => tools::docs::tool_stop_watch_docs(&args),
+        "pipeline_plugins" => tools::pipelines::tool_pipeline_plugins(&args),
+        "pipeline_deps" => tools::pipelines::tool_pipeline_deps(&args),
+        "pipeline_impact" => tools::pipelines::tool_pipeline_impact(&args),
+        "pipeline_compliance" => tools::pipelines::tool_pipeline_compliance(&args),
+        "pipeline_query" => tools::pipelines::tool_pipeline_query(&args),
         _ => Err(anyhow::anyhow!("Unknown tool: {tool_name}")),
     };
 

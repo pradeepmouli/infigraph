@@ -14,3 +14,7 @@ sha2 = "0.10"
 chrono = "0.4"
 ureq = { version = "2", features = ["json"] }
 regex = "1"
+
+[[bin]]
+name = "infigraph-pipeline-extractor"
+path = "src/bin/pipeline_extractor.rs"

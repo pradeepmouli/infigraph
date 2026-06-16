@@ -1,0 +1,15 @@
+[package]
+name = "infigraph-pipeline-plugin"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Runtime pipeline plugin system — load pipeline extractors via subprocess"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+toml = "0.8"
+dirs-next = "2"
+regex = "1"
+log = "0.4"

@@ -1,0 +1,62 @@
+[plugin]
+name = "Intuit Confluence Pipelines"
+plugin_id = "intuit"
+command = ["infigraph-pipeline-extractor"]
+detect_patterns = [
+    "(?i)## Source System",
+    "(?i)## Scheduler",
+    "(?i)## Compliance",
+    "(?i)## DACI",
+]
+searchable_fields = [
+    "compliance",
+    "business_logic_summary",
+    "daci",
+    "scheduler_type",
+    "source_systems",
+    "dest_tables",
+]
+
+[[plugin.schema]]
+name = "source_systems"
+col_type = "STRING"
+
+[[plugin.schema]]
+name = "dest_tables"
+col_type = "STRING"
+
+[[plugin.schema]]
+name = "scheduler_type"
+col_type = "STRING"
+
+[[plugin.schema]]
+name = "scheduler_config"
+col_type = "STRING"
+
+[[plugin.schema]]
+name = "compliance"
+col_type = "STRING"
+
+[[plugin.schema]]
+name = "github_repo"
+col_type = "STRING"
+
+[[plugin.schema]]
+name = "daci"
+col_type = "STRING"
+
+[[plugin.schema]]
+name = "idempotent"
+col_type = "STRING"
+
+[[plugin.schema]]
+name = "business_logic_summary"
+col_type = "STRING"
+
+[[plugin.schema]]
+name = "data_quality"
+col_type = "STRING"
+
+[plugin.dependency_fields]
+inputs = "core.inputs"
+outputs = "core.outputs"
