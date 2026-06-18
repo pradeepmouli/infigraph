@@ -427,3 +427,101 @@ fn test_resolve_stats_display_no_learned() {
     let display = format!("{stats}");
     assert!(!display.contains("learned"), "should not mention learned when 0");
 }
+
+// ---------- Learned resolution: interface dispatch scenario ----------
+// Simulates the assessment's Example 1: processor.charge() with multiple
+// implementations. Without learned store, resolver can't pick the right impl.
+// With learned store (e.g. populated from SCIP), it resolves correctly.
+
+#[test]
+fn test_learned_resolves_interface_dispatch() {
+    use infigraph_core::learned::LearnedStore;
+
+    // Scene: service.py calls processor.charge(request)
+    // Three implementations exist: CardPaymentProcessor, BankPaymentProcessor, WalletPaymentProcessor
+    // AST sees the call but can't determine which impl — all three have charge().
+    let extractions = vec![
+        FileExtraction {
+            file: "service.py".to_string(),
+            language: "python".to_string(),
+            content_hash: "a".to_string(),
+            symbols: vec![
+                sym("service.py::process_payment", "process_payment", SymbolKind::Function, "service.py", 1, 10),
+            ],
+            relations: vec![
+                // The call target is scoped to source file (unresolved cross-file call)
+                call("service.py::process_payment", "service.py::charge"),
+            ],
+            statements: vec![],
+        },
+        FileExtraction {
+            file: "card_processor.py".to_string(),
+            language: "python".to_string(),
+            content_hash: "b".to_string(),
+            symbols: vec![
+                sym("card_processor.py::CardPaymentProcessor", "CardPaymentProcessor", SymbolKind::Class, "card_processor.py", 1, 30),
+                sym("card_processor.py::CardPaymentProcessor::charge", "charge", SymbolKind::Method, "card_processor.py", 5, 15),
+            ],
+            relations: vec![],
+            statements: vec![],
+        },
+        FileExtraction {
+            file: "bank_processor.py".to_string(),
+            language: "python".to_string(),
+            content_hash: "c".to_string(),
+            symbols: vec![
+                sym("bank_processor.py::BankPaymentProcessor", "BankPaymentProcessor", SymbolKind::Class, "bank_processor.py", 1, 30),
+                sym("bank_processor.py::BankPaymentProcessor::charge", "charge", SymbolKind::Method, "bank_processor.py", 5, 15),
+            ],
+            relations: vec![],
+            statements: vec![],
+        },
+        FileExtraction {
+            file: "wallet_processor.py".to_string(),
+            language: "python".to_string(),
+            content_hash: "d".to_string(),
+            symbols: vec![
+                sym("wallet_processor.py::WalletPaymentProcessor", "WalletPaymentProcessor", SymbolKind::Class, "wallet_processor.py", 1, 30),
+                sym("wallet_processor.py::WalletPaymentProcessor::charge", "charge", SymbolKind::Method, "wallet_processor.py", 5, 15),
+            ],
+            relations: vec![],
+            statements: vec![],
+        },
+    ];
+
+    // --- Without learned store: three ambiguous impls, no receiver, no import hint.
+    // Resolver CANNOT disambiguate → call stays unresolved. This is the gap.
+    let env = TestEnv::new(&extractions);
+    let stats_no_learn = resolve::resolve_calls(&env.store, &extractions, None).unwrap();
+    assert_eq!(stats_no_learn.total_calls, 1);
+    assert_eq!(stats_no_learn.resolved, 0, "ambiguous dispatch stays unresolved without learned store");
+    assert_eq!(stats_no_learn.unresolved, 1);
+    assert_eq!(stats_no_learn.learned_resolved, 0);
+
+    // --- With learned store: SCIP told us the real target is CardPaymentProcessor::charge
+    let mut learned = LearnedStore::default();
+    learned.record_correction(
+        "service.py",
+        "charge",
+        "card_processor.py",
+        "card_processor.py::CardPaymentProcessor::charge",
+    );
+
+    // Re-resolve with learned patterns
+    let env2 = TestEnv::new(&extractions);
+    let stats_learned = resolve::resolve_calls(&env2.store, &extractions, Some(&learned)).unwrap();
+    assert_eq!(stats_learned.total_calls, 1);
+    assert_eq!(stats_learned.resolved, 1);
+    assert_eq!(stats_learned.learned_resolved, 1, "should resolve via learned pattern");
+
+    // Verify it resolved to the CORRECT impl, not just any impl
+    let conn = env2.store.connection().unwrap();
+    let q = infigraph_core::graph::GraphQuery::new(&conn);
+    let callees = q.callees_of("service.py::process_payment").unwrap();
+    assert!(callees.iter().any(|c| c.contains("CardPaymentProcessor::charge")),
+        "learned store should resolve to CardPaymentProcessor::charge, got: {:?}", callees);
+    assert!(!callees.iter().any(|c| c.contains("BankPaymentProcessor")),
+        "should NOT resolve to BankPaymentProcessor");
+    assert!(!callees.iter().any(|c| c.contains("WalletPaymentProcessor")),
+        "should NOT resolve to WalletPaymentProcessor");
+}

@@ -3,6 +3,8 @@ pub mod bench;
 pub mod bridges;
 pub mod check;
 pub mod cluster;
+pub mod concerns;
+pub mod config;
 pub mod diff;
 pub mod embed;
 pub mod export;
@@ -15,6 +17,7 @@ pub mod model;
 pub mod multi;
 pub mod patterns;
 pub mod refactor;
+pub mod reflection;
 mod report;
 pub mod resolve;
 pub mod review;
@@ -22,6 +25,7 @@ pub mod routes;
 pub mod scip;
 pub mod search;
 pub mod security;
+pub mod taint;
 pub mod sequence;
 pub mod viz;
 pub mod vuln;
@@ -37,7 +41,7 @@ use graph::GraphStore;
 use lang::LanguageRegistry;
 use model::FileExtraction;
 
-fn escape_str(s: &str) -> String {
+pub(crate) fn escape_str(s: &str) -> String {
     s.replace('\\', "\\\\").replace('\'', "\\'")
 }
 

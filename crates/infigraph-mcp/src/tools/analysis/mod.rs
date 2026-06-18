@@ -1,11 +1,19 @@
 pub mod call_graph;
 pub mod clones;
+pub mod concerns;
+pub mod config;
 pub mod diagrams;
 pub mod git;
+pub mod reflection;
 pub mod security;
+pub mod taint;
 
 pub use call_graph::*;
 pub use clones::*;
+pub use concerns::*;
+pub use config::*;
 pub use diagrams::*;
 pub use git::*;
+pub use reflection::*;
 pub use security::*;
+pub use taint::*;

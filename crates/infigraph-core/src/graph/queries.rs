@@ -389,6 +389,22 @@ impl<'a, 'db> GraphQuery<'a, 'db> {
         })
     }
 
+    pub fn cross_cutting_for(&self, symbol_id: &str) -> Result<Vec<(String, String)>> {
+        let esc = crate::escape_str(symbol_id);
+        let result = self.conn.query(&format!(
+            "MATCH (s:Symbol)-[:HAS_CONCERN]->(c:Concern) WHERE s.id = '{}' RETURN c.kind, c.detail",
+            esc
+        )).map_err(|e| anyhow::anyhow!("cross_cutting query failed: {e}"))?;
+
+        let mut out = Vec::new();
+        for row in result {
+            if row.len() >= 2 {
+                out.push((row[0].to_string(), row[1].to_string()));
+            }
+        }
+        Ok(out)
+    }
+
     /// Run a raw Cypher query and return string results.
     pub fn raw_query(&self, cypher: &str) -> Result<Vec<Vec<String>>> {
         let result = self

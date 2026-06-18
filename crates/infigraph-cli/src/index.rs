@@ -50,6 +50,55 @@ pub(crate) fn cmd_index(root: &Path, full: bool, no_embed: bool) -> Result<()> {
         println!("{}", result.resolve_stats);
     }
 
+    // Detect cross-cutting concerns (authorization, caching, transactions, etc.)
+    if let Some(store) = prism.store() {
+        match infigraph_core::concerns::detect_cross_cutting(store) {
+            Ok(matches) if !matches.is_empty() => {
+                println!("Detected {} cross-cutting concerns", matches.len());
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("warning: concern detection failed: {e}"),
+        }
+        match infigraph_core::config::detect_config_bindings(store) {
+            Ok(bindings) if !bindings.is_empty() => {
+                println!("Detected {} config bindings", bindings.len());
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("warning: config binding detection failed: {e}"),
+        }
+        match infigraph_core::reflection::detect_reflection_sites(store, root) {
+            Ok(sites) if !sites.is_empty() => {
+                let resolved = sites.iter().filter(|s| s.resolved_to.is_some()).count();
+                println!("Detected {} reflection sites ({} resolved)", sites.len(), resolved);
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("warning: reflection detection failed: {e}"),
+        }
+        match infigraph_core::taint::detect_taint_flows(store, root) {
+            Ok(flows) if !flows.is_empty() => {
+                let active = flows.iter().filter(|f| !f.sanitized).count();
+                println!("Detected {} taint flows ({} active, {} sanitized)", flows.len(), active, flows.len() - active);
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("warning: taint analysis failed: {e}"),
+        }
+        match infigraph_core::taint::interprocedural::detect_interprocedural_taint(store, root, 5) {
+            Ok(flows) if !flows.is_empty() => {
+                println!("Detected {} inter-procedural taint flows", flows.len());
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("warning: inter-procedural taint failed: {e}"),
+        }
+        match infigraph_core::taint::dynamic_urls::detect_dynamic_urls(store, root) {
+            Ok(urls) if !urls.is_empty() => {
+                let matched = urls.iter().filter(|u| u.matched_route.is_some()).count();
+                println!("Detected {} dynamic URLs ({} matched to routes)", urls.len(), matched);
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("warning: dynamic URL detection failed: {e}"),
+        }
+    }
+
     let stats = prism.stats()?;
     println!("\n{}", stats);
 

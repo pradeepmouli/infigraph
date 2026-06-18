@@ -3,6 +3,12 @@ pub const MIGRATIONS: &[&str] = &[
     "ALTER TABLE Symbol ADD return_type STRING DEFAULT ''",
     "CREATE NODE TABLE IF NOT EXISTS Statement(id STRING, kind STRING, condition STRING, start_line INT32, end_line INT32, depth INT32, parent_symbol STRING, PRIMARY KEY(id))",
     "CREATE REL TABLE IF NOT EXISTS HAS_STATEMENT(FROM Symbol TO Statement)",
+    "CREATE NODE TABLE IF NOT EXISTS Concern(id STRING, kind STRING, detail STRING, PRIMARY KEY(id))",
+    "CREATE REL TABLE IF NOT EXISTS HAS_CONCERN(FROM Symbol TO Concern)",
+    "CREATE NODE TABLE IF NOT EXISTS ConfigBinding(id STRING, kind STRING, key STRING, value STRING, `profile` STRING, source_file STRING, PRIMARY KEY(id))",
+    "CREATE REL TABLE IF NOT EXISTS HAS_CONFIG(FROM Symbol TO ConfigBinding)",
+    "CREATE REL TABLE IF NOT EXISTS RESOLVES_TO(FROM Symbol TO Symbol, mechanism STRING, config_source STRING)",
+    "CREATE REL TABLE IF NOT EXISTS TAINT_FLOW(FROM Symbol TO Symbol, source_kind STRING, sink_kind STRING, path STRING)",
 ];
 
 /// Kuzu schema DDL for the infigraph graph.
@@ -90,6 +96,12 @@ pub const CREATE_SCHEMA: &[&str] = &[
     "CREATE REL TABLE IF NOT EXISTS DEFINES(FROM File TO Symbol)",
     "CREATE REL TABLE IF NOT EXISTS CALLS_SERVICE(FROM Symbol TO Symbol, method STRING, path STRING, target_service STRING)",
     "CREATE REL TABLE IF NOT EXISTS HAS_STATEMENT(FROM Symbol TO Statement)",
+    "CREATE NODE TABLE IF NOT EXISTS Concern(id STRING, kind STRING, detail STRING, PRIMARY KEY(id))",
+    "CREATE REL TABLE IF NOT EXISTS HAS_CONCERN(FROM Symbol TO Concern)",
+    "CREATE NODE TABLE IF NOT EXISTS ConfigBinding(id STRING, kind STRING, key STRING, value STRING, `profile` STRING, source_file STRING, PRIMARY KEY(id))",
+    "CREATE REL TABLE IF NOT EXISTS HAS_CONFIG(FROM Symbol TO ConfigBinding)",
+    "CREATE REL TABLE IF NOT EXISTS RESOLVES_TO(FROM Symbol TO Symbol, mechanism STRING, config_source STRING)",
+    "CREATE REL TABLE IF NOT EXISTS TAINT_FLOW(FROM Symbol TO Symbol, source_kind STRING, sink_kind STRING, path STRING)",
 ];
 
 use kuzu::Connection;

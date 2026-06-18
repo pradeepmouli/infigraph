@@ -74,6 +74,8 @@ pub struct Finding {
     pub rule_id: String,
     pub message: String,
     pub snippet: String,
+    pub suppressed: bool,
+    pub sanitizer_hint: Option<String>,
 }
 
 /// Summary stats from a security scan.
@@ -540,6 +542,91 @@ static RULES: &[Rule] = &[
 ];
 
 // ---------------------------------------------------------------------------
+// Sanitizer definitions — suppress findings when nearby code sanitizes input
+// ---------------------------------------------------------------------------
+
+struct Sanitizer {
+    category: fn() -> Category,
+    patterns: &'static [&'static str],
+}
+
+static SANITIZERS: &[Sanitizer] = &[
+    Sanitizer {
+        category: || Category::SqlInjection,
+        patterns: &[
+            "parameterize", "prepare(", "bind_param", "sanitize_sql",
+            "sqlalchemy.text(", "prepared_statement", "placeholders",
+            "cursor.execute(%s", "cursor.execute(?,", "?)",
+        ],
+    },
+    Sanitizer {
+        category: || Category::XssRisk,
+        patterns: &[
+            "escape_html", "sanitize(", "dompurify", "bleach.clean(",
+            "html.escape(", "encodeuricomponent(", "cgi.escape(",
+            "markupsafe.escape(", "xss_clean(",
+        ],
+    },
+    Sanitizer {
+        category: || Category::CommandInjection,
+        patterns: &[
+            "shlex.quote(", "shell_escape", "escapeshellarg(",
+            "escapeshellcmd(", "shell=false", "shlex.split(",
+        ],
+    },
+    Sanitizer {
+        category: || Category::PathTraversal,
+        patterns: &[
+            "realpath(", "abspath(", "normalize(", "canonicalize(",
+            "path.resolve(", "secure_filename(", "os.path.basename(",
+        ],
+    },
+    Sanitizer {
+        category: || Category::Ssrf,
+        patterns: &[
+            "validate_url(", "is_allowed_host(", "urlparse(",
+            "allowed_hosts", "url_validator(", "safelist",
+        ],
+    },
+    Sanitizer {
+        category: || Category::OpenRedirect,
+        patterns: &[
+            "url_has_allowed_host(", "is_safe_url(", "validate_redirect(",
+            "allowed_hosts", "safe_redirect(",
+        ],
+    },
+    Sanitizer {
+        category: || Category::InsecureDeserialization,
+        patterns: &[
+            "safe_load(", "yaml.safe_load(", "json.loads(",
+            "allowlist", "whitelist_classes",
+        ],
+    },
+];
+
+const SANITIZER_WINDOW: usize = 5;
+
+fn find_sanitizer_for(category: &Category, lines: &[&str], finding_line: usize) -> Option<String> {
+    let start = finding_line.saturating_sub(SANITIZER_WINDOW);
+    let end = (finding_line + SANITIZER_WINDOW + 1).min(lines.len());
+
+    for sanitizer in SANITIZERS {
+        if (sanitizer.category)() != *category {
+            continue;
+        }
+        for &line in &lines[start..end] {
+            let lower = line.to_lowercase();
+            for &pat in sanitizer.patterns {
+                if lower.contains(pat) {
+                    return Some(pat.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
 // Scanner
 // ---------------------------------------------------------------------------
 
@@ -612,43 +699,46 @@ fn scan_file(path: &Path, rel_path: &str, ext: &str, stats: &mut ScanStats) -> R
 
     stats.files_scanned += 1;
     let ext_lower = ext.to_lowercase();
+    let all_lines: Vec<&str> = content.lines().collect();
 
-    for (line_no, line) in content.lines().enumerate() {
+    for (line_idx, line) in all_lines.iter().enumerate() {
         let line_lower = line.to_lowercase();
-        let line_no = (line_no + 1) as u32;
+        let line_no = (line_idx + 1) as u32;
 
         for rule in RULES {
-            // Extension filter
             if let Some(exts) = rule.extensions {
                 if !exts.contains(&ext_lower.as_str()) {
                     continue;
                 }
             }
 
-            // Pattern match (case-insensitive)
             if !line_lower.contains(rule.pattern) {
                 continue;
             }
 
-            // Exclusion check (case-insensitive)
             if let Some(excl) = rule.exclude_if {
                 if line_lower.contains(&excl.to_lowercase() as &str) {
                     continue;
                 }
             }
 
-            // Find column of match
             let col = line_lower.find(rule.pattern).unwrap_or(0) as u32 + 1;
+            let category = (rule.category)();
+
+            let sanitizer_hit = find_sanitizer_for(&category, &all_lines, line_idx);
+            let suppressed = sanitizer_hit.is_some();
 
             stats.findings.push(Finding {
                 file: rel_path.to_string(),
                 line: line_no,
                 col,
                 severity: rule.severity.clone(),
-                category: (rule.category)(),
+                category,
                 rule_id: rule.id.to_string(),
                 message: rule.message.to_string(),
                 snippet: line.trim().chars().take(120).collect(),
+                suppressed,
+                sanitizer_hint: sanitizer_hit,
             });
         }
     }
@@ -665,18 +755,22 @@ pub fn format_scan_results(stats: &ScanStats) -> String {
         );
     }
 
+    let active: Vec<_> = stats.findings.iter().filter(|f| !f.suppressed).collect();
+    let suppressed_count = stats.findings.len() - active.len();
+
     let mut out = format!(
-        "Security scan: {} files, {} findings  [CRITICAL:{} HIGH:{} MEDIUM:{} LOW:{}]\n\n",
+        "Security scan: {} files, {} findings ({} suppressed by sanitizer)  [CRITICAL:{} HIGH:{} MEDIUM:{} LOW:{}]\n\n",
         stats.files_scanned,
-        stats.findings.len(),
-        stats.critical_count(),
-        stats.high_count(),
-        stats.medium_count(),
-        stats.low_count(),
+        active.len(),
+        suppressed_count,
+        active.iter().filter(|f| f.severity == Severity::Critical).count(),
+        active.iter().filter(|f| f.severity == Severity::High).count(),
+        active.iter().filter(|f| f.severity == Severity::Medium).count(),
+        active.iter().filter(|f| f.severity == Severity::Low).count(),
     );
 
     let mut cur_file = String::new();
-    for f in &stats.findings {
+    for f in &active {
         if f.file != cur_file {
             out.push_str(&format!("\n  {}\n", f.file));
             cur_file = f.file.clone();
@@ -689,6 +783,17 @@ pub fn format_scan_results(stats: &ScanStats) -> String {
             msg = f.message,
         ));
         out.push_str(&format!("             {}\n", f.snippet));
+    }
+
+    if suppressed_count > 0 {
+        out.push_str(&format!("\n--- {} findings suppressed (sanitizer detected nearby) ---\n", suppressed_count));
+        for f in stats.findings.iter().filter(|f| f.suppressed) {
+            out.push_str(&format!(
+                "  {}:L{} [{}] suppressed by: {}\n",
+                f.file, f.line, f.rule_id,
+                f.sanitizer_hint.as_deref().unwrap_or("unknown"),
+            ));
+        }
     }
 
     out
@@ -743,5 +848,62 @@ mod tests {
     fn no_false_positive_yaml_safe() {
         let findings = scan_str("data = yaml.load(f, loader=yaml.SafeLoader)", "py");
         assert!(!findings.iter().any(|f| f.rule_id == "SEC032"));
+    }
+
+    #[test]
+    fn sanitizer_suppresses_sql_injection() {
+        let code = "query = sanitize_sql(user_input)\ncursor.execute(query)";
+        let findings = scan_str(code, "py");
+        let sql_findings: Vec<_> = findings.iter()
+            .filter(|f| f.category == Category::SqlInjection)
+            .collect();
+        assert!(!sql_findings.is_empty(), "should still detect execute()");
+        assert!(sql_findings.iter().all(|f| f.suppressed), "should be suppressed by sanitize_sql");
+        assert!(sql_findings[0].sanitizer_hint.as_deref() == Some("sanitize_sql"));
+    }
+
+    #[test]
+    fn sanitizer_suppresses_xss_dompurify() {
+        let code = "const clean = DOMPurify.sanitize(content);\nel.innerHTML = clean;";
+        let findings = scan_str(code, "js");
+        let xss: Vec<_> = findings.iter()
+            .filter(|f| f.category == Category::XssRisk)
+            .collect();
+        assert!(!xss.is_empty());
+        assert!(xss.iter().all(|f| f.suppressed), "innerHTML near DOMPurify should be suppressed");
+    }
+
+    #[test]
+    fn no_suppression_without_sanitizer() {
+        let code = "cursor.execute(\"SELECT * FROM users WHERE name = \" + user_input)";
+        let findings = scan_str(code, "py");
+        let sql: Vec<_> = findings.iter()
+            .filter(|f| f.category == Category::SqlInjection)
+            .collect();
+        assert!(!sql.is_empty());
+        assert!(sql.iter().all(|f| !f.suppressed), "no sanitizer = not suppressed");
+    }
+
+    #[test]
+    fn sanitizer_suppresses_command_injection() {
+        let code = "safe_arg = shlex.quote(user_input)\nos.system(safe_arg)";
+        let findings = scan_str(code, "py");
+        let cmd: Vec<_> = findings.iter()
+            .filter(|f| f.category == Category::CommandInjection)
+            .collect();
+        assert!(!cmd.is_empty());
+        assert!(cmd.iter().all(|f| f.suppressed), "shlex.quote nearby should suppress");
+    }
+
+    #[test]
+    fn sanitizer_suppresses_path_traversal() {
+        let code = "safe = os.path.realpath(user_path)\nopen(safe)";
+        let findings = scan_str(code, "py");
+        let path_findings: Vec<_> = findings.iter()
+            .filter(|f| f.category == Category::PathTraversal)
+            .collect();
+        for f in &path_findings {
+            assert!(f.suppressed, "realpath nearby should suppress path traversal");
+        }
     }
 }

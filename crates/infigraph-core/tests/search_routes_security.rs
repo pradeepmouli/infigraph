@@ -184,6 +184,8 @@ fn test_format_scan_results_with_findings() {
             rule_id: "SEC001".to_string(),
             message: "Hardcoded password".to_string(),
             snippet: "password = \"s3cret\"".to_string(),
+            suppressed: false,
+            sanitizer_hint: None,
         }],
     };
     let out = format_scan_results(&stats);
@@ -205,24 +207,28 @@ fn test_scan_stats_count_methods() {
                 severity: Severity::Critical,
                 category: Category::HardcodedSecret,
                 rule_id: "S1".to_string(), message: "".to_string(), snippet: "".to_string(),
+                suppressed: false, sanitizer_hint: None,
             },
             Finding {
                 file: "b.py".to_string(), line: 2, col: 0,
                 severity: Severity::High,
                 category: Category::HardcodedSecret,
                 rule_id: "S2".to_string(), message: "".to_string(), snippet: "".to_string(),
+                suppressed: false, sanitizer_hint: None,
             },
             Finding {
                 file: "c.py".to_string(), line: 3, col: 0,
                 severity: Severity::Medium,
                 category: Category::SqlInjection,
                 rule_id: "S3".to_string(), message: "".to_string(), snippet: "".to_string(),
+                suppressed: false, sanitizer_hint: None,
             },
             Finding {
                 file: "d.py".to_string(), line: 4, col: 0,
                 severity: Severity::Low,
                 category: Category::SqlInjection,
                 rule_id: "S4".to_string(), message: "".to_string(), snippet: "".to_string(),
+                suppressed: false, sanitizer_hint: None,
             },
         ],
     };
