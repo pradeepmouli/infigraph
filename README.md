@@ -108,12 +108,16 @@ Examples:
 - **OSV Vulnerability Scanning:** Scans dependencies against the OSV database for known vulnerabilities.
 - **Design Pattern Detection:** Identifies Singleton, Factory, Observer, Strategy, Builder, and other patterns.
 - **Refactor Analysis:** Complexity hotspots, coupling, near-duplicate detection, dead code — ranked by impact/effort.
+- **Taint Analysis:** Intra + inter-procedural dataflow tracking from sources (HTTP params, user input) to sinks (SQL, exec, file I/O). Sanitizer-aware.
+- **Cross-Cutting Concerns:** Detects authorization, caching, transactions, rate limiting, audit logging, and more from annotations across 7 languages.
+- **Config Binding Resolution:** Parses Spring profiles, Django settings, .NET appsettings, Rails envs — links conditional annotations to config properties.
+- **Reflection Scanner:** Detects `Class.forName`, `importlib.import_module`, dynamic `require` — resolves targets via config files.
 - **Document Indexing:** Index PDF, DOCX, PPTX, HTML, Markdown with hybrid search.
 - **Confluence Wiki Crawler:** BFS wiki crawl with incremental sync — indexes pages into the same search pipeline as code.
 - **Auto-Watch:** File watcher auto-starts after indexing. Index stays fresh without manual intervention.
 - **HNSW Vector Index:** Approximate nearest neighbor search for fast similarity queries at scale (~2ms for 500K symbols).
 - **Session Continuity:** Persists context across AI agent sessions — summary, pending tasks, decisions, touched files.
-- **74 MCP Tools:** Full AI agent integration for 11 coding agents (Claude Code, Cursor, VS Code, Copilot, Windsurf, etc.).
+- **82 MCP Tools:** Full AI agent integration for 11 coding agents (Claude Code, Cursor, VS Code, Copilot, Windsurf, etc.).
 - **Sequence Diagrams:** Auto-generates Mermaid sequence diagrams from call graphs.
 - **Cross-Language Detection:** Delphi↔COM, VB6↔COM, C#↔JNI, FFI, gRPC, WASM bridges.
 - **Grammar Plugins:** Drop `.g4` + `plugin.toml` — parse any custom/internal DSL without Rust compilation.
@@ -637,6 +641,12 @@ Replace `/path/to/infigraph-mcp` with the output of `which infigraph-mcp`.
 - **CI check runner** — configurable checks (security, complexity, dead code, vuln scan) with pass/fail gates
 - **OSV vulnerability scanning** — scans dependencies against the OSV database for known vulnerabilities
 - **Design pattern detection** — identifies Singleton, Factory, Observer, Strategy, Builder, and other patterns
+- **Taint analysis** — intra-procedural source→sink tracking + inter-procedural BFS through call graph (depth-limited). Sanitizer-aware false-positive reduction
+- **Cross-cutting concern detection** — authorization, validation, caching, transactions, rate limiting, audit logging, feature flags, CORS, async, retry across Java/Python/TS/C#/Ruby/Go/Rust
+- **Config binding resolution** — Spring profiles/qualifiers, Django settings, .NET appsettings, Rails envs, Go build tags, NestJS config
+- **Reflection/dynamic invocation scanner** — Class.forName, ServiceLoader, getattr, importlib, dynamic require/import with config-file-based target resolution
+- **Dynamic URL detection** — extracts URL templates from HTTP client calls (fetch, axios, requests, etc.), matches against known Route nodes
+- **Path traversal detection** — multi-layer analysis combining intra+inter procedural taint with path-specific sanitizer awareness
 - Dead code detection (uncalled functions/methods)
 - Transitive impact / blast radius analysis
 - Git diff → affected symbols mapping
@@ -699,7 +709,7 @@ infigraph scip-import --index index.scip
 ```
 
 ### Integration
-- **74 MCP tools** for AI coding agents
+- **82 MCP tools** for AI coding agents
 - **11 agent auto-configs** — Claude Code, Cursor, VS Code, Codex, Gemini CLI, Zed, OpenCode, Aider, Windsurf, Kiro, GitHub Copilot
 - **Web UI** at localhost:9749 with graph explorer, search, route map, multi-repo groups, contracts
 - **Export** — Neo4j Cypher, GraphML, JSON
@@ -736,7 +746,7 @@ infigraph-mcp --ui --port=9749
 # Open http://localhost:9749/?path=/your/project
 ```
 
-### 74 MCP Tools
+### 82 MCP Tools
 
 | Tool | Description |
 |------|-------------|
@@ -763,7 +773,14 @@ infigraph-mcp --ui --port=9749
 | `get_complexity` | Cyclomatic complexity metrics per symbol |
 | `detect_clones` | Near-duplicate functions via vector similarity |
 | `detect_clusters` | Louvain community detection on call graph |
-| `detect_security_issues` | Security scan: SQL injection, secrets, eval, path traversal, XSS, etc. |
+| `detect_security_issues` | Security scan: SQL injection, secrets, eval, path traversal, XSS, etc. (sanitizer-aware) |
+| `detect_taint_flows` | Intra-procedural taint analysis — source→sink tracking with sanitizer awareness |
+| `detect_interprocedural_taint` | Cross-function taint tracing via BFS through call graph (depth-limited) |
+| `detect_dynamic_urls` | Dynamic URL construction detection — matches against known Route nodes |
+| `detect_path_traversal` | Multi-layer path traversal detection (intra + inter procedural) |
+| `detect_cross_cutting` | Cross-cutting concern detection (auth, caching, transactions, etc.) across 7 languages |
+| `detect_config_bindings` | Config-driven conditional resolution (Spring profiles, Django settings, .NET, Rails) |
+| `detect_reflection` | Reflection/dynamic invocation scanner with config-file-based target resolution |
 | `detect_bridges` | Cross-language boundaries: FFI, JNI, cgo, gRPC, WASM, COM |
 | `detect_routes` | HTTP route/endpoint detection (22 frameworks) |
 | `get_test_coverage` | Test coverage analysis — covered %, uncovered symbols |
@@ -847,6 +864,10 @@ infigraph/
 │   │       ├── vuln/            # OSV vulnerability scanning
 │   │       ├── patterns/        # Design pattern detection
 │   │       ├── learned/         # Learned resolution patterns for cross-file calls
+│   │       ├── concerns/        # Cross-cutting concern detection (auth, caching, transactions)
+│   │       ├── config/          # Config binding resolution (Spring, Django, .NET, Rails)
+│   │       ├── reflection/      # Reflection/dynamic invocation scanner
+│   │       ├── taint/           # Taint analysis (intra/inter-procedural, dynamic URLs, path traversal)
 │   │       ├── viz/             # HTML graph visualization
 │   │       └── export/          # Cypher, GraphML, JSON export
 │   ├── infigraph-docs/          # Document indexing (PDF, DOCX, PPTX, HTML, Markdown)
@@ -856,7 +877,7 @@ infigraph/
 │   ├── infigraph-grammar-plugin/   # Runtime ANTLR grammar plugin system (JVM subprocess)
 │   │   └── src/                 # Driver, config-driven extractor, plugin discovery
 │   ├── infigraph-cli/           # 50+ CLI commands
-│   ├── infigraph-mcp/           # 69-tool MCP server + web UI
+│   ├── infigraph-mcp/           # 82-tool MCP server + web UI
 │   └── lsp-to-scip/             # Generic LSP → SCIP bridge binary
 ├── driver/                          # Java ANTLR grammar driver (JVM subprocess)
 │   ├── infigraph-driver.jar       # Fat jar (ANTLR4 runtime bundled)
@@ -879,6 +900,9 @@ infigraph/
 - **File** — source file
 - **Folder** — directory
 - **Dependency** — external package dependency (name, version, ecosystem, is_dev)
+- **Statement** — control flow statement (if/for/while/match) with kind, condition, depth
+- **Concern** — cross-cutting concern (authorization, caching, transaction, etc.)
+- **ConfigBinding** — configuration property binding (key, value, profile, source_file)
 
 ### Edges
 - **CALLS** — function/method call (cross-file resolved + SCIP-enriched)
@@ -896,6 +920,11 @@ infigraph/
 - **DEFINES** — file defines symbol
 - **CONTAINS_FILE** — folder contains file
 - **CONTAINS_FOLDER** — folder contains subfolder
+- **HAS_CONCERN** — symbol has cross-cutting concern
+- **HAS_CONFIG** — symbol has config binding
+- **HAS_STATEMENT** — symbol contains control flow statement
+- **RESOLVES_TO** — reflection/dynamic invocation resolves to target (with mechanism, config_source)
+- **TAINT_FLOW** — dataflow from source to sink (with source_kind, sink_kind, path)
 - **Custom edges** — extensible via language plugins (DECORATED_BY, SPAWNS, etc.)
 
 ## Tech Stack
