@@ -40,6 +40,7 @@ pub fn build_combined_graph(registry: &Registry, group_name: &str) -> Result<(us
     }
 
     let combined_store = GraphStore::open(&combined_path)?;
+    let _lock = combined_store.write_lock()?;
     let combined_conn = combined_store.connection()?;
     let tmp = std::env::temp_dir().join("ig_combined");
     std::fs::create_dir_all(&tmp)?;

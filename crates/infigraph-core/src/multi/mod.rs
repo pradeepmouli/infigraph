@@ -655,6 +655,10 @@ pub fn link_cross_service_calls(
             Some(s) => s,
             None => continue,
         };
+        let _lock = match store.write_lock() {
+            Ok(l) => l,
+            Err(_) => continue,
+        };
         let conn = match store.connection() {
             Ok(c) => c,
             Err(_) => continue,
@@ -760,6 +764,7 @@ pub fn index_group(
 }
 
 pub fn promote_bridges_to_calls(store: &GraphStore) -> Result<usize> {
+    let _lock = store.write_lock()?;
     let conn = store.connection()?;
     let gq = GraphQuery::new(&conn);
 

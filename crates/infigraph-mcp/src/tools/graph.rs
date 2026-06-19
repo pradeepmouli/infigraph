@@ -565,6 +565,20 @@ pub fn tool_get_complexity(args: &Value) -> Result<String> {
     Ok(out)
 }
 
+pub fn tool_get_skeleton(args: &Value) -> Result<String> {
+    let prism = open_prism(args)?;
+    let store = prism.store().context("not initialized")?;
+    let conn = store.connection()?;
+    let gq = infigraph_core::graph::GraphQuery::new(&conn);
+
+    let file = args
+        .get("file")
+        .and_then(|v| v.as_str())
+        .context("missing 'file'")?;
+
+    gq.skeleton(file)
+}
+
 pub fn tool_get_doc_context(args: &Value) -> Result<String> {
     let prism = open_prism(args)?;
     let symbol_id = args

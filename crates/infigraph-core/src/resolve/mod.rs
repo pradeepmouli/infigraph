@@ -10,6 +10,7 @@ use crate::model::{FileExtraction, RelationKind};
 /// Post-indexing pass that resolves call edges using cross-file symbol lookup.
 /// Builds symbol map from the full graph (not just re-indexed files) so
 /// incremental indexing doesn't lose cross-file resolution.
+/// Caller must hold WriteLock (creates CALLS and INHERITS edges).
 pub fn resolve_calls_incremental(
     store: &GraphStore,
     extractions: &[FileExtraction],
@@ -44,6 +45,7 @@ pub fn resolve_calls_incremental(
 /// a CALLS relation targeting `main.py::authenticate`. But the real symbol
 /// is `auth.py::authenticate`. This pass:
 ///
+/// Caller must hold WriteLock.
 /// 1. Builds a symbol table from all extractions
 /// 2. For each CALLS relation where the target doesn't exist locally,
 ///    searches the global symbol table by name
@@ -72,6 +74,7 @@ pub fn resolve_calls(
     Ok(stats)
 }
 
+/// Caller must hold WriteLock.
 fn resolve_with_map(
     conn: &kuzu::Connection<'_>,
     extractions: &[FileExtraction],
@@ -401,6 +404,7 @@ pub fn re_resolve_for_files(
         });
     }
 
+    let _lock = store.write_lock()?;
     let conn = store.connection()?;
 
     for file in files {
@@ -465,6 +469,7 @@ impl std::fmt::Display for ResolveStats {
 
 const TYPE_KINDS: &[&str] = &["Class", "Interface", "Struct", "Trait", "Enum"];
 
+/// Caller must hold WriteLock.
 fn resolve_inherits(
     conn: &kuzu::Connection<'_>,
     extractions: &[FileExtraction],

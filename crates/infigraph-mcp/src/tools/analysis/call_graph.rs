@@ -186,6 +186,7 @@ pub fn build_architecture_report(gq: &infigraph_core::graph::GraphQuery) -> Resu
 pub fn tool_detect_clusters(args: &Value) -> Result<String> {
     let prism = open_prism(args)?;
     let store = prism.store().context("not initialized")?;
+    let _lock = store.write_lock()?;
     let conn = store.connection()?;
 
     let stats = infigraph_core::cluster::detect_clusters(&conn)?;

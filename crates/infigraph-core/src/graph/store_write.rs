@@ -12,10 +12,12 @@ impl GraphStore {
     /// Insert a file extraction into the graph.
     /// Removes old data for the file first (incremental update).
     pub fn upsert_file(&self, extraction: &FileExtraction) -> Result<()> {
+        let _lock = self.write_lock()?;
         let conn = self.connection()?;
         self.upsert_file_conn(&conn, extraction)
     }
 
+    /// Caller must hold WriteLock.
     pub fn upsert_file_conn(
         &self,
         conn: &Connection<'_>,
@@ -37,6 +39,7 @@ impl GraphStore {
         self.upsert_file_conn_no_delete(conn, extraction)
     }
 
+    /// Caller must hold WriteLock.
     pub fn upsert_file_conn_no_delete(
         &self,
         conn: &Connection<'_>,

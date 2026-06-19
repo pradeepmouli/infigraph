@@ -93,6 +93,25 @@ enum Commands {
         file: String,
     },
 
+    /// Compact annotated file skeleton (signatures + complexity + fan-in)
+    Skeleton {
+        /// File to inspect
+        file: String,
+    },
+
+    /// Ingest structured data using plug-n-play TOML schemas
+    Ingest {
+        /// Schema ID (omit to list available schemas)
+        #[arg(long)]
+        schema: Option<String>,
+        /// Path to JSON or YAML data file
+        #[arg(long)]
+        data_file: Option<String>,
+        /// Directory containing JSON/YAML data files
+        #[arg(long)]
+        source: Option<String>,
+    },
+
     /// Run a raw Cypher query against the graph
     Query {
         /// Cypher query string
@@ -546,6 +565,8 @@ fn run(command: Commands, root: &Path) -> Result<()> {
         Commands::Stats => cmd_stats(root),
         Commands::Languages => cmd_languages(Some(root)),
         Commands::Symbols { file } => cmd_symbols(root, &file),
+        Commands::Skeleton { file } => cmd_skeleton(root, &file),
+        Commands::Ingest { schema, data_file, source } => cmd_ingest(root, schema.as_deref(), data_file.as_deref(), source.as_deref()),
         Commands::Query { cypher } => cmd_query(root, &cypher),
         Commands::Search {
             query,

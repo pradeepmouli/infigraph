@@ -14,6 +14,7 @@ pub use queries::{
     ApiSymbol, CoverageRow, FileDeps, GraphQuery, HierarchyNode, ImpactRow, ReferenceRow,
     SymbolDetail, SymbolRow, TestCoverage, TypeHierarchy,
     BranchInfo, TestTarget, TestContext, ExampleTest,
+    SkeletonSymbol, format_skeleton,
 };
 pub use session_store::{SessionData, SessionStore};
 pub use store::{GraphStats, GraphStore};

@@ -59,6 +59,77 @@ pub(crate) fn cmd_symbols(root: &Path, file: &str) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn cmd_skeleton(root: &Path, file: &str) -> Result<()> {
+    let registry = bundled_registry()?;
+    let mut prism = Infigraph::open(root, registry)?;
+    prism.init()?;
+
+    let store = prism.store().context("graph not initialized")?;
+    let conn = store.connection()?;
+    let gq = infigraph_core::graph::GraphQuery::new(&conn);
+
+    let result = gq.skeleton(file)?;
+    print!("{}", result);
+    Ok(())
+}
+
+pub(crate) fn cmd_ingest(root: &Path, schema_id: Option<&str>, data_file: Option<&str>, source_dir: Option<&str>) -> Result<()> {
+    let registry = bundled_registry()?;
+    let mut prism = Infigraph::open(root, registry)?;
+    prism.init()?;
+
+    let schemas = infigraph_core::structured::discover_schemas(root)?;
+
+    if schemas.is_empty() {
+        println!("No structured schemas found.");
+        println!("Create .toml schema files in .infigraph/structured-schemas/ or ~/.infigraph/structured-schemas/");
+        return Ok(());
+    }
+
+    let sid = match schema_id {
+        Some(id) => id,
+        None => {
+            println!("Available schemas:\n");
+            for (path, schema) in &schemas {
+                println!(
+                    "  {} — {} (table: {}, {} columns, {} edges)\n    Source: {}\n",
+                    schema.schema.schema_id,
+                    schema.schema.name,
+                    schema.schema.node_table,
+                    schema.schema.columns.len(),
+                    schema.schema.edges.len(),
+                    path.display(),
+                );
+            }
+            return Ok(());
+        }
+    };
+
+    let (_, schema) = schemas.iter()
+        .find(|(_, s)| s.schema.schema_id == sid)
+        .context(format!("schema '{}' not found", sid))?;
+
+    let store = prism.store().context("graph not initialized")?;
+    let _lock = store.write_lock()?;
+    let conn = store.connection()?;
+
+    if let Some(dir) = source_dir {
+        let result = infigraph_core::structured::ingest_directory(&conn, &schema.schema, std::path::Path::new(dir))?;
+        println!(
+            "Ingested directory '{}' using schema '{}': {} nodes, {} edges",
+            dir, sid, result.nodes_created, result.edges_created
+        );
+    } else {
+        let file = data_file.context("--data-file or --source required when --schema is specified")?;
+        let result = infigraph_core::structured::ingest_file(&conn, &schema.schema, std::path::Path::new(file))?;
+        println!(
+            "Ingested '{}' using schema '{}': {} nodes, {} edges",
+            file, sid, result.nodes_created, result.edges_created
+        );
+    }
+    Ok(())
+}
+
 pub(crate) fn cmd_index_manifests(root: &Path) -> Result<()> {
     let registry = bundled_registry()?;
     let mut prism = Infigraph::open(root, registry)?;

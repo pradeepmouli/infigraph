@@ -11,6 +11,7 @@ use crate::model::{FileExtraction, RelationKind};
 impl GraphStore {
     /// Bulk insert all extractions in minimal queries -- one UNWIND per node/edge type.
     /// Much faster than calling upsert_file_conn_no_delete per file.
+    /// Caller must hold WriteLock.
     pub fn upsert_all_bulk(
         &self,
         conn: &Connection<'_>,

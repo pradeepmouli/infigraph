@@ -438,6 +438,80 @@ impl<'a, 'db> GraphQuery<'a, 'db> {
         Ok(count)
     }
 
+    pub fn skeleton(&self, file: &str) -> Result<String> {
+        use std::collections::HashMap;
+
+        let esc = file.replace('\'', "\\'");
+        let query = format!(
+            "MATCH (s:Symbol) WHERE s.file = '{esc}' \
+             RETURN s.id, s.name, s.kind, s.start_line, s.end_line, s.complexity, s.parameters, s.return_type, s.visibility, s.parent \
+             ORDER BY s.start_line"
+        );
+        let rows = self.raw_query(&query)?;
+
+        if rows.is_empty() {
+            return Ok(format_skeleton(file, &[]));
+        }
+
+        let mut fan_in: HashMap<String, usize> = HashMap::new();
+        for row in &rows {
+            let id = row.first().map(|s| s.as_str()).unwrap_or("");
+            if id.is_empty() {
+                continue;
+            }
+            let callers = self.callers_of(id).unwrap_or_default();
+            fan_in.insert(id.to_string(), callers.len());
+        }
+
+        let stmt_query = format!(
+            "MATCH (s:Symbol)-[:HAS_STATEMENT]->(st:Statement) WHERE s.file = '{esc}' \
+             RETURN s.id, count(st) ORDER BY s.id"
+        );
+        let mut stmt_counts: HashMap<String, usize> = HashMap::new();
+        if let Ok(stmt_rows) = self.raw_query(&stmt_query) {
+            for sr in &stmt_rows {
+                if sr.len() >= 2 {
+                    let count: usize = sr[1].parse().unwrap_or(0);
+                    stmt_counts.insert(sr[0].clone(), count);
+                }
+            }
+        }
+
+        let nesting_query = format!(
+            "MATCH (s:Symbol)-[:HAS_STATEMENT]->(st:Statement) WHERE s.file = '{esc}' \
+             RETURN s.id, max(st.depth) ORDER BY s.id"
+        );
+        let mut nesting: HashMap<String, u32> = HashMap::new();
+        if let Ok(nest_rows) = self.raw_query(&nesting_query) {
+            for nr in &nest_rows {
+                if nr.len() >= 2 {
+                    let depth: u32 = nr[1].parse().unwrap_or(0);
+                    nesting.insert(nr[0].clone(), depth);
+                }
+            }
+        }
+
+        let symbols: Vec<SkeletonSymbol> = rows.iter().map(|row| {
+            let id = row.first().map(|s| s.to_string()).unwrap_or_default();
+            SkeletonSymbol {
+                fan_in: fan_in.get(&id).copied().unwrap_or(0),
+                stmt_count: stmt_counts.get(&id).copied().unwrap_or(0),
+                nesting: nesting.get(&id).copied().unwrap_or(0),
+                id,
+                name: row.get(1).cloned().unwrap_or_default(),
+                kind: row.get(2).cloned().unwrap_or_default(),
+                start_line: row.get(3).cloned().unwrap_or_default(),
+                complexity: row.get(5).and_then(|s| s.parse().ok()).unwrap_or(0),
+                params: row.get(6).cloned().unwrap_or_default(),
+                return_type: row.get(7).cloned().unwrap_or_default(),
+                visibility: row.get(8).cloned().unwrap_or_default(),
+                parent: row.get(9).cloned().unwrap_or_default(),
+            }
+        }).collect();
+
+        Ok(format_skeleton(file, &symbols))
+    }
+
     pub fn generate_test_context(&self, file_filter: Option<&str>, limit: usize) -> Result<TestContext> {
         let framework = self.detect_test_framework()?;
         let example_test = self.find_example_test(file_filter)?;
@@ -763,4 +837,79 @@ pub struct ExampleTest {
     pub file: String,
     pub start_line: u32,
     pub end_line: u32,
+}
+
+// ── Shared skeleton data + formatter (used by both Kuzu GraphQuery and CozoStore) ──
+
+pub struct SkeletonSymbol {
+    pub id: String,
+    pub name: String,
+    pub kind: String,
+    pub start_line: String,
+    pub complexity: u32,
+    pub params: String,
+    pub return_type: String,
+    pub visibility: String,
+    pub parent: String,
+    pub fan_in: usize,
+    pub stmt_count: usize,
+    pub nesting: u32,
+}
+
+pub fn format_skeleton(file: &str, symbols: &[SkeletonSymbol]) -> String {
+    if symbols.is_empty() {
+        return format!("No symbols found in '{file}'. File may not be indexed.");
+    }
+
+    let mut out = format!("# {file}\n\n");
+    let mut indent_stack: Vec<String> = Vec::new();
+
+    for s in symbols {
+        let indent = if !s.parent.is_empty() {
+            while indent_stack.last().map(|v| v.as_str()) != Some(&s.parent) && !indent_stack.is_empty() {
+                indent_stack.pop();
+            }
+            if indent_stack.is_empty() {
+                indent_stack.push(s.parent.clone());
+            }
+            "  ".repeat(indent_stack.len())
+        } else {
+            indent_stack.clear();
+            String::new()
+        };
+
+        let vis_prefix = if s.visibility.is_empty() || s.visibility == "public" {
+            String::new()
+        } else {
+            format!("{} ", s.visibility)
+        };
+
+        let sig = match s.kind.as_str() {
+            "Function" | "Method" | "Test" => {
+                let p = if s.params.is_empty() { "()" } else { &s.params };
+                let r = if s.return_type.is_empty() {
+                    String::new()
+                } else {
+                    format!(" -> {}", s.return_type)
+                };
+                format!("{vis_prefix}{}{p}{r}", s.name)
+            }
+            "Class" | "Struct" | "Interface" | "Trait" | "Enum" => {
+                indent_stack.push(s.id.clone());
+                format!("{vis_prefix}{} {}", s.kind.to_lowercase(), s.name)
+            }
+            _ => format!("{vis_prefix}{} {}", s.kind, s.name),
+        };
+
+        out.push_str(&format!("{:>4}: {indent}{sig}\n", s.start_line));
+
+        if matches!(s.kind.as_str(), "Function" | "Method" | "Test") {
+            out.push_str(&format!(
+                "       {indent}# complexity: {} | nesting: {} | stmts: {} | fan-in: {}\n",
+                s.complexity, s.nesting, s.stmt_count, s.fan_in
+            ));
+        }
+    }
+
+    out
 }

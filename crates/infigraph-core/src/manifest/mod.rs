@@ -589,6 +589,7 @@ fn scan_csproj_dir(
 }
 
 fn store_manifest(store: &GraphStore, result: &ManifestResult) -> Result<()> {
+    let _lock = store.write_lock()?;
     let conn = store.connection()?;
 
     for dep in &result.deps {

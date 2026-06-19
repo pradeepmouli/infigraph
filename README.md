@@ -122,6 +122,9 @@ Examples:
 - **Cross-Language Detection:** Delphi↔COM, VB6↔COM, C#↔JNI, FFI, gRPC, WASM bridges.
 - **Grammar Plugins:** Drop `.g4` + `plugin.toml` — parse any custom/internal DSL without Rust compilation.
 - **[Pipeline Plugins](docs/PIPELINE_PLUGINS.md):** Runtime-extensible pipeline metadata extraction — add new data pipeline formats (dbt, Airflow, custom) without recompiling. Dependency graphs, impact analysis, compliance queries.
+- **Structured Ingestion:** TOML schema-driven plug-n-play data ingestion — define schemas in `.infigraph/structured-schemas/`, drop JSON/YAML data files. Symbol resolution, directory mode, dual backend.
+- **Named Sessions:** Save and recall named AI agent sessions by identity — persist context across long-running projects.
+- **Write-Lock Safety:** Advisory file locking for Kuzu single-writer constraint. All write paths protected. RAII guard auto-releases on drop or crash.
 - **Web UI:** Built-in graph explorer, search, route map at localhost:9749.
 - **Export:** Neo4j Cypher, GraphML, JSON — take your graph anywhere.
 
@@ -634,6 +637,10 @@ Replace `/path/to/infigraph-mcp` with the output of `which infigraph-mcp`.
 - **Custom edge types** — extensible relation system: language plugins can define custom edges (DECORATED_BY, SPAWNS, etc.) that persist in the graph
 - **Gitignore-aware** — respects `.gitignore` and `.infigraphignore` patterns during indexing via the `ignore` crate
 - **Learned resolution** — records successful cross-file call resolutions to improve accuracy on subsequent indexes
+- **Structured ingestion** — TOML schema-driven data ingestion: define node tables, columns, edges in `.infigraph/structured-schemas/*.toml`. Ingest JSON/YAML files or entire directories. Edges can target the Symbol table with auto-resolution by name or ID. Both Kuzu and CozoDB backends
+- **Named identity sessions** — `save_session` accepts `name` parameter to create named sessions (`named_{name}` IDs). `get_latest_session` accepts `name` to recall by identity. Named sessions stored separately from daily auto-saves
+- **Skeleton annotations** — code skeleton includes quality metrics: `# complexity: N | nesting: N | stmts: N | fan-in: N` on functions/methods. Shared formatting between Kuzu and CozoDB
+- **Write-lock concurrency safety** — advisory file locking (`flock`) for Kuzu single-writer constraint. All write paths protected — indexing, SCIP import, structured ingestion, cross-service linking, resolve. RAII guard auto-releases on drop or crash
 
 ### Analysis
 - **Refactor analysis** — complexity hotspots, coupling (fan-in/fan-out), near-duplicate detection, dead code, file size — ranked by impact/effort
@@ -654,6 +661,69 @@ Replace `/path/to/infigraph-mcp` with the output of `which infigraph-mcp`.
 - HTTP route/endpoint detection across 22 languages (Flask, Express, Spring, Django, Gin, Actix, Phoenix, Rails, NestJS, and more)
 - Cross-service HTTP dependency detection (`group deps`) — scans URL strings, matches to contracts across repos
 - Bridge-to-call promotion — promotes detected cross-language bridges to CALLS edges for unified call graph analysis
+
+### Structured Ingestion
+
+Define TOML schemas to ingest arbitrary JSON/YAML data into the graph:
+
+```toml
+# .infigraph/structured-schemas/api_endpoints.toml
+schema_id = "api_endpoints"
+name = "API Endpoints"
+node_table = "Endpoint"
+
+[[columns]]
+name = "id"
+col_type = "STRING"
+primary = true
+
+[[columns]]
+name = "url"
+col_type = "STRING"
+
+[[columns]]
+name = "method"
+col_type = "STRING"
+
+[[edges]]
+name = "HANDLED_BY"
+from_table = "Endpoint"
+to_table = "Symbol"
+from_column = "id"
+to_column = "handler"
+resolve_symbol = true  # auto-resolves handler names to Symbol nodes
+```
+
+Discovery paths: `.infigraph/structured-schemas/`, `.terragraph/schemas/`, `~/.infigraph/structured-schemas/`
+
+```bash
+# CLI usage
+infigraph ingest --schema api_endpoints --data-file endpoints.json
+infigraph ingest --schema api_endpoints --source ./data/endpoints/
+
+# MCP tool
+# tool: ingest_structured { schema_id: "api_endpoints", data_file: "endpoints.json" }
+```
+
+### CI Check Configuration
+
+Configure quality gates via `check.toml`:
+
+```toml
+[security]
+enabled = true
+max_critical = 0
+max_high = 5
+
+[complexity]
+enabled = true
+threshold = 15
+max_violations = 10
+
+[dead_code]
+enabled = true
+max_dead = 20
+```
 
 ### SCIP Integration (Compiler-grade Enrichment)
 Infigraph natively imports [SCIP](https://sourcegraph.com/blog/announcing-scip) indexes to enrich the graph with precise compiler-grade symbols, types, and cross-file relationships. SCIP indexers are **auto-downloaded** — `infigraph index` detects project languages and fetches the right indexer binaries (with portable runtimes for Node.js, JRE, .NET, Dart, PHP) on first use:
@@ -832,8 +902,8 @@ infigraph-mcp --ui --port=9749
 | `stop_watch` | Stop a running watcher |
 | `get_watch_status` | Check watcher status and pending reindexes |
 | **Session Context** | |
-| `save_session` | Save session context to graph DB with TOUCHED edges + semantic embedding. Auto-purges after configurable days (default: 30) |
-| `get_latest_session` | Retrieve most recent session — summary, pending tasks, decisions, linked files. Suggests purge if old sessions exist |
+| `save_session` | Save session context to graph DB with TOUCHED edges + semantic embedding. Optional `name` param for named identity sessions (`named_{name}`). Auto-purges after configurable days (default: 30) |
+| `get_latest_session` | Retrieve most recent session — summary, pending tasks, decisions, linked files. Optional `name` param to recall by identity. Suggests purge if old sessions exist |
 | `purge_sessions` | Delete sessions older than N days (default: 30). User-initiated cleanup |
 
 ## Architecture
@@ -868,6 +938,7 @@ infigraph/
 │   │       ├── config/          # Config binding resolution (Spring, Django, .NET, Rails)
 │   │       ├── reflection/      # Reflection/dynamic invocation scanner
 │   │       ├── taint/           # Taint analysis (intra/inter-procedural, dynamic URLs, path traversal)
+│   │       ├── structured/      # TOML schema-driven structured data ingestion
 │   │       ├── viz/             # HTML graph visualization
 │   │       └── export/          # Cypher, GraphML, JSON export
 │   ├── infigraph-docs/          # Document indexing (PDF, DOCX, PPTX, HTML, Markdown)

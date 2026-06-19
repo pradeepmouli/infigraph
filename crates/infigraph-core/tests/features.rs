@@ -333,7 +333,7 @@ fn test_diff_format() {
                 name: "changed_func".to_string(),
                 kind: "Function".to_string(),
                 file: "api.py".to_string(),
-                change: ChangeKind::Modified,
+                change: ChangeKind::BodyChanged,
                 caller_count: 1,
             },
         ],

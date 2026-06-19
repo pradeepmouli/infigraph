@@ -237,3 +237,53 @@ fn test_scan_stats_count_methods() {
     assert_eq!(stats.medium_count(), 1);
     assert_eq!(stats.low_count(), 1);
 }
+
+// ---------- DES false positive tests ----------
+
+#[test]
+fn test_des_false_positive_excluded() {
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::write(
+        dir.path().join("app.py"),
+        "description = 'A long description'\ndescribe('test case')\ndes_key = 'not_crypto'\n",
+    ).unwrap();
+
+    let stats = infigraph_core::security::scan_project(dir.path()).unwrap();
+    let des_findings: Vec<_> = stats.findings.iter()
+        .filter(|f| f.rule_id.starts_with("SEC072"))
+        .collect();
+    assert!(des_findings.is_empty(), "description/describe should NOT trigger DES rule: {:?}", des_findings);
+}
+
+#[test]
+fn test_des_real_crypto_detected() {
+    let dir = tempfile::TempDir::new().unwrap();
+    std::fs::write(
+        dir.path().join("crypto.py"),
+        "from Crypto.Cipher import DES\ncipher = DES.new(key, DES.MODE_ECB)\n",
+    ).unwrap();
+
+    let stats = infigraph_core::security::scan_project(dir.path()).unwrap();
+    let des_findings: Vec<_> = stats.findings.iter()
+        .filter(|f| f.rule_id.starts_with("SEC072"))
+        .collect();
+    assert!(!des_findings.is_empty(), "DES.new() should be flagged: findings = {:?}", stats.findings.iter().map(|f| &f.rule_id).collect::<Vec<_>>());
+}
+
+#[test]
+fn test_sanitizer_window_respects_boundary() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut code = String::new();
+    code.push_str("# sanitize: escaped\n");
+    for _ in 0..10 {
+        code.push_str("x = 1\n");
+    }
+    code.push_str("query = f\"SELECT * FROM users WHERE id = {user_input}\"\n");
+    std::fs::write(dir.path().join("far.py"), &code).unwrap();
+
+    let stats = infigraph_core::security::scan_project(dir.path()).unwrap();
+    let sql_findings: Vec<_> = stats.findings.iter()
+        .filter(|f| f.category == Category::SqlInjection && !f.suppressed)
+        .collect();
+    assert!(!sql_findings.is_empty(), "sanitizer 10+ lines away should NOT suppress finding");
+}

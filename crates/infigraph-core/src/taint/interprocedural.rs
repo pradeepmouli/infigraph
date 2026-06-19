@@ -7,6 +7,7 @@ use serde::Serialize;
 use crate::graph::GraphStore;
 use crate::graph::GraphQuery;
 
+use super::{FuncInfo, SourceCache};
 use super::sinks::TAINT_SINKS;
 use super::sources::TAINT_SOURCES;
 
@@ -80,6 +81,127 @@ pub fn detect_interprocedural_taint(
     }
 
     Ok(flows)
+}
+
+pub fn detect_interprocedural_taint_with_cache(
+    store: &GraphStore,
+    functions: &[FuncInfo],
+    cache: &SourceCache,
+    max_depth: u32,
+) -> Result<Vec<InterProcTaintFlow>> {
+    let conn = store.connection()?;
+
+    // Preload entire CALLS adjacency list in one query instead of per-node queries
+    let adj = load_call_adjacency(&conn)?;
+
+    let (source_functions, sink_functions) = find_sources_and_sinks_from_cache(functions, cache);
+
+    let mut flows = Vec::new();
+    for (src_sym, src_kind) in &source_functions {
+        let mut visited: HashSet<String> = HashSet::new();
+        let mut queue: VecDeque<(String, Vec<String>, u32)> = VecDeque::new();
+        visited.insert(src_sym.clone());
+        queue.push_back((src_sym.clone(), vec![src_sym.clone()], 0));
+
+        while let Some((current, chain, depth)) = queue.pop_front() {
+            if depth > max_depth { continue; }
+            if let Some((sink_kind, sink_cat)) = sink_functions.get(&current) {
+                if current != *src_sym {
+                    flows.push(InterProcTaintFlow {
+                        source_symbol: src_sym.clone(),
+                        sink_symbol: current.clone(),
+                        source_kind: src_kind.clone(),
+                        sink_kind: sink_kind.clone(),
+                        sink_category: sink_cat.clone(),
+                        call_chain: chain.clone(),
+                        depth,
+                    });
+                }
+            }
+            if let Some(callees) = adj.get(&current) {
+                for callee in callees {
+                    if !visited.contains(callee) {
+                        visited.insert(callee.clone());
+                        let mut new_chain = chain.clone();
+                        new_chain.push(callee.clone());
+                        queue.push_back((callee.clone(), new_chain, depth + 1));
+                    }
+                }
+            }
+        }
+    }
+    Ok(flows)
+}
+
+fn load_call_adjacency(conn: &kuzu::Connection<'_>) -> Result<HashMap<String, Vec<String>>> {
+    let result = conn
+        .query("MATCH (a:Symbol)-[:CALLS]->(b:Symbol) RETURN a.id, b.id")
+        .map_err(|e| anyhow::anyhow!("load call adjacency: {e}"))?;
+    let mut adj: HashMap<String, Vec<String>> = HashMap::new();
+    for row in result {
+        if row.len() >= 2 {
+            adj.entry(row[0].to_string())
+                .or_default()
+                .push(row[1].to_string());
+        }
+    }
+    Ok(adj)
+}
+
+fn find_sources_and_sinks_from_cache(
+    functions: &[FuncInfo],
+    cache: &SourceCache,
+) -> (Vec<(String, String)>, HashMap<String, (String, String)>) {
+    let mut sources: Vec<(String, String)> = Vec::new();
+    let mut sinks: HashMap<String, (String, String)> = HashMap::new();
+
+    for func in functions {
+        let lines = match cache.get(&func.file) {
+            Some(l) => l,
+            None => continue,
+        };
+        let start_idx = (func.start_line as usize).saturating_sub(1);
+        let end_idx = (func.end_line as usize).min(lines.len());
+        if start_idx >= end_idx { continue; }
+
+        let mut found_source = false;
+        let mut found_sink = false;
+
+        for line in &lines[start_idx..end_idx] {
+            let lower = line.to_lowercase();
+
+            if !found_source {
+                for src in super::sources::TAINT_SOURCES {
+                    for &pat in src.patterns {
+                        if lower.contains(&pat.to_lowercase()) {
+                            sources.push((func.id.clone(), src.kind.to_string()));
+                            found_source = true;
+                            break;
+                        }
+                    }
+                    if found_source { break; }
+                }
+            }
+
+            if !found_sink {
+                for sink in TAINT_SINKS {
+                    for &pat in sink.patterns {
+                        if lower.contains(&pat.to_lowercase()) {
+                            sinks.insert(func.id.clone(), (sink.kind.to_string(), sink.category.to_string()));
+                            found_sink = true;
+                            break;
+                        }
+                    }
+                    if found_sink { break; }
+                }
+            }
+
+            if found_source && found_sink { break; }
+        }
+    }
+
+    sources.dedup_by(|a, b| a.0 == b.0);
+    (sources, sinks)
 }
 
 fn find_source_functions(store: &GraphStore, root: &Path) -> Result<Vec<(String, String)>> {

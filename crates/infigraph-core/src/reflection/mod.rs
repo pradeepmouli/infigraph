@@ -85,6 +85,7 @@ pub fn detect_reflection_sites(
     store: &GraphStore,
     root: &Path,
 ) -> Result<Vec<ReflectionSite>> {
+    let _lock = store.write_lock()?;
     let conn = store.connection()?;
 
     let result = conn

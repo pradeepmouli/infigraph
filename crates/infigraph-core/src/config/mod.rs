@@ -108,6 +108,7 @@ static CONDITIONAL_PATTERNS: &[ConditionalPattern] = &[
 ];
 
 pub fn detect_config_bindings(store: &GraphStore) -> Result<Vec<ConfigBinding>> {
+    let _lock = store.write_lock()?;
     let conn = store.connection()?;
 
     let result = conn

@@ -11,6 +11,7 @@ use super::queries::{
     SymbolRow, SymbolDetail, ImpactRow, ReferenceRow, ApiSymbol,
     FileDeps, HierarchyNode, TypeHierarchy, CoverageRow, TestCoverage,
     BranchInfo, TestTarget, TestContext, ExampleTest,
+    SkeletonSymbol, format_skeleton,
 };
 use crate::model::{FileExtraction, RelationKind};
 
@@ -90,6 +91,76 @@ impl CozoStore {
             false,
         )?;
         Ok(named_rows_to_symbol_rows(&r))
+    }
+
+    pub fn skeleton(&self, file: &str) -> Result<String> {
+        let mut params = empty_params();
+        params.insert("file".into(), DataValue::Str(file.into()));
+
+        let r = self.run_params(
+            r#"?[id, name, kind, start_line, complexity, parameters, return_type, visibility, parent] :=
+                *symbol{id, name, kind, file, start_line, complexity, parameters, return_type, visibility, parent},
+                file = $file
+            :order start_line"#,
+            params.clone(),
+            false,
+        )?;
+
+        if r.rows.is_empty() {
+            return Ok(format!("No symbols found in '{file}'. File may not be indexed."));
+        }
+
+        let ids: Vec<String> = r.rows.iter().map(|row| dv_str(&row[0])).collect();
+
+        let mut fan_in: HashMap<String, usize> = HashMap::new();
+        for id in &ids {
+            let mut p = empty_params();
+            p.insert("target".into(), DataValue::Str(id.clone().into()));
+            let cr = self.run_params(
+                r#"?[count(caller)] := *calls{caller, callee: $target}"#,
+                p,
+                false,
+            )?;
+            fan_in.insert(id.clone(), dv_u64(&cr) as usize);
+        }
+
+        let mut stmt_counts: HashMap<String, usize> = HashMap::new();
+        let mut nesting: HashMap<String, u32> = HashMap::new();
+        for id in &ids {
+            let mut p = empty_params();
+            p.insert("sym".into(), DataValue::Str(id.clone().into()));
+            let sr = self.run_params(
+                r#"?[count(stmt_id), max(depth)] :=
+                    *has_statement{symbol_id: $sym, statement_id: stmt_id},
+                    *statement{id: stmt_id, depth}"#,
+                p,
+                false,
+            )?;
+            if let Some(row) = sr.rows.first() {
+                stmt_counts.insert(id.clone(), dv_u64_val(&row[0]) as usize);
+                nesting.insert(id.clone(), dv_u32(&row[1]));
+            }
+        }
+
+        let symbols: Vec<SkeletonSymbol> = r.rows.iter().map(|row| {
+            let id = dv_str(&row[0]);
+            SkeletonSymbol {
+                fan_in: fan_in.get(&id).copied().unwrap_or(0),
+                stmt_count: stmt_counts.get(&id).copied().unwrap_or(0),
+                nesting: nesting.get(&id).copied().unwrap_or(0),
+                id,
+                name: dv_str(&row[1]),
+                kind: dv_str(&row[2]),
+                start_line: dv_str(&row[3]),
+                complexity: dv_u32(&row[4]),
+                params: dv_str(&row[5]),
+                return_type: dv_str(&row[6]),
+                visibility: dv_str(&row[7]),
+                parent: dv_str(&row[8]),
+            }
+        }).collect();
+
+        Ok(format_skeleton(file, &symbols))
     }
 
     pub fn callers_of(&self, symbol_id: &str) -> Result<Vec<String>> {

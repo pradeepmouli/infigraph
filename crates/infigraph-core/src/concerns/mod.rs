@@ -222,6 +222,7 @@ static CONCERN_PATTERNS: &[ConcernPattern] = &[
 ];
 
 pub fn detect_cross_cutting(store: &GraphStore) -> Result<Vec<ConcernMatch>> {
+    let _lock = store.write_lock()?;
     let conn = store.connection()?;
 
     let result = conn

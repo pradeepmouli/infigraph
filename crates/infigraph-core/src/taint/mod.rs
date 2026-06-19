@@ -8,11 +8,61 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::Result;
+use rayon::prelude::*;
 use serde::Serialize;
 
 use crate::graph::GraphStore;
 use sinks::{TAINT_SANITIZERS, TAINT_SINKS};
 use sources::TAINT_SOURCES;
+
+pub type SourceCache = HashMap<String, Vec<String>>;
+
+#[derive(Clone)]
+pub struct FuncInfo {
+    pub id: String,
+    pub file: String,
+    pub start_line: u32,
+    pub end_line: u32,
+}
+
+pub fn build_source_cache(
+    store: &GraphStore,
+    root: &Path,
+) -> Result<(Vec<FuncInfo>, SourceCache)> {
+    let conn = store.connection()?;
+    let result = conn
+        .query("MATCH (s:Symbol) WHERE s.kind IN ['Function', 'Method', 'Test'] AND s.file IS NOT NULL RETURN s.id, s.file, s.start_line, s.end_line")
+        .map_err(|e| anyhow::anyhow!("query failed: {e}"))?;
+
+    let mut functions = Vec::new();
+    let mut files_needed: HashSet<String> = HashSet::new();
+    for row in result {
+        if row.len() < 4 { continue; }
+        let id = row[0].to_string();
+        let file = row[1].to_string();
+        let start: u32 = row[2].to_string().parse().unwrap_or(0);
+        let end: u32 = row[3].to_string().parse().unwrap_or(0);
+        if start > 0 && end > start {
+            files_needed.insert(file.clone());
+            functions.push(FuncInfo { id, file, start_line: start, end_line: end });
+        }
+    }
+
+    let files_vec: Vec<String> = files_needed.into_iter().collect();
+    let cache: SourceCache = files_vec
+        .par_iter()
+        .map(|file| {
+            let content = std::fs::read_to_string(root.join(file))
+                .unwrap_or_default()
+                .lines()
+                .map(String::from)
+                .collect();
+            (file.clone(), content)
+        })
+        .collect();
+
+    Ok((functions, cache))
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TaintFlow {
@@ -30,6 +80,7 @@ pub struct TaintFlow {
 }
 
 pub fn detect_taint_flows(store: &GraphStore, root: &Path) -> Result<Vec<TaintFlow>> {
+    let _lock = store.write_lock()?;
     let conn = store.connection()?;
 
     let result = conn
@@ -71,6 +122,35 @@ pub fn detect_taint_flows(store: &GraphStore, root: &Path) -> Result<Vec<TaintFl
 
         let func_lines = &lines[start_idx..end_idx];
         let flows = analyze_function(symbol_id, file, *start_line, func_lines);
+        all_flows.extend(flows);
+    }
+
+    if !all_flows.is_empty() {
+        write_taint_flows(store, &all_flows)?;
+    }
+
+    Ok(all_flows)
+}
+
+pub fn detect_taint_flows_with_cache(
+    store: &GraphStore,
+    functions: &[FuncInfo],
+    cache: &SourceCache,
+) -> Result<Vec<TaintFlow>> {
+    let _lock = store.write_lock()?;
+    let mut all_flows = Vec::new();
+
+    for func in functions {
+        let lines = match cache.get(&func.file) {
+            Some(l) => l,
+            None => continue,
+        };
+        let start_idx = (func.start_line as usize).saturating_sub(1);
+        let end_idx = (func.end_line as usize).min(lines.len());
+        if start_idx >= end_idx { continue; }
+
+        let func_lines = &lines[start_idx..end_idx];
+        let flows = analyze_function(&func.id, &func.file, func.start_line, func_lines);
         all_flows.extend(flows);
     }
 

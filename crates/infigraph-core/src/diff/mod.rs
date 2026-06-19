@@ -1,7 +1,7 @@
 //! Semantic diff between two git refs at the symbol level.
 //!
 //! Instead of a line diff, this compares the extracted symbol graphs of two
-//! git tree-states and classifies each change as Added / Removed / Modified /
+//! git tree-states and classifies each change as Added / Removed / BodyChanged /
 //! SignatureChanged.  The caller supplies a project root and two git refs
 //! (e.g. "HEAD~1", "main"); the module checks out each ref into a temp
 //! worktree, indexes it with the current language registry, and returns a
@@ -26,9 +26,11 @@ pub enum ChangeKind {
     /// Symbol exists in both; signature_hash changed (parameter / return type change).
     SignatureChanged,
     /// Symbol exists in both; body changed but signature is the same.
-    Modified,
+    BodyChanged,
     /// Symbol moved to a different file.
     Moved { from_file: String },
+    /// Symbol renamed in the same file (structurally similar body).
+    Renamed { old_name: String },
 }
 
 impl std::fmt::Display for ChangeKind {
@@ -37,8 +39,9 @@ impl std::fmt::Display for ChangeKind {
             ChangeKind::Added => write!(f, "ADDED"),
             ChangeKind::Removed => write!(f, "REMOVED"),
             ChangeKind::SignatureChanged => write!(f, "SIGNATURE_CHANGED"),
-            ChangeKind::Modified => write!(f, "MODIFIED"),
+            ChangeKind::BodyChanged => write!(f, "BODY_CHANGED"),
             ChangeKind::Moved { from_file } => write!(f, "MOVED(from:{})", from_file),
+            ChangeKind::Renamed { old_name } => write!(f, "RENAMED(from:{})", old_name),
         }
     }
 }
@@ -77,7 +80,10 @@ impl SymbolDiff {
         self.changes.iter().filter(|c| {
             matches!(
                 c.change,
-                ChangeKind::Modified | ChangeKind::SignatureChanged | ChangeKind::Moved { .. }
+                ChangeKind::BodyChanged
+                    | ChangeKind::SignatureChanged
+                    | ChangeKind::Moved { .. }
+                    | ChangeKind::Renamed { .. }
             )
         })
     }
@@ -87,13 +93,15 @@ impl SymbolDiff {
 // Public API
 // ---------------------------------------------------------------------------
 
-/// A flat symbol record used during diff (file + name + kind + sig_hash).
+/// A flat symbol record used during diff.
 #[derive(Clone)]
-struct FlatSym {
-    file: String,
-    name: String,
-    kind: String,
-    sig_hash: String,
+pub(crate) struct FlatSym {
+    pub(crate) file: String,
+    pub(crate) name: String,
+    pub(crate) kind: String,
+    pub(crate) sig_hash: String,
+    pub(crate) params: String,
+    pub(crate) return_type: String,
 }
 
 /// Compute a symbol-level diff between `old_ref` and `new_ref` in `project_root`.
@@ -350,6 +358,8 @@ fn collect_symbols(
                         name: sym.name.clone(),
                         kind: kind_str,
                         sig_hash: sym.signature_hash.clone(),
+                        params: sym.parameters.clone().unwrap_or_default(),
+                        return_type: sym.return_type.clone().unwrap_or_default(),
                     },
                 );
             }
@@ -362,7 +372,11 @@ fn collect_symbols(
 // Diff two symbol maps
 // ---------------------------------------------------------------------------
 
-fn diff_symbol_maps(
+pub(crate) fn sig_matches(a: &FlatSym, b: &FlatSym) -> bool {
+    a.params == b.params && a.return_type == b.return_type
+}
+
+pub(crate) fn diff_symbol_maps(
     old_ref: &str,
     new_ref: &str,
     old: HashMap<String, FlatSym>,
@@ -379,16 +393,27 @@ fn diff_symbol_maps(
     // Check new symbols against old
     for (key, new_sym) in &new {
         if let Some(old_sym) = old.get(key) {
-            // Same file+name+kind — check signature change
-            if old_sym.sig_hash != new_sym.sig_hash
-                && !old_sym.sig_hash.is_empty()
-                && !new_sym.sig_hash.is_empty()
+            // Same file+name+kind — classify change type
+            if old_sym.sig_hash == new_sym.sig_hash
+                || old_sym.sig_hash.is_empty()
+                || new_sym.sig_hash.is_empty()
             {
+                continue;
+            }
+            if !sig_matches(old_sym, new_sym) {
                 changes.push(SymbolChange {
                     name: new_sym.name.clone(),
                     kind: new_sym.kind.clone(),
                     file: new_sym.file.clone(),
                     change: ChangeKind::SignatureChanged,
+                    caller_count: 0,
+                });
+            } else {
+                changes.push(SymbolChange {
+                    name: new_sym.name.clone(),
+                    kind: new_sym.kind.clone(),
+                    file: new_sym.file.clone(),
+                    change: ChangeKind::BodyChanged,
                     caller_count: 0,
                 });
             }
@@ -447,13 +472,71 @@ fn diff_symbol_maps(
         }
     }
 
-    // Sort: Removed first, then Added, then modified kinds
+    // Rename detection: match Added+Removed pairs in same file+kind by structural similarity
+    let added: Vec<usize> = changes
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.change == ChangeKind::Added)
+        .map(|(i, _)| i)
+        .collect();
+    let removed: Vec<usize> = changes
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.change == ChangeKind::Removed)
+        .map(|(i, _)| i)
+        .collect();
+
+    let mut rename_pairs: Vec<(usize, usize, String)> = Vec::new();
+    let mut used_removed: HashSet<usize> = HashSet::new();
+
+    for &ai in &added {
+        let a = &changes[ai];
+        for &ri in &removed {
+            if used_removed.contains(&ri) {
+                continue;
+            }
+            let r = &changes[ri];
+            if a.file != r.file || a.kind != r.kind {
+                continue;
+            }
+            // Same file, same kind, different name — check structural match via sig_hash
+            let a_key = format!("{}::{}::{}", a.file, a.name, a.kind);
+            let r_key = format!("{}::{}::{}", r.file, r.name, r.kind);
+            if let (Some(a_sym), Some(r_sym)) = (new.get(&a_key), old.get(&r_key)) {
+                if a_sym.sig_hash == r_sym.sig_hash && !a_sym.sig_hash.is_empty() {
+                    rename_pairs.push((ai, ri, r.name.clone()));
+                    used_removed.insert(ri);
+                    break;
+                }
+            }
+        }
+    }
+
+    let mut remove_indices: HashSet<usize> = HashSet::new();
+    for (ai, ri, old_name) in &rename_pairs {
+        changes[*ai].change = ChangeKind::Renamed {
+            old_name: old_name.clone(),
+        };
+        remove_indices.insert(*ri);
+    }
+
+    if !remove_indices.is_empty() {
+        let mut idx = 0;
+        changes.retain(|_| {
+            let keep = !remove_indices.contains(&idx);
+            idx += 1;
+            keep
+        });
+    }
+
+    // Sort: Removed first, then signature changes, body changes, moves, renames, added
     changes.sort_by_key(|c| match &c.change {
         ChangeKind::Removed => 0,
         ChangeKind::SignatureChanged => 1,
-        ChangeKind::Modified => 2,
+        ChangeKind::BodyChanged => 2,
         ChangeKind::Moved { .. } => 3,
-        ChangeKind::Added => 4,
+        ChangeKind::Renamed { .. } => 4,
+        ChangeKind::Added => 5,
     });
 
     SymbolDiff {
@@ -505,4 +588,219 @@ pub fn format_diff(diff: &SymbolDiff) -> String {
     }
 
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sym(file: &str, name: &str, kind: &str, sig_hash: &str, params: &str, ret: &str) -> FlatSym {
+        FlatSym {
+            file: file.to_string(),
+            name: name.to_string(),
+            kind: kind.to_string(),
+            sig_hash: sig_hash.to_string(),
+            params: params.to_string(),
+            return_type: ret.to_string(),
+        }
+    }
+
+    fn key(file: &str, name: &str, kind: &str) -> String {
+        format!("{}::{}::{}", file, name, kind)
+    }
+
+    #[test]
+    fn test_body_change_classified_as_body_changed() {
+        let mut old = HashMap::new();
+        let mut new = HashMap::new();
+        let k = key("app.py", "validate_email", "Function");
+        old.insert(k.clone(), sym("app.py", "validate_email", "Function", "hash_v1", "(addr: str)", "bool"));
+        new.insert(k.clone(), sym("app.py", "validate_email", "Function", "hash_v2", "(addr: str)", "bool"));
+
+        let diff = diff_symbol_maps("old", "new", old, new);
+        assert_eq!(diff.changes.len(), 1);
+        assert_eq!(diff.changes[0].change, ChangeKind::BodyChanged);
+        assert_eq!(diff.changes[0].name, "validate_email");
+    }
+
+    #[test]
+    fn test_signature_change_params_differ() {
+        let mut old = HashMap::new();
+        let mut new = HashMap::new();
+        let k = key("app.py", "process", "Function");
+        old.insert(k.clone(), sym("app.py", "process", "Function", "hash_v1", "(x: int)", "None"));
+        new.insert(k.clone(), sym("app.py", "process", "Function", "hash_v2", "(x: int, y: int)", "None"));
+
+        let diff = diff_symbol_maps("old", "new", old, new);
+        assert_eq!(diff.changes.len(), 1);
+        assert_eq!(diff.changes[0].change, ChangeKind::SignatureChanged);
+    }
+
+    #[test]
+    fn test_signature_change_return_type_differs() {
+        let mut old = HashMap::new();
+        let mut new = HashMap::new();
+        let k = key("app.py", "get_value", "Function");
+        old.insert(k.clone(), sym("app.py", "get_value", "Function", "hash_v1", "()", "int"));
+        new.insert(k.clone(), sym("app.py", "get_value", "Function", "hash_v2", "()", "str"));
+
+        let diff = diff_symbol_maps("old", "new", old, new);
+        assert_eq!(diff.changes.len(), 1);
+        assert_eq!(diff.changes[0].change, ChangeKind::SignatureChanged);
+    }
+
+    #[test]
+    fn test_rename_same_file_identical_body() {
+        let mut old = HashMap::new();
+        let mut new = HashMap::new();
+        old.insert(
+            key("calculator.py", "calculate_order_total", "Function"),
+            sym("calculator.py", "calculate_order_total", "Function", "body_hash_abc", "(items: list[Item])", "Decimal"),
+        );
+        new.insert(
+            key("calculator.py", "compute_order_sum", "Function"),
+            sym("calculator.py", "compute_order_sum", "Function", "body_hash_abc", "(items: list[Item])", "Decimal"),
+        );
+
+        let diff = diff_symbol_maps("old", "new", old, new);
+        let renamed: Vec<_> = diff.changes.iter()
+            .filter(|c| matches!(&c.change, ChangeKind::Renamed { .. }))
+            .collect();
+        assert_eq!(renamed.len(), 1, "Expected 1 rename, got: {:?}",
+            diff.changes.iter().map(|c| format!("{}: {}", c.name, c.change)).collect::<Vec<_>>());
+        assert_eq!(renamed[0].name, "compute_order_sum");
+        if let ChangeKind::Renamed { old_name } = &renamed[0].change {
+            assert_eq!(old_name, "calculate_order_total");
+        }
+        let removed: Vec<_> = diff.changes.iter()
+            .filter(|c| c.change == ChangeKind::Removed)
+            .collect();
+        assert_eq!(removed.len(), 0, "Old name should not appear as Removed");
+    }
+
+    #[test]
+    fn test_rename_not_detected_different_body() {
+        let mut old = HashMap::new();
+        let mut new = HashMap::new();
+        old.insert(
+            key("app.py", "old_func", "Function"),
+            sym("app.py", "old_func", "Function", "hash_A", "()", ""),
+        );
+        new.insert(
+            key("app.py", "new_func", "Function"),
+            sym("app.py", "new_func", "Function", "hash_B", "()", ""),
+        );
+
+        let diff = diff_symbol_maps("old", "new", old, new);
+        let renamed: Vec<_> = diff.changes.iter()
+            .filter(|c| matches!(&c.change, ChangeKind::Renamed { .. }))
+            .collect();
+        assert_eq!(renamed.len(), 0);
+        assert!(diff.changes.iter().any(|c| c.change == ChangeKind::Added));
+        assert!(diff.changes.iter().any(|c| c.change == ChangeKind::Removed));
+    }
+
+    #[test]
+    fn test_move_across_files() {
+        let mut old = HashMap::new();
+        let mut new = HashMap::new();
+        old.insert(
+            key("old_file.py", "helper", "Function"),
+            sym("old_file.py", "helper", "Function", "hash_1", "()", ""),
+        );
+        new.insert(
+            key("new_file.py", "helper", "Function"),
+            sym("new_file.py", "helper", "Function", "hash_1", "()", ""),
+        );
+
+        let diff = diff_symbol_maps("old", "new", old, new);
+        let moved: Vec<_> = diff.changes.iter()
+            .filter(|c| matches!(&c.change, ChangeKind::Moved { .. }))
+            .collect();
+        assert_eq!(moved.len(), 1);
+        if let ChangeKind::Moved { from_file } = &moved[0].change {
+            assert_eq!(from_file, "old_file.py");
+        }
+    }
+
+    #[test]
+    fn test_added_and_removed() {
+        let mut old = HashMap::new();
+        let mut new = HashMap::new();
+        old.insert(
+            key("app.py", "removed_fn", "Function"),
+            sym("app.py", "removed_fn", "Function", "hash_r", "()", ""),
+        );
+        new.insert(
+            key("app.py", "added_fn", "Function"),
+            sym("app.py", "added_fn", "Function", "hash_a", "()", ""),
+        );
+
+        let diff = diff_symbol_maps("old", "new", old, new);
+        assert!(diff.changes.iter().any(|c| c.change == ChangeKind::Added && c.name == "added_fn"));
+        assert!(diff.changes.iter().any(|c| c.change == ChangeKind::Removed && c.name == "removed_fn"));
+    }
+
+    #[test]
+    fn test_no_change_same_hash() {
+        let mut old = HashMap::new();
+        let mut new = HashMap::new();
+        let k = key("app.py", "stable_fn", "Function");
+        old.insert(k.clone(), sym("app.py", "stable_fn", "Function", "same_hash", "()", "int"));
+        new.insert(k.clone(), sym("app.py", "stable_fn", "Function", "same_hash", "()", "int"));
+
+        let diff = diff_symbol_maps("old", "new", old, new);
+        assert_eq!(diff.changes.len(), 0);
+    }
+
+    #[test]
+    fn test_modified_helper_returns_all_change_types() {
+        let mut old = HashMap::new();
+        let mut new = HashMap::new();
+
+        // BodyChanged
+        let k1 = key("a.py", "fn_body", "Function");
+        old.insert(k1.clone(), sym("a.py", "fn_body", "Function", "h1", "()", ""));
+        new.insert(k1.clone(), sym("a.py", "fn_body", "Function", "h2", "()", ""));
+
+        // SignatureChanged
+        let k2 = key("a.py", "fn_sig", "Function");
+        old.insert(k2.clone(), sym("a.py", "fn_sig", "Function", "h3", "(x: int)", ""));
+        new.insert(k2.clone(), sym("a.py", "fn_sig", "Function", "h4", "(x: str)", ""));
+
+        // Moved
+        old.insert(key("old.py", "fn_moved", "Function"), sym("old.py", "fn_moved", "Function", "h5", "()", ""));
+        new.insert(key("new.py", "fn_moved", "Function"), sym("new.py", "fn_moved", "Function", "h5", "()", ""));
+
+        // Renamed
+        old.insert(key("a.py", "old_name", "Function"), sym("a.py", "old_name", "Function", "h6", "()", ""));
+        new.insert(key("a.py", "new_name", "Function"), sym("a.py", "new_name", "Function", "h6", "()", ""));
+
+        let diff = diff_symbol_maps("old", "new", old, new);
+        let modified: Vec<_> = diff.modified().collect();
+        assert_eq!(modified.len(), 4, "modified() should include all 4 change types, got: {:?}",
+            modified.iter().map(|c| format!("{}: {}", c.name, c.change)).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn test_combined_rename_and_body_change() {
+        let mut old = HashMap::new();
+        let mut new = HashMap::new();
+        old.insert(
+            key("app.py", "calc_total", "Function"),
+            sym("app.py", "calc_total", "Function", "hash_old", "(items: list)", "float"),
+        );
+        new.insert(
+            key("app.py", "compute_sum", "Function"),
+            sym("app.py", "compute_sum", "Function", "hash_new", "(items: list)", "float"),
+        );
+
+        let diff = diff_symbol_maps("old", "new", old, new);
+        let renamed: Vec<_> = diff.changes.iter()
+            .filter(|c| matches!(&c.change, ChangeKind::Renamed { .. }))
+            .collect();
+        assert_eq!(renamed.len(), 0, "Should NOT detect rename when body hash differs");
+        assert!(diff.changes.iter().any(|c| c.change == ChangeKind::Added));
+        assert!(diff.changes.iter().any(|c| c.change == ChangeKind::Removed));
+    }
 }

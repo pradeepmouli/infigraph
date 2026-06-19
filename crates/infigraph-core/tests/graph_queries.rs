@@ -1107,6 +1107,206 @@ fn test_folders_root_level_files() {
     assert!(folders.is_empty(), "root-level file should create no folders");
 }
 
+// ---------- Skeleton tests ----------
+
+#[test]
+fn test_skeleton_output_format() {
+    let tg = TestGraph::new();
+    let mut s = sym("skel.py::compute", "compute", SymbolKind::Function, "skel.py", 10, 25);
+    s.complexity = 5;
+    s.parameters = Some("(x: int, y: int)".to_string());
+    s.return_type = Some("int".to_string());
+
+    let extraction = FileExtraction {
+        file: "skel.py".to_string(),
+        language: "python".to_string(),
+        content_hash: "sk".to_string(),
+        symbols: vec![s],
+        relations: vec![],
+        statements: vec![
+            stmt("skel.py::compute", 0, StatementKind::If, 12, 0),
+            stmt("skel.py::compute", 1, StatementKind::For, 15, 1),
+        ],
+    };
+    {
+        let conn = tg.store.connection().unwrap();
+        tg.store.upsert_all_bulk(&conn, &[extraction]).unwrap();
+    }
+
+    let conn = tg.store.connection().unwrap();
+    let q = GraphQuery::new(&conn);
+    let out = q.skeleton("skel.py").unwrap();
+
+    assert!(out.contains("# skel.py"), "should have file header");
+    assert!(out.contains("compute(x: int, y: int) -> int"), "should have signature with params and return type");
+    assert!(out.contains("# complexity: 5"), "should show complexity annotation");
+    assert!(out.contains("nesting:"), "should show nesting annotation");
+    assert!(out.contains("stmts:"), "should show stmts annotation");
+    assert!(out.contains("fan-in:"), "should show fan-in annotation");
+}
+
+#[test]
+fn test_skeleton_nesting_from_statements() {
+    let tg = TestGraph::new();
+    let extraction = FileExtraction {
+        file: "nest.py".to_string(),
+        language: "python".to_string(),
+        content_hash: "ns".to_string(),
+        symbols: vec![sym("nest.py::deep", "deep", SymbolKind::Function, "nest.py", 1, 20)],
+        relations: vec![],
+        statements: vec![
+            stmt("nest.py::deep", 0, StatementKind::If, 2, 0),
+            stmt("nest.py::deep", 1, StatementKind::For, 4, 1),
+            stmt("nest.py::deep", 2, StatementKind::If, 6, 2),
+            stmt("nest.py::deep", 3, StatementKind::While, 8, 3),
+        ],
+    };
+    {
+        let conn = tg.store.connection().unwrap();
+        tg.store.upsert_all_bulk(&conn, &[extraction]).unwrap();
+    }
+
+    let conn = tg.store.connection().unwrap();
+    let q = GraphQuery::new(&conn);
+    let out = q.skeleton("nest.py").unwrap();
+    assert!(out.contains("nesting: 3"), "max depth should be 3, got:\n{out}");
+    assert!(out.contains("stmts: 4"), "should have 4 statements, got:\n{out}");
+}
+
+#[test]
+fn test_skeleton_fan_in_count() {
+    let tg = TestGraph::new();
+    let extraction = FileExtraction {
+        file: "fanin.py".to_string(),
+        language: "python".to_string(),
+        content_hash: "fi".to_string(),
+        symbols: vec![
+            sym("fanin.py::target", "target", SymbolKind::Function, "fanin.py", 1, 5),
+            sym("fanin.py::caller1", "caller1", SymbolKind::Function, "fanin.py", 7, 10),
+            sym("fanin.py::caller2", "caller2", SymbolKind::Function, "fanin.py", 12, 15),
+        ],
+        relations: vec![
+            rel("fanin.py::caller1", "fanin.py::target", RelationKind::Calls),
+            rel("fanin.py::caller2", "fanin.py::target", RelationKind::Calls),
+        ],
+        statements: vec![],
+    };
+    {
+        let conn = tg.store.connection().unwrap();
+        tg.store.upsert_all_bulk(&conn, &[extraction]).unwrap();
+    }
+
+    let conn = tg.store.connection().unwrap();
+    let q = GraphQuery::new(&conn);
+    let out = q.skeleton("fanin.py").unwrap();
+
+    let target_section: &str = out.split("target").nth(1).unwrap_or("");
+    let fan_in_line = target_section.lines().find(|l| l.contains("fan-in:")).unwrap_or("");
+    assert!(fan_in_line.contains("fan-in: 2"), "target should have fan-in: 2, got: {fan_in_line}");
+}
+
+#[test]
+fn test_skeleton_class_members_indented() {
+    let tg = TestGraph::new();
+    let mut method = sym("cls.py::MyClass::do_thing", "do_thing", SymbolKind::Method, "cls.py", 5, 15);
+    method.parent = Some("cls.py::MyClass".to_string());
+
+    let extraction = FileExtraction {
+        file: "cls.py".to_string(),
+        language: "python".to_string(),
+        content_hash: "cl".to_string(),
+        symbols: vec![
+            sym("cls.py::MyClass", "MyClass", SymbolKind::Class, "cls.py", 1, 20),
+            method,
+        ],
+        relations: vec![],
+        statements: vec![],
+    };
+    {
+        let conn = tg.store.connection().unwrap();
+        tg.store.upsert_all_bulk(&conn, &[extraction]).unwrap();
+    }
+
+    let conn = tg.store.connection().unwrap();
+    let q = GraphQuery::new(&conn);
+    let out = q.skeleton("cls.py").unwrap();
+
+    let lines: Vec<&str> = out.lines().collect();
+    let class_line = lines.iter().find(|l| l.contains("MyClass")).unwrap();
+    let method_line = lines.iter().find(|l| l.contains("do_thing")).unwrap();
+
+    fn content_after_colon(line: &str) -> &str {
+        line.find(": ").map(|i| &line[i+2..]).unwrap_or(line)
+    }
+    let class_content = content_after_colon(class_line);
+    let method_content = content_after_colon(method_line);
+    let class_indent = class_content.len() - class_content.trim_start().len();
+    let method_indent = method_content.len() - method_content.trim_start().len();
+    assert!(method_indent > class_indent, "method should be indented more than class: class={class_indent}, method={method_indent}");
+}
+
+#[test]
+fn test_skeleton_no_annotations_on_class() {
+    let tg = TestGraph::new();
+    let extraction = FileExtraction {
+        file: "noann.py".to_string(),
+        language: "python".to_string(),
+        content_hash: "na".to_string(),
+        symbols: vec![
+            sym("noann.py::Base", "Base", SymbolKind::Class, "noann.py", 1, 20),
+        ],
+        relations: vec![],
+        statements: vec![],
+    };
+    {
+        let conn = tg.store.connection().unwrap();
+        tg.store.upsert_all_bulk(&conn, &[extraction]).unwrap();
+    }
+
+    let conn = tg.store.connection().unwrap();
+    let q = GraphQuery::new(&conn);
+    let out = q.skeleton("noann.py").unwrap();
+
+    let lines: Vec<&str> = out.lines().collect();
+    let class_idx = lines.iter().position(|l| l.contains("Base")).unwrap();
+    let next_line = lines.get(class_idx + 1).unwrap_or(&"");
+    assert!(!next_line.contains("# complexity:"), "class should not have annotation line, got: {next_line}");
+}
+
+#[test]
+fn test_skeleton_empty_file() {
+    let tg = setup();
+    let conn = tg.store.connection().unwrap();
+    let q = GraphQuery::new(&conn);
+    let out = q.skeleton("nonexistent_file.py").unwrap();
+    assert!(out.contains("No symbols found"), "empty/missing file should say no symbols: {out}");
+}
+
+#[test]
+fn test_skeleton_visibility_prefix() {
+    let tg = TestGraph::new();
+    let mut s = sym("vis.py::_internal", "_internal", SymbolKind::Function, "vis.py", 1, 10);
+    s.visibility = Some("private".to_string());
+
+    let extraction = FileExtraction {
+        file: "vis.py".to_string(),
+        language: "python".to_string(),
+        content_hash: "vp".to_string(),
+        symbols: vec![s],
+        relations: vec![],
+        statements: vec![],
+    };
+    {
+        let conn = tg.store.connection().unwrap();
+        tg.store.upsert_all_bulk(&conn, &[extraction]).unwrap();
+    }
+
+    let conn = tg.store.connection().unwrap();
+    let q = GraphQuery::new(&conn);
+    let out = q.skeleton("vis.py").unwrap();
+    assert!(out.contains("private _internal"), "should show visibility prefix for non-public: {out}");
+}
+
 // ---------- Parquet vs Bulk write equivalence ----------
 
 #[test]

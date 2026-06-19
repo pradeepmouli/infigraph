@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Result;
 use arrow::array::{Int64Array, StringArray};
@@ -10,14 +11,25 @@ use super::store::GraphStore;
 use super::store_util::{escape, fwd_slash_path, unwind_edges_from_pairs};
 use crate::model::{FileExtraction, RelationKind};
 
+fn unique_tmp_dir() -> std::path::PathBuf {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    let dir = std::env::temp_dir().join(format!("infigraph_pq_{}_{}", pid, id));
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
 impl GraphStore {
     /// Create Folder nodes and edges for a set of file paths in bulk.
     /// More efficient than per-file upsert_folder_hierarchy calls.
     pub fn upsert_folders_bulk(&self, file_paths: &[&str]) -> Result<()> {
+        let _lock = self.write_lock()?;
         let conn = self.connection()?;
         self.upsert_folders_bulk_conn(&conn, file_paths)
     }
 
+    /// Caller must hold WriteLock.
     pub fn upsert_folders_bulk_conn(
         &self,
         conn: &Connection<'_>,
@@ -41,7 +53,7 @@ impl GraphStore {
         }
 
         // Write Folder nodes to parquet
-        let folder_pq = std::env::temp_dir().join("infigraph_folders.parquet");
+        let folder_pq = unique_tmp_dir().join("infigraph_folders.parquet");
         {
             let ids: Vec<&str> = all_folders.iter().map(|s| s.as_str()).collect();
             let names: Vec<&str> = all_folders
@@ -101,7 +113,7 @@ impl GraphStore {
 
         if copy_ok {
             // Write edge parquet files and COPY FROM
-            let cf_pq = std::env::temp_dir().join("infigraph_contains_folder.parquet");
+            let cf_pq = unique_tmp_dir().join("infigraph_contains_folder.parquet");
             let cf_refs: Vec<(&str, &str)> = cf_pairs
                 .iter()
                 .map(|(a, b)| (a.as_str(), b.as_str()))
@@ -116,7 +128,7 @@ impl GraphStore {
             }
             let _ = std::fs::remove_file(&cf_pq);
 
-            let cfile_pq = std::env::temp_dir().join("infigraph_contains_file.parquet");
+            let cfile_pq = unique_tmp_dir().join("infigraph_contains_file.parquet");
             let cfile_refs: Vec<(&str, &str)> = cfile_pairs
                 .iter()
                 .map(|(a, b)| (a.as_str(), b.as_str()))
@@ -173,9 +185,18 @@ impl GraphStore {
         if extractions.is_empty() {
             return Ok(());
         }
-
+        let _lock = self.write_lock()?;
         let conn = self.connection()?;
-        let tmp = std::env::temp_dir();
+        self.upsert_all_parquet_conn(&conn, extractions)
+    }
+
+    /// Caller must hold WriteLock.
+    pub fn upsert_all_parquet_conn(&self, conn: &Connection<'_>, extractions: &[FileExtraction]) -> Result<()> {
+        if extractions.is_empty() {
+            return Ok(());
+        }
+
+        let tmp = unique_tmp_dir();
 
         let mut known_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
         for e in extractions {

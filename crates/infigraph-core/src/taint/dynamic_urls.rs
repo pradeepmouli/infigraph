@@ -7,6 +7,7 @@ use serde::Serialize;
 use crate::graph::GraphStore;
 use crate::graph::GraphQuery;
 use crate::routes::Route;
+use super::{FuncInfo, SourceCache};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct DynamicUrl {
@@ -41,6 +42,7 @@ static HTTP_CLIENT_PATTERNS: &[(&str, &[&str])] = &[
 ];
 
 pub fn detect_dynamic_urls(store: &GraphStore, root: &Path) -> Result<Vec<DynamicUrl>> {
+    let _lock = store.write_lock()?;
     let conn = store.connection()?;
     let gq = GraphQuery::new(&conn);
 
@@ -81,6 +83,38 @@ pub fn detect_dynamic_urls(store: &GraphStore, root: &Path) -> Result<Vec<Dynami
 
         let func_lines = &lines[start_idx..end_idx];
         let detected = find_urls_in_function(symbol_id, file, *start_line, func_lines, &routes);
+        urls.extend(detected);
+    }
+
+    if !urls.is_empty() {
+        write_calls_service_edges(store, &urls)?;
+    }
+
+    Ok(urls)
+}
+
+pub fn detect_dynamic_urls_with_cache(
+    store: &GraphStore,
+    functions: &[FuncInfo],
+    cache: &SourceCache,
+) -> Result<Vec<DynamicUrl>> {
+    let _lock = store.write_lock()?;
+    let conn = store.connection()?;
+    let gq = GraphQuery::new(&conn);
+    let routes = crate::routes::detect_routes(&gq).unwrap_or_default();
+
+    let mut urls = Vec::new();
+    for func in functions {
+        let lines = match cache.get(&func.file) {
+            Some(l) => l,
+            None => continue,
+        };
+        let start_idx = (func.start_line as usize).saturating_sub(1);
+        let end_idx = (func.end_line as usize).min(lines.len());
+        if start_idx >= end_idx { continue; }
+
+        let func_lines = &lines[start_idx..end_idx];
+        let detected = find_urls_in_function(&func.id, &func.file, func.start_line, func_lines, &routes);
         urls.extend(detected);
     }
 

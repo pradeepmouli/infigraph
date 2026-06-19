@@ -104,6 +104,7 @@ pub(crate) fn cmd_cluster(root: &Path) -> Result<()> {
     prism.init()?;
 
     let store = prism.store().context("graph not initialized")?;
+    let _lock = store.write_lock()?;
     let conn = store.connection()?;
 
     println!("Running Louvain community detection...");

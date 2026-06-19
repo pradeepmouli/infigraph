@@ -25,6 +25,7 @@ pub mod routes;
 pub mod scip;
 pub mod search;
 pub mod security;
+pub mod structured;
 pub mod taint;
 pub mod sequence;
 pub mod viz;
@@ -120,10 +121,15 @@ impl Infigraph {
         // Write all changed files — use CSV bulk load for fresh index or large batches,
         // fall back to per-file UNWIND only for small incremental updates.
         let use_csv = !extractions.is_empty() && (existing_hashes.is_empty() || indexed > 100);
+        let _write_lock = if !extractions.is_empty() {
+            Some(store.write_lock()?)
+        } else {
+            None
+        };
+
         if !extractions.is_empty() {
             if use_csv {
                 if !existing_hashes.is_empty() {
-                    // Incremental bulk: delete old data for changed files before CSV load
                     let conn = store.connection()?;
                     conn.query("BEGIN TRANSACTION")
                         .context("failed to begin delete transaction")?;
@@ -151,9 +157,9 @@ impl Infigraph {
                     conn.query("COMMIT")
                         .context("failed to commit delete transaction")?;
                 }
-                store.upsert_all_parquet(&extractions)?;
+                let conn = store.connection()?;
+                store.upsert_all_parquet_conn(&conn, &extractions)?;
             } else {
-                // Small incremental: per-file UNWIND (overhead acceptable for <100 files)
                 let conn = store.connection()?;
                 conn.query("BEGIN TRANSACTION")
                     .context("failed to begin index transaction")?;
@@ -183,21 +189,18 @@ impl Infigraph {
                 }
                 conn.query("COMMIT")
                     .context("failed to commit index transaction")?;
-                // Folder upsert outside transaction — COPY FROM can't run inside explicit txn
                 let file_paths: Vec<&str> = extractions.iter().map(|e| e.file.as_str()).collect();
                 store.upsert_folders_bulk_conn(&conn, &file_paths)?;
             }
         }
 
-        // Bulk-write folder hierarchy for CSV path — no explicit txn wrapper
-        // because upsert_folders_bulk_conn may use COPY FROM which can't run inside explicit txn
         if use_csv {
             let file_paths: Vec<&str> = extractions.iter().map(|e| e.file.as_str()).collect();
             let conn = store.connection()?;
             store.upsert_folders_bulk_conn(&conn, &file_paths)?;
         }
 
-        // Post-indexing: resolve cross-file call targets using full graph symbol table
+        // resolve runs under the same write lock (creates CALLS/INHERITS edges)
         let resolve_stats = resolve::resolve_calls_incremental(store, &extractions, None)
             .unwrap_or_else(|e| {
                 eprintln!("warning: call resolution failed: {e}");
@@ -209,6 +212,8 @@ impl Infigraph {
                     inherits_resolved: 0,
                 }
             });
+
+        drop(_write_lock);
 
         Ok(IndexResult {
             total_files: total,
@@ -309,6 +314,12 @@ impl Infigraph {
 
         let indexed = extractions.len();
 
+        let _write_lock = if !extractions.is_empty() {
+            Some(store.write_lock()?)
+        } else {
+            None
+        };
+
         if !extractions.is_empty() {
             let conn = store.connection()?;
             conn.query("BEGIN TRANSACTION")
@@ -334,7 +345,8 @@ impl Infigraph {
                 .context("failed to commit batch delete transaction")?;
 
             if indexed > 10 {
-                store.upsert_all_parquet(&extractions)?;
+                let conn = store.connection()?;
+                store.upsert_all_parquet_conn(&conn, &extractions)?;
             } else {
                 let conn = store.connection()?;
                 store.upsert_all_bulk(&conn, &extractions)?;
@@ -356,6 +368,8 @@ impl Infigraph {
                     inherits_resolved: 0,
                 }
             });
+
+        drop(_write_lock);
 
         Ok(IndexResult {
             total_files: paths.len(),

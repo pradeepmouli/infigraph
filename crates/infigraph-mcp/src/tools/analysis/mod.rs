@@ -6,6 +6,7 @@ pub mod diagrams;
 pub mod git;
 pub mod reflection;
 pub mod security;
+pub mod structured;
 pub mod taint;
 
 pub use call_graph::*;
@@ -16,4 +17,5 @@ pub use diagrams::*;
 pub use git::*;
 pub use reflection::*;
 pub use security::*;
+pub use structured::*;
 pub use taint::*;

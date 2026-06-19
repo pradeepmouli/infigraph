@@ -1,15 +1,55 @@
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
+use fs2::FileExt;
 use kuzu::{Connection, Database, SystemConfig};
 
 use super::schema::{CREATE_SCHEMA, MIGRATIONS};
 use super::store_util::escape;
 
+/// RAII guard for exclusive write access to the graph store.
+/// Holds an advisory file lock on `<db_path>.lock`.
+pub struct WriteLock {
+    _file: std::fs::File,
+}
+
+impl WriteLock {
+    fn acquire(lock_path: &Path) -> Result<Self> {
+        if let Some(parent) = lock_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(lock_path)?;
+        file.lock_exclusive()
+            .map_err(|e| anyhow::anyhow!("failed to acquire write lock: {e}"))?;
+        Ok(Self { _file: file })
+    }
+
+    fn try_acquire(lock_path: &Path) -> Result<Option<Self>> {
+        if let Some(parent) = lock_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(lock_path)?;
+        match file.try_lock_exclusive() {
+            Ok(()) => Ok(Some(Self { _file: file })),
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+            Err(e) => Err(anyhow::anyhow!("lock error: {e}")),
+        }
+    }
+}
+
 /// Persistent graph store backed by Kuzu.
 pub struct GraphStore {
     db: Database,
+    lock_path: PathBuf,
 }
 
 impl GraphStore {
@@ -18,11 +58,22 @@ impl GraphStore {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        let lock_path = path.with_extension("lock");
         let db = Database::new(path, SystemConfig::default())
             .map_err(|e| anyhow::anyhow!("failed to open kuzu db: {e}"))?;
-        let store = Self { db };
+        let store = Self { db, lock_path };
         store.init_schema()?;
         Ok(store)
+    }
+
+    /// Acquire exclusive write lock. Blocks until available.
+    pub fn write_lock(&self) -> Result<WriteLock> {
+        WriteLock::acquire(&self.lock_path)
+    }
+
+    /// Try to acquire write lock without blocking. Returns None if already held.
+    pub fn try_write_lock(&self) -> Result<Option<WriteLock>> {
+        WriteLock::try_acquire(&self.lock_path)
     }
 
     fn init_schema(&self) -> Result<()> {
@@ -43,7 +94,13 @@ impl GraphStore {
 
     /// Remove all graph data for a deleted file.
     pub fn remove_file(&self, file: &str) -> Result<()> {
+        let _lock = self.write_lock()?;
         let conn = self.connection()?;
+        self.remove_file_conn(&conn, file)
+    }
+
+    /// Caller must hold WriteLock.
+    pub fn remove_file_conn(&self, conn: &Connection<'_>, file: &str) -> Result<()> {
         let _ = conn.query(&format!(
             "MATCH (f:File)-[:DEFINES]->(s:Symbol)-[:HAS_STATEMENT]->(st:Statement) WHERE f.id = '{}' DETACH DELETE st",
             escape(file)
@@ -101,6 +158,7 @@ impl GraphStore {
 
     /// Get total counts for stats.
     pub fn derive_tested_by_edges(&self) -> Result<usize> {
+        let _lock = self.write_lock()?;
         let conn = self.connection()?;
         let q = super::queries::GraphQuery::new(&conn);
         q.derive_tested_by_edges()

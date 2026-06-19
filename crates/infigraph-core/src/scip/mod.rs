@@ -30,6 +30,7 @@ pub fn import_scip_index(
         .with_context(|| format!("failed to parse SCIP index: {}", index_path.display()))?;
 
     let mut stats = ImportStats::default();
+    let _lock = store.write_lock()?;
     let conn = store.connection()?;
 
     // Load learned pattern store for recording SCIP corrections
