@@ -11,9 +11,12 @@ readme.workspace = true
 description = "Runtime ANTLR grammar plugin system — load .g4 grammars via JVM subprocess"
 
 [dependencies]
-infigraph-core = { path = "../infigraph-core", version = "1.5.2" }
+infigraph-core = { path = "../infigraph-core", version = "1.5.3" }
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
 toml = "0.8"
 dirs-next = "2"
+
+[dev-dependencies]
+tempfile = "3"

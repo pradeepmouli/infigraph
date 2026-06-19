@@ -32,6 +32,25 @@ pub fn load_pipeline_plugins(
     Ok(registry)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_load_pipeline_plugins_empty() {
+        let dir = std::env::temp_dir().join(format!(
+            "infigraph_test_empty_plugins_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let registry = load_pipeline_plugins(Some(&dir)).unwrap();
+        // Project dir is empty so no plugins from it; home dir may contribute
+        // but on clean systems this should be empty
+        assert!(registry.get_plugin("nonexistent").is_none());
+        let _ = std::fs::remove_dir(&dir);
+    }
+}
+
 fn discover_and_register(dir: &Path, registry: &mut PipelinePluginRegistry) -> Result<()> {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,

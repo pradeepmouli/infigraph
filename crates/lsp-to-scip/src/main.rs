@@ -562,3 +562,338 @@ fn lsp_kind_num_to_str(n: u32) -> &'static str {
         _ => "Unknown",
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    // ── lang_extensions ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_lang_extensions_cpp() {
+        let exts = lang_extensions("cpp");
+        assert!(exts.contains(&"cpp"));
+        assert!(exts.contains(&"h"));
+        assert!(exts.contains(&"hpp"));
+    }
+
+    #[test]
+    fn test_lang_extensions_cpp_alias() {
+        assert_eq!(lang_extensions("c++"), lang_extensions("cpp"));
+    }
+
+    #[test]
+    fn test_lang_extensions_zig() {
+        assert_eq!(lang_extensions("zig"), vec!["zig"]);
+    }
+
+    #[test]
+    fn test_lang_extensions_elixir() {
+        let exts = lang_extensions("elixir");
+        assert!(exts.contains(&"ex"));
+        assert!(exts.contains(&"exs"));
+    }
+
+    #[test]
+    fn test_lang_extensions_fsharp_alias() {
+        assert_eq!(lang_extensions("f#"), lang_extensions("fsharp"));
+    }
+
+    #[test]
+    fn test_lang_extensions_unknown() {
+        assert!(lang_extensions("brainfuck").is_empty());
+    }
+
+    // ── symbol_string ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_symbol_string_basic() {
+        let s = symbol_string("src/main.rs", "foo", "Function");
+        assert_eq!(s, "lsp . . . src.main.rs#foo");
+    }
+
+    #[test]
+    fn test_symbol_string_nested_path() {
+        let s = symbol_string("a/b/c.rs", "Bar", "Class");
+        assert_eq!(s, "lsp . . . a.b.c.rs#Bar");
+    }
+
+    // ── lsp_kind_to_scip ────────────────────────────────────────────────
+
+    #[test]
+    fn test_lsp_kind_to_scip_function() {
+        assert_eq!(
+            lsp_kind_to_scip("Function"),
+            symbol_information::Kind::Function
+        );
+    }
+
+    #[test]
+    fn test_lsp_kind_to_scip_method() {
+        assert_eq!(lsp_kind_to_scip("Method"), symbol_information::Kind::Method);
+    }
+
+    #[test]
+    fn test_lsp_kind_to_scip_constructor() {
+        assert_eq!(
+            lsp_kind_to_scip("Constructor"),
+            symbol_information::Kind::Method
+        );
+    }
+
+    #[test]
+    fn test_lsp_kind_to_scip_class() {
+        assert_eq!(lsp_kind_to_scip("Class"), symbol_information::Kind::Class);
+    }
+
+    #[test]
+    fn test_lsp_kind_to_scip_enum() {
+        assert_eq!(lsp_kind_to_scip("Enum"), symbol_information::Kind::Enum);
+    }
+
+    #[test]
+    fn test_lsp_kind_to_scip_enum_member() {
+        assert_eq!(
+            lsp_kind_to_scip("EnumMember"),
+            symbol_information::Kind::Enum
+        );
+    }
+
+    #[test]
+    fn test_lsp_kind_to_scip_struct() {
+        assert_eq!(lsp_kind_to_scip("Struct"), symbol_information::Kind::Struct);
+    }
+
+    #[test]
+    fn test_lsp_kind_to_scip_variable() {
+        assert_eq!(
+            lsp_kind_to_scip("Variable"),
+            symbol_information::Kind::Variable
+        );
+    }
+
+    #[test]
+    fn test_lsp_kind_to_scip_constant() {
+        assert_eq!(
+            lsp_kind_to_scip("Constant"),
+            symbol_information::Kind::Constant
+        );
+    }
+
+    #[test]
+    fn test_lsp_kind_to_scip_trait() {
+        assert_eq!(lsp_kind_to_scip("Trait"), symbol_information::Kind::Trait);
+    }
+
+    #[test]
+    fn test_lsp_kind_to_scip_unknown() {
+        assert_eq!(
+            lsp_kind_to_scip("Banana"),
+            symbol_information::Kind::UnspecifiedKind
+        );
+    }
+
+    // ── lsp_kind_num_to_str ─────────────────────────────────────────────
+
+    #[test]
+    fn test_lsp_kind_num_to_str_known() {
+        assert_eq!(lsp_kind_num_to_str(1), "File");
+        assert_eq!(lsp_kind_num_to_str(5), "Class");
+        assert_eq!(lsp_kind_num_to_str(12), "Function");
+        assert_eq!(lsp_kind_num_to_str(23), "Struct");
+        assert_eq!(lsp_kind_num_to_str(26), "TypeParameter");
+    }
+
+    #[test]
+    fn test_lsp_kind_num_to_str_boundaries() {
+        assert_eq!(lsp_kind_num_to_str(0), "Unknown");
+        assert_eq!(lsp_kind_num_to_str(27), "Unknown");
+        assert_eq!(lsp_kind_num_to_str(999), "Unknown");
+    }
+
+    // ── parse_range ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_range_valid() {
+        let v = serde_json::json!({
+            "start": {"line": 1, "character": 2},
+            "end": {"line": 3, "character": 5}
+        });
+        let r = parse_range(&v).unwrap();
+        assert_eq!(r.start.line, 1);
+        assert_eq!(r.start.character, 2);
+        assert_eq!(r.end.line, 3);
+        assert_eq!(r.end.character, 5);
+    }
+
+    #[test]
+    fn test_parse_range_missing_field() {
+        let v = serde_json::json!({"start": {"line": 0}});
+        assert!(parse_range(&v).is_none());
+    }
+
+    #[test]
+    fn test_parse_range_null() {
+        let v = serde_json::json!(null);
+        assert!(parse_range(&v).is_none());
+    }
+
+    // ── parse_symbol ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_symbol_document_symbol() {
+        let v = serde_json::json!({
+            "name": "myFunc",
+            "kind": 12,
+            "detail": "fn myFunc()",
+            "range": {
+                "start": {"line": 0, "character": 0},
+                "end": {"line": 5, "character": 1}
+            },
+            "selectionRange": {
+                "start": {"line": 0, "character": 3},
+                "end": {"line": 0, "character": 9}
+            }
+        });
+        let sym = parse_symbol(&v).unwrap();
+        assert_eq!(sym.name, "myFunc");
+        assert_eq!(sym.kind, "Function");
+        assert_eq!(sym.detail.as_deref(), Some("fn myFunc()"));
+        assert_eq!(sym.range.start.line, 0);
+        assert_eq!(sym.selection_range.start.character, 3);
+    }
+
+    #[test]
+    fn test_parse_symbol_symbol_information() {
+        let v = serde_json::json!({
+            "name": "MyClass",
+            "kind": 5,
+            "location": {
+                "uri": "file:///tmp/foo.rs",
+                "range": {
+                    "start": {"line": 10, "character": 0},
+                    "end": {"line": 20, "character": 1}
+                }
+            }
+        });
+        let sym = parse_symbol(&v).unwrap();
+        assert_eq!(sym.name, "MyClass");
+        assert_eq!(sym.kind, "Class");
+        assert!(sym.detail.is_none());
+        assert_eq!(sym.range.start.line, 10);
+    }
+
+    #[test]
+    fn test_parse_symbol_missing_name() {
+        let v = serde_json::json!({"kind": 5});
+        assert!(parse_symbol(&v).is_none());
+    }
+
+    #[test]
+    fn test_parse_symbol_missing_range_and_location() {
+        let v = serde_json::json!({"name": "x", "kind": 5});
+        assert!(parse_symbol(&v).is_none());
+    }
+
+    // ── path_to_uri ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_path_to_uri() {
+        let p = Path::new("/tmp/project/src/main.rs");
+        assert_eq!(path_to_uri(p), "file:///tmp/project/src/main.rs");
+    }
+
+    // ── uri_to_rel_path ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_uri_to_rel_path_strips_prefix() {
+        let root = Path::new("/tmp/project");
+        let uri = "file:///tmp/project/src/main.rs";
+        assert_eq!(uri_to_rel_path(uri, root), "src/main.rs");
+    }
+
+    #[test]
+    fn test_uri_to_rel_path_no_file_scheme() {
+        let root = Path::new("/tmp/project");
+        let uri = "/tmp/project/lib.rs";
+        assert_eq!(uri_to_rel_path(uri, root), "lib.rs");
+    }
+
+    #[test]
+    fn test_uri_to_rel_path_outside_root() {
+        let root = Path::new("/tmp/project");
+        let uri = "file:///other/place/foo.rs";
+        assert_eq!(uri_to_rel_path(uri, root), "/other/place/foo.rs");
+    }
+
+    // ── collect_files ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_collect_files_basic() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("main.zig"), "").unwrap();
+        fs::write(root.join("readme.txt"), "").unwrap();
+
+        let files = collect_files(root, &["zig"], 0);
+        assert_eq!(files.len(), 1);
+        assert!(files[0].ends_with("main.zig"));
+    }
+
+    #[test]
+    fn test_collect_files_skips_ignored_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        fs::create_dir(root.join(".git")).unwrap();
+        fs::write(root.join(".git/config.zig"), "").unwrap();
+
+        fs::create_dir(root.join("node_modules")).unwrap();
+        fs::write(root.join("node_modules/dep.zig"), "").unwrap();
+
+        fs::create_dir(root.join("target")).unwrap();
+        fs::write(root.join("target/out.zig"), "").unwrap();
+
+        fs::write(root.join("real.zig"), "").unwrap();
+
+        let files = collect_files(root, &["zig"], 0);
+        assert_eq!(files.len(), 1);
+        assert!(files[0].ends_with("real.zig"));
+    }
+
+    #[test]
+    fn test_collect_files_max_truncates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("a.rs"), "").unwrap();
+        fs::write(root.join("b.rs"), "").unwrap();
+        fs::write(root.join("c.rs"), "").unwrap();
+
+        let files = collect_files(root, &["rs"], 1);
+        assert_eq!(files.len(), 1);
+    }
+
+    #[test]
+    fn test_collect_files_max_zero_no_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("a.rs"), "").unwrap();
+        fs::write(root.join("b.rs"), "").unwrap();
+
+        let files = collect_files(root, &["rs"], 0);
+        assert_eq!(files.len(), 2);
+    }
+
+    #[test]
+    fn test_collect_files_recurses_subdirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "").unwrap();
+
+        let files = collect_files(root, &["rs"], 0);
+        assert_eq!(files.len(), 1);
+        assert!(files[0].ends_with("src/lib.rs"));
+    }
+}

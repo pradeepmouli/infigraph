@@ -227,6 +227,63 @@ col_type = "VARCHAR"
     }
 
     #[test]
+    fn test_to_kuzu_type_all_variants() {
+        let types = vec![
+            ("STRING", "STRING"),
+            ("INT64", "INT64"),
+            ("BOOL", "BOOL"),
+            ("DOUBLE", "DOUBLE"),
+            ("STRING[]", "STRING[]"),
+        ];
+        for (input, expected) in types {
+            let col = ColumnDef {
+                name: "x".to_string(),
+                col_type: input.to_string(),
+            };
+            assert_eq!(col.to_kuzu_type(), expected, "mismatch for {}", input);
+        }
+    }
+
+    #[test]
+    fn test_validate_boundary_plugin_id() {
+        // Exactly 32 chars: 1 leading + 31 trailing = 32 total
+        let id = "a".repeat(32);
+        let toml_str = format!(
+            r#"
+[plugin]
+name = "Boundary"
+plugin_id = "{}"
+command = ["echo"]
+"#,
+            id
+        );
+        let config: PipelinePluginConfig = toml::from_str(&toml_str).unwrap();
+        config.plugin.validate().unwrap();
+    }
+
+    #[test]
+    fn test_generate_ddl_no_columns() {
+        let ddl = generate_ddl("empty", &[]);
+        assert_eq!(
+            ddl,
+            "CREATE NODE TABLE IF NOT EXISTS Pipeline_empty(id STRING, PRIMARY KEY(id))"
+        );
+    }
+
+    #[test]
+    fn test_config_without_dependency_fields() {
+        let toml_str = r#"
+[plugin]
+name = "NoDeps"
+plugin_id = "nodeps"
+command = ["echo"]
+"#;
+        let config: PipelinePluginConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.plugin.dependency_fields.is_none());
+        config.plugin.validate().unwrap();
+    }
+
+    #[test]
     fn test_empty_command() {
         let toml_str = r#"
 [plugin]

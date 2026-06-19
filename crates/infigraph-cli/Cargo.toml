@@ -37,9 +37,9 @@ path = "src/bin/cozo_vs_kuzu.rs"
 [dependencies]
 infigraph-core.workspace = true
 infigraph-languages.workspace = true
-infigraph-grammar-plugin = { path = "../infigraph-grammar-plugin", version = "1.5.2" }
-infigraph-docs = { path = "../infigraph-docs", version = "1.5.2" }
-infigraph-confluence = { path = "../infigraph-confluence", version = "1.5.2" }
+infigraph-grammar-plugin = { path = "../infigraph-grammar-plugin", version = "1.5.3" }
+infigraph-docs = { path = "../infigraph-docs", version = "1.5.3" }
+infigraph-confluence = { path = "../infigraph-confluence", version = "1.5.3" }
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true

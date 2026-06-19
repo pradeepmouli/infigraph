@@ -331,6 +331,74 @@ mod tests {
     }
 
     #[test]
+    fn test_registry_register_and_get() {
+        let toml_str = r#"
+[plugin]
+name = "Test Plugin"
+plugin_id = "testplug"
+command = ["echo"]
+"#;
+        let config: PipelinePluginConfig = toml::from_str(toml_str).unwrap();
+        let driver = PipelinePluginDriver::new(config, std::path::PathBuf::from("."));
+        let mut registry = PipelinePluginRegistry::new();
+        registry.register(driver);
+        assert!(!registry.is_empty());
+        assert_eq!(registry.plugin_ids(), vec!["testplug"]);
+        assert!(registry.get_plugin("testplug").is_some());
+        assert!(registry.get_plugin("nonexistent").is_none());
+    }
+
+    #[test]
+    fn test_pipeline_data_empty_inputs_outputs() {
+        let json = r#"{
+            "core": {
+                "name": "minimal"
+            }
+        }"#;
+        let data: PipelineData = serde_json::from_str(json).unwrap();
+        assert_eq!(data.core.name, "minimal");
+        assert!(data.core.inputs.is_empty());
+        assert!(data.core.outputs.is_empty());
+        assert!(data.properties.is_empty());
+    }
+
+    #[test]
+    fn test_matches_detect_patterns_invalid_regex() {
+        let patterns = vec!["[invalid".to_string()];
+        assert!(!matches_detect_patterns("anything", &patterns));
+    }
+
+    #[test]
+    fn test_pipeline_data_with_properties() {
+        let json = r#"{
+            "core": {
+                "name": "rich",
+                "inputs": ["a"],
+                "outputs": ["b"]
+            },
+            "properties": {
+                "count": 42,
+                "flag": true,
+                "label": "hello"
+            }
+        }"#;
+        let data: PipelineData = serde_json::from_str(json).unwrap();
+        assert_eq!(data.core.name, "rich");
+        assert_eq!(
+            data.properties.get("count").unwrap(),
+            &serde_json::json!(42)
+        );
+        assert_eq!(
+            data.properties.get("flag").unwrap(),
+            &serde_json::json!(true)
+        );
+        assert_eq!(
+            data.properties.get("label").unwrap(),
+            &serde_json::Value::String("hello".to_string())
+        );
+    }
+
+    #[test]
     fn test_detect_patterns() {
         let patterns = vec![r"stage\s*\(".to_string(), r"pipeline\s*\{".to_string()];
 

@@ -13,24 +13,33 @@ fn make_store() -> (TempDir, GraphStore) {
 #[test]
 fn test_lock_released_on_panic() {
     let dir = TempDir::new().unwrap();
-    let db_path = dir.path().join("panic.db");
-    let store = GraphStore::open(&db_path).unwrap();
+    let lock_path = dir.path().join("panic.lock");
 
-    let lock_path = db_path.with_extension("lock");
     let lock_path_clone = lock_path.clone();
-
     let handle = std::thread::spawn(move || {
-        let store2 = GraphStore::open(&db_path).unwrap();
-        let _lock = store2.write_lock().unwrap();
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path_clone)
+            .unwrap();
+        use fs2::FileExt;
+        file.lock_exclusive().unwrap();
         panic!("intentional panic while holding lock");
     });
 
     let _ = handle.join(); // panicked thread
 
-    // Lock should be released — Rust unwinding drops the WriteLock
-    let lock = store.try_write_lock().unwrap();
-    assert!(lock.is_some(), "lock should be released after thread panic");
-    let _ = lock_path_clone;
+    // Lock should be released — Rust unwinding drops the file
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .unwrap();
+    use fs2::FileExt;
+    let result = file.try_lock_exclusive();
+    assert!(result.is_ok(), "lock should be released after thread panic");
 }
 
 #[test]
@@ -106,20 +115,39 @@ fn test_try_lock_timeout_pattern() {
 
 #[test]
 fn test_lock_survives_store_reopen() {
+    // Kuzu locks the DB directory, preventing two Database instances on the same
+    // path (especially on Windows). Test the lock file directly instead.
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("reopen.db");
     let store1 = GraphStore::open(&db_path).unwrap();
     let _lock = store1.write_lock().unwrap();
 
-    let store2 = GraphStore::open(&db_path).unwrap();
-    let result = store2.try_write_lock().unwrap();
-    assert!(result.is_none(), "store2 should see lock held by store1");
+    // Verify lock is held via the lock file directly
+    let lock_path = db_path.with_extension("lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .unwrap();
+    use fs2::FileExt;
+    let result = file.try_lock_exclusive();
+    assert!(result.is_err(), "lock file should be held by store1");
+    drop(file);
 
     drop(_lock);
-    let result = store2.try_write_lock().unwrap();
+
+    // After releasing, a new fd should be able to acquire
+    let file2 = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .unwrap();
+    let result2 = file2.try_lock_exclusive();
     assert!(
-        result.is_some(),
-        "store2 should acquire after store1 releases"
+        result2.is_ok(),
+        "lock should be acquirable after store1 releases"
     );
 }
 

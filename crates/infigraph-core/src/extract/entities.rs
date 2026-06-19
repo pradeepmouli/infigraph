@@ -187,7 +187,12 @@ pub fn extract_entities(
                 end_col: node.end_position().column as u32,
             };
 
-            let signature_hash = hash_node(node, source);
+            let signature_hash = match sym_kind {
+                SymbolKind::Function | SymbolKind::Method | SymbolKind::Test => {
+                    hash_body(node, source)
+                }
+                _ => hash_node(node, source),
+            };
 
             // Find parent class for methods by walking up the AST
             let parent_class = find_parent_class(node, source);
@@ -673,6 +678,22 @@ fn hash_node(node: Node, source: &[u8]) -> String {
     let text = &source[node.byte_range()];
     hasher.update(text);
     format!("{:x}", hasher.finalize())[..16].to_string()
+}
+
+/// Hash only the body of a function/method node, excluding the signature line.
+/// This allows rename detection: two functions with different names but identical
+/// bodies will produce the same hash.
+fn hash_body(node: Node, source: &[u8]) -> String {
+    if let Some(body) = node.child_by_field_name("body") {
+        hash_node(body, source)
+    } else {
+        // Fallback: try "block" field (used by some grammars like Java/C#)
+        if let Some(block) = node.child_by_field_name("block") {
+            hash_node(block, source)
+        } else {
+            hash_node(node, source)
+        }
+    }
 }
 
 /// Strip string delimiters (quotes) from a captured path string.
@@ -1408,5 +1429,64 @@ mod tests {
             "test/foo.xxx",
             "unknown_lang"
         ));
+    }
+
+    #[test]
+    fn test_renamed_function_produces_same_sig_hash() {
+        let grammar = tree_sitter_python::LANGUAGE.into();
+        let src_old = b"def calculate_order_total(items: list) -> float:\n    return sum(i[\"price\"] * i[\"quantity\"] for i in items)\n";
+        let src_new = b"def compute_order_sum(items: list) -> float:\n    return sum(i[\"price\"] * i[\"quantity\"] for i in items)\n";
+
+        let mut parser = Parser::new();
+        parser.set_language(&grammar).unwrap();
+
+        let query = tree_sitter::Query::new(
+            &grammar,
+            "(function_definition name: (identifier) @func.name) @func.def",
+        )
+        .unwrap();
+
+        let tree_old = parser.parse(src_old, None).unwrap();
+        let syms_old = extract_entities("calc.py", src_old, tree_old.root_node(), &query, "python");
+        assert_eq!(syms_old.len(), 1);
+
+        let tree_new = parser.parse(src_new, None).unwrap();
+        let syms_new = extract_entities("calc.py", src_new, tree_new.root_node(), &query, "python");
+        assert_eq!(syms_new.len(), 1);
+
+        assert_eq!(
+            syms_old[0].signature_hash, syms_new[0].signature_hash,
+            "Renamed function with identical body should produce same sig_hash.\n  old: {} ({})\n  new: {} ({})",
+            syms_old[0].name, syms_old[0].signature_hash,
+            syms_new[0].name, syms_new[0].signature_hash,
+        );
+        assert_ne!(syms_old[0].name, syms_new[0].name);
+    }
+
+    #[test]
+    fn test_different_body_produces_different_sig_hash() {
+        let grammar = tree_sitter_python::LANGUAGE.into();
+        let src_a = b"def foo(x):\n    return x + 1\n";
+        let src_b = b"def foo(x):\n    return x * 2\n";
+
+        let mut parser = Parser::new();
+        parser.set_language(&grammar).unwrap();
+
+        let query = tree_sitter::Query::new(
+            &grammar,
+            "(function_definition name: (identifier) @func.name) @func.def",
+        )
+        .unwrap();
+
+        let tree_a = parser.parse(src_a, None).unwrap();
+        let syms_a = extract_entities("a.py", src_a, tree_a.root_node(), &query, "python");
+
+        let tree_b = parser.parse(src_b, None).unwrap();
+        let syms_b = extract_entities("a.py", src_b, tree_b.root_node(), &query, "python");
+
+        assert_ne!(
+            syms_a[0].signature_hash, syms_b[0].signature_hash,
+            "Functions with different bodies should have different sig_hash"
+        );
     }
 }

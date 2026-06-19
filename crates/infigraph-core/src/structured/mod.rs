@@ -577,4 +577,209 @@ node_table = "TGNode"
         assert_eq!(cozo_ingest::format_cozo_value("STRING", None), "\"\"");
         assert_eq!(cozo_ingest::format_cozo_value("INT64", None), "0");
     }
+
+    #[test]
+    fn test_ingest_data_empty_batch() {
+        let (_dir, store) = kuzu_conn();
+        let conn = store.connection().unwrap();
+        let schema = simple_schema();
+
+        let data: Vec<serde_json::Value> = vec![];
+        let result = ingest_data(&conn, &schema, &data).unwrap();
+        assert_eq!(result.nodes_created, 0);
+        assert_eq!(result.edges_created, 0);
+    }
+
+    #[test]
+    fn test_discover_schemas_neither_dir_exists() {
+        let dir = tempfile::TempDir::new().unwrap();
+        // temp dir has no .infigraph or .terragraph subdirs
+        let result = discover_schemas(dir.path());
+        assert!(result.is_ok(), "should not error on missing schema dirs");
+        // cannot assert empty — ~/.infigraph/structured-schemas may exist on host
+        let schemas = result.unwrap();
+        for (path, _) in &schemas {
+            assert!(
+                !path.starts_with(dir.path()),
+                "should not find schemas under temp dir"
+            );
+        }
+    }
+
+    #[test]
+    fn test_schema_with_searchable_fields() {
+        let (_dir, store) = kuzu_conn();
+        let conn = store.connection().unwrap();
+
+        let schema = SchemaMeta {
+            schema_id: "searchable".to_string(),
+            name: "Searchable".to_string(),
+            node_table: "SearchNode".to_string(),
+            columns: vec![
+                ColumnDef {
+                    name: "title".to_string(),
+                    col_type: "STRING".to_string(),
+                    required: true,
+                },
+                ColumnDef {
+                    name: "body".to_string(),
+                    col_type: "STRING".to_string(),
+                    required: false,
+                },
+            ],
+            edges: vec![],
+            searchable_fields: vec!["title".to_string(), "body".to_string()],
+            id_template: Some("search_{sid}".to_string()),
+        };
+
+        let data = vec![
+            serde_json::json!({"sid": "S1", "title": "Hello", "body": "World"}),
+            serde_json::json!({"sid": "S2", "title": "Foo"}),
+        ];
+
+        let result = ingest_data(&conn, &schema, &data).unwrap();
+        assert_eq!(result.nodes_created, 2);
+    }
+
+    #[test]
+    fn test_ingest_data_duplicate_id_error() {
+        let (_dir, store) = kuzu_conn();
+        let conn = store.connection().unwrap();
+        let schema = simple_schema();
+
+        let data1 = vec![serde_json::json!({"item_id": "DUP", "title": "Original", "priority": 1})];
+        ingest_data(&conn, &schema, &data1).unwrap();
+
+        // CREATE with same PK should error — no upsert semantics
+        let data2 = vec![serde_json::json!({"item_id": "DUP", "title": "Updated", "priority": 9})];
+        let result = ingest_data(&conn, &schema, &data2);
+        assert!(
+            result.is_err(),
+            "duplicate id should error (CREATE, not MERGE)"
+        );
+    }
+
+    #[test]
+    fn test_edge_with_properties() {
+        let (_dir, store) = kuzu_conn();
+        let conn = store.connection().unwrap();
+
+        let schema = SchemaMeta {
+            schema_id: "prop_edge".to_string(),
+            name: "PropEdge".to_string(),
+            node_table: "PropNode".to_string(),
+            columns: vec![ColumnDef {
+                name: "label".to_string(),
+                col_type: "STRING".to_string(),
+                required: false,
+            }],
+            edges: vec![EdgeDef {
+                name: "RELATES".to_string(),
+                from_table: "PropNode".to_string(),
+                to_table: "PropNode".to_string(),
+                properties: vec![
+                    ColumnDef {
+                        name: "weight".to_string(),
+                        col_type: "INT64".to_string(),
+                        required: false,
+                    },
+                    ColumnDef {
+                        name: "note".to_string(),
+                        col_type: "STRING".to_string(),
+                        required: false,
+                    },
+                ],
+                source_field: "relates_to".to_string(),
+                target_lookup: None,
+            }],
+            searchable_fields: vec![],
+            id_template: None,
+        };
+
+        let data = vec![
+            serde_json::json!({"id": "p2", "label": "Target"}),
+            serde_json::json!({"id": "p1", "label": "Source", "relates_to": ["p2"], "weight": 5, "note": "important"}),
+        ];
+
+        let result = ingest_data(&conn, &schema, &data).unwrap();
+        assert_eq!(result.nodes_created, 2);
+        assert_eq!(result.edges_created, 1);
+
+        // verify edge properties persisted
+        let qr = conn
+            .query("MATCH (a:PropNode)-[r:RELATES]->(b:PropNode) RETURN r.weight, r.note")
+            .unwrap();
+        let rows: Vec<_> = qr.collect();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0][0].to_string().contains("5"));
+    }
+
+    #[test]
+    fn test_ingest_directory_yaml_files() {
+        let (_dir, store) = kuzu_conn();
+        let conn = store.connection().unwrap();
+        let schema = simple_schema();
+
+        let data_dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            data_dir.path().join("batch1.yaml"),
+            "- item_id: Y1\n  title: Yaml One\n  priority: 1\n",
+        )
+        .unwrap();
+        std::fs::write(
+            data_dir.path().join("batch2.yml"),
+            "- item_id: Y2\n  title: Yml Two\n  priority: 2\n- item_id: Y3\n  title: Yml Three\n  priority: 3\n",
+        )
+        .unwrap();
+        // non-data file should be ignored
+        std::fs::write(data_dir.path().join("readme.txt"), "ignore me").unwrap();
+
+        let result = ingest_directory(&conn, &schema, data_dir.path()).unwrap();
+        assert_eq!(result.nodes_created, 3);
+    }
+
+    #[test]
+    fn test_discover_schemas_both_dirs_present() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        let infigraph_dir = dir.path().join(".infigraph/structured-schemas");
+        std::fs::create_dir_all(&infigraph_dir).unwrap();
+        std::fs::write(
+            infigraph_dir.join("alpha.toml"),
+            r#"
+[schema]
+schema_id = "alpha"
+name = "Alpha"
+node_table = "AlphaNode"
+"#,
+        )
+        .unwrap();
+
+        let terragraph_dir = dir.path().join(".terragraph/schemas");
+        std::fs::create_dir_all(&terragraph_dir).unwrap();
+        std::fs::write(
+            terragraph_dir.join("beta.toml"),
+            r#"
+[schema]
+schema_id = "beta"
+name = "Beta"
+node_table = "BetaNode"
+"#,
+        )
+        .unwrap();
+
+        let schemas = discover_schemas(dir.path()).unwrap();
+        let ids: Vec<&str> = schemas
+            .iter()
+            .map(|(_, s)| s.schema.schema_id.as_str())
+            .collect();
+        assert!(
+            ids.contains(&"alpha"),
+            "should find schema from .infigraph dir"
+        );
+        assert!(
+            ids.contains(&"beta"),
+            "should find schema from .terragraph dir"
+        );
+    }
 }

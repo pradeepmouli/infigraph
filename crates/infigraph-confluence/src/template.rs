@@ -783,4 +783,147 @@ https://github.intuit.com/tax-data/w2-metrics-pipeline
             "Should return None when no sections found"
         );
     }
+
+    #[test]
+    fn test_extract_sources_basic() {
+        let text = "Source table: `analytics_src.user_events`\nSchema: billing_dm.invoice_lines";
+        let result = extract_sources(text);
+        assert!(
+            result.contains("analytics_src.user_events"),
+            "got: {}",
+            result
+        );
+        assert!(
+            result.contains("billing_dm.invoice_lines"),
+            "got: {}",
+            result
+        );
+    }
+
+    #[test]
+    fn test_extract_tables_basic() {
+        let text =
+            "### reporting_rpt.daily_summary\nSummary table.\n\nAlso uses `warehouse.dim_date`";
+        let result = extract_tables(text);
+        assert!(
+            result.contains("reporting_rpt.daily_summary"),
+            "got: {}",
+            result
+        );
+        assert!(result.contains("warehouse.dim_date"), "got: {}", result);
+    }
+
+    #[test]
+    fn test_extract_scheduler_airflow() {
+        let text = "Scheduled via Airflow DAG `etl_daily_dag`, runs at 3am UTC.";
+        let (stype, config) = extract_scheduler(text);
+        assert_eq!(stype, "Airflow");
+        assert!(config.contains("3am UTC"), "got: {}", config);
+    }
+
+    #[test]
+    fn test_extract_scheduler_none() {
+        let text = "Runs on an internal platform with no specific tooling mentioned.";
+        let (stype, _config) = extract_scheduler(text);
+        assert_eq!(stype, "unknown");
+    }
+
+    #[test]
+    fn test_extract_daci_basic() {
+        let text = "**Driver:** Jane\n**Approver:** John\n**Contributor:** Sarah, Mike\n**Informed:** Ops Team";
+        let result = extract_daci(text);
+        assert!(result.contains("Driver: Jane"), "got: {}", result);
+        assert!(result.contains("Approver: John"), "got: {}", result);
+        assert!(
+            result.contains("Contributor: Sarah, Mike"),
+            "got: {}",
+            result
+        );
+        assert!(result.contains("Informed: Ops Team"), "got: {}", result);
+    }
+
+    #[test]
+    fn test_extract_github_repo() {
+        let text = "Code lives at https://github.com/org/data-pipeline and is reviewed weekly.";
+        let result = extract_github_repo(text);
+        assert_eq!(result, "https://github.com/org/data-pipeline");
+    }
+
+    #[test]
+    fn test_needs_llm_fallback_complete() {
+        let record = PipelineRecord {
+            id: "pipeline::full".to_string(),
+            name: "Full".to_string(),
+            doc_id: "doc::full".to_string(),
+            source_systems: "src.table_a".to_string(),
+            dest_tables: "dst.table_b".to_string(),
+            scheduler_type: "Airflow".to_string(),
+            scheduler_config: "daily".to_string(),
+            github_repo: "https://github.com/org/repo".to_string(),
+            daci: "Driver: X".to_string(),
+            business_logic_summary: "Aggregates data.".to_string(),
+            ..Default::default()
+        };
+        let missing = needs_llm_fallback(&record);
+        assert!(
+            missing.is_empty(),
+            "expected no missing, got: {:?}",
+            missing
+        );
+    }
+
+    #[test]
+    fn test_needs_llm_fallback_missing_fields() {
+        let record = PipelineRecord {
+            id: "pipeline::empty".to_string(),
+            name: "Empty".to_string(),
+            doc_id: "doc::empty".to_string(),
+            ..Default::default()
+        };
+        let missing = needs_llm_fallback(&record);
+        assert!(missing.contains(&"source_systems"));
+        assert!(missing.contains(&"dest_tables"));
+        assert!(missing.contains(&"github_repo"));
+        assert!(missing.contains(&"daci"));
+        assert!(missing.contains(&"business_logic_summary"));
+    }
+
+    #[test]
+    fn test_parse_pipeline_template_empty_html() {
+        let content = "# Empty Pipeline\n\n## Overview\nNothing here.\n";
+        let result = parse_pipeline_template(content, "Empty", "doc::e");
+        match result {
+            Some(r) => {
+                assert_eq!(r.name, "Empty");
+                assert!(r.source_systems.is_empty());
+                assert!(r.dest_tables.is_empty());
+                assert!(r.github_repo.is_empty());
+            }
+            None => panic!("Expected Some with Overview section parsed"),
+        }
+    }
+
+    #[test]
+    fn test_crawl_options_custom_values() {
+        use crate::sync::CrawlOptions;
+
+        let opts = CrawlOptions {
+            follow_links: true,
+            follow_depth: 3,
+            max_pages: 50,
+            same_space_only: false,
+        };
+        assert_eq!(opts.follow_depth, 3);
+        assert_eq!(opts.max_pages, 50);
+        assert!(!opts.same_space_only);
+        assert!(opts.follow_links);
+
+        let default = CrawlOptions::default_follow();
+        assert_eq!(default.follow_depth, 1);
+        assert_eq!(default.max_pages, 100);
+
+        let no = CrawlOptions::no_follow();
+        assert!(!no.follow_links);
+        assert_eq!(no.follow_depth, 0);
+    }
 }

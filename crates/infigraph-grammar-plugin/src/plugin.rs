@@ -264,3 +264,181 @@ fn parse_relation_kind(s: &str) -> RelationKind {
         _ => RelationKind::Calls,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_symbol_kind_all_variants() {
+        assert_eq!(parse_symbol_kind("Function"), SymbolKind::Function);
+        assert_eq!(parse_symbol_kind("Method"), SymbolKind::Method);
+        assert_eq!(parse_symbol_kind("Class"), SymbolKind::Class);
+        assert_eq!(parse_symbol_kind("Struct"), SymbolKind::Struct);
+        assert_eq!(parse_symbol_kind("Interface"), SymbolKind::Interface);
+        assert_eq!(parse_symbol_kind("Trait"), SymbolKind::Trait);
+        assert_eq!(parse_symbol_kind("Enum"), SymbolKind::Enum);
+        assert_eq!(parse_symbol_kind("Module"), SymbolKind::Module);
+        assert_eq!(parse_symbol_kind("Variable"), SymbolKind::Variable);
+        assert_eq!(parse_symbol_kind("Constant"), SymbolKind::Constant);
+        assert_eq!(parse_symbol_kind("Test"), SymbolKind::Test);
+        assert_eq!(parse_symbol_kind("Section"), SymbolKind::Section);
+        assert_eq!(parse_symbol_kind("Route"), SymbolKind::Route);
+        assert_eq!(parse_symbol_kind("Field"), SymbolKind::Field);
+    }
+
+    #[test]
+    fn test_parse_symbol_kind_unknown_defaults() {
+        assert_eq!(parse_symbol_kind("unknown_kind"), SymbolKind::Function);
+        assert_eq!(parse_symbol_kind(""), SymbolKind::Function);
+    }
+
+    #[test]
+    fn test_parse_relation_kind_all_variants() {
+        assert_eq!(parse_relation_kind("Calls"), RelationKind::Calls);
+        assert_eq!(parse_relation_kind("Imports"), RelationKind::Imports);
+        assert_eq!(parse_relation_kind("Inherits"), RelationKind::Inherits);
+        assert_eq!(parse_relation_kind("Implements"), RelationKind::Implements);
+        assert_eq!(parse_relation_kind("Contains"), RelationKind::Contains);
+        assert_eq!(parse_relation_kind("Reads"), RelationKind::Reads);
+        assert_eq!(parse_relation_kind("Writes"), RelationKind::Writes);
+    }
+
+    #[test]
+    fn test_parse_relation_kind_unknown_defaults() {
+        assert_eq!(parse_relation_kind("unknown_rel"), RelationKind::Calls);
+        assert_eq!(parse_relation_kind(""), RelationKind::Calls);
+    }
+
+    #[test]
+    fn test_plugin_config_deserialize() {
+        let toml_str = r#"
+[language]
+name = "cobol"
+extensions = [".cob", ".cbl"]
+entry_rule = "program"
+lexer = "CobolLexer.g4"
+parser = "CobolParser.g4"
+extractor = "CobolExtractor"
+"#;
+        let config: GrammarPluginConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.language.name, "cobol");
+        assert_eq!(config.language.extensions, vec![".cob", ".cbl"]);
+        assert_eq!(config.language.entry_rule, "program");
+        assert_eq!(config.language.lexer, "CobolLexer.g4");
+        assert_eq!(config.language.parser, "CobolParser.g4");
+        assert_eq!(config.language.extractor, "CobolExtractor");
+    }
+
+    #[test]
+    fn test_plugin_config_optional_fields() {
+        let toml_str = r#"
+[language]
+name = "plsql"
+extensions = [".sql"]
+entry_rule = "compilation_unit"
+lexer = "PlSqlLexer.g4"
+parser = "PlSqlParser.g4"
+extractor = "PlSqlExtractor"
+"#;
+        let config: GrammarPluginConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.language.preprocessor.is_none());
+        assert!(!config.language.emit_referenced_form_imports);
+    }
+
+    #[test]
+    fn test_plugin_config_with_all_fields() {
+        let toml_str = r#"
+[language]
+name = "vb6"
+extensions = [".frm", ".bas", ".cls"]
+entry_rule = "startRule"
+lexer = "VisualBasic6Lexer.g4"
+parser = "VisualBasic6Parser.g4"
+preprocessor = "Vb6Preprocessor"
+extractor = "Vb6Extractor"
+emit_referenced_form_imports = true
+"#;
+        let config: GrammarPluginConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            config.language.preprocessor.as_deref(),
+            Some("Vb6Preprocessor")
+        );
+        assert_eq!(config.language.extractor, "Vb6Extractor");
+        assert!(config.language.emit_referenced_form_imports);
+    }
+
+    #[test]
+    fn test_discover_plugins_empty_dir() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let plugins = discover_plugins(dir.path()).unwrap();
+        assert!(plugins.is_empty());
+    }
+
+    #[test]
+    fn test_discover_plugins_finds_plugin_toml() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let plugin_dir = dir.path().join("my-grammar");
+        std::fs::create_dir(&plugin_dir).unwrap();
+        std::fs::write(
+            plugin_dir.join("plugin.toml"),
+            r#"
+[language]
+name = "test-lang"
+extensions = [".tst"]
+entry_rule = "start"
+lexer = "TestLexer.g4"
+parser = "TestParser.g4"
+extractor = "TestExtractor"
+"#,
+        )
+        .unwrap();
+        std::fs::write(plugin_dir.join("TestLexer.g4"), "").unwrap();
+        std::fs::write(plugin_dir.join("TestParser.g4"), "").unwrap();
+        let plugins = discover_plugins(dir.path()).unwrap();
+        assert_eq!(plugins.len(), 1);
+        assert_eq!(plugins[0].0.language.name, "test-lang");
+    }
+
+    #[test]
+    fn test_discover_plugins_skips_missing_grammar_files() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let plugin_dir = dir.path().join("no-grammar");
+        std::fs::create_dir(&plugin_dir).unwrap();
+        std::fs::write(
+            plugin_dir.join("plugin.toml"),
+            r#"
+[language]
+name = "missing"
+extensions = [".miss"]
+entry_rule = "start"
+lexer = "Missing.g4"
+parser = "MissingParser.g4"
+extractor = "X"
+"#,
+        )
+        .unwrap();
+        let plugins = discover_plugins(dir.path()).unwrap();
+        assert!(plugins.is_empty());
+    }
+
+    #[test]
+    fn test_project_config_deserialize() {
+        let toml_str = r#"
+[preprocessor]
+defines = ["WIN32", "DEBUG"]
+include_paths = ["/usr/include", "./vendor"]
+"#;
+        let config: ProjectConfig = toml::from_str(toml_str).unwrap();
+        let pp = config.preprocessor.unwrap();
+        assert_eq!(pp.defines, vec!["WIN32", "DEBUG"]);
+        assert_eq!(pp.include_paths, vec!["/usr/include", "./vendor"]);
+    }
+
+    #[test]
+    fn test_project_config_no_preprocessor() {
+        let toml_str = "";
+        let config: ProjectConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.preprocessor.is_none());
+    }
+}
