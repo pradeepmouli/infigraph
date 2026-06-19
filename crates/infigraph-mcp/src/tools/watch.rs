@@ -15,8 +15,7 @@ pub struct WatcherEntry {
 
 pub static WATCHERS: Mutex<Option<HashMap<String, WatcherEntry>>> = Mutex::new(None);
 
-pub fn get_watchers() -> std::sync::MutexGuard<'static, Option<HashMap<String, WatcherEntry>>>
-{
+pub fn get_watchers() -> std::sync::MutexGuard<'static, Option<HashMap<String, WatcherEntry>>> {
     WATCHERS.lock().unwrap()
 }
 

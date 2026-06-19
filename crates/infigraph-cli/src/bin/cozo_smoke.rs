@@ -21,13 +21,15 @@ fn main() {
         ":create calls {caller: String, callee: String}",
         Default::default(),
         cozo::ScriptMutability::Mutable,
-    ).expect("create calls");
+    )
+    .expect("create calls");
 
     db.run_script(
         ":create defines {file_id: String, symbol_id: String}",
         Default::default(),
         cozo::ScriptMutability::Mutable,
-    ).expect("create defines");
+    )
+    .expect("create defines");
 
     // Insert test data
     let params: BTreeMap<String, cozo::DataValue> = BTreeMap::new();
@@ -51,7 +53,8 @@ fn main() {
         :put file {id => name, path, language, symbol_count}"#,
         params.clone(),
         cozo::ScriptMutability::Mutable,
-    ).expect("insert files");
+    )
+    .expect("insert files");
 
     db.run_script(
         r#"?[file_id, symbol_id] <- [
@@ -62,7 +65,8 @@ fn main() {
         :put defines {file_id, symbol_id}"#,
         params.clone(),
         cozo::ScriptMutability::Mutable,
-    ).expect("insert defines");
+    )
+    .expect("insert defines");
 
     db.run_script(
         r#"?[caller, callee] <- [
@@ -73,17 +77,20 @@ fn main() {
         :put calls {caller, callee}"#,
         params.clone(),
         cozo::ScriptMutability::Mutable,
-    ).expect("insert calls");
+    )
+    .expect("insert calls");
 
     // Query 1: symbols_in_file
-    let r = db.run_script(
-        r#"?[id, name, kind, start_line, end_line] :=
+    let r = db
+        .run_script(
+            r#"?[id, name, kind, start_line, end_line] :=
             *defines{file_id: "src/main.rs", symbol_id: id},
             *symbol{id, name, kind, start_line, end_line}
         :order start_line"#,
-        params.clone(),
-        cozo::ScriptMutability::Immutable,
-    ).expect("symbols_in_file");
+            params.clone(),
+            cozo::ScriptMutability::Immutable,
+        )
+        .expect("symbols_in_file");
     println!("=== symbols_in_file(src/main.rs) ===");
     println!("headers: {:?}", r.headers);
     for row in &r.rows {
@@ -91,48 +98,56 @@ fn main() {
     }
 
     // Query 2: callers_of(sym_b)
-    let r = db.run_script(
-        r#"?[caller_id] := *calls{caller: caller_id, callee: "sym_b"}"#,
-        params.clone(),
-        cozo::ScriptMutability::Immutable,
-    ).expect("callers_of");
+    let r = db
+        .run_script(
+            r#"?[caller_id] := *calls{caller: caller_id, callee: "sym_b"}"#,
+            params.clone(),
+            cozo::ScriptMutability::Immutable,
+        )
+        .expect("callers_of");
     println!("\n=== callers_of(sym_b) ===");
     for row in &r.rows {
         println!("  {:?}", row);
     }
 
     // Query 3: callees_of(sym_a)
-    let r = db.run_script(
-        r#"?[callee_id] := *calls{caller: "sym_a", callee: callee_id}"#,
-        params.clone(),
-        cozo::ScriptMutability::Immutable,
-    ).expect("callees_of");
+    let r = db
+        .run_script(
+            r#"?[callee_id] := *calls{caller: "sym_a", callee: callee_id}"#,
+            params.clone(),
+            cozo::ScriptMutability::Immutable,
+        )
+        .expect("callees_of");
     println!("\n=== callees_of(sym_a) ===");
     for row in &r.rows {
         println!("  {:?}", row);
     }
 
     // Query 4: find_symbol_by_id(sym_c)
-    let r = db.run_script(
-        r#"?[id, name, kind, file, start_line, end_line] :=
+    let r = db
+        .run_script(
+            r#"?[id, name, kind, file, start_line, end_line] :=
             id = "sym_c",
             *symbol{id, name, kind, file, start_line, end_line}"#,
-        params.clone(),
-        cozo::ScriptMutability::Immutable,
-    ).expect("find_symbol_by_id");
+            params.clone(),
+            cozo::ScriptMutability::Immutable,
+        )
+        .expect("find_symbol_by_id");
     println!("\n=== find_symbol_by_id(sym_c) ===");
     for row in &r.rows {
         println!("  {:?}", row);
     }
 
     // Query 5: transitive callers (recursive) — who transitively calls sym_b?
-    let r = db.run_script(
-        r#"reaches[caller] := *calls{caller, callee: "sym_b"}
+    let r = db
+        .run_script(
+            r#"reaches[caller] := *calls{caller, callee: "sym_b"}
         reaches[caller] := *calls{caller, callee}, reaches[callee]
         ?[caller] := reaches[caller]"#,
-        params.clone(),
-        cozo::ScriptMutability::Immutable,
-    ).expect("transitive callers");
+            params.clone(),
+            cozo::ScriptMutability::Immutable,
+        )
+        .expect("transitive callers");
     println!("\n=== transitive_impact(sym_b) ===");
     for row in &r.rows {
         println!("  {:?}", row);

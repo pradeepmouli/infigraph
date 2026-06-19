@@ -151,7 +151,11 @@ impl PipelinePluginDriver {
                     .get("message")
                     .and_then(|v| v.as_str())
                     .unwrap_or("unknown error");
-                bail!("Plugin '{}' returned error: {}", self.config.plugin.plugin_id, msg);
+                bail!(
+                    "Plugin '{}' returned error: {}",
+                    self.config.plugin.plugin_id,
+                    msg
+                );
             }
             other => {
                 bail!(
@@ -308,10 +312,7 @@ mod tests {
             data.properties.get("stage_name").unwrap(),
             &serde_json::Value::String("compile".to_string())
         );
-        assert_eq!(
-            data.properties.get("order").unwrap(),
-            &serde_json::json!(1)
-        );
+        assert_eq!(data.properties.get("order").unwrap(), &serde_json::json!(1));
     }
 
     #[test]
@@ -331,10 +332,7 @@ mod tests {
 
     #[test]
     fn test_detect_patterns() {
-        let patterns = vec![
-            r"stage\s*\(".to_string(),
-            r"pipeline\s*\{".to_string(),
-        ];
+        let patterns = vec![r"stage\s*\(".to_string(), r"pipeline\s*\{".to_string()];
 
         assert!(matches_detect_patterns("  stage ( foo )", &patterns));
         assert!(matches_detect_patterns("pipeline {", &patterns));

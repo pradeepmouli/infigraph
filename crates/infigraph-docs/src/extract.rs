@@ -109,19 +109,35 @@ fn extract_pdf(path: &Path, bytes: &[u8]) -> Result<(String, Option<String>, Opt
                 match doc.extract_text(i) {
                     Ok(text) => pages_text.push(text),
                     Err(e) => {
-                        eprintln!("warning: PDF page {} extraction failed in {}: {e}", i + 1, path.display());
+                        eprintln!(
+                            "warning: PDF page {} extraction failed in {}: {e}",
+                            i + 1,
+                            path.display()
+                        );
                     }
                 }
             }
             let text = pages_text.join("\n");
-            let title = text.lines().next().map(|l| l.trim().to_string()).filter(|t| !t.is_empty());
-            let count = if page_count > 0 { Some(page_count) } else { None };
+            let title = text
+                .lines()
+                .next()
+                .map(|l| l.trim().to_string())
+                .filter(|t| !t.is_empty());
+            let count = if page_count > 0 {
+                Some(page_count)
+            } else {
+                None
+            };
             Ok((text, title, count))
         }
         Err(_) => {
             let text = String::from_utf8_lossy(bytes);
             if text.is_ascii() && text.len() > 10 {
-                let title = text.lines().next().map(|l| l.trim().to_string()).filter(|t| !t.is_empty());
+                let title = text
+                    .lines()
+                    .next()
+                    .map(|l| l.trim().to_string())
+                    .filter(|t| !t.is_empty());
                 Ok((text.into_owned(), title, None))
             } else {
                 anyhow::bail!("PDF extraction failed: {}", path.display())

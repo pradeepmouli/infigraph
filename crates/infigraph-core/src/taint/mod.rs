@@ -25,10 +25,7 @@ pub struct FuncInfo {
     pub end_line: u32,
 }
 
-pub fn build_source_cache(
-    store: &GraphStore,
-    root: &Path,
-) -> Result<(Vec<FuncInfo>, SourceCache)> {
+pub fn build_source_cache(store: &GraphStore, root: &Path) -> Result<(Vec<FuncInfo>, SourceCache)> {
     let conn = store.connection()?;
     let result = conn
         .query("MATCH (s:Symbol) WHERE s.kind IN ['Function', 'Method', 'Test'] AND s.file IS NOT NULL RETURN s.id, s.file, s.start_line, s.end_line")
@@ -37,14 +34,21 @@ pub fn build_source_cache(
     let mut functions = Vec::new();
     let mut files_needed: HashSet<String> = HashSet::new();
     for row in result {
-        if row.len() < 4 { continue; }
+        if row.len() < 4 {
+            continue;
+        }
         let id = row[0].to_string();
         let file = row[1].to_string();
         let start: u32 = row[2].to_string().parse().unwrap_or(0);
         let end: u32 = row[3].to_string().parse().unwrap_or(0);
         if start > 0 && end > start {
             files_needed.insert(file.clone());
-            functions.push(FuncInfo { id, file, start_line: start, end_line: end });
+            functions.push(FuncInfo {
+                id,
+                file,
+                start_line: start,
+                end_line: end,
+            });
         }
     }
 
@@ -147,7 +151,9 @@ pub fn detect_taint_flows_with_cache(
         };
         let start_idx = (func.start_line as usize).saturating_sub(1);
         let end_idx = (func.end_line as usize).min(lines.len());
-        if start_idx >= end_idx { continue; }
+        if start_idx >= end_idx {
+            continue;
+        }
 
         let func_lines = &lines[start_idx..end_idx];
         let flows = analyze_function(&func.id, &func.file, func.start_line, func_lines);
@@ -161,7 +167,12 @@ pub fn detect_taint_flows_with_cache(
     Ok(all_flows)
 }
 
-fn analyze_function(symbol_id: &str, file: &str, base_line: u32, lines: &[String]) -> Vec<TaintFlow> {
+fn analyze_function(
+    symbol_id: &str,
+    file: &str,
+    base_line: u32,
+    lines: &[String],
+) -> Vec<TaintFlow> {
     let mut tainted: HashMap<String, TaintInfo> = HashMap::new();
     let mut flows = Vec::new();
 
@@ -175,12 +186,15 @@ fn analyze_function(symbol_id: &str, file: &str, base_line: u32, lines: &[String
             for &pattern in source.patterns {
                 if lower.contains(&pattern.to_lowercase()) {
                     if let Some(var) = extract_lhs(trimmed) {
-                        tainted.insert(var.clone(), TaintInfo {
-                            source_kind: source.kind.to_string(),
-                            source_line: line_no,
-                            path: vec![format!("L{}: {} <- {}", line_no, var, source.kind)],
-                            original_var: var,
-                        });
+                        tainted.insert(
+                            var.clone(),
+                            TaintInfo {
+                                source_kind: source.kind.to_string(),
+                                source_line: line_no,
+                                path: vec![format!("L{}: {} <- {}", line_no, var, source.kind)],
+                                original_var: var,
+                            },
+                        );
                     }
                 }
             }
@@ -194,12 +208,15 @@ fn analyze_function(symbol_id: &str, file: &str, base_line: u32, lines: &[String
                 if rhs_lower.contains(&tvar.to_lowercase()) {
                     let mut new_path = info.path.clone();
                     new_path.push(format!("L{}: {} = ...{}...", line_no, lhs, tvar));
-                    tainted.insert(lhs.clone(), TaintInfo {
-                        source_kind: info.source_kind.clone(),
-                        source_line: info.source_line,
-                        path: new_path,
-                        original_var: info.original_var.clone(),
-                    });
+                    tainted.insert(
+                        lhs.clone(),
+                        TaintInfo {
+                            source_kind: info.source_kind.clone(),
+                            source_line: info.source_line,
+                            path: new_path,
+                            original_var: info.original_var.clone(),
+                        },
+                    );
                     propagated = true;
                     break;
                 }
@@ -223,7 +240,10 @@ fn analyze_function(symbol_id: &str, file: &str, base_line: u32, lines: &[String
                     let sink_vars = extract_args_from_call(trimmed);
                     for svar in &sink_vars {
                         if let Some(info) = tainted.get(&svar.to_lowercase()).or_else(|| {
-                            tainted.iter().find(|(k, _)| svar.to_lowercase().contains(&k.to_lowercase())).map(|(_, v)| v)
+                            tainted
+                                .iter()
+                                .find(|(k, _)| svar.to_lowercase().contains(&k.to_lowercase()))
+                                .map(|(_, v)| v)
                         }) {
                             let sanitized = is_sanitized_nearby(lines, offset, sink.category);
                             let sanitizer = if sanitized {
@@ -233,7 +253,13 @@ fn analyze_function(symbol_id: &str, file: &str, base_line: u32, lines: &[String
                             };
 
                             let mut path = info.path.clone();
-                            path.push(format!("L{}: {}({}) [SINK: {}]", line_no, pattern.trim_end_matches('('), svar, sink.kind));
+                            path.push(format!(
+                                "L{}: {}({}) [SINK: {}]",
+                                line_no,
+                                pattern.trim_end_matches('('),
+                                svar,
+                                sink.kind
+                            ));
 
                             flows.push(TaintFlow {
                                 symbol_id: symbol_id.to_string(),
@@ -332,7 +358,9 @@ fn extract_args_from_call(line: &str) -> Vec<String> {
         if let Some(close) = lower[i..].find(')') {
             let inner = &line[i + 1..i + close];
             for arg in inner.split(',') {
-                let arg = arg.trim().trim_matches(|c: char| c == '"' || c == '\'' || c == '`');
+                let arg = arg
+                    .trim()
+                    .trim_matches(|c: char| c == '"' || c == '\'' || c == '`');
                 let var = arg.split('.').next().unwrap_or(arg).trim();
                 if !var.is_empty() && var.chars().all(|c| c.is_alphanumeric() || c == '_') {
                     args.push(var.to_lowercase());
@@ -451,9 +479,7 @@ pub fn format_taint_flows(flows: &[TaintFlow]) -> String {
             for f in items {
                 out.push_str(&format!(
                     "  {}:{} -> {}:{}\n    {} -> {}\n",
-                    f.file, f.source_line,
-                    f.file, f.sink_line,
-                    f.source_kind, f.sink_kind,
+                    f.file, f.source_line, f.file, f.sink_line, f.source_kind, f.sink_kind,
                 ));
                 out.push_str("    Path: ");
                 for (i, step) in f.path.iter().enumerate() {
@@ -473,8 +499,11 @@ pub fn format_taint_flows(flows: &[TaintFlow]) -> String {
         for f in flows.iter().filter(|f| f.sanitized) {
             out.push_str(&format!(
                 "  {}:L{} -> L{} ({} -> {}) sanitized by: {}\n",
-                f.file, f.source_line, f.sink_line,
-                f.source_kind, f.sink_kind,
+                f.file,
+                f.source_line,
+                f.sink_line,
+                f.source_kind,
+                f.sink_kind,
                 f.sanitizer.as_deref().unwrap_or("unknown"),
             ));
         }
@@ -500,8 +529,14 @@ cursor.execute("SELECT * FROM users WHERE name = " + user_input)
 "#;
         let flows = run_analysis(code);
         assert!(!flows.is_empty(), "should detect taint flow");
-        assert!(flows.iter().any(|f| f.sink_category == "SqlInjection"), "should be SQL injection");
-        assert!(flows.iter().any(|f| f.source_kind == "HttpParam"), "source should be HttpParam");
+        assert!(
+            flows.iter().any(|f| f.sink_category == "SqlInjection"),
+            "should be SQL injection"
+        );
+        assert!(
+            flows.iter().any(|f| f.source_kind == "HttpParam"),
+            "source should be HttpParam"
+        );
     }
 
     #[test]
@@ -514,8 +549,15 @@ cursor.execute(c)
 "#;
         let flows = run_analysis(code);
         assert!(!flows.is_empty(), "should detect multi-step taint");
-        let flow = flows.iter().find(|f| f.sink_category == "SqlInjection").unwrap();
-        assert!(flow.path.len() >= 3, "path should have multiple steps: {:?}", flow.path);
+        let flow = flows
+            .iter()
+            .find(|f| f.sink_category == "SqlInjection")
+            .unwrap();
+        assert!(
+            flow.path.len() >= 3,
+            "path should have multiple steps: {:?}",
+            flow.path
+        );
     }
 
     #[test]
@@ -528,7 +570,10 @@ el.innerHTML = safe_input
         let flows = run_analysis(code);
         // safe_input is sanitized, so innerHTML should not have active taint from it
         // But user_input is still tainted and might match
-        let xss_flows: Vec<_> = flows.iter().filter(|f| f.sink_category == "XssRisk").collect();
+        let xss_flows: Vec<_> = flows
+            .iter()
+            .filter(|f| f.sink_category == "XssRisk")
+            .collect();
         // All XSS flows involving safe_input should be sanitized
         for f in &xss_flows {
             if f.source_var == "safe_input" {
@@ -554,7 +599,11 @@ filename = req.params.filename
 content = open(filename)
 "#;
         let flows = run_analysis(code);
-        assert!(flows.iter().any(|f| f.sink_category == "PathTraversal"), "flows: {:?}", flows);
+        assert!(
+            flows.iter().any(|f| f.sink_category == "PathTraversal"),
+            "flows: {:?}",
+            flows
+        );
     }
 
     #[test]
@@ -564,7 +613,11 @@ url = request.GET.get('next')
 redirect(url)
 "#;
         let flows = run_analysis(code);
-        assert!(flows.iter().any(|f| f.sink_category == "OpenRedirect"), "flows: {:?}", flows);
+        assert!(
+            flows.iter().any(|f| f.sink_category == "OpenRedirect"),
+            "flows: {:?}",
+            flows
+        );
     }
 
     #[test]
@@ -574,7 +627,11 @@ name = "hardcoded"
 cursor.execute("SELECT * FROM users WHERE name = " + name)
 "#;
         let flows = run_analysis(code);
-        assert!(flows.is_empty(), "hardcoded string should not be tainted: {:?}", flows);
+        assert!(
+            flows.is_empty(),
+            "hardcoded string should not be tainted: {:?}",
+            flows
+        );
     }
 
     #[test]
@@ -585,11 +642,17 @@ safe = sanitize_sql(user_input)
 cursor.execute(safe)
 "#;
         let flows = run_analysis(code);
-        let sql: Vec<_> = flows.iter().filter(|f| f.sink_category == "SqlInjection").collect();
+        let sql: Vec<_> = flows
+            .iter()
+            .filter(|f| f.sink_category == "SqlInjection")
+            .collect();
         // Should either be empty (taint cleared) or sanitized
         for f in &sql {
             if f.source_var != "user_input" {
-                assert!(f.sanitized || f.path.is_empty(), "sanitized input should not produce active flow");
+                assert!(
+                    f.sanitized || f.path.is_empty(),
+                    "sanitized input should not produce active flow"
+                );
             }
         }
     }
@@ -601,7 +664,11 @@ String name = request.getParameter("name");
 stmt.executeQuery("SELECT * FROM users WHERE name = '" + name + "'");
 "#;
         let flows = run_analysis(code);
-        assert!(flows.iter().any(|f| f.sink_category == "SqlInjection"), "flows: {:?}", flows);
+        assert!(
+            flows.iter().any(|f| f.sink_category == "SqlInjection"),
+            "flows: {:?}",
+            flows
+        );
     }
 
     #[test]
@@ -647,6 +714,12 @@ data = request.body
 obj = pickle.loads(data)
 "#;
         let flows = run_analysis(code);
-        assert!(flows.iter().any(|f| f.sink_category == "InsecureDeserialization"), "flows: {:?}", flows);
+        assert!(
+            flows
+                .iter()
+                .any(|f| f.sink_category == "InsecureDeserialization"),
+            "flows: {:?}",
+            flows
+        );
     }
 }

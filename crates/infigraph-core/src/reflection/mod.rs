@@ -47,7 +47,11 @@ static REFLECTION_PATTERNS: &[ReflectionPattern] = &[
     },
     ReflectionPattern {
         mechanism: "ImportModule",
-        patterns: &["importlib.import_module(", "importlib.import_module (", "__import__("],
+        patterns: &[
+            "importlib.import_module(",
+            "importlib.import_module (",
+            "__import__(",
+        ],
         extensions: &["py"],
     },
     // JavaScript/TypeScript dynamic require/import
@@ -64,7 +68,11 @@ static REFLECTION_PATTERNS: &[ReflectionPattern] = &[
     // C# reflection
     ReflectionPattern {
         mechanism: "CSharpReflection",
-        patterns: &["Activator.CreateInstance(", "Type.GetType(", "Assembly.Load("],
+        patterns: &[
+            "Activator.CreateInstance(",
+            "Type.GetType(",
+            "Assembly.Load(",
+        ],
         extensions: &["cs"],
     },
     // Ruby dynamic dispatch
@@ -81,10 +89,7 @@ static REFLECTION_PATTERNS: &[ReflectionPattern] = &[
     },
 ];
 
-pub fn detect_reflection_sites(
-    store: &GraphStore,
-    root: &Path,
-) -> Result<Vec<ReflectionSite>> {
+pub fn detect_reflection_sites(store: &GraphStore, root: &Path) -> Result<Vec<ReflectionSite>> {
     let _lock = store.write_lock()?;
     let conn = store.connection()?;
 
@@ -118,13 +123,8 @@ pub fn detect_reflection_sites(
                         continue;
                     }
 
-                    let (resolved, config_src) = try_resolve(
-                        &raw_arg,
-                        rp.mechanism,
-                        &all_symbols,
-                        &config_values,
-                        root,
-                    );
+                    let (resolved, config_src) =
+                        try_resolve(&raw_arg, rp.mechanism, &all_symbols, &config_values, root);
 
                     let line = docstring[..pos].lines().count() as u32 + 1;
 
@@ -167,10 +167,16 @@ fn extract_string_arg(after_pattern: &str) -> String {
             return trimmed[1..end + 1].to_string();
         }
     }
-    let end = trimmed.find(|c: char| c == ')' || c == ',' || c.is_whitespace())
+    let end = trimmed
+        .find(|c: char| c == ')' || c == ',' || c.is_whitespace())
         .unwrap_or(trimmed.len().min(80));
     let candidate = &trimmed[..end];
-    if candidate.contains('.') || candidate.contains("::") || candidate.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '.' || c == ':' || c == '/') {
+    if candidate.contains('.')
+        || candidate.contains("::")
+        || candidate
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '.' || c == ':' || c == '/')
+    {
         return candidate.to_string();
     }
     String::new()
@@ -273,7 +279,9 @@ fn parse_python_settings(content: &str, values: &mut HashMap<String, String>) {
         }
         if let Some(eq_pos) = line.find('=') {
             let key = line[..eq_pos].trim();
-            let val = line[eq_pos + 1..].trim().trim_matches(|c: char| c == '\'' || c == '"');
+            let val = line[eq_pos + 1..]
+                .trim()
+                .trim_matches(|c: char| c == '\'' || c == '"');
             if key.chars().all(|c| c.is_alphanumeric() || c == '_') {
                 values.insert(key.to_string(), val.to_string());
             }
@@ -308,9 +316,15 @@ fn try_resolve(
         if let Some(impl_fqcn) = config_values.get(&service_key) {
             let impl_short = impl_fqcn.rsplit('.').next().unwrap_or(impl_fqcn);
             if let Some(symbol_id) = all_symbols.get(impl_short) {
-                return (Some(symbol_id.clone()), Some(format!("META-INF/services/{}", raw_arg)));
+                return (
+                    Some(symbol_id.clone()),
+                    Some(format!("META-INF/services/{}", raw_arg)),
+                );
             }
-            return (Some(impl_fqcn.clone()), Some(format!("META-INF/services/{}", raw_arg)));
+            return (
+                Some(impl_fqcn.clone()),
+                Some(format!("META-INF/services/{}", raw_arg)),
+            );
         }
     }
 
@@ -406,7 +420,10 @@ mod tests {
 
     #[test]
     fn test_extract_string_arg_double_quotes() {
-        assert_eq!(extract_string_arg("\"com.example.MyClass\")"), "com.example.MyClass");
+        assert_eq!(
+            extract_string_arg("\"com.example.MyClass\")"),
+            "com.example.MyClass"
+        );
     }
 
     #[test]
@@ -416,7 +433,10 @@ mod tests {
 
     #[test]
     fn test_extract_string_arg_backtick() {
-        assert_eq!(extract_string_arg("`./modules/${name}`)"), "./modules/${name}");
+        assert_eq!(
+            extract_string_arg("`./modules/${name}`)"),
+            "./modules/${name}"
+        );
     }
 
     #[test]
@@ -444,7 +464,10 @@ mod tests {
                 }
             }
         }
-        assert!(found.contains(&"ClassForName"), "should detect Class.forName");
+        assert!(
+            found.contains(&"ClassForName"),
+            "should detect Class.forName"
+        );
     }
 
     #[test]
@@ -462,7 +485,10 @@ mod tests {
                 }
             }
         }
-        assert!(found.contains(&"ImportModule"), "should detect importlib.import_module");
+        assert!(
+            found.contains(&"ImportModule"),
+            "should detect importlib.import_module"
+        );
     }
 
     #[test]
@@ -498,7 +524,10 @@ mod tests {
                 }
             }
         }
-        assert!(found.contains(&"CSharpReflection"), "should detect Activator.CreateInstance");
+        assert!(
+            found.contains(&"CSharpReflection"),
+            "should detect Activator.CreateInstance"
+        );
     }
 
     #[test]
@@ -552,7 +581,10 @@ mod tests {
                 }
             }
         }
-        assert!(found.contains(&"ServiceLoader"), "should detect ServiceLoader.load");
+        assert!(
+            found.contains(&"ServiceLoader"),
+            "should detect ServiceLoader.load"
+        );
     }
 
     #[test]
@@ -560,7 +592,10 @@ mod tests {
         let content = "handler.class=com.example.MyHandler\ndb.url=jdbc:mysql://localhost/test";
         let mut values = HashMap::new();
         parse_properties_into(content, &mut values);
-        assert_eq!(values.get("handler.class").unwrap(), "com.example.MyHandler");
+        assert_eq!(
+            values.get("handler.class").unwrap(),
+            "com.example.MyHandler"
+        );
         assert_eq!(values.get("db.url").unwrap(), "jdbc:mysql://localhost/test");
     }
 
@@ -575,18 +610,36 @@ mod tests {
     #[test]
     fn test_try_resolve_direct_match() {
         let mut symbols = HashMap::new();
-        symbols.insert("MyHandler".to_string(), "handler.java::MyHandler".to_string());
+        symbols.insert(
+            "MyHandler".to_string(),
+            "handler.java::MyHandler".to_string(),
+        );
         let configs = HashMap::new();
-        let (resolved, _) = try_resolve("MyHandler", "ClassForName", &symbols, &configs, Path::new("."));
+        let (resolved, _) = try_resolve(
+            "MyHandler",
+            "ClassForName",
+            &symbols,
+            &configs,
+            Path::new("."),
+        );
         assert_eq!(resolved.unwrap(), "handler.java::MyHandler");
     }
 
     #[test]
     fn test_try_resolve_fqcn_short_name() {
         let mut symbols = HashMap::new();
-        symbols.insert("MyHandler".to_string(), "handler.java::MyHandler".to_string());
+        symbols.insert(
+            "MyHandler".to_string(),
+            "handler.java::MyHandler".to_string(),
+        );
         let configs = HashMap::new();
-        let (resolved, _) = try_resolve("com.example.MyHandler", "ClassForName", &symbols, &configs, Path::new("."));
+        let (resolved, _) = try_resolve(
+            "com.example.MyHandler",
+            "ClassForName",
+            &symbols,
+            &configs,
+            Path::new("."),
+        );
         assert_eq!(resolved.unwrap(), "handler.java::MyHandler");
     }
 
@@ -594,7 +647,13 @@ mod tests {
     fn test_try_resolve_unresolved() {
         let symbols = HashMap::new();
         let configs = HashMap::new();
-        let (resolved, _) = try_resolve("com.unknown.Mystery", "ClassForName", &symbols, &configs, Path::new("."));
+        let (resolved, _) = try_resolve(
+            "com.unknown.Mystery",
+            "ClassForName",
+            &symbols,
+            &configs,
+            Path::new("."),
+        );
         assert!(resolved.is_none());
     }
 
@@ -618,7 +677,10 @@ mod tests {
         let content = "HANDLER_CLASS = 'myapp.handlers.EmailHandler'\nDEBUG = True";
         let mut values = HashMap::new();
         super::parse_python_settings(content, &mut values);
-        assert_eq!(values.get("HANDLER_CLASS").unwrap(), "myapp.handlers.EmailHandler");
+        assert_eq!(
+            values.get("HANDLER_CLASS").unwrap(),
+            "myapp.handlers.EmailHandler"
+        );
         assert_eq!(values.get("DEBUG").unwrap(), "True");
     }
 }

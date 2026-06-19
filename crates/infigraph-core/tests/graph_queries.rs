@@ -72,12 +72,34 @@ fn fixture_extractions() -> Vec<FileExtraction> {
             language: "python".to_string(),
             content_hash: "aaa".to_string(),
             symbols: vec![
-                sym("src/main.py::main", "main", SymbolKind::Function, "src/main.py", 1, 10),
-                sym("src/main.py::helper", "helper", SymbolKind::Function, "src/main.py", 12, 20),
+                sym(
+                    "src/main.py::main",
+                    "main",
+                    SymbolKind::Function,
+                    "src/main.py",
+                    1,
+                    10,
+                ),
+                sym(
+                    "src/main.py::helper",
+                    "helper",
+                    SymbolKind::Function,
+                    "src/main.py",
+                    12,
+                    20,
+                ),
             ],
             relations: vec![
-                rel("src/main.py::main", "src/main.py::helper", RelationKind::Calls),
-                rel("src/main.py::main", "src/lib.py::process", RelationKind::Calls),
+                rel(
+                    "src/main.py::main",
+                    "src/main.py::helper",
+                    RelationKind::Calls,
+                ),
+                rel(
+                    "src/main.py::main",
+                    "src/lib.py::process",
+                    RelationKind::Calls,
+                ),
             ],
             statements: vec![
                 stmt("src/main.py::main", 0, StatementKind::If, 3, 0),
@@ -90,16 +112,41 @@ fn fixture_extractions() -> Vec<FileExtraction> {
             language: "python".to_string(),
             content_hash: "bbb".to_string(),
             symbols: vec![
-                sym("src/lib.py::process", "process", SymbolKind::Function, "src/lib.py", 1, 15),
-                sym("src/lib.py::validate", "validate", SymbolKind::Function, "src/lib.py", 17, 25),
+                sym(
+                    "src/lib.py::process",
+                    "process",
+                    SymbolKind::Function,
+                    "src/lib.py",
+                    1,
+                    15,
+                ),
+                sym(
+                    "src/lib.py::validate",
+                    "validate",
+                    SymbolKind::Function,
+                    "src/lib.py",
+                    17,
+                    25,
+                ),
                 {
-                    let mut s = sym("src/lib.py::BaseClass", "BaseClass", SymbolKind::Class, "src/lib.py", 27, 40);
+                    let mut s = sym(
+                        "src/lib.py::BaseClass",
+                        "BaseClass",
+                        SymbolKind::Class,
+                        "src/lib.py",
+                        27,
+                        40,
+                    );
                     s.complexity = 3;
                     s
                 },
             ],
             relations: vec![
-                rel("src/lib.py::process", "src/lib.py::validate", RelationKind::Calls),
+                rel(
+                    "src/lib.py::process",
+                    "src/lib.py::validate",
+                    RelationKind::Calls,
+                ),
                 rel("src/lib.py", "src/main.py", RelationKind::Imports),
             ],
             statements: vec![
@@ -113,15 +160,37 @@ fn fixture_extractions() -> Vec<FileExtraction> {
             content_hash: "ccc".to_string(),
             symbols: vec![
                 {
-                    let mut s = sym("src/models.py::ChildClass", "ChildClass", SymbolKind::Class, "src/models.py", 1, 20);
+                    let mut s = sym(
+                        "src/models.py::ChildClass",
+                        "ChildClass",
+                        SymbolKind::Class,
+                        "src/models.py",
+                        1,
+                        20,
+                    );
                     s.complexity = 2;
                     s
                 },
-                sym("src/models.py::do_work", "do_work", SymbolKind::Method, "src/models.py", 5, 15),
+                sym(
+                    "src/models.py::do_work",
+                    "do_work",
+                    SymbolKind::Method,
+                    "src/models.py",
+                    5,
+                    15,
+                ),
             ],
             relations: vec![
-                rel("src/models.py::ChildClass", "src/lib.py::BaseClass", RelationKind::Inherits),
-                rel("src/models.py::do_work", "src/lib.py::validate", RelationKind::Calls),
+                rel(
+                    "src/models.py::ChildClass",
+                    "src/lib.py::BaseClass",
+                    RelationKind::Inherits,
+                ),
+                rel(
+                    "src/models.py::do_work",
+                    "src/lib.py::validate",
+                    RelationKind::Calls,
+                ),
             ],
             statements: vec![],
         },
@@ -131,15 +200,37 @@ fn fixture_extractions() -> Vec<FileExtraction> {
             content_hash: "ddd".to_string(),
             symbols: vec![
                 {
-                    let mut s = sym("tests/test_main.py::test_main", "test_main", SymbolKind::Test, "tests/test_main.py", 1, 10);
+                    let mut s = sym(
+                        "tests/test_main.py::test_main",
+                        "test_main",
+                        SymbolKind::Test,
+                        "tests/test_main.py",
+                        1,
+                        10,
+                    );
                     s.docstring = Some("@pytest".to_string());
                     s
                 },
-                sym("tests/test_main.py::test_helper", "test_helper", SymbolKind::Test, "tests/test_main.py", 12, 20),
+                sym(
+                    "tests/test_main.py::test_helper",
+                    "test_helper",
+                    SymbolKind::Test,
+                    "tests/test_main.py",
+                    12,
+                    20,
+                ),
             ],
             relations: vec![
-                rel("tests/test_main.py::test_main", "src/main.py::main", RelationKind::Calls),
-                rel("tests/test_main.py::test_helper", "src/main.py::helper", RelationKind::Calls),
+                rel(
+                    "tests/test_main.py::test_main",
+                    "src/main.py::main",
+                    RelationKind::Calls,
+                ),
+                rel(
+                    "tests/test_main.py::test_helper",
+                    "src/main.py::helper",
+                    RelationKind::Calls,
+                ),
             ],
             statements: vec![],
         },
@@ -254,8 +345,14 @@ fn test_transitive_impact() {
     // validate is called by process (depth 1) and process is called by main (depth 2)
     let impact = q.transitive_impact("src/lib.py::validate", 3).unwrap();
     let ids: Vec<&str> = impact.iter().map(|r| r.id.as_str()).collect();
-    assert!(ids.iter().any(|id| id.contains("process")), "process should be impacted");
-    assert!(ids.iter().any(|id| id.contains("main")), "main should be transitively impacted");
+    assert!(
+        ids.iter().any(|id| id.contains("process")),
+        "process should be impacted"
+    );
+    assert!(
+        ids.iter().any(|id| id.contains("main")),
+        "main should be transitively impacted"
+    );
 }
 
 #[test]
@@ -266,7 +363,10 @@ fn test_transitive_impact_depth_1() {
 
     let impact = q.transitive_impact("src/main.py::helper", 1).unwrap();
     let ids: Vec<&str> = impact.iter().map(|r| r.id.as_str()).collect();
-    assert!(ids.iter().any(|id| id.contains("main")), "main calls helper directly");
+    assert!(
+        ids.iter().any(|id| id.contains("main")),
+        "main calls helper directly"
+    );
 }
 
 #[test]
@@ -360,7 +460,9 @@ fn test_get_type_hierarchy() {
     assert_eq!(hier.root_name, "BaseClass");
     assert!(hier.descendants.iter().any(|d| d.name == "ChildClass"));
 
-    let hier2 = q.get_type_hierarchy("src/models.py::ChildClass", 3).unwrap();
+    let hier2 = q
+        .get_type_hierarchy("src/models.py::ChildClass", 3)
+        .unwrap();
     assert!(hier2.ancestors.iter().any(|a| a.name == "BaseClass"));
 }
 
@@ -370,7 +472,10 @@ fn test_derive_tested_by_and_coverage() {
 
     // Derive edges (store-level method)
     let count = tg.store.derive_tested_by_edges().unwrap();
-    assert!(count >= 2, "expected at least 2 TESTED_BY edges, got {count}");
+    assert!(
+        count >= 2,
+        "expected at least 2 TESTED_BY edges, got {count}"
+    );
 
     // Query coverage
     let conn = tg.store.connection().unwrap();
@@ -413,7 +518,10 @@ fn test_generate_test_context_file_filter() {
     let q = GraphQuery::new(&conn);
     let ctx = q.generate_test_context(Some("models"), 10).unwrap();
     for t in &ctx.targets {
-        assert!(t.file.contains("models"), "filter should restrict to models files");
+        assert!(
+            t.file.contains("models"),
+            "filter should restrict to models files"
+        );
     }
 }
 
@@ -425,8 +533,11 @@ fn test_detect_test_framework() {
 
     // Our test fixtures have @pytest in docstring
     let ctx = q.generate_test_context(None, 1).unwrap();
-    assert!(ctx.framework.contains("pytest") || ctx.framework.contains("python"),
-        "expected pytest framework, got: {}", ctx.framework);
+    assert!(
+        ctx.framework.contains("pytest") || ctx.framework.contains("python"),
+        "expected pytest framework, got: {}",
+        ctx.framework
+    );
 }
 
 // ---------- GraphStore tests ----------
@@ -435,11 +546,27 @@ fn test_detect_test_framework() {
 fn test_stats() {
     let tg = setup();
     let stats = tg.store.stats().unwrap();
-    assert!(stats.symbols >= 7, "expected >= 7 symbols, got {}", stats.symbols);
-    assert!(stats.modules >= 4, "expected >= 4 modules, got {}", stats.modules);
+    assert!(
+        stats.symbols >= 7,
+        "expected >= 7 symbols, got {}",
+        stats.symbols
+    );
+    assert!(
+        stats.modules >= 4,
+        "expected >= 4 modules, got {}",
+        stats.modules
+    );
     assert!(stats.files >= 4, "expected >= 4 files, got {}", stats.files);
-    assert!(stats.calls >= 4, "expected >= 4 call edges, got {}", stats.calls);
-    assert!(stats.inherits >= 1, "expected >= 1 inherit edge, got {}", stats.inherits);
+    assert!(
+        stats.calls >= 4,
+        "expected >= 4 call edges, got {}",
+        stats.calls
+    );
+    assert!(
+        stats.inherits >= 1,
+        "expected >= 1 inherit edge, got {}",
+        stats.inherits
+    );
 }
 
 #[test]
@@ -486,7 +613,14 @@ fn test_upsert_file_single() {
         file: "single.py".to_string(),
         language: "python".to_string(),
         content_hash: "zzz".to_string(),
-        symbols: vec![sym("single.py::foo", "foo", SymbolKind::Function, "single.py", 1, 5)],
+        symbols: vec![sym(
+            "single.py::foo",
+            "foo",
+            SymbolKind::Function,
+            "single.py",
+            1,
+            5,
+        )],
         relations: vec![],
         statements: vec![stmt("single.py::foo", 0, StatementKind::If, 2, 0)],
     };
@@ -543,7 +677,9 @@ fn test_raw_query() {
     let conn = tg.store.connection().unwrap();
     let q = GraphQuery::new(&conn);
 
-    let rows = q.raw_query("MATCH (s:Symbol) RETURN s.name ORDER BY s.name").unwrap();
+    let rows = q
+        .raw_query("MATCH (s:Symbol) RETURN s.name ORDER BY s.name")
+        .unwrap();
     assert!(!rows.is_empty());
     let first_col: Vec<&str> = rows.iter().map(|r| r[0].as_str()).collect();
     assert!(first_col.contains(&"main"));
@@ -635,16 +771,23 @@ fn test_upsert_folders_bulk() {
     let tg = TestGraph::new();
     {
         let conn = tg.store.connection().unwrap();
-        tg.store.upsert_all_bulk(&conn, &fixture_extractions()).unwrap();
+        tg.store
+            .upsert_all_bulk(&conn, &fixture_extractions())
+            .unwrap();
     }
     let file_paths: Vec<&str> = vec![
-        "src/main.py", "src/lib.py", "src/models.py", "tests/test_main.py",
+        "src/main.py",
+        "src/lib.py",
+        "src/models.py",
+        "tests/test_main.py",
     ];
     tg.store.upsert_folders_bulk(&file_paths).unwrap();
 
     let conn = tg.store.connection().unwrap();
     let q = GraphQuery::new(&conn);
-    let rows = q.raw_query("MATCH (d:Folder) RETURN d.id ORDER BY d.id").unwrap();
+    let rows = q
+        .raw_query("MATCH (d:Folder) RETURN d.id ORDER BY d.id")
+        .unwrap();
     assert!(!rows.is_empty(), "should have created folder nodes");
     let ids: Vec<&str> = rows.iter().map(|r| r[0].as_str()).collect();
     assert!(ids.iter().any(|id| id.contains("src")));
@@ -661,21 +804,37 @@ fn test_custom_edge_relations() {
         language: "python".to_string(),
         content_hash: "custom".to_string(),
         symbols: vec![
-            sym("decorators.py::my_decorator", "my_decorator", SymbolKind::Function, "decorators.py", 1, 5),
-            sym("decorators.py::my_func", "my_func", SymbolKind::Function, "decorators.py", 7, 15),
+            sym(
+                "decorators.py::my_decorator",
+                "my_decorator",
+                SymbolKind::Function,
+                "decorators.py",
+                1,
+                5,
+            ),
+            sym(
+                "decorators.py::my_func",
+                "my_func",
+                SymbolKind::Function,
+                "decorators.py",
+                7,
+                15,
+            ),
         ],
-        relations: vec![
-            rel("decorators.py::my_func", "decorators.py::my_decorator", RelationKind::Custom("DECORATED_BY".to_string())),
-        ],
+        relations: vec![rel(
+            "decorators.py::my_func",
+            "decorators.py::my_decorator",
+            RelationKind::Custom("DECORATED_BY".to_string()),
+        )],
         statements: vec![],
     };
     tg.store.upsert_file(&extraction).unwrap();
 
     let conn = tg.store.connection().unwrap();
     let q = GraphQuery::new(&conn);
-    let rows = q.raw_query(
-        "MATCH (a:Symbol)-[:DECORATED_BY]->(b:Symbol) RETURN a.name, b.name"
-    ).unwrap();
+    let rows = q
+        .raw_query("MATCH (a:Symbol)-[:DECORATED_BY]->(b:Symbol) RETURN a.name, b.name")
+        .unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0][0], "my_func");
     assert_eq!(rows[0][1], "my_decorator");
@@ -700,15 +859,32 @@ fn test_bulk_vs_single_write_equivalence() {
 
     let stats_bulk = tg_bulk.store.stats().unwrap();
     let stats_single = tg_single.store.stats().unwrap();
-    assert_eq!(stats_bulk.symbols, stats_single.symbols, "symbol count mismatch");
-    assert_eq!(stats_bulk.modules, stats_single.modules, "module count mismatch");
+    assert_eq!(
+        stats_bulk.symbols, stats_single.symbols,
+        "symbol count mismatch"
+    );
+    assert_eq!(
+        stats_bulk.modules, stats_single.modules,
+        "module count mismatch"
+    );
     assert_eq!(stats_bulk.files, stats_single.files, "file count mismatch");
     // CALLS may differ: bulk inserts all at once; single upsert deletes+recreates per file,
     // which can drop cross-file edges when target file is rewritten later.
     // Both counts should be >= 4 (the within-file edges).
-    assert!(stats_bulk.calls >= 4, "bulk calls too low: {}", stats_bulk.calls);
-    assert!(stats_single.calls >= 4, "single calls too low: {}", stats_single.calls);
-    assert_eq!(stats_bulk.inherits, stats_single.inherits, "inherits count mismatch");
+    assert!(
+        stats_bulk.calls >= 4,
+        "bulk calls too low: {}",
+        stats_bulk.calls
+    );
+    assert!(
+        stats_single.calls >= 4,
+        "single calls too low: {}",
+        stats_single.calls
+    );
+    assert_eq!(
+        stats_bulk.inherits, stats_single.inherits,
+        "inherits count mismatch"
+    );
 }
 
 // ---------- Direct _conn method tests ----------
@@ -721,15 +897,29 @@ fn test_upsert_file_conn_direct() {
         language: "python".to_string(),
         content_hash: "conn1".to_string(),
         symbols: vec![
-            sym("conn_test.py::alpha", "alpha", SymbolKind::Function, "conn_test.py", 1, 5),
-            sym("conn_test.py::beta", "beta", SymbolKind::Function, "conn_test.py", 7, 12),
+            sym(
+                "conn_test.py::alpha",
+                "alpha",
+                SymbolKind::Function,
+                "conn_test.py",
+                1,
+                5,
+            ),
+            sym(
+                "conn_test.py::beta",
+                "beta",
+                SymbolKind::Function,
+                "conn_test.py",
+                7,
+                12,
+            ),
         ],
-        relations: vec![
-            rel("conn_test.py::alpha", "conn_test.py::beta", RelationKind::Calls),
-        ],
-        statements: vec![
-            stmt("conn_test.py::alpha", 0, StatementKind::If, 2, 0),
-        ],
+        relations: vec![rel(
+            "conn_test.py::alpha",
+            "conn_test.py::beta",
+            RelationKind::Calls,
+        )],
+        statements: vec![stmt("conn_test.py::alpha", 0, StatementKind::If, 2, 0)],
     };
 
     let conn = tg.store.connection().unwrap();
@@ -754,9 +944,14 @@ fn test_upsert_file_conn_overwrites_old_data() {
         file: "evolve.py".to_string(),
         language: "python".to_string(),
         content_hash: "v1".to_string(),
-        symbols: vec![
-            sym("evolve.py::old_fn", "old_fn", SymbolKind::Function, "evolve.py", 1, 5),
-        ],
+        symbols: vec![sym(
+            "evolve.py::old_fn",
+            "old_fn",
+            SymbolKind::Function,
+            "evolve.py",
+            1,
+            5,
+        )],
         relations: vec![],
         statements: vec![],
     };
@@ -771,8 +966,22 @@ fn test_upsert_file_conn_overwrites_old_data() {
         language: "python".to_string(),
         content_hash: "v2".to_string(),
         symbols: vec![
-            sym("evolve.py::new_fn", "new_fn", SymbolKind::Function, "evolve.py", 1, 5),
-            sym("evolve.py::other", "other", SymbolKind::Function, "evolve.py", 7, 10),
+            sym(
+                "evolve.py::new_fn",
+                "new_fn",
+                SymbolKind::Function,
+                "evolve.py",
+                1,
+                5,
+            ),
+            sym(
+                "evolve.py::other",
+                "other",
+                SymbolKind::Function,
+                "evolve.py",
+                7,
+                10,
+            ),
         ],
         relations: vec![],
         statements: vec![],
@@ -796,9 +1005,14 @@ fn test_upsert_file_conn_no_delete_accumulates() {
         file: "accum.py".to_string(),
         language: "python".to_string(),
         content_hash: "h1".to_string(),
-        symbols: vec![
-            sym("accum.py::first", "first", SymbolKind::Function, "accum.py", 1, 5),
-        ],
+        symbols: vec![sym(
+            "accum.py::first",
+            "first",
+            SymbolKind::Function,
+            "accum.py",
+            1,
+            5,
+        )],
         relations: vec![],
         statements: vec![],
     };
@@ -813,9 +1027,14 @@ fn test_upsert_file_conn_no_delete_accumulates() {
         file: "accum2.py".to_string(),
         language: "python".to_string(),
         content_hash: "h2".to_string(),
-        symbols: vec![
-            sym("accum2.py::second", "second", SymbolKind::Function, "accum2.py", 1, 5),
-        ],
+        symbols: vec![sym(
+            "accum2.py::second",
+            "second",
+            SymbolKind::Function,
+            "accum2.py",
+            1,
+            5,
+        )],
         relations: vec![],
         statements: vec![],
     };
@@ -833,23 +1052,33 @@ fn test_upsert_folders_bulk_conn_direct() {
     let tg = TestGraph::new();
     {
         let conn = tg.store.connection().unwrap();
-        tg.store.upsert_all_bulk(&conn, &fixture_extractions()).unwrap();
+        tg.store
+            .upsert_all_bulk(&conn, &fixture_extractions())
+            .unwrap();
     }
 
     let conn = tg.store.connection().unwrap();
     let paths: Vec<&str> = vec![
-        "src/main.py", "src/lib.py", "src/models.py", "tests/test_main.py",
+        "src/main.py",
+        "src/lib.py",
+        "src/models.py",
+        "tests/test_main.py",
         "src/deep/nested/file.py",
     ];
     tg.store.upsert_folders_bulk_conn(&conn, &paths).unwrap();
 
     let q = GraphQuery::new(&conn);
-    let folders = q.raw_query("MATCH (d:Folder) RETURN d.id ORDER BY d.id").unwrap();
+    let folders = q
+        .raw_query("MATCH (d:Folder) RETURN d.id ORDER BY d.id")
+        .unwrap();
     let ids: Vec<&str> = folders.iter().map(|r| r[0].as_str()).collect();
     assert!(ids.contains(&"src"), "should have src folder");
     assert!(ids.contains(&"tests"), "should have tests folder");
     assert!(ids.contains(&"src/deep"), "should have src/deep folder");
-    assert!(ids.contains(&"src/deep/nested"), "should have src/deep/nested folder");
+    assert!(
+        ids.contains(&"src/deep/nested"),
+        "should have src/deep/nested folder"
+    );
 }
 
 // ---------- Empty extraction edge cases ----------
@@ -870,11 +1099,20 @@ fn test_upsert_empty_extraction() {
     let conn = tg.store.connection().unwrap();
     let q = GraphQuery::new(&conn);
     let rows = q.symbols_in_file("empty.py").unwrap();
-    assert!(rows.is_empty(), "empty extraction should produce no symbols");
+    assert!(
+        rows.is_empty(),
+        "empty extraction should produce no symbols"
+    );
 
     // Module and File nodes should still exist
-    let modules = q.raw_query("MATCH (m:Module) WHERE m.id = 'empty.py' RETURN m.id").unwrap();
-    assert_eq!(modules.len(), 1, "module node should exist even with no symbols");
+    let modules = q
+        .raw_query("MATCH (m:Module) WHERE m.id = 'empty.py' RETURN m.id")
+        .unwrap();
+    assert_eq!(
+        modules.len(),
+        1,
+        "module node should exist even with no symbols"
+    );
 }
 
 #[test]
@@ -919,12 +1157,28 @@ fn test_ensure_custom_edge_table_idempotent() {
         language: "python".to_string(),
         content_hash: "c1".to_string(),
         symbols: vec![
-            sym("custom1.py::a", "a", SymbolKind::Function, "custom1.py", 1, 5),
-            sym("custom1.py::b", "b", SymbolKind::Function, "custom1.py", 7, 10),
+            sym(
+                "custom1.py::a",
+                "a",
+                SymbolKind::Function,
+                "custom1.py",
+                1,
+                5,
+            ),
+            sym(
+                "custom1.py::b",
+                "b",
+                SymbolKind::Function,
+                "custom1.py",
+                7,
+                10,
+            ),
         ],
-        relations: vec![
-            rel("custom1.py::a", "custom1.py::b", RelationKind::Custom("MY_CUSTOM_EDGE".to_string())),
-        ],
+        relations: vec![rel(
+            "custom1.py::a",
+            "custom1.py::b",
+            RelationKind::Custom("MY_CUSTOM_EDGE".to_string()),
+        )],
         statements: vec![],
     };
     tg.store.upsert_file(&extraction1).unwrap();
@@ -935,18 +1189,36 @@ fn test_ensure_custom_edge_table_idempotent() {
         language: "python".to_string(),
         content_hash: "c2".to_string(),
         symbols: vec![
-            sym("custom2.py::x", "x", SymbolKind::Function, "custom2.py", 1, 5),
-            sym("custom2.py::y", "y", SymbolKind::Function, "custom2.py", 7, 10),
+            sym(
+                "custom2.py::x",
+                "x",
+                SymbolKind::Function,
+                "custom2.py",
+                1,
+                5,
+            ),
+            sym(
+                "custom2.py::y",
+                "y",
+                SymbolKind::Function,
+                "custom2.py",
+                7,
+                10,
+            ),
         ],
-        relations: vec![
-            rel("custom2.py::x", "custom2.py::y", RelationKind::Custom("MY_CUSTOM_EDGE".to_string())),
-        ],
+        relations: vec![rel(
+            "custom2.py::x",
+            "custom2.py::y",
+            RelationKind::Custom("MY_CUSTOM_EDGE".to_string()),
+        )],
         statements: vec![],
     };
     tg.store.upsert_file(&extraction2).unwrap();
 
     let q = GraphQuery::new(&conn);
-    let rows = q.raw_query("MATCH (a:Symbol)-[:MY_CUSTOM_EDGE]->(b:Symbol) RETURN a.name, b.name").unwrap();
+    let rows = q
+        .raw_query("MATCH (a:Symbol)-[:MY_CUSTOM_EDGE]->(b:Symbol) RETURN a.name, b.name")
+        .unwrap();
     assert_eq!(rows.len(), 2, "both custom edges should exist");
 }
 
@@ -955,7 +1227,14 @@ fn test_ensure_custom_edge_table_idempotent() {
 #[test]
 fn test_special_chars_newlines_and_quotes() {
     let tg = TestGraph::new();
-    let mut s = sym("special.py::func", "func", SymbolKind::Function, "special.py", 1, 5);
+    let mut s = sym(
+        "special.py::func",
+        "func",
+        SymbolKind::Function,
+        "special.py",
+        1,
+        5,
+    );
     s.docstring = Some("Line one\nLine two\n\"quoted\"".to_string());
     s.parameters = Some("a: str, b: int = 'default'".to_string());
     s.return_type = Some("Optional[Dict[str, Any]]".to_string());
@@ -984,12 +1263,28 @@ fn test_unicode_in_symbol_names() {
         language: "python".to_string(),
         content_hash: "uni".to_string(),
         symbols: vec![
-            sym("unicode.py::café", "café", SymbolKind::Function, "unicode.py", 1, 5),
-            sym("unicode.py::日本語", "日本語", SymbolKind::Function, "unicode.py", 7, 10),
+            sym(
+                "unicode.py::café",
+                "café",
+                SymbolKind::Function,
+                "unicode.py",
+                1,
+                5,
+            ),
+            sym(
+                "unicode.py::日本語",
+                "日本語",
+                SymbolKind::Function,
+                "unicode.py",
+                7,
+                10,
+            ),
         ],
-        relations: vec![
-            rel("unicode.py::café", "unicode.py::日本語", RelationKind::Calls),
-        ],
+        relations: vec![rel(
+            "unicode.py::café",
+            "unicode.py::日本語",
+            RelationKind::Calls,
+        )],
         statements: vec![],
     };
     tg.store.upsert_file(&extraction).unwrap();
@@ -1036,7 +1331,10 @@ fn test_transitive_impact_depth_limit() {
     let impact1 = q.transitive_impact("chain.py::e", 1).unwrap();
     let ids1: Vec<&str> = impact1.iter().map(|r| r.id.as_str()).collect();
     assert!(ids1.contains(&"chain.py::d"), "d calls e directly");
-    assert!(!ids1.contains(&"chain.py::a"), "a should not appear at depth 1");
+    assert!(
+        !ids1.contains(&"chain.py::a"),
+        "a should not appear at depth 1"
+    );
 
     // Depth 2: should show d and c
     let impact2 = q.transitive_impact("chain.py::e", 2).unwrap();
@@ -1046,7 +1344,11 @@ fn test_transitive_impact_depth_limit() {
 
     // Depth 4: should show all callers
     let impact4 = q.transitive_impact("chain.py::e", 4).unwrap();
-    assert!(impact4.len() >= 4, "depth 4 should reach all 4 callers, got {}", impact4.len());
+    assert!(
+        impact4.len() >= 4,
+        "depth 4 should reach all 4 callers, got {}",
+        impact4.len()
+    );
 }
 
 // ---------- NULL field handling ----------
@@ -1054,7 +1356,14 @@ fn test_transitive_impact_depth_limit() {
 #[test]
 fn test_null_optional_fields() {
     let tg = TestGraph::new();
-    let mut s = sym("nulls.py::func", "func", SymbolKind::Function, "nulls.py", 1, 5);
+    let mut s = sym(
+        "nulls.py::func",
+        "func",
+        SymbolKind::Function,
+        "nulls.py",
+        1,
+        5,
+    );
     s.visibility = None;
     s.docstring = None;
     s.parent = None;
@@ -1079,7 +1388,10 @@ fn test_null_optional_fields() {
     // API surface — NULL visibility should not appear as "public"
     let api = q.get_api_surface().unwrap();
     let has_nulls_func = api.iter().any(|a| a.name == "func");
-    assert!(!has_nulls_func, "NULL visibility should not count as public");
+    assert!(
+        !has_nulls_func,
+        "NULL visibility should not count as public"
+    );
 }
 
 // ---------- Folders with no parent (root-level files) ----------
@@ -1091,7 +1403,14 @@ fn test_folders_root_level_files() {
         file: "main.py".to_string(),
         language: "python".to_string(),
         content_hash: "root".to_string(),
-        symbols: vec![sym("main.py::main", "main", SymbolKind::Function, "main.py", 1, 5)],
+        symbols: vec![sym(
+            "main.py::main",
+            "main",
+            SymbolKind::Function,
+            "main.py",
+            1,
+            5,
+        )],
         relations: vec![],
         statements: vec![],
     };
@@ -1104,7 +1423,10 @@ fn test_folders_root_level_files() {
     let conn = tg.store.connection().unwrap();
     let q = GraphQuery::new(&conn);
     let folders = q.raw_query("MATCH (f:Folder) RETURN f.id").unwrap();
-    assert!(folders.is_empty(), "root-level file should create no folders");
+    assert!(
+        folders.is_empty(),
+        "root-level file should create no folders"
+    );
 }
 
 // ---------- Skeleton tests ----------
@@ -1112,7 +1434,14 @@ fn test_folders_root_level_files() {
 #[test]
 fn test_skeleton_output_format() {
     let tg = TestGraph::new();
-    let mut s = sym("skel.py::compute", "compute", SymbolKind::Function, "skel.py", 10, 25);
+    let mut s = sym(
+        "skel.py::compute",
+        "compute",
+        SymbolKind::Function,
+        "skel.py",
+        10,
+        25,
+    );
     s.complexity = 5;
     s.parameters = Some("(x: int, y: int)".to_string());
     s.return_type = Some("int".to_string());
@@ -1138,8 +1467,14 @@ fn test_skeleton_output_format() {
     let out = q.skeleton("skel.py").unwrap();
 
     assert!(out.contains("# skel.py"), "should have file header");
-    assert!(out.contains("compute(x: int, y: int) -> int"), "should have signature with params and return type");
-    assert!(out.contains("# complexity: 5"), "should show complexity annotation");
+    assert!(
+        out.contains("compute(x: int, y: int) -> int"),
+        "should have signature with params and return type"
+    );
+    assert!(
+        out.contains("# complexity: 5"),
+        "should show complexity annotation"
+    );
     assert!(out.contains("nesting:"), "should show nesting annotation");
     assert!(out.contains("stmts:"), "should show stmts annotation");
     assert!(out.contains("fan-in:"), "should show fan-in annotation");
@@ -1152,7 +1487,14 @@ fn test_skeleton_nesting_from_statements() {
         file: "nest.py".to_string(),
         language: "python".to_string(),
         content_hash: "ns".to_string(),
-        symbols: vec![sym("nest.py::deep", "deep", SymbolKind::Function, "nest.py", 1, 20)],
+        symbols: vec![sym(
+            "nest.py::deep",
+            "deep",
+            SymbolKind::Function,
+            "nest.py",
+            1,
+            20,
+        )],
         relations: vec![],
         statements: vec![
             stmt("nest.py::deep", 0, StatementKind::If, 2, 0),
@@ -1169,8 +1511,14 @@ fn test_skeleton_nesting_from_statements() {
     let conn = tg.store.connection().unwrap();
     let q = GraphQuery::new(&conn);
     let out = q.skeleton("nest.py").unwrap();
-    assert!(out.contains("nesting: 3"), "max depth should be 3, got:\n{out}");
-    assert!(out.contains("stmts: 4"), "should have 4 statements, got:\n{out}");
+    assert!(
+        out.contains("nesting: 3"),
+        "max depth should be 3, got:\n{out}"
+    );
+    assert!(
+        out.contains("stmts: 4"),
+        "should have 4 statements, got:\n{out}"
+    );
 }
 
 #[test]
@@ -1181,9 +1529,30 @@ fn test_skeleton_fan_in_count() {
         language: "python".to_string(),
         content_hash: "fi".to_string(),
         symbols: vec![
-            sym("fanin.py::target", "target", SymbolKind::Function, "fanin.py", 1, 5),
-            sym("fanin.py::caller1", "caller1", SymbolKind::Function, "fanin.py", 7, 10),
-            sym("fanin.py::caller2", "caller2", SymbolKind::Function, "fanin.py", 12, 15),
+            sym(
+                "fanin.py::target",
+                "target",
+                SymbolKind::Function,
+                "fanin.py",
+                1,
+                5,
+            ),
+            sym(
+                "fanin.py::caller1",
+                "caller1",
+                SymbolKind::Function,
+                "fanin.py",
+                7,
+                10,
+            ),
+            sym(
+                "fanin.py::caller2",
+                "caller2",
+                SymbolKind::Function,
+                "fanin.py",
+                12,
+                15,
+            ),
         ],
         relations: vec![
             rel("fanin.py::caller1", "fanin.py::target", RelationKind::Calls),
@@ -1201,14 +1570,27 @@ fn test_skeleton_fan_in_count() {
     let out = q.skeleton("fanin.py").unwrap();
 
     let target_section: &str = out.split("target").nth(1).unwrap_or("");
-    let fan_in_line = target_section.lines().find(|l| l.contains("fan-in:")).unwrap_or("");
-    assert!(fan_in_line.contains("fan-in: 2"), "target should have fan-in: 2, got: {fan_in_line}");
+    let fan_in_line = target_section
+        .lines()
+        .find(|l| l.contains("fan-in:"))
+        .unwrap_or("");
+    assert!(
+        fan_in_line.contains("fan-in: 2"),
+        "target should have fan-in: 2, got: {fan_in_line}"
+    );
 }
 
 #[test]
 fn test_skeleton_class_members_indented() {
     let tg = TestGraph::new();
-    let mut method = sym("cls.py::MyClass::do_thing", "do_thing", SymbolKind::Method, "cls.py", 5, 15);
+    let mut method = sym(
+        "cls.py::MyClass::do_thing",
+        "do_thing",
+        SymbolKind::Method,
+        "cls.py",
+        5,
+        15,
+    );
     method.parent = Some("cls.py::MyClass".to_string());
 
     let extraction = FileExtraction {
@@ -1216,7 +1598,14 @@ fn test_skeleton_class_members_indented() {
         language: "python".to_string(),
         content_hash: "cl".to_string(),
         symbols: vec![
-            sym("cls.py::MyClass", "MyClass", SymbolKind::Class, "cls.py", 1, 20),
+            sym(
+                "cls.py::MyClass",
+                "MyClass",
+                SymbolKind::Class,
+                "cls.py",
+                1,
+                20,
+            ),
             method,
         ],
         relations: vec![],
@@ -1236,13 +1625,16 @@ fn test_skeleton_class_members_indented() {
     let method_line = lines.iter().find(|l| l.contains("do_thing")).unwrap();
 
     fn content_after_colon(line: &str) -> &str {
-        line.find(": ").map(|i| &line[i+2..]).unwrap_or(line)
+        line.find(": ").map(|i| &line[i + 2..]).unwrap_or(line)
     }
     let class_content = content_after_colon(class_line);
     let method_content = content_after_colon(method_line);
     let class_indent = class_content.len() - class_content.trim_start().len();
     let method_indent = method_content.len() - method_content.trim_start().len();
-    assert!(method_indent > class_indent, "method should be indented more than class: class={class_indent}, method={method_indent}");
+    assert!(
+        method_indent > class_indent,
+        "method should be indented more than class: class={class_indent}, method={method_indent}"
+    );
 }
 
 #[test]
@@ -1252,9 +1644,14 @@ fn test_skeleton_no_annotations_on_class() {
         file: "noann.py".to_string(),
         language: "python".to_string(),
         content_hash: "na".to_string(),
-        symbols: vec![
-            sym("noann.py::Base", "Base", SymbolKind::Class, "noann.py", 1, 20),
-        ],
+        symbols: vec![sym(
+            "noann.py::Base",
+            "Base",
+            SymbolKind::Class,
+            "noann.py",
+            1,
+            20,
+        )],
         relations: vec![],
         statements: vec![],
     };
@@ -1270,7 +1667,10 @@ fn test_skeleton_no_annotations_on_class() {
     let lines: Vec<&str> = out.lines().collect();
     let class_idx = lines.iter().position(|l| l.contains("Base")).unwrap();
     let next_line = lines.get(class_idx + 1).unwrap_or(&"");
-    assert!(!next_line.contains("# complexity:"), "class should not have annotation line, got: {next_line}");
+    assert!(
+        !next_line.contains("# complexity:"),
+        "class should not have annotation line, got: {next_line}"
+    );
 }
 
 #[test]
@@ -1279,13 +1679,23 @@ fn test_skeleton_empty_file() {
     let conn = tg.store.connection().unwrap();
     let q = GraphQuery::new(&conn);
     let out = q.skeleton("nonexistent_file.py").unwrap();
-    assert!(out.contains("No symbols found"), "empty/missing file should say no symbols: {out}");
+    assert!(
+        out.contains("No symbols found"),
+        "empty/missing file should say no symbols: {out}"
+    );
 }
 
 #[test]
 fn test_skeleton_visibility_prefix() {
     let tg = TestGraph::new();
-    let mut s = sym("vis.py::_internal", "_internal", SymbolKind::Function, "vis.py", 1, 10);
+    let mut s = sym(
+        "vis.py::_internal",
+        "_internal",
+        SymbolKind::Function,
+        "vis.py",
+        1,
+        10,
+    );
     s.visibility = Some("private".to_string());
 
     let extraction = FileExtraction {
@@ -1304,7 +1714,10 @@ fn test_skeleton_visibility_prefix() {
     let conn = tg.store.connection().unwrap();
     let q = GraphQuery::new(&conn);
     let out = q.skeleton("vis.py").unwrap();
-    assert!(out.contains("private _internal"), "should show visibility prefix for non-public: {out}");
+    assert!(
+        out.contains("private _internal"),
+        "should show visibility prefix for non-public: {out}"
+    );
 }
 
 // ---------- Parquet vs Bulk write equivalence ----------
@@ -1324,9 +1737,18 @@ fn test_parquet_vs_bulk_write_equivalence() {
 
     let stats_pq = tg_parquet.store.stats().unwrap();
     let stats_bulk = tg_bulk.store.stats().unwrap();
-    assert_eq!(stats_pq.symbols, stats_bulk.symbols, "symbol count mismatch");
-    assert_eq!(stats_pq.modules, stats_bulk.modules, "module count mismatch");
+    assert_eq!(
+        stats_pq.symbols, stats_bulk.symbols,
+        "symbol count mismatch"
+    );
+    assert_eq!(
+        stats_pq.modules, stats_bulk.modules,
+        "module count mismatch"
+    );
     assert_eq!(stats_pq.files, stats_bulk.files, "file count mismatch");
     assert_eq!(stats_pq.calls, stats_bulk.calls, "calls count mismatch");
-    assert_eq!(stats_pq.inherits, stats_bulk.inherits, "inherits count mismatch");
+    assert_eq!(
+        stats_pq.inherits, stats_bulk.inherits,
+        "inherits count mismatch"
+    );
 }

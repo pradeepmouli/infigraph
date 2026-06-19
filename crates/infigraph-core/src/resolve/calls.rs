@@ -7,8 +7,8 @@ use crate::graph::store::GraphStore;
 use crate::learned::LearnedStore;
 use crate::model::{FileExtraction, RelationKind};
 
-use super::{escape, shortest_id, ResolveStats};
 use super::inherits::resolve_inherits;
+use super::{escape, shortest_id, ResolveStats};
 
 /// Post-indexing pass that resolves call edges using cross-file symbol lookup.
 /// Builds symbol map from the full graph (not just re-indexed files) so
@@ -205,7 +205,9 @@ fn resolve_with_map(
                             by_import.or_else(|| {
                                 matches
                                     .iter()
-                                    .min_by(|(a, _), (b, _)| a.len().cmp(&b.len()).then_with(|| a.cmp(b)))
+                                    .min_by(|(a, _), (b, _)| {
+                                        a.len().cmp(&b.len()).then_with(|| a.cmp(b))
+                                    })
                                     .map(|(id, _)| id.clone())
                             })
                         };
@@ -237,22 +239,21 @@ fn resolve_with_map(
                     let resolved_id = if cross_file.len() == 1 {
                         Some(cross_file[0].0.clone())
                     } else if cross_file.len() > 1 {
-                        let by_receiver: Option<String> =
-                            rel.receiver.as_ref().and_then(|recv| {
-                                let pattern = format!("::{}::{}", recv, target_name);
-                                shortest_id(cross_file.iter().copied(), |(id, _, _)| {
-                                    id.contains(&pattern)
-                                })
-                            });
+                        let by_receiver: Option<String> = rel.receiver.as_ref().and_then(|recv| {
+                            let pattern = format!("::{}::{}", recv, target_name);
+                            shortest_id(cross_file.iter().copied(), |(id, _, _)| {
+                                id.contains(&pattern)
+                            })
+                        });
 
                         if by_receiver.is_some() {
                             by_receiver
                         } else if let Some(ref cls) = caller_class {
                             let cls_pattern = format!("::{cls}::");
-                            let same_class = shortest_id(
-                                cross_file.iter().copied(),
-                                |(id, _, _)| id.contains(&cls_pattern),
-                            );
+                            let same_class =
+                                shortest_id(cross_file.iter().copied(), |(id, _, _)| {
+                                    id.contains(&cls_pattern)
+                                });
                             if same_class.is_some() {
                                 same_class
                             } else {

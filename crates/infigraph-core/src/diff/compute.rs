@@ -474,8 +474,28 @@ mod tests {
         let mut old = HashMap::new();
         let mut new = HashMap::new();
         let k = key("app.py", "validate_email", "Function");
-        old.insert(k.clone(), sym("app.py", "validate_email", "Function", "hash_v1", "(addr: str)", "bool"));
-        new.insert(k.clone(), sym("app.py", "validate_email", "Function", "hash_v2", "(addr: str)", "bool"));
+        old.insert(
+            k.clone(),
+            sym(
+                "app.py",
+                "validate_email",
+                "Function",
+                "hash_v1",
+                "(addr: str)",
+                "bool",
+            ),
+        );
+        new.insert(
+            k.clone(),
+            sym(
+                "app.py",
+                "validate_email",
+                "Function",
+                "hash_v2",
+                "(addr: str)",
+                "bool",
+            ),
+        );
 
         let diff = diff_symbol_maps("old", "new", old, new);
         assert_eq!(diff.changes.len(), 1);
@@ -488,8 +508,23 @@ mod tests {
         let mut old = HashMap::new();
         let mut new = HashMap::new();
         let k = key("app.py", "process", "Function");
-        old.insert(k.clone(), sym("app.py", "process", "Function", "hash_v1", "(x: int)", "None"));
-        new.insert(k.clone(), sym("app.py", "process", "Function", "hash_v2", "(x: int, y: int)", "None"));
+        old.insert(
+            k.clone(),
+            sym(
+                "app.py", "process", "Function", "hash_v1", "(x: int)", "None",
+            ),
+        );
+        new.insert(
+            k.clone(),
+            sym(
+                "app.py",
+                "process",
+                "Function",
+                "hash_v2",
+                "(x: int, y: int)",
+                "None",
+            ),
+        );
 
         let diff = diff_symbol_maps("old", "new", old, new);
         assert_eq!(diff.changes.len(), 1);
@@ -501,8 +536,14 @@ mod tests {
         let mut old = HashMap::new();
         let mut new = HashMap::new();
         let k = key("app.py", "get_value", "Function");
-        old.insert(k.clone(), sym("app.py", "get_value", "Function", "hash_v1", "()", "int"));
-        new.insert(k.clone(), sym("app.py", "get_value", "Function", "hash_v2", "()", "str"));
+        old.insert(
+            k.clone(),
+            sym("app.py", "get_value", "Function", "hash_v1", "()", "int"),
+        );
+        new.insert(
+            k.clone(),
+            sym("app.py", "get_value", "Function", "hash_v2", "()", "str"),
+        );
 
         let diff = diff_symbol_maps("old", "new", old, new);
         assert_eq!(diff.changes.len(), 1);
@@ -515,24 +556,49 @@ mod tests {
         let mut new = HashMap::new();
         old.insert(
             key("calculator.py", "calculate_order_total", "Function"),
-            sym("calculator.py", "calculate_order_total", "Function", "body_hash_abc", "(items: list[Item])", "Decimal"),
+            sym(
+                "calculator.py",
+                "calculate_order_total",
+                "Function",
+                "body_hash_abc",
+                "(items: list[Item])",
+                "Decimal",
+            ),
         );
         new.insert(
             key("calculator.py", "compute_order_sum", "Function"),
-            sym("calculator.py", "compute_order_sum", "Function", "body_hash_abc", "(items: list[Item])", "Decimal"),
+            sym(
+                "calculator.py",
+                "compute_order_sum",
+                "Function",
+                "body_hash_abc",
+                "(items: list[Item])",
+                "Decimal",
+            ),
         );
 
         let diff = diff_symbol_maps("old", "new", old, new);
-        let renamed: Vec<_> = diff.changes.iter()
+        let renamed: Vec<_> = diff
+            .changes
+            .iter()
             .filter(|c| matches!(&c.change, ChangeKind::Renamed { .. }))
             .collect();
-        assert_eq!(renamed.len(), 1, "Expected 1 rename, got: {:?}",
-            diff.changes.iter().map(|c| format!("{}: {}", c.name, c.change)).collect::<Vec<_>>());
+        assert_eq!(
+            renamed.len(),
+            1,
+            "Expected 1 rename, got: {:?}",
+            diff.changes
+                .iter()
+                .map(|c| format!("{}: {}", c.name, c.change))
+                .collect::<Vec<_>>()
+        );
         assert_eq!(renamed[0].name, "compute_order_sum");
         if let ChangeKind::Renamed { old_name } = &renamed[0].change {
             assert_eq!(old_name, "calculate_order_total");
         }
-        let removed: Vec<_> = diff.changes.iter()
+        let removed: Vec<_> = diff
+            .changes
+            .iter()
             .filter(|c| c.change == ChangeKind::Removed)
             .collect();
         assert_eq!(removed.len(), 0, "Old name should not appear as Removed");
@@ -552,7 +618,9 @@ mod tests {
         );
 
         let diff = diff_symbol_maps("old", "new", old, new);
-        let renamed: Vec<_> = diff.changes.iter()
+        let renamed: Vec<_> = diff
+            .changes
+            .iter()
             .filter(|c| matches!(&c.change, ChangeKind::Renamed { .. }))
             .collect();
         assert_eq!(renamed.len(), 0);
@@ -574,7 +642,9 @@ mod tests {
         );
 
         let diff = diff_symbol_maps("old", "new", old, new);
-        let moved: Vec<_> = diff.changes.iter()
+        let moved: Vec<_> = diff
+            .changes
+            .iter()
             .filter(|c| matches!(&c.change, ChangeKind::Moved { .. }))
             .collect();
         assert_eq!(moved.len(), 1);
@@ -597,8 +667,14 @@ mod tests {
         );
 
         let diff = diff_symbol_maps("old", "new", old, new);
-        assert!(diff.changes.iter().any(|c| c.change == ChangeKind::Added && c.name == "added_fn"));
-        assert!(diff.changes.iter().any(|c| c.change == ChangeKind::Removed && c.name == "removed_fn"));
+        assert!(diff
+            .changes
+            .iter()
+            .any(|c| c.change == ChangeKind::Added && c.name == "added_fn"));
+        assert!(diff
+            .changes
+            .iter()
+            .any(|c| c.change == ChangeKind::Removed && c.name == "removed_fn"));
     }
 
     #[test]
@@ -606,8 +682,14 @@ mod tests {
         let mut old = HashMap::new();
         let mut new = HashMap::new();
         let k = key("app.py", "stable_fn", "Function");
-        old.insert(k.clone(), sym("app.py", "stable_fn", "Function", "same_hash", "()", "int"));
-        new.insert(k.clone(), sym("app.py", "stable_fn", "Function", "same_hash", "()", "int"));
+        old.insert(
+            k.clone(),
+            sym("app.py", "stable_fn", "Function", "same_hash", "()", "int"),
+        );
+        new.insert(
+            k.clone(),
+            sym("app.py", "stable_fn", "Function", "same_hash", "()", "int"),
+        );
 
         let diff = diff_symbol_maps("old", "new", old, new);
         assert_eq!(diff.changes.len(), 0);
@@ -620,26 +702,57 @@ mod tests {
 
         // BodyChanged
         let k1 = key("a.py", "fn_body", "Function");
-        old.insert(k1.clone(), sym("a.py", "fn_body", "Function", "h1", "()", ""));
-        new.insert(k1.clone(), sym("a.py", "fn_body", "Function", "h2", "()", ""));
+        old.insert(
+            k1.clone(),
+            sym("a.py", "fn_body", "Function", "h1", "()", ""),
+        );
+        new.insert(
+            k1.clone(),
+            sym("a.py", "fn_body", "Function", "h2", "()", ""),
+        );
 
         // SignatureChanged
         let k2 = key("a.py", "fn_sig", "Function");
-        old.insert(k2.clone(), sym("a.py", "fn_sig", "Function", "h3", "(x: int)", ""));
-        new.insert(k2.clone(), sym("a.py", "fn_sig", "Function", "h4", "(x: str)", ""));
+        old.insert(
+            k2.clone(),
+            sym("a.py", "fn_sig", "Function", "h3", "(x: int)", ""),
+        );
+        new.insert(
+            k2.clone(),
+            sym("a.py", "fn_sig", "Function", "h4", "(x: str)", ""),
+        );
 
         // Moved
-        old.insert(key("old.py", "fn_moved", "Function"), sym("old.py", "fn_moved", "Function", "h5", "()", ""));
-        new.insert(key("new.py", "fn_moved", "Function"), sym("new.py", "fn_moved", "Function", "h5", "()", ""));
+        old.insert(
+            key("old.py", "fn_moved", "Function"),
+            sym("old.py", "fn_moved", "Function", "h5", "()", ""),
+        );
+        new.insert(
+            key("new.py", "fn_moved", "Function"),
+            sym("new.py", "fn_moved", "Function", "h5", "()", ""),
+        );
 
         // Renamed
-        old.insert(key("a.py", "old_name", "Function"), sym("a.py", "old_name", "Function", "h6", "()", ""));
-        new.insert(key("a.py", "new_name", "Function"), sym("a.py", "new_name", "Function", "h6", "()", ""));
+        old.insert(
+            key("a.py", "old_name", "Function"),
+            sym("a.py", "old_name", "Function", "h6", "()", ""),
+        );
+        new.insert(
+            key("a.py", "new_name", "Function"),
+            sym("a.py", "new_name", "Function", "h6", "()", ""),
+        );
 
         let diff = diff_symbol_maps("old", "new", old, new);
         let modified: Vec<_> = diff.modified().collect();
-        assert_eq!(modified.len(), 4, "modified() should include all 4 change types, got: {:?}",
-            modified.iter().map(|c| format!("{}: {}", c.name, c.change)).collect::<Vec<_>>());
+        assert_eq!(
+            modified.len(),
+            4,
+            "modified() should include all 4 change types, got: {:?}",
+            modified
+                .iter()
+                .map(|c| format!("{}: {}", c.name, c.change))
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -648,18 +761,38 @@ mod tests {
         let mut new = HashMap::new();
         old.insert(
             key("app.py", "calc_total", "Function"),
-            sym("app.py", "calc_total", "Function", "hash_old", "(items: list)", "float"),
+            sym(
+                "app.py",
+                "calc_total",
+                "Function",
+                "hash_old",
+                "(items: list)",
+                "float",
+            ),
         );
         new.insert(
             key("app.py", "compute_sum", "Function"),
-            sym("app.py", "compute_sum", "Function", "hash_new", "(items: list)", "float"),
+            sym(
+                "app.py",
+                "compute_sum",
+                "Function",
+                "hash_new",
+                "(items: list)",
+                "float",
+            ),
         );
 
         let diff = diff_symbol_maps("old", "new", old, new);
-        let renamed: Vec<_> = diff.changes.iter()
+        let renamed: Vec<_> = diff
+            .changes
+            .iter()
             .filter(|c| matches!(&c.change, ChangeKind::Renamed { .. }))
             .collect();
-        assert_eq!(renamed.len(), 0, "Should NOT detect rename when body hash differs");
+        assert_eq!(
+            renamed.len(),
+            0,
+            "Should NOT detect rename when body hash differs"
+        );
         assert!(diff.changes.iter().any(|c| c.change == ChangeKind::Added));
         assert!(diff.changes.iter().any(|c| c.change == ChangeKind::Removed));
     }

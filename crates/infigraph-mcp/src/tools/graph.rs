@@ -688,11 +688,17 @@ pub fn tool_generate_test_context(args: &Value) -> Result<String> {
 
     let ctx = gq.generate_test_context(file_filter, limit)?;
 
-    let mut out = format!("## Test Generation Context\n\nFramework: {}\n", ctx.framework);
+    let mut out = format!(
+        "## Test Generation Context\n\nFramework: {}\n",
+        ctx.framework
+    );
 
     if let Some(ref ex) = ctx.example_test {
         out.push_str(&format!("\n### Example Test (style reference)\n"));
-        out.push_str(&format!("  {} — {}:{}-{}\n", ex.name, ex.file, ex.start_line, ex.end_line));
+        out.push_str(&format!(
+            "  {} — {}:{}-{}\n",
+            ex.name, ex.file, ex.start_line, ex.end_line
+        ));
         let file_path = prism.root().join(&ex.file);
         if let Ok(source) = std::fs::read_to_string(&file_path) {
             let lines: Vec<&str> = source.lines().collect();
@@ -708,12 +714,21 @@ pub fn tool_generate_test_context(args: &Value) -> Result<String> {
         }
     }
 
-    out.push_str(&format!("\n### Targets ({} uncovered symbols, priority-ranked)\n\n", ctx.targets.len()));
+    out.push_str(&format!(
+        "\n### Targets ({} uncovered symbols, priority-ranked)\n\n",
+        ctx.targets.len()
+    ));
 
     for (i, t) in ctx.targets.iter().enumerate() {
         out.push_str(&format!(
             "{}. **{}** [{}] — {}:{}-{} (priority: {})\n",
-            i + 1, t.name, t.kind, t.file, t.start_line, t.end_line, t.priority_score
+            i + 1,
+            t.name,
+            t.kind,
+            t.file,
+            t.start_line,
+            t.end_line,
+            t.priority_score
         ));
         if !t.visibility.is_empty() {
             out.push_str(&format!("   visibility: {}\n", t.visibility));
@@ -740,7 +755,10 @@ pub fn tool_generate_test_context(args: &Value) -> Result<String> {
                 if b.condition.is_empty() {
                     out.push_str(&format!("{}L{}: {}\n", indent, b.line, b.kind));
                 } else {
-                    out.push_str(&format!("{}L{}: {} ({})\n", indent, b.line, b.kind, b.condition));
+                    out.push_str(&format!(
+                        "{}L{}: {} ({})\n",
+                        indent, b.line, b.kind, b.condition
+                    ));
                 }
             }
         }

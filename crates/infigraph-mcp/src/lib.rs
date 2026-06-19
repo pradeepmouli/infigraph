@@ -1,7 +1,7 @@
 pub mod tools;
 pub mod web;
 
-use tools::watch::{tool_watch_project, is_watching};
+use tools::watch::{is_watching, tool_watch_project};
 
 pub fn auto_start_watch(path: &str) -> Option<String> {
     let root = std::path::PathBuf::from(path).canonicalize().ok()?;

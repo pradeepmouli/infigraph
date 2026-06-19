@@ -126,7 +126,10 @@ pub fn parse_pipeline_template(content: &str, title: &str, doc_id: &str) -> Opti
                 .map(|(s, _, _)| *s)
                 .unwrap_or(content.len());
 
-            let body_start = content[start..].find('\n').map(|p| start + p + 1).unwrap_or(end);
+            let body_start = content[start..]
+                .find('\n')
+                .map(|p| start + p + 1)
+                .unwrap_or(end);
             let body = content[body_start..end].trim().to_string();
             sections.push(SectionContent {
                 section,
@@ -197,7 +200,9 @@ pub fn parse_pipeline_template(content: &str, title: &str, doc_id: &str) -> Opti
 fn extract_sources(text: &str) -> String {
     let mut sources = Vec::new();
 
-    let table_re = Regex::new(r"(?i)(?:table|schema|database|source)[:\s]*[`]?(\w+\.\w+(?:\.\w+)?)[`]?").unwrap();
+    let table_re =
+        Regex::new(r"(?i)(?:table|schema|database|source)[:\s]*[`]?(\w+\.\w+(?:\.\w+)?)[`]?")
+            .unwrap();
     for cap in table_re.captures_iter(text) {
         sources.push(cap[1].to_string());
     }
@@ -220,7 +225,8 @@ fn extract_sources(text: &str) -> String {
 fn extract_tables(text: &str) -> String {
     let mut tables = Vec::new();
 
-    let heading_table_re = Regex::new(r"(?i)(?:^|\n)#{1,6}\s+(?:Table[:\s]*)?[`]?(\w+\.\w+(?:\.\w+)?)[`]?").unwrap();
+    let heading_table_re =
+        Regex::new(r"(?i)(?:^|\n)#{1,6}\s+(?:Table[:\s]*)?[`]?(\w+\.\w+(?:\.\w+)?)[`]?").unwrap();
     for cap in heading_table_re.captures_iter(text) {
         let t = cap[1].to_string();
         if !tables.contains(&t) {
@@ -287,7 +293,10 @@ fn extract_github_repo(text: &str) -> String {
 
 fn extract_daci(text: &str) -> String {
     let mut parts = Vec::new();
-    let role_re = Regex::new(r"(?im)^\s*\**\s*(Driver|Approver|Contributor|Informed|Accountable)[:\s*]*(.+)$").unwrap();
+    let role_re = Regex::new(
+        r"(?im)^\s*\**\s*(Driver|Approver|Contributor|Informed|Accountable)[:\s*]*(.+)$",
+    )
+    .unwrap();
     for cap in role_re.captures_iter(text) {
         parts.push(format!("{}: {}", &cap[1], cap[2].trim()));
     }
@@ -317,14 +326,20 @@ fn extract_dependencies(text: &str) -> (String, String) {
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
-        if trimmed.starts_with("|--") || trimmed.starts_with("| --") || trimmed.chars().all(|c| c == '-' || c == '|' || c == ' ') {
+        if trimmed.starts_with("|--")
+            || trimmed.starts_with("| --")
+            || trimmed.chars().all(|c| c == '-' || c == '|' || c == ' ')
+        {
             continue;
         }
-        if trimmed.starts_with('|') && (lower.contains("dependency") || lower.contains("owner") || lower.contains("sla")) {
+        if trimmed.starts_with('|')
+            && (lower.contains("dependency") || lower.contains("owner") || lower.contains("sla"))
+        {
             continue;
         }
         if trimmed.starts_with('|') {
-            let cells: Vec<&str> = trimmed.split('|')
+            let cells: Vec<&str> = trimmed
+                .split('|')
                 .map(|c| c.trim())
                 .filter(|c| !c.is_empty())
                 .collect();
@@ -371,12 +386,24 @@ fn summarize_section(text: &str, max_chars: usize) -> String {
 
 fn needs_llm_fallback(record: &PipelineRecord) -> Vec<&'static str> {
     let mut missing = Vec::new();
-    if record.source_systems.is_empty() { missing.push("source_systems"); }
-    if record.dest_tables.is_empty() { missing.push("dest_tables"); }
-    if record.scheduler_type.is_empty() || record.scheduler_type == "unknown" { missing.push("scheduler_type"); }
-    if record.github_repo.is_empty() { missing.push("github_repo"); }
-    if record.daci.is_empty() { missing.push("daci"); }
-    if record.business_logic_summary.is_empty() { missing.push("business_logic_summary"); }
+    if record.source_systems.is_empty() {
+        missing.push("source_systems");
+    }
+    if record.dest_tables.is_empty() {
+        missing.push("dest_tables");
+    }
+    if record.scheduler_type.is_empty() || record.scheduler_type == "unknown" {
+        missing.push("scheduler_type");
+    }
+    if record.github_repo.is_empty() {
+        missing.push("github_repo");
+    }
+    if record.daci.is_empty() {
+        missing.push("daci");
+    }
+    if record.business_logic_summary.is_empty() {
+        missing.push("business_logic_summary");
+    }
     missing
 }
 
@@ -450,21 +477,45 @@ pub fn fill_with_llm(record: &mut PipelineRecord, content: &str, title: &str) ->
 
     let prompt = build_extraction_prompt(content, title, &missing);
     let Some(json) = call_claude_extract(&prompt) else {
-        eprintln!("LLM extraction failed for pipeline '{}' (missing: {})", title, missing.join(", "));
+        eprintln!(
+            "LLM extraction failed for pipeline '{}' (missing: {})",
+            title,
+            missing.join(", ")
+        );
         return 0;
     };
 
     let mut filled = 0;
     for field in &missing {
         if let Some(val) = json.get(field).and_then(|v| v.as_str()) {
-            if val.is_empty() { continue; }
+            if val.is_empty() {
+                continue;
+            }
             match *field {
-                "source_systems" => { record.source_systems = val.to_string(); filled += 1; }
-                "dest_tables" => { record.dest_tables = val.to_string(); filled += 1; }
-                "scheduler_type" => { record.scheduler_type = val.to_string(); filled += 1; }
-                "github_repo" => { record.github_repo = val.to_string(); filled += 1; }
-                "daci" => { record.daci = val.to_string(); filled += 1; }
-                "business_logic_summary" => { record.business_logic_summary = val.to_string(); filled += 1; }
+                "source_systems" => {
+                    record.source_systems = val.to_string();
+                    filled += 1;
+                }
+                "dest_tables" => {
+                    record.dest_tables = val.to_string();
+                    filled += 1;
+                }
+                "scheduler_type" => {
+                    record.scheduler_type = val.to_string();
+                    filled += 1;
+                }
+                "github_repo" => {
+                    record.github_repo = val.to_string();
+                    filled += 1;
+                }
+                "daci" => {
+                    record.daci = val.to_string();
+                    filled += 1;
+                }
+                "business_logic_summary" => {
+                    record.business_logic_summary = val.to_string();
+                    filled += 1;
+                }
                 _ => {}
             }
         }
@@ -567,7 +618,11 @@ https://github.intuit.com/tax-data/w2-metrics-pipeline
         assert!(!record.compliance.is_empty());
 
         let missing = needs_llm_fallback(&record);
-        assert!(missing.is_empty(), "Full pipeline should have no missing fields, got: {:?}", missing);
+        assert!(
+            missing.is_empty(),
+            "Full pipeline should have no missing fields, got: {:?}",
+            missing
+        );
     }
 
     #[test]
@@ -578,13 +633,25 @@ https://github.intuit.com/tax-data/w2-metrics-pipeline
         assert_eq!(record.name, "Mystery ETL");
         assert_eq!(record.doc_id, "doc::mystery");
 
-        assert!(!record.source_systems.is_empty(), "source_systems gets prose summary fallback");
-        assert!(!record.dest_tables.is_empty(), "dest_tables gets prose summary fallback");
+        assert!(
+            !record.source_systems.is_empty(),
+            "source_systems gets prose summary fallback"
+        );
+        assert!(
+            !record.dest_tables.is_empty(),
+            "dest_tables gets prose summary fallback"
+        );
         assert!(!record.daci.is_empty(), "daci gets prose summary fallback");
 
         let missing = needs_llm_fallback(&record);
-        assert!(missing.contains(&"scheduler_type"), "scheduler_type should be 'unknown' → needs LLM");
-        assert!(missing.contains(&"github_repo"), "github_repo should be empty — no section matched");
+        assert!(
+            missing.contains(&"scheduler_type"),
+            "scheduler_type should be 'unknown' → needs LLM"
+        );
+        assert!(
+            missing.contains(&"github_repo"),
+            "github_repo should be empty — no section matched"
+        );
     }
 
     #[test]
@@ -603,7 +670,12 @@ https://github.intuit.com/tax-data/w2-metrics-pipeline
         };
 
         let missing = needs_llm_fallback(&record);
-        assert_eq!(missing.len(), 6, "All 6 fields should be flagged: {:?}", missing);
+        assert_eq!(
+            missing.len(),
+            6,
+            "All 6 fields should be flagged: {:?}",
+            missing
+        );
     }
 
     #[test]
@@ -617,10 +689,16 @@ https://github.intuit.com/tax-data/w2-metrics-pipeline
         assert!(!missing_before.is_empty(), "Should have missing fields");
 
         let filled = fill_with_llm(&mut record, content, "Mystery ETL");
-        assert_eq!(filled, 0, "Should return 0 when INFIGRAPH_LLM_EXTRACT not set");
+        assert_eq!(
+            filled, 0,
+            "Should return 0 when INFIGRAPH_LLM_EXTRACT not set"
+        );
 
         let missing_after = needs_llm_fallback(&record);
-        assert_eq!(missing_before, missing_after, "Fields should be unchanged when env var not set");
+        assert_eq!(
+            missing_before, missing_after,
+            "Fields should be unchanged when env var not set"
+        );
     }
 
     #[test]
@@ -649,9 +727,21 @@ https://github.intuit.com/tax-data/w2-metrics-pipeline
 | tax_rpt.executive_dashboard | BI Team | 6am UTC |
 "#;
         let (up, down) = extract_dependencies(dep_text);
-        assert!(up.contains("tax_src.raw_w2_data"), "upstream should contain tax_src.raw_w2_data, got: {}", up);
-        assert!(up.contains("ref_data.employer_dim"), "upstream should contain ref_data.employer_dim, got: {}", up);
-        assert!(down.contains("tax_rpt.executive_dashboard"), "downstream should contain tax_rpt.executive_dashboard, got: {}", down);
+        assert!(
+            up.contains("tax_src.raw_w2_data"),
+            "upstream should contain tax_src.raw_w2_data, got: {}",
+            up
+        );
+        assert!(
+            up.contains("ref_data.employer_dim"),
+            "upstream should contain ref_data.employer_dim, got: {}",
+            up
+        );
+        assert!(
+            down.contains("tax_rpt.executive_dashboard"),
+            "downstream should contain tax_rpt.executive_dashboard, got: {}",
+            down
+        );
     }
 
     #[test]
@@ -674,14 +764,23 @@ https://github.intuit.com/tax-data/w2-metrics-pipeline
         let prompt = build_extraction_prompt("doc content here", "Test Pipeline", &missing);
         assert!(prompt.contains("source_systems"));
         assert!(prompt.contains("github_repo"));
-        assert!(!prompt.contains("scheduler_type"), "Should not include non-missing fields");
-        assert!(!prompt.contains("daci"), "Should not include non-missing fields");
+        assert!(
+            !prompt.contains("scheduler_type"),
+            "Should not include non-missing fields"
+        );
+        assert!(
+            !prompt.contains("daci"),
+            "Should not include non-missing fields"
+        );
     }
 
     #[test]
     fn test_no_sections_returns_none() {
         let content = "Just some plain text with no headings at all.";
         let result = parse_pipeline_template(content, "Empty", "doc::empty");
-        assert!(result.is_none(), "Should return None when no sections found");
+        assert!(
+            result.is_none(),
+            "Should return None when no sections found"
+        );
     }
 }

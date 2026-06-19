@@ -29,11 +29,18 @@ pub fn tool_detect_config_bindings(args: &Value) -> Result<String> {
     let filtered: Vec<_> = bindings
         .iter()
         .filter(|b| {
-            kind_filter.as_ref().map_or(true, |k| b.kind.to_lowercase() == *k)
-                && profile_filter.as_ref().map_or(true, |p| b.profile.to_lowercase() == *p)
+            kind_filter
+                .as_ref()
+                .map_or(true, |k| b.kind.to_lowercase() == *k)
+                && profile_filter
+                    .as_ref()
+                    .map_or(true, |p| b.profile.to_lowercase() == *p)
         })
         .cloned()
         .collect();
 
-    Ok(infigraph_core::config::format_config_bindings(&filtered, &config_files))
+    Ok(infigraph_core::config::format_config_bindings(
+        &filtered,
+        &config_files,
+    ))
 }

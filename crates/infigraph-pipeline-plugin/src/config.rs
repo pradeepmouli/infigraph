@@ -90,10 +90,7 @@ impl ColumnDef {
 
 /// Generate CREATE NODE TABLE DDL for a pipeline plugin.
 pub fn generate_ddl(plugin_id: &str, columns: &[ColumnDef]) -> String {
-    let table_name = format!(
-        "Pipeline_{}",
-        plugin_id
-    );
+    let table_name = format!("Pipeline_{}", plugin_id);
     let mut col_defs = vec!["id STRING".to_string()];
     for col in columns {
         col_defs.push(format!("{} {}", col.name, col.to_kuzu_type()));

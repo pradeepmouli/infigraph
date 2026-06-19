@@ -1,4 +1,4 @@
-use infigraph_core::graph::{SessionStore, SessionData};
+use infigraph_core::graph::{SessionData, SessionStore};
 
 fn make_session(id: &str, created_at: i64, updated_at: i64) -> SessionData {
     SessionData {
@@ -31,9 +31,15 @@ fn test_save_load_roundtrip() {
 fn test_list_all_sorted_by_created() {
     let dir = tempfile::tempdir().unwrap();
     let store = SessionStore::open_dir(dir.path()).unwrap();
-    store.save(&make_session("session_2026-06-05", 100, 200)).unwrap();
-    store.save(&make_session("session_2026-06-07", 300, 400)).unwrap();
-    store.save(&make_session("session_2026-06-06", 200, 500)).unwrap();
+    store
+        .save(&make_session("session_2026-06-05", 100, 200))
+        .unwrap();
+    store
+        .save(&make_session("session_2026-06-07", 300, 400))
+        .unwrap();
+    store
+        .save(&make_session("session_2026-06-06", 200, 500))
+        .unwrap();
 
     let all = store.list_all().unwrap();
     assert_eq!(all.len(), 3);
@@ -46,9 +52,15 @@ fn test_list_all_sorted_by_created() {
 fn test_list_by_updated_sorted() {
     let dir = tempfile::tempdir().unwrap();
     let store = SessionStore::open_dir(dir.path()).unwrap();
-    store.save(&make_session("session_2026-06-05", 100, 500)).unwrap();
-    store.save(&make_session("session_2026-06-07", 300, 300)).unwrap();
-    store.save(&make_session("session_2026-06-06", 200, 400)).unwrap();
+    store
+        .save(&make_session("session_2026-06-05", 100, 500))
+        .unwrap();
+    store
+        .save(&make_session("session_2026-06-07", 300, 300))
+        .unwrap();
+    store
+        .save(&make_session("session_2026-06-06", 200, 400))
+        .unwrap();
 
     let sorted = store.list_by_updated().unwrap();
     assert_eq!(sorted[0].id, "session_2026-06-05");
@@ -60,9 +72,15 @@ fn test_list_by_updated_sorted() {
 fn test_list_recent_truncates() {
     let dir = tempfile::tempdir().unwrap();
     let store = SessionStore::open_dir(dir.path()).unwrap();
-    store.save(&make_session("session_2026-06-05", 100, 100)).unwrap();
-    store.save(&make_session("session_2026-06-06", 200, 200)).unwrap();
-    store.save(&make_session("session_2026-06-07", 300, 300)).unwrap();
+    store
+        .save(&make_session("session_2026-06-05", 100, 100))
+        .unwrap();
+    store
+        .save(&make_session("session_2026-06-06", 200, 200))
+        .unwrap();
+    store
+        .save(&make_session("session_2026-06-07", 300, 300))
+        .unwrap();
 
     let recent = store.list_recent(2).unwrap();
     assert_eq!(recent.len(), 2);
@@ -74,7 +92,9 @@ fn test_list_recent_truncates() {
 fn test_delete_session() {
     let dir = tempfile::tempdir().unwrap();
     let store = SessionStore::open_dir(dir.path()).unwrap();
-    store.save(&make_session("session_2026-06-08", 100, 100)).unwrap();
+    store
+        .save(&make_session("session_2026-06-08", 100, 100))
+        .unwrap();
     assert!(store.load("session_2026-06-08").unwrap().is_some());
     store.delete("session_2026-06-08").unwrap();
     assert!(store.load("session_2026-06-08").unwrap().is_none());

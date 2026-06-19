@@ -4,10 +4,10 @@ use std::path::Path;
 use anyhow::Result;
 use serde::Serialize;
 
-use crate::graph::GraphStore;
-use crate::graph::GraphQuery;
-use crate::routes::Route;
 use super::{FuncInfo, SourceCache};
+use crate::graph::GraphQuery;
+use crate::graph::GraphStore;
+use crate::routes::Route;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct DynamicUrl {
@@ -29,16 +29,67 @@ pub struct MatchedRoute {
 
 static HTTP_CLIENT_PATTERNS: &[(&str, &[&str])] = &[
     ("fetch", &["fetch(", "fetch ("]),
-    ("axios", &["axios.get(", "axios.post(", "axios.put(", "axios.delete(", "axios.patch(", "axios("]),
-    ("requests", &["requests.get(", "requests.post(", "requests.put(", "requests.delete(", "requests.patch("]),
-    ("http_client", &["HttpClient(", "http.get(", "http.post(", "http.put(", "http.delete("]),
+    (
+        "axios",
+        &[
+            "axios.get(",
+            "axios.post(",
+            "axios.put(",
+            "axios.delete(",
+            "axios.patch(",
+            "axios(",
+        ],
+    ),
+    (
+        "requests",
+        &[
+            "requests.get(",
+            "requests.post(",
+            "requests.put(",
+            "requests.delete(",
+            "requests.patch(",
+        ],
+    ),
+    (
+        "http_client",
+        &[
+            "HttpClient(",
+            "http.get(",
+            "http.post(",
+            "http.put(",
+            "http.delete(",
+        ],
+    ),
     ("urllib", &["urllib.request.urlopen(", "urlopen("]),
-    ("okhttp", &["OkHttpClient(", ".newCall(", "Request.Builder()"]),
-    ("resttemplate", &["restTemplate.getForObject(", "restTemplate.postForObject(", "restTemplate.exchange("]),
-    ("webclient", &["WebClient.create(", "webClient.get()", "webClient.post()"]),
-    ("httpclient_dotnet", &["HttpClient.GetAsync(", "HttpClient.PostAsync(", "HttpClient.SendAsync("]),
+    (
+        "okhttp",
+        &["OkHttpClient(", ".newCall(", "Request.Builder()"],
+    ),
+    (
+        "resttemplate",
+        &[
+            "restTemplate.getForObject(",
+            "restTemplate.postForObject(",
+            "restTemplate.exchange(",
+        ],
+    ),
+    (
+        "webclient",
+        &["WebClient.create(", "webClient.get()", "webClient.post()"],
+    ),
+    (
+        "httpclient_dotnet",
+        &[
+            "HttpClient.GetAsync(",
+            "HttpClient.PostAsync(",
+            "HttpClient.SendAsync(",
+        ],
+    ),
     ("net_http", &["http.Get(", "http.Post(", "http.NewRequest("]),
-    ("reqwest", &["reqwest::get(", "reqwest::Client::new(", ".send().await"]),
+    (
+        "reqwest",
+        &["reqwest::get(", "reqwest::Client::new(", ".send().await"],
+    ),
 ];
 
 pub fn detect_dynamic_urls(store: &GraphStore, root: &Path) -> Result<Vec<DynamicUrl>> {
@@ -55,7 +106,9 @@ pub fn detect_dynamic_urls(store: &GraphStore, root: &Path) -> Result<Vec<Dynami
 
     let mut functions: Vec<(String, String, u32, u32)> = Vec::new();
     for row in result {
-        if row.len() < 4 { continue; }
+        if row.len() < 4 {
+            continue;
+        }
         let id = row[0].to_string();
         let file = row[1].to_string();
         let start: u32 = row[2].to_string().parse().unwrap_or(0);
@@ -79,7 +132,9 @@ pub fn detect_dynamic_urls(store: &GraphStore, root: &Path) -> Result<Vec<Dynami
 
         let start_idx = (*start_line as usize).saturating_sub(1);
         let end_idx = (*end_line as usize).min(lines.len());
-        if start_idx >= end_idx { continue; }
+        if start_idx >= end_idx {
+            continue;
+        }
 
         let func_lines = &lines[start_idx..end_idx];
         let detected = find_urls_in_function(symbol_id, file, *start_line, func_lines, &routes);
@@ -111,10 +166,13 @@ pub fn detect_dynamic_urls_with_cache(
         };
         let start_idx = (func.start_line as usize).saturating_sub(1);
         let end_idx = (func.end_line as usize).min(lines.len());
-        if start_idx >= end_idx { continue; }
+        if start_idx >= end_idx {
+            continue;
+        }
 
         let func_lines = &lines[start_idx..end_idx];
-        let detected = find_urls_in_function(&func.id, &func.file, func.start_line, func_lines, &routes);
+        let detected =
+            find_urls_in_function(&func.id, &func.file, func.start_line, func_lines, &routes);
         urls.extend(detected);
     }
 
@@ -210,10 +268,14 @@ fn extract_url_from_line(line: &str, vars: &HashMap<String, String>) -> Option<S
         let mut search_from = 0;
         while let Some(start) = line[search_from..].find(delim) {
             let abs_start = search_from + start + 1;
-            if abs_start >= line.len() { break; }
+            if abs_start >= line.len() {
+                break;
+            }
             if let Some(end) = line[abs_start..].find(delim) {
                 let candidate = &line[abs_start..abs_start + end];
-                if url_indicators.iter().any(|ind| candidate.contains(ind)) || candidate.starts_with('/') {
+                if url_indicators.iter().any(|ind| candidate.contains(ind))
+                    || candidate.starts_with('/')
+                {
                     return Some(candidate.to_string());
                 }
             }
@@ -225,7 +287,8 @@ fn extract_url_from_line(line: &str, vars: &HashMap<String, String>) -> Option<S
     if let Some(start) = line.find('`') {
         if let Some(end) = line[start + 1..].find('`') {
             let template = &line[start + 1..start + 1 + end];
-            if url_indicators.iter().any(|ind| template.contains(ind)) || template.starts_with('/') {
+            if url_indicators.iter().any(|ind| template.contains(ind)) || template.starts_with('/')
+            {
                 return Some(template.to_string());
             }
         }
@@ -237,7 +300,8 @@ fn extract_url_from_line(line: &str, vars: &HashMap<String, String>) -> Option<S
         let inner_start = fstart + 2;
         if let Some(end) = line[inner_start..].find(delim) {
             let template = &line[inner_start..inner_start + end];
-            if url_indicators.iter().any(|ind| template.contains(ind)) || template.starts_with('/') {
+            if url_indicators.iter().any(|ind| template.contains(ind)) || template.starts_with('/')
+            {
                 return Some(template.to_string());
             }
         }
@@ -290,7 +354,10 @@ fn match_route(template: &str, routes: &[Route]) -> Option<MatchedRoute> {
     let template_path = template_path.split("://").last().unwrap_or(template_path);
     // Strip host if present
     let template_path = if template_path.contains('/') && !template_path.starts_with('/') {
-        template_path.split_once('/').map(|(_, p)| format!("/{}", p)).unwrap_or_else(|| template_path.to_string())
+        template_path
+            .split_once('/')
+            .map(|(_, p)| format!("/{}", p))
+            .unwrap_or_else(|| template_path.to_string())
     } else {
         template_path.to_string()
     };
@@ -381,7 +448,10 @@ pub fn format_dynamic_urls(urls: &[DynamicUrl]) -> String {
         for u in items {
             out.push_str(&format!("  {}:{} — {}\n", u.file, u.line, u.url_template));
             if let Some(ref m) = u.matched_route {
-                out.push_str(&format!("    -> {} {} ({}) [{}]\n", m.method, m.path, m.handler_id, m.framework));
+                out.push_str(&format!(
+                    "    -> {} {} ({}) [{}]\n",
+                    m.method, m.path, m.handler_id, m.framework
+                ));
             }
         }
         out.push('\n');
@@ -467,7 +537,8 @@ mod tests {
 
     #[test]
     fn test_extract_string_assignment() {
-        let (var, val) = extract_string_assignment(r#"const base_url = "https://api.example.com""#).unwrap();
+        let (var, val) =
+            extract_string_assignment(r#"const base_url = "https://api.example.com""#).unwrap();
         assert_eq!(var, "base_url");
         assert_eq!(val, "https://api.example.com");
     }

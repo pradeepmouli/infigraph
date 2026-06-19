@@ -417,7 +417,9 @@ fn handle_tools_call(id: &Value, request: &Value) -> Value {
         "detect_config_bindings" => tools::analysis::config::tool_detect_config_bindings(&args),
         "detect_reflection" => tools::analysis::reflection::tool_detect_reflection(&args),
         "detect_taint_flows" => tools::analysis::taint::tool_detect_taint_flows(&args),
-        "detect_interprocedural_taint" => tools::analysis::taint::tool_detect_interprocedural_taint(&args),
+        "detect_interprocedural_taint" => {
+            tools::analysis::taint::tool_detect_interprocedural_taint(&args)
+        }
         "detect_dynamic_urls" => tools::analysis::taint::tool_detect_dynamic_urls(&args),
         "detect_path_traversal" => tools::analysis::taint::tool_detect_path_traversal(&args),
         "ingest_structured" => tools::analysis::structured::tool_ingest_structured(&args),

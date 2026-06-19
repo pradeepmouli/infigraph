@@ -40,11 +40,16 @@ pub fn format_scan_results(stats: &ScanStats) -> String {
     }
 
     if suppressed_count > 0 {
-        out.push_str(&format!("\n--- {} findings suppressed (sanitizer detected nearby) ---\n", suppressed_count));
+        out.push_str(&format!(
+            "\n--- {} findings suppressed (sanitizer detected nearby) ---\n",
+            suppressed_count
+        ));
         for f in stats.findings.iter().filter(|f| f.suppressed) {
             out.push_str(&format!(
                 "  {}:L{} [{}] suppressed by: {}\n",
-                f.file, f.line, f.rule_id,
+                f.file,
+                f.line,
+                f.rule_id,
                 f.sanitizer_hint.as_deref().unwrap_or("unknown"),
             ));
         }

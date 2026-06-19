@@ -80,7 +80,14 @@ const PYTHON_RELATIONS: &str = r#"
 
 fn python_pack() -> LanguagePack {
     let grammar = tree_sitter_python::LANGUAGE.into();
-    LanguagePack::new("python", vec![".py"], grammar, PYTHON_ENTITIES, PYTHON_RELATIONS).unwrap()
+    LanguagePack::new(
+        "python",
+        vec![".py"],
+        grammar,
+        PYTHON_ENTITIES,
+        PYTHON_RELATIONS,
+    )
+    .unwrap()
 }
 
 // ---------- extract_file end-to-end ----------
@@ -98,7 +105,11 @@ fn test_extract_simple_function() {
     assert_eq!(ext.symbols[0].name, "hello");
     assert_eq!(ext.symbols[0].kind, SymbolKind::Function);
     assert!(ext.symbols[0].parameters.is_some());
-    assert!(ext.symbols[0].parameters.as_deref().unwrap().contains("name"));
+    assert!(ext.symbols[0]
+        .parameters
+        .as_deref()
+        .unwrap()
+        .contains("name"));
     assert!(ext.symbols[0].return_type.is_some());
 }
 
@@ -112,7 +123,9 @@ fn test_extract_class_with_methods() {
     assert!(class.is_some());
     assert_eq!(class.unwrap().name, "Animal");
 
-    let methods: Vec<&str> = ext.symbols.iter()
+    let methods: Vec<&str> = ext
+        .symbols
+        .iter()
         .filter(|s| s.kind == SymbolKind::Method)
         .map(|s| s.name.as_str())
         .collect();
@@ -126,7 +139,9 @@ fn test_extract_test_functions() {
     let pack = python_pack();
     let ext = extract_file("test_math.py", src, &pack).unwrap();
 
-    let tests: Vec<&str> = ext.symbols.iter()
+    let tests: Vec<&str> = ext
+        .symbols
+        .iter()
         .filter(|s| s.kind == SymbolKind::Test)
         .map(|s| s.name.as_str())
         .collect();
@@ -134,7 +149,9 @@ fn test_extract_test_functions() {
     assert!(tests.contains(&"test_addition"));
     assert!(tests.contains(&"test_subtraction"));
 
-    let funcs: Vec<&str> = ext.symbols.iter()
+    let funcs: Vec<&str> = ext
+        .symbols
+        .iter()
         .filter(|s| s.kind == SymbolKind::Function)
         .map(|s| s.name.as_str())
         .collect();
@@ -147,12 +164,20 @@ fn test_extract_call_relations() {
     let pack = python_pack();
     let ext = extract_file("calls.py", src, &pack).unwrap();
 
-    let calls: Vec<&str> = ext.relations.iter()
+    let calls: Vec<&str> = ext
+        .relations
+        .iter()
         .filter(|r| r.kind == RelationKind::Calls)
         .map(|r| r.target_id.as_str())
         .collect();
-    assert!(calls.iter().any(|t| t.contains("helper")), "should detect helper() call");
-    assert!(calls.iter().any(|t| t.contains("method")), "should detect obj.method() call");
+    assert!(
+        calls.iter().any(|t| t.contains("helper")),
+        "should detect helper() call"
+    );
+    assert!(
+        calls.iter().any(|t| t.contains("method")),
+        "should detect obj.method() call"
+    );
 }
 
 #[test]
@@ -161,12 +186,20 @@ fn test_extract_import_relations() {
     let pack = python_pack();
     let ext = extract_file("imports.py", src, &pack).unwrap();
 
-    let imports: Vec<&str> = ext.relations.iter()
+    let imports: Vec<&str> = ext
+        .relations
+        .iter()
         .filter(|r| r.kind == RelationKind::Imports)
         .map(|r| r.target_id.as_str())
         .collect();
-    assert!(imports.iter().any(|t| t.contains("os")), "should detect import os");
-    assert!(imports.iter().any(|t| t.contains("pathlib")), "should detect from pathlib import");
+    assert!(
+        imports.iter().any(|t| t.contains("os")),
+        "should detect import os"
+    );
+    assert!(
+        imports.iter().any(|t| t.contains("pathlib")),
+        "should detect from pathlib import"
+    );
 }
 
 #[test]
@@ -175,7 +208,9 @@ fn test_extract_inheritance() {
     let pack = python_pack();
     let ext = extract_file("inherit.py", src, &pack).unwrap();
 
-    let inherits: Vec<_> = ext.relations.iter()
+    let inherits: Vec<_> = ext
+        .relations
+        .iter()
         .filter(|r| r.kind == RelationKind::Inherits)
         .collect();
     assert_eq!(inherits.len(), 1);
@@ -202,8 +237,16 @@ fn test_extract_complexity() {
     let pack = python_pack();
     let ext = extract_file("complex.py", src, &pack).unwrap();
 
-    let func = ext.symbols.iter().find(|s| s.name == "complex_func").unwrap();
-    assert!(func.complexity > 1, "complex function should have complexity > 1, got {}", func.complexity);
+    let func = ext
+        .symbols
+        .iter()
+        .find(|s| s.name == "complex_func")
+        .unwrap();
+    assert!(
+        func.complexity > 1,
+        "complex function should have complexity > 1, got {}",
+        func.complexity
+    );
 }
 
 #[test]
@@ -212,7 +255,9 @@ fn test_extract_module_level_variables() {
     let pack = python_pack();
     let ext = extract_file("config.py", src, &pack).unwrap();
 
-    let vars: Vec<&str> = ext.symbols.iter()
+    let vars: Vec<&str> = ext
+        .symbols
+        .iter()
         .filter(|s| s.kind == SymbolKind::Variable)
         .map(|s| s.name.as_str())
         .collect();
@@ -244,7 +289,11 @@ fn test_extract_symbol_ids_contain_file() {
     let ext = extract_file("src/module.py", src, &pack).unwrap();
 
     for sym in &ext.symbols {
-        assert!(sym.id.contains("src/module.py"), "symbol id should contain file path: {}", sym.id);
+        assert!(
+            sym.id.contains("src/module.py"),
+            "symbol id should contain file path: {}",
+            sym.id
+        );
     }
 }
 
@@ -276,11 +325,27 @@ fn test_extract_docstrings() {
     let pack = python_pack();
     let ext = extract_file("doc.py", src, &pack).unwrap();
 
-    let class = ext.symbols.iter().find(|s| s.kind == SymbolKind::Class).unwrap();
-    assert!(class.docstring.as_deref().unwrap_or("").contains("friendly greeter"));
+    let class = ext
+        .symbols
+        .iter()
+        .find(|s| s.kind == SymbolKind::Class)
+        .unwrap();
+    assert!(class
+        .docstring
+        .as_deref()
+        .unwrap_or("")
+        .contains("friendly greeter"));
 
-    let method = ext.symbols.iter().find(|s| s.kind == SymbolKind::Method).unwrap();
-    assert!(method.docstring.as_deref().unwrap_or("").contains("Say hello"));
+    let method = ext
+        .symbols
+        .iter()
+        .find(|s| s.kind == SymbolKind::Method)
+        .unwrap();
+    assert!(method
+        .docstring
+        .as_deref()
+        .unwrap_or("")
+        .contains("Say hello"));
 }
 
 #[test]
@@ -289,7 +354,9 @@ fn test_extract_nested_class_method_not_top_level() {
     let pack = python_pack();
     let ext = extract_file("nested.py", src, &pack).unwrap();
 
-    let methods: Vec<&str> = ext.symbols.iter()
+    let methods: Vec<&str> = ext
+        .symbols
+        .iter()
         .filter(|s| s.kind == SymbolKind::Method)
         .map(|s| s.name.as_str())
         .collect();
@@ -303,7 +370,9 @@ fn test_extract_multiple_inheritance() {
     let pack = python_pack();
     let ext = extract_file("multi.py", src, &pack).unwrap();
 
-    let inherits: Vec<_> = ext.relations.iter()
+    let inherits: Vec<_> = ext
+        .relations
+        .iter()
         .filter(|r| r.kind == RelationKind::Inherits)
         .collect();
     assert_eq!(inherits.len(), 2, "C inherits from both A and B");
@@ -315,10 +384,15 @@ fn test_extract_receiver_on_method_call() {
     let pack = python_pack();
     let ext = extract_file("recv.py", src, &pack).unwrap();
 
-    let calls_with_receiver: Vec<_> = ext.relations.iter()
+    let calls_with_receiver: Vec<_> = ext
+        .relations
+        .iter()
         .filter(|r| r.kind == RelationKind::Calls && r.receiver.is_some())
         .collect();
-    assert!(!calls_with_receiver.is_empty(), "method calls should have receiver");
+    assert!(
+        !calls_with_receiver.is_empty(),
+        "method calls should have receiver"
+    );
 }
 
 // ---------- Full pipeline: extract → graph → query ----------
@@ -339,10 +413,17 @@ fn test_extract_to_graph_roundtrip() {
     let q = GraphQuery::new(&conn);
 
     let syms = q.symbols_in_file("service.py").unwrap();
-    assert!(syms.len() >= 3, "expected Service, handle, validate, test_handle; got {}", syms.len());
+    assert!(
+        syms.len() >= 3,
+        "expected Service, handle, validate, test_handle; got {}",
+        syms.len()
+    );
 
-    let branches = q.branches_of(
-        &syms.iter().find(|s| s.name == "validate").unwrap().id
-    ).unwrap();
-    assert!(!branches.is_empty(), "validate should have branches (if statement)");
+    let branches = q
+        .branches_of(&syms.iter().find(|s| s.name == "validate").unwrap().id)
+        .unwrap();
+    assert!(
+        !branches.is_empty(),
+        "validate should have branches (if statement)"
+    );
 }

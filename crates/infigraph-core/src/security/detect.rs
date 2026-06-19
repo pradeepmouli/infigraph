@@ -65,7 +65,12 @@ fn walk_and_scan(root: &Path, dir: &Path, stats: &mut ScanStats) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn scan_file(path: &Path, rel_path: &str, ext: &str, stats: &mut ScanStats) -> Result<()> {
+pub(crate) fn scan_file(
+    path: &Path,
+    rel_path: &str,
+    ext: &str,
+    stats: &mut ScanStats,
+) -> Result<()> {
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
         Err(_) => return Ok(()), // skip binary files

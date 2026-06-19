@@ -227,9 +227,17 @@ impl GraphStore {
                 stmt_rows.join(", ")
             ));
 
-            let edge_rows: Vec<String> = extraction.statements.iter().map(|s| {
-                format!("{{a: '{}', b: '{}'}}", escape(&s.parent_symbol), escape(&s.id))
-            }).collect();
+            let edge_rows: Vec<String> = extraction
+                .statements
+                .iter()
+                .map(|s| {
+                    format!(
+                        "{{a: '{}', b: '{}'}}",
+                        escape(&s.parent_symbol),
+                        escape(&s.id)
+                    )
+                })
+                .collect();
             let _ = conn.query(&format!(
                 "UNWIND [{}] AS p MATCH (a:Symbol), (b:Statement) WHERE a.id = p.a AND b.id = p.b CREATE (a)-[:HAS_STATEMENT]->(b)",
                 edge_rows.join(", ")

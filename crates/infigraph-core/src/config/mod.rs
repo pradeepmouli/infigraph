@@ -35,11 +35,7 @@ static CONDITIONAL_PATTERNS: &[ConditionalPattern] = &[
     // Spring qualifiers
     ConditionalPattern {
         kind: "Qualifier",
-        patterns: &[
-            "@Qualifier(",
-            "@Primary",
-            "@Named(",
-        ],
+        patterns: &["@Qualifier(", "@Primary", "@Named("],
     },
     // .NET environment
     ConditionalPattern {
@@ -79,10 +75,7 @@ static CONDITIONAL_PATTERNS: &[ConditionalPattern] = &[
     // Go build tags
     ConditionalPattern {
         kind: "BuildTag",
-        patterns: &[
-            "//go:build ",
-            "// +build ",
-        ],
+        patterns: &["//go:build ", "// +build "],
     },
     // Rust feature gates
     ConditionalPattern {
@@ -170,7 +163,13 @@ fn parse_config_kv(detail: &str, pattern: &str) -> (String, String) {
             .unwrap_or("");
         if inner.contains('=') {
             let parts: Vec<&str> = inner.splitn(2, '=').collect();
-            return (parts[0].trim().to_string(), parts.get(1).map(|s| s.trim().to_string()).unwrap_or_default());
+            return (
+                parts[0].trim().to_string(),
+                parts
+                    .get(1)
+                    .map(|s| s.trim().to_string())
+                    .unwrap_or_default(),
+            );
         }
         return (inner.to_string(), String::new());
     }
@@ -192,17 +191,28 @@ fn extract_profile(detail: &str, kind: &str) -> String {
             "default".to_string()
         }
         "RailsEnv" => {
-            if detail.contains("production") { "production".to_string() }
-            else if detail.contains("development") { "development".to_string() }
-            else if detail.contains("staging") { "staging".to_string() }
-            else if detail.contains("test") { "test".to_string() }
-            else { "default".to_string() }
+            if detail.contains("production") {
+                "production".to_string()
+            } else if detail.contains("development") {
+                "development".to_string()
+            } else if detail.contains("staging") {
+                "staging".to_string()
+            } else if detail.contains("test") {
+                "test".to_string()
+            } else {
+                "default".to_string()
+            }
         }
         "Environment" => {
-            if detail.contains("Production") { "production".to_string() }
-            else if detail.contains("Development") { "development".to_string() }
-            else if detail.contains("Staging") { "staging".to_string() }
-            else { "default".to_string() }
+            if detail.contains("Production") {
+                "production".to_string()
+            } else if detail.contains("Development") {
+                "development".to_string()
+            } else if detail.contains("Staging") {
+                "staging".to_string()
+            } else {
+                "default".to_string()
+            }
         }
         _ => "default".to_string(),
     }
@@ -291,7 +301,12 @@ fn glob_walk(root: &Path) -> Result<Vec<std::path::PathBuf>> {
     Ok(files)
 }
 
-fn walk_config_dir(root: &Path, dir: &Path, files: &mut Vec<std::path::PathBuf>, depth: usize) -> Result<()> {
+fn walk_config_dir(
+    root: &Path,
+    dir: &Path,
+    files: &mut Vec<std::path::PathBuf>,
+    depth: usize,
+) -> Result<()> {
     if depth > 5 {
         return Ok(());
     }
@@ -307,7 +322,16 @@ fn walk_config_dir(root: &Path, dir: &Path, files: &mut Vec<std::path::PathBuf>,
             continue;
         }
         if path.is_dir() {
-            let skip = ["node_modules", "target", "build", "dist", ".git", "__pycache__", "venv", ".venv"];
+            let skip = [
+                "node_modules",
+                "target",
+                "build",
+                "dist",
+                ".git",
+                "__pycache__",
+                "venv",
+                ".venv",
+            ];
             if !skip.contains(&name.as_str()) {
                 walk_config_dir(root, &path, files, depth + 1)?;
             }
@@ -351,7 +375,10 @@ fn extract_profile_from_filename(filename: &str, framework: &str) -> String {
         }
         "Generic" => {
             if filename.starts_with(".env.") {
-                return filename.strip_prefix(".env.").unwrap_or("default").to_string();
+                return filename
+                    .strip_prefix(".env.")
+                    .unwrap_or("default")
+                    .to_string();
             }
             "default".to_string()
         }
@@ -359,7 +386,10 @@ fn extract_profile_from_filename(filename: &str, framework: &str) -> String {
     }
 }
 
-pub fn format_config_bindings(bindings: &[ConfigBinding], config_files: &[ConfigFileInfo]) -> String {
+pub fn format_config_bindings(
+    bindings: &[ConfigBinding],
+    config_files: &[ConfigFileInfo],
+) -> String {
     if bindings.is_empty() && config_files.is_empty() {
         return "No configuration bindings or config files detected.".to_string();
     }
@@ -367,8 +397,12 @@ pub fn format_config_bindings(bindings: &[ConfigBinding], config_files: &[Config
     let mut out = String::new();
 
     if !config_files.is_empty() {
-        out.push_str(&format!("Config files detected: {}\n\n", config_files.len()));
-        let mut by_fw: std::collections::BTreeMap<&str, Vec<&ConfigFileInfo>> = std::collections::BTreeMap::new();
+        out.push_str(&format!(
+            "Config files detected: {}\n\n",
+            config_files.len()
+        ));
+        let mut by_fw: std::collections::BTreeMap<&str, Vec<&ConfigFileInfo>> =
+            std::collections::BTreeMap::new();
         for cf in config_files {
             by_fw.entry(&cf.framework).or_default().push(cf);
         }
@@ -383,7 +417,8 @@ pub fn format_config_bindings(bindings: &[ConfigBinding], config_files: &[Config
 
     if !bindings.is_empty() {
         out.push_str(&format!("Config bindings: {} total\n\n", bindings.len()));
-        let mut by_kind: std::collections::BTreeMap<&str, Vec<&ConfigBinding>> = std::collections::BTreeMap::new();
+        let mut by_kind: std::collections::BTreeMap<&str, Vec<&ConfigBinding>> =
+            std::collections::BTreeMap::new();
         for b in bindings {
             by_kind.entry(b.kind).or_default().push(b);
         }
@@ -391,9 +426,15 @@ pub fn format_config_bindings(bindings: &[ConfigBinding], config_files: &[Config
             out.push_str(&format!("## {} ({} symbols)\n", kind, items.len()));
             for item in items {
                 if item.value.is_empty() {
-                    out.push_str(&format!("  {} — {} [profile: {}]\n", item.symbol_id, item.key, item.profile));
+                    out.push_str(&format!(
+                        "  {} — {} [profile: {}]\n",
+                        item.symbol_id, item.key, item.profile
+                    ));
                 } else {
-                    out.push_str(&format!("  {} — {}={} [profile: {}]\n", item.symbol_id, item.key, item.value, item.profile));
+                    out.push_str(&format!(
+                        "  {} — {}={} [profile: {}]\n",
+                        item.symbol_id, item.key, item.value, item.profile
+                    ));
                 }
             }
             out.push('\n');
@@ -449,7 +490,10 @@ mod tests {
                 }
             }
         }
-        assert!(found.contains(&"Environment"), "should detect IsDevelopment()");
+        assert!(
+            found.contains(&"Environment"),
+            "should detect IsDevelopment()"
+        );
     }
 
     #[test]
@@ -464,7 +508,10 @@ mod tests {
                 }
             }
         }
-        assert!(found.contains(&"DjangoSetting"), "should detect settings.DEBUG");
+        assert!(
+            found.contains(&"DjangoSetting"),
+            "should detect settings.DEBUG"
+        );
     }
 
     #[test]
@@ -479,7 +526,10 @@ mod tests {
                 }
             }
         }
-        assert!(found.contains(&"RailsEnv"), "should detect Rails.env.production?");
+        assert!(
+            found.contains(&"RailsEnv"),
+            "should detect Rails.env.production?"
+        );
     }
 
     #[test]
@@ -509,7 +559,10 @@ mod tests {
                 }
             }
         }
-        assert!(found.contains(&"FeatureGate"), "should detect #[cfg(feature");
+        assert!(
+            found.contains(&"FeatureGate"),
+            "should detect #[cfg(feature"
+        );
     }
 
     #[test]
@@ -550,28 +603,59 @@ mod tests {
 
     #[test]
     fn test_config_file_spring_profile() {
-        assert_eq!(extract_profile_from_filename("application-prod.yml", "Spring"), "prod");
-        assert_eq!(extract_profile_from_filename("application.yml", "Spring"), "default");
+        assert_eq!(
+            extract_profile_from_filename("application-prod.yml", "Spring"),
+            "prod"
+        );
+        assert_eq!(
+            extract_profile_from_filename("application.yml", "Spring"),
+            "default"
+        );
     }
 
     #[test]
     fn test_config_file_dotnet_profile() {
-        assert_eq!(extract_profile_from_filename("appsettings.Production.json", "DotNet"), "Production");
-        assert_eq!(extract_profile_from_filename("appsettings.json", "DotNet"), "default");
+        assert_eq!(
+            extract_profile_from_filename("appsettings.Production.json", "DotNet"),
+            "Production"
+        );
+        assert_eq!(
+            extract_profile_from_filename("appsettings.json", "DotNet"),
+            "default"
+        );
     }
 
     #[test]
     fn test_config_file_env_profile() {
-        assert_eq!(extract_profile_from_filename(".env.production", "Generic"), "production");
+        assert_eq!(
+            extract_profile_from_filename(".env.production", "Generic"),
+            "production"
+        );
         assert_eq!(extract_profile_from_filename(".env", "Generic"), "default");
     }
 
     #[test]
     fn test_matches_config_pattern() {
-        assert!(matches_config_pattern("application.yml", "application.yml", "application.yml"));
-        assert!(matches_config_pattern("application-prod.yml", "application-prod.yml", "application-*.yml"));
-        assert!(!matches_config_pattern("other.yml", "other.yml", "application-*.yml"));
-        assert!(matches_config_pattern(".env.production", ".env.production", ".env.*"));
+        assert!(matches_config_pattern(
+            "application.yml",
+            "application.yml",
+            "application.yml"
+        ));
+        assert!(matches_config_pattern(
+            "application-prod.yml",
+            "application-prod.yml",
+            "application-*.yml"
+        ));
+        assert!(!matches_config_pattern(
+            "other.yml",
+            "other.yml",
+            "application-*.yml"
+        ));
+        assert!(matches_config_pattern(
+            ".env.production",
+            ".env.production",
+            ".env.*"
+        ));
     }
 
     #[test]
@@ -600,6 +684,10 @@ mod tests {
     fn test_parse_config_kv_conditional() {
         let detail = "@ConditionalOnProperty(name=\"feature.enabled\", havingValue=\"true\")";
         let (key, _val) = parse_config_kv(detail, "@ConditionalOnProperty(");
-        assert!(key.contains("feature.enabled") || key.contains("name"), "key={}", key);
+        assert!(
+            key.contains("feature.enabled") || key.contains("name"),
+            "key={}",
+            key
+        );
     }
 }

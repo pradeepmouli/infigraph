@@ -166,12 +166,8 @@ fn test_mixed_read_write_concurrent() {
     let store = Arc::new(store);
 
     // Seed 2 files so readers have something to read
-    store
-        .upsert_file(&make_extraction("seed0.py"))
-        .unwrap();
-    store
-        .upsert_file(&make_extraction("seed1.py"))
-        .unwrap();
+    store.upsert_file(&make_extraction("seed0.py")).unwrap();
+    store.upsert_file(&make_extraction("seed1.py")).unwrap();
 
     let mut handles = Vec::new();
 

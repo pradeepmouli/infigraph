@@ -77,11 +77,7 @@ fn discover_and_register(dir: &Path, registry: &mut PipelinePluginRegistry) -> R
         };
 
         if let Err(e) = config.plugin.validate() {
-            log::warn!(
-                "Invalid pipeline plugin config in {:?}: {}",
-                plugin_toml,
-                e
-            );
+            log::warn!("Invalid pipeline plugin config in {:?}: {}", plugin_toml, e);
             continue;
         }
 

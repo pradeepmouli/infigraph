@@ -1,15 +1,15 @@
-mod rules;
 mod detect;
 mod format;
+mod rules;
 
-pub use rules::*;
 pub use detect::*;
 pub use format::*;
+pub use rules::*;
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::detect::scan_file;
+    use super::*;
     use std::io::Write;
 
     fn scan_str(content: &str, ext: &str) -> Vec<Finding> {
@@ -62,11 +62,15 @@ mod tests {
     fn sanitizer_suppresses_sql_injection() {
         let code = "query = sanitize_sql(user_input)\ncursor.execute(query)";
         let findings = scan_str(code, "py");
-        let sql_findings: Vec<_> = findings.iter()
+        let sql_findings: Vec<_> = findings
+            .iter()
             .filter(|f| f.category == Category::SqlInjection)
             .collect();
         assert!(!sql_findings.is_empty(), "should still detect execute()");
-        assert!(sql_findings.iter().all(|f| f.suppressed), "should be suppressed by sanitize_sql");
+        assert!(
+            sql_findings.iter().all(|f| f.suppressed),
+            "should be suppressed by sanitize_sql"
+        );
         assert!(sql_findings[0].sanitizer_hint.as_deref() == Some("sanitize_sql"));
     }
 
@@ -74,44 +78,60 @@ mod tests {
     fn sanitizer_suppresses_xss_dompurify() {
         let code = "const clean = DOMPurify.sanitize(content);\nel.innerHTML = clean;";
         let findings = scan_str(code, "js");
-        let xss: Vec<_> = findings.iter()
+        let xss: Vec<_> = findings
+            .iter()
             .filter(|f| f.category == Category::XssRisk)
             .collect();
         assert!(!xss.is_empty());
-        assert!(xss.iter().all(|f| f.suppressed), "innerHTML near DOMPurify should be suppressed");
+        assert!(
+            xss.iter().all(|f| f.suppressed),
+            "innerHTML near DOMPurify should be suppressed"
+        );
     }
 
     #[test]
     fn no_suppression_without_sanitizer() {
         let code = "cursor.execute(\"SELECT * FROM users WHERE name = \" + user_input)";
         let findings = scan_str(code, "py");
-        let sql: Vec<_> = findings.iter()
+        let sql: Vec<_> = findings
+            .iter()
             .filter(|f| f.category == Category::SqlInjection)
             .collect();
         assert!(!sql.is_empty());
-        assert!(sql.iter().all(|f| !f.suppressed), "no sanitizer = not suppressed");
+        assert!(
+            sql.iter().all(|f| !f.suppressed),
+            "no sanitizer = not suppressed"
+        );
     }
 
     #[test]
     fn sanitizer_suppresses_command_injection() {
         let code = "safe_arg = shlex.quote(user_input)\nos.system(safe_arg)";
         let findings = scan_str(code, "py");
-        let cmd: Vec<_> = findings.iter()
+        let cmd: Vec<_> = findings
+            .iter()
             .filter(|f| f.category == Category::CommandInjection)
             .collect();
         assert!(!cmd.is_empty());
-        assert!(cmd.iter().all(|f| f.suppressed), "shlex.quote nearby should suppress");
+        assert!(
+            cmd.iter().all(|f| f.suppressed),
+            "shlex.quote nearby should suppress"
+        );
     }
 
     #[test]
     fn sanitizer_suppresses_path_traversal() {
         let code = "safe = os.path.realpath(user_path)\nopen(safe)";
         let findings = scan_str(code, "py");
-        let path_findings: Vec<_> = findings.iter()
+        let path_findings: Vec<_> = findings
+            .iter()
             .filter(|f| f.category == Category::PathTraversal)
             .collect();
         for f in &path_findings {
-            assert!(f.suppressed, "realpath nearby should suppress path traversal");
+            assert!(
+                f.suppressed,
+                "realpath nearby should suppress path traversal"
+            );
         }
     }
 }

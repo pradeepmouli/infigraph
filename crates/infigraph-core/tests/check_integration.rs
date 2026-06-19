@@ -1,6 +1,4 @@
-use infigraph_core::check::{
-    load_config, run_checks, CheckConfig, CheckSelection, CheckStatus,
-};
+use infigraph_core::check::{load_config, run_checks, CheckConfig, CheckSelection, CheckStatus};
 use infigraph_core::graph::GraphStore;
 
 fn empty_store() -> (tempfile::TempDir, GraphStore) {
@@ -75,7 +73,12 @@ fn test_check_security_pass() {
 
     let sec = results.iter().find(|r| r.name == "security");
     if let Some(s) = sec {
-        assert_eq!(s.status, CheckStatus::Pass, "safe code should pass: {}", s.summary);
+        assert_eq!(
+            s.status,
+            CheckStatus::Pass,
+            "safe code should pass: {}",
+            s.summary
+        );
     }
 }
 
@@ -92,23 +95,42 @@ fn test_check_security_fail() {
     let mut cfg = CheckConfig::default();
     cfg.security.max_critical = 0;
     cfg.security.max_high = 0;
-    let sel = CheckSelection { security: true, complexity: false, dead_code: false, vulnerabilities: false };
+    let sel = CheckSelection {
+        security: true,
+        complexity: false,
+        dead_code: false,
+        vulnerabilities: false,
+    };
     let results = run_checks(dir.path(), &cfg, &store, &sel);
 
     let sec = results.iter().find(|r| r.name == "security").unwrap();
-    assert_eq!(sec.status, CheckStatus::Fail, "vuln code should fail: {}", sec.summary);
+    assert_eq!(
+        sec.status,
+        CheckStatus::Fail,
+        "vuln code should fail: {}",
+        sec.summary
+    );
 }
 
 #[test]
 fn test_check_complexity_pass() {
     let (_tmp, store) = empty_store();
     let cfg = CheckConfig::default();
-    let sel = CheckSelection { security: false, complexity: true, dead_code: false, vulnerabilities: false };
+    let sel = CheckSelection {
+        security: false,
+        complexity: true,
+        dead_code: false,
+        vulnerabilities: false,
+    };
     let results = run_checks(std::path::Path::new("."), &cfg, &store, &sel);
 
     let cx = results.iter().find(|r| r.name == "complexity");
     if let Some(c) = cx {
-        assert_eq!(c.status, CheckStatus::Pass, "empty graph should pass complexity");
+        assert_eq!(
+            c.status,
+            CheckStatus::Pass,
+            "empty graph should pass complexity"
+        );
     }
 }
 

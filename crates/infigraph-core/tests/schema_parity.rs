@@ -32,7 +32,9 @@ fn extract_cozo_relations(schema: &[&str]) -> BTreeSet<String> {
     for ddl in schema {
         if ddl.starts_with(":create ") {
             let rest = &ddl[8..];
-            let end = rest.find(|c: char| c == ' ' || c == '{').unwrap_or(rest.len());
+            let end = rest
+                .find(|c: char| c == ' ' || c == '{')
+                .unwrap_or(rest.len());
             names.insert(rest[..end].trim().to_string());
         }
     }
@@ -45,25 +47,43 @@ fn extract_cozo_relations(schema: &[&str]) -> BTreeSet<String> {
 
 /// Canonical set of node tables that MUST exist in both backends.
 const EXPECTED_NODE_TABLES: &[&str] = &[
-    "symbol", "module", "cluster", "file", "folder",
-    "dependency", "statement", "concern", "configbinding",
+    "symbol",
+    "module",
+    "cluster",
+    "file",
+    "folder",
+    "dependency",
+    "statement",
+    "concern",
+    "configbinding",
 ];
 
 /// Canonical set of relation/edge tables that MUST exist in both backends.
 /// CozoDB uses lowercase; Kuzu uses uppercase. We normalize to lowercase.
 /// Note: CozoDB uses `reads_rel`/`writes_rel` instead of `reads`/`writes` (reserved words).
 const EXPECTED_RELATIONS: &[&str] = &[
-    "calls", "depends_on", "imports", "contains", "inherits",
-    "tested_by", "member_of", "similar_to", "bridge_to",
-    "contains_file", "contains_folder", "defines", "calls_service",
-    "has_statement", "has_concern", "has_config", "resolves_to", "taint_flow",
+    "calls",
+    "depends_on",
+    "imports",
+    "contains",
+    "inherits",
+    "tested_by",
+    "member_of",
+    "similar_to",
+    "bridge_to",
+    "contains_file",
+    "contains_folder",
+    "defines",
+    "calls_service",
+    "has_statement",
+    "has_concern",
+    "has_config",
+    "resolves_to",
+    "taint_flow",
 ];
 
 /// Relations that exist in both but with different names due to reserved words.
-const RENAMED_RELATIONS: &[(&str, &str)] = &[
-    ("reads", "reads_rel"),
-    ("writes", "writes_rel"),
-];
+const RENAMED_RELATIONS: &[(&str, &str)] = &[("reads", "reads_rel"), ("writes", "writes_rel")];
 
 #[test]
 fn test_kuzu_schema_has_all_expected_node_tables() {
@@ -118,7 +138,11 @@ fn test_cozo_schema_has_all_expected_node_tables() {
     let schema = infigraph_core::graph::cozo_schema_ddl();
     let cozo_rels = extract_cozo_relations(&schema);
     for expected in EXPECTED_NODE_TABLES {
-        let name = if *expected == "configbinding" { "config_binding" } else { expected };
+        let name = if *expected == "configbinding" {
+            "config_binding"
+        } else {
+            expected
+        };
         assert!(
             cozo_rels.contains(name),
             "CozoDB schema missing node table: {name}. Found: {cozo_rels:?}"
@@ -137,7 +161,11 @@ fn test_schema_parity_no_kuzu_only_tables() {
         RENAMED_RELATIONS.iter().copied().collect();
 
     for node in &kuzu_nodes {
-        let cozo_name = if node == "configbinding" { "config_binding".to_string() } else { node.clone() };
+        let cozo_name = if node == "configbinding" {
+            "config_binding".to_string()
+        } else {
+            node.clone()
+        };
         assert!(
             cozo_rels_set.contains(&cozo_name),
             "Kuzu node table '{node}' has no CozoDB equivalent (expected '{cozo_name}')"
@@ -145,7 +173,10 @@ fn test_schema_parity_no_kuzu_only_tables() {
     }
 
     for rel in &kuzu_rels {
-        let cozo_name = rename_map.get(rel.as_str()).map(|s| s.to_string()).unwrap_or_else(|| rel.clone());
+        let cozo_name = rename_map
+            .get(rel.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| rel.clone());
         assert!(
             cozo_rels_set.contains(&cozo_name),
             "Kuzu relation '{rel}' has no CozoDB equivalent (expected '{cozo_name}')"
@@ -157,7 +188,8 @@ fn test_schema_parity_no_kuzu_only_tables() {
 fn test_symbol_schema_has_no_embedding_column() {
     let schema = infigraph_core::graph::schema_ddl();
     for ddl in &schema {
-        if ddl.to_uppercase().contains("CREATE NODE TABLE") && ddl.to_uppercase().contains("SYMBOL") {
+        if ddl.to_uppercase().contains("CREATE NODE TABLE") && ddl.to_uppercase().contains("SYMBOL")
+        {
             assert!(
                 !ddl.to_lowercase().contains("embedding"),
                 "Symbol schema should NOT contain embedding column — embeddings are stored in sidecar embeddings.bin file, not in graph DB. Found: {ddl}"
@@ -206,7 +238,9 @@ fn extract_cozo_columns(ddl: &str) -> Vec<String> {
         .filter_map(|part| {
             let trimmed = part.trim();
             let col_name = trimmed.split(':').next()?.trim();
-            if col_name.is_empty() { return None; }
+            if col_name.is_empty() {
+                return None;
+            }
             Some(col_name.to_lowercase())
         })
         .collect()
@@ -225,7 +259,9 @@ fn kuzu_table_name(ddl: &str) -> Option<String> {
 fn cozo_relation_name(ddl: &str) -> Option<String> {
     if ddl.starts_with(":create ") {
         let rest = &ddl[8..];
-        let end = rest.find(|c: char| c == ' ' || c == '{').unwrap_or(rest.len());
+        let end = rest
+            .find(|c: char| c == ' ' || c == '{')
+            .unwrap_or(rest.len());
         return Some(rest[..end].trim().to_string());
     }
     None
@@ -245,7 +281,8 @@ fn test_node_table_column_parity() {
     let cozo_schema = infigraph_core::graph::cozo_schema_ddl();
 
     // Build map: cozo relation name -> columns
-    let mut cozo_cols: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    let mut cozo_cols: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
     for ddl in &cozo_schema {
         if let Some(name) = cozo_relation_name(ddl) {
             cozo_cols.insert(name, extract_cozo_columns(ddl));
@@ -255,7 +292,9 @@ fn test_node_table_column_parity() {
     // For each Kuzu node table, verify all columns exist in CozoDB equivalent
     for ddl in &kuzu_schema {
         let upper = ddl.to_uppercase();
-        if !upper.contains("CREATE NODE TABLE") { continue; }
+        if !upper.contains("CREATE NODE TABLE") {
+            continue;
+        }
         let kuzu_name = match kuzu_table_name(ddl) {
             Some(n) => n,
             None => continue,
@@ -284,7 +323,8 @@ fn test_edge_column_parity() {
     let cozo_schema = infigraph_core::graph::cozo_schema_ddl();
 
     // Build map: cozo relation name -> columns
-    let mut cozo_cols: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    let mut cozo_cols: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
     for ddl in &cozo_schema {
         if let Some(name) = cozo_relation_name(ddl) {
             cozo_cols.insert(name, extract_cozo_columns(ddl));
@@ -292,13 +332,16 @@ fn test_edge_column_parity() {
     }
 
     // Kuzu edge name -> CozoDB edge name
-    let edge_rename: std::collections::HashMap<&str, &str> = [
-        ("reads", "reads_rel"), ("writes", "writes_rel"),
-    ].into_iter().collect();
+    let edge_rename: std::collections::HashMap<&str, &str> =
+        [("reads", "reads_rel"), ("writes", "writes_rel")]
+            .into_iter()
+            .collect();
 
     for ddl in &kuzu_schema {
         let upper = ddl.to_uppercase();
-        if !upper.contains("CREATE REL TABLE") { continue; }
+        if !upper.contains("CREATE REL TABLE") {
+            continue;
+        }
         let kuzu_name = match extract_after(&upper, "CREATE REL TABLE IF NOT EXISTS ") {
             Some(n) => n.to_lowercase(),
             None => continue,
@@ -317,19 +360,25 @@ fn test_edge_column_parity() {
         let body = &ddl[open..close];
         let parts: Vec<&str> = body.split(',').collect();
         // First part is "FROM X TO Y", rest are extra columns
-        let extra_cols: Vec<String> = parts[1..].iter()
+        let extra_cols: Vec<String> = parts[1..]
+            .iter()
             .filter_map(|p| {
                 let trimmed = p.trim();
                 let col = trimmed.split_whitespace().next()?;
                 let col_lower = col.to_lowercase();
-                if col_lower == "from" || col_lower == "to" { return None; }
+                if col_lower == "from" || col_lower == "to" {
+                    return None;
+                }
                 Some(col_lower)
             })
             .collect();
 
-        if extra_cols.is_empty() { continue; }
+        if extra_cols.is_empty() {
+            continue;
+        }
 
-        let cozo_name = edge_rename.get(kuzu_name.as_str())
+        let cozo_name = edge_rename
+            .get(kuzu_name.as_str())
             .map(|s| s.to_string())
             .unwrap_or_else(|| kuzu_name.clone());
 
@@ -359,7 +408,8 @@ fn test_migrations_covered_in_cozo_base_schema() {
     let cozo_rels = extract_cozo_relations(&cozo_schema);
 
     // Build column maps for CozoDB
-    let mut cozo_cols: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    let mut cozo_cols: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
     for ddl in &cozo_schema {
         if let Some(name) = cozo_relation_name(ddl) {
             cozo_cols.insert(name, extract_cozo_columns(ddl));
@@ -404,7 +454,8 @@ fn test_migrations_covered_in_cozo_base_schema() {
                 let lower = name.to_lowercase();
                 let rename_map: std::collections::HashMap<&str, &str> =
                     RENAMED_RELATIONS.iter().copied().collect();
-                let cozo_name = rename_map.get(lower.as_str())
+                let cozo_name = rename_map
+                    .get(lower.as_str())
                     .map(|s| s.to_string())
                     .unwrap_or(lower);
                 assert!(
@@ -427,8 +478,14 @@ fn test_embeddings_use_sidecar_file_not_graph_db() {
     ];
     infigraph_core::embed::save_embeddings(&emb_path, &embeddings).unwrap();
 
-    assert!(emb_path.exists(), "embeddings.bin should be created as sidecar file");
-    assert!(emb_path.metadata().unwrap().len() > 0, "embeddings.bin should have content");
+    assert!(
+        emb_path.exists(),
+        "embeddings.bin should be created as sidecar file"
+    );
+    assert!(
+        emb_path.metadata().unwrap().len() > 0,
+        "embeddings.bin should have content"
+    );
 
     let loaded = infigraph_core::embed::load_embeddings(&emb_path).unwrap();
     assert_eq!(loaded.len(), 2);

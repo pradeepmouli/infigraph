@@ -554,11 +554,7 @@ impl DocStore {
     }
 
     /// Impact analysis using PipelineCore inputs/outputs.
-    pub fn impact_analysis(
-        &self,
-        table_name: &str,
-        max_depth: u32,
-    ) -> Result<Vec<ImpactResult>> {
+    pub fn impact_analysis(&self, table_name: &str, max_depth: u32) -> Result<Vec<ImpactResult>> {
         let conn = self.connection()?;
         let esc = escape_str(table_name);
         let mut results = Vec::new();
@@ -570,8 +566,7 @@ impl DocStore {
                 esc
             ))
             .map_err(|e| anyhow::anyhow!("impact_analysis direct: {e}"))?;
-        let mut affected_ids: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
+        let mut affected_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
         while let Some(row) = direct.next() {
             if row.len() >= 2 {
                 let id = row[0].to_string();

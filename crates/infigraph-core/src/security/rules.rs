@@ -569,59 +569,95 @@ pub(crate) static SANITIZERS: &[Sanitizer] = &[
     Sanitizer {
         category: || Category::SqlInjection,
         patterns: &[
-            "parameterize", "prepare(", "bind_param", "sanitize_sql",
-            "sqlalchemy.text(", "prepared_statement", "placeholders",
-            "cursor.execute(%s", "cursor.execute(?,", "?)",
+            "parameterize",
+            "prepare(",
+            "bind_param",
+            "sanitize_sql",
+            "sqlalchemy.text(",
+            "prepared_statement",
+            "placeholders",
+            "cursor.execute(%s",
+            "cursor.execute(?,",
+            "?)",
         ],
     },
     Sanitizer {
         category: || Category::XssRisk,
         patterns: &[
-            "escape_html", "sanitize(", "dompurify", "bleach.clean(",
-            "html.escape(", "encodeuricomponent(", "cgi.escape(",
-            "markupsafe.escape(", "xss_clean(",
+            "escape_html",
+            "sanitize(",
+            "dompurify",
+            "bleach.clean(",
+            "html.escape(",
+            "encodeuricomponent(",
+            "cgi.escape(",
+            "markupsafe.escape(",
+            "xss_clean(",
         ],
     },
     Sanitizer {
         category: || Category::CommandInjection,
         patterns: &[
-            "shlex.quote(", "shell_escape", "escapeshellarg(",
-            "escapeshellcmd(", "shell=false", "shlex.split(",
+            "shlex.quote(",
+            "shell_escape",
+            "escapeshellarg(",
+            "escapeshellcmd(",
+            "shell=false",
+            "shlex.split(",
         ],
     },
     Sanitizer {
         category: || Category::PathTraversal,
         patterns: &[
-            "realpath(", "abspath(", "normalize(", "canonicalize(",
-            "path.resolve(", "secure_filename(", "os.path.basename(",
+            "realpath(",
+            "abspath(",
+            "normalize(",
+            "canonicalize(",
+            "path.resolve(",
+            "secure_filename(",
+            "os.path.basename(",
         ],
     },
     Sanitizer {
         category: || Category::Ssrf,
         patterns: &[
-            "validate_url(", "is_allowed_host(", "urlparse(",
-            "allowed_hosts", "url_validator(", "safelist",
+            "validate_url(",
+            "is_allowed_host(",
+            "urlparse(",
+            "allowed_hosts",
+            "url_validator(",
+            "safelist",
         ],
     },
     Sanitizer {
         category: || Category::OpenRedirect,
         patterns: &[
-            "url_has_allowed_host(", "is_safe_url(", "validate_redirect(",
-            "allowed_hosts", "safe_redirect(",
+            "url_has_allowed_host(",
+            "is_safe_url(",
+            "validate_redirect(",
+            "allowed_hosts",
+            "safe_redirect(",
         ],
     },
     Sanitizer {
         category: || Category::InsecureDeserialization,
         patterns: &[
-            "safe_load(", "yaml.safe_load(", "json.loads(",
-            "allowlist", "whitelist_classes",
+            "safe_load(",
+            "yaml.safe_load(",
+            "json.loads(",
+            "allowlist",
+            "whitelist_classes",
         ],
     },
 ];
 
 pub(crate) const SANITIZER_WINDOW: usize = 5;
 
-pub(crate) fn find_sanitizer_for(category: &Category, lines: &[&str], finding_line: usize) -> Option<String> {
+pub(crate) fn find_sanitizer_for(
+    category: &Category,
+    lines: &[&str],
+    finding_line: usize,
+) -> Option<String> {
     let start = finding_line.saturating_sub(SANITIZER_WINDOW);
     let end = (finding_line + SANITIZER_WINDOW + 1).min(lines.len());
 

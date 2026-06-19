@@ -1,4 +1,6 @@
-use infigraph_confluence::{parse_pipeline_template, CrawlOptions, ConfluenceClient, ConfluenceSync};
+use infigraph_confluence::{
+    parse_pipeline_template, ConfluenceClient, ConfluenceSync, CrawlOptions,
+};
 
 // ==================== CrawlOptions ====================
 
@@ -30,7 +32,8 @@ fn test_client_new_trims_url() {
 
 #[test]
 fn test_client_new_basic() {
-    let client = ConfluenceClient::new_basic("https://wiki.example.com", "user@test.com", "token123");
+    let client =
+        ConfluenceClient::new_basic("https://wiki.example.com", "user@test.com", "token123");
     assert_eq!(client.base_url(), "https://wiki.example.com");
 }
 
@@ -90,10 +93,16 @@ Null check on transaction_id, amount > 0 validation.
     assert_eq!(record.name, "Sales ETL");
     assert_eq!(record.doc_id, "doc::sales");
     assert!(record.id.starts_with("pipeline::"));
-    assert!(record.source_systems.contains("sales_src.raw_transactions"),
-        "source: {}", record.source_systems);
-    assert!(record.dest_tables.contains("sales_dm.fact_daily_sales"),
-        "dest: {}", record.dest_tables);
+    assert!(
+        record.source_systems.contains("sales_src.raw_transactions"),
+        "source: {}",
+        record.source_systems
+    );
+    assert!(
+        record.dest_tables.contains("sales_dm.fact_daily_sales"),
+        "dest: {}",
+        record.dest_tables
+    );
     assert_eq!(record.scheduler_type, "Airflow");
     assert!(record.github_repo.contains("github.intuit.com"));
     assert!(record.daci.contains("Alice"));
@@ -138,10 +147,19 @@ fn test_parse_pipeline_dependency_extraction() {
 | analytics.daily_report | BI Team | 8am |
 "#;
     let r = parse_pipeline_template(content, "Deps", "doc::deps").unwrap();
-    assert!(r.dependencies_upstream.contains("db_src.orders"),
-        "upstream: {}", r.dependencies_upstream);
-    assert!(r.dependencies_upstream.contains("db_src.products"),
-        "upstream: {}", r.dependencies_upstream);
-    assert!(r.dependencies_downstream.contains("analytics.daily_report"),
-        "downstream: {}", r.dependencies_downstream);
+    assert!(
+        r.dependencies_upstream.contains("db_src.orders"),
+        "upstream: {}",
+        r.dependencies_upstream
+    );
+    assert!(
+        r.dependencies_upstream.contains("db_src.products"),
+        "upstream: {}",
+        r.dependencies_upstream
+    );
+    assert!(
+        r.dependencies_downstream.contains("analytics.daily_report"),
+        "downstream: {}",
+        r.dependencies_downstream
+    );
 }

@@ -52,61 +52,78 @@ pub(crate) fn cmd_index(root: &Path, full: bool, no_embed: bool) -> Result<()> {
 
     // Detect cross-cutting concerns, taint, etc. — skip when no files changed (incremental no-op)
     if result.indexed_files > 0 {
-    if let Some(store) = prism.store() {
-        // Docstring-only analyzers (no file I/O)
-        match infigraph_core::concerns::detect_cross_cutting(store) {
-            Ok(matches) if !matches.is_empty() => {
-                println!("Detected {} cross-cutting concerns", matches.len());
-            }
-            Ok(_) => {}
-            Err(e) => eprintln!("warning: concern detection failed: {e}"),
-        }
-        match infigraph_core::config::detect_config_bindings(store) {
-            Ok(bindings) if !bindings.is_empty() => {
-                println!("Detected {} config bindings", bindings.len());
-            }
-            Ok(_) => {}
-            Err(e) => eprintln!("warning: config binding detection failed: {e}"),
-        }
-        match infigraph_core::reflection::detect_reflection_sites(store, root) {
-            Ok(sites) if !sites.is_empty() => {
-                let resolved = sites.iter().filter(|s| s.resolved_to.is_some()).count();
-                println!("Detected {} reflection sites ({} resolved)", sites.len(), resolved);
-            }
-            Ok(_) => {}
-            Err(e) => eprintln!("warning: reflection detection failed: {e}"),
-        }
-
-        // Source-reading analyzers — build shared cache once, pass to all three
-        match infigraph_core::taint::build_source_cache(store, root) {
-            Ok((functions, cache)) => {
-                match infigraph_core::taint::detect_taint_flows_with_cache(store, &functions, &cache) {
-                    Ok(flows) if !flows.is_empty() => {
-                        let active = flows.iter().filter(|f| !f.sanitized).count();
-                        println!("Detected {} taint flows ({} active, {} sanitized)", flows.len(), active, flows.len() - active);
-                    }
-                    Ok(_) => {}
-                    Err(e) => eprintln!("warning: taint analysis failed: {e}"),
+        if let Some(store) = prism.store() {
+            // Docstring-only analyzers (no file I/O)
+            match infigraph_core::concerns::detect_cross_cutting(store) {
+                Ok(matches) if !matches.is_empty() => {
+                    println!("Detected {} cross-cutting concerns", matches.len());
                 }
-                match infigraph_core::taint::interprocedural::detect_interprocedural_taint_with_cache(store, &functions, &cache, 5) {
+                Ok(_) => {}
+                Err(e) => eprintln!("warning: concern detection failed: {e}"),
+            }
+            match infigraph_core::config::detect_config_bindings(store) {
+                Ok(bindings) if !bindings.is_empty() => {
+                    println!("Detected {} config bindings", bindings.len());
+                }
+                Ok(_) => {}
+                Err(e) => eprintln!("warning: config binding detection failed: {e}"),
+            }
+            match infigraph_core::reflection::detect_reflection_sites(store, root) {
+                Ok(sites) if !sites.is_empty() => {
+                    let resolved = sites.iter().filter(|s| s.resolved_to.is_some()).count();
+                    println!(
+                        "Detected {} reflection sites ({} resolved)",
+                        sites.len(),
+                        resolved
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => eprintln!("warning: reflection detection failed: {e}"),
+            }
+
+            // Source-reading analyzers — build shared cache once, pass to all three
+            match infigraph_core::taint::build_source_cache(store, root) {
+                Ok((functions, cache)) => {
+                    match infigraph_core::taint::detect_taint_flows_with_cache(
+                        store, &functions, &cache,
+                    ) {
+                        Ok(flows) if !flows.is_empty() => {
+                            let active = flows.iter().filter(|f| !f.sanitized).count();
+                            println!(
+                                "Detected {} taint flows ({} active, {} sanitized)",
+                                flows.len(),
+                                active,
+                                flows.len() - active
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(e) => eprintln!("warning: taint analysis failed: {e}"),
+                    }
+                    match infigraph_core::taint::interprocedural::detect_interprocedural_taint_with_cache(store, &functions, &cache, 5) {
                     Ok(flows) if !flows.is_empty() => {
                         println!("Detected {} inter-procedural taint flows", flows.len());
                     }
                     Ok(_) => {}
                     Err(e) => eprintln!("warning: inter-procedural taint failed: {e}"),
                 }
-                match infigraph_core::taint::dynamic_urls::detect_dynamic_urls_with_cache(store, &functions, &cache) {
-                    Ok(urls) if !urls.is_empty() => {
-                        let matched = urls.iter().filter(|u| u.matched_route.is_some()).count();
-                        println!("Detected {} dynamic URLs ({} matched to routes)", urls.len(), matched);
+                    match infigraph_core::taint::dynamic_urls::detect_dynamic_urls_with_cache(
+                        store, &functions, &cache,
+                    ) {
+                        Ok(urls) if !urls.is_empty() => {
+                            let matched = urls.iter().filter(|u| u.matched_route.is_some()).count();
+                            println!(
+                                "Detected {} dynamic URLs ({} matched to routes)",
+                                urls.len(),
+                                matched
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(e) => eprintln!("warning: dynamic URL detection failed: {e}"),
                     }
-                    Ok(_) => {}
-                    Err(e) => eprintln!("warning: dynamic URL detection failed: {e}"),
                 }
+                Err(e) => eprintln!("warning: source cache build failed: {e}"),
             }
-            Err(e) => eprintln!("warning: source cache build failed: {e}"),
         }
-    }
     }
 
     let stats = prism.stats()?;

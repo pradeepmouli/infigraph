@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use anyhow::Result;
 use arrow::array::{Int64Array, StringArray};
@@ -191,7 +191,11 @@ impl GraphStore {
     }
 
     /// Caller must hold WriteLock.
-    pub fn upsert_all_parquet_conn(&self, conn: &Connection<'_>, extractions: &[FileExtraction]) -> Result<()> {
+    pub fn upsert_all_parquet_conn(
+        &self,
+        conn: &Connection<'_>,
+        extractions: &[FileExtraction],
+    ) -> Result<()> {
         if extractions.is_empty() {
             return Ok(());
         }
@@ -473,18 +477,32 @@ impl GraphStore {
 
         let stmt_pq = tmp.join("infigraph_index_statements.parquet");
         if !stmt_ids.is_empty() {
-            parquet_loader::write_node_parquet(&stmt_pq, &[
-                ("id", DataType::Utf8), ("kind", DataType::Utf8), ("condition", DataType::Utf8),
-                ("start_line", DataType::Int64), ("end_line", DataType::Int64),
-                ("depth", DataType::Int64), ("parent_symbol", DataType::Utf8),
-            ], vec![
-                Arc::new(StringArray::from(stmt_ids)), Arc::new(StringArray::from(stmt_kinds)),
-                Arc::new(StringArray::from(stmt_conditions)),
-                Arc::new(Int64Array::from(stmt_slines)), Arc::new(Int64Array::from(stmt_elines)),
-                Arc::new(Int64Array::from(stmt_depths)), Arc::new(StringArray::from(stmt_parents_sym)),
-            ])?;
-            conn.query(&format!("COPY Statement FROM '{}'", fwd_slash_path(&stmt_pq)))
-                .map_err(|e| anyhow::anyhow!("COPY Statement failed: {e}"))?;
+            parquet_loader::write_node_parquet(
+                &stmt_pq,
+                &[
+                    ("id", DataType::Utf8),
+                    ("kind", DataType::Utf8),
+                    ("condition", DataType::Utf8),
+                    ("start_line", DataType::Int64),
+                    ("end_line", DataType::Int64),
+                    ("depth", DataType::Int64),
+                    ("parent_symbol", DataType::Utf8),
+                ],
+                vec![
+                    Arc::new(StringArray::from(stmt_ids)),
+                    Arc::new(StringArray::from(stmt_kinds)),
+                    Arc::new(StringArray::from(stmt_conditions)),
+                    Arc::new(Int64Array::from(stmt_slines)),
+                    Arc::new(Int64Array::from(stmt_elines)),
+                    Arc::new(Int64Array::from(stmt_depths)),
+                    Arc::new(StringArray::from(stmt_parents_sym)),
+                ],
+            )?;
+            conn.query(&format!(
+                "COPY Statement FROM '{}'",
+                fwd_slash_path(&stmt_pq)
+            ))
+            .map_err(|e| anyhow::anyhow!("COPY Statement failed: {e}"))?;
         }
 
         // Edge tables -- write parquet and COPY FROM with in-memory UNWIND fallback

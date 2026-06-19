@@ -1,11 +1,11 @@
 use std::collections::HashSet;
 use std::path::Path;
 
-use infigraph_docs::extract::{extract_document, DocFormat, ExtractedDoc};
 use infigraph_docs::chunk::{chunk_document, Chunk, ChunkStrategy};
+use infigraph_docs::extract::{extract_document, DocFormat, ExtractedDoc};
+use infigraph_docs::links::extract_and_link_doc;
 use infigraph_docs::search::DocBM25Index;
 use infigraph_docs::store::DocStore;
-use infigraph_docs::links::extract_and_link_doc;
 use infigraph_docs::{is_document_file, DocIndex};
 
 // ==================== is_document_file ====================
@@ -13,24 +13,52 @@ use infigraph_docs::{is_document_file, DocIndex};
 #[test]
 fn test_is_document_file_supported() {
     let supported = [
-        "readme.md", "readme.markdown", "notes.txt", "doc.rst", "guide.adoc",
-        "spec.org", "report.pdf", "letter.docx", "slides.pptx", "data.xlsx",
-        "page.html", "page.htm", "book.epub", "data.xml", "style.xsl",
-        "schema.xsd", "icon.svg", "config.plist", "manual.rtf",
+        "readme.md",
+        "readme.markdown",
+        "notes.txt",
+        "doc.rst",
+        "guide.adoc",
+        "spec.org",
+        "report.pdf",
+        "letter.docx",
+        "slides.pptx",
+        "data.xlsx",
+        "page.html",
+        "page.htm",
+        "book.epub",
+        "data.xml",
+        "style.xsl",
+        "schema.xsd",
+        "icon.svg",
+        "config.plist",
+        "manual.rtf",
     ];
     for name in &supported {
-        assert!(is_document_file(Path::new(name)), "{name} should be document");
+        assert!(
+            is_document_file(Path::new(name)),
+            "{name} should be document"
+        );
     }
 }
 
 #[test]
 fn test_is_document_file_unsupported() {
     let unsupported = [
-        "main.rs", "app.py", "index.js", "Cargo.toml", "Makefile",
-        "no_extension", "image.png", "photo.jpg", "video.mp4",
+        "main.rs",
+        "app.py",
+        "index.js",
+        "Cargo.toml",
+        "Makefile",
+        "no_extension",
+        "image.png",
+        "photo.jpg",
+        "video.mp4",
     ];
     for name in &unsupported {
-        assert!(!is_document_file(Path::new(name)), "{name} should not be document");
+        assert!(
+            !is_document_file(Path::new(name)),
+            "{name} should not be document"
+        );
     }
 }
 
@@ -58,7 +86,8 @@ fn test_extract_plaintext() {
 
 #[test]
 fn test_extract_html() {
-    let content = b"<html><head><title>My Page</title></head><body><p>Hello world</p></body></html>";
+    let content =
+        b"<html><head><title>My Page</title></head><body><p>Hello world</p></body></html>";
     let doc = extract_document(Path::new("test.html"), content, "html").unwrap();
     assert_eq!(doc.format, DocFormat::Html);
     assert_eq!(doc.title.as_deref(), Some("My Page"));
@@ -106,9 +135,20 @@ fn test_chunk_by_headings() {
     let text = "# Introduction\n\nThis is the intro.\n\n## Details\n\nHere are details.\n";
     let doc = make_doc(text);
     let chunks = chunk_document(&doc, "test.md", "hash1", ChunkStrategy::HeadingBounded);
-    assert!(chunks.len() >= 2, "should produce at least 2 chunks: got {}", chunks.len());
-    assert!(chunks[0].text.contains("Introduction"), "first chunk: {}", chunks[0].text);
-    assert!(chunks.iter().any(|c| c.text.contains("Details")), "should have Details chunk");
+    assert!(
+        chunks.len() >= 2,
+        "should produce at least 2 chunks: got {}",
+        chunks.len()
+    );
+    assert!(
+        chunks[0].text.contains("Introduction"),
+        "first chunk: {}",
+        chunks[0].text
+    );
+    assert!(
+        chunks.iter().any(|c| c.text.contains("Details")),
+        "should have Details chunk"
+    );
 
     for (i, c) in chunks.iter().enumerate() {
         assert_eq!(c.index, i, "chunk index mismatch");
@@ -126,7 +166,11 @@ fn test_chunk_no_headings_falls_back_to_paragraphs() {
     let doc = make_doc(&text);
     let chunks = chunk_document(&doc, "doc.txt", "hash2", ChunkStrategy::HeadingBounded);
     assert!(!chunks.is_empty(), "should produce chunks from paragraphs");
-    assert!(chunks[0].text.contains("Paragraph"), "chunk text: {}", chunks[0].text);
+    assert!(
+        chunks[0].text.contains("Paragraph"),
+        "chunk text: {}",
+        chunks[0].text
+    );
 }
 
 #[test]
@@ -141,8 +185,20 @@ fn test_chunk_fixed_token() {
     let words: Vec<String> = (0..600).map(|i| format!("word{i}")).collect();
     let text = words.join(" ");
     let doc = make_doc(&text);
-    let chunks = chunk_document(&doc, "big.txt", "hash4", ChunkStrategy::FixedToken { size: 100, overlap: 20 });
-    assert!(chunks.len() >= 6, "600 words / 100 token chunks = at least 6 chunks, got {}", chunks.len());
+    let chunks = chunk_document(
+        &doc,
+        "big.txt",
+        "hash4",
+        ChunkStrategy::FixedToken {
+            size: 100,
+            overlap: 20,
+        },
+    );
+    assert!(
+        chunks.len() >= 6,
+        "600 words / 100 token chunks = at least 6 chunks, got {}",
+        chunks.len()
+    );
     assert!(chunks[0].text.contains("word0"));
 }
 
@@ -151,9 +207,18 @@ fn test_chunk_fixed_token() {
 #[test]
 fn test_bm25_basic_ranking() {
     let docs = vec![
-        ("doc1".to_string(), "the quick brown fox jumps over the lazy dog".to_string()),
-        ("doc2".to_string(), "rust programming language is fast and safe".to_string()),
-        ("doc3".to_string(), "the fox and the dog are friends".to_string()),
+        (
+            "doc1".to_string(),
+            "the quick brown fox jumps over the lazy dog".to_string(),
+        ),
+        (
+            "doc2".to_string(),
+            "rust programming language is fast and safe".to_string(),
+        ),
+        (
+            "doc3".to_string(),
+            "the fox and the dog are friends".to_string(),
+        ),
     ];
     let index = DocBM25Index::build(docs);
 
@@ -167,9 +232,7 @@ fn test_bm25_basic_ranking() {
 
 #[test]
 fn test_bm25_no_match() {
-    let docs = vec![
-        ("doc1".to_string(), "hello world".to_string()),
-    ];
+    let docs = vec![("doc1".to_string(), "hello world".to_string())];
     let index = DocBM25Index::build(docs);
     let results = index.search("nonexistent", 10);
     assert!(results.is_empty(), "no match expected");
@@ -241,10 +304,9 @@ fn test_store_upsert_and_hashes() {
     let c2 = sample_chunk("readme.md", 1);
     let c3 = sample_chunk("guide.md", 0);
 
-    store.upsert_all_parquet(
-        &[&doc1, &doc2],
-        &[&c1, &c2, &c3],
-    ).unwrap();
+    store
+        .upsert_all_parquet(&[&doc1, &doc2], &[&c1, &c2, &c3])
+        .unwrap();
 
     let hashes = store.get_doc_hashes().unwrap();
     assert_eq!(hashes.len(), 2, "should have 2 docs");
@@ -315,7 +377,9 @@ fn test_store_delete_docs_by_ids() {
     let doc2 = sample_doc("delete.md");
     let c1 = sample_chunk("keep.md", 0);
     let c2 = sample_chunk("delete.md", 0);
-    store.upsert_all_parquet(&[&doc1, &doc2], &[&c1, &c2]).unwrap();
+    store
+        .upsert_all_parquet(&[&doc1, &doc2], &[&c1, &c2])
+        .unwrap();
 
     store.delete_docs_by_ids(&["delete.md"]).unwrap();
 
@@ -329,7 +393,9 @@ fn test_store_delete_docs_by_ids() {
 fn test_store_source_crud() {
     let (store, _dir) = temp_store();
 
-    store.upsert_source("src1", "confluence", "https://wiki.example.com", "SPACE").unwrap();
+    store
+        .upsert_source("src1", "confluence", "https://wiki.example.com", "SPACE")
+        .unwrap();
 
     let doc = sample_doc("page.md");
     let c = sample_chunk("page.md", 0);
@@ -337,7 +403,10 @@ fn test_store_source_crud() {
 
     store.link_doc_to_source("page.md", "src1").unwrap();
     let docs = store.get_docs_by_source("src1").unwrap();
-    assert!(docs.contains(&"page.md".to_string()), "should find linked doc: {docs:?}");
+    assert!(
+        docs.contains(&"page.md".to_string()),
+        "should find linked doc: {docs:?}"
+    );
 }
 
 #[test]
@@ -348,14 +417,16 @@ fn test_store_links_crud() {
     let doc2 = sample_doc("b.md");
     let c1 = sample_chunk("a.md", 0);
     let c2 = sample_chunk("b.md", 0);
-    store.upsert_all_parquet(&[&doc1, &doc2], &[&c1, &c2]).unwrap();
+    store
+        .upsert_all_parquet(&[&doc1, &doc2], &[&c1, &c2])
+        .unwrap();
 
     store.create_link("a.md", "b.md", "b.md", "local").unwrap();
 
     let conn = store.connection().unwrap();
-    let mut result = conn.query(
-        "MATCH (a:Document)-[l:LINKS_TO]->(b:Document) RETURN a.id, b.id, l.url"
-    ).unwrap();
+    let mut result = conn
+        .query("MATCH (a:Document)-[l:LINKS_TO]->(b:Document) RETURN a.id, b.id, l.url")
+        .unwrap();
     let mut found = false;
     while let Some(row) = result.next() {
         if row[0].to_string() == "a.md" && row[1].to_string() == "b.md" {
@@ -365,9 +436,9 @@ fn test_store_links_crud() {
     assert!(found, "should have LINKS_TO edge from a.md to b.md");
 
     store.delete_links_from("a.md").unwrap();
-    let mut result2 = conn.query(
-        "MATCH (a:Document)-[l:LINKS_TO]->(b:Document) WHERE a.id = 'a.md' RETURN count(l)"
-    ).unwrap();
+    let mut result2 = conn
+        .query("MATCH (a:Document)-[l:LINKS_TO]->(b:Document) WHERE a.id = 'a.md' RETURN count(l)")
+        .unwrap();
     if let Some(row) = result2.next() {
         let count: i64 = row[0].to_string().parse().unwrap_or(0);
         assert_eq!(count, 0, "links should be deleted");
@@ -384,19 +455,24 @@ fn test_extract_and_link_doc_markdown_links() {
     let doc_b = sample_doc("docs/guide.md");
     let c_a = sample_chunk("docs/index.md", 0);
     let c_b = sample_chunk("docs/guide.md", 0);
-    store.upsert_all_parquet(&[&doc_a, &doc_b], &[&c_a, &c_b]).unwrap();
+    store
+        .upsert_all_parquet(&[&doc_a, &doc_b], &[&c_a, &c_b])
+        .unwrap();
 
     let source_doc = ExtractedDoc {
         file: "docs/index.md".to_string(),
         title: Some("Index".to_string()),
         content_hash: "hash1".to_string(),
         format: DocFormat::Markdown,
-        text: "See the [guide](guide.md) for details.\nAlso [external](https://example.com).".to_string(),
+        text: "See the [guide](guide.md) for details.\nAlso [external](https://example.com)."
+            .to_string(),
         page_count: None,
     };
 
     let all_doc_ids: HashSet<String> = ["docs/index.md", "docs/guide.md"]
-        .iter().map(|s| s.to_string()).collect();
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
 
     extract_and_link_doc(&store, &source_doc, &all_doc_ids);
 
@@ -415,8 +491,14 @@ fn test_extract_and_link_doc_markdown_links() {
             linked_external = true;
         }
     }
-    assert!(linked_to_guide, "should create LINKS_TO for relative markdown link");
-    assert!(!linked_external, "should NOT create LINKS_TO for external links (target not in all_doc_ids)");
+    assert!(
+        linked_to_guide,
+        "should create LINKS_TO for relative markdown link"
+    );
+    assert!(
+        !linked_external,
+        "should NOT create LINKS_TO for external links (target not in all_doc_ids)"
+    );
 }
 
 // ==================== DocIndex lifecycle ====================
@@ -425,7 +507,10 @@ fn test_extract_and_link_doc_markdown_links() {
 fn test_docindex_open_creates_infigraph_dir() {
     let dir = tempfile::tempdir().unwrap();
     let _idx = DocIndex::open(dir.path()).unwrap();
-    assert!(dir.path().join(".infigraph").exists(), ".infigraph dir should be created");
+    assert!(
+        dir.path().join(".infigraph").exists(),
+        ".infigraph dir should be created"
+    );
 }
 
 #[test]
@@ -466,11 +551,13 @@ fn test_docindex_index_with_files() {
     std::fs::write(
         dir.path().join("readme.md"),
         "# Project\n\nThis is the readme.\n\n## Setup\n\nRun install.\n",
-    ).unwrap();
+    )
+    .unwrap();
     std::fs::write(
         dir.path().join("notes.txt"),
         "Some plain text notes about the project.\n\nAnother paragraph.\n",
-    ).unwrap();
+    )
+    .unwrap();
     // Non-document file should be ignored
     std::fs::write(dir.path().join("main.rs"), "fn main() {}").unwrap();
 
@@ -500,7 +587,10 @@ fn test_docindex_reindex_is_incremental() {
 
     // Second index with same content should be no-op
     let r2 = idx.index().unwrap();
-    assert_eq!(r2.indexed_files, 0, "unchanged file should not be re-indexed");
+    assert_eq!(
+        r2.indexed_files, 0,
+        "unchanged file should not be re-indexed"
+    );
     assert_eq!(r2.total_files, 1, "should still see the file");
 }
 
@@ -538,5 +628,8 @@ fn test_docindex_ignores_hidden_and_build_dirs() {
     let mut idx = DocIndex::open(dir.path()).unwrap();
     idx.init().unwrap();
     let result = idx.index().unwrap();
-    assert_eq!(result.total_files, 1, "should only find real.md, not files in ignored dirs");
+    assert_eq!(
+        result.total_files, 1,
+        "should only find real.md, not files in ignored dirs"
+    );
 }

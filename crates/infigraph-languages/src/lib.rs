@@ -416,7 +416,7 @@ pub fn bundled_registry() -> Result<LanguageRegistry> {
         Ok(pack) => registry.register(pack),
         Err(e) => eprintln!("warning: failed to load Pascal/Delphi language pack: {e}"),
     }
-        match vb6_pack() {
+    match vb6_pack() {
         Ok(pack) => registry.register(pack),
         Err(e) => eprintln!("warning: failed to load VB6 language pack: {e}"),
     }
@@ -1181,12 +1181,12 @@ mod tests {
     }
 
     #[test]
-        fn test_vb6_pack() {
+    fn test_vb6_pack() {
         vb6_pack().expect("VB6 pack should load");
     }
 
     #[test]
-        fn test_vb6_e2e_smoke() {
+    fn test_vb6_e2e_smoke() {
         let pack = vb6_pack().expect("VB6 pack should load");
         // Note: the tree-sitter-vb6 grammar parses `Call Foo(args)` incorrectly (Call becomes
         // the function name); use direct call syntax `Foo(args)` instead.
@@ -1773,27 +1773,39 @@ begin
 end;
 end."#;
 
-        let extraction = infigraph_core::extract::extract_file(
-            "test.pas",
-            &src[..],
-            &pack,
-        ).expect("extract_file should succeed for Pascal");
+        let extraction = infigraph_core::extract::extract_file("test.pas", &src[..], &pack)
+            .expect("extract_file should succeed for Pascal");
 
-        let calls: Vec<_> = extraction.relations.iter()
+        let calls: Vec<_> = extraction
+            .relations
+            .iter()
             .filter(|r| r.kind == infigraph_core::model::RelationKind::Calls)
             .collect();
 
-        let imports: Vec<_> = extraction.relations.iter()
+        let imports: Vec<_> = extraction
+            .relations
+            .iter()
             .filter(|r| r.kind == infigraph_core::model::RelationKind::Imports)
             .collect();
 
-        let inherits: Vec<_> = extraction.relations.iter()
+        let inherits: Vec<_> = extraction
+            .relations
+            .iter()
             .filter(|r| r.kind == infigraph_core::model::RelationKind::Inherits)
             .collect();
 
-        assert!(!calls.is_empty(), "Expected CALLS relations from Pascal code");
-        assert!(!imports.is_empty(), "Expected IMPORTS relations from Pascal code");
-        assert!(!inherits.is_empty(), "Expected INHERITS relations from Pascal code");
+        assert!(
+            !calls.is_empty(),
+            "Expected CALLS relations from Pascal code"
+        );
+        assert!(
+            !imports.is_empty(),
+            "Expected IMPORTS relations from Pascal code"
+        );
+        assert!(
+            !inherits.is_empty(),
+            "Expected INHERITS relations from Pascal code"
+        );
     }
 
     #[test]
@@ -1814,10 +1826,15 @@ namespace Intuit.Applications.PTG.DatabaseService
         let extraction = infigraph_core::extract::extract_file("test.cs", &src[..], &pack)
             .expect("extract_file should succeed for C#");
 
-        let inherits: Vec<_> = extraction.relations.iter()
+        let inherits: Vec<_> = extraction
+            .relations
+            .iter()
             .filter(|r| r.kind == infigraph_core::model::RelationKind::Inherits)
             .collect();
-        assert!(!inherits.is_empty(), "Expected INHERITS relations from C# class : interface");
+        assert!(
+            !inherits.is_empty(),
+            "Expected INHERITS relations from C# class : interface"
+        );
     }
 
     #[test]
@@ -1842,23 +1859,37 @@ pub(crate) fn crate_fn() {}
 
         let test_add = syms.iter().find(|s| s.name == "test_add");
         assert!(test_add.is_some(), "test_add should be extracted");
-        assert_eq!(test_add.unwrap().kind, infigraph_core::model::SymbolKind::Test,
-            "test_add should have Test kind, got {:?}", test_add.unwrap().kind);
+        assert_eq!(
+            test_add.unwrap().kind,
+            infigraph_core::model::SymbolKind::Test,
+            "test_add should have Test kind, got {:?}",
+            test_add.unwrap().kind
+        );
 
         let public_fn = syms.iter().find(|s| s.name == "public_fn");
         assert!(public_fn.is_some(), "public_fn should be extracted");
-        assert_eq!(public_fn.unwrap().visibility.as_deref(), Some("pub"),
-            "public_fn should have pub visibility, got {:?}", public_fn.unwrap().visibility);
+        assert_eq!(
+            public_fn.unwrap().visibility.as_deref(),
+            Some("pub"),
+            "public_fn should have pub visibility, got {:?}",
+            public_fn.unwrap().visibility
+        );
 
         let private_fn = syms.iter().find(|s| s.name == "private_fn");
         assert!(private_fn.is_some(), "private_fn should be extracted");
-        assert!(private_fn.unwrap().visibility.is_none(),
-            "private_fn should have no visibility modifier");
+        assert!(
+            private_fn.unwrap().visibility.is_none(),
+            "private_fn should have no visibility modifier"
+        );
 
         let crate_fn = syms.iter().find(|s| s.name == "crate_fn");
         assert!(crate_fn.is_some(), "crate_fn should be extracted");
-        assert_eq!(crate_fn.unwrap().visibility.as_deref(), Some("pub(crate)"),
-            "crate_fn should have pub(crate) visibility, got {:?}", crate_fn.unwrap().visibility);
+        assert_eq!(
+            crate_fn.unwrap().visibility.as_deref(),
+            Some("pub(crate)"),
+            "crate_fn should have pub(crate) visibility, got {:?}",
+            crate_fn.unwrap().visibility
+        );
     }
 
     #[test]
@@ -1871,9 +1902,16 @@ async fn test_async_op() {
 }
 "#;
         let extraction = infigraph_core::extract::extract_file("lib.rs", src, &pack).unwrap();
-        let test_fn = extraction.symbols.iter().find(|s| s.name == "test_async_op");
+        let test_fn = extraction
+            .symbols
+            .iter()
+            .find(|s| s.name == "test_async_op");
         assert!(test_fn.is_some(), "test_async_op should be extracted");
-        assert_eq!(test_fn.unwrap().kind, infigraph_core::model::SymbolKind::Test,
-            "tokio::test should produce Test kind, got {:?}", test_fn.unwrap().kind);
+        assert_eq!(
+            test_fn.unwrap().kind,
+            infigraph_core::model::SymbolKind::Test,
+            "tokio::test should produce Test kind, got {:?}",
+            test_fn.unwrap().kind
+        );
     }
 }

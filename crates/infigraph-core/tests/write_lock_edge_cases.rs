@@ -76,7 +76,10 @@ fn test_lock_file_permissions_readonly() {
     perms.set_readonly(false);
     std::fs::set_permissions(&lock_path, perms).unwrap();
 
-    assert!(result.is_err(), "write_lock on readonly file should error, not hang");
+    assert!(
+        result.is_err(),
+        "write_lock on readonly file should error, not hang"
+    );
 }
 
 #[test]
@@ -95,7 +98,10 @@ fn test_try_lock_timeout_pattern() {
         std::thread::sleep(Duration::from_millis(50));
     }
 
-    assert!(!acquired, "should not acquire lock while held — timeout pattern works");
+    assert!(
+        !acquired,
+        "should not acquire lock while held — timeout pattern works"
+    );
 }
 
 #[test]
@@ -111,7 +117,10 @@ fn test_lock_survives_store_reopen() {
 
     drop(_lock);
     let result = store2.try_write_lock().unwrap();
-    assert!(result.is_some(), "store2 should acquire after store1 releases");
+    assert!(
+        result.is_some(),
+        "store2 should acquire after store1 releases"
+    );
 }
 
 #[test]
@@ -122,7 +131,10 @@ fn test_lock_different_db_paths_independent() {
 
     let _lock_a = store_a.write_lock().unwrap();
     let lock_b = store_b.try_write_lock().unwrap();
-    assert!(lock_b.is_some(), "different DB paths should have independent locks");
+    assert!(
+        lock_b.is_some(),
+        "different DB paths should have independent locks"
+    );
 }
 
 #[test]
@@ -155,7 +167,13 @@ fn test_write_during_read_query() {
             id: "seed::f".to_string(),
             name: "f".to_string(),
             kind: SymbolKind::Function,
-            span: Span { file: "seed.py".to_string(), start_line: 1, start_col: 0, end_line: 3, end_col: 0 },
+            span: Span {
+                file: "seed.py".to_string(),
+                start_line: 1,
+                start_col: 0,
+                end_line: 3,
+                end_col: 0,
+            },
             signature_hash: "s".to_string(),
             parent: None,
             language: "python".to_string(),
@@ -189,7 +207,13 @@ fn test_write_during_read_query() {
                     id: format!("w{i}::g"),
                     name: "g".to_string(),
                     kind: SymbolKind::Function,
-                    span: Span { file: format!("w{i}.py"), start_line: 1, start_col: 0, end_line: 2, end_col: 0 },
+                    span: Span {
+                        file: format!("w{i}.py"),
+                        start_line: 1,
+                        start_col: 0,
+                        end_line: 2,
+                        end_col: 0,
+                    },
                     signature_hash: "s".to_string(),
                     parent: None,
                     language: "python".to_string(),
@@ -227,7 +251,10 @@ fn test_lock_after_db_corruption_recovery() {
     assert!(lock_path.exists() || !lock_path.exists()); // may or may not exist
     let store2 = GraphStore::open(&db_path).unwrap();
     let lock = store2.write_lock();
-    assert!(lock.is_ok(), "lock should work even after DB corruption recovery");
+    assert!(
+        lock.is_ok(),
+        "lock should work even after DB corruption recovery"
+    );
 }
 
 #[cfg(unix)]
@@ -264,5 +291,8 @@ fn test_lock_released_on_process_exit() {
         .unwrap();
     use fs2::FileExt;
     let result = file.try_lock_exclusive();
-    assert!(result.is_ok(), "lock should be released after child process killed");
+    assert!(
+        result.is_ok(),
+        "lock should be released after child process killed"
+    );
 }

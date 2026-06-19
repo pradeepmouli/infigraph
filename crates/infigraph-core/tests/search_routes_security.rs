@@ -1,7 +1,9 @@
-use infigraph_core::routes::{format_routes, Route};
 use infigraph_core::bridges::BridgeScanResult;
 use infigraph_core::model::{Bridge, BridgeKind};
-use infigraph_core::security::{scan_project, format_scan_results, Category, ScanStats, Finding, Severity};
+use infigraph_core::routes::{format_routes, Route};
+use infigraph_core::security::{
+    format_scan_results, scan_project, Category, Finding, ScanStats, Severity,
+};
 
 // ==================== format_routes ====================
 
@@ -107,17 +109,15 @@ fn test_bridge_scan_com_count_with_com() {
 #[test]
 fn test_bridge_scan_by_kind() {
     let result = BridgeScanResult {
-        bridges: vec![
-            Bridge {
-                file: "a.java".to_string(),
-                line: 1,
-                kind: BridgeKind::Jni,
-                foreign_symbol: "native_func".to_string(),
-                source_language: "java".to_string(),
-                target_language: Some("c".to_string()),
-                detail: "JNI".to_string(),
-            },
-        ],
+        bridges: vec![Bridge {
+            file: "a.java".to_string(),
+            line: 1,
+            kind: BridgeKind::Jni,
+            foreign_symbol: "native_func".to_string(),
+            source_language: "java".to_string(),
+            target_language: Some("c".to_string()),
+            detail: "JNI".to_string(),
+        }],
     };
     let jni = result.by_kind(&BridgeKind::Jni);
     assert_eq!(jni.len(), 1);
@@ -130,7 +130,11 @@ fn test_bridge_scan_by_kind() {
 #[test]
 fn test_scan_project_clean_dir() {
     let tmp = tempfile::tempdir().unwrap();
-    std::fs::write(tmp.path().join("clean.py"), "def hello():\n    print('hi')\n").unwrap();
+    std::fs::write(
+        tmp.path().join("clean.py"),
+        "def hello():\n    print('hi')\n",
+    )
+    .unwrap();
     let stats = scan_project(tmp.path()).unwrap();
     assert_eq!(stats.findings.len(), 0);
     assert!(stats.files_scanned >= 1);
@@ -142,9 +146,13 @@ fn test_scan_project_hardcoded_password() {
     std::fs::write(
         tmp.path().join("bad.py"),
         "password = \"s3cret123\"\ndb_password = \"hunter2\"\n",
-    ).unwrap();
+    )
+    .unwrap();
     let stats = scan_project(tmp.path()).unwrap();
-    assert!(!stats.findings.is_empty(), "should detect hardcoded password");
+    assert!(
+        !stats.findings.is_empty(),
+        "should detect hardcoded password"
+    );
 }
 
 #[test]
@@ -155,7 +163,10 @@ fn test_scan_project_sql_injection() {
         "def run(user_input):\n    query = \"SELECT * FROM users WHERE id = \" + user_input\n    cursor.execute(query)\n",
     ).unwrap();
     let stats = scan_project(tmp.path()).unwrap();
-    assert!(!stats.findings.is_empty(), "should detect SQL injection pattern");
+    assert!(
+        !stats.findings.is_empty(),
+        "should detect SQL injection pattern"
+    );
 }
 
 // ==================== security: format_scan_results ====================
@@ -203,32 +214,52 @@ fn test_scan_stats_count_methods() {
         files_scanned: 10,
         findings: vec![
             Finding {
-                file: "a.py".to_string(), line: 1, col: 0,
+                file: "a.py".to_string(),
+                line: 1,
+                col: 0,
                 severity: Severity::Critical,
                 category: Category::HardcodedSecret,
-                rule_id: "S1".to_string(), message: "".to_string(), snippet: "".to_string(),
-                suppressed: false, sanitizer_hint: None,
+                rule_id: "S1".to_string(),
+                message: "".to_string(),
+                snippet: "".to_string(),
+                suppressed: false,
+                sanitizer_hint: None,
             },
             Finding {
-                file: "b.py".to_string(), line: 2, col: 0,
+                file: "b.py".to_string(),
+                line: 2,
+                col: 0,
                 severity: Severity::High,
                 category: Category::HardcodedSecret,
-                rule_id: "S2".to_string(), message: "".to_string(), snippet: "".to_string(),
-                suppressed: false, sanitizer_hint: None,
+                rule_id: "S2".to_string(),
+                message: "".to_string(),
+                snippet: "".to_string(),
+                suppressed: false,
+                sanitizer_hint: None,
             },
             Finding {
-                file: "c.py".to_string(), line: 3, col: 0,
+                file: "c.py".to_string(),
+                line: 3,
+                col: 0,
                 severity: Severity::Medium,
                 category: Category::SqlInjection,
-                rule_id: "S3".to_string(), message: "".to_string(), snippet: "".to_string(),
-                suppressed: false, sanitizer_hint: None,
+                rule_id: "S3".to_string(),
+                message: "".to_string(),
+                snippet: "".to_string(),
+                suppressed: false,
+                sanitizer_hint: None,
             },
             Finding {
-                file: "d.py".to_string(), line: 4, col: 0,
+                file: "d.py".to_string(),
+                line: 4,
+                col: 0,
                 severity: Severity::Low,
                 category: Category::SqlInjection,
-                rule_id: "S4".to_string(), message: "".to_string(), snippet: "".to_string(),
-                suppressed: false, sanitizer_hint: None,
+                rule_id: "S4".to_string(),
+                message: "".to_string(),
+                snippet: "".to_string(),
+                suppressed: false,
+                sanitizer_hint: None,
             },
         ],
     };
@@ -246,13 +277,20 @@ fn test_des_false_positive_excluded() {
     std::fs::write(
         dir.path().join("app.py"),
         "description = 'A long description'\ndescribe('test case')\ndes_key = 'not_crypto'\n",
-    ).unwrap();
+    )
+    .unwrap();
 
     let stats = infigraph_core::security::scan_project(dir.path()).unwrap();
-    let des_findings: Vec<_> = stats.findings.iter()
+    let des_findings: Vec<_> = stats
+        .findings
+        .iter()
         .filter(|f| f.rule_id.starts_with("SEC072"))
         .collect();
-    assert!(des_findings.is_empty(), "description/describe should NOT trigger DES rule: {:?}", des_findings);
+    assert!(
+        des_findings.is_empty(),
+        "description/describe should NOT trigger DES rule: {:?}",
+        des_findings
+    );
 }
 
 #[test]
@@ -261,13 +299,24 @@ fn test_des_real_crypto_detected() {
     std::fs::write(
         dir.path().join("crypto.py"),
         "from Crypto.Cipher import DES\ncipher = DES.new(key, DES.MODE_ECB)\n",
-    ).unwrap();
+    )
+    .unwrap();
 
     let stats = infigraph_core::security::scan_project(dir.path()).unwrap();
-    let des_findings: Vec<_> = stats.findings.iter()
+    let des_findings: Vec<_> = stats
+        .findings
+        .iter()
         .filter(|f| f.rule_id.starts_with("SEC072"))
         .collect();
-    assert!(!des_findings.is_empty(), "DES.new() should be flagged: findings = {:?}", stats.findings.iter().map(|f| &f.rule_id).collect::<Vec<_>>());
+    assert!(
+        !des_findings.is_empty(),
+        "DES.new() should be flagged: findings = {:?}",
+        stats
+            .findings
+            .iter()
+            .map(|f| &f.rule_id)
+            .collect::<Vec<_>>()
+    );
 }
 
 #[test]
@@ -282,8 +331,13 @@ fn test_sanitizer_window_respects_boundary() {
     std::fs::write(dir.path().join("far.py"), &code).unwrap();
 
     let stats = infigraph_core::security::scan_project(dir.path()).unwrap();
-    let sql_findings: Vec<_> = stats.findings.iter()
+    let sql_findings: Vec<_> = stats
+        .findings
+        .iter()
         .filter(|f| f.category == Category::SqlInjection && !f.suppressed)
         .collect();
-    assert!(!sql_findings.is_empty(), "sanitizer 10+ lines away should NOT suppress finding");
+    assert!(
+        !sql_findings.is_empty(),
+        "sanitizer 10+ lines away should NOT suppress finding"
+    );
 }

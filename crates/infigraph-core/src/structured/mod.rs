@@ -1,10 +1,10 @@
-mod schema;
-mod ingest;
 mod cozo;
+mod ingest;
+mod schema;
 
-pub use schema::*;
-pub use ingest::*;
 pub use cozo::*;
+pub use ingest::*;
+pub use schema::*;
 
 #[cfg(test)]
 mod tests {
@@ -81,17 +81,32 @@ node_table = "Bad"
     #[test]
     fn test_id_template_interpolation() {
         let mut obj = serde_json::Map::new();
-        obj.insert("req_id".to_string(), serde_json::Value::String("REQ-001".to_string()));
-        obj.insert("category".to_string(), serde_json::Value::String("security".to_string()));
+        obj.insert(
+            "req_id".to_string(),
+            serde_json::Value::String("REQ-001".to_string()),
+        );
+        obj.insert(
+            "category".to_string(),
+            serde_json::Value::String("security".to_string()),
+        );
         let result = schema::interpolate_template("ears_{req_id}_{category}", &obj);
         assert_eq!(result, "ears_REQ-001_security");
     }
 
     #[test]
     fn test_format_value() {
-        assert_eq!(schema::format_value("STRING", Some(&serde_json::json!("hello"))), "'hello'");
-        assert_eq!(schema::format_value("INT64", Some(&serde_json::json!(42))), "42");
-        assert_eq!(schema::format_value("BOOL", Some(&serde_json::json!(true))), "true");
+        assert_eq!(
+            schema::format_value("STRING", Some(&serde_json::json!("hello"))),
+            "'hello'"
+        );
+        assert_eq!(
+            schema::format_value("INT64", Some(&serde_json::json!(42))),
+            "42"
+        );
+        assert_eq!(
+            schema::format_value("BOOL", Some(&serde_json::json!(true))),
+            "true"
+        );
         assert_eq!(schema::format_value("STRING", None), "''");
         assert_eq!(schema::format_value("INT64", None), "0");
     }
@@ -102,8 +117,16 @@ node_table = "Bad"
             name: "Test Items".to_string(),
             node_table: "TestItem".to_string(),
             columns: vec![
-                ColumnDef { name: "title".to_string(), col_type: "STRING".to_string(), required: true },
-                ColumnDef { name: "priority".to_string(), col_type: "INT64".to_string(), required: false },
+                ColumnDef {
+                    name: "title".to_string(),
+                    col_type: "STRING".to_string(),
+                    required: true,
+                },
+                ColumnDef {
+                    name: "priority".to_string(),
+                    col_type: "INT64".to_string(),
+                    required: false,
+                },
             ],
             edges: vec![],
             searchable_fields: vec![],
@@ -132,7 +155,9 @@ node_table = "Bad"
         let result = ingest_data(&conn, &schema, &data).unwrap();
         assert_eq!(result.nodes_created, 3);
 
-        let mut qr = conn.query("MATCH (t:TestItem) RETURN t.id ORDER BY t.id").unwrap();
+        let mut qr = conn
+            .query("MATCH (t:TestItem) RETURN t.id ORDER BY t.id")
+            .unwrap();
         let mut ids = Vec::new();
         while let Some(row) = qr.next() {
             ids.push(row[0].to_string());
@@ -148,7 +173,11 @@ node_table = "Bad"
         let schema = simple_schema();
 
         let tmp = tempfile::NamedTempFile::with_suffix(".json").unwrap();
-        std::fs::write(tmp.path(), r#"[{"item_id":"J1","title":"JSON item","priority":5}]"#).unwrap();
+        std::fs::write(
+            tmp.path(),
+            r#"[{"item_id":"J1","title":"JSON item","priority":5}]"#,
+        )
+        .unwrap();
 
         let result = ingest_file(&conn, &schema, tmp.path()).unwrap();
         assert_eq!(result.nodes_created, 1);
@@ -161,7 +190,11 @@ node_table = "Bad"
         let schema = simple_schema();
 
         let tmp = tempfile::NamedTempFile::with_suffix(".yaml").unwrap();
-        std::fs::write(tmp.path(), "- item_id: Y1\n  title: YAML item\n  priority: 10\n").unwrap();
+        std::fs::write(
+            tmp.path(),
+            "- item_id: Y1\n  title: YAML item\n  priority: 10\n",
+        )
+        .unwrap();
 
         let result = ingest_file(&conn, &schema, tmp.path()).unwrap();
         assert_eq!(result.nodes_created, 1);
@@ -177,15 +210,14 @@ node_table = "Bad"
         std::fs::write(
             data_dir.path().join("batch1.json"),
             r#"[{"item_id":"D1","title":"Dir item 1","priority":1}]"#,
-        ).unwrap();
+        )
+        .unwrap();
         std::fs::write(
             data_dir.path().join("batch2.json"),
             r#"[{"item_id":"D2","title":"Dir item 2","priority":2}]"#,
-        ).unwrap();
-        std::fs::write(
-            data_dir.path().join("ignore.txt"),
-            "not a data file",
-        ).unwrap();
+        )
+        .unwrap();
+        std::fs::write(data_dir.path().join("ignore.txt"), "not a data file").unwrap();
 
         let result = ingest_directory(&conn, &schema, data_dir.path()).unwrap();
         assert_eq!(result.nodes_created, 2);
@@ -199,7 +231,10 @@ node_table = "Bad"
 
         let data = vec![serde_json::json!({"item_id": "X1", "priority": 1})];
         let err = ingest_data(&conn, &schema, &data).unwrap_err();
-        assert!(err.to_string().contains("title"), "error should mention missing field 'title': {err}");
+        assert!(
+            err.to_string().contains("title"),
+            "error should mention missing field 'title': {err}"
+        );
     }
 
     #[test]
@@ -211,9 +246,11 @@ node_table = "Bad"
             schema_id: "linked".to_string(),
             name: "Linked".to_string(),
             node_table: "LinkedNode".to_string(),
-            columns: vec![
-                ColumnDef { name: "label".to_string(), col_type: "STRING".to_string(), required: false },
-            ],
+            columns: vec![ColumnDef {
+                name: "label".to_string(),
+                col_type: "STRING".to_string(),
+                required: false,
+            }],
             edges: vec![EdgeDef {
                 name: "LINKS_TO".to_string(),
                 from_table: "LinkedNode".to_string(),
@@ -239,9 +276,15 @@ node_table = "Bad"
     #[test]
     fn test_id_template_with_missing_field() {
         let mut obj = serde_json::Map::new();
-        obj.insert("req_id".to_string(), serde_json::Value::String("REQ-001".to_string()));
+        obj.insert(
+            "req_id".to_string(),
+            serde_json::Value::String("REQ-001".to_string()),
+        );
         let result = schema::interpolate_template("{req_id}_{category}", &obj);
-        assert_eq!(result, "REQ-001_{category}", "missing field should remain as literal placeholder");
+        assert_eq!(
+            result, "REQ-001_{category}",
+            "missing field should remain as literal placeholder"
+        );
     }
 
     #[test]
@@ -266,13 +309,14 @@ node_table = "Bad"
             id_template: None,
         };
 
-        let data = vec![
-            serde_json::json!({"id": "exists", "refs": ["does_not_exist"]}),
-        ];
+        let data = vec![serde_json::json!({"id": "exists", "refs": ["does_not_exist"]})];
 
         let result = ingest_data(&conn, &schema, &data).unwrap();
         assert_eq!(result.nodes_created, 1);
-        assert_eq!(result.edges_created, 0, "edge to nonexistent target should silently fail");
+        assert_eq!(
+            result.edges_created, 0,
+            "edge to nonexistent target should silently fail"
+        );
     }
 
     #[test]
@@ -285,7 +329,10 @@ node_table = "Bad"
         std::fs::write(tmp.path(), "a,b\n1,2").unwrap();
 
         let err = ingest_file(&conn, &schema, tmp.path()).unwrap_err();
-        assert!(err.to_string().contains("Unsupported"), "should mention unsupported format: {err}");
+        assert!(
+            err.to_string().contains("Unsupported"),
+            "should mention unsupported format: {err}"
+        );
     }
 
     #[test]
@@ -301,7 +348,8 @@ schema_id = "found"
 name = "Found"
 node_table = "Found"
 "#,
-        ).unwrap();
+        )
+        .unwrap();
 
         let schemas = discover_schemas(dir.path()).unwrap();
         assert_eq!(schemas.len(), 1);
@@ -321,7 +369,8 @@ schema_id = "tg_schema"
 name = "TG Schema"
 node_table = "TGNode"
 "#,
-        ).unwrap();
+        )
+        .unwrap();
 
         let schemas = discover_schemas(dir.path()).unwrap();
         assert_eq!(schemas.len(), 1);
@@ -332,7 +381,12 @@ node_table = "TGNode"
 
     fn cozo_db() -> (tempfile::TempDir, ::cozo::DbInstance) {
         let dir = tempfile::TempDir::new().unwrap();
-        let db = ::cozo::DbInstance::new("sqlite", dir.path().join("cozo.db").to_str().unwrap(), Default::default()).unwrap();
+        let db = ::cozo::DbInstance::new(
+            "sqlite",
+            dir.path().join("cozo.db").to_str().unwrap(),
+            Default::default(),
+        )
+        .unwrap();
         (dir, db)
     }
 
@@ -341,8 +395,14 @@ node_table = "TGNode"
         let schema = simple_schema();
         let ddl = schema.generate_cozo_ddl();
         assert_eq!(ddl.len(), 1);
-        assert!(ddl[0].contains("testitem"), "table name should be lowercased");
-        assert!(ddl[0].contains("title: String"), "should have String column");
+        assert!(
+            ddl[0].contains("testitem"),
+            "table name should be lowercased"
+        );
+        assert!(
+            ddl[0].contains("title: String"),
+            "should have String column"
+        );
         assert!(ddl[0].contains("priority: Int"), "should have Int column");
     }
 
@@ -360,11 +420,13 @@ node_table = "TGNode"
         let result = ingest_data_cozo(&db, &schema, &data).unwrap();
         assert_eq!(result.nodes_created, 3);
 
-        let r = db.run_script(
-            "?[id] := *testitem{id}\n:order id",
-            std::collections::BTreeMap::new(),
-            ::cozo::ScriptMutability::Immutable,
-        ).unwrap();
+        let r = db
+            .run_script(
+                "?[id] := *testitem{id}\n:order id",
+                std::collections::BTreeMap::new(),
+                ::cozo::ScriptMutability::Immutable,
+            )
+            .unwrap();
         assert_eq!(r.rows.len(), 3);
     }
 
@@ -374,7 +436,11 @@ node_table = "TGNode"
         let schema = simple_schema();
 
         let tmp = tempfile::NamedTempFile::with_suffix(".json").unwrap();
-        std::fs::write(tmp.path(), r#"[{"item_id":"J1","title":"JSON item","priority":5}]"#).unwrap();
+        std::fs::write(
+            tmp.path(),
+            r#"[{"item_id":"J1","title":"JSON item","priority":5}]"#,
+        )
+        .unwrap();
 
         let result = ingest_file_cozo(&db, &schema, tmp.path()).unwrap();
         assert_eq!(result.nodes_created, 1);
@@ -386,7 +452,11 @@ node_table = "TGNode"
         let schema = simple_schema();
 
         let tmp = tempfile::NamedTempFile::with_suffix(".yaml").unwrap();
-        std::fs::write(tmp.path(), "- item_id: Y1\n  title: YAML item\n  priority: 10\n").unwrap();
+        std::fs::write(
+            tmp.path(),
+            "- item_id: Y1\n  title: YAML item\n  priority: 10\n",
+        )
+        .unwrap();
 
         let result = ingest_file_cozo(&db, &schema, tmp.path()).unwrap();
         assert_eq!(result.nodes_created, 1);
@@ -401,11 +471,13 @@ node_table = "TGNode"
         std::fs::write(
             data_dir.path().join("batch1.json"),
             r#"[{"item_id":"D1","title":"Dir item 1","priority":1}]"#,
-        ).unwrap();
+        )
+        .unwrap();
         std::fs::write(
             data_dir.path().join("batch2.json"),
             r#"[{"item_id":"D2","title":"Dir item 2","priority":2}]"#,
-        ).unwrap();
+        )
+        .unwrap();
 
         let result = ingest_directory_cozo(&db, &schema, data_dir.path()).unwrap();
         assert_eq!(result.nodes_created, 2);
@@ -418,7 +490,10 @@ node_table = "TGNode"
 
         let data = vec![serde_json::json!({"item_id": "X1", "priority": 1})];
         let err = ingest_data_cozo(&db, &schema, &data).unwrap_err();
-        assert!(err.to_string().contains("title"), "error should mention missing field: {err}");
+        assert!(
+            err.to_string().contains("title"),
+            "error should mention missing field: {err}"
+        );
     }
 
     #[test]
@@ -429,9 +504,11 @@ node_table = "TGNode"
             schema_id: "linked".to_string(),
             name: "Linked".to_string(),
             node_table: "LinkedNode".to_string(),
-            columns: vec![
-                ColumnDef { name: "label".to_string(), col_type: "STRING".to_string(), required: false },
-            ],
+            columns: vec![ColumnDef {
+                name: "label".to_string(),
+                col_type: "STRING".to_string(),
+                required: false,
+            }],
             edges: vec![EdgeDef {
                 name: "LINKS_TO".to_string(),
                 from_table: "LinkedNode".to_string(),
@@ -475,9 +552,7 @@ node_table = "TGNode"
             id_template: None,
         };
 
-        let data = vec![
-            serde_json::json!({"id": "exists", "refs": ["does_not_exist"]}),
-        ];
+        let data = vec![serde_json::json!({"id": "exists", "refs": ["does_not_exist"]})];
 
         let result = ingest_data_cozo(&db, &schema, &data).unwrap();
         assert_eq!(result.nodes_created, 1);
@@ -487,9 +562,18 @@ node_table = "TGNode"
     #[test]
     fn test_cozo_format_value() {
         use super::cozo as cozo_ingest;
-        assert_eq!(cozo_ingest::format_cozo_value("STRING", Some(&serde_json::json!("hello"))), "\"hello\"");
-        assert_eq!(cozo_ingest::format_cozo_value("INT64", Some(&serde_json::json!(42))), "42");
-        assert_eq!(cozo_ingest::format_cozo_value("BOOL", Some(&serde_json::json!(true))), "true");
+        assert_eq!(
+            cozo_ingest::format_cozo_value("STRING", Some(&serde_json::json!("hello"))),
+            "\"hello\""
+        );
+        assert_eq!(
+            cozo_ingest::format_cozo_value("INT64", Some(&serde_json::json!(42))),
+            "42"
+        );
+        assert_eq!(
+            cozo_ingest::format_cozo_value("BOOL", Some(&serde_json::json!(true))),
+            "true"
+        );
         assert_eq!(cozo_ingest::format_cozo_value("STRING", None), "\"\"");
         assert_eq!(cozo_ingest::format_cozo_value("INT64", None), "0");
     }

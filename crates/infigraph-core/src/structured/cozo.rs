@@ -29,20 +29,41 @@ impl SchemaMeta {
     pub fn generate_cozo_ddl(&self) -> Vec<String> {
         let mut stmts = Vec::new();
 
-        let cols: Vec<String> = self.columns.iter()
-            .map(|c| format!("{}: {} default {}", c.name, cozo_col_type(&c.col_type), cozo_col_default(&c.col_type)))
+        let cols: Vec<String> = self
+            .columns
+            .iter()
+            .map(|c| {
+                format!(
+                    "{}: {} default {}",
+                    c.name,
+                    cozo_col_type(&c.col_type),
+                    cozo_col_default(&c.col_type)
+                )
+            })
             .collect();
         let table_name = self.node_table.to_lowercase();
         if cols.is_empty() {
             stmts.push(format!(":create {table_name} {{id: String}}"));
         } else {
-            stmts.push(format!(":create {table_name} {{id: String => {}}}", cols.join(", ")));
+            stmts.push(format!(
+                ":create {table_name} {{id: String => {}}}",
+                cols.join(", ")
+            ));
         }
 
         for edge in &self.edges {
             let edge_name = edge.name.to_lowercase();
-            let prop_cols: Vec<String> = edge.properties.iter()
-                .map(|c| format!(", {}: {} default {}", c.name, cozo_col_type(&c.col_type), cozo_col_default(&c.col_type)))
+            let prop_cols: Vec<String> = edge
+                .properties
+                .iter()
+                .map(|c| {
+                    format!(
+                        ", {}: {} default {}",
+                        c.name,
+                        cozo_col_type(&c.col_type),
+                        cozo_col_default(&c.col_type)
+                    )
+                })
                 .collect();
             stmts.push(format!(
                 ":create {edge_name} {{from_id: String, to_id: String{}}}",
@@ -60,7 +81,11 @@ pub fn ingest_data_cozo(
     data: &[serde_json::Value],
 ) -> Result<IngestResult> {
     for ddl in schema.generate_cozo_ddl() {
-        match db.run_script(&ddl, std::collections::BTreeMap::new(), cozo::ScriptMutability::Mutable) {
+        match db.run_script(
+            &ddl,
+            std::collections::BTreeMap::new(),
+            cozo::ScriptMutability::Mutable,
+        ) {
             Ok(_) => {}
             Err(e) => {
                 let msg = format!("{e}");
@@ -76,13 +101,16 @@ pub fn ingest_data_cozo(
     let mut edges_created = 0usize;
 
     for (idx, record) in data.iter().enumerate() {
-        let obj = record.as_object()
+        let obj = record
+            .as_object()
             .with_context(|| format!("record {} is not an object", idx))?;
 
         let id = if let Some(tmpl) = &schema.id_template {
             interpolate_template(tmpl, obj)
         } else if let Some(v) = obj.get("id") {
-            v.as_str().unwrap_or(&format!("{}_{}", schema.schema_id, idx)).to_string()
+            v.as_str()
+                .unwrap_or(&format!("{}_{}", schema.schema_id, idx))
+                .to_string()
         } else {
             format!("{}_{}", schema.schema_id, idx)
         };
@@ -104,15 +132,20 @@ pub fn ingest_data_cozo(
             col_vals.join(", "),
             col_names.join(", "),
         );
-        db.run_script(&put_script, std::collections::BTreeMap::new(), cozo::ScriptMutability::Mutable)
-            .map_err(|e| anyhow::anyhow!("failed to create node {}: {}", id, e))?;
+        db.run_script(
+            &put_script,
+            std::collections::BTreeMap::new(),
+            cozo::ScriptMutability::Mutable,
+        )
+        .map_err(|e| anyhow::anyhow!("failed to create node {}: {}", id, e))?;
         nodes_created += 1;
 
         for edge in &schema.edges {
             let targets = match obj.get(&edge.source_field) {
-                Some(serde_json::Value::Array(arr)) => {
-                    arr.iter().filter_map(|v| v.as_str().map(String::from)).collect::<Vec<_>>()
-                }
+                Some(serde_json::Value::Array(arr)) => arr
+                    .iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect::<Vec<_>>(),
                 Some(serde_json::Value::String(s)) => vec![s.clone()],
                 _ => continue,
             };
@@ -135,18 +168,20 @@ pub fn ingest_data_cozo(
                     "?[count(id)] := *{to_table}{{id}}, id = \"{}\"",
                     escape(&target_id)
                 );
-                let target_exists = db.run_script(
-                    &check_script,
-                    std::collections::BTreeMap::new(),
-                    cozo::ScriptMutability::Immutable,
-                ).ok().and_then(|r| {
-                    r.rows.first().and_then(|row| row.first()).map(|v| {
-                        match v {
+                let target_exists = db
+                    .run_script(
+                        &check_script,
+                        std::collections::BTreeMap::new(),
+                        cozo::ScriptMutability::Immutable,
+                    )
+                    .ok()
+                    .and_then(|r| {
+                        r.rows.first().and_then(|row| row.first()).map(|v| match v {
                             cozo::DataValue::Num(cozo::Num::Int(i)) => *i > 0,
                             _ => false,
-                        }
+                        })
                     })
-                }).unwrap_or(false);
+                    .unwrap_or(false);
 
                 if target_exists {
                     let mut edge_col_names = vec!["from_id".to_string(), "to_id".to_string()];
@@ -165,7 +200,11 @@ pub fn ingest_data_cozo(
                         edge_col_vals.join(", "),
                         edge_col_names.join(", "),
                     );
-                    match db.run_script(&put_edge, std::collections::BTreeMap::new(), cozo::ScriptMutability::Mutable) {
+                    match db.run_script(
+                        &put_edge,
+                        std::collections::BTreeMap::new(),
+                        cozo::ScriptMutability::Mutable,
+                    ) {
                         Ok(_) => edges_created += 1,
                         Err(_) => {}
                     }
@@ -174,7 +213,10 @@ pub fn ingest_data_cozo(
         }
     }
 
-    Ok(IngestResult { nodes_created, edges_created })
+    Ok(IngestResult {
+        nodes_created,
+        edges_created,
+    })
 }
 
 pub(crate) fn format_cozo_value(col_type: &str, val: Option<&serde_json::Value>) -> String {
@@ -187,13 +229,17 @@ pub(crate) fn format_cozo_value(col_type: &str, val: Option<&serde_json::Value>)
             _ => "\"\"".to_string(),
         },
         Some(v) => match col_type {
-            "STRING" => format!("\"{}\"", escape(&v.as_str().unwrap_or_default().to_string())),
+            "STRING" => format!(
+                "\"{}\"",
+                escape(&v.as_str().unwrap_or_default().to_string())
+            ),
             "INT64" => v.as_i64().unwrap_or(0).to_string(),
             "BOOL" => v.as_bool().unwrap_or(false).to_string(),
             "DOUBLE" => v.as_f64().unwrap_or(0.0).to_string(),
             "STRING[]" => {
                 if let Some(arr) = v.as_array() {
-                    let items: Vec<String> = arr.iter()
+                    let items: Vec<String> = arr
+                        .iter()
                         .filter_map(|s| s.as_str().map(|s| format!("\"{}\"", escape(s))))
                         .collect();
                     format!("[{}]", items.join(", "))
@@ -208,17 +254,22 @@ pub(crate) fn format_cozo_value(col_type: &str, val: Option<&serde_json::Value>)
 
 fn resolve_symbol_cozo(db: &cozo::DbInstance, reference: &str) -> Option<String> {
     let esc = reference.replace('"', "\\\"");
-    let script = format!(
-        "?[id] := *symbol{{id, name}}, id = \"{esc}\" or name = \"{esc}\"\n:limit 1"
-    );
-    db.run_script(&script, std::collections::BTreeMap::new(), cozo::ScriptMutability::Immutable)
-        .ok()
-        .and_then(|r| r.rows.first().and_then(|row| row.first().map(|v| {
-            match v {
+    let script =
+        format!("?[id] := *symbol{{id, name}}, id = \"{esc}\" or name = \"{esc}\"\n:limit 1");
+    db.run_script(
+        &script,
+        std::collections::BTreeMap::new(),
+        cozo::ScriptMutability::Immutable,
+    )
+    .ok()
+    .and_then(|r| {
+        r.rows.first().and_then(|row| {
+            row.first().map(|v| match v {
                 cozo::DataValue::Str(s) => s.to_string(),
                 _ => reference.to_string(),
-            }
-        })))
+            })
+        })
+    })
 }
 
 pub fn ingest_file_cozo(
@@ -249,7 +300,10 @@ pub fn ingest_file_cozo(
                 _ => bail!("YAML must be a sequence or mapping"),
             }
         }
-        _ => bail!("Unsupported data file format '{}' — use .json or .yaml/.yml", ext),
+        _ => bail!(
+            "Unsupported data file format '{}' — use .json or .yaml/.yml",
+            ext
+        ),
     };
 
     ingest_data_cozo(db, schema, &data)
@@ -264,7 +318,10 @@ pub fn ingest_directory_cozo(
         bail!("'{}' is not a directory", dir_path.display());
     }
 
-    let mut total = IngestResult { nodes_created: 0, edges_created: 0 };
+    let mut total = IngestResult {
+        nodes_created: 0,
+        edges_created: 0,
+    };
 
     for entry in std::fs::read_dir(dir_path)
         .with_context(|| format!("failed to read directory: {}", dir_path.display()))?

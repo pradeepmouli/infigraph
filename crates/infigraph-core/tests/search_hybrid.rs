@@ -42,9 +42,18 @@ impl EmbedProvider for MockEmbedder {
 #[test]
 fn test_bm25_basic_search() {
     let docs = vec![
-        ("sym::authenticate".to_string(), "authenticate user login".to_string()),
-        ("sym::process_payment".to_string(), "process payment transaction".to_string()),
-        ("sym::validate_email".to_string(), "validate email address format".to_string()),
+        (
+            "sym::authenticate".to_string(),
+            "authenticate user login".to_string(),
+        ),
+        (
+            "sym::process_payment".to_string(),
+            "process payment transaction".to_string(),
+        ),
+        (
+            "sym::validate_email".to_string(),
+            "validate email address format".to_string(),
+        ),
     ];
     let index = BM25Index::build(docs);
 
@@ -55,9 +64,7 @@ fn test_bm25_basic_search() {
 
 #[test]
 fn test_bm25_no_match() {
-    let docs = vec![
-        ("a".to_string(), "alpha beta gamma".to_string()),
-    ];
+    let docs = vec![("a".to_string(), "alpha beta gamma".to_string())];
     let index = BM25Index::build(docs);
 
     let results = index.search("zzzzz_nonexistent", 10);
@@ -106,7 +113,10 @@ fn test_bm25_ranking_order() {
     assert!(results.len() >= 2);
     // "rare" should rank higher — shorter doc with the term
     let top_id = index.doc_id(results[0].0);
-    assert_eq!(top_id, "rare", "shorter doc should rank higher for exact term");
+    assert_eq!(
+        top_id, "rare",
+        "shorter doc should rank higher for exact term"
+    );
 }
 
 // ---------- combine_scores ----------
@@ -114,14 +124,8 @@ fn test_bm25_ranking_order() {
 #[test]
 fn test_combine_scores_pure_bm25() {
     let raw = RawScores {
-        bm25: HashMap::from([
-            ("a".to_string(), 0.9),
-            ("b".to_string(), 0.5),
-        ]),
-        vector: HashMap::from([
-            ("a".to_string(), 0.1),
-            ("b".to_string(), 0.8),
-        ]),
+        bm25: HashMap::from([("a".to_string(), 0.9), ("b".to_string(), 0.5)]),
+        vector: HashMap::from([("a".to_string(), 0.1), ("b".to_string(), 0.8)]),
     };
 
     let results = search::combine_scores(&raw, 0.0, 10);
@@ -131,14 +135,8 @@ fn test_combine_scores_pure_bm25() {
 #[test]
 fn test_combine_scores_pure_vector() {
     let raw = RawScores {
-        bm25: HashMap::from([
-            ("a".to_string(), 0.9),
-            ("b".to_string(), 0.5),
-        ]),
-        vector: HashMap::from([
-            ("a".to_string(), 0.1),
-            ("b".to_string(), 0.8),
-        ]),
+        bm25: HashMap::from([("a".to_string(), 0.9), ("b".to_string(), 0.5)]),
+        vector: HashMap::from([("a".to_string(), 0.1), ("b".to_string(), 0.8)]),
     };
 
     let results = search::combine_scores(&raw, 1.0, 10);
@@ -175,9 +173,18 @@ fn test_combine_scores_empty() {
 #[test]
 fn test_hybrid_search_end_to_end() {
     let docs = vec![
-        ("sym::auth".to_string(), "authenticate user login session".to_string()),
-        ("sym::pay".to_string(), "process payment stripe billing".to_string()),
-        ("sym::email".to_string(), "validate email address smtp".to_string()),
+        (
+            "sym::auth".to_string(),
+            "authenticate user login session".to_string(),
+        ),
+        (
+            "sym::pay".to_string(),
+            "process payment stripe billing".to_string(),
+        ),
+        (
+            "sym::email".to_string(),
+            "validate email address smtp".to_string(),
+        ),
     ];
     let index = BM25Index::build(docs.clone());
 
@@ -199,7 +206,8 @@ fn test_hybrid_search_end_to_end() {
         0.3,
         None,
         None,
-    ).unwrap();
+    )
+    .unwrap();
 
     assert!(!results.is_empty());
     assert_eq!(results[0].symbol_id, "sym::auth");
@@ -209,9 +217,7 @@ fn test_hybrid_search_end_to_end() {
 
 #[test]
 fn test_hybrid_search_empty_query() {
-    let docs = vec![
-        ("sym::a".to_string(), "hello world".to_string()),
-    ];
+    let docs = vec![("sym::a".to_string(), "hello world".to_string())];
     let index = BM25Index::build(docs.clone());
     let embedder = MockEmbedder::new(32);
     let embeddings: Vec<(String, Vec<f32>)> = docs
@@ -219,9 +225,8 @@ fn test_hybrid_search_empty_query() {
         .map(|(id, text)| (id.clone(), embedder.embed(text).unwrap()))
         .collect();
 
-    let results = search::hybrid_search(
-        "", &index, &embedder, &embeddings, 10, 0.5, None, None,
-    ).unwrap();
+    let results =
+        search::hybrid_search("", &index, &embedder, &embeddings, 10, 0.5, None, None).unwrap();
     // Empty query may return results (vector similarity to zero vec) or not — just don't panic
     let _ = results;
 }
@@ -270,7 +275,11 @@ fn test_grep_search_limit() {
 #[test]
 fn test_grep_search_regex() {
     let dir = tempfile::TempDir::new().unwrap();
-    std::fs::write(dir.path().join("code.rs"), "fn foo() {}\nfn bar() {}\nlet x = 42;\n").unwrap();
+    std::fs::write(
+        dir.path().join("code.rs"),
+        "fn foo() {}\nfn bar() {}\nlet x = 42;\n",
+    )
+    .unwrap();
 
     let results = search::grep_search(dir.path(), r"^fn \w+", None, 100).unwrap();
     assert_eq!(results.len(), 2);

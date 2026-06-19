@@ -3,8 +3,8 @@ use std::sync::OnceLock;
 use serde_json::json;
 
 use infigraph_mcp::tools::groups::*;
-use infigraph_mcp::tools::watch::*;
 use infigraph_mcp::tools::index::tool_index_project;
+use infigraph_mcp::tools::watch::*;
 
 // Two microservice projects for group testing
 struct GroupFixture {
@@ -29,7 +29,9 @@ fn group_fixture() -> &'static GroupFixture {
         // Service A: a Flask-like Python API
         let svc_a_dir = tempfile::TempDir::new().expect("svc_a");
         let svc_a_files: &[(&str, &str)] = &[
-            ("app.py", "\
+            (
+                "app.py",
+                "\
 from flask import Flask, jsonify, request
 import requests
 
@@ -55,14 +57,18 @@ def validate_order(data):
 
 def save_order(data):
     return data
-"),
-            ("tests/test_orders.py", "\
+",
+            ),
+            (
+                "tests/test_orders.py",
+                "\
 from app import process_order
 
 def test_process_order():
     result = process_order({'items': ['a']})
     assert result is not None
-"),
+",
+            ),
         ];
         for (name, content) in svc_a_files {
             let p = svc_a_dir.path().join(name);
@@ -74,8 +80,9 @@ def test_process_order():
 
         // Service B: a user service
         let svc_b_dir = tempfile::TempDir::new().expect("svc_b");
-        let svc_b_files: &[(&str, &str)] = &[
-            ("app.py", "\
+        let svc_b_files: &[(&str, &str)] = &[(
+            "app.py",
+            "\
 from flask import Flask, jsonify
 
 app = Flask(__name__)
@@ -90,8 +97,8 @@ def get_user(id):
 
 def create_user(data):
     return data
-"),
-        ];
+",
+        )];
         for (name, content) in svc_b_files {
             let p = svc_b_dir.path().join(name);
             if let Some(parent) = p.parent() {
@@ -135,15 +142,22 @@ fn test_groups_watch_perf() {
 
     // --- group_list (empty group) ---
     let result = tool_group_list(&json!({})).unwrap();
-    assert!(result.contains("test-microservices"), "group_list: should show group: {result}");
-    assert!(result.contains("0 repos"), "group_list: should show 0 repos: {result}");
+    assert!(
+        result.contains("test-microservices"),
+        "group_list: should show group: {result}"
+    );
+    assert!(
+        result.contains("0 repos"),
+        "group_list: should show 0 repos: {result}"
+    );
 
     // --- group_add service A ---
     let result = tool_group_add(&json!({
         "group_name": "test-microservices",
         "repo_name": "order-service",
         "path": &fix.svc_a_path
-    })).unwrap();
+    }))
+    .unwrap();
     assert!(result.contains("Added"), "group_add(A): {result}");
 
     // --- group_add service B ---
@@ -151,29 +165,44 @@ fn test_groups_watch_perf() {
         "group_name": "test-microservices",
         "repo_name": "user-service",
         "path": &fix.svc_b_path
-    })).unwrap();
+    }))
+    .unwrap();
     assert!(result.contains("Added"), "group_add(B): {result}");
 
     // --- group_list (with repos) ---
     let result = tool_group_list(&json!({})).unwrap();
-    assert!(result.contains("2 repos"), "group_list: should show 2 repos: {result}");
-    assert!(result.contains("order-service"), "group_list: should show order-service: {result}");
-    assert!(result.contains("user-service"), "group_list: should show user-service: {result}");
+    assert!(
+        result.contains("2 repos"),
+        "group_list: should show 2 repos: {result}"
+    );
+    assert!(
+        result.contains("order-service"),
+        "group_list: should show order-service: {result}"
+    );
+    assert!(
+        result.contains("user-service"),
+        "group_list: should show user-service: {result}"
+    );
 
     // --- group_query ---
     let result = tool_group_query(&json!({
         "group_name": "test-microservices",
         "cypher": "MATCH (s:Symbol) WHERE s.kind = 'Function' RETURN s.name LIMIT 3"
-    })).unwrap();
+    }))
+    .unwrap();
     assert!(!result.is_empty(), "group_query: empty result");
     // Should have results from both repos
-    assert!(result.contains("order-service") || result.contains("user-service"),
-        "group_query: should identify repos: {result}");
+    assert!(
+        result.contains("order-service") || result.contains("user-service"),
+        "group_query: should identify repos: {result}"
+    );
 
     // --- group_sync (extract HTTP contracts) ---
     let result = tool_group_sync(&json!({"group_name": "test-microservices"})).unwrap();
-    assert!(result.contains("contracts") || result.contains("Extracted"),
-        "group_sync: {result}");
+    assert!(
+        result.contains("contracts") || result.contains("Extracted"),
+        "group_sync: {result}"
+    );
 
     // --- group_contracts ---
     let result = tool_group_contracts(&json!({"group_name": "test-microservices"})).unwrap();
@@ -188,16 +217,26 @@ fn test_groups_watch_perf() {
     // --- group_index ---
     let result = tool_group_index(&json!({"group_name": "test-microservices"})).unwrap();
     assert!(result.contains("Indexed"), "group_index: {result}");
-    assert!(result.contains("order-service"), "group_index: missing order-service: {result}");
-    assert!(result.contains("user-service"), "group_index: missing user-service: {result}");
+    assert!(
+        result.contains("order-service"),
+        "group_index: missing order-service: {result}"
+    );
+    assert!(
+        result.contains("user-service"),
+        "group_index: missing user-service: {result}"
+    );
 
     // --- group_link ---
     let result = tool_group_link(&json!({"group_name": "test-microservices"})).unwrap();
-    assert!(result.contains("Linked") || result.contains("CALLS_SERVICE"),
-        "group_link: {result}");
+    assert!(
+        result.contains("Linked") || result.contains("CALLS_SERVICE"),
+        "group_link: {result}"
+    );
 
     // --- error cases ---
-    let result = tool_group_query(&json!({"group_name": "nonexistent", "cypher": "MATCH (s:Symbol) RETURN s.name"}));
+    let result = tool_group_query(
+        &json!({"group_name": "nonexistent", "cypher": "MATCH (s:Symbol) RETURN s.name"}),
+    );
     assert!(result.is_err(), "query nonexistent group should error");
 
     let result = tool_group_add(&json!({"group_name": "nonexistent", "repo_name": "foo"}));
@@ -226,10 +265,15 @@ fn test_groups_watch_perf() {
     let result = tool_watch_project(&json!({
         "path": &fix.svc_a_path,
         "debounce_ms": 200
-    })).unwrap();
+    }))
+    .unwrap();
     assert!(result.contains("Watcher started"), "watch: {result}");
-    assert!(result.contains("watch-"), "watch: should return ID: {result}");
-    let watcher_id = result.lines()
+    assert!(
+        result.contains("watch-"),
+        "watch: should return ID: {result}"
+    );
+    let watcher_id = result
+        .lines()
         .find(|l| l.starts_with("ID: "))
         .map(|l| l.trim_start_matches("ID: ").trim())
         .expect("should find watcher ID in output");
@@ -237,13 +281,18 @@ fn test_groups_watch_perf() {
     // --- get_watch_status (all watchers) ---
     let result = tool_get_watch_status(&json!({})).unwrap();
     assert!(result.contains("watcher"), "status(all): {result}");
-    assert!(result.contains(watcher_id), "status(all): should show watcher ID: {result}");
+    assert!(
+        result.contains(watcher_id),
+        "status(all): should show watcher ID: {result}"
+    );
 
     // --- get_watch_status (specific) ---
     let result = tool_get_watch_status(&json!({"watcher_id": watcher_id})).unwrap();
     assert!(result.contains(watcher_id), "status(specific): {result}");
-    assert!(result.contains("OK") || result.contains("Status"),
-        "status(specific): should show status: {result}");
+    assert!(
+        result.contains("OK") || result.contains("Status"),
+        "status(specific): should show status: {result}"
+    );
 
     // --- trigger file change and verify watcher detects it ---
     let modified_file = std::path::Path::new(&fix.svc_a_path).join("app.py");
@@ -258,21 +307,31 @@ fn test_groups_watch_perf() {
 
     // --- verify watcher is gone ---
     let result = tool_get_watch_status(&json!({})).unwrap();
-    assert!(result.contains("No watchers") || !result.contains(watcher_id),
-        "status after stop: should not show stopped watcher: {result}");
+    assert!(
+        result.contains("No watchers") || !result.contains(watcher_id),
+        "status after stop: should not show stopped watcher: {result}"
+    );
 
     // --- stop nonexistent watcher ---
     let result = tool_stop_watch(&json!({"watcher_id": "nonexistent-id"})).unwrap();
-    assert!(result.contains("No watcher found"), "stop nonexistent: {result}");
+    assert!(
+        result.contains("No watcher found"),
+        "stop nonexistent: {result}"
+    );
 
     // --- watch_project with auto_resolve ---
     let result = tool_watch_project(&json!({
         "path": &fix.svc_b_path,
         "auto_resolve": true,
         "debounce_ms": 200
-    })).unwrap();
-    assert!(result.contains("auto_resolve: ON"), "auto_resolve watch: {result}");
-    let watcher_id2 = result.lines()
+    }))
+    .unwrap();
+    assert!(
+        result.contains("auto_resolve: ON"),
+        "auto_resolve watch: {result}"
+    );
+    let watcher_id2 = result
+        .lines()
         .find(|l| l.starts_with("ID: "))
         .map(|l| l.trim_start_matches("ID: ").trim())
         .expect("should find watcher ID");
@@ -313,15 +372,21 @@ fn test_groups_watch_perf() {
     let result = tool_index_project(&json!({"path": &perf_path})).unwrap();
     let elapsed = start.elapsed();
 
-    println!("Index 50 files (500+ symbols): {:.2}s", elapsed.as_secs_f64());
+    println!(
+        "Index 50 files (500+ symbols): {:.2}s",
+        elapsed.as_secs_f64()
+    );
     println!("Result: {result}");
 
     // Sanity: indexing should complete and produce output
     assert!(!result.is_empty(), "index should produce output");
 
     // Performance: 50 Python files should index in under 30 seconds
-    assert!(elapsed.as_secs() < 30,
-        "index took too long: {:.2}s (expected <30s)", elapsed.as_secs_f64());
+    assert!(
+        elapsed.as_secs() < 30,
+        "index took too long: {:.2}s (expected <30s)",
+        elapsed.as_secs_f64()
+    );
 
     // Stop any auto-started watchers before re-index (watcher holds DB lock)
     {
@@ -345,9 +410,12 @@ fn test_groups_watch_perf() {
 
     // Incremental should be at least 2x faster than full (most files unchanged)
     if elapsed.as_millis() > 2000 {
-        assert!(elapsed2 < elapsed,
+        assert!(
+            elapsed2 < elapsed,
             "incremental re-index ({:.2}s) should be faster than full ({:.2}s)",
-            elapsed2.as_secs_f64(), elapsed.as_secs_f64());
+            elapsed2.as_secs_f64(),
+            elapsed.as_secs_f64()
+        );
     }
 
     // Restore HOME

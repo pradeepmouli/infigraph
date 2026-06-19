@@ -58,12 +58,18 @@ impl SchemaMeta {
         let col_re = regex::Regex::new(r"^[a-z][a-z0-9_]{0,63}$").unwrap();
         for col in &self.columns {
             if !col_re.is_match(&col.name) {
-                bail!("Invalid column name '{}' in schema '{}'", col.name, self.schema_id);
+                bail!(
+                    "Invalid column name '{}' in schema '{}'",
+                    col.name,
+                    self.schema_id
+                );
             }
             if !VALID_COL_TYPES.contains(&col.col_type.as_str()) {
                 bail!(
                     "Invalid col_type '{}' for column '{}': must be one of {:?}",
-                    col.col_type, col.name, VALID_COL_TYPES
+                    col.col_type,
+                    col.name,
+                    VALID_COL_TYPES
                 );
             }
         }
@@ -91,7 +97,9 @@ impl SchemaMeta {
         for edge in &self.edges {
             let mut props = String::new();
             if !edge.properties.is_empty() {
-                let p: Vec<String> = edge.properties.iter()
+                let p: Vec<String> = edge
+                    .properties
+                    .iter()
                     .map(|c| format!("{} {}", c.name, c.col_type))
                     .collect();
                 props = format!(", {}", p.join(", "));
@@ -129,7 +137,9 @@ pub fn discover_schemas(project_root: &Path) -> Result<Vec<(PathBuf, StructuredS
                     .with_context(|| format!("failed to read schema: {}", path.display()))?;
                 let schema: StructuredSchema = toml::from_str(&content)
                     .with_context(|| format!("invalid schema TOML: {}", path.display()))?;
-                schema.schema.validate()
+                schema
+                    .schema
+                    .validate()
                     .with_context(|| format!("schema validation failed: {}", path.display()))?;
                 schemas.push((path, schema));
             }
@@ -166,7 +176,8 @@ pub(crate) fn format_value(col_type: &str, val: Option<&serde_json::Value>) -> S
             "DOUBLE" => v.as_f64().unwrap_or(0.0).to_string(),
             "STRING[]" => {
                 if let Some(arr) = v.as_array() {
-                    let items: Vec<String> = arr.iter()
+                    let items: Vec<String> = arr
+                        .iter()
                         .filter_map(|i| i.as_str())
                         .map(|s| format!("'{}'", escape(s)))
                         .collect();
@@ -180,7 +191,10 @@ pub(crate) fn format_value(col_type: &str, val: Option<&serde_json::Value>) -> S
     }
 }
 
-pub(crate) fn interpolate_template(tmpl: &str, obj: &serde_json::Map<String, serde_json::Value>) -> String {
+pub(crate) fn interpolate_template(
+    tmpl: &str,
+    obj: &serde_json::Map<String, serde_json::Value>,
+) -> String {
     let mut result = tmpl.to_string();
     for (key, val) in obj {
         let placeholder = format!("{{{}}}", key);

@@ -21,12 +21,21 @@ pub fn extract_statements<'a>(
 ) -> Vec<Statement> {
     let mut stmts = Vec::new();
     let mut counter = 0u32;
-    collect_statements(node, source, parent_symbol, file, 0, &mut stmts, &mut counter);
+    collect_statements(
+        node,
+        source,
+        parent_symbol,
+        file,
+        0,
+        &mut stmts,
+        &mut counter,
+    );
     stmts
 }
 
 fn node_condition_text<'a>(node: Node<'a>, source: &'a [u8], kind: &str) -> String {
-    let cond = node.child_by_field_name("condition")
+    let cond = node
+        .child_by_field_name("condition")
         .or_else(|| node.child_by_field_name("value"))
         .or_else(|| {
             if kind.starts_with("for") {
@@ -72,13 +81,23 @@ fn collect_statements<'a>(
         "while_statement" | "while_expression" => Some(StatementKind::While),
         "do_statement" => Some(StatementKind::DoWhile),
         "loop_expression" => Some(StatementKind::Loop),
-        "match_expression" | "switch_expression" | "switch_statement" | "when_expression" => Some(StatementKind::Match),
-        "match_arm" | "case_clause" | "switch_case" | "arm" | "when_clause" => Some(StatementKind::Case),
+        "match_expression" | "switch_expression" | "switch_statement" | "when_expression" => {
+            Some(StatementKind::Match)
+        }
+        "match_arm" | "case_clause" | "switch_case" | "arm" | "when_clause" => {
+            Some(StatementKind::Case)
+        }
         "try_statement" | "try_expression" => Some(StatementKind::Try),
         "catch_clause" | "except_clause" | "rescue_clause" => Some(StatementKind::Catch),
         "ternary_expression" | "conditional_expression" => Some(StatementKind::Ternary),
         "return_statement" => {
-            if depth == 1 && node.start_position().row < node.parent().map(|p| p.end_position().row.saturating_sub(2)).unwrap_or(0) {
+            if depth == 1
+                && node.start_position().row
+                    < node
+                        .parent()
+                        .map(|p| p.end_position().row.saturating_sub(2))
+                        .unwrap_or(0)
+            {
                 Some(StatementKind::Guard)
             } else {
                 None
@@ -107,14 +126,27 @@ fn collect_statements<'a>(
     for i in 0..node.child_count() {
         if let Some(child) = node.child(i as u32) {
             let ck = child.kind();
-            if ck == "function_definition" || ck == "function_item" || ck == "function_declaration"
-                || ck == "method_declaration" || ck == "method_definition"
-                || ck == "closure_expression" || ck == "lambda_expression"
-                || ck == "arrow_function" || ck == "anonymous_function_creation_expression"
+            if ck == "function_definition"
+                || ck == "function_item"
+                || ck == "function_declaration"
+                || ck == "method_declaration"
+                || ck == "method_definition"
+                || ck == "closure_expression"
+                || ck == "lambda_expression"
+                || ck == "arrow_function"
+                || ck == "anonymous_function_creation_expression"
             {
                 continue;
             }
-            collect_statements(child, source, parent_symbol, file, next_depth, stmts, counter);
+            collect_statements(
+                child,
+                source,
+                parent_symbol,
+                file,
+                next_depth,
+                stmts,
+                counter,
+            );
         }
     }
 }
@@ -166,7 +198,9 @@ mod tests {
 
     fn parse_python(source: &str) -> Vec<Statement> {
         let mut parser = tree_sitter::Parser::new();
-        parser.set_language(&tree_sitter_python::LANGUAGE.into()).unwrap();
+        parser
+            .set_language(&tree_sitter_python::LANGUAGE.into())
+            .unwrap();
         let tree = parser.parse(source.as_bytes(), None).unwrap();
         let root = tree.root_node();
         let fn_node = find_first_function(root).unwrap_or(root);
@@ -189,7 +223,8 @@ mod tests {
 
     #[test]
     fn test_python_if_else() {
-        let source = "def check(x):\n    if x > 0:\n        return True\n    else:\n        return False\n";
+        let source =
+            "def check(x):\n    if x > 0:\n        return True\n    else:\n        return False\n";
         let stmts = parse_python(source);
         let kinds: Vec<&str> = stmts.iter().map(|s| s.kind.as_str()).collect();
         assert!(kinds.contains(&"If"), "expected If, got {:?}", kinds);
@@ -202,7 +237,11 @@ mod tests {
         let stmts = parse_python(source);
         let kinds: Vec<&str> = stmts.iter().map(|s| s.kind.as_str()).collect();
         assert!(kinds.contains(&"If"), "expected If, got {:?}", kinds);
-        assert!(kinds.contains(&"ElseIf"), "expected ElseIf, got {:?}", kinds);
+        assert!(
+            kinds.contains(&"ElseIf"),
+            "expected ElseIf, got {:?}",
+            kinds
+        );
         assert!(kinds.contains(&"Else"), "expected Else, got {:?}", kinds);
     }
 
@@ -230,14 +269,21 @@ mod tests {
         let source = "def pick(x):\n    return 'yes' if x > 0 else 'no'\n";
         let stmts = parse_python(source);
         let kinds: Vec<&str> = stmts.iter().map(|s| s.kind.as_str()).collect();
-        assert!(kinds.contains(&"Ternary"), "expected Ternary, got {:?}", kinds);
+        assert!(
+            kinds.contains(&"Ternary"),
+            "expected Ternary, got {:?}",
+            kinds
+        );
     }
 
     #[test]
     fn test_depth_tracking() {
         let source = "def nested(x):\n    if x > 0:\n        if x > 10:\n            if x > 100:\n                do_thing()\n";
         let stmts = parse_python(source);
-        let ifs: Vec<&Statement> = stmts.iter().filter(|s| s.kind == StatementKind::If).collect();
+        let ifs: Vec<&Statement> = stmts
+            .iter()
+            .filter(|s| s.kind == StatementKind::If)
+            .collect();
         assert_eq!(ifs.len(), 3, "expected 3 nested ifs, got {}", ifs.len());
         assert_eq!(ifs[0].depth, 0);
         assert_eq!(ifs[1].depth, 1);
@@ -248,15 +294,26 @@ mod tests {
     fn test_condition_text_extracted() {
         let source = "def check(x):\n    if x > 42:\n        print('big')\n";
         let stmts = parse_python(source);
-        let if_stmt = stmts.iter().find(|s| s.kind == StatementKind::If).expect("expected If");
-        assert!(if_stmt.condition.contains("x > 42"), "expected 'x > 42', got '{}'", if_stmt.condition);
+        let if_stmt = stmts
+            .iter()
+            .find(|s| s.kind == StatementKind::If)
+            .expect("expected If");
+        assert!(
+            if_stmt.condition.contains("x > 42"),
+            "expected 'x > 42', got '{}'",
+            if_stmt.condition
+        );
     }
 
     #[test]
     fn test_no_statements_simple_function() {
         let source = "def add(a, b):\n    return a + b\n";
         let stmts = parse_python(source);
-        assert!(stmts.is_empty(), "expected no statements, got {}", stmts.len());
+        assert!(
+            stmts.is_empty(),
+            "expected no statements, got {}",
+            stmts.len()
+        );
     }
 
     #[test]

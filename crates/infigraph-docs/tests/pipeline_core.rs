@@ -50,14 +50,20 @@ fn test_upsert_pipeline_core_and_get() {
     let fetched = store.get_pipeline_core("pipeline::w2").unwrap().unwrap();
     assert_eq!(fetched.name, "W2 Metrics");
     assert_eq!(fetched.plugin_id, "intuit");
-    assert_eq!(fetched.inputs, vec!["tax_src.raw_w2_data", "ref_data.employer_dim"]);
+    assert_eq!(
+        fetched.inputs,
+        vec!["tax_src.raw_w2_data", "ref_data.employer_dim"]
+    );
     assert_eq!(fetched.outputs, vec!["tax_dm.fact_w2_metric"]);
 }
 
 #[test]
 fn test_get_pipeline_core_missing() {
     let (_tmp, store) = test_store();
-    assert!(store.get_pipeline_core("pipeline::nonexistent").unwrap().is_none());
+    assert!(store
+        .get_pipeline_core("pipeline::nonexistent")
+        .unwrap()
+        .is_none());
 }
 
 #[test]
@@ -139,9 +145,15 @@ fn test_link_pipeline_dependencies() {
     let deps = store.get_pipeline_deps().unwrap();
     assert_eq!(deps.len(), 2);
 
-    let dep_pairs: Vec<(String, String)> = deps.iter().map(|(f, t, _)| (f.clone(), t.clone())).collect();
+    let dep_pairs: Vec<(String, String)> = deps
+        .iter()
+        .map(|(f, t, _)| (f.clone(), t.clone()))
+        .collect();
     assert!(dep_pairs.contains(&("Marketing Attributes".into(), "W2 Metrics".into())));
-    assert!(dep_pairs.contains(&("Deceased Taxpayer Filter".into(), "Marketing Attributes".into())));
+    assert!(dep_pairs.contains(&(
+        "Deceased Taxpayer Filter".into(),
+        "Marketing Attributes".into()
+    )));
 }
 
 #[test]
@@ -152,7 +164,10 @@ fn test_link_pipeline_dependencies_idempotent() {
 
     store.link_pipeline_dependencies().unwrap();
     let count = store.link_pipeline_dependencies().unwrap();
-    assert_eq!(count, 1, "re-linking should produce same count (old edges cleared first)");
+    assert_eq!(
+        count, 1,
+        "re-linking should produce same count (old edges cleared first)"
+    );
 }
 
 #[test]
@@ -187,17 +202,35 @@ fn test_impact_analysis_transitive() {
     store.link_pipeline_dependencies().unwrap();
 
     let results = store.impact_analysis("tax_dm.fact_w2_metric", 3).unwrap();
-    assert!(results.len() >= 2, "expected at least 2 impacted pipelines, got {}", results.len());
+    assert!(
+        results.len() >= 2,
+        "expected at least 2 impacted pipelines, got {}",
+        results.len()
+    );
 
     let names: Vec<&str> = results.iter().map(|r| r.pipeline_name.as_str()).collect();
-    assert!(names.contains(&"Marketing Attributes"), "missing Marketing Attributes: {:?}", names);
-    assert!(names.contains(&"Deceased Taxpayer Filter"), "missing Deceased: {:?}", names);
+    assert!(
+        names.contains(&"Marketing Attributes"),
+        "missing Marketing Attributes: {:?}",
+        names
+    );
+    assert!(
+        names.contains(&"Deceased Taxpayer Filter"),
+        "missing Deceased: {:?}",
+        names
+    );
 
-    let marketing = results.iter().find(|r| r.pipeline_name == "Marketing Attributes").unwrap();
+    let marketing = results
+        .iter()
+        .find(|r| r.pipeline_name == "Marketing Attributes")
+        .unwrap();
     assert_eq!(marketing.impact_type, "direct");
     assert_eq!(marketing.depth, 1);
 
-    let deceased = results.iter().find(|r| r.pipeline_name == "Deceased Taxpayer Filter").unwrap();
+    let deceased = results
+        .iter()
+        .find(|r| r.pipeline_name == "Deceased Taxpayer Filter")
+        .unwrap();
     assert_eq!(deceased.impact_type, "transitive");
 }
 
@@ -222,13 +255,26 @@ fn test_ensure_plugin_table_and_query() {
     store.ensure_plugin_table("intuit", &columns).unwrap();
 
     let mut properties = serde_json::Map::new();
-    properties.insert("scheduler_type".into(), serde_json::Value::String("BPP".into()));
-    properties.insert("compliance".into(), serde_json::Value::String("IRS 7216".into()));
+    properties.insert(
+        "scheduler_type".into(),
+        serde_json::Value::String("BPP".into()),
+    );
+    properties.insert(
+        "compliance".into(),
+        serde_json::Value::String("IRS 7216".into()),
+    );
 
-    store.upsert_plugin_properties("pipeline::w2", "intuit", &properties, &columns).unwrap();
+    store
+        .upsert_plugin_properties("pipeline::w2", "intuit", &properties, &columns)
+        .unwrap();
 
-    let rows = store.query_plugin_table("intuit", "compliance", "7216").unwrap();
-    assert!(!rows.is_empty(), "expected compliance query to return results");
+    let rows = store
+        .query_plugin_table("intuit", "compliance", "7216")
+        .unwrap();
+    assert!(
+        !rows.is_empty(),
+        "expected compliance query to return results"
+    );
 }
 
 #[test]
@@ -239,10 +285,17 @@ fn test_query_plugin_table_no_match() {
     store.ensure_plugin_table("intuit", &columns).unwrap();
 
     let mut properties = serde_json::Map::new();
-    properties.insert("compliance".into(), serde_json::Value::String("IRS 7216".into()));
-    store.upsert_plugin_properties("pipeline::w2", "intuit", &properties, &columns).unwrap();
+    properties.insert(
+        "compliance".into(),
+        serde_json::Value::String("IRS 7216".into()),
+    );
+    store
+        .upsert_plugin_properties("pipeline::w2", "intuit", &properties, &columns)
+        .unwrap();
 
-    let rows = store.query_plugin_table("intuit", "compliance", "SOX").unwrap();
+    let rows = store
+        .query_plugin_table("intuit", "compliance", "SOX")
+        .unwrap();
     assert!(rows.is_empty(), "SOX should not match IRS 7216");
 }
 
@@ -257,7 +310,9 @@ fn test_link_pipeline_core_to_doc() {
     let conn = store.connection().unwrap();
     conn.query("CREATE (d:Document {id: 'doc::w2', file: 'confluence://TAXDATA/w2', title: 'W2 Pipeline', content_hash: 'abc123'})").unwrap();
 
-    store.link_pipeline_core_to_doc("pipeline::w2", "doc::w2").unwrap();
+    store
+        .link_pipeline_core_to_doc("pipeline::w2", "doc::w2")
+        .unwrap();
 
     // Verify edge exists
     let mut result = conn.query(
@@ -309,7 +364,10 @@ fn test_cross_plugin_dependency_linking() {
     store.upsert_pipeline_core(&dbt_pipeline).unwrap();
 
     let count = store.link_pipeline_dependencies().unwrap();
-    assert_eq!(count, 1, "dbt consumes intuit's output → 1 cross-plugin edge");
+    assert_eq!(
+        count, 1,
+        "dbt consumes intuit's output → 1 cross-plugin edge"
+    );
 
     let deps = store.get_pipeline_deps().unwrap();
     assert_eq!(deps.len(), 1);

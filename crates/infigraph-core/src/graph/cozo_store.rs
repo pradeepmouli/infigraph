@@ -6,13 +6,12 @@ use cozo::{DataValue, DbInstance, NamedRows, Num, ScriptMutability};
 
 use std::collections::HashMap;
 
-use super::store::GraphStats;
 use super::queries::{
-    SymbolRow, SymbolDetail, ImpactRow, ReferenceRow, ApiSymbol,
-    FileDeps, HierarchyNode, TypeHierarchy, CoverageRow, TestCoverage,
-    BranchInfo, TestTarget, TestContext, ExampleTest,
-    SkeletonSymbol, format_skeleton,
+    format_skeleton, ApiSymbol, BranchInfo, CoverageRow, ExampleTest, FileDeps, HierarchyNode,
+    ImpactRow, ReferenceRow, SkeletonSymbol, SymbolDetail, SymbolRow, TestContext, TestCoverage,
+    TestTarget, TypeHierarchy,
 };
+use super::store::GraphStats;
 use crate::model::{FileExtraction, RelationKind};
 
 type Params = BTreeMap<String, DataValue>;
@@ -39,7 +38,10 @@ impl CozoStore {
 
     fn init_schema(&self) -> Result<()> {
         for ddl in COZO_SCHEMA {
-            match self.db.run_script(ddl, empty_params(), ScriptMutability::Mutable) {
+            match self
+                .db
+                .run_script(ddl, empty_params(), ScriptMutability::Mutable)
+            {
                 Ok(_) => {}
                 Err(e) => {
                     let msg = format!("{e}");
@@ -50,12 +52,17 @@ impl CozoStore {
             }
         }
         for idx in COZO_INDICES {
-            match self.db.run_script(idx, empty_params(), ScriptMutability::Mutable) {
+            match self
+                .db
+                .run_script(idx, empty_params(), ScriptMutability::Mutable)
+            {
                 Ok(_) => {}
                 Err(e) => {
                     let msg = format!("{e}");
-                    if !msg.contains("already exists") && !msg.contains("conflicts")
-                        && !msg.contains("duplicate") {
+                    if !msg.contains("already exists")
+                        && !msg.contains("conflicts")
+                        && !msg.contains("duplicate")
+                    {
                         return Err(anyhow::anyhow!("index error: {e}\n  DDL: {idx}"));
                     }
                 }
@@ -67,14 +74,26 @@ impl CozoStore {
     fn run(&self, script: &str) -> Result<NamedRows> {
         self.db
             .run_script(script, empty_params(), ScriptMutability::Immutable)
-            .map_err(|e| anyhow::anyhow!("query failed: {e}\n  script: {}", &script[..script.len().min(200)]))
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "query failed: {e}\n  script: {}",
+                    &script[..script.len().min(200)]
+                )
+            })
     }
 
     fn run_params(&self, script: &str, params: Params, mutable: bool) -> Result<NamedRows> {
-        let m = if mutable { ScriptMutability::Mutable } else { ScriptMutability::Immutable };
-        self.db
-            .run_script(script, params, m)
-            .map_err(|e| anyhow::anyhow!("query failed: {e}\n  script: {}", &script[..script.len().min(200)]))
+        let m = if mutable {
+            ScriptMutability::Mutable
+        } else {
+            ScriptMutability::Immutable
+        };
+        self.db.run_script(script, params, m).map_err(|e| {
+            anyhow::anyhow!(
+                "query failed: {e}\n  script: {}",
+                &script[..script.len().min(200)]
+            )
+        })
     }
 
     // ── Read queries (match GraphQuery interface) ──────────────────────
@@ -107,7 +126,9 @@ impl CozoStore {
         )?;
 
         if r.rows.is_empty() {
-            return Ok(format!("No symbols found in '{file}'. File may not be indexed."));
+            return Ok(format!(
+                "No symbols found in '{file}'. File may not be indexed."
+            ));
         }
 
         let ids: Vec<String> = r.rows.iter().map(|row| dv_str(&row[0])).collect();
@@ -142,23 +163,27 @@ impl CozoStore {
             }
         }
 
-        let symbols: Vec<SkeletonSymbol> = r.rows.iter().map(|row| {
-            let id = dv_str(&row[0]);
-            SkeletonSymbol {
-                fan_in: fan_in.get(&id).copied().unwrap_or(0),
-                stmt_count: stmt_counts.get(&id).copied().unwrap_or(0),
-                nesting: nesting.get(&id).copied().unwrap_or(0),
-                id,
-                name: dv_str(&row[1]),
-                kind: dv_str(&row[2]),
-                start_line: dv_str(&row[3]),
-                complexity: dv_u32(&row[4]),
-                params: dv_str(&row[5]),
-                return_type: dv_str(&row[6]),
-                visibility: dv_str(&row[7]),
-                parent: dv_str(&row[8]),
-            }
-        }).collect();
+        let symbols: Vec<SkeletonSymbol> = r
+            .rows
+            .iter()
+            .map(|row| {
+                let id = dv_str(&row[0]);
+                SkeletonSymbol {
+                    fan_in: fan_in.get(&id).copied().unwrap_or(0),
+                    stmt_count: stmt_counts.get(&id).copied().unwrap_or(0),
+                    nesting: nesting.get(&id).copied().unwrap_or(0),
+                    id,
+                    name: dv_str(&row[1]),
+                    kind: dv_str(&row[2]),
+                    start_line: dv_str(&row[3]),
+                    complexity: dv_u32(&row[4]),
+                    params: dv_str(&row[5]),
+                    return_type: dv_str(&row[6]),
+                    visibility: dv_str(&row[7]),
+                    parent: dv_str(&row[8]),
+                }
+            })
+            .collect();
 
         Ok(format_skeleton(file, &symbols))
     }
@@ -213,12 +238,15 @@ impl CozoStore {
             params,
             false,
         )?;
-        Ok(r.rows.iter().map(|row| BranchInfo {
-            kind: dv_str(&row[0]),
-            condition: dv_str(&row[1]),
-            line: dv_u32(&row[2]),
-            depth: dv_u32(&row[3]),
-        }).collect())
+        Ok(r.rows
+            .iter()
+            .map(|row| BranchInfo {
+                kind: dv_str(&row[0]),
+                condition: dv_str(&row[1]),
+                line: dv_u32(&row[2]),
+                depth: dv_u32(&row[3]),
+            })
+            .collect())
     }
 
     pub fn transitive_impact(&self, symbol_id: &str, max_depth: u32) -> Result<Vec<ImpactRow>> {
@@ -240,12 +268,15 @@ impl CozoStore {
             ));
         }
         let r = self.run_params(&rules, params, false)?;
-        Ok(r.rows.iter().map(|row| ImpactRow {
-            id: dv_str(&row[0]),
-            name: dv_str(&row[1]),
-            file: dv_str(&row[2]),
-            kind: dv_str(&row[3]),
-        }).collect())
+        Ok(r.rows
+            .iter()
+            .map(|row| ImpactRow {
+                id: dv_str(&row[0]),
+                name: dv_str(&row[1]),
+                file: dv_str(&row[2]),
+                kind: dv_str(&row[3]),
+            })
+            .collect())
     }
 
     pub fn symbols_in_range(&self, file: &str, start: u32, end: u32) -> Result<Vec<SymbolDetail>> {
@@ -276,13 +307,16 @@ impl CozoStore {
             params,
             false,
         )?;
-        Ok(r.rows.iter().map(|row| ReferenceRow {
-            caller_id: dv_str(&row[0]),
-            caller_name: dv_str(&row[1]),
-            file: dv_str(&row[2]),
-            line: dv_u32(&row[3]),
-            target_id: dv_str(&row[4]),
-        }).collect())
+        Ok(r.rows
+            .iter()
+            .map(|row| ReferenceRow {
+                caller_id: dv_str(&row[0]),
+                caller_name: dv_str(&row[1]),
+                file: dv_str(&row[2]),
+                line: dv_u32(&row[3]),
+                target_id: dv_str(&row[4]),
+            })
+            .collect())
     }
 
     pub fn get_api_surface(&self) -> Result<Vec<ApiSymbol>> {
@@ -300,15 +334,18 @@ impl CozoStore {
             params,
             false,
         )?;
-        Ok(r.rows.iter().map(|row| ApiSymbol {
-            id: dv_str(&row[0]),
-            name: dv_str(&row[1]),
-            kind: dv_str(&row[2]),
-            file: dv_str(&row[3]),
-            line: dv_u32(&row[4]),
-            visibility: dv_str(&row[5]),
-            docstring: dv_str(&row[6]),
-        }).collect())
+        Ok(r.rows
+            .iter()
+            .map(|row| ApiSymbol {
+                id: dv_str(&row[0]),
+                name: dv_str(&row[1]),
+                kind: dv_str(&row[2]),
+                file: dv_str(&row[3]),
+                line: dv_u32(&row[4]),
+                visibility: dv_str(&row[5]),
+                docstring: dv_str(&row[6]),
+            })
+            .collect())
     }
 
     pub fn get_file_deps(&self, file: &str) -> Result<FileDeps> {
@@ -331,7 +368,11 @@ impl CozoStore {
         )?;
         let imported_by = collect_strings(&r_in);
 
-        Ok(FileDeps { file: file.to_string(), imports, imported_by })
+        Ok(FileDeps {
+            file: file.to_string(),
+            imports,
+            imported_by,
+        })
     }
 
     pub fn get_type_hierarchy(&self, symbol_id: &str, max_depth: u32) -> Result<TypeHierarchy> {
@@ -353,12 +394,16 @@ impl CozoStore {
             ));
         }
         let r_up = self.run_params(&up_rules, params.clone(), false)?;
-        let ancestors: Vec<HierarchyNode> = r_up.rows.iter().map(|row| HierarchyNode {
-            id: dv_str(&row[0]),
-            name: dv_str(&row[1]),
-            kind: dv_str(&row[2]),
-            file: dv_str(&row[3]),
-        }).collect();
+        let ancestors: Vec<HierarchyNode> = r_up
+            .rows
+            .iter()
+            .map(|row| HierarchyNode {
+                id: dv_str(&row[0]),
+                name: dv_str(&row[1]),
+                kind: dv_str(&row[2]),
+                file: dv_str(&row[3]),
+            })
+            .collect();
 
         // Descendants: unrolled layers walking INHERITS downward
         let mut down_rules = String::new();
@@ -375,18 +420,25 @@ impl CozoStore {
             ));
         }
         let r_down = self.run_params(&down_rules, params.clone(), false)?;
-        let descendants: Vec<HierarchyNode> = r_down.rows.iter().map(|row| HierarchyNode {
-            id: dv_str(&row[0]),
-            name: dv_str(&row[1]),
-            kind: dv_str(&row[2]),
-            file: dv_str(&row[3]),
-        }).collect();
+        let descendants: Vec<HierarchyNode> = r_down
+            .rows
+            .iter()
+            .map(|row| HierarchyNode {
+                id: dv_str(&row[0]),
+                name: dv_str(&row[1]),
+                kind: dv_str(&row[2]),
+                file: dv_str(&row[3]),
+            })
+            .collect();
 
         let root_detail = self.find_symbol_by_id(symbol_id)?;
 
         Ok(TypeHierarchy {
             root_id: symbol_id.to_string(),
-            root_name: root_detail.as_ref().map(|s| s.name.clone()).unwrap_or_default(),
+            root_name: root_detail
+                .as_ref()
+                .map(|s| s.name.clone())
+                .unwrap_or_default(),
             ancestors,
             descendants,
         })
@@ -394,24 +446,22 @@ impl CozoStore {
 
     pub fn get_test_coverage(&self) -> Result<TestCoverage> {
         // Query 1: all tested_by edges (small, indexed)
-        let r_tested = self.run(
-            r#"?[symbol_id, test_id] := *tested_by{symbol_id, test_id}"#,
-        )?;
+        let r_tested = self.run(r#"?[symbol_id, test_id] := *tested_by{symbol_id, test_id}"#)?;
         let mut tested_map: HashMap<String, String> = HashMap::new();
         for row in &r_tested.rows {
             tested_map.insert(dv_str(&row[0]), dv_str(&row[1]));
         }
 
         // Query 2: all symbols, filter testable kinds in Rust
-        let r_syms = self.run(
-            r#"?[id, name, kind, file] := *symbol{id, name, kind, file}"#,
-        )?;
+        let r_syms = self.run(r#"?[id, name, kind, file] := *symbol{id, name, kind, file}"#)?;
 
         let mut covered = Vec::new();
         let mut uncovered = Vec::new();
         for row in &r_syms.rows {
             let kind = dv_str(&row[2]);
-            if !is_testable_kind(&kind) { continue; }
+            if !is_testable_kind(&kind) {
+                continue;
+            }
             let id = dv_str(&row[0]);
             if let Some(test_id) = tested_map.get(&id) {
                 covered.push(CoverageRow {
@@ -433,7 +483,11 @@ impl CozoStore {
         }
 
         let total = covered.len() + uncovered.len();
-        let pct = if total > 0 { covered.len() * 100 / total } else { 0 };
+        let pct = if total > 0 {
+            covered.len() * 100 / total
+        } else {
+            0
+        };
 
         Ok(TestCoverage {
             covered_count: covered.len(),
@@ -444,14 +498,18 @@ impl CozoStore {
         })
     }
 
-    pub fn generate_test_context(&self, file_filter: Option<&str>, limit: usize) -> Result<TestContext> {
+    pub fn generate_test_context(
+        &self,
+        file_filter: Option<&str>,
+        limit: usize,
+    ) -> Result<TestContext> {
         let framework = self.detect_test_framework()?;
         let example_test = self.find_example_test(file_filter)?;
 
         // Get tested symbol IDs (small set, indexed)
         let r_tested = self.run(r#"?[symbol_id] := *tested_by{symbol_id, test_id: _}"#)?;
-        let tested_ids: std::collections::HashSet<String> = r_tested.rows.iter()
-            .map(|row| dv_str(&row[0])).collect();
+        let tested_ids: std::collections::HashSet<String> =
+            r_tested.rows.iter().map(|row| dv_str(&row[0])).collect();
 
         // Get testable symbols via kind index (6 indexed lookups)
         let file_clause = if let Some(f) = file_filter {
@@ -467,7 +525,9 @@ impl CozoStore {
         ))?;
 
         // Filter testable + untested in Rust
-        let mut targets: Vec<TestTarget> = r.rows.iter()
+        let mut targets: Vec<TestTarget> = r
+            .rows
+            .iter()
             .filter(|row| {
                 let kind = dv_str(&row[2]);
                 is_testable_kind(&kind) && !tested_ids.contains(&dv_str(&row[0]))
@@ -475,7 +535,11 @@ impl CozoStore {
             .map(|row| {
                 let visibility = dv_str(&row[6]);
                 let complexity = dv_u32(&row[9]);
-                let vis_score: u32 = if visibility == "public" || visibility == "pub" { 10 } else { 0 };
+                let vis_score: u32 = if visibility == "public" || visibility == "pub" {
+                    10
+                } else {
+                    0
+                };
                 TestTarget {
                     symbol_id: dv_str(&row[0]),
                     name: dv_str(&row[1]),
@@ -513,7 +577,11 @@ impl CozoStore {
 
         targets.sort_by(|a, b| b.priority_score.cmp(&a.priority_score));
 
-        Ok(TestContext { framework, example_test, targets })
+        Ok(TestContext {
+            framework,
+            example_test,
+            targets,
+        })
     }
 
     fn detect_test_framework(&self) -> Result<String> {
@@ -569,181 +637,346 @@ impl CozoStore {
 
     pub fn raw_query(&self, script: &str) -> Result<Vec<Vec<String>>> {
         let r = self.run(script)?;
-        Ok(r.rows.iter().map(|row| {
-            row.iter().map(|v| dv_str(v)).collect()
-        }).collect())
+        Ok(r.rows
+            .iter()
+            .map(|row| row.iter().map(|v| dv_str(v)).collect())
+            .collect())
     }
 
     // ── Write methods (for migration) ─────────────────────────────────
 
-    pub fn import_symbols(&self, rows: &[(String, String, String, String, i64, i64, String, String, String, String, String, i64, String, String)]) -> Result<()> {
-        if rows.is_empty() { return Ok(()); }
+    pub fn import_symbols(
+        &self,
+        rows: &[(
+            String,
+            String,
+            String,
+            String,
+            i64,
+            i64,
+            String,
+            String,
+            String,
+            String,
+            String,
+            i64,
+            String,
+            String,
+        )],
+    ) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
         let headers = vec![
-            "id".into(), "name".into(), "kind".into(), "file".into(),
-            "start_line".into(), "end_line".into(), "signature_hash".into(),
-            "language".into(), "visibility".into(), "parent".into(),
-            "docstring".into(), "complexity".into(), "parameters".into(), "return_type".into(),
+            "id".into(),
+            "name".into(),
+            "kind".into(),
+            "file".into(),
+            "start_line".into(),
+            "end_line".into(),
+            "signature_hash".into(),
+            "language".into(),
+            "visibility".into(),
+            "parent".into(),
+            "docstring".into(),
+            "complexity".into(),
+            "parameters".into(),
+            "return_type".into(),
         ];
-        let data_rows: Vec<Vec<DataValue>> = rows.iter().map(|r| vec![
-            DataValue::Str(r.0.clone().into()), DataValue::Str(r.1.clone().into()),
-            DataValue::Str(r.2.clone().into()), DataValue::Str(r.3.clone().into()),
-            DataValue::from(r.4), DataValue::from(r.5),
-            DataValue::Str(r.6.clone().into()), DataValue::Str(r.7.clone().into()),
-            DataValue::Str(r.8.clone().into()), DataValue::Str(r.9.clone().into()),
-            DataValue::Str(r.10.clone().into()), DataValue::from(r.11),
-            DataValue::Str(r.12.clone().into()), DataValue::Str(r.13.clone().into()),
-        ]).collect();
+        let data_rows: Vec<Vec<DataValue>> = rows
+            .iter()
+            .map(|r| {
+                vec![
+                    DataValue::Str(r.0.clone().into()),
+                    DataValue::Str(r.1.clone().into()),
+                    DataValue::Str(r.2.clone().into()),
+                    DataValue::Str(r.3.clone().into()),
+                    DataValue::from(r.4),
+                    DataValue::from(r.5),
+                    DataValue::Str(r.6.clone().into()),
+                    DataValue::Str(r.7.clone().into()),
+                    DataValue::Str(r.8.clone().into()),
+                    DataValue::Str(r.9.clone().into()),
+                    DataValue::Str(r.10.clone().into()),
+                    DataValue::from(r.11),
+                    DataValue::Str(r.12.clone().into()),
+                    DataValue::Str(r.13.clone().into()),
+                ]
+            })
+            .collect();
         let named = NamedRows::new(headers, data_rows);
         let mut map = BTreeMap::new();
         map.insert("symbol".to_string(), named);
-        self.db.import_relations(map)
+        self.db
+            .import_relations(map)
             .map_err(|e| anyhow::anyhow!("import symbols: {e}"))
     }
 
-    pub fn import_modules(&self, rows: &[(String, String, String, String, String, String)]) -> Result<()> {
-        if rows.is_empty() { return Ok(()); }
-        let headers = vec!["id".into(), "name".into(), "file".into(), "language".into(), "content_hash".into(), "summary".into()];
-        let data_rows: Vec<Vec<DataValue>> = rows.iter().map(|r| vec![
-            DataValue::Str(r.0.clone().into()), DataValue::Str(r.1.clone().into()),
-            DataValue::Str(r.2.clone().into()), DataValue::Str(r.3.clone().into()),
-            DataValue::Str(r.4.clone().into()), DataValue::Str(r.5.clone().into()),
-        ]).collect();
+    pub fn import_modules(
+        &self,
+        rows: &[(String, String, String, String, String, String)],
+    ) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let headers = vec![
+            "id".into(),
+            "name".into(),
+            "file".into(),
+            "language".into(),
+            "content_hash".into(),
+            "summary".into(),
+        ];
+        let data_rows: Vec<Vec<DataValue>> = rows
+            .iter()
+            .map(|r| {
+                vec![
+                    DataValue::Str(r.0.clone().into()),
+                    DataValue::Str(r.1.clone().into()),
+                    DataValue::Str(r.2.clone().into()),
+                    DataValue::Str(r.3.clone().into()),
+                    DataValue::Str(r.4.clone().into()),
+                    DataValue::Str(r.5.clone().into()),
+                ]
+            })
+            .collect();
         let named = NamedRows::new(headers, data_rows);
         let mut map = BTreeMap::new();
         map.insert("module".to_string(), named);
-        self.db.import_relations(map)
+        self.db
+            .import_relations(map)
             .map_err(|e| anyhow::anyhow!("import modules: {e}"))
     }
 
     pub fn import_files(&self, rows: &[(String, String, String, String, i64)]) -> Result<()> {
-        if rows.is_empty() { return Ok(()); }
-        let headers = vec!["id".into(), "name".into(), "path".into(), "language".into(), "symbol_count".into()];
-        let data_rows: Vec<Vec<DataValue>> = rows.iter().map(|r| vec![
-            DataValue::Str(r.0.clone().into()), DataValue::Str(r.1.clone().into()),
-            DataValue::Str(r.2.clone().into()), DataValue::Str(r.3.clone().into()),
-            DataValue::from(r.4),
-        ]).collect();
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let headers = vec![
+            "id".into(),
+            "name".into(),
+            "path".into(),
+            "language".into(),
+            "symbol_count".into(),
+        ];
+        let data_rows: Vec<Vec<DataValue>> = rows
+            .iter()
+            .map(|r| {
+                vec![
+                    DataValue::Str(r.0.clone().into()),
+                    DataValue::Str(r.1.clone().into()),
+                    DataValue::Str(r.2.clone().into()),
+                    DataValue::Str(r.3.clone().into()),
+                    DataValue::from(r.4),
+                ]
+            })
+            .collect();
         let named = NamedRows::new(headers, data_rows);
         let mut map = BTreeMap::new();
         map.insert("file".to_string(), named);
-        self.db.import_relations(map)
+        self.db
+            .import_relations(map)
             .map_err(|e| anyhow::anyhow!("import files: {e}"))
     }
 
     pub fn import_edges(&self, relation: &str, pairs: &[(String, String)]) -> Result<()> {
-        if pairs.is_empty() { return Ok(()); }
+        if pairs.is_empty() {
+            return Ok(());
+        }
         let (col_a, col_b) = edge_columns(relation);
         if relation == "calls" {
             let headers = vec![col_a.to_string(), col_b.to_string(), "line".to_string()];
-            let data_rows: Vec<Vec<DataValue>> = pairs.iter().map(|(a, b)| vec![
-                DataValue::Str(a.clone().into()), DataValue::Str(b.clone().into()),
-                DataValue::from(0i64),
-            ]).collect();
+            let data_rows: Vec<Vec<DataValue>> = pairs
+                .iter()
+                .map(|(a, b)| {
+                    vec![
+                        DataValue::Str(a.clone().into()),
+                        DataValue::Str(b.clone().into()),
+                        DataValue::from(0i64),
+                    ]
+                })
+                .collect();
             let named = NamedRows::new(headers, data_rows);
             let mut map = BTreeMap::new();
             map.insert(relation.to_string(), named);
-            self.db.import_relations(map)
+            self.db
+                .import_relations(map)
                 .map_err(|e| anyhow::anyhow!("import {relation}: {e}"))
         } else {
             let headers = vec![col_a.to_string(), col_b.to_string()];
-            let data_rows: Vec<Vec<DataValue>> = pairs.iter().map(|(a, b)| vec![
-                DataValue::Str(a.clone().into()), DataValue::Str(b.clone().into()),
-            ]).collect();
+            let data_rows: Vec<Vec<DataValue>> = pairs
+                .iter()
+                .map(|(a, b)| {
+                    vec![
+                        DataValue::Str(a.clone().into()),
+                        DataValue::Str(b.clone().into()),
+                    ]
+                })
+                .collect();
             let named = NamedRows::new(headers, data_rows);
             let mut map = BTreeMap::new();
             map.insert(relation.to_string(), named);
-            self.db.import_relations(map)
+            self.db
+                .import_relations(map)
                 .map_err(|e| anyhow::anyhow!("import {relation}: {e}"))
         }
     }
 
     pub fn import_calls_with_lines(&self, rows: &[(String, String, i64)]) -> Result<()> {
-        if rows.is_empty() { return Ok(()); }
+        if rows.is_empty() {
+            return Ok(());
+        }
         let headers = vec!["caller".into(), "callee".into(), "line".into()];
-        let data_rows: Vec<Vec<DataValue>> = rows.iter().map(|r| vec![
-            DataValue::Str(r.0.clone().into()),
-            DataValue::Str(r.1.clone().into()),
-            DataValue::from(r.2),
-        ]).collect();
+        let data_rows: Vec<Vec<DataValue>> = rows
+            .iter()
+            .map(|r| {
+                vec![
+                    DataValue::Str(r.0.clone().into()),
+                    DataValue::Str(r.1.clone().into()),
+                    DataValue::from(r.2),
+                ]
+            })
+            .collect();
         let named = NamedRows::new(headers, data_rows);
         let mut map = BTreeMap::new();
         map.insert("calls".to_string(), named);
-        self.db.import_relations(map)
+        self.db
+            .import_relations(map)
             .map_err(|e| anyhow::anyhow!("import calls: {e}"))
     }
 
-    pub fn import_statements(&self, rows: &[(String, String, String, i64, i64, i64, String)]) -> Result<()> {
-        if rows.is_empty() { return Ok(()); }
+    pub fn import_statements(
+        &self,
+        rows: &[(String, String, String, i64, i64, i64, String)],
+    ) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
         let headers = vec![
-            "id".into(), "kind".into(), "condition".into(),
-            "start_line".into(), "end_line".into(), "depth".into(), "parent_symbol".into(),
+            "id".into(),
+            "kind".into(),
+            "condition".into(),
+            "start_line".into(),
+            "end_line".into(),
+            "depth".into(),
+            "parent_symbol".into(),
         ];
-        let data_rows: Vec<Vec<DataValue>> = rows.iter().map(|r| vec![
-            DataValue::Str(r.0.clone().into()), DataValue::Str(r.1.clone().into()),
-            DataValue::Str(r.2.clone().into()), DataValue::from(r.3),
-            DataValue::from(r.4), DataValue::from(r.5),
-            DataValue::Str(r.6.clone().into()),
-        ]).collect();
+        let data_rows: Vec<Vec<DataValue>> = rows
+            .iter()
+            .map(|r| {
+                vec![
+                    DataValue::Str(r.0.clone().into()),
+                    DataValue::Str(r.1.clone().into()),
+                    DataValue::Str(r.2.clone().into()),
+                    DataValue::from(r.3),
+                    DataValue::from(r.4),
+                    DataValue::from(r.5),
+                    DataValue::Str(r.6.clone().into()),
+                ]
+            })
+            .collect();
         let named = NamedRows::new(headers, data_rows);
         let mut map = BTreeMap::new();
         map.insert("statement".to_string(), named);
-        self.db.import_relations(map)
+        self.db
+            .import_relations(map)
             .map_err(|e| anyhow::anyhow!("import statements: {e}"))
     }
 
-    pub fn import_raw(&self, relation: &str, headers: Vec<String>, rows: Vec<Vec<DataValue>>) -> Result<()> {
-        if rows.is_empty() { return Ok(()); }
+    pub fn import_raw(
+        &self,
+        relation: &str,
+        headers: Vec<String>,
+        rows: Vec<Vec<DataValue>>,
+    ) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
         let named = NamedRows::new(headers, rows);
         let mut map = BTreeMap::new();
         map.insert(relation.to_string(), named);
-        self.db.import_relations(map)
+        self.db
+            .import_relations(map)
             .map_err(|e| anyhow::anyhow!("import {relation}: {e}"))
     }
 
     pub fn import_folders(&self, rows: &[(String, String, String)]) -> Result<()> {
-        if rows.is_empty() { return Ok(()); }
+        if rows.is_empty() {
+            return Ok(());
+        }
         let headers = vec!["id".into(), "name".into(), "path".into()];
-        let data_rows: Vec<Vec<DataValue>> = rows.iter().map(|r| vec![
-            DataValue::Str(r.0.clone().into()),
-            DataValue::Str(r.1.clone().into()),
-            DataValue::Str(r.2.clone().into()),
-        ]).collect();
+        let data_rows: Vec<Vec<DataValue>> = rows
+            .iter()
+            .map(|r| {
+                vec![
+                    DataValue::Str(r.0.clone().into()),
+                    DataValue::Str(r.1.clone().into()),
+                    DataValue::Str(r.2.clone().into()),
+                ]
+            })
+            .collect();
         let named = NamedRows::new(headers, data_rows);
         let mut map = BTreeMap::new();
         map.insert("folder".to_string(), named);
-        self.db.import_relations(map)
+        self.db
+            .import_relations(map)
             .map_err(|e| anyhow::anyhow!("import folders: {e}"))
     }
 
-    pub fn import_dependencies(&self, rows: &[(String, String, String, String, bool)]) -> Result<()> {
-        if rows.is_empty() { return Ok(()); }
-        let headers = vec!["id".into(), "name".into(), "version".into(), "ecosystem".into(), "is_dev".into()];
-        let data_rows: Vec<Vec<DataValue>> = rows.iter().map(|r| vec![
-            DataValue::Str(r.0.clone().into()),
-            DataValue::Str(r.1.clone().into()),
-            DataValue::Str(r.2.clone().into()),
-            DataValue::Str(r.3.clone().into()),
-            DataValue::Bool(r.4),
-        ]).collect();
+    pub fn import_dependencies(
+        &self,
+        rows: &[(String, String, String, String, bool)],
+    ) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let headers = vec![
+            "id".into(),
+            "name".into(),
+            "version".into(),
+            "ecosystem".into(),
+            "is_dev".into(),
+        ];
+        let data_rows: Vec<Vec<DataValue>> = rows
+            .iter()
+            .map(|r| {
+                vec![
+                    DataValue::Str(r.0.clone().into()),
+                    DataValue::Str(r.1.clone().into()),
+                    DataValue::Str(r.2.clone().into()),
+                    DataValue::Str(r.3.clone().into()),
+                    DataValue::Bool(r.4),
+                ]
+            })
+            .collect();
         let named = NamedRows::new(headers, data_rows);
         let mut map = BTreeMap::new();
         map.insert("dependency".to_string(), named);
-        self.db.import_relations(map)
+        self.db
+            .import_relations(map)
             .map_err(|e| anyhow::anyhow!("import dependencies: {e}"))
     }
 
     pub fn import_clusters(&self, rows: &[(String, String, String)]) -> Result<()> {
-        if rows.is_empty() { return Ok(()); }
+        if rows.is_empty() {
+            return Ok(());
+        }
         let headers = vec!["id".into(), "name".into(), "description".into()];
-        let data_rows: Vec<Vec<DataValue>> = rows.iter().map(|r| vec![
-            DataValue::Str(r.0.clone().into()),
-            DataValue::Str(r.1.clone().into()),
-            DataValue::Str(r.2.clone().into()),
-        ]).collect();
+        let data_rows: Vec<Vec<DataValue>> = rows
+            .iter()
+            .map(|r| {
+                vec![
+                    DataValue::Str(r.0.clone().into()),
+                    DataValue::Str(r.1.clone().into()),
+                    DataValue::Str(r.2.clone().into()),
+                ]
+            })
+            .collect();
         let named = NamedRows::new(headers, data_rows);
         let mut map = BTreeMap::new();
         map.insert("cluster".to_string(), named);
-        self.db.import_relations(map)
+        self.db
+            .import_relations(map)
             .map_err(|e| anyhow::anyhow!("import clusters: {e}"))
     }
 
@@ -803,44 +1036,54 @@ impl CozoStore {
         let _ = self.run_params(
             r#"?[module_id, symbol_id] := *contains{module_id: $file, symbol_id}
             :rm contains {module_id, symbol_id}"#,
-            params.clone(), true,
+            params.clone(),
+            true,
         );
         // Delete imports edges from this module
         let _ = self.run_params(
             r#"?[importer, imported] := *imports{importer: $file, imported}
             :rm imports {importer, imported}"#,
-            params.clone(), true,
+            params.clone(),
+            true,
         );
         // Delete defines edges
         let _ = self.run_params(
             r#"?[file_id, symbol_id] := *defines{file_id: $file, symbol_id}
             :rm defines {file_id, symbol_id}"#,
-            params.clone(), true,
+            params.clone(),
+            true,
         );
         // Delete symbols for this file
         let _ = self.run_params(
             r#"?[id] := *symbol{id, file: $file}
             :rm symbol {id}"#,
-            params.clone(), true,
+            params.clone(),
+            true,
         );
         // Delete module
         let _ = self.run_params(
             r#"?[id] := id = $file
             :rm module {id}"#,
-            params.clone(), true,
+            params.clone(),
+            true,
         );
         // Delete file node
         let _ = self.run_params(
             r#"?[id] := id = $file
             :rm file {id}"#,
-            params, true,
+            params,
+            true,
         );
         Ok(())
     }
 
     fn insert_file_data(&self, extraction: &FileExtraction) -> Result<()> {
         let module_id = &extraction.file;
-        let module_name = extraction.file.rsplit_once('/').map(|(_, f)| f).unwrap_or(&extraction.file);
+        let module_name = extraction
+            .file
+            .rsplit_once('/')
+            .map(|(_, f)| f)
+            .unwrap_or(&extraction.file);
         let file_name = module_name;
 
         // Insert module
@@ -864,32 +1107,42 @@ impl CozoStore {
 
         // Insert symbols
         if !extraction.symbols.is_empty() {
-            let sym_rows: Vec<_> = extraction.symbols.iter().map(|sym| (
-                sym.id.clone(),
-                sym.name.clone(),
-                sym.kind.as_str().to_string(),
-                extraction.file.clone(),
-                sym.span.start_line as i64,
-                sym.span.end_line as i64,
-                sym.signature_hash.clone(),
-                sym.language.clone(),
-                sym.visibility.clone().unwrap_or_default(),
-                sym.parent.clone().unwrap_or_default(),
-                sym.docstring.clone().unwrap_or_default(),
-                sym.complexity as i64,
-                sym.parameters.clone().unwrap_or_default(),
-                sym.return_type.clone().unwrap_or_default(),
-            )).collect();
+            let sym_rows: Vec<_> = extraction
+                .symbols
+                .iter()
+                .map(|sym| {
+                    (
+                        sym.id.clone(),
+                        sym.name.clone(),
+                        sym.kind.as_str().to_string(),
+                        extraction.file.clone(),
+                        sym.span.start_line as i64,
+                        sym.span.end_line as i64,
+                        sym.signature_hash.clone(),
+                        sym.language.clone(),
+                        sym.visibility.clone().unwrap_or_default(),
+                        sym.parent.clone().unwrap_or_default(),
+                        sym.docstring.clone().unwrap_or_default(),
+                        sym.complexity as i64,
+                        sym.parameters.clone().unwrap_or_default(),
+                        sym.return_type.clone().unwrap_or_default(),
+                    )
+                })
+                .collect();
             self.import_symbols(&sym_rows)?;
 
             // CONTAINS edges: module -> symbols
-            let contains: Vec<_> = extraction.symbols.iter()
+            let contains: Vec<_> = extraction
+                .symbols
+                .iter()
                 .map(|s| (module_id.clone(), s.id.clone()))
                 .collect();
             self.import_edges("contains", &contains)?;
 
             // DEFINES edges: file -> symbols
-            let defines: Vec<_> = extraction.symbols.iter()
+            let defines: Vec<_> = extraction
+                .symbols
+                .iter()
                 .map(|s| (extraction.file.clone(), s.id.clone()))
                 .collect();
             self.import_edges("defines", &defines)?;
@@ -926,7 +1179,8 @@ impl CozoStore {
                     writes_pairs.push((rel.source_id.clone(), rel.target_id.clone()));
                 }
                 RelationKind::Custom(edge_name) => {
-                    custom_pairs.entry(edge_name.clone())
+                    custom_pairs
+                        .entry(edge_name.clone())
                         .or_default()
                         .push((rel.source_id.clone(), rel.target_id.clone()));
                 }
@@ -950,18 +1204,26 @@ impl CozoStore {
 
         // Insert statements + HAS_STATEMENT edges
         if !extraction.statements.is_empty() {
-            let stmt_rows: Vec<_> = extraction.statements.iter().map(|s| (
-                s.id.clone(),
-                s.kind.as_str().to_string(),
-                s.condition.clone(),
-                s.start_line as i64,
-                s.end_line as i64,
-                s.depth as i64,
-                s.parent_symbol.clone(),
-            )).collect();
+            let stmt_rows: Vec<_> = extraction
+                .statements
+                .iter()
+                .map(|s| {
+                    (
+                        s.id.clone(),
+                        s.kind.as_str().to_string(),
+                        s.condition.clone(),
+                        s.start_line as i64,
+                        s.end_line as i64,
+                        s.depth as i64,
+                        s.parent_symbol.clone(),
+                    )
+                })
+                .collect();
             self.import_statements(&stmt_rows)?;
 
-            let has_stmt: Vec<_> = extraction.statements.iter()
+            let has_stmt: Vec<_> = extraction
+                .statements
+                .iter()
                 .map(|s| (s.parent_symbol.clone(), s.id.clone()))
                 .collect();
             self.import_edges("has_statement", &has_stmt)?;
@@ -978,17 +1240,22 @@ impl CozoStore {
     fn invalidate_caches(&self) -> Result<()> {
         let _ = self.run_params(
             "?[key, val] <- []\n:replace meta_cache {key: String => val: Int}",
-            empty_params(), true,
+            empty_params(),
+            true,
         );
         let _ = self.run_params(
             "?[id] <- []\n:replace testable_cache {id: String}",
-            empty_params(), true,
+            empty_params(),
+            true,
         );
         Ok(())
     }
 
     fn batch_callers(&self, ids: &[&str]) -> Result<HashMap<String, Vec<String>>> {
-        let vals: Vec<String> = ids.iter().map(|id| format!("[\"{}\"]", id.replace('"', "\\\""))).collect();
+        let vals: Vec<String> = ids
+            .iter()
+            .map(|id| format!("[\"{}\"]", id.replace('"', "\\\"")))
+            .collect();
         let script = format!(
             "targets[id] <- [{}]\n?[callee, caller] := targets[callee], *calls{{caller, callee}}",
             vals.join(", ")
@@ -996,13 +1263,18 @@ impl CozoStore {
         let r = self.run(&script)?;
         let mut map: HashMap<String, Vec<String>> = HashMap::new();
         for row in &r.rows {
-            map.entry(dv_str(&row[0])).or_default().push(dv_str(&row[1]));
+            map.entry(dv_str(&row[0]))
+                .or_default()
+                .push(dv_str(&row[1]));
         }
         Ok(map)
     }
 
     fn batch_callees(&self, ids: &[&str]) -> Result<HashMap<String, Vec<String>>> {
-        let vals: Vec<String> = ids.iter().map(|id| format!("[\"{}\"]", id.replace('"', "\\\""))).collect();
+        let vals: Vec<String> = ids
+            .iter()
+            .map(|id| format!("[\"{}\"]", id.replace('"', "\\\"")))
+            .collect();
         let script = format!(
             "targets[id] <- [{}]\n?[caller, callee] := targets[caller], *calls{{caller, callee}}",
             vals.join(", ")
@@ -1010,13 +1282,18 @@ impl CozoStore {
         let r = self.run(&script)?;
         let mut map: HashMap<String, Vec<String>> = HashMap::new();
         for row in &r.rows {
-            map.entry(dv_str(&row[0])).or_default().push(dv_str(&row[1]));
+            map.entry(dv_str(&row[0]))
+                .or_default()
+                .push(dv_str(&row[1]));
         }
         Ok(map)
     }
 
     fn batch_branches(&self, ids: &[&str]) -> Result<HashMap<String, Vec<BranchInfo>>> {
-        let vals: Vec<String> = ids.iter().map(|id| format!("[\"{}\"]", id.replace('"', "\\\""))).collect();
+        let vals: Vec<String> = ids
+            .iter()
+            .map(|id| format!("[\"{}\"]", id.replace('"', "\\\"")))
+            .collect();
         let script = format!(
             "targets[id] <- [{}]\n?[sym, stmt_kind, condition, start_line, depth] := targets[sym], *has_statement{{symbol_id: sym, statement_id: sid}}, *statement{{id: sid, kind: stmt_kind, condition, start_line, depth}}",
             vals.join(", ")
@@ -1067,13 +1344,17 @@ impl CozoStore {
             ?[id] := *symbol{id, kind: "Trait"}
             ?[id] := *symbol{id, kind: "Interface"}
             :replace testable_cache {id: String}"#,
-            empty_params(), true,
+            empty_params(),
+            true,
         )?;
         Ok(())
     }
 
     pub fn create_custom_edge(&self, ddl: &str) -> Result<()> {
-        match self.db.run_script(ddl, empty_params(), ScriptMutability::Mutable) {
+        match self
+            .db
+            .run_script(ddl, empty_params(), ScriptMutability::Mutable)
+        {
             Ok(_) => Ok(()),
             Err(e) => {
                 let msg = format!("{e}");
@@ -1090,7 +1371,9 @@ impl CozoStore {
         let r = self.run(r#"?[key, val] := *meta_cache{key, val}"#);
         if let Ok(r) = &r {
             if !r.rows.is_empty() {
-                let m: HashMap<String, u64> = r.rows.iter()
+                let m: HashMap<String, u64> = r
+                    .rows
+                    .iter()
                     .map(|row| (dv_str(&row[0]), dv_u64_val(&row[1])))
                     .collect();
                 return Ok(GraphStats {
@@ -1122,12 +1405,17 @@ impl CozoStore {
 
     pub fn get_all_symbols(&self) -> Result<Vec<(String, String, String, String)>> {
         let r = self.run(r#"?[name, id, file, kind] := *symbol{id, name, file, kind}"#)?;
-        Ok(r.rows.iter().map(|row| (
-            dv_str(&row[0]),
-            dv_str(&row[1]),
-            dv_str(&row[2]),
-            dv_str(&row[3]),
-        )).collect())
+        Ok(r.rows
+            .iter()
+            .map(|row| {
+                (
+                    dv_str(&row[0]),
+                    dv_str(&row[1]),
+                    dv_str(&row[2]),
+                    dv_str(&row[3]),
+                )
+            })
+            .collect())
     }
 
     pub fn remove_file(&self, file: &str) -> Result<()> {
@@ -1145,7 +1433,8 @@ impl CozoStore {
         let _ = self.run_params(
             r#"?[symbol_id, test_id] := *tested_by{symbol_id, test_id}
             :rm tested_by {symbol_id, test_id}"#,
-            empty_params(), true,
+            empty_params(),
+            true,
         );
         self.run_params(
             r#"?[symbol_id, test_id] := *calls{caller: test_id, callee: symbol_id},
@@ -1153,7 +1442,8 @@ impl CozoStore {
                 *symbol{id: symbol_id, kind},
                 kind != "Test"
             :put tested_by {symbol_id, test_id}"#,
-            empty_params(), true,
+            empty_params(),
+            true,
         )?;
         let r = self.run(r#"?[count(symbol_id)] := *tested_by{symbol_id}"#)?;
         Ok(dv_u64(&r) as usize)
@@ -1166,124 +1456,223 @@ impl CozoStore {
             r#"?[kind, detail] := *has_concern{symbol_id: $sym, concern_id: cid}, *concern{id: cid, kind, detail}"#,
             params, false,
         )?;
-        Ok(r.rows.iter().map(|row| (dv_str(&row[0]), dv_str(&row[1]))).collect())
+        Ok(r.rows
+            .iter()
+            .map(|row| (dv_str(&row[0]), dv_str(&row[1])))
+            .collect())
     }
 
     pub fn upsert_folders_bulk(&self, file_paths: &[&str]) -> Result<()> {
         let mut all_folders: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         for file_path in file_paths {
             let parts: Vec<&str> = file_path.rsplitn(2, '/').collect();
-            if parts.len() < 2 { continue; }
+            if parts.len() < 2 {
+                continue;
+            }
             let dir_path = parts[1];
             let segments: Vec<&str> = dir_path.split('/').collect();
             for i in 0..segments.len() {
                 all_folders.insert(segments[..=i].join("/"));
             }
         }
-        if all_folders.is_empty() { return Ok(()); }
+        if all_folders.is_empty() {
+            return Ok(());
+        }
 
-        let folder_rows: Vec<(String, String, String)> = all_folders.iter().map(|fp| {
-            let name = fp.rsplit_once('/').map(|(_, n)| n).unwrap_or(fp.as_str());
-            (fp.clone(), name.to_string(), fp.clone())
-        }).collect();
+        let folder_rows: Vec<(String, String, String)> = all_folders
+            .iter()
+            .map(|fp| {
+                let name = fp.rsplit_once('/').map(|(_, n)| n).unwrap_or(fp.as_str());
+                (fp.clone(), name.to_string(), fp.clone())
+            })
+            .collect();
         self.import_folders(&folder_rows)?;
 
-        let cf_pairs: Vec<(String, String)> = all_folders.iter().filter_map(|child| {
-            child.rsplit_once('/').map(|(p, _)| p).and_then(|parent_path| {
-                if all_folders.contains(parent_path) {
-                    Some((parent_path.to_string(), child.clone()))
-                } else {
-                    None
-                }
+        let cf_pairs: Vec<(String, String)> = all_folders
+            .iter()
+            .filter_map(|child| {
+                child
+                    .rsplit_once('/')
+                    .map(|(p, _)| p)
+                    .and_then(|parent_path| {
+                        if all_folders.contains(parent_path) {
+                            Some((parent_path.to_string(), child.clone()))
+                        } else {
+                            None
+                        }
+                    })
             })
-        }).collect();
+            .collect();
         self.import_edges("contains_folder", &cf_pairs)?;
 
-        let cfile_pairs: Vec<(String, String)> = file_paths.iter().filter_map(|fp| {
-            let parts: Vec<&str> = fp.rsplitn(2, '/').collect();
-            if parts.len() < 2 { return None; }
-            Some((parts[1].to_string(), fp.to_string()))
-        }).collect();
+        let cfile_pairs: Vec<(String, String)> = file_paths
+            .iter()
+            .filter_map(|fp| {
+                let parts: Vec<&str> = fp.rsplitn(2, '/').collect();
+                if parts.len() < 2 {
+                    return None;
+                }
+                Some((parts[1].to_string(), fp.to_string()))
+            })
+            .collect();
         self.import_edges("contains_file", &cfile_pairs)?;
 
         Ok(())
     }
 
     pub fn import_concerns(&self, rows: &[(String, String, String)]) -> Result<()> {
-        if rows.is_empty() { return Ok(()); }
+        if rows.is_empty() {
+            return Ok(());
+        }
         let headers = vec!["id".into(), "kind".into(), "detail".into()];
-        let data_rows: Vec<Vec<DataValue>> = rows.iter().map(|r| vec![
-            DataValue::Str(r.0.clone().into()),
-            DataValue::Str(r.1.clone().into()),
-            DataValue::Str(r.2.clone().into()),
-        ]).collect();
+        let data_rows: Vec<Vec<DataValue>> = rows
+            .iter()
+            .map(|r| {
+                vec![
+                    DataValue::Str(r.0.clone().into()),
+                    DataValue::Str(r.1.clone().into()),
+                    DataValue::Str(r.2.clone().into()),
+                ]
+            })
+            .collect();
         let named = NamedRows::new(headers, data_rows);
         let mut map = BTreeMap::new();
         map.insert("concern".to_string(), named);
-        self.db.import_relations(map)
+        self.db
+            .import_relations(map)
             .map_err(|e| anyhow::anyhow!("import concerns: {e}"))
     }
 
-    pub fn import_config_bindings(&self, rows: &[(String, String, String, String, String, String)]) -> Result<()> {
-        if rows.is_empty() { return Ok(()); }
-        let headers = vec!["id".into(), "kind".into(), "key".into(), "value".into(), "profile".into(), "source_file".into()];
-        let data_rows: Vec<Vec<DataValue>> = rows.iter().map(|r| vec![
-            DataValue::Str(r.0.clone().into()), DataValue::Str(r.1.clone().into()),
-            DataValue::Str(r.2.clone().into()), DataValue::Str(r.3.clone().into()),
-            DataValue::Str(r.4.clone().into()), DataValue::Str(r.5.clone().into()),
-        ]).collect();
+    pub fn import_config_bindings(
+        &self,
+        rows: &[(String, String, String, String, String, String)],
+    ) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let headers = vec![
+            "id".into(),
+            "kind".into(),
+            "key".into(),
+            "value".into(),
+            "profile".into(),
+            "source_file".into(),
+        ];
+        let data_rows: Vec<Vec<DataValue>> = rows
+            .iter()
+            .map(|r| {
+                vec![
+                    DataValue::Str(r.0.clone().into()),
+                    DataValue::Str(r.1.clone().into()),
+                    DataValue::Str(r.2.clone().into()),
+                    DataValue::Str(r.3.clone().into()),
+                    DataValue::Str(r.4.clone().into()),
+                    DataValue::Str(r.5.clone().into()),
+                ]
+            })
+            .collect();
         let named = NamedRows::new(headers, data_rows);
         let mut map = BTreeMap::new();
         map.insert("config_binding".to_string(), named);
-        self.db.import_relations(map)
+        self.db
+            .import_relations(map)
             .map_err(|e| anyhow::anyhow!("import config_bindings: {e}"))
     }
 
-    pub fn import_taint_flows(&self, rows: &[(String, String, String, String, String)]) -> Result<()> {
-        if rows.is_empty() { return Ok(()); }
-        let headers = vec!["source".into(), "target".into(), "source_kind".into(), "sink_kind".into(), "path".into()];
-        let data_rows: Vec<Vec<DataValue>> = rows.iter().map(|r| vec![
-            DataValue::Str(r.0.clone().into()), DataValue::Str(r.1.clone().into()),
-            DataValue::Str(r.2.clone().into()), DataValue::Str(r.3.clone().into()),
-            DataValue::Str(r.4.clone().into()),
-        ]).collect();
+    pub fn import_taint_flows(
+        &self,
+        rows: &[(String, String, String, String, String)],
+    ) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let headers = vec![
+            "source".into(),
+            "target".into(),
+            "source_kind".into(),
+            "sink_kind".into(),
+            "path".into(),
+        ];
+        let data_rows: Vec<Vec<DataValue>> = rows
+            .iter()
+            .map(|r| {
+                vec![
+                    DataValue::Str(r.0.clone().into()),
+                    DataValue::Str(r.1.clone().into()),
+                    DataValue::Str(r.2.clone().into()),
+                    DataValue::Str(r.3.clone().into()),
+                    DataValue::Str(r.4.clone().into()),
+                ]
+            })
+            .collect();
         let named = NamedRows::new(headers, data_rows);
         let mut map = BTreeMap::new();
         map.insert("taint_flow".to_string(), named);
-        self.db.import_relations(map)
+        self.db
+            .import_relations(map)
             .map_err(|e| anyhow::anyhow!("import taint_flows: {e}"))
     }
 
     pub fn import_resolves_to(&self, rows: &[(String, String, String, String)]) -> Result<()> {
-        if rows.is_empty() { return Ok(()); }
-        let headers = vec!["source".into(), "target".into(), "mechanism".into(), "config_source".into()];
-        let data_rows: Vec<Vec<DataValue>> = rows.iter().map(|r| vec![
-            DataValue::Str(r.0.clone().into()), DataValue::Str(r.1.clone().into()),
-            DataValue::Str(r.2.clone().into()), DataValue::Str(r.3.clone().into()),
-        ]).collect();
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let headers = vec![
+            "source".into(),
+            "target".into(),
+            "mechanism".into(),
+            "config_source".into(),
+        ];
+        let data_rows: Vec<Vec<DataValue>> = rows
+            .iter()
+            .map(|r| {
+                vec![
+                    DataValue::Str(r.0.clone().into()),
+                    DataValue::Str(r.1.clone().into()),
+                    DataValue::Str(r.2.clone().into()),
+                    DataValue::Str(r.3.clone().into()),
+                ]
+            })
+            .collect();
         let named = NamedRows::new(headers, data_rows);
         let mut map = BTreeMap::new();
         map.insert("resolves_to".to_string(), named);
-        self.db.import_relations(map)
+        self.db
+            .import_relations(map)
             .map_err(|e| anyhow::anyhow!("import resolves_to: {e}"))
     }
 
     pub fn relation_counts(&self) -> Result<BTreeMap<String, u64>> {
         let relations = [
-            ("symbol", "id"), ("module", "id"), ("cluster", "id"),
-            ("file", "id"), ("folder", "id"), ("dependency", "id"),
+            ("symbol", "id"),
+            ("module", "id"),
+            ("cluster", "id"),
+            ("file", "id"),
+            ("folder", "id"),
+            ("dependency", "id"),
             ("statement", "id"),
-            ("calls", "caller"), ("depends_on", "module_id"),
-            ("imports", "importer"), ("contains", "module_id"),
-            ("inherits", "child"), ("tested_by", "symbol_id"),
-            ("reads_rel", "reader"), ("writes_rel", "writer"),
-            ("member_of", "symbol_id"), ("similar_to", "symbol_a"),
-            ("bridge_to", "source"), ("contains_file", "folder_id"),
-            ("contains_folder", "parent_id"), ("defines", "file_id"),
-            ("calls_service", "caller"), ("has_statement", "symbol_id"),
-            ("concern", "id"), ("has_concern", "symbol_id"),
-            ("config_binding", "id"), ("has_config", "symbol_id"),
-            ("resolves_to", "source"), ("taint_flow", "source"),
+            ("calls", "caller"),
+            ("depends_on", "module_id"),
+            ("imports", "importer"),
+            ("contains", "module_id"),
+            ("inherits", "child"),
+            ("tested_by", "symbol_id"),
+            ("reads_rel", "reader"),
+            ("writes_rel", "writer"),
+            ("member_of", "symbol_id"),
+            ("similar_to", "symbol_a"),
+            ("bridge_to", "source"),
+            ("contains_file", "folder_id"),
+            ("contains_folder", "parent_id"),
+            ("defines", "file_id"),
+            ("calls_service", "caller"),
+            ("has_statement", "symbol_id"),
+            ("concern", "id"),
+            ("has_concern", "symbol_id"),
+            ("config_binding", "id"),
+            ("has_config", "symbol_id"),
+            ("resolves_to", "source"),
+            ("taint_flow", "source"),
         ];
         let mut counts = BTreeMap::new();
         for (rel, col) in &relations {
@@ -1293,7 +1682,6 @@ impl CozoStore {
         }
         Ok(counts)
     }
-
 }
 
 // ── Schema ────────────────────────────────────────────────────────────
@@ -1402,7 +1790,8 @@ fn dv_u32(v: &DataValue) -> u32 {
 }
 
 fn dv_u64(r: &NamedRows) -> u64 {
-    r.rows.first()
+    r.rows
+        .first()
         .and_then(|row| row.first())
         .map(|v| dv_u64_val(v))
         .unwrap_or(0)
@@ -1417,23 +1806,30 @@ fn dv_u64_val(v: &DataValue) -> u64 {
 }
 
 fn is_testable_kind(kind: &str) -> bool {
-    matches!(kind, "Function" | "Method" | "Class" | "Struct" | "Trait" | "Interface")
+    matches!(
+        kind,
+        "Function" | "Method" | "Class" | "Struct" | "Trait" | "Interface"
+    )
 }
 
 fn collect_strings(r: &NamedRows) -> Vec<String> {
-    r.rows.iter().filter_map(|row| {
-        row.first().map(|v| dv_str(v))
-    }).collect()
+    r.rows
+        .iter()
+        .filter_map(|row| row.first().map(|v| dv_str(v)))
+        .collect()
 }
 
 fn named_rows_to_symbol_rows(r: &NamedRows) -> Vec<SymbolRow> {
-    r.rows.iter().map(|row| SymbolRow {
-        id: dv_str(&row[0]),
-        name: dv_str(&row[1]),
-        kind: dv_str(&row[2]),
-        start_line: dv_u32(&row[3]),
-        end_line: dv_u32(&row[4]),
-    }).collect()
+    r.rows
+        .iter()
+        .map(|row| SymbolRow {
+            id: dv_str(&row[0]),
+            name: dv_str(&row[1]),
+            kind: dv_str(&row[2]),
+            start_line: dv_u32(&row[3]),
+            end_line: dv_u32(&row[4]),
+        })
+        .collect()
 }
 
 fn row_to_symbol_detail(row: &[DataValue]) -> SymbolDetail {

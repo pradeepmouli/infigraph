@@ -4,7 +4,7 @@ pub mod graph;
 pub mod groups;
 pub mod helpers;
 pub mod index;
+pub mod pipelines;
 pub mod search;
 pub mod session;
-pub mod pipelines;
 pub mod watch;

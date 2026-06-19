@@ -337,7 +337,10 @@ mod tests {
                 }
             }
         }
-        assert!(found.contains(&"Authorization"), "should detect @PreAuthorize");
+        assert!(
+            found.contains(&"Authorization"),
+            "should detect @PreAuthorize"
+        );
     }
 
     #[test]
@@ -383,8 +386,14 @@ mod tests {
                 }
             }
         }
-        assert!(found.contains(&"Authorization"), "should detect [Authorize]");
-        assert!(found.contains(&"Validation"), "should detect [ValidateAntiForgeryToken]");
+        assert!(
+            found.contains(&"Authorization"),
+            "should detect [Authorize]"
+        );
+        assert!(
+            found.contains(&"Validation"),
+            "should detect [ValidateAntiForgeryToken]"
+        );
     }
 
     #[test]
@@ -399,7 +408,10 @@ mod tests {
                 }
             }
         }
-        assert!(found.contains(&"AuditLogging"), "should detect #[instrument]");
+        assert!(
+            found.contains(&"AuditLogging"),
+            "should detect #[instrument]"
+        );
     }
 
     #[test]
@@ -414,7 +426,10 @@ mod tests {
                 }
             }
         }
-        assert!(found.contains(&"Transaction"), "should detect @Transactional");
+        assert!(
+            found.contains(&"Transaction"),
+            "should detect @Transactional"
+        );
     }
 
     #[test]
@@ -429,7 +444,11 @@ mod tests {
                 }
             }
         }
-        assert!(found.is_empty(), "should not match plain text without annotation syntax: {:?}", found);
+        assert!(
+            found.is_empty(),
+            "should not match plain text without annotation syntax: {:?}",
+            found
+        );
     }
 
     #[test]
@@ -451,7 +470,10 @@ mod tests {
                 }
             }
         }
-        assert!(found.contains(&"Authorization"), "should detect @login_required");
+        assert!(
+            found.contains(&"Authorization"),
+            "should detect @login_required"
+        );
     }
 
     #[test]
@@ -468,7 +490,10 @@ mod tests {
         }
         // Ruby patterns don't start with @ or [, they're bare method calls
         // "before_action :authenticate" is not in our patterns — let me check
-        assert!(found.is_empty() || found.contains(&"Authorization"),
-            "Ruby before_action pattern check: {:?}", found);
+        assert!(
+            found.is_empty() || found.contains(&"Authorization"),
+            "Ruby before_action pattern check: {:?}",
+            found
+        );
     }
 }

@@ -1,10 +1,14 @@
 use infigraph_core::graph::{GraphQuery, GraphStore};
-use infigraph_core::model::{
-    FileExtraction, Relation, RelationKind, Span, Symbol, SymbolKind,
-};
+use infigraph_core::model::{FileExtraction, Relation, RelationKind, Span, Symbol, SymbolKind};
 
 fn span(file: &str, start: u32, end: u32) -> Span {
-    Span { file: file.to_string(), start_line: start, start_col: 0, end_line: end, end_col: 0 }
+    Span {
+        file: file.to_string(),
+        start_line: start,
+        start_col: 0,
+        end_line: end,
+        end_col: 0,
+    }
 }
 
 fn sym(id: &str, name: &str, kind: SymbolKind, file: &str, start: u32, end: u32) -> Symbol {
@@ -48,12 +52,34 @@ fn setup_graph() -> TestGraph {
             language: "python".to_string(),
             content_hash: "a".to_string(),
             symbols: vec![
-                sym("src/api/handler.py::handle_request", "handle_request", SymbolKind::Function, "src/api/handler.py", 1, 20),
-                sym("src/api/handler.py::validate_input", "validate_input", SymbolKind::Function, "src/api/handler.py", 22, 35),
+                sym(
+                    "src/api/handler.py::handle_request",
+                    "handle_request",
+                    SymbolKind::Function,
+                    "src/api/handler.py",
+                    1,
+                    20,
+                ),
+                sym(
+                    "src/api/handler.py::validate_input",
+                    "validate_input",
+                    SymbolKind::Function,
+                    "src/api/handler.py",
+                    22,
+                    35,
+                ),
             ],
             relations: vec![
-                rel("src/api/handler.py::handle_request", "src/api/handler.py::validate_input", RelationKind::Calls),
-                rel("src/api/handler.py::handle_request", "src/service/user.py::get_user", RelationKind::Calls),
+                rel(
+                    "src/api/handler.py::handle_request",
+                    "src/api/handler.py::validate_input",
+                    RelationKind::Calls,
+                ),
+                rel(
+                    "src/api/handler.py::handle_request",
+                    "src/service/user.py::get_user",
+                    RelationKind::Calls,
+                ),
             ],
             statements: vec![],
         },
@@ -62,12 +88,34 @@ fn setup_graph() -> TestGraph {
             language: "python".to_string(),
             content_hash: "b".to_string(),
             symbols: vec![
-                sym("src/service/user.py::get_user", "get_user", SymbolKind::Function, "src/service/user.py", 1, 15),
-                sym("src/service/user.py::save_user", "save_user", SymbolKind::Function, "src/service/user.py", 17, 30),
+                sym(
+                    "src/service/user.py::get_user",
+                    "get_user",
+                    SymbolKind::Function,
+                    "src/service/user.py",
+                    1,
+                    15,
+                ),
+                sym(
+                    "src/service/user.py::save_user",
+                    "save_user",
+                    SymbolKind::Function,
+                    "src/service/user.py",
+                    17,
+                    30,
+                ),
             ],
             relations: vec![
-                rel("src/service/user.py::get_user", "src/service/user.py::save_user", RelationKind::Calls),
-                rel("src/service/user.py", "src/api/handler.py", RelationKind::Imports),
+                rel(
+                    "src/service/user.py::get_user",
+                    "src/service/user.py::save_user",
+                    RelationKind::Calls,
+                ),
+                rel(
+                    "src/service/user.py",
+                    "src/api/handler.py",
+                    RelationKind::Imports,
+                ),
             ],
             statements: vec![],
         },
@@ -76,12 +124,28 @@ fn setup_graph() -> TestGraph {
             language: "python".to_string(),
             content_hash: "c".to_string(),
             symbols: vec![
-                sym("src/models/base.py::BaseModel", "BaseModel", SymbolKind::Class, "src/models/base.py", 1, 20),
-                sym("src/models/base.py::UserModel", "UserModel", SymbolKind::Class, "src/models/base.py", 22, 40),
+                sym(
+                    "src/models/base.py::BaseModel",
+                    "BaseModel",
+                    SymbolKind::Class,
+                    "src/models/base.py",
+                    1,
+                    20,
+                ),
+                sym(
+                    "src/models/base.py::UserModel",
+                    "UserModel",
+                    SymbolKind::Class,
+                    "src/models/base.py",
+                    22,
+                    40,
+                ),
             ],
-            relations: vec![
-                rel("src/models/base.py::UserModel", "src/models/base.py::BaseModel", RelationKind::Inherits),
-            ],
+            relations: vec![rel(
+                "src/models/base.py::UserModel",
+                "src/models/base.py::BaseModel",
+                RelationKind::Inherits,
+            )],
             statements: vec![],
         },
     ];
@@ -107,7 +171,10 @@ fn test_export_cypher() {
     let output = String::from_utf8(buf).unwrap();
 
     assert!(output.contains("CREATE"), "should have CREATE statements");
-    assert!(output.contains("handle_request"), "should contain symbol names");
+    assert!(
+        output.contains("handle_request"),
+        "should contain symbol names"
+    );
     assert!(output.contains("CALLS"), "should contain CALLS edges");
 }
 
@@ -169,11 +236,17 @@ fn test_sequence_diagram_basic() {
         &q,
         "src/api/handler.py::handle_request",
         3,
-    ).unwrap();
+    )
+    .unwrap();
 
-    assert!(mermaid.contains("sequenceDiagram"), "should start with sequenceDiagram");
-    assert!(mermaid.contains("handle_request") || mermaid.contains("handler"),
-        "should reference entry symbol");
+    assert!(
+        mermaid.contains("sequenceDiagram"),
+        "should start with sequenceDiagram"
+    );
+    assert!(
+        mermaid.contains("handle_request") || mermaid.contains("handler"),
+        "should reference entry symbol"
+    );
 }
 
 #[test]
@@ -186,10 +259,14 @@ fn test_sequence_diagram_no_calls() {
         &q,
         "src/api/handler.py::validate_input",
         3,
-    ).unwrap();
+    )
+    .unwrap();
 
     assert!(mermaid.contains("sequenceDiagram"));
-    assert!(mermaid.contains("no outgoing calls"), "leaf symbol should show no-calls note");
+    assert!(
+        mermaid.contains("no outgoing calls"),
+        "leaf symbol should show no-calls note"
+    );
 }
 
 #[test]
@@ -202,13 +279,15 @@ fn test_sequence_diagram_depth_limit() {
         &q,
         "src/api/handler.py::handle_request",
         1,
-    ).unwrap();
+    )
+    .unwrap();
 
     let deep = infigraph_core::sequence::generate_sequence_mermaid(
         &q,
         "src/api/handler.py::handle_request",
         5,
-    ).unwrap();
+    )
+    .unwrap();
 
     // Deeper traversal should produce same or more content
     assert!(deep.len() >= shallow.len());
@@ -233,10 +312,15 @@ extern "C" {
 #[no_mangle]
 pub extern "C" fn my_exported_fn() {}
 "#,
-    ).unwrap();
+    )
+    .unwrap();
 
     let result = infigraph_core::bridges::detect_bridges(dir.path()).unwrap();
-    assert!(result.ffi_count() >= 1, "should detect FFI bridge: {:?}", result.bridges);
+    assert!(
+        result.ffi_count() >= 1,
+        "should detect FFI bridge: {:?}",
+        result.bridges
+    );
 }
 
 #[test]
@@ -248,7 +332,11 @@ fn test_detect_bridges_grpc() {
     ).unwrap();
 
     let result = infigraph_core::bridges::detect_bridges(dir.path()).unwrap();
-    assert!(result.grpc_count() >= 1, "should detect gRPC service: {:?}", result.bridges);
+    assert!(
+        result.grpc_count() >= 1,
+        "should detect gRPC service: {:?}",
+        result.bridges
+    );
 }
 
 #[test]
@@ -260,7 +348,11 @@ fn test_detect_bridges_jni() {
     ).unwrap();
 
     let result = infigraph_core::bridges::detect_bridges(dir.path()).unwrap();
-    assert!(result.jni_count() >= 1, "should detect JNI bridge: {:?}", result.bridges);
+    assert!(
+        result.jni_count() >= 1,
+        "should detect JNI bridge: {:?}",
+        result.bridges
+    );
 }
 
 #[test]
@@ -269,10 +361,15 @@ fn test_detect_bridges_pinvoke() {
     std::fs::write(
         dir.path().join("Interop.cs"),
         "[DllImport(\"kernel32.dll\")]\nstatic extern bool CloseHandle(IntPtr handle);\n",
-    ).unwrap();
+    )
+    .unwrap();
 
     let result = infigraph_core::bridges::detect_bridges(dir.path()).unwrap();
-    assert!(result.pinvoke_count() >= 1, "should detect P/Invoke: {:?}", result.bridges);
+    assert!(
+        result.pinvoke_count() >= 1,
+        "should detect P/Invoke: {:?}",
+        result.bridges
+    );
 }
 
 #[test]
@@ -287,14 +384,12 @@ fn test_bridge_scan_result_by_kind() {
     let dir = tempfile::TempDir::new().unwrap();
     let src_dir = dir.path().join("src");
     std::fs::create_dir(&src_dir).unwrap();
-    std::fs::write(
-        src_dir.join("lib.rs"),
-        "extern \"C\" { fn ext_func(); }\n",
-    ).unwrap();
+    std::fs::write(src_dir.join("lib.rs"), "extern \"C\" { fn ext_func(); }\n").unwrap();
     std::fs::write(
         dir.path().join("service.proto"),
         "syntax = \"proto3\";\nservice Svc { rpc Do (Req) returns (Res); }\n",
-    ).unwrap();
+    )
+    .unwrap();
 
     let result = infigraph_core::bridges::detect_bridges(dir.path()).unwrap();
     let ffi = result.by_kind(&infigraph_core::model::BridgeKind::Ffi);
@@ -344,9 +439,18 @@ fn test_diff_format() {
     assert_eq!(diff.modified().count(), 1);
 
     let formatted = format_diff(&diff);
-    assert!(formatted.contains("new_func"), "should contain added symbol");
-    assert!(formatted.contains("old_func"), "should contain removed symbol");
-    assert!(formatted.contains("changed_func"), "should contain modified symbol");
+    assert!(
+        formatted.contains("new_func"),
+        "should contain added symbol"
+    );
+    assert!(
+        formatted.contains("old_func"),
+        "should contain removed symbol"
+    );
+    assert!(
+        formatted.contains("changed_func"),
+        "should contain modified symbol"
+    );
     assert!(formatted.contains("main"), "should reference old ref");
     assert!(formatted.contains("feature"), "should reference new ref");
 }
@@ -365,8 +469,14 @@ fn test_viz_generate_html() {
     let result_path = infigraph_core::viz::generate_html(&q, &output_path).unwrap();
     assert!(!result_path.is_empty());
     let html = std::fs::read_to_string(&output_path).unwrap();
-    assert!(html.contains("<html") || html.contains("<!DOCTYPE"), "should produce HTML");
-    assert!(html.contains("handle_request") || html.contains("node"), "should contain graph data");
+    assert!(
+        html.contains("<html") || html.contains("<!DOCTYPE"),
+        "should produce HTML"
+    );
+    assert!(
+        html.contains("handle_request") || html.contains("node"),
+        "should contain graph data"
+    );
 }
 
 #[test]
@@ -381,7 +491,8 @@ fn test_viz_generate_symbol_html() {
         "src/api/handler.py::handle_request",
         2,
         &output_path,
-    ).unwrap();
+    )
+    .unwrap();
     assert!(!result_path.is_empty());
     let html = std::fs::read_to_string(&output_path).unwrap();
     assert!(html.contains("<html") || html.contains("<!DOCTYPE"));

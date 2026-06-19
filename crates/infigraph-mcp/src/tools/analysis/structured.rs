@@ -11,7 +11,8 @@ pub fn tool_ingest_structured(args: &Value) -> Result<String> {
     let data_file = args.get("data_file").and_then(|v| v.as_str());
     let inline_data = args.get("data").and_then(|v| v.as_array());
 
-    let project_root = args.get("path")
+    let project_root = args
+        .get("path")
         .and_then(|v| v.as_str())
         .map(std::path::Path::new)
         .unwrap_or(std::path::Path::new("."));
@@ -41,7 +42,8 @@ pub fn tool_ingest_structured(args: &Value) -> Result<String> {
     }
 
     let sid = schema_id.context("missing 'schema_id'")?;
-    let (_, schema) = schemas.iter()
+    let (_, schema) = schemas
+        .iter()
         .find(|(_, s)| s.schema.schema_id == sid)
         .with_context(|| format!("schema '{}' not found", sid))?;
 
@@ -68,7 +70,10 @@ pub fn tool_ingest_structured(args: &Value) -> Result<String> {
         let result = infigraph_core::structured::ingest_data(&conn, &schema.schema, &data_vec)?;
         Ok(format!(
             "Ingested {} records using schema '{}': {} nodes created, {} edges created",
-            data_vec.len(), sid, result.nodes_created, result.edges_created
+            data_vec.len(),
+            sid,
+            result.nodes_created,
+            result.edges_created
         ))
     } else {
         Ok("Provide 'data_file' (path to .json/.yaml) or 'data' (inline JSON array)".to_string())
@@ -76,7 +81,8 @@ pub fn tool_ingest_structured(args: &Value) -> Result<String> {
 }
 
 pub fn tool_list_structured_schemas(args: &Value) -> Result<String> {
-    let project_root = args.get("path")
+    let project_root = args
+        .get("path")
         .and_then(|v| v.as_str())
         .map(std::path::Path::new)
         .unwrap_or(std::path::Path::new("."));

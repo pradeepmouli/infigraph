@@ -2,9 +2,9 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use infigraph_core::graph::CozoStore;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use infigraph_core::graph::CozoStore;
 
 fn main() -> Result<()> {
     let project_root = std::env::args()
@@ -33,7 +33,11 @@ fn main() -> Result<()> {
     };
 
     let sample = pick_samples(&store)?;
-    eprintln!("Samples: {} symbol IDs, {} files", sample.symbol_ids.len(), sample.files.len());
+    eprintln!(
+        "Samples: {} symbol IDs, {} files",
+        sample.symbol_ids.len(),
+        sample.files.len()
+    );
 
     // 1. symbols_in_file
     {
@@ -107,7 +111,10 @@ fn main() -> Result<()> {
             let detail = store.find_symbol_by_id(id)?;
             all.insert(id.clone(), detail);
         }
-        all.insert("__nonexistent__".to_string(), store.find_symbol_by_id("__nonexistent__")?);
+        all.insert(
+            "__nonexistent__".to_string(),
+            store.find_symbol_by_id("__nonexistent__")?,
+        );
         write_golden(&out_dir, &mut manifest, "find_symbol_by_id", &all)?;
     }
 
@@ -156,7 +163,11 @@ fn main() -> Result<()> {
     // 12. get_test_coverage
     {
         let mut cov = store.get_test_coverage()?;
-        cov.covered.sort_by(|a, b| a.symbol_id.cmp(&b.symbol_id).then(a.test_id.cmp(&b.test_id)));
+        cov.covered.sort_by(|a, b| {
+            a.symbol_id
+                .cmp(&b.symbol_id)
+                .then(a.test_id.cmp(&b.test_id))
+        });
         cov.uncovered.sort_by(|a, b| a.symbol_id.cmp(&b.symbol_id));
         write_golden(&out_dir, &mut manifest, "get_test_coverage", &cov)?;
     }
@@ -175,9 +186,18 @@ fn main() -> Result<()> {
     let manifest_json = serde_json::to_string_pretty(&manifest)?;
     std::fs::write(out_dir.join("manifest.json"), &manifest_json)?;
 
-    eprintln!("CozoDB golden export: {} queries → {}", manifest.entries.len(), out_dir.display());
+    eprintln!(
+        "CozoDB golden export: {} queries → {}",
+        manifest.entries.len(),
+        out_dir.display()
+    );
     for e in &manifest.entries {
-        eprintln!("  {} — {} bytes, hash {}", e.query, e.size_bytes, &e.content_hash[..16]);
+        eprintln!(
+            "  {} — {} bytes, hash {}",
+            e.query,
+            e.size_bytes,
+            &e.content_hash[..16]
+        );
     }
 
     Ok(())
@@ -194,7 +214,7 @@ fn pick_samples(store: &CozoStore) -> Result<Samples> {
     let top_called = store.raw_query(
         r#"?[target, count(caller)] := *calls{caller, callee: target}
         :order -count(caller)
-        :limit 5"#
+        :limit 5"#,
     )?;
 
     // 3 symbols with zero callers
@@ -202,13 +222,11 @@ fn pick_samples(store: &CozoStore) -> Result<Samples> {
         r#"called[id] := *calls{callee: id}
         ?[id] := *symbol{id, kind}, kind in ["Function", "Method"], not called[id]
         :order id
-        :limit 3"#
+        :limit 3"#,
     )?;
 
     // INHERITS participants
-    let inherits = store.raw_query(
-        r#"?[child, parent] := *inherits{child, parent}"#
-    )?;
+    let inherits = store.raw_query(r#"?[child, parent] := *inherits{child, parent}"#)?;
 
     let mut symbol_ids: Vec<String> = Vec::new();
     for row in &top_called {
@@ -245,7 +263,11 @@ fn pick_samples(store: &CozoStore) -> Result<Samples> {
     files.sort();
     files.dedup();
 
-    Ok(Samples { symbol_ids, files, inherits_ids })
+    Ok(Samples {
+        symbol_ids,
+        files,
+        inherits_ids,
+    })
 }
 
 #[derive(Serialize)]
@@ -269,8 +291,7 @@ fn write_golden<T: Serialize>(
     name: &str,
     data: &T,
 ) -> Result<()> {
-    let json = serde_json::to_string_pretty(data)
-        .with_context(|| format!("serialize {name}"))?;
+    let json = serde_json::to_string_pretty(data).with_context(|| format!("serialize {name}"))?;
     let file_name = format!("{name}.json");
     let path = out_dir.join(&file_name);
     let size = json.len();

@@ -31,5 +31,7 @@ pub fn tool_detect_reflection(args: &Value) -> Result<String> {
         sites
     };
 
-    Ok(infigraph_core::reflection::format_reflection_sites(&filtered))
+    Ok(infigraph_core::reflection::format_reflection_sites(
+        &filtered,
+    ))
 }

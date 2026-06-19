@@ -190,7 +190,9 @@ pub fn tool_save_session(args: &Value) -> Result<String> {
     if session_name.is_empty() {
         Ok(format!("Session saved: {session_id}"))
     } else {
-        Ok(format!("Session saved: {session_id} (name: {session_name})"))
+        Ok(format!(
+            "Session saved: {session_id} (name: {session_name})"
+        ))
     }
 }
 
@@ -232,7 +234,10 @@ pub fn format_session_output(
         out.push_str(&format!("## Session {} of {}\n\n", idx + 1, total));
     }
     if !session.name.is_empty() {
-        out.push_str(&format!("**Session:** {} (name: **{}**)\n\n", session.id, session.name));
+        out.push_str(&format!(
+            "**Session:** {} (name: **{}**)\n\n",
+            session.id, session.name
+        ));
     } else {
         out.push_str(&format!("**Session:** {}\n\n", session.id));
     }
@@ -532,7 +537,7 @@ pub fn tool_search_sessions(args: &Value) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use infigraph_core::graph::{SessionStore, SessionData};
+    use infigraph_core::graph::{SessionData, SessionStore};
 
     fn make_session(id: &str, created_at: i64, updated_at: i64) -> SessionData {
         SessionData {
@@ -561,9 +566,7 @@ mod tests {
 
     #[test]
     fn test_cluster_single_session() {
-        let (_dir, store) = store_with_sessions(&[
-            make_session("session_2026-06-08", 1000, 1000),
-        ]);
+        let (_dir, store) = store_with_sessions(&[make_session("session_2026-06-08", 1000, 1000)]);
         let cluster = detect_session_cluster(&store).unwrap();
         assert_eq!(cluster.len(), 1);
         assert_eq!(cluster[0].id, "session_2026-06-08");
@@ -588,7 +591,11 @@ mod tests {
             make_session("session_2026-06-08", now, now),
         ]);
         let cluster = detect_session_cluster(&store).unwrap();
-        assert_eq!(cluster.len(), 2, "sessions 55h apart should cluster (< 72h)");
+        assert_eq!(
+            cluster.len(),
+            2,
+            "sessions 55h apart should cluster (< 72h)"
+        );
     }
 
     #[test]
@@ -614,7 +621,11 @@ mod tests {
             make_session("session_2026-06-08", now, now),
         ]);
         let cluster = detect_session_cluster(&store).unwrap();
-        assert_eq!(cluster.len(), 3, "chained 48h gaps should all cluster (each < 72h from neighbor)");
+        assert_eq!(
+            cluster.len(),
+            3,
+            "chained 48h gaps should all cluster (each < 72h from neighbor)"
+        );
     }
 
     #[test]
@@ -626,7 +637,11 @@ mod tests {
             make_session("session_2026-06-08", now, now),
         ]);
         let cluster = detect_session_cluster(&store).unwrap();
-        assert_eq!(cluster.len(), 2, "old session 30d ago should not be in cluster");
+        assert_eq!(
+            cluster.len(),
+            2,
+            "old session 30d ago should not be in cluster"
+        );
         assert_eq!(cluster[0].id, "session_2026-06-08");
         assert_eq!(cluster[1].id, "session_2026-06-07");
     }

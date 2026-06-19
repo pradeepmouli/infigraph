@@ -73,7 +73,12 @@ pub(crate) fn cmd_skeleton(root: &Path, file: &str) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn cmd_ingest(root: &Path, schema_id: Option<&str>, data_file: Option<&str>, source_dir: Option<&str>) -> Result<()> {
+pub(crate) fn cmd_ingest(
+    root: &Path,
+    schema_id: Option<&str>,
+    data_file: Option<&str>,
+    source_dir: Option<&str>,
+) -> Result<()> {
     let registry = bundled_registry()?;
     let mut prism = Infigraph::open(root, registry)?;
     prism.init()?;
@@ -105,7 +110,8 @@ pub(crate) fn cmd_ingest(root: &Path, schema_id: Option<&str>, data_file: Option
         }
     };
 
-    let (_, schema) = schemas.iter()
+    let (_, schema) = schemas
+        .iter()
         .find(|(_, s)| s.schema.schema_id == sid)
         .context(format!("schema '{}' not found", sid))?;
 
@@ -114,14 +120,23 @@ pub(crate) fn cmd_ingest(root: &Path, schema_id: Option<&str>, data_file: Option
     let conn = store.connection()?;
 
     if let Some(dir) = source_dir {
-        let result = infigraph_core::structured::ingest_directory(&conn, &schema.schema, std::path::Path::new(dir))?;
+        let result = infigraph_core::structured::ingest_directory(
+            &conn,
+            &schema.schema,
+            std::path::Path::new(dir),
+        )?;
         println!(
             "Ingested directory '{}' using schema '{}': {} nodes, {} edges",
             dir, sid, result.nodes_created, result.edges_created
         );
     } else {
-        let file = data_file.context("--data-file or --source required when --schema is specified")?;
-        let result = infigraph_core::structured::ingest_file(&conn, &schema.schema, std::path::Path::new(file))?;
+        let file =
+            data_file.context("--data-file or --source required when --schema is specified")?;
+        let result = infigraph_core::structured::ingest_file(
+            &conn,
+            &schema.schema,
+            std::path::Path::new(file),
+        )?;
         println!(
             "Ingested '{}' using schema '{}': {} nodes, {} edges",
             file, sid, result.nodes_created, result.edges_created

@@ -1,8 +1,8 @@
+use infigraph_core::learned::LearnedStore;
+use infigraph_core::model::{BridgeKind, RelationKind, StatementKind, SymbolKind};
+use infigraph_core::watch::batch::ChangeBatch;
 use std::collections::HashSet;
 use std::path::PathBuf;
-use infigraph_core::model::{BridgeKind, RelationKind, StatementKind, SymbolKind};
-use infigraph_core::learned::LearnedStore;
-use infigraph_core::watch::batch::ChangeBatch;
 
 // ==================== SymbolKind::as_str ====================
 

@@ -1,5 +1,5 @@
 use infigraph_core::graph::SessionStore;
-use infigraph_core::lang::{LanguagePack, CustomEdgeDef};
+use infigraph_core::lang::{CustomEdgeDef, LanguagePack};
 
 // ==================== SessionStore ====================
 
@@ -55,7 +55,13 @@ fn test_language_pack_new_basic() {
     let entity_query = "(function_definition name: (identifier) @function.name) @function.def";
     let relation_query = "(call function: (identifier) @call.ref)";
 
-    let pack = LanguagePack::new("test_python", vec![".py"], grammar, entity_query, relation_query);
+    let pack = LanguagePack::new(
+        "test_python",
+        vec![".py"],
+        grammar,
+        entity_query,
+        relation_query,
+    );
     assert!(pack.is_ok());
     let p = pack.unwrap();
     assert_eq!(p.name, "test_python");

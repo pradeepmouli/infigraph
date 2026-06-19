@@ -62,7 +62,10 @@ fn test_registry_extension_lookup() {
         match registry.for_extension(ext) {
             Some(pack) => {
                 if pack.name != *expected_name {
-                    failures.push(format!("{ext}: expected '{expected_name}', got '{}'", pack.name));
+                    failures.push(format!(
+                        "{ext}: expected '{expected_name}', got '{}'",
+                        pack.name
+                    ));
                 }
             }
             None => failures.push(format!("{ext}: not found in registry")),
@@ -112,9 +115,17 @@ fn test_extraction_smoke_python() {
     assert!(names.contains(&"Foo"), "should extract Foo: {names:?}");
     assert!(names.contains(&"bar"), "should extract bar: {names:?}");
 
-    assert!(!extraction.relations.is_empty(), "should have call relations");
-    assert!(extraction.relations.iter().any(|r| r.target_id.contains("greet")),
-        "should have call to greet");
+    assert!(
+        !extraction.relations.is_empty(),
+        "should have call relations"
+    );
+    assert!(
+        extraction
+            .relations
+            .iter()
+            .any(|r| r.target_id.contains("greet")),
+        "should have call to greet"
+    );
 }
 
 #[test]
@@ -141,8 +152,14 @@ fn test_extraction_smoke_typescript() {
         .expect("extraction should succeed");
 
     let names: Vec<&str> = extraction.symbols.iter().map(|s| s.name.as_str()).collect();
-    assert!(names.contains(&"fetchData"), "should extract fetchData: {names:?}");
-    assert!(names.contains(&"ApiClient"), "should extract ApiClient: {names:?}");
+    assert!(
+        names.contains(&"fetchData"),
+        "should extract fetchData: {names:?}"
+    );
+    assert!(
+        names.contains(&"ApiClient"),
+        "should extract ApiClient: {names:?}"
+    );
 }
 
 #[test]
@@ -150,7 +167,8 @@ fn test_extraction_smoke_go() {
     let registry = bundled_registry().unwrap();
     let pack = registry.for_extension(".go").unwrap();
 
-    let source = b"package main\nfunc Add(a, b int) int { return a + b }\nfunc main() { Add(1, 2) }\n";
+    let source =
+        b"package main\nfunc Add(a, b int) int { return a + b }\nfunc main() { Add(1, 2) }\n";
     let extraction = infigraph_core::extract::extract_file("main.go", source, pack)
         .expect("extraction should succeed");
 
@@ -169,6 +187,9 @@ fn test_extraction_smoke_java() {
         .expect("extraction should succeed");
 
     let names: Vec<&str> = extraction.symbols.iter().map(|s| s.name.as_str()).collect();
-    assert!(names.contains(&"Calculator"), "should extract Calculator: {names:?}");
+    assert!(
+        names.contains(&"Calculator"),
+        "should extract Calculator: {names:?}"
+    );
     assert!(names.contains(&"add"), "should extract add: {names:?}");
 }

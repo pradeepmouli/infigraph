@@ -24,7 +24,9 @@ pub(crate) fn cmd_group(root: &Path, action: GroupAction) -> Result<()> {
             registry.register_repo(&repo, root, &prism)?;
             registry.group_add(&group, &repo)?;
             registry.save()?;
-            let resolved = registry.repos.get(&repo)
+            let resolved = registry
+                .repos
+                .get(&repo)
                 .map(|e| e.path.display().to_string())
                 .unwrap_or_else(|| root.display().to_string());
             println!("Added repo '{}' ({}) to group '{}'", repo, resolved, group);
@@ -53,15 +55,19 @@ pub(crate) fn cmd_group(root: &Path, action: GroupAction) -> Result<()> {
                 .context(format!("group '{}' not found", group))?
                 .clone();
             // Warn on duplicate resolved paths
-            let mut seen_paths: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+            let mut seen_paths: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
             for repo_name in &g.repos {
                 if let Some(entry) = registry.repos.get(repo_name) {
                     let resolved = std::fs::canonicalize(&entry.path)
                         .unwrap_or_else(|_| entry.path.clone())
-                        .display().to_string();
+                        .display()
+                        .to_string();
                     if let Some(prev) = seen_paths.get(&resolved) {
-                        eprintln!("WARNING: repos '{}' and '{}' resolve to the same path: {}",
-                            prev, repo_name, resolved);
+                        eprintln!(
+                            "WARNING: repos '{}' and '{}' resolve to the same path: {}",
+                            prev, repo_name, resolved
+                        );
                     } else {
                         seen_paths.insert(resolved, repo_name.clone());
                     }
@@ -102,8 +108,11 @@ pub(crate) fn cmd_group(root: &Path, action: GroupAction) -> Result<()> {
                     result.indexed_files, result.total_files
                 );
                 if result.indexed_files == 0 && result.total_files > 0 {
-                    eprintln!("  WARNING: 0 files indexed for '{}' — path may be incorrect: {}",
-                        repo_name, entry.path.display());
+                    eprintln!(
+                        "  WARNING: 0 files indexed for '{}' — path may be incorrect: {}",
+                        repo_name,
+                        entry.path.display()
+                    );
                 }
                 registry.register_repo(repo_name, &entry.path, &prism)?;
             }

@@ -2,13 +2,18 @@ use std::io::{self, BufRead, Write};
 
 use serde_json::{json, Value};
 
-use infigraph_confluence::template::{parse_pipeline_template, fill_with_llm};
+use infigraph_confluence::template::{fill_with_llm, parse_pipeline_template};
 
 fn main() {
     let stdout = io::stdout();
     let mut out = stdout.lock();
 
-    writeln!(out, "{}", json!({"ready": true, "plugin_id": "intuit", "version": "1.0"})).unwrap();
+    writeln!(
+        out,
+        "{}",
+        json!({"ready": true, "plugin_id": "intuit", "version": "1.0"})
+    )
+    .unwrap();
     out.flush().unwrap();
 
     let stdin = io::stdin();
@@ -25,7 +30,12 @@ fn main() {
         let cmd: Value = match serde_json::from_str(&line) {
             Ok(v) => v,
             Err(e) => {
-                writeln!(out, "{}", json!({"status": "error", "message": format!("Invalid JSON: {e}")})).unwrap();
+                writeln!(
+                    out,
+                    "{}",
+                    json!({"status": "error", "message": format!("Invalid JSON: {e}")})
+                )
+                .unwrap();
                 out.flush().unwrap();
                 continue;
             }
@@ -100,7 +110,12 @@ fn main() {
                 out.flush().unwrap();
             }
             _ => {
-                writeln!(out, "{}", json!({"status": "error", "message": format!("Unknown command: {command}")})).unwrap();
+                writeln!(
+                    out,
+                    "{}",
+                    json!({"status": "error", "message": format!("Unknown command: {command}")})
+                )
+                .unwrap();
                 out.flush().unwrap();
             }
         }
@@ -111,5 +126,8 @@ fn split_csv(s: &str) -> Vec<&str> {
     if s.is_empty() {
         return Vec::new();
     }
-    s.split(',').map(|p| p.trim()).filter(|p| !p.is_empty()).collect()
+    s.split(',')
+        .map(|p| p.trim())
+        .filter(|p| !p.is_empty())
+        .collect()
 }

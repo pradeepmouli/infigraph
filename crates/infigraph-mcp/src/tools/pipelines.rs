@@ -11,13 +11,11 @@ pub fn tool_pipeline_plugins(args: &Value) -> Result<String> {
         .and_then(|p| p.as_str())
         .context("missing 'path'")?;
     let project_dir = PathBuf::from(path).join("pipelines");
-    let registry = infigraph_pipeline_plugin::load_pipeline_plugins(
-        if project_dir.is_dir() {
-            Some(project_dir.as_path())
-        } else {
-            None
-        },
-    )?;
+    let registry = infigraph_pipeline_plugin::load_pipeline_plugins(if project_dir.is_dir() {
+        Some(project_dir.as_path())
+    } else {
+        None
+    })?;
 
     if registry.is_empty() {
         return Ok("No pipeline plugins loaded.\n\nTo add plugins, create directories under ~/.infigraph/pipelines/ or <project>/pipelines/ with a plugin.toml file.".to_string());
@@ -62,16 +60,11 @@ pub fn tool_pipeline_impact(args: &Value) -> Result<String> {
         .get("table_name")
         .and_then(|v| v.as_str())
         .context("missing 'table_name'")?;
-    let max_depth = args
-        .get("max_depth")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(3) as u32;
+    let max_depth = args.get("max_depth").and_then(|v| v.as_u64()).unwrap_or(3) as u32;
 
     let results = store.impact_analysis(table_name, max_depth)?;
     if results.is_empty() {
-        return Ok(format!(
-            "No pipelines impacted by table '{table_name}'."
-        ));
+        return Ok(format!("No pipelines impacted by table '{table_name}'."));
     }
 
     let mut out = format!(

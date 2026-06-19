@@ -28,7 +28,9 @@ pub fn tool_detect_taint_flows(args: &Value) -> Result<String> {
     let filtered: Vec<_> = flows
         .iter()
         .filter(|f| {
-            category_filter.as_ref().map_or(true, |c| f.sink_category.to_lowercase() == *c)
+            category_filter
+                .as_ref()
+                .map_or(true, |c| f.sink_category.to_lowercase() == *c)
                 && (show_sanitized || !f.sanitized)
         })
         .cloned()
@@ -48,12 +50,11 @@ pub fn tool_detect_interprocedural_taint(args: &Value) -> Result<String> {
     let db_path = root.join(".infigraph").join("graph");
     let store = GraphStore::open(&db_path)?;
 
-    let max_depth = args
-        .get("max_depth")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(5) as u32;
+    let max_depth = args.get("max_depth").and_then(|v| v.as_u64()).unwrap_or(5) as u32;
 
-    let flows = infigraph_core::taint::interprocedural::detect_interprocedural_taint(&store, &root, max_depth)?;
+    let flows = infigraph_core::taint::interprocedural::detect_interprocedural_taint(
+        &store, &root, max_depth,
+    )?;
 
     let category_filter = args
         .get("category")
@@ -61,7 +62,11 @@ pub fn tool_detect_interprocedural_taint(args: &Value) -> Result<String> {
         .map(|s| s.to_lowercase());
 
     let filtered: Vec<_> = if let Some(ref c) = category_filter {
-        flows.iter().filter(|f| f.sink_category.to_lowercase() == *c).cloned().collect()
+        flows
+            .iter()
+            .filter(|f| f.sink_category.to_lowercase() == *c)
+            .cloned()
+            .collect()
     } else {
         flows
     };
@@ -82,7 +87,9 @@ pub fn tool_detect_dynamic_urls(args: &Value) -> Result<String> {
 
     let urls = infigraph_core::taint::dynamic_urls::detect_dynamic_urls(&store, &root)?;
 
-    Ok(infigraph_core::taint::dynamic_urls::format_dynamic_urls(&urls))
+    Ok(infigraph_core::taint::dynamic_urls::format_dynamic_urls(
+        &urls,
+    ))
 }
 
 pub fn tool_detect_path_traversal(args: &Value) -> Result<String> {
@@ -96,12 +103,10 @@ pub fn tool_detect_path_traversal(args: &Value) -> Result<String> {
     let db_path = root.join(".infigraph").join("graph");
     let store = GraphStore::open(&db_path)?;
 
-    let max_depth = args
-        .get("max_depth")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(5) as u32;
+    let max_depth = args.get("max_depth").and_then(|v| v.as_u64()).unwrap_or(5) as u32;
 
-    let flows = infigraph_core::taint::path_traversal::detect_path_traversal(&store, &root, max_depth)?;
+    let flows =
+        infigraph_core::taint::path_traversal::detect_path_traversal(&store, &root, max_depth)?;
 
     Ok(infigraph_core::taint::path_traversal::format_path_traversal(&flows))
 }

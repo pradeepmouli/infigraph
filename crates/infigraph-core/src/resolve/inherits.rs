@@ -62,13 +62,18 @@ pub(crate) fn resolve_inherits(
                             .unwrap_or_default();
                         imported_stems.contains(&stem)
                     });
-                    let by_kind = in_scope.is_none().then(|| {
-                        shortest_id(cross_file.iter().copied(), |(_, _, k)| k == "Interface")
-                    }).flatten();
+                    let by_kind = in_scope
+                        .is_none()
+                        .then(|| {
+                            shortest_id(cross_file.iter().copied(), |(_, _, k)| k == "Interface")
+                        })
+                        .flatten();
                     in_scope.or(by_kind).or_else(|| {
                         cross_file
                             .iter()
-                            .min_by(|(a, _, _), (b, _, _)| a.len().cmp(&b.len()).then_with(|| a.cmp(b)))
+                            .min_by(|(a, _, _), (b, _, _)| {
+                                a.len().cmp(&b.len()).then_with(|| a.cmp(b))
+                            })
                             .map(|(id, _, _)| id.clone())
                     })
                 } else {

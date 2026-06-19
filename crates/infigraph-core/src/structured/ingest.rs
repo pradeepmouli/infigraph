@@ -25,13 +25,16 @@ pub fn ingest_data(
     let mut edges_created = 0usize;
 
     for (idx, record) in data.iter().enumerate() {
-        let obj = record.as_object()
+        let obj = record
+            .as_object()
             .with_context(|| format!("record {} is not an object", idx))?;
 
         let id = if let Some(tmpl) = &schema.id_template {
             interpolate_template(tmpl, obj)
         } else if let Some(v) = obj.get("id") {
-            v.as_str().unwrap_or(&format!("{}_{}", schema.schema_id, idx)).to_string()
+            v.as_str()
+                .unwrap_or(&format!("{}_{}", schema.schema_id, idx))
+                .to_string()
         } else {
             format!("{}_{}", schema.schema_id, idx)
         };
@@ -46,20 +49,17 @@ pub fn ingest_data(
             props.push(format!("{}: {}", col.name, formatted));
         }
 
-        let cypher = format!(
-            "CREATE (:{} {{{}}})",
-            schema.node_table,
-            props.join(", ")
-        );
+        let cypher = format!("CREATE (:{} {{{}}})", schema.node_table, props.join(", "));
         conn.query(&cypher)
             .map_err(|e| anyhow::anyhow!("failed to create node {}: {}", id, e))?;
         nodes_created += 1;
 
         for edge in &schema.edges {
             let targets = match obj.get(&edge.source_field) {
-                Some(serde_json::Value::Array(arr)) => {
-                    arr.iter().filter_map(|v| v.as_str().map(String::from)).collect::<Vec<_>>()
-                }
+                Some(serde_json::Value::Array(arr)) => arr
+                    .iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect::<Vec<_>>(),
                 Some(serde_json::Value::String(s)) => vec![s.clone()],
                 _ => continue,
             };
@@ -78,7 +78,9 @@ pub fn ingest_data(
 
                 let mut edge_props = String::new();
                 if !edge.properties.is_empty() {
-                    let p: Vec<String> = edge.properties.iter()
+                    let p: Vec<String> = edge
+                        .properties
+                        .iter()
                         .map(|c| {
                             let val = obj.get(&c.name);
                             format!("{}: {}", c.name, format_value(&c.col_type, val))
@@ -94,19 +96,28 @@ pub fn ingest_data(
                 };
                 let cypher = format!(
                     "MATCH (a:{} {{id: '{}'}}), (b:{} {{id: '{}'}}) CREATE (a)-[:{}{}]->(b)",
-                    schema.node_table, escape(&id),
-                    edge.to_table, escape(&target_id),
+                    schema.node_table,
+                    escape(&id),
+                    edge.to_table,
+                    escape(&target_id),
                     edge.name,
                     edge_prop_str,
                 );
                 let check_query = format!(
                     "MATCH (a:{} {{id: '{}'}}), (b:{} {{id: '{}'}}) RETURN count(*)",
-                    schema.node_table, escape(&id),
-                    edge.to_table, escape(&target_id),
+                    schema.node_table,
+                    escape(&id),
+                    edge.to_table,
+                    escape(&target_id),
                 );
-                let target_exists = conn.query(&check_query).ok().and_then(|mut qr| {
-                    qr.next().map(|row| row[0].to_string().parse::<u64>().unwrap_or(0) > 0)
-                }).unwrap_or(false);
+                let target_exists = conn
+                    .query(&check_query)
+                    .ok()
+                    .and_then(|mut qr| {
+                        qr.next()
+                            .map(|row| row[0].to_string().parse::<u64>().unwrap_or(0) > 0)
+                    })
+                    .unwrap_or(false);
 
                 if target_exists {
                     match conn.query(&cypher) {
@@ -118,7 +129,10 @@ pub fn ingest_data(
         }
     }
 
-    Ok(IngestResult { nodes_created, edges_created })
+    Ok(IngestResult {
+        nodes_created,
+        edges_created,
+    })
 }
 
 fn resolve_symbol(conn: &kuzu::Connection<'_>, reference: &str) -> Option<String> {
@@ -127,9 +141,9 @@ fn resolve_symbol(conn: &kuzu::Connection<'_>, reference: &str) -> Option<String
         "MATCH (s:Symbol) WHERE s.id = '{}' OR s.name = '{}' RETURN s.id LIMIT 1",
         esc, esc
     );
-    conn.query(&query).ok().and_then(|mut result| {
-        result.next().map(|row| row[0].to_string())
-    })
+    conn.query(&query)
+        .ok()
+        .and_then(|mut result| result.next().map(|row| row[0].to_string()))
 }
 
 pub fn ingest_directory(
@@ -141,7 +155,10 @@ pub fn ingest_directory(
         bail!("'{}' is not a directory", dir_path.display());
     }
 
-    let mut total = IngestResult { nodes_created: 0, edges_created: 0 };
+    let mut total = IngestResult {
+        nodes_created: 0,
+        edges_created: 0,
+    };
 
     for entry in std::fs::read_dir(dir_path)
         .with_context(|| format!("failed to read directory: {}", dir_path.display()))?
@@ -188,7 +205,10 @@ pub fn ingest_file(
                 _ => bail!("YAML must be a sequence or mapping"),
             }
         }
-        _ => bail!("Unsupported data file format '{}' — use .json or .yaml/.yml", ext),
+        _ => bail!(
+            "Unsupported data file format '{}' — use .json or .yaml/.yml",
+            ext
+        ),
     };
 
     ingest_data(conn, schema, &data)

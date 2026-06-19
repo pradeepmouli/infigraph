@@ -1,6 +1,6 @@
+use infigraph_core::graph::GraphStore;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
-use infigraph_core::graph::GraphStore;
 
 fn make_store() -> (TempDir, GraphStore) {
     let dir = TempDir::new().unwrap();
@@ -23,14 +23,20 @@ fn test_try_write_lock_returns_none_when_held() {
     let (_dir, store) = make_store();
     let _lock = store.write_lock().unwrap();
     let result = store.try_write_lock().unwrap();
-    assert!(result.is_none(), "try_write_lock should return None when lock is held");
+    assert!(
+        result.is_none(),
+        "try_write_lock should return None when lock is held"
+    );
 }
 
 #[test]
 fn test_try_write_lock_succeeds_when_free() {
     let (_dir, store) = make_store();
     let result = store.try_write_lock().unwrap();
-    assert!(result.is_some(), "try_write_lock should return Some when lock is free");
+    assert!(
+        result.is_some(),
+        "try_write_lock should return Some when lock is free"
+    );
 }
 
 #[test]
@@ -98,5 +104,8 @@ fn test_write_lock_different_stores_same_path() {
 
     let _lock1 = store1.write_lock().unwrap();
     let result = store2.try_write_lock().unwrap();
-    assert!(result.is_none(), "second store should see lock held by first");
+    assert!(
+        result.is_none(),
+        "second store should see lock held by first"
+    );
 }

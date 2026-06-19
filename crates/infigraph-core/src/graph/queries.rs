@@ -62,7 +62,9 @@ impl<'a, 'db> GraphQuery<'a, 'db> {
              RETURN st.kind, st.condition, st.start_line, st.depth ORDER BY st.start_line",
             symbol_id.replace('\'', "\\'")
         );
-        let mut result = self.conn.query(&query)
+        let mut result = self
+            .conn
+            .query(&query)
             .map_err(|e| anyhow::anyhow!("branches_of failed: {e}"))?;
         let mut branches = Vec::new();
         while let Some(row) = result.next() {
@@ -423,15 +425,22 @@ impl<'a, 'db> GraphQuery<'a, 'db> {
     /// Derive TESTED_BY edges from CALLS: if a Test symbol calls a non-test symbol,
     /// create (called)-[:TESTED_BY]->(test). Returns number of edges created.
     pub fn derive_tested_by_edges(&self) -> Result<usize> {
-        let _ = self.conn.query("MATCH (s:Symbol)-[r:TESTED_BY]->(t:Symbol) DELETE r");
-        self.conn.query(
-            "MATCH (t:Symbol)-[:CALLS]->(s:Symbol) \
+        let _ = self
+            .conn
+            .query("MATCH (s:Symbol)-[r:TESTED_BY]->(t:Symbol) DELETE r");
+        self.conn
+            .query(
+                "MATCH (t:Symbol)-[:CALLS]->(s:Symbol) \
              WHERE t.kind = 'Test' AND s.kind <> 'Test' \
-             CREATE (s)-[:TESTED_BY]->(t)"
-        ).map_err(|e| anyhow::anyhow!("derive TESTED_BY failed: {e}"))?;
-        let mut r = self.conn.query("MATCH ()-[r:TESTED_BY]->() RETURN count(r)")
+             CREATE (s)-[:TESTED_BY]->(t)",
+            )
+            .map_err(|e| anyhow::anyhow!("derive TESTED_BY failed: {e}"))?;
+        let mut r = self
+            .conn
+            .query("MATCH ()-[r:TESTED_BY]->() RETURN count(r)")
             .map_err(|e| anyhow::anyhow!("count TESTED_BY failed: {e}"))?;
-        let count = r.next()
+        let count = r
+            .next()
             .and_then(|row| row.first().map(|v| v.to_string()))
             .and_then(|s| s.parse::<usize>().ok())
             .unwrap_or(0);
@@ -491,28 +500,35 @@ impl<'a, 'db> GraphQuery<'a, 'db> {
             }
         }
 
-        let symbols: Vec<SkeletonSymbol> = rows.iter().map(|row| {
-            let id = row.first().map(|s| s.to_string()).unwrap_or_default();
-            SkeletonSymbol {
-                fan_in: fan_in.get(&id).copied().unwrap_or(0),
-                stmt_count: stmt_counts.get(&id).copied().unwrap_or(0),
-                nesting: nesting.get(&id).copied().unwrap_or(0),
-                id,
-                name: row.get(1).cloned().unwrap_or_default(),
-                kind: row.get(2).cloned().unwrap_or_default(),
-                start_line: row.get(3).cloned().unwrap_or_default(),
-                complexity: row.get(5).and_then(|s| s.parse().ok()).unwrap_or(0),
-                params: row.get(6).cloned().unwrap_or_default(),
-                return_type: row.get(7).cloned().unwrap_or_default(),
-                visibility: row.get(8).cloned().unwrap_or_default(),
-                parent: row.get(9).cloned().unwrap_or_default(),
-            }
-        }).collect();
+        let symbols: Vec<SkeletonSymbol> = rows
+            .iter()
+            .map(|row| {
+                let id = row.first().map(|s| s.to_string()).unwrap_or_default();
+                SkeletonSymbol {
+                    fan_in: fan_in.get(&id).copied().unwrap_or(0),
+                    stmt_count: stmt_counts.get(&id).copied().unwrap_or(0),
+                    nesting: nesting.get(&id).copied().unwrap_or(0),
+                    id,
+                    name: row.get(1).cloned().unwrap_or_default(),
+                    kind: row.get(2).cloned().unwrap_or_default(),
+                    start_line: row.get(3).cloned().unwrap_or_default(),
+                    complexity: row.get(5).and_then(|s| s.parse().ok()).unwrap_or(0),
+                    params: row.get(6).cloned().unwrap_or_default(),
+                    return_type: row.get(7).cloned().unwrap_or_default(),
+                    visibility: row.get(8).cloned().unwrap_or_default(),
+                    parent: row.get(9).cloned().unwrap_or_default(),
+                }
+            })
+            .collect();
 
         Ok(format_skeleton(file, &symbols))
     }
 
-    pub fn generate_test_context(&self, file_filter: Option<&str>, limit: usize) -> Result<TestContext> {
+    pub fn generate_test_context(
+        &self,
+        file_filter: Option<&str>,
+        limit: usize,
+    ) -> Result<TestContext> {
         let framework = self.detect_test_framework()?;
         let example_test = self.find_example_test(file_filter)?;
 
@@ -522,21 +538,31 @@ impl<'a, 'db> GraphQuery<'a, 'db> {
              AND NOT EXISTS { MATCH (s)-[:TESTED_BY]->(:Symbol) } \
              RETURN s.id, s.name, s.kind, s.file, s.start_line, s.end_line, \
                     s.visibility, s.parameters, s.return_type, s.complexity \
-             ORDER BY s.complexity DESC, s.file, s.start_line"
+             ORDER BY s.complexity DESC, s.file, s.start_line",
         );
-        let mut result = self.conn.query(&q)
+        let mut result = self
+            .conn
+            .query(&q)
             .map_err(|e| anyhow::anyhow!("generate_test_context query failed: {e}"))?;
 
         let mut targets = Vec::new();
         while let Some(row) = result.next() {
-            if row.len() < 10 { continue; }
+            if row.len() < 10 {
+                continue;
+            }
             let file = row[3].to_string();
             if let Some(f) = file_filter {
-                if !file.contains(f) { continue; }
+                if !file.contains(f) {
+                    continue;
+                }
             }
             let visibility = row[6].to_string();
             let complexity: u32 = row[9].to_string().parse().unwrap_or(1);
-            let vis_score: u32 = if visibility == "public" || visibility == "pub" { 10 } else { 0 };
+            let vis_score: u32 = if visibility == "public" || visibility == "pub" {
+                10
+            } else {
+                0
+            };
             let priority_score = complexity * 5 + vis_score;
 
             targets.push(TestTarget {
@@ -569,18 +595,27 @@ impl<'a, 'db> GraphQuery<'a, 'db> {
 
         targets.sort_by(|a, b| b.priority_score.cmp(&a.priority_score));
 
-        Ok(TestContext { framework, example_test, targets })
+        Ok(TestContext {
+            framework,
+            example_test,
+            targets,
+        })
     }
 
     fn detect_test_framework(&self) -> Result<String> {
         let q = "MATCH (s:Symbol) WHERE s.kind = 'Test' RETURN s.docstring LIMIT 20";
-        let mut result = self.conn.query(q)
+        let mut result = self
+            .conn
+            .query(q)
             .map_err(|e| anyhow::anyhow!("detect_test_framework failed: {e}"))?;
 
         let mut frameworks = std::collections::HashMap::new();
         while let Some(row) = result.next() {
             let doc = row.first().map(|v| v.to_string()).unwrap_or_default();
-            if doc.contains("#[test]") || doc.contains("#[tokio::test]") || doc.contains("#[rstest]") {
+            if doc.contains("#[test]")
+                || doc.contains("#[tokio::test]")
+                || doc.contains("#[rstest]")
+            {
                 *frameworks.entry("rust (cargo test)").or_insert(0u32) += 1;
             }
             if doc.contains("@Test") || doc.contains("@ParameterizedTest") {
@@ -606,8 +641,9 @@ impl<'a, 'db> GraphQuery<'a, 'db> {
             while let Some(row) = r2.next() {
                 let dep = row.first().map(|v| v.to_string()).unwrap_or_default();
                 match dep.as_str() {
-                    "jest" | "vitest" | "mocha" | "ava" | "tap" | "cypress" =>
-                        return Ok(format!("javascript ({})", dep)),
+                    "jest" | "vitest" | "mocha" | "ava" | "tap" | "cypress" => {
+                        return Ok(format!("javascript ({})", dep))
+                    }
                     "pytest" => return Ok("python (pytest)".to_string()),
                     "rspec" | "rspec-core" => return Ok("ruby (rspec)".to_string()),
                     "minitest" => return Ok("ruby (minitest)".to_string()),
@@ -621,7 +657,10 @@ impl<'a, 'db> GraphQuery<'a, 'db> {
                         if dep.contains("kotlin-test") || dep.contains("kotest") {
                             return Ok(format!("kotlin ({})", dep));
                         }
-                        if dep.contains("scalatest") || dep.contains("specs2") || dep.contains("munit") {
+                        if dep.contains("scalatest")
+                            || dep.contains("specs2")
+                            || dep.contains("munit")
+                        {
                             return Ok(format!("scala ({})", dep));
                         }
                     }
@@ -673,10 +712,13 @@ impl<'a, 'db> GraphQuery<'a, 'db> {
             )
         } else {
             "MATCH (s:Symbol) WHERE s.kind = 'Test' \
-             RETURN s.id, s.name, s.file, s.start_line, s.end_line LIMIT 1".to_string()
+             RETURN s.id, s.name, s.file, s.start_line, s.end_line LIMIT 1"
+                .to_string()
         };
 
-        let mut result = self.conn.query(&q)
+        let mut result = self
+            .conn
+            .query(&q)
             .map_err(|e| anyhow::anyhow!("find_example_test failed: {e}"))?;
 
         if let Some(row) = result.next() {
@@ -866,7 +908,9 @@ pub fn format_skeleton(file: &str, symbols: &[SkeletonSymbol]) -> String {
 
     for s in symbols {
         let indent = if !s.parent.is_empty() {
-            while indent_stack.last().map(|v| v.as_str()) != Some(&s.parent) && !indent_stack.is_empty() {
+            while indent_stack.last().map(|v| v.as_str()) != Some(&s.parent)
+                && !indent_stack.is_empty()
+            {
                 indent_stack.pop();
             }
             if indent_stack.is_empty() {

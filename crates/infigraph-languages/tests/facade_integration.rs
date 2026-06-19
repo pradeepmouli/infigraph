@@ -1,6 +1,6 @@
-use std::path::PathBuf;
 use infigraph_core::Infigraph;
 use infigraph_languages::bundled_registry;
+use std::path::PathBuf;
 
 #[test]
 fn test_infigraph_open() {
@@ -69,13 +69,21 @@ fn test_infigraph_index_empty_dir() {
 fn test_infigraph_index_file() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().canonicalize().unwrap();
-    std::fs::write(root.join("hello.py"), "def greet(name):\n    return f'Hello {name}'\n").unwrap();
+    std::fs::write(
+        root.join("hello.py"),
+        "def greet(name):\n    return f'Hello {name}'\n",
+    )
+    .unwrap();
     let registry = bundled_registry().unwrap();
     let mut tg = Infigraph::open(&root, registry).unwrap();
     tg.init().unwrap();
     tg.index_file(&root.join("hello.py")).unwrap();
     let stats = tg.stats().unwrap();
-    assert!(stats.symbols >= 1, "should have at least 1 symbol, got {}", stats.symbols);
+    assert!(
+        stats.symbols >= 1,
+        "should have at least 1 symbol, got {}",
+        stats.symbols
+    );
 }
 
 #[test]
@@ -106,7 +114,10 @@ fn test_infigraph_remove_file() {
 
     tg.remove_file(&PathBuf::from("a.py")).unwrap();
     let stats_after = tg.stats().unwrap();
-    assert_eq!(stats_after.symbols, 0, "symbols should be 0 after remove_file");
+    assert_eq!(
+        stats_after.symbols, 0,
+        "symbols should be 0 after remove_file"
+    );
 }
 
 #[test]

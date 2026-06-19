@@ -23,10 +23,15 @@ static PATH_TRAVERSAL_SOURCE_KINDS: &[&str] = &["HttpParam", "HttpBody", "HttpHe
 static PATH_TRAVERSAL_SINK_CATEGORIES: &[&str] = &["PathTraversal"];
 
 static PATH_TRAVERSAL_SANITIZERS: &[&str] = &[
-    "realpath(", "abspath(", "canonicalize(",
-    "path.resolve(", "secure_filename(",
-    "os.path.basename(", "filepath.Clean(",
-    "os.path.normpath(", "Path.normalize(",
+    "realpath(",
+    "abspath(",
+    "canonicalize(",
+    "path.resolve(",
+    "secure_filename(",
+    "os.path.basename(",
+    "filepath.Clean(",
+    "os.path.normpath(",
+    "Path.normalize(",
 ];
 
 pub fn detect_path_traversal(
@@ -39,7 +44,9 @@ pub fn detect_path_traversal(
     // Intra-procedural: check existing taint flows
     let intra_flows = super::detect_taint_flows(store, root)?;
     for flow in &intra_flows {
-        if flow.sink_category == "PathTraversal" && PATH_TRAVERSAL_SOURCE_KINDS.contains(&flow.source_kind.as_str()) {
+        if flow.sink_category == "PathTraversal"
+            && PATH_TRAVERSAL_SOURCE_KINDS.contains(&flow.source_kind.as_str())
+        {
             results.push(PathTraversalFlow {
                 kind: "intra-procedural",
                 source_symbol: flow.symbol_id.clone(),
@@ -88,7 +95,9 @@ fn check_chain_sanitized(store: &GraphStore, root: &Path, chain: &[String]) -> b
 
         if let Ok(result) = result {
             for row in result {
-                if row.len() < 3 { continue; }
+                if row.len() < 3 {
+                    continue;
+                }
                 let file = row[0].to_string();
                 let start: usize = row[1].to_string().parse().unwrap_or(0);
                 let end: usize = row[2].to_string().parse().unwrap_or(0);
@@ -130,13 +139,22 @@ pub fn format_path_traversal(flows: &[PathTraversalFlow]) -> String {
     );
 
     if !active.is_empty() {
-        let intra: Vec<_> = active.iter().filter(|f| f.kind == "intra-procedural").collect();
-        let inter: Vec<_> = active.iter().filter(|f| f.kind == "inter-procedural").collect();
+        let intra: Vec<_> = active
+            .iter()
+            .filter(|f| f.kind == "intra-procedural")
+            .collect();
+        let inter: Vec<_> = active
+            .iter()
+            .filter(|f| f.kind == "inter-procedural")
+            .collect();
 
         if !intra.is_empty() {
             out.push_str(&format!("## Intra-procedural ({} flows)\n", intra.len()));
             for f in &intra {
-                out.push_str(&format!("  {} ({}) — same function\n", f.source_symbol, f.source_kind));
+                out.push_str(&format!(
+                    "  {} ({}) — same function\n",
+                    f.source_symbol, f.source_kind
+                ));
             }
             out.push('\n');
         }
@@ -146,7 +164,10 @@ pub fn format_path_traversal(flows: &[PathTraversalFlow]) -> String {
             for f in &inter {
                 out.push_str(&format!(
                     "  {} -> {} ({}, depth: {})\n    Chain: {}\n",
-                    f.source_symbol, f.sink_symbol, f.source_kind, f.depth,
+                    f.source_symbol,
+                    f.sink_symbol,
+                    f.source_kind,
+                    f.depth,
                     f.call_chain.join(" -> ")
                 ));
             }
@@ -155,7 +176,10 @@ pub fn format_path_traversal(flows: &[PathTraversalFlow]) -> String {
     }
 
     if sanitized > 0 {
-        out.push_str(&format!("\n--- {} flows sanitized (path normalization detected) ---\n", sanitized));
+        out.push_str(&format!(
+            "\n--- {} flows sanitized (path normalization detected) ---\n",
+            sanitized
+        ));
     }
 
     out
@@ -189,7 +213,10 @@ mod tests {
                 sink_symbol: "storage.py::read_file".to_string(),
                 source_kind: "HttpParam".to_string(),
                 depth: 1,
-                call_chain: vec!["api.py::get_file".to_string(), "storage.py::read_file".to_string()],
+                call_chain: vec![
+                    "api.py::get_file".to_string(),
+                    "storage.py::read_file".to_string(),
+                ],
                 sanitized: false,
             },
         ];

@@ -1,4 +1,6 @@
-use infigraph_mcp::tools::helpers::{glob_match_inner, glob_matches, session_date_id, session_epoch};
+use infigraph_mcp::tools::helpers::{
+    glob_match_inner, glob_matches, session_date_id, session_epoch,
+};
 
 // ==================== glob_matches ====================
 
@@ -100,9 +102,16 @@ fn test_session_epoch_monotonic() {
 #[test]
 fn test_session_date_id_format() {
     let id = session_date_id();
-    assert!(id.starts_with("session_"), "should start with 'session_': {id}");
+    assert!(
+        id.starts_with("session_"),
+        "should start with 'session_': {id}"
+    );
     let date_part = &id["session_".len()..];
-    assert_eq!(date_part.len(), 10, "date part should be YYYY-MM-DD: {date_part}");
+    assert_eq!(
+        date_part.len(),
+        10,
+        "date part should be YYYY-MM-DD: {date_part}"
+    );
     assert_eq!(&date_part[4..5], "-");
     assert_eq!(&date_part[7..8], "-");
 }

@@ -566,7 +566,16 @@ fn run(command: Commands, root: &Path) -> Result<()> {
         Commands::Languages => cmd_languages(Some(root)),
         Commands::Symbols { file } => cmd_symbols(root, &file),
         Commands::Skeleton { file } => cmd_skeleton(root, &file),
-        Commands::Ingest { schema, data_file, source } => cmd_ingest(root, schema.as_deref(), data_file.as_deref(), source.as_deref()),
+        Commands::Ingest {
+            schema,
+            data_file,
+            source,
+        } => cmd_ingest(
+            root,
+            schema.as_deref(),
+            data_file.as_deref(),
+            source.as_deref(),
+        ),
         Commands::Query { cypher } => cmd_query(root, &cypher),
         Commands::Search {
             query,

@@ -78,7 +78,12 @@ fn extract_statements_for_symbols(
 ) -> Vec<Statement> {
     let fn_symbols: Vec<(&str, u32, u32)> = symbols
         .iter()
-        .filter(|s| matches!(s.kind, SymbolKind::Function | SymbolKind::Method | SymbolKind::Test))
+        .filter(|s| {
+            matches!(
+                s.kind,
+                SymbolKind::Function | SymbolKind::Method | SymbolKind::Test
+            )
+        })
         .map(|s| (s.id.as_str(), s.span.start_line, s.span.end_line))
         .collect();
 
@@ -102,7 +107,10 @@ fn collect_fn_nodes<'a>(
     let start = node.start_position().row as u32 + 1;
     let end = node.end_position().row as u32 + 1;
 
-    if let Some((sym_id, _, _)) = fn_symbols.iter().find(|(_, sl, el)| start == *sl && end == *el) {
+    if let Some((sym_id, _, _)) = fn_symbols
+        .iter()
+        .find(|(_, sl, el)| start == *sl && end == *el)
+    {
         let mut extracted = extract_statements(node, source, sym_id, "");
         stmts.append(&mut extracted);
     }
