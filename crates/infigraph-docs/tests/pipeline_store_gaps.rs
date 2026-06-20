@@ -62,7 +62,10 @@ fn test_doc_format_as_str_all() {
 fn test_doc_index_root() {
     let tmp = tempfile::tempdir().unwrap();
     let idx = DocIndex::open(tmp.path()).unwrap();
-    let root = idx.root().canonicalize().unwrap_or_else(|_| idx.root().to_path_buf());
+    let root = idx
+        .root()
+        .canonicalize()
+        .unwrap_or_else(|_| idx.root().to_path_buf());
     let expected = tmp.path().canonicalize().unwrap();
     assert_eq!(
         root, expected,
