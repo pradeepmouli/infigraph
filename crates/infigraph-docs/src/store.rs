@@ -13,6 +13,10 @@ use parquet::file::properties::WriterProperties;
 use crate::chunk::Chunk;
 use crate::extract::ExtractedDoc;
 
+fn fwd_slash_path(p: &Path) -> String {
+    p.to_string_lossy().replace('\\', "/")
+}
+
 const CREATE_SCHEMA: &[&str] = &[
     "CREATE NODE TABLE IF NOT EXISTS Document(
         id STRING,
@@ -163,7 +167,7 @@ impl DocStore {
             writer.write(&batch)?;
             writer.close()?;
 
-            conn.query(&format!("COPY Document FROM '{}'", path.to_string_lossy()))
+            conn.query(&format!("COPY Document FROM '{}'", fwd_slash_path(&path)))
                 .map_err(|e| anyhow::anyhow!("COPY Document: {e}"))?;
         }
 
@@ -213,7 +217,7 @@ impl DocStore {
             writer.write(&batch)?;
             writer.close()?;
 
-            conn.query(&format!("COPY Chunk FROM '{}'", path.to_string_lossy()))
+            conn.query(&format!("COPY Chunk FROM '{}'", fwd_slash_path(&path)))
                 .map_err(|e| anyhow::anyhow!("COPY Chunk: {e}"))?;
         }
 
@@ -242,7 +246,7 @@ impl DocStore {
             writer.write(&batch)?;
             writer.close()?;
 
-            conn.query(&format!("COPY HAS_CHUNK FROM '{}'", path.to_string_lossy()))
+            conn.query(&format!("COPY HAS_CHUNK FROM '{}'", fwd_slash_path(&path)))
                 .map_err(|e| anyhow::anyhow!("COPY HAS_CHUNK: {e}"))?;
         }
 

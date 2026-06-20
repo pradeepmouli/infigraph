@@ -11,7 +11,7 @@ readme.workspace = true
 description = "Document indexing and search for Infigraph — PDF, DOCX, PPTX, XLSX, Markdown, and plain text"
 
 [dependencies]
-infigraph-core = { path = "../infigraph-core", version = "1.5.4" }
+infigraph-core = { path = "../infigraph-core", version = "1.5.5" }
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true

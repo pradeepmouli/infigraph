@@ -2175,7 +2175,7 @@ dependencies = [
 
 [[package]]
 name = "infigraph-cli"
-version = "1.5.4"
+version = "1.5.5"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2198,7 +2198,7 @@ dependencies = [
 
 [[package]]
 name = "infigraph-confluence"
-version = "1.5.4"
+version = "1.5.5"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2212,7 +2212,7 @@ dependencies = [
 
 [[package]]
 name = "infigraph-core"
-version = "1.5.4"
+version = "1.5.5"
 dependencies = [
  "anyhow",
  "arrow",
@@ -2245,7 +2245,7 @@ dependencies = [
 
 [[package]]
 name = "infigraph-docs"
-version = "1.5.4"
+version = "1.5.5"
 dependencies = [
  "anyhow",
  "arrow",
@@ -2268,7 +2268,7 @@ dependencies = [
 
 [[package]]
 name = "infigraph-grammar-plugin"
-version = "1.5.4"
+version = "1.5.5"
 dependencies = [
  "anyhow",
  "dirs-next",
@@ -2281,7 +2281,7 @@ dependencies = [
 
 [[package]]
 name = "infigraph-languages"
-version = "1.5.4"
+version = "1.5.5"
 dependencies = [
  "anyhow",
  "infigraph-core",
@@ -2349,7 +2349,7 @@ dependencies = [
 
 [[package]]
 name = "infigraph-mcp"
-version = "1.5.4"
+version = "1.5.5"
 dependencies = [
  "anyhow",
  "infigraph-confluence",
@@ -2367,7 +2367,7 @@ dependencies = [
 
 [[package]]
 name = "infigraph-pipeline-plugin"
-version = "1.5.4"
+version = "1.5.5"
 dependencies = [
  "anyhow",
  "dirs-next",
@@ -2733,7 +2733,7 @@ checksum = "953f07c43838f8e6f9758cab68bf5bed85465e7587ebe0b823f1bcd81978ad3a"
 
 [[package]]
 name = "lsp-to-scip"
-version = "1.5.4"
+version = "1.5.5"
 dependencies = [
  "anyhow",
  "clap",

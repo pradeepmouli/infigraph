@@ -16,10 +16,10 @@ path = "src/main.rs"
 
 [dependencies]
 infigraph-core.workspace = true
-infigraph-languages = { path = "../infigraph-languages", version = "1.5.4" }
-infigraph-docs = { path = "../infigraph-docs", version = "1.5.4" }
-infigraph-confluence = { path = "../infigraph-confluence", version = "1.5.4" }
-infigraph-pipeline-plugin = { path = "../infigraph-pipeline-plugin", version = "1.5.4" }
+infigraph-languages = { path = "../infigraph-languages", version = "1.5.5" }
+infigraph-docs = { path = "../infigraph-docs", version = "1.5.5" }
+infigraph-confluence = { path = "../infigraph-confluence", version = "1.5.5" }
+infigraph-pipeline-plugin = { path = "../infigraph-pipeline-plugin", version = "1.5.5" }
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
