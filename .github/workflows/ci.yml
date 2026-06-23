@@ -38,5 +38,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
+      - name: Build CLI
+        run: cargo build -p infigraph-cli
       - name: Test
         run: cargo test --all
