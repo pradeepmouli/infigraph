@@ -698,6 +698,7 @@ pub(crate) enum PipelineAction {
 
 fn main() -> Result<()> {
     // ANTLR parsers recurse deeply; Rayon's default 2MB stack overflows.
+    // Windows default main-thread stack is 1MB — also too small.
     let _ = rayon::ThreadPoolBuilder::new()
         .stack_size(32 * 1024 * 1024)
         .build_global();
@@ -707,7 +708,12 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let root = cli.root.unwrap_or_else(|| PathBuf::from("."));
 
-    let result = run(cli.command, &root);
+    let result = std::thread::Builder::new()
+        .stack_size(32 * 1024 * 1024)
+        .spawn(move || run(cli.command, &root))
+        .expect("failed to spawn main worker thread")
+        .join()
+        .expect("main worker thread panicked");
 
     install::print_update_hint(update_handle);
 
