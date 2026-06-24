@@ -313,10 +313,6 @@ pub(crate) fn cmd_test_coverage(root: &Path, file_filter: Option<&str>) -> Resul
 }
 
 pub(crate) fn cmd_watch(root: &Path, debounce: u64) -> Result<()> {
-    let registry = bundled_registry()?;
-    let mut prism = Infigraph::open(root, registry)?;
-    prism.init()?;
-
     println!(
         "Watching {} (debounce {}ms) — Ctrl-C to stop",
         root.display(),
@@ -330,7 +326,7 @@ pub(crate) fn cmd_watch(root: &Path, debounce: u64) -> Result<()> {
     })
     .ok();
 
-    infigraph_core::watch::watch_project(&prism, debounce, stop_rx, |evt| {
+    infigraph_core::watch::watch_project(root, bundled_registry, debounce, stop_rx, |evt| {
         println!("[watch] {evt}");
     })?;
 

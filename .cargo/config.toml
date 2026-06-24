@@ -7,3 +7,8 @@ rustflags = ["-C", "link-arg=-Wl,--allow-multiple-definition"]
 
 [target.aarch64-unknown-linux-gnu]
 rustflags = ["-C", "link-arg=-Wl,--allow-multiple-definition"]
+
+# Windows default main-thread stack is 1MB; tree-sitter/ANTLR parsers
+# recurse deeply during static init and Cli::parse(). Set 32MB default.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "link-arg=/STACK:33554432"]

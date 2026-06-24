@@ -1,7 +1,7 @@
 pub mod batch;
 
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -47,23 +47,24 @@ impl std::fmt::Display for WatchEvent {
 
 /// Watch a project directory and auto-reindex on file changes.
 ///
-/// After reindexing a changed file, checks if it has cross-file CALLS edges.
-/// If so, sets `WatchEvent.has_cross_file_calls = true` so the caller can
-/// prompt the user to run a full reindex (to re-resolve dangling call targets).
-///
-/// `on_periodic` is called every `periodic_secs` seconds when at least one file
-/// has changed since the last call. It receives the IndexResult from a full
-/// reindex and can run expensive post-processing (e.g., SCIP import).
+/// Opens a short-lived DB connection for each batch of changes rather than
+/// holding one open continuously. This avoids Kuzu file-lock conflicts on
+/// Windows where mandatory locking prevents concurrent DB connections.
 ///
 /// Blocks until `stop_rx` receives a signal.
-pub fn watch_project(
-    prism: &Infigraph,
+pub fn watch_project<MR>(
+    root: &Path,
+    make_registry: MR,
     debounce_ms: u64,
     stop_rx: mpsc::Receiver<()>,
     on_event: impl Fn(WatchEvent) + Send + 'static,
-) -> Result<()> {
+) -> Result<()>
+where
+    MR: Fn() -> Result<crate::lang::LanguageRegistry> + Send + 'static,
+{
     watch_project_with_periodic(
-        prism,
+        root,
+        make_registry,
         debounce_ms,
         stop_rx,
         on_event,
@@ -72,8 +73,9 @@ pub fn watch_project(
     )
 }
 
-pub fn watch_project_with_periodic<F>(
-    prism: &Infigraph,
+pub fn watch_project_with_periodic<MR, F>(
+    root: &Path,
+    make_registry: MR,
     debounce_ms: u64,
     stop_rx: mpsc::Receiver<()>,
     on_event: impl Fn(WatchEvent) + Send + 'static,
@@ -81,6 +83,7 @@ pub fn watch_project_with_periodic<F>(
     on_periodic: Option<F>,
 ) -> Result<()>
 where
+    MR: Fn() -> Result<crate::lang::LanguageRegistry> + Send + 'static,
     F: Fn(&crate::IndexResult) + Send + 'static,
 {
     let (tx, rx) = mpsc::channel::<notify::Result<Event>>();
@@ -102,9 +105,10 @@ where
         ".tox",
     ];
 
-    // Watch directories selectively instead of RecursiveMode::Recursive
-    // to avoid exhausting file descriptors on repos with node_modules/target
-    register_watch_dirs(&mut watcher, prism.root(), ignore_dirs)?;
+    register_watch_dirs(&mut watcher, root, ignore_dirs)?;
+
+    // Build a registry once for file-extension filtering (no DB needed).
+    let filter_registry = make_registry()?;
 
     let mut changes_since_periodic: usize = 0;
     let mut last_periodic = std::time::Instant::now();
@@ -124,13 +128,15 @@ where
             && last_periodic.elapsed() >= Duration::from_secs(periodic_secs)
         {
             if let Some(ref cb) = on_periodic {
-                match prism.index() {
-                    Ok(result) => {
-                        if !result.extractions.is_empty() {
-                            cb(&result);
+                if let Ok(prism) = open_transient(root, &make_registry) {
+                    match prism.index() {
+                        Ok(result) => {
+                            if !result.extractions.is_empty() {
+                                cb(&result);
+                            }
                         }
+                        Err(e) => eprintln!("[watch] periodic reindex failed: {e}"),
                     }
-                    Err(e) => eprintln!("[watch] periodic reindex failed: {e}"),
                 }
             }
             changes_since_periodic = 0;
@@ -143,33 +149,36 @@ where
             let count = paths.len();
             eprintln!("[watch] batch indexing {count} files");
 
-            match prism.index_files(&paths) {
-                Ok(result) => {
-                    changes_since_periodic += result.indexed_files;
+            if let Ok(prism) = open_transient(root, &make_registry) {
+                match prism.index_files(&paths) {
+                    Ok(result) => {
+                        changes_since_periodic += result.indexed_files;
 
-                    if let Some(store) = prism.store() {
-                        let changed: Vec<&str> =
-                            result.extractions.iter().map(|e| e.file.as_str()).collect();
-                        if !changed.is_empty() {
-                            if let Err(e) =
-                                crate::embed::update_embeddings(store, prism.root(), &changed)
-                            {
-                                eprintln!("[watch] batch embedding update failed: {e}");
+                        if let Some(store) = prism.store() {
+                            let changed: Vec<&str> =
+                                result.extractions.iter().map(|e| e.file.as_str()).collect();
+                            if !changed.is_empty() {
+                                if let Err(e) =
+                                    crate::embed::update_embeddings(store, root, &changed)
+                                {
+                                    eprintln!("[watch] batch embedding update failed: {e}");
+                                }
                             }
                         }
-                    }
 
-                    for extraction in &result.extractions {
-                        let cross = has_cross_file_calls(prism, &extraction.file);
-                        let abs_path = prism.root().join(&extraction.file);
-                        on_event(WatchEvent {
-                            kind: WatchEventKind::Modified,
-                            path: abs_path,
-                            has_cross_file_calls: cross,
-                        });
+                        for extraction in &result.extractions {
+                            let cross = has_cross_file_calls(&prism, &extraction.file);
+                            let abs_path = root.join(&extraction.file);
+                            on_event(WatchEvent {
+                                kind: WatchEventKind::Modified,
+                                path: abs_path,
+                                has_cross_file_calls: cross,
+                            });
+                        }
                     }
+                    Err(e) => eprintln!("[watch] batch reindex failed: {e}"),
                 }
-                Err(e) => eprintln!("[watch] batch reindex failed: {e}"),
+                // prism drops here, releasing the DB lock
             }
         }
 
@@ -187,14 +196,16 @@ where
                         continue;
                     }
 
-                    let rel = match path.strip_prefix(prism.root()) {
+                    let rel = match path.strip_prefix(root) {
                         Ok(r) => r.to_string_lossy().replace('\\', "/"),
                         Err(_) => continue,
                     };
 
                     match watch_kind {
                         WatchEventKind::Removed => {
-                            let _ = prism.remove_file(&path);
+                            if let Ok(prism) = open_transient(root, &make_registry) {
+                                let _ = prism.remove_file(&path);
+                            }
                             changes_since_periodic += 1;
                             on_event(WatchEvent {
                                 kind: watch_kind.clone(),
@@ -203,7 +214,7 @@ where
                             });
                         }
                         WatchEventKind::Created | WatchEventKind::Modified => {
-                            if prism.registry().for_file(&rel).is_some() {
+                            if filter_registry.for_file(&rel).is_some() {
                                 batch.add(path);
                             }
                         }
@@ -226,25 +237,31 @@ where
 /// the changed file plus its cross-file dependents and uses `prism.index_files()` to
 /// re-index only the affected subset, then runs targeted re-resolution via
 /// `resolve::re_resolve_for_files()`.
-pub fn watch_project_auto_resolve(
-    prism: &Infigraph,
+pub fn watch_project_auto_resolve<MR>(
+    root: &Path,
+    make_registry: MR,
     debounce_ms: u64,
     stop_rx: mpsc::Receiver<()>,
     log_prefix: &str,
-    make_registry: impl Fn() -> anyhow::Result<crate::lang::LanguageRegistry> + Send + 'static,
-) -> Result<()> {
-    let root = prism.root().to_path_buf();
-    watch_project(prism, debounce_ms, stop_rx, {
-        let prefix = log_prefix.to_string();
+) -> Result<()>
+where
+    MR: Fn() -> Result<crate::lang::LanguageRegistry> + Send + Sync + 'static,
+{
+    let root_owned = root.to_path_buf();
+    let prefix = log_prefix.to_string();
+    let factory: Arc<dyn Fn() -> Result<crate::lang::LanguageRegistry> + Send + Sync> =
+        Arc::new(make_registry);
+    let factory_for_event = Arc::clone(&factory);
+    watch_project(root, move || factory(), debounce_ms, stop_rx, {
         move |evt: WatchEvent| {
             if evt.has_cross_file_calls {
                 eprintln!("[watch {prefix}] {evt}");
-                if let Ok(reg) = make_registry() {
-                    if let Ok(mut p) = Infigraph::open(&root, reg) {
+                if let Ok(reg) = factory_for_event() {
+                    if let Ok(mut p) = Infigraph::open(&root_owned, reg) {
                         if p.init().is_ok() {
                             let changed_rel = evt
                                 .path
-                                .strip_prefix(&root)
+                                .strip_prefix(&root_owned)
                                 .map(|r| r.to_string_lossy().replace('\\', "/"))
                                 .unwrap_or_else(|_| evt.path.to_string_lossy().replace('\\', "/"));
                             let mut affected_files = vec![evt.path.clone()];
@@ -252,7 +269,7 @@ pub fn watch_project_auto_resolve(
                             if let Some(store) = p.store() {
                                 let deps = get_cross_file_dependents(store, &changed_rel);
                                 for dep_rel in deps {
-                                    let dep_abs = root.join(&dep_rel);
+                                    let dep_abs = root_owned.join(&dep_rel);
                                     if dep_abs.exists() {
                                         affected_files.push(dep_abs);
                                     }
@@ -286,7 +303,9 @@ pub fn watch_project_auto_resolve(
                                         let changed: Vec<&str> =
                                             r.extractions.iter().map(|e| e.file.as_str()).collect();
                                         match crate::embed::update_embeddings(
-                                            store, &root, &changed,
+                                            store,
+                                            &root_owned,
+                                            &changed,
                                         ) {
                                             Ok(n) => {
                                                 eprintln!("[watch {prefix}] updated {n} embeddings")
@@ -301,6 +320,7 @@ pub fn watch_project_auto_resolve(
                                     eprintln!("[watch {prefix}] targeted reindex failed: {e}")
                                 }
                             }
+                            // p drops here, releasing the DB lock
                         }
                     }
                 }
@@ -309,6 +329,17 @@ pub fn watch_project_auto_resolve(
             }
         }
     })
+}
+
+/// Open a short-lived Infigraph instance for batch work.
+fn open_transient<MR>(root: &Path, make_registry: &MR) -> Result<Infigraph>
+where
+    MR: Fn() -> Result<crate::lang::LanguageRegistry>,
+{
+    let registry = make_registry()?;
+    let mut prism = Infigraph::open(root, registry)?;
+    prism.init()?;
+    Ok(prism)
 }
 
 /// Returns the relative paths of files that have cross-file CALLS edges to/from the given file.

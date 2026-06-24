@@ -4,7 +4,6 @@ use std::sync::{mpsc, Arc, Mutex};
 use anyhow::{Context, Result};
 use serde_json::Value;
 
-use infigraph_core::Infigraph;
 use infigraph_languages::bundled_registry;
 
 pub struct WatcherEntry {
@@ -79,10 +78,6 @@ pub fn tool_watch_project(args: &Value) -> Result<String> {
         .context("invalid path")?;
     let root_str = root.to_string_lossy().replace('\\', "/");
 
-    let registry = bundled_registry()?;
-    let mut prism = Infigraph::open(&root, registry)?;
-    prism.init()?;
-
     let (stop_tx, stop_rx) = mpsc::channel::<()>();
     let watcher_id = format!(
         "watch-{}",
@@ -112,39 +107,42 @@ pub fn tool_watch_project(args: &Value) -> Result<String> {
     let watcher_id_clone = watcher_id.clone();
     std::thread::spawn(move || {
         let id_short = watcher_id_clone[..12.min(watcher_id_clone.len())].to_string();
-        let on_event = {
-            let id_short = id_short.clone();
-            move |evt: infigraph_core::watch::WatchEvent| {
-                if evt.has_cross_file_calls {
-                    let file = evt.path.to_string_lossy().replace('\\', "/");
-                    eprintln!("[watch {id_short}] {evt}");
-                    if !auto_resolve {
+        if auto_resolve {
+            if let Err(e) = infigraph_core::watch::watch_project_auto_resolve(
+                &root,
+                bundled_registry,
+                debounce_ms,
+                stop_rx,
+                &id_short,
+            ) {
+                eprintln!("[watch] error: {e}");
+            }
+        } else {
+            let on_event = {
+                let id_short = id_short.clone();
+                move |evt: infigraph_core::watch::WatchEvent| {
+                    if evt.has_cross_file_calls {
+                        let file = evt.path.to_string_lossy().replace('\\', "/");
+                        eprintln!("[watch {id_short}] {evt}");
                         let mut pending = pending_clone.lock().unwrap();
                         if !pending.contains(&file) {
                             pending.push(file);
                         }
                         eprintln!("[watch {id_short}] ⚠ cross-file calls affected — call index_project to re-resolve (or use auto_resolve=true)");
+                    } else {
+                        eprintln!("[watch {id_short}] {evt}");
                     }
-                } else {
-                    eprintln!("[watch {id_short}] {evt}");
                 }
-            }
-        };
-        if auto_resolve {
-            // Use auto-resolve variant that runs full reindex on cross-file changes
-            if let Err(e) = infigraph_core::watch::watch_project_auto_resolve(
-                &prism,
+            };
+            if let Err(e) = infigraph_core::watch::watch_project(
+                &root,
+                bundled_registry,
                 debounce_ms,
                 stop_rx,
-                &id_short,
-                bundled_registry,
+                on_event,
             ) {
                 eprintln!("[watch] error: {e}");
             }
-        } else if let Err(e) =
-            infigraph_core::watch::watch_project(&prism, debounce_ms, stop_rx, on_event)
-        {
-            eprintln!("[watch] error: {e}");
         }
         let mut guard = WATCHERS.lock().unwrap();
         if let Some(map) = guard.as_mut() {
