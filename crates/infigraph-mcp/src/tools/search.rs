@@ -1,12 +1,135 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::SystemTime;
 
 use anyhow::{Context, Result};
 use serde_json::Value;
 
 use infigraph_core::embed;
+use infigraph_core::search::BM25Index;
 
 use super::docs::{open_doc_index, tool_search_docs};
 use super::helpers::{find_containing_symbol, open_prism};
+
+struct SearchContext {
+    db_path: PathBuf,
+    db_mtime: SystemTime,
+    rows: Arc<Vec<Vec<String>>>,
+    bm25_unfiltered: Arc<BM25Index>,
+    docs_unfiltered: Arc<Vec<(String, String)>>,
+    symbol_embeddings: Arc<Vec<(String, Vec<f32>)>>,
+}
+
+static SEARCH_CTX: OnceLock<Mutex<Option<SearchContext>>> = OnceLock::new();
+
+fn search_ctx_lock() -> &'static Mutex<Option<SearchContext>> {
+    SEARCH_CTX.get_or_init(|| Mutex::new(None))
+}
+
+fn build_docs_from_rows(rows: &[Vec<String>]) -> Vec<(String, String)> {
+    rows.iter()
+        .map(|row| {
+            let id = row[0].clone();
+            let text = if row.get(4).is_some_and(|s| !s.is_empty()) {
+                format!("{} {}: {}", row[2], row[1], row[4])
+            } else {
+                format!("{} {}", row[2], row[1])
+            };
+            (id, text)
+        })
+        .collect()
+}
+
+struct CachedSearchData {
+    rows: Arc<Vec<Vec<String>>>,
+    bm25: Arc<BM25Index>,
+    docs: Arc<Vec<(String, String)>>,
+    symbol_embeddings: Arc<Vec<(String, Vec<f32>)>>,
+}
+
+fn get_or_build_search_ctx(args: &Value) -> Result<CachedSearchData> {
+    let path = args.get("path").and_then(|p| p.as_str()).unwrap_or(".");
+    let tg_root = PathBuf::from(path).join(".infigraph");
+    let emb_file = tg_root.join("embeddings.bin");
+    let canon = tg_root.canonicalize().unwrap_or_else(|_| tg_root.clone());
+    let mtime = std::fs::metadata(&emb_file)
+        .and_then(|m| m.modified())
+        .unwrap_or(std::time::UNIX_EPOCH);
+
+    {
+        let guard = search_ctx_lock().lock().unwrap();
+        if let Some(ctx) = guard.as_ref() {
+            if ctx.db_path == canon && ctx.db_mtime == mtime {
+                return Ok(CachedSearchData {
+                    rows: Arc::clone(&ctx.rows),
+                    bm25: Arc::clone(&ctx.bm25_unfiltered),
+                    docs: Arc::clone(&ctx.docs_unfiltered),
+                    symbol_embeddings: Arc::clone(&ctx.symbol_embeddings),
+                });
+            }
+        }
+    }
+
+    let prism = open_prism(args)?;
+    let store = prism.store().context("not initialized")?;
+    let conn = store.connection()?;
+    let gq = infigraph_core::graph::GraphQuery::new(&conn);
+    let rows = gq.raw_query(
+        "MATCH (s:Symbol) RETURN s.id, s.name, s.kind, s.file, s.docstring, s.start_line, s.end_line",
+    )?;
+
+    let docs = build_docs_from_rows(&rows);
+    let bm25 = BM25Index::build(docs.clone());
+    let embedder = embed::best_embedder();
+    let emb_path = PathBuf::from(path)
+        .join(".infigraph")
+        .join("embeddings.bin");
+    let embeddings_map: HashMap<String, Vec<f32>> = if emb_path.exists() {
+        embed::load_embeddings_cached(&emb_path)?
+            .into_iter()
+            .collect()
+    } else {
+        docs.iter()
+            .map(|(id, text)| (id.clone(), embedder.embed(text).unwrap_or_default()))
+            .collect()
+    };
+
+    let symbol_embeddings: Vec<(String, Vec<f32>)> = docs
+        .iter()
+        .filter_map(|(id, text)| {
+            embeddings_map
+                .get(id)
+                .cloned()
+                .or_else(|| embedder.embed(text).ok())
+                .map(|emb| (id.clone(), emb))
+        })
+        .collect();
+
+    let rows = Arc::new(rows);
+    let bm25 = Arc::new(bm25);
+    let docs = Arc::new(docs);
+    let symbol_embeddings = Arc::new(symbol_embeddings);
+
+    let data = CachedSearchData {
+        rows: Arc::clone(&rows),
+        bm25: Arc::clone(&bm25),
+        docs: Arc::clone(&docs),
+        symbol_embeddings: Arc::clone(&symbol_embeddings),
+    };
+
+    let mut guard = search_ctx_lock().lock().unwrap();
+    *guard = Some(SearchContext {
+        db_path: canon,
+        db_mtime: mtime,
+        rows,
+        bm25_unfiltered: bm25,
+        docs_unfiltered: docs,
+        symbol_embeddings,
+    });
+
+    Ok(data)
+}
 
 pub fn tool_search(args: &Value) -> Result<String> {
     let scope = args.get("scope").and_then(|s| s.as_str()).unwrap_or("all");
@@ -15,7 +138,6 @@ pub fn tool_search(args: &Value) -> Result<String> {
         return tool_search_docs(args);
     }
 
-    let prism = open_prism(args)?;
     let query = args
         .get("query")
         .and_then(|q| q.as_str())
@@ -29,14 +151,9 @@ pub fn tool_search(args: &Value) -> Result<String> {
     let path = args.get("path").and_then(|p| p.as_str()).unwrap_or(".");
     let use_regex = args.get("regex").and_then(|v| v.as_bool()).unwrap_or(false);
 
-    let store = prism.store().context("not initialized")?;
-    let conn = store.connection()?;
-    let gq = infigraph_core::graph::GraphQuery::new(&conn);
+    let ctx = get_or_build_search_ctx(args)?;
 
-    let rows = gq.raw_query(
-        "MATCH (s:Symbol) RETURN s.id, s.name, s.kind, s.file, s.docstring, s.start_line, s.end_line",
-    )?;
-
+    let rows = ctx.rows;
     if rows.is_empty() {
         return Ok("No symbols indexed. Run index_project first.".to_string());
     }
@@ -56,52 +173,48 @@ pub fn tool_search(args: &Value) -> Result<String> {
         ));
     }
 
-    let docs: Vec<(String, String)> = filtered_rows
-        .iter()
-        .map(|row| {
-            let id = row[0].clone();
-            let text = if row.get(4).is_some_and(|s| !s.is_empty()) {
-                format!("{} {}: {}", row[2], row[1], row[4])
-            } else {
-                format!("{} {}", row[2], row[1])
-            };
-            (id, text)
-        })
-        .collect();
-
-    let bm25_index = infigraph_core::search::BM25Index::build(docs.clone());
-    let embedder = embed::best_embedder();
-    let emb_path = std::path::PathBuf::from(path)
-        .join(".infigraph")
-        .join("embeddings.bin");
-    let symbol_embeddings: Vec<(String, Vec<f32>)> = if emb_path.exists() {
-        let all: std::collections::HashMap<String, Vec<f32>> =
-            embed::load_embeddings_cached(&emb_path)?
-                .into_iter()
-                .collect();
-        docs.iter()
-            .filter_map(|(id, text)| {
-                all.get(id)
-                    .cloned()
-                    .or_else(|| embedder.embed(text).ok())
-                    .map(|emb| (id.clone(), emb))
-            })
-            .collect()
+    let filtered_bm25;
+    let filtered_docs;
+    let (bm25_ref, docs_ref): (&BM25Index, &[(String, String)]) = if kind_filter.is_some() {
+        filtered_docs = build_docs_from_rows(
+            &filtered_rows
+                .iter()
+                .map(|r| (*r).clone())
+                .collect::<Vec<_>>(),
+        );
+        filtered_bm25 = BM25Index::build(filtered_docs.clone());
+        (&filtered_bm25, &filtered_docs)
     } else {
-        docs.iter()
-            .map(|(id, text)| (id.clone(), embedder.embed(text).unwrap_or_default()))
-            .collect()
+        (&ctx.bm25, &ctx.docs)
+    };
+
+    let embedder = embed::best_embedder();
+
+    let filtered_symbol_embeddings;
+    let symbol_embeddings_ref: &[(String, Vec<f32>)] = if kind_filter.is_some() {
+        let ids: std::collections::HashSet<&str> =
+            docs_ref.iter().map(|(id, _)| id.as_str()).collect();
+        filtered_symbol_embeddings = ctx
+            .symbol_embeddings
+            .iter()
+            .filter(|(id, _)| ids.contains(id.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        &filtered_symbol_embeddings
+    } else {
+        &ctx.symbol_embeddings
     };
 
     // Compute raw scores once, blend with both alphas
     let oversample = limit * 2;
-    let tg_dir = std::path::PathBuf::from(path).join(".infigraph");
+    let tg_dir = PathBuf::from(path).join(".infigraph");
     let hnsw_path = tg_dir.join("hnsw_index.usearch");
+    let emb_path = tg_dir.join("embeddings.bin");
     let raw = infigraph_core::search::compute_raw_scores(
         query,
-        &bm25_index,
+        bm25_ref,
         embedder.as_ref(),
-        &symbol_embeddings,
+        symbol_embeddings_ref,
         oversample,
         Some(&hnsw_path),
         Some(&emb_path),
@@ -195,9 +308,9 @@ pub fn tool_search(args: &Value) -> Result<String> {
         let esc_oversample = esc_limit * 2;
         let raw2 = infigraph_core::search::compute_raw_scores(
             query,
-            &bm25_index,
+            bm25_ref,
             embedder.as_ref(),
-            &symbol_embeddings,
+            symbol_embeddings_ref,
             esc_oversample,
             Some(&hnsw_path),
             Some(&emb_path),
@@ -318,64 +431,54 @@ pub fn tool_search(args: &Value) -> Result<String> {
         out.push_str(&format!("No results for '{}'", query));
     }
 
+    if !super::watch::is_watching(&root.to_string_lossy().replace('\\', "/")) {
+        let lock_path = root.join(".infigraph").join("watch.lock");
+        let cli_watching = {
+            use fs2::FileExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&lock_path)
+                .ok()
+                .map(|f| {
+                    let locked = f.try_lock_exclusive().is_err();
+                    let _ = f.unlock();
+                    locked
+                })
+                .unwrap_or(false)
+        };
+        if !cli_watching {
+            out.push_str("\n⚠ No file watcher running — results may be stale. Run `infigraph watch` or re-index to refresh.");
+        }
+    }
+
     Ok(out)
 }
 
 pub fn tool_search_symbols(args: &Value) -> Result<String> {
-    let prism = open_prism(args)?;
     let query = args
         .get("query")
         .and_then(|q| q.as_str())
         .context("missing 'query'")?;
     let limit = args.get("limit").and_then(|l| l.as_u64()).unwrap_or(10) as usize;
+    let path = args.get("path").and_then(|p| p.as_str()).unwrap_or(".");
 
-    let store = prism.store().context("not initialized")?;
-    let conn = store.connection()?;
-    let gq = infigraph_core::graph::GraphQuery::new(&conn);
-
-    let rows = gq.raw_query(
-        "MATCH (s:Symbol) RETURN s.id, s.name, s.kind, s.file, s.docstring, s.start_line, s.end_line",
-    )?;
+    let ctx = get_or_build_search_ctx(args)?;
+    let rows = ctx.rows;
 
     if rows.is_empty() {
         return Ok("No symbols indexed. Run index_project first.".to_string());
     }
 
-    let docs: Vec<(String, String)> = rows
-        .iter()
-        .map(|row| {
-            let id = row[0].clone();
-            let text = if row.get(4).is_some_and(|s| !s.is_empty()) {
-                format!("{} {}: {}", row[2], row[1], row[4])
-            } else {
-                format!("{} {}", row[2], row[1])
-            };
-            (id, text)
-        })
-        .collect();
-
-    let bm25_index = infigraph_core::search::BM25Index::build(docs.clone());
     let embedder = embed::best_embedder();
-    let path = args.get("path").and_then(|p| p.as_str()).unwrap_or(".");
-    let emb_path = std::path::PathBuf::from(path)
-        .join(".infigraph")
-        .join("embeddings.bin");
-    let symbol_embeddings: Vec<(String, Vec<f32>)> = if emb_path.exists() {
-        embed::load_embeddings_cached(&emb_path)?
-    } else {
-        docs.iter()
-            .map(|(id, text)| (id.clone(), embedder.embed(text).unwrap_or_default()))
-            .collect()
-    };
 
-    let hnsw_path = std::path::PathBuf::from(path)
-        .join(".infigraph")
-        .join("hnsw_index.usearch");
+    let tg_dir = PathBuf::from(path).join(".infigraph");
+    let hnsw_path = tg_dir.join("hnsw_index.usearch");
+    let emb_path = tg_dir.join("embeddings.bin");
     let results = infigraph_core::search::hybrid_search(
         query,
-        &bm25_index,
+        &ctx.bm25,
         embedder.as_ref(),
-        &symbol_embeddings,
+        &ctx.symbol_embeddings,
         limit,
         0.3,
         Some(&hnsw_path),
@@ -433,7 +536,6 @@ pub fn tool_search_code(args: &Value) -> Result<String> {
 }
 
 pub fn tool_semantic_search(args: &Value) -> Result<String> {
-    let prism = open_prism(args)?;
     let query = args
         .get("query")
         .and_then(|q| q.as_str())
@@ -443,20 +545,15 @@ pub fn tool_semantic_search(args: &Value) -> Result<String> {
         .get("kind")
         .and_then(|v| v.as_str())
         .map(str::to_lowercase);
+    let path = args.get("path").and_then(|p| p.as_str()).unwrap_or(".");
 
-    let store = prism.store().context("not initialized")?;
-    let conn = store.connection()?;
-    let gq = infigraph_core::graph::GraphQuery::new(&conn);
-
-    let rows = gq.raw_query(
-        "MATCH (s:Symbol) RETURN s.id, s.name, s.kind, s.file, s.docstring, s.start_line",
-    )?;
+    let ctx = get_or_build_search_ctx(args)?;
+    let rows = ctx.rows;
 
     if rows.is_empty() {
         return Ok("No symbols indexed. Run index_project first.".to_string());
     }
 
-    // Apply kind filter before building index
     let filtered_rows: Vec<&Vec<String>> = match &kind_filter {
         Some(k) => rows
             .iter()
@@ -472,66 +569,53 @@ pub fn tool_semantic_search(args: &Value) -> Result<String> {
         ));
     }
 
-    let docs: Vec<(String, String)> = filtered_rows
-        .iter()
-        .map(|row| {
-            let id = row[0].clone();
-            let text = if row.get(4).is_some_and(|s| !s.is_empty()) {
-                format!("{} {}: {}", row[2], row[1], row[4])
-            } else {
-                format!("{} {}", row[2], row[1])
-            };
-            (id, text)
-        })
-        .collect();
-
-    // Build BM25 index (used lightly at alpha=0.15 — mostly semantic)
-    let bm25_index = infigraph_core::search::BM25Index::build(docs.clone());
-    let embedder = embed::best_embedder();
-
-    let path = args.get("path").and_then(|p| p.as_str()).unwrap_or(".");
-    let emb_path = std::path::PathBuf::from(path)
-        .join(".infigraph")
-        .join("embeddings.bin");
-
-    // Load or compute embeddings for filtered set
-    let all_embeddings: std::collections::HashMap<String, Vec<f32>> = if emb_path.exists() {
-        infigraph_core::embed::load_embeddings_cached(&emb_path)?
-            .into_iter()
-            .collect()
+    let filtered_bm25_sem;
+    let filtered_docs_sem;
+    let (bm25_ref_sem, docs_ref_sem): (&BM25Index, &[(String, String)]) = if kind_filter.is_some() {
+        filtered_docs_sem = build_docs_from_rows(
+            &filtered_rows
+                .iter()
+                .map(|r| (*r).clone())
+                .collect::<Vec<_>>(),
+        );
+        filtered_bm25_sem = BM25Index::build(filtered_docs_sem.clone());
+        (&filtered_bm25_sem, &filtered_docs_sem)
     } else {
-        docs.iter()
-            .map(|(id, text)| (id.clone(), embedder.embed(text).unwrap_or_default()))
-            .collect()
+        (&ctx.bm25, &ctx.docs)
     };
 
-    let symbol_embeddings: Vec<(String, Vec<f32>)> = docs
-        .iter()
-        .filter_map(|(id, text)| {
-            all_embeddings
-                .get(id)
-                .cloned()
-                .or_else(|| embedder.embed(text).ok())
-                .map(|emb| (id.clone(), emb))
-        })
-        .collect();
+    let embedder = embed::best_embedder();
 
-    // alpha=0.85: heavily vector-weighted for semantic meaning
-    let hnsw_path = std::path::PathBuf::from(path)
-        .join(".infigraph")
-        .join("hnsw_index.usearch");
+    let filtered_sym_emb_sem;
+    let sym_emb_ref_sem: &[(String, Vec<f32>)] = if kind_filter.is_some() {
+        let ids: std::collections::HashSet<&str> =
+            docs_ref_sem.iter().map(|(id, _)| id.as_str()).collect();
+        filtered_sym_emb_sem = ctx
+            .symbol_embeddings
+            .iter()
+            .filter(|(id, _)| ids.contains(id.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        &filtered_sym_emb_sem
+    } else {
+        &ctx.symbol_embeddings
+    };
+
+    let tg_dir = PathBuf::from(path).join(".infigraph");
+    let hnsw_path = tg_dir.join("hnsw_index.usearch");
+    let emb_path = tg_dir.join("embeddings.bin");
     let results = infigraph_core::search::hybrid_search(
         query,
-        &bm25_index,
+        bm25_ref_sem,
         embedder.as_ref(),
-        &symbol_embeddings,
+        sym_emb_ref_sem,
         limit,
         0.85,
         Some(&hnsw_path),
         Some(&emb_path),
     )?;
 
-    let row_map: std::collections::HashMap<&str, &Vec<String>> = filtered_rows
+    let row_map: HashMap<&str, &Vec<String>> = filtered_rows
         .iter()
         .map(|row| (row[0].as_str(), *row))
         .collect();

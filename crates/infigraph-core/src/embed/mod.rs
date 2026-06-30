@@ -373,27 +373,36 @@ pub fn save_embeddings(path: &Path, embeddings: &[(String, Vec<f32>)]) -> Result
     Ok(())
 }
 
-/// Load symbol embeddings from a binary file.
+/// Load symbol embeddings from a binary file using memory-mapped I/O.
 pub fn load_embeddings(path: &Path) -> Result<Vec<(String, Vec<f32>)>> {
     let file = std::fs::File::open(path).context("open embeddings file")?;
-    let mut r = BufReader::new(file);
-    let mut buf4 = [0u8; 4];
-    r.read_exact(&mut buf4)?;
-    let count = u32::from_le_bytes(buf4) as usize;
+    let mmap = unsafe { memmap2::Mmap::map(&file) }.context("mmap embeddings file")?;
+    let data = &mmap[..];
+
+    anyhow::ensure!(data.len() >= 4, "embeddings file too small");
+    let count = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
     let mut result = Vec::with_capacity(count);
+    let mut pos = 4usize;
+
     for _ in 0..count {
-        r.read_exact(&mut buf4)?;
-        let id_len = u32::from_le_bytes(buf4) as usize;
-        let mut id_buf = vec![0u8; id_len];
-        r.read_exact(&mut id_buf)?;
-        let id = String::from_utf8(id_buf).context("invalid utf8 in embedding id")?;
-        r.read_exact(&mut buf4)?;
-        let dim = u32::from_le_bytes(buf4) as usize;
-        let mut vec = Vec::with_capacity(dim);
-        for _ in 0..dim {
-            r.read_exact(&mut buf4)?;
-            vec.push(f32::from_le_bytes(buf4));
-        }
+        anyhow::ensure!(pos + 4 <= data.len(), "truncated embeddings file");
+        let id_len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+        pos += 4;
+        anyhow::ensure!(pos + id_len <= data.len(), "truncated embeddings file");
+        let id = std::str::from_utf8(&data[pos..pos + id_len])
+            .context("invalid utf8 in embedding id")?
+            .to_string();
+        pos += id_len;
+        anyhow::ensure!(pos + 4 <= data.len(), "truncated embeddings file");
+        let dim = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+        pos += 4;
+        let float_bytes = dim * 4;
+        anyhow::ensure!(pos + float_bytes <= data.len(), "truncated embeddings file");
+        let vec: Vec<f32> = data[pos..pos + float_bytes]
+            .chunks_exact(4)
+            .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect();
+        pos += float_bytes;
         result.push((id, vec));
     }
     Ok(result)
@@ -574,14 +583,7 @@ pub fn build_hnsw_index(
         .and_then(|m| m.modified())
         .unwrap_or(std::time::UNIX_EPOCH);
     let sidecar_path = index_path.with_extension("meta");
-    let ids: Vec<&str> = embeddings.iter().map(|(id, _)| id.as_str()).collect();
-    let sidecar = serde_json::json!({
-        "emb_mtime_secs": emb_mtime.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
-        "count": n,
-        "dim": dim,
-        "ids": ids,
-    });
-    std::fs::write(&sidecar_path, serde_json::to_vec(&sidecar)?).context("write hnsw sidecar")?;
+    write_binary_sidecar(&sidecar_path, emb_mtime, n, dim, embeddings)?;
 
     invalidate_hnsw_cache();
     Ok(n)
@@ -592,6 +594,85 @@ pub fn invalidate_hnsw_cache() {
     if let Ok(mut guard) = hnsw_cache_lock().lock() {
         *guard = None;
     }
+}
+
+fn write_binary_sidecar(
+    path: &Path,
+    emb_mtime: std::time::SystemTime,
+    count: usize,
+    dim: usize,
+    embeddings: &[(String, Vec<f32>)],
+) -> Result<()> {
+    let mtime_secs = emb_mtime
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let mut buf = Vec::with_capacity(1 + 4 + 4 + 8 + count * 40);
+    buf.push(1u8); // version
+    buf.extend_from_slice(&(count as u32).to_le_bytes());
+    buf.extend_from_slice(&(dim as u32).to_le_bytes());
+    buf.extend_from_slice(&mtime_secs.to_le_bytes());
+    for (id, _) in embeddings {
+        let id_bytes = id.as_bytes();
+        buf.extend_from_slice(&(id_bytes.len() as u32).to_le_bytes());
+        buf.extend_from_slice(id_bytes);
+    }
+    std::fs::write(path, &buf).context("write binary hnsw sidecar")?;
+    Ok(())
+}
+
+struct SidecarData {
+    emb_mtime_secs: u64,
+    dim: usize,
+    ids: Vec<String>,
+}
+
+fn read_sidecar(bytes: &[u8]) -> Result<SidecarData> {
+    if bytes.is_empty() {
+        anyhow::bail!("empty sidecar file");
+    }
+    if bytes[0] == b'{' {
+        // JSON fallback for pre-upgrade sidecars
+        let sidecar: serde_json::Value =
+            serde_json::from_slice(bytes).context("parse json hnsw sidecar")?;
+        let mtime = sidecar["emb_mtime_secs"].as_u64().unwrap_or(0);
+        let dim = sidecar["dim"].as_u64().unwrap_or(256) as usize;
+        let ids = sidecar["ids"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        return Ok(SidecarData {
+            emb_mtime_secs: mtime,
+            dim,
+            ids,
+        });
+    }
+    // Binary format: [version:u8] [count:u32] [dim:u32] [emb_mtime_secs:u64] foreach: [id_len:u32] [id_bytes]
+    anyhow::ensure!(bytes[0] == 1, "unsupported sidecar version {}", bytes[0]);
+    anyhow::ensure!(bytes.len() >= 17, "sidecar too small for header");
+    let count = u32::from_le_bytes(bytes[1..5].try_into().unwrap()) as usize;
+    let dim = u32::from_le_bytes(bytes[5..9].try_into().unwrap()) as usize;
+    let emb_mtime_secs = u64::from_le_bytes(bytes[9..17].try_into().unwrap());
+    let mut ids = Vec::with_capacity(count);
+    let mut pos = 17usize;
+    for _ in 0..count {
+        anyhow::ensure!(pos + 4 <= bytes.len(), "truncated sidecar");
+        let id_len = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
+        pos += 4;
+        anyhow::ensure!(pos + id_len <= bytes.len(), "truncated sidecar id");
+        let id = String::from_utf8_lossy(&bytes[pos..pos + id_len]).into_owned();
+        pos += id_len;
+        ids.push(id);
+    }
+    Ok(SidecarData {
+        emb_mtime_secs,
+        dim,
+        ids,
+    })
 }
 
 /// Query result from HNSW search.
@@ -668,23 +749,13 @@ pub fn search_hnsw(
 
     // Cache miss — load sidecar and validate freshness
     let sidecar_bytes = std::fs::read(&sidecar_path).context("read hnsw sidecar")?;
-    let sidecar: serde_json::Value =
-        serde_json::from_slice(&sidecar_bytes).context("parse hnsw sidecar")?;
-    let stored_mtime = sidecar["emb_mtime_secs"].as_u64().unwrap_or(0);
-    if stored_mtime != emb_mtime_secs {
+    let sidecar = read_sidecar(&sidecar_bytes)?;
+    if sidecar.emb_mtime_secs != emb_mtime_secs {
         return Ok(None);
     }
+    let id_map = sidecar.ids;
 
-    let id_map: Vec<String> = sidecar["ids"]
-        .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
-
-    let dim = sidecar["dim"].as_u64().unwrap_or(256) as usize;
+    let dim = sidecar.dim;
     let path_str = index_path
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("non-utf8 index path"))?;

@@ -118,6 +118,8 @@ Examples:
 - **Auto-Watch:** File watcher auto-starts after indexing. Index stays fresh without manual intervention.
 - **HNSW Vector Index:** Approximate nearest neighbor search for fast similarity queries at scale (~2ms for 500K symbols).
 - **Session Continuity:** Persists context across AI agent sessions — summary, pending tasks, decisions, touched files.
+- **[LM2 Memory System](docs/LM2.md):** Session-aware memory with confidence decay, auto-injection, and consolidation. Tools: `memory_context` (intelligent context gathering), `consolidate_memory` (merge related sessions).
+- **Search Performance:** BM25 disk cache + binary HNSW sidecar for 16x faster MCP repeat searches (3.68s→223ms) and 2x faster CLI (4.3s→2.08s).
 - **82 MCP Tools:** Full AI agent integration for 11 coding agents (Claude Code, Cursor, VS Code, Copilot, Windsurf, etc.).
 - **Sequence Diagrams:** Auto-generates Mermaid sequence diagrams from call graphs.
 - **Cross-Language Detection:** Delphi↔COM, VB6↔COM, C#↔JNI, FFI, gRPC, WASM bridges.
@@ -965,6 +967,8 @@ infigraph-mcp --ui --port=9749
 | `get_latest_session` | Retrieve most recent session — summary, pending tasks, decisions, linked files. Optional `name` param to recall by identity. Suggests purge if old sessions exist |
 | `search_sessions` | Semantic search across past sessions — finds sessions by meaning, ranked by relevance |
 | `purge_sessions` | Delete sessions older than N days (default: 30). User-initiated cleanup |
+| `memory_context` | Intelligent context gathering (code + sessions + skeleton) with auto-depth L1/L2/L3 |
+| `consolidate_memory` | Merge related sessions, boost confidence, reduce redundancy |
 
 ## Architecture
 

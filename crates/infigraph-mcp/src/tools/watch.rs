@@ -40,6 +40,10 @@ pub fn auto_start_watch(path: &str) -> Option<String> {
         return None;
     }
 
+    if cli_watcher_holds_lock(&root) {
+        return None;
+    }
+
     let args = serde_json::json!({
         "path": path,
         "auto_resolve": true,
@@ -54,6 +58,27 @@ pub fn auto_start_watch(path: &str) -> Option<String> {
             eprintln!("[auto-watch] Failed to start watcher: {e}");
             None
         }
+    }
+}
+
+fn cli_watcher_holds_lock(root: &std::path::Path) -> bool {
+    use fs2::FileExt;
+    let lock_path = root.join(".infigraph").join("watch.lock");
+    let file = match std::fs::OpenOptions::new()
+        .create(false)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+    {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    match file.try_lock_exclusive() {
+        Ok(()) => {
+            let _ = file.unlock();
+            false
+        }
+        Err(_) => true,
     }
 }
 

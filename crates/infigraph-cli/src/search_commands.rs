@@ -1,8 +1,7 @@
-use std::path::Path;
-
 use anyhow::{Context, Result};
 use infigraph_core::Infigraph;
 use infigraph_languages::bundled_registry;
+use std::path::Path;
 
 pub(crate) fn cmd_search(root: &Path, query: &str, limit: usize, alpha: f32) -> Result<()> {
     use infigraph_core::embed;
@@ -38,10 +37,33 @@ pub(crate) fn cmd_search(root: &Path, query: &str, limit: usize, alpha: f32) -> 
         })
         .collect();
 
-    let bm25_index = infigraph_core::search::BM25Index::build(docs.clone());
+    let emb_path = root.join(".infigraph").join("embeddings.bin");
+    let bm25_cache_path = root.join(".infigraph").join("bm25_cache.bin");
+    let emb_mtime = std::fs::metadata(&emb_path).and_then(|m| m.modified()).ok();
+    let cache_mtime = std::fs::metadata(&bm25_cache_path)
+        .and_then(|m| m.modified())
+        .ok();
+    let cache_fresh = match (emb_mtime, cache_mtime) {
+        (Some(e), Some(c)) => c >= e,
+        _ => false,
+    };
+    let bm25_index = if cache_fresh {
+        match infigraph_core::search::BM25Index::load(&bm25_cache_path) {
+            Ok(idx) => idx,
+            Err(_) => {
+                let idx = infigraph_core::search::BM25Index::build(docs.clone());
+                let _ = idx.save(&bm25_cache_path);
+                idx
+            }
+        }
+    } else {
+        let idx = infigraph_core::search::BM25Index::build(docs.clone());
+        let _ = idx.save(&bm25_cache_path);
+        idx
+    };
 
     let embedder = embed::best_embedder();
-    let emb_path = root.join(".infigraph").join("embeddings.bin");
+
     let symbol_embeddings: Vec<(String, Vec<f32>)> = if emb_path.exists() {
         embed::load_embeddings_cached(&emb_path)?
     } else {

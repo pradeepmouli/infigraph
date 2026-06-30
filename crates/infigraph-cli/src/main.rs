@@ -266,6 +266,12 @@ enum Commands {
         debounce: u64,
     },
 
+    /// Stop the background auto-watcher
+    WatchStop,
+
+    /// Check if a background watcher is running
+    WatchStatus,
+
     /// Index documents (Markdown, PDF, DOCX, TXT, RST, HTML, etc.) into a document graph
     IndexDocs,
 
@@ -688,7 +694,13 @@ pub(crate) enum GroupAction {
     /// Link cross-service dependencies as CALLS_SERVICE edges in caller graphs
     Link { group: String },
     /// Run a Cypher query across all repos in a group
-    Query { group: String, cypher: String },
+    Query {
+        group: String,
+        cypher: String,
+        /// Query the combined graph instead of individual repos
+        #[arg(long)]
+        combined: bool,
+    },
     /// Watch all repos in a group for changes, auto-reindex and rebuild combined graph
     Watch {
         group: String,
@@ -742,9 +754,30 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let root = cli.root.unwrap_or_else(|| PathBuf::from("."));
 
+    let should_auto_watch = !matches!(
+        cli.command,
+        Commands::Watch { .. }
+            | Commands::WatchStop
+            | Commands::WatchStatus
+            | Commands::ScipEnrich { .. }
+            | Commands::Delete
+            | Commands::Update
+            | Commands::Install
+            | Commands::Uninstall
+            | Commands::Init { .. }
+            | Commands::Languages
+            | Commands::Repos
+            | Commands::CleanRuntimes
+    );
+
     let result = std::thread::Builder::new()
         .stack_size(32 * 1024 * 1024)
-        .spawn(move || run(cli.command, &root))
+        .spawn(move || {
+            if should_auto_watch {
+                index::ensure_watcher_running(&root);
+            }
+            run(cli.command, &root)
+        })
         .expect("failed to spawn main worker thread")
         .join()
         .expect("main worker thread panicked");
@@ -819,6 +852,8 @@ fn run(command: Commands, root: &Path) -> Result<()> {
         Commands::Routes => cmd_routes(root),
         Commands::ScipImport { index } => cmd_scip_import(root, &index),
         Commands::Watch { debounce } => cmd_watch(root, debounce),
+        Commands::WatchStop => cmd_watch_stop(root),
+        Commands::WatchStatus => cmd_watch_status(root),
         Commands::IndexDocs => cmd_index_docs(root),
         Commands::ReindexDocs => cmd_reindex_docs(root),
         Commands::CleanDocs => cmd_clean_docs(root),

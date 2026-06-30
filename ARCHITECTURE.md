@@ -354,6 +354,14 @@ The MCP server automatically starts a file watcher after any indexing operation 
 
 Session context (summary, pending tasks, decisions, touched files) is persisted to a separate KuzuDB instance at `.infigraph/sessions/db`. This keeps session data isolated from the code graph — sessions can be purged without affecting the index. Each session stores TOUCHED edges linking to files the agent worked on, enabling semantic resume: `get_latest_session` returns the prior session's state so the agent can pick up where it left off. Sessions are auto-purged after 30 days by default.
 
+### LM2 Memory System
+
+Session continuity is extended by a 5-phase memory pipeline (LM2): output gate (filters noise), tiered retrieval (L1 current file, L2 related files, L3 semantic archive), confidence decay (older memories lose weight), auto-injection (relevant session context injected into `symbol_context`/`get_doc_context` output), and consolidation (merges related sessions to reduce redundancy and boost confidence). Tools: `memory_context` gathers code + session + skeleton context in one call with automatic depth selection; `consolidate_memory` merges overlapping sessions.
+
+### Search Performance Caches
+
+Two disk caches accelerate repeat searches. A BM25 binary cache at `.infigraph/bm25_cache.bin` persists the inverted index across CLI/MCP sessions — eliminates rebuild on every search call. A binary HNSW sidecar at `.infigraph/hnsw.bin` stores the approximate nearest neighbor graph in a compact binary format. Together they reduce MCP repeat search latency by 16x (3.68s→223ms) and CLI search by 2x (4.3s→2.08s).
+
 ---
 
 ## 11. Known Limitations

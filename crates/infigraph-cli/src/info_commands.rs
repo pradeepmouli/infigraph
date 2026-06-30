@@ -314,6 +314,10 @@ pub(crate) fn cmd_test_coverage(root: &Path, file_filter: Option<&str>) -> Resul
 }
 
 pub(crate) fn cmd_watch(root: &Path, debounce: u64) -> Result<()> {
+    // Hold exclusive lock for lifetime — signals liveness to ensure_watcher_running.
+    let lock_path = root.join(".infigraph").join("watch.lock");
+    let _lock = acquire_watch_lock(&lock_path)?;
+
     println!(
         "Watching {} (debounce {}ms) — Ctrl-C to stop",
         root.display(),
@@ -333,6 +337,66 @@ pub(crate) fn cmd_watch(root: &Path, debounce: u64) -> Result<()> {
 
     println!("Watch stopped.");
     Ok(())
+}
+
+pub(crate) fn cmd_watch_stop(root: &Path) -> Result<()> {
+    let sentinel = root.join(".infigraph").join("watch.stop");
+    let lock_path = root.join(".infigraph").join("watch.lock");
+
+    if !watcher_is_alive(&lock_path) {
+        println!("No watcher running.");
+        return Ok(());
+    }
+
+    std::fs::write(&sentinel, b"")?;
+    println!("Stop signal sent. Watcher will exit within ~1 second.");
+    Ok(())
+}
+
+pub(crate) fn cmd_watch_status(root: &Path) -> Result<()> {
+    let lock_path = root.join(".infigraph").join("watch.lock");
+
+    if watcher_is_alive(&lock_path) {
+        println!("Watcher is running.");
+    } else {
+        println!("No watcher running.");
+    }
+    Ok(())
+}
+
+pub(crate) fn watcher_is_alive(lock_path: &Path) -> bool {
+    use fs2::FileExt;
+    let file = match std::fs::OpenOptions::new()
+        .create(false)
+        .write(true)
+        .truncate(false)
+        .open(lock_path)
+    {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    match file.try_lock_exclusive() {
+        Ok(()) => {
+            let _ = file.unlock();
+            false
+        }
+        Err(_) => true,
+    }
+}
+
+pub(crate) fn acquire_watch_lock(lock_path: &Path) -> Result<std::fs::File> {
+    use fs2::FileExt;
+    if let Some(parent) = lock_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(lock_path)?;
+    file.try_lock_exclusive()
+        .map_err(|_| anyhow::anyhow!("another watcher is already running"))?;
+    Ok(file)
 }
 
 pub(crate) fn cmd_scip_import(root: &Path, index_path: &Path) -> Result<()> {
@@ -594,6 +658,14 @@ pub(crate) fn cmd_generate_test_context(
 
 pub(crate) fn cmd_delete_project(root: &Path) -> Result<()> {
     let project_path = PathBuf::from(root);
+
+    // Stop watcher before removing data
+    let lock_path = project_path.join(".infigraph").join("watch.lock");
+    if watcher_is_alive(&lock_path) {
+        let sentinel = project_path.join(".infigraph").join("watch.stop");
+        let _ = std::fs::write(&sentinel, b"");
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
 
     // Remove the .infigraph directory within the project
     let infigraph_dir = project_path.join(".infigraph");

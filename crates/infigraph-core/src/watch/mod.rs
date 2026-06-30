@@ -117,8 +117,15 @@ where
     // then index them all at once using the bulk write path.
     let mut batch = ChangeBatch::new(1000);
 
+    let sentinel = root.join(".infigraph").join("watch.stop");
+
     loop {
         if stop_rx.try_recv().is_ok() {
+            break;
+        }
+
+        if sentinel.exists() {
+            let _ = std::fs::remove_file(&sentinel);
             break;
         }
 

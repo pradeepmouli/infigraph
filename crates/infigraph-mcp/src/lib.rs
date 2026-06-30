@@ -2,32 +2,8 @@ pub mod tools;
 pub mod web;
 
 use serde_json::{json, Value};
-use tools::watch::{is_watching, tool_watch_project};
 
-pub fn auto_start_watch(path: &str) -> Option<String> {
-    let root = std::path::PathBuf::from(path).canonicalize().ok()?;
-    let root_str = root.to_string_lossy().replace('\\', "/");
-
-    if is_watching(&root_str) {
-        return None;
-    }
-
-    let args = serde_json::json!({
-        "path": path,
-        "auto_resolve": true,
-        "debounce_ms": 500
-    });
-    match tool_watch_project(&args) {
-        Ok(msg) => {
-            eprintln!("[auto-watch] Started watcher for {root_str}");
-            Some(msg)
-        }
-        Err(e) => {
-            eprintln!("[auto-watch] Failed to start watcher: {e}");
-            None
-        }
-    }
-}
+pub use tools::watch::auto_start_watch;
 
 /// Maps MCP tool names to their CLI subcommand names.
 /// Used by parity tests to verify every MCP tool has a CLI equivalent.
@@ -102,6 +78,8 @@ pub const MCP_TO_CLI_MAP: &[(&str, &str)] = &[
     ("group_deps", "group deps"),
     ("group_index", "group index"),
     ("group_link", "group link"),
+    ("stop_watch", "watch-stop"),
+    ("get_watch_status", "watch-status"),
     ("memory_context", "memory-context"),
     ("consolidate_memory", "consolidate-memory"),
     ("purge_sessions", "purge-sessions"),
@@ -111,13 +89,12 @@ pub const MCP_TO_CLI_MAP: &[(&str, &str)] = &[
 /// These are either agent-optimized variants of existing CLI commands,
 /// or features that only make sense in an AI agent context.
 pub const MCP_ONLY_TOOLS: &[&str] = &[
-    "search_symbols",         // CLI has `search` which covers this
-    "semantic_search",        // CLI has `search` which covers this
-    "symbol_context",         // agent-optimized read — CLI uses `snippet`
-    "get_doc_context",        // agent-optimized read — CLI uses `snippet`
-    "get_graph_schema",       // low value as CLI — use `stats` or `query`
-    "get_watch_status",       // watch runs interactively in CLI
-    "stop_watch",             // watch runs interactively in CLI
+    "search_symbols",   // CLI has `search` which covers this
+    "semantic_search",  // CLI has `search` which covers this
+    "symbol_context",   // agent-optimized read — CLI uses `snippet`
+    "get_doc_context",  // agent-optimized read — CLI uses `snippet`
+    "get_graph_schema", // low value as CLI — use `stats` or `query`
+    // stop_watch / get_watch_status now have CLI equivalents: watch-stop, watch-status
     "watch_docs",             // watch runs interactively in CLI
     "stop_watch_docs",        // watch runs interactively in CLI
     "save_session",           // agent session management only

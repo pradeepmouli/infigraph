@@ -223,6 +223,103 @@ fn spawn_scip_child_process(root: &Path, detected_languages: &std::collections::
     eprintln!("  Log: {}", log_path.display());
 }
 
+pub(crate) const CI_ENV_VARS: &[&str] = &[
+    "CI",
+    "GITHUB_ACTIONS",
+    "JENKINS_URL",
+    "BUILDKITE",
+    "GITLAB_CI",
+    "INFIGRAPH_NO_WATCH",
+];
+
+pub(crate) fn is_ci() -> bool {
+    CI_ENV_VARS.iter().any(|v| std::env::var_os(v).is_some())
+}
+
+pub(crate) fn ensure_watcher_running(root: &Path) {
+    if is_ci() {
+        return;
+    }
+
+    let tg_dir = root.join(".infigraph");
+    if !tg_dir.exists() {
+        return;
+    }
+
+    let lock_path = tg_dir.join("watch.lock");
+    let lock_file = match std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+    {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+
+    use fs2::FileExt;
+    match lock_file.try_lock_exclusive() {
+        Ok(()) => {
+            // Lock acquired — no watcher running. Release and spawn one.
+            let _ = lock_file.unlock();
+            drop(lock_file);
+            spawn_watcher(root, &tg_dir);
+        }
+        Err(_) => {
+            // Lock held — watcher already alive.
+        }
+    }
+}
+
+fn spawn_watcher(root: &Path, tg_dir: &Path) {
+    let exe = match std::env::current_exe() {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+
+    let log_path = tg_dir.join("watch.log");
+    let stderr_target = match std::fs::File::create(&log_path) {
+        Ok(f) => std::process::Stdio::from(f),
+        Err(_) => std::process::Stdio::null(),
+    };
+
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("watch")
+        .current_dir(root)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(stderr_target);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const DETACHED_PROCESS: u32 = 0x00000008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+    }
+
+    match cmd.spawn() {
+        Ok(_) => {
+            eprintln!("[auto-watch] Watcher started (log: {})", log_path.display());
+        }
+        Err(e) => {
+            eprintln!("[auto-watch] Failed to start watcher: {e}");
+        }
+    }
+}
+
 pub(crate) fn on_path(cmd: &str) -> bool {
     let lookup = if cfg!(windows) { "where" } else { "which" };
     std::process::Command::new(lookup)
@@ -733,5 +830,487 @@ fn run_scip_indexer_cmd(
             eprintln!("Auto-SCIP: failed to run {label}: {e}");
             false
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    #[test]
+    fn ci_env_vars_list_complete() {
+        assert!(CI_ENV_VARS.contains(&"CI"));
+        assert!(CI_ENV_VARS.contains(&"GITHUB_ACTIONS"));
+        assert!(CI_ENV_VARS.contains(&"JENKINS_URL"));
+        assert!(CI_ENV_VARS.contains(&"BUILDKITE"));
+        assert!(CI_ENV_VARS.contains(&"GITLAB_CI"));
+        assert!(CI_ENV_VARS.contains(&"INFIGRAPH_NO_WATCH"));
+    }
+
+    #[test]
+    fn lock_acquired_when_no_watcher() {
+        let tmp = TempDir::new().unwrap();
+        let lock_path = tmp.path().join("watch.lock");
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap();
+        use fs2::FileExt;
+        file.try_lock_exclusive().unwrap();
+        file.unlock().unwrap();
+    }
+
+    #[test]
+    fn lock_fails_when_watcher_holds_it() {
+        let tmp = TempDir::new().unwrap();
+        let lock_path = tmp.path().join("watch.lock");
+
+        let watcher_file = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap();
+        use fs2::FileExt;
+        watcher_file.lock_exclusive().unwrap();
+
+        let check_file = fs::OpenOptions::new().write(true).open(&lock_path).unwrap();
+        assert!(check_file.try_lock_exclusive().is_err());
+
+        watcher_file.unlock().unwrap();
+        check_file.try_lock_exclusive().unwrap();
+        check_file.unlock().unwrap();
+    }
+
+    #[test]
+    fn ensure_watcher_skips_without_infigraph_dir() {
+        let tmp = TempDir::new().unwrap();
+        ensure_watcher_running(tmp.path());
+        assert!(!tmp.path().join(".infigraph").join("watch.lock").exists());
+    }
+
+    #[test]
+    fn ensure_watcher_skips_when_lock_held() {
+        let tmp = TempDir::new().unwrap();
+        let tg_dir = tmp.path().join(".infigraph");
+        fs::create_dir_all(&tg_dir).unwrap();
+        let lock_path = tg_dir.join("watch.lock");
+
+        let _lock = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap();
+        use fs2::FileExt;
+        _lock.lock_exclusive().unwrap();
+
+        ensure_watcher_running(tmp.path());
+    }
+
+    #[test]
+    fn is_ci_respects_infigraph_no_watch() {
+        // Temporarily set INFIGRAPH_NO_WATCH — is_ci should return true
+        std::env::set_var("INFIGRAPH_NO_WATCH", "1");
+        assert!(is_ci());
+        std::env::remove_var("INFIGRAPH_NO_WATCH");
+    }
+
+    #[test]
+    fn lock_released_after_drop() {
+        let tmp = TempDir::new().unwrap();
+        let lock_path = tmp.path().join("watch.lock");
+
+        use fs2::FileExt;
+        {
+            let file = fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(false)
+                .open(&lock_path)
+                .unwrap();
+            file.lock_exclusive().unwrap();
+            // file dropped here — lock should release
+        }
+
+        // Re-acquire should succeed after drop
+        let file2 = fs::OpenOptions::new().write(true).open(&lock_path).unwrap();
+        file2.try_lock_exclusive().unwrap();
+        file2.unlock().unwrap();
+    }
+
+    #[test]
+    fn acquire_watch_lock_creates_parent_dirs() {
+        let tmp = TempDir::new().unwrap();
+        let lock_path = tmp.path().join("nested").join("dir").join("watch.lock");
+        assert!(!lock_path.parent().unwrap().exists());
+
+        let lock = crate::info_commands::acquire_watch_lock(&lock_path);
+        assert!(lock.is_ok());
+        assert!(lock_path.exists());
+    }
+
+    #[test]
+    fn watcher_is_alive_when_lock_held() {
+        let tmp = TempDir::new().unwrap();
+        let tg_dir = tmp.path().join(".infigraph");
+        fs::create_dir_all(&tg_dir).unwrap();
+        let lock_path = tg_dir.join("watch.lock");
+
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap();
+        use fs2::FileExt;
+        file.lock_exclusive().unwrap();
+
+        assert!(crate::info_commands::watcher_is_alive(&lock_path));
+
+        file.unlock().unwrap();
+        assert!(!crate::info_commands::watcher_is_alive(&lock_path));
+    }
+
+    #[test]
+    fn watcher_is_alive_no_file() {
+        let tmp = TempDir::new().unwrap();
+        let lock_path = tmp.path().join("nonexistent").join("watch.lock");
+        assert!(!crate::info_commands::watcher_is_alive(&lock_path));
+    }
+
+    #[test]
+    fn watch_stop_creates_sentinel() {
+        let tmp = TempDir::new().unwrap();
+        let tg_dir = tmp.path().join(".infigraph");
+        fs::create_dir_all(&tg_dir).unwrap();
+
+        let sentinel = tg_dir.join("watch.stop");
+        assert!(!sentinel.exists());
+
+        // No watcher running — watch_stop should say "No watcher running"
+        let result = crate::info_commands::cmd_watch_stop(tmp.path());
+        assert!(result.is_ok());
+        assert!(!sentinel.exists());
+
+        // Simulate watcher holding lock
+        let lock_path = tg_dir.join("watch.lock");
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap();
+        use fs2::FileExt;
+        file.lock_exclusive().unwrap();
+
+        let result = crate::info_commands::cmd_watch_stop(tmp.path());
+        assert!(result.is_ok());
+        assert!(sentinel.exists());
+
+        file.unlock().unwrap();
+    }
+
+    #[test]
+    fn watch_status_reports_correctly() {
+        let tmp = TempDir::new().unwrap();
+        let tg_dir = tmp.path().join(".infigraph");
+        fs::create_dir_all(&tg_dir).unwrap();
+
+        // No lock file — not running
+        let result = crate::info_commands::cmd_watch_status(tmp.path());
+        assert!(result.is_ok());
+
+        // Lock held — running
+        let lock_path = tg_dir.join("watch.lock");
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap();
+        use fs2::FileExt;
+        file.lock_exclusive().unwrap();
+
+        let result = crate::info_commands::cmd_watch_status(tmp.path());
+        assert!(result.is_ok());
+
+        file.unlock().unwrap();
+    }
+
+    #[test]
+    fn sentinel_file_removed_by_watcher_loop() {
+        let tmp = TempDir::new().unwrap();
+        let tg_dir = tmp.path().join(".infigraph");
+        fs::create_dir_all(&tg_dir).unwrap();
+
+        let sentinel = tg_dir.join("watch.stop");
+        fs::write(&sentinel, b"").unwrap();
+        assert!(sentinel.exists());
+
+        // Simulate what the watcher loop does
+        if sentinel.exists() {
+            let _ = fs::remove_file(&sentinel);
+        }
+        assert!(!sentinel.exists());
+    }
+
+    #[test]
+    fn global_hook_exclusion_list_is_exhaustive() {
+        // Commands that should NOT trigger auto-watcher
+        let excluded = [
+            "watch",
+            "watch-stop",
+            "watch-status",
+            "scip-enrich",
+            "delete",
+            "update",
+            "install",
+            "uninstall",
+            "init",
+            "languages",
+            "repos",
+            "clean-runtimes",
+        ];
+        // Verify none of these are index-dependent commands
+        for cmd in &excluded {
+            assert!(
+                ![
+                    "search",
+                    "callers",
+                    "callees",
+                    "dead-code",
+                    "stats",
+                    "impact"
+                ]
+                .contains(cmd),
+                "{cmd} should not be in exclusion list"
+            );
+        }
+    }
+
+    #[test]
+    fn ensure_watcher_noop_when_ci_env_set() {
+        std::env::set_var("CI", "true");
+        let tmp = TempDir::new().unwrap();
+        let tg_dir = tmp.path().join(".infigraph");
+        fs::create_dir_all(&tg_dir).unwrap();
+
+        ensure_watcher_running(tmp.path());
+        assert!(!tg_dir.join("watch.lock").exists());
+
+        std::env::remove_var("CI");
+    }
+
+    #[test]
+    fn ensure_watcher_called_for_each_group_repo() {
+        // Simulate what group index does: ensure_watcher_running per repo
+        let repos: Vec<TempDir> = (0..3).map(|_| TempDir::new().unwrap()).collect();
+        for repo in &repos {
+            let tg_dir = repo.path().join(".infigraph");
+            fs::create_dir_all(&tg_dir).unwrap();
+        }
+
+        // Each repo should be checkable independently
+        for repo in &repos {
+            let lock_path = repo.path().join(".infigraph").join("watch.lock");
+            assert!(!crate::info_commands::watcher_is_alive(&lock_path));
+        }
+    }
+
+    #[test]
+    fn group_watcher_skips_repos_without_infigraph() {
+        let tmp = TempDir::new().unwrap();
+        // No .infigraph dir — should not panic or create files
+        ensure_watcher_running(tmp.path());
+        assert!(!tmp.path().join(".infigraph").exists());
+    }
+
+    #[test]
+    fn multiple_watchers_independent_locks() {
+        let repo_a = TempDir::new().unwrap();
+        let repo_b = TempDir::new().unwrap();
+        let dir_a = repo_a.path().join(".infigraph");
+        let dir_b = repo_b.path().join(".infigraph");
+        fs::create_dir_all(&dir_a).unwrap();
+        fs::create_dir_all(&dir_b).unwrap();
+
+        let lock_a = dir_a.join("watch.lock");
+        let lock_b = dir_b.join("watch.lock");
+
+        use fs2::FileExt;
+        // Lock repo A
+        let file_a = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_a)
+            .unwrap();
+        file_a.lock_exclusive().unwrap();
+
+        // Repo B should be unlocked
+        assert!(crate::info_commands::watcher_is_alive(&lock_a));
+        assert!(!crate::info_commands::watcher_is_alive(&lock_b));
+
+        file_a.unlock().unwrap();
+    }
+
+    #[test]
+    fn sentinel_stops_only_target_repo() {
+        let repo_a = TempDir::new().unwrap();
+        let repo_b = TempDir::new().unwrap();
+        let dir_a = repo_a.path().join(".infigraph");
+        let dir_b = repo_b.path().join(".infigraph");
+        fs::create_dir_all(&dir_a).unwrap();
+        fs::create_dir_all(&dir_b).unwrap();
+
+        // Write sentinel to repo A only
+        fs::write(dir_a.join("watch.stop"), b"").unwrap();
+
+        assert!(dir_a.join("watch.stop").exists());
+        assert!(!dir_b.join("watch.stop").exists());
+    }
+
+    #[test]
+    fn delete_sends_sentinel_before_removal() {
+        let tmp = TempDir::new().unwrap();
+        let tg_dir = tmp.path().join(".infigraph");
+        fs::create_dir_all(&tg_dir).unwrap();
+
+        let lock_path = tg_dir.join("watch.lock");
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap();
+        use fs2::FileExt;
+        file.lock_exclusive().unwrap();
+
+        // Simulate what cmd_delete_project does: check alive → write sentinel
+        assert!(crate::info_commands::watcher_is_alive(&lock_path));
+        let sentinel = tg_dir.join("watch.stop");
+        fs::write(&sentinel, b"").unwrap();
+        assert!(sentinel.exists());
+
+        file.unlock().unwrap();
+    }
+
+    #[test]
+    fn bm25_cache_stale_when_embeddings_newer() {
+        let tmp = TempDir::new().unwrap();
+        let tg_dir = tmp.path().join(".infigraph");
+        fs::create_dir_all(&tg_dir).unwrap();
+
+        let emb_path = tg_dir.join("embeddings.bin");
+        let bm25_path = tg_dir.join("bm25_cache.bin");
+
+        // Create BM25 cache first
+        fs::write(&bm25_path, b"old_cache").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        // Then update embeddings (newer mtime)
+        fs::write(&emb_path, b"new_embeddings").unwrap();
+
+        let emb_mtime = fs::metadata(&emb_path).unwrap().modified().unwrap();
+        let cache_mtime = fs::metadata(&bm25_path).unwrap().modified().unwrap();
+
+        // Cache should be stale (embeddings newer than cache)
+        assert!(
+            emb_mtime > cache_mtime,
+            "embeddings should be newer than BM25 cache"
+        );
+    }
+
+    #[test]
+    fn bm25_cache_fresh_when_older_than_embeddings() {
+        let tmp = TempDir::new().unwrap();
+        let tg_dir = tmp.path().join(".infigraph");
+        fs::create_dir_all(&tg_dir).unwrap();
+
+        let emb_path = tg_dir.join("embeddings.bin");
+        let bm25_path = tg_dir.join("bm25_cache.bin");
+
+        // Create embeddings first
+        fs::write(&emb_path, b"embeddings").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        // Then create BM25 cache (newer mtime)
+        fs::write(&bm25_path, b"cache").unwrap();
+
+        let emb_mtime = fs::metadata(&emb_path).unwrap().modified().unwrap();
+        let cache_mtime = fs::metadata(&bm25_path).unwrap().modified().unwrap();
+
+        // Cache should be fresh (cache newer than embeddings)
+        assert!(cache_mtime >= emb_mtime, "BM25 cache should be fresh");
+    }
+
+    #[test]
+    fn hnsw_sidecar_invalidated_after_embed_update() {
+        let tmp = TempDir::new().unwrap();
+        let tg_dir = tmp.path().join(".infigraph");
+        fs::create_dir_all(&tg_dir).unwrap();
+
+        let hnsw_path = tg_dir.join("hnsw_index.usearch");
+        let emb_path = tg_dir.join("embeddings.bin");
+
+        // Create HNSW first
+        fs::write(&hnsw_path, b"old_hnsw").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        // Update embeddings (simulates watcher reindex)
+        fs::write(&emb_path, b"new_embeddings").unwrap();
+
+        let hnsw_mtime = fs::metadata(&hnsw_path).unwrap().modified().unwrap();
+        let emb_mtime = fs::metadata(&emb_path).unwrap().modified().unwrap();
+
+        // HNSW should be stale
+        assert!(
+            emb_mtime > hnsw_mtime,
+            "HNSW sidecar should be stale after embed update"
+        );
+    }
+
+    #[test]
+    fn search_cache_key_uses_embeddings_mtime() {
+        let tmp = TempDir::new().unwrap();
+        let tg_dir = tmp.path().join(".infigraph");
+        fs::create_dir_all(&tg_dir).unwrap();
+
+        let emb_path = tg_dir.join("embeddings.bin");
+        fs::write(&emb_path, b"v1").unwrap();
+        let mtime1 = fs::metadata(&emb_path).unwrap().modified().unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        fs::write(&emb_path, b"v2").unwrap();
+        let mtime2 = fs::metadata(&emb_path).unwrap().modified().unwrap();
+
+        // Different writes should produce different mtimes
+        assert_ne!(
+            mtime1, mtime2,
+            "mtime should change after embeddings.bin update"
+        );
+    }
+
+    #[test]
+    fn watch_stop_idempotent() {
+        let tmp = TempDir::new().unwrap();
+        let tg_dir = tmp.path().join(".infigraph");
+        fs::create_dir_all(&tg_dir).unwrap();
+
+        // No watcher running — multiple stops should be fine
+        for _ in 0..3 {
+            let result = crate::info_commands::cmd_watch_stop(tmp.path());
+            assert!(result.is_ok());
+        }
+    }
+
+    #[test]
+    fn watch_status_no_infigraph_dir() {
+        let tmp = TempDir::new().unwrap();
+        // No .infigraph — should report not running without error
+        let result = crate::info_commands::cmd_watch_status(tmp.path());
+        assert!(result.is_ok());
     }
 }

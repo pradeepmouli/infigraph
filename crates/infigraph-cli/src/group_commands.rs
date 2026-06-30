@@ -116,6 +116,12 @@ pub(crate) fn cmd_group(root: &Path, action: GroupAction) -> Result<()> {
                 }
                 registry.register_repo(repo_name, &entry.path, &prism)?;
             }
+            // Auto-start watcher for each repo in group
+            for repo_name in &g.repos {
+                if let Some(entry) = registry.repos.get(repo_name) {
+                    crate::index::ensure_watcher_running(&entry.path);
+                }
+            }
             println!(
                 "\nDone. All {} repos in group '{}' indexed.",
                 g.repos.len(),
@@ -123,7 +129,25 @@ pub(crate) fn cmd_group(root: &Path, action: GroupAction) -> Result<()> {
             );
         }
         GroupAction::Combined { group } => {
-            println!("Combined graph for group '{}' not yet implemented", group);
+            let g = registry
+                .groups
+                .get(&group)
+                .context(format!("group '{}' not found", group))?;
+            println!(
+                "Building combined graph for group '{}' ({} repos)...",
+                group,
+                g.repos.len()
+            );
+            let (symbols, edges) =
+                infigraph_core::multi::combined::build_combined_graph(&registry, &group)?;
+            println!(
+                "Combined graph ready: {} symbols, {} edges (including cross-repo).",
+                symbols, edges
+            );
+            println!(
+                "Query with: infigraph group query {} '<cypher>' --combined",
+                group
+            );
         }
         GroupAction::Sync { group } => {
             let count = infigraph_core::multi::sync_group_contracts(
@@ -191,17 +215,97 @@ pub(crate) fn cmd_group(root: &Path, action: GroupAction) -> Result<()> {
                 count, group
             );
         }
-        GroupAction::Query { group, cypher } => {
-            let results = registry.group_query(&group, &cypher, bundled_registry)?;
-            for (repo, rows) in &results {
-                println!("--- {} ---", repo);
-                for row in rows {
+        GroupAction::Query {
+            group,
+            cypher,
+            combined,
+        } => {
+            if combined {
+                let rows = infigraph_core::multi::combined::combined_query(&group, &cypher)?;
+                for row in &rows {
                     println!("  {}", row.join(" | "));
+                }
+            } else {
+                let results = registry.group_query(&group, &cypher, bundled_registry)?;
+                for (repo, rows) in &results {
+                    println!("--- {} ---", repo);
+                    for row in rows {
+                        println!("  {}", row.join(" | "));
+                    }
                 }
             }
         }
-        GroupAction::Watch { group, .. } => {
-            println!("Watch for group '{}' not yet implemented", group);
+        GroupAction::Watch { group, debounce } => {
+            let g = registry
+                .groups
+                .get(&group)
+                .context(format!("group '{}' not found", group))?
+                .clone();
+
+            if g.repos.is_empty() {
+                println!("Group '{}' has no repos.", group);
+                return Ok(());
+            }
+
+            let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+            ctrlc::set_handler(move || {
+                let _ = stop_tx.send(());
+            })
+            .ok();
+
+            println!(
+                "Watching {} repos in group '{}' (debounce {}ms) — Ctrl-C to stop",
+                g.repos.len(),
+                group,
+                debounce
+            );
+
+            let mut handles = Vec::new();
+            for repo_name in &g.repos {
+                let entry = registry
+                    .repos
+                    .get(repo_name)
+                    .context(format!("repo '{}' not in registry", repo_name))?
+                    .clone();
+
+                let lock_path = entry.path.join(".infigraph").join("watch.lock");
+                let lock = crate::info_commands::acquire_watch_lock(&lock_path)?;
+
+                let repo_root = entry.path.clone();
+                let repo_label = repo_name.clone();
+                let thread_label = repo_name.clone();
+                let (local_stop_tx, local_stop_rx) = std::sync::mpsc::channel();
+                handles.push((repo_label, local_stop_tx, lock));
+
+                std::thread::spawn(move || {
+                    let err_label = thread_label.clone();
+                    let res = infigraph_core::watch::watch_project(
+                        &repo_root,
+                        bundled_registry,
+                        debounce,
+                        local_stop_rx,
+                        move |evt| {
+                            println!("[watch:{}] {evt}", thread_label);
+                        },
+                    );
+                    if let Err(e) = res {
+                        eprintln!("[watch:{}] error: {e}", err_label);
+                    }
+                });
+            }
+
+            // Block until Ctrl-C
+            let _ = stop_rx.recv();
+
+            // Signal all repo watchers to stop
+            for (name, tx, _lock) in &handles {
+                let _ = tx.send(());
+                println!("Stopping watcher for {}...", name);
+            }
+
+            // Give watchers time to exit
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            println!("All watchers stopped.");
         }
     }
 

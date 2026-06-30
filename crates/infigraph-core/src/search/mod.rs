@@ -25,6 +25,7 @@ const K1: f32 = 1.2;
 const B: f32 = 0.75;
 
 /// Simple BM25 scorer over symbol text (name + docstring).
+#[derive(Clone)]
 pub struct BM25Index {
     /// symbol_id -> text
     docs: Vec<(String, String)>,
@@ -103,6 +104,82 @@ impl BM25Index {
 
     pub fn doc_text(&self, idx: usize) -> &str {
         &self.docs[idx].1
+    }
+
+    pub fn save(&self, path: &Path) -> Result<()> {
+        let mut buf = Vec::new();
+        buf.push(1u8); // version
+        buf.extend_from_slice(&self.avg_doc_len.to_le_bytes());
+        buf.extend_from_slice(&(self.docs.len() as u32).to_le_bytes());
+        for (id, text) in &self.docs {
+            let id_b = id.as_bytes();
+            buf.extend_from_slice(&(id_b.len() as u32).to_le_bytes());
+            buf.extend_from_slice(id_b);
+            let text_b = text.as_bytes();
+            buf.extend_from_slice(&(text_b.len() as u32).to_le_bytes());
+            buf.extend_from_slice(text_b);
+        }
+        buf.extend_from_slice(&(self.inverted.len() as u32).to_le_bytes());
+        for (term, postings) in &self.inverted {
+            let tb = term.as_bytes();
+            buf.extend_from_slice(&(tb.len() as u32).to_le_bytes());
+            buf.extend_from_slice(tb);
+            buf.extend_from_slice(&(postings.len() as u32).to_le_bytes());
+            for &(doc_idx, tf) in postings {
+                buf.extend_from_slice(&(doc_idx as u32).to_le_bytes());
+                buf.extend_from_slice(&tf.to_le_bytes());
+            }
+        }
+        std::fs::write(path, &buf).map_err(|e| anyhow::anyhow!("write bm25 cache: {}", e))
+    }
+
+    pub fn load(path: &Path) -> Result<Self> {
+        let data = std::fs::read(path).map_err(|e| anyhow::anyhow!("read bm25 cache: {}", e))?;
+        anyhow::ensure!(
+            !data.is_empty() && data[0] == 1,
+            "unsupported bm25 cache version"
+        );
+        anyhow::ensure!(data.len() >= 9, "bm25 cache too small");
+        let avg_doc_len = f32::from_le_bytes(data[1..5].try_into().unwrap());
+        let doc_count = u32::from_le_bytes(data[5..9].try_into().unwrap()) as usize;
+        let mut pos = 9usize;
+        let mut docs = Vec::with_capacity(doc_count);
+        for _ in 0..doc_count {
+            let id_len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+            pos += 4;
+            let id = String::from_utf8_lossy(&data[pos..pos + id_len]).into_owned();
+            pos += id_len;
+            let text_len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+            pos += 4;
+            let text = String::from_utf8_lossy(&data[pos..pos + text_len]).into_owned();
+            pos += text_len;
+            docs.push((id, text));
+        }
+        let term_count = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+        pos += 4;
+        let mut inverted = HashMap::with_capacity(term_count);
+        for _ in 0..term_count {
+            let tl = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+            pos += 4;
+            let term = String::from_utf8_lossy(&data[pos..pos + tl]).into_owned();
+            pos += tl;
+            let pc = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+            pos += 4;
+            let mut postings = Vec::with_capacity(pc);
+            for _ in 0..pc {
+                let doc_idx = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+                pos += 4;
+                let tf = f32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
+                pos += 4;
+                postings.push((doc_idx, tf));
+            }
+            inverted.insert(term, postings);
+        }
+        Ok(Self {
+            docs,
+            inverted,
+            avg_doc_len,
+        })
     }
 }
 

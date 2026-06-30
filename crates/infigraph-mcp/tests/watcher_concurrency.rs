@@ -331,3 +331,124 @@ def get_users():
     stop_all_watchers();
     std::env::set_var("HOME", &orig_home);
 }
+
+/// MCP auto_start_watch should skip if CLI watcher holds the lock.
+#[test]
+fn test_mcp_skips_when_cli_lock_held() {
+    stop_all_watchers();
+    init_watchers();
+    let (_dir, path) = make_project(&[("main.py", "def hello(): pass")]);
+    tool_index_project(&json!({"path": &path})).unwrap();
+    stop_all_watchers();
+
+    // Simulate CLI watcher holding the lock
+    let lock_path = std::path::PathBuf::from(&path)
+        .join(".infigraph")
+        .join("watch.lock");
+    std::fs::create_dir_all(lock_path.parent().unwrap()).ok();
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .unwrap();
+    use fs2::FileExt;
+    lock_file.lock_exclusive().unwrap();
+
+    // MCP auto_start_watch should return None (skip)
+    let result = auto_start_watch(&path);
+    assert!(result.is_none(), "should skip when CLI lock held");
+
+    lock_file.unlock().unwrap();
+    stop_all_watchers();
+}
+
+/// MCP auto_start_watch should succeed when no CLI lock held.
+#[test]
+fn test_mcp_starts_when_no_cli_lock() {
+    stop_all_watchers();
+    init_watchers();
+    let (_dir, path) = make_project(&[("main.py", "def greet(): pass")]);
+    tool_index_project(&json!({"path": &path})).unwrap();
+
+    // tool_index_project auto-starts a watcher — stop it first
+    stop_all_watchers();
+
+    // Now manually start — should succeed with no CLI lock
+    let result = auto_start_watch(&path);
+    assert!(
+        result.is_some(),
+        "should start when no CLI lock, got None for path: {path}"
+    );
+
+    stop_all_watchers();
+}
+
+/// Search output should contain stale warning when no watcher running.
+#[test]
+fn test_stale_search_warning_no_watcher() {
+    stop_all_watchers();
+    init_watchers();
+    let (_dir, path) = make_project(&[("lib.py", "def compute(): return 42")]);
+    tool_index_project(&json!({"path": &path})).unwrap();
+
+    // tool_index_project auto-starts watcher — stop it
+    stop_all_watchers();
+
+    // Now search with no watcher — should include stale warning
+    let result = tool_search(&json!({"path": &path, "query": "compute"})).unwrap();
+    assert!(
+        result.contains("No file watcher running") || result.contains("stale"),
+        "search should warn about stale results, got: {result}"
+    );
+}
+
+/// Search output should NOT contain stale warning when MCP watcher running.
+#[test]
+fn test_no_stale_warning_with_mcp_watcher() {
+    stop_all_watchers();
+    init_watchers();
+    let (_dir, path) = make_project(&[("app.py", "def serve(): pass")]);
+    tool_index_project(&json!({"path": &path})).unwrap();
+    // tool_index_project already started a watcher — it should be active
+
+    let result = tool_search(&json!({"path": &path, "query": "serve"})).unwrap();
+    assert!(
+        !result.contains("No file watcher running"),
+        "should not warn when watcher is active, got: {result}"
+    );
+
+    stop_all_watchers();
+}
+
+/// Search output should NOT contain stale warning when CLI lock held.
+#[test]
+fn test_no_stale_warning_with_cli_watcher() {
+    stop_all_watchers();
+    init_watchers();
+    let (_dir, path) = make_project(&[("util.py", "def parse(): pass")]);
+    tool_index_project(&json!({"path": &path})).unwrap();
+    stop_all_watchers();
+
+    // Simulate CLI watcher holding lock
+    let lock_path = std::path::PathBuf::from(&path)
+        .join(".infigraph")
+        .join("watch.lock");
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .unwrap();
+    use fs2::FileExt;
+    lock_file.lock_exclusive().unwrap();
+
+    let result = tool_search(&json!({"path": &path, "query": "parse"})).unwrap();
+    assert!(
+        !result.contains("No file watcher running"),
+        "should not warn when CLI watcher holds lock"
+    );
+
+    lock_file.unlock().unwrap();
+    stop_all_watchers();
+}

@@ -2183,6 +2183,7 @@ dependencies = [
  "cozo",
  "ctrlc",
  "dirs 5.0.1",
+ "fs2",
  "infigraph-confluence",
  "infigraph-core",
  "infigraph-docs",
@@ -2191,10 +2192,12 @@ dependencies = [
  "infigraph-mcp",
  "infigraph-pipeline-plugin",
  "lbug",
+ "libc",
  "rayon",
  "serde",
  "serde_json",
  "sha2 0.10.9",
+ "tempfile",
  "ureq",
 ]
 
@@ -2225,6 +2228,7 @@ dependencies = [
  "glob",
  "ignore",
  "lbug",
+ "memmap2",
  "model2vec-rs",
  "notify",
  "parquet",
@@ -2354,6 +2358,7 @@ name = "infigraph-mcp"
 version = "1.6.0"
 dependencies = [
  "anyhow",
+ "fs2",
  "infigraph-confluence",
  "infigraph-core",
  "infigraph-docs",
