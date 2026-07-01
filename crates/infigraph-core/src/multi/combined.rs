@@ -42,8 +42,9 @@ pub fn build_combined_graph(registry: &Registry, group_name: &str) -> Result<(us
     let combined_store = GraphStore::open(&combined_path)?;
     let _lock = combined_store.write_lock()?;
     let combined_conn = combined_store.connection()?;
-    let tmp = std::env::temp_dir().join("ig_combined");
-    std::fs::create_dir_all(&tmp)?;
+    let tmp_dir =
+        tempfile::TempDir::new().context("failed to create temp dir for combined graph")?;
+    let tmp = tmp_dir.path().to_path_buf();
     let fwd = |p: &Path| p.to_string_lossy().replace('\\', "/");
 
     let mut total_symbols = 0usize;
@@ -208,7 +209,7 @@ pub fn build_combined_graph(registry: &Registry, group_name: &str) -> Result<(us
     let cross_resolved = resolve_cross_repo(&combined_store)?;
     total_edges += cross_resolved;
 
-    let _ = std::fs::remove_dir_all(&tmp);
+    drop(tmp_dir);
 
     eprintln!(
         "[combined] Done: {} symbols, {} edges ({} cross-repo)",

@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 use infigraph_core::lang::{LanguagePack, LanguageRegistry};
 use infigraph_core::multi::combined::{
@@ -7,6 +8,9 @@ use infigraph_core::multi::combined::{
 };
 use infigraph_core::multi::{Group, Registry, RepoEntry};
 use infigraph_core::Infigraph;
+
+// Tests set HOME env var which is process-global, so must run sequentially.
+static COMBINED_LOCK: Mutex<()> = Mutex::new(());
 
 const PYTHON_ENTITIES: &str = r#"
 (module
@@ -214,6 +218,7 @@ def health_check():
 
 #[test]
 fn test_build_combined_graph_merges_symbols() {
+    let _guard = COMBINED_LOCK.lock().unwrap();
     let home = tempfile::TempDir::new().unwrap();
     let orig_home = std::env::var("HOME").unwrap_or_default();
     let (registry, _dir_a, _dir_b) = setup_two_repo_group(&home);
@@ -227,6 +232,7 @@ fn test_build_combined_graph_merges_symbols() {
 
 #[test]
 fn test_has_combined_graph_true_after_build() {
+    let _guard = COMBINED_LOCK.lock().unwrap();
     let home = tempfile::TempDir::new().unwrap();
     let orig_home = std::env::var("HOME").unwrap_or_default();
     let (registry, _dir_a, _dir_b) = setup_two_repo_group(&home);
@@ -248,6 +254,7 @@ fn test_has_combined_graph_true_after_build() {
 
 #[test]
 fn test_combined_query_returns_symbols_from_both_repos() {
+    let _guard = COMBINED_LOCK.lock().unwrap();
     let home = tempfile::TempDir::new().unwrap();
     let orig_home = std::env::var("HOME").unwrap_or_default();
     let (registry, _dir_a, _dir_b) = setup_two_repo_group(&home);
@@ -284,6 +291,7 @@ fn test_combined_query_returns_symbols_from_both_repos() {
 
 #[test]
 fn test_combined_query_cross_repo_edges() {
+    let _guard = COMBINED_LOCK.lock().unwrap();
     let home = tempfile::TempDir::new().unwrap();
     let orig_home = std::env::var("HOME").unwrap_or_default();
     let (registry, _dir_a, _dir_b) = setup_two_repo_group(&home);
@@ -303,6 +311,7 @@ fn test_combined_query_cross_repo_edges() {
 
 #[test]
 fn test_combined_graph_rebuild_replaces_old() {
+    let _guard = COMBINED_LOCK.lock().unwrap();
     let home = tempfile::TempDir::new().unwrap();
     let orig_home = std::env::var("HOME").unwrap_or_default();
     let (registry, _dir_a, _dir_b) = setup_two_repo_group(&home);
@@ -318,6 +327,7 @@ fn test_combined_graph_rebuild_replaces_old() {
 
 #[test]
 fn test_combined_graph_path_under_home() {
+    let _guard = COMBINED_LOCK.lock().unwrap();
     let home = tempfile::TempDir::new().unwrap();
     let orig_home = std::env::var("HOME").unwrap_or_default();
     std::env::set_var("HOME", home.path());
@@ -337,6 +347,7 @@ fn test_combined_graph_path_under_home() {
 
 #[test]
 fn test_combined_query_before_build_errors() {
+    let _guard = COMBINED_LOCK.lock().unwrap();
     let home = tempfile::TempDir::new().unwrap();
     let orig_home = std::env::var("HOME").unwrap_or_default();
     std::env::set_var("HOME", home.path());
@@ -355,6 +366,7 @@ fn test_combined_query_before_build_errors() {
 
 #[test]
 fn test_build_combined_graph_unknown_group_errors() {
+    let _guard = COMBINED_LOCK.lock().unwrap();
     let home = tempfile::TempDir::new().unwrap();
     let orig_home = std::env::var("HOME").unwrap_or_default();
     std::env::set_var("HOME", home.path());
@@ -368,6 +380,7 @@ fn test_build_combined_graph_unknown_group_errors() {
 
 #[test]
 fn test_combined_graph_contains_modules() {
+    let _guard = COMBINED_LOCK.lock().unwrap();
     let home = tempfile::TempDir::new().unwrap();
     let orig_home = std::env::var("HOME").unwrap_or_default();
     let (registry, _dir_a, _dir_b) = setup_two_repo_group(&home);
@@ -382,6 +395,7 @@ fn test_combined_graph_contains_modules() {
 
 #[test]
 fn test_combined_graph_contains_files() {
+    let _guard = COMBINED_LOCK.lock().unwrap();
     let home = tempfile::TempDir::new().unwrap();
     let orig_home = std::env::var("HOME").unwrap_or_default();
     let (registry, _dir_a, _dir_b) = setup_two_repo_group(&home);
