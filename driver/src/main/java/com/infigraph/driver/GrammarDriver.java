@@ -9,10 +9,15 @@ import org.antlr.v4.runtime.tree.*;
 import com.infigraph.driver.extractors.BaseExtractor;
 
 import java.io.*;
+import java.net.URLClassLoader;
 import java.nio.file.*;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.regex.*;
+import javax.tools.JavaCompiler;
+import javax.tools.JavaFileObject;
+import javax.tools.StandardJavaFileManager;
+import javax.tools.ToolProvider;
 
 public class GrammarDriver {
 
@@ -43,6 +48,105 @@ public class GrammarDriver {
             this.file = file;
             this.originalLine = originalLine;
         }
+    }
+
+    // Cache compiled extractor classes by absolute .java source path, so
+    // batch mode's per-file newInstance() reuse doesn't trigger a recompile.
+    private static final Map<String, Class<?>> extractorClassCache = new ConcurrentHashMap<>();
+
+    /**
+     * Resolves the extractor spec (either "GenericExtractor" or an absolute
+     * path to a .java source file) into a BaseExtractor instance.
+     * .java files are compiled on the fly via the JDK compiler API and
+     * loaded via URLClassLoader — no build step required from the caller.
+     */
+    private static BaseExtractor resolveExtractor(String extractorSpec) throws Exception {
+        if ("GenericExtractor".equals(extractorSpec)) {
+            return new com.infigraph.driver.extractors.GenericExtractor();
+        }
+        if (!extractorSpec.endsWith(".java")) {
+            throw new IllegalArgumentException(
+                "Unsupported extractor '" + extractorSpec + "': must be 'GenericExtractor' "
+                + "or an absolute path to a .java source file");
+        }
+        Class<?> cls = extractorClassCache.get(extractorSpec);
+        if (cls == null) {
+            cls = compileExtractor(extractorSpec);
+            extractorClassCache.put(extractorSpec, cls);
+        }
+        return (BaseExtractor) cls.getDeclaredConstructor().newInstance();
+    }
+
+    private static Class<?> compileExtractor(String javaSourcePath) throws Exception {
+        Path sourcePath = Paths.get(javaSourcePath);
+        if (!Files.exists(sourcePath)) {
+            throw new FileNotFoundException("Extractor source not found: " + javaSourcePath);
+        }
+
+        JavaCompiler compiler = ToolProvider.getSystemJavaCompiler();
+        if (compiler == null) {
+            throw new IllegalStateException(
+                "No Java compiler available (running on a JRE, not a JDK). "
+                + "Custom .java extractors require a JDK to compile on load: " + javaSourcePath);
+        }
+
+        Path outDir = Files.createTempDirectory("infigraph-extractor-");
+        String driverClasspath = System.getProperty("java.class.path");
+
+        StringWriter diagnostics = new StringWriter();
+        try (StandardJavaFileManager fm = compiler.getStandardFileManager(null, null, null)) {
+            Iterable<? extends JavaFileObject> units =
+                fm.getJavaFileObjectsFromStrings(List.of(javaSourcePath));
+            List<String> options = List.of(
+                "-cp", driverClasspath,
+                "-d", outDir.toString());
+            boolean ok = compiler.getTask(
+                new PrintWriter(diagnostics), fm, null, options, null, units).call();
+            if (!ok) {
+                throw new IllegalStateException(
+                    "Failed to compile extractor '" + javaSourcePath + "':\n" + diagnostics);
+            }
+        }
+
+        String className = sourcePath.getFileName().toString().replace(".java", "");
+        URLClassLoader loader = new URLClassLoader(
+            new java.net.URL[]{outDir.toUri().toURL()},
+            GrammarDriver.class.getClassLoader());
+        return Class.forName(className, true, loader);
+    }
+
+    /**
+     * Reads a source file as UTF-8, falling back to ISO-8859-1 (Latin-1) if
+     * the bytes aren't valid UTF-8. Legacy DSL source trees mix encodings
+     * file-by-file; Latin-1 never throws (every byte sequence is valid), so
+     * it's a safe universal fallback rather than crashing on the first
+     * non-ASCII byte a file happens to contain.
+     */
+    private static String readSourceFile(Path path) throws IOException {
+        byte[] bytes = Files.readAllBytes(path);
+        try {
+            java.nio.CharBuffer decoded = java.nio.charset.StandardCharsets.UTF_8.newDecoder()
+                .onMalformedInput(java.nio.charset.CodingErrorAction.REPORT)
+                .onUnmappableCharacter(java.nio.charset.CodingErrorAction.REPORT)
+                .decode(java.nio.ByteBuffer.wrap(bytes));
+            return decoded.toString();
+        } catch (java.nio.charset.CharacterCodingException e) {
+            return new String(bytes, java.nio.charset.StandardCharsets.ISO_8859_1);
+        }
+    }
+
+    /**
+     * Describes an exception for user-facing error messages. Falls back to
+     * the exception's class name + originating stack frame when getMessage()
+     * is null (common for NullPointerException), so a bug in a customer's
+     * extractor is diagnosable instead of reporting an empty error.
+     */
+    private static String describeException(Exception e) {
+        String msg = e.getMessage();
+        if (msg != null && !msg.isEmpty()) return msg;
+        StackTraceElement[] trace = e.getStackTrace();
+        String at = trace.length > 0 ? " at " + trace[0] : "";
+        return e.getClass().getName() + at;
     }
 
     private static void applySourceMap(BaseExtractor.ExtractContext ctx, Map<Integer, SourceMapping> sourceMap) {
@@ -88,7 +192,7 @@ public class GrammarDriver {
             try {
                 driver.handleRequest(line);
             } catch (Exception e) {
-                driver.sendError(e.getMessage());
+                driver.sendError(describeException(e));
             }
         }
     }
@@ -146,9 +250,15 @@ public class GrammarDriver {
                 extensions = val;
             } else if (line.startsWith("extractor")) {
                 extractorClass = line.split("=", 2)[1].trim().replace("\"", "");
+                if (extractorClass.endsWith(".java")) {
+                    extractorClass = gDir.resolve(extractorClass).toString();
+                }
             } else if (line.startsWith("preprocessor") && !line.contains("_")) {
                 String val = line.split("=", 2)[1].trim().replace("\"", "");
                 if ("c".equals(val) && preprocessorCmd == null) preprocessorCmd = "mcpp -W0";
+            } else if (line.startsWith("pipe_strings")) {
+                String val = line.split("=", 2)[1].trim();
+                pipeStrings = pipeStrings || "true".equals(val);
             }
         }
         if (lexerFile == null || parserFile == null) {
@@ -196,12 +306,7 @@ public class GrammarDriver {
         }
 
         if (extractorClass != null) {
-            if ("GenericExtractor".equals(extractorClass)) {
-                loaded.extractor = new com.infigraph.driver.extractors.GenericExtractor();
-            } else {
-                Class<?> cls = Class.forName("com.infigraph.driver.extractors." + extractorClass);
-                loaded.extractor = (BaseExtractor) cls.getDeclaredConstructor().newInstance();
-            }
+            loaded.extractor = resolveExtractor(extractorClass);
         }
 
         grammars.put("batch", loaded);
@@ -254,7 +359,7 @@ public class GrammarDriver {
             pool.submit(() -> {
                 String filePath = files.get(idx).toString();
                 try {
-                    String source = Files.readString(files.get(idx));
+                    String source = readSourceFile(files.get(idx));
                     Map<Integer, SourceMapping> sourceMap = null;
                     if (pp != null) {
                         sourceMap = new HashMap<>();
@@ -330,7 +435,7 @@ public class GrammarDriver {
                 } catch (Exception e) {
                     results[idx] = new String[]{
                         "{\"file\":\"" + escapeJson(filePath) +
-                        "\",\"error\":\"" + escapeJson(e.getMessage()) + "\"}"
+                        "\",\"error\":\"" + escapeJson(describeException(e)) + "\"}"
                     };
                 } finally {
                     latch.countDown();
@@ -457,8 +562,7 @@ public class GrammarDriver {
             loaded.extractor = parseGenericExtractor(mappings);
         } else {
             try {
-                Class<?> cls = Class.forName("com.infigraph.driver.extractors." + className);
-                loaded.extractor = (BaseExtractor) cls.getDeclaredConstructor().newInstance();
+                loaded.extractor = resolveExtractor(className);
             } catch (Exception e) {
                 sendError("Failed to load extractor '" + className + "': " + e.getMessage());
                 return;
@@ -613,8 +717,14 @@ public class GrammarDriver {
 
         BaseExtractor.ExtractContext ctx = new BaseExtractor.ExtractContext(file, loaded.ruleNames, source);
         applySourceMap(ctx, sourceMap);
-        loaded.extractor.init(ctx, source);
-        loaded.extractor.extract(tree, tokens, ctx);
+        try {
+            loaded.extractor.init(ctx, source);
+            loaded.extractor.extract(tree, tokens, ctx);
+        } catch (Exception e) {
+            sendError("Extractor '" + loaded.extractor.getClass().getSimpleName()
+                + "' failed on file '" + file + "': " + describeException(e));
+            return;
+        }
 
         if (loaded.emitReferencedFormImports) {
             for (String formName : ctx.referencedForms) {
@@ -682,7 +792,7 @@ public class GrammarDriver {
             if (file.isEmpty()) continue;
             String f = file;
             futures.put(f, pool.submit(() -> {
-                String source = Files.readString(Paths.get(f));
+                String source = readSourceFile(Paths.get(f));
                 Map<Integer, SourceMapping> sm = null;
                 if (loaded.preprocessor != null) {
                     sm = new HashMap<>();
@@ -975,7 +1085,7 @@ public class GrammarDriver {
                     if (resolved != null && !includedFiles.contains(resolved)) {
                         includedFiles.add(resolved);
                         try {
-                            String content = Files.readString(Paths.get(resolved));
+                            String content = readSourceFile(Paths.get(resolved));
                             String[] incLines = content.split("\n", -1);
                             processLines(incLines, resolved, defs, includePaths,
                                 sourceMap, out, ifStack, 1, includedFiles);

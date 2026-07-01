@@ -98,7 +98,7 @@ python3 tests/test_grammar_plugins.py
 | `fallback_entry_rules` | No | Array of fallback rules to try if `entry_rule` produces parse errors (useful for fragment files) |
 | `lexer` | Yes | Lexer grammar filename |
 | `parser` | Yes | Parser grammar filename |
-| `extractor` | No | Custom Java extractor class name (omit to use GenericExtractor) |
+| `extractor` | No | Path to a custom `.java` extractor source file, e.g. `"MyExtractor.java"` (omit to use GenericExtractor) |
 | `emit_referenced_form_imports` | No | If `true`, generates `Imports` relations for cross-file references |
 
 ### `[[extract.symbols]]` — Symbol extraction rules
@@ -210,15 +210,16 @@ include_paths = ["includes/", "shared/"]
 
 ## Advanced: Custom Java Extractors
 
-For complex extraction logic that can't be expressed in TOML (synthetic names, custom string processing, conditional logic), write a custom Java extractor.
+For complex extraction logic that can't be expressed in TOML (synthetic names, cross-form field reads, custom string processing, conditional logic), write a custom Java extractor.
 
-Set `extractor = "YourExtractor"` in `[language]` and omit the `[extract]` section.
+**No build step required.** Write a plain `.java` source file, put it next to your `plugin.toml`, and set `extractor` to its filename. The driver compiles it on load (via the JDK compiler API) and loads the result — you never run `javac` yourself, and there's no jar to build or ship. This requires a **JDK** on the machine running the driver, not just a JRE (`java -version` alone isn't enough — you also need `javac`).
 
-Create `driver/src/main/java/com/infigraph/driver/extractors/YourExtractor.java`:
+Set `extractor = "YourExtractor.java"` in `[language]` and omit the `[extract]` section. The path resolves relative to `plugin.toml`'s directory.
+
+Create `YourExtractor.java` next to `plugin.toml`:
 
 ```java
-package com.infigraph.driver.extractors;
-
+import com.infigraph.driver.extractors.BaseExtractor;
 import org.antlr.v4.runtime.*;
 import org.antlr.v4.runtime.tree.*;
 
@@ -247,6 +248,16 @@ public class YourExtractor extends BaseExtractor {
 }
 ```
 
+No `package` declaration — the file is compiled standalone against the driver's own classpath (`BaseExtractor` and the ANTLR runtime are resolvable via `import`, but your class itself stays in the default package). The class name must match the filename, same as any Java source file.
+
+### Class name resolution
+
+The compiled class name is derived from the filename: `MyExtractor.java` → class `MyExtractor`. If your source declares a different public class name than the filename, compilation will fail — keep them matching.
+
+### Compiled-class caching
+
+The driver compiles a given `.java` path once per process and reuses the compiled class for every subsequent `set_extractor` call or batch-mode file — editing the `.java` file requires restarting the driver process to pick up the change (there's no file-watching/hot-reload).
+
 ### BaseExtractor Helpers
 
 | Method | Description |
@@ -255,13 +266,16 @@ public class YourExtractor extends BaseExtractor {
 | `findChildRawText(tree, ruleName, ruleNames)` | First child matching rule name → text |
 | `findChildRawTextByIndex(tree, ruleName, index, ruleNames)` | Nth child matching rule name → text |
 | `collectRawText(tree)` | Full text of tree node (used for signature hashing) |
-| `ctx.pushSymbol(name, kind, sL, sC, eL, eC, signature, formQualified)` | Emit a symbol |
-| `ctx.pushRelation(targetName, kind, sL, sC, eL, eC)` | Emit a relation |
+| `ctx.pushSymbol(name, kind, sL, sC, eL, eC, signature, formQualified)` | Emit a symbol. If `formQualified` is true and form names were scanned via `parseFormNames`, emits one symbol per known form instead of a single scoped symbol |
+| `ctx.pushRelation(targetName, kind, sL, sC, eL, eC)` | Emit a relation targeting a name in the current file/scope |
+| `ctx.pushFormQualifiedRelation(formName, fieldName, kind, sL, sC, eL, eC, trackRef)` | Emit a relation targeting `FORMNAME::fieldName` in another form — use for `Form.Field` cross-form reads. Set `trackRef=true` to also register the form in `ctx.referencedForms` (feeds `emit_referenced_form_imports`) |
 | `ctx.scopeStack.push(name)` / `ctx.currentScope()` | Manage nested scope |
+
+`BaseExtractor` only provides helpers that return **text** from a matched child (`findChildRawText` and friends) — there's no built-in helper that returns the child **tree node** itself. If you need to walk further into a specific child (e.g. to call `collectRawText` on just that subtree, or to look for a grandchild), write a small local helper that mirrors `findChildRawText`'s loop but returns the `ParseTree` instead of calling `collectRawText`/`collectText` on it.
 
 ### processRule return value
 
-- **`return true`** — this rule creates a scope. Children are visited, scope auto-pops on exit.
+- **`return true`** — this rule creates a scope. Children are visited, scope auto-pops on exit. Only return `true` if you actually pushed something onto `ctx.scopeStack` — returning `true` without a matching push will throw when the walker tries to pop an empty stack.
 - **`return false`** — children are still visited, but no scope management.
 
 ## JVM Driver JSON IPC Protocol
@@ -275,10 +289,11 @@ The driver accepts JSON commands on stdin and responds on stdout. One JSON objec
 {"cmd": "load", "id": "mygrammar", "lexer": "path/Lexer.g4", "parser": "path/Parser.g4", "entry_rule": "program", "preprocessor_cmd": "mcpp -W0", "preprocessor_pipe_strings": "true"}
 ```
 
-**`set_extractor`** — Set custom Java extractor
+**`set_extractor`** — Set custom Java extractor (compiled on load from source)
 ```json
-{"cmd": "set_extractor", "id": "mygrammar", "class": "MyExtractor"}
+{"cmd": "set_extractor", "id": "mygrammar", "class": "/absolute/path/to/MyExtractor.java"}
 ```
+The `class` field must be an absolute path ending in `.java`, or the literal string `"GenericExtractor"`. Bare class names (e.g. `"MyExtractor"` with no `.java` suffix and no path) are rejected — this is the only accepted syntax.
 
 **`set_extractor` (generic)** — Set GenericExtractor with pipe-delimited mappings
 ```json
@@ -365,7 +380,6 @@ Project grammars override global, global overrides bundled.
 
 - [ ] `plugin.toml` with correct `entry_rule`, `lexer`, `parser`
 - [ ] `.g4` files parse clean in ANTLR4
-- [ ] `[extract]` section defines symbol and relation mappings (or `extractor` for custom Java)
-- [ ] `bash driver/build.sh` compiles without errors
+- [ ] `[extract]` section defines symbol and relation mappings, or `extractor = "YourExtractor.java"` for custom Java (no separate build step — the driver compiles it on load, but a JDK must be present)
 - [ ] `python3 tests/test_grammar_plugins.py` passes
 - [ ] Smoke test: `infigraph index` picks up files and extracts symbols

@@ -8,6 +8,13 @@ pub struct GrammarDriver {
     inner: Mutex<DriverInner>,
 }
 
+pub struct LoadGrammarOptions<'a> {
+    pub entry_rule: &'a str,
+    pub preprocessor: Option<&'a str>,
+    pub emit_referenced_form_imports: bool,
+    pub pipe_strings: bool,
+}
+
 struct DriverInner {
     child: Child,
     reader: BufReader<std::process::ChildStdout>,
@@ -51,25 +58,29 @@ impl GrammarDriver {
         id: &str,
         lexer_path: &str,
         parser_path: &str,
-        entry_rule: &str,
-        preprocessor: Option<&str>,
-        emit_referenced_form_imports: bool,
+        opts: &LoadGrammarOptions,
     ) -> Result<()> {
         let mut req = serde_json::json!({
             "cmd": "load",
             "id": id,
             "lexer": lexer_path,
             "parser": parser_path,
-            "entry_rule": entry_rule,
+            "entry_rule": opts.entry_rule,
         });
-        if let Some(pp) = preprocessor {
+        if let Some(pp) = opts.preprocessor {
             req.as_object_mut()
                 .unwrap()
                 .insert("preprocessor".into(), serde_json::json!(pp));
         }
-        if emit_referenced_form_imports {
+        if opts.emit_referenced_form_imports {
             req.as_object_mut().unwrap().insert(
                 "emit_referenced_form_imports".into(),
+                serde_json::json!("true"),
+            );
+        }
+        if opts.pipe_strings {
+            req.as_object_mut().unwrap().insert(
+                "preprocessor_pipe_strings".into(),
                 serde_json::json!("true"),
             );
         }

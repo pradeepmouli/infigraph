@@ -25,6 +25,8 @@ pub struct LanguageMeta {
     pub extractor: String,
     #[serde(default)]
     pub emit_referenced_form_imports: bool,
+    #[serde(default)]
+    pub pipe_strings: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -72,10 +74,13 @@ impl GrammarPlugin {
             &self.config.language.entry_rule,
             self.config.language.preprocessor.as_deref(),
             self.config.language.emit_referenced_form_imports,
+            self.config.language.pipe_strings,
         )?;
 
+        let resolved_extractor =
+            resolve_extractor(&self.plugin_dir, &self.config.language.extractor)?;
         self.driver
-            .set_extractor(&self.config.language.name, &self.config.language.extractor)?;
+            .set_extractor(&self.config.language.name, &resolved_extractor)?;
 
         Ok(())
     }
@@ -232,6 +237,22 @@ pub fn discover_plugins(plugins_dir: &Path) -> Result<Vec<(GrammarPluginConfig, 
     Ok(plugins)
 }
 
+/// Resolves the `extractor` field to what the driver expects: a `.java`
+/// source file is resolved to an absolute path next to `plugin.toml` (the
+/// driver compiles it on load); anything else (e.g. `"GenericExtractor"`)
+/// passes through unchanged.
+fn resolve_extractor(plugin_dir: &Path, extractor: &str) -> Result<String> {
+    if extractor.ends_with(".java") {
+        plugin_dir
+            .join(extractor)
+            .to_str()
+            .context("Invalid extractor path")
+            .map(str::to_string)
+    } else {
+        Ok(extractor.to_string())
+    }
+}
+
 fn parse_symbol_kind(s: &str) -> SymbolKind {
     match s {
         "Function" => SymbolKind::Function,
@@ -344,6 +365,24 @@ extractor = "PlSqlExtractor"
         let config: GrammarPluginConfig = toml::from_str(toml_str).unwrap();
         assert!(config.language.preprocessor.is_none());
         assert!(!config.language.emit_referenced_form_imports);
+        assert!(!config.language.pipe_strings);
+    }
+
+    #[test]
+    fn test_plugin_config_pipe_strings_enabled() {
+        let toml_str = r#"
+[language]
+name = "interview"
+extensions = [".int"]
+entry_rule = "program"
+lexer = "InterviewLexer.g4"
+parser = "InterviewParser.g4"
+extractor = "InterviewExtractor.java"
+preprocessor = "c"
+pipe_strings = true
+"#;
+        let config: GrammarPluginConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.language.pipe_strings);
     }
 
     #[test]
@@ -366,6 +405,20 @@ emit_referenced_form_imports = true
         );
         assert_eq!(config.language.extractor, "Vb6Extractor");
         assert!(config.language.emit_referenced_form_imports);
+    }
+
+    #[test]
+    fn test_resolve_extractor_java_source_resolves_to_absolute_path() {
+        let plugin_dir = Path::new("/plugins/interview");
+        let resolved = resolve_extractor(plugin_dir, "InterviewExtractor.java").unwrap();
+        assert_eq!(resolved, "/plugins/interview/InterviewExtractor.java");
+    }
+
+    #[test]
+    fn test_resolve_extractor_generic_extractor_passes_through() {
+        let plugin_dir = Path::new("/plugins/interview");
+        let resolved = resolve_extractor(plugin_dir, "GenericExtractor").unwrap();
+        assert_eq!(resolved, "GenericExtractor");
     }
 
     #[test]
