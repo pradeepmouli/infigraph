@@ -646,7 +646,10 @@ pub fn combined_query(group_name: &str, cypher: &str) -> Result<Vec<Vec<String>>
 }
 
 pub fn combined_graph_path(group_name: &str) -> Result<PathBuf> {
-    let home = dirs_next::home_dir().context("cannot determine home directory")?;
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .or_else(dirs_next::home_dir)
+        .context("cannot determine home directory")?;
     Ok(home
         .join(".infigraph")
         .join("groups")

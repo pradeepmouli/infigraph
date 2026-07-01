@@ -416,6 +416,9 @@ pub fn index_group(
 }
 
 fn registry_path() -> Result<PathBuf> {
-    let home = dirs_next::home_dir().context("cannot determine home directory")?;
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .or_else(dirs_next::home_dir)
+        .context("cannot determine home directory")?;
     Ok(home.join(".infigraph").join("registry.json"))
 }
