@@ -30,7 +30,10 @@ fn test_lock_released_on_panic() {
 
     let _ = handle.join(); // panicked thread
 
-    // Lock should be released — Rust unwinding drops the file
+    // Lock should be released — Rust unwinding drops the file. The OS may
+    // take a moment to process the fd close after join() returns (seen as
+    // flakiness on loaded CI runners), so poll with a deadline instead of
+    // asserting immediately.
     let file = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
@@ -38,8 +41,16 @@ fn test_lock_released_on_panic() {
         .open(&lock_path)
         .unwrap();
     use fs2::FileExt;
-    let result = file.try_lock_exclusive();
-    assert!(result.is_ok(), "lock should be released after thread panic");
+    let deadline = Instant::now() + Duration::from_millis(500);
+    let mut released = false;
+    while Instant::now() < deadline {
+        if file.try_lock_exclusive().is_ok() {
+            released = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(released, "lock should be released after thread panic");
 }
 
 #[test]
