@@ -124,6 +124,28 @@ impl GraphStore {
         Ok(())
     }
 
+    /// Remove all files whose path starts with the given prefix (handles directory removal).
+    pub fn remove_files_by_prefix(&self, prefix: &str) -> Result<usize> {
+        let _lock = self.write_lock()?;
+        let conn = self.connection()?;
+        let escaped = escape(prefix);
+        let result = conn
+            .query(&format!(
+                "MATCH (f:File) WHERE f.id STARTS WITH '{escaped}' RETURN f.id"
+            ))
+            .map_err(|e| anyhow::anyhow!("query files by prefix: {e}"))?;
+        let mut files = Vec::new();
+        for row in result {
+            if let Some(val) = row.first() {
+                files.push(val.to_string());
+            }
+        }
+        for f in &files {
+            self.remove_file_conn(&conn, f)?;
+        }
+        Ok(files.len())
+    }
+
     /// Return map of file path -> content_hash for all indexed modules.
     /// Used by incremental indexing to skip unchanged files.
     pub fn get_file_hashes(&self) -> Result<HashMap<String, String>> {

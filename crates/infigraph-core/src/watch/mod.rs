@@ -212,6 +212,8 @@ where
                         WatchEventKind::Removed => {
                             if let Ok(prism) = open_transient(root, &make_registry) {
                                 let _ = prism.remove_file(&path);
+                                // Also remove files under this path (handles directory removal)
+                                let _ = prism.remove_files_by_prefix(&path);
                             }
                             changes_since_periodic += 1;
                             on_event(WatchEvent {

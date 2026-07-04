@@ -154,6 +154,28 @@ impl DocIndex {
             embed::update_doc_embeddings(store, &self.root, &all_chunks, &changed_files)?;
         }
 
+        // Prune stale docs: remove entries for files that no longer exist on disk
+        {
+            let current_files: std::collections::HashSet<String> = files
+                .iter()
+                .filter_map(|p| {
+                    p.strip_prefix(&self.root)
+                        .ok()
+                        .map(|r| r.to_string_lossy().replace('\\', "/"))
+                })
+                .collect();
+            let stale: Vec<String> = existing_hashes
+                .keys()
+                .filter(|k| !current_files.contains(k.as_str()))
+                .cloned()
+                .collect();
+            if !stale.is_empty() {
+                eprintln!("Doc pruning: removing {} stale doc(s)", stale.len());
+                let stale_refs: Vec<&str> = stale.iter().map(|s| s.as_str()).collect();
+                let _ = store.delete_docs_by_ids(&stale_refs);
+            }
+        }
+
         // Extract links from indexed docs and create LINKS_TO edges
         if !results.is_empty() {
             let all_doc_ids: std::collections::HashSet<String> = {

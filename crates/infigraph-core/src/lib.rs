@@ -200,6 +200,30 @@ impl Infigraph {
             store.upsert_folders_bulk_conn(&conn, &file_paths)?;
         }
 
+        // Prune stale files: remove entries for files that no longer exist on disk
+        {
+            let current_files: std::collections::HashSet<String> = files
+                .iter()
+                .filter_map(|p| {
+                    p.strip_prefix(&self.root)
+                        .ok()
+                        .map(|r| r.to_string_lossy().replace('\\', "/"))
+                })
+                .collect();
+            let stale: Vec<String> = existing_hashes
+                .keys()
+                .filter(|k| !current_files.contains(k.as_str()))
+                .cloned()
+                .collect();
+            if !stale.is_empty() {
+                eprintln!("[index] pruning {} stale file(s) from graph", stale.len());
+                let conn = store.connection()?;
+                for f in &stale {
+                    let _ = store.remove_file_conn(&conn, f);
+                }
+            }
+        }
+
         // resolve runs under the same write lock (creates CALLS/INHERITS edges)
         let resolve_stats = resolve::resolve_calls_incremental(store, &extractions, None)
             .unwrap_or_else(|e| {
@@ -396,6 +420,26 @@ impl Infigraph {
             path.to_string_lossy().replace('\\', "/")
         };
         store.remove_file(&rel)
+    }
+
+    /// Remove all indexed files whose relative path starts with the given prefix.
+    /// Handles directory removal where individual file Remove events may not fire.
+    pub fn remove_files_by_prefix(&self, path: &Path) -> Result<usize> {
+        let store = self.store.as_ref().context("call init() first")?;
+        let rel = if path.is_absolute() {
+            path.strip_prefix(&self.root)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .replace('\\', "/")
+        } else {
+            path.to_string_lossy().replace('\\', "/")
+        };
+        let prefix = if rel.ends_with('/') {
+            rel
+        } else {
+            format!("{rel}/")
+        };
+        store.remove_files_by_prefix(&prefix)
     }
 
     fn collect_files(&self) -> Result<Vec<PathBuf>> {
