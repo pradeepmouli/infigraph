@@ -44,6 +44,14 @@ case "$tool" in
         ;;
     esac
     ;;
+  Read)
+    file_path=$(echo "$input" | jq -r '.tool_input.file_path // empty')
+    if echo "$file_path" | grep -qE '\.(rs|ts|tsx|js|jsx|py|go|java|c|cpp|h|hpp|cs|rb|swift|kt)$'; then
+      cat <<'ENDJSON'
+{"hookSpecificOutput":{"hookEventName":"PreToolUse","additionalContext":"INFIGRAPH HINT: You are reading a code file with Read. Prefer mcp__infigraph__get_doc_context (returns source+callers+callees) or mcp__infigraph__get_code_snippet for code understanding. Only use Read when you need exact line numbers for the Edit tool."}}
+ENDJSON
+    fi
+    ;;
 esac
 
 exit 0
@@ -75,7 +83,7 @@ echo "$count" > "$counter_file"
 
 if [ $((count % 5)) -eq 0 ]; then
   cat <<'ENDJSON'
-{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":"INFIGRAPH SESSION SAVE: You have NOT called save_session in the last 5 exchanges. Call mcp__infigraph__save_session NOW with a summary of work done so far, pending tasks, and decisions made. Do NOT defer this."}}
+{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":"MANDATORY AUTO-SAVE: Print '💾 Auto-saving session...' to the user, then IMMEDIATELY call mcp__infigraph__save_session with summary, pending_tasks, decisions, and narrative from the current session. Do this BEFORE answering the user's question. After saving, print '✅ Session saved.' and continue with the user's request. This is automatic — do NOT ask permission, do NOT skip, do NOT defer."}}
 ENDJSON
 fi
 
@@ -125,6 +133,12 @@ ENDJSON
 ENDJSON
     ;;
   clear)
+    # Reset exchange counters on /clear
+    session_id=$(echo "$input" | jq -r '.session_id // empty')
+    if [ -n "$session_id" ]; then
+      echo "0" > "${TMPDIR:-/tmp}/infigraph-sessions/$session_id.count" 2>/dev/null
+      echo "0" > "${TMPDIR:-/tmp}/claude-clear-suggest/$session_id.count" 2>/dev/null
+    fi
     backup=$(ls -t "$cwd"/.infigraph/sessions/unsaved-transcript-*.md 2>/dev/null | head -1)
     if [ -n "$backup" ]; then
       cat <<ENDJSON
@@ -226,7 +240,7 @@ echo "$count" > "$counter_file"
 
 if [ $((count % 5)) -eq 0 ]; then
   cat <<'ENDJSON'
-{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":"CONTEXT CLEANUP: 5 turns since last reminder. Suggest running /clear to keep context lean. Ask user yes/no — only proceed if confirmed. ALWAYS call save_session before clearing."}}
+{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":"MANDATORY VISIBLE ACTION — CONTEXT CLEANUP: You MUST print this message verbatim to the user RIGHT NOW before doing anything else:\n\n---\n🧹 **Context getting long** — type `/clear` to reset. Session was auto-saved.\n---\n\nDo NOT skip this message. Do NOT silently absorb it. The user MUST see it in the chat output. After printing, continue with the user's request."}}
 ENDJSON
 fi
 
@@ -263,7 +277,7 @@ pub(crate) fn install_enforcement_hook(home: &std::path::Path) -> Result<()> {
     }
 
     let hook_entry = json!({
-        "matcher": "Grep|Glob|Bash|Agent",
+        "matcher": "Grep|Glob|Bash|Agent|Read",
         "hooks": [{
             "type": "command",
             "command": hook_path.to_string_lossy(),
@@ -301,7 +315,7 @@ pub(crate) fn install_enforcement_hook(home: &std::path::Path) -> Result<()> {
         std::fs::write(&settings_path, pretty)?;
         println!("  Added PreToolUse hook to {}", settings_path.display());
     } else {
-        let expected_matcher = "Grep|Glob|Bash|Agent";
+        let expected_matcher = "Grep|Glob|Bash|Agent|Read";
         let mut arr = pre_tool;
         let mut updated = false;
         for entry in arr.iter_mut() {
