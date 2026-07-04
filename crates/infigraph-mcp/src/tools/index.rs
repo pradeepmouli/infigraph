@@ -3,6 +3,7 @@ use serde_json::Value;
 
 use infigraph_core::embed;
 
+use super::docs::auto_start_doc_watch;
 use super::helpers::{find_infigraph_cli, open_prism};
 use super::watch::auto_start_watch;
 
@@ -29,9 +30,21 @@ pub fn tool_index_project(args: &Value) -> Result<String> {
             return Err(anyhow::anyhow!("infigraph index failed:\n{}", combined));
         }
         let mut out = combined;
+
+        // Register in global registry so watchers auto-start on next MCP init
+        if let Ok(prism) = open_prism(args) {
+            let project_name = std::path::Path::new(path)
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| path.to_string());
+            let mut registry = infigraph_core::multi::Registry::load().unwrap_or_default();
+            let _ = registry.register_repo(&project_name, &std::path::PathBuf::from(path), &prism);
+        }
+
         if let Some(msg) = auto_start_watch(path) {
             out.push_str(&format!("\n{}", msg));
         }
+        auto_start_doc_watch(path);
         return Ok(out);
     }
 
@@ -69,9 +82,21 @@ pub fn tool_index_project(args: &Value) -> Result<String> {
     }
     let stats = prism.stats()?;
     out.push_str(&format!("\n{}", stats));
+
+    // Register in global registry so watchers auto-start on next MCP init
+    {
+        let project_name = std::path::Path::new(path)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.to_string());
+        let mut registry = infigraph_core::multi::Registry::load().unwrap_or_default();
+        let _ = registry.register_repo(&project_name, &std::path::PathBuf::from(path), &prism);
+    }
+
     if let Some(msg) = auto_start_watch(path) {
         out.push_str(&format!("\n{}", msg));
     }
+    auto_start_doc_watch(path);
     Ok(out)
 }
 

@@ -40,6 +40,41 @@ pub fn get_doc_watchers() -> std::sync::MutexGuard<'static, Option<HashMap<Strin
     DOC_WATCHERS.lock().unwrap()
 }
 
+pub fn is_doc_watching(path: &str) -> bool {
+    let guard = DOC_WATCHERS.lock().unwrap();
+    guard
+        .as_ref()
+        .is_some_and(|map| map.values().any(|e| e.path == path))
+}
+
+pub fn auto_start_doc_watch(path: &str) -> Option<String> {
+    let root = std::path::PathBuf::from(path).canonicalize().ok()?;
+    let root_str = root.to_string_lossy().replace('\\', "/");
+
+    if is_doc_watching(&root_str) {
+        return None;
+    }
+
+    if !root.join(".infigraph").join("docs.kuzu").exists() {
+        return None;
+    }
+
+    let args = serde_json::json!({
+        "path": path,
+        "debounce_ms": 500
+    });
+    match tool_watch_docs(&args) {
+        Ok(msg) => {
+            eprintln!("[auto-watch] Started doc watcher for {root_str}");
+            Some(msg)
+        }
+        Err(e) => {
+            eprintln!("[auto-watch] Failed to start doc watcher: {e}");
+            None
+        }
+    }
+}
+
 pub fn tool_review(args: &Value) -> Result<String> {
     let prism = open_prism(args)?;
     let base_ref = args
@@ -121,6 +156,7 @@ pub fn tool_index_docs(args: &Value) -> Result<String> {
                 combined
             ));
         }
+        auto_start_doc_watch(path);
         return Ok(combined);
     }
 
@@ -140,6 +176,7 @@ pub fn tool_index_docs(args: &Value) -> Result<String> {
         ));
     }
 
+    auto_start_doc_watch(path);
     Ok(out)
 }
 

@@ -4,6 +4,8 @@ use anyhow::Result;
 use serde_json::{json, Value};
 
 use infigraph_mcp::tools;
+use infigraph_mcp::tools::docs::{auto_start_doc_watch, init_doc_watchers};
+use infigraph_mcp::tools::watch::{auto_start_watch, init_watchers};
 use infigraph_mcp::web;
 
 fn main() -> Result<()> {
@@ -115,6 +117,29 @@ fn write_response(stdout: &io::Stdout, response: Value) -> Result<()> {
 }
 
 fn handle_initialize(id: &Value) -> Value {
+    // Auto-start watchers for all registered projects
+    std::thread::spawn(|| {
+        init_watchers();
+        init_doc_watchers();
+
+        let registry = match infigraph_core::multi::Registry::load() {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("[init] Failed to load registry: {e}");
+                return;
+            }
+        };
+
+        for entry in registry.repos.values() {
+            let path = entry.path.to_string_lossy().to_string();
+            if !entry.path.join(".infigraph").exists() {
+                continue;
+            }
+            auto_start_watch(&path);
+            auto_start_doc_watch(&path);
+        }
+    });
+
     json!({
         "jsonrpc": "2.0",
         "id": id,

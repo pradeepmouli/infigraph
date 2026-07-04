@@ -4,7 +4,8 @@ use std::time::{Duration, Instant};
 use serde_json::json;
 
 use infigraph_mcp::tools::docs::{
-    init_doc_watchers, tool_index_docs, tool_search_docs, tool_watch_docs, DOC_WATCHERS,
+    auto_start_doc_watch, init_doc_watchers, is_doc_watching, tool_index_docs, tool_search_docs,
+    tool_watch_docs, DOC_WATCHERS,
 };
 use infigraph_mcp::tools::helpers::open_prism;
 use infigraph_mcp::tools::index::tool_index_project;
@@ -925,4 +926,137 @@ fn test_doc_watcher_prunes_stale_docs() {
             "kept doc should still be in doc store"
         );
     }
+}
+
+/// auto_start_watch should not create duplicate watchers when called multiple times.
+#[test]
+fn test_auto_start_watch_no_duplicates() {
+    let _guard = WATCHER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    stop_all_watchers();
+    stop_all_doc_watchers();
+    init_watchers();
+    init_doc_watchers();
+
+    let (_dir, path) = make_project(&[("src/main.py", "def hello(): pass")]);
+    tool_index_project(&json!({"path": &path})).expect("index");
+
+    // index_project already calls auto_start_watch, so watcher should be running
+    let count_after_index = {
+        let guard = get_watchers();
+        guard.as_ref().map(|m| m.len()).unwrap_or(0)
+    };
+    assert!(
+        count_after_index >= 1,
+        "index_project should have started a watcher"
+    );
+
+    // Explicit auto_start_watch should be no-op (already watching)
+    let result = auto_start_watch(&path);
+    assert!(
+        result.is_none(),
+        "auto_start_watch should be no-op when already watching"
+    );
+
+    let count_after_explicit = {
+        let guard = get_watchers();
+        guard.as_ref().map(|m| m.len()).unwrap_or(0)
+    };
+    assert_eq!(
+        count_after_index, count_after_explicit,
+        "explicit auto_start_watch should not create duplicate"
+    );
+
+    // Re-index should also not create duplicate
+    tool_index_project(&json!({"path": &path})).expect("re-index");
+
+    let count_after_reindex = {
+        let guard = get_watchers();
+        guard.as_ref().map(|m| m.len()).unwrap_or(0)
+    };
+    assert_eq!(
+        count_after_index, count_after_reindex,
+        "re-indexing should not create duplicate watcher"
+    );
+
+    stop_all_watchers();
+    stop_all_doc_watchers();
+}
+
+/// auto_start_doc_watch should not create duplicate doc watchers.
+#[test]
+fn test_auto_start_doc_watch_no_duplicates() {
+    let _guard = WATCHER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    stop_all_watchers();
+    stop_all_doc_watchers();
+    init_watchers();
+    init_doc_watchers();
+
+    let (_dir, path) = make_project(&[("docs/readme.md", "# Hello\n\nDoc content.")]);
+    tool_index_docs(&json!({"path": &path})).expect("doc index");
+
+    let canonical = std::path::PathBuf::from(&path)
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .replace('\\', "/");
+
+    // tool_index_docs now calls auto_start_doc_watch, so it should be running
+    assert!(
+        is_doc_watching(&canonical),
+        "should be doc watching after index_docs"
+    );
+
+    let count_after_index = {
+        let guard = DOC_WATCHERS.lock().unwrap();
+        guard.as_ref().map(|m| m.len()).unwrap_or(0)
+    };
+
+    // Explicit call should be no-op
+    let result = auto_start_doc_watch(&path);
+    assert!(
+        result.is_none(),
+        "auto_start_doc_watch should be no-op when already watching"
+    );
+
+    let count_after_explicit = {
+        let guard = DOC_WATCHERS.lock().unwrap();
+        guard.as_ref().map(|m| m.len()).unwrap_or(0)
+    };
+    assert_eq!(
+        count_after_index, count_after_explicit,
+        "doc watcher count should not increase on duplicate auto_start_doc_watch"
+    );
+
+    stop_all_doc_watchers();
+    stop_all_watchers();
+}
+
+/// is_watching returns false after watchers are stopped.
+#[test]
+fn test_is_watching_lifecycle() {
+    let _guard = WATCHER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    stop_all_watchers();
+    stop_all_doc_watchers();
+    init_watchers();
+    init_doc_watchers();
+
+    let (_dir, path) = make_project(&[("src/lib.py", "def func(): pass")]);
+    tool_index_project(&json!({"path": &path})).expect("index");
+
+    let canonical = std::path::PathBuf::from(&path)
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .replace('\\', "/");
+
+    // index_project starts watcher automatically now
+    assert!(is_watching(&canonical), "should be watching after index");
+
+    stop_all_watchers();
+    assert!(
+        !is_watching(&canonical),
+        "should not be watching after stop"
+    );
+
+    stop_all_doc_watchers();
 }
