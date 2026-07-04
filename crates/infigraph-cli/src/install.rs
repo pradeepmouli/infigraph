@@ -86,9 +86,12 @@ pub(crate) fn cmd_install() -> Result<()> {
 
     // Install hooks and Claude Code allowlist
     crate::hooks::install_enforcement_hook(&home)?;
+    crate::hooks::install_edit_tracker_hook(&home)?;
     crate::hooks::install_session_save_hook(&home)?;
     crate::hooks::install_clear_suggest_hook(&home)?;
     crate::hooks::install_session_end_hook(&home)?;
+    crate::hooks::install_test_context_sentinel_hook(&home)?;
+    crate::hooks::install_search_fallback_sentinel_hook(&home)?;
     crate::hooks::install_claude_allowlist(&home)?;
 
     // Copy model files to ~/.infigraph/models/
@@ -690,9 +693,12 @@ fn reinstall_hooks() -> Result<()> {
     let home = dirs::home_dir().context("cannot find home directory")?;
     println!("\nReinstalling hooks...");
     crate::hooks::install_enforcement_hook(&home)?;
+    crate::hooks::install_edit_tracker_hook(&home)?;
     crate::hooks::install_session_save_hook(&home)?;
     crate::hooks::install_clear_suggest_hook(&home)?;
     crate::hooks::install_session_end_hook(&home)?;
+    crate::hooks::install_test_context_sentinel_hook(&home)?;
+    crate::hooks::install_search_fallback_sentinel_hook(&home)?;
     crate::hooks::install_claude_allowlist(&home)?;
     Ok(())
 }

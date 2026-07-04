@@ -2,10 +2,9 @@ use anyhow::Result;
 use serde_json::json;
 
 pub(crate) const ENFORCE_HOOK_SCRIPT: &str = r#"#!/usr/bin/env bash
-# Infigraph PreToolUse enforcement hook
-# Warns when raw search/file tools are used in Infigraph-indexed projects.
-# stdin: JSON {tool_name, tool_input, cwd}
-# exit 0 = allow (with warning on stderr)
+# Infigraph PreToolUse enforcement hook — deny-by-default
+# Blocks raw search/file tools in Infigraph-indexed projects.
+# Deny-by-default. Fallback sentinel allows raw tools after infigraph search returns no results.
 
 input=$(cat)
 tool=$(echo "$input" | jq -r '.tool_name // empty')
@@ -14,42 +13,87 @@ cwd=$(echo "$input" | jq -r '.cwd // empty')
 # Guard: only enforce in projects with a .infigraph directory
 [ -d "$cwd/.infigraph" ] || exit 0
 
+# Check search-fallback sentinel — if infigraph search returned no results recently, allow raw tools
+search_sentinel="$cwd/.infigraph/.search-fallback-allowed"
+if [ -f "$search_sentinel" ]; then
+  now=$(date +%s)
+  sentinel_ts=$(cat "$search_sentinel" 2>/dev/null || echo 0)
+  if [ $((now - sentinel_ts)) -lt 300 ]; then
+    exit 0
+  fi
+fi
+
 case "$tool" in
   Grep)
-    echo "WARNING: Prefer mcp__infigraph__search (unified search) over Grep. Infigraph is indexed for this project." >&2
+    cat <<'ENDJSON'
+{"hookSpecificOutput":{"hookEventName":"PreToolUse","additionalContext":"BLOCKED: Use mcp__infigraph__search instead of Grep."}}
+ENDJSON
+    exit 2
     ;;
   Glob)
-    echo "WARNING: Prefer mcp__infigraph__list_files over Glob. Infigraph is indexed for this project." >&2
+    cat <<'ENDJSON'
+{"hookSpecificOutput":{"hookEventName":"PreToolUse","additionalContext":"BLOCKED: Use mcp__infigraph__list_files instead of Glob."}}
+ENDJSON
+    exit 2
     ;;
   Bash)
     cmd=$(echo "$input" | jq -r '.tool_input.command // empty')
     if echo "$cmd" | grep -qE '(^|\s|/)(grep|egrep|fgrep|rg|ripgrep|ag|ack)(\s|$)'; then
-      echo "WARNING: Prefer mcp__infigraph__search over grep/rg. Infigraph is indexed for this project." >&2
+      cat <<'ENDJSON'
+{"hookSpecificOutput":{"hookEventName":"PreToolUse","additionalContext":"BLOCKED: Use mcp__infigraph__search instead of grep/rg."}}
+ENDJSON
+      exit 2
     fi
     if echo "$cmd" | grep -qE '(^|\s)find\s.*-name\s'; then
-      echo "WARNING: Prefer mcp__infigraph__list_files over find. Infigraph is indexed for this project." >&2
+      cat <<'ENDJSON'
+{"hookSpecificOutput":{"hookEventName":"PreToolUse","additionalContext":"BLOCKED: Use mcp__infigraph__list_files instead of find."}}
+ENDJSON
+      exit 2
     fi
     ;;
   Agent)
     agent_type=$(echo "$input" | jq -r '.tool_input.subagent_type // empty')
     case "$agent_type" in
-      Explore)
-        echo "WARNING: Do NOT use Explore agent — it lacks MCP access. Use infigraph search/search_code/search_symbols directly, or use general-purpose agent." >&2
-        ;;
-      Plan)
-        echo "WARNING: Do NOT use Plan agent — it lacks MCP access. Use infigraph get_architecture/get_skeleton directly, or use general-purpose agent." >&2
-        ;;
-      code-reviewer)
-        echo "WARNING: Do NOT use code-reviewer agent — it lacks MCP access. Use infigraph get_doc_context/review directly, or use general-purpose agent." >&2
+      Explore|Plan|code-reviewer)
+        cat <<'ENDJSON'
+{"hookSpecificOutput":{"hookEventName":"PreToolUse","additionalContext":"BLOCKED: This agent type lacks MCP access. Use general-purpose agent instead."}}
+ENDJSON
+        exit 2
         ;;
     esac
     ;;
   Read)
     file_path=$(echo "$input" | jq -r '.tool_input.file_path // empty')
-    if echo "$file_path" | grep -qE '\.(rs|ts|tsx|js|jsx|py|go|java|c|cpp|h|hpp|cs|rb|swift|kt)$'; then
+    # Allow if offset specified (targeted line-number lookup for Edit)
+    has_offset=$(echo "$input" | jq -r '.tool_input.offset // empty')
+    if [ -n "$has_offset" ] && [ "$has_offset" != "null" ]; then
+      exit 0
+    fi
+    # Allow if file was recently edited (Edit tracker exemption)
+    tracker_file="${TMPDIR:-/tmp}/infigraph-edit-tracker/recent_edits.log"
+    if [ -f "$tracker_file" ] && grep -qF "$file_path" "$tracker_file" 2>/dev/null; then
+      exit 0
+    fi
+    # Block — use infigraph tools. If infigraph search returns nothing, sentinel allows retry.
+    echo "BLOCKED: Use mcp__infigraph__get_doc_context, search, or get_code_snippet. Read only for Edit line numbers (pass offset)." >&2
+    exit 2
+    ;;
+  Write|Edit)
+    file_path=$(echo "$input" | jq -r '.tool_input.file_path // empty')
+    if echo "$file_path" | grep -qE '(test_[^/]+\.[^/]+|[^/]+_test\.[^/]+|[^/]+\.test\.[^/]+|[^/]+_spec\.[^/]+|[^/]+\.spec\.[^/]+|tests/[^/]+\.[^/]+|__tests__/|\.feature$|\.karate$)'; then
+      sentinel="$cwd/.infigraph/.test-context-called"
+      if [ -f "$sentinel" ]; then
+        # Check freshness — allow if sentinel written within last 30 minutes
+        now=$(date +%s)
+        sentinel_ts=$(cat "$sentinel" 2>/dev/null || echo 0)
+        if [ $((now - sentinel_ts)) -lt 1800 ]; then
+          exit 0
+        fi
+      fi
       cat <<'ENDJSON'
-{"hookSpecificOutput":{"hookEventName":"PreToolUse","additionalContext":"INFIGRAPH HINT: You are reading a code file with Read. Prefer mcp__infigraph__get_doc_context (returns source+callers+callees) or mcp__infigraph__get_code_snippet for code understanding. Only use Read when you need exact line numbers for the Edit tool."}}
+{"hookSpecificOutput":{"hookEventName":"PreToolUse","additionalContext":"BLOCKED: Call mcp__infigraph__generate_test_context before writing tests."}}
 ENDJSON
+      exit 2
     fi
     ;;
 esac
@@ -139,6 +183,9 @@ ENDJSON
       echo "0" > "${TMPDIR:-/tmp}/infigraph-sessions/$session_id.count" 2>/dev/null
       echo "0" > "${TMPDIR:-/tmp}/claude-clear-suggest/$session_id.count" 2>/dev/null
     fi
+    # Reset test-context sentinel on clear
+    rm -f "$cwd/.infigraph/.test-context-called" 2>/dev/null
+    rm -f "$cwd/.infigraph/.search-fallback-allowed" 2>/dev/null
     backup=$(ls -t "$cwd"/.infigraph/sessions/unsaved-transcript-*.md 2>/dev/null | head -1)
     if [ -n "$backup" ]; then
       cat <<ENDJSON
@@ -277,7 +324,7 @@ pub(crate) fn install_enforcement_hook(home: &std::path::Path) -> Result<()> {
     }
 
     let hook_entry = json!({
-        "matcher": "Grep|Glob|Bash|Agent|Read",
+        "matcher": "Grep|Glob|Bash|Read|Write|Edit|Agent",
         "hooks": [{
             "type": "command",
             "command": hook_path.to_string_lossy(),
@@ -315,7 +362,7 @@ pub(crate) fn install_enforcement_hook(home: &std::path::Path) -> Result<()> {
         std::fs::write(&settings_path, pretty)?;
         println!("  Added PreToolUse hook to {}", settings_path.display());
     } else {
-        let expected_matcher = "Grep|Glob|Bash|Agent|Read";
+        let expected_matcher = "Grep|Glob|Bash|Read|Write|Edit|Agent";
         let mut arr = pre_tool;
         let mut updated = false;
         for entry in arr.iter_mut() {
@@ -353,6 +400,169 @@ pub(crate) fn install_enforcement_hook(home: &std::path::Path) -> Result<()> {
                 settings_path.display()
             );
         }
+    }
+
+    Ok(())
+}
+
+pub(crate) const TEST_CONTEXT_SENTINEL_HOOK_SCRIPT: &str = r#"#!/usr/bin/env bash
+# PostToolUse hook: writes sentinel after generate_test_context succeeds.
+# Allows Write/Edit enforcement hook to pass for test files.
+
+input=$(cat)
+tool=$(echo "$input" | jq -r '.tool_name // empty')
+cwd=$(echo "$input" | jq -r '.cwd // empty')
+
+[ "$tool" = "mcp__infigraph__generate_test_context" ] || exit 0
+[ -d "$cwd/.infigraph" ] || exit 0
+
+echo "$(date +%s)" > "$cwd/.infigraph/.test-context-called"
+
+exit 0
+"#;
+
+pub(crate) const SEARCH_FALLBACK_SENTINEL_HOOK_SCRIPT: &str = r#"#!/usr/bin/env bash
+# PostToolUse hook: writes fallback sentinel when infigraph search returns no results.
+# Allows Grep/Glob/Read enforcement to pass as fallback.
+
+input=$(cat)
+tool=$(echo "$input" | jq -r '.tool_name // empty')
+cwd=$(echo "$input" | jq -r '.cwd // empty')
+
+[ -d "$cwd/.infigraph" ] || exit 0
+
+case "$tool" in
+  mcp__infigraph__search|mcp__infigraph__search_code|mcp__infigraph__search_symbols|mcp__infigraph__list_files)
+    output=$(echo "$input" | jq -r '.tool_output // empty')
+    # Check for empty results indicators
+    if echo "$output" | grep -qE '(0 symbol results, 0 text matches|0 results|No files found|No symbols found|No matches)'; then
+      mkdir -p "$cwd/.infigraph" 2>/dev/null
+      echo "$(date +%s)" > "$cwd/.infigraph/.search-fallback-allowed"
+    fi
+    ;;
+esac
+
+exit 0
+"#;
+
+pub(crate) const EDIT_TRACKER_HOOK_SCRIPT: &str = r#"#!/usr/bin/env bash
+# PostToolUse hook for Edit: records file path to allow subsequent Read for line numbers.
+# Tracks files that were recently edited so the Read enforcement hook can exempt them.
+
+input=$(cat)
+tool=$(echo "$input" | jq -r '.tool_name // empty')
+
+[ "$tool" = "Edit" ] || exit 0
+
+file_path=$(echo "$input" | jq -r '.tool_input.file_path // empty')
+[ -z "$file_path" ] && exit 0
+
+tracker_dir="${TMPDIR:-/tmp}/infigraph-edit-tracker"
+mkdir -p "$tracker_dir" 2>/dev/null
+
+# Write file path with timestamp — Read hook checks recency
+echo "$(date +%s) $file_path" >> "$tracker_dir/recent_edits.log"
+
+# Prune entries older than 5 minutes
+now=$(date +%s)
+if [ -f "$tracker_dir/recent_edits.log" ]; then
+  awk -v cutoff=$((now - 300)) '$1 >= cutoff' "$tracker_dir/recent_edits.log" > "$tracker_dir/recent_edits.tmp" 2>/dev/null
+  mv "$tracker_dir/recent_edits.tmp" "$tracker_dir/recent_edits.log" 2>/dev/null
+fi
+
+exit 0
+"#;
+
+pub(crate) fn install_edit_tracker_hook(home: &std::path::Path) -> Result<()> {
+    let hooks_dir = home.join(".claude").join("hooks");
+    std::fs::create_dir_all(&hooks_dir)?;
+
+    let hook_path = hooks_dir.join("infigraph-edit-tracker.sh");
+    std::fs::write(&hook_path, EDIT_TRACKER_HOOK_SCRIPT)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hook_path, std::fs::Permissions::from_mode(0o755))?;
+    }
+    println!("  Installed edit tracker hook: {}", hook_path.display());
+
+    let settings_path = home.join(".claude").join("settings.json");
+    let mut settings: serde_json::Value = if settings_path.is_file() {
+        let content = std::fs::read_to_string(&settings_path)?;
+        serde_json::from_str(&content)?
+    } else {
+        json!({})
+    };
+
+    if settings.get("hooks").is_none() {
+        settings["hooks"] = json!({});
+    }
+
+    let post_tool = settings["hooks"]
+        .get("PostToolUse")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    // Check if edit tracker already registered in any PostToolUse entry
+    let already_exists = post_tool.iter().any(|entry| {
+        entry
+            .get("hooks")
+            .and_then(|h| h.as_array())
+            .map(|hooks| {
+                hooks.iter().any(|h| {
+                    h.get("command")
+                        .and_then(|c| c.as_str())
+                        .map(|c| c.contains("infigraph-edit-tracker"))
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false)
+    });
+
+    if !already_exists {
+        // Find existing Edit|Write matcher entry and add our hook, or create new entry
+        let mut arr = post_tool;
+        let mut added = false;
+        for entry in arr.iter_mut() {
+            let matcher = entry.get("matcher").and_then(|m| m.as_str()).unwrap_or("");
+            if matcher.contains("Edit") {
+                if let Some(hooks) = entry.get_mut("hooks").and_then(|h| h.as_array_mut()) {
+                    hooks.push(json!({
+                        "type": "command",
+                        "command": hook_path.to_string_lossy(),
+                        "timeout": 5,
+                        "async": true
+                    }));
+                    added = true;
+                    break;
+                }
+            }
+        }
+        if !added {
+            arr.push(json!({
+                "matcher": "Edit|Write|NotebookEdit",
+                "hooks": [{
+                    "type": "command",
+                    "command": hook_path.to_string_lossy(),
+                    "timeout": 5,
+                    "async": true
+                }]
+            }));
+        }
+        settings["hooks"]["PostToolUse"] = serde_json::Value::Array(arr);
+
+        let pretty = serde_json::to_string_pretty(&settings)?;
+        std::fs::write(&settings_path, pretty)?;
+        println!(
+            "  Added PostToolUse edit tracker hook to {}",
+            settings_path.display()
+        );
+    } else {
+        println!(
+            "  Edit tracker hook already configured in {}",
+            settings_path.display()
+        );
     }
 
     Ok(())
@@ -799,15 +1009,166 @@ pub(crate) fn uninstall_claude_allowlist(home: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn install_test_context_sentinel_hook(home: &std::path::Path) -> Result<()> {
+    let hooks_dir = home.join(".claude").join("hooks");
+    std::fs::create_dir_all(&hooks_dir)?;
+
+    let hook_path = hooks_dir.join("infigraph-test-context-sentinel.sh");
+    std::fs::write(&hook_path, TEST_CONTEXT_SENTINEL_HOOK_SCRIPT)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hook_path, std::fs::Permissions::from_mode(0o755))?;
+    }
+    println!(
+        "  Installed test-context sentinel hook: {}",
+        hook_path.display()
+    );
+
+    let settings_path = home.join(".claude").join("settings.json");
+    let mut settings: serde_json::Value = if settings_path.is_file() {
+        let content = std::fs::read_to_string(&settings_path)?;
+        serde_json::from_str(&content)?
+    } else {
+        json!({})
+    };
+
+    if settings.get("hooks").is_none() {
+        settings["hooks"] = json!({});
+    }
+
+    let post_tool = settings["hooks"]
+        .get("PostToolUse")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let already_exists = post_tool.iter().any(|entry| {
+        entry
+            .get("hooks")
+            .and_then(|h| h.as_array())
+            .map(|hooks| {
+                hooks.iter().any(|h| {
+                    h.get("command")
+                        .and_then(|c| c.as_str())
+                        .map(|c| c.contains("infigraph-test-context-sentinel"))
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false)
+    });
+
+    if !already_exists {
+        let mut arr = post_tool;
+        arr.push(json!({
+            "matcher": "mcp__infigraph__generate_test_context",
+            "hooks": [{
+                "type": "command",
+                "command": hook_path.to_string_lossy(),
+                "timeout": 5,
+                "async": true
+            }]
+        }));
+        settings["hooks"]["PostToolUse"] = serde_json::Value::Array(arr);
+        let pretty = serde_json::to_string_pretty(&settings)?;
+        std::fs::write(&settings_path, pretty)?;
+        println!(
+            "  Added PostToolUse test-context sentinel hook to {}",
+            settings_path.display()
+        );
+    } else {
+        println!("  Test-context sentinel hook already configured");
+    }
+
+    Ok(())
+}
+
+pub(crate) fn install_search_fallback_sentinel_hook(home: &std::path::Path) -> Result<()> {
+    let hooks_dir = home.join(".claude").join("hooks");
+    std::fs::create_dir_all(&hooks_dir)?;
+
+    let hook_path = hooks_dir.join("infigraph-search-fallback-sentinel.sh");
+    std::fs::write(&hook_path, SEARCH_FALLBACK_SENTINEL_HOOK_SCRIPT)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hook_path, std::fs::Permissions::from_mode(0o755))?;
+    }
+    println!(
+        "  Installed search-fallback sentinel hook: {}",
+        hook_path.display()
+    );
+
+    let settings_path = home.join(".claude").join("settings.json");
+    let mut settings: serde_json::Value = if settings_path.is_file() {
+        let content = std::fs::read_to_string(&settings_path)?;
+        serde_json::from_str(&content)?
+    } else {
+        json!({})
+    };
+
+    if settings.get("hooks").is_none() {
+        settings["hooks"] = json!({});
+    }
+
+    let post_tool = settings["hooks"]
+        .get("PostToolUse")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let already_exists = post_tool.iter().any(|entry| {
+        entry
+            .get("hooks")
+            .and_then(|h| h.as_array())
+            .map(|hooks| {
+                hooks.iter().any(|h| {
+                    h.get("command")
+                        .and_then(|c| c.as_str())
+                        .map(|c| c.contains("infigraph-search-fallback-sentinel"))
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false)
+    });
+
+    if !already_exists {
+        let mut arr = post_tool;
+        arr.push(json!({
+            "matcher": "mcp__infigraph__search|mcp__infigraph__search_code|mcp__infigraph__search_symbols|mcp__infigraph__list_files",
+            "hooks": [{
+                "type": "command",
+                "command": hook_path.to_string_lossy(),
+                "timeout": 5,
+                "async": true
+            }]
+        }));
+        settings["hooks"]["PostToolUse"] = serde_json::Value::Array(arr);
+        let pretty = serde_json::to_string_pretty(&settings)?;
+        std::fs::write(&settings_path, pretty)?;
+        println!(
+            "  Added PostToolUse search-fallback sentinel hook to {}",
+            settings_path.display()
+        );
+    } else {
+        println!("  Search-fallback sentinel hook already configured");
+    }
+
+    Ok(())
+}
+
 pub(crate) fn uninstall_hooks(home: &std::path::Path) -> Result<()> {
     let hooks_dir = home.join(".claude").join("hooks");
     for hook_file in &[
         "infigraph-enforce.sh",
+        "infigraph-edit-tracker.sh",
         "infigraph-session-save.sh",
         "infigraph-session-reset.sh",
         "infigraph-session-start.sh",
         "infigraph-clear-suggest.sh",
         "infigraph-session-end-save.sh",
+        "infigraph-test-context-sentinel.sh",
+        "infigraph-search-fallback-sentinel.sh",
     ] {
         let hook_path = hooks_dir.join(hook_file);
         if hook_path.exists() {
@@ -862,4 +1223,302 @@ pub(crate) fn uninstall_hooks(home: &std::path::Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn setup_home() -> (TempDir, std::path::PathBuf) {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path().to_path_buf();
+        std::fs::create_dir_all(home.join(".claude/hooks")).unwrap();
+        std::fs::write(home.join(".claude/settings.json"), "{}").unwrap();
+        (tmp, home)
+    }
+
+    #[test]
+    fn install_enforcement_hook_creates_file_and_settings() {
+        let (_tmp, home) = setup_home();
+        install_enforcement_hook(&home).unwrap();
+
+        let hook_path = home.join(".claude/hooks/infigraph-enforce.sh");
+        assert!(hook_path.exists());
+
+        let content = std::fs::read_to_string(&hook_path).unwrap();
+        assert!(content.contains("deny-by-default"));
+        assert!(content.contains("search-fallback-allowed"));
+
+        let settings: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(home.join(".claude/settings.json")).unwrap(),
+        )
+        .unwrap();
+        let pre_tool = settings["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(pre_tool.len(), 1);
+        assert_eq!(
+            pre_tool[0]["matcher"].as_str().unwrap(),
+            "Grep|Glob|Bash|Read|Write|Edit|Agent"
+        );
+    }
+
+    #[test]
+    fn install_enforcement_hook_idempotent() {
+        let (_tmp, home) = setup_home();
+        install_enforcement_hook(&home).unwrap();
+        install_enforcement_hook(&home).unwrap();
+
+        let settings: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(home.join(".claude/settings.json")).unwrap(),
+        )
+        .unwrap();
+        let pre_tool = settings["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(pre_tool.len(), 1);
+    }
+
+    #[test]
+    fn install_edit_tracker_hook_creates_file() {
+        let (_tmp, home) = setup_home();
+        install_edit_tracker_hook(&home).unwrap();
+
+        assert!(home
+            .join(".claude/hooks/infigraph-edit-tracker.sh")
+            .exists());
+
+        let settings: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(home.join(".claude/settings.json")).unwrap(),
+        )
+        .unwrap();
+        let post_tool = settings["hooks"]["PostToolUse"].as_array().unwrap();
+        assert!(post_tool.iter().any(|e| {
+            e["hooks"].as_array().unwrap().iter().any(|h| {
+                h["command"]
+                    .as_str()
+                    .unwrap()
+                    .contains("infigraph-edit-tracker")
+            })
+        }));
+    }
+
+    #[test]
+    fn install_test_context_sentinel() {
+        let (_tmp, home) = setup_home();
+        install_test_context_sentinel_hook(&home).unwrap();
+
+        assert!(home
+            .join(".claude/hooks/infigraph-test-context-sentinel.sh")
+            .exists());
+
+        let settings: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(home.join(".claude/settings.json")).unwrap(),
+        )
+        .unwrap();
+        let post_tool = settings["hooks"]["PostToolUse"].as_array().unwrap();
+        let entry = post_tool
+            .iter()
+            .find(|e| {
+                e["matcher"]
+                    .as_str()
+                    .map(|m| m.contains("generate_test_context"))
+                    .unwrap_or(false)
+            })
+            .expect("should have test-context matcher");
+        assert!(entry["hooks"][0]["command"]
+            .as_str()
+            .unwrap()
+            .contains("test-context-sentinel"));
+    }
+
+    #[test]
+    fn install_search_fallback_sentinel() {
+        let (_tmp, home) = setup_home();
+        install_search_fallback_sentinel_hook(&home).unwrap();
+
+        assert!(home
+            .join(".claude/hooks/infigraph-search-fallback-sentinel.sh")
+            .exists());
+
+        let settings: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(home.join(".claude/settings.json")).unwrap(),
+        )
+        .unwrap();
+        let post_tool = settings["hooks"]["PostToolUse"].as_array().unwrap();
+        let entry = post_tool
+            .iter()
+            .find(|e| {
+                e["matcher"]
+                    .as_str()
+                    .map(|m| m.contains("mcp__infigraph__search"))
+                    .unwrap_or(false)
+            })
+            .expect("should have search fallback matcher");
+        assert!(entry["hooks"][0]["command"]
+            .as_str()
+            .unwrap()
+            .contains("search-fallback-sentinel"));
+    }
+
+    #[test]
+    fn install_session_hooks() {
+        let (_tmp, home) = setup_home();
+        install_session_save_hook(&home).unwrap();
+
+        assert!(home
+            .join(".claude/hooks/infigraph-session-save.sh")
+            .exists());
+        assert!(home
+            .join(".claude/hooks/infigraph-session-reset.sh")
+            .exists());
+        assert!(home
+            .join(".claude/hooks/infigraph-session-start.sh")
+            .exists());
+
+        let settings: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(home.join(".claude/settings.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(!settings["hooks"]["UserPromptSubmit"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        assert!(!settings["hooks"]["PostToolUse"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        assert!(!settings["hooks"]["SessionStart"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn install_session_end_hook_creates_file() {
+        let (_tmp, home) = setup_home();
+        install_session_end_hook(&home).unwrap();
+
+        assert!(home
+            .join(".claude/hooks/infigraph-session-end-save.sh")
+            .exists());
+
+        let settings: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(home.join(".claude/settings.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(!settings["hooks"]["SessionEnd"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn install_clear_suggest_hook_creates_file() {
+        let (_tmp, home) = setup_home();
+        install_clear_suggest_hook(&home).unwrap();
+
+        assert!(home
+            .join(".claude/hooks/infigraph-clear-suggest.sh")
+            .exists());
+    }
+
+    #[test]
+    fn uninstall_removes_all_hook_files() {
+        let (_tmp, home) = setup_home();
+
+        install_enforcement_hook(&home).unwrap();
+        install_edit_tracker_hook(&home).unwrap();
+        install_session_save_hook(&home).unwrap();
+        install_clear_suggest_hook(&home).unwrap();
+        install_session_end_hook(&home).unwrap();
+        install_test_context_sentinel_hook(&home).unwrap();
+        install_search_fallback_sentinel_hook(&home).unwrap();
+
+        let hook_files = [
+            "infigraph-enforce.sh",
+            "infigraph-edit-tracker.sh",
+            "infigraph-session-save.sh",
+            "infigraph-session-reset.sh",
+            "infigraph-session-start.sh",
+            "infigraph-clear-suggest.sh",
+            "infigraph-session-end-save.sh",
+            "infigraph-test-context-sentinel.sh",
+            "infigraph-search-fallback-sentinel.sh",
+        ];
+        for f in &hook_files {
+            assert!(
+                home.join(".claude/hooks").join(f).exists(),
+                "{f} should exist after install"
+            );
+        }
+
+        uninstall_hooks(&home).unwrap();
+
+        for f in &hook_files {
+            assert!(
+                !home.join(".claude/hooks").join(f).exists(),
+                "{f} should be removed"
+            );
+        }
+    }
+
+    #[test]
+    fn uninstall_cleans_settings_json() {
+        let (_tmp, home) = setup_home();
+
+        install_enforcement_hook(&home).unwrap();
+        install_edit_tracker_hook(&home).unwrap();
+        install_session_save_hook(&home).unwrap();
+        install_session_end_hook(&home).unwrap();
+        install_test_context_sentinel_hook(&home).unwrap();
+        install_search_fallback_sentinel_hook(&home).unwrap();
+
+        uninstall_hooks(&home).unwrap();
+
+        let settings: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(home.join(".claude/settings.json")).unwrap(),
+        )
+        .unwrap();
+
+        for event in &[
+            "PreToolUse",
+            "PostToolUse",
+            "UserPromptSubmit",
+            "SessionStart",
+            "SessionEnd",
+        ] {
+            let count = settings["hooks"][event]
+                .as_array()
+                .map(|a| a.len())
+                .unwrap_or(0);
+            assert_eq!(count, 0, "{event} should be empty after uninstall");
+        }
+    }
+
+    #[test]
+    fn enforce_script_covers_all_tool_cases() {
+        let script = ENFORCE_HOOK_SCRIPT;
+        assert!(script.contains("Grep)"));
+        assert!(script.contains("Glob)"));
+        assert!(script.contains("Bash)"));
+        assert!(script.contains("Agent)"));
+        assert!(script.contains("Read)"));
+        assert!(script.contains("Write|Edit)"));
+        assert!(script.contains("search-fallback-allowed"));
+        assert!(script.contains("test-context-called"));
+    }
+
+    #[test]
+    fn search_fallback_sentinel_covers_all_search_tools() {
+        let script = SEARCH_FALLBACK_SENTINEL_HOOK_SCRIPT;
+        assert!(script.contains("mcp__infigraph__search|"));
+        assert!(script.contains("mcp__infigraph__search_code|"));
+        assert!(script.contains("mcp__infigraph__search_symbols|"));
+        assert!(script.contains("mcp__infigraph__list_files"));
+    }
+
+    #[test]
+    fn session_start_resets_sentinels_on_clear() {
+        let script = SESSION_START_HOOK_SCRIPT;
+        assert!(script.contains("rm -f \"$cwd/.infigraph/.test-context-called\""));
+        assert!(script.contains("rm -f \"$cwd/.infigraph/.search-fallback-allowed\""));
+    }
 }
