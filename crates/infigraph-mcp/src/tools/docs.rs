@@ -21,18 +21,23 @@ pub fn open_doc_index(args: &Value) -> Result<infigraph_docs::DocIndex> {
     Ok(idx)
 }
 
-pub(crate) struct DocWatcherEntry {
-    stop_tx: mpsc::Sender<()>,
-    path: String,
+pub struct DocWatcherEntry {
+    pub stop_tx: mpsc::Sender<()>,
+    pub path: String,
 }
 
-pub(crate) static DOC_WATCHERS: Mutex<Option<HashMap<String, DocWatcherEntry>>> = Mutex::new(None);
+pub static DOC_WATCHERS: Mutex<Option<HashMap<String, DocWatcherEntry>>> = Mutex::new(None);
 
 pub fn init_doc_watchers() {
     let mut guard = DOC_WATCHERS.lock().unwrap();
     if guard.is_none() {
         *guard = Some(HashMap::new());
     }
+}
+
+pub fn get_doc_watchers() -> std::sync::MutexGuard<'static, Option<HashMap<String, DocWatcherEntry>>>
+{
+    DOC_WATCHERS.lock().unwrap()
 }
 
 pub fn tool_review(args: &Value) -> Result<String> {

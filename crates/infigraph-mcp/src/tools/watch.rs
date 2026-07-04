@@ -205,48 +205,77 @@ pub fn tool_stop_watch(args: &Value) -> Result<String> {
 pub fn tool_get_watch_status(args: &Value) -> Result<String> {
     let watcher_id = args.get("watcher_id").and_then(|v| v.as_str());
 
-    let guard = get_watchers();
-    let map = match guard.as_ref() {
-        Some(m) => m,
-        None => return Ok("No watchers running.".to_string()),
-    };
-
-    if map.is_empty() {
-        return Ok("No watchers running.".to_string());
+    if let Some(id) = watcher_id {
+        // Check code watchers
+        {
+            let guard = get_watchers();
+            if let Some(map) = guard.as_ref() {
+                if let Some(entry) = map.get(id) {
+                    let pending = entry.pending_reindex.lock().unwrap();
+                    let mut out = format!("Watcher: {id}\nType: code\nPath: {}\n", entry.path);
+                    if pending.is_empty() {
+                        out.push_str("Status: OK — no pending reindex needed\n");
+                    } else {
+                        out.push_str(&format!(
+                            "⚠ {} file(s) changed with cross-file calls — run index_project to re-resolve:\n",
+                            pending.len()
+                        ));
+                        for f in pending.iter() {
+                            out.push_str(&format!("  - {f}\n"));
+                        }
+                    }
+                    return Ok(out);
+                }
+            }
+        }
+        // Check doc watchers
+        {
+            let guard = super::docs::get_doc_watchers();
+            if let Some(map) = guard.as_ref() {
+                if let Some(entry) = map.get(id) {
+                    return Ok(format!(
+                        "Watcher: {id}\nType: docs\nPath: {}\nStatus: active\n",
+                        entry.path
+                    ));
+                }
+            }
+        }
+        return Ok(format!("No watcher found with ID: {id}"));
     }
 
-    if let Some(id) = watcher_id {
-        match map.get(id) {
-            None => return Ok(format!("No watcher found with ID: {id}")),
-            Some(entry) => {
-                let pending = entry.pending_reindex.lock().unwrap();
-                let mut out = format!("Watcher: {id}\nPath: {}\n", entry.path);
-                if pending.is_empty() {
-                    out.push_str("Status: OK — no pending reindex needed\n");
+    // List all watchers from both registries
+    let mut total = 0usize;
+    let mut out = String::new();
+
+    {
+        let guard = get_watchers();
+        if let Some(map) = guard.as_ref() {
+            for (id, entry) in map.iter() {
+                total += 1;
+                let pending_count = entry.pending_reindex.lock().unwrap().len();
+                let warn = if pending_count > 0 {
+                    format!(" ⚠ {pending_count} pending reindex")
                 } else {
-                    out.push_str(&format!(
-                        "⚠ {} file(s) changed with cross-file calls — run index_project to re-resolve:\n",
-                        pending.len()
-                    ));
-                    for f in pending.iter() {
-                        out.push_str(&format!("  - {f}\n"));
-                    }
-                }
-                return Ok(out);
+                    String::new()
+                };
+                out.push_str(&format!("  {id} — [code] {}{warn}\n", entry.path));
             }
         }
     }
 
-    // List all watchers
-    let mut out = format!("{} watcher(s) running:\n", map.len());
-    for (id, entry) in map.iter() {
-        let pending_count = entry.pending_reindex.lock().unwrap().len();
-        let warn = if pending_count > 0 {
-            format!(" ⚠ {pending_count} pending reindex")
-        } else {
-            String::new()
-        };
-        out.push_str(&format!("  {id} — {}{warn}\n", entry.path));
+    {
+        let guard = super::docs::get_doc_watchers();
+        if let Some(map) = guard.as_ref() {
+            for (id, entry) in map.iter() {
+                total += 1;
+                out.push_str(&format!("  {id} — [docs] {}\n", entry.path));
+            }
+        }
     }
-    Ok(out)
+
+    if total == 0 {
+        return Ok("No watchers running.".to_string());
+    }
+
+    Ok(format!("{total} watcher(s) running:\n{out}"))
 }
