@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use arrow::array::{Int64Array, StringArray};
@@ -58,16 +58,25 @@ const CREATE_SCHEMA: &[&str] = &[
 
 pub struct DocStore {
     db: Database,
+    _db_guard: std::sync::MutexGuard<'static, ()>,
 }
+
+static DB_LOCK: Mutex<()> = Mutex::new(());
 
 impl DocStore {
     pub fn open(path: &Path) -> Result<Self> {
+        let guard = DB_LOCK
+            .lock()
+            .map_err(|e| anyhow::anyhow!("doc store lock poisoned: {e}"))?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let db = Database::new(path, SystemConfig::default())
             .map_err(|e| anyhow::anyhow!("failed to open docs kuzu db: {e}"))?;
-        let store = Self { db };
+        let store = Self {
+            db,
+            _db_guard: guard,
+        };
         store.init_schema()?;
         Ok(store)
     }

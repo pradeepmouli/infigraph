@@ -221,7 +221,9 @@ where
                             });
                         }
                         WatchEventKind::Created | WatchEventKind::Modified => {
-                            if filter_registry.for_file(&rel).is_some() {
+                            if path.is_dir() {
+                                register_subdirs(&mut watcher, &path, ignore_dirs);
+                            } else if filter_registry.for_file(&rel).is_some() {
                                 batch.add(path);
                             }
                         }
