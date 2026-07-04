@@ -49,8 +49,9 @@ struct CachedSearchData {
 }
 
 fn get_or_build_search_ctx(args: &Value) -> Result<CachedSearchData> {
-    let path = args.get("path").and_then(|p| p.as_str()).unwrap_or(".");
-    let tg_root = PathBuf::from(path).join(".infigraph");
+    let raw_path = args.get("path").and_then(|p| p.as_str()).unwrap_or(".");
+    let path = super::helpers::resolve_project_path(raw_path);
+    let tg_root = PathBuf::from(&path).join(".infigraph");
     let emb_file = tg_root.join("embeddings.bin");
     let canon = tg_root.canonicalize().unwrap_or_else(|_| tg_root.clone());
     let mtime = std::fs::metadata(&emb_file)
@@ -148,7 +149,9 @@ pub fn tool_search(args: &Value) -> Result<String> {
         .and_then(|v| v.as_str())
         .map(str::to_lowercase);
     let file_pattern = args.get("file_pattern").and_then(|f| f.as_str());
-    let path = args.get("path").and_then(|p| p.as_str()).unwrap_or(".");
+    let path = &super::helpers::resolve_project_path(
+        args.get("path").and_then(|p| p.as_str()).unwrap_or("."),
+    );
     let use_regex = args.get("regex").and_then(|v| v.as_bool()).unwrap_or(false);
 
     let ctx = get_or_build_search_ctx(args)?;
@@ -465,7 +468,9 @@ pub fn tool_search_symbols(args: &Value) -> Result<String> {
         .and_then(|q| q.as_str())
         .context("missing 'query'")?;
     let limit = args.get("limit").and_then(|l| l.as_u64()).unwrap_or(10) as usize;
-    let path = args.get("path").and_then(|p| p.as_str()).unwrap_or(".");
+    let path = &super::helpers::resolve_project_path(
+        args.get("path").and_then(|p| p.as_str()).unwrap_or("."),
+    );
 
     let ctx = get_or_build_search_ctx(args)?;
     let rows = ctx.rows;
@@ -550,7 +555,9 @@ pub fn tool_semantic_search(args: &Value) -> Result<String> {
         .get("kind")
         .and_then(|v| v.as_str())
         .map(str::to_lowercase);
-    let path = args.get("path").and_then(|p| p.as_str()).unwrap_or(".");
+    let path = &super::helpers::resolve_project_path(
+        args.get("path").and_then(|p| p.as_str()).unwrap_or("."),
+    );
 
     let ctx = get_or_build_search_ctx(args)?;
     let rows = ctx.rows;

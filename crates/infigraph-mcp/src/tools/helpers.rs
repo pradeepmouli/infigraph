@@ -8,13 +8,56 @@ use infigraph_languages::bundled_registry;
 
 pub use super::session::{session_date_id, session_epoch};
 
+/// Resolve a path argument to a project root containing `.infigraph/`.
+/// 1. If the path itself has `.infigraph/`, use it directly.
+/// 2. Walk UP from the path looking for `.infigraph/` (handles subdirectory CWD).
+/// 3. Check the global registry for a project whose path starts with (or contains) this path.
+/// 4. Fall back to the original path (let downstream error).
+pub fn resolve_project_path(path: &str) -> String {
+    let start = if path == "." {
+        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+    } else {
+        PathBuf::from(path)
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from(path))
+    };
+
+    // Direct match
+    if start.join(".infigraph").is_dir() {
+        return start.to_string_lossy().to_string();
+    }
+
+    // Walk up (CWD is inside a project subdir)
+    let mut current = start.as_path();
+    while let Some(parent) = current.parent() {
+        if parent.join(".infigraph").is_dir() {
+            return parent.to_string_lossy().to_string();
+        }
+        current = parent;
+    }
+
+    // Check registry for child projects under this path
+    if let Ok(registry) = infigraph_core::multi::Registry::load() {
+        let start_str = start.to_string_lossy();
+        for entry in registry.repos.values() {
+            let entry_str = entry.path.to_string_lossy();
+            if entry_str.starts_with(start_str.as_ref()) {
+                return entry.path.to_string_lossy().to_string();
+            }
+        }
+    }
+
+    path.to_string()
+}
+
 pub fn open_prism(args: &Value) -> Result<Infigraph> {
-    let path = args
+    let raw_path = args
         .get("path")
         .and_then(|p| p.as_str())
         .context("missing 'path' argument")?;
+    let path = resolve_project_path(raw_path);
     let registry = bundled_registry()?;
-    let mut prism = Infigraph::open(&PathBuf::from(path), registry)?;
+    let mut prism = Infigraph::open(&PathBuf::from(&path), registry)?;
     prism.init()?;
     Ok(prism)
 }
