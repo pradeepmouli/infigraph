@@ -472,6 +472,21 @@ Quick overview:
 - Shared `PipelineCore` table enables cross-plugin dependency graphs and impact analysis
 - 5 MCP tools: `pipeline_plugins`, `pipeline_deps`, `pipeline_impact`, `pipeline_compliance`, `pipeline_query`
 
+## Test Context Generator
+
+Generate framework-aware test scaffolds from your code graph. `generate_test_context` finds untested symbols, ranks them by caller count, and returns source + callers + callees + framework-specific templates — everything needed to write tests without guessing.
+
+- **18 frameworks**: Rust, pytest, unittest, JUnit, TestNG, Jest/Vitest, Mocha, Playwright/Cypress, Karate, Go, NUnit/xUnit/MSTest, Kotlin/Kotest, ScalaTest, RSpec, Minitest, XCTest, ExUnit, Cucumber
+- **4 test types**: unit, integration, functional, e2e
+- **Auto-detection**: scans `Cargo.toml`, `package.json`, `pom.xml`, `go.mod`, etc. to pick the right framework
+- **Style matching**: uses existing tests in your repo as style reference before falling back to templates
+
+```
+generate_test_context(path="/your/project", file="src/auth.py", test_type="unit")
+```
+
+**[Full Test Context Guide →](docs/TEST_CONTEXT_GUIDE.md)**
+
 ## Building from Source
 
 ### Prerequisites

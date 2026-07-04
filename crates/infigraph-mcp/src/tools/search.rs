@@ -447,7 +447,11 @@ pub fn tool_search(args: &Value) -> Result<String> {
                 .unwrap_or(false)
         };
         if !cli_watching {
-            out.push_str("\n⚠ No file watcher running — results may be stale. Run `infigraph watch` or re-index to refresh.");
+            if let Some(msg) = super::watch::auto_start_watch(path) {
+                out.push_str(&format!("\n✓ Auto-started watcher: {msg}"));
+            } else {
+                out.push_str("\n⚠ No file watcher running — results may be stale. Run `infigraph watch` or re-index to refresh.");
+            }
         }
     }
 
