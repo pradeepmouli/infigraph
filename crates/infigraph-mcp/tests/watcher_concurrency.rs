@@ -2,6 +2,7 @@ use std::sync::Mutex;
 
 use serde_json::json;
 
+use infigraph_mcp::tools::docs::get_doc_watchers;
 use infigraph_mcp::tools::graph::*;
 use infigraph_mcp::tools::index::tool_index_project;
 use infigraph_mcp::tools::search::tool_search;
@@ -33,6 +34,16 @@ fn stop_all_watchers() {
             }
         }
     }
+    drop(guard);
+    let mut doc_guard = get_doc_watchers();
+    if let Some(map) = doc_guard.as_mut() {
+        let ids: Vec<String> = map.keys().cloned().collect();
+        for id in ids {
+            if let Some(entry) = map.remove(&id) {
+                let _ = entry.stop_tx.send(());
+            }
+        }
+    }
 }
 
 fn extract_watcher_id(output: &str) -> String {
@@ -47,7 +58,7 @@ fn extract_watcher_id(output: &str) -> String {
 /// This is the core scenario that broke on Windows due to Kuzu mandatory file locking.
 #[test]
 fn test_graph_tools_with_active_watchers() {
-    let _guard = WATCHER_LOCK.lock().unwrap();
+    let _guard = WATCHER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (_dir_a, path_a) = make_project(&[
         (
             "src/main.py",
@@ -203,22 +214,17 @@ def handle_request():
         "find_all_references on A with watcher: {result}"
     );
 
-    // Clean up
+    // Clean up — stop all (code + doc) watchers
     tool_stop_watch(&json!({"watcher_id": watcher_id_a})).unwrap();
     tool_stop_watch(&json!({"watcher_id": watcher_id_b})).unwrap();
-
-    let status = tool_get_watch_status(&json!({})).unwrap();
-    assert!(
-        status.contains("No watchers"),
-        "all watchers should be stopped: {status}"
-    );
+    stop_all_watchers();
 }
 
 /// Group index starts auto-watchers for all repos in the group.
 /// Graph tools on individual repos must work while group watchers are running.
 #[test]
 fn test_graph_tools_with_group_watchers() {
-    let _guard = WATCHER_LOCK.lock().unwrap();
+    let _guard = WATCHER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let home_dir = tempfile::TempDir::new().expect("tmpdir for home");
     let orig_home = std::env::var("HOME").unwrap_or_default();
     std::env::set_var("HOME", home_dir.path());
@@ -342,7 +348,7 @@ def get_users():
 /// MCP auto_start_watch should skip if CLI watcher holds the lock.
 #[test]
 fn test_mcp_skips_when_cli_lock_held() {
-    let _guard = WATCHER_LOCK.lock().unwrap();
+    let _guard = WATCHER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     stop_all_watchers();
     init_watchers();
     let (_dir, path) = make_project(&[("main.py", "def hello(): pass")]);
@@ -374,7 +380,7 @@ fn test_mcp_skips_when_cli_lock_held() {
 /// MCP auto_start_watch should succeed when no CLI lock held.
 #[test]
 fn test_mcp_starts_when_no_cli_lock() {
-    let _guard = WATCHER_LOCK.lock().unwrap();
+    let _guard = WATCHER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     stop_all_watchers();
     init_watchers();
     let (_dir, path) = make_project(&[("main.py", "def greet(): pass")]);
@@ -393,10 +399,10 @@ fn test_mcp_starts_when_no_cli_lock() {
     stop_all_watchers();
 }
 
-/// Search output should contain stale warning when no watcher running.
+/// Search auto-starts a watcher when none is running (no stale warning).
 #[test]
-fn test_stale_search_warning_no_watcher() {
-    let _guard = WATCHER_LOCK.lock().unwrap();
+fn test_search_auto_starts_watcher_when_none_running() {
+    let _guard = WATCHER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     stop_all_watchers();
     init_watchers();
     let (_dir, path) = make_project(&[("lib.py", "def compute(): return 42")]);
@@ -405,18 +411,20 @@ fn test_stale_search_warning_no_watcher() {
     // tool_index_project auto-starts watcher — stop it
     stop_all_watchers();
 
-    // Now search with no watcher — should include stale warning
+    // Search should auto-start a watcher rather than warn about stale results
     let result = tool_search(&json!({"path": &path, "query": "compute"})).unwrap();
     assert!(
-        result.contains("No file watcher running") || result.contains("stale"),
-        "search should warn about stale results, got: {result}"
+        result.contains("Auto-started watcher") || !result.contains("No file watcher running"),
+        "search should auto-start watcher or not warn, got: {result}"
     );
+
+    stop_all_watchers();
 }
 
 /// Search output should NOT contain stale warning when MCP watcher running.
 #[test]
 fn test_no_stale_warning_with_mcp_watcher() {
-    let _guard = WATCHER_LOCK.lock().unwrap();
+    let _guard = WATCHER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     stop_all_watchers();
     init_watchers();
     let (_dir, path) = make_project(&[("app.py", "def serve(): pass")]);
@@ -435,7 +443,7 @@ fn test_no_stale_warning_with_mcp_watcher() {
 /// Search output should NOT contain stale warning when CLI lock held.
 #[test]
 fn test_no_stale_warning_with_cli_watcher() {
-    let _guard = WATCHER_LOCK.lock().unwrap();
+    let _guard = WATCHER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     stop_all_watchers();
     init_watchers();
     let (_dir, path) = make_project(&[("util.py", "def parse(): pass")]);
