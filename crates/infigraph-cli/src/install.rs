@@ -218,7 +218,7 @@ fn write_reindex_command(home: &Path) -> Result<()> {
     let reindex_cmd = commands_dir.join("infigraph-reindex.md");
     let reindex_content = r#"# Infigraph Reindex
 
-Reindex the current project in a subagent to avoid polluting main context with index output.
+Reindex the project directly (no subagent — saves tokens).
 
 ## Usage
 
@@ -228,13 +228,12 @@ Reindex the current project in a subagent to avoid polluting main context with i
 
 If `path` is omitted, uses the current working directory.
 
-## Agent Instructions
-
-You are a Infigraph reindex subagent. Your only job is to reindex the project and report results.
+## Instructions
 
 1. Determine project path: use the argument provided, or fall back to the current working directory.
-2. Call `mcp__infigraph__index_project` with that path.
-3. Report back in this exact format (nothing else):
+2. Load the tool schema: `ToolSearch("select:mcp__infigraph__index_project")`
+3. Call `mcp__infigraph__index_project` with that path directly (do NOT spawn an Agent).
+4. Report back in this exact format (nothing else):
 
 ```
 Reindexed: <path>
@@ -244,18 +243,12 @@ Languages: <comma-separated list with file counts>
 
 If indexing fails, report the error verbatim. Do not attempt fixes.
 "#;
-    if !reindex_cmd.exists() {
-        std::fs::write(&reindex_cmd, reindex_content)?;
-        println!(
-            "  Added /infigraph-reindex command to {}",
-            reindex_cmd.display()
-        );
-    } else {
-        println!(
-            "  /infigraph-reindex command already exists at {}",
-            reindex_cmd.display()
-        );
-    }
+    // Always overwrite to pick up content updates
+    std::fs::write(&reindex_cmd, reindex_content)?;
+    println!(
+        "  Updated /infigraph-reindex command at {}",
+        reindex_cmd.display()
+    );
     Ok(())
 }
 

@@ -1,12 +1,18 @@
+use std::sync::Mutex;
+
 use serde_json::json;
 
 use infigraph_mcp::tools::index::tool_index_project;
 use infigraph_mcp::tools::search::tool_search;
 
+// set_current_dir is process-global — tests that change CWD must not run in parallel.
+static CWD_LOCK: Mutex<()> = Mutex::new(());
+
 /// Issue #8: Infigraph tools fail when CWD is parent of indexed project directory.
 /// Tools should work using the `path` parameter, regardless of CWD.
 #[test]
 fn test_search_works_from_parent_cwd() {
+    let _lock = CWD_LOCK.lock().unwrap();
     // Create a project inside a parent directory
     let parent = tempfile::TempDir::new().expect("parent tmpdir");
     let project_dir = parent.path().join("myproject");
@@ -53,6 +59,7 @@ fn test_search_works_from_parent_cwd() {
 /// Issue #8: Search with relative path "." should use CWD, which may not be the project.
 #[test]
 fn test_search_with_dot_path_uses_cwd() {
+    let _lock = CWD_LOCK.lock().unwrap();
     let parent = tempfile::TempDir::new().expect("parent tmpdir");
     let project_dir = parent.path().join("subproject");
     std::fs::create_dir_all(project_dir.join("src")).unwrap();
@@ -83,6 +90,7 @@ fn test_search_with_dot_path_uses_cwd() {
 /// Issue #8: CWD is parent of indexed project, path is "." — should resolve via registry.
 #[test]
 fn test_search_dot_path_from_parent_finds_via_registry() {
+    let _lock = CWD_LOCK.lock().unwrap();
     let parent = tempfile::TempDir::new().expect("parent tmpdir");
     let project_dir = parent.path().join("child");
     std::fs::create_dir_all(project_dir.join("src")).unwrap();
