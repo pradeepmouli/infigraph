@@ -263,8 +263,12 @@ pub fn detect_session_cluster(store: &SessionStore) -> Result<Vec<SessionData>> 
         return Ok(sorted);
     }
 
+    const MAX_CLUSTER: usize = 3;
     let mut cluster = vec![sorted[0].clone()];
     for session in &sorted[1..] {
+        if cluster.len() >= MAX_CLUSTER {
+            break;
+        }
         let prev_updated = cluster.last().unwrap().updated_at;
         if prev_updated - session.updated_at <= CLUSTER_GAP_SECS {
             cluster.push(session.clone());
@@ -986,7 +990,11 @@ mod tests {
             make_session("session_2026-06-08", now, now),
         ]);
         let cluster = detect_session_cluster(&store).unwrap();
-        assert_eq!(cluster.len(), 5, "daily sessions should all cluster");
+        assert_eq!(
+            cluster.len(),
+            3,
+            "daily sessions cluster but capped at MAX_CLUSTER=3"
+        );
     }
 
     #[test]

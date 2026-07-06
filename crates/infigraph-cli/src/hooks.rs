@@ -149,6 +149,10 @@ session_id=$(echo "$input" | jq -r '.session_id // empty')
 counter_file="${TMPDIR:-/tmp}/infigraph-sessions/$session_id.count"
 echo "0" > "$counter_file" 2>/dev/null
 
+# Set saved sentinel for clear-guard (separate from exchange counter)
+saved_file="${TMPDIR:-/tmp}/infigraph-sessions/$session_id.saved"
+echo "1" > "$saved_file" 2>/dev/null
+
 exit 0
 "#;
 
@@ -164,6 +168,35 @@ cwd=$(echo "$input" | jq -r '.cwd // empty')
 [ -d "$cwd/.infigraph" ] || exit 0
 
 source_type=$(echo "$input" | jq -r '.source // "startup"')
+session_id=$(echo "$input" | jq -r '.session_id // empty')
+
+# Clear saved sentinel on new session (must save before /clear)
+if [ -n "$session_id" ]; then
+  rm -f "${TMPDIR:-/tmp}/infigraph-sessions/$session_id.saved" 2>/dev/null
+fi
+
+# Helper: read latest session JSON and extract key fields inline
+inject_session_summary() {
+  local sessions_dir="$cwd/.infigraph/sessions"
+  local latest=$(ls -t "$sessions_dir"/session_*.json 2>/dev/null | head -1)
+  [ -z "$latest" ] && return
+  local summary pending decisions constraints blockers
+  summary=$(jq -r '.summary // empty' "$latest" 2>/dev/null)
+  pending=$(jq -r '.pending_tasks // empty' "$latest" 2>/dev/null)
+  decisions=$(jq -r '.decisions // empty' "$latest" 2>/dev/null)
+  constraints=$(jq -r '.constraints // empty' "$latest" 2>/dev/null)
+  blockers=$(jq -r '.blockers // empty' "$latest" 2>/dev/null)
+  local session_id=$(basename "$latest" .json)
+  local out="PRIOR SESSION ($session_id):"
+  [ -n "$summary" ] && out="$out Summary: $summary."
+  [ -n "$pending" ] && out="$out Pending: $pending."
+  [ -n "$decisions" ] && out="$out Decisions: $decisions."
+  [ -n "$constraints" ] && out="$out Constraints: $constraints."
+  [ -n "$blockers" ] && out="$out Blockers: $blockers."
+  local narrative="$sessions_dir/${session_id}.md"
+  [ -f "$narrative" ] && out="$out Narrative log: $narrative (read if more context needed)."
+  echo "$out"
+}
 
 case "$source_type" in
   compact)
@@ -172,9 +205,18 @@ case "$source_type" in
 ENDJSON
     ;;
   startup|resume)
-    cat <<'ENDJSON'
-{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"INFIGRAPH SESSION RESTORE: Call mcp__infigraph__get_latest_session to recover prior session context (decisions, constraints, blockers, pending tasks). Do NOT start work without checking prior session state."}}
+    session_ctx=$(inject_session_summary)
+    if [ -n "$session_ctx" ]; then
+      session_ctx=$(echo "$session_ctx" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read().strip()))')
+      session_ctx=${session_ctx:1:-1}
+      cat <<ENDJSON
+{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"INFIGRAPH SESSION RESTORE: $session_ctx If you need more detail, call mcp__infigraph__get_latest_session. Do NOT start work without acknowledging prior session state."}}
 ENDJSON
+    else
+      cat <<'ENDJSON'
+{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"INFIGRAPH SESSION RESTORE: No prior sessions found. Fresh start."}}
+ENDJSON
+    fi
     ;;
   clear)
     # Reset exchange counters on /clear
@@ -187,13 +229,18 @@ ENDJSON
     rm -f "$cwd/.infigraph/.test-context-called" 2>/dev/null
     rm -f "$cwd/.infigraph/.search-fallback-allowed" 2>/dev/null
     backup=$(ls -t "$cwd"/.infigraph/sessions/unsaved-transcript-*.md 2>/dev/null | head -1)
+    session_ctx=$(inject_session_summary)
+    if [ -n "$session_ctx" ]; then
+      session_ctx=$(echo "$session_ctx" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read().strip()))')
+      session_ctx=${session_ctx:1:-1}
+    fi
     if [ -n "$backup" ]; then
       cat <<ENDJSON
-{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"INFIGRAPH CONTEXT RESET: Context was cleared. A pre-clear transcript backup exists at $backup. Read this file (contains last ~5 exchanges as clean markdown), extract key context (summary, decisions, pending tasks, files touched), then call mcp__infigraph__save_session to persist it. After saving, delete the backup file with Bash rm. Then call mcp__infigraph__get_latest_session to reload. Do NOT proceed with user work until this recovery is complete."}}
+{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"INFIGRAPH CONTEXT RESET: Context was cleared. $session_ctx A pre-clear transcript backup exists at $backup. Read this file (contains last ~5 exchanges as clean markdown), extract key context (summary, decisions, pending tasks, files touched), then call mcp__infigraph__save_session to persist it. After saving, delete the backup file with Bash rm. Do NOT proceed with user work until this recovery is complete."}}
 ENDJSON
     else
-      cat <<'ENDJSON'
-{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"INFIGRAPH CONTEXT RESET: Context was cleared. Call mcp__infigraph__get_latest_session to restore prior session state, then call mcp__infigraph__memory_context with the user's next query to inject relevant code and session context. Do NOT proceed without restoring context. NOTE: If session was NOT saved before /clear, some recent context may be lost — remind user to save_session before clearing next time."}}
+      cat <<ENDJSON
+{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"INFIGRAPH CONTEXT RESET: Context was cleared. $session_ctx If you need more detail, call mcp__infigraph__get_latest_session. NOTE: If session was NOT saved before /clear, some recent context may be lost."}}
 ENDJSON
     fi
     ;;
@@ -287,7 +334,7 @@ echo "$count" > "$counter_file"
 
 if [ $((count % 5)) -eq 0 ]; then
   cat <<'ENDJSON'
-{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":"MANDATORY VISIBLE ACTION — CONTEXT CLEANUP: You MUST print this message verbatim to the user RIGHT NOW before doing anything else:\n\n---\n🧹 **Context getting long** — type `/clear` to reset. Session was auto-saved.\n---\n\nDo NOT skip this message. Do NOT silently absorb it. The user MUST see it in the chat output. After printing, continue with the user's request."}}
+{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":"MANDATORY VISIBLE ACTION — CONTEXT CLEANUP: You MUST print this message verbatim to the user RIGHT NOW before doing anything else:\n\n---\n🧹 **Context getting long** — save session and type `/clear` to reset.\n---\n\nDo NOT skip this message. Do NOT silently absorb it. The user MUST see it in the chat output. After printing, continue with the user's request."}}
 ENDJSON
 fi
 
@@ -295,8 +342,9 @@ exit 0
 "#;
 
 pub(crate) const CLEAR_GUARD_HOOK_SCRIPT: &str = r##"#!/usr/bin/env bash
-# Infigraph UserPromptSubmit hook — block /clear unless session was saved recently.
-# Checks the session-reset sentinel set by PostToolUse after save_session.
+# Infigraph UserPromptSubmit hook — block /clear unless session was saved.
+# Uses a separate sentinel set by session-reset hook after save_session.
+# Sentinel is cleared on session start so each session must save at least once.
 
 input=$(cat)
 prompt=$(echo "$input" | jq -r '.prompt // empty')
@@ -310,18 +358,15 @@ session_id=$(echo "$input" | jq -r '.session_id // empty')
 cleaned=$(echo "$prompt" | sed 's/^[[:space:]]*//' | sed 's/[[:space:]]*$//')
 [ "$cleaned" = "/clear" ] || exit 0
 
-# Check if session was saved recently (sentinel set by session-reset hook after save_session)
-counter_dir="${TMPDIR:-/tmp}/infigraph-sessions"
-counter_file="$counter_dir/$session_id.count"
-count=0
-[ -f "$counter_file" ] && count=$(cat "$counter_file" 2>/dev/null || echo 0)
+# Check if save_session was called this session
+saved_file="${TMPDIR:-/tmp}/infigraph-sessions/$session_id.saved"
+if [ -f "$saved_file" ]; then
+  exit 0
+fi
 
-# count is reset to 0 after save_session. If it's 0, save was recent.
-if [ "$count" != "0" ]; then
-  cat <<'ENDJSON'
+cat <<'ENDJSON'
 {"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","decision":"block","reason":"⚠️ Session not saved! Call save_session first, then /clear. Unsaved context will be lost."}}
 ENDJSON
-fi
 
 exit 0
 "##;
