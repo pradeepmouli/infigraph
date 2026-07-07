@@ -411,3 +411,216 @@ fn test_combined_graph_contains_files() {
 
     std::env::set_var("HOME", &orig_home);
 }
+
+/// Fix 0 regression: same-named classes in different modules must NOT
+/// create false cross-repo INHERITS or CALLS edges.
+#[test]
+fn test_combined_graph_no_false_cross_repo_edges() {
+    let _guard = COMBINED_LOCK.lock().unwrap();
+    let home = tempfile::TempDir::new().unwrap();
+    let orig_home = std::env::var("HOME").unwrap_or_default();
+    std::env::set_var("HOME", home.path());
+
+    let dir_a = tempfile::TempDir::new().unwrap();
+    let path_a = make_repo(
+        &dir_a,
+        &[(
+            "config.py",
+            "\
+class Settings:
+    def __init__(self):
+        self.debug = True
+
+def get_settings():
+    return Settings()
+",
+        )],
+    );
+
+    let dir_b = tempfile::TempDir::new().unwrap();
+    let path_b = make_repo(
+        &dir_b,
+        &[(
+            "app_config.py",
+            "\
+class Settings:
+    def __init__(self):
+        self.port = 8080
+
+def get_settings():
+    return Settings()
+",
+        )],
+    );
+
+    let ig_a = index_repo(&path_a);
+    let ig_b = index_repo(&path_b);
+
+    let mut registry = Registry {
+        repos: HashMap::new(),
+        groups: HashMap::new(),
+    };
+    registry.repos.insert(
+        "svc-a".to_string(),
+        RepoEntry {
+            name: "svc-a".to_string(),
+            path: path_a,
+            languages: vec!["Python".to_string()],
+            symbol_count: ig_a.stats().map(|s| s.symbols).unwrap_or(0),
+            module_count: ig_a.stats().map(|s| s.modules).unwrap_or(0),
+        },
+    );
+    registry.repos.insert(
+        "svc-b".to_string(),
+        RepoEntry {
+            name: "svc-b".to_string(),
+            path: path_b,
+            languages: vec!["Python".to_string()],
+            symbol_count: ig_b.stats().map(|s| s.symbols).unwrap_or(0),
+            module_count: ig_b.stats().map(|s| s.modules).unwrap_or(0),
+        },
+    );
+    registry.groups.insert(
+        "test-false-match".to_string(),
+        Group {
+            name: "test-false-match".to_string(),
+            repos: vec!["svc-a".to_string(), "svc-b".to_string()],
+            contracts: vec![],
+        },
+    );
+
+    build_combined_graph(&registry, "test-false-match").unwrap();
+
+    let cross_inherits = combined_query(
+        "test-false-match",
+        "MATCH (a:Symbol)-[:INHERITS]->(b:Symbol) \
+         WHERE a.id STARTS WITH '[svc-a]' AND b.id STARTS WITH '[svc-b]' \
+         RETURN a.id, b.id",
+    )
+    .unwrap();
+    assert!(
+        cross_inherits.is_empty(),
+        "same-named Settings in different modules should NOT create cross-repo INHERITS, got {} edges",
+        cross_inherits.len()
+    );
+
+    let cross_calls = combined_query(
+        "test-false-match",
+        "MATCH (a:Symbol)-[:CALLS]->(b:Symbol) \
+         WHERE a.id STARTS WITH '[svc-a]' AND b.id STARTS WITH '[svc-b]' \
+         RETURN a.id, b.id",
+    )
+    .unwrap();
+    assert!(
+        cross_calls.is_empty(),
+        "same-named get_settings in different modules should NOT create cross-repo CALLS, got {} edges",
+        cross_calls.len()
+    );
+
+    std::env::set_var("HOME", &orig_home);
+}
+
+/// Fix 0 positive case: when repo-A has class Child(BaseHandler) and repo-B
+/// has the same base.py::BaseHandler, the cross-repo INHERITS bridge should fire.
+#[test]
+fn test_combined_graph_real_inherits_preserved() {
+    let _guard = COMBINED_LOCK.lock().unwrap();
+    let home = tempfile::TempDir::new().unwrap();
+    let orig_home = std::env::var("HOME").unwrap_or_default();
+    std::env::set_var("HOME", home.path());
+
+    // repo-A: base.py defines BaseHandler, child.py inherits from it
+    let dir_a = tempfile::TempDir::new().unwrap();
+    let path_a = make_repo(
+        &dir_a,
+        &[
+            (
+                "base.py",
+                "\
+class BaseHandler:
+    def handle(self):
+        pass
+",
+            ),
+            (
+                "child.py",
+                "\
+from base import BaseHandler
+
+class MyHandler(BaseHandler):
+    def handle(self):
+        return 'hello'
+",
+            ),
+        ],
+    );
+
+    // repo-B: base.py also defines BaseHandler (same qualified key: base::BaseHandler)
+    let dir_b = tempfile::TempDir::new().unwrap();
+    let path_b = make_repo(
+        &dir_b,
+        &[(
+            "base.py",
+            "\
+class BaseHandler:
+    def handle(self):
+        pass
+",
+        )],
+    );
+
+    let ig_a = index_repo(&path_a);
+    let ig_b = index_repo(&path_b);
+
+    let mut registry = Registry {
+        repos: HashMap::new(),
+        groups: HashMap::new(),
+    };
+    registry.repos.insert(
+        "lib-a".to_string(),
+        RepoEntry {
+            name: "lib-a".to_string(),
+            path: path_a,
+            languages: vec!["Python".to_string()],
+            symbol_count: ig_a.stats().map(|s| s.symbols).unwrap_or(0),
+            module_count: ig_a.stats().map(|s| s.modules).unwrap_or(0),
+        },
+    );
+    registry.repos.insert(
+        "lib-b".to_string(),
+        RepoEntry {
+            name: "lib-b".to_string(),
+            path: path_b,
+            languages: vec!["Python".to_string()],
+            symbol_count: ig_b.stats().map(|s| s.symbols).unwrap_or(0),
+            module_count: ig_b.stats().map(|s| s.modules).unwrap_or(0),
+        },
+    );
+    registry.groups.insert(
+        "test-real-inherit".to_string(),
+        Group {
+            name: "test-real-inherit".to_string(),
+            repos: vec!["lib-a".to_string(), "lib-b".to_string()],
+            contracts: vec![],
+        },
+    );
+
+    build_combined_graph(&registry, "test-real-inherit").unwrap();
+
+    // MyHandler in lib-a inherits BaseHandler in lib-a.
+    // BaseHandler exists in both repos with same qualified key.
+    // Cross-repo bridge should create INHERITS from lib-a::MyHandler to lib-b::BaseHandler.
+    let cross_inherits = combined_query(
+        "test-real-inherit",
+        "MATCH (a:Symbol)-[:INHERITS]->(b:Symbol) \
+         WHERE a.id STARTS WITH '[lib-a]' AND b.id STARTS WITH '[lib-b]' \
+         RETURN a.id, b.id",
+    )
+    .unwrap();
+    assert!(
+        !cross_inherits.is_empty(),
+        "MyHandler inheriting BaseHandler should bridge to lib-b's BaseHandler via same qualified key"
+    );
+
+    std::env::set_var("HOME", &orig_home);
+}

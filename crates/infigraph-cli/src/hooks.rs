@@ -207,10 +207,9 @@ ENDJSON
   startup|resume)
     session_ctx=$(inject_session_summary)
     if [ -n "$session_ctx" ]; then
-      session_ctx=$(echo "$session_ctx" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read().strip()))')
-      session_ctx=${session_ctx:1:-1}
+      session_ctx=$(echo "$session_ctx" | python3 -c 'import sys,json; s=json.dumps(sys.stdin.read().strip()); print(s[1:-1])')
       cat <<ENDJSON
-{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"INFIGRAPH SESSION RESTORE: $session_ctx If you need more detail, call mcp__infigraph__get_latest_session. Do NOT start work without acknowledging prior session state."}}
+{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"INFIGRAPH SESSION RESTORE: $session_ctx You MUST print a visible summary of prior session context to the user (summary + pending tasks) so they can see session continuity is working. Then call mcp__infigraph__get_latest_session if more detail needed."}}
 ENDJSON
     else
       cat <<'ENDJSON'
@@ -231,16 +230,15 @@ ENDJSON
     backup=$(ls -t "$cwd"/.infigraph/sessions/unsaved-transcript-*.md 2>/dev/null | head -1)
     session_ctx=$(inject_session_summary)
     if [ -n "$session_ctx" ]; then
-      session_ctx=$(echo "$session_ctx" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read().strip()))')
-      session_ctx=${session_ctx:1:-1}
+      session_ctx=$(echo "$session_ctx" | python3 -c 'import sys,json; s=json.dumps(sys.stdin.read().strip()); print(s[1:-1])')
     fi
     if [ -n "$backup" ]; then
       cat <<ENDJSON
-{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"INFIGRAPH CONTEXT RESET: Context was cleared. $session_ctx A pre-clear transcript backup exists at $backup. Read this file (contains last ~5 exchanges as clean markdown), extract key context (summary, decisions, pending tasks, files touched), then call mcp__infigraph__save_session to persist it. After saving, delete the backup file with Bash rm. Do NOT proceed with user work until this recovery is complete."}}
+{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"INFIGRAPH CONTEXT RESET: Context was cleared. $session_ctx You MUST print a visible summary of prior session context to the user (summary + pending tasks) so they can see session continuity is working. A pre-clear transcript backup exists at $backup. Read this file (contains last ~5 exchanges as clean markdown), extract key context (summary, decisions, pending tasks, files touched), then call mcp__infigraph__save_session to persist it. After saving, delete the backup file with Bash rm. Do NOT proceed with user work until this recovery is complete."}}
 ENDJSON
     else
       cat <<ENDJSON
-{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"INFIGRAPH CONTEXT RESET: Context was cleared. $session_ctx If you need more detail, call mcp__infigraph__get_latest_session. NOTE: If session was NOT saved before /clear, some recent context may be lost."}}
+{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"INFIGRAPH CONTEXT RESET: Context was cleared. $session_ctx You MUST print a visible summary of prior session context to the user (summary + pending tasks) so they can see session continuity is working. If you need more detail, call mcp__infigraph__get_latest_session. NOTE: If session was NOT saved before /clear, some recent context may be lost."}}
 ENDJSON
     fi
     ;;

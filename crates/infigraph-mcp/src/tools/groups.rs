@@ -229,6 +229,12 @@ pub fn tool_group_index(args: &Value) -> Result<String> {
                 if let Some(msg) = auto_start_watch(&p) {
                     out.push_str(&format!("{}\n", msg));
                 }
+                if let Err(e) = infigraph_core::claude_md::ensure_project_claude_md(&entry.path) {
+                    out.push_str(&format!(
+                        "warning: CLAUDE.md update failed for {}: {e}\n",
+                        repo_name
+                    ));
+                }
             }
         }
     }

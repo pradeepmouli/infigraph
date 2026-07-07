@@ -371,12 +371,14 @@ fn resolve_cross_repo(store: &GraphStore) -> Result<usize> {
     let conn = store.connection()?;
     let gq = GraphQuery::new(&conn);
 
-    // Build symbol map: name → [(id, file, kind)]
+    // Build symbol map: qualified_key → [(id, file, kind)]
+    // Key by module_stem::name to avoid false matches on bare names like "Settings"
     let mut symbol_map: HashMap<String, Vec<(String, String, String)>> = HashMap::new();
     let rows = gq.raw_query("MATCH (s:Symbol) RETURN s.name, s.id, s.file, s.kind")?;
     for row in &rows {
         if row.len() >= 4 {
-            symbol_map.entry(row[0].clone()).or_default().push((
+            let qualified_key = qualified_symbol_key(&row[0], &row[2]);
+            symbol_map.entry(qualified_key).or_default().push((
                 row[1].clone(),
                 row[2].clone(),
                 row[3].clone(),
@@ -387,9 +389,9 @@ fn resolve_cross_repo(store: &GraphStore) -> Result<usize> {
     let mut new_calls = 0;
     let mut new_inherits = 0;
 
-    // Cross-repo INHERITS: types with same name in multiple repos
+    // Cross-repo INHERITS: types with same qualified key in multiple repos
     let mut name_to_ids: HashMap<String, Vec<(String, String)>> = HashMap::new();
-    for (name, entries) in &symbol_map {
+    for (qkey, entries) in &symbol_map {
         let type_entries: Vec<_> = entries
             .iter()
             .filter(|(_, _, k)| {
@@ -399,14 +401,23 @@ fn resolve_cross_repo(store: &GraphStore) -> Result<usize> {
                 )
             })
             .collect();
-        if type_entries.len() >= 2 {
-            for (id, _, _) in &type_entries {
-                let repo = extract_repo(id);
-                name_to_ids
-                    .entry(name.clone())
-                    .or_default()
-                    .push((id.clone(), repo.to_string()));
-            }
+        if type_entries.len() < 2 {
+            continue;
+        }
+        // Only group types from different repos
+        let mut repos_seen: HashSet<&str> = HashSet::new();
+        for (id, _, _) in &type_entries {
+            repos_seen.insert(extract_repo(id));
+        }
+        if repos_seen.len() < 2 {
+            continue;
+        }
+        for (id, _, _) in &type_entries {
+            let repo = extract_repo(id);
+            name_to_ids
+                .entry(qkey.clone())
+                .or_default()
+                .push((id.clone(), repo.to_string()));
         }
     }
 
@@ -491,8 +502,10 @@ fn resolve_cross_repo(store: &GraphStore) -> Result<usize> {
     }
 
     // Build file→methods index for INHERITS-chain type files
+    // Use bare name (after "::") for method matching across files
     let mut file_methods: HashMap<String, HashMap<String, Vec<String>>> = HashMap::new();
-    for (name, entries) in &symbol_map {
+    for (qkey, entries) in &symbol_map {
+        let bare_name = qkey.split("::").last().unwrap_or(qkey);
         for (id, file, kind) in entries {
             if kind == "Class"
                 || kind == "Interface"
@@ -506,7 +519,7 @@ fn resolve_cross_repo(store: &GraphStore) -> Result<usize> {
             file_methods
                 .entry(file.clone())
                 .or_default()
-                .entry(name.clone())
+                .entry(bare_name.to_string())
                 .or_default()
                 .push(id.clone());
         }
@@ -670,6 +683,26 @@ pub fn strip_prefix(id: &str) -> &str {
     } else {
         id
     }
+}
+
+/// Build a qualified key from symbol name and file path.
+/// Strips the repo prefix from the file, extracts the module stem,
+/// and produces "module_stem::name". This prevents false cross-repo
+/// matches on common names like "Settings" or "Config" that appear
+/// in unrelated modules across repos.
+fn qualified_symbol_key(name: &str, file: &str) -> String {
+    // Strip repo prefix: "[repo-name]::path/to/file.py" → "path/to/file.py"
+    let file_path = if let Some(idx) = file.find("]::") {
+        &file[idx + 3..]
+    } else {
+        file
+    };
+    // Extract module stem: "path/to/settings.py" → "settings"
+    let stem = std::path::Path::new(file_path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    format!("{}::{}", stem, name)
 }
 
 pub fn extract_repo(id: &str) -> &str {

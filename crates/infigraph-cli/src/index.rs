@@ -175,6 +175,10 @@ pub(crate) fn cmd_index(root: &Path, full: bool, no_embed: bool) -> Result<()> {
     // SCIP enrichment in a detached child process — parent returns immediately.
     spawn_scip_child_process(root, &detected_languages);
 
+    if let Err(e) = infigraph_core::claude_md::ensure_project_claude_md(root) {
+        eprintln!("warning: failed to update project CLAUDE.md: {e}");
+    }
+
     Ok(())
 }
 

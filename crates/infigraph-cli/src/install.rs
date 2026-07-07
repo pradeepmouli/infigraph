@@ -184,6 +184,8 @@ For tasks requiring a subagent, use **general-purpose** — it has full MCP/infi
     Ok(())
 }
 
+// Project-level CLAUDE.md generation moved to infigraph_core::claude_md
+
 fn write_editor_rules(home: &Path) -> Result<()> {
     let marker = "<!-- infigraph-primary-search -->";
     let instructions = crate::agent::infigraph_instructions();
@@ -391,6 +393,17 @@ pub(crate) fn cmd_uninstall() -> Result<()> {
         if bin_path.exists() {
             std::fs::remove_file(&bin_path)?;
             println!("  Removed binary: {}", bin_path.display());
+        }
+    }
+
+    // Remove project-level CLAUDE.md managed blocks from all registered projects
+    if let Ok(registry) = infigraph_core::multi::Registry::load() {
+        for (name, entry) in &registry.repos {
+            match infigraph_core::claude_md::remove_project_claude_md(&entry.path) {
+                Ok(true) => println!("  Removed CLAUDE.md block from {}", name),
+                Ok(false) => {}
+                Err(e) => eprintln!("  warning: failed to clean CLAUDE.md for {}: {e}", name),
+            }
         }
     }
 

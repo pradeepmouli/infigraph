@@ -97,6 +97,12 @@ pub fn tool_index_project(args: &Value) -> Result<String> {
         out.push_str(&format!("\n{}", msg));
     }
     auto_start_doc_watch(path);
+    if let Err(e) = infigraph_core::claude_md::ensure_project_claude_md(std::path::Path::new(path))
+    {
+        out.push_str(&format!(
+            "\nwarning: failed to update project CLAUDE.md: {e}"
+        ));
+    }
     Ok(out)
 }
 

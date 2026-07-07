@@ -606,6 +606,14 @@ fn store_manifest(store: &GraphStore, result: &ManifestResult) -> Result<()> {
                 escape(&id), escape(&dep.name), escape(&dep.version), escape(&dep.ecosystem), dep.is_dev
             );
             let _ = conn.query(&insert);
+        } else {
+            let update = format!(
+                "MATCH (d:Dependency) WHERE d.id = '{}' SET d.version = '{}', d.is_dev = {}",
+                escape(&id),
+                escape(&dep.version),
+                dep.is_dev
+            );
+            let _ = conn.query(&update);
         }
 
         // Wire DEPENDS_ON from the manifest's Module (or first Module in project)
@@ -633,4 +641,53 @@ fn split_pep508(s: &str) -> (String, String) {
 
 fn escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('\'', "\\'")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_manifest_upsert_updates_version() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("graph");
+        let store = crate::graph::GraphStore::open(&db_path).unwrap();
+        let result1 = ManifestResult {
+            manifest_file: "pyproject.toml".to_string(),
+            ecosystem: "pypi".to_string(),
+            deps: vec![DepEntry {
+                name: "requests".to_string(),
+                version: "1.0".to_string(),
+                ecosystem: "pypi".to_string(),
+                is_dev: false,
+            }],
+        };
+        store_manifest(&store, &result1).unwrap();
+
+        let conn = store.connection().unwrap();
+        let gq = crate::graph::GraphQuery::new(&conn);
+        let rows = gq
+            .raw_query("MATCH (d:Dependency) WHERE d.id = 'pypi::requests' RETURN d.version")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0], "1.0");
+
+        let result2 = ManifestResult {
+            manifest_file: "pyproject.toml".to_string(),
+            ecosystem: "pypi".to_string(),
+            deps: vec![DepEntry {
+                name: "requests".to_string(),
+                version: "2.0".to_string(),
+                ecosystem: "pypi".to_string(),
+                is_dev: false,
+            }],
+        };
+        store_manifest(&store, &result2).unwrap();
+
+        let rows2 = gq
+            .raw_query("MATCH (d:Dependency) WHERE d.id = 'pypi::requests' RETURN d.version")
+            .unwrap();
+        assert_eq!(rows2.len(), 1);
+        assert_eq!(rows2[0][0], "2.0");
+    }
 }

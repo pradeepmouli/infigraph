@@ -58,6 +58,7 @@ pub enum ContractKind {
     GrpcService,
     EventPublish,
     EventSubscribe,
+    SharedPackage,
 }
 
 impl Registry {
@@ -225,27 +226,62 @@ pub fn extract_contracts(prism: &Infigraph, service_name: &str) -> Result<Vec<Co
 
     // 2. Decorated functions with route info in docstring
     let decorated_rows = gq.raw_query(
-        "MATCH (s:Symbol) WHERE s.kind IN ['Function', 'Method'] AND s.docstring IS NOT NULL AND (s.docstring CONTAINS '@app.route' OR s.docstring CONTAINS '@app.get' OR s.docstring CONTAINS '@app.post' OR s.docstring CONTAINS '#[get' OR s.docstring CONTAINS '#[post' OR s.docstring CONTAINS '@GetMapping' OR s.docstring CONTAINS '@PostMapping' OR s.docstring CONTAINS '@RequestMapping' OR s.docstring CONTAINS 'MapGet' OR s.docstring CONTAINS 'MapPost') RETURN s.id, s.name, s.kind, s.file, s.docstring",
+        "MATCH (s:Symbol) WHERE s.kind IN ['Function', 'Method'] AND s.docstring IS NOT NULL AND (s.docstring CONTAINS '@app.route' OR s.docstring CONTAINS '@app.get' OR s.docstring CONTAINS '@app.post' OR s.docstring CONTAINS '@router.get' OR s.docstring CONTAINS '@router.post' OR s.docstring CONTAINS '@router.put' OR s.docstring CONTAINS '@router.delete' OR s.docstring CONTAINS '@router.patch' OR s.docstring CONTAINS '#[get' OR s.docstring CONTAINS '#[post' OR s.docstring CONTAINS '@GetMapping' OR s.docstring CONTAINS '@PostMapping' OR s.docstring CONTAINS '@RequestMapping' OR s.docstring CONTAINS 'MapGet' OR s.docstring CONTAINS 'MapPost') RETURN s.id, s.name, s.kind, s.file, s.docstring",
     )?;
+    let mut prefix_cache: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    let project_root = prism.root();
     for row in &decorated_rows {
         let doc = row.get(4).map(|s| s.as_str()).unwrap_or("");
         let (method, path) = parse_route_from_docstring(doc);
         if !path.is_empty() {
-            let key = format!("{} {}", method, path);
+            let file = &row[3];
+            let full_path = if doc.contains("@router.") {
+                let prefix = prefix_cache
+                    .entry(file.clone())
+                    .or_insert_with(|| extract_router_prefix(project_root, file));
+                format!("{}{}", prefix, path)
+            } else {
+                path
+            };
+            let key = format!("{} {}", method, full_path);
             if seen_paths.insert(key) {
                 contracts.push(Contract {
                     kind: ContractKind::HttpRoute,
                     service: service_name.to_string(),
                     method,
-                    path,
+                    path: full_path,
                     symbol_id: row[0].clone(),
-                    file: row[3].clone(),
+                    file: file.clone(),
                 });
             }
         }
     }
 
     Ok(contracts)
+}
+
+/// Extract the APIRouter/Router prefix from a Python/Go/etc source file.
+/// Looks for patterns like `APIRouter(prefix="/v1/labrador")` or `router.prefix("/api")`.
+fn extract_router_prefix(project_root: &Path, file: &str) -> String {
+    let full_path = project_root.join(file);
+    if let Ok(content) = std::fs::read_to_string(&full_path) {
+        for line in content.lines() {
+            let trimmed = line.trim();
+            // Python FastAPI: APIRouter(prefix="/v1/labrador", ...)
+            if let Some(idx) = trimmed.find("prefix=") {
+                let after = &trimmed[idx + 7..];
+                let after = after.trim_start_matches('\"').trim_start_matches('\'');
+                if let Some(end) = after.find(['"', '\'']) {
+                    let prefix = &after[..end];
+                    if prefix.starts_with('/') {
+                        return prefix.to_string();
+                    }
+                }
+            }
+        }
+    }
+    String::new()
 }
 
 /// Parse "GET /api/users" or "MAPGET /api/users" into (method, path).
@@ -298,30 +334,35 @@ fn parse_route_from_docstring(doc: &str) -> (String, String) {
             "UNKNOWN"
         }
     } else if doc_lower.contains("@app.get")
+        || doc_lower.contains("@router.get")
         || doc_lower.contains("#[get")
         || doc_lower.contains("getmapping")
         || doc_lower.contains("mapget")
     {
         "GET"
     } else if doc_lower.contains("@app.post")
+        || doc_lower.contains("@router.post")
         || doc_lower.contains("#[post")
         || doc_lower.contains("postmapping")
         || doc_lower.contains("mappost")
     {
         "POST"
     } else if doc_lower.contains("@app.put")
+        || doc_lower.contains("@router.put")
         || doc_lower.contains("#[put")
         || doc_lower.contains("putmapping")
         || doc_lower.contains("mapput")
     {
         "PUT"
     } else if doc_lower.contains("@app.delete")
+        || doc_lower.contains("@router.delete")
         || doc_lower.contains("#[delete")
         || doc_lower.contains("deletemapping")
         || doc_lower.contains("mapdelete")
     {
         "DELETE"
     } else if doc_lower.contains("@app.patch")
+        || doc_lower.contains("@router.patch")
         || doc_lower.contains("#[patch")
         || doc_lower.contains("patchmapping")
         || doc_lower.contains("mappatch")
@@ -348,6 +389,21 @@ pub fn sync_group_contracts(
 
     let mut all_contracts = Vec::new();
 
+    // First pass: build publisher map (lightweight, no graph open)
+    let mut publishers: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for repo_name in &group.repos {
+        let entry = match registry.repos.get(repo_name) {
+            Some(e) => e,
+            None => continue,
+        };
+        if let Some(pkg_name) = cross_service::read_published_package_name(&entry.path) {
+            publishers.insert(pkg_name, repo_name.clone());
+        }
+    }
+
+    // Second pass: extract routes + collect deps (one graph open per repo)
+    let mut dep_map: Vec<(String, Vec<String>)> = Vec::new();
     for repo_name in &group.repos {
         let entry = registry
             .repos
@@ -361,6 +417,43 @@ pub fn sync_group_contracts(
 
         let contracts = extract_contracts(&prism, repo_name)?;
         all_contracts.extend(contracts);
+
+        // Collect dependency names while graph is open
+        if let Some(store) = prism.store() {
+            if let Ok(conn) = store.connection() {
+                let gq = crate::graph::GraphQuery::new(&conn);
+                let dep_rows = gq
+                    .raw_query("MATCH (d:Dependency) RETURN d.name")
+                    .unwrap_or_default();
+                let dep_names: Vec<String> = dep_rows
+                    .into_iter()
+                    .filter_map(|r| r.into_iter().next())
+                    .collect();
+                dep_map.push((repo_name.clone(), dep_names));
+            }
+        }
+    }
+
+    // Match deps against publishers
+    let mut seen_pkg: std::collections::HashSet<(String, String)> =
+        std::collections::HashSet::new();
+    for (repo_name, dep_names) in &dep_map {
+        for dep_name in dep_names {
+            if let Some(publisher_repo) = publishers.get(dep_name) {
+                if publisher_repo != repo_name
+                    && seen_pkg.insert((repo_name.clone(), publisher_repo.clone()))
+                {
+                    all_contracts.push(Contract {
+                        kind: ContractKind::SharedPackage,
+                        service: publisher_repo.clone(),
+                        method: "package".to_string(),
+                        path: dep_name.clone(),
+                        symbol_id: format!("pkg::{}::{}", publisher_repo, dep_name),
+                        file: String::new(),
+                    });
+                }
+            }
+        }
     }
 
     let count = all_contracts.len();
