@@ -238,6 +238,7 @@ impl GraphStore {
         let mut sym_complexities: Vec<i64> = Vec::new();
         let mut sym_parameters = Vec::new();
         let mut sym_return_types = Vec::new();
+        let mut sym_categories = Vec::new();
         let mut contains_pairs: Vec<(String, String)> = Vec::new();
         let mut defines_pairs: Vec<(String, String)> = Vec::new();
 
@@ -306,6 +307,7 @@ impl GraphStore {
                     sym_complexities.push(sym.complexity as i64);
                     sym_parameters.push(sym.parameters.as_deref().unwrap_or("").to_string());
                     sym_return_types.push(sym.return_type.as_deref().unwrap_or("").to_string());
+                    sym_categories.push(super::store_util::classify_file(&e.file).to_string());
                     contains_pairs.push((e.file.clone(), sym.id.clone()));
                     defines_pairs.push((e.file.clone(), sym.id.clone()));
                 }
@@ -446,6 +448,7 @@ impl GraphStore {
                 ("complexity", DataType::Int64),
                 ("parameters", DataType::Utf8),
                 ("return_type", DataType::Utf8),
+                ("category", DataType::Utf8),
             ],
             vec![
                 Arc::new(StringArray::from(sym_ids)),
@@ -462,6 +465,7 @@ impl GraphStore {
                 Arc::new(Int64Array::from(sym_complexities)),
                 Arc::new(StringArray::from(sym_parameters)),
                 Arc::new(StringArray::from(sym_return_types)),
+                Arc::new(StringArray::from(sym_categories)),
             ],
         )?;
 
@@ -471,7 +475,7 @@ impl GraphStore {
         conn.query(&format!("COPY File FROM '{}'", fwd_slash_path(&file_pq)))
             .map_err(|e| anyhow::anyhow!("COPY File failed: {e}"))?;
         conn.query(&format!(
-            "COPY Symbol (id, name, kind, file, start_line, end_line, signature_hash, language, visibility, parent, docstring, complexity, parameters, return_type) FROM '{}'",
+            "COPY Symbol (id, name, kind, file, start_line, end_line, signature_hash, language, visibility, parent, docstring, complexity, parameters, return_type, category) FROM '{}'",
             fwd_slash_path(&sym_pq)
         )).map_err(|e| anyhow::anyhow!("COPY Symbol failed: {e}"))?;
 

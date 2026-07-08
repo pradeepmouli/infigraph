@@ -60,20 +60,22 @@ impl GraphStore {
         // 3. All Symbol nodes in chunks (query string size limit)
         const SYM_CHUNK: usize = 2000;
         let all_syms: Vec<String> = extractions.iter().flat_map(|e| {
+            let cat = super::store_util::classify_file(&e.file);
             e.symbols.iter().map(move |sym| format!(
-                "{{id: '{}', name: '{}', kind: '{}', file: '{}', start_line: {}, end_line: {}, signature_hash: '{}', language: '{}', visibility: '{}', parent: '{}', docstring: '{}', complexity: {}, parameters: '{}', return_type: '{}'}}",
+                "{{id: '{}', name: '{}', kind: '{}', file: '{}', start_line: {}, end_line: {}, signature_hash: '{}', language: '{}', visibility: '{}', parent: '{}', docstring: '{}', complexity: {}, parameters: '{}', return_type: '{}', category: '{}'}}",
                 escape(&sym.id), escape(&sym.name), sym.kind.as_str(), escape(&e.file),
                 sym.span.start_line, sym.span.end_line, escape(&sym.signature_hash),
                 escape(&sym.language), escape(sym.visibility.as_deref().unwrap_or("")),
                 escape(sym.parent.as_deref().unwrap_or("")),
                 escape(sym.docstring.as_deref().unwrap_or("")), sym.complexity,
                 escape(sym.parameters.as_deref().unwrap_or("")),
-                escape(sym.return_type.as_deref().unwrap_or(""))
+                escape(sym.return_type.as_deref().unwrap_or("")),
+                cat
             ))
         }).collect();
         for chunk in all_syms.chunks(SYM_CHUNK) {
             conn.query(&format!(
-                "UNWIND [{}] AS s CREATE (:Symbol {{id: s.id, name: s.name, kind: s.kind, file: s.file, start_line: s.start_line, end_line: s.end_line, signature_hash: s.signature_hash, language: s.language, visibility: s.visibility, parent: s.parent, docstring: s.docstring, complexity: s.complexity, parameters: s.parameters, return_type: s.return_type}})",
+                "UNWIND [{}] AS s CREATE (:Symbol {{id: s.id, name: s.name, kind: s.kind, file: s.file, start_line: s.start_line, end_line: s.end_line, signature_hash: s.signature_hash, language: s.language, visibility: s.visibility, parent: s.parent, docstring: s.docstring, complexity: s.complexity, parameters: s.parameters, return_type: s.return_type, category: s.category}})",
                 chunk.join(", ")
             )).context("bulk symbol insert")?;
         }

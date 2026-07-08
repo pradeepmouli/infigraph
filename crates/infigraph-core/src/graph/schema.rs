@@ -1,6 +1,7 @@
 pub const MIGRATIONS: &[&str] = &[
     "ALTER TABLE Symbol ADD parameters STRING DEFAULT ''",
     "ALTER TABLE Symbol ADD return_type STRING DEFAULT ''",
+    "ALTER TABLE Symbol ADD category STRING DEFAULT 'impl'",
     "CREATE NODE TABLE IF NOT EXISTS Statement(id STRING, kind STRING, condition STRING, start_line INT32, end_line INT32, depth INT32, parent_symbol STRING, PRIMARY KEY(id))",
     "CREATE REL TABLE IF NOT EXISTS HAS_STATEMENT(FROM Symbol TO Statement)",
     "CREATE NODE TABLE IF NOT EXISTS Concern(id STRING, kind STRING, detail STRING, PRIMARY KEY(id))",
@@ -29,6 +30,7 @@ pub const CREATE_SCHEMA: &[&str] = &[
         complexity INT32,
         parameters STRING,
         return_type STRING,
+        category STRING,
         PRIMARY KEY(id)
     )",
     "CREATE NODE TABLE IF NOT EXISTS Module(

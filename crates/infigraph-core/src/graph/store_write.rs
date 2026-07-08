@@ -85,9 +85,10 @@ impl GraphStore {
 
         // Batch insert symbols via UNWIND
         if !extraction.symbols.is_empty() {
+            let cat = super::store_util::classify_file(&extraction.file);
             let sym_rows: Vec<String> = extraction.symbols.iter().map(|sym| {
                 format!(
-                    "{{id: '{}', name: '{}', kind: '{}', file: '{}', start_line: {}, end_line: {}, signature_hash: '{}', language: '{}', visibility: '{}', parent: '{}', docstring: '{}', complexity: {}, parameters: '{}', return_type: '{}'}}",
+                    "{{id: '{}', name: '{}', kind: '{}', file: '{}', start_line: {}, end_line: {}, signature_hash: '{}', language: '{}', visibility: '{}', parent: '{}', docstring: '{}', complexity: {}, parameters: '{}', return_type: '{}', category: '{}'}}",
                     escape(&sym.id),
                     escape(&sym.name),
                     sym.kind.as_str(),
@@ -102,10 +103,11 @@ impl GraphStore {
                     sym.complexity,
                     escape(sym.parameters.as_deref().unwrap_or("")),
                     escape(sym.return_type.as_deref().unwrap_or("")),
+                    cat,
                 )
             }).collect();
             let batch_insert = format!(
-                "UNWIND [{}] AS s CREATE (:Symbol {{id: s.id, name: s.name, kind: s.kind, file: s.file, start_line: s.start_line, end_line: s.end_line, signature_hash: s.signature_hash, language: s.language, visibility: s.visibility, parent: s.parent, docstring: s.docstring, complexity: s.complexity, parameters: s.parameters, return_type: s.return_type}})",
+                "UNWIND [{}] AS s CREATE (:Symbol {{id: s.id, name: s.name, kind: s.kind, file: s.file, start_line: s.start_line, end_line: s.end_line, signature_hash: s.signature_hash, language: s.language, visibility: s.visibility, parent: s.parent, docstring: s.docstring, complexity: s.complexity, parameters: s.parameters, return_type: s.return_type, category: s.category}})",
                 sym_rows.join(", ")
             );
             conn.query(&batch_insert)
