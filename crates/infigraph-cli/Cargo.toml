@@ -37,11 +37,11 @@ path = "src/bin/cozo_vs_kuzu.rs"
 [dependencies]
 infigraph-core.workspace = true
 infigraph-languages.workspace = true
-infigraph-grammar-plugin = { path = "../infigraph-grammar-plugin", version = "2.1.0" }
-infigraph-docs = { path = "../infigraph-docs", version = "2.1.0" }
-infigraph-confluence = { path = "../infigraph-confluence", version = "2.1.0" }
-infigraph-mcp = { path = "../infigraph-mcp", version = "2.1.0" }
-infigraph-pipeline-plugin = { path = "../infigraph-pipeline-plugin", version = "2.1.0" }
+infigraph-grammar-plugin = { path = "../infigraph-grammar-plugin" }
+infigraph-docs = { path = "../infigraph-docs" }
+infigraph-confluence = { path = "../infigraph-confluence" }
+infigraph-mcp = { path = "../infigraph-mcp" }
+infigraph-pipeline-plugin = { path = "../infigraph-pipeline-plugin" }
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true

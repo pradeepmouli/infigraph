@@ -11,7 +11,7 @@ readme.workspace = true
 description = "Confluence ingestion for Infigraph — fetch, parse, and index Confluence pages into the document graph"
 
 [dependencies]
-infigraph-docs = { path = "../infigraph-docs", version = "2.1.0" }
+infigraph-docs = { path = "../infigraph-docs" }
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
