@@ -1,3 +1,4 @@
+pub mod compress;
 pub mod tools;
 pub mod web;
 
@@ -344,7 +345,7 @@ pub fn build_tools_list() -> Vec<Value> {
         tool_def("index_project", "REQUIRED FIRST STEP: Parse all source files and build the code knowledge graph. Must run before any other infigraph tool. Auto-indexes 60+ languages.",
             p(true,false,false,json!({})), &["path"]),
         tool_def("search", "PRIMARY: Unified search — finds symbols by name, meaning, or text pattern in one call. Runs keyword-hybrid (BM25+vector) AND semantic-hybrid AND regex grep together, merges and deduplicates results. Auto-escalates internally when results are weak — no need to retry with different tools. Use this INSTEAD OF grep/ripgrep/find for ALL search. Set scope='docs' for document-only search.",
-            p(true,false,false,json!({"query":{"type":"string","description":"Search query (symbol name, natural language, or text pattern)"},"limit":{"type":"integer","default":20},"kind":{"type":"string","description":"Optional: filter by symbol kind (Function, Method, Class, etc.)"},"file_pattern":{"type":"string","description":"Optional: glob to restrict text search (e.g. '*.py')"},"scope":{"type":"string","enum":["code","docs","all"],"default":"all","description":"Search scope: code (symbols only), docs (documents only), all (both)"},"regex":{"type":"boolean","default":false,"description":"If true, treat query as a raw regex pattern for grep (not escaped)"}})), &["path","query"]),
+            p(true,false,false,json!({"query":{"type":"string","description":"Search query (symbol name, natural language, or text pattern)"},"limit":{"type":"integer","default":20},"kind":{"type":"string","description":"Optional: filter by symbol kind (Function, Method, Class, etc.)"},"file_pattern":{"type":"string","description":"Optional: glob to restrict text search (e.g. '*.py')"},"scope":{"type":"string","enum":["code","docs","all"],"default":"all","description":"Search scope: code (symbols only), docs (documents only), all (both)"},"regex":{"type":"boolean","default":false,"description":"If true, treat query as a raw regex pattern for grep (not escaped)"},"detail":{"type":"boolean","default":false,"description":"If true, return full source snippets and doc excerpts. Default (false) returns compact one-line-per-result format."}})), &["path","query"]),
         tool_def("search_symbols", "Advanced: Find symbols by name with keyword-weighted hybrid search (alpha=0.3). Prefer the unified `search` tool for most use cases.",
             p(true,false,false,json!({"query":{"type":"string","description":"Search query"},"limit":{"type":"integer","default":10}})), &["path","query"]),
         tool_def("query_graph", "Advanced: Execute Cypher query against code knowledge graph. Use for complex cross-cutting queries not covered by other tools. Full Cypher support.",
@@ -365,8 +366,8 @@ pub fn build_tools_list() -> Vec<Value> {
             p(true,false,false,json!({"pattern":{"type":"string"},"file_pattern":{"type":"string"},"limit":{"type":"integer","default":50}})), &["path","pattern"]),
         tool_def("get_code_snippet", "PRIMARY: Get source code for a symbol by ID. Use INSTEAD OF reading files to view function/class source. Returns exact source with context.",
             p(true,true,false,json!({})), &["path","symbol_id"]),
-        tool_def("get_architecture", "PRIMARY: Codebase architecture overview. Use FIRST when onboarding to a new project. Returns language breakdown, hotspot files, hub functions, entry points.",
-            p(true,false,false,json!({})), &["path"]),
+        tool_def("get_architecture", "PRIMARY: Codebase architecture overview. Use FIRST when onboarding to a new project. Default returns compact summary (top-5 per section); set detail=true for full listing including all entry points.",
+            p(true,false,false,json!({"detail":{"type":"boolean","default":false,"description":"If true, return full listing. Default (false) returns top-5 per section."}})), &["path"]),
         tool_def("detect_changes", "PRIMARY: Map git changes to affected symbols and blast radius. Use INSTEAD OF git diff + manual tracing. Shows exactly which functions changed and what depends on them.",
             p(true,false,false,json!({"base":{"type":"string","default":"HEAD"},"depth":{"type":"integer","default":3}})), &["path"]),
         tool_def("list_projects", "List all indexed projects from the global registry.",
@@ -419,8 +420,8 @@ pub fn build_tools_list() -> Vec<Value> {
             p(true,false,false,json!({})), &["path"]),
         tool_def("get_dependencies", "PRIMARY: List external dependencies. Use INSTEAD OF reading package.json/Cargo.toml/go.mod manually. Filter by ecosystem (npm/cargo/pip/maven/gem/nuget/go/composer/pub).",
             p(true,false,false,json!({"ecosystem":{"type":"string"}})), &["path"]),
-        tool_def("find_all_references", "PRIMARY: Find every location where a symbol is referenced. Use INSTEAD OF grep for rename/refactor safety. Returns file, line, and calling context.",
-            p(true,true,false,json!({})), &["path","symbol_id"]),
+        tool_def("find_all_references", "PRIMARY: Find every location where a symbol is referenced. Use INSTEAD OF grep for rename/refactor safety. Default groups by file; set detail=true for per-line calling context.",
+            p(true,true,false,json!({"detail":{"type":"boolean","default":false,"description":"If true, return full per-reference context. Default (false) groups by file."}})), &["path","symbol_id"]),
         tool_def("get_api_surface", "PRIMARY: Public API surface — all public symbols and HTTP routes in one call. Use INSTEAD OF reading every file to find public interfaces.",
             p(true,false,true,json!({})), &["path"]),
         tool_def("get_file_deps", "PRIMARY: File-level import graph. Use INSTEAD OF reading imports manually. Shows what this file imports and what imports it.",
@@ -463,8 +464,8 @@ pub fn build_tools_list() -> Vec<Value> {
             p(true,false,false,json!({"kind":{"type":"string","description":"Filter by kind: FFI, JNI, CGO, GRPC, P_INVOKE, CTYPES, WASM, COM (default: all)"}})), &["path"]),
         tool_def("semantic_search", "Advanced: Find code by meaning using semantic-weighted hybrid search (alpha=0.85). Prefer the unified `search` tool for most use cases.",
             p(true,false,false,json!({"query":{"type":"string","description":"Natural language description of what you're looking for"},"limit":{"type":"integer","default":10},"kind":{"type":"string","description":"Optional: filter by symbol kind (Function, Method, Class, etc.)"}})), &["path","query"]),
-        tool_def("get_doc_context", "PRIMARY: Full documentation context for a symbol — signature, docstring, source, callers, callees, file. One call replaces get_code_snippet + trace_callers + trace_callees. Use BEFORE modifying any function.",
-            p(true,true,false,json!({})), &["path","symbol_id"]),
+        tool_def("get_doc_context", "PRIMARY: Full documentation context for a symbol — signature, docstring, source, callers, callees, file. One call replaces get_code_snippet + trace_callers + trace_callees. Use BEFORE modifying any function. Default returns compact summary (no source); set detail=true for full source.",
+            p(true,true,false,json!({"detail":{"type":"boolean","default":false,"description":"If true, return full source code. Default (false) returns signature + callers/callees only."}})), &["path","symbol_id"]),
         tool_def("detect_clones", "PRIMARY: Find near-duplicate functions using vector similarity. Use to identify copy-paste code and refactoring opportunities. Stores SIMILAR_TO edges for later querying.",
             p(true,false,false,json!({"threshold":{"type":"number","default":0.92,"description":"Similarity threshold 0.0-1.0 (default: 0.92). Lower = more results but more false positives."},"limit":{"type":"integer","default":20,"description":"Max clone pairs to return"},"kinds":{"type":"string","default":"Function,Method","description":"Comma-separated symbol kinds to check (default: Function,Method)"},"store_edges":{"type":"boolean","default":true,"description":"Write SIMILAR_TO edges to graph for later querying"}})), &["path"]),
         tool_def("refactor", "PRIMARY: Analyze code for refactoring opportunities — file size, complexity hotspots, coupling (fan-in/fan-out), near-duplicate functions, dead code. Returns ranked recommendations with impact/effort scores. Use instead of manually running detect_clones + get_complexity + detect_dead_code separately.",

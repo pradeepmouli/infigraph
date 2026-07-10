@@ -439,6 +439,13 @@ fn handle_tools_list(id: &Value) -> Value {
     })
 }
 
+fn estimate_tokens(text: &str) -> usize {
+    // Calibrated heuristic: split on whitespace + punctuation boundaries.
+    // Code ~1.5x words, prose ~1.3x. Use 1.4 as middle ground for mixed output.
+    let words = text.split_whitespace().count();
+    ((words as f64) * 1.4).ceil() as usize
+}
+
 fn handle_tools_call(id: &Value, request: &Value) -> Value {
     let params = request.get("params").cloned().unwrap_or(Value::Null);
     let tool_name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
@@ -446,18 +453,77 @@ fn handle_tools_call(id: &Value, request: &Value) -> Value {
 
     tools::helpers::log_activity(tool_name, &args);
 
+    let metrics_enabled = std::env::var("INFIGRAPH_METRICS").is_ok_and(|v| v == "1");
+
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         infigraph_mcp::dispatch_tool(tool_name, &args)
     }));
 
     match result {
-        Ok(Ok(content)) => json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "result": {
-                "content": [{ "type": "text", "text": content }]
+        Ok(Ok(content)) => {
+            let compressed =
+                infigraph_mcp::compress::compress_tool_output(&content, tool_name, &args);
+            if metrics_enabled {
+                let raw_tokens = estimate_tokens(&content);
+                let comp_tokens = estimate_tokens(&compressed);
+                let ratio = if raw_tokens > 0 {
+                    comp_tokens as f64 / raw_tokens as f64
+                } else {
+                    1.0
+                };
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let args_summary = args
+                    .get("query")
+                    .or_else(|| args.get("symbol"))
+                    .or_else(|| args.get("name"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let detail = args
+                    .get("detail")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let line = json!({
+                    "tool": tool_name,
+                    "timestamp": ts,
+                    "raw_tokens": raw_tokens,
+                    "compressed_tokens": comp_tokens,
+                    "compression_ratio": (ratio * 100.0).round() / 100.0,
+                    "detail_requested": detail,
+                    "args_summary": args_summary,
+                });
+                if let Some(dir) = args
+                    .get("path")
+                    .and_then(|p| p.as_str())
+                    .map(|p| std::path::PathBuf::from(p).join(".infigraph"))
+                    .or_else(|| {
+                        std::env::var("HOME")
+                            .ok()
+                            .map(|h| std::path::PathBuf::from(h).join(".infigraph"))
+                    })
+                {
+                    let _ = std::fs::create_dir_all(&dir);
+                    let path = dir.join("compression_metrics.jsonl");
+                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&path)
+                    {
+                        use std::io::Write;
+                        let _ = writeln!(f, "{}", line);
+                    }
+                }
             }
-        }),
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "content": [{ "type": "text", "text": compressed }]
+                }
+            })
+        }
         Ok(Err(e)) => {
             mcp_log("ERROR", &format!("tool={tool_name} err={e}"));
             json!({
