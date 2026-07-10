@@ -101,6 +101,27 @@ fn cli_map_entries_are_valid_mcp_tool_names() {
 }
 
 #[test]
+fn tool_definitions_are_byte_stable() {
+    let first = serde_json::to_string(&infigraph_mcp::build_tools_list()).unwrap();
+    let second = serde_json::to_string(&infigraph_mcp::build_tools_list()).unwrap();
+    assert_eq!(
+        first, second,
+        "build_tools_list() produces different bytes across calls — this breaks LLM prefix caching"
+    );
+}
+
+#[test]
+fn tool_schema_token_budget() {
+    let tools = serde_json::to_string(&infigraph_mcp::build_tools_list()).unwrap();
+    let word_count = tools.split_whitespace().count();
+    let est_tokens = ((word_count as f64) * 1.4).ceil() as usize;
+    assert!(
+        est_tokens < 10_000,
+        "Tool schemas are {est_tokens} estimated tokens — exceeds 10k budget. Trim descriptions."
+    );
+}
+
+#[test]
 fn no_tool_is_both_cli_mapped_and_mcp_only() {
     let cli_mapped: HashSet<&str> = infigraph_mcp::MCP_TO_CLI_MAP
         .iter()
