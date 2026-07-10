@@ -107,6 +107,7 @@ Examples:
 - **PR Review & CI:** Auto-detects PR type (bug fix, refactor, migration, feature) and scope. Runs semantic diff, blast radius, affected tests, security scan, complexity, dead code, clones — with optional LLM-enriched test plan and risk assessment. Cross-repo blast radius via groups. Configurable CI check gates.
 - **Test Context Generator:** `get_test_coverage` identifies untested symbols per file. `review` surfaces affected tests for changed code. Together they generate test context for AI agents writing tests.
 - **OSV Vulnerability Scanning:** Scans dependencies against the OSV database for known vulnerabilities.
+- **Context Compression:** Automatic 70-90% token reduction on tool outputs. Budget-aware scaling, session dedup, quality monitoring with per-tool safety caps.
 - **Design Pattern Detection:** Identifies Singleton, Factory, Observer, Strategy, Builder, and other patterns.
 - **Refactor Analysis:** Complexity hotspots, coupling, near-duplicate detection, dead code — ranked by impact/effort.
 - **Taint Analysis:** Intra + inter-procedural dataflow tracking from sources (HTTP params, user input) to sinks (SQL, exec, file I/O). Sanitizer-aware.
@@ -1180,6 +1181,7 @@ See [docs/README.md](docs/README.md) for detailed documentation setup instructio
 
 - **[Code Parsing](docs/CODE-PARSING.md)** — How source code is parsed, symbols extracted, relationships mapped, and the graph built. Covers tree-sitter parsing, the grammar plugin system, all 62 languages, edge types, Kùzu storage, incremental indexing, embeddings, search, watch mode, route/contract extraction, and multi-repo groups.
 - **[Document Indexing](docs/DOCUMENT-INDEXING.md)** — How documents are discovered, extracted, chunked, linked, and searched. Covers all supported formats (Markdown, PDF, DOCX, PPTX, XLSX, HTML, RTF, XML), BFS crawling, link classification, cross-repo document linking, DocStore schema, hybrid search, and watch mode.
+- **[Context Compression](docs/CONTEXT-COMPRESSION.md)** — How tool outputs are automatically compressed to save 70-90% of tokens. Covers the 4-layer compression stack, tool-specific and generic compressors, session dedup, budget-aware scaling, quality monitoring, and configuration.
 
 ## Contributing
 

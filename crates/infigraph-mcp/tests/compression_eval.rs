@@ -1,4 +1,6 @@
-use infigraph_mcp::{compress::compress_tool_output, dispatch_tool};
+use infigraph_mcp::{
+    compress::compress_tool_output_with_level, dispatch_tool, session_context::CompressionLevel,
+};
 use serde_json::json;
 
 fn estimate_tokens(text: &str) -> usize {
@@ -23,7 +25,7 @@ impl EvalResult {
 
 fn run_task(id: &'static str, tool: &'static str, args: serde_json::Value) -> EvalResult {
     let raw = dispatch_tool(tool, &args).unwrap_or_else(|e| format!("Error: {e}"));
-    let compressed = compress_tool_output(&raw, tool, &args);
+    let compressed = compress_tool_output_with_level(&raw, tool, &args, CompressionLevel::Summary);
     let raw_tokens = estimate_tokens(&raw);
     let comp_tokens = estimate_tokens(&compressed);
     EvalResult {

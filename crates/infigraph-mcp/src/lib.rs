@@ -321,6 +321,7 @@ pub fn dispatch_tool(tool_name: &str, args: &Value) -> Result<String, anyhow::Er
         "memory_context" => tools::memory_context::tool_memory_context(args),
         "consolidate_memory" => tools::session::tool_consolidate_memory(args),
         "compress" => tool_compress(args),
+        "get_compression_stats" => Ok(session_context::get_compression_stats()),
         _ => Err(anyhow::anyhow!("Unknown tool: {tool_name}")),
     }
 }
@@ -560,5 +561,7 @@ pub fn build_tools_list() -> Vec<Value> {
             p(true,false,false,json!({"threshold":{"type":"number","default":0.7,"description":"Similarity threshold for grouping sessions (0.0-1.0, default 0.7)"}})), &["path"]),
         tool_def("compress", "Compress arbitrary text (JSON, logs, build output, stack traces, tables). Auto-detects content type and applies type-specific compression. Returns detected type, token savings, and compressed text.",
             json!({"text": {"type": "string", "description": "Text to compress"}}), &["text"]),
+        tool_def("get_compression_stats", "Show compression metrics for the current session: compression level, token budget usage, dedup entries, call count.",
+            json!({}), &[]),
     ]
 }

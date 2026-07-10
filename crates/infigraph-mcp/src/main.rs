@@ -461,6 +461,11 @@ fn handle_tools_call(id: &Value, request: &Value) -> Value {
 
     match result {
         Ok(Ok(content)) => {
+            let detail_requested = args
+                .get("detail")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            infigraph_mcp::session_context::record_tool_call(tool_name, detail_requested);
             let compressed =
                 infigraph_mcp::compress::compress_tool_output(&content, tool_name, &args);
             let compressed =

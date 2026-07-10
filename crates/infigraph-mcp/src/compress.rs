@@ -46,14 +46,19 @@ pub fn compress_tool_output_with_level(
     }
 }
 
-/// Cap compression level per tool based on eval quality results.
+/// Cap compression level per tool based on eval quality results and runtime detail-rate.
 /// Search degrades at Aggressive (top-3 drops important results).
-/// All other tools retain 100% quality through Minimal.
+/// If detail-request rate >30% for a tool, cap at Summary.
 fn effective_level(tool_name: &str, level: CompressionLevel) -> CompressionLevel {
-    let max_level = match tool_name {
+    let mut max_level = match tool_name {
         "search" => CompressionLevel::Summary,
         _ => CompressionLevel::Minimal,
     };
+    if crate::session_context::should_reduce_compression(tool_name)
+        && max_level > CompressionLevel::Summary
+    {
+        max_level = CompressionLevel::Summary;
+    }
     if level > max_level {
         max_level
     } else {

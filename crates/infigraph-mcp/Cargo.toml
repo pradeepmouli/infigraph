@@ -27,6 +27,7 @@ rayon = "1"
 tiny_http = "0.12"
 sha2 = "0.10"
 fs2 = "0.4"
+toml = "0.8"
 
 [lib]
 name = "infigraph_mcp"

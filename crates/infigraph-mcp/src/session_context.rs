@@ -1,12 +1,70 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Mutex;
 
+use serde::Deserialize;
 use serde_json::Value;
 
 const DEFAULT_STALENESS_WINDOW: usize = 6;
 const DEFAULT_TOKEN_BUDGET: usize = 150_000;
 
 static SESSION: Mutex<Option<SessionContext>> = Mutex::new(None);
+
+#[derive(Debug, Default, Deserialize)]
+struct ConfigFile {
+    #[serde(default)]
+    compression: CompressionConfig,
+}
+
+#[derive(Debug, Deserialize)]
+struct CompressionConfig {
+    #[serde(default = "default_true")]
+    enabled: bool,
+    #[serde(default)]
+    level: Option<String>,
+    #[serde(default)]
+    dedup: Option<bool>,
+    #[serde(default)]
+    token_budget: Option<usize>,
+    #[serde(default)]
+    staleness_window: Option<usize>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for CompressionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            level: None,
+            dedup: None,
+            token_budget: None,
+            staleness_window: None,
+        }
+    }
+}
+
+fn find_config_file() -> Option<PathBuf> {
+    let cwd = std::env::current_dir().ok()?;
+    let mut dir = cwd.as_path();
+    loop {
+        let candidate = dir.join(".infigraph").join("config.toml");
+        if candidate.exists() {
+            return Some(candidate);
+        }
+        dir = dir.parent()?;
+    }
+}
+
+fn load_config() -> CompressionConfig {
+    find_config_file()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| toml::from_str::<ConfigFile>(&s).ok())
+        .map(|c| c.compression)
+        .unwrap_or_default()
+}
 
 struct SeenEntry {
     call_seen: usize,
@@ -22,26 +80,38 @@ pub enum CompressionLevel {
     Minimal,
 }
 
+struct ToolCallStats {
+    total: usize,
+    detail_requests: usize,
+}
+
 struct SessionContext {
     seen: HashMap<String, SeenEntry>,
     call_counter: usize,
     staleness_window: usize,
     total_tokens_sent: usize,
     token_budget: usize,
+    config: CompressionConfig,
+    tool_stats: HashMap<String, ToolCallStats>,
 }
 
 impl SessionContext {
     fn new() -> Self {
+        let cfg = load_config();
         let budget = std::env::var("INFIGRAPH_TOKEN_BUDGET")
             .ok()
             .and_then(|v| v.parse().ok())
+            .or(cfg.token_budget)
             .unwrap_or(DEFAULT_TOKEN_BUDGET);
+        let staleness = cfg.staleness_window.unwrap_or(DEFAULT_STALENESS_WINDOW);
         Self {
             seen: HashMap::new(),
             call_counter: 0,
-            staleness_window: DEFAULT_STALENESS_WINDOW,
+            staleness_window: staleness,
             total_tokens_sent: 0,
             token_budget: budget,
+            config: cfg,
+            tool_stats: HashMap::new(),
         }
     }
 
@@ -89,26 +159,42 @@ fn estimate_tokens(s: &str) -> usize {
 }
 
 /// Get current compression level based on token budget usage.
-/// Override with `INFIGRAPH_COMPRESSION_LEVEL=off|summary|aggressive|minimal`.
+/// Priority: env var > config.toml level > auto (budget-based).
+/// If compression is disabled (config `enabled = false`), returns Off.
 pub fn get_compression_level() -> CompressionLevel {
     if let Some(level) = parse_level_override() {
         return level;
     }
     let mut guard = SESSION.lock().unwrap_or_else(|e| e.into_inner());
     let ctx = guard.get_or_insert_with(SessionContext::new);
+    if !ctx.config.enabled {
+        return CompressionLevel::Off;
+    }
+    if let Some(ref level_str) = ctx.config.level {
+        if let Some(level) = parse_level_str(level_str) {
+            if level != CompressionLevel::Off {
+                return level;
+            }
+        }
+    }
     ctx.auto_level()
+}
+
+fn parse_level_str(s: &str) -> Option<CompressionLevel> {
+    match s.to_lowercase().as_str() {
+        "off" => Some(CompressionLevel::Off),
+        "summary" => Some(CompressionLevel::Summary),
+        "aggressive" => Some(CompressionLevel::Aggressive),
+        "minimal" => Some(CompressionLevel::Minimal),
+        "auto" => None,
+        _ => None,
+    }
 }
 
 fn parse_level_override() -> Option<CompressionLevel> {
     std::env::var("INFIGRAPH_COMPRESSION_LEVEL")
         .ok()
-        .and_then(|v| match v.to_lowercase().as_str() {
-            "off" => Some(CompressionLevel::Off),
-            "summary" => Some(CompressionLevel::Summary),
-            "aggressive" => Some(CompressionLevel::Aggressive),
-            "minimal" => Some(CompressionLevel::Minimal),
-            _ => None,
-        })
+        .and_then(|v| parse_level_str(&v))
 }
 
 /// Record tokens sent and return updated compression level.
@@ -122,7 +208,15 @@ pub fn track_tokens(tokens: usize) -> CompressionLevel {
 /// Apply seen-dedup to already-compressed tool output.
 /// Returns the output unchanged if dedup is disabled or content is fresh.
 pub fn apply_seen_dedup(compressed: &str, tool_name: &str, args: &Value) -> String {
-    if !std::env::var("INFIGRAPH_DEDUP").is_ok_and(|v| v == "1") {
+    let env_dedup = std::env::var("INFIGRAPH_DEDUP").ok().map(|v| v != "0");
+    let config_dedup = {
+        let guard = SESSION.lock().unwrap_or_else(|e| e.into_inner());
+        guard
+            .as_ref()
+            .and_then(|ctx| ctx.config.dedup)
+            .unwrap_or(true)
+    };
+    if !env_dedup.unwrap_or(config_dedup) {
         return compressed.to_string();
     }
 
@@ -188,6 +282,92 @@ pub fn apply_seen_dedup(compressed: &str, tool_name: &str, args: &Value) -> Stri
     );
 
     compressed.to_string()
+}
+
+/// Record a tool call, noting whether detail=true was requested.
+pub fn record_tool_call(tool_name: &str, detail_requested: bool) {
+    let mut guard = SESSION.lock().unwrap_or_else(|e| e.into_inner());
+    let ctx = guard.get_or_insert_with(SessionContext::new);
+    let entry = ctx
+        .tool_stats
+        .entry(tool_name.to_string())
+        .or_insert(ToolCallStats {
+            total: 0,
+            detail_requests: 0,
+        });
+    entry.total += 1;
+    if detail_requested {
+        entry.detail_requests += 1;
+    }
+}
+
+/// Check if a tool's detail-request rate exceeds 30%, suggesting compression is too aggressive.
+pub fn should_reduce_compression(tool_name: &str) -> bool {
+    let guard = SESSION.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(ctx) = guard.as_ref() else {
+        return false;
+    };
+    let Some(stats) = ctx.tool_stats.get(tool_name) else {
+        return false;
+    };
+    if stats.total < 5 {
+        return false;
+    }
+    (stats.detail_requests as f64 / stats.total as f64) > 0.3
+}
+
+/// Return compression stats for the current session.
+pub fn get_compression_stats() -> String {
+    let guard = SESSION.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(ctx) = guard.as_ref() else {
+        return "No compression data yet (no tool calls in this session).".to_string();
+    };
+    let level = if let Some(l) = parse_level_override() {
+        format!("{l:?} (env override)")
+    } else if !ctx.config.enabled {
+        "Off (disabled in config)".to_string()
+    } else if let Some(ref ls) = ctx.config.level {
+        if let Some(l) = parse_level_str(ls) {
+            format!("{l:?} (config)")
+        } else {
+            format!("{:?} (auto)", ctx.auto_level())
+        }
+    } else {
+        format!("{:?} (auto)", ctx.auto_level())
+    };
+    let remaining_pct = if ctx.token_budget > 0 {
+        ((ctx.token_budget.saturating_sub(ctx.total_tokens_sent)) as f64 / ctx.token_budget as f64
+            * 100.0) as usize
+    } else {
+        0
+    };
+    let dedup_entries = ctx.seen.len();
+    let mut out = format!(
+        "Compression Stats (current session):\n  Level: {level}\n  Token budget: {}\n  Tokens sent: {}\n  Budget remaining: {remaining_pct}%\n  Tool calls tracked: {}\n  Dedup entries: {dedup_entries}",
+        ctx.token_budget, ctx.total_tokens_sent, ctx.call_counter,
+    );
+    if !ctx.tool_stats.is_empty() {
+        out.push_str("\n  Detail-request rates:");
+        let mut tools: Vec<_> = ctx.tool_stats.iter().collect();
+        tools.sort_by_key(|(name, _)| (*name).clone());
+        for (name, stats) in &tools {
+            let rate = if stats.total > 0 {
+                (stats.detail_requests as f64 / stats.total as f64 * 100.0).round() as usize
+            } else {
+                0
+            };
+            let flag = if stats.total >= 5 && rate > 30 {
+                " ⚠ auto-reduced"
+            } else {
+                ""
+            };
+            out.push_str(&format!(
+                "\n    {name}: {}/{} ({rate}%){flag}",
+                stats.detail_requests, stats.total
+            ));
+        }
+    }
+    out
 }
 
 /// Reset session state (for testing).
@@ -286,7 +466,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dedup_disabled_without_env() {
+    fn test_dedup_enabled_by_default() {
         let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         reset_session();
         std::env::remove_var("INFIGRAPH_DEDUP");
@@ -295,7 +475,20 @@ mod tests {
 
         apply_seen_dedup(&output, "get_doc_context", &args);
         let second = apply_seen_dedup(&output, "get_doc_context", &args);
-        assert_eq!(second, output); // No dedup
+        assert!(second.starts_with("(seen")); // Dedup on by default
+    }
+
+    #[test]
+    fn test_dedup_disabled_with_env_zero() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        reset_session();
+        std::env::set_var("INFIGRAPH_DEDUP", "0");
+        let output = big_output();
+        let args = json!({"symbol_id": "src/lib.rs::foo"});
+
+        apply_seen_dedup(&output, "get_doc_context", &args);
+        let second = apply_seen_dedup(&output, "get_doc_context", &args);
+        assert_eq!(second, output); // Dedup off via env
     }
 
     #[test]
