@@ -231,9 +231,10 @@ fn compress_references(raw: &str, _args: &Value) -> String {
             continue;
         }
         // "file:line — in func"
-        if let Some(dash_pos) = trimmed.find(" — in ") {
+        if let Some(dash_pos) = trimmed.find(" \u{2014} in ") {
             let loc = &trimmed[..dash_pos];
-            let func = &trimmed[dash_pos + 6..];
+            let separator = " \u{2014} in ";
+            let func = &trimmed[dash_pos + separator.len()..];
             let file = loc.rsplit_once(':').map(|(f, _)| f).unwrap_or(loc);
             if by_file.last().is_none_or(|(f, _)| *f != file) {
                 by_file.push((file, Vec::new()));
@@ -486,5 +487,104 @@ Callees (3):
         let raw = "Error: missing 'query'";
         let result = compress_tool_output(raw, "search", &json!({}));
         assert_eq!(result, raw);
+    }
+
+    #[test]
+    fn test_compress_references_groups_by_file() {
+        let raw = "References to 'src/auth.rs::login' (5 total):\n\n  src/routes/auth.rs:12 — in login_handler\n  src/routes/auth.rs:34 — in logout_handler\n  src/tests/auth_test.rs:10 — in test_login\n  src/tests/auth_test.rs:25 — in test_login_fail\n  src/tests/auth_test.rs:40 — in test_login_expired\n";
+
+        let compressed = compress_references(raw, &json!({}));
+
+        // Header preserved
+        assert!(compressed.contains("References to 'src/auth.rs::login' (5 total):"));
+        // Grouped by file with count
+        assert!(compressed.contains("src/routes/auth.rs (2x)"));
+        assert!(compressed.contains("src/tests/auth_test.rs (3x)"));
+        // Detail hint
+        assert!(compressed.contains("detail=true"));
+    }
+
+    #[test]
+    fn test_compress_references_single_ref_per_file() {
+        let raw = "References to 'lib.rs::foo' (2 total):\n\n  src/a.rs:10 — in bar\n  src/b.rs:20 — in baz\n";
+
+        let compressed = compress_references(raw, &json!({}));
+
+        // Single refs kept as-is (no grouping needed)
+        assert!(compressed.contains("src/a.rs:10 — in bar"));
+        assert!(compressed.contains("src/b.rs:20 — in baz"));
+    }
+
+    #[test]
+    fn test_compress_references_passthrough_on_bad_format() {
+        let raw = "not a references output";
+        assert_eq!(compress_references(raw, &json!({})), raw);
+    }
+
+    #[test]
+    fn test_compress_architecture_truncates_sections() {
+        let raw = "\
+=== Language Breakdown ===
+                  rust: 201 files
+              markdown: 24 files
+                  toml: 16 files
+                  json: 10 files
+                python: 8 files
+                  bash: 6 files
+            typescript: 4 files
+
+=== Symbols by Kind ===
+              Function: 1146
+                  Test: 950
+
+=== Hotspot Files (most symbols) ===
+   1. src/a.rs       220 symbols
+   2. src/b.rs       85 symbols
+   3. src/c.rs       83 symbols
+   4. src/d.rs       77 symbols
+   5. src/e.rs       72 symbols
+   6. src/f.rs       71 symbols
+   7. src/g.rs       67 symbols
+
+=== Hub Functions (most callers) ===
+   1. iter       src/lib.rs   834 callers
+   2. push_str   src/sync.rs  514 callers
+   3. split      src/ext.rs   129 callers
+   4. next       src/lib.rs   120 callers
+   5. lock       src/js.rs    101 callers
+   6. bundled    src/lang.rs   84 callers
+
+=== Entry Points (call others, never called) ===
+  Function main    src/bin/a.rs
+  Function main    src/bin/b.rs
+  Function main    src/bin/c.rs
+  Function setup   src/test.rs
+";
+
+        let compressed = compress_architecture(raw, &json!({}));
+
+        // Languages: top 5 kept, rest truncated
+        assert!(compressed.contains("rust: 201 files"));
+        assert!(compressed.contains("python: 8 files"));
+        assert!(!compressed.contains("bash: 6 files"));
+        assert!(compressed.contains("(truncated)"));
+        // Symbols by kind: all kept
+        assert!(compressed.contains("Function: 1146"));
+        assert!(compressed.contains("Test: 950"));
+        // Hotspots: top 5 kept
+        assert!(compressed.contains("src/e.rs"));
+        assert!(!compressed.contains("src/f.rs"));
+        // Hubs: top 5 kept
+        assert!(compressed.contains("lock"));
+        assert!(!compressed.contains("bundled"));
+        // Entry points: collapsed to count
+        assert!(compressed.contains("4 entry points"));
+        assert!(!compressed.contains("Function main"));
+    }
+
+    #[test]
+    fn test_compress_architecture_passthrough_on_bad_format() {
+        let raw = "not architecture output";
+        assert_eq!(compress_architecture(raw, &json!({})), raw);
     }
 }
