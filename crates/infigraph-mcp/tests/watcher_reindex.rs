@@ -14,6 +14,15 @@ use infigraph_mcp::tools::watch::*;
 
 static WATCHER_LOCK: Mutex<()> = Mutex::new(());
 
+struct WatcherCleanup;
+
+impl Drop for WatcherCleanup {
+    fn drop(&mut self) {
+        stop_all_watchers();
+        stop_all_doc_watchers();
+    }
+}
+
 fn make_project(files: &[(&str, &str)]) -> (tempfile::TempDir, String) {
     let dir = tempfile::TempDir::new().expect("tmpdir");
     for (name, content) in files {
@@ -55,6 +64,7 @@ fn poll_until<F: Fn() -> bool>(check: F, timeout: Duration, desc: &str) -> bool 
 #[test]
 fn test_code_watcher_reindexes_modified_file() {
     let _guard = WATCHER_LOCK.lock().unwrap();
+    let _cleanup = WatcherCleanup;
     stop_all_watchers();
     init_watchers();
 
@@ -104,7 +114,6 @@ fn test_code_watcher_reindexes_modified_file() {
         "brand_new_function should be searchable after watcher reindex",
     );
 
-    stop_all_watchers();
     assert!(
         found,
         "watcher should have reindexed modified file — brand_new_function not found"
@@ -115,6 +124,7 @@ fn test_code_watcher_reindexes_modified_file() {
 #[test]
 fn test_code_watcher_reindexes_new_file_existing_dir() {
     let _guard = WATCHER_LOCK.lock().unwrap();
+    let _cleanup = WatcherCleanup;
     stop_all_watchers();
     init_watchers();
 
@@ -146,7 +156,6 @@ fn test_code_watcher_reindexes_new_file_existing_dir() {
         "helper_util should be searchable after watcher reindex",
     );
 
-    stop_all_watchers();
     assert!(
         found,
         "watcher should have reindexed new file in existing dir"
@@ -158,6 +167,7 @@ fn test_code_watcher_reindexes_new_file_existing_dir() {
 #[test]
 fn test_code_watcher_reindexes_new_file_new_dir() {
     let _guard = WATCHER_LOCK.lock().unwrap();
+    let _cleanup = WatcherCleanup;
     stop_all_watchers();
     init_watchers();
 
@@ -194,7 +204,6 @@ fn test_code_watcher_reindexes_new_file_new_dir() {
         "new_feature should be searchable after watcher reindex",
     );
 
-    stop_all_watchers();
     assert!(
         found,
         "watcher should have reindexed new file in new dir — branch switch scenario"
@@ -217,6 +226,7 @@ fn stop_all_doc_watchers() {
 #[test]
 fn test_doc_watcher_reindexes_new_doc() {
     let _guard = WATCHER_LOCK.lock().unwrap();
+    let _cleanup = WatcherCleanup;
     stop_all_watchers();
     stop_all_doc_watchers();
     init_doc_watchers();
@@ -269,7 +279,6 @@ fn test_doc_watcher_reindexes_new_doc() {
         "xylophone_zebra_unicorn should be searchable after doc watcher reindex",
     );
 
-    stop_all_doc_watchers();
     assert!(found, "doc watcher should have reindexed new document");
 }
 
@@ -277,6 +286,7 @@ fn test_doc_watcher_reindexes_new_doc() {
 #[test]
 fn test_doc_watcher_reindexes_no_concurrent_read() {
     let _guard = WATCHER_LOCK.lock().unwrap();
+    let _cleanup = WatcherCleanup;
     stop_all_watchers();
     stop_all_doc_watchers();
     init_doc_watchers();
@@ -318,6 +328,7 @@ fn test_doc_watcher_reindexes_no_concurrent_read() {
 #[test]
 fn test_code_watcher_branch_switch_existing_dirs() {
     let _guard = WATCHER_LOCK.lock().unwrap();
+    let _cleanup = WatcherCleanup;
     stop_all_watchers();
     init_watchers();
 
@@ -365,7 +376,6 @@ fn test_code_watcher_branch_switch_existing_dirs() {
         "extra_branch_b searchable",
     );
 
-    stop_all_watchers();
     assert!(
         found_main,
         "modified file main_b should be searchable after branch switch"
@@ -380,6 +390,7 @@ fn test_code_watcher_branch_switch_existing_dirs() {
 #[test]
 fn test_code_watcher_branch_switch_new_dirs() {
     let _guard = WATCHER_LOCK.lock().unwrap();
+    let _cleanup = WatcherCleanup;
     stop_all_watchers();
     init_watchers();
 
@@ -436,7 +447,6 @@ fn test_code_watcher_branch_switch_new_dirs() {
         "deeply_nested_func in nested new dir",
     );
 
-    stop_all_watchers();
     assert!(
         found_feature,
         "file in new dir should be searchable after branch switch"
@@ -451,6 +461,7 @@ fn test_code_watcher_branch_switch_new_dirs() {
 #[test]
 fn test_doc_watcher_reindexes_new_doc_new_dir() {
     let _guard = WATCHER_LOCK.lock().unwrap();
+    let _cleanup = WatcherCleanup;
     stop_all_watchers();
     stop_all_doc_watchers();
     init_doc_watchers();
@@ -485,7 +496,6 @@ fn test_doc_watcher_reindexes_new_doc_new_dir() {
         "quantum_flux_capacitor should be searchable after doc watcher picks up new subdir",
     );
 
-    stop_all_doc_watchers();
     assert!(
         found,
         "doc watcher should reindex docs in new subdirectories (recursive mode)"
@@ -496,6 +506,7 @@ fn test_doc_watcher_reindexes_new_doc_new_dir() {
 #[test]
 fn test_code_watcher_handles_dir_removal() {
     let _guard = WATCHER_LOCK.lock().unwrap();
+    let _cleanup = WatcherCleanup;
     stop_all_watchers();
     init_watchers();
 
@@ -579,6 +590,7 @@ fn test_code_watcher_handles_dir_removal() {
 #[test]
 fn test_code_watcher_grammar_plugin_extensions() {
     let _guard = WATCHER_LOCK.lock().unwrap();
+    let _cleanup = WatcherCleanup;
     stop_all_watchers();
     init_watchers();
 
@@ -637,7 +649,6 @@ fn test_code_watcher_grammar_plugin_extensions() {
         "terraform_watcher_test (.tf) searchable if HCL grammar loaded",
     );
 
-    stop_all_watchers();
     assert!(
         found_control,
         "control .py file must be detected by watcher"
@@ -655,6 +666,7 @@ fn test_code_watcher_grammar_plugin_extensions() {
 #[test]
 fn test_code_watcher_cross_file_auto_resolve() {
     let _guard = WATCHER_LOCK.lock().unwrap();
+    let _cleanup = WatcherCleanup;
     stop_all_watchers();
     init_watchers();
 
@@ -705,7 +717,6 @@ fn test_code_watcher_cross_file_auto_resolve() {
         "extra_resolved_func should be searchable after auto-resolve reindex",
     );
 
-    stop_all_watchers();
     assert!(
         found,
         "auto_resolve watcher should reindex cross-file changes"
@@ -716,6 +727,7 @@ fn test_code_watcher_cross_file_auto_resolve() {
 #[test]
 fn test_code_watcher_ignores_excluded_dirs() {
     let _guard = WATCHER_LOCK.lock().unwrap();
+    let _cleanup = WatcherCleanup;
     stop_all_watchers();
     init_watchers();
 
@@ -773,7 +785,6 @@ fn test_code_watcher_ignores_excluded_dirs() {
         .map(|r| r.contains("ignored_venv_func"))
         .unwrap_or(false);
 
-    stop_all_watchers();
     assert!(found_legit, "legitimate file should be indexed by watcher");
     assert!(
         !found_nm,
@@ -786,6 +797,7 @@ fn test_code_watcher_ignores_excluded_dirs() {
 #[test]
 fn test_code_watcher_sentinel_stop() {
     let _guard = WATCHER_LOCK.lock().unwrap();
+    let _cleanup = WatcherCleanup;
     stop_all_watchers();
     init_watchers();
 
@@ -833,7 +845,6 @@ fn test_code_watcher_sentinel_stop() {
         "watcher should stop after sentinel file created",
     );
 
-    stop_all_watchers();
     assert!(
         stopped,
         "watcher should have stopped via sentinel file mechanism"
@@ -850,6 +861,7 @@ fn test_code_watcher_sentinel_stop() {
 #[test]
 fn test_doc_watcher_prunes_stale_docs() {
     let _guard = WATCHER_LOCK.lock().unwrap();
+    let _cleanup = WatcherCleanup;
     stop_all_watchers();
     stop_all_doc_watchers();
     init_doc_watchers();
@@ -932,6 +944,7 @@ fn test_doc_watcher_prunes_stale_docs() {
 #[test]
 fn test_auto_start_watch_no_duplicates() {
     let _guard = WATCHER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _cleanup = WatcherCleanup;
     stop_all_watchers();
     stop_all_doc_watchers();
     init_watchers();
@@ -977,15 +990,13 @@ fn test_auto_start_watch_no_duplicates() {
         count_after_index, count_after_reindex,
         "re-indexing should not create duplicate watcher"
     );
-
-    stop_all_watchers();
-    stop_all_doc_watchers();
 }
 
 /// auto_start_doc_watch should not create duplicate doc watchers.
 #[test]
 fn test_auto_start_doc_watch_no_duplicates() {
     let _guard = WATCHER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _cleanup = WatcherCleanup;
     stop_all_watchers();
     stop_all_doc_watchers();
     init_watchers();
@@ -1026,15 +1037,13 @@ fn test_auto_start_doc_watch_no_duplicates() {
         count_after_index, count_after_explicit,
         "doc watcher count should not increase on duplicate auto_start_doc_watch"
     );
-
-    stop_all_doc_watchers();
-    stop_all_watchers();
 }
 
 /// is_watching returns false after watchers are stopped.
 #[test]
 fn test_is_watching_lifecycle() {
     let _guard = WATCHER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _cleanup = WatcherCleanup;
     stop_all_watchers();
     stop_all_doc_watchers();
     init_watchers();
@@ -1057,6 +1066,4 @@ fn test_is_watching_lifecycle() {
         !is_watching(&canonical),
         "should not be watching after stop"
     );
-
-    stop_all_doc_watchers();
 }
