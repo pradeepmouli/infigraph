@@ -48,7 +48,15 @@ pub fn is_doc_watching(path: &str) -> bool {
 }
 
 pub fn auto_start_doc_watch(path: &str) -> Option<String> {
-    if super::watch::watchers_disabled() {
+    auto_start_doc_watch_inner(path, false)
+}
+
+pub fn auto_start_doc_watch_opportunistic(path: &str) -> Option<String> {
+    auto_start_doc_watch_inner(path, true)
+}
+
+fn auto_start_doc_watch_inner(path: &str, skip_disabled_check: bool) -> Option<String> {
+    if !skip_disabled_check && super::watch::watchers_disabled() {
         return None;
     }
     let root = std::path::PathBuf::from(path).canonicalize().ok()?;

@@ -3,9 +3,9 @@ use serde_json::Value;
 
 use infigraph_core::embed;
 
-use super::docs::auto_start_doc_watch;
+use super::docs::auto_start_doc_watch_opportunistic as auto_start_doc_watch;
 use super::helpers::{find_infigraph_cli, open_prism};
-use super::watch::auto_start_watch;
+use super::watch::auto_start_watch_opportunistic as auto_start_watch;
 
 pub fn tool_index_project(args: &Value) -> Result<String> {
     let path = args.get("path").and_then(|p| p.as_str()).unwrap_or(".");

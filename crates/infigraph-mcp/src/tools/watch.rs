@@ -65,7 +65,15 @@ pub fn is_watching(path: &str) -> bool {
 }
 
 pub fn auto_start_watch(path: &str) -> Option<String> {
-    if watchers_disabled() {
+    auto_start_watch_inner(path, false)
+}
+
+pub fn auto_start_watch_opportunistic(path: &str) -> Option<String> {
+    auto_start_watch_inner(path, true)
+}
+
+fn auto_start_watch_inner(path: &str, skip_disabled_check: bool) -> Option<String> {
+    if !skip_disabled_check && watchers_disabled() {
         return None;
     }
     let root = std::path::PathBuf::from(path).canonicalize().ok()?;

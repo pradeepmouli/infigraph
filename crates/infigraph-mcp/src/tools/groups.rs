@@ -7,7 +7,7 @@ use infigraph_core::multi::{self, combined, Registry};
 use infigraph_core::Infigraph;
 use infigraph_languages::bundled_registry;
 
-use super::watch::auto_start_watch;
+use super::watch::auto_start_watch_opportunistic as auto_start_watch;
 
 pub fn tool_group_list(_args: &Value) -> Result<String> {
     let registry = Registry::load()?;

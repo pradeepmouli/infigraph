@@ -450,12 +450,12 @@ pub fn tool_search(args: &Value) -> Result<String> {
                 .unwrap_or(false)
         };
         if !cli_watching {
-            if let Some(msg) = super::watch::auto_start_watch(path) {
+            if let Some(msg) = super::watch::auto_start_watch_opportunistic(path) {
                 out.push_str(&format!("\n✓ Auto-started watcher: {msg}"));
             } else {
                 out.push_str("\n⚠ No file watcher running — results may be stale. Run `infigraph watch` or re-index to refresh.");
             }
-            super::docs::auto_start_doc_watch(path);
+            super::docs::auto_start_doc_watch_opportunistic(path);
         }
     }
 
