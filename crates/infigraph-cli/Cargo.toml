@@ -34,13 +34,17 @@ path = "src/bin/golden_cozo_export.rs"
 name = "cozo_vs_kuzu"
 path = "src/bin/cozo_vs_kuzu.rs"
 
+[features]
+default = ["kompress"]
+kompress = ["infigraph-mcp/kompress"]
+
 [dependencies]
 infigraph-core.workspace = true
 infigraph-languages.workspace = true
 infigraph-grammar-plugin = { path = "../infigraph-grammar-plugin" }
 infigraph-docs = { path = "../infigraph-docs" }
 infigraph-confluence = { path = "../infigraph-confluence" }
-infigraph-mcp = { path = "../infigraph-mcp" }
+infigraph-mcp = { path = "../infigraph-mcp", default-features = false }
 infigraph-pipeline-plugin = { path = "../infigraph-pipeline-plugin" }
 anyhow.workspace = true
 serde.workspace = true

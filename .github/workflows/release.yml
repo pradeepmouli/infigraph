@@ -55,15 +55,19 @@ jobs:
           - os: macos-latest
             target: aarch64-apple-darwin
             archive: tar.gz
+            cargo_features: ""
           - os: macos-latest
             target: x86_64-apple-darwin
             archive: tar.gz
+            cargo_features: "--no-default-features"
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             archive: tar.gz
+            cargo_features: ""
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             archive: zip
+            cargo_features: "--no-default-features"
     steps:
       - uses: actions/checkout@v4
       - name: Free disk space (Ubuntu)
@@ -88,7 +92,7 @@ jobs:
           name: infigraph-driver
 
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }} -p infigraph-cli -p infigraph-mcp
+        run: cargo build --release --target ${{ matrix.target }} -p infigraph-cli -p infigraph-mcp ${{ matrix.cargo_features }}
 
       - name: Sign (macOS)
         if: runner.os == 'macOS'

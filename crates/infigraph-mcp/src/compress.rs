@@ -1,4 +1,6 @@
-use crate::session_context::{get_ml_compression_mode, CompressionLevel};
+#[cfg(feature = "kompress")]
+use crate::session_context::get_ml_compression_mode;
+use crate::session_context::CompressionLevel;
 use serde_json::Value;
 
 const MIN_TOKENS_TO_COMPRESS: usize = 100;
@@ -1087,6 +1089,7 @@ fn compress_prose(text: &str) -> String {
         return text.to_string();
     }
 
+    #[cfg(feature = "kompress")]
     if get_ml_compression_mode() == "kompress" {
         if let Some(compressed) = kompress::compress(text) {
             return compressed;
@@ -1381,6 +1384,7 @@ fn strip_filler_words(text: &str) -> String {
 
 // --- Kompress ML token compression ---
 
+#[cfg(feature = "kompress")]
 mod kompress {
     use std::path::{Path, PathBuf};
     use std::sync::{Mutex, OnceLock};
@@ -2325,6 +2329,7 @@ Callees (3):
     }
 
     #[test]
+    #[cfg(feature = "kompress")]
     fn test_kompress_direct() {
         // Only runs if model is downloaded
         if let Some(compressed) = kompress::compress(

@@ -28,9 +28,13 @@ tiny_http = "0.12"
 sha2 = "0.10"
 fs2 = "0.4"
 toml = "0.8"
-ort = { version = "2.0.0-rc.12", features = ["download-binaries"] }
-ndarray = "0.16"
-tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
+ort = { version = "2.0.0-rc.12", features = ["download-binaries"], optional = true }
+ndarray = { version = "0.16", optional = true }
+tokenizers = { version = "0.21", default-features = false, features = ["onig"], optional = true }
+
+[features]
+default = ["kompress"]
+kompress = ["dep:ort", "dep:ndarray", "dep:tokenizers"]
 
 [lib]
 name = "infigraph_mcp"
