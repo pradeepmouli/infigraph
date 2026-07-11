@@ -1,4 +1,4 @@
-use crate::session_context::CompressionLevel;
+use crate::session_context::{get_ml_compression_mode, CompressionLevel};
 use serde_json::Value;
 
 const MIN_TOKENS_TO_COMPRESS: usize = 100;
@@ -796,7 +796,7 @@ pub fn compress_generic(text: &str) -> String {
         ContentType::BuildOutput => compress_build_output(text),
         ContentType::FileTree => compress_file_tree(text),
         ContentType::Table => compress_table(text),
-        ContentType::PlainText => text.to_string(),
+        ContentType::PlainText => compress_prose(text),
     }
 }
 
@@ -1079,6 +1079,558 @@ fn compress_table(text: &str) -> String {
         out.push('\n');
     }
     out
+}
+
+fn compress_prose(text: &str) -> String {
+    let est_tokens = ((text.split_whitespace().count() as f64) * 1.4).ceil() as usize;
+    if est_tokens < 200 {
+        return text.to_string();
+    }
+
+    if get_ml_compression_mode() == "kompress" {
+        if let Some(compressed) = kompress::compress(text) {
+            return compressed;
+        }
+    }
+
+    let lines: Vec<&str> = text.lines().collect();
+    let mut out = String::with_capacity(text.len() / 2);
+    let mut prose_buf: Vec<&str> = Vec::new();
+
+    let mut in_code_block = false;
+
+    for line in &lines {
+        if line.starts_with("```") {
+            if !prose_buf.is_empty() {
+                out.push_str(&summarize_prose_block(&prose_buf));
+                prose_buf.clear();
+            }
+            in_code_block = !in_code_block;
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+
+        if in_code_block {
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+
+        let trimmed = line.trim();
+
+        // Preserve: headings, list items, links, blank lines (as separators), tables
+        let is_structural = trimmed.is_empty()
+            || trimmed.starts_with('#')
+            || trimmed.starts_with("- ")
+            || trimmed.starts_with("* ")
+            || trimmed.starts_with("> ")
+            || trimmed.starts_with("| ")
+            || trimmed.chars().next().is_some_and(|c| c.is_ascii_digit()) && trimmed.contains(". ");
+
+        if is_structural {
+            if !prose_buf.is_empty() {
+                out.push_str(&summarize_prose_block(&prose_buf));
+                prose_buf.clear();
+            }
+            out.push_str(line);
+            out.push('\n');
+        } else {
+            prose_buf.push(trimmed);
+        }
+    }
+
+    if !prose_buf.is_empty() {
+        out.push_str(&summarize_prose_block(&prose_buf));
+    }
+
+    strip_filler_words(&out)
+}
+
+fn summarize_prose_block(lines: &[&str]) -> String {
+    let text = lines.join(" ");
+    let sentences: Vec<&str> = split_sentences(&text);
+
+    if sentences.len() <= 3 {
+        let mut out = String::new();
+        for s in &sentences {
+            out.push_str(s);
+            out.push(' ');
+        }
+        out.push('\n');
+        return out;
+    }
+
+    // Try Potion embedding scoring first, fall back to TF-IDF
+    let scored = score_sentences_embedding(&sentences)
+        .unwrap_or_else(|| score_sentences_tfidf(&sentences, &text));
+
+    // Keep top ~40% of sentences, min 2, max original-1
+    let keep = ((sentences.len() as f64 * 0.4).ceil() as usize)
+        .max(2)
+        .min(sentences.len() - 1);
+
+    let mut kept_indices: Vec<usize> = scored.iter().take(keep).map(|(i, _)| *i).collect();
+    kept_indices.sort();
+
+    let mut out = String::new();
+    for &i in &kept_indices {
+        out.push_str(sentences[i]);
+        out.push(' ');
+    }
+    out.push('\n');
+    out
+}
+
+fn score_sentences_embedding(sentences: &[&str]) -> Option<Vec<(usize, f64)>> {
+    let embedder = infigraph_core::embed::doc_embedder();
+    let embeddings = embedder.embed_batch(sentences).ok()?;
+    if embeddings.len() != sentences.len() {
+        return None;
+    }
+
+    // Document centroid = mean of all sentence embeddings
+    let dim = embeddings[0].len();
+    let mut centroid = vec![0.0f32; dim];
+    for emb in &embeddings {
+        for (j, v) in emb.iter().enumerate() {
+            centroid[j] += v;
+        }
+    }
+    let n = embeddings.len() as f32;
+    for v in &mut centroid {
+        *v /= n;
+    }
+
+    let mut scored: Vec<(usize, f64)> = embeddings
+        .iter()
+        .enumerate()
+        .map(|(i, emb)| {
+            let mut dot = 0.0f64;
+            let mut norm_a = 0.0f64;
+            let mut norm_b = 0.0f64;
+            for (a, b) in emb.iter().zip(centroid.iter()) {
+                dot += (*a as f64) * (*b as f64);
+                norm_a += (*a as f64) * (*a as f64);
+                norm_b += (*b as f64) * (*b as f64);
+            }
+            let cosine = if norm_a > 0.0 && norm_b > 0.0 {
+                dot / (norm_a.sqrt() * norm_b.sqrt())
+            } else {
+                0.0
+            };
+            // Position bonus
+            let pos_bonus = if i == 0 {
+                1.5
+            } else if i == sentences.len() - 1 {
+                1.2
+            } else {
+                1.0
+            };
+            (i, cosine * pos_bonus)
+        })
+        .collect();
+
+    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    Some(scored)
+}
+
+fn score_sentences_tfidf(sentences: &[&str], text: &str) -> Vec<(usize, f64)> {
+    let doc_word_count = word_freq(text);
+    let total_words: f64 = doc_word_count.values().sum::<usize>() as f64;
+
+    let mut scored: Vec<(usize, f64)> = sentences
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let words: Vec<&str> = s.split_whitespace().collect();
+            if words.is_empty() {
+                return (i, 0.0);
+            }
+            let mut score: f64 = 0.0;
+            for w in &words {
+                let lower = w.to_lowercase();
+                let tf = *doc_word_count.get(lower.as_str()).unwrap_or(&0) as f64 / total_words;
+                let idf = (total_words
+                    / (1.0 + *doc_word_count.get(lower.as_str()).unwrap_or(&1) as f64))
+                    .ln();
+                score += tf * idf;
+            }
+            if i == 0 {
+                score *= 1.5;
+            } else if i == sentences.len() - 1 {
+                score *= 1.2;
+            }
+            score /= words.len() as f64;
+            (i, score)
+        })
+        .collect();
+
+    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    scored
+}
+
+fn split_sentences(text: &str) -> Vec<&str> {
+    let mut sentences = Vec::new();
+    let mut start = 0;
+    let bytes = text.as_bytes();
+    let len = bytes.len();
+
+    let mut i = 0;
+    while i < len {
+        if (bytes[i] == b'.' || bytes[i] == b'!' || bytes[i] == b'?')
+            && (i + 1 >= len || bytes[i + 1] == b' ' || bytes[i + 1] == b'\n')
+        {
+            let end = i + 1;
+            let s = text[start..end].trim();
+            if !s.is_empty() {
+                sentences.push(s);
+            }
+            start = end;
+        }
+        i += 1;
+    }
+
+    // Remainder
+    let s = text[start..].trim();
+    if !s.is_empty() {
+        sentences.push(s);
+    }
+
+    sentences
+}
+
+fn word_freq(text: &str) -> std::collections::HashMap<&str, usize> {
+    let mut freq = std::collections::HashMap::new();
+    for word in text.split_whitespace() {
+        *freq.entry(word).or_insert(0) += 1;
+    }
+    freq
+}
+
+static FILLER_WORDS: &[&str] = &[
+    " the ",
+    " a ",
+    " an ",
+    " just ",
+    " really ",
+    " basically ",
+    " actually ",
+    " simply ",
+    " very ",
+    " quite ",
+    " rather ",
+    " somewhat ",
+    " perhaps ",
+    " certainly ",
+    " definitely ",
+    " obviously ",
+    " clearly ",
+    " essentially ",
+    " furthermore ",
+    " moreover ",
+    " however ",
+    " therefore ",
+    " consequently ",
+    " nevertheless ",
+    " accordingly ",
+    " in order to ",
+    " due to the fact that ",
+    " it is important to note that ",
+    " it should be noted that ",
+    " as a matter of fact ",
+    " in the event that ",
+    " for the purpose of ",
+];
+
+fn strip_filler_words(text: &str) -> String {
+    let mut result = text.to_string();
+    for filler in FILLER_WORDS {
+        // Case-insensitive replacement preserving surrounding spaces
+        let lower = result.to_lowercase();
+        let filler_lower = filler.to_lowercase();
+        let mut search_from = 0;
+        let mut new_result = String::with_capacity(result.len());
+        while let Some(pos) = lower[search_from..].find(&filler_lower) {
+            let abs_pos = search_from + pos;
+            new_result.push_str(&result[search_from..abs_pos]);
+            new_result.push(' ');
+            search_from = abs_pos + filler.len();
+        }
+        new_result.push_str(&result[search_from..]);
+        result = new_result;
+    }
+    // Collapse multiple spaces
+    let mut prev_space = false;
+    let collapsed: String = result
+        .chars()
+        .filter(|c| {
+            if *c == ' ' {
+                if prev_space {
+                    return false;
+                }
+                prev_space = true;
+            } else {
+                prev_space = false;
+            }
+            true
+        })
+        .collect();
+    collapsed
+}
+
+// --- Kompress ML token compression ---
+
+mod kompress {
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex, OnceLock};
+
+    const MODEL_NAME: &str = "kompress-small";
+    const HF_REPO: &str = "chopratejas/kompress-small";
+    const MODEL_FILES: &[&str] = &["model.onnx", "model.onnx.data", "tokenizer.json"];
+
+    static KOMPRESS: OnceLock<Mutex<Option<KompressModel>>> = OnceLock::new();
+
+    struct KompressModel {
+        session: ort::session::Session,
+        tokenizer: tokenizers::Tokenizer,
+    }
+
+    fn model_dir() -> PathBuf {
+        if let Ok(p) = std::env::var("INFIGRAPH_KOMPRESS_DIR") {
+            return PathBuf::from(p);
+        }
+        let home = std::env::var("HOME")
+            .or_else(|_| std::env::var("USERPROFILE"))
+            .unwrap_or_else(|_| ".".to_string());
+        PathBuf::from(home)
+            .join(".infigraph")
+            .join("models")
+            .join(MODEL_NAME)
+    }
+
+    fn is_downloaded() -> bool {
+        let dir = model_dir();
+        dir.join("model.onnx").exists() && dir.join("tokenizer.json").exists()
+    }
+
+    fn download_model() -> Result<PathBuf, String> {
+        let dir = model_dir();
+        std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir: {e}"))?;
+
+        for file in MODEL_FILES {
+            let dest = dir.join(file);
+            if dest.exists() {
+                continue;
+            }
+            let url = format!("https://huggingface.co/{}/resolve/main/{}", HF_REPO, file);
+            eprintln!("kompress: downloading {file}...");
+            download_file(&url, &dest)?;
+        }
+        Ok(dir)
+    }
+
+    fn download_file(url: &str, dest: &Path) -> Result<(), String> {
+        let tmp = dest.with_extension("tmp");
+        let status = std::process::Command::new("curl")
+            .args(["-fSL", "-o"])
+            .arg(&tmp)
+            .arg(url)
+            .status()
+            .map_err(|e| format!("curl: {e}"))?;
+        if !status.success() {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!("download failed: {url}"));
+        }
+        std::fs::rename(&tmp, dest).map_err(|e| format!("rename: {e}"))?;
+        Ok(())
+    }
+
+    fn load_model(dir: &Path) -> Result<KompressModel, String> {
+        let session = ort::session::Session::builder()
+            .map_err(|e| format!("ort session builder: {e}"))?
+            .with_intra_threads(1)
+            .map_err(|e| format!("ort threads: {e}"))?
+            .commit_from_file(dir.join("model.onnx"))
+            .map_err(|e| format!("ort load: {e}"))?;
+
+        let tokenizer = tokenizers::Tokenizer::from_file(dir.join("tokenizer.json"))
+            .map_err(|e| format!("tokenizer: {e}"))?;
+
+        Ok(KompressModel { session, tokenizer })
+    }
+
+    fn init_model() -> Option<KompressModel> {
+        let dir = if is_downloaded() {
+            model_dir()
+        } else {
+            match download_model() {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("kompress: download failed: {e}");
+                    return None;
+                }
+            }
+        };
+        match load_model(&dir) {
+            Ok(m) => Some(m),
+            Err(e) => {
+                eprintln!("kompress: load failed: {e}");
+                None
+            }
+        }
+    }
+
+    const MAX_TOKENS: usize = 8192;
+    const CHUNK_OVERLAP_WORDS: usize = 20;
+
+    pub fn compress(text: &str) -> Option<String> {
+        let mutex = KOMPRESS.get_or_init(|| Mutex::new(init_model()));
+        let mut guard = mutex.lock().ok()?;
+        let model = guard.as_mut()?;
+
+        let encoding = model.tokenizer.encode(text, true).ok()?;
+
+        if encoding.get_ids().len() > MAX_TOKENS {
+            return compress_chunked(model, text);
+        }
+
+        let input_ids: Vec<i64> = encoding.get_ids().iter().map(|&id| id as i64).collect();
+        let attention_mask: Vec<i64> = encoding
+            .get_attention_mask()
+            .iter()
+            .map(|&m| m as i64)
+            .collect();
+        let seq_len = input_ids.len();
+
+        let ids_tensor =
+            ort::value::Tensor::from_array((vec![1, seq_len as i64], input_ids.into_boxed_slice()))
+                .ok()?;
+        let mask_tensor = ort::value::Tensor::from_array((
+            vec![1, seq_len as i64],
+            attention_mask.into_boxed_slice(),
+        ))
+        .ok()?;
+
+        let outputs = model
+            .session
+            .run(ort::inputs![ids_tensor, mask_tensor])
+            .ok()?;
+
+        // Token logits: flat [1 * seq_len * 2] — class 0=drop, class 1=keep
+        let (_shape, logits) = outputs[0].try_extract_tensor::<f32>().ok()?;
+        let tokens = encoding.get_tokens();
+        let mut kept = Vec::new();
+
+        for i in 0..seq_len {
+            let base = i * 2;
+            let drop_logit = logits.get(base).copied().unwrap_or(0.0);
+            let keep_logit = logits.get(base + 1).copied().unwrap_or(0.0);
+            if keep_logit > drop_logit {
+                if let Some(tok) = tokens.get(i) {
+                    if tok != "[CLS]" && tok != "[SEP]" && tok != "<s>" && tok != "</s>" {
+                        kept.push(tok.as_str());
+                    }
+                }
+            }
+        }
+
+        if kept.is_empty() {
+            return None;
+        }
+
+        // Reconstruct text: Ġ prefix marks word boundary, others are subword continuations
+        let mut result = String::with_capacity(text.len());
+        for tok in &kept {
+            if let Some(rest) = tok.strip_prefix('Ġ') {
+                if !result.is_empty() {
+                    result.push(' ');
+                }
+                result.push_str(rest);
+            } else {
+                result.push_str(tok);
+            }
+        }
+        if result.is_empty() {
+            return None;
+        }
+        Some(result)
+    }
+
+    fn compress_chunked(model: &mut KompressModel, text: &str) -> Option<String> {
+        let words: Vec<&str> = text.split_whitespace().collect();
+        let chunk_size = 350; // ~500 tokens per chunk, well under 8192
+        let mut parts = Vec::new();
+        let mut start = 0;
+
+        while start < words.len() {
+            let end = (start + chunk_size).min(words.len());
+            let chunk: String = words[start..end].join(" ");
+
+            let encoding = model.tokenizer.encode(chunk.as_str(), true).ok()?;
+            let input_ids: Vec<i64> = encoding.get_ids().iter().map(|&id| id as i64).collect();
+            let attention_mask: Vec<i64> = encoding
+                .get_attention_mask()
+                .iter()
+                .map(|&m| m as i64)
+                .collect();
+            let seq_len = input_ids.len();
+
+            let ids_tensor = ort::value::Tensor::from_array((
+                vec![1, seq_len as i64],
+                input_ids.into_boxed_slice(),
+            ))
+            .ok()?;
+            let mask_tensor = ort::value::Tensor::from_array((
+                vec![1, seq_len as i64],
+                attention_mask.into_boxed_slice(),
+            ))
+            .ok()?;
+
+            let outputs = model
+                .session
+                .run(ort::inputs![ids_tensor, mask_tensor])
+                .ok()?;
+            let (_shape, logits) = outputs[0].try_extract_tensor::<f32>().ok()?;
+            let tokens = encoding.get_tokens();
+
+            let mut chunk_result = String::new();
+            for i in 0..seq_len {
+                let base = i * 2;
+                let drop_logit = logits.get(base).copied().unwrap_or(0.0);
+                let keep_logit = logits.get(base + 1).copied().unwrap_or(0.0);
+                if keep_logit > drop_logit {
+                    if let Some(tok) = tokens.get(i) {
+                        if tok == "[CLS]" || tok == "[SEP]" || tok == "<s>" || tok == "</s>" {
+                            continue;
+                        }
+                        if let Some(rest) = tok.strip_prefix('Ġ') {
+                            if !chunk_result.is_empty() {
+                                chunk_result.push(' ');
+                            }
+                            chunk_result.push_str(rest);
+                        } else {
+                            chunk_result.push_str(tok);
+                        }
+                    }
+                }
+            }
+
+            if !chunk_result.is_empty() {
+                parts.push(chunk_result);
+            }
+
+            if end >= words.len() {
+                break;
+            }
+            start = end.saturating_sub(CHUNK_OVERLAP_WORDS);
+        }
+
+        if parts.is_empty() {
+            return None;
+        }
+        Some(parts.join(" "))
+    }
 }
 
 #[cfg(test)]
@@ -1670,5 +2222,136 @@ Callees (3):
         assert!(compressed.contains("API Surface (5 symbols):"));
         assert!(compressed.contains("2 files"));
         assert!(!compressed.contains("[Class]"));
+    }
+
+    // --- Prose compression tests ---
+
+    #[test]
+    fn test_prose_small_passthrough() {
+        let small = "This is a short text. Nothing to compress here.";
+        assert_eq!(compress_prose(small), small.to_string());
+    }
+
+    #[test]
+    fn test_prose_preserves_headings() {
+        let md = format!(
+            "# Main Title\n\n{}\n\n## Section Two\n\n- item one\n- item two\n",
+            "The quick brown fox jumps over the lazy dog. ".repeat(20)
+        );
+        let compressed = compress_prose(&md);
+        assert!(compressed.contains("# Main Title"));
+        assert!(compressed.contains("## Section Two"));
+        assert!(compressed.contains("- item one"));
+        assert!(compressed.contains("- item two"));
+    }
+
+    #[test]
+    fn test_prose_preserves_code_blocks() {
+        let md = format!(
+            "{}\n\n```rust\nfn main() {{}}\n```\n\n{}",
+            "This is important context about the code. ".repeat(15),
+            "More prose content follows the code block. ".repeat(15),
+        );
+        let compressed = compress_prose(&md);
+        assert!(compressed.contains("```rust"));
+        assert!(compressed.contains("fn main() {}"));
+        assert!(compressed.contains("```"));
+    }
+
+    #[test]
+    fn test_prose_reduces_long_paragraphs() {
+        let long_para = format!("{} {} {}",
+            "Authentication uses JWT tokens for stateless session management. The token contains claims about the user identity and permissions. Sessions are stored server-side in Redis for fast lookup. Cookies carry the session identifier between requests. HTTP headers include authorization bearer tokens. Middleware validates tokens before passing requests to handlers. The routing layer maps URLs to controller functions. Caching reduces database load by storing frequent queries.",
+            "Logging captures request and response metadata for debugging. Metrics track latency percentiles and error rates. Rate limiting prevents abuse by throttling excessive requests. Circuit breakers protect downstream services from cascading failures. Load balancers distribute traffic across multiple instances. Health checks verify service readiness and liveness. Graceful shutdown drains in-flight requests before terminating.",
+            "Database migrations run during deployment using a versioned schema approach. Connection pooling minimizes the overhead of establishing new database connections. Query optimization involves analyzing execution plans and adding appropriate indexes. Replication ensures data durability across geographic regions. Backup procedures run nightly with point-in-time recovery capability. Schema validation prevents malformed data from entering the system."
+        );
+        let compressed = compress_prose(&long_para);
+        assert!(
+            compressed.len() < long_para.len(),
+            "compressed ({}) should be smaller than original ({})",
+            compressed.len(),
+            long_para.len()
+        );
+    }
+
+    #[test]
+    fn test_prose_generic_dispatch() {
+        let prose =
+            "This is a plain text document without any special formatting markers. ".repeat(20);
+        assert_eq!(classify_content(&prose), ContentType::PlainText);
+        let compressed = compress_generic(&prose);
+        assert!(compressed.len() < prose.len());
+    }
+
+    #[test]
+    fn test_split_sentences() {
+        let text = "First sentence. Second one! Third here? Last one.";
+        let s = split_sentences(text);
+        assert_eq!(s.len(), 4);
+        assert_eq!(s[0], "First sentence.");
+        assert_eq!(s[1], "Second one!");
+        assert_eq!(s[2], "Third here?");
+        assert_eq!(s[3], "Last one.");
+    }
+
+    #[test]
+    fn test_strip_filler_words() {
+        let input =
+            "It is important to note that the system basically just needs a simple restart.";
+        let stripped = strip_filler_words(input);
+        assert!(!stripped.contains("basically"));
+        assert!(!stripped.contains("just"));
+        assert!(!stripped.contains("it is important to note that"));
+        assert!(stripped.contains("system"));
+        assert!(stripped.contains("needs"));
+        assert!(stripped.contains("restart"));
+    }
+
+    #[test]
+    fn test_filler_stripping_in_prose() {
+        let prose = "The authentication system basically just needs the simple configuration. It is important to note that the middleware actually validates tokens. The routing layer essentially maps URLs to controllers. Furthermore the caching system really reduces database load. Moreover the logging framework certainly captures all request metadata. Nevertheless the metrics system definitely tracks latency percentiles. Accordingly the rate limiter simply prevents abuse. Consequently the circuit breaker obviously protects downstream services. The load balancer clearly distributes traffic. The health check system quite reliably verifies readiness. The graceful shutdown process rather carefully drains requests. The database migration tool somewhat automatically handles schema changes. The connection pool perhaps efficiently manages database connections. The query optimizer definitely analyzes execution plans. The replication system certainly ensures data durability.";
+        let stripped = strip_filler_words(prose);
+        // Filler stripping should reduce length meaningfully
+        assert!(
+            stripped.len() < (prose.len() as f64 * 0.85) as usize,
+            "Filler stripping should remove >15% chars: {} -> {}",
+            prose.len(),
+            stripped.len()
+        );
+        // Core content preserved
+        assert!(stripped.contains("authentication"));
+        assert!(stripped.contains("middleware"));
+        assert!(stripped.contains("validates tokens"));
+    }
+
+    #[test]
+    fn test_kompress_direct() {
+        // Only runs if model is downloaded
+        if let Some(compressed) = kompress::compress(
+            "Authentication uses JWT tokens for stateless session management. \
+             The token contains claims about the user identity and permissions. \
+             Sessions are stored server-side in Redis for fast lookup. \
+             Cookies carry the session identifier between requests. \
+             HTTP headers include authorization bearer tokens. \
+             Middleware validates tokens before passing requests to handlers. \
+             The routing layer maps URLs to controller functions. \
+             Caching reduces database load by storing frequent queries. \
+             Logging captures request and response metadata for debugging. \
+             Metrics track latency percentiles and error rates.",
+        ) {
+            assert!(!compressed.is_empty());
+            assert!(
+                compressed.len() < 800,
+                "kompress should compress: got {}",
+                compressed.len()
+            );
+            eprintln!(
+                "kompress output ({} chars): {}",
+                compressed.len(),
+                &compressed[..compressed.len().min(200)]
+            );
+        } else {
+            eprintln!("kompress: model not available, skipping");
+        }
     }
 }

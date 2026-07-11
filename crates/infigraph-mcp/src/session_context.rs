@@ -28,6 +28,8 @@ struct CompressionConfig {
     token_budget: Option<usize>,
     #[serde(default)]
     staleness_window: Option<usize>,
+    #[serde(default)]
+    ml_compression: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -42,6 +44,7 @@ impl Default for CompressionConfig {
             dedup: None,
             token_budget: None,
             staleness_window: None,
+            ml_compression: None,
         }
     }
 }
@@ -55,6 +58,44 @@ fn find_config_file() -> Option<PathBuf> {
             return Some(candidate);
         }
         dir = dir.parent()?;
+    }
+}
+
+const DEDUP_STATE_FILE: &str = "dedup_state.json";
+const PERSIST_INTERVAL: usize = 5;
+
+fn dedup_state_path() -> Option<PathBuf> {
+    let cwd = std::env::current_dir().ok()?;
+    let mut dir = cwd.as_path();
+    loop {
+        let infigraph = dir.join(".infigraph");
+        if infigraph.is_dir() {
+            return Some(infigraph.join(DEDUP_STATE_FILE));
+        }
+        dir = dir.parent()?;
+    }
+}
+
+fn load_dedup_state() -> HashMap<String, u64> {
+    let Some(path) = dedup_state_path() else {
+        return HashMap::new();
+    };
+    let Ok(data) = std::fs::read_to_string(&path) else {
+        return HashMap::new();
+    };
+    serde_json::from_str(&data).unwrap_or_default()
+}
+
+fn persist_dedup_state(seen: &HashMap<String, SeenEntry>) {
+    let Some(path) = dedup_state_path() else {
+        return;
+    };
+    let hashes: HashMap<&str, u64> = seen
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.content_hash))
+        .collect();
+    if let Ok(data) = serde_json::to_string(&hashes) {
+        let _ = std::fs::write(path, data);
     }
 }
 
@@ -87,12 +128,14 @@ struct ToolCallStats {
 
 struct SessionContext {
     seen: HashMap<String, SeenEntry>,
+    prior_hashes: HashMap<String, u64>,
     call_counter: usize,
     staleness_window: usize,
     total_tokens_sent: usize,
     token_budget: usize,
     config: CompressionConfig,
     tool_stats: HashMap<String, ToolCallStats>,
+    persist_counter: usize,
 }
 
 impl SessionContext {
@@ -104,14 +147,17 @@ impl SessionContext {
             .or(cfg.token_budget)
             .unwrap_or(DEFAULT_TOKEN_BUDGET);
         let staleness = cfg.staleness_window.unwrap_or(DEFAULT_STALENESS_WINDOW);
+        let prior = load_dedup_state();
         Self {
             seen: HashMap::new(),
+            prior_hashes: prior,
             call_counter: 0,
             staleness_window: staleness,
             total_tokens_sent: 0,
             token_budget: budget,
             config: cfg,
             tool_stats: HashMap::new(),
+            persist_counter: 0,
         }
     }
 
@@ -191,6 +237,20 @@ fn parse_level_str(s: &str) -> Option<CompressionLevel> {
     }
 }
 
+/// Get ML compression mode: "off", "extractive" (default), or "kompress".
+/// Priority: env var INFIGRAPH_ML_COMPRESSION > config.toml > "extractive".
+pub fn get_ml_compression_mode() -> String {
+    if let Ok(v) = std::env::var("INFIGRAPH_ML_COMPRESSION") {
+        return v.to_lowercase();
+    }
+    let guard = SESSION.lock().unwrap_or_else(|e| e.into_inner());
+    guard
+        .as_ref()
+        .and_then(|ctx| ctx.config.ml_compression.clone())
+        .unwrap_or_else(|| "extractive".to_string())
+        .to_lowercase()
+}
+
 fn parse_level_override() -> Option<CompressionLevel> {
     std::env::var("INFIGRAPH_COMPRESSION_LEVEL")
         .ok()
@@ -267,9 +327,34 @@ pub fn apply_seen_dedup(compressed: &str, tool_name: &str, args: &Value) -> Stri
                     tokens_sent: entry.tokens_sent,
                 },
             );
+            maybe_persist(ctx);
             return placeholder;
         }
         // Content changed or stale — fall through to show full + update
+    }
+
+    // Check prior session hashes (content-verified dedup)
+    if let Some(&prior_hash) = ctx.prior_hashes.get(&key) {
+        if prior_hash == hash {
+            // Content unchanged since prior session — dedup
+            ctx.seen.insert(
+                key.clone(),
+                SeenEntry {
+                    call_seen: current_call,
+                    content_hash: hash,
+                    tokens_sent: tokens,
+                },
+            );
+            ctx.prior_hashes.remove(&key);
+            let placeholder = format!(
+                "(seen in prior session: {key}, {} tokens — use detail=true to force full output)",
+                tokens
+            );
+            maybe_persist(ctx);
+            return placeholder;
+        }
+        // Content changed — remove stale prior hash
+        ctx.prior_hashes.remove(&key);
     }
 
     ctx.seen.insert(
@@ -281,7 +366,15 @@ pub fn apply_seen_dedup(compressed: &str, tool_name: &str, args: &Value) -> Stri
         },
     );
 
+    maybe_persist(ctx);
     compressed.to_string()
+}
+
+fn maybe_persist(ctx: &mut SessionContext) {
+    ctx.persist_counter += 1;
+    if ctx.persist_counter.is_multiple_of(PERSIST_INTERVAL) {
+        persist_dedup_state(&ctx.seen);
+    }
 }
 
 /// Record a tool call, noting whether detail=true was requested.
@@ -586,5 +679,113 @@ mod tests {
         // 3000/10000 = 70% remaining → Summary (boundary)
         let level = get_compression_level();
         assert_eq!(level, CompressionLevel::Summary);
+    }
+
+    // --- Phase 3.7: Prior-session dedup tests ---
+
+    fn inject_prior_hashes(hashes: HashMap<String, u64>) {
+        let mut guard = SESSION.lock().unwrap_or_else(|e| e.into_inner());
+        let ctx = guard.get_or_insert_with(SessionContext::new);
+        ctx.prior_hashes = hashes;
+    }
+
+    #[test]
+    fn test_prior_session_dedup_matching_hash() {
+        let _g = setup();
+        let output = big_output();
+        let args = json!({"symbol_id": "src/lib.rs::foo"});
+        let key = "get_doc_context:src/lib.rs::foo";
+        let hash = hash_content(&output);
+
+        inject_prior_hashes(HashMap::from([(key.to_string(), hash)]));
+
+        let result = apply_seen_dedup(&output, "get_doc_context", &args);
+        assert!(
+            result.starts_with("(seen in prior session:"),
+            "expected prior-session placeholder, got: {result}"
+        );
+        assert!(result.contains(key));
+    }
+
+    #[test]
+    fn test_prior_session_dedup_stale_hash() {
+        let _g = setup();
+        let output = big_output();
+        let changed = format!("{} changed content", big_output());
+        let args = json!({"symbol_id": "src/lib.rs::foo"});
+        let key = "get_doc_context:src/lib.rs::foo";
+        let old_hash = hash_content(&output);
+
+        inject_prior_hashes(HashMap::from([(key.to_string(), old_hash)]));
+
+        // Content changed — should NOT dedup, should return full
+        let result = apply_seen_dedup(&changed, "get_doc_context", &args);
+        assert!(
+            !result.starts_with("(seen"),
+            "stale hash should not dedup, got: {result}"
+        );
+        assert_eq!(result, changed);
+
+        // Prior hash should be removed — verify by checking second call isn't prior-session dedup
+        let result2 = apply_seen_dedup(&changed, "get_doc_context", &args);
+        assert!(
+            result2.starts_with("(seen "),
+            "second call should be regular dedup"
+        );
+        assert!(!result2.contains("prior session"));
+    }
+
+    #[test]
+    fn test_prior_session_dedup_migrates_to_seen() {
+        let _g = setup();
+        let output = big_output();
+        let args = json!({"symbol_id": "src/lib.rs::foo"});
+        let key = "get_doc_context:src/lib.rs::foo";
+        let hash = hash_content(&output);
+
+        inject_prior_hashes(HashMap::from([(key.to_string(), hash)]));
+
+        // First call: hits prior_hashes, migrates to seen
+        let r1 = apply_seen_dedup(&output, "get_doc_context", &args);
+        assert!(r1.contains("prior session"));
+
+        // Second call: should hit regular seen map, not prior
+        let r2 = apply_seen_dedup(&output, "get_doc_context", &args);
+        assert!(r2.starts_with("(seen "));
+        assert!(!r2.contains("prior session"));
+    }
+
+    #[test]
+    fn test_persist_writes_at_interval() {
+        let _g = setup();
+        let dir = tempfile::tempdir().unwrap();
+        let infigraph_dir = dir.path().join(".infigraph");
+        std::fs::create_dir_all(&infigraph_dir).unwrap();
+        let state_file = infigraph_dir.join(DEDUP_STATE_FILE);
+
+        // Change cwd so dedup_state_path() finds our temp dir
+        let orig_dir = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        reset_session();
+
+        let _args = json!({"symbol_id": "src/lib.rs::foo"});
+
+        // Make PERSIST_INTERVAL calls (5) — file should exist after
+        for i in 0..PERSIST_INTERVAL {
+            let out = format!("output number {} {}", i, big_output());
+            let a = json!({"symbol_id": format!("sym_{i}")});
+            apply_seen_dedup(&out, "get_doc_context", &a);
+        }
+
+        assert!(
+            state_file.exists(),
+            "dedup state should be persisted after {PERSIST_INTERVAL} calls"
+        );
+        let data: HashMap<String, u64> =
+            serde_json::from_str(&std::fs::read_to_string(&state_file).unwrap()).unwrap();
+        assert_eq!(data.len(), PERSIST_INTERVAL);
+
+        // Restore cwd
+        std::env::set_current_dir(orig_dir).unwrap();
     }
 }

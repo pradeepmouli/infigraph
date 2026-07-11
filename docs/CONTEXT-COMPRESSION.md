@@ -2,6 +2,17 @@
 
 Infigraph's context compression engine reduces AI agent token usage by 70-90% while preserving answer quality. It works automatically — no configuration needed.
 
+## Quick Start
+
+**Nothing to do.** Compression is built into the infigraph-mcp binary and enabled by default. When you build and run the server (`cargo build -p infigraph-mcp`), every tool response is automatically compressed before reaching the AI agent. No config files, no environment variables, no opt-in required.
+
+- First ~70% of token budget: no compression (raw output)
+- As budget fills: compression scales up automatically (Summary → Aggressive → Minimal)
+- Session dedup: repeated content returns a compact placeholder instead of full output
+- Cross-session dedup: content hashes persist across `/clear` restarts
+
+To customize behavior, see [Configuration](#configuration) below. To disable entirely: `INFIGRAPH_COMPRESSION_LEVEL=off`.
+
 ## How It Works
 
 Every tool response passes through a 4-layer compression stack before reaching the AI agent:
@@ -64,6 +75,31 @@ Per-tool safety caps prevent quality loss — search is capped at Summary (eval 
 | Build output | Collapse compile lines, keep errors/warnings | ~80% |
 | File trees | Node collapse with file counts | ~60% |
 | Tables | Header + row count + first/last rows | ~70% |
+| Plain text/prose | Extractive summarization (TF-IDF/Potion sentence scoring + filler stripping) | ~55% |
+
+### ML Token Compression (opt-in)
+
+When enabled, prose compression uses **kompress-small** (70M params, ModernBERT) for token-level keep/drop classification:
+
+| Mode | Strategy | Savings | Latency |
+|------|----------|---------|---------|
+| `extractive` (default) | Sentence scoring + filler stripping | ~55% | <1ms |
+| `kompress` (opt-in) | ONNX token classifier (dual head: token + span conv) | ~33% | ~50ms |
+
+The model (~275MB) is downloaded on first use to `~/.infigraph/models/kompress-small/`. If download or inference fails, extractive compression is used as fallback.
+
+Enable via config:
+```toml
+[compression]
+ml_compression = "kompress"    # extractive (default) | kompress | off
+```
+
+Or environment variable:
+```
+INFIGRAPH_ML_COMPRESSION=kompress
+```
+
+Long texts (>8192 tokens) are automatically chunked with 20-word overlap.
 
 ## Getting Full Output
 
@@ -101,6 +137,10 @@ When the same content is requested again within a session, the engine returns a 
 
 Dedup is enabled by default. Disable with `INFIGRAPH_DEDUP=0`.
 
+### Cross-Session Dedup
+
+Content hashes are persisted to `.infigraph/dedup_state.json` every 5 tool calls. When a new session starts (e.g. after `/clear`), prior hashes are loaded and content-verified before deduping — if the content hash matches, a compact placeholder is returned; if content changed, the stale hash is discarded and full output is shown.
+
 ## The `compress` MCP Tool
 
 For non-Infigraph content (bash output, JSON blobs, log files), use the `compress` tool directly:
@@ -127,6 +167,7 @@ level = "auto"           # off | summary | aggressive | minimal | auto
 dedup = true             # false to disable session dedup
 token_budget = 150000    # total token budget for auto-scaling
 staleness_window = 6     # dedup staleness window (calls)
+ml_compression = "extractive"  # extractive | kompress | off
 ```
 
 ### Environment variables (override config file)
@@ -136,6 +177,8 @@ staleness_window = 6     # dedup staleness window (calls)
 | `INFIGRAPH_COMPRESSION_LEVEL` | (auto) | Force level: `off`, `summary`, `aggressive`, `minimal` |
 | `INFIGRAPH_TOKEN_BUDGET` | `150000` | Total token budget for auto-scaling |
 | `INFIGRAPH_DEDUP` | (on) | `0` to disable session dedup |
+| `INFIGRAPH_ML_COMPRESSION` | `extractive` | ML compression mode: `extractive`, `kompress`, `off` |
+| `INFIGRAPH_KOMPRESS_DIR` | `~/.infigraph/models/kompress-small` | Custom path for kompress model files |
 | `INFIGRAPH_METRICS` | (off) | `1` to log compression metrics to `.infigraph/compression_metrics.jsonl` |
 
 ## Quality Monitoring
@@ -156,6 +199,22 @@ Phase 6.4 eval across 20 tasks (search, doc_context, references, architecture):
 | Minimal | 72.9% | 100% (with per-tool caps) |
 
 Quality is measured via must_contain assertions — key facts (symbol names, file paths, structural info) that must survive compression for the task to be answerable.
+
+## Not Implemented
+
+These items are deferred — blocked by MCP protocol limitations or deprioritized. Pick up later when constraints change.
+
+| Item | Why Deferred | Unblocks When |
+|------|-------------|---------------|
+| **Focus-aware compression** (3.3) | Mostly covered by `for_edit=true` + content-hash dedup | Value proven in production usage |
+| **Graph-aware context compaction** (3.6) | MCP server can't detect when Claude Code triggers context compaction | MCP spec adds compaction event or client notification |
+| **Cross-agent context sharing** (Phase 5) | MCP protocol carries no agent identifier — can't distinguish which agent is calling | MCP spec adds agent/session ID to requests |
+| **Multi-provider cache adaptation** (6.5) | MCP doesn't expose provider metadata (Claude vs GPT vs Gemini cache models differ) | MCP spec adds client capability negotiation |
+| **Compression failure fallback** (2.9) | Compressors already fall through to raw on parse failure; formal `catch_unwind` + health monitoring not yet added | Production incident or stability concern |
+| **Smart detail prefetch** (2.8) | `detail=true` is cheap and explicit; prefetching adds complexity for marginal gain | Usage data shows agents repeatedly request detail on same symbols |
+| **LLM follow-up detection** (8.3) | Can't detect from MCP server when agent asks follow-up questions suggesting info was lost | Bidirectional MCP or agent feedback channel |
+
+See [Implementation Plan](PLAN-context-compression.md) for full design details on each item.
 
 ## Architecture
 
