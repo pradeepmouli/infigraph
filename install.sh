@@ -95,9 +95,15 @@ try_prebuilt() {
   local asset_name="infigraph-${TARGET}.${ARCHIVE_EXT}"
   local download_path="/tmp/${asset_name}"
 
-  # Get latest release
+  # Get latest release tag
   local release_tag
-  release_tag=$(gh api --hostname "${GHE_HOST}" "repos/${GHE_OWNER}/${GHE_REPO}/releases/latest" --jq '.tag_name' 2>/dev/null || echo "")
+  if [[ "$GHE_HOST" == "github.com" ]]; then
+    # Public GitHub: use curl, no gh CLI needed
+    release_tag=$(curl -fsSL "https://api.github.com/repos/${GHE_OWNER}/${GHE_REPO}/releases/latest" 2>/dev/null \
+      | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/')
+  else
+    release_tag=$(gh api --hostname "${GHE_HOST}" "repos/${GHE_OWNER}/${GHE_REPO}/releases/latest" --jq '.tag_name' 2>/dev/null || echo "")
+  fi
 
   if [ -z "$release_tag" ]; then
     echo "No releases found."
@@ -108,12 +114,30 @@ try_prebuilt() {
   echo "Looking for: ${asset_name}"
 
   # Download asset
-  local dl_err
-  dl_err=$(GH_HOST="${GHE_HOST}" gh release download "${release_tag}" \
-    --repo "${GHE_OWNER}/${GHE_REPO}" \
-    --pattern "${asset_name}" \
-    --dir /tmp --clobber 2>&1)
-  if [ $? -eq 0 ]; then
+  local dl_ok=false
+  if [[ "$GHE_HOST" == "github.com" ]]; then
+    # Public GitHub: direct curl download, no gh CLI needed
+    local url="https://github.com/${GHE_OWNER}/${GHE_REPO}/releases/download/${release_tag}/${asset_name}"
+    if curl -fsSL -o "${download_path}" "$url" 2>/dev/null; then
+      dl_ok=true
+    else
+      echo "Download failed: ${url}"
+    fi
+  else
+    local dl_err
+    dl_err=$(GH_HOST="${GHE_HOST}" gh release download "${release_tag}" \
+      --repo "${GHE_OWNER}/${GHE_REPO}" \
+      --pattern "${asset_name}" \
+      --dir /tmp --clobber 2>&1)
+    if [ $? -eq 0 ]; then
+      dl_ok=true
+    else
+      echo "Download failed for ${TARGET} in release ${release_tag}:"
+      echo "  ${dl_err}"
+    fi
+  fi
+
+  if [ "$dl_ok" = true ]; then
 
     mkdir -p "$INSTALL_DIR"
 
@@ -138,8 +162,6 @@ try_prebuilt() {
     return 0
   fi
 
-  echo "Download failed for ${TARGET} in release ${release_tag}:"
-  echo "  ${dl_err}"
   return 1
 }
 
@@ -229,6 +251,28 @@ if [[ "$OS_TAG" != "pc-windows-msvc" ]]; then
     echo "Restart your shell or run:"
     echo "  export PATH=\"$INSTALL_DIR:\$PATH\""
   fi
+fi
+
+# Download Kompress ML compression model (~275MB)
+KOMPRESS_DIR="$HOME/.infigraph/models/kompress-small"
+HF_REPO="chopratejas/kompress-small"
+KOMPRESS_FILES="model.onnx model.onnx.data tokenizer.json"
+if [ ! -f "$KOMPRESS_DIR/model.onnx" ] || [ ! -f "$KOMPRESS_DIR/tokenizer.json" ]; then
+  echo ""
+  echo "Downloading Kompress ML model for context compression..."
+  mkdir -p "$KOMPRESS_DIR"
+  for f in $KOMPRESS_FILES; do
+    if [ ! -f "$KOMPRESS_DIR/$f" ]; then
+      echo "  ↓ $f"
+      curl -# -fSL -o "$KOMPRESS_DIR/${f}.tmp" \
+        "https://huggingface.co/${HF_REPO}/resolve/main/${f}" \
+        && mv "$KOMPRESS_DIR/${f}.tmp" "$KOMPRESS_DIR/$f" \
+        || { echo "  ⚠ Failed to download $f (non-fatal, will retry on first use)"; rm -f "$KOMPRESS_DIR/${f}.tmp"; }
+    fi
+  done
+  echo "  ✓ Kompress model ready"
+else
+  echo "Kompress model already installed"
 fi
 
 # Auto-run infigraph install to register MCP + primary search
