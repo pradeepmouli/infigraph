@@ -272,10 +272,12 @@ Built into `crates/infigraph-mcp/` as response middleware in `dispatch_tool`. No
 - `get_compression_stats` reports `Compress failures` count
 
 ### Deliverable ✅
-- 4 compressors: search, get_doc_context, find_all_references, get_architecture
+- Core tool compressors: search, get_doc_context, find_all_references, get_architecture
+- Later additions: list_files, detect_dead_code, get_api_surface, git_summary, **search_sessions** (Decisions/Files truncation by level)
 - Metrics logging in handle_tools_call (gated INFIGRAPH_METRICS=1)
-- Bypass rules: security tools, small outputs, errors, detail=true, for_edit=true
+- Bypass rules: security tools, small outputs, errors, detail=true, for_edit=true, focus set (3.3)
 - Per-tool level caps (search capped at Summary) — commit `651ec59`
+- Compression failure fallback (2.9): `compress_pipeline_safe` + Compress failures in stats
 
 ---
 
@@ -283,7 +285,7 @@ Built into `crates/infigraph-mcp/` as response middleware in `dispatch_tool`. No
 
 **Goal:** Avoid re-sending content the LLM already has in context. Target: additional 20-30% reduction.
 
-**Outcome:** Core seen-dedup (3.1+3.2+3.4) implemented in `session_context.rs`. FNV-1a hashing, 6-call staleness window, gated behind `INFIGRAPH_DEDUP=1`. 8 tests. Commit: `4a7bf04`. Deferred: 3.3 (focus tracking), 3.6 (graph-aware compaction — undetectable from MCP), 3.7 (LM2 integration — MCP restarts on /clear).
+**Outcome:** Core seen-dedup (3.1+3.2+3.4) implemented in `session_context.rs`. FNV-1a hashing, 6-call staleness window, dedup on by default (`INFIGRAPH_DEDUP=0` to disable). Focus tracking (3.3) and cross-session dedup (3.7) shipped. Still deferred: 3.6 (graph-aware compaction — undetectable from MCP).
 
 ### Task 3.1: Design session context store ✅
 
@@ -305,13 +307,15 @@ Built into `crates/infigraph-mcp/` as response middleware in `dispatch_tool`. No
 - [x] Track files/symbols from `get_doc_context` with `for_edit=true` and `get_code_snippet`
 - [x] Never compress content in the focus set (`should_bypass` → `is_in_focus`)
 - [x] Focus ages out after staleness window (default 6 calls via `focus_clock`)
-- File path from `symbol_id` (`path::name`) is also tracked so sibling symbols in the same file stay uncompressed
+- [x] File path from `symbol_id` (`path::name`) is also tracked so sibling symbols in the same file stay uncompressed
+- [x] Focused args also skip `(seen …)` dedup placeholders in `apply_seen_dedup`
+- [x] Free-text `query` is not a focus candidate (avoids false-positive bypass on `search`)
 
 ### Task 3.4: Wire into compression middleware
 
-- [x] `apply_seen_dedup` called after `compress_tool_output` in `handle_tools_call`
+- [x] `apply_seen_dedup` called after `compress_tool_output` in `handle_tools_call` (via `compress_pipeline_safe`)
 - [x] Dedup runs on already-compressed output
-- [x] Gated behind `INFIGRAPH_DEDUP=1` env var
+- [x] Dedup on by default; `INFIGRAPH_DEDUP=0` disables
 
 ### Task 3.5: Run Phase 3 eval ✅
 - [x] Integration test `phase3_dedup_eval` in compression_eval.rs
@@ -352,7 +356,7 @@ Built into `crates/infigraph-mcp/` as response middleware in `dispatch_tool`. No
 - [x] Session context tracking with seen-dedup (session_context.rs, 8 tests)
 - [x] Phase 3 eval: 42.6% additional savings, 67% dedup rate, quality preserved
 - [x] LM2 session integration: cross-session dedup via persisted content hashes (3.7, 4 tests)
-- [x] Focus-aware compression (3.3 — `record_focus` / `is_in_focus` bypass)
+- [x] Focus-aware compression (3.3 — `record_focus` / `is_in_focus` bypasses compress + dedup)
 - [ ] Graph-aware context compaction (deferred: 3.6 — undetectable from MCP server)
 
 ---
@@ -361,7 +365,7 @@ Built into `crates/infigraph-mcp/` as response middleware in `dispatch_tool`. No
 
 **Goal:** Compress non-Infigraph content (bash output, file reads, JSON blobs, prose text). Target: 50-80% reduction on these content types.
 
-**Outcome (Phase 4a):** Added 4 more tool-specific compressors: `list_files` (dir tree collapse), `detect_dead_code` (group by file), `get_api_surface` (collapse symbols, keep routes), `git_summary` (truncate symbol lists >5).
+**Outcome (Phase 4a):** Added tool-specific compressors: `list_files` (dir tree collapse), `detect_dead_code` (group by file), `get_api_surface` (collapse symbols, keep routes), `git_summary` (truncate symbol lists >5), later `search_sessions` (truncate Decisions pipes; level-aware Files Touched).
 
 **Outcome (Phase 4b):** Content classifier (8 types: Json, JsonArray, LogOutput, StackTrace, BuildOutput, FileTree, Table, PlainText) + 7 generic compressors (JSON schema+sample, log dedup, stack trace framework collapse, build output compile collapse, file tree node collapse, table truncation, PlainText passthrough). `compress` MCP tool wired up for arbitrary text compression. ML prose (Task 4.9/4.10) deferred — extractive summarizer needs no new deps but PlainText is passthrough for now.
 
@@ -430,6 +434,7 @@ Built into `crates/infigraph-mcp/` as response middleware in `dispatch_tool`. No
 - [x] Content classifier + 8 generic compressors (JSON, log, stack, build, file tree, table, prose extractive)
 - [x] `compress` MCP tool for arbitrary text compression
 - [x] 4 more tool compressors: list_files, detect_dead_code, get_api_surface, git_summary
+- [x] `search_sessions` compressor (truncate Decisions; level-aware Files Touched)
 - [x] Extractive prose compressor (TF-IDF/Potion sentence scoring + filler stripping)
 - [x] Kompress ML token compression (opt-in, download-on-first-use)
 - [x] Phase 4 eval: 78.7% generic savings, 33.4% kompress prose savings

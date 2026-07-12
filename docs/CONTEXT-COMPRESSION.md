@@ -6,33 +6,40 @@ Infigraph's context compression engine reduces AI agent token usage by 70-90% wh
 
 **Nothing to do.** Compression is built into the infigraph-mcp binary and enabled by default. When you build and run the server (`cargo build -p infigraph-mcp`), every tool response is automatically compressed before reaching the AI agent. No config files, no environment variables, no opt-in required.
 
-- First ~70% of token budget: no compression (raw output)
-- As budget fills: compression scales up automatically (Summary → Aggressive → Minimal)
+- Fresh install writes `[compression] level = "summary"` so tool output is shaped immediately
+- Without a fixed level (`level = "auto"`): first ~70% of token budget is raw; as budget fills, compression scales Summary → Aggressive → Minimal
 - Session dedup: repeated content returns a compact placeholder instead of full output
 - Cross-session dedup: content hashes persist across `/clear` restarts
+- Focus set: recently edited symbols/files bypass compression and dedup for a short window
 
 To customize behavior, see [Configuration](#configuration) below. To disable entirely: `INFIGRAPH_COMPRESSION_LEVEL=off`.
 
 ## How It Works
 
-Every tool response passes through a 4-layer compression stack before reaching the AI agent:
+Every tool response passes through the compression stack before reaching the AI agent:
 
 ```
 Raw tool output (e.g. 1722 tokens)
     │
     ▼
+Focus / bypass checks
+    │  detail=true, for_edit=true, focus set, security, tiny/error → raw
+    ▼
 Layer 1: Content Classification
     │  Detect type → route to optimal compressor
     ▼
 Layer 2: Type-Specific Compression
-    │  Tool-aware: search, doc_context, refs, architecture
+    │  Tool-aware: search, doc_context, refs, architecture, search_sessions, …
     │  Generic: JSON, logs, stack traces, build output, tables, file trees
     ▼
 Layer 3: Session Dedup
     │  Skip content already in context (FNV-1a hash tracking)
+    │  Focus keys skip `(seen …)` placeholders too
     ▼
 Layer 4: Budget-Aware Scaling
-    │  Compress harder as token budget fills up
+    │  Compress harder as token budget fills up (when level = auto)
+    ▼
+Safety: panic in compress/dedup → return raw + Compress failures++
     ▼
 Compressed output (e.g. 113 tokens = 93% reduction)
 ```
@@ -63,7 +70,7 @@ Per-tool safety caps prevent quality loss — search is capped at Summary (eval 
 | `list_files` | Directory tree with file counts | varies |
 | `get_api_surface` | Collapsed per-file, keep routes | varies |
 | `git_summary` | Truncate symbol lists > 5 | varies |
-| `search_sessions` | Keep summary/pending/narrative; truncate Decisions pipes + long Files Touched | high on decision-heavy results |
+| `search_sessions` | Keep summary/pending/narrative; truncate Decisions pipes; Files kept only at Summary (dropped at Aggressive/Minimal) | high on decision-heavy results |
 
 ### Generic Compressors (via `compress` tool)
 
@@ -123,10 +130,19 @@ get_doc_context symbol_id="..." for_edit=true
 ## Bypass Rules
 
 These are never compressed:
-- `get_code_snippet` output (always needs full source)
+- `get_code_snippet` output (always needs full source) — also **records focus** for the symbol/file
 - Security tools (`detect_security_issues`, `detect_taint_flows`, etc.)
 - Error responses and small outputs (< 100 tokens)
 - Requests with `detail=true` or `for_edit=true`
+- Args matching the **focus set** (see below)
+
+### Focus-aware bypass (task 3.3)
+
+Calling `get_code_snippet` or `get_doc_context` with `for_edit=true` marks the symbol (and file prefix from `path::name`) as in focus. For the next staleness window (default 6 tool calls):
+
+- Matching `symbol_id` / `symbol` / `file` args **skip compression**
+- Focused content also **skips dedup placeholders** — you always get the full (or shaped) payload, not `(seen …)`
+- Free-text `query` does **not** match focus (avoids false positives on `search`)
 
 ## Session Dedup
 
@@ -136,7 +152,7 @@ When the same content is requested again within a session, the engine returns a 
 (seen 2 calls ago: get_doc_context:src/lib.rs::dispatch_tool, 580 tokens — use detail=true to force full output)
 ```
 
-Dedup is enabled by default. Disable with `INFIGRAPH_DEDUP=0`.
+Dedup is enabled by default. Disable with `INFIGRAPH_DEDUP=0`. Focus-set matches bypass this placeholder (see above).
 
 ### Cross-Session Dedup
 
@@ -186,7 +202,13 @@ ml_compression = "extractive"  # extractive | kompress | off
 
 The engine tracks when agents request full output (`detail=true`). If the detail-request rate exceeds 30% for any tool (minimum 5 calls), compression is automatically reduced to Summary level for that tool.
 
-Use the `get_compression_stats` tool to see current session metrics including detail-request rates per tool.
+Use the `get_compression_stats` tool to see current session metrics including:
+
+- Compression level (and whether it came from env / config / auto)
+- Token budget usage and tool call counts
+- Dedup entry count and focus entry count
+- Per-tool detail-request rates
+- **Compress failures** — panics recovered by the 2.9 safety net (`catch_unwind` around compress+dedup returns raw output and increments this counter)
 
 ## Eval Results
 
@@ -222,7 +244,8 @@ See [Implementation Plan](PLAN-context-compression.md) for full design details o
 ## Architecture
 
 Source files:
-- `crates/infigraph-mcp/src/compress.rs` — Tool-specific + generic compressors, content classifier, level caps
-- `crates/infigraph-mcp/src/session_context.rs` — Session state, dedup, budget tracking, auto-level
+- `crates/infigraph-mcp/src/compress.rs` — Tool-specific + generic compressors, content classifier, level caps, `compress_pipeline_safe`
+- `crates/infigraph-mcp/src/session_context.rs` — Session state, dedup, focus, budget tracking, auto-level
+- `crates/infigraph-mcp/src/recovery.rs` — Shared wipe helper for code+docs reindex after corrupt store / crash (reliability path, not compression)
 
 See [Implementation Plan](PLAN-context-compression.md) for full design details and eval methodology.
