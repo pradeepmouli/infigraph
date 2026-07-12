@@ -625,13 +625,15 @@ The UI is served by the same `infigraph-mcp` process Claude Code spawns. No sepa
   "mcpServers": {
     "infigraph": {
       "command": "/path/to/infigraph-mcp",
-      "args": ["--ui", "--mcp", "--port=9749"]
+      "args": ["--mcp"]
     }
   }
 }
 ```
 
-Replace `/path/to/infigraph-mcp` with the output of `which infigraph-mcp`.
+Replace `/path/to/infigraph-mcp` with the output of `which infigraph-mcp`. (`infigraph install` writes the same `args`.)
+
+For the graph explorer UI separately: `infigraph-mcp --ui --port=9749` (see [Web UI](#web-ui)).
 
 **Other causes:**
 - Binary not found: verify `which infigraph-mcp` returns a path
