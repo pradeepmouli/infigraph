@@ -566,3 +566,216 @@ pub fn build_tools_list() -> Vec<Value> {
             json!({}), &[]),
     ]
 }
+
+pub fn mcp_log(level: &str, msg: &str) {
+    use std::io::Write;
+    let path = mcp_log_file_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let _ = writeln!(f, "[{ts}] {level}: {msg}");
+    }
+}
+
+fn mcp_log_file_path() -> std::path::PathBuf {
+    std::env::var("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from("."))
+        .join(".infigraph")
+        .join("mcp.log")
+}
+
+pub fn estimate_tokens(text: &str) -> usize {
+    let words = text.split_whitespace().count();
+    ((words as f64) * 1.4).ceil() as usize
+}
+
+pub fn handle_initialize(id: &Value, is_primary: bool) -> Value {
+    mcp_log("INFO", &format!("initialize called (primary={is_primary})"));
+    if is_primary {
+        std::thread::spawn(|| {
+            mcp_log("DEBUG", "init_watchers start");
+            tools::watch::init_watchers();
+            mcp_log("DEBUG", "init_doc_watchers start");
+            tools::docs::init_doc_watchers();
+
+            let registry = match infigraph_core::multi::Registry::load() {
+                Ok(r) => {
+                    mcp_log(
+                        "DEBUG",
+                        &format!("registry loaded: {} repos", r.repos.len()),
+                    );
+                    r
+                }
+                Err(e) => {
+                    mcp_log("ERROR", &format!("registry load failed: {e}"));
+                    return;
+                }
+            };
+
+            for entry in registry.repos.values() {
+                if !entry.path.join(".infigraph").exists() {
+                    continue;
+                }
+                let path = entry.path.to_string_lossy().to_string();
+                tools::watch::auto_start_watch(&path);
+                tools::docs::auto_start_doc_watch(&path);
+            }
+        });
+    } else {
+        mcp_log("INFO", "Skipping watchers — not primary instance");
+    }
+
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {
+                "tools": {}
+            },
+            "serverInfo": {
+                "name": "infigraph",
+                "version": "0.1.0"
+            }
+        }
+    })
+}
+
+pub fn handle_tools_list(id: &Value) -> Value {
+    let tools = build_tools_list();
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": {
+            "tools": tools
+        }
+    })
+}
+
+pub fn handle_tools_call(id: &Value, request: &Value) -> Value {
+    let params = request.get("params").cloned().unwrap_or(Value::Null);
+    let tool_name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
+    let args = params.get("arguments").cloned().unwrap_or(json!({}));
+
+    tools::helpers::log_activity(tool_name, &args);
+
+    let metrics_enabled = std::env::var("INFIGRAPH_METRICS").is_ok_and(|v| v == "1");
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        dispatch_tool(tool_name, &args)
+    }));
+
+    match result {
+        Ok(Ok(content)) => {
+            let detail_requested = args
+                .get("detail")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            session_context::record_tool_call(tool_name, detail_requested);
+            session_context::record_focus(tool_name, &args);
+            let compressed = compress::compress_pipeline_safe(&content, tool_name, &args);
+            let comp_tokens = estimate_tokens(&compressed);
+            let level_used = session_context::get_compression_level();
+            session_context::track_tokens(comp_tokens);
+            if metrics_enabled {
+                let raw_tokens = estimate_tokens(&content);
+                let ratio = if raw_tokens > 0 {
+                    comp_tokens as f64 / raw_tokens as f64
+                } else {
+                    1.0
+                };
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let args_summary = args
+                    .get("query")
+                    .or_else(|| args.get("symbol"))
+                    .or_else(|| args.get("name"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let detail = args
+                    .get("detail")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let line = json!({
+                    "tool": tool_name,
+                    "timestamp": ts,
+                    "raw_tokens": raw_tokens,
+                    "compressed_tokens": comp_tokens,
+                    "compression_ratio": (ratio * 100.0).round() / 100.0,
+                    "compression_level": format!("{:?}", level_used),
+                    "detail_requested": detail,
+                    "args_summary": args_summary,
+                });
+                if let Some(dir) = args
+                    .get("path")
+                    .and_then(|p| p.as_str())
+                    .map(|p| std::path::PathBuf::from(p).join(".infigraph"))
+                    .or_else(|| {
+                        std::env::var("HOME")
+                            .ok()
+                            .map(|h| std::path::PathBuf::from(h).join(".infigraph"))
+                    })
+                {
+                    let _ = std::fs::create_dir_all(&dir);
+                    let path = dir.join("compression_metrics.jsonl");
+                    if let Ok(mut f) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&path)
+                    {
+                        use std::io::Write;
+                        let _ = writeln!(f, "{}", line);
+                    }
+                }
+            }
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "content": [{ "type": "text", "text": compressed }]
+                }
+            })
+        }
+        Ok(Err(e)) => {
+            mcp_log("ERROR", &format!("tool={tool_name} err={e}"));
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "content": [{ "type": "text", "text": format!("Error: {e}") }],
+                    "isError": true
+                }
+            })
+        }
+        Err(panic_info) => {
+            let msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
+                s.to_string()
+            } else if let Some(s) = panic_info.downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "unknown panic".to_string()
+            };
+            mcp_log("ERROR", &format!("tool={tool_name} PANIC: {msg}"));
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "content": [{ "type": "text", "text": format!("Error: panic in {tool_name}: {msg}") }],
+                    "isError": true
+                }
+            })
+        }
+    }
+}

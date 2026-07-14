@@ -23,6 +23,7 @@ Built in Rust. Zero LLM dependency. Runs locally. No API keys. No network calls.
 - [Quick Start](#quick-start) — Install and run in 2 minutes
 - [How It Works](#how-it-works) — Integration with AI coding agents
 - [Offline-First Design](#offline-first-design) — No APIs, no network calls
+- [Remote MCP (HTTP Transport)](#remote-mcp-http-transport) — Serve as team-wide remote MCP
 - [Installation](#installation) — Setup for all platforms
 - [Usage Examples](#usage-examples) — CLI commands, Web UI, tasks
 - [Features & Architecture](#features--architecture) — Full capabilities list
@@ -201,6 +202,52 @@ This means:
 - No external dependencies or API keys required
 - Your codebase never leaves your machine
 - Works on air-gapped systems
+
+## Remote MCP (HTTP Transport)
+
+Serve Infigraph as a **remote MCP server** over HTTP, giving your entire team access to the code intelligence graph without local setup.
+
+```bash
+# Start HTTP server (default port 8642)
+infigraph-mcp --serve
+
+# Custom port + API key auth
+INFIGRAPH_API_KEY=your-secret infigraph-mcp --serve --mcp-port=9000
+
+# Combine with stdio MCP (serve both transports)
+infigraph-mcp --mcp --serve
+```
+
+### Connect from Claude Code
+
+Add to `~/.claude.json` or project `.claude/settings.json`:
+
+```json
+{
+  "mcpServers": {
+    "infigraph": {
+      "type": "url",
+      "url": "http://<server>:8642/tools/mcp",
+      "headers": {
+        "Authorization": "Bearer your-secret"
+      }
+    }
+  }
+}
+```
+
+### Endpoints
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| POST | `/tools/mcp` | MCP JSON-RPC (initialize, tools/list, tools/call) |
+| GET | `/health` | Health check |
+
+### Auth
+
+Set `INFIGRAPH_API_KEY` on the server. Clients send `Authorization: Bearer <key>`. If no key is set, the server is open.
+
+---
 
 ## Installation
 

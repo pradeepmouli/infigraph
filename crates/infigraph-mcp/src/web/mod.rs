@@ -73,6 +73,115 @@ pub fn start_ui_server(port: u16) -> bool {
     true
 }
 
+pub fn start_mcp_http_server(port: u16, is_primary: bool) -> bool {
+    let addr = format!("0.0.0.0:{}", port);
+    let server = match Server::http(&addr) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    thread::spawn(move || {
+        for mut request in server.incoming_requests() {
+            let url = request.url().to_string();
+            let method = request.method().to_string();
+            let route = url.split('?').next().unwrap_or(&url);
+
+            if !check_auth(&request) {
+                let _ = request.respond(serve_json_status(
+                    401,
+                    json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32000, "message": "Unauthorized"}}),
+                ));
+                continue;
+            }
+
+            let response = match (method.as_str(), route) {
+                ("POST", "/tools/mcp") => handle_mcp_post(&mut request, is_primary),
+                ("GET", "/health") => serve_json(json!({"status": "ok"})),
+                ("OPTIONS", _) => handle_cors_preflight(),
+                _ => serve_json_status(
+                    404,
+                    json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32000, "message": "Not found"}}),
+                ),
+            };
+
+            let _ = request.respond(response);
+        }
+    });
+    true
+}
+
+fn handle_mcp_post(
+    request: &mut tiny_http::Request,
+    is_primary: bool,
+) -> Response<std::io::Cursor<Vec<u8>>> {
+    let mut body = String::new();
+    let _ = request.as_reader().read_to_string(&mut body);
+
+    let rpc: Value = match serde_json::from_str(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            return serve_json(json!({
+                "jsonrpc": "2.0", "id": null,
+                "error": {"code": -32700, "message": format!("Parse error: {e}")}
+            }))
+        }
+    };
+
+    let id = rpc.get("id").cloned().unwrap_or(Value::Null);
+    let method = rpc.get("method").and_then(|m| m.as_str()).unwrap_or("");
+
+    let response = match method {
+        "initialize" => crate::handle_initialize(&id, is_primary),
+        "tools/list" => crate::handle_tools_list(&id),
+        "tools/call" => crate::handle_tools_call(&id, &rpc),
+        "notifications/initialized" | "notifications/cancelled" => {
+            json!({"jsonrpc": "2.0", "id": id, "result": {}})
+        }
+        _ => {
+            json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32601, "message": format!("Method not found: {method}")}})
+        }
+    };
+    serve_json(response)
+}
+
+fn check_auth(request: &tiny_http::Request) -> bool {
+    let key = std::env::var("INFIGRAPH_API_KEY").ok();
+    match key {
+        None => true,
+        Some(k) => request.headers().iter().any(|h| {
+            let field: &str = h.field.as_str().as_str();
+            field.eq_ignore_ascii_case("authorization")
+                && h.value.as_str() == format!("Bearer {}", k).as_str()
+        }),
+    }
+}
+
+fn handle_cors_preflight() -> Response<std::io::Cursor<Vec<u8>>> {
+    let data = Vec::new();
+    let h1 = Header::from_bytes("Access-Control-Allow-Origin", "*").unwrap();
+    let h2 = Header::from_bytes("Access-Control-Allow-Methods", "POST, GET, OPTIONS").unwrap();
+    let h3 = Header::from_bytes(
+        "Access-Control-Allow-Headers",
+        "Content-Type, Authorization, MCP-Session-Id",
+    )
+    .unwrap();
+    Response::from_data(data)
+        .with_status_code(204)
+        .with_header(h1)
+        .with_header(h2)
+        .with_header(h3)
+}
+
+fn serve_json_status(status: u16, value: Value) -> Response<std::io::Cursor<Vec<u8>>> {
+    let body = serde_json::to_string(&value).unwrap_or_default();
+    let data = body.into_bytes();
+    let ct = Header::from_bytes("Content-Type", "application/json").unwrap();
+    let cors = Header::from_bytes("Access-Control-Allow-Origin", "*").unwrap();
+    Response::from_data(data)
+        .with_status_code(status)
+        .with_header(ct)
+        .with_header(cors)
+}
+
 fn serve_html(body: &str, content_type: &str) -> Response<std::io::Cursor<Vec<u8>>> {
     let data = body.as_bytes().to_vec();
     let header = Header::from_bytes("Content-Type", content_type).unwrap();
