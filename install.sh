@@ -99,11 +99,12 @@ try_prebuilt() {
   local release_tag
   if [[ "$GHE_HOST" == "github.com" ]]; then
     # Public GitHub: direct download, no gh CLI needed
-    local api_response curl_auth=()
+    local api_response
     if [ -n "${GITHUB_TOKEN:-}" ]; then
-      curl_auth=(-H "Authorization: token ${GITHUB_TOKEN}")
+      api_response=$(curl -sL -H "Authorization: token ${GITHUB_TOKEN}" "https://api.github.com/repos/${GHE_OWNER}/${GHE_REPO}/releases/latest" 2>/dev/null)
+    else
+      api_response=$(curl -sL "https://api.github.com/repos/${GHE_OWNER}/${GHE_REPO}/releases/latest" 2>/dev/null)
     fi
-    api_response=$(curl -sL "${curl_auth[@]}" "https://api.github.com/repos/${GHE_OWNER}/${GHE_REPO}/releases/latest" 2>/dev/null)
     release_tag=$(echo "$api_response" | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/')
     if [ -z "$release_tag" ]; then
       # Check if rate-limited
