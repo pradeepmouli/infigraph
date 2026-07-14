@@ -52,12 +52,30 @@ pub fn watch_docs(
             if let Err(e) = idx.init() {
                 eprintln!("[{log_prefix}] init error: {e}");
             } else {
-                match idx.index() {
-                    Ok(r) => eprintln!(
-                        "[{log_prefix}] reindexed: {} files, {} chunks",
-                        r.indexed_files, r.total_chunks
-                    ),
-                    Err(e) => eprintln!("[{log_prefix}] index error: {e}"),
+                let indexed = match idx.index() {
+                    Ok(r) => {
+                        eprintln!(
+                            "[{log_prefix}] reindexed: {} files, {} chunks",
+                            r.indexed_files, r.total_chunks
+                        );
+                        true
+                    }
+                    Err(e) => {
+                        eprintln!("[{log_prefix}] index error: {e}");
+                        false
+                    }
+                };
+                drop(idx);
+                if indexed {
+                    match crate::combined::schedule_group_doc_refresh(root) {
+                        Ok(count) if count > 0 => {
+                            eprintln!(
+                                "[{log_prefix}] refreshing {count} combined document group(s)"
+                            )
+                        }
+                        Ok(_) => {}
+                        Err(e) => eprintln!("[{log_prefix}] combined refresh error: {e}"),
+                    }
                 }
             }
             pending = false;

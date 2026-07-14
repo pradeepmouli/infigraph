@@ -685,6 +685,8 @@ pub(crate) enum GroupAction {
     },
     /// Build (or rebuild) the combined graph for a group
     Combined { group: String },
+    /// Build (or rebuild) the physical combined document store for a group
+    CombinedDocs { group: String },
     /// Extract and sync contracts across repos in a group
     Sync { group: String },
     /// Show contracts discovered in a group
@@ -722,6 +724,18 @@ pub(crate) enum GroupAction {
         /// Deep mode: enrich results with cross-repo graph context for LLM reasoning
         #[arg(long)]
         deep: bool,
+    },
+    /// Hybrid BM25+vector search across the combined document store
+    SearchDocs {
+        group: String,
+        /// Document search query
+        query: String,
+        /// Max results
+        #[arg(short, long, default_value = "10")]
+        limit: usize,
+        /// BM25/vector blend (0.0 = pure BM25, 1.0 = pure vector)
+        #[arg(short, long, default_value = "0.5")]
+        alpha: f32,
     },
     /// Watch all repos in a group for changes, auto-reindex and rebuild combined graph
     Watch {

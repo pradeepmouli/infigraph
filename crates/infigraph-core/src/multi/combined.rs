@@ -246,7 +246,7 @@ pub fn build_combined_graph(registry: &Registry, group_name: &str) -> Result<(us
 
 /// Read a parquet file, prefix specified string columns, write back.
 /// Tracks IDs in `id_set` (column at `id_col_idx`). Returns row count.
-fn prefix_parquet_columns(
+pub fn prefix_parquet_columns(
     input: &Path,
     output: &Path,
     prefix: &str,
@@ -337,7 +337,7 @@ fn prefix_parquet_columns(
 
 /// Read edge parquet, prefix specified columns (ID columns), pass others through.
 /// `prefix_cols` lists column indices to prefix (e.g. &[0, 1] for src, tgt).
-fn prefix_edge_parquet(
+pub fn prefix_edge_parquet(
     input: &Path,
     output: &Path,
     prefix: &str,
@@ -920,7 +920,28 @@ pub fn open_combined_graph(group_name: &str) -> Result<GraphStore> {
             group_name
         );
     }
-    GraphStore::open(&path)
+    match GraphStore::open(&path) {
+        Ok(store) => Ok(store),
+        Err(first_err) => {
+            eprintln!(
+                "[combined-graph] open failed for group '{group_name}' ({first_err}), \
+                 wiping corrupt graph and scheduling rebuild..."
+            );
+            wipe_combined_graph(group_name);
+            Err(first_err.context(format!(
+                "combined graph corrupt for group '{group_name}'; wiped, rebuild needed"
+            )))
+        }
+    }
+}
+
+fn wipe_combined_graph(group_name: &str) {
+    if let Ok(path) = combined_graph_path(group_name) {
+        let _ = std::fs::remove_dir_all(&path);
+        let _ = std::fs::remove_file(&path);
+        let wal = path.with_extension("wal");
+        let _ = std::fs::remove_file(&wal);
+    }
 }
 
 /// Query the combined graph with a single Cypher query.

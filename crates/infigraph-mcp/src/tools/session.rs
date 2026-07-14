@@ -257,26 +257,35 @@ pub fn tool_save_session(args: &Value) -> Result<String> {
 
 pub const CLUSTER_GAP_SECS: i64 = 72 * 3600;
 
+/// Sessions whose `updated_at` falls within [`CLUSTER_GAP_SECS`] of the newest session.
+/// Unlike a chained walk from newest, this returns every session in the active window
+/// (parallel daily/named saves) without an arbitrary cap.
 pub fn detect_session_cluster(store: &SessionStore) -> Result<Vec<SessionData>> {
     let sorted = store.list_by_updated()?;
-    if sorted.len() <= 1 {
-        return Ok(sorted);
+    if sorted.is_empty() {
+        return Ok(vec![]);
     }
+    let anchor = sorted[0].updated_at;
+    Ok(sorted
+        .into_iter()
+        .filter(|s| anchor - s.updated_at <= CLUSTER_GAP_SECS)
+        .collect())
+}
 
-    const MAX_CLUSTER: usize = 3;
-    let mut cluster = vec![sorted[0].clone()];
-    for session in &sorted[1..] {
-        if cluster.len() >= MAX_CLUSTER {
-            break;
-        }
-        let prev_updated = cluster.last().unwrap().updated_at;
-        if prev_updated - session.updated_at <= CLUSTER_GAP_SECS {
-            cluster.push(session.clone());
-        } else {
-            break;
-        }
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
     }
-    Ok(cluster)
+    let end = s.char_indices().nth(max).map(|(i, _)| i).unwrap_or(s.len());
+    format!("{}…", &s[..end])
+}
+
+fn decision_count(decisions: &str) -> usize {
+    if decisions.is_empty() {
+        0
+    } else {
+        1 + decisions.matches(" | Goal:").count()
+    }
 }
 
 pub fn date_from_session_id(id: &str) -> &str {
@@ -357,6 +366,74 @@ pub fn format_session_output(
     out
 }
 
+/// Token-light card for multi-session restore. Omits bulky decisions/files; points to narrative.
+pub fn format_session_compact(
+    session: &SessionData,
+    idx: usize,
+    total: usize,
+    path: &str,
+) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("### {}. {}\n\n", idx + 1, session.id));
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let confidence = session.compute_confidence(now);
+
+    if !session.name.is_empty() {
+        out.push_str(&format!(
+            "**Name:** {} | **Confidence:** {:.2}\n\n",
+            session.name, confidence
+        ));
+    } else {
+        out.push_str(&format!("**Confidence:** {:.2}\n\n", confidence));
+    }
+    if !session.summary.is_empty() {
+        out.push_str(&format!(
+            "**Summary:** {}\n\n",
+            truncate_chars(&session.summary, 240)
+        ));
+    }
+    if !session.pending_tasks.is_empty() {
+        out.push_str(&format!(
+            "**Pending:** {}\n\n",
+            truncate_chars(&session.pending_tasks, 180)
+        ));
+    }
+    let n = decision_count(&session.decisions);
+    if n > 0 {
+        out.push_str(&format!(
+            "**Decisions:** ({n} — use `name='{}'` or narrative for full)\n\n",
+            if session.name.is_empty() {
+                session.id.clone()
+            } else {
+                session.name.clone()
+            }
+        ));
+    }
+    if !session.blockers.is_empty() {
+        out.push_str(&format!(
+            "**Blockers:** {}\n\n",
+            truncate_chars(&session.blockers, 120)
+        ));
+    }
+
+    let narrative_path = PathBuf::from(path)
+        .join(".infigraph")
+        .join("sessions")
+        .join(format!("{}.md", session.id));
+    if narrative_path.exists() {
+        out.push_str(&format!(
+            "**Narrative:** `{}`\n\n",
+            narrative_path.display()
+        ));
+    }
+    let _ = total; // idx/total used in header by caller
+    out
+}
+
 pub fn append_activity_log(out: &mut String, path: &str) {
     let today_date = session_date_id().replace("session_", "");
     let activity_path = PathBuf::from(path)
@@ -422,6 +499,10 @@ pub fn tool_get_latest_session(args: &Value) -> Result<String> {
     let path = args.get("path").and_then(|p| p.as_str()).unwrap_or(".");
     let explicit_limit = args.get("limit").and_then(|v| v.as_u64());
     let session_name = args.get("name").and_then(|s| s.as_str()).unwrap_or("");
+    let detail = args
+        .get("detail")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let store = open_session_store(args)?;
 
     if !session_name.is_empty() {
@@ -446,21 +527,25 @@ pub fn tool_get_latest_session(args: &Value) -> Result<String> {
 
     let mut out = String::new();
     let total = sessions.len();
+    let multi = total > 1 && !detail;
 
-    if total > 1 {
+    if multi {
         let newest_date = date_from_session_id(&sessions[0].id);
         let oldest_date = date_from_session_id(&sessions[total - 1].id);
         out.push_str(&format!(
-            "## {} parallel sessions detected ({} — {})\n\n\
-             **Ask the user which session to resume before proceeding.**\n\n",
-            total, oldest_date, newest_date
+            "## {total} recent sessions ({oldest_date} — {newest_date})\n\n\
+             All sessions updated within 72h of the newest save. \
+             Compact index below; use `name='<label>'` or `detail=true` for full fields.\n\n"
         ));
-    }
-
-    for (idx, session) in sessions.iter().enumerate() {
-        out.push_str(&format_session_output(session, idx, total, path));
-        if idx < total - 1 {
-            out.push_str("\n---\n\n");
+        for (idx, session) in sessions.iter().enumerate() {
+            out.push_str(&format_session_compact(session, idx, total, path));
+        }
+    } else {
+        for (idx, session) in sessions.iter().enumerate() {
+            out.push_str(&format_session_output(session, idx, total, path));
+            if idx < total - 1 {
+                out.push_str("\n---\n\n");
+            }
         }
     }
 
@@ -948,9 +1033,11 @@ mod tests {
         let cluster = detect_session_cluster(&store).unwrap();
         assert_eq!(
             cluster.len(),
-            3,
-            "chained 48h gaps should all cluster (each < 72h from neighbor)"
+            2,
+            "96h-old session falls outside 72h window from newest"
         );
+        assert_eq!(cluster[0].id, "session_2026-06-08");
+        assert_eq!(cluster[1].id, "session_2026-06-06");
     }
 
     #[test]
@@ -992,8 +1079,8 @@ mod tests {
         let cluster = detect_session_cluster(&store).unwrap();
         assert_eq!(
             cluster.len(),
-            3,
-            "daily sessions cluster but capped at MAX_CLUSTER=3"
+            4,
+            "all sessions within 72h of newest (days 0–3), none capped"
         );
     }
 
@@ -1001,5 +1088,28 @@ mod tests {
     fn test_date_from_session_id() {
         assert_eq!(date_from_session_id("session_2026-06-08"), "2026-06-08");
         assert_eq!(date_from_session_id("weird_id"), "weird_id");
+    }
+
+    #[test]
+    fn test_multi_session_compact_omits_decisions_body() {
+        let now = 1_750_000_000i64;
+        let mut s1 = make_session("session_2026-06-07", now - 86400, now - 3600);
+        s1.summary = "Worked on clustering".into();
+        s1.pending_tasks = "Fix tests".into();
+        s1.decisions =
+            "Goal: foo. Decision: bar. Why: baz. | Goal: qux. Decision: qax. Why: qaz.".into();
+        let mut s2 = make_session("session_2026-06-08", now, now);
+        s2.summary = "Token burn fix".into();
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path();
+        let sessions_dir = project.join(".infigraph").join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let store = SessionStore::open_dir(&sessions_dir).unwrap();
+        store.save(&s1).unwrap();
+        store.save(&s2).unwrap();
+        let out = tool_get_latest_session(&json!({"path": project.to_str().unwrap()})).unwrap();
+        assert!(out.contains("2 recent sessions"));
+        assert!(out.contains("**Decisions:** (2 — use"));
+        assert!(!out.contains("Goal: foo. Decision: bar"));
     }
 }

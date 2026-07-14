@@ -101,6 +101,16 @@ pub fn hybrid_doc_search(
     limit: usize,
     alpha: f32,
 ) -> Result<Vec<DocSearchResult>> {
+    hybrid_doc_search_in_dir(query, store, &root.join(".infigraph"), limit, alpha)
+}
+
+pub fn hybrid_doc_search_in_dir(
+    query: &str,
+    store: &DocStore,
+    artifact_dir: &Path,
+    limit: usize,
+    alpha: f32,
+) -> Result<Vec<DocSearchResult>> {
     let chunks = store.get_all_chunks()?;
 
     if chunks.is_empty() {
@@ -122,9 +132,8 @@ pub fn hybrid_doc_search(
         .collect();
 
     // Vector search
-    let tg_dir = root.join(".infigraph");
-    let emb_path = tg_dir.join("docs_embeddings.bin");
-    let hnsw_path = tg_dir.join("docs_hnsw_index.usearch");
+    let emb_path = artifact_dir.join("docs_embeddings.bin");
+    let hnsw_path = artifact_dir.join("docs_hnsw_index.usearch");
 
     let embedder = doc_embedder();
     let query_vec = embedder.embed(query)?;

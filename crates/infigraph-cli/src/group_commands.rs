@@ -152,6 +152,19 @@ pub(crate) fn cmd_group(root: &Path, action: GroupAction) -> Result<()> {
                 group
             );
         }
+        GroupAction::CombinedDocs { group } => {
+            let stats = infigraph_docs::combined::build_combined_docs(&registry, &group)?;
+            println!(
+                "Combined document store ready: {} documents, {} chunks, {} links ({} intra-repo, {} cross-repo), {} sources, {} embeddings.",
+                stats.documents,
+                stats.chunks,
+                stats.links,
+                stats.intra_repo_links,
+                stats.cross_repo_links,
+                stats.sources,
+                stats.embeddings
+            );
+        }
         GroupAction::Sync { group } => {
             let count = infigraph_core::multi::sync_group_contracts(
                 &mut registry,
@@ -246,7 +259,7 @@ pub(crate) fn cmd_group(root: &Path, action: GroupAction) -> Result<()> {
                 .clone();
 
             // Step 1: Index
-            println!("=== Step 1/4: Indexing {} repos ===", g.repos.len());
+            println!("=== Step 1/5: Indexing {} repos ===", g.repos.len());
             for repo_name in &g.repos {
                 let entry = registry
                     .repos
@@ -285,7 +298,7 @@ pub(crate) fn cmd_group(root: &Path, action: GroupAction) -> Result<()> {
             }
 
             // Step 2: Sync contracts
-            println!("=== Step 2/4: Syncing contracts ===");
+            println!("=== Step 2/5: Syncing contracts ===");
             let contract_count = infigraph_core::multi::sync_group_contracts(
                 &mut registry,
                 &group,
@@ -295,7 +308,7 @@ pub(crate) fn cmd_group(root: &Path, action: GroupAction) -> Result<()> {
             println!("  {} contracts", contract_count);
 
             // Step 3: Link cross-service calls
-            println!("=== Step 3/4: Linking cross-service calls ===");
+            println!("=== Step 3/5: Linking cross-service calls ===");
             let edge_count = infigraph_core::multi::link_cross_service_calls(
                 &registry,
                 &group,
@@ -304,12 +317,35 @@ pub(crate) fn cmd_group(root: &Path, action: GroupAction) -> Result<()> {
             println!("  {} CALLS_SERVICE edges", edge_count);
 
             // Step 4: Build combined graph
-            println!("=== Step 4/4: Building combined graph ===");
+            println!("=== Step 4/5: Building combined graph ===");
             let (symbols, edges) =
                 infigraph_core::multi::combined::build_combined_graph(&registry, &group)?;
+
+            // Step 5: Index docs sequentially, then build their physical combined store.
+            println!("=== Step 5/5: Building combined document store ===");
+            let mut bfs_discovered = 0;
+            for repo_name in &g.repos {
+                let entry = registry
+                    .repos
+                    .get(repo_name)
+                    .context(format!("repo '{}' not in registry", repo_name))?;
+                let mut index = infigraph_docs::DocIndex::open(&entry.path)?;
+                index.init()?;
+                bfs_discovered += index.index()?.bfs_discovered;
+            }
+            let doc_stats = infigraph_docs::combined::build_combined_docs(&registry, &group)?;
             println!(
-                "Done. {} symbols, {} edges. Ready for 'group search {} <query>'.",
-                symbols, edges, group
+                "Done. {} symbols, {} code edges, {} documents, {} chunks, {} doc links ({} intra-repo, {} cross-repo), {} sources, {} BFS discoveries, {} doc embeddings.",
+                symbols,
+                edges,
+                doc_stats.documents,
+                doc_stats.chunks,
+                doc_stats.links,
+                doc_stats.intra_repo_links,
+                doc_stats.cross_repo_links,
+                doc_stats.sources,
+                bfs_discovered,
+                doc_stats.embeddings
             );
         }
         GroupAction::Search {
@@ -347,6 +383,29 @@ pub(crate) fn cmd_group(root: &Path, action: GroupAction) -> Result<()> {
                             }
                         }
                     }
+                }
+            }
+        }
+        GroupAction::SearchDocs {
+            group,
+            query,
+            limit,
+            alpha,
+        } => {
+            let results =
+                infigraph_docs::combined::combined_doc_search(&group, &query, limit, alpha)?;
+            if results.is_empty() {
+                println!("No document results for '{}' in group '{}'", query, group);
+            } else {
+                println!("Document results for '{}' in group '{}':", query, group);
+                for result in results {
+                    let repo = infigraph_core::multi::combined::extract_repo(&result.doc_file);
+                    println!(
+                        "  {:.3} (bm25:{:.2} vec:{:.2}) [{}] {}",
+                        result.score, result.bm25_score, result.vector_score, repo, result.doc_file
+                    );
+                    let preview: String = result.text.chars().take(120).collect();
+                    println!("         {}", preview.replace('\n', " "));
                 }
             }
         }

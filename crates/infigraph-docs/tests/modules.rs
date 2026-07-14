@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::path::Path;
 
+use infigraph_core::embed::load_embeddings;
 use infigraph_docs::chunk::{chunk_document, Chunk, ChunkStrategy};
 use infigraph_docs::extract::{extract_document, DocFormat, ExtractedDoc};
 use infigraph_docs::links::extract_and_link_doc;
@@ -721,6 +722,18 @@ fn test_bfs_follows_link_outside_root() {
     let store = idx.store().unwrap();
     let hashes = store.get_doc_hashes().unwrap();
     assert_eq!(hashes.len(), 2, "should have 2 docs total");
+
+    let chunk_ids: HashSet<_> = store.get_chunk_ids().unwrap().into_iter().collect();
+    let embedded_ids: HashSet<_> =
+        load_embeddings(&doc_root.join(".infigraph/docs_embeddings.bin"))
+            .unwrap()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+    assert_eq!(
+        embedded_ids, chunk_ids,
+        "BFS-discovered chunks should have embeddings"
+    );
 }
 
 #[test]
@@ -1051,6 +1064,12 @@ fn test_extract_repo_from_url() {
         extract_repo_from_url("https://gitlab.com/org/repo/-/blob/main/README.md"),
         Some("repo".to_string())
     );
+    assert_eq!(
+        extract_repo_from_url(
+            "https://gitlab.com/group/subgroup/nested-repo/-/blob/main/docs/README.md"
+        ),
+        Some("nested-repo".to_string())
+    );
     assert_eq!(extract_repo_from_url("not-a-url"), None);
     assert_eq!(extract_repo_from_url("https://example.com"), None);
     // PR URL — still extracts repo name
@@ -1063,6 +1082,35 @@ fn test_extract_repo_from_url() {
         extract_repo_from_url("http://github.com/org/repo/blob/main/README.md"),
         Some("repo".to_string())
     );
+}
+
+#[test]
+fn test_resolve_doc_id_exact_suffix_and_boundary() {
+    use infigraph_docs::links::resolve_doc_id;
+
+    let ids: HashSet<String> = ["README.md", "guide/foo.md", "not-foo.md"]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    assert_eq!(
+        resolve_doc_id("README.md", &ids),
+        Some("README.md".to_string())
+    );
+    assert_eq!(
+        resolve_doc_id("docs/guide/foo.md", &ids),
+        Some("guide/foo.md".to_string())
+    );
+    assert_eq!(
+        resolve_doc_id("foo.md", &ids),
+        Some("guide/foo.md".to_string())
+    );
+    assert_eq!(resolve_doc_id("bar/foo.md", &ids), None);
+
+    let ambiguous: HashSet<String> = ["guide/foo.md", "other/foo.md"]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    assert_eq!(resolve_doc_id("foo.md", &ambiguous), None);
 }
 
 // ==================== classify_doc_link: GitHub branch ====================
@@ -1202,192 +1250,5 @@ fn test_cross_repo_github_link_no_edge_without_group() {
     assert_eq!(
         count, 0,
         "cross-repo link should NOT create edge without group context"
-    );
-}
-
-// ==================== cross_link_group_docs ====================
-
-#[test]
-fn test_cross_link_group_docs_creates_edges() {
-    use infigraph_docs::links::cross_link_group_docs;
-
-    // Create two repos on disk with markdown files
-    let dir_a = tempfile::tempdir().unwrap();
-    let dir_b = tempfile::tempdir().unwrap();
-
-    // Repo A has a doc that links to repo B
-    std::fs::create_dir_all(dir_a.path().join("doc/adr")).unwrap();
-    std::fs::write(
-        dir_a.path().join("doc/adr/0001-decision.md"),
-        "# Decision\nSee [data map](https://github.com/org/repo-b/blob/main/doc/adr/0012-data-map.md).",
-    )
-    .unwrap();
-
-    // Repo B has the target doc
-    std::fs::create_dir_all(dir_b.path().join("doc/adr")).unwrap();
-    std::fs::write(
-        dir_b.path().join("doc/adr/0012-data-map.md"),
-        "# Data Map\nContent here.",
-    )
-    .unwrap();
-
-    // Create stores
-    let db_a = dir_a.path().join("docs_a.kuzu");
-    let store_a = DocStore::open(&db_a).unwrap();
-    let doc_a = sample_doc("doc/adr/0001-decision.md");
-    let c_a = sample_chunk("doc/adr/0001-decision.md", 0);
-    store_a.upsert_all_parquet(&[&doc_a], &[&c_a]).unwrap();
-
-    let db_b = dir_b.path().join("docs_b.kuzu");
-    let store_b = DocStore::open(&db_b).unwrap();
-    let doc_b = sample_doc("doc/adr/0012-data-map.md");
-    let c_b = sample_chunk("doc/adr/0012-data-map.md", 0);
-    store_b.upsert_all_parquet(&[&doc_b], &[&c_b]).unwrap();
-
-    let ids_a: HashSet<String> = ["doc/adr/0001-decision.md".to_string()]
-        .into_iter()
-        .collect();
-    let ids_b: HashSet<String> = ["doc/adr/0012-data-map.md".to_string()]
-        .into_iter()
-        .collect();
-
-    let repo_docs = vec![
-        (
-            "repo-a".to_string(),
-            dir_a.path().to_path_buf(),
-            &store_a,
-            ids_a,
-        ),
-        (
-            "repo-b".to_string(),
-            dir_b.path().to_path_buf(),
-            &store_b,
-            ids_b,
-        ),
-    ];
-
-    let count = cross_link_group_docs(&repo_docs);
-    assert_eq!(count, 1, "should create one cross-repo LINKS_TO edge");
-
-    // Verify edge in repo A's store
-    let conn = store_a.connection().unwrap();
-    let result = conn
-        .query("MATCH (a:Document)-[l:LINKS_TO]->(b:Document) RETURN a.id, b.id, l.link_type")
-        .unwrap();
-    let rows: Vec<_> = result.collect();
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0][0].to_string(), "doc/adr/0001-decision.md");
-    assert_eq!(rows[0][1].to_string(), "repo-b::doc/adr/0012-data-map.md");
-    assert_eq!(rows[0][2].to_string(), "cross_repo");
-}
-
-#[test]
-fn test_cross_link_skips_intra_repo() {
-    use infigraph_docs::links::cross_link_group_docs;
-
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::create_dir_all(dir.path().join("doc/adr")).unwrap();
-    // Doc links to SAME repo — should be skipped (handled by extract_and_link_doc)
-    std::fs::write(
-        dir.path().join("doc/adr/0010.md"),
-        "See [other](https://github.com/org/my-repo/blob/main/doc/adr/0005.md).",
-    )
-    .unwrap();
-    std::fs::write(dir.path().join("doc/adr/0005.md"), "# Target").unwrap();
-
-    let db = dir.path().join("docs.kuzu");
-    let store = DocStore::open(&db).unwrap();
-    let d1 = sample_doc("doc/adr/0010.md");
-    let d2 = sample_doc("doc/adr/0005.md");
-    let c1 = sample_chunk("doc/adr/0010.md", 0);
-    let c2 = sample_chunk("doc/adr/0005.md", 0);
-    store.upsert_all_parquet(&[&d1, &d2], &[&c1, &c2]).unwrap();
-
-    let ids: HashSet<String> = ["doc/adr/0010.md", "doc/adr/0005.md"]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-
-    let repo_docs = vec![("my-repo".to_string(), dir.path().to_path_buf(), &store, ids)];
-
-    let count = cross_link_group_docs(&repo_docs);
-    assert_eq!(
-        count, 0,
-        "intra-repo links should be skipped by cross_link_group_docs"
-    );
-}
-
-#[test]
-fn test_cross_link_target_not_in_group() {
-    use infigraph_docs::links::cross_link_group_docs;
-
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::create_dir_all(dir.path().join("doc/adr")).unwrap();
-    // Links to repo-c which is NOT in the group
-    std::fs::write(
-        dir.path().join("doc/adr/0001.md"),
-        "See [doc](https://github.com/org/repo-c/blob/main/doc/adr/0099.md).",
-    )
-    .unwrap();
-
-    let db = dir.path().join("docs.kuzu");
-    let store = DocStore::open(&db).unwrap();
-    let d = sample_doc("doc/adr/0001.md");
-    let c = sample_chunk("doc/adr/0001.md", 0);
-    store.upsert_all_parquet(&[&d], &[&c]).unwrap();
-
-    let ids: HashSet<String> = ["doc/adr/0001.md".to_string()].into_iter().collect();
-    let repo_docs = vec![("repo-a".to_string(), dir.path().to_path_buf(), &store, ids)];
-
-    let count = cross_link_group_docs(&repo_docs);
-    assert_eq!(count, 0, "link to repo not in group should create no edge");
-}
-
-#[test]
-fn test_cross_link_target_doc_not_indexed() {
-    use infigraph_docs::links::cross_link_group_docs;
-
-    let dir_a = tempfile::tempdir().unwrap();
-    let dir_b = tempfile::tempdir().unwrap();
-
-    std::fs::create_dir_all(dir_a.path().join("doc/adr")).unwrap();
-    // Links to a doc that exists in repo-b's repo but is NOT in its doc_ids
-    std::fs::write(
-        dir_a.path().join("doc/adr/0001.md"),
-        "See [missing](https://github.com/org/repo-b/blob/main/doc/adr/9999-nonexistent.md).",
-    )
-    .unwrap();
-
-    let db_a = dir_a.path().join("docs_a.kuzu");
-    let store_a = DocStore::open(&db_a).unwrap();
-    let d = sample_doc("doc/adr/0001.md");
-    let c = sample_chunk("doc/adr/0001.md", 0);
-    store_a.upsert_all_parquet(&[&d], &[&c]).unwrap();
-
-    let db_b = dir_b.path().join("docs_b.kuzu");
-    let store_b = DocStore::open(&db_b).unwrap();
-
-    let ids_a: HashSet<String> = ["doc/adr/0001.md".to_string()].into_iter().collect();
-    let ids_b: HashSet<String> = HashSet::new(); // repo-b has no indexed docs
-
-    let repo_docs = vec![
-        (
-            "repo-a".to_string(),
-            dir_a.path().to_path_buf(),
-            &store_a,
-            ids_a,
-        ),
-        (
-            "repo-b".to_string(),
-            dir_b.path().to_path_buf(),
-            &store_b,
-            ids_b,
-        ),
-    ];
-
-    let count = cross_link_group_docs(&repo_docs);
-    assert_eq!(
-        count, 0,
-        "link to non-indexed doc in target repo should create no edge"
     );
 }

@@ -28,3 +28,4 @@ zip = "2"
 quick-xml = "0.37"
 notify = { version = "6", features = ["macos_kqueue"] }
 chrono = "0.4.45"
+fs2 = "0.4.3"

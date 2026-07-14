@@ -69,10 +69,32 @@ impl Infigraph {
     }
 
     /// Initialize the graph store (creates DB on first run).
+    /// On corruption, wipes the graph directory and retries.
     pub fn init(&mut self) -> Result<()> {
-        let store = GraphStore::open(&self.db_path)?;
-        self.store = Some(store);
-        Ok(())
+        match GraphStore::open(&self.db_path) {
+            Ok(store) => {
+                self.store = Some(store);
+                Ok(())
+            }
+            Err(first_err) => {
+                eprintln!(
+                    "[graph] open failed ({first_err}), wiping corrupt graph and rebuilding..."
+                );
+                Self::wipe_graph(&self.db_path);
+                let store = GraphStore::open(&self.db_path).with_context(|| {
+                    format!("graph still unreadable after wipe (was: {first_err})")
+                })?;
+                self.store = Some(store);
+                Ok(())
+            }
+        }
+    }
+
+    fn wipe_graph(db_path: &Path) {
+        let _ = std::fs::remove_dir_all(db_path);
+        let _ = std::fs::remove_file(db_path);
+        let wal = db_path.with_extension("wal");
+        let _ = std::fs::remove_file(&wal);
     }
 
     /// Initialize the graph store in read-only mode.

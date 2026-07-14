@@ -84,6 +84,7 @@ pub fn compress_tool_output_with_level(
         "get_api_surface" => compress_api_surface(raw, args, effective),
         "git_summary" => compress_git_summary(raw, args),
         "search_sessions" => compress_search_sessions(raw, args, effective),
+        "get_latest_session" => compress_get_latest_session(raw, args, effective),
         _ => raw.to_string(),
     }
 }
@@ -733,6 +734,16 @@ fn compress_git_summary(raw: &str, _args: &Value) -> String {
 /// Truncate bulky session markdown — Decisions pipes and Files Touched dominate tokens.
 fn compress_search_sessions(raw: &str, _args: &Value, level: CompressionLevel) -> String {
     if !raw.starts_with("## Session Search:") {
+        return raw.to_string();
+    }
+    compress_session_markdown_fields(raw, level)
+}
+
+fn compress_get_latest_session(raw: &str, _args: &Value, level: CompressionLevel) -> String {
+    if raw.starts_with("No previous sessions")
+        || raw.starts_with("No session found")
+        || raw.starts_with("Error:")
+    {
         return raw.to_string();
     }
     compress_session_markdown_fields(raw, level)

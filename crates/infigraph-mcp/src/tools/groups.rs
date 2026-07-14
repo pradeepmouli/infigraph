@@ -267,40 +267,18 @@ pub fn tool_group_link_docs(args: &Value) -> Result<String> {
         .context("missing 'group_name' argument")?;
 
     let registry = Registry::load()?;
-    let group = registry
-        .groups
-        .get(group_name)
-        .context(format!("group '{}' not found", group_name))?;
-
-    let mut repo_data: Vec<(String, std::path::PathBuf, infigraph_docs::DocIndex)> = Vec::new();
-    for repo_name in &group.repos {
-        if let Some(entry) = registry.repos.get(repo_name) {
-            let mut idx = infigraph_docs::DocIndex::open(&entry.path)?;
-            idx.init()?;
-            repo_data.push((repo_name.clone(), entry.path.clone(), idx));
-        }
-    }
-
-    let repo_docs: Vec<(
-        String,
-        std::path::PathBuf,
-        &infigraph_docs::store::DocStore,
-        std::collections::HashSet<String>,
-    )> = repo_data
-        .iter()
-        .filter_map(|(name, root, idx)| {
-            let store = idx.store()?;
-            let ids: std::collections::HashSet<String> =
-                store.get_doc_hashes().ok()?.keys().cloned().collect();
-            Some((name.clone(), root.clone(), store, ids))
-        })
-        .collect();
-
-    let count = infigraph_docs::links::cross_link_group_docs(&repo_docs);
+    let stats = infigraph_docs::combined::build_combined_docs(&registry, group_name)?;
 
     Ok(format!(
-        "Created {} cross-repo doc LINKS_TO edges in group '{}'.",
-        count, group_name
+        "Combined document store rebuilt for group '{}': {} documents, {} chunks, {} links ({} intra-repo, {} cross-repo), {} sources, {} embeddings.",
+        group_name,
+        stats.documents,
+        stats.chunks,
+        stats.links,
+        stats.intra_repo_links,
+        stats.cross_repo_links,
+        stats.sources,
+        stats.embeddings
     ))
 }
 
@@ -347,6 +325,47 @@ pub fn tool_group_search(args: &Value) -> Result<String> {
     Ok(out)
 }
 
+pub fn tool_group_search_docs(args: &Value) -> Result<String> {
+    let group_name = args
+        .get("group_name")
+        .and_then(|g| g.as_str())
+        .context("missing 'group_name' argument")?;
+    let query = args
+        .get("query")
+        .and_then(|q| q.as_str())
+        .context("missing 'query' argument")?;
+    let limit = args.get("limit").and_then(|l| l.as_u64()).unwrap_or(10) as usize;
+    let alpha = args.get("alpha").and_then(|a| a.as_f64()).unwrap_or(0.5) as f32;
+
+    let results = infigraph_docs::combined::combined_doc_search(group_name, query, limit, alpha)?;
+    if results.is_empty() {
+        return Ok(format!(
+            "No document results for '{}' in group '{}'.",
+            query, group_name
+        ));
+    }
+
+    let mut out = format!(
+        "Document results for '{}' in group '{}' ({} hits):\n",
+        query,
+        group_name,
+        results.len()
+    );
+    for result in results {
+        let repo = combined::extract_repo(&result.doc_file);
+        out.push_str(&format!(
+            "  {:.3} (bm25:{:.2} vec:{:.2}) [{}] {}",
+            result.score, result.bm25_score, result.vector_score, repo, result.doc_file
+        ));
+        if let Some(heading) = result.heading {
+            out.push_str(&format!(" > {heading}"));
+        }
+        let preview: String = result.text.chars().take(200).collect();
+        out.push_str(&format!("\n      {}\n", preview.replace('\n', " ")));
+    }
+    Ok(out)
+}
+
 pub fn tool_group_build(args: &Value) -> Result<String> {
     let group_name = args
         .get("group_name")
@@ -387,52 +406,34 @@ pub fn tool_group_build(args: &Value) -> Result<String> {
         symbols, edges
     ));
 
-    // Step 5: Index docs + cross-repo doc linking
-    {
-        let registry2 = Registry::load()?;
-        let group2 = registry2.groups.get(group_name);
-        let mut repo_data: Vec<(String, std::path::PathBuf, infigraph_docs::DocIndex)> = Vec::new();
-        if let Some(g) = group2 {
-            for repo_name in &g.repos {
-                if let Some(entry) = registry2.repos.get(repo_name) {
-                    let mut idx = infigraph_docs::DocIndex::open(&entry.path).ok();
-                    if let Some(ref mut ix) = idx {
-                        let _ = ix.init();
-                        let _ = ix.index();
-                    }
-                    if let Some(ix) = idx {
-                        repo_data.push((repo_name.clone(), entry.path.clone(), ix));
-                    }
-                }
-            }
-        }
-        let total_docs: usize = repo_data
-            .iter()
-            .filter_map(|(_, _, idx)| {
-                idx.store()
-                    .and_then(|s| Some(s.get_doc_hashes().ok()?.len()))
-            })
-            .sum();
-        let repo_docs: Vec<(
-            String,
-            std::path::PathBuf,
-            &infigraph_docs::store::DocStore,
-            std::collections::HashSet<String>,
-        )> = repo_data
-            .iter()
-            .filter_map(|(name, root, idx)| {
-                let store = idx.store()?;
-                let ids: std::collections::HashSet<String> =
-                    store.get_doc_hashes().ok()?.keys().cloned().collect();
-                Some((name.clone(), root.clone(), store, ids))
-            })
-            .collect();
-        let doc_links = infigraph_docs::links::cross_link_group_docs(&repo_docs);
-        out.push_str(&format!(
-            "Step 5/5 — {} docs indexed, {} cross-repo doc links\n",
-            total_docs, doc_links
-        ));
+    // Step 5: Index per-repo docs, then build one physical combined document store.
+    let group = registry
+        .groups
+        .get(group_name)
+        .context(format!("group '{}' not found", group_name))?
+        .clone();
+    let mut bfs_discovered = 0;
+    for repo_name in &group.repos {
+        let entry = registry
+            .repos
+            .get(repo_name)
+            .context(format!("repo '{}' not in registry", repo_name))?;
+        let mut idx = infigraph_docs::DocIndex::open(&entry.path)?;
+        idx.init()?;
+        bfs_discovered += idx.index()?.bfs_discovered;
     }
+    let doc_stats = infigraph_docs::combined::build_combined_docs(&registry, group_name)?;
+    out.push_str(&format!(
+        "Step 5/5 — Combined documents: {} docs, {} chunks, {} links ({} intra-repo, {} cross-repo), {} sources, {} BFS discoveries, {} embeddings\n",
+        doc_stats.documents,
+        doc_stats.chunks,
+        doc_stats.links,
+        doc_stats.intra_repo_links,
+        doc_stats.cross_repo_links,
+        doc_stats.sources,
+        bfs_discovered,
+        doc_stats.embeddings
+    ));
 
     // Start watchers + CLAUDE.md
     if let Some(group) = registry.groups.get(group_name) {
@@ -445,6 +446,8 @@ pub fn tool_group_build(args: &Value) -> Result<String> {
         }
     }
 
-    out.push_str("\nReady. Use group_search to query across all repos.");
+    out.push_str(
+        "\nReady. Use group_search for code or group_search_docs for documents across all repos.",
+    );
     Ok(out)
 }

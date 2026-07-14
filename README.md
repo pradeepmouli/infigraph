@@ -25,6 +25,7 @@ Built in Rust. Zero LLM dependency. Runs locally. No API keys. No network calls.
 - [Offline-First Design](#offline-first-design) — No APIs, no network calls
 - [Installation](#installation) — Setup for all platforms
 - [Usage Examples](#usage-examples) — CLI commands, Web UI, tasks
+- [Context Compression](#context-compression) — Levels, config, and optional kompress
 - [Features & Architecture](#features--architecture) — Full capabilities list
 - [Supported Languages (62)](#supported-languages-62) — All 62 languages
 - [Contributing](#contributing) — Build from source, add languages, contribute
@@ -610,6 +611,57 @@ The UI is served by the same `infigraph-mcp` process Claude Code spawns. No sepa
 
 **From Claude:** ask Claude to open the UI — it can launch a browser or give you the URL for your indexed project.
 
+## Context Compression
+
+MCP tool outputs are compressed automatically to cut agent token use (~70–90%). Fresh install defaults to `summary`. Full design, evals, and edge cases: [docs/CONTEXT-COMPRESSION.md](docs/CONTEXT-COMPRESSION.md).
+
+### Compression levels
+
+| Level | When to use |
+|-------|-------------|
+| `off` | Debugging / need raw tool output |
+| `summary` | Default — structured summaries, results kept |
+| `aggressive` | Shorter summaries, fewer callers/callees |
+| `minimal` | One-liners / counts only |
+| `auto` | Scales Off → Summary → Aggressive → Minimal as the session token budget fills |
+
+**Config** (`.infigraph/config.toml` or `~/.infigraph/config.toml`):
+
+```toml
+[compression]
+enabled = true
+level = "summary"          # off | summary | aggressive | minimal | auto
+token_budget = 150000      # used when level = "auto"
+dedup = true
+ml_compression = "extractive"  # extractive | kompress | off
+```
+
+**Environment** (overrides config):
+
+```bash
+export INFIGRAPH_COMPRESSION_LEVEL=aggressive   # off | summary | aggressive | minimal
+export INFIGRAPH_TOKEN_BUDGET=150000            # for level=auto
+export INFIGRAPH_DEDUP=0                        # disable session dedup
+```
+
+Use `detail=true` on tools (e.g. `search`, `get_doc_context`) when you need full uncompressed output for that call. `get_compression_stats` reports the active level and savings.
+
+### Optional: kompress (ML prose compression)
+
+Default prose path is fast extractive summarization. To use **kompress-small** (ONNX, ~275MB, downloaded on first use to `~/.infigraph/models/kompress-small/`):
+
+```toml
+[compression]
+ml_compression = "kompress"
+```
+
+```bash
+export INFIGRAPH_ML_COMPRESSION=kompress
+# optional: export INFIGRAPH_KOMPRESS_DIR=/path/to/kompress-small
+```
+
+Requires a build with the `kompress` Cargo feature (default on most release targets; Intel Mac release builds may omit it). If the model download or inference fails, Infigraph falls back to extractive compression.
+
 ## Troubleshooting
 
 ### MCP tools not available in Claude Code
@@ -854,6 +906,7 @@ infigraph scip-import --index index.scip
 ### Integration
 - **82 MCP tools** for AI coding agents
 - **11 agent auto-configs** — Claude Code, Cursor, VS Code, Codex, Gemini CLI, Zed, OpenCode, Aider, Windsurf, Kiro, GitHub Copilot
+- **Context compression** — configurable levels (`off` / `summary` / `aggressive` / `minimal` / `auto`) plus optional kompress ML prose path; see [Context Compression](#context-compression)
 - **Web UI** at localhost:9749 with graph explorer, search, route map, multi-repo groups, contracts
 - **Export** — Neo4j Cypher, GraphML, JSON
 
@@ -982,8 +1035,8 @@ infigraph-mcp --ui --port=9749
 | `get_watch_status` | Check watcher status and pending reindexes |
 | **Session Context** | |
 | `save_session` | Save session context to graph DB with TOUCHED edges + semantic embedding. Optional `name` param for named identity sessions (`named_{name}`). Auto-purges after configurable days (default: 30) |
-| `get_latest_session` | Retrieve most recent session — summary, pending tasks, decisions, linked files. Optional `name` param to recall by identity. Suggests purge if old sessions exist |
-| `search_sessions` | Semantic search across past sessions — finds sessions by meaning, ranked by relevance |
+| `get_latest_session` | Retrieve most recent session cluster (all sessions updated within 72h of the newest). Compact cards by default; `detail=true` for full fields. Optional `name` param to recall a specific named session |
+| `search_sessions` | Semantic search across ALL past sessions (no time window) — finds sessions by meaning, ranked by relevance. Use this to find older sessions beyond the 72h window |
 | `purge_sessions` | Delete sessions older than N days (default: 30). User-initiated cleanup |
 | `memory_context` | Intelligent context gathering (code + sessions + skeleton) with auto-depth L1/L2/L3 |
 | `consolidate_memory` | Merge related sessions, boost confidence, reduce redundancy |
@@ -1183,7 +1236,7 @@ See [docs/README.md](docs/README.md) for detailed documentation setup instructio
 
 - **[Code Parsing](docs/CODE-PARSING.md)** — How source code is parsed, symbols extracted, relationships mapped, and the graph built. Covers tree-sitter parsing, the grammar plugin system, all 62 languages, edge types, Kùzu storage, incremental indexing, embeddings, search, watch mode, route/contract extraction, and multi-repo groups.
 - **[Document Indexing](docs/DOCUMENT-INDEXING.md)** — How documents are discovered, extracted, chunked, linked, and searched. Covers all supported formats (Markdown, PDF, DOCX, PPTX, XLSX, HTML, RTF, XML), BFS crawling, link classification, cross-repo document linking, DocStore schema, hybrid search, and watch mode.
-- **[Context Compression](docs/CONTEXT-COMPRESSION.md)** — How tool outputs are automatically compressed to save 70-90% of tokens. Covers the 4-layer compression stack, tool-specific and generic compressors, session dedup, budget-aware scaling, quality monitoring, and configuration.
+- **[Context Compression](docs/CONTEXT-COMPRESSION.md)** — How tool outputs are compressed (70–90% token savings): levels, config/`INFIGRAPH_*` env vars, optional kompress, session dedup, budget-aware `auto`, quality monitoring. Quick how-to also in [Context Compression](#context-compression) above.
 
 ## Contributing
 

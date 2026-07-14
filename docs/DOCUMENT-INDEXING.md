@@ -14,7 +14,7 @@ This document describes how Infigraph discovers, extracts, chunks, links, and se
 6. [Graph Storage (DocStore)](#graph-storage-docstore)
 7. [Link Extraction](#link-extraction)
 8. [BFS Crawling](#bfs-crawling)
-9. [Cross-Repo Document Linking](#cross-repo-document-linking)
+9. [Combined Group Document Store](#combined-group-document-store)
 10. [Manifest Integration](#manifest-integration)
 11. [Incremental Indexing](#incremental-indexing)
 12. [Embeddings](#embeddings)
@@ -382,43 +382,72 @@ If BFS discovers new docs, link extraction is re-run for **every** currently-ind
 
 ---
 
-## Cross-Repo Document Linking
+## Combined Group Document Store
 
-`cross_link_group_docs` (`links.rs:260-313`) creates LINKS_TO edges between documents in different repos within a group.
+`build_combined_docs` (`combined.rs`) publishes immutable document generations for a repository group:
 
-### Input
-
-```rust
-repo_docs: &[(String, PathBuf, &DocStore, HashSet<String>)]
-//           repo_name, repo_root, store, doc_ids
+```
+~/.infigraph/groups/<group>/.infigraph/docs-generations/gen-<timestamp>-<pid>/
+  docs.kuzu
+  docs_embeddings.bin
+  docs_hnsw_index.usearch
+  docs_hnsw_index.meta
 ```
 
-### Algorithm
+Readers select the newest completely published generation. Legacy flat files remain readable until the first generation is built. Per-repository document stores remain the incremental indexing sources.
 
-1. Build a lookup map: `repo_name → (store, doc_ids)` across all repos
-2. For each document in each repo:
-   - Re-read the file from disk
-   - Extract links, filter to `link_type == "github"` only
-   - Extract target repo name via `extract_repo_from_url`
-   - Skip if target repo == current repo (intra-repo, already handled)
-   - If target repo is in the group AND the target doc path exists in that repo's `doc_ids`:
-     - Create a synthetic node ID: `"{target_repo}::{target_doc_path}"`
-     - Ensure that node exists via `store.ensure_document_node`
-     - Create a LINKS_TO edge with `link_type = "cross_repo"`
+### Build pipeline
 
-### Edge storage
+1. Acquire the group's cross-process `docs-build.lock`.
+2. Build a staged database in a temporary directory on the same filesystem; the active store remains queryable.
+3. Open each repository's DocStore **sequentially** because `DocStore` serializes embedded Kùzu access process-wide.
+4. Export `Document`, `Chunk`, `Source`, `HAS_CHUNK`, `LINKS_TO`, and `FROM_SOURCE` data through Kùzu `COPY TO` Parquet.
+5. Prefix repository-scoped identifiers with `"[<repo>]::"` and import the transformed Parquet into the staged DocStore.
+6. Merge each repository's `docs_embeddings.bin`, prefixing chunk IDs and dropping embeddings for chunks absent from the combined graph. Corrupt files or inconsistent vector dimensions fail the build.
+7. Re-read repository documents and create `cross_repo` LINKS_TO edges directly between real combined Document nodes.
+8. Build the staged document HNSW index when the merged embedding count reaches 200,000.
+9. Close the staged database and atomically rename its complete artifact directory into `docs-generations`. Readers see either the previous or new generation, never a partial file set.
+10. Retain the newest two generations and best-effort remove older ones.
 
-Cross-repo edges are stored in the **source** repo's DocStore. The target document gets a synthetic Document node (just an ID, no content) in the source store.
+`PipelineCore`, dynamic `Pipeline_*` plugin tables, `DEFINED_IN`, and `DEPENDS_ON` remain per-repository and are not copied into the combined document store.
+
+### Collision handling
+
+Repository prefixes make otherwise identical paths and chunk IDs distinct:
+
+```
+[repo-a]::README.md
+[repo-b]::README.md
+[repo-a]::README.md::chunk_0
+[repo-b]::README.md::chunk_0
+```
+
+Cross-repo links target the prefixed real document in the destination repository rather than creating a synthetic stub. Repository keys are resolved through the registry name, local directory name, and Git remote slug. Nested GitLab blob URLs and safe path-suffix matching are supported.
 
 ### Integration with group_build
 
-`tool_group_build` (`crates/infigraph-mcp/src/tools/groups.rs:346-439`) runs cross-repo doc linking as Step 5 of 5:
+`group_build` runs the document pipeline as Step 5 of 5:
 
 1. Index all repos (code)
 2. Sync contracts
 3. Link cross-service calls
-4. Build combined graph
-5. **Index docs + cross-repo doc linking**
+4. Build the combined code graph
+5. **Index per-repository docs + build the combined document store**
+
+`group_link_docs` rebuilds only the combined document store from existing per-repository indexes. `group_search_docs` and `infigraph group search-docs` run hybrid BM25+vector search against the combined store. After a successful per-repository watcher reindex, affected existing group stores are refreshed asynchronously and coalesced per group.
+
+### Auto-Recovery
+
+All four store types auto-recover from corruption:
+
+| Store | Recovery behavior |
+|-------|------------------|
+| **Single doc store** (`DocIndex::init`) | Catches open failure, wipes `docs.kuzu`, reopens, reindexes from source files |
+| **Combined doc store** (`combined_doc_search`, `combined_doc_query`) | On query/search failure, wipes the corrupt generation directory and schedules a background `build_combined_docs` rebuild via `REFRESHING_GROUPS` |
+| **Single code graph** (`Infigraph::init`) | Catches `GraphStore::open` failure, wipes `graph/` + `graph.wal`, reopens empty |
+| **Combined code graph** (`open_combined_graph`) | On open failure, wipes the combined graph directory + WAL. Caller must trigger `build_combined_graph` to rebuild |
+
+Combined doc store recovery is fully automatic (background thread rebuilds). Combined code graph recovery requires an explicit rebuild call (e.g., via `group_build` or `group_index`).
 
 ---
 
@@ -432,7 +461,7 @@ Called from `tool_index_manifests` (`docs.rs:591-643`), which sources `doc_urls`
 
 For each URL in the manifest:
 1. Try Confluence page ID match → exact match against `all_doc_ids`
-2. Try GitHub/GitLab blob path extraction → exact match
+2. Try GitHub/GitLab blob path extraction → exact match, then path-segment suffix match
 3. Fall back to suffix match (`doc_id.ends_with(doc_path)` or vice versa) to handle path prefix mismatches
 
 Edge type is `"manifest_ref"`. The manifest file itself gets a synthetic Document node.

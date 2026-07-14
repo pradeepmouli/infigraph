@@ -1,4 +1,5 @@
 pub mod chunk;
+pub mod combined;
 pub mod embed;
 pub mod extract;
 pub mod search;
@@ -290,6 +291,8 @@ impl DocIndex {
             .canonicalize()
             .unwrap_or_else(|_| self.root.clone());
         let mut total_new = 0usize;
+        let mut new_chunks = Vec::new();
+        let mut changed_files = Vec::new();
         let mut frontier: Vec<PathBuf> = indexed_docs
             .iter()
             .filter_map(|rel| {
@@ -390,13 +393,21 @@ impl DocIndex {
                     let docs_ref = vec![&doc];
                     let chunks_ref: Vec<&Chunk> = chunks.iter().collect();
                     if store.upsert_all_parquet(&docs_ref, &chunks_ref).is_ok() {
-                        indexed_docs.insert(rel_id);
+                        indexed_docs.insert(rel_id.clone());
+                        changed_files.push(rel_id);
+                        new_chunks.extend(chunks);
                         next_frontier.push(abs);
                         total_new += 1;
                     }
                 }
             }
             frontier = next_frontier;
+        }
+
+        if !new_chunks.is_empty() {
+            let chunk_refs: Vec<&Chunk> = new_chunks.iter().collect();
+            let changed_file_refs: Vec<&str> = changed_files.iter().map(String::as_str).collect();
+            embed::update_doc_embeddings(store, &self.root, &chunk_refs, &changed_file_refs)?;
         }
 
         // Re-run link extraction for all docs (newly discovered may link to each other)
