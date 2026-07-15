@@ -811,6 +811,34 @@ impl GraphBackend for Neo4jBackend {
             .collect())
     }
 
+    fn get_symbols_for_search(&self) -> Result<Vec<Vec<String>>> {
+        let rows = self.run_query(query(
+            "MATCH (s:Symbol) \
+             RETURN s.id AS id, s.name AS name, s.kind AS kind, \
+                    s.file AS file, s.docstring AS docstring, \
+                    s.start_line AS start_line, s.end_line AS end_line",
+        ))?;
+        Ok(rows
+            .iter()
+            .map(|r| {
+                let id: String = r.get("id").unwrap_or_default();
+                let name: String = r.get("name").unwrap_or_default();
+                let kind: String = r.get("kind").unwrap_or_default();
+                let file: String = r.get("file").unwrap_or_default();
+                let docstring: String = r.get("docstring").unwrap_or_default();
+                let start_line: String = r
+                    .get::<i64>("start_line")
+                    .map(|v| v.to_string())
+                    .unwrap_or_default();
+                let end_line: String = r
+                    .get::<i64>("end_line")
+                    .map(|v| v.to_string())
+                    .unwrap_or_default();
+                vec![id, name, kind, file, docstring, start_line, end_line]
+            })
+            .collect())
+    }
+
     fn upsert_file(&self, extraction: &FileExtraction) -> Result<()> {
         self.delete_files_data(&[extraction.file.clone()])?;
         self.upsert_extraction(extraction)

@@ -56,6 +56,16 @@ pub trait GraphBackend: Send + Sync {
 
     fn raw_query(&self, query: &str) -> Result<Vec<Vec<String>>>;
 
+    /// Return all symbols with 7 columns in fixed order:
+    /// [id, name, kind, file, docstring, start_line, end_line].
+    /// Used by search to build BM25 index + display results.
+    /// Default impl uses raw_query (safe for Kuzu where column order matches RETURN order).
+    fn get_symbols_for_search(&self) -> Result<Vec<Vec<String>>> {
+        self.raw_query(
+            "MATCH (s:Symbol) RETURN s.id, s.name, s.kind, s.file, s.docstring, s.start_line, s.end_line",
+        )
+    }
+
     // ── Write ────────────────────────────────────────────────────────
 
     /// Insert a single file extraction (delete existing + insert).

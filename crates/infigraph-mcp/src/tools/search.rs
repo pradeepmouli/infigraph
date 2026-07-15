@@ -48,15 +48,37 @@ struct CachedSearchData {
     symbol_embeddings: Arc<Vec<(String, Vec<f32>)>>,
 }
 
+fn is_remote_mode() -> bool {
+    #[cfg(feature = "remote")]
+    {
+        std::env::var("INFIGRAPH_BACKEND")
+            .map(|v| v == "neo4j")
+            .unwrap_or(false)
+    }
+    #[cfg(not(feature = "remote"))]
+    {
+        false
+    }
+}
+
 fn get_or_build_search_ctx(args: &Value) -> Result<CachedSearchData> {
     let raw_path = args.get("path").and_then(|p| p.as_str()).unwrap_or(".");
     let path = super::helpers::resolve_project_path(raw_path);
     let tg_root = PathBuf::from(&path).join(".infigraph");
-    let emb_file = tg_root.join("embeddings.bin");
     let canon = tg_root.canonicalize().unwrap_or_else(|_| tg_root.clone());
-    let mtime = std::fs::metadata(&emb_file)
-        .and_then(|m| m.modified())
-        .unwrap_or(std::time::UNIX_EPOCH);
+
+    let is_remote = is_remote_mode();
+
+    // Cache key: in remote mode use a sentinel mtime (no local embeddings.bin).
+    // TODO: use pgvector count or max(updated_at) for proper invalidation.
+    let mtime = if is_remote {
+        std::time::UNIX_EPOCH
+    } else {
+        let emb_file = tg_root.join("embeddings.bin");
+        std::fs::metadata(&emb_file)
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::UNIX_EPOCH)
+    };
 
     {
         let guard = search_ctx_lock().lock().unwrap();
@@ -72,6 +94,44 @@ fn get_or_build_search_ctx(args: &Value) -> Result<CachedSearchData> {
         }
     }
 
+    let (rows, symbol_embeddings) = if is_remote {
+        get_search_data_remote()?
+    } else {
+        get_search_data_local(args, &path)?
+    };
+
+    let docs = build_docs_from_rows(&rows);
+    let bm25 = BM25Index::build(docs.clone());
+
+    let rows = Arc::new(rows);
+    let bm25 = Arc::new(bm25);
+    let docs = Arc::new(docs);
+    let symbol_embeddings = Arc::new(symbol_embeddings);
+
+    let data = CachedSearchData {
+        rows: Arc::clone(&rows),
+        bm25: Arc::clone(&bm25),
+        docs: Arc::clone(&docs),
+        symbol_embeddings: Arc::clone(&symbol_embeddings),
+    };
+
+    let mut guard = search_ctx_lock().lock().unwrap();
+    *guard = Some(SearchContext {
+        db_path: canon,
+        db_mtime: mtime,
+        rows,
+        bm25_unfiltered: bm25,
+        docs_unfiltered: docs,
+        symbol_embeddings,
+    });
+
+    Ok(data)
+}
+
+fn get_search_data_local(
+    args: &Value,
+    path: &str,
+) -> Result<(Vec<Vec<String>>, Vec<(String, Vec<f32>)>)> {
     let prism = super::helpers::open_prism_read_only(args)?;
     let store = prism.store().context("not initialized")?;
     let conn = store.connection()?;
@@ -81,7 +141,6 @@ fn get_or_build_search_ctx(args: &Value) -> Result<CachedSearchData> {
     )?;
 
     let docs = build_docs_from_rows(&rows);
-    let bm25 = BM25Index::build(docs.clone());
     let embedder = embed::best_embedder();
     let emb_path = PathBuf::from(path)
         .join(".infigraph")
@@ -107,29 +166,28 @@ fn get_or_build_search_ctx(args: &Value) -> Result<CachedSearchData> {
         })
         .collect();
 
-    let rows = Arc::new(rows);
-    let bm25 = Arc::new(bm25);
-    let docs = Arc::new(docs);
-    let symbol_embeddings = Arc::new(symbol_embeddings);
+    Ok((rows, symbol_embeddings))
+}
 
-    let data = CachedSearchData {
-        rows: Arc::clone(&rows),
-        bm25: Arc::clone(&bm25),
-        docs: Arc::clone(&docs),
-        symbol_embeddings: Arc::clone(&symbol_embeddings),
-    };
+#[allow(unused)]
+fn get_search_data_remote() -> Result<(Vec<Vec<String>>, Vec<(String, Vec<f32>)>)> {
+    #[cfg(feature = "remote")]
+    {
+        use infigraph_core::graph::{Neo4jBackend, GraphBackend};
+        use infigraph_core::meta::PostgresMetaStore;
 
-    let mut guard = search_ctx_lock().lock().unwrap();
-    *guard = Some(SearchContext {
-        db_path: canon,
-        db_mtime: mtime,
-        rows,
-        bm25_unfiltered: bm25,
-        docs_unfiltered: docs,
-        symbol_embeddings,
-    });
+        let backend = Neo4jBackend::connect_from_env()?;
+        let rows = backend.get_symbols_for_search()?;
 
-    Ok(data)
+        let pg = PostgresMetaStore::connect_from_env()?;
+        let symbol_embeddings = pg.all_embeddings("symbol")?;
+
+        Ok((rows, symbol_embeddings))
+    }
+    #[cfg(not(feature = "remote"))]
+    {
+        anyhow::bail!("remote mode requires --features remote")
+    }
 }
 
 pub fn tool_search(args: &Value) -> Result<String> {
@@ -210,17 +268,23 @@ pub fn tool_search(args: &Value) -> Result<String> {
 
     // Compute raw scores once, blend with both alphas
     let oversample = limit * 2;
+    let is_remote = is_remote_mode();
     let tg_dir = PathBuf::from(path).join(".infigraph");
     let hnsw_path = tg_dir.join("hnsw_index.usearch");
     let emb_path = tg_dir.join("embeddings.bin");
+    let (hnsw_opt, emb_opt): (Option<&std::path::Path>, Option<&std::path::Path>) = if is_remote {
+        (None, None)
+    } else {
+        (Some(hnsw_path.as_path()), Some(emb_path.as_path()))
+    };
     let raw = infigraph_core::search::compute_raw_scores(
         query,
         bm25_ref,
         embedder.as_ref(),
         symbol_embeddings_ref,
         oversample,
-        Some(&hnsw_path),
-        Some(&emb_path),
+        hnsw_opt,
+        emb_opt,
     )?;
 
     let keyword_results = infigraph_core::search::combine_scores(&raw, 0.3, limit);
@@ -315,8 +379,8 @@ pub fn tool_search(args: &Value) -> Result<String> {
             embedder.as_ref(),
             symbol_embeddings_ref,
             esc_oversample,
-            Some(&hnsw_path),
-            Some(&emb_path),
+            hnsw_opt,
+            emb_opt,
         )?;
         let kw2 = infigraph_core::search::combine_scores(&raw2, 0.3, esc_limit);
         let sem2 = infigraph_core::search::combine_scores(&raw2, 0.85, esc_limit);
@@ -616,6 +680,12 @@ pub fn tool_semantic_search(args: &Value) -> Result<String> {
     let tg_dir = PathBuf::from(path).join(".infigraph");
     let hnsw_path = tg_dir.join("hnsw_index.usearch");
     let emb_path = tg_dir.join("embeddings.bin");
+    let (hnsw_opt, emb_opt): (Option<&std::path::Path>, Option<&std::path::Path>) =
+        if is_remote_mode() {
+            (None, None)
+        } else {
+            (Some(hnsw_path.as_path()), Some(emb_path.as_path()))
+        };
     let results = infigraph_core::search::hybrid_search(
         query,
         bm25_ref_sem,
@@ -623,8 +693,8 @@ pub fn tool_semantic_search(args: &Value) -> Result<String> {
         sym_emb_ref_sem,
         limit,
         0.85,
-        Some(&hnsw_path),
-        Some(&emb_path),
+        hnsw_opt,
+        emb_opt,
     )?;
 
     let row_map: HashMap<&str, &Vec<String>> = filtered_rows
