@@ -259,6 +259,12 @@ fn run() -> Result<()> {
         .and_then(|a| a.strip_prefix("--mcp-port="))
         .and_then(|p| p.parse().ok())
         .unwrap_or(8642);
+    let health_path: String = args
+        .iter()
+        .find(|a| a.starts_with("--health-path="))
+        .and_then(|a| a.strip_prefix("--health-path="))
+        .unwrap_or("/health")
+        .to_string();
 
     if ui_enabled {
         if web::start_ui_server(port) {
@@ -278,7 +284,7 @@ fn run() -> Result<()> {
     }
 
     if serve_mode {
-        if web::start_mcp_http_server(mcp_port, is_primary) {
+        if web::start_mcp_http_server(mcp_port, is_primary, &health_path) {
             eprintln!("Infigraph MCP HTTP server at http://0.0.0.0:{}", mcp_port);
         } else {
             eprintln!("Infigraph MCP HTTP port {} already in use", mcp_port);

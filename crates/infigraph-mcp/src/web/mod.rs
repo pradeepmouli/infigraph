@@ -88,19 +88,20 @@ pub fn start_ui_server(port: u16) -> bool {
     true
 }
 
-pub fn start_mcp_http_server(port: u16, is_primary: bool) -> bool {
+pub fn start_mcp_http_server(port: u16, is_primary: bool, health_path: &str) -> bool {
     let addr = format!("0.0.0.0:{}", port);
     let server = match Server::http(&addr) {
         Ok(s) => s,
         Err(_) => return false,
     };
+    let health_path = health_path.to_string();
     thread::spawn(move || {
         for mut request in server.incoming_requests() {
             let url = request.url().to_string();
             let method = request.method().to_string();
             let route = url.split('?').next().unwrap_or(&url);
 
-            if method == "GET" && route == "/health" {
+            if method == "GET" && route == health_path {
                 let (status, body) = if is_ready() {
                     (200, json!({"status": "ok"}))
                 } else {
@@ -381,3 +382,96 @@ pub(super) fn open_prism(params: &Value) -> Result<Infigraph> {
 
 // The full HTML UI -- embedded as a const string
 const INDEX_HTML: &str = include_str!("../ui.html");
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read as _, Write as _};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::Mutex;
+
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn free_port() -> u16 {
+        TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    fn http_get(port: u16, path: &str) -> (u16, String) {
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).unwrap();
+        write!(
+            stream,
+            "GET {} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+            path
+        )
+        .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        let status = response
+            .lines()
+            .next()
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let body = response.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
+        (status, body)
+    }
+
+    #[test]
+    fn test_health_default_path() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let port = free_port();
+        set_ready(true);
+        assert!(start_mcp_http_server(port, false, "/health"));
+        thread::sleep(std::time::Duration::from_millis(100));
+
+        let (status, body) = http_get(port, "/health");
+        assert_eq!(status, 200);
+        assert!(body.contains("\"ok\""), "body: {}", body);
+    }
+
+    #[test]
+    fn test_health_custom_path() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let port = free_port();
+        set_ready(true);
+        assert!(start_mcp_http_server(port, false, "/health/full"));
+        thread::sleep(std::time::Duration::from_millis(100));
+
+        let (status, body) = http_get(port, "/health/full");
+        assert_eq!(status, 200);
+        assert!(body.contains("\"ok\""), "body: {}", body);
+    }
+
+    #[test]
+    fn test_health_returns_503_when_not_ready() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let port = free_port();
+        set_ready(false);
+        assert!(start_mcp_http_server(port, false, "/health"));
+        thread::sleep(std::time::Duration::from_millis(100));
+
+        let (status, body) = http_get(port, "/health");
+        assert_eq!(status, 503);
+        assert!(body.contains("\"indexing\""), "body: {}", body);
+        set_ready(true);
+    }
+
+    #[test]
+    fn test_health_wrong_path_not_matched() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let port = free_port();
+        set_ready(true);
+        assert!(start_mcp_http_server(port, false, "/health/full"));
+        thread::sleep(std::time::Duration::from_millis(100));
+
+        let (status, _) = http_get(port, "/health");
+        assert_ne!(
+            status, 200,
+            "/health should not match when health_path is /health/full"
+        );
+    }
+}

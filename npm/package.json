@@ -19,6 +19,7 @@
     "@intuit/infigraph-darwin-arm64": "1.6.0",
     "@intuit/infigraph-darwin-x64": "1.6.0",
     "@intuit/infigraph-linux-x64": "1.6.0",
+    "@intuit/infigraph-linux-arm64": "1.6.0",
     "@intuit/infigraph-win32-x64": "1.6.0"
   },
   "engines": {

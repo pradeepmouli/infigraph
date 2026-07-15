@@ -64,6 +64,10 @@ jobs:
             target: x86_64-unknown-linux-gnu
             archive: tar.gz
             cargo_features: ""
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            archive: tar.gz
+            cargo_features: ""
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             archive: zip
@@ -159,7 +163,7 @@ jobs:
         run: |
           TAG="${{ github.ref_name }}"
           mkdir -p /tmp/release-assets
-          for target in aarch64-apple-darwin x86_64-apple-darwin x86_64-unknown-linux-gnu; do
+          for target in aarch64-apple-darwin x86_64-apple-darwin x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
             gh release download "$TAG" --pattern "infigraph-${target}.tar.gz" --dir /tmp/release-assets --repo "${{ github.repository }}"
           done
           gh release download "$TAG" --pattern "infigraph-x86_64-pc-windows-msvc.zip" --dir /tmp/release-assets --repo "${{ github.repository }}"
@@ -172,11 +176,11 @@ jobs:
           cd npm
           npm version "$VERSION" --no-git-tag-version --allow-same-version
           # Update optionalDependencies versions
-          for platform in darwin-arm64 darwin-x64 linux-x64 win32-x64; do
+          for platform in darwin-arm64 darwin-x64 linux-x64 linux-arm64 win32-x64; do
             sed -i "s|\"@intuit/infigraph-${platform}\": \".*\"|\"@intuit/infigraph-${platform}\": \"${VERSION}\"|" package.json
           done
           # Update platform package.json versions
-          for platform in darwin-arm64 darwin-x64 linux-x64 win32-x64; do
+          for platform in darwin-arm64 darwin-x64 linux-x64 linux-arm64 win32-x64; do
             cd platforms/${platform}
             npm version "$VERSION" --no-git-tag-version --allow-same-version
             cd ../..
@@ -190,6 +194,7 @@ jobs:
             ["aarch64-apple-darwin"]="darwin-arm64"
             ["x86_64-apple-darwin"]="darwin-x64"
             ["x86_64-unknown-linux-gnu"]="linux-x64"
+            ["aarch64-unknown-linux-gnu"]="linux-arm64"
             ["x86_64-pc-windows-msvc"]="win32-x64"
           )
 
@@ -220,7 +225,7 @@ jobs:
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
-          for platform in darwin-arm64 darwin-x64 linux-x64 win32-x64; do
+          for platform in darwin-arm64 darwin-x64 linux-x64 linux-arm64 win32-x64; do
             cd npm/platforms/${platform}
             npm publish --access public || echo "Platform ${platform} publish failed (may already exist)"
             cd "${{ github.workspace }}"
