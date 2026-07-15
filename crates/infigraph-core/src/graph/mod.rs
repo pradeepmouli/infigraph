@@ -1,6 +1,8 @@
 mod backend;
 pub mod cozo_store;
 mod kuzu_backend;
+#[cfg(feature = "neo4j")]
+mod neo4j_backend;
 pub mod parquet_loader;
 mod queries;
 mod schema;
@@ -16,6 +18,8 @@ pub mod test_templates;
 pub use backend::GraphBackend;
 pub use cozo_store::CozoStore;
 pub use kuzu_backend::KuzuBackend;
+#[cfg(feature = "neo4j")]
+pub use neo4j_backend::Neo4jBackend;
 pub use queries::{
     format_skeleton, ApiSymbol, BranchInfo, CoverageRow, ExampleTest, FileDeps, GraphQuery,
     HierarchyNode, ImpactRow, ReferenceRow, SkeletonSymbol, SymbolDetail, SymbolRow, TestContext,

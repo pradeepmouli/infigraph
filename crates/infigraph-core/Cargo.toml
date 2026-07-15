@@ -41,6 +41,19 @@ serde_yaml = "0.9.34"
 fs2 = "0.4.3"
 memmap2 = "0.9"
 
+[features]
+default = []
+neo4j = ["neo4rs", "tokio"]
+
+[dependencies.neo4rs]
+version = "0.8"
+optional = true
+
+[dependencies.tokio]
+version = "1"
+features = ["rt-multi-thread"]
+optional = true
+
 [dev-dependencies]
 tree-sitter-python = "0.25"
 cargo-husky = { version = "1", default-features = false, features = ["user-hooks"] }
