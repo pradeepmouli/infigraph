@@ -12,6 +12,8 @@ use infigraph_core::search::BM25Index;
 use super::docs::{open_doc_index, tool_search_docs};
 use super::helpers::find_containing_symbol;
 
+type SearchData = (Vec<Vec<String>>, Vec<(String, Vec<f32>)>);
+
 struct SearchContext {
     db_path: PathBuf,
     db_mtime: SystemTime,
@@ -128,10 +130,7 @@ fn get_or_build_search_ctx(args: &Value) -> Result<CachedSearchData> {
     Ok(data)
 }
 
-fn get_search_data_local(
-    args: &Value,
-    path: &str,
-) -> Result<(Vec<Vec<String>>, Vec<(String, Vec<f32>)>)> {
+fn get_search_data_local(args: &Value, path: &str) -> Result<SearchData> {
     let prism = super::helpers::open_prism_read_only(args)?;
     let store = prism.store().context("not initialized")?;
     let conn = store.connection()?;
@@ -170,10 +169,10 @@ fn get_search_data_local(
 }
 
 #[allow(unused)]
-fn get_search_data_remote() -> Result<(Vec<Vec<String>>, Vec<(String, Vec<f32>)>)> {
+fn get_search_data_remote() -> Result<SearchData> {
     #[cfg(feature = "remote")]
     {
-        use infigraph_core::graph::{Neo4jBackend, GraphBackend};
+        use infigraph_core::graph::{GraphBackend, Neo4jBackend};
         use infigraph_core::meta::PostgresMetaStore;
 
         let backend = Neo4jBackend::connect_from_env()?;
