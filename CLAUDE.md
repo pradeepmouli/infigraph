@@ -50,8 +50,16 @@ Source → AST extraction → cross-file resolution → graph → optional SCIP 
 - File-watching uses a lock file for cross-process dedup — anything that starts a watcher must hold it for the watcher's lifetime.
 - Route/decorator extraction differs by language syntax (query-based vs. AST-sibling-scan) — check both before assuming a language isn't covered.
 - Background scratch files (SCIP enrichment log/tmp) use fixed, non-run-unique paths — concurrent `infigraph index` runs can race on them.
+- Never call `kuzu::Database::new` on an unvalidated path — a truncated/corrupt file can make Kuzu's parser read a bogus size field and request a huge allocation, which aborts the whole process on some platforms (observed on Linux, not macOS) before any `Result` exists to catch it. Check file size against a sane minimum first (see `GraphStore::open`/`DocStore::open`).
+- Any "wipe and rebuild on open failure" logic must distinguish transient errors (lock contention, resource pressure) from actual corruption — treating every failure as corruption risks destroying real data mid-race with a concurrent reader/writer.
 
-For deeper detail on any of these, see the matching skill/rule (adding a language, cross-file call resolution, SCIP enrichment, multi-repo groups, taint analysis, debugging indexing/watch issues).
+For deeper detail on any of these, see the matching skill/rule (`code-indexing-pipeline` for language/resolution/SCIP/watch; `analysis-subsystems` for multi-repo/taint).
+
+### CI / toolchain gotchas
+
+- CI's `dtolnay/rust-toolchain@stable` floats to whatever "stable" resolves to at run time — a newer clippy than your local toolchain can fail on lints your local run never sees. If local and CI disagree on fmt/clippy, suspect this before assuming a bug — confirm by installing CI's exact version locally (`rustup show active-toolchain` with a temporary `rust-toolchain.toml` override) rather than guessing.
+- If a PR gets merged into `main` directly *and* separately into a feature branch, GitHub's synthetic PR-merge-commit computation can silently duplicate content (e.g. two copies of the same test module) even when neither branch alone shows a problem — this only appears in the merge commit itself. Rebase the feature branch onto current `main` to fix it for real, rather than trying to resolve it in a synthetic merge.
+- Local test runs under high parallelism (`--test-threads` default) can produce resource-contention failures (e.g. mmap/buffer-manager exhaustion from multiple embedded-DB test processes) that aren't real bugs — always confirm a suspected regression with `--test-threads=1` before treating it as one.
 
 ### Test fixtures
 

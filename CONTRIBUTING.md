@@ -4,7 +4,7 @@ Thank you for your interest in contributing!
 
 ## AI-assisted contributions
 
-If you're using Claude Code, see [`CLAUDE.md`](CLAUDE.md) — architecture, build/test commands, and cross-cutting invariants, plus deeper guides under `.claude/skills/` (adding a language, cross-file call resolution, SCIP enrichment, multi-repo groups, taint analysis, debugging indexing/watch issues). Cursor users get the same content via `.cursor/rules/*.mdc`, auto-loaded per file.
+If you're using Claude Code, see [`CLAUDE.md`](CLAUDE.md) — architecture, build/test commands, and cross-cutting invariants, plus deeper guides under `.claude/skills/` (`code-indexing-pipeline`, `analysis-subsystems`, `review-pr-against-issue`). Cursor users get the same content via `.cursor/rules/*.mdc`, auto-loaded per file.
 
 ## Prerequisites
 
