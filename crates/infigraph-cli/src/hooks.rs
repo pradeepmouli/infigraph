@@ -74,7 +74,43 @@ ENDJSON
     if [ -f "$tracker_file" ] && grep -qF "$file_path" "$tracker_file" 2>/dev/null; then
       exit 0
     fi
-    # Block — use infigraph tools. If infigraph search returns nothing, sentinel allows retry.
+    # Allow if the file isn't inside the current project directory
+    case "$file_path" in
+      "$cwd"/*) ;;
+      *) exit 0 ;;
+    esac
+    # Allow if the file is in a directory infigraph excludes from indexing
+    rel_path="${file_path#"$cwd"/}"
+    case "$rel_path" in
+      .infigraph/*|*/.infigraph/*|.claude/*|*/.claude/*|node_modules/*|*/node_modules/*|__pycache__/*|*/__pycache__/*|.tox/*|*/.tox/*|.git/*|*/.git/*)
+        exit 0 ;;
+    esac
+    # Allow if git considers the file ignored (approximates .gitignore; .infigraphignore not covered)
+    if command -v git >/dev/null 2>&1 && git -C "$cwd" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+      if git -C "$cwd" check-ignore -q "$file_path" 2>/dev/null; then
+        exit 0
+      fi
+    fi
+    # Allow if the file type isn't one infigraph indexes
+    base=$(basename -- "$file_path")
+    case "$base" in
+      Dockerfile|Containerfile|Makefile|makefile|GNUmakefile|CMakeLists.txt|BUILD|BUILD.bazel|WORKSPACE) ;;
+      *)
+        case "$file_path" in
+          *.py|*.rs|*.ts|*.tsx|*.js|*.jsx|*.mjs|*.go|*.java|*.c|*.h|*.cpp|*.cc|*.cxx|*.hpp|*.hxx|*.hh|\
+          *.rb|*.rake|*.gemspec|*.php|*.swift|*.kt|*.kts|*.cs|*.scala|*.sc|*.lua|*.zig|*.ex|*.exs|*.dart|\
+          *.m|*.mm|*.hs|*.lhs|*.pl|*.pm|*.t|*.r|*.R|*.Rmd|*.ml|*.mli|*.sh|*.bash|*.zsh|*.sql|*.jl|*.proto|\
+          *.ps1|*.psm1|*.psd1|*.v|*.sv|*.svh|*.vh|*.hcl|*.tf|*.tfvars|*.toml|*.yml|*.yaml|*.erl|*.hrl|\
+          *.f90|*.f95|*.f03|*.f08|*.f|*.for|*.nix|*.svelte|*.fs|*.fsi|*.fsx|*.groovy|*.gradle|*.css|\
+          *.html|*.htm|*.json|*.xml|*.xsl|*.xsd|*.svg|*.plist|*.graphql|*.gql|*.glsl|*.vert|*.frag|*.geom|\
+          *.comp|*.lisp|*.lsp|*.cl|*.asd|*.elm|*.el|*.ini|*.cfg|*.conf|*.bzl|*.star|*.mlx|*.mat|*.md|\
+          *.markdown|*.clj|*.cljs|*.cljc|*.edn|*.cu|*.cuh|*.pas|*.pp|*.dpr|*.dpk|*.inc|*.lpr|*.bas|*.cls|\
+          *.frm|*.dockerfile|*.mk|*.cmake) ;;
+          *) exit 0 ;;
+        esac
+        ;;
+    esac
+    # Block — this file is indexable; use infigraph tools instead. If infigraph search returns nothing, sentinel allows retry.
     echo "BLOCKED: Use mcp__infigraph__get_doc_context, search, or get_code_snippet. Read only for Edit line numbers (pass offset)." >&2
     exit 2
     ;;
