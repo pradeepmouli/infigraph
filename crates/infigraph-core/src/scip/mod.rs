@@ -406,6 +406,81 @@ pub fn import_scip_index(
         let _ = std::fs::remove_file(&edge_pq);
     }
 
+    // Pass 3: build INHERITS edges from SCIP's compiler-verified is_implementation
+    // relationships (class/interface/trait implementation and inheritance).
+    // Mapped onto the same RelationKind::Inherits used by tree-sitter's
+    // @inherit.child/@inherit.parent captures, since no language's relations.scm
+    // currently distinguishes extends from implements.
+    let mut inherits_to_create: Vec<(String, String)> = Vec::new();
+    let mut seen_inherits: std::collections::HashSet<(String, String)> =
+        std::collections::HashSet::new();
+
+    for doc in &index.documents {
+        for si in &doc.symbols {
+            if si.symbol.starts_with("local ") || si.symbol.starts_with('<') {
+                continue;
+            }
+            let Some((sfile, sname)) = scip_sym_to_file_name.get(&si.symbol) else {
+                continue;
+            };
+            let Some(source_id) = file_name_to_ids
+                .get(&(sfile.clone(), sname.clone()))
+                .and_then(|ids| ids.first())
+                .cloned()
+            else {
+                continue;
+            };
+
+            for rel in &si.relationships {
+                if !rel.is_implementation {
+                    continue;
+                }
+                let Some((tfile, tname)) = scip_sym_to_file_name.get(&rel.symbol) else {
+                    continue;
+                };
+                let Some(target_id) = file_name_to_ids
+                    .get(&(tfile.clone(), tname.clone()))
+                    .and_then(|ids| ids.first())
+                    .cloned()
+                else {
+                    continue;
+                };
+
+                if source_id == target_id {
+                    continue;
+                }
+
+                let edge = (source_id.clone(), target_id);
+                if seen_inherits.insert(edge.clone()) {
+                    inherits_to_create.push(edge);
+                }
+            }
+        }
+    }
+
+    // Bulk write INHERITS edges via Parquet COPY FROM
+    if !inherits_to_create.is_empty() {
+        let tmp = std::env::temp_dir();
+        let edge_pq = tmp.join("infigraph_scip_inherits.parquet");
+        let refs: Vec<(&str, &str)> = inherits_to_create
+            .iter()
+            .map(|(a, b)| (a.as_str(), b.as_str()))
+            .collect();
+        if parquet_loader::write_edge_parquet(&edge_pq, &refs).is_ok() {
+            if let Err(e) = conn.query(&format!(
+                "COPY INHERITS FROM '{}'",
+                fwd_slash_path(&edge_pq)
+            )) {
+                eprintln!("Auto-SCIP: COPY INHERITS failed ({e}), falling back to UNWIND");
+                unwind_edges_from_pairs(&conn, &refs, "INHERITS", "Symbol", "Symbol");
+            }
+        } else {
+            unwind_edges_from_pairs(&conn, &refs, "INHERITS", "Symbol", "Symbol");
+        }
+        stats.relations_added = inherits_to_create.len();
+        let _ = std::fs::remove_file(&edge_pq);
+    }
+
     // Persist learned corrections (if any were recorded)
     if let Some(root) = project_root {
         if stats.corrections_learned > 0 {
@@ -508,6 +583,7 @@ pub struct ImportStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use scip::types::{Document, Occurrence, Relationship, SymbolInformation};
 
     #[test]
     fn scip_sym_to_name_strips_trailing_suffix_markers() {
@@ -541,5 +617,153 @@ mod tests {
             scip_sym_to_name("scip-python python test-pkg 1.0.0 `test`/Animal#"),
             "Animal"
         );
+    }
+
+    fn scip_symbol(name: &str, file: &str) -> String {
+        format!("scip-test npm test 1.0.0 `{file}`/{name}#")
+    }
+
+    fn make_scip_index(file: &str, child: &str, parent: &str) -> Vec<u8> {
+        let child_sym = scip_symbol(child, file);
+        let parent_sym = scip_symbol(parent, file);
+
+        let doc = Document {
+            relative_path: file.to_string(),
+            occurrences: vec![
+                Occurrence {
+                    range: vec![0, 0, 0, parent.len() as i32],
+                    symbol: parent_sym.clone(),
+                    symbol_roles: SymbolRole::Definition as i32,
+                    ..Default::default()
+                },
+                Occurrence {
+                    range: vec![5, 0, 5, child.len() as i32],
+                    symbol: child_sym.clone(),
+                    symbol_roles: SymbolRole::Definition as i32,
+                    ..Default::default()
+                },
+            ],
+            symbols: vec![
+                SymbolInformation {
+                    symbol: parent_sym.clone(),
+                    ..Default::default()
+                },
+                SymbolInformation {
+                    symbol: child_sym.clone(),
+                    relationships: vec![Relationship {
+                        symbol: parent_sym.clone(),
+                        is_implementation: true,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        let index = Index {
+            documents: vec![doc],
+            ..Default::default()
+        };
+        index.write_to_bytes().expect("serialize synthetic SCIP index")
+    }
+
+    struct TestEnv {
+        _dir: tempfile::TempDir,
+        store: GraphStore,
+    }
+
+    impl TestEnv {
+        fn new() -> Self {
+            let dir = tempfile::TempDir::new().unwrap();
+            let store = GraphStore::open(&dir.path().join("graph")).unwrap();
+            Self { _dir: dir, store }
+        }
+    }
+
+    #[test]
+    fn is_implementation_relationship_creates_inherits_edge() {
+        let env = TestEnv::new();
+        let bytes = make_scip_index("test.ts", "Dog", "Animal");
+
+        let index_path = env._dir.path().join("index.scip");
+        std::fs::write(&index_path, bytes).unwrap();
+
+        let stats = import_scip_index(&index_path, &env.store, None).unwrap();
+        assert_eq!(stats.relations_added, 1);
+
+        let conn = env.store.connection().unwrap();
+        let rows = conn
+            .query("MATCH (a:Symbol)-[:INHERITS]->(b:Symbol) RETURN a.name, b.name")
+            .unwrap();
+        let pairs: Vec<(String, String)> = rows
+            .into_iter()
+            .map(|row| {
+                (
+                    row[0].to_string().trim_matches('"').to_string(),
+                    row[1].to_string().trim_matches('"').to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(pairs, vec![("Dog".to_string(), "Animal".to_string())]);
+    }
+
+    #[test]
+    fn non_implementation_relationship_does_not_create_inherits_edge() {
+        let env = TestEnv::new();
+        let file = "test.ts";
+        let child_sym = scip_symbol("Dog", file);
+        let parent_sym = scip_symbol("Animal", file);
+
+        let doc = Document {
+            relative_path: file.to_string(),
+            occurrences: vec![
+                Occurrence {
+                    range: vec![0, 0, 0, 6],
+                    symbol: parent_sym.clone(),
+                    symbol_roles: SymbolRole::Definition as i32,
+                    ..Default::default()
+                },
+                Occurrence {
+                    range: vec![5, 0, 5, 3],
+                    symbol: child_sym.clone(),
+                    symbol_roles: SymbolRole::Definition as i32,
+                    ..Default::default()
+                },
+            ],
+            symbols: vec![
+                SymbolInformation {
+                    symbol: parent_sym.clone(),
+                    ..Default::default()
+                },
+                SymbolInformation {
+                    symbol: child_sym.clone(),
+                    // is_reference only, NOT is_implementation -- must not become INHERITS.
+                    relationships: vec![Relationship {
+                        symbol: parent_sym.clone(),
+                        is_reference: true,
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let index = Index {
+            documents: vec![doc],
+            ..Default::default()
+        };
+        let bytes = index.write_to_bytes().unwrap();
+        let index_path = env._dir.path().join("index.scip");
+        std::fs::write(&index_path, bytes).unwrap();
+
+        let stats = import_scip_index(&index_path, &env.store, None).unwrap();
+        assert_eq!(stats.relations_added, 0);
+
+        let conn = env.store.connection().unwrap();
+        let rows = conn
+            .query("MATCH (a:Symbol)-[:INHERITS]->(b:Symbol) RETURN a.name, b.name")
+            .unwrap();
+        assert!(rows.into_iter().next().is_none());
     }
 }
