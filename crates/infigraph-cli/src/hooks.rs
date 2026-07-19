@@ -23,32 +23,33 @@ if [ -f "$search_sentinel" ]; then
   fi
 fi
 
+deny() {
+  jq -n --arg reason "$1" \
+    '{hookSpecificOutput: {hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: $reason}}'
+  exit 0
+}
+
 case "$tool" in
   Grep)
-    echo "BLOCKED: Use mcp__infigraph__search instead of Grep." >&2
-    exit 2
+    deny "BLOCKED: Use mcp__infigraph__search instead of Grep."
     ;;
   Glob)
-    echo "BLOCKED: Use mcp__infigraph__list_files instead of Glob." >&2
-    exit 2
+    deny "BLOCKED: Use mcp__infigraph__list_files instead of Glob."
     ;;
   Bash)
     cmd=$(echo "$input" | jq -r '.tool_input.command // empty')
     if echo "$cmd" | grep -qE '(^|\s|/)(grep|egrep|fgrep|rg|ripgrep|ag|ack)(\s|$)'; then
-      echo "BLOCKED: Use mcp__infigraph__search instead of grep/rg." >&2
-      exit 2
+      deny "BLOCKED: Use mcp__infigraph__search instead of grep/rg."
     fi
     if echo "$cmd" | grep -qE '(^|\s)find\s.*-name\s'; then
-      echo "BLOCKED: Use mcp__infigraph__list_files instead of find." >&2
-      exit 2
+      deny "BLOCKED: Use mcp__infigraph__list_files instead of find."
     fi
     ;;
   Agent)
     agent_type=$(echo "$input" | jq -r '.tool_input.subagent_type // empty')
     case "$agent_type" in
       Explore|Plan|code-reviewer)
-        echo "BLOCKED: This agent type lacks MCP access. Use general-purpose agent instead." >&2
-        exit 2
+        deny "BLOCKED: This agent type lacks MCP access. Use general-purpose agent instead."
         ;;
     esac
     ;;
@@ -101,8 +102,7 @@ case "$tool" in
         ;;
     esac
     # Block — this file is indexable; use infigraph tools instead. If infigraph search returns nothing, sentinel allows retry.
-    echo "BLOCKED: Use mcp__infigraph__get_doc_context, search, or get_code_snippet. Read only for Edit line numbers (pass offset)." >&2
-    exit 2
+    deny "BLOCKED: Use mcp__infigraph__get_doc_context, search, or get_code_snippet. Read only for Edit line numbers (pass offset)."
     ;;
   Write|Edit)
     file_path=$(echo "$input" | jq -r '.tool_input.file_path // empty')
@@ -116,8 +116,7 @@ case "$tool" in
           exit 0
         fi
       fi
-      echo "BLOCKED: Call mcp__infigraph__generate_test_context before writing tests." >&2
-      exit 2
+      deny "BLOCKED: Call mcp__infigraph__generate_test_context before writing tests."
     fi
     ;;
 esac
