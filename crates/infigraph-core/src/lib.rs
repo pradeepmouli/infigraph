@@ -91,6 +91,10 @@ enum BackendKind {
 }
 
 impl Infigraph {
+    /// Backoff schedule (ms) for retrying a non-lock-contention graph open
+    /// failure before concluding it's genuine corruption. See `init()`.
+    const OPEN_RETRY_BACKOFF_MS: [u64; 3] = [200, 500, 1000];
+
     /// Open a project directory. Creates `.infigraph/` if it doesn't exist.
     pub fn open(root: &Path, registry: LanguageRegistry) -> Result<Self> {
         let root = root.canonicalize().context("invalid project root")?;
@@ -141,15 +145,54 @@ impl Infigraph {
                     })
                 }
                 Err(first_err) => {
-                    eprintln!(
-                        "[graph] open failed ({first_err}), wiping corrupt graph and rebuilding..."
-                    );
-                    Self::wipe_graph(&self.db_path);
-                    let kb = graph::KuzuBackend::open(&self.db_path).with_context(|| {
-                        format!("graph still unreadable after wipe (was: {first_err})")
-                    })?;
-                    self.backend_kind = BackendKind::Kuzu(kb);
-                    Ok(())
+                    // Some Kuzu IO errors (e.g. a short read while a concurrent
+                    // writer is mid-checkpoint) look identical to genuine
+                    // corruption at open time but resolve themselves once that
+                    // writer finishes. Retry with backoff before concluding the
+                    // graph is unrecoverable -- wiping destroys real data if the
+                    // first failure was just a transient race, and a single
+                    // fixed-delay retry isn't enough for a slower writer (e.g. a
+                    // large SCIP import mid-checkpoint).
+                    let mut last_err = first_err;
+                    let mut recovered = None;
+                    for delay_ms in Self::OPEN_RETRY_BACKOFF_MS {
+                        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                        match graph::KuzuBackend::open(&self.db_path) {
+                            Ok(kb) => {
+                                recovered = Some(kb);
+                                break;
+                            }
+                            Err(e) if is_lock_contention_error(&e) => {
+                                // Now unambiguously another live process holding the
+                                // db open, not a transient checkpoint race -- stop
+                                // retrying and report it as such.
+                                return Err(e).with_context(|| {
+                                    "graph is locked by another infigraph process (e.g. a \
+                                     running `infigraph watch`) -- not corrupted, so it was \
+                                     left untouched. Run `infigraph watch-status` or try \
+                                     again in a moment."
+                                });
+                            }
+                            Err(e) => last_err = e,
+                        }
+                    }
+
+                    if let Some(kb) = recovered {
+                        self.backend_kind = BackendKind::Kuzu(kb);
+                        Ok(())
+                    } else {
+                        eprintln!(
+                            "[graph] open failed after {} attempts ({last_err}), wiping \
+                             corrupt graph and rebuilding...",
+                            Self::OPEN_RETRY_BACKOFF_MS.len() + 1
+                        );
+                        Self::wipe_graph(&self.db_path);
+                        let kb = graph::KuzuBackend::open(&self.db_path).with_context(|| {
+                            format!("graph still unreadable after wipe (was: {last_err})")
+                        })?;
+                        self.backend_kind = BackendKind::Kuzu(kb);
+                        Ok(())
+                    }
                 }
             },
         }
