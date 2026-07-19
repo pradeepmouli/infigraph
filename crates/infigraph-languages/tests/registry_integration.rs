@@ -142,6 +142,31 @@ fn test_extraction_smoke_rust() {
     assert!(names.contains(&"main"), "should extract main: {names:?}");
 }
 
+/// Regression test: rust/relations.scm had a comment describing intent to
+/// capture `impl Trait for Type` as an INHERITS relationship, but no actual
+/// query pattern was ever written -- every trait impl in every Rust codebase
+/// silently produced zero INHERITS edges (confirmed against infigraph's own
+/// `impl GraphBackend for KuzuBackend`, which had no corresponding edge).
+#[test]
+fn test_extraction_rust_impl_trait_produces_inherits_edge() {
+    use infigraph_core::model::RelationKind;
+
+    let registry = bundled_registry().unwrap();
+    let pack = registry.for_extension(".rs").unwrap();
+
+    let source = b"trait Greet {\n    fn hello(&self);\n}\nstruct Person;\nimpl Greet for Person {\n    fn hello(&self) {}\n}\n";
+    let extraction = infigraph_core::extract::extract_file("test.rs", source, pack)
+        .expect("extraction should succeed");
+
+    assert!(
+        extraction.relations.iter().any(|r| r.kind == RelationKind::Inherits
+            && r.source_id.contains("Person")
+            && r.target_id.contains("Greet")),
+        "expected an INHERITS edge from Person to Greet, got: {:?}",
+        extraction.relations
+    );
+}
+
 #[test]
 fn test_extraction_smoke_typescript() {
     let registry = bundled_registry().unwrap();
@@ -160,6 +185,38 @@ fn test_extraction_smoke_typescript() {
         names.contains(&"ApiClient"),
         "should extract ApiClient: {names:?}"
     );
+}
+
+/// Regression test: typescript/relations.scm had no inheritance capture at
+/// all (only calls + imports), unlike python/relations.scm and
+/// javascript/relations.scm which both have working @inherit.child/
+/// @inherit.parent patterns -- every `class X extends Y`, `interface X
+/// extends Y`, and `class X implements Y` in every TypeScript codebase
+/// silently produced zero INHERITS edges (confirmed against a real repo's
+/// `InputProps extends React.ComponentProps<'input'>`, which had no
+/// corresponding edge).
+#[test]
+fn test_extraction_typescript_inheritance_produces_edges() {
+    use infigraph_core::model::RelationKind;
+
+    let registry = bundled_registry().unwrap();
+    let pack = registry.for_extension(".ts").unwrap();
+
+    let source = b"class Animal {}\nclass Dog extends Animal {}\n\ninterface Shape {}\ninterface Circle extends Shape {}\n\ninterface Drawable {}\nclass Square implements Drawable {}\n";
+    let extraction = infigraph_core::extract::extract_file("test.ts", source, pack)
+        .expect("extraction should succeed");
+
+    let has_edge = |child: &str, parent: &str| {
+        extraction.relations.iter().any(|r| {
+            r.kind == RelationKind::Inherits
+                && r.source_id.contains(child)
+                && r.target_id.contains(parent)
+        })
+    };
+
+    assert!(has_edge("Dog", "Animal"), "class extends: {:?}", extraction.relations);
+    assert!(has_edge("Circle", "Shape"), "interface extends: {:?}", extraction.relations);
+    assert!(has_edge("Square", "Drawable"), "class implements: {:?}", extraction.relations);
 }
 
 #[test]

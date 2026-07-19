@@ -19,3 +19,6 @@
 
 ; Struct inheritance via trait bounds isn't direct, but impl Trait for Type is
 ; We capture impl blocks as a relationship
+(impl_item
+  trait: (type_identifier) @inherit.parent
+  type: (type_identifier) @inherit.child)
