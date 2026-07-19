@@ -11,3 +11,8 @@
 ; Module import (@import)
 (module_import
   path: (identifier) @import.module)
+
+; Class inheritance: @interface Foo : Bar
+(class_interface
+  (identifier) @inherit.child
+  superclass: (identifier) @inherit.parent)

@@ -14,3 +14,17 @@
 ; Import declarations
 (import_declaration
   (identifier) @import.module)
+
+; Class/struct/enum/protocol inheritance or protocol conformance:
+; class Foo: Bar, protocol Foo: Bar
+(class_declaration
+  name: (type_identifier) @inherit.child
+  (inheritance_specifier
+    inherits_from: (user_type
+      (type_identifier) @inherit.parent)))
+
+(protocol_declaration
+  name: (type_identifier) @inherit.child
+  (inheritance_specifier
+    inherits_from: (user_type
+      (type_identifier) @inherit.parent)))
