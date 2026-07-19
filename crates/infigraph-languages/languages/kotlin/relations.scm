@@ -13,3 +13,13 @@
 ; Import declarations
 (import
   (identifier) @import.module)
+
+; Class inheritance / interface implementation: class Dog : Animal() or class Foo : Bar
+(class_declaration
+  name: (identifier) @inherit.child
+  (delegation_specifiers
+    (delegation_specifier
+      [
+        (user_type (identifier) @inherit.parent)
+        (constructor_invocation (user_type (identifier) @inherit.parent))
+      ])))
