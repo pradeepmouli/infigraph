@@ -25,29 +25,21 @@ fi
 
 case "$tool" in
   Grep)
-    cat <<'ENDJSON'
-{"hookSpecificOutput":{"hookEventName":"PreToolUse","additionalContext":"BLOCKED: Use mcp__infigraph__search instead of Grep."}}
-ENDJSON
+    echo "BLOCKED: Use mcp__infigraph__search instead of Grep." >&2
     exit 2
     ;;
   Glob)
-    cat <<'ENDJSON'
-{"hookSpecificOutput":{"hookEventName":"PreToolUse","additionalContext":"BLOCKED: Use mcp__infigraph__list_files instead of Glob."}}
-ENDJSON
+    echo "BLOCKED: Use mcp__infigraph__list_files instead of Glob." >&2
     exit 2
     ;;
   Bash)
     cmd=$(echo "$input" | jq -r '.tool_input.command // empty')
     if echo "$cmd" | grep -qE '(^|\s|/)(grep|egrep|fgrep|rg|ripgrep|ag|ack)(\s|$)'; then
-      cat <<'ENDJSON'
-{"hookSpecificOutput":{"hookEventName":"PreToolUse","additionalContext":"BLOCKED: Use mcp__infigraph__search instead of grep/rg."}}
-ENDJSON
+      echo "BLOCKED: Use mcp__infigraph__search instead of grep/rg." >&2
       exit 2
     fi
     if echo "$cmd" | grep -qE '(^|\s)find\s.*-name\s'; then
-      cat <<'ENDJSON'
-{"hookSpecificOutput":{"hookEventName":"PreToolUse","additionalContext":"BLOCKED: Use mcp__infigraph__list_files instead of find."}}
-ENDJSON
+      echo "BLOCKED: Use mcp__infigraph__list_files instead of find." >&2
       exit 2
     fi
     ;;
@@ -55,9 +47,7 @@ ENDJSON
     agent_type=$(echo "$input" | jq -r '.tool_input.subagent_type // empty')
     case "$agent_type" in
       Explore|Plan|code-reviewer)
-        cat <<'ENDJSON'
-{"hookSpecificOutput":{"hookEventName":"PreToolUse","additionalContext":"BLOCKED: This agent type lacks MCP access. Use general-purpose agent instead."}}
-ENDJSON
+        echo "BLOCKED: This agent type lacks MCP access. Use general-purpose agent instead." >&2
         exit 2
         ;;
     esac
@@ -126,9 +116,7 @@ ENDJSON
           exit 0
         fi
       fi
-      cat <<'ENDJSON'
-{"hookSpecificOutput":{"hookEventName":"PreToolUse","additionalContext":"BLOCKED: Call mcp__infigraph__generate_test_context before writing tests."}}
-ENDJSON
+      echo "BLOCKED: Call mcp__infigraph__generate_test_context before writing tests." >&2
       exit 2
     fi
     ;;
