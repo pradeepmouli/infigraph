@@ -78,7 +78,7 @@ scoring wholesale.
 ```rust
 pub trait PatternDetector: Sync {
     fn name(&self) -> &'static str;
-    fn detect(&self, gq: &GraphQuery) -> Result<Vec<PatternMatch>>;
+    fn detect(&self, backend: &dyn GraphBackend) -> Result<Vec<PatternMatch>>;
 }
 
 // ZST marker structs, each delegating to the existing detect_x function
@@ -91,8 +91,8 @@ struct DecoratorDetector;
 
 impl PatternDetector for FactoryDetector {
     fn name(&self) -> &'static str { "Factory" }
-    fn detect(&self, gq: &GraphQuery) -> Result<Vec<PatternMatch>> {
-        detect_factory(gq)
+    fn detect(&self, backend: &dyn GraphBackend) -> Result<Vec<PatternMatch>> {
+        detect_factory(backend)
     }
 }
 // ... one impl per detector, same shape
@@ -170,13 +170,13 @@ a future, data-informed pass per the phasing decision.
 
 ## Error handling
 
-- `detect_all(store) -> Result<PatternReport>`: builds `PatternRegistry::new()`,
-  runs every registered detector even if one fails (no fail-fast — one
-  detector's bug shouldn't discard four other detectors' working results).
-  Successes accumulate into `patterns`; failures accumulate into a new
-  `errors: Vec<(String, String)>` field on `PatternReport` (detector name,
-  error message) instead of being dropped.
-- `detect_filtered(store, Some(name)) -> Result<PatternReport>`:
+- `detect_all(backend: &dyn GraphBackend) -> Result<PatternReport>`: builds
+  `PatternRegistry::new()`, runs every registered detector even if one fails
+  (no fail-fast — one detector's bug shouldn't discard four other detectors'
+  working results). Successes accumulate into `patterns`; failures accumulate
+  into a new `errors: Vec<(String, String)>` field on `PatternReport`
+  (detector name, error message) instead of being dropped.
+- `detect_filtered(backend, Some(name)) -> Result<PatternReport>`:
   `PatternRegistry::new().find(name)` → `None` is a **hard `Err`**
   (`"unknown pattern '{name}', available: {...}"`) — this is a caller
   mistake (asking for a detector that doesn't exist), not a runtime failure,
@@ -185,8 +185,8 @@ a future, data-informed pass per the phasing decision.
   through the same collect-don't-abort path as `detect_all` (a runtime error
   from a *known* detector goes into `errors`, not a hard failure — the
   detector existing and running is not a caller mistake).
-- `detect_filtered(store, None) -> Result<PatternReport>`: delegates to
-  `detect_all(store)`.
+- `detect_filtered(backend, None) -> Result<PatternReport>`: delegates to
+  `detect_all(backend)`.
 
 ```rust
 pub struct PatternReport {
@@ -199,21 +199,31 @@ pub struct PatternReport {
 
 The only current caller is the CLI — confirmed via `search_code` grep (not
 just `trace_callers`, which missed the cross-crate edge): `analysis_commands
-::cmd_detect_patterns` (`crates/infigraph-cli/src/analysis_commands.rs:531-
-548`) calls `patterns::detect_filtered(store, pattern)`. No MCP tool wraps
-pattern detection today, so no MCP-side changes are needed for this phase.
+::cmd_detect_patterns` (`crates/infigraph-cli/src/analysis_commands.rs:349-
+357`) calls `prism.backend().context(...)?` then
+`patterns::detect_filtered(backend, pattern)`. No MCP tool wraps pattern
+detection today, so no MCP-side changes are needed for this phase.
+
+Note: as of the 2026-07-18 upstream sync (v3.0.0), `Infigraph::backend()`
+returns `Some` for every backend kind including the default local Kuzu
+backend (previously `None` — Kuzu callers went through a separate
+`GraphStore`/`GraphQuery` path). `patterns::detect_all`/`detect_filtered`
+were updated upstream as part of that same refactor to take
+`backend: &dyn GraphBackend` directly instead of `&GraphStore`, so this
+design's registry/detector plumbing targets that signature throughout.
 
 ```
 cmd_detect_patterns(pattern: Option<&str>)
-  -> patterns::detect_filtered(store, pattern)
+  -> prism.backend().context("graph not initialized...")?
+  -> patterns::detect_filtered(backend, pattern)
        pattern = Some(name):
          PatternRegistry::new().find(name)
            None  -> Err("unknown pattern '{name}', available: {...}")
-           Some(d) -> d.detect(&gq) -> single-detector PatternReport
+           Some(d) -> d.detect(backend) -> single-detector PatternReport
        pattern = None:
-         -> detect_all(store)
+         -> detect_all(backend)
               PatternRegistry::new().all().iter()
-                -> each d.detect(&gq)  [Cypher query + Rust post-processing]
+                -> each d.detect(backend)  [Cypher via backend.raw_query() + Rust post-processing]
                 -> Ok(matches)  => patterns.extend(matches)
                 -> Err(e)       => errors.push((d.name(), e.to_string()))
               -> PatternReport { patterns, errors }
@@ -237,9 +247,11 @@ real graph.
 Fixture convention already established in this codebase: integration tests
 under `crates/infigraph-core/tests/` (`modules.rs`, `features.rs`) each
 define their own local `setup_graph() -> TestGraph` helper that indexes real
-fixture source files into an actual `GraphStore` — confirmed via
-`search_code` that this helper is duplicated per file rather than shared, so
-a new test file follows the same local-fixture convention.
+fixture source files and exposes a `backend: KuzuBackend` field directly —
+`KuzuBackend` implements `GraphBackend`, so `tg.backend` can be passed
+straight into `detect_x(&tg.backend)` calls with no wrapper needed.
+Confirmed via `search_code` that this helper is duplicated per file rather
+than shared, so a new test file follows the same local-fixture convention.
 
 Additions for this phase:
 
@@ -280,7 +292,7 @@ Additions for this phase:
   per-file `entities.scm`/`relations.scm` symbol/relation extraction) cannot
   express cross-file, cross-symbol graph traversal — it operates on a single
   file's AST at parse time, before the graph exists. Cypher (via
-  `GraphQuery::raw_query`) is already the graph-query DSL in active use by
+  `GraphBackend::raw_query`) is already the graph-query DSL in active use by
   every `detect_x` function; the open question was packaging (inline vs.
   externalized query files), not capability. Decided to keep queries inline
   with their Rust post-processing, since each detector's confidence-grading
