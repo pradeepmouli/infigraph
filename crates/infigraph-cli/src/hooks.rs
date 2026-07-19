@@ -51,42 +51,33 @@ fi
 # itself and the check above will correctly let the retry through.
 recovery_hint="If a quick ToolSearch shows the suggested infigraph tool genuinely isn't available despite this hook's process check, write the current unix timestamp to \$cwd/.infigraph/.search-fallback-allowed (the same sentinel checked above) and retry -- it will be allowed then."
 
+deny() {
+  jq -n --arg reason "$1" \
+    '{hookSpecificOutput: {hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: $reason}}'
+  exit 0
+}
+
 case "$tool" in
   Grep)
-    cat <<ENDJSON
-{"hookSpecificOutput":{"hookEventName":"PreToolUse","additionalContext":"BLOCKED: Use mcp__infigraph__search instead of Grep. $recovery_hint"}}
-ENDJSON
-    exit 2
+    deny "BLOCKED: Use mcp__infigraph__search instead of Grep. $recovery_hint"
     ;;
   Glob)
-    cat <<ENDJSON
-{"hookSpecificOutput":{"hookEventName":"PreToolUse","additionalContext":"BLOCKED: Use mcp__infigraph__list_files instead of Glob. $recovery_hint"}}
-ENDJSON
-    exit 2
+    deny "BLOCKED: Use mcp__infigraph__list_files instead of Glob. $recovery_hint"
     ;;
   Bash)
     cmd=$(echo "$input" | jq -r '.tool_input.command // empty')
     if echo "$cmd" | grep -qE '(^|\s|/)(grep|egrep|fgrep|rg|ripgrep|ag|ack)(\s|$)'; then
-      cat <<ENDJSON
-{"hookSpecificOutput":{"hookEventName":"PreToolUse","additionalContext":"BLOCKED: Use mcp__infigraph__search instead of grep/rg. $recovery_hint"}}
-ENDJSON
-      exit 2
+      deny "BLOCKED: Use mcp__infigraph__search instead of grep/rg. $recovery_hint"
     fi
     if echo "$cmd" | grep -qE '(^|\s)find\s.*-name\s'; then
-      cat <<ENDJSON
-{"hookSpecificOutput":{"hookEventName":"PreToolUse","additionalContext":"BLOCKED: Use mcp__infigraph__list_files instead of find. $recovery_hint"}}
-ENDJSON
-      exit 2
+      deny "BLOCKED: Use mcp__infigraph__list_files instead of find. $recovery_hint"
     fi
     ;;
   Agent)
     agent_type=$(echo "$input" | jq -r '.tool_input.subagent_type // empty')
     case "$agent_type" in
       Explore|Plan|code-reviewer)
-        cat <<ENDJSON
-{"hookSpecificOutput":{"hookEventName":"PreToolUse","additionalContext":"BLOCKED: This agent type lacks MCP access. Use general-purpose agent instead. $recovery_hint"}}
-ENDJSON
-        exit 2
+        deny "BLOCKED: This agent type lacks MCP access. Use general-purpose agent instead. $recovery_hint"
         ;;
     esac
     ;;
@@ -139,8 +130,7 @@ ENDJSON
         ;;
     esac
     # Block — this file is indexable; use infigraph tools instead. If infigraph search returns nothing, sentinel allows retry.
-    echo "BLOCKED: Use mcp__infigraph__get_doc_context, search, or get_code_snippet. Read only for Edit line numbers (pass offset). $recovery_hint" >&2
-    exit 2
+    deny "BLOCKED: Use mcp__infigraph__get_doc_context, search, or get_code_snippet. Read only for Edit line numbers (pass offset). $recovery_hint"
     ;;
   Write|Edit)
     file_path=$(echo "$input" | jq -r '.tool_input.file_path // empty')
@@ -154,10 +144,7 @@ ENDJSON
           exit 0
         fi
       fi
-      cat <<ENDJSON
-{"hookSpecificOutput":{"hookEventName":"PreToolUse","additionalContext":"BLOCKED: Call mcp__infigraph__generate_test_context before writing tests. $recovery_hint"}}
-ENDJSON
-      exit 2
+      deny "BLOCKED: Call mcp__infigraph__generate_test_context before writing tests. $recovery_hint"
     fi
     ;;
 esac
