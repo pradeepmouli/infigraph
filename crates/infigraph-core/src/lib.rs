@@ -83,6 +83,10 @@ enum BackendKind {
 }
 
 impl Infigraph {
+    /// Backoff schedule (ms) for retrying a non-lock-contention graph open
+    /// failure before concluding it's genuine corruption. See `init()`.
+    const OPEN_RETRY_BACKOFF_MS: [u64; 3] = [200, 500, 1000];
+
     /// Open a project directory. Creates `.infigraph/` if it doesn't exist.
     pub fn open(root: &Path, registry: LanguageRegistry) -> Result<Self> {
         let root = root.canonicalize().context("invalid project root")?;
@@ -133,15 +137,54 @@ impl Infigraph {
                     })
                 }
                 Err(first_err) => {
-                    eprintln!(
-                        "[graph] open failed ({first_err}), wiping corrupt graph and rebuilding..."
-                    );
-                    Self::wipe_graph(&self.db_path);
-                    let kb = graph::KuzuBackend::open(&self.db_path).with_context(|| {
-                        format!("graph still unreadable after wipe (was: {first_err})")
-                    })?;
-                    self.backend_kind = BackendKind::Kuzu(kb);
-                    Ok(())
+                    // Some Kuzu IO errors (e.g. a short read while a concurrent
+                    // writer is mid-checkpoint) look identical to genuine
+                    // corruption at open time but resolve themselves once that
+                    // writer finishes. Retry with backoff before concluding the
+                    // graph is unrecoverable -- wiping destroys real data if the
+                    // first failure was just a transient race, and a single
+                    // fixed-delay retry isn't enough for a slower writer (e.g. a
+                    // large SCIP import mid-checkpoint).
+                    let mut last_err = first_err;
+                    let mut recovered = None;
+                    for delay_ms in Self::OPEN_RETRY_BACKOFF_MS {
+                        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                        match graph::KuzuBackend::open(&self.db_path) {
+                            Ok(kb) => {
+                                recovered = Some(kb);
+                                break;
+                            }
+                            Err(e) if is_lock_contention_error(&e) => {
+                                // Now unambiguously another live process holding the
+                                // db open, not a transient checkpoint race -- stop
+                                // retrying and report it as such.
+                                return Err(e).with_context(|| {
+                                    "graph is locked by another infigraph process (e.g. a \
+                                     running `infigraph watch`) -- not corrupted, so it was \
+                                     left untouched. Run `infigraph watch-status` or try \
+                                     again in a moment."
+                                });
+                            }
+                            Err(e) => last_err = e,
+                        }
+                    }
+
+                    if let Some(kb) = recovered {
+                        self.backend_kind = BackendKind::Kuzu(kb);
+                        Ok(())
+                    } else {
+                        eprintln!(
+                            "[graph] open failed after {} attempts ({last_err}), wiping \
+                             corrupt graph and rebuilding...",
+                            Self::OPEN_RETRY_BACKOFF_MS.len() + 1
+                        );
+                        Self::wipe_graph(&self.db_path);
+                        let kb = graph::KuzuBackend::open(&self.db_path).with_context(|| {
+                            format!("graph still unreadable after wipe (was: {last_err})")
+                        })?;
+                        self.backend_kind = BackendKind::Kuzu(kb);
+                        Ok(())
+                    }
                 }
             },
         }
@@ -559,6 +602,159 @@ mod tests {
         assert!(
             !is_lock_contention_error(&err),
             "a genuine format/ID mismatch must still be treated as corruption and wiped"
+        );
+    }
+
+    /// Regression test for a second data-loss bug in the same area: a Kuzu
+    /// open failure that isn't lock contention (e.g. a short read while a
+    /// concurrent writer is mid-checkpoint) used to be wiped immediately with
+    /// no retry, even though the underlying file becomes readable again the
+    /// instant that writer finishes. `init()` destroyed a real repo's graph
+    /// this way -- the open failed with "Cannot read from file... 0 bytes",
+    /// not a lock message, so it fell straight through to `wipe_graph`.
+    #[test]
+    fn init_recovers_from_transient_open_failure_without_wiping() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        let db_path = root.join(".infigraph").join("graph");
+
+        // Build a real graph with a marker symbol, then close it.
+        {
+            let store = GraphStore::open(&db_path).unwrap();
+            let conn = store.connection().unwrap();
+            conn.query(
+                "CREATE (:Symbol {id: 'marker::survived', name: 'survived', kind: 'function', \
+                 file: 'marker.rs', start_line: 0, end_line: 0, signature_hash: '', \
+                 language: 'rust', visibility: 'public', parent: '', docstring: '', \
+                 complexity: 0, parameters: '', return_type: ''})",
+            )
+            .unwrap();
+        }
+        let valid_bytes = std::fs::read(&db_path).unwrap();
+
+        // Corrupt the file so the first open attempt fails, then heal it
+        // shortly after -- well within init()'s 300ms retry delay -- to
+        // simulate a concurrent writer that was mid-checkpoint.
+        std::fs::write(&db_path, b"not a valid kuzu database file at all").unwrap();
+        let healer_path = db_path.clone();
+        let healer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            std::fs::write(&healer_path, &valid_bytes).unwrap();
+        });
+
+        let registry = LanguageRegistry::new();
+        let mut ig = Infigraph::open(root, registry).unwrap();
+        let result = ig.init();
+        healer.join().unwrap();
+
+        assert!(
+            result.is_ok(),
+            "init() should recover once the transient failure heals: {result:?}"
+        );
+
+        let backend = ig.backend().unwrap();
+        let rows = backend
+            .raw_query("MATCH (s:Symbol) WHERE s.id = 'marker::survived' RETURN s.id")
+            .unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "the pre-existing graph must survive a transient failure -- no wipe should occur"
+        );
+    }
+
+    /// A single fixed-delay retry isn't enough for a slower concurrent writer
+    /// (e.g. a large SCIP import still mid-checkpoint). Heal at ~600ms --
+    /// past where a lone 300ms retry would already have given up and wiped,
+    /// but within OPEN_RETRY_BACKOFF_MS's cumulative 200+500=700ms window --
+    /// to prove the backoff schedule covers slower recoveries too.
+    #[test]
+    fn init_recovers_from_slower_transient_failure_via_backoff() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        let db_path = root.join(".infigraph").join("graph");
+
+        {
+            let store = GraphStore::open(&db_path).unwrap();
+            let conn = store.connection().unwrap();
+            conn.query(
+                "CREATE (:Symbol {id: 'marker::slow-heal', name: 'slow_heal', kind: 'function', \
+                 file: 'marker.rs', start_line: 0, end_line: 0, signature_hash: '', \
+                 language: 'rust', visibility: 'public', parent: '', docstring: '', \
+                 complexity: 0, parameters: '', return_type: ''})",
+            )
+            .unwrap();
+        }
+        let valid_bytes = std::fs::read(&db_path).unwrap();
+
+        std::fs::write(&db_path, b"not a valid kuzu database file at all").unwrap();
+        let healer_path = db_path.clone();
+        let healer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(600));
+            std::fs::write(&healer_path, &valid_bytes).unwrap();
+        });
+
+        let registry = LanguageRegistry::new();
+        let mut ig = Infigraph::open(root, registry).unwrap();
+        let result = ig.init();
+        healer.join().unwrap();
+
+        assert!(
+            result.is_ok(),
+            "init() should recover via the backoff schedule: {result:?}"
+        );
+
+        let backend = ig.backend().unwrap();
+        let rows = backend
+            .raw_query("MATCH (s:Symbol) WHERE s.id = 'marker::slow-heal' RETURN s.id")
+            .unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "a slower-but-still-transient failure must not be wiped either"
+        );
+    }
+
+    /// Companion to the test above: if the open failure is *not* transient
+    /// (the file is durably corrupt, not just briefly unreadable), init()
+    /// must still recover by wiping and rebuilding rather than looping
+    /// forever or erroring out permanently.
+    #[test]
+    fn init_wipes_and_rebuilds_on_persistent_corruption() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        let db_path = root.join(".infigraph").join("graph");
+
+        {
+            let store = GraphStore::open(&db_path).unwrap();
+            let conn = store.connection().unwrap();
+            conn.query(
+                "CREATE (:Symbol {id: 'marker::wiped', name: 'wiped', kind: 'function', \
+                 file: 'marker.rs', start_line: 0, end_line: 0, signature_hash: '', \
+                 language: 'rust', visibility: 'public', parent: '', docstring: '', \
+                 complexity: 0, parameters: '', return_type: ''})",
+            )
+            .unwrap();
+        }
+        // Corrupt permanently -- nothing heals this one.
+        std::fs::write(&db_path, b"not a valid kuzu database file at all").unwrap();
+
+        let registry = LanguageRegistry::new();
+        let mut ig = Infigraph::open(root, registry).unwrap();
+        let result = ig.init();
+
+        assert!(
+            result.is_ok(),
+            "init() must recover from persistent corruption via wipe+rebuild: {result:?}"
+        );
+        let backend = ig.backend().unwrap();
+        let rows = backend
+            .raw_query("MATCH (s:Symbol) WHERE s.id = 'marker::wiped' RETURN s.id")
+            .unwrap();
+        assert_eq!(
+            rows.len(),
+            0,
+            "persistent corruption should have been wiped, not silently ignored"
         );
     }
 }
