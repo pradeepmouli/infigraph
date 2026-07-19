@@ -10,16 +10,19 @@
   (identifier) @method.name) @method.def
 
 ; Class interface declarations
+; class_interface has no "name" field (its grammar rule injects the
+; identifier positionally, right after @interface) -- name: (identifier)
+; never matched anything, so no class symbols were ever extracted.
 (class_interface
-  name: (identifier) @class.name) @class.def
+  (identifier) @class.name) @class.def
 
-; Class implementation
+; Class implementation (same field-less structure as class_interface)
 (class_implementation
-  name: (identifier) @class.name) @class.def
+  (identifier) @class.name) @class.def
 
-; Protocol declarations
+; Protocol declarations (same field-less structure)
 (protocol_declaration
-  name: (identifier) @class.name) @class.def
+  (identifier) @class.name) @class.def
 
 ; Category interface (ObjC categories use class_interface with category field)
 ; Captured by the class_interface rule above
