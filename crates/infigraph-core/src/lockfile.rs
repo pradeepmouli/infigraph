@@ -155,11 +155,11 @@ pub fn try_acquire(path: &Path, role: &str) -> Result<Option<LockFile>> {
 }
 
 /// Blocking acquisition with a wait budget. Polls `try_acquire` with
-/// backoff (50ms doubling to a 500ms cap). On expiry returns a `Busy`
+/// backoff (1ms doubling to a 500ms cap). On expiry returns a `Busy`
 /// error carrying the holder identity when the payload is readable.
 pub fn acquire(path: &Path, role: &str, timeout: Duration) -> Result<LockFile> {
     let start = Instant::now();
-    let mut delay = Duration::from_millis(50);
+    let mut delay = Duration::from_millis(1);
     loop {
         if let Some(guard) = try_acquire(path, role)? {
             return Ok(guard);
