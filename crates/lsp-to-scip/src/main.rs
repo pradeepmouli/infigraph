@@ -495,7 +495,6 @@ fn parse_symbol(v: &serde_json::Value) -> Option<LspSymbol> {
 
     // DocumentSymbol has range + selectionRange
     // SymbolInformation has location.range
-    #[allow(clippy::question_mark)]
     let (range, sel_range) = if let Some(r) = v.get("range") {
         let range = parse_range(r)?;
         let sel = v
@@ -503,11 +502,10 @@ fn parse_symbol(v: &serde_json::Value) -> Option<LspSymbol> {
             .and_then(parse_range)
             .unwrap_or(range.clone());
         (range, sel)
-    } else if let Some(loc) = v.get("location") {
+    } else {
+        let loc = v.get("location")?;
         let range = parse_range(&loc["range"])?;
         (range.clone(), range)
-    } else {
-        return None;
     };
 
     Some(LspSymbol {
