@@ -13,6 +13,7 @@ pub mod extract;
 pub mod graph;
 pub mod lang;
 pub mod learned;
+pub mod lockfile;
 pub mod manifest;
 pub mod meta;
 pub mod model;
