@@ -416,13 +416,12 @@ pub fn format_table(report: &VulnReport) -> String {
         } else {
             f.summary.clone()
         };
-        #[allow(clippy::useless_borrows_in_formatting)]
         out.push_str(&format!(
             "  {:<20} {:<12} {:<18} {:<10} {}\n",
             truncate_str(&f.dep_name, 20),
             truncate_str(&f.dep_version, 12),
             truncate_str(&f.vuln_id, 18),
-            &f.severity,
+            f.severity,
             summary_truncated,
         ));
     }
