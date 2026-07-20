@@ -48,6 +48,12 @@ pub(crate) fn escape_str(s: &str) -> String {
     s.replace('\\', "\\\\").replace('\'', "\\'")
 }
 
+/// Short git SHA this binary was built from ("-dirty" when the tree had
+/// uncommitted changes; "unknown" outside a git checkout). Stamped into
+/// lock-file identity payloads so stale-binary holders are identifiable.
+pub fn build_hash() -> &'static str {
+    env!("INFIGRAPH_BUILD_HASH")
+}
 /// The main entry point for the infigraph framework.
 pub struct Infigraph {
     root: PathBuf,
