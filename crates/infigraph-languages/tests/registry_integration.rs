@@ -159,9 +159,12 @@ fn test_extraction_rust_impl_trait_produces_inherits_edge() {
         .expect("extraction should succeed");
 
     assert!(
-        extraction.relations.iter().any(|r| r.kind == RelationKind::Inherits
-            && r.source_id.contains("Person")
-            && r.target_id.contains("Greet")),
+        extraction
+            .relations
+            .iter()
+            .any(|r| r.kind == RelationKind::Inherits
+                && r.source_id.contains("Person")
+                && r.target_id.contains("Greet")),
         "expected an INHERITS edge from Person to Greet, got: {:?}",
         extraction.relations
     );
@@ -214,9 +217,21 @@ fn test_extraction_typescript_inheritance_produces_edges() {
         })
     };
 
-    assert!(has_edge("Dog", "Animal"), "class extends: {:?}", extraction.relations);
-    assert!(has_edge("Circle", "Shape"), "interface extends: {:?}", extraction.relations);
-    assert!(has_edge("Square", "Drawable"), "class implements: {:?}", extraction.relations);
+    assert!(
+        has_edge("Dog", "Animal"),
+        "class extends: {:?}",
+        extraction.relations
+    );
+    assert!(
+        has_edge("Circle", "Shape"),
+        "interface extends: {:?}",
+        extraction.relations
+    );
+    assert!(
+        has_edge("Square", "Drawable"),
+        "class implements: {:?}",
+        extraction.relations
+    );
 }
 
 #[test]
