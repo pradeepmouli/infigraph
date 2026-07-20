@@ -38,7 +38,10 @@ case "$tool" in
     ;;
   Bash)
     cmd=$(echo "$input" | jq -r '.tool_input.command // empty')
-    if echo "$cmd" | grep -qE '(^|\s|/)(grep|egrep|fgrep|rg|ripgrep|ag|ack)(\s|$)'; then
+    # Strip grep-like invocations fed via a pipe (filtering another command's output,
+    # e.g. `docker ps | grep foo`) — those aren't code search and shouldn't be blocked.
+    cmd_no_piped_grep=$(echo "$cmd" | sed -E 's/\|[[:space:]]*(grep|egrep|fgrep|rg|ripgrep|ag|ack)([[:space:]][^|]*)?//g')
+    if echo "$cmd_no_piped_grep" | grep -qE '(^|\s|/)(grep|egrep|fgrep|rg|ripgrep|ag|ack)(\s|$)'; then
       deny "BLOCKED: Use mcp__infigraph__search instead of grep/rg."
     fi
     if echo "$cmd" | grep -qE '(^|\s)find\s.*-name\s'; then
