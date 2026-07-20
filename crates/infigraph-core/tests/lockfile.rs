@@ -133,3 +133,54 @@ fn test_stale_payload_without_flock_is_adopted() {
     let holder = lockfile::read_holder(&path).unwrap();
     assert_eq!(holder.role, "adopter");
 }
+
+#[test]
+fn test_acquire_waits_then_succeeds() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("e.lock");
+    let guard = lockfile::try_acquire(&path, "short-holder").unwrap().expect("free");
+    let path2 = path.clone();
+    let t = std::thread::spawn(move || {
+        // Holder releases after 200ms; waiter has a 5s budget.
+        std::thread::sleep(Duration::from_millis(200));
+        drop(guard);
+    });
+    let acquired = lockfile::acquire(&path2, "waiter", Duration::from_secs(5)).unwrap();
+    t.join().unwrap();
+    assert_eq!(lockfile::read_holder(&path2).unwrap().role, "waiter");
+    drop(acquired);
+}
+
+#[test]
+fn test_acquire_times_out_with_busy_naming_holder() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("f.lock");
+    let _guard = lockfile::try_acquire(&path, "long-holder").unwrap().expect("free");
+    let err = lockfile::acquire(&path, "impatient", Duration::from_millis(300))
+        .expect_err("must time out while held");
+    let busy = err.downcast_ref::<Busy>().expect("error must be Busy");
+    let holder = busy.holder.as_ref().expect("holder identity readable");
+    assert_eq!(holder.role, "long-holder");
+    assert_eq!(holder.pid, std::process::id());
+    assert!(busy.waited >= Duration::from_millis(300));
+}
+
+#[test]
+fn test_acquire_timeout_unknown_holder_on_bare_flock() {
+    // Old-binary compatibility: flock held but no payload (pre-identity
+    // binaries never write one). Must time out as unknown holder, never break.
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("g.lock");
+    let bare = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&path)
+        .unwrap();
+    fs2::FileExt::lock_exclusive(&bare).unwrap();
+    let err = lockfile::acquire(&path, "modern", Duration::from_millis(200))
+        .expect_err("must time out");
+    let busy = err.downcast_ref::<Busy>().expect("error must be Busy");
+    assert!(busy.holder.is_none(), "bare flock has unknown holder");
+    fs2::FileExt::unlock(&bare).unwrap();
+}

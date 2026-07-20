@@ -12,7 +12,7 @@
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use fs2::FileExt;
@@ -82,6 +82,7 @@ impl std::error::Error for Busy {}
 
 /// RAII guard for a held lock file. Releasing (drop) truncates the payload
 /// then unlocks, so a cleanly-released lock file is empty.
+#[derive(Debug)]
 pub struct LockFile {
     file: File,
     path: PathBuf,
@@ -150,5 +151,28 @@ pub fn try_acquire(path: &Path, role: &str) -> Result<Option<LockFile>> {
             Ok(None)
         }
         Err(e) => Err(anyhow::anyhow!("lock error on {}: {e}", path.display())),
+    }
+}
+
+/// Blocking acquisition with a wait budget. Polls `try_acquire` with
+/// backoff (50ms doubling to a 500ms cap). On expiry returns a `Busy`
+/// error carrying the holder identity when the payload is readable.
+pub fn acquire(path: &Path, role: &str, timeout: Duration) -> Result<LockFile> {
+    let start = Instant::now();
+    let mut delay = Duration::from_millis(50);
+    loop {
+        if let Some(guard) = try_acquire(path, role)? {
+            return Ok(guard);
+        }
+        if start.elapsed() >= timeout {
+            return Err(anyhow::Error::new(Busy {
+                lock_path: path.to_path_buf(),
+                holder: read_holder(path),
+                waited: start.elapsed(),
+            }));
+        }
+        let remaining = timeout.saturating_sub(start.elapsed());
+        std::thread::sleep(delay.min(remaining));
+        delay = (delay * 2).min(Duration::from_millis(500));
     }
 }
