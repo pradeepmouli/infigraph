@@ -34,12 +34,18 @@ impl LockInfo {
             pid: std::process::id(),
             role: role.to_string(),
             build_hash: crate::build_hash().to_string(),
-            acquired_at: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0),
+            acquired_at: now_epoch_secs(),
         }
     }
+}
+
+/// Current time as Unix epoch seconds. Falls back to 0 on a clock error
+/// (e.g. system time before the epoch) rather than panicking.
+fn now_epoch_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Returned when a lock could not be acquired within the wait budget.
@@ -54,10 +60,7 @@ impl std::fmt::Display for Busy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.holder {
             Some(h) => {
-                let held_for = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_secs().saturating_sub(h.acquired_at))
-                    .unwrap_or(0);
+                let held_for = now_epoch_secs().saturating_sub(h.acquired_at);
                 write!(
                     f,
                     "{} is locked by {} (PID {}), held {}s — waited {}s, giving up",
