@@ -495,6 +495,7 @@ fn parse_symbol(v: &serde_json::Value) -> Option<LspSymbol> {
 
     // DocumentSymbol has range + selectionRange
     // SymbolInformation has location.range
+    #[allow(clippy::question_mark)]
     let (range, sel_range) = if let Some(r) = v.get("range") {
         let range = parse_range(r)?;
         let sel = v

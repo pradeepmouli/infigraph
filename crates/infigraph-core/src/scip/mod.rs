@@ -601,7 +601,9 @@ mod tests {
             documents: vec![doc],
             ..Default::default()
         };
-        index.write_to_bytes().expect("serialize synthetic SCIP index")
+        index
+            .write_to_bytes()
+            .expect("serialize synthetic SCIP index")
     }
 
     struct TestEnv {
