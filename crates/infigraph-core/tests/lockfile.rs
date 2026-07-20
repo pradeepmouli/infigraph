@@ -1,7 +1,9 @@
 use infigraph_core::build_hash;
+use infigraph_core::lockfile;
 use infigraph_core::lockfile::{Busy, LockInfo};
 use std::path::PathBuf;
 use std::time::Duration;
+use tempfile::TempDir;
 
 #[test]
 fn test_build_hash_is_nonempty() {
@@ -17,7 +19,10 @@ fn test_lockinfo_current_and_roundtrip() {
     assert_eq!(info.pid, std::process::id());
     assert_eq!(info.role, "test-role");
     assert_eq!(info.build_hash, build_hash());
-    assert!(info.acquired_at > 1_700_000_000, "acquired_at should be epoch seconds");
+    assert!(
+        info.acquired_at > 1_700_000_000,
+        "acquired_at should be epoch seconds"
+    );
 
     let json = serde_json::to_string(&info).unwrap();
     let back: LockInfo = serde_json::from_str(&json).unwrap();
@@ -38,8 +43,14 @@ fn test_busy_display_names_holder() {
         waited: Duration::from_secs(30),
     };
     let msg = busy.to_string();
-    assert!(msg.contains("4242"), "message should name holder pid: {msg}");
-    assert!(msg.contains("infigraph watch"), "message should name role: {msg}");
+    assert!(
+        msg.contains("4242"),
+        "message should name holder pid: {msg}"
+    );
+    assert!(
+        msg.contains("infigraph watch"),
+        "message should name role: {msg}"
+    );
     assert!(msg.contains("30"), "message should mention wait: {msg}");
 }
 
@@ -51,5 +62,74 @@ fn test_busy_display_unknown_holder() {
         waited: Duration::from_secs(5),
     };
     let msg = busy.to_string();
-    assert!(msg.contains("unknown"), "unknown holder should be stated: {msg}");
+    assert!(
+        msg.contains("unknown"),
+        "unknown holder should be stated: {msg}"
+    );
+}
+
+#[test]
+fn test_try_acquire_stamps_identity() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("a.lock");
+    let guard = lockfile::try_acquire(&path, "unit-test")
+        .unwrap()
+        .expect("free lock");
+    let holder = lockfile::read_holder(&path).expect("payload written");
+    assert_eq!(holder.pid, std::process::id());
+    assert_eq!(holder.role, "unit-test");
+    assert_eq!(holder.build_hash, build_hash());
+    drop(guard);
+}
+
+#[test]
+fn test_try_acquire_none_when_held() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("b.lock");
+    let _guard = lockfile::try_acquire(&path, "first")
+        .unwrap()
+        .expect("free lock");
+    let second = lockfile::try_acquire(&path, "second").unwrap();
+    assert!(
+        second.is_none(),
+        "second handle must not acquire a held lock"
+    );
+}
+
+#[test]
+fn test_release_clears_payload_and_reacquire_works() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("c.lock");
+    {
+        let _guard = lockfile::try_acquire(&path, "first")
+            .unwrap()
+            .expect("free lock");
+    }
+    // After clean release the payload is cleared (empty file), and the lock is free.
+    assert!(
+        lockfile::read_holder(&path).is_none(),
+        "payload should clear on drop"
+    );
+    let again = lockfile::try_acquire(&path, "second").unwrap();
+    assert!(again.is_some(), "lock should be reacquirable after drop");
+}
+
+#[test]
+fn test_stale_payload_without_flock_is_adopted() {
+    // Simulates a holder that died without cleanup (kernel released the
+    // flock; stale JSON remains). Acquisition must succeed and overwrite.
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("d.lock");
+    std::fs::write(
+        &path,
+        r#"{"pid":999999,"role":"dead","build_hash":"x","acquired_at":1}"#,
+    )
+    .unwrap();
+    let guard = lockfile::try_acquire(&path, "adopter").unwrap();
+    assert!(
+        guard.is_some(),
+        "free flock with stale payload must be adopted"
+    );
+    let holder = lockfile::read_holder(&path).unwrap();
+    assert_eq!(holder.role, "adopter");
 }
