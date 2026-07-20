@@ -9,9 +9,13 @@
 //! a held flock with an unreadable payload is an *unknown holder* —
 //! bounded-wait then `Busy`, never broken.
 
-use std::path::PathBuf;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use anyhow::Result;
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
 /// Identity payload stamped into a held lock file.
@@ -75,3 +79,76 @@ impl std::fmt::Display for Busy {
 }
 
 impl std::error::Error for Busy {}
+
+/// RAII guard for a held lock file. Releasing (drop) truncates the payload
+/// then unlocks, so a cleanly-released lock file is empty.
+pub struct LockFile {
+    file: File,
+    path: PathBuf,
+}
+
+impl LockFile {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for LockFile {
+    fn drop(&mut self) {
+        // Best-effort: clear payload before the flock releases so readers
+        // never see a stale identity on a free lock we released cleanly.
+        let _ = self.file.set_len(0);
+        let _ = fs2::FileExt::unlock(&self.file);
+    }
+}
+
+fn open_lock_file(path: &Path) -> Result<File> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    Ok(std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(path)?)
+}
+
+fn stamp(file: &mut File, role: &str) -> Result<()> {
+    let info = LockInfo::current(role);
+    let json = serde_json::to_string(&info)?;
+    file.set_len(0)?;
+    file.seek(SeekFrom::Start(0))?;
+    file.write_all(json.as_bytes())?;
+    file.flush()?;
+    Ok(())
+}
+
+/// Best-effort read of the current holder's identity. `None` when the file
+/// is missing, empty, or unparseable (old binary / mid-write).
+pub fn read_holder(path: &Path) -> Option<LockInfo> {
+    let mut buf = String::new();
+    File::open(path).ok()?.read_to_string(&mut buf).ok()?;
+    serde_json::from_str(buf.trim()).ok()
+}
+
+/// Non-blocking acquisition. `Ok(None)` when another open file description
+/// holds the flock. On success the identity payload is stamped.
+pub fn try_acquire(path: &Path, role: &str) -> Result<Option<LockFile>> {
+    let mut file = open_lock_file(path)?;
+    match file.try_lock_exclusive() {
+        Ok(()) => {
+            stamp(&mut file, role)?;
+            Ok(Some(LockFile {
+                file,
+                path: path.to_path_buf(),
+            }))
+        }
+        Err(ref e)
+            if e.kind() == std::io::ErrorKind::WouldBlock || e.raw_os_error() == Some(33) =>
+        {
+            Ok(None)
+        }
+        Err(e) => Err(anyhow::anyhow!("lock error on {}: {e}", path.display())),
+    }
+}
