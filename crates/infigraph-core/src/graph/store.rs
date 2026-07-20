@@ -2,51 +2,39 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
-use fs2::FileExt;
 use kuzu::{Connection, Database, SystemConfig};
 
 use super::schema::{CREATE_SCHEMA, MIGRATIONS};
 use super::store_util::escape;
+use crate::lockfile::{self, LockFile};
 
 /// RAII guard for exclusive write access to the graph store.
-/// Holds an advisory file lock on `<db_path>.lock`.
+/// Holds an advisory file lock on `<db_path>.lock` with an identity
+/// payload (see `crate::lockfile`).
+#[derive(Debug)]
 pub struct WriteLock {
-    _file: std::fs::File,
+    _guard: LockFile,
 }
+
+/// Role string stamped into the graph write lock's identity payload.
+const GRAPH_WRITE_ROLE: &str = "graph-write";
+
+/// Default wait budget for the graph write lock. Individual write calls
+/// are short; 30s of waiting means something is wedged — surface it.
+const GRAPH_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl WriteLock {
     fn acquire(lock_path: &Path) -> Result<Self> {
-        if let Some(parent) = lock_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(false)
-            .open(lock_path)?;
-        file.lock_exclusive()
-            .map_err(|e| anyhow::anyhow!("failed to acquire write lock: {e}"))?;
-        Ok(Self { _file: file })
+        Self::acquire_with_timeout(lock_path, GRAPH_WRITE_TIMEOUT)
+    }
+
+    fn acquire_with_timeout(lock_path: &Path, timeout: std::time::Duration) -> Result<Self> {
+        let guard = lockfile::acquire(lock_path, GRAPH_WRITE_ROLE, timeout)?;
+        Ok(Self { _guard: guard })
     }
 
     fn try_acquire(lock_path: &Path) -> Result<Option<Self>> {
-        if let Some(parent) = lock_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(false)
-            .open(lock_path)?;
-        match file.try_lock_exclusive() {
-            Ok(()) => Ok(Some(Self { _file: file })),
-            Err(ref e)
-                if e.kind() == std::io::ErrorKind::WouldBlock || e.raw_os_error() == Some(33) =>
-            {
-                Ok(None)
-            }
-            Err(e) => Err(anyhow::anyhow!("lock error: {e}")),
-        }
+        Ok(lockfile::try_acquire(lock_path, GRAPH_WRITE_ROLE)?.map(|guard| Self { _guard: guard }))
     }
 }
 
@@ -82,9 +70,15 @@ impl GraphStore {
         Ok(Self { db, lock_path })
     }
 
-    /// Acquire exclusive write lock. Blocks until available.
+    /// Acquire exclusive write lock. Waits up to 30s, returning `Busy` if
+    /// still held at expiry.
     pub fn write_lock(&self) -> Result<WriteLock> {
         WriteLock::acquire(&self.lock_path)
+    }
+
+    /// Acquire the write lock with a caller-chosen wait budget.
+    pub fn write_lock_with_timeout(&self, timeout: std::time::Duration) -> Result<WriteLock> {
+        WriteLock::acquire_with_timeout(&self.lock_path, timeout)
     }
 
     /// Try to acquire write lock without blocking. Returns None if already held.

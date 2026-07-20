@@ -125,3 +125,29 @@ fn test_write_lock_different_stores_same_path() {
 
     drop(file1);
 }
+
+#[test]
+fn test_write_lock_stamps_identity_and_busy_on_timeout() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("identity.db");
+    let store = GraphStore::open(&db_path).unwrap();
+
+    let _held = store.write_lock().unwrap();
+    let holder = infigraph_core::lockfile::read_holder(&db_path.with_extension("lock"))
+        .expect("write lock should stamp identity");
+    assert_eq!(holder.pid, std::process::id());
+    assert_eq!(holder.role, "graph-write");
+
+    // A second store on the same path must time out with Busy, not hang.
+    let store2 = GraphStore::open(&db_path); // may fail: kuzu holds its own db lock
+    if let Ok(store2) = store2 {
+        let err = store2
+            .write_lock_with_timeout(std::time::Duration::from_millis(300))
+            .expect_err("held lock must yield Busy");
+        assert!(
+            err.downcast_ref::<infigraph_core::lockfile::Busy>()
+                .is_some(),
+            "expected Busy, got: {err}"
+        );
+    }
+}
