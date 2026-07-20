@@ -211,9 +211,12 @@ fn test_extraction_go_struct_embedding_produces_inherits_edge() {
         .expect("extraction should succeed");
 
     assert!(
-        extraction.relations.iter().any(|r| r.kind == RelationKind::Inherits
-            && r.source_id.contains("Dog")
-            && r.target_id.contains("Animal")),
+        extraction
+            .relations
+            .iter()
+            .any(|r| r.kind == RelationKind::Inherits
+                && r.source_id.contains("Dog")
+                && r.target_id.contains("Animal")),
         "expected an INHERITS edge from Dog to Animal (embedded field), got: {:?}",
         extraction.relations
     );
@@ -227,7 +230,8 @@ fn test_extraction_kotlin_inheritance_produces_edges() {
     let registry = bundled_registry().unwrap();
     let pack = registry.for_extension(".kt").unwrap();
 
-    let source = b"open class Animal\nclass Dog : Animal()\n\ninterface Shape\nclass Circle : Shape\n";
+    let source =
+        b"open class Animal\nclass Dog : Animal()\n\ninterface Shape\nclass Circle : Shape\n";
     let extraction = infigraph_core::extract::extract_file("Test.kt", source, pack)
         .expect("extraction should succeed");
 
@@ -239,8 +243,16 @@ fn test_extraction_kotlin_inheritance_produces_edges() {
         })
     };
 
-    assert!(has_edge("Dog", "Animal"), "class inheritance: {:?}", extraction.relations);
-    assert!(has_edge("Circle", "Shape"), "interface implementation: {:?}", extraction.relations);
+    assert!(
+        has_edge("Dog", "Animal"),
+        "class inheritance: {:?}",
+        extraction.relations
+    );
+    assert!(
+        has_edge("Circle", "Shape"),
+        "interface implementation: {:?}",
+        extraction.relations
+    );
 }
 
 /// Regression test: swift/relations.scm had no inheritance capture at all.
@@ -251,7 +263,8 @@ fn test_extraction_swift_inheritance_produces_edges() {
     let registry = bundled_registry().unwrap();
     let pack = registry.for_extension(".swift").unwrap();
 
-    let source = b"class Animal {}\nclass Dog: Animal {}\n\nprotocol Shape {}\nprotocol Circle: Shape {}\n";
+    let source =
+        b"class Animal {}\nclass Dog: Animal {}\n\nprotocol Shape {}\nprotocol Circle: Shape {}\n";
     let extraction = infigraph_core::extract::extract_file("Test.swift", source, pack)
         .expect("extraction should succeed");
 
@@ -263,8 +276,16 @@ fn test_extraction_swift_inheritance_produces_edges() {
         })
     };
 
-    assert!(has_edge("Dog", "Animal"), "class inheritance: {:?}", extraction.relations);
-    assert!(has_edge("Circle", "Shape"), "protocol inheritance: {:?}", extraction.relations);
+    assert!(
+        has_edge("Dog", "Animal"),
+        "class inheritance: {:?}",
+        extraction.relations
+    );
+    assert!(
+        has_edge("Circle", "Shape"),
+        "protocol inheritance: {:?}",
+        extraction.relations
+    );
 }
 
 /// Regression test: dart/relations.scm had no inheritance capture at all.
@@ -287,8 +308,16 @@ fn test_extraction_dart_inheritance_produces_edges() {
         })
     };
 
-    assert!(has_edge("Dog", "Animal"), "class extends: {:?}", extraction.relations);
-    assert!(has_edge("Square", "Drawable"), "class implements: {:?}", extraction.relations);
+    assert!(
+        has_edge("Dog", "Animal"),
+        "class extends: {:?}",
+        extraction.relations
+    );
+    assert!(
+        has_edge("Square", "Drawable"),
+        "class implements: {:?}",
+        extraction.relations
+    );
 }
 
 /// Regression test: objc/relations.scm had no inheritance capture, AND
@@ -310,13 +339,19 @@ fn test_extraction_objc_produces_symbols_and_inherits_edge() {
         .expect("extraction should succeed");
 
     let names: Vec<&str> = extraction.symbols.iter().map(|s| s.name.as_str()).collect();
-    assert!(names.contains(&"Animal"), "should extract Animal: {names:?}");
+    assert!(
+        names.contains(&"Animal"),
+        "should extract Animal: {names:?}"
+    );
     assert!(names.contains(&"Dog"), "should extract Dog: {names:?}");
 
     assert!(
-        extraction.relations.iter().any(|r| r.kind == RelationKind::Inherits
-            && r.source_id.contains("Dog")
-            && r.target_id.contains("Animal")),
+        extraction
+            .relations
+            .iter()
+            .any(|r| r.kind == RelationKind::Inherits
+                && r.source_id.contains("Dog")
+                && r.target_id.contains("Animal")),
         "expected an INHERITS edge from Dog to Animal, got: {:?}",
         extraction.relations
     );
