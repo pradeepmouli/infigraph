@@ -28,6 +28,16 @@ fn wipe_code_and_docs_with_timeout(root: &Path, timeout: Duration) -> anyhow::Re
         let _ = std::fs::remove_dir_all(&graph_path);
     }
     let _ = std::fs::remove_file(ig.join("graph.wal"));
+    // Also remove Kuzu's WAL-family temp siblings (e.g. graph.wal.checkpoint):
+    // one left behind carries the old database's ID and permanently blocks
+    // opening a freshly rebuilt graph.
+    if let Ok(entries) = std::fs::read_dir(&ig) {
+        for e in entries.flatten() {
+            if e.file_name().to_string_lossy().starts_with("graph.wal.") {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
 
     if let Ok(mut idx) = infigraph_docs::DocIndex::open(root) {
         let _ = idx.clean();
