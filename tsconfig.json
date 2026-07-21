@@ -1,0 +1,15 @@
+{
+  "exclude": [
+    "target/**",
+    "build/**",
+    "dist/**",
+    "out/**",
+    "vendor/**",
+    "obj/**",
+    "generated/**",
+    "third_party/**",
+    "**/CMakeFiles/**",
+    "models/**",
+    "node_modules/**"
+  ]
+}

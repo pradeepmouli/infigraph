@@ -1,0 +1,11 @@
+target/        # Rust build output
+build/         # build output (Gradle, CMake, etc.)
+dist/          # distribution bundles
+out/           # compiler/IDE output
+vendor/        # vendored dependencies (Go, Ruby)
+bin/           # compiled binaries
+obj/           # intermediate build objects (.NET, C++)
+generated/     # auto-generated code
+third_party/   # third-party source copies
+CMakeFiles/    # CMake internal files
+models/        # downloaded ML model weights (Model2Vec, etc.) — binary data, not source
