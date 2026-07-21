@@ -194,7 +194,8 @@ fn setup_graph() -> TestGraph {
     ];
     {
         let conn = store.connection().unwrap();
-        store.upsert_all_bulk(&conn, &extractions).unwrap();
+        let lock = store.write_lock().unwrap();
+        store.upsert_all_bulk(&conn, &extractions, &lock).unwrap();
     }
     TestGraph {
         _dir: dir,
@@ -256,7 +257,8 @@ fn test_cluster_isolated_symbols() {
     }];
     {
         let conn = store.connection().unwrap();
-        store.upsert_all_bulk(&conn, &extractions).unwrap();
+        let lock = store.write_lock().unwrap();
+        store.upsert_all_bulk(&conn, &extractions, &lock).unwrap();
     }
     let backend = KuzuBackend::from_store(store);
     let stats = infigraph_core::cluster::detect_clusters(&backend).unwrap();

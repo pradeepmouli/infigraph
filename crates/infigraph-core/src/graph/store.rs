@@ -104,13 +104,17 @@ impl GraphStore {
 
     /// Remove all graph data for a deleted file.
     pub fn remove_file(&self, file: &str) -> Result<()> {
-        let _lock = self.write_lock()?;
+        let lock = self.write_lock()?;
         let conn = self.connection()?;
-        self.remove_file_conn(&conn, file)
+        self.remove_file_conn(&conn, file, &lock)
     }
 
-    /// Caller must hold WriteLock.
-    pub fn remove_file_conn(&self, conn: &Connection<'_>, file: &str) -> Result<()> {
+    pub fn remove_file_conn(
+        &self,
+        conn: &Connection<'_>,
+        file: &str,
+        _witness: &WriteLock,
+    ) -> Result<()> {
         let _ = conn.query(&format!(
             "MATCH (f:File)-[:DEFINES]->(s:Symbol)-[:HAS_STATEMENT]->(st:Statement) WHERE f.id = '{}' DETACH DELETE st",
             escape(file)
@@ -132,7 +136,7 @@ impl GraphStore {
 
     /// Remove all files whose path starts with the given prefix (handles directory removal).
     pub fn remove_files_by_prefix(&self, prefix: &str) -> Result<usize> {
-        let _lock = self.write_lock()?;
+        let lock = self.write_lock()?;
         let conn = self.connection()?;
         let escaped = escape(prefix);
         let result = conn
@@ -147,7 +151,7 @@ impl GraphStore {
             }
         }
         for f in &files {
-            self.remove_file_conn(&conn, f)?;
+            self.remove_file_conn(&conn, f, &lock)?;
         }
         Ok(files.len())
     }

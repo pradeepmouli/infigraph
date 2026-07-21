@@ -225,9 +225,9 @@ fn test_upsert_all_bulk_throughput() {
     let (_dir, store) = make_store();
     let conn = store.connection().unwrap();
 
-    let _lock = store.write_lock().unwrap();
+    let lock = store.write_lock().unwrap();
     let start = Instant::now();
-    store.upsert_all_bulk(&conn, &extractions).unwrap();
+    store.upsert_all_bulk(&conn, &extractions, &lock).unwrap();
     let elapsed = start.elapsed();
 
     let per_file = elapsed / 50;

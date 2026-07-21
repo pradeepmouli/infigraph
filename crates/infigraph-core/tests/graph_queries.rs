@@ -241,8 +241,9 @@ fn setup() -> TestGraph {
     let tg = TestGraph::new();
     {
         let conn = tg.store.connection().expect("connection");
+        let lock = tg.store.write_lock().expect("lock");
         tg.store
-            .upsert_all_bulk(&conn, &fixture_extractions())
+            .upsert_all_bulk(&conn, &fixture_extractions(), &lock)
             .expect("bulk insert");
     }
     tg
@@ -918,8 +919,9 @@ fn test_upsert_folders_bulk() {
     let tg = TestGraph::new();
     {
         let conn = tg.store.connection().unwrap();
+        let lock = tg.store.write_lock().unwrap();
         tg.store
-            .upsert_all_bulk(&conn, &fixture_extractions())
+            .upsert_all_bulk(&conn, &fixture_extractions(), &lock)
             .unwrap();
     }
     let file_paths: Vec<&str> = vec![
@@ -996,7 +998,11 @@ fn test_bulk_vs_single_write_equivalence() {
     let tg_bulk = TestGraph::new();
     {
         let conn = tg_bulk.store.connection().unwrap();
-        tg_bulk.store.upsert_all_bulk(&conn, &extractions).unwrap();
+        let lock = tg_bulk.store.write_lock().unwrap();
+        tg_bulk
+            .store
+            .upsert_all_bulk(&conn, &extractions, &lock)
+            .unwrap();
     }
 
     let tg_single = TestGraph::new();
@@ -1070,7 +1076,10 @@ fn test_upsert_file_conn_direct() {
     };
 
     let conn = tg.store.connection().unwrap();
-    tg.store.upsert_file_conn(&conn, &extraction).unwrap();
+    let lock = tg.store.write_lock().unwrap();
+    tg.store
+        .upsert_file_conn(&conn, &extraction, &lock)
+        .unwrap();
 
     let q = GraphQuery::new(&conn);
     let rows = q.symbols_in_file("conn_test.py").unwrap();
@@ -1086,6 +1095,7 @@ fn test_upsert_file_conn_direct() {
 fn test_upsert_file_conn_overwrites_old_data() {
     let tg = TestGraph::new();
     let conn = tg.store.connection().unwrap();
+    let lock = tg.store.write_lock().unwrap();
 
     let v1 = FileExtraction {
         file: "evolve.py".to_string(),
@@ -1102,7 +1112,7 @@ fn test_upsert_file_conn_overwrites_old_data() {
         relations: vec![],
         statements: vec![],
     };
-    tg.store.upsert_file_conn(&conn, &v1).unwrap();
+    tg.store.upsert_file_conn(&conn, &v1, &lock).unwrap();
 
     let q = GraphQuery::new(&conn);
     assert_eq!(q.symbols_in_file("evolve.py").unwrap().len(), 1);
@@ -1133,7 +1143,7 @@ fn test_upsert_file_conn_overwrites_old_data() {
         relations: vec![],
         statements: vec![],
     };
-    tg.store.upsert_file_conn(&conn, &v2).unwrap();
+    tg.store.upsert_file_conn(&conn, &v2, &lock).unwrap();
 
     let rows = q.symbols_in_file("evolve.py").unwrap();
     assert_eq!(rows.len(), 2, "should have 2 new symbols");
@@ -1147,6 +1157,7 @@ fn test_upsert_file_conn_overwrites_old_data() {
 fn test_upsert_file_conn_no_delete_accumulates() {
     let tg = TestGraph::new();
     let conn = tg.store.connection().unwrap();
+    let lock = tg.store.write_lock().unwrap();
 
     let e1 = FileExtraction {
         file: "accum.py".to_string(),
@@ -1163,7 +1174,9 @@ fn test_upsert_file_conn_no_delete_accumulates() {
         relations: vec![],
         statements: vec![],
     };
-    tg.store.upsert_file_conn_no_delete(&conn, &e1).unwrap();
+    tg.store
+        .upsert_file_conn_no_delete(&conn, &e1, &lock)
+        .unwrap();
 
     let q = GraphQuery::new(&conn);
     assert_eq!(q.symbols_in_file("accum.py").unwrap().len(), 1);
@@ -1185,7 +1198,9 @@ fn test_upsert_file_conn_no_delete_accumulates() {
         relations: vec![],
         statements: vec![],
     };
-    tg.store.upsert_file_conn_no_delete(&conn, &e2).unwrap();
+    tg.store
+        .upsert_file_conn_no_delete(&conn, &e2, &lock)
+        .unwrap();
 
     // Both files should have their symbols
     assert_eq!(q.symbols_in_file("accum.py").unwrap().len(), 1);
@@ -1199,12 +1214,14 @@ fn test_upsert_folders_bulk_conn_direct() {
     let tg = TestGraph::new();
     {
         let conn = tg.store.connection().unwrap();
+        let lock = tg.store.write_lock().unwrap();
         tg.store
-            .upsert_all_bulk(&conn, &fixture_extractions())
+            .upsert_all_bulk(&conn, &fixture_extractions(), &lock)
             .unwrap();
     }
 
     let conn = tg.store.connection().unwrap();
+    let lock = tg.store.write_lock().unwrap();
     let paths: Vec<&str> = vec![
         "src/main.py",
         "src/lib.py",
@@ -1212,7 +1229,9 @@ fn test_upsert_folders_bulk_conn_direct() {
         "tests/test_main.py",
         "src/deep/nested/file.py",
     ];
-    tg.store.upsert_folders_bulk_conn(&conn, &paths).unwrap();
+    tg.store
+        .upsert_folders_bulk_conn(&conn, &paths, &lock)
+        .unwrap();
 
     let q = GraphQuery::new(&conn);
     let folders = q
@@ -1266,7 +1285,8 @@ fn test_upsert_empty_extraction() {
 fn test_bulk_empty_extractions() {
     let tg = TestGraph::new();
     let conn = tg.store.connection().unwrap();
-    tg.store.upsert_all_bulk(&conn, &[]).unwrap();
+    let lock = tg.store.write_lock().unwrap();
+    tg.store.upsert_all_bulk(&conn, &[], &lock).unwrap();
     let stats = tg.store.stats().unwrap();
     assert_eq!(stats.symbols, 0);
     assert_eq!(stats.modules, 0);
@@ -1606,7 +1626,10 @@ fn test_skeleton_output_format() {
     };
     {
         let conn = tg.store.connection().unwrap();
-        tg.store.upsert_all_bulk(&conn, &[extraction]).unwrap();
+        let lock = tg.store.write_lock().unwrap();
+        tg.store
+            .upsert_all_bulk(&conn, &[extraction], &lock)
+            .unwrap();
     }
 
     let conn = tg.store.connection().unwrap();
@@ -1652,7 +1675,10 @@ fn test_skeleton_nesting_from_statements() {
     };
     {
         let conn = tg.store.connection().unwrap();
-        tg.store.upsert_all_bulk(&conn, &[extraction]).unwrap();
+        let lock = tg.store.write_lock().unwrap();
+        tg.store
+            .upsert_all_bulk(&conn, &[extraction], &lock)
+            .unwrap();
     }
 
     let conn = tg.store.connection().unwrap();
@@ -1709,7 +1735,10 @@ fn test_skeleton_fan_in_count() {
     };
     {
         let conn = tg.store.connection().unwrap();
-        tg.store.upsert_all_bulk(&conn, &[extraction]).unwrap();
+        let lock = tg.store.write_lock().unwrap();
+        tg.store
+            .upsert_all_bulk(&conn, &[extraction], &lock)
+            .unwrap();
     }
 
     let conn = tg.store.connection().unwrap();
@@ -1760,7 +1789,10 @@ fn test_skeleton_class_members_indented() {
     };
     {
         let conn = tg.store.connection().unwrap();
-        tg.store.upsert_all_bulk(&conn, &[extraction]).unwrap();
+        let lock = tg.store.write_lock().unwrap();
+        tg.store
+            .upsert_all_bulk(&conn, &[extraction], &lock)
+            .unwrap();
     }
 
     let conn = tg.store.connection().unwrap();
@@ -1804,7 +1836,10 @@ fn test_skeleton_no_annotations_on_class() {
     };
     {
         let conn = tg.store.connection().unwrap();
-        tg.store.upsert_all_bulk(&conn, &[extraction]).unwrap();
+        let lock = tg.store.write_lock().unwrap();
+        tg.store
+            .upsert_all_bulk(&conn, &[extraction], &lock)
+            .unwrap();
     }
 
     let conn = tg.store.connection().unwrap();
@@ -1855,7 +1890,10 @@ fn test_skeleton_visibility_prefix() {
     };
     {
         let conn = tg.store.connection().unwrap();
-        tg.store.upsert_all_bulk(&conn, &[extraction]).unwrap();
+        let lock = tg.store.write_lock().unwrap();
+        tg.store
+            .upsert_all_bulk(&conn, &[extraction], &lock)
+            .unwrap();
     }
 
     let conn = tg.store.connection().unwrap();
@@ -1879,7 +1917,11 @@ fn test_parquet_vs_bulk_write_equivalence() {
     let tg_bulk = TestGraph::new();
     {
         let conn = tg_bulk.store.connection().unwrap();
-        tg_bulk.store.upsert_all_bulk(&conn, &extractions).unwrap();
+        let lock = tg_bulk.store.write_lock().unwrap();
+        tg_bulk
+            .store
+            .upsert_all_bulk(&conn, &extractions, &lock)
+            .unwrap();
     }
 
     let stats_pq = tg_parquet.store.stats().unwrap();
