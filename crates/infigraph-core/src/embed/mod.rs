@@ -383,22 +383,30 @@ pub fn embedding_count(root: &Path) -> usize {
     u32::from_le_bytes(buf4) as usize
 }
 
-/// Save symbol embeddings to a binary file.
-/// Format: [count:u32] then for each entry: [id_len:u32][id_bytes][dim:u32][f32 * dim]
+/// Save symbol embeddings to a binary file. Format: [count:u32] then for each entry: [id_len:u32][id_bytes][dim:u32][f32 * dim]
 pub fn save_embeddings(path: &Path, embeddings: &[(String, Vec<f32>)]) -> Result<()> {
-    let file = std::fs::File::create(path).context("create embeddings file")?;
-    let mut w = BufWriter::new(file);
-    w.write_all(&(embeddings.len() as u32).to_le_bytes())?;
-    for (id, vec) in embeddings {
-        let id_bytes = id.as_bytes();
-        w.write_all(&(id_bytes.len() as u32).to_le_bytes())?;
-        w.write_all(id_bytes)?;
-        w.write_all(&(vec.len() as u32).to_le_bytes())?;
-        for &v in vec {
-            w.write_all(&v.to_le_bytes())?;
+    let tmp_path = path.with_file_name(format!(
+        "{}.tmp",
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("embeddings.bin")
+    ));
+    {
+        let file = std::fs::File::create(&tmp_path).context("create temp embeddings file")?;
+        let mut w = BufWriter::new(file);
+        w.write_all(&(embeddings.len() as u32).to_le_bytes())?;
+        for (id, vec) in embeddings {
+            let id_bytes = id.as_bytes();
+            w.write_all(&(id_bytes.len() as u32).to_le_bytes())?;
+            w.write_all(id_bytes)?;
+            w.write_all(&(vec.len() as u32).to_le_bytes())?;
+            for &v in vec {
+                w.write_all(&v.to_le_bytes())?;
+            }
         }
+        w.flush().context("flush temp embeddings file")?;
     }
-    drop(w);
+    std::fs::rename(&tmp_path, path).context("atomically replace embeddings file")?;
     invalidate_embeddings_cache();
     Ok(())
 }
