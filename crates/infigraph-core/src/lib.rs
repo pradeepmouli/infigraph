@@ -13,6 +13,7 @@ pub mod extract;
 pub mod graph;
 pub mod lang;
 pub mod learned;
+pub mod lockfile;
 pub mod manifest;
 pub mod meta;
 pub mod model;
@@ -46,6 +47,13 @@ use model::FileExtraction;
 
 pub(crate) fn escape_str(s: &str) -> String {
     s.replace('\\', "\\\\").replace('\'', "\\'")
+}
+
+/// Short git SHA this binary was built from ("-dirty" when the tree had
+/// uncommitted changes; "unknown" outside a git checkout). Stamped into
+/// lock-file identity payloads so stale-binary holders are identifiable.
+pub fn build_hash() -> &'static str {
+    env!("INFIGRAPH_BUILD_HASH")
 }
 
 /// Kuzu's IO-layer error for "another process holds this database's lock"
