@@ -1,5 +1,6 @@
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Context, Result};
@@ -307,11 +308,39 @@ impl EmbedProvider for Model2VecEmbedder {
 static CODE_EMBEDDER: OnceLock<Arc<dyn EmbedProvider>> = OnceLock::new();
 static DOC_EMBEDDER: OnceLock<Arc<dyn EmbedProvider>> = OnceLock::new();
 
+/// Below this many embeddings, brute-force rayon dot-product beats HNSW
+/// (index load + search overhead). Shared by the index build gate, search,
+/// and the health footer's "HNSW missing" check.
+pub const HNSW_THRESHOLD: usize = 200_000;
+
+/// Process-wide latch: set when embedder construction fell back to trigram
+/// hashing because Model2Vec was unavailable. Read by the MCP health footer.
+static TRIGRAM_FALLBACK: AtomicBool = AtomicBool::new(false);
+
+/// Record that an embedder was constructed on the trigram fallback path.
+pub fn note_trigram_fallback() {
+    TRIGRAM_FALLBACK.store(true, Ordering::Relaxed);
+}
+
+pub fn trigram_fallback_active() -> bool {
+    TRIGRAM_FALLBACK.load(Ordering::Relaxed)
+}
+
+/// True when this project is above the HNSW threshold but the sidecar index
+/// file is missing — vector search is silently on a linear scan that no
+/// longer pays off at this scale. Below the threshold a missing index is by
+/// design, not degradation.
+pub fn hnsw_expected_but_missing(root: &Path) -> bool {
+    let hnsw = root.join(".infigraph").join("hnsw_index.usearch");
+    !hnsw.exists() && embedding_count(root) >= HNSW_THRESHOLD
+}
+
 /// Factory: select Model2Vec if available, otherwise fall back to TrigramEmbedder.
 pub fn init_embedder() -> Arc<dyn EmbedProvider> {
     match Model2VecEmbedder::new() {
         Ok(m) => Arc::new(m),
         Err(e) => {
+            note_trigram_fallback();
             eprintln!("warning: Model2Vec unavailable ({e}), using trigram fallback");
             Arc::new(TrigramEmbedder::default())
         }
@@ -333,6 +362,7 @@ pub fn best_embedder() -> Box<dyn EmbedProvider> {
     match Model2VecEmbedder::new() {
         Ok(m) => Box::new(m),
         Err(e) => {
+            note_trigram_fallback();
             eprintln!("warning: Model2Vec unavailable ({e}), using trigram fallback");
             Box::new(TrigramEmbedder::default())
         }
@@ -482,10 +512,8 @@ pub fn update_embeddings(
     let count = symbol_embeddings.len();
     save_embeddings(&emb_path, &symbol_embeddings)?;
 
-    // Below 200K symbols, brute-force rayon dot-product is faster than HNSW.
     // Build/rebuild HNSW only when above threshold OR when an existing index
     // needs to stay current after incremental updates.
-    const HNSW_THRESHOLD: usize = 200_000;
     let hnsw_path = root.join(".infigraph").join("hnsw_index.usearch");
     let should_build = count >= HNSW_THRESHOLD || hnsw_path.exists();
     if should_build {
