@@ -360,10 +360,38 @@ fn run() -> Result<()> {
 
     mcp_log("INFO", "stdin loop exited");
 
-    // If UI mode is active, keep process alive after stdin EOF (web server still serving)
+    // Reaching here means the MCP client's stdio connection closed — the
+    // two OTHER "loop forever" branches earlier in this function (pure
+    // --ui-only, pure --serve-only, neither with --mcp) return before ever
+    // entering the stdin read loop, since they never had a stdio client to
+    // begin with; they are legitimate standing daemons and are untouched
+    // by this block. If --ui is also active, someone might still have the
+    // local web UI open, so don't exit instantly — but don't loop forever
+    // either (DESIGN-hardening.md I-5 / R2.2.3): self-terminate after an
+    // idle grace period.
     if ui_enabled {
+        let grace = infigraph_mcp::idle::idle_grace_period();
+        let poll = infigraph_mcp::idle::idle_poll_interval();
+        mcp_log(
+            "INFO",
+            &format!(
+                "MCP client disconnected; UI still serving — exiting after {}s idle unless reconnected",
+                grace.as_secs()
+            ),
+        );
+        let stdin_closed_at = std::time::Instant::now();
         loop {
-            std::thread::sleep(std::time::Duration::from_secs(3600));
+            std::thread::sleep(poll);
+            if infigraph_mcp::idle::should_exit_idle(stdin_closed_at.elapsed(), grace) {
+                mcp_log(
+                    "INFO",
+                    &format!(
+                        "Idle grace period ({}s) elapsed since MCP client disconnected — exiting",
+                        grace.as_secs()
+                    ),
+                );
+                break;
+            }
         }
     }
 
