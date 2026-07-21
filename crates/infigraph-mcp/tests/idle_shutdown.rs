@@ -43,13 +43,17 @@ fn worker_exits_after_idle_grace_following_stdin_close() {
 /// pure --ui-only invocation (no --mcp flag) never enters the stdin read
 /// loop at all — it's a legitimate standing daemon with no stdio client to
 /// ever disconnect from, and must NOT be affected by the idle-grace logic
-/// even though the same INFIGRAPH_MCP_IDLE_* env vars are set.
+/// even though the same INFIGRAPH_MCP_IDLE_* env vars are set. The sleep
+/// window must clear process startup overhead (instance-lock acquisition,
+/// rayon threadpool init, TCP bind — observed up to ~3.5s on a loaded
+/// machine) plus the grace period plus one poll cycle with real margin, or
+/// the test can report "still running" for the wrong reason.
 #[test]
 fn ui_only_daemon_without_mcp_flag_is_unaffected_by_idle_grace() {
     let exe = env!("CARGO_BIN_EXE_infigraph-mcp");
     let mut child = Command::new(exe)
         .args(["--worker", "--ui", "--port=0"])
-        .env("INFIGRAPH_MCP_IDLE_GRACE_SECS", "1")
+        .env("INFIGRAPH_MCP_IDLE_GRACE_SECS", "2")
         .env("INFIGRAPH_MCP_IDLE_POLL_SECS", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -57,7 +61,7 @@ fn ui_only_daemon_without_mcp_flag_is_unaffected_by_idle_grace() {
         .spawn()
         .expect("spawn infigraph-mcp");
 
-    std::thread::sleep(Duration::from_secs(3));
+    std::thread::sleep(Duration::from_secs(8));
     let status = child.try_wait().expect("try_wait");
     assert!(
         status.is_none(),
