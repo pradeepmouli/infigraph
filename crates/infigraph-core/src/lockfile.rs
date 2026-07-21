@@ -83,6 +83,54 @@ impl std::fmt::Display for Busy {
 
 impl std::error::Error for Busy {}
 
+/// A lock acquisition that succeeded only after waiting longer than the
+/// slow-wait threshold. The caller saw success, so without this record the
+/// contention would be invisible; the MCP health footer drains these to
+/// report "lock contention while serving this call".
+#[derive(Debug, Clone)]
+pub struct SlowWait {
+    pub lock_path: PathBuf,
+    pub waited: Duration,
+}
+
+static SLOW_WAITS: std::sync::Mutex<Vec<SlowWait>> = std::sync::Mutex::new(Vec::new());
+
+/// Cap on buffered events between drains — processes that never drain
+/// (the CLI) must not grow this without bound.
+const SLOW_WAITS_CAP: usize = 16;
+
+/// Threshold above which a successful-but-slow acquisition is recorded.
+/// Milliseconds, overridable via `INFIGRAPH_SLOW_LOCK_MS` (tests).
+pub fn slow_wait_threshold() -> Duration {
+    std::env::var("INFIGRAPH_SLOW_LOCK_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(Duration::from_secs(2))
+}
+
+fn record_slow_wait(path: &Path, waited: Duration) {
+    if waited < slow_wait_threshold() {
+        return;
+    }
+    if let Ok(mut buf) = SLOW_WAITS.lock() {
+        if buf.len() < SLOW_WAITS_CAP {
+            buf.push(SlowWait {
+                lock_path: path.to_path_buf(),
+                waited,
+            });
+        }
+    }
+}
+
+/// Drain all slow-wait events recorded since the previous drain.
+pub fn take_slow_waits() -> Vec<SlowWait> {
+    SLOW_WAITS
+        .lock()
+        .map(|mut b| std::mem::take(&mut *b))
+        .unwrap_or_default()
+}
+
 /// RAII guard for a held lock file. Releasing (drop) truncates the payload
 /// then unlocks, so a cleanly-released lock file is empty.
 #[derive(Debug)]
@@ -165,6 +213,7 @@ pub fn acquire(path: &Path, role: &str, timeout: Duration) -> Result<LockFile> {
     let mut delay = Duration::from_millis(1);
     loop {
         if let Some(guard) = try_acquire(path, role)? {
+            record_slow_wait(path, start.elapsed());
             return Ok(guard);
         }
         if start.elapsed() >= timeout {

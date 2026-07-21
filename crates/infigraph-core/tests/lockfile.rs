@@ -188,3 +188,55 @@ fn test_acquire_timeout_unknown_holder_on_bare_flock() {
     assert!(busy.holder.is_none(), "bare flock has unknown holder");
     fs2::FileExt::unlock(&bare).unwrap();
 }
+
+#[test]
+fn test_slow_wait_recorded_and_drained() {
+    // Edition 2021: set_var is safe. 50ms threshold keeps the test fast;
+    // other tests in this binary never successfully acquire after a
+    // >50ms contended wait (contended tests end in Busy, which must NOT
+    // record), so cross-test interference is limited to extra entries we
+    // filter out by path.
+    std::env::set_var("INFIGRAPH_SLOW_LOCK_MS", "50");
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("slow.lock");
+
+    let held = lockfile::try_acquire(&path, "holder").unwrap().unwrap();
+    let path2 = path.clone();
+    let waiter = std::thread::spawn(move || {
+        lockfile::acquire(&path2, "waiter", std::time::Duration::from_secs(5)).unwrap()
+    });
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    drop(held);
+    let _guard = waiter.join().unwrap();
+
+    let waits = lockfile::take_slow_waits();
+    assert!(
+        waits
+            .iter()
+            .any(|w| w.lock_path == path && w.waited >= std::time::Duration::from_millis(50)),
+        "expected a recorded slow wait for {}, got {waits:?}",
+        path.display()
+    );
+    // Drained: our path must not appear again.
+    assert!(
+        lockfile::take_slow_waits()
+            .iter()
+            .all(|w| w.lock_path != path),
+        "take_slow_waits must drain recorded events"
+    );
+    std::env::remove_var("INFIGRAPH_SLOW_LOCK_MS");
+}
+
+#[test]
+fn test_fast_acquire_records_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("fast.lock");
+    let g = lockfile::acquire(&path, "solo", std::time::Duration::from_secs(1)).unwrap();
+    drop(g);
+    assert!(
+        lockfile::take_slow_waits()
+            .iter()
+            .all(|w| w.lock_path != path),
+        "uncontended acquire must not record a slow wait"
+    );
+}
