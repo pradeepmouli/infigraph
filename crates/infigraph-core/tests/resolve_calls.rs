@@ -80,7 +80,8 @@ impl TestEnv {
         let store = GraphStore::open(&dir.path().join("graph")).unwrap();
         {
             let conn = store.connection().unwrap();
-            store.upsert_all_bulk(&conn, extractions).unwrap();
+            let lock = store.write_lock().unwrap();
+            store.upsert_all_bulk(&conn, extractions, &lock).unwrap();
         }
         Self { _dir: dir, store }
     }
@@ -337,7 +338,8 @@ fn test_resolve_incremental_uses_full_graph() {
     }];
     {
         let conn = env.store.connection().unwrap();
-        env.store.upsert_all_bulk(&conn, &new_files).unwrap();
+        let lock = env.store.write_lock().unwrap();
+        env.store.upsert_all_bulk(&conn, &new_files, &lock).unwrap();
     }
 
     // resolve_calls_incremental uses get_all_symbols() from the full graph

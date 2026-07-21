@@ -412,7 +412,7 @@ impl GraphBackend for KuzuBackend {
             return Ok(());
         }
 
-        let _write_lock = self.store.write_lock()?;
+        let write_lock = self.store.write_lock()?;
 
         let use_csv = existing_hashes_empty || extractions.len() > 100;
 
@@ -427,7 +427,8 @@ impl GraphBackend for KuzuBackend {
                     .context("failed to commit delete transaction")?;
             }
             let conn = self.store.connection()?;
-            self.store.upsert_all_parquet_conn(&conn, extractions)?;
+            self.store
+                .upsert_all_parquet_conn(&conn, extractions, &write_lock)?;
         } else {
             // Per-file UNWIND path for small incremental updates
             let conn = self.store.connection()?;
@@ -435,7 +436,8 @@ impl GraphBackend for KuzuBackend {
                 .context("failed to begin index transaction")?;
             self.delete_files_data(&conn, extractions)?;
             for extraction in extractions {
-                self.store.upsert_file_conn_no_delete(&conn, extraction)?;
+                self.store
+                    .upsert_file_conn_no_delete(&conn, extraction, &write_lock)?;
             }
             conn.query("COMMIT")
                 .context("failed to commit index transaction")?;
@@ -444,7 +446,8 @@ impl GraphBackend for KuzuBackend {
         // Upsert folder hierarchy
         let file_paths: Vec<&str> = extractions.iter().map(|e| e.file.as_str()).collect();
         let conn = self.store.connection()?;
-        self.store.upsert_folders_bulk_conn(&conn, &file_paths)?;
+        self.store
+            .upsert_folders_bulk_conn(&conn, &file_paths, &write_lock)?;
 
         Ok(())
     }

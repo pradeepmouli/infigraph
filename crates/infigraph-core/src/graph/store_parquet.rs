@@ -7,7 +7,7 @@ use arrow::datatypes::DataType;
 use kuzu::Connection;
 
 use super::parquet_loader;
-use super::store::GraphStore;
+use super::store::{GraphStore, WriteLock};
 use super::store_util::{escape, fwd_slash_path, unwind_edges_from_pairs};
 use crate::model::{FileExtraction, RelationKind};
 
@@ -24,16 +24,16 @@ impl GraphStore {
     /// Create Folder nodes and edges for a set of file paths in bulk.
     /// More efficient than per-file upsert_folder_hierarchy calls.
     pub fn upsert_folders_bulk(&self, file_paths: &[&str]) -> Result<()> {
-        let _lock = self.write_lock()?;
+        let lock = self.write_lock()?;
         let conn = self.connection()?;
-        self.upsert_folders_bulk_conn(&conn, file_paths)
+        self.upsert_folders_bulk_conn(&conn, file_paths, &lock)
     }
 
-    /// Caller must hold WriteLock.
     pub fn upsert_folders_bulk_conn(
         &self,
         conn: &Connection<'_>,
         file_paths: &[&str],
+        _witness: &WriteLock,
     ) -> Result<()> {
         let mut all_folders: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         for file_path in file_paths {
@@ -185,16 +185,16 @@ impl GraphStore {
         if extractions.is_empty() {
             return Ok(());
         }
-        let _lock = self.write_lock()?;
+        let lock = self.write_lock()?;
         let conn = self.connection()?;
-        self.upsert_all_parquet_conn(&conn, extractions)
+        self.upsert_all_parquet_conn(&conn, extractions, &lock)
     }
 
-    /// Caller must hold WriteLock.
     pub fn upsert_all_parquet_conn(
         &self,
         conn: &Connection<'_>,
         extractions: &[FileExtraction],
+        _witness: &WriteLock,
     ) -> Result<()> {
         if extractions.is_empty() {
             return Ok(());
