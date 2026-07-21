@@ -119,7 +119,10 @@ fn reindex_path(cli_path: &std::path::Path, path: &std::path::Path) {
     let path_str = path.to_string_lossy().to_string();
     mcp_log("INFO", &format!("Auto-reindexing: {path_str}"));
 
-    infigraph_mcp::recovery::wipe_code_and_docs(path);
+    if let Err(e) = infigraph_mcp::recovery::wipe_code_and_docs(path) {
+        mcp_log("ERROR", &format!("Reindex wipe skipped: {path_str}: {e:#}"));
+        return;
+    }
 
     let result = std::process::Command::new(cli_path)
         .arg("index")
