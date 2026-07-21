@@ -86,12 +86,12 @@ fn phase2_compression_eval() {
         run_task(
             "E1",
             "get_doc_context",
-            json!({"path": p, "symbol_id": "crates/infigraph-mcp/src/lib.rs::dispatch_tool"}),
+            json!({"path": p, "symbol_id": "crates/infigraph-core/src/embed/mod.rs::update_embeddings"}),
         ),
         run_task(
             "E3",
             "get_doc_context",
-            json!({"path": p, "symbol_id": "crates/infigraph-mcp/src/tools/search.rs::tool_search"}),
+            json!({"path": p, "symbol_id": "crates/infigraph-core/src/watch/mod.rs::watch_project_auto_resolve"}),
         ),
         run_task(
             "E4",
@@ -101,7 +101,7 @@ fn phase2_compression_eval() {
         run_task(
             "E5",
             "get_doc_context",
-            json!({"path": p, "symbol_id": "crates/infigraph-mcp/src/tools/index.rs::tool_index_project"}),
+            json!({"path": p, "symbol_id": "crates/infigraph-cli/src/index.rs::auto_scip_background"}),
         ),
         run_task(
             "R2",
