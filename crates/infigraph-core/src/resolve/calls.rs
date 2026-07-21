@@ -30,6 +30,9 @@ pub fn resolve_calls_incremental(
         });
     }
 
+    // Lock scope is intentionally wide: the symbol-map read below must be
+    // snapshotted under the same lock as the edge writes that use it, or a
+    // concurrent writer could invalidate the map between read and write.
     let lock = store.write_lock()?;
     let conn = store.connection()?;
 
@@ -60,6 +63,9 @@ pub fn resolve_calls(
     extractions: &[FileExtraction],
     learned_store: Option<&LearnedStore>,
 ) -> Result<ResolveStats> {
+    // Lock scope is intentionally wide: the symbol-map read below must be
+    // snapshotted under the same lock as the edge writes that use it, or a
+    // concurrent writer could invalidate the map between read and write.
     let lock = store.write_lock()?;
     let conn = store.connection()?;
 
@@ -411,6 +417,9 @@ pub fn re_resolve_for_files(
         });
     }
 
+    // Lock scope is intentionally wide: the symbol-map read below must be
+    // snapshotted under the same lock as the edge writes that use it, or a
+    // concurrent writer could invalidate the map between read and write.
     let lock = store.write_lock()?;
     let conn = store.connection()?;
 
