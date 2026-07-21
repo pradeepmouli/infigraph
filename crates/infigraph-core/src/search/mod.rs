@@ -221,10 +221,7 @@ pub fn compute_raw_scores(
 
     let query_embedding = embedder.embed(query)?;
 
-    // HNSW only pays off above ~200K embeddings where brute-force exceeds index
-    // load + search time. Below that, rayon dot-product is faster.
-    const HNSW_THRESHOLD: usize = 200_000;
-    let use_hnsw = symbol_embeddings.len() >= HNSW_THRESHOLD;
+    let use_hnsw = symbol_embeddings.len() >= embed::HNSW_THRESHOLD;
     let vec_scores = if use_hnsw {
         if let (Some(idx_path), Some(emb_path)) = (hnsw_index_path, embeddings_path) {
             match embed::search_hnsw(idx_path, emb_path, &query_embedding, oversample) {
