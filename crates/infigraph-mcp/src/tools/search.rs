@@ -107,7 +107,7 @@ fn get_or_build_search_ctx(args: &Value) -> Result<CachedSearchData> {
     }
 
     let (rows, symbol_embeddings) = if is_remote {
-        get_search_data_remote()?
+        get_search_data_remote(&path)?
     } else {
         get_search_data_local(args, &path)?
     };
@@ -175,17 +175,32 @@ fn get_search_data_local(args: &Value, path: &str) -> Result<SearchData> {
 }
 
 #[allow(unused)]
-fn get_search_data_remote() -> Result<SearchData> {
+fn get_search_data_remote(path: &str) -> Result<SearchData> {
     #[cfg(feature = "remote")]
     {
         use infigraph_core::graph::{GraphBackend, Neo4jBackend};
         use infigraph_core::meta::PostgresMetaStore;
 
-        let backend = Neo4jBackend::connect_from_env()?;
+        // Scope to the repo this path resolves to (org/repo from the group registry).
+        // Without this, remote search loads EVERY repo's symbols + embeddings from the
+        // shared graph and returns cross-project results.
+        let ns = infigraph_core::multi::Registry::load()
+            .ok()
+            .and_then(|reg| reg.resolve_repo_namespace(std::path::Path::new(path)));
+
+        let mut backend = Neo4jBackend::connect_from_env()?;
+        if let Some(ref ns) = ns {
+            backend.set_repo_filter(ns);
+        }
         let rows = backend.get_symbols_for_search()?;
 
         let pg = PostgresMetaStore::connect_from_env_cached()?;
-        let symbol_embeddings = pg.all_embeddings("symbol")?;
+        let mut symbol_embeddings = pg.all_embeddings("symbol")?;
+        if let Some(ref ns) = ns {
+            // Embedding ids are namespaced symbol ids (org/repo/file::sym); keep only this repo's.
+            let prefix = format!("{ns}/");
+            symbol_embeddings.retain(|(id, _)| id.starts_with(&prefix));
+        }
 
         Ok((rows, symbol_embeddings))
     }

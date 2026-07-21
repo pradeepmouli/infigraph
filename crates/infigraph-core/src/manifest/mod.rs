@@ -63,8 +63,19 @@ pub fn index_manifests(root: &Path, backend: &dyn GraphBackend) -> Result<Vec<Ma
 
 /// Query dependencies stored in graph for a project.
 pub fn query_deps(backend: &dyn GraphBackend) -> Result<Vec<DepEntry>> {
-    let q = "MATCH (d:Dependency) RETURN d.name, d.version, d.ecosystem, d.is_dev ORDER BY d.ecosystem, d.name";
-    let rows = backend.raw_query(q)?;
+    // Dependency nodes are shared globally (id = ecosystem::name, no repo attribution),
+    // so in shared-graph mode scope through this repo's Modules via DEPENDS_ON. Module
+    // `file` ids are namespaced (`org/repo/...`), which is how we isolate the repo.
+    let q = if let Some(repo) = backend.repo_filter() {
+        let r = crate::escape_str(repo);
+        format!(
+            "MATCH (m:Module)-[:DEPENDS_ON]->(d:Dependency) WHERE m.file STARTS WITH '{r}/' \
+             RETURN DISTINCT d.name, d.version, d.ecosystem, d.is_dev ORDER BY d.ecosystem, d.name"
+        )
+    } else {
+        "MATCH (d:Dependency) RETURN d.name, d.version, d.ecosystem, d.is_dev ORDER BY d.ecosystem, d.name".to_string()
+    };
+    let rows = backend.raw_query(&q)?;
 
     let mut deps = Vec::new();
     for row in &rows {
@@ -739,13 +750,27 @@ fn store_manifest(backend: &dyn GraphBackend, result: &ManifestResult) -> Result
             let _ = backend.raw_query(&update);
         }
 
-        let rel = format!(
-            "MATCH (m:Module), (d:Dependency) WHERE m.file CONTAINS '{}' AND d.id = '{}' \
-             CREATE (m)-[:DEPENDS_ON {{is_dev: {}}}]->(d)",
-            escape(result.manifest_file.rsplit('/').next().unwrap_or("")),
-            escape(&id),
-            dep.is_dev
-        );
+        // Scope the DEPENDS_ON edge to THIS repo's modules. Without the repo guard,
+        // `m.file CONTAINS 'pyproject.toml'` matches every repo's manifest module in a
+        // shared graph, cross-linking one repo's deps onto all others.
+        let manifest_base = escape(result.manifest_file.rsplit('/').next().unwrap_or(""));
+        let rel = if let Some(repo) = backend.repo_filter() {
+            let r = escape(repo);
+            format!(
+                "MATCH (m:Module), (d:Dependency) \
+                 WHERE m.file STARTS WITH '{r}/' AND m.file CONTAINS '{manifest_base}' AND d.id = '{}' \
+                 CREATE (m)-[:DEPENDS_ON {{is_dev: {}}}]->(d)",
+                escape(&id),
+                dep.is_dev
+            )
+        } else {
+            format!(
+                "MATCH (m:Module), (d:Dependency) WHERE m.file CONTAINS '{manifest_base}' AND d.id = '{}' \
+                 CREATE (m)-[:DEPENDS_ON {{is_dev: {}}}]->(d)",
+                escape(&id),
+                dep.is_dev
+            )
+        };
         let _ = backend.raw_query(&rel);
     }
     Ok(())

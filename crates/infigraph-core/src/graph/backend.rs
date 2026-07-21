@@ -121,6 +121,13 @@ pub trait GraphBackend: Send + Sync {
         Ok(())
     }
 
+    /// The `org/repo` namespace this backend is scoped to, if any.
+    /// Lets backend-agnostic analysis passes (manifest deps, clusters) scope their
+    /// own Cypher in shared-graph mode. Default: `None` (Kuzu is single-repo).
+    fn repo_filter(&self) -> Option<&str> {
+        None
+    }
+
     // ── Resolve ──────────────────────────────────────────────────────
 
     /// Run call/inheritance resolution for the given extractions.

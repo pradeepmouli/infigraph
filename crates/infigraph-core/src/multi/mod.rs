@@ -888,4 +888,67 @@ mod tests {
         assert_eq!(loaded.org, "");
         assert_eq!(loaded.name, "old-group");
     }
+
+    fn registry_with(org: &str, repo: &str, path: &Path) -> Registry {
+        let mut reg = Registry::default();
+        reg.repos.insert(
+            repo.to_string(),
+            RepoEntry {
+                name: repo.to_string(),
+                path: path.to_path_buf(),
+                languages: vec![],
+                symbol_count: 0,
+                module_count: 0,
+                last_indexed_commit: None,
+            },
+        );
+        let key = qualified_group_name(org, "grp");
+        reg.groups.insert(
+            key,
+            Group {
+                name: "grp".to_string(),
+                org: org.to_string(),
+                repos: vec![repo.to_string()],
+                contracts: vec![],
+            },
+        );
+        reg
+    }
+
+    #[test]
+    fn test_resolve_repo_namespace_uses_group_org() {
+        let dir = std::env::temp_dir().join("ig_ns_test_repo");
+        std::fs::create_dir_all(&dir).unwrap();
+        let reg = registry_with("data-mlplatform", "prismo", &dir);
+        // Resolves from the group's org, NOT from INFIGRAPH_ORG / directory name.
+        assert_eq!(
+            reg.resolve_repo_namespace(&dir).as_deref(),
+            Some("data-mlplatform/prismo")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_resolve_repo_namespace_unregistered_is_none() {
+        let reg = Registry::default();
+        let dir = std::env::temp_dir().join("ig_ns_test_unregistered");
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(reg.resolve_repo_namespace(&dir), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_resolve_group_key_bare_to_org_qualified() {
+        let dir = std::env::temp_dir().join("ig_grpkey_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let reg = registry_with("data-mlplatform", "prismo", &dir);
+        // Group stored as `data-mlplatform/grp`; bare `grp` must resolve to it.
+        assert_eq!(reg.resolve_group_key("grp"), "data-mlplatform/grp");
+        // Already-qualified passes through.
+        assert_eq!(
+            reg.resolve_group_key("data-mlplatform/grp"),
+            "data-mlplatform/grp"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

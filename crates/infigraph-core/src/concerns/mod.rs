@@ -222,22 +222,24 @@ static CONCERN_PATTERNS: &[ConcernPattern] = &[
 ];
 
 pub fn detect_cross_cutting(backend: &dyn GraphBackend) -> Result<Vec<ConcernMatch>> {
-    let result = backend
-        .raw_query("MATCH (s:Symbol) WHERE s.docstring IS NOT NULL AND s.docstring <> '' RETURN s.id, s.docstring")?;
+    // Use the repo-scoped `symbols_with_docstring` accessor instead of a global
+    // `MATCH (s:Symbol)` — in shared-Neo4j mode the latter returns every repo's symbols
+    // and leaks concerns across projects. This honors the backend's repo_filter.
+    let symbols = backend.symbols_with_docstring(None)?;
 
     let mut matches = Vec::new();
 
-    for row in result {
-        if row.len() < 2 {
+    for sym in &symbols {
+        if sym.docstring.is_empty() {
             continue;
         }
-        let symbol_id = row[0].to_string();
-        let docstring = row[1].to_string();
+        let symbol_id = &sym.id;
+        let docstring = &sym.docstring;
 
         for cp in CONCERN_PATTERNS {
             for &pattern in cp.patterns {
                 if docstring.contains(pattern) {
-                    let detail = extract_matched_line(&docstring, pattern);
+                    let detail = extract_matched_line(docstring, pattern);
                     matches.push(ConcernMatch {
                         symbol_id: symbol_id.clone(),
                         kind: cp.kind,

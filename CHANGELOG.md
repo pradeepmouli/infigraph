@@ -7,6 +7,25 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [3.2.4] - 2026-07-21
+
+### Fixed
+
+- Remote (shared-Neo4j) mode: MCP read tools no longer return another project's
+  data or `Symbols: 0`. Read paths that queried the global graph are now scoped
+  to the repo (`org/repo`), resolved from the group registry:
+  - `apply_repo_filter` (MCP reader) resolves the repo namespace from the group
+    registry instead of guessing from `INFIGRAPH_ORG`, fixing `Symbols: 0`
+    (with `Folders`/`Contains` still populated) when the env org didn't match.
+  - `detect_cross_cutting`, `detect_routes`, and `search`/`semantic_search`
+    (remote) now return only the queried repo instead of all repos.
+  - `get_dependencies` is scoped through the repo's own modules, and the
+    `DEPENDS_ON` edge is written only against in-repo modules (previously
+    `m.file CONTAINS 'package.json'` cross-linked every repo's manifest).
+  - `detect_clusters` scopes CALLS edges and symbols to the repo.
+  - `GraphBackend` gains a `repo_filter()` accessor so backend-agnostic analysis
+    passes can scope their own Cypher.
+
 ## [3.2.3] - 2026-07-21
 
 ### Fixed
@@ -22,7 +41,11 @@ Versions follow [Semantic Versioning](https://semver.org/).
     (which stole orphan files across repos) is removed.
   - Group indexing scopes reads to the repo being indexed, so reindexing one
     repo no longer deletes every other repo's data from the shared graph.
-  - Read filters resolve the same `org/repo` key that writes use.
+  - Read filters resolve the same `org/repo` key that writes use, looked up
+    from the group registry (source of truth) rather than derived from
+    `INFIGRAPH_ORG`. Fixes MCP tools reporting `Symbols: 0 / Files: 0` (with
+    globally-counted `Folders`/`Contains` still populated) when the server's
+    `INFIGRAPH_ORG` didn't match the org a repo was indexed under.
   - `BEGIN TRANSACTION`/`COMMIT`/`ROLLBACK` are no-ops on the Neo4j backend
     (valid Kùzu, invalid Cypher), fixing concern/taint/reflection/config/
     dynamic-URL analysis in remote mode.

@@ -506,6 +506,10 @@ fn extract_column_name(expr: &str) -> String {
 }
 
 impl GraphBackend for Neo4jBackend {
+    fn repo_filter(&self) -> Option<&str> {
+        self.repo_filter.as_deref()
+    }
+
     fn stats(&self) -> Result<GraphStats> {
         if let Some(repo) = self.repo_filter() {
             let r = escape(repo);
