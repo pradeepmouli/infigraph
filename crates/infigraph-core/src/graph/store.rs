@@ -47,6 +47,11 @@ pub struct GraphStore {
 impl GraphStore {
     /// Open or create a Kuzu database at the given path.
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_with_lock_timeout(path, GRAPH_WRITE_TIMEOUT)
+    }
+
+    /// Open with a caller-chosen wait budget for the schema-init write lock.
+    pub fn open_with_lock_timeout(path: &Path, timeout: std::time::Duration) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -54,7 +59,9 @@ impl GraphStore {
         let db = Database::new(path, SystemConfig::default())
             .map_err(|e| anyhow::anyhow!("failed to open kuzu db: {e}"))?;
         let store = Self { db, lock_path };
-        store.init_schema()?;
+        let lock = WriteLock::acquire_with_timeout(&store.lock_path, timeout)?;
+        store.init_schema(&lock)?;
+        drop(lock);
         Ok(store)
     }
 
@@ -86,7 +93,7 @@ impl GraphStore {
         WriteLock::try_acquire(&self.lock_path)
     }
 
-    fn init_schema(&self) -> Result<()> {
+    fn init_schema(&self, _witness: &WriteLock) -> Result<()> {
         let conn = self.connection()?;
         for ddl in CREATE_SCHEMA {
             conn.query(ddl)

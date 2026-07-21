@@ -204,3 +204,31 @@ fn test_mixed_read_write_concurrent() {
         stats.files
     );
 }
+
+#[test]
+fn test_open_initializes_schema_under_write_lock() {
+    // Schema DDL is a write: open() must hold the write lock while running it.
+    // Regression shape: open a store, hold its write lock, then open a SECOND
+    // GraphStore on the same path from this process — it must not deadlock
+    // (bounded wait) and must surface Busy rather than running DDL unlocked.
+    let dir = tempfile::TempDir::new().unwrap();
+    let db_path = dir.path().join("locked_open.db");
+    let store = infigraph_core::graph::GraphStore::open(&db_path).unwrap();
+    let _held = store.write_lock().unwrap();
+    let started = std::time::Instant::now();
+    let second = infigraph_core::graph::GraphStore::open_with_lock_timeout(
+        &db_path,
+        std::time::Duration::from_millis(300),
+    );
+    assert!(
+        second.is_err(),
+        "open under a held lock must not run DDL unlocked"
+    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(10));
+    let err = second.err().unwrap();
+    assert!(
+        err.downcast_ref::<infigraph_core::lockfile::Busy>()
+            .is_some(),
+        "expected Busy, got: {err}"
+    );
+}
