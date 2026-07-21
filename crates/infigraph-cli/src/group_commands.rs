@@ -90,6 +90,7 @@ pub(crate) fn cmd_group(root: &Path, action: GroupAction) -> Result<()> {
             }
 
             let mut skipped = 0usize;
+            let mut lock_skipped = 0usize;
             println!("Indexing {} repos in group '{}'...", g.repos.len(), group);
             for repo_name in &g.repos {
                 let entry = registry
@@ -111,6 +112,22 @@ pub(crate) fn cmd_group(root: &Path, action: GroupAction) -> Result<()> {
                         continue;
                     }
                 }
+
+                // Take this member's own index operation lock before
+                // touching its graph — same invariant as `index_group`.
+                let op = infigraph_core::ops::begin_index_op(
+                    &entry.path,
+                    "group index",
+                    std::time::Duration::ZERO,
+                )?;
+                let _op_guard = match op {
+                    infigraph_core::ops::IndexOpOutcome::Acquired(guard) => guard,
+                    o @ infigraph_core::ops::IndexOpOutcome::AlreadyRunning(_) => {
+                        println!("  {}: skipped — {}", repo_name, o.skip_reason().unwrap());
+                        lock_skipped += 1;
+                        continue;
+                    }
+                };
 
                 if full {
                     let tg_dir = entry.path.join(".infigraph");
@@ -155,6 +172,12 @@ pub(crate) fn cmd_group(root: &Path, action: GroupAction) -> Result<()> {
                     skipped
                 );
             }
+            if lock_skipped > 0 {
+                println!(
+                    "  ({} repos skipped — index already in progress)",
+                    lock_skipped
+                );
+            }
             // Auto-start watcher for each repo in group
             for repo_name in &g.repos {
                 if let Some(entry) = registry.repos.get(repo_name) {
@@ -177,16 +200,21 @@ pub(crate) fn cmd_group(root: &Path, action: GroupAction) -> Result<()> {
                 group,
                 g.repos.len()
             );
-            let (symbols, edges) =
-                infigraph_core::multi::combined::build_combined_graph(&registry, &group)?;
-            println!(
-                "Combined graph ready: {} symbols, {} edges (including cross-repo).",
-                symbols, edges
-            );
-            println!(
-                "Query with: infigraph group query {} '<cypher>' --combined",
-                group
-            );
+            match infigraph_core::multi::combined::build_combined_graph(&registry, &group)? {
+                infigraph_core::multi::combined::CombinedBuildOutcome::Built { symbols, edges } => {
+                    println!(
+                        "Combined graph ready: {} symbols, {} edges (including cross-repo).",
+                        symbols, edges
+                    );
+                    println!(
+                        "Query with: infigraph group query {} '<cypher>' --combined",
+                        group
+                    );
+                }
+                infigraph_core::multi::combined::CombinedBuildOutcome::Skipped(note) => {
+                    println!("Skipped combined graph build for '{}' — {}", group, note);
+                }
+            }
         }
         GroupAction::CombinedDocs { group } => {
             let stats = infigraph_docs::combined::build_combined_docs(&registry, &group)?;
@@ -292,8 +320,11 @@ pub(crate) fn cmd_group(root: &Path, action: GroupAction) -> Result<()> {
             let results =
                 infigraph_core::multi::index_group(&mut registry, &group, full, bundled_registry)?;
             println!("=== Step 1/5: Indexed {} repos ===", results.len());
-            for (repo, indexed, total) in &results {
-                println!("  {}: {}/{} files", repo, indexed, total);
+            for (repo, indexed, total, note) in &results {
+                match note {
+                    Some(n) => println!("  {}: skipped — {}", repo, n),
+                    None => println!("  {}: {}/{} files", repo, indexed, total),
+                }
             }
 
             // Step 2: Sync contracts
@@ -335,9 +366,17 @@ pub(crate) fn cmd_group(root: &Path, action: GroupAction) -> Result<()> {
                 );
             } else {
                 println!("=== Step 4/5: Building combined graph ===");
-                let (symbols, edges) =
-                    infigraph_core::multi::combined::build_combined_graph(&registry, &group)?;
-                println!("  {} symbols, {} edges", symbols, edges);
+                match infigraph_core::multi::combined::build_combined_graph(&registry, &group)? {
+                    infigraph_core::multi::combined::CombinedBuildOutcome::Built {
+                        symbols,
+                        edges,
+                    } => {
+                        println!("  {} symbols, {} edges", symbols, edges);
+                    }
+                    infigraph_core::multi::combined::CombinedBuildOutcome::Skipped(note) => {
+                        println!("  skipped — {}", note);
+                    }
+                }
             }
 
             // Step 5: Index docs + embeddings

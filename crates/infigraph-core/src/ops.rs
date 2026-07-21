@@ -41,6 +41,14 @@ impl IndexOpOutcome {
             }
         }
     }
+
+    /// Same reason as `skip_note`, without the trailing "— skipped" suffix —
+    /// for callers that compose their own "skipped" phrasing (e.g. group
+    /// operations reporting one line per member: "repo: skipped — <reason>").
+    pub fn skip_reason(&self) -> Option<String> {
+        self.skip_note()
+            .map(|n| n.trim_end_matches(" — skipped").to_string())
+    }
 }
 
 fn index_lock_path(root: &Path) -> std::path::PathBuf {
