@@ -208,7 +208,19 @@ impl Infigraph {
             crate::lockfile::acquire(&lock_path, "graph-wipe", std::time::Duration::from_secs(5))?;
         let _ = std::fs::remove_dir_all(db_path);
         let _ = std::fs::remove_file(db_path);
-        let wal = db_path.with_extension("wal");
+        // Kuzu's on-disk WAL filename APPENDS ".wal" to the full db filename
+        // (e.g. "graph" -> "graph.wal", "docs.kuzu" -> "docs.kuzu.wal"). It
+        // does NOT replace the extension the way `Path::with_extension` does
+        // -- `db_path.with_extension("wal")` on an extensioned path like
+        // "docs.kuzu" silently computes "docs.wal", a file Kuzu never wrote,
+        // leaving the real WAL behind for the freshly recreated base image
+        // to replay from. Verified empirically (see Task 5 report) that the
+        // real sibling is always `<full filename>.wal`. For infigraph's
+        // extensionless production path (".infigraph/graph"), this was a
+        // no-op difference -- `with_extension` and append coincide when
+        // there's no extension to strip -- so this fix only changes
+        // behavior for extensioned db paths (e.g. ".infigraph/docs.kuzu").
+        let wal = PathBuf::from(format!("{}.wal", db_path.display()));
         let _ = std::fs::remove_file(&wal);
         Ok(())
     }
