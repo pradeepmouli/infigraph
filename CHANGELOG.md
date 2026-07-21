@@ -7,6 +7,25 @@ Versions follow [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [3.2.5] - 2026-07-21
+
+### Fixed
+
+- Remote (shared-Neo4j) mode, follow-ups found in production testing:
+  - `get_symbols_in_file`, `get_skeleton`, `symbols_in_range`, and `get_file_deps`
+    now accept a repo-relative file path (not just the fully namespaced one) by
+    normalizing it against the repo namespace — previously a bare path returned
+    "not indexed" even though the file was indexed.
+  - `get_symbols_in_file` output now includes each symbol's `id`, which is the
+    argument the traversal tools (`trace_callers`, `get_code_snippet`,
+    `symbol_context`, `find_all_references`, …) require — they were undiscoverable.
+  - `get_code_snippet` strips the `org/repo/` namespace before joining to the
+    project root, fixing a double-prefixed path that made source reads fail.
+  - `detect_config_bindings` is repo-scoped (was returning other projects' bindings).
+  - Contract sync into Postgres is chunked to stay under the 65535 bound-parameter
+    limit — large groups previously failed with "parameters is not drained",
+    dropping cross-service contract data.
+
 ## [3.2.4] - 2026-07-21
 
 ### Fixed

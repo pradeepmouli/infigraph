@@ -43,9 +43,12 @@ pub fn tool_get_symbols_in_file(args: &Value) -> Result<String> {
     let symbols = backend.symbols_in_file(file)?;
     let mut out = String::new();
     for s in &symbols {
+        // Include the symbol id — it's the required argument for trace_callers,
+        // get_code_snippet, symbol_context, find_all_references, etc. Without it those
+        // tools are undiscoverable.
         out.push_str(&format!(
-            "{:>8} {:30} L{}-{}\n",
-            s.kind, s.name, s.start_line, s.end_line
+            "{:>8} {:30} L{}-{}  id={}\n",
+            s.kind, s.name, s.start_line, s.end_line, s.id
         ));
     }
     if out.is_empty() {
@@ -73,10 +76,20 @@ pub fn tool_get_code_snippet(args: &Value) -> Result<String> {
         .find_symbol_by_id(symbol_id)?
         .context(format!("symbol '{}' not found in graph", symbol_id))?;
 
-    let file_path = if std::path::Path::new(&detail.file).is_absolute() {
-        PathBuf::from(&detail.file)
+    // In shared-graph mode `detail.file` is namespaced (`org/repo/rel/path`), but the file
+    // on disk is at `root/rel/path`. Strip the namespace prefix before joining, or the path
+    // double-prefixes and the read fails.
+    let rel_file = match backend.repo_filter() {
+        Some(ns) => detail
+            .file
+            .strip_prefix(&format!("{ns}/"))
+            .unwrap_or(&detail.file),
+        None => &detail.file,
+    };
+    let file_path = if std::path::Path::new(rel_file).is_absolute() {
+        PathBuf::from(rel_file)
     } else {
-        prism.root().join(&detail.file)
+        prism.root().join(rel_file)
     };
     let snippet = infigraph_core::search::read_lines_from_file(
         &file_path,

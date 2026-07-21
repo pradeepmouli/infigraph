@@ -111,6 +111,16 @@ impl Neo4jBackend {
         self.repo_filter.as_deref()
     }
 
+    /// Normalize a file-path argument to the stored (namespaced) form. In shared-graph
+    /// mode `s.file` is prefixed with `org/repo/`; callers naturally pass the repo-relative
+    /// path, so prepend the namespace when it isn't already present. No-op without a filter.
+    fn resolve_file_key(&self, file: &str) -> String {
+        match self.repo_filter() {
+            Some(repo) if !file.starts_with(&format!("{repo}/")) => format!("{repo}/{file}"),
+            _ => file.to_string(),
+        }
+    }
+
     fn block_on<F: std::future::Future>(&self, f: F) -> F::Output {
         self.handle.block_on(f)
     }
@@ -590,6 +600,7 @@ impl GraphBackend for Neo4jBackend {
     }
 
     fn symbols_in_file(&self, file: &str) -> Result<Vec<SymbolRow>> {
+        let file = self.resolve_file_key(file);
         let rows = self.run_query(
             query(
                 "MATCH (s:Symbol {file: $file}) \
@@ -597,7 +608,7 @@ impl GraphBackend for Neo4jBackend {
                         s.start_line AS start_line, s.end_line AS end_line \
                  ORDER BY s.start_line",
             )
-            .param("file", file.to_string()),
+            .param("file", file.clone()),
         )?;
         Ok(rows
             .iter()
@@ -635,6 +646,7 @@ impl GraphBackend for Neo4jBackend {
     }
 
     fn symbols_in_range(&self, file: &str, start: u32, end: u32) -> Result<Vec<SymbolDetail>> {
+        let file = self.resolve_file_key(file);
         let rows = self.run_query(
             query(
                 "MATCH (s:Symbol {file: $file}) \
@@ -643,7 +655,7 @@ impl GraphBackend for Neo4jBackend {
                         s.file AS file, s.start_line AS start_line, s.end_line AS end_line \
                  ORDER BY s.start_line",
             )
-            .param("file", file.to_string())
+            .param("file", file.clone())
             .param("start", start as i64)
             .param("end", end as i64),
         )?;
@@ -663,6 +675,7 @@ impl GraphBackend for Neo4jBackend {
     }
 
     fn skeleton(&self, file: &str) -> Result<String> {
+        let file = self.resolve_file_key(file);
         let rows = self.run_query(
             query(
                 "MATCH (s:Symbol {file: $file}) \
@@ -676,7 +689,7 @@ impl GraphBackend for Neo4jBackend {
                         fan_in, stmt_count \
                  ORDER BY s.start_line",
             )
-            .param("file", file.to_string()),
+            .param("file", file.clone()),
         )?;
         let symbols: Vec<super::queries::SkeletonSymbol> = rows
             .iter()
@@ -697,7 +710,7 @@ impl GraphBackend for Neo4jBackend {
                 })
             })
             .collect();
-        Ok(super::queries::format_skeleton(file, &symbols))
+        Ok(super::queries::format_skeleton(&file, &symbols))
     }
 
     fn callers_of(&self, symbol_id: &str) -> Result<Vec<String>> {
@@ -841,11 +854,12 @@ impl GraphBackend for Neo4jBackend {
     }
 
     fn get_file_deps(&self, file: &str) -> Result<FileDeps> {
+        let file = self.resolve_file_key(file);
         let imports = self.collect_strings(
             &format!(
                 "MATCH (s:Symbol {{file: '{}'}})-[:IMPORTS]->(t:Symbol) \
                  RETURN DISTINCT t.file AS file",
-                escape(file)
+                escape(&file)
             ),
             "file",
         )?;
@@ -853,12 +867,12 @@ impl GraphBackend for Neo4jBackend {
             &format!(
                 "MATCH (s:Symbol)-[:IMPORTS]->(t:Symbol {{file: '{}'}}) \
                  RETURN DISTINCT s.file AS file",
-                escape(file)
+                escape(&file)
             ),
             "file",
         )?;
         Ok(FileDeps {
-            file: file.to_string(),
+            file: file.clone(),
             imports,
             imported_by,
         })
