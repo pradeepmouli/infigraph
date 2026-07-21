@@ -138,9 +138,11 @@ pub(crate) fn cmd_group(root: &Path, action: GroupAction) -> Result<()> {
                         if had {
                             let _ = std::fs::rename(&sess_dir, &sess_bak);
                         }
-                        std::fs::remove_dir_all(&tg_dir)?;
+                        // `_op_guard` above holds a flock on this member's
+                        // index.lock — the shared helper preserves that file
+                        // by name so the held lock stays valid through the wipe.
+                        infigraph_core::ops::wipe_infigraph_preserving_index_lock(&tg_dir)?;
                         if had {
-                            std::fs::create_dir_all(&tg_dir)?;
                             let _ = std::fs::rename(&sess_bak, &sess_dir);
                         }
                         println!("  Cleaned .infigraph/ for full reindex (sessions preserved)");

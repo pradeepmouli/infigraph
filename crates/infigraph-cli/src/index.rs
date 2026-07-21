@@ -42,27 +42,9 @@ pub(crate) fn cmd_index(root: &Path, full: bool, no_embed: bool) -> Result<()> {
                     let _ = std::fs::rename(&sessions_dir, &sessions_backup);
                 }
                 // `_op_guard` above holds a flock on .infigraph/index.lock for
-                // this whole reindex. A flock is held on the underlying inode,
-                // not the path — deleting the file just unlinks that name, so
-                // remove_dir_all-ing the whole directory (as this used to do)
-                // would silently drop our lock's visibility: a second process
-                // could then create a fresh index.lock and acquire an
-                // uncontended lock on it for the rest of this full reindex,
-                // defeating the mutual exclusion the lock exists to provide.
-                // So the wipe walks the directory and removes everything
-                // except index.lock (kept as the live rendezvous point) —
-                // sessions/ is already excluded above via the rename dance.
-                for entry in std::fs::read_dir(&tg_dir)?.flatten() {
-                    if entry.file_name() == "index.lock" {
-                        continue;
-                    }
-                    let path = entry.path();
-                    if path.is_dir() {
-                        std::fs::remove_dir_all(&path)?;
-                    } else {
-                        std::fs::remove_file(&path)?;
-                    }
-                }
+                // this whole reindex; the shared helper preserves that file
+                // by name so the held lock stays valid through the wipe.
+                infigraph_core::ops::wipe_infigraph_preserving_index_lock(&tg_dir)?;
                 if had_sessions {
                     let _ = std::fs::rename(&sessions_backup, &sessions_dir);
                 }

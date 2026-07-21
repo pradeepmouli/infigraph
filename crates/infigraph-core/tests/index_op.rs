@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use infigraph_core::lang::LanguageRegistry;
 use infigraph_core::multi::{index_group, Group, Registry, RepoEntry};
-use infigraph_core::ops::{begin_index_op, IndexOpOutcome};
+use infigraph_core::ops::{begin_index_op, wipe_infigraph_preserving_index_lock, IndexOpOutcome};
 use tempfile::TempDir;
 
 #[test]
@@ -143,4 +143,47 @@ fn test_group_index_skips_locked_member() {
     );
 
     drop(held);
+}
+
+/// `wipe_infigraph_preserving_index_lock` must delete everything under a
+/// `.infigraph/` directory except `index.lock`, and must not disturb a
+/// lock currently held on that file — a held lock's visibility to other
+/// processes has to survive the wipe, otherwise a second process could
+/// create a fresh `index.lock` and acquire an uncontended lock on it,
+/// defeating the coalescing the lock exists to provide.
+#[test]
+fn test_wipe_infigraph_preserving_index_lock_keeps_lock_removes_rest() {
+    let dir = TempDir::new().unwrap();
+    let tg_dir = dir.path().join(".infigraph");
+    std::fs::create_dir_all(tg_dir.join("graph")).unwrap();
+    std::fs::write(tg_dir.join("graph").join("data.bin"), b"graph-data").unwrap();
+    std::fs::write(tg_dir.join("registry.json"), b"{}").unwrap();
+
+    // A live op holding the lock — its guard must survive the wipe.
+    let guard = match begin_index_op(dir.path(), "test-wipe", Duration::ZERO).unwrap() {
+        IndexOpOutcome::Acquired(g) => g,
+        IndexOpOutcome::AlreadyRunning(_) => panic!("fresh lock must acquire"),
+    };
+
+    wipe_infigraph_preserving_index_lock(&tg_dir).unwrap();
+
+    assert!(
+        tg_dir.join("index.lock").exists(),
+        "index.lock must survive the wipe"
+    );
+    assert!(!tg_dir.join("graph").exists(), "graph dir should be wiped");
+    assert!(
+        !tg_dir.join("registry.json").exists(),
+        "registry.json should be wiped"
+    );
+
+    // The lock is still held by `guard` post-wipe — a second acquire
+    // attempt must coalesce, proving the wipe didn't silently drop the
+    // lock's visibility to other processes.
+    match begin_index_op(dir.path(), "second", Duration::ZERO).unwrap() {
+        IndexOpOutcome::Acquired(_) => panic!("held lock must still coalesce after the wipe"),
+        IndexOpOutcome::AlreadyRunning(_) => {}
+    }
+
+    drop(guard);
 }

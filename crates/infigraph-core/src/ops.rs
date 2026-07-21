@@ -67,3 +67,35 @@ pub fn begin_index_op(root: &Path, role: &str, wait: Duration) -> Result<IndexOp
         Ok(IndexOpOutcome::Acquired(IndexOpGuard { _lock: lock }))
     }
 }
+
+/// Wipe everything under a `.infigraph/` directory (`tg_dir`) except
+/// `index.lock` itself, for a `--full` reindex.
+///
+/// A flock is held on the underlying inode, not the path — deleting the
+/// lock file out from under a live `IndexOpGuard` would just unlink that
+/// name, so a second process could then create a fresh `index.lock` and
+/// acquire an uncontended lock on it for the rest of the reindex,
+/// defeating the mutual exclusion the lock exists to provide. This walks
+/// the directory and removes everything *except* `index.lock` (kept in
+/// place as the live rendezvous point), so a lock held on it by the
+/// caller stays valid for the whole wipe-and-reindex.
+///
+/// Callers are responsible for their own `sessions/` preserve-across-wipe
+/// dance where that applies (rename out, wipe, rename back) — this only
+/// handles the lock-safe wipe of everything else. Callers should check
+/// `tg_dir.exists()` before calling, matching the existing call-site
+/// convention (a missing directory is a no-op, not an error here).
+pub fn wipe_infigraph_preserving_index_lock(tg_dir: &Path) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(tg_dir)?.flatten() {
+        if entry.file_name() == "index.lock" {
+            continue;
+        }
+        let path = entry.path();
+        if path.is_dir() {
+            std::fs::remove_dir_all(&path)?;
+        } else {
+            std::fs::remove_file(&path)?;
+        }
+    }
+    Ok(())
+}

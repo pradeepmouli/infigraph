@@ -25,7 +25,8 @@ pub enum CombinedBuildOutcome {
     Built { symbols: usize, edges: usize },
     /// The group root's index operation lock was already held by another
     /// in-flight build (or group index) — skipped without touching the
-    /// combined graph. Carries the skip note (e.g. holder identity).
+    /// combined graph. Carries the skip reason (no trailing "— skipped";
+    /// callers compose their own "skipped — <reason>" phrasing).
     Skipped(String),
 }
 
@@ -69,7 +70,7 @@ pub fn build_combined_graph(registry: &Registry, group_name: &str) -> Result<Com
     let _op_guard = match op {
         IndexOpOutcome::Acquired(g) => g,
         o @ IndexOpOutcome::AlreadyRunning(_) => {
-            return Ok(CombinedBuildOutcome::Skipped(o.skip_note().unwrap()));
+            return Ok(CombinedBuildOutcome::Skipped(o.skip_reason().unwrap()));
         }
     };
 

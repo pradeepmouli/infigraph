@@ -159,6 +159,15 @@ where
                 // Wait mode: serializes against a concurrently-running index
                 // op rather than skipping outright, so a periodic refresh
                 // isn't starved by e.g. a long CLI `infigraph index` run.
+                // Note: this call blocks synchronously for up to 30s, and
+                // this whole loop iteration is single-threaded — so under
+                // sustained contention (another op holding the lock for
+                // most/all of that window) the ENTIRE watcher loop stalls
+                // for the wait, not just the periodic refresh: the batch
+                // flush below and event draining from `rx` both wait too,
+                // roughly once per periodic tick. Filesystem events aren't
+                // lost during the stall — `notify`'s channel just buffers
+                // them until the next `rx` drain — but latency spikes.
                 match begin_index_op(root, "infigraph watch", Duration::from_secs(30)) {
                     Ok(IndexOpOutcome::Acquired(_guard)) => {
                         if let Ok(prism) = open_transient(root, &make_registry) {

@@ -14,7 +14,9 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::lang::LanguageRegistry;
-use crate::ops::{begin_index_op, IndexOpGuard, IndexOpOutcome};
+use crate::ops::{
+    begin_index_op, wipe_infigraph_preserving_index_lock, IndexOpGuard, IndexOpOutcome,
+};
 use crate::Infigraph;
 
 #[cfg(feature = "neo4j")]
@@ -540,26 +542,6 @@ pub fn index_group(
         })
         .collect::<Result<Vec<_>>>()?;
 
-    if full {
-        for (_, entry) in &entries {
-            let tg_dir = entry.path.join(".infigraph");
-            if tg_dir.exists() {
-                // Preserve session data across full reindex
-                let sess_dir = tg_dir.join("sessions");
-                let sess_bak = entry.path.join(".infigraph-sessions-backup");
-                let had_sessions = sess_dir.exists();
-                if had_sessions {
-                    let _ = std::fs::rename(&sess_dir, &sess_bak);
-                }
-                std::fs::remove_dir_all(&tg_dir)?;
-                if had_sessions {
-                    std::fs::create_dir_all(&tg_dir)?;
-                    let _ = std::fs::rename(&sess_bak, &sess_dir);
-                }
-            }
-        }
-    }
-
     // Skip repos whose HEAD commit hasn't changed since last index (incremental).
     // In Neo4j mode, also verify the graph actually has data for "unchanged" repos —
     // if Neo4j storage was wiped, Postgres still thinks repos are indexed.
@@ -660,6 +642,26 @@ pub fn index_group(
                 ));
             }
         };
+
+        if full {
+            let tg_dir = entry.path.join(".infigraph");
+            if tg_dir.exists() {
+                // Preserve session data across full reindex
+                let sess_dir = tg_dir.join("sessions");
+                let sess_bak = entry.path.join(".infigraph-sessions-backup");
+                let had_sessions = sess_dir.exists();
+                if had_sessions {
+                    let _ = std::fs::rename(&sess_dir, &sess_bak);
+                }
+                // `op_guard` above holds a flock on this member's
+                // index.lock — the shared helper preserves that file by
+                // name so the held lock stays valid through the wipe.
+                wipe_infigraph_preserving_index_lock(&tg_dir)?;
+                if had_sessions {
+                    let _ = std::fs::rename(&sess_bak, &sess_dir);
+                }
+            }
+        }
 
         let lang_registry = build_registry()?;
         let mut prism = Infigraph::open(&entry.path, lang_registry)?;
