@@ -87,8 +87,10 @@ fn test_lock_file_permissions_readonly() {
     perms.set_readonly(true);
     std::fs::set_permissions(&lock_path, perms).unwrap();
 
-    let store = GraphStore::open(&db_path).unwrap();
-    let result = store.write_lock();
+    // open() now acquires the write lock itself to run schema init under
+    // it, so a readonly lock file surfaces here rather than at a later
+    // explicit write_lock() call.
+    let result = GraphStore::open(&db_path);
 
     // Restore perms for cleanup
     let mut perms = std::fs::metadata(&lock_path).unwrap().permissions();
@@ -98,7 +100,7 @@ fn test_lock_file_permissions_readonly() {
 
     assert!(
         result.is_err(),
-        "write_lock on readonly file should error, not hang"
+        "open() on readonly lock file should error, not hang"
     );
 }
 
