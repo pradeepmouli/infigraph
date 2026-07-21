@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use kuzu::Connection;
 
 use super::schema::ensure_custom_edge_table;
-use super::store::GraphStore;
+use super::store::{GraphStore, WriteLock};
 use super::store_util::escape;
 use crate::model::{FileExtraction, RelationKind};
 
@@ -12,16 +12,16 @@ impl GraphStore {
     /// Insert a file extraction into the graph.
     /// Removes old data for the file first (incremental update).
     pub fn upsert_file(&self, extraction: &FileExtraction) -> Result<()> {
-        let _lock = self.write_lock()?;
+        let lock = self.write_lock()?;
         let conn = self.connection()?;
-        self.upsert_file_conn(&conn, extraction)
+        self.upsert_file_conn(&conn, extraction, &lock)
     }
 
-    /// Caller must hold WriteLock.
     pub fn upsert_file_conn(
         &self,
         conn: &Connection<'_>,
         extraction: &FileExtraction,
+        witness: &WriteLock,
     ) -> Result<()> {
         // Remove old symbols for this file
         let _ = conn.query(&format!(
@@ -36,14 +36,14 @@ impl GraphStore {
             "MATCH (f:File) WHERE f.id = '{}' DETACH DELETE f",
             escape(&extraction.file)
         ));
-        self.upsert_file_conn_no_delete(conn, extraction)
+        self.upsert_file_conn_no_delete(conn, extraction, witness)
     }
 
-    /// Caller must hold WriteLock.
     pub fn upsert_file_conn_no_delete(
         &self,
         conn: &Connection<'_>,
         extraction: &FileExtraction,
+        _witness: &WriteLock,
     ) -> Result<()> {
         // Insert module node
         let module_id = &extraction.file;

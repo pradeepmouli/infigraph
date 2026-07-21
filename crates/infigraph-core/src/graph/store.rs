@@ -38,6 +38,26 @@ impl WriteLock {
     }
 }
 
+/// Marker error: the graph's on-disk state failed integrity recovery (e.g.
+/// WAL replay). Downcast target for callers that route to quarantine
+/// (DESIGN-hardening.md R3.1) instead of scanning damaged pages.
+///
+/// Exists because a tolerant read-only open used to serve a torn base image
+/// over a corrupt WAL instead of erroring — the 2026-07-19 incident stayed
+/// latent for a day until scans over the torn graph segfaulted.
+#[derive(Debug)]
+pub struct GraphCorruption {
+    pub detail: String,
+}
+
+impl std::fmt::Display for GraphCorruption {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "graph corruption detected: {}", self.detail)
+    }
+}
+
+impl std::error::Error for GraphCorruption {}
+
 /// Persistent graph store backed by Kuzu.
 pub struct GraphStore {
     db: Database,
@@ -47,6 +67,11 @@ pub struct GraphStore {
 impl GraphStore {
     /// Open or create a Kuzu database at the given path.
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_with_lock_timeout(path, GRAPH_WRITE_TIMEOUT)
+    }
+
+    /// Open with a caller-chosen wait budget for the schema-init write lock.
+    pub fn open_with_lock_timeout(path: &Path, timeout: std::time::Duration) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -54,7 +79,9 @@ impl GraphStore {
         let db = Database::new(path, SystemConfig::default())
             .map_err(|e| anyhow::anyhow!("failed to open kuzu db: {e}"))?;
         let store = Self { db, lock_path };
-        store.init_schema()?;
+        let lock = WriteLock::acquire_with_timeout(&store.lock_path, timeout)?;
+        store.init_schema(&lock)?;
+        drop(lock);
         Ok(store)
     }
 
@@ -62,11 +89,18 @@ impl GraphStore {
     /// Safe for concurrent access while a watcher is writing.
     pub fn open_read_only(path: &Path) -> Result<Self> {
         let lock_path = path.with_extension("lock");
-        let config = SystemConfig::default()
-            .read_only(true)
-            .throw_on_wal_replay_failure(false);
-        let db = Database::new(path, config)
-            .map_err(|e| anyhow::anyhow!("failed to open kuzu db (read-only): {e}"))?;
+        // `throw_on_wal_replay_failure` defaults to true (unset here): a WAL
+        // replay failure now surfaces as an error instead of being silently
+        // tolerated and served as a torn base image.
+        let config = SystemConfig::default().read_only(true);
+        let db = Database::new(path, config).map_err(|e| {
+            let msg = format!("failed to open kuzu db (read-only): {e}");
+            if msg.to_lowercase().contains("wal") {
+                anyhow::Error::new(GraphCorruption { detail: msg })
+            } else {
+                anyhow::anyhow!(msg)
+            }
+        })?;
         Ok(Self { db, lock_path })
     }
 
@@ -86,7 +120,7 @@ impl GraphStore {
         WriteLock::try_acquire(&self.lock_path)
     }
 
-    fn init_schema(&self) -> Result<()> {
+    fn init_schema(&self, _witness: &WriteLock) -> Result<()> {
         let conn = self.connection()?;
         for ddl in CREATE_SCHEMA {
             conn.query(ddl)
@@ -104,13 +138,17 @@ impl GraphStore {
 
     /// Remove all graph data for a deleted file.
     pub fn remove_file(&self, file: &str) -> Result<()> {
-        let _lock = self.write_lock()?;
+        let lock = self.write_lock()?;
         let conn = self.connection()?;
-        self.remove_file_conn(&conn, file)
+        self.remove_file_conn(&conn, file, &lock)
     }
 
-    /// Caller must hold WriteLock.
-    pub fn remove_file_conn(&self, conn: &Connection<'_>, file: &str) -> Result<()> {
+    pub fn remove_file_conn(
+        &self,
+        conn: &Connection<'_>,
+        file: &str,
+        _witness: &WriteLock,
+    ) -> Result<()> {
         let _ = conn.query(&format!(
             "MATCH (f:File)-[:DEFINES]->(s:Symbol)-[:HAS_STATEMENT]->(st:Statement) WHERE f.id = '{}' DETACH DELETE st",
             escape(file)
@@ -132,7 +170,7 @@ impl GraphStore {
 
     /// Remove all files whose path starts with the given prefix (handles directory removal).
     pub fn remove_files_by_prefix(&self, prefix: &str) -> Result<usize> {
-        let _lock = self.write_lock()?;
+        let lock = self.write_lock()?;
         let conn = self.connection()?;
         let escaped = escape(prefix);
         let result = conn
@@ -147,7 +185,7 @@ impl GraphStore {
             }
         }
         for f in &files {
-            self.remove_file_conn(&conn, f)?;
+            self.remove_file_conn(&conn, f, &lock)?;
         }
         Ok(files.len())
     }

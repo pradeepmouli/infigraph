@@ -151,7 +151,8 @@ fn setup_graph() -> TestGraph {
     ];
     {
         let conn = store.connection().unwrap();
-        store.upsert_all_bulk(&conn, &extractions).unwrap();
+        let lock = store.write_lock().unwrap();
+        store.upsert_all_bulk(&conn, &extractions, &lock).unwrap();
     }
     TestGraph {
         _dir: dir,

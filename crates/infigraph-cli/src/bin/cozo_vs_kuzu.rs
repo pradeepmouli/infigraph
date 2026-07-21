@@ -82,9 +82,11 @@ fn main() -> Result<()> {
 
     let t0 = Instant::now();
     let conn = kuzu.connection()?;
+    let lock = kuzu.write_lock()?;
     for extraction in &extractions {
-        kuzu.upsert_file_conn(&conn, extraction)?;
+        kuzu.upsert_file_conn(&conn, extraction, &lock)?;
     }
+    drop(lock);
     let kuzu_write_ms = t0.elapsed().as_millis();
 
     let t0 = Instant::now();
@@ -368,8 +370,9 @@ fn main() -> Result<()> {
         let iters: u128 = 5;
 
         let t0 = Instant::now();
+        let inc_lock = kuzu.write_lock()?;
         for _ in 0..iters {
-            kuzu.upsert_file_conn(&conn, ext)?;
+            kuzu.upsert_file_conn(&conn, ext, &inc_lock)?;
         }
         let kuzu_inc = t0.elapsed().as_micros() / iters;
 

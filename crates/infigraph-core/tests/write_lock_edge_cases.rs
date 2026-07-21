@@ -87,8 +87,10 @@ fn test_lock_file_permissions_readonly() {
     perms.set_readonly(true);
     std::fs::set_permissions(&lock_path, perms).unwrap();
 
-    let store = GraphStore::open(&db_path).unwrap();
-    let result = store.write_lock();
+    // open() now acquires the write lock itself to run schema init under
+    // it, so a readonly lock file surfaces here rather than at a later
+    // explicit write_lock() call.
+    let result = GraphStore::open(&db_path);
 
     // Restore perms for cleanup
     let mut perms = std::fs::metadata(&lock_path).unwrap().permissions();
@@ -98,7 +100,7 @@ fn test_lock_file_permissions_readonly() {
 
     assert!(
         result.is_err(),
-        "write_lock on readonly file should error, not hang"
+        "open() on readonly lock file should error, not hang"
     );
 }
 
@@ -334,4 +336,35 @@ fn test_lock_released_on_process_exit() {
         result.is_ok(),
         "lock should be released after child process killed"
     );
+}
+
+#[test]
+fn test_read_only_open_surfaces_wal_replay_failure() {
+    // A torn/garbage WAL next to a valid db must yield GraphCorruption,
+    // not a silently-served torn base image (the 2026-07-19 latent-corruption mode).
+    //
+    // NOTE on WAL path: Kuzu's on-disk WAL filename APPENDS ".wal" to the
+    // full db filename (e.g. "walfail.db.wal"). It does NOT replace the
+    // extension the way `Path::with_extension` does — `db_path.with_extension("wal")`
+    // on "walfail.db" silently produces "walfail.wal", a file Kuzu never
+    // reads, which made an earlier draft of this test pass for the wrong
+    // reason (open never touched the real WAL at all). Verified empirically
+    // by dumping the directory listing after a real Kuzu write: the on-disk
+    // WAL sibling of `<name>.db` is `<name>.db.wal`.
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("walfail.db");
+    {
+        let _ = infigraph_core::graph::GraphStore::open(&db_path).unwrap();
+    }
+    let real_wal_path = format!("{}.wal", db_path.display());
+    std::fs::write(&real_wal_path, b"\xde\xad\xbe\xef garbage wal").unwrap();
+    let res = infigraph_core::graph::GraphStore::open_read_only(&db_path);
+    match res {
+        Ok(_) => panic!("read-only open must not silently succeed over a corrupt WAL"),
+        Err(e) => assert!(
+            e.downcast_ref::<infigraph_core::graph::GraphCorruption>()
+                .is_some(),
+            "expected GraphCorruption marker, got: {e}"
+        ),
+    }
 }

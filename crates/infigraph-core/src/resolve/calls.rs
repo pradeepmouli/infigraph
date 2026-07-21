@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use anyhow::Result;
 use rayon::prelude::*;
 
-use crate::graph::store::GraphStore;
+use crate::graph::store::{GraphStore, WriteLock};
 use crate::learned::LearnedStore;
 use crate::model::{FileExtraction, RelationKind};
 
@@ -13,7 +13,8 @@ use super::{escape, shortest_id, ResolveStats};
 /// Post-indexing pass that resolves call edges using cross-file symbol lookup.
 /// Builds symbol map from the full graph (not just re-indexed files) so
 /// incremental indexing doesn't lose cross-file resolution.
-/// Caller must hold WriteLock (creates CALLS and INHERITS edges).
+/// Acquires the graph write lock for the duration of the resolve (creates
+/// CALLS and INHERITS edges).
 pub fn resolve_calls_incremental(
     store: &GraphStore,
     extractions: &[FileExtraction],
@@ -29,6 +30,10 @@ pub fn resolve_calls_incremental(
         });
     }
 
+    // Lock scope is intentionally wide: the symbol-map read below must be
+    // snapshotted under the same lock as the edge writes that use it, or a
+    // concurrent writer could invalidate the map between read and write.
+    let lock = store.write_lock()?;
     let conn = store.connection()?;
 
     // Build global symbol table from full graph: name -> [(id, file, kind)]
@@ -37,8 +42,8 @@ pub fn resolve_calls_incremental(
         symbol_map.entry(name).or_default().push((id, file, kind));
     }
 
-    let mut stats = resolve_with_map(&conn, extractions, &symbol_map, learned_store)?;
-    stats.inherits_resolved = resolve_inherits(&conn, extractions, &symbol_map)?;
+    let mut stats = resolve_with_map(&conn, extractions, &symbol_map, learned_store, &lock)?;
+    stats.inherits_resolved = resolve_inherits(&conn, extractions, &symbol_map, &lock)?;
     Ok(stats)
 }
 
@@ -48,7 +53,7 @@ pub fn resolve_calls_incremental(
 /// a CALLS relation targeting `main.py::authenticate`. But the real symbol
 /// is `auth.py::authenticate`. This pass:
 ///
-/// Caller must hold WriteLock.
+/// Acquires the graph write lock for the duration of the resolve.
 /// 1. Builds a symbol table from all extractions
 /// 2. For each CALLS relation where the target doesn't exist locally,
 ///    searches the global symbol table by name
@@ -58,6 +63,10 @@ pub fn resolve_calls(
     extractions: &[FileExtraction],
     learned_store: Option<&LearnedStore>,
 ) -> Result<ResolveStats> {
+    // Lock scope is intentionally wide: the symbol-map read below must be
+    // snapshotted under the same lock as the edge writes that use it, or a
+    // concurrent writer could invalidate the map between read and write.
+    let lock = store.write_lock()?;
     let conn = store.connection()?;
 
     // Build global symbol table: name -> list of (id, file, kind)
@@ -72,17 +81,17 @@ pub fn resolve_calls(
         }
     }
 
-    let mut stats = resolve_with_map(&conn, extractions, &symbol_map, learned_store)?;
-    stats.inherits_resolved = resolve_inherits(&conn, extractions, &symbol_map)?;
+    let mut stats = resolve_with_map(&conn, extractions, &symbol_map, learned_store, &lock)?;
+    stats.inherits_resolved = resolve_inherits(&conn, extractions, &symbol_map, &lock)?;
     Ok(stats)
 }
 
-/// Caller must hold WriteLock.
 fn resolve_with_map(
     conn: &kuzu::Connection<'_>,
     extractions: &[FileExtraction],
     symbol_map: &HashMap<String, Vec<(String, String, String)>>,
     learned_store: Option<&LearnedStore>,
+    _witness: &WriteLock,
 ) -> Result<ResolveStats> {
     let mut resolved = 0;
     let mut unresolved = 0;
@@ -408,7 +417,10 @@ pub fn re_resolve_for_files(
         });
     }
 
-    let _lock = store.write_lock()?;
+    // Lock scope is intentionally wide: the symbol-map read below must be
+    // snapshotted under the same lock as the edge writes that use it, or a
+    // concurrent writer could invalidate the map between read and write.
+    let lock = store.write_lock()?;
     let conn = store.connection()?;
 
     for file in files {
@@ -435,8 +447,8 @@ pub fn re_resolve_for_files(
         .collect();
 
     let filtered_owned: Vec<FileExtraction> = filtered.into_iter().cloned().collect();
-    let mut stats = resolve_with_map(&conn, &filtered_owned, &symbol_map, learned_store)?;
-    stats.inherits_resolved = resolve_inherits(&conn, &filtered_owned, &symbol_map)?;
+    let mut stats = resolve_with_map(&conn, &filtered_owned, &symbol_map, learned_store, &lock)?;
+    stats.inherits_resolved = resolve_inherits(&conn, &filtered_owned, &symbol_map, &lock)?;
     Ok(stats)
 }
 
