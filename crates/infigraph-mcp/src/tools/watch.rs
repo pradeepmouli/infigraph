@@ -64,6 +64,29 @@ pub fn is_watching(path: &str) -> bool {
         .is_some_and(|map| map.values().any(|e| e.path == path))
 }
 
+/// True when a code watcher is running for `root` — either in this process
+/// (WATCHERS map) or in another process (CLI `infigraph watch` or another
+/// MCP worker holding `.infigraph/watch.lock`). Probe-only: opens the lock
+/// file and immediately releases the trial flock; never creates the file.
+pub fn watcher_running(root: &std::path::Path) -> bool {
+    let root_str = root.to_string_lossy().replace('\\', "/");
+    if is_watching(&root_str) {
+        return true;
+    }
+    use fs2::FileExt;
+    let lock_path = root.join(".infigraph").join("watch.lock");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&lock_path)
+        .ok()
+        .map(|f| {
+            let locked = f.try_lock_exclusive().is_err();
+            let _ = fs2::FileExt::unlock(&f);
+            locked
+        })
+        .unwrap_or(false)
+}
+
 pub fn auto_start_watch(path: &str) -> Option<String> {
     auto_start_watch_inner(path, false)
 }

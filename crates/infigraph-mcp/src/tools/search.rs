@@ -518,29 +518,11 @@ pub fn tool_search(args: &Value) -> Result<String> {
         out.push_str(&format!("No results for '{}'", query));
     }
 
-    if !super::watch::is_watching(&root.to_string_lossy().replace('\\', "/")) {
-        let lock_path = root.join(".infigraph").join("watch.lock");
-        let cli_watching = {
-            use fs2::FileExt;
-            std::fs::OpenOptions::new()
-                .write(true)
-                .open(&lock_path)
-                .ok()
-                .map(|f| {
-                    let locked = f.try_lock_exclusive().is_err();
-                    let _ = f.unlock();
-                    locked
-                })
-                .unwrap_or(false)
-        };
-        if !cli_watching {
-            if let Some(msg) = super::watch::auto_start_watch_opportunistic(path) {
-                out.push_str(&format!("\n✓ Auto-started watcher: {msg}"));
-            } else {
-                out.push_str("\n⚠ No file watcher running — results may be stale. Run `infigraph watch` or re-index to refresh.");
-            }
-            super::docs::auto_start_doc_watch_opportunistic(path);
+    if !super::watch::watcher_running(&root) {
+        if let Some(msg) = super::watch::auto_start_watch_opportunistic(path) {
+            out.push_str(&format!("\n✓ Auto-started watcher: {msg}"));
         }
+        super::docs::auto_start_doc_watch_opportunistic(path);
     }
 
     Ok(out)
