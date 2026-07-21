@@ -1,4 +1,5 @@
 pub mod compress;
+pub mod health;
 pub mod recovery;
 pub mod session_context;
 pub mod tools;
@@ -610,6 +611,7 @@ pub fn estimate_tokens(text: &str) -> usize {
 }
 
 pub fn handle_initialize(id: &Value, is_primary: bool) -> Value {
+    health::HEALTH.mark_initialized();
     mcp_log("INFO", &format!("initialize called (primary={is_primary})"));
     if is_primary {
         std::thread::spawn(|| {
@@ -693,7 +695,11 @@ pub fn handle_tools_call(id: &Value, request: &Value) -> Value {
                 .unwrap_or(false);
             session_context::record_tool_call(tool_name, detail_requested);
             session_context::record_focus(tool_name, &args);
-            let compressed = compress::compress_pipeline_safe(&content, tool_name, &args);
+            let mut compressed = compress::compress_pipeline_safe(&content, tool_name, &args);
+            if let Some(footer) = health::health_footer(tool_name, &args) {
+                compressed.push('\n');
+                compressed.push_str(&footer);
+            }
             let comp_tokens = estimate_tokens(&compressed);
             let level_used = session_context::get_compression_level();
             session_context::track_tokens(comp_tokens);
