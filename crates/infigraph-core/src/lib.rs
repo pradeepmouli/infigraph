@@ -18,6 +18,7 @@ pub mod manifest;
 pub mod meta;
 pub mod model;
 pub mod multi;
+pub mod ops;
 pub mod patterns;
 pub mod refactor;
 pub mod reflection;
