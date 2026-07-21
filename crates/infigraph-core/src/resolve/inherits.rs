@@ -2,17 +2,18 @@ use std::collections::HashMap;
 
 use anyhow::Result;
 
+use crate::graph::store::WriteLock;
 use crate::model::{FileExtraction, RelationKind};
 
 use super::{escape, shortest_id};
 
 const TYPE_KINDS: &[&str] = &["Class", "Interface", "Struct", "Trait", "Enum"];
 
-/// Caller must hold WriteLock.
 pub(crate) fn resolve_inherits(
     conn: &kuzu::Connection<'_>,
     extractions: &[FileExtraction],
     symbol_map: &HashMap<String, Vec<(String, String, String)>>,
+    _witness: &WriteLock,
 ) -> Result<usize> {
     let mut resolved_pairs: Vec<(String, String)> = Vec::new();
 
