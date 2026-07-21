@@ -5,6 +5,11 @@ use std::path::PathBuf;
 use std::time::Duration;
 use tempfile::TempDir;
 
+/// Serializes the tests that read or mutate INFIGRAPH_SLOW_LOCK_MS — the
+/// threshold is process-global, so a lowered value must not leak into a
+/// concurrently-running test's window.
+static SLOW_LOCK_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[test]
 fn test_build_hash_is_nonempty() {
     let h = build_hash();
@@ -191,6 +196,7 @@ fn test_acquire_timeout_unknown_holder_on_bare_flock() {
 
 #[test]
 fn test_slow_wait_recorded_and_drained() {
+    let _env = SLOW_LOCK_ENV.lock().unwrap_or_else(|e| e.into_inner());
     // Edition 2021: set_var is safe. 50ms threshold keeps the test fast;
     // other tests in this binary never successfully acquire after a
     // >50ms contended wait (contended tests end in Busy, which must NOT
@@ -229,6 +235,7 @@ fn test_slow_wait_recorded_and_drained() {
 
 #[test]
 fn test_fast_acquire_records_nothing() {
+    let _env = SLOW_LOCK_ENV.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("fast.lock");
     let g = lockfile::acquire(&path, "solo", std::time::Duration::from_secs(1)).unwrap();
