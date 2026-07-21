@@ -226,7 +226,9 @@ fn test_build_combined_graph_merges_symbols() {
     let orig_home = std::env::var("HOME").unwrap_or_default();
     let (registry, _dir_a, _dir_b) = setup_two_repo_group(&home);
 
-    let (symbols, edges) = build_combined_graph(&registry, "test-platform").unwrap();
+    let (symbols, edges) = build_combined_graph(&registry, "test-platform")
+        .unwrap()
+        .expect_built();
     assert!(symbols > 0, "combined graph should have symbols, got 0");
     assert!(edges > 0, "combined graph should have edges, got 0");
 
@@ -319,8 +321,12 @@ fn test_combined_graph_rebuild_replaces_old() {
     let orig_home = std::env::var("HOME").unwrap_or_default();
     let (registry, _dir_a, _dir_b) = setup_two_repo_group(&home);
 
-    let (sym1, edge1) = build_combined_graph(&registry, "test-platform").unwrap();
-    let (sym2, edge2) = build_combined_graph(&registry, "test-platform").unwrap();
+    let (sym1, edge1) = build_combined_graph(&registry, "test-platform")
+        .unwrap()
+        .expect_built();
+    let (sym2, edge2) = build_combined_graph(&registry, "test-platform")
+        .unwrap()
+        .expect_built();
 
     assert_eq!(sym1, sym2, "rebuild should produce same symbol count");
     assert_eq!(edge1, edge2, "rebuild should produce same edge count");

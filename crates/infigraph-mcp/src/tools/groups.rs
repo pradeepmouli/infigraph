@@ -231,8 +231,11 @@ pub fn tool_group_index(args: &Value) -> Result<String> {
         results.len(),
         group_name
     );
-    for (repo, indexed, total) in &results {
-        out.push_str(&format!("  {}: {}/{} files\n", repo, indexed, total));
+    for (repo, indexed, total, note) in &results {
+        match note {
+            Some(n) => out.push_str(&format!("  {}: skipped — {}\n", repo, n)),
+            None => out.push_str(&format!("  {}: {}/{} files\n", repo, indexed, total)),
+        }
     }
     let group = registry.groups.get(group_name);
     if let Some(g) = group {
@@ -447,8 +450,11 @@ pub fn tool_group_build(args: &Value) -> Result<String> {
         infigraph_languages::bundled_registry,
     )?;
     out.push_str(&format!("Step 1/5 — Indexed {} repos:\n", results.len()));
-    for (repo, indexed, total) in &results {
-        out.push_str(&format!("  {}: {}/{} files\n", repo, indexed, total));
+    for (repo, indexed, total, note) in &results {
+        match note {
+            Some(n) => out.push_str(&format!("  {}: skipped — {}\n", repo, n)),
+            None => out.push_str(&format!("  {}: {}/{} files\n", repo, indexed, total)),
+        }
     }
 
     // Step 2: Sync contracts
@@ -479,11 +485,20 @@ pub fn tool_group_build(args: &Value) -> Result<String> {
     if is_remote {
         out.push_str("Step 4/5 — Skipped combined graph (shared Neo4j already namespaced)\n");
     } else {
-        let (symbols, edges) = combined::build_combined_graph(&registry, group_name)?;
-        out.push_str(&format!(
-            "Step 4/5 — Combined graph: {} symbols, {} edges\n",
-            symbols, edges
-        ));
+        match combined::build_combined_graph(&registry, group_name)? {
+            combined::CombinedBuildOutcome::Built { symbols, edges } => {
+                out.push_str(&format!(
+                    "Step 4/5 — Combined graph: {} symbols, {} edges\n",
+                    symbols, edges
+                ));
+            }
+            combined::CombinedBuildOutcome::Skipped(note) => {
+                out.push_str(&format!(
+                    "Step 4/5 — Skipped combined graph build — {}\n",
+                    note
+                ));
+            }
+        }
     }
 
     // Step 5: Index per-repo docs + embeddings.
