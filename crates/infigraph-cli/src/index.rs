@@ -7,6 +7,16 @@ use infigraph_core::Infigraph;
 use infigraph_languages::bundled_registry;
 
 pub(crate) fn cmd_index(root: &Path, full: bool, no_embed: bool) -> Result<()> {
+    let op =
+        infigraph_core::ops::begin_index_op(root, "infigraph index", std::time::Duration::ZERO)?;
+    let _op_guard = match op {
+        infigraph_core::ops::IndexOpOutcome::Acquired(g) => g,
+        o @ infigraph_core::ops::IndexOpOutcome::AlreadyRunning(_) => {
+            println!("{}", o.skip_note().unwrap());
+            return Ok(());
+        }
+    };
+
     #[cfg(feature = "remote")]
     let remote = is_neo4j_backend();
     #[cfg(not(feature = "remote"))]
@@ -31,9 +41,29 @@ pub(crate) fn cmd_index(root: &Path, full: bool, no_embed: bool) -> Result<()> {
                 if had_sessions {
                     let _ = std::fs::rename(&sessions_dir, &sessions_backup);
                 }
-                std::fs::remove_dir_all(&tg_dir)?;
+                // `_op_guard` above holds a flock on .infigraph/index.lock for
+                // this whole reindex. A flock is held on the underlying inode,
+                // not the path — deleting the file just unlinks that name, so
+                // remove_dir_all-ing the whole directory (as this used to do)
+                // would silently drop our lock's visibility: a second process
+                // could then create a fresh index.lock and acquire an
+                // uncontended lock on it for the rest of this full reindex,
+                // defeating the mutual exclusion the lock exists to provide.
+                // So the wipe walks the directory and removes everything
+                // except index.lock (kept as the live rendezvous point) —
+                // sessions/ is already excluded above via the rename dance.
+                for entry in std::fs::read_dir(&tg_dir)?.flatten() {
+                    if entry.file_name() == "index.lock" {
+                        continue;
+                    }
+                    let path = entry.path();
+                    if path.is_dir() {
+                        std::fs::remove_dir_all(&path)?;
+                    } else {
+                        std::fs::remove_file(&path)?;
+                    }
+                }
                 if had_sessions {
-                    std::fs::create_dir_all(&tg_dir)?;
                     let _ = std::fs::rename(&sessions_backup, &sessions_dir);
                 }
                 println!("Cleaned .infigraph/ for full reindex (sessions preserved)");
@@ -247,6 +277,13 @@ pub(crate) fn cmd_index(root: &Path, full: bool, no_embed: bool) -> Result<()> {
         .map(|e| e.language.clone())
         .collect();
     drop(prism);
+
+    // Release the index-op lock before spawning the detached scip-enrich
+    // child. That child re-invokes this binary and immediately tries to
+    // acquire the same index.lock (role "scip-enrich") — if we're still
+    // holding it here, the child would see AlreadyRunning against its own
+    // parent and silently skip enrichment on every single index run.
+    drop(_op_guard);
 
     // SCIP enrichment in a detached child process — parent returns immediately.
     spawn_scip_child_process(root, &detected_languages);
@@ -695,6 +732,18 @@ pub(crate) fn run_scip_indexer(
 
 /// Entry point for the hidden `scip-enrich` subcommand (spawned by `index`).
 pub(crate) fn cmd_scip_enrich(root: &Path, detected_languages: &std::collections::HashSet<String>) {
+    let op = infigraph_core::ops::begin_index_op(root, "scip-enrich", std::time::Duration::ZERO);
+    let _op_guard = match op {
+        Ok(infigraph_core::ops::IndexOpOutcome::Acquired(g)) => g,
+        Ok(o @ infigraph_core::ops::IndexOpOutcome::AlreadyRunning(_)) => {
+            eprintln!("{}", o.skip_note().unwrap());
+            return;
+        }
+        Err(e) => {
+            eprintln!("warning: scip-enrich: failed to acquire index-op lock: {e}");
+            return;
+        }
+    };
     auto_scip_background(root, detected_languages);
 }
 
