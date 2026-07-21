@@ -223,6 +223,20 @@ impl Infigraph {
         // behavior for extensioned db paths (e.g. ".infigraph/docs.kuzu").
         let wal = PathBuf::from(format!("{}.wal", db_path.display()));
         let _ = std::fs::remove_file(&wal);
+        // Kuzu also leaves WAL-family temp siblings (e.g. `<db>.wal.checkpoint`)
+        // carrying the OLD database's ID; a leftover one makes a freshly
+        // recreated database permanently unopenable ("Database ID ... does not
+        // match"). Remove the whole family.
+        if let (Some(parent), Some(name)) = (db_path.parent(), db_path.file_name()) {
+            let prefix = format!("{}.wal.", name.to_string_lossy());
+            if let Ok(entries) = std::fs::read_dir(parent) {
+                for e in entries.flatten() {
+                    if e.file_name().to_string_lossy().starts_with(&prefix) {
+                        let _ = std::fs::remove_file(e.path());
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
