@@ -186,7 +186,9 @@ impl Infigraph {
                              corrupt graph and rebuilding...",
                             Self::OPEN_RETRY_BACKOFF_MS.len() + 1
                         );
-                        Self::wipe_graph(&self.db_path);
+                        Self::wipe_graph(&self.db_path).with_context(|| {
+                            "refusing to wipe: graph write lock is held by a live process"
+                        })?;
                         let kb = graph::KuzuBackend::open(&self.db_path).with_context(|| {
                             format!("graph still unreadable after wipe (was: {last_err})")
                         })?;
@@ -198,11 +200,17 @@ impl Infigraph {
         }
     }
 
-    fn wipe_graph(db_path: &Path) {
+    fn wipe_graph(db_path: &Path) -> Result<()> {
+        // A wipe must never race a live writer: take the same per-graph lock
+        // writers hold. Busy here means a live process -- refuse, don't destroy.
+        let lock_path = db_path.with_extension("lock");
+        let _lock =
+            crate::lockfile::acquire(&lock_path, "graph-wipe", std::time::Duration::from_secs(5))?;
         let _ = std::fs::remove_dir_all(db_path);
         let _ = std::fs::remove_file(db_path);
         let wal = db_path.with_extension("wal");
         let _ = std::fs::remove_file(&wal);
+        Ok(())
     }
 
     /// Initialize the graph store in read-only mode.
