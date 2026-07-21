@@ -1,5 +1,6 @@
 pub mod compress;
 pub mod health;
+pub mod idle;
 pub mod recovery;
 pub mod session_context;
 pub mod tools;
