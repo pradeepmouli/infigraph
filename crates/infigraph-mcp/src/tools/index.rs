@@ -56,6 +56,19 @@ pub fn tool_index_project(args: &Value) -> Result<String> {
     }
 
     // Fallback: run inline if CLI not found
+    let root = std::path::Path::new(path);
+    let op = infigraph_core::ops::begin_index_op(
+        root,
+        "index_project (mcp)",
+        std::time::Duration::ZERO,
+    )?;
+    let _op_guard = match op {
+        infigraph_core::ops::IndexOpOutcome::Acquired(g) => g,
+        o @ infigraph_core::ops::IndexOpOutcome::AlreadyRunning(_) => {
+            return Ok(o.skip_note().unwrap());
+        }
+    };
+
     let prism = open_prism(args)?;
     let result = prism.index()?;
 

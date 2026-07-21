@@ -7,6 +7,7 @@ use std::time::Duration;
 use anyhow::Result;
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
+use crate::ops::{begin_index_op, IndexOpOutcome};
 use crate::Infigraph;
 use batch::ChangeBatch;
 
@@ -155,25 +156,89 @@ where
             && last_periodic.elapsed() >= Duration::from_secs(periodic_secs)
         {
             if let Some(ref cb) = on_periodic {
-                if let Ok(prism) = open_transient(root, &make_registry) {
-                    match prism.index() {
-                        Ok(result) => {
-                            if !result.extractions.is_empty() {
-                                cb(&result);
+                // Wait mode: serializes against a concurrently-running index
+                // op rather than skipping outright, so a periodic refresh
+                // isn't starved by e.g. a long CLI `infigraph index` run.
+                // Note: this call blocks synchronously for up to 30s, and
+                // this whole loop iteration is single-threaded — so under
+                // sustained contention (another op holding the lock for
+                // most/all of that window) the ENTIRE watcher loop stalls
+                // for the wait, not just the periodic refresh: the batch
+                // flush below and event draining from `rx` both wait too,
+                // roughly once per periodic tick. Filesystem events aren't
+                // lost during the stall — `notify`'s channel just buffers
+                // them until the next `rx` drain — but latency spikes.
+                match begin_index_op(root, "infigraph watch", Duration::from_secs(30)) {
+                    Ok(IndexOpOutcome::Acquired(_guard)) => {
+                        if let Ok(prism) = open_transient(root, &make_registry) {
+                            match prism.index() {
+                                Ok(result) => {
+                                    if !result.extractions.is_empty() {
+                                        cb(&result);
+                                    }
+                                }
+                                Err(e) => eprintln!("[watch] periodic reindex failed: {e}"),
                             }
                         }
-                        Err(e) => eprintln!("[watch] periodic reindex failed: {e}"),
+                        changes_since_periodic = 0;
+                        last_periodic = std::time::Instant::now();
+                        // _guard drops here, releasing the index-op lock
+                    }
+                    Ok(o @ IndexOpOutcome::AlreadyRunning(_)) => {
+                        // begin_index_op only returns this variant in
+                        // non-blocking (wait=ZERO) mode; with the 30s wait
+                        // budget used here it always resolves to Acquired
+                        // or Err(Busy). Handled rather than assumed
+                        // unreachable. Counters are left untouched so this
+                        // cycle is retried on the next loop tick.
+                        eprintln!(
+                            "[watch] periodic index operation busy ({}), retrying next period",
+                            o.skip_note().unwrap_or_default()
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[watch] periodic index operation busy ({e}), retrying next period"
+                        );
                     }
                 }
+            } else {
+                changes_since_periodic = 0;
+                last_periodic = std::time::Instant::now();
             }
-            changes_since_periodic = 0;
-            last_periodic = std::time::Instant::now();
         }
 
         // Flush the batch when the window has closed
         if !batch.is_empty() && batch.is_ready() {
             let paths = batch.drain();
             let count = paths.len();
+
+            // Serialize this batch against any other index operation (CLI
+            // `infigraph index`, MCP `index_project`, SCIP enrichment, ...)
+            // rather than racing it. Waits up to 30s; on contention beyond
+            // that, the drained paths are re-added to the batch instead of
+            // being dropped, so the next window retries them.
+            let guard = match begin_index_op(root, "infigraph watch", Duration::from_secs(30)) {
+                Ok(IndexOpOutcome::Acquired(g)) => g,
+                Ok(o @ IndexOpOutcome::AlreadyRunning(_)) => {
+                    // begin_index_op only returns this variant in
+                    // non-blocking (wait=ZERO) mode; with the 30s wait
+                    // budget used here it always resolves to Acquired or
+                    // Err(Busy). Handled rather than assumed unreachable.
+                    eprintln!(
+                        "[watch] index operation busy ({}), retrying batch next window",
+                        o.skip_note().unwrap_or_default()
+                    );
+                    batch.readd(paths);
+                    continue;
+                }
+                Err(e) => {
+                    eprintln!("[watch] index operation busy ({e}), retrying batch next window");
+                    batch.readd(paths);
+                    continue;
+                }
+            };
+
             eprintln!("[watch] batch indexing {count} files");
 
             if let Ok(prism) = open_transient(root, &make_registry) {
@@ -207,6 +272,10 @@ where
                 }
                 // prism drops here, releasing the DB lock
             }
+            drop(guard);
+            // guard released the index-op lock; the batch guard was held
+            // across index_files, the embedding update, and event emission
+            // above, matching the task-3 contract.
         }
 
         match rx.recv_timeout(Duration::from_millis(200)) {

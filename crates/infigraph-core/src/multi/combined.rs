@@ -6,6 +6,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use arrow::array::{Array, StringArray};
@@ -14,16 +15,64 @@ use arrow::datatypes::DataType;
 use crate::graph::parquet_loader;
 use crate::graph::store::GraphStore;
 use crate::graph::GraphQuery;
+use crate::ops::{begin_index_op, IndexOpOutcome};
 
 use super::Registry;
 
+/// Outcome of a combined-graph build attempt.
+pub enum CombinedBuildOutcome {
+    /// Built normally: (symbol_count, edge_count).
+    Built { symbols: usize, edges: usize },
+    /// The group root's index operation lock was already held by another
+    /// in-flight build (or group index) — skipped without touching the
+    /// combined graph. Carries the skip reason (no trailing "— skipped";
+    /// callers compose their own "skipped — <reason>" phrasing).
+    Skipped(String),
+}
+
+impl CombinedBuildOutcome {
+    /// Unwraps a `Built` outcome, panicking with the skip note otherwise.
+    /// For call sites (mostly tests) that don't expect contention.
+    pub fn expect_built(self) -> (usize, usize) {
+        match self {
+            CombinedBuildOutcome::Built { symbols, edges } => (symbols, edges),
+            CombinedBuildOutcome::Skipped(note) => {
+                panic!("combined graph build was skipped: {note}")
+            }
+        }
+    }
+}
+
+/// Root directory for a group — project-shaped, with its own `.infigraph/`
+/// (holding the combined graph and the group's index operation lock).
+fn group_root_path(group_name: &str) -> Result<PathBuf> {
+    let graph_path = combined_graph_path(group_name)?; // .../groups/{group}/.infigraph/graph
+    let infigraph_dir = graph_path.parent().context("invalid combined graph path")?;
+    let root = infigraph_dir
+        .parent()
+        .context("invalid combined graph path")?;
+    Ok(root.to_path_buf())
+}
+
 /// Build (or rebuild) a combined graph for a group.
-/// Returns (symbol_count, edge_count) in the combined graph.
-pub fn build_combined_graph(registry: &Registry, group_name: &str) -> Result<(usize, usize)> {
+pub fn build_combined_graph(registry: &Registry, group_name: &str) -> Result<CombinedBuildOutcome> {
     let group = registry
         .groups
         .get(group_name)
         .context(format!("group '{}' not found", group_name))?;
+
+    // Take the group root's own index operation lock before touching the
+    // combined graph — coarser than the write lock taken below, held
+    // across the whole build so it never interleaves with another build
+    // (or a `group index` run) against the same group.
+    let group_root = group_root_path(group_name)?;
+    let op = begin_index_op(&group_root, "group build", Duration::ZERO)?;
+    let _op_guard = match op {
+        IndexOpOutcome::Acquired(g) => g,
+        o @ IndexOpOutcome::AlreadyRunning(_) => {
+            return Ok(CombinedBuildOutcome::Skipped(o.skip_reason().unwrap()));
+        }
+    };
 
     let combined_path = combined_graph_path(group_name)?;
     if combined_path.exists() {
@@ -241,7 +290,10 @@ pub fn build_combined_graph(registry: &Registry, group_name: &str) -> Result<(us
         total_symbols, total_edges, cross_resolved
     );
 
-    Ok((total_symbols, total_edges))
+    Ok(CombinedBuildOutcome::Built {
+        symbols: total_symbols,
+        edges: total_edges,
+    })
 }
 
 /// Read a parquet file, prefix specified string columns, write back.

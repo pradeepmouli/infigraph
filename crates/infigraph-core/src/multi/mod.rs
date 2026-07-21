@@ -8,11 +8,15 @@ pub use cross_service::*;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::lang::LanguageRegistry;
+use crate::ops::{
+    begin_index_op, wipe_infigraph_preserving_index_lock, IndexOpGuard, IndexOpOutcome,
+};
 use crate::Infigraph;
 
 #[cfg(feature = "neo4j")]
@@ -492,13 +496,32 @@ pub fn sync_group_contracts(
     Ok(count)
 }
 
-/// Index all repos in a group. Returns Vec of (repo_name, indexed_files, total_files).
+/// Outcome of indexing a single group member.
+enum MemberOutcome {
+    /// Indexed normally: (repo_name, indexed_files, total_files, opened
+    /// graph, held op lock). The lock guard rides along so it stays held
+    /// through this member's post-processing (manifest indexing +
+    /// registry registration) in the caller's post-index loop, not just
+    /// through `index_one` itself.
+    Indexed(String, usize, usize, Box<Infigraph>, IndexOpGuard),
+    /// The member's own index operation lock was already held by another
+    /// in-flight run — skipped without touching its graph. Carries the
+    /// skip reason (no trailing "— skipped"; callers compose their own).
+    Skipped(String, String),
+}
+
+/// (repo_name, indexed_files, total_files, skip_note) per group member.
+/// `skip_note` is `Some` when the member's index operation lock was
+/// already held by another in-flight run — the member was left untouched.
+pub type GroupIndexResults = Vec<(String, usize, usize, Option<String>)>;
+
+/// Index all repos in a group.
 pub fn index_group(
     registry: &mut Registry,
     group_name: &str,
     full: bool,
     build_registry: impl Fn() -> Result<LanguageRegistry> + Send + Sync,
-) -> Result<Vec<(String, usize, usize)>> {
+) -> Result<GroupIndexResults> {
     let group = registry
         .groups
         .get(group_name)
@@ -518,26 +541,6 @@ pub fn index_group(
             Ok((name.clone(), entry))
         })
         .collect::<Result<Vec<_>>>()?;
-
-    if full {
-        for (_, entry) in &entries {
-            let tg_dir = entry.path.join(".infigraph");
-            if tg_dir.exists() {
-                // Preserve session data across full reindex
-                let sess_dir = tg_dir.join("sessions");
-                let sess_bak = entry.path.join(".infigraph-sessions-backup");
-                let had_sessions = sess_dir.exists();
-                if had_sessions {
-                    let _ = std::fs::rename(&sess_dir, &sess_bak);
-                }
-                std::fs::remove_dir_all(&tg_dir)?;
-                if had_sessions {
-                    std::fs::create_dir_all(&tg_dir)?;
-                    let _ = std::fs::rename(&sess_bak, &sess_dir);
-                }
-            }
-        }
-    }
 
     // Skip repos whose HEAD commit hasn't changed since last index (incremental).
     // In Neo4j mode, also verify the graph actually has data for "unchanged" repos —
@@ -621,29 +624,67 @@ pub fn index_group(
         .unwrap_or(false);
 
     let org = group.org.clone();
-    let index_one =
-        |repo_name: &str, entry: &RepoEntry| -> Result<(String, usize, usize, Infigraph)> {
-            let lang_registry = build_registry()?;
-            let mut prism = Infigraph::open(&entry.path, lang_registry)?;
-            prism.init()?;
-            if prism.backend().is_some() {
-                let ns = if org.is_empty() {
-                    repo_name.to_string()
-                } else {
-                    format!("{org}/{repo_name}")
-                };
-                prism.set_namespace(&ns);
+    let index_one = |repo_name: &str, entry: &RepoEntry| -> Result<MemberOutcome> {
+        // Take this member's own index operation lock before touching its
+        // graph at all — mirrors the single-repo index path (core fns
+        // deliberately don't self-acquire; the caller loop does it here).
+        let op = begin_index_op(&entry.path, "group index", Duration::ZERO)?;
+        // Carried into MemberOutcome::Indexed rather than dropped here —
+        // this member's own graph stays touched (manifest indexing,
+        // registry registration) after index_one returns, in the
+        // caller's post-index loop, so the lock must still be held then.
+        let op_guard = match op {
+            IndexOpOutcome::Acquired(g) => g,
+            o @ IndexOpOutcome::AlreadyRunning(_) => {
+                return Ok(MemberOutcome::Skipped(
+                    repo_name.to_string(),
+                    o.skip_reason().unwrap(),
+                ));
             }
-            let result = prism.index()?;
-            Ok((
-                repo_name.to_string(),
-                result.indexed_files,
-                result.total_files,
-                prism,
-            ))
         };
 
-    let indexed: Vec<Result<(String, usize, usize, Infigraph)>> = if use_parallel {
+        if full {
+            let tg_dir = entry.path.join(".infigraph");
+            if tg_dir.exists() {
+                // Preserve session data across full reindex
+                let sess_dir = tg_dir.join("sessions");
+                let sess_bak = entry.path.join(".infigraph-sessions-backup");
+                let had_sessions = sess_dir.exists();
+                if had_sessions {
+                    let _ = std::fs::rename(&sess_dir, &sess_bak);
+                }
+                // `op_guard` above holds a flock on this member's
+                // index.lock — the shared helper preserves that file by
+                // name so the held lock stays valid through the wipe.
+                wipe_infigraph_preserving_index_lock(&tg_dir)?;
+                if had_sessions {
+                    let _ = std::fs::rename(&sess_bak, &sess_dir);
+                }
+            }
+        }
+
+        let lang_registry = build_registry()?;
+        let mut prism = Infigraph::open(&entry.path, lang_registry)?;
+        prism.init()?;
+        if prism.backend().is_some() {
+            let ns = if org.is_empty() {
+                repo_name.to_string()
+            } else {
+                format!("{org}/{repo_name}")
+            };
+            prism.set_namespace(&ns);
+        }
+        let result = prism.index()?;
+        Ok(MemberOutcome::Indexed(
+            repo_name.to_string(),
+            result.indexed_files,
+            result.total_files,
+            Box::new(prism),
+            op_guard,
+        ))
+    };
+
+    let indexed: Vec<Result<MemberOutcome>> = if use_parallel {
         use rayon::prelude::*;
         eprintln!(
             "[group] parallel indexing {} repos via Neo4j backend",
@@ -664,8 +705,12 @@ pub fn index_group(
     let mut results = Vec::new();
     for item in indexed {
         match item {
-            Ok((repo_name, indexed_files, total_files, prism)) => {
-                results.push((repo_name.clone(), indexed_files, total_files));
+            Ok(MemberOutcome::Indexed(repo_name, indexed_files, total_files, prism, _op_guard)) => {
+                // `_op_guard` (this member's index operation lock) stays held for
+                // the rest of this match arm — through manifest indexing and
+                // registry registration below — and only releases once this
+                // iteration ends, not when `index_one` returned.
+                results.push((repo_name.clone(), indexed_files, total_files, None));
 
                 // Index manifests so Dependency nodes exist for SharedPackage detection
                 if let Some(backend) = prism.backend() {
@@ -678,6 +723,10 @@ pub fn index_group(
                 if let Some(entry) = entry {
                     registry.register_repo(&repo_name, &entry.path, &prism)?;
                 }
+            }
+            Ok(MemberOutcome::Skipped(repo_name, note)) => {
+                eprintln!("[group] skipping '{}': {}", repo_name, note);
+                results.push((repo_name, 0, 0, Some(note)));
             }
             Err(e) => {
                 eprintln!("[group] indexing failed: {e}");
