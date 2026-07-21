@@ -138,7 +138,9 @@ fn test_stale_payload_without_flock_is_adopted() {
 fn test_acquire_waits_then_succeeds() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("e.lock");
-    let guard = lockfile::try_acquire(&path, "short-holder").unwrap().expect("free");
+    let guard = lockfile::try_acquire(&path, "short-holder")
+        .unwrap()
+        .expect("free");
     let path2 = path.clone();
     let t = std::thread::spawn(move || {
         // Holder releases after 200ms; waiter has a 5s budget.
@@ -155,7 +157,9 @@ fn test_acquire_waits_then_succeeds() {
 fn test_acquire_times_out_with_busy_naming_holder() {
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("f.lock");
-    let _guard = lockfile::try_acquire(&path, "long-holder").unwrap().expect("free");
+    let _guard = lockfile::try_acquire(&path, "long-holder")
+        .unwrap()
+        .expect("free");
     let err = lockfile::acquire(&path, "impatient", Duration::from_millis(300))
         .expect_err("must time out while held");
     let busy = err.downcast_ref::<Busy>().expect("error must be Busy");
@@ -178,8 +182,8 @@ fn test_acquire_timeout_unknown_holder_on_bare_flock() {
         .open(&path)
         .unwrap();
     fs2::FileExt::lock_exclusive(&bare).unwrap();
-    let err = lockfile::acquire(&path, "modern", Duration::from_millis(200))
-        .expect_err("must time out");
+    let err =
+        lockfile::acquire(&path, "modern", Duration::from_millis(200)).expect_err("must time out");
     let busy = err.downcast_ref::<Busy>().expect("error must be Busy");
     assert!(busy.holder.is_none(), "bare flock has unknown holder");
     fs2::FileExt::unlock(&bare).unwrap();
