@@ -41,3 +41,33 @@ fn trigram_flag_defaults_false_and_latches() {
     embed::note_trigram_fallback();
     assert!(embed::trigram_fallback_active());
 }
+
+/// Regression test for the header-format bug: `embedding_count` must be
+/// magic-aware, not assume the first 4 bytes are always a raw count. Against
+/// the buggy version this read the `b"IGE1"` magic as a little-endian u32
+/// (~827 million) instead of the real count.
+#[test]
+fn embedding_count_reads_current_header_format_after_save() {
+    let dir = tempfile::tempdir().unwrap();
+    let tg = dir.path().join(".infigraph");
+    std::fs::create_dir_all(&tg).unwrap();
+    let path = tg.join("embeddings.bin");
+
+    let embeddings = vec![
+        ("a".to_string(), vec![1.0, 2.0]),
+        ("b".to_string(), vec![3.0, 4.0]),
+        ("c".to_string(), vec![5.0, 6.0]),
+    ];
+    embed::save_embeddings(&path, &embeddings).unwrap();
+
+    assert_eq!(embed::embedding_count(dir.path()), 3);
+}
+
+/// `embedding_count` must still support the legacy headerless format
+/// (pre-existing files written before the magic/version header existed).
+#[test]
+fn embedding_count_reads_legacy_headerless_format() {
+    let dir = tempfile::tempdir().unwrap();
+    write_embeddings_header(dir.path(), 42);
+    assert_eq!(embed::embedding_count(dir.path()), 42);
+}
