@@ -1,10 +1,12 @@
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 
 use infigraph_core::embed;
 use infigraph_core::graph::{SessionData, SessionStore};
+use infigraph_core::lockfile;
 
 pub fn open_session_store(args: &Value) -> Result<SessionStore> {
     let path = args
@@ -104,6 +106,8 @@ fn score_session_value(
     0.5
 }
 
+const SESSION_LOCK_TIMEOUT: Duration = Duration::from_secs(10);
+
 pub fn tool_save_session(args: &Value) -> Result<String> {
     let store = open_session_store(args)?;
     let path = args
@@ -136,103 +140,116 @@ pub fn tool_save_session(args: &Value) -> Result<String> {
     let session_name = args.get("name").and_then(|s| s.as_str()).unwrap_or("");
 
     let now = session_epoch();
-    let session_id = if session_name.is_empty() {
-        session_date_id()
-    } else {
-        format!("named_{}", session_name.to_lowercase().replace(' ', "_"))
-    };
-
-    let new_files: Vec<&str> = files_touched
-        .split(',')
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .collect();
-
-    let session = if let Some(existing) = store.load(&session_id)? {
-        let merged_decisions = if decisions.is_empty() {
-            existing.decisions.clone()
-        } else if existing.decisions.is_empty() {
-            decisions.to_string()
-        } else {
-            format!("{} | {}", existing.decisions, decisions)
-        };
-
-        let mut all_files: Vec<String> = existing
-            .files_touched
-            .split(", ")
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-        for f in &new_files {
-            if !all_files.iter().any(|x| x == f) {
-                all_files.push(f.to_string());
-            }
-        }
-
-        SessionData {
-            id: session_id.clone(),
-            name: session_name.to_string(),
-            summary: summary.to_string(),
-            pending_tasks: pending_tasks.to_string(),
-            decisions: merged_decisions,
-            files_touched: all_files.join(", "),
-            constraints: constraints.to_string(),
-            assumptions: assumptions.to_string(),
-            blockers: blockers.to_string(),
-            created_at: existing.created_at,
-            updated_at: now,
-            confidence: 0.9_f32.max(existing.confidence),
-            last_accessed: now,
-        }
-    } else {
-        SessionData {
-            id: session_id.clone(),
-            name: session_name.to_string(),
-            summary: summary.to_string(),
-            pending_tasks: pending_tasks.to_string(),
-            decisions: decisions.to_string(),
-            files_touched: new_files.join(", "),
-            constraints: constraints.to_string(),
-            assumptions: assumptions.to_string(),
-            blockers: blockers.to_string(),
-            created_at: now,
-            updated_at: now,
-            confidence: score_session_value(decisions, constraints, assumptions, blockers),
-            last_accessed: now,
-        }
-    };
-
-    store.save(&session)?;
-
     let root = PathBuf::from(path);
     let sessions_dir = root.join(".infigraph").join("sessions");
 
-    if !narrative.is_empty() {
-        let md_path = sessions_dir.join(format!("{session_id}.md"));
-        use std::io::Write;
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&md_path)?;
-        let ts_secs = now % 86400;
-        let hh = ts_secs / 3600;
-        let mm = (ts_secs % 3600) / 60;
-        writeln!(f, "\n## Save @ {hh:02}:{mm:02} UTC\n")?;
-        writeln!(f, "{narrative}")?;
-    }
+    let (session_id, session_count) = {
+        let _session_lock = lockfile::acquire(
+            &sessions_dir.join("sessions.lock"),
+            "session-write",
+            SESSION_LOCK_TIMEOUT,
+        )?;
 
-    let emb_path = sessions_dir.join("embeddings.bin");
-    let embed_text =
-        format!("{session_name} {summary} {pending_tasks} {decisions} {constraints} {assumptions} {narrative}");
-    let embedder = embed::code_embedder();
-    let vec = embedder.embed(&embed_text)?;
-    let mut emb_store = embed::load_embeddings(&emb_path).unwrap_or_default();
-    emb_store.retain(|(id, _)| id != &session_id);
-    emb_store.push((session_id.clone(), vec));
-    embed::save_embeddings(&emb_path, &emb_store)?;
+        let session_id = if session_name.is_empty() {
+            session_date_id()
+        } else {
+            format!("named_{}", session_name.to_lowercase().replace(' ', "_"))
+        };
 
-    // Auto-trigger consolidation when session count > 50
-    let session_count = emb_store.len();
+        let new_files: Vec<&str> = files_touched
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        let session = if let Some(existing) = store.load(&session_id)? {
+            let merged_decisions = if decisions.is_empty() {
+                existing.decisions.clone()
+            } else if existing.decisions.is_empty() {
+                decisions.to_string()
+            } else {
+                format!("{} | {}", existing.decisions, decisions)
+            };
+
+            let mut all_files: Vec<String> = existing
+                .files_touched
+                .split(", ")
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            for f in &new_files {
+                if !all_files.iter().any(|x| x == f) {
+                    all_files.push(f.to_string());
+                }
+            }
+
+            SessionData {
+                id: session_id.clone(),
+                name: session_name.to_string(),
+                summary: summary.to_string(),
+                pending_tasks: pending_tasks.to_string(),
+                decisions: merged_decisions,
+                files_touched: all_files.join(", "),
+                constraints: constraints.to_string(),
+                assumptions: assumptions.to_string(),
+                blockers: blockers.to_string(),
+                created_at: existing.created_at,
+                updated_at: now,
+                confidence: 0.9_f32.max(existing.confidence),
+                last_accessed: now,
+            }
+        } else {
+            SessionData {
+                id: session_id.clone(),
+                name: session_name.to_string(),
+                summary: summary.to_string(),
+                pending_tasks: pending_tasks.to_string(),
+                decisions: decisions.to_string(),
+                files_touched: new_files.join(", "),
+                constraints: constraints.to_string(),
+                assumptions: assumptions.to_string(),
+                blockers: blockers.to_string(),
+                created_at: now,
+                updated_at: now,
+                confidence: score_session_value(decisions, constraints, assumptions, blockers),
+                last_accessed: now,
+            }
+        };
+
+        store.save(&session)?;
+
+        if !narrative.is_empty() {
+            let md_path = sessions_dir.join(format!("{session_id}.md"));
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&md_path)?;
+            let ts_secs = now % 86400;
+            let hh = ts_secs / 3600;
+            let mm = (ts_secs % 3600) / 60;
+            writeln!(f, "\n## Save @ {hh:02}:{mm:02} UTC\n")?;
+            writeln!(f, "{narrative}")?;
+        }
+
+        let emb_path = sessions_dir.join("embeddings.bin");
+        let embed_text = format!(
+            "{session_name} {summary} {pending_tasks} {decisions} {constraints} {assumptions} {narrative}"
+        );
+        let embedder = embed::code_embedder();
+        let vec = embedder.embed(&embed_text)?;
+        let mut emb_store = embed::load_embeddings(&emb_path).unwrap_or_default();
+        emb_store.retain(|(id, _)| id != &session_id);
+        emb_store.push((session_id.clone(), vec));
+        embed::save_embeddings(&emb_path, &emb_store)?;
+
+        (session_id, emb_store.len())
+    };
+    // `_session_lock` is dropped here (end of block), released before the
+    // auto-consolidation call below — tool_consolidate_memory acquires the
+    // same sessions.lock itself (Task 3), so holding it across that call
+    // would self-deadlock.
+
     let auto_consolidated = if session_count > 50 {
         let consolidate_args = serde_json::json!({ "path": path, "threshold": 0.7 });
         tool_consolidate_memory(&consolidate_args).ok()
@@ -1111,5 +1128,53 @@ mod tests {
         assert!(out.contains("2 recent sessions"));
         assert!(out.contains("**Decisions:** (2 — use"));
         assert!(!out.contains("Goal: foo. Decision: bar"));
+    }
+
+    #[test]
+    fn concurrent_save_session_preserves_all_embeddings() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path();
+        std::fs::create_dir_all(project.join(".infigraph")).unwrap();
+        let project_str = project.to_str().unwrap().to_string();
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let mut handles = Vec::new();
+        for t in 0..2 {
+            let project_str = project_str.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                for i in 0..15 {
+                    let args = json!({
+                        "path": project_str,
+                        "name": format!("concurrent-{t}-{i}"),
+                        "summary": format!("thread {t} iteration {i}"),
+                    });
+                    tool_save_session(&args).unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let emb_path = project
+            .join(".infigraph")
+            .join("sessions")
+            .join("embeddings.bin");
+        let embeddings = embed::load_embeddings(&emb_path).unwrap();
+        let ids: std::collections::HashSet<&str> =
+            embeddings.iter().map(|(id, _)| id.as_str()).collect();
+
+        for t in 0..2 {
+            for i in 0..15 {
+                let expected = format!("named_concurrent-{t}-{i}");
+                assert!(
+                    ids.contains(expected.as_str()),
+                    "missing embedding for {expected} — lost update, {} of 30 present",
+                    ids.len()
+                );
+            }
+        }
     }
 }
