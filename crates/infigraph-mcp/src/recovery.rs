@@ -12,9 +12,10 @@ pub fn wipe_code_and_docs(root: &Path) {
 
     let graph_path = ig.join("graph");
     if graph_path.exists() {
-        let _ = std::fs::remove_file(&graph_path);
-        let _ = std::fs::remove_dir_all(&graph_path);
+        let _ = infigraph_core::quarantine::quarantine_graph(&ig, "graph");
     }
+    let _ = std::fs::remove_file(&graph_path);
+    let _ = std::fs::remove_dir_all(&graph_path);
     let _ = std::fs::remove_file(ig.join("graph.wal"));
 
     if let Ok(mut idx) = infigraph_docs::DocIndex::open(root) {
