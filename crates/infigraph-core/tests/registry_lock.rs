@@ -40,7 +40,10 @@ fn concurrent_saves_never_produce_unparseable_registry_json() {
     // Every save() call went through an atomic temp+rename swap, so the
     // final file must always parse — a torn write would fail here.
     let loaded = Registry::load();
-    assert!(loaded.is_ok(), "registry.json corrupted after concurrent saves: {loaded:?}");
+    assert!(
+        loaded.is_ok(),
+        "registry.json corrupted after concurrent saves: {loaded:?}"
+    );
 
     std::env::remove_var("HOME");
 }
