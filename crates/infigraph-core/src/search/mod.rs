@@ -169,16 +169,7 @@ impl BM25Index {
                 buf.extend_from_slice(&tf.to_le_bytes());
             }
         }
-        let tmp_path = path.with_file_name(format!(
-            "{}.tmp",
-            path.file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("bm25_cache.bin")
-        ));
-        std::fs::write(&tmp_path, &buf)
-            .map_err(|e| anyhow::anyhow!("write bm25 cache temp file: {}", e))?;
-        std::fs::rename(&tmp_path, path)
-            .map_err(|e| anyhow::anyhow!("atomically replace bm25 cache: {}", e))?;
+        embed::atomic_write(path, &buf)?;
         Ok(())
     }
 

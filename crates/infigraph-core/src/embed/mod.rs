@@ -7,6 +7,32 @@ use anyhow::{Context, Result};
 
 use crate::model::Symbol;
 
+/// Compute the sibling temp path for an atomic write: same directory as
+/// `path`, with a `.tmp` suffix appended to the file name. Same-directory
+/// placement is required for the subsequent `rename(2)` to stay on one
+/// filesystem and be atomic.
+pub fn atomic_tmp_path(path: &Path) -> PathBuf {
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("out");
+    path.with_file_name(format!("{name}.tmp"))
+}
+
+/// Write `buf` to `path` atomically via temp-file-then-rename: write to a
+/// sibling `.tmp` file (see `atomic_tmp_path`), then `rename(2)` it into
+/// place so readers never observe a partially-written file.
+///
+/// Callers that can't hand over a pre-built buffer — e.g. a third-party
+/// library that writes directly to a path, like `usearch::Index::save` —
+/// should call `atomic_tmp_path` themselves and perform the write + rename
+/// manually instead of using this helper.
+pub fn atomic_write(path: &Path, buf: &[u8]) -> Result<()> {
+    let tmp_path = atomic_tmp_path(path);
+    std::fs::write(&tmp_path, buf)
+        .with_context(|| format!("write temp file {}", tmp_path.display()))?;
+    std::fs::rename(&tmp_path, path)
+        .with_context(|| format!("atomically replace {}", path.display()))?;
+    Ok(())
+}
+
 struct CachedEmbeddings {
     path: PathBuf,
     modified: std::time::SystemTime,
@@ -711,13 +737,7 @@ pub fn build_hnsw_index(
         }
     });
 
-    let tmp_index_path = index_path.with_file_name(format!(
-        "{}.tmp",
-        index_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("hnsw_index.usearch")
-    ));
+    let tmp_index_path = atomic_tmp_path(index_path);
     let tmp_index_str = tmp_index_path
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("non-utf8 temp index path"))?;
@@ -764,14 +784,7 @@ fn write_binary_sidecar(
         buf.extend_from_slice(&(id_bytes.len() as u32).to_le_bytes());
         buf.extend_from_slice(id_bytes);
     }
-    let tmp_path = path.with_file_name(format!(
-        "{}.tmp",
-        path.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("hnsw.meta")
-    ));
-    std::fs::write(&tmp_path, &buf).context("write binary hnsw sidecar temp file")?;
-    std::fs::rename(&tmp_path, path).context("atomically replace binary hnsw sidecar")?;
+    atomic_write(path, &buf)?;
     Ok(())
 }
 
