@@ -20,6 +20,7 @@ pub mod model;
 pub mod multi;
 pub mod ops;
 pub mod patterns;
+pub mod quarantine;
 pub mod refactor;
 pub mod reflection;
 mod report;
@@ -207,6 +208,21 @@ impl Infigraph {
         let lock_path = db_path.with_extension("lock");
         let _lock =
             crate::lockfile::acquire(&lock_path, "graph-wipe", std::time::Duration::from_secs(5))?;
+
+        // Quarantine (rename aside) instead of delete: this path only runs
+        // after init()'s retry/backoff verdict concludes the graph is
+        // durably unopenable and no live process holds it (see the caller).
+        // Per R3.1.2, an automatic corruption verdict must not destroy the
+        // evidence -- a human may need it to diagnose what went wrong.
+        if let (Some(parent), Some(name)) = (db_path.parent(), db_path.file_name()) {
+            if db_path.exists() {
+                let _ = crate::quarantine::quarantine_graph(parent, &name.to_string_lossy());
+            }
+        }
+        // quarantine_graph best-effort-moves the base path + `.wal`/`.wal.*`
+        // family together; fall through to remove anything it couldn't move
+        // (e.g. if db_path didn't exist, or a partial failure left remnants)
+        // so a freshly recreated database never inherits stale WAL state.
         let _ = std::fs::remove_dir_all(db_path);
         let _ = std::fs::remove_file(db_path);
         // Kuzu's on-disk WAL filename APPENDS ".wal" to the full db filename
@@ -812,6 +828,58 @@ mod tests {
             rows.len(),
             0,
             "persistent corruption should have been wiped, not silently ignored"
+        );
+    }
+
+    #[test]
+    fn init_quarantines_instead_of_deleting_on_persistent_corruption() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        let db_path = root.join(".infigraph").join("graph");
+
+        {
+            let store = GraphStore::open(&db_path).unwrap();
+            let conn = store.connection().unwrap();
+            conn.query(
+                "CREATE (:Symbol {id: 'marker::quarantined', name: 'quarantined', kind: 'function', \
+                 file: 'marker.rs', start_line: 0, end_line: 0, signature_hash: '', \
+                 language: 'rust', visibility: 'public', parent: '', docstring: '', \
+                 complexity: 0, parameters: '', return_type: ''})",
+            )
+            .unwrap();
+        }
+        // Corrupt permanently -- nothing heals this one.
+        std::fs::write(&db_path, b"not a valid kuzu database file at all").unwrap();
+
+        let registry = LanguageRegistry::new();
+        let mut ig = Infigraph::open(root, registry).unwrap();
+        let result = ig.init();
+        assert!(result.is_ok(), "init() must still recover: {result:?}");
+
+        let infigraph_dir = root.join(".infigraph");
+        let quarantine_dirs: Vec<_> = std::fs::read_dir(&infigraph_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("graph.corrupt.")
+            })
+            .collect();
+        assert_eq!(
+            quarantine_dirs.len(),
+            1,
+            "exactly one quarantine dir must exist after a persistent-corruption wipe"
+        );
+        let quarantined_content = std::fs::read(quarantine_dirs[0].path()).unwrap_or_default();
+        assert_eq!(
+            quarantined_content, b"not a valid kuzu database file at all",
+            "the quarantined file must preserve the exact corrupt content, not be re-created empty"
+        );
+        assert!(
+            !db_path.exists() || GraphStore::open(&db_path).is_ok(),
+            "the live db_path must either be gone or be the freshly rebuilt, openable database \
+             -- never the old corrupt content left in place"
         );
     }
 }

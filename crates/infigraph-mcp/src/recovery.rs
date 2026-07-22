@@ -24,9 +24,10 @@ fn wipe_code_and_docs_with_timeout(root: &Path, timeout: Duration) -> anyhow::Re
 
     let graph_path = ig.join("graph");
     if graph_path.exists() {
-        let _ = std::fs::remove_file(&graph_path);
-        let _ = std::fs::remove_dir_all(&graph_path);
+        let _ = infigraph_core::quarantine::quarantine_graph(&ig, "graph");
     }
+    let _ = std::fs::remove_file(&graph_path);
+    let _ = std::fs::remove_dir_all(&graph_path);
     let _ = std::fs::remove_file(ig.join("graph.wal"));
     // Also remove Kuzu's WAL-family temp siblings (e.g. graph.wal.checkpoint):
     // one left behind carries the old database's ID and permanently blocks
