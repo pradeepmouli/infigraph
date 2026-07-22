@@ -96,13 +96,10 @@ fn auto_reindex_all() {
     }
 
     // Reindex group combined graphs
-    let groups_dir = std::env::var("HOME")
-        .map(|h| {
-            std::path::PathBuf::from(h)
-                .join(".infigraph")
-                .join("groups")
-        })
-        .ok();
+    let groups_dir = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(dirs_next::home_dir)
+        .map(|h| h.join(".infigraph").join("groups"));
     if let Some(ref gd) = groups_dir {
         if let Ok(entries) = std::fs::read_dir(gd) {
             for entry in entries.flatten() {
@@ -149,7 +146,9 @@ fn find_infigraph_cli_for_reindex() -> Option<std::path::PathBuf> {
         }
     }
     // Check common install locations
-    let home = std::env::var("HOME").ok().map(std::path::PathBuf::from);
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(dirs_next::home_dir);
     if let Some(ref h) = home {
         let local_bin = h.join(".local").join("bin").join(bin_name);
         if local_bin.exists() {
@@ -198,9 +197,10 @@ fn install_panic_hook() {
 }
 
 fn acquire_instance_lock() -> Option<std::fs::File> {
-    let lock_path = std::env::var("HOME")
+    let lock_path = std::env::var_os("HOME")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::path::PathBuf::from("."))
+        .or_else(dirs_next::home_dir)
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
         .join(".infigraph")
         .join("mcp.lock");
     if let Some(parent) = lock_path.parent() {

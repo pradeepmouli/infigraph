@@ -596,9 +596,10 @@ pub fn mcp_log(level: &str, msg: &str) {
 }
 
 fn mcp_log_file_path() -> std::path::PathBuf {
-    std::env::var("HOME")
+    std::env::var_os("HOME")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::path::PathBuf::from("."))
+        .or_else(dirs_next::home_dir)
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
         .join(".infigraph")
         .join("mcp.log")
 }
@@ -732,9 +733,10 @@ pub fn handle_tools_call(id: &Value, request: &Value) -> Value {
                     .and_then(|p| p.as_str())
                     .map(|p| std::path::PathBuf::from(p).join(".infigraph"))
                     .or_else(|| {
-                        std::env::var("HOME")
-                            .ok()
-                            .map(|h| std::path::PathBuf::from(h).join(".infigraph"))
+                        std::env::var_os("HOME")
+                            .map(std::path::PathBuf::from)
+                            .or_else(dirs_next::home_dir)
+                            .map(|h| h.join(".infigraph"))
                     })
                 {
                     let _ = std::fs::create_dir_all(&dir);
