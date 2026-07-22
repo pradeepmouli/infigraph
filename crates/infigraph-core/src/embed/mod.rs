@@ -396,6 +396,12 @@ pub fn best_embedder() -> Box<dyn EmbedProvider> {
 }
 
 /// Count the number of embeddings in the binary file at `root/.infigraph/embeddings.bin`.
+///
+/// Magic-aware but lightweight: reads only enough bytes to locate the
+/// `count:u32` field, without mmapping or checksum-validating the whole
+/// file the way `load_embeddings` does. Handles both the current
+/// `[magic:4][version:1][count:4]...` format and the legacy headerless
+/// `[count:4]...` format that `load_embeddings` also falls back to.
 pub fn embedding_count(root: &Path) -> usize {
     let path = root.join(".infigraph").join("embeddings.bin");
     let Ok(file) = std::fs::File::open(&path) else {
@@ -406,7 +412,21 @@ pub fn embedding_count(root: &Path) -> usize {
     if r.read_exact(&mut buf4).is_err() {
         return 0;
     }
-    u32::from_le_bytes(buf4) as usize
+    if buf4 == EMBEDDINGS_MAGIC {
+        // Skip the 1-byte version field, then read the real count field.
+        let mut version = [0u8; 1];
+        if r.read_exact(&mut version).is_err() {
+            return 0;
+        }
+        let mut count_buf = [0u8; 4];
+        if r.read_exact(&mut count_buf).is_err() {
+            return 0;
+        }
+        u32::from_le_bytes(count_buf) as usize
+    } else {
+        // Legacy headerless format: the first 4 bytes are the count itself.
+        u32::from_le_bytes(buf4) as usize
+    }
 }
 
 const EMBEDDINGS_MAGIC: [u8; 4] = *b"IGE1";
