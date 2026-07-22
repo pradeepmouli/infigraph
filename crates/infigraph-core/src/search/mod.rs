@@ -34,6 +34,16 @@ pub struct BM25Index {
     avg_doc_len: f32,
 }
 
+impl Default for BM25Index {
+    fn default() -> Self {
+        Self {
+            docs: Vec::new(),
+            inverted: HashMap::new(),
+            avg_doc_len: 1.0,
+        }
+    }
+}
+
 impl BM25Index {
     /// Build a BM25 index from symbol (id, text) pairs.
     pub fn build(docs: Vec<(String, String)>) -> Self {
@@ -66,6 +76,35 @@ impl BM25Index {
             inverted,
             avg_doc_len,
         }
+    }
+
+    /// Add a document to the index. Only used for testing purposes.
+    #[allow(dead_code)]
+    pub fn add_document(&mut self, id: String, text: String) {
+        let idx = self.docs.len();
+        self.docs.push((id, text.clone()));
+
+        let tokens = tokenize(&text);
+        let mut tf_map: HashMap<&str, f32> = HashMap::new();
+        for t in &tokens {
+            *tf_map.entry(t.as_str()).or_default() += 1.0;
+        }
+
+        for (term, tf) in tf_map {
+            self.inverted
+                .entry(term.to_string())
+                .or_default()
+                .push((idx, tf));
+        }
+
+        // Recalculate average document length
+        let total_len: usize = self.docs.iter().map(|(_, t)| tokenize(t).len()).sum();
+        self.avg_doc_len = total_len as f32 / self.docs.len().max(1) as f32;
+    }
+
+    /// Get the number of documents in the index.
+    pub fn doc_count(&self) -> usize {
+        self.docs.len()
     }
 
     /// Score all documents against a query. Returns (doc_index, score) sorted descending.
@@ -130,7 +169,17 @@ impl BM25Index {
                 buf.extend_from_slice(&tf.to_le_bytes());
             }
         }
-        std::fs::write(path, &buf).map_err(|e| anyhow::anyhow!("write bm25 cache: {}", e))
+        let tmp_path = path.with_file_name(format!(
+            "{}.tmp",
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("bm25_cache.bin")
+        ));
+        std::fs::write(&tmp_path, &buf)
+            .map_err(|e| anyhow::anyhow!("write bm25 cache temp file: {}", e))?;
+        std::fs::rename(&tmp_path, path)
+            .map_err(|e| anyhow::anyhow!("atomically replace bm25 cache: {}", e))?;
+        Ok(())
     }
 
     pub fn load(path: &Path) -> Result<Self> {

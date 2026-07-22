@@ -711,12 +711,20 @@ pub fn build_hnsw_index(
         }
     });
 
-    let path_str = index_path
+    let tmp_index_path = index_path.with_file_name(format!(
+        "{}.tmp",
+        index_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("hnsw_index.usearch")
+    ));
+    let tmp_index_str = tmp_index_path
         .to_str()
-        .ok_or_else(|| anyhow::anyhow!("non-utf8 index path"))?;
+        .ok_or_else(|| anyhow::anyhow!("non-utf8 temp index path"))?;
     index
-        .save(path_str)
+        .save(tmp_index_str)
         .map_err(|e| anyhow::anyhow!("usearch save: {e}"))?;
+    std::fs::rename(&tmp_index_path, index_path).context("atomically replace hnsw index file")?;
 
     let emb_mtime = std::fs::metadata(embeddings_path)
         .and_then(|m| m.modified())
@@ -756,7 +764,14 @@ fn write_binary_sidecar(
         buf.extend_from_slice(&(id_bytes.len() as u32).to_le_bytes());
         buf.extend_from_slice(id_bytes);
     }
-    std::fs::write(path, &buf).context("write binary hnsw sidecar")?;
+    let tmp_path = path.with_file_name(format!(
+        "{}.tmp",
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("hnsw.meta")
+    ));
+    std::fs::write(&tmp_path, &buf).context("write binary hnsw sidecar temp file")?;
+    std::fs::rename(&tmp_path, path).context("atomically replace binary hnsw sidecar")?;
     Ok(())
 }
 
