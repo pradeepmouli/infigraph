@@ -63,3 +63,50 @@ fn concurrent_readers_never_observe_a_torn_write() {
         r.join().unwrap();
     }
 }
+
+#[test]
+fn save_embeddings_detects_truncation_via_checksum() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("embeddings.bin");
+    let data = vec![
+        ("a".to_string(), vec![1.0, 2.0, 3.0, 4.0]),
+        ("b".to_string(), vec![5.0, 6.0, 7.0, 8.0]),
+    ];
+    save_embeddings(&path, &data).unwrap();
+
+    // Corrupt the file: flip a byte in the middle of the payload without
+    // changing its length, so length-based `ensure!` checks in the parser
+    // would not catch it — only a checksum can.
+    let mut bytes = std::fs::read(&path).unwrap();
+    let mid = bytes.len() / 2;
+    bytes[mid] ^= 0xFF;
+    std::fs::write(&path, &bytes).unwrap();
+
+    let result = load_embeddings(&path);
+    assert!(
+        result.is_err(),
+        "a single flipped byte must be caught by the checksum, not silently parsed"
+    );
+}
+
+#[test]
+fn load_embeddings_still_reads_pre_header_legacy_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("embeddings.bin");
+    // Hand-write the OLD headerless format directly (no magic/version/checksum)
+    // to simulate a file written before this task landed.
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&1u32.to_le_bytes()); // count
+    let id = b"legacy";
+    buf.extend_from_slice(&(id.len() as u32).to_le_bytes());
+    buf.extend_from_slice(id);
+    buf.extend_from_slice(&2u32.to_le_bytes()); // dim
+    buf.extend_from_slice(&1.0_f32.to_le_bytes());
+    buf.extend_from_slice(&2.0_f32.to_le_bytes());
+    std::fs::write(&path, &buf).unwrap();
+
+    let loaded = load_embeddings(&path).unwrap();
+    assert_eq!(loaded.len(), 1);
+    assert_eq!(loaded[0].0, "legacy");
+    assert_eq!(loaded[0].1, vec![1.0, 2.0]);
+}

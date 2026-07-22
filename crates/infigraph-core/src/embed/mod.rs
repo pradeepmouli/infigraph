@@ -409,27 +409,53 @@ pub fn embedding_count(root: &Path) -> usize {
     u32::from_le_bytes(buf4) as usize
 }
 
-/// Save symbol embeddings to a binary file. Format: [count:u32] then for each entry: [id_len:u32][id_bytes][dim:u32][f32 * dim]
+const EMBEDDINGS_MAGIC: [u8; 4] = *b"IGE1";
+const EMBEDDINGS_FORMAT_VERSION: u8 = 2;
+
+/// Save symbol embeddings to a binary file. Format:
+/// [magic:4][version:u8][count:u32] then per entry [id_len:u32][id_bytes][dim:u32][f32*dim],
+/// followed by an 8-byte trailing checksum (std DefaultHasher) over everything
+/// from `count` through the last entry (i.e. everything after the magic+version).
 pub fn save_embeddings(path: &Path, embeddings: &[(String, Vec<f32>)]) -> Result<()> {
-    let tmp_path = path.with_file_name(format!(
-        "{}.tmp",
-        path.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("embeddings.bin")
-    ));
+    use std::hash::Hasher;
+    let tmp_path = atomic_tmp_path(path);
     {
         let file = std::fs::File::create(&tmp_path).context("create temp embeddings file")?;
         let mut w = BufWriter::new(file);
-        w.write_all(&(embeddings.len() as u32).to_le_bytes())?;
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+
+        w.write_all(&EMBEDDINGS_MAGIC)?;
+        w.write_all(&[EMBEDDINGS_FORMAT_VERSION])?;
+
+        // NOTE: hash bytes via `Hasher::write` (raw, streaming-composable
+        // concatenation of bytes) rather than the `Hash` trait's `.hash()`
+        // method — `Hash for [T]`/`Hash for [T; N]` length-prefixes every
+        // call, so hashing several small chunks here would NOT reproduce
+        // the same digest as `load_embeddings` hashing the whole payload
+        // buffer in one call. `Hasher::write` has no such prefix and is
+        // safe to split across arbitrarily many calls.
+        let count_bytes = (embeddings.len() as u32).to_le_bytes();
+        w.write_all(&count_bytes)?;
+        hasher.write(&count_bytes);
+
         for (id, vec) in embeddings {
             let id_bytes = id.as_bytes();
-            w.write_all(&(id_bytes.len() as u32).to_le_bytes())?;
+            let id_len_bytes = (id_bytes.len() as u32).to_le_bytes();
+            w.write_all(&id_len_bytes)?;
+            hasher.write(&id_len_bytes);
             w.write_all(id_bytes)?;
-            w.write_all(&(vec.len() as u32).to_le_bytes())?;
+            hasher.write(id_bytes);
+            let dim_bytes = (vec.len() as u32).to_le_bytes();
+            w.write_all(&dim_bytes)?;
+            hasher.write(&dim_bytes);
             for &v in vec {
-                w.write_all(&v.to_le_bytes())?;
+                let f_bytes = v.to_le_bytes();
+                w.write_all(&f_bytes)?;
+                hasher.write(&f_bytes);
             }
         }
+
+        w.write_all(&hasher.finish().to_le_bytes())?;
         w.flush().context("flush temp embeddings file")?;
     }
     std::fs::rename(&tmp_path, path).context("atomically replace embeddings file")?;
@@ -438,37 +464,75 @@ pub fn save_embeddings(path: &Path, embeddings: &[(String, Vec<f32>)]) -> Result
 }
 
 /// Load symbol embeddings from a binary file using memory-mapped I/O.
+/// Transparently reads both the current header+checksum format and the
+/// legacy headerless format written before this format existed.
 pub fn load_embeddings(path: &Path) -> Result<Vec<(String, Vec<f32>)>> {
+    use std::hash::Hasher;
     let file = std::fs::File::open(path).context("open embeddings file")?;
     let mmap = unsafe { memmap2::Mmap::map(&file) }.context("mmap embeddings file")?;
     let data = &mmap[..];
 
     anyhow::ensure!(data.len() >= 4, "embeddings file too small");
-    let count = u32::from_le_bytes(data[0..4].try_into().unwrap()) as usize;
+
+    let (payload, has_checksum) = if data.len() >= 5 && data[0..4] == EMBEDDINGS_MAGIC {
+        anyhow::ensure!(
+            data.len() >= 5 + 8,
+            "embeddings file has a header but is too small to hold a checksum trailer"
+        );
+        let version = data[4];
+        anyhow::ensure!(
+            version == EMBEDDINGS_FORMAT_VERSION,
+            "unsupported embeddings format version: {version}"
+        );
+        let payload_end = data.len() - 8;
+        let payload = &data[5..payload_end];
+        let stored_checksum = u64::from_le_bytes(data[payload_end..].try_into().unwrap());
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        // Raw `write`, matching the per-chunk `Hasher::write` calls in
+        // `save_embeddings` — see the note there on why `.hash()` (the
+        // `Hash` trait method, which length-prefixes) would not match.
+        hasher.write(payload);
+        anyhow::ensure!(
+            hasher.finish() == stored_checksum,
+            "embeddings file checksum mismatch — file is corrupt: {}",
+            path.display()
+        );
+        (payload, true)
+    } else {
+        (data, false)
+    };
+    let _ = has_checksum; // only used to document the branch above; no further behavior differs
+
+    anyhow::ensure!(payload.len() >= 4, "embeddings payload too small");
+    let count = u32::from_le_bytes(payload[0..4].try_into().unwrap()) as usize;
     let mut result = Vec::with_capacity(count);
     let mut pos = 4usize;
 
     for _ in 0..count {
-        anyhow::ensure!(pos + 4 <= data.len(), "truncated embeddings file");
-        let id_len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+        anyhow::ensure!(pos + 4 <= payload.len(), "truncated embeddings file");
+        let id_len = u32::from_le_bytes(payload[pos..pos + 4].try_into().unwrap()) as usize;
         pos += 4;
-        anyhow::ensure!(pos + id_len <= data.len(), "truncated embeddings file");
-        let id = std::str::from_utf8(&data[pos..pos + id_len])
+        anyhow::ensure!(pos + id_len <= payload.len(), "truncated embeddings file");
+        let id = std::str::from_utf8(&payload[pos..pos + id_len])
             .context("invalid utf8 in embedding id")?
             .to_string();
         pos += id_len;
-        anyhow::ensure!(pos + 4 <= data.len(), "truncated embeddings file");
-        let dim = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
+        anyhow::ensure!(pos + 4 <= payload.len(), "truncated embeddings file");
+        let dim = u32::from_le_bytes(payload[pos..pos + 4].try_into().unwrap()) as usize;
         pos += 4;
         let float_bytes = dim * 4;
-        anyhow::ensure!(pos + float_bytes <= data.len(), "truncated embeddings file");
-        let vec: Vec<f32> = data[pos..pos + float_bytes]
+        anyhow::ensure!(
+            pos + float_bytes <= payload.len(),
+            "truncated embeddings file"
+        );
+        let vec: Vec<f32> = payload[pos..pos + float_bytes]
             .chunks_exact(4)
-            .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
             .collect();
         pos += float_bytes;
         result.push((id, vec));
     }
+
     Ok(result)
 }
 
