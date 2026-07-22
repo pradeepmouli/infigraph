@@ -596,16 +596,19 @@ pub fn tool_purge_sessions(args: &Value) -> Result<String> {
     }
 
     let purged_ids: Vec<String> = to_purge.iter().map(|s| s.id.clone()).collect();
+    let root = PathBuf::from(path);
+    let sessions_dir = root.join(".infigraph").join("sessions");
+    let _session_lock = lockfile::acquire(
+        &sessions_dir.join("sessions.lock"),
+        "session-write",
+        SESSION_LOCK_TIMEOUT,
+    )?;
 
     for id in &purged_ids {
         store.delete(id)?;
     }
 
-    let root = PathBuf::from(path);
-    let emb_path = root
-        .join(".infigraph")
-        .join("sessions")
-        .join("embeddings.bin");
+    let emb_path = sessions_dir.join("embeddings.bin");
     if emb_path.exists() {
         let mut emb_store = embed::load_embeddings(&emb_path).unwrap_or_default();
         let before = emb_store.len();
@@ -748,190 +751,200 @@ pub fn tool_consolidate_memory(args: &Value) -> Result<String> {
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
 
-    // Purge expired sessions (confidence < 0.1)
-    let purged = store.purge_expired(now)?;
-
     let root = PathBuf::from(path);
-    let emb_path = root
-        .join(".infigraph")
-        .join("sessions")
-        .join("embeddings.bin");
+    let sessions_dir = root.join(".infigraph").join("sessions");
 
-    if !emb_path.exists() {
-        let msg = if purged.is_empty() {
-            "No session embeddings found. Nothing to consolidate.".to_string()
-        } else {
-            format!(
-                "Purged {} expired sessions. No embeddings to consolidate.",
-                purged.len()
-            )
-        };
-        return Ok(msg);
-    }
+    let (consolidated_count, mut out) = {
+        let _session_lock = lockfile::acquire(
+            &sessions_dir.join("sessions.lock"),
+            "session-write",
+            SESSION_LOCK_TIMEOUT,
+        )?;
 
-    let emb_store = embed::load_embeddings(&emb_path)?;
-    if emb_store.len() < 2 {
-        return Ok("Fewer than 2 sessions — nothing to consolidate.".to_string());
-    }
+        // Purge expired sessions (confidence < 0.1)
+        let purged = store.purge_expired(now)?;
 
-    // Load all active sessions with embeddings
-    let mut sessions_with_emb: Vec<(SessionData, Vec<f32>)> = Vec::new();
-    for (id, emb) in &emb_store {
-        if let Some(session) = store.load(id)? {
-            if !session.is_archived(now) && !id.starts_with("consolidated_") {
-                sessions_with_emb.push((session, emb.clone()));
-            }
+        let emb_path = sessions_dir.join("embeddings.bin");
+
+        if !emb_path.exists() {
+            let msg = if purged.is_empty() {
+                "No session embeddings found. Nothing to consolidate.".to_string()
+            } else {
+                format!(
+                    "Purged {} expired sessions. No embeddings to consolidate.",
+                    purged.len()
+                )
+            };
+            return Ok(msg);
         }
-    }
 
-    if sessions_with_emb.len() < 2 {
-        return Ok("Fewer than 2 active sessions — nothing to consolidate.".to_string());
-    }
-
-    // Union-find clustering by similarity
-    let n = sessions_with_emb.len();
-    let mut parent: Vec<usize> = (0..n).collect();
-
-    fn find(parent: &mut [usize], i: usize) -> usize {
-        if parent[i] != i {
-            parent[i] = find(parent, parent[i]);
+        let emb_store = embed::load_embeddings(&emb_path)?;
+        if emb_store.len() < 2 {
+            return Ok("Fewer than 2 sessions — nothing to consolidate.".to_string());
         }
-        parent[i]
-    }
 
-    for i in 0..n {
-        for j in (i + 1)..n {
-            let sim = embed::cosine_similarity(&sessions_with_emb[i].1, &sessions_with_emb[j].1);
-            if sim >= similarity_threshold {
-                let pi = find(&mut parent, i);
-                let pj = find(&mut parent, j);
-                if pi != pj {
-                    parent[pi] = pj;
+        // Load all active sessions with embeddings
+        let mut sessions_with_emb: Vec<(SessionData, Vec<f32>)> = Vec::new();
+        for (id, emb) in &emb_store {
+            if let Some(session) = store.load(id)? {
+                if !session.is_archived(now) && !id.starts_with("consolidated_") {
+                    sessions_with_emb.push((session, emb.clone()));
                 }
             }
         }
-    }
 
-    // Build clusters
-    let mut clusters: std::collections::HashMap<usize, Vec<usize>> =
-        std::collections::HashMap::new();
-    for i in 0..n {
-        let root_idx = find(&mut parent, i);
-        clusters.entry(root_idx).or_default().push(i);
-    }
-
-    let mut consolidated_count = 0;
-    let mut out = String::from("## Memory Consolidation\n\n");
-
-    for members in clusters.values() {
-        if members.len() < 2 {
-            continue;
+        if sessions_with_emb.len() < 2 {
+            return Ok("Fewer than 2 active sessions — nothing to consolidate.".to_string());
         }
 
-        // Merge sessions in cluster
-        let mut merged_summary = String::new();
-        let mut merged_decisions = String::new();
-        let mut merged_constraints = String::new();
-        let mut merged_assumptions = String::new();
-        let mut merged_blockers = String::new();
-        let mut merged_files: Vec<String> = Vec::new();
-        let mut source_ids: Vec<String> = Vec::new();
-        let mut earliest_created = i64::MAX;
-        let mut latest_updated = 0i64;
+        // Union-find clustering by similarity
+        let n = sessions_with_emb.len();
+        let mut parent: Vec<usize> = (0..n).collect();
 
-        for &idx in members {
-            let session = &sessions_with_emb[idx].0;
-            source_ids.push(session.id.clone());
-
-            if !session.summary.is_empty() {
-                if !merged_summary.is_empty() {
-                    merged_summary.push_str(" | ");
-                }
-                merged_summary.push_str(&session.summary);
+        fn find(parent: &mut [usize], i: usize) -> usize {
+            if parent[i] != i {
+                parent[i] = find(parent, parent[i]);
             }
-            if !session.decisions.is_empty() {
-                if !merged_decisions.is_empty() {
-                    merged_decisions.push_str(" | ");
-                }
-                merged_decisions.push_str(&session.decisions);
-            }
-            if !session.constraints.is_empty() {
-                if !merged_constraints.is_empty() {
-                    merged_constraints.push_str(" | ");
-                }
-                merged_constraints.push_str(&session.constraints);
-            }
-            if !session.assumptions.is_empty() {
-                if !merged_assumptions.is_empty() {
-                    merged_assumptions.push_str(" | ");
-                }
-                merged_assumptions.push_str(&session.assumptions);
-            }
-            if !session.blockers.is_empty() {
-                if !merged_blockers.is_empty() {
-                    merged_blockers.push_str(" | ");
-                }
-                merged_blockers.push_str(&session.blockers);
-            }
-            for f in session.files_touched.split(',').map(|s| s.trim()) {
-                if !f.is_empty() && !merged_files.contains(&f.to_string()) {
-                    merged_files.push(f.to_string());
-                }
-            }
-            earliest_created = earliest_created.min(session.created_at);
-            latest_updated = latest_updated.max(session.updated_at);
+            parent[i]
         }
 
-        let consolidated_id = format!("consolidated_{}", earliest_created);
-
-        let consolidated = SessionData {
-            id: consolidated_id.clone(),
-            name: format!("Consolidated ({} sessions)", members.len()),
-            summary: merged_summary,
-            pending_tasks: String::new(),
-            decisions: merged_decisions,
-            files_touched: merged_files.join(", "),
-            constraints: merged_constraints,
-            assumptions: merged_assumptions,
-            blockers: merged_blockers,
-            created_at: earliest_created,
-            updated_at: now,
-            confidence: 0.9,
-            last_accessed: now,
-        };
-
-        store.save(&consolidated)?;
-
-        // Re-embed consolidated session
-        let embed_text = format!(
-            "{} {} {} {}",
-            consolidated.summary,
-            consolidated.decisions,
-            consolidated.constraints,
-            consolidated.assumptions
-        );
-        let embedder = embed::code_embedder();
-        if let Ok(emb_vec) = embedder.embed(&embed_text) {
-            let mut all_embs = embed::load_embeddings(&emb_path)?;
-            all_embs.push((consolidated_id.clone(), emb_vec));
-            embed::save_embeddings(&emb_path, &all_embs)?;
+        for i in 0..n {
+            for j in (i + 1)..n {
+                let sim =
+                    embed::cosine_similarity(&sessions_with_emb[i].1, &sessions_with_emb[j].1);
+                if sim >= similarity_threshold {
+                    let pi = find(&mut parent, i);
+                    let pj = find(&mut parent, j);
+                    if pi != pj {
+                        parent[pi] = pj;
+                    }
+                }
+            }
         }
 
-        // Lower confidence of source sessions (superseded, not deleted)
-        for &idx in members {
-            let mut session = sessions_with_emb[idx].0.clone();
-            session.confidence = (session.compute_confidence(now) * 0.5).max(0.3);
-            store.save(&session)?;
+        // Build clusters
+        let mut clusters: std::collections::HashMap<usize, Vec<usize>> =
+            std::collections::HashMap::new();
+        for i in 0..n {
+            let root_idx = find(&mut parent, i);
+            clusters.entry(root_idx).or_default().push(i);
         }
 
-        out.push_str(&format!(
-            "### {} — merged {} sessions\n",
-            consolidated_id,
-            members.len()
-        ));
-        out.push_str(&format!("Sources: {}\n\n", source_ids.join(", ")));
-        consolidated_count += 1;
-    }
+        let mut consolidated_count = 0;
+        let mut out = String::from("## Memory Consolidation\n\n");
+
+        for members in clusters.values() {
+            if members.len() < 2 {
+                continue;
+            }
+
+            let mut merged_summary = String::new();
+            let mut merged_decisions = String::new();
+            let mut merged_constraints = String::new();
+            let mut merged_assumptions = String::new();
+            let mut merged_blockers = String::new();
+            let mut merged_files: Vec<String> = Vec::new();
+            let mut source_ids: Vec<String> = Vec::new();
+            let mut earliest_created = i64::MAX;
+            let mut latest_updated = 0i64;
+
+            for &idx in members {
+                let session = &sessions_with_emb[idx].0;
+                source_ids.push(session.id.clone());
+
+                if !session.summary.is_empty() {
+                    if !merged_summary.is_empty() {
+                        merged_summary.push_str(" | ");
+                    }
+                    merged_summary.push_str(&session.summary);
+                }
+                if !session.decisions.is_empty() {
+                    if !merged_decisions.is_empty() {
+                        merged_decisions.push_str(" | ");
+                    }
+                    merged_decisions.push_str(&session.decisions);
+                }
+                if !session.constraints.is_empty() {
+                    if !merged_constraints.is_empty() {
+                        merged_constraints.push_str(" | ");
+                    }
+                    merged_constraints.push_str(&session.constraints);
+                }
+                if !session.assumptions.is_empty() {
+                    if !merged_assumptions.is_empty() {
+                        merged_assumptions.push_str(" | ");
+                    }
+                    merged_assumptions.push_str(&session.assumptions);
+                }
+                if !session.blockers.is_empty() {
+                    if !merged_blockers.is_empty() {
+                        merged_blockers.push_str(" | ");
+                    }
+                    merged_blockers.push_str(&session.blockers);
+                }
+                for f in session.files_touched.split(',').map(|s| s.trim()) {
+                    if !f.is_empty() && !merged_files.contains(&f.to_string()) {
+                        merged_files.push(f.to_string());
+                    }
+                }
+                earliest_created = earliest_created.min(session.created_at);
+                latest_updated = latest_updated.max(session.updated_at);
+            }
+
+            let consolidated_id = format!("consolidated_{}", earliest_created);
+
+            let consolidated = SessionData {
+                id: consolidated_id.clone(),
+                name: format!("Consolidated ({} sessions)", members.len()),
+                summary: merged_summary,
+                pending_tasks: String::new(),
+                decisions: merged_decisions,
+                files_touched: merged_files.join(", "),
+                constraints: merged_constraints,
+                assumptions: merged_assumptions,
+                blockers: merged_blockers,
+                created_at: earliest_created,
+                updated_at: now,
+                confidence: 0.9,
+                last_accessed: now,
+            };
+
+            store.save(&consolidated)?;
+
+            let embed_text = format!(
+                "{} {} {} {}",
+                consolidated.summary,
+                consolidated.decisions,
+                consolidated.constraints,
+                consolidated.assumptions
+            );
+            let embedder = embed::code_embedder();
+            if let Ok(emb_vec) = embedder.embed(&embed_text) {
+                let mut all_embs = embed::load_embeddings(&emb_path)?;
+                all_embs.push((consolidated_id.clone(), emb_vec));
+                embed::save_embeddings(&emb_path, &all_embs)?;
+            }
+
+            for &idx in members {
+                let mut session = sessions_with_emb[idx].0.clone();
+                session.confidence = (session.compute_confidence(now) * 0.5).max(0.3);
+                store.save(&session)?;
+            }
+
+            out.push_str(&format!(
+                "### {} — merged {} sessions\n",
+                consolidated_id,
+                members.len()
+            ));
+            out.push_str(&format!("Sources: {}\n\n", source_ids.join(", ")));
+            consolidated_count += 1;
+        }
+
+        (consolidated_count, out)
+    };
+    // `_session_lock` is dropped here — the symbol-cluster lookup below
+    // touches unrelated graph state, not sessions.lock resources, so it
+    // deliberately runs outside the lock.
 
     if consolidated_count == 0 {
         out.push_str(
@@ -1176,5 +1189,55 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn concurrent_save_and_purge_do_not_corrupt_embeddings() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path();
+        std::fs::create_dir_all(project.join(".infigraph")).unwrap();
+        let project_str = project.to_str().unwrap().to_string();
+
+        // Seed a handful of sessions so purge has something to look at.
+        for i in 0..3 {
+            let args = json!({
+                "path": project_str,
+                "name": format!("seed-{i}"),
+                "summary": format!("seed session {i}"),
+            });
+            tool_save_session(&args).unwrap();
+        }
+
+        let save_path = project_str.clone();
+        let saver = std::thread::spawn(move || {
+            for i in 0..10 {
+                let args = json!({
+                    "path": save_path,
+                    "name": format!("racer-{i}"),
+                    "summary": format!("racer session {i}"),
+                });
+                tool_save_session(&args).unwrap();
+            }
+        });
+
+        let purge_path = project_str.clone();
+        let purger = std::thread::spawn(move || {
+            for _ in 0..10 {
+                let args = json!({ "path": purge_path, "older_than_days": 9999 });
+                tool_purge_sessions(&args).ok();
+            }
+        });
+
+        saver.join().unwrap();
+        purger.join().unwrap();
+
+        // The embeddings file must remain parseable after the race — a torn
+        // or corrupted write would make load_embeddings return Err.
+        let emb_path = project
+            .join(".infigraph")
+            .join("sessions")
+            .join("embeddings.bin");
+        let loaded = embed::load_embeddings(&emb_path);
+        assert!(loaded.is_ok(), "embeddings.bin corrupted: {loaded:?}");
     }
 }
