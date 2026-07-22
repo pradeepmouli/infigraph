@@ -8,11 +8,13 @@ pub use cross_service::*;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::lang::LanguageRegistry;
+use crate::lockfile;
 use crate::Infigraph;
 
 #[cfg(feature = "neo4j")]
@@ -104,8 +106,12 @@ impl Registry {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        let lock_path = registry_lock_path()?;
+        let _lock = lockfile::acquire(&lock_path, "registry-write", REGISTRY_LOCK_TIMEOUT)?;
+        let tmp_path = path.with_file_name("registry.json.tmp");
         let data = serde_json::to_string_pretty(self)?;
-        std::fs::write(&path, data)?;
+        std::fs::write(&tmp_path, &data)?;
+        std::fs::rename(&tmp_path, &path)?;
         Ok(())
     }
 
@@ -766,6 +772,16 @@ fn registry_path() -> Result<PathBuf> {
         .context("cannot determine home directory")?;
     Ok(home.join(".infigraph").join("registry.json"))
 }
+
+fn registry_lock_path() -> Result<PathBuf> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .or_else(dirs_next::home_dir)
+        .context("cannot determine home directory")?;
+    Ok(home.join(".infigraph").join("registry.lock"))
+}
+
+const REGISTRY_LOCK_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Default org from `INFIGRAPH_ORG` env var. Empty string means no org scoping.
 pub fn default_org() -> String {
