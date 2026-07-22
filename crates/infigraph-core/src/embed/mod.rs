@@ -401,7 +401,10 @@ pub fn best_embedder() -> Box<dyn EmbedProvider> {
 /// `count:u32` field, without mmapping or checksum-validating the whole
 /// file the way `load_embeddings` does. Handles both the current
 /// `[magic:4][version:1][count:4]...` format and the legacy headerless
-/// `[count:4]...` format that `load_embeddings` also falls back to.
+/// `[count:4]...` format that `load_embeddings` also falls back to, via the
+/// shared `embeddings_count_offset` helper — so an unrecognized version byte
+/// is rejected the same way `load_embeddings` rejects it, rather than being
+/// silently misread as a count.
 pub fn embedding_count(root: &Path) -> usize {
     let path = root.join(".infigraph").join("embeddings.bin");
     let Ok(file) = std::fs::File::open(&path) else {
@@ -412,25 +415,62 @@ pub fn embedding_count(root: &Path) -> usize {
     if r.read_exact(&mut buf4).is_err() {
         return 0;
     }
-    if buf4 == EMBEDDINGS_MAGIC {
-        // Skip the 1-byte version field, then read the real count field.
-        let mut version = [0u8; 1];
-        if r.read_exact(&mut version).is_err() {
-            return 0;
-        }
-        let mut count_buf = [0u8; 4];
-        if r.read_exact(&mut count_buf).is_err() {
-            return 0;
-        }
-        u32::from_le_bytes(count_buf) as usize
-    } else {
-        // Legacy headerless format: the first 4 bytes are the count itself.
-        u32::from_le_bytes(buf4) as usize
+
+    // Only new-format files need the 5th (version) byte to decide the count
+    // offset; read it opportunistically so `embeddings_count_offset` can see
+    // the full header when present.
+    let mut header = [0u8; 5];
+    header[0..4].copy_from_slice(&buf4);
+    if buf4 == EMBEDDINGS_MAGIC && r.read_exact(&mut header[4..5]).is_err() {
+        return 0;
     }
+
+    let count_offset = match embeddings_count_offset(&header) {
+        Ok(offset) => offset,
+        // Recognized magic but unsupported/corrupt version — treat like any
+        // other unreadable file rather than silently misreading the count.
+        Err(_) => return 0,
+    };
+
+    let count_buf = if count_offset == 0 {
+        buf4
+    } else {
+        let mut buf = [0u8; 4];
+        if r.read_exact(&mut buf).is_err() {
+            return 0;
+        }
+        buf
+    };
+    u32::from_le_bytes(count_buf) as usize
 }
 
 const EMBEDDINGS_MAGIC: [u8; 4] = *b"IGE1";
 const EMBEDDINGS_FORMAT_VERSION: u8 = 2;
+
+/// Single source of truth for the embeddings.bin header layout: given the
+/// leading bytes of the file (at least 5, when available), determine the
+/// byte offset of the `count:u32` field.
+///
+/// New-format files begin with `EMBEDDINGS_MAGIC` (4 bytes) followed by a
+/// 1-byte version, placing `count` at offset 5. Legacy pre-header files
+/// place `count` at offset 0. Both `embedding_count` and `load_embeddings`
+/// call this so the offset arithmetic and version check live in one place.
+///
+/// Returns an error if a new-format magic is present but the version byte
+/// doesn't match `EMBEDDINGS_FORMAT_VERSION` — callers should treat that as
+/// corrupt/unsupported input, not fall back to treating it as legacy.
+fn embeddings_count_offset(header: &[u8]) -> Result<usize> {
+    if header.len() >= 5 && header[0..4] == EMBEDDINGS_MAGIC {
+        let version = header[4];
+        anyhow::ensure!(
+            version == EMBEDDINGS_FORMAT_VERSION,
+            "unsupported embeddings format version: {version}"
+        );
+        Ok(5)
+    } else {
+        Ok(0)
+    }
+}
 
 /// Save symbol embeddings to a binary file. Format:
 /// [magic:4][version:u8][count:u32] then per entry [id_len:u32][id_bytes][dim:u32][f32*dim],
@@ -494,18 +534,18 @@ pub fn load_embeddings(path: &Path) -> Result<Vec<(String, Vec<f32>)>> {
 
     anyhow::ensure!(data.len() >= 4, "embeddings file too small");
 
-    let (payload, has_checksum) = if data.len() >= 5 && data[0..4] == EMBEDDINGS_MAGIC {
+    let header_len = data.len().min(5);
+    let count_offset = embeddings_count_offset(&data[..header_len])?;
+
+    let payload = if count_offset > 0 {
+        // New format: everything after the magic+version header is the
+        // counted payload, up to an 8-byte checksum trailer.
         anyhow::ensure!(
-            data.len() >= 5 + 8,
+            data.len() >= count_offset + 8,
             "embeddings file has a header but is too small to hold a checksum trailer"
         );
-        let version = data[4];
-        anyhow::ensure!(
-            version == EMBEDDINGS_FORMAT_VERSION,
-            "unsupported embeddings format version: {version}"
-        );
         let payload_end = data.len() - 8;
-        let payload = &data[5..payload_end];
+        let payload = &data[count_offset..payload_end];
         let stored_checksum = u64::from_le_bytes(data[payload_end..].try_into().unwrap());
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         // Raw `write`, matching the per-chunk `Hasher::write` calls in
@@ -517,11 +557,11 @@ pub fn load_embeddings(path: &Path) -> Result<Vec<(String, Vec<f32>)>> {
             "embeddings file checksum mismatch — file is corrupt: {}",
             path.display()
         );
-        (payload, true)
+        payload
     } else {
-        (data, false)
+        // Legacy headerless format: the whole buffer is the payload.
+        data
     };
-    let _ = has_checksum; // only used to document the branch above; no further behavior differs
 
     anyhow::ensure!(payload.len() >= 4, "embeddings payload too small");
     let count = u32::from_le_bytes(payload[0..4].try_into().unwrap()) as usize;
