@@ -21,6 +21,7 @@ pub fn extract_file(path: &str, source: &[u8], pack: &LanguagePack) -> Result<Fi
             grammar,
             entity_query,
             relation_query,
+            inherit_decompose_query,
         } => TS_PARSER.with(|cell| -> Result<_> {
             let mut parser = cell.borrow_mut();
             parser.set_language(grammar)?;
@@ -33,7 +34,13 @@ pub fn extract_file(path: &str, source: &[u8], pack: &LanguagePack) -> Result<Fi
 
             let symbols = extract_entities(path, source, root, entity_query, &pack.name);
             let relations = if pack.custom_edges.is_empty() {
-                extract_relations(path, source, root, relation_query)
+                extract_relations(
+                    path,
+                    source,
+                    root,
+                    relation_query,
+                    inherit_decompose_query.as_deref(),
+                )
             } else {
                 extract_relations_with_custom_edges(
                     path,
@@ -41,6 +48,7 @@ pub fn extract_file(path: &str, source: &[u8], pack: &LanguagePack) -> Result<Fi
                     root,
                     relation_query,
                     &pack.custom_edges,
+                    inherit_decompose_query.as_deref(),
                 )
             };
             let stmts = extract_statements_for_symbols(root, source, &symbols);

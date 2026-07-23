@@ -18,11 +18,14 @@
 (import_from_statement
   module_name: (dotted_name) @import.module)
 
-; Class inheritance: class Foo(Bar)
+; Class inheritance: class Foo(Bar). superclasses can be plain identifiers, dotted
+; names (pkg.Bar), or subscripted generics (Generic[T]); matching the "expression"
+; supertype (rather than a bare wildcard) correctly excludes keyword_argument nodes
+; like metaclass=Meta, which are NOT base classes.
 (class_definition
   name: (identifier) @inherit.child
   superclasses: (argument_list
-    (identifier) @inherit.parent))
+    (expression) @inherit.parent))
 
 ; Decorator on a function: @decorator def func()
 (decorated_definition
