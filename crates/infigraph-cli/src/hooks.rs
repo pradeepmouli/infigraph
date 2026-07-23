@@ -154,6 +154,16 @@ cwd=$(echo "$input" | jq -r '.cwd // empty')
 session_id=$(echo "$input" | jq -r '.session_id // empty')
 [ -z "$session_id" ] && exit 0
 
+# Teammate/subagent relays (SendMessage-delivered turns, e.g. idle
+# notifications and status pings from background agents) arrive as
+# UserPromptSubmit events just like real human input, but aren't a "user
+# exchange" in the sense this hook means -- exclude them so the counter
+# tracks actual turns with the human, not agent-orchestration chatter.
+prompt=$(echo "$input" | jq -r '.prompt // empty')
+case "$prompt" in
+  *"<teammate-message"*) exit 0 ;;
+esac
+
 counter_dir="${TMPDIR:-/tmp}/infigraph-sessions"
 mkdir -p "$counter_dir" 2>/dev/null
 counter_file="$counter_dir/$session_id.count"
