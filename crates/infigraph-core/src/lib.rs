@@ -11,6 +11,7 @@ pub mod embed;
 pub mod export;
 pub mod extract;
 pub mod graph;
+pub mod instances;
 pub mod lang;
 pub mod learned;
 pub mod lockfile;
