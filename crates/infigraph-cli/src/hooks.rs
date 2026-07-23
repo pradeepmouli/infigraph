@@ -5,8 +5,25 @@ pub(crate) const ENFORCE_HOOK_SCRIPT: &str = r#"#!/usr/bin/env bash
 # Infigraph PreToolUse enforcement hook — deny-by-default
 # Blocks raw search/file tools in Infigraph-indexed projects.
 # Deny-by-default. Fallback sentinel allows raw tools after infigraph search returns no results.
-
+#
+# MCP-liveness gate: every existing escape hatch below (the search-fallback
+# sentinel, the test-context sentinel) only ever gets set AFTER a real
+# mcp__infigraph__* tool call has already succeeded once -- meaning none of
+# them can ever fire if MCP is fully unreachable, since that requires first
+# successfully calling a tool that doesn't exist. Without this check, a
+# disconnected MCP server would block every raw tool forever while pointing
+# at an alternative that can't be reached -- no valid path out at all. A
+# `pgrep` process check can only rule the tool OUT (no process = certainly
+# unreachable), never confirm it's IN (a running process could still be
+# stale/orphaned/serving a different session), so only the "definitely not
+# running" case bypasses the block below; when a process IS found, the
+# existing sentinel-based behavior is unchanged.
 input=$(cat)
+
+if ! pgrep -f "infigraph-mcp" >/dev/null 2>&1; then
+  exit 0
+fi
+
 tool=$(echo "$input" | jq -r '.tool_name // empty')
 cwd=$(echo "$input" | jq -r '.cwd // empty')
 
@@ -23,30 +40,41 @@ if [ -f "$search_sentinel" ]; then
   fi
 fi
 
+# Even having reached here (an infigraph-mcp process was found by pgrep above),
+# that process could still be stale/orphaned/serving a different session --
+# pgrep can only rule out its total absence, never confirm it's actually
+# reachable from THIS session. Simply retrying the same raw tool call would
+# just hit this same block again (same pgrep result, same missing sentinel)
+# -- an infinite loop, not a real escape hatch. So every denial below points
+# at the sentinel check above: if Claude confirms via ToolSearch that the
+# suggested tool is genuinely unreachable, it can set that same sentinel
+# itself and the check above will correctly let the retry through.
+recovery_hint="If a quick ToolSearch shows the suggested infigraph tool genuinely isn't available despite this hook's process check, write the current unix timestamp to \$cwd/.infigraph/.search-fallback-allowed (the same sentinel checked above) and retry -- it will be allowed then."
+
 case "$tool" in
   Grep)
-    cat <<'ENDJSON'
-{"hookSpecificOutput":{"hookEventName":"PreToolUse","additionalContext":"BLOCKED: Use mcp__infigraph__search instead of Grep."}}
+    cat <<ENDJSON
+{"hookSpecificOutput":{"hookEventName":"PreToolUse","additionalContext":"BLOCKED: Use mcp__infigraph__search instead of Grep. $recovery_hint"}}
 ENDJSON
     exit 2
     ;;
   Glob)
-    cat <<'ENDJSON'
-{"hookSpecificOutput":{"hookEventName":"PreToolUse","additionalContext":"BLOCKED: Use mcp__infigraph__list_files instead of Glob."}}
+    cat <<ENDJSON
+{"hookSpecificOutput":{"hookEventName":"PreToolUse","additionalContext":"BLOCKED: Use mcp__infigraph__list_files instead of Glob. $recovery_hint"}}
 ENDJSON
     exit 2
     ;;
   Bash)
     cmd=$(echo "$input" | jq -r '.tool_input.command // empty')
     if echo "$cmd" | grep -qE '(^|\s|/)(grep|egrep|fgrep|rg|ripgrep|ag|ack)(\s|$)'; then
-      cat <<'ENDJSON'
-{"hookSpecificOutput":{"hookEventName":"PreToolUse","additionalContext":"BLOCKED: Use mcp__infigraph__search instead of grep/rg."}}
+      cat <<ENDJSON
+{"hookSpecificOutput":{"hookEventName":"PreToolUse","additionalContext":"BLOCKED: Use mcp__infigraph__search instead of grep/rg. $recovery_hint"}}
 ENDJSON
       exit 2
     fi
     if echo "$cmd" | grep -qE '(^|\s)find\s.*-name\s'; then
-      cat <<'ENDJSON'
-{"hookSpecificOutput":{"hookEventName":"PreToolUse","additionalContext":"BLOCKED: Use mcp__infigraph__list_files instead of find."}}
+      cat <<ENDJSON
+{"hookSpecificOutput":{"hookEventName":"PreToolUse","additionalContext":"BLOCKED: Use mcp__infigraph__list_files instead of find. $recovery_hint"}}
 ENDJSON
       exit 2
     fi
@@ -55,8 +83,8 @@ ENDJSON
     agent_type=$(echo "$input" | jq -r '.tool_input.subagent_type // empty')
     case "$agent_type" in
       Explore|Plan|code-reviewer)
-        cat <<'ENDJSON'
-{"hookSpecificOutput":{"hookEventName":"PreToolUse","additionalContext":"BLOCKED: This agent type lacks MCP access. Use general-purpose agent instead."}}
+        cat <<ENDJSON
+{"hookSpecificOutput":{"hookEventName":"PreToolUse","additionalContext":"BLOCKED: This agent type lacks MCP access. Use general-purpose agent instead. $recovery_hint"}}
 ENDJSON
         exit 2
         ;;
@@ -75,7 +103,7 @@ ENDJSON
       exit 0
     fi
     # Block — use infigraph tools. If infigraph search returns nothing, sentinel allows retry.
-    echo "BLOCKED: Use mcp__infigraph__get_doc_context, search, or get_code_snippet. Read only for Edit line numbers (pass offset)." >&2
+    echo "BLOCKED: Use mcp__infigraph__get_doc_context, search, or get_code_snippet. Read only for Edit line numbers (pass offset). $recovery_hint" >&2
     exit 2
     ;;
   Write|Edit)
@@ -90,8 +118,8 @@ ENDJSON
           exit 0
         fi
       fi
-      cat <<'ENDJSON'
-{"hookSpecificOutput":{"hookEventName":"PreToolUse","additionalContext":"BLOCKED: Call mcp__infigraph__generate_test_context before writing tests."}}
+      cat <<ENDJSON
+{"hookSpecificOutput":{"hookEventName":"PreToolUse","additionalContext":"BLOCKED: Call mcp__infigraph__generate_test_context before writing tests. $recovery_hint"}}
 ENDJSON
       exit 2
     fi
@@ -106,6 +134,16 @@ pub(crate) const SESSION_SAVE_HOOK_SCRIPT: &str = r#"#!/usr/bin/env bash
 # Counts user exchanges per Claude session. Every 5th exchange, emits a
 # reminder to call save_session. Resets when the PostToolUse reset hook fires.
 # stdin: JSON {prompt, session_id, cwd, ...}
+#
+# MCP-liveness aware: a hook script cannot query Claude Code's actual MCP
+# connection state (not exposed to hooks), so `pgrep` for a running
+# infigraph-mcp process is used as a cheap ONE-SIDED heuristic: no process
+# found is high-confidence "the tool call would fail," but a process found
+# is NOT proof the tool is reachable from THIS session (could be a stale,
+# orphaned, or another session's worker) — pgrep can only rule the tool
+# OUT, never confirm it's IN. So the real gate against wasted tokens is
+# always a cheap ToolSearch check done BEFORE composing any narrative,
+# regardless of what pgrep found; pgrep only changes the up-front framing.
 
 input=$(cat)
 cwd=$(echo "$input" | jq -r '.cwd // empty')
@@ -126,8 +164,22 @@ count=$((count + 1))
 echo "$count" > "$counter_file"
 
 if [ $((count % 5)) -eq 0 ]; then
-  cat <<'ENDJSON'
-{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":"MANDATORY AUTO-SAVE: Print '💾 Auto-saving session...' to the user, then IMMEDIATELY call mcp__infigraph__save_session with summary, pending_tasks, decisions, and narrative from the current session. Do this BEFORE answering the user's question. After saving, print '✅ Session saved.' and continue with the user's request. This is automatic — do NOT ask permission, do NOT skip, do NOT defer."}}
+  if pgrep -f "infigraph-mcp" >/dev/null 2>&1; then
+    mcp_hint="An infigraph-mcp process is running, but that does NOT prove it's connected to this session (could be stale, orphaned, or serving a different session)."
+  else
+    mcp_hint="No infigraph-mcp process detected at all -- mcp__infigraph__save_session is essentially guaranteed to fail."
+  fi
+
+  check_first="Regardless of that: before writing ANY summary/narrative content, do a cheap availability check first (ToolSearch for mcp__infigraph__save_session, or just attempt the call once with minimal args) -- do NOT compose the full narrative until you've confirmed the tool actually responds. This check is what actually prevents wasted work, not the process-liveness hint above."
+
+  fallback_recipe="FALLBACK once the check above shows the tool is unavailable or it errors: write directly to a file at \$cwd/.infigraph/sessions/session_<YYYY-MM-DD>.json (today's UTC date). It's a JSON object with these string fields: id (value 'session_<YYYY-MM-DD>'), name (empty string unless this is a named session), summary, pending_tasks, decisions, files_touched (comma-separated), constraints, assumptions, blockers -- plus these numeric fields: created_at, updated_at, last_accessed (all unix epoch seconds), and confidence (float). If a file for today already exists, load and merge into it rather than overwriting: decisions appends onto the existing value separated by ' | ', files_touched unions the new files in, everything else (summary/pending_tasks/constraints/assumptions/blockers) replaces the old value, created_at is kept from the existing file, confidence becomes the max of 0.9 and the existing confidence, updated_at and last_accessed become now. Also append the narrative to the companion file session_<YYYY-MM-DD>.md as a new section: a blank line, then '## Save @ HH:MM UTC' (current UTC time), a blank line, then the narrative text. Then, to keep /clear working correctly (it checks a sentinel that's normally only set after a real tool call succeeds), write '0' to \${TMPDIR:-/tmp}/infigraph-sessions/\$session_id.count and '1' to \${TMPDIR:-/tmp}/infigraph-sessions/\$session_id.saved. Only use this fallback once the check above has actually shown the tool is unreachable -- never skip the check itself."
+
+  full_context="MANDATORY AUTO-SAVE: Print '💾 Auto-saving session...' to the user, then save this session's context -- summary, pending_tasks, decisions, and narrative -- before answering the user's question. $mcp_hint $check_first $fallback_recipe After saving (via either path), print '✅ Session saved.' and continue with the user's request. This is automatic -- do NOT ask permission, do NOT skip, do NOT defer, and do NOT silently give up if the tool call fails without falling back."
+
+  json_escaped=$(printf '%s' "$full_context" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read())[1:-1])')
+
+  cat <<ENDJSON
+{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":"$json_escaped"}}
 ENDJSON
 fi
 
@@ -160,6 +212,12 @@ pub(crate) const SESSION_START_HOOK_SCRIPT: &str = r#"#!/usr/bin/env bash
 # Infigraph SessionStart hook — session continuity on startup/resume/compaction
 # stdin: JSON {session_id, cwd, source, ...}
 # source: "startup" | "resume" | "clear" | "compact"
+#
+# MCP-liveness note: reads (get_latest_session) don't need a tool-call fallback
+# at all -- this hook already reads .infigraph/sessions/*.json directly via
+# inject_session_summary, so that content is injected up front regardless of
+# whether the MCP tool would work. Only writes (save_session) genuinely need
+# a try-then-fallback recipe, since only the LLM can compose new content.
 
 input=$(cat)
 cwd=$(echo "$input" | jq -r '.cwd // empty')
@@ -198,18 +256,44 @@ inject_session_summary() {
   echo "$out"
 }
 
+# Shared save-fallback recipe (only the write side needs this -- reads are handled
+# by inject_session_summary above, which already goes straight to the file with no
+# tool call involved). pgrep can only rule the MCP tool OUT (no process = definitely
+# unreachable), never confirm it's IN (a running process could be stale/orphaned/
+# another session's) -- so it only changes the framing below. The actual gate against
+# wasted work is always a cheap availability check done before composing any
+# narrative, regardless of what pgrep found.
+save_fallback_recipe() {
+  local hint
+  if pgrep -f "infigraph-mcp" >/dev/null 2>&1; then
+    hint="An infigraph-mcp process is running, but that does NOT prove it's connected to this session (could be stale, orphaned, or serving a different session)."
+  else
+    hint="No infigraph-mcp process detected at all -- mcp__infigraph__save_session is essentially guaranteed to fail."
+  fi
+  echo "$hint Regardless of that: before writing ANY summary/narrative content, do a cheap availability check first (ToolSearch for mcp__infigraph__save_session, or attempt the call once with minimal args) -- do NOT compose the full narrative until you've confirmed the tool actually responds. FALLBACK once that check shows the tool is unavailable or it errors: write directly to a file at \$cwd/.infigraph/sessions/session_<YYYY-MM-DD>.json (today's UTC date). It's a JSON object with these string fields: id (value 'session_<YYYY-MM-DD>'), name (empty string unless this is a named session), summary, pending_tasks, decisions, files_touched (comma-separated), constraints, assumptions, blockers -- plus these numeric fields: created_at, updated_at, last_accessed (all unix epoch seconds), and confidence (float). If a file for today already exists, merge into it: decisions appends onto the existing value separated by ' | ', files_touched unions the new files in, everything else replaces the old value, created_at is kept from the existing file, confidence becomes the max of 0.9 and the existing confidence. Also append the narrative to the companion session_<YYYY-MM-DD>.md file as a new section (blank line, '## Save @ HH:MM UTC', blank line, narrative text). Then write '0' to \${TMPDIR:-/tmp}/infigraph-sessions/\$session_id.count and '1' to \${TMPDIR:-/tmp}/infigraph-sessions/\$session_id.saved so /clear keeps working. Only use this fallback once the check has actually shown the tool is unreachable -- never skip the check itself."
+}
+
+json_escape() {
+  python3 -c 'import sys,json; print(json.dumps(sys.stdin.read().strip())[1:-1])'
+}
+
 case "$source_type" in
   compact)
-    cat <<'ENDJSON'
-{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"INFIGRAPH SESSION SAVE (COMPACTION): Context was just compacted. Pre-compaction decisions and context are at risk of being lost. Call mcp__infigraph__save_session NOW with summary, pending_tasks, decisions, constraints, assumptions, and blockers from this session. Then call mcp__infigraph__get_latest_session to reload saved context. Do NOT skip this."}}
+    session_ctx=$(inject_session_summary)
+    [ -z "$session_ctx" ] && session_ctx="No prior sessions found."
+    fallback=$(save_fallback_recipe)
+    full="INFIGRAPH SESSION SAVE (COMPACTION): Context was just compacted. $session_ctx (that's what's already on disk from before this compaction -- no tool call needed to see it). Pre-compaction decisions and context not yet captured above are at risk of being lost -- capture them now. $fallback Do NOT skip this."
+    escaped=$(printf '%s' "$full" | json_escape)
+    cat <<ENDJSON
+{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"$escaped"}}
 ENDJSON
     ;;
   startup|resume)
     session_ctx=$(inject_session_summary)
     if [ -n "$session_ctx" ]; then
-      session_ctx=$(echo "$session_ctx" | python3 -c 'import sys,json; s=json.dumps(sys.stdin.read().strip()); print(s[1:-1])')
+      escaped=$(printf '%s' "$session_ctx" | json_escape)
       cat <<ENDJSON
-{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"INFIGRAPH SESSION RESTORE: $session_ctx You MUST print a visible summary of prior session context to the user (summary + pending tasks) so they can see session continuity is working. Then call mcp__infigraph__get_latest_session if more detail needed."}}
+{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"INFIGRAPH SESSION RESTORE: $escaped You MUST print a visible summary of prior session context to the user (summary + pending tasks) so they can see session continuity is working."}}
 ENDJSON
     else
       cat <<'ENDJSON'
@@ -229,16 +313,17 @@ ENDJSON
     rm -f "$cwd/.infigraph/.search-fallback-allowed" 2>/dev/null
     backup=$(ls -t "$cwd"/.infigraph/sessions/unsaved-transcript-*.md 2>/dev/null | head -1)
     session_ctx=$(inject_session_summary)
-    if [ -n "$session_ctx" ]; then
-      session_ctx=$(echo "$session_ctx" | python3 -c 'import sys,json; s=json.dumps(sys.stdin.read().strip()); print(s[1:-1])')
-    fi
     if [ -n "$backup" ]; then
+      fallback=$(save_fallback_recipe)
+      full="INFIGRAPH CONTEXT RESET: Context was cleared. $session_ctx You MUST print a visible summary of prior session context to the user (summary + pending tasks) so they can see session continuity is working. A pre-clear transcript backup exists at $backup. Read this file (contains last ~5 exchanges as clean markdown), extract key context (summary, decisions, pending tasks, files touched), then persist it: $fallback After saving (via either path), delete the backup file with Bash rm. Do NOT proceed with user work until this recovery is complete."
+      escaped=$(printf '%s' "$full" | json_escape)
       cat <<ENDJSON
-{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"INFIGRAPH CONTEXT RESET: Context was cleared. $session_ctx You MUST print a visible summary of prior session context to the user (summary + pending tasks) so they can see session continuity is working. A pre-clear transcript backup exists at $backup. Read this file (contains last ~5 exchanges as clean markdown), extract key context (summary, decisions, pending tasks, files touched), then call mcp__infigraph__save_session to persist it. After saving, delete the backup file with Bash rm. Do NOT proceed with user work until this recovery is complete."}}
+{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"$escaped"}}
 ENDJSON
     else
+      escaped=$(printf '%s' "$session_ctx" | json_escape)
       cat <<ENDJSON
-{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"INFIGRAPH CONTEXT RESET: Context was cleared. $session_ctx You MUST print a visible summary of prior session context to the user (summary + pending tasks) so they can see session continuity is working. If you need more detail, call mcp__infigraph__get_latest_session. NOTE: If session was NOT saved before /clear, some recent context may be lost."}}
+{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"INFIGRAPH CONTEXT RESET: Context was cleared. $escaped You MUST print a visible summary of prior session context to the user (summary + pending tasks) so they can see session continuity is working."}}
 ENDJSON
     fi
     ;;
