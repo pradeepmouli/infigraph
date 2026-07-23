@@ -33,7 +33,13 @@ pub enum ParserBackend {
     TreeSitter {
         grammar: Language,
         entity_query: Query,
-        relation_query: Query,
+        relation_query: Box<Query>,
+        /// Optional query for resolving a captured `@inherit.parent`/`@inherit.child`
+        /// node down to its base identifier when it's a compound wrapper (generics,
+        /// qualified/dotted names, member expressions). `None` for languages whose
+        /// grammar can't produce such compound shapes in an inheritance position, or
+        /// where a single fully-anchored pattern in `relation_query` already handles it.
+        inherit_decompose_query: Option<Box<Query>>,
     },
     Custom(Box<dyn CustomExtractor>),
 }
@@ -56,7 +62,7 @@ impl LanguagePack {
         relation_query_src: &str,
     ) -> Result<Self> {
         let entity_query = Query::new(&grammar, entity_query_src)?;
-        let relation_query = Query::new(&grammar, relation_query_src)?;
+        let relation_query = Box::new(Query::new(&grammar, relation_query_src)?);
         Ok(Self {
             name: name.to_string(),
             extensions: extensions.into_iter().map(String::from).collect(),
@@ -64,9 +70,26 @@ impl LanguagePack {
                 grammar,
                 entity_query,
                 relation_query,
+                inherit_decompose_query: None,
             },
             custom_edges: Vec::new(),
         })
+    }
+
+    /// Attach a decomposition query used to resolve compound `@inherit.parent`/
+    /// `@inherit.child` captures (generics, qualified names, member expressions) down
+    /// to their base identifier. Only meaningful for `ParserBackend::TreeSitter` packs;
+    /// a no-op on `Custom` backends.
+    pub fn with_inherit_decompose(mut self, query_src: &str) -> Result<Self> {
+        if let ParserBackend::TreeSitter {
+            grammar,
+            inherit_decompose_query,
+            ..
+        } = &mut self.backend
+        {
+            *inherit_decompose_query = Some(Box::new(Query::new(grammar, query_src)?));
+        }
+        Ok(self)
     }
 
     /// Create a tree-sitter-backed language pack with custom edge definitions.

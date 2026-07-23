@@ -16,15 +16,14 @@
   (identifier) @import.module)
 
 ; Class/struct/enum/protocol inheritance or protocol conformance:
-; class Foo: Bar, protocol Foo: Bar
+; class Foo: Bar, protocol Foo: Bar (Bar may be generic e.g. Comparable<Foo>,
+; or qualified e.g. pkg.Bar)
 (class_declaration
   name: (type_identifier) @inherit.child
   (inheritance_specifier
-    inherits_from: (user_type
-      (type_identifier) @inherit.parent)))
+    inherits_from: (_) @inherit.parent))
 
 (protocol_declaration
   name: (type_identifier) @inherit.child
   (inheritance_specifier
-    inherits_from: (user_type
-      (type_identifier) @inherit.parent)))
+    inherits_from: (_) @inherit.parent))
