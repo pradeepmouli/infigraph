@@ -363,6 +363,9 @@ pub(crate) fn cmd_watch_status(root: &Path) -> Result<()> {
 }
 
 pub(crate) fn watcher_is_alive(lock_path: &Path) -> bool {
+    if !lock_path.exists() {
+        return false;
+    }
     infigraph_core::lockfile::try_acquire(lock_path, "watch-liveness-probe")
         .ok()
         .flatten()

@@ -1313,8 +1313,25 @@ mod tests {
     #[test]
     fn watcher_is_alive_no_file() {
         let tmp = TempDir::new().unwrap();
-        let lock_path = tmp.path().join("nonexistent").join("watch.lock");
+        // No `.infigraph` dir at all — simulates probing a project that was
+        // never indexed. `watcher_is_alive` must be a pure read: it must not
+        // create the lock file (or its parent dir) as a side effect of
+        // merely checking status (see task-2-review.md, "create(true)
+        // side-effect claim").
+        let infigraph_dir = tmp.path().join(".infigraph");
+        let lock_path = infigraph_dir.join("watch.lock");
+        assert!(!infigraph_dir.exists());
+
         assert!(!crate::info_commands::watcher_is_alive(&lock_path));
+
+        assert!(
+            !infigraph_dir.exists(),
+            "watcher_is_alive must not create .infigraph as a side effect of probing"
+        );
+        assert!(
+            !lock_path.exists(),
+            "watcher_is_alive must not create watch.lock as a side effect of probing"
+        );
     }
 
     #[test]
