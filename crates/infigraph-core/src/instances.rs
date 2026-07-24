@@ -177,17 +177,6 @@ pub fn classify_instances(
         .collect()
 }
 
-/// Grace period between SIGTERM and SIGKILL when reaping an orphan.
-/// Overridable via `INFIGRAPH_REAP_GRACE_SECS` (seconds) — kept small in
-/// tests.
-pub fn reap_grace_period() -> Duration {
-    std::env::var("INFIGRAPH_REAP_GRACE_SECS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .map(Duration::from_secs)
-        .unwrap_or(Duration::from_secs(5))
-}
-
 /// How often the periodic orphan scan runs. Overridable via
 /// `INFIGRAPH_REAP_SCAN_SECS` (seconds).
 pub fn reap_scan_interval() -> Duration {
@@ -198,29 +187,16 @@ pub fn reap_scan_interval() -> Duration {
         .unwrap_or(Duration::from_secs(600))
 }
 
-/// SIGTERM the orphan's PID, wait `reap_grace_period()`, SIGKILL if still
-/// alive, then remove its registry file regardless (a removed file for an
-/// already-dead PID is correct cleanup either way). Best-effort: a process
-/// that exits on its own between the classify scan and this call is not an
-/// error.
-pub fn reap_orphan(path: &Path, pid: u32) {
-    let spid = sysinfo::Pid::from_u32(pid);
-    let mut sys = sysinfo::System::new();
-    sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[spid]), true);
-    if let Some(process) = sys.process(spid) {
-        if process.kill_with(sysinfo::Signal::Term).is_none() {
-            // SIGTERM not supported on this platform — skip straight to
-            // an unconditional kill rather than waiting out a grace period
-            // for a signal that was never actually sent.
-            process.kill();
-        } else {
-            std::thread::sleep(reap_grace_period());
-            sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[spid]), true);
-            if let Some(still_alive) = sys.process(spid) {
-                still_alive.kill();
-            }
-        }
-    }
+/// Removes a stale registry file. This is remove-file-only, on purpose —
+/// it never looks up or signals a process. `classify_instances` only marks
+/// an entry `Orphan` in two cases: the PID is dead (nothing to signal), or
+/// a live process exists at that PID but its start time doesn't match the
+/// recorded one, which — per the PID-reuse guard — *proves* that live
+/// process is not the one the entry named. Signaling in that second case
+/// would mean sending SIGTERM/SIGKILL to a provably unrelated process, so
+/// there is never a case where signaling here is correct; only cleaning up
+/// the stale file is.
+pub fn reap_orphan(path: &Path) {
     let _ = std::fs::remove_file(path);
 }
 
@@ -231,9 +207,9 @@ pub fn reap_orphans_once(own_pid: u32) -> usize {
     let entries = list_instances();
     let classified = classify_instances(&entries, own_pid, current_process_start_time);
     let mut reaped = 0;
-    for (path, info, status) in classified {
+    for (path, _info, status) in classified {
         if status == InstanceStatus::Orphan {
-            reap_orphan(&path, info.pid);
+            reap_orphan(&path);
             reaped += 1;
         }
     }

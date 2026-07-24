@@ -1,6 +1,6 @@
 use infigraph_core::instances::{
-    current_process_start_time, instances_dir, is_stale, list_instances, register_instance,
-    InstanceInfo,
+    current_process_start_time, instances_dir, is_stale, list_instances, reap_orphans_once,
+    register_instance, InstanceInfo,
 };
 
 /// Serializes tests that mutate the process-global INFIGRAPH_INSTANCES_DIR
@@ -120,5 +120,65 @@ fn list_instances_skips_unparseable_entries() {
     );
     assert_eq!(listed[0].1, info);
 
+    std::env::remove_var("INFIGRAPH_INSTANCES_DIR");
+}
+
+/// Regression test for a Critical bug: `reap_orphan` used to send real
+/// SIGTERM/SIGKILL to whatever process currently held the recorded PID,
+/// without re-checking `started_at`. But `classify_instances` only ever
+/// marks an entry `Orphan` when either the PID is dead, or a live process
+/// exists at that PID with a *different* start time than recorded — and
+/// that second case, by the PID-reuse guard's own definition, means the
+/// live process is provably not the one the entry named. So the old code's
+/// only live target was always an innocent, unrelated process. This test
+/// spawns a real child process, registers it under a deliberately wrong
+/// `started_at` (simulating the PID-reuse classification case), reaps it,
+/// and asserts the child is still alive — proving `reap_orphan` never
+/// signals a process, only removes the stale file.
+#[test]
+fn reap_orphan_never_kills_a_pid_reused_process() {
+    let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::env::set_var("INFIGRAPH_INSTANCES_DIR", dir.path());
+
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn sleep");
+    let pid = child.id();
+
+    // Deliberately wrong: real start times are always far larger than 1,
+    // so this is guaranteed to mismatch whatever `current_process_start_time`
+    // reports for the real child, simulating "PID reused" classification.
+    let info = InstanceInfo {
+        pid,
+        started_at: 1,
+        project_path: "/fake/project".to_string(),
+        transport: "stdio".to_string(),
+        host_agent_hint: None,
+    };
+    let path = dir.path().join(format!("{pid}.json"));
+    std::fs::write(&path, serde_json::to_string_pretty(&info).unwrap()).unwrap();
+
+    let own_pid = std::process::id();
+    assert_ne!(
+        own_pid, pid,
+        "test process pid must differ from the spawned child's pid"
+    );
+    reap_orphans_once(own_pid);
+
+    assert_eq!(
+        child.try_wait().expect("try_wait on child"),
+        None,
+        "reap_orphans_once must never signal a live process, even one \
+         classified Orphan due to a mismatched recorded start time"
+    );
+    assert!(
+        !path.exists(),
+        "the stale registry file must still be removed"
+    );
+
+    child.kill().expect("kill spawned child");
+    child.wait().expect("wait for spawned child");
     std::env::remove_var("INFIGRAPH_INSTANCES_DIR");
 }
