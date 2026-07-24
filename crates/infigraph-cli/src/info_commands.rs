@@ -312,6 +312,13 @@ pub(crate) fn cmd_test_coverage(root: &Path, file_filter: Option<&str>) -> Resul
 }
 
 pub(crate) fn cmd_watch(root: &Path, debounce: u64) -> Result<()> {
+    if infigraph_core::watch::daemon::is_remote_backend() {
+        println!(
+            "File watching is not supported in remote mode (Neo4j backend). \
+             Reindexing is triggered via webhooks instead."
+        );
+        return Ok(());
+    }
     // Hold exclusive lock for lifetime — signals liveness to ensure_watcher_running.
     let lock_path = root.join(".infigraph").join("watch.lock");
     let _lock = acquire_watch_lock(&lock_path)?;

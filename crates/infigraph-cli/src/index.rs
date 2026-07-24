@@ -413,100 +413,22 @@ fn scip_enrich_exit_message(
     }
 }
 
-pub(crate) const CI_ENV_VARS: &[&str] = &[
-    "CI",
-    "GITHUB_ACTIONS",
-    "JENKINS_URL",
-    "BUILDKITE",
-    "GITLAB_CI",
-    "INFIGRAPH_NO_WATCH",
-];
-
-pub(crate) fn is_ci() -> bool {
-    CI_ENV_VARS.iter().any(|v| std::env::var_os(v).is_some())
-}
-
 pub(crate) fn ensure_watcher_running(root: &Path) {
-    if is_ci() {
+    if infigraph_core::watch::daemon::is_ci_env() {
         return;
     }
-
-    let tg_dir = root.join(".infigraph");
-    if !tg_dir.exists() {
-        return;
-    }
-
-    let lock_path = tg_dir.join("watch.lock");
-    let lock_file = match std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(&lock_path)
-    {
-        Ok(f) => f,
-        Err(_) => return,
-    };
-
-    use fs2::FileExt;
-    match lock_file.try_lock_exclusive() {
-        Ok(()) => {
-            // Lock acquired — no watcher running. Release and spawn one.
-            let _ = lock_file.unlock();
-            drop(lock_file);
-            spawn_watcher(root, &tg_dir);
-        }
-        Err(_) => {
-            // Lock held — watcher already alive.
-        }
-    }
-}
-
-fn spawn_watcher(root: &Path, tg_dir: &Path) {
     let exe = match std::env::current_exe() {
         Ok(e) => e,
         Err(_) => return,
     };
-
-    let log_path = tg_dir.join("watch.log");
-    let stderr_target = match std::fs::File::create(&log_path) {
-        Ok(f) => std::process::Stdio::from(f),
-        Err(_) => std::process::Stdio::null(),
-    };
-
-    let mut cmd = std::process::Command::new(exe);
-    cmd.arg("watch")
-        .current_dir(root)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(stderr_target);
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        unsafe {
-            cmd.pre_exec(|| {
-                libc::setsid();
-                Ok(())
-            });
+    match infigraph_core::watch::daemon::ensure_daemon_running(root, &exe) {
+        infigraph_core::watch::daemon::DaemonStartOutcome::Spawned => {
+            eprintln!("[auto-watch] Watcher started");
         }
-    }
-
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const DETACHED_PROCESS: u32 = 0x00000008;
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
-        const CREATE_NO_WINDOW: u32 = 0x08000000;
-        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
-    }
-
-    match cmd.spawn() {
-        Ok(_) => {
-            eprintln!("[auto-watch] Watcher started (log: {})", log_path.display());
-        }
-        Err(e) => {
+        infigraph_core::watch::daemon::DaemonStartOutcome::Failed(e) => {
             eprintln!("[auto-watch] Failed to start watcher: {e}");
         }
+        infigraph_core::watch::daemon::DaemonStartOutcome::AlreadyRunning => {}
     }
 }
 
@@ -1174,16 +1096,6 @@ mod tests {
     }
 
     #[test]
-    fn ci_env_vars_list_complete() {
-        assert!(CI_ENV_VARS.contains(&"CI"));
-        assert!(CI_ENV_VARS.contains(&"GITHUB_ACTIONS"));
-        assert!(CI_ENV_VARS.contains(&"JENKINS_URL"));
-        assert!(CI_ENV_VARS.contains(&"BUILDKITE"));
-        assert!(CI_ENV_VARS.contains(&"GITLAB_CI"));
-        assert!(CI_ENV_VARS.contains(&"INFIGRAPH_NO_WATCH"));
-    }
-
-    #[test]
     fn lock_acquired_when_no_watcher() {
         let tmp = TempDir::new().unwrap();
         let lock_path = tmp.path().join("watch.lock");
@@ -1244,14 +1156,6 @@ mod tests {
         _lock.lock_exclusive().unwrap();
 
         ensure_watcher_running(tmp.path());
-    }
-
-    #[test]
-    fn is_ci_respects_infigraph_no_watch() {
-        // Temporarily set INFIGRAPH_NO_WATCH — is_ci should return true
-        std::env::set_var("INFIGRAPH_NO_WATCH", "1");
-        assert!(is_ci());
-        std::env::remove_var("INFIGRAPH_NO_WATCH");
     }
 
     #[test]
