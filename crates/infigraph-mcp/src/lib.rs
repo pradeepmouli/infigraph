@@ -620,14 +620,14 @@ pub fn handle_initialize(id: &Value, is_primary: bool) -> Value {
             mcp_log("DEBUG", "init_doc_watchers start");
             tools::docs::init_doc_watchers();
 
-            if infigraph_core::watch::daemon::watch_daemon_mode_enabled() {
+            let daemon_mode = infigraph_core::watch::daemon::watch_daemon_mode_enabled();
+            if daemon_mode {
                 mcp_log(
                     "INFO",
-                    "watch daemon mode active — skipping bulk watcher re-arm \
-                     (persistent daemons survive worker restarts, opportunistic \
-                     per-call starts are sufficient)",
+                    "watch daemon mode active — skipping bulk code-watcher re-arm \
+                     (persistent daemons survive worker restarts, opportunistic per-call \
+                     starts are sufficient); doc-watcher bootstrap still runs eagerly",
                 );
-                return;
             }
 
             let registry = match infigraph_core::multi::Registry::load() {
@@ -649,7 +649,9 @@ pub fn handle_initialize(id: &Value, is_primary: bool) -> Value {
                     continue;
                 }
                 let path = entry.path.to_string_lossy().to_string();
-                tools::watch::auto_start_watch(&path);
+                if !daemon_mode {
+                    tools::watch::auto_start_watch(&path);
+                }
                 tools::docs::auto_start_doc_watch(&path);
             }
         });

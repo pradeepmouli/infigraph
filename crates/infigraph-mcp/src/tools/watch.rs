@@ -338,12 +338,14 @@ pub fn tool_stop_watch(args: &Value) -> Result<String> {
             .context("invalid path")?;
         let sentinel = root.join(".infigraph").join("watch.stop");
         let lock_path = root.join(".infigraph").join("watch.lock");
-        if infigraph_core::lockfile::read_holder(&lock_path).is_none()
-            && infigraph_core::lockfile::try_acquire(&lock_path, "watch-liveness-probe")
-                .ok()
-                .flatten()
-                .is_some()
-        {
+        if !lock_path.exists() {
+            return Ok("No watcher running.".to_string());
+        }
+        let alive = infigraph_core::lockfile::try_acquire(&lock_path, "watch-liveness-probe")
+            .ok()
+            .flatten()
+            .is_none();
+        if !alive {
             return Ok("No watcher running.".to_string());
         }
         std::fs::write(&sentinel, b"")?;
@@ -359,6 +361,16 @@ pub fn tool_get_watch_status(args: &Value) -> Result<String> {
             .canonicalize()
             .context("invalid path")?;
         let lock_path = root.join(".infigraph").join("watch.lock");
+        if !lock_path.exists() {
+            return Ok(format!("No watcher running for {path}."));
+        }
+        let alive = infigraph_core::lockfile::try_acquire(&lock_path, "watch-liveness-probe")
+            .ok()
+            .flatten()
+            .is_none();
+        if !alive {
+            return Ok(format!("No watcher running for {path}."));
+        }
         return Ok(match infigraph_core::lockfile::read_holder(&lock_path) {
             Some(info) => format!(
                 "Watcher active for {path}\nHeld by PID {} (role: {}) since epoch {}\n\
@@ -366,7 +378,11 @@ pub fn tool_get_watch_status(args: &Value) -> Result<String> {
                  daemon mode — use index_project if unsure whether a reindex is needed.",
                 info.pid, info.role, info.acquired_at
             ),
-            None => format!("No watcher running for {path}."),
+            None => format!(
+                "Watcher active for {path} (holder identity unavailable)\n\
+                 Note: pending-reindex tracking is not available across processes in \
+                 daemon mode — use index_project if unsure whether a reindex is needed."
+            ),
         });
     }
 

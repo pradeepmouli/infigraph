@@ -143,3 +143,66 @@ fn get_watch_status_by_path_reports_holder_identity_when_lock_held() {
     let result = infigraph_mcp::tools::watch::tool_get_watch_status(&args).unwrap();
     assert!(result.contains("role: test-daemon"));
 }
+
+/// Writes a `LockInfo` JSON payload directly into `.infigraph/watch.lock`
+/// (bypassing `try_acquire`/`LockFile`) without ever holding the flock —
+/// simulating the stale payload left behind after an unclean watcher death
+/// (SIGKILL/OOM/crash), where the flock releases automatically but the
+/// JSON identity payload survives because `Drop` never ran to clear it.
+fn write_stale_lock_payload(lock_path: &std::path::Path) {
+    if let Some(parent) = lock_path.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    let stale = infigraph_core::lockfile::LockInfo {
+        pid: 999_999,
+        role: "test-stale".to_string(),
+        build_hash: "test".to_string(),
+        acquired_at: 0,
+    };
+    std::fs::write(lock_path, serde_json::to_string(&stale).unwrap()).unwrap();
+}
+
+/// C2 regression test: a stale `LockInfo` payload with no live flock holder
+/// must NOT be reported as an active watcher. Fails against the pre-fix
+/// implementation, which used `read_holder` alone as the liveness signal
+/// and would report "Watcher active ... Held by PID 999999".
+#[test]
+fn get_watch_status_by_path_ignores_stale_payload_without_live_flock() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let lock_path = root.join(".infigraph").join("watch.lock");
+    write_stale_lock_payload(&lock_path);
+
+    let args = serde_json::json!({ "path": root.to_string_lossy() });
+    let result = infigraph_mcp::tools::watch::tool_get_watch_status(&args).unwrap();
+    assert!(
+        result.starts_with("No watcher running for"),
+        "expected stale payload to be treated as no watcher, got: {result}"
+    );
+}
+
+/// C1 regression test: a stale `LockInfo` payload with no live flock holder
+/// must NOT cause `tool_stop_watch` to write a stop sentinel — nothing is
+/// running, so there is nothing to stop, and writing the sentinel anyway
+/// would poison the next legitimately-spawned watcher (its first loop
+/// iteration would see the stale sentinel and exit within ~1s). Fails
+/// against the pre-fix implementation, which short-circuited on
+/// `read_holder(...).is_none()` being false and fell through to writing
+/// the sentinel.
+#[test]
+fn stop_watch_by_path_ignores_stale_payload_without_live_flock() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let lock_path = root.join(".infigraph").join("watch.lock");
+    write_stale_lock_payload(&lock_path);
+
+    let args = serde_json::json!({ "path": root.to_string_lossy() });
+    let result = infigraph_mcp::tools::watch::tool_stop_watch(&args).unwrap();
+    assert_eq!(result, "No watcher running.");
+
+    let sentinel = root.join(".infigraph").join("watch.stop");
+    assert!(
+        !sentinel.exists(),
+        "stop sentinel must not be written for a dead watcher with a stale payload"
+    );
+}
