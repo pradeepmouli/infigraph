@@ -65,3 +65,39 @@ fn ensure_daemon_running_noops_under_ci() {
     );
     std::env::remove_var("CI");
 }
+
+/// A project that hasn't been indexed yet (no `.infigraph` at `root`) is a
+/// benign precondition-not-met state, not a failure — e.g. the CLI calls
+/// this on every command dispatch, including the very first `infigraph
+/// index` on a fresh project, before `.infigraph` is created. Callers
+/// (`infigraph-cli::index::ensure_watcher_running`) surface `Failed` as a
+/// visible "Failed to start watcher" stderr message, so this case must stay
+/// `AlreadyRunning` (silent) rather than `Failed`, or ordinary first-time
+/// use prints a spurious failure line. See task-3-review.md Finding 1.
+#[test]
+fn ensure_daemon_running_noops_when_not_yet_indexed() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    for v in [
+        "CI",
+        "GITHUB_ACTIONS",
+        "JENKINS_URL",
+        "BUILDKITE",
+        "GITLAB_CI",
+        "INFIGRAPH_NO_WATCH",
+        "INFIGRAPH_BACKEND",
+    ] {
+        std::env::remove_var(v);
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    assert!(!tmp.path().join(".infigraph").exists());
+
+    let outcome = infigraph_core::watch::daemon::ensure_daemon_running(
+        tmp.path(),
+        std::path::Path::new("/nonexistent/infigraph"),
+    );
+    assert_eq!(
+        outcome,
+        infigraph_core::watch::daemon::DaemonStartOutcome::AlreadyRunning,
+        "not-yet-indexed projects must no-op silently, not report Failed"
+    );
+}

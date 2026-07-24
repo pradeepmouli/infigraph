@@ -54,12 +54,18 @@ pub fn watch_daemon_mode_enabled() -> bool {
 /// Outcome of an `ensure_daemon_running` call.
 #[derive(Debug, PartialEq, Eq)]
 pub enum DaemonStartOutcome {
-    /// A daemon is already alive for this repo (lock held), or watching is
-    /// inapplicable (CI / remote backend) — no-op either way.
+    /// A daemon is already alive for this repo (lock held), watching is
+    /// inapplicable (CI / remote backend), or the project simply hasn't been
+    /// indexed yet (no `.infigraph` at `root`) — no-op either way. The
+    /// "not indexed yet" case is a benign precondition-not-met state (e.g.
+    /// the very first `infigraph index` on a fresh project, before
+    /// `.infigraph` exists), not an actionable failure, so it's folded into
+    /// this silent variant rather than `Failed`.
     AlreadyRunning,
     /// This call won the lock race and spawned a new daemon process.
     Spawned,
-    /// Spawn was attempted but failed (e.g. binary not found).
+    /// Spawn was attempted but failed (e.g. binary not found, OS-level spawn
+    /// error, lock-probe I/O error).
     Failed(String),
 }
 
@@ -80,7 +86,12 @@ pub fn ensure_daemon_running(root: &Path, watch_binary: &Path) -> DaemonStartOut
 
     let tg_dir = root.join(".infigraph");
     if !tg_dir.exists() {
-        return DaemonStartOutcome::Failed("not an indexed project (.infigraph missing)".into());
+        // Not yet indexed (e.g. the very first `infigraph index` on a fresh
+        // project, called before `.infigraph` is created). This is an
+        // expected precondition-not-met state, not a failure — treat it the
+        // same as "nothing to do" so callers don't surface a spurious
+        // "Failed to start watcher" message on ordinary first-time use.
+        return DaemonStartOutcome::AlreadyRunning;
     }
 
     let lock_path = tg_dir.join("watch.lock");
