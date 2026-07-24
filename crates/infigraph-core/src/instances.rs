@@ -7,8 +7,8 @@
 //! bare PID match is not proof it's the same process the entry named.
 
 use std::io::Write as _;
-use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -145,4 +145,97 @@ pub fn list_instances() -> Vec<(PathBuf, InstanceInfo)> {
 /// entry originally named is gone.
 pub fn is_stale(recorded_start: u64, actual_start: Option<u64>) -> bool {
     actual_start != Some(recorded_start)
+}
+
+/// One registry entry's classification against the current process table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstanceStatus {
+    LivePeer,
+    Orphan,
+}
+
+/// Pure: classifies every entry except `own_pid` (a process never reaps
+/// itself — self-termination is R2.2.3's job) via an injectable start-time
+/// lookup, so this is fully testable without touching real processes.
+pub fn classify_instances(
+    entries: &[(PathBuf, InstanceInfo)],
+    own_pid: u32,
+    lookup_start_time: impl Fn(u32) -> Option<u64>,
+) -> Vec<(PathBuf, InstanceInfo, InstanceStatus)> {
+    entries
+        .iter()
+        .filter(|(_, info)| info.pid != own_pid)
+        .map(|(path, info)| {
+            let actual = lookup_start_time(info.pid);
+            let status = if is_stale(info.started_at, actual) {
+                InstanceStatus::Orphan
+            } else {
+                InstanceStatus::LivePeer
+            };
+            (path.clone(), info.clone(), status)
+        })
+        .collect()
+}
+
+/// Grace period between SIGTERM and SIGKILL when reaping an orphan.
+/// Overridable via `INFIGRAPH_REAP_GRACE_SECS` (seconds) — kept small in
+/// tests.
+pub fn reap_grace_period() -> Duration {
+    std::env::var("INFIGRAPH_REAP_GRACE_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(5))
+}
+
+/// How often the periodic orphan scan runs. Overridable via
+/// `INFIGRAPH_REAP_SCAN_SECS` (seconds).
+pub fn reap_scan_interval() -> Duration {
+    std::env::var("INFIGRAPH_REAP_SCAN_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(600))
+}
+
+/// SIGTERM the orphan's PID, wait `reap_grace_period()`, SIGKILL if still
+/// alive, then remove its registry file regardless (a removed file for an
+/// already-dead PID is correct cleanup either way). Best-effort: a process
+/// that exits on its own between the classify scan and this call is not an
+/// error.
+pub fn reap_orphan(path: &Path, pid: u32) {
+    let spid = sysinfo::Pid::from_u32(pid);
+    let mut sys = sysinfo::System::new();
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[spid]), true);
+    if let Some(process) = sys.process(spid) {
+        if process.kill_with(sysinfo::Signal::Term).is_none() {
+            // SIGTERM not supported on this platform — skip straight to
+            // an unconditional kill rather than waiting out a grace period
+            // for a signal that was never actually sent.
+            process.kill();
+        } else {
+            std::thread::sleep(reap_grace_period());
+            sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[spid]), true);
+            if let Some(still_alive) = sys.process(spid) {
+                still_alive.kill();
+            }
+        }
+    }
+    let _ = std::fs::remove_file(path);
+}
+
+/// Runs one full scan-and-reap pass: lists the registry, classifies every
+/// other entry, reaps every orphan found. Returns the count reaped, for
+/// the caller to log.
+pub fn reap_orphans_once(own_pid: u32) -> usize {
+    let entries = list_instances();
+    let classified = classify_instances(&entries, own_pid, current_process_start_time);
+    let mut reaped = 0;
+    for (path, info, status) in classified {
+        if status == InstanceStatus::Orphan {
+            reap_orphan(&path, info.pid);
+            reaped += 1;
+        }
+    }
+    reaped
 }
