@@ -109,6 +109,29 @@ fn auto_start_watch_inner(path: &str, skip_disabled_check: bool) -> Option<Strin
         return None;
     }
 
+    if infigraph_core::watch::daemon::watch_daemon_mode_enabled() {
+        let mcp_exe = std::env::current_exe().ok()?;
+        let cli_binary =
+            match infigraph_core::watch::daemon::resolve_cli_binary_sibling_of(&mcp_exe) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("[auto-watch] could not locate infigraph CLI binary: {e}");
+                    return None;
+                }
+            };
+        return match infigraph_core::watch::daemon::ensure_daemon_running(&root, &cli_binary) {
+            infigraph_core::watch::daemon::DaemonStartOutcome::Spawned => {
+                eprintln!("[auto-watch] Started daemon watcher for {root_str}");
+                Some(format!("Daemon watcher started for {root_str}"))
+            }
+            infigraph_core::watch::daemon::DaemonStartOutcome::AlreadyRunning => None,
+            infigraph_core::watch::daemon::DaemonStartOutcome::Failed(e) => {
+                eprintln!("[auto-watch] Failed to start daemon watcher: {e}");
+                None
+            }
+        };
+    }
+
     let args = serde_json::json!({
         "path": path,
         "auto_resolve": true,
