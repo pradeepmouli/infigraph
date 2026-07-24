@@ -30,6 +30,7 @@ hmac = "0.12"
 hex = "0.4"
 fs2 = "0.4"
 toml = "0.8"
+dirs-next = "2"
 ort = { version = "2.0.0-rc.12", features = ["download-binaries"], optional = true }
 ndarray = { version = "0.16", optional = true }
 tokenizers = { version = "0.21", default-features = false, features = ["onig"], optional = true }

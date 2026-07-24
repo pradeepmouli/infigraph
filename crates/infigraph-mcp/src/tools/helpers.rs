@@ -66,6 +66,7 @@ pub fn open_prism(args: &Value) -> Result<Infigraph> {
     let registry = bundled_registry()?;
     let mut prism = Infigraph::open(&PathBuf::from(&path), registry)?;
     prism.init()?;
+    apply_repo_filter(&mut prism, &path);
     Ok(prism)
 }
 
@@ -78,8 +79,46 @@ pub fn open_prism_read_only(args: &Value) -> Result<Infigraph> {
     let registry = bundled_registry()?;
     let mut prism = Infigraph::open(&PathBuf::from(&path), registry)?;
     prism.init_read_only()?;
+    apply_repo_filter(&mut prism, &path);
     Ok(prism)
 }
+
+/// In Neo4j (remote) mode, scope read queries to the repo matching this path.
+/// Read and write MUST agree on the `org/repo` key or repo-scoped queries return
+/// nothing (files/symbols show 0 while global folders/contains stay populated).
+///
+/// The group registry is the source of truth for a repo's `org/repo` identity, so
+/// resolve from it first. Only fall back to deriving from `INFIGRAPH_ORG` + directory
+/// name when the path isn't registered — that fallback is guaranteed to match the
+/// write key only when the env org equals the group's org, which is exactly why the
+/// registry lookup is preferred.
+#[cfg(feature = "remote")]
+fn apply_repo_filter(prism: &mut Infigraph, raw_path: &str) {
+    if std::env::var("INFIGRAPH_BACKEND").as_deref() != Ok("neo4j") {
+        return;
+    }
+    let path = std::path::Path::new(raw_path);
+    if let Ok(reg) = infigraph_core::multi::Registry::load() {
+        if let Some(ns) = reg.resolve_repo_namespace(path) {
+            prism.set_repo_filter(&ns);
+            return;
+        }
+    }
+    let repo_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| raw_path.to_string());
+    let org = infigraph_core::multi::default_org();
+    let key = if org.is_empty() {
+        repo_name
+    } else {
+        format!("{org}/{repo_name}")
+    };
+    prism.set_repo_filter(&key);
+}
+
+#[cfg(not(feature = "remote"))]
+fn apply_repo_filter(_prism: &mut Infigraph, _raw_path: &str) {}
 
 pub fn find_infigraph_cli() -> Option<std::path::PathBuf> {
     let bin_name = if cfg!(windows) {

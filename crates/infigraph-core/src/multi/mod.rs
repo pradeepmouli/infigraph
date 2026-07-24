@@ -15,6 +15,9 @@ use serde::{Deserialize, Serialize};
 use crate::lang::LanguageRegistry;
 use crate::Infigraph;
 
+#[cfg(feature = "neo4j")]
+use crate::graph::GraphBackend;
+
 #[cfg(feature = "postgres")]
 use crate::meta::PostgresMetaStore;
 
@@ -73,7 +76,7 @@ impl Registry {
         #[cfg(feature = "postgres")]
         {
             if is_remote_mode() {
-                let pg = PostgresMetaStore::connect_from_env()?;
+                let pg = PostgresMetaStore::connect_from_env_cached()?;
                 pg.init_schema()?;
                 return pg.load_registry();
             }
@@ -92,7 +95,7 @@ impl Registry {
         #[cfg(feature = "postgres")]
         {
             if is_remote_mode() {
-                let pg = PostgresMetaStore::connect_from_env()?;
+                let pg = PostgresMetaStore::connect_from_env_cached()?;
                 pg.init_schema()?;
                 return pg.save_registry(self);
             }
@@ -155,6 +158,61 @@ impl Registry {
         self.save()
     }
 
+    /// Resolve a user-supplied group name to the actual stored key.
+    /// Tries the name as-is first (already qualified or org-less), then the
+    /// `INFIGRAPH_ORG`-qualified form `org/name`. This lets CLI commands and the
+    /// webhook accept the bare group name even when it was created with an org
+    /// (create stores `org/name`; without this, every later lookup would miss).
+    pub fn resolve_group_key(&self, name: &str) -> String {
+        // 1. Exact match (already-qualified or org-less).
+        if self.groups.contains_key(name) {
+            return name.to_string();
+        }
+        // 2. INFIGRAPH_ORG-qualified form.
+        let qualified = qualified_group_name(&default_org(), name);
+        if self.groups.contains_key(&qualified) {
+            return qualified;
+        }
+        // 3. Unique `<org>/name` match, regardless of INFIGRAPH_ORG. Lets a group
+        //    created with an explicit --org be referenced by its bare name even when
+        //    the env var is unset or set to a different org.
+        let suffix = format!("/{name}");
+        let mut matches = self.groups.keys().filter(|k| k.ends_with(&suffix));
+        if let Some(first) = matches.next() {
+            if matches.next().is_none() {
+                return first.clone();
+            }
+        }
+        name.to_string()
+    }
+
+    /// Resolve the shared-graph namespace (`org/repo`) for a repo on disk, using the
+    /// group registry as the single source of truth for repo identity. Returns `None`
+    /// if the path is not registered in any group.
+    ///
+    /// A standalone remote `index` must use this rather than deriving a namespace from
+    /// the directory name: the latter can disagree with the group's `org/repo` and write
+    /// orphaned, mis-namespaced nodes into the shared graph.
+    pub fn resolve_repo_namespace(&self, path: &Path) -> Option<String> {
+        let want = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        // Find the registered repo whose canonical path matches.
+        let repo_name = self.repos.iter().find_map(|(name, entry)| {
+            let ep = std::fs::canonicalize(&entry.path).unwrap_or_else(|_| entry.path.clone());
+            if ep == want {
+                Some(name.clone())
+            } else {
+                None
+            }
+        })?;
+        // Find a group containing this repo and use its org for the namespace.
+        let org = self
+            .groups
+            .values()
+            .find(|g| g.repos.contains(&repo_name))
+            .map(|g| g.org.clone())?;
+        Some(qualified_group_name(&org, &repo_name))
+    }
+
     /// Add a repo to a group.
     pub fn group_add(&mut self, group_name: &str, repo_name: &str) -> Result<()> {
         let group = self
@@ -164,9 +222,10 @@ impl Registry {
         if !self.repos.contains_key(repo_name) {
             anyhow::bail!("repo '{}' not registered. Run index first.", repo_name);
         }
-        if !group.repos.contains(&repo_name.to_string()) {
-            group.repos.push(repo_name.to_string());
+        if group.repos.contains(&repo_name.to_string()) {
+            return Ok(());
         }
+        group.repos.push(repo_name.to_string());
         self.save()
     }
 
@@ -535,9 +594,25 @@ pub fn index_group(
         }
     }
 
-    // Skip repos whose HEAD commit hasn't changed since last index (incremental)
+    // Skip repos whose HEAD commit hasn't changed since last index (incremental).
+    // In Neo4j mode, also verify the graph actually has data for "unchanged" repos —
+    // if Neo4j storage was wiped, Postgres still thinks repos are indexed.
     let mut to_index: Vec<(String, RepoEntry)> = Vec::new();
     let mut skipped: Vec<String> = Vec::new();
+
+    #[cfg(feature = "neo4j")]
+    let neo4j_backend = if !full
+        && std::env::var("INFIGRAPH_BACKEND")
+            .map(|v| v == "neo4j")
+            .unwrap_or(false)
+    {
+        crate::graph::Neo4jBackend::connect_from_env().ok()
+    } else {
+        None
+    };
+    #[cfg(not(feature = "neo4j"))]
+    let neo4j_backend: Option<()> = None;
+
     if full {
         to_index = entries;
     } else {
@@ -548,7 +623,40 @@ pub fn index_group(
                 _ => false,
             };
             if unchanged {
-                skipped.push(name);
+                #[allow(unused_mut)]
+                let mut graph_empty = false;
+                #[cfg(feature = "neo4j")]
+                if let Some(ref neo) = neo4j_backend {
+                    let ns = if group.org.is_empty() {
+                        name.clone()
+                    } else {
+                        format!("{}/{}", group.org, name)
+                    };
+                    let escaped_ns = crate::escape_str(&ns);
+                    let cypher = format!(
+                        "MATCH (s:Symbol) WHERE s.id STARTS WITH '{escaped_ns}/' RETURN count(s) AS c"
+                    );
+                    if let Ok(rows) = neo.raw_query(&cypher) {
+                        let count: u64 = rows
+                            .first()
+                            .and_then(|r| r.first())
+                            .and_then(|s| s.parse().ok())
+                            .unwrap_or(0);
+                        if count == 0 {
+                            graph_empty = true;
+                        }
+                    }
+                }
+                let _ = &neo4j_backend; // suppress unused warning when neo4j feature off
+                if graph_empty {
+                    eprintln!(
+                        "[group] repo '{}' commit unchanged but graph empty — forcing re-index",
+                        name
+                    );
+                    to_index.push((name, entry));
+                } else {
+                    skipped.push(name);
+                }
             } else {
                 to_index.push((name, entry));
             }
@@ -580,6 +688,12 @@ pub fn index_group(
                     format!("{org}/{repo_name}")
                 };
                 prism.set_namespace(&ns);
+                // Scope reads (get_file_hashes / stale-prune) to THIS repo. Without this,
+                // incremental indexing fetches every repo's file hashes from the shared graph
+                // and the stale-file prune deletes all OTHER repos' data. Must match the
+                // write namespace exactly.
+                #[cfg(feature = "neo4j")]
+                prism.set_repo_filter(&ns);
             }
             let result = prism.index()?;
             Ok((
@@ -616,7 +730,19 @@ pub fn index_group(
 
                 // Index manifests so Dependency nodes exist for SharedPackage detection
                 if let Some(backend) = prism.backend() {
-                    let _ = crate::manifest::index_manifests(prism.root(), backend);
+                    if let Err(e) = crate::manifest::index_manifests(prism.root(), backend) {
+                        eprintln!("[group] manifest indexing failed for '{}': {e}", repo_name);
+                    }
+                    // Create the Repo node + BELONGS_TO edges keyed by the SAME org/repo
+                    // namespace stamped onto f.repo, so read filters and BELONGS_TO agree.
+                    let ns = if org.is_empty() {
+                        repo_name.clone()
+                    } else {
+                        format!("{org}/{repo_name}")
+                    };
+                    if let Err(e) = backend.upsert_repo(&ns) {
+                        eprintln!("[group] repo node creation failed for '{}': {e}", repo_name);
+                    }
                 }
 
                 let entry = registry.repos.get(&repo_name).cloned();
@@ -761,5 +887,68 @@ mod tests {
         let loaded: Group = serde_json::from_str(json).unwrap();
         assert_eq!(loaded.org, "");
         assert_eq!(loaded.name, "old-group");
+    }
+
+    fn registry_with(org: &str, repo: &str, path: &Path) -> Registry {
+        let mut reg = Registry::default();
+        reg.repos.insert(
+            repo.to_string(),
+            RepoEntry {
+                name: repo.to_string(),
+                path: path.to_path_buf(),
+                languages: vec![],
+                symbol_count: 0,
+                module_count: 0,
+                last_indexed_commit: None,
+            },
+        );
+        let key = qualified_group_name(org, "grp");
+        reg.groups.insert(
+            key,
+            Group {
+                name: "grp".to_string(),
+                org: org.to_string(),
+                repos: vec![repo.to_string()],
+                contracts: vec![],
+            },
+        );
+        reg
+    }
+
+    #[test]
+    fn test_resolve_repo_namespace_uses_group_org() {
+        let dir = std::env::temp_dir().join("ig_ns_test_repo");
+        std::fs::create_dir_all(&dir).unwrap();
+        let reg = registry_with("data-mlplatform", "prismo", &dir);
+        // Resolves from the group's org, NOT from INFIGRAPH_ORG / directory name.
+        assert_eq!(
+            reg.resolve_repo_namespace(&dir).as_deref(),
+            Some("data-mlplatform/prismo")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_resolve_repo_namespace_unregistered_is_none() {
+        let reg = Registry::default();
+        let dir = std::env::temp_dir().join("ig_ns_test_unregistered");
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(reg.resolve_repo_namespace(&dir), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_resolve_group_key_bare_to_org_qualified() {
+        let dir = std::env::temp_dir().join("ig_grpkey_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let reg = registry_with("data-mlplatform", "prismo", &dir);
+        // Group stored as `data-mlplatform/grp`; bare `grp` must resolve to it.
+        assert_eq!(reg.resolve_group_key("grp"), "data-mlplatform/grp");
+        // Already-qualified passes through.
+        assert_eq!(
+            reg.resolve_group_key("data-mlplatform/grp"),
+            "data-mlplatform/grp"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

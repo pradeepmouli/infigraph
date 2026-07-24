@@ -20,9 +20,10 @@ pub fn watchers_disabled() -> bool {
 
 fn watch_log(level: &str, msg: &str) {
     use std::io::Write;
-    let path = std::env::var("HOME")
+    let path = std::env::var_os("HOME")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::path::PathBuf::from("."))
+        .or_else(dirs_next::home_dir)
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
         .join(".infigraph")
         .join("mcp.log");
     if let Ok(mut f) = std::fs::OpenOptions::new()
@@ -73,6 +74,9 @@ pub fn auto_start_watch_opportunistic(path: &str) -> Option<String> {
 }
 
 fn auto_start_watch_inner(path: &str, skip_disabled_check: bool) -> Option<String> {
+    if is_remote_mode() {
+        return None;
+    }
     if !skip_disabled_check && watchers_disabled() {
         return None;
     }
@@ -131,7 +135,21 @@ fn acquire_project_watch_lock(lock_path: &std::path::Path) -> Result<std::fs::Fi
     Err(last_err.unwrap().into())
 }
 
+fn is_remote_mode() -> bool {
+    std::env::var("INFIGRAPH_BACKEND")
+        .map(|v| v == "neo4j")
+        .unwrap_or(false)
+}
+
 pub fn tool_watch_project(args: &Value) -> Result<String> {
+    if is_remote_mode() {
+        return Ok(
+            "File watching is not supported in remote mode (Neo4j backend). \
+                    Reindexing is triggered via webhooks instead."
+                .to_string(),
+        );
+    }
+
     init_watchers();
 
     let path = args

@@ -50,8 +50,29 @@ impl std::fmt::Display for ClusterStats {
 /// 2. Runs single-level Louvain (iterative modularity optimization).
 /// 3. Creates Cluster nodes and MEMBER_OF edges in the graph.
 pub fn detect_clusters(backend: &dyn GraphBackend) -> Result<ClusterStats> {
-    // Step 1: Fetch all CALLS edges as (source_id, target_id) pairs.
-    let edge_rows = backend.raw_query("MATCH (a:Symbol)-[:CALLS]->(b:Symbol) RETURN a.id, b.id")?;
+    // Scope CALLS edges + symbols to the repo in shared-graph mode; otherwise clusters
+    // mix symbols from every repo. Edges are kept only when the source File is in-repo.
+    let (edge_q, sym_q) = if let Some(repo) = backend.repo_filter() {
+        let r = crate::escape_str(repo);
+        (
+            format!(
+                "MATCH (fa:File {{repo: '{r}'}})-[:DEFINES]->(a:Symbol)-[:CALLS]->(b:Symbol) \
+                 RETURN a.id, b.id"
+            ),
+            format!(
+                "MATCH (f:File {{repo: '{r}'}})-[:DEFINES]->(s:Symbol) \
+                 WHERE s.kind IN ['Function', 'Method', 'Class'] RETURN s.id"
+            ),
+        )
+    } else {
+        (
+            "MATCH (a:Symbol)-[:CALLS]->(b:Symbol) RETURN a.id, b.id".to_string(),
+            "MATCH (s:Symbol) WHERE s.kind IN ['Function', 'Method', 'Class'] RETURN s.id"
+                .to_string(),
+        )
+    };
+    // Step 1: Fetch CALLS edges as (source_id, target_id) pairs.
+    let edge_rows = backend.raw_query(&edge_q)?;
 
     // Build node index: map symbol ID -> dense integer index.
     let mut id_to_idx: HashMap<String, usize> = HashMap::new();
@@ -68,9 +89,7 @@ pub fn detect_clusters(backend: &dyn GraphBackend) -> Result<ClusterStats> {
     }
 
     // Also include isolated symbols (no CALLS edges) so they appear in their own clusters.
-    let all_symbols = backend.raw_query(
-        "MATCH (s:Symbol) WHERE s.kind IN ['Function', 'Method', 'Class'] RETURN s.id",
-    )?;
+    let all_symbols = backend.raw_query(&sym_q)?;
     for row in &all_symbols {
         if let Some(id) = row.first() {
             if !id_to_idx.contains_key(id) {

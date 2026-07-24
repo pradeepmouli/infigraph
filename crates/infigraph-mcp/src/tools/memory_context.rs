@@ -339,7 +339,11 @@ fn gather_file_symbols(
             file, sym.name, sym.kind, start_line, end_line
         );
 
-        let file_path = prism.root().join(file);
+        let file_path = if std::path::Path::new(file).is_absolute() {
+            std::path::PathBuf::from(file)
+        } else {
+            prism.root().join(file)
+        };
         if let Ok(source) = std::fs::read_to_string(&file_path) {
             let lines: Vec<&str> = source.lines().collect();
             let start = (start_line as usize).saturating_sub(1);
@@ -389,7 +393,11 @@ fn render_symbol_ids(
             detail.file, detail.name, base_score, detail.kind, detail.start_line, detail.end_line
         );
 
-        let file_path = prism.root().join(&detail.file);
+        let file_path = if std::path::Path::new(&detail.file).is_absolute() {
+            std::path::PathBuf::from(&detail.file)
+        } else {
+            prism.root().join(&detail.file)
+        };
         if let Ok(source) = std::fs::read_to_string(&file_path) {
             let lines: Vec<&str> = source.lines().collect();
             let start = (detail.start_line as usize).saturating_sub(1);
@@ -528,7 +536,11 @@ fn gather_l3_hybrid(
             text.push_str(&format!("Doc: {}\n", doc));
         }
 
-        let file_path = prism.root().join(file);
+        let file_path = if std::path::Path::new(file).is_absolute() {
+            std::path::PathBuf::from(file)
+        } else {
+            prism.root().join(file)
+        };
         if let Ok(source) = std::fs::read_to_string(&file_path) {
             let lines: Vec<&str> = source.lines().collect();
             let start = start_line.saturating_sub(1);

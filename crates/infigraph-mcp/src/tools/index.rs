@@ -7,6 +7,13 @@ use super::docs::auto_start_doc_watch_opportunistic as auto_start_doc_watch;
 use super::helpers::{find_infigraph_cli, open_prism};
 use super::watch::auto_start_watch_opportunistic as auto_start_watch;
 
+#[cfg(feature = "remote")]
+fn is_remote_mode() -> bool {
+    std::env::var("INFIGRAPH_BACKEND")
+        .map(|v| v == "neo4j")
+        .unwrap_or(false)
+}
+
 pub fn tool_index_project(args: &Value) -> Result<String> {
     let path = args.get("path").and_then(|p| p.as_str()).unwrap_or(".");
     let full = args.get("full").and_then(|f| f.as_bool()).unwrap_or(false);
@@ -49,13 +56,31 @@ pub fn tool_index_project(args: &Value) -> Result<String> {
     }
 
     // Fallback: run inline if CLI not found
-    let prism = open_prism(args)?;
+    #[allow(unused_mut)]
+    let mut prism = open_prism(args)?;
+    #[cfg(feature = "remote")]
+    if is_remote_mode() {
+        let repo_name = std::path::Path::new(path)
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| path.to_string());
+        prism.set_namespace(&repo_name);
+    }
     let result = prism.index()?;
 
-    let mut out = format!(
-        "Indexed {}/{} files\n",
-        result.indexed_files, result.total_files
-    );
+    let mut out = if result.indexed_files == 0 {
+        format!(
+            "All {} files up-to-date, nothing to reindex\n",
+            result.total_files
+        )
+    } else {
+        format!(
+            "Indexed {} files ({} up-to-date, {} total)\n",
+            result.indexed_files,
+            result.total_files - result.indexed_files,
+            result.total_files
+        )
+    };
     let mut by_lang: std::collections::HashMap<&str, (usize, usize)> =
         std::collections::HashMap::new();
     for ext in &result.extractions {
@@ -75,9 +100,25 @@ pub fn tool_index_project(args: &Value) -> Result<String> {
     if let Some(backend) = prism.backend() {
         let root = std::path::PathBuf::from(path);
         let changed: Vec<&str> = result.extractions.iter().map(|e| e.file.as_str()).collect();
-        match embed::update_embeddings(backend, &root, &changed) {
-            Ok(n) => out.push_str(&format!("Saved {} embeddings\n", n)),
-            Err(e) => out.push_str(&format!("warning: embedding update failed: {e}\n")),
+        #[allow(unused_mut)]
+        let mut embed_done = false;
+        #[cfg(feature = "remote")]
+        if is_remote_mode() {
+            if let Ok(pg) = infigraph_core::meta::PostgresMetaStore::connect_from_env_cached() {
+                match embed::update_embeddings_remote(backend, pg, &changed) {
+                    Ok(n) => out.push_str(&format!("Saved {} embeddings to pgvector\n", n)),
+                    Err(e) => {
+                        out.push_str(&format!("warning: remote embedding update failed: {e}\n"))
+                    }
+                }
+                embed_done = true;
+            }
+        }
+        if !embed_done {
+            match embed::update_embeddings(backend, &root, &changed) {
+                Ok(n) => out.push_str(&format!("Saved {} embeddings\n", n)),
+                Err(e) => out.push_str(&format!("warning: embedding update failed: {e}\n")),
+            }
         }
     }
     let stats = prism.stats()?;

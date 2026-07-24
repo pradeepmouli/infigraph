@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 use anyhow::{Context, Result};
 use pgvector::Vector;
@@ -10,6 +11,8 @@ use tokio_postgres::{Client, NoTls};
 
 use crate::graph::SessionData;
 use crate::multi::{Contract, ContractKind, Group, Registry, RepoEntry};
+
+static PG_CONN: OnceLock<PostgresMetaStore> = OnceLock::new();
 
 const CORE_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS repos (
@@ -165,6 +168,19 @@ impl PostgresMetaStore {
             "host=localhost user=infigraph password=infigraph dbname=infigraph".into()
         });
         Self::connect(&url)
+    }
+
+    /// Cached connection — creates once, reuses across all callers.
+    /// Avoids per-call runtime leak from `connect_from_env()`.
+    pub fn connect_from_env_cached() -> Result<&'static Self> {
+        if let Some(store) = PG_CONN.get() {
+            return Ok(store);
+        }
+        let store = Self::connect_from_env()?;
+        let _ = PG_CONN.set(store);
+        PG_CONN
+            .get()
+            .ok_or_else(|| anyhow::anyhow!("PG_CONN OnceLock unexpectedly empty"))
     }
 
     /// Run schema migrations (idempotent).
@@ -421,50 +437,56 @@ impl PostgresMetaStore {
         })?;
 
         if !group.contracts.is_empty() {
-            let mut sql = String::from(
-                "INSERT INTO contracts (group_org, group_name, kind, service, method, path, symbol_id, file) VALUES ",
-            );
-            let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync>> = Vec::new();
-            for (i, c) in group.contracts.iter().enumerate() {
-                if i > 0 {
-                    sql.push_str(", ");
+            // Postgres' extended-protocol caps bound parameters at 65535 (u16). With 8
+            // params/contract, a large group (many HTTP routes across repos) overflows that
+            // and fails with "parameters is not drained". Chunk to stay well under the limit.
+            const CONTRACTS_PER_BATCH: usize = 8000; // 8000 * 8 = 64000 < 65535
+            for chunk in group.contracts.chunks(CONTRACTS_PER_BATCH) {
+                let mut sql = String::from(
+                    "INSERT INTO contracts (group_org, group_name, kind, service, method, path, symbol_id, file) VALUES ",
+                );
+                let mut params: Vec<Box<dyn tokio_postgres::types::ToSql + Sync>> = Vec::new();
+                for (i, c) in chunk.iter().enumerate() {
+                    if i > 0 {
+                        sql.push_str(", ");
+                    }
+                    let base = i * 8;
+                    sql.push_str(&format!(
+                        "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
+                        base + 1,
+                        base + 2,
+                        base + 3,
+                        base + 4,
+                        base + 5,
+                        base + 6,
+                        base + 7,
+                        base + 8
+                    ));
+                    let kind_str = match c.kind {
+                        ContractKind::HttpRoute => "HttpRoute",
+                        ContractKind::GrpcService => "GrpcService",
+                        ContractKind::EventPublish => "EventPublish",
+                        ContractKind::EventSubscribe => "EventSubscribe",
+                        ContractKind::SharedPackage => "SharedPackage",
+                    };
+                    params.push(Box::new(org.to_string()));
+                    params.push(Box::new(name.to_string()));
+                    params.push(Box::new(kind_str.to_string()));
+                    params.push(Box::new(c.service.clone()));
+                    params.push(Box::new(c.method.clone()));
+                    params.push(Box::new(c.path.clone()));
+                    params.push(Box::new(c.symbol_id.clone()));
+                    params.push(Box::new(c.file.clone()));
                 }
-                let base = i * 8;
-                sql.push_str(&format!(
-                    "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
-                    base + 1,
-                    base + 2,
-                    base + 3,
-                    base + 4,
-                    base + 5,
-                    base + 6,
-                    base + 7,
-                    base + 8
-                ));
-                let kind_str = match c.kind {
-                    ContractKind::HttpRoute => "HttpRoute",
-                    ContractKind::GrpcService => "GrpcService",
-                    ContractKind::EventPublish => "EventPublish",
-                    ContractKind::EventSubscribe => "EventSubscribe",
-                    ContractKind::SharedPackage => "SharedPackage",
-                };
-                params.push(Box::new(org.to_string()));
-                params.push(Box::new(name.to_string()));
-                params.push(Box::new(kind_str.to_string()));
-                params.push(Box::new(c.service.clone()));
-                params.push(Box::new(c.method.clone()));
-                params.push(Box::new(c.path.clone()));
-                params.push(Box::new(c.symbol_id.clone()));
-                params.push(Box::new(c.file.clone()));
+                let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
+                    params.iter().map(|p| p.as_ref()).collect();
+                self.block_on(async {
+                    self.client
+                        .execute(&sql as &str, &param_refs)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("bulk insert contracts failed: {e:?}"))
+                })?;
             }
-            let param_refs: Vec<&(dyn tokio_postgres::types::ToSql + Sync)> =
-                params.iter().map(|p| p.as_ref()).collect();
-            self.block_on(async {
-                self.client
-                    .execute(&sql as &str, &param_refs)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("bulk insert contracts failed: {e:?}"))
-            })?;
         }
 
         Ok(())
@@ -847,6 +869,16 @@ impl PostgresMetaStore {
                 (id, v.to_vec())
             })
             .collect())
+    }
+
+    pub fn all_embedding_ids(&self, kind: &str) -> Result<Vec<String>> {
+        let rows = self.block_on(async {
+            self.client
+                .query("SELECT id FROM embeddings WHERE kind = $1", &[&kind])
+                .await
+                .map_err(|e| anyhow::anyhow!("all embedding ids failed: {e:?}"))
+        })?;
+        Ok(rows.iter().map(|r| r.get(0)).collect())
     }
 
     pub fn embedding_count(&self, kind: &str) -> Result<i64> {

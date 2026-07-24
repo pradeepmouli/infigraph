@@ -109,6 +109,7 @@ pub const MCP_ONLY_TOOLS: &[&str] = &[
     "index_confluence_pages", // programmatic — CLI has `index-confluence`
     "group_link_docs",        // cross-repo doc linking — runs as part of group_build
     "compress",               // agent-only — compress arbitrary text
+    "get_compression_stats",  // agent-only — session compression metrics
 ];
 
 pub const MCP_TOOL_NAMES: &[&str] = &[
@@ -202,6 +203,7 @@ pub const MCP_TOOL_NAMES: &[&str] = &[
     "memory_context",
     "consolidate_memory",
     "compress",
+    "get_compression_stats",
 ];
 
 pub fn allowed_tools_from_names() -> Vec<String> {
@@ -574,6 +576,12 @@ pub fn build_tools_list() -> Vec<Value> {
 
 pub fn mcp_log(level: &str, msg: &str) {
     use std::io::Write;
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let line = format!("[{ts}] {level}: {msg}");
+    eprintln!("{line}");
     let path = mcp_log_file_path();
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -583,18 +591,15 @@ pub fn mcp_log(level: &str, msg: &str) {
         .append(true)
         .open(&path)
     {
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        let _ = writeln!(f, "[{ts}] {level}: {msg}");
+        let _ = writeln!(f, "{line}");
     }
 }
 
 fn mcp_log_file_path() -> std::path::PathBuf {
-    std::env::var("HOME")
+    std::env::var_os("HOME")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::path::PathBuf::from("."))
+        .or_else(dirs_next::home_dir)
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
         .join(".infigraph")
         .join("mcp.log")
 }
@@ -728,9 +733,10 @@ pub fn handle_tools_call(id: &Value, request: &Value) -> Value {
                     .and_then(|p| p.as_str())
                     .map(|p| std::path::PathBuf::from(p).join(".infigraph"))
                     .or_else(|| {
-                        std::env::var("HOME")
-                            .ok()
-                            .map(|h| std::path::PathBuf::from(h).join(".infigraph"))
+                        std::env::var_os("HOME")
+                            .map(std::path::PathBuf::from)
+                            .or_else(dirs_next::home_dir)
+                            .map(|h| h.join(".infigraph"))
                     })
                 {
                     let _ = std::fs::create_dir_all(&dir);

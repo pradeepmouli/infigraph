@@ -103,7 +103,30 @@ pub trait GraphBackend: Send + Sync {
     fn remove_file(&self, file: &str) -> Result<()>;
 
     /// Derive TESTED_BY edges from naming conventions.
-    fn derive_tested_by_edges(&self) -> Result<usize>;
+    /// When `changed_files` is provided, only derives edges where at least one
+    /// endpoint (test or target) is in the changed set — needed because
+    /// DETACH DELETE on target files destroys existing TESTED_BY edges.
+    fn derive_tested_by_edges(&self, changed_files: Option<&[&str]>) -> Result<usize>;
+
+    /// Delete all data from the graph (used by `--full` reindex in remote mode).
+    /// Default: no-op (local backends wipe `~/.infigraph/` on disk instead).
+    fn clear_all_data(&self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Create a Repo node and link all File nodes to it via BELONGS_TO.
+    /// Sets `repo` property on File nodes for scoped queries.
+    /// Default: no-op (only meaningful for Neo4j multi-repo graphs).
+    fn upsert_repo(&self, _repo_name: &str) -> Result<()> {
+        Ok(())
+    }
+
+    /// The `org/repo` namespace this backend is scoped to, if any.
+    /// Lets backend-agnostic analysis passes (manifest deps, clusters) scope their
+    /// own Cypher in shared-graph mode. Default: `None` (Kuzu is single-repo).
+    fn repo_filter(&self) -> Option<&str> {
+        None
+    }
 
     // ── Resolve ──────────────────────────────────────────────────────
 

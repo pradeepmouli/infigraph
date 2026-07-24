@@ -18,15 +18,16 @@
 (import_declaration
   (scoped_identifier) @import.module)
 
-; Class inheritance: extends
+; Class inheritance: extends. May be type_identifier, generic_type, or
+; scoped_type_identifier (e.g. class Foo extends Bar<T>, class Foo extends pkg.Bar).
 (class_declaration
   name: (identifier) @inherit.child
   (superclass
-    (type_identifier) @inherit.parent))
+    (_) @inherit.parent))
 
 ; Interface implementation: implements
 (class_declaration
   name: (identifier) @inherit.child
   (super_interfaces
     (type_list
-      (type_identifier) @inherit.parent)))
+      (_) @inherit.parent)))

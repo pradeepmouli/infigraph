@@ -455,7 +455,7 @@ pub(crate) fn cmd_index_docs(root: &Path) -> Result<()> {
 
     #[cfg(feature = "remote")]
     if is_remote {
-        let pg = infigraph_core::meta::PostgresMetaStore::connect_from_env()?;
+        let pg = infigraph_core::meta::PostgresMetaStore::connect_from_env_cached()?;
         pg.init_schema()?;
         let store = idx.store().context("doc store not initialized")?;
         let chunk_refs: Vec<&infigraph_docs::chunk::Chunk> = result.new_chunks.iter().collect();

@@ -1,39 +1,92 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
+#[cfg(feature = "remote")]
+use infigraph_core::graph::GraphBackend;
 use infigraph_core::Infigraph;
 use infigraph_languages::bundled_registry;
 
 pub(crate) fn cmd_index(root: &Path, full: bool, no_embed: bool) -> Result<()> {
+    #[cfg(feature = "remote")]
+    let remote = is_neo4j_backend();
+    #[cfg(not(feature = "remote"))]
+    let remote = false;
+
     if full {
-        let tg_dir = root.join(".infigraph");
-        if tg_dir.exists() {
-            // Sessions are in a separate DB at .infigraph/sessions/db/ — preserve them
-            let sessions_dir = tg_dir.join("sessions");
-            let sessions_backup = root.join(".infigraph-sessions-backup");
-            let had_sessions = sessions_dir.exists();
-            if had_sessions {
-                let _ = std::fs::rename(&sessions_dir, &sessions_backup);
+        if remote {
+            // Remote mode: clear the Neo4j graph (local .infigraph/ is irrelevant)
+            #[cfg(feature = "remote")]
+            {
+                let neo = infigraph_core::graph::Neo4jBackend::connect_from_env()?;
+                neo.init_schema()?;
+                neo.clear_all_data()?;
+                println!("Cleared Neo4j graph for full reindex");
             }
-            std::fs::remove_dir_all(&tg_dir)?;
-            if had_sessions {
-                std::fs::create_dir_all(&tg_dir)?;
-                let _ = std::fs::rename(&sessions_backup, &sessions_dir);
+        } else {
+            let tg_dir = root.join(".infigraph");
+            if tg_dir.exists() {
+                let sessions_dir = tg_dir.join("sessions");
+                let sessions_backup = root.join(".infigraph-sessions-backup");
+                let had_sessions = sessions_dir.exists();
+                if had_sessions {
+                    let _ = std::fs::rename(&sessions_dir, &sessions_backup);
+                }
+                std::fs::remove_dir_all(&tg_dir)?;
+                if had_sessions {
+                    std::fs::create_dir_all(&tg_dir)?;
+                    let _ = std::fs::rename(&sessions_backup, &sessions_dir);
+                }
+                println!("Cleaned .infigraph/ for full reindex (sessions preserved)");
             }
-            println!("Cleaned .infigraph/ for full reindex (sessions preserved)");
         }
     }
 
     let registry = crate::full_registry(Some(root))?;
+    #[allow(unused_mut)]
     let mut prism = Infigraph::open(root, registry)?;
     prism.init()?;
 
+    // In shared Neo4j mode, a repo's identity is defined by the group registry, not by its
+    // directory name. Resolve the `org/repo` namespace from the registry so a standalone
+    // `infigraph index` writes data consistent with `group build` and the read filters.
+    // Refuse to index an unregistered repo: writing a locally-invented namespace into the
+    // shared graph produces orphaned, mis-namespaced nodes (the original reindter bug).
+    #[cfg(feature = "remote")]
+    let remote_ns = if remote {
+        let reg = infigraph_core::multi::Registry::load()?;
+        let ns = reg.resolve_repo_namespace(root).ok_or_else(|| {
+            anyhow::anyhow!(
+                "repo at '{}' is not registered in any group; in remote mode run \
+                 `infigraph group add <group> <path>` first so its org/repo namespace is defined. \
+                 (A standalone index cannot invent a namespace for a shared graph.)",
+                root.display()
+            )
+        })?;
+        prism.set_namespace(&ns);
+        // Scope reads (get_file_hashes / stale-prune) to THIS repo. Without this, a
+        // standalone index fetches every repo's file hashes from the shared graph and the
+        // stale-file prune deletes all OTHER repos' data — same hazard as group indexing.
+        prism.set_repo_filter(&ns);
+        Some(ns)
+    } else {
+        None
+    };
+
     println!("Indexing project...");
     let result = prism.index()?;
-    println!(
-        "Indexed {}/{} files",
-        result.indexed_files, result.total_files
-    );
+    if result.indexed_files == 0 {
+        println!(
+            "All {} files up-to-date, nothing to reindex",
+            result.total_files
+        );
+    } else {
+        println!(
+            "Indexed {} files ({} up-to-date, {} total)",
+            result.indexed_files,
+            result.total_files - result.indexed_files,
+            result.total_files
+        );
+    }
 
     let mut by_lang: std::collections::HashMap<&str, (usize, usize)> =
         std::collections::HashMap::new();
@@ -48,6 +101,17 @@ pub(crate) fn cmd_index(root: &Path, full: bool, no_embed: bool) -> Result<()> {
 
     if result.resolve_stats.total_calls > 0 {
         println!("{}", result.resolve_stats);
+    }
+
+    // Derive TESTED_BY edges — scoped to changed files for incremental
+    if result.indexed_files > 0 && prism.backend().is_some() {
+        let changed: Vec<&str> = result.extractions.iter().map(|e| e.file.as_str()).collect();
+        let scope = if full { None } else { Some(changed.as_slice()) };
+        match prism.backend().unwrap().derive_tested_by_edges(scope) {
+            Ok(count) if count > 0 => println!("Derived {} TESTED_BY edges", count),
+            Ok(_) => {}
+            Err(e) => eprintln!("warning: TESTED_BY derivation failed: {e}"),
+        }
     }
 
     // Detect cross-cutting concerns, taint, etc. — skip when no files changed (incremental no-op)
@@ -135,10 +199,7 @@ pub(crate) fn cmd_index(root: &Path, full: bool, no_embed: bool) -> Result<()> {
     // In remote mode, register this repo in Postgres so it appears in registry queries
     #[cfg(feature = "remote")]
     {
-        if std::env::var("INFIGRAPH_BACKEND")
-            .map(|v| v == "neo4j")
-            .unwrap_or(false)
-        {
+        if is_neo4j_backend() {
             let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
             let repo_name = canonical
                 .file_name()
@@ -147,6 +208,14 @@ pub(crate) fn cmd_index(root: &Path, full: bool, no_embed: bool) -> Result<()> {
             let mut registry = infigraph_core::multi::Registry::load()?;
             registry.register_repo(&repo_name, root, &prism)?;
             println!("Registered '{}' in Postgres registry", repo_name);
+
+            // Create Repo node in Neo4j keyed by the org/repo namespace (matching f.repo),
+            // and link only this repo's files.
+            if let Some(backend) = prism.backend() {
+                let repo_key = remote_ns.as_deref().unwrap_or(&repo_name);
+                backend.upsert_repo(repo_key)?;
+                println!("Created Repo node '{}' with BELONGS_TO edges", repo_key);
+            }
         }
     }
 
@@ -178,8 +247,9 @@ pub(crate) fn cmd_index(root: &Path, full: bool, no_embed: bool) -> Result<()> {
         let mut done = false;
 
         #[cfg(feature = "remote")]
-        if let Some(backend) = prism.backend() {
-            let pg = infigraph_core::meta::PostgresMetaStore::connect_from_env()?;
+        if is_neo4j_backend() {
+            let backend = prism.backend().context("graph not initialized")?;
+            let pg = infigraph_core::meta::PostgresMetaStore::connect_from_env_cached()?;
             pg.init_schema()?;
             let count = infigraph_core::embed::update_embeddings_remote(backend, &pg, &changed)?;
             println!("Saved {} embeddings to Postgres pgvector", count);
@@ -285,6 +355,24 @@ fn spawn_scip_child_process(root: &Path, detected_languages: &std::collections::
 /// without spawning a process.
 fn scip_enrich_args(langs: &str) -> Vec<String> {
     vec!["scip-enrich".to_string(), langs.to_string()]
+}
+
+/// Whether the active backend is remote Neo4j (vs. the default local Kùzu).
+///
+/// `Infigraph::backend()` used to return `None` for the default Kùzu
+/// backend, so `if let Some(backend) = prism.backend()` doubled as a de
+/// facto "are we in remote mode" check. Once `backend()` was made universal
+/// (returning `Some` for every backend kind, including local Kùzu), that
+/// check silently broke: the Postgres-embeddings branch below started
+/// firing on every `remote`-feature build regardless of backend, attempting
+/// a Postgres connection even for plain local indexing and failing the
+/// whole `index` command with a connection-refused error. Extracted so the
+/// exact condition can be unit-tested independently of a real backend.
+#[cfg(feature = "remote")]
+fn is_neo4j_backend() -> bool {
+    std::env::var("INFIGRAPH_BACKEND")
+        .map(|v| v == "neo4j")
+        .unwrap_or(false)
 }
 
 /// Decides what (if anything) to warn about after waiting on the detached
@@ -736,14 +824,35 @@ fn auto_scip_background(root: &Path, detected_languages: &std::collections::Hash
     let Some(backend) = prism.backend() else {
         return;
     };
-    match infigraph_core::embed::update_embeddings(backend, &root_buf, &[]) {
-        Ok(n) => {
-            let new = n.saturating_sub(pre_count);
-            if new > 0 {
-                eprintln!("Auto-SCIP: embedded {new} new symbols from SCIP enrichment");
+    #[allow(unused_mut)]
+    let mut done = false;
+    #[cfg(feature = "remote")]
+    if is_neo4j_backend() {
+        if let Ok(pg) = infigraph_core::meta::PostgresMetaStore::connect_from_env_cached() {
+            match infigraph_core::embed::update_embeddings_remote(backend, pg, &[]) {
+                Ok(n) => {
+                    let new = n.saturating_sub(pre_count);
+                    if new > 0 {
+                        eprintln!(
+                            "Auto-SCIP: embedded {new} new symbols to pgvector from SCIP enrichment"
+                        );
+                    }
+                }
+                Err(e) => eprintln!("Auto-SCIP: remote embedding update failed: {e}"),
             }
+            done = true;
         }
-        Err(e) => eprintln!("Auto-SCIP: embedding update failed: {e}"),
+    }
+    if !done {
+        match infigraph_core::embed::update_embeddings(backend, &root_buf, &[]) {
+            Ok(n) => {
+                let new = n.saturating_sub(pre_count);
+                if new > 0 {
+                    eprintln!("Auto-SCIP: embedded {new} new symbols from SCIP enrichment");
+                }
+            }
+            Err(e) => eprintln!("Auto-SCIP: embedding update failed: {e}"),
+        }
     }
 
     eprintln!("Auto-SCIP: background enrichment complete.");
@@ -997,6 +1106,40 @@ mod tests {
                 .is_some_and(|m| m.contains("failed to wait on scip-enrich")),
             "expected a warning about the wait() failure, got {msg:?}"
         );
+    }
+
+    /// Regression test for the Postgres-connect-on-plain-local-index bug:
+    /// `Infigraph::backend()` became universal (returning `Some` for the
+    /// default local Kùzu backend too, not just Neo4j), which silently
+    /// turned `if let Some(backend) = prism.backend()` into an always-true
+    /// check gating the Postgres-embeddings branch — so `infigraph index`
+    /// tried to connect to Postgres and failed even for plain local
+    /// indexing with no remote backend configured. `is_neo4j_backend()`
+    /// replaces that check with the same explicit `INFIGRAPH_BACKEND`
+    /// check already used a few lines above it (repo registration) —
+    /// asserts it's only true for an explicit `neo4j` value.
+    #[test]
+    #[cfg(feature = "remote")]
+    fn is_neo4j_backend_only_true_for_explicit_neo4j_env() {
+        std::env::remove_var("INFIGRAPH_BACKEND");
+        assert!(
+            !is_neo4j_backend(),
+            "unset INFIGRAPH_BACKEND must not select Postgres"
+        );
+
+        std::env::set_var("INFIGRAPH_BACKEND", "kuzu");
+        assert!(
+            !is_neo4j_backend(),
+            "explicit kuzu backend must not select Postgres"
+        );
+
+        std::env::set_var("INFIGRAPH_BACKEND", "neo4j");
+        assert!(
+            is_neo4j_backend(),
+            "explicit neo4j backend must select Postgres"
+        );
+
+        std::env::remove_var("INFIGRAPH_BACKEND");
     }
 
     #[test]

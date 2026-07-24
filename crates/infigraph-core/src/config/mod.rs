@@ -101,18 +101,19 @@ static CONDITIONAL_PATTERNS: &[ConditionalPattern] = &[
 ];
 
 pub fn detect_config_bindings(backend: &dyn GraphBackend) -> Result<Vec<ConfigBinding>> {
-    let result = backend
-        .raw_query("MATCH (s:Symbol) WHERE s.docstring IS NOT NULL AND s.docstring <> '' RETURN s.id, s.docstring, s.file")?;
+    // Repo-scoped accessor instead of a global MATCH (s:Symbol) — otherwise config
+    // bindings leak across every repo in a shared graph.
+    let symbols = backend.symbols_with_docstring(None)?;
 
     let mut bindings = Vec::new();
 
-    for row in result {
-        if row.len() < 3 {
+    for sym in &symbols {
+        if sym.docstring.is_empty() {
             continue;
         }
-        let symbol_id = row[0].to_string();
-        let docstring = row[1].to_string();
-        let file = row[2].to_string();
+        let symbol_id = sym.id.clone();
+        let docstring = sym.docstring.clone();
+        let file = sym.file.clone();
 
         for cp in CONDITIONAL_PATTERNS {
             for &pattern in cp.patterns {

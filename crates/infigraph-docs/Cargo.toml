@@ -30,6 +30,15 @@ notify = "6"
 chrono = "0.4.45"
 fs2 = "0.4.3"
 
+[dependencies.neo4rs]
+version = "0.8"
+optional = true
+
+[dependencies.tokio]
+version = "1"
+features = ["rt-multi-thread"]
+optional = true
+
 [features]
 default = []
-remote = ["infigraph-core/remote"]
+remote = ["infigraph-core/remote", "neo4rs", "tokio"]

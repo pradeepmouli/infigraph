@@ -453,7 +453,7 @@ impl GraphBackend for KuzuBackend {
         self.store.remove_file(file)
     }
 
-    fn derive_tested_by_edges(&self) -> Result<usize> {
+    fn derive_tested_by_edges(&self, _changed_files: Option<&[&str]>) -> Result<usize> {
         self.store.derive_tested_by_edges()
     }
 

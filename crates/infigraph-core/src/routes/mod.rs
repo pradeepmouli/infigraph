@@ -49,10 +49,14 @@ pub struct Route {
 /// docstrings to identify likely HTTP handlers. This is intentionally broad
 /// to catch routes across many web frameworks.
 pub fn detect_routes(backend: &dyn GraphBackend) -> Result<Vec<Route>> {
-    let rows = backend.raw_query(
-        "MATCH (s:Symbol) WHERE s.kind IN ['Function', 'Method'] \
-         RETURN s.id, s.name, s.kind, s.file, s.docstring",
-    )?;
+    // Use the repo-scoped `symbols_with_docstring` accessor instead of a global
+    // `MATCH (s:Symbol)` — the latter returns every repo's symbols in shared-Neo4j mode
+    // and leaks routes across projects. This honors the backend's repo_filter.
+    let syms = backend.symbols_with_docstring(Some(&["Function", "Method"]))?;
+    let rows: Vec<Vec<String>> = syms
+        .into_iter()
+        .map(|s| vec![s.id, s.name, s.kind, s.file, s.docstring])
+        .collect();
     Ok(detect_routes_from_rows(&rows))
 }
 

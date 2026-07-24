@@ -13,6 +13,7 @@ pub mod extract;
 pub mod graph;
 pub mod lang;
 pub mod learned;
+pub mod lockfile;
 pub mod manifest;
 pub mod meta;
 pub mod model;
@@ -48,6 +49,24 @@ pub(crate) fn escape_str(s: &str) -> String {
     s.replace('\\', "\\\\").replace('\'', "\\'")
 }
 
+/// Short git SHA this binary was built from ("-dirty" when the tree had
+/// uncommitted changes; "unknown" outside a git checkout). Stamped into
+/// lock-file identity payloads so stale-binary holders are identifiable.
+pub fn build_hash() -> &'static str {
+    env!("INFIGRAPH_BUILD_HASH")
+}
+
+/// Kuzu's IO-layer error for "another process holds this database's lock"
+/// (see docs.ladybugdb.com/concurrency) is lock contention, not corruption.
+/// `GraphStore::open` collapses the underlying Kuzu error into a stringified
+/// `anyhow::Error` before it reaches `Infigraph::init`, so there's no
+/// structured error variant to match on here -- only Kuzu's own error text.
+/// This was previously indistinguishable from genuine corruption, so a
+/// second `infigraph` process opening a graph while a watcher already had
+/// it open would trigger `wipe_graph`, destroying the watcher's live data.
+fn is_lock_contention_error(err: &anyhow::Error) -> bool {
+    err.to_string().contains("Could not set lock on file")
+}
 /// The main entry point for the infigraph framework.
 pub struct Infigraph {
     root: PathBuf,
@@ -109,6 +128,16 @@ impl Infigraph {
                 Ok(kb) => {
                     self.backend_kind = BackendKind::Kuzu(kb);
                     Ok(())
+                }
+                Err(first_err) if is_lock_contention_error(&first_err) => {
+                    // Another live process (e.g. a running `infigraph watch`) holds
+                    // this database open -- not corruption. Wiping here would destroy
+                    // a perfectly good graph out from under that process.
+                    Err(first_err).with_context(|| {
+                        "graph is locked by another infigraph process (e.g. a running \
+                         `infigraph watch`) -- not corrupted, so it was left untouched. \
+                         Run `infigraph watch-status` or try again in a moment."
+                    })
                 }
                 Err(first_err) => {
                     eprintln!(
@@ -316,6 +345,20 @@ impl Infigraph {
     /// All file paths and symbol IDs will be prefixed with `{namespace}/`.
     pub fn set_namespace(&mut self, ns: &str) {
         self.namespace = Some(ns.to_string());
+        // Mirror to the Neo4j backend so File nodes get f.repo = ns at write time.
+        #[cfg(feature = "neo4j")]
+        if let BackendKind::Neo4j(ref mut neo) = self.backend_kind {
+            neo.set_write_namespace(ns);
+        }
+    }
+
+    /// Scope Neo4j read queries to a single repo by its directory name.
+    /// No-op for Kuzu (single-repo by design).
+    #[cfg(feature = "neo4j")]
+    pub fn set_repo_filter(&mut self, repo: &str) {
+        if let BackendKind::Neo4j(ref mut neo) = self.backend_kind {
+            neo.set_repo_filter(repo);
+        }
     }
 
     /// Index (or re-index) a single file by its path on disk.
@@ -502,4 +545,41 @@ pub struct IndexResult {
     pub indexed_files: usize,
     pub extractions: Vec<FileExtraction>,
     pub resolve_stats: resolve::ResolveStats,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression test for a data-loss bug: `Infigraph::init()` used to
+    /// treat every Kuzu open failure as corruption and wipe the graph --
+    /// including plain lock contention from another live process (e.g. a
+    /// running `infigraph watch`), destroying its data. `is_lock_contention_error`
+    /// is the check that now distinguishes the two. A genuine two-OS-process
+    /// reproduction isn't exercised here -- `Database::new()` doesn't
+    /// conflict across two `Infigraph` instances in the *same* process, only
+    /// across separate processes, and this codebase deliberately avoids
+    /// fork()-based tests given the tokio/rayon runtime state that would be
+    /// undefined in a forked child (same reasoning as `scip_enrich_exit_message`
+    /// in infigraph-cli's index.rs, which tests extracted logic rather than
+    /// the full spawn path for the same class of reason).
+    #[test]
+    fn is_lock_contention_error_matches_kuzu_lock_message() {
+        let err = anyhow::anyhow!(
+            "failed to open kuzu db: IO exception: Could not set lock on file : /repo/.infigraph/graph"
+        );
+        assert!(is_lock_contention_error(&err));
+    }
+
+    #[test]
+    fn is_lock_contention_error_does_not_match_genuine_corruption() {
+        let err = anyhow::anyhow!(
+            "failed to open kuzu db: Runtime exception: Database ID for temporary file \
+             '/repo/.infigraph/graph.wal.checkpoint' does not match the current database."
+        );
+        assert!(
+            !is_lock_contention_error(&err),
+            "a genuine format/ID mismatch must still be treated as corruption and wiped"
+        );
+    }
 }
