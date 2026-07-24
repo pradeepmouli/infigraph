@@ -131,30 +131,23 @@ fn auto_start_watch_inner(path: &str, skip_disabled_check: bool) -> Option<Strin
 /// a watcher that was just told to stop may take up to its poll interval
 /// (~200ms) to actually exit and release this lock, and without a retry
 /// window a start attempt landing in that gap would spuriously fail.
-fn acquire_project_watch_lock(lock_path: &std::path::Path) -> Result<std::fs::File> {
-    use fs2::FileExt;
-    if let Some(parent) = lock_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(lock_path)?;
-
+fn acquire_project_watch_lock(
+    lock_path: &std::path::Path,
+) -> Result<infigraph_core::lockfile::LockFile> {
     const ATTEMPTS: u32 = 10;
     const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
     let mut last_err = None;
     for _ in 0..ATTEMPTS {
-        match file.try_lock_exclusive() {
-            Ok(()) => return Ok(file),
-            Err(e) => {
-                last_err = Some(e);
+        match infigraph_core::lockfile::try_acquire(lock_path, "mcp-watch") {
+            Ok(Some(guard)) => return Ok(guard),
+            Ok(None) => {
+                last_err = Some(anyhow::anyhow!("lock held"));
                 std::thread::sleep(RETRY_DELAY);
             }
+            Err(e) => return Err(e),
         }
     }
-    Err(last_err.unwrap().into())
+    Err(last_err.unwrap())
 }
 
 fn is_remote_mode() -> bool {

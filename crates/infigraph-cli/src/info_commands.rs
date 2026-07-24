@@ -363,38 +363,15 @@ pub(crate) fn cmd_watch_status(root: &Path) -> Result<()> {
 }
 
 pub(crate) fn watcher_is_alive(lock_path: &Path) -> bool {
-    use fs2::FileExt;
-    let file = match std::fs::OpenOptions::new()
-        .create(false)
-        .write(true)
-        .truncate(false)
-        .open(lock_path)
-    {
-        Ok(f) => f,
-        Err(_) => return false,
-    };
-    match file.try_lock_exclusive() {
-        Ok(()) => {
-            let _ = file.unlock();
-            false
-        }
-        Err(_) => true,
-    }
+    infigraph_core::lockfile::try_acquire(lock_path, "watch-liveness-probe")
+        .ok()
+        .flatten()
+        .is_none()
 }
 
-pub(crate) fn acquire_watch_lock(lock_path: &Path) -> Result<std::fs::File> {
-    use fs2::FileExt;
-    if let Some(parent) = lock_path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(lock_path)?;
-    file.try_lock_exclusive()
-        .map_err(|_| anyhow::anyhow!("another watcher is already running"))?;
-    Ok(file)
+pub(crate) fn acquire_watch_lock(lock_path: &Path) -> Result<infigraph_core::lockfile::LockFile> {
+    infigraph_core::lockfile::try_acquire(lock_path, "cli-watch")?
+        .ok_or_else(|| anyhow::anyhow!("another watcher is already running"))
 }
 
 pub(crate) fn cmd_scip_import(root: &Path, index_path: &Path) -> Result<()> {
