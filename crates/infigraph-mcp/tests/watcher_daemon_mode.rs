@@ -108,3 +108,38 @@ fn daemon_mode_on_does_not_populate_in_process_watchers_map() {
 
     std::env::remove_var("INFIGRAPH_WATCH_DAEMON");
 }
+
+#[test]
+fn stop_watch_by_path_reports_no_watcher_when_none_running() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(root.join(".infigraph")).unwrap();
+    let args = serde_json::json!({ "path": root.to_string_lossy() });
+    let result = infigraph_mcp::tools::watch::tool_stop_watch(&args).unwrap();
+    assert_eq!(result, "No watcher running.");
+}
+
+#[test]
+fn get_watch_status_by_path_reports_no_watcher_when_none_running() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(root.join(".infigraph")).unwrap();
+    let args = serde_json::json!({ "path": root.to_string_lossy() });
+    let result = infigraph_mcp::tools::watch::tool_get_watch_status(&args).unwrap();
+    assert!(result.starts_with("No watcher running for"));
+}
+
+#[test]
+fn get_watch_status_by_path_reports_holder_identity_when_lock_held() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(root.join(".infigraph")).unwrap();
+    let lock_path = root.join(".infigraph").join("watch.lock");
+    let _held = infigraph_core::lockfile::try_acquire(&lock_path, "test-daemon")
+        .unwrap()
+        .unwrap();
+
+    let args = serde_json::json!({ "path": root.to_string_lossy() });
+    let result = infigraph_mcp::tools::watch::tool_get_watch_status(&args).unwrap();
+    assert!(result.contains("role: test-daemon"));
+}

@@ -620,6 +620,16 @@ pub fn handle_initialize(id: &Value, is_primary: bool) -> Value {
             mcp_log("DEBUG", "init_doc_watchers start");
             tools::docs::init_doc_watchers();
 
+            if infigraph_core::watch::daemon::watch_daemon_mode_enabled() {
+                mcp_log(
+                    "INFO",
+                    "watch daemon mode active — skipping bulk watcher re-arm \
+                     (persistent daemons survive worker restarts, opportunistic \
+                     per-call starts are sufficient)",
+                );
+                return;
+            }
+
             let registry = match infigraph_core::multi::Registry::load() {
                 Ok(r) => {
                     mcp_log(

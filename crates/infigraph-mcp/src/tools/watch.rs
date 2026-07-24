@@ -321,22 +321,55 @@ pub fn tool_watch_project(args: &Value) -> Result<String> {
 }
 
 pub fn tool_stop_watch(args: &Value) -> Result<String> {
-    let watcher_id = args
-        .get("watcher_id")
-        .and_then(|v| v.as_str())
-        .context("missing 'watcher_id'")?;
-
-    let mut guard = get_watchers();
-    if let Some(map) = guard.as_mut() {
-        if let Some(entry) = map.remove(watcher_id) {
-            let _ = entry.stop_tx.send(());
-            return Ok(format!("Watcher {watcher_id} stopped."));
+    if let Some(watcher_id) = args.get("watcher_id").and_then(|v| v.as_str()) {
+        let mut guard = get_watchers();
+        if let Some(map) = guard.as_mut() {
+            if let Some(entry) = map.remove(watcher_id) {
+                let _ = entry.stop_tx.send(());
+                return Ok(format!("Watcher {watcher_id} stopped."));
+            }
         }
+        return Ok(format!("No watcher found with ID: {watcher_id}"));
     }
-    Ok(format!("No watcher found with ID: {watcher_id}"))
+
+    if let Some(path) = args.get("path").and_then(|v| v.as_str()) {
+        let root = std::path::PathBuf::from(path)
+            .canonicalize()
+            .context("invalid path")?;
+        let sentinel = root.join(".infigraph").join("watch.stop");
+        let lock_path = root.join(".infigraph").join("watch.lock");
+        if infigraph_core::lockfile::read_holder(&lock_path).is_none()
+            && infigraph_core::lockfile::try_acquire(&lock_path, "watch-liveness-probe")
+                .ok()
+                .flatten()
+                .is_some()
+        {
+            return Ok("No watcher running.".to_string());
+        }
+        std::fs::write(&sentinel, b"")?;
+        return Ok("Stop signal sent. Watcher will exit within ~1 second.".to_string());
+    }
+
+    anyhow::bail!("missing 'watcher_id' or 'path'")
 }
 
 pub fn tool_get_watch_status(args: &Value) -> Result<String> {
+    if let Some(path) = args.get("path").and_then(|v| v.as_str()) {
+        let root = std::path::PathBuf::from(path)
+            .canonicalize()
+            .context("invalid path")?;
+        let lock_path = root.join(".infigraph").join("watch.lock");
+        return Ok(match infigraph_core::lockfile::read_holder(&lock_path) {
+            Some(info) => format!(
+                "Watcher active for {path}\nHeld by PID {} (role: {}) since epoch {}\n\
+                 Note: pending-reindex tracking is not available across processes in \
+                 daemon mode — use index_project if unsure whether a reindex is needed.",
+                info.pid, info.role, info.acquired_at
+            ),
+            None => format!("No watcher running for {path}."),
+        });
+    }
+
     let watcher_id = args.get("watcher_id").and_then(|v| v.as_str());
 
     if let Some(id) = watcher_id {
