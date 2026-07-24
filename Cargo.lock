@@ -2470,6 +2470,7 @@ dependencies = [
  "glob",
  "ignore",
  "lbug",
+ "libc",
  "memmap2",
  "model2vec-rs",
  "neo4rs",
