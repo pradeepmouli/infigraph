@@ -254,6 +254,25 @@ fn run() -> Result<()> {
         }
     };
 
+    let reaped = infigraph_core::instances::reap_orphans_once(std::process::id());
+    if reaped > 0 {
+        mcp_log(
+            "INFO",
+            &format!("Reaped {reaped} orphaned instance(s) on startup"),
+        );
+    }
+
+    std::thread::spawn(|| loop {
+        std::thread::sleep(infigraph_core::instances::reap_scan_interval());
+        let reaped = infigraph_core::instances::reap_orphans_once(std::process::id());
+        if reaped > 0 {
+            mcp_log(
+                "INFO",
+                &format!("Reaped {reaped} orphaned instance(s) (periodic scan)"),
+            );
+        }
+    });
+
     let ui_enabled = args
         .iter()
         .any(|a| a == "--ui" || a.starts_with("--ui=") || a == "--mcp");
