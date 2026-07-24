@@ -18,4 +18,9 @@
   argument: (identifier) @import.module)
 
 ; Struct inheritance via trait bounds isn't direct, but impl Trait for Type is
-; We capture impl blocks as a relationship
+; We capture impl blocks as a relationship. trait/type may be type_identifier,
+; generic_type, or scoped_type_identifier (e.g. impl std::fmt::Display for MyType,
+; impl Iterator<Item=T> for MyType).
+(impl_item
+  trait: (_) @inherit.parent
+  type: (_) @inherit.child)
