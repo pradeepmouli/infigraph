@@ -237,6 +237,20 @@ fn run() -> Result<()> {
     }
 
     let args: Vec<String> = std::env::args().collect();
+    let mcp_mode = args.iter().any(|a| a == "--mcp");
+    let transport = if mcp_mode { "stdio" } else { "http" };
+    let project_path = std::env::current_dir()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| "unknown".to_string());
+    let instance_info = infigraph_core::instances::InstanceInfo::current(&project_path, transport);
+    let _instance_guard = match infigraph_core::instances::register_instance(&instance_info) {
+        Ok(guard) => Some(guard),
+        Err(e) => {
+            mcp_log("WARN", &format!("Failed to register instance: {e:#}"));
+            None
+        }
+    };
+
     let ui_enabled = args
         .iter()
         .any(|a| a == "--ui" || a.starts_with("--ui=") || a == "--mcp");
@@ -247,7 +261,6 @@ fn run() -> Result<()> {
         .and_then(|p| p.parse().ok())
         .unwrap_or(9749);
 
-    let mcp_mode = args.iter().any(|a| a == "--mcp");
     let serve_mode = args.iter().any(|a| a == "--serve");
     let not_ready = args.iter().any(|a| a == "--not-ready");
     if not_ready {
