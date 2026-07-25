@@ -856,6 +856,13 @@ pub fn git_head_commit(repo_path: &Path) -> Option<String> {
     std::process::Command::new("git")
         .args(["rev-parse", "HEAD"])
         .current_dir(repo_path)
+        // A caller running inside a `git commit` hook inherits GIT_DIR/GIT_WORK_TREE/
+        // GIT_INDEX_FILE from the outer git process; left ambient, they override
+        // `current_dir` and redirect this lookup to the OUTER repo instead of
+        // `repo_path`'s own repo, corrupting index_group's incremental change detection.
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
         .output()
         .ok()
         .filter(|o| o.status.success())
@@ -1014,5 +1021,67 @@ mod tests {
             "data-mlplatform/grp"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Serializes tests that mutate process-global GIT_DIR/GIT_WORK_TREE env vars --
+    // cargo runs this file's tests on parallel threads.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn run_git(dir: &std::path::Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .status()
+            .expect("git command should run");
+        assert!(status.success(), "git {:?} failed in {:?}", args, dir);
+    }
+
+    #[test]
+    fn git_head_commit_ignores_ambient_git_dir_env() {
+        // Simulates running inside a `git commit` hook: git sets GIT_DIR/GIT_WORK_TREE
+        // (and GIT_INDEX_FILE) in the hook process's own environment, pointing at the
+        // repo the hook is running in. git_head_commit(repo_path) must resolve HEAD for
+        // `repo_path`'s own repo regardless -- otherwise index_group's incremental skip
+        // logic silently compares against the wrong repository's commit.
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        let outer = tempfile::TempDir::new().unwrap();
+        run_git(outer.path(), &["init", "-q"]);
+        run_git(outer.path(), &["config", "user.email", "t@t.com"]);
+        run_git(outer.path(), &["config", "user.name", "t"]);
+        std::fs::write(outer.path().join("a.txt"), "a").unwrap();
+        run_git(outer.path(), &["add", "."]);
+        run_git(outer.path(), &["commit", "-q", "-m", "outer"]);
+        let outer_head = git_head_commit(outer.path()).expect("outer repo should have a HEAD");
+
+        let inner = tempfile::TempDir::new().unwrap();
+        run_git(inner.path(), &["init", "-q"]);
+        run_git(inner.path(), &["config", "user.email", "t@t.com"]);
+        run_git(inner.path(), &["config", "user.name", "t"]);
+        std::fs::write(inner.path().join("b.txt"), "b").unwrap();
+        run_git(inner.path(), &["add", "."]);
+        run_git(inner.path(), &["commit", "-q", "-m", "inner"]);
+        let inner_head = git_head_commit(inner.path()).expect("inner repo should have a HEAD");
+
+        assert_ne!(
+            outer_head, inner_head,
+            "test setup: the two repos must have different HEADs"
+        );
+
+        // Simulate the ambient env a git hook process would have -- pointing at `outer`.
+        std::env::set_var("GIT_DIR", outer.path().join(".git"));
+        std::env::set_var("GIT_WORK_TREE", outer.path());
+        let result = git_head_commit(inner.path());
+        std::env::remove_var("GIT_DIR");
+        std::env::remove_var("GIT_WORK_TREE");
+
+        assert_eq!(
+            result,
+            Some(inner_head),
+            "git_head_commit must resolve HEAD for the requested repo_path, not leak the ambient GIT_DIR/GIT_WORK_TREE"
+        );
     }
 }
