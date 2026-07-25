@@ -4,8 +4,8 @@ use std::time::{Duration, Instant};
 use serde_json::json;
 
 use infigraph_mcp::tools::docs::{
-    auto_start_doc_watch, init_doc_watchers, is_doc_watching, tool_index_docs, tool_search_docs,
-    tool_watch_docs, DOC_WATCHERS,
+    auto_start_doc_watch, init_doc_watchers, is_doc_watching, open_doc_index, tool_index_docs,
+    tool_search_docs, tool_watch_docs, DOC_WATCHERS,
 };
 use infigraph_mcp::tools::helpers::open_prism;
 use infigraph_mcp::tools::index::tool_index_project;
@@ -1081,6 +1081,55 @@ fn test_auto_start_doc_watch_no_duplicates() {
     assert_eq!(
         count_after_index, count_after_explicit,
         "doc watcher count should not increase on duplicate auto_start_doc_watch"
+    );
+}
+
+/// auto_start_doc_watch only starts watching once `.infigraph/docs.kuzu` exists (it
+/// gates on that file, per auto_start_doc_watch_inner). tool_index_project's in-process
+/// fallback path relies on this: it must index docs before calling auto_start_doc_watch,
+/// or the call silently no-ops -- this is the exact invariant that regressed when that
+/// fallback path started the doc watcher without ever indexing docs first.
+#[test]
+fn test_doc_watch_noop_before_doc_index_then_starts_after() {
+    let _guard = WATCHER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _cleanup = WatcherCleanup;
+    stop_all_watchers();
+    stop_all_doc_watchers();
+    init_doc_watchers();
+
+    let (_dir, path) = make_project(&[("docs/readme.md", "# Hello\n\nDoc content.")]);
+
+    // No doc indexing yet -- docs.kuzu doesn't exist, so this must no-op.
+    let result = auto_start_doc_watch(&path);
+    assert!(
+        result.is_none(),
+        "auto_start_doc_watch must no-op before docs have been indexed"
+    );
+
+    let canonical = std::path::PathBuf::from(&path)
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .replace('\\', "/");
+    assert!(
+        !is_doc_watching(&canonical),
+        "doc watcher must not be running when docs were never indexed"
+    );
+
+    // Index docs directly (bypassing tool_index_docs's own internal auto-start, which
+    // would otherwise start the watcher itself and mask what this test isolates) --
+    // mirrors exactly what tool_index_project's fallback path must do before this call.
+    let idx = open_doc_index(&json!({"path": &path})).expect("open doc index");
+    idx.index().expect("doc index");
+
+    let result = auto_start_doc_watch(&path);
+    assert!(
+        result.is_some(),
+        "auto_start_doc_watch should start watching once docs.kuzu exists"
+    );
+    assert!(
+        is_doc_watching(&canonical),
+        "doc watcher should be running after docs are indexed"
     );
 }
 

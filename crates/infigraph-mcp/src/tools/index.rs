@@ -3,7 +3,7 @@ use serde_json::Value;
 
 use infigraph_core::embed;
 
-use super::docs::auto_start_doc_watch_opportunistic as auto_start_doc_watch;
+use super::docs::{auto_start_doc_watch_opportunistic as auto_start_doc_watch, open_doc_index};
 use super::helpers::{find_infigraph_cli, open_prism};
 use super::watch::auto_start_watch_opportunistic as auto_start_watch;
 
@@ -149,6 +149,17 @@ pub fn tool_index_project(args: &Value) -> Result<String> {
 
     if let Some(msg) = auto_start_watch(path) {
         out.push_str(&format!("\n{}", msg));
+    }
+    // Index docs before starting the doc watcher: auto_start_doc_watch only starts
+    // watching when .infigraph/docs.kuzu already exists, and this in-process fallback
+    // (unlike the CLI-subprocess path above, whose `infigraph index` invocation already
+    // indexes docs) never created it otherwise -- making the call below a silent no-op.
+    match open_doc_index(args).and_then(|idx| idx.index()) {
+        Ok(doc_result) => out.push_str(&format!(
+            "Document indexing complete.\n  Files scanned: {}\n  Files indexed: {}\n  Chunks created: {}\n",
+            doc_result.total_files, doc_result.indexed_files, doc_result.total_chunks
+        )),
+        Err(e) => out.push_str(&format!("warning: doc indexing failed: {e}\n")),
     }
     auto_start_doc_watch(path);
     if let Err(e) = infigraph_core::claude_md::ensure_project_claude_md(std::path::Path::new(path))
