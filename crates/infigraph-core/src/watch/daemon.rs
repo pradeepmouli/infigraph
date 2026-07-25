@@ -161,11 +161,23 @@ pub fn resolve_cli_binary_sibling_of(current_exe: &Path) -> Result<std::path::Pa
     };
     let candidate = dir.join(name);
     if candidate.exists() {
-        Ok(candidate)
-    } else {
-        Err(anyhow::anyhow!(
-            "expected infigraph CLI binary at {}",
-            candidate.display()
-        ))
+        return Ok(candidate);
     }
+    // `cargo test` integration-test binaries live one level below the real
+    // build output directory (target/debug/deps/<test>-<hash> vs
+    // target/debug/), so the sibling check above never finds the CLI binary
+    // there even though it genuinely exists one directory up. This fallback
+    // only matters under that layout: production installs always place
+    // `infigraph` and `infigraph-mcp` as true siblings, so the check above
+    // already succeeds for them and this branch is never reached.
+    if let Some(grandparent) = dir.parent() {
+        let grandparent_candidate = grandparent.join(name);
+        if grandparent_candidate.exists() {
+            return Ok(grandparent_candidate);
+        }
+    }
+    Err(anyhow::anyhow!(
+        "expected infigraph CLI binary at {}",
+        candidate.display()
+    ))
 }

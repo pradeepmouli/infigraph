@@ -87,6 +87,18 @@ fn daemon_mode_off_by_default_uses_in_process_thread() {
 /// thread — is_watching() (which only reflects the in-process WATCHERS
 /// map) must stay false, since the watcher is meant to live in a separate
 /// daemon process instead.
+///
+/// Whether `resolve_cli_binary_sibling_of` actually *finds* the `infigraph`
+/// CLI binary next to this test binary is environment-dependent: it lives
+/// in `target/debug/deps/` (one level below `target/debug/`, where the real
+/// sibling binaries are), and a grandparent-directory fallback was added so
+/// it CAN be found there once `infigraph-cli`'s binary has been built into
+/// `target/debug/` (e.g. by a full-workspace `cargo test` invocation that
+/// also builds `-p infigraph-cli`). Either outcome — spawn succeeds or the
+/// binary genuinely isn't there yet — is acceptable; this test only asserts
+/// the one invariant that must hold in both cases: daemon mode never
+/// populates the in-process WATCHERS map. When a real daemon does spawn, it
+/// is cleaned up before returning so it doesn't leak into other tests.
 #[test]
 fn daemon_mode_on_does_not_populate_in_process_watchers_map() {
     let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -96,15 +108,24 @@ fn daemon_mode_on_does_not_populate_in_process_watchers_map() {
     std::fs::create_dir_all(root.join(".infigraph")).unwrap();
     let path = root.to_string_lossy().to_string();
 
-    // No infigraph CLI binary sibling exists next to the test binary, so
-    // this exercises the "could not locate infigraph CLI binary" failure
-    // path — proving daemon mode was taken (not the in-process path) even
-    // though the actual spawn can't succeed in this test environment.
     let result = infigraph_mcp::tools::watch::auto_start_watch(&path);
-    assert!(result.is_none());
     assert!(!infigraph_mcp::tools::watch::is_watching(
         &path.replace('\\', "/")
     ));
+
+    if let Some(msg) = result {
+        // The CLI binary was found and a real detached daemon spawned —
+        // stop it via the same path-based stop mechanism a real caller
+        // would use, and wait for the lock to be released, so this test
+        // doesn't leave an orphaned watch process or a held lock behind.
+        assert!(
+            msg.contains("Daemon watcher started"),
+            "unexpected auto_start_watch outcome: {msg}"
+        );
+        let args = serde_json::json!({ "path": path });
+        let _ = infigraph_mcp::tools::watch::tool_stop_watch(&args);
+        wait_for_watch_locks_released(std::slice::from_ref(&path));
+    }
 
     std::env::remove_var("INFIGRAPH_WATCH_DAEMON");
 }
