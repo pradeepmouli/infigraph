@@ -14,6 +14,126 @@ fn is_remote_mode() -> bool {
         .unwrap_or(false)
 }
 
+/// Outcome of a bounded-wait subprocess run.
+enum RunOutcome {
+    Completed { success: bool, output: String },
+    TimedOut,
+}
+
+/// Run `cmd` to completion, killing it if it doesn't finish within `timeout`.
+///
+/// Uses `try_wait()` polling rather than the blocking `.output()`/`.wait()` so a hung
+/// child (e.g. `infigraph index` stuck opening a corrupted graph DB) can be killed
+/// instead of blocking this thread forever. stdout/stderr are drained continuously on
+/// background threads while polling -- `Stdio::piped()` without draining would let the
+/// child block on a full pipe buffer during a long, verbose index run.
+fn run_with_timeout(
+    cmd: &mut std::process::Command,
+    timeout: std::time::Duration,
+) -> Result<RunOutcome> {
+    use std::io::Read;
+
+    cmd.stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn().context("failed to spawn subprocess")?;
+
+    let mut stdout_pipe = child.stdout.take().expect("stdout was piped");
+    let mut stderr_pipe = child.stderr.take().expect("stderr was piped");
+    let stdout_thread = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout_pipe.read_to_end(&mut buf);
+        buf
+    });
+    let stderr_thread = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stderr_pipe.read_to_end(&mut buf);
+        buf
+    });
+
+    let start = std::time::Instant::now();
+    let poll_interval = std::time::Duration::from_millis(50);
+    let status = loop {
+        match child
+            .try_wait()
+            .context("failed to poll subprocess status")?
+        {
+            Some(status) => break Some(status),
+            None => {
+                if start.elapsed() >= timeout {
+                    break None;
+                }
+                std::thread::sleep(poll_interval);
+            }
+        }
+    };
+
+    match status {
+        Some(status) => {
+            let stdout = stdout_thread.join().unwrap_or_default();
+            let stderr = stderr_thread.join().unwrap_or_default();
+            let combined = format!(
+                "{}{}",
+                String::from_utf8_lossy(&stdout),
+                String::from_utf8_lossy(&stderr)
+            );
+            Ok(RunOutcome::Completed {
+                success: status.success(),
+                output: combined,
+            })
+        }
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            Ok(RunOutcome::TimedOut)
+        }
+    }
+}
+
+/// Run an indexing attempt with automatic recovery from a hung/corrupted graph.
+///
+/// `attempt(full)` should run one bounded-timeout attempt (typically wrapping
+/// `run_with_timeout`) and return its outcome. The sequence is exactly three
+/// attempts: as originally requested, a plain retry with the same `full` value
+/// (handles transient slowness), then one escalated attempt with `full` forced to
+/// `true` (two consecutive timeouts is evidence of corruption, not slowness -- and
+/// since indexing's whole job is already to rebuild the graph, self-healing via a
+/// full reindex here doesn't cross the same line the general wipe-on-failure
+/// caution warns about for other subsystems). A `Result::Err` from `attempt` itself
+/// (e.g. a genuine spawn failure) propagates immediately without retrying -- only a
+/// `TimedOut` outcome triggers the retry/escalate sequence.
+fn run_with_recovery(
+    mut attempt: impl FnMut(bool) -> Result<RunOutcome>,
+    full: bool,
+    timeout: std::time::Duration,
+) -> Result<(bool, String)> {
+    let attempts = [full, full, true];
+    for (i, &attempt_full) in attempts.iter().enumerate() {
+        match attempt(attempt_full)? {
+            RunOutcome::Completed { success, output } => return Ok((success, output)),
+            RunOutcome::TimedOut => {
+                if i == 0 {
+                    crate::mcp_log(
+                        "WARN",
+                        &format!(
+                            "infigraph index timed out after {timeout:?}, killing and retrying once"
+                        ),
+                    );
+                } else if i == 1 {
+                    crate::mcp_log(
+                        "WARN",
+                        "infigraph index timed out twice in a row -- escalating to --full reindex",
+                    );
+                }
+            }
+        }
+    }
+    Err(anyhow::anyhow!(
+        "infigraph index timed out 3 times in a row (including one --full attempt) after \
+         {timeout:?} each -- likely unrecoverable graph corruption. Manually inspect/remove \
+         .infigraph/graph and .infigraph/graph.wal, then retry."
+    ))
+}
+
 pub fn tool_index_project(args: &Value) -> Result<String> {
     let path = args.get("path").and_then(|p| p.as_str()).unwrap_or(".");
     let full = args.get("full").and_then(|f| f.as_bool()).unwrap_or(false);
@@ -228,4 +348,192 @@ pub fn tool_scip_import(args: &Value) -> Result<String> {
         out.push_str(&format!("\n{}", msg));
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[cfg(unix)]
+    #[test]
+    fn run_with_timeout_completes_fast_command_successfully() {
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", "echo hello; echo world 1>&2"]);
+        let outcome = run_with_timeout(&mut cmd, Duration::from_secs(5)).unwrap();
+        match outcome {
+            RunOutcome::Completed { success, output } => {
+                assert!(success);
+                assert!(output.contains("hello"), "missing stdout: {output}");
+                assert!(output.contains("world"), "missing stderr: {output}");
+            }
+            RunOutcome::TimedOut => panic!("expected completion, got TimedOut"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_with_timeout_reports_nonzero_exit_as_not_success() {
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", "exit 1"]);
+        let outcome = run_with_timeout(&mut cmd, Duration::from_secs(5)).unwrap();
+        match outcome {
+            RunOutcome::Completed { success, .. } => assert!(!success),
+            RunOutcome::TimedOut => panic!("expected completion, got TimedOut"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_with_timeout_kills_and_reports_timeout_for_a_hung_command() {
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", "sleep 30"]);
+        let start = std::time::Instant::now();
+        let outcome = run_with_timeout(&mut cmd, Duration::from_millis(200)).unwrap();
+        let elapsed = start.elapsed();
+        assert!(matches!(outcome, RunOutcome::TimedOut));
+        // Must return close to the timeout, not wait for the full 30s sleep --
+        // proves the child was actually killed, not merely abandoned.
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "took {elapsed:?}, should have returned shortly after the 200ms timeout"
+        );
+    }
+
+    #[test]
+    fn run_with_recovery_returns_immediately_on_first_success() {
+        let mut calls: Vec<bool> = Vec::new();
+        let result = run_with_recovery(
+            |full| {
+                calls.push(full);
+                Ok(RunOutcome::Completed {
+                    success: true,
+                    output: "ok".to_string(),
+                })
+            },
+            false,
+            Duration::from_secs(1),
+        );
+        assert!(result.is_ok());
+        let (success, output) = result.unwrap();
+        assert!(success);
+        assert_eq!(output, "ok");
+        assert_eq!(calls, vec![false], "only one attempt should have run");
+    }
+
+    #[test]
+    fn run_with_recovery_retries_once_with_same_flags_before_escalating() {
+        let mut calls: Vec<bool> = Vec::new();
+        let mut call_count = 0;
+        let result = run_with_recovery(
+            |full| {
+                calls.push(full);
+                call_count += 1;
+                if call_count == 1 {
+                    Ok(RunOutcome::TimedOut)
+                } else {
+                    Ok(RunOutcome::Completed {
+                        success: true,
+                        output: "recovered".to_string(),
+                    })
+                }
+            },
+            false,
+            Duration::from_millis(1),
+        );
+        assert!(result.is_ok());
+        let (success, output) = result.unwrap();
+        assert!(success);
+        assert_eq!(output, "recovered");
+        assert_eq!(
+            calls,
+            vec![false, false],
+            "second attempt (the plain retry) must use the same `full` value as the first, not escalate yet"
+        );
+    }
+
+    #[test]
+    fn run_with_recovery_escalates_to_full_after_two_timeouts() {
+        let mut calls: Vec<bool> = Vec::new();
+        let mut call_count = 0;
+        let result = run_with_recovery(
+            |full| {
+                calls.push(full);
+                call_count += 1;
+                if call_count <= 2 {
+                    Ok(RunOutcome::TimedOut)
+                } else {
+                    Ok(RunOutcome::Completed {
+                        success: true,
+                        output: "healed by full reindex".to_string(),
+                    })
+                }
+            },
+            false,
+            Duration::from_millis(1),
+        );
+        assert!(result.is_ok());
+        let (success, _) = result.unwrap();
+        assert!(success);
+        assert_eq!(
+            calls,
+            vec![false, false, true],
+            "third attempt must be escalated to full=true regardless of the originally requested value"
+        );
+    }
+
+    #[test]
+    fn run_with_recovery_escalates_even_when_full_was_already_requested() {
+        // If the caller already asked for --full, attempt 3 stays full=true (no
+        // meaningful distinction to escalate further into), and the sequence is
+        // still exactly 3 attempts, not fewer or more.
+        let mut calls: Vec<bool> = Vec::new();
+        let result = run_with_recovery(
+            |full| {
+                calls.push(full);
+                Ok(RunOutcome::TimedOut)
+            },
+            true,
+            Duration::from_millis(1),
+        );
+        assert!(result.is_err());
+        assert_eq!(calls, vec![true, true, true]);
+    }
+
+    #[test]
+    fn run_with_recovery_gives_up_with_actionable_error_after_three_timeouts() {
+        let result = run_with_recovery(
+            |_full| Ok(RunOutcome::TimedOut),
+            false,
+            Duration::from_millis(1),
+        );
+        let err = result.expect_err("three consecutive timeouts must return Err");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("3 times") || msg.contains("three"),
+            "error should mention the attempt count: {msg}"
+        );
+        assert!(
+            msg.to_lowercase().contains("graph") || msg.to_lowercase().contains("corrupt"),
+            "error should point at the graph/corruption as the likely cause: {msg}"
+        );
+    }
+
+    #[test]
+    fn run_with_recovery_propagates_a_spawn_error_immediately_without_retrying() {
+        let mut calls = 0;
+        let result = run_with_recovery(
+            |_full| {
+                calls += 1;
+                Err(anyhow::anyhow!("failed to spawn subprocess: no such file"))
+            },
+            false,
+            Duration::from_secs(1),
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            calls, 1,
+            "a genuine spawn error (not a timeout) must not trigger the retry/escalate loop"
+        );
+    }
 }
