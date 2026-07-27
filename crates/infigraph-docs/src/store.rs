@@ -72,6 +72,10 @@ impl DocStore {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        // Preflight: a truncated/corrupt file can abort or segfault inside
+        // `Database::new` before any `Result` exists. Reject it here so
+        // `DocIndex::init`'s wipe-and-rebuild recovery runs instead.
+        infigraph_core::graph::validate_db_file(path)?;
         let db = Database::new(path, SystemConfig::default())
             .map_err(|e| anyhow::anyhow!("failed to open docs kuzu db: {e}"))?;
         let store = Self {
@@ -950,4 +954,24 @@ fn parse_string_list(s: &str) -> Vec<String> {
         .map(|s| s.trim().trim_matches('\'').trim_matches('"').to_string())
         .filter(|s| !s.is_empty())
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn open_truncated_docs_db_file_returns_err() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("docs.kuzu");
+        std::fs::write(&db_path, b"garbage, way below one page").unwrap();
+
+        let err = DocStore::open(&db_path)
+            .map(|_| ())
+            .expect_err("truncated docs file must be rejected");
+        assert!(
+            err.to_string().contains("truncated/corrupt"),
+            "unexpected error: {err}"
+        );
+    }
 }
