@@ -13,7 +13,10 @@ fn main() -> Result<()> {
         return run_worker();
     }
 
-    // Supervisor mode: spawn self as --worker, monitor for segfault, auto-reindex
+    // Supervisor mode: spawn self as --worker, monitor for segfault, auto-reindex.
+    // Remember the repo we were launched in: it's the primary recovery target
+    // even when the global registry is empty (standalone use).
+    let startup_dir = std::env::current_dir().ok();
     loop {
         let exe = std::env::current_exe()?;
         let mut cmd = std::process::Command::new(&exe);
@@ -37,7 +40,7 @@ fn main() -> Result<()> {
                     "SIGSEGV detected — triggering auto-reindex of registered projects (code + docs)",
                 );
                 eprintln!("infigraph-mcp: crash detected (SIGSEGV), auto-reindexing code+docs...");
-                auto_reindex_all();
+                auto_reindex_all(startup_dir.as_deref());
                 // Respawn worker after reindex
                 continue;
             }
@@ -55,7 +58,7 @@ fn main() -> Result<()> {
                         ),
                     );
                     eprintln!("infigraph-mcp: crash detected, auto-reindexing code+docs...");
-                    auto_reindex_all();
+                    auto_reindex_all(startup_dir.as_deref());
                     continue;
                 }
             }
@@ -65,7 +68,7 @@ fn main() -> Result<()> {
     }
 }
 
-fn auto_reindex_all() {
+fn auto_reindex_all(startup_dir: Option<&std::path::Path>) {
     let cli = find_infigraph_cli_for_reindex();
     let cli_path = match cli {
         Some(p) => p,
@@ -75,27 +78,19 @@ fn auto_reindex_all() {
         }
     };
 
-    let registry = match infigraph_core::multi::Registry::load() {
-        Ok(r) => r,
+    // Registry repos are optional extras: an empty/broken registry must not
+    // prevent recovery of the repo this MCP server was launched in.
+    let registry_paths: Vec<std::path::PathBuf> = match infigraph_core::multi::Registry::load() {
+        Ok(r) => r.repos.values().map(|e| e.path.clone()).collect(),
         Err(e) => {
             mcp_log(
                 "ERROR",
                 &format!("Registry load failed during reindex: {e}"),
             );
-            return;
+            Vec::new()
         }
     };
 
-    // Reindex individual projects
-    for entry in registry.repos.values() {
-        let path = &entry.path;
-        if !path.join(".infigraph").exists() {
-            continue;
-        }
-        reindex_path(&cli_path, path);
-    }
-
-    // Reindex group combined graphs
     let groups_dir = std::env::var("HOME")
         .map(|h| {
             std::path::PathBuf::from(h)
@@ -103,15 +98,18 @@ fn auto_reindex_all() {
                 .join("groups")
         })
         .ok();
-    if let Some(ref gd) = groups_dir {
-        if let Ok(entries) = std::fs::read_dir(gd) {
-            for entry in entries.flatten() {
-                let group_path = entry.path();
-                if group_path.join(".infigraph").exists() {
-                    reindex_path(&cli_path, &group_path);
-                }
-            }
-        }
+
+    let targets = infigraph_mcp::recovery::collect_reindex_targets(
+        startup_dir,
+        &registry_paths,
+        groups_dir.as_deref(),
+    );
+    if targets.is_empty() {
+        mcp_log("WARN", "Auto-reindex found no targets with .infigraph");
+        return;
+    }
+    for path in &targets {
+        reindex_path(&cli_path, path);
     }
 }
 
