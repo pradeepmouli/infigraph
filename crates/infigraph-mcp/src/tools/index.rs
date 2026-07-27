@@ -14,6 +14,13 @@ fn is_remote_mode() -> bool {
         .unwrap_or(false)
 }
 
+/// Anchored empirically: this repo's own reindex takes ~10s cold, so 3 minutes
+/// comfortably covers real large-repo indexing while still catching a hang far
+/// short of the hour-plus incidents this session's own corrupted-graph events
+/// caused (an `infigraph index` subprocess stuck at ~100% CPU with a bogus ~8.4TB
+/// VSZ, blocking its MCP caller indefinitely with zero feedback).
+const INDEX_SUBPROCESS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+
 /// Outcome of a bounded-wait subprocess run.
 enum RunOutcome {
     Completed { success: bool, output: String },
@@ -139,21 +146,22 @@ pub fn tool_index_project(args: &Value) -> Result<String> {
     let full = args.get("full").and_then(|f| f.as_bool()).unwrap_or(false);
 
     if let Some(cli) = find_infigraph_cli() {
-        let mut cmd = std::process::Command::new(&cli);
-        cmd.arg("index").current_dir(path);
-        if full {
-            cmd.arg("--full");
-        }
+        let build_cmd = |attempt_full: bool| {
+            let mut cmd = std::process::Command::new(&cli);
+            cmd.arg("index").current_dir(path);
+            if attempt_full {
+                cmd.arg("--full");
+            }
+            cmd
+        };
 
-        let output = cmd
-            .output()
-            .with_context(|| format!("Failed to run {}", cli.display()))?;
+        let (success, combined) = run_with_recovery(
+            |attempt_full| run_with_timeout(&mut build_cmd(attempt_full), INDEX_SUBPROCESS_TIMEOUT),
+            full,
+            INDEX_SUBPROCESS_TIMEOUT,
+        )?;
 
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        let combined = format!("{}{}", stdout, stderr);
-
-        if !output.status.success() {
+        if !success {
             return Err(anyhow::anyhow!("infigraph index failed:\n{}", combined));
         }
         let mut out = combined;

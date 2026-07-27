@@ -320,3 +320,21 @@ fn test_graph_tools() {
         ".infigraph/graph should be removed"
     );
 }
+
+#[test]
+fn index_project_schema_exposes_full_param() {
+    let tools = infigraph_mcp::build_tools_list();
+    let index_project = tools
+        .iter()
+        .find(|t| t["name"] == "index_project")
+        .expect("index_project tool must be registered");
+    let props = &index_project["inputSchema"]["properties"];
+    assert!(
+        props.get("full").is_some(),
+        "index_project schema must expose `full` so MCP clients can request a full reindex: {index_project}"
+    );
+    assert_eq!(
+        props["full"]["type"], "boolean",
+        "full must be typed as boolean"
+    );
+}
