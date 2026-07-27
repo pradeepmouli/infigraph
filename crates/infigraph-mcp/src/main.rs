@@ -24,6 +24,12 @@ fn main() -> Result<()> {
         for arg in args.iter().skip(1).filter(|a| *a != "--worker") {
             cmd.arg(arg);
         }
+        // Let the worker detect supervisor death and exit instead of
+        // lingering as an orphan holding the instance lock.
+        cmd.env(
+            infigraph_mcp::lifecycle::SUPERVISOR_PID_ENV,
+            std::process::id().to_string(),
+        );
         cmd.stdin(std::process::Stdio::inherit())
             .stdout(std::process::Stdio::inherit())
             .stderr(std::process::Stdio::inherit());
@@ -162,6 +168,11 @@ fn find_infigraph_cli_for_reindex() -> Option<std::path::PathBuf> {
 
 fn run_worker() -> Result<()> {
     install_panic_hook();
+
+    // Exit if the supervisor dies, instead of surviving as an orphan
+    // (PPID 1) that holds the instance lock forever. Stdin EOF alone is
+    // not sufficient: --ui/--serve modes never read stdin.
+    infigraph_mcp::lifecycle::spawn_parent_monitor();
 
     let _ = rayon::ThreadPoolBuilder::new()
         .stack_size(32 * 1024 * 1024)
