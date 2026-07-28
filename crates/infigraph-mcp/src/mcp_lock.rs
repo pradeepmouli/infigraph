@@ -3,6 +3,13 @@
 //! mismatch takeover (R2.3.1/R2.3.2/R2.3.2a). This is the lock that
 //! decides which of possibly-several concurrently-running infigraph-mcp
 //! processes on a machine is the "primary" allowed to run watchers.
+//!
+//! Invariant: a stale/wedged heartbeat alone never grants Primary -- it is
+//! surfaced only as a loud log (`check_wedged_and_log`). The only way a
+//! challenger becomes Primary is winning the real OS-level flock via
+//! `lockfile::try_acquire`, either because the lock was free or because a
+//! build-hash-mismatch handover request caused the incumbent to
+//! voluntarily release and exit.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -44,8 +51,9 @@ pub fn wedged_threshold_secs() -> u64 {
 }
 
 /// Non-blocking: try to become mcp.lock's primary. `None` if another
-/// process already holds it. No takeover logic yet -- Task 4 wraps this
-/// into `acquire_with_takeover`.
+/// process already holds it. Test-only seam; production code goes through
+/// `acquire_with_takeover`, which wraps this with the build-hash-mismatch
+/// handover handshake.
 pub fn acquire_primary() -> Option<LockFile> {
     lockfile::try_acquire(&lock_path(), "mcp-primary")
         .ok()
@@ -54,8 +62,9 @@ pub fn acquire_primary() -> Option<LockFile> {
 
 /// One heartbeat tick: refresh `last_heartbeat`. Logs a WARN on I/O
 /// failure but never panics -- a heartbeat write failure alone shouldn't
-/// bring down the primary. No handover check yet -- Task 4 extends this
-/// into `heartbeat_and_check_handover`.
+/// bring down the primary. Production code calls this via
+/// `heartbeat_and_check_handover`, which additionally checks for a
+/// pending handover request after each tick.
 pub fn heartbeat_tick(lock: &mut LockFile) {
     if let Err(e) = lock.heartbeat() {
         crate::mcp_log("WARN", &format!("mcp.lock heartbeat failed: {e:#}"));

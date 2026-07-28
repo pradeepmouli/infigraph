@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Serializes tests that mutate the process-global INFIGRAPH_MCP_LOCK_*
 /// env vars -- cargo runs this binary's tests on parallel threads, so a
@@ -244,13 +244,28 @@ fn no_handover_request_written_when_build_hash_matches() {
 
     let _incumbent = infigraph_mcp::mcp_lock::acquire_primary().expect("free");
 
+    // The same-build path must return immediately (no handover ever
+    // written, so no poll/timeout wait). Without this timing check, this
+    // test can't actually distinguish "no request was ever written" from
+    // "a request was written and then cleaned up after the (here,
+    // 20s-floored) timeout elapsed" -- both leave the handover file
+    // absent by the time the assertions below run. `effective_takeover_wait_timeout()`
+    // floors the wait at 20s regardless of the 1s env overrides above, so
+    // a generous 2s bound cleanly separates the two cases.
+    let started = Instant::now();
     let outcome = infigraph_mcp::mcp_lock::acquire_with_takeover();
+    let elapsed = started.elapsed();
     match outcome {
         infigraph_mcp::mcp_lock::AcquireOutcome::Secondary => {}
         infigraph_mcp::mcp_lock::AcquireOutcome::Primary(_) => {
             panic!("must not win the lock when build_hash matches the incumbent's")
         }
     }
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "same-build path must return immediately without writing/polling a \
+         handover request, not after a ~20s timeout wait (took {elapsed:?})"
+    );
     let handover_path = dir.path().join("mcp.lock.handover");
     assert!(
         !handover_path.exists(),
