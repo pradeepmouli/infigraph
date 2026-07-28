@@ -26,15 +26,28 @@ pub struct LockInfo {
     pub build_hash: String,
     /// Unix epoch seconds at acquisition.
     pub acquired_at: u64,
+    /// Unix epoch seconds of the holder's last heartbeat refresh (see
+    /// `LockFile::heartbeat`). Equals `acquired_at` until the first
+    /// heartbeat call. Lock types that never call `heartbeat()` (e.g.
+    /// `graph.lock`, `index.lock`) simply never advance this past their
+    /// initial acquire time — harmless, since nothing currently reads this
+    /// field for staleness on those lock types, only `mcp.lock` does.
+    /// `#[serde(default)]` so a lock file written by a binary that
+    /// predates this field still parses (defaults to 0, which `read_holder`
+    /// callers must treat as "unknown," not "just acquired").
+    #[serde(default)]
+    pub last_heartbeat: u64,
 }
 
 impl LockInfo {
     pub fn current(role: &str) -> Self {
+        let now = now_epoch_secs();
         Self {
             pid: std::process::id(),
             role: role.to_string(),
             build_hash: crate::build_hash().to_string(),
-            acquired_at: now_epoch_secs(),
+            acquired_at: now,
+            last_heartbeat: now,
         }
     }
 }
@@ -137,11 +150,26 @@ pub fn take_slow_waits() -> Vec<SlowWait> {
 pub struct LockFile {
     file: File,
     path: PathBuf,
+    info: LockInfo,
 }
 
 impl LockFile {
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Re-stamps the lock's payload with a fresh `last_heartbeat`, leaving
+    /// `pid`/`role`/`build_hash`/`acquired_at` unchanged. Callers that want
+    /// `is_holder_wedged`-based staleness detection to work for this lock
+    /// must call this periodically while holding it.
+    pub fn heartbeat(&mut self) -> Result<()> {
+        self.info.last_heartbeat = now_epoch_secs();
+        let json = serde_json::to_string(&self.info)?;
+        self.file.set_len(0)?;
+        self.file.seek(SeekFrom::Start(0))?;
+        self.file.write_all(json.as_bytes())?;
+        self.file.flush()?;
+        Ok(())
     }
 }
 
@@ -166,14 +194,14 @@ fn open_lock_file(path: &Path) -> Result<File> {
         .open(path)?)
 }
 
-fn stamp(file: &mut File, role: &str) -> Result<()> {
+fn stamp(file: &mut File, role: &str) -> Result<LockInfo> {
     let info = LockInfo::current(role);
     let json = serde_json::to_string(&info)?;
     file.set_len(0)?;
     file.seek(SeekFrom::Start(0))?;
     file.write_all(json.as_bytes())?;
     file.flush()?;
-    Ok(())
+    Ok(info)
 }
 
 /// Best-effort read of the current holder's identity. `None` when the file
@@ -190,10 +218,11 @@ pub fn try_acquire(path: &Path, role: &str) -> Result<Option<LockFile>> {
     let mut file = open_lock_file(path)?;
     match file.try_lock_exclusive() {
         Ok(()) => {
-            stamp(&mut file, role)?;
+            let info = stamp(&mut file, role)?;
             Ok(Some(LockFile {
                 file,
                 path: path.to_path_buf(),
+                info,
             }))
         }
         Err(ref e)
@@ -203,6 +232,14 @@ pub fn try_acquire(path: &Path, role: &str) -> Result<Option<LockFile>> {
         }
         Err(e) => Err(anyhow::anyhow!("lock error on {}: {e}", path.display())),
     }
+}
+
+/// Pure: has a lock holder's heartbeat gone stale enough to suspect it's
+/// wedged (still holding the flock -- so not dead in the liveness sense --
+/// but not doing whatever periodic work it's supposed to be doing)?
+/// Boundary is inclusive.
+pub fn is_holder_wedged(last_heartbeat: u64, now: u64, threshold_secs: u64) -> bool {
+    now.saturating_sub(last_heartbeat) >= threshold_secs
 }
 
 /// Blocking acquisition with a wait budget. Polls `try_acquire` with
