@@ -130,6 +130,44 @@ fn daemon_mode_on_does_not_populate_in_process_watchers_map() {
     std::env::remove_var("INFIGRAPH_WATCH_DAEMON");
 }
 
+/// `tool_watch_project` (the explicit MCP tool a client can call directly,
+/// not just the opportunistic auto-start wrapper) must ALSO respect the
+/// daemon-mode toggle. Before this fix, only `auto_start_watch_inner`
+/// checked `watch_daemon_mode_enabled()` -- a direct `watch_project` call
+/// bypassed the toggle entirely and always created an in-process watcher,
+/// even with daemon mode on. This caused a real incident: a daemon watcher
+/// was correctly running for a repo, but a direct tool call on the MCP
+/// worker also started a competing in-process watcher that later wedged,
+/// holding `.infigraph/index.lock` indefinitely.
+#[test]
+fn tool_watch_project_respects_daemon_mode_toggle() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    std::env::set_var("INFIGRAPH_WATCH_DAEMON", "1");
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(root.join(".infigraph")).unwrap();
+    let path = root.to_string_lossy().to_string();
+
+    let args = serde_json::json!({ "path": path });
+    let result = infigraph_mcp::tools::watch::tool_watch_project(&args);
+
+    assert!(
+        !infigraph_mcp::tools::watch::is_watching(&path.replace('\\', "/")),
+        "daemon mode must never populate the in-process WATCHERS map, even on a direct tool_watch_project call"
+    );
+
+    if let Ok(msg) = &result {
+        assert!(
+            msg.contains("Daemon watcher"),
+            "unexpected tool_watch_project outcome under daemon mode: {msg}"
+        );
+        let _ = infigraph_mcp::tools::watch::tool_stop_watch(&args);
+        wait_for_watch_locks_released(std::slice::from_ref(&path));
+    }
+
+    std::env::remove_var("INFIGRAPH_WATCH_DAEMON");
+}
+
 #[test]
 fn stop_watch_by_path_reports_no_watcher_when_none_running() {
     let tmp = tempfile::tempdir().unwrap();

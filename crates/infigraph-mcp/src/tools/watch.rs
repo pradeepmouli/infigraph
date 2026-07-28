@@ -110,23 +110,18 @@ fn auto_start_watch_inner(path: &str, skip_disabled_check: bool) -> Option<Strin
     }
 
     if infigraph_core::watch::daemon::watch_daemon_mode_enabled() {
-        let mcp_exe = std::env::current_exe().ok()?;
-        let cli_binary =
-            match infigraph_core::watch::daemon::resolve_cli_binary_sibling_of(&mcp_exe) {
-                Ok(p) => p,
-                Err(e) => {
-                    eprintln!("[auto-watch] could not locate infigraph CLI binary: {e}");
-                    return None;
-                }
-            };
-        return match infigraph_core::watch::daemon::ensure_daemon_running(&root, &cli_binary) {
-            infigraph_core::watch::daemon::DaemonStartOutcome::Spawned => {
+        return match ensure_daemon_watcher(&root) {
+            Ok(infigraph_core::watch::daemon::DaemonStartOutcome::Spawned) => {
                 eprintln!("[auto-watch] Started daemon watcher for {root_str}");
                 Some(format!("Daemon watcher started for {root_str}"))
             }
-            infigraph_core::watch::daemon::DaemonStartOutcome::AlreadyRunning => None,
-            infigraph_core::watch::daemon::DaemonStartOutcome::Failed(e) => {
+            Ok(infigraph_core::watch::daemon::DaemonStartOutcome::AlreadyRunning) => None,
+            Ok(infigraph_core::watch::daemon::DaemonStartOutcome::Failed(e)) => {
                 eprintln!("[auto-watch] Failed to start daemon watcher: {e}");
+                None
+            }
+            Err(e) => {
+                eprintln!("[auto-watch] could not locate infigraph CLI binary: {e}");
                 None
             }
         };
@@ -147,6 +142,25 @@ fn auto_start_watch_inner(path: &str, skip_disabled_check: bool) -> Option<Strin
             None
         }
     }
+}
+
+/// Resolve the CLI binary next to this MCP binary and ask the shared daemon
+/// primitive to ensure a detached watcher is running for `root`. Shared by
+/// `tool_watch_project`'s explicit daemon-mode branch and the opportunistic
+/// `auto_start_watch_inner` path so CLI-binary resolution isn't duplicated
+/// between them — each caller still formats its own message/log from the
+/// returned outcome, since a silent auto-start and an explicit tool call
+/// want different things reported.
+fn ensure_daemon_watcher(
+    root: &std::path::Path,
+) -> Result<infigraph_core::watch::daemon::DaemonStartOutcome> {
+    let mcp_exe = std::env::current_exe().context("could not resolve current executable")?;
+    let cli_binary = infigraph_core::watch::daemon::resolve_cli_binary_sibling_of(&mcp_exe)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok(infigraph_core::watch::daemon::ensure_daemon_running(
+        root,
+        &cli_binary,
+    ))
 }
 
 /// Acquire the per-project watch lock (`.infigraph/watch.lock`), the same
@@ -188,8 +202,6 @@ pub fn tool_watch_project(args: &Value) -> Result<String> {
         );
     }
 
-    init_watchers();
-
     let path = args
         .get("path")
         .and_then(|p| p.as_str())
@@ -207,6 +219,35 @@ pub fn tool_watch_project(args: &Value) -> Result<String> {
         .canonicalize()
         .context("invalid path")?;
     let root_str = root.to_string_lossy().replace('\\', "/");
+
+    // Explicit calls must respect the same coordination auto-start already
+    // does — without these two checks, a direct watch_project call bypasses
+    // both the daemon-mode toggle and primary/secondary gating, letting a
+    // competing in-process watcher race a properly daemon-spawned one for
+    // the same repo's index.lock.
+    if watchers_disabled() {
+        return Ok(format!(
+            "Not starting a watcher for {root_str}: this MCP instance is not primary \
+             (another instance holds mcp.lock and owns watchers for this machine). \
+             Use get_watch_status to check the active watcher."
+        ));
+    }
+
+    if infigraph_core::watch::daemon::watch_daemon_mode_enabled() {
+        return match ensure_daemon_watcher(&root)? {
+            infigraph_core::watch::daemon::DaemonStartOutcome::Spawned => {
+                Ok(format!("Daemon watcher started for {root_str}"))
+            }
+            infigraph_core::watch::daemon::DaemonStartOutcome::AlreadyRunning => {
+                Ok(format!("Daemon watcher already running for {root_str}"))
+            }
+            infigraph_core::watch::daemon::DaemonStartOutcome::Failed(e) => {
+                Err(anyhow::anyhow!("Failed to start daemon watcher: {e}"))
+            }
+        };
+    }
+
+    init_watchers();
 
     let lock_path = root.join(".infigraph").join("watch.lock");
     let watch_lock = acquire_project_watch_lock(&lock_path).map_err(|_| {
