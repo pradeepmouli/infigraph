@@ -60,3 +60,25 @@ pub fn heartbeat_tick(lock: &mut LockFile) {
         crate::mcp_log("WARN", &format!("mcp.lock heartbeat failed: {e:#}"));
     }
 }
+
+/// Logs a loud WARN if `holder`'s heartbeat is stale enough to suspect
+/// it's wedged -- still holding the OS-level flock (so alive in the
+/// liveness sense) but not doing whatever periodic heartbeat work it's
+/// supposed to be doing. Advisory only: this never forces a takeover by
+/// itself (see the module doc comment) -- it's what makes a wedged holder
+/// visible instead of silently blocking every other process forever.
+pub fn check_wedged_and_log(holder: &infigraph_core::lockfile::LockInfo, now: u64) {
+    if lockfile::is_holder_wedged(holder.last_heartbeat, now, wedged_threshold_secs()) {
+        let stale_for = now.saturating_sub(holder.last_heartbeat);
+        crate::mcp_log(
+            "WARN",
+            &format!(
+                "mcp.lock is held by PID {} but its heartbeat is {stale_for}s stale \
+                 (threshold {}s) -- it may be wedged. Run `infigraph watch-status` \
+                 or check the process directly.",
+                holder.pid,
+                wedged_threshold_secs()
+            ),
+        );
+    }
+}

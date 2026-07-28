@@ -73,3 +73,35 @@ fn heartbeat_tick_advances_last_heartbeat() {
 
     std::env::remove_var("INFIGRAPH_MCP_LOCK_PATH");
 }
+
+#[test]
+fn check_wedged_and_log_does_not_panic_on_fresh_or_stale_heartbeat() {
+    // This function's only observable effect is a log line; there's no
+    // return value to assert on directly (mcp_log has no test hook). This
+    // test exists to catch a panic (e.g. an integer underflow bug in the
+    // staleness math) on both a fresh and a very stale heartbeat -- the
+    // real coverage of the underlying pure math is
+    // `is_holder_wedged_pure_cases` in infigraph-core's own lockfile.rs
+    // tests (Task 1).
+    let fresh = infigraph_core::lockfile::LockInfo {
+        pid: 1,
+        role: "mcp-primary".to_string(),
+        build_hash: "abc".to_string(),
+        acquired_at: 1000,
+        last_heartbeat: 1000,
+    };
+    infigraph_mcp::mcp_lock::check_wedged_and_log(&fresh, 1005);
+
+    let stale = infigraph_core::lockfile::LockInfo {
+        pid: 1,
+        role: "mcp-primary".to_string(),
+        build_hash: "abc".to_string(),
+        acquired_at: 1000,
+        last_heartbeat: 1000,
+    };
+    infigraph_mcp::mcp_lock::check_wedged_and_log(&stale, 1000 + wedged_secs_for_test() + 1);
+}
+
+fn wedged_secs_for_test() -> u64 {
+    infigraph_mcp::mcp_lock::wedged_threshold_secs()
+}
