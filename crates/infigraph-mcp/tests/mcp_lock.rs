@@ -268,9 +268,11 @@ fn no_handover_request_written_when_build_hash_matches() {
 /// handshake failed ~1/3 of the time by construction, and a tick landing
 /// just inside the deadline could leave zero primaries. The deadline must
 /// therefore be derived from `effective_takeover_wait_timeout()`, which
-/// enforces the margin in code rather than by convention.
+/// enforces the margin in code rather than by convention -- but bounded,
+/// because the entire wait is dead time before the MCP transport is up and a
+/// wedged incumbent makes the challenger burn all of it.
 #[test]
-fn effective_takeover_wait_timeout_keeps_margin_over_heartbeat_interval() {
+fn effective_takeover_wait_timeout_keeps_bounded_margin_over_heartbeat_interval() {
     let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     std::env::remove_var("INFIGRAPH_MCP_LOCK_HEARTBEAT_SECS");
     std::env::remove_var("INFIGRAPH_MCP_LOCK_TAKEOVER_TIMEOUT_SECS");
@@ -281,23 +283,45 @@ fn effective_takeover_wait_timeout_keeps_margin_over_heartbeat_interval() {
             < infigraph_mcp::mcp_lock::heartbeat_interval(),
         "precondition: the raw defaults are the ones that produced the bug"
     );
+    let effective = infigraph_mcp::mcp_lock::effective_takeover_wait_timeout();
     assert_eq!(
-        infigraph_mcp::mcp_lock::effective_takeover_wait_timeout(),
-        Duration::from_secs(45),
-        "effective wait must be 3 heartbeat intervals when the raw timeout is smaller"
+        effective,
+        Duration::from_secs(20),
+        "default effective wait must be heartbeat + 5s, at the 20s cap"
+    );
+    assert!(
+        effective > infigraph_mcp::mcp_lock::heartbeat_interval(),
+        "effective wait {effective:?} must still outlast one whole heartbeat tick, \
+         or the incumbent never gets a chance to honor the request"
+    );
+    assert!(
+        effective < Duration::from_secs(30),
+        "effective wait {effective:?} is dead time before the MCP transport exists -- \
+         it must stay well inside a ~30s client startup budget"
     );
 
-    // A heartbeat interval far larger than the raw timeout must still be
-    // covered with margin -- this is the case the original code got wrong.
+    // A heartbeat interval large enough that heartbeat + 5s would exceed the
+    // cap: the cap wins, and the tick-covering guarantee is knowingly given
+    // up (documented on `effective_takeover_wait_timeout`).
     std::env::set_var("INFIGRAPH_MCP_LOCK_HEARTBEAT_SECS", "30");
     std::env::set_var("INFIGRAPH_MCP_LOCK_TAKEOVER_TIMEOUT_SECS", "5");
-    let effective = infigraph_mcp::mcp_lock::effective_takeover_wait_timeout();
-    assert!(
-        effective >= infigraph_mcp::mcp_lock::heartbeat_interval() * 3,
-        "effective wait {effective:?} must cover at least 3 heartbeat ticks"
+    assert_eq!(
+        infigraph_mcp::mcp_lock::effective_takeover_wait_timeout(),
+        Duration::from_secs(20),
+        "the derived margin must never push the wait past the startup-latency cap"
     );
 
-    // An explicitly-configured timeout larger than the margin still wins.
+    // Below the cap, the margin is the full heartbeat + 5s.
+    std::env::set_var("INFIGRAPH_MCP_LOCK_HEARTBEAT_SECS", "8");
+    assert_eq!(
+        infigraph_mcp::mcp_lock::effective_takeover_wait_timeout(),
+        Duration::from_secs(13),
+        "under the cap the derived wait must cover a whole tick plus jitter"
+    );
+
+    // An explicitly-configured timeout larger than the margin still wins: the
+    // cap bounds only the wait an operator inherited, not one they chose.
+    std::env::remove_var("INFIGRAPH_MCP_LOCK_HEARTBEAT_SECS");
     std::env::set_var("INFIGRAPH_MCP_LOCK_TAKEOVER_TIMEOUT_SECS", "300");
     assert_eq!(
         infigraph_mcp::mcp_lock::effective_takeover_wait_timeout(),
@@ -429,8 +453,9 @@ fn takeover_wins_when_incumbent_honors_request_mid_poll() {
             panic!("challenger's poll loop must win the lock once the incumbent releases it")
         }
     }
-    // The effective wait here is 3s (3 x the 1s heartbeat interval). Winning
-    // well inside that proves the in-loop poll is what acquired the lock,
+    // The effective wait here is 6s (the 1s heartbeat interval + the 5s
+    // fixed margin). Winning well inside that proves the in-loop poll is what
+    // acquired the lock,
     // not the post-deadline last-chance attempt -- otherwise a broken poll
     // loop would still show up as Primary and this test would prove nothing.
     assert!(

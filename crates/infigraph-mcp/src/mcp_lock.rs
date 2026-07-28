@@ -194,17 +194,38 @@ pub fn takeover_wait_timeout() -> Duration {
         .unwrap_or(Duration::from_secs(10))
 }
 
+/// Ceiling on the automatically-derived part of the takeover wait. The whole
+/// wait runs in `main.rs::run()` *before* the MCP transport exists, so every
+/// second of it is dead time in which the server cannot answer a client at
+/// all -- and against a genuinely wedged incumbent (one that never ticks, the
+/// case `check_wedged_and_log` exists to surface) the challenger burns the
+/// entire wait before degrading to Secondary. Common MCP client startup
+/// budgets are ~30s (Claude Code's default `MCP_TIMEOUT`); 20s leaves ~10s of
+/// that for the rest of startup, so "degrade to secondary" stays a degraded
+/// server rather than a killed one.
+const MAX_DERIVED_TAKEOVER_WAIT: Duration = Duration::from_secs(20);
+
 /// The wait a challenger actually uses, with the heartbeat interval's
 /// margin enforced in code rather than by convention: the incumbent only
 /// ever notices a handover request on its own heartbeat tick, which lands
 /// uniformly somewhere in `[0, heartbeat_interval)` after the request is
 /// written. A wait shorter than the interval therefore fails a fraction of
 /// the time by construction (the raw defaults -- 10s wait vs 15s heartbeat
-/// -- failed ~1/3 of the time). Three ticks of margin absorbs scheduling
-/// jitter comfortably; an operator-configured wait larger than that is
-/// honored as-is.
+/// -- failed ~1/3 of the time). One full interval plus 5s covers the tick
+/// itself plus scheduling jitter, and the derived floor is then capped at
+/// `MAX_DERIVED_TAKEOVER_WAIT`. Defaults land exactly on that cap: 20s, i.e.
+/// 5s above the 15s heartbeat and 10s below a 30s client timeout.
+///
+/// A hard cap and an unbounded margin cannot both hold. If an operator raises
+/// `heartbeat_interval` to at or above the cap, the derived wait no longer
+/// covers a whole tick and the handshake regains the fractional-failure mode
+/// the margin was added to remove. That is a disclosed trade-off -- startup
+/// latency wins -- not an oversight. An explicitly configured
+/// `takeover_wait_timeout` above the cap is still honored as-is: unlike the
+/// derived floor, that wait was chosen rather than inherited.
 pub fn effective_takeover_wait_timeout() -> Duration {
-    takeover_wait_timeout().max(heartbeat_interval() * 3)
+    let derived = (heartbeat_interval() + Duration::from_secs(5)).min(MAX_DERIVED_TAKEOVER_WAIT);
+    takeover_wait_timeout().max(derived)
 }
 
 /// How old a pending handover request may be before the incumbent treats it
@@ -280,9 +301,14 @@ pub fn acquire_with_takeover_using(own_build: &str) -> AcquireOutcome {
     }
 
     // The incumbent may have honored the request and released the lock in
-    // the very instant the deadline was crossed. Without this last attempt,
-    // that window ends with the incumbent exited AND the challenger
-    // demoted -- no primary at all until something restarts one.
+    // the very instant the deadline was crossed, which would end with the
+    // incumbent exited AND the challenger demoted -- no primary at all until
+    // something restarts one. This last attempt narrows that window from
+    // roughly a whole poll interval down to sub-millisecond; it does not
+    // eliminate it, since the incumbent's `drop(lock)` can still land just
+    // after this call returns. Closing it fully would mean watching for the
+    // handover file's disappearance instead of retrying blindly -- out of
+    // scope here.
     if let Ok(Some(lock)) = lockfile::try_acquire(&path, "mcp-primary") {
         clear_handover_request();
         return AcquireOutcome::Primary(lock);
