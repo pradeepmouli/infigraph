@@ -336,9 +336,25 @@ pub(crate) fn cmd_watch(root: &Path, debounce: u64) -> Result<()> {
     })
     .ok();
 
+    let doc_shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let doc_shutdown_for_thread = std::sync::Arc::clone(&doc_shutdown);
+    let doc_root = root.to_path_buf();
+    let doc_thread = std::thread::spawn(move || {
+        if let Err(e) = infigraph_docs::watch::watch_docs_daemon_loop(
+            &doc_root,
+            debounce,
+            doc_shutdown_for_thread,
+        ) {
+            eprintln!("[doc-watch-daemon] error: {e}");
+        }
+    });
+
     infigraph_core::watch::watch_project(root, bundled_registry, debounce, stop_rx, |evt| {
         println!("[watch] {evt}");
     })?;
+
+    doc_shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = doc_thread.join();
 
     println!("Watch stopped.");
     Ok(())
