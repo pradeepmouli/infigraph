@@ -217,6 +217,7 @@ fn write_stale_lock_payload(lock_path: &std::path::Path) {
         role: "test-stale".to_string(),
         build_hash: "test".to_string(),
         acquired_at: 0,
+        last_heartbeat: 0,
     };
     std::fs::write(lock_path, serde_json::to_string(&stale).unwrap()).unwrap();
 }

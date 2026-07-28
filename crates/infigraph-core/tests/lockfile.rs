@@ -44,6 +44,7 @@ fn test_busy_display_names_holder() {
             role: "infigraph watch".into(),
             build_hash: "abc123".into(),
             acquired_at: 0,
+            last_heartbeat: 0,
         }),
         waited: Duration::from_secs(30),
     };
@@ -245,5 +246,72 @@ fn test_fast_acquire_records_nothing() {
             .iter()
             .all(|w| w.lock_path != path),
         "uncontended acquire must not record a slow wait"
+    );
+}
+
+use infigraph_core::lockfile::is_holder_wedged;
+
+#[test]
+fn is_holder_wedged_pure_cases() {
+    // Heartbeat well within the threshold: not wedged.
+    assert!(!is_holder_wedged(1000, 1030, 60));
+    // Heartbeat exactly at the threshold: wedged (boundary inclusive).
+    assert!(is_holder_wedged(1000, 1060, 60));
+    // Heartbeat well past the threshold: wedged.
+    assert!(is_holder_wedged(1000, 1200, 60));
+}
+
+#[test]
+fn heartbeat_updates_last_heartbeat_but_not_acquired_at() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let lock_path = dir.path().join("test.lock");
+
+    let mut lock = infigraph_core::lockfile::try_acquire(&lock_path, "test-role")
+        .expect("try_acquire")
+        .expect("lock should be free");
+
+    let before = infigraph_core::lockfile::read_holder(&lock_path).expect("holder readable");
+    assert_eq!(
+        before.acquired_at, before.last_heartbeat,
+        "fresh acquire: both timestamps equal"
+    );
+
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    lock.heartbeat().expect("heartbeat");
+
+    let after = infigraph_core::lockfile::read_holder(&lock_path).expect("holder readable");
+    assert_eq!(
+        after.acquired_at, before.acquired_at,
+        "heartbeat must not change acquired_at"
+    );
+    assert!(
+        after.last_heartbeat > before.last_heartbeat,
+        "heartbeat must advance last_heartbeat: before={} after={}",
+        before.last_heartbeat,
+        after.last_heartbeat
+    );
+    assert_eq!(after.pid, before.pid);
+    assert_eq!(after.role, before.role);
+    assert_eq!(after.build_hash, before.build_hash);
+}
+
+#[test]
+fn old_lock_file_without_last_heartbeat_field_still_parses() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let lock_path = dir.path().join("test.lock");
+    // Simulates a lock file written by a pre-this-PR binary: no
+    // last_heartbeat key at all.
+    std::fs::write(
+        &lock_path,
+        r#"{"pid":12345,"role":"old-role","build_hash":"deadbeef","acquired_at":1000}"#,
+    )
+    .unwrap();
+
+    let holder = infigraph_core::lockfile::read_holder(&lock_path);
+    assert!(holder.is_some(), "must still parse without last_heartbeat");
+    assert_eq!(
+        holder.unwrap().last_heartbeat,
+        0,
+        "missing field defaults to 0"
     );
 }
