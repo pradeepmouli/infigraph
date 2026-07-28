@@ -140,41 +140,83 @@ pub fn watch_docs_daemon_loop(
             continue;
         }
 
-        let (inner_stop_tx, inner_stop_rx) = mpsc::channel::<()>();
-        let shutdown_for_detacher = Arc::clone(&shutdown);
-        let docs_kuzu_for_detacher = docs_kuzu.clone();
-        let stop_sentinel_for_detacher = stop_sentinel.clone();
-
-        // Runs concurrently with the blocking watch_docs call below, and
-        // signals it to return once any detach/shutdown condition is met.
-        let detacher = std::thread::spawn(move || -> bool {
-            loop {
-                if shutdown_for_detacher.load(Ordering::Relaxed) {
-                    let _ = inner_stop_tx.send(());
-                    return false;
-                }
-                if stop_sentinel_for_detacher.exists() {
-                    let _ = std::fs::remove_file(&stop_sentinel_for_detacher);
-                    let _ = inner_stop_tx.send(());
-                    return true;
-                }
-                if !docs_kuzu_for_detacher.exists() {
-                    let _ = inner_stop_tx.send(());
-                    return false;
-                }
-                std::thread::sleep(poll);
-            }
-        });
-
+        let root_owned = root.to_path_buf();
         eprintln!(
             "[doc-watch-daemon] attaching doc watcher for {}",
             root.display()
         );
-        if let Err(e) = watch_docs(root, debounce_ms, inner_stop_rx, "doc-watch-daemon") {
-            eprintln!("[doc-watch-daemon] watch_docs error: {e}");
+        suppressed_until_absent = run_attached_cycle(
+            &docs_kuzu,
+            &stop_sentinel,
+            &shutdown,
+            poll,
+            move |stop_rx| watch_docs(&root_owned, debounce_ms, stop_rx, "doc-watch-daemon"),
+        );
+    }
+}
+
+/// Drives one attach cycle: runs `watch_fn` (normally a `watch_docs` call) on
+/// its own thread and polls, in the CALLING thread, for whichever trips
+/// first: `watch_fn` finishing on its own (unrequested), `shutdown`, the
+/// stop sentinel, or `docs_kuzu` disappearing.
+///
+/// `handle.is_finished()` is checked before any of the other conditions on
+/// every tick specifically so this function can never block forever: those
+/// other conditions are things `watch_fn` reacts to via `stop_rx`, so once
+/// `watch_fn` has already returned (e.g. `notify`'s sender was dropped, or
+/// the watcher failed to start), none of them will necessarily ever become
+/// true, and this function must notice that exit directly instead of
+/// waiting on a stop signal nothing will act on.
+///
+/// Returns whether this was a "sticky" detach (explicit stop sentinel,
+/// which suppresses re-attachment until `docs_kuzu` disappears and
+/// reappears) as opposed to any other exit reason.
+fn run_attached_cycle<F>(
+    docs_kuzu: &Path,
+    stop_sentinel: &Path,
+    shutdown: &Arc<AtomicBool>,
+    poll: Duration,
+    watch_fn: F,
+) -> bool
+where
+    F: FnOnce(mpsc::Receiver<()>) -> Result<()> + Send + 'static,
+{
+    let (stop_tx, stop_rx) = mpsc::channel::<()>();
+    let handle = std::thread::spawn(move || watch_fn(stop_rx));
+
+    let log_join_result = |res: std::thread::Result<Result<()>>| match res {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => eprintln!("[doc-watch-daemon] watch_docs error: {e}"),
+        Err(_) => eprintln!("[doc-watch-daemon] watch_docs thread panicked"),
+    };
+
+    loop {
+        if handle.is_finished() {
+            log_join_result(handle.join());
+            eprintln!("[doc-watch-daemon] watch_docs exited unexpectedly, retrying");
+            return false;
         }
 
-        suppressed_until_absent = detacher.join().unwrap_or(false);
+        if shutdown.load(Ordering::Relaxed) {
+            let _ = stop_tx.send(());
+            log_join_result(handle.join());
+            return false;
+        }
+
+        if stop_sentinel.exists() {
+            let _ = std::fs::remove_file(stop_sentinel);
+            let _ = stop_tx.send(());
+            log_join_result(handle.join());
+            return true;
+        }
+
+        if !docs_kuzu.exists() {
+            let _ = stop_tx.send(());
+            log_join_result(handle.join());
+            return false;
+        }
+
+        std::thread::sleep(poll);
     }
 }
 
@@ -199,6 +241,18 @@ mod tests {
     /// transient contention with a concurrently-writing daemon thread) is
     /// treated as 0, matching what a hypothetical fallible `chunk_count()`
     /// accessor would collapse to.
+    ///
+    /// This helper opens a second, independent `DocIndex`/`DocStore` handle
+    /// against the same `docs.kuzu` while the daemon thread under test may
+    /// concurrently be mid-`open`/`init`/`index`/`drop` on its own handle.
+    /// That's safe: `DocStore::open` (see `store.rs`) takes a process-wide
+    /// `static DB_LOCK: Mutex<()>` and holds the guard for the `DocStore`'s
+    /// whole lifetime, so two `DocStore::open` calls in this test binary
+    /// cannot run concurrently -- the second simply blocks on `Mutex::lock()`
+    /// until the first is dropped, it does not error out. Since
+    /// `DocIndex::init()`'s wipe-and-rebuild-on-failure path only triggers on
+    /// an actual `Err` from `DocStore::open`, ordinary lock contention here
+    /// cannot spuriously trip it.
     fn chunk_count(root: &Path) -> usize {
         let mut idx = match crate::DocIndex::open(root) {
             Ok(i) => i,
@@ -326,5 +380,41 @@ mod tests {
         shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
         handle.join().unwrap().unwrap();
         clear_fast_poll();
+    }
+
+    #[test]
+    fn run_attached_cycle_reports_non_sticky_when_watch_fn_exits_unrequested() {
+        // Proves the fix for Finding 1: if the watch invocation returns on
+        // its own (e.g. `watch_docs` seeing its internal channel disconnect,
+        // or erroring out before its loop ever starts) -- none of
+        // shutdown/stop_sentinel/docs_kuzu-absent -- `run_attached_cycle`
+        // must still return promptly instead of blocking on a stop signal
+        // the exited thread can no longer act on.
+        let (result_tx, result_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().canonicalize().unwrap();
+            let docs_kuzu = root.join("docs.kuzu");
+            let stop_sentinel = root.join("watch.stop.docs");
+            let shutdown = Arc::new(AtomicBool::new(false));
+
+            let sticky = run_attached_cycle(
+                &docs_kuzu,
+                &stop_sentinel,
+                &shutdown,
+                Duration::from_millis(10),
+                |_stop_rx: mpsc::Receiver<()>| -> Result<()> { Ok(()) },
+            );
+            let _ = result_tx.send(sticky);
+        });
+
+        let sticky = result_rx.recv_timeout(Duration::from_secs(2)).expect(
+            "run_attached_cycle must return promptly when watch_fn exits unrequested, \
+             not block waiting on a stop condition nothing will ever trip",
+        );
+        assert!(
+            !sticky,
+            "an unrequested watch_fn exit must not be reported as a sticky (explicit-stop) detach"
+        );
     }
 }
