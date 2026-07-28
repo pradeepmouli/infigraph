@@ -209,23 +209,29 @@ fn install_panic_hook() {
 }
 
 fn run() -> Result<()> {
-    let mcp_lock = infigraph_mcp::mcp_lock::acquire_primary();
-    let is_primary = mcp_lock.is_some();
-
-    if is_primary {
-        mcp_log("INFO", "Acquired mcp.lock — running as primary");
-    } else {
-        mcp_log(
-            "WARN",
-            "Another MCP instance holds mcp.lock — running without watchers",
-        );
-        infigraph_mcp::tools::watch::disable_watchers();
-    }
+    let mcp_lock_outcome = infigraph_mcp::mcp_lock::acquire_with_takeover();
+    let (is_primary, mcp_lock) = match mcp_lock_outcome {
+        infigraph_mcp::mcp_lock::AcquireOutcome::Primary(lock) => {
+            mcp_log("INFO", "Acquired mcp.lock — running as primary");
+            (true, Some(lock))
+        }
+        infigraph_mcp::mcp_lock::AcquireOutcome::Secondary => {
+            mcp_log(
+                "WARN",
+                "Another MCP instance holds mcp.lock — running without watchers",
+            );
+            infigraph_mcp::tools::watch::disable_watchers();
+            (false, None)
+        }
+    };
 
     if let Some(mut lock) = mcp_lock {
         std::thread::spawn(move || loop {
             std::thread::sleep(infigraph_mcp::mcp_lock::heartbeat_interval());
-            infigraph_mcp::mcp_lock::heartbeat_tick(&mut lock);
+            if infigraph_mcp::mcp_lock::heartbeat_and_check_handover(&mut lock) {
+                drop(lock);
+                std::process::exit(0);
+            }
         });
     }
 
