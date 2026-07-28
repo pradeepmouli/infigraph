@@ -1,7 +1,6 @@
 use std::io::{self, BufRead, Write};
 
 use anyhow::Result;
-use fs2::FileExt;
 use serde_json::{json, Value};
 
 use infigraph_mcp::web;
@@ -209,43 +208,25 @@ fn install_panic_hook() {
     }));
 }
 
-fn acquire_instance_lock() -> Option<std::fs::File> {
-    let lock_path = std::env::var("HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::path::PathBuf::from("."))
-        .join(".infigraph")
-        .join("mcp.lock");
-    if let Some(parent) = lock_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&lock_path)
-        .ok()?;
-    match file.try_lock_exclusive() {
-        Ok(()) => {
-            mcp_log("INFO", "Acquired MCP instance lock");
-            Some(file)
-        }
-        Err(_) => {
-            mcp_log(
-                "WARN",
-                "Another MCP instance holds the lock — running without watchers",
-            );
-            None
-        }
-    }
-}
-
 fn run() -> Result<()> {
-    let instance_lock = acquire_instance_lock();
-    let is_primary = instance_lock.is_some();
-    let _lock_guard = instance_lock;
+    let mcp_lock = infigraph_mcp::mcp_lock::acquire_primary();
+    let is_primary = mcp_lock.is_some();
 
-    if !is_primary {
+    if is_primary {
+        mcp_log("INFO", "Acquired mcp.lock — running as primary");
+    } else {
+        mcp_log(
+            "WARN",
+            "Another MCP instance holds mcp.lock — running without watchers",
+        );
         infigraph_mcp::tools::watch::disable_watchers();
+    }
+
+    if let Some(mut lock) = mcp_lock {
+        std::thread::spawn(move || loop {
+            std::thread::sleep(infigraph_mcp::mcp_lock::heartbeat_interval());
+            infigraph_mcp::mcp_lock::heartbeat_tick(&mut lock);
+        });
     }
 
     let args: Vec<String> = std::env::args().collect();
