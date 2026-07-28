@@ -143,6 +143,35 @@ fn clear_handover_request() {
     let _ = std::fs::remove_file(handover_request_path());
 }
 
+/// A pending handover request, but only if the challenger that wrote it
+/// could still be waiting on it. A request whose writer died before its own
+/// timeout-triggered clear ran would otherwise survive on disk indefinitely
+/// and kill the next process to become primary -- possibly hours later, for
+/// an entirely unrelated reason -- on its very first heartbeat tick. Both
+/// gates clear the file, so a discarded request isn't re-examined every
+/// tick forever.
+fn live_handover_request() -> Option<HandoverRequest> {
+    let req = read_handover_request()?;
+    let now = now_epoch_secs();
+    let too_old = lockfile::is_holder_wedged(req.requested_at, now, handover_request_stale_secs());
+    let requester_gone = !crate::lifecycle::process_alive(req.pid);
+    if too_old || requester_gone {
+        crate::mcp_log(
+            "WARN",
+            &format!(
+                "Discarding orphaned mcp.lock handover request from PID {} ({}s old, \
+                 requester {}) -- keeping the lock",
+                req.pid,
+                now.saturating_sub(req.requested_at),
+                if requester_gone { "gone" } else { "alive" }
+            ),
+        );
+        clear_handover_request();
+        return None;
+    }
+    Some(req)
+}
+
 /// How often a challenger, having requested takeover, re-tries acquiring
 /// the lock while waiting for the incumbent to honor the request.
 /// Overridable via `INFIGRAPH_MCP_LOCK_TAKEOVER_POLL_SECS`.
@@ -165,6 +194,29 @@ pub fn takeover_wait_timeout() -> Duration {
         .unwrap_or(Duration::from_secs(10))
 }
 
+/// The wait a challenger actually uses, with the heartbeat interval's
+/// margin enforced in code rather than by convention: the incumbent only
+/// ever notices a handover request on its own heartbeat tick, which lands
+/// uniformly somewhere in `[0, heartbeat_interval)` after the request is
+/// written. A wait shorter than the interval therefore fails a fraction of
+/// the time by construction (the raw defaults -- 10s wait vs 15s heartbeat
+/// -- failed ~1/3 of the time). Three ticks of margin absorbs scheduling
+/// jitter comfortably; an operator-configured wait larger than that is
+/// honored as-is.
+pub fn effective_takeover_wait_timeout() -> Duration {
+    takeover_wait_timeout().max(heartbeat_interval() * 3)
+}
+
+/// How old a pending handover request may be before the incumbent treats it
+/// as abandoned. Double the challenger's own wait window, so a request can
+/// only be judged stale well after the challenger that wrote it would
+/// already have given up and cleared it.
+fn handover_request_stale_secs() -> u64 {
+    effective_takeover_wait_timeout()
+        .as_secs()
+        .saturating_mul(2)
+}
+
 /// Result of attempting to become mcp.lock's primary.
 pub enum AcquireOutcome {
     Primary(LockFile),
@@ -174,9 +226,19 @@ pub enum AcquireOutcome {
 /// Try to become primary. If the lock is free, wins immediately. If it's
 /// held, checks the incumbent's heartbeat (logs loudly if wedged, see
 /// `check_wedged_and_log`) and build_hash: on a mismatch, requests
-/// takeover and polls for up to `takeover_wait_timeout()`; on a match, or
-/// if the wait times out, falls back to Secondary.
+/// takeover and polls for up to `effective_takeover_wait_timeout()`; on a
+/// match, or if the wait times out, falls back to Secondary.
 pub fn acquire_with_takeover() -> AcquireOutcome {
+    acquire_with_takeover_using(infigraph_core::build_hash())
+}
+
+/// `acquire_with_takeover` with the challenger's own build hash supplied
+/// rather than read from `infigraph_core::build_hash()`. `pub` so tests can
+/// drive the full request/poll/win/timeout loop against a real incumbent:
+/// two "processes" inside one test binary otherwise compute the identical
+/// real build hash, making a genuine mismatch -- the only thing that opens
+/// this path -- impossible to produce.
+pub fn acquire_with_takeover_using(own_build: &str) -> AcquireOutcome {
     let path = lock_path();
     match lockfile::try_acquire(&path, "mcp-primary") {
         Ok(Some(lock)) => return AcquireOutcome::Primary(lock),
@@ -193,7 +255,6 @@ pub fn acquire_with_takeover() -> AcquireOutcome {
 
     check_wedged_and_log(&holder, now_epoch_secs());
 
-    let own_build = infigraph_core::build_hash();
     if !build_hash_mismatch(own_build, &holder.build_hash) {
         return AcquireOutcome::Secondary;
     }
@@ -209,13 +270,22 @@ pub fn acquire_with_takeover() -> AcquireOutcome {
         return AcquireOutcome::Secondary;
     }
 
-    let deadline = Instant::now() + takeover_wait_timeout();
+    let deadline = Instant::now() + effective_takeover_wait_timeout();
     while Instant::now() < deadline {
         std::thread::sleep(takeover_poll_interval());
         if let Ok(Some(lock)) = lockfile::try_acquire(&path, "mcp-primary") {
             clear_handover_request();
             return AcquireOutcome::Primary(lock);
         }
+    }
+
+    // The incumbent may have honored the request and released the lock in
+    // the very instant the deadline was crossed. Without this last attempt,
+    // that window ends with the incumbent exited AND the challenger
+    // demoted -- no primary at all until something restarts one.
+    if let Ok(Some(lock)) = lockfile::try_acquire(&path, "mcp-primary") {
+        clear_handover_request();
+        return AcquireOutcome::Primary(lock);
     }
 
     crate::mcp_log(
@@ -233,7 +303,7 @@ pub fn acquire_with_takeover() -> AcquireOutcome {
 /// out of scope here).
 pub fn heartbeat_and_check_handover(lock: &mut LockFile) -> bool {
     heartbeat_tick(lock);
-    if let Some(req) = read_handover_request() {
+    if let Some(req) = live_handover_request() {
         crate::mcp_log(
             "INFO",
             &format!(
