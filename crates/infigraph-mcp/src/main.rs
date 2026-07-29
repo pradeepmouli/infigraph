@@ -96,13 +96,10 @@ fn auto_reindex_all(startup_dir: Option<&std::path::Path>) {
         }
     };
 
-    let groups_dir = std::env::var("HOME")
-        .map(|h| {
-            std::path::PathBuf::from(h)
-                .join(".infigraph")
-                .join("groups")
-        })
-        .ok();
+    let groups_dir = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(dirs_next::home_dir)
+        .map(|h| h.join(".infigraph").join("groups"));
 
     let targets = infigraph_mcp::recovery::collect_reindex_targets(
         startup_dir,

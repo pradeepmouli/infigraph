@@ -214,7 +214,7 @@ fn test_group_build_links_cross_service_call_neo4j_postgres() {
     )
     .expect("index_group should succeed against live Neo4j");
     assert_eq!(index_results.len(), 2, "both repos should have indexed");
-    for (repo_name, indexed_files, _total_files) in &index_results {
+    for (repo_name, indexed_files, _total_files, _note) in &index_results {
         assert!(
             *indexed_files > 0,
             "repo '{repo_name}' should have indexed at least one file"
