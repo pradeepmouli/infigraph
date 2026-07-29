@@ -1,5 +1,7 @@
 # Rust
 /target
+/.shared-target
+/.cargo/
 Cargo.lock
 *.rlib
 *.rmeta
