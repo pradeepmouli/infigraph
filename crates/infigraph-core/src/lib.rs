@@ -75,7 +75,7 @@ fn is_lock_contention_error(err: &anyhow::Error) -> bool {
 pub struct Infigraph {
     root: PathBuf,
     db_path: PathBuf,
-    registry: LanguageRegistry,
+    registry: std::sync::Arc<LanguageRegistry>,
     backend_kind: BackendKind,
     /// When set, all file paths and symbol IDs are prefixed with `{namespace}/`.
     /// Used for multi-repo indexing into a shared Neo4j DB to prevent collisions.
@@ -100,6 +100,14 @@ impl Infigraph {
 
     /// Open a project directory. Creates `.infigraph/` if it doesn't exist.
     pub fn open(root: &Path, registry: LanguageRegistry) -> Result<Self> {
+        Self::open_shared(root, std::sync::Arc::new(registry))
+    }
+
+    /// Open a project directory using a registry already shared via `Arc`.
+    /// Use this instead of `open` when indexing many repos in one run
+    /// (e.g. `group index`/`group build`) to avoid rebuilding the language
+    /// registry (~62 tree-sitter packs) once per repo.
+    pub fn open_shared(root: &Path, registry: std::sync::Arc<LanguageRegistry>) -> Result<Self> {
         let root = root.canonicalize().context("invalid project root")?;
         let db_path = root.join(".infigraph").join("graph");
         Ok(Self {

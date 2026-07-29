@@ -72,3 +72,8 @@ optional = true
 [dev-dependencies]
 tree-sitter-python = "0.25"
 cargo-husky = { version = "1", default-features = false, features = ["user-hooks"] }
+# Dev-dep cycle (infigraph-languages -> infigraph-core) is fine: dev-deps are excluded
+# from the normal build graph. Needed so remote_cross_service.rs can index real
+# TypeScript/Rust fixtures with the same bundled_registry() the CLI passes as
+# `build_registry` to index_group/link_cross_service_calls in production.
+infigraph-languages = { path = "../infigraph-languages" }

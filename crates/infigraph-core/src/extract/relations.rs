@@ -10,8 +10,18 @@ use crate::model::{Relation, RelationKind, Span};
 ///   @import.module / @import.name    — imports
 ///   @inherit.child / @inherit.parent — inheritance
 ///   @{custom}.source / @{custom}.target — custom edges (from language pack custom_edges)
-pub fn extract_relations(file: &str, source: &[u8], root: Node, query: &Query) -> Vec<Relation> {
-    extract_relations_with_custom_edges(file, source, root, query, &[])
+///
+/// `decompose_query`, when present, resolves compound `@inherit.parent`/`@inherit.child`
+/// captures (generics, qualified names, member expressions) down to their base identifier
+/// — see `resolve_inherit_text`.
+pub fn extract_relations(
+    file: &str,
+    source: &[u8],
+    root: Node,
+    query: &Query,
+    decompose_query: Option<&Query>,
+) -> Vec<Relation> {
+    extract_relations_with_custom_edges(file, source, root, query, &[], decompose_query)
 }
 
 /// Extract relationships including custom edge types defined by the language pack.
@@ -21,6 +31,7 @@ pub fn extract_relations_with_custom_edges(
     root: Node,
     query: &Query,
     custom_edges: &[CustomEdgeDef],
+    decompose_query: Option<&Query>,
 ) -> Vec<Relation> {
     let mut cursor = QueryCursor::new();
     let mut matches = cursor.matches(query, root, source);
@@ -72,13 +83,13 @@ pub fn extract_relations_with_custom_edges(
                     source_name = Some(file.to_string());
                 }
                 "inherit.child" => {
-                    source_name = Some(text);
+                    source_name = Some(resolve_inherit_text(node, source, decompose_query));
                     if rel_kind.is_none() {
                         rel_kind = Some(RelationKind::Inherits);
                     }
                 }
                 "inherit.parent" => {
-                    target_name = Some(text);
+                    target_name = Some(resolve_inherit_text(node, source, decompose_query));
                     rel_kind = Some(RelationKind::Inherits);
                 }
                 other => {
@@ -293,6 +304,40 @@ fn find_enclosing_class(node: Node, source: &[u8]) -> Option<String> {
         current = n.parent();
     }
     None
+}
+
+/// Resolve a captured `@inherit.parent`/`@inherit.child` node down to its base identifier
+/// text. If `decompose_query` is present, recursively descends through compound wrapper
+/// nodes (generics, qualified/dotted names, member expressions) — each iteration re-runs
+/// the query against the current node, keeping only captures whose direct parent is the
+/// current node (never a deeper descendant, which would risk matching e.g. a generic type
+/// parameter instead of the real base type). Bottoms out — and falls back to the node's own
+/// raw text — as soon as the query finds nothing further, or if no decompose query exists
+/// for this language at all. Never guesses: an unrecognized compound shape just yields its
+/// own raw text, same as today's pre-fix behavior, rather than resolving to the wrong name.
+fn resolve_inherit_text(node: Node, source: &[u8], decompose_query: Option<&Query>) -> String {
+    let Some(query) = decompose_query else {
+        return node_text(node, source);
+    };
+
+    let mut current = node;
+    loop {
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(query, current, source);
+        let mut next = None;
+        'outer: while let Some(m) = matches.next() {
+            for capture in m.captures {
+                if capture.node.parent().map(|p| p.id()) == Some(current.id()) {
+                    next = Some(capture.node);
+                    break 'outer;
+                }
+            }
+        }
+        match next {
+            Some(n) => current = n,
+            None => return node_text(current, source),
+        }
+    }
 }
 
 fn node_text(node: Node, source: &[u8]) -> String {

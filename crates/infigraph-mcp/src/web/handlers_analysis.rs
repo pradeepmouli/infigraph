@@ -187,8 +187,10 @@ pub(crate) fn api_routes(params: &Value) -> Value {
 }
 
 pub(crate) fn api_groups(_params: &Value) -> Value {
-    let registry_path = std::env::var("HOME")
-        .map(|h| PathBuf::from(h).join(".infigraph").join("registry.json"))
+    let registry_path = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .or_else(dirs_next::home_dir)
+        .map(|h| h.join(".infigraph").join("registry.json"))
         .unwrap_or_default();
     if !registry_path.exists() {
         return json!({"groups": [], "count": 0});
@@ -216,8 +218,10 @@ pub(crate) fn api_groups(_params: &Value) -> Value {
 
 pub(crate) fn api_contracts(params: &Value) -> Value {
     let group_name = params.get("group").and_then(|g| g.as_str()).unwrap_or("");
-    let registry_path = std::env::var("HOME")
-        .map(|h| PathBuf::from(h).join(".infigraph").join("registry.json"))
+    let registry_path = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .or_else(dirs_next::home_dir)
+        .map(|h| h.join(".infigraph").join("registry.json"))
         .unwrap_or_default();
     if !registry_path.exists() {
         return json!({"contracts": [], "count": 0});

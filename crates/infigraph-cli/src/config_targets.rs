@@ -117,15 +117,14 @@ pub(crate) fn install_toml_target(config_path: &std::path::Path, mcp_path_str: &
         String::new()
     };
 
-    let mcp_block = format!(
-        "[mcp]\ninfigraph = {{ command = \"{}\", args = [\"--mcp\"] }}\n",
-        mcp_path_str
-    );
+    let escaped_path = mcp_path_str.replace('\\', "\\\\").replace('"', "\\\"");
+    let section_header = "[mcp_servers.infigraph]";
+    let mcp_block = format!("{section_header}\ncommand = \"{escaped_path}\"\nargs = [\"--mcp\"]\n");
 
     let new_content = if existing.is_empty() {
         mcp_block
-    } else if let Some(start) = existing.find("[mcp]") {
-        let after_header = start + "[mcp]".len();
+    } else if let Some(start) = existing.find(section_header) {
+        let after_header = start + section_header.len();
         let section_end = existing[after_header..]
             .find("\n[")
             .map(|pos| after_header + pos + 1)
@@ -194,35 +193,34 @@ pub(crate) fn uninstall_toml_target<'a>(
     let content = std::fs::read_to_string(config_path)
         .with_context(|| format!("Failed to read {}", config_path.display()))?;
 
-    if let Some(start) = content.find("[mcp]") {
-        let after_header = start + "[mcp]".len();
+    let section_header = "[mcp_servers.infigraph]";
+    if let Some(start) = content.find(section_header) {
+        let after_header = start + section_header.len();
         let section_end = content[after_header..]
             .find("\n[")
             .map(|pos| after_header + pos + 1)
             .unwrap_or(content.len());
 
-        let section_text = &content[start..section_end];
-        if section_text.contains("infigraph") {
-            let new_content = format!("{}{}", &content[..start], &content[section_end..]);
-            let trimmed = new_content.trim_end().to_string();
-            let final_content = if trimmed.is_empty() {
-                String::new()
-            } else {
-                format!("{}\n", trimmed)
-            };
-            std::fs::write(config_path, final_content.as_bytes())
-                .with_context(|| format!("Failed to write {}", config_path.display()))?;
-            println!(
-                "  Removed infigraph from {} ({})",
-                label,
-                config_path.display()
-            );
-            return Ok(Some(label));
+        let new_content = format!("{}{}", &content[..start], &content[section_end..]);
+        let trimmed = new_content.trim_end().to_string();
+        let final_content = if trimmed.is_empty() {
+            String::new()
         } else {
-            println!("  Skipping {} (infigraph entry not found in [mcp])", label);
-        }
+            format!("{}\n", trimmed)
+        };
+        std::fs::write(config_path, final_content.as_bytes())
+            .with_context(|| format!("Failed to write {}", config_path.display()))?;
+        println!(
+            "  Removed infigraph from {} ({})",
+            label,
+            config_path.display()
+        );
+        return Ok(Some(label));
     } else {
-        println!("  Skipping {} (no [mcp] section in config)", label);
+        println!(
+            "  Skipping {} (no [mcp_servers.infigraph] section in config)",
+            label
+        );
     }
 
     Ok(None)
@@ -288,12 +286,45 @@ mod tests {
 
         let content = std::fs::read_to_string(&config).unwrap();
         assert!(
+            content.contains("[mcp_servers.infigraph]"),
+            "Codex expects [mcp_servers.infigraph], got: {}",
+            content
+        );
+        assert!(
             content.contains(r#"args = ["--mcp"]"#),
             "toml args must be [\"--mcp\"], got: {}",
             content
         );
         assert!(!content.contains("--ui"), "must not contain --ui");
         assert!(!content.contains("--port"), "must not contain --port");
+    }
+
+    #[test]
+    fn install_toml_escapes_windows_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        install_toml_target(&config, r"C:\Users\foo\infigraph-mcp.exe").unwrap();
+
+        let content = std::fs::read_to_string(&config).unwrap();
+        let parsed: toml::Value = toml::from_str(&content)
+            .unwrap_or_else(|e| panic!("generated TOML must parse, got error {e}: {content}"));
+        assert_eq!(
+            parsed["mcp_servers"]["infigraph"]["command"].as_str(),
+            Some(r"C:\Users\foo\infigraph-mcp.exe")
+        );
+    }
+
+    #[test]
+    fn install_toml_preserves_existing_sections() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        std::fs::write(&config, "[mcp_servers.other]\ncommand = \"other\"\n").unwrap();
+
+        install_toml_target(&config, "/usr/bin/infigraph-mcp").unwrap();
+
+        let content = std::fs::read_to_string(&config).unwrap();
+        assert!(content.contains("[mcp_servers.other]"));
+        assert!(content.contains("[mcp_servers.infigraph]"));
     }
 
     #[test]

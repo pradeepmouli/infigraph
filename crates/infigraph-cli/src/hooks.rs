@@ -126,7 +126,7 @@ exit 0
 
 pub(crate) const SESSION_SAVE_HOOK_SCRIPT: &str = r#"#!/usr/bin/env bash
 # Infigraph UserPromptSubmit hook — session save reminder
-# Counts user exchanges per Claude session. Every 5th exchange, emits a
+# Counts user exchanges per Claude session. Every 10th exchange, emits a
 # reminder to call save_session. Resets when the PostToolUse reset hook fires.
 # stdin: JSON {prompt, session_id, cwd, ...}
 
@@ -148,9 +148,9 @@ count=0
 count=$((count + 1))
 echo "$count" > "$counter_file"
 
-if [ $((count % 5)) -eq 0 ]; then
+if [ $((count % 10)) -eq 0 ]; then
   cat <<'ENDJSON'
-{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":"MANDATORY AUTO-SAVE: Print '💾 Auto-saving session...' to the user, then IMMEDIATELY call mcp__infigraph__save_session with summary, pending_tasks, decisions, and narrative from the current session. Do this BEFORE answering the user's question. After saving, print '✅ Session saved.' and continue with the user's request. This is automatic — do NOT ask permission, do NOT skip, do NOT defer."}}
+{"hookSpecificOutput":{"hookEventName":"UserPromptSubmit","additionalContext":"MANDATORY AUTO-SAVE (periodic backstop): Print '💾 Auto-saving session...' to the user, then IMMEDIATELY call mcp__infigraph__save_session with summary, pending_tasks, and decisions from the current session. Do NOT include narrative on this periodic save — structured fields only, this is a cheap safety-net save, not a milestone save. Do this BEFORE answering the user's question. After saving, print '✅ Session saved.' and continue with the user's request. This is automatic — do NOT ask permission, do NOT skip, do NOT defer."}}
 ENDJSON
 fi
 
@@ -223,9 +223,16 @@ inject_session_summary() {
 
 case "$source_type" in
   compact)
-    cat <<'ENDJSON'
+    backup=$(ls -t "$cwd"/.infigraph/sessions/unsaved-transcript-*.md 2>/dev/null | head -1)
+    if [ -n "$backup" ]; then
+      cat <<ENDJSON
+{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"INFIGRAPH SESSION SAVE (COMPACTION): Context was just compacted. Pre-compaction decisions and context are at risk of being lost. A pre-compaction transcript backup exists at $backup. Read this file (contains recent exchanges as clean markdown), extract key context (summary, decisions, pending tasks, constraints, assumptions, blockers, files touched), then call mcp__infigraph__save_session to persist it. After saving, delete the backup file with Bash rm. Then call mcp__infigraph__get_latest_session to reload saved context. Do NOT skip this."}}
+ENDJSON
+    else
+      cat <<'ENDJSON'
 {"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"INFIGRAPH SESSION SAVE (COMPACTION): Context was just compacted. Pre-compaction decisions and context are at risk of being lost. Call mcp__infigraph__save_session NOW with summary, pending_tasks, decisions, constraints, assumptions, and blockers from this session. Then call mcp__infigraph__get_latest_session to reload saved context. Do NOT skip this."}}
 ENDJSON
+    fi
     ;;
   startup|resume)
     session_ctx=$(inject_session_summary)
@@ -257,7 +264,7 @@ ENDJSON
     fi
     if [ -n "$backup" ]; then
       cat <<ENDJSON
-{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"INFIGRAPH CONTEXT RESET: Context was cleared. $session_ctx You MUST print a visible summary of prior session context to the user (summary + pending tasks) so they can see session continuity is working. A pre-clear transcript backup exists at $backup. Read this file (contains last ~5 exchanges as clean markdown), extract key context (summary, decisions, pending tasks, files touched), then call mcp__infigraph__save_session to persist it. After saving, delete the backup file with Bash rm. Do NOT proceed with user work until this recovery is complete."}}
+{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"INFIGRAPH CONTEXT RESET: Context was cleared. $session_ctx You MUST print a visible summary of prior session context to the user (summary + pending tasks) so they can see session continuity is working. A pre-clear transcript backup exists at $backup. Read this file (contains recent exchanges as clean markdown), extract key context (summary, decisions, pending tasks, files touched), then call mcp__infigraph__save_session to persist it. After saving, delete the backup file with Bash rm. Do NOT proceed with user work until this recovery is complete."}}
 ENDJSON
     else
       cat <<ENDJSON
@@ -271,11 +278,11 @@ exit 0
 "#;
 
 pub(crate) const SESSION_END_SAVE_HOOK_SCRIPT: &str = r##"#!/usr/bin/env bash
-# SessionEnd hook — extract last ~5 exchanges from transcript for recovery.
+# SessionEnd / PreCompact hook — extract recent transcript for recovery.
 # Next SessionStart will detect this and prompt model to summarize + save_session.
 
 input=$(cat)
-reason=$(echo "$input" | jq -r '.reason // empty')
+reason=$(echo "$input" | jq -r '.trigger // .reason // empty')
 transcript_path=$(echo "$input" | jq -r '.transcript_path // empty')
 cwd=$(echo "$input" | jq -r '.cwd // empty')
 
@@ -326,9 +333,9 @@ with open('$transcript_path') as f:
             if content.strip():
                 messages.append(('assistant', content.strip()))
 
-recent = messages[-10:]
+recent = messages[-40:]
 with open('$backup', 'w') as out:
-    out.write('# Unsaved session context (last ~5 exchanges)\n\n')
+    out.write('# Unsaved session context (last ~20 exchanges)\n\n')
     for role, text in recent:
         out.write(f'## {role.title()}\n{text}\n\n')
 " 2>/dev/null
@@ -1056,13 +1063,48 @@ pub(crate) fn install_session_end_hook(home: &std::path::Path) -> Result<()> {
 
     if !already_exists {
         let mut arr = session_end;
-        arr.push(hook_entry);
+        arr.push(hook_entry.clone());
         settings["hooks"]["SessionEnd"] = serde_json::Value::Array(arr);
         let pretty = serde_json::to_string_pretty(&settings)?;
         std::fs::write(&settings_path, pretty)?;
         println!("  Added SessionEnd hook to {}", settings_path.display());
     } else {
         println!("  SessionEnd session-end hook already configured");
+    }
+
+    // Also register for PreCompact — the same script handles both events
+    // (reads .trigger for PreCompact, .reason for SessionEnd), so pre-compaction
+    // context gets the same transcript-backup safety net as session-end does.
+    let pre_compact = settings["hooks"]
+        .get("PreCompact")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let pre_compact_exists = pre_compact.iter().any(|entry| {
+        entry
+            .get("hooks")
+            .and_then(|h| h.as_array())
+            .map(|hooks| {
+                hooks.iter().any(|h| {
+                    h.get("command")
+                        .and_then(|c| c.as_str())
+                        .map(|c| c.contains("infigraph-session-end"))
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false)
+    });
+
+    if !pre_compact_exists {
+        let mut arr = pre_compact;
+        arr.push(hook_entry);
+        settings["hooks"]["PreCompact"] = serde_json::Value::Array(arr);
+        let pretty = serde_json::to_string_pretty(&settings)?;
+        std::fs::write(&settings_path, pretty)?;
+        println!("  Added PreCompact hook to {}", settings_path.display());
+    } else {
+        println!("  PreCompact session-end hook already configured");
     }
 
     Ok(())
@@ -1371,6 +1413,7 @@ pub(crate) fn uninstall_hooks(home: &std::path::Path) -> Result<()> {
                 "PostToolUse",
                 "SessionStart",
                 "SessionEnd",
+                "PreCompact",
             ] {
                 if let Some(arr) = settings["hooks"]
                     .get_mut(*event)
@@ -1578,6 +1621,14 @@ mod tests {
             .as_array()
             .unwrap()
             .is_empty());
+        assert!(
+            !settings["hooks"]["PreCompact"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "PreCompact should get the same transcript-backup hook as SessionEnd, \
+             so pre-compaction context isn't lost the same way pre-session-end context is"
+        );
     }
 
     #[test]
@@ -1665,6 +1716,7 @@ mod tests {
             "UserPromptSubmit",
             "SessionStart",
             "SessionEnd",
+            "PreCompact",
         ] {
             let count = settings["hooks"][event]
                 .as_array()

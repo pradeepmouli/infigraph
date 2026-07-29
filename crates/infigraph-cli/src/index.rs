@@ -276,7 +276,11 @@ pub(crate) fn cmd_index(root: &Path, full: bool, no_embed: bool) -> Result<()> {
     }
 
     // Auto-index documents (PDF, DOCX, XML, Markdown, etc.)
-    match crate::commands::cmd_index_docs(root) {
+    #[cfg(feature = "remote")]
+    let doc_ns = remote_ns.as_deref();
+    #[cfg(not(feature = "remote"))]
+    let doc_ns: Option<&str> = None;
+    match crate::commands::cmd_index_docs(root, doc_ns) {
         Ok(()) => {}
         Err(e) => eprintln!("warning: document indexing failed: {e}"),
     }
@@ -1359,6 +1363,22 @@ mod tests {
         assert!(!tg_dir.join("watch.lock").exists());
 
         std::env::remove_var("CI");
+    }
+
+    #[test]
+    #[cfg(feature = "remote")]
+    fn ensure_watcher_noop_when_remote_backend() {
+        // Remote (shared-Neo4j) mode reindexes via webhook — a local watcher
+        // would be redundant and race the webhook path.
+        std::env::set_var("INFIGRAPH_BACKEND", "neo4j");
+        let tmp = TempDir::new().unwrap();
+        let tg_dir = tmp.path().join(".infigraph");
+        fs::create_dir_all(&tg_dir).unwrap();
+
+        ensure_watcher_running(tmp.path());
+        assert!(!tg_dir.join("watch.lock").exists());
+
+        std::env::remove_var("INFIGRAPH_BACKEND");
     }
 
     #[test]
