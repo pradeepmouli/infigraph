@@ -79,6 +79,8 @@ Needs a targeted unit test in `crates/infigraph-core/src/scip/mod.rs`'s existing
 ## Confirmed / no longer open
 
 - ~~Whether `SymbolInformation.kind` is reliable~~ — checked, it is not (always `UnspecifiedKind`); design no longer depends on it at all.
+- ~~Whether a newer `scip-typescript` might behave differently~~ — checked: the bare `scip-typescript` npm name is a squatted/deprecated placeholder; the real, actively-maintained package is `@sourcegraph/scip-typescript` (also what `crates/infigraph-cli/src/scip_download.rs`'s `CATALOG` installs, unpinned). `0.4.0` is its current latest and what all verification above used — re-confirmed with the exact `index --infer-tsconfig --output ...` invocation infigraph itself runs (`scip_download.rs:97`), not just a bare `index` call. Same shape, `kind` still always `UnspecifiedKind`.
+- ~~Whether the decompose/match-against-known check needs to apply anywhere beyond Pass 1's new-symbol decision~~ — checked against real data: indexed a `class Button implements Widget` and inspected `si.relationships` directly. Both `si.symbol` (source) and `rel.symbol` (target) are always clean, top-level Class/Interface/Method monikers, never a nested `.(paramName)`-shaped descriptor — structurally, only types/methods can implement/be implemented, never a parameter. Pass 3's existing exact-match lookup is already correct; no decompose fallback needed there. Pass 2 needs no separate change either — once Pass 1 stops creating the bogus node, Pass 2's `file_name_to_ids` lookup for any reference to it simply finds nothing and skips, exactly like today's handling of any other unresolvable reference. **The decompose check is scoped to exactly one call site: Pass 1's new-symbol decision.**
 
 ## Scope
 
