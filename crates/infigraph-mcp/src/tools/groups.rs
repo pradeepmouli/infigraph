@@ -518,6 +518,12 @@ pub fn tool_group_build(args: &Value) -> Result<String> {
         let mut idx = infigraph_docs::DocIndex::open(&entry.path)?;
         if is_remote {
             idx.set_skip_file_embeddings(true);
+            let ns = if group.org.is_empty() {
+                repo_name.clone()
+            } else {
+                format!("{}/{}", group.org, repo_name)
+            };
+            idx.set_namespace(&ns);
         }
         idx.init()?;
         let result = idx.index()?;

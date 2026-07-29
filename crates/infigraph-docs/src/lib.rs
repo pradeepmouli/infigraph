@@ -35,6 +35,11 @@ pub struct DocIndex {
     db_path: PathBuf,
     store: Option<Box<dyn DocBackend>>,
     skip_file_embeddings: bool,
+    /// When set (remote multi-repo mode only), all doc/chunk IDs are prefixed
+    /// with `{namespace}/`, mirroring `Infigraph::set_namespace` for the code
+    /// graph — keeps repos sharing one Neo4j instance from colliding on
+    /// identical relative paths (e.g. every repo's README.md).
+    namespace: Option<String>,
 }
 
 pub struct DocIndexResult {
@@ -58,7 +63,14 @@ impl DocIndex {
             db_path,
             store: None,
             skip_file_embeddings: false,
+            namespace: None,
         })
+    }
+
+    /// Set a namespace prefix (`org/repo`) for multi-repo doc indexing into a
+    /// shared Neo4j instance. All doc/chunk IDs are prefixed with `{namespace}/`.
+    pub fn set_namespace(&mut self, ns: &str) {
+        self.namespace = Some(ns.to_string());
     }
 
     pub fn init(&mut self) -> Result<()> {
@@ -147,15 +159,20 @@ impl DocIndex {
 
         let done = AtomicUsize::new(0);
         let root = &self.root;
+        let ns = self.namespace.as_deref();
 
         let results: Vec<(ExtractedDoc, Vec<Chunk>)> = files
             .par_iter()
             .filter_map(|path| {
-                let rel = path
+                let raw_rel = path
                     .strip_prefix(root)
                     .ok()?
                     .to_string_lossy()
                     .replace('\\', "/");
+                let rel = match ns {
+                    Some(prefix) => format!("{prefix}/{raw_rel}"),
+                    None => raw_rel,
+                };
                 let bytes = std::fs::read(path).ok()?;
                 let hash = {
                     let mut h = Sha256::new();
@@ -220,18 +237,29 @@ impl DocIndex {
             embed::update_doc_embeddings(store, &self.root, &all_chunks, &changed_files)?;
         }
 
-        // Prune stale docs: remove entries for files that no longer exist on disk
+        // Prune stale docs: remove entries for files that no longer exist on disk.
+        // Scope both sides to this repo's namespace — `existing_hashes` pools every
+        // repo sharing the store in remote mode, so an unscoped diff would flag
+        // every other repo's docs as "stale" and delete them.
         {
             let current_files: std::collections::HashSet<String> = files
                 .iter()
                 .filter_map(|p| {
-                    p.strip_prefix(&self.root)
-                        .ok()
-                        .map(|r| r.to_string_lossy().replace('\\', "/"))
+                    p.strip_prefix(&self.root).ok().map(|r| {
+                        let raw = r.to_string_lossy().replace('\\', "/");
+                        match ns {
+                            Some(prefix) => format!("{prefix}/{raw}"),
+                            None => raw,
+                        }
+                    })
                 })
                 .collect();
             let stale: Vec<String> = existing_hashes
                 .keys()
+                .filter(|k| match ns {
+                    Some(prefix) => k.starts_with(&format!("{prefix}/")),
+                    None => true,
+                })
                 .filter(|k| !current_files.contains(k.as_str()))
                 .cloned()
                 .collect();
@@ -242,10 +270,19 @@ impl DocIndex {
             }
         }
 
-        // Extract links from indexed docs and create LINKS_TO edges
+        // Extract links from indexed docs and create LINKS_TO edges.
+        // Scope to this repo's namespace so cross-repo docs aren't offered as
+        // link targets that don't actually exist in this repo's tree.
         let mut all_doc_ids: HashSet<String> = {
             let existing = store.get_doc_hashes().unwrap_or_default();
-            existing.keys().cloned().collect()
+            existing
+                .keys()
+                .filter(|k| match ns {
+                    Some(prefix) => k.starts_with(&format!("{prefix}/")),
+                    None => true,
+                })
+                .cloned()
+                .collect()
         };
         if !results.is_empty() {
             for (doc, _) in &results {
@@ -341,10 +378,20 @@ impl DocIndex {
         let mut total_new = 0usize;
         let mut new_chunks = Vec::new();
         let mut changed_files = Vec::new();
+        let ns = self.namespace.as_deref();
+        let strip_ns = |id: &str| -> String {
+            match ns {
+                Some(prefix) => id
+                    .strip_prefix(&format!("{prefix}/"))
+                    .unwrap_or(id)
+                    .to_string(),
+                None => id.to_string(),
+            }
+        };
         let mut frontier: Vec<PathBuf> = indexed_docs
             .iter()
             .filter_map(|rel| {
-                let p = self.root.join(rel);
+                let p = self.root.join(strip_ns(rel));
                 p.canonicalize().ok().filter(|c| c.is_file())
             })
             .collect();
@@ -403,7 +450,11 @@ impl DocIndex {
 
                     // Build relative ID (relative to doc root for consistency, or absolute if outside)
                     let rel_id = if let Ok(rel) = abs.strip_prefix(&root_canonical) {
-                        rel.to_string_lossy().replace('\\', "/")
+                        let raw = rel.to_string_lossy().replace('\\', "/");
+                        match ns {
+                            Some(prefix) => format!("{prefix}/{raw}"),
+                            None => raw,
+                        }
                     } else {
                         abs.to_string_lossy().replace('\\', "/")
                     };
@@ -458,15 +509,25 @@ impl DocIndex {
             embed::update_doc_embeddings(store, &self.root, &chunk_refs, &changed_file_refs)?;
         }
 
-        // Re-run link extraction for all docs (newly discovered may link to each other)
+        // Re-run link extraction for all docs (newly discovered may link to each other).
+        // Scope to this repo's namespace — other repos' doc IDs don't resolve
+        // under this repo's root and would just fail the read below, but
+        // skipping them up front avoids wasted global-store round-trips.
         if total_new > 0 {
             let all_hashes = store.get_doc_hashes().unwrap_or_default();
-            let all_ids: HashSet<String> = all_hashes.keys().cloned().collect();
+            let all_ids: HashSet<String> = all_hashes
+                .keys()
+                .filter(|k| match ns {
+                    Some(prefix) => k.starts_with(&format!("{prefix}/")),
+                    None => true,
+                })
+                .cloned()
+                .collect();
             for doc_id in all_ids.iter() {
                 let doc_path = if doc_id.starts_with('/') {
                     PathBuf::from(doc_id)
                 } else {
-                    self.root.join(doc_id)
+                    self.root.join(strip_ns(doc_id))
                 };
                 if let Ok(text) = std::fs::read_to_string(&doc_path) {
                     let doc = ExtractedDoc {

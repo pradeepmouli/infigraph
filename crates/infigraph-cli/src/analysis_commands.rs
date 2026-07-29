@@ -720,3 +720,165 @@ pub(crate) fn cmd_bridges_promote(root: &Path) -> Result<()> {
     println!("Promoted {} BRIDGE_TO edges to CALLS edges.", count);
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_files(root: &Path, files: &[(&str, &str)]) {
+        for (name, content) in files {
+            let p = root.join(name);
+            if let Some(parent) = p.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(&p, content).unwrap();
+        }
+    }
+
+    fn index_project(root: &Path) {
+        let mut ig = Infigraph::open(root, bundled_registry().unwrap()).unwrap();
+        ig.init().unwrap();
+        ig.index().unwrap();
+    }
+
+    #[test]
+    fn cmd_architecture_empty_project_reports_no_data() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        index_project(tmp.path());
+        assert!(cmd_architecture(tmp.path()).is_ok());
+    }
+
+    #[test]
+    fn cmd_architecture_populated_project_succeeds() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_files(
+            tmp.path(),
+            &[(
+                "src/main.py",
+                "def helper():\n    return 1\n\ndef main():\n    return helper()\n",
+            )],
+        );
+        index_project(tmp.path());
+        assert!(cmd_architecture(tmp.path()).is_ok());
+    }
+
+    #[test]
+    fn cmd_security_runs_on_sql_injection_fixture() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_files(
+            tmp.path(),
+            &[(
+                "query.py",
+                "def run(user_input):\n    query = \"SELECT * FROM users WHERE id = \" + user_input\n    cursor.execute(query)\n",
+            )],
+        );
+        assert!(cmd_security(tmp.path(), None, None).is_ok());
+    }
+
+    #[test]
+    fn cmd_security_filters_by_unmatched_severity_without_error() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_files(
+            tmp.path(),
+            &[(
+                "query.py",
+                "def run(user_input):\n    query = \"SELECT * FROM users WHERE id = \" + user_input\n    cursor.execute(query)\n",
+            )],
+        );
+        assert!(cmd_security(tmp.path(), Some("critical"), Some("sql injection")).is_ok());
+    }
+
+    #[test]
+    fn cmd_taint_runs_on_indexed_project() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_files(
+            tmp.path(),
+            &[(
+                "views.py",
+                "def handler(request):\n    user_input = request.GET.get('name')\n    cursor.execute(\"SELECT * FROM users WHERE name = \" + user_input)\n",
+            )],
+        );
+        index_project(tmp.path());
+        assert!(cmd_taint(tmp.path(), None, false, false, 3).is_ok());
+    }
+
+    #[test]
+    fn cmd_taint_interprocedural_mode_succeeds() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_files(
+            tmp.path(),
+            &[(
+                "views.py",
+                "def handler(request):\n    user_input = request.GET.get('name')\n    cursor.execute(\"SELECT * FROM users WHERE name = \" + user_input)\n",
+            )],
+        );
+        index_project(tmp.path());
+        assert!(cmd_taint(tmp.path(), None, false, true, 3).is_ok());
+    }
+
+    #[test]
+    fn cmd_review_errors_outside_git_repo() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_files(tmp.path(), &[("main.py", "def f():\n    return 1\n")]);
+        index_project(tmp.path());
+        let result = cmd_review(tmp.path(), "HEAD~1", 50, false, false, false, None, None);
+        assert!(
+            result.is_err(),
+            "review should require a git repository with history"
+        );
+    }
+
+    #[test]
+    fn cmd_check_security_only_passes_on_clean_project() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_files(tmp.path(), &[("main.py", "def f():\n    return 1\n")]);
+        index_project(tmp.path());
+        let any_failed = cmd_check(tmp.path(), None, false, Some("security")).unwrap();
+        assert!(
+            !any_failed,
+            "clean project should not fail the security check"
+        );
+    }
+
+    #[test]
+    fn cmd_check_security_only_fails_on_vulnerable_project() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_files(
+            tmp.path(),
+            &[(
+                "vuln.py",
+                "import os\npassword = 'hardcoded_secret'\nos.system(user_input)\neval(data)\n",
+            )],
+        );
+        index_project(tmp.path());
+        let any_failed = cmd_check(tmp.path(), None, false, Some("security")).unwrap();
+        assert!(
+            any_failed,
+            "vulnerable project should fail the security check"
+        );
+    }
+
+    #[test]
+    fn cmd_check_json_output_mode_succeeds() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        write_files(tmp.path(), &[("main.py", "def f():\n    return 1\n")]);
+        index_project(tmp.path());
+        assert!(cmd_check(tmp.path(), None, true, Some("security")).is_ok());
+    }
+
+    #[test]
+    fn cmd_forget_clears_learned_store() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path()).unwrap();
+        let abs = std::fs::canonicalize(tmp.path()).unwrap();
+
+        let mut store = infigraph_core::learned::LearnedStore::load(&abs);
+        store.record_correction("a.py", "foo", "b.py", "b.py::foo");
+        store.save(&abs).unwrap();
+        assert_eq!(infigraph_core::learned::LearnedStore::load(&abs).len(), 1);
+
+        assert!(cmd_forget(tmp.path()).is_ok());
+
+        assert_eq!(infigraph_core::learned::LearnedStore::load(&abs).len(), 0);
+    }
+}

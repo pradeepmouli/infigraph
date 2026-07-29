@@ -410,9 +410,12 @@ pub(crate) fn cmd_scip_import(root: &Path, index_path: &Path) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn cmd_index_docs(root: &Path) -> Result<()> {
+pub(crate) fn cmd_index_docs(root: &Path, namespace: Option<&str>) -> Result<()> {
     let start = std::time::Instant::now();
     let mut idx = infigraph_docs::DocIndex::open(root)?;
+    if let Some(ns) = namespace {
+        idx.set_namespace(ns);
+    }
 
     #[cfg(feature = "remote")]
     let is_remote = std::env::var("INFIGRAPH_BACKEND")

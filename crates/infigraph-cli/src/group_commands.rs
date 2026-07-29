@@ -31,6 +31,34 @@ pub(crate) fn cmd_group(root: &Path, action: GroupAction) -> Result<()> {
             } else {
                 (repo.clone(), root.to_path_buf())
             };
+
+            // Fast path: repo already registered at this exact path and already a
+            // member of this group — nothing to do. Skips compiling ~62 tree-sitter
+            // grammar packs (bundled_registry) and opening/initializing the graph,
+            // which otherwise cost the same ~1-2s per repo whether or not anything
+            // actually changed (seen in production as an unconditional re-add loop
+            // on every pod restart).
+            let canonical = std::fs::canonicalize(&actual_path).unwrap_or(actual_path.clone());
+            let already_current = registry
+                .repos
+                .get(&repo_name)
+                .map(|e| e.path == canonical)
+                .unwrap_or(false)
+                && registry
+                    .groups
+                    .get(&group)
+                    .map(|g| g.repos.iter().any(|r| r == &repo_name))
+                    .unwrap_or(false);
+            if already_current {
+                println!(
+                    "Repo '{}' already in group '{}' at '{}' — nothing to do",
+                    repo_name,
+                    group,
+                    canonical.display()
+                );
+                return Ok(());
+            }
+
             let reg = bundled_registry()?;
             let mut prism = Infigraph::open(&actual_path, reg)?;
             prism.init()?;
@@ -398,8 +426,21 @@ pub(crate) fn cmd_group(root: &Path, action: GroupAction) -> Result<()> {
                 .get(&group)
                 .context(format!("group '{}' not found", group))?
                 .clone();
+            // A repo Step 1 skipped (git commit unchanged since last index) has nothing
+            // new for doc-indexing either — docs are git-tracked in the same tree, so an
+            // unchanged commit means unchanged docs too. `--full` naturally sidesteps this:
+            // index_group puts every repo in `results` when full=true, so this gate skips
+            // nothing and all repos get doc-indexed (covers e.g. a repo indexed before doc
+            // support existed).
+            let processed: std::collections::HashSet<&str> =
+                results.iter().map(|(r, _, _, _)| r.as_str()).collect();
             let mut bfs_discovered = 0;
+            let mut skipped_docs = 0;
             for repo_name in &g.repos {
+                if !processed.contains(repo_name.as_str()) {
+                    skipped_docs += 1;
+                    continue;
+                }
                 let entry = registry
                     .repos
                     .get(repo_name)
@@ -407,6 +448,12 @@ pub(crate) fn cmd_group(root: &Path, action: GroupAction) -> Result<()> {
                 let mut idx = infigraph_docs::DocIndex::open(&entry.path)?;
                 if is_remote {
                     idx.set_skip_file_embeddings(true);
+                    let ns = if g.org.is_empty() {
+                        repo_name.clone()
+                    } else {
+                        format!("{}/{}", g.org, repo_name)
+                    };
+                    idx.set_namespace(&ns);
                 }
                 idx.init()?;
                 let result = idx.index()?;
@@ -435,9 +482,12 @@ pub(crate) fn cmd_group(root: &Path, action: GroupAction) -> Result<()> {
             if is_remote {
                 println!(
                     "=== Step 5/5: Indexed docs for {} repos, {} BFS discoveries, embeddings in pgvector ===",
-                    g.repos.len(),
+                    processed.len(),
                     bfs_discovered
                 );
+                if skipped_docs > 0 {
+                    println!("  [docs] skipped {skipped_docs} unchanged repos");
+                }
             } else {
                 println!("=== Step 5/5: Building combined document store ===");
                 let doc_stats = infigraph_docs::combined::build_combined_docs(&registry, &group)?;

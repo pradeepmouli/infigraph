@@ -602,7 +602,9 @@ fn register_subdirs(watcher: &mut RecommendedWatcher, dir: &Path, ignore_dirs: &
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
     use super::*;
+    #[cfg(target_os = "macos")]
     use std::sync::Mutex;
 
     /// Regression test for a macOS-specific bug: `watch_project_with_periodic`

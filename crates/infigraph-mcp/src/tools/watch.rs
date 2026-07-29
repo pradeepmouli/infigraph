@@ -20,9 +20,10 @@ pub fn watchers_disabled() -> bool {
 
 fn watch_log(level: &str, msg: &str) {
     use std::io::Write;
-    let path = std::env::var("HOME")
+    let path = std::env::var_os("HOME")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::path::PathBuf::from("."))
+        .or_else(dirs_next::home_dir)
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
         .join(".infigraph")
         .join("mcp.log");
     if let Ok(mut f) = std::fs::OpenOptions::new()

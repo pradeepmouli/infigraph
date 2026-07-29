@@ -3,21 +3,27 @@ use infigraph_core::lang::{CustomEdgeDef, LanguagePack, LanguageRegistry};
 
 const PYTHON_ENTITIES: &str = include_str!("../languages/python/entities.scm");
 const PYTHON_RELATIONS: &str = include_str!("../languages/python/relations.scm");
+const PYTHON_INHERIT_DECOMPOSE: &str = include_str!("../languages/python/inherit_decompose.scm");
 
 const RUST_ENTITIES: &str = include_str!("../languages/rust/entities.scm");
 const RUST_RELATIONS: &str = include_str!("../languages/rust/relations.scm");
+const RUST_INHERIT_DECOMPOSE: &str = include_str!("../languages/rust/inherit_decompose.scm");
 
 const TYPESCRIPT_ENTITIES: &str = include_str!("../languages/typescript/entities.scm");
 const TYPESCRIPT_RELATIONS: &str = include_str!("../languages/typescript/relations.scm");
+const TYPESCRIPT_INHERIT_DECOMPOSE: &str =
+    include_str!("../languages/typescript/inherit_decompose.scm");
 
 const JAVASCRIPT_ENTITIES: &str = include_str!("../languages/javascript/entities.scm");
 const JAVASCRIPT_RELATIONS: &str = include_str!("../languages/javascript/relations.scm");
 
 const GO_ENTITIES: &str = include_str!("../languages/go/entities.scm");
 const GO_RELATIONS: &str = include_str!("../languages/go/relations.scm");
+const GO_INHERIT_DECOMPOSE: &str = include_str!("../languages/go/inherit_decompose.scm");
 
 const JAVA_ENTITIES: &str = include_str!("../languages/java/entities.scm");
 const JAVA_RELATIONS: &str = include_str!("../languages/java/relations.scm");
+const JAVA_INHERIT_DECOMPOSE: &str = include_str!("../languages/java/inherit_decompose.scm");
 
 const C_ENTITIES: &str = include_str!("../languages/c/entities.scm");
 const C_RELATIONS: &str = include_str!("../languages/c/relations.scm");
@@ -33,9 +39,11 @@ const PHP_RELATIONS: &str = include_str!("../languages/php/relations.scm");
 
 const SWIFT_ENTITIES: &str = include_str!("../languages/swift/entities.scm");
 const SWIFT_RELATIONS: &str = include_str!("../languages/swift/relations.scm");
+const SWIFT_INHERIT_DECOMPOSE: &str = include_str!("../languages/swift/inherit_decompose.scm");
 
 const KOTLIN_ENTITIES: &str = include_str!("../languages/kotlin/entities.scm");
 const KOTLIN_RELATIONS: &str = include_str!("../languages/kotlin/relations.scm");
+const KOTLIN_INHERIT_DECOMPOSE: &str = include_str!("../languages/kotlin/inherit_decompose.scm");
 
 const CSHARP_ENTITIES: &str = include_str!("../languages/csharp/entities.scm");
 const CSHARP_RELATIONS: &str = include_str!("../languages/csharp/relations.scm");
@@ -436,12 +444,14 @@ fn python_pack() -> Result<LanguagePack> {
             name: "DECORATED_BY".to_string(),
             capture: "decorates".to_string(),
         }],
-    )
+    )?
+    .with_inherit_decompose(PYTHON_INHERIT_DECOMPOSE)
 }
 
 fn rust_pack() -> Result<LanguagePack> {
     let grammar = tree_sitter_rust::LANGUAGE.into();
-    LanguagePack::new("rust", vec![".rs"], grammar, RUST_ENTITIES, RUST_RELATIONS)
+    LanguagePack::new("rust", vec![".rs"], grammar, RUST_ENTITIES, RUST_RELATIONS)?
+        .with_inherit_decompose(RUST_INHERIT_DECOMPOSE)
 }
 
 fn typescript_pack() -> Result<LanguagePack> {
@@ -452,7 +462,8 @@ fn typescript_pack() -> Result<LanguagePack> {
         grammar,
         TYPESCRIPT_ENTITIES,
         TYPESCRIPT_RELATIONS,
-    )
+    )?
+    .with_inherit_decompose(TYPESCRIPT_INHERIT_DECOMPOSE)
 }
 
 fn javascript_pack() -> Result<LanguagePack> {
@@ -478,7 +489,8 @@ fn go_pack() -> Result<LanguagePack> {
             name: "SPAWNS".to_string(),
             capture: "goroutine".to_string(),
         }],
-    )
+    )?
+    .with_inherit_decompose(GO_INHERIT_DECOMPOSE)
 }
 
 fn java_pack() -> Result<LanguagePack> {
@@ -489,7 +501,8 @@ fn java_pack() -> Result<LanguagePack> {
         grammar,
         JAVA_ENTITIES,
         JAVA_RELATIONS,
-    )
+    )?
+    .with_inherit_decompose(JAVA_INHERIT_DECOMPOSE)
 }
 
 fn c_pack() -> Result<LanguagePack> {
@@ -532,7 +545,8 @@ fn swift_pack() -> Result<LanguagePack> {
         grammar,
         SWIFT_ENTITIES,
         SWIFT_RELATIONS,
-    )
+    )?
+    .with_inherit_decompose(SWIFT_INHERIT_DECOMPOSE)
 }
 
 fn kotlin_pack() -> Result<LanguagePack> {
@@ -543,7 +557,8 @@ fn kotlin_pack() -> Result<LanguagePack> {
         grammar,
         KOTLIN_ENTITIES,
         KOTLIN_RELATIONS,
-    )
+    )?
+    .with_inherit_decompose(KOTLIN_INHERIT_DECOMPOSE)
 }
 
 fn csharp_pack() -> Result<LanguagePack> {

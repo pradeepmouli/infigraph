@@ -2417,7 +2417,7 @@ dependencies = [
 
 [[package]]
 name = "infigraph-cli"
-version = "3.2.5"
+version = "3.2.6"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2440,12 +2440,13 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
+ "toml",
  "ureq 2.12.1",
 ]
 
 [[package]]
 name = "infigraph-confluence"
-version = "3.2.5"
+version = "3.2.6"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2459,7 +2460,7 @@ dependencies = [
 
 [[package]]
 name = "infigraph-core"
-version = "3.2.5"
+version = "3.2.6"
 dependencies = [
  "anyhow",
  "arrow",
@@ -2469,6 +2470,7 @@ dependencies = [
  "fs2",
  "glob",
  "ignore",
+ "infigraph-languages",
  "lbug",
  "libc",
  "memmap2",
@@ -2499,7 +2501,7 @@ dependencies = [
 
 [[package]]
 name = "infigraph-docs"
-version = "3.2.5"
+version = "3.2.6"
 dependencies = [
  "anyhow",
  "arrow",
@@ -2525,7 +2527,7 @@ dependencies = [
 
 [[package]]
 name = "infigraph-grammar-plugin"
-version = "3.2.5"
+version = "3.2.6"
 dependencies = [
  "anyhow",
  "dirs-next",
@@ -2538,7 +2540,7 @@ dependencies = [
 
 [[package]]
 name = "infigraph-languages"
-version = "3.2.5"
+version = "3.2.6"
 dependencies = [
  "anyhow",
  "infigraph-core",
@@ -2606,9 +2608,10 @@ dependencies = [
 
 [[package]]
 name = "infigraph-mcp"
-version = "3.2.5"
+version = "3.2.6"
 dependencies = [
  "anyhow",
+ "dirs-next",
  "fs2",
  "hex",
  "hmac 0.12.1",
@@ -2633,7 +2636,7 @@ dependencies = [
 
 [[package]]
 name = "infigraph-pipeline-plugin"
-version = "3.2.5"
+version = "3.2.6"
 dependencies = [
  "anyhow",
  "dirs-next",
@@ -3010,7 +3013,7 @@ checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 
 [[package]]
 name = "lsp-to-scip"
-version = "3.2.5"
+version = "3.2.6"
 dependencies = [
  "anyhow",
  "clap",

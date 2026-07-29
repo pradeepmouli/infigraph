@@ -895,7 +895,22 @@ fn run(command: Commands, root: &Path) -> Result<()> {
         Commands::Watch { debounce } => cmd_watch(root, debounce),
         Commands::WatchStop => cmd_watch_stop(root),
         Commands::WatchStatus => cmd_watch_status(root),
-        Commands::IndexDocs => cmd_index_docs(root),
+        Commands::IndexDocs => {
+            #[cfg(feature = "remote")]
+            let doc_ns = if std::env::var("INFIGRAPH_BACKEND")
+                .map(|v| v == "neo4j")
+                .unwrap_or(false)
+            {
+                infigraph_core::multi::Registry::load()
+                    .ok()
+                    .and_then(|reg| reg.resolve_repo_namespace(root))
+            } else {
+                None
+            };
+            #[cfg(not(feature = "remote"))]
+            let doc_ns: Option<String> = None;
+            cmd_index_docs(root, doc_ns.as_deref())
+        }
         Commands::ReindexDocs => cmd_reindex_docs(root),
         Commands::CleanDocs => cmd_clean_docs(root),
         Commands::SearchDocs { query, limit } => cmd_search_docs(root, &query, limit),

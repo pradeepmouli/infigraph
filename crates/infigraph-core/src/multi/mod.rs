@@ -253,7 +253,9 @@ impl Registry {
         &self,
         group_name: &str,
         cypher: &str,
-        build_registry: impl Fn() -> Result<LanguageRegistry>,
+        // Kept for call-site compatibility — only runs raw_query below, never
+        // parses source, so an empty LanguageRegistry is used instead.
+        _build_registry: impl Fn() -> Result<LanguageRegistry>,
     ) -> Result<Vec<(String, Vec<Vec<String>>)>> {
         let group = self
             .groups
@@ -267,8 +269,10 @@ impl Registry {
                 .get(repo_name)
                 .context(format!("repo '{}' not in registry", repo_name))?;
 
-            let registry = build_registry()?;
-            let mut prism = Infigraph::open(&entry.path, registry)?;
+            // Runs arbitrary user-supplied Cypher via raw_query below — never parses
+            // source, so an empty registry avoids rebuilding all 62 language packs
+            // per repo in the group.
+            let mut prism = Infigraph::open(&entry.path, LanguageRegistry::new())?;
             prism.init()?;
 
             let backend = prism.backend().context("graph not initialized")?;
@@ -295,14 +299,29 @@ impl Registry {
 /// 1. Route symbols (kind='Route') — from call-expression routing (Express, Gin, etc.)
 /// 2. Decorated functions — docstring contains route decorator (@app.route, #[get], etc.)
 /// 3. Heuristic detect_routes fallback
-pub fn extract_contracts(prism: &Infigraph, service_name: &str) -> Result<Vec<Contract>> {
+pub fn extract_contracts(
+    prism: &Infigraph,
+    service_name: &str,
+    namespace: Option<&str>,
+) -> Result<Vec<Contract>> {
     let mut contracts = Vec::new();
     let mut seen_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    // Scope queries to this repo's own namespace when running against a shared
+    // (remote/Neo4j) graph — otherwise these hand-written Cypher scans see every
+    // other repo's symbols too. Local (non-namespaced) mode passes `None`, which
+    // must be a no-op: local per-repo Kuzu graphs store unprefixed file paths.
+    let ns_clause = namespace
+        .map(|ns| format!(" AND s.file STARTS WITH '{}/'", crate::escape_str(ns)))
+        .unwrap_or_default();
 
     // 1. Route symbols (call-expression routes: Express, Gin, Django, etc.)
     let route_rows = raw_query_prism(
         prism,
-        "MATCH (s:Symbol) WHERE s.kind = 'Route' RETURN s.id, s.name, s.kind, s.file, s.docstring",
+        &format!(
+            "MATCH (s:Symbol) WHERE s.kind = 'Route'{} RETURN s.id, s.name, s.kind, s.file, s.docstring",
+            ns_clause
+        ),
     )?;
     for row in &route_rows {
         let (method, path) = parse_route_name(&row[1]);
@@ -320,9 +339,10 @@ pub fn extract_contracts(prism: &Infigraph, service_name: &str) -> Result<Vec<Co
     }
 
     // 2. Decorated functions with route info in docstring
-    let decorated_rows = raw_query_prism(prism,
-        "MATCH (s:Symbol) WHERE s.kind IN ['Function', 'Method'] AND s.docstring IS NOT NULL AND (s.docstring CONTAINS '@app.route' OR s.docstring CONTAINS '@app.get' OR s.docstring CONTAINS '@app.post' OR s.docstring CONTAINS '@router.get' OR s.docstring CONTAINS '@router.post' OR s.docstring CONTAINS '@router.put' OR s.docstring CONTAINS '@router.delete' OR s.docstring CONTAINS '@router.patch' OR s.docstring CONTAINS '#[get' OR s.docstring CONTAINS '#[post' OR s.docstring CONTAINS '@GetMapping' OR s.docstring CONTAINS '@PostMapping' OR s.docstring CONTAINS '@RequestMapping' OR s.docstring CONTAINS 'MapGet' OR s.docstring CONTAINS 'MapPost') RETURN s.id, s.name, s.kind, s.file, s.docstring",
-    )?;
+    let decorated_rows = raw_query_prism(prism, &format!(
+        "MATCH (s:Symbol) WHERE s.kind IN ['Function', 'Method'] AND s.docstring IS NOT NULL AND (s.docstring CONTAINS '@app.route' OR s.docstring CONTAINS '@app.get' OR s.docstring CONTAINS '@app.post' OR s.docstring CONTAINS '@router.get' OR s.docstring CONTAINS '@router.post' OR s.docstring CONTAINS '@router.put' OR s.docstring CONTAINS '@router.delete' OR s.docstring CONTAINS '@router.patch' OR s.docstring CONTAINS '#[get' OR s.docstring CONTAINS '#[post' OR s.docstring CONTAINS '@GetMapping' OR s.docstring CONTAINS '@PostMapping' OR s.docstring CONTAINS '@RequestMapping' OR s.docstring CONTAINS 'MapGet' OR s.docstring CONTAINS 'MapPost'){} RETURN s.id, s.name, s.kind, s.file, s.docstring",
+        ns_clause
+    ))?;
     let mut prefix_cache: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
     let project_root = prism.root();
@@ -474,7 +494,10 @@ fn parse_route_from_docstring(doc: &str) -> (String, String) {
 pub fn sync_group_contracts(
     registry: &mut Registry,
     group_name: &str,
-    build_registry: impl Fn() -> Result<LanguageRegistry>,
+    // Kept for call-site compatibility — extract_contracts and the dependency
+    // scan below only run raw_query, never parse source, so an empty
+    // LanguageRegistry is used instead.
+    _build_registry: impl Fn() -> Result<LanguageRegistry>,
 ) -> Result<usize> {
     let group = registry
         .groups
@@ -506,11 +529,19 @@ pub fn sync_group_contracts(
             .context(format!("repo '{}' not in registry", repo_name))?
             .clone();
 
-        let lang_registry = build_registry()?;
-        let mut prism = Infigraph::open(&entry.path, lang_registry)?;
+        // extract_contracts (below) and the dependency scan after it only run
+        // raw_query against the already-built graph — never parse source — so an
+        // empty registry avoids rebuilding all 62 language packs per repo.
+        let mut prism = Infigraph::open(&entry.path, LanguageRegistry::new())?;
         prism.init()?;
 
-        let contracts = extract_contracts(&prism, repo_name)?;
+        // Same repo/org namespace `index_group` stamps onto `s.file` when writing
+        // to a shared Neo4j graph — index_group always namespaces by at least
+        // `repo_name` in remote mode, even with an empty org, so the discriminator
+        // here is "are we in remote/Neo4j mode", not "is org empty". Local (Kuzu)
+        // per-repo graphs store unprefixed paths — no scoping needed (or possible).
+        let namespace = remote_namespace(&group.org, repo_name);
+        let contracts = extract_contracts(&prism, repo_name, namespace.as_deref())?;
         all_contracts.extend(contracts);
 
         // Collect dependency names while graph is open
@@ -684,6 +715,11 @@ pub fn index_group(
         .unwrap_or(false);
 
     let org = group.org.clone();
+    // Build once and share across repos — bundled_registry() compiles ~62
+    // tree-sitter packs from scratch on every call, and LanguageRegistry
+    // can't be cheaply cloned (tree_sitter::Query isn't Clone), so a fresh
+    // build per repo is pure wasted time on `--full`/large-group runs.
+    let shared_registry = std::sync::Arc::new(build_registry()?);
     let index_one = |repo_name: &str, entry: &RepoEntry| -> Result<MemberOutcome> {
         // Take this member's own index operation lock before touching its
         // graph at all — mirrors the single-repo index path (core fns
@@ -723,8 +759,10 @@ pub fn index_group(
             }
         }
 
-        let lang_registry = build_registry()?;
-        let mut prism = Infigraph::open(&entry.path, lang_registry)?;
+        // Shared across all members — bundled_registry() compiles ~62 tree-sitter
+        // packs from scratch on every call; building it once up front (see
+        // `shared_registry` above) avoids doing that per repo on `--full`/large-group runs.
+        let mut prism = Infigraph::open_shared(&entry.path, shared_registry.clone())?;
         prism.init()?;
         if prism.backend().is_some() {
             let ns = if org.is_empty() {
@@ -843,6 +881,22 @@ pub fn qualified_group_name(org: &str, name: &str) -> String {
     } else {
         format!("{org}/{name}")
     }
+}
+
+/// Namespace prefix a repo's `s.file`/`s.id` values carry in the graph when
+/// running in remote (shared Neo4j) mode — `None` in local (Kuzu) mode, where
+/// per-repo graphs store unprefixed paths. Mirrors `index_group`'s own
+/// namespace formula exactly: remote mode always namespaces by at least
+/// `repo_name`, even with an empty org, so "is org empty" alone is NOT a
+/// valid signal for "is this graph namespaced".
+pub(crate) fn remote_namespace(org: &str, repo_name: &str) -> Option<String> {
+    let in_remote = std::env::var("INFIGRAPH_BACKEND")
+        .map(|v| v == "neo4j")
+        .unwrap_or(false);
+    if !in_remote {
+        return None;
+    }
+    Some(qualified_group_name(org, repo_name))
 }
 
 #[cfg(feature = "postgres")]

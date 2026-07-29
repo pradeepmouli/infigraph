@@ -155,7 +155,9 @@ fn find_infigraph_cli_for_reindex() -> Option<std::path::PathBuf> {
         }
     }
     // Check common install locations
-    let home = std::env::var("HOME").ok().map(std::path::PathBuf::from);
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(dirs_next::home_dir);
     if let Some(ref h) = home {
         let local_bin = h.join(".local").join("bin").join(bin_name);
         if local_bin.exists() {

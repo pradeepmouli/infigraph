@@ -27,7 +27,10 @@ pub struct CrossServiceDep {
 pub fn detect_cross_service_deps(
     registry: &Registry,
     group_name: &str,
-    build_registry: impl Fn() -> Result<LanguageRegistry>,
+    // Kept for call-site compatibility (callers pass `bundled_registry`) even though
+    // this function no longer calls it — every loop below only queries the graph via
+    // `raw_query`, never parses source, so an empty `LanguageRegistry` is used instead.
+    _build_registry: impl Fn() -> Result<LanguageRegistry>,
 ) -> Result<Vec<CrossServiceDep>> {
     let group = registry
         .groups
@@ -137,8 +140,10 @@ pub fn detect_cross_service_deps(
             None => continue,
         };
 
-        let lang_registry = build_registry()?;
-        let mut prism = Infigraph::open(&entry.path, lang_registry)?;
+        // Only queries the graph below (raw_query) — never parses source, so no
+        // language packs are needed. Building the real registry here cost ~850ms/repo
+        // (compiling all 62 tree-sitter packs) for zero benefit.
+        let mut prism = Infigraph::open(&entry.path, LanguageRegistry::new())?;
         prism.init()?;
 
         let backend = match prism.backend() {
@@ -146,9 +151,22 @@ pub fn detect_cross_service_deps(
             None => continue,
         };
 
+        // Scope this repo's raw Cypher scans to its own namespace when running
+        // against a shared (remote/Neo4j) graph — same org/repo stamp `index_group`
+        // writes onto `s.file`. Local (non-remote) mode means per-repo graphs
+        // already store unprefixed paths, so no scoping applies.
+        let ns = crate::multi::remote_namespace(&group.org, repo_name);
+        let ns_clause = ns
+            .as_ref()
+            .map(|n| format!(" AND s.file STARTS WITH '{}/'", crate::escape_str(n)))
+            .unwrap_or_default();
+
         // Find symbols with URL-like strings in docstrings or search source files
         let rows = backend.raw_query(
-            "MATCH (s:Symbol) WHERE s.docstring IS NOT NULL AND (s.docstring CONTAINS '/api/' OR s.docstring CONTAINS '/v1/' OR s.docstring CONTAINS '/v2/' OR s.docstring CONTAINS '/v3/' OR s.docstring CONTAINS 'http://' OR s.docstring CONTAINS 'https://') RETURN s.id, s.name, s.file, s.docstring",
+            &format!(
+                "MATCH (s:Symbol) WHERE s.docstring IS NOT NULL AND (s.docstring CONTAINS '/api/' OR s.docstring CONTAINS '/v1/' OR s.docstring CONTAINS '/v2/' OR s.docstring CONTAINS '/v3/' OR s.docstring CONTAINS 'http://' OR s.docstring CONTAINS 'https://'){} RETURN s.id, s.name, s.file, s.docstring",
+                ns_clause
+            ),
         ).unwrap_or_default();
 
         for row in &rows {
@@ -193,10 +211,18 @@ pub fn detect_cross_service_deps(
                 resolve_route(&normalized, consumer_method.as_deref(), repo_name)
             {
                 if target_svc != *repo_name {
-                    // Try to resolve line hint to enclosing symbol ID
+                    // Try to resolve line hint to enclosing symbol ID. `file` here is
+                    // repo-relative (from scan_source_for_urls), but s.file in a
+                    // namespaced (remote) graph is stored as `{ns}/{relative}` — prefix
+                    // the lookup value to match, or the query silently finds nothing
+                    // and falls back to a synthetic (non-graph) symbol id below.
                     let caller_id = if let Some(stripped) = symbol_hint.strip_prefix("line:") {
                         let line_num: i32 = stripped.parse().unwrap_or(0);
-                        let escaped_file = file.replace('\'', "\\'");
+                        let lookup_file = match &ns {
+                            Some(n) => format!("{}/{}", n, file),
+                            None => file.clone(),
+                        };
+                        let escaped_file = lookup_file.replace('\'', "\\'");
                         let q = format!(
                             "MATCH (s:Symbol) WHERE s.file = '{}' AND s.start_line <= {} AND s.end_line >= {} RETURN s.id ORDER BY (s.end_line - s.start_line) ASC LIMIT 1",
                             escaped_file, line_num, line_num
@@ -235,7 +261,11 @@ pub fn detect_cross_service_deps(
             }
             let caller_id = if let Some(stripped) = line_hint.strip_prefix("line:") {
                 let line_num: i32 = stripped.parse().unwrap_or(0);
-                let escaped_file = file.replace('\'', "\\'");
+                let lookup_file = match &ns {
+                    Some(n) => format!("{}/{}", n, file),
+                    None => file.clone(),
+                };
+                let escaped_file = lookup_file.replace('\'', "\\'");
                 let q = format!(
                     "MATCH (s:Symbol) WHERE s.file = '{}' AND s.start_line <= {} AND s.end_line >= {} RETURN s.id ORDER BY (s.end_line - s.start_line) ASC LIMIT 1",
                     escaped_file, line_num, line_num
@@ -278,16 +308,22 @@ pub fn detect_cross_service_deps(
                 Some(e) => e.clone(),
                 None => continue,
             };
+            let ns = crate::multi::remote_namespace(&group.org, repo_name);
             let spec_hits = scan_source_for_spec_fetches(&entry.path);
             for (file, symbol_hint, spec_path) in spec_hits {
-                // Resolve symbol from line hint
-                let lang_registry = build_registry()?;
+                // Resolve symbol from line hint. Only queries the graph below — no
+                // parsing needed, so an empty registry avoids rebuilding all 62
+                // language packs per spec-fetch match.
                 let caller_id = if let Some(stripped) = symbol_hint.strip_prefix("line:") {
                     let line_num: i32 = stripped.parse().unwrap_or(0);
-                    if let Ok(mut prism) = Infigraph::open(&entry.path, lang_registry) {
+                    if let Ok(mut prism) = Infigraph::open(&entry.path, LanguageRegistry::new()) {
                         if prism.init().is_ok() {
                             if let Some(backend) = prism.backend() {
-                                let escaped_file = file.replace('\'', "\\'");
+                                let lookup_file = match &ns {
+                                    Some(n) => format!("{}/{}", n, file),
+                                    None => file.clone(),
+                                };
+                                let escaped_file = lookup_file.replace('\'', "\\'");
                                 let q = format!(
                                     "MATCH (s:Symbol) WHERE s.file = '{}' AND s.start_line <= {} AND s.end_line >= {} RETURN s.id ORDER BY (s.end_line - s.start_line) ASC LIMIT 1",
                                     escaped_file, line_num, line_num
@@ -340,8 +376,8 @@ pub fn detect_cross_service_deps(
     if !pkg_name_to_service.is_empty() {
         for repo_name in &group.repos {
             if let Some(entry) = registry.repos.get(repo_name) {
-                let lang_reg = build_registry()?;
-                if let Ok(mut prism) = Infigraph::open(&entry.path, lang_reg) {
+                // Only queries the graph below — empty registry, no parsing needed.
+                if let Ok(mut prism) = Infigraph::open(&entry.path, LanguageRegistry::new()) {
                     if prism.init().is_ok() {
                         if let Some(backend) = prism.backend() {
                             if let Ok(member_deps) = crate::manifest::query_deps(backend) {
@@ -522,8 +558,8 @@ pub fn link_cross_service_calls(
             None => continue,
         };
 
-        let lang_registry = build_registry()?;
-        let mut prism = Infigraph::open(&entry.path, lang_registry)?;
+        // Only queries the graph below — empty registry, no parsing needed.
+        let mut prism = Infigraph::open(&entry.path, LanguageRegistry::new())?;
         prism.init()?;
 
         let backend = match prism.backend() {
@@ -613,8 +649,8 @@ pub fn link_cross_service_calls(
                 Some(e) => e,
                 None => continue,
             };
-            let lang_registry = build_registry()?;
-            let mut prism = Infigraph::open(&entry.path, lang_registry)?;
+            // Only queries the graph below — empty registry, no parsing needed.
+            let mut prism = Infigraph::open(&entry.path, LanguageRegistry::new())?;
             prism.init()?;
             let backend = match prism.backend() {
                 Some(b) => b,
@@ -1546,7 +1582,9 @@ fn extract_mcp_topic_from_url(url: &str) -> Option<String> {
 pub fn detect_shared_package_deps(
     registry: &Registry,
     group_name: &str,
-    build_registry: &impl Fn() -> Result<LanguageRegistry>,
+    // Kept for call-site compatibility — this function only queries the graph via
+    // `raw_query`, never parses source, so an empty `LanguageRegistry` is used instead.
+    _build_registry: &impl Fn() -> Result<LanguageRegistry>,
 ) -> Result<Vec<Contract>> {
     let group = registry
         .groups
@@ -1575,8 +1613,8 @@ pub fn detect_shared_package_deps(
             None => continue,
         };
 
-        let lang_registry = build_registry()?;
-        let mut prism = Infigraph::open(&entry.path, lang_registry)?;
+        // Only queries the graph below — empty registry, no parsing needed.
+        let mut prism = Infigraph::open(&entry.path, LanguageRegistry::new())?;
         prism.init()?;
 
         let backend = match prism.backend() {
