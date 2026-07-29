@@ -331,3 +331,53 @@ fn tool_watch_docs_respects_daemon_mode_toggle() {
 
     std::env::remove_var("INFIGRAPH_WATCH_DAEMON");
 }
+
+/// `tool_stop_watch_docs` must accept a `path` argument (today it only
+/// accepts `watcher_id`, which is meaningless in daemon mode since there is
+/// no in-process DOC_WATCHERS entry to look up) and, when the shared daemon
+/// is alive, write `.infigraph/watch.stop.docs`.
+#[test]
+fn stop_watch_docs_by_path_writes_sentinel_when_daemon_alive() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let ig = root.join(".infigraph");
+    std::fs::create_dir_all(&ig).unwrap();
+    infigraph_docs::DocIndex::open(&root)
+        .unwrap()
+        .init()
+        .unwrap();
+
+    // Simulate a live daemon: hold watch.lock for the duration of this test.
+    let lock_path = ig.join("watch.lock");
+    let _held = infigraph_core::lockfile::try_acquire(&lock_path, "cli-watch")
+        .unwrap()
+        .expect("free");
+
+    let args = serde_json::json!({ "path": root.to_string_lossy() });
+    let result = infigraph_mcp::tools::docs::tool_stop_watch_docs(&args).unwrap();
+
+    assert!(
+        result.to_lowercase().contains("stop"),
+        "expected a stop-signal message, got: {result}"
+    );
+    assert!(
+        ig.join("watch.stop.docs").exists(),
+        "must write the docs-specific stop sentinel while the shared daemon is alive"
+    );
+}
+
+#[test]
+fn stop_watch_docs_by_path_reports_no_watcher_when_lock_free() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(root.join(".infigraph")).unwrap();
+
+    let args = serde_json::json!({ "path": root.to_string_lossy() });
+    let result = infigraph_mcp::tools::docs::tool_stop_watch_docs(&args).unwrap();
+
+    assert!(
+        result.to_lowercase().contains("no"),
+        "expected a no-watcher message, got: {result}"
+    );
+    assert!(!root.join(".infigraph").join("watch.stop.docs").exists());
+}

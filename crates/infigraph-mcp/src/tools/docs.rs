@@ -640,21 +640,43 @@ pub fn tool_watch_docs(args: &Value) -> Result<String> {
 }
 
 pub fn tool_stop_watch_docs(args: &Value) -> Result<String> {
-    let watcher_id = args
-        .get("watcher_id")
-        .and_then(|v| v.as_str())
-        .context("missing 'watcher_id'")?;
-    let mut guard = DOC_WATCHERS.lock().unwrap();
-    if let Some(map) = guard.as_mut() {
-        if let Some(entry) = map.remove(watcher_id) {
-            let _ = entry.stop_tx.send(());
-            return Ok(format!(
-                "Document watcher {watcher_id} stopped (was watching: {}).",
-                entry.path
-            ));
+    if let Some(watcher_id) = args.get("watcher_id").and_then(|v| v.as_str()) {
+        let mut guard = DOC_WATCHERS.lock().unwrap();
+        if let Some(map) = guard.as_mut() {
+            if let Some(entry) = map.remove(watcher_id) {
+                let _ = entry.stop_tx.send(());
+                return Ok(format!(
+                    "Document watcher {watcher_id} stopped (was watching: {}).",
+                    entry.path
+                ));
+            }
         }
+        return Ok(format!("No active document watcher with ID {watcher_id}"));
     }
-    Ok(format!("No active document watcher with ID {watcher_id}"))
+
+    if let Some(path) = args.get("path").and_then(|v| v.as_str()) {
+        let root = PathBuf::from(path).canonicalize().context("invalid path")?;
+        let root_str = root.to_string_lossy().replace('\\', "/");
+        let lock_path = root.join(".infigraph").join("watch.lock");
+        if !lock_path.exists() {
+            return Ok("No watcher running.".to_string());
+        }
+        let alive = infigraph_core::lockfile::try_acquire(&lock_path, "watch-liveness-probe")
+            .ok()
+            .flatten()
+            .is_none();
+        if !alive {
+            return Ok("No watcher running.".to_string());
+        }
+        let sentinel = root.join(".infigraph").join("watch.stop.docs");
+        std::fs::write(&sentinel, b"")?;
+        return Ok(format!(
+            "Stop signal sent for the doc watcher on {root_str}. It will detach within ~1 second \
+             (the code watcher, if any, is unaffected)."
+        ));
+    }
+
+    anyhow::bail!("missing 'watcher_id' or 'path'")
 }
 
 pub fn tool_index_manifests(args: &Value) -> Result<String> {
