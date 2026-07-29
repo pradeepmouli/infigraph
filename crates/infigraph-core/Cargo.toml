@@ -72,4 +72,5 @@ optional = true
 [dev-dependencies]
 tree-sitter-python = "0.25"
 tree-sitter-kotlin-ng = "1.1"
+tree-sitter-dart = "0.2"
 cargo-husky = { version = "1", default-features = false, features = ["user-hooks"] }
