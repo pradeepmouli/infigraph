@@ -265,3 +265,69 @@ fn stop_watch_by_path_ignores_stale_payload_without_live_flock() {
         "stop sentinel must not be written for a dead watcher with a stale payload"
     );
 }
+
+/// `auto_start_doc_watch` (the doc-side opportunistic auto-start, mirroring
+/// `auto_start_watch`'s existing daemon-mode test above) must ALSO route
+/// through the shared daemon primitive when the toggle is on, instead of
+/// its current unconditional in-process-thread behavior.
+#[test]
+fn auto_start_doc_watch_respects_daemon_mode_toggle() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    std::env::set_var("INFIGRAPH_WATCH_DAEMON", "1");
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(root.join(".infigraph")).unwrap();
+    infigraph_docs::DocIndex::open(&root)
+        .unwrap()
+        .init()
+        .unwrap();
+    let path = root.to_string_lossy().to_string();
+
+    let result = infigraph_mcp::tools::docs::auto_start_doc_watch(&path);
+
+    assert!(
+        !infigraph_mcp::tools::docs::is_doc_watching(&path.replace('\\', "/")),
+        "daemon mode must never populate the in-process DOC_WATCHERS map"
+    );
+
+    if let Some(msg) = result {
+        assert!(
+            msg.contains("Daemon watcher"),
+            "unexpected auto_start_doc_watch outcome under daemon mode: {msg}"
+        );
+    }
+
+    std::env::remove_var("INFIGRAPH_WATCH_DAEMON");
+}
+
+/// `tool_watch_docs` (the explicit MCP tool) must also respect the daemon
+/// toggle -- mirrors `tool_watch_project_respects_daemon_mode_toggle` above.
+#[test]
+fn tool_watch_docs_respects_daemon_mode_toggle() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    std::env::set_var("INFIGRAPH_WATCH_DAEMON", "1");
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(root.join(".infigraph")).unwrap();
+    infigraph_docs::DocIndex::open(&root)
+        .unwrap()
+        .init()
+        .unwrap();
+    let path = root.to_string_lossy().to_string();
+
+    let args = serde_json::json!({ "path": path });
+    let result = infigraph_mcp::tools::docs::tool_watch_docs(&args);
+
+    assert!(!infigraph_mcp::tools::docs::is_doc_watching(
+        &path.replace('\\', "/")
+    ));
+
+    if let Ok(msg) = &result {
+        assert!(
+            msg.contains("Daemon watcher"),
+            "unexpected tool_watch_docs outcome under daemon mode: {msg}"
+        );
+    }
+
+    std::env::remove_var("INFIGRAPH_WATCH_DAEMON");
+}

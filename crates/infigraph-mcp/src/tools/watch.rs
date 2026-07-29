@@ -151,7 +151,7 @@ fn auto_start_watch_inner(path: &str, skip_disabled_check: bool) -> Option<Strin
 /// between them — each caller still formats its own message/log from the
 /// returned outcome, since a silent auto-start and an explicit tool call
 /// want different things reported.
-fn ensure_daemon_watcher(
+pub(crate) fn ensure_daemon_watcher(
     root: &std::path::Path,
 ) -> Result<infigraph_core::watch::daemon::DaemonStartOutcome> {
     let mcp_exe = std::env::current_exe().context("could not resolve current executable")?;
