@@ -79,6 +79,24 @@ fn auto_start_doc_watch_inner(path: &str, skip_disabled_check: bool) -> Option<S
         return None;
     }
 
+    if infigraph_core::watch::daemon::watch_daemon_mode_enabled() {
+        return match super::watch::ensure_daemon_watcher(&root) {
+            Ok(infigraph_core::watch::daemon::DaemonStartOutcome::Spawned) => {
+                eprintln!("[auto-watch] Started daemon watcher for {root_str}");
+                Some(format!("Daemon watcher started for {root_str}"))
+            }
+            Ok(infigraph_core::watch::daemon::DaemonStartOutcome::AlreadyRunning) => None,
+            Ok(infigraph_core::watch::daemon::DaemonStartOutcome::Failed(e)) => {
+                eprintln!("[auto-watch] Failed to start daemon watcher: {e}");
+                None
+            }
+            Err(e) => {
+                eprintln!("[auto-watch] could not locate infigraph CLI binary: {e}");
+                None
+            }
+        };
+    }
+
     let args = serde_json::json!({
         "path": path,
         "debounce_ms": 500
@@ -544,7 +562,6 @@ pub fn tool_watch_docs(args: &Value) -> Result<String> {
                 .to_string(),
         );
     }
-    init_doc_watchers();
 
     let path = args
         .get("path")
@@ -558,14 +575,32 @@ pub fn tool_watch_docs(args: &Value) -> Result<String> {
     let root = PathBuf::from(path).canonicalize().context("invalid path")?;
     let root_str = root.to_string_lossy().replace('\\', "/");
 
+    if super::watch::watchers_disabled() {
+        return Ok(format!(
+            "Not starting a doc watcher for {root_str}: this MCP instance is not primary \
+             (another instance holds mcp.lock and owns watchers for this machine). \
+             Use get_watch_status to check the active watcher."
+        ));
+    }
+
+    if infigraph_core::watch::daemon::watch_daemon_mode_enabled() {
+        return match super::watch::ensure_daemon_watcher(&root)? {
+            infigraph_core::watch::daemon::DaemonStartOutcome::Spawned => {
+                Ok(format!("Daemon watcher started for {root_str}"))
+            }
+            infigraph_core::watch::daemon::DaemonStartOutcome::AlreadyRunning => {
+                Ok(format!("Daemon watcher already running for {root_str}"))
+            }
+            infigraph_core::watch::daemon::DaemonStartOutcome::Failed(e) => {
+                Err(anyhow::anyhow!("Failed to start daemon watcher: {e}"))
+            }
+        };
+    }
+
+    init_doc_watchers();
+
     let (stop_tx, stop_rx) = mpsc::channel::<()>();
-    let watcher_id = format!(
-        "docwatch-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis()
-    );
+    let watcher_id = super::watch::generate_watcher_id("docwatch");
 
     {
         let mut guard = DOC_WATCHERS.lock().unwrap();
@@ -599,21 +634,43 @@ pub fn tool_watch_docs(args: &Value) -> Result<String> {
 }
 
 pub fn tool_stop_watch_docs(args: &Value) -> Result<String> {
-    let watcher_id = args
-        .get("watcher_id")
-        .and_then(|v| v.as_str())
-        .context("missing 'watcher_id'")?;
-    let mut guard = DOC_WATCHERS.lock().unwrap();
-    if let Some(map) = guard.as_mut() {
-        if let Some(entry) = map.remove(watcher_id) {
-            let _ = entry.stop_tx.send(());
-            return Ok(format!(
-                "Document watcher {watcher_id} stopped (was watching: {}).",
-                entry.path
-            ));
+    if let Some(watcher_id) = args.get("watcher_id").and_then(|v| v.as_str()) {
+        let mut guard = DOC_WATCHERS.lock().unwrap();
+        if let Some(map) = guard.as_mut() {
+            if let Some(entry) = map.remove(watcher_id) {
+                let _ = entry.stop_tx.send(());
+                return Ok(format!(
+                    "Document watcher {watcher_id} stopped (was watching: {}).",
+                    entry.path
+                ));
+            }
         }
+        return Ok(format!("No active document watcher with ID {watcher_id}"));
     }
-    Ok(format!("No active document watcher with ID {watcher_id}"))
+
+    if let Some(path) = args.get("path").and_then(|v| v.as_str()) {
+        let root = PathBuf::from(path).canonicalize().context("invalid path")?;
+        let root_str = root.to_string_lossy().replace('\\', "/");
+        let lock_path = root.join(".infigraph").join("watch.lock");
+        if !lock_path.exists() {
+            return Ok("No watcher running.".to_string());
+        }
+        let alive = infigraph_core::lockfile::try_acquire(&lock_path, "watch-liveness-probe")
+            .ok()
+            .flatten()
+            .is_none();
+        if !alive {
+            return Ok("No watcher running.".to_string());
+        }
+        let sentinel = root.join(".infigraph").join("watch.stop.docs");
+        std::fs::write(&sentinel, b"")?;
+        return Ok(format!(
+            "Stop signal sent for the doc watcher on {root_str}. It will detach within ~1 second \
+             (the code watcher, if any, is unaffected)."
+        ));
+    }
+
+    anyhow::bail!("missing 'watcher_id' or 'path'")
 }
 
 pub fn tool_index_manifests(args: &Value) -> Result<String> {

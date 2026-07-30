@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 
 use anyhow::{Context, Result};
@@ -16,6 +16,27 @@ pub fn disable_watchers() {
 
 pub fn watchers_disabled() -> bool {
     WATCHERS_DISABLED.load(Ordering::Relaxed)
+}
+
+/// Monotonic tie-breaker for `generate_watcher_id`. A millisecond timestamp
+/// alone collides whenever two watchers start in the same millisecond --
+/// routine when e.g. `tool_index_project` fires back-to-back for multiple
+/// repos in a tight loop -- and a collision silently overwrites the earlier
+/// watcher's map entry, dropping its `stop_tx` and leaking that watcher
+/// (never reachable by ID again, so `stop_all_watchers`-style cleanup can
+/// never signal it).
+static WATCHER_ID_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Build a collision-proof watcher ID: `{prefix}-{millis}-{seq}`. Shared by
+/// code watchers (`tool_watch_project`) and doc watchers (`tool_watch_docs`)
+/// so both get the same uniqueness guarantee from one place.
+pub(crate) fn generate_watcher_id(prefix: &str) -> String {
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let seq = WATCHER_ID_SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("{prefix}-{millis}-{seq}")
 }
 
 fn watch_log(level: &str, msg: &str) {
@@ -152,7 +173,7 @@ fn auto_start_watch_inner(path: &str, skip_disabled_check: bool) -> Option<Strin
 /// between them — each caller still formats its own message/log from the
 /// returned outcome, since a silent auto-start and an explicit tool call
 /// want different things reported.
-fn ensure_daemon_watcher(
+pub(crate) fn ensure_daemon_watcher(
     root: &std::path::Path,
 ) -> Result<infigraph_core::watch::daemon::DaemonStartOutcome> {
     let mcp_exe = std::env::current_exe().context("could not resolve current executable")?;
@@ -260,13 +281,7 @@ pub fn tool_watch_project(args: &Value) -> Result<String> {
     })?;
 
     let (stop_tx, stop_rx) = mpsc::channel::<()>();
-    let watcher_id = format!(
-        "watch-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis()
-    );
+    let watcher_id = generate_watcher_id("watch");
 
     let pending_reindex: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let pending_clone = Arc::clone(&pending_reindex);
@@ -503,4 +518,31 @@ pub fn tool_get_watch_status(args: &Value) -> Result<String> {
     }
 
     Ok(format!("{total} watcher(s) running:\n{out}"))
+}
+
+#[cfg(test)]
+mod watcher_id_tests {
+    use super::*;
+
+    #[test]
+    fn generate_watcher_id_is_unique_within_the_same_millisecond() {
+        // Regression test: two watchers starting back-to-back (e.g.
+        // tool_index_project firing for two repos in a tight loop) used to
+        // get the identical ID when both calls landed in the same
+        // millisecond, silently overwriting one watcher's map entry and
+        // leaking it (unreachable for stop/cleanup by ID ever again).
+        let ids: Vec<String> = (0..500).map(|_| generate_watcher_id("watch")).collect();
+        let unique: std::collections::HashSet<&String> = ids.iter().collect();
+        assert_eq!(
+            unique.len(),
+            ids.len(),
+            "generate_watcher_id produced a duplicate within a tight loop"
+        );
+    }
+
+    #[test]
+    fn generate_watcher_id_uses_the_given_prefix() {
+        assert!(generate_watcher_id("docwatch").starts_with("docwatch-"));
+        assert!(generate_watcher_id("watch").starts_with("watch-"));
+    }
 }
