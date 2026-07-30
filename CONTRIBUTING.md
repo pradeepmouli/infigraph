@@ -6,6 +6,10 @@ Thank you for your interest in contributing!
 
 If you're using Claude Code, see [`CLAUDE.md`](CLAUDE.md) — architecture, build/test commands, and cross-cutting invariants, plus deeper guides under `.claude/skills/` (`code-indexing-pipeline`, `analysis-subsystems`, `review-pr-against-issue`). Cursor users get the same content via `.cursor/rules/*.mdc`, auto-loaded per file.
 
+## Working from this fork
+
+If you're contributing from `pradeepmouli/infigraph` specifically, see [`FORK_CONTRIBUTING.md`](FORK_CONTRIBUTING.md) for branch topology and how a fix makes its way upstream.
+
 ## Prerequisites
 
 - Rust stable (via [rustup](https://rustup.rs/))
