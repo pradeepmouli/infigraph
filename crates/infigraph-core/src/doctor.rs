@@ -103,7 +103,7 @@ pub struct DoctorContext {
 /// `~/.infigraph/scan_roots.txt` (one path per line). Empty if neither is
 /// configured -- callers must treat that as "not configured," not "no
 /// projects found."
-pub fn scan_roots_from_env() -> Vec<PathBuf> {
+pub(crate) fn scan_roots_from_env() -> Vec<PathBuf> {
     if let Ok(val) = std::env::var("INFIGRAPH_SCAN_ROOTS") {
         return val
             .split(':')
