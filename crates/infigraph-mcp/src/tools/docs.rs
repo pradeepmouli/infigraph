@@ -600,13 +600,7 @@ pub fn tool_watch_docs(args: &Value) -> Result<String> {
     init_doc_watchers();
 
     let (stop_tx, stop_rx) = mpsc::channel::<()>();
-    let watcher_id = format!(
-        "docwatch-{}",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis()
-    );
+    let watcher_id = super::watch::generate_watcher_id("docwatch");
 
     {
         let mut guard = DOC_WATCHERS.lock().unwrap();
