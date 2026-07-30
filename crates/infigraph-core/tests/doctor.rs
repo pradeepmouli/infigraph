@@ -2,8 +2,10 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use infigraph_core::doctor::{
-    check_registry, find_repo_entry, projects_in_scope, CheckStatus, DoctorContext, DoctorScope,
+    check_locks, check_registry, find_repo_entry, projects_in_scope, CheckStatus, DoctorContext,
+    DoctorScope,
 };
+use infigraph_core::lockfile::LockInfo;
 use infigraph_core::multi::{Registry, RepoEntry};
 
 fn repo_entry(name: &str, path: &str) -> RepoEntry {
@@ -210,4 +212,126 @@ fn projects_in_scope_global_returns_all_registered_repos() {
     assert_eq!(paths.len(), 2);
     assert!(paths.contains(&proj1));
     assert!(paths.contains(&proj2));
+}
+
+fn write_lock_file(path: &std::path::Path, info: &LockInfo) {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, serde_json::to_string(info).unwrap()).unwrap();
+}
+
+#[test]
+fn check_locks_passes_for_live_holder_matching_build_hash() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let project = dir.path().join("myproj");
+    std::fs::create_dir_all(&project).unwrap();
+    let lock_path = project.join(".infigraph").join("graph.lock");
+    write_lock_file(
+        &lock_path,
+        &LockInfo {
+            pid: std::process::id(), // our own PID -- guaranteed alive
+            role: "graph-write".to_string(),
+            build_hash: "matching-hash".to_string(),
+            acquired_at: 1000,
+            last_heartbeat: 1000,
+        },
+    );
+    let registry = infigraph_core::multi::Registry::default();
+    let ctx = DoctorContext {
+        registry,
+        scope: DoctorScope::Project(project.clone()),
+        installed_build_hash: "matching-hash".to_string(),
+        disk_free_bytes: None,
+        scan_roots: Vec::new(),
+    };
+
+    let results = check_locks(&ctx);
+    let graph_lock = results
+        .iter()
+        .find(|r| r.name.contains("graph.lock"))
+        .expect("must check graph.lock");
+    assert_eq!(graph_lock.status, CheckStatus::Pass);
+}
+
+#[test]
+fn check_locks_warns_on_build_hash_mismatch() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let project = dir.path().join("myproj");
+    std::fs::create_dir_all(&project).unwrap();
+    let lock_path = project.join(".infigraph").join("graph.lock");
+    write_lock_file(
+        &lock_path,
+        &LockInfo {
+            pid: std::process::id(),
+            role: "graph-write".to_string(),
+            build_hash: "old-hash".to_string(),
+            acquired_at: 1000,
+            last_heartbeat: 1000,
+        },
+    );
+    let ctx = DoctorContext {
+        registry: infigraph_core::multi::Registry::default(),
+        scope: DoctorScope::Project(project.clone()),
+        installed_build_hash: "new-hash".to_string(),
+        disk_free_bytes: None,
+        scan_roots: Vec::new(),
+    };
+
+    let results = check_locks(&ctx);
+    let graph_lock = results
+        .iter()
+        .find(|r| r.name.contains("graph.lock"))
+        .expect("must check graph.lock");
+    assert_eq!(graph_lock.status, CheckStatus::Warn);
+    assert!(
+        graph_lock.message.contains("build"),
+        "message should mention build hash mismatch: {}",
+        graph_lock.message
+    );
+}
+
+#[test]
+fn check_locks_warns_on_stale_zero_byte_lock() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let project = dir.path().join("myproj");
+    std::fs::create_dir_all(project.join(".infigraph")).unwrap();
+    let lock_path = project.join(".infigraph").join("watch.lock");
+    std::fs::write(&lock_path, b"").unwrap(); // zero-byte, no holder payload
+
+    let ctx = DoctorContext {
+        registry: infigraph_core::multi::Registry::default(),
+        scope: DoctorScope::Project(project.clone()),
+        installed_build_hash: "any-hash".to_string(),
+        disk_free_bytes: None,
+        scan_roots: Vec::new(),
+    };
+
+    let results = check_locks(&ctx);
+    let watch_lock = results
+        .iter()
+        .find(|r| r.name.contains("watch.lock"))
+        .expect("must check watch.lock even when zero-byte");
+    assert_eq!(watch_lock.status, CheckStatus::Warn);
+}
+
+#[test]
+fn check_locks_passes_when_lock_file_absent() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let project = dir.path().join("myproj");
+    std::fs::create_dir_all(&project).unwrap();
+    // no .infigraph dir at all -- absent lock is not itself a problem
+
+    let ctx = DoctorContext {
+        registry: infigraph_core::multi::Registry::default(),
+        scope: DoctorScope::Project(project.clone()),
+        installed_build_hash: "any-hash".to_string(),
+        disk_free_bytes: None,
+        scan_roots: Vec::new(),
+    };
+
+    let results = check_locks(&ctx);
+    let graph_lock = results
+        .iter()
+        .find(|r| r.name.contains("graph.lock"))
+        .expect("must still report a result for an absent lock file");
+    assert_eq!(graph_lock.status, CheckStatus::Pass);
 }

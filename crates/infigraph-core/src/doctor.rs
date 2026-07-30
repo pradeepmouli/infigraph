@@ -288,3 +288,77 @@ fn check_unregistered_projects(ctx: &DoctorContext) -> CheckResult {
         )
     }
 }
+
+use crate::lockfile;
+
+fn is_pid_alive(pid: u32) -> bool {
+    crate::instances::current_process_start_time(pid).is_some()
+}
+
+fn check_one_lock(project_path: &Path, lock_name: &str, installed_build_hash: &str) -> CheckResult {
+    let lock_path = project_path.join(".infigraph").join(lock_name);
+    let label = format!("{}: {}", project_path.display(), lock_name);
+
+    if !lock_path.exists() {
+        return CheckResult::pass(CATEGORY, label, "no lock file present");
+    }
+
+    let Some(holder) = lockfile::read_holder(&lock_path) else {
+        // Empty file with no readable payload: either cleanly released (normal)
+        // or a stale remnant from a crashed holder that never re-acquired.
+        // We can't distinguish those from the payload alone -- surface it as a
+        // WARN so a human/doctor-caller can check whether it's actually stuck.
+        return CheckResult::warn(
+            CATEGORY,
+            label,
+            "lock file exists but has no readable holder identity (empty or unparseable)",
+            "if no infigraph process is running for this project, delete the lock file",
+        );
+    };
+
+    if !is_pid_alive(holder.pid) {
+        return CheckResult::warn(
+            CATEGORY,
+            label,
+            format!("holder PID {} is not running (stale lock)", holder.pid),
+            "safe to delete -- the recorded holder process is gone",
+        );
+    }
+
+    if holder.build_hash != installed_build_hash {
+        return CheckResult::warn(
+            CATEGORY,
+            label,
+            format!(
+                "holder (PID {}) is running build {}, installed binary is {}",
+                holder.pid, holder.build_hash, installed_build_hash
+            ),
+            "the running process predates the currently installed binary; restart it to pick up the new build",
+        );
+    }
+
+    CheckResult::pass(
+        CATEGORY,
+        label,
+        format!("held by live PID {} on the installed build", holder.pid),
+    )
+}
+
+pub fn check_locks(ctx: &DoctorContext) -> Vec<CheckResult> {
+    let projects = projects_in_scope(ctx);
+
+    let mut results = Vec::new();
+    for project in &projects {
+        results.push(check_one_lock(
+            project,
+            "graph.lock",
+            &ctx.installed_build_hash,
+        ));
+        results.push(check_one_lock(
+            project,
+            "watch.lock",
+            &ctx.installed_build_hash,
+        ));
+    }
+    results
+}
