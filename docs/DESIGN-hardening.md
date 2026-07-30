@@ -1,0 +1,272 @@
+# DESIGN — Infigraph Hardening
+
+**Status:** Draft — implementation underway; see "Implementation Status" below
+**Date:** 2026-07-20
+**Updated:** 2026-07-30
+**Scope:** Process lifecycle, data integrity, error handling, reliability, observability, scalability, deployment/upgrade
+
+---
+
+## Implementation Status (as of 2026-07-30)
+
+Requirement text in §2–§8 is unchanged from the 2026-07-20 draft; where reality has since moved, this section is authoritative. All "shipped" claims below were verified against the tree on `feat/health-beacons`, not inferred.
+
+### Shipped
+
+| Requirement | Evidence |
+|---|---|
+| R2.2.1–3 — instance registry + orphan reaping (PR7a) | `crates/infigraph-core/src/instances.rs`: `InstanceInfo` with PID-reuse guard (OS start-time match), `register_instance`, `reap_orphans_once`, `list_instances` |
+| R2.3.1–5 — `mcp.lock` identity, heartbeat, wedged-holder detection, build-hash takeover (PR7b) | `crates/infigraph-mcp/src/mcp_lock.rs`: `LockInfo`, `acquire_with_takeover`, heartbeat thread + `takeover_poll_interval`, wedged detection (stale heartbeat is surfaced loudly but never grants primary by itself — only a real flock win does) |
+| R2.1.1 — per-graph write lock | `infigraph_core::lockfile` + `graph.lock`, acquired by write and wipe paths (e.g. `Infigraph::wipe_graph` takes it before any destructive action; refuses if a live holder exists); tests in `crates/infigraph-core/tests/write_lock*.rs`. **Note:** §2.3's "writer.lock does not exist in any form" snapshot predates this landing. |
+| R3.1.1 — lock contention is never corruption | `Infigraph::init()` (`crates/infigraph-core/src/lib.rs`): `is_lock_contention_error()` distinguishes Kuzu's "Could not set lock on file" (another live process — e.g. a running `infigraph watch` — has the DB open) from corruption, and returns a clear busy error instead of wiping. Closes a real data-loss bug: a second `infigraph` command concurrent with a live watcher used to destroy the watcher's data. |
+| R3.1.1 — retry-with-backoff before a corruption verdict | Same file: a non-lock-contention open failure is retried 3× with backoff (`OPEN_RETRY_BACKOFF_MS` = 200/500/1000 ms) before the graph is declared corrupt. Closes a second data-loss bug (I-17): a transient short-read from a concurrent writer mid-checkpoint used to be wiped with zero retry. |
+| R3.1.2 — quarantine, don't delete (part of PR9) | `crates/infigraph-core/src/quarantine.rs`: `quarantine_graph`, `QUARANTINE_RETENTION` = 2, `move_wal_sibling`; wired into `Infigraph::init()`/`wipe_graph` — corrupt graph dirs move to `graph.corrupt.<timestamp>`, preserving the exact corrupt bytes for postmortem |
+| R3.3.1 — atomic sidecar writes (PR4 Task 1) | `embed::save_embeddings` uses temp-file + rename |
+| R3.3.2 — sidecar format header/checksum (PR9 Task 2) | Shipped |
+| R7.2 — disk preflight (**partial**) | `store_util::check_disk_headroom()` (via `fs2`): requires free space ≥ max(3× projected write, 200 MB) before writing. **Caveat:** wired into `import_scip_index` ONLY — the other three graph write paths (full reindex, incremental/watch, resolve) have no preflight yet. Open follow-up under R7.2. |
+
+### In progress
+
+- **R6.4 `infigraph doctor`** — brainstorming started; checks under consideration: `verify`, instance-registry scan, lock status, disk usage per project, sidecar freshness, hook installation/version checks, toolchain/codesign validity. The invocation surface (CLI-only vs. CLI+MCP) is an **open question, not yet decided**. No design doc has been written or committed yet. Directly motivated by I-19 below — `doctor` productizes exactly that manual audit (registry-vs-filesystem diff, watch/graph lock freshness + build-hash checks, orphaned-process detection) as a repeatable PASS/WARN/FAIL command with remediation per check.
+
+### Not started
+
+- CLI subcommands `doctor` / `verify` / `ps` / `kill` / `gc` / `restore` (R6.4, R3.4.1, R2.2.4, R7.1, R3.2.2) — none exist in any `Commands` enum across the workspace.
+- R6.1 structured `tracing` JSON logging — zero `tracing::` call sites; logging is still ad-hoc `eprintln!`/`mcp_log`/`watch_log`.
+- R8.4 pinned toolchain — `rust-toolchain.toml` absent (verified).
+- R3.2.1/R3.2.2 pre-write snapshots + `infigraph restore` — absent.
+- R3.3.3 graph generation IDs — absent.
+- R4.1 full error taxonomy — only `lockfile::Busy` exists as a structured variant; the rest is stringly-typed `anyhow` errors.
+- Most of §5 Reliability (R5.1, R5.2, R5.5, R5.6) — absent.
+
+### Other hardening work landed since the 2026-07-20 draft (fixes for I-16–I-19)
+
+- **`scip_sym_to_name` fixes** (`crates/infigraph-core/src/scip/mod.rs`) — two parsing bugs root-caused from I-16: double-quote-quoted descriptors with disambiguator digits, and chained non-empty `(...)` disambiguator groups after empty method parens.
+- **Bad-record-drop-and-retry heuristic** (`crates/infigraph-core/src/graph/store_util.rs`) — `extract_bad_copy_value` / `copy_edges_with_bad_record_retry`: on a Kuzu bulk-COPY failure, parses the offending value out of the error text, drops just that record, retries (bounded 20 attempts) before falling back to the slow per-row path. Applied to Symbol node COPY and both CALLS/INHERITS edge COPY paths.
+- **INHERITS extraction fixes across nine languages** (I-18) — TypeScript, Rust, Go, Kotlin, Swift, Dart, Objective-C, Python, and Java `relations.scm` queries now use wildcard `(_)` node patterns that capture generic and qualified/dotted base types (`Shape<T>`, `pkg.Animal`, `React.Component`) the original narrow `type_identifier`-only patterns silently missed. Unblinds `patterns/mod.rs` Strategy/Decorator detection, which relies on INHERITS edges as its core structural signal.
+- **`groups_watch_perf` race hardening** (`crates/infigraph-mcp/tests/groups_watch_perf.rs`) — the `group_index` assertion no longer races auto-watch ("Indexed 0 repos").
+- **Enforcement-hook structured decisions** (`crates/infigraph-cli/src/hooks.rs`) — a `deny()` helper emits proper PreToolUse JSON (`hookSpecificOutput.permissionDecision: "deny"` with a reason) on stdout with exit 0, replacing the old raw `echo >&2; exit 2` pattern. Advances the I-9/R4.2.3 hook-quality track.
+
+### Branch/repo topology (process note, §8-adjacent)
+
+- A persistent `feat/hardening` branch now exists (created from `feat/health-beacons`), intended as the ongoing build/local-install branch. Existing `feat/` branches continue as separate parallel work streams.
+- `origin/main` was reset to exactly track `upstream/main` (it had diverged by 11 commits). All 11 were individually verified (cherry-pick + diff-against-parent + compare-to-current-code) as superseded by later, more complete fixes on `feat/health-beacons` — nothing was lost.
+
+---
+
+## 1. Motivation — Incident Catalog
+
+Every requirement in this spec traces back to a real failure observed in daily use during July 2026. This is not speculative hardening.
+
+| # | Incident | Root Cause | Class |
+|---|----------|-----------|-------|
+| I-1 | macOS FD exhaustion after hours of MCP uptime | kqueue watcher backend leaked one FD per watched file, never released on rewatch | Resource leak |
+| I-2 | Multiple watchers on the same project, duplicate reindex storms | No dedup guard when `watch_project` + auto-watch both fired | Process lifecycle |
+| I-3 | **Graph wiped 3× under lock contention** | `init()` treated *any* Kuzu open failure — including "database is locked by another process" — as corruption and deleted + recreated the graph | Data loss |
+| I-4 | Kuzu corruption from concurrent CLI + MCP writes | Single-writer invariant exists by convention only; nothing enforces it | Data loss |
+| I-5 | 7 orphaned `infigraph-mcp` processes found running simultaneously | No instance detection, no PID tracking, no orphan reaping; agent hosts spawn MCP servers and abandon them | Process lifecycle |
+| I-6 | Local `infigraph index` failed trying to reach Postgres (v3.0.0) | `backend()` refactor silently changed backend selection; local mode attempted remote path | Config/error handling |
+| I-7 | Disk full: 38 GB `target/`, 8.3 GB stale registry entries (69 projects, 6 live) | No disk accounting, no registry GC, no artifact quota | Resource exhaustion |
+| I-8 | SCIP enrichment silently produced wrong results | Child process invoked with flag instead of positional arg; exit status not validated against output | Silent failure |
+| I-9 | Enforcement hook blocks legitimate `Read` of markdown/config files; blocks `grep` filtering non-code stdout | Over-broad indexable-file check; fixes revert on reinstall because installed binary ≠ local clone | Deployment drift |
+| I-10 | `cp` of rebuilt binary broke macOS code-signing; MCP silently failed to launch | Install path doesn't preserve/reapply signature | Deployment |
+| I-11 | CI green→red with no code change | Unpinned Rust toolchain; clippy/fmt drift across 1.9x releases | Deployment/CI |
+| I-12 | All sessions served by a 20-hour orphaned worker running a stale binary; fresh workers exit on `mcp.lock`; reinstalled fixes never take effect | Worker-singleton dedup has no lifecycle: lock file is empty (no PID/start-time/version), so live-peer vs. orphan vs. stale-version is undecidable and takeover never happens | Process lifecycle / deployment drift |
+| I-13 | `search` on one project hangs forever (>120s, every attempt); diagnosed as worker SIGSEGV in lbug column scan (`BufferManager::optimisticRead`→`memmove`) on a corrupt/`version-skewed graph file | Supervisor respawns the worker transparently but the crashed worker's in-flight JSON-RPC request is never answered — no error, no timeout, client blocks forever; crash is invisible unless you read `~/.infigraph/mcp.log` | Error propagation / silent failure |
+| I-14 | Every worker SIGSEGV wipes (`wipe_code_and_docs`) and reindexes **all registered projects + groups** — while the actually-corrupt project (unregistered) is never repaired, so the crash loops indefinitely; each cycle also spawns another watcher | Crash recovery is global and destructive instead of scoped to the faulting project; recovery scope is keyed on registry membership, not on the database that crashed | Data loss / destructive recovery |
+| I-15 | Killing a stale worker to force takeover (post-upgrade) also killed its parent front-end — the live MCP connection an agent session depended on | The front-end's supervisor loop (`main.rs`) only auto-respawns the worker child on a *detected SIGSEGV*; any other exit (including a deliberate, clean SIGTERM for legitimate takeover) falls through to `std::process::exit`, taking the front-end down with it | Process lifecycle |
+| I-16 | SCIP enrichment on the `sittir` project produced 43 GB of graph bloat and crashed | Two `scip_sym_to_name` parsing bugs (double-quote-quoted descriptors with disambiguator digits; chained non-empty `(...)` disambiguator groups after empty method parens) resolved symbol names wrongly or empty → duplicate-PK COPY failures → runaway graph growth via the slow per-row UNWIND fallback path | Silent failure / resource exhaustion |
+| I-17 | A transient short-read while a concurrent writer (large SCIP import) was mid-checkpoint got a healthy graph wiped as "corrupt" | `init()` had zero retry: any non-lock-contention open failure produced an immediate corruption verdict, even though the file became readable again moments later | Data loss |
+| I-18 | Strategy/Decorator pattern detection effectively blind for most supported languages | `relations.scm` INHERITS queries matched only bare `type_identifier` base types — generic (`Shape<T>`) and qualified/dotted (`pkg.Animal`, `React.Component`) bases silently produced no INHERITS edges across TS/Rust/Go/Kotlin/Swift/Dart/ObjC/Python/Java | Silent failure |
+| I-19 | Machine-wide health audit found: a project (`rune-langium`) indexed on disk but unregistered in the instance registry; a stale/frozen watcher; several leaked test-fixture watchers; an orphaned duplicate watcher — all diagnosed and cleaned up by hand via `lsof`, lock-file contents, and `ps aux` | No repeatable health check exists; registry and filesystem drift with no signal. This is the concrete motivation for R6.4 `infigraph doctor` (see Implementation Status) | Process lifecycle / observability |
+
+**Themes:** (a) destructive recovery paths that turn transient errors into permanent data loss; (b) unmanaged process lifecycle; (c) silent fallbacks that change behavior instead of failing loudly; (d) drift between source, installed binary, and CI.
+
+---
+
+## 2. Process & Lifecycle Management
+
+### 2.1 Single-writer enforcement (P0)
+
+The single-writer invariant for the Kuzu graph must be **mechanically enforced**, not conventional.
+
+- **R2.1.1 — Writer lock file.** Any process opening `.infigraph/graph/` for write acquires `.infigraph/writer.lock` (advisory `flock` + PID + start-time + role written into the file). Read-only opens skip the lock.
+- **R2.1.2 — Stale-lock recovery.** On lock acquisition failure: read PID + start-time from the lock file; if no live process matches (PID reuse guarded by start-time), the lock is stale → break it and proceed. If a live holder exists → retry with backoff (already implemented for `init()`, PR #24), then fail with a `Busy` error naming the holder PID and role. **Never** treat lock contention as corruption.
+- **R2.1.3 — MCP as write coordinator (target architecture).** Long-term, all writes route through `infigraph-mcp` as the single writer per project; the CLI detects a running MCP for the project (via lock file / IPC socket) and delegates write operations to it rather than opening the graph directly. CLI direct-write remains the fallback when no MCP is running. *(Prerequisite: instance registry, R2.2.)*
+
+### 2.2 Instance registry & orphan reaping (P0)
+
+- **R2.2.1 — Instance registry.** Every `infigraph-mcp` process registers itself in `~/.infigraph/instances/<pid>.json` (pid, start-time, project path, transport, host-agent hint) on startup and removes it on clean shutdown.
+- **R2.2.2 — Duplicate detection: peers vs. orphans.** On startup, an MCP server scans the instance registry for a live instance already serving the same project path, then discriminates:
+  - **Live peer** (holder's parent agent process alive, stdin open): this is a concurrent agent session (two Claude windows, Claude + Codex). The new instance must **coexist** — both front-ends share the singleton worker (§2.3); killing a live peer's front-end or its in-use worker without handover is never permitted.
+  - **Orphan** (holder's PID dead, or live but parent gone / stdin closed): reap it (SIGTERM → grace → SIGKILL) and clean its registry entry. An orphaned *worker* additionally goes through the takeover path (R2.3.2) so serving continuity is preserved for live sessions.
+- **R2.2.3 — Orphan reaping.** On startup and on a periodic timer (every 10 min), reap registry entries whose PID is dead, and detect *live orphans*: an MCP whose parent agent process is gone (stdio transport: parent PID is init/1, or stdin is closed). Live orphans self-terminate after a configurable idle grace (default 5 min with stdin closed).
+- **R2.2.4 — `infigraph ps` / `infigraph kill`.** CLI commands to list all live infigraph processes (MCP servers, watchers, SCIP children) with project, uptime, RSS, FD count — and to terminate them. This turns "found 7 orphaned processes with `ps aux`" into a supported workflow.
+
+### 2.3 Concurrent agent sessions — worker lifecycle (P0)
+
+The common real-world case: two agent sessions (two Claude windows, or Claude + Codex) open in the same repo, each spawning its own `infigraph-mcp` over stdio. Both must keep working; neither may corrupt the graph.
+
+**Existing architecture (as of v3.x, verified by reading `main.rs`/`lib.rs`, not inferred):** each session's stdio process is a thin *front-end* that unconditionally spawns and supervises its **own** `--worker` child (`main.rs`'s non-worker branch always execs `current_exe() --worker`, respawning on detected SIGSEGV). There is no discovery of, or request-routing to, any other running worker — every concurrent session gets a fully independent worker process, each capable of opening (and **writing**) any project's graph with zero coordination between them. This is the opposite of a converged singleton, and it means **I-4 (single-writer violation) is live and completely unmitigated today** — not partially solved by anything described below.
+
+The global `~/.infigraph/mcp.lock` + port `9749` genuinely gate exactly two things, and nothing else (confirmed: `is_primary` appears in only 13 lines across the whole crate): (a) whether this process starts auto-watchers for every registered project (`main.rs:235`, `lib.rs:609`), and (b) whether it binds the shared web-UI HTTP server (`main.rs:287`). A losing (non-primary) worker still runs its full tool-dispatch loop — search, `index_project`, `save_session`, all 91 tools — identically to the primary. The lock file being empty (no PID/start-time/version) is a real bug (I-12: a dead orphan can squat the lock, permanently disabling watchers and the shared web UI everywhere, and — plausibly, since it's the one process serving the shared HTTP port — anything that classifies files through that port, such as the enforcement hook, keeps consulting stale logic even while every session's own MCP tool calls are already running fine on fresh per-session workers underneath). But fixing the lock's identity problem (R2.3.1–R2.3.5 below) only fixes watcher/UI-port arbitration — it does **not** fix I-4. That requires the entirely separate, entirely unbuilt mechanism in §2.1 (`writer.lock`, R2.1.1): a real cross-process single-writer lock that every worker's graph-write path actually checks, which does not exist in the codebase today in any form.
+
+**Two distinct problems, easy to conflate — kept separate below.** (1) The *lock-holder* role (`mcp.lock`) arbitrates only watcher auto-start and the shared web-UI port; every session's own worker keeps running regardless of who holds it. (2) *Write safety* (`writer.lock`, R2.1.1) doesn't exist in any form today — every concurrently-running worker can open any project's graph for write with zero coordination. Fixing (1) does not touch (2).
+
+**Lock-holder lifecycle (fixes I-12: stale lock-holder blocking watchers/UI machine-wide):**
+- **R2.3.1 — Lock carries identity.** `mcp.lock` records holder PID, process start-time, binary version, and build hash. Empty/unreadable lock ⇒ treated as stale (today it's always empty — zero identity fields are written).
+- **R2.3.2 — Takeover, not surrender.** A starting process that loses the `mcp.lock` race discriminates the incumbent holder:
+  - **Live holder, same build** → stay non-primary (current behavior; this process's own worker keeps serving its own front-end regardless).
+  - **Live holder, different build** → request graceful handover (incumbent finishes any in-flight watcher-triggered write, stops watchers, releases the lock, exits); on timeout, SIGTERM → grace → SIGKILL. This is what makes `install.sh` actually *deploy* the shared web UI and watcher behavior (closes I-9/I-12 for that surface) — it does **not** and cannot make already-running per-session workers pick up a new binary; those only refresh when their own front-end's supervisor loop respawns them (I-15 governs that path).
+  - **Dead holder** (PID gone, or start-time mismatch = PID reuse) → break the lock, take over.
+
+  **Precondition (I-15) — applies only if a handover is ever made to kill someone's own worker, not the lock-holder role above:** killing *a worker* (as opposed to just losing/winning the `mcp.lock` race, which kills nothing) takes its parent front-end down with it today, because the supervisor's auto-respawn only fires on a detected SIGSEGV. Nothing in this lock-holder takeover needs to kill any session's worker — the holder and the worker are different roles that happen to run in the same process today. Keep them conceptually separate if a future redesign (R2.1.3-style real write coordinator) needs to kill/replace a worker deliberately.
+- **R2.3.2a — Lock-holder build-hash handshake.** Same mechanism as R2.3.2, keyed on build hash (git SHA + dirty flag via `build.rs`, fallback: hash the binary) rather than semver — dev builds share a version number (the I-12 orphan and its replacement were both "3.0.0"), so only a content-addressed comparator actually detects staleness.
+- **R2.3.3 — Wedged lock-holder degrades loudly.** If the lock is held by a live process that stops answering (port unreachable, health check failing), `infigraph doctor` and the web UI surface a named-PID warning rather than silently going dark. This does not affect any session's own MCP tool calls — those go through that session's own worker, unaffected by the lock-holder's health.
+- **R2.3.4 — Lock respawn.** When the current lock holder exits, the next process to initialize (any session) races for the lock and becomes the new watcher/UI owner. Unrelated to worker health — every session already has a working worker regardless of lock state.
+- **R2.3.5 — Lock-holder heartbeat.** The lock holder refreshes a heartbeat (mtime touch, or timestamp in the lock file) every N seconds; a live-PID-but-stale-heartbeat holder is treated as wedged (R2.3.3), closing the "zombie holds the lock forever" gap a PID-only check misses.
+
+**Write safety (fixes I-4, currently unmitigated — separate mechanism entirely):**
+- **R2.3.6 — Sessions DB needs the same treatment as the code graph.** `save_session`/`get_latest_session` write to a second Kuzu instance with the identical single-writer constraint and identical lack of protection: any concurrently-running worker can write it. Whatever mechanism R2.1 builds for the code graph's `writer.lock` must cover the sessions DB too, not be graph-specific.
+- **R2.3.7 — Per-project write lock (the actual fix for I-4).** Every worker process must acquire `.infigraph/writer.lock` (R2.1.1, per-project, independent of the global `mcp.lock`) before any graph write, and hold it only for the write's duration — not for the worker's lifetime, since a worker legitimately serves many projects across its life. This is new work, not an extension of anything described above. Until it lands, two concurrent sessions independently calling `index_project` (or the CLI calling `infigraph index` while any MCP worker is also live, since the CLI doesn't even participate in the *lock-holder* mechanism, let alone a write lock) on the same project race with no protection at all.
+- **R2.3.8 — Real write coordination (R2.1.3, target architecture, P2/Phase 3).** The durable fix is routing every write — from every worker, and eventually the CLI — through one process per project that actually serializes them, rather than N independent workers each grabbing `writer.lock` per-call (lock-per-call prevents corruption but not lost-update races between two legitimate concurrent index runs). That's a bigger lift than anything above and is deliberately deferred to Phase 3.
+
+### 2.4 Watcher lifecycle (P1)
+
+- **R2.4.1 — Watcher owned by writer.** Watchers only run inside the process holding the writer lock (the primary, R2.3.1). If the lock is lost/released, the watcher stops.
+- **R2.4.2 — Resource ceilings.** Watcher backends declare and enforce an FD budget (kqueue) / watch-descriptor budget (inotify). Exceeding the budget degrades to directory-level watching or polling with a logged warning — never unbounded FD growth (I-1).
+- **R2.4.3 — Leak regression tests.** The existing kqueue FD regression test generalizes into a lifecycle test suite: start/stop/restart watcher 100×, assert FD count and thread count return to baseline.
+
+### 2.5 Child process hygiene (P1)
+
+- **R2.5.1** — All spawned children (SCIP indexers, ANTLR/JVM bridge, grammar plugins) run with: a timeout, a kill-on-drop guard (process group kill so grandchildren die too), and captured stderr attached to any resulting error.
+- **R2.5.2** — Child invocations validate the *contract*, not just exit code: SCIP import asserts the output file exists, is non-empty, and parses, before replacing prior enrichment data (I-8).
+
+---
+
+### 2.6 Implementation notes — building blocks & prior art
+
+No single Rust crate provides lock-with-identity + takeover + version handshake; the off-the-shelf daemon crates (`single-instance`, `pidlock`, `daemonize`) are PID-only and don't solve stale-version displacement. The standard practice is assembling small pieces and copying semantics from systems that solved this exact problem:
+
+**Crates (building blocks):**
+- `fs4` — cross-platform advisory file locking (maintained `fs2` successor); the `flock` layer for R2.1.1/R2.3.1.
+- `sysinfo` — process start-time lookup, for the PID-reuse guard in stale-lock detection.
+- `interprocess` — cross-platform local sockets (unix socket / named pipe), for front-end↔worker IPC on Windows too.
+
+**Systems to copy semantics from (each solved the singleton-daemon-for-CLI-clients problem):**
+- **Watchman** (Meta) — the closest prior art: per-user singleton daemon, clients auto-spawn it, connect over a unix socket, do a `version` handshake, and `shutdown-server` performs graceful handover. Its state-dir + sockname layout maps directly onto `~/.infigraph/instances/`.
+- **Gradle daemon** — version-keyed daemons: a client only connects to a daemon of *its own* version and starts a new one otherwise; incompatible daemons idle out. This is R2.3.2a's handshake with a different displacement policy (coexist-then-expire vs. takeover) — worth considering if graceful takeover proves racy.
+- **sccache** — client/server with auto-spawn on demand, idle-timeout self-shutdown (solves orphans by attrition), and a port file as the discovery mechanism.
+
+**OS-level supervision (alternative to hand-rolling):** a launchd LaunchAgent (macOS) / systemd user unit (Linux) with **socket activation** makes the OS the supervisor — the OS owns the socket (singleton by construction), starts the worker on first connection, restarts it on crash, and no orphan is possible. Trade-off: install-time registration and per-OS plumbing vs. infigraph's zero-config posture; `install.sh` could offer it as an opt-in `--supervised` mode while the lock-file protocol remains the portable default.
+
+---
+
+## 3. Data Integrity
+
+### 3.1 The Prime Directive: never destroy on error (P0)
+
+- **R3.1.1 — No destructive recovery without a corruption verdict.** Deleting/recreating `.infigraph/graph/` is permitted **only** when a dedicated corruption check (Kuzu open returns a definitive corruption error class *and* the writer lock is confirmed free) passes. All other open failures — lock contention, ENOSPC, EMFILE, permissions, version mismatch — are surfaced as errors. This generalizes the PR #24 fix (I-3) from `init()` to every code path that can currently delete graph state.
+- **R3.1.2 — Quarantine, don't delete.** When destructive recovery *is* warranted, the old graph is renamed to `.infigraph/graph.corrupt.<timestamp>/` (bounded to N=2 quarantines, oldest evicted), never unlinked directly. Data loss becomes recoverable and diagnosable.
+
+### 3.2 Snapshots & backup (P1)
+
+- **R3.2.1 — Pre-write snapshot.** Before any full reindex or schema migration, hardlink-copy (cheap on APFS: `clonefile`) the graph directory to `.infigraph/snapshots/<timestamp>/`. Keep last N=2. A failed reindex rolls back by rename-swap.
+- **R3.2.2 — `infigraph restore`.** CLI command to list snapshots/quarantines and restore one.
+
+### 3.3 Atomicity & cross-file consistency (P1)
+
+- **R3.3.1 — Sidecar files written atomically.** `embeddings.bin`, `hnsw.bin`, `bm25_cache.bin` are written to a temp file in the same directory and `rename(2)`-swapped. A crash mid-write must never leave a truncated file that a later load half-parses.
+- **R3.3.2 — Sidecar headers.** Each sidecar gains a header: magic bytes, format version, graph generation ID, payload checksum (xxhash64). Loaders verify; mismatch → rebuild the sidecar (they are derived data — rebuilding is always safe) and log at `warn`.
+- **R3.3.3 — Graph generation ID.** The graph stores a monotonically incremented generation ID (bumped per completed index run). Sidecars record the generation they were built from. A sidecar from a stale generation is rebuilt rather than served — eliminating the class of "search returns symbols that no longer exist / misses new ones."
+- **R3.3.4 — Track and surface SCIP-enrichment staleness.** The watcher's incremental reindex is AST-only (`prism.index_files`); it never re-runs SCIP enrichment (confirmed: every call site — CLI `cmd_watch` and both MCP `watch_project` variants — routes through `watch_project` with `periodic_secs` hardcoded to `0`, so the library's own "periodic SCIP refresh" branch is unreachable dead code as of this writing). This means `INHERITS` edges and other compiler-verified data silently diverge from a live-watched codebase with no signal. The generation ID (R3.3.3) should distinguish an `ast_generation` (bumped by every reindex, including watcher batches) from a `scip_generation` (bumped only by explicit SCIP enrichment); `get_stats`/`doctor` surfaces the gap between them (e.g. "SCIP enrichment is 340 commits / 6h of watched changes behind") so staleness is visible instead of silent.
+
+### 3.4 Verification (P2)
+
+- **R3.4.1 — `infigraph verify`.** Offline consistency check: graph opens cleanly, edge endpoints exist, sidecar checksums and generations match, embeddings count ≈ symbol count, registry paths exist. Used by `doctor` (§6.4) and CI.
+
+---
+
+## 4. Error Handling
+
+### 4.1 Error taxonomy (P0)
+
+Introduce a structured error enum at the `infigraph-core` boundary; every error carries one class:
+
+| Class | Meaning | Policy |
+|-------|---------|--------|
+| `Busy` | Lock/resource held by live process | Retry w/ backoff, then report holder |
+| `Corrupt` | Verified data corruption | Quarantine + rebuild (§3.1) |
+| `Resource` | ENOSPC / EMFILE / OOM | Fail fast, actionable message, **never** destructive recovery |
+| `Config` | Bad/missing/ambiguous configuration | Fail fast at startup, name the key |
+| `Transient` | Child crash, IO race | Bounded retry |
+| `Internal` | Bug | Fail, request report |
+
+The lock-contention wipe (I-3) was a taxonomy failure: `Busy` mis-classified as `Corrupt`. The taxonomy makes the recovery policy a property of the error class, decided in one place.
+
+### 4.2 No silent behavioral fallbacks (P0)
+
+- **R4.2.1 — Backend selection is explicit and validated.** Local vs. remote (Postgres) backend is resolved once at startup from explicit config; the resolved choice is logged. Remote selected without reachable Postgres → `Config` error at startup, not a mid-index failure (I-6). Local mode must be incapable of touching the network path (feature-gate or runtime assert).
+- **R4.2.2 — Fallbacks that change quality are visible.** Acceptable fallbacks (Model2Vec → trigram, HNSW → brute-force, directory-watch → poll) emit a one-time `warn` and are reflected in `get_stats`/`doctor` output. A fallback the operator can't see is a bug with extra steps.
+- **R4.2.3 — Enforcement hook fails open.** The PreToolUse hook (I-9) must fail *open* for anything it can't positively classify as an indexed code file: non-code files, files outside indexed projects, grep filtering another command's stdout. Classification errors block agents from working; the hook's job is nudging, not gating. Ship the hook's file-classification logic with its own test fixtures (markdown, configs, piped-grep cases) so regressions are caught in CI rather than by blocked agents.
+
+### 4.3 Partial failure reporting (P1)
+
+- **R4.3.1** — Index runs aggregate per-file errors (parse failures, extraction panics caught at the file boundary) and report a summary: `indexed 1240, skipped 3 (errors), see log`. A single bad file must never abort or poison a full index run — and must never be *silently* skipped either.
+
+---
+
+## 5. Reliability / Uptime
+
+- **R5.1 — Crash-safe startup (P0).** MCP startup sequence: reap instance registry → acquire writer lock (retry/backoff) → verify sidecar checksums (rebuild if bad) → serve. Every step has a bounded time budget; a hung step fails startup with a named phase rather than hanging the host agent's MCP handshake.
+- **R5.2 — Self-watchdog (P1).** The MCP server monitors its own RSS, FD count, and thread count against soft ceilings; on breach it logs, drops caches (embeddings/BM25 process caches are reloadable), and on a hard ceiling restarts itself cleanly (state is all on disk; a restart is cheap). This converts slow leaks (I-1) from multi-hour degradations into logged blips.
+- **R5.3 — Health endpoint (P1).** `GET /healthz` on the web UI port + a `health` MCP tool: lock status, generation ID, sidecar freshness, watcher state, RSS/FD, last index result. Machine-readable so host tooling can supervise. **Ground truth, not process memory:** `get_watch_status` today answers from the current worker's in-process registry, which a worker restart (crash, upgrade takeover, orphan reap) wipes — even though the actual watcher (a detached, `setsid`'d process) survives the restart untouched and keeps running. Observed directly: after killing a worker for a binary upgrade, `get_watch_status` reported no watcher running for a project whose watcher (PID confirmed via `watch.lock` holder) had been alive and reindexing the entire time. Every status surface must reconstruct state from durable/OS-level facts (lock file holder + liveness check) on each query, never rely solely on an in-memory registry that a restart silently invalidates — the failure mode is a health check that's wrong exactly when it's most needed, right after a restart.
+- **R5.5 — Crash containment (P0).** When the worker crashes, recovery must be **scoped to the database that crashed**: the supervisor records which project's graph was being served (worker writes a `current-op` breadcrumb file before risky operations), quarantines *that* graph per R3.1.2, and touches nothing else. The I-14 behavior — wipe+reindex of every *registered* project while the actually-corrupt (unregistered) graph is never repaired, looping forever — inverts both requirements: recovery must key on the faulting database, never on registry membership.
+- **R5.6 — No black-holed requests (P0).** A worker crash must fail the in-flight request, not orphan it: the supervisor (or front-end) tracks outstanding JSON-RPC ids and, on worker death, answers each with an error naming the crash (`worker crashed (SIGSEGV) while serving search on <project>; graph quarantined`). Additionally, every tool call gets a hard deadline at the front-end. I-13's symptom — an infinite client hang with the crash visible only in `mcp.log` — is the worst possible surface for a corruption bug: the agent retries, and each retry wipes more bystander state (I-14).
+- **R5.4 — Graceful shutdown (P1).** SIGTERM/stdin-close: stop watcher, flush in-flight writes, release writer lock, deregister instance — bounded by 5 s, then hard-exit. Prevents both orphans (I-5) and stale locks (I-3's trigger).
+
+---
+
+## 6. Observability
+
+- **R6.1 — Structured logging (P0).** `tracing` with JSON output to `.infigraph/logs/` (per-project, size-capped rotation, e.g. 3 × 10 MB) plus `~/.infigraph/logs/` for process-lifecycle events. Every log line carries: pid, project, subsystem, error class. Today's failure forensics ("which process wiped the graph? when?") required guesswork; logs make I-3-style incidents diagnosable in minutes.
+- **R6.2 — Metrics (P2).** Lightweight internal counters (index duration, files/s, resolution rate, search latency, FD/RSS, watcher events, lock contention count) exposed via `get_stats` and `/healthz`. No external metrics stack required — the consumer is `doctor` and the user.
+- **R6.3 — Audit trail for destructive ops (P0).** Any quarantine, snapshot restore, registry eviction, or instance kill writes an audit line to `~/.infigraph/logs/audit.log` (append-only): who (pid/role), what, why (error class), affected path. Cheap, and turns "the graph is gone" into "here's the line that says why."
+- **R6.4 — `infigraph doctor` (P1).** One command that runs: `verify` (§3.4), instance-registry scan, lock status, disk usage per project, sidecar freshness, hook installation check (installed binary version vs. hook script version), toolchain/codesign validity of the installed binary. Prints PASS/WARN/FAIL with remediation for each. This is the front line for every "infigraph is acting weird" report.
+
+---
+
+## 7. Scalability & Resource Management
+
+- **R7.1 — Registry GC (P1).** `registry.json` entries whose path no longer exists (or hasn't been indexed in N=90 days, configurable) are flagged by `doctor` and evicted by `infigraph gc` (with audit line). Prevents the 69-entry / 8.3 GB bloat (I-7) from recurring.
+- **R7.2 — Disk accounting & preflight (P1).** Index runs preflight available disk vs. a projected write estimate (proportional to source size); insufficient space → `Resource` error *before* writing, never a mid-write corruption. `get_stats`/`doctor` report per-project `.infigraph/` size including snapshots/quarantines.
+- **R7.3 — Bounded derived data (P1).** Snapshots (N=2), quarantines (N=2), logs (rotated), sessions (30-day purge — exists) are all bounded by construction. Nothing in `.infigraph/` may grow without a cap.
+- **R7.4 — Large-repo backpressure (P2).** Watcher reindex storms (mass git checkout, branch switch) coalesce: if >K files change within the debounce window, fall back to a single incremental index pass instead of per-file updates.
+
+---
+
+## 8. Deployment & Upgrade
+
+- **R8.1 — Schema/format versioning (P0).** The graph stores a schema version; `embeddings.bin`/`hnsw.bin`/`bm25_cache.bin` carry format versions (§3.3.2). On open: same → proceed; older → run migration (or trigger clean rebuild *via the snapshot path*, §3.2); newer → refuse with "built by newer infigraph" (`Config` error). Never open-and-guess.
+- **R8.2 — Install integrity (P1).** `install.sh` and any local-build install path end with: verify the binary launches (`infigraph --version`), verify code signature validity on macOS (re-sign ad-hoc if the copy invalidated it — I-10), and print the installed vs. previous version. A failed swap restores the previous binary.
+- **R8.3 — Hook/binary version coupling (P1).** The enforcement hook script embeds the version it shipped with; on invocation it compares against `infigraph --version` and warns (fails open) on mismatch. Kills the class of "hook fix reverted by reinstall" surprises (I-9) — drift becomes visible instead of silent.
+- **R8.4 — Pinned toolchain (P0, trivial).** `rust-toolchain.toml` pins the exact Rust version; CI uses it. Clippy/fmt drift (I-11) stops breaking unrelated PRs. Toolchain bumps become deliberate PRs.
+- **R8.5 — Upgrade smoke test in CI (P2).** CI job: build previous release → index a fixture repo → build HEAD → open the same `.infigraph/` → assert query correctness or clean migration. Guards R8.1 forever.
+
+---
+
+## 9. Phasing
+
+**Phase 1 — Stop the bleeding (P0):** error taxonomy + no-destroy invariant (R3.1, R4.1) · **per-project write lock — the actual fix for the live, unmitigated I-4 single-writer violation (R2.3.6–7)** · instance registry + peer/orphan discrimination (R2.2) · lock-holder lifecycle: identity, stale-version takeover, build-hash handshake (R2.3.1–5, fixes I-12's watcher/UI staleness — distinct from and no substitute for R2.3.6–7) · explicit backend selection (R4.2.1) · hook fails open (R4.2.3) · structured logging + audit trail (R6.1, R6.3) · pinned toolchain (R8.4) · schema versioning (R8.1).
+
+**Phase 2 — Operability (P1):** snapshots/restore/quarantine (R3.2) · sidecar atomicity + generations (R3.3, incl. R3.3.4 SCIP-staleness tracking) · `doctor` + `ps`/`kill`/`gc` (R6.4, R2.2.4, R7.1) · watchdog + ground-truth health + graceful shutdown (R5.2–6) · disk preflight (R7.2) · install integrity + hook version coupling (R8.2–3) · watcher lifecycle ceilings (R2.4) · child-process hygiene (R2.5) · partial-failure reporting (R4.3).
+
+**Phase 3 — Polish (P2):** `verify` (R3.4) · metrics (R6.2) · reindex-storm coalescing (R7.4) · upgrade smoke test (R8.5) · real write coordination replacing lock-per-call (R2.3.8 / R2.1.3 — largest architectural item; depends on Phase 1's per-project write lock proving the invariant, then centralizing it).
+
+---
+
+## 10. Non-Goals
+
+- HA/replication, multi-host coordination — infigraph is a local, single-user tool.
+- External observability stacks (Prometheus, OTLP) — `doctor` + logs + `/healthz` suffice.
+- Encrypted-at-rest graph storage — out of scope; `.infigraph/` inherits repo/disk protections.
