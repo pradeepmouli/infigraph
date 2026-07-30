@@ -2494,6 +2494,8 @@ dependencies = [
  "tokio-postgres",
  "toml",
  "tree-sitter",
+ "tree-sitter-dart",
+ "tree-sitter-kotlin-ng",
  "tree-sitter-python",
  "ureq 2.12.1",
  "usearch",

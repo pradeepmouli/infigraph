@@ -8,7 +8,11 @@ use crate::model::{Span, Symbol, SymbolKind};
 ///
 /// The query must use these capture names:
 ///   @func.def / @func.name / @func.docstring / @func.decorator
+///   @func.params / @func.return_type (both optional -- only needed when a
+///     grammar doesn't expose "parameters"/"return_type"/"result" as named
+///     fields on the captured @func.def node; see Kotlin/Dart for examples)
 ///   @method.def / @method.name / @method.docstring / @method.decorator
+///   @method.params / @method.return_type (same as @func.params/@func.return_type)
 ///   @class.def / @class.name / @class.docstring / @class.decorator
 ///   @module.def / @module.name
 ///   @test.def / @test.name / @test.docstring
@@ -34,6 +38,8 @@ pub fn extract_entities(
         let mut kind = None;
         let mut docstring = None;
         let mut decorator = None;
+        let mut params_capture: Option<String> = None;
+        let mut return_type_capture: Option<String> = None;
         let mut route_method: Option<String> = None;
         let mut route_path: Option<String> = None;
         let mut route_handler: Option<String> = None;
@@ -78,6 +84,12 @@ pub fn extract_entities(
                 }
                 "method.decorator" => {
                     decorator = Some(node_text(node, source));
+                }
+                "func.params" | "method.params" => {
+                    params_capture = Some(node_text(node, source));
+                }
+                "func.return_type" | "method.return_type" => {
+                    return_type_capture = Some(node_text(node, source));
                 }
                 "class.name" => {
                     name_text = Some(node_text(node, source));
@@ -210,9 +222,12 @@ pub fn extract_entities(
                 _ => 1,
             };
 
-            let parameters = extract_child_text(node, "parameters", source);
-            let return_type = extract_child_text(node, "return_type", source)
-                .or_else(|| extract_child_text(node, "result", source));
+            let parameters =
+                params_capture.or_else(|| extract_child_text(node, "parameters", source));
+            let return_type = return_type_capture.or_else(|| {
+                extract_child_text(node, "return_type", source)
+                    .or_else(|| extract_child_text(node, "result", source))
+            });
 
             let visibility = extract_visibility(node, source);
 
@@ -833,6 +848,181 @@ mod tests {
         assert!(
             symbols[0].return_type.is_none(),
             "no return type annotation"
+        );
+    }
+
+    #[test]
+    fn test_kotlin_function_extracts_parameters_and_return_type() {
+        // tree-sitter-kotlin-ng's function_declaration has no named
+        // "parameters"/"return_type" fields at all -- function_value_parameters
+        // and the return type are both positional children. Verified against
+        // the crate's real node-types.json before writing this test.
+        let grammar = tree_sitter_kotlin_ng::LANGUAGE.into();
+        let src = b"fun greet(name: String, age: Int): String {\n    return name\n}\n";
+        let mut parser = Parser::new();
+        parser.set_language(&grammar).unwrap();
+        let tree = parser.parse(src, None).unwrap();
+        let root = tree.root_node();
+
+        let query = tree_sitter::Query::new(
+            &grammar,
+            "(function_declaration\n  \
+               name: (identifier) @func.name\n  \
+               (function_value_parameters) @func.params\n  \
+               (type)? @func.return_type) @func.def",
+        )
+        .unwrap();
+
+        let symbols = extract_entities("greet.kt", src, root, &query, "kotlin");
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].name, "greet");
+        assert!(
+            symbols[0].parameters.is_some(),
+            "parameters should be extracted via the @func.params capture"
+        );
+        assert!(
+            symbols[0].parameters.as_deref().unwrap().contains("name"),
+            "parameters should contain param names: {:?}",
+            symbols[0].parameters
+        );
+        assert_eq!(
+            symbols[0].return_type.as_deref(),
+            Some("String"),
+            "return_type should be extracted via the @func.return_type capture"
+        );
+    }
+
+    #[test]
+    fn test_kotlin_function_without_return_type_annotation() {
+        // @func.return_type is an optional capture (`(type)?`) -- must not
+        // panic or produce a bogus value when a function has no explicit
+        // return type (Kotlin infers Unit).
+        let grammar = tree_sitter_kotlin_ng::LANGUAGE.into();
+        let src = b"fun sayHi(name: String) {\n    println(name)\n}\n";
+        let mut parser = Parser::new();
+        parser.set_language(&grammar).unwrap();
+        let tree = parser.parse(src, None).unwrap();
+        let root = tree.root_node();
+
+        let query = tree_sitter::Query::new(
+            &grammar,
+            "(function_declaration\n  \
+               name: (identifier) @func.name\n  \
+               (function_value_parameters) @func.params\n  \
+               (type)? @func.return_type) @func.def",
+        )
+        .unwrap();
+
+        let symbols = extract_entities("sayHi.kt", src, root, &query, "kotlin");
+        assert_eq!(symbols.len(), 1);
+        assert!(symbols[0].parameters.is_some());
+        assert_eq!(symbols[0].return_type, None);
+    }
+
+    #[test]
+    fn test_dart_function_extracts_parameters_and_return_type() {
+        // tree-sitter-dart's function_signature DOES have real "parameters"/
+        // "return_type" named fields -- but they're one level below the
+        // captured function_declaration node (reached via its "signature"
+        // field), so extract_child_text's direct child_by_field_name lookup
+        // on the outer node misses them. Verified against the crate's real
+        // node-types.json before writing this test.
+        let grammar = tree_sitter_dart::LANGUAGE.into();
+        let src = b"String greet(String name, int age) {\n  return 'hello';\n}\n";
+        let mut parser = Parser::new();
+        parser.set_language(&grammar).unwrap();
+        let tree = parser.parse(src, None).unwrap();
+        let root = tree.root_node();
+
+        let query = tree_sitter::Query::new(
+            &grammar,
+            "(function_declaration\n  \
+               signature: (function_signature\n    \
+                 return_type: (type)? @func.return_type\n    \
+                 name: (identifier) @func.name\n    \
+                 parameters: (formal_parameter_list) @func.params)) @func.def",
+        )
+        .unwrap();
+
+        let symbols = extract_entities("greet.dart", src, root, &query, "dart");
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].name, "greet");
+        assert!(
+            symbols[0].parameters.is_some(),
+            "parameters should be extracted via the @func.params capture"
+        );
+        assert!(
+            symbols[0].parameters.as_deref().unwrap().contains("name"),
+            "parameters should contain param names: {:?}",
+            symbols[0].parameters
+        );
+        assert_eq!(symbols[0].return_type.as_deref(), Some("String"));
+    }
+
+    #[test]
+    fn test_dart_method_extracts_parameters_and_return_type() {
+        // method_signature has ZERO named fields at all (verified against
+        // node-types.json) -- structurally unreachable via child_by_field_name
+        // from the captured node regardless of nesting depth, unlike the
+        // top-level function case which is merely "one level too shallow".
+        let grammar = tree_sitter_dart::LANGUAGE.into();
+        let src =
+            b"class Greeter {\n  String greet(String name, int age) {\n    return 'hi';\n  }\n}\n";
+        let mut parser = Parser::new();
+        parser.set_language(&grammar).unwrap();
+        let tree = parser.parse(src, None).unwrap();
+        let root = tree.root_node();
+
+        let query = tree_sitter::Query::new(
+            &grammar,
+            "(method_signature\n  \
+               (function_signature\n    \
+                 return_type: (type)? @method.return_type\n    \
+                 name: (identifier) @method.name\n    \
+                 parameters: (formal_parameter_list) @method.params)) @method.def",
+        )
+        .unwrap();
+
+        let symbols = extract_entities("greeter.dart", src, root, &query, "dart");
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].name, "greet");
+        assert!(
+            symbols[0].parameters.is_some(),
+            "parameters should be extracted for Dart methods too, not just top-level functions"
+        );
+        assert!(
+            symbols[0].parameters.as_deref().unwrap().contains("name"),
+            "parameters should contain param names: {:?}",
+            symbols[0].parameters
+        );
+        assert_eq!(symbols[0].return_type.as_deref(), Some("String"));
+    }
+
+    #[test]
+    fn test_dart_constructor_still_works_unchanged() {
+        // constructor_signature has direct name+parameters fields, no
+        // nesting -- already worked before this plan and must keep working,
+        // using the existing child_by_field_name fallback (no @method.params
+        // capture needed or added for constructors).
+        let grammar = tree_sitter_dart::LANGUAGE.into();
+        let src = b"class Greeter {\n  Greeter(String name, int age);\n}\n";
+        let mut parser = Parser::new();
+        parser.set_language(&grammar).unwrap();
+        let tree = parser.parse(src, None).unwrap();
+        let root = tree.root_node();
+
+        let query = tree_sitter::Query::new(
+            &grammar,
+            "(constructor_signature name: (identifier) @method.name) @method.def",
+        )
+        .unwrap();
+
+        let symbols = extract_entities("greeter.dart", src, root, &query, "dart");
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].name, "Greeter");
+        assert!(
+            symbols[0].parameters.is_some(),
+            "constructor parameters must still work via the pre-existing fallback"
         );
     }
 
