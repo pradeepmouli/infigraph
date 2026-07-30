@@ -1,7 +1,7 @@
 # Rust
 /target
 /.shared-target
-/scratchpad/.cargo/
+/scratchpad/
 Cargo.lock
 *.rlib
 *.rmeta
