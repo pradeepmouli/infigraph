@@ -11,33 +11,38 @@
 
 Requirement text in §2–§8 is unchanged from the 2026-07-20 draft; where reality has since moved, this section is authoritative. All "shipped" claims below were verified against the tree on `feat/health-beacons`, not inferred.
 
+Each item below is tracked as a GitHub issue (label `hardening`) once it moves past "shipped" — see the issue number on each unchecked item. Issues link back to any PR that landed partial/adjacent groundwork.
+
 ### Shipped
 
-| Requirement | Evidence |
-|---|---|
-| R2.2.1–3 — instance registry + orphan reaping (PR7a) | `crates/infigraph-core/src/instances.rs`: `InstanceInfo` with PID-reuse guard (OS start-time match), `register_instance`, `reap_orphans_once`, `list_instances` |
-| R2.3.1–5 — `mcp.lock` identity, heartbeat, wedged-holder detection, build-hash takeover (PR7b) | `crates/infigraph-mcp/src/mcp_lock.rs`: `LockInfo`, `acquire_with_takeover`, heartbeat thread + `takeover_poll_interval`, wedged detection (stale heartbeat is surfaced loudly but never grants primary by itself — only a real flock win does) |
-| R2.1.1 — per-graph write lock | `infigraph_core::lockfile` + `graph.lock`, acquired by write and wipe paths (e.g. `Infigraph::wipe_graph` takes it before any destructive action; refuses if a live holder exists); tests in `crates/infigraph-core/tests/write_lock*.rs`. **Note:** §2.3's "writer.lock does not exist in any form" snapshot predates this landing. |
-| R3.1.1 — lock contention is never corruption | `Infigraph::init()` (`crates/infigraph-core/src/lib.rs`): `is_lock_contention_error()` distinguishes Kuzu's "Could not set lock on file" (another live process — e.g. a running `infigraph watch` — has the DB open) from corruption, and returns a clear busy error instead of wiping. Closes a real data-loss bug: a second `infigraph` command concurrent with a live watcher used to destroy the watcher's data. |
-| R3.1.1 — retry-with-backoff before a corruption verdict | Same file: a non-lock-contention open failure is retried 3× with backoff (`OPEN_RETRY_BACKOFF_MS` = 200/500/1000 ms) before the graph is declared corrupt. Closes a second data-loss bug (I-17): a transient short-read from a concurrent writer mid-checkpoint used to be wiped with zero retry. |
-| R3.1.2 — quarantine, don't delete (part of PR9) | `crates/infigraph-core/src/quarantine.rs`: `quarantine_graph`, `QUARANTINE_RETENTION` = 2, `move_wal_sibling`; wired into `Infigraph::init()`/`wipe_graph` — corrupt graph dirs move to `graph.corrupt.<timestamp>`, preserving the exact corrupt bytes for postmortem |
-| R3.3.1 — atomic sidecar writes (PR4 Task 1) | `embed::save_embeddings` uses temp-file + rename |
-| R3.3.2 — sidecar format header/checksum (PR9 Task 2) | Shipped |
-| R7.2 — disk preflight (**partial**) | `store_util::check_disk_headroom()` (via `fs2`): requires free space ≥ max(3× projected write, 200 MB) before writing. **Caveat:** wired into `import_scip_index` ONLY — the other three graph write paths (full reindex, incremental/watch, resolve) have no preflight yet. Open follow-up under R7.2. |
+- [x] R2.2.1–3 — instance registry + orphan reaping (PR7a) — `crates/infigraph-core/src/instances.rs`: `InstanceInfo` with PID-reuse guard (OS start-time match), `register_instance`, `reap_orphans_once`, `list_instances`
+- [x] R2.3.1–5 — `mcp.lock` identity, heartbeat, wedged-holder detection, build-hash takeover (PR7b) — `crates/infigraph-mcp/src/mcp_lock.rs`: `LockInfo`, `acquire_with_takeover`, heartbeat thread + `takeover_poll_interval`, wedged detection (stale heartbeat is surfaced loudly but never grants primary by itself — only a real flock win does)
+- [x] R2.1.1 — per-graph write lock — `infigraph_core::lockfile` + `graph.lock`, acquired by write and wipe paths (e.g. `Infigraph::wipe_graph` takes it before any destructive action; refuses if a live holder exists); tests in `crates/infigraph-core/tests/write_lock*.rs`. **Note:** §2.3's "writer.lock does not exist in any form" snapshot predates this landing.
+- [x] R3.1.1 — lock contention is never corruption — `Infigraph::init()` (`crates/infigraph-core/src/lib.rs`): `is_lock_contention_error()` distinguishes Kuzu's "Could not set lock on file" (another live process — e.g. a running `infigraph watch` — has the DB open) from corruption, and returns a clear busy error instead of wiping. Closes a real data-loss bug: a second `infigraph` command concurrent with a live watcher used to destroy the watcher's data.
+- [x] R3.1.1 — retry-with-backoff before a corruption verdict — same file: a non-lock-contention open failure is retried 3× with backoff (`OPEN_RETRY_BACKOFF_MS` = 200/500/1000 ms) before the graph is declared corrupt. Closes a second data-loss bug (I-17): a transient short-read from a concurrent writer mid-checkpoint used to be wiped with zero retry.
+- [x] R3.1.2 — quarantine, don't delete (part of PR9) — `crates/infigraph-core/src/quarantine.rs`: `quarantine_graph`, `QUARANTINE_RETENTION` = 2, `move_wal_sibling`; wired into `Infigraph::init()`/`wipe_graph` — corrupt graph dirs move to `graph.corrupt.<timestamp>`, preserving the exact corrupt bytes for postmortem
+- [x] R3.3.1 — atomic sidecar writes (PR4 Task 1) — `embed::save_embeddings` uses temp-file + rename
+- [x] R3.3.2 — sidecar format header/checksum (PR9 Task 2)
+- [ ] R7.2 — disk preflight (**partial**) — `store_util::check_disk_headroom()` (via `fs2`): requires free space ≥ max(3× projected write, 200 MB) before writing. **Caveat:** wired into `import_scip_index` ONLY — the other three graph write paths (full reindex, incremental/watch, resolve) have no preflight yet.
 
 ### In progress
 
-- **R6.4 `infigraph doctor`** — brainstorming started; checks under consideration: `verify`, instance-registry scan, lock status, disk usage per project, sidecar freshness, hook installation/version checks, toolchain/codesign validity. The invocation surface (CLI-only vs. CLI+MCP) is an **open question, not yet decided**. No design doc has been written or committed yet. Directly motivated by I-19 below — `doctor` productizes exactly that manual audit (registry-vs-filesystem diff, watch/graph lock freshness + build-hash checks, orphaned-process detection) as a repeatable PASS/WARN/FAIL command with remediation per check.
+- [ ] R6.4 — `infigraph doctor` ([#9](https://github.com/pradeepmouli/infigraph/issues/9)) — brainstorming started; checks under consideration: `verify`, instance-registry scan, lock status, disk usage per project, sidecar freshness, hook installation/version checks, toolchain/codesign validity. Design spec committed: `docs/superpowers/specs/2026-07-30-infigraph-doctor-design.md` (CLI + MCP dual surface, project-scoped by default). Directly motivated by I-19 below — `doctor` productizes exactly that manual audit (registry-vs-filesystem diff, watch/graph lock freshness + build-hash checks, orphaned-process detection) as a repeatable PASS/WARN/FAIL command with remediation per check.
 
 ### Not started
 
-- CLI subcommands `doctor` / `verify` / `ps` / `kill` / `gc` / `restore` (R6.4, R3.4.1, R2.2.4, R7.1, R3.2.2) — none exist in any `Commands` enum across the workspace.
-- R6.1 structured `tracing` JSON logging — zero `tracing::` call sites; logging is still ad-hoc `eprintln!`/`mcp_log`/`watch_log`.
-- R8.4 pinned toolchain — `rust-toolchain.toml` absent (verified).
-- R3.2.1/R3.2.2 pre-write snapshots + `infigraph restore` — absent.
-- R3.3.3 graph generation IDs — absent.
-- R4.1 full error taxonomy — only `lockfile::Busy` exists as a structured variant; the rest is stringly-typed `anyhow` errors.
-- Most of §5 Reliability (R5.1, R5.2, R5.5, R5.6) — absent.
+- [ ] R3.4.1 — `infigraph verify` ([#10](https://github.com/pradeepmouli/infigraph/issues/10))
+- [ ] R2.2.4 — `infigraph ps` / `infigraph kill` ([#11](https://github.com/pradeepmouli/infigraph/issues/11))
+- [ ] R7.1 — Registry GC, `infigraph gc` ([#12](https://github.com/pradeepmouli/infigraph/issues/12))
+- [ ] R3.2.1/R3.2.2 — pre-write snapshots + `infigraph restore` ([#13](https://github.com/pradeepmouli/infigraph/issues/13))
+- [ ] R6.1 — structured `tracing` JSON logging ([#14](https://github.com/pradeepmouli/infigraph/issues/14)) — zero `tracing::` call sites; logging is still ad-hoc `eprintln!`/`mcp_log`/`watch_log`
+- [ ] R8.4 — pinned toolchain ([#15](https://github.com/pradeepmouli/infigraph/issues/15)) — `rust-toolchain.toml` absent (verified)
+- [ ] R3.3.3 — graph generation IDs ([#16](https://github.com/pradeepmouli/infigraph/issues/16))
+- [ ] R4.1 — full error taxonomy ([#17](https://github.com/pradeepmouli/infigraph/issues/17)) — only `lockfile::Busy` exists as a structured variant; the rest is stringly-typed `anyhow` errors
+- [ ] R5.1 — crash-safe startup ([#18](https://github.com/pradeepmouli/infigraph/issues/18))
+- [ ] R5.2 — self-watchdog ([#19](https://github.com/pradeepmouli/infigraph/issues/19))
+- [ ] R5.5 — crash containment, scoped recovery ([#20](https://github.com/pradeepmouli/infigraph/issues/20))
+- [ ] R5.6 — no black-holed requests ([#21](https://github.com/pradeepmouli/infigraph/issues/21))
 
 ### Other hardening work landed since the 2026-07-20 draft (fixes for I-16–I-19)
 
