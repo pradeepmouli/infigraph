@@ -7,6 +7,7 @@ pub mod cluster;
 pub mod concerns;
 pub mod config;
 pub mod diff;
+pub mod doctor;
 pub mod embed;
 pub mod export;
 pub mod extract;
