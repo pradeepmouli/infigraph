@@ -443,3 +443,142 @@ pub fn check_watchers(ctx: &DoctorContext) -> Vec<CheckResult> {
     let projects = projects_in_scope(ctx);
     projects.iter().map(|p| check_one_watcher(p)).collect()
 }
+
+const DISK_CATEGORY: &str = "disk";
+
+const DISK_FAIL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const DISK_WARN_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+
+fn dir_size(path: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    let mut total = 0u64;
+    for entry in entries.flatten() {
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if metadata.is_dir() {
+            total += dir_size(&entry.path());
+        } else {
+            total += metadata.len();
+        }
+    }
+    total
+}
+
+pub fn check_disk(ctx: &DoctorContext) -> Vec<CheckResult> {
+    let mut results = Vec::new();
+
+    let free_result = match ctx.disk_free_bytes {
+        None => CheckResult::warn(
+            DISK_CATEGORY,
+            "disk: free space",
+            "could not determine free disk space",
+            "check filesystem permissions",
+        ),
+        Some(free) if free < DISK_FAIL_BYTES => CheckResult::fail(
+            DISK_CATEGORY,
+            "disk: free space",
+            format!("only {} MB free (below the 2GB floor)", free / (1024 * 1024)),
+            "free up disk space immediately -- low disk has already caused a real MCP server crash mid-index (see I-16/I-17 in DESIGN-hardening.md)",
+        ),
+        Some(free) if free < DISK_WARN_BYTES => CheckResult::warn(
+            DISK_CATEGORY,
+            "disk: free space",
+            format!("{} MB free (below the 10GB warn floor)", free / (1024 * 1024)),
+            "consider freeing disk space soon",
+        ),
+        Some(free) => CheckResult::pass(
+            DISK_CATEGORY,
+            "disk: free space",
+            format!("{} MB free", free / (1024 * 1024)),
+        ),
+    };
+    results.push(free_result);
+
+    // Informational only -- graph size is reported, never classified.
+    let projects: Vec<&RepoEntry> = match &ctx.scope {
+        DoctorScope::Project(path) => ctx
+            .registry
+            .repos
+            .values()
+            .filter(|e| e.path == *path)
+            .collect(),
+        DoctorScope::Global => ctx.registry.repos.values().collect(),
+    };
+    for entry in projects {
+        let graph_dir = entry.path.join(".infigraph").join("graph");
+        if graph_dir.exists() {
+            let size_mb = dir_size(&graph_dir) / (1024 * 1024);
+            results.push(CheckResult::pass(
+                DISK_CATEGORY,
+                format!("{}: graph size", entry.name),
+                format!("{size_mb} MB (informational only, not classified)"),
+            ));
+        }
+    }
+
+    results
+}
+
+const SIDECAR_CATEGORY: &str = "sidecars";
+const SIDECAR_STALE_SECS: u64 = 60 * 60; // 1 hour
+
+fn check_one_sidecar(project_path: &Path, sidecar_name: &str) -> Option<CheckResult> {
+    let infigraph_dir = project_path.join(".infigraph");
+    let graph_path = infigraph_dir.join("graph");
+    let sidecar_path = infigraph_dir.join(sidecar_name);
+
+    if !sidecar_path.exists() || !graph_path.exists() {
+        return None;
+    }
+
+    let graph_mtime = std::fs::metadata(&graph_path).ok()?.modified().ok()?;
+    let sidecar_mtime = std::fs::metadata(&sidecar_path).ok()?.modified().ok()?;
+
+    let label = format!("{}: {}", project_path.display(), sidecar_name);
+    match graph_mtime.duration_since(sidecar_mtime) {
+        Ok(staleness) if staleness.as_secs() > SIDECAR_STALE_SECS => Some(CheckResult::warn(
+            SIDECAR_CATEGORY,
+            label,
+            format!(
+                "sidecar is {} minutes older than the graph",
+                staleness.as_secs() / 60
+            ),
+            "reindex to refresh the sidecar",
+        )),
+        _ => Some(CheckResult::pass(
+            SIDECAR_CATEGORY,
+            label,
+            "fresh relative to graph",
+        )),
+    }
+}
+
+pub fn check_sidecars(ctx: &DoctorContext) -> Vec<CheckResult> {
+    let projects = projects_in_scope(ctx);
+
+    projects
+        .iter()
+        .flat_map(|p| {
+            ["embeddings.bin", "docs_embeddings.bin"]
+                .into_iter()
+                .filter_map(move |name| check_one_sidecar(p, name))
+        })
+        .collect()
+}
+
+const TOOLCHAIN_CATEGORY: &str = "toolchain";
+
+pub fn check_toolchain(ctx: &DoctorContext) -> Vec<CheckResult> {
+    vec![CheckResult::pass(
+        TOOLCHAIN_CATEGORY,
+        "installed binary: version",
+        format!(
+            "infigraph {} (build {})",
+            env!("CARGO_PKG_VERSION"),
+            ctx.installed_build_hash
+        ),
+    )]
+}

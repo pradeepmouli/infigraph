@@ -2,8 +2,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use infigraph_core::doctor::{
-    check_locks, check_registry, check_watchers, find_repo_entry, projects_in_scope, CheckStatus,
-    DoctorContext, DoctorScope,
+    check_disk, check_locks, check_registry, check_sidecars, check_toolchain, check_watchers,
+    find_repo_entry, projects_in_scope, CheckStatus, DoctorContext, DoctorScope,
 };
 use infigraph_core::lockfile::LockInfo;
 use infigraph_core::multi::{Registry, RepoEntry};
@@ -399,4 +399,103 @@ fn check_watchers_passes_when_no_watch_lock_present() {
         .find(|r| r.name.contains("watcher liveness"))
         .expect("must still produce a result when no watcher is running");
     assert_eq!(watcher.status, CheckStatus::Pass);
+}
+
+#[test]
+fn check_disk_fails_below_2gb() {
+    let ctx = DoctorContext {
+        registry: infigraph_core::multi::Registry::default(),
+        scope: DoctorScope::Global,
+        installed_build_hash: "h".to_string(),
+        disk_free_bytes: Some(1024 * 1024 * 1024), // 1GB
+        scan_roots: Vec::new(),
+    };
+    let results = check_disk(&ctx);
+    let free_space = results
+        .iter()
+        .find(|r| r.name.contains("free space"))
+        .unwrap();
+    assert_eq!(free_space.status, CheckStatus::Fail);
+}
+
+#[test]
+fn check_disk_warns_below_10gb() {
+    let ctx = DoctorContext {
+        registry: infigraph_core::multi::Registry::default(),
+        scope: DoctorScope::Global,
+        installed_build_hash: "h".to_string(),
+        disk_free_bytes: Some(5 * 1024 * 1024 * 1024), // 5GB
+        scan_roots: Vec::new(),
+    };
+    let results = check_disk(&ctx);
+    let free_space = results
+        .iter()
+        .find(|r| r.name.contains("free space"))
+        .unwrap();
+    assert_eq!(free_space.status, CheckStatus::Warn);
+}
+
+#[test]
+fn check_disk_passes_above_10gb() {
+    let ctx = DoctorContext {
+        registry: infigraph_core::multi::Registry::default(),
+        scope: DoctorScope::Global,
+        installed_build_hash: "h".to_string(),
+        disk_free_bytes: Some(50 * 1024 * 1024 * 1024), // 50GB
+        scan_roots: Vec::new(),
+    };
+    let results = check_disk(&ctx);
+    let free_space = results
+        .iter()
+        .find(|r| r.name.contains("free space"))
+        .unwrap();
+    assert_eq!(free_space.status, CheckStatus::Pass);
+}
+
+#[test]
+fn check_sidecars_warns_when_embeddings_older_than_graph_by_over_an_hour() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let project = dir.path().join("myproj");
+    let infigraph_dir = project.join(".infigraph");
+    std::fs::create_dir_all(&infigraph_dir).unwrap();
+
+    let graph_path = infigraph_dir.join("graph");
+    std::fs::write(&graph_path, b"graph-data").unwrap();
+    let embeddings_path = infigraph_dir.join("embeddings.bin");
+    std::fs::write(&embeddings_path, b"stale-embeddings").unwrap();
+
+    // Back-date the embeddings file by 2 hours relative to the graph file.
+    let graph_mtime = std::fs::metadata(&graph_path).unwrap().modified().unwrap();
+    let stale_mtime = graph_mtime - std::time::Duration::from_secs(2 * 60 * 60);
+    let stale_file = std::fs::File::open(&embeddings_path).unwrap();
+    stale_file.set_modified(stale_mtime).unwrap();
+
+    let ctx = DoctorContext {
+        registry: infigraph_core::multi::Registry::default(),
+        scope: DoctorScope::Project(project.clone()),
+        installed_build_hash: "h".to_string(),
+        disk_free_bytes: None,
+        scan_roots: Vec::new(),
+    };
+    let results = check_sidecars(&ctx);
+    let sidecar = results
+        .iter()
+        .find(|r| r.name.contains("embeddings.bin"))
+        .unwrap();
+    assert_eq!(sidecar.status, CheckStatus::Warn);
+}
+
+#[test]
+fn check_toolchain_passes_and_reports_installed_version() {
+    let ctx = DoctorContext {
+        registry: infigraph_core::multi::Registry::default(),
+        scope: DoctorScope::Global,
+        installed_build_hash: "abc123".to_string(),
+        disk_free_bytes: None,
+        scan_roots: Vec::new(),
+    };
+    let results = check_toolchain(&ctx);
+    let version = results.iter().find(|r| r.name.contains("version")).unwrap();
+    assert_eq!(version.status, CheckStatus::Pass);
+    assert!(version.message.contains("abc123"));
 }
