@@ -201,6 +201,11 @@ fn check_project_registration(registry: &Registry, project_path: &Path) -> Check
                 entry.symbol_count, entry.module_count
             ),
         ),
+        None if !project_path.join(".infigraph").exists() => CheckResult::pass(
+            CATEGORY,
+            format!("{}: registration", project_path.display()),
+            "not an infigraph project (no .infigraph directory) -- nothing to check",
+        ),
         None => CheckResult::fail(
             CATEGORY,
             format!("{}: registration", project_path.display()),
@@ -248,8 +253,10 @@ fn check_unregistered_projects(ctx: &DoctorContext) -> CheckResult {
     }
 
     let mut unregistered = Vec::new();
+    let mut unreadable_roots = Vec::new();
     for root in &ctx.scan_roots {
         let Ok(entries) = std::fs::read_dir(root) else {
+            unreadable_roots.push(root.display().to_string());
             continue;
         };
         for entry in entries.flatten() {
@@ -266,13 +273,7 @@ fn check_unregistered_projects(ctx: &DoctorContext) -> CheckResult {
         }
     }
 
-    if unregistered.is_empty() {
-        CheckResult::pass(
-            CATEGORY,
-            "unregistered-project discovery",
-            format!("scanned {} root(s), no drift found", ctx.scan_roots.len()),
-        )
-    } else {
+    if !unregistered.is_empty() {
         let names: Vec<String> = unregistered
             .iter()
             .map(|p| p.display().to_string())
@@ -285,6 +286,24 @@ fn check_unregistered_projects(ctx: &DoctorContext) -> CheckResult {
                 unregistered.len()
             ),
             "run `infigraph index <path>` on each to register it",
+        )
+    } else if !unreadable_roots.is_empty() {
+        CheckResult::warn(
+            CATEGORY,
+            "unregistered-project discovery",
+            format!(
+                "scanned {} of {} root(s); could not read: {}",
+                ctx.scan_roots.len() - unreadable_roots.len(),
+                ctx.scan_roots.len(),
+                unreadable_roots.join(", ")
+            ),
+            "check that the scan root(s) exist and are readable",
+        )
+    } else {
+        CheckResult::pass(
+            CATEGORY,
+            "unregistered-project discovery",
+            format!("scanned {} root(s), no drift found", ctx.scan_roots.len()),
         )
     }
 }
@@ -306,16 +325,24 @@ fn check_one_lock(project_path: &Path, lock_name: &str, installed_build_hash: &s
     }
 
     let Some(holder) = lockfile::read_holder(&lock_path) else {
-        // Empty file with no readable payload: either cleanly released (normal)
-        // or a stale remnant from a crashed holder that never re-acquired.
-        // We can't distinguish those from the payload alone -- surface it as a
-        // WARN so a human/doctor-caller can check whether it's actually stuck.
-        return CheckResult::warn(
-            LOCK_CATEGORY,
-            label,
-            "lock file exists but has no readable holder identity (empty or unparseable)",
-            "if no infigraph process is running for this project, delete the lock file",
-        );
+        // `LockFile::Drop` truncates the payload to zero bytes on a clean
+        // release so readers never see a stale identity -- a zero-byte lock
+        // is the normal, healthy post-release state, not a problem. Only a
+        // non-empty payload that fails to parse indicates something is
+        // actually wrong (mid-write torn read, old/incompatible format).
+        let empty = std::fs::metadata(&lock_path)
+            .map(|m| m.len() == 0)
+            .unwrap_or(false);
+        return if empty {
+            CheckResult::pass(LOCK_CATEGORY, label, "lock released (empty payload)")
+        } else {
+            CheckResult::warn(
+                LOCK_CATEGORY,
+                label,
+                "lock file has an unreadable holder payload",
+                "if no infigraph process is running for this project, delete the lock file",
+            )
+        };
     };
 
     if !is_pid_alive(holder.pid) {
@@ -385,11 +412,21 @@ fn check_one_watcher(project_path: &Path) -> CheckResult {
     }
 
     let Some(holder) = lockfile::read_holder(&lock_path) else {
-        return CheckResult::pass(
-            WATCHER_CATEGORY,
-            label,
-            "watch.lock present but unreadable (likely cleanly released)",
-        );
+        // Same empty-vs-unparseable distinction as check_one_lock: a
+        // zero-byte watch.lock is the normal state after a clean release.
+        let empty = std::fs::metadata(&lock_path)
+            .map(|m| m.len() == 0)
+            .unwrap_or(false);
+        return if empty {
+            CheckResult::pass(WATCHER_CATEGORY, label, "watcher released (empty payload)")
+        } else {
+            CheckResult::warn(
+                WATCHER_CATEGORY,
+                label,
+                "watch.lock has an unreadable holder payload",
+                "if no infigraph process is running for this project, delete the lock file",
+            )
+        };
     };
 
     if !is_pid_alive(holder.pid) {
@@ -467,6 +504,21 @@ fn dir_size(path: &Path) -> u64 {
     total
 }
 
+/// Size of `path` regardless of whether it's a file or a directory. The
+/// graph store (`.infigraph/graph`) is a single file in the current layout
+/// but a directory in the legacy layout -- `dir_size` alone silently reports
+/// 0 for the (now-common) file case since `read_dir` on a file errors.
+fn path_size(path: &Path) -> u64 {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return 0;
+    };
+    if meta.is_dir() {
+        dir_size(path)
+    } else {
+        meta.len()
+    }
+}
+
 pub fn check_disk(ctx: &DoctorContext) -> Vec<CheckResult> {
     let mut results = Vec::new();
 
@@ -511,7 +563,7 @@ pub fn check_disk(ctx: &DoctorContext) -> Vec<CheckResult> {
     for entry in projects {
         let graph_dir = entry.path.join(".infigraph").join("graph");
         if graph_dir.exists() {
-            let size_mb = dir_size(&graph_dir) / (1024 * 1024);
+            let size_mb = path_size(&graph_dir) / (1024 * 1024);
             results.push(CheckResult::pass(
                 DISK_CATEGORY,
                 format!("{}: graph size", entry.name),
@@ -586,9 +638,12 @@ pub fn check_toolchain(ctx: &DoctorContext) -> Vec<CheckResult> {
 
 /// Runs every check category against `ctx` and aggregates the results. Each
 /// category function is already infallible (returns `Vec<CheckResult>`, no
-/// `Result`) -- an internal problem inside a category becomes a `Fail`
-/// result for that specific check via that function's own error handling,
-/// never a panic that would take out the rest of the report.
+/// `Result`), so no category can panic or propagate a hard error out of
+/// `run_doctor` and take out the rest of the report. That's a structural
+/// guarantee about the report as a whole -- it does NOT mean every internal
+/// problem inside a check is guaranteed to surface as a `Fail`; individual
+/// checks are free to degrade to a `Warn`, a `Pass`, or silently omit a
+/// result, per that check's own judgment about what the failure means.
 pub fn run_doctor(ctx: DoctorContext) -> DoctorReport {
     let mut checks = Vec::new();
     checks.extend(check_registry(&ctx));

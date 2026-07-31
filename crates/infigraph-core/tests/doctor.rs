@@ -95,7 +95,11 @@ fn check_registry_project_scope_passes_when_registered() {
 fn check_registry_project_scope_fails_when_unregistered() {
     let dir = tempfile::TempDir::new().unwrap();
     let project = dir.path().join("myproj");
-    std::fs::create_dir_all(&project).unwrap();
+    // A `.infigraph` directory with no matching registry entry represents a
+    // genuinely orphaned/indexed-but-unregistered project. A bare dir with no
+    // `.infigraph` at all was never indexed and must PASS instead -- see
+    // run_doctor_passes_registration_for_never_indexed_dir.
+    std::fs::create_dir_all(project.join(".infigraph")).unwrap();
     let registry = Registry {
         repos: HashMap::new(),
         groups: HashMap::new(),
@@ -156,6 +160,36 @@ fn check_registry_global_scope_with_scan_roots_finds_unregistered_project() {
         .find(|r| r.name.contains("orphan-proj"))
         .expect("must find the unregistered project under the scan root");
     assert_eq!(discovery.status, CheckStatus::Fail);
+}
+
+#[test]
+fn check_registry_warns_when_a_scan_root_is_unreadable() {
+    // An unreadable scan root (typo'd path, unmounted, permission-denied)
+    // must not be silently skipped and reported as a clean scan -- it must
+    // downgrade to WARN and name the root(s) it could not read.
+    let dir = tempfile::TempDir::new().unwrap();
+    let good_root = dir.path().join("good-root");
+    std::fs::create_dir_all(&good_root).unwrap();
+    let bad_root = dir.path().join("does-not-exist");
+
+    let registry = Registry {
+        repos: HashMap::new(),
+        groups: HashMap::new(),
+    };
+    let mut ctx = ctx_for(DoctorScope::Global, registry);
+    ctx.scan_roots = vec![good_root, bad_root.clone()];
+
+    let results = check_registry(&ctx);
+    let discovery = results
+        .iter()
+        .find(|r| r.name.contains("unregistered-project discovery"))
+        .expect("must produce an unregistered-project discovery result");
+    assert_eq!(discovery.status, CheckStatus::Warn);
+    assert!(
+        discovery.message.contains(bad_root.to_str().unwrap()),
+        "message should name the unreadable root: {}",
+        discovery.message
+    );
 }
 
 #[test]
@@ -290,7 +324,11 @@ fn check_locks_warns_on_build_hash_mismatch() {
 }
 
 #[test]
-fn check_locks_warns_on_stale_zero_byte_lock() {
+fn check_locks_passes_on_cleanly_released_zero_byte_lock() {
+    // `LockFile::Drop` truncates the payload to zero bytes on a clean
+    // release specifically so readers never see a stale identity -- a
+    // zero-byte lock is the normal healthy post-release state, not a
+    // problem, so this must PASS rather than WARN.
     let dir = tempfile::TempDir::new().unwrap();
     let project = dir.path().join("myproj");
     std::fs::create_dir_all(project.join(".infigraph")).unwrap();
@@ -310,6 +348,32 @@ fn check_locks_warns_on_stale_zero_byte_lock() {
         .iter()
         .find(|r| r.name.contains("watch.lock"))
         .expect("must check watch.lock even when zero-byte");
+    assert_eq!(watch_lock.status, CheckStatus::Pass);
+}
+
+#[test]
+fn check_locks_warns_on_genuinely_unparseable_lock() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let project = dir.path().join("myproj");
+    std::fs::create_dir_all(project.join(".infigraph")).unwrap();
+    let lock_path = project.join(".infigraph").join("watch.lock");
+    // Non-empty but not valid LockInfo JSON -- genuinely corrupt, not a
+    // clean release.
+    std::fs::write(&lock_path, b"not valid json garbage").unwrap();
+
+    let ctx = DoctorContext {
+        registry: infigraph_core::multi::Registry::default(),
+        scope: DoctorScope::Project(project.clone()),
+        installed_build_hash: "any-hash".to_string(),
+        disk_free_bytes: None,
+        scan_roots: Vec::new(),
+    };
+
+    let results = check_locks(&ctx);
+    let watch_lock = results
+        .iter()
+        .find(|r| r.name.contains("watch.lock"))
+        .expect("must check watch.lock even when unparseable");
     assert_eq!(watch_lock.status, CheckStatus::Warn);
 }
 
@@ -399,6 +463,56 @@ fn check_watchers_passes_when_no_watch_lock_present() {
         .find(|r| r.name.contains("watcher liveness"))
         .expect("must still produce a result when no watcher is running");
     assert_eq!(watcher.status, CheckStatus::Pass);
+}
+
+#[test]
+fn check_watchers_passes_on_cleanly_released_zero_byte_lock() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let project = dir.path().join("myproj");
+    std::fs::create_dir_all(project.join(".infigraph")).unwrap();
+    let lock_path = project.join(".infigraph").join("watch.lock");
+    std::fs::write(&lock_path, b"").unwrap(); // zero-byte, no holder payload
+
+    let ctx = DoctorContext {
+        registry: infigraph_core::multi::Registry::default(),
+        scope: DoctorScope::Project(project.clone()),
+        installed_build_hash: "any-hash".to_string(),
+        disk_free_bytes: None,
+        scan_roots: Vec::new(),
+    };
+
+    let results = check_watchers(&ctx);
+    let watcher = results
+        .iter()
+        .find(|r| r.name.contains("watcher liveness"))
+        .expect("must check watch.lock even when zero-byte");
+    assert_eq!(watcher.status, CheckStatus::Pass);
+}
+
+#[test]
+fn check_watchers_warns_on_genuinely_unparseable_lock() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let project = dir.path().join("myproj");
+    std::fs::create_dir_all(project.join(".infigraph")).unwrap();
+    let lock_path = project.join(".infigraph").join("watch.lock");
+    // Non-empty but not valid LockInfo JSON -- genuinely corrupt, not a
+    // clean release.
+    std::fs::write(&lock_path, b"not valid json garbage").unwrap();
+
+    let ctx = DoctorContext {
+        registry: infigraph_core::multi::Registry::default(),
+        scope: DoctorScope::Project(project.clone()),
+        installed_build_hash: "any-hash".to_string(),
+        disk_free_bytes: None,
+        scan_roots: Vec::new(),
+    };
+
+    let results = check_watchers(&ctx);
+    let watcher = results
+        .iter()
+        .find(|r| r.name.contains("watcher liveness"))
+        .expect("must check watch.lock even when unparseable");
+    assert_eq!(watcher.status, CheckStatus::Warn);
 }
 
 #[test]
@@ -505,14 +619,24 @@ fn check_disk_graph_size_uses_canonicalized_path_lookup() {
     let dir = tempfile::TempDir::new().unwrap();
     let project = dir.path().join("myproj");
     let infigraph_dir = project.join(".infigraph");
-    let graph_dir = infigraph_dir.join("graph");
-    std::fs::create_dir_all(&graph_dir).unwrap();
-    std::fs::write(graph_dir.join("test.db"), b"x").unwrap();
+    std::fs::create_dir_all(&infigraph_dir).unwrap();
 
+    // The graph store is a *file* in the current layout, not a directory --
+    // it must be a file here so the fix (path_size, which handles files) is
+    // actually exercised; a directory would silently mask the bug it fixes.
+    let graph_path = infigraph_dir.join("graph");
+    let graph_bytes = 3 * 1024 * 1024; // exact, non-zero expected size: 3 MB
+    std::fs::write(&graph_path, vec![b'x'; graph_bytes]).unwrap();
+
+    // Register the project under a path representation that differs
+    // textually from the scope's path but resolves to the same location on
+    // disk, so the lookup genuinely has to canonicalize rather than
+    // succeeding on a trivial string equality match.
+    let registry_path = project.join(".");
     let mut repos = HashMap::new();
     repos.insert(
         "myproj".to_string(),
-        repo_entry("myproj", project.to_str().unwrap()),
+        repo_entry("myproj", registry_path.to_str().unwrap()),
     );
     let registry = Registry {
         repos,
@@ -533,14 +657,22 @@ fn check_disk_graph_size_uses_canonicalized_path_lookup() {
         .find(|r| r.name.contains("graph size"))
         .expect("must find graph size result for matched project");
     assert_eq!(graph_size.status, CheckStatus::Pass);
-    assert!(graph_size.message.contains("MB"));
+    assert!(
+        graph_size.message.contains("3 MB"),
+        "expected exact 3 MB size from the file-based graph store, got: {}",
+        graph_size.message
+    );
 }
 
 #[test]
 fn run_doctor_aggregates_every_check_category() {
     let dir = tempfile::TempDir::new().unwrap();
     let project = dir.path().join("myproj");
-    std::fs::create_dir_all(&project).unwrap();
+    // A `.infigraph` directory with no matching registry entry represents a
+    // genuinely orphaned/indexed-but-unregistered project (not a
+    // never-indexed one -- see run_doctor_passes_registration_for_never_indexed_dir
+    // for that case), so the registration check should still FAIL here.
+    std::fs::create_dir_all(project.join(".infigraph")).unwrap();
 
     let ctx = DoctorContext {
         registry: infigraph_core::multi::Registry::default(),
@@ -554,7 +686,32 @@ fn run_doctor_aggregates_every_check_category() {
     let categories: std::collections::HashSet<&str> =
         report.checks.iter().map(|c| c.category).collect();
     assert!(categories.contains("registry"));
-    // registration check on an unregistered temp dir must FAIL, making the
+    // registration check on an orphaned .infigraph dir must FAIL, making the
     // aggregate worst status FAIL -- proves run_doctor doesn't silently drop it
     assert_eq!(report.worst_status(), CheckStatus::Fail);
+}
+
+#[test]
+fn run_doctor_passes_registration_for_never_indexed_dir() {
+    // A bare directory with no `.infigraph` state at all was never indexed --
+    // it's not "orphaned," so the registration check must PASS, not FAIL.
+    let dir = tempfile::TempDir::new().unwrap();
+    let project = dir.path().join("myproj");
+    std::fs::create_dir_all(&project).unwrap();
+
+    let ctx = DoctorContext {
+        registry: infigraph_core::multi::Registry::default(),
+        scope: DoctorScope::Project(project),
+        installed_build_hash: "h".to_string(),
+        disk_free_bytes: Some(50 * 1024 * 1024 * 1024),
+        scan_roots: Vec::new(),
+    };
+
+    let report = run_doctor(ctx);
+    let registration = report
+        .checks
+        .iter()
+        .find(|c| c.name.contains("registration"))
+        .expect("must produce a registration result");
+    assert_eq!(registration.status, CheckStatus::Pass);
 }
