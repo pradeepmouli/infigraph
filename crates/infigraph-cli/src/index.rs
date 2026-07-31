@@ -208,26 +208,28 @@ pub(crate) fn cmd_index(root: &Path, full: bool, no_embed: bool) -> Result<()> {
     let stats = prism.stats()?;
     println!("\n{}", stats);
 
-    // In remote mode, register this repo in Postgres so it appears in registry queries
-    #[cfg(feature = "remote")]
+    // Register this repo in the registry (~/.infigraph/registry.json locally,
+    // Postgres in remote mode) so `infigraph repos` and `infigraph doctor` see it.
+    let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let repo_name = canonical
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
     {
-        if is_neo4j_backend() {
-            let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-            let repo_name = canonical
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| "unknown".to_string());
-            let mut registry = infigraph_core::multi::Registry::load()?;
-            registry.register_repo(&repo_name, root, &prism)?;
-            println!("Registered '{}' in Postgres registry", repo_name);
+        let mut registry = infigraph_core::multi::Registry::load()?;
+        registry.register_repo(&repo_name, root, &prism)?;
+    }
 
-            // Create Repo node in Neo4j keyed by the org/repo namespace (matching f.repo),
-            // and link only this repo's files.
-            if let Some(backend) = prism.backend() {
-                let repo_key = remote_ns.as_deref().unwrap_or(&repo_name);
-                backend.upsert_repo(repo_key)?;
-                println!("Created Repo node '{}' with BELONGS_TO edges", repo_key);
-            }
+    #[cfg(feature = "remote")]
+    if is_neo4j_backend() {
+        println!("Registered '{}' in Postgres registry", repo_name);
+
+        // Create Repo node in Neo4j keyed by the org/repo namespace (matching f.repo),
+        // and link only this repo's files.
+        if let Some(backend) = prism.backend() {
+            let repo_key = remote_ns.as_deref().unwrap_or(&repo_name);
+            backend.upsert_repo(repo_key)?;
+            println!("Created Repo node '{}' with BELONGS_TO edges", repo_key);
         }
     }
 
