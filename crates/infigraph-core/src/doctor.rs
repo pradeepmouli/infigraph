@@ -661,7 +661,12 @@ pub fn run_doctor(ctx: DoctorContext) -> DoctorReport {
 /// Human-readable report, grouped by category, one line per check plus a
 /// remediation line when present, ending with a summary count. Shared by
 /// the CLI and MCP surfaces.
-pub fn format_report(report: &DoctorReport) -> String {
+///
+/// `color` wraps each glyph in ANSI SGR codes (green/yellow/red) when true.
+/// Callers own the decision of whether color is appropriate for their
+/// output stream (a real TTY vs. a pipe, a file, or MCP tool-call text) —
+/// this function only renders what it's told.
+pub fn format_report(report: &DoctorReport, color: bool) -> String {
     let mut out = String::new();
     let mut by_category: std::collections::BTreeMap<&str, Vec<&CheckResult>> =
         std::collections::BTreeMap::new();
@@ -676,21 +681,26 @@ pub fn format_report(report: &DoctorReport) -> String {
     for (category, checks) in by_category {
         out.push_str(&format!("== {category} ==\n"));
         for check in checks {
-            let label = match check.status {
+            let (glyph, sgr) = match check.status {
                 CheckStatus::Pass => {
                     pass += 1;
-                    "PASS"
+                    ("✓", "32")
                 }
                 CheckStatus::Warn => {
                     warn += 1;
-                    "WARN"
+                    ("!", "33")
                 }
                 CheckStatus::Fail => {
                     fail += 1;
-                    "FAIL"
+                    ("✗", "31")
                 }
             };
-            out.push_str(&format!("[{label}] {}: {}\n", check.name, check.message));
+            let tag = if color {
+                format!("\x1b[{sgr}m{glyph}\x1b[0m")
+            } else {
+                glyph.to_string()
+            };
+            out.push_str(&format!("[{tag}] {}: {}\n", check.name, check.message));
             if let Some(remediation) = &check.remediation {
                 out.push_str(&format!("  -> {remediation}\n"));
             }

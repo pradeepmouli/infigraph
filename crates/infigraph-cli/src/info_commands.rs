@@ -786,6 +786,14 @@ pub(crate) fn cmd_purge_sessions(root: &Path, days: u32) -> Result<()> {
     Ok(())
 }
 
+/// Color only when stdout is a real terminal and the user hasn't opted out
+/// via `NO_COLOR` (https://no-color.org/) — piped/redirected output (logs,
+/// CI, `| less`) stays plain so it greps and diffs cleanly.
+fn doctor_output_is_colorized() -> bool {
+    use std::io::IsTerminal;
+    std::env::var_os("NO_COLOR").is_none() && std::io::stdout().is_terminal()
+}
+
 pub(crate) fn cmd_doctor(root: &Path, global: bool) -> Result<()> {
     use infigraph_core::doctor::{
         assemble_context, format_report, run_doctor, CheckStatus, DoctorScope,
@@ -799,7 +807,7 @@ pub(crate) fn cmd_doctor(root: &Path, global: bool) -> Result<()> {
     };
     let ctx = assemble_context(scope);
     let report = run_doctor(ctx);
-    print!("{}", format_report(&report));
+    print!("{}", format_report(&report, doctor_output_is_colorized()));
 
     match report.worst_status() {
         CheckStatus::Pass => Ok(()),

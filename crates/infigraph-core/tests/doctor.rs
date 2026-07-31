@@ -3,7 +3,8 @@ use std::path::PathBuf;
 
 use infigraph_core::doctor::{
     check_disk, check_locks, check_registry, check_sidecars, check_toolchain, check_watchers,
-    find_repo_entry, projects_in_scope, run_doctor, CheckStatus, DoctorContext, DoctorScope,
+    find_repo_entry, format_report, projects_in_scope, run_doctor, CheckResult, CheckStatus,
+    DoctorContext, DoctorReport, DoctorScope,
 };
 use infigraph_core::lockfile::LockInfo;
 use infigraph_core::multi::{Registry, RepoEntry};
@@ -714,4 +715,62 @@ fn run_doctor_passes_registration_for_never_indexed_dir() {
         .find(|c| c.name.contains("registration"))
         .expect("must produce a registration result");
     assert_eq!(registration.status, CheckStatus::Pass);
+}
+
+#[test]
+fn format_report_uses_plain_glyphs_by_color_flag() {
+    let report = DoctorReport {
+        scope: DoctorScope::Project(PathBuf::from("/tmp/x")),
+        checks: vec![
+            CheckResult {
+                category: "disk",
+                name: "disk: free space".to_string(),
+                status: CheckStatus::Pass,
+                message: "10 GB free".to_string(),
+                remediation: None,
+            },
+            CheckResult {
+                category: "locks",
+                name: "graph.lock".to_string(),
+                status: CheckStatus::Warn,
+                message: "stale".to_string(),
+                remediation: Some("delete it".to_string()),
+            },
+            CheckResult {
+                category: "registry",
+                name: "registration".to_string(),
+                status: CheckStatus::Fail,
+                message: "not registered".to_string(),
+                remediation: Some("run infigraph index".to_string()),
+            },
+        ],
+    };
+
+    let plain = format_report(&report, false);
+    assert!(plain.contains("[✓]"), "plain output:\n{plain}");
+    assert!(plain.contains("[!]"), "plain output:\n{plain}");
+    assert!(plain.contains("[✗]"), "plain output:\n{plain}");
+    assert!(
+        !plain.contains('\x1b'),
+        "color=false must never emit ANSI escapes:\n{plain}"
+    );
+
+    let colored = format_report(&report, true);
+    assert!(
+        colored.contains("\x1b[32m✓\x1b[0m"),
+        "colored output:\n{colored}"
+    );
+    assert!(
+        colored.contains("\x1b[33m!\x1b[0m"),
+        "colored output:\n{colored}"
+    );
+    assert!(
+        colored.contains("\x1b[31m✗\x1b[0m"),
+        "colored output:\n{colored}"
+    );
+
+    // Summary line stays plain text regardless of color, so existing
+    // substring-based consumers (e.g. the MCP tool_dispatch test) keep working.
+    assert!(plain.contains("1 PASS, 1 WARN, 1 FAIL"));
+    assert!(colored.contains("1 PASS, 1 WARN, 1 FAIL"));
 }
