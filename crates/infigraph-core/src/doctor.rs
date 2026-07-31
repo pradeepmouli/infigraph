@@ -289,6 +289,8 @@ fn check_unregistered_projects(ctx: &DoctorContext) -> CheckResult {
     }
 }
 
+const LOCK_CATEGORY: &str = "locks";
+
 use crate::lockfile;
 
 fn is_pid_alive(pid: u32) -> bool {
@@ -300,7 +302,7 @@ fn check_one_lock(project_path: &Path, lock_name: &str, installed_build_hash: &s
     let label = format!("{}: {}", project_path.display(), lock_name);
 
     if !lock_path.exists() {
-        return CheckResult::pass(CATEGORY, label, "no lock file present");
+        return CheckResult::pass(LOCK_CATEGORY, label, "no lock file present");
     }
 
     let Some(holder) = lockfile::read_holder(&lock_path) else {
@@ -309,7 +311,7 @@ fn check_one_lock(project_path: &Path, lock_name: &str, installed_build_hash: &s
         // We can't distinguish those from the payload alone -- surface it as a
         // WARN so a human/doctor-caller can check whether it's actually stuck.
         return CheckResult::warn(
-            CATEGORY,
+            LOCK_CATEGORY,
             label,
             "lock file exists but has no readable holder identity (empty or unparseable)",
             "if no infigraph process is running for this project, delete the lock file",
@@ -318,7 +320,7 @@ fn check_one_lock(project_path: &Path, lock_name: &str, installed_build_hash: &s
 
     if !is_pid_alive(holder.pid) {
         return CheckResult::warn(
-            CATEGORY,
+            LOCK_CATEGORY,
             label,
             format!("holder PID {} is not running (stale lock)", holder.pid),
             "safe to delete -- the recorded holder process is gone",
@@ -327,7 +329,7 @@ fn check_one_lock(project_path: &Path, lock_name: &str, installed_build_hash: &s
 
     if holder.build_hash != installed_build_hash {
         return CheckResult::warn(
-            CATEGORY,
+            LOCK_CATEGORY,
             label,
             format!(
                 "holder (PID {}) is running build {}, installed binary is {}",
@@ -338,7 +340,7 @@ fn check_one_lock(project_path: &Path, lock_name: &str, installed_build_hash: &s
     }
 
     CheckResult::pass(
-        CATEGORY,
+        LOCK_CATEGORY,
         label,
         format!("held by live PID {} on the installed build", holder.pid),
     )
