@@ -499,12 +499,13 @@ pub fn check_disk(ctx: &DoctorContext) -> Vec<CheckResult> {
 
     // Informational only -- graph size is reported, never classified.
     let projects: Vec<&RepoEntry> = match &ctx.scope {
-        DoctorScope::Project(path) => ctx
-            .registry
-            .repos
-            .values()
-            .filter(|e| e.path == *path)
-            .collect(),
+        DoctorScope::Project(path) => {
+            if let Some(entry) = find_repo_entry(&ctx.registry, path) {
+                vec![entry]
+            } else {
+                vec![]
+            }
+        }
         DoctorScope::Global => ctx.registry.repos.values().collect(),
     };
     for entry in projects {

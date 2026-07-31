@@ -499,3 +499,39 @@ fn check_toolchain_passes_and_reports_installed_version() {
     assert_eq!(version.status, CheckStatus::Pass);
     assert!(version.message.contains("abc123"));
 }
+
+#[test]
+fn check_disk_graph_size_uses_canonicalized_path_lookup() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let project = dir.path().join("myproj");
+    let infigraph_dir = project.join(".infigraph");
+    let graph_dir = infigraph_dir.join("graph");
+    std::fs::create_dir_all(&graph_dir).unwrap();
+    std::fs::write(graph_dir.join("test.db"), b"x").unwrap();
+
+    let mut repos = HashMap::new();
+    repos.insert(
+        "myproj".to_string(),
+        repo_entry("myproj", project.to_str().unwrap()),
+    );
+    let registry = Registry {
+        repos,
+        groups: HashMap::new(),
+    };
+
+    let ctx = DoctorContext {
+        registry,
+        scope: DoctorScope::Project(project.clone()),
+        installed_build_hash: "h".to_string(),
+        disk_free_bytes: Some(50 * 1024 * 1024 * 1024),
+        scan_roots: Vec::new(),
+    };
+
+    let results = check_disk(&ctx);
+    let graph_size = results
+        .iter()
+        .find(|r| r.name.contains("graph size"))
+        .expect("must find graph size result for matched project");
+    assert_eq!(graph_size.status, CheckStatus::Pass);
+    assert!(graph_size.message.contains("MB"));
+}
