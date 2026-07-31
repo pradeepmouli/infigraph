@@ -364,3 +364,82 @@ pub fn check_locks(ctx: &DoctorContext) -> Vec<CheckResult> {
     }
     results
 }
+
+const WATCHER_HEARTBEAT_STALE_SECS: u64 = 300;
+
+fn now_epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+const WATCHER_CATEGORY: &str = "watchers";
+
+fn check_one_watcher(project_path: &Path) -> CheckResult {
+    let lock_path = project_path.join(".infigraph").join("watch.lock");
+    let label = format!("{}: watcher liveness", project_path.display());
+
+    if !lock_path.exists() {
+        return CheckResult::pass(WATCHER_CATEGORY, label, "no watcher running");
+    }
+
+    let Some(holder) = lockfile::read_holder(&lock_path) else {
+        return CheckResult::pass(
+            WATCHER_CATEGORY,
+            label,
+            "watch.lock present but unreadable (likely cleanly released)",
+        );
+    };
+
+    if !is_pid_alive(holder.pid) {
+        return CheckResult::warn(
+            WATCHER_CATEGORY,
+            label,
+            format!("watch.lock holder PID {} is not running", holder.pid),
+            "stale lock -- safe to delete if you don't expect a watcher here",
+        );
+    }
+
+    // last_heartbeat == acquired_at means this lock type has never called
+    // LockFile::heartbeat() (true for cli-watch as of this writing) -- report
+    // that explicitly rather than treating "never updated" as "just stale."
+    if holder.last_heartbeat == holder.acquired_at {
+        return CheckResult::warn(
+            WATCHER_CATEGORY,
+            label,
+            format!(
+                "watcher (PID {}) is alive, but this lock type never updates its heartbeat -- cannot distinguish frozen from idle",
+                holder.pid
+            ),
+            "no action needed unless the watcher is suspected frozen; this is a known gap (see R2.3.5 in DESIGN-hardening.md)",
+        );
+    }
+
+    if lockfile::is_holder_wedged(
+        holder.last_heartbeat,
+        now_epoch_secs(),
+        WATCHER_HEARTBEAT_STALE_SECS,
+    ) {
+        return CheckResult::warn(
+            WATCHER_CATEGORY,
+            label,
+            format!(
+                "watcher (PID {}) heartbeat is stale (>{}s)",
+                holder.pid, WATCHER_HEARTBEAT_STALE_SECS
+            ),
+            "the watcher process is alive but not making progress -- consider restarting it",
+        );
+    }
+
+    CheckResult::pass(
+        WATCHER_CATEGORY,
+        label,
+        format!("watcher (PID {}) alive with fresh heartbeat", holder.pid),
+    )
+}
+
+pub fn check_watchers(ctx: &DoctorContext) -> Vec<CheckResult> {
+    let projects = projects_in_scope(ctx);
+    projects.iter().map(|p| check_one_watcher(p)).collect()
+}
