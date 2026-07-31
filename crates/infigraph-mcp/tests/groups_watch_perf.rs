@@ -14,6 +14,7 @@ struct GroupFixture {
     svc_a_path: String,
     svc_b_path: String,
     orig_home: String,
+    orig_watch_daemon: Option<String>,
 }
 
 static GROUP_FIXTURE: OnceLock<GroupFixture> = OnceLock::new();
@@ -22,6 +23,17 @@ unsafe impl Sync for GroupFixture {}
 
 fn group_fixture() -> &'static GroupFixture {
     GROUP_FIXTURE.get_or_init(|| {
+        // This test targets the in-process watcher path (WATCHERS map,
+        // stopped via stop_tx below) and asserts on its "Watcher started"
+        // message. If INFIGRAPH_WATCH_DAEMON=1 leaks in from the ambient
+        // environment (e.g. a developer's shell profile), auto-start and
+        // the explicit watch_project call both take the real-subprocess
+        // daemon path instead, whose "AlreadyRunning" message this test
+        // doesn't expect (issue #48) — force it off for the test's duration
+        // regardless of what the environment has set.
+        let orig_watch_daemon = std::env::var("INFIGRAPH_WATCH_DAEMON").ok();
+        std::env::remove_var("INFIGRAPH_WATCH_DAEMON");
+
         let home_dir = tempfile::TempDir::new().expect("tmpdir for home");
         let orig_home = std::env::var("HOME").unwrap_or_default();
         std::env::set_var("HOME", home_dir.path());
@@ -121,6 +133,7 @@ def create_user(data):
             svc_a_path,
             svc_b_path,
             orig_home,
+            orig_watch_daemon,
         }
     })
 }
@@ -443,4 +456,10 @@ fn test_groups_watch_perf() {
 
     // Restore HOME
     std::env::set_var("HOME", &fix.orig_home);
+
+    // Restore INFIGRAPH_WATCH_DAEMON
+    match &fix.orig_watch_daemon {
+        Some(v) => std::env::set_var("INFIGRAPH_WATCH_DAEMON", v),
+        None => std::env::remove_var("INFIGRAPH_WATCH_DAEMON"),
+    }
 }
