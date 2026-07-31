@@ -338,3 +338,28 @@ fn index_project_schema_exposes_full_param() {
         "full must be typed as boolean"
     );
 }
+
+#[test]
+fn test_doctor_tool_project_scope() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().to_str().unwrap();
+
+    let result = infigraph_mcp::dispatch_tool("doctor", &serde_json::json!({ "path": path }));
+    assert!(
+        result.is_ok(),
+        "doctor tool should not error: {:?}",
+        result.err()
+    );
+    let output = result.unwrap();
+    assert!(output.contains("PASS") || output.contains("WARN") || output.contains("FAIL"));
+}
+
+#[test]
+fn test_doctor_tool_defaults_to_current_dir_when_path_omitted() {
+    let result = infigraph_mcp::dispatch_tool("doctor", &serde_json::json!({}));
+    assert!(
+        result.is_ok(),
+        "doctor tool must work with no path argument: {:?}",
+        result.err()
+    );
+}

@@ -1,5 +1,6 @@
 pub mod analysis;
 pub mod docs;
+pub mod doctor;
 pub mod graph;
 pub mod groups;
 pub mod helpers;
