@@ -583,3 +583,66 @@ pub fn check_toolchain(ctx: &DoctorContext) -> Vec<CheckResult> {
         ),
     )]
 }
+
+/// Runs every check category against `ctx` and aggregates the results. Each
+/// category function is already infallible (returns `Vec<CheckResult>`, no
+/// `Result`) -- an internal problem inside a category becomes a `Fail`
+/// result for that specific check via that function's own error handling,
+/// never a panic that would take out the rest of the report.
+pub fn run_doctor(ctx: DoctorContext) -> DoctorReport {
+    let mut checks = Vec::new();
+    checks.extend(check_registry(&ctx));
+    checks.extend(check_locks(&ctx));
+    checks.extend(check_watchers(&ctx));
+    checks.extend(check_disk(&ctx));
+    checks.extend(check_sidecars(&ctx));
+    checks.extend(check_toolchain(&ctx));
+    DoctorReport {
+        checks,
+        scope: ctx.scope,
+    }
+}
+
+/// Human-readable report, grouped by category, one line per check plus a
+/// remediation line when present, ending with a summary count. Shared by
+/// the CLI and MCP surfaces.
+pub fn format_report(report: &DoctorReport) -> String {
+    let mut out = String::new();
+    let mut by_category: std::collections::BTreeMap<&str, Vec<&CheckResult>> =
+        std::collections::BTreeMap::new();
+    for check in &report.checks {
+        by_category.entry(check.category).or_default().push(check);
+    }
+
+    let mut pass = 0;
+    let mut warn = 0;
+    let mut fail = 0;
+
+    for (category, checks) in by_category {
+        out.push_str(&format!("== {category} ==\n"));
+        for check in checks {
+            let label = match check.status {
+                CheckStatus::Pass => {
+                    pass += 1;
+                    "PASS"
+                }
+                CheckStatus::Warn => {
+                    warn += 1;
+                    "WARN"
+                }
+                CheckStatus::Fail => {
+                    fail += 1;
+                    "FAIL"
+                }
+            };
+            out.push_str(&format!("[{label}] {}: {}\n", check.name, check.message));
+            if let Some(remediation) = &check.remediation {
+                out.push_str(&format!("  -> {remediation}\n"));
+            }
+        }
+        out.push('\n');
+    }
+
+    out.push_str(&format!("{pass} PASS, {warn} WARN, {fail} FAIL\n"));
+    out
+}

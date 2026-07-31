@@ -785,3 +785,25 @@ pub(crate) fn cmd_purge_sessions(root: &Path, days: u32) -> Result<()> {
     println!("{result}");
     Ok(())
 }
+
+pub(crate) fn cmd_doctor(root: &Path, global: bool) -> Result<()> {
+    use infigraph_core::doctor::{
+        assemble_context, format_report, run_doctor, CheckStatus, DoctorScope,
+    };
+
+    let scope = if global {
+        DoctorScope::Global
+    } else {
+        let canonical_root = root.canonicalize().context("invalid project root")?;
+        DoctorScope::Project(canonical_root)
+    };
+    let ctx = assemble_context(scope);
+    let report = run_doctor(ctx);
+    print!("{}", format_report(&report));
+
+    match report.worst_status() {
+        CheckStatus::Pass => Ok(()),
+        CheckStatus::Warn => anyhow::bail!("doctor found warnings"),
+        CheckStatus::Fail => std::process::exit(2),
+    }
+}

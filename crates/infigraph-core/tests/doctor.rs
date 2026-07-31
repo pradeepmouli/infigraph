@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use infigraph_core::doctor::{
     check_disk, check_locks, check_registry, check_sidecars, check_toolchain, check_watchers,
-    find_repo_entry, projects_in_scope, CheckStatus, DoctorContext, DoctorScope,
+    find_repo_entry, projects_in_scope, run_doctor, CheckStatus, DoctorContext, DoctorScope,
 };
 use infigraph_core::lockfile::LockInfo;
 use infigraph_core::multi::{Registry, RepoEntry};
@@ -534,4 +534,27 @@ fn check_disk_graph_size_uses_canonicalized_path_lookup() {
         .expect("must find graph size result for matched project");
     assert_eq!(graph_size.status, CheckStatus::Pass);
     assert!(graph_size.message.contains("MB"));
+}
+
+#[test]
+fn run_doctor_aggregates_every_check_category() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let project = dir.path().join("myproj");
+    std::fs::create_dir_all(&project).unwrap();
+
+    let ctx = DoctorContext {
+        registry: infigraph_core::multi::Registry::default(),
+        scope: DoctorScope::Project(project),
+        installed_build_hash: "h".to_string(),
+        disk_free_bytes: Some(50 * 1024 * 1024 * 1024),
+        scan_roots: Vec::new(),
+    };
+
+    let report = run_doctor(ctx);
+    let categories: std::collections::HashSet<&str> =
+        report.checks.iter().map(|c| c.category).collect();
+    assert!(categories.contains("registry"));
+    // registration check on an unregistered temp dir must FAIL, making the
+    // aggregate worst status FAIL -- proves run_doctor doesn't silently drop it
+    assert_eq!(report.worst_status(), CheckStatus::Fail);
 }

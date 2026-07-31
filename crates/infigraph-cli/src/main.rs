@@ -86,6 +86,15 @@ enum Commands {
     /// Show graph statistics
     Stats,
 
+    /// Health checks for the infigraph installation: registry consistency,
+    /// lock status, watcher liveness, disk space, sidecar freshness,
+    /// toolchain validity. Defaults to the current project; --global sweeps
+    /// every registered project.
+    Doctor {
+        /// Sweep every registered project instead of just the current one
+        #[arg(long)]
+        global: bool,
+    },
     /// List available languages
     Languages,
 
@@ -833,6 +842,7 @@ fn run(command: Commands, root: &Path) -> Result<()> {
         Commands::Init { group, quick, yes } => cmd_init(root, group.as_deref(), quick, yes),
         Commands::Index { full, no_embed } => cmd_index(root, full, no_embed),
         Commands::Stats => cmd_stats(root),
+        Commands::Doctor { global } => cmd_doctor(root, global),
         Commands::Languages => cmd_languages(Some(root)),
         Commands::Symbols { file } => cmd_symbols(root, &file),
         Commands::Skeleton { file } => cmd_skeleton(root, &file),
