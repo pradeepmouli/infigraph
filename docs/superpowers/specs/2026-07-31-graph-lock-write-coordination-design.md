@@ -1,9 +1,13 @@
 # Cross-Process Write Coordination — Lock-Before-Open Ordering + Watcher Connection Yield
 
 **Date:** 2026-07-31
-**Status:** Approved (design); spec self-review pending, then user review gate
+**Status:** Approved (design); spec self-review complete, delivery structure confirmed
 **Parent:** `docs/DESIGN-hardening.md` — completes R2.3.7 (write safety); gap-closure follow-up to `docs/superpowers/specs/2026-07-20-write-safety-locks-design.md`, whose PR 1-2 implemented `graph.lock`'s per-call leasing but left the gaps below unaddressed
 **Also resolves:** the direct conflict between upstream PR #43 (persistent watcher DB connection) and upstream issue #46 (watcher starves other writers) — this design is the "we will come up with a solution for both issues" follow-up promised on #46.
+
+**Delivery (two upstream PRs, verified against `upstream/main`):**
+- **Part 1 PR** — standalone, opens against `upstream/main` directly. Confirmed applicable to unmodified upstream: `lockfile.rs`, `graph.lock`/`WriteLock`, and `watch.lock` all already exist there, and `store.rs:49-54`'s `open()` has the identical open-before-lock ordering bug. No dependency on PR #43 — two short-lived writers race on plain upstream today, independent of the watcher.
+- **Part 2 PR** — stacked on top of PR #43's branch (`fix/watch-persistent-db-connection`, worktree `scratchpad/wt-upstream-watch-persistent-conn`), not opened until #43 exists to build on. Confirmed there is nothing for Part 2 to fix on unmodified upstream: `watch/mod.rs:343` there still opens a fresh `Infigraph::open()` per batch (the original short-lived design, no `held_prism`), so the connection-yield mechanism has no long-lived connection to protect against until #43 lands.
 
 ## Problem
 
