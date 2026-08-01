@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 /// A request for the daemon to perform a write. Carries references (paths),
 /// never pre-computed data -- the daemon does its own parsing/extraction
@@ -56,6 +58,61 @@ pub fn write_atomic(path: &Path, contents: &str) -> anyhow::Result<()> {
     drop(file);
     std::fs::rename(&tmp_path, path)?;
     Ok(())
+}
+
+/// Process-local disambiguator: `SystemTime::now()`'s nanosecond field is
+/// not guaranteed nanosecond-*resolution* on every platform, so two
+/// threads in the same process racing this function could otherwise
+/// collide on the same request name -- `write_atomic` overwrites
+/// unconditionally (no existence check), so a collision would silently
+/// drop one caller's request rather than erroring.
+static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Writes `request` as a `.request` file into `staging_dir` (unique name:
+/// pid + nanosecond timestamp + a process-local counter -- no new
+/// dependency, no UUID crate), then polls for the matching `.result` file
+/// until `timeout` expires. Bounded-wait-with-backoff, same idiom as
+/// `lockfile::acquire`.
+pub fn submit_write_request(
+    staging_dir: &Path,
+    request: &WriteRequest,
+    timeout: Duration,
+) -> anyhow::Result<WriteResult> {
+    std::fs::create_dir_all(staging_dir)?;
+    let counter = REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let name = format!(
+        "{}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos(),
+        counter
+    );
+    let request_path = staging_dir.join(format!("{name}.request"));
+    let result_path = staging_dir.join(format!("{name}.result"));
+
+    write_atomic(&request_path, &serde_json::to_string(request)?)?;
+
+    let start = Instant::now();
+    let mut delay = Duration::from_millis(10);
+    loop {
+        if result_path.exists() {
+            let contents = std::fs::read_to_string(&result_path)?;
+            std::fs::remove_file(&result_path).ok();
+            return Ok(serde_json::from_str(&contents)?);
+        }
+        if start.elapsed() >= timeout {
+            std::fs::remove_file(&request_path).ok();
+            anyhow::bail!(
+                "no daemon responded to write request within {:?} ({})",
+                timeout,
+                request_path.display()
+            );
+        }
+        std::thread::sleep(delay.min(timeout.saturating_sub(start.elapsed())));
+        delay = (delay * 2).min(Duration::from_millis(200));
+    }
 }
 
 #[cfg(test)]
@@ -167,5 +224,75 @@ mod tests {
         let json = serde_json::to_string(&res).unwrap();
         let back: WriteResult = serde_json::from_str(&json).unwrap();
         assert_eq!(res, back);
+    }
+}
+
+#[cfg(test)]
+mod submit_tests {
+    use super::{submit_write_request, write_atomic, WriteRequest, WriteResult};
+    use std::time::Duration;
+
+    #[test]
+    fn submit_write_request_writes_request_file_and_returns_matching_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging_dir = dir.path().join("requests");
+        std::fs::create_dir_all(&staging_dir).unwrap();
+
+        let request = WriteRequest::Index {
+            paths: Some(vec!["src/main.rs".into()]),
+        };
+
+        // Simulate the server: a background thread watches for the request
+        // file to appear, then writes a matching result file.
+        let staging_dir_clone = staging_dir.clone();
+        let handle = std::thread::spawn(move || {
+            let start = std::time::Instant::now();
+            loop {
+                let entries: Vec<_> = std::fs::read_dir(&staging_dir_clone)
+                    .unwrap()
+                    .filter_map(|e| e.ok())
+                    .filter(|e| e.path().extension().is_some_and(|ext| ext == "request"))
+                    .collect();
+                if let Some(entry) = entries.first() {
+                    let result_path = entry.path().with_extension("result");
+                    let result = WriteResult::Ok {
+                        total_files: 1,
+                        indexed_files: 1,
+                    };
+                    write_atomic(&result_path, &serde_json::to_string(&result).unwrap()).unwrap();
+                    std::fs::remove_file(entry.path()).unwrap();
+                    return;
+                }
+                if start.elapsed() > Duration::from_secs(2) {
+                    panic!("test server never saw a request file appear");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+
+        let result = submit_write_request(&staging_dir, &request, Duration::from_secs(2)).unwrap();
+        assert_eq!(
+            result,
+            WriteResult::Ok {
+                total_files: 1,
+                indexed_files: 1,
+            }
+        );
+
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn submit_write_request_times_out_cleanly_when_no_result_appears() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging_dir = dir.path().join("requests");
+        std::fs::create_dir_all(&staging_dir).unwrap();
+
+        let request = WriteRequest::Index { paths: None };
+        let result = submit_write_request(&staging_dir, &request, Duration::from_millis(200));
+        assert!(
+            result.is_err(),
+            "expected a timeout error when no server ever responds"
+        );
     }
 }
