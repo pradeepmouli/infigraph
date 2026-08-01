@@ -45,8 +45,14 @@ pub fn write_atomic(path: &Path, contents: &str) -> anyhow::Result<()> {
         std::process::id()
     ));
     let mut file = std::fs::File::create(&tmp_path)?;
-    file.write_all(contents.as_bytes())?;
-    file.sync_all()?;
+    if let Err(e) = file.write_all(contents.as_bytes()) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e.into());
+    }
+    if let Err(e) = file.sync_all() {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e.into());
+    }
     drop(file);
     std::fs::rename(&tmp_path, path)?;
     Ok(())
@@ -88,6 +94,45 @@ mod atomic_write_tests {
         write_atomic(&path, "first").unwrap();
         write_atomic(&path, "second").unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "second");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn write_atomic_cleans_up_temp_file_on_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let subdir = dir.path().join("sub");
+        std::fs::create_dir(&subdir).unwrap();
+
+        let path = subdir.join("test.json");
+
+        // Create a file first (this will succeed)
+        write_atomic(&path, "initial").unwrap();
+
+        // Make the directory read-only to cause subsequent write_atomic to fail
+        std::fs::set_permissions(&subdir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        // Try to write again (this will fail)
+        let result = write_atomic(&path, "should fail");
+
+        // Restore permissions so we can check directory contents
+        std::fs::set_permissions(&subdir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(result.is_err(), "write should have failed");
+
+        // Verify only the original file exists; no temp files should be orphaned
+        let entries: Vec<_> = std::fs::read_dir(&subdir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+
+        assert_eq!(
+            entries.len(),
+            1,
+            "should only have the original file, no temp files. Found: {entries:?}"
+        );
+        assert_eq!(entries[0], "test.json");
     }
 }
 
