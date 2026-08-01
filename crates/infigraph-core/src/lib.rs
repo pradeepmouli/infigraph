@@ -6,6 +6,7 @@ pub mod claude_md;
 pub mod cluster;
 pub mod concerns;
 pub mod config;
+pub mod daemon_protocol;
 pub mod diff;
 pub mod doctor;
 pub mod embed;
