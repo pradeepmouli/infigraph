@@ -396,11 +396,14 @@ git commit -m "feat: add submit_write_request client-side polling function"
 ### Task 4: Server-side request handling
 
 **Files:**
-- Modify: `crates/infigraph-core/src/daemon_protocol.rs`
+- Modify: `crates/infigraph-core/src/daemon_protocol.rs` (the `serve_one_request` function itself)
+- Create: `crates/infigraph-core/tests/daemon_protocol_serve.rs` (tests — see note below, not a `#[cfg(test)]` unit-test module)
 
 **Interfaces:**
 - Consumes: `WriteRequest`/`WriteResult` (Task 1), `write_atomic` (Task 2), `Infigraph::index_files`/`Infigraph::index` (existing, `lib.rs:493`/`:299` on this branch — not upstream/main, where they're at different line numbers; this plan targets whatever's checked out, `feat/hardening`, not a specific pinned branch like the earlier ordering-fix plan did).
 - Produces: `pub fn serve_one_request(infigraph: &Infigraph, request_path: &Path) -> Result<()>` — used by a later plan's watcher-loop wiring.
+
+**Discovered during implementation (corrected here, not just in git history):** this task's tests must live in a separate integration test file (`crates/infigraph-core/tests/daemon_protocol_serve.rs`), not a `#[cfg(test)]` unit-test module inside `daemon_protocol.rs` itself. `infigraph-core`'s `Cargo.toml` has a dev-dependency cycle (`infigraph-languages` depends back on `infigraph-core`; see the comment above that dependency line), and `cargo test --lib` compiles a distinct `--cfg test` instance of `infigraph-core` from the normal instance the dev-dependency needs — so `bundled_registry()`'s returned `LanguageRegistry` type is incompatible with `crate::lang::LanguageRegistry` when called from a unit test, but compiles and works correctly from a separate integration test binary (confirmed pre-existing precedent: `crates/infigraph-core/tests/remote_cross_service.rs` already uses `bundled_registry()` successfully). The steps below are written as originally planned (unit-test module) for historical accuracy; follow the corrected file placement above instead — the test code itself is otherwise identical, just needs `infigraph_core::`-qualified imports instead of `crate::` ones.
 
 - [ ] **Step 1: Write the failing test**
 
