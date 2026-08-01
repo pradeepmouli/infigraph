@@ -296,3 +296,176 @@ mod submit_tests {
         );
     }
 }
+
+use crate::Infigraph;
+
+/// Reads the request at `request_path`, executes it against `infigraph`
+/// (an already-open, write-mode `Infigraph` -- the daemon's own persistent
+/// connection), writes the matching `.result` file, then removes the
+/// request file. Never panics on a failed operation -- a request that
+/// fails to index still produces an `Err` result file, so the caller's
+/// `submit_write_request` poll resolves instead of timing out. A request
+/// file that fails to even parse (corrupt/truncated write) also produces
+/// an `Err` result rather than silently leaving the caller to time out.
+///
+/// Assumes the single-daemon invariant this whole design is built on: at
+/// most one process ever calls this function for a given `request_path`.
+/// Under that invariant there's no read-execute-write-remove TOCTOU risk;
+/// this function does not defend against a second concurrent caller (e.g.
+/// via a claim-by-rename step) since that scenario should never arise in
+/// the real architecture -- if it's ever reused somewhere that invariant
+/// doesn't hold, add that defense first.
+pub fn serve_one_request(infigraph: &Infigraph, request_path: &Path) -> anyhow::Result<()> {
+    let result_path = request_path.with_extension("result");
+
+    let result = match std::fs::read_to_string(request_path)
+        .map_err(anyhow::Error::from)
+        .and_then(|contents| Ok(serde_json::from_str::<WriteRequest>(&contents)?))
+    {
+        Ok(request) => match &request {
+            WriteRequest::Index { paths: None } => match infigraph.index() {
+                Ok(r) => WriteResult::Ok {
+                    total_files: r.total_files,
+                    indexed_files: r.indexed_files,
+                },
+                Err(e) => WriteResult::Err {
+                    message: e.to_string(),
+                },
+            },
+            WriteRequest::Index { paths: Some(paths) } => match infigraph.index_files(paths) {
+                Ok(r) => WriteResult::Ok {
+                    total_files: r.total_files,
+                    indexed_files: r.indexed_files,
+                },
+                Err(e) => WriteResult::Err {
+                    message: e.to_string(),
+                },
+            },
+            WriteRequest::ScipImport { scip_path: _ } => WriteResult::Err {
+                message: "scip-import serving not yet implemented".to_string(),
+            },
+        },
+        Err(e) => WriteResult::Err {
+            message: format!("failed to read/parse request: {e}"),
+        },
+    };
+
+    write_atomic(&result_path, &serde_json::to_string(&result)?)?;
+    // Tolerate the request file already being gone: a caller that timed
+    // out (submit_write_request) removes its own request file, and this
+    // function may race that removal if it finishes serving right around
+    // the caller's timeout. The result file above is still written either
+    // way -- an accepted, documented gap (unconsumed result files
+    // accumulating in the staging directory) that the watcher-wiring plan
+    // needs to address with a cleanup/TTL pass, not silently ignored here.
+    std::fs::remove_file(request_path).ok();
+    Ok(())
+}
+
+#[cfg(test)]
+mod serve_tests {
+    use super::{serve_one_request, write_atomic, WriteRequest, WriteResult};
+    use crate::Infigraph;
+
+    #[test]
+    fn serve_one_request_indexes_and_writes_result_and_removes_request() {
+        let project_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            project_dir.path().join("main.py"),
+            "def hello():\n    pass\n",
+        )
+        .unwrap();
+
+        let mut infigraph = Infigraph::open(project_dir.path(), {
+            use crate::lang::LanguageRegistry;
+            LanguageRegistry::new()
+        })
+        .unwrap();
+        infigraph.init().unwrap();
+
+        let staging_dir = project_dir.path().join(".infigraph").join("requests");
+        std::fs::create_dir_all(&staging_dir).unwrap();
+        let request_path = staging_dir.join("test-1.request");
+        let result_path = staging_dir.join("test-1.result");
+        write_atomic(
+            &request_path,
+            &serde_json::to_string(&WriteRequest::Index { paths: None }).unwrap(),
+        )
+        .unwrap();
+
+        serve_one_request(&infigraph, &request_path).unwrap();
+
+        assert!(
+            !request_path.exists(),
+            "request file should be removed after serving"
+        );
+        assert!(result_path.exists(), "result file should have been written");
+        let result: WriteResult =
+            serde_json::from_str(&std::fs::read_to_string(&result_path).unwrap()).unwrap();
+        match result {
+            WriteResult::Ok { indexed_files, .. } => assert_eq!(indexed_files, 1),
+            WriteResult::Err { message } => panic!("expected Ok, got Err: {message}"),
+        }
+    }
+
+    #[test]
+    fn serve_one_request_writes_err_result_on_failure_without_panicking() {
+        let project_dir = tempfile::tempdir().unwrap();
+        let mut infigraph = Infigraph::open(project_dir.path(), {
+            use crate::lang::LanguageRegistry;
+            LanguageRegistry::new()
+        })
+        .unwrap();
+        infigraph.init().unwrap();
+
+        let staging_dir = project_dir.path().join(".infigraph").join("requests");
+        std::fs::create_dir_all(&staging_dir).unwrap();
+        let request_path = staging_dir.join("test-2.request");
+        let result_path = staging_dir.join("test-2.result");
+        // A path that doesn't exist -- index_files should fail cleanly per-file,
+        // not panic; serve_one_request must still produce a result file.
+        write_atomic(
+            &request_path,
+            &serde_json::to_string(&WriteRequest::Index {
+                paths: Some(vec!["does/not/exist.py".into()]),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        serve_one_request(&infigraph, &request_path).unwrap();
+        assert!(result_path.exists());
+    }
+
+    #[test]
+    fn serve_one_request_writes_err_result_on_corrupt_request_json() {
+        let project_dir = tempfile::tempdir().unwrap();
+        let mut infigraph = Infigraph::open(project_dir.path(), {
+            use crate::lang::LanguageRegistry;
+            LanguageRegistry::new()
+        })
+        .unwrap();
+        infigraph.init().unwrap();
+
+        let staging_dir = project_dir.path().join(".infigraph").join("requests");
+        std::fs::create_dir_all(&staging_dir).unwrap();
+        let request_path = staging_dir.join("test-3.request");
+        let result_path = staging_dir.join("test-3.result");
+        // Not valid JSON at all -- a caller must still get a result rather
+        // than timing out with no explanation.
+        write_atomic(&request_path, "not valid json {{{").unwrap();
+
+        serve_one_request(&infigraph, &request_path).unwrap();
+
+        assert!(
+            result_path.exists(),
+            "corrupt request must still produce a result file"
+        );
+        let result: WriteResult =
+            serde_json::from_str(&std::fs::read_to_string(&result_path).unwrap()).unwrap();
+        assert!(
+            matches!(result, WriteResult::Err { .. }),
+            "expected Err for a corrupt request, got {result:?}"
+        );
+    }
+}
