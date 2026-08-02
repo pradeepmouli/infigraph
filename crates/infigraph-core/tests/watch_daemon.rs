@@ -102,22 +102,48 @@ fn ensure_daemon_running_noops_when_not_yet_indexed() {
     );
 }
 
+/// Direct, deterministic assertion on the `Command` that `spawn_daemon`
+/// builds (via the `pub` `build_daemon_command` helper): its env mutations
+/// must include an explicit removal of `INFIGRAPH_BACKEND`, regardless of
+/// what leaked into the *test's own* environment. `Command::get_envs()`
+/// (stable since Rust 1.57) iterates a command's explicit env mutations,
+/// where a removed var appears as `(key, None)` — so this proves
+/// `env_remove("INFIGRAPH_BACKEND")` was actually applied to the command
+/// that will be exec'd. Delete that call from `build_daemon_command` and
+/// this assertion fails; keep it and the test passes — no timing, no OS
+/// tool dependency, no reliance on a placeholder backend panicking.
+#[test]
+fn build_daemon_command_strips_infigraph_backend_env_var() {
+    let project_dir = tempfile::tempdir().unwrap();
+    let tg_dir = project_dir.path().join(".infigraph");
+    std::fs::create_dir_all(&tg_dir).unwrap();
+
+    let cmd = infigraph_core::watch::daemon::build_daemon_command(
+        project_dir.path(),
+        &tg_dir,
+        std::path::Path::new("/nonexistent/infigraph"),
+    );
+
+    let removed = cmd
+        .get_envs()
+        .any(|(key, value)| key == "INFIGRAPH_BACKEND" && value.is_none());
+    assert!(
+        removed,
+        "expected build_daemon_command's Command to explicitly remove INFIGRAPH_BACKEND from its env"
+    );
+}
+
+/// Sanity check that a daemon spawned via `ensure_daemon_running` still
+/// starts up and acquires `watch.lock` end-to-end, even with
+/// `INFIGRAPH_BACKEND=daemon` leaked into the *test's own* environment.
+/// This supplements (does not replace) the deterministic
+/// `build_daemon_command_strips_infigraph_backend_env_var` assertion above:
+/// lock acquisition in `cmd_daemon` happens before backend selection is
+/// even reached, so this alone can't prove the env-stripping fix works —
+/// it only proves the daemon still functions normally.
 #[test]
 #[cfg(unix)]
-fn spawn_daemon_child_command_does_not_inherit_infigraph_backend() {
-    // spawn_daemon is private to the daemon module; this test exercises it
-    // indirectly through ensure_daemon_running, then inspects the actual
-    // spawned process's environment via /proc (Linux) is not portable to
-    // macOS, so instead: assert the *intent* at the unit level by checking
-    // the Command-building helper directly. Since spawn_daemon is a free
-    // function returning a spawned child (not testable via mocking without
-    // real process spawn), this test spawns a real detached child against a
-    // temp project and confirms it starts (Spawned outcome) with
-    // INFIGRAPH_BACKEND set in the *test's* own environment -- if the
-    // child inherited it and it caused `cmd_daemon` to select DaemonKuzu on
-    // itself, the daemon would hang waiting on ensure_daemon_running's own
-    // request (deadlock) instead of successfully acquiring watch.lock, and
-    // this test's later liveness check would fail.
+fn spawn_daemon_child_still_starts_with_infigraph_backend_leaked_into_test_env() {
     let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let project_dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(project_dir.path().join(".infigraph")).unwrap();
@@ -144,9 +170,7 @@ fn spawn_daemon_child_command_does_not_inherit_infigraph_backend() {
         "expected the daemon to spawn successfully despite INFIGRAPH_BACKEND=daemon in this test's own env"
     );
 
-    // Give the child a moment to acquire watch.lock -- if it deadlocked
-    // trying to route its own writes through itself, this lock would
-    // never be held.
+    // Give the child a moment to acquire watch.lock.
     let lock_path = project_dir.path().join(".infigraph").join("watch.lock");
     let start = std::time::Instant::now();
     loop {
@@ -154,7 +178,7 @@ fn spawn_daemon_child_command_does_not_inherit_infigraph_backend() {
             break;
         }
         if start.elapsed() > std::time::Duration::from_secs(5) {
-            panic!("daemon never acquired watch.lock -- likely deadlocked routing its own writes through itself");
+            panic!("daemon never acquired watch.lock");
         }
         std::thread::sleep(std::time::Duration::from_millis(50));
     }

@@ -108,7 +108,12 @@ pub fn ensure_daemon_running(root: &Path, watch_binary: &Path) -> DaemonStartOut
     }
 }
 
-fn spawn_daemon(root: &Path, tg_dir: &Path, watch_binary: &Path) -> DaemonStartOutcome {
+/// Build (without spawning) the `Command` used to launch a detached
+/// `infigraph daemon` child for `root`. Exposed as `pub` — separate from
+/// [`spawn_daemon`] — so integration tests can assert on the command's
+/// configuration (e.g. its env mutations) directly, without needing to
+/// actually spawn and observe a real child process.
+pub fn build_daemon_command(root: &Path, tg_dir: &Path, watch_binary: &Path) -> Command {
     let log_path = tg_dir.join("watch.log");
     let stderr_target = match std::fs::File::create(&log_path) {
         Ok(f) => Stdio::from(f),
@@ -143,6 +148,11 @@ fn spawn_daemon(root: &Path, tg_dir: &Path, watch_binary: &Path) -> DaemonStartO
         cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
     }
 
+    cmd
+}
+
+fn spawn_daemon(root: &Path, tg_dir: &Path, watch_binary: &Path) -> DaemonStartOutcome {
+    let mut cmd = build_daemon_command(root, tg_dir, watch_binary);
     match cmd.spawn() {
         Ok(_) => DaemonStartOutcome::Spawned,
         Err(e) => DaemonStartOutcome::Failed(e.to_string()),
