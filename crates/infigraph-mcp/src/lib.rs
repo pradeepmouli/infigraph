@@ -56,7 +56,7 @@ pub const MCP_TO_CLI_MAP: &[(&str, &str)] = &[
     ("detect_path_traversal", "path-traversal"),
     ("ingest_structured", "ingest"),
     ("semantic_diff", "semantic-diff"),
-    ("watch_project", "watch"),
+    ("watch_project", "daemon"),
     ("detect_bridges", "bridges"),
     ("detect_clones", "clones"),
     ("refactor", "refactor"),
