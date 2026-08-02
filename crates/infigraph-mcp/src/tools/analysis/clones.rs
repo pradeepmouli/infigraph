@@ -89,7 +89,17 @@ pub fn tool_detect_clones(args: &Value) -> Result<String> {
 
     if store_edges && !pairs.is_empty() {
         for (score, i, j) in &pairs {
-            let _ = backend.upsert_similar_edge(&symbol_vecs[*i].0, &symbol_vecs[*j].0, *score);
+            if let Err(e) =
+                backend.upsert_similar_edge(&symbol_vecs[*i].0, &symbol_vecs[*j].0, *score)
+            {
+                crate::mcp_log(
+                    "WARN",
+                    &format!(
+                        "failed to store similarity edge {} <-> {}: {e}",
+                        symbol_vecs[*i].0, symbol_vecs[*j].0
+                    ),
+                );
+            }
         }
     }
 

@@ -500,7 +500,13 @@ pub(crate) fn cmd_clones(root: &Path, threshold: f64, limit: usize) -> Result<()
     }
 
     for (score, i, j) in &pairs {
-        let _ = backend.upsert_similar_edge(&symbol_vecs[*i].0, &symbol_vecs[*j].0, *score);
+        if let Err(e) = backend.upsert_similar_edge(&symbol_vecs[*i].0, &symbol_vecs[*j].0, *score)
+        {
+            eprintln!(
+                "warning: failed to store similarity edge {} <-> {}: {e}",
+                symbol_vecs[*i].0, symbol_vecs[*j].0
+            );
+        }
     }
 
     println!(
