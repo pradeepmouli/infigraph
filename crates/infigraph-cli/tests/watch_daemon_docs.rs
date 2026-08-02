@@ -16,6 +16,33 @@ fn cli_binary() -> std::path::PathBuf {
     deps_dir.parent().unwrap().join("infigraph")
 }
 
+/// RAII guard that kills and reaps a spawned child process on drop, so a
+/// panic anywhere in the test (not just the happy path) can't leave a real
+/// `infigraph daemon` process running forever against an abandoned tempdir.
+/// `std::process::Child` does not do this itself -- Drop just closes the
+/// parent's handle, the child keeps running independently.
+struct KillOnDrop(std::process::Child);
+
+impl std::ops::Deref for KillOnDrop {
+    type Target = std::process::Child;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for KillOnDrop {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 /// Real end-to-end test: spawns `infigraph watch <root>` as a genuine
 /// detached child process, indexes docs for the same root partway through,
 /// and confirms the daemon's doc thread picked it up without restarting
@@ -64,19 +91,21 @@ fn cmd_watch_daemon_also_indexes_docs_without_restart() {
     std::fs::create_dir_all(root.join(".infigraph")).unwrap();
     std::fs::write(root.join("main.rs"), "fn main() {}").unwrap();
 
-    let mut child = Command::new(&bin)
-        .arg("daemon")
-        .arg("--debounce")
-        .arg("50")
-        // Fast daemon attach-poll so this test doesn't wait through the
-        // production default (1000ms) to notice docs.kuzu appearing.
-        .env("INFIGRAPH_DOC_DAEMON_POLL_MS", "50")
-        .current_dir(&root)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("failed to spawn infigraph watch");
+    let mut child = KillOnDrop(
+        Command::new(&bin)
+            .arg("daemon")
+            .arg("--debounce")
+            .arg("50")
+            // Fast daemon attach-poll so this test doesn't wait through the
+            // production default (1000ms) to notice docs.kuzu appearing.
+            .env("INFIGRAPH_DOC_DAEMON_POLL_MS", "50")
+            .current_dir(&root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("failed to spawn infigraph watch"),
+    );
 
     let (attach_tx, attach_rx) = mpsc::channel::<()>();
     let (reindexed_tx, reindexed_rx) = mpsc::channel::<String>();
@@ -125,6 +154,10 @@ fn cmd_watch_daemon_also_indexes_docs_without_restart() {
 
     let reindex_line = reindexed_rx.recv_timeout(Duration::from_secs(10));
 
+    // Kill the daemon now rather than waiting for `child` to drop at end of
+    // scope, so it can't still be writing reindex lines during the
+    // post-kill assertions below. `KillOnDrop` still guards every other
+    // exit path (early return, panic).
     let _ = child.kill();
     let _ = child.wait();
 
@@ -139,5 +172,47 @@ fn cmd_watch_daemon_also_indexes_docs_without_restart() {
     assert!(
         indexed_files > 0,
         "expected a real reindex of readme.md, got: {reindex_line}"
+    );
+}
+
+/// Regression test for `KillOnDrop` itself: a panic while a spawned child is
+/// wrapped in the guard must still kill and reap the child. This is the
+/// scenario that used to leak real `infigraph daemon` processes above --
+/// an `.expect()` panicking before the old explicit `child.kill()` call ran
+/// left the spawned process orphaned forever, reparented to PID 1, holding
+/// a real `.infigraph/watch.lock`. Proving Drop fires on the unwind path
+/// (not just the normal return path) is the whole point of the fix.
+#[cfg(unix)]
+#[test]
+fn kill_on_drop_kills_child_on_panic() {
+    let child = Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("failed to spawn sleep");
+    let pid = child.id();
+    assert!(
+        infigraph_mcp::lifecycle::process_alive(pid),
+        "sleep process should be alive right after spawn"
+    );
+
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _guard = KillOnDrop(child);
+        panic!("simulated panic while the guard is alive");
+    }));
+    assert!(unwound.is_err(), "expected the closure to panic");
+
+    // Give the OS a brief moment to finish tearing the process down after
+    // the guard's Drop sends the kill signal during unwind.
+    let mut still_alive = infigraph_mcp::lifecycle::process_alive(pid);
+    for _ in 0..50 {
+        if !still_alive {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        still_alive = infigraph_mcp::lifecycle::process_alive(pid);
+    }
+    assert!(
+        !still_alive,
+        "KillOnDrop must kill child pid {pid} even when dropped during a panic unwind"
     );
 }
