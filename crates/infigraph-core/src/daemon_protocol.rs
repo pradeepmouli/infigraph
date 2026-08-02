@@ -21,6 +21,11 @@ pub enum WriteRequest {
         schema_id: String,
         source: IngestSource,
     },
+    /// Create a Repo node and link this project's files to it.
+    UpsertRepo { namespace: String },
+    /// Derive TESTED_BY edges. `files` scopes to changed files for
+    /// incremental runs; `None` means a full derivation pass.
+    DeriveTestedBy { files: Option<Vec<String>> },
 }
 
 /// Where IngestStructured's data comes from. `Inline` carries no data
@@ -377,6 +382,39 @@ pub fn serve_one_request(infigraph: &Infigraph, request_path: &Path) -> anyhow::
                     },
                     Err(e) => WriteResult::Err {
                         message: e.to_string(),
+                    },
+                }
+            }
+            WriteRequest::UpsertRepo { namespace } => match infigraph.backend() {
+                Some(b) => match b.upsert_repo(namespace) {
+                    Ok(()) => WriteResult::Ok {
+                        total_files: 0,
+                        indexed_files: 0,
+                    },
+                    Err(e) => WriteResult::Err {
+                        message: e.to_string(),
+                    },
+                },
+                None => WriteResult::Err {
+                    message: "graph not initialized".to_string(),
+                },
+            },
+            WriteRequest::DeriveTestedBy { files } => {
+                let files_ref: Option<Vec<&str>> = files
+                    .as_ref()
+                    .map(|f| f.iter().map(String::as_str).collect());
+                match infigraph.backend() {
+                    Some(b) => match b.derive_tested_by_edges(files_ref.as_deref()) {
+                        Ok(count) => WriteResult::Ok {
+                            total_files: 0,
+                            indexed_files: count,
+                        },
+                        Err(e) => WriteResult::Err {
+                            message: e.to_string(),
+                        },
+                    },
+                    None => WriteResult::Err {
+                        message: "graph not initialized".to_string(),
                     },
                 }
             }

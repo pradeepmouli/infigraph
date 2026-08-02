@@ -235,3 +235,67 @@ node_table = "TestNode"
         other => panic!("unexpected WriteResult for IngestStructured Inline: {other:?}"),
     }
 }
+
+#[test]
+fn serve_one_request_handles_upsert_repo() {
+    let project_dir = tempfile::tempdir().unwrap();
+    let registry = bundled_registry().unwrap();
+    let mut infigraph = Infigraph::open(project_dir.path(), registry).unwrap();
+    infigraph.init().unwrap();
+
+    let staging_dir = project_dir.path().join(".infigraph").join("requests");
+    std::fs::create_dir_all(&staging_dir).unwrap();
+    let request_path = staging_dir.join("test-repo.request");
+    let result_path = staging_dir.join("test-repo.result");
+    write_atomic(
+        &request_path,
+        &serde_json::to_string(&WriteRequest::UpsertRepo {
+            namespace: "org/repo".to_string(),
+        })
+        .unwrap(),
+    )
+    .unwrap();
+
+    serve_one_request(&infigraph, &request_path).unwrap();
+
+    let result: WriteResult =
+        serde_json::from_str(&std::fs::read_to_string(&result_path).unwrap()).unwrap();
+    assert!(
+        matches!(result, WriteResult::Ok { .. }),
+        "expected Ok, got {result:?}"
+    );
+}
+
+#[test]
+fn serve_one_request_handles_derive_tested_by() {
+    let project_dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        project_dir.path().join("main.py"),
+        "def hello():\n    pass\n\ndef test_hello():\n    hello()\n",
+    )
+    .unwrap();
+    let registry = bundled_registry().unwrap();
+    let mut infigraph = Infigraph::open(project_dir.path(), registry).unwrap();
+    infigraph.init().unwrap();
+    infigraph.index().unwrap();
+
+    let staging_dir = project_dir.path().join(".infigraph").join("requests");
+    std::fs::create_dir_all(&staging_dir).unwrap();
+    let request_path = staging_dir.join("test-tested-by.request");
+    let result_path = staging_dir.join("test-tested-by.result");
+    write_atomic(
+        &request_path,
+        &serde_json::to_string(&WriteRequest::DeriveTestedBy { files: None }).unwrap(),
+    )
+    .unwrap();
+
+    serve_one_request(&infigraph, &request_path).unwrap();
+
+    let result: WriteResult =
+        serde_json::from_str(&std::fs::read_to_string(&result_path).unwrap()).unwrap();
+    match result {
+        WriteResult::Ok { .. } => {}
+        WriteResult::Err { message } => panic!("expected Ok, got Err: {message}"),
+        other => panic!("unexpected WriteResult for DeriveTestedBy: {other:?}"),
+    }
+}
