@@ -14,6 +14,25 @@ pub enum WriteRequest {
     Index { paths: Option<Vec<PathBuf>> },
     /// Import a SCIP index file at the given path.
     ScipImport { scip_path: PathBuf },
+    /// Ingest structured data using a schema already discoverable by the
+    /// daemon itself (via discover_schemas) -- looked up by schema_id, not
+    /// serialized into the request.
+    IngestStructured {
+        schema_id: String,
+        source: IngestSource,
+    },
+}
+
+/// Where IngestStructured's data comes from. `Inline` carries no data
+/// itself -- the actual array lives in a sibling `.data.json` file next to
+/// the request (see write_ingest_inline_sibling / read at
+/// `handle_ingest_structured`), following the same reference-not-payload
+/// convention paths already use.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum IngestSource {
+    File(PathBuf),
+    Directory(PathBuf),
+    Inline,
 }
 
 /// Small summary of what happened -- never the full `IndexResult` (which
@@ -350,6 +369,17 @@ pub fn serve_one_request(infigraph: &Infigraph, request_path: &Path) -> anyhow::
                     message: e.to_string(),
                 },
             },
+            WriteRequest::IngestStructured { schema_id, source } => {
+                match handle_ingest_structured(infigraph, schema_id, source, request_path) {
+                    Ok(r) => WriteResult::Ok {
+                        total_files: r.nodes_created + r.edges_created,
+                        indexed_files: r.nodes_created,
+                    },
+                    Err(e) => WriteResult::Err {
+                        message: e.to_string(),
+                    },
+                }
+            }
         },
         Err(e) => WriteResult::Err {
             message: format!("failed to read/parse request: {e}"),
@@ -366,4 +396,61 @@ pub fn serve_one_request(infigraph: &Infigraph, request_path: &Path) -> anyhow::
     // needs to address with a cleanup/TTL pass, not silently ignored here.
     std::fs::remove_file(request_path).ok();
     Ok(())
+}
+
+fn handle_ingest_structured(
+    infigraph: &Infigraph,
+    schema_id: &str,
+    source: &IngestSource,
+    request_path: &Path,
+) -> anyhow::Result<crate::structured::IngestResult> {
+    let backend = infigraph
+        .backend()
+        .ok_or_else(|| anyhow::anyhow!("graph not initialized"))?;
+    let schemas = crate::structured::discover_schemas(infigraph.root())?;
+    let (_, schema) = schemas
+        .iter()
+        .find(|(_, s)| s.schema.schema_id == schema_id)
+        .ok_or_else(|| anyhow::anyhow!("schema '{schema_id}' not found"))?;
+
+    match source {
+        IngestSource::File(path) => {
+            let full_path = infigraph.root().join(path);
+            backend.ingest_structured_file(&schema.schema, &full_path)
+        }
+        IngestSource::Directory(path) => {
+            let full_path = infigraph.root().join(path);
+            backend.ingest_structured_directory(&schema.schema, &full_path)
+        }
+        IngestSource::Inline => {
+            let sibling_path = request_path.with_extension("data.json");
+            let contents = std::fs::read_to_string(&sibling_path)?;
+            let data: Vec<serde_json::Value> = serde_json::from_str(&contents)?;
+            let result = backend.ingest_structured_data(&schema.schema, &data)?;
+            std::fs::remove_file(&sibling_path).ok();
+            Ok(result)
+        }
+    }
+}
+
+/// Writes `data` as a sibling `.data.json` file next to where a request
+/// named `request_path` will be written, using the same atomic-write
+/// guarantee as the request/result files themselves. Returns the path the
+/// server-side handler will read (request_path.with_extension("data.json")).
+///
+/// Note: this helper needs the FINAL request path to derive the sibling
+/// path, but `submit_write_request` currently generates that path
+/// internally and doesn't expose it before writing the request. Task 13's
+/// wrapper will need `submit_write_request` (or a variant of it) to write
+/// the sibling file *before* the request file, using the same generated
+/// name -- this only establishes the naming convention and the
+/// server-side read/cleanup (see `handle_ingest_structured`'s
+/// `IngestSource::Inline` arm).
+pub fn write_ingest_inline_sibling(
+    request_path: &Path,
+    data: &[serde_json::Value],
+) -> anyhow::Result<PathBuf> {
+    let sibling_path = request_path.with_extension("data.json");
+    write_atomic(&sibling_path, &serde_json::to_string(data)?)?;
+    Ok(sibling_path)
 }

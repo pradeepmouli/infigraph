@@ -1,4 +1,6 @@
-use infigraph_core::daemon_protocol::{serve_one_request, write_atomic, WriteRequest, WriteResult};
+use infigraph_core::daemon_protocol::{
+    serve_one_request, write_atomic, IngestSource, WriteRequest, WriteResult,
+};
 use infigraph_core::Infigraph;
 use infigraph_languages::bundled_registry;
 
@@ -124,4 +126,112 @@ fn serve_one_request_handles_scip_import() {
         matches!(result, WriteResult::Err { .. }),
         "expected Err for a missing scip file, got {result:?}"
     );
+}
+
+#[test]
+fn serve_one_request_handles_ingest_structured_file() {
+    let project_dir = tempfile::tempdir().unwrap();
+    let schema_dir = project_dir
+        .path()
+        .join(".infigraph")
+        .join("structured-schemas");
+    std::fs::create_dir_all(&schema_dir).unwrap();
+    std::fs::write(
+        schema_dir.join("test.toml"),
+        r#"
+[schema]
+schema_id = "test_schema"
+name = "Test Schema"
+node_table = "TestNode"
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        project_dir.path().join("data.json"),
+        r#"[{"id": "a"}, {"id": "b"}]"#,
+    )
+    .unwrap();
+
+    let registry = bundled_registry().unwrap();
+    let mut infigraph = Infigraph::open(project_dir.path(), registry).unwrap();
+    infigraph.init().unwrap();
+
+    let staging_dir = project_dir.path().join(".infigraph").join("requests");
+    std::fs::create_dir_all(&staging_dir).unwrap();
+    let request_path = staging_dir.join("test-ingest.request");
+    let result_path = staging_dir.join("test-ingest.result");
+    write_atomic(
+        &request_path,
+        &serde_json::to_string(&WriteRequest::IngestStructured {
+            schema_id: "test_schema".to_string(),
+            source: IngestSource::File("data.json".into()),
+        })
+        .unwrap(),
+    )
+    .unwrap();
+
+    serve_one_request(&infigraph, &request_path).unwrap();
+
+    let result: WriteResult =
+        serde_json::from_str(&std::fs::read_to_string(&result_path).unwrap()).unwrap();
+    match result {
+        WriteResult::Ok { indexed_files, .. } => assert_eq!(indexed_files, 2),
+        WriteResult::Err { message } => panic!("expected Ok, got Err: {message}"),
+        other => panic!("unexpected WriteResult for IngestStructured: {other:?}"),
+    }
+}
+
+#[test]
+fn serve_one_request_handles_ingest_structured_inline() {
+    let project_dir = tempfile::tempdir().unwrap();
+    let schema_dir = project_dir
+        .path()
+        .join(".infigraph")
+        .join("structured-schemas");
+    std::fs::create_dir_all(&schema_dir).unwrap();
+    std::fs::write(
+        schema_dir.join("test.toml"),
+        r#"
+[schema]
+schema_id = "test_schema"
+name = "Test Schema"
+node_table = "TestNode"
+"#,
+    )
+    .unwrap();
+
+    let registry = bundled_registry().unwrap();
+    let mut infigraph = Infigraph::open(project_dir.path(), registry).unwrap();
+    infigraph.init().unwrap();
+
+    let staging_dir = project_dir.path().join(".infigraph").join("requests");
+    std::fs::create_dir_all(&staging_dir).unwrap();
+    let request_path = staging_dir.join("test-inline.request");
+    let result_path = staging_dir.join("test-inline.result");
+    let sibling_path = staging_dir.join("test-inline.data.json");
+
+    write_atomic(&sibling_path, r#"[{"id": "a"}, {"id": "b"}, {"id": "c"}]"#).unwrap();
+    write_atomic(
+        &request_path,
+        &serde_json::to_string(&WriteRequest::IngestStructured {
+            schema_id: "test_schema".to_string(),
+            source: IngestSource::Inline,
+        })
+        .unwrap(),
+    )
+    .unwrap();
+
+    serve_one_request(&infigraph, &request_path).unwrap();
+
+    assert!(
+        !sibling_path.exists(),
+        "sibling data file should be cleaned up after serving"
+    );
+    let result: WriteResult =
+        serde_json::from_str(&std::fs::read_to_string(&result_path).unwrap()).unwrap();
+    match result {
+        WriteResult::Ok { indexed_files, .. } => assert_eq!(indexed_files, 3),
+        WriteResult::Err { message } => panic!("expected Ok, got Err: {message}"),
+        other => panic!("unexpected WriteResult for IngestStructured Inline: {other:?}"),
+    }
 }
