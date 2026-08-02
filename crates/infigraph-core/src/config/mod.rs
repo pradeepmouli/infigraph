@@ -14,6 +14,32 @@ pub struct ConfigBinding {
     pub source_file: String,
 }
 
+/// Owned, serializable counterpart to `ConfigBinding` (whose `kind` field
+/// is `&'static str` and can't round-trip through serde_json into an
+/// owned value). Used only for the DaemonKuzu wire protocol.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct ConfigBindingWire {
+    pub symbol_id: String,
+    pub kind: String,
+    pub key: String,
+    pub value: String,
+    pub profile: String,
+    pub source_file: String,
+}
+
+impl From<&ConfigBinding> for ConfigBindingWire {
+    fn from(b: &ConfigBinding) -> Self {
+        Self {
+            symbol_id: b.symbol_id.clone(),
+            kind: b.kind.to_string(),
+            key: b.key.clone(),
+            value: b.value.clone(),
+            profile: b.profile.clone(),
+            source_file: b.source_file.clone(),
+        }
+    }
+}
+
 struct ConditionalPattern {
     kind: &'static str,
     patterns: &'static [&'static str],
@@ -135,7 +161,9 @@ pub fn detect_config_bindings(backend: &dyn GraphBackend) -> Result<Vec<ConfigBi
     }
 
     if !bindings.is_empty() {
-        write_config_bindings(backend, &bindings)?;
+        let wire_bindings: Vec<ConfigBindingWire> =
+            bindings.iter().map(ConfigBindingWire::from).collect();
+        backend.store_config_bindings(&wire_bindings)?;
     }
 
     Ok(bindings)
@@ -213,30 +241,6 @@ fn extract_profile(detail: &str, kind: &str) -> String {
         }
         _ => "default".to_string(),
     }
-}
-
-fn write_config_bindings(backend: &dyn GraphBackend, bindings: &[ConfigBinding]) -> Result<()> {
-    let _ = backend.raw_query("MATCH (c:ConfigBinding) DETACH DELETE c");
-
-    for b in bindings {
-        let id = format!("{}::{}::{}", b.symbol_id, b.kind, b.key);
-        let id_esc = crate::escape_str(&id);
-        let kind_esc = crate::escape_str(b.kind);
-        let key_esc = crate::escape_str(&b.key);
-        let val_esc = crate::escape_str(&b.value);
-        let profile_esc = crate::escape_str(&b.profile);
-        let src_esc = crate::escape_str(&b.source_file);
-        let sym_esc = crate::escape_str(&b.symbol_id);
-
-        let _ = backend.raw_query(&format!(
-            "CREATE (c:ConfigBinding {{id: '{id_esc}', kind: '{kind_esc}', key: '{key_esc}', value: '{val_esc}', `profile`: '{profile_esc}', source_file: '{src_esc}'}})"
-        ));
-        let _ = backend.raw_query(&format!(
-            "MATCH (s:Symbol), (c:ConfigBinding) WHERE s.id = '{sym_esc}' AND c.id = '{id_esc}' CREATE (s)-[:HAS_CONFIG]->(c)"
-        ));
-    }
-
-    Ok(())
 }
 
 pub fn detect_config_files(root: &Path) -> Vec<ConfigFileInfo> {

@@ -163,6 +163,11 @@ pub trait GraphBackend: Send + Sync {
         modularity: f64,
     ) -> Result<crate::cluster::ClusterStats>;
 
+    /// Store detected config bindings as ConfigBinding nodes + HAS_CONFIG
+    /// edges. Clears existing ConfigBinding data first. No default impl --
+    /// see the Global Constraints note in the implementation plan.
+    fn store_config_bindings(&self, bindings: &[crate::config::ConfigBindingWire]) -> Result<()>;
+
     // ── Resolve ──────────────────────────────────────────────────────
 
     /// Run call/inheritance resolution for the given extractions.

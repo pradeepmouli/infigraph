@@ -55,6 +55,11 @@ pub enum WriteRequest {
         community: Vec<usize>,
         modularity: f64,
     },
+    /// Store detected config bindings. Small, serde-serializable payload --
+    /// rides inline in this envelope, no sibling file needed.
+    StoreConfigBindings {
+        bindings: Vec<crate::config::ConfigBindingWire>,
+    },
 }
 
 /// Where IngestStructured's data comes from. `Inline` carries no data
@@ -504,6 +509,20 @@ pub fn serve_one_request(infigraph: &Infigraph, request_path: &Path) -> anyhow::
             } => match infigraph.backend() {
                 Some(b) => match b.store_clusters(idx_to_id, community, *modularity) {
                     Ok(stats) => WriteResult::ClustersOk(stats),
+                    Err(e) => WriteResult::Err {
+                        message: e.to_string(),
+                    },
+                },
+                None => WriteResult::Err {
+                    message: "graph not initialized".to_string(),
+                },
+            },
+            WriteRequest::StoreConfigBindings { bindings } => match infigraph.backend() {
+                Some(b) => match b.store_config_bindings(bindings) {
+                    Ok(()) => WriteResult::Ok {
+                        total_files: 0,
+                        indexed_files: 0,
+                    },
                     Err(e) => WriteResult::Err {
                         message: e.to_string(),
                     },

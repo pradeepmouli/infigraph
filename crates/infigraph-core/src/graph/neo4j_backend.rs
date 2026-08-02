@@ -1886,6 +1886,56 @@ impl GraphBackend for Neo4jBackend {
         })
     }
 
+    fn store_config_bindings(&self, bindings: &[crate::config::ConfigBindingWire]) -> Result<()> {
+        self.run_void("MATCH (c:ConfigBinding) DETACH DELETE c")?;
+
+        if bindings.is_empty() {
+            return Ok(());
+        }
+
+        let batch: Vec<HashMap<&str, String>> = bindings
+            .iter()
+            .map(|b| {
+                let id = format!("{}::{}::{}", b.symbol_id, b.kind, b.key);
+                let mut m = HashMap::new();
+                m.insert("id", id);
+                m.insert("symbol_id", b.symbol_id.clone());
+                m.insert("kind", b.kind.clone());
+                m.insert("key", b.key.clone());
+                m.insert("value", b.value.clone());
+                m.insert("profile", b.profile.clone());
+                m.insert("source_file", b.source_file.clone());
+                m
+            })
+            .collect();
+
+        self.block_on(
+            self.graph.run(
+                query(
+                    "UNWIND $batch AS p \
+                     CREATE (c:ConfigBinding {id: p.id, kind: p.kind, key: p.key, value: p.value, \
+                     profile: p.profile, source_file: p.source_file})",
+                )
+                .param("batch", batch.clone()),
+            ),
+        )
+        .map_err(|e| anyhow::anyhow!("failed to create ConfigBinding nodes: {e}"))?;
+
+        self.block_on(
+            self.graph.run(
+                query(
+                    "UNWIND $batch AS p \
+                     MATCH (s:Symbol {id: p.symbol_id}), (c:ConfigBinding {id: p.id}) \
+                     CREATE (s)-[:HAS_CONFIG]->(c)",
+                )
+                .param("batch", batch),
+            ),
+        )
+        .map_err(|e| anyhow::anyhow!("failed to create HAS_CONFIG edges: {e}"))?;
+
+        Ok(())
+    }
+
     fn clear_all_data(&self) -> Result<()> {
         loop {
             let deleted = self.count_query(

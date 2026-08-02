@@ -1,3 +1,4 @@
+use infigraph_core::config::ConfigBindingWire;
 use infigraph_core::daemon_protocol::{
     serve_one_request, write_atomic, IngestSource, WriteRequest, WriteResult,
 };
@@ -471,6 +472,65 @@ fn serve_one_request_handles_store_clusters() {
         .raw_query("MATCH (c:Cluster) RETURN c.id")
         .unwrap();
     assert_eq!(rows.len(), 1, "expected the Cluster node to exist");
+}
+
+#[test]
+fn serve_one_request_handles_store_config_bindings() {
+    let project_dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        project_dir.path().join("main.py"),
+        "def hello():\n    pass\n",
+    )
+    .unwrap();
+    let registry = bundled_registry().unwrap();
+    let mut infigraph = Infigraph::open(project_dir.path(), registry).unwrap();
+    infigraph.init().unwrap();
+    infigraph.index().unwrap();
+
+    let symbols = infigraph
+        .backend()
+        .unwrap()
+        .symbols_with_docstring(None)
+        .unwrap();
+    let symbol_id = symbols
+        .first()
+        .map(|s| s.id.clone())
+        .unwrap_or_else(|| "nonexistent".to_string());
+
+    let staging_dir = project_dir.path().join(".infigraph").join("requests");
+    std::fs::create_dir_all(&staging_dir).unwrap();
+    let request_path = staging_dir.join("test-config-bindings.request");
+    let result_path = staging_dir.join("test-config-bindings.result");
+
+    let bindings = vec![ConfigBindingWire {
+        symbol_id,
+        kind: "EnvVar".to_string(),
+        key: "DATABASE_URL".to_string(),
+        value: "postgres://...".to_string(),
+        profile: "default".to_string(),
+        source_file: "main.py".to_string(),
+    }];
+    write_atomic(
+        &request_path,
+        &serde_json::to_string(&WriteRequest::StoreConfigBindings { bindings }).unwrap(),
+    )
+    .unwrap();
+
+    serve_one_request(&infigraph, &request_path).unwrap();
+
+    let result: WriteResult =
+        serde_json::from_str(&std::fs::read_to_string(&result_path).unwrap()).unwrap();
+    assert!(
+        matches!(result, WriteResult::Ok { .. }),
+        "expected Ok, got {result:?}"
+    );
+
+    let rows = infigraph
+        .backend()
+        .unwrap()
+        .raw_query("MATCH (c:ConfigBinding) RETURN c.id")
+        .unwrap();
+    assert_eq!(rows.len(), 1, "expected the ConfigBinding node to exist");
 }
 
 #[test]

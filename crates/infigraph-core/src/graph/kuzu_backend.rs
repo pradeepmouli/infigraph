@@ -602,6 +602,30 @@ impl GraphBackend for KuzuBackend {
         })
     }
 
+    fn store_config_bindings(&self, bindings: &[crate::config::ConfigBindingWire]) -> Result<()> {
+        self.raw_query("MATCH (c:ConfigBinding) DETACH DELETE c")?;
+
+        for b in bindings {
+            let id = format!("{}::{}::{}", b.symbol_id, b.kind, b.key);
+            let id_esc = crate::escape_str(&id);
+            let kind_esc = crate::escape_str(&b.kind);
+            let key_esc = crate::escape_str(&b.key);
+            let val_esc = crate::escape_str(&b.value);
+            let profile_esc = crate::escape_str(&b.profile);
+            let src_esc = crate::escape_str(&b.source_file);
+            let sym_esc = crate::escape_str(&b.symbol_id);
+
+            self.raw_query(&format!(
+                "CREATE (c:ConfigBinding {{id: '{id_esc}', kind: '{kind_esc}', key: '{key_esc}', value: '{val_esc}', `profile`: '{profile_esc}', source_file: '{src_esc}'}})"
+            ))?;
+            self.raw_query(&format!(
+                "MATCH (s:Symbol), (c:ConfigBinding) WHERE s.id = '{sym_esc}' AND c.id = '{id_esc}' CREATE (s)-[:HAS_CONFIG]->(c)"
+            ))?;
+        }
+
+        Ok(())
+    }
+
     // ── Resolve ──────────────────────────────────────────────────────
 
     fn resolve_calls(
