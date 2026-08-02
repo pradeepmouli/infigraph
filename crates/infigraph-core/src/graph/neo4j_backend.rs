@@ -1729,6 +1729,75 @@ impl GraphBackend for Neo4jBackend {
         Ok(())
     }
 
+    fn upsert_dependencies(&self, result: &crate::manifest::ManifestResult) -> Result<()> {
+        if result.deps.is_empty() {
+            return Ok(());
+        }
+
+        let dep_maps: Vec<HashMap<&str, String>> = result
+            .deps
+            .iter()
+            .map(|dep| {
+                let mut m = HashMap::new();
+                m.insert("id", format!("{}::{}", dep.ecosystem, dep.name));
+                m.insert("name", dep.name.clone());
+                m.insert("version", dep.version.clone());
+                m.insert("ecosystem", dep.ecosystem.clone());
+                m.insert("is_dev", dep.is_dev.to_string());
+                m
+            })
+            .collect();
+
+        self.block_on(
+            self.graph.run(
+                query(
+                    "UNWIND $batch AS p \
+                     MERGE (d:Dependency {id: p.id}) \
+                     SET d.name = p.name, d.version = p.version, d.ecosystem = p.ecosystem, \
+                         d.is_dev = (p.is_dev = 'true')",
+                )
+                .param("batch", dep_maps.clone()),
+            ),
+        )
+        .map_err(|e| anyhow::anyhow!("upsert Dependency nodes failed: {e}"))?;
+
+        // Scope the DEPENDS_ON edge to THIS repo's modules -- same reasoning as
+        // KuzuBackend's implementation: without the repo guard, `m.file CONTAINS
+        // manifest_base` matches every repo's manifest module in a shared graph,
+        // cross-linking one repo's deps onto all others.
+        let manifest_base = result
+            .manifest_file
+            .rsplit('/')
+            .next()
+            .unwrap_or("")
+            .to_string();
+        let cypher = if let Some(repo) = self.repo_filter() {
+            let r = escape(repo);
+            format!(
+                "UNWIND $batch AS p \
+                 MATCH (m:Module), (d:Dependency {{id: p.id}}) \
+                 WHERE m.file STARTS WITH '{r}/' AND m.file CONTAINS $manifest_base \
+                 MERGE (m)-[:DEPENDS_ON {{is_dev: (p.is_dev = 'true')}}]->(d)"
+            )
+        } else {
+            "UNWIND $batch AS p \
+             MATCH (m:Module), (d:Dependency {id: p.id}) \
+             WHERE m.file CONTAINS $manifest_base \
+             MERGE (m)-[:DEPENDS_ON {is_dev: (p.is_dev = 'true')}]->(d)"
+                .to_string()
+        };
+        self.block_on(
+            self.graph.run(
+                query(&cypher)
+                    .param("batch", dep_maps)
+                    .param("manifest_base", manifest_base),
+            ),
+        )
+        .map_err(|e| anyhow::anyhow!("upsert DEPENDS_ON edges failed: {e}"))?;
+
+        Ok(())
+    }
+
     fn clear_all_data(&self) -> Result<()> {
         loop {
             let deleted = self.count_query(

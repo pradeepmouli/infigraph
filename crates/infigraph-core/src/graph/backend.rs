@@ -5,6 +5,7 @@ use anyhow::Result;
 use std::path::Path;
 
 use crate::learned::LearnedStore;
+use crate::manifest::ManifestResult;
 use crate::model::FileExtraction;
 use crate::resolve::ResolveStats;
 use crate::scip::ImportStats;
@@ -144,6 +145,13 @@ pub trait GraphBackend: Send + Sync {
     /// directly (same design as `upsert_files_bulk`/`resolve_calls`). A
     /// no-op for an empty slice.
     fn write_calls_service_edges(&self, edges: &[CallsServiceEdge]) -> Result<()>;
+
+    /// Store a manifest's dependencies as Dependency nodes + DEPENDS_ON
+    /// edges. No default impl -- see the Global Constraints note in
+    /// docs/superpowers/plans/2026-08-01-daemonkuzu-daemon-wiring-plan.md:
+    /// a default written in terms of raw_query would be silently inherited
+    /// by the DaemonKuzu wrapper's read-only connection.
+    fn upsert_dependencies(&self, result: &ManifestResult) -> Result<()>;
 
     // ── Resolve ──────────────────────────────────────────────────────
 

@@ -1,6 +1,7 @@
 use infigraph_core::daemon_protocol::{
     serve_one_request, write_atomic, IngestSource, WriteRequest, WriteResult,
 };
+use infigraph_core::manifest::{DepEntry, ManifestResult};
 use infigraph_core::Infigraph;
 use infigraph_languages::bundled_registry;
 
@@ -361,6 +362,61 @@ fn serve_one_request_handles_write_calls_service_edges() {
         matches!(result, WriteResult::Ok { .. }),
         "expected Ok, got {result:?}"
     );
+}
+
+#[test]
+fn serve_one_request_handles_upsert_dependencies() {
+    let project_dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        project_dir.path().join("main.py"),
+        "def hello():\n    pass\n",
+    )
+    .unwrap();
+    let registry = bundled_registry().unwrap();
+    let mut infigraph = Infigraph::open(project_dir.path(), registry).unwrap();
+    infigraph.init().unwrap();
+    infigraph.index().unwrap();
+
+    let staging_dir = project_dir.path().join(".infigraph").join("requests");
+    std::fs::create_dir_all(&staging_dir).unwrap();
+    let request_path = staging_dir.join("test-deps.request");
+    let result_path = staging_dir.join("test-deps.result");
+
+    let manifest_result = ManifestResult {
+        ecosystem: "pypi".to_string(),
+        manifest_file: "requirements.txt".to_string(),
+        deps: vec![DepEntry {
+            name: "requests".to_string(),
+            version: "2.31.0".to_string(),
+            ecosystem: "pypi".to_string(),
+            is_dev: false,
+        }],
+        doc_urls: vec![],
+    };
+    write_atomic(
+        &request_path,
+        &serde_json::to_string(&WriteRequest::UpsertDependencies {
+            result: manifest_result,
+        })
+        .unwrap(),
+    )
+    .unwrap();
+
+    serve_one_request(&infigraph, &request_path).unwrap();
+
+    let result: WriteResult =
+        serde_json::from_str(&std::fs::read_to_string(&result_path).unwrap()).unwrap();
+    assert!(
+        matches!(result, WriteResult::Ok { .. }),
+        "expected Ok, got {result:?}"
+    );
+
+    let rows = infigraph
+        .backend()
+        .unwrap()
+        .raw_query("MATCH (d:Dependency) WHERE d.id = 'pypi::requests' RETURN d.id")
+        .unwrap();
+    assert_eq!(rows.len(), 1, "expected the Dependency node to exist");
 }
 
 #[test]

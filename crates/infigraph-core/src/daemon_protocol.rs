@@ -42,6 +42,11 @@ pub enum WriteRequest {
     /// an Arrow IPC sibling file at edges_path (genuinely tabular bulk
     /// data), not inline in this envelope.
     WriteCallsServiceEdges { edges_path: PathBuf },
+    /// Store a manifest's parsed dependencies. Small, serde-serializable
+    /// payload -- rides inline in this envelope, no sibling file needed.
+    UpsertDependencies {
+        result: crate::manifest::ManifestResult,
+    },
 }
 
 /// Where IngestStructured's data comes from. `Inline` carries no data
@@ -467,6 +472,20 @@ pub fn serve_one_request(infigraph: &Infigraph, request_path: &Path) -> anyhow::
                     },
                 }
             }
+            WriteRequest::UpsertDependencies { result } => match infigraph.backend() {
+                Some(b) => match b.upsert_dependencies(result) {
+                    Ok(()) => WriteResult::Ok {
+                        total_files: 0,
+                        indexed_files: 0,
+                    },
+                    Err(e) => WriteResult::Err {
+                        message: e.to_string(),
+                    },
+                },
+                None => WriteResult::Err {
+                    message: "graph not initialized".to_string(),
+                },
+            },
         },
         Err(e) => WriteResult::Err {
             message: format!("failed to read/parse request: {e}"),

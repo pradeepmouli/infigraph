@@ -488,6 +488,56 @@ impl GraphBackend for KuzuBackend {
         Ok(())
     }
 
+    fn upsert_dependencies(&self, result: &crate::manifest::ManifestResult) -> Result<()> {
+        for dep in &result.deps {
+            let id = format!("{}::{}", dep.ecosystem, dep.name);
+            let check = format!(
+                "MATCH (d:Dependency) WHERE d.id = '{}' RETURN d.id",
+                escape(&id)
+            );
+            let existing = self.raw_query(&check)?;
+            if existing.is_empty() {
+                let insert = format!(
+                    "CREATE (d:Dependency {{id: '{}', name: '{}', version: '{}', ecosystem: '{}', is_dev: {}}})",
+                    escape(&id), escape(&dep.name), escape(&dep.version), escape(&dep.ecosystem), dep.is_dev
+                );
+                self.raw_query(&insert)?;
+            } else {
+                let update = format!(
+                    "MATCH (d:Dependency) WHERE d.id = '{}' SET d.version = '{}', d.is_dev = {}",
+                    escape(&id),
+                    escape(&dep.version),
+                    dep.is_dev
+                );
+                self.raw_query(&update)?;
+            }
+
+            // Scope the DEPENDS_ON edge to THIS repo's modules. Without the repo guard,
+            // `m.file CONTAINS 'pyproject.toml'` matches every repo's manifest module in a
+            // shared graph, cross-linking one repo's deps onto all others.
+            let manifest_base = escape(result.manifest_file.rsplit('/').next().unwrap_or(""));
+            let rel = if let Some(repo) = self.repo_filter() {
+                let r = escape(repo);
+                format!(
+                    "MATCH (m:Module), (d:Dependency) \
+                     WHERE m.file STARTS WITH '{r}/' AND m.file CONTAINS '{manifest_base}' AND d.id = '{}' \
+                     CREATE (m)-[:DEPENDS_ON {{is_dev: {}}}]->(d)",
+                    escape(&id),
+                    dep.is_dev
+                )
+            } else {
+                format!(
+                    "MATCH (m:Module), (d:Dependency) WHERE m.file CONTAINS '{manifest_base}' AND d.id = '{}' \
+                     CREATE (m)-[:DEPENDS_ON {{is_dev: {}}}]->(d)",
+                    escape(&id),
+                    dep.is_dev
+                )
+            };
+            self.raw_query(&rel)?;
+        }
+        Ok(())
+    }
+
     // ── Resolve ──────────────────────────────────────────────────────
 
     fn resolve_calls(

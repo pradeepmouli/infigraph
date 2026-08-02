@@ -10,7 +10,7 @@ use anyhow::Result;
 
 use crate::graph::GraphBackend;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct DepEntry {
     pub name: String,
     pub version: String,
@@ -18,7 +18,7 @@ pub struct DepEntry {
     pub is_dev: bool,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ManifestResult {
     pub ecosystem: String,
     pub manifest_file: String,
@@ -717,7 +717,9 @@ fn scan_csproj_dir(
                         deps,
                         doc_urls: Vec::new(),
                     };
-                    let _ = store_manifest(backend, &result);
+                    if let Err(e) = store_manifest(backend, &result) {
+                        eprintln!("[manifest] failed to store {}: {e}", result.manifest_file);
+                    }
                     results.push(result);
                 }
             }
@@ -727,53 +729,7 @@ fn scan_csproj_dir(
 }
 
 fn store_manifest(backend: &dyn GraphBackend, result: &ManifestResult) -> Result<()> {
-    for dep in &result.deps {
-        let id = format!("{}::{}", dep.ecosystem, dep.name);
-        let check = format!(
-            "MATCH (d:Dependency) WHERE d.id = '{}' RETURN d.id",
-            escape(&id)
-        );
-        let existing = backend.raw_query(&check)?;
-        if existing.is_empty() {
-            let insert = format!(
-                "CREATE (d:Dependency {{id: '{}', name: '{}', version: '{}', ecosystem: '{}', is_dev: {}}})",
-                escape(&id), escape(&dep.name), escape(&dep.version), escape(&dep.ecosystem), dep.is_dev
-            );
-            let _ = backend.raw_query(&insert);
-        } else {
-            let update = format!(
-                "MATCH (d:Dependency) WHERE d.id = '{}' SET d.version = '{}', d.is_dev = {}",
-                escape(&id),
-                escape(&dep.version),
-                dep.is_dev
-            );
-            let _ = backend.raw_query(&update);
-        }
-
-        // Scope the DEPENDS_ON edge to THIS repo's modules. Without the repo guard,
-        // `m.file CONTAINS 'pyproject.toml'` matches every repo's manifest module in a
-        // shared graph, cross-linking one repo's deps onto all others.
-        let manifest_base = escape(result.manifest_file.rsplit('/').next().unwrap_or(""));
-        let rel = if let Some(repo) = backend.repo_filter() {
-            let r = escape(repo);
-            format!(
-                "MATCH (m:Module), (d:Dependency) \
-                 WHERE m.file STARTS WITH '{r}/' AND m.file CONTAINS '{manifest_base}' AND d.id = '{}' \
-                 CREATE (m)-[:DEPENDS_ON {{is_dev: {}}}]->(d)",
-                escape(&id),
-                dep.is_dev
-            )
-        } else {
-            format!(
-                "MATCH (m:Module), (d:Dependency) WHERE m.file CONTAINS '{manifest_base}' AND d.id = '{}' \
-                 CREATE (m)-[:DEPENDS_ON {{is_dev: {}}}]->(d)",
-                escape(&id),
-                dep.is_dev
-            )
-        };
-        let _ = backend.raw_query(&rel);
-    }
-    Ok(())
+    backend.upsert_dependencies(result)
 }
 
 fn split_pep508(s: &str) -> (String, String) {
@@ -782,10 +738,6 @@ fn split_pep508(s: &str) -> (String, String) {
     } else {
         (s.trim().to_string(), "*".to_string())
     }
-}
-
-fn escape(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('\'', "\\'")
 }
 
 #[cfg(test)]
