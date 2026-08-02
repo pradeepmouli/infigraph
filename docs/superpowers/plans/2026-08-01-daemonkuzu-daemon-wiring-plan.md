@@ -10,6 +10,7 @@
 
 ## Global Constraints
 
+- Never set `CARGO_TARGET_DIR` explicitly in any command — this worktree's `.cargo/config.toml` (inherited from `scratchpad/.cargo/config.toml`) already points `target-dir` at the shared absolute path across every `scratchpad/wt-*` worktree. A relative `CARGO_TARGET_DIR=.shared-target` override shadows that and creates a stray per-worktree copy instead — this is a known, already-hit bug (~13G duplicated in one worktree before it was caught), not a hypothetical.
 - No new dependencies. `arrow` is already a direct dependency of `infigraph-core` (`Cargo.toml:38`) and is used only for the two genuinely tabular bulk payloads (`WriteCallsServiceEdges`, `WriteCrossServiceEdges`); the request/result envelope itself stays JSON.
 - No MCP tool renaming. `watch_project`, `watch_docs`, `stop_watch_docs`, `get_watch_status` keep their exact names.
 - `.infigraph/watch.lock` / `.infigraph/watch.stop` file names are unchanged — only the CLI subcommand (`infigraph watch` → `infigraph daemon`) and its Rust identifiers are renamed.
@@ -211,7 +212,7 @@ fn init_selects_kuzu_backend_by_default() {
 
 - [ ] **Step 2b: Run test to verify it fails**
 
-Run: `CARGO_TARGET_DIR=.shared-target cargo test -p infigraph-core --test backend_selection`
+Run: `cargo test -p infigraph-core --test backend_selection`
 Expected: FAIL — `"daemon"` isn't a recognized value for `INFIGRAPH_BACKEND` yet, so `init_selects_daemon_kuzu_backend_when_env_var_set` falls through to the default Kuzu-open arm and does something else (or the test doesn't compile yet, since `BackendKind::DaemonKuzu` doesn't exist).
 
 - [ ] **Step 3: Add the `DaemonKuzu` variant and `init()` arm**
@@ -274,7 +275,7 @@ This compiles: `backend()` returning `None` for the placeholder is deliberate fo
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `CARGO_TARGET_DIR=.shared-target cargo test -p infigraph-core --test backend_selection`
+Run: `cargo test -p infigraph-core --test backend_selection`
 Expected: PASS, both tests.
 
 - [ ] **Step 5: Write the failing test for `spawn_daemon`'s env stripping**
@@ -338,7 +339,7 @@ Note: `env!("CARGO_BIN_EXE_infigraph")` requires this test crate to have `infigr
 
 - [ ] **Step 6: Run test to verify it fails**
 
-Run: `env -u INFIGRAPH_WATCH_DAEMON CARGO_TARGET_DIR=.shared-target cargo test -p infigraph-core --test watch_daemon spawn_daemon_child_command_does_not_inherit_infigraph_backend`
+Run: `env -u INFIGRAPH_WATCH_DAEMON cargo test -p infigraph-core --test watch_daemon spawn_daemon_child_command_does_not_inherit_infigraph_backend`
 Expected: The spawned child inherits `INFIGRAPH_BACKEND=daemon`, `cmd_daemon`'s own `Infigraph::open`/`init()` (reached via `watch_project`/`watch_db`/`open_transient`) selects the placeholder `DaemonKuzuBackend`, which panics with `unimplemented!()` inside the watcher loop before ever acquiring `watch.lock` — test times out waiting for the lock and fails with the panic message above.
 
 - [ ] **Step 7: Strip `INFIGRAPH_BACKEND` at spawn**
@@ -357,7 +358,7 @@ In `crates/infigraph-core/src/watch/daemon.rs`, in `spawn_daemon` (around line 1
 
 - [ ] **Step 8: Run test to verify it passes**
 
-Run: `env -u INFIGRAPH_WATCH_DAEMON CARGO_TARGET_DIR=.shared-target cargo test -p infigraph-core --test watch_daemon spawn_daemon_child_command_does_not_inherit_infigraph_backend`
+Run: `env -u INFIGRAPH_WATCH_DAEMON cargo test -p infigraph-core --test watch_daemon spawn_daemon_child_command_does_not_inherit_infigraph_backend`
 Expected: PASS.
 
 - [ ] **Step 9: Add the belt-and-braces layer for a manually-started daemon**
@@ -405,7 +406,7 @@ This test is intentionally trivial — it documents the fix's mechanism (env var
 
 - [ ] **Step 11: Run test to verify it passes**
 
-Run: `CARGO_TARGET_DIR=.shared-target cargo test -p infigraph-core --test backend_selection`
+Run: `cargo test -p infigraph-core --test backend_selection`
 Expected: PASS, all three tests.
 
 - [ ] **Step 12: Commit**
@@ -509,7 +510,7 @@ fn watch_loop_does_not_serve_requests_when_serve_requests_is_false() {
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `env -u INFIGRAPH_WATCH_DAEMON CARGO_TARGET_DIR=.shared-target cargo test -p infigraph-core --test daemon_protocol_watcher_wiring`
+Run: `env -u INFIGRAPH_WATCH_DAEMON cargo test -p infigraph-core --test daemon_protocol_watcher_wiring`
 Expected: FAIL to compile — `watch_project_with_periodic` doesn't take a `serve_requests` parameter yet.
 
 - [ ] **Step 3: Add the `serve_requests` parameter and request-serving to the loop**
@@ -605,7 +606,7 @@ Search for other call sites (the function has at least one more caller beyond `w
 
 - [ ] **Step 5: Run test to verify it passes**
 
-Run: `env -u INFIGRAPH_WATCH_DAEMON CARGO_TARGET_DIR=.shared-target cargo test -p infigraph-core --test daemon_protocol_watcher_wiring`
+Run: `env -u INFIGRAPH_WATCH_DAEMON cargo test -p infigraph-core --test daemon_protocol_watcher_wiring`
 Expected: PASS, both tests.
 
 - [ ] **Step 6: Wire `cmd_daemon` to pass `serve_requests: true`**
@@ -629,7 +630,7 @@ Expected: PASS, both tests.
 
 - [ ] **Step 7: Run the full daemon-mode test suite to check for regressions**
 
-Run: `env -u INFIGRAPH_WATCH_DAEMON CARGO_TARGET_DIR=.shared-target cargo test -p infigraph-core -p infigraph-mcp watch -- --test-threads=1`
+Run: `env -u INFIGRAPH_WATCH_DAEMON cargo test -p infigraph-core -p infigraph-mcp watch -- --test-threads=1`
 Expected: PASS. If any watcher test fails specifically because it now expects `watch_project_with_periodic`'s old 7-argument signature, update that call site's trailing argument to `false` (it's not daemon-mode) rather than changing the test's assertions.
 
 - [ ] **Step 8: Commit**
@@ -697,7 +698,7 @@ fn serve_one_request_handles_scip_import() {
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `CARGO_TARGET_DIR=.shared-target cargo test -p infigraph-core --test daemon_protocol_serve serve_one_request_handles_scip_import`
+Run: `cargo test -p infigraph-core --test daemon_protocol_serve serve_one_request_handles_scip_import`
 Expected: FAIL — currently `serve_one_request` returns `WriteResult::Err { message: "scip-import serving not yet implemented" }` for every `ScipImport` request without attempting the import, so this specific assertion may actually already pass (`Err` either way) — the goal of this test is to lock in real behavior; run it now to confirm the CURRENT stub also returns `Err`, then Step 4 confirms the message text actually changes to reflect a real attempt, not the stub text.
 
 - [ ] **Step 3: Add `Infigraph::import_scip`**
@@ -780,7 +781,7 @@ In `crates/infigraph-core/src/daemon_protocol.rs`, replace the `ScipImport` arm:
 
 - [ ] **Step 6: Run test to verify it passes**
 
-Run: `CARGO_TARGET_DIR=.shared-target cargo test -p infigraph-core --test daemon_protocol_serve serve_one_request_handles_scip_import`
+Run: `cargo test -p infigraph-core --test daemon_protocol_serve serve_one_request_handles_scip_import`
 Expected: PASS, with the error message reflecting a real file-not-found error rather than "not yet implemented".
 
 - [ ] **Step 7: Commit**
@@ -864,7 +865,7 @@ type = "string"
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `CARGO_TARGET_DIR=.shared-target cargo test -p infigraph-core --test daemon_protocol_serve serve_one_request_handles_ingest_structured_file`
+Run: `cargo test -p infigraph-core --test daemon_protocol_serve serve_one_request_handles_ingest_structured_file`
 Expected: FAIL to compile — `WriteRequest::IngestStructured`/`IngestSource` don't exist yet.
 
 - [ ] **Step 3: Add the types and File/Directory handling**
@@ -958,7 +959,7 @@ Verify `Infigraph` exposes `root()` (it does, `crates/infigraph-core/src/lib.rs:
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `CARGO_TARGET_DIR=.shared-target cargo test -p infigraph-core --test daemon_protocol_serve serve_one_request_handles_ingest_structured_file`
+Run: `cargo test -p infigraph-core --test daemon_protocol_serve serve_one_request_handles_ingest_structured_file`
 Expected: PASS.
 
 - [ ] **Step 5: Write the failing test for the `Inline` sibling-file case**
@@ -1025,7 +1026,7 @@ type = "string"
 
 - [ ] **Step 6: Run test to verify it passes**
 
-Run: `CARGO_TARGET_DIR=.shared-target cargo test -p infigraph-core --test daemon_protocol_serve serve_one_request_handles_ingest_structured_inline`
+Run: `cargo test -p infigraph-core --test daemon_protocol_serve serve_one_request_handles_ingest_structured_inline`
 Expected: PASS (the `Inline` arm implemented in Step 3 already handles this).
 
 - [ ] **Step 7: Add the client-side sibling-file writer**
@@ -1139,7 +1140,7 @@ fn serve_one_request_handles_derive_tested_by() {
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `CARGO_TARGET_DIR=.shared-target cargo test -p infigraph-core --test daemon_protocol_serve serve_one_request_handles_upsert_repo serve_one_request_handles_derive_tested_by`
+Run: `cargo test -p infigraph-core --test daemon_protocol_serve serve_one_request_handles_upsert_repo serve_one_request_handles_derive_tested_by`
 Expected: FAIL to compile — the variants don't exist yet.
 
 - [ ] **Step 3: Add the variants and handlers**
@@ -1183,7 +1184,7 @@ Add to `serve_one_request`:
 
 - [ ] **Step 4: Run tests to verify they pass**
 
-Run: `CARGO_TARGET_DIR=.shared-target cargo test -p infigraph-core --test daemon_protocol_serve serve_one_request_handles_upsert_repo serve_one_request_handles_derive_tested_by`
+Run: `cargo test -p infigraph-core --test daemon_protocol_serve serve_one_request_handles_upsert_repo serve_one_request_handles_derive_tested_by`
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
@@ -1254,7 +1255,7 @@ fn serve_one_request_handles_upsert_similar_edge() {
 
 - [ ] **Step 2: Run test to verify it fails, then add the variant + handler**
 
-Run: `CARGO_TARGET_DIR=.shared-target cargo test -p infigraph-core --test daemon_protocol_serve serve_one_request_handles_upsert_similar_edge`
+Run: `cargo test -p infigraph-core --test daemon_protocol_serve serve_one_request_handles_upsert_similar_edge`
 Expected: FAIL to compile.
 
 In `crates/infigraph-core/src/daemon_protocol.rs`:
@@ -1445,7 +1446,7 @@ Add to `serve_one_request`:
 
 - [ ] **Step 5: Run tests to verify they pass**
 
-Run: `CARGO_TARGET_DIR=.shared-target cargo test -p infigraph-core --test daemon_protocol_serve serve_one_request_handles_write_calls_service_edges serve_one_request_handles_upsert_similar_edge`
+Run: `cargo test -p infigraph-core --test daemon_protocol_serve serve_one_request_handles_write_calls_service_edges serve_one_request_handles_upsert_similar_edge`
 Expected: PASS.
 
 - [ ] **Step 6: Commit**
@@ -1547,7 +1548,7 @@ fn upsert_dependencies_creates_dependency_node_and_edge() {
 
 - [ ] **Step 3: Run test to verify it fails**
 
-Run: `CARGO_TARGET_DIR=.shared-target cargo test -p infigraph-core --test manifest_backend`
+Run: `cargo test -p infigraph-core --test manifest_backend`
 Expected: FAIL to compile — `upsert_dependencies` doesn't exist on `GraphBackend` yet.
 
 - [ ] **Step 4: Add the trait method (no default impl) and implement it on `KuzuBackend`**
@@ -1651,12 +1652,12 @@ And fix `scan_csproj`'s discard (around line 720):
 
 - [ ] **Step 7: Run test to verify it passes**
 
-Run: `CARGO_TARGET_DIR=.shared-target cargo test -p infigraph-core --test manifest_backend`
+Run: `cargo test -p infigraph-core --test manifest_backend`
 Expected: PASS.
 
 - [ ] **Step 8: Run the existing manifest test suite to check for regressions**
 
-Run: `CARGO_TARGET_DIR=.shared-target cargo test -p infigraph-core manifest::`
+Run: `cargo test -p infigraph-core manifest::`
 Expected: PASS (existing `index_manifests` tests still exercise the same end-to-end behavior through the now-thinner `store_manifest`).
 
 - [ ] **Step 9: Add the `WriteRequest::UpsertDependencies` variant + handler**
@@ -1683,7 +1684,7 @@ Add a test to `daemon_protocol_serve.rs` mirroring the pattern of Task 6/7's tes
 
 - [ ] **Step 10: Run test to verify it passes**
 
-Run: `CARGO_TARGET_DIR=.shared-target cargo test -p infigraph-core --test daemon_protocol_serve`
+Run: `cargo test -p infigraph-core --test daemon_protocol_serve`
 Expected: PASS, including the new test.
 
 - [ ] **Step 11: Commit**
@@ -1756,7 +1757,7 @@ fn store_clusters_creates_cluster_node_and_membership() {
 
 - [ ] **Step 3: Run test to verify it fails**
 
-Run: `CARGO_TARGET_DIR=.shared-target cargo test -p infigraph-core --test cluster_backend`
+Run: `cargo test -p infigraph-core --test cluster_backend`
 Expected: FAIL to compile.
 
 - [ ] **Step 4: Add the trait method and implement on `KuzuBackend`**
@@ -1861,10 +1862,10 @@ Delete the old free `fn store_clusters(...)` from `cluster/mod.rs` entirely (its
 
 - [ ] **Step 7: Run test to verify it passes, then run the existing cluster test suite**
 
-Run: `CARGO_TARGET_DIR=.shared-target cargo test -p infigraph-core --test cluster_backend`
+Run: `cargo test -p infigraph-core --test cluster_backend`
 Expected: PASS.
 
-Run: `CARGO_TARGET_DIR=.shared-target cargo test -p infigraph-core cluster::`
+Run: `cargo test -p infigraph-core cluster::`
 Expected: PASS (no regressions in existing `detect_clusters` tests).
 
 - [ ] **Step 8: Add `WriteRequest::StoreClusters` variant, a `WriteResult::ClustersOk` variant, and the handler + test**
@@ -1916,7 +1917,7 @@ Add a test to `daemon_protocol_serve.rs` mirroring `store_clusters_creates_clust
 
 - [ ] **Step 9: Run tests to verify they pass**
 
-Run: `CARGO_TARGET_DIR=.shared-target cargo test -p infigraph-core --test daemon_protocol_serve`
+Run: `cargo test -p infigraph-core --test daemon_protocol_serve`
 Expected: PASS.
 
 - [ ] **Step 10: Commit**
@@ -2017,7 +2018,7 @@ fn store_config_bindings_creates_node_and_edge() {
 
 - [ ] **Step 3: Run test to verify it fails**
 
-Run: `CARGO_TARGET_DIR=.shared-target cargo test -p infigraph-core --test config_backend`
+Run: `cargo test -p infigraph-core --test config_backend`
 Expected: FAIL to compile.
 
 - [ ] **Step 4: Add the trait method and implement on `KuzuBackend`**
@@ -2078,10 +2079,10 @@ Delete the old free `fn write_config_bindings(...)` entirely.
 
 - [ ] **Step 7: Run test to verify it passes, then the existing config test suite**
 
-Run: `CARGO_TARGET_DIR=.shared-target cargo test -p infigraph-core --test config_backend`
+Run: `cargo test -p infigraph-core --test config_backend`
 Expected: PASS.
 
-Run: `CARGO_TARGET_DIR=.shared-target cargo test -p infigraph-core config::`
+Run: `cargo test -p infigraph-core config::`
 Expected: PASS (no regressions in `detect_config_bindings` tests).
 
 - [ ] **Step 8: Add `WriteRequest::StoreConfigBindings` variant + handler + test**
@@ -2090,7 +2091,7 @@ Mirror Task 8's Step 9-10 pattern, with `WriteRequest::StoreConfigBindings { bin
 
 - [ ] **Step 9: Run tests to verify they pass**
 
-Run: `CARGO_TARGET_DIR=.shared-target cargo test -p infigraph-core --test daemon_protocol_serve`
+Run: `cargo test -p infigraph-core --test daemon_protocol_serve`
 Expected: PASS.
 
 - [ ] **Step 10: Commit**
@@ -2193,7 +2194,7 @@ fn write_cross_service_edges_creates_target_node_and_edge_once() {
 
 - [ ] **Step 3: Run test to verify it fails**
 
-Run: `CARGO_TARGET_DIR=.shared-target cargo test -p infigraph-core --test cross_service_backend`
+Run: `cargo test -p infigraph-core --test cross_service_backend`
 Expected: FAIL to compile.
 
 - [ ] **Step 4: Add the trait method and implement on `KuzuBackend`**
@@ -2263,10 +2264,10 @@ Keep the `total` counter (used for the function's return value / log message) wo
 
 - [ ] **Step 7: Run test to verify it passes, then the existing cross-service test suite**
 
-Run: `CARGO_TARGET_DIR=.shared-target cargo test -p infigraph-core --test cross_service_backend`
+Run: `cargo test -p infigraph-core --test cross_service_backend`
 Expected: PASS.
 
-Run: `CARGO_TARGET_DIR=.shared-target cargo test -p infigraph-core cross_service`
+Run: `cargo test -p infigraph-core cross_service`
 Expected: PASS (no regressions in `link_cross_service_calls`/`group link` tests).
 
 - [ ] **Step 8: Add `WriteRequest::WriteCrossServiceEdges` variant + Arrow IPC handler + test**
@@ -2275,7 +2276,7 @@ Mirror Task 7's `WriteCallsServiceEdges` pattern exactly (Arrow IPC sibling file
 
 - [ ] **Step 9: Run tests to verify they pass**
 
-Run: `CARGO_TARGET_DIR=.shared-target cargo test -p infigraph-core --test daemon_protocol_serve`
+Run: `cargo test -p infigraph-core --test daemon_protocol_serve`
 Expected: PASS.
 
 - [ ] **Step 10: Commit**
@@ -2356,7 +2357,7 @@ fn read_methods_pass_through_to_a_real_connection() {
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `CARGO_TARGET_DIR=.shared-target cargo test -p infigraph-core --test daemon_kuzu_backend`
+Run: `cargo test -p infigraph-core --test daemon_kuzu_backend`
 Expected: FAIL to compile — `DaemonKuzuBackend` doesn't implement `GraphBackend` yet (Task 2's placeholder deliberately doesn't), and `open` doesn't open a real read-only connection.
 
 - [ ] **Step 3: Implement `DaemonKuzuBackend`'s read tier and open a real read-only connection**
@@ -2514,7 +2515,7 @@ Note: this lists every `GraphBackend` trait method explicitly (no reliance on de
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `CARGO_TARGET_DIR=.shared-target cargo test -p infigraph-core --test daemon_kuzu_backend`
+Run: `cargo test -p infigraph-core --test daemon_kuzu_backend`
 Expected: PASS, both tests. If `read_only_connection_rejects_write_statements` still passes (i.e. the `CREATE` doesn't error), this is a load-bearing finding for the whole design — stop and re-read the spec's Open Questions section before proceeding to Task 13, since the entire safety-net argument depends on this test's assertion being true. Do not weaken the assertion to make it pass; if Kuzu's read-only mode doesn't reject writes at the DB level, that's a real problem requiring a design conversation, not a test to relax.
 
 - [ ] **Step 5: Update `BackendKind::DaemonKuzu`'s construction in `lib.rs` (from Task 2) to use the real type**
@@ -2527,7 +2528,7 @@ Task 2's `graph::DaemonKuzuBackend::open(&self.root)` call already matches this 
 
 - [ ] **Step 6: Run the full backend_selection test suite to confirm no regression**
 
-Run: `CARGO_TARGET_DIR=.shared-target cargo test -p infigraph-core --test backend_selection`
+Run: `cargo test -p infigraph-core --test backend_selection`
 Expected: PASS, all three tests (from Task 2) still pass with the real wrapper now wired in.
 
 - [ ] **Step 7: Commit**
@@ -2627,7 +2628,7 @@ pub fn submit_write_request(
 
 - [ ] **Step 2: Run the existing daemon_protocol unit tests to confirm the refactor didn't break anything**
 
-Run: `CARGO_TARGET_DIR=.shared-target cargo test -p infigraph-core daemon_protocol::`
+Run: `cargo test -p infigraph-core daemon_protocol::`
 Expected: PASS, unchanged (this refactor is behavior-preserving for `submit_write_request`'s existing callers).
 
 - [ ] **Step 3: Write the failing tests for the wrapper's covered writes**
@@ -2680,7 +2681,7 @@ fn wrapper_upsert_repo_routes_through_daemon_protocol() {
 
 - [ ] **Step 4: Run test to verify it fails**
 
-Run: `CARGO_TARGET_DIR=.shared-target cargo test -p infigraph-core --test daemon_kuzu_backend wrapper_upsert_repo_routes_through_daemon_protocol`
+Run: `cargo test -p infigraph-core --test daemon_kuzu_backend wrapper_upsert_repo_routes_through_daemon_protocol`
 Expected: FAIL — `dk.upsert_repo` currently returns the Task 12 placeholder's `not_supported` error, not routing through `submit_write_request`.
 
 - [ ] **Step 5: Wire the simple (non-Arrow) covered writes**
@@ -2805,7 +2806,7 @@ Apply the same pattern to `write_cross_service_edges` (using `write_cross_servic
 
 - [ ] **Step 7: Run test to verify it passes**
 
-Run: `CARGO_TARGET_DIR=.shared-target cargo test -p infigraph-core --test daemon_kuzu_backend wrapper_upsert_repo_routes_through_daemon_protocol`
+Run: `cargo test -p infigraph-core --test daemon_kuzu_backend wrapper_upsert_repo_routes_through_daemon_protocol`
 Expected: PASS.
 
 - [ ] **Step 8: Add one wrapper-level test per remaining covered write, following the same background-thread-serves-one-request pattern as Step 3**
@@ -2814,7 +2815,7 @@ At minimum, add tests for: `derive_tested_by_edges`, `upsert_similar_edge`, `wri
 
 - [ ] **Step 9: Run the full wrapper test suite**
 
-Run: `CARGO_TARGET_DIR=.shared-target cargo test -p infigraph-core --test daemon_kuzu_backend`
+Run: `cargo test -p infigraph-core --test daemon_kuzu_backend`
 Expected: PASS, all tests.
 
 - [ ] **Step 10: Commit**
@@ -2952,7 +2953,7 @@ Note `upsert_repo` was chosen for this end-to-end test specifically because `Rep
 
 - [ ] **Step 2: Run test to verify it fails naturally, then passes once everything from Tasks 1-13 is in place**
 
-Run: `env -u INFIGRAPH_WATCH_DAEMON CARGO_TARGET_DIR=.shared-target cargo test -p infigraph-core --test daemon_kuzu_e2e -- --test-threads=1`
+Run: `env -u INFIGRAPH_WATCH_DAEMON cargo test -p infigraph-core --test daemon_kuzu_e2e -- --test-threads=1`
 Expected: This test should already PASS at this point in the plan, since it exercises only functionality Tasks 1-13 already built and verified individually — this task's job is proving the *composition* works with a real spawned process, not introducing new behavior. If it fails, the failure points at an integration gap between two tasks' pieces that their individual tests didn't catch (e.g. a path-resolution mismatch between the CLI's `current_dir` and `Infigraph::open`'s root canonicalization) — debug and fix the root cause rather than adjusting the test's assertions to match broken behavior.
 
 - [ ] **Step 3: Commit**
@@ -3003,7 +3004,7 @@ Read `crates/infigraph-mcp/src/tools/analysis/clones.rs` to find its `store_edge
 
 - [ ] **Step 3: Run the existing clone-detection test suite to confirm no regressions**
 
-Run: `CARGO_TARGET_DIR=.shared-target cargo test -p infigraph-cli -p infigraph-mcp clones`
+Run: `cargo test -p infigraph-cli -p infigraph-mcp clones`
 Expected: PASS (this is a pure error-surfacing change — no behavior change on the success path).
 
 - [ ] **Step 4: Commit**
@@ -3023,16 +3024,16 @@ git commit -m "fix: surface upsert_similar_edge failures as warnings instead of 
 
 This machine has two known environmental gotchas (from the prior merged daemonkuzu-file-drop-protocol plan's Task 6 — see its ledger at `.superpowers/sdd/2026-07-31-daemonkuzu-file-drop-protocol/progress.md` for the full history):
 
-(a) Always point `CARGO_TARGET_DIR` at the repo's existing shared target directory. Do NOT override it to a fresh local path — that duplicates the entire dependency tree (Arrow, Kuzu, tree-sitter's ~62 language packs, etc.) and can exhaust disk on this machine. Every command in this plan already uses `CARGO_TARGET_DIR=.shared-target` for this reason; keep doing so here.
+(a) Never set `CARGO_TARGET_DIR` explicitly. `scratchpad/.cargo/config.toml` already points `target-dir` at the repo's shared absolute path for every `scratchpad/wt-*` worktree — a relative `CARGO_TARGET_DIR=.shared-target` override (this plan originally used that convention throughout; it has since been corrected) resolves against whatever directory the command runs from, so under a worktree it silently creates a second, duplicate target dir instead of preventing one. Just run plain `cargo`/`cargo test` and let the ambient config resolve it.
 
 (b) This machine's `~/.zshrc` exports `INFIGRAPH_WATCH_DAEMON=1` globally, which breaks `watcher_concurrency.rs`/`watcher_reindex.rs` tests unless the run is prefixed with `env -u INFIGRAPH_WATCH_DAEMON`.
 
-Run: `env -u INFIGRAPH_WATCH_DAEMON CARGO_TARGET_DIR=.shared-target cargo test --workspace --no-fail-fast`
+Run: `env -u INFIGRAPH_WATCH_DAEMON cargo test --workspace --no-fail-fast`
 Expected: PASS. If a failure looks unrelated to this plan's changes (e.g. the same Kuzu mmap-exhaustion-under-full-parallelism or cross-test-pollution patterns documented in the prior plan's Task 6 ledger), rerun that specific test/file in isolation (`cargo test -p <crate> --test <file> -- --test-threads=1` or similar) before treating it as a real regression — if it passes in isolation, it's environmental, not a defect in this plan's code.
 
 - [ ] **Step 2: Run `cargo fmt` and `cargo clippy`**
 
-Run: `env -u INFIGRAPH_WATCH_DAEMON cargo fmt -- --check && env -u INFIGRAPH_WATCH_DAEMON CARGO_TARGET_DIR=.shared-target cargo clippy --all-targets -- -D warnings`
+Run: `env -u INFIGRAPH_WATCH_DAEMON cargo fmt -- --check && env -u INFIGRAPH_WATCH_DAEMON cargo clippy --all-targets -- -D warnings`
 Expected: clean, no warnings.
 
 - [ ] **Step 3: Verify the Write Coverage Audit's promises actually hold**
