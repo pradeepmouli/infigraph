@@ -268,8 +268,9 @@ enum Commands {
         index: PathBuf,
     },
 
-    /// Watch project for file changes and auto-reindex
-    Watch {
+    /// Run the infigraph daemon: serves file-dropped write requests and
+    /// watches for file changes to auto-reindex
+    Daemon {
         /// Debounce interval in milliseconds
         #[arg(short, long, default_value = "500")]
         debounce: u64,
@@ -806,7 +807,7 @@ fn main() -> Result<()> {
 
     let should_auto_watch = !matches!(
         cli.command,
-        Commands::Watch { .. }
+        Commands::Daemon { .. }
             | Commands::WatchStop
             | Commands::WatchStatus
             | Commands::ScipEnrich { .. }
@@ -902,7 +903,7 @@ fn run(command: Commands, root: &Path) -> Result<()> {
         }
         Commands::Routes => cmd_routes(root),
         Commands::ScipImport { index } => cmd_scip_import(root, &index),
-        Commands::Watch { debounce } => cmd_watch(root, debounce),
+        Commands::Daemon { debounce } => cmd_daemon(root, debounce),
         Commands::WatchStop => cmd_watch_stop(root),
         Commands::WatchStatus => cmd_watch_status(root),
         Commands::IndexDocs => {

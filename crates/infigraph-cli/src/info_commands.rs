@@ -311,7 +311,7 @@ pub(crate) fn cmd_test_coverage(root: &Path, file_filter: Option<&str>) -> Resul
     Ok(())
 }
 
-pub(crate) fn cmd_watch(root: &Path, debounce: u64) -> Result<()> {
+pub(crate) fn cmd_daemon(root: &Path, debounce: u64) -> Result<()> {
     if infigraph_core::watch::daemon::is_remote_backend() {
         println!(
             "File watching is not supported in remote mode (Neo4j backend). \

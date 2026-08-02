@@ -1324,7 +1324,7 @@ mod tests {
     fn global_hook_exclusion_list_is_exhaustive() {
         // Commands that should NOT trigger auto-watcher
         let excluded = [
-            "watch",
+            "daemon",
             "watch-stop",
             "watch-status",
             "scip-enrich",

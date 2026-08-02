@@ -116,7 +116,7 @@ fn spawn_daemon(root: &Path, tg_dir: &Path, watch_binary: &Path) -> DaemonStartO
     };
 
     let mut cmd = Command::new(watch_binary);
-    cmd.arg("watch")
+    cmd.arg("daemon")
         .current_dir(root)
         .stdin(Stdio::null())
         .stdout(Stdio::null())

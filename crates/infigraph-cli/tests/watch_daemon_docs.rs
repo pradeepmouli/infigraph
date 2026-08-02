@@ -65,7 +65,7 @@ fn cmd_watch_daemon_also_indexes_docs_without_restart() {
     std::fs::write(root.join("main.rs"), "fn main() {}").unwrap();
 
     let mut child = Command::new(&bin)
-        .arg("watch")
+        .arg("daemon")
         .arg("--debounce")
         .arg("50")
         // Fast daemon attach-poll so this test doesn't wait through the
