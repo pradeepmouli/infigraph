@@ -1,7 +1,11 @@
+use crate::graph::CallsServiceEdge;
+use arrow::array::{RecordBatch, StringArray};
+use arrow::datatypes::{DataType, Field, Schema};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// A request for the daemon to perform a write. Carries references (paths),
@@ -26,6 +30,18 @@ pub enum WriteRequest {
     /// Derive TESTED_BY edges. `files` scopes to changed files for
     /// incremental runs; `None` means a full derivation pass.
     DeriveTestedBy { files: Option<Vec<String>> },
+    /// Link two symbols as similar (clone detection). Deliberately
+    /// unbatched -- matches Neo4jBackend::upsert_similar_edge's existing
+    /// per-call precedent (one Cypher MERGE per call).
+    UpsertSimilarEdge {
+        id_a: String,
+        id_b: String,
+        score: f32,
+    },
+    /// Write a batch of CALLS_SERVICE edges. The edges themselves live in
+    /// an Arrow IPC sibling file at edges_path (genuinely tabular bulk
+    /// data), not inline in this envelope.
+    WriteCallsServiceEdges { edges_path: PathBuf },
 }
 
 /// Where IngestStructured's data comes from. `Inline` carries no data
@@ -418,6 +434,39 @@ pub fn serve_one_request(infigraph: &Infigraph, request_path: &Path) -> anyhow::
                     },
                 }
             }
+            WriteRequest::UpsertSimilarEdge { id_a, id_b, score } => match infigraph.backend() {
+                Some(b) => match b.upsert_similar_edge(id_a, id_b, *score) {
+                    Ok(()) => WriteResult::Ok {
+                        total_files: 0,
+                        indexed_files: 0,
+                    },
+                    Err(e) => WriteResult::Err {
+                        message: e.to_string(),
+                    },
+                },
+                None => WriteResult::Err {
+                    message: "graph not initialized".to_string(),
+                },
+            },
+            WriteRequest::WriteCallsServiceEdges { edges_path } => {
+                match read_calls_service_edges_arrow(edges_path).and_then(|edges| {
+                    infigraph
+                        .backend()
+                        .ok_or_else(|| anyhow::anyhow!("graph not initialized"))
+                        .and_then(|b| b.write_calls_service_edges(&edges))
+                }) {
+                    Ok(()) => {
+                        std::fs::remove_file(edges_path).ok();
+                        WriteResult::Ok {
+                            total_files: 0,
+                            indexed_files: 0,
+                        }
+                    }
+                    Err(e) => WriteResult::Err {
+                        message: e.to_string(),
+                    },
+                }
+            }
         },
         Err(e) => WriteResult::Err {
             message: format!("failed to read/parse request: {e}"),
@@ -491,4 +540,91 @@ pub fn write_ingest_inline_sibling(
     let sibling_path = request_path.with_extension("data.json");
     write_atomic(&sibling_path, &serde_json::to_string(data)?)?;
     Ok(sibling_path)
+}
+
+fn calls_service_edges_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("symbol_id", DataType::Utf8, false),
+        Field::new("target_id", DataType::Utf8, false),
+        Field::new("method", DataType::Utf8, false),
+        Field::new("path", DataType::Utf8, false),
+    ]))
+}
+
+/// Writes `edges` as an Arrow IPC file at `path` -- genuinely tabular bulk
+/// data (many rows, same shape), unlike the small heterogeneous
+/// WriteRequest/WriteResult envelope, which stays JSON.
+pub fn write_calls_service_edges_arrow(
+    path: &Path,
+    edges: &[CallsServiceEdge],
+) -> anyhow::Result<()> {
+    let schema = calls_service_edges_schema();
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(
+                edges
+                    .iter()
+                    .map(|e| e.symbol_id.as_str())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                edges
+                    .iter()
+                    .map(|e| e.target_id.as_str())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                edges.iter().map(|e| e.method.as_str()).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                edges.iter().map(|e| e.path.as_str()).collect::<Vec<_>>(),
+            )),
+        ],
+    )?;
+    let file = std::fs::File::create(path)?;
+    let mut writer = arrow::ipc::writer::FileWriter::try_new(file, &schema)?;
+    writer.write(&batch)?;
+    writer.finish()?;
+    Ok(())
+}
+
+/// Reads `CallsServiceEdge`s back from an Arrow IPC file written by
+/// write_calls_service_edges_arrow.
+pub fn read_calls_service_edges_arrow(path: &Path) -> anyhow::Result<Vec<CallsServiceEdge>> {
+    let file = std::fs::File::open(path)?;
+    let reader = arrow::ipc::reader::FileReader::try_new(file, None)?;
+    let mut edges = Vec::new();
+    for batch in reader {
+        let batch = batch?;
+        let symbol_ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let target_ids = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let methods = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let paths = batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        for i in 0..batch.num_rows() {
+            edges.push(CallsServiceEdge {
+                symbol_id: symbol_ids.value(i).to_string(),
+                target_id: target_ids.value(i).to_string(),
+                method: methods.value(i).to_string(),
+                path: paths.value(i).to_string(),
+            });
+        }
+    }
+    Ok(edges)
 }

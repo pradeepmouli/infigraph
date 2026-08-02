@@ -19,7 +19,7 @@ use super::{
 /// A single detected dynamic-URL/route match, to be written as a
 /// `CALLS_SERVICE` edge from the calling symbol to the matched route
 /// handler.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct CallsServiceEdge {
     pub symbol_id: String,
     pub target_id: String,

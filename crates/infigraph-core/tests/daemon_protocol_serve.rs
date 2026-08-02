@@ -267,6 +267,103 @@ fn serve_one_request_handles_upsert_repo() {
 }
 
 #[test]
+fn serve_one_request_handles_upsert_similar_edge() {
+    let project_dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        project_dir.path().join("main.py"),
+        "def foo():\n    pass\n\ndef bar():\n    pass\n",
+    )
+    .unwrap();
+    let registry = bundled_registry().unwrap();
+    let mut infigraph = Infigraph::open(project_dir.path(), registry).unwrap();
+    infigraph.init().unwrap();
+    infigraph.index().unwrap();
+
+    let symbols = infigraph
+        .backend()
+        .unwrap()
+        .symbols_with_docstring(None)
+        .unwrap();
+    assert!(symbols.len() >= 2, "expected at least 2 symbols to link");
+
+    let staging_dir = project_dir.path().join(".infigraph").join("requests");
+    std::fs::create_dir_all(&staging_dir).unwrap();
+    let request_path = staging_dir.join("test-similar.request");
+    let result_path = staging_dir.join("test-similar.result");
+    write_atomic(
+        &request_path,
+        &serde_json::to_string(&WriteRequest::UpsertSimilarEdge {
+            id_a: symbols[0].id.clone(),
+            id_b: symbols[1].id.clone(),
+            score: 0.9,
+        })
+        .unwrap(),
+    )
+    .unwrap();
+
+    serve_one_request(&infigraph, &request_path).unwrap();
+
+    let result: WriteResult =
+        serde_json::from_str(&std::fs::read_to_string(&result_path).unwrap()).unwrap();
+    assert!(
+        matches!(result, WriteResult::Ok { .. }),
+        "expected Ok, got {result:?}"
+    );
+}
+
+#[test]
+fn serve_one_request_handles_write_calls_service_edges() {
+    let project_dir = tempfile::tempdir().unwrap();
+    let registry = bundled_registry().unwrap();
+    let mut infigraph = Infigraph::open(project_dir.path(), registry).unwrap();
+    infigraph.init().unwrap();
+
+    let staging_dir = project_dir.path().join(".infigraph").join("requests");
+    std::fs::create_dir_all(&staging_dir).unwrap();
+    let request_path = staging_dir.join("test-cse.request");
+    let result_path = staging_dir.join("test-cse.result");
+    let edges_path = staging_dir.join("test-cse.edges.arrow");
+
+    let edges = vec![
+        infigraph_core::graph::CallsServiceEdge {
+            symbol_id: "s1".to_string(),
+            target_id: "t1".to_string(),
+            method: "GET".to_string(),
+            path: "/foo".to_string(),
+        },
+        infigraph_core::graph::CallsServiceEdge {
+            symbol_id: "s2".to_string(),
+            target_id: "t2".to_string(),
+            method: "POST".to_string(),
+            path: "/bar".to_string(),
+        },
+    ];
+    infigraph_core::daemon_protocol::write_calls_service_edges_arrow(&edges_path, &edges).unwrap();
+
+    write_atomic(
+        &request_path,
+        &serde_json::to_string(&WriteRequest::WriteCallsServiceEdges {
+            edges_path: edges_path.clone(),
+        })
+        .unwrap(),
+    )
+    .unwrap();
+
+    serve_one_request(&infigraph, &request_path).unwrap();
+
+    assert!(
+        !edges_path.exists(),
+        "sibling edges file should be cleaned up after serving"
+    );
+    let result: WriteResult =
+        serde_json::from_str(&std::fs::read_to_string(&result_path).unwrap()).unwrap();
+    assert!(
+        matches!(result, WriteResult::Ok { .. }),
+        "expected Ok, got {result:?}"
+    );
+}
+
+#[test]
 fn serve_one_request_handles_derive_tested_by() {
     let project_dir = tempfile::tempdir().unwrap();
     std::fs::write(
