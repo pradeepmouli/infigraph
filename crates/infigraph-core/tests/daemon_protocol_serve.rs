@@ -36,7 +36,7 @@ fn serve_one_request_indexes_and_writes_result_and_removes_request() {
         serde_json::from_str(&std::fs::read_to_string(&result_path).unwrap()).unwrap();
     match result {
         WriteResult::Ok { indexed_files, .. } => assert_eq!(indexed_files, 1),
-        WriteResult::Err { message } => panic!("expected Ok, got Err: {message}"),
+        other => panic!("expected Ok, got {other:?}"),
     }
 }
 
@@ -88,5 +88,40 @@ fn serve_one_request_writes_err_result_on_corrupt_request_json() {
     assert!(
         matches!(result, WriteResult::Err { .. }),
         "expected Err for a corrupt request, got {result:?}"
+    );
+}
+
+#[test]
+fn serve_one_request_handles_scip_import() {
+    let project_dir = tempfile::tempdir().unwrap();
+    let registry = bundled_registry().unwrap();
+    let mut infigraph = Infigraph::open(project_dir.path(), registry).unwrap();
+    infigraph.init().unwrap();
+
+    let staging_dir = project_dir.path().join(".infigraph").join("requests");
+    std::fs::create_dir_all(&staging_dir).unwrap();
+    let request_path = staging_dir.join("test-scip.request");
+    let result_path = staging_dir.join("test-scip.result");
+    // A nonexistent scip file is fine for this test -- it exercises the
+    // handler routes to import_scip and returns Err cleanly, not that a
+    // real SCIP import succeeds (that's covered by existing scip-import
+    // integration tests).
+    write_atomic(
+        &request_path,
+        &serde_json::to_string(&WriteRequest::ScipImport {
+            scip_path: "does/not/exist.scip".into(),
+        })
+        .unwrap(),
+    )
+    .unwrap();
+
+    serve_one_request(&infigraph, &request_path).unwrap();
+
+    assert!(result_path.exists());
+    let result: WriteResult =
+        serde_json::from_str(&std::fs::read_to_string(&result_path).unwrap()).unwrap();
+    assert!(
+        matches!(result, WriteResult::Err { .. }),
+        "expected Err for a missing scip file, got {result:?}"
     );
 }

@@ -310,6 +310,14 @@ impl Infigraph {
         self.index_via_backend(backend)
     }
 
+    /// Import a SCIP index file into the graph. Thin wrapper matching
+    /// index()/index_files()'s shape, so the daemon protocol has a single
+    /// clean entry point rather than reaching for prism.backend() directly.
+    pub fn import_scip(&self, scip_path: &Path) -> Result<crate::scip::ImportStats> {
+        let backend = self.backend().context("call init() first")?;
+        backend.import_scip_index(scip_path, Some(&self.root))
+    }
+
     /// Backend-agnostic index path (used for Neo4j and future backends).
     fn index_via_backend(&self, backend: &dyn graph::GraphBackend) -> Result<IndexResult> {
         let files = self.collect_files()?;

@@ -62,9 +62,7 @@ fn client_and_server_interoperate_end_to_end() {
         infigraph_core::daemon_protocol::WriteResult::Ok { indexed_files, .. } => {
             assert_eq!(indexed_files, 1)
         }
-        infigraph_core::daemon_protocol::WriteResult::Err { message } => {
-            panic!("expected Ok, got Err: {message}")
-        }
+        other => panic!("expected Ok, got {other:?}"),
     }
 
     server_handle.join().unwrap();

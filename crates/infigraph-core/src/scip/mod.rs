@@ -676,7 +676,7 @@ fn scip_kind_to_prism(kind: &symbol_information::Kind) -> SymbolKind {
     }
 }
 
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ImportStats {
     pub files_processed: usize,
     pub symbols_added: usize,

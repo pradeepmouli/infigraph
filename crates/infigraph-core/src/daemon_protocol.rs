@@ -25,6 +25,9 @@ pub enum WriteResult {
         total_files: usize,
         indexed_files: usize,
     },
+    /// Real SCIP import stats -- `Ok`'s two usize fields can't represent
+    /// ImportStats's seven fields without losing data.
+    ScipImportOk(crate::scip::ImportStats),
     Err {
         message: String,
     },
@@ -341,8 +344,11 @@ pub fn serve_one_request(infigraph: &Infigraph, request_path: &Path) -> anyhow::
                     message: e.to_string(),
                 },
             },
-            WriteRequest::ScipImport { scip_path: _ } => WriteResult::Err {
-                message: "scip-import serving not yet implemented".to_string(),
+            WriteRequest::ScipImport { scip_path } => match infigraph.import_scip(scip_path) {
+                Ok(stats) => WriteResult::ScipImportOk(stats),
+                Err(e) => WriteResult::Err {
+                    message: e.to_string(),
+                },
             },
         },
         Err(e) => WriteResult::Err {
