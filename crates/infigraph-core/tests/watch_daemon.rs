@@ -101,3 +101,64 @@ fn ensure_daemon_running_noops_when_not_yet_indexed() {
         "not-yet-indexed projects must no-op silently, not report Failed"
     );
 }
+
+#[test]
+#[cfg(unix)]
+fn spawn_daemon_child_command_does_not_inherit_infigraph_backend() {
+    // spawn_daemon is private to the daemon module; this test exercises it
+    // indirectly through ensure_daemon_running, then inspects the actual
+    // spawned process's environment via /proc (Linux) is not portable to
+    // macOS, so instead: assert the *intent* at the unit level by checking
+    // the Command-building helper directly. Since spawn_daemon is a free
+    // function returning a spawned child (not testable via mocking without
+    // real process spawn), this test spawns a real detached child against a
+    // temp project and confirms it starts (Spawned outcome) with
+    // INFIGRAPH_BACKEND set in the *test's* own environment -- if the
+    // child inherited it and it caused `cmd_daemon` to select DaemonKuzu on
+    // itself, the daemon would hang waiting on ensure_daemon_running's own
+    // request (deadlock) instead of successfully acquiring watch.lock, and
+    // this test's later liveness check would fail.
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let project_dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(project_dir.path().join(".infigraph")).unwrap();
+
+    // infigraph-core has no dev-dependency on infigraph-cli, so
+    // `env!("CARGO_BIN_EXE_infigraph")` isn't available here (cargo only
+    // sets that var for a test binary's own crate-graph binaries). Fall
+    // back to the same sibling-binary resolution MCP uses, matching the
+    // pattern in crates/infigraph-cli/tests/watch_daemon_docs.rs's
+    // `cli_binary` helper.
+    let cli_binary = infigraph_core::watch::daemon::resolve_cli_binary_sibling_of(
+        &std::env::current_exe().unwrap(),
+    )
+    .expect("infigraph CLI binary must already be built (shared target dir)");
+
+    std::env::set_var("INFIGRAPH_BACKEND", "daemon");
+    let outcome =
+        infigraph_core::watch::daemon::ensure_daemon_running(project_dir.path(), &cli_binary);
+    std::env::remove_var("INFIGRAPH_BACKEND");
+
+    assert_eq!(
+        outcome,
+        infigraph_core::watch::daemon::DaemonStartOutcome::Spawned,
+        "expected the daemon to spawn successfully despite INFIGRAPH_BACKEND=daemon in this test's own env"
+    );
+
+    // Give the child a moment to acquire watch.lock -- if it deadlocked
+    // trying to route its own writes through itself, this lock would
+    // never be held.
+    let lock_path = project_dir.path().join(".infigraph").join("watch.lock");
+    let start = std::time::Instant::now();
+    loop {
+        if lock_path.exists() && std::fs::metadata(&lock_path).unwrap().len() > 0 {
+            break;
+        }
+        if start.elapsed() > std::time::Duration::from_secs(5) {
+            panic!("daemon never acquired watch.lock -- likely deadlocked routing its own writes through itself");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    // Clean up: signal the spawned daemon to stop.
+    std::fs::write(project_dir.path().join(".infigraph").join("watch.stop"), "").unwrap();
+}

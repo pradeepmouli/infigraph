@@ -93,6 +93,9 @@ enum BackendKind {
     /// Remote Neo4j sidecar via Bolt.
     #[cfg(feature = "neo4j")]
     Neo4j(graph::Neo4jBackend),
+    /// Routes writes through a DaemonKuzu daemon instead of opening its
+    /// own embedded Kuzu connection. Selected via `INFIGRAPH_BACKEND=daemon`.
+    DaemonKuzu(graph::DaemonKuzuBackend),
 }
 
 impl Infigraph {
@@ -141,6 +144,11 @@ impl Infigraph {
             #[cfg(not(feature = "neo4j"))]
             "neo4j" => {
                 anyhow::bail!("neo4j backend requested but binary compiled without `neo4j` feature")
+            }
+            "daemon" => {
+                let dk = graph::DaemonKuzuBackend::open(&self.root)?;
+                self.backend_kind = BackendKind::DaemonKuzu(dk);
+                Ok(())
             }
             _ => match graph::KuzuBackend::open(&self.db_path) {
                 Ok(kb) => {
@@ -434,6 +442,7 @@ impl Infigraph {
             BackendKind::Uninit => None,
             #[cfg(feature = "neo4j")]
             BackendKind::Neo4j(neo) => Some(neo),
+            BackendKind::DaemonKuzu(_) => None, // placeholder until Task 13
         }
     }
 

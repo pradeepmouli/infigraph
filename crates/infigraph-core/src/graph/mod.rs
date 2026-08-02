@@ -1,5 +1,6 @@
 mod backend;
 pub mod cozo_store;
+pub mod daemon_kuzu_backend;
 mod kuzu_backend;
 #[cfg(feature = "neo4j")]
 mod neo4j_backend;
@@ -17,6 +18,7 @@ pub mod test_templates;
 
 pub use backend::{CallsServiceEdge, GraphBackend};
 pub use cozo_store::CozoStore;
+pub use daemon_kuzu_backend::DaemonKuzuBackend;
 pub use kuzu_backend::KuzuBackend;
 #[cfg(feature = "neo4j")]
 pub use neo4j_backend::Neo4jBackend;

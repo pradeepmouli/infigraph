@@ -120,7 +120,8 @@ fn spawn_daemon(root: &Path, tg_dir: &Path, watch_binary: &Path) -> DaemonStartO
         .current_dir(root)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(stderr_target);
+        .stderr(stderr_target)
+        .env_remove("INFIGRAPH_BACKEND");
 
     #[cfg(unix)]
     {

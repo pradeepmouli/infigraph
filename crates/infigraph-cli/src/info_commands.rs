@@ -312,6 +312,15 @@ pub(crate) fn cmd_test_coverage(root: &Path, file_filter: Option<&str>) -> Resul
 }
 
 pub(crate) fn cmd_daemon(root: &Path, debounce: u64) -> Result<()> {
+    // Belt-and-braces: spawn_daemon (watch/daemon.rs) already strips
+    // INFIGRAPH_BACKEND when it spawns this process normally. This
+    // covers the case where someone runs `infigraph daemon` directly
+    // from a shell that happens to have INFIGRAPH_BACKEND=daemon set --
+    // without this, the daemon's own Infigraph::open (reached via
+    // watch_project -> open_transient) would select DaemonKuzu on
+    // itself and deadlock waiting on a request nothing serves.
+    std::env::remove_var("INFIGRAPH_BACKEND");
+
     if infigraph_core::watch::daemon::is_remote_backend() {
         println!(
             "File watching is not supported in remote mode (Neo4j backend). \
