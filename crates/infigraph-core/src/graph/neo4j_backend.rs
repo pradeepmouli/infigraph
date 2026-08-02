@@ -1798,6 +1798,94 @@ impl GraphBackend for Neo4jBackend {
         Ok(())
     }
 
+    fn store_clusters(
+        &self,
+        idx_to_id: &[String],
+        community: &[usize],
+        modularity: f64,
+    ) -> Result<crate::cluster::ClusterStats> {
+        self.run_void("MATCH (s:Symbol)-[r:MEMBER_OF]->(c:Cluster) DELETE r")?;
+        self.run_void("MATCH (c:Cluster) DELETE c")?;
+
+        let mut comm_members: HashMap<usize, Vec<usize>> = HashMap::new();
+        for (node, &comm) in community.iter().enumerate() {
+            comm_members.entry(comm).or_default().push(node);
+        }
+
+        let mut cluster_maps: Vec<HashMap<&str, String>> = Vec::new();
+        let mut membership_maps: Vec<HashMap<&str, String>> = Vec::new();
+        let mut cluster_sizes = Vec::new();
+
+        for (cluster_idx, members) in comm_members.values().enumerate() {
+            let cluster_id = format!("cluster_{}", cluster_idx);
+            let cluster_name = format!("Cluster {}", cluster_idx);
+
+            let mut files: Vec<&str> = Vec::new();
+            for &node in members {
+                let sym_id = &idx_to_id[node];
+                if let Some((file, _)) = sym_id.rsplit_once("::") {
+                    if !files.contains(&file) {
+                        files.push(file);
+                    }
+                }
+            }
+            files.truncate(5);
+            let description = format!(
+                "{} symbols across files: {}",
+                members.len(),
+                files.join(", ")
+            );
+
+            let mut cluster_map = HashMap::new();
+            cluster_map.insert("id", cluster_id.clone());
+            cluster_map.insert("name", cluster_name);
+            cluster_map.insert("description", description);
+            cluster_maps.push(cluster_map);
+
+            for &node in members {
+                let mut membership_map = HashMap::new();
+                membership_map.insert("symbol_id", idx_to_id[node].clone());
+                membership_map.insert("cluster_id", cluster_id.clone());
+                membership_maps.push(membership_map);
+            }
+
+            cluster_sizes.push(members.len());
+        }
+
+        if !cluster_maps.is_empty() {
+            self.block_on(
+                self.graph.run(
+                    query(
+                        "UNWIND $batch AS p \
+                     CREATE (c:Cluster {id: p.id, name: p.name, description: p.description})",
+                    )
+                    .param("batch", cluster_maps),
+                ),
+            )
+            .map_err(|e| anyhow::anyhow!("failed to create Cluster nodes: {e}"))?;
+        }
+
+        if !membership_maps.is_empty() {
+            self.block_on(
+                self.graph.run(
+                    query(
+                        "UNWIND $batch AS p \
+                     MATCH (s:Symbol {id: p.symbol_id}), (c:Cluster {id: p.cluster_id}) \
+                     CREATE (s)-[:MEMBER_OF]->(c)",
+                    )
+                    .param("batch", membership_maps),
+                ),
+            )
+            .map_err(|e| anyhow::anyhow!("failed to create MEMBER_OF edges: {e}"))?;
+        }
+
+        Ok(crate::cluster::ClusterStats {
+            num_clusters: cluster_sizes.len(),
+            cluster_sizes,
+            modularity,
+        })
+    }
+
     fn clear_all_data(&self) -> Result<()> {
         loop {
             let deleted = self.count_query(

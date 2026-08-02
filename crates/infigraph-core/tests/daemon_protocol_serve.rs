@@ -420,6 +420,60 @@ fn serve_one_request_handles_upsert_dependencies() {
 }
 
 #[test]
+fn serve_one_request_handles_store_clusters() {
+    let project_dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        project_dir.path().join("main.py"),
+        "def hello():\n    pass\n",
+    )
+    .unwrap();
+    let registry = bundled_registry().unwrap();
+    let mut infigraph = Infigraph::open(project_dir.path(), registry).unwrap();
+    infigraph.init().unwrap();
+    infigraph.index().unwrap();
+
+    let symbols = infigraph
+        .backend()
+        .unwrap()
+        .symbols_with_docstring(None)
+        .unwrap();
+    assert!(!symbols.is_empty());
+    let idx_to_id: Vec<String> = symbols.iter().map(|s| s.id.clone()).collect();
+    let community: Vec<usize> = vec![0; idx_to_id.len()];
+
+    let staging_dir = project_dir.path().join(".infigraph").join("requests");
+    std::fs::create_dir_all(&staging_dir).unwrap();
+    let request_path = staging_dir.join("test-clusters.request");
+    let result_path = staging_dir.join("test-clusters.result");
+    write_atomic(
+        &request_path,
+        &serde_json::to_string(&WriteRequest::StoreClusters {
+            idx_to_id,
+            community,
+            modularity: 0.5,
+        })
+        .unwrap(),
+    )
+    .unwrap();
+
+    serve_one_request(&infigraph, &request_path).unwrap();
+
+    let result: WriteResult =
+        serde_json::from_str(&std::fs::read_to_string(&result_path).unwrap()).unwrap();
+    assert!(
+        matches!(result, WriteResult::ClustersOk(ref stats) if stats.num_clusters == 1),
+        "expected ClustersOk with num_clusters == 1, got {result:?}"
+    );
+
+    let rows = infigraph
+        .backend()
+        .unwrap()
+        .raw_query("MATCH (c:Cluster) RETURN c.id")
+        .unwrap();
+    assert_eq!(rows.len(), 1, "expected the Cluster node to exist");
+}
+
+#[test]
 fn serve_one_request_handles_derive_tested_by() {
     let project_dir = tempfile::tempdir().unwrap();
     std::fs::write(

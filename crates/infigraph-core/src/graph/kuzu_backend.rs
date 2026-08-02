@@ -538,6 +538,70 @@ impl GraphBackend for KuzuBackend {
         Ok(())
     }
 
+    fn store_clusters(
+        &self,
+        idx_to_id: &[String],
+        community: &[usize],
+        modularity: f64,
+    ) -> Result<crate::cluster::ClusterStats> {
+        self.raw_query("MATCH (s:Symbol)-[r:MEMBER_OF]->(c:Cluster) DELETE r")?;
+        self.raw_query("MATCH (c:Cluster) DELETE c")?;
+
+        let mut comm_members: HashMap<usize, Vec<usize>> = HashMap::new();
+        for (node, &comm) in community.iter().enumerate() {
+            comm_members.entry(comm).or_default().push(node);
+        }
+
+        let mut cluster_sizes = Vec::new();
+
+        for (cluster_idx, members) in comm_members.values().enumerate() {
+            let cluster_id = format!("cluster_{}", cluster_idx);
+            let cluster_name = format!("Cluster {}", cluster_idx);
+
+            let mut files: Vec<&str> = Vec::new();
+            for &node in members {
+                let sym_id = &idx_to_id[node];
+                if let Some((file, _)) = sym_id.rsplit_once("::") {
+                    if !files.contains(&file) {
+                        files.push(file);
+                    }
+                }
+            }
+            files.truncate(5);
+            let description = format!(
+                "{} symbols across files: {}",
+                members.len(),
+                files.join(", ")
+            );
+
+            let create_cluster = format!(
+                "CREATE (c:Cluster {{id: '{}', name: '{}', description: '{}'}})",
+                escape(&cluster_id),
+                escape(&cluster_name),
+                escape(&description),
+            );
+            self.raw_query(&create_cluster)?;
+
+            for &node in members {
+                let sym_id = &idx_to_id[node];
+                let create_edge = format!(
+                    "MATCH (s:Symbol), (c:Cluster) WHERE s.id = '{}' AND c.id = '{}' CREATE (s)-[:MEMBER_OF]->(c)",
+                    escape(sym_id),
+                    escape(&cluster_id),
+                );
+                self.raw_query(&create_edge)?;
+            }
+
+            cluster_sizes.push(members.len());
+        }
+
+        Ok(crate::cluster::ClusterStats {
+            num_clusters: cluster_sizes.len(),
+            cluster_sizes,
+            modularity,
+        })
+    }
+
     // ── Resolve ──────────────────────────────────────────────────────
 
     fn resolve_calls(

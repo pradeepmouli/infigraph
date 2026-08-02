@@ -47,6 +47,14 @@ pub enum WriteRequest {
     UpsertDependencies {
         result: crate::manifest::ManifestResult,
     },
+    /// Store cluster-detection results. idx_to_id/community are already in
+    /// memory on the caller's side by the time this is called -- small
+    /// enough to ride inline, no sibling file needed.
+    StoreClusters {
+        idx_to_id: Vec<String>,
+        community: Vec<usize>,
+        modularity: f64,
+    },
 }
 
 /// Where IngestStructured's data comes from. `Inline` carries no data
@@ -73,6 +81,9 @@ pub enum WriteResult {
     /// Real SCIP import stats -- `Ok`'s two usize fields can't represent
     /// ImportStats's seven fields without losing data.
     ScipImportOk(crate::scip::ImportStats),
+    /// Real cluster stats -- `Ok`'s two usize fields can't represent
+    /// ClusterStats's num_clusters/cluster_sizes/modularity without losing data.
+    ClustersOk(crate::cluster::ClusterStats),
     Err {
         message: String,
     },
@@ -478,6 +489,21 @@ pub fn serve_one_request(infigraph: &Infigraph, request_path: &Path) -> anyhow::
                         total_files: 0,
                         indexed_files: 0,
                     },
+                    Err(e) => WriteResult::Err {
+                        message: e.to_string(),
+                    },
+                },
+                None => WriteResult::Err {
+                    message: "graph not initialized".to_string(),
+                },
+            },
+            WriteRequest::StoreClusters {
+                idx_to_id,
+                community,
+                modularity,
+            } => match infigraph.backend() {
+                Some(b) => match b.store_clusters(idx_to_id, community, *modularity) {
+                    Ok(stats) => WriteResult::ClustersOk(stats),
                     Err(e) => WriteResult::Err {
                         message: e.to_string(),
                     },

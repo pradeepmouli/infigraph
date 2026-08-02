@@ -6,12 +6,13 @@
 
 use std::collections::HashMap;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
+use serde::{Deserialize, Serialize};
 
 use crate::graph::GraphBackend;
 
 /// Statistics returned after clustering.
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ClusterStats {
     /// Total number of clusters discovered.
     pub num_clusters: usize,
@@ -135,7 +136,7 @@ pub fn detect_clusters(backend: &dyn GraphBackend) -> Result<ClusterStats> {
     if total_weight == 0.0 {
         // No edges: each node is its own cluster.
         let assignments: Vec<usize> = (0..n).collect();
-        let stats = store_clusters(backend, &idx_to_id, &assignments, 0.0)?;
+        let stats = backend.store_clusters(&idx_to_id, &assignments, 0.0)?;
         return Ok(stats);
     }
 
@@ -220,7 +221,7 @@ pub fn detect_clusters(backend: &dyn GraphBackend) -> Result<ClusterStats> {
     let modularity = compute_modularity(&community, &edge_weight, &degree, m);
 
     // Step 3: Store results in the graph.
-    let stats = store_clusters(backend, &idx_to_id, &community, modularity)?;
+    let stats = backend.store_clusters(&idx_to_id, &community, modularity)?;
     Ok(stats)
 }
 
@@ -244,81 +245,4 @@ fn compute_modularity(
     }
 
     q / m
-}
-
-/// Store cluster results into the graph: create Cluster nodes and MEMBER_OF edges.
-/// Clears any existing Cluster/MEMBER_OF data first.
-fn store_clusters(
-    backend: &dyn GraphBackend,
-    idx_to_id: &[String],
-    community: &[usize],
-    modularity: f64,
-) -> Result<ClusterStats> {
-    let _ = backend.raw_query("MATCH (s:Symbol)-[r:MEMBER_OF]->(c:Cluster) DELETE r");
-    let _ = backend.raw_query("MATCH (c:Cluster) DELETE c");
-
-    // Build community -> members map, renumbering communities to be contiguous.
-    let mut comm_members: HashMap<usize, Vec<usize>> = HashMap::new();
-    for (node, &comm) in community.iter().enumerate() {
-        comm_members.entry(comm).or_default().push(node);
-    }
-
-    let mut cluster_sizes = Vec::new();
-
-    for (cluster_idx, members) in comm_members.values().enumerate() {
-        let cluster_id = format!("cluster_{}", cluster_idx);
-        let cluster_name = format!("Cluster {}", cluster_idx);
-
-        // Gather file names for description.
-        let mut files: Vec<&str> = Vec::new();
-        for &node in members {
-            let sym_id = &idx_to_id[node];
-            // Extract file part from symbol ID (format: "file::name").
-            if let Some((file, _)) = sym_id.rsplit_once("::") {
-                if !files.contains(&file) {
-                    files.push(file);
-                }
-            }
-        }
-        files.truncate(5);
-        let description = format!(
-            "{} symbols across files: {}",
-            members.len(),
-            files.join(", ")
-        );
-
-        // Create cluster node.
-        let create_cluster = format!(
-            "CREATE (c:Cluster {{id: '{}', name: '{}', description: '{}'}})",
-            escape(&cluster_id),
-            escape(&cluster_name),
-            escape(&description),
-        );
-        backend
-            .raw_query(&create_cluster)
-            .with_context(|| format!("failed to create cluster node: {}", cluster_id))?;
-
-        // Create MEMBER_OF edges.
-        for &node in members {
-            let sym_id = &idx_to_id[node];
-            let create_edge = format!(
-                "MATCH (s:Symbol), (c:Cluster) WHERE s.id = '{}' AND c.id = '{}' CREATE (s)-[:MEMBER_OF]->(c)",
-                escape(sym_id),
-                escape(&cluster_id),
-            );
-            let _ = backend.raw_query(&create_edge);
-        }
-
-        cluster_sizes.push(members.len());
-    }
-
-    Ok(ClusterStats {
-        num_clusters: cluster_sizes.len(),
-        cluster_sizes,
-        modularity,
-    })
-}
-
-fn escape(s: &str) -> String {
-    s.replace('\'', "\\'")
 }

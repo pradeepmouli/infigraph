@@ -153,6 +153,16 @@ pub trait GraphBackend: Send + Sync {
     /// by the DaemonKuzu wrapper's read-only connection.
     fn upsert_dependencies(&self, result: &ManifestResult) -> Result<()>;
 
+    /// Store cluster-detection results as Cluster nodes + MEMBER_OF edges.
+    /// Clears any existing Cluster/MEMBER_OF data first. No default impl
+    /// -- see the Global Constraints note in the implementation plan.
+    fn store_clusters(
+        &self,
+        idx_to_id: &[String],
+        community: &[usize],
+        modularity: f64,
+    ) -> Result<crate::cluster::ClusterStats>;
+
     // ── Resolve ──────────────────────────────────────────────────────
 
     /// Run call/inheritance resolution for the given extractions.
