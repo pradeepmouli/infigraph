@@ -358,9 +358,18 @@ pub(crate) fn cmd_daemon(root: &Path, debounce: u64) -> Result<()> {
         }
     });
 
-    infigraph_core::watch::watch_project(root, bundled_registry, debounce, stop_rx, |evt| {
-        println!("[watch] {evt}");
-    })?;
+    infigraph_core::watch::watch_project_with_periodic(
+        root,
+        bundled_registry,
+        debounce,
+        stop_rx,
+        |evt| {
+            println!("[watch] {evt}");
+        },
+        0,
+        None::<fn(&infigraph_core::IndexResult)>,
+        true,
+    )?;
 
     doc_shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
     let _ = doc_thread.join();

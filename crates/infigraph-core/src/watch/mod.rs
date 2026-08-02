@@ -84,9 +84,11 @@ where
         on_event,
         0,
         None::<fn(&crate::IndexResult)>,
+        false,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn watch_project_with_periodic<MR, F>(
     root: &Path,
     make_registry: MR,
@@ -95,6 +97,7 @@ pub fn watch_project_with_periodic<MR, F>(
     on_event: impl Fn(WatchEvent) + Send + 'static,
     periodic_secs: u64,
     on_periodic: Option<F>,
+    serve_requests: bool,
 ) -> Result<()>
 where
     MR: Fn() -> Result<crate::lang::LanguageRegistry> + Send + 'static,
@@ -222,6 +225,49 @@ where
             } else {
                 changes_since_periodic = 0;
                 last_periodic = std::time::Instant::now();
+            }
+        }
+
+        // Serve file-dropped write requests -- daemon-mode only (never from
+        // in-process MCP watcher threads, which always pass
+        // serve_requests=false). Piggybacks on this loop's existing tick
+        // (at least every 200ms via the rx.recv_timeout below) rather than
+        // a separate notify-based watch on the requests directory --
+        // submit_write_request's own poll-with-backoff starts at 10ms and
+        // only reaches 200ms after several rounds, so this cadence is fine.
+        if serve_requests {
+            let requests_dir = root.join(".infigraph").join("requests");
+            if let Ok(entries) = std::fs::read_dir(&requests_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().is_some_and(|ext| ext == "request") {
+                        match begin_index_op(root, "infigraph daemon", Duration::from_secs(30)) {
+                            Ok(IndexOpOutcome::Acquired(_guard)) => {
+                                if let Ok(prism) = watch_db(root, &make_registry, &mut held_prism) {
+                                    if let Err(e) =
+                                        crate::daemon_protocol::serve_one_request(prism, &path)
+                                    {
+                                        eprintln!(
+                                            "[daemon] failed to serve request {}: {e}",
+                                            path.display()
+                                        );
+                                    }
+                                }
+                            }
+                            Ok(o @ IndexOpOutcome::AlreadyRunning(_)) => {
+                                eprintln!(
+                                    "[daemon] request-serving busy ({}), retrying next tick",
+                                    o.skip_note().unwrap_or_default()
+                                );
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "[daemon] request-serving busy ({e}), retrying next tick"
+                                );
+                            }
+                        }
+                    }
+                }
             }
         }
 
