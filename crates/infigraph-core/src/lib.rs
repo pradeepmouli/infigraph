@@ -450,7 +450,7 @@ impl Infigraph {
             BackendKind::Uninit => None,
             #[cfg(feature = "neo4j")]
             BackendKind::Neo4j(neo) => Some(neo),
-            BackendKind::DaemonKuzu(_) => None, // placeholder until Task 13
+            BackendKind::DaemonKuzu(dk) => Some(dk),
         }
     }
 

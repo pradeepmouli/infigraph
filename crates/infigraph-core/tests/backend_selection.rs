@@ -16,14 +16,26 @@ fn init_selects_daemon_kuzu_backend_when_env_var_set() {
     )
     .unwrap();
 
+    // DaemonKuzuBackend::open() opens a real read-only Kuzu connection
+    // (Task 12), and a read-only connection cannot create a database --
+    // so the graph must already exist on disk before daemon-mode init()
+    // can succeed. In production this precondition is met by a real
+    // `infigraph daemon` process having already run a normal (writable)
+    // init() first; here we simulate that by initializing with the
+    // default Kuzu backend and dropping it before switching to daemon
+    // mode.
+    std::env::remove_var("INFIGRAPH_BACKEND");
+    let registry = bundled_registry().unwrap();
+    let mut infigraph = Infigraph::open(project_dir.path(), registry).unwrap();
+    infigraph.init().unwrap();
+    drop(infigraph);
+
     std::env::set_var("INFIGRAPH_BACKEND", "daemon");
     let registry = bundled_registry().unwrap();
     let mut infigraph = Infigraph::open(project_dir.path(), registry).unwrap();
     let result = infigraph.init();
     std::env::remove_var("INFIGRAPH_BACKEND");
 
-    // init() succeeds even though the placeholder DaemonKuzuBackend has no
-    // real behavior yet -- selection itself must not require a live daemon.
     assert!(result.is_ok(), "init() failed: {result:?}");
 }
 
