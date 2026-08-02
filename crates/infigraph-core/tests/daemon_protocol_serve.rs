@@ -366,6 +366,65 @@ fn serve_one_request_handles_write_calls_service_edges() {
 }
 
 #[test]
+fn serve_one_request_handles_write_cross_service_edges() {
+    let project_dir = tempfile::tempdir().unwrap();
+    let registry = bundled_registry().unwrap();
+    let mut infigraph = Infigraph::open(project_dir.path(), registry).unwrap();
+    infigraph.init().unwrap();
+
+    let staging_dir = project_dir.path().join(".infigraph").join("requests");
+    std::fs::create_dir_all(&staging_dir).unwrap();
+    let request_path = staging_dir.join("test-xse.request");
+    let result_path = staging_dir.join("test-xse.result");
+    let edges_path = staging_dir.join("test-xse.edges.arrow");
+
+    let candidates = vec![
+        infigraph_core::graph::CrossServiceEdgeCandidate {
+            target_id: "xsvc::payments::GET::/foo".to_string(),
+            target_name: "payments GET /foo".to_string(),
+            docstring: "External service: payments GET /foo".to_string(),
+            caller_symbol_id: "s1".to_string(),
+            method: "GET".to_string(),
+            path: "/foo".to_string(),
+            target_service: "payments".to_string(),
+        },
+        infigraph_core::graph::CrossServiceEdgeCandidate {
+            target_id: "xsvc::billing::POST::/bar".to_string(),
+            target_name: "billing POST /bar".to_string(),
+            docstring: "External service: billing POST /bar".to_string(),
+            caller_symbol_id: "s2".to_string(),
+            method: "POST".to_string(),
+            path: "/bar".to_string(),
+            target_service: "billing".to_string(),
+        },
+    ];
+    infigraph_core::daemon_protocol::write_cross_service_edges_arrow(&edges_path, &candidates)
+        .unwrap();
+
+    write_atomic(
+        &request_path,
+        &serde_json::to_string(&WriteRequest::WriteCrossServiceEdges {
+            edges_path: edges_path.clone(),
+        })
+        .unwrap(),
+    )
+    .unwrap();
+
+    serve_one_request(&infigraph, &request_path).unwrap();
+
+    assert!(
+        !edges_path.exists(),
+        "sibling edges file should be cleaned up after serving"
+    );
+    let result: WriteResult =
+        serde_json::from_str(&std::fs::read_to_string(&result_path).unwrap()).unwrap();
+    assert!(
+        matches!(result, WriteResult::Ok { .. }),
+        "expected Ok, got {result:?}"
+    );
+}
+
+#[test]
 fn serve_one_request_handles_upsert_dependencies() {
     let project_dir = tempfile::tempdir().unwrap();
     std::fs::write(

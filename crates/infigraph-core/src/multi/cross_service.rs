@@ -4,6 +4,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::graph::CrossServiceEdgeCandidate;
 use crate::lang::LanguageRegistry;
 use crate::Infigraph;
 
@@ -567,58 +568,33 @@ pub fn link_cross_service_calls(
             None => continue,
         };
 
+        let mut candidates = Vec::new();
         for dep in svc_deps {
+            // Create ExternalService node — only use columns from Symbol schema.
+            // Use MERGE for idempotency (safe to run group_link multiple times).
             let target_id = format!(
                 "xsvc::{}::{}::{}",
-                dep.target_service,
-                dep.target_method,
-                dep.target_path.replace('\'', "\\'")
+                dep.target_service, dep.target_method, dep.target_path
             );
             let target_name = format!(
                 "{} {} {}",
                 dep.target_service, dep.target_method, dep.target_path
-            )
-            .replace('\'', "\\'");
-            let caller_sym = dep.caller_symbol.replace('\'', "\\'");
-            let target_svc = dep.target_service.replace('\'', "\\'");
-            let target_method = dep.target_method.replace('\'', "\\'");
-            let target_path = dep.target_path.replace('\'', "\\'");
-
-            // Create ExternalService node — only use columns from Symbol schema.
-            // Use MERGE for idempotency (safe to run group_link multiple times).
+            );
             let docstring = format!(
                 "External service: {} {} {}",
-                target_svc, target_method, target_path
+                dep.target_service, dep.target_method, dep.target_path
             );
-            let create_target = format!(
-                "MERGE (t:Symbol {{id: '{}'}}) \
-                 ON CREATE SET t.name = '{}', t.kind = 'ExternalService', \
-                 t.file = '(external)', t.start_line = 0, t.end_line = 0, \
-                 t.signature_hash = '', t.language = 'external', t.visibility = 'public', \
-                 t.parent = '', t.docstring = '{}', t.complexity = 0",
-                target_id, target_name, docstring,
-            );
-            let _ = backend.raw_query(&create_target);
-
-            // Check if edge already exists before creating (idempotent)
-            let check_edge = format!(
-                "MATCH (caller:Symbol {{id: '{}'}})-[:CALLS_SERVICE]->(target:Symbol {{id: '{}'}}) RETURN caller.id",
-                caller_sym, target_id,
-            );
-            let existing = backend.raw_query(&check_edge).unwrap_or_default();
-            if !existing.is_empty() {
-                continue;
-            }
-
-            let create_edge = format!(
-                "MATCH (caller:Symbol {{id: '{}'}}), (target:Symbol {{id: '{}'}}) \
-                 CREATE (caller)-[:CALLS_SERVICE {{method: '{}', path: '{}', target_service: '{}'}}]->(target)",
-                caller_sym, target_id, target_method, target_path, target_svc,
-            );
-            if backend.raw_query(&create_edge).is_ok() {
-                total += 1;
-            }
+            candidates.push(CrossServiceEdgeCandidate {
+                target_id,
+                target_name,
+                docstring,
+                caller_symbol_id: dep.caller_symbol.clone(),
+                method: dep.target_method.clone(),
+                path: dep.target_path.clone(),
+                target_service: dep.target_service.clone(),
+            });
         }
+        total += backend.write_cross_service_edges(&candidates)?;
     }
 
     // SharedPackage linking: for each SharedPackage contract, find import symbols
@@ -660,6 +636,7 @@ pub fn link_cross_service_calls(
             // Scan source files for import statements matching the package
             let import_hits =
                 scan_source_for_package_imports(&entry.path, &search_terms, repo_name);
+            let mut candidates = Vec::new();
             for (file, line_num, _import_text) in &import_hits {
                 let escaped_file = file.replace('\'', "\\'");
                 let q = format!(
@@ -684,40 +661,22 @@ pub fn link_cross_service_calls(
                             .and_then(|row| row.into_iter().next())
                     })
                     .unwrap_or_else(|| format!("{}:{}", file, line_num));
-                let caller_sym = caller_sym.replace('\'', "\\'");
 
                 let target_id = format!("xsvc::{}::package::{}", publisher, pkg_name);
-                let target_name =
-                    format!("{} package {}", publisher, pkg_name).replace('\'', "\\'");
+                let target_name = format!("{} package {}", publisher, pkg_name);
+                let docstring = format!("Shared package: {}", pkg_name);
 
-                let create_target = format!(
-                    "MERGE (t:Symbol {{id: '{}'}}) \
-                     ON CREATE SET t.name = '{}', t.kind = 'ExternalService', \
-                     t.file = '(external)', t.start_line = 0, t.end_line = 0, \
-                     t.signature_hash = '', t.language = 'external', t.visibility = 'public', \
-                     t.parent = '', t.docstring = 'Shared package: {}', t.complexity = 0",
-                    target_id, target_name, pkg_name,
-                );
-                let _ = backend.raw_query(&create_target);
-
-                let check_edge = format!(
-                    "MATCH (a:Symbol {{id: '{}'}})-[:CALLS_SERVICE]->(b:Symbol {{id: '{}'}}) RETURN a.id",
-                    caller_sym, target_id,
-                );
-                let existing = backend.raw_query(&check_edge).unwrap_or_default();
-                if !existing.is_empty() {
-                    continue;
-                }
-
-                let create_edge = format!(
-                    "MATCH (a:Symbol {{id: '{}'}}), (b:Symbol {{id: '{}'}}) \
-                     CREATE (a)-[:CALLS_SERVICE {{method: 'package', path: '{}', target_service: '{}'}}]->(b)",
-                    caller_sym, target_id, pkg_name, publisher,
-                );
-                if backend.raw_query(&create_edge).is_ok() {
-                    total += 1;
-                }
+                candidates.push(CrossServiceEdgeCandidate {
+                    target_id,
+                    target_name,
+                    docstring,
+                    caller_symbol_id: caller_sym,
+                    method: "package".to_string(),
+                    path: pkg_name.clone(),
+                    target_service: publisher.clone(),
+                });
             }
+            total += backend.write_cross_service_edges(&candidates)?;
         }
     }
 

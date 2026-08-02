@@ -7,7 +7,7 @@ use crate::learned::LearnedStore;
 use crate::model::FileExtraction;
 use crate::resolve::ResolveStats;
 
-use super::backend::{CallsServiceEdge, GraphBackend};
+use super::backend::{CallsServiceEdge, CrossServiceEdgeCandidate, GraphBackend};
 use super::queries::GraphQuery;
 use super::store::GraphStore;
 use super::{
@@ -486,6 +486,44 @@ impl GraphBackend for KuzuBackend {
         conn.query("COMMIT")
             .map_err(|e| anyhow::anyhow!("failed to commit CALLS_SERVICE edges: {e}"))?;
         Ok(())
+    }
+
+    fn write_cross_service_edges(&self, candidates: &[CrossServiceEdgeCandidate]) -> Result<usize> {
+        let mut created = 0;
+        for c in candidates {
+            let target_id = escape(&c.target_id);
+            let target_name = escape(&c.target_name);
+            let docstring = escape(&c.docstring);
+            let caller_sym = escape(&c.caller_symbol_id);
+            let method = escape(&c.method);
+            let path = escape(&c.path);
+            let target_svc = escape(&c.target_service);
+
+            let create_target = format!(
+                "MERGE (t:Symbol {{id: '{target_id}'}}) \
+                 ON CREATE SET t.name = '{target_name}', t.kind = 'ExternalService', \
+                 t.file = '(external)', t.start_line = 0, t.end_line = 0, \
+                 t.signature_hash = '', t.language = 'external', t.visibility = 'public', \
+                 t.parent = '', t.docstring = '{docstring}', t.complexity = 0"
+            );
+            self.raw_query(&create_target)?;
+
+            let check_edge = format!(
+                "MATCH (caller:Symbol {{id: '{caller_sym}'}})-[:CALLS_SERVICE]->(target:Symbol {{id: '{target_id}'}}) RETURN caller.id"
+            );
+            let existing = self.raw_query(&check_edge)?;
+            if !existing.is_empty() {
+                continue;
+            }
+
+            let create_edge = format!(
+                "MATCH (caller:Symbol {{id: '{caller_sym}'}}), (target:Symbol {{id: '{target_id}'}}) \
+                 CREATE (caller)-[:CALLS_SERVICE {{method: '{method}', path: '{path}', target_service: '{target_svc}'}}]->(target)"
+            );
+            self.raw_query(&create_edge)?;
+            created += 1;
+        }
+        Ok(created)
     }
 
     fn upsert_dependencies(&self, result: &crate::manifest::ManifestResult) -> Result<()> {

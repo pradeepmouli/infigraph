@@ -28,6 +28,25 @@ pub struct CallsServiceEdge {
     pub path: String,
 }
 
+/// One candidate cross-service edge: an ExternalService target node to
+/// MERGE (idempotent — safe to run group_link repeatedly) plus the
+/// CALLS_SERVICE edge to CREATE if it doesn't already exist. The
+/// existence check and the two writes all happen inside the backend
+/// implementation, not the caller — this is why the read (the existence
+/// check) is safe to route through the same daemon call as the writes:
+/// server-side, it runs against the real connection, not the wrapper's
+/// read-only one.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CrossServiceEdgeCandidate {
+    pub target_id: String,
+    pub target_name: String,
+    pub docstring: String,
+    pub caller_symbol_id: String,
+    pub method: String,
+    pub path: String,
+    pub target_service: String,
+}
+
 /// Backend-agnostic graph storage interface.
 ///
 /// KuzuBackend wraps the existing embedded Kùzu store (local mode).
@@ -145,6 +164,13 @@ pub trait GraphBackend: Send + Sync {
     /// directly (same design as `upsert_files_bulk`/`resolve_calls`). A
     /// no-op for an empty slice.
     fn write_calls_service_edges(&self, edges: &[CallsServiceEdge]) -> Result<()>;
+
+    /// Write a batch of cross-service call edges for one repo's graph.
+    /// Idempotent per candidate (MERGE the target, skip the edge CREATE
+    /// if it already exists). Returns the number of edges actually
+    /// created (not the number of candidates). No default impl -- see the
+    /// Global Constraints note in the implementation plan.
+    fn write_cross_service_edges(&self, candidates: &[CrossServiceEdgeCandidate]) -> Result<usize>;
 
     /// Store a manifest's dependencies as Dependency nodes + DEPENDS_ON
     /// edges. No default impl -- see the Global Constraints note in

@@ -16,7 +16,7 @@ pub(crate) mod store_util;
 mod store_write;
 pub mod test_templates;
 
-pub use backend::{CallsServiceEdge, GraphBackend};
+pub use backend::{CallsServiceEdge, CrossServiceEdgeCandidate, GraphBackend};
 pub use cozo_store::CozoStore;
 pub use daemon_kuzu_backend::DaemonKuzuBackend;
 pub use kuzu_backend::KuzuBackend;

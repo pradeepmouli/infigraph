@@ -1,4 +1,4 @@
-use crate::graph::CallsServiceEdge;
+use crate::graph::{CallsServiceEdge, CrossServiceEdgeCandidate};
 use arrow::array::{RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use serde::{Deserialize, Serialize};
@@ -42,6 +42,10 @@ pub enum WriteRequest {
     /// an Arrow IPC sibling file at edges_path (genuinely tabular bulk
     /// data), not inline in this envelope.
     WriteCallsServiceEdges { edges_path: PathBuf },
+    /// Write a batch of cross-service edge candidates. The candidates
+    /// themselves live in an Arrow IPC sibling file at edges_path
+    /// (genuinely tabular bulk data), not inline in this envelope.
+    WriteCrossServiceEdges { edges_path: PathBuf },
     /// Store a manifest's parsed dependencies. Small, serde-serializable
     /// payload -- rides inline in this envelope, no sibling file needed.
     UpsertDependencies {
@@ -488,6 +492,25 @@ pub fn serve_one_request(infigraph: &Infigraph, request_path: &Path) -> anyhow::
                     },
                 }
             }
+            WriteRequest::WriteCrossServiceEdges { edges_path } => {
+                match read_cross_service_edges_arrow(edges_path).and_then(|candidates| {
+                    infigraph
+                        .backend()
+                        .ok_or_else(|| anyhow::anyhow!("graph not initialized"))
+                        .and_then(|b| b.write_cross_service_edges(&candidates))
+                }) {
+                    Ok(created) => {
+                        std::fs::remove_file(edges_path).ok();
+                        WriteResult::Ok {
+                            total_files: 0,
+                            indexed_files: created,
+                        }
+                    }
+                    Err(e) => WriteResult::Err {
+                        message: e.to_string(),
+                    },
+                }
+            }
             WriteRequest::UpsertDependencies { result } => match infigraph.backend() {
                 Some(b) => match b.upsert_dependencies(result) {
                     Ok(()) => WriteResult::Ok {
@@ -691,4 +714,138 @@ pub fn read_calls_service_edges_arrow(path: &Path) -> anyhow::Result<Vec<CallsSe
         }
     }
     Ok(edges)
+}
+
+fn cross_service_edge_candidates_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Field::new("target_id", DataType::Utf8, false),
+        Field::new("target_name", DataType::Utf8, false),
+        Field::new("docstring", DataType::Utf8, false),
+        Field::new("caller_symbol_id", DataType::Utf8, false),
+        Field::new("method", DataType::Utf8, false),
+        Field::new("path", DataType::Utf8, false),
+        Field::new("target_service", DataType::Utf8, false),
+    ]))
+}
+
+/// Writes `candidates` as an Arrow IPC file at `path` -- genuinely tabular
+/// bulk data (many rows, same shape), unlike the small heterogeneous
+/// WriteRequest/WriteResult envelope, which stays JSON.
+pub fn write_cross_service_edges_arrow(
+    path: &Path,
+    candidates: &[CrossServiceEdgeCandidate],
+) -> anyhow::Result<()> {
+    let schema = cross_service_edge_candidates_schema();
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(StringArray::from(
+                candidates
+                    .iter()
+                    .map(|c| c.target_id.as_str())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                candidates
+                    .iter()
+                    .map(|c| c.target_name.as_str())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                candidates
+                    .iter()
+                    .map(|c| c.docstring.as_str())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                candidates
+                    .iter()
+                    .map(|c| c.caller_symbol_id.as_str())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                candidates
+                    .iter()
+                    .map(|c| c.method.as_str())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                candidates
+                    .iter()
+                    .map(|c| c.path.as_str())
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                candidates
+                    .iter()
+                    .map(|c| c.target_service.as_str())
+                    .collect::<Vec<_>>(),
+            )),
+        ],
+    )?;
+    let file = std::fs::File::create(path)?;
+    let mut writer = arrow::ipc::writer::FileWriter::try_new(file, &schema)?;
+    writer.write(&batch)?;
+    writer.finish()?;
+    Ok(())
+}
+
+/// Reads `CrossServiceEdgeCandidate`s back from an Arrow IPC file written by
+/// write_cross_service_edges_arrow.
+pub fn read_cross_service_edges_arrow(
+    path: &Path,
+) -> anyhow::Result<Vec<CrossServiceEdgeCandidate>> {
+    let file = std::fs::File::open(path)?;
+    let reader = arrow::ipc::reader::FileReader::try_new(file, None)?;
+    let mut candidates = Vec::new();
+    for batch in reader {
+        let batch = batch?;
+        let target_ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let target_names = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let docstrings = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let caller_symbol_ids = batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let methods = batch
+            .column(4)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let paths = batch
+            .column(5)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let target_services = batch
+            .column(6)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        for i in 0..batch.num_rows() {
+            candidates.push(CrossServiceEdgeCandidate {
+                target_id: target_ids.value(i).to_string(),
+                target_name: target_names.value(i).to_string(),
+                docstring: docstrings.value(i).to_string(),
+                caller_symbol_id: caller_symbol_ids.value(i).to_string(),
+                method: methods.value(i).to_string(),
+                path: paths.value(i).to_string(),
+                target_service: target_services.value(i).to_string(),
+            });
+        }
+    }
+    Ok(candidates)
 }
