@@ -136,6 +136,23 @@ pub fn write_atomic(path: &Path, contents: &str) -> anyhow::Result<()> {
 /// drop one caller's request rather than erroring.
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// Generates a unique request name the same way submit_write_request does
+/// internally, without writing anything -- used by callers that need to
+/// write a sibling file (Arrow IPC edges, inline ingest data) before the
+/// request file itself, using the same generated name.
+pub fn generate_request_name() -> String {
+    let counter = REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!(
+        "{}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos(),
+        counter
+    )
+}
+
 /// Writes `request` as a `.request` file into `staging_dir` (unique name:
 /// pid + nanosecond timestamp + a process-local counter -- no new
 /// dependency, no UUID crate), then polls for the matching `.result` file
@@ -146,17 +163,21 @@ pub fn submit_write_request(
     request: &WriteRequest,
     timeout: Duration,
 ) -> anyhow::Result<WriteResult> {
+    let name = generate_request_name();
+    submit_write_request_named(staging_dir, &name, request, timeout)
+}
+
+/// Same as submit_write_request, but the request/result file names are
+/// pre-determined (via generate_request_name) rather than generated
+/// internally -- lets a caller write a sibling file first, using the same
+/// name, before the request file that references it exists.
+pub fn submit_write_request_named(
+    staging_dir: &Path,
+    name: &str,
+    request: &WriteRequest,
+    timeout: Duration,
+) -> anyhow::Result<WriteResult> {
     std::fs::create_dir_all(staging_dir)?;
-    let counter = REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let name = format!(
-        "{}-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos(),
-        counter
-    );
     let request_path = staging_dir.join(format!("{name}.request"));
     let result_path = staging_dir.join(format!("{name}.result"));
 

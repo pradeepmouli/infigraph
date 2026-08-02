@@ -29,9 +29,6 @@ use super::{
 ///    real collision some other way.
 pub struct DaemonKuzuBackend {
     read_conn: KuzuBackend,
-    // Unused until Task 13 wires submit_write_request, which needs the
-    // project root to locate the daemon's staging directory.
-    #[allow(dead_code)]
     root: std::path::PathBuf,
 }
 
@@ -49,6 +46,10 @@ impl DaemonKuzuBackend {
         anyhow::anyhow!(
             "not supported via direct backend access under DaemonKuzu -- use {alternative} instead ({method})"
         )
+    }
+
+    fn staging_dir(&self) -> std::path::PathBuf {
+        self.root.join(".infigraph").join("requests")
     }
 }
 
@@ -150,15 +151,27 @@ impl GraphBackend for DaemonKuzuBackend {
         self.read_conn.repo_filter()
     }
 
-    // ── Tier 3 placeholders: Task 13 replaces each of these with a Tier 2
-    //    submit_write_request call. Left as loud errors here so this task
-    //    compiles as a complete GraphBackend impl on its own. ──
+    // ── Tier 2: writes covered by WriteRequest route through the daemon
+    //    protocol's submit_write_request(_named). ──
 
-    fn upsert_similar_edge(&self, _id_a: &str, _id_b: &str, _score: f32) -> Result<()> {
-        Err(Self::not_supported(
-            "upsert_similar_edge",
-            "Infigraph's daemon protocol (wired in Task 13)",
-        ))
+    fn upsert_similar_edge(&self, id_a: &str, id_b: &str, score: f32) -> Result<()> {
+        let staging_dir = self.staging_dir();
+        let request = crate::daemon_protocol::WriteRequest::UpsertSimilarEdge {
+            id_a: id_a.to_string(),
+            id_b: id_b.to_string(),
+            score,
+        };
+        match crate::daemon_protocol::submit_write_request(
+            &staging_dir,
+            &request,
+            std::time::Duration::from_secs(30),
+        )? {
+            crate::daemon_protocol::WriteResult::Ok { .. } => Ok(()),
+            crate::daemon_protocol::WriteResult::Err { message } => Err(anyhow::anyhow!(message)),
+            other => Err(anyhow::anyhow!(
+                "unexpected WriteResult for UpsertSimilarEdge: {other:?}"
+            )),
+        }
     }
     fn upsert_file(&self, _extraction: &FileExtraction) -> Result<()> {
         Err(Self::not_supported(
@@ -182,25 +195,73 @@ impl GraphBackend for DaemonKuzuBackend {
             "Infigraph::index()/index_files() (internal only)",
         ))
     }
-    fn derive_tested_by_edges(&self, _changed_files: Option<&[&str]>) -> Result<usize> {
-        Err(Self::not_supported(
-            "derive_tested_by_edges",
-            "Infigraph's daemon protocol (wired in Task 13)",
-        ))
+    fn derive_tested_by_edges(&self, changed_files: Option<&[&str]>) -> Result<usize> {
+        let staging_dir = self.staging_dir();
+        let request = crate::daemon_protocol::WriteRequest::DeriveTestedBy {
+            files: changed_files.map(|files| files.iter().map(|s| s.to_string()).collect()),
+        };
+        match crate::daemon_protocol::submit_write_request(
+            &staging_dir,
+            &request,
+            std::time::Duration::from_secs(60),
+        )? {
+            crate::daemon_protocol::WriteResult::Ok { indexed_files, .. } => Ok(indexed_files),
+            crate::daemon_protocol::WriteResult::Err { message } => Err(anyhow::anyhow!(message)),
+            other => Err(anyhow::anyhow!(
+                "unexpected WriteResult for DeriveTestedBy: {other:?}"
+            )),
+        }
     }
-    fn upsert_repo(&self, _repo_name: &str) -> Result<()> {
+    fn upsert_repo(&self, repo_name: &str) -> Result<()> {
         // Deliberately overridden (not left as the trait's no-op default)
         // -- see Task 6's warning about the inherited-default trap.
-        Err(Self::not_supported(
-            "upsert_repo",
-            "Infigraph's daemon protocol (wired in Task 13)",
-        ))
+        let staging_dir = self.staging_dir();
+        let request = crate::daemon_protocol::WriteRequest::UpsertRepo {
+            namespace: repo_name.to_string(),
+        };
+        match crate::daemon_protocol::submit_write_request(
+            &staging_dir,
+            &request,
+            std::time::Duration::from_secs(30),
+        )? {
+            crate::daemon_protocol::WriteResult::Ok { .. } => Ok(()),
+            crate::daemon_protocol::WriteResult::Err { message } => Err(anyhow::anyhow!(message)),
+            other => Err(anyhow::anyhow!(
+                "unexpected WriteResult for UpsertRepo: {other:?}"
+            )),
+        }
     }
-    fn write_calls_service_edges(&self, _edges: &[CallsServiceEdge]) -> Result<()> {
-        Err(Self::not_supported(
-            "write_calls_service_edges",
-            "Infigraph's daemon protocol (wired in Task 13)",
-        ))
+    fn write_calls_service_edges(&self, edges: &[CallsServiceEdge]) -> Result<()> {
+        if edges.is_empty() {
+            return Ok(());
+        }
+        let staging_dir = self.staging_dir();
+        std::fs::create_dir_all(&staging_dir)?;
+        let name = crate::daemon_protocol::generate_request_name();
+        let edges_path = staging_dir.join(format!("{name}.edges.arrow"));
+        crate::daemon_protocol::write_calls_service_edges_arrow(&edges_path, edges)?;
+
+        let request = crate::daemon_protocol::WriteRequest::WriteCallsServiceEdges {
+            edges_path: edges_path.clone(),
+        };
+        match crate::daemon_protocol::submit_write_request_named(
+            &staging_dir,
+            &name,
+            &request,
+            std::time::Duration::from_secs(60),
+        ) {
+            Ok(crate::daemon_protocol::WriteResult::Ok { .. }) => Ok(()),
+            Ok(crate::daemon_protocol::WriteResult::Err { message }) => {
+                Err(anyhow::anyhow!(message))
+            }
+            Ok(other) => Err(anyhow::anyhow!(
+                "unexpected WriteResult for WriteCallsServiceEdges: {other:?}"
+            )),
+            Err(e) => {
+                std::fs::remove_file(&edges_path).ok(); // clean up on timeout -- the daemon never consumed it
+                Err(e)
+            }
+        }
     }
     fn resolve_calls(
         &self,
@@ -225,74 +286,209 @@ impl GraphBackend for DaemonKuzuBackend {
     }
     fn import_scip_index(
         &self,
-        _index_path: &Path,
+        index_path: &Path,
         _project_root: Option<&Path>,
     ) -> Result<crate::scip::ImportStats> {
-        Err(Self::not_supported(
-            "import_scip_index",
-            "Infigraph's daemon protocol (wired in Task 13)",
-        ))
+        let staging_dir = self.staging_dir();
+        let request = crate::daemon_protocol::WriteRequest::ScipImport {
+            scip_path: index_path.to_path_buf(),
+        };
+        match crate::daemon_protocol::submit_write_request(
+            &staging_dir,
+            &request,
+            std::time::Duration::from_secs(120),
+        )? {
+            crate::daemon_protocol::WriteResult::ScipImportOk(stats) => Ok(stats),
+            crate::daemon_protocol::WriteResult::Err { message } => Err(anyhow::anyhow!(message)),
+            other => Err(anyhow::anyhow!(
+                "unexpected WriteResult for ScipImport: {other:?}"
+            )),
+        }
     }
     fn ingest_structured_data(
         &self,
-        _schema: &crate::structured::SchemaMeta,
-        _data: &[serde_json::Value],
+        schema: &crate::structured::SchemaMeta,
+        data: &[serde_json::Value],
     ) -> Result<crate::structured::IngestResult> {
-        Err(Self::not_supported(
-            "ingest_structured_data",
-            "Infigraph's daemon protocol (wired in Task 13)",
-        ))
+        let staging_dir = self.staging_dir();
+        std::fs::create_dir_all(&staging_dir)?;
+        let name = crate::daemon_protocol::generate_request_name();
+        let request_path = staging_dir.join(format!("{name}.request"));
+        let data_path = crate::daemon_protocol::write_ingest_inline_sibling(&request_path, data)?;
+
+        let request = crate::daemon_protocol::WriteRequest::IngestStructured {
+            schema_id: schema.schema_id.clone(),
+            source: crate::daemon_protocol::IngestSource::Inline,
+        };
+        match crate::daemon_protocol::submit_write_request_named(
+            &staging_dir,
+            &name,
+            &request,
+            std::time::Duration::from_secs(120),
+        ) {
+            Ok(crate::daemon_protocol::WriteResult::Ok {
+                total_files,
+                indexed_files,
+            }) => Ok(crate::structured::IngestResult {
+                nodes_created: indexed_files,
+                edges_created: total_files.saturating_sub(indexed_files),
+            }),
+            Ok(crate::daemon_protocol::WriteResult::Err { message }) => {
+                Err(anyhow::anyhow!(message))
+            }
+            Ok(other) => Err(anyhow::anyhow!(
+                "unexpected WriteResult for IngestStructured: {other:?}"
+            )),
+            Err(e) => {
+                std::fs::remove_file(&data_path).ok(); // clean up on timeout -- the daemon never consumed it
+                Err(e)
+            }
+        }
     }
     fn ingest_structured_file(
         &self,
-        _schema: &crate::structured::SchemaMeta,
-        _path: &Path,
+        schema: &crate::structured::SchemaMeta,
+        path: &Path,
     ) -> Result<crate::structured::IngestResult> {
-        Err(Self::not_supported(
-            "ingest_structured_file",
-            "Infigraph's daemon protocol (wired in Task 13)",
-        ))
+        let staging_dir = self.staging_dir();
+        let request = crate::daemon_protocol::WriteRequest::IngestStructured {
+            schema_id: schema.schema_id.clone(),
+            source: crate::daemon_protocol::IngestSource::File(path.to_path_buf()),
+        };
+        match crate::daemon_protocol::submit_write_request(
+            &staging_dir,
+            &request,
+            std::time::Duration::from_secs(120),
+        )? {
+            crate::daemon_protocol::WriteResult::Ok {
+                total_files,
+                indexed_files,
+            } => Ok(crate::structured::IngestResult {
+                nodes_created: indexed_files,
+                edges_created: total_files.saturating_sub(indexed_files),
+            }),
+            crate::daemon_protocol::WriteResult::Err { message } => Err(anyhow::anyhow!(message)),
+            other => Err(anyhow::anyhow!(
+                "unexpected WriteResult for IngestStructured: {other:?}"
+            )),
+        }
     }
     fn ingest_structured_directory(
         &self,
-        _schema: &crate::structured::SchemaMeta,
-        _dir: &Path,
+        schema: &crate::structured::SchemaMeta,
+        dir: &Path,
     ) -> Result<crate::structured::IngestResult> {
-        Err(Self::not_supported(
-            "ingest_structured_directory",
-            "Infigraph's daemon protocol (wired in Task 13)",
-        ))
+        let staging_dir = self.staging_dir();
+        let request = crate::daemon_protocol::WriteRequest::IngestStructured {
+            schema_id: schema.schema_id.clone(),
+            source: crate::daemon_protocol::IngestSource::Directory(dir.to_path_buf()),
+        };
+        match crate::daemon_protocol::submit_write_request(
+            &staging_dir,
+            &request,
+            std::time::Duration::from_secs(120),
+        )? {
+            crate::daemon_protocol::WriteResult::Ok {
+                total_files,
+                indexed_files,
+            } => Ok(crate::structured::IngestResult {
+                nodes_created: indexed_files,
+                edges_created: total_files.saturating_sub(indexed_files),
+            }),
+            crate::daemon_protocol::WriteResult::Err { message } => Err(anyhow::anyhow!(message)),
+            other => Err(anyhow::anyhow!(
+                "unexpected WriteResult for IngestStructured: {other:?}"
+            )),
+        }
     }
-    fn upsert_dependencies(&self, _result: &crate::manifest::ManifestResult) -> Result<()> {
-        Err(Self::not_supported(
-            "upsert_dependencies",
-            "Infigraph's daemon protocol (wired in Task 13)",
-        ))
+    fn upsert_dependencies(&self, result: &crate::manifest::ManifestResult) -> Result<()> {
+        let staging_dir = self.staging_dir();
+        let request = crate::daemon_protocol::WriteRequest::UpsertDependencies {
+            result: result.clone(),
+        };
+        match crate::daemon_protocol::submit_write_request(
+            &staging_dir,
+            &request,
+            std::time::Duration::from_secs(30),
+        )? {
+            crate::daemon_protocol::WriteResult::Ok { .. } => Ok(()),
+            crate::daemon_protocol::WriteResult::Err { message } => Err(anyhow::anyhow!(message)),
+            other => Err(anyhow::anyhow!(
+                "unexpected WriteResult for UpsertDependencies: {other:?}"
+            )),
+        }
     }
     fn store_clusters(
         &self,
-        _idx_to_id: &[String],
-        _community: &[usize],
-        _modularity: f64,
+        idx_to_id: &[String],
+        community: &[usize],
+        modularity: f64,
     ) -> Result<crate::cluster::ClusterStats> {
-        Err(Self::not_supported(
-            "store_clusters",
-            "Infigraph's daemon protocol (wired in Task 13)",
-        ))
+        let staging_dir = self.staging_dir();
+        let request = crate::daemon_protocol::WriteRequest::StoreClusters {
+            idx_to_id: idx_to_id.to_vec(),
+            community: community.to_vec(),
+            modularity,
+        };
+        match crate::daemon_protocol::submit_write_request(
+            &staging_dir,
+            &request,
+            std::time::Duration::from_secs(30),
+        )? {
+            crate::daemon_protocol::WriteResult::ClustersOk(stats) => Ok(stats),
+            crate::daemon_protocol::WriteResult::Err { message } => Err(anyhow::anyhow!(message)),
+            other => Err(anyhow::anyhow!(
+                "unexpected WriteResult for StoreClusters: {other:?}"
+            )),
+        }
     }
-    fn store_config_bindings(&self, _bindings: &[crate::config::ConfigBindingWire]) -> Result<()> {
-        Err(Self::not_supported(
-            "store_config_bindings",
-            "Infigraph's daemon protocol (wired in Task 13)",
-        ))
+    fn store_config_bindings(&self, bindings: &[crate::config::ConfigBindingWire]) -> Result<()> {
+        let staging_dir = self.staging_dir();
+        let request = crate::daemon_protocol::WriteRequest::StoreConfigBindings {
+            bindings: bindings.to_vec(),
+        };
+        match crate::daemon_protocol::submit_write_request(
+            &staging_dir,
+            &request,
+            std::time::Duration::from_secs(30),
+        )? {
+            crate::daemon_protocol::WriteResult::Ok { .. } => Ok(()),
+            crate::daemon_protocol::WriteResult::Err { message } => Err(anyhow::anyhow!(message)),
+            other => Err(anyhow::anyhow!(
+                "unexpected WriteResult for StoreConfigBindings: {other:?}"
+            )),
+        }
     }
-    fn write_cross_service_edges(
-        &self,
-        _candidates: &[CrossServiceEdgeCandidate],
-    ) -> Result<usize> {
-        Err(Self::not_supported(
-            "write_cross_service_edges",
-            "Infigraph's daemon protocol (wired in Task 13)",
-        ))
+    fn write_cross_service_edges(&self, candidates: &[CrossServiceEdgeCandidate]) -> Result<usize> {
+        if candidates.is_empty() {
+            return Ok(0);
+        }
+        let staging_dir = self.staging_dir();
+        std::fs::create_dir_all(&staging_dir)?;
+        let name = crate::daemon_protocol::generate_request_name();
+        let edges_path = staging_dir.join(format!("{name}.edges.arrow"));
+        crate::daemon_protocol::write_cross_service_edges_arrow(&edges_path, candidates)?;
+
+        let request = crate::daemon_protocol::WriteRequest::WriteCrossServiceEdges {
+            edges_path: edges_path.clone(),
+        };
+        match crate::daemon_protocol::submit_write_request_named(
+            &staging_dir,
+            &name,
+            &request,
+            std::time::Duration::from_secs(60),
+        ) {
+            Ok(crate::daemon_protocol::WriteResult::Ok { indexed_files, .. }) => Ok(indexed_files),
+            Ok(crate::daemon_protocol::WriteResult::Err { message }) => {
+                Err(anyhow::anyhow!(message))
+            }
+            Ok(other) => Err(anyhow::anyhow!(
+                "unexpected WriteResult for WriteCrossServiceEdges: {other:?}"
+            )),
+            Err(e) => {
+                std::fs::remove_file(&edges_path).ok(); // clean up on timeout -- the daemon never consumed it
+                Err(e)
+            }
+        }
     }
 }
