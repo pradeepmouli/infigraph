@@ -40,18 +40,6 @@ pub mod viz;
 pub mod vuln;
 pub mod watch;
 
-/// `watch::queue`/`watch::drain` are intentionally `pub(crate)` (internal
-/// daemon-loop plumbing, not public API), so their regression coverage
-/// can't live in a real Cargo integration test (a separate crate that only
-/// sees `infigraph_core`'s public surface). Including the file as an
-/// in-crate module instead gives it `pub(crate)` visibility while keeping
-/// the test file at its natural location under `tests/`; the matching
-/// `[[test]] test = false` override in Cargo.toml stops Cargo from also
-/// building it as a standalone (and then-uncompilable) integration binary.
-#[cfg(test)]
-#[path = "../tests/watch_drain.rs"]
-mod watch_drain_tests;
-
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};

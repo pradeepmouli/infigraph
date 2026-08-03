@@ -79,15 +79,3 @@ cargo-husky = { version = "1", default-features = false, features = ["user-hooks
 # TypeScript/Rust fixtures with the same bundled_registry() the CLI passes as
 # `build_registry` to index_group/link_cross_service_calls in production.
 infigraph-languages = { path = "../infigraph-languages" }
-
-# watch_drain.rs exercises `watch::queue`/`watch::drain`, both intentionally
-# `pub(crate)` (internal daemon-loop plumbing). A normal Cargo integration
-# test can't see `pub(crate)` items, so this file is instead included as an
-# in-crate `#[cfg(test)]` module (see lib.rs) and run via `cargo test --lib`.
-# `test = false` stops Cargo's tests/*.rs autodiscovery from also building it
-# as a standalone integration binary, which would fail with the same
-# visibility error the in-crate include exists to avoid.
-[[test]]
-name = "watch_drain"
-path = "tests/watch_drain.rs"
-test = false
