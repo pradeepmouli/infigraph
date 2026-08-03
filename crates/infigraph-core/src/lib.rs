@@ -148,6 +148,12 @@ impl Infigraph {
             "daemon" => {
                 let dk = graph::DaemonKuzuBackend::open(&self.root)?;
                 self.backend_kind = BackendKind::DaemonKuzu(dk);
+                // Selecting this backend implies daemon-mode watching: every
+                // covered write routes through a daemon, so without one
+                // running each would block for its full timeout before
+                // failing. Reads (already wired above) don't depend on it,
+                // hence the ordering.
+                self.ensure_daemon_for_writes();
                 Ok(())
             }
             _ => match graph::KuzuBackend::open(&self.db_path) {
@@ -218,6 +224,32 @@ impl Infigraph {
                     }
                 }
             },
+        }
+    }
+
+    /// Best-effort "a daemon exists to serve this backend's writes".
+    ///
+    /// Never fails `init()`: reads work regardless, and a failed spawn does
+    /// not mean writes are doomed -- another process may be racing to spawn
+    /// the same daemon, and if nothing really is running, the first write's
+    /// own timeout reports it with a clearer message than a startup abort
+    /// would. `ensure_daemon_running` is itself safe to call redundantly
+    /// (it coordinates through `.infigraph/watch.lock`).
+    fn ensure_daemon_for_writes(&self) {
+        let watch_binary = match std::env::current_exe()
+            .map_err(anyhow::Error::from)
+            .and_then(|exe| crate::watch::daemon::resolve_cli_binary_sibling_of(&exe))
+        {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("[daemon] could not locate the infigraph CLI binary to start a daemon ({e}); writes will fail until one is running");
+                return;
+            }
+        };
+        if let crate::watch::daemon::DaemonStartOutcome::Failed(e) =
+            crate::watch::daemon::ensure_daemon_running(&self.root, &watch_binary)
+        {
+            eprintln!("[daemon] failed to start a daemon for {} ({e}); writes will fail until one is running", self.root.display());
         }
     }
 
@@ -303,11 +335,70 @@ impl Infigraph {
         }
     }
 
+    /// A full reindex is the most expensive operation in the write
+    /// protocol -- on a large repo it can legitimately run for many
+    /// minutes. `submit_write_request`'s timeout is a hard deadline (the
+    /// daemon only writes its `.result` once the whole index finishes), so
+    /// a tight budget here would abort a *working* reindex partway and
+    /// report it as "no daemon responded".
+    const DAEMON_FULL_REINDEX_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+    /// A scoped `index_files` call is normally a watcher-sized batch, so a
+    /// shorter budget still can't truncate real work but surfaces a dead
+    /// daemon twice as fast.
+    const DAEMON_SCOPED_INDEX_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
     /// Index all supported files in the project, building the graph.
     /// Skips files whose content hash matches the stored hash (incremental).
     pub fn index(&self) -> Result<IndexResult> {
+        if matches!(self.backend_kind, BackendKind::DaemonKuzu(_)) {
+            return self.index_via_daemon(None, Self::DAEMON_FULL_REINDEX_TIMEOUT);
+        }
         let backend = self.backend().context("call init() first")?;
         self.index_via_backend(backend)
+    }
+
+    /// Ask the daemon to do the indexing on its own write-mode connection.
+    ///
+    /// Under `BackendKind::DaemonKuzu` the client has no writable
+    /// connection at all: `upsert_files_bulk`/`remove_file`/`resolve_calls`
+    /// are all Tier-3 stubs, so the client-side path in `index_via_backend`
+    /// cannot complete. Routing the whole operation as one
+    /// `WriteRequest::Index` (rather than making each of those primitives
+    /// individually daemon-aware) also keeps bulk writes bulk -- shipping
+    /// stale-file pruning through the protocol one `remove_file` at a time
+    /// would be pathological.
+    ///
+    /// This never recurses: the daemon serves the request against its own
+    /// `Infigraph`, which is always `BackendKind::Kuzu` because `cmd_daemon`
+    /// and `spawn_daemon` both strip `INFIGRAPH_BACKEND` from the daemon
+    /// process's environment.
+    fn index_via_daemon(
+        &self,
+        paths: Option<Vec<PathBuf>>,
+        timeout: std::time::Duration,
+    ) -> Result<IndexResult> {
+        let staging_dir = self.root.join(".infigraph").join("requests");
+        let request = crate::daemon_protocol::WriteRequest::Index { paths };
+        match crate::daemon_protocol::submit_write_request(&staging_dir, &request, timeout)? {
+            crate::daemon_protocol::WriteResult::Ok {
+                total_files,
+                indexed_files,
+            } => Ok(IndexResult {
+                total_files,
+                indexed_files,
+                // The daemon did the parsing and resolving on its side and
+                // the protocol deliberately doesn't ship either back (see
+                // WriteResult's doc comment) -- so these are genuinely
+                // unavailable client-side, not defaults papering over a
+                // failure.
+                extractions: Vec::new(),
+                resolve_stats: resolve::ResolveStats::default(),
+            }),
+            crate::daemon_protocol::WriteResult::Err { message } => Err(anyhow::anyhow!(message)),
+            other => Err(anyhow::anyhow!(
+                "unexpected WriteResult for Index: {other:?}"
+            )),
+        }
     }
 
     /// Import a SCIP index file into the graph. Thin wrapper matching
@@ -487,6 +578,21 @@ impl Infigraph {
     /// Index (or re-index) a single file by its path on disk.
     /// Path may be absolute or relative to project root.
     pub fn index_file(&self, path: &Path) -> Result<()> {
+        // `upsert_file` is a Tier-3 stub under DaemonKuzu, so route through
+        // the daemon instead. There is no single-file `WriteRequest`
+        // primitive, so this goes via the full `index_files` path -- a
+        // little heavier than a bare `upsert_file` (it re-resolves calls),
+        // but correct, and this method has no production caller today
+        // (only the watcher's own server-side loop indexes single files,
+        // and that never runs under DaemonKuzu).
+        if matches!(self.backend_kind, BackendKind::DaemonKuzu(_)) {
+            return self
+                .index_via_daemon(
+                    Some(vec![path.to_path_buf()]),
+                    Self::DAEMON_SCOPED_INDEX_TIMEOUT,
+                )
+                .map(|_| ());
+        }
         let rel = if path.is_absolute() {
             path.strip_prefix(&self.root)
                 .unwrap_or(path)
@@ -524,6 +630,10 @@ impl Infigraph {
 
         if paths.is_empty() {
             return Ok(empty_result());
+        }
+
+        if matches!(self.backend_kind, BackendKind::DaemonKuzu(_)) {
+            return self.index_via_daemon(Some(paths.to_vec()), Self::DAEMON_SCOPED_INDEX_TIMEOUT);
         }
 
         let extractions: Vec<FileExtraction> = paths

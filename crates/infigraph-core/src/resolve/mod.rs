@@ -4,7 +4,7 @@ pub(crate) mod inherits;
 pub use calls::*;
 
 /// Statistics from call/inheritance resolution.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct ResolveStats {
     pub total_calls: usize,
     pub resolved: usize,

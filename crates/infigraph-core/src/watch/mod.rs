@@ -187,8 +187,8 @@ where
                 // them until the next `rx` drain — but latency spikes.
                 match begin_index_op(root, "infigraph watch", Duration::from_secs(30)) {
                     Ok(IndexOpOutcome::Acquired(_guard)) => {
-                        if let Ok(prism) = watch_db(root, &make_registry, &mut held_prism) {
-                            match prism.index() {
+                        match watch_db(root, &make_registry, &mut held_prism) {
+                            Ok(prism) => match prism.index() {
                                 Ok(result) => {
                                     if !result.extractions.is_empty() {
                                         cb(&result);
@@ -198,7 +198,14 @@ where
                                     eprintln!("[watch] periodic reindex failed: {e}");
                                     poison_watch_db(&mut held_prism);
                                 }
-                            }
+                            },
+                            // Already poisoned (watch_db only reopens when
+                            // `held` is None), so every later tick fails the
+                            // same way until whatever blocks open_transient
+                            // clears -- log it rather than looping silently.
+                            Err(e) => eprintln!(
+                                "[watch] failed to reopen graph connection, will retry: {e}"
+                            ),
                         }
                         changes_since_periodic = 0;
                         last_periodic = std::time::Instant::now();
@@ -243,15 +250,25 @@ where
                     if path.extension().is_some_and(|ext| ext == "request") {
                         match begin_index_op(root, "infigraph daemon", Duration::from_secs(30)) {
                             Ok(IndexOpOutcome::Acquired(_guard)) => {
-                                if let Ok(prism) = watch_db(root, &make_registry, &mut held_prism) {
-                                    if let Err(e) =
-                                        crate::daemon_protocol::serve_one_request(prism, &path)
-                                    {
-                                        eprintln!(
-                                            "[daemon] failed to serve request {}: {e}",
-                                            path.display()
-                                        );
+                                match watch_db(root, &make_registry, &mut held_prism) {
+                                    Ok(prism) => {
+                                        if let Err(e) =
+                                            crate::daemon_protocol::serve_one_request(prism, &path)
+                                        {
+                                            eprintln!(
+                                                "[daemon] failed to serve request {}: {e}",
+                                                path.display()
+                                            );
+                                        }
                                     }
+                                    // Without this the daemon would take the
+                                    // lock, do nothing, release it and repeat
+                                    // every 200ms with no output at all, while
+                                    // the client sees only an opaque "no daemon
+                                    // responded" timeout.
+                                    Err(e) => eprintln!(
+                                        "[daemon] failed to reopen graph connection, will retry: {e}"
+                                    ),
                                 }
                             }
                             Ok(o @ IndexOpOutcome::AlreadyRunning(_)) => {

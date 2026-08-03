@@ -102,6 +102,100 @@ fn ensure_daemon_running_noops_when_not_yet_indexed() {
     );
 }
 
+/// Selecting `DaemonKuzu` implies daemon-mode watching: `init()` must start
+/// a daemon itself rather than requiring `INFIGRAPH_WATCH_DAEMON=1` to be
+/// set independently (plan Global Constraints). Proves the real effect --
+/// a daemon process exists and holds `.infigraph/watch.lock` afterwards --
+/// not merely that `ensure_daemon_running` is called.
+#[test]
+fn init_daemon_backend_starts_a_daemon() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    for v in [
+        "CI",
+        "GITHUB_ACTIONS",
+        "JENKINS_URL",
+        "BUILDKITE",
+        "GITLAB_CI",
+        "INFIGRAPH_NO_WATCH",
+        "INFIGRAPH_BACKEND",
+    ] {
+        std::env::remove_var(v);
+    }
+
+    // init()'s daemon arm re-execs the CLI binary; skip rather than fail if
+    // this test binary was built without it (infigraph-core has no
+    // dev-dependency on infigraph-cli, so cargo won't build it for us).
+    let Ok(_cli) = infigraph_core::watch::daemon::resolve_cli_binary_sibling_of(
+        &std::env::current_exe().unwrap(),
+    ) else {
+        eprintln!("skipping: infigraph CLI binary not built in this target dir");
+        return;
+    };
+
+    let project_dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        project_dir.path().join("main.py"),
+        "def hello():\n    pass\n",
+    )
+    .unwrap();
+
+    // A read-only connection can't create a database, so the graph must
+    // exist before daemon-mode init() can open it. Bootstrap with the
+    // default Kuzu backend and drop it (releasing the write lock) first.
+    let registry = infigraph_languages::bundled_registry().unwrap();
+    let mut boot = infigraph_core::Infigraph::open(project_dir.path(), registry).unwrap();
+    boot.init().unwrap();
+    drop(boot);
+
+    let lock_path = project_dir.path().join(".infigraph").join("watch.lock");
+    assert!(
+        infigraph_core::lockfile::try_acquire(&lock_path, "test-probe")
+            .unwrap()
+            .is_some(),
+        "no daemon should be running before init()"
+    );
+
+    std::env::set_var("INFIGRAPH_BACKEND", "daemon");
+    let registry = infigraph_languages::bundled_registry().unwrap();
+    let mut client = infigraph_core::Infigraph::open(project_dir.path(), registry).unwrap();
+    let init_result = client.init();
+    std::env::remove_var("INFIGRAPH_BACKEND");
+    init_result.unwrap();
+
+    // The spawned daemon is detached (setsid), so there's no Child handle to
+    // wait on -- its lock hold is the observable proof it came up.
+    let start = std::time::Instant::now();
+    let mut started = false;
+    while start.elapsed() < std::time::Duration::from_secs(15) {
+        if infigraph_core::lockfile::try_acquire(&lock_path, "test-probe")
+            .map(|g| g.is_none())
+            .unwrap_or(false)
+        {
+            started = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    // Stop it before asserting, so a failed assertion can't leak a daemon.
+    std::fs::write(project_dir.path().join(".infigraph").join("watch.stop"), "").unwrap();
+    let stop_start = std::time::Instant::now();
+    while stop_start.elapsed() < std::time::Duration::from_secs(15) {
+        if infigraph_core::lockfile::try_acquire(&lock_path, "test-probe")
+            .map(|g| g.is_some())
+            .unwrap_or(false)
+        {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    assert!(
+        started,
+        "init() under INFIGRAPH_BACKEND=daemon must leave a daemon holding watch.lock"
+    );
+}
+
 /// Direct, deterministic assertion on the `Command` that `spawn_daemon`
 /// builds (via the `pub` `build_daemon_command` helper): its env mutations
 /// must include an explicit removal of `INFIGRAPH_BACKEND`, regardless of
