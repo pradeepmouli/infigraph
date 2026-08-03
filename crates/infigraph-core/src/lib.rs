@@ -98,6 +98,34 @@ enum BackendKind {
     DaemonKuzu(graph::DaemonKuzuBackend),
 }
 
+/// Whether `INFIGRAPH_BACKEND` selects the daemon backend. This is the exact
+/// condition `Infigraph::init` dispatches `BackendKind::DaemonKuzu` on,
+/// exposed for callers that must know *before* `init()` -- notably
+/// `cmd_index`, which otherwise takes `.infigraph/index.lock` and deadlocks
+/// against the daemon that needs that same lock to serve its writes.
+///
+/// Prefer `Infigraph::is_daemon_backend` once you have an initialized
+/// instance; that reports what was actually opened rather than what was
+/// requested.
+pub fn daemon_backend_selected() -> bool {
+    std::env::var("INFIGRAPH_BACKEND")
+        .map(|v| v == "daemon")
+        .unwrap_or(false)
+}
+
+/// Opt-in toggle for handing a whole `index()`/`index_files()` job to the
+/// daemon as a single `WriteRequest::Index`, instead of the default (parse
+/// locally, let the individual graph writes route themselves through the
+/// daemon). Off by default; only consulted under `INFIGRAPH_BACKEND=daemon`.
+///
+/// Same `"1"`-means-on convention as
+/// `crate::watch::daemon::watch_daemon_mode_enabled`.
+pub fn index_via_daemon_mode_enabled() -> bool {
+    std::env::var("INFIGRAPH_INDEX_VIA_DAEMON")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
 impl Infigraph {
     /// Backoff schedule (ms) for retrying a non-lock-contention graph open
     /// failure before concluding it's genuine corruption. See `init()`.
@@ -131,6 +159,18 @@ impl Infigraph {
     /// - `kuzu` (default): embedded Kùzu graph DB
     /// - `neo4j`: remote Neo4j sidecar via Bolt (requires `neo4j` feature)
     pub fn init(&mut self) -> Result<()> {
+        if daemon_backend_selected() {
+            let dk = graph::DaemonKuzuBackend::open(&self.root)?;
+            self.backend_kind = BackendKind::DaemonKuzu(dk);
+            // Selecting this backend implies daemon-mode watching: every
+            // covered write routes through a daemon, so without one
+            // running each would block for its full timeout before
+            // failing. Reads (already wired above) don't depend on it,
+            // hence the ordering.
+            self.ensure_daemon_for_writes();
+            return Ok(());
+        }
+
         let backend_env = std::env::var("INFIGRAPH_BACKEND").unwrap_or_else(|_| "kuzu".into());
 
         match backend_env.as_str() {
@@ -144,17 +184,6 @@ impl Infigraph {
             #[cfg(not(feature = "neo4j"))]
             "neo4j" => {
                 anyhow::bail!("neo4j backend requested but binary compiled without `neo4j` feature")
-            }
-            "daemon" => {
-                let dk = graph::DaemonKuzuBackend::open(&self.root)?;
-                self.backend_kind = BackendKind::DaemonKuzu(dk);
-                // Selecting this backend implies daemon-mode watching: every
-                // covered write routes through a daemon, so without one
-                // running each would block for its full timeout before
-                // failing. Reads (already wired above) don't depend on it,
-                // hence the ordering.
-                self.ensure_daemon_for_writes();
-                Ok(())
             }
             _ => match graph::KuzuBackend::open(&self.db_path) {
                 Ok(kb) => {
@@ -350,23 +379,41 @@ impl Infigraph {
     /// Index all supported files in the project, building the graph.
     /// Skips files whose content hash matches the stored hash (incremental).
     pub fn index(&self) -> Result<IndexResult> {
-        if matches!(self.backend_kind, BackendKind::DaemonKuzu(_)) {
+        if self.delegates_whole_index_to_daemon() {
             return self.index_via_daemon(None, Self::DAEMON_FULL_REINDEX_TIMEOUT);
         }
         let backend = self.backend().context("call init() first")?;
         self.index_via_backend(backend)
     }
 
+    /// Whether `index()`/`index_files()` should hand the *entire* job to the
+    /// daemon rather than parsing locally and letting the individual backend
+    /// writes route themselves.
+    ///
+    /// Off by default. `DaemonKuzuBackend` implements `upsert_files_bulk`,
+    /// `remove_file` and `resolve_calls` as real daemon-routed writes, so the
+    /// ordinary `index_via_backend` path works under `DaemonKuzu` like any
+    /// other backend -- and keeps the client's own `extractions` and
+    /// `resolve_stats`, which the daemon-side path cannot return (see
+    /// `index_via_daemon`).
+    fn delegates_whole_index_to_daemon(&self) -> bool {
+        self.is_daemon_backend() && index_via_daemon_mode_enabled()
+    }
+
+    /// Whether writes go through a daemon process instead of a connection
+    /// this process owns. Callers use this to avoid holding
+    /// `.infigraph/index.lock` across a daemon round-trip: the daemon
+    /// acquires that same lock to serve any request, so a caller that holds
+    /// it while waiting deadlocks.
+    pub fn is_daemon_backend(&self) -> bool {
+        matches!(self.backend_kind, BackendKind::DaemonKuzu(_))
+    }
+
     /// Ask the daemon to do the indexing on its own write-mode connection.
     ///
-    /// Under `BackendKind::DaemonKuzu` the client has no writable
-    /// connection at all: `upsert_files_bulk`/`remove_file`/`resolve_calls`
-    /// are all Tier-3 stubs, so the client-side path in `index_via_backend`
-    /// cannot complete. Routing the whole operation as one
-    /// `WriteRequest::Index` (rather than making each of those primitives
-    /// individually daemon-aware) also keeps bulk writes bulk -- shipping
-    /// stale-file pruning through the protocol one `remove_file` at a time
-    /// would be pathological.
+    /// Opt-in via `INFIGRAPH_INDEX_VIA_DAEMON=1` (see
+    /// `delegates_whole_index_to_daemon`); `index_file` also uses it
+    /// unconditionally, since `upsert_file` is still a Tier-3 stub.
     ///
     /// This never recurses: the daemon serves the request against its own
     /// `Infigraph`, which is always `BackendKind::Kuzu` because `cmd_daemon`
@@ -585,7 +632,7 @@ impl Infigraph {
         // but correct, and this method has no production caller today
         // (only the watcher's own server-side loop indexes single files,
         // and that never runs under DaemonKuzu).
-        if matches!(self.backend_kind, BackendKind::DaemonKuzu(_)) {
+        if self.is_daemon_backend() {
             return self
                 .index_via_daemon(
                     Some(vec![path.to_path_buf()]),
@@ -632,7 +679,7 @@ impl Infigraph {
             return Ok(empty_result());
         }
 
-        if matches!(self.backend_kind, BackendKind::DaemonKuzu(_)) {
+        if self.delegates_whole_index_to_daemon() {
             return self.index_via_daemon(Some(paths.to_vec()), Self::DAEMON_SCOPED_INDEX_TIMEOUT);
         }
 
