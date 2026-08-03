@@ -48,6 +48,25 @@ pub(crate) fn cmd_index(root: &Path, full: bool, no_embed: bool) -> Result<()> {
                 neo.clear_all_data()?;
                 println!("Cleared Neo4j graph for full reindex");
             }
+        } else if infigraph_core::daemon_backend_selected() {
+            // The wipe below is a direct, local filesystem operation with no
+            // routing through the daemon -- under DaemonKuzu the daemon holds
+            // a persistent, open connection on .infigraph/graph for its whole
+            // lifetime (docs/DESIGN-hardening.md SS2.1.3), so deleting it out
+            // from under that handle is unsafe (verified against lbug's own
+            // concurrency docs: safe concurrent access is guaranteed only
+            // within one process's Database object, not across two). Refuse
+            // loudly rather than corrupt the daemon's graph silently -- see
+            // https://github.com/pradeepmouli/infigraph/issues/50 for the
+            // real fix (routing --full through the daemon).
+            anyhow::bail!(
+                "`infigraph index --full` is not yet supported under the daemon backend \
+                 (INFIGRAPH_BACKEND=daemon) -- wiping .infigraph/graph while the daemon \
+                 holds a persistent connection on it would corrupt it. Stop the daemon \
+                 first (e.g. `infigraph kill`), run `infigraph index --full` locally, \
+                 then restart the daemon. Tracked: \
+                 https://github.com/pradeepmouli/infigraph/issues/50"
+            );
         } else {
             let tg_dir = root.join(".infigraph");
             if tg_dir.exists() {
