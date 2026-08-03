@@ -353,6 +353,9 @@ impl GraphBackend for DaemonKuzuBackend {
         extractions: &[FileExtraction],
         learned: Option<&LearnedStore>,
     ) -> Result<ResolveStats> {
+        if extractions.is_empty() {
+            return Ok(ResolveStats::default());
+        }
         let staging_dir = self.staging_dir();
         std::fs::create_dir_all(&staging_dir)?;
         let name = crate::daemon_protocol::generate_request_name();

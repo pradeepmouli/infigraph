@@ -687,16 +687,27 @@ pub(crate) fn run_scip_indexer(
 
 /// Entry point for the hidden `scip-enrich` subcommand (spawned by `index`).
 pub(crate) fn cmd_scip_enrich(root: &Path, detected_languages: &std::collections::HashSet<String>) {
-    let op = infigraph_core::ops::begin_index_op(root, "scip-enrich", std::time::Duration::ZERO);
-    let _op_guard = match op {
-        Ok(infigraph_core::ops::IndexOpOutcome::Acquired(g)) => g,
-        Ok(o @ infigraph_core::ops::IndexOpOutcome::AlreadyRunning(_)) => {
-            eprintln!("{}", o.skip_note().unwrap());
-            return;
-        }
-        Err(e) => {
-            eprintln!("warning: scip-enrich: failed to acquire index-op lock: {e}");
-            return;
+    // Same deadlock as `cmd_index` (see its comment): under the daemon
+    // backend, `import_scip_index` routes the `ScipImport` write to the
+    // daemon, which needs this very `.infigraph/index.lock` to serve it.
+    // Holding the lock here while waiting on that write deadlocks this
+    // detached child against the daemon. Skip local acquisition entirely --
+    // the daemon's own per-request locking already serializes the write.
+    let _op_guard = if infigraph_core::daemon_backend_selected() {
+        None
+    } else {
+        let op =
+            infigraph_core::ops::begin_index_op(root, "scip-enrich", std::time::Duration::ZERO);
+        match op {
+            Ok(infigraph_core::ops::IndexOpOutcome::Acquired(g)) => Some(g),
+            Ok(o @ infigraph_core::ops::IndexOpOutcome::AlreadyRunning(_)) => {
+                eprintln!("{}", o.skip_note().unwrap());
+                return;
+            }
+            Err(e) => {
+                eprintln!("warning: scip-enrich: failed to acquire index-op lock: {e}");
+                return;
+            }
         }
     };
     auto_scip_background(root, detected_languages);
