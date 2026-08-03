@@ -1,5 +1,6 @@
 pub mod batch;
 pub mod daemon;
+pub(crate) mod queue;
 
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc};
