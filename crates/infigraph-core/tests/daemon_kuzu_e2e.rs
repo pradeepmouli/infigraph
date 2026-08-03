@@ -390,6 +390,67 @@ fn index_and_index_files_route_through_the_daemon() {
     stop_daemon(project_dir.path(), &mut daemon);
 }
 
+/// The exact scenario reproduced live while confirming the predecessor fix
+/// (fix/daemonkuzu-index-routing): under INFIGRAPH_INDEX_VIA_DAEMON=1,
+/// creating a file and immediately running `infigraph index` -- no
+/// settling delay for the daemon's own watcher debounce -- used to produce
+/// a Kuzu duplicate-primary-key error, because the daemon's own
+/// autonomous watcher and the client's explicit Index request each
+/// independently decided the new file needed indexing. Proves the fix:
+/// this must complete successfully, not error.
+#[test]
+fn ad_hoc_index_request_racing_the_watchers_own_debounce_does_not_duplicate_key() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(project.path().join("main.py"), "def main():\n    pass\n").unwrap();
+
+    let mut daemon = start_real_daemon(project.path());
+
+    // Bootstrap: one file already indexed before the race file appears,
+    // matching the live repro's setup.
+    let bootstrap = std::process::Command::new(cli_binary())
+        .arg("--root")
+        .arg(project.path())
+        .arg("index")
+        .arg("--no-embed")
+        .env_remove("INFIGRAPH_BACKEND")
+        .status()
+        .unwrap();
+    assert!(bootstrap.success());
+
+    // The race: create a new file, then IMMEDIATELY (no settling delay)
+    // submit an ad-hoc Index request via the opt-in whole-job-to-daemon
+    // mode -- the exact combination that reproduced the bug live.
+    std::fs::write(
+        project.path().join("second.py"),
+        "def second():\n    pass\n",
+    )
+    .unwrap();
+
+    let output = std::process::Command::new(cli_binary())
+        .arg("--root")
+        .arg(project.path())
+        .arg("index")
+        .arg("--no-embed")
+        .env("INFIGRAPH_BACKEND", "daemon")
+        .env("INFIGRAPH_INDEX_VIA_DAEMON", "1")
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "expected the racing Index request to succeed, not duplicate-key error:\nstdout={}\nstderr={stderr}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        !stderr.contains("duplicated primary key"),
+        "the coalescing bug reproduced:\n{stderr}"
+    );
+
+    stop_daemon(project.path(), &mut daemon);
+}
+
 /// Read-after-write through the SAME long-lived wrapper instance.
 ///
 /// Every other test here verifies a daemon-side write through a *fresh*

@@ -140,6 +140,13 @@ where
     // per call on Windows).
     let mut held_prism: Option<Infigraph> = None;
 
+    // Accumulates index-shaped work from every producer below (periodic
+    // reindex, watch-triggered batch/removal, ad-hoc daemon-protocol
+    // requests) so it's drained as one combined execution per tick instead
+    // of each producer racing its own stale plan against the others -- see
+    // docs/superpowers/specs/2026-08-03-daemon-index-work-queue-design.md.
+    let mut queue = crate::watch::queue::IndexWorkQueue::new();
+
     let sentinel = root.join(".infigraph").join("watch.stop");
 
     const MAX_RESTARTS: u32 = 3;
@@ -174,63 +181,15 @@ where
             && changes_since_periodic > 0
             && last_periodic.elapsed() >= Duration::from_secs(periodic_secs)
         {
-            if let Some(ref cb) = on_periodic {
-                // Wait mode: serializes against a concurrently-running index
-                // op rather than skipping outright, so a periodic refresh
-                // isn't starved by e.g. a long CLI `infigraph index` run.
-                // Note: this call blocks synchronously for up to 30s, and
-                // this whole loop iteration is single-threaded — so under
-                // sustained contention (another op holding the lock for
-                // most/all of that window) the ENTIRE watcher loop stalls
-                // for the wait, not just the periodic refresh: the batch
-                // flush below and event draining from `rx` both wait too,
-                // roughly once per periodic tick. Filesystem events aren't
-                // lost during the stall — `notify`'s channel just buffers
-                // them until the next `rx` drain — but latency spikes.
-                match begin_index_op(root, "infigraph watch", Duration::from_secs(30)) {
-                    Ok(IndexOpOutcome::Acquired(_guard)) => {
-                        match watch_db(root, &make_registry, &mut held_prism) {
-                            Ok(prism) => match prism.index() {
-                                Ok(result) => {
-                                    if !result.extractions.is_empty() {
-                                        cb(&result);
-                                    }
-                                }
-                                Err(e) => {
-                                    eprintln!("[watch] periodic reindex failed: {e}");
-                                    poison_watch_db(&mut held_prism);
-                                }
-                            },
-                            // Already poisoned (watch_db only reopens when
-                            // `held` is None), so every later tick fails the
-                            // same way until whatever blocks open_transient
-                            // clears -- log it rather than looping silently.
-                            Err(e) => eprintln!(
-                                "[watch] failed to reopen graph connection, will retry: {e}"
-                            ),
-                        }
-                        changes_since_periodic = 0;
-                        last_periodic = std::time::Instant::now();
-                        // _guard drops here, releasing the index-op lock
-                    }
-                    Ok(o @ IndexOpOutcome::AlreadyRunning(_)) => {
-                        // begin_index_op only returns this variant in
-                        // non-blocking (wait=ZERO) mode; with the 30s wait
-                        // budget used here it always resolves to Acquired
-                        // or Err(Busy). Handled rather than assumed
-                        // unreachable. Counters are left untouched so this
-                        // cycle is retried on the next loop tick.
-                        eprintln!(
-                            "[watch] periodic index operation busy ({}), retrying next period",
-                            o.skip_note().unwrap_or_default()
-                        );
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "[watch] periodic index operation busy ({e}), retrying next period"
-                        );
-                    }
-                }
+            if on_periodic.is_some() {
+                // Marks the queue rather than indexing directly -- the
+                // shared drain step below runs the actual scan/upsert/
+                // resolve pass and invokes `on_periodic` with the real
+                // `DrainOutcome`, folded into whatever else this tick's
+                // other producers also contributed.
+                queue.mark_whole_project();
+                changes_since_periodic = 0;
+                last_periodic = std::time::Instant::now();
             } else {
                 changes_since_periodic = 0;
                 last_periodic = std::time::Instant::now();
@@ -250,119 +209,31 @@ where
                 for entry in entries.flatten() {
                     let path = entry.path();
                     if path.extension().is_some_and(|ext| ext == "request") {
-                        match begin_index_op(root, "infigraph daemon", Duration::from_secs(30)) {
-                            Ok(IndexOpOutcome::Acquired(_guard)) => {
-                                match watch_db(root, &make_registry, &mut held_prism) {
-                                    Ok(prism) => {
-                                        if let Err(e) =
-                                            crate::daemon_protocol::serve_one_request(prism, &path)
-                                        {
-                                            eprintln!(
-                                                "[daemon] failed to serve request {}: {e}",
-                                                path.display()
-                                            );
-                                        }
-                                    }
-                                    // Without this the daemon would take the
-                                    // lock, do nothing, release it and repeat
-                                    // every 200ms with no output at all, while
-                                    // the client sees only an opaque "no daemon
-                                    // responded" timeout.
-                                    Err(e) => eprintln!(
-                                        "[daemon] failed to reopen graph connection, will retry: {e}"
-                                    ),
-                                }
-                            }
-                            Ok(o @ IndexOpOutcome::AlreadyRunning(_)) => {
-                                eprintln!(
-                                    "[daemon] request-serving busy ({}), retrying next tick",
-                                    o.skip_note().unwrap_or_default()
-                                );
-                            }
-                            Err(e) => {
-                                eprintln!(
-                                    "[daemon] request-serving busy ({e}), retrying next tick"
-                                );
-                            }
-                        }
+                        route_or_serve_request(
+                            root,
+                            &path,
+                            &mut queue,
+                            &make_registry,
+                            &mut held_prism,
+                        );
                     }
                 }
             }
         }
 
-        // Flush the batch when the window has closed
+        // Flush the batch when the window has closed -- feeds the shared
+        // queue rather than indexing directly; the drain step below is what
+        // actually executes it, combined with whatever else this tick's
+        // other producers also contributed.
         if !batch.is_empty() && batch.is_ready() {
             let paths = batch.drain();
-            let count = paths.len();
-
-            // Serialize this batch against any other index operation (CLI
-            // `infigraph index`, MCP `index_project`, SCIP enrichment, ...)
-            // rather than racing it. Waits up to 30s; on contention beyond
-            // that, the drained paths are re-added to the batch instead of
-            // being dropped, so the next window retries them.
-            let guard = match begin_index_op(root, "infigraph watch", Duration::from_secs(30)) {
-                Ok(IndexOpOutcome::Acquired(g)) => g,
-                Ok(o @ IndexOpOutcome::AlreadyRunning(_)) => {
-                    // begin_index_op only returns this variant in
-                    // non-blocking (wait=ZERO) mode; with the 30s wait
-                    // budget used here it always resolves to Acquired or
-                    // Err(Busy). Handled rather than assumed unreachable.
-                    eprintln!(
-                        "[watch] index operation busy ({}), retrying batch next window",
-                        o.skip_note().unwrap_or_default()
-                    );
-                    batch.readd(paths);
-                    continue;
-                }
-                Err(e) => {
-                    eprintln!("[watch] index operation busy ({e}), retrying batch next window");
-                    batch.readd(paths);
-                    continue;
-                }
-            };
-
-            eprintln!("[watch] batch indexing {count} files");
-
-            if let Ok(prism) = watch_db(root, &make_registry, &mut held_prism) {
-                match prism.index_files(&paths) {
-                    Ok(result) => {
-                        changes_since_periodic += result.indexed_files;
-
-                        if let Some(backend) = prism.backend() {
-                            let changed: Vec<&str> =
-                                result.extractions.iter().map(|e| e.file.as_str()).collect();
-                            if !changed.is_empty() {
-                                if let Err(e) =
-                                    crate::embed::update_embeddings(backend, root, &changed)
-                                {
-                                    eprintln!("[watch] batch embedding update failed: {e}");
-                                }
-                            }
-                        }
-
-                        for extraction in &result.extractions {
-                            let cross = has_cross_file_calls(prism, &extraction.file);
-                            let abs_path = root.join(&extraction.file);
-                            on_event(WatchEvent {
-                                kind: WatchEventKind::Modified,
-                                path: abs_path,
-                                has_cross_file_calls: cross,
-                            });
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("[watch] batch reindex failed: {e}");
-                        poison_watch_db(&mut held_prism);
-                    }
-                }
-                // On non-Windows this connection stays open for reuse by the
-                // next batch; on Windows it's closed on the next `watch_db`
-                // call's reopen (or when the loop exits).
+            for path in paths {
+                let rel = path
+                    .strip_prefix(root)
+                    .map(|r| r.to_string_lossy().replace('\\', "/"))
+                    .unwrap_or_else(|_| path.to_string_lossy().replace('\\', "/"));
+                queue.add_raw(rel);
             }
-            drop(guard);
-            // guard released the index-op lock; the batch guard was held
-            // across index_files, the embedding update, and event emission
-            // above, matching the task-3 contract.
         }
 
         match rx.recv_timeout(Duration::from_millis(200)) {
@@ -386,11 +257,11 @@ where
 
                     match watch_kind {
                         WatchEventKind::Removed => {
-                            if let Ok(prism) = watch_db(root, &make_registry, &mut held_prism) {
-                                let _ = prism.remove_file(&path);
-                                // Also remove files under this path (handles directory removal)
-                                let _ = prism.remove_files_by_prefix(&path);
-                            }
+                            // Deferred to the shared drain step below rather
+                            // than touching the graph directly here -- this
+                            // closes a pre-existing gap where watch-triggered
+                            // removal never took `index.lock` at all.
+                            queue.add_removal(rel);
                             changes_since_periodic += 1;
                             on_event(WatchEvent {
                                 kind: watch_kind.clone(),
@@ -450,6 +321,79 @@ where
                         });
                         break;
                     }
+                }
+            }
+        }
+
+        // Shared drain step: runs once per tick, combining whatever every
+        // producer above (periodic mark, ad-hoc requests, batch flush,
+        // watch-triggered removal) contributed this tick into ONE execution
+        // -- this is the actual fix for the coalescing bug (see
+        // docs/superpowers/specs/2026-08-03-daemon-index-work-queue-design.md).
+        // Same lock, same role string, same cross-process contract the
+        // batch-flush block used to acquire on its own.
+        if !queue.is_empty() {
+            match begin_index_op(root, "infigraph daemon", Duration::from_secs(30)) {
+                Ok(IndexOpOutcome::Acquired(_guard)) => {
+                    if let Ok(prism) = watch_db(root, &make_registry, &mut held_prism) {
+                        match crate::watch::drain::execute_drain(prism, queue.drain()) {
+                            Ok(outcome) => {
+                                changes_since_periodic += outcome.extractions.len();
+                                if let Some(ref cb) = on_periodic {
+                                    if !outcome.extractions.is_empty() {
+                                        cb(&crate::IndexResult {
+                                            total_files: outcome.extractions.len(),
+                                            indexed_files: outcome.extractions.len(),
+                                            extractions: outcome.extractions.clone(),
+                                            resolve_stats: outcome.resolve_stats.clone(),
+                                        });
+                                    }
+                                }
+                                if let Some(backend) = prism.backend() {
+                                    let changed: Vec<&str> = outcome
+                                        .extractions
+                                        .iter()
+                                        .map(|e| e.file.as_str())
+                                        .collect();
+                                    if !changed.is_empty() {
+                                        if let Err(e) =
+                                            crate::embed::update_embeddings(backend, root, &changed)
+                                        {
+                                            eprintln!("[watch] embedding update failed: {e}");
+                                        }
+                                    }
+                                }
+                                for extraction in &outcome.extractions {
+                                    let cross = has_cross_file_calls(prism, &extraction.file);
+                                    let abs_path = root.join(&extraction.file);
+                                    on_event(WatchEvent {
+                                        kind: WatchEventKind::Modified,
+                                        path: abs_path,
+                                        has_cross_file_calls: cross,
+                                    });
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("[watch] drain failed: {e}");
+                                poison_watch_db(&mut held_prism);
+                            }
+                        }
+                    } else {
+                        eprintln!("[watch] failed to reopen graph connection, will retry");
+                    }
+                    // _guard drops here, releasing the index-op lock
+                }
+                Ok(o @ IndexOpOutcome::AlreadyRunning(_)) => {
+                    // Queue contents are NOT cleared here -- queue.drain()
+                    // only runs inside the Acquired arm above, so whatever
+                    // was pending stays queued for the next tick's attempt.
+                    eprintln!(
+                        "[watch] index operation busy ({}), retrying next tick",
+                        o.skip_note().unwrap_or_default()
+                    );
+                }
+                Err(e) => {
+                    eprintln!("[watch] index operation busy ({e}), retrying next tick");
                 }
             }
         }
@@ -628,6 +572,129 @@ where
 /// call reopens fresh. See `watch_db`'s doc comment for when to call this.
 fn poison_watch_db(held: &mut Option<Infigraph>) {
     *held = None;
+}
+
+/// Parses a `.request` file and either enqueues it (for the four
+/// index-shaped `WriteRequest` variants this design coordinates) or falls
+/// through to the existing, unmodified `serve_one_request` for everything
+/// else. Enqueued requests' `.request` file is deleted immediately (the
+/// daemon has already accepted responsibility for serving it the moment
+/// it's queued) -- the reply arrives later, written by `execute_drain`.
+fn route_or_serve_request<MR>(
+    root: &Path,
+    path: &Path,
+    queue: &mut crate::watch::queue::IndexWorkQueue,
+    make_registry: &MR,
+    held: &mut Option<Infigraph>,
+) where
+    MR: Fn() -> Result<crate::lang::LanguageRegistry>,
+{
+    let reply_path = path.with_extension("result");
+    let contents = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return, // transient; will be retried next tick if the file reappears
+    };
+    let request: crate::daemon_protocol::WriteRequest = match serde_json::from_str(&contents) {
+        Ok(r) => r,
+        Err(_) => {
+            // Malformed request JSON -- not this design's concern to
+            // recover; hand off to serve_one_request, whose existing
+            // corrupt-JSON handling (WriteResult::Err) already covers it.
+            if let Ok(prism) = watch_db(root, make_registry, held) {
+                let _ = crate::daemon_protocol::serve_one_request(prism, path);
+            }
+            return;
+        }
+    };
+
+    use crate::daemon_protocol::WriteRequest;
+    use crate::watch::queue::{Waiter, WaiterKind};
+
+    match request {
+        WriteRequest::Index { paths: None } => {
+            queue.mark_whole_project();
+            queue.add_waiter(Waiter {
+                kind: WaiterKind::Index,
+                use_learned: false,
+                reply_path,
+            });
+            std::fs::remove_file(path).ok();
+        }
+        WriteRequest::Index { paths: Some(paths) } => {
+            for p in paths {
+                let rel = p.to_string_lossy().replace('\\', "/");
+                queue.add_raw(rel);
+            }
+            queue.add_waiter(Waiter {
+                kind: WaiterKind::Index,
+                use_learned: false,
+                reply_path,
+            });
+            std::fs::remove_file(path).ok();
+        }
+        WriteRequest::UpsertFilesBulk {
+            extractions_path, ..
+        } => match crate::daemon_protocol::read_extractions_json(&extractions_path) {
+            Ok(extractions) => {
+                for extraction in extractions {
+                    queue.add_structured(extraction);
+                }
+                queue.add_waiter(Waiter {
+                    kind: WaiterKind::UpsertFilesBulk,
+                    use_learned: false,
+                    reply_path,
+                });
+                std::fs::remove_file(&extractions_path).ok();
+                std::fs::remove_file(path).ok();
+            }
+            Err(_) => {
+                // Sibling extractions file missing/corrupt -- fall
+                // through to serve_one_request's existing error path.
+                if let Ok(prism) = watch_db(root, make_registry, held) {
+                    let _ = crate::daemon_protocol::serve_one_request(prism, path);
+                }
+            }
+        },
+        WriteRequest::RemoveFiles { files } => {
+            for f in files {
+                queue.add_removal(f);
+            }
+            queue.add_waiter(Waiter {
+                kind: WaiterKind::RemoveFiles,
+                use_learned: false,
+                reply_path,
+            });
+            std::fs::remove_file(path).ok();
+        }
+        WriteRequest::ResolveCalls {
+            extractions_path,
+            use_learned,
+        } => match crate::daemon_protocol::read_extractions_json(&extractions_path) {
+            Ok(extractions) => {
+                for extraction in extractions {
+                    queue.add_resolve_only(extraction);
+                }
+                queue.add_waiter(Waiter {
+                    kind: WaiterKind::ResolveCalls,
+                    use_learned,
+                    reply_path,
+                });
+                std::fs::remove_file(&extractions_path).ok();
+                std::fs::remove_file(path).ok();
+            }
+            Err(_) => {
+                if let Ok(prism) = watch_db(root, make_registry, held) {
+                    let _ = crate::daemon_protocol::serve_one_request(prism, path);
+                }
+            }
+        },
+        _ => {
+            // The other 9 variants: unchanged behavior, immediate execution.
+            if let Ok(prism) = watch_db(root, make_registry, held) {
+                let _ = crate::daemon_protocol::serve_one_request(prism, path);
+            }
+        }
+    }
 }
 
 /// Returns the relative paths of files that have cross-file CALLS edges to/from the given file.
