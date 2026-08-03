@@ -7,13 +7,29 @@ use infigraph_core::Infigraph;
 use infigraph_languages::bundled_registry;
 
 pub(crate) fn cmd_index(root: &Path, full: bool, no_embed: bool) -> Result<()> {
-    let op =
-        infigraph_core::ops::begin_index_op(root, "infigraph index", std::time::Duration::ZERO)?;
-    let _op_guard = match op {
-        infigraph_core::ops::IndexOpOutcome::Acquired(g) => g,
-        o @ infigraph_core::ops::IndexOpOutcome::AlreadyRunning(_) => {
-            println!("{}", o.skip_note().unwrap());
-            return Ok(());
+    // Under the daemon backend this command performs no local graph writes:
+    // each one is routed to the daemon, which takes this very
+    // .infigraph/index.lock to serve it. Holding the lock here deadlocks --
+    // we block on the daemon's result while the daemon retries forever
+    // waiting for us -- and even releasing it early isn't enough, because
+    // the zero-wait acquisition also makes this command a silent no-op
+    // whenever the daemon, its watcher, or a background scip-enrich holds
+    // the lock, which under daemon mode is routine. The daemon's own
+    // per-request locking is what serializes writes now.
+    let op_guard = if infigraph_core::daemon_backend_selected() {
+        None
+    } else {
+        let op = infigraph_core::ops::begin_index_op(
+            root,
+            "infigraph index",
+            std::time::Duration::ZERO,
+        )?;
+        match op {
+            infigraph_core::ops::IndexOpOutcome::Acquired(g) => Some(g),
+            o @ infigraph_core::ops::IndexOpOutcome::AlreadyRunning(_) => {
+                println!("{}", o.skip_note().unwrap());
+                return Ok(());
+            }
         }
     };
 
@@ -41,8 +57,8 @@ pub(crate) fn cmd_index(root: &Path, full: bool, no_embed: bool) -> Result<()> {
                 if had_sessions {
                     let _ = std::fs::rename(&sessions_dir, &sessions_backup);
                 }
-                // `_op_guard` above holds a flock on .infigraph/index.lock for
-                // this whole reindex; the shared helper preserves that file
+                // `op_guard` above holds a flock on .infigraph/index.lock
+                // across this wipe; the shared helper preserves that file
                 // by name so the held lock stays valid through the wipe.
                 infigraph_core::ops::wipe_infigraph_preserving_index_lock(&tg_dir)?;
                 if had_sessions {
@@ -300,7 +316,7 @@ pub(crate) fn cmd_index(root: &Path, full: bool, no_embed: bool) -> Result<()> {
     // acquire the same index.lock (role "scip-enrich") — if we're still
     // holding it here, the child would see AlreadyRunning against its own
     // parent and silently skip enrichment on every single index run.
-    drop(_op_guard);
+    drop(op_guard);
 
     // SCIP enrichment in a detached child process — parent returns immediately.
     spawn_scip_child_process(root, &detected_languages);

@@ -120,6 +120,169 @@ fn verify_conn(project_dir: &Path) -> infigraph_core::graph::KuzuBackend {
     .unwrap()
 }
 
+/// Generous, but bounded. The bug these `real_cli_index_*` tests exist for
+/// showed up as a *hang* (the client held `.infigraph/index.lock` while
+/// blocking on a daemon that needs that same lock to serve anything), and
+/// the client-side budget for a routed write is 600s -- so an unbounded
+/// `Command::status()` here would turn a regression into a ten-minute stall
+/// instead of a test failure.
+const CLI_INDEX_DEADLINE: Duration = Duration::from_secs(240);
+
+/// Runs the REAL `infigraph index` subcommand against `project_dir` with
+/// `INFIGRAPH_BACKEND=daemon`, and returns its combined output.
+///
+/// Every other test in this file drives `Infigraph::index()` as a library
+/// call, which is exactly why the deadlock shipped: `cmd_index` acquires
+/// `index.lock` itself, before it ever reaches the library, so no
+/// library-level test could see it. This helper is the whole point -- it
+/// goes through the same entry point a person at a terminal does.
+fn run_cli_index(project_dir: &Path, extra_env: &[(&str, &str)]) -> String {
+    // Inside `.infigraph/` so neither the indexer nor the daemon's watcher
+    // ever sees this log as a project file.
+    let log_path = project_dir.join(".infigraph").join("test-cli-index.log");
+    let log = std::fs::File::create(&log_path).unwrap();
+
+    let mut cmd = Command::new(cli_binary());
+    cmd.arg("index")
+        .current_dir(project_dir)
+        .env("INFIGRAPH_BACKEND", "daemon")
+        // This machine exports INFIGRAPH_WATCH_DAEMON globally; leaving it
+        // set would change which watcher model the child picks.
+        .env_remove("INFIGRAPH_WATCH_DAEMON")
+        .stdout(log.try_clone().unwrap())
+        .stderr(log);
+    for (key, value) in extra_env {
+        cmd.env(key, value);
+    }
+
+    let mut child = KillOnDrop(cmd.spawn().unwrap());
+    let start = std::time::Instant::now();
+    let status = loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            break status;
+        }
+        if start.elapsed() > CLI_INDEX_DEADLINE {
+            panic!(
+                "`infigraph index` did not finish within {CLI_INDEX_DEADLINE:?} -- \
+                 the index.lock deadlock is back. Output so far:\n{}",
+                std::fs::read_to_string(&log_path).unwrap_or_default()
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+
+    let output = std::fs::read_to_string(&log_path).unwrap_or_default();
+    std::fs::remove_file(&log_path).ok();
+    assert!(
+        status.success(),
+        "`infigraph index` exited with {status}:\n{output}"
+    );
+    output
+}
+
+/// Whether `cmd_index` printed its per-language breakdown, which it derives
+/// purely from `IndexResult::extractions`. That makes this an exact,
+/// observable proxy for "the client did the parsing itself and kept its
+/// extractions" -- empty extractions produce no such line.
+fn has_language_breakdown(output: &str) -> bool {
+    output.lines().any(|l| l.trim_start().starts_with("lua:"))
+}
+
+fn file_is_in_graph(project_dir: &Path, file: &str) -> bool {
+    !verify_conn(project_dir)
+        .raw_query(&format!("MATCH (f:File) WHERE f.id = '{file}' RETURN f.id"))
+        .unwrap()
+        .is_empty()
+}
+
+/// Regression test for the deadlock that shipped with `DaemonKuzu`:
+/// `infigraph daemon` in one process, `INFIGRAPH_BACKEND=daemon infigraph
+/// index` in another, against the same project, hung forever. `cmd_index`
+/// took `.infigraph/index.lock` up front (a holdover from when indexing was
+/// always local work), then blocked on a daemon whose request-serving loop
+/// needs that same lock -- so the daemon logged "busy, retrying" until the
+/// client timed out.
+///
+/// Covers both routing modes, because both route writes through the
+/// daemon's request-serving loop and so both hit the same lock:
+///  - the default, where the client parses locally and only the graph
+///    writes (`upsert_files_bulk`/`remove_file`/`resolve_calls`) route; and
+///  - `INFIGRAPH_INDEX_VIA_DAEMON=1`, where the whole job is one
+///    `WriteRequest::Index` and the daemon redoes the scan itself.
+#[test]
+fn real_cli_index_against_a_real_daemon_completes_and_writes() {
+    let project_dir = tempfile::tempdir().unwrap();
+    // Lua deliberately: no SCIP indexer covers it (see scip_download::CATALOG),
+    // so `infigraph index` spawns no detached scip-enrich child. Such a child
+    // holds `index.lock` for as long as it runs, which is itself enough to
+    // make every assertion below unreachable -- the first draft of this test
+    // failed exactly that way against a `.py` project.
+    std::fs::write(
+        project_dir.path().join("main.lua"),
+        "function hello()\nend\n",
+    )
+    .unwrap();
+
+    let mut daemon = start_real_daemon(project_dir.path());
+
+    // ── Default mode: the client parses, the daemon writes ──
+    //
+    // The daemon is also a watcher on this directory and can pick a new file
+    // up on its own inside its 1s batch window, which would leave our run
+    // with nothing to parse and make the extractions assertion vacuous.
+    // Retry with a fresh file until we win that race.
+    let mut default_file = String::new();
+    let mut default_output = String::new();
+    for attempt in 0..5 {
+        default_file = format!("generated_{attempt}.lua");
+        std::fs::write(
+            project_dir.path().join(&default_file),
+            "function helper()\nend\n\nfunction caller()\n  helper()\nend\n",
+        )
+        .unwrap();
+        default_output = run_cli_index(project_dir.path(), &[]);
+        if default_output.contains("Indexed ") {
+            break;
+        }
+    }
+    assert!(
+        default_output.contains("Indexed "),
+        "the daemon's own watcher beat every attempt to it; no run had files to parse:\n\
+         {default_output}"
+    );
+    assert!(
+        has_language_breakdown(&default_output),
+        "under the default routing the client parses locally, so IndexResult::extractions \
+         must be populated and cmd_index must print its per-language breakdown:\n{default_output}"
+    );
+    assert!(
+        file_is_in_graph(project_dir.path(), &default_file),
+        "{default_file} must actually be in the graph -- checked over an independent \
+         read-only connection, so this cannot pass on client-side caching"
+    );
+
+    // ── Opt-in mode: the daemon redoes the whole job ──
+    let opt_in_file = "opt_in.lua";
+    std::fs::write(
+        project_dir.path().join(opt_in_file),
+        "function opt_in_marker()\nend\n",
+    )
+    .unwrap();
+    let opt_in_output = run_cli_index(project_dir.path(), &[("INFIGRAPH_INDEX_VIA_DAEMON", "1")]);
+    assert!(
+        !has_language_breakdown(&opt_in_output),
+        "under INFIGRAPH_INDEX_VIA_DAEMON the daemon does the parsing and the protocol \
+         deliberately doesn't ship extractions back, so there is nothing to break down \
+         by language:\n{opt_in_output}"
+    );
+    assert!(
+        file_is_in_graph(project_dir.path(), opt_in_file),
+        "the daemon must still have indexed {opt_in_file} in opt-in mode"
+    );
+
+    stop_daemon(project_dir.path(), &mut daemon);
+}
+
 /// End-to-end proof that a real spawned `infigraph daemon` process and a
 /// real `DaemonKuzu`-backed client `Infigraph` genuinely interoperate --
 /// not just the in-process simulated-server pattern (a background thread
@@ -172,12 +335,12 @@ fn real_daemon_process_serves_a_daemon_kuzu_client() {
 }
 
 /// `Infigraph::index()`/`index_files()` must work under `BackendKind::
-/// DaemonKuzu`. They can't use the client-side path -- `upsert_files_bulk`,
-/// `remove_file` and `resolve_calls` are all Tier-3 stubs there -- so they
-/// route the whole operation to the daemon as a `WriteRequest::Index`.
-/// Before that routing existed, `index()` with changed files failed with
-/// "use Infigraph::index()/index_files() instead", i.e. it told the caller
-/// to call the function they were already inside.
+/// DaemonKuzu`. They take the ordinary client-side path there like any other
+/// backend -- parse locally, then let `upsert_files_bulk`, `remove_file` and
+/// `resolve_calls` route themselves to the daemon. Before those three were
+/// implemented they were Tier-3 stubs, and `index()` with changed files
+/// failed with "use Infigraph::index()/index_files() instead", i.e. it told
+/// the caller to call the function they were already inside.
 #[test]
 fn index_and_index_files_route_through_the_daemon() {
     let project_dir = tempfile::tempdir().unwrap();
