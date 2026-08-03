@@ -1,6 +1,14 @@
 #!/bin/sh
 set -e
 
+# Dev-loop env vars that opt a shell into daemon-backed indexing
+# (INFIGRAPH_BACKEND=daemon) or watcher auto-start (INFIGRAPH_WATCH_DAEMON)
+# are meant for interactive use, not for this hook's own test/build
+# subprocesses -- a shell profile that sets them globally otherwise makes
+# tests like groups_watch_perf fail with "Cannot create an empty database
+# under READ ONLY mode" for reasons unrelated to the change being committed.
+unset INFIGRAPH_BACKEND INFIGRAPH_WATCH_DAEMON INFIGRAPH_INDEX_VIA_DAEMON
+
 # `cargo clippy --all-targets` alone forces a full workspace rebuild (100+
 # crates, including native lbug/kuzu builds) -- wasted work for a docs-only
 # change, and has repeatedly exhausted disk on machines running close to
