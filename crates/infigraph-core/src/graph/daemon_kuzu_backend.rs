@@ -19,27 +19,56 @@ use super::{
 /// docs/superpowers/specs/2026-08-01-daemonkuzu-daemon-wiring-design.md.
 ///
 /// Three-tier contract:
-/// 1. Reads delegate to `read_conn`, a real directly-opened read-only
-///    Kuzu connection -- reads never route through the daemon.
+/// 1. Reads delegate to a real directly-opened read-only Kuzu connection --
+///    reads never route through the daemon. The connection is opened
+///    *fresh per read call* (see `open_read`), not held for the wrapper's
+///    lifetime.
 /// 2. The write methods covered by WriteRequest (see daemon_protocol.rs)
 ///    route through submit_write_request (Task 13).
 /// 3. Any other write method returns a clear error rather than silently
-///    writing through read_conn (which would fail at the DB level, per
-///    read_only_connection_rejects_write_statements) or reintroducing a
-///    real collision some other way.
+///    writing through the read connection (which would fail at the DB
+///    level, per read_only_connection_rejects_write_statements) or
+///    reintroducing a real collision some other way.
 pub struct DaemonKuzuBackend {
-    read_conn: KuzuBackend,
+    db_path: std::path::PathBuf,
     root: std::path::PathBuf,
 }
 
 impl DaemonKuzuBackend {
     pub fn open(root: &Path) -> Result<Self> {
         let db_path = root.join(".infigraph").join("graph");
-        let read_conn = KuzuBackend::open_read_only(&db_path)?;
+        // Validation probe only -- immediately dropped. Reads open their own
+        // connection, but callers (notably `Infigraph::init`'s "daemon" arm,
+        // which propagates this `?`) rely on `open` failing eagerly when the
+        // graph is missing or unopenable rather than surfacing that on some
+        // later read.
+        drop(KuzuBackend::open_read_only(&db_path)?);
         Ok(Self {
-            read_conn,
+            db_path,
             root: root.to_path_buf(),
         })
+    }
+
+    /// A fresh read-only connection for a single read call.
+    ///
+    /// Reopening per read is what makes reads see daemon-side commits at
+    /// all: a Kuzu embedded read-only `Database` serves the snapshot it
+    /// loaded at open time and never observes another process's later
+    /// commits, so one connection held for this wrapper's (potentially very
+    /// long) lifetime goes permanently stale the moment the daemon writes --
+    /// including writes from the daemon's own watcher-driven reindexing or
+    /// another client, not just this instance's. A fresh `Connection` on a
+    /// held `Database` is not enough; the `Database` itself must be reopened.
+    ///
+    /// Measured at ~12.6ms, trivial against this backend's 30s-600s write
+    /// timeouts. This does not reintroduce the write-amplification bug from
+    /// upstream PR #43: that came from reopening a *write* connection, whose
+    /// close triggers `forceCheckpointOnClose` and flushes accumulated WAL
+    /// into the base file. A read-only connection never writes, so it has
+    /// nothing to checkpoint -- verified empirically as zero bytes of file
+    /// growth over 100 open/close cycles against a real indexed graph.
+    fn open_read(&self) -> Result<KuzuBackend> {
+        KuzuBackend::open_read_only(&self.db_path)
     }
 
     fn not_supported(method: &str, alternative: &str) -> anyhow::Error {
@@ -58,58 +87,59 @@ impl DaemonKuzuBackend {
 // behavior for DaemonKuzu too, matching KuzuBackend's own reliance on the
 // same default -- this is a deliberate choice, not an oversight.
 impl GraphBackend for DaemonKuzuBackend {
-    // ── Tier 1: reads pass through to the real read-only connection ──
+    // ── Tier 1: reads pass through to a freshly opened read-only
+    //    connection (see `open_read` for why it is not held open) ──
 
     fn stats(&self) -> Result<GraphStats> {
-        self.read_conn.stats()
+        self.open_read()?.stats()
     }
     fn get_file_hashes(&self) -> Result<HashMap<String, String>> {
-        self.read_conn.get_file_hashes()
+        self.open_read()?.get_file_hashes()
     }
     fn get_all_symbols(&self) -> Result<Vec<(String, String, String, String)>> {
-        self.read_conn.get_all_symbols()
+        self.open_read()?.get_all_symbols()
     }
     fn symbols_in_file(&self, file: &str) -> Result<Vec<SymbolRow>> {
-        self.read_conn.symbols_in_file(file)
+        self.open_read()?.symbols_in_file(file)
     }
     fn find_symbol_by_id(&self, id: &str) -> Result<Option<SymbolDetail>> {
-        self.read_conn.find_symbol_by_id(id)
+        self.open_read()?.find_symbol_by_id(id)
     }
     fn symbols_in_range(&self, file: &str, start: u32, end: u32) -> Result<Vec<SymbolDetail>> {
-        self.read_conn.symbols_in_range(file, start, end)
+        self.open_read()?.symbols_in_range(file, start, end)
     }
     fn skeleton(&self, file: &str) -> Result<String> {
-        self.read_conn.skeleton(file)
+        self.open_read()?.skeleton(file)
     }
     fn callers_of(&self, symbol_id: &str) -> Result<Vec<String>> {
-        self.read_conn.callers_of(symbol_id)
+        self.open_read()?.callers_of(symbol_id)
     }
     fn callees_of(&self, symbol_id: &str) -> Result<Vec<String>> {
-        self.read_conn.callees_of(symbol_id)
+        self.open_read()?.callees_of(symbol_id)
     }
     fn branches_of(&self, symbol_id: &str) -> Result<Vec<BranchInfo>> {
-        self.read_conn.branches_of(symbol_id)
+        self.open_read()?.branches_of(symbol_id)
     }
     fn transitive_impact(&self, id: &str, max_depth: u32) -> Result<Vec<ImpactRow>> {
-        self.read_conn.transitive_impact(id, max_depth)
+        self.open_read()?.transitive_impact(id, max_depth)
     }
     fn find_all_references(&self, id: &str) -> Result<Vec<ReferenceRow>> {
-        self.read_conn.find_all_references(id)
+        self.open_read()?.find_all_references(id)
     }
     fn cross_cutting_for(&self, id: &str) -> Result<Vec<(String, String)>> {
-        self.read_conn.cross_cutting_for(id)
+        self.open_read()?.cross_cutting_for(id)
     }
     fn get_api_surface(&self) -> Result<Vec<ApiSymbol>> {
-        self.read_conn.get_api_surface()
+        self.open_read()?.get_api_surface()
     }
     fn get_file_deps(&self, file: &str) -> Result<FileDeps> {
-        self.read_conn.get_file_deps(file)
+        self.open_read()?.get_file_deps(file)
     }
     fn get_type_hierarchy(&self, id: &str, max_depth: u32) -> Result<TypeHierarchy> {
-        self.read_conn.get_type_hierarchy(id, max_depth)
+        self.open_read()?.get_type_hierarchy(id, max_depth)
     }
     fn get_test_coverage(&self) -> Result<TestCoverage> {
-        self.read_conn.get_test_coverage()
+        self.open_read()?.get_test_coverage()
     }
     fn generate_test_context(
         &self,
@@ -117,38 +147,43 @@ impl GraphBackend for DaemonKuzuBackend {
         limit: usize,
         test_type: Option<&str>,
     ) -> Result<TestContext> {
-        self.read_conn
+        self.open_read()?
             .generate_test_context(file_filter, limit, test_type)
     }
     fn raw_query(&self, query: &str) -> Result<Vec<Vec<String>>> {
-        self.read_conn.raw_query(query)
+        self.open_read()?.raw_query(query)
     }
     fn get_symbols_for_search(&self) -> Result<Vec<Vec<String>>> {
-        self.read_conn.get_symbols_for_search()
+        self.open_read()?.get_symbols_for_search()
     }
     fn symbol_metadata(&self, id: &str) -> Result<Option<SymbolMeta>> {
-        self.read_conn.symbol_metadata(id)
+        self.open_read()?.symbol_metadata(id)
     }
     fn get_complexity_ranking(&self, file_filter: Option<&str>) -> Result<Vec<ComplexityRow>> {
-        self.read_conn.get_complexity_ranking(file_filter)
+        self.open_read()?.get_complexity_ranking(file_filter)
     }
     fn list_indexed_files(&self) -> Result<Vec<String>> {
-        self.read_conn.list_indexed_files()
+        self.open_read()?.list_indexed_files()
     }
     fn find_uncalled_symbols(&self) -> Result<Vec<DeadCodeRow>> {
-        self.read_conn.find_uncalled_symbols()
+        self.open_read()?.find_uncalled_symbols()
     }
     fn get_architecture_stats(&self) -> Result<ArchitectureStats> {
-        self.read_conn.get_architecture_stats()
+        self.open_read()?.get_architecture_stats()
     }
     fn symbols_with_docstring(
         &self,
         kind_filter: Option<&[&str]>,
     ) -> Result<Vec<SymbolWithDocstring>> {
-        self.read_conn.symbols_with_docstring(kind_filter)
+        self.open_read()?.symbols_with_docstring(kind_filter)
     }
+    /// `KuzuBackend` never overrides `repo_filter`; it inherits the trait
+    /// default, which is unconditionally `None` (Kuzu is single-repo by
+    /// design). Returning `None` directly is therefore behavior-identical to
+    /// delegating, and avoids both the pointless open and the borrow of a
+    /// connection that would drop at the end of this function.
     fn repo_filter(&self) -> Option<&str> {
-        self.read_conn.repo_filter()
+        None
     }
 
     // ── Tier 2: writes covered by WriteRequest route through the daemon

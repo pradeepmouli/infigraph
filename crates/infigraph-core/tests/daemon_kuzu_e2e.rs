@@ -229,32 +229,23 @@ fn index_and_index_files_route_through_the_daemon() {
 
 /// Read-after-write through the SAME long-lived wrapper instance.
 ///
-/// `DaemonKuzuBackend` opens one read-only `KuzuBackend` at construction and
-/// reuses it for every read. Every other test here verifies a daemon-side
-/// write through a *fresh* connection (deliberately, to rule out client-side
-/// caching), which leaves the question this test answers untested: does a
-/// commit made by the daemon process become visible to an already-open
-/// read-only connection in another process, without reopening it?
+/// Every other test here verifies a daemon-side write through a *fresh*
+/// connection (deliberately, to rule out client-side caching), which leaves
+/// the question this test answers untested: does a commit made by the daemon
+/// process become visible to a `DaemonKuzuBackend` constructed before that
+/// write happened?
 ///
 /// This matters for any code path that reads via the wrapper and writes via
 /// the daemon within one process -- e.g. `detect_config_bindings`,
 /// `detect_clusters`, `link_cross_service_calls`.
 ///
-/// KNOWN FAILING -- documents an unresolved architectural limitation, which
-/// is why it is `#[ignore]`d rather than deleted or weakened. The answer is
-/// NO: a Kuzu embedded read-only `Database` serves the snapshot it loaded at
-/// open time and does not observe another process's later commits. The
-/// assertion below is written as the behavior we *want*; running
-/// `cargo test -p infigraph-core --test daemon_kuzu_e2e -- --ignored` shows
-/// it failing with the independent-connection check above it passing, i.e.
-/// the write commits but the long-lived connection can't see it.
-///
-/// Deliberately NOT fixed here by reopening `read_conn` inside the wrapper's
-/// read methods -- that is a real design change (when to reopen, what it
-/// costs per read, whether reads should be `&mut self`) that needs its own
-/// consideration, not a silent patch smuggled into a review-fix round.
+/// It passes only because `DaemonKuzuBackend` opens a fresh read-only
+/// connection per read rather than holding one for its lifetime: a Kuzu
+/// embedded read-only `Database` serves the snapshot it loaded at open time
+/// and never observes another process's later commits, so a held connection
+/// would permanently miss every daemon write. See `open_read` in
+/// `daemon_kuzu_backend.rs`.
 #[test]
-#[ignore = "known limitation: daemon commits are invisible to an already-open read-only connection"]
 fn daemon_write_is_visible_through_the_same_wrapper_instance() {
     let project_dir = tempfile::tempdir().unwrap();
     std::fs::write(
@@ -297,7 +288,8 @@ fn daemon_write_is_visible_through_the_same_wrapper_instance() {
         "the daemon must have committed the write"
     );
 
-    // The actual question: same wrapper instance, same connection, no reopen.
+    // The actual question: the same wrapper instance, constructed before the
+    // write, must still see it.
     let same_instance = backend
         .raw_query("MATCH (c:ConfigBinding {key: 'SAME_INSTANCE_KEY'}) RETURN c.key")
         .unwrap();
@@ -307,7 +299,7 @@ fn daemon_write_is_visible_through_the_same_wrapper_instance() {
     assert_eq!(
         same_instance.len(),
         1,
-        "a daemon-committed write must be visible through the same long-lived \
-         DaemonKuzuBackend read connection without reopening it"
+        "a daemon-committed write must be visible through a DaemonKuzuBackend \
+         instance that was constructed before the write"
     );
 }
