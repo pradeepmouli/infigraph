@@ -1,6 +1,19 @@
 #!/bin/sh
 set -e
 
+# `cargo clippy --all-targets` alone forces a full workspace rebuild (100+
+# crates, including native lbug/kuzu builds) -- wasted work for a docs-only
+# change, and has repeatedly exhausted disk on machines running close to
+# their space limit. Skip the Rust checks entirely when every staged file
+# is documentation (under docs/, or any *.md).
+staged_files=$(git diff --cached --name-only --diff-filter=ACMR)
+non_docs=$(printf '%s\n' "$staged_files" | grep -v -E '^docs/|\.md$' || true)
+
+if [ -n "$staged_files" ] && [ -z "$non_docs" ]; then
+    echo 'pre-commit: docs-only change, skipping Rust checks'
+    exit 0
+fi
+
 echo '+cargo fmt -- --check'
 cargo fmt -- --check
 
