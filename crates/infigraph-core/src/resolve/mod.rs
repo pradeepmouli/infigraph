@@ -2,9 +2,10 @@ mod calls;
 pub(crate) mod inherits;
 
 pub use calls::*;
+use serde::{Deserialize, Serialize};
 
 /// Statistics from call/inheritance resolution.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResolveStats {
     pub total_calls: usize,
     pub resolved: usize,

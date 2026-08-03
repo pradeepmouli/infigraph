@@ -1,4 +1,5 @@
 use crate::graph::{CallsServiceEdge, CrossServiceEdgeCandidate};
+use crate::model::FileExtraction;
 use arrow::array::{RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use serde::{Deserialize, Serialize};
@@ -64,6 +65,35 @@ pub enum WriteRequest {
     StoreConfigBindings {
         bindings: Vec<crate::config::ConfigBindingWire>,
     },
+    /// Bulk-write already-parsed file extractions. The extractions live in a
+    /// JSON sibling file at `extractions_path`, following
+    /// `IngestStructured::Inline`'s pattern rather than Task 7/11's Arrow IPC
+    /// one: `FileExtraction` is three nested `Vec`s of structs that
+    /// themselves carry enums and `Option`s, so Arrow's flat columnar model
+    /// would need a hand-written flatten/rebuild pass per nested type, and a
+    /// silent mismatch between the two halves would corrupt the graph.
+    /// (`FileExtraction` also has no `PartialEq`, which this enum derives, so
+    /// it could not ride inline here regardless.)
+    UpsertFilesBulk {
+        extractions_path: PathBuf,
+        existing_hashes_empty: bool,
+    },
+    /// Remove files from the graph. `Vec` rather than a single path so
+    /// pruning a batch of stale files is expressible as one round-trip;
+    /// `GraphBackend` has no bulk-remove primitive, so the handler loops
+    /// `remove_file` per entry, matching `StoreConfigBindings`'s handler.
+    RemoveFiles { files: Vec<String> },
+    /// Resolve calls/inheritance for already-parsed extractions, which ride
+    /// in a JSON sibling file for the same reason as `UpsertFilesBulk`.
+    /// `use_learned` is a flag, not a payload: `LearnedStore` is disk-backed
+    /// at `.infigraph/learned/patterns.json` under the project root the
+    /// daemon is already running in, so it loads its own -- the same
+    /// "the daemon has local context, don't transmit it" choice behind
+    /// `IngestStructured` carrying a `schema_id` instead of a `SchemaMeta`.
+    ResolveCalls {
+        extractions_path: PathBuf,
+        use_learned: bool,
+    },
 }
 
 /// Where IngestStructured's data comes from. `Inline` carries no data
@@ -93,6 +123,9 @@ pub enum WriteResult {
     /// Real cluster stats -- `Ok`'s two usize fields can't represent
     /// ClusterStats's num_clusters/cluster_sizes/modularity without losing data.
     ClustersOk(crate::cluster::ClusterStats),
+    /// Real resolve stats -- `Ok`'s two usize fields can't represent
+    /// ResolveStats's five counters without losing data.
+    ResolveOk(crate::resolve::ResolveStats),
     Err {
         message: String,
     },
@@ -575,6 +608,67 @@ pub fn serve_one_request(infigraph: &Infigraph, request_path: &Path) -> anyhow::
                     message: "graph not initialized".to_string(),
                 },
             },
+            WriteRequest::UpsertFilesBulk {
+                extractions_path,
+                existing_hashes_empty,
+            } => match read_extractions_json(extractions_path).and_then(|extractions| {
+                infigraph
+                    .backend()
+                    .ok_or_else(|| anyhow::anyhow!("graph not initialized"))
+                    .and_then(|b| {
+                        b.upsert_files_bulk(&extractions, *existing_hashes_empty)
+                            .map(|()| extractions.len())
+                    })
+            }) {
+                Ok(written) => {
+                    std::fs::remove_file(extractions_path).ok();
+                    WriteResult::Ok {
+                        total_files: written,
+                        indexed_files: written,
+                    }
+                }
+                Err(e) => WriteResult::Err {
+                    message: e.to_string(),
+                },
+            },
+            WriteRequest::RemoveFiles { files } => match infigraph.backend() {
+                Some(b) => match files.iter().try_for_each(|f| b.remove_file(f)) {
+                    Ok(()) => WriteResult::Ok {
+                        total_files: files.len(),
+                        indexed_files: files.len(),
+                    },
+                    Err(e) => WriteResult::Err {
+                        message: e.to_string(),
+                    },
+                },
+                None => WriteResult::Err {
+                    message: "graph not initialized".to_string(),
+                },
+            },
+            WriteRequest::ResolveCalls {
+                extractions_path,
+                use_learned,
+            } => {
+                // Loaded here, not shipped in the request: the daemon runs in
+                // the same project root, so it reads the same
+                // .infigraph/learned/patterns.json the client would have.
+                let learned =
+                    use_learned.then(|| crate::learned::LearnedStore::load(infigraph.root()));
+                match read_extractions_json(extractions_path).and_then(|extractions| {
+                    infigraph
+                        .backend()
+                        .ok_or_else(|| anyhow::anyhow!("graph not initialized"))
+                        .and_then(|b| b.resolve_calls(&extractions, learned.as_ref()))
+                }) {
+                    Ok(stats) => {
+                        std::fs::remove_file(extractions_path).ok();
+                        WriteResult::ResolveOk(stats)
+                    }
+                    Err(e) => WriteResult::Err {
+                        message: e.to_string(),
+                    },
+                }
+            }
         },
         Err(e) => WriteResult::Err {
             message: format!("failed to read/parse request: {e}"),
@@ -648,6 +742,19 @@ pub fn write_ingest_inline_sibling(
     let sibling_path = request_path.with_extension("data.json");
     write_atomic(&sibling_path, &serde_json::to_string(data)?)?;
     Ok(sibling_path)
+}
+
+/// Writes `extractions` as a JSON sibling file at `path`, for
+/// `UpsertFilesBulk`/`ResolveCalls`. Not Arrow IPC -- see
+/// `WriteRequest::UpsertFilesBulk`'s doc comment for why this payload takes
+/// the JSON-sibling route the Arrow write paths deliberately don't.
+pub fn write_extractions_json(path: &Path, extractions: &[FileExtraction]) -> anyhow::Result<()> {
+    write_atomic(path, &serde_json::to_string(extractions)?)
+}
+
+/// Reads extractions back from a file written by `write_extractions_json`.
+pub fn read_extractions_json(path: &Path) -> anyhow::Result<Vec<FileExtraction>> {
+    Ok(serde_json::from_str(&std::fs::read_to_string(path)?)?)
 }
 
 fn calls_service_edges_schema() -> Arc<Schema> {

@@ -80,6 +80,14 @@ impl DaemonKuzuBackend {
     fn staging_dir(&self) -> std::path::PathBuf {
         self.root.join(".infigraph").join("requests")
     }
+
+    /// Budget for the two whole-index-sized writes (`upsert_files_bulk`,
+    /// `resolve_calls`). A full first index of a large repo puts every file's
+    /// extraction through one of these, and the daemon only writes its
+    /// `.result` once the whole batch commits -- matching the 600s
+    /// `Infigraph::index()` allows for the same work under the
+    /// `INFIGRAPH_INDEX_VIA_DAEMON` path.
+    const BULK_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 }
 
 // clear_all_data is deliberately left un-overridden: the trait's own
@@ -216,19 +224,61 @@ impl GraphBackend for DaemonKuzuBackend {
     }
     fn upsert_files_bulk(
         &self,
-        _extractions: &[FileExtraction],
-        _existing_hashes_empty: bool,
+        extractions: &[FileExtraction],
+        existing_hashes_empty: bool,
     ) -> Result<()> {
-        Err(Self::not_supported(
-            "upsert_files_bulk",
-            "Infigraph::index()/index_files()",
-        ))
+        if extractions.is_empty() {
+            return Ok(());
+        }
+        let staging_dir = self.staging_dir();
+        std::fs::create_dir_all(&staging_dir)?;
+        let name = crate::daemon_protocol::generate_request_name();
+        let extractions_path = staging_dir.join(format!("{name}.extractions.json"));
+        crate::daemon_protocol::write_extractions_json(&extractions_path, extractions)?;
+
+        let request = crate::daemon_protocol::WriteRequest::UpsertFilesBulk {
+            extractions_path: extractions_path.clone(),
+            existing_hashes_empty,
+        };
+        match crate::daemon_protocol::submit_write_request_named(
+            &staging_dir,
+            &name,
+            &request,
+            Self::BULK_WRITE_TIMEOUT,
+        ) {
+            Ok(crate::daemon_protocol::WriteResult::Ok { .. }) => Ok(()),
+            Ok(crate::daemon_protocol::WriteResult::Err { message }) => {
+                Err(anyhow::anyhow!(message))
+            }
+            Ok(other) => Err(anyhow::anyhow!(
+                "unexpected WriteResult for UpsertFilesBulk: {other:?}"
+            )),
+            Err(e) => {
+                std::fs::remove_file(&extractions_path).ok(); // clean up on timeout -- the daemon never consumed it
+                Err(e)
+            }
+        }
     }
-    fn remove_file(&self, _file: &str) -> Result<()> {
-        Err(Self::not_supported(
-            "remove_file",
-            "Infigraph::index()/index_files() (internal only)",
-        ))
+    /// Sends a one-element `RemoveFiles` batch. The trait's per-file
+    /// signature is what forces one round-trip per file here; the request
+    /// itself is already batch-shaped, so a future bulk caller needs no
+    /// protocol change.
+    fn remove_file(&self, file: &str) -> Result<()> {
+        let staging_dir = self.staging_dir();
+        let request = crate::daemon_protocol::WriteRequest::RemoveFiles {
+            files: vec![file.to_string()],
+        };
+        match crate::daemon_protocol::submit_write_request(
+            &staging_dir,
+            &request,
+            std::time::Duration::from_secs(60),
+        )? {
+            crate::daemon_protocol::WriteResult::Ok { .. } => Ok(()),
+            crate::daemon_protocol::WriteResult::Err { message } => Err(anyhow::anyhow!(message)),
+            other => Err(anyhow::anyhow!(
+                "unexpected WriteResult for RemoveFiles: {other:?}"
+            )),
+        }
     }
     fn derive_tested_by_edges(&self, changed_files: Option<&[&str]>) -> Result<usize> {
         let staging_dir = self.staging_dir();
@@ -300,13 +350,40 @@ impl GraphBackend for DaemonKuzuBackend {
     }
     fn resolve_calls(
         &self,
-        _extractions: &[FileExtraction],
-        _learned: Option<&LearnedStore>,
+        extractions: &[FileExtraction],
+        learned: Option<&LearnedStore>,
     ) -> Result<ResolveStats> {
-        Err(Self::not_supported(
-            "resolve_calls",
-            "Infigraph::index()/index_files() (internal only)",
-        ))
+        let staging_dir = self.staging_dir();
+        std::fs::create_dir_all(&staging_dir)?;
+        let name = crate::daemon_protocol::generate_request_name();
+        let extractions_path = staging_dir.join(format!("{name}.extractions.json"));
+        crate::daemon_protocol::write_extractions_json(&extractions_path, extractions)?;
+
+        let request = crate::daemon_protocol::WriteRequest::ResolveCalls {
+            extractions_path: extractions_path.clone(),
+            // Only the caller's intent travels; the daemon loads the store
+            // itself. A caller passing `None` still gets no learned patterns
+            // applied, so this is not a silent behavior change.
+            use_learned: learned.is_some(),
+        };
+        match crate::daemon_protocol::submit_write_request_named(
+            &staging_dir,
+            &name,
+            &request,
+            Self::BULK_WRITE_TIMEOUT,
+        ) {
+            Ok(crate::daemon_protocol::WriteResult::ResolveOk(stats)) => Ok(stats),
+            Ok(crate::daemon_protocol::WriteResult::Err { message }) => {
+                Err(anyhow::anyhow!(message))
+            }
+            Ok(other) => Err(anyhow::anyhow!(
+                "unexpected WriteResult for ResolveCalls: {other:?}"
+            )),
+            Err(e) => {
+                std::fs::remove_file(&extractions_path).ok(); // clean up on timeout -- the daemon never consumed it
+                Err(e)
+            }
+        }
     }
     fn re_resolve_for_files(
         &self,

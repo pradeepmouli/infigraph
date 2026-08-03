@@ -1,6 +1,7 @@
 use infigraph_core::config::ConfigBindingWire;
 use infigraph_core::daemon_protocol::{
-    serve_one_request, write_atomic, IngestSource, WriteRequest, WriteResult,
+    serve_one_request, write_atomic, write_extractions_json, IngestSource, WriteRequest,
+    WriteResult,
 };
 use infigraph_core::manifest::{DepEntry, ManifestResult};
 use infigraph_core::Infigraph;
@@ -623,5 +624,117 @@ fn serve_one_request_handles_derive_tested_by() {
         WriteResult::Ok { .. } => {}
         WriteResult::Err { message } => panic!("expected Ok, got Err: {message}"),
         other => panic!("unexpected WriteResult for DeriveTestedBy: {other:?}"),
+    }
+}
+
+fn file_in_graph(infigraph: &Infigraph, file: &str) -> bool {
+    !infigraph
+        .backend()
+        .unwrap()
+        .raw_query(&format!("MATCH (f:File) WHERE f.id = '{file}' RETURN f.id"))
+        .unwrap()
+        .is_empty()
+}
+
+/// The three write paths that carry already-parsed `FileExtraction`s.
+///
+/// Driven with real extractions from a real index rather than hand-built
+/// structs, so this also covers the round-trip fidelity the JSON-sibling
+/// choice rests on: `FileExtraction` is three nested `Vec`s of structs that
+/// themselves carry enums and `Option`s, which is exactly why these do not
+/// use the Arrow IPC sibling format the flat edge-writing paths use.
+#[test]
+fn serve_one_request_handles_the_extraction_carrying_writes() {
+    let project_dir = tempfile::tempdir().unwrap();
+    // Deliberately a CROSS-file call: `ResolveStats::total_calls` counts
+    // calls still dangling after extraction, and a same-file call is already
+    // resolved by then (see tests/resolve_calls.rs), so a single-file fixture
+    // would report zero and assert nothing.
+    std::fs::write(
+        project_dir.path().join("helpers.py"),
+        "def helper():\n    pass\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project_dir.path().join("main.py"),
+        "from helpers import helper\n\n\ndef caller():\n    helper()\n",
+    )
+    .unwrap();
+
+    let registry = bundled_registry().unwrap();
+    let mut infigraph = Infigraph::open(project_dir.path(), registry).unwrap();
+    infigraph.init().unwrap();
+    let indexed = infigraph.index().unwrap();
+    assert_eq!(
+        indexed.extractions.len(),
+        2,
+        "expected both files to be parsed"
+    );
+
+    let staging_dir = project_dir.path().join(".infigraph").join("requests");
+    std::fs::create_dir_all(&staging_dir).unwrap();
+
+    // RemoveFiles takes the file back out...
+    let request_path = staging_dir.join("remove.request");
+    write_atomic(
+        &request_path,
+        &serde_json::to_string(&WriteRequest::RemoveFiles {
+            files: vec!["main.py".to_string()],
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    serve_one_request(&infigraph, &request_path).unwrap();
+    assert!(
+        !file_in_graph(&infigraph, "main.py"),
+        "RemoveFiles must have deleted the File node"
+    );
+
+    // ...and UpsertFilesBulk puts it back, from the JSON sibling alone.
+    let request_path = staging_dir.join("bulk.request");
+    let extractions_path = staging_dir.join("bulk.extractions.json");
+    write_extractions_json(&extractions_path, &indexed.extractions).unwrap();
+    write_atomic(
+        &request_path,
+        &serde_json::to_string(&WriteRequest::UpsertFilesBulk {
+            extractions_path: extractions_path.clone(),
+            existing_hashes_empty: false,
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    serve_one_request(&infigraph, &request_path).unwrap();
+    assert!(
+        file_in_graph(&infigraph, "main.py"),
+        "UpsertFilesBulk must have restored the File node from the sibling file"
+    );
+    assert!(
+        !extractions_path.exists(),
+        "the handler must clean up the sibling file it consumed"
+    );
+
+    // ResolveCalls must report real stats, not `Ok`'s two lossy counters.
+    let request_path = staging_dir.join("resolve.request");
+    let extractions_path = staging_dir.join("resolve.extractions.json");
+    write_extractions_json(&extractions_path, &indexed.extractions).unwrap();
+    write_atomic(
+        &request_path,
+        &serde_json::to_string(&WriteRequest::ResolveCalls {
+            extractions_path,
+            use_learned: false,
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    serve_one_request(&infigraph, &request_path).unwrap();
+    let result: WriteResult =
+        serde_json::from_str(&std::fs::read_to_string(staging_dir.join("resolve.result")).unwrap())
+            .unwrap();
+    match result {
+        WriteResult::ResolveOk(stats) => assert!(
+            stats.total_calls > 0,
+            "caller() calls helper(), so resolution must see at least one call: {stats:?}"
+        ),
+        other => panic!("expected ResolveOk, got {other:?}"),
     }
 }
