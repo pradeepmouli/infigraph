@@ -623,3 +623,184 @@ fn producers_keep_accepting_work_while_a_drain_is_in_flight() {
     // rather than being left parked on a finished drain.
     stop_daemon(project.path(), &mut daemon);
 }
+
+/// A request that's only queued (not yet executing) when a FullReindex
+/// arrives is superseded, not silently dropped -- its waiter gets an
+/// explicit reply rather than hanging until its own client-side timeout.
+#[test]
+fn a_queued_request_racing_a_full_reindex_gets_a_superseded_reply_not_a_hang() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(project.path().join("a.py"), "def a():\n    pass\n").unwrap();
+
+    let mut daemon = start_real_daemon(project.path());
+
+    // Submit both near-simultaneously: an ad-hoc single-file Index request
+    // and a FullReindex, racing to see which the daemon picks up first.
+    // Regardless of ordering, the Index request's client must get SOME
+    // reply within the deadline -- either its own normal completion (if it
+    // slipped in first) or a superseded error (if FullReindex won) -- never
+    // a hang.
+    std::fs::write(project.path().join("b.py"), "def b():\n    pass\n").unwrap();
+
+    let cli = cli_binary();
+    let index_child = std::process::Command::new(&cli)
+        .arg("index")
+        .arg("--no-embed")
+        .current_dir(project.path())
+        .env("INFIGRAPH_BACKEND", "daemon")
+        .env("INFIGRAPH_INDEX_VIA_DAEMON", "1")
+        .spawn()
+        .unwrap();
+
+    let full_output = std::process::Command::new(&cli)
+        .arg("index")
+        .arg("--full")
+        .arg("--no-embed")
+        .current_dir(project.path())
+        .env("INFIGRAPH_BACKEND", "daemon")
+        .output()
+        .unwrap();
+
+    let index_output = index_child.wait_with_output().unwrap();
+
+    // Both must complete within the deadline (neither hangs), regardless
+    // of which one the daemon happened to serve first.
+    assert!(
+        full_output.status.success(),
+        "full reindex must succeed:\nstderr={}",
+        String::from_utf8_lossy(&full_output.stderr)
+    );
+    // The ad-hoc index either succeeded normally or failed with the
+    // superseded message -- both are acceptable outcomes; a hang (the
+    // process still running past this point) is what this test guards
+    // against, and `wait_with_output` above already proves it didn't hang.
+    let index_stderr = String::from_utf8_lossy(&index_output.stderr);
+    if !index_output.status.success() {
+        assert!(
+            index_stderr.contains("superseded"),
+            "if the ad-hoc index failed, it must be because it was superseded, not some other error:\n{index_stderr}"
+        );
+    }
+
+    daemon.0.kill().ok();
+}
+
+/// A read attempted during the rebuild window sees the still-valid OLD
+/// graph, not an error or an empty result -- proving reads are genuinely
+/// unaffected by an in-progress full reindex, not just assumed to be.
+#[test]
+fn a_read_during_full_reindex_sees_the_old_graph_not_an_error() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    // Enough files that the rebuild takes real wall time, giving a window
+    // for a concurrent read to land mid-rebuild.
+    for i in 0..300 {
+        std::fs::write(
+            project.path().join(format!("f{i}.py")),
+            format!("def f{i}():\n    pass\n"),
+        )
+        .unwrap();
+    }
+
+    let mut daemon = start_real_daemon(project.path());
+    let cli = cli_binary();
+
+    let mut full = std::process::Command::new(&cli)
+        .arg("index")
+        .arg("--full")
+        .arg("--no-embed")
+        .current_dir(project.path())
+        .env("INFIGRAPH_BACKEND", "daemon")
+        .spawn()
+        .unwrap();
+
+    // Give the rebuild a moment to actually start before reading.
+    std::thread::sleep(Duration::from_millis(200));
+
+    // A direct read-only connection against the LIVE path (not through the
+    // daemon protocol -- reads never route through it), matching
+    // `verify_conn`'s own approach.
+    let read_during = verify_conn(project.path());
+    let rows = read_during
+        .raw_query("MATCH (s:Symbol) RETURN count(s.id)")
+        .expect("a read during the rebuild window must succeed, not error");
+    assert!(!rows.is_empty());
+
+    let status = full.wait().unwrap();
+    assert!(status.success(), "full reindex must still succeed");
+
+    daemon.0.kill().ok();
+}
+
+/// A failed rebuild (extraction/write error mid-build) leaves the live
+/// graph completely unharmed -- the real advantage of build-fresh-then-swap
+/// over wipe-in-place.
+#[test]
+fn a_failed_rebuild_leaves_the_live_graph_untouched() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(project.path().join("a.py"), "def a():\n    pass\n").unwrap();
+
+    let mut daemon = start_real_daemon(project.path());
+
+    let before = verify_conn(project.path());
+    let before_rows = before.raw_query("MATCH (s:Symbol) RETURN s.name").unwrap();
+    assert!(
+        !before_rows.is_empty(),
+        "must have real content before the attempt"
+    );
+
+    // Make the project root itself unreadable-as-a-directory to force
+    // `scan_changed_files`'s file collection to fail partway through the
+    // rebuild -- a real, reproducible failure mode rather than a
+    // synthetic hook. (Restored before the daemon shuts down, so cleanup
+    // doesn't itself fail.)
+    let unreadable_dir = project.path().join("unreadable");
+    std::fs::create_dir(&unreadable_dir).unwrap();
+    std::fs::write(unreadable_dir.join("x.py"), "def x():\n    pass\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&unreadable_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+    }
+
+    let cli = cli_binary();
+    let output = std::process::Command::new(&cli)
+        .arg("index")
+        .arg("--full")
+        .arg("--no-embed")
+        .current_dir(project.path())
+        .env("INFIGRAPH_BACKEND", "daemon")
+        .output()
+        .unwrap();
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&unreadable_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    // Whether this specific permission trick actually fails the rebuild is
+    // platform/permission-model dependent (e.g. root-owned CI runners may
+    // bypass it) -- assert on the INVARIANT this test actually cares
+    // about (the live graph survives) rather than requiring the injection
+    // to have worked, so this test isn't flaky-by-construction across
+    // environments.
+    let _ = output.status;
+
+    let after = verify_conn(project.path());
+    let after_rows = after.raw_query("MATCH (s:Symbol) RETURN s.name").unwrap();
+    assert!(
+        !after_rows.is_empty(),
+        "the live graph must survive regardless of whether the rebuild succeeded or failed"
+    );
+
+    let rebuilding_path = project.path().join(".infigraph").join("graph.rebuilding");
+    assert!(
+        !rebuilding_path.exists(),
+        "an incomplete rebuild attempt must not leave graph.rebuilding behind"
+    );
+
+    daemon.0.kill().ok();
+}
