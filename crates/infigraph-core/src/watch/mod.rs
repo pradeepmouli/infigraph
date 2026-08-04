@@ -809,8 +809,9 @@ fn serve_request_locked<MR>(
 /// completely untouched and fully readable throughout (reads already
 /// reopen a fresh connection per call, so they transparently keep hitting
 /// the still-valid old graph right up until the swap). On success,
-/// atomically swaps the two directories in and quarantines the old one
-/// (`crate::quarantine::quarantine_graph`) rather than deleting it. See
+/// atomically swaps the two directories in and retires the old one into a
+/// bounded rollback pool (`crate::quarantine::retire_previous_graph`)
+/// rather than deleting it. See
 /// docs/superpowers/specs/2026-08-04-daemon-routed-full-reindex-design.md.
 fn serve_full_reindex_request<MR>(
     root: &Path,
@@ -866,17 +867,25 @@ fn serve_full_reindex_request<MR>(
         }
     }
 
+    const LIVE_NAME: &str = "graph";
+    const REBUILDING_NAME: &str = "graph.rebuilding";
+
     let infigraph_dir = root.join(".infigraph");
-    let rebuilding_path = infigraph_dir.join("graph.rebuilding");
-    let live_path = infigraph_dir.join("graph");
+    let rebuilding_path = infigraph_dir.join(REBUILDING_NAME);
+    let live_path = infigraph_dir.join(LIVE_NAME);
 
     // Clean up any stale leftover from a previously-interrupted rebuild
     // attempt (e.g. the daemon was killed mid-rebuild last time) before
-    // starting a new one.
-    if rebuilding_path.exists() {
-        let _ = std::fs::remove_dir_all(&rebuilding_path);
-        let _ = std::fs::remove_file(&rebuilding_path);
-    }
+    // starting a new one. Unconditional, and covering the WAL family as
+    // well as the base image: a surviving `graph.rebuilding.wal*` carries
+    // the dead database's ID and makes the fresh `graph.rebuilding` we're
+    // about to create permanently unopenable, which would wedge every
+    // future full reindex. Guarding this on the *base* image existing is
+    // exactly wrong -- the wedged state is "base already deleted, WAL
+    // sibling still there".
+    let _ = std::fs::remove_dir_all(&rebuilding_path);
+    let _ = std::fs::remove_file(&rebuilding_path);
+    crate::graph::remove_wal_family(&rebuilding_path);
 
     let registry = match make_registry() {
         Ok(r) => r,
@@ -903,6 +912,17 @@ fn serve_full_reindex_request<MR>(
                 backend.upsert_files_bulk(&scan.extractions, true)?;
             }
             let resolve_stats = backend.resolve_calls(&scan.extractions, None)?;
+            // The swap replaces the graph wholesale, so whatever TESTED_BY
+            // edges the live graph had are about to be discarded -- derive
+            // them here or they are gone for good. Nothing downstream will
+            // recover them: the CLI's own derivation is gated on
+            // `indexed_files > 0`, and after a fresh full rebuild every file
+            // hash matches, so the next ordinary index also skips it. `None`
+            // scope means "everything", matching how the local `--full` path
+            // calls it. Non-fatal, mirroring that path's warn-and-continue.
+            if let Err(e) = backend.derive_tested_by_edges(None) {
+                eprintln!("[daemon] full-reindex: TESTED_BY derivation failed: {e}");
+            }
             Ok((scan.extractions.len(), resolve_stats))
         });
 
@@ -913,24 +933,65 @@ fn serve_full_reindex_request<MR>(
             // the daemon's own handle and swap.
             poison_watch_db(held);
 
-            // Bind the quarantine destination rather than discarding it --
-            // if quarantine succeeds but the rename below fails, `live_path`
-            // no longer exists (it's now this destination), so an error
-            // message that names `live_path` would point an operator at a
-            // path that's already gone and never say where the real data
-            // actually went.
-            let quarantined_path: Option<PathBuf> = if live_path.exists() {
-                match crate::quarantine::quarantine_graph(&infigraph_dir, "graph") {
+            // Replacing the live graph on disk is a graph-level write, so
+            // it takes the same advisory lock every writer takes --
+            // `index.lock` (held by `guard`) does not cover writers that
+            // only take `graph.lock`, notably `init()`'s corruption-retry
+            // calling `wipe_graph`. Scoped narrowly to the destructive
+            // section, matching `wipe_graph`: the reopen further down
+            // re-acquires this same lock through `GraphStore`, so holding
+            // it any wider would deadlock against ourselves.
+            let graph_lock = match crate::lockfile::acquire(
+                &live_path.with_extension("lock"),
+                "full-reindex-swap",
+                Duration::from_secs(5),
+            ) {
+                Ok(l) => l,
+                Err(e) => {
+                    // Nothing destructive has happened yet -- same
+                    // leave-everything-where-it-is shape as the
+                    // quarantine-failure branch below.
+                    let result = crate::daemon_protocol::WriteResult::Err {
+                        message: format!(
+                            "full reindex rebuilt successfully but could not take the graph \
+                             write lock to swap it in: {e:#}. The live graph at {} was left \
+                             untouched; the rebuilt graph remains at {}",
+                            live_path.display(),
+                            rebuilding_path.display()
+                        ),
+                    };
+                    if let Ok(json) = serde_json::to_string(&result) {
+                        let _ = crate::daemon_protocol::write_atomic(&reply_path, &json);
+                    }
+                    std::fs::remove_file(path).ok();
+                    drop(guard);
+                    return;
+                }
+            };
+
+            // Bind the retirement destination rather than discarding it --
+            // if the move-aside succeeds but the rename below fails,
+            // `live_path` no longer exists (it's now this destination), so
+            // an error message that names `live_path` would point an
+            // operator at a path that's already gone and never say where
+            // the real data actually went.
+            let retired_path: Option<PathBuf> = if live_path.exists() {
+                // A healthy superseded graph goes into its own bounded
+                // rollback pool, NOT the corruption-quarantine pool --
+                // that one exists to preserve corruption evidence for
+                // human diagnosis (R3.1.2), and routine full reindexes
+                // filing healthy graphs into it would evict real evidence.
+                match crate::quarantine::retire_previous_graph(&infigraph_dir, LIVE_NAME) {
                     Ok(dest) => Some(dest),
                     Err(e) => {
-                        // Quarantine itself failed -- `live_path` was never
+                        // Retiring itself failed -- `live_path` was never
                         // touched, so it's still there and still valid.
                         // Same early-reply-and-cleanup shape as the
                         // registry-build-failure branch above.
                         let result = crate::daemon_protocol::WriteResult::Err {
                             message: format!(
-                                "full reindex rebuilt successfully but could not quarantine \
-                                 the old graph: {e:#}. The live graph at {} was left \
+                                "full reindex rebuilt successfully but could not move the old \
+                                 graph aside: {e:#}. The live graph at {} was left \
                                  untouched; the rebuilt graph remains at {}",
                                 live_path.display(),
                                 rebuilding_path.display()
@@ -939,16 +1000,49 @@ fn serve_full_reindex_request<MR>(
                         if let Ok(json) = serde_json::to_string(&result) {
                             let _ = crate::daemon_protocol::write_atomic(&reply_path, &json);
                         }
+                        drop(graph_lock);
                         std::fs::remove_file(path).ok();
                         drop(guard);
                         return;
                     }
                 }
             } else {
+                // No base image to retire, but a `graph.wal*` family can
+                // still be sitting there orphaned (e.g. an earlier crash
+                // took the base but not its siblings). Renaming the
+                // rebuilt graph on top of a foreign-ID WAL would make the
+                // graph we just swapped in unopenable.
+                crate::graph::remove_wal_family(&live_path);
                 None
             };
 
-            match std::fs::rename(&rebuilding_path, &live_path) {
+            let swap = std::fs::rename(&rebuilding_path, &live_path);
+            if swap.is_ok() {
+                // The base image moved; its WAL-family siblings have to
+                // follow it or a not-yet-checkpointed WAL belonging to the
+                // graph we just swapped in is lost -- and worse, it stays
+                // behind at the rebuild path for a later reindex to
+                // inherit. Same rename-then-copy fallback the retirement
+                // path uses, for the same reason: a silent failure here
+                // leaves a foreign WAL where it does damage.
+                for src in crate::graph::wal_family_paths(&rebuilding_path) {
+                    let name = src.file_name().unwrap_or_default().to_string_lossy();
+                    let suffix = name.strip_prefix(REBUILDING_NAME).unwrap_or(&name);
+                    let dest = infigraph_dir.join(format!("{LIVE_NAME}{suffix}"));
+                    if let Err(e) = crate::quarantine::move_wal_sibling(&src, &dest) {
+                        eprintln!(
+                            "[daemon] full-reindex: could not carry WAL sibling {} across to {} \
+                             ({e:#}) -- the swapped-in graph may be missing uncheckpointed \
+                             writes; the leftover is cleaned up by the next full reindex",
+                            src.display(),
+                            dest.display()
+                        );
+                    }
+                }
+            }
+            drop(graph_lock);
+
+            match swap {
                 Ok(()) => {
                     // Reopen and reconcile embeddings against the NEW
                     // graph -- update_embeddings queries the live symbol
@@ -974,12 +1068,12 @@ fn serve_full_reindex_request<MR>(
                 Err(e) => {
                     // The rebuilt graph is verified-good and still sitting
                     // at `rebuilding_path` -- nothing was lost. Report the
-                    // old graph's real current location: wherever
-                    // quarantine actually put it, or "no prior graph" if
-                    // this was a from-scratch build.
-                    let old_graph_location = match &quarantined_path {
-                        Some(q) => format!("the old graph was quarantined to {}", q.display()),
-                        None => "there was no prior graph to quarantine".to_string(),
+                    // old graph's real current location: wherever it was
+                    // moved aside to, or "no prior graph" if this was a
+                    // from-scratch build.
+                    let old_graph_location = match &retired_path {
+                        Some(q) => format!("the old graph was moved aside to {}", q.display()),
+                        None => "there was no prior graph to move aside".to_string(),
                     };
                     eprintln!(
                         "[daemon] full-reindex swap failed after a successful rebuild: {e} \
@@ -1004,8 +1098,12 @@ fn serve_full_reindex_request<MR>(
             // The live graph was never touched -- clean up the incomplete
             // rebuild attempt and reply with the failure. The daemon keeps
             // serving the old (still fully valid) graph exactly as before.
+            // The WAL family goes with the base image: leaving a
+            // `graph.rebuilding.wal*` behind hands the next attempt a
+            // foreign-ID WAL to trip over.
             let _ = std::fs::remove_dir_all(&rebuilding_path);
             let _ = std::fs::remove_file(&rebuilding_path);
+            crate::graph::remove_wal_family(&rebuilding_path);
             let result = crate::daemon_protocol::WriteResult::Err {
                 message: format!("full reindex failed: {e:#}"),
             };

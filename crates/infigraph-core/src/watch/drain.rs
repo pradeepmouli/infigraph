@@ -375,19 +375,145 @@ mod tests {
             "rebuilt graph must not contain the old symbol"
         );
 
-        let quarantine_entries: Vec<_> = fs::read_dir(root.join(".infigraph"))
+        let aside: Vec<String> = fs::read_dir(root.join(".infigraph"))
             .unwrap()
             .flatten()
-            .filter(|e| {
-                e.file_name()
-                    .to_string_lossy()
-                    .starts_with("graph.corrupt.")
-            })
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("graph.previous.") || n.starts_with("graph.corrupt."))
             .collect();
         assert_eq!(
-            quarantine_entries.len(),
+            aside.len(),
             1,
-            "the old graph must be quarantined (renamed aside), not deleted"
+            "the old graph must be moved aside (renamed), not deleted: {aside:?}"
+        );
+        assert!(
+            aside[0].starts_with("graph.previous."),
+            "a healthy superseded graph must go to the rollback pool, not the \
+             corruption-evidence pool: {aside:?}"
+        );
+    }
+
+    /// Regression coverage for the WAL-family half of the final review's C1:
+    /// a rebuild interrupted by a SIGKILL can leave `graph.rebuilding.wal*`
+    /// behind with its own (now dead) database ID. The stale-leftover cleanup
+    /// used to be gated on the *base image* existing and only removed that,
+    /// so a surviving WAL sibling was never cleaned -- and a fresh
+    /// `graph.rebuilding` created beside it is permanently unopenable
+    /// ("Database ID ... does not match"), wedging every future full reindex
+    /// with no self-healing path. This test seeds exactly that state: a WAL
+    /// sibling with NO base image, which is what the old guard skipped.
+    #[test]
+    fn full_reindex_clears_a_stale_rebuilding_wal_left_by_an_interrupted_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("a.py"), "def a():\n    pass\n").unwrap();
+
+        let prism = open_project(root);
+        prism.index().unwrap();
+
+        let infigraph_dir = root.join(".infigraph");
+        let stale_wal = infigraph_dir.join("graph.rebuilding.wal");
+        let stale_checkpoint = infigraph_dir.join("graph.rebuilding.wal.checkpoint");
+        fs::write(&stale_wal, b"a dead database's write-ahead log").unwrap();
+        fs::write(&stale_checkpoint, b"and its checkpoint temp file").unwrap();
+        assert!(
+            !infigraph_dir.join("graph.rebuilding").exists(),
+            "the interesting case is a WAL sibling with no base image"
+        );
+
+        let queue = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::watch::queue::IndexWorkQueue::new(),
+        ));
+        let mut held: Option<std::sync::Arc<crate::Infigraph>> = None;
+        let make_registry = || Ok(python_registry());
+
+        let request_path = infigraph_dir.join("fullreindex.request");
+        fs::write(
+            &request_path,
+            serde_json::to_string(&crate::daemon_protocol::WriteRequest::FullReindex).unwrap(),
+        )
+        .unwrap();
+
+        crate::watch::serve_full_reindex_request(
+            root,
+            &request_path,
+            &queue,
+            &make_registry,
+            &mut held,
+            false,
+        );
+
+        let reply: crate::daemon_protocol::WriteResult = serde_json::from_str(
+            &fs::read_to_string(request_path.with_extension("result")).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            matches!(reply, crate::daemon_protocol::WriteResult::Ok { .. }),
+            "a stale WAL leftover must not wedge the reindex, got {reply:?}"
+        );
+        assert!(
+            !stale_wal.exists() && !stale_checkpoint.exists(),
+            "the stale WAL family must be cleaned up, not left for the next run to inherit"
+        );
+    }
+
+    /// Regression coverage for the final review's I2: the swap replaces the
+    /// graph wholesale, so TESTED_BY edges the live graph held are destroyed.
+    /// Nothing downstream restores them -- the CLI's own derivation is gated
+    /// on `indexed_files > 0`, and after a full rebuild every file hash
+    /// matches, so the next ordinary index skips it too. The daemon must
+    /// therefore re-derive them itself before swapping.
+    #[test]
+    fn full_reindex_rederives_tested_by_edges_the_swap_would_otherwise_destroy() {
+        use crate::graph::GraphBackend;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // `test_`-prefixed function in a `test_`-named file is what marks a
+        // symbol as kind `Test` (see `extract::entities`), and TESTED_BY is
+        // derived from a Test symbol's CALLS edges.
+        fs::write(root.join("lib.py"), "def target():\n    pass\n").unwrap();
+        fs::write(
+            root.join("test_lib.py"),
+            "def test_target():\n    target()\n",
+        )
+        .unwrap();
+
+        let prism = open_project(root);
+        prism.index().unwrap();
+
+        let queue = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::watch::queue::IndexWorkQueue::new(),
+        ));
+        let mut held: Option<std::sync::Arc<crate::Infigraph>> = None;
+        let make_registry = || Ok(python_registry());
+
+        let request_path = root.join(".infigraph").join("fullreindex.request");
+        fs::write(
+            &request_path,
+            serde_json::to_string(&crate::daemon_protocol::WriteRequest::FullReindex).unwrap(),
+        )
+        .unwrap();
+
+        crate::watch::serve_full_reindex_request(
+            root,
+            &request_path,
+            &queue,
+            &make_registry,
+            &mut held,
+            false,
+        );
+
+        let verify =
+            crate::graph::KuzuBackend::open_read_only(&root.join(".infigraph").join("graph"))
+                .unwrap();
+        let rows = verify
+            .raw_query("MATCH (s:Symbol)-[:TESTED_BY]->(t:Symbol) RETURN s.name, t.name")
+            .unwrap();
+        assert!(
+            !rows.is_empty(),
+            "the rebuilt graph must carry TESTED_BY edges; without re-derivation \
+             the swap silently drops them for good"
         );
     }
 
