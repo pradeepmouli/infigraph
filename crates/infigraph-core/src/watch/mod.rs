@@ -913,16 +913,42 @@ fn serve_full_reindex_request<MR>(
             // the daemon's own handle and swap.
             poison_watch_db(held);
 
-            let quarantine_result = if live_path.exists() {
-                crate::quarantine::quarantine_graph(&infigraph_dir, "graph").map(|_| ())
+            // Bind the quarantine destination rather than discarding it --
+            // if quarantine succeeds but the rename below fails, `live_path`
+            // no longer exists (it's now this destination), so an error
+            // message that names `live_path` would point an operator at a
+            // path that's already gone and never say where the real data
+            // actually went.
+            let quarantined_path: Option<PathBuf> = if live_path.exists() {
+                match crate::quarantine::quarantine_graph(&infigraph_dir, "graph") {
+                    Ok(dest) => Some(dest),
+                    Err(e) => {
+                        // Quarantine itself failed -- `live_path` was never
+                        // touched, so it's still there and still valid.
+                        // Same early-reply-and-cleanup shape as the
+                        // registry-build-failure branch above.
+                        let result = crate::daemon_protocol::WriteResult::Err {
+                            message: format!(
+                                "full reindex rebuilt successfully but could not quarantine \
+                                 the old graph: {e:#}. The live graph at {} was left \
+                                 untouched; the rebuilt graph remains at {}",
+                                live_path.display(),
+                                rebuilding_path.display()
+                            ),
+                        };
+                        if let Ok(json) = serde_json::to_string(&result) {
+                            let _ = crate::daemon_protocol::write_atomic(&reply_path, &json);
+                        }
+                        std::fs::remove_file(path).ok();
+                        drop(guard);
+                        return;
+                    }
+                }
             } else {
-                Ok(())
+                None
             };
 
-            match quarantine_result.and_then(|()| {
-                std::fs::rename(&rebuilding_path, &live_path)
-                    .map_err(|e| anyhow::anyhow!("failed to swap rebuilt graph into place: {e}"))
-            }) {
+            match std::fs::rename(&rebuilding_path, &live_path) {
                 Ok(()) => {
                     // Reopen and reconcile embeddings against the NEW
                     // graph -- update_embeddings queries the live symbol
@@ -946,17 +972,25 @@ fn serve_full_reindex_request<MR>(
                     }
                 }
                 Err(e) => {
+                    // The rebuilt graph is verified-good and still sitting
+                    // at `rebuilding_path` -- nothing was lost. Report the
+                    // old graph's real current location: wherever
+                    // quarantine actually put it, or "no prior graph" if
+                    // this was a from-scratch build.
+                    let old_graph_location = match &quarantined_path {
+                        Some(q) => format!("the old graph was quarantined to {}", q.display()),
+                        None => "there was no prior graph to quarantine".to_string(),
+                    };
                     eprintln!(
-                        "[daemon] full-reindex swap failed after a successful rebuild: {e:#} \
-                         -- check {} and {} by hand",
-                        live_path.display(),
+                        "[daemon] full-reindex swap failed after a successful rebuild: {e} \
+                         -- {old_graph_location}; the rebuilt graph is at {} -- check both by hand",
                         rebuilding_path.display()
                     );
                     let result = crate::daemon_protocol::WriteResult::Err {
                         message: format!(
-                            "full reindex rebuilt successfully but the swap failed: {e:#}. \
-                             Manual recovery needed: check {} and {}",
-                            live_path.display(),
+                            "full reindex rebuilt successfully but the swap failed: {e}. \
+                             Manual recovery needed: {old_graph_location}; the rebuilt \
+                             graph is at {}",
                             rebuilding_path.display()
                         ),
                     };

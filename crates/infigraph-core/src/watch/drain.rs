@@ -301,17 +301,6 @@ mod tests {
         );
     }
 
-    /// Regression test for a final-review Critical finding: the watch loop's
-    /// `WatchEventKind::Removed` handling used to call both `remove_file`
-    /// (the exact path) and `remove_files_by_prefix` (anything nested under
-    /// it, for directory removal) directly and unlocked. Coalescing removal
-    /// into the queue (`add_removal`) kept only the exact-path removal --
-    /// deleting a whole directory left every file that had been under it
-    /// stranded in the graph forever, since the real daemon runs with no
-    /// periodic whole-project scan to eventually notice the drift.
-    /// `add_watch_removal` (used only for genuine filesystem removal events)
-    /// restores the directory-prefix scan/removal alongside the exact-path
-    /// removal.
     /// Drives `serve_full_reindex_request` directly (no real daemon process)
     /// against a real temp-dir project: seeds a graph, submits FullReindex,
     /// confirms the old content is genuinely gone and the graph is rebuilt,
@@ -402,6 +391,79 @@ mod tests {
         );
     }
 
+    /// Regression coverage for the "superseded waiters" property of
+    /// `serve_full_reindex_request`: a request only *queued* (not yet
+    /// executing) when `FullReindex` arrives is genuinely moot -- the full
+    /// reindex is about to re-scan every file from disk regardless of what
+    /// was pending -- but its waiter must still be answered, not left
+    /// hanging until its own timeout. Without this test the drain-and-reply
+    /// loop that implements this could regress (e.g. an early return before
+    /// answering waiters, or draining without replying) and nothing would
+    /// fail except a client silently hanging in production.
+    #[test]
+    fn full_reindex_answers_a_superseded_waiter_with_an_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("a.py"), "def a():\n    pass\n").unwrap();
+
+        let prism = open_project(root);
+        prism.index().unwrap();
+
+        let queue = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::watch::queue::IndexWorkQueue::new(),
+        ));
+        // A request queued but not yet executing when FullReindex arrives.
+        let superseded_reply = root.join(".infigraph").join("superseded.result");
+        queue.lock().unwrap().add_waiter(Waiter {
+            kind: WaiterKind::Index,
+            use_learned: false,
+            reply_path: superseded_reply.clone(),
+            paths: None,
+        });
+
+        let mut held: Option<std::sync::Arc<crate::Infigraph>> = None;
+        let make_registry = || Ok(python_registry());
+
+        let request_path = root.join(".infigraph").join("fullreindex.request");
+        fs::write(
+            &request_path,
+            serde_json::to_string(&crate::daemon_protocol::WriteRequest::FullReindex).unwrap(),
+        )
+        .unwrap();
+
+        crate::watch::serve_full_reindex_request(
+            root,
+            &request_path,
+            &queue,
+            &make_registry,
+            &mut held,
+            false,
+        );
+
+        let reply: crate::daemon_protocol::WriteResult =
+            serde_json::from_str(&fs::read_to_string(&superseded_reply).unwrap()).unwrap();
+        match reply {
+            crate::daemon_protocol::WriteResult::Err { message } => {
+                assert!(
+                    message.contains("superseded"),
+                    "a superseded waiter's reply must explain why, got: {message}"
+                );
+            }
+            other => panic!("expected WriteResult::Err, got {other:?}"),
+        }
+    }
+
+    /// Regression test for a final-review Critical finding: the watch loop's
+    /// `WatchEventKind::Removed` handling used to call both `remove_file`
+    /// (the exact path) and `remove_files_by_prefix` (anything nested under
+    /// it, for directory removal) directly and unlocked. Coalescing removal
+    /// into the queue (`add_removal`) kept only the exact-path removal --
+    /// deleting a whole directory left every file that had been under it
+    /// stranded in the graph forever, since the real daemon runs with no
+    /// periodic whole-project scan to eventually notice the drift.
+    /// `add_watch_removal` (used only for genuine filesystem removal events)
+    /// restores the directory-prefix scan/removal alongside the exact-path
+    /// removal.
     #[test]
     fn a_watch_removal_of_a_directory_removes_every_file_that_was_under_it() {
         let tmp = tempfile::tempdir().unwrap();
