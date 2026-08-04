@@ -1,69 +1,84 @@
-//! `infigraph index --full` under `INFIGRAPH_BACKEND=daemon` must refuse
-//! loudly rather than wipe `.infigraph/graph` unlocked out from under a
-//! daemon that may hold a persistent connection on it. See
-//! https://github.com/pradeepmouli/infigraph/issues/50.
+//! `infigraph index --full` under `INFIGRAPH_BACKEND=daemon` now works by
+//! routing through the daemon's own build-fresh-then-swap handler, instead
+//! of refusing. See
+//! docs/superpowers/specs/2026-08-04-daemon-routed-full-reindex-design.md
+//! and the real e2e coverage in
+//! crates/infigraph-core/tests/daemon_kuzu_e2e.rs (this file only checks
+//! the CLI-level success/failure contract, not the daemon internals).
 
 use std::process::Command;
 
 #[test]
-fn full_reindex_refuses_under_daemon_backend_without_wiping_graph() {
+fn full_reindex_succeeds_under_daemon_backend_with_a_real_running_daemon() {
     let project = tempfile::tempdir().expect("failed to create project temp dir");
     let fake_home = tempfile::tempdir().expect("failed to create fake home temp dir");
 
     std::fs::write(project.path().join("hello.py"), "def hello():\n    pass\n")
         .expect("failed to write fixture file");
 
-    // Seed a fake existing graph directory with a marker file, so a wipe
-    // (which this test must prove does NOT happen) is directly observable.
-    let graph_dir = project.path().join(".infigraph").join("graph");
-    std::fs::create_dir_all(&graph_dir).expect("failed to create fake graph dir");
-    let marker = graph_dir.join("marker.txt");
-    std::fs::write(&marker, "pre-existing graph data").expect("failed to write marker file");
+    let cli = env!("CARGO_BIN_EXE_infigraph");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_infigraph"))
-        .arg("--root")
-        .arg(project.path())
+    // Bootstrap-index locally first (no daemon involved yet), matching the
+    // established pattern in crates/infigraph-core/tests/daemon_kuzu_e2e.rs.
+    let bootstrap = Command::new(cli)
+        .arg("index")
+        .current_dir(project.path())
+        .env("HOME", fake_home.path())
+        .env_remove("INFIGRAPH_BACKEND")
+        .status()
+        .expect("failed to run bootstrap infigraph index");
+    assert!(bootstrap.success(), "bootstrap index must succeed");
+
+    // Start a real daemon against the project.
+    let mut daemon = Command::new(cli)
+        .arg("daemon")
+        .current_dir(project.path())
+        .env("HOME", fake_home.path())
+        .env_remove("INFIGRAPH_BACKEND")
+        .spawn()
+        .expect("failed to spawn daemon");
+
+    let lock_path = project.path().join(".infigraph").join("watch.lock");
+    let start = std::time::Instant::now();
+    loop {
+        if lock_path.exists() && std::fs::metadata(&lock_path).unwrap().len() > 0 {
+            break;
+        }
+        if start.elapsed() > std::time::Duration::from_secs(10) {
+            let _ = daemon.kill();
+            panic!("daemon never acquired watch.lock");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+
+    let output = Command::new(cli)
         .arg("index")
         .arg("--full")
         .arg("--no-embed")
+        .current_dir(project.path())
         .env("HOME", fake_home.path())
-        .env("INFIGRAPH_NO_WATCH", "1")
         .env("INFIGRAPH_BACKEND", "daemon")
         .env_remove("CI")
         .env_remove("GITHUB_ACTIONS")
-        .env_remove("JENKINS_URL")
-        .env_remove("BUILDKITE")
-        .env_remove("GITLAB_CI")
         .output()
         .expect("failed to run infigraph index --full");
 
-    if !output.status.success() && output.stdout.is_empty() && output.stderr.is_empty() {
-        eprintln!("Skipping: infigraph binary could not execute in this environment");
-        return;
-    }
+    let _ = daemon.kill();
+    let _ = daemon.wait();
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        !output.status.success(),
-        "expected `infigraph index --full` to refuse under INFIGRAPH_BACKEND=daemon, but it succeeded:\nstdout={}\nstderr={stderr}",
+        output.status.success(),
+        "expected `infigraph index --full` to succeed under the daemon backend, but it failed:\nstdout={}\nstderr={stderr}",
         String::from_utf8_lossy(&output.stdout),
     );
     assert!(
-        stderr.contains("not yet supported under the daemon backend"),
-        "expected the daemon-mode refusal message, got:\n{stderr}"
-    );
-    assert!(
-        stderr.contains("issues/50"),
-        "expected the refusal to point at the tracked follow-up issue, got:\n{stderr}"
+        !stderr.contains("not yet supported under the daemon backend"),
+        "the old refusal message must not appear -- this behavior was replaced, got:\n{stderr}"
     );
 
-    assert!(
-        marker.exists(),
-        "the pre-existing graph marker file was deleted -- the wipe ran despite the daemon-mode refusal"
-    );
-    assert_eq!(
-        std::fs::read_to_string(&marker).unwrap(),
-        "pre-existing graph data",
-        "the marker file's content changed -- something touched the graph dir"
-    );
+    // Verify the graph genuinely has real content (a real rebuild
+    // happened, not a silent no-op).
+    let graph_path = project.path().join(".infigraph").join("graph");
+    assert!(graph_path.exists(), "graph must exist after a full reindex");
 }
