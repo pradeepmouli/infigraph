@@ -4,7 +4,7 @@ pub(crate) mod drain;
 pub(crate) mod queue;
 
 use std::path::{Path, PathBuf};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -138,14 +138,29 @@ where
     // Shared DB connection for the watch session — see `watch_db`'s doc
     // comment for the platform split (held open on non-Windows, reopened
     // per call on Windows).
-    let mut held_prism: Option<Infigraph> = None;
+    let mut held_prism: Option<Arc<Infigraph>> = None;
 
     // Accumulates index-shaped work from every producer below (periodic
     // reindex, watch-triggered batch/removal, ad-hoc daemon-protocol
     // requests) so it's drained as one combined execution per tick instead
     // of each producer racing its own stale plan against the others -- see
     // docs/superpowers/specs/2026-08-03-daemon-index-work-queue-design.md.
-    let mut queue = crate::watch::queue::IndexWorkQueue::new();
+    //
+    // Shared rather than loop-local because the drain runs on a background
+    // task: producers below keep filling it, under the mutex, while a drain
+    // executes.
+    let queue = Arc::new(Mutex::new(crate::watch::queue::IndexWorkQueue::new()));
+
+    // Drains run here instead of inline so a large one (a whole-project
+    // reindex can take minutes) doesn't stop this loop from accepting
+    // fsevents, periodic ticks and further requests for its whole duration.
+    // One worker is enough -- `drain_in_flight` allows at most one drain at
+    // a time, and the drain itself is a `spawn_blocking` task.
+    let drain_rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .thread_name("infigraph-drain")
+        .build()?;
+    let mut drain_in_flight: Option<InFlightDrain> = None;
 
     let sentinel = root.join(".infigraph").join("watch.stop");
 
@@ -176,6 +191,75 @@ where
             break;
         }
 
+        // Shared drain step, in two halves: reap whatever finished since the
+        // last tick (here), then schedule the next one (at the end of the
+        // tick). The drain itself combines everything every producer below
+        // (periodic mark, ad-hoc requests, batch flush, watch-triggered
+        // removal) contributed into ONE execution -- the actual fix for the
+        // coalescing bug (see
+        // docs/superpowers/specs/2026-08-03-daemon-index-work-queue-design.md).
+        // Same lock, same role string, same cross-process contract the
+        // batch-flush block used to acquire on its own; only *where* the
+        // execution runs changed.
+        //
+        // Reaping runs first in the tick, before anything else that wants
+        // `index.lock`: the task hands the guard back rather than dropping
+        // it (so these downstream steps still run under it, exactly as they
+        // did when the drain was inline), which means the lock stays held
+        // until this block runs. Anything here that blocked on it first
+        // would be waiting on itself.
+        if drain_in_flight
+            .as_ref()
+            .is_some_and(|d| d.handle.is_finished())
+        {
+            let InFlightDrain {
+                handle,
+                prism,
+                waiter_replies,
+            } = drain_in_flight.take().expect("checked is_some just above");
+            let (guard, outcome) = finish_drain(drain_rt.block_on(handle), &waiter_replies);
+            match outcome {
+                Some(outcome) => {
+                    changes_since_periodic += outcome.extractions.len();
+                    if let Some(ref cb) = on_periodic {
+                        if !outcome.extractions.is_empty() {
+                            cb(&crate::IndexResult {
+                                total_files: outcome.extractions.len(),
+                                indexed_files: outcome.extractions.len(),
+                                extractions: outcome.extractions.clone(),
+                                resolve_stats: outcome.resolve_stats.clone(),
+                            });
+                        }
+                    }
+                    if let Some(backend) = prism.backend() {
+                        let changed: Vec<&str> = outcome
+                            .extractions
+                            .iter()
+                            .map(|e| e.file.as_str())
+                            .collect();
+                        if !changed.is_empty() {
+                            if let Err(e) = crate::embed::update_embeddings(backend, root, &changed)
+                            {
+                                eprintln!("[watch] embedding update failed: {e}");
+                            }
+                        }
+                    }
+                    for extraction in &outcome.extractions {
+                        let cross = has_cross_file_calls(&prism, &extraction.file);
+                        let abs_path = root.join(&extraction.file);
+                        on_event(WatchEvent {
+                            kind: WatchEventKind::Modified,
+                            path: abs_path,
+                            has_cross_file_calls: cross,
+                        });
+                    }
+                }
+                // `finish_drain` already logged and replied to the waiters.
+                None => poison_watch_db(&mut held_prism),
+            }
+            drop(guard);
+        }
+
         // Periodic SCIP refresh: if changes accumulated and enough time passed
         if periodic_secs > 0
             && changes_since_periodic > 0
@@ -187,7 +271,7 @@ where
                 // resolve pass and invokes `on_periodic` with the real
                 // `DrainOutcome`, folded into whatever else this tick's
                 // other producers also contributed.
-                queue.mark_whole_project();
+                queue.lock().unwrap().mark_whole_project();
                 changes_since_periodic = 0;
                 last_periodic = std::time::Instant::now();
             } else {
@@ -212,9 +296,10 @@ where
                         route_or_serve_request(
                             root,
                             &path,
-                            &mut queue,
+                            &queue,
                             &make_registry,
                             &mut held_prism,
+                            drain_in_flight.is_some(),
                         );
                     }
                 }
@@ -227,12 +312,13 @@ where
         // other producers also contributed.
         if !batch.is_empty() && batch.is_ready() {
             let paths = batch.drain();
+            let mut q = queue.lock().unwrap();
             for path in paths {
                 let rel = path
                     .strip_prefix(root)
                     .map(|r| r.to_string_lossy().replace('\\', "/"))
                     .unwrap_or_else(|_| path.to_string_lossy().replace('\\', "/"));
-                queue.add_raw(rel);
+                q.add_raw(rel);
             }
         }
 
@@ -261,7 +347,7 @@ where
                             // than touching the graph directly here -- this
                             // closes a pre-existing gap where watch-triggered
                             // removal never took `index.lock` at all.
-                            queue.add_removal(rel);
+                            queue.lock().unwrap().add_removal(rel);
                             changes_since_periodic += 1;
                             on_event(WatchEvent {
                                 kind: watch_kind.clone(),
@@ -325,63 +411,39 @@ where
             }
         }
 
-        // Shared drain step: runs once per tick, combining whatever every
-        // producer above (periodic mark, ad-hoc requests, batch flush,
-        // watch-triggered removal) contributed this tick into ONE execution
-        // -- this is the actual fix for the coalescing bug (see
-        // docs/superpowers/specs/2026-08-03-daemon-index-work-queue-design.md).
-        // Same lock, same role string, same cross-process contract the
-        // batch-flush block used to acquire on its own.
-        if !queue.is_empty() {
+        // Schedule: only when nothing's in flight, so at most one drain runs
+        // at a time and this loop never waits on its own background task's
+        // `index.lock`.
+        if drain_in_flight.is_none() && !queue.lock().unwrap().is_empty() {
             match begin_index_op(root, "infigraph daemon", Duration::from_secs(30)) {
-                Ok(IndexOpOutcome::Acquired(_guard)) => {
-                    if let Ok(prism) = watch_db(root, &make_registry, &mut held_prism) {
-                        match crate::watch::drain::execute_drain(prism, queue.drain()) {
-                            Ok(outcome) => {
-                                changes_since_periodic += outcome.extractions.len();
-                                if let Some(ref cb) = on_periodic {
-                                    if !outcome.extractions.is_empty() {
-                                        cb(&crate::IndexResult {
-                                            total_files: outcome.extractions.len(),
-                                            indexed_files: outcome.extractions.len(),
-                                            extractions: outcome.extractions.clone(),
-                                            resolve_stats: outcome.resolve_stats.clone(),
-                                        });
-                                    }
-                                }
-                                if let Some(backend) = prism.backend() {
-                                    let changed: Vec<&str> = outcome
-                                        .extractions
-                                        .iter()
-                                        .map(|e| e.file.as_str())
-                                        .collect();
-                                    if !changed.is_empty() {
-                                        if let Err(e) =
-                                            crate::embed::update_embeddings(backend, root, &changed)
-                                        {
-                                            eprintln!("[watch] embedding update failed: {e}");
-                                        }
-                                    }
-                                }
-                                for extraction in &outcome.extractions {
-                                    let cross = has_cross_file_calls(prism, &extraction.file);
-                                    let abs_path = root.join(&extraction.file);
-                                    on_event(WatchEvent {
-                                        kind: WatchEventKind::Modified,
-                                        path: abs_path,
-                                        has_cross_file_calls: cross,
-                                    });
-                                }
-                            }
-                            Err(e) => {
-                                eprintln!("[watch] drain failed: {e}");
-                                poison_watch_db(&mut held_prism);
-                            }
+                Ok(IndexOpOutcome::Acquired(guard)) => {
+                    match watch_db(root, &make_registry, &mut held_prism) {
+                        Ok(prism) => {
+                            // Drained here on the loop thread rather than
+                            // inside the task, so a panicking task can't take
+                            // its waiters down with it -- `waiter_replies`
+                            // survives to be answered by `finish_drain`.
+                            let drained = queue.lock().unwrap().drain();
+                            let waiter_replies: Vec<PathBuf> = drained
+                                .waiters
+                                .iter()
+                                .map(|w| w.reply_path.clone())
+                                .collect();
+                            let task_prism = Arc::clone(&prism);
+                            let handle = drain_rt.spawn_blocking(move || DrainTaskOutput {
+                                result: crate::watch::drain::execute_drain(&task_prism, drained),
+                                guard,
+                            });
+                            drain_in_flight = Some(InFlightDrain {
+                                handle,
+                                prism,
+                                waiter_replies,
+                            });
                         }
-                    } else {
-                        eprintln!("[watch] failed to reopen graph connection, will retry");
+                        Err(e) => {
+                            eprintln!("[watch] failed to reopen graph connection, will retry: {e}")
+                        }
                     }
-                    // _guard drops here, releasing the index-op lock
                 }
                 Ok(o @ IndexOpOutcome::AlreadyRunning(_)) => {
                     // Queue contents are NOT cleared here -- queue.drain()
@@ -399,7 +461,99 @@ where
         }
     }
 
+    // A drain still running when the loop exits holds `index.lock` and a
+    // connection to the graph. Wait it out rather than returning into a
+    // process teardown that would drop both mid-write.
+    if let Some(in_flight) = drain_in_flight.take() {
+        let (guard, _) = finish_drain(
+            drain_rt.block_on(in_flight.handle),
+            &in_flight.waiter_replies,
+        );
+        drop(guard);
+    }
+
     Ok(())
+}
+
+/// A drain executing on the background task, plus everything the loop
+/// thread needs to finish it: the shared graph connection its downstream
+/// steps run against, and the reply paths of the waiters folded into it --
+/// retained here, outside the task, precisely so a panic in the task still
+/// leaves someone able to answer them.
+struct InFlightDrain {
+    handle: tokio::task::JoinHandle<DrainTaskOutput>,
+    prism: Arc<Infigraph>,
+    waiter_replies: Vec<PathBuf>,
+}
+
+/// What the background drain task hands back. The `index.lock` guard rides
+/// along so the loop thread keeps holding it across the post-drain steps
+/// (embedding update, cross-file-call event emission) instead of those
+/// running unlocked.
+struct DrainTaskOutput {
+    guard: crate::ops::IndexOpGuard,
+    result: Result<crate::watch::drain::DrainOutcome>,
+}
+
+/// Collects a finished drain task. Returns the index-op guard to keep held
+/// (absent if the task panicked, since it was dropped during the unwind)
+/// and the outcome, if the drain produced one.
+///
+/// Both failure modes -- a panic, and an `execute_drain` error -- answer
+/// every waiter with `WriteResult::Err`. Without that a client blocks until
+/// its own multi-minute timeout with nothing explaining why: `execute_drain`
+/// writes replies as its last step, so a failure anywhere before that
+/// leaves them unwritten.
+fn finish_drain(
+    joined: std::result::Result<DrainTaskOutput, tokio::task::JoinError>,
+    waiter_replies: &[PathBuf],
+) -> (
+    Option<crate::ops::IndexOpGuard>,
+    Option<crate::watch::drain::DrainOutcome>,
+) {
+    match joined {
+        Ok(DrainTaskOutput {
+            guard,
+            result: Ok(outcome),
+        }) => (Some(guard), Some(outcome)),
+        Ok(DrainTaskOutput {
+            guard,
+            result: Err(e),
+        }) => {
+            eprintln!("[watch] drain failed: {e}");
+            reply_err_to_waiters(waiter_replies, &format!("daemon drain failed: {e}"));
+            (Some(guard), None)
+        }
+        Err(join_err) => {
+            eprintln!("[watch] drain task panicked: {join_err}");
+            reply_err_to_waiters(
+                waiter_replies,
+                &format!("daemon drain task panicked: {join_err}"),
+            );
+            (None, None)
+        }
+    }
+}
+
+fn reply_err_to_waiters(waiter_replies: &[PathBuf], message: &str) {
+    let result = crate::daemon_protocol::WriteResult::Err {
+        message: message.to_string(),
+    };
+    let json = match serde_json::to_string(&result) {
+        Ok(j) => j,
+        Err(e) => {
+            eprintln!("[watch] could not encode drain failure reply: {e}");
+            return;
+        }
+    };
+    for reply_path in waiter_replies {
+        if let Err(e) = crate::daemon_protocol::write_atomic(reply_path, &json) {
+            eprintln!(
+                "[watch] could not write drain failure reply to {}: {e}",
+                reply_path.display()
+            );
+        }
+    }
 }
 
 /// Like `watch_project` but automatically re-resolves cross-file call edges
@@ -536,19 +690,27 @@ where
 /// next call reopens fresh (e.g. after the on-disk database was replaced out
 /// from under a live connection, such as a concurrent `infigraph index
 /// --full` against a project this watcher is also watching).
+///
+/// Returns an `Arc` clone rather than a borrow so the background drain task
+/// can hold the *same* `Infigraph` -- and therefore the same in-process
+/// `kuzu::Database` -- that the loop thread keeps using. Each graph
+/// operation opens its own short-lived `Connection` from that shared
+/// `Database` (see `GraphStore::connection`), which is the concurrency
+/// pattern lbug documents as safe. Opening a second `Database` on the same
+/// file for the drain would be a materially weaker guarantee.
 #[cfg(not(windows))]
-fn watch_db<'a, MR>(
+fn watch_db<MR>(
     root: &Path,
     make_registry: &MR,
-    held: &'a mut Option<Infigraph>,
-) -> Result<&'a mut Infigraph>
+    held: &mut Option<Arc<Infigraph>>,
+) -> Result<Arc<Infigraph>>
 where
     MR: Fn() -> Result<crate::lang::LanguageRegistry>,
 {
     if held.is_none() {
-        *held = Some(open_transient(root, make_registry)?);
+        *held = Some(Arc::new(open_transient(root, make_registry)?));
     }
-    Ok(held.as_mut().unwrap())
+    Ok(Arc::clone(held.as_ref().unwrap()))
 }
 
 /// Windows' mandatory file locking prevents a second concurrent connection
@@ -556,21 +718,21 @@ where
 /// opens (and the previous one closes) fresh rather than holding one open
 /// across the whole session — see `open_transient`.
 #[cfg(windows)]
-fn watch_db<'a, MR>(
+fn watch_db<MR>(
     root: &Path,
     make_registry: &MR,
-    held: &'a mut Option<Infigraph>,
-) -> Result<&'a mut Infigraph>
+    held: &mut Option<Arc<Infigraph>>,
+) -> Result<Arc<Infigraph>>
 where
     MR: Fn() -> Result<crate::lang::LanguageRegistry>,
 {
-    *held = Some(open_transient(root, make_registry)?);
-    Ok(held.as_mut().unwrap())
+    *held = Some(Arc::new(open_transient(root, make_registry)?));
+    Ok(Arc::clone(held.as_ref().unwrap()))
 }
 
 /// Drops the watch session's shared DB connection so the next `watch_db`
 /// call reopens fresh. See `watch_db`'s doc comment for when to call this.
-fn poison_watch_db(held: &mut Option<Infigraph>) {
+fn poison_watch_db(held: &mut Option<Arc<Infigraph>>) {
     *held = None;
 }
 
@@ -584,18 +746,28 @@ fn poison_watch_db(held: &mut Option<Infigraph>) {
 /// or a concurrent CLI `infigraph index --full`, violating the single-writer
 /// invariant. On contention the `.request` file is left in place (not
 /// deleted) so it's retried on a later tick, matching the old behavior.
+/// Does nothing while this daemon's own drain is in flight. That drain holds
+/// `index.lock` until the loop thread reaps it -- so blocking here to wait
+/// for that lock would park the only thread that can release it, a
+/// self-deadlock broken only by the 30s acquire timeout. Returning instead
+/// leaves the `.request` file in place, which is already this function's
+/// contention behaviour: a later tick, after the drain is reaped, serves it.
 fn serve_request_locked<MR>(
     root: &Path,
     path: &Path,
     make_registry: &MR,
-    held: &mut Option<Infigraph>,
+    held: &mut Option<Arc<Infigraph>>,
+    drain_in_flight: bool,
 ) where
     MR: Fn() -> Result<crate::lang::LanguageRegistry>,
 {
+    if drain_in_flight {
+        return;
+    }
     match begin_index_op(root, "infigraph daemon", Duration::from_secs(30)) {
         Ok(IndexOpOutcome::Acquired(_guard)) => match watch_db(root, make_registry, held) {
             Ok(prism) => {
-                if let Err(e) = crate::daemon_protocol::serve_one_request(prism, path) {
+                if let Err(e) = crate::daemon_protocol::serve_one_request(&prism, path) {
                     eprintln!("[daemon] failed to serve request {}: {e}", path.display());
                 }
             }
@@ -625,9 +797,10 @@ fn serve_request_locked<MR>(
 fn route_or_serve_request<MR>(
     root: &Path,
     path: &Path,
-    queue: &mut crate::watch::queue::IndexWorkQueue,
+    queue: &Arc<Mutex<crate::watch::queue::IndexWorkQueue>>,
     make_registry: &MR,
-    held: &mut Option<Infigraph>,
+    held: &mut Option<Arc<Infigraph>>,
+    drain_in_flight: bool,
 ) where
     MR: Fn() -> Result<crate::lang::LanguageRegistry>,
 {
@@ -642,7 +815,7 @@ fn route_or_serve_request<MR>(
             // Malformed request JSON -- not this design's concern to
             // recover; hand off to serve_one_request, whose existing
             // corrupt-JSON handling (WriteResult::Err) already covers it.
-            serve_request_locked(root, path, make_registry, held);
+            serve_request_locked(root, path, make_registry, held, drain_in_flight);
             return;
         }
     };
@@ -650,58 +823,70 @@ fn route_or_serve_request<MR>(
     use crate::daemon_protocol::WriteRequest;
     use crate::watch::queue::{Waiter, WaiterKind};
 
+    // Each arm holds the queue lock across its work-items-plus-waiter pair
+    // so a drain scheduled concurrently can never take the items without
+    // the waiter that's blocked on them (which would leave that client
+    // waiting for a reply no later drain owes it).
     match request {
         WriteRequest::Index { paths: None } => {
-            queue.mark_whole_project();
-            queue.add_waiter(Waiter {
+            let mut q = queue.lock().unwrap();
+            q.mark_whole_project();
+            q.add_waiter(Waiter {
                 kind: WaiterKind::Index,
                 use_learned: false,
                 reply_path,
             });
+            drop(q);
             std::fs::remove_file(path).ok();
         }
         WriteRequest::Index { paths: Some(paths) } => {
+            let mut q = queue.lock().unwrap();
             for p in paths {
                 let rel = p.to_string_lossy().replace('\\', "/");
-                queue.add_raw(rel);
+                q.add_raw(rel);
             }
-            queue.add_waiter(Waiter {
+            q.add_waiter(Waiter {
                 kind: WaiterKind::Index,
                 use_learned: false,
                 reply_path,
             });
+            drop(q);
             std::fs::remove_file(path).ok();
         }
         WriteRequest::UpsertFilesBulk {
             extractions_path, ..
         } => match crate::daemon_protocol::read_extractions_json(&extractions_path) {
             Ok(extractions) => {
+                let mut q = queue.lock().unwrap();
                 for extraction in extractions {
-                    queue.add_structured(extraction);
+                    q.add_structured(extraction);
                 }
-                queue.add_waiter(Waiter {
+                q.add_waiter(Waiter {
                     kind: WaiterKind::UpsertFilesBulk,
                     use_learned: false,
                     reply_path,
                 });
+                drop(q);
                 std::fs::remove_file(&extractions_path).ok();
                 std::fs::remove_file(path).ok();
             }
             Err(_) => {
                 // Sibling extractions file missing/corrupt -- fall
                 // through to serve_one_request's existing error path.
-                serve_request_locked(root, path, make_registry, held);
+                serve_request_locked(root, path, make_registry, held, drain_in_flight);
             }
         },
         WriteRequest::RemoveFiles { files } => {
+            let mut q = queue.lock().unwrap();
             for f in files {
-                queue.add_removal(f);
+                q.add_removal(f);
             }
-            queue.add_waiter(Waiter {
+            q.add_waiter(Waiter {
                 kind: WaiterKind::RemoveFiles,
                 use_learned: false,
                 reply_path,
             });
+            drop(q);
             std::fs::remove_file(path).ok();
         }
         WriteRequest::ResolveCalls {
@@ -709,25 +894,27 @@ fn route_or_serve_request<MR>(
             use_learned,
         } => match crate::daemon_protocol::read_extractions_json(&extractions_path) {
             Ok(extractions) => {
+                let mut q = queue.lock().unwrap();
                 for extraction in extractions {
-                    queue.add_resolve_only(extraction);
+                    q.add_resolve_only(extraction);
                 }
-                queue.add_waiter(Waiter {
+                q.add_waiter(Waiter {
                     kind: WaiterKind::ResolveCalls,
                     use_learned,
                     reply_path,
                 });
+                drop(q);
                 std::fs::remove_file(&extractions_path).ok();
                 std::fs::remove_file(path).ok();
             }
             Err(_) => {
-                serve_request_locked(root, path, make_registry, held);
+                serve_request_locked(root, path, make_registry, held, drain_in_flight);
             }
         },
         _ => {
             // The other 9 variants: unchanged behavior, immediate execution
             // (still under index.lock, matching pre-IndexWorkQueue behavior).
-            serve_request_locked(root, path, make_registry, held);
+            serve_request_locked(root, path, make_registry, held, drain_in_flight);
         }
     }
 }
@@ -836,10 +1023,70 @@ fn register_subdirs(watcher: &mut RecommendedWatcher, dir: &Path, ignore_dirs: &
 
 #[cfg(test)]
 mod tests {
-    #[cfg(target_os = "macos")]
     use super::*;
-    #[cfg(target_os = "macos")]
-    use std::sync::Mutex;
+
+    /// A drain runs on a background task, so a panic inside it unwinds on a
+    /// thread the watch loop never sees. Nothing else would ever answer the
+    /// ad-hoc requests folded into that drain: `execute_drain` writes every
+    /// reply as its final step, so a panic before that point leaves the
+    /// clients blocking on a `.result` file that no longer has an author.
+    /// They'd sit there until their own multi-minute timeout with no
+    /// explanation. `finish_drain` is what turns that silence into a real
+    /// `WriteResult::Err`.
+    #[test]
+    fn drain_task_panic_surfaces_as_write_result_err_not_a_hang() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = tmp.path().join("waiter-a.result");
+        let second = tmp.path().join("waiter-b.result");
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .build()
+            .unwrap();
+
+        // The panic is the point of the test, so its default backtrace
+        // message would just look like a failure in the log. Suppressed only
+        // across the join -- by the time `block_on` returns, the panic has
+        // already been caught and reported through the `JoinError`.
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let joined = rt
+            .block_on(rt.spawn_blocking(|| -> DrainTaskOutput { panic!("simulated drain panic") }));
+        std::panic::set_hook(previous_hook);
+
+        assert!(
+            joined.is_err(),
+            "test setup is wrong: the drain task did not actually panic"
+        );
+
+        let (guard, outcome) = finish_drain(joined, &[first.clone(), second.clone()]);
+        assert!(
+            guard.is_none(),
+            "a panicking task drops its index-op guard during the unwind, \
+             so there is none left to hand back"
+        );
+        assert!(outcome.is_none(), "a panicked drain produced no outcome");
+
+        for reply_path in [&first, &second] {
+            let contents = std::fs::read_to_string(reply_path).unwrap_or_else(|e| {
+                panic!(
+                    "a panicked drain must still answer every waiter folded into it, \
+                     but {} was never written ({e}) -- that client would block until \
+                     its own timeout",
+                    reply_path.display()
+                )
+            });
+            let reply: crate::daemon_protocol::WriteResult =
+                serde_json::from_str(&contents).unwrap();
+            match reply {
+                crate::daemon_protocol::WriteResult::Err { message } => assert!(
+                    message.contains("panic"),
+                    "the reply must say the drain panicked, got: {message}"
+                ),
+                other => panic!("expected WriteResult::Err, got {other:?}"),
+            }
+        }
+    }
 
     /// Regression test for a macOS-specific bug: `watch_project_with_periodic`
     /// used to compare raw filesystem-watch event paths against the caller's

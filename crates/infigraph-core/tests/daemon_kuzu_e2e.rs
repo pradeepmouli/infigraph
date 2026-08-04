@@ -527,3 +527,99 @@ fn daemon_write_is_visible_through_the_same_wrapper_instance() {
          instance that was constructed before the write"
     );
 }
+
+/// The behavioural claim background draining makes: a drain no longer owns
+/// the watch loop for its whole duration, so work submitted *while* one is
+/// running is still accepted, and is served by the next drain.
+///
+/// What this can and cannot see: from outside the daemon process there is no
+/// way to directly observe "this request was accepted into the queue at
+/// t+50ms rather than t+8s". What it *can* prove -- and what the risky part
+/// of backgrounding a drain would break -- is that the loop does not wedge:
+/// a second request landing mid-drain still completes, the requests
+/// directory drains to empty rather than orphaning it, and the daemon is
+/// still serving afterwards. A drain task that deadlocked against its own
+/// `index.lock`, dropped its queue on the floor, or left the loop parked
+/// would fail one of those.
+#[test]
+fn producers_keep_accepting_work_while_a_drain_is_in_flight() {
+    let project = tempfile::tempdir().unwrap();
+
+    // Lua for the same reason `real_cli_index_against_a_real_daemon_*` uses
+    // it: no SCIP indexer covers it, so `infigraph index` spawns no detached
+    // scip-enrich child, which would hold `index.lock` and make every timing
+    // observation below meaningless. Enough files, with enough in each, that
+    // a whole-project drain takes real wall time rather than completing
+    // inside one 200ms tick.
+    for i in 0..300 {
+        let body: String = (0..40)
+            .map(|j| format!("function f{i}_{j}()\n  return {j}\nend\n"))
+            .collect();
+        std::fs::write(project.path().join(format!("m{i}.lua")), body).unwrap();
+    }
+
+    let mut daemon = start_real_daemon(project.path());
+
+    // A whole-project index routed entirely through the daemon: one
+    // `WriteRequest::Index`, so the daemon itself does the scan/extract/
+    // upsert/resolve pass. This is the slow drain the second request has to
+    // land in the middle of.
+    let slow = std::thread::spawn({
+        let dir = project.path().to_path_buf();
+        move || run_cli_index(&dir, &[("INFIGRAPH_INDEX_VIA_DAEMON", "1")])
+    });
+
+    // Give the daemon a moment to actually pick the request up and start
+    // draining, so the second request really does land mid-drain rather
+    // than racing it to the front of the queue.
+    std::thread::sleep(Duration::from_millis(750));
+
+    std::fs::write(
+        project.path().join("late.lua"),
+        "function late()\n  return 1\nend\n",
+    )
+    .unwrap();
+    let second_started = std::time::Instant::now();
+    run_cli_index(project.path(), &[("INFIGRAPH_INDEX_VIA_DAEMON", "1")]);
+    let second_elapsed = second_started.elapsed();
+
+    slow.join().expect("the slow whole-project index panicked");
+
+    // Both requests were served, and the file that only ever existed during
+    // the in-flight drain made it into the graph -- work submitted mid-drain
+    // is queued, not dropped.
+    assert!(
+        file_is_in_graph(project.path(), "late.lua"),
+        "a file created while a drain was in flight must still be indexed by \
+         the next drain, not silently dropped"
+    );
+
+    // Nothing orphaned: every `.request` the daemon accepted was answered
+    // and removed. A drain that panicked or wedged would leave one behind.
+    let leftover: Vec<_> = std::fs::read_dir(project.path().join(".infigraph").join("requests"))
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.extension().is_some_and(|ext| ext == "request"))
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        leftover.is_empty(),
+        "the daemon left unanswered requests behind: {leftover:?}"
+    );
+
+    // The second request cannot have taken longer than a whole extra
+    // serialized run of the first -- it shares the deadline every other
+    // routed write in this file is held to.
+    assert!(
+        second_elapsed < CLI_INDEX_DEADLINE,
+        "a request submitted during an in-flight drain took {second_elapsed:?}, \
+         which suggests the watch loop stopped making progress"
+    );
+
+    // Still serving after all that: the loop returned to its normal tick
+    // rather than being left parked on a finished drain.
+    stop_daemon(project.path(), &mut daemon);
+}

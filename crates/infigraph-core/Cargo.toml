@@ -41,23 +41,24 @@ serde_yaml = "0.9.34"
 fs2 = "0.4.3"
 memmap2 = "0.9"
 sysinfo = "0.39.6"
+# Unconditional (not just under `remote`): the daemon watch loop runs each
+# index drain on a `spawn_blocking` task so a long drain can't stall the
+# loop. The `neo4j`/`postgres` features used to pull this in optionally and
+# now share this one entry -- `rt-multi-thread` is the only feature either
+# of them ever asked for.
+tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [features]
 default = []
-neo4j = ["neo4rs", "tokio"]
-postgres = ["tokio-postgres", "pgvector", "tokio"]
+neo4j = ["neo4rs"]
+postgres = ["tokio-postgres", "pgvector"]
 remote = ["neo4j", "postgres"]
 
 [dependencies.neo4rs]
 version = "0.8"
-optional = true
-
-[dependencies.tokio]
-version = "1"
-features = ["rt-multi-thread"]
 optional = true
 
 [dependencies.tokio-postgres]
