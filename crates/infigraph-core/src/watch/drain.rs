@@ -391,6 +391,83 @@ mod tests {
         );
     }
 
+    /// Regression coverage for the registry-build failure branch of
+    /// `serve_full_reindex_request` (the `make_registry()` early return,
+    /// `watch/mod.rs:881-893`): a `FullReindex` request whose language
+    /// registry fails to build must reply with an explicit error and leave
+    /// the live graph completely untouched -- no partial rebuild, no
+    /// `graph.rebuilding` left behind. This is the property build-fresh-
+    /// then-swap exists to guarantee; the two tests above only exercise the
+    /// success path, so without this test that guarantee was unverified
+    /// anywhere in the codebase.
+    #[test]
+    fn full_reindex_replies_with_an_error_and_leaves_the_old_graph_untouched_when_the_registry_build_fails(
+    ) {
+        use crate::graph::GraphBackend;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("old.py"), "def old_symbol():\n    pass\n").unwrap();
+
+        let prism = open_project(root);
+        prism.index().unwrap();
+
+        let live_graph_path = root.join(".infigraph").join("graph");
+        assert!(live_graph_path.exists());
+
+        let queue = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::watch::queue::IndexWorkQueue::new(),
+        ));
+        let mut held: Option<std::sync::Arc<crate::Infigraph>> = None;
+        let make_registry = || Err(anyhow::anyhow!("injected registry failure"));
+
+        let request_path = root.join(".infigraph").join("fullreindex.request");
+        fs::write(
+            &request_path,
+            serde_json::to_string(&crate::daemon_protocol::WriteRequest::FullReindex).unwrap(),
+        )
+        .unwrap();
+
+        crate::watch::serve_full_reindex_request(
+            root,
+            &request_path,
+            &queue,
+            &make_registry,
+            &mut held,
+            false,
+        );
+
+        let reply_path = request_path.with_extension("result");
+        let reply: crate::daemon_protocol::WriteResult =
+            serde_json::from_str(&fs::read_to_string(&reply_path).unwrap()).unwrap();
+        match reply {
+            crate::daemon_protocol::WriteResult::Err { message } => {
+                assert!(
+                    message.contains("full reindex failed"),
+                    "expected a full-reindex failure message, got: {message}"
+                );
+            }
+            other => panic!("expected WriteResult::Err, got {other:?}"),
+        }
+
+        // Verify against a completely fresh read connection, matching the
+        // success-path test's own approach: the original content must
+        // still be there, untouched by the failed attempt.
+        let verify = crate::graph::KuzuBackend::open_read_only(&live_graph_path).unwrap();
+        let rows = verify.raw_query("MATCH (s:Symbol) RETURN s.name").unwrap();
+        let names: Vec<&str> = rows.iter().map(|r| r[0].as_str()).collect();
+        assert!(
+            names.contains(&"old_symbol"),
+            "a registry-build failure must leave the live graph's original content untouched"
+        );
+
+        let rebuilding_path = root.join(".infigraph").join("graph.rebuilding");
+        assert!(
+            !rebuilding_path.exists(),
+            "a registry-build failure must not leave graph.rebuilding behind"
+        );
+    }
+
     /// Regression coverage for the "superseded waiters" property of
     /// `serve_full_reindex_request`: a request only *queued* (not yet
     /// executing) when `FullReindex` arrives is genuinely moot -- the full

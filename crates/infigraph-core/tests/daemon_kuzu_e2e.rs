@@ -644,7 +644,7 @@ fn a_queued_request_racing_a_full_reindex_gets_a_superseded_reply_not_a_hang() {
     std::fs::write(project.path().join("b.py"), "def b():\n    pass\n").unwrap();
 
     let cli = cli_binary();
-    let index_child = std::process::Command::new(&cli)
+    let mut index_child = std::process::Command::new(&cli)
         .arg("index")
         .arg("--no-embed")
         .current_dir(project.path())
@@ -653,15 +653,45 @@ fn a_queued_request_racing_a_full_reindex_gets_a_superseded_reply_not_a_hang() {
         .spawn()
         .unwrap();
 
-    let full_output = std::process::Command::new(&cli)
+    let mut full_child = std::process::Command::new(&cli)
         .arg("index")
         .arg("--full")
         .arg("--no-embed")
         .current_dir(project.path())
         .env("INFIGRAPH_BACKEND", "daemon")
-        .output()
+        .spawn()
         .unwrap();
 
+    // Bounded waits: this test exists to prove neither request hangs, so an
+    // unbounded wait here would turn exactly the regression it guards
+    // against into a stalled test process instead of a clean failure --
+    // same `try_wait` poll pattern as `run_cli_index` above.
+    let full_start = std::time::Instant::now();
+    loop {
+        if full_child.try_wait().unwrap().is_some() {
+            break;
+        }
+        if full_start.elapsed() > CLI_INDEX_DEADLINE {
+            let _ = full_child.kill();
+            let _ = full_child.wait();
+            panic!("full reindex did not finish within {CLI_INDEX_DEADLINE:?}");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let full_output = full_child.wait_with_output().unwrap();
+
+    let index_start = std::time::Instant::now();
+    loop {
+        if index_child.try_wait().unwrap().is_some() {
+            break;
+        }
+        if index_start.elapsed() > CLI_INDEX_DEADLINE {
+            let _ = index_child.kill();
+            let _ = index_child.wait();
+            panic!("ad-hoc index did not finish within {CLI_INDEX_DEADLINE:?}");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
     let index_output = index_child.wait_with_output().unwrap();
 
     // Both must complete within the deadline (neither hangs), regardless
@@ -723,10 +753,29 @@ fn a_read_during_full_reindex_sees_the_old_graph_not_an_error() {
     // `verify_conn`'s own approach.
     let read_during = verify_conn(project.path());
     let rows = read_during
-        .raw_query("MATCH (s:Symbol) RETURN count(s.id)")
+        .raw_query("MATCH (s:Symbol) RETURN s.name LIMIT 1")
         .expect("a read during the rebuild window must succeed, not error");
-    assert!(!rows.is_empty());
+    assert!(
+        !rows.is_empty(),
+        "a read during the rebuild window must see real content from the still-valid old graph, \
+         not an empty result"
+    );
 
+    // Bounded wait, matching `run_cli_index`'s own `try_wait` poll loop: an
+    // unbounded `wait()` here would turn a real hang into a stalled test
+    // process instead of a clean failure.
+    let full_start = std::time::Instant::now();
+    loop {
+        if full.try_wait().unwrap().is_some() {
+            break;
+        }
+        if full_start.elapsed() > CLI_INDEX_DEADLINE {
+            let _ = full.kill();
+            let _ = full.wait();
+            panic!("full reindex did not finish within {CLI_INDEX_DEADLINE:?}");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
     let status = full.wait().unwrap();
     assert!(status.success(), "full reindex must still succeed");
 
@@ -766,14 +815,31 @@ fn a_failed_rebuild_leaves_the_live_graph_untouched() {
     }
 
     let cli = cli_binary();
-    let output = std::process::Command::new(&cli)
+    let mut child = std::process::Command::new(&cli)
         .arg("index")
         .arg("--full")
         .arg("--no-embed")
         .current_dir(project.path())
         .env("INFIGRAPH_BACKEND", "daemon")
-        .output()
+        .spawn()
         .unwrap();
+
+    // Bounded wait, matching `run_cli_index`'s own `try_wait` poll loop: an
+    // unbounded wait here would turn a real hang into a stalled test
+    // process instead of a clean failure.
+    let start = std::time::Instant::now();
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        if start.elapsed() > CLI_INDEX_DEADLINE {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("full reindex did not finish within {CLI_INDEX_DEADLINE:?}");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let output = child.wait_with_output().unwrap();
 
     #[cfg(unix)]
     {
