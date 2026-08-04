@@ -94,6 +94,12 @@ pub enum WriteRequest {
         extractions_path: PathBuf,
         use_learned: bool,
     },
+    /// Rebuild the graph from scratch. Handled entirely inside the daemon's
+    /// watch loop (`serve_full_reindex_request` in `watch/mod.rs`), which
+    /// builds a fresh database at a side path and atomically swaps it in --
+    /// see `docs/superpowers/specs/2026-08-04-daemon-routed-full-reindex-design.md`.
+    /// No fields: it always means "rebuild everything."
+    FullReindex,
 }
 
 /// Where IngestStructured's data comes from. `Inline` carries no data
@@ -669,6 +675,9 @@ pub fn serve_one_request(infigraph: &Infigraph, request_path: &Path) -> anyhow::
                     },
                 }
             }
+            WriteRequest::FullReindex => WriteResult::Err {
+                message: "FullReindex not yet implemented".to_string(),
+            },
         },
         Err(e) => WriteResult::Err {
             message: format!("failed to read/parse request: {e}"),

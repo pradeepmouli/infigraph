@@ -152,6 +152,31 @@ impl Infigraph {
         })
     }
 
+    /// Opens a plain, non-daemon-routed `Infigraph` at an explicit
+    /// `db_path`, bypassing `init()`'s `INFIGRAPH_BACKEND` env-var
+    /// branching entirely. Used by the daemon's own full-reindex handler
+    /// (`serve_full_reindex_request` in `watch/mod.rs`) to build a fresh
+    /// graph at a side path (e.g. `.infigraph/graph.rebuilding`) from
+    /// *inside* the daemon process itself -- which must never route back
+    /// through the daemon protocol to reach its own rebuild, regardless of
+    /// what `INFIGRAPH_BACKEND` is set to in this process's environment.
+    #[allow(dead_code)]
+    pub(crate) fn open_local_kuzu_at(
+        root: &Path,
+        registry: LanguageRegistry,
+        db_path: PathBuf,
+    ) -> Result<Self> {
+        let root = root.canonicalize().context("invalid project root")?;
+        let kb = graph::KuzuBackend::open(&db_path)?;
+        Ok(Self {
+            root,
+            db_path,
+            registry: std::sync::Arc::new(registry),
+            backend_kind: BackendKind::Kuzu(kb),
+            namespace: None,
+        })
+    }
+
     /// Initialize the graph store (creates DB on first run).
     /// On corruption, wipes the graph directory and retries.
     ///
@@ -1111,5 +1136,46 @@ mod tests {
             "the live db_path must either be gone or be the freshly rebuilt, openable database \
              -- never the old corrupt content left in place"
         );
+    }
+
+    /// `open_local_kuzu_at` is what the daemon's own full-reindex handler
+    /// uses to build its rebuild copy -- it must ALWAYS open a plain, local
+    /// Kuzu backend, never route through the daemon protocol, regardless of
+    /// what `INFIGRAPH_BACKEND` happens to be set to in this process's own
+    /// environment (the daemon's own env has `INFIGRAPH_BACKEND=daemon` set,
+    /// since that's how it was told to run as one -- routing its own
+    /// internal rebuild back through itself would be circular and would
+    /// hang, since nothing would be listening for that self-submitted
+    /// request in time).
+    #[test]
+    fn open_local_kuzu_at_ignores_daemon_backend_env_and_uses_a_custom_path() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".infigraph")).unwrap();
+
+        let custom_db_path = root.join(".infigraph").join("graph.rebuilding");
+        let default_db_path = root.join(".infigraph").join("graph");
+
+        std::env::set_var("INFIGRAPH_BACKEND", "daemon");
+        let registry = LanguageRegistry::new();
+        let prism = Infigraph::open_local_kuzu_at(root, registry, custom_db_path.clone()).unwrap();
+        std::env::remove_var("INFIGRAPH_BACKEND");
+
+        assert!(
+            !prism.is_daemon_backend(),
+            "must always open plain Kuzu, never route through the daemon protocol"
+        );
+        assert!(
+            custom_db_path.exists(),
+            "backend should have created its database at the custom path"
+        );
+        assert!(
+            !default_db_path.exists(),
+            "must not touch the default .infigraph/graph path"
+        );
+
+        // Confirm it's genuinely usable, not just constructed.
+        let backend = prism.backend().unwrap();
+        assert!(backend.get_file_hashes().unwrap().is_empty());
     }
 }
