@@ -347,7 +347,13 @@ where
                             // than touching the graph directly here -- this
                             // closes a pre-existing gap where watch-triggered
                             // removal never took `index.lock` at all.
-                            queue.lock().unwrap().add_removal(rel);
+                            // `add_watch_removal` (not `add_removal`) because
+                            // this is a real filesystem removal event: `path`
+                            // is already gone from disk, so there is no way
+                            // to tell here whether it named a file or a
+                            // directory -- the drain step scans for and
+                            // removes anything nested under it too.
+                            queue.lock().unwrap().add_watch_removal(rel);
                             changes_since_periodic += 1;
                             on_event(WatchEvent {
                                 kind: watch_kind.clone(),
@@ -846,29 +852,51 @@ fn route_or_serve_request<MR>(
                 kind: WaiterKind::Index,
                 use_learned: false,
                 reply_path,
+                paths: None,
             });
             drop(q);
             std::fs::remove_file(path).ok();
         }
         WriteRequest::Index { paths: Some(paths) } => {
             let mut q = queue.lock().unwrap();
+            let mut rel_paths = Vec::with_capacity(paths.len());
             for p in paths {
-                let rel = p.to_string_lossy().replace('\\', "/");
-                q.add_raw(rel);
+                // `p` may be absolute -- `Infigraph::index_file`/`index_files`
+                // both forward the caller's path verbatim (absolute paths are
+                // an explicitly documented option), and `extract_paths` below
+                // joins it onto `root` unnormalized, which for an absolute
+                // path is a no-op join that leaves it absolute. Mirrors the
+                // batch-flush block above.
+                let rel = p
+                    .strip_prefix(root)
+                    .map(|r| r.to_string_lossy().replace('\\', "/"))
+                    .unwrap_or_else(|_| p.to_string_lossy().replace('\\', "/"));
+                q.add_raw(rel.clone());
+                rel_paths.push(rel);
             }
             q.add_waiter(Waiter {
                 kind: WaiterKind::Index,
                 use_learned: false,
                 reply_path,
+                paths: Some(rel_paths),
             });
             drop(q);
             std::fs::remove_file(path).ok();
         }
         WriteRequest::UpsertFilesBulk {
-            extractions_path, ..
+            extractions_path,
+            // `existing_hashes_empty` is a snapshot the client captured when
+            // it built this request; it's not threaded through the queue
+            // because `execute_drain` recomputes the same flag itself, at
+            // actual drain time, from the backend's live file-hash state --
+            // strictly fresher than the client's snapshot, especially once
+            // other producers' work has been folded into the same drain.
+            // Dropped deliberately, not an oversight.
+            ..
         } => match crate::daemon_protocol::read_extractions_json(&extractions_path) {
             Ok(extractions) => {
                 let mut q = queue.lock().unwrap();
+                let rel_paths: Vec<String> = extractions.iter().map(|e| e.file.clone()).collect();
                 for extraction in extractions {
                     q.add_structured(extraction);
                 }
@@ -876,6 +904,7 @@ fn route_or_serve_request<MR>(
                     kind: WaiterKind::UpsertFilesBulk,
                     use_learned: false,
                     reply_path,
+                    paths: Some(rel_paths),
                 });
                 drop(q);
                 std::fs::remove_file(&extractions_path).ok();
@@ -889,6 +918,7 @@ fn route_or_serve_request<MR>(
         },
         WriteRequest::RemoveFiles { files } => {
             let mut q = queue.lock().unwrap();
+            let rel_paths = files.clone();
             for f in files {
                 q.add_removal(f);
             }
@@ -896,6 +926,7 @@ fn route_or_serve_request<MR>(
                 kind: WaiterKind::RemoveFiles,
                 use_learned: false,
                 reply_path,
+                paths: Some(rel_paths),
             });
             drop(q);
             std::fs::remove_file(path).ok();
@@ -913,6 +944,10 @@ fn route_or_serve_request<MR>(
                     kind: WaiterKind::ResolveCalls,
                     use_learned,
                     reply_path,
+                    // ResolveCalls replies carry `ResolveStats` (call-edge
+                    // counts), not a file count -- not path-attributable the
+                    // way Index/UpsertFilesBulk/RemoveFiles are.
+                    paths: None,
                 });
                 drop(q);
                 std::fs::remove_file(&extractions_path).ok();
@@ -1125,11 +1160,13 @@ mod tests {
             kind: crate::watch::queue::WaiterKind::Index,
             use_learned: false,
             reply_path: ok_reply.clone(),
+            paths: None,
         });
         queue.add_waiter(crate::watch::queue::Waiter {
             kind: crate::watch::queue::WaiterKind::Index,
             use_learned: false,
             reply_path: fail_reply.clone(),
+            paths: None,
         });
         let drained = queue.drain();
 
@@ -1274,6 +1311,57 @@ mod tests {
             "watch_project delivered no events for a change under a non-canonical \
              (symlinked) root — the root.canonicalize() call in \
              watch_project_with_periodic may have regressed"
+        );
+    }
+
+    /// Regression test for a final-review Critical finding: `WriteRequest::Index
+    /// { paths: Some(paths) }` used to enqueue each path via
+    /// `p.to_string_lossy()` without stripping `root` first, so an absolute
+    /// path -- an explicitly documented option on `Infigraph::index_file`/
+    /// `index_files`, both of which forward the caller's path verbatim into
+    /// this same request type -- ended up keyed by its absolute string in
+    /// the queue. `extract_paths` then joins that onto `root`, which for an
+    /// absolute path is a no-op join that leaves it absolute, so
+    /// `FileExtraction.file` (and therefore the resulting graph node's id)
+    /// ended up absolute too: a second `File` node alongside the real
+    /// relative one, un-deduplicated and never cleaned up by `remove_file`.
+    #[test]
+    fn route_or_serve_index_request_normalizes_an_absolute_path_to_relative_before_enqueuing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        std::fs::write(root.join("foo.py"), "def foo():\n    pass\n").unwrap();
+
+        let abs_path = root.join("foo.py");
+        let request = crate::daemon_protocol::WriteRequest::Index {
+            paths: Some(vec![abs_path]),
+        };
+        let request_path = root.join("test.request");
+        std::fs::write(&request_path, serde_json::to_string(&request).unwrap()).unwrap();
+
+        let queue = Arc::new(Mutex::new(crate::watch::queue::IndexWorkQueue::new()));
+        let mut held: Option<Arc<Infigraph>> = None;
+        route_or_serve_request(
+            &root,
+            &request_path,
+            &queue,
+            &|| Ok(crate::lang::LanguageRegistry::new()),
+            &mut held,
+            false,
+        );
+
+        let drained = queue.lock().unwrap().drain();
+        assert_eq!(drained.items.len(), 1, "expected exactly one queued item");
+        assert!(
+            drained.items.contains_key("foo.py"),
+            "an absolute input path must be normalized to a root-relative key \
+             before enqueuing, got keys: {:?}",
+            drained.items.keys().collect::<Vec<_>>()
+        );
+
+        assert_eq!(
+            drained.waiters[0].paths,
+            Some(vec!["foo.py".to_string()]),
+            "the waiter's own scoped paths must also be relative"
         );
     }
 }

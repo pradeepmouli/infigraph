@@ -4,6 +4,7 @@ use crate::resolve::ResolveStats;
 use crate::watch::queue::{DrainedQueue, PendingIndexItem, WaiterKind};
 use crate::Infigraph;
 use anyhow::Result;
+use std::path::Path;
 
 /// What the unified drain actually did, for the batch-flush path's
 /// existing downstream steps (embedding updates, cross-file-call event
@@ -46,11 +47,14 @@ pub(crate) fn execute_drain(infigraph: &Infigraph, drained: DrainedQueue) -> Res
             // A whole-project scan finding a change for a path that ALSO
             // has an explicit pending item takes a back seat to that
             // explicit item (it's more specific/recent); only add what
-            // isn't already covered.
+            // isn't already covered. `scan_changed_files` already parsed
+            // this file -- keep that parse (push into `pre_parsed`) instead
+            // of discarding it down to just `.file` and re-parsing it from
+            // disk via `extract_paths` below.
             if !pre_parsed.iter().any(|e| e.file == extraction.file)
                 && !to_extract.contains(&extraction.file)
             {
-                to_extract.push(extraction.file);
+                pre_parsed.push(extraction);
             }
         }
         whole_project_stale = scan.stale_files;
@@ -64,11 +68,19 @@ pub(crate) fn execute_drain(infigraph: &Infigraph, drained: DrainedQueue) -> Res
 
     let mut extractions = freshly_extracted;
     extractions.extend(pre_parsed);
+    let extractions_count = extractions.len();
 
     let mut removals: Vec<String> = drained.removals.into_iter().collect();
     removals.extend(whole_project_stale);
     for path in &removals {
         let _ = backend.remove_file(path);
+    }
+    // A removal that came from a real filesystem event, where whether the
+    // now-gone path was a file or a directory can no longer be determined --
+    // also scan for and remove anything still in the graph under it as a
+    // directory prefix. A no-op query for a path that was actually a file.
+    for prefix in &drained.removal_prefixes {
+        let _ = infigraph.remove_files_by_prefix(Path::new(prefix));
     }
 
     if !extractions.is_empty() {
@@ -85,10 +97,15 @@ pub(crate) fn execute_drain(infigraph: &Infigraph, drained: DrainedQueue) -> Res
     } else {
         None
     };
-    let mut resolve_extractions = extractions.clone();
-    resolve_extractions.extend(resolve_only);
+    // Moved into the resolve set (rather than cloned) to avoid a full deep
+    // copy of every symbol/relation/statement in the batch -- the
+    // upsert-only view (returned in `DrainOutcome`, and used for the
+    // Index/UpsertFilesBulk waiter replies below) is restored afterward by
+    // truncating off the `resolve_only` tail, since nothing else needs
+    // those elements once `resolve_calls` has run.
+    extractions.extend(resolve_only);
     let resolve_stats = backend
-        .resolve_calls(&resolve_extractions, learned.as_ref())
+        .resolve_calls(&extractions, learned.as_ref())
         .unwrap_or_else(|e| {
             eprintln!("warning: call resolution failed: {e}");
             ResolveStats {
@@ -99,21 +116,39 @@ pub(crate) fn execute_drain(infigraph: &Infigraph, drained: DrainedQueue) -> Res
                 inherits_resolved: 0,
             }
         });
+    extractions.truncate(extractions_count);
 
     for waiter in &drained.waiters {
+        // Scoped to the waiter's own requested paths when it named any --
+        // otherwise a targeted request (e.g. a single-file `Index`) would
+        // report a count that includes unrelated concurrent work folded
+        // into the same drain. `paths: None` means the waiter is inherently
+        // whole-batch scoped (whole-project `Index`), for which the
+        // batch-wide count below is the correct answer.
         let result = match waiter.kind {
-            WaiterKind::Index => WriteResult::Ok {
-                total_files: extractions.len(),
-                indexed_files: extractions.len(),
-            },
-            WaiterKind::UpsertFilesBulk => WriteResult::Ok {
-                total_files: extractions.len(),
-                indexed_files: extractions.len(),
-            },
-            WaiterKind::RemoveFiles => WriteResult::Ok {
-                total_files: removals.len(),
-                indexed_files: removals.len(),
-            },
+            WaiterKind::Index | WaiterKind::UpsertFilesBulk => {
+                let count = match &waiter.paths {
+                    Some(paths) => extractions
+                        .iter()
+                        .filter(|&e| paths.contains(&e.file))
+                        .count(),
+                    None => extractions.len(),
+                };
+                WriteResult::Ok {
+                    total_files: count,
+                    indexed_files: count,
+                }
+            }
+            WaiterKind::RemoveFiles => {
+                let count = match &waiter.paths {
+                    Some(paths) => removals.iter().filter(|&r| paths.contains(r)).count(),
+                    None => removals.len(),
+                };
+                WriteResult::Ok {
+                    total_files: count,
+                    indexed_files: count,
+                }
+            }
             WaiterKind::ResolveCalls => WriteResult::ResolveOk(resolve_stats.clone()),
         };
         write_atomic(&waiter.reply_path, &serde_json::to_string(&result)?)?;
@@ -202,6 +237,7 @@ mod tests {
             kind: WaiterKind::Index,
             use_learned: false,
             reply_path: result_path.clone(),
+            paths: None,
         });
 
         let drained = queue.drain();
@@ -263,5 +299,142 @@ mod tests {
             "a redundant upsert would not change the hash count here, but IS a real wasted write -- \
              this assertion documents the guarantee this test exists to protect"
         );
+    }
+
+    /// Regression test for a final-review Critical finding: the watch loop's
+    /// `WatchEventKind::Removed` handling used to call both `remove_file`
+    /// (the exact path) and `remove_files_by_prefix` (anything nested under
+    /// it, for directory removal) directly and unlocked. Coalescing removal
+    /// into the queue (`add_removal`) kept only the exact-path removal --
+    /// deleting a whole directory left every file that had been under it
+    /// stranded in the graph forever, since the real daemon runs with no
+    /// periodic whole-project scan to eventually notice the drift.
+    /// `add_watch_removal` (used only for genuine filesystem removal events)
+    /// restores the directory-prefix scan/removal alongside the exact-path
+    /// removal.
+    #[test]
+    fn a_watch_removal_of_a_directory_removes_every_file_that_was_under_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir(root.join("sub")).unwrap();
+        fs::write(root.join("sub/a.py"), "def a():\n    pass\n").unwrap();
+        fs::write(root.join("sub/b.py"), "def b():\n    pass\n").unwrap();
+        fs::write(root.join("top.py"), "def top():\n    pass\n").unwrap();
+
+        let prism = open_project(root);
+        prism.index().unwrap();
+
+        let backend = prism.backend().unwrap();
+        let hashes_before = backend.get_file_hashes().unwrap();
+        assert!(hashes_before.contains_key("sub/a.py"));
+        assert!(hashes_before.contains_key("sub/b.py"));
+        assert!(hashes_before.contains_key("top.py"));
+
+        // The directory is already gone from disk by the time a real
+        // filesystem removal event would fire -- nothing left to inspect to
+        // tell it apart from a single-file removal.
+        fs::remove_dir_all(root.join("sub")).unwrap();
+
+        let mut queue = IndexWorkQueue::new();
+        queue.add_watch_removal("sub".to_string());
+        let drained = queue.drain();
+        let outcome = execute_drain(&prism, drained).unwrap();
+        assert!(outcome.extractions.is_empty());
+
+        let hashes_after = backend.get_file_hashes().unwrap();
+        assert!(
+            !hashes_after.contains_key("sub/a.py"),
+            "a file under the deleted directory must be removed from the graph"
+        );
+        assert!(
+            !hashes_after.contains_key("sub/b.py"),
+            "a file under the deleted directory must be removed from the graph"
+        );
+        assert!(
+            hashes_after.contains_key("top.py"),
+            "a file outside the deleted directory must survive"
+        );
+    }
+
+    /// Regression test for a final-review Important finding: every
+    /// Index/UpsertFilesBulk waiter folded into a drain used to be told
+    /// `extractions.len()` for the WHOLE merged batch, even when its own
+    /// request named only one file -- so a targeted single-file `Index`
+    /// request could report having indexed hundreds of files that were
+    /// actually someone else's concurrent work riding along in the same
+    /// drain. `Waiter::paths` lets a waiter's reply be scoped to what it
+    /// actually asked for.
+    #[test]
+    fn a_targeted_waiter_reports_a_count_scoped_to_its_own_request_not_the_whole_batch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("a.py"), "def a():\n    pass\n").unwrap();
+        fs::write(root.join("b.py"), "def b():\n    pass\n").unwrap();
+        let prism = open_project(root);
+        prism.index().unwrap();
+
+        // Both files changed since the last index -- both will be
+        // re-extracted by this one combined drain.
+        fs::write(
+            root.join("a.py"),
+            "def a():\n    pass\n\ndef a2():\n    pass\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("b.py"),
+            "def b():\n    pass\n\ndef b2():\n    pass\n",
+        )
+        .unwrap();
+
+        let mut queue = IndexWorkQueue::new();
+        queue.add_raw("a.py".to_string());
+        queue.add_raw("b.py".to_string());
+
+        // A targeted waiter that only ever asked about a.py.
+        let targeted_reply = tmp.path().join("targeted.result");
+        queue.add_waiter(Waiter {
+            kind: WaiterKind::Index,
+            use_learned: false,
+            reply_path: targeted_reply.clone(),
+            paths: Some(vec!["a.py".to_string()]),
+        });
+
+        // A whole-project waiter, riding along in the same drain.
+        let whole_project_reply = tmp.path().join("whole-project.result");
+        queue.add_waiter(Waiter {
+            kind: WaiterKind::Index,
+            use_learned: false,
+            reply_path: whole_project_reply.clone(),
+            paths: None,
+        });
+
+        let drained = queue.drain();
+        let outcome = execute_drain(&prism, drained).unwrap();
+        assert_eq!(
+            outcome.extractions.len(),
+            2,
+            "test setup is wrong: both a.py and b.py should have been re-extracted"
+        );
+
+        let targeted: WriteResult =
+            serde_json::from_str(&fs::read_to_string(&targeted_reply).unwrap()).unwrap();
+        match targeted {
+            WriteResult::Ok { indexed_files, .. } => assert_eq!(
+                indexed_files, 1,
+                "a waiter that only asked about a.py must not be told about b.py's \
+                 concurrent, unrelated work"
+            ),
+            other => panic!("expected WriteResult::Ok, got {other:?}"),
+        }
+
+        let whole_project: WriteResult =
+            serde_json::from_str(&fs::read_to_string(&whole_project_reply).unwrap()).unwrap();
+        match whole_project {
+            WriteResult::Ok { indexed_files, .. } => assert_eq!(
+                indexed_files, 2,
+                "a paths: None waiter is inherently whole-batch scoped"
+            ),
+            other => panic!("expected WriteResult::Ok, got {other:?}"),
+        }
     }
 }
