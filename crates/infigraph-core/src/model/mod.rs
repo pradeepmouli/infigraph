@@ -52,7 +52,7 @@ pub struct Span {
 }
 
 /// A symbol (entity) extracted from the AST.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Symbol {
     /// Unique ID: "file::name" or "file::class::method"
     pub id: String,
@@ -120,7 +120,7 @@ impl RelationKind {
 }
 
 /// A relationship (edge) between two symbols.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Relation {
     pub source_id: String,
     pub target_id: String,
@@ -224,7 +224,7 @@ impl StatementKind {
 }
 
 /// A control-flow statement inside a function/method body.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Statement {
     pub id: String,
     pub kind: StatementKind,
@@ -236,7 +236,7 @@ pub struct Statement {
 }
 
 /// Result of extracting a single file.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FileExtraction {
     pub file: String,
     pub language: String,

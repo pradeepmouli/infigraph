@@ -456,8 +456,15 @@ impl Infigraph {
         backend.import_scip_index(scip_path, Some(&self.root))
     }
 
-    /// Backend-agnostic index path (used for Neo4j and future backends).
-    fn index_via_backend(&self, backend: &dyn graph::GraphBackend) -> Result<IndexResult> {
+    /// Scans every file under `self.root`, hash-diffs against what the
+    /// backend already has, and extracts only what changed. Does not write
+    /// anything -- callers (both `index_via_backend` and the daemon drain's
+    /// whole-project handling) own the upsert/resolve/prune steps, so this
+    /// stays a pure "what needs work" computation reusable by both.
+    pub(crate) fn scan_changed_files(
+        &self,
+        backend: &dyn graph::GraphBackend,
+    ) -> Result<ScanResult> {
         let files = self.collect_files()?;
         let total = files.len();
 
@@ -497,48 +504,78 @@ impl Infigraph {
             })
             .collect();
 
-        let indexed = extractions.len();
+        let current_files: std::collections::HashSet<String> = files
+            .iter()
+            .filter_map(|p| {
+                p.strip_prefix(&self.root).ok().map(|r| {
+                    let raw = r.to_string_lossy().replace('\\', "/");
+                    match ns {
+                        Some(prefix) => format!("{}/{}", prefix, raw),
+                        None => raw,
+                    }
+                })
+            })
+            .collect();
+        let stale_files: Vec<String> = existing_hashes
+            .keys()
+            .filter(|k| !current_files.contains(k.as_str()))
+            .cloned()
+            .collect();
 
-        if !extractions.is_empty() {
+        Ok(ScanResult {
+            total_files: total,
+            extractions,
+            stale_files,
+        })
+    }
+
+    /// Extracts `rel_paths` fresh from disk, unconditionally (no hash
+    /// comparison -- the caller has already decided these need re-parsing).
+    /// Used by the daemon drain for `Raw` queue entries.
+    #[allow(dead_code)]
+    pub(crate) fn extract_paths(&self, rel_paths: &[String]) -> Vec<FileExtraction> {
+        rel_paths
+            .par_iter()
+            .filter_map(|rel_path| {
+                let abs = self.root.join(rel_path);
+                let source = std::fs::read(&abs).ok()?;
+                let pack = self.registry.for_file_with_content(rel_path, &source)?;
+                extract::extract_file(rel_path, &source, pack).ok()
+            })
+            .collect()
+    }
+
+    /// Backend-agnostic index path (used for Neo4j and future backends).
+    fn index_via_backend(&self, backend: &dyn graph::GraphBackend) -> Result<IndexResult> {
+        let scan = self.scan_changed_files(backend)?;
+        let indexed = scan.extractions.len();
+
+        if !scan.extractions.is_empty() {
             eprintln!("Writing: {} files (backend bulk)", indexed);
             let write_start = std::time::Instant::now();
-            backend.upsert_files_bulk(&extractions, existing_hashes.is_empty())?;
+            backend.upsert_files_bulk(
+                &scan.extractions,
+                backend.get_file_hashes().unwrap_or_default().is_empty(),
+            )?;
             eprintln!("Write complete: {}s", write_start.elapsed().as_secs());
         }
 
-        // Prune stale files
-        {
-            let current_files: std::collections::HashSet<String> = files
-                .iter()
-                .filter_map(|p| {
-                    p.strip_prefix(&self.root).ok().map(|r| {
-                        let raw = r.to_string_lossy().replace('\\', "/");
-                        match ns {
-                            Some(prefix) => format!("{}/{}", prefix, raw),
-                            None => raw,
-                        }
-                    })
-                })
-                .collect();
-            let stale: Vec<String> = existing_hashes
-                .keys()
-                .filter(|k| !current_files.contains(k.as_str()))
-                .cloned()
-                .collect();
-            if !stale.is_empty() {
-                eprintln!("[index] pruning {} stale file(s) from graph", stale.len());
-                for f in &stale {
-                    let _ = backend.remove_file(f);
-                }
+        if !scan.stale_files.is_empty() {
+            eprintln!(
+                "[index] pruning {} stale file(s) from graph",
+                scan.stale_files.len()
+            );
+            for f in &scan.stale_files {
+                let _ = backend.remove_file(f);
             }
         }
 
         let resolve_start = std::time::Instant::now();
-        if !extractions.is_empty() {
+        if !scan.extractions.is_empty() {
             eprintln!("Resolving: calls + inheritance for {} files", indexed);
         }
         let resolve_stats = backend
-            .resolve_calls(&extractions, None)
+            .resolve_calls(&scan.extractions, None)
             .unwrap_or_else(|e| {
                 eprintln!("warning: call resolution failed: {e}");
                 resolve::ResolveStats {
@@ -549,7 +586,7 @@ impl Infigraph {
                     inherits_resolved: 0,
                 }
             });
-        if !extractions.is_empty() {
+        if !scan.extractions.is_empty() {
             eprintln!(
                 "Resolve complete: {}s ({} resolved, {} unresolved)",
                 resolve_start.elapsed().as_secs(),
@@ -559,9 +596,9 @@ impl Infigraph {
         }
 
         Ok(IndexResult {
-            total_files: total,
+            total_files: scan.total_files,
             indexed_files: indexed,
-            extractions,
+            extractions: scan.extractions,
             resolve_stats,
         })
     }
@@ -825,6 +862,14 @@ pub struct IndexResult {
     pub indexed_files: usize,
     pub extractions: Vec<FileExtraction>,
     pub resolve_stats: resolve::ResolveStats,
+}
+
+/// The result of `Infigraph::scan_changed_files`: everything that needs
+/// work, without having written anything yet.
+pub(crate) struct ScanResult {
+    pub total_files: usize,
+    pub extractions: Vec<FileExtraction>,
+    pub stale_files: Vec<String>,
 }
 
 #[cfg(test)]
