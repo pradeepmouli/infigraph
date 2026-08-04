@@ -535,6 +535,14 @@ fn finish_drain(
     }
 }
 
+/// `execute_drain` writes each waiter's reply as the last step of its own
+/// internal loop, using `?` to propagate a `write_atomic` failure -- so an
+/// ordinary `execute_drain` error can still leave some waiters *earlier* in
+/// that loop already answered correctly on disk. Skipping any `reply_path`
+/// that already exists avoids clobbering those real answers with a false
+/// `Err`; `write_atomic` writes to a temp file and renames into place, so an
+/// existing reply file is always a complete, correctly-written one, never a
+/// partial write a caller could race against.
 fn reply_err_to_waiters(waiter_replies: &[PathBuf], message: &str) {
     let result = crate::daemon_protocol::WriteResult::Err {
         message: message.to_string(),
@@ -547,6 +555,9 @@ fn reply_err_to_waiters(waiter_replies: &[PathBuf], message: &str) {
         }
     };
     for reply_path in waiter_replies {
+        if reply_path.exists() {
+            continue;
+        }
         if let Err(e) = crate::daemon_protocol::write_atomic(reply_path, &json) {
             eprintln!(
                 "[watch] could not write drain failure reply to {}: {e}",
@@ -1084,6 +1095,110 @@ mod tests {
                     "the reply must say the drain panicked, got: {message}"
                 ),
                 other => panic!("expected WriteResult::Err, got {other:?}"),
+            }
+        }
+    }
+
+    /// Regression test for a review finding on `finish_drain`: an *ordinary*
+    /// `execute_drain` failure (not a panic) used to answer every retained
+    /// waiter with `WriteResult::Err`, even though `execute_drain` writes
+    /// each waiter's reply sequentially as its own last step -- so a
+    /// `write_atomic` failure partway through that loop left *earlier*
+    /// waiters already holding a correct, real `Ok` reply on disk.
+    /// `finish_drain`'s blanket overwrite told those already-succeeded
+    /// clients their write had failed, when it had actually succeeded.
+    #[test]
+    fn finish_drain_does_not_overwrite_a_reply_execute_drain_already_wrote() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        let mut prism = Infigraph::open(root, crate::lang::LanguageRegistry::new()).unwrap();
+        prism.init().unwrap();
+
+        let ok_reply = root.join("waiter-ok.result");
+        let fail_dir = root.join("readonly");
+        std::fs::create_dir(&fail_dir).unwrap();
+        let fail_reply = fail_dir.join("waiter-fail.result");
+
+        let mut queue = crate::watch::queue::IndexWorkQueue::new();
+        queue.add_waiter(crate::watch::queue::Waiter {
+            kind: crate::watch::queue::WaiterKind::Index,
+            use_learned: false,
+            reply_path: ok_reply.clone(),
+        });
+        queue.add_waiter(crate::watch::queue::Waiter {
+            kind: crate::watch::queue::WaiterKind::Index,
+            use_learned: false,
+            reply_path: fail_reply.clone(),
+        });
+        let drained = queue.drain();
+
+        // `write_atomic` calls `File::create` in the reply's parent
+        // directory -- read-only permissions make that fail for the second
+        // waiter only, after the first waiter's reply has already been
+        // written successfully.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fail_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        }
+        let drain_result = crate::watch::drain::execute_drain(&prism, drained);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fail_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let err = match drain_result {
+            Err(e) => e,
+            Ok(_) => panic!("test setup is wrong: expected execute_drain to fail on fail_reply"),
+        };
+
+        // Confirm the partial-success setup: the first waiter really did
+        // get a correct Ok reply from execute_drain itself, and the second
+        // was never reached.
+        let ok_before: crate::daemon_protocol::WriteResult =
+            serde_json::from_str(&std::fs::read_to_string(&ok_reply).unwrap()).unwrap();
+        assert!(
+            matches!(ok_before, crate::daemon_protocol::WriteResult::Ok { .. }),
+            "test setup is wrong: execute_drain should have answered the first waiter"
+        );
+        assert!(
+            !fail_reply.exists(),
+            "test setup is wrong: execute_drain should not have reached the second waiter"
+        );
+
+        // Route that failure through the real recovery path a background
+        // drain task uses, and confirm it does not clobber the first
+        // waiter's already-correct reply.
+        let guard = match begin_index_op(root, "test", Duration::ZERO).unwrap() {
+            IndexOpOutcome::Acquired(g) => g,
+            IndexOpOutcome::AlreadyRunning(_) => panic!("test setup is wrong: lock contended"),
+        };
+        let joined: std::result::Result<DrainTaskOutput, tokio::task::JoinError> =
+            Ok(DrainTaskOutput {
+                guard,
+                result: Err(err),
+            });
+        let (guard, outcome) = finish_drain(joined, &[ok_reply.clone(), fail_reply.clone()]);
+        assert!(guard.is_some());
+        assert!(outcome.is_none());
+
+        let ok_after: crate::daemon_protocol::WriteResult =
+            serde_json::from_str(&std::fs::read_to_string(&ok_reply).unwrap()).unwrap();
+        match ok_after {
+            crate::daemon_protocol::WriteResult::Ok { .. } => {}
+            other => panic!(
+                "finish_drain overwrote the first waiter's already-correct Ok reply with {other:?}"
+            ),
+        }
+
+        let fail_after: crate::daemon_protocol::WriteResult =
+            serde_json::from_str(&std::fs::read_to_string(&fail_reply).unwrap()).unwrap();
+        match fail_after {
+            crate::daemon_protocol::WriteResult::Err { .. } => {}
+            other => {
+                panic!("expected the never-answered waiter to get WriteResult::Err, got {other:?}")
             }
         }
     }
