@@ -1,4 +1,4 @@
-use infigraph_core::quarantine::quarantine_graph;
+use infigraph_core::quarantine::{quarantine_graph, retire_previous_graph};
 use std::fs;
 
 #[test]
@@ -184,4 +184,80 @@ fn quarantine_moves_wal_family_siblings_with_content_intact() {
         b"checkpoint content",
         "quarantined .wal.checkpoint sibling content must be preserved"
     );
+}
+
+/// A full reindex retires the healthy graph it just superseded. That must
+/// go into its own pool: the `.corrupt.` pool exists to preserve corruption
+/// evidence for human diagnosis (R3.1.2), and routine reindexes filing
+/// healthy graphs into it would evict real evidence within two runs and
+/// label healthy graphs as corrupt.
+#[test]
+fn retiring_a_superseded_graph_does_not_touch_the_corruption_pool() {
+    let dir = tempfile::tempdir().unwrap();
+    let ig = dir.path().join(".infigraph");
+    fs::create_dir_all(&ig).unwrap();
+
+    fs::write(ig.join("graph.corrupt.100"), b"real corruption evidence").unwrap();
+    fs::write(ig.join("graph"), b"superseded but healthy").unwrap();
+    fs::write(ig.join("graph.wal"), b"its wal").unwrap();
+
+    let retired = retire_previous_graph(&ig, "graph").unwrap();
+
+    assert!(
+        retired
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("graph.previous."),
+        "a superseded graph must not be labelled `.corrupt.`, got {}",
+        retired.display()
+    );
+    assert_eq!(fs::read(&retired).unwrap(), b"superseded but healthy");
+    let stem = retired.file_name().unwrap().to_string_lossy().into_owned();
+    assert_eq!(
+        fs::read(ig.join(format!("{stem}.wal"))).unwrap(),
+        b"its wal",
+        "the retired graph's WAL family must travel with it"
+    );
+    assert!(
+        ig.join("graph.corrupt.100").exists(),
+        "retiring a healthy graph must not evict corruption evidence"
+    );
+}
+
+/// The retirement pool is bounded at one: it holds full graph copies of a
+/// routine operation's output, so an unbounded (or even N=2) pool is real
+/// disk cost for little added rollback value.
+#[test]
+fn retirement_pool_keeps_only_the_most_recent_superseded_graph() {
+    let dir = tempfile::tempdir().unwrap();
+    let ig = dir.path().join(".infigraph");
+    fs::create_dir_all(&ig).unwrap();
+
+    fs::write(ig.join("graph.previous.100"), b"older").unwrap();
+    fs::write(ig.join("graph.previous.100.wal"), b"older wal").unwrap();
+    fs::write(ig.join("graph"), b"newest").unwrap();
+
+    let retired = retire_previous_graph(&ig, "graph").unwrap();
+
+    assert!(
+        !ig.join("graph.previous.100").exists(),
+        "the previously-retired graph must be evicted"
+    );
+    assert!(
+        !ig.join("graph.previous.100.wal").exists(),
+        "an evicted entry's WAL siblings must go with it, not leak"
+    );
+    assert!(retired.exists());
+
+    let remaining = fs::read_dir(&ig)
+        .unwrap()
+        .flatten()
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with("graph.previous.")
+        })
+        .count();
+    assert_eq!(remaining, 1, "retirement pool must never exceed N=1");
 }

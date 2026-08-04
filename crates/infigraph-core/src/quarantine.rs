@@ -6,6 +6,18 @@ use std::path::{Path, PathBuf};
 /// filesystem mtime) is deleted first.
 const QUARANTINE_RETENTION: usize = 2;
 
+/// Infix distinguishing the corruption-evidence pool (`graph.corrupt.<ts>`).
+const CORRUPT_INFIX: &str = "corrupt";
+
+/// Infix for the superseded-by-full-reindex pool (`graph.previous.<ts>`).
+const PREVIOUS_INFIX: &str = "previous";
+
+/// How many superseded-by-full-reindex copies to retain. Deliberately
+/// tighter than `QUARANTINE_RETENTION`: this pool holds *healthy* graphs
+/// filed aside by a routine operation, so one rollback candidate is the
+/// useful amount and each extra copy is a full graph's worth of disk.
+const PREVIOUS_RETENTION: usize = 1;
+
 fn now_epoch_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -24,10 +36,46 @@ fn now_epoch_secs() -> u64 {
 /// mirroring `wipe_graph`'s existing contract where the caller already
 /// acquired `graph.lock` before deciding to wipe.
 pub fn quarantine_graph(infigraph_dir: &Path, graph_name: &str) -> Result<PathBuf> {
-    evict_oldest_if_at_bound(infigraph_dir, graph_name)?;
+    move_graph_aside(
+        infigraph_dir,
+        graph_name,
+        CORRUPT_INFIX,
+        QUARANTINE_RETENTION,
+    )
+}
+
+/// Rename the current live graph aside as `<graph_name>.previous.<ts>` after
+/// a successful full reindex has built its replacement, keeping a bounded
+/// rollback pool of superseded-but-healthy graphs.
+///
+/// Deliberately a *separate* pool from `quarantine_graph`'s: that one exists
+/// to preserve corruption evidence for human diagnosis (R3.1.2), and routine
+/// full reindexes filing healthy graphs into it would both evict real
+/// evidence and label healthy graphs `.corrupt.`.
+///
+/// Same locking contract as `quarantine_graph`: the caller must already hold
+/// whatever write lock guards `graph_name`.
+pub fn retire_previous_graph(infigraph_dir: &Path, graph_name: &str) -> Result<PathBuf> {
+    move_graph_aside(
+        infigraph_dir,
+        graph_name,
+        PREVIOUS_INFIX,
+        PREVIOUS_RETENTION,
+    )
+}
+
+/// Shared implementation behind both bounded aside-pools. `infix` selects
+/// the pool (`"corrupt"` / `"previous"`); `retention` is that pool's bound.
+fn move_graph_aside(
+    infigraph_dir: &Path,
+    graph_name: &str,
+    infix: &str,
+    retention: usize,
+) -> Result<PathBuf> {
+    evict_oldest_if_at_bound(infigraph_dir, graph_name, infix, retention)?;
 
     let ts = now_epoch_secs();
-    let quarantine_stem = format!("{graph_name}.corrupt.{ts}");
+    let quarantine_stem = format!("{graph_name}.{infix}.{ts}");
     let quarantine_path = infigraph_dir.join(&quarantine_stem);
     let source = infigraph_dir.join(graph_name);
 
@@ -60,49 +108,27 @@ pub fn quarantine_graph(infigraph_dir: &Path, graph_name: &str) -> Result<PathBu
     // remove the original, so even a failure removing the original
     // afterward is harmless (the caller's fallback cleanup just finishes
     // that removal; quarantine already holds the evidence).
-    let wal = infigraph_dir.join(format!("{graph_name}.wal"));
-    if wal.exists() {
-        let dest = infigraph_dir.join(format!("{quarantine_stem}.wal"));
-        if let Err(e) = move_wal_sibling(&wal, &dest) {
+    for path in crate::graph::wal_family_paths(&source) {
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        // name looks like "<graph_name>.wal" or "<graph_name>.wal.checkpoint";
+        // keep everything after "<graph_name>" so the moved-aside name stays
+        // recognizable and collision-free (e.g. "graph.corrupt.<ts>.wal.checkpoint").
+        let suffix = name.strip_prefix(graph_name).unwrap_or(&name).to_owned();
+        let dest = infigraph_dir.join(format!("{quarantine_stem}{suffix}"));
+        if let Err(e) = move_wal_sibling(&path, &dest) {
             eprintln!(
                 "[quarantine] warning: could not relocate WAL sibling {} into quarantine ({e:#}) \
                  -- it may be destroyed by fallback cleanup at its original path",
-                wal.display()
+                path.display()
             );
-        }
-    }
-    if let Ok(entries) = std::fs::read_dir(infigraph_dir) {
-        let prefix = format!("{graph_name}.wal.");
-        let siblings: Vec<PathBuf> = entries
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| {
-                p.file_name()
-                    .map(|n| n.to_string_lossy().starts_with(&prefix))
-                    .unwrap_or(false)
-            })
-            .collect();
-        for path in siblings {
-            let name = path.file_name().unwrap().to_string_lossy().into_owned();
-            // name looks like "<graph_name>.wal.checkpoint"; keep everything
-            // after "<graph_name>" so the quarantined name stays recognizable
-            // and collision-free (e.g. "graph.corrupt.<ts>.wal.checkpoint").
-            let suffix = name.strip_prefix(graph_name).unwrap_or(name.as_str());
-            let dest = infigraph_dir.join(format!("{quarantine_stem}{suffix}"));
-            if let Err(e) = move_wal_sibling(&path, &dest) {
-                eprintln!(
-                    "[quarantine] warning: could not relocate WAL sibling {} into quarantine \
-                     ({e:#}) -- it may be destroyed by fallback cleanup at its original path",
-                    path.display()
-                );
-            }
         }
     }
 
     Ok(quarantine_path)
 }
 
-/// Move a WAL-family sibling into quarantine: try an atomic rename first
+/// Move a WAL-family sibling alongside the base image it belongs to: try an
+/// atomic rename first
 /// (fast, same-filesystem, the common case), and if that fails, fall back to
 /// copy+remove so a rename failure that copy wouldn't hit (e.g. certain
 /// filesystem edge cases) doesn't silently lose the file. Once the copy
@@ -110,7 +136,7 @@ pub fn quarantine_graph(infigraph_dir: &Path, graph_name: &str) -> Result<PathBu
 /// now-redundant original afterward is not treated as an error -- the
 /// caller's existing fallback cleanup will finish removing that leftover.
 /// Only returns `Err` if the content could not be relocated at all.
-fn move_wal_sibling(src: &Path, dest: &Path) -> Result<()> {
+pub(crate) fn move_wal_sibling(src: &Path, dest: &Path) -> Result<()> {
     if std::fs::rename(src, dest).is_ok() {
         return Ok(());
     }
@@ -125,8 +151,13 @@ fn move_wal_sibling(src: &Path, dest: &Path) -> Result<()> {
     Ok(())
 }
 
-fn evict_oldest_if_at_bound(infigraph_dir: &Path, graph_name: &str) -> Result<()> {
-    let prefix = format!("{graph_name}.corrupt.");
+fn evict_oldest_if_at_bound(
+    infigraph_dir: &Path,
+    graph_name: &str,
+    infix: &str,
+    retention: usize,
+) -> Result<()> {
+    let prefix = format!("{graph_name}.{infix}.");
     let mut existing: Vec<(u64, PathBuf)> = Vec::new();
     if let Ok(entries) = std::fs::read_dir(infigraph_dir) {
         for e in entries.flatten() {
@@ -138,14 +169,14 @@ fn evict_oldest_if_at_bound(infigraph_dir: &Path, graph_name: &str) -> Result<()
             }
         }
     }
-    if existing.len() < QUARANTINE_RETENTION {
+    if existing.len() < retention {
         return Ok(());
     }
     existing.sort_by_key(|(ts, _)| *ts);
-    // existing.len() >= QUARANTINE_RETENTION and we're about to add one more,
-    // so evict enough of the oldest entries to land at QUARANTINE_RETENTION - 1
-    // before the new one is created (bringing the total back to QUARANTINE_RETENTION).
-    let to_evict = existing.len() - (QUARANTINE_RETENTION - 1);
+    // existing.len() >= retention and we're about to add one more, so evict
+    // enough of the oldest entries to land at retention - 1 before the new
+    // one is created (bringing the total back to retention).
+    let to_evict = existing.len() - (retention - 1);
     for (ts, path) in existing.into_iter().take(to_evict) {
         // The quarantine target is typically a plain FILE (Kuzu's on-disk
         // graph is a single file, not a directory -- see `wipe_graph`), so
@@ -163,7 +194,7 @@ fn evict_oldest_if_at_bound(infigraph_dir: &Path, graph_name: &str) -> Result<()
         // Also evict any WAL-family siblings quarantined alongside this
         // entry (e.g. "<name>.corrupt.<ts>.wal", "...wal.checkpoint") so
         // the pool doesn't leak unbounded copies of those either.
-        let sibling_prefix = format!("{graph_name}.corrupt.{ts}.");
+        let sibling_prefix = format!("{graph_name}.{infix}.{ts}.");
         if let Ok(entries) = std::fs::read_dir(infigraph_dir) {
             for e in entries.flatten() {
                 if e.file_name().to_string_lossy().starts_with(&sibling_prefix) {
