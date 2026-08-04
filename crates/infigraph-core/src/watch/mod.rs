@@ -574,12 +574,54 @@ fn poison_watch_db(held: &mut Option<Infigraph>) {
     *held = None;
 }
 
+/// Serves a single `.request` file via `serve_one_request`, wrapped in the
+/// same `index.lock` acquisition (`begin_index_op`) the pre-`IndexWorkQueue`
+/// per-request loop used. `route_or_serve_request`'s in-scope `WriteRequest`
+/// variants are coordinated through the shared queue and drain step instead,
+/// but its fallback paths (out-of-scope variants, malformed JSON, corrupt
+/// sibling extractions files) still execute immediately here -- doing so
+/// unlocked would let them race the periodic reindex, the queue's own drain,
+/// or a concurrent CLI `infigraph index --full`, violating the single-writer
+/// invariant. On contention the `.request` file is left in place (not
+/// deleted) so it's retried on a later tick, matching the old behavior.
+fn serve_request_locked<MR>(
+    root: &Path,
+    path: &Path,
+    make_registry: &MR,
+    held: &mut Option<Infigraph>,
+) where
+    MR: Fn() -> Result<crate::lang::LanguageRegistry>,
+{
+    match begin_index_op(root, "infigraph daemon", Duration::from_secs(30)) {
+        Ok(IndexOpOutcome::Acquired(_guard)) => match watch_db(root, make_registry, held) {
+            Ok(prism) => {
+                if let Err(e) = crate::daemon_protocol::serve_one_request(prism, path) {
+                    eprintln!("[daemon] failed to serve request {}: {e}", path.display());
+                }
+            }
+            Err(e) => {
+                eprintln!("[daemon] failed to reopen graph connection, will retry: {e}");
+            }
+        },
+        Ok(o @ IndexOpOutcome::AlreadyRunning(_)) => {
+            eprintln!(
+                "[daemon] request-serving busy ({}), retrying next tick",
+                o.skip_note().unwrap_or_default()
+            );
+        }
+        Err(e) => {
+            eprintln!("[daemon] request-serving busy ({e}), retrying next tick");
+        }
+    }
+}
+
 /// Parses a `.request` file and either enqueues it (for the four
 /// index-shaped `WriteRequest` variants this design coordinates) or falls
-/// through to the existing, unmodified `serve_one_request` for everything
-/// else. Enqueued requests' `.request` file is deleted immediately (the
-/// daemon has already accepted responsibility for serving it the moment
-/// it's queued) -- the reply arrives later, written by `execute_drain`.
+/// through to `serve_request_locked` (unchanged `serve_one_request`
+/// dispatch, still under `index.lock`) for everything else. Enqueued
+/// requests' `.request` file is deleted immediately (the daemon has already
+/// accepted responsibility for serving it the moment it's queued) -- the
+/// reply arrives later, written by `execute_drain`.
 fn route_or_serve_request<MR>(
     root: &Path,
     path: &Path,
@@ -600,9 +642,7 @@ fn route_or_serve_request<MR>(
             // Malformed request JSON -- not this design's concern to
             // recover; hand off to serve_one_request, whose existing
             // corrupt-JSON handling (WriteResult::Err) already covers it.
-            if let Ok(prism) = watch_db(root, make_registry, held) {
-                let _ = crate::daemon_protocol::serve_one_request(prism, path);
-            }
+            serve_request_locked(root, path, make_registry, held);
             return;
         }
     };
@@ -650,9 +690,7 @@ fn route_or_serve_request<MR>(
             Err(_) => {
                 // Sibling extractions file missing/corrupt -- fall
                 // through to serve_one_request's existing error path.
-                if let Ok(prism) = watch_db(root, make_registry, held) {
-                    let _ = crate::daemon_protocol::serve_one_request(prism, path);
-                }
+                serve_request_locked(root, path, make_registry, held);
             }
         },
         WriteRequest::RemoveFiles { files } => {
@@ -683,16 +721,13 @@ fn route_or_serve_request<MR>(
                 std::fs::remove_file(path).ok();
             }
             Err(_) => {
-                if let Ok(prism) = watch_db(root, make_registry, held) {
-                    let _ = crate::daemon_protocol::serve_one_request(prism, path);
-                }
+                serve_request_locked(root, path, make_registry, held);
             }
         },
         _ => {
-            // The other 9 variants: unchanged behavior, immediate execution.
-            if let Ok(prism) = watch_db(root, make_registry, held) {
-                let _ = crate::daemon_protocol::serve_one_request(prism, path);
-            }
+            // The other 9 variants: unchanged behavior, immediate execution
+            // (still under index.lock, matching pre-IndexWorkQueue behavior).
+            serve_request_locked(root, path, make_registry, held);
         }
     }
 }

@@ -446,3 +446,116 @@ fn watch_triggered_file_removal_contends_with_a_held_index_lock() {
     stop_tx.send(()).unwrap();
     handle.join().unwrap().unwrap();
 }
+
+/// Regression test for the Task 3 review finding: `route_or_serve_request`'s
+/// fallback paths (the 9 out-of-scope `WriteRequest` variants, plus
+/// malformed/corrupt requests) used to call `serve_one_request` directly
+/// with no `index.lock` acquisition at all, unlike every other write path in
+/// the daemon. Proves the fix using `WriteRequest::UpsertRepo` -- one of the
+/// 9 out-of-scope variants, chosen because it's the simplest to construct
+/// (a single string field) and its handler (`GraphBackend::upsert_repo`)
+/// writes to the graph: while `index.lock` is held externally, the request
+/// must NOT be served (no `.result` file appears, and the `.request` file
+/// stays in place so it's retried); once the lock is released, it is
+/// served.
+#[test]
+fn out_of_scope_write_request_contends_with_a_held_index_lock() {
+    let project = tempfile::Builder::new()
+        .prefix("infigraph-watch-lock-oos-test-")
+        .tempdir()
+        .unwrap();
+
+    // Bootstrap so the graph exists before the watcher opens its own connection.
+    {
+        let registry = infigraph_languages::bundled_registry().unwrap();
+        let mut boot = infigraph_core::Infigraph::open(project.path(), registry).unwrap();
+        boot.init().unwrap();
+    }
+
+    // Hold index.lock externally, simulating another in-flight operation
+    // (e.g. a concurrent `infigraph index --full`).
+    let held = infigraph_core::ops::begin_index_op(
+        project.path(),
+        "test-holder",
+        std::time::Duration::ZERO,
+    )
+    .unwrap();
+    let held_guard = match held {
+        infigraph_core::ops::IndexOpOutcome::Acquired(g) => g,
+        _ => panic!("expected to acquire index.lock in this fresh test dir"),
+    };
+
+    let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+    let root = project.path().to_path_buf();
+    let handle = std::thread::spawn(move || {
+        infigraph_core::watch::watch_project_with_periodic(
+            &root,
+            || Ok(infigraph_languages::bundled_registry().unwrap()),
+            50, // debounce_ms
+            stop_rx,
+            |_evt| {},
+            0,
+            None::<fn(&infigraph_core::IndexResult)>,
+            true, // serve_requests
+        )
+    });
+
+    // Let the loop start ticking before dropping a request file.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+
+    let requests_dir = project.path().join(".infigraph").join("requests");
+    let request_path = requests_dir.join("out-of-scope-test.request");
+    let result_path = requests_dir.join("out-of-scope-test.result");
+    let request = infigraph_core::daemon_protocol::WriteRequest::UpsertRepo {
+        namespace: "test-repo".to_string(),
+    };
+    infigraph_core::daemon_protocol::write_atomic(
+        &request_path,
+        &serde_json::to_string(&request).unwrap(),
+    )
+    .unwrap();
+
+    // Poll rather than a single fixed-sleep-then-check: a one-shot check
+    // after a fixed delay can false-pass against the pre-fix (unlocked) bug
+    // if cold-start latency (registry construction, DB open) happens to
+    // push the wrongful serve past the checkpoint -- the same false-negative
+    // trap documented on the sibling
+    // `watch_triggered_file_removal_contends_with_a_held_index_lock` test
+    // above. Polling for up to 10s means any premature serve is caught
+    // whenever it actually happens, not just at one sampled instant.
+    for i in 0..100 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(
+            !result_path.exists(),
+            "out-of-scope request was served after ~{}ms while index.lock is held \
+             externally -- route_or_serve_request's fallback path is bypassing the lock",
+            (i + 1) * 100
+        );
+    }
+    assert!(
+        request_path.exists(),
+        ".request file must remain in place (not deleted) while contended, so it's retried \
+         on a later tick"
+    );
+
+    // Release the external hold; the next tick's serve_request_locked
+    // attempt should now succeed.
+    drop(held_guard);
+
+    let mut served = false;
+    for _ in 0..150 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        if result_path.exists() {
+            served = true;
+            break;
+        }
+    }
+    assert!(
+        served,
+        "expected the watcher to serve the deferred out-of-scope request once \
+         index.lock was released"
+    );
+
+    stop_tx.send(()).unwrap();
+    handle.join().unwrap().unwrap();
+}
