@@ -148,6 +148,23 @@ pub fn remove_wal_family(db_path: &Path) {
     }
 }
 
+/// The advisory lock path for the database at `db_path`.
+///
+/// APPENDS ".lock" to the full db filename, the same convention used for
+/// the WAL family above (see `wal_family_paths`'s doc comment) -- and for
+/// the identical reason: `db_path.with_extension("lock")` *replaces* an
+/// existing extension rather than appending, so on an extensioned path like
+/// "docs.kuzu" it silently computes "docs.lock" (colliding with an
+/// unrelated file) instead of "docs.kuzu.lock", and on a path like
+/// "graph.rebuilding" it computes "graph.lock" -- the *same* lock path as
+/// the live "graph" database, rather than a lock of its own. For
+/// infigraph's extensionless production path (".infigraph/graph"),
+/// `with_extension` and append coincide, so this only changes behavior for
+/// extensioned db paths.
+pub fn db_lock_path(db_path: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.lock", db_path.display()))
+}
+
 /// Persistent graph store backed by Kuzu.
 pub struct GraphStore {
     db: Database,
@@ -166,7 +183,7 @@ impl GraphStore {
             std::fs::create_dir_all(parent)?;
         }
         validate_db_file(path)?;
-        let lock_path = path.with_extension("lock");
+        let lock_path = db_lock_path(path);
         let db = Database::new(path, SystemConfig::default())
             .map_err(|e| anyhow::anyhow!("failed to open kuzu db: {e}"))?;
         let store = Self { db, lock_path };
@@ -191,7 +208,7 @@ impl GraphStore {
     /// Safe for concurrent access while a watcher is writing.
     pub fn open_read_only(path: &Path) -> Result<Self> {
         validate_db_file(path)?;
-        let lock_path = path.with_extension("lock");
+        let lock_path = db_lock_path(path);
         // `throw_on_wal_replay_failure` defaults to true (unset here): a WAL
         // replay failure now surfaces as an error instead of being silently
         // tolerated and served as a torn base image.
