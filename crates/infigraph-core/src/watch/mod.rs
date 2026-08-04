@@ -1007,14 +1007,22 @@ fn serve_full_reindex_request<MR>(
                     }
                 }
             } else {
-                // No base image to retire, but a `graph.wal*` family can
-                // still be sitting there orphaned (e.g. an earlier crash
-                // took the base but not its siblings). Renaming the
-                // rebuilt graph on top of a foreign-ID WAL would make the
-                // graph we just swapped in unopenable.
-                crate::graph::remove_wal_family(&live_path);
                 None
             };
+
+            // Unconditional, regardless of which branch above ran: a
+            // `graph.wal*` family can still be sitting at `live_path` even
+            // after a successful retire, since `move_wal_sibling`'s
+            // copy-then-remove fallback can leave the original in place if
+            // only the trailing `remove_file` fails (it still returns `Ok`
+            // in that case, since the content is already safe in the
+            // retirement pool). And when there was no base image to retire
+            // at all, an orphaned `graph.wal*` from an earlier crash could
+            // still be here. Either way, renaming the rebuilt graph on top
+            // of a foreign-ID WAL would make the graph we just swapped in
+            // unopenable, so clear it unconditionally right before the
+            // swap rather than only in the no-base-image case.
+            crate::graph::remove_wal_family(&live_path);
 
             let swap = std::fs::rename(&rebuilding_path, &live_path);
             if swap.is_ok() {
