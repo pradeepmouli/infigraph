@@ -870,3 +870,77 @@ fn a_failed_rebuild_leaves_the_live_graph_untouched() {
 
     daemon.0.kill().ok();
 }
+
+/// Regression test for the final review's I5. `index --full` under
+/// `INFIGRAPH_BACKEND=daemon` drops a request into `.infigraph/requests` and
+/// polls for a reply for up to 600s. Because that branch returns before
+/// `Infigraph::open`, the usual daemon auto-start never runs either -- so
+/// with no daemon around, the command used to sit silently for ten minutes
+/// and then report an opaque timeout. That's a plausible everyday case:
+/// `INFIGRAPH_BACKEND` is commonly exported from a shell profile.
+///
+/// Deliberately runs the real binary rather than calling `cmd_index`:
+/// `daemon_backend_selected()` reads a process-wide env var, and the fast
+/// path being tested lives in the CLI's own argument handling.
+#[test]
+fn full_reindex_with_no_daemon_fails_fast_instead_of_polling_for_ten_minutes() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(project.path().join("a.py"), "def a():\n    pass\n").unwrap();
+
+    // Bootstrap a `.infigraph/` locally so the failure under test is
+    // genuinely "no daemon", not "no project".
+    let cli = cli_binary();
+    let status = Command::new(&cli)
+        .arg("index")
+        .current_dir(project.path())
+        .env_remove("INFIGRAPH_BACKEND")
+        .env_remove("INFIGRAPH_WATCH_DAEMON")
+        .status()
+        .unwrap();
+    assert!(status.success(), "bootstrap index failed");
+
+    // Comfortably under the 600s submit deadline, but far enough above a
+    // liveness probe that this can't pass by luck.
+    const FAIL_FAST_BUDGET: Duration = Duration::from_secs(30);
+
+    let start = std::time::Instant::now();
+    let mut child = Command::new(&cli)
+        .arg("index")
+        .arg("--full")
+        .current_dir(project.path())
+        .env("INFIGRAPH_BACKEND", "daemon")
+        .env_remove("INFIGRAPH_WATCH_DAEMON")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        if start.elapsed() > FAIL_FAST_BUDGET {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "`index --full` with no daemon running did not fail within {FAIL_FAST_BUDGET:?}"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let output = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "must be a hard failure, not a silent success: {stderr}"
+    );
+    assert!(
+        stderr.contains("no daemon is running"),
+        "the error must say what's actually wrong and how to fix it, got: {stderr}"
+    );
+    assert!(
+        !project.path().join(".infigraph").join("requests").exists(),
+        "the request must not be submitted at all when there is nothing to serve it"
+    );
+}
