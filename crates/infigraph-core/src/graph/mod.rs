@@ -29,7 +29,10 @@ pub use queries::{
     SymbolRow, SymbolWithDocstring, TestContext, TestCoverage, TestTarget, TypeHierarchy,
 };
 pub use session_store::{SessionData, SessionStore};
-pub use store::{validate_db_file, GraphCorruption, GraphStats, GraphStore, WriteLock};
+pub use store::{
+    remove_wal_family, validate_db_file, wal_family_paths, GraphCorruption, GraphStats, GraphStore,
+    WriteLock,
+};
 pub use test_templates::{test_templates_for, TestTemplate};
 
 pub fn schema_ddl() -> Vec<&'static str> {

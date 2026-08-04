@@ -330,34 +330,7 @@ impl Infigraph {
         // so a freshly recreated database never inherits stale WAL state.
         let _ = std::fs::remove_dir_all(db_path);
         let _ = std::fs::remove_file(db_path);
-        // Kuzu's on-disk WAL filename APPENDS ".wal" to the full db filename
-        // (e.g. "graph" -> "graph.wal", "docs.kuzu" -> "docs.kuzu.wal"). It
-        // does NOT replace the extension the way `Path::with_extension` does
-        // -- `db_path.with_extension("wal")` on an extensioned path like
-        // "docs.kuzu" silently computes "docs.wal", a file Kuzu never wrote,
-        // leaving the real WAL behind for the freshly recreated base image
-        // to replay from. Verified empirically (see Task 5 report) that the
-        // real sibling is always `<full filename>.wal`. For infigraph's
-        // extensionless production path (".infigraph/graph"), this was a
-        // no-op difference -- `with_extension` and append coincide when
-        // there's no extension to strip -- so this fix only changes
-        // behavior for extensioned db paths (e.g. ".infigraph/docs.kuzu").
-        let wal = PathBuf::from(format!("{}.wal", db_path.display()));
-        let _ = std::fs::remove_file(&wal);
-        // Kuzu also leaves WAL-family temp siblings (e.g. `<db>.wal.checkpoint`)
-        // carrying the OLD database's ID; a leftover one makes a freshly
-        // recreated database permanently unopenable ("Database ID ... does not
-        // match"). Remove the whole family.
-        if let (Some(parent), Some(name)) = (db_path.parent(), db_path.file_name()) {
-            let prefix = format!("{}.wal.", name.to_string_lossy());
-            if let Ok(entries) = std::fs::read_dir(parent) {
-                for e in entries.flatten() {
-                    if e.file_name().to_string_lossy().starts_with(&prefix) {
-                        let _ = std::fs::remove_file(e.path());
-                    }
-                }
-            }
-        }
+        crate::graph::remove_wal_family(db_path);
         Ok(())
     }
 

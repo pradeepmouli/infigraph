@@ -101,6 +101,53 @@ pub fn validate_db_file(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Every WAL-family sibling of the database at `db_path` that currently
+/// exists: `<db>.wal` plus the `<db>.wal.*` family.
+///
+/// Kuzu's on-disk WAL filename APPENDS ".wal" to the full db filename
+/// (e.g. "graph" -> "graph.wal", "docs.kuzu" -> "docs.kuzu.wal"). It does
+/// NOT replace the extension the way `Path::with_extension` does --
+/// `db_path.with_extension("wal")` on an extensioned path like "docs.kuzu"
+/// silently computes "docs.wal", a file Kuzu never wrote. Verified
+/// empirically (see the Task 5 report on `wipe_graph`) that the real
+/// sibling is always `<full filename>.wal`.
+pub fn wal_family_paths(db_path: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let wal = PathBuf::from(format!("{}.wal", db_path.display()));
+    if wal.exists() {
+        found.push(wal);
+    }
+    if let (Some(parent), Some(name)) = (db_path.parent(), db_path.file_name()) {
+        let prefix = format!("{}.wal.", name.to_string_lossy());
+        if let Ok(entries) = std::fs::read_dir(parent) {
+            for e in entries.flatten() {
+                if e.file_name().to_string_lossy().starts_with(&prefix) {
+                    found.push(e.path());
+                }
+            }
+        }
+    }
+    found
+}
+
+/// Delete every WAL-family sibling of the database at `db_path`.
+///
+/// Kuzu leaves WAL-family temp siblings (e.g. `<db>.wal.checkpoint`)
+/// carrying the OLD database's ID; a leftover one makes a freshly recreated
+/// database at the same path *permanently unopenable* ("Database ID ... does
+/// not match"). Anything that recreates a database at a path some other
+/// database previously occupied must clear the whole family first, or that
+/// path is wedged until a human deletes the leftovers by hand.
+///
+/// Best-effort by design: a sibling that can't be removed is not worth
+/// failing the caller over, and the caller's own error handling covers the
+/// resulting open failure.
+pub fn remove_wal_family(db_path: &Path) {
+    for path in wal_family_paths(db_path) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 /// Persistent graph store backed by Kuzu.
 pub struct GraphStore {
     db: Database,
@@ -385,6 +432,43 @@ mod tests {
         assert!(validate_db_file(&dir.path().join("does-not-exist")).is_ok());
         // Directory (legacy layout) → fine.
         assert!(validate_db_file(dir.path()).is_ok());
+    }
+
+    #[test]
+    fn wal_family_covers_the_appended_wal_and_its_temp_siblings() {
+        let dir = tempfile::tempdir().unwrap();
+        // An extensioned db name is the case `with_extension("wal")` gets
+        // wrong ("docs.wal" instead of "docs.kuzu.wal"), so use it here.
+        let db_path = dir.path().join("docs.kuzu");
+        std::fs::write(&db_path, b"base image").unwrap();
+        std::fs::write(dir.path().join("docs.kuzu.wal"), b"wal").unwrap();
+        std::fs::write(dir.path().join("docs.kuzu.wal.checkpoint"), b"ckpt").unwrap();
+        // Neither a different db's family nor the base image itself.
+        std::fs::write(dir.path().join("graph.wal"), b"other db").unwrap();
+
+        let mut found: Vec<String> = wal_family_paths(&db_path)
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        found.sort();
+        assert_eq!(found, vec!["docs.kuzu.wal", "docs.kuzu.wal.checkpoint"]);
+
+        remove_wal_family(&db_path);
+        assert!(!dir.path().join("docs.kuzu.wal").exists());
+        assert!(!dir.path().join("docs.kuzu.wal.checkpoint").exists());
+        assert!(db_path.exists(), "the base image must be left alone");
+        assert!(
+            dir.path().join("graph.wal").exists(),
+            "another database's WAL must be left alone"
+        );
+    }
+
+    #[test]
+    fn wal_family_of_a_db_that_never_existed_is_empty_and_removal_is_a_no_op() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("graph.rebuilding");
+        assert!(wal_family_paths(&db_path).is_empty());
+        remove_wal_family(&db_path);
     }
 
     #[test]
