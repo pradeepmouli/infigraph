@@ -312,6 +312,96 @@ mod tests {
     /// `add_watch_removal` (used only for genuine filesystem removal events)
     /// restores the directory-prefix scan/removal alongside the exact-path
     /// removal.
+    /// Drives `serve_full_reindex_request` directly (no real daemon process)
+    /// against a real temp-dir project: seeds a graph, submits FullReindex,
+    /// confirms the old content is genuinely gone and the graph is rebuilt,
+    /// and confirms the old graph directory was quarantined (renamed aside),
+    /// not deleted.
+    #[test]
+    fn full_reindex_rebuilds_the_graph_and_quarantines_the_old_one() {
+        use crate::graph::GraphBackend;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("old.py"), "def old_symbol():\n    pass\n").unwrap();
+
+        let prism = open_project(root);
+        prism.index().unwrap();
+
+        let old_graph_path = root.join(".infigraph").join("graph");
+        assert!(old_graph_path.exists());
+
+        // Simulate what changed between the bootstrap index and the full
+        // reindex request: old.py is replaced by new.py, matching a real
+        // "the codebase moved on" scenario a full reindex is meant to catch.
+        fs::remove_file(root.join("old.py")).unwrap();
+        fs::write(root.join("new.py"), "def new_symbol():\n    pass\n").unwrap();
+
+        let queue = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::watch::queue::IndexWorkQueue::new(),
+        ));
+        let mut held: Option<std::sync::Arc<crate::Infigraph>> = None;
+        let make_registry = || Ok(python_registry());
+
+        let request_path = root.join(".infigraph").join("fullreindex.request");
+        fs::write(
+            &request_path,
+            serde_json::to_string(&crate::daemon_protocol::WriteRequest::FullReindex).unwrap(),
+        )
+        .unwrap();
+
+        crate::watch::serve_full_reindex_request(
+            root,
+            &request_path,
+            &queue,
+            &make_registry,
+            &mut held,
+            false,
+        );
+
+        let reply_path = request_path.with_extension("result");
+        let reply: crate::daemon_protocol::WriteResult =
+            serde_json::from_str(&fs::read_to_string(&reply_path).unwrap()).unwrap();
+        match reply {
+            crate::daemon_protocol::WriteResult::Ok { indexed_files, .. } => {
+                assert_eq!(
+                    indexed_files, 1,
+                    "only new.py should be in the rebuilt graph"
+                );
+            }
+            other => panic!("expected WriteResult::Ok, got {other:?}"),
+        }
+
+        // Verify against a completely fresh read connection, not the
+        // (now-poisoned) `held` handle from before the swap.
+        let verify = crate::graph::KuzuBackend::open_read_only(&old_graph_path).unwrap();
+        let rows = verify.raw_query("MATCH (s:Symbol) RETURN s.name").unwrap();
+        let names: Vec<&str> = rows.iter().map(|r| r[0].as_str()).collect();
+        assert!(
+            names.contains(&"new_symbol"),
+            "rebuilt graph must contain the new symbol"
+        );
+        assert!(
+            !names.contains(&"old_symbol"),
+            "rebuilt graph must not contain the old symbol"
+        );
+
+        let quarantine_entries: Vec<_> = fs::read_dir(root.join(".infigraph"))
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("graph.corrupt.")
+            })
+            .collect();
+        assert_eq!(
+            quarantine_entries.len(),
+            1,
+            "the old graph must be quarantined (renamed aside), not deleted"
+        );
+    }
+
     #[test]
     fn a_watch_removal_of_a_directory_removes_every_file_that_was_under_it() {
         let tmp = tempfile::tempdir().unwrap();
