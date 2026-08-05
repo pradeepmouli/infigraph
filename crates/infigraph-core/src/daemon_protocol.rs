@@ -94,10 +94,11 @@ pub enum WriteRequest {
         extractions_path: PathBuf,
         use_learned: bool,
     },
-    /// Rebuild the graph from scratch. Handled entirely inside the daemon's
-    /// watch loop (`serve_full_reindex_request` in `watch/mod.rs`), which
-    /// builds a fresh database at a side path and atomically swaps it in --
-    /// see `docs/superpowers/specs/2026-08-04-daemon-routed-full-reindex-design.md`.
+    /// Rebuild the graph from scratch. Handled inside the daemon's watch
+    /// loop by `try_start_full_reindex`/`build_full_reindex`/
+    /// `finish_full_reindex` in `watch/mod.rs`, which builds a fresh
+    /// database at a side path in the background and atomically swaps it in
+    /// -- see `docs/superpowers/specs/2026-08-04-daemon-routed-full-reindex-design.md`.
     /// No fields: it always means "rebuild everything."
     FullReindex,
 }
@@ -132,6 +133,14 @@ pub enum WriteResult {
     /// Real resolve stats -- `Ok`'s two usize fields can't represent
     /// ResolveStats's five counters without losing data.
     ResolveOk(crate::resolve::ResolveStats),
+    /// Real full-reindex stats -- `Ok`'s two usize fields can't represent
+    /// the rebuild's detected-languages set (needed by the CLI to trigger
+    /// SCIP enrichment for the right languages) without losing it.
+    FullReindexOk {
+        total_files: usize,
+        indexed_files: usize,
+        detected_languages: Vec<String>,
+    },
     Err {
         message: String,
     },
