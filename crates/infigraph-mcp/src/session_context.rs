@@ -25,6 +25,8 @@ pub fn force_dedup_panic(enabled: bool) {
 struct ConfigFile {
     #[serde(default)]
     compression: CompressionConfig,
+    #[serde(default)]
+    watch: WatchConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -56,6 +58,20 @@ impl Default for CompressionConfig {
             token_budget: None,
             staleness_window: None,
             ml_compression: None,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct WatchConfig {
+    #[serde(default = "default_true")]
+    auto_start_on_boot: bool,
+}
+
+impl Default for WatchConfig {
+    fn default() -> Self {
+        Self {
+            auto_start_on_boot: true,
         }
     }
 }
@@ -121,12 +137,19 @@ fn persist_dedup_state(seen: &HashMap<String, SeenEntry>) {
     }
 }
 
-fn load_config() -> CompressionConfig {
+/// Read and parse `.infigraph/config.toml` fresh (no caching) into its full
+/// structure. Callers that only need one section should prefer a narrower
+/// wrapper (e.g. `load_config`) to keep call sites simple, but both go
+/// through this single parse so the file is never parsed twice per call.
+fn load_config_file() -> ConfigFile {
     find_config_file_with_home_fallback()
         .and_then(|p| std::fs::read_to_string(p).ok())
         .and_then(|s| toml::from_str::<ConfigFile>(&s).ok())
-        .map(|c| c.compression)
         .unwrap_or_default()
+}
+
+fn load_config() -> CompressionConfig {
+    load_config_file().compression
 }
 
 struct SeenEntry {
@@ -284,6 +307,21 @@ pub fn get_ml_compression_mode() -> String {
         .and_then(|ctx| ctx.config.ml_compression.clone())
         .unwrap_or_else(|| "extractive".to_string())
         .to_lowercase()
+}
+
+/// Whether the MCP server should proactively start watching every
+/// already-registered project on boot (daemon mode only), rather than only
+/// ever starting a watcher reactively after some write happens to touch
+/// that project. Priority: env var, then config.toml
+/// `[watch].auto_start_on_boot`, then the hardcoded default (on). Reads the
+/// config file fresh rather than going through the session-cached
+/// `SESSION` static, since this must be callable from `main.rs::run()` at
+/// raw process startup, before any per-session context exists.
+pub fn auto_start_watch_on_boot_enabled() -> bool {
+    if let Ok(v) = std::env::var("INFIGRAPH_AUTO_START_WATCH") {
+        return v != "0" && v.to_lowercase() != "false";
+    }
+    load_config_file().watch.auto_start_on_boot
 }
 
 fn parse_level_override() -> Option<CompressionLevel> {

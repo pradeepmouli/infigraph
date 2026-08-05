@@ -185,6 +185,9 @@ dedup = true             # false to disable session dedup
 token_budget = 150000    # total token budget for auto-scaling
 staleness_window = 6     # dedup staleness window (calls)
 ml_compression = "extractive"  # extractive | kompress | off
+
+[watch]
+auto_start_on_boot = true  # false to skip proactive watch startup for registered projects on boot
 ```
 
 ### Environment variables (override config file)
@@ -197,6 +200,7 @@ ml_compression = "extractive"  # extractive | kompress | off
 | `INFIGRAPH_ML_COMPRESSION` | `extractive` | ML compression mode: `extractive`, `kompress`, `off` |
 | `INFIGRAPH_KOMPRESS_DIR` | `~/.infigraph/models/kompress-small` | Custom path for kompress model files |
 | `INFIGRAPH_METRICS` | (off) | `1` to log compression metrics to `.infigraph/compression_metrics.jsonl` |
+| `INFIGRAPH_AUTO_START_WATCH` | (on) | `0`/`false` to skip proactive watch startup for registered projects on boot (daemon mode only) |
 
 ## Quality Monitoring
 
