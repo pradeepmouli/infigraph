@@ -358,6 +358,16 @@ pub(crate) fn cmd_daemon(root: &Path, debounce: u64) -> Result<()> {
         }
     });
 
+    let on_full_reindex: std::sync::Arc<infigraph_core::watch::FullReindexCallback> =
+        std::sync::Arc::new(
+            move |prism: std::sync::Arc<infigraph_core::Infigraph>,
+                  detected_languages: Vec<String>| {
+                let languages: std::collections::HashSet<String> =
+                    detected_languages.into_iter().collect();
+                crate::index::run_auto_scip_on(prism.root(), &prism, &languages);
+            },
+        );
+
     infigraph_core::watch::watch_project_with_periodic(
         root,
         bundled_registry,
@@ -369,6 +379,7 @@ pub(crate) fn cmd_daemon(root: &Path, debounce: u64) -> Result<()> {
         0,
         None::<fn(&infigraph_core::IndexResult)>,
         true,
+        Some(on_full_reindex),
     )?;
 
     doc_shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
