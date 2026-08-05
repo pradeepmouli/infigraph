@@ -25,14 +25,16 @@ fn group_fixture() -> &'static GroupFixture {
     GROUP_FIXTURE.get_or_init(|| {
         // This test targets the in-process watcher path (WATCHERS map,
         // stopped via stop_tx below) and asserts on its "Watcher started"
-        // message. If INFIGRAPH_WATCH_DAEMON=1 leaks in from the ambient
+        // message. If INFIGRAPH_BACKEND=daemon leaks in from the ambient
         // environment (e.g. a developer's shell profile), auto-start and
         // the explicit watch_project call both take the real-subprocess
         // daemon path instead, whose "AlreadyRunning" message this test
         // doesn't expect (issue #48) — force it off for the test's duration
-        // regardless of what the environment has set.
-        let orig_watch_daemon = std::env::var("INFIGRAPH_WATCH_DAEMON").ok();
-        std::env::remove_var("INFIGRAPH_WATCH_DAEMON");
+        // regardless of what the environment has set. (Was keyed on the
+        // now-retired INFIGRAPH_WATCH_DAEMON toggle; daemon-mode watching
+        // is controlled solely by INFIGRAPH_BACKEND=daemon now.)
+        let orig_watch_daemon = std::env::var("INFIGRAPH_BACKEND").ok();
+        std::env::remove_var("INFIGRAPH_BACKEND");
 
         let home_dir = tempfile::TempDir::new().expect("tmpdir for home");
         let orig_home = std::env::var("HOME").unwrap_or_default();
@@ -457,9 +459,9 @@ fn test_groups_watch_perf() {
     // Restore HOME
     std::env::set_var("HOME", &fix.orig_home);
 
-    // Restore INFIGRAPH_WATCH_DAEMON
+    // Restore INFIGRAPH_BACKEND
     match &fix.orig_watch_daemon {
-        Some(v) => std::env::set_var("INFIGRAPH_WATCH_DAEMON", v),
-        None => std::env::remove_var("INFIGRAPH_WATCH_DAEMON"),
+        Some(v) => std::env::set_var("INFIGRAPH_BACKEND", v),
+        None => std::env::remove_var("INFIGRAPH_BACKEND"),
     }
 }
