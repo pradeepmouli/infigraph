@@ -41,14 +41,16 @@ pub fn is_remote_backend() -> bool {
         .unwrap_or(false)
 }
 
-/// Opt-in toggle for the external-daemon watcher model. Off by default:
-/// existing in-process-thread behavior (an MCP worker spawning a watcher
-/// thread that dies with the worker) is unchanged unless this is set to
-/// `"1"`.
+/// Whether daemon-mode watching is active. Aliases `daemon_backend_selected`
+/// (`INFIGRAPH_BACKEND=daemon`) rather than reading its own env var --
+/// `INFIGRAPH_WATCH_DAEMON` used to be an independent toggle, but setting it
+/// without also selecting the daemon backend left a real hazard: the
+/// watcher would become a real daemon process holding its own `Database`
+/// handle on the live graph, while the calling process -- still on the
+/// local Kuzu backend -- opened a second, independent `Database` object on
+/// the same path for its own writes. One env var now controls both.
 pub fn watch_daemon_mode_enabled() -> bool {
-    std::env::var("INFIGRAPH_WATCH_DAEMON")
-        .map(|v| v == "1")
-        .unwrap_or(false)
+    crate::daemon_backend_selected()
 }
 
 /// Outcome of an `ensure_daemon_running` call.

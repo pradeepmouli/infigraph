@@ -41,13 +41,13 @@ fn is_ci_env_detects_any_known_ci_var() {
 #[test]
 fn watch_daemon_mode_is_opt_in_off_by_default() {
     let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::remove_var("INFIGRAPH_WATCH_DAEMON");
+    std::env::remove_var("INFIGRAPH_BACKEND");
     assert!(!watch_daemon_mode_enabled());
-    std::env::set_var("INFIGRAPH_WATCH_DAEMON", "1");
+    std::env::set_var("INFIGRAPH_BACKEND", "daemon");
     assert!(watch_daemon_mode_enabled());
-    std::env::set_var("INFIGRAPH_WATCH_DAEMON", "0");
+    std::env::set_var("INFIGRAPH_BACKEND", "kuzu");
     assert!(!watch_daemon_mode_enabled());
-    std::env::remove_var("INFIGRAPH_WATCH_DAEMON");
+    std::env::remove_var("INFIGRAPH_BACKEND");
 }
 
 #[test]

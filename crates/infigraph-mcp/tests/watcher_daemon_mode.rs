@@ -68,7 +68,7 @@ fn wait_for_watch_locks_released(paths: &[String]) {
 #[test]
 fn daemon_mode_off_by_default_uses_in_process_thread() {
     let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::remove_var("INFIGRAPH_WATCH_DAEMON");
+    std::env::remove_var("INFIGRAPH_BACKEND");
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().canonicalize().unwrap();
     std::fs::create_dir_all(root.join(".infigraph")).unwrap();
@@ -102,7 +102,7 @@ fn daemon_mode_off_by_default_uses_in_process_thread() {
 #[test]
 fn daemon_mode_on_does_not_populate_in_process_watchers_map() {
     let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::set_var("INFIGRAPH_WATCH_DAEMON", "1");
+    std::env::set_var("INFIGRAPH_BACKEND", "daemon");
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().canonicalize().unwrap();
     std::fs::create_dir_all(root.join(".infigraph")).unwrap();
@@ -127,7 +127,7 @@ fn daemon_mode_on_does_not_populate_in_process_watchers_map() {
         wait_for_watch_locks_released(std::slice::from_ref(&path));
     }
 
-    std::env::remove_var("INFIGRAPH_WATCH_DAEMON");
+    std::env::remove_var("INFIGRAPH_BACKEND");
 }
 
 /// `tool_watch_project` (the explicit MCP tool a client can call directly,
@@ -142,7 +142,7 @@ fn daemon_mode_on_does_not_populate_in_process_watchers_map() {
 #[test]
 fn tool_watch_project_respects_daemon_mode_toggle() {
     let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::set_var("INFIGRAPH_WATCH_DAEMON", "1");
+    std::env::set_var("INFIGRAPH_BACKEND", "daemon");
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().canonicalize().unwrap();
     std::fs::create_dir_all(root.join(".infigraph")).unwrap();
@@ -165,7 +165,7 @@ fn tool_watch_project_respects_daemon_mode_toggle() {
         wait_for_watch_locks_released(std::slice::from_ref(&path));
     }
 
-    std::env::remove_var("INFIGRAPH_WATCH_DAEMON");
+    std::env::remove_var("INFIGRAPH_BACKEND");
 }
 
 #[test]
@@ -274,7 +274,7 @@ fn stop_watch_by_path_ignores_stale_payload_without_live_flock() {
 #[test]
 fn auto_start_doc_watch_respects_daemon_mode_toggle() {
     let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::set_var("INFIGRAPH_WATCH_DAEMON", "1");
+    std::env::set_var("INFIGRAPH_BACKEND", "daemon");
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().canonicalize().unwrap();
     std::fs::create_dir_all(root.join(".infigraph")).unwrap();
@@ -298,7 +298,7 @@ fn auto_start_doc_watch_respects_daemon_mode_toggle() {
         );
     }
 
-    std::env::remove_var("INFIGRAPH_WATCH_DAEMON");
+    std::env::remove_var("INFIGRAPH_BACKEND");
 }
 
 /// `tool_watch_docs` (the explicit MCP tool) must also respect the daemon
@@ -306,7 +306,7 @@ fn auto_start_doc_watch_respects_daemon_mode_toggle() {
 #[test]
 fn tool_watch_docs_respects_daemon_mode_toggle() {
     let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::set_var("INFIGRAPH_WATCH_DAEMON", "1");
+    std::env::set_var("INFIGRAPH_BACKEND", "daemon");
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().canonicalize().unwrap();
     std::fs::create_dir_all(root.join(".infigraph")).unwrap();
@@ -330,7 +330,7 @@ fn tool_watch_docs_respects_daemon_mode_toggle() {
         );
     }
 
-    std::env::remove_var("INFIGRAPH_WATCH_DAEMON");
+    std::env::remove_var("INFIGRAPH_BACKEND");
 }
 
 /// `tool_stop_watch_docs` must accept a `path` argument (today it only
