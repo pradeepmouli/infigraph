@@ -364,7 +364,34 @@ pub(crate) fn cmd_daemon(root: &Path, debounce: u64) -> Result<()> {
                   detected_languages: Vec<String>| {
                 let languages: std::collections::HashSet<String> =
                     detected_languages.into_iter().collect();
-                crate::index::run_auto_scip_on(prism.root(), &prism, &languages);
+                let root = prism.root().to_path_buf();
+                // Part A (running the external indexer binaries) is
+                // deliberately unlocked -- it can take several minutes on a
+                // real multi-language repo and touches nothing in the graph.
+                // Only the import step below needs `index.lock`.
+                let results = crate::index::run_scip_indexers(&root, &languages);
+                if results.is_empty() {
+                    return;
+                }
+                match infigraph_core::ops::begin_index_op(
+                    &root,
+                    "infigraph daemon (scip import)",
+                    std::time::Duration::from_secs(30),
+                ) {
+                    Ok(infigraph_core::ops::IndexOpOutcome::Acquired(guard)) => {
+                        crate::index::import_scip_results_and_embed(&root, &prism, &results);
+                        drop(guard);
+                    }
+                    Ok(o @ infigraph_core::ops::IndexOpOutcome::AlreadyRunning(_)) => {
+                        eprintln!(
+                            "[daemon] scip-import busy ({}), skipping this round",
+                            o.skip_note().unwrap_or_default()
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("[daemon] scip-import busy ({e}), skipping this round");
+                    }
+                }
             },
         );
 

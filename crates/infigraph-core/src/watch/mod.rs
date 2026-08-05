@@ -59,6 +59,15 @@ impl std::fmt::Display for WatchEvent {
 /// on the same live graph path; Kuzu only allows safe concurrent access
 /// within one process's `Database` object, not across two, even in the same
 /// process.
+///
+/// The loop that invokes this callback does NOT hold `index.lock` around
+/// the call -- the callback is responsible for acquiring it itself, scoped
+/// narrowly around whichever part of its own work actually touches the
+/// graph. Holding it for the callback's entire duration (as an earlier
+/// version of this design did) blocks every other daemon write for
+/// however long any graph-independent work inside the callback takes --
+/// e.g. running external SCIP indexer binaries, which can take minutes on
+/// a real repo.
 pub type FullReindexCallback = dyn Fn(Arc<Infigraph>, Vec<String>) + Send + Sync;
 
 /// Watch a project directory and auto-reindex on file changes.
@@ -300,28 +309,23 @@ where
             drop(guard);
 
             if let Some(languages) = scheduled_languages {
-                if let (Some(cb), Some(prism)) = (on_full_reindex.clone(), held_prism.clone()) {
-                    let root_buf = root.to_path_buf();
+                if scip_in_flight.is_some() {
+                    // A previous full reindex's SCIP task is still running --
+                    // don't overwrite its tracked handle (we'd lose the ability to
+                    // reap/log it) or run two enrichment passes concurrently
+                    // against the same connection. This round's enrichment is
+                    // simply skipped; the graph itself is still correct (just not
+                    // freshly re-enriched) and the next full reindex tries again.
+                    eprintln!(
+                        "[daemon] a previous SCIP-enrichment task is still running; skipping \
+                         enrichment for this reindex (detected languages: {})",
+                        languages.join(", ")
+                    );
+                } else if let (Some(cb), Some(prism)) =
+                    (on_full_reindex.clone(), held_prism.clone())
+                {
                     let handle = drain_rt.spawn_blocking(move || {
-                        match begin_index_op(
-                            &root_buf,
-                            "infigraph daemon (scip enrich)",
-                            Duration::from_secs(30),
-                        ) {
-                            Ok(IndexOpOutcome::Acquired(guard)) => {
-                                cb(prism, languages);
-                                drop(guard);
-                            }
-                            Ok(o @ IndexOpOutcome::AlreadyRunning(_)) => {
-                                eprintln!(
-                                    "[daemon] scip-enrich busy ({}), skipping this round",
-                                    o.skip_note().unwrap_or_default()
-                                );
-                            }
-                            Err(e) => {
-                                eprintln!("[daemon] scip-enrich busy ({e}), skipping this round");
-                            }
-                        }
+                        cb(prism, languages);
                     });
                     scip_in_flight = Some(InFlightScip { handle });
                 }
@@ -383,7 +387,6 @@ where
                             &mut held_prism,
                             drain_in_flight.is_some(),
                             full_reindex_in_flight.is_some(),
-                            scip_in_flight.is_some(),
                             &drain_rt,
                         ) {
                             full_reindex_in_flight = Some(started);
@@ -509,7 +512,6 @@ where
         // `index.lock`.
         if drain_in_flight.is_none()
             && full_reindex_in_flight.is_none()
-            && scip_in_flight.is_none()
             && !queue.lock().unwrap().is_empty()
         {
             match begin_index_op(root, "infigraph daemon", Duration::from_secs(30)) {
@@ -1013,16 +1015,15 @@ fn build_full_reindex(
 }
 
 /// Loop-thread entry point for a `WriteRequest::FullReindex`. Does the
-/// cheap, synchronous gating (never overlap a queue drain, another full
-/// reindex, or a running SCIP-enrichment task -- all three write the same
-/// live graph) and, if clear, acquires `index.lock` and hands the expensive
-/// build off to `drain_rt` so this loop keeps ticking (accepting fsevents,
-/// other requests, the stop signal) for the whole multi-minute rebuild
-/// instead of blocking on it. Returns `None` if nothing was started
-/// (busy, or an early failure already replied and cleaned up the request
-/// file itself); `Some` if a build was scheduled -- the caller must track
-/// the returned handle and reap it via `finish_full_reindex` on a later
-/// tick.
+/// cheap, synchronous gating (never overlap a queue drain or another full
+/// reindex -- both write the same live graph) and, if clear, acquires
+/// `index.lock` and hands the expensive build off to `drain_rt` so this loop
+/// keeps ticking (accepting fsevents, other requests, the stop signal) for
+/// the whole multi-minute rebuild instead of blocking on it. Returns `None`
+/// if nothing was started (busy, or an early failure already replied and
+/// cleaned up the request file itself); `Some` if a build was scheduled --
+/// the caller must track the returned handle and reap it via
+/// `finish_full_reindex` on a later tick.
 #[allow(clippy::too_many_arguments)]
 fn try_start_full_reindex<MR>(
     root: &Path,
@@ -1031,7 +1032,6 @@ fn try_start_full_reindex<MR>(
     make_registry: &MR,
     drain_in_flight: bool,
     full_reindex_in_flight: bool,
-    scip_in_flight: bool,
     drain_rt: &tokio::runtime::Runtime,
 ) -> Option<InFlightFullReindex>
 where
@@ -1039,15 +1039,24 @@ where
 {
     let reply_path = path.with_extension("result");
 
-    // Never overlap a queue drain, another full reindex, or a running SCIP
-    // task -- same invariant every locked write path in this loop
-    // preserves; all three touch the same live graph. Deferring here
-    // (rather than blocking) gets "wait for whichever is in progress to
-    // finish first" for free: `begin_index_op` below serializes on the
-    // same `index.lock` every one of them takes regardless, but skipping
-    // the attempt when we already know it's busy avoids spawning a task
-    // that's certain to lose the race.
-    if drain_in_flight || full_reindex_in_flight || scip_in_flight {
+    // Never overlap a queue drain or another full reindex -- same
+    // invariant every locked write path in this loop preserves; both
+    // touch the same live graph. Deferring here (rather than blocking)
+    // gets "wait for whichever is in progress to finish first" for free:
+    // `begin_index_op` below serializes on the same `index.lock` either
+    // one takes regardless, but skipping the attempt when we already know
+    // it's busy avoids spawning a task that's certain to lose the race.
+    //
+    // Deliberately does NOT check for an in-flight SCIP task: SCIP's
+    // external-indexer phase touches nothing in the graph (see
+    // `run_scip_indexers` in infigraph-cli), and its import phase acquires
+    // `index.lock` itself, narrowly, around just that step -- so it
+    // already serializes correctly against a concurrent full reindex
+    // without needing a loop-level gate here too. Gating on it here would
+    // reintroduce the exact regression this split fixed: SCIP's slow,
+    // graph-independent indexer-running phase blocking every other write
+    // for its entire duration.
+    if drain_in_flight || full_reindex_in_flight {
         return None;
     }
 
@@ -1341,7 +1350,6 @@ fn route_or_serve_request<MR>(
     held: &mut Option<Arc<Infigraph>>,
     drain_in_flight: bool,
     full_reindex_in_flight: bool,
-    scip_in_flight: bool,
     drain_rt: &tokio::runtime::Runtime,
 ) -> Option<InFlightFullReindex>
 where
@@ -1497,7 +1505,6 @@ where
             make_registry,
             drain_in_flight,
             full_reindex_in_flight,
-            scip_in_flight,
             drain_rt,
         ),
         _ => {
@@ -1889,7 +1896,6 @@ mod tests {
             &queue,
             &|| Ok(crate::lang::LanguageRegistry::new()),
             &mut held,
-            false,
             false,
             false,
             &drain_rt,

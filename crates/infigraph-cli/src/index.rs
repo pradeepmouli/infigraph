@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 #[cfg(feature = "remote")]
@@ -771,22 +771,28 @@ pub(crate) fn cmd_scip_enrich(root: &Path, detected_languages: &std::collections
     auto_scip_background(root, detected_languages);
 }
 
-/// Runs auto-SCIP enrichment (find indexers for `detected_languages`, run
-/// them, import results, update embeddings) against an already-open
-/// `Infigraph` connection. Shared by the standalone CLI path
-/// (`auto_scip_background`, which opens its own connection below) and the
-/// daemon's in-process full-reindex path (which reuses the daemon's own
-/// connection instead of opening a second one on the same live graph path).
-pub(crate) fn run_auto_scip_on(
+/// Part A of SCIP enrichment: find indexers for `detected_languages`,
+/// ensure their binaries are downloaded, and run them to produce `.scip`
+/// files. Touches nothing in the graph -- safe to run without holding
+/// `index.lock`. This matters specifically for the daemon's in-process
+/// full-reindex path: this phase can take several minutes on a real
+/// multi-language repo (rust-analyzer's cold-start cargo-metadata
+/// resolution alone is slow), and holding `index.lock` for that whole
+/// duration would block every other write the daemon needs to serve in
+/// the meantime -- exactly the regression this split exists to avoid.
+///
+/// Returns `(label, scip_output_path, succeeded)` per indexer that was
+/// actually run. An empty result means there was nothing to import --
+/// callers should skip acquiring any lock at all in that case.
+pub(crate) fn run_scip_indexers(
     root: &Path,
-    prism: &Infigraph,
     detected_languages: &std::collections::HashSet<String>,
-) {
+) -> Vec<(&'static str, PathBuf, bool)> {
     use crate::scip_download;
 
     let indexers = scip_download::indexers_for_languages(detected_languages);
     if indexers.is_empty() {
-        return;
+        return Vec::new();
     }
 
     // Parallel download: ensure all indexer binaries are available
@@ -816,11 +822,11 @@ pub(crate) fn run_auto_scip_on(
 
     if tasks.is_empty() {
         let _ = std::fs::remove_dir_all(&scip_tmp);
-        return;
+        return Vec::new();
     }
 
-    // Part A: Run indexers in parallel with per-indexer output paths
-    let results: Vec<_> = std::thread::scope(|s| {
+    // Run indexers in parallel with per-indexer output paths
+    std::thread::scope(|s| {
         let handles: Vec<_> = tasks
             .iter()
             .map(|(indexer, bin, output_path)| {
@@ -831,13 +837,27 @@ pub(crate) fn run_auto_scip_on(
             })
             .collect();
         handles.into_iter().map(|h| h.join().unwrap()).collect()
-    });
+    })
+}
+
+/// Part B+C of SCIP enrichment: import each indexer's `.scip` results into
+/// the graph, then update embeddings for anything new (embeddings depend
+/// on post-import graph state, so this must run after import, under the
+/// same lock). This is the part that actually touches the graph -- callers
+/// under daemon mode must hold `index.lock` for (only) this call, not for
+/// `run_scip_indexers` above. Cleans up `scip_tmp`'s contents as it goes.
+pub(crate) fn import_scip_results_and_embed(
+    root: &Path,
+    prism: &Infigraph,
+    results: &[(&'static str, PathBuf, bool)],
+) {
+    let scip_tmp = root.join(".infigraph").join("scip-tmp");
 
     let Some(backend) = prism.backend() else {
         let _ = std::fs::remove_dir_all(&scip_tmp);
         return;
     };
-    for (label, scip_path, success) in &results {
+    for (label, scip_path, success) in results {
         if *success && scip_path.exists() {
             match backend.import_scip_index(scip_path, Some(root)) {
                 Ok(stats) => eprintln!(
@@ -889,6 +909,32 @@ pub(crate) fn run_auto_scip_on(
     }
 
     eprintln!("Auto-SCIP: background enrichment complete.");
+}
+
+/// Runs auto-SCIP enrichment (find indexers, run them, import results,
+/// update embeddings) against an already-open `Infigraph` connection, with
+/// **no internal lock acquisition of its own** -- just Part A followed by
+/// Part B+C in sequence. Callers that need `index.lock` serialization
+/// (anything routing through the daemon) must acquire it themselves,
+/// scoped around *only* `import_scip_results_and_embed`, not this whole
+/// function -- see `cmd_daemon`'s `on_full_reindex` wiring in
+/// `info_commands.rs` for that case.
+///
+/// `auto_scip_background`'s caller (`cmd_scip_enrich`) already acquires
+/// `index.lock` around this *entire* call in the non-daemon case --
+/// unchanged by this split, since a standalone detached child process
+/// doesn't have anything else it would be blocking by holding it for the
+/// whole duration (unlike the daemon's own request-serving loop).
+pub(crate) fn run_auto_scip_on(
+    root: &Path,
+    prism: &Infigraph,
+    detected_languages: &std::collections::HashSet<String>,
+) {
+    let results = run_scip_indexers(root, detected_languages);
+    if results.is_empty() {
+        return;
+    }
+    import_scip_results_and_embed(root, prism, &results);
 }
 
 /// Background SCIP pipeline for the standalone CLI path: opens its own

@@ -237,7 +237,6 @@ mod tests {
             make_registry,
             false,
             false,
-            false,
             &drain_rt,
         ) {
             let (guard, _) = crate::watch::finish_full_reindex(
