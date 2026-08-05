@@ -115,40 +115,18 @@ fn auto_reindex_all(startup_dir: Option<&std::path::Path>) {
     }
 }
 
-/// Spawns a background thread that proactively starts watching every
-/// already-registered project (plus the directory this MCP server was
-/// launched in). Thin wrapper around the library crate's
-/// `recovery::start_daemon_watchers_for_all_registered`, which does the
-/// actual gating (daemon mode + `[watch].auto_start_on_boot`) and target
-/// walk synchronously -- kept there rather than here so it's reachable from
-/// `infigraph-mcp`'s integration tests, since this `main.rs` is a separate
-/// `[[bin]]` target. Runs on its own thread so a large registry doesn't
-/// delay this server's readiness to serve the MCP client's `initialize`
-/// handshake.
-fn start_daemon_watchers_for_all_registered(startup_dir: Option<&std::path::Path>) {
+/// Spawns a background thread that proactively starts watching the
+/// directory this MCP server was launched in. Thin wrapper around the
+/// library crate's `recovery::start_daemon_watcher_for_startup_dir`, which
+/// does the actual gating (daemon mode + `[watch].auto_start_on_boot`) --
+/// kept there rather than here so it's reachable from `infigraph-mcp`'s
+/// integration tests, since this `main.rs` is a separate `[[bin]]` target.
+/// Runs on its own thread so this doesn't delay this server's readiness to
+/// serve the MCP client's `initialize` handshake.
+fn start_daemon_watcher_for_startup_dir(startup_dir: Option<&std::path::Path>) {
     let startup_dir = startup_dir.map(|p| p.to_path_buf());
     std::thread::spawn(move || {
-        let registry_paths: Vec<std::path::PathBuf> = match infigraph_core::multi::Registry::load()
-        {
-            Ok(r) => r.repos.values().map(|e| e.path.clone()).collect(),
-            Err(e) => {
-                mcp_log(
-                    "ERROR",
-                    &format!("Registry load failed during startup watch: {e}"),
-                );
-                Vec::new()
-            }
-        };
-        let groups_dir = std::env::var_os("HOME")
-            .map(std::path::PathBuf::from)
-            .or_else(dirs_next::home_dir)
-            .map(|h| h.join(".infigraph").join("groups"));
-
-        infigraph_mcp::recovery::start_daemon_watchers_for_all_registered(
-            startup_dir.as_deref(),
-            &registry_paths,
-            groups_dir.as_deref(),
-        );
+        infigraph_mcp::recovery::start_daemon_watcher_for_startup_dir(startup_dir.as_deref());
     });
 }
 
@@ -261,14 +239,14 @@ fn run() -> Result<()> {
         }
     };
 
-    // `start_daemon_watchers_for_all_registered` (and the library function it
+    // `start_daemon_watcher_for_startup_dir` (and the library function it
     // wraps) gate on daemon mode + the `[watch].auto_start_on_boot` config
     // toggle internally -- `is_primary` is the one precondition that belongs
     // here, since it's derived from the mcp.lock outcome above, not from
     // config the library function can read for itself.
     if is_primary {
         let startup_dir = std::env::current_dir().ok();
-        start_daemon_watchers_for_all_registered(startup_dir.as_deref());
+        start_daemon_watcher_for_startup_dir(startup_dir.as_deref());
     }
 
     if let Some(mut lock) = mcp_lock {

@@ -54,47 +54,53 @@ pub fn collect_reindex_targets(
     targets
 }
 
-/// Proactively starts watching every already-registered project (plus the
-/// directory this MCP server was launched in), rather than only ever
-/// starting a watcher reactively after some write happens to touch that
-/// project. Only takes effect when both daemon mode
+/// Proactively starts watching the directory this MCP server was launched
+/// in, rather than only ever starting a watcher reactively after some write
+/// happens to touch it. Only takes effect when both daemon mode
 /// (`INFIGRAPH_BACKEND=daemon`) and the `[watch].auto_start_on_boot`
-/// config toggle (env override: `INFIGRAPH_AUTO_START_WATCH`) are on --
-/// that's the only combination where "start watching" means "spawn/confirm
-/// a lightweight separate daemon process" rather than an in-process thread
-/// per project, which would be wasteful to start eagerly for every
-/// registered repo, and where a user may reasonably want to opt out for a
-/// large registry.
+/// config toggle (env override: `INFIGRAPH_AUTO_START_WATCH`) are on.
+///
+/// Scoped to just `startup_dir` -- an earlier version swept the whole
+/// project registry plus the groups dir (reusing `collect_reindex_targets`,
+/// which crash recovery still uses for its own, legitimately broader,
+/// purpose), but that meant every MCP server startup spun up a daemon for
+/// every registered project regardless of whether this server instance was
+/// actually serving it: stale temp-test directories, a groups config dir
+/// that isn't really a "project", and other repos not even open in this
+/// session. Only the repo this server was launched in is this server's
+/// concern.
 ///
 /// Deliberately synchronous (unlike `main.rs`'s SIGSEGV recovery path,
 /// which fires deep into a crash-handling loop): `main.rs::run()` wraps this
-/// call in its own thread so a large registry doesn't delay MCP server
-/// readiness, but keeping the logic itself synchronous means tests can
-/// observe its effect deterministically without polling a background
-/// thread's completion. Lives in the library crate (alongside
-/// `collect_reindex_targets`, which it reuses for target discovery) rather
-/// than as a `main.rs`-only function, specifically so integration tests in
-/// `tests/` can reach it -- `main.rs` compiles to a separate `[[bin]]`
-/// target with no unit-test history of its own.
-pub fn start_daemon_watchers_for_all_registered(
-    startup_dir: Option<&Path>,
-    registry_paths: &[PathBuf],
-    groups_dir: Option<&Path>,
-) {
+/// call in its own thread so this doesn't delay MCP server readiness, but
+/// keeping the logic itself synchronous means tests can observe its effect
+/// deterministically. Lives in the library crate rather than as a
+/// `main.rs`-only function, specifically so integration tests in `tests/`
+/// can reach it -- `main.rs` compiles to a separate `[[bin]]` target with no
+/// unit-test history of its own.
+pub fn start_daemon_watcher_for_startup_dir(startup_dir: Option<&Path>) {
     if !infigraph_core::daemon_backend_selected()
         || !crate::session_context::auto_start_watch_on_boot_enabled()
     {
         return;
     }
 
-    let targets = collect_reindex_targets(startup_dir, registry_paths, groups_dir);
-    for path in &targets {
-        let path_str = path.to_string_lossy().to_string();
-        if let Some(msg) = crate::tools::watch::auto_start_watch(&path_str) {
-            crate::mcp_log("INFO", &format!("Startup watch: {path_str}: {msg}"));
-        }
-        crate::tools::docs::auto_start_doc_watch(&path_str);
+    let Some(dir) = startup_dir else {
+        return;
+    };
+    // Must be a directory that's actually been indexed -- mirrors
+    // `collect_reindex_targets`'s own guard, for the same reason: a fresh,
+    // never-indexed cwd has no `.infigraph/watch.lock` home for a daemon to
+    // coordinate through, and there's nothing to watch yet regardless.
+    if !dir.join(".infigraph").is_dir() {
+        return;
     }
+
+    let path_str = dir.to_string_lossy().to_string();
+    if let Some(msg) = crate::tools::watch::auto_start_watch(&path_str) {
+        crate::mcp_log("INFO", &format!("Startup watch: {path_str}: {msg}"));
+    }
+    crate::tools::docs::auto_start_doc_watch(&path_str);
 }
 
 /// Wipe code graph and document index artifacts under `root/.infigraph/`.
