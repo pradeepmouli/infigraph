@@ -53,6 +53,14 @@ impl std::fmt::Display for WatchEvent {
     }
 }
 
+/// Callback for in-process SCIP enrichment after a successful daemon full
+/// reindex. Takes the daemon's own (already-open, already-reopened-post-swap)
+/// connection -- the callback must NOT open a second `Infigraph`/`Database`
+/// on the same live graph path; Kuzu only allows safe concurrent access
+/// within one process's `Database` object, not across two, even in the same
+/// process.
+pub type FullReindexCallback = dyn Fn(Arc<Infigraph>, Vec<String>) + Send + Sync;
+
 /// Watch a project directory and auto-reindex on file changes.
 ///
 /// On non-Windows platforms, holds one DB connection open for the whole
@@ -87,6 +95,7 @@ where
         0,
         None::<fn(&crate::IndexResult)>,
         false,
+        None,
     )
 }
 
@@ -100,6 +109,7 @@ pub fn watch_project_with_periodic<MR, F>(
     periodic_secs: u64,
     on_periodic: Option<F>,
     serve_requests: bool,
+    on_full_reindex: Option<Arc<FullReindexCallback>>,
 ) -> Result<()>
 where
     MR: Fn() -> Result<crate::lang::LanguageRegistry> + Send + 'static,
@@ -161,6 +171,8 @@ where
         .thread_name("infigraph-drain")
         .build()?;
     let mut drain_in_flight: Option<InFlightDrain> = None;
+    let mut full_reindex_in_flight: Option<InFlightFullReindex> = None;
+    let mut scip_in_flight: Option<InFlightScip> = None;
 
     let sentinel = root.join(".infigraph").join("watch.stop");
 
@@ -260,6 +272,76 @@ where
             drop(guard);
         }
 
+        // Reap a finished full-reindex build the same way the regular drain
+        // above is reaped: pull the handle, run the fast held-touching finish
+        // step on this thread, then (only on full success) schedule SCIP
+        // enrichment as its own background task -- never inside the same task,
+        // so a `--full` reindex still returns to the client as soon as the
+        // rebuild lands, not after SCIP also finishes.
+        if full_reindex_in_flight
+            .as_ref()
+            .is_some_and(|f| f.handle.is_finished())
+        {
+            let InFlightFullReindex {
+                handle,
+                request_path,
+                reply_path,
+            } = full_reindex_in_flight
+                .take()
+                .expect("checked is_some just above");
+            let (guard, scheduled_languages) = finish_full_reindex(
+                root,
+                &reply_path,
+                &make_registry,
+                &mut held_prism,
+                drain_rt.block_on(handle),
+            );
+            std::fs::remove_file(&request_path).ok();
+            drop(guard);
+
+            if let Some(languages) = scheduled_languages {
+                if let (Some(cb), Some(prism)) = (on_full_reindex.clone(), held_prism.clone()) {
+                    let root_buf = root.to_path_buf();
+                    let handle = drain_rt.spawn_blocking(move || {
+                        match begin_index_op(
+                            &root_buf,
+                            "infigraph daemon (scip enrich)",
+                            Duration::from_secs(30),
+                        ) {
+                            Ok(IndexOpOutcome::Acquired(guard)) => {
+                                cb(prism, languages);
+                                drop(guard);
+                            }
+                            Ok(o @ IndexOpOutcome::AlreadyRunning(_)) => {
+                                eprintln!(
+                                    "[daemon] scip-enrich busy ({}), skipping this round",
+                                    o.skip_note().unwrap_or_default()
+                                );
+                            }
+                            Err(e) => {
+                                eprintln!("[daemon] scip-enrich busy ({e}), skipping this round");
+                            }
+                        }
+                    });
+                    scip_in_flight = Some(InFlightScip { handle });
+                }
+            }
+        }
+
+        // Reap a finished SCIP-enrichment task. Nobody is waiting on a reply for
+        // this one -- it isn't client-requested -- so this only needs to log a
+        // panic and free the slot.
+        if scip_in_flight
+            .as_ref()
+            .is_some_and(|s| s.handle.is_finished())
+        {
+            let InFlightScip { handle } =
+                scip_in_flight.take().expect("checked is_some just above");
+            if let Err(join_err) = drain_rt.block_on(handle) {
+                eprintln!("[watch] scip-enrich task panicked: {join_err}");
+            }
+        }
+
         // Periodic SCIP refresh: if changes accumulated and enough time passed
         if periodic_secs > 0
             && changes_since_periodic > 0
@@ -293,14 +375,19 @@ where
                 for entry in entries.flatten() {
                     let path = entry.path();
                     if path.extension().is_some_and(|ext| ext == "request") {
-                        route_or_serve_request(
+                        if let Some(started) = route_or_serve_request(
                             root,
                             &path,
                             &queue,
                             &make_registry,
                             &mut held_prism,
                             drain_in_flight.is_some(),
-                        );
+                            full_reindex_in_flight.is_some(),
+                            scip_in_flight.is_some(),
+                            &drain_rt,
+                        ) {
+                            full_reindex_in_flight = Some(started);
+                        }
                     }
                 }
             }
@@ -420,7 +507,11 @@ where
         // Schedule: only when nothing's in flight, so at most one drain runs
         // at a time and this loop never waits on its own background task's
         // `index.lock`.
-        if drain_in_flight.is_none() && !queue.lock().unwrap().is_empty() {
+        if drain_in_flight.is_none()
+            && full_reindex_in_flight.is_none()
+            && scip_in_flight.is_none()
+            && !queue.lock().unwrap().is_empty()
+        {
             match begin_index_op(root, "infigraph daemon", Duration::from_secs(30)) {
                 Ok(IndexOpOutcome::Acquired(guard)) => {
                     match watch_db(root, &make_registry, &mut held_prism) {
@@ -476,6 +567,24 @@ where
             &in_flight.waiter_replies,
         );
         drop(guard);
+    }
+
+    // Same reasoning as the drain cleanup above -- a full reindex or a SCIP
+    // task still running when the loop exits holds `index.lock` (and, for
+    // the full reindex, a connection to the graph). Wait it out.
+    if let Some(in_flight) = full_reindex_in_flight.take() {
+        let (guard, _) = finish_full_reindex(
+            root,
+            &in_flight.reply_path,
+            &make_registry,
+            &mut held_prism,
+            drain_rt.block_on(in_flight.handle),
+        );
+        std::fs::remove_file(&in_flight.request_path).ok();
+        drop(guard);
+    }
+    if let Some(in_flight) = scip_in_flight.take() {
+        let _ = drain_rt.block_on(in_flight.handle);
     }
 
     Ok(())
@@ -804,34 +913,142 @@ fn serve_request_locked<MR>(
     }
 }
 
-/// Handles `WriteRequest::FullReindex`: builds an entirely new database at
-/// `.infigraph/graph.rebuilding/`, leaving the live `.infigraph/graph`
-/// completely untouched and fully readable throughout (reads already
-/// reopen a fresh connection per call, so they transparently keep hitting
-/// the still-valid old graph right up until the swap). On success,
-/// atomically swaps the two directories in and retires the old one into a
-/// bounded rollback pool (`crate::quarantine::retire_previous_graph`)
-/// rather than deleting it. See
-/// docs/superpowers/specs/2026-08-04-daemon-routed-full-reindex-design.md.
-fn serve_full_reindex_request<MR>(
+/// What the background full-reindex build task computes: a verified-good
+/// fresh graph sitting at `graph.rebuilding`, or (via the `Result` this is
+/// wrapped in) the reason it isn't. The swap itself, and everything that
+/// touches `held`, happens afterward on the loop thread
+/// (`finish_full_reindex`) -- `spawn_blocking`'s `'static` bound can't
+/// capture `&mut Option<Arc<Infigraph>>`.
+struct FullReindexBuildOutcome {
+    indexed_files: usize,
+    detected_languages: Vec<String>,
+}
+
+/// What the background build task hands back. The `index.lock` guard rides
+/// along so the loop thread keeps holding it across the swap, matching
+/// `DrainTaskOutput`'s shape.
+struct FullReindexTaskOutput {
+    guard: crate::ops::IndexOpGuard,
+    result: Result<FullReindexBuildOutcome>,
+}
+
+/// A full-reindex build executing on the background task, plus what the
+/// loop thread needs to finish it once it completes.
+struct InFlightFullReindex {
+    handle: tokio::task::JoinHandle<FullReindexTaskOutput>,
+    request_path: PathBuf,
+    reply_path: PathBuf,
+}
+
+/// A background SCIP-enrichment task scheduled after a successful full
+/// reindex. Reaped for logging only -- nothing is waiting on a reply for
+/// this one (it isn't client-requested), so there's no waiter to answer.
+struct InFlightScip {
+    handle: tokio::task::JoinHandle<()>,
+}
+
+/// The expensive, `held`-independent part of a full reindex: build a fresh
+/// database at `graph.rebuilding`, scan/extract/upsert/resolve every file,
+/// derive TESTED_BY edges. Runs entirely against its own connection, opened
+/// fresh inside this call -- deliberately takes no `&mut Option<Arc<Infigraph>>`
+/// so it can run inside `spawn_blocking`'s `'static` closure. The live graph
+/// is never touched here; only `finish_full_reindex` (loop thread) swaps it
+/// in.
+fn build_full_reindex(
+    root: &Path,
+    registry: crate::lang::LanguageRegistry,
+) -> Result<FullReindexBuildOutcome> {
+    const REBUILDING_NAME: &str = "graph.rebuilding";
+    let rebuilding_path = root.join(".infigraph").join(REBUILDING_NAME);
+
+    // Clean up any stale leftover from a previously-interrupted rebuild
+    // attempt (e.g. the daemon was killed mid-rebuild last time) before
+    // starting a new one. Unconditional, and covering the WAL family as
+    // well as the base image -- see the original function's comment (now
+    // removed) for why a surviving WAL sibling permanently wedges every
+    // future full reindex if left in place.
+    let _ = std::fs::remove_dir_all(&rebuilding_path);
+    let _ = std::fs::remove_file(&rebuilding_path);
+    crate::graph::remove_wal_family(&rebuilding_path);
+
+    let build_result = Infigraph::open_local_kuzu_at(root, registry, rebuilding_path.clone())
+        .and_then(|fresh| {
+            let backend = fresh
+                .backend()
+                .ok_or_else(|| anyhow::anyhow!("freshly-opened backend was not initialized"))?;
+            let scan = fresh.scan_changed_files(backend)?;
+            let detected_languages: std::collections::HashSet<String> = scan
+                .extractions
+                .iter()
+                .map(|e| e.language.clone())
+                .collect();
+            if !scan.extractions.is_empty() {
+                backend.upsert_files_bulk(&scan.extractions, true)?;
+            }
+            let _resolve_stats = backend.resolve_calls(&scan.extractions, None)?;
+            // The swap replaces the graph wholesale, so whatever TESTED_BY
+            // edges the live graph had are about to be discarded -- derive
+            // them here or they are gone for good. `None` scope means
+            // "everything", matching how the local `--full` path calls it.
+            // Non-fatal, mirroring that path's warn-and-continue.
+            if let Err(e) = backend.derive_tested_by_edges(None) {
+                eprintln!("[daemon] full-reindex: TESTED_BY derivation failed: {e}");
+            }
+            Ok(FullReindexBuildOutcome {
+                indexed_files: scan.extractions.len(),
+                detected_languages: detected_languages.into_iter().collect(),
+            })
+        });
+
+    if build_result.is_err() {
+        // The live graph was never touched -- clean up the incomplete
+        // rebuild attempt so the next full reindex doesn't inherit a
+        // half-built `graph.rebuilding` or a foreign-ID WAL.
+        let _ = std::fs::remove_dir_all(&rebuilding_path);
+        let _ = std::fs::remove_file(&rebuilding_path);
+        crate::graph::remove_wal_family(&rebuilding_path);
+    }
+
+    build_result
+}
+
+/// Loop-thread entry point for a `WriteRequest::FullReindex`. Does the
+/// cheap, synchronous gating (never overlap a queue drain, another full
+/// reindex, or a running SCIP-enrichment task -- all three write the same
+/// live graph) and, if clear, acquires `index.lock` and hands the expensive
+/// build off to `drain_rt` so this loop keeps ticking (accepting fsevents,
+/// other requests, the stop signal) for the whole multi-minute rebuild
+/// instead of blocking on it. Returns `None` if nothing was started
+/// (busy, or an early failure already replied and cleaned up the request
+/// file itself); `Some` if a build was scheduled -- the caller must track
+/// the returned handle and reap it via `finish_full_reindex` on a later
+/// tick.
+#[allow(clippy::too_many_arguments)]
+fn try_start_full_reindex<MR>(
     root: &Path,
     path: &Path,
     queue: &Arc<Mutex<crate::watch::queue::IndexWorkQueue>>,
     make_registry: &MR,
-    held: &mut Option<Arc<Infigraph>>,
     drain_in_flight: bool,
-) where
+    full_reindex_in_flight: bool,
+    scip_in_flight: bool,
+    drain_rt: &tokio::runtime::Runtime,
+) -> Option<InFlightFullReindex>
+where
     MR: Fn() -> Result<crate::lang::LanguageRegistry>,
 {
     let reply_path = path.with_extension("result");
 
-    // Never drain unless Acquired -- same invariant every other locked
-    // operation in this loop preserves. Deferring here (rather than
-    // blocking) also gets "wait for any in-progress drain to finish
-    // first" for free: it's the same lock every write already
-    // serializes on.
-    if drain_in_flight {
-        return;
+    // Never overlap a queue drain, another full reindex, or a running SCIP
+    // task -- same invariant every locked write path in this loop
+    // preserves; all three touch the same live graph. Deferring here
+    // (rather than blocking) gets "wait for whichever is in progress to
+    // finish first" for free: `begin_index_op` below serializes on the
+    // same `index.lock` every one of them takes regardless, but skipping
+    // the attempt when we already know it's busy avoids spawning a task
+    // that's certain to lose the race.
+    if drain_in_flight || full_reindex_in_flight || scip_in_flight {
+        return None;
     }
 
     let guard = match begin_index_op(
@@ -845,11 +1062,11 @@ fn serve_full_reindex_request<MR>(
                 "[daemon] full-reindex busy ({}), retrying next tick",
                 o.skip_note().unwrap_or_default()
             );
-            return;
+            return None;
         }
         Err(e) => {
             eprintln!("[daemon] full-reindex busy ({e}), retrying next tick");
-            return;
+            return None;
         }
     };
 
@@ -867,26 +1084,6 @@ fn serve_full_reindex_request<MR>(
         }
     }
 
-    const LIVE_NAME: &str = "graph";
-    const REBUILDING_NAME: &str = "graph.rebuilding";
-
-    let infigraph_dir = root.join(".infigraph");
-    let rebuilding_path = infigraph_dir.join(REBUILDING_NAME);
-    let live_path = infigraph_dir.join(LIVE_NAME);
-
-    // Clean up any stale leftover from a previously-interrupted rebuild
-    // attempt (e.g. the daemon was killed mid-rebuild last time) before
-    // starting a new one. Unconditional, and covering the WAL family as
-    // well as the base image: a surviving `graph.rebuilding.wal*` carries
-    // the dead database's ID and makes the fresh `graph.rebuilding` we're
-    // about to create permanently unopenable, which would wedge every
-    // future full reindex. Guarding this on the *base* image existing is
-    // exactly wrong -- the wedged state is "base already deleted, WAL
-    // sibling still there".
-    let _ = std::fs::remove_dir_all(&rebuilding_path);
-    let _ = std::fs::remove_file(&rebuilding_path);
-    crate::graph::remove_wal_family(&rebuilding_path);
-
     let registry = match make_registry() {
         Ok(r) => r,
         Err(e) => {
@@ -898,231 +1095,234 @@ fn serve_full_reindex_request<MR>(
             }
             std::fs::remove_file(path).ok();
             drop(guard);
-            return;
+            return None;
         }
     };
 
-    let build_result = Infigraph::open_local_kuzu_at(root, registry, rebuilding_path.clone())
-        .and_then(|fresh| {
-            let backend = fresh
-                .backend()
-                .ok_or_else(|| anyhow::anyhow!("freshly-opened backend was not initialized"))?;
-            let scan = fresh.scan_changed_files(backend)?;
-            if !scan.extractions.is_empty() {
-                backend.upsert_files_bulk(&scan.extractions, true)?;
-            }
-            let resolve_stats = backend.resolve_calls(&scan.extractions, None)?;
-            // The swap replaces the graph wholesale, so whatever TESTED_BY
-            // edges the live graph had are about to be discarded -- derive
-            // them here or they are gone for good. Nothing downstream will
-            // recover them: the CLI's own derivation is gated on
-            // `indexed_files > 0`, and after a fresh full rebuild every file
-            // hash matches, so the next ordinary index also skips it. `None`
-            // scope means "everything", matching how the local `--full` path
-            // calls it. Non-fatal, mirroring that path's warn-and-continue.
-            if let Err(e) = backend.derive_tested_by_edges(None) {
-                eprintln!("[daemon] full-reindex: TESTED_BY derivation failed: {e}");
-            }
-            Ok((scan.extractions.len(), resolve_stats))
-        });
+    let root_buf = root.to_path_buf();
+    let handle = drain_rt.spawn_blocking(move || FullReindexTaskOutput {
+        result: build_full_reindex(&root_buf, registry),
+        guard,
+    });
 
-    match build_result {
-        Ok((indexed_files, _resolve_stats)) => {
-            // The live graph was never touched up to this point -- only
-            // now, with a verified-good fresh build in hand, do we poison
-            // the daemon's own handle and swap.
-            poison_watch_db(held);
+    Some(InFlightFullReindex {
+        handle,
+        request_path: path.to_path_buf(),
+        reply_path,
+    })
+}
 
-            // Replacing the live graph on disk is a graph-level write, so
-            // it takes the same advisory lock every writer takes --
-            // `index.lock` (held by `guard`) does not cover writers that
-            // only take `graph.lock`, notably `init()`'s corruption-retry
-            // calling `wipe_graph`. Scoped narrowly to the destructive
-            // section, matching `wipe_graph`: the reopen further down
-            // re-acquires this same lock through `GraphStore`, so holding
-            // it any wider would deadlock against ourselves.
-            let graph_lock = match crate::lockfile::acquire(
-                &live_path.with_extension("lock"),
-                "full-reindex-swap",
-                Duration::from_secs(5),
-            ) {
-                Ok(l) => l,
-                Err(e) => {
-                    // Nothing destructive has happened yet -- same
-                    // leave-everything-where-it-is shape as the
-                    // quarantine-failure branch below.
-                    let result = crate::daemon_protocol::WriteResult::Err {
-                        message: format!(
-                            "full reindex rebuilt successfully but could not take the graph \
-                             write lock to swap it in: {e:#}. The live graph at {} was left \
-                             untouched; the rebuilt graph remains at {}",
-                            live_path.display(),
-                            rebuilding_path.display()
-                        ),
-                    };
-                    if let Ok(json) = serde_json::to_string(&result) {
-                        let _ = crate::daemon_protocol::write_atomic(&reply_path, &json);
-                    }
-                    std::fs::remove_file(path).ok();
-                    drop(guard);
-                    return;
-                }
+/// Loop-thread finish for a completed full-reindex build: poison the
+/// daemon's own connection, swap the verified-good rebuilt graph in for the
+/// live one (still under `graph.lock`, not `index.lock` -- see the
+/// `graph_lock` comment below), reopen and reconcile embeddings, and reply.
+/// Mirrors `finish_drain`'s "task does the heavy work, loop thread does the
+/// `held`-touching part" split.
+///
+/// Returns the `index.lock` guard to drop (absent if the task panicked, since
+/// it was dropped during the unwind -- same convention as `finish_drain`),
+/// and `Some(detected_languages)` only when the swap fully succeeded --
+/// that's the signal the caller uses to schedule SCIP enrichment. Any
+/// failure path returns `None` for languages: don't enrich a reindex that
+/// didn't actually land.
+fn finish_full_reindex<MR>(
+    root: &Path,
+    reply_path: &Path,
+    make_registry: &MR,
+    held: &mut Option<Arc<Infigraph>>,
+    joined: std::result::Result<FullReindexTaskOutput, tokio::task::JoinError>,
+) -> (Option<crate::ops::IndexOpGuard>, Option<Vec<String>>)
+where
+    MR: Fn() -> Result<crate::lang::LanguageRegistry>,
+{
+    let FullReindexTaskOutput { guard, result } = match joined {
+        Ok(output) => output,
+        Err(join_err) => {
+            eprintln!("[watch] full-reindex task panicked: {join_err}");
+            let result = crate::daemon_protocol::WriteResult::Err {
+                message: format!("daemon full-reindex task panicked: {join_err}"),
             };
-
-            // Bind the retirement destination rather than discarding it --
-            // if the move-aside succeeds but the rename below fails,
-            // `live_path` no longer exists (it's now this destination), so
-            // an error message that names `live_path` would point an
-            // operator at a path that's already gone and never say where
-            // the real data actually went.
-            let retired_path: Option<PathBuf> = if live_path.exists() {
-                // A healthy superseded graph goes into its own bounded
-                // rollback pool, NOT the corruption-quarantine pool --
-                // that one exists to preserve corruption evidence for
-                // human diagnosis (R3.1.2), and routine full reindexes
-                // filing healthy graphs into it would evict real evidence.
-                match crate::quarantine::retire_previous_graph(&infigraph_dir, LIVE_NAME) {
-                    Ok(dest) => Some(dest),
-                    Err(e) => {
-                        // Retiring itself failed -- `live_path` was never
-                        // touched, so it's still there and still valid.
-                        // Same early-reply-and-cleanup shape as the
-                        // registry-build-failure branch above.
-                        let result = crate::daemon_protocol::WriteResult::Err {
-                            message: format!(
-                                "full reindex rebuilt successfully but could not move the old \
-                                 graph aside: {e:#}. The live graph at {} was left \
-                                 untouched; the rebuilt graph remains at {}",
-                                live_path.display(),
-                                rebuilding_path.display()
-                            ),
-                        };
-                        if let Ok(json) = serde_json::to_string(&result) {
-                            let _ = crate::daemon_protocol::write_atomic(&reply_path, &json);
-                        }
-                        drop(graph_lock);
-                        std::fs::remove_file(path).ok();
-                        drop(guard);
-                        return;
-                    }
-                }
-            } else {
-                None
-            };
-
-            // Unconditional, regardless of which branch above ran: a
-            // `graph.wal*` family can still be sitting at `live_path` even
-            // after a successful retire, since `move_wal_sibling`'s
-            // copy-then-remove fallback can leave the original in place if
-            // only the trailing `remove_file` fails (it still returns `Ok`
-            // in that case, since the content is already safe in the
-            // retirement pool). And when there was no base image to retire
-            // at all, an orphaned `graph.wal*` from an earlier crash could
-            // still be here. Either way, renaming the rebuilt graph on top
-            // of a foreign-ID WAL would make the graph we just swapped in
-            // unopenable, so clear it unconditionally right before the
-            // swap rather than only in the no-base-image case.
-            crate::graph::remove_wal_family(&live_path);
-
-            let swap = std::fs::rename(&rebuilding_path, &live_path);
-            if swap.is_ok() {
-                // The base image moved; its WAL-family siblings have to
-                // follow it or a not-yet-checkpointed WAL belonging to the
-                // graph we just swapped in is lost -- and worse, it stays
-                // behind at the rebuild path for a later reindex to
-                // inherit. Same rename-then-copy fallback the retirement
-                // path uses, for the same reason: a silent failure here
-                // leaves a foreign WAL where it does damage.
-                for src in crate::graph::wal_family_paths(&rebuilding_path) {
-                    let name = src.file_name().unwrap_or_default().to_string_lossy();
-                    let suffix = name.strip_prefix(REBUILDING_NAME).unwrap_or(&name);
-                    let dest = infigraph_dir.join(format!("{LIVE_NAME}{suffix}"));
-                    if let Err(e) = crate::quarantine::move_wal_sibling(&src, &dest) {
-                        eprintln!(
-                            "[daemon] full-reindex: could not carry WAL sibling {} across to {} \
-                             ({e:#}) -- the swapped-in graph may be missing uncheckpointed \
-                             writes; the leftover is cleaned up by the next full reindex",
-                            src.display(),
-                            dest.display()
-                        );
-                    }
-                }
+            if let Ok(json) = serde_json::to_string(&result) {
+                let _ = crate::daemon_protocol::write_atomic(reply_path, &json);
             }
-            drop(graph_lock);
-
-            match swap {
-                Ok(()) => {
-                    // Reopen and reconcile embeddings against the NEW
-                    // graph -- update_embeddings queries the live symbol
-                    // set and prunes anything not in it, so this converges
-                    // embeddings.bin to the rebuilt graph regardless of
-                    // whether it was wiped first (it wasn't, deliberately
-                    // -- see the design doc).
-                    if let Ok(prism) = watch_db(root, make_registry, held) {
-                        if let Some(backend) = prism.backend() {
-                            if let Err(e) = crate::embed::update_embeddings(backend, root, &[]) {
-                                eprintln!("[daemon] full-reindex: embedding update failed: {e}");
-                            }
-                        }
-                    }
-                    let result = crate::daemon_protocol::WriteResult::Ok {
-                        total_files: indexed_files,
-                        indexed_files,
-                    };
-                    if let Ok(json) = serde_json::to_string(&result) {
-                        let _ = crate::daemon_protocol::write_atomic(&reply_path, &json);
-                    }
-                }
-                Err(e) => {
-                    // The rebuilt graph is verified-good and still sitting
-                    // at `rebuilding_path` -- nothing was lost. Report the
-                    // old graph's real current location: wherever it was
-                    // moved aside to, or "no prior graph" if this was a
-                    // from-scratch build.
-                    let old_graph_location = match &retired_path {
-                        Some(q) => format!("the old graph was moved aside to {}", q.display()),
-                        None => "there was no prior graph to move aside".to_string(),
-                    };
-                    eprintln!(
-                        "[daemon] full-reindex swap failed after a successful rebuild: {e} \
-                         -- {old_graph_location}; the rebuilt graph is at {} -- check both by hand",
-                        rebuilding_path.display()
-                    );
-                    let result = crate::daemon_protocol::WriteResult::Err {
-                        message: format!(
-                            "full reindex rebuilt successfully but the swap failed: {e}. \
-                             Manual recovery needed: {old_graph_location}; the rebuilt \
-                             graph is at {}",
-                            rebuilding_path.display()
-                        ),
-                    };
-                    if let Ok(json) = serde_json::to_string(&result) {
-                        let _ = crate::daemon_protocol::write_atomic(&reply_path, &json);
-                    }
-                }
-            }
+            return (None, None);
         }
+    };
+
+    let (indexed_files, detected_languages) = match result {
+        Ok(outcome) => (outcome.indexed_files, outcome.detected_languages),
         Err(e) => {
-            // The live graph was never touched -- clean up the incomplete
-            // rebuild attempt and reply with the failure. The daemon keeps
-            // serving the old (still fully valid) graph exactly as before.
-            // The WAL family goes with the base image: leaving a
-            // `graph.rebuilding.wal*` behind hands the next attempt a
-            // foreign-ID WAL to trip over.
-            let _ = std::fs::remove_dir_all(&rebuilding_path);
-            let _ = std::fs::remove_file(&rebuilding_path);
-            crate::graph::remove_wal_family(&rebuilding_path);
             let result = crate::daemon_protocol::WriteResult::Err {
                 message: format!("full reindex failed: {e:#}"),
             };
             if let Ok(json) = serde_json::to_string(&result) {
-                let _ = crate::daemon_protocol::write_atomic(&reply_path, &json);
+                let _ = crate::daemon_protocol::write_atomic(reply_path, &json);
+            }
+            return (Some(guard), None);
+        }
+    };
+
+    const LIVE_NAME: &str = "graph";
+    const REBUILDING_NAME: &str = "graph.rebuilding";
+    let infigraph_dir = root.join(".infigraph");
+    let rebuilding_path = infigraph_dir.join(REBUILDING_NAME);
+    let live_path = infigraph_dir.join(LIVE_NAME);
+
+    // The live graph was never touched up to this point -- only now, with a
+    // verified-good fresh build in hand, do we poison the daemon's own
+    // handle and swap.
+    poison_watch_db(held);
+
+    // Replacing the live graph on disk is a graph-level write, so it takes
+    // the same advisory lock every writer takes -- `index.lock` (held by
+    // `guard`) does not cover writers that only take `graph.lock`, notably
+    // `init()`'s corruption-retry calling `wipe_graph`. Scoped narrowly to
+    // the destructive section, matching `wipe_graph`: the reopen further
+    // down re-acquires this same lock through `GraphStore`, so holding it
+    // any wider would deadlock against ourselves.
+    let graph_lock = match crate::lockfile::acquire(
+        &live_path.with_extension("lock"),
+        "full-reindex-swap",
+        Duration::from_secs(5),
+    ) {
+        Ok(l) => l,
+        Err(e) => {
+            let result = crate::daemon_protocol::WriteResult::Err {
+                message: format!(
+                    "full reindex rebuilt successfully but could not take the graph write lock \
+                     to swap it in: {e:#}. The live graph at {} was left untouched; the rebuilt \
+                     graph remains at {}",
+                    live_path.display(),
+                    rebuilding_path.display()
+                ),
+            };
+            if let Ok(json) = serde_json::to_string(&result) {
+                let _ = crate::daemon_protocol::write_atomic(reply_path, &json);
+            }
+            return (Some(guard), None);
+        }
+    };
+
+    // Bind the retirement destination rather than discarding it -- if the
+    // move-aside succeeds but the rename below fails, `live_path` no longer
+    // exists (it's now this destination), so an error message that names
+    // `live_path` would point an operator at a path that's already gone and
+    // never say where the real data actually went.
+    let retired_path: Option<PathBuf> = if live_path.exists() {
+        // A healthy superseded graph goes into its own bounded rollback
+        // pool, NOT the corruption-quarantine pool -- that one exists to
+        // preserve corruption evidence for human diagnosis, and routine
+        // full reindexes filing healthy graphs into it would evict real
+        // evidence.
+        match crate::quarantine::retire_previous_graph(&infigraph_dir, LIVE_NAME) {
+            Ok(dest) => Some(dest),
+            Err(e) => {
+                let result = crate::daemon_protocol::WriteResult::Err {
+                    message: format!(
+                        "full reindex rebuilt successfully but could not move the old graph \
+                         aside: {e:#}. The live graph at {} was left untouched; the rebuilt \
+                         graph remains at {}",
+                        live_path.display(),
+                        rebuilding_path.display()
+                    ),
+                };
+                if let Ok(json) = serde_json::to_string(&result) {
+                    let _ = crate::daemon_protocol::write_atomic(reply_path, &json);
+                }
+                drop(graph_lock);
+                return (Some(guard), None);
+            }
+        }
+    } else {
+        None
+    };
+
+    // Unconditional, regardless of which branch above ran: a `graph.wal*`
+    // family can still be sitting at `live_path` even after a successful
+    // retire (a copy-then-remove fallback can leave the original in place),
+    // and when there was no base image to retire at all, an orphaned
+    // `graph.wal*` from an earlier crash could still be here. Either way,
+    // renaming the rebuilt graph on top of a foreign-ID WAL would make the
+    // graph we just swapped in unopenable, so clear it unconditionally
+    // right before the swap.
+    crate::graph::remove_wal_family(&live_path);
+
+    let swap = std::fs::rename(&rebuilding_path, &live_path);
+    if swap.is_ok() {
+        // The base image moved; its WAL-family siblings have to follow it
+        // or a not-yet-checkpointed WAL belonging to the graph we just
+        // swapped in is lost -- and worse, it stays behind at the rebuild
+        // path for a later reindex to inherit. Same rename-then-copy
+        // fallback the retirement path uses, for the same reason: a silent
+        // failure here leaves a foreign WAL where it does damage.
+        for src in crate::graph::wal_family_paths(&rebuilding_path) {
+            let name = src.file_name().unwrap_or_default().to_string_lossy();
+            let suffix = name.strip_prefix(REBUILDING_NAME).unwrap_or(&name);
+            let dest = infigraph_dir.join(format!("{LIVE_NAME}{suffix}"));
+            if let Err(e) = crate::quarantine::move_wal_sibling(&src, &dest) {
+                eprintln!(
+                    "[daemon] full-reindex: could not carry WAL sibling {} across to {} ({e:#}) \
+                     -- the swapped-in graph may be missing uncheckpointed writes; the leftover \
+                     is cleaned up by the next full reindex",
+                    src.display(),
+                    dest.display()
+                );
             }
         }
     }
+    drop(graph_lock);
 
-    std::fs::remove_file(path).ok();
-    drop(guard);
+    match swap {
+        Ok(()) => {
+            // Reopen and reconcile embeddings against the NEW graph --
+            // update_embeddings queries the live symbol set and prunes
+            // anything not in it, so this converges embeddings.bin to the
+            // rebuilt graph regardless of whether it was wiped first (it
+            // wasn't, deliberately).
+            if let Ok(prism) = watch_db(root, make_registry, held) {
+                if let Some(backend) = prism.backend() {
+                    if let Err(e) = crate::embed::update_embeddings(backend, root, &[]) {
+                        eprintln!("[daemon] full-reindex: embedding update failed: {e}");
+                    }
+                }
+            }
+            let result = crate::daemon_protocol::WriteResult::FullReindexOk {
+                total_files: indexed_files,
+                indexed_files,
+                detected_languages: detected_languages.clone(),
+            };
+            if let Ok(json) = serde_json::to_string(&result) {
+                let _ = crate::daemon_protocol::write_atomic(reply_path, &json);
+            }
+            (Some(guard), Some(detected_languages))
+        }
+        Err(e) => {
+            // The rebuilt graph is verified-good and still sitting at
+            // `rebuilding_path` -- nothing was lost. Report the old
+            // graph's real current location: wherever it was moved aside
+            // to, or "no prior graph" if this was a from-scratch build.
+            let old_graph_location = match &retired_path {
+                Some(q) => format!("the old graph was moved aside to {}", q.display()),
+                None => "there was no prior graph to move aside".to_string(),
+            };
+            eprintln!(
+                "[daemon] full-reindex swap failed after a successful rebuild: {e} -- \
+                 {old_graph_location}; the rebuilt graph is at {} -- check both by hand",
+                rebuilding_path.display()
+            );
+            let result = crate::daemon_protocol::WriteResult::Err {
+                message: format!(
+                    "full reindex rebuilt successfully but the swap failed: {e}. Manual \
+                     recovery needed: {old_graph_location}; the rebuilt graph is at {}",
+                    rebuilding_path.display()
+                ),
+            };
+            if let Ok(json) = serde_json::to_string(&result) {
+                let _ = crate::daemon_protocol::write_atomic(reply_path, &json);
+            }
+            (Some(guard), None)
+        }
+    }
 }
 
 /// Parses a `.request` file and either enqueues it (for the four
@@ -1132,6 +1332,7 @@ fn serve_full_reindex_request<MR>(
 /// requests' `.request` file is deleted immediately (the daemon has already
 /// accepted responsibility for serving it the moment it's queued) -- the
 /// reply arrives later, written by `execute_drain`.
+#[allow(clippy::too_many_arguments)]
 fn route_or_serve_request<MR>(
     root: &Path,
     path: &Path,
@@ -1139,13 +1340,17 @@ fn route_or_serve_request<MR>(
     make_registry: &MR,
     held: &mut Option<Arc<Infigraph>>,
     drain_in_flight: bool,
-) where
+    full_reindex_in_flight: bool,
+    scip_in_flight: bool,
+    drain_rt: &tokio::runtime::Runtime,
+) -> Option<InFlightFullReindex>
+where
     MR: Fn() -> Result<crate::lang::LanguageRegistry>,
 {
     let reply_path = path.with_extension("result");
     let contents = match std::fs::read_to_string(path) {
         Ok(c) => c,
-        Err(_) => return, // transient; will be retried next tick if the file reappears
+        Err(_) => return None, // transient; will be retried next tick if the file reappears
     };
     let request: crate::daemon_protocol::WriteRequest = match serde_json::from_str(&contents) {
         Ok(r) => r,
@@ -1154,7 +1359,7 @@ fn route_or_serve_request<MR>(
             // recover; hand off to serve_one_request, whose existing
             // corrupt-JSON handling (WriteResult::Err) already covers it.
             serve_request_locked(root, path, make_registry, held, drain_in_flight);
-            return;
+            return None;
         }
     };
 
@@ -1177,6 +1382,7 @@ fn route_or_serve_request<MR>(
             });
             drop(q);
             std::fs::remove_file(path).ok();
+            None
         }
         WriteRequest::Index { paths: Some(paths) } => {
             let mut q = queue.lock().unwrap();
@@ -1203,6 +1409,7 @@ fn route_or_serve_request<MR>(
             });
             drop(q);
             std::fs::remove_file(path).ok();
+            None
         }
         WriteRequest::UpsertFilesBulk {
             extractions_path,
@@ -1230,11 +1437,13 @@ fn route_or_serve_request<MR>(
                 drop(q);
                 std::fs::remove_file(&extractions_path).ok();
                 std::fs::remove_file(path).ok();
+                None
             }
             Err(_) => {
                 // Sibling extractions file missing/corrupt -- fall
                 // through to serve_one_request's existing error path.
                 serve_request_locked(root, path, make_registry, held, drain_in_flight);
+                None
             }
         },
         WriteRequest::RemoveFiles { files } => {
@@ -1251,6 +1460,7 @@ fn route_or_serve_request<MR>(
             });
             drop(q);
             std::fs::remove_file(path).ok();
+            None
         }
         WriteRequest::ResolveCalls {
             extractions_path,
@@ -1273,18 +1483,26 @@ fn route_or_serve_request<MR>(
                 drop(q);
                 std::fs::remove_file(&extractions_path).ok();
                 std::fs::remove_file(path).ok();
+                None
             }
             Err(_) => {
                 serve_request_locked(root, path, make_registry, held, drain_in_flight);
+                None
             }
         },
-        WriteRequest::FullReindex => {
-            serve_full_reindex_request(root, path, queue, make_registry, held, drain_in_flight);
-        }
+        WriteRequest::FullReindex => try_start_full_reindex(
+            root,
+            path,
+            queue,
+            make_registry,
+            drain_in_flight,
+            full_reindex_in_flight,
+            scip_in_flight,
+            drain_rt,
+        ),
         _ => {
-            // The other 8 variants: unchanged behavior, immediate execution
-            // (still under index.lock, matching pre-IndexWorkQueue behavior).
             serve_request_locked(root, path, make_registry, held, drain_in_flight);
+            None
         }
     }
 }
@@ -1664,6 +1882,7 @@ mod tests {
 
         let queue = Arc::new(Mutex::new(crate::watch::queue::IndexWorkQueue::new()));
         let mut held: Option<Arc<Infigraph>> = None;
+        let drain_rt = tokio::runtime::Runtime::new().unwrap();
         route_or_serve_request(
             &root,
             &request_path,
@@ -1671,6 +1890,9 @@ mod tests {
             &|| Ok(crate::lang::LanguageRegistry::new()),
             &mut held,
             false,
+            false,
+            false,
+            &drain_rt,
         );
 
         let drained = queue.lock().unwrap().drain();

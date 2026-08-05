@@ -212,6 +212,46 @@ mod tests {
         prism
     }
 
+    /// Drives a `FullReindex` request synchronously (no real daemon loop
+    /// needed), against a real temp-dir project: `try_start_full_reindex`
+    /// (loop-thread gating + spawning the background build) followed by
+    /// `finish_full_reindex` (loop-thread swap), exactly like a real
+    /// `watch_project_with_periodic` tick's reap block, minus the loop
+    /// itself. Replaces the old direct call to `serve_full_reindex_request`,
+    /// which ran everything inline on one thread and no longer exists now
+    /// that the build runs on `drain_rt`.
+    fn drive_full_reindex_sync<MR>(
+        root: &std::path::Path,
+        request_path: &std::path::Path,
+        queue: &std::sync::Arc<std::sync::Mutex<crate::watch::queue::IndexWorkQueue>>,
+        make_registry: &MR,
+        held: &mut Option<std::sync::Arc<crate::Infigraph>>,
+    ) where
+        MR: Fn() -> Result<crate::lang::LanguageRegistry>,
+    {
+        let drain_rt = tokio::runtime::Runtime::new().unwrap();
+        if let Some(in_flight) = crate::watch::try_start_full_reindex(
+            root,
+            request_path,
+            queue,
+            make_registry,
+            false,
+            false,
+            false,
+            &drain_rt,
+        ) {
+            let (guard, _) = crate::watch::finish_full_reindex(
+                root,
+                &in_flight.reply_path,
+                make_registry,
+                held,
+                drain_rt.block_on(in_flight.handle),
+            );
+            std::fs::remove_file(&in_flight.request_path).ok();
+            drop(guard);
+        }
+    }
+
     #[test]
     fn a_raw_entry_and_an_index_waiter_for_the_same_new_file_coalesce_into_one_execution() {
         let tmp = tempfile::tempdir().unwrap();
@@ -301,7 +341,7 @@ mod tests {
         );
     }
 
-    /// Drives `serve_full_reindex_request` directly (no real daemon process)
+    /// Drives a `FullReindex` request directly (no real daemon process)
     /// against a real temp-dir project: seeds a graph, submits FullReindex,
     /// confirms the old content is genuinely gone and the graph is rebuilt,
     /// and confirms the old graph directory was quarantined (renamed aside),
@@ -339,26 +379,19 @@ mod tests {
         )
         .unwrap();
 
-        crate::watch::serve_full_reindex_request(
-            root,
-            &request_path,
-            &queue,
-            &make_registry,
-            &mut held,
-            false,
-        );
+        drive_full_reindex_sync(root, &request_path, &queue, &make_registry, &mut held);
 
         let reply_path = request_path.with_extension("result");
         let reply: crate::daemon_protocol::WriteResult =
             serde_json::from_str(&fs::read_to_string(&reply_path).unwrap()).unwrap();
         match reply {
-            crate::daemon_protocol::WriteResult::Ok { indexed_files, .. } => {
+            crate::daemon_protocol::WriteResult::FullReindexOk { indexed_files, .. } => {
                 assert_eq!(
                     indexed_files, 1,
                     "only new.py should be in the rebuilt graph"
                 );
             }
-            other => panic!("expected WriteResult::Ok, got {other:?}"),
+            other => panic!("expected WriteResult::FullReindexOk, got {other:?}"),
         }
 
         // Verify against a completely fresh read connection, not the
@@ -434,21 +467,17 @@ mod tests {
         )
         .unwrap();
 
-        crate::watch::serve_full_reindex_request(
-            root,
-            &request_path,
-            &queue,
-            &make_registry,
-            &mut held,
-            false,
-        );
+        drive_full_reindex_sync(root, &request_path, &queue, &make_registry, &mut held);
 
         let reply: crate::daemon_protocol::WriteResult = serde_json::from_str(
             &fs::read_to_string(request_path.with_extension("result")).unwrap(),
         )
         .unwrap();
         assert!(
-            matches!(reply, crate::daemon_protocol::WriteResult::Ok { .. }),
+            matches!(
+                reply,
+                crate::daemon_protocol::WriteResult::FullReindexOk { .. }
+            ),
             "a stale WAL leftover must not wedge the reindex, got {reply:?}"
         );
         assert!(
@@ -495,14 +524,7 @@ mod tests {
         )
         .unwrap();
 
-        crate::watch::serve_full_reindex_request(
-            root,
-            &request_path,
-            &queue,
-            &make_registry,
-            &mut held,
-            false,
-        );
+        drive_full_reindex_sync(root, &request_path, &queue, &make_registry, &mut held);
 
         let verify =
             crate::graph::KuzuBackend::open_read_only(&root.join(".infigraph").join("graph"))
@@ -518,8 +540,8 @@ mod tests {
     }
 
     /// Regression coverage for the registry-build failure branch of
-    /// `serve_full_reindex_request` (the `make_registry()` early return,
-    /// `watch/mod.rs:881-893`): a `FullReindex` request whose language
+    /// `try_start_full_reindex` (the `make_registry()` early return in
+    /// `watch/mod.rs`): a `FullReindex` request whose language
     /// registry fails to build must reply with an explicit error and leave
     /// the live graph completely untouched -- no partial rebuild, no
     /// `graph.rebuilding` left behind. This is the property build-fresh-
@@ -554,14 +576,7 @@ mod tests {
         )
         .unwrap();
 
-        crate::watch::serve_full_reindex_request(
-            root,
-            &request_path,
-            &queue,
-            &make_registry,
-            &mut held,
-            false,
-        );
+        drive_full_reindex_sync(root, &request_path, &queue, &make_registry, &mut held);
 
         let reply_path = request_path.with_extension("result");
         let reply: crate::daemon_protocol::WriteResult =
@@ -595,7 +610,7 @@ mod tests {
     }
 
     /// Regression coverage for the "superseded waiters" property of
-    /// `serve_full_reindex_request`: a request only *queued* (not yet
+    /// `try_start_full_reindex`: a request only *queued* (not yet
     /// executing) when `FullReindex` arrives is genuinely moot -- the full
     /// reindex is about to re-scan every file from disk regardless of what
     /// was pending -- but its waiter must still be answered, not left
@@ -634,14 +649,7 @@ mod tests {
         )
         .unwrap();
 
-        crate::watch::serve_full_reindex_request(
-            root,
-            &request_path,
-            &queue,
-            &make_registry,
-            &mut held,
-            false,
-        );
+        drive_full_reindex_sync(root, &request_path, &queue, &make_registry, &mut held);
 
         let reply: crate::daemon_protocol::WriteResult =
             serde_json::from_str(&fs::read_to_string(&superseded_reply).unwrap()).unwrap();

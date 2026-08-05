@@ -393,6 +393,7 @@ fn watch_triggered_file_removal_contends_with_a_held_index_lock() {
             0,
             None::<fn(&infigraph_core::IndexResult)>,
             false, // serve_requests
+            None,
         )
     });
 
@@ -497,6 +498,7 @@ fn out_of_scope_write_request_contends_with_a_held_index_lock() {
             0,
             None::<fn(&infigraph_core::IndexResult)>,
             true, // serve_requests
+            None,
         )
     });
 

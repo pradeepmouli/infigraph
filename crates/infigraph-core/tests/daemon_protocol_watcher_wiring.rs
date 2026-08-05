@@ -24,6 +24,7 @@ fn watch_loop_serves_write_requests_when_serve_requests_is_true() {
             0,
             None::<fn(&infigraph_core::IndexResult)>,
             true, // serve_requests
+            None,
         )
     });
 
@@ -57,6 +58,7 @@ fn watch_loop_does_not_serve_requests_when_serve_requests_is_false() {
             0,
             None::<fn(&infigraph_core::IndexResult)>,
             false, // serve_requests
+            None,
         )
     });
 
