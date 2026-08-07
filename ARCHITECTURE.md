@@ -288,7 +288,7 @@ Every indexed file has its SHA-256 content hash stored in the `Module` node (`co
 
 For large changes (>100 files changed), the write path uses KuzuDB's `COPY FROM CSV` bulk loader for throughput. For small changes (<100 files), it uses per-file transactions which have lower overhead for tiny batches.
 
-Embedding updates are also incremental: only symbols in changed files get new embeddings. Symbols in unchanged files keep their cached vectors.
+Embedding updates are also incremental: only symbols in changed files get new embeddings. Symbols in unchanged files keep their cached vectors. As of the v3 `embeddings.bin` format, each vector is stored with an FNV-1a hash of its input text, so `update_embeddings` re-embeds a symbol only when that hash no longer matches — a body-only edit that leaves the symbol's name/docstring/signature untouched is a no-op. When a pass embeds and prunes nothing, both the file save and the HNSW rebuild are skipped; files from the prior v2 format load with hash 0 and are upgraded to v3 on their next save.
 
 ---
 

@@ -540,6 +540,10 @@ Both initialized via `init_embedder` / `best_embedder` (`embed/mod.rs:311-340`).
 - Embeddings: Postgres + pgvector (`embeddings` table, `kind` column separates `symbol` vs `doc_chunk`)
 - HNSW index: not used — brute-force scoring via materialized vectors from `all_embeddings(kind)`
 
+### Input-hash skip (v3)
+
+`embeddings.bin` v3 stores an FNV-1a hash of each symbol's input text (kind + name + file + language + docstring + parameters + return type) alongside its vector. `update_embeddings` (`embed/mod.rs:698-810`) only re-embeds a symbol when its current input hash no longer matches the stored one, so an edit that doesn't touch a symbol's name/docstring/signature costs nothing. When a pass embeds nothing and prunes nothing, both the write to `embeddings.bin` and the HNSW rebuild are skipped entirely. Files written by the prior v2 format load with hash `0` (always a mismatch on first touch) and are upgraded to v3 the next time embeddings for that project are saved.
+
 ### HNSW threshold
 
 HNSW index is built only when the symbol/chunk count exceeds a threshold (100K+ for code, 200K+ for docs) or when an HNSW index already exists. Below the threshold, brute-force linear scan is used (fast enough for smaller codebases). Remote mode always uses brute-force.
