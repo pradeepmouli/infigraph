@@ -20,6 +20,16 @@ pub fn watch_docs(
     let mut watcher = notify::RecommendedWatcher::new(tx, config)?;
     watcher.watch(root, RecursiveMode::Recursive)?;
 
+    // notify's recursive watch has no directory exclusion of its own -- it
+    // subscribes to the entire tree, `.infigraph`/`target`/`node_modules`
+    // included. `is_document_file` alone isn't enough of a filter: a build
+    // tool continuously regenerating e.g. `target/doc/*.html` or coverage
+    // `*.xml`/`*.svg` output matches it on every write, setting `pending`
+    // forever even though `collect_doc_files` (which respects the same
+    // ignore rules) will never actually index anything under `target/` --
+    // observed live as an infinite "reindexed: 0 files, 0 chunks" loop.
+    let ignore_matcher = infigraph_core::ignore_rules::IgnoreMatcher::build(root);
+
     let debounce = Duration::from_millis(debounce_ms);
     let mut last_reindex = Instant::now();
     let mut pending = false;
@@ -32,7 +42,11 @@ pub fn watch_docs(
 
         match rx.recv_timeout(Duration::from_millis(500)) {
             Ok(Ok(event)) => {
-                if event.paths.iter().any(|p| is_document_file(p)) {
+                if event
+                    .paths
+                    .iter()
+                    .any(|p| is_document_file(p) && !ignore_matcher.is_ignored(p, false))
+                {
                     pending = true;
                 }
             }
@@ -339,6 +353,52 @@ mod tests {
         shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
         handle.join().unwrap().unwrap();
         clear_fast_poll();
+    }
+
+    /// Regression test for a real infinite-loop bug (#52): `notify`'s
+    /// recursive watch has no directory exclusion of its own, so a
+    /// document-extension file written under a safety-excluded directory
+    /// (e.g. `target/doc/*.html` from `cargo doc`, coverage `*.xml`/`*.svg`
+    /// output, etc.) used to satisfy `is_document_file` alone and set
+    /// `pending` just like a real doc change -- except `collect_doc_files`
+    /// (which respects the same ignore rules) never actually indexes
+    /// anything under `target/`, so the reindex always finds "0 files, 0
+    /// chunks" and the next write under `target/` sets `pending` again,
+    /// forever. Tests the exact combined predicate `watch_docs`'s event
+    /// filter uses directly, rather than through the full threaded
+    /// daemon+FSEvents path -- a build artifact under `target/` is excluded
+    /// from indexing either way, so observing `chunk_count` alone can't
+    /// distinguish "reindex was wrongly attempted" from "correctly
+    /// skipped."
+    #[test]
+    fn document_change_filter_excludes_safety_listed_directories() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join("target").join("doc")).unwrap();
+        std::fs::write(root.join("readme.md"), "# hello\n").unwrap();
+
+        let ignore_matcher = infigraph_core::ignore_rules::IgnoreMatcher::build(&root);
+        let real_doc = root.join("readme.md");
+        let build_artifact = root.join("target").join("doc").join("index.html");
+
+        assert!(
+            is_document_file(&real_doc) && !ignore_matcher.is_ignored(&real_doc, false),
+            "a real doc outside any excluded directory must still set pending"
+        );
+        assert!(
+            is_document_file(&build_artifact),
+            "sanity check: the build artifact's extension alone looks document-shaped"
+        );
+        assert!(
+            ignore_matcher.is_ignored(&build_artifact, false),
+            "a file under target/ must be recognized as safety-excluded"
+        );
+        assert!(
+            !(is_document_file(&build_artifact)
+                && !ignore_matcher.is_ignored(&build_artifact, false)),
+            "watch_docs's combined filter must reject a build artifact under target/, \
+             not just check its extension"
+        );
     }
 
     #[test]
