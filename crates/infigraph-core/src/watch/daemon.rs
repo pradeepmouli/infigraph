@@ -105,9 +105,95 @@ pub fn ensure_daemon_running(root: &Path, watch_binary: &Path) -> DaemonStartOut
             drop(guard);
             spawn_daemon(root, &tg_dir, watch_binary)
         }
-        Ok(None) => DaemonStartOutcome::AlreadyRunning,
+        Ok(None) => {
+            if !prune_stale_holder(&lock_path) {
+                return DaemonStartOutcome::AlreadyRunning;
+            }
+            // The stale holder was pruned (or was already dead) and the
+            // lock should now be free — retry once.
+            match crate::lockfile::try_acquire(&lock_path, "watch-daemon-probe") {
+                Ok(Some(guard)) => {
+                    drop(guard);
+                    spawn_daemon(root, &tg_dir, watch_binary)
+                }
+                Ok(None) => DaemonStartOutcome::AlreadyRunning,
+                Err(e) => DaemonStartOutcome::Failed(e.to_string()),
+            }
+        }
         Err(e) => DaemonStartOutcome::Failed(e.to_string()),
     }
+}
+
+/// If `lock_path`'s current holder is dead, or alive but running a
+/// different build than this process, terminate it and wait briefly for
+/// the lock to be released. Returns `true` if the holder was found to be
+/// stale (dead, or a live-but-outdated build that was signaled), `false`
+/// if the holder is live and current, or no holder identity could be read
+/// at all (nothing actionable to prune).
+///
+/// PID-reuse guard: `LockInfo` (unlike the MCP instance registry) carries
+/// no OS-reported process-start-time to re-verify against, so a bare PID
+/// match is not on its own proof this is the process the lock named (same
+/// hazard `instances::classify_instances` guards against). Before sending
+/// any signal, this checks that the live process at that PID still looks
+/// like an infigraph binary — if the PID was recycled for something else
+/// entirely, it's left alone.
+fn prune_stale_holder(lock_path: &Path) -> bool {
+    let Some(holder) = crate::lockfile::read_holder(lock_path) else {
+        return false;
+    };
+
+    let spid = sysinfo::Pid::from_u32(holder.pid);
+    let mut sys = sysinfo::System::new();
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[spid]), true);
+
+    let Some(proc) = sys.process(spid) else {
+        // PID isn't running at all -- the lock is simply stale (the holder
+        // crashed or was killed without releasing it). Nothing to signal;
+        // the caller's retry-acquire will pick up the now-free lock.
+        return true;
+    };
+
+    if holder.build_hash == crate::build_hash() {
+        return false; // live and current -- nothing to prune
+    }
+
+    // Exact match against the real CLI binary names only -- a substring
+    // check (e.g. "contains infigraph") would also match this very test
+    // binary (`infigraph_core-<hash>`) and any other infigraph-* crate's
+    // build/test artifacts, defeating the guard entirely.
+    let proc_name = proc.name().to_string_lossy().to_ascii_lowercase();
+    let looks_like_infigraph = proc_name == "infigraph" || proc_name == "infigraph.exe";
+    if !looks_like_infigraph {
+        // The PID was recycled for an unrelated process. Leave it alone --
+        // the lock file is just stale metadata pointing at a dead holder;
+        // nothing here to terminate.
+        return false;
+    }
+
+    // Alive, current binary differs: ask it to exit. The watch loop already
+    // releases watch.lock cleanly on SIGTERM (the same path Ctrl-C/`kill`
+    // already trigger), so this is not a hard kill.
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(holder.pid as libc::pid_t, libc::SIGTERM);
+    }
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/PID", &holder.pid.to_string()])
+            .output();
+    }
+
+    const ATTEMPTS: u32 = 20;
+    const DELAY: std::time::Duration = std::time::Duration::from_millis(100);
+    for _ in 0..ATTEMPTS {
+        if crate::lockfile::read_holder(lock_path).is_none() {
+            break;
+        }
+        std::thread::sleep(DELAY);
+    }
+    true
 }
 
 /// Build (without spawning) the `Command` used to launch a detached
@@ -193,4 +279,95 @@ pub fn resolve_cli_binary_sibling_of(current_exe: &Path) -> Result<std::path::Pa
         "expected infigraph CLI binary at {}",
         candidate.display()
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::prune_stale_holder;
+    use crate::lockfile::LockInfo;
+
+    fn write_lock_info(path: &std::path::Path, info: &LockInfo) {
+        std::fs::write(path, serde_json::to_string(info).unwrap()).unwrap();
+    }
+
+    /// A holder PID that no longer exists at all: the lock is simply stale
+    /// (the process crashed or was `kill -9`'d without releasing it), so
+    /// there's nothing to signal — but it must still be reported as prunable
+    /// so the caller retries the acquisition.
+    #[test]
+    fn prune_stale_holder_reports_dead_pid_as_prunable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lock_path = tmp.path().join("watch.lock");
+
+        write_lock_info(
+            &lock_path,
+            &LockInfo {
+                pid: std::process::id() + 1_000_000, // implausible as a real live pid
+                role: "cli-watch".to_string(),
+                build_hash: "some-old-build".to_string(),
+                acquired_at: 0,
+                last_heartbeat: 0,
+            },
+        );
+
+        assert!(
+            prune_stale_holder(&lock_path),
+            "a dead holder PID must be reported as prunable"
+        );
+    }
+
+    /// A holder that's alive and on the current build has nothing to prune
+    /// — this is the ordinary "a watcher is already running and up to date"
+    /// case, and must be a true no-op (no signal sent, lock untouched). If
+    /// this incorrectly sent SIGTERM to our own PID, the test process would
+    /// terminate here rather than reach the assertion.
+    #[test]
+    fn prune_stale_holder_leaves_live_current_build_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lock_path = tmp.path().join("watch.lock");
+
+        write_lock_info(
+            &lock_path,
+            &LockInfo {
+                pid: std::process::id(),
+                role: "cli-watch".to_string(),
+                build_hash: crate::build_hash().to_string(),
+                acquired_at: 0,
+                last_heartbeat: 0,
+            },
+        );
+
+        assert!(
+            !prune_stale_holder(&lock_path),
+            "a live holder on the current build must not be pruned"
+        );
+    }
+
+    /// PID-reuse guard: a live PID with a mismatched build_hash is only
+    /// terminated if the live process at that PID still looks like an
+    /// infigraph binary. This test's own PID is alive with a deliberately
+    /// mismatched build_hash, but the running process is a `cargo test`
+    /// binary (name never contains "infigraph") — so this must be a no-op,
+    /// not a self-inflicted SIGTERM.
+    #[test]
+    fn prune_stale_holder_does_not_signal_a_live_non_infigraph_process() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lock_path = tmp.path().join("watch.lock");
+
+        write_lock_info(
+            &lock_path,
+            &LockInfo {
+                pid: std::process::id(),
+                role: "cli-watch".to_string(),
+                build_hash: "definitely-not-the-current-build".to_string(),
+                acquired_at: 0,
+                last_heartbeat: 0,
+            },
+        );
+
+        assert!(
+            !prune_stale_holder(&lock_path),
+            "a live PID whose process name doesn't look like infigraph must not be pruned/signaled"
+        );
+    }
 }

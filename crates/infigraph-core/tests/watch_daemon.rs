@@ -282,6 +282,82 @@ fn spawn_daemon_child_still_starts_with_infigraph_backend_leaked_into_test_env()
     std::fs::write(project_dir.path().join(".infigraph").join("watch.stop"), "").unwrap();
 }
 
+/// End-to-end proof that `ensure_daemon_running` prunes a stale watch.lock
+/// (here: a dead holder PID from a build that's no longer installed) and
+/// spawns a fresh daemon, instead of reporting `AlreadyRunning` forever —
+/// the gap that let a genuinely-dead-but-locked project sit unwatched until
+/// someone noticed via `infigraph doctor` and killed the stale holder by
+/// hand.
+#[test]
+#[cfg(unix)]
+fn ensure_daemon_running_prunes_a_dead_stale_holder_and_spawns_fresh() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let project_dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(project_dir.path().join(".infigraph")).unwrap();
+
+    let cli_binary = infigraph_core::watch::daemon::resolve_cli_binary_sibling_of(
+        &std::env::current_exe().unwrap(),
+    )
+    .expect("infigraph CLI binary must already be built (shared target dir)");
+
+    // Plant a lock payload naming a PID that isn't running and a build_hash
+    // that isn't the one installed here -- simulating a watcher left behind
+    // by an old binary, the exact scenario `infigraph doctor` flags as
+    // "predates the currently installed binary; restart it to pick up the
+    // new build."
+    let lock_path = project_dir.path().join(".infigraph").join("watch.lock");
+    let stale_payload = serde_json::json!({
+        "pid": std::process::id() + 1_000_000,
+        "role": "cli-watch",
+        "build_hash": "some-old-build-that-no-longer-exists",
+        "acquired_at": 0,
+        "last_heartbeat": 0
+    });
+    std::fs::write(&lock_path, stale_payload.to_string()).unwrap();
+
+    std::env::set_var("INFIGRAPH_BACKEND", "daemon");
+    let outcome =
+        infigraph_core::watch::daemon::ensure_daemon_running(project_dir.path(), &cli_binary);
+    std::env::remove_var("INFIGRAPH_BACKEND");
+
+    assert_eq!(
+        outcome,
+        infigraph_core::watch::daemon::DaemonStartOutcome::Spawned,
+        "a dead stale holder must be pruned and a fresh daemon spawned, not reported as AlreadyRunning"
+    );
+
+    // Confirm a real, current-build daemon now holds the lock.
+    let start = std::time::Instant::now();
+    let mut holder = None;
+    while start.elapsed() < std::time::Duration::from_secs(5) {
+        if let Some(h) = infigraph_core::lockfile::read_holder(&lock_path) {
+            holder = Some(h);
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    // Note: this doesn't compare against `infigraph_core::build_hash()` --
+    // the spawned `infigraph` CLI binary comes from whatever last built it
+    // (e.g. a prior `cargo build -p infigraph-cli`), which cargo does not
+    // keep in lockstep with `cargo test -p infigraph-core` (infigraph-core
+    // has no dev-dependency on infigraph-cli). What matters here is that a
+    // *real* daemon took over -- proven by a live PID distinct from the
+    // fake one, on a build_hash distinct from the fake stale payload.
+    let holder = holder.expect("expected a fresh daemon to have acquired watch.lock");
+    assert_ne!(
+        holder.build_hash, "some-old-build-that-no-longer-exists",
+        "the fake stale payload must have been replaced by a real daemon's own identity"
+    );
+    assert_ne!(
+        holder.pid,
+        std::process::id() + 1_000_000,
+        "the lock must now be held by a real spawned process, not the fake stale PID"
+    );
+
+    // Clean up: signal the spawned daemon to stop.
+    std::fs::write(project_dir.path().join(".infigraph").join("watch.stop"), "").unwrap();
+}
+
 /// Independent, freshly-opened read-only check of what actually landed on
 /// disk -- `GraphStore::open_read_only`'s doc comment states this is safe
 /// for concurrent access while a watcher is writing, and a fresh open per
