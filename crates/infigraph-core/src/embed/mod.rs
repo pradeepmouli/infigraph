@@ -8,12 +8,14 @@ use anyhow::{Context, Result};
 use crate::model::Symbol;
 
 /// Compute the sibling temp path for an atomic write: same directory as
-/// `path`, with a `.tmp` suffix appended to the file name. Same-directory
-/// placement is required for the subsequent `rename(2)` to stay on one
-/// filesystem and be atomic.
+/// `path`, with a process-unique `.tmp` suffix appended to the file name.
+/// Same-directory placement is required for the subsequent `rename(2)` to
+/// stay on one filesystem and be atomic; the pid component keeps concurrent
+/// writers in different processes from clobbering each other's temp file
+/// mid-write.
 pub fn atomic_tmp_path(path: &Path) -> PathBuf {
     let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("out");
-    path.with_file_name(format!("{name}.tmp"))
+    path.with_file_name(format!("{name}.{}.tmp", std::process::id()))
 }
 
 /// Write `buf` to `path` atomically via temp-file-then-rename: write to a

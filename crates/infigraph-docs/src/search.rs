@@ -128,8 +128,7 @@ impl DocBM25Index {
                 buf.extend_from_slice(&tf.to_le_bytes());
             }
         }
-        // Unique temp name per process so concurrent writers can't interleave.
-        let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
+        let tmp = infigraph_core::embed::atomic_tmp_path(path);
         std::fs::write(&tmp, &buf).map_err(|e| anyhow::anyhow!("write doc bm25 cache: {}", e))?;
         std::fs::rename(&tmp, path).map_err(|e| anyhow::anyhow!("rename doc bm25 cache: {}", e))
     }
