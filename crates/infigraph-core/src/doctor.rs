@@ -5,6 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::instances;
 use crate::multi::{Registry, RepoEntry};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -469,11 +470,49 @@ fn check_one_watcher(project_path: &Path) -> CheckResult {
         );
     }
 
+    if !project_has_live_mcp_instance(project_path) {
+        return CheckResult::warn(
+            WATCHER_CATEGORY,
+            label,
+            format!(
+                "watcher (PID {}) is alive and healthy, but no MCP server instance is \
+                 currently serving this project",
+                holder.pid
+            ),
+            "likely left running from a closed MCP session -- if you're not also using it \
+             from a standalone CLI session, it's safe to stop; a future MCP session will \
+             restart it and catch up automatically",
+        );
+    }
+
     CheckResult::pass(
         WATCHER_CATEGORY,
         label,
         format!("watcher (PID {}) alive with fresh heartbeat", holder.pid),
     )
+}
+
+/// Whether any live MCP server instance (per the instance registry --
+/// `instances::list_instances`/`classify_instances`) is currently serving
+/// `project_path`. Used to distinguish a watch daemon that's still useful
+/// (some MCP server will query it) from one left spinning for a project no
+/// MCP session is using anymore. `own_pid` is passed as `0` (never a real
+/// PID) since doctor is not itself an MCP instance and must not exclude a
+/// genuine entry.
+fn project_has_live_mcp_instance(project_path: &Path) -> bool {
+    let target = project_path
+        .canonicalize()
+        .unwrap_or_else(|_| project_path.to_path_buf());
+    let entries = instances::list_instances();
+    let classified =
+        instances::classify_instances(&entries, 0, instances::current_process_start_time);
+    classified.iter().any(|(_, info, status)| {
+        *status == instances::InstanceStatus::LivePeer
+            && Path::new(&info.project_path)
+                .canonicalize()
+                .map(|p| p == target)
+                .unwrap_or(false)
+    })
 }
 
 pub fn check_watchers(ctx: &DoctorContext) -> Vec<CheckResult> {

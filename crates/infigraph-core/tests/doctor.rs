@@ -774,3 +774,108 @@ fn format_report_uses_plain_glyphs_by_color_flag() {
     assert!(plain.contains("1 PASS, 1 WARN, 1 FAIL"));
     assert!(colored.contains("1 PASS, 1 WARN, 1 FAIL"));
 }
+
+/// Serializes tests that mutate `INFIGRAPH_INSTANCES_DIR` (process-global),
+/// mirroring the `ENV_LOCK` convention used by other integration test
+/// binaries in this workspace (e.g. `startup_watch.rs`) -- not reusable
+/// across files since each `tests/*.rs` compiles to its own crate.
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn write_alive_watch_lock(lock_path: &std::path::Path) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    write_lock_file(
+        lock_path,
+        &LockInfo {
+            pid: std::process::id(),
+            role: "cli-watch".to_string(),
+            build_hash: "any-hash".to_string(),
+            acquired_at: now - 10,
+            last_heartbeat: now, // fresh, and distinct from acquired_at
+        },
+    );
+}
+
+/// A watch daemon that's alive and healthy by every other measure, but for
+/// a project with no live MCP server instance registered, must now WARN --
+/// this is the orphan-daemon-detection half of the true-up work: a daemon
+/// left running from a closed MCP session is otherwise invisible to doctor
+/// since it looks identical to one still being used.
+#[test]
+fn check_watchers_warns_when_alive_watcher_has_no_live_mcp_instance() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let project = dir.path().join("myproj");
+    std::fs::create_dir_all(project.join(".infigraph")).unwrap();
+    let lock_path = project.join(".infigraph").join("watch.lock");
+    write_alive_watch_lock(&lock_path);
+
+    let instances_dir = dir.path().join("instances");
+    std::fs::create_dir_all(&instances_dir).unwrap();
+    std::env::set_var("INFIGRAPH_INSTANCES_DIR", &instances_dir);
+
+    let ctx = ctx_for(DoctorScope::Project(project.clone()), Registry::default());
+    let results = check_watchers(&ctx);
+
+    std::env::remove_var("INFIGRAPH_INSTANCES_DIR");
+
+    let watcher = results
+        .iter()
+        .find(|r| r.name.contains("watcher liveness"))
+        .expect("must produce a watcher liveness result");
+    assert_eq!(watcher.status, CheckStatus::Warn);
+    assert!(
+        watcher.message.contains("no MCP server instance"),
+        "message should explain no live MCP instance is serving this project: {}",
+        watcher.message
+    );
+}
+
+/// The counterpart: a live MCP instance genuinely registered for this exact
+/// project must keep the watcher check passing -- the new check must not
+/// warn on the ordinary, common case (MCP server actively using its own
+/// watcher).
+#[test]
+fn check_watchers_passes_when_alive_watcher_has_a_live_mcp_instance() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let project = dir.path().join("myproj");
+    std::fs::create_dir_all(project.join(".infigraph")).unwrap();
+    let lock_path = project.join(".infigraph").join("watch.lock");
+    write_alive_watch_lock(&lock_path);
+
+    let instances_dir = dir.path().join("instances");
+    std::fs::create_dir_all(&instances_dir).unwrap();
+    std::env::set_var("INFIGRAPH_INSTANCES_DIR", &instances_dir);
+
+    // A live "MCP instance" for this project -- this test process itself
+    // stands in for one, since the check only needs a PID/start-time that's
+    // genuinely alive right now (same technique `prune_stale_holder`'s own
+    // tests use for a live-holder case).
+    let canonical_project = project.canonicalize().unwrap();
+    let info = infigraph_core::instances::InstanceInfo::current(
+        &canonical_project.to_string_lossy(),
+        "stdio",
+    );
+    let _instance_guard = infigraph_core::instances::register_instance(&info).unwrap();
+
+    let ctx = ctx_for(DoctorScope::Project(project.clone()), Registry::default());
+    let results = check_watchers(&ctx);
+
+    std::env::remove_var("INFIGRAPH_INSTANCES_DIR");
+
+    let watcher = results
+        .iter()
+        .find(|r| r.name.contains("watcher liveness"))
+        .expect("must produce a watcher liveness result");
+    assert_eq!(
+        watcher.status,
+        CheckStatus::Pass,
+        "a live MCP instance registered for this exact project must not warn: {}",
+        watcher.message
+    );
+}
