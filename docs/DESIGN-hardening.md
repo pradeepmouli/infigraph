@@ -40,7 +40,7 @@ _(none currently — both items previously listed here have shipped; see above.)
 - [ ] R6.1 — structured `tracing` JSON logging ([#14](https://github.com/pradeepmouli/infigraph/issues/14)) — zero `tracing::` call sites; logging is still ad-hoc `eprintln!`/`mcp_log`/`watch_log`
 - [ ] R8.4 — pinned toolchain ([#15](https://github.com/pradeepmouli/infigraph/issues/15)) — `rust-toolchain.toml` absent (verified)
 - [ ] R3.3.3 — graph generation IDs ([#16](https://github.com/pradeepmouli/infigraph/issues/16))
-- [ ] R3.3.4 — track and surface SCIP-enrichment staleness — no GitHub issue yet (found missing from this checklist while folding #26 in; the requirement itself has been defined in §3.3 since the 2026-07-20 draft)
+- [ ] R3.3.4 — track and surface SCIP-enrichment staleness ([#55](https://github.com/pradeepmouli/infigraph/issues/55)) — found missing from this checklist while folding #26 in; the requirement itself has been defined in §3.3 since the 2026-07-20 draft
 - [ ] R3.3.5 — persistent dirty-file set, shared across watcher/index/hook triggers ([#28](https://github.com/pradeepmouli/infigraph/issues/28))
 - [ ] R3.3.6 — surface index staleness in search results ([#26](https://github.com/pradeepmouli/infigraph/issues/26)) — depends on R3.3.3/R3.3.4; can ship a filesystem-mtime version standalone first
 - [ ] R4.1 — full error taxonomy ([#17](https://github.com/pradeepmouli/infigraph/issues/17)) — only `lockfile::Busy` exists as a structured variant; the rest is stringly-typed `anyhow` errors
