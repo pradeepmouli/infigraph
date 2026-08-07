@@ -5,7 +5,7 @@ This supplements [`CONTRIBUTING.md`](CONTRIBUTING.md) (build/test/style/adding-l
 ## Branch topology
 
 - **`upstream/main`** — `intuit/infigraph`'s main branch. Never pushed to directly from this fork; only ever a PR target.
-- **`origin/main`** — a **pure passive mirror** of `upstream/main`. It is never a merge target for work that upstream hasn't accepted yet. It only ever moves via `git fetch upstream && git push origin upstream/main:main --force`. If you find yourself about to merge a PR into `origin/main`, stop — that's the wrong branch (see [Why not `origin/main`](#why-not-originmain) below).
+- **`origin/main`** — `upstream/main` plus whatever this fork's currently-**open** upstream PR branches are (fast-forward-merged on top, one at a time, once each has a real PR against `intuit/infigraph`). It moves two ways: (1) `git fetch upstream && git push origin upstream/main:main --force` to absorb upstream's latest — this also naturally drops any PR upstream just merged, since that PR's commits now arrive as part of `upstream/main` itself (often under different SHAs, e.g. squash-merged); (2) fast-forward `main` onto an open-PR branch (never a merge commit — the PR branch must already be rebased cleanly onto the current `main`/`upstream/main`) once that branch has an actual PR open. **Never** put work here before its PR exists — see [Why not `origin/main`](#why-not-originmain) below for the sequencing that still applies.
 - **`feat/hardening`** — the persistent branch for hardening work (see `docs/DESIGN-hardening.md`) and the branch local builds/installs are cut from. Fork-specific infrastructure that doesn't necessarily belong upstream (or isn't ready to) lives here permanently. Other `feat/*` branches continue as separate parallel work streams and merge into this one when ready.
 
 ## Where work goes
@@ -25,11 +25,13 @@ gh pr create --repo intuit/infigraph --base main
 
 Independently verify against the fresh cherry-pick — don't trust that "it worked on the fork" is sufficient, since the fork's tree has diverged and a clean cherry-pick can still behave differently against upstream's actual code.
 
-### Why not `origin/main`?
+### Why not `origin/main` *before* the PR exists?
 
-It's tempting to also merge the cherry-pickable fix into `origin/main` first — as a staging step, or so the fork's own main branch has the fix immediately rather than waiting on upstream's review cycle. Don't: the moment `origin/main` has a commit `upstream/main` doesn't, it's diverged again, which is exactly the state this fork spent real effort eliminating (11 stray commits were found, reconciled, and `origin/main` was reset to match `upstream/main` exactly). Keeping `origin/main` a strict mirror means that reset never has to happen again. The "resolve conflicts before opening the real PR" need is already satisfied by cherry-picking onto a **fresh `upstream/main`-based branch** — that step *is* the merge-conflict triage, no intermediate `origin/main` merge required.
+It's tempting to merge the cherry-pickable fix into `origin/main` as a staging step, before even opening the upstream PR. Don't: the moment `origin/main` has a commit that isn't either from `upstream/main` or from a branch with a real, open PR against it, it's diverged in a way nothing tracks or cleans up — exactly the state this fork spent real effort eliminating once already (11 stray commits were found, reconciled, and `origin/main` was reset to match `upstream/main` exactly). The "resolve conflicts before opening the real PR" need is already satisfied by cherry-picking onto a **fresh `upstream/main`-based branch** — that step *is* the merge-conflict triage, no pre-PR `origin/main` merge required.
 
-If `origin/main` ever needs the fix before upstream merges it, that's what `feat/hardening` (or a `feat/*` branch based on it) is for — check it out locally rather than expecting `origin/main` to carry unreleased work.
+The correct sequence is: (1) do the work on `feat/hardening` as usual; (2) cherry-pick onto a fresh `upstream/main`-based branch, verify independently, push, `gh pr create --repo intuit/infigraph`; (3) **only once that PR is open**, fast-forward `origin/main` onto the PR branch (`git push origin <branch>:main` or `git branch -f main <branch> && git push origin main`) so the fork's own `main` carries it while waiting on review. When upstream merges the PR, the next `git fetch upstream && git push origin upstream/main:main --force` absorbs it and `origin/main` is a pure mirror again until the next open PR.
+
+For anything that *isn't* PR-bound — fork-specific hardening infrastructure with no plan to go upstream — `origin/main` is still never the place for it. That's what `feat/hardening` (or a `feat/*` branch based on it) is for — check it out locally rather than expecting `origin/main` to carry unreleased, non-upstreamable work.
 
 ## Hardening work tracking
 
