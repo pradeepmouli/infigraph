@@ -128,7 +128,16 @@ impl Registry {
             .collect();
 
         let abs_path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-        let commit = git_head_commit(path);
+        // Only stamp last_indexed_commit when the graph actually has symbols.
+        // `group add` calls this after `prism.init()` (opens the DB, never
+        // extracts) — stamping the commit here would make `index_group`'s
+        // incremental skip check believe the repo is already indexed at HEAD
+        // when it has zero symbols, permanently skipping real indexing.
+        let commit = if stats.symbols > 0 {
+            git_head_commit(path)
+        } else {
+            None
+        };
 
         self.repos.insert(
             name.to_string(),

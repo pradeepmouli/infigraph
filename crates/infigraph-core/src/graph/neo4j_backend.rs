@@ -282,7 +282,7 @@ impl Neo4jBackend {
             .map_err(|e| anyhow::anyhow!("upsert symbols failed: {e}"))?;
         }
 
-        // DEFINES edges (File -> Symbol)
+        // DEFINES edges (File -> Symbol), CONTAINS edges (Module -> Symbol)
         if !ext.symbols.is_empty() {
             let sym_ids: Vec<String> = ext.symbols.iter().map(|s| s.id.clone()).collect();
             for chunk in sym_ids.chunks(BATCH_SIZE) {
@@ -298,6 +298,18 @@ impl Neo4jBackend {
                     ),
                 )
                 .map_err(|e| anyhow::anyhow!("upsert DEFINES failed: {e}"))?;
+                self.block_on(
+                    self.graph.run(
+                        query(
+                            "UNWIND $ids AS sid \
+                         MATCH (m:Module {file: $file}), (s:Symbol {id: sid}) \
+                         MERGE (m)-[:CONTAINS]->(s)",
+                        )
+                        .param("file", ext.file.clone())
+                        .param("ids", chunk.to_vec()),
+                    ),
+                )
+                .map_err(|e| anyhow::anyhow!("upsert CONTAINS failed: {e}"))?;
             }
         }
 
@@ -334,62 +346,92 @@ impl Neo4jBackend {
             .map_err(|e| anyhow::anyhow!("upsert statements failed: {e}"))?;
         }
 
-        // IMPORTS edges
-        let imports: Vec<(String, String)> = ext
-            .relations
-            .iter()
-            .filter(|r| r.kind == crate::model::RelationKind::Imports)
-            .map(|r| (r.source_id.clone(), r.target_id.clone()))
-            .collect();
-        for chunk in imports.chunks(BATCH_SIZE) {
-            let pairs: Vec<HashMap<String, String>> = chunk
-                .iter()
-                .map(|(src, tgt)| {
-                    let mut m = HashMap::new();
-                    m.insert("src".into(), src.clone());
-                    m.insert("tgt".into(), tgt.clone());
-                    m
-                })
-                .collect();
+        // Relation edges grouped by type. IMPORTS is Module -> Module (direct
+        // match on target_id, mirroring KuzuBackend::upsert_file_conn_no_delete);
+        // everything else here is Symbol -> Symbol. Custom(name) edges (e.g.
+        // REGISTERS_MIDDLEWARE, INJECTS_DEPENDENCY from language plugins) use a
+        // dynamic relationship type, which Cypher requires as a literal in the
+        // query text rather than a bound parameter.
+        let mut calls_pairs: Vec<HashMap<String, String>> = Vec::new();
+        let mut inherits_pairs: Vec<HashMap<String, String>> = Vec::new();
+        let mut tested_by_pairs: Vec<HashMap<String, String>> = Vec::new();
+        let mut imports_pairs: Vec<HashMap<String, String>> = Vec::new();
+        let mut reads_pairs: Vec<HashMap<String, String>> = Vec::new();
+        let mut writes_pairs: Vec<HashMap<String, String>> = Vec::new();
+        let mut custom_pairs: HashMap<String, Vec<HashMap<String, String>>> = HashMap::new();
+        for rel in &ext.relations {
+            let mut m = HashMap::new();
+            m.insert("src".into(), rel.source_id.clone());
+            m.insert("tgt".into(), rel.target_id.clone());
+            match &rel.kind {
+                crate::model::RelationKind::Calls | crate::model::RelationKind::CalledBy => {
+                    calls_pairs.push(m)
+                }
+                crate::model::RelationKind::Inherits | crate::model::RelationKind::InheritedBy => {
+                    inherits_pairs.push(m)
+                }
+                crate::model::RelationKind::TestedBy | crate::model::RelationKind::Tests => {
+                    tested_by_pairs.push(m)
+                }
+                crate::model::RelationKind::Imports | crate::model::RelationKind::ImportedBy => {
+                    imports_pairs.push(m)
+                }
+                crate::model::RelationKind::Reads => reads_pairs.push(m),
+                crate::model::RelationKind::Writes => writes_pairs.push(m),
+                crate::model::RelationKind::Custom(name) => {
+                    custom_pairs.entry(name.clone()).or_default().push(m)
+                }
+                _ => {}
+            }
+        }
+        for (pairs, rel_type) in [
+            (&calls_pairs, "CALLS"),
+            (&inherits_pairs, "INHERITS"),
+            (&tested_by_pairs, "TESTED_BY"),
+            (&reads_pairs, "READS"),
+            (&writes_pairs, "WRITES"),
+        ] {
+            for chunk in pairs.chunks(BATCH_SIZE) {
+                let _ = self.block_on(
+                    self.graph.run(
+                        query(&format!(
+                            "UNWIND $batch AS p \
+                         MATCH (a:Symbol {{id: p.src}}), (b:Symbol {{id: p.tgt}}) \
+                         MERGE (a)-[:{rel_type}]->(b)"
+                        ))
+                        .param("batch", chunk.to_vec()),
+                    ),
+                );
+            }
+        }
+        for chunk in imports_pairs.chunks(BATCH_SIZE) {
             let _ = self.block_on(
                 self.graph.run(
                     query(
                         "UNWIND $batch AS p \
-                     MATCH (a:Symbol {id: p.src}), (b:Symbol {id: p.tgt}) \
+                     MATCH (a:Module {file: p.src}), (b:Module {file: p.tgt}) \
                      MERGE (a)-[:IMPORTS]->(b)",
                     )
-                    .param("batch", pairs),
+                    .param("batch", chunk.to_vec()),
                 ),
             );
         }
-
-        // CALLS edges — both intra-file and cross-file (MATCH skips missing targets)
-        let calls: Vec<(String, String)> = ext
-            .relations
-            .iter()
-            .filter(|r| r.kind == crate::model::RelationKind::Calls)
-            .map(|r| (r.source_id.clone(), r.target_id.clone()))
-            .collect();
-        for chunk in calls.chunks(BATCH_SIZE) {
-            let pairs: Vec<HashMap<String, String>> = chunk
-                .iter()
-                .map(|(src, tgt)| {
-                    let mut m = HashMap::new();
-                    m.insert("src".into(), src.clone());
-                    m.insert("tgt".into(), tgt.clone());
-                    m
-                })
-                .collect();
-            let _ = self.block_on(
-                self.graph.run(
-                    query(
-                        "UNWIND $batch AS p \
-                     MATCH (a:Symbol {id: p.src}), (b:Symbol {id: p.tgt}) \
-                     MERGE (a)-[:CALLS]->(b)",
-                    )
-                    .param("batch", pairs),
-                ),
-            );
+        for (edge_name, pairs) in &custom_pairs {
+            if pairs.is_empty() {
+                continue;
+            }
+            for chunk in pairs.chunks(BATCH_SIZE) {
+                let _ = self.block_on(
+                    self.graph.run(
+                        query(&format!(
+                            "UNWIND $batch AS p \
+                         MATCH (a:Symbol {{id: p.src}}), (b:Symbol {{id: p.tgt}}) \
+                         MERGE (a)-[:{edge_name}]->(b)"
+                        ))
+                        .param("batch", chunk.to_vec()),
+                    ),
+                );
+            }
         }
 
         Ok(())
@@ -860,9 +902,11 @@ impl GraphBackend for Neo4jBackend {
 
     fn get_file_deps(&self, file: &str) -> Result<FileDeps> {
         let file = self.resolve_file_key(file);
+        // IMPORTS edges are Module -> Module (see upsert_extraction/upsert_files_bulk),
+        // not Symbol -> Symbol.
         let imports = self.collect_strings(
             &format!(
-                "MATCH (s:Symbol {{file: '{}'}})-[:IMPORTS]->(t:Symbol) \
+                "MATCH (m:Module {{file: '{}'}})-[:IMPORTS]->(t:Module) \
                  RETURN DISTINCT t.file AS file",
                 escape(&file)
             ),
@@ -870,8 +914,8 @@ impl GraphBackend for Neo4jBackend {
         )?;
         let imported_by = self.collect_strings(
             &format!(
-                "MATCH (s:Symbol)-[:IMPORTS]->(t:Symbol {{file: '{}'}}) \
-                 RETURN DISTINCT s.file AS file",
+                "MATCH (m:Module)-[:IMPORTS]->(t:Module {{file: '{}'}}) \
+                 RETURN DISTINCT m.file AS file",
                 escape(&file)
             ),
             "file",
@@ -1577,9 +1621,9 @@ impl GraphBackend for Neo4jBackend {
             .map_err(|e| anyhow::anyhow!("bulk upsert statements failed: {e}"))?;
         }
 
-        // ── Phase 2: Edges (DEFINES, IMPORTS, CALLS) ─────────────────
+        // ── Phase 2: Edges (DEFINES, CONTAINS, and all relation kinds) ────
 
-        // DEFINES edges (File -> Symbol)
+        // DEFINES edges (File -> Symbol), CONTAINS edges (Module -> Symbol)
         let all_defines: Vec<HashMap<String, String>> = extractions
             .iter()
             .flat_map(|ext| {
@@ -1603,62 +1647,120 @@ impl GraphBackend for Neo4jBackend {
                 ),
             )
             .map_err(|e| anyhow::anyhow!("bulk upsert DEFINES failed: {e}"))?;
+            self.block_on(
+                self.graph.run(
+                    query(
+                        "UNWIND $batch AS d \
+                     MATCH (m:Module {file: d.file}), (s:Symbol {id: d.sym}) \
+                     MERGE (m)-[:CONTAINS]->(s)",
+                    )
+                    .param("batch", chunk.to_vec()),
+                ),
+            )
+            .map_err(|e| anyhow::anyhow!("bulk upsert CONTAINS failed: {e}"))?;
         }
 
-        // IMPORTS edges
-        let all_imports: Vec<HashMap<String, String>> = extractions
+        // Relation edges grouped by type, mirroring KuzuBackend::upsert_all_bulk.
+        // IMPORTS targets are raw "{file}::{module_name}" strings, not real node
+        // ids — resolve the bare module name to the imported file's Module id via
+        // a stem lookup built from this batch, same as the kuzu bulk path (without
+        // this, the MATCH below silently matches zero rows: AIF3X-331 #20b applies
+        // to Neo4j's bulk writer exactly as it did to kuzu's before that fix).
+        let module_by_stem: HashMap<String, &str> = extractions
             .iter()
-            .flat_map(|ext| {
-                ext.relations
-                    .iter()
-                    .filter(|r| r.kind == crate::model::RelationKind::Imports)
-                    .map(|r| {
-                        let mut m = HashMap::new();
-                        m.insert("src".into(), r.source_id.clone());
-                        m.insert("tgt".into(), r.target_id.clone());
-                        m
-                    })
-            })
+            .map(|e| (super::store_util::file_stem(&e.file), e.file.as_str()))
             .collect();
-        for chunk in all_imports.chunks(BATCH_SIZE) {
+
+        let mut calls_pairs: Vec<HashMap<String, String>> = Vec::new();
+        let mut inherits_pairs: Vec<HashMap<String, String>> = Vec::new();
+        let mut tested_by_pairs: Vec<HashMap<String, String>> = Vec::new();
+        let mut imports_pairs: Vec<HashMap<String, String>> = Vec::new();
+        let mut reads_pairs: Vec<HashMap<String, String>> = Vec::new();
+        let mut writes_pairs: Vec<HashMap<String, String>> = Vec::new();
+        let mut custom_pairs: HashMap<String, Vec<HashMap<String, String>>> = HashMap::new();
+        for ext in extractions {
+            for rel in &ext.relations {
+                let mut m = HashMap::new();
+                m.insert("src".into(), rel.source_id.clone());
+                m.insert("tgt".into(), rel.target_id.clone());
+                match &rel.kind {
+                    crate::model::RelationKind::Calls | crate::model::RelationKind::CalledBy => {
+                        calls_pairs.push(m)
+                    }
+                    crate::model::RelationKind::Inherits
+                    | crate::model::RelationKind::InheritedBy => inherits_pairs.push(m),
+                    crate::model::RelationKind::TestedBy | crate::model::RelationKind::Tests => {
+                        tested_by_pairs.push(m)
+                    }
+                    crate::model::RelationKind::Imports
+                    | crate::model::RelationKind::ImportedBy => {
+                        let module_name =
+                            rel.target_id.rsplit("::").next().unwrap_or(&rel.target_id);
+                        let stem = super::store_util::import_stem(module_name);
+                        if let Some(target_file) = module_by_stem.get(stem.as_str()) {
+                            if *target_file != rel.source_id {
+                                m.insert("tgt".into(), target_file.to_string());
+                                imports_pairs.push(m);
+                            }
+                        }
+                    }
+                    crate::model::RelationKind::Reads => reads_pairs.push(m),
+                    crate::model::RelationKind::Writes => writes_pairs.push(m),
+                    crate::model::RelationKind::Custom(name) => {
+                        custom_pairs.entry(name.clone()).or_default().push(m)
+                    }
+                    _ => {}
+                }
+            }
+        }
+        for (pairs, rel_type) in [
+            (&calls_pairs, "CALLS"),
+            (&inherits_pairs, "INHERITS"),
+            (&tested_by_pairs, "TESTED_BY"),
+            (&reads_pairs, "READS"),
+            (&writes_pairs, "WRITES"),
+        ] {
+            for chunk in pairs.chunks(BATCH_SIZE) {
+                let _ = self.block_on(
+                    self.graph.run(
+                        query(&format!(
+                            "UNWIND $batch AS p \
+                         MATCH (a:Symbol {{id: p.src}}), (b:Symbol {{id: p.tgt}}) \
+                         MERGE (a)-[:{rel_type}]->(b)"
+                        ))
+                        .param("batch", chunk.to_vec()),
+                    ),
+                );
+            }
+        }
+        for chunk in imports_pairs.chunks(BATCH_SIZE) {
             let _ = self.block_on(
                 self.graph.run(
                     query(
                         "UNWIND $batch AS p \
-                     MATCH (a:Symbol {id: p.src}), (b:Symbol {id: p.tgt}) \
+                     MATCH (a:Module {file: p.src}), (b:Module {file: p.tgt}) \
                      MERGE (a)-[:IMPORTS]->(b)",
                     )
                     .param("batch", chunk.to_vec()),
                 ),
             );
         }
-
-        // CALLS edges
-        let all_calls: Vec<HashMap<String, String>> = extractions
-            .iter()
-            .flat_map(|ext| {
-                ext.relations
-                    .iter()
-                    .filter(|r| r.kind == crate::model::RelationKind::Calls)
-                    .map(|r| {
-                        let mut m = HashMap::new();
-                        m.insert("src".into(), r.source_id.clone());
-                        m.insert("tgt".into(), r.target_id.clone());
-                        m
-                    })
-            })
-            .collect();
-        for chunk in all_calls.chunks(BATCH_SIZE) {
-            let _ = self.block_on(
-                self.graph.run(
-                    query(
-                        "UNWIND $batch AS p \
-                     MATCH (a:Symbol {id: p.src}), (b:Symbol {id: p.tgt}) \
-                     MERGE (a)-[:CALLS]->(b)",
-                    )
-                    .param("batch", chunk.to_vec()),
-                ),
-            );
+        for (edge_name, pairs) in &custom_pairs {
+            if pairs.is_empty() {
+                continue;
+            }
+            for chunk in pairs.chunks(BATCH_SIZE) {
+                let _ = self.block_on(
+                    self.graph.run(
+                        query(&format!(
+                            "UNWIND $batch AS p \
+                         MATCH (a:Symbol {{id: p.src}}), (b:Symbol {{id: p.tgt}}) \
+                         MERGE (a)-[:{edge_name}]->(b)"
+                        ))
+                        .param("batch", chunk.to_vec()),
+                    ),
+                );
+            }
         }
 
         let file_paths: Vec<&str> = extractions.iter().map(|e| e.file.as_str()).collect();
@@ -2141,6 +2243,82 @@ impl GraphBackend for Neo4jBackend {
                         inherits_resolved += 1;
                     }
                 }
+            }
+        }
+
+        // Resolve RelationKind::Custom edges (AIF3X-331 #16 / #33: INJECTS_DEPENDENCY,
+        // REGISTERS_MIDDLEWARE, ...), mirroring KuzuBackend's resolve_custom_edges.
+        // Extraction always scopes a custom edge's target_id to its own file
+        // ("{file}::{name}") since it has no cross-file symbol table at parse
+        // time. Without this pass, a registration referencing an imported
+        // symbol (e.g. `Depends(fn)` where `fn` lives in another file) points
+        // at a target_id that never exists, so the edge silently never gets
+        // written (its MATCH finds nothing).
+        let known_ids: std::collections::HashSet<&str> = symbol_map
+            .values()
+            .flat_map(|v| v.iter().map(|(id, _, _)| id.as_str()))
+            .collect();
+        let mut custom_by_edge_kind: HashMap<String, Vec<(String, String)>> = HashMap::new();
+        for ext in extractions {
+            for rel in &ext.relations {
+                let crate::model::RelationKind::Custom(edge_name) = &rel.kind else {
+                    continue;
+                };
+                if known_ids.contains(rel.target_id.as_str()) {
+                    // Already resolves (e.g. local-file target) — write as-is.
+                    custom_by_edge_kind
+                        .entry(edge_name.clone())
+                        .or_default()
+                        .push((rel.source_id.clone(), rel.target_id.clone()));
+                    continue;
+                }
+                // Cross-file: look up by bare name in the global symbol table.
+                // Single-candidate-only policy — collision handling across
+                // multiple same-named candidates is intentionally out of scope.
+                let target_name = rel.target_id.rsplit("::").next().unwrap_or(&rel.target_id);
+                if let Some(candidates) = symbol_map.get(target_name) {
+                    if candidates.len() == 1 {
+                        custom_by_edge_kind
+                            .entry(edge_name.clone())
+                            .or_default()
+                            .push((rel.source_id.clone(), candidates[0].0.clone()));
+                    }
+                }
+            }
+        }
+        for (edge_name, pairs) in &custom_by_edge_kind {
+            if pairs.is_empty() {
+                continue;
+            }
+            let mut seen: std::collections::HashSet<&(String, String)> =
+                std::collections::HashSet::new();
+            let valid: Vec<HashMap<String, String>> = pairs
+                .iter()
+                .filter(|(src, tgt)| {
+                    known_ids.contains(src.as_str()) && known_ids.contains(tgt.as_str())
+                })
+                .filter(|pair| seen.insert(pair))
+                .map(|(src, tgt)| {
+                    let mut m = HashMap::new();
+                    m.insert("src".into(), src.clone());
+                    m.insert("tgt".into(), tgt.clone());
+                    m
+                })
+                .collect();
+            if valid.is_empty() {
+                continue;
+            }
+            for chunk in valid.chunks(BATCH_SIZE) {
+                let _ = self.block_on(
+                    self.graph.run(
+                        query(&format!(
+                            "UNWIND $batch AS p \
+                         MATCH (a:Symbol {{id: p.src}}), (b:Symbol {{id: p.tgt}}) \
+                         MERGE (a)-[:{edge_name}]->(b)"
+                        ))
+                        .param("batch", chunk.to_vec()),
+                    ),
+                );
             }
         }
 

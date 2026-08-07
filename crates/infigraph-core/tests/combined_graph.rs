@@ -639,3 +639,77 @@ class BaseHandler:
 
     std::env::set_var("HOME", &orig_home);
 }
+
+/// `register_repo` must not stamp `last_indexed_commit` for a repo that was
+/// only `init()`'d (as `group add` does) and never actually indexed — doing
+/// so makes `index_group`'s incremental skip check believe the repo is
+/// already up to date at HEAD when it has zero symbols, permanently skipping
+/// real indexing (AIF3X-331).
+#[test]
+fn test_register_repo_does_not_stamp_commit_without_indexing() {
+    let _guard = COMBINED_LOCK.lock().unwrap();
+    let orig_home = std::env::var("HOME").unwrap_or_default();
+    let home = tempfile::TempDir::new().unwrap();
+    std::env::set_var("HOME", home.path());
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = make_repo(
+        &dir,
+        &[("src/api.py", "def get_user(uid):\n    return uid\n")],
+    );
+
+    std::process::Command::new("git")
+        .args(["init"])
+        .current_dir(&path)
+        .output()
+        .unwrap();
+    std::process::Command::new("git")
+        .args(["-c", "user.email=t@t.com", "-c", "user.name=t", "add", "-A"])
+        .current_dir(&path)
+        .output()
+        .unwrap();
+    std::process::Command::new("git")
+        .args([
+            "-c",
+            "user.email=t@t.com",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-m",
+            "init",
+        ])
+        .current_dir(&path)
+        .output()
+        .unwrap();
+
+    let mut registry = Registry {
+        repos: HashMap::new(),
+        groups: HashMap::new(),
+    };
+
+    // `group add`'s path: open + init only, never index().
+    let mut ig = Infigraph::open(&path, python_registry()).unwrap();
+    ig.init().unwrap();
+    registry.register_repo("svc", &path, &ig).unwrap();
+
+    let entry = &registry.repos["svc"];
+    assert_eq!(entry.symbol_count, 0);
+    assert!(
+        entry.last_indexed_commit.is_none(),
+        "must not stamp a commit for a repo with zero symbols, got: {:?}",
+        entry.last_indexed_commit
+    );
+
+    // Now actually index — register_repo should stamp the commit this time.
+    ig.index().unwrap();
+    registry.register_repo("svc", &path, &ig).unwrap();
+
+    let entry = &registry.repos["svc"];
+    assert!(entry.symbol_count > 0);
+    assert!(
+        entry.last_indexed_commit.is_some(),
+        "must stamp a commit once the repo has actually been indexed"
+    );
+
+    std::env::set_var("HOME", &orig_home);
+}
