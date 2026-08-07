@@ -689,8 +689,12 @@ fn load_embeddings_impl(path: &Path) -> Result<Vec<(String, Vec<f32>, u64)>> {
 
 /// Incrementally update embeddings for changed files.
 ///
-/// Loads existing embeddings, re-embeds symbols in `changed_files`, removes orphans,
-/// and saves back. If `changed_files` is empty, treats all symbols as changed (full rebuild).
+/// Loads existing embeddings and brings symbols in `changed_files` into scope for
+/// re-embedding (if `changed_files` is empty, every symbol is in scope). A symbol
+/// only actually re-embeds when its input text's hash differs from the one stored
+/// alongside its vector (v3 format) — an unchanged input keeps its existing vector
+/// even when in scope. Orphaned symbols are pruned. If nothing was re-embedded and
+/// nothing was pruned, the on-disk file and HNSW index are left untouched entirely.
 pub fn update_embeddings(
     backend: &dyn crate::graph::GraphBackend,
     root: &Path,
