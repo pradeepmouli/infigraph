@@ -2,14 +2,14 @@
 
 **Status:** Draft — implementation underway; see "Implementation Status" below
 **Date:** 2026-07-20
-**Updated:** 2026-07-30
+**Updated:** 2026-08-07
 **Scope:** Process lifecycle, data integrity, error handling, reliability, observability, scalability, deployment/upgrade
 
 ---
 
-## Implementation Status (as of 2026-07-30)
+## Implementation Status (as of 2026-08-07)
 
-Requirement text in §2–§8 is unchanged from the 2026-07-20 draft; where reality has since moved, this section is authoritative. All "shipped" claims below were verified against the tree on `feat/health-beacons`, not inferred.
+Requirement text in §2–§8 is unchanged from the 2026-07-20 draft; where reality has since moved, this section is authoritative. All "shipped" claims below were verified against the tree on `feat/hardening` (the branch `feat/health-beacons` fed into), not inferred.
 
 Each item below is tracked as a GitHub issue (label `hardening`) once it moves past "shipped" — see the issue number on each unchecked item. Issues link back to any PR that landed partial/adjacent groundwork.
 
@@ -24,17 +24,18 @@ Each item below is tracked as a GitHub issue (label `hardening`) once it moves p
 - [x] R3.3.1 — atomic sidecar writes (PR4 Task 1) — `embed::save_embeddings` uses temp-file + rename
 - [x] R3.3.2 — sidecar format header/checksum (PR9 Task 2)
 - [ ] R7.2 — disk preflight (**partial**) — `store_util::check_disk_headroom()` (via `fs2`): requires free space ≥ max(3× projected write, 200 MB) before writing. **Caveat:** wired into `import_scip_index` ONLY — the other three graph write paths (full reindex, incremental/watch, resolve) have no preflight yet.
+- [x] R2.1.3/R2.3.8 — watcher-as-sole-writer daemon (`DaemonKuzu`), superseding R2.3.7 — `crates/infigraph-core/src/graph/daemon_kuzu_backend.rs` (client wrapper routing writes through the daemon), `crates/infigraph-core/src/watch/daemon.rs` (`ensure_daemon_running`/`spawn_daemon`, shared by the CLI's `infigraph watch` auto-start and MCP's opportunistic/bootstrap paths), `crates/infigraph-core/src/daemon_protocol.rs` (the request/response wire protocol). Selected via `INFIGRAPH_BACKEND=daemon`, unified with the former separate `INFIGRAPH_WATCH_DAEMON` toggle. Tests: `crates/infigraph-core/tests/watch_daemon.rs`, `daemon_kuzu_backend.rs`, `daemon_protocol_serve.rs`, `daemon_protocol_e2e.rs`, `daemon_protocol_watcher_wiring.rs`.
+- [x] R6.4 — `infigraph doctor` ([#9](https://github.com/pradeepmouli/infigraph/issues/9)) — `crates/infigraph-core/src/doctor.rs` + `mcp__infigraph__doctor` MCP tool. Checks implemented: disk headroom, `graph.lock`/`watch.lock` freshness (holder-alive + build-hash-mismatch detection), registry-vs-filesystem drift, unregistered-project discovery (opt-in via `INFIGRAPH_SCAN_ROOTS`/`~/.infigraph/scan_roots.txt`), sidecar (`embeddings.bin`/`docs_embeddings.bin`) freshness relative to the graph, installed toolchain/build-hash validity, watcher liveness. Project-scoped by default, `scope=global` sweeps every registered project. PASS/WARN/FAIL output with a remediation hint per check.
 
 ### In progress
 
-- [ ] R2.1.3/R2.3.8 — watcher-as-sole-writer daemon (`DaemonKuzu`), superseding R2.3.7 — design spec committed: `docs/superpowers/specs/2026-07-31-graph-lock-write-coordination-design.md`. Moved out of Phase 3's original "deliberately deferred" framing after an earlier, lighter lock-based design for this same slot (R2.3.7) was found — via independent review — not to actually close the cross-process collision it targeted. Not yet implemented; also directly unblocks upstream PR #43 / resolves upstream issue #46.
-- [ ] R6.4 — `infigraph doctor` ([#9](https://github.com/pradeepmouli/infigraph/issues/9)) — brainstorming started; checks under consideration: `verify`, instance-registry scan, lock status, disk usage per project, sidecar freshness, hook installation/version checks, toolchain/codesign validity. Design spec committed: `docs/superpowers/specs/2026-07-30-infigraph-doctor-design.md` (CLI + MCP dual surface, project-scoped by default). Directly motivated by I-19 below — `doctor` productizes exactly that manual audit (registry-vs-filesystem diff, watch/graph lock freshness + build-hash checks, orphaned-process detection) as a repeatable PASS/WARN/FAIL command with remediation per check.
+_(none currently — both items previously listed here have shipped; see above.)_
 
 ### Not started
 
 - [ ] R3.4.1 — `infigraph verify` ([#10](https://github.com/pradeepmouli/infigraph/issues/10))
 - [ ] R2.2.4 — `infigraph ps` / `infigraph kill` ([#11](https://github.com/pradeepmouli/infigraph/issues/11))
-- [ ] R7.1 — Registry GC, `infigraph gc` ([#12](https://github.com/pradeepmouli/infigraph/issues/12))
+- [ ] R7.1 — Registry GC, `infigraph gc` ([#12](https://github.com/pradeepmouli/infigraph/issues/12)) — `doctor` (now shipped, see above) surfaces stale registry entries pointing at deleted paths as WARN, but nothing actually evicts them yet; still accumulate indefinitely
 - [ ] R3.2.1/R3.2.2 — pre-write snapshots + `infigraph restore` ([#13](https://github.com/pradeepmouli/infigraph/issues/13))
 - [ ] R6.1 — structured `tracing` JSON logging ([#14](https://github.com/pradeepmouli/infigraph/issues/14)) — zero `tracing::` call sites; logging is still ad-hoc `eprintln!`/`mcp_log`/`watch_log`
 - [ ] R8.4 — pinned toolchain ([#15](https://github.com/pradeepmouli/infigraph/issues/15)) — `rust-toolchain.toml` absent (verified)
@@ -54,6 +55,7 @@ Each item below is tracked as a GitHub issue (label `hardening`) once it moves p
 - **INHERITS extraction fixes across nine languages** (I-18) — TypeScript, Rust, Go, Kotlin, Swift, Dart, Objective-C, Python, and Java `relations.scm` queries now use wildcard `(_)` node patterns that capture generic and qualified/dotted base types (`Shape<T>`, `pkg.Animal`, `React.Component`) the original narrow `type_identifier`-only patterns silently missed. Unblinds `patterns/mod.rs` Strategy/Decorator detection, which relies on INHERITS edges as its core structural signal.
 - **`groups_watch_perf` race hardening** (`crates/infigraph-mcp/tests/groups_watch_perf.rs`) — the `group_index` assertion no longer races auto-watch ("Indexed 0 repos").
 - **Enforcement-hook structured decisions** (`crates/infigraph-cli/src/hooks.rs`) — a `deny()` helper emits proper PreToolUse JSON (`hookSpecificOutput.permissionDecision: "deny"` with a reason) on stdout with exit 0, replacing the old raw `echo >&2; exit 2` pattern. Advances the I-9/R4.2.3 hook-quality track.
+- **Auto-start prunes a stale `watch.lock` holder instead of giving up** (`crates/infigraph-core/src/watch/daemon.rs`: `prune_stale_holder`) — extends R2.3's build-hash-takeover pattern (previously `mcp.lock`-only, R2.3.1–5) to `watch.lock`: `ensure_daemon_running` used to report `AlreadyRunning` unconditionally on any held lock, so a watcher left behind by an old/uninstalled binary (or one that crashed without releasing it) sat there forever, invisible until someone ran `doctor` and killed it by hand. Now: a dead holder PID is pruned with nothing to signal; a live holder on a different `build_hash` gets SIGTERM'd (the watch loop already releases the lock cleanly on SIGTERM) and the acquisition is retried. PID-reuse guard: `LockInfo` has no OS-reported start time to cross-check (unlike the MCP instance registry's `InstanceInfo`), so before signaling anything the live process's name is exact-matched against `infigraph`/`infigraph.exe` — not a substring check, which would also match this crate's own compiled test binary (`infigraph_core-<hash>`) and did cause a real self-SIGTERM in an early draft, caught by its own unit test.
 
 ### Branch/repo topology (process note, §8-adjacent)
 
