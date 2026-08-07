@@ -202,8 +202,26 @@ fn prune_stale_holder(lock_path: &Path) -> bool {
 /// configuration (e.g. its env mutations) directly, without needing to
 /// actually spawn and observe a real child process.
 pub fn build_daemon_command(root: &Path, tg_dir: &Path, watch_binary: &Path) -> Command {
+    // Append, never truncate: multiple spawn attempts can race to acquire
+    // watch.lock (see ensure_daemon_running's probe-then-spawn window), and
+    // every attempt -- winner and losers alike -- opens this same file for
+    // its child's stderr before the race is decided. O_APPEND makes each
+    // write atomically seek-to-end, so a losing child's short "another
+    // watcher is already running" message lands after the winner's output
+    // instead of truncating it away.
+    // Append, never truncate: multiple spawn attempts can race to acquire
+    // watch.lock (see ensure_daemon_running's probe-then-spawn window), and
+    // every attempt -- winner and losers alike -- opens this same file for
+    // its child's stderr before the race is decided. O_APPEND makes each
+    // write atomically seek-to-end, so a losing child's short "another
+    // watcher is already running" message lands after the winner's output
+    // instead of truncating it away.
     let log_path = tg_dir.join("watch.log");
-    let stderr_target = match std::fs::File::create(&log_path) {
+    let stderr_target = match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    {
         Ok(f) => Stdio::from(f),
         Err(_) => Stdio::null(),
     };
@@ -368,6 +386,30 @@ mod tests {
         assert!(
             !prune_stale_holder(&lock_path),
             "a live PID whose process name doesn't look like infigraph must not be pruned/signaled"
+        );
+    }
+
+    /// `build_daemon_command` must open `watch.log` in append mode: a losing
+    /// spawn attempt racing against an already-running daemon (see
+    /// `ensure_daemon_running`'s probe-then-spawn window) must not truncate
+    /// away the winner's existing log content.
+    #[test]
+    fn build_daemon_command_appends_to_an_existing_log_instead_of_truncating() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tg_dir = tmp.path().join(".infigraph");
+        std::fs::create_dir_all(&tg_dir).unwrap();
+        std::fs::write(tg_dir.join("watch.log"), b"previous daemon's output\n").unwrap();
+
+        // Building the command opens (but doesn't write to) the log for the
+        // child's stderr; drop it immediately, as a real spawn would hand
+        // the fd to the child rather than writing through it here.
+        let _cmd =
+            super::build_daemon_command(tmp.path(), &tg_dir, std::path::Path::new("infigraph"));
+
+        let contents = std::fs::read_to_string(tg_dir.join("watch.log")).unwrap();
+        assert_eq!(
+            contents, "previous daemon's output\n",
+            "opening the log for a new spawn attempt must not truncate prior content"
         );
     }
 }
