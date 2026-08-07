@@ -705,61 +705,91 @@ pub fn update_embeddings(
     }
 
     let emb_path = root.join(".infigraph").join("embeddings.bin");
-    let mut existing: std::collections::HashMap<String, Vec<f32>> = load_embeddings(&emb_path)
-        .unwrap_or_default()
-        .into_iter()
-        .collect();
+    // id -> (vector, input_hash); hash 0 = unknown (legacy/v2 files).
+    let mut existing: std::collections::HashMap<String, (Vec<f32>, u64)> =
+        load_embeddings_hashed(&emb_path)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(id, v, h)| (id, (v, h)))
+            .collect();
 
     let changed_set: std::collections::HashSet<&str> = changed_files.iter().copied().collect();
 
-    let to_embed: Vec<(String, String)> = rows
-        .iter()
-        .filter_map(|row| {
-            let id = &row[0];
-            let file = row.get(3).map(|s| s.as_str()).unwrap_or("");
-            if !changed_set.is_empty() && !changed_set.contains(file) && existing.contains_key(id) {
-                return None;
-            }
-            let name = &row[1];
-            let kind = &row[2];
-            let doc = row.get(4).map(|s| s.as_str()).unwrap_or("");
-            let lang = row.get(5).map(|s| s.as_str()).unwrap_or("");
-            let params = row.get(6).map(|s| s.as_str()).unwrap_or("");
-            let ret = row.get(7).map(|s| s.as_str()).unwrap_or("");
-            let text = rich_symbol_text_full(kind, name, file, lang, doc, params, ret);
-            Some((id.clone(), text))
-        })
-        .collect();
+    // Early cutoff: a symbol in scope only re-embeds when its input text hash
+    // differs from the one stored beside its vector.
+    let mut to_embed: Vec<(String, String, u64)> = Vec::new();
+    for row in &rows {
+        let id = &row[0];
+        let file = row.get(3).map(|s| s.as_str()).unwrap_or("");
+        let in_scope = changed_set.is_empty()
+            || changed_set.contains(file)
+            || !existing.contains_key(id.as_str());
+        if !in_scope {
+            continue;
+        }
+        let name = &row[1];
+        let kind = &row[2];
+        let doc = row.get(4).map(|s| s.as_str()).unwrap_or("");
+        let lang = row.get(5).map(|s| s.as_str()).unwrap_or("");
+        let params = row.get(6).map(|s| s.as_str()).unwrap_or("");
+        let ret = row.get(7).map(|s| s.as_str()).unwrap_or("");
+        let text = rich_symbol_text_full(kind, name, file, lang, doc, params, ret);
+        let h = fnv1a64(text.as_bytes());
+        match existing.get(id.as_str()) {
+            Some((_, stored)) if *stored == h => {} // input unchanged: keep the vector
+            _ => to_embed.push((id.clone(), text, h)),
+        }
+    }
 
+    let mut embedded = 0usize;
     if !to_embed.is_empty() {
         let embedder: Arc<Box<dyn EmbedProvider>> = Arc::new(best_embedder());
         const BATCH: usize = 256;
-        let results: Vec<Vec<(String, Vec<f32>)>> = to_embed
+        let results: Vec<Vec<(String, Vec<f32>, u64)>> = to_embed
             .par_chunks(BATCH)
             .map(|chunk| {
                 let emb = Arc::clone(&embedder);
-                let texts: Vec<&str> = chunk.iter().map(|(_, t)| t.as_str()).collect();
+                let texts: Vec<&str> = chunk.iter().map(|(_, t, _)| t.as_str()).collect();
                 let vecs = emb.embed_batch(&texts).unwrap_or_default();
                 chunk
                     .iter()
                     .enumerate()
-                    .filter_map(|(i, (id, _))| vecs.get(i).map(|v| (id.clone(), v.clone())))
+                    .filter_map(|(i, (id, _, h))| vecs.get(i).map(|v| (id.clone(), v.clone(), *h)))
                     .collect()
             })
             .collect();
         for batch in results {
-            for (id, v) in batch {
-                existing.insert(id, v);
+            for (id, v, h) in batch {
+                existing.insert(id, (v, h));
+                embedded += 1;
             }
         }
     }
 
     let all_ids: std::collections::HashSet<String> = rows.iter().map(|r| r[0].clone()).collect();
+    let before_prune = existing.len();
     existing.retain(|id, _| all_ids.contains(id));
+    let pruned = before_prune - existing.len();
 
-    let symbol_embeddings: Vec<(String, Vec<f32>)> = existing.into_iter().collect();
-    let count = symbol_embeddings.len();
-    save_embeddings(&emb_path, &symbol_embeddings)?;
+    let count = existing.len();
+
+    // Nothing embedded, nothing pruned: the file's contents would be identical.
+    // Skip the write AND the O(n) HNSW rebuild — this is the body-only-edit
+    // fast path.
+    if embedded == 0 && pruned == 0 {
+        return Ok(count);
+    }
+
+    let entries: Vec<(String, Vec<f32>, u64)> = existing
+        .into_iter()
+        .map(|(id, (v, h))| (id, v, h))
+        .collect();
+    save_embeddings_hashed(&emb_path, &entries)?;
+
+    let symbol_embeddings: Vec<(String, Vec<f32>)> = entries
+        .iter()
+        .map(|(id, v, _)| (id.clone(), v.clone()))
+        .collect();
 
     // Build/rebuild HNSW only when above threshold OR when an existing index
     // needs to stay current after incremental updates.
