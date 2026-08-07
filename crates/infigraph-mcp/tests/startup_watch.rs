@@ -161,6 +161,85 @@ fn start_daemon_watcher_for_startup_dir_never_touches_other_projects() {
     );
 }
 
+/// True-up: a project that drifted while nothing was watching it (e.g. a
+/// file was added between MCP server restarts) must be caught by
+/// `start_daemon_watcher_for_startup_dir` before it starts watching, not
+/// silently missed until some future fsevent happens to touch that exact
+/// file again. Before this fix, the function only ever started the watcher
+/// and relied entirely on future filesystem events -- drift accumulated
+/// while unwatched was invisible until something else touched it.
+#[test]
+fn start_daemon_watcher_for_startup_dir_catches_drift_from_before_it_was_running() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let Ok(_cli) = infigraph_core::watch::daemon::resolve_cli_binary_sibling_of(
+        &std::env::current_exe().unwrap(),
+    ) else {
+        eprintln!("skipping: infigraph CLI binary not built in this target dir");
+        return;
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::write(root.join("main.py"), "def main(): pass\n").unwrap();
+    let path_str = root.to_string_lossy().to_string();
+
+    let lock_path = root.join(".infigraph").join("watch.lock");
+
+    // Bootstrap: index once so `.infigraph/` is a real, already-indexed
+    // project (not just an empty directory), matching a project that was
+    // indexed in a prior session. Without `INFIGRAPH_BACKEND=daemon` set
+    // yet, this also auto-starts an ordinary in-process watcher -- stop it
+    // and wait for `watch.lock` to be released, so it doesn't sit there
+    // holding the lock and starving the real daemon spawn below (the true-up
+    // step's write would otherwise be dropped into `.infigraph/requests/`
+    // with nothing -- no real `infigraph daemon` process -- ever polling
+    // that directory to serve it, hanging until its timeout).
+    infigraph_mcp::tools::index::tool_index_project(&serde_json::json!({ "path": &path_str }))
+        .expect("initial index");
+    std::fs::write(root.join(".infigraph").join("watch.stop"), "").unwrap();
+    wait_for_watch_lock_state(&lock_path, false, Duration::from_secs(15));
+
+    // Nothing is watching yet -- simulate drift accumulated between MCP
+    // server runs by adding a file with no watcher alive to see it.
+    std::fs::write(
+        root.join("drifted.py"),
+        "def drifted_during_downtime(): return 'late'\n",
+    )
+    .unwrap();
+
+    std::env::set_var("INFIGRAPH_BACKEND", "daemon");
+    std::env::set_var("INFIGRAPH_AUTO_START_WATCH", "1");
+
+    infigraph_mcp::recovery::start_daemon_watcher_for_startup_dir(Some(&root));
+    let started = wait_for_watch_lock_state(&lock_path, true, Duration::from_secs(15));
+
+    let hashes = infigraph_mcp::tools::helpers::open_prism_read_only(&serde_json::json!({
+        "path": &path_str
+    }))
+    .ok()
+    .and_then(|prism| prism.backend().and_then(|b| b.get_file_hashes().ok()));
+    let drifted_file_indexed = hashes
+        .map(|h| h.keys().any(|k| k.ends_with("drifted.py")))
+        .unwrap_or(false);
+
+    // Clean up unconditionally before asserting, so a failed assertion
+    // can't leak a daemon process or a held lock.
+    std::fs::write(root.join(".infigraph").join("watch.stop"), "").unwrap();
+    wait_for_watch_lock_state(&lock_path, false, Duration::from_secs(15));
+
+    std::env::remove_var("INFIGRAPH_AUTO_START_WATCH");
+    std::env::remove_var("INFIGRAPH_BACKEND");
+
+    assert!(started, "expected a daemon to start for the startup dir");
+    assert!(
+        drifted_file_indexed,
+        "a file added while nothing was watching must be caught by the true-up \
+         index before the watcher starts, not left invisible until some future \
+         fsevent happens to touch it"
+    );
+}
+
 /// `auto_start_watch_on_boot_enabled` itself: env var overrides config file
 /// overrides the hardcoded default (on), matching the priority convention
 /// documented on `get_ml_compression_mode` in the same file.

@@ -58,7 +58,10 @@ pub fn collect_reindex_targets(
 /// in, rather than only ever starting a watcher reactively after some write
 /// happens to touch it. Only takes effect when both daemon mode
 /// (`INFIGRAPH_BACKEND=daemon`) and the `[watch].auto_start_on_boot`
-/// config toggle (env override: `INFIGRAPH_AUTO_START_WATCH`) are on.
+/// config toggle (env override: `INFIGRAPH_AUTO_START_WATCH`) are on. Runs
+/// a true-up reindex first (see the "True-up" comment inline below) so the
+/// watcher starts from a caught-up baseline instead of only ever reacting
+/// to changes from this point forward.
 ///
 /// Scoped to just `startup_dir` -- an earlier version swept the whole
 /// project registry plus the groups dir (reusing `collect_reindex_targets`,
@@ -97,6 +100,25 @@ pub fn start_daemon_watcher_for_startup_dir(startup_dir: Option<&Path>) {
     }
 
     let path_str = dir.to_string_lossy().to_string();
+
+    // True-up: catch drift accumulated while nothing was watching this
+    // project (MCP was down, or a prior watcher exceeded its restart
+    // budget and gave up) before starting to watch -- the watcher itself
+    // only reacts to *future* filesystem events, so without this a file
+    // added or changed during that gap stays invisible until something
+    // else happens to touch it again. Reuses the same tool a client would
+    // call to reindex by hand: incremental (mtime/hash based) under the
+    // hood, so this is near-free when nothing drifted and does real work
+    // only when it did. Errors are logged, not propagated -- a failed
+    // true-up must not block starting the watcher below.
+    match crate::tools::index::tool_index_project(&serde_json::json!({ "path": path_str })) {
+        Ok(msg) => crate::mcp_log("INFO", &format!("Startup true-up index: {path_str}: {msg}")),
+        Err(e) => crate::mcp_log(
+            "WARN",
+            &format!("Startup true-up index failed for {path_str}: {e}"),
+        ),
+    }
+
     if let Some(msg) = crate::tools::watch::auto_start_watch(&path_str) {
         crate::mcp_log("INFO", &format!("Startup watch: {path_str}: {msg}"));
     }
