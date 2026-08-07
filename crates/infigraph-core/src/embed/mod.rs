@@ -140,6 +140,22 @@ pub fn rich_symbol_text_full(
     text
 }
 
+/// FNV-1a 64-bit. Used as the embedding-input fingerprint in v3 files.
+/// 0 is reserved to mean "unknown", so a genuine hash of 0 maps to 1
+/// (worst case: that one symbol always re-embeds).
+pub fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    if h == 0 {
+        1
+    } else {
+        h
+    }
+}
+
 /// Extract meaningful context from a file path by filtering out common directory names.
 pub fn path_to_context(file: &str) -> String {
     let parts: Vec<&str> = file.split('/').collect();
@@ -402,7 +418,7 @@ pub fn best_embedder() -> Box<dyn EmbedProvider> {
 /// file the way `load_embeddings` does. Handles both the current
 /// `[magic:4][version:1][count:4]...` format and the legacy headerless
 /// `[count:4]...` format that `load_embeddings` also falls back to, via the
-/// shared `embeddings_count_offset` helper — so an unrecognized version byte
+/// shared `embeddings_header` helper — so an unrecognized version byte
 /// is rejected the same way `load_embeddings` rejects it, rather than being
 /// silently misread as a count.
 pub fn embedding_count(root: &Path) -> usize {
@@ -417,7 +433,7 @@ pub fn embedding_count(root: &Path) -> usize {
     }
 
     // Only new-format files need the 5th (version) byte to decide the count
-    // offset; read it opportunistically so `embeddings_count_offset` can see
+    // offset; read it opportunistically so `embeddings_header` can see
     // the full header when present.
     let mut header = [0u8; 5];
     header[0..4].copy_from_slice(&buf4);
@@ -425,8 +441,8 @@ pub fn embedding_count(root: &Path) -> usize {
         return 0;
     }
 
-    let count_offset = match embeddings_count_offset(&header) {
-        Ok(offset) => offset,
+    let count_offset = match embeddings_header(&header) {
+        Ok((offset, _version)) => offset,
         // Recognized magic but unsupported/corrupt version — treat like any
         // other unreadable file rather than silently misreading the count.
         Err(_) => return 0,
@@ -446,10 +462,12 @@ pub fn embedding_count(root: &Path) -> usize {
 
 const EMBEDDINGS_MAGIC: [u8; 4] = *b"IGE1";
 const EMBEDDINGS_FORMAT_VERSION: u8 = 2;
+/// v3 = v2 plus a per-entry FNV-1a input-text hash for embed-skip.
+pub const EMBEDDINGS_FORMAT_VERSION_HASHED: u8 = 3;
 
 /// Single source of truth for the embeddings.bin header layout: given the
-/// leading bytes of the file (at least 5, when available), determine the
-/// byte offset of the `count:u32` field.
+/// leading bytes (at least 5, when available), returns (count_offset, version).
+/// Legacy headerless files report version 0.
 ///
 /// New-format files begin with `EMBEDDINGS_MAGIC` (4 bytes) followed by a
 /// 1-byte version, placing `count` at offset 5. Legacy pre-header files
@@ -457,18 +475,18 @@ const EMBEDDINGS_FORMAT_VERSION: u8 = 2;
 /// call this so the offset arithmetic and version check live in one place.
 ///
 /// Returns an error if a new-format magic is present but the version byte
-/// doesn't match `EMBEDDINGS_FORMAT_VERSION` — callers should treat that as
+/// isn't a recognized format version — callers should treat that as
 /// corrupt/unsupported input, not fall back to treating it as legacy.
-fn embeddings_count_offset(header: &[u8]) -> Result<usize> {
+fn embeddings_header(header: &[u8]) -> Result<(usize, u8)> {
     if header.len() >= 5 && header[0..4] == EMBEDDINGS_MAGIC {
         let version = header[4];
         anyhow::ensure!(
-            version == EMBEDDINGS_FORMAT_VERSION,
+            version == EMBEDDINGS_FORMAT_VERSION || version == EMBEDDINGS_FORMAT_VERSION_HASHED,
             "unsupported embeddings format version: {version}"
         );
-        Ok(5)
+        Ok((5, version))
     } else {
-        Ok(0)
+        Ok((0, 0))
     }
 }
 
@@ -523,10 +541,75 @@ pub fn save_embeddings(path: &Path, embeddings: &[(String, Vec<f32>)]) -> Result
     Ok(())
 }
 
+/// Save symbol embeddings plus a per-entry input-text hash to a binary file
+/// (format version 3). Format: [magic:4][version:u8=3][count:u32] then per
+/// entry [id_len:u32][id_bytes][input_hash:u64][dim:u32][f32*dim], followed
+/// by the same trailing checksum scheme as `save_embeddings`. The hash lets
+/// callers skip re-embedding symbols whose source text hasn't changed.
+pub fn save_embeddings_hashed(path: &Path, entries: &[(String, Vec<f32>, u64)]) -> Result<()> {
+    use std::hash::Hasher;
+    let tmp_path = atomic_tmp_path(path);
+    {
+        let file = std::fs::File::create(&tmp_path).context("create temp embeddings file")?;
+        let mut w = BufWriter::new(file);
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+
+        w.write_all(&EMBEDDINGS_MAGIC)?;
+        w.write_all(&[EMBEDDINGS_FORMAT_VERSION_HASHED])?;
+
+        // NOTE: see `save_embeddings` for why hashing must go through the
+        // raw, streaming-composable `Hasher::write` rather than `.hash()`.
+        let count_bytes = (entries.len() as u32).to_le_bytes();
+        w.write_all(&count_bytes)?;
+        hasher.write(&count_bytes);
+
+        for (id, vec, h) in entries {
+            let id_bytes = id.as_bytes();
+            let id_len_bytes = (id_bytes.len() as u32).to_le_bytes();
+            w.write_all(&id_len_bytes)?;
+            hasher.write(&id_len_bytes);
+            w.write_all(id_bytes)?;
+            hasher.write(id_bytes);
+            let hash_bytes = h.to_le_bytes();
+            w.write_all(&hash_bytes)?;
+            hasher.write(&hash_bytes);
+            let dim_bytes = (vec.len() as u32).to_le_bytes();
+            w.write_all(&dim_bytes)?;
+            hasher.write(&dim_bytes);
+            for &v in vec {
+                let f_bytes = v.to_le_bytes();
+                w.write_all(&f_bytes)?;
+                hasher.write(&f_bytes);
+            }
+        }
+
+        w.write_all(&hasher.finish().to_le_bytes())?;
+        w.flush().context("flush temp embeddings file")?;
+    }
+    std::fs::rename(&tmp_path, path).context("atomically replace embeddings file")?;
+    invalidate_embeddings_cache();
+    Ok(())
+}
+
+/// Load symbol embeddings (with input-text hashes) from a binary file using
+/// memory-mapped I/O. Transparently reads the current header+checksum
+/// format (v2 or v3) and the legacy headerless format written before this
+/// format existed. v2/legacy entries carry an "unknown" hash of 0.
+pub fn load_embeddings_hashed(path: &Path) -> Result<Vec<(String, Vec<f32>, u64)>> {
+    load_embeddings_impl(path)
+}
+
 /// Load symbol embeddings from a binary file using memory-mapped I/O.
 /// Transparently reads both the current header+checksum format and the
 /// legacy headerless format written before this format existed.
 pub fn load_embeddings(path: &Path) -> Result<Vec<(String, Vec<f32>)>> {
+    Ok(load_embeddings_impl(path)?
+        .into_iter()
+        .map(|(id, v, _)| (id, v))
+        .collect())
+}
+
+fn load_embeddings_impl(path: &Path) -> Result<Vec<(String, Vec<f32>, u64)>> {
     use std::hash::Hasher;
     let file = std::fs::File::open(path).context("open embeddings file")?;
     let mmap = unsafe { memmap2::Mmap::map(&file) }.context("mmap embeddings file")?;
@@ -535,7 +618,7 @@ pub fn load_embeddings(path: &Path) -> Result<Vec<(String, Vec<f32>)>> {
     anyhow::ensure!(data.len() >= 4, "embeddings file too small");
 
     let header_len = data.len().min(5);
-    let count_offset = embeddings_count_offset(&data[..header_len])?;
+    let (count_offset, version) = embeddings_header(&data[..header_len])?;
 
     let payload = if count_offset > 0 {
         // New format: everything after the magic+version header is the
@@ -577,6 +660,14 @@ pub fn load_embeddings(path: &Path) -> Result<Vec<(String, Vec<f32>)>> {
             .context("invalid utf8 in embedding id")?
             .to_string();
         pos += id_len;
+        let input_hash = if version == EMBEDDINGS_FORMAT_VERSION_HASHED {
+            anyhow::ensure!(pos + 8 <= payload.len(), "truncated embeddings file");
+            let h = u64::from_le_bytes(payload[pos..pos + 8].try_into().unwrap());
+            pos += 8;
+            h
+        } else {
+            0
+        };
         anyhow::ensure!(pos + 4 <= payload.len(), "truncated embeddings file");
         let dim = u32::from_le_bytes(payload[pos..pos + 4].try_into().unwrap()) as usize;
         pos += 4;
@@ -590,7 +681,7 @@ pub fn load_embeddings(path: &Path) -> Result<Vec<(String, Vec<f32>)>> {
             .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
             .collect();
         pos += float_bytes;
-        result.push((id, vec));
+        result.push((id, vec, input_hash));
     }
 
     Ok(result)
