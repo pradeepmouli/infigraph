@@ -38,11 +38,21 @@ pub fn tool_trace_callers(args: &Value) -> Result<String> {
         .get("symbol_id")
         .and_then(|s| s.as_str())
         .context("missing 'symbol_id'")?;
+    // Default true (backward compatible); set false to exclude test callers.
+    let include_tests = args
+        .get("include_tests")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
 
     let backend = prism.backend().context("not initialized")?;
-    let callers = backend.callers_of(symbol_id)?;
+    let callers = backend.callers_of_filtered(symbol_id, include_tests)?;
     if callers.is_empty() {
-        return Ok(format!("No callers found for '{}'", symbol_id));
+        let suffix = if include_tests {
+            String::new()
+        } else {
+            " (excluding tests)".to_string()
+        };
+        return Ok(format!("No callers found for '{}'{}", symbol_id, suffix));
     }
     Ok(callers.join("\n"))
 }
@@ -53,11 +63,21 @@ pub fn tool_trace_callees(args: &Value) -> Result<String> {
         .get("symbol_id")
         .and_then(|s| s.as_str())
         .context("missing 'symbol_id'")?;
+    // Default true (backward compatible); set false to exclude test callees.
+    let include_tests = args
+        .get("include_tests")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
 
     let backend = prism.backend().context("not initialized")?;
-    let callees = backend.callees_of(symbol_id)?;
+    let callees = backend.callees_of_filtered(symbol_id, include_tests)?;
     if callees.is_empty() {
-        return Ok(format!("No callees found for '{}'", symbol_id));
+        let suffix = if include_tests {
+            String::new()
+        } else {
+            " (excluding tests)".to_string()
+        };
+        return Ok(format!("No callees found for '{}'{}", symbol_id, suffix));
     }
     Ok(callees.join("\n"))
 }

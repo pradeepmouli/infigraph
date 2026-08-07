@@ -6,7 +6,7 @@ mod kuzu_backend;
 mod neo4j_backend;
 pub mod parquet_loader;
 mod queries;
-mod schema;
+pub(crate) mod schema;
 mod session_store;
 pub mod store;
 mod store_bench;

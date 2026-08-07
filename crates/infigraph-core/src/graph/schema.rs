@@ -10,6 +10,17 @@ pub const MIGRATIONS: &[&str] = &[
     "CREATE REL TABLE IF NOT EXISTS HAS_CONFIG(FROM Symbol TO ConfigBinding)",
     "CREATE REL TABLE IF NOT EXISTS RESOLVES_TO(FROM Symbol TO Symbol, mechanism STRING, config_source STRING)",
     "CREATE REL TABLE IF NOT EXISTS TAINT_FLOW(FROM Symbol TO Symbol, source_kind STRING, sink_kind STRING, path STRING)",
+    // AIF3X-331 #16: INJECTS_DEPENDENCY/REGISTERS_MIDDLEWARE start as
+    // language-plugin custom edges (see python_pack's CustomEdgeDef) but
+    // callers_of() now names them explicitly, so they must always exist — a
+    // MATCH against an uncreated Kuzu rel table is a binder error, not an
+    // empty result, so this can't be left to ensure_custom_edge_table's lazy
+    // on-write creation. Named INJECTS_DEPENDENCY, not DEPENDS_ON, because
+    // DEPENDS_ON already exists below as the unrelated Module->Dependency
+    // package-manager-dependency table (a name collision on a Symbol->Symbol
+    // table of the same name would clash with that existing table's schema).
+    "CREATE REL TABLE IF NOT EXISTS INJECTS_DEPENDENCY(FROM Symbol TO Symbol)",
+    "CREATE REL TABLE IF NOT EXISTS REGISTERS_MIDDLEWARE(FROM Symbol TO Symbol)",
 ];
 
 /// Kuzu schema DDL for the infigraph graph.

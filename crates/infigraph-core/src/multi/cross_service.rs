@@ -8,7 +8,7 @@ use crate::graph::CrossServiceEdgeCandidate;
 use crate::lang::LanguageRegistry;
 use crate::Infigraph;
 
-use super::{Contract, ContractKind, Registry};
+use super::{ContractKind, Registry};
 
 /// A cross-service dependency: service A calls service B at a specific route.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -506,6 +506,123 @@ pub fn detect_cross_service_deps(
                             url_found: mcp_url.clone(),
                         });
                     }
+                }
+            }
+        }
+    }
+
+    // gRPC cross-service detection (AIF3X-331 #21 / #21c). A producer defines a
+    // service in a .proto (GrpcService contracts, keyed here by service NAME →
+    // owning repo). A consumer references the generated stub by naming
+    // convention ({Service}Stub / {Service}Client / {Service}Grpc /
+    // {service}_pb2_grpc) — protoc's output names ARE the contract.
+    //
+    // Detection is SOURCE-SCAN based (not a graph query): a stub import/usage
+    // does not survive as a queryable Symbol node (external imports are dropped
+    // at index time), so we scan consumer source text exactly like the HTTP
+    // consumer scan above, then resolve each hit line to its enclosing symbol.
+    {
+        // service-name → owning service, from GrpcService contracts. Parse the
+        // "/Service/Rpc" path to recover the service name.
+        let mut grpc_owner: HashMap<String, String> = HashMap::new();
+        for contract in &group.contracts {
+            if contract.kind == ContractKind::GrpcService {
+                if let Some(svc) = contract.path.trim_start_matches('/').split('/').next() {
+                    if !svc.is_empty() {
+                        grpc_owner
+                            .entry(svc.to_string())
+                            .or_insert_with(|| contract.service.clone());
+                    }
+                }
+            }
+        }
+
+        if !grpc_owner.is_empty() {
+            for repo_name in &group.repos {
+                let entry = match registry.repos.get(repo_name) {
+                    Some(e) => e.clone(),
+                    None => continue,
+                };
+
+                // A consumer repo shouldn't be scanned for services it owns.
+                let services_to_find: Vec<String> = grpc_owner
+                    .iter()
+                    .filter(|(_, owner)| *owner != repo_name)
+                    .map(|(svc, _)| svc.clone())
+                    .collect();
+                let stub_hits = scan_source_for_grpc_stubs(&entry.path, &services_to_find);
+                if stub_hits.is_empty() {
+                    continue;
+                }
+
+                // Resolve line hints to enclosing symbol ids via the repo graph,
+                // same as the HTTP scan. Namespaced (remote) graphs store
+                // `{ns}/{relative}` file paths, so prefix the lookup to match.
+                let mut prism = match Infigraph::open(&entry.path, LanguageRegistry::new()) {
+                    Ok(p) => p,
+                    Err(_) => continue,
+                };
+                if prism.init().is_err() {
+                    continue;
+                }
+                let backend = match prism.backend() {
+                    Some(b) => b,
+                    None => continue,
+                };
+                let ns = crate::multi::remote_namespace(&group.org, repo_name);
+
+                for (file, line_hint, svc_name) in stub_hits {
+                    let owner = match grpc_owner.get(&svc_name) {
+                        Some(o) => o.clone(),
+                        None => continue,
+                    };
+                    let caller_id = if let Some(stripped) = line_hint.strip_prefix("line:") {
+                        let line_num: i32 = stripped.parse().unwrap_or(0);
+                        let lookup_file = match &ns {
+                            Some(n) => format!("{}/{}", n, file),
+                            None => file.clone(),
+                        };
+                        let escaped_file = lookup_file.replace('\'', "\\'");
+                        let q = format!(
+                            "MATCH (s:Symbol) WHERE s.file = '{}' AND s.start_line <= {} AND s.end_line >= {} RETURN s.id ORDER BY (s.end_line - s.start_line) ASC LIMIT 1",
+                            escaped_file, line_num, line_num
+                        );
+                        backend
+                            .raw_query(&q)
+                            .ok()
+                            .and_then(|rows| rows.into_iter().next())
+                            .and_then(|row| row.into_iter().next())
+                            // A stub imported at module level (e.g. line 1) sits
+                            // outside any symbol's line range, so the enclosing-
+                            // symbol lookup misses. Fall back to any symbol in the
+                            // file so the edge attaches to a REAL node (same policy
+                            // as the SharedPackage import scan) — a synthetic
+                            // "file:line" id would match no node and silently drop
+                            // the CALLS_SERVICE edge at link time.
+                            .or_else(|| {
+                                let fq = format!(
+                                    "MATCH (s:Symbol) WHERE s.file = '{}' RETURN s.id ORDER BY s.start_line ASC LIMIT 1",
+                                    escaped_file
+                                );
+                                backend
+                                    .raw_query(&fq)
+                                    .ok()
+                                    .and_then(|rows| rows.into_iter().next())
+                                    .and_then(|row| row.into_iter().next())
+                            })
+                            .unwrap_or_else(|| format!("{}:{}", file, line_hint))
+                    } else {
+                        line_hint.clone()
+                    };
+                    deps.push(CrossServiceDep {
+                        caller_service: repo_name.clone(),
+                        caller_file: file,
+                        caller_symbol: caller_id,
+                        target_service: owner,
+                        target_method: "GRPC".to_string(),
+                        target_path: format!("/{svc_name}"),
+                        url_found: format!("grpc://{svc_name}"),
+                    });
                 }
             }
         }
@@ -1341,6 +1458,170 @@ fn walk_for_contracts(
     }
 }
 
+/// Scan source files for gRPC client stub references (AIF3X-331 #21c).
+///
+/// A gRPC client references a generated stub by naming convention — protoc's
+/// output names ARE the contract: `{Service}Stub`, `{Service}Client`,
+/// `{Service}Grpc`, or the Python module `{service}_pb2_grpc`. These references
+/// (imports, constructor calls, type annotations) do NOT survive as queryable
+/// Symbol nodes — external imports are discarded at index time — so unlike the
+/// producer side, clients must be found by scanning source text, exactly like
+/// the HTTP consumer scan (scan_source_for_urls / scan_source_for_contracts).
+///
+/// `services` is the set of gRPC service NAMES known from GrpcService contracts.
+/// Returns (relative_file, "line:N" hint, matched_service_name) per hit; the
+/// caller resolves the line hint to the enclosing symbol id.
+fn scan_source_for_grpc_stubs(root: &Path, services: &[String]) -> Vec<(String, String, String)> {
+    if services.is_empty() {
+        return Vec::new();
+    }
+    const SKIP_DIRS: &[&str] = &[
+        ".infigraph",
+        ".git",
+        "node_modules",
+        "target",
+        "build",
+        "dist",
+        "__pycache__",
+        ".venv",
+    ];
+    // Per-language stub tokens (all lower-cased; the scan lower-cases each line).
+    // Each is a self-contained substring that only appears at a real client
+    // call/type site for the given service — the protoc/tonic/grpc codegen
+    // naming IS the contract. Ordered roughly specific→general; the scan records
+    // one hit per (file, service) so overlap is harmless. See tasks #30-34.
+    let mut token_to_service: Vec<(String, String)> = Vec::new();
+    for svc in services {
+        let snake = super::grpc::to_snake_case(svc); // UserService -> user_service
+        let lc = svc.to_lowercase();
+        let toks = [
+            // Python (grpcio): generated module + stub class. #30
+            format!("{snake}_pb2_grpc"),
+            format!("{lc}stub"), // {Svc}Stub — also Java plain stub
+            // Go (protoc-gen-go-grpc): New{Svc}Client constructor + {Svc}Client
+            // interface + the server-registration helper. #31
+            format!("new{lc}client"),
+            format!("{lc}client"), // also TS @grpc/grpc-js `new {Svc}Client(...)`
+            format!("register{lc}server"),
+            // Java (grpc-java): {Svc}Grpc holder + typed stub classes. #32
+            format!("{lc}grpc"),
+            format!("{lc}blockingstub"),
+            format!("{lc}futurestub"),
+            // Rust (tonic): {snake}_client module + {Svc}Client type. #34
+            format!("{snake}_client"),
+            // Python server registration (a service reference, not a client, but
+            // still a cross-service coupling worth surfacing). The generated
+            // helper uses the PascalCase service name verbatim
+            // (add_UserServiceServicer_to_server), not snake_case. #30
+            format!("add_{lc}servicer_to_server"),
+        ];
+        for t in toks {
+            token_to_service.push((t, svc.clone()));
+        }
+    }
+    // connect-es / connect-web (TS/JS) construct a client from the SERVICE symbol
+    // itself: `createPromiseClient(UserService, transport)` / `createClient(...)`.
+    // There's no {Svc}Client token, so match the factory call AND the service
+    // name on the same line (handled specially in the walker via this marker).
+    let connect_markers: Vec<(String, String)> = services
+        .iter()
+        .map(|svc| (svc.to_lowercase(), svc.clone()))
+        .collect();
+    let mut results = Vec::new();
+    walk_for_grpc_stubs(
+        root,
+        root,
+        SKIP_DIRS,
+        &token_to_service,
+        &connect_markers,
+        &mut results,
+    );
+    results
+}
+
+fn walk_for_grpc_stubs(
+    base: &Path,
+    dir: &Path,
+    skip: &[&str],
+    token_to_service: &[(String, String)],
+    connect_markers: &[(String, String)],
+    results: &mut Vec<(String, String, String)>,
+) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+
+        if path.is_dir() {
+            if !skip.contains(&name_str.as_ref()) && !name_str.starts_with('.') {
+                walk_for_grpc_stubs(
+                    base,
+                    &path,
+                    skip,
+                    token_to_service,
+                    connect_markers,
+                    results,
+                );
+            }
+        } else if path.is_file() {
+            // Only scan real source; skip .proto (that's the producer) and
+            // test/doc files (consistent with the HTTP scanners).
+            let rel = path
+                .strip_prefix(base)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            if rel.ends_with(".proto") || is_test_or_doc_file(&rel) {
+                continue;
+            }
+            let content = match std::fs::read_to_string(&path) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            // One hit per (file, service) — first reference line is enough to
+            // attach the dependency; dedup keeps the earliest.
+            let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+            for (line_num, line) in content.lines().enumerate() {
+                let line_lower = line.to_lowercase();
+                for (token, svc) in token_to_service {
+                    if seen.contains(svc.as_str()) {
+                        continue;
+                    }
+                    if line_lower.contains(token.as_str()) {
+                        seen.insert(svc.as_str());
+                        results.push((rel.clone(), format!("line:{}", line_num + 1), svc.clone()));
+                    }
+                }
+                // connect-es/connect-web: createPromiseClient(Svc, ...) /
+                // createClient(Svc, ...) — the client is built from the service
+                // symbol, so require both the factory call and the service name
+                // on the same line (bare service name alone is too broad). #33
+                let is_connect_call = line_lower.contains("createpromiseclient")
+                    || line_lower.contains("createclient");
+                if is_connect_call {
+                    for (svc_lc, svc) in connect_markers {
+                        if seen.contains(svc.as_str()) {
+                            continue;
+                        }
+                        if line_lower.contains(svc_lc.as_str()) {
+                            seen.insert(svc.as_str());
+                            results.push((
+                                rel.clone(),
+                                format!("line:{}", line_num + 1),
+                                svc.clone(),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Scan source files for import statements matching package search terms.
 /// Returns (relative_file, line_number, import_text).
 fn scan_source_for_package_imports(
@@ -1538,78 +1819,6 @@ fn extract_mcp_topic_from_url(url: &str) -> Option<String> {
 
 /// Detect cross-repo package dependencies within a group.
 /// If repo B depends on a package that repo A publishes, returns a Contract linking them.
-pub fn detect_shared_package_deps(
-    registry: &Registry,
-    group_name: &str,
-    // Kept for call-site compatibility — this function only queries the graph via
-    // `raw_query`, never parses source, so an empty `LanguageRegistry` is used instead.
-    _build_registry: &impl Fn() -> Result<LanguageRegistry>,
-) -> Result<Vec<Contract>> {
-    let group = registry
-        .groups
-        .get(group_name)
-        .context(format!("group '{}' not found", group_name))?;
-
-    // Build map: published_package_name → repo_name
-    let mut publishers: HashMap<String, String> = HashMap::new();
-    for repo_name in &group.repos {
-        let entry = match registry.repos.get(repo_name) {
-            Some(e) => e,
-            None => continue,
-        };
-        if let Some(pkg_name) = read_published_package_name(&entry.path) {
-            publishers.insert(pkg_name, repo_name.clone());
-        }
-    }
-
-    // For each repo, read its Dependency nodes and check against publishers
-    let mut contracts = Vec::new();
-    let mut seen: HashSet<(String, String)> = HashSet::new();
-
-    for repo_name in &group.repos {
-        let entry = match registry.repos.get(repo_name) {
-            Some(e) => e.clone(),
-            None => continue,
-        };
-
-        // Only queries the graph below — empty registry, no parsing needed.
-        let mut prism = Infigraph::open(&entry.path, LanguageRegistry::new())?;
-        prism.init()?;
-
-        let backend = match prism.backend() {
-            Some(b) => b,
-            None => continue,
-        };
-
-        let dep_rows = backend
-            .raw_query("MATCH (d:Dependency) RETURN d.name, d.version")
-            .unwrap_or_default();
-
-        for row in &dep_rows {
-            if row.is_empty() {
-                continue;
-            }
-            let dep_name = &row[0];
-            if let Some(publisher_repo) = publishers.get(dep_name) {
-                if publisher_repo != repo_name
-                    && seen.insert((repo_name.clone(), publisher_repo.clone()))
-                {
-                    contracts.push(Contract {
-                        kind: ContractKind::SharedPackage,
-                        service: publisher_repo.clone(),
-                        method: "package".to_string(),
-                        path: dep_name.clone(),
-                        symbol_id: format!("pkg::{}::{}", publisher_repo, dep_name),
-                        file: String::new(),
-                    });
-                }
-            }
-        }
-    }
-
-    Ok(contracts)
-}
-
 /// Read the published package name from a repo's manifest file.
 pub fn read_published_package_name(root: &Path) -> Option<String> {
     // Python: pyproject.toml

@@ -45,6 +45,7 @@ pub fn resolve_calls_incremental(
 
     let mut stats = resolve_with_map(&conn, extractions, &symbol_map, learned_store, &lock)?;
     stats.inherits_resolved = resolve_inherits(&conn, extractions, &symbol_map, &lock)?;
+    resolve_custom_edges(&conn, extractions, &symbol_map, &lock)?;
     Ok(stats)
 }
 
@@ -84,9 +85,102 @@ pub fn resolve_calls(
 
     let mut stats = resolve_with_map(&conn, extractions, &symbol_map, learned_store, &lock)?;
     stats.inherits_resolved = resolve_inherits(&conn, extractions, &symbol_map, &lock)?;
+    resolve_custom_edges(&conn, extractions, &symbol_map, &lock)?;
     Ok(stats)
 }
 
+/// Cross-file resolution for `RelationKind::Custom` edges (AIF3X-331 #16:
+/// INJECTS_DEPENDENCY, REGISTERS_MIDDLEWARE), mirroring what `resolve_with_map`
+/// does for CALLS. Extraction always scopes a custom edge's target_id to its
+/// own file (`{file}::{name}`) since it has no cross-file symbol table to
+/// consult at parse time — same as a raw dangling CALLS target. Without this
+/// pass, a registration referencing an imported symbol (e.g. `Depends(fn)`
+/// where `fn` lives in another file) points at a target_id that never exists
+/// in the graph, so the edge silently vanishes at write time (upsert_all_bulk's
+/// `MATCH (a),(b) WHERE ... CREATE` finds nothing to attach to).
+///
+/// Caller must hold WriteLock. Each edge kind is resolved and written to its
+/// own rel table (never CALLS) to keep call-graph semantics unchanged.
+fn resolve_custom_edges(
+    conn: &kuzu::Connection<'_>,
+    extractions: &[FileExtraction],
+    symbol_map: &HashMap<String, Vec<(String, String, String)>>,
+    _witness: &WriteLock,
+) -> Result<()> {
+    let known_ids: std::collections::HashSet<&str> = symbol_map
+        .values()
+        .flat_map(|v| v.iter().map(|(id, _, _)| id.as_str()))
+        .collect();
+
+    let mut by_edge_kind: HashMap<&str, Vec<(String, String)>> = HashMap::new();
+
+    for ext in extractions {
+        for rel in &ext.relations {
+            let RelationKind::Custom(edge_name) = &rel.kind else {
+                continue;
+            };
+
+            let target_name = rel.target_id.rsplit("::").next().unwrap_or(&rel.target_id);
+            if known_ids.contains(rel.target_id.as_str()) {
+                // Already resolves (e.g. local-file target) — write as-is.
+                by_edge_kind
+                    .entry(edge_name.as_str())
+                    .or_default()
+                    .push((rel.source_id.clone(), rel.target_id.clone()));
+                continue;
+            }
+
+            // Cross-file: look up by bare name in the global symbol table,
+            // same single-candidate-only policy resolve_with_map uses before
+            // falling back to import-scope disambiguation — collision
+            // handling across multiple same-named candidates is intentionally
+            // out of scope for this pass (see AIF3X-331 #16 design doc).
+            if let Some(candidates) = symbol_map.get(target_name) {
+                if candidates.len() == 1 {
+                    by_edge_kind
+                        .entry(edge_name.as_str())
+                        .or_default()
+                        .push((rel.source_id.clone(), candidates[0].0.clone()));
+                }
+            }
+        }
+    }
+
+    for (edge_name, pairs) in &by_edge_kind {
+        if pairs.is_empty() {
+            continue;
+        }
+        let mut seen: std::collections::HashSet<&(String, String)> =
+            std::collections::HashSet::new();
+        let valid: Vec<&(String, String)> = pairs
+            .iter()
+            .filter(|(src, tgt)| {
+                known_ids.contains(src.as_str()) && known_ids.contains(tgt.as_str())
+            })
+            .filter(|pair| seen.insert(pair))
+            .collect();
+        if valid.is_empty() {
+            continue;
+        }
+        crate::graph::schema::ensure_custom_edge_table(conn, edge_name)?;
+        const CHUNK_SIZE: usize = 500;
+        for chunk in valid.chunks(CHUNK_SIZE) {
+            let pair_list: Vec<String> = chunk
+                .iter()
+                .map(|(a, b)| format!("{{a: '{}', b: '{}'}}", escape(a), escape(b)))
+                .collect();
+            let _ = conn.query(&format!(
+                "UNWIND [{}] AS p MATCH (a:Symbol), (b:Symbol) WHERE a.id = p.a AND b.id = p.b CREATE (a)-[:{}]->(b)",
+                pair_list.join(", "),
+                edge_name
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// Caller must hold WriteLock.
 fn resolve_with_map(
     conn: &kuzu::Connection<'_>,
     extractions: &[FileExtraction],
@@ -160,11 +254,13 @@ fn resolve_with_map(
                 .iter()
                 .filter(|r| r.kind == RelationKind::Imports)
                 .map(|r| {
-                    let raw = r
-                        .target_id
-                        .rsplit(['/', '\\', '.'])
-                        .next()
-                        .unwrap_or(&r.target_id);
+                    // target_id is "{file}::{module}" — strip the file prefix
+                    // before taking the last dotted segment, otherwise a
+                    // bare (dot-free) module name like a relative import's
+                    // falls back to splitting the file's own ".py" extension
+                    // instead (e.g. "a/b.py::risk_service" -> "py::risk_service").
+                    let module = r.target_id.rsplit("::").next().unwrap_or(&r.target_id);
+                    let raw = module.rsplit(['/', '\\', '.']).next().unwrap_or(module);
                     raw.to_lowercase()
                 })
                 .collect();
@@ -358,11 +454,17 @@ fn resolve_with_map(
             })
             .collect();
 
+        // file_name_to_ids can carry the same id twice for one (file, name) key
+        // (populated once from extractions and once from symbol_map), which
+        // would otherwise fan a single call site out into duplicate CALLS edges.
+        let mut seen_pairs: std::collections::HashSet<&(String, String)> =
+            std::collections::HashSet::new();
         let valid_pairs: Vec<&(String, String)> = fixed_pairs
             .iter()
             .filter(|(src, tgt)| {
                 known_ids.contains(src.as_str()) && known_ids.contains(tgt.as_str())
             })
+            .filter(|pair| seen_pairs.insert(pair))
             .collect();
 
         let pairs: Vec<(String, String)> = valid_pairs

@@ -1919,6 +1919,9 @@ mod tests {
 
     #[test]
     fn test_compress_pipeline_safe_normal_path() {
+        let _g = crate::session_context::SESSION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         crate::session_context::reset_session();
         force_compress_panic(false);
         crate::session_context::record_tool_call("search", false);
@@ -2640,6 +2643,16 @@ Callees (3):
 
     #[test]
     fn test_prose_preserves_headings() {
+        // These tests assert the extractive (heuristic) prose path. Serialize
+        // against other tests that mutate the global SESSION and reset it so the
+        // ml_compression mode is the default "extractive", not a "kompress" mode
+        // leaked in from a concurrent test (which would take the ML branch and
+        // drop headings). Without this, the test flakes only inside the full
+        // suite, never when run alone.
+        let _g = crate::session_context::SESSION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::session_context::reset_session();
         let md = format!(
             "# Main Title\n\n{}\n\n## Section Two\n\n- item one\n- item two\n",
             "The quick brown fox jumps over the lazy dog. ".repeat(20)
@@ -2653,6 +2666,11 @@ Callees (3):
 
     #[test]
     fn test_prose_preserves_code_blocks() {
+        // See test_prose_preserves_headings: pin the extractive path.
+        let _g = crate::session_context::SESSION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::session_context::reset_session();
         let md = format!(
             "{}\n\n```rust\nfn main() {{}}\n```\n\n{}",
             "This is important context about the code. ".repeat(15),

@@ -22,12 +22,15 @@ pub fn extract_grpc_contracts(backend: &dyn GraphBackend) -> Vec<super::Contract
         }
         let svc_name = &svc_row[0];
         let svc_file = &svc_row[1];
+        let svc_id = &svc_row[2];
 
-        // Find RPC methods for this service
+        // Find RPC methods for this service. Methods store their parent as the
+        // service's qualified id ("{file}::{ServiceName}", set via find_parent_class),
+        // NOT the bare service name — match on the id.
         let rpc_query = format!(
             "MATCH (s:Symbol) WHERE s.kind = 'Method' AND s.file = '{}' AND s.parent = '{}' RETURN s.name, s.id",
             svc_file.replace('\'', "\\'"),
-            svc_name.replace('\'', "\\'"),
+            svc_id.replace('\'', "\\'"),
         );
         if let Ok(rpcs) = backend.raw_query(&rpc_query) {
             for rpc in &rpcs {
@@ -108,7 +111,7 @@ pub fn detect_grpc_clients(
 }
 
 /// Convert PascalCase/camelCase to snake_case for Python gRPC pattern matching.
-fn to_snake_case(s: &str) -> String {
+pub(crate) fn to_snake_case(s: &str) -> String {
     let mut result = String::new();
     for (i, ch) in s.chars().enumerate() {
         if ch.is_uppercase() && i > 0 {

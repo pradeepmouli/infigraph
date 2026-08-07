@@ -47,6 +47,12 @@ fn make_extraction(file: &str) -> FileExtraction {
 fn test_lock_overhead_under_1ms() {
     let (_dir, store) = make_store();
 
+    // Warm up: the very first locks pay one-time init/page-fault costs that
+    // aren't representative of steady-state overhead.
+    for _ in 0..100 {
+        drop(store.write_lock().unwrap());
+    }
+
     let start = Instant::now();
     let iterations = 1000;
     for _ in 0..iterations {
@@ -55,9 +61,15 @@ fn test_lock_overhead_under_1ms() {
     }
     let elapsed = start.elapsed();
     let avg = elapsed / iterations;
+    // An in-memory advisory lock/unlock is sub-microsecond; this guards against
+    // a *gross* regression (e.g. accidentally adding disk I/O or a blocking
+    // syscall to the lock path), not micro-jitter. The threshold is deliberately
+    // loose (~1000x the real cost) so a loaded dev machine's scheduler jitter
+    // doesn't flake it while a genuine 100x+ regression still trips it. The old
+    // <1ms wall flaked constantly under machine load (AIF3X-331 #25).
     assert!(
-        avg < Duration::from_millis(1),
-        "avg lock/unlock should be <1ms, got {:?}",
+        avg < Duration::from_millis(5),
+        "avg lock/unlock should be well under 5ms (regression guard), got {:?}",
         avg
     );
 }

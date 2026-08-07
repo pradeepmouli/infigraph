@@ -128,6 +128,135 @@ fn test_extraction_smoke_python() {
     );
 }
 
+/// Regression test: `from .foo import bar` / `from ..pkg.foo import bar` parse
+/// module_name as `(relative_import (import_prefix) (dotted_name)?)`, not a
+/// bare `dotted_name` — the plain from-import query pattern doesn't match this
+/// shape at all, so every relative import silently produced zero Imports
+/// relations (AIF3X-331 #15: this broke import-scope-based CALLS resolution
+/// whenever a called function's name collided with another same-named symbol
+/// elsewhere in the codebase).
+#[test]
+fn test_extraction_python_relative_import_produces_imports_relation() {
+    use infigraph_core::model::RelationKind;
+
+    let registry = bundled_registry().unwrap();
+    let pack = registry.for_extension(".py").unwrap();
+
+    let cases = [
+        (
+            "relative_single_dot",
+            b"from .risk_service import do_input_risk_screening\n" as &[u8],
+        ),
+        (
+            "relative_double_dot",
+            b"from ..services.risk_service import do_input_risk_screening\n",
+        ),
+    ];
+
+    for (label, src) in cases {
+        let ext = infigraph_core::extract::extract_file("x.py", src, pack).unwrap();
+        let imports: Vec<_> = ext
+            .relations
+            .iter()
+            .filter(|r| r.kind == RelationKind::Imports)
+            .collect();
+        assert!(
+            imports.iter().any(|r| r.target_id.contains("risk_service")),
+            "{label}: expected an Imports relation targeting risk_service, got: {imports:?}"
+        );
+    }
+}
+
+/// AIF3X-331 #16: FastAPI `add_middleware(...)` registration should produce a
+/// REGISTERS_MIDDLEWARE custom edge naming the dispatch function (or the
+/// middleware class when there's no dispatch kwarg), so trace_callers on the
+/// registered symbol surfaces the registration site instead of only unit
+/// tests.
+#[test]
+fn test_extraction_python_add_middleware_produces_custom_edge() {
+    use infigraph_core::model::RelationKind;
+
+    let registry = bundled_registry().unwrap();
+    let pack = registry.for_extension(".py").unwrap();
+
+    let dispatch_src =
+        b"app.add_middleware(BaseHTTPMiddleware, dispatch=v3_logging_context_middleware)\n"
+            as &[u8];
+    let ext = infigraph_core::extract::extract_file("x.py", dispatch_src, pack).unwrap();
+    let custom: Vec<_> = ext
+        .relations
+        .iter()
+        .filter(|r| matches!(&r.kind, RelationKind::Custom(name) if name == "REGISTERS_MIDDLEWARE"))
+        .collect();
+    assert!(
+        custom
+            .iter()
+            .any(|r| r.target_id.contains("v3_logging_context_middleware")),
+        "expected REGISTERS_MIDDLEWARE targeting the dispatch fn, got: {custom:?}"
+    );
+
+    let class_only_src = b"app.add_middleware(RawContextMiddleware)\n" as &[u8];
+    let ext = infigraph_core::extract::extract_file("y.py", class_only_src, pack).unwrap();
+    let custom: Vec<_> = ext
+        .relations
+        .iter()
+        .filter(|r| matches!(&r.kind, RelationKind::Custom(name) if name == "REGISTERS_MIDDLEWARE"))
+        .collect();
+    assert!(
+        custom
+            .iter()
+            .any(|r| r.target_id.contains("RawContextMiddleware")),
+        "expected REGISTERS_MIDDLEWARE targeting the middleware class, got: {custom:?}"
+    );
+}
+
+/// AIF3X-331 #16: FastAPI `Depends(fn)` — both the parameter-default form and
+/// the router-level `dependencies=[Depends(fn)]` form — should produce an
+/// INJECTS_DEPENDENCY custom edge naming the dependency function.
+#[test]
+fn test_extraction_python_depends_produces_custom_edge() {
+    use infigraph_core::model::RelationKind;
+
+    let registry = bundled_registry().unwrap();
+    let pack = registry.for_extension(".py").unwrap();
+
+    let param_default_src =
+        b"async def handler(headers=Depends(validate_request_headers)):\n    pass\n" as &[u8];
+    let ext = infigraph_core::extract::extract_file("x.py", param_default_src, pack).unwrap();
+    let custom: Vec<_> = ext
+        .relations
+        .iter()
+        .filter(|r| matches!(&r.kind, RelationKind::Custom(name) if name == "INJECTS_DEPENDENCY"))
+        .collect();
+    assert!(
+        custom
+            .iter()
+            .any(|r| r.source_id.contains("handler")
+                && r.target_id.contains("validate_request_headers")),
+        "expected INJECTS_DEPENDENCY from handler to validate_request_headers, got: {custom:?}"
+    );
+
+    let router_deps_src = b"router = APIRouter(dependencies=[Depends(validate_request_headers), Depends(validate_model_in_config)])\n" as &[u8];
+    let ext = infigraph_core::extract::extract_file("y.py", router_deps_src, pack).unwrap();
+    let custom: Vec<_> = ext
+        .relations
+        .iter()
+        .filter(|r| matches!(&r.kind, RelationKind::Custom(name) if name == "INJECTS_DEPENDENCY"))
+        .collect();
+    assert!(
+        custom
+            .iter()
+            .any(|r| r.target_id.contains("validate_request_headers")),
+        "expected INJECTS_DEPENDENCY targeting validate_request_headers, got: {custom:?}"
+    );
+    assert!(
+        custom
+            .iter()
+            .any(|r| r.target_id.contains("validate_model_in_config")),
+        "expected INJECTS_DEPENDENCY targeting validate_model_in_config, got: {custom:?}"
+    );
+}
+
 #[test]
 fn test_extraction_smoke_rust() {
     let registry = bundled_registry().unwrap();

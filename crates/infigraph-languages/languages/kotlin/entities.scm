@@ -9,8 +9,50 @@
   (function_value_parameters) @func.params
   (type)? @func.return_type) @func.def
 
+; Annotated function declarations, bare (@GetMapping)
+(function_declaration
+  (modifiers
+    (annotation
+      (user_type
+        (identifier) @func.decorator)))
+  name: (identifier) @func.name) @func.def
+
+; Annotated function declarations, with arguments (@PostMapping("/x"))
+(function_declaration
+  (modifiers
+    (annotation
+      (constructor_invocation
+        (user_type
+          (identifier) @func.decorator)
+        (value_arguments
+          (value_argument
+            (string_literal
+              (string_content) @func.docstring))?))))
+  name: (identifier) @func.name) @func.def
+
 ; Class declarations
 (class_declaration
+  name: (identifier) @class.name) @class.def
+
+; Annotated class declarations, bare (@RestController)
+(class_declaration
+  (modifiers
+    (annotation
+      (user_type
+        (identifier) @class.decorator)))
+  name: (identifier) @class.name) @class.def
+
+; Annotated class declarations, with arguments (@RequestMapping("/api"))
+(class_declaration
+  (modifiers
+    (annotation
+      (constructor_invocation
+        (user_type
+          (identifier) @class.decorator)
+        (value_arguments
+          (value_argument
+            (string_literal
+              (string_content) @class.docstring))?))))
   name: (identifier) @class.name) @class.def
 
 ; Object declarations

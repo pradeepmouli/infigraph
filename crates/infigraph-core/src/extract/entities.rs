@@ -229,7 +229,8 @@ pub fn extract_entities(
                     .or_else(|| extract_child_text(node, "result", source))
             });
 
-            let visibility = extract_visibility(node, source);
+            let visibility =
+                extract_visibility(node, source).or_else(|| default_visibility(&name, language));
 
             symbols.push(Symbol {
                 id,
@@ -296,14 +297,31 @@ pub fn extract_entities(
         }
     }
 
-    // Deduplicate by ID — prefer more specific kind (Test > Function)
+    // Deduplicate by ID — multiple query patterns (e.g. bare vs. annotated
+    // decorator variants, or a params/return_type-capturing pattern vs. an
+    // annotation-capturing one) can match the same definition node, each
+    // populating a different subset of fields. Prefer the more specific kind
+    // (Test > Function/Method), keep the richest docstring seen so an
+    // earlier bare-pattern match doesn't blank out a later match's
+    // decorator/annotation text, and fill in parameters/return_type from any
+    // duplicate match that has them if the kept entry doesn't yet.
     let mut seen = std::collections::HashMap::new();
     for sym in symbols {
         seen.entry(sym.id.clone())
             .and_modify(|existing: &mut Symbol| {
-                // Test is more specific than Function
                 if sym.kind == SymbolKind::Test && existing.kind == SymbolKind::Function {
-                    *existing = sym.clone();
+                    existing.kind = sym.kind.clone();
+                }
+                let existing_len = existing.docstring.as_deref().map_or(0, str::len);
+                let new_len = sym.docstring.as_deref().map_or(0, str::len);
+                if new_len > existing_len {
+                    existing.docstring = sym.docstring.clone();
+                }
+                if existing.parameters.is_none() && sym.parameters.is_some() {
+                    existing.parameters = sym.parameters.clone();
+                }
+                if existing.return_type.is_none() && sym.return_type.is_some() {
+                    existing.return_type = sym.return_type.clone();
                 }
             })
             .or_insert(sym);
@@ -320,6 +338,20 @@ fn find_parent_class(node: Node, source: &[u8]) -> Option<String> {
             return n
                 .child_by_field_name("name")
                 .map(|name_node| node_text(name_node, source));
+        }
+        // Protobuf: an `rpc` lives inside a `service` node. The service name has
+        // no "name" field — it's a `service_name` child. Without this, proto RPC
+        // methods get an empty parent, so gRPC contract extraction (which groups
+        // RPCs under their service) finds nothing (AIF3X-331 #21).
+        if n.kind() == "service" {
+            let mut cursor = n.walk();
+            let name = n
+                .children(&mut cursor)
+                .find(|c| c.kind() == "service_name" || c.kind() == "message_name")
+                .map(|name_node| node_text(name_node, source));
+            if let Some(name) = name {
+                return Some(name);
+            }
         }
         current = n.parent();
     }
@@ -463,6 +495,40 @@ fn extract_visibility(node: Node, source: &[u8]) -> Option<String> {
         }
     }
     None
+}
+
+/// Fallback visibility for languages that have no explicit access-modifier
+/// keyword (Python, JavaScript, Ruby, Go, …). `extract_visibility` returns
+/// `None` for these, which previously stored an empty string and made every
+/// such symbol invisible to `get_api_surface` (WHERE s.visibility = 'public').
+///
+/// Convention: a leading underscore marks a symbol private (Python `_x`,
+/// JS/TS `_x`); Go uses capitalization (lower-case first letter = unexported).
+/// Everything else defaults to `public`. Languages WITH real modifiers
+/// (rust/java/c#/kotlin/swift/…) are intentionally excluded — for those,
+/// absence of a modifier is a deliberate signal (package-private / module-
+/// private) and must not be rewritten to public.
+fn default_visibility(name: &str, language: &str) -> Option<String> {
+    let public = Some("public".to_string());
+    let private = Some("private".to_string());
+    match language {
+        "python" | "javascript" | "typescript" | "ruby" | "lua" | "r" => {
+            if name.starts_with('_') {
+                private
+            } else {
+                public
+            }
+        }
+        // Go: exported iff the first letter is upper-case.
+        "go" => match name.chars().next() {
+            Some(c) if c.is_uppercase() => public,
+            Some(_) => private,
+            None => None,
+        },
+        // Languages with explicit modifiers: leave as-is (None → stored empty),
+        // so we don't override a meaningful "no modifier" with "public".
+        _ => None,
+    }
 }
 
 const TEST_ATTR_PATTERNS: &[&str] = &[
@@ -920,6 +986,60 @@ mod tests {
     }
 
     #[test]
+    fn test_dedup_merges_params_from_one_pattern_with_docstring_from_another() {
+        // Regression test for a real interaction bug: when two separate
+        // .scm patterns match the same function_declaration node -- one
+        // capturing @func.params/@func.return_type (no decorator), another
+        // capturing @func.decorator/@func.docstring (no params) -- the
+        // dedup step used to keep only whichever match's Symbol was
+        // inserted first, silently dropping the other match's fields.
+        // Both parameters/return_type AND docstring must survive together.
+        let grammar = tree_sitter_kotlin_ng::LANGUAGE.into();
+        let src = b"@PostMapping(\"/x\")\nfun render(templateId: String): String {\n    return templateId\n}\n";
+        let mut parser = Parser::new();
+        parser.set_language(&grammar).unwrap();
+        let tree = parser.parse(src, None).unwrap();
+        let root = tree.root_node();
+
+        let query = tree_sitter::Query::new(
+            &grammar,
+            "(function_declaration\n  \
+               name: (identifier) @func.name\n  \
+               (function_value_parameters) @func.params\n  \
+               (type)? @func.return_type) @func.def\n\
+             (function_declaration\n  \
+               (modifiers\n    \
+                 (annotation\n      \
+                   (constructor_invocation\n        \
+                     (user_type\n          \
+                       (identifier) @func.decorator)\n        \
+                     (value_arguments\n          \
+                       (value_argument\n            \
+                         (string_literal\n              \
+                           (string_content) @func.docstring))?))))\n  \
+               name: (identifier) @func.name) @func.def",
+        )
+        .unwrap();
+
+        let symbols = extract_entities("render.kt", src, root, &query, "kotlin");
+        assert_eq!(symbols.len(), 1);
+        assert!(
+            symbols[0].parameters.is_some(),
+            "parameters from the params-capturing pattern must survive dedup"
+        );
+        assert_eq!(
+            symbols[0].return_type.as_deref(),
+            Some("String"),
+            "return_type from the params-capturing pattern must survive dedup"
+        );
+        assert_eq!(
+            symbols[0].docstring.as_deref(),
+            Some("PostMapping /x"),
+            "docstring from the annotation-capturing pattern must survive dedup"
+        );
+    }
+
+    #[test]
     fn test_dart_function_extracts_parameters_and_return_type() {
         // tree-sitter-dart's function_signature DOES have real "parameters"/
         // "return_type" named fields -- but they're one level below the
@@ -1065,6 +1185,39 @@ mod tests {
             "typescript"
         ));
         assert!(!is_test_by_name_and_path("it", "src/auth.ts", "typescript"));
+    }
+
+    // AIF3X-331 #20: keyword-less languages must default to a concrete
+    // visibility so get_api_surface (WHERE s.visibility = 'public') surfaces
+    // them. Previously extract_visibility returned None → stored '' → invisible.
+    #[test]
+    fn test_default_visibility_keywordless_langs() {
+        // Underscore-convention private
+        for lang in ["python", "javascript", "typescript", "ruby", "lua", "r"] {
+            assert_eq!(
+                default_visibility("public_fn", lang).as_deref(),
+                Some("public"),
+                "{lang}: bare name should default public"
+            );
+            assert_eq!(
+                default_visibility("_private_fn", lang).as_deref(),
+                Some("private"),
+                "{lang}: leading underscore should be private"
+            );
+        }
+        // Go: exported iff capitalized
+        assert_eq!(
+            default_visibility("Exported", "go").as_deref(),
+            Some("public")
+        );
+        assert_eq!(
+            default_visibility("unexported", "go").as_deref(),
+            Some("private")
+        );
+        // Languages with real modifiers keep None (absence of a keyword is a
+        // deliberate signal there, not "public").
+        assert_eq!(default_visibility("foo", "rust"), None);
+        assert_eq!(default_visibility("Foo", "java"), None);
     }
 
     #[test]

@@ -60,7 +60,13 @@ mod tests {
 
     #[test]
     fn sanitizer_suppresses_sql_injection() {
-        let code = "query = sanitize_sql(user_input)\ncursor.execute(query)";
+        // AIF3X-331 #17: execute() now requires same-line SQL evidence (to
+        // stop flagging bare async HTTP client calls), so the fixture must
+        // carry that evidence on the execute() line itself for SEC001 to fire
+        // at all -- a bare `cursor.execute(query)` is now a known false
+        // negative (cross-line SQL construction is taint's job, not this
+        // line-heuristic's).
+        let code = "safe = sanitize_sql(user_input)\ncursor.execute(\"SELECT * FROM users WHERE id = \" + safe)";
         let findings = scan_str(code, "py");
         let sql_findings: Vec<_> = findings
             .iter()

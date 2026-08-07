@@ -70,6 +70,47 @@ pub trait GraphBackend: Send + Sync {
 
     fn callers_of(&self, symbol_id: &str) -> Result<Vec<String>>;
     fn callees_of(&self, symbol_id: &str) -> Result<Vec<String>>;
+
+    /// Callers of `symbol_id`, optionally excluding test symbols.
+    /// When `include_tests` is true this is equivalent to `callers_of`.
+    /// Test symbols are those extracted with `SymbolKind::Test` (see
+    /// `extract::entities::is_test_by_name_and_path` / `is_test_by_docstring`),
+    /// stored as `kind = 'Test'` on the node. Built on `raw_query` so both the
+    /// Kuzu and Neo4j backends inherit it without a bespoke impl — the `kind`
+    /// filter is plain Cypher supported by both.
+    fn callers_of_filtered(&self, symbol_id: &str, include_tests: bool) -> Result<Vec<String>> {
+        if include_tests {
+            return self.callers_of(symbol_id);
+        }
+        let query = format!(
+            "MATCH (caller:Symbol)-[:CALLS|INJECTS_DEPENDENCY|REGISTERS_MIDDLEWARE]->(target:Symbol) \
+             WHERE target.id = '{}' AND caller.kind <> 'Test' RETURN caller.id",
+            symbol_id.replace('\'', "\\'")
+        );
+        Ok(self
+            .raw_query(&query)?
+            .into_iter()
+            .filter_map(|row| row.into_iter().next())
+            .collect())
+    }
+
+    /// Callees of `symbol_id`, optionally excluding test symbols.
+    /// When `include_tests` is true this is equivalent to `callees_of`.
+    fn callees_of_filtered(&self, symbol_id: &str, include_tests: bool) -> Result<Vec<String>> {
+        if include_tests {
+            return self.callees_of(symbol_id);
+        }
+        let query = format!(
+            "MATCH (source:Symbol)-[:CALLS]->(callee:Symbol) \
+             WHERE source.id = '{}' AND callee.kind <> 'Test' RETURN callee.id",
+            symbol_id.replace('\'', "\\'")
+        );
+        Ok(self
+            .raw_query(&query)?
+            .into_iter()
+            .filter_map(|row| row.into_iter().next())
+            .collect())
+    }
     fn branches_of(&self, symbol_id: &str) -> Result<Vec<BranchInfo>>;
     fn transitive_impact(&self, id: &str, max_depth: u32) -> Result<Vec<ImpactRow>>;
     fn find_all_references(&self, id: &str) -> Result<Vec<ReferenceRow>>;
@@ -78,6 +119,24 @@ pub trait GraphBackend: Send + Sync {
     // ── Read: aggregate queries ──────────────────────────────────────
 
     fn get_api_surface(&self) -> Result<Vec<ApiSymbol>>;
+
+    /// `get_api_surface`, optionally excluding test symbols.
+    /// When `include_tests` is true this is equivalent to `get_api_surface`.
+    ///
+    /// For languages where `visibility` is derived from naming convention
+    /// rather than a real access modifier (e.g. Python: any non-underscore
+    /// name is "public"), every non-underscore test helper and e2e fixture
+    /// otherwise qualifies as "public" too, swamping the real API surface
+    /// (observed: 3795/5718 symbols in a FastAPI repo, almost all under
+    /// app/test/). Filtered here in Rust rather than duplicating a `kind <>
+    /// 'Test'` clause across every backend's own query dialect.
+    fn get_api_surface_filtered(&self, include_tests: bool) -> Result<Vec<ApiSymbol>> {
+        let surface = self.get_api_surface()?;
+        if include_tests {
+            return Ok(surface);
+        }
+        Ok(surface.into_iter().filter(|s| s.kind != "Test").collect())
+    }
     fn get_file_deps(&self, file: &str) -> Result<FileDeps>;
     fn get_type_hierarchy(&self, id: &str, max_depth: u32) -> Result<TypeHierarchy>;
     fn get_test_coverage(&self) -> Result<TestCoverage>;

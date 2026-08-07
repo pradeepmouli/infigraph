@@ -18,6 +18,7 @@ Cargo.lock
 
 # IDE / Editor
 .claude/
+.worktrees/
 .vscode/
 .idea/
 *.swp

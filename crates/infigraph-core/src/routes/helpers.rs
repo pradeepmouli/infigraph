@@ -41,6 +41,17 @@ pub(crate) fn language_from_file(file: &str) -> Lang {
     }
 }
 
+/// True if `kw` occurs in `text` bounded by non-alphanumeric chars (or
+/// start/end of string) on both sides, so e.g. "get" matches "@router.get("
+/// and "GET /x" but not the "get" inside "/widgets" or "budget()".
+fn contains_word(text: &str, kw: &str) -> bool {
+    let is_boundary = |c: Option<char>| !matches!(c, Some(c) if c.is_alphanumeric());
+    text.match_indices(kw).any(|(start, _)| {
+        let end = start + kw.len();
+        is_boundary(text[..start].chars().next_back()) && is_boundary(text[end..].chars().next())
+    })
+}
+
 pub(crate) fn detect_from_docstring(
     id: &str,
     name: &str,
@@ -49,37 +60,43 @@ pub(crate) fn detect_from_docstring(
 ) -> Option<Route> {
     // Look for explicit HTTP method keywords in docstrings
     let http_methods = [
-        ("get ", "GET"),
-        ("post ", "POST"),
-        ("put ", "PUT"),
-        ("delete ", "DELETE"),
-        ("patch ", "PATCH"),
+        ("get", "GET"),
+        ("post", "POST"),
+        ("put", "PUT"),
+        ("delete", "DELETE"),
+        ("patch", "PATCH"),
     ];
 
-    // Pattern: docstring mentions route/endpoint/api along with an HTTP method
-    let has_route_context = doc_lower.contains("route")
-        || doc_lower.contains("endpoint")
-        || doc_lower.contains("api")
-        || doc_lower.contains("handler")
-        || doc_lower.contains("@app.")
-        || doc_lower.contains("@router.")
-        || doc_lower.contains("handlefunc")
-        || doc_lower.contains("mapping");
+    // Explicit decorator/annotation syntax is hard evidence on its own.
+    let has_decorator = doc_lower.contains("@app.") || doc_lower.contains("@router.");
 
-    if !has_route_context {
-        return None;
+    // Match as a whole word (not a substring of a path segment like
+    // "widgets" or "deleted") by requiring a non-alphanumeric char (or
+    // start-of-string) on both sides.
+    let method_kw = http_methods
+        .iter()
+        .find(|(kw, _)| contains_word(doc_lower, kw))
+        .map(|(_, m)| m.to_string());
+
+    let path_from_text = extract_path_from_text(doc_lower);
+
+    if !has_decorator {
+        // Without an explicit decorator, prose alone (e.g. "Responses API
+        // responses", "the endpoint handler") is not evidence -- almost any
+        // docstring in an HTTP-serving codebase mentions "api"/"handler"/
+        // "endpoint" without describing an actual route (AIF3X-331: this
+        // previously matched on those words alone, then defaulted the
+        // method to GET when no verb was found, turning plain helper
+        // functions like `apply_luhn_check` into fabricated `GET
+        // /apply_luhn_check` routes). Require BOTH a real HTTP verb and an
+        // extractable /path token together.
+        if method_kw.is_none() || path_from_text.is_none() {
+            return None;
+        }
     }
 
-    // Try to extract method from docstring
-    let method = http_methods
-        .iter()
-        .find(|(kw, _)| doc_lower.contains(kw))
-        .map(|(_, m)| m.to_string())
-        .unwrap_or_else(|| "GET".to_string());
-
-    // Try to extract a path from the docstring (look for /something patterns)
-    let path =
-        extract_path_from_text(doc_lower).unwrap_or_else(|| format!("/{}", name.to_lowercase()));
+    let method = method_kw.unwrap_or_else(|| "GET".to_string());
+    let path = path_from_text.unwrap_or_else(|| format!("/{}", name.to_lowercase()));
 
     Some(Route {
         method,
@@ -88,50 +105,6 @@ pub(crate) fn detect_from_docstring(
         file: file.to_string(),
         framework: detect_framework_from_docstring(doc_lower),
     })
-}
-
-pub(crate) fn detect_python_framework(doc_lower: &str) -> String {
-    if doc_lower.contains("fastapi") {
-        "fastapi".to_string()
-    } else if doc_lower.contains("flask")
-        || doc_lower.contains("@app.")
-        || doc_lower.contains("@blueprint.")
-    {
-        "flask".to_string()
-    } else if doc_lower.contains("django") {
-        "django".to_string()
-    } else if doc_lower.contains("starlette") {
-        "starlette".to_string()
-    } else if doc_lower.contains("tornado") {
-        "tornado".to_string()
-    } else if doc_lower.contains("aiohttp") {
-        "aiohttp".to_string()
-    } else {
-        "generic_python".to_string()
-    }
-}
-
-pub(crate) fn detect_js_framework(file: &str, doc_lower: &str) -> String {
-    let file_lower = file.to_lowercase();
-    if doc_lower.contains("nestjs")
-        || doc_lower.contains("@controller")
-        || doc_lower.contains("@get(")
-        || doc_lower.contains("@post(")
-    {
-        "nestjs".to_string()
-    } else if file_lower.contains("pages/api/") || file_lower.contains("app/api/") {
-        "nextjs".to_string()
-    } else if doc_lower.contains("fastify") {
-        "fastify".to_string()
-    } else if doc_lower.contains("koa") {
-        "koa".to_string()
-    } else if doc_lower.contains("hapi") {
-        "hapi".to_string()
-    } else if doc_lower.contains("express") {
-        "express".to_string()
-    } else {
-        "generic_js".to_string()
-    }
 }
 
 pub(crate) fn detect_go_framework(doc_lower: &str) -> String {
@@ -150,47 +123,21 @@ pub(crate) fn detect_go_framework(doc_lower: &str) -> String {
     }
 }
 
-pub(crate) fn detect_java_framework(doc_lower: &str) -> String {
-    if doc_lower.contains("@getmapping")
-        || doc_lower.contains("@postmapping")
-        || doc_lower.contains("@requestmapping")
-        || doc_lower.contains("@putmapping")
-        || doc_lower.contains("@deletemapping")
-        || doc_lower.contains("@patchmapping")
-    {
-        "spring".to_string()
-    } else if doc_lower.contains("@path")
-        || doc_lower.contains("jax-rs")
-        || doc_lower.contains("javax.ws.rs")
-    {
-        "jaxrs".to_string()
-    } else if doc_lower.contains("micronaut") {
-        "micronaut".to_string()
-    } else if doc_lower.contains("quarkus") {
-        "quarkus".to_string()
-    } else if doc_lower.contains("ktor") {
-        "ktor".to_string()
-    } else {
-        "spring".to_string()
-    }
-}
-
-pub(crate) fn detect_rust_framework(doc_lower: &str) -> String {
-    if doc_lower.contains("actix") {
-        "actix".to_string()
-    } else if doc_lower.contains("axum") {
-        "axum".to_string()
-    } else if doc_lower.contains("rocket")
-        || doc_lower.contains("#[get")
-        || doc_lower.contains("#[post")
-    {
-        "rocket".to_string()
-    } else if doc_lower.contains("warp") {
-        "warp".to_string()
-    } else if doc_lower.contains("tide") {
-        "tide".to_string()
-    } else {
-        "generic_rust".to_string()
+/// Best-effort framework label for a `Route`-kind (registration) symbol, keyed
+/// off the source file extension since the registration site has no decorator
+/// docstring to inspect.
+pub(crate) fn detect_framework_from_file(file: &str) -> String {
+    match language_from_file(file) {
+        Lang::Python => "python".to_string(),
+        Lang::JavaScript | Lang::TypeScript => "express".to_string(),
+        Lang::Go => "net/http".to_string(),
+        Lang::Java => "spring".to_string(),
+        Lang::Rust => "rust".to_string(),
+        Lang::Ruby => "rails".to_string(),
+        Lang::Php => "laravel".to_string(),
+        Lang::CSharp => "aspnet".to_string(),
+        Lang::Elixir => "phoenix".to_string(),
+        Lang::Other => "unknown".to_string(),
     }
 }
 
@@ -302,41 +249,4 @@ pub(crate) fn camel_to_path(s: &str) -> String {
     }
     // Also convert underscores to slashes
     result.replace('_', "/")
-}
-
-/// Infer a route path from the file path (useful for Next.js API routes, etc.).
-pub(crate) fn infer_path_from_file(file: &str) -> String {
-    // Next.js: pages/api/users/[id].ts -> /api/users/:id
-    // Also: app/api/users/route.ts -> /api/users
-    let normalized = file.replace('\\', "/").to_lowercase();
-
-    // Try to extract the API route part
-    if let Some(api_idx) = normalized.find("/api/") {
-        let path_part = &file[api_idx..];
-        let cleaned = path_part
-            .trim_end_matches(".ts")
-            .trim_end_matches(".tsx")
-            .trim_end_matches(".js")
-            .trim_end_matches(".jsx")
-            .trim_end_matches("/route")
-            .trim_end_matches("/index");
-        // Convert [param] to :param
-        let result = cleaned.replace('[', ":").replace(']', "");
-        return result;
-    }
-
-    // Fallback: use the file stem
-    let stem = file
-        .rsplit('/')
-        .next()
-        .unwrap_or(file)
-        .trim_end_matches(".ts")
-        .trim_end_matches(".tsx")
-        .trim_end_matches(".js")
-        .trim_end_matches(".jsx")
-        .trim_end_matches(".py")
-        .trim_end_matches(".go")
-        .trim_end_matches(".rs");
-
-    format!("/{}", stem.to_lowercase())
 }

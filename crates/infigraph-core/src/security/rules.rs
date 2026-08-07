@@ -123,7 +123,24 @@ pub(crate) struct Rule {
     pub(crate) pattern: &'static str,
     /// If Some, the line must NOT contain this to avoid false positives
     pub(crate) exclude_if: Option<&'static str>,
+    /// If Some, the line must contain at least one of these (word-boundary
+    /// match) or the finding is dropped entirely. Unlike `exclude_if` this
+    /// requires positive evidence rather than excluding a known-bad phrase —
+    /// used to distinguish e.g. a DB `execute()` call from an unrelated
+    /// `execute()` on an HTTP client, which `pattern` alone can't tell apart.
+    pub(crate) require_any: Option<&'static [&'static str]>,
     pub(crate) message: &'static str,
+}
+
+/// Word-boundary substring match: `kw` must not be flanked by an
+/// alphanumeric character on either side, so e.g. "from" doesn't match
+/// inside "platform" or "delete" inside "deleted_at".
+pub(crate) fn contains_word(text: &str, kw: &str) -> bool {
+    let is_boundary = |c: Option<char>| !matches!(c, Some(c) if c.is_alphanumeric() || c == '_');
+    text.match_indices(kw).any(|(start, _)| {
+        let end = start + kw.len();
+        is_boundary(text[..start].chars().next_back()) && is_boundary(text[end..].chars().next())
+    })
 }
 
 pub(crate) static RULES: &[Rule] = &[
@@ -135,6 +152,17 @@ pub(crate) static RULES: &[Rule] = &[
         extensions: Some(&["py", "js", "ts", "java", "go", "rb", "php", "cs", "rs"]),
         pattern: "execute(",
         exclude_if: Some("# nosec"),
+        // A bare `execute(` fires on any client with that method name (HTTP
+        // clients included — AIF3X-331 #17: async HTTP .execute() calls were
+        // being flagged as SQL injection). Requiring a SQL keyword on the
+        // same line distinguishes cursor.execute("SELECT ...") from
+        // http_client.execute(request) without a receiver-name denylist,
+        // which would be unsafe (e.g. SQLAlchemy's session.execute(text(...))
+        // uses a receiver name ("session") that's also common on HTTP clients).
+        // "update"/"delete" are deliberately excluded: they're also HTTP verbs
+        // (e.g. `execute(Request(method="DELETE", ...))`), and real SQL
+        // DELETE/UPDATE injections carry "from"/"where" on the same line anyway.
+        require_any: Some(&["select", "insert", "from", "where"]),
         message:
             "Possible SQL injection: raw string passed to execute(). Use parameterized queries.",
     },
@@ -145,6 +173,7 @@ pub(crate) static RULES: &[Rule] = &[
         extensions: Some(&["py", "js", "ts", "java", "go", "rb", "php", "cs", "rs"]),
         pattern: "raw_query(",
         exclude_if: None,
+        require_any: None,
         message: "raw_query() call — ensure parameters are not interpolated from user input.",
     },
     Rule {
@@ -154,6 +183,7 @@ pub(crate) static RULES: &[Rule] = &[
         extensions: Some(&["py", "js", "ts", "java", "go", "rb", "php", "cs"]),
         pattern: "format!(\"select",
         exclude_if: None,
+        require_any: None,
         message: "String-interpolated SQL SELECT — classic SQL injection risk.",
     },
     Rule {
@@ -163,6 +193,7 @@ pub(crate) static RULES: &[Rule] = &[
         extensions: Some(&["py", "js", "ts", "java", "go", "rb", "php"]),
         pattern: "f\"select",
         exclude_if: None,
+        require_any: None,
         message: "f-string SQL SELECT — SQL injection risk.",
     },
     Rule {
@@ -172,6 +203,7 @@ pub(crate) static RULES: &[Rule] = &[
         extensions: Some(&["py", "js", "ts", "java", "go", "rb", "php"]),
         pattern: "f'select",
         exclude_if: None,
+        require_any: None,
         message: "f-string SQL SELECT — SQL injection risk.",
     },
     // ── Hardcoded Secrets ────────────────────────────────────────────────────
@@ -182,6 +214,7 @@ pub(crate) static RULES: &[Rule] = &[
         extensions: None,
         pattern: "password = \"",
         exclude_if: Some("example"),
+        require_any: None,
         message: "Hardcoded password literal.",
     },
     Rule {
@@ -191,6 +224,7 @@ pub(crate) static RULES: &[Rule] = &[
         extensions: None,
         pattern: "password = '",
         exclude_if: Some("example"),
+        require_any: None,
         message: "Hardcoded password literal.",
     },
     Rule {
@@ -200,6 +234,7 @@ pub(crate) static RULES: &[Rule] = &[
         extensions: None,
         pattern: "secret_key = \"",
         exclude_if: None,
+        require_any: None,
         message: "Hardcoded secret key.",
     },
     Rule {
@@ -209,6 +244,7 @@ pub(crate) static RULES: &[Rule] = &[
         extensions: None,
         pattern: "api_key = \"",
         exclude_if: Some("os."),
+        require_any: None,
         message: "Hardcoded API key.",
     },
     Rule {
@@ -218,6 +254,7 @@ pub(crate) static RULES: &[Rule] = &[
         extensions: None,
         pattern: "aws_secret_access_key",
         exclude_if: Some("os.environ"),
+        require_any: None,
         message: "AWS secret access key reference — ensure not hardcoded.",
     },
     Rule {
@@ -227,6 +264,7 @@ pub(crate) static RULES: &[Rule] = &[
         extensions: Some(&["py", "js", "ts", "go", "java", "rb", "cs", "rs"]),
         pattern: "private_key = \"",
         exclude_if: None,
+        require_any: None,
         message: "Hardcoded private key.",
     },
     Rule {
@@ -236,6 +274,7 @@ pub(crate) static RULES: &[Rule] = &[
         extensions: None,
         pattern: "-----begin rsa private key-----",
         exclude_if: None,
+        require_any: None,
         message: "RSA private key literal in source code.",
     },
     Rule {
@@ -245,6 +284,7 @@ pub(crate) static RULES: &[Rule] = &[
         extensions: None,
         pattern: "-----begin ec private key-----",
         exclude_if: None,
+        require_any: None,
         message: "EC private key literal in source code.",
     },
     // ── Dangerous Eval ───────────────────────────────────────────────────────
@@ -255,6 +295,7 @@ pub(crate) static RULES: &[Rule] = &[
         extensions: Some(&["py"]),
         pattern: "eval(",
         exclude_if: Some("#"),
+        require_any: None,
         message: "eval() with dynamic input is dangerous — possible code injection.",
     },
     Rule {
@@ -264,6 +305,7 @@ pub(crate) static RULES: &[Rule] = &[
         extensions: Some(&["js", "ts"]),
         pattern: "eval(",
         exclude_if: None,
+        require_any: None,
         message: "JavaScript eval() — code injection risk.",
     },
     Rule {
@@ -273,6 +315,7 @@ pub(crate) static RULES: &[Rule] = &[
         extensions: Some(&["py"]),
         pattern: "exec(",
         exclude_if: Some("#"),
+        require_any: None,
         message: "Python exec() — code injection risk if input is not sanitized.",
     },
     // ── Insecure Deserialization ──────────────────────────────────────────────
@@ -283,6 +326,7 @@ pub(crate) static RULES: &[Rule] = &[
         extensions: Some(&["py"]),
         pattern: "pickle.loads(",
         exclude_if: None,
+        require_any: None,
         message: "pickle.loads() on untrusted data allows arbitrary code execution.",
     },
     Rule {
@@ -292,6 +336,7 @@ pub(crate) static RULES: &[Rule] = &[
         extensions: Some(&["py"]),
         pattern: "pickle.load(",
         exclude_if: None,
+        require_any: None,
         message: "pickle.load() on untrusted data allows arbitrary code execution.",
     },
     Rule {
@@ -301,6 +346,7 @@ pub(crate) static RULES: &[Rule] = &[
         extensions: Some(&["py"]),
         pattern: "yaml.load(",
         exclude_if: Some("loader=yaml.SafeLoader"),
+        require_any: None,
         message: "yaml.load() without SafeLoader — use yaml.safe_load() instead.",
     },
     Rule {
@@ -310,6 +356,7 @@ pub(crate) static RULES: &[Rule] = &[
         extensions: Some(&["java"]),
         pattern: "objectinputstream",
         exclude_if: None,
+        require_any: None,
         message: "Java ObjectInputStream deserialization — gadget chain risk.",
     },
     Rule {
@@ -319,6 +366,7 @@ pub(crate) static RULES: &[Rule] = &[
         extensions: Some(&["rb"]),
         pattern: "marshal.load(",
         exclude_if: None,
+        require_any: None,
         message: "Ruby Marshal.load on untrusted data — code execution risk.",
     },
     // ── Path Traversal ───────────────────────────────────────────────────────
@@ -329,6 +377,7 @@ pub(crate) static RULES: &[Rule] = &[
         extensions: Some(&["py", "js", "ts", "go", "java", "rb", "php", "cs", "rs"]),
         pattern: "../",
         exclude_if: Some("test"),
+        require_any: None,
         message: "Literal '../' in path construction — possible path traversal.",
     },
     Rule {
@@ -338,6 +387,7 @@ pub(crate) static RULES: &[Rule] = &[
         extensions: Some(&["py"]),
         pattern: "open(request.",
         exclude_if: None,
+        require_any: None,
         message: "File open with request parameter — path traversal risk.",
     },
     // ── SSRF ─────────────────────────────────────────────────────────────────
@@ -348,6 +398,7 @@ pub(crate) static RULES: &[Rule] = &[
         extensions: Some(&["py"]),
         pattern: "requests.get(request.",
         exclude_if: None,
+        require_any: None,
         message: "HTTP GET with user-controlled URL — SSRF risk.",
     },
     Rule {
@@ -357,6 +408,7 @@ pub(crate) static RULES: &[Rule] = &[
         extensions: Some(&["py"]),
         pattern: "requests.post(request.",
         exclude_if: None,
+        require_any: None,
         message: "HTTP POST with user-controlled URL — SSRF risk.",
     },
     Rule {
@@ -366,6 +418,7 @@ pub(crate) static RULES: &[Rule] = &[
         extensions: Some(&["js", "ts"]),
         pattern: "fetch(req.",
         exclude_if: None,
+        require_any: None,
         message: "fetch() with request-derived URL — SSRF risk.",
     },
     // ── XXE ──────────────────────────────────────────────────────────────────
@@ -376,6 +429,7 @@ pub(crate) static RULES: &[Rule] = &[
         extensions: Some(&["py"]),
         pattern: "etree.parse(",
         exclude_if: Some("defusedxml"),
+        require_any: None,
         message: "xml.etree.parse() — XXE risk. Use defusedxml.",
     },
     Rule {
@@ -385,6 +439,7 @@ pub(crate) static RULES: &[Rule] = &[
         extensions: Some(&["java"]),
         pattern: "documentbuilderfactory.newinstance()",
         exclude_if: Some("setfeature"),
+        require_any: None,
         message: "DocumentBuilderFactory without XXE protection.",
     },
     // ── Weak Crypto ───────────────────────────────────────────────────────────
@@ -395,6 +450,7 @@ pub(crate) static RULES: &[Rule] = &[
         extensions: None,
         pattern: "md5(",
         exclude_if: Some("test"),
+        require_any: None,
         message: "MD5 is cryptographically broken. Use SHA-256 or better.",
     },
     Rule {
@@ -404,6 +460,7 @@ pub(crate) static RULES: &[Rule] = &[
         extensions: None,
         pattern: "sha1(",
         exclude_if: Some("test"),
+        require_any: None,
         message: "SHA-1 is cryptographically weak. Use SHA-256 or better.",
     },
     Rule {
@@ -413,6 +470,7 @@ pub(crate) static RULES: &[Rule] = &[
         extensions: None,
         pattern: "des.new(",
         exclude_if: Some("test"),
+        require_any: None,
         message: "DES is broken. Use AES-256.",
     },
     Rule {
@@ -422,6 +480,7 @@ pub(crate) static RULES: &[Rule] = &[
         extensions: None,
         pattern: "des_cbc",
         exclude_if: Some("test"),
+        require_any: None,
         message: "DES/3DES is broken. Use AES-256.",
     },
     Rule {
@@ -431,6 +490,7 @@ pub(crate) static RULES: &[Rule] = &[
         extensions: None,
         pattern: "des_ede",
         exclude_if: Some("test"),
+        require_any: None,
         message: "Triple-DES (DES-EDE) is deprecated. Use AES-256.",
     },
     Rule {
@@ -440,6 +500,7 @@ pub(crate) static RULES: &[Rule] = &[
         extensions: Some(&["py", "js", "ts", "go", "java", "rb", "rs"]),
         pattern: "hashlib.md5(",
         exclude_if: None,
+        require_any: None,
         message: "hashlib.md5 — not suitable for security-sensitive hashing.",
     },
     // ── Command Injection ─────────────────────────────────────────────────────
@@ -450,6 +511,7 @@ pub(crate) static RULES: &[Rule] = &[
         extensions: Some(&["py"]),
         pattern: "os.system(",
         exclude_if: None,
+        require_any: None,
         message: "os.system() with dynamic input — command injection risk.",
     },
     Rule {
@@ -459,6 +521,7 @@ pub(crate) static RULES: &[Rule] = &[
         extensions: Some(&["py"]),
         pattern: "subprocess.call(",
         exclude_if: Some("shell=False"),
+        require_any: None,
         message: "subprocess.call() — use shell=False and list arguments.",
     },
     Rule {
@@ -468,6 +531,7 @@ pub(crate) static RULES: &[Rule] = &[
         extensions: Some(&["py"]),
         pattern: "subprocess.popen(",
         exclude_if: Some("shell=false"),
+        require_any: None,
         message: "subprocess.Popen() — use shell=False and list arguments.",
     },
     Rule {
@@ -477,6 +541,7 @@ pub(crate) static RULES: &[Rule] = &[
         extensions: Some(&["js", "ts"]),
         pattern: "exec(",
         exclude_if: Some("test"),
+        require_any: None,
         message: "child_process.exec() with dynamic input — command injection risk.",
     },
     Rule {
@@ -486,6 +551,7 @@ pub(crate) static RULES: &[Rule] = &[
         extensions: Some(&["go"]),
         pattern: "exec.command(",
         exclude_if: None,
+        require_any: None,
         message: "exec.Command with user-controlled args — verify input is sanitized.",
     },
     // ── Insecure Random ───────────────────────────────────────────────────────
@@ -496,6 +562,7 @@ pub(crate) static RULES: &[Rule] = &[
         extensions: Some(&["py"]),
         pattern: "random.random(",
         exclude_if: None,
+        require_any: None,
         message: "random.random() is not cryptographically secure. Use secrets module.",
     },
     Rule {
@@ -505,6 +572,7 @@ pub(crate) static RULES: &[Rule] = &[
         extensions: Some(&["py"]),
         pattern: "random.randint(",
         exclude_if: None,
+        require_any: None,
         message: "random.randint() is not cryptographically secure. Use secrets.randbelow().",
     },
     Rule {
@@ -514,6 +582,7 @@ pub(crate) static RULES: &[Rule] = &[
         extensions: Some(&["js", "ts"]),
         pattern: "math.random()",
         exclude_if: None,
+        require_any: None,
         message: "Math.random() is not cryptographically secure. Use crypto.getRandomValues().",
     },
     // ── XSS Risk ─────────────────────────────────────────────────────────────
@@ -524,6 +593,7 @@ pub(crate) static RULES: &[Rule] = &[
         extensions: Some(&["js", "ts"]),
         pattern: "innerhtml",
         exclude_if: None,
+        require_any: None,
         message: "innerHTML assignment — XSS risk if content is user-controlled.",
     },
     Rule {
@@ -533,6 +603,7 @@ pub(crate) static RULES: &[Rule] = &[
         extensions: Some(&["js", "ts"]),
         pattern: "dangerouslysetinnerhtml",
         exclude_if: None,
+        require_any: None,
         message: "React dangerouslySetInnerHTML — XSS risk.",
     },
     Rule {
@@ -542,6 +613,7 @@ pub(crate) static RULES: &[Rule] = &[
         extensions: Some(&["py"]),
         pattern: "mark_safe(",
         exclude_if: None,
+        require_any: None,
         message: "Django mark_safe() — ensure content is sanitized before marking safe.",
     },
     // ── Open Redirect ─────────────────────────────────────────────────────────
@@ -552,6 +624,7 @@ pub(crate) static RULES: &[Rule] = &[
         extensions: Some(&["py", "js", "ts", "go", "java", "rb"]),
         pattern: "redirect(request.",
         exclude_if: None,
+        require_any: None,
         message: "redirect() with user-supplied URL — open redirect risk.",
     },
 ];

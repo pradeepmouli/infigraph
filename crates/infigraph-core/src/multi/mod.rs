@@ -373,6 +373,48 @@ pub fn extract_contracts(
         }
     }
 
+    // 3. gRPC service contracts from .proto files (AIF3X-331 #21). Each RPC
+    // becomes a contract with path "/Service/Rpc" so detect_cross_service_deps
+    // can match a client's grpc:// dependency against it. RPC methods carry
+    // their service's qualified id in `parent` (see find_parent_class).
+    let svc_rows = raw_query_prism(
+        prism,
+        &format!(
+            "MATCH (s:Symbol) WHERE s.kind = 'Class' AND s.file ENDS WITH '.proto'{} RETURN s.name, s.file, s.id",
+            ns_clause
+        ),
+    )?;
+    for svc in &svc_rows {
+        if svc.len() < 3 {
+            continue;
+        }
+        let (svc_name, svc_file, svc_id) = (&svc[0], &svc[1], &svc[2]);
+        let rpc_rows = raw_query_prism(
+            prism,
+            &format!(
+                "MATCH (s:Symbol) WHERE s.kind = 'Method' AND s.file = '{}' AND s.parent = '{}' RETURN s.name, s.id",
+                crate::escape_str(svc_file),
+                crate::escape_str(svc_id),
+            ),
+        )?;
+        for rpc in &rpc_rows {
+            if rpc.is_empty() {
+                continue;
+            }
+            let path = format!("/{}/{}", svc_name, rpc[0]);
+            if seen_paths.insert(format!("GRPC {path}")) {
+                contracts.push(Contract {
+                    kind: ContractKind::GrpcService,
+                    service: service_name.to_string(),
+                    method: "GRPC".to_string(),
+                    path,
+                    symbol_id: rpc.get(1).cloned().unwrap_or_default(),
+                    file: svc_file.clone(),
+                });
+            }
+        }
+    }
+
     Ok(contracts)
 }
 

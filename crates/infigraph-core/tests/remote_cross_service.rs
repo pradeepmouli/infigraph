@@ -275,3 +275,123 @@ fn test_group_build_links_cross_service_call_neo4j_postgres() {
     clean_pg(&pg);
     std::env::remove_var("INFIGRAPH_BACKEND");
 }
+
+// gRPC producer/consumer fixtures for the remote gRPC test (AIF3X-331 #35).
+const USER_SERVICE_PROTO: &str = "syntax = \"proto3\";\nservice UserService {\n  rpc GetUser (GetUserRequest) returns (User);\n}\n";
+
+const API_GATEWAY_PY_CLIENT: &str = r#"from user_service_pb2_grpc import UserServiceStub
+
+class Gateway:
+    def __init__(self, channel):
+        self.stub = UserServiceStub(channel)
+
+    def fetch(self, uid):
+        return self.stub.GetUser(uid)
+"#;
+
+/// Remote-mode gRPC cross-service link against live Neo4j + Postgres (#35).
+///
+/// user-service (producer) defines `UserService` in a .proto; api-gateway
+/// (consumer) references `UserServiceStub`. On the SHARED Neo4j graph,
+/// detect_cross_service_deps' gRPC client scan must namespace-scope its source
+/// resolution to each repo's `{org}/{repo}` prefix (same as the HTTP scan) —
+/// otherwise the stub reference in one repo's namespace could misattribute.
+/// Asserts a gRPC CALLS_SERVICE edge from api-gateway into user-service, with
+/// target_service correctly attributed and method 'GRPC'.
+///
+/// `#[ignore]`: needs live containers (see module header). Run with
+/// `--ignored --test-threads=1` alongside the other remote tests.
+#[test]
+#[ignore]
+fn test_group_build_links_grpc_cross_service_call_neo4j_postgres() {
+    let group_name = "remote-grpc-xsvc-test-group";
+
+    std::env::set_var("INFIGRAPH_BACKEND", "neo4j");
+
+    let pg = connect_pg();
+    clean_pg(&pg);
+    let neo = connect_neo4j();
+    neo.raw_query("MATCH (n) DETACH DELETE n")
+        .expect("clear neo4j graph before test");
+
+    let producer_dir = make_repo(&[("proto/user.proto", USER_SERVICE_PROTO)]);
+    let consumer_dir = make_repo(&[("app/gateway.py", API_GATEWAY_PY_CLIENT)]);
+
+    pg.upsert_repo(
+        "user-service",
+        &repo_entry("user-service", producer_dir.path()),
+    )
+    .expect("seed user-service repo");
+    pg.upsert_repo(
+        "api-gateway",
+        &repo_entry("api-gateway", consumer_dir.path()),
+    )
+    .expect("seed api-gateway repo");
+    pg.create_group(group_name).expect("create group");
+    pg.group_add(group_name, "user-service")
+        .expect("add user-service to group");
+    pg.group_add(group_name, "api-gateway")
+        .expect("add api-gateway to group");
+
+    let mut registry =
+        Registry::load().expect("load registry via Postgres (INFIGRAPH_BACKEND=neo4j)");
+    assert!(
+        registry.groups.contains_key(group_name),
+        "seeded gRPC group should round-trip through Postgres"
+    );
+
+    let index_results = multi::index_group(
+        &mut registry,
+        group_name,
+        true,
+        infigraph_languages::bundled_registry,
+    )
+    .expect("index_group should succeed against live Neo4j");
+    assert_eq!(index_results.len(), 2, "both repos should have indexed");
+
+    let contract_count = multi::sync_group_contracts(
+        &mut registry,
+        group_name,
+        infigraph_languages::bundled_registry,
+    )
+    .expect("sync_group_contracts should succeed");
+    assert!(
+        contract_count > 0,
+        "expected a GrpcService contract from user-service's .proto"
+    );
+
+    let linked = multi::link_cross_service_calls(
+        &registry,
+        group_name,
+        infigraph_languages::bundled_registry,
+    )
+    .expect("link_cross_service_calls should succeed");
+    assert!(
+        linked > 0,
+        "expected a gRPC CALLS_SERVICE edge from api-gateway into user-service"
+    );
+
+    // A gRPC CALLS_SERVICE edge into user-service, method 'GRPC', correctly
+    // attributed (not leaked to another repo's namespace on the shared graph).
+    let rows = neo
+        .raw_query(
+            "MATCH (caller:Symbol)-[r:CALLS_SERVICE]->(target:Symbol) \
+             WHERE r.method = 'GRPC' AND r.target_service = 'user-service' \
+             RETURN caller.id, target.id, r.target_service, r.path",
+        )
+        .expect("query for gRPC CALLS_SERVICE edge into user-service");
+    assert!(
+        !rows.is_empty(),
+        "expected a gRPC CALLS_SERVICE edge from an api-gateway caller into \
+         user-service (target_service = 'user-service', method = 'GRPC'); the \
+         namespaced source scan must resolve the UserServiceStub reference in \
+         api-gateway's own namespace. Rows: {:?}",
+        rows
+    );
+
+    // Cleanup.
+    neo.raw_query("MATCH (n) DETACH DELETE n")
+        .expect("clear neo4j graph after test");
+    clean_pg(&pg);
+    std::env::remove_var("INFIGRAPH_BACKEND");
+}

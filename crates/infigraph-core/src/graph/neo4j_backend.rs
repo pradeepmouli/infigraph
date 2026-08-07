@@ -481,7 +481,7 @@ fn parse_return_columns(cypher: &str) -> Vec<String> {
         .iter()
         .filter_map(|kw| {
             let u = after_return.to_uppercase();
-            u.find(kw).map(|p| p)
+            u.find(kw)
         })
         .min()
         .unwrap_or(after_return.len());
@@ -714,9 +714,14 @@ impl GraphBackend for Neo4jBackend {
     }
 
     fn callers_of(&self, symbol_id: &str) -> Result<Vec<String>> {
+        // Also surfaces FastAPI-style DI/middleware registration sites
+        // (INJECTS_DEPENDENCY, REGISTERS_MIDDLEWARE) alongside real CALLS
+        // edges, matching KuzuBackend/GraphQuery::callers_of — AIF3X-331 #16.
+        // Neo4j returns an empty match (not an error) for an edge type with
+        // zero instances, so this is safe even for non-Python repos.
         self.collect_strings(
             &format!(
-                "MATCH (caller:Symbol)-[:CALLS]->(s:Symbol {{id: '{}'}}) RETURN caller.id AS id",
+                "MATCH (caller:Symbol)-[:CALLS|INJECTS_DEPENDENCY|REGISTERS_MIDDLEWARE]->(s:Symbol {{id: '{}'}}) RETURN caller.id AS id",
                 escape(symbol_id)
             ),
             "id",
@@ -975,11 +980,7 @@ impl GraphBackend for Neo4jBackend {
             .collect();
 
         let total = covered.len() + uncovered.len();
-        let pct = if total > 0 {
-            covered.len() * 100 / total
-        } else {
-            0
-        };
+        let pct = (covered.len() * 100).checked_div(total).unwrap_or(0);
 
         Ok(TestCoverage {
             covered_count: covered.len(),
@@ -1415,7 +1416,7 @@ impl GraphBackend for Neo4jBackend {
     // ── Write ────────────────────────────────────────────────────────
 
     fn upsert_file(&self, extraction: &FileExtraction) -> Result<()> {
-        self.delete_files_data(&[extraction.file.clone()])?;
+        self.delete_files_data(std::slice::from_ref(&extraction.file))?;
         self.upsert_extraction(extraction)
     }
 

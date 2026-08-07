@@ -62,6 +62,26 @@ pub(crate) fn fwd_slash_path(p: &std::path::Path) -> String {
     p.to_string_lossy().replace('\\', "/")
 }
 
+/// Lookup stem for a Module file id (a path): final path segment with its file
+/// extension stripped, lower-cased. "pkg/helpers.py" -> "helpers".
+pub(crate) fn file_stem(path: &str) -> String {
+    let base = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    let stem = base.rsplit_once('.').map(|(s, _)| s).unwrap_or(base);
+    stem.to_lowercase()
+}
+
+/// Lookup stem for an import target module name: the last dotted/slashed
+/// segment, lower-cased. Python "src.lib" -> "lib"; "pkg/mod" -> "mod";
+/// bare "helpers" -> "helpers". Matches `file_stem` so an import resolves to
+/// the imported file's Module node (whose stem is computed via `file_stem`).
+pub(crate) fn import_stem(module_name: &str) -> String {
+    module_name
+        .rsplit(['.', '/', '\\'])
+        .next()
+        .unwrap_or(module_name)
+        .to_lowercase()
+}
+
 /// Batch-insert edges via UNWIND in chunks of 500.
 pub(crate) fn unwind_edges_from_pairs(
     conn: &Connection,

@@ -1728,6 +1728,13 @@ const COZO_SCHEMA: &[&str] = &[
     ":create has_config {symbol_id: String, config_id: String}",
     ":create resolves_to {source: String, target: String, mechanism: String default \"\", config_source: String default \"\"}",
     ":create taint_flow {source: String, target: String, source_kind: String default \"\", sink_kind: String default \"\", path: String default \"\"}",
+    // AIF3X-331 #16: parity entries for the Kuzu INJECTS_DEPENDENCY/
+    // REGISTERS_MIDDLEWARE rel tables (schema_parity.rs requires every Kuzu
+    // rel table to have a Cozo equivalent). Cozo isn't an active GraphBackend
+    // implementation (only Kuzu/Neo4j are — see backend.rs), so this is
+    // schema-shape parity only, not a functional query path.
+    ":create injects_dependency {source: String, target: String}",
+    ":create registers_middleware {source: String, target: String}",
     // Materialized helpers for fast aggregation
     ":create meta_cache {key: String => val: Int}",
     ":create testable_cache {id: String}",

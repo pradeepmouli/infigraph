@@ -13,6 +13,7 @@ pub mod embed;
 pub mod export;
 pub mod extract;
 pub mod graph;
+pub mod ignore_rules;
 pub mod instances;
 pub mod lang;
 pub mod learned;
@@ -71,6 +72,34 @@ pub fn build_hash() -> &'static str {
 /// it open would trigger `wipe_graph`, destroying the watcher's live data.
 fn is_lock_contention_error(err: &anyhow::Error) -> bool {
     err.to_string().contains("Could not set lock on file")
+}
+
+/// Open the Kùzu graph, retrying briefly on lock contention (AIF3X-331 #36).
+///
+/// The graph is single-writer: while a watcher's per-reindex write holds the
+/// lock (~milliseconds), a concurrent open fails with "Could not set lock on
+/// file". That window is transient, so rather than hard-fail a reader/opener
+/// immediately, poll with exponential backoff (1ms doubling to a 200ms cap) up
+/// to `budget`, then surface the error. A genuinely stuck holder still fails
+/// after the budget. Non-lock errors (e.g. real corruption) return immediately
+/// so the caller's wipe/rebuild path isn't delayed.
+fn open_kuzu_with_retry<T>(
+    mut open: impl FnMut() -> Result<T>,
+    budget: std::time::Duration,
+) -> Result<T> {
+    let start = std::time::Instant::now();
+    let mut delay = std::time::Duration::from_millis(1);
+    loop {
+        match open() {
+            Ok(v) => return Ok(v),
+            Err(e) if is_lock_contention_error(&e) && start.elapsed() < budget => {
+                let remaining = budget.saturating_sub(start.elapsed());
+                std::thread::sleep(delay.min(remaining));
+                delay = (delay * 2).min(std::time::Duration::from_millis(200));
+            }
+            Err(e) => return Err(e),
+        }
+    }
 }
 
 /// The main entry point for the infigraph framework.
@@ -210,7 +239,10 @@ impl Infigraph {
             "neo4j" => {
                 anyhow::bail!("neo4j backend requested but binary compiled without `neo4j` feature")
             }
-            _ => match graph::KuzuBackend::open(&self.db_path) {
+            _ => match open_kuzu_with_retry(
+                || graph::KuzuBackend::open(&self.db_path),
+                std::time::Duration::from_secs(3),
+            ) {
                 Ok(kb) => {
                     self.backend_kind = BackendKind::Kuzu(kb);
                     Ok(())
@@ -355,7 +387,13 @@ impl Infigraph {
                 anyhow::bail!("neo4j backend requested but binary compiled without `neo4j` feature")
             }
             _ => {
-                let kb = graph::KuzuBackend::open_read_only(&self.db_path)?;
+                // Retry briefly on lock contention: a reader landing during a
+                // watcher's per-reindex write window should wait it out, not
+                // hard-fail (AIF3X-331 #36).
+                let kb = open_kuzu_with_retry(
+                    || graph::KuzuBackend::open_read_only(&self.db_path),
+                    std::time::Duration::from_secs(3),
+                )?;
                 self.backend_kind = BackendKind::Kuzu(kb);
                 Ok(())
             }
@@ -823,21 +861,8 @@ impl Infigraph {
     }
 
     fn collect_files(&self) -> Result<Vec<PathBuf>> {
-        use ignore::WalkBuilder;
-
         let mut files = Vec::new();
-        let walker = WalkBuilder::new(&self.root)
-            .hidden(true)
-            .add_custom_ignore_filename(".infigraphignore")
-            .git_ignore(true)
-            .filter_entry(|e| {
-                let name = e.file_name().to_string_lossy();
-                !matches!(
-                    name.as_ref(),
-                    ".infigraph" | "node_modules" | "__pycache__" | ".tox"
-                )
-            })
-            .build();
+        let walker = crate::ignore_rules::walk_builder(&self.root).build();
 
         for result in walker {
             let entry = match result {
@@ -903,6 +928,85 @@ mod tests {
         assert!(
             !is_lock_contention_error(&err),
             "a genuine format/ID mismatch must still be treated as corruption and wiped"
+        );
+    }
+
+    // AIF3X-331 #36: open_kuzu_with_retry waits out a transient lock-contention
+    // window (a watcher's per-reindex write) instead of hard-failing a reader.
+
+    #[test]
+    fn open_kuzu_retry_succeeds_after_transient_lock_contention() {
+        use std::cell::Cell;
+        // Fail with a lock error the first 3 attempts, then succeed — models a
+        // reindex write that releases the lock a few polls in.
+        let attempts = Cell::new(0);
+        let result = open_kuzu_with_retry(
+            || {
+                let n = attempts.get() + 1;
+                attempts.set(n);
+                if n <= 3 {
+                    Err(anyhow::anyhow!(
+                        "failed to open kuzu db: IO exception: Could not set lock on file : /x/.infigraph/graph"
+                    ))
+                } else {
+                    Ok(n)
+                }
+            },
+            std::time::Duration::from_secs(2),
+        );
+        assert_eq!(
+            result.unwrap(),
+            4,
+            "should retry past the transient lock window and succeed on the 4th open"
+        );
+    }
+
+    #[test]
+    fn open_kuzu_retry_surfaces_error_after_budget() {
+        // Persistent lock contention must still fail once the budget expires,
+        // so a genuinely stuck holder doesn't hang forever.
+        let attempts = std::cell::Cell::new(0);
+        let start = std::time::Instant::now();
+        let result: Result<()> = open_kuzu_with_retry(
+            || {
+                attempts.set(attempts.get() + 1);
+                Err(anyhow::anyhow!(
+                    "failed to open kuzu db: IO exception: Could not set lock on file : /x/.infigraph/graph"
+                ))
+            },
+            std::time::Duration::from_millis(50),
+        );
+        assert!(
+            result.is_err(),
+            "persistent lock contention must eventually error"
+        );
+        assert!(is_lock_contention_error(&result.unwrap_err()));
+        assert!(
+            start.elapsed() >= std::time::Duration::from_millis(50),
+            "should have waited out the full budget before failing"
+        );
+        assert!(attempts.get() >= 2, "should have retried at least once");
+    }
+
+    #[test]
+    fn open_kuzu_retry_does_not_retry_non_lock_errors() {
+        // Genuine corruption must return immediately (no wasted backoff) so the
+        // caller's wipe/rebuild path isn't delayed.
+        let attempts = std::cell::Cell::new(0);
+        let result: Result<()> = open_kuzu_with_retry(
+            || {
+                attempts.set(attempts.get() + 1);
+                Err(anyhow::anyhow!(
+                    "failed to open kuzu db: Runtime exception: Database ID mismatch (corrupt)"
+                ))
+            },
+            std::time::Duration::from_secs(5),
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            attempts.get(),
+            1,
+            "a non-lock (corruption) error must not be retried"
         );
     }
 

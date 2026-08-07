@@ -327,6 +327,43 @@ fn test_detect_bridges_grpc() {
     );
 }
 
+// AIF3X-331 #21: gRPC contract extraction produces one contract per RPC method.
+// Real extraction (not hand-built symbols) so it exercises find_parent_class's
+// proto `service` handling — RPC methods must carry their service's qualified id
+// as parent, and extract_grpc_contracts must match on that id. Before the fix,
+// proto RPCs had an empty parent and this returned zero contracts.
+#[test]
+fn test_extract_grpc_contracts_one_per_rpc() {
+    use infigraph_core::graph::GraphBackend;
+    use infigraph_languages::bundled_registry;
+
+    let registry = bundled_registry().unwrap();
+    let pack = registry.for_extension(".proto").unwrap();
+    let src = b"syntax = \"proto3\";\nservice UserService {\n  rpc GetUser (GetUserRequest) returns (User);\n  rpc ListUsers (ListReq) returns (UserList);\n}\n";
+    let ext = infigraph_core::extract::extract_file("user.proto", src, pack).unwrap();
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let backend = KuzuBackend::open(&dir.path().join("graph")).unwrap();
+    backend.upsert_files_bulk(&[ext], true).unwrap();
+
+    let contracts = infigraph_core::multi::grpc::extract_grpc_contracts(&backend);
+    let rpcs: Vec<&str> = contracts
+        .iter()
+        .filter(|c| c.service == "UserService" || c.path.starts_with("/UserService/"))
+        .map(|c| c.path.as_str())
+        .collect();
+    assert_eq!(
+        contracts.len(),
+        2,
+        "expected one GrpcService contract per RPC (GetUser, ListUsers), got: {:?}",
+        contracts.iter().map(|c| &c.path).collect::<Vec<_>>()
+    );
+    assert!(
+        rpcs.contains(&"/UserService/GetUser") && rpcs.contains(&"/UserService/ListUsers"),
+        "contracts should cover both RPCs, got: {rpcs:?}"
+    );
+}
+
 #[test]
 fn test_detect_bridges_jni() {
     let dir = tempfile::TempDir::new().unwrap();

@@ -5,7 +5,7 @@ use kuzu::Connection;
 
 use super::schema::ensure_custom_edge_table;
 use super::store::{GraphStore, WriteLock};
-use super::store_util::escape;
+use super::store_util::{escape, file_stem, import_stem};
 use crate::model::{FileExtraction, RelationKind};
 
 impl GraphStore {
@@ -112,6 +112,21 @@ impl GraphStore {
             ));
         }
 
+        // Map module-basename (no extension) -> Module file-id, so IMPORTS
+        // targets (which are captured as bare module NAMES like "helpers", not
+        // file paths) can be resolved to the actual Module node id (its file
+        // path). Without this, the IMPORTS write below matched b.id against a
+        // "{file}::{module}" string that no Module node ever has, so zero
+        // Module->Module edges were created and get_file_deps was always empty
+        // (AIF3X-331 #20b). Built from the current batch — on a full index that
+        // is every file; incremental single-file re-index can't resolve a
+        // cross-file import target here, which is acceptable (get_file_deps is
+        // computed against the persisted full graph).
+        let module_by_stem: HashMap<String, &str> = extractions
+            .iter()
+            .map(|e| (file_stem(&e.file), e.file.as_str()))
+            .collect();
+
         // 6. All relation edges grouped by type
         let mut calls_pairs: Vec<String> = Vec::new();
         let mut inherits_pairs: Vec<String> = Vec::new();
@@ -122,20 +137,58 @@ impl GraphStore {
         let mut custom_pairs: HashMap<String, Vec<String>> = HashMap::new();
         for e in extractions {
             for rel in &e.relations {
-                let pair = format!(
-                    "{{a: '{}', b: '{}'}}",
-                    escape(&rel.source_id),
-                    escape(&rel.target_id)
-                );
                 match &rel.kind {
-                    RelationKind::Calls | RelationKind::CalledBy => calls_pairs.push(pair),
-                    RelationKind::Inherits | RelationKind::InheritedBy => inherits_pairs.push(pair),
-                    RelationKind::TestedBy | RelationKind::Tests => tested_by_pairs.push(pair),
-                    RelationKind::Imports | RelationKind::ImportedBy => imports_pairs.push(pair),
-                    RelationKind::Reads => reads_pairs.push(pair),
-                    RelationKind::Writes => writes_pairs.push(pair),
+                    RelationKind::Calls | RelationKind::CalledBy => calls_pairs.push(format!(
+                        "{{a: '{}', b: '{}'}}",
+                        escape(&rel.source_id),
+                        escape(&rel.target_id)
+                    )),
+                    RelationKind::Inherits | RelationKind::InheritedBy => {
+                        inherits_pairs.push(format!(
+                            "{{a: '{}', b: '{}'}}",
+                            escape(&rel.source_id),
+                            escape(&rel.target_id)
+                        ))
+                    }
+                    RelationKind::TestedBy | RelationKind::Tests => tested_by_pairs.push(format!(
+                        "{{a: '{}', b: '{}'}}",
+                        escape(&rel.source_id),
+                        escape(&rel.target_id)
+                    )),
+                    RelationKind::Imports | RelationKind::ImportedBy => {
+                        // target_id is "{file}::{module_name}"; resolve the bare
+                        // module name to the imported file's Module id. Skip
+                        // external/unresolvable imports (e.g. "fastapi") — they
+                        // have no Module node in this project.
+                        let module_name =
+                            rel.target_id.rsplit("::").next().unwrap_or(&rel.target_id);
+                        let stem = import_stem(module_name);
+                        if let Some(target_file) = module_by_stem.get(stem.as_str()) {
+                            if *target_file != rel.source_id {
+                                imports_pairs.push(format!(
+                                    "{{a: '{}', b: '{}'}}",
+                                    escape(&rel.source_id),
+                                    escape(target_file)
+                                ));
+                            }
+                        }
+                    }
+                    RelationKind::Reads => reads_pairs.push(format!(
+                        "{{a: '{}', b: '{}'}}",
+                        escape(&rel.source_id),
+                        escape(&rel.target_id)
+                    )),
+                    RelationKind::Writes => writes_pairs.push(format!(
+                        "{{a: '{}', b: '{}'}}",
+                        escape(&rel.source_id),
+                        escape(&rel.target_id)
+                    )),
                     RelationKind::Custom(name) => {
-                        custom_pairs.entry(name.clone()).or_default().push(pair);
+                        custom_pairs.entry(name.clone()).or_default().push(format!(
+                            "{{a: '{}', b: '{}'}}",
+                            escape(&rel.source_id),
+                            escape(&rel.target_id)
+                        ));
                     }
                     _ => {}
                 }

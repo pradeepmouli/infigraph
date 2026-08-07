@@ -540,7 +540,7 @@ fn test_neo4j_delete_file_full() {
 
     let hashes = backend.get_file_hashes().expect("hashes");
     assert!(
-        hashes.get("src/lib.py").is_none(),
+        !hashes.contains_key("src/lib.py"),
         "hash for deleted file should be gone"
     );
 
@@ -667,7 +667,7 @@ fn test_neo4j_move_rename_file() {
     assert_eq!(new_syms[0].name, "process");
 
     let hashes = backend.get_file_hashes().expect("hashes");
-    assert!(hashes.get("src/lib.py").is_none(), "old path hash gone");
+    assert!(!hashes.contains_key("src/lib.py"), "old path hash gone");
     assert_eq!(
         hashes.get("src/core/lib.py").map(|s| s.as_str()),
         Some("bbb"),

@@ -251,6 +251,33 @@ pub fn detect_cross_cutting(backend: &dyn GraphBackend) -> Result<Vec<ConcernMat
         }
     }
 
+    // Docstring patterns can't see FastAPI's `app.add_middleware(...)` /
+    // `Depends(...)` wiring -- that's structural (a registration call site
+    // calling into the middleware/dependency function), not a decorator on
+    // the function itself, and it's already captured as REGISTERS_MIDDLEWARE
+    // / INJECTS_DEPENDENCY graph edges during extraction (AIF3X-331 #16).
+    // Surface those edges here too instead of leaving this tool blind to them.
+    for (edge_kind, concern_kind) in [
+        ("REGISTERS_MIDDLEWARE", "Middleware"),
+        ("INJECTS_DEPENDENCY", "DependencyInjection"),
+    ] {
+        let query = format!("MATCH (a:Symbol)-[:{edge_kind}]->(b:Symbol) RETURN a.id, b.id");
+        if let Ok(rows) = backend.raw_query(&query) {
+            for row in rows {
+                if row.len() < 2 {
+                    continue;
+                }
+                let source_id = row[0].trim_matches('"');
+                let target_id = row[1].trim_matches('"');
+                matches.push(ConcernMatch {
+                    symbol_id: target_id.to_string(),
+                    kind: concern_kind,
+                    detail: format!("registered via {edge_kind} at {source_id}"),
+                });
+            }
+        }
+    }
+
     if !matches.is_empty() {
         write_concerns(backend, &matches)?;
     }

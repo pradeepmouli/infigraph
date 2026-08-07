@@ -171,6 +171,22 @@ impl GraphBackend for KuzuBackend {
     // ── Read: raw query ──────────────────────────────────────────────
 
     fn raw_query(&self, query: &str) -> Result<Vec<Vec<String>>> {
+        // Each call opens a fresh Connection (see GraphStore::connection), so
+        // BEGIN TRANSACTION/COMMIT/ROLLBACK issued through this method can
+        // never span multiple statements -- the transaction dies with the
+        // connection that opened it, and a later call's COMMIT then fails
+        // with "No active transaction." Kuzu auto-commits each statement
+        // individually outside an explicit transaction, so no-op these
+        // exactly like Neo4jBackend::raw_query already does, rather than
+        // let every multi-statement "transactional" write silently break.
+        let trimmed = query.trim_end_matches(';').trim();
+        if trimmed.eq_ignore_ascii_case("BEGIN TRANSACTION")
+            || trimmed.eq_ignore_ascii_case("BEGIN")
+            || trimmed.eq_ignore_ascii_case("COMMIT")
+            || trimmed.eq_ignore_ascii_case("ROLLBACK")
+        {
+            return Ok(Vec::new());
+        }
         let conn = self.store.connection()?;
         let q = GraphQuery::new(&conn);
         q.raw_query(query)

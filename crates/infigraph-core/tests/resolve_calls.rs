@@ -1,6 +1,8 @@
+use infigraph_core::extract::extract_file;
 use infigraph_core::graph::GraphStore;
 use infigraph_core::model::{FileExtraction, Relation, RelationKind, Span, Symbol, SymbolKind};
 use infigraph_core::resolve;
+use infigraph_languages::bundled_registry;
 
 fn span(file: &str, start: u32, end: u32) -> Span {
     Span {
@@ -444,6 +446,146 @@ fn test_resolve_empty_extractions() {
     let stats = resolve::resolve_calls_incremental(&env.store, &[], None).unwrap();
     assert_eq!(stats.total_calls, 0);
     assert_eq!(stats.resolved, 0);
+}
+
+#[test]
+fn test_resolve_class_method_calling_imported_function_no_duplicate_edge() {
+    // Regression for AIF3X-331 #14: a class method's call site is emitted with
+    // an unqualified source_id (file::method, no class segment), which forces
+    // the file_name_to_ids fallback expansion in resolve_with_map. That map is
+    // populated once from extractions and once from symbol_map, so the same
+    // target id could be pushed twice for one (file, name) key — fanning a
+    // single call site out into two identical CALLS edges.
+    let extractions = vec![
+        FileExtraction {
+            file: "risk_service.py".to_string(),
+            language: "python".to_string(),
+            content_hash: "a".to_string(),
+            symbols: vec![sym(
+                "risk_service.py::do_input_risk_screening",
+                "do_input_risk_screening",
+                SymbolKind::Function,
+                "risk_service.py",
+                1,
+                3,
+            )],
+            relations: vec![],
+            statements: vec![],
+        },
+        FileExtraction {
+            file: "chat_service.py".to_string(),
+            language: "python".to_string(),
+            content_hash: "b".to_string(),
+            symbols: vec![
+                sym(
+                    "chat_service.py::ChatService",
+                    "ChatService",
+                    SymbolKind::Class,
+                    "chat_service.py",
+                    1,
+                    10,
+                ),
+                sym(
+                    "chat_service.py::ChatService::process_chat_request",
+                    "process_chat_request",
+                    SymbolKind::Method,
+                    "chat_service.py",
+                    4,
+                    9,
+                ),
+            ],
+            relations: vec![
+                // Unqualified source_id, as find_enclosing_function emits it.
+                call(
+                    "chat_service.py::process_chat_request",
+                    "risk_service.py::do_input_risk_screening",
+                ),
+                import("chat_service.py", "risk_service"),
+            ],
+            statements: vec![],
+        },
+    ];
+
+    let env = TestEnv::new(&extractions);
+    let stats = resolve::resolve_calls(&env.store, &extractions, None).unwrap();
+    assert_eq!(stats.resolved, 1);
+
+    let conn = env.store.connection().unwrap();
+    let q = infigraph_core::graph::GraphQuery::new(&conn);
+    let callees = q
+        .callees_of("chat_service.py::ChatService::process_chat_request")
+        .unwrap();
+    assert_eq!(
+        callees.len(),
+        1,
+        "expected exactly one CALLS edge, got: {:?}",
+        callees
+    );
+}
+
+// ---------- AIF3X-331 #15: real extractor, relative-import + name-collision repro ----------
+//
+// The eval report claimed do_input_risk_screening was missing 2 of 4 real
+// production callers. Every hand-crafted-relation fixture tried previously
+// resolved 4/4, because a unique target name short-circuits resolution
+// (resolve_with_map only consults import-scope matching when more than one
+// same-named candidate exists). This test removes that short-circuit by
+// creating a genuine name collision, and runs real .py source through the
+// production tree-sitter registry (not hand-built Relations), since the
+// python/relations.scm import query only matches `module_name: (dotted_name)`
+// and silently produces zero Imports relations for a relative import.
+fn extract_real(file: &str, src: &[u8]) -> FileExtraction {
+    let registry = bundled_registry().unwrap();
+    let pack = registry.for_extension(".py").unwrap();
+    extract_file(file, src, pack).unwrap()
+}
+
+#[test]
+fn test_resolve_relative_import_with_name_collision() {
+    let risk_service = extract_real(
+        "app/service/v3/services/risk_service.py",
+        b"async def do_input_risk_screening(request):\n    return True\n",
+    );
+    // The collision: a second, unrelated definition sharing the same bare name.
+    let decoy = extract_real(
+        "tests/fakes/fake_risk.py",
+        b"async def do_input_risk_screening(request):\n    return False\n",
+    );
+    let chat_service = extract_real(
+        "app/service/v3/services/chat_service.py",
+        b"from .risk_service import do_input_risk_screening\n\nclass ChatService:\n    async def process_chat_request(self, request):\n        await do_input_risk_screening(request)\n",
+    );
+    let messages_service = extract_real(
+        "app/service/v3/services/messages_service.py",
+        b"from app.service.v3.services.risk_service import do_input_risk_screening\n\nclass MessagesService:\n    async def process_messages_request(self, request):\n        await do_input_risk_screening(request)\n",
+    );
+
+    let extractions = vec![risk_service, decoy, chat_service, messages_service];
+    let env = TestEnv::new(&extractions);
+    resolve::resolve_calls(&env.store, &extractions, None).unwrap();
+
+    let conn = env.store.connection().unwrap();
+    let q = infigraph_core::graph::GraphQuery::new(&conn);
+    let real_callers = q
+        .callers_of("app/service/v3/services/risk_service.py::do_input_risk_screening")
+        .unwrap();
+
+    assert!(
+        real_callers
+            .iter()
+            .any(|c| c.contains("process_chat_request")),
+        "relative-import caller (chat_service, matches report's missing case) should resolve \
+         to the real risk_service definition, got callers: {:?}",
+        real_callers
+    );
+    assert!(
+        real_callers
+            .iter()
+            .any(|c| c.contains("process_messages_request")),
+        "absolute-import caller (messages_service, matches report's found case) should resolve \
+         to the real risk_service definition, got callers: {:?}",
+        real_callers
+    );
 }
 
 #[test]

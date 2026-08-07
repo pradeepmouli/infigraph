@@ -40,10 +40,14 @@ impl<'a, 'db> GraphQuery<'a, 'db> {
         Ok(rows)
     }
 
-    /// Find direct callers of a symbol.
+    /// Find direct callers of a symbol. Also surfaces FastAPI-style DI/middleware
+    /// registration sites (INJECTS_DEPENDENCY, REGISTERS_MIDDLEWARE) alongside
+    /// real CALLS edges — AIF3X-331 #16: a Depends()/add_middleware() registration
+    /// is a real reference to the symbol, and trace_callers should show it instead
+    /// of only unit-test callers.
     pub fn callers_of(&self, symbol_id: &str) -> Result<Vec<String>> {
         let query = format!(
-            "MATCH (caller:Symbol)-[:CALLS]->(target:Symbol) WHERE target.id = '{}' RETURN caller.id",
+            "MATCH (caller:Symbol)-[:CALLS|INJECTS_DEPENDENCY|REGISTERS_MIDDLEWARE]->(target:Symbol) WHERE target.id = '{}' RETURN caller.id",
             symbol_id.replace('\'', "\\'")
         );
         self.collect_strings(&query)

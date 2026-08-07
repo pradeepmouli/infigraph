@@ -323,7 +323,11 @@ pub fn tool_get_api_surface(args: &Value) -> Result<String> {
     let backend = prism.backend().context("not initialized")?;
 
     let file_filter = args.get("file").and_then(|v| v.as_str());
-    let mut syms = backend.get_api_surface()?;
+    let include_tests = args
+        .get("include_tests")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let mut syms = backend.get_api_surface_filtered(include_tests)?;
     if let Some(f) = file_filter {
         syms.retain(|s| s.file.contains(f));
     }

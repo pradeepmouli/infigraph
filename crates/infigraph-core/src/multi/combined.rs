@@ -728,12 +728,34 @@ fn resolve_cross_repo(store: &GraphStore, contracts: &[super::Contract]) -> Resu
         // Build contract lookup: (service, method, normalized_path) → symbol_id
         let mut contract_map: HashMap<(String, String, String), String> = HashMap::new();
         for c in contracts {
-            if c.kind == ContractKind::HttpRoute {
-                let norm = normalize_route_path(&c.path);
-                contract_map.insert(
-                    (c.service.clone(), c.method.to_ascii_uppercase(), norm),
-                    c.symbol_id.clone(),
-                );
+            match c.kind {
+                ContractKind::HttpRoute => {
+                    let norm = normalize_route_path(&c.path);
+                    contract_map.insert(
+                        (c.service.clone(), c.method.to_ascii_uppercase(), norm),
+                        c.symbol_id.clone(),
+                    );
+                }
+                // gRPC (AIF3X-331 #21b): the CALLS_SERVICE edge is SERVICE-level
+                // (method "GRPC", path "/ServiceName"), while a GrpcService
+                // contract is RPC-level (path "/ServiceName/Rpc"). Key the map at
+                // service granularity ("/ServiceName") so the edge resolves; the
+                // value is a concrete RPC symbol of that service, so the promoted
+                // CALLS edge lands on a real node. first-RPC-wins is fine — any
+                // RPC symbol anchors the caller→service link.
+                ContractKind::GrpcService => {
+                    let svc_path = {
+                        let p = c.path.trim_start_matches('/');
+                        match p.split_once('/') {
+                            Some((svc, _rpc)) => format!("/{svc}"),
+                            None => format!("/{p}"),
+                        }
+                    };
+                    contract_map
+                        .entry((c.service.clone(), "GRPC".to_string(), svc_path))
+                        .or_insert_with(|| c.symbol_id.clone());
+                }
+                _ => {}
             }
         }
 

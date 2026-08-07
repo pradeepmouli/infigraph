@@ -843,10 +843,10 @@ impl PostgresMetaStore {
 
         Ok(rows
             .iter()
-            .filter_map(|r| {
+            .map(|r| {
                 let id: String = r.get(0);
                 let dist: f64 = r.get(1);
-                Some((id, dist as f32))
+                (id, dist as f32)
             })
             .collect())
     }

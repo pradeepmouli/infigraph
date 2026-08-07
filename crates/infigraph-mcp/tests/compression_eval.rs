@@ -230,23 +230,33 @@ fn phase3_dedup_eval() {
         second_is_placeholder: bool,
     }
 
+    // Each case must (a) produce output large enough to clear apply_seen_dedup's
+    // internal `tokens < 50` gate, and (b) carry an identifying arg that
+    // content_key() keys on (symbol_id / query / name / file). A path-only call
+    // like get_architecture({path}) builds the key "get_architecture:" which
+    // ends in ':' and is deliberately never deduped, so it must not be used as a
+    // dedup sample (the eligibility gate below drops any case that early-returns).
     let test_cases: Vec<(&str, &str, serde_json::Value)> = vec![
         (
             "D1",
-            "search",
-            json!({"path": p, "query": "dedup eval test symbol", "limit": 10}),
+            "get_skeleton",
+            json!({"path": p, "file": "crates/infigraph-mcp/src/session_context.rs"}),
         ),
         (
             "D2",
-            "get_doc_context",
-            json!({"path": p, "symbol_id": "crates/infigraph-mcp/src/lib.rs::dispatch_tool"}),
+            "get_skeleton",
+            json!({"path": p, "file": "crates/infigraph-mcp/src/compress.rs"}),
         ),
         (
             "D3",
-            "find_all_references",
-            json!({"path": p, "symbol_id": "crates/infigraph-mcp/src/tools/search.rs::tool_search"}),
+            "get_doc_context",
+            json!({"path": p, "symbol_id": "crates/infigraph-mcp/src/session_context.rs::apply_seen_dedup"}),
         ),
-        ("D4", "get_architecture", json!({"path": p})),
+        (
+            "D4",
+            "get_doc_context",
+            json!({"path": p, "symbol_id": "crates/infigraph-mcp/src/lib.rs::dispatch_tool"}),
+        ),
     ];
 
     let mut results: Vec<DedupResult> = Vec::new();
@@ -321,19 +331,27 @@ fn phase3_dedup_eval() {
         results.len()
     );
 
-    // Quality gate: dedup should work on outputs large enough to compress
-    // Small outputs (<50 tokens) are exempt from dedup
+    // Quality gate: dedup should work on outputs large enough to compress.
+    // apply_seen_dedup exempts outputs under 50 tokens (its internal gate uses
+    // the same estimate_tokens formula this test does), so first_tokens >= 50 is
+    // an accurate proxy for "went through the dedup path". The sample is chosen
+    // so that at least two cases clear that gate and carry a content_key-able arg.
     let dedup_eligible: Vec<&DedupResult> =
         results.iter().filter(|r| r.first_tokens >= 50).collect();
-    let dedup_rate = if !dedup_eligible.is_empty() {
-        dedup_eligible
+    assert!(
+        !dedup_eligible.is_empty(),
+        "no eligible (>=50 token) outputs in the dedup sample — the test cases no \
+         longer produce large enough output to exercise dedup; results: {:?}",
+        results
             .iter()
-            .filter(|r| r.second_is_placeholder)
-            .count() as f64
-            / dedup_eligible.len() as f64
-    } else {
-        0.0
-    };
+            .map(|r| (r.id, r.tool, r.first_tokens, r.second_is_placeholder))
+            .collect::<Vec<_>>()
+    );
+    let dedup_rate = dedup_eligible
+        .iter()
+        .filter(|r| r.second_is_placeholder)
+        .count() as f64
+        / dedup_eligible.len() as f64;
     println!("Dedup rate (eligible): {:.0}%", dedup_rate * 100.0);
 
     assert!(

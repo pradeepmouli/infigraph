@@ -440,10 +440,20 @@ fn python_pack() -> Result<LanguagePack> {
         grammar,
         PYTHON_ENTITIES,
         PYTHON_RELATIONS,
-        vec![CustomEdgeDef {
-            name: "DECORATED_BY".to_string(),
-            capture: "decorates".to_string(),
-        }],
+        vec![
+            CustomEdgeDef {
+                name: "DECORATED_BY".to_string(),
+                capture: "decorates".to_string(),
+            },
+            CustomEdgeDef {
+                name: "REGISTERS_MIDDLEWARE".to_string(),
+                capture: "middleware".to_string(),
+            },
+            CustomEdgeDef {
+                name: "INJECTS_DEPENDENCY".to_string(),
+                capture: "depends".to_string(),
+            },
+        ],
     )?
     .with_inherit_decompose(PYTHON_INHERIT_DECOMPOSE)
 }

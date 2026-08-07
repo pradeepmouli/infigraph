@@ -3,6 +3,7 @@ use std::sync::OnceLock;
 
 use serde_json::json;
 
+use infigraph_mcp::tools::analysis::call_graph::{tool_trace_callees, tool_trace_callers};
 use infigraph_mcp::tools::graph::*;
 use infigraph_mcp::tools::helpers::log_activity;
 use infigraph_mcp::tools::index::tool_index_project;
@@ -177,15 +178,38 @@ fn test_graph_tools() {
         "refs: missing defining file: {result}"
     );
 
-    // --- get_api_surface ---
+    // --- get_api_surface (AIF3X-331 #20) ---
+    // Python has no visibility keywords; extract_visibility returns None and the
+    // symbols were previously stored with visibility='' and excluded by
+    // get_api_surface's WHERE s.visibility = 'public'. default_visibility now
+    // marks non-underscore Python symbols public, so they must surface here.
     let result = tool_get_api_surface(&a(json!({}))).unwrap();
     assert!(!result.is_empty(), "api_surface: empty response: {result}");
+    assert!(
+        result.contains("process"),
+        "api_surface: public Python function 'process' must appear (visibility \
+         default regressed?): {result}"
+    );
+    assert!(
+        result.contains("BaseModel"),
+        "api_surface: public Python class 'BaseModel' must appear: {result}"
+    );
 
-    // --- get_file_deps ---
+    // --- get_file_deps (AIF3X-331 #20b) ---
+    // src/main.py has `from src.lib import process`. Import targets are captured
+    // as bare module names ("src.lib"), which previously never resolved to a
+    // Module file id, so IMPORTS edges were never created and this returned no
+    // dependencies. The import-resolution fix in upsert_all_bulk resolves the
+    // module name to src/lib.py, so it must now appear as a dependency.
     let result = tool_get_file_deps(&a(json!({"file": "src/main.py"}))).unwrap();
     assert!(
         result.contains("src/main.py") || result.contains("dependencies"),
         "file_deps: missing file name: {result}"
+    );
+    assert!(
+        result.contains("src/lib.py"),
+        "file_deps: src/main.py imports src/lib.py — the resolved IMPORTS edge \
+         must appear (import module-name→file resolution regressed?): {result}"
     );
 
     // --- get_type_hierarchy ---
@@ -288,6 +312,47 @@ fn test_graph_tools() {
     log_activity("search", &args);
     log_activity("search", &args);
     log_activity("get_latest_session", &args);
+
+    // --- trace_callers include_tests (AIF3X-331 #18) ---
+    // src/lib.py::process is called by src/main.py::main (non-test) AND
+    // tests/test_lib.py::test_process (a Test-kind symbol). Default includes the
+    // test caller; include_tests=false must drop it while keeping main.
+    let callers_all = tool_trace_callers(&a(json!({"symbol_id": "src/lib.py::process"}))).unwrap();
+    assert!(
+        callers_all.contains("test_process"),
+        "trace_callers (default) should include the test caller: {callers_all}"
+    );
+    assert!(
+        callers_all.contains("::main"),
+        "trace_callers (default) should include the non-test caller main: {callers_all}"
+    );
+
+    let callers_no_tests = tool_trace_callers(&a(
+        json!({"symbol_id": "src/lib.py::process", "include_tests": false}),
+    ))
+    .unwrap();
+    assert!(
+        !callers_no_tests.contains("test_process"),
+        "trace_callers(include_tests=false) must exclude the test caller: {callers_no_tests}"
+    );
+    assert!(
+        callers_no_tests.contains("::main"),
+        "trace_callers(include_tests=false) must keep the non-test caller main: {callers_no_tests}"
+    );
+
+    // --- trace_callees include_tests (AIF3X-331 #18) ---
+    // tests/test_lib.py::test_process calls src/lib.py::process. Callees of a
+    // non-test symbol here are all non-test, so the filter must not drop them.
+    let callees_all = tool_trace_callees(&a(json!({"symbol_id": "src/main.py::main"}))).unwrap();
+    let callees_no_tests = tool_trace_callees(&a(
+        json!({"symbol_id": "src/main.py::main", "include_tests": false}),
+    ))
+    .unwrap();
+    assert!(
+        callees_all.contains("process") && callees_no_tests.contains("process"),
+        "trace_callees should keep the non-test callee process in both modes: \
+         all={callees_all} / no_tests={callees_no_tests}"
+    );
 
     // --- error cases ---
     let result = tool_get_stats(&json!({}));
