@@ -14,6 +14,7 @@ mod pipeline_commands;
 mod scip_download;
 mod search_commands;
 mod viz_commands;
+mod worktree_commands;
 
 use std::path::{Path, PathBuf};
 
@@ -646,6 +647,12 @@ enum Commands {
         action: PipelineAction,
     },
 
+    /// Git worktree lifecycle: bootstrap, teardown, and reconcile registry+index state
+    Worktree {
+        #[command(subcommand)]
+        action: WorktreeAction,
+    },
+
     /// LM2 adaptive context: ranked code + sessions + skeleton in one query
     #[command(alias = "mc")]
     MemoryContext {
@@ -802,6 +809,15 @@ pub(crate) enum PipelineAction {
     },
 }
 
+#[derive(Subcommand)]
+pub(crate) enum WorktreeAction {
+    /// Bootstrap a newly created worktree: clone the main worktree's index, then incrementally reindex
+    Init {
+        /// Path to the new worktree
+        path: PathBuf,
+    },
+}
+
 fn main() -> Result<()> {
     // ANTLR parsers recurse deeply; Rayon's default 2MB stack overflows.
     // Windows default main-thread stack is 1MB — also too small.
@@ -822,6 +838,7 @@ fn main() -> Result<()> {
             | Commands::ScipEnrich { .. }
             | Commands::Delete
             | Commands::Clone { .. }
+            | Commands::Worktree { .. }
             | Commands::Update
             | Commands::Install
             | Commands::Uninstall
@@ -1113,6 +1130,9 @@ fn run(command: Commands, root: &Path) -> Result<()> {
                 field,
                 value,
             } => cmd_pipeline_query(root, &plugin_id, &field, &value),
+        },
+        Commands::Worktree { action } => match action {
+            WorktreeAction::Init { path } => worktree_commands::cmd_worktree_init(&path),
         },
     }
 }
