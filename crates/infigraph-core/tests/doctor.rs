@@ -3,8 +3,8 @@ use std::path::PathBuf;
 
 use infigraph_core::doctor::{
     check_disk, check_locks, check_registry, check_sidecars, check_toolchain, check_watchers,
-    find_repo_entry, format_report, projects_in_scope, run_doctor, CheckResult, CheckStatus,
-    DoctorContext, DoctorReport, DoctorScope,
+    check_worktrees, find_repo_entry, format_report, projects_in_scope, run_doctor, CheckResult,
+    CheckStatus, DoctorContext, DoctorReport, DoctorScope,
 };
 use infigraph_core::lockfile::LockInfo;
 use infigraph_core::multi::{Registry, RepoEntry};
@@ -878,4 +878,65 @@ fn check_watchers_passes_when_alive_watcher_has_a_live_mcp_instance() {
         "a live MCP instance registered for this exact project must not warn: {}",
         watcher.message
     );
+}
+
+#[test]
+fn check_worktrees_warns_on_teardown_candidate() {
+    let main = tempfile::TempDir::new().unwrap();
+    let git = |args: &[&str]| {
+        assert!(std::process::Command::new("git")
+            .args(args)
+            .current_dir(main.path())
+            .status()
+            .unwrap()
+            .success());
+    };
+    git(&["init"]);
+    git(&["config", "user.email", "t@t.com"]);
+    git(&["config", "user.name", "t"]);
+    std::fs::write(main.path().join("a.py"), "x = 1\n").unwrap();
+    git(&["add", "a.py"]);
+    git(&["commit", "-m", "init"]);
+
+    let parent = tempfile::TempDir::new().unwrap();
+    let wt_path = parent.path().join("wt1");
+    assert!(std::process::Command::new("git")
+        .args(["worktree", "add", "-b", "gone", wt_path.to_str().unwrap()])
+        .current_dir(main.path())
+        .status()
+        .unwrap()
+        .success());
+    assert!(std::process::Command::new("git")
+        .args(["worktree", "remove", "--force", wt_path.to_str().unwrap()])
+        .current_dir(main.path())
+        .status()
+        .unwrap()
+        .success());
+
+    let mut registry = Registry {
+        repos: HashMap::new(),
+        groups: HashMap::new(),
+    };
+    registry.repos.insert(
+        "main-repo".to_string(),
+        repo_entry("main-repo", main.path().to_str().unwrap()),
+    );
+    registry.repos.insert(
+        "wt1".to_string(),
+        repo_entry("wt1", wt_path.to_str().unwrap()),
+    );
+
+    let ctx = ctx_for(DoctorScope::Project(main.path().to_path_buf()), registry);
+    let results = check_worktrees(&ctx);
+
+    let teardown_warning = results
+        .iter()
+        .find(|r| r.name.contains("wt1"))
+        .expect("must flag the removed-but-registered worktree");
+    assert_eq!(teardown_warning.status, CheckStatus::Warn);
+    assert!(teardown_warning
+        .remediation
+        .as_ref()
+        .unwrap()
+        .contains("infigraph worktree teardown"));
 }

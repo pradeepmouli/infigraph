@@ -821,6 +821,12 @@ pub(crate) enum WorktreeAction {
         /// Path to the removed worktree
         path: PathBuf,
     },
+    /// Reconcile the registry against live git worktrees: evict removed worktrees, report unindexed ones
+    Reconcile {
+        /// Sweep every registered project's repo instead of just the current one
+        #[arg(long)]
+        global: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -1139,6 +1145,9 @@ fn run(command: Commands, root: &Path) -> Result<()> {
         Commands::Worktree { action } => match action {
             WorktreeAction::Init { path } => worktree_commands::cmd_worktree_init(&path),
             WorktreeAction::Teardown { path } => worktree_commands::cmd_worktree_teardown(&path),
+            WorktreeAction::Reconcile { global } => {
+                worktree_commands::cmd_worktree_reconcile(global)
+            }
         },
     }
 }

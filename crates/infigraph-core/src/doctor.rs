@@ -661,6 +661,34 @@ pub fn check_sidecars(ctx: &DoctorContext) -> Vec<CheckResult> {
         .collect()
 }
 
+const WORKTREE_CATEGORY: &str = "worktrees";
+
+/// Diffs the registry against live git worktrees (always a global scan,
+/// regardless of `ctx.scope`, since worktree drift is a git-structure
+/// property, not a registry scan-root property).
+pub fn check_worktrees(ctx: &DoctorContext) -> Vec<CheckResult> {
+    let drift = crate::worktree::find_worktree_drift(&ctx.registry, None);
+    let mut results = Vec::new();
+
+    for path in &drift.bootstrap_candidates {
+        results.push(CheckResult::warn(
+            WORKTREE_CATEGORY,
+            format!("{}: unindexed worktree", path.display()),
+            "git worktree exists but has not been indexed",
+            format!("run `infigraph worktree init {}`", path.display()),
+        ));
+    }
+    for path in &drift.teardown_candidates {
+        results.push(CheckResult::warn(
+            WORKTREE_CATEGORY,
+            format!("{}: removed worktree still registered", path.display()),
+            "git no longer lists this worktree, but it has a registry entry",
+            format!("run `infigraph worktree teardown {}`", path.display()),
+        ));
+    }
+    results
+}
+
 const TOOLCHAIN_CATEGORY: &str = "toolchain";
 
 pub fn check_toolchain(ctx: &DoctorContext) -> Vec<CheckResult> {
@@ -690,6 +718,7 @@ pub fn run_doctor(ctx: DoctorContext) -> DoctorReport {
     checks.extend(check_watchers(&ctx));
     checks.extend(check_disk(&ctx));
     checks.extend(check_sidecars(&ctx));
+    checks.extend(check_worktrees(&ctx));
     checks.extend(check_toolchain(&ctx));
     DoctorReport {
         checks,

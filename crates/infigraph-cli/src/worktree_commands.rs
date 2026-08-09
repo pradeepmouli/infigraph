@@ -3,7 +3,7 @@ use std::path::Path;
 use anyhow::Result;
 use infigraph_core::clone::clone_infigraph_dir;
 use infigraph_core::multi::Registry;
-use infigraph_core::worktree::main_worktree_path;
+use infigraph_core::worktree::{find_worktree_drift, main_worktree_path};
 
 use crate::index::cmd_index;
 
@@ -51,6 +51,36 @@ pub(crate) fn cmd_worktree_teardown(path: &Path) -> Result<()> {
             "Evicted '{}' from the registry. .infigraph/ left on disk.",
             removed.join(", ")
         );
+    }
+    Ok(())
+}
+
+pub(crate) fn cmd_worktree_reconcile(global: bool) -> Result<()> {
+    let registry = Registry::load()?;
+    let scope = if global {
+        None
+    } else {
+        Some(std::env::current_dir()?)
+    };
+    let drift = find_worktree_drift(&registry, scope.as_deref());
+
+    for path in &drift.teardown_candidates {
+        cmd_worktree_teardown(path)?;
+    }
+
+    if drift.bootstrap_candidates.is_empty() {
+        println!("No unindexed worktrees found.");
+    } else {
+        println!(
+            "{} unindexed worktree(s) found:",
+            drift.bootstrap_candidates.len()
+        );
+        for path in &drift.bootstrap_candidates {
+            println!(
+                "  run `infigraph worktree init {}` to bootstrap it",
+                path.display()
+            );
+        }
     }
     Ok(())
 }
