@@ -685,6 +685,14 @@ group_create("my-group")
 
 `Registry` stores repo entries (name, path, symbol count) and group definitions (repos, contracts). Persisted to disk and loaded by all group operations.
 
+### Git worktree lifecycle
+
+`infigraph clone <src> <dst>` copies an existing project's `.infigraph/` index into a new location (excludes locks/logs, doesn't index) — the primitive the worktree commands below build on.
+
+`infigraph worktree init <path>` bootstraps a newly created git worktree: clones the main worktree's `.infigraph/` (if present), then incrementally reindexes so unchanged files are skipped via content-hash comparison. `infigraph worktree teardown <path>` cleans up a removed worktree — stops its watcher and evicts its registry entry, but never deletes `.infigraph/` from disk. `infigraph worktree reconcile [--global]` diffs the registry against live `git worktree list` output (`find_worktree_drift` in `crates/infigraph-core/src/worktree.rs`): it actually evicts teardown candidates but only reports bootstrap candidates, never auto-indexing them. `infigraph doctor` surfaces the same drift as warnings under the `worktrees` category.
+
+A Claude Code `PostToolUse` hook (installed via `infigraph install`) runs `infigraph worktree reconcile` in the background after any successful `git worktree add|remove|prune`, so the registry self-heals without manual intervention.
+
 ### Group search
 
 `group_search` (`combined.rs`) runs hybrid BM25+vector search across the combined graph. `group_query` executes arbitrary Cypher against it.
