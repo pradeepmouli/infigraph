@@ -41,6 +41,7 @@ pub mod taint;
 pub mod viz;
 pub mod vuln;
 pub mod watch;
+pub mod worktree;
 
 use std::path::{Path, PathBuf};
 
