@@ -603,6 +603,111 @@ pub(crate) fn install_enforcement_hook(home: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+pub(crate) const WORKTREE_HOOK_SCRIPT: &str = r#"#!/usr/bin/env bash
+# Infigraph PostToolUse hook -- git worktree lifecycle.
+# Fires after every Bash tool call; only acts when the command looks like a
+# `git worktree add|remove|prune` invocation that actually succeeded (exit 0).
+# Rather than parse the triggering command's own arguments (which may use a
+# default worktree name, a relative path, or --force flags in any order), it
+# re-runs `git worktree list --porcelain` before and after and diffs the two
+# -- the authoritative source of what actually changed, regardless of how the
+# command was phrased.
+input=$(cat)
+
+tool=$(echo "$input" | jq -r '.tool_name // empty')
+[ "$tool" = "Bash" ] || exit 0
+
+cmd=$(echo "$input" | jq -r '.tool_input.command // empty')
+echo "$cmd" | grep -qE '(^|\s)git\s+worktree\s+(add|remove|prune)(\s|$)' || exit 0
+
+exit_code=$(echo "$input" | jq -r '.tool_response.exitCode // 0')
+[ "$exit_code" = "0" ] || exit 0
+
+cwd=$(echo "$input" | jq -r '.cwd // empty')
+[ -n "$cwd" ] || exit 0
+
+command -v infigraph >/dev/null 2>&1 || exit 0
+git -C "$cwd" rev-parse --is-inside-work-tree >/dev/null 2>&1 || exit 0
+
+infigraph worktree reconcile >/dev/null 2>&1 &
+disown
+exit 0
+"#;
+
+pub(crate) fn install_worktree_lifecycle_hook(home: &std::path::Path) -> Result<()> {
+    let hooks_dir = home.join(".claude").join("hooks");
+    std::fs::create_dir_all(&hooks_dir)?;
+
+    let hook_path = hooks_dir.join("infigraph-worktree.sh");
+    std::fs::write(&hook_path, WORKTREE_HOOK_SCRIPT)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&hook_path, std::fs::Permissions::from_mode(0o755))?;
+    }
+    println!(
+        "  Installed worktree lifecycle hook: {}",
+        hook_path.display()
+    );
+
+    let settings_path = home.join(".claude").join("settings.json");
+    let mut settings: serde_json::Value = if settings_path.is_file() {
+        let content = std::fs::read_to_string(&settings_path)?;
+        serde_json::from_str(&content)?
+    } else {
+        json!({})
+    };
+    if settings.get("hooks").is_none() {
+        settings["hooks"] = json!({});
+    }
+
+    let hook_entry = json!({
+        "matcher": "Bash",
+        "hooks": [{
+            "type": "command",
+            "command": hook_path.to_string_lossy(),
+            "timeout": 5
+        }]
+    });
+
+    let post_tool = settings["hooks"]
+        .get("PostToolUse")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+
+    let already_exists = post_tool.iter().any(|entry| {
+        entry
+            .get("hooks")
+            .and_then(|h| h.as_array())
+            .map(|hooks| {
+                hooks.iter().any(|h| {
+                    h.get("command")
+                        .and_then(|c| c.as_str())
+                        .map(|c| c.contains("infigraph-worktree"))
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false)
+    });
+
+    if !already_exists {
+        let mut arr = post_tool;
+        arr.push(hook_entry);
+        settings["hooks"]["PostToolUse"] = serde_json::Value::Array(arr);
+        let pretty = serde_json::to_string_pretty(&settings)?;
+        std::fs::write(&settings_path, pretty)?;
+        println!("  Added PostToolUse hook to {}", settings_path.display());
+    } else {
+        println!(
+            "  PostToolUse worktree hook already configured in {}",
+            settings_path.display()
+        );
+    }
+
+    Ok(())
+}
+
 pub(crate) const TEST_CONTEXT_SENTINEL_HOOK_SCRIPT: &str = r#"#!/usr/bin/env bash
 # PostToolUse hook: writes sentinel after generate_test_context succeeds.
 # Allows Write/Edit enforcement hook to pass for test files.
@@ -1465,6 +1570,7 @@ pub(crate) fn uninstall_hooks(home: &std::path::Path) -> Result<()> {
     let hooks_dir = home.join(".claude").join("hooks");
     for hook_file in &[
         "infigraph-enforce.sh",
+        "infigraph-worktree.sh",
         "infigraph-edit-tracker.sh",
         "infigraph-session-save.sh",
         "infigraph-session-reset.sh",
@@ -1542,6 +1648,47 @@ mod tests {
         std::fs::create_dir_all(home.join(".claude/hooks")).unwrap();
         std::fs::write(home.join(".claude/settings.json"), "{}").unwrap();
         (tmp, home)
+    }
+
+    #[test]
+    fn install_worktree_lifecycle_hook_creates_file_and_settings() {
+        let (_tmp, home) = setup_home();
+        install_worktree_lifecycle_hook(&home).unwrap();
+
+        let hook_path = home.join(".claude/hooks/infigraph-worktree.sh");
+        assert!(hook_path.exists());
+        let content = std::fs::read_to_string(&hook_path).unwrap();
+        // The hook deliberately delegates to `worktree reconcile` (a single
+        // diff-and-act call) rather than computing init/teardown itself --
+        // see the WORKTREE_HOOK_SCRIPT doc comment for the rationale.
+        assert!(content.contains("worktree reconcile"));
+        assert!(content.contains("git worktree"));
+
+        let settings: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(home.join(".claude/settings.json")).unwrap(),
+        )
+        .unwrap();
+        let post_tool = settings["hooks"]["PostToolUse"].as_array().unwrap();
+        assert_eq!(post_tool.len(), 1);
+        assert_eq!(post_tool[0]["matcher"].as_str().unwrap(), "Bash");
+    }
+
+    #[test]
+    fn install_worktree_lifecycle_hook_idempotent() {
+        let (_tmp, home) = setup_home();
+        install_worktree_lifecycle_hook(&home).unwrap();
+        install_worktree_lifecycle_hook(&home).unwrap();
+
+        let settings: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(home.join(".claude/settings.json")).unwrap(),
+        )
+        .unwrap();
+        let post_tool = settings["hooks"]["PostToolUse"].as_array().unwrap();
+        assert_eq!(
+            post_tool.len(),
+            1,
+            "second install must not duplicate the hook entry"
+        );
     }
 
     #[test]
@@ -1747,6 +1894,7 @@ mod tests {
         let (_tmp, home) = setup_home();
 
         install_enforcement_hook(&home).unwrap();
+        install_worktree_lifecycle_hook(&home).unwrap();
         install_edit_tracker_hook(&home).unwrap();
         install_session_save_hook(&home).unwrap();
         install_clear_suggest_hook(&home).unwrap();
@@ -1757,6 +1905,7 @@ mod tests {
 
         let hook_files = [
             "infigraph-enforce.sh",
+            "infigraph-worktree.sh",
             "infigraph-edit-tracker.sh",
             "infigraph-session-save.sh",
             "infigraph-session-reset.sh",

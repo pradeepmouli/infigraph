@@ -86,6 +86,7 @@ pub(crate) fn cmd_install() -> Result<()> {
 
     // Install hooks and Claude Code allowlist
     crate::hooks::install_enforcement_hook(&home)?;
+    crate::hooks::install_worktree_lifecycle_hook(&home)?;
     crate::hooks::install_edit_tracker_hook(&home)?;
     crate::hooks::install_session_save_hook(&home)?;
     crate::hooks::install_clear_suggest_hook(&home)?;
@@ -700,6 +701,7 @@ fn reinstall_hooks() -> Result<()> {
     let home = dirs::home_dir().context("cannot find home directory")?;
     println!("\nReinstalling hooks...");
     crate::hooks::install_enforcement_hook(&home)?;
+    crate::hooks::install_worktree_lifecycle_hook(&home)?;
     crate::hooks::install_edit_tracker_hook(&home)?;
     crate::hooks::install_session_save_hook(&home)?;
     crate::hooks::install_clear_suggest_hook(&home)?;
