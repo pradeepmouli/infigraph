@@ -761,25 +761,7 @@ pub(crate) fn cmd_delete_project(root: &Path) -> Result<()> {
     // Unregister from the global registry
     use infigraph_core::multi::Registry;
     let mut registry = Registry::load()?;
-    let canonical = project_path.canonicalize().unwrap_or(project_path.clone());
-    let to_remove: Vec<String> = registry
-        .repos
-        .iter()
-        .filter(|(_, entry)| {
-            entry.path == project_path
-                || entry.path == canonical
-                || entry
-                    .path
-                    .canonicalize()
-                    .map(|p| p == canonical)
-                    .unwrap_or(false)
-        })
-        .map(|(name, _)| name.clone())
-        .collect();
-
-    for name in &to_remove {
-        registry.repos.remove(name);
-    }
+    let to_remove = registry.deregister_by_path(&project_path);
     registry.save()?;
 
     if to_remove.is_empty() {

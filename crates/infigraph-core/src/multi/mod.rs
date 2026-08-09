@@ -118,6 +118,31 @@ impl Registry {
         Ok(())
     }
 
+    /// Remove every entry whose path matches `path` (raw or canonicalized).
+    /// Returns the names removed. Does not persist -- call `save()` after.
+    pub fn deregister_by_path(&mut self, path: &Path) -> Vec<String> {
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let to_remove: Vec<String> = self
+            .repos
+            .iter()
+            .filter(|(_, entry)| {
+                entry.path == path
+                    || entry.path == canonical
+                    || entry
+                        .path
+                        .canonicalize()
+                        .map(|p| p == canonical)
+                        .unwrap_or(false)
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+
+        for name in &to_remove {
+            self.repos.remove(name);
+        }
+        to_remove
+    }
+
     /// Register a repository after indexing.
     pub fn register_repo(&mut self, name: &str, path: &Path, prism: &Infigraph) -> Result<()> {
         let stats = prism.stats()?;
