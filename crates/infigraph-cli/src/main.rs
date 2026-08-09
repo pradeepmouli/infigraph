@@ -816,6 +816,11 @@ pub(crate) enum WorktreeAction {
         /// Path to the new worktree
         path: PathBuf,
     },
+    /// Clean up a removed worktree: stop its watcher, evict its registry entry (never deletes .infigraph/)
+    Teardown {
+        /// Path to the removed worktree
+        path: PathBuf,
+    },
 }
 
 fn main() -> Result<()> {
@@ -1133,6 +1138,7 @@ fn run(command: Commands, root: &Path) -> Result<()> {
         },
         Commands::Worktree { action } => match action {
             WorktreeAction::Init { path } => worktree_commands::cmd_worktree_init(&path),
+            WorktreeAction::Teardown { path } => worktree_commands::cmd_worktree_teardown(&path),
         },
     }
 }
