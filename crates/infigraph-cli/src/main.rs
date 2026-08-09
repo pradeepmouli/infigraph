@@ -1,5 +1,6 @@
 mod agent;
 mod analysis_commands;
+mod clone_commands;
 mod commands;
 mod config_targets;
 mod git_commands;
@@ -631,6 +632,14 @@ enum Commands {
     /// Delete the project's .infigraph data and deregister from repo list
     Delete,
 
+    /// Copy an existing project's .infigraph/ index into a new location (excludes locks/logs, doesn't index)
+    Clone {
+        /// Source project root (must already have an indexed .infigraph/ directory)
+        src: PathBuf,
+        /// Destination project root
+        dst: PathBuf,
+    },
+
     /// Pipeline analysis (plugins, deps, impact, compliance, query)
     Pipeline {
         #[command(subcommand)]
@@ -812,6 +821,7 @@ fn main() -> Result<()> {
             | Commands::WatchStatus
             | Commands::ScipEnrich { .. }
             | Commands::Delete
+            | Commands::Clone { .. }
             | Commands::Update
             | Commands::Install
             | Commands::Uninstall
@@ -1081,6 +1091,7 @@ fn run(command: Commands, root: &Path) -> Result<()> {
             cmd_generate_test_context(root, file.as_deref(), limit)
         }
         Commands::Delete => cmd_delete_project(root),
+        Commands::Clone { src, dst } => clone_commands::cmd_clone(&src, &dst),
         Commands::MemoryContext {
             query,
             file,
