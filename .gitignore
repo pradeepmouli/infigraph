@@ -19,7 +19,11 @@ Cargo.lock
 # IDE / Editor
 .claude/
 .worktrees/
+!crates/infigraph-cli/resources/integrations/**/.claude/
+!crates/infigraph-cli/resources/integrations/**/.claude/**
 .vscode/
+!crates/infigraph-cli/resources/integrations/**/.vscode/
+!crates/infigraph-cli/resources/integrations/**/.vscode/**
 .idea/
 *.swp
 *.swo
