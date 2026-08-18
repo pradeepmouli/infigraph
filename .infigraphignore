@@ -1,11 +1,30 @@
-target/        # Rust build output
-build/         # build output (Gradle, CMake, etc.)
-dist/          # distribution bundles
-out/           # compiler/IDE output
-vendor/        # vendored dependencies (Go, Ruby)
-bin/           # compiled binaries
-obj/           # intermediate build objects (.NET, C++)
-generated/     # auto-generated code
-third_party/   # third-party source copies
-CMakeFiles/    # CMake internal files
-models/        # downloaded ML model weights (Model2Vec, etc.) — binary data, not source
+# gitignore-style patterns: a "#" is only a comment when it's the first
+# character of a line -- a trailing "# comment" after a real pattern is
+# parsed as literal pattern text (verified against the `ignore` crate this
+# repo's ignore_rules.rs uses) and never matches anything. Keep comments on
+# their own line, never trailing.
+
+# Rust build output
+target/
+# this repo's own shared cargo target-dir (see root Cargo.toml comments)
+.shared-target/
+# build output (Gradle, CMake, etc.)
+build/
+# distribution bundles
+dist/
+# compiler/IDE output
+out/
+# vendored dependencies (Go, Ruby)
+vendor/
+# compiled binaries
+bin/
+# intermediate build objects (.NET, C++)
+obj/
+# auto-generated code
+generated/
+# third-party source copies
+third_party/
+# CMake internal files
+CMakeFiles/
+# downloaded ML model weights (Model2Vec, etc.) — binary data, not source
+models/
