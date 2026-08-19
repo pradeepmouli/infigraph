@@ -82,7 +82,7 @@ jobs:
             /usr/local/lib/node_modules /opt/hostedtoolcache/CodeQL
           sudo docker image prune --all --force || true
           df -h
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.97.1
         with:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
