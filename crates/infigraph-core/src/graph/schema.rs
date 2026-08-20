@@ -30,7 +30,21 @@ pub const MIGRATIONS: &[&str] = &[
     // unused deadweight rather than attempting a Kuzu column rename/drop.
     "ALTER TABLE GraphMeta ADD ast_generation INT64 DEFAULT 0",
     "ALTER TABLE GraphMeta ADD scip_generation INT64 DEFAULT 0",
+    // R8.1 (#85): the schema version this database was last written by.
+    // 0 = predates versioning. Stamped to SCHEMA_VERSION after every
+    // successful open's DDL pass; a stored version NEWER than this
+    // binary's is refused at open ("built by newer infigraph") before any
+    // DDL runs.
+    "ALTER TABLE GraphMeta ADD schema_version INT64 DEFAULT 0",
 ];
+
+/// The schema version THIS binary writes (R8.1, #85). Bump it whenever
+/// `CREATE_SCHEMA`/`MIGRATIONS` change shape in a way an older binary
+/// could misread; opening a database stamped with a NEWER version than
+/// this refuses with a `Config`-style error instead of open-and-guess.
+/// Older/unstamped databases are migrated forward by the unconditional
+/// DDL pass exactly as before, then stamped.
+pub const SCHEMA_VERSION: i64 = 1;
 
 /// Kuzu schema DDL for the infigraph graph.
 pub const CREATE_SCHEMA: &[&str] = &[
@@ -134,7 +148,7 @@ pub const CREATE_SCHEMA: &[&str] = &[
     // own -- comparing the two surfaces that drift (R3.3.4) instead of
     // leaving INHERITS edges and other compiler-verified data silently out
     // of sync with a live-watched codebase.
-    "CREATE NODE TABLE IF NOT EXISTS GraphMeta(id STRING, ast_generation INT64, scip_generation INT64, PRIMARY KEY(id))",
+    "CREATE NODE TABLE IF NOT EXISTS GraphMeta(id STRING, ast_generation INT64, scip_generation INT64, schema_version INT64, PRIMARY KEY(id))",
 ];
 
 use kuzu::Connection;
