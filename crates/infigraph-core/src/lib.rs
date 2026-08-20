@@ -1,4 +1,5 @@
 mod analysis;
+pub mod audit;
 pub mod bench;
 pub mod bridges;
 pub mod check;
@@ -14,18 +15,21 @@ pub mod doctor;
 pub mod embed;
 pub mod export;
 pub mod extract;
+pub mod gc;
 pub mod graph;
 pub mod ignore_rules;
 pub mod instances;
 pub mod lang;
 pub mod learned;
 pub mod lockfile;
+pub mod logrotate;
 pub mod manifest;
 pub mod meta;
 pub mod model;
 pub mod multi;
 pub mod ops;
 pub mod patterns;
+pub mod ps;
 pub mod quarantine;
 pub mod refactor;
 pub mod reflection;
@@ -40,6 +44,7 @@ pub mod sequence;
 pub mod snapshot;
 pub mod structured;
 pub mod taint;
+pub mod verify;
 pub mod viz;
 pub mod vuln;
 pub mod watch;
@@ -480,6 +485,7 @@ impl Infigraph {
                 // failure.
                 extractions: Vec::new(),
                 resolve_stats: resolve::ResolveStats::default(),
+                skipped_errors: Vec::new(),
             }),
             crate::daemon_protocol::WriteResult::Err { message } => Err(anyhow::anyhow!(message)),
             other => Err(anyhow::anyhow!(
@@ -512,9 +518,13 @@ impl Infigraph {
 
         let ns = &self.namespace;
         let done = std::sync::atomic::AtomicUsize::new(0);
-        let extractions: Vec<FileExtraction> = files
+        // R4.3.1 (#77): a per-file failure (unreadable file, parser error)
+        // must neither abort the run nor vanish -- it's collected and
+        // reported. Expected skips (unchanged hash, no language pack for
+        // the extension) are None: not errors, not worth reporting.
+        let outcomes: Vec<Option<std::result::Result<FileExtraction, String>>> = files
             .par_iter()
-            .filter_map(|path| {
+            .map(|path| {
                 let raw_rel = path
                     .strip_prefix(&self.root)
                     .ok()?
@@ -524,7 +534,10 @@ impl Infigraph {
                     Some(prefix) => format!("{}/{}", prefix, raw_rel),
                     None => raw_rel.clone(),
                 };
-                let source = std::fs::read(path).ok()?;
+                let source = match std::fs::read(path) {
+                    Ok(s) => s,
+                    Err(e) => return Some(Err(format!("{rel_path}: {e}"))),
+                };
                 let hash = {
                     let mut h = Sha256::new();
                     h.update(&source);
@@ -540,9 +553,20 @@ impl Infigraph {
                     return None;
                 }
                 let pack = self.registry.for_file_with_content(&rel_path, &source)?;
-                extract::extract_file(&rel_path, &source, pack).ok()
+                match extract::extract_file(&rel_path, &source, pack) {
+                    Ok(extraction) => Some(Ok(extraction)),
+                    Err(e) => Some(Err(format!("{rel_path}: {e}"))),
+                }
             })
             .collect();
+        let mut extractions = Vec::new();
+        let mut skipped_errors = Vec::new();
+        for outcome in outcomes.into_iter().flatten() {
+            match outcome {
+                Ok(extraction) => extractions.push(extraction),
+                Err(reason) => skipped_errors.push(reason),
+            }
+        }
 
         let current_files: std::collections::HashSet<String> = files
             .iter()
@@ -566,6 +590,7 @@ impl Infigraph {
             total_files: total,
             extractions,
             stale_files,
+            skipped_errors,
         })
     }
 
@@ -607,6 +632,22 @@ impl Infigraph {
             );
             for f in &scan.stale_files {
                 let _ = backend.remove_file(f);
+            }
+        }
+
+        // R4.3.1 (#77): failures are reported, never silently dropped --
+        // the summary names the count and the first few offenders; all of
+        // them ride in IndexResult.skipped_errors for the caller.
+        if !scan.skipped_errors.is_empty() {
+            eprintln!(
+                "[index] skipped {} file(s) with errors:",
+                scan.skipped_errors.len()
+            );
+            for err in scan.skipped_errors.iter().take(5) {
+                eprintln!("[index]   {err}");
+            }
+            if scan.skipped_errors.len() > 5 {
+                eprintln!("[index]   ... and {} more", scan.skipped_errors.len() - 5);
             }
         }
 
@@ -658,6 +699,7 @@ impl Infigraph {
             indexed_files: indexed,
             extractions: scan.extractions,
             resolve_stats,
+            skipped_errors: scan.skipped_errors,
         })
     }
 
@@ -761,6 +803,7 @@ impl Infigraph {
             total_files: 0,
             indexed_files: 0,
             extractions: Vec::new(),
+            skipped_errors: Vec::new(),
             resolve_stats: resolve::ResolveStats {
                 total_calls: 0,
                 resolved: 0,
@@ -829,6 +872,11 @@ impl Infigraph {
             indexed_files: indexed,
             extractions,
             resolve_stats,
+            // index_files feeds through extract_paths, whose silent
+            // per-file drop is load-bearing for the dirty-set retry
+            // semantics (R3.3.5) -- failure aggregation there is a
+            // separate change, not defaulted-away data.
+            skipped_errors: Vec::new(),
         })
     }
 
@@ -907,6 +955,12 @@ pub struct IndexResult {
     pub indexed_files: usize,
     pub extractions: Vec<FileExtraction>,
     pub resolve_stats: resolve::ResolveStats,
+    /// Files that FAILED extraction (unreadable, parser error) --
+    /// "<path>: <reason>" (R4.3.1, #77). Distinct from expected skips
+    /// (unchanged hash, no language pack), which are not errors. A bad
+    /// file never aborts the run and never disappears silently: it lands
+    /// here for the caller to report.
+    pub skipped_errors: Vec<String>,
 }
 
 /// The result of `Infigraph::scan_changed_files`: everything that needs
@@ -915,6 +969,8 @@ pub(crate) struct ScanResult {
     pub total_files: usize,
     pub extractions: Vec<FileExtraction>,
     pub stale_files: Vec<String>,
+    /// "<path>: <reason>" per file that failed extraction (R4.3.1).
+    pub skipped_errors: Vec<String>,
 }
 
 #[cfg(test)]

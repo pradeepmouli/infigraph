@@ -541,7 +541,36 @@ pub fn tool_search(args: &Value) -> Result<String> {
         super::docs::auto_start_doc_watch_opportunistic(path);
     }
 
+    // R3.3.6 (#26): surface index staleness WITH the results instead of
+    // leaving the caller to trust them blindly. The R3.3.5 dirty set is an
+    // O(1) read of exactly the files whose edits were observed but not yet
+    // drained into the graph -- far cheaper and more precise than the
+    // filesystem-mtime walk R3.3.6 originally sketched (files with no
+    // watcher observation are covered by the auto-start above: the next
+    // edits get marked). Prepended so a truncating client still sees it.
+    if let Some(banner) = staleness_banner(&root) {
+        out.insert_str(0, &banner);
+    }
+
     Ok(out)
+}
+
+/// One-line warning when the project's persistent dirty set (R3.3.5) says
+/// edits are awaiting reindex; `None` when everything known is drained.
+fn staleness_banner(root: &std::path::Path) -> Option<String> {
+    let pending = infigraph_core::dirty::pending_dirty(&root.join(".infigraph")).ok()?;
+    if pending.is_empty() {
+        return None;
+    }
+    let mut names: Vec<&str> = pending.iter().map(String::as_str).collect();
+    names.sort_unstable();
+    let sample = names.iter().take(3).copied().collect::<Vec<_>>().join(", ");
+    let more = if names.len() > 3 { ", ..." } else { "" };
+    Some(format!(
+        "⚠ results may be stale -- {} file(s) changed since the last index ({sample}{more}); \
+         the watcher drains these shortly, or run index_project to force it\n\n",
+        names.len()
+    ))
 }
 
 pub fn tool_search_symbols(args: &Value) -> Result<String> {
@@ -745,4 +774,59 @@ pub fn tool_semantic_search(args: &Value) -> Result<String> {
         out.push_str("No results found.");
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod staleness_banner_tests {
+    use super::staleness_banner;
+
+    #[test]
+    fn empty_or_absent_dirty_set_yields_no_banner() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(staleness_banner(tmp.path()).is_none());
+    }
+
+    #[test]
+    fn pending_dirty_files_yield_a_banner_naming_count_and_sample() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ig = tmp.path().join(".infigraph");
+        infigraph_core::dirty::mark_dirty(
+            &ig,
+            &[
+                "a.py".to_string(),
+                "b.py".to_string(),
+                "c.py".to_string(),
+                "d.py".to_string(),
+            ],
+        )
+        .unwrap();
+
+        let banner = staleness_banner(tmp.path()).expect("4 pending files must warn");
+        assert!(banner.contains("4 file(s)"), "{banner}");
+        assert!(
+            banner.contains("a.py"),
+            "sorted sample must start at a.py: {banner}"
+        );
+        assert!(
+            banner.contains("..."),
+            "overflow marker for >3 files: {banner}"
+        );
+        assert!(
+            banner.starts_with('\u{26a0}'),
+            "must be a visible warning: {banner}"
+        );
+    }
+
+    #[test]
+    fn banner_clears_once_the_dirty_set_is_drained() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ig = tmp.path().join(".infigraph");
+        infigraph_core::dirty::mark_dirty(&ig, &["a.py".to_string()]).unwrap();
+        assert!(staleness_banner(tmp.path()).is_some());
+        infigraph_core::dirty::clear_dirty(&ig, &["a.py".to_string()]).unwrap();
+        assert!(
+            staleness_banner(tmp.path()).is_none(),
+            "a drained dirty set must stop warning"
+        );
+    }
 }

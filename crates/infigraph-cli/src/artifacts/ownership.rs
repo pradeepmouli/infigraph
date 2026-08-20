@@ -57,6 +57,30 @@ pub(crate) fn record_written(home: &Path, target_path: &Path, content: &[u8]) ->
     save_manifest(home, &manifest)
 }
 
+/// Returns true if `target_path` was hand-edited since infigraph last wrote
+/// it: a hash was recorded for this path, the file still exists, and its
+/// current content no longer matches that recorded hash. Read-only -- unlike
+/// `verify_unchanged_and_clear`, this does NOT clear the manifest entry,
+/// since it's consulted before a write (install), not before a delete
+/// (uninstall), and the entry must survive to be checked again next install.
+///
+/// This is the pre-write counterpart the install path was missing: `apply_overwrite`
+/// used to write unconditionally regardless of what was on disk, so a hand-edited
+/// hook (or any other `overwrite`-strategy artifact) was silently destroyed by the
+/// next `infigraph install` -- the same manifest that already protected hand-edits
+/// on uninstall was simply never consulted on the write side.
+pub(crate) fn hand_edited_since_install(home: &Path, target_path: &Path) -> Result<bool> {
+    let manifest = load_manifest(home)?;
+    let key = target_path.to_string_lossy().into_owned();
+    let Some(recorded_hash) = manifest.get(&key) else {
+        return Ok(false);
+    };
+    match std::fs::read(target_path) {
+        Ok(on_disk) => Ok(&hash_hex(&on_disk) != recorded_hash),
+        Err(_) => Ok(false), // gone -- nothing to preserve, install will just create it
+    }
+}
+
 /// Returns true if `target_path` is safe to delete on uninstall: either it
 /// was never recorded (an install that predates this tracking, or content
 /// written outside the artifact engine), or its current on-disk content
@@ -85,6 +109,70 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let target = home.path().join("some/file.sh");
         assert!(verify_unchanged_and_clear(home.path(), &target).unwrap());
+    }
+
+    #[test]
+    fn unrecorded_path_is_not_flagged_as_hand_edited() {
+        // A path infigraph never wrote (predates tracking, or written outside
+        // the artifact engine) has nothing to compare against -- treat as clean.
+        let home = tempfile::tempdir().unwrap();
+        let target = home.path().join("hooks/never-tracked.sh");
+        assert!(!hand_edited_since_install(home.path(), &target).unwrap());
+    }
+
+    #[test]
+    fn unchanged_content_is_not_flagged_as_hand_edited() {
+        let home = tempfile::tempdir().unwrap();
+        let target = home.path().join("hooks/script.sh");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, b"original").unwrap();
+        record_written(home.path(), &target, b"original").unwrap();
+
+        assert!(!hand_edited_since_install(home.path(), &target).unwrap());
+    }
+
+    #[test]
+    fn modified_content_is_flagged_as_hand_edited() {
+        let home = tempfile::tempdir().unwrap();
+        let target = home.path().join("hooks/script.sh");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, b"original").unwrap();
+        record_written(home.path(), &target, b"original").unwrap();
+
+        std::fs::write(&target, b"user edited this").unwrap();
+
+        assert!(hand_edited_since_install(home.path(), &target).unwrap());
+    }
+
+    #[test]
+    fn hand_edited_check_does_not_clear_the_manifest_entry() {
+        // Unlike verify_unchanged_and_clear (uninstall-side), this is consulted
+        // before a write, not before a delete -- the entry must survive so the
+        // next install can check it again.
+        let home = tempfile::tempdir().unwrap();
+        let target = home.path().join("hooks/script.sh");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, b"original").unwrap();
+        record_written(home.path(), &target, b"original").unwrap();
+
+        std::fs::write(&target, b"user edited this").unwrap();
+        hand_edited_since_install(home.path(), &target).unwrap();
+
+        assert_eq!(load_manifest(home.path()).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn deleted_file_is_not_flagged_as_hand_edited() {
+        // Nothing on disk to preserve or compare -- install will just recreate it.
+        let home = tempfile::tempdir().unwrap();
+        let target = home.path().join("hooks/script.sh");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, b"original").unwrap();
+        record_written(home.path(), &target, b"original").unwrap();
+
+        std::fs::remove_file(&target).unwrap();
+
+        assert!(!hand_edited_since_install(home.path(), &target).unwrap());
     }
 
     #[test]

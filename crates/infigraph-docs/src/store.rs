@@ -60,6 +60,14 @@ const CREATE_SCHEMA: &[&str] = &[
 pub struct DocStore {
     db: Database,
     _db_guard: std::sync::MutexGuard<'static, ()>,
+    /// Cross-process identity lock on `<db>.lock` (`docs.kuzu.lock`), held
+    /// for the store's lifetime so a crashed holder is identifiable by its
+    /// stale payload -- the signal `unclean_shutdown_wal_holder` needs to
+    /// refuse a WAL replay that would crash the process (R3.1.3 / #93).
+    /// Best-effort: `None` when another live process already holds it, in
+    /// which case Kuzu's own file lock remains the arbiter exactly as
+    /// before this field existed.
+    _write_lock: Option<infigraph_core::lockfile::LockFile>,
 }
 
 static DB_LOCK: Mutex<()> = Mutex::new(());
@@ -76,11 +84,37 @@ impl DocStore {
         // `Database::new` before any `Result` exists. Reject it here so
         // `DocIndex::init`'s wipe-and-rebuild recovery runs instead.
         infigraph_core::graph::validate_db_file(path)?;
+
+        // Second preflight, same crash class (R3.1.3 / #93, mirroring the
+        // code graph's fix for #92): an unreplayed WAL left by a dead
+        // holder can crash Kuzu's WAL-replay-on-open with SIGBUS before
+        // any `Result` exists. Must run BEFORE the try_acquire below --
+        // acquiring the lock overwrites the dead holder's payload, which
+        // is exactly the evidence this check reads.
+        let lock_path = infigraph_core::graph::db_lock_path(path);
+        if let Some(pid) = infigraph_core::graph::unclean_shutdown_wal_holder(path, &lock_path) {
+            anyhow::bail!(
+                "docs store {} has an unreplayed WAL from process {pid}, which is no longer \
+                 running (unclean shutdown) -- refusing to open it directly since WAL replay \
+                 in this state can crash the whole process; docs are derived data, so the \
+                 wipe-and-rebuild recovery in DocIndex::init handles this automatically",
+                path.display()
+            );
+        }
+
+        // Best-effort identity lock (see the field's doc comment). A live
+        // holder means proceed without it -- today's behavior, no new
+        // failure mode; Kuzu's own lock still arbitrates actual access.
+        let write_lock = infigraph_core::lockfile::try_acquire(&lock_path, "docs-write")
+            .ok()
+            .flatten();
+
         let db = Database::new(path, SystemConfig::default())
             .map_err(|e| anyhow::anyhow!("failed to open docs kuzu db: {e}"))?;
         let store = Self {
             db,
             _db_guard: guard,
+            _write_lock: write_lock,
         };
         store.init_schema()?;
         Ok(store)

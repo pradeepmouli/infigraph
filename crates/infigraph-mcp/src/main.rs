@@ -8,6 +8,39 @@ use infigraph_mcp::web;
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
 
+    // Pure introspection MUST be answered before any supervisor/worker/
+    // lock/registry side effects (#61 / I-21): `infigraph-mcp --version`
+    // used to fall through into the normal startup path, whose mcp.lock
+    // acquisition requested a handover from the live server -- a version
+    // probe killed the in-use MCP server out from under its clients
+    // (observed right after installing a newer build, which makes the
+    // takeover eager). Checked even before the `--worker` branch so a
+    // stray combination can never reach the lock path either.
+    if args.iter().skip(1).any(|a| a == "--version" || a == "-V") {
+        println!(
+            "infigraph-mcp {} (build {})",
+            env!("CARGO_PKG_VERSION"),
+            infigraph_core::build_hash()
+        );
+        return Ok(());
+    }
+    if args.iter().skip(1).any(|a| a == "--help" || a == "-h") {
+        println!(
+            "infigraph-mcp {} — MCP server for infigraph code intelligence\n\
+             \n\
+             Usage: infigraph-mcp [OPTIONS]\n\
+             \n\
+             Options:\n\
+             \x20 --mcp        Serve MCP over stdio (default when stdin is a pipe)\n\
+             \x20 --serve      Serve MCP over HTTP\n\
+             \x20 --ui         Serve the web UI\n\
+             \x20 --version    Print version and exit\n\
+             \x20 --help       Print this help and exit",
+            env!("CARGO_PKG_VERSION")
+        );
+        return Ok(());
+    }
+
     if args.iter().any(|a| a == "--worker") {
         return run_worker();
     }
@@ -277,6 +310,26 @@ fn run() -> Result<()> {
             None
         }
     };
+
+    // R5.4 (#79): SIGTERM/SIGINT must deregister this instance and exit
+    // cleanly. Without a handler the signal kills the process mid-anything
+    // with Drop handlers skipped, leaving a stale instance registration
+    // (reaped only later) and a stale lock payload. The handler does the
+    // one durable cleanup a signal context can do safely -- remove our own
+    // registration file -- then exits; the flock releases with the
+    // process, and the payload staleness is covered by holder_is_alive.
+    {
+        let pid = std::process::id();
+        ctrlc::set_handler(move || {
+            let _ = std::fs::remove_file(infigraph_core::instances::instance_path(pid));
+            mcp_log(
+                "INFO",
+                "termination signal received -- instance deregistered, exiting",
+            );
+            std::process::exit(0);
+        })
+        .ok();
+    }
 
     let reaped = infigraph_core::instances::reap_orphans_once(std::process::id());
     if reaped > 0 {

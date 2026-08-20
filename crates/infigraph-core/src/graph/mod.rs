@@ -30,8 +30,8 @@ pub use queries::{
 };
 pub use session_store::{SessionData, SessionStore};
 pub use store::{
-    remove_wal_family, validate_db_file, wal_family_paths, GraphCorruption, GraphStats, GraphStore,
-    WriteLock,
+    db_lock_path, remove_wal_family, unclean_shutdown_wal_holder, validate_db_file,
+    wal_family_paths, GraphCorruption, GraphStats, GraphStore, WriteLock,
 };
 pub use test_templates::{test_templates_for, TestTemplate};
 

@@ -595,6 +595,8 @@ pub fn mcp_log(level: &str, msg: &str) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
+    // R7.3 (#83): size-cap the append-only log before each open.
+    infigraph_core::logrotate::rotate_if_over(&path, 10 * 1024 * 1024);
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)

@@ -12,6 +12,10 @@ GHE_OWNER="${INFIGRAPH_GH_OWNER:-intuit}"
 GHE_REPO="infigraph"
 INSTALL_DIR="${INFIGRAPH_INSTALL_DIR:-$HOME/.local/bin}"
 
+# R8.2: remember what was there before the swap, for the installed-vs-
+# previous report at the end.
+PREV_VERSION="$("$INSTALL_DIR/infigraph" --version 2>/dev/null || true)"
+
 echo "Infigraph installer"
 echo "==================="
 
@@ -298,6 +302,34 @@ if [ ! -f "$KOMPRESS_DIR/model.onnx" ] || [ ! -f "$KOMPRESS_DIR/tokenizer.json" 
   echo "  ✓ Kompress model ready"
 else
   echo "Kompress model already installed"
+fi
+
+# R8.2 (#86): install integrity. Verify signature validity on macOS
+# (ad-hoc re-sign if the copy/extract invalidated it -- I-10: an invalid
+# signature means SIGKILL at exec), then verify the binaries actually
+# LAUNCH, and report installed vs previous version. A binary that fails
+# its launch check aborts here with a clear message instead of leaving a
+# broken install that only fails at first real use.
+if [ "$OS" = "Darwin" ]; then
+  for bin in infigraph infigraph-mcp lsp-to-scip; do
+    if [ -f "$INSTALL_DIR/$bin" ] && ! codesign --verify "$INSTALL_DIR/$bin" >/dev/null 2>&1; then
+      codesign --force --sign - "$INSTALL_DIR/$bin" 2>/dev/null || true
+    fi
+  done
+fi
+NEW_VERSION="$("$INSTALL_DIR/infigraph${BIN_SUFFIX}" --version 2>/dev/null)" || {
+  echo "ERROR: the installed infigraph binary failed to launch -- install aborted."
+  echo "       ($INSTALL_DIR/infigraph${BIN_SUFFIX} --version exited non-zero)"
+  exit 1
+}
+"$INSTALL_DIR/infigraph-mcp${BIN_SUFFIX}" --version >/dev/null 2>&1 || {
+  echo "ERROR: the installed infigraph-mcp binary failed to launch -- install aborted."
+  exit 1
+}
+if [ -n "${PREV_VERSION:-}" ]; then
+  echo "Installed: $NEW_VERSION (previous: $PREV_VERSION)"
+else
+  echo "Installed: $NEW_VERSION (no previous install detected)"
 fi
 
 # Auto-run infigraph install to register MCP + primary search

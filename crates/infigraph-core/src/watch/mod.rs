@@ -131,8 +131,16 @@ where
     // below silently fails for every event and all changes are dropped.
     let root = &root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
 
-    // Build a registry once for file-extension filtering (no DB needed).
-    let filter_registry = make_registry()?;
+    // Build the registry ONCE for the whole watch session (#58): it serves
+    // both file-extension filtering here and every `watch_db` open below
+    // via `Infigraph::open_shared`. It used to be built twice serially
+    // (filter + first drain's open), which alone consumed ~5s in debug
+    // builds and pushed the daemon's first request reply past callers'
+    // timeouts. The full-reindex side-path build keeps its own fresh
+    // `make_registry()` call -- a rebuild takes far longer than a registry
+    // build, so sharing buys nothing there.
+    let shared_registry: Arc<crate::lang::LanguageRegistry> = Arc::new(make_registry()?);
+    let filter_registry = &shared_registry;
 
     let mut changes_since_periodic: usize = 0;
     let mut last_periodic = std::time::Instant::now();
@@ -204,6 +212,13 @@ where
     let sentinel = root.join(".infigraph").join("watch.stop");
 
     const MAX_RESTARTS: u32 = 3;
+    // R7.4 (#84): above this many files in one debounce window, the batch
+    // coalesces into a single whole-project pass instead of per-file
+    // updates. Overridable via INFIGRAPH_STORM_THRESHOLD for tests/tuning.
+    let storm_threshold: usize = std::env::var("INFIGRAPH_STORM_THRESHOLD")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(200);
     let mut restart_count: u32 = 0;
 
     // Create initial watcher — factored into a closure for restart.
@@ -281,6 +296,7 @@ where
                                 indexed_files: outcome.extractions.len(),
                                 extractions: outcome.extractions.clone(),
                                 resolve_stats: outcome.resolve_stats.clone(),
+                                skipped_errors: Vec::new(),
                             });
                         }
                     }
@@ -333,7 +349,7 @@ where
             let (guard, scheduled_languages) = finish_full_reindex(
                 root,
                 &reply_path,
-                &make_registry,
+                &shared_registry,
                 &mut held_prism,
                 drain_rt.block_on(handle),
             );
@@ -423,6 +439,7 @@ where
                             root,
                             &path,
                             &queue,
+                            &shared_registry,
                             &make_registry,
                             &mut held_prism,
                             drain_in_flight.is_some(),
@@ -443,13 +460,7 @@ where
         if !batch.is_empty() && batch.is_ready() {
             let paths = batch.drain();
             let mut q = queue.lock().unwrap();
-            for path in paths {
-                let rel = path
-                    .strip_prefix(root)
-                    .map(|r| r.to_string_lossy().replace('\\', "/"))
-                    .unwrap_or_else(|_| path.to_string_lossy().replace('\\', "/"));
-                q.add_raw(rel);
-            }
+            flush_batch_into_queue(&mut q, paths, root, storm_threshold);
         }
 
         match rx.recv_timeout(Duration::from_millis(200)) {
@@ -576,7 +587,7 @@ where
         {
             match begin_index_op(root, "infigraph daemon", Duration::from_secs(30)) {
                 Ok(IndexOpOutcome::Acquired(guard)) => {
-                    match watch_db(root, &make_registry, &mut held_prism) {
+                    match watch_db(root, &shared_registry, &mut held_prism) {
                         Ok(prism) => {
                             // Drained here on the loop thread rather than
                             // inside the task, so a panicking task can't take
@@ -649,7 +660,7 @@ where
         let (guard, _) = finish_full_reindex(
             root,
             &in_flight.reply_path,
-            &make_registry,
+            &shared_registry,
             &mut held_prism,
             drain_rt.block_on(in_flight.handle),
         );
@@ -876,13 +887,47 @@ where
     })
 }
 
-/// Open a short-lived Infigraph instance for batch work.
-fn open_transient<MR>(root: &Path, make_registry: &MR) -> Result<Infigraph>
-where
-    MR: Fn() -> Result<crate::lang::LanguageRegistry>,
-{
-    let registry = make_registry()?;
-    let mut prism = Infigraph::open(root, registry)?;
+// (open_transient below opens a short-lived Infigraph instance for batch work.)
+
+/// Feeds one drained debounce batch into the shared queue (R7.4, #84).
+/// A reindex storm (mass git checkout, branch switch) floods the batch
+/// with hundreds of per-file events; above `storm_threshold`, one
+/// whole-project pass beats N per-file extractions -- the drain's
+/// scan_changed_files hash-diffs the tree, so unchanged files cost a hash
+/// each while every actually-changed file is still picked up, including
+/// any the storm's event flood dropped or that arrived after the window
+/// closed, and the scan's stale-file sweep prunes removals too.
+fn flush_batch_into_queue(
+    q: &mut crate::watch::queue::IndexWorkQueue,
+    paths: Vec<PathBuf>,
+    root: &Path,
+    storm_threshold: usize,
+) {
+    if paths.len() > storm_threshold {
+        eprintln!(
+            "[watch] {} files changed in one debounce window (> {}) -- \
+             coalescing into a single whole-project pass",
+            paths.len(),
+            storm_threshold
+        );
+        q.mark_whole_project();
+        return;
+    }
+    for path in paths {
+        let rel = path
+            .strip_prefix(root)
+            .map(|r| r.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_else(|_| path.to_string_lossy().replace('\\', "/"));
+        q.add_raw(rel);
+    }
+}
+
+fn open_transient(root: &Path, registry: &Arc<crate::lang::LanguageRegistry>) -> Result<Infigraph> {
+    // Reuses the watch session's already-built registry (#58): building the
+    // 62-pack registry takes seconds in debug builds, and doing it again
+    // here put the daemon's first request reply right at the edge of
+    // callers' timeouts. `Infigraph::open_shared` exists for exactly this.
+    let mut prism = Infigraph::open_shared(root, Arc::clone(registry))?;
     prism.init()?;
     Ok(prism)
 }
@@ -904,16 +949,13 @@ where
 /// pattern lbug documents as safe. Opening a second `Database` on the same
 /// file for the drain would be a materially weaker guarantee.
 #[cfg(not(windows))]
-fn watch_db<MR>(
+fn watch_db(
     root: &Path,
-    make_registry: &MR,
+    registry: &Arc<crate::lang::LanguageRegistry>,
     held: &mut Option<Arc<Infigraph>>,
-) -> Result<Arc<Infigraph>>
-where
-    MR: Fn() -> Result<crate::lang::LanguageRegistry>,
-{
+) -> Result<Arc<Infigraph>> {
     if held.is_none() {
-        *held = Some(Arc::new(open_transient(root, make_registry)?));
+        *held = Some(Arc::new(open_transient(root, registry)?));
     }
     Ok(Arc::clone(held.as_ref().unwrap()))
 }
@@ -923,15 +965,12 @@ where
 /// opens (and the previous one closes) fresh rather than holding one open
 /// across the whole session — see `open_transient`.
 #[cfg(windows)]
-fn watch_db<MR>(
+fn watch_db(
     root: &Path,
-    make_registry: &MR,
+    registry: &Arc<crate::lang::LanguageRegistry>,
     held: &mut Option<Arc<Infigraph>>,
-) -> Result<Arc<Infigraph>>
-where
-    MR: Fn() -> Result<crate::lang::LanguageRegistry>,
-{
-    *held = Some(Arc::new(open_transient(root, make_registry)?));
+) -> Result<Arc<Infigraph>> {
+    *held = Some(Arc::new(open_transient(root, registry)?));
     Ok(Arc::clone(held.as_ref().unwrap()))
 }
 
@@ -957,20 +996,18 @@ fn poison_watch_db(held: &mut Option<Arc<Infigraph>>) {
 /// self-deadlock broken only by the 30s acquire timeout. Returning instead
 /// leaves the `.request` file in place, which is already this function's
 /// contention behaviour: a later tick, after the drain is reaped, serves it.
-fn serve_request_locked<MR>(
+fn serve_request_locked(
     root: &Path,
     path: &Path,
-    make_registry: &MR,
+    registry: &Arc<crate::lang::LanguageRegistry>,
     held: &mut Option<Arc<Infigraph>>,
     drain_in_flight: bool,
-) where
-    MR: Fn() -> Result<crate::lang::LanguageRegistry>,
-{
+) {
     if drain_in_flight {
         return;
     }
     match begin_index_op(root, "infigraph daemon", Duration::from_secs(30)) {
-        Ok(IndexOpOutcome::Acquired(_guard)) => match watch_db(root, make_registry, held) {
+        Ok(IndexOpOutcome::Acquired(_guard)) => match watch_db(root, registry, held) {
             Ok(prism) => {
                 if let Err(e) = crate::daemon_protocol::serve_one_request(&prism, path) {
                     eprintln!("[daemon] failed to serve request {}: {e}", path.display());
@@ -1211,16 +1248,13 @@ where
 /// that's the signal the caller uses to schedule SCIP enrichment. Any
 /// failure path returns `None` for languages: don't enrich a reindex that
 /// didn't actually land.
-fn finish_full_reindex<MR>(
+fn finish_full_reindex(
     root: &Path,
     reply_path: &Path,
-    make_registry: &MR,
+    registry: &Arc<crate::lang::LanguageRegistry>,
     held: &mut Option<Arc<Infigraph>>,
     joined: std::result::Result<FullReindexTaskOutput, tokio::task::JoinError>,
-) -> (Option<crate::ops::IndexOpGuard>, Option<Vec<String>>)
-where
-    MR: Fn() -> Result<crate::lang::LanguageRegistry>,
-{
+) -> (Option<crate::ops::IndexOpGuard>, Option<Vec<String>>) {
     let FullReindexTaskOutput { guard, result } = match joined {
         Ok(output) => output,
         Err(join_err) => {
@@ -1418,7 +1452,7 @@ where
 
     // The swap succeeded -- verify the new graph actually opens before
     // declaring success and discarding the ability to roll back.
-    match watch_db(root, make_registry, held) {
+    match watch_db(root, registry, held) {
         Ok(prism) => {
             // Reconcile embeddings against the NEW graph -- update_embeddings
             // queries the live symbol set and prunes anything not in it, so
@@ -1513,6 +1547,7 @@ fn route_or_serve_request<MR>(
     root: &Path,
     path: &Path,
     queue: &Arc<Mutex<crate::watch::queue::IndexWorkQueue>>,
+    registry: &Arc<crate::lang::LanguageRegistry>,
     make_registry: &MR,
     held: &mut Option<Arc<Infigraph>>,
     drain_in_flight: bool,
@@ -1533,7 +1568,7 @@ where
             // Malformed request JSON -- not this design's concern to
             // recover; hand off to serve_one_request, whose existing
             // corrupt-JSON handling (WriteResult::Err) already covers it.
-            serve_request_locked(root, path, make_registry, held, drain_in_flight);
+            serve_request_locked(root, path, registry, held, drain_in_flight);
             return None;
         }
     };
@@ -1617,7 +1652,7 @@ where
             Err(_) => {
                 // Sibling extractions file missing/corrupt -- fall
                 // through to serve_one_request's existing error path.
-                serve_request_locked(root, path, make_registry, held, drain_in_flight);
+                serve_request_locked(root, path, registry, held, drain_in_flight);
                 None
             }
         },
@@ -1661,7 +1696,7 @@ where
                 None
             }
             Err(_) => {
-                serve_request_locked(root, path, make_registry, held, drain_in_flight);
+                serve_request_locked(root, path, registry, held, drain_in_flight);
                 None
             }
         },
@@ -1675,7 +1710,7 @@ where
             drain_rt,
         ),
         _ => {
-            serve_request_locked(root, path, make_registry, held, drain_in_flight);
+            serve_request_locked(root, path, registry, held, drain_in_flight);
             None
         }
     }
@@ -2037,6 +2072,7 @@ mod tests {
             &root,
             &request_path,
             &queue,
+            &Arc::new(crate::lang::LanguageRegistry::new()),
             &|| Ok(crate::lang::LanguageRegistry::new()),
             &mut held,
             false,
@@ -2058,5 +2094,51 @@ mod tests {
             Some(vec!["foo.py".to_string()]),
             "the waiter's own scoped paths must also be relative"
         );
+    }
+}
+
+#[cfg(test)]
+mod storm_coalescing {
+    use crate::watch::flush_batch_into_queue;
+    use crate::watch::queue::IndexWorkQueue;
+    use std::path::{Path, PathBuf};
+
+    fn paths(root: &Path, n: usize) -> Vec<PathBuf> {
+        (0..n).map(|i| root.join(format!("f{i}.py"))).collect()
+    }
+
+    #[test]
+    fn under_threshold_batches_enqueue_per_file_raw_items() {
+        let root = Path::new("/proj");
+        let mut q = IndexWorkQueue::new();
+        flush_batch_into_queue(&mut q, paths(root, 3), root, 200);
+        let drained = q.drain();
+        assert!(!drained.whole_project);
+        assert_eq!(drained.items.len(), 3);
+        assert!(drained.items.contains_key("f0.py"), "{:?}", drained.items);
+    }
+
+    #[test]
+    fn storm_sized_batches_coalesce_into_one_whole_project_pass() {
+        let root = Path::new("/proj");
+        let mut q = IndexWorkQueue::new();
+        flush_batch_into_queue(&mut q, paths(root, 201), root, 200);
+        let drained = q.drain();
+        assert!(drained.whole_project, "must fall back to one scan pass");
+        assert!(
+            drained.items.is_empty(),
+            "no per-file items alongside the whole-project pass: {:?}",
+            drained.items.len()
+        );
+    }
+
+    #[test]
+    fn threshold_is_exclusive_a_batch_exactly_at_it_stays_per_file() {
+        let root = Path::new("/proj");
+        let mut q = IndexWorkQueue::new();
+        flush_batch_into_queue(&mut q, paths(root, 200), root, 200);
+        let drained = q.drain();
+        assert!(!drained.whole_project);
+        assert_eq!(drained.items.len(), 200);
     }
 }

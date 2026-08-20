@@ -50,13 +50,13 @@ pub(crate) fn find_mcp_binary() -> Result<PathBuf> {
     )
 }
 
-pub(crate) fn cmd_install() -> Result<()> {
+pub(crate) fn cmd_install(force: bool) -> Result<()> {
     let mcp_path = find_mcp_binary()?;
     println!("Found infigraph-mcp at: {}", mcp_path.to_string_lossy());
 
     let home = dirs::home_dir().context("Could not determine home directory")?;
 
-    let report = run_install(&mcp_path, &home)?;
+    let report = run_install(&mcp_path, &home, force)?;
 
     if report.written.is_empty() {
         println!("No agents were configured.");
@@ -83,7 +83,7 @@ pub(crate) fn cmd_install() -> Result<()> {
 
 /// The actual artifact-engine install logic, factored out from `cmd_install`
 /// so it's testable against a fake `$HOME` without touching the real one.
-pub(crate) fn run_install(mcp_path: &Path, home: &Path) -> Result<InstallReport> {
+pub(crate) fn run_install(mcp_path: &Path, home: &Path, force: bool) -> Result<InstallReport> {
     let mcp_path_str = mcp_path.to_string_lossy().to_string();
     let user_override_dir = home.join(".infigraph").join("integrations");
 
@@ -99,17 +99,18 @@ pub(crate) fn run_install(mcp_path: &Path, home: &Path) -> Result<InstallReport>
     };
 
     for artifact in &artifacts {
-        let outcome = crate::artifacts::apply_resolved_artifact(artifact, home, &mcp_path_str)
-            .with_context(|| {
-                format!(
-                    "applying {} artifact for {}",
-                    artifact.integration_label,
-                    artifact
-                        .target_relative_path
-                        .as_deref()
-                        .unwrap_or("(resolver-determined path)")
-                )
-            })?;
+        let outcome =
+            crate::artifacts::apply_resolved_artifact(artifact, home, &mcp_path_str, force)
+                .with_context(|| {
+                    format!(
+                        "applying {} artifact for {}",
+                        artifact.integration_label,
+                        artifact
+                            .target_relative_path
+                            .as_deref()
+                            .unwrap_or("(resolver-determined path)")
+                    )
+                })?;
         let label = artifact
             .target_relative_path
             .clone()
@@ -442,28 +443,105 @@ pub(crate) fn self_update(version: &str) -> Result<()> {
 
     let _ = std::fs::remove_file(&download_path);
 
-    for bin in &["infigraph", "infigraph-mcp", "lsp-to-scip"] {
-        let _ = std::fs::remove_file(install_dir.join(format!("{bin}{bin_suffix}.old")));
-    }
-
     if os == "macos" {
         for bin in &["infigraph", "infigraph-mcp", "lsp-to-scip"] {
+            let bin_path = install_dir.join(bin);
             let _ = std::process::Command::new("xattr")
-                .args([
-                    "-dr",
-                    "com.apple.quarantine",
-                    &install_dir.join(bin).to_string_lossy(),
-                ])
+                .args(["-dr", "com.apple.quarantine", &bin_path.to_string_lossy()])
                 .status();
+            // I-10: a copied/extracted binary whose signature the move
+            // invalidated gets SIGKILL'd at exec on macOS. Verify and
+            // ad-hoc re-sign before the launch check below, so "doesn't
+            // launch" below means genuinely broken, not just unsigned.
+            macos_ensure_signed(&bin_path);
         }
+    }
+
+    // R8.2 (#86): verify the swapped-in binaries actually LAUNCH before
+    // discarding the previous ones -- a corrupt download that extracts
+    // fine but doesn't run used to leave broken binaries and no rollback.
+    // (`lsp-to-scip` is a helper without a --version contract; presence in
+    // the archive is its check.)
+    let mut launch_failure = None;
+    for bin in &["infigraph", "infigraph-mcp"] {
+        let bin_path = install_dir.join(format!("{bin}{bin_suffix}"));
+        if let Err(e) = verify_binary_launches(&bin_path) {
+            launch_failure = Some(format!("{}: {e}", bin_path.display()));
+            break;
+        }
+    }
+    if let Some(reason) = launch_failure {
+        let restored = restore_swap_backups(&install_dir, bin_suffix);
+        anyhow::bail!(
+            "the freshly installed binary failed its launch check ({reason}) -- \
+             restored the previous binaries ({restored} of 3); the update was NOT applied"
+        );
+    }
+
+    // Only now, with launch-verified replacements in place, discard the
+    // previous binaries.
+    for bin in &["infigraph", "infigraph-mcp", "lsp-to-scip"] {
+        let _ = std::fs::remove_file(install_dir.join(format!("{bin}{bin_suffix}.old")));
     }
 
     if let Some(cache_path) = update_cache_path() {
         let _ = std::fs::remove_file(&cache_path);
     }
 
-    println!("Installed v{version} to {}", install_dir.display());
+    println!(
+        "Installed v{version} to {} (previous: v{}); launch check passed",
+        install_dir.display(),
+        env!("CARGO_PKG_VERSION")
+    );
     Ok(())
+}
+
+/// R8.2: does the binary at `path` start and answer `--version` with exit
+/// 0? Returns its first stdout line on success.
+fn verify_binary_launches(path: &Path) -> Result<String> {
+    let output = std::process::Command::new(path)
+        .arg("--version")
+        .output()
+        .with_context(|| format!("failed to execute {}", path.display()))?;
+    if !output.status.success() {
+        anyhow::bail!("exited with {:?}", output.status.code());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_string())
+}
+
+/// Renames every `<bin>.old` backup back into place. Returns how many were
+/// restored. Best-effort by design: a partially failed restore still beats
+/// deleting the only working copies.
+fn restore_swap_backups(install_dir: &Path, bin_suffix: &str) -> usize {
+    let mut restored = 0;
+    for bin in &["infigraph", "infigraph-mcp", "lsp-to-scip"] {
+        let bin_path = install_dir.join(format!("{bin}{bin_suffix}"));
+        let old_path = install_dir.join(format!("{bin}{bin_suffix}.old"));
+        if old_path.exists() && std::fs::rename(&old_path, &bin_path).is_ok() {
+            restored += 1;
+        }
+    }
+    restored
+}
+
+/// I-10 (macOS): `codesign --verify` the binary; on failure, ad-hoc
+/// re-sign in place. Best-effort -- on any error the launch check that
+/// follows is the real gate.
+fn macos_ensure_signed(bin_path: &Path) {
+    let verified = std::process::Command::new("codesign")
+        .args(["--verify", &bin_path.to_string_lossy()])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !verified {
+        let _ = std::process::Command::new("codesign")
+            .args(["--force", "--sign", "-", &bin_path.to_string_lossy()])
+            .status();
+    }
 }
 
 pub(crate) fn print_capabilities_summary(configured: &[String]) {
@@ -615,7 +693,10 @@ fn reinstall_hooks() -> Result<()> {
     let home = dirs::home_dir().context("cannot find home directory")?;
     println!("\nReinstalling hooks...");
     let mcp_path = find_mcp_binary()?;
-    run_install(&mcp_path, &home)?;
+    // force=false: this runs automatically after a binary self-update (see
+    // cmd_update below), with no user present to answer for a hand-edited
+    // hook -- respect the same guard a manual `infigraph install` would.
+    run_install(&mcp_path, &home, false)?;
     Ok(())
 }
 
@@ -688,11 +769,63 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(unix)]
+    fn verify_binary_launches_accepts_working_and_rejects_broken() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+
+        let good = tmp.path().join("good");
+        std::fs::write(&good, "#!/bin/sh\necho fake-tool 9.9.9\n").unwrap();
+        std::fs::set_permissions(&good, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(verify_binary_launches(&good).unwrap(), "fake-tool 9.9.9");
+
+        let broken = tmp.path().join("broken");
+        std::fs::write(&broken, "#!/bin/sh\nexit 3\n").unwrap();
+        std::fs::set_permissions(&broken, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(verify_binary_launches(&broken).is_err());
+
+        assert!(
+            verify_binary_launches(&tmp.path().join("missing")).is_err(),
+            "a binary that is not there did not launch"
+        );
+    }
+
+    #[test]
+    fn restore_swap_backups_renames_old_binaries_back_into_place() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Failed swap state: the new (broken) binaries in place, the
+        // previous ones parked as .old.
+        std::fs::write(tmp.path().join("infigraph"), b"broken new").unwrap();
+        std::fs::write(tmp.path().join("infigraph.old"), b"working previous").unwrap();
+        std::fs::write(
+            tmp.path().join("infigraph-mcp.old"),
+            b"working previous mcp",
+        )
+        .unwrap();
+        // lsp-to-scip has no backup -- restore must cope.
+
+        let restored = restore_swap_backups(tmp.path(), "");
+
+        assert_eq!(restored, 2);
+        assert_eq!(
+            std::fs::read(tmp.path().join("infigraph")).unwrap(),
+            b"working previous",
+            "the previous binary must be back in place"
+        );
+        assert_eq!(
+            std::fs::read(tmp.path().join("infigraph-mcp")).unwrap(),
+            b"working previous mcp"
+        );
+        assert!(!tmp.path().join("infigraph.old").exists());
+    }
+
+    #[test]
     fn cmd_install_writes_every_convention_based_integration_under_a_fake_home() {
         let home_dir = tempfile::tempdir().unwrap();
         let mcp_path = "/opt/infigraph/bin/infigraph-mcp";
 
-        let report = run_install(&std::path::PathBuf::from(mcp_path), home_dir.path()).unwrap();
+        let report =
+            run_install(&std::path::PathBuf::from(mcp_path), home_dir.path(), false).unwrap();
 
         assert!(report.written.iter().any(|p| p == ".claude.json"));
         assert!(report.written.iter().any(|p| p == ".gemini/settings.json"));
@@ -714,8 +847,8 @@ mod tests {
         let home_dir = tempfile::tempdir().unwrap();
         let mcp_path = "/opt/infigraph/bin/infigraph-mcp";
 
-        run_install(&std::path::PathBuf::from(mcp_path), home_dir.path()).unwrap();
-        run_install(&std::path::PathBuf::from(mcp_path), home_dir.path()).unwrap();
+        run_install(&std::path::PathBuf::from(mcp_path), home_dir.path(), false).unwrap();
+        run_install(&std::path::PathBuf::from(mcp_path), home_dir.path(), false).unwrap();
 
         let claude_json: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(home_dir.path().join(".claude.json")).unwrap(),
@@ -735,7 +868,7 @@ mod tests {
         let home_dir = tempfile::tempdir().unwrap();
         let mcp_path = "/opt/infigraph/bin/infigraph-mcp";
 
-        run_install(&std::path::PathBuf::from(mcp_path), home_dir.path()).unwrap();
+        run_install(&std::path::PathBuf::from(mcp_path), home_dir.path(), false).unwrap();
         assert!(home_dir.path().join(".claude.json").exists());
 
         run_uninstall(&std::path::PathBuf::from(mcp_path), home_dir.path()).unwrap();

@@ -1704,6 +1704,12 @@ const COZO_SCHEMA: &[&str] = &[
     ":create cluster {id: String => name: String, description: String default \"\"}",
     ":create file {id: String => name: String, path: String, language: String, symbol_count: Int default 0}",
     ":create folder {id: String => name: String, path: String}",
+    // Parity with Kuzu's GraphMeta singleton (R3.3.3/R3.3.4/R8.1): the
+    // generation counters and schema version. CozoStore does not bump
+    // these today (it has no incremental write path that needs them), but
+    // the table exists so the schemas stay column-for-column comparable
+    // and a future Cozo write path has the row shape ready.
+    ":create graphmeta {id: String => ast_generation: Int default 0, scip_generation: Int default 0, schema_version: Int default 0}",
     ":create dependency {id: String => name: String, version: String default \"\", ecosystem: String default \"\", is_dev: Bool default false}",
     ":create statement {id: String => kind: String, condition: String default \"\", start_line: Int default 0, end_line: Int default 0, depth: Int default 0, parent_symbol: String default \"\"}",
     ":create calls {caller: String, callee: String, line: Int default 0}",

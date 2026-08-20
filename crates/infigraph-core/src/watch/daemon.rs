@@ -217,6 +217,10 @@ pub fn build_daemon_command(root: &Path, tg_dir: &Path, watch_binary: &Path) -> 
     // watcher is already running" message lands after the winner's output
     // instead of truncating it away.
     let log_path = tg_dir.join("watch.log");
+    // R7.3 (#83): cap before handing the file to the child as its stderr.
+    // Rotate-at-spawn is the only safe point -- once the fd is inherited,
+    // the child appends for its whole lifetime.
+    crate::logrotate::rotate_if_over(&log_path, 10 * 1024 * 1024);
     let stderr_target = match std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -325,6 +329,7 @@ mod tests {
                 build_hash: "some-old-build".to_string(),
                 acquired_at: 0,
                 last_heartbeat: 0,
+                holder_started_at: 0,
             },
         );
 
@@ -352,6 +357,7 @@ mod tests {
                 build_hash: crate::build_hash().to_string(),
                 acquired_at: 0,
                 last_heartbeat: 0,
+                holder_started_at: 0,
             },
         );
 
@@ -380,6 +386,7 @@ mod tests {
                 build_hash: "definitely-not-the-current-build".to_string(),
                 acquired_at: 0,
                 last_heartbeat: 0,
+                holder_started_at: 0,
             },
         );
 

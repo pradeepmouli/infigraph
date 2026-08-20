@@ -235,12 +235,28 @@ pub fn list_restore_points(infigraph_dir: &Path) -> Vec<RestorePoint> {
 /// Callers are responsible for holding whatever lock serializes writes to
 /// `infigraph_dir` before calling this (see `create_snapshot`).
 pub fn restore(infigraph_dir: &Path, point: &RestorePoint) -> Result<()> {
-    match point.kind {
+    let result = match point.kind {
         RestorePointKind::Snapshot => restore_from_snapshot(infigraph_dir, point.timestamp),
         RestorePointKind::Previous | RestorePointKind::Corrupt => {
             restore_from_graph_pool(infigraph_dir, point.kind, point.timestamp)
         }
+    };
+    if result.is_ok() {
+        // R6.3: a restore replaces live state wholesale -- exactly the
+        // kind of act "the graph looks different now" forensics need a
+        // line for. Only on success: a failed restore changed nothing
+        // durable worth attesting (staging holds any partial work).
+        crate::audit::audit_log(
+            "restore",
+            "restore-live-state",
+            &format!(
+                "operator restored from {:?} point {}",
+                point.kind, point.timestamp
+            ),
+            &infigraph_dir.display().to_string(),
+        );
     }
+    result
 }
 
 fn restore_from_snapshot(infigraph_dir: &Path, timestamp: u64) -> Result<()> {

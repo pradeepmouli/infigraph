@@ -184,6 +184,22 @@ pub(crate) fn apply_overwrite(target_path: &Path, content: &[u8]) -> Result<Appl
     Ok(ApplyOutcome::Written)
 }
 
+/// Install-time token substitution (R8.3, #87): a bundled text artifact
+/// containing `__INFIGRAPH_VERSION__` gets the installing binary's version
+/// baked in at write time. This is what lets a hook script know which
+/// version SHIPPED it, so it can warn when the binary on PATH has moved on
+/// (the "hook fix reverted by reinstall" drift class, I-9). Binary content
+/// and token-free text pass through untouched.
+pub(crate) fn substitute_install_tokens(content: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    const TOKEN: &str = "__INFIGRAPH_VERSION__";
+    match std::str::from_utf8(content) {
+        Ok(text) if text.contains(TOKEN) => {
+            std::borrow::Cow::Owned(text.replace(TOKEN, env!("CARGO_PKG_VERSION")).into_bytes())
+        }
+        _ => std::borrow::Cow::Borrowed(content),
+    }
+}
+
 pub(crate) fn remove_json_deep_merge(target_path: &Path, fragment_content: &str) -> Result<bool> {
     if !target_path.is_file() {
         return Ok(false);
@@ -682,6 +698,35 @@ mod tests {
             std::fs::read(&target).unwrap(),
             b"#!/usr/bin/env bash\necho hi\n"
         );
+    }
+
+    #[test]
+    fn substitute_install_tokens_bakes_the_crate_version_into_text() {
+        let out = substitute_install_tokens(
+            b"#!/bin/sh\nHOOK_SHIPPED_VERSION=\"__INFIGRAPH_VERSION__\"\n",
+        );
+        let text = std::str::from_utf8(&out).unwrap();
+        assert!(
+            text.contains(&format!(
+                "HOOK_SHIPPED_VERSION=\"{}\"",
+                env!("CARGO_PKG_VERSION")
+            )),
+            "{text}"
+        );
+        assert!(!text.contains("__INFIGRAPH_VERSION__"), "{text}");
+    }
+
+    #[test]
+    fn substitute_install_tokens_leaves_token_free_and_binary_content_untouched() {
+        assert!(matches!(
+            substitute_install_tokens(b"no tokens here"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        let binary = [0xffu8, 0xfe, 0x00, 0x01];
+        assert!(matches!(
+            substitute_install_tokens(&binary),
+            std::borrow::Cow::Borrowed(_)
+        ));
     }
 
     #[test]

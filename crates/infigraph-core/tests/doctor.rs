@@ -269,6 +269,7 @@ fn check_locks_passes_for_live_holder_matching_build_hash() {
             build_hash: "matching-hash".to_string(),
             acquired_at: 1000,
             last_heartbeat: 1000,
+            holder_started_at: 0,
         },
     );
     let registry = infigraph_core::multi::Registry::default();
@@ -302,6 +303,7 @@ fn check_locks_warns_on_build_hash_mismatch() {
             build_hash: "old-hash".to_string(),
             acquired_at: 1000,
             last_heartbeat: 1000,
+            holder_started_at: 0,
         },
     );
     let ctx = DoctorContext {
@@ -421,6 +423,7 @@ fn check_watchers_warns_when_heartbeat_stale_but_pid_alive() {
             build_hash: "any-hash".to_string(),
             acquired_at: now - 500,
             last_heartbeat: now - 400, // >300s stale, and distinct from acquired_at
+            holder_started_at: 0,
         },
     );
 
@@ -795,6 +798,7 @@ fn write_alive_watch_lock(lock_path: &std::path::Path) {
             build_hash: "any-hash".to_string(),
             acquired_at: now - 10,
             last_heartbeat: now, // fresh, and distinct from acquired_at
+            holder_started_at: 0,
         },
     );
 }

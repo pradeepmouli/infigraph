@@ -45,7 +45,9 @@ pub fn instances_dir() -> PathBuf {
         .join("instances")
 }
 
-fn instance_path(pid: u32) -> PathBuf {
+/// The registration file path for `pid` (pub for R5.4's signal-time
+/// deregistration, which cannot reach the InstanceGuard from a handler).
+pub fn instance_path(pid: u32) -> PathBuf {
     instances_dir().join(format!("{pid}.json"))
 }
 
@@ -207,9 +209,21 @@ pub fn reap_orphans_once(own_pid: u32) -> usize {
     let entries = list_instances();
     let classified = classify_instances(&entries, own_pid, current_process_start_time);
     let mut reaped = 0;
-    for (path, _info, status) in classified {
+    for (path, info, status) in classified {
         if status == InstanceStatus::Orphan {
             reap_orphan(&path);
+            // R6.3: registry evictions are destructive ops -- one audit
+            // line each, naming the dead instance, so "where did my
+            // registration go" is answerable from the trail.
+            crate::audit::audit_log(
+                "instances",
+                "reap-orphan-registration",
+                &format!(
+                    "pid {} (started {}) is gone or its pid was recycled",
+                    info.pid, info.started_at
+                ),
+                &path.display().to_string(),
+            );
             reaped += 1;
         }
     }

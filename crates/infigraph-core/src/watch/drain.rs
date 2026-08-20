@@ -239,10 +239,11 @@ mod tests {
             false,
             &drain_rt,
         ) {
+            let registry = std::sync::Arc::new(make_registry().unwrap());
             let (guard, _) = crate::watch::finish_full_reindex(
                 root,
                 &in_flight.reply_path,
-                make_registry,
+                &registry,
                 held,
                 drain_rt.block_on(in_flight.handle),
             );
@@ -413,15 +414,29 @@ mod tests {
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .filter(|n| n.starts_with("graph.previous.") || n.starts_with("graph.corrupt."))
             .collect();
+        // Count only BASE pool entries ("graph.previous.<ts>", all digits
+        // after the infix): the retire also relocates WAL-family siblings
+        // sharing the stem ("graph.previous.<ts>.wal"), which are part of
+        // the same single retired entry, not extra entries.
+        let base_entries: Vec<&String> = aside
+            .iter()
+            .filter(|n| {
+                n.strip_prefix("graph.previous.")
+                    .or_else(|| n.strip_prefix("graph.corrupt."))
+                    .is_some_and(|rest| {
+                        !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit())
+                    })
+            })
+            .collect();
         assert_eq!(
-            aside.len(),
+            base_entries.len(),
             1,
             "the old graph must be moved aside (renamed), not deleted: {aside:?}"
         );
         assert!(
-            aside[0].starts_with("graph.previous."),
-            "a healthy superseded graph must go to the rollback pool, not the \
-             corruption-evidence pool: {aside:?}"
+            aside.iter().all(|n| n.starts_with("graph.previous.")),
+            "a healthy superseded graph (and its WAL siblings) must go to the rollback \
+             pool, not the corruption-evidence pool: {aside:?}"
         );
     }
 

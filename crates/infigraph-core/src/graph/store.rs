@@ -190,15 +190,51 @@ pub fn db_lock_path(db_path: &Path) -> PathBuf {
 /// holder" via `lockfile::read_holder` returning `None`, and does not flag
 /// -- conservative by design, since a false positive here means refusing
 /// to open a perfectly good graph.
-fn unclean_shutdown_wal_holder(db_path: &Path, lock_path: &Path) -> Option<u32> {
+pub fn unclean_shutdown_wal_holder(db_path: &Path, lock_path: &Path) -> Option<u32> {
     if wal_family_paths(db_path).is_empty() {
         return None;
     }
     let holder = lockfile::read_holder(lock_path)?;
-    if crate::instances::current_process_start_time(holder.pid).is_some() {
+    if lockfile::holder_is_alive(&holder) {
         return None; // holder is alive -- not our call to intervene
     }
     Some(holder.pid)
+}
+
+/// Reads the schema version stamped in `db`'s GraphMeta singleton. 0 =
+/// pre-versioning database (missing table/row/column all read as 0).
+fn read_stored_schema_version(db: &Database) -> i64 {
+    let Ok(conn) = Connection::new(db) else {
+        return 0;
+    };
+    let Ok(mut result) =
+        conn.query("MATCH (g:GraphMeta {id: 'singleton'}) RETURN g.schema_version")
+    else {
+        return 0;
+    };
+    result
+        .next()
+        .and_then(|row| row.first().and_then(|v| v.to_string().parse::<i64>().ok()))
+        .unwrap_or(0)
+}
+
+/// R8.1 (#85): refuse to touch a database written by a NEWER schema than
+/// this binary understands -- "open-and-guess" against a future layout is
+/// how silent corruption starts. Runs BEFORE any DDL, so the refusal is
+/// side-effect-free. Older/unstamped versions return Ok: the unconditional
+/// CREATE/MIGRATIONS pass migrates them forward, exactly as before.
+fn refuse_newer_schema(db: &Database, db_path: &Path) -> Result<()> {
+    let stored = read_stored_schema_version(db);
+    if stored > super::schema::SCHEMA_VERSION {
+        anyhow::bail!(
+            "graph {} was written by a newer infigraph (schema v{stored}; this binary \
+             understands up to v{}) -- upgrade infigraph rather than opening it with \
+             this version",
+            db_path.display(),
+            super::schema::SCHEMA_VERSION
+        );
+    }
+    Ok(())
 }
 
 /// Persistent graph store backed by Kuzu.
@@ -231,6 +267,7 @@ impl GraphStore {
         }
         let db = Database::new(path, SystemConfig::default())
             .map_err(|e| anyhow::anyhow!("failed to open kuzu db: {e}"))?;
+        refuse_newer_schema(&db, path)?;
         let store = Self { db, lock_path };
         let lock = WriteLock::acquire_with_timeout(&store.lock_path, timeout)?;
         store.init_schema(&lock)?;
@@ -277,6 +314,7 @@ impl GraphStore {
                 anyhow::anyhow!(msg)
             }
         })?;
+        refuse_newer_schema(&db, path)?;
         Ok(Self { db, lock_path })
     }
 
@@ -305,6 +343,18 @@ impl GraphStore {
         for migration in MIGRATIONS {
             let _ = conn.query(migration);
         }
+        // R8.1 (#85): stamp the schema version this binary just ensured.
+        // ON CREATE initializes BOTH generation counters explicitly --
+        // Kuzu's NULL+1=NULL arithmetic on a never-initialized column bit
+        // the R3.3.4 bump helper before shipping (same lesson applied).
+        conn.query(&format!(
+            "MERGE (g:GraphMeta {{id: 'singleton'}}) \
+             ON CREATE SET g.ast_generation = 0, g.scip_generation = 0, \
+                           g.schema_version = {v} \
+             ON MATCH SET g.schema_version = {v}",
+            v = super::schema::SCHEMA_VERSION
+        ))
+        .map_err(|e| anyhow::anyhow!("failed to stamp schema version: {e}"))?;
         Ok(())
     }
 
@@ -592,6 +642,7 @@ mod tests {
             build_hash: "test".to_string(),
             acquired_at: 0,
             last_heartbeat: 0,
+            holder_started_at: 0,
         };
         std::fs::write(lock_path, serde_json::to_string(&info).unwrap()).unwrap();
     }
@@ -721,6 +772,71 @@ mod tests {
         assert!(validate_db_file(&dir.path().join("does-not-exist")).is_ok());
         // Directory (legacy layout) → fine.
         assert!(validate_db_file(dir.path()).is_ok());
+    }
+
+    #[test]
+    fn schema_version_is_stamped_on_open_and_a_newer_one_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("graph");
+
+        // Fresh open stamps the current version; reopen proceeds fine.
+        drop(GraphStore::open(&db_path).unwrap());
+        let store = GraphStore::open(&db_path).unwrap();
+        let conn = store.connection().unwrap();
+        let mut result = conn
+            .query("MATCH (g:GraphMeta {id: 'singleton'}) RETURN g.schema_version")
+            .unwrap();
+        let stamped: i64 = result
+            .next()
+            .and_then(|row| row.first().and_then(|v| v.to_string().parse().ok()))
+            .unwrap();
+        assert_eq!(stamped, super::super::schema::SCHEMA_VERSION);
+
+        // Simulate a database written by a FUTURE binary.
+        conn.query(&format!(
+            "MATCH (g:GraphMeta {{id: 'singleton'}}) SET g.schema_version = {}",
+            super::super::schema::SCHEMA_VERSION + 1
+        ))
+        .unwrap();
+        drop(result);
+        drop(conn);
+        drop(store);
+
+        let err = GraphStore::open(&db_path)
+            .map(|_| ())
+            .expect_err("a newer schema must be refused, not open-and-guessed");
+        assert!(err.to_string().contains("newer infigraph"), "{err}");
+        let err = GraphStore::open_read_only(&db_path)
+            .map(|_| ())
+            .expect_err("read-only must refuse a newer schema too");
+        assert!(err.to_string().contains("newer infigraph"), "{err}");
+    }
+
+    #[test]
+    fn unstamped_or_older_schema_is_migrated_forward_and_restamped() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("graph");
+        {
+            let store = GraphStore::open(&db_path).unwrap();
+            let conn = store.connection().unwrap();
+            // Roll the stamp back to "pre-versioning" (0).
+            conn.query("MATCH (g:GraphMeta {id: 'singleton'}) SET g.schema_version = 0")
+                .unwrap();
+        }
+        let store = GraphStore::open(&db_path).expect("older/unstamped must open and migrate");
+        let conn = store.connection().unwrap();
+        let mut result = conn
+            .query("MATCH (g:GraphMeta {id: 'singleton'}) RETURN g.schema_version")
+            .unwrap();
+        let stamped: i64 = result
+            .next()
+            .and_then(|row| row.first().and_then(|v| v.to_string().parse().ok()))
+            .unwrap();
+        assert_eq!(
+            stamped,
+            super::super::schema::SCHEMA_VERSION,
+            "open must re-stamp after migrating forward"
+        );
     }
 
     #[test]

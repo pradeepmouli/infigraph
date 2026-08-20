@@ -18,6 +18,27 @@ const PREVIOUS_INFIX: &str = "previous";
 /// useful amount and each extra copy is a full graph's worth of disk.
 const PREVIOUS_RETENTION: usize = 1;
 
+/// Byte cap on a single CORRUPT-pool base image (R7.3 / #100). The sittir
+/// incident quarantined a 9.9G corrupt store (40x the healthy rebuild of
+/// the same repo) and filled the disk -- and a corrupt base image's pages
+/// are mostly worthless for forensics anyway; the WAL family plus a
+/// manifest carry the evidence that matters. An oversized base is
+/// therefore dropped (with an R6.3 audit line) in favor of its WAL
+/// siblings and a small manifest recording what was dropped.
+///
+/// The `previous` pool is deliberately NOT size-capped: retention=1
+/// already bounds it to one healthy rollback candidate of about the live
+/// graph's size, and truncating a healthy graph destroys its entire
+/// rollback value.
+///
+/// Overridable via `INFIGRAPH_QUARANTINE_MAX_BYTES` (0 disables the cap).
+fn quarantine_max_bytes() -> u64 {
+    std::env::var("INFIGRAPH_QUARANTINE_MAX_BYTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1024 * 1024 * 1024)
+}
+
 fn now_epoch_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -74,10 +95,48 @@ fn move_graph_aside(
 ) -> Result<PathBuf> {
     evict_oldest_if_at_bound(infigraph_dir, graph_name, infix, retention)?;
 
-    let ts = now_epoch_secs();
+    // now_epoch_secs() is second-granularity: two calls into the same pool
+    // within one wall-clock second would collide on the destination name,
+    // and fs::rename on Unix silently REPLACES an existing regular-file
+    // destination -- destroying the earlier entry in a module whose whole
+    // purpose is not losing data. Same bug class (and same fix) as
+    // snapshot::create_snapshot: walk forward to a genuinely free stem.
+    let ts = next_free_aside_ts(infigraph_dir, graph_name, infix, now_epoch_secs());
     let quarantine_stem = format!("{graph_name}.{infix}.{ts}");
     let quarantine_path = infigraph_dir.join(&quarantine_stem);
     let source = infigraph_dir.join(graph_name);
+
+    // Size cap, corrupt pool only (see `quarantine_max_bytes`). Runs
+    // before the rename so the oversized base never enters the pool at
+    // all: the WAL family still gets relocated below (it shares the stem
+    // with the manifest), preserving the actually-useful evidence.
+    let cap = quarantine_max_bytes();
+    if infix == CORRUPT_INFIX && cap > 0 {
+        let base_size = entry_size_bytes(&source);
+        if base_size > cap {
+            let manifest_path = infigraph_dir.join(format!("{quarantine_stem}.manifest.json"));
+            let manifest = serde_json::json!({
+                "dropped_base_image": source.display().to_string(),
+                "dropped_bytes": base_size,
+                "cap_bytes": cap,
+                "reason": "corrupt base image exceeded INFIGRAPH_QUARANTINE_MAX_BYTES;                            WAL-family siblings retained for forensics",
+                "dropped_at_epoch": ts,
+            });
+            let _ = std::fs::write(
+                &manifest_path,
+                serde_json::to_string_pretty(&manifest).unwrap_or_default(),
+            );
+            remove_entry(&source);
+            crate::audit::audit_log(
+                "quarantine",
+                "drop-oversized-corrupt-base",
+                &format!("{base_size} bytes exceeded the {cap}-byte quarantine cap"),
+                &source.display().to_string(),
+            );
+            relocate_wal_family(infigraph_dir, graph_name, &quarantine_stem, &source);
+            return Ok(manifest_path);
+        }
+    }
 
     std::fs::rename(&source, &quarantine_path).with_context(|| {
         format!(
@@ -108,7 +167,37 @@ fn move_graph_aside(
     // remove the original, so even a failure removing the original
     // afterward is harmless (the caller's fallback cleanup just finishes
     // that removal; quarantine already holds the evidence).
-    for path in crate::graph::wal_family_paths(&source) {
+    relocate_wal_family(infigraph_dir, graph_name, &quarantine_stem, &source);
+
+    crate::audit::audit_log(
+        "quarantine",
+        if infix == CORRUPT_INFIX {
+            "quarantine-corrupt-graph"
+        } else {
+            "retire-previous-graph"
+        },
+        if infix == CORRUPT_INFIX {
+            "graph failed a corruption verdict"
+        } else {
+            "superseded by a successful full reindex"
+        },
+        &quarantine_path.display().to_string(),
+    );
+
+    Ok(quarantine_path)
+}
+
+/// Move every WAL-family sibling of `source` beside the pool entry, as
+/// flat files sharing its stem (e.g. "graph.corrupt.<ts>.wal") -- see the
+/// long comment at the call site in `move_graph_aside` for why the
+/// copy+remove fallback inside `move_wal_sibling` is load-bearing.
+fn relocate_wal_family(
+    infigraph_dir: &Path,
+    graph_name: &str,
+    quarantine_stem: &str,
+    source: &Path,
+) {
+    for path in crate::graph::wal_family_paths(source) {
         let name = path.file_name().unwrap_or_default().to_string_lossy();
         // name looks like "<graph_name>.wal" or "<graph_name>.wal.checkpoint";
         // keep everything after "<graph_name>" so the moved-aside name stays
@@ -123,8 +212,68 @@ fn move_graph_aside(
             );
         }
     }
+}
 
-    Ok(quarantine_path)
+/// Total size of a pool entry or source graph: the file's length, or a
+/// directory's recursive sum (legacy directory layout).
+fn entry_size_bytes(path: &Path) -> u64 {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return 0;
+    };
+    if !meta.is_dir() {
+        return meta.len();
+    }
+    let mut total = 0;
+    if let Ok(entries) = std::fs::read_dir(path) {
+        for e in entries.flatten() {
+            total += entry_size_bytes(&e.path());
+        }
+    }
+    total
+}
+
+/// Delete a base entry, dispatching on file-vs-directory (remove_dir_all
+/// errors on a plain file, and that error used to be silently swallowed
+/// elsewhere -- see evict_oldest_if_at_bound's same dispatch).
+fn remove_entry(path: &Path) {
+    let is_dir = std::fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false);
+    if is_dir {
+        let _ = std::fs::remove_dir_all(path);
+    } else {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// First timestamp `>= start_ts` whose pool stem
+/// (`<graph_name>.<infix>.<ts>`) is genuinely unused: neither the base
+/// entry itself nor any sibling sharing the stem (e.g. `<stem>.wal`, a
+/// stray leftover from a partial earlier move) exists. Checking siblings
+/// too -- rather than a bare `exists()` on the base path -- matters
+/// because the WAL-relocation loop in `move_graph_aside` writes
+/// `<stem>.wal`-style names, and `move_wal_sibling`'s copy fallback would
+/// silently overwrite one just as `fs::rename` overwrites the base.
+///
+/// The `stem == name` / `starts_with("<stem>.")` split (not a plain
+/// `starts_with(stem)`) keeps `graph.corrupt.17` from falsely matching
+/// `graph.corrupt.170`'s entries.
+fn next_free_aside_ts(infigraph_dir: &Path, graph_name: &str, infix: &str, start_ts: u64) -> u64 {
+    let mut ts = start_ts;
+    loop {
+        let stem = format!("{graph_name}.{infix}.{ts}");
+        let stem_dot = format!("{stem}.");
+        let in_use = std::fs::read_dir(infigraph_dir)
+            .map(|entries| {
+                entries.flatten().any(|e| {
+                    let name = e.file_name().to_string_lossy().into_owned();
+                    name == stem || name.starts_with(&stem_dot)
+                })
+            })
+            .unwrap_or(false);
+        if !in_use {
+            return ts;
+        }
+        ts += 1;
+    }
 }
 
 /// Move a WAL-family sibling alongside the base image it belongs to: try an
@@ -204,4 +353,71 @@ fn evict_oldest_if_at_bound(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn next_free_aside_ts_returns_start_when_nothing_collides() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            next_free_aside_ts(dir.path(), "graph", "corrupt", 1000),
+            1000
+        );
+    }
+
+    #[test]
+    fn next_free_aside_ts_walks_past_an_existing_base_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("graph.corrupt.1000"), b"earlier entry").unwrap();
+        assert_eq!(
+            next_free_aside_ts(dir.path(), "graph", "corrupt", 1000),
+            1001
+        );
+    }
+
+    #[test]
+    fn next_free_aside_ts_walks_past_a_run_of_occupied_seconds() {
+        let dir = tempfile::tempdir().unwrap();
+        for ts in 1000..1003u64 {
+            std::fs::write(dir.path().join(format!("graph.corrupt.{ts}")), b"x").unwrap();
+        }
+        assert_eq!(
+            next_free_aside_ts(dir.path(), "graph", "corrupt", 1000),
+            1003
+        );
+    }
+
+    #[test]
+    fn next_free_aside_ts_treats_a_stray_wal_sibling_as_occupied() {
+        let dir = tempfile::tempdir().unwrap();
+        // Only the sibling exists (partial earlier move) -- the stem must
+        // still count as taken, or move_wal_sibling's copy fallback would
+        // silently overwrite it.
+        std::fs::write(dir.path().join("graph.corrupt.1000.wal"), b"stray").unwrap();
+        assert_eq!(
+            next_free_aside_ts(dir.path(), "graph", "corrupt", 1000),
+            1001
+        );
+    }
+
+    #[test]
+    fn next_free_aside_ts_does_not_false_match_a_longer_timestamp_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        // "graph.corrupt.100" must not be blocked by "graph.corrupt.1000".
+        std::fs::write(dir.path().join("graph.corrupt.1000"), b"other entry").unwrap();
+        assert_eq!(next_free_aside_ts(dir.path(), "graph", "corrupt", 100), 100);
+    }
+
+    #[test]
+    fn next_free_aside_ts_pools_do_not_block_each_other() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("graph.previous.1000"), b"retired").unwrap();
+        assert_eq!(
+            next_free_aside_ts(dir.path(), "graph", "corrupt", 1000),
+            1000
+        );
+    }
 }

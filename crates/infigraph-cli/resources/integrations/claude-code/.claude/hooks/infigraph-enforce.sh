@@ -17,6 +17,29 @@
 # existing sentinel-based behavior is unchanged.
 input=$(cat)
 
+# R8.3 (#87): hook/binary version coupling. This script embeds the version
+# that installed it (substituted at install time); when the infigraph
+# binary on PATH has moved past it, warn -- fail OPEN, never block: drift
+# becomes visible instead of silently reverting hook fixes on reinstall
+# (I-9). Throttled to once an hour via a stamp file so the version probe
+# doesn't tax every tool call.
+HOOK_SHIPPED_VERSION="__INFIGRAPH_VERSION__"
+case "$HOOK_SHIPPED_VERSION" in
+  __INFIGRAPH*) : ;; # unsubstituted (repo copy / dev install) -- skip
+  *)
+    stamp="${TMPDIR:-/tmp}/.infigraph-hook-version-checked"
+    now=$(date +%s)
+    last=$(cat "$stamp" 2>/dev/null || echo 0)
+    if [ $((now - last)) -ge 3600 ]; then
+      echo "$now" > "$stamp" 2>/dev/null
+      bin_version=$(infigraph --version 2>/dev/null | awk '{print $2}')
+      if [ -n "$bin_version" ] && [ "$bin_version" != "$HOOK_SHIPPED_VERSION" ]; then
+        echo "[infigraph-enforce] warning: hooks installed by infigraph v$HOOK_SHIPPED_VERSION but v$bin_version is on PATH -- run 'infigraph install' to refresh them" >&2
+      fi
+    fi
+    ;;
+esac
+
 if ! pgrep -f "infigraph-mcp" >/dev/null 2>&1; then
   exit 0
 fi

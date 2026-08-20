@@ -112,6 +112,43 @@ enum Commands {
         #[arg(long)]
         global: bool,
     },
+
+    /// Evict registry entries for projects that no longer exist (R7.1).
+    /// By default only entries whose path is gone are evicted; add
+    /// --stale-days to also evict projects not reindexed in N days.
+    /// Every eviction is recorded in ~/.infigraph/logs/audit.log.
+    Gc {
+        /// Show what would be evicted without changing anything
+        #[arg(long)]
+        dry_run: bool,
+        /// Also evict entries whose graph was last rebuilt at least this
+        /// many days ago (recoverable: `infigraph index` re-registers)
+        #[arg(long)]
+        stale_days: Option<u64>,
+    },
+
+    /// Offline consistency check of this project's index (R3.4.1): the
+    /// graph opens cleanly, symbol->file references hold, sidecars parse
+    /// and match the graph's generation. Read-only; exit 0/1/2 =
+    /// pass/warn/fail for CI use.
+    Verify,
+
+    /// List all infigraph processes the durable state knows about (MCP
+    /// servers, watchers/daemons, in-flight index runs) with liveness,
+    /// uptime and memory -- including DEAD holders of stale locks (R2.2.4)
+    Ps,
+
+    /// Terminate an infigraph process by pid (SIGTERM; --force for
+    /// SIGKILL). Refuses pids whose binary is not verifiably infigraph's,
+    /// so a recycled pid never kills a bystander. Audited (R6.3).
+    Kill {
+        /// Process id (see `infigraph ps`)
+        pid: u32,
+        /// SIGKILL instead of the graceful SIGTERM
+        #[arg(long)]
+        force: bool,
+    },
+
     /// List available languages
     Languages,
 
@@ -186,7 +223,13 @@ enum Commands {
     },
 
     /// Install infigraph MCP server config for AI coding agents
-    Install,
+    Install {
+        /// Overwrite hooks/config even if changed since the last install
+        /// (by default, a file that no longer matches what infigraph last
+        /// wrote is left alone and reported as skipped)
+        #[arg(long)]
+        force: bool,
+    },
 
     /// Uninstall infigraph MCP server config from AI coding agents
     Uninstall,
@@ -866,7 +909,7 @@ fn main() -> Result<()> {
             | Commands::Clone { .. }
             | Commands::Worktree { .. }
             | Commands::Update
-            | Commands::Install
+            | Commands::Install { .. }
             | Commands::Uninstall
             | Commands::Init { .. }
             | Commands::Languages
@@ -898,6 +941,13 @@ fn run(command: Commands, root: &Path) -> Result<()> {
         Commands::Stats => cmd_stats(root),
         Commands::Restore { id, yes } => cmd_restore(root, id.as_deref(), yes),
         Commands::Doctor { global } => cmd_doctor(root, global),
+        Commands::Gc {
+            dry_run,
+            stale_days,
+        } => cmd_gc(dry_run, stale_days),
+        Commands::Verify => cmd_verify(root),
+        Commands::Ps => cmd_ps(root),
+        Commands::Kill { pid, force } => cmd_kill(pid, force),
         Commands::Languages => cmd_languages(Some(root)),
         Commands::Symbols { file } => cmd_symbols(root, &file),
         Commands::Skeleton { file } => cmd_skeleton(root, &file),
@@ -921,7 +971,7 @@ fn run(command: Commands, root: &Path) -> Result<()> {
         Commands::Callees { symbol } => cmd_callees(root, &symbol),
         Commands::DeadCode => cmd_dead_code(root),
         Commands::Impact { symbol, depth } => cmd_impact(root, &symbol, depth),
-        Commands::Install => cmd_install(),
+        Commands::Install { force } => cmd_install(force),
         Commands::Uninstall => cmd_uninstall(),
         Commands::Bench { n } => {
             let registry = bundled_registry()?;

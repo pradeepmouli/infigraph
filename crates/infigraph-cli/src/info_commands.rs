@@ -342,6 +342,17 @@ pub(crate) fn cmd_daemon(root: &Path, debounce: u64) -> Result<()> {
 
     ctrlc::set_handler(move || {
         let _ = stop_tx.send(());
+        // R5.4 (#79): bound the graceful path. The watch loop's shutdown
+        // waits out in-flight drains; if one is wedged (stuck on a lock or
+        // a hung query), that wait never ends and the daemon becomes an
+        // unkillable-by-SIGTERM orphan -- exactly what graceful shutdown
+        // exists to prevent. 5s is the R5.4 budget; a hard exit still
+        // releases every flock with the process.
+        std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            eprintln!("[daemon] graceful shutdown exceeded the 5s budget -- hard exit");
+            std::process::exit(1);
+        });
     })
     .ok();
 
@@ -452,8 +463,22 @@ pub(crate) fn watcher_is_alive(lock_path: &Path) -> bool {
 }
 
 pub(crate) fn acquire_watch_lock(lock_path: &Path) -> Result<infigraph_core::lockfile::LockFile> {
-    infigraph_core::lockfile::try_acquire(lock_path, "cli-watch")?
-        .ok_or_else(|| anyhow::anyhow!("another watcher is already running"))
+    infigraph_core::lockfile::try_acquire(lock_path, "cli-watch")?.ok_or_else(|| {
+        // Name the actual holder (#100 item 4's confusion: "another watcher
+        // is already running" fired right after an auto-watch had spawned
+        // one -- factually true, but unexplained). read_holder is
+        // best-effort: a mid-write payload still yields the generic form.
+        match infigraph_core::lockfile::read_holder(lock_path) {
+            Some(h) => anyhow::anyhow!(
+                "another watcher is already running: {} (PID {}) -- often the auto-watch \
+                 spawned by a recent infigraph command; `infigraph ps` lists it, \
+                 `infigraph watch-stop` stops it",
+                h.role,
+                h.pid
+            ),
+            None => anyhow::anyhow!("another watcher is already running"),
+        }
+    })
 }
 
 pub(crate) fn cmd_scip_import(root: &Path, index_path: &Path) -> Result<()> {
@@ -850,6 +875,170 @@ pub(crate) fn cmd_doctor(root: &Path, global: bool) -> Result<()> {
     match report.worst_status() {
         CheckStatus::Pass => Ok(()),
         CheckStatus::Warn => anyhow::bail!("doctor found warnings"),
+        CheckStatus::Fail => std::process::exit(2),
+    }
+}
+
+/// `infigraph gc` (R7.1): evict registry entries for deleted projects,
+/// optionally also age-stale ones. Planning/mutation live in
+/// `infigraph_core::gc` (pure, tested there); this owns the user-facing
+/// report, the confirmation-free-but-auditable persistence, and the R6.3
+/// audit lines -- written only AFTER the registry save succeeds, so the
+/// audit never records an eviction that didn't actually persist.
+pub(crate) fn cmd_gc(dry_run: bool, stale_days: Option<u64>) -> Result<()> {
+    let mut registry = infigraph_core::multi::Registry::load()?;
+    let plan =
+        infigraph_core::gc::plan_registry_gc(&registry, stale_days, std::time::SystemTime::now());
+
+    if plan.is_empty() {
+        println!("Registry is clean -- nothing to evict.");
+        return Ok(());
+    }
+
+    for c in &plan.evictions {
+        println!("evict: {} ({}) -- {}", c.name, c.path.display(), c.reason);
+    }
+    for (group, member) in &plan.dangling_group_members {
+        println!("prune: group '{group}' member '{member}' (no longer registered)");
+    }
+
+    if dry_run {
+        println!(
+            "\nDry run -- nothing changed. Re-run without --dry-run to evict {} entr{}.",
+            plan.evictions.len(),
+            if plan.evictions.len() == 1 {
+                "y"
+            } else {
+                "ies"
+            }
+        );
+        return Ok(());
+    }
+
+    infigraph_core::gc::execute_registry_gc(&mut registry, &plan);
+    registry.save()?;
+
+    for c in &plan.evictions {
+        infigraph_core::audit::audit_log(
+            "gc",
+            "evict-registry-entry",
+            &c.reason.to_string(),
+            &c.path.display().to_string(),
+        );
+    }
+    for (group, member) in &plan.dangling_group_members {
+        infigraph_core::audit::audit_log(
+            "gc",
+            "prune-group-member",
+            "member no longer registered",
+            &format!("{group}/{member}"),
+        );
+    }
+
+    println!(
+        "\nEvicted {} registry entr{}, pruned {} group member(s). Audit: ~/.infigraph/logs/audit.log",
+        plan.evictions.len(),
+        if plan.evictions.len() == 1 { "y" } else { "ies" },
+        plan.dangling_group_members.len()
+    );
+    Ok(())
+}
+
+/// `infigraph ps` (R2.2.4): every process the durable state knows about.
+pub(crate) fn cmd_ps(root: &Path) -> Result<()> {
+    let registry = infigraph_core::multi::Registry::load().unwrap_or_default();
+    let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let scope = infigraph_core::ps::ps_scope(&registry, &canonical_root);
+    let scope_refs: Vec<&Path> = scope.iter().map(|p| p.as_path()).collect();
+    let rows = infigraph_core::ps::list_infigraph_processes(&scope_refs);
+
+    if rows.is_empty() {
+        println!("No infigraph processes recorded (no instance registrations, no lock holders).");
+        return Ok(());
+    }
+
+    println!(
+        "{:<8} {:<6} {:<10} {:<10} {:<28} PROJECT / EVIDENCE",
+        "PID", "STATE", "UPTIME", "RSS", "ROLE"
+    );
+    for r in &rows {
+        let state = if r.alive { "live" } else { "dead" };
+        let uptime = r
+            .uptime_secs
+            .map(format_uptime)
+            .unwrap_or_else(|| "-".to_string());
+        let rss = r
+            .rss_bytes
+            .map(|b| format!("{} MB", b / (1024 * 1024)))
+            .unwrap_or_else(|| "-".to_string());
+        println!(
+            "{:<8} {:<6} {:<10} {:<10} {:<28} {} [{}]",
+            r.pid,
+            state,
+            uptime,
+            rss,
+            r.roles.join(","),
+            r.projects.join(", "),
+            r.evidence.join(",")
+        );
+        if !r.alive {
+            println!(
+                "         ^ stale lock -- holder is gone; `infigraph doctor` explains, deleting the lock file is safe"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn format_uptime(secs: u64) -> String {
+    if secs >= 86_400 {
+        format!("{}d{}h", secs / 86_400, (secs % 86_400) / 3600)
+    } else if secs >= 3600 {
+        format!("{}h{}m", secs / 3600, (secs % 3600) / 60)
+    } else if secs >= 60 {
+        format!("{}m{}s", secs / 60, secs % 60)
+    } else {
+        format!("{secs}s")
+    }
+}
+
+/// `infigraph kill` (R2.2.4): guarded terminate, audited (R6.3).
+pub(crate) fn cmd_kill(pid: u32, force: bool) -> Result<()> {
+    match infigraph_core::ps::kill_infigraph_process(pid, force) {
+        Ok(name) => {
+            let how = if force { "SIGKILL" } else { "SIGTERM" };
+            infigraph_core::audit::audit_log(
+                "kill",
+                if force {
+                    "kill-forced"
+                } else {
+                    "kill-graceful"
+                },
+                "operator requested via infigraph kill",
+                &format!("pid={pid} name={name}"),
+            );
+            println!("Sent {how} to {name} (pid {pid}). Audit: ~/.infigraph/logs/audit.log");
+            Ok(())
+        }
+        Err(refusal) => anyhow::bail!("refusing to kill pid {pid}: {refusal}"),
+    }
+}
+
+/// `infigraph verify` (R3.4.1): offline consistency check, doctor-style
+/// output, CI-friendly exit codes (0 pass / 1 warn / 2 fail).
+pub(crate) fn cmd_verify(root: &Path) -> Result<()> {
+    use infigraph_core::doctor::{format_report, CheckStatus, DoctorReport, DoctorScope};
+
+    let canonical_root = root.canonicalize().context("invalid project root")?;
+    let checks = infigraph_core::verify::run_verify(&canonical_root);
+    let report = DoctorReport {
+        checks,
+        scope: DoctorScope::Project(canonical_root),
+    };
+    print!("{}", format_report(&report, doctor_output_is_colorized()));
+    match report.worst_status() {
+        CheckStatus::Pass => Ok(()),
+        CheckStatus::Warn => anyhow::bail!("verify found warnings"),
         CheckStatus::Fail => std::process::exit(2),
     }
 }

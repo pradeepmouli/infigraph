@@ -30,7 +30,11 @@ fn watch_loop_serves_write_requests_when_serve_requests_is_true() {
 
     let staging_dir = project_dir.path().join(".infigraph").join("requests");
     let request = WriteRequest::Index { paths: None };
-    let result = submit_write_request(&staging_dir, &request, Duration::from_secs(5)).unwrap();
+    // 30s, not 5s: this asserts the WIRING serves requests, not first-reply
+    // latency. Debug-build registry construction alone approached the old
+    // 5s budget on loaded machines (#58) -- a genuine wiring hang still
+    // fails, just without the false negatives.
+    let result = submit_write_request(&staging_dir, &request, Duration::from_secs(30)).unwrap();
 
     #[allow(unreachable_patterns)]
     match result {

@@ -25,7 +25,11 @@ pub struct CheckResult {
 }
 
 impl CheckResult {
-    fn pass(category: &'static str, name: impl Into<String>, message: impl Into<String>) -> Self {
+    pub fn pass(
+        category: &'static str,
+        name: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
         Self {
             category,
             name: name.into(),
@@ -35,7 +39,7 @@ impl CheckResult {
         }
     }
 
-    fn warn(
+    pub fn warn(
         category: &'static str,
         name: impl Into<String>,
         message: impl Into<String>,
@@ -50,7 +54,7 @@ impl CheckResult {
         }
     }
 
-    fn fail(
+    pub fn fail(
         category: &'static str,
         name: impl Into<String>,
         message: impl Into<String>,
@@ -234,7 +238,7 @@ fn check_registered_path_still_exists(entry: &RepoEntry) -> CheckResult {
                 "registry entry points at a path that no longer exists: {}",
                 entry.path.display()
             ),
-            "run `infigraph gc` to evict stale registry entries (R7.1, not yet implemented)",
+            "run `infigraph gc` to evict it (add --stale-days N to also evict long-unindexed projects)",
         )
     }
 }
@@ -346,11 +350,19 @@ fn check_one_lock(project_path: &Path, lock_name: &str, installed_build_hash: &s
         };
     };
 
-    if !is_pid_alive(holder.pid) {
+    if !lockfile::holder_is_alive(&holder) {
         return CheckResult::warn(
             LOCK_CATEGORY,
             label,
-            format!("holder PID {} is not running (stale lock)", holder.pid),
+            format!(
+                "holder PID {} is not running (stale lock{})",
+                holder.pid,
+                if holder.holder_started_at != 0 && is_pid_alive(holder.pid) {
+                    " -- the PID was recycled by an unrelated process"
+                } else {
+                    ""
+                }
+            ),
             "safe to delete -- the recorded holder process is gone",
         );
     }
