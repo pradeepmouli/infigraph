@@ -239,10 +239,11 @@ mod tests {
             false,
             &drain_rt,
         ) {
+            let registry = std::sync::Arc::new(make_registry().unwrap());
             let (guard, _) = crate::watch::finish_full_reindex(
                 root,
                 &in_flight.reply_path,
-                make_registry,
+                &registry,
                 held,
                 drain_rt.block_on(in_flight.handle),
             );

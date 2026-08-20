@@ -131,8 +131,16 @@ where
     // below silently fails for every event and all changes are dropped.
     let root = &root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
 
-    // Build a registry once for file-extension filtering (no DB needed).
-    let filter_registry = make_registry()?;
+    // Build the registry ONCE for the whole watch session (#58): it serves
+    // both file-extension filtering here and every `watch_db` open below
+    // via `Infigraph::open_shared`. It used to be built twice serially
+    // (filter + first drain's open), which alone consumed ~5s in debug
+    // builds and pushed the daemon's first request reply past callers'
+    // timeouts. The full-reindex side-path build keeps its own fresh
+    // `make_registry()` call -- a rebuild takes far longer than a registry
+    // build, so sharing buys nothing there.
+    let shared_registry: Arc<crate::lang::LanguageRegistry> = Arc::new(make_registry()?);
+    let filter_registry = &shared_registry;
 
     let mut changes_since_periodic: usize = 0;
     let mut last_periodic = std::time::Instant::now();
@@ -334,7 +342,7 @@ where
             let (guard, scheduled_languages) = finish_full_reindex(
                 root,
                 &reply_path,
-                &make_registry,
+                &shared_registry,
                 &mut held_prism,
                 drain_rt.block_on(handle),
             );
@@ -424,6 +432,7 @@ where
                             root,
                             &path,
                             &queue,
+                            &shared_registry,
                             &make_registry,
                             &mut held_prism,
                             drain_in_flight.is_some(),
@@ -577,7 +586,7 @@ where
         {
             match begin_index_op(root, "infigraph daemon", Duration::from_secs(30)) {
                 Ok(IndexOpOutcome::Acquired(guard)) => {
-                    match watch_db(root, &make_registry, &mut held_prism) {
+                    match watch_db(root, &shared_registry, &mut held_prism) {
                         Ok(prism) => {
                             // Drained here on the loop thread rather than
                             // inside the task, so a panicking task can't take
@@ -650,7 +659,7 @@ where
         let (guard, _) = finish_full_reindex(
             root,
             &in_flight.reply_path,
-            &make_registry,
+            &shared_registry,
             &mut held_prism,
             drain_rt.block_on(in_flight.handle),
         );
@@ -878,12 +887,12 @@ where
 }
 
 /// Open a short-lived Infigraph instance for batch work.
-fn open_transient<MR>(root: &Path, make_registry: &MR) -> Result<Infigraph>
-where
-    MR: Fn() -> Result<crate::lang::LanguageRegistry>,
-{
-    let registry = make_registry()?;
-    let mut prism = Infigraph::open(root, registry)?;
+fn open_transient(root: &Path, registry: &Arc<crate::lang::LanguageRegistry>) -> Result<Infigraph> {
+    // Reuses the watch session's already-built registry (#58): building the
+    // 62-pack registry takes seconds in debug builds, and doing it again
+    // here put the daemon's first request reply right at the edge of
+    // callers' timeouts. `Infigraph::open_shared` exists for exactly this.
+    let mut prism = Infigraph::open_shared(root, Arc::clone(registry))?;
     prism.init()?;
     Ok(prism)
 }
@@ -905,16 +914,13 @@ where
 /// pattern lbug documents as safe. Opening a second `Database` on the same
 /// file for the drain would be a materially weaker guarantee.
 #[cfg(not(windows))]
-fn watch_db<MR>(
+fn watch_db(
     root: &Path,
-    make_registry: &MR,
+    registry: &Arc<crate::lang::LanguageRegistry>,
     held: &mut Option<Arc<Infigraph>>,
-) -> Result<Arc<Infigraph>>
-where
-    MR: Fn() -> Result<crate::lang::LanguageRegistry>,
-{
+) -> Result<Arc<Infigraph>> {
     if held.is_none() {
-        *held = Some(Arc::new(open_transient(root, make_registry)?));
+        *held = Some(Arc::new(open_transient(root, registry)?));
     }
     Ok(Arc::clone(held.as_ref().unwrap()))
 }
@@ -924,15 +930,12 @@ where
 /// opens (and the previous one closes) fresh rather than holding one open
 /// across the whole session — see `open_transient`.
 #[cfg(windows)]
-fn watch_db<MR>(
+fn watch_db(
     root: &Path,
-    make_registry: &MR,
+    registry: &Arc<crate::lang::LanguageRegistry>,
     held: &mut Option<Arc<Infigraph>>,
-) -> Result<Arc<Infigraph>>
-where
-    MR: Fn() -> Result<crate::lang::LanguageRegistry>,
-{
-    *held = Some(Arc::new(open_transient(root, make_registry)?));
+) -> Result<Arc<Infigraph>> {
+    *held = Some(Arc::new(open_transient(root, registry)?));
     Ok(Arc::clone(held.as_ref().unwrap()))
 }
 
@@ -958,20 +961,18 @@ fn poison_watch_db(held: &mut Option<Arc<Infigraph>>) {
 /// self-deadlock broken only by the 30s acquire timeout. Returning instead
 /// leaves the `.request` file in place, which is already this function's
 /// contention behaviour: a later tick, after the drain is reaped, serves it.
-fn serve_request_locked<MR>(
+fn serve_request_locked(
     root: &Path,
     path: &Path,
-    make_registry: &MR,
+    registry: &Arc<crate::lang::LanguageRegistry>,
     held: &mut Option<Arc<Infigraph>>,
     drain_in_flight: bool,
-) where
-    MR: Fn() -> Result<crate::lang::LanguageRegistry>,
-{
+) {
     if drain_in_flight {
         return;
     }
     match begin_index_op(root, "infigraph daemon", Duration::from_secs(30)) {
-        Ok(IndexOpOutcome::Acquired(_guard)) => match watch_db(root, make_registry, held) {
+        Ok(IndexOpOutcome::Acquired(_guard)) => match watch_db(root, registry, held) {
             Ok(prism) => {
                 if let Err(e) = crate::daemon_protocol::serve_one_request(&prism, path) {
                     eprintln!("[daemon] failed to serve request {}: {e}", path.display());
@@ -1212,16 +1213,13 @@ where
 /// that's the signal the caller uses to schedule SCIP enrichment. Any
 /// failure path returns `None` for languages: don't enrich a reindex that
 /// didn't actually land.
-fn finish_full_reindex<MR>(
+fn finish_full_reindex(
     root: &Path,
     reply_path: &Path,
-    make_registry: &MR,
+    registry: &Arc<crate::lang::LanguageRegistry>,
     held: &mut Option<Arc<Infigraph>>,
     joined: std::result::Result<FullReindexTaskOutput, tokio::task::JoinError>,
-) -> (Option<crate::ops::IndexOpGuard>, Option<Vec<String>>)
-where
-    MR: Fn() -> Result<crate::lang::LanguageRegistry>,
-{
+) -> (Option<crate::ops::IndexOpGuard>, Option<Vec<String>>) {
     let FullReindexTaskOutput { guard, result } = match joined {
         Ok(output) => output,
         Err(join_err) => {
@@ -1419,7 +1417,7 @@ where
 
     // The swap succeeded -- verify the new graph actually opens before
     // declaring success and discarding the ability to roll back.
-    match watch_db(root, make_registry, held) {
+    match watch_db(root, registry, held) {
         Ok(prism) => {
             // Reconcile embeddings against the NEW graph -- update_embeddings
             // queries the live symbol set and prunes anything not in it, so
@@ -1514,6 +1512,7 @@ fn route_or_serve_request<MR>(
     root: &Path,
     path: &Path,
     queue: &Arc<Mutex<crate::watch::queue::IndexWorkQueue>>,
+    registry: &Arc<crate::lang::LanguageRegistry>,
     make_registry: &MR,
     held: &mut Option<Arc<Infigraph>>,
     drain_in_flight: bool,
@@ -1534,7 +1533,7 @@ where
             // Malformed request JSON -- not this design's concern to
             // recover; hand off to serve_one_request, whose existing
             // corrupt-JSON handling (WriteResult::Err) already covers it.
-            serve_request_locked(root, path, make_registry, held, drain_in_flight);
+            serve_request_locked(root, path, registry, held, drain_in_flight);
             return None;
         }
     };
@@ -1618,7 +1617,7 @@ where
             Err(_) => {
                 // Sibling extractions file missing/corrupt -- fall
                 // through to serve_one_request's existing error path.
-                serve_request_locked(root, path, make_registry, held, drain_in_flight);
+                serve_request_locked(root, path, registry, held, drain_in_flight);
                 None
             }
         },
@@ -1662,7 +1661,7 @@ where
                 None
             }
             Err(_) => {
-                serve_request_locked(root, path, make_registry, held, drain_in_flight);
+                serve_request_locked(root, path, registry, held, drain_in_flight);
                 None
             }
         },
@@ -1676,7 +1675,7 @@ where
             drain_rt,
         ),
         _ => {
-            serve_request_locked(root, path, make_registry, held, drain_in_flight);
+            serve_request_locked(root, path, registry, held, drain_in_flight);
             None
         }
     }
@@ -2038,6 +2037,7 @@ mod tests {
             &root,
             &request_path,
             &queue,
+            &Arc::new(crate::lang::LanguageRegistry::new()),
             &|| Ok(crate::lang::LanguageRegistry::new()),
             &mut held,
             false,
