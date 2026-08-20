@@ -223,7 +223,13 @@ enum Commands {
     },
 
     /// Install infigraph MCP server config for AI coding agents
-    Install,
+    Install {
+        /// Overwrite hooks/config even if changed since the last install
+        /// (by default, a file that no longer matches what infigraph last
+        /// wrote is left alone and reported as skipped)
+        #[arg(long)]
+        force: bool,
+    },
 
     /// Uninstall infigraph MCP server config from AI coding agents
     Uninstall,
@@ -903,7 +909,7 @@ fn main() -> Result<()> {
             | Commands::Clone { .. }
             | Commands::Worktree { .. }
             | Commands::Update
-            | Commands::Install
+            | Commands::Install { .. }
             | Commands::Uninstall
             | Commands::Init { .. }
             | Commands::Languages
@@ -965,7 +971,7 @@ fn run(command: Commands, root: &Path) -> Result<()> {
         Commands::Callees { symbol } => cmd_callees(root, &symbol),
         Commands::DeadCode => cmd_dead_code(root),
         Commands::Impact { symbol, depth } => cmd_impact(root, &symbol, depth),
-        Commands::Install => cmd_install(),
+        Commands::Install { force } => cmd_install(force),
         Commands::Uninstall => cmd_uninstall(),
         Commands::Bench { n } => {
             let registry = bundled_registry()?;

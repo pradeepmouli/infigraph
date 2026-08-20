@@ -50,13 +50,13 @@ pub(crate) fn find_mcp_binary() -> Result<PathBuf> {
     )
 }
 
-pub(crate) fn cmd_install() -> Result<()> {
+pub(crate) fn cmd_install(force: bool) -> Result<()> {
     let mcp_path = find_mcp_binary()?;
     println!("Found infigraph-mcp at: {}", mcp_path.to_string_lossy());
 
     let home = dirs::home_dir().context("Could not determine home directory")?;
 
-    let report = run_install(&mcp_path, &home)?;
+    let report = run_install(&mcp_path, &home, force)?;
 
     if report.written.is_empty() {
         println!("No agents were configured.");
@@ -83,7 +83,7 @@ pub(crate) fn cmd_install() -> Result<()> {
 
 /// The actual artifact-engine install logic, factored out from `cmd_install`
 /// so it's testable against a fake `$HOME` without touching the real one.
-pub(crate) fn run_install(mcp_path: &Path, home: &Path) -> Result<InstallReport> {
+pub(crate) fn run_install(mcp_path: &Path, home: &Path, force: bool) -> Result<InstallReport> {
     let mcp_path_str = mcp_path.to_string_lossy().to_string();
     let user_override_dir = home.join(".infigraph").join("integrations");
 
@@ -99,17 +99,18 @@ pub(crate) fn run_install(mcp_path: &Path, home: &Path) -> Result<InstallReport>
     };
 
     for artifact in &artifacts {
-        let outcome = crate::artifacts::apply_resolved_artifact(artifact, home, &mcp_path_str)
-            .with_context(|| {
-                format!(
-                    "applying {} artifact for {}",
-                    artifact.integration_label,
-                    artifact
-                        .target_relative_path
-                        .as_deref()
-                        .unwrap_or("(resolver-determined path)")
-                )
-            })?;
+        let outcome =
+            crate::artifacts::apply_resolved_artifact(artifact, home, &mcp_path_str, force)
+                .with_context(|| {
+                    format!(
+                        "applying {} artifact for {}",
+                        artifact.integration_label,
+                        artifact
+                            .target_relative_path
+                            .as_deref()
+                            .unwrap_or("(resolver-determined path)")
+                    )
+                })?;
         let label = artifact
             .target_relative_path
             .clone()
@@ -692,7 +693,10 @@ fn reinstall_hooks() -> Result<()> {
     let home = dirs::home_dir().context("cannot find home directory")?;
     println!("\nReinstalling hooks...");
     let mcp_path = find_mcp_binary()?;
-    run_install(&mcp_path, &home)?;
+    // force=false: this runs automatically after a binary self-update (see
+    // cmd_update below), with no user present to answer for a hand-edited
+    // hook -- respect the same guard a manual `infigraph install` would.
+    run_install(&mcp_path, &home, false)?;
     Ok(())
 }
 
@@ -820,7 +824,8 @@ mod tests {
         let home_dir = tempfile::tempdir().unwrap();
         let mcp_path = "/opt/infigraph/bin/infigraph-mcp";
 
-        let report = run_install(&std::path::PathBuf::from(mcp_path), home_dir.path()).unwrap();
+        let report =
+            run_install(&std::path::PathBuf::from(mcp_path), home_dir.path(), false).unwrap();
 
         assert!(report.written.iter().any(|p| p == ".claude.json"));
         assert!(report.written.iter().any(|p| p == ".gemini/settings.json"));
@@ -842,8 +847,8 @@ mod tests {
         let home_dir = tempfile::tempdir().unwrap();
         let mcp_path = "/opt/infigraph/bin/infigraph-mcp";
 
-        run_install(&std::path::PathBuf::from(mcp_path), home_dir.path()).unwrap();
-        run_install(&std::path::PathBuf::from(mcp_path), home_dir.path()).unwrap();
+        run_install(&std::path::PathBuf::from(mcp_path), home_dir.path(), false).unwrap();
+        run_install(&std::path::PathBuf::from(mcp_path), home_dir.path(), false).unwrap();
 
         let claude_json: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(home_dir.path().join(".claude.json")).unwrap(),
@@ -863,7 +868,7 @@ mod tests {
         let home_dir = tempfile::tempdir().unwrap();
         let mcp_path = "/opt/infigraph/bin/infigraph-mcp";
 
-        run_install(&std::path::PathBuf::from(mcp_path), home_dir.path()).unwrap();
+        run_install(&std::path::PathBuf::from(mcp_path), home_dir.path(), false).unwrap();
         assert!(home_dir.path().join(".claude.json").exists());
 
         run_uninstall(&std::path::PathBuf::from(mcp_path), home_dir.path()).unwrap();

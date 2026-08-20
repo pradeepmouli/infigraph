@@ -44,6 +44,7 @@ pub(crate) fn apply_resolved_artifact(
     artifact: &ResolvedArtifact,
     home: &std::path::Path,
     mcp_path: &str,
+    force: bool,
 ) -> anyhow::Result<ApplyOutcome> {
     let (target_path, resolved_content) = match &artifact.resolver {
         Some(spec) => {
@@ -99,6 +100,25 @@ pub(crate) fn apply_resolved_artifact(
             // and be preserved forever (caught by
             // cmd_uninstall_removes_everything_cmd_install_wrote).
             let content = strategy::substitute_install_tokens(&content).into_owned();
+
+            // Pre-write hand-edit guard: apply_overwrite used to write
+            // unconditionally regardless of what was already on disk, so any
+            // local change made to a hook (or other overwrite-strategy
+            // artifact) since the last install was silently destroyed by the
+            // next `infigraph install` -- with no warning, no diff, nothing.
+            // The ownership manifest already existed for exactly this
+            // comparison (it's what protects hand-edits on uninstall) but was
+            // never consulted here, on the write side. --force bypasses this.
+            if !force && ownership::hand_edited_since_install(home, &target_path)? {
+                return Ok(ApplyOutcome::Skipped {
+                    reason: format!(
+                        "{} was changed since infigraph last installed it -- not overwriting. Re-run with --force to overwrite anyway.",
+                        target_path.display()
+                    ),
+                    manual_snippet: String::new(),
+                });
+            }
+
             let outcome = strategy::apply_overwrite(&target_path, &content)?;
             if matches!(outcome, ApplyOutcome::Written) {
                 ownership::record_written(home, &target_path, &content)?;
@@ -297,7 +317,7 @@ content_file = "mcp-section.toml"
         assert_eq!(artifacts.len(), 4);
 
         for artifact in &artifacts {
-            let outcome = apply_resolved_artifact(artifact, home, mcp_path).unwrap();
+            let outcome = apply_resolved_artifact(artifact, home, mcp_path, false).unwrap();
             assert!(
                 matches!(outcome, ApplyOutcome::Written),
                 "{:?} failed to apply",
@@ -328,7 +348,7 @@ content_file = "mcp-section.toml"
         // Reapply is idempotent (no duplication) -- exercises the whole
         // pipeline's self-healing property, not just one strategy in isolation.
         for artifact in &artifacts {
-            apply_resolved_artifact(artifact, home, mcp_path).unwrap();
+            apply_resolved_artifact(artifact, home, mcp_path, false).unwrap();
         }
         let claude_json_again: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(home.join(".claude.json")).unwrap())
@@ -384,7 +404,7 @@ content_file = "mcp-section.toml"
 
         let artifacts = discover_artifacts(bundled, user_dir.path(), mcp_path).unwrap();
         for artifact in &artifacts {
-            apply_resolved_artifact(artifact, home_dir.path(), mcp_path).unwrap();
+            apply_resolved_artifact(artifact, home_dir.path(), mcp_path, false).unwrap();
         }
 
         let content =
@@ -424,7 +444,8 @@ resolver = ["./resolve-zed-path.sh"]
         let artifacts = discover_artifacts(bundled, user_dir.path(), mcp_path).unwrap();
         assert_eq!(artifacts.len(), 1);
 
-        let outcome = apply_resolved_artifact(&artifacts[0], home_dir.path(), mcp_path).unwrap();
+        let outcome =
+            apply_resolved_artifact(&artifacts[0], home_dir.path(), mcp_path, false).unwrap();
         assert!(matches!(outcome, ApplyOutcome::Written));
 
         let written: serde_json::Value = serde_json::from_str(
@@ -463,7 +484,7 @@ resolver = ["./resolve-zed-path.sh"]
         assert_eq!(artifacts.len(), 2);
 
         for artifact in &artifacts {
-            let outcome = apply_resolved_artifact(artifact, home, mcp_path).unwrap();
+            let outcome = apply_resolved_artifact(artifact, home, mcp_path, false).unwrap();
             assert!(matches!(outcome, ApplyOutcome::Written));
         }
 
@@ -501,6 +522,58 @@ resolver = ["./resolve-zed-path.sh"]
     }
 
     #[test]
+    fn reinstall_skips_a_hand_edited_overwrite_artifact_but_force_overwrites_it() {
+        // Regression test for the Aug-9 clobber incident: apply_overwrite used
+        // to write unconditionally, silently destroying a hand-edited hook (or
+        // any other overwrite-strategy artifact) on the next install. This
+        // proves the pre-write guard actually protects the on-disk edit, and
+        // that --force still allows an explicit overwrite.
+        let bundled: &[(&str, &[u8])] = &[(
+            "claude-code/.claude/hooks/infigraph-enforce.sh",
+            b"#!/usr/bin/env bash\necho original\n",
+        )];
+        let user_dir = tempfile::tempdir().unwrap();
+        let home_dir = tempfile::tempdir().unwrap();
+        let home = home_dir.path();
+        let mcp_path = "/opt/infigraph/bin/infigraph-mcp";
+
+        let artifacts = discover_artifacts(bundled, user_dir.path(), mcp_path).unwrap();
+        assert_eq!(artifacts.len(), 1);
+        let artifact = &artifacts[0];
+
+        let outcome = apply_resolved_artifact(artifact, home, mcp_path, false).unwrap();
+        assert!(matches!(outcome, ApplyOutcome::Written));
+
+        let hook_path = home.join(".claude/hooks/infigraph-enforce.sh");
+        std::fs::write(
+            &hook_path,
+            "#!/usr/bin/env bash\necho my hand-tuned version\n",
+        )
+        .unwrap();
+
+        // A plain reinstall must not clobber it.
+        let outcome = apply_resolved_artifact(artifact, home, mcp_path, false).unwrap();
+        assert!(
+            matches!(outcome, ApplyOutcome::Skipped { .. }),
+            "hand-edited hook should have been skipped, not overwritten: {outcome:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&hook_path).unwrap(),
+            "#!/usr/bin/env bash\necho my hand-tuned version\n",
+            "hand-edited content must survive a non-forced reinstall"
+        );
+
+        // --force overrides the guard.
+        let outcome = apply_resolved_artifact(artifact, home, mcp_path, true).unwrap();
+        assert!(matches!(outcome, ApplyOutcome::Written));
+        assert_eq!(
+            std::fs::read_to_string(&hook_path).unwrap(),
+            "#!/usr/bin/env bash\necho original\n",
+            "force=true should overwrite back to the bundled content"
+        );
+    }
+
+    #[test]
     fn bundled_gemini_cli_mcp_fragment_applies_correctly() {
         let user_dir = tempfile::tempdir().unwrap();
         let home_dir = tempfile::tempdir().unwrap();
@@ -514,7 +587,7 @@ resolver = ["./resolve-zed-path.sh"]
             .expect("gemini-cli fragment should be discovered from the bundled registry");
         assert_eq!(gemini.strategy, Strategy::JsonDeepMerge);
 
-        apply_resolved_artifact(gemini, home_dir.path(), mcp_path).unwrap();
+        apply_resolved_artifact(gemini, home_dir.path(), mcp_path, false).unwrap();
         let written: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(home_dir.path().join(".gemini/settings.json")).unwrap(),
         )
@@ -537,7 +610,7 @@ resolver = ["./resolve-zed-path.sh"]
             .expect("opencode fragment should be discovered from the bundled registry");
         assert_eq!(opencode.strategy, Strategy::JsonDeepMerge);
 
-        apply_resolved_artifact(opencode, home_dir.path(), mcp_path).unwrap();
+        apply_resolved_artifact(opencode, home_dir.path(), mcp_path, false).unwrap();
         let written: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(home_dir.path().join(".config/opencode/opencode.json"))
                 .unwrap(),
@@ -562,7 +635,7 @@ resolver = ["./resolve-zed-path.sh"]
             .expect("aider fragment should be discovered from the bundled registry");
         assert_eq!(aider.strategy, Strategy::JsonDeepMerge);
 
-        apply_resolved_artifact(aider, home_dir.path(), mcp_path).unwrap();
+        apply_resolved_artifact(aider, home_dir.path(), mcp_path, false).unwrap();
         let written: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(home_dir.path().join(".aider/mcp.json")).unwrap(),
         )
@@ -585,7 +658,7 @@ resolver = ["./resolve-zed-path.sh"]
             .expect("kiro fragment should be discovered from the bundled registry");
         assert_eq!(kiro.strategy, Strategy::JsonDeepMerge);
 
-        apply_resolved_artifact(kiro, home_dir.path(), mcp_path).unwrap();
+        apply_resolved_artifact(kiro, home_dir.path(), mcp_path, false).unwrap();
         let written: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(home_dir.path().join(".kiro/settings/mcp.json")).unwrap(),
         )
@@ -608,7 +681,7 @@ resolver = ["./resolve-zed-path.sh"]
             .expect("github-copilot-cli fragment should be discovered from the bundled registry");
         assert_eq!(copilot.strategy, Strategy::JsonDeepMerge);
 
-        apply_resolved_artifact(copilot, home_dir.path(), mcp_path).unwrap();
+        apply_resolved_artifact(copilot, home_dir.path(), mcp_path, false).unwrap();
         let written: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(home_dir.path().join(".copilot/mcp-config.json")).unwrap(),
         )
@@ -637,7 +710,7 @@ resolver = ["./resolve-zed-path.sh"]
             .expect("claude-code's .claude.json fragment should be discovered");
         assert_eq!(claude_json.strategy, Strategy::JsonDeepMerge);
 
-        apply_resolved_artifact(claude_json, home_dir.path(), mcp_path).unwrap();
+        apply_resolved_artifact(claude_json, home_dir.path(), mcp_path, false).unwrap();
         let written: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(home_dir.path().join(".claude.json")).unwrap(),
         )
@@ -661,7 +734,7 @@ resolver = ["./resolve-zed-path.sh"]
                 "CLAUDE.md marker_delimited artifact should be discovered from claude-code/config.toml",
             );
         assert_eq!(claude_md.strategy, Strategy::MarkerDelimited);
-        apply_resolved_artifact(claude_md, home_dir.path(), mcp_path).unwrap();
+        apply_resolved_artifact(claude_md, home_dir.path(), mcp_path, false).unwrap();
         let claude_md_content =
             std::fs::read_to_string(home_dir.path().join(".claude/CLAUDE.md")).unwrap();
         assert!(claude_md_content.contains("## Infigraph — Primary Code Intelligence"));
@@ -675,7 +748,7 @@ resolver = ["./resolve-zed-path.sh"]
             })
             .expect("reindex skill artifact should be discovered from claude-code/config.toml");
         assert_eq!(skill.strategy, Strategy::Overwrite);
-        apply_resolved_artifact(skill, home_dir.path(), mcp_path).unwrap();
+        apply_resolved_artifact(skill, home_dir.path(), mcp_path, false).unwrap();
         let skill_content = std::fs::read_to_string(
             home_dir
                 .path()
@@ -700,8 +773,8 @@ resolver = ["./resolve-zed-path.sh"]
             .expect("settings.json fragment should be discovered");
         assert_eq!(settings.strategy, Strategy::JsonDeepMerge);
 
-        apply_resolved_artifact(settings, home_dir.path(), mcp_path).unwrap();
-        apply_resolved_artifact(settings, home_dir.path(), mcp_path).unwrap(); // reapply: must not duplicate
+        apply_resolved_artifact(settings, home_dir.path(), mcp_path, false).unwrap();
+        apply_resolved_artifact(settings, home_dir.path(), mcp_path, false).unwrap(); // reapply: must not duplicate
 
         let written: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(home_dir.path().join(".claude/settings.json")).unwrap(),
@@ -752,7 +825,7 @@ resolver = ["./resolve-zed-path.sh"]
                 a.target_relative_path.as_deref() == Some(".claude/hooks/infigraph-enforce.sh")
             })
             .unwrap();
-        apply_resolved_artifact(enforce, home_dir.path(), mcp_path).unwrap();
+        apply_resolved_artifact(enforce, home_dir.path(), mcp_path, false).unwrap();
 
         let installed = home_dir.path().join(".claude/hooks/infigraph-enforce.sh");
         let mode = std::fs::metadata(&installed).unwrap().permissions().mode();
@@ -784,7 +857,7 @@ resolver = ["./resolve-zed-path.sh"]
                 a.target_relative_path.as_deref() == Some(".claude/hooks/infigraph-enforce.sh")
             })
             .unwrap();
-        apply_resolved_artifact(enforce, home_dir.path(), mcp_path).unwrap();
+        apply_resolved_artifact(enforce, home_dir.path(), mcp_path, false).unwrap();
         let content =
             std::fs::read_to_string(home_dir.path().join(".claude/hooks/infigraph-enforce.sh"))
                 .unwrap();
@@ -853,7 +926,7 @@ resolver = ["./resolve-zed-path.sh"]
                 .find(|a| a.target_relative_path.as_deref() == Some(relative))
                 .unwrap_or_else(|| panic!("{relative} should be discovered"));
             assert_eq!(artifact.strategy, Strategy::Overwrite);
-            apply_resolved_artifact(artifact, home_dir.path(), mcp_path).unwrap();
+            apply_resolved_artifact(artifact, home_dir.path(), mcp_path, false).unwrap();
             let content = std::fs::read_to_string(home_dir.path().join(relative)).unwrap();
             assert!(
                 content.contains(expected_substring),
@@ -876,7 +949,7 @@ resolver = ["./resolve-zed-path.sh"]
             .find(|a| a.target_relative_path.as_deref() == Some(".cursor/rules/infigraph.mdc"))
             .expect("cursor rules artifact should be discovered from cursor/config.toml");
         assert_eq!(rules.strategy, Strategy::Overwrite);
-        apply_resolved_artifact(rules, home_dir.path(), mcp_path).unwrap();
+        apply_resolved_artifact(rules, home_dir.path(), mcp_path, false).unwrap();
         let rules_content =
             std::fs::read_to_string(home_dir.path().join(".cursor/rules/infigraph.mdc")).unwrap();
         assert!(rules_content.contains("## Infigraph — Primary Code Intelligence"));
@@ -886,7 +959,7 @@ resolver = ["./resolve-zed-path.sh"]
             .find(|a| a.target_relative_path.as_deref() == Some(".cursor/mcp.json"))
             .expect("cursor mcp.json fragment should be discovered");
         assert_eq!(mcp.strategy, Strategy::JsonDeepMerge);
-        apply_resolved_artifact(mcp, home_dir.path(), mcp_path).unwrap();
+        apply_resolved_artifact(mcp, home_dir.path(), mcp_path, false).unwrap();
         let mcp_written: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(home_dir.path().join(".cursor/mcp.json")).unwrap(),
         )
@@ -908,7 +981,7 @@ resolver = ["./resolve-zed-path.sh"]
             .find(|a| a.target_relative_path.as_deref() == Some(".windsurf/rules/infigraph.md"))
             .expect("windsurf rules artifact should be discovered from windsurf/config.toml");
         assert_eq!(rules.strategy, Strategy::Overwrite);
-        apply_resolved_artifact(rules, home_dir.path(), mcp_path).unwrap();
+        apply_resolved_artifact(rules, home_dir.path(), mcp_path, false).unwrap();
         let rules_content =
             std::fs::read_to_string(home_dir.path().join(".windsurf/rules/infigraph.md")).unwrap();
         assert!(rules_content.contains("## Infigraph — Primary Code Intelligence"));
@@ -920,7 +993,7 @@ resolver = ["./resolve-zed-path.sh"]
             })
             .expect("windsurf mcp_config.json fragment should be discovered");
         assert_eq!(mcp.strategy, Strategy::JsonDeepMerge);
-        apply_resolved_artifact(mcp, home_dir.path(), mcp_path).unwrap();
+        apply_resolved_artifact(mcp, home_dir.path(), mcp_path, false).unwrap();
         let mcp_written: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(home_dir.path().join(".codeium/windsurf/mcp_config.json"))
                 .unwrap(),
@@ -980,7 +1053,7 @@ resolver = ["./resolve-zed-path.sh"]
             mcp.key_path,
             Some(vec!["mcp_servers".to_string(), "infigraph".to_string()])
         );
-        apply_resolved_artifact(mcp, home_dir.path(), mcp_path).unwrap();
+        apply_resolved_artifact(mcp, home_dir.path(), mcp_path, false).unwrap();
         let toml_content =
             std::fs::read_to_string(home_dir.path().join(".codex/config.toml")).unwrap();
         assert!(toml_content.contains("[mcp_servers.infigraph]"));
@@ -994,7 +1067,7 @@ resolver = ["./resolve-zed-path.sh"]
             })
             .expect("codex reindex skill artifact should be discovered");
         assert_eq!(skill.strategy, Strategy::Overwrite);
-        apply_resolved_artifact(skill, home_dir.path(), mcp_path).unwrap();
+        apply_resolved_artifact(skill, home_dir.path(), mcp_path, false).unwrap();
         let skill_content = std::fs::read_to_string(
             home_dir
                 .path()
@@ -1017,8 +1090,8 @@ resolver = ["./resolve-zed-path.sh"]
             .find(|a| a.target_relative_path.as_deref() == Some(".codex/config.toml"))
             .unwrap();
 
-        apply_resolved_artifact(mcp, home_dir.path(), mcp_path).unwrap();
-        apply_resolved_artifact(mcp, home_dir.path(), mcp_path).unwrap();
+        apply_resolved_artifact(mcp, home_dir.path(), mcp_path, false).unwrap();
+        apply_resolved_artifact(mcp, home_dir.path(), mcp_path, false).unwrap();
 
         let toml_content =
             std::fs::read_to_string(home_dir.path().join(".codex/config.toml")).unwrap();
@@ -1041,7 +1114,7 @@ resolver = ["./resolve-zed-path.sh"]
         assert!(vscode.target_relative_path.is_none());
         assert!(vscode.resolver.is_some());
 
-        let outcome = apply_resolved_artifact(vscode, home_dir.path(), mcp_path).unwrap();
+        let outcome = apply_resolved_artifact(vscode, home_dir.path(), mcp_path, false).unwrap();
         assert!(matches!(outcome, ApplyOutcome::Written));
 
         // The resolver branches on OS -- assert against whichever path it
@@ -1077,7 +1150,7 @@ resolver = ["./resolve-zed-path.sh"]
         );
         assert!(zed.target_relative_path.is_none());
 
-        let outcome = apply_resolved_artifact(zed, home_dir.path(), mcp_path).unwrap();
+        let outcome = apply_resolved_artifact(zed, home_dir.path(), mcp_path, false).unwrap();
         assert!(matches!(outcome, ApplyOutcome::Written));
 
         let expected_suffix = match std::env::consts::OS {
