@@ -55,6 +55,9 @@ pub fn resolve_calls_incremental(
     let mut stats = resolve_with_map(&conn, extractions, &symbol_map, learned_store, &lock)?;
     stats.inherits_resolved = resolve_inherits(&conn, extractions, &symbol_map, &lock)?;
     resolve_custom_edges(&conn, extractions, &symbol_map, &lock)?;
+    // R3.3.3: bump once per completed write, so sidecars built from a
+    // now-stale generation can be detected rather than served.
+    store.bump_generation_conn(&conn, &lock)?;
     Ok(stats)
 }
 
@@ -553,6 +556,9 @@ pub fn re_resolve_for_files(
 
     let mut stats = resolve_with_map(&conn, &filtered_owned, &symbol_map, learned_store, &lock)?;
     stats.inherits_resolved = resolve_inherits(&conn, &filtered_owned, &symbol_map, &lock)?;
+    // R3.3.3: bump once per completed write, so sidecars built from a
+    // now-stale generation can be detected rather than served.
+    store.bump_generation_conn(&conn, &lock)?;
     Ok(stats)
 }
 

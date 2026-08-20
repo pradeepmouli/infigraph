@@ -252,6 +252,54 @@ impl GraphStore {
         Ok(())
     }
 
+    /// Bump the graph's generation counter (R3.3.3/docs/DESIGN-hardening.md
+    /// §3.3.3) by 1, creating it at 1 on the very first write, and return
+    /// the new value. Every real write path calls this once its write
+    /// succeeds, so a sidecar that records the generation it was built from
+    /// can detect drift against the live graph.
+    ///
+    /// Takes an already-open `conn` and the caller's `WriteLock` witness --
+    /// mirrors the `_conn` convention used by `upsert_file_conn` etc., since
+    /// every call site already holds both by the time its write completes.
+    pub(crate) fn bump_generation_conn(
+        &self,
+        conn: &Connection<'_>,
+        _witness: &WriteLock,
+    ) -> Result<i64> {
+        conn.query(
+            "MERGE (g:GraphMeta {id: 'singleton'}) \
+             ON CREATE SET g.generation = 1 \
+             ON MATCH SET g.generation = g.generation + 1",
+        )
+        .map_err(|e| anyhow::anyhow!("failed to bump graph generation: {e}"))?;
+        let mut result = conn
+            .query("MATCH (g:GraphMeta {id: 'singleton'}) RETURN g.generation")
+            .map_err(|e| anyhow::anyhow!("failed to read graph generation after bump: {e}"))?;
+        let row = result
+            .next()
+            .context("GraphMeta singleton missing immediately after MERGE")?;
+        let val = row
+            .first()
+            .context("graph generation query returned an empty row")?;
+        val.to_string()
+            .parse()
+            .context("graph generation value is not a valid integer")
+    }
+
+    /// Read the graph's current generation without bumping it. Returns 0
+    /// for a graph that has never had a write bump the counter (e.g. a
+    /// freshly opened, never-indexed database) -- callers comparing a
+    /// sidecar's recorded generation against this should treat 0 as "no
+    /// generation recorded yet", not a real generation value.
+    pub fn current_generation(&self) -> Result<i64> {
+        let conn = self.connection()?;
+        Ok(count_query(
+            &conn,
+            "MATCH (g:GraphMeta {id: 'singleton'}) RETURN g.generation",
+        )
+        .unwrap_or(0) as i64)
+    }
+
     pub fn connection(&self) -> Result<Connection<'_>> {
         Connection::new(&self.db).map_err(|e| anyhow::anyhow!("failed to create connection: {e}"))
     }
@@ -496,5 +544,29 @@ mod tests {
         drop(GraphStore::open(&db_path).expect("fresh create must succeed"));
         // Reopen of a valid db must pass the preflight.
         drop(GraphStore::open(&db_path).expect("reopen of valid db must succeed"));
+    }
+
+    #[test]
+    fn generation_starts_at_zero_and_bumps_monotonically() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("graph");
+        let store = GraphStore::open(&db_path).unwrap();
+
+        assert_eq!(
+            store.current_generation().unwrap(),
+            0,
+            "a never-bumped graph reports generation 0"
+        );
+
+        let lock = store.write_lock().unwrap();
+        let conn = store.connection().unwrap();
+
+        let first = store.bump_generation_conn(&conn, &lock).unwrap();
+        assert_eq!(first, 1, "the first bump creates the counter at 1");
+        assert_eq!(store.current_generation().unwrap(), 1);
+
+        let second = store.bump_generation_conn(&conn, &lock).unwrap();
+        assert_eq!(second, 2, "each subsequent bump increments by 1");
+        assert_eq!(store.current_generation().unwrap(), 2);
     }
 }

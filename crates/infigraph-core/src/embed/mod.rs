@@ -35,6 +35,52 @@ pub fn atomic_write(path: &Path, buf: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Companion-file suffix for recording which graph generation a sidecar was
+/// built from (R3.3.3/docs/DESIGN-hardening.md §3.3.3). A companion file
+/// rather than an in-band header field: `embeddings.bin`'s binary format is
+/// shared across code-symbol search, docs search, and session memory (three
+/// distinct crates/callers), so threading a new header field through it
+/// would ripple across every reader/writer/test that touches the shared
+/// format. A tiny sibling file gets the same functional outcome -- "does
+/// this sidecar match the graph's current generation" -- without touching
+/// that shared surface, and the same pattern is directly reusable for other
+/// sidecars (`bm25_cache.bin`, `hnsw_index.usearch`) that have no header of
+/// their own to extend at all.
+const GENERATION_MARKER_SUFFIX: &str = ".generation";
+
+fn generation_marker_path(sidecar_path: &Path) -> PathBuf {
+    let name = sidecar_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("sidecar");
+    sidecar_path.with_file_name(format!("{name}{GENERATION_MARKER_SUFFIX}"))
+}
+
+/// Record which graph generation `sidecar_path` was just built from.
+/// `generation <= 0` (the sentinel `GraphBackend::current_generation`
+/// returns for "unsupported/unknown", e.g. remote/Neo4j or the daemon
+/// client relay) is a deliberate no-op -- writing a marker for an unknown
+/// generation would make a later real staleness check falsely conclude the
+/// sidecar is behind every actual generation.
+pub fn write_generation_marker(sidecar_path: &Path, generation: i64) -> Result<()> {
+    if generation <= 0 {
+        return Ok(());
+    }
+    atomic_write(
+        &generation_marker_path(sidecar_path),
+        &generation.to_le_bytes(),
+    )
+}
+
+/// Read the generation `sidecar_path` was last built from, if a marker
+/// exists and is well-formed. `None` means "no generation recorded" --
+/// callers should treat that as "can't judge staleness", never as "stale".
+pub fn read_generation_marker(sidecar_path: &Path) -> Option<i64> {
+    let bytes = std::fs::read(generation_marker_path(sidecar_path)).ok()?;
+    let arr: [u8; 8] = bytes.get(..8)?.try_into().ok()?;
+    Some(i64::from_le_bytes(arr))
+}
+
 struct CachedEmbeddings {
     path: PathBuf,
     modified: std::time::SystemTime,
@@ -791,6 +837,14 @@ pub fn update_embeddings(
         .map(|(id, (v, h))| (id, v, h))
         .collect();
     save_embeddings_hashed(&emb_path, &entries)?;
+    // R3.3.3: record which graph generation this embeddings.bin now
+    // reflects, so a stale copy can be detected on load rather than served.
+    // Best-effort: a failed marker write shouldn't fail an otherwise
+    // successful embeddings rebuild -- worst case, a later staleness check
+    // just can't judge this file (see `read_generation_marker`).
+    if let Ok(generation) = backend.current_generation() {
+        let _ = write_generation_marker(&emb_path, generation);
+    }
 
     let symbol_embeddings: Vec<(String, Vec<f32>)> = entries
         .iter()

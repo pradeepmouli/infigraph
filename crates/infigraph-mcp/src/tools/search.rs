@@ -151,6 +151,22 @@ fn get_search_data_local(args: &Value, path: &str) -> Result<SearchData> {
         .join(".infigraph")
         .join("embeddings.bin");
     let embeddings_map: HashMap<String, Vec<f32>> = if emb_path.exists() {
+        // R3.3.3: warn (don't block or auto-rebuild) when embeddings.bin
+        // was built from a graph generation older than the live one --
+        // search still serves what's on disk, but the operator gets a
+        // signal that a reindex would refresh semantic ranking.
+        if let (Ok(current_gen), Some(recorded_gen)) = (
+            backend.current_generation(),
+            embed::read_generation_marker(&emb_path),
+        ) {
+            if current_gen > 0 && recorded_gen < current_gen {
+                eprintln!(
+                    "[search] warn: embeddings.bin was built from graph generation \
+                     {recorded_gen}, but the graph is now at generation {current_gen} -- \
+                     semantic ranking may be stale until the next reindex rebuilds it"
+                );
+            }
+        }
         embed::load_embeddings_cached(&emb_path)?
             .into_iter()
             .collect()

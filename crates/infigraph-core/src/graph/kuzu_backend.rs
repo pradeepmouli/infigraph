@@ -475,11 +475,19 @@ impl GraphBackend for KuzuBackend {
         self.store
             .upsert_folders_bulk_conn(&conn, &file_paths, &write_lock)?;
 
+        // R3.3.3: bump once per completed write, so sidecars built from a
+        // now-stale generation can be detected rather than served.
+        self.store.bump_generation_conn(&conn, &write_lock)?;
+
         Ok(())
     }
 
     fn remove_file(&self, file: &str) -> Result<()> {
         self.store.remove_file(file)
+    }
+
+    fn current_generation(&self) -> Result<i64> {
+        self.store.current_generation()
     }
 
     fn derive_tested_by_edges(&self, _changed_files: Option<&[&str]>) -> Result<usize> {

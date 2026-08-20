@@ -29,7 +29,9 @@ impl GraphStore {
         }
 
         let conn = self.connection()?;
-        self.upsert_file_conn(&conn, extraction, &lock)
+        self.upsert_file_conn(&conn, extraction, &lock)?;
+        self.bump_generation_conn(&conn, &lock)?;
+        Ok(())
     }
 
     pub fn upsert_file_conn(

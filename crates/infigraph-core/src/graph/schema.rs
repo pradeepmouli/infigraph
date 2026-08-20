@@ -114,6 +114,13 @@ pub const CREATE_SCHEMA: &[&str] = &[
     "CREATE REL TABLE IF NOT EXISTS HAS_CONFIG(FROM Symbol TO ConfigBinding)",
     "CREATE REL TABLE IF NOT EXISTS RESOLVES_TO(FROM Symbol TO Symbol, mechanism STRING, config_source STRING)",
     "CREATE REL TABLE IF NOT EXISTS TAINT_FLOW(FROM Symbol TO Symbol, source_kind STRING, sink_kind STRING, path STRING)",
+    // R3.3.3 (docs/DESIGN-hardening.md §3.3.3): a single-row table holding a
+    // monotonically incremented generation ID, bumped once per completed
+    // write to the graph. Sidecars (embeddings.bin etc.) record the
+    // generation they were built from; a sidecar from a stale generation is
+    // treated as unusable rather than served, so search results never
+    // silently drift from what's actually in the graph.
+    "CREATE NODE TABLE IF NOT EXISTS GraphMeta(id STRING, generation INT64, PRIMARY KEY(id))",
 ];
 
 use kuzu::Connection;
