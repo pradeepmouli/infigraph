@@ -701,6 +701,11 @@ pub fn link_cross_service_calls(
                 "External service: {} {} {}",
                 dep.target_service, dep.target_method, dep.target_path
             );
+            let protocol = if dep.target_method.eq_ignore_ascii_case("grpc") {
+                "grpc"
+            } else {
+                "http"
+            };
             candidates.push(CrossServiceEdgeCandidate {
                 target_id,
                 target_name,
@@ -709,6 +714,7 @@ pub fn link_cross_service_calls(
                 method: dep.target_method.clone(),
                 path: dep.target_path.clone(),
                 target_service: dep.target_service.clone(),
+                protocol: protocol.to_string(),
             });
         }
         total += backend.write_cross_service_edges(&candidates)?;
@@ -791,6 +797,7 @@ pub fn link_cross_service_calls(
                     method: "package".to_string(),
                     path: pkg_name.clone(),
                     target_service: publisher.clone(),
+                    protocol: "package".to_string(),
                 });
             }
             total += backend.write_cross_service_edges(&candidates)?;
@@ -1509,6 +1516,10 @@ fn scan_source_for_grpc_stubs(root: &Path, services: &[String]) -> Vec<(String, 
             format!("{lc}futurestub"),
             // Rust (tonic): {snake}_client module + {Svc}Client type. #34
             format!("{snake}_client"),
+            // C++ (grpc C++ codegen): {Svc}::NewStub(channel) factory call —
+            // the C++ generator doesn't produce a {Svc}Client type name like
+            // Go/TS, it's a static factory method on the service class itself.
+            format!("{lc}::newstub"),
             // Python server registration (a service reference, not a client, but
             // still a cross-service coupling worth surfacing). The generated
             // helper uses the PascalCase service name verbatim

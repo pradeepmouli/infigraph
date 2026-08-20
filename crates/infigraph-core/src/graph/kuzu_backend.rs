@@ -272,15 +272,16 @@ impl GraphBackend for KuzuBackend {
         let rows = q.raw_query(
             "MATCH (s:Symbol) WHERE s.kind IN ['Function', 'Method'] \
              AND NOT EXISTS { MATCH ()-[:CALLS]->(s) } \
-             RETURN s.name, s.kind, s.file ORDER BY s.file, s.name",
+             RETURN s.id, s.name, s.kind, s.file ORDER BY s.file, s.name",
         )?;
         Ok(rows
             .into_iter()
             .filter_map(|r| {
                 Some(DeadCodeRow {
-                    name: r.first()?.clone(),
-                    kind: r.get(1)?.clone(),
-                    file: r.get(2)?.clone(),
+                    id: r.first()?.clone(),
+                    name: r.get(1)?.clone(),
+                    kind: r.get(2)?.clone(),
+                    file: r.get(3)?.clone(),
                 })
             })
             .collect())
@@ -345,15 +346,16 @@ impl GraphBackend for KuzuBackend {
         let entry_rows = q.raw_query(
             "MATCH (s:Symbol)-[:CALLS]->() WHERE s.kind IN ['Function', 'Method'] \
              AND NOT EXISTS { MATCH ()-[:CALLS]->(s) } \
-             RETURN DISTINCT s.name, s.kind, s.file ORDER BY s.file, s.name LIMIT 20",
+             RETURN DISTINCT s.id, s.name, s.kind, s.file ORDER BY s.file, s.name LIMIT 20",
         )?;
         let entry_points: Vec<DeadCodeRow> = entry_rows
             .into_iter()
             .filter_map(|r| {
                 Some(DeadCodeRow {
-                    name: r.first()?.clone(),
-                    kind: r.get(1)?.clone(),
-                    file: r.get(2)?.clone(),
+                    id: r.first()?.clone(),
+                    name: r.get(1)?.clone(),
+                    kind: r.get(2)?.clone(),
+                    file: r.get(3)?.clone(),
                 })
             })
             .collect();
@@ -536,6 +538,7 @@ impl GraphBackend for KuzuBackend {
             let method = escape(&c.method);
             let path = escape(&c.path);
             let target_svc = escape(&c.target_service);
+            let protocol = escape(&c.protocol);
 
             let create_target = format!(
                 "MERGE (t:Symbol {{id: '{target_id}'}}) \
@@ -556,7 +559,7 @@ impl GraphBackend for KuzuBackend {
 
             let create_edge = format!(
                 "MATCH (caller:Symbol {{id: '{caller_sym}'}}), (target:Symbol {{id: '{target_id}'}}) \
-                 CREATE (caller)-[:CALLS_SERVICE {{method: '{method}', path: '{path}', target_service: '{target_svc}'}}]->(target)"
+                 CREATE (caller)-[:CALLS_SERVICE {{method: '{method}', path: '{path}', target_service: '{target_svc}', protocol: '{protocol}'}}]->(target)"
             );
             self.raw_query(&create_edge)?;
             created += 1;

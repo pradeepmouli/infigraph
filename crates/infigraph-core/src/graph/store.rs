@@ -290,6 +290,18 @@ impl GraphStore {
     /// Safe for concurrent access while a watcher is writing.
     pub fn open_read_only(path: &Path) -> Result<Self> {
         validate_db_file(path)?;
+        // `validate_db_file` treats a missing file as fine ("fresh create"),
+        // which is correct for the write path (`open`) but not here: a
+        // read-only Kuzu connection can never create a database, so letting
+        // this fall through to `Database::new` below produces Kuzu's own
+        // confusing "Cannot create an empty database under READ ONLY mode"
+        // instead of a clear, actionable message.
+        if !path.exists() {
+            anyhow::bail!(
+                "no graph exists yet at {} -- run `infigraph index` first",
+                path.display()
+            );
+        }
         let lock_path = db_lock_path(path);
         if let Some(pid) = unclean_shutdown_wal_holder(path, &lock_path) {
             return Err(anyhow::Error::new(GraphCorruption {
@@ -935,5 +947,34 @@ mod tests {
         // And the reverse: a SCIP bump must not advance ast_generation.
         assert_eq!(store.current_ast_generation().unwrap(), 2);
         assert_eq!(store.current_scip_generation().unwrap(), 1);
+    }
+
+    /// Regression test: `open_read_only` on a nonexistent graph must fail
+    /// with a clear, actionable error rather than falling through to Kuzu's
+    /// own confusing "Cannot create an empty database under READ ONLY mode"
+    /// (read-only mode can never create a database).
+    #[test]
+    fn open_read_only_on_missing_graph_gives_a_clear_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("graph");
+
+        let err = match GraphStore::open_read_only(&db_path) {
+            Ok(_) => panic!("expected an error opening a nonexistent graph read-only"),
+            Err(e) => e,
+        };
+
+        assert!(
+            err.to_string().contains("run `infigraph index` first"),
+            "expected the actionable no-graph-yet message, got: {err}"
+        );
+    }
+
+    #[test]
+    fn open_read_only_succeeds_once_the_graph_has_been_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("graph");
+        drop(GraphStore::open(&db_path).unwrap());
+
+        GraphStore::open_read_only(&db_path).unwrap();
     }
 }

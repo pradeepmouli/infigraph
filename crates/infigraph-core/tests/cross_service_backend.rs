@@ -31,6 +31,7 @@ fn write_cross_service_edges_creates_target_node_and_edge_once() {
         method: "POST".to_string(),
         path: "/charge".to_string(),
         target_service: "payments".to_string(),
+        protocol: "http".to_string(),
     };
 
     let created_first = backend

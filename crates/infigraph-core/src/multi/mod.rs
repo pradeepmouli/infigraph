@@ -2,6 +2,7 @@ mod bridge;
 pub mod combined;
 mod cross_service;
 pub mod grpc;
+pub mod namespace_link;
 
 pub use bridge::*;
 pub use cross_service::*;
@@ -847,6 +848,23 @@ pub fn index_group(
             prism.set_repo_filter(&ns);
         }
         let result = prism.index()?;
+        // `group build` bypasses the CLI's single-repo `index` command (see
+        // infigraph-cli/src/index.rs), which is the only other place this
+        // gets called -- without this, TESTED_BY edges are never derived
+        // for anything indexed via a group, and get_test_coverage silently
+        // reports 0% on every repo indexed this way (confirmed via AIF3X-331
+        // eval: the live e2e pod runs group build exclusively). Scope to
+        // this repo's own files so it doesn't touch other repos sharing the
+        // same Neo4j instance.
+        if let Some(backend) = prism.backend() {
+            let changed: Vec<&str> = result.extractions.iter().map(|e| e.file.as_str()).collect();
+            if let Err(e) = backend.derive_tested_by_edges(Some(&changed)) {
+                eprintln!(
+                    "[group] TESTED_BY derivation failed for '{}': {e}",
+                    repo_name
+                );
+            }
+        }
         Ok(MemberOutcome::Indexed(
             repo_name.to_string(),
             result.indexed_files,
@@ -919,7 +937,12 @@ pub fn index_group(
     Ok(results)
 }
 
-fn registry_path() -> Result<PathBuf> {
+pub fn registry_path() -> Result<PathBuf> {
+    if let Some(override_dir) = std::env::var_os("INFIGRAPH_REGISTRY_HOME") {
+        return Ok(PathBuf::from(override_dir)
+            .join(".infigraph")
+            .join("registry.json"));
+    }
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .or_else(dirs_next::home_dir)

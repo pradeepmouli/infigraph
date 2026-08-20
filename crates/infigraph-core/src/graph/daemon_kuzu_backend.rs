@@ -42,7 +42,17 @@ impl DaemonKuzuBackend {
         // which propagates this `?`) rely on `open` failing eagerly when the
         // graph is missing or unopenable rather than surfacing that on some
         // later read.
-        drop(KuzuBackend::open_read_only(&db_path)?);
+        //
+        // Skipped entirely when the graph doesn't exist yet -- a brand-new
+        // project being indexed for the first time. Read-only mode can never
+        // create a database (Kuzu itself refuses with "Cannot create an
+        // empty database under READ ONLY mode"), so probing here would
+        // always fail even though the daemon's own write path creates the
+        // graph fine on the first real index. Only probe when there's
+        // something on disk to actually validate.
+        if db_path.exists() {
+            drop(KuzuBackend::open_read_only(&db_path)?);
+        }
         Ok(Self {
             db_path,
             root: root.to_path_buf(),
@@ -605,5 +615,38 @@ impl GraphBackend for DaemonKuzuBackend {
                 Err(e)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression test: `open` used to eagerly probe with
+    /// `KuzuBackend::open_read_only` unconditionally, which fails on any
+    /// nonexistent graph (read-only mode can never create a database) --
+    /// breaking indexing of a brand-new project under
+    /// `INFIGRAPH_BACKEND=daemon`. The probe must be skipped entirely when
+    /// there's nothing on disk yet.
+    #[test]
+    fn open_succeeds_on_a_project_with_no_graph_yet() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let backend = DaemonKuzuBackend::open(dir.path()).unwrap();
+
+        assert_eq!(backend.db_path, dir.path().join(".infigraph").join("graph"));
+        assert!(
+            !backend.db_path.exists(),
+            "open must not create the graph itself -- that's the daemon's write path's job"
+        );
+    }
+
+    #[test]
+    fn open_still_validates_an_existing_graph() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join(".infigraph").join("graph");
+        drop(super::super::store::GraphStore::open(&db_path).unwrap());
+
+        DaemonKuzuBackend::open(dir.path()).unwrap();
     }
 }

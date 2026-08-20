@@ -388,6 +388,7 @@ fn serve_one_request_handles_write_cross_service_edges() {
             method: "GET".to_string(),
             path: "/foo".to_string(),
             target_service: "payments".to_string(),
+            protocol: "http".to_string(),
         },
         infigraph_core::graph::CrossServiceEdgeCandidate {
             target_id: "xsvc::billing::POST::/bar".to_string(),
@@ -397,6 +398,7 @@ fn serve_one_request_handles_write_cross_service_edges() {
             method: "POST".to_string(),
             path: "/bar".to_string(),
             target_service: "billing".to_string(),
+            protocol: "http".to_string(),
         },
     ];
     infigraph_core::daemon_protocol::write_cross_service_edges_arrow(&edges_path, &candidates)

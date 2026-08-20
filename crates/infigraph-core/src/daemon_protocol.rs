@@ -871,6 +871,7 @@ fn cross_service_edge_candidates_schema() -> Arc<Schema> {
         Field::new("method", DataType::Utf8, false),
         Field::new("path", DataType::Utf8, false),
         Field::new("target_service", DataType::Utf8, false),
+        Field::new("protocol", DataType::Utf8, false),
     ]))
 }
 
@@ -927,6 +928,12 @@ pub fn write_cross_service_edges_arrow(
                     .map(|c| c.target_service.as_str())
                     .collect::<Vec<_>>(),
             )),
+            Arc::new(StringArray::from(
+                candidates
+                    .iter()
+                    .map(|c| c.protocol.as_str())
+                    .collect::<Vec<_>>(),
+            )),
         ],
     )?;
     let file = std::fs::File::create(path)?;
@@ -981,6 +988,11 @@ pub fn read_cross_service_edges_arrow(
             .as_any()
             .downcast_ref::<StringArray>()
             .unwrap();
+        let protocols = batch
+            .column(7)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
         for i in 0..batch.num_rows() {
             candidates.push(CrossServiceEdgeCandidate {
                 target_id: target_ids.value(i).to_string(),
@@ -990,6 +1002,7 @@ pub fn read_cross_service_edges_arrow(
                 method: methods.value(i).to_string(),
                 path: paths.value(i).to_string(),
                 target_service: target_services.value(i).to_string(),
+                protocol: protocols.value(i).to_string(),
             });
         }
     }
