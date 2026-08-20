@@ -430,6 +430,16 @@ impl GraphBackend for KuzuBackend {
 
         let write_lock = self.store.write_lock()?;
 
+        // Preflight disk headroom before any COPY/UNWIND write -- covers both
+        // full reindex and incremental/watch batches, which both funnel
+        // through this function (see store_util::check_disk_headroom).
+        if let Some(dir) = self.store.db_dir() {
+            let projected = crate::graph::store_util::estimate_extractions_write_bytes(extractions);
+            if let Err(shortfall) = crate::graph::store_util::check_disk_headroom(dir, projected) {
+                anyhow::bail!("refusing to index -- {shortfall}");
+            }
+        }
+
         let use_csv = existing_hashes_empty || extractions.len() > 100;
 
         if use_csv {

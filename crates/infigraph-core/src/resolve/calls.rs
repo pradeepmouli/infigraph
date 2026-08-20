@@ -37,6 +37,15 @@ pub fn resolve_calls_incremental(
     let lock = store.write_lock()?;
     let conn = store.connection()?;
 
+    // Preflight disk headroom before writing CALLS/INHERITS/custom edges
+    // (see store_util::check_disk_headroom).
+    if let Some(dir) = store.db_dir() {
+        let projected = crate::graph::store_util::estimate_extractions_write_bytes(extractions);
+        if let Err(shortfall) = crate::graph::store_util::check_disk_headroom(dir, projected) {
+            anyhow::bail!("refusing to resolve calls -- {shortfall}");
+        }
+    }
+
     // Build global symbol table from full graph: name -> [(id, file, kind)]
     let mut symbol_map: HashMap<String, Vec<(String, String, String)>> = HashMap::new();
     for (name, id, file, kind) in store.get_all_symbols()? {
@@ -507,6 +516,24 @@ pub fn re_resolve_for_files(
     let lock = store.write_lock()?;
     let conn = store.connection()?;
 
+    let target_files: std::collections::HashSet<&str> = files.iter().map(|f| f.as_str()).collect();
+    let filtered: Vec<&FileExtraction> = extractions
+        .iter()
+        .filter(|e| target_files.contains(e.file.as_str()))
+        .collect();
+    let filtered_owned: Vec<FileExtraction> = filtered.into_iter().cloned().collect();
+
+    // Preflight disk headroom before writing CALLS/INHERITS edges (see
+    // store_util::check_disk_headroom). Estimated off the filtered,
+    // target-file-scoped set -- what's actually about to be written -- not
+    // the full `extractions` slice the caller passed in.
+    if let Some(dir) = store.db_dir() {
+        let projected = crate::graph::store_util::estimate_extractions_write_bytes(&filtered_owned);
+        if let Err(shortfall) = crate::graph::store_util::check_disk_headroom(dir, projected) {
+            anyhow::bail!("refusing to re-resolve calls -- {shortfall}");
+        }
+    }
+
     for file in files {
         let escaped = escape(file);
         let _ = conn.query(&format!(
@@ -524,13 +551,6 @@ pub fn re_resolve_for_files(
         symbol_map.entry(name).or_default().push((id, file, kind));
     }
 
-    let target_files: std::collections::HashSet<&str> = files.iter().map(|f| f.as_str()).collect();
-    let filtered: Vec<&FileExtraction> = extractions
-        .iter()
-        .filter(|e| target_files.contains(e.file.as_str()))
-        .collect();
-
-    let filtered_owned: Vec<FileExtraction> = filtered.into_iter().cloned().collect();
     let mut stats = resolve_with_map(&conn, &filtered_owned, &symbol_map, learned_store, &lock)?;
     stats.inherits_resolved = resolve_inherits(&conn, &filtered_owned, &symbol_map, &lock)?;
     Ok(stats)

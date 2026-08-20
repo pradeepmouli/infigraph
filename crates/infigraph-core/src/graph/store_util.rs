@@ -48,6 +48,20 @@ pub(crate) fn check_disk_headroom(dir: &Path, projected_write_bytes: u64) -> Res
     }
 }
 
+/// Serialized-size proxy for a batch of file extractions, used as the
+/// `check_disk_headroom` write estimate by bulk upsert/resolve paths that
+/// have no raw source-file byte count on hand (unlike SCIP import, which
+/// reads the whole `.scip` file into memory up front). Not exact -- the
+/// actual on-disk write is Parquet/CSV, not JSON -- but proportional to
+/// what's about to be written, which is what the headroom check needs.
+pub(crate) fn estimate_extractions_write_bytes(
+    extractions: &[crate::model::FileExtraction],
+) -> u64 {
+    serde_json::to_vec(extractions)
+        .map(|v| v.len() as u64)
+        .unwrap_or(0)
+}
+
 /// Escape single quotes and control characters for Kuzu string literals.
 pub(crate) fn escape(s: &str) -> String {
     s.replace('\\', "\\\\")
