@@ -45,7 +45,9 @@ pub fn instances_dir() -> PathBuf {
         .join("instances")
 }
 
-fn instance_path(pid: u32) -> PathBuf {
+/// The registration file path for `pid` (pub for R5.4's signal-time
+/// deregistration, which cannot reach the InstanceGuard from a handler).
+pub fn instance_path(pid: u32) -> PathBuf {
     instances_dir().join(format!("{pid}.json"))
 }
 

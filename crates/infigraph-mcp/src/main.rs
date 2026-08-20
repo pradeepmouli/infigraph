@@ -311,6 +311,26 @@ fn run() -> Result<()> {
         }
     };
 
+    // R5.4 (#79): SIGTERM/SIGINT must deregister this instance and exit
+    // cleanly. Without a handler the signal kills the process mid-anything
+    // with Drop handlers skipped, leaving a stale instance registration
+    // (reaped only later) and a stale lock payload. The handler does the
+    // one durable cleanup a signal context can do safely -- remove our own
+    // registration file -- then exits; the flock releases with the
+    // process, and the payload staleness is covered by holder_is_alive.
+    {
+        let pid = std::process::id();
+        ctrlc::set_handler(move || {
+            let _ = std::fs::remove_file(infigraph_core::instances::instance_path(pid));
+            mcp_log(
+                "INFO",
+                "termination signal received -- instance deregistered, exiting",
+            );
+            std::process::exit(0);
+        })
+        .ok();
+    }
+
     let reaped = infigraph_core::instances::reap_orphans_once(std::process::id());
     if reaped > 0 {
         mcp_log(

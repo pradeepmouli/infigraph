@@ -342,6 +342,17 @@ pub(crate) fn cmd_daemon(root: &Path, debounce: u64) -> Result<()> {
 
     ctrlc::set_handler(move || {
         let _ = stop_tx.send(());
+        // R5.4 (#79): bound the graceful path. The watch loop's shutdown
+        // waits out in-flight drains; if one is wedged (stuck on a lock or
+        // a hung query), that wait never ends and the daemon becomes an
+        // unkillable-by-SIGTERM orphan -- exactly what graceful shutdown
+        // exists to prevent. 5s is the R5.4 budget; a hard exit still
+        // releases every flock with the process.
+        std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            eprintln!("[daemon] graceful shutdown exceeded the 5s budget -- hard exit");
+            std::process::exit(1);
+        });
     })
     .ok();
 

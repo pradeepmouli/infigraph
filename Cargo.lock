@@ -2613,6 +2613,7 @@ name = "infigraph-mcp"
 version = "3.2.12"
 dependencies = [
  "anyhow",
+ "ctrlc",
  "dirs-next",
  "fs2",
  "hex",
