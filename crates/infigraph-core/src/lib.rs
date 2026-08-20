@@ -36,6 +36,7 @@ pub mod scip;
 pub mod search;
 pub mod security;
 pub mod sequence;
+pub mod snapshot;
 pub mod structured;
 pub mod taint;
 pub mod viz;

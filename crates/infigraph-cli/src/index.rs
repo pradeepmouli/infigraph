@@ -1,3 +1,4 @@
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
@@ -109,20 +110,12 @@ pub(crate) fn cmd_index(root: &Path, full: bool, no_embed: bool) -> Result<()> {
         } else {
             let tg_dir = root.join(".infigraph");
             if tg_dir.exists() {
-                let sessions_dir = tg_dir.join("sessions");
-                let sessions_backup = root.join(".infigraph-sessions-backup");
-                let had_sessions = sessions_dir.exists();
-                if had_sessions {
-                    let _ = std::fs::rename(&sessions_dir, &sessions_backup);
-                }
-                // `op_guard` above holds a flock on .infigraph/index.lock
-                // across this wipe; the shared helper preserves that file
-                // by name so the held lock stays valid through the wipe.
-                infigraph_core::ops::wipe_infigraph_preserving_index_lock(&tg_dir)?;
-                if had_sessions {
-                    let _ = std::fs::rename(&sessions_backup, &sessions_dir);
-                }
-                println!("Cleaned .infigraph/ for full reindex (sessions preserved)");
+                // `op_guard` above already holds .infigraph/index.lock,
+                // satisfying full_reindex_wipe's locking contract.
+                infigraph_core::ops::full_reindex_wipe(&tg_dir)?;
+                println!(
+                    "Cleaned .infigraph/ for full reindex (snapshot saved, sessions preserved)"
+                );
             }
         }
     }
@@ -384,6 +377,91 @@ pub(crate) fn cmd_index(root: &Path, full: bool, no_embed: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// List or restore pre-write snapshots, quarantined (corrupt) graphs, and
+/// retired-previous graphs (R3.2.2/docs/DESIGN-hardening.md §3.2).
+pub(crate) fn cmd_restore(root: &Path, id: Option<&str>, yes: bool) -> Result<()> {
+    let tg_dir = root.join(".infigraph");
+    let points = infigraph_core::snapshot::list_restore_points(&tg_dir);
+
+    let Some(id) = id else {
+        if points.is_empty() {
+            println!("No restore points found under {}", tg_dir.display());
+        } else {
+            println!("Restore points (newest first):");
+            for p in &points {
+                println!("  {}  {}", p.id(), format_timestamp(p.timestamp));
+            }
+            println!("\nRestore one with: infigraph restore <id>");
+        }
+        return Ok(());
+    };
+
+    let point = points
+        .iter()
+        .find(|p| p.id() == id)
+        .with_context(|| format!("no restore point matching '{id}' -- run `infigraph restore` with no arguments to list available points"))?;
+
+    if !yes {
+        let should_proceed = if std::io::stdin().is_terminal() {
+            print!(
+                "Restore {} ({})? The current live state will be preserved first. [y/N] ",
+                point.id(),
+                format_timestamp(point.timestamp)
+            );
+            use std::io::Write;
+            std::io::stdout().flush()?;
+            let mut answer = String::new();
+            let _ = std::io::stdin().read_line(&mut answer);
+            let answer = answer.trim().to_lowercase();
+            answer == "y" || answer == "yes"
+        } else {
+            false
+        };
+        if !should_proceed {
+            println!("Aborted (pass --yes to restore without confirming).");
+            return Ok(());
+        }
+    }
+
+    // Serializes against a live index/watcher touching the same .infigraph/
+    // tree, same contract `cmd_index`'s destructive --full wipe relies on.
+    let _op_guard = match infigraph_core::ops::begin_index_op(
+        root,
+        "infigraph restore",
+        std::time::Duration::from_secs(5),
+    )? {
+        infigraph_core::ops::IndexOpOutcome::Acquired(g) => g,
+        o @ infigraph_core::ops::IndexOpOutcome::AlreadyRunning(_) => {
+            anyhow::bail!(
+                "{}",
+                o.skip_note()
+                    .unwrap_or_else(|| "another index operation is already running".to_string())
+            );
+        }
+    };
+
+    infigraph_core::snapshot::restore(&tg_dir, point)
+        .with_context(|| format!("restore of {} failed", point.id()))?;
+
+    println!("Restored {}.", point.id());
+    if !matches!(
+        point.kind,
+        infigraph_core::snapshot::RestorePointKind::Snapshot
+    ) {
+        println!(
+            "Note: this pool only holds the graph itself -- embeddings/sidecars are now stale \
+             relative to it. Run `infigraph index` to refresh them."
+        );
+    }
+    Ok(())
+}
+
+fn format_timestamp(epoch_secs: u64) -> String {
+    chrono::DateTime::from_timestamp(epoch_secs as i64, 0)
+        .map(|dt| dt.to_rfc3339())
+        .unwrap_or_else(|| format!("epoch {epoch_secs}"))
 }
 
 fn spawn_scip_child_process(root: &Path, detected_languages: &std::collections::HashSet<String>) {

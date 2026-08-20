@@ -6,7 +6,7 @@
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use crate::lockfile::{self, LockFile, LockInfo};
 
@@ -80,6 +80,13 @@ pub fn begin_index_op(root: &Path, role: &str, wait: Duration) -> Result<IndexOp
 /// place as the live rendezvous point), so a lock held on it by the
 /// caller stays valid for the whole wipe-and-reindex.
 ///
+/// Also preserves the snapshot/quarantine/retired-previous backup pools
+/// (`crate::snapshot::should_skip`, R3.2) — a caller that just took a
+/// pre-write snapshot of this same directory (see `full_reindex_wipe`)
+/// would otherwise have that snapshot destroyed by the wipe it was meant to
+/// protect against, along with any existing corruption-quarantine or
+/// retired-previous-graph entries.
+///
 /// Callers are responsible for their own `sessions/` preserve-across-wipe
 /// dance where that applies (rename out, wipe, rename back) — this only
 /// handles the lock-safe wipe of everything else. Callers should check
@@ -87,7 +94,7 @@ pub fn begin_index_op(root: &Path, role: &str, wait: Duration) -> Result<IndexOp
 /// convention (a missing directory is a no-op, not an error here).
 pub fn wipe_infigraph_preserving_index_lock(tg_dir: &Path) -> std::io::Result<()> {
     for entry in std::fs::read_dir(tg_dir)?.flatten() {
-        if entry.file_name() == "index.lock" {
+        if crate::snapshot::should_skip(&entry.file_name().to_string_lossy()) {
             continue;
         }
         let path = entry.path();
@@ -98,4 +105,38 @@ pub fn wipe_infigraph_preserving_index_lock(tg_dir: &Path) -> std::io::Result<()
         }
     }
     Ok(())
+}
+
+/// The full snapshot-then-wipe sequence shared by every full-reindex call
+/// site that destructively clears `.infigraph/` for a from-scratch rebuild
+/// (R3.2.1/docs/DESIGN-hardening.md §3.2): snapshot the current state,
+/// preserve `sessions/` across the wipe (conversation history, not derived
+/// index data, so it isn't backed up by the snapshot's restore semantics),
+/// wipe, restore sessions. A failed snapshot aborts before anything
+/// destructive runs, rather than proceeding with an unprotected wipe.
+///
+/// Callers are responsible for holding whatever lock serializes writes to
+/// `tg_dir` before calling this (typically `index.lock` via
+/// `begin_index_op`) — mirrors `snapshot::create_snapshot`'s own contract.
+pub fn full_reindex_wipe(tg_dir: &Path) -> Result<()> {
+    crate::snapshot::create_snapshot(tg_dir)
+        .context("pre-reindex snapshot failed; aborting full reindex")?;
+
+    let sessions_dir = tg_dir.join("sessions");
+    let sessions_backup = tg_dir
+        .parent()
+        .unwrap_or(tg_dir)
+        .join(".infigraph-sessions-backup");
+    let had_sessions = sessions_dir.exists();
+    if had_sessions {
+        let _ = std::fs::rename(&sessions_dir, &sessions_backup);
+    }
+
+    let wipe_result = wipe_infigraph_preserving_index_lock(tg_dir).context("wipe failed");
+
+    if had_sessions {
+        let _ = std::fs::rename(&sessions_backup, &sessions_dir);
+    }
+
+    wipe_result
 }

@@ -3,7 +3,9 @@ use std::time::Duration;
 
 use infigraph_core::lang::LanguageRegistry;
 use infigraph_core::multi::{index_group, Group, Registry, RepoEntry};
-use infigraph_core::ops::{begin_index_op, wipe_infigraph_preserving_index_lock, IndexOpOutcome};
+use infigraph_core::ops::{
+    begin_index_op, full_reindex_wipe, wipe_infigraph_preserving_index_lock, IndexOpOutcome,
+};
 use tempfile::TempDir;
 
 #[test]
@@ -186,4 +188,76 @@ fn test_wipe_infigraph_preserving_index_lock_keeps_lock_removes_rest() {
     }
 
     drop(guard);
+}
+
+/// `wipe_infigraph_preserving_index_lock` must also preserve the
+/// snapshot/quarantine/retired-previous backup pools (R3.2) alongside
+/// `index.lock` — otherwise a caller that just took a pre-write snapshot of
+/// this same directory (`full_reindex_wipe`) would have that snapshot
+/// destroyed by the very wipe it exists to protect against.
+#[test]
+fn test_wipe_preserves_backup_pools() {
+    let dir = TempDir::new().unwrap();
+    let tg_dir = dir.path().join(".infigraph");
+    std::fs::create_dir_all(tg_dir.join("snapshots").join("111")).unwrap();
+    std::fs::write(
+        tg_dir.join("snapshots").join("111").join("graph"),
+        b"snapshotted",
+    )
+    .unwrap();
+    std::fs::write(tg_dir.join("graph.corrupt.222"), b"corrupt").unwrap();
+    std::fs::write(tg_dir.join("graph.previous.333"), b"previous").unwrap();
+    std::fs::write(tg_dir.join("graph"), b"live").unwrap();
+
+    wipe_infigraph_preserving_index_lock(&tg_dir).unwrap();
+
+    assert!(
+        tg_dir.join("snapshots").join("111").join("graph").exists(),
+        "pre-write snapshots must survive the wipe"
+    );
+    assert!(
+        tg_dir.join("graph.corrupt.222").exists(),
+        "corruption quarantine must survive the wipe"
+    );
+    assert!(
+        tg_dir.join("graph.previous.333").exists(),
+        "retired-previous graph must survive the wipe"
+    );
+    assert!(!tg_dir.join("graph").exists(), "live graph should be wiped");
+}
+
+/// `full_reindex_wipe` must snapshot the live state before wiping it, and
+/// that snapshot must itself survive the wipe -- end-to-end coverage of the
+/// bug the two fixes above were built to close (caught via a manual CLI run
+/// of `infigraph index --full` before this test existed: the snapshot was
+/// silently deleted by the wipe that followed it).
+#[test]
+fn test_full_reindex_wipe_snapshot_survives_the_wipe() {
+    let dir = TempDir::new().unwrap();
+    let tg_dir = dir.path().join(".infigraph");
+    std::fs::create_dir_all(&tg_dir).unwrap();
+    std::fs::write(tg_dir.join("graph"), b"pre-reindex-live").unwrap();
+    std::fs::write(tg_dir.join("index.lock"), b"").unwrap();
+
+    full_reindex_wipe(&tg_dir).unwrap();
+
+    let snapshots_dir = tg_dir.join("snapshots");
+    let entries: Vec<_> = std::fs::read_dir(&snapshots_dir)
+        .unwrap()
+        .flatten()
+        .collect();
+    assert_eq!(entries.len(), 1, "exactly one snapshot should exist");
+    assert_eq!(
+        std::fs::read_to_string(entries[0].path().join("graph")).unwrap(),
+        "pre-reindex-live",
+        "the snapshot must hold the pre-wipe graph content"
+    );
+    assert!(
+        !tg_dir.join("graph").exists(),
+        "the live graph should be wiped"
+    );
+    assert!(
+        tg_dir.join("index.lock").exists(),
+        "index.lock must survive"
+    );
 }

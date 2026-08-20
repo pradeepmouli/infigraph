@@ -163,20 +163,11 @@ pub(crate) fn cmd_group(root: &Path, action: GroupAction) -> Result<()> {
                 if full {
                     let tg_dir = entry.path.join(".infigraph");
                     if tg_dir.exists() {
-                        let sess_dir = tg_dir.join("sessions");
-                        let sess_bak = entry.path.join(".infigraph-sessions-backup");
-                        let had = sess_dir.exists();
-                        if had {
-                            let _ = std::fs::rename(&sess_dir, &sess_bak);
-                        }
                         // `_op_guard` above holds a flock on this member's
-                        // index.lock — the shared helper preserves that file
-                        // by name so the held lock stays valid through the wipe.
-                        infigraph_core::ops::wipe_infigraph_preserving_index_lock(&tg_dir)?;
-                        if had {
-                            let _ = std::fs::rename(&sess_bak, &sess_dir);
-                        }
-                        println!("  Cleaned .infigraph/ for full reindex (sessions preserved)");
+                        // index.lock, satisfying full_reindex_wipe's locking
+                        // contract (snapshot + sessions-preserve + wipe).
+                        infigraph_core::ops::full_reindex_wipe(&tg_dir)?;
+                        println!("  Cleaned .infigraph/ for full reindex (snapshot saved, sessions preserved)");
                     }
                 }
                 let reg = bundled_registry()?;

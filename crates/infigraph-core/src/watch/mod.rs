@@ -1213,17 +1213,40 @@ where
     // `live_path` would point an operator at a path that's already gone and
     // never say where the real data actually went.
     let retired_path: Option<PathBuf> = if live_path.exists() {
-        // A healthy superseded graph goes into its own bounded rollback
-        // pool, NOT the corruption-quarantine pool -- that one exists to
-        // preserve corruption evidence for human diagnosis, and routine
-        // full reindexes filing healthy graphs into it would evict real
-        // evidence.
-        match crate::quarantine::retire_previous_graph(&infigraph_dir, LIVE_NAME) {
-            Ok(dest) => Some(dest),
+        // Same backup mechanism as the local `infigraph index --full` path
+        // (R3.2.1/docs/DESIGN-hardening.md §3.2) -- a whole-`.infigraph/`-tree
+        // snapshot, not just the graph file, so a restore brings back graph
+        // and sidecars together instead of leaving them mismatched.
+        // `create_snapshot` only copies; it doesn't remove the original, so
+        // the live graph's base image still needs an explicit removal below
+        // before the rename-swap can claim `live_path` (`fs::rename` can't
+        // reliably overwrite an existing destination on Windows). Its
+        // WAL-family siblings are cleaned up unconditionally further down.
+        match crate::snapshot::create_snapshot(&infigraph_dir) {
+            Ok(dest) => match std::fs::remove_file(&live_path) {
+                Ok(()) => Some(dest),
+                Err(e) => {
+                    let result = crate::daemon_protocol::WriteResult::Err {
+                        message: format!(
+                            "full reindex rebuilt successfully and the pre-reindex state was \
+                             snapshotted to {}, but the live graph at {} could not be removed \
+                             to make way for the swap: {e:#}. The rebuilt graph remains at {}",
+                            dest.display(),
+                            live_path.display(),
+                            rebuilding_path.display()
+                        ),
+                    };
+                    if let Ok(json) = serde_json::to_string(&result) {
+                        let _ = crate::daemon_protocol::write_atomic(reply_path, &json);
+                    }
+                    drop(graph_lock);
+                    return (Some(guard), None);
+                }
+            },
             Err(e) => {
                 let result = crate::daemon_protocol::WriteResult::Err {
                     message: format!(
-                        "full reindex rebuilt successfully but could not move the old graph \
+                        "full reindex rebuilt successfully but could not snapshot the old graph \
                          aside: {e:#}. The live graph at {} was left untouched; the rebuilt \
                          graph remains at {}",
                         live_path.display(),
@@ -1303,11 +1326,15 @@ where
         Err(e) => {
             // The rebuilt graph is verified-good and still sitting at
             // `rebuilding_path` -- nothing was lost. Report the old
-            // graph's real current location: wherever it was moved aside
-            // to, or "no prior graph" if this was a from-scratch build.
+            // graph's real current location: the pre-reindex snapshot it
+            // was preserved in, or "no prior graph" if this was a
+            // from-scratch build.
             let old_graph_location = match &retired_path {
-                Some(q) => format!("the old graph was moved aside to {}", q.display()),
-                None => "there was no prior graph to move aside".to_string(),
+                Some(q) => format!(
+                    "the old graph was preserved in the pre-reindex snapshot at {}",
+                    q.display()
+                ),
+                None => "there was no prior graph to preserve".to_string(),
             };
             eprintln!(
                 "[daemon] full-reindex swap failed after a successful rebuild: {e} -- \

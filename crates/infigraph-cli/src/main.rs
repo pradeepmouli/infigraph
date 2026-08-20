@@ -27,7 +27,7 @@ use infigraph_languages::bundled_registry;
 use agent::cmd_init;
 use commands::*;
 use group_commands::{cmd_group, cmd_repos};
-use index::cmd_index;
+use index::{cmd_index, cmd_restore};
 use install::{cmd_install, cmd_uninstall, cmd_update};
 
 /// Build a language registry with bundled languages + grammar plugins.
@@ -87,6 +87,21 @@ enum Commands {
 
     /// Show graph statistics
     Stats,
+
+    /// List or restore pre-write snapshots, quarantined (corrupt) graphs,
+    /// and retired-previous graphs (R3.2.2). With no id, lists every
+    /// restore point across all three pools, newest first. With an id
+    /// (e.g. "snapshot:1787184237", copied from the list output), restores
+    /// it -- the current live state is itself preserved first, so an
+    /// unwanted restore can always be undone with another restore.
+    Restore {
+        /// Restore point id from a prior `infigraph restore` listing
+        /// (e.g. "snapshot:1787184237"). Omit to just list restore points.
+        id: Option<String>,
+        /// Skip the confirmation prompt
+        #[arg(long, short)]
+        yes: bool,
+    },
 
     /// Health checks for the infigraph installation: registry consistency,
     /// lock status, watcher liveness, disk space, sidecar freshness,
@@ -881,6 +896,7 @@ fn run(command: Commands, root: &Path) -> Result<()> {
         Commands::Init { group, quick, yes } => cmd_init(root, group.as_deref(), quick, yes),
         Commands::Index { full, no_embed } => cmd_index(root, full, no_embed),
         Commands::Stats => cmd_stats(root),
+        Commands::Restore { id, yes } => cmd_restore(root, id.as_deref(), yes),
         Commands::Doctor { global } => cmd_doctor(root, global),
         Commands::Languages => cmd_languages(Some(root)),
         Commands::Symbols { file } => cmd_symbols(root, &file),
