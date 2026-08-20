@@ -169,6 +169,21 @@ fn move_graph_aside(
     // that removal; quarantine already holds the evidence).
     relocate_wal_family(infigraph_dir, graph_name, &quarantine_stem, &source);
 
+    crate::audit::audit_log(
+        "quarantine",
+        if infix == CORRUPT_INFIX {
+            "quarantine-corrupt-graph"
+        } else {
+            "retire-previous-graph"
+        },
+        if infix == CORRUPT_INFIX {
+            "graph failed a corruption verdict"
+        } else {
+            "superseded by a successful full reindex"
+        },
+        &quarantine_path.display().to_string(),
+    );
+
     Ok(quarantine_path)
 }
 
