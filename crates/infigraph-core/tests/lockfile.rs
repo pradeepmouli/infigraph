@@ -45,6 +45,7 @@ fn test_busy_display_names_holder() {
             build_hash: "abc123".into(),
             acquired_at: 0,
             last_heartbeat: 0,
+            holder_started_at: 0,
         }),
         waited: Duration::from_secs(30),
     };
@@ -314,4 +315,69 @@ fn old_lock_file_without_last_heartbeat_field_still_parses() {
         0,
         "missing field defaults to 0"
     );
+}
+
+mod holder_is_alive_pid_reuse {
+    //! R2.1.2 (#67): PID existence alone must not vouch for a lock holder
+    //! -- a recycled PID belongs to a different process with a different
+    //! OS start time.
+    use infigraph_core::instances::current_process_start_time;
+    use infigraph_core::lockfile::{holder_is_alive, LockInfo};
+
+    fn info(pid: u32, holder_started_at: u64) -> LockInfo {
+        LockInfo {
+            pid,
+            role: "test".to_string(),
+            build_hash: "test".to_string(),
+            acquired_at: 0,
+            last_heartbeat: 0,
+            holder_started_at,
+        }
+    }
+
+    #[test]
+    fn live_pid_with_matching_start_time_is_alive() {
+        let own_start = current_process_start_time(std::process::id()).unwrap();
+        assert!(holder_is_alive(&info(std::process::id(), own_start)));
+    }
+
+    #[test]
+    fn live_pid_with_mismatched_start_time_is_a_recycled_pid_not_the_holder() {
+        let own_start = current_process_start_time(std::process::id()).unwrap();
+        assert!(
+            !holder_is_alive(&info(std::process::id(), own_start + 12345)),
+            "same pid, different start time = different process -- the recorded holder is gone"
+        );
+    }
+
+    #[test]
+    fn zero_start_time_falls_back_to_pid_existence_for_old_payloads() {
+        assert!(
+            holder_is_alive(&info(std::process::id(), 0)),
+            "pre-R2.1.2 payloads (no recorded start) must keep the old pid-only behavior"
+        );
+        assert!(!holder_is_alive(&info(999_999, 0)));
+    }
+
+    #[test]
+    fn dead_pid_is_dead_regardless_of_recorded_start_time() {
+        assert!(!holder_is_alive(&info(999_999, 42)));
+    }
+
+    #[test]
+    fn lock_acquisition_stamps_the_holders_real_start_time() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lock_path = tmp.path().join("x.lock");
+        let _guard = infigraph_core::lockfile::try_acquire(&lock_path, "test-role")
+            .unwrap()
+            .unwrap();
+        let holder = infigraph_core::lockfile::read_holder(&lock_path).unwrap();
+        assert_eq!(
+            holder.holder_started_at,
+            current_process_start_time(std::process::id()).unwrap(),
+            "acquire must record the holder's OS start time so later liveness checks \
+             can detect PID reuse"
+        );
+        assert!(holder_is_alive(&holder));
+    }
 }

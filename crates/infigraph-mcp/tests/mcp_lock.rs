@@ -89,6 +89,7 @@ fn check_wedged_and_log_does_not_panic_on_fresh_or_stale_heartbeat() {
         build_hash: "abc".to_string(),
         acquired_at: 1000,
         last_heartbeat: 1000,
+        holder_started_at: 0,
     };
     infigraph_mcp::mcp_lock::check_wedged_and_log(&fresh, 1005);
 
@@ -98,6 +99,7 @@ fn check_wedged_and_log_does_not_panic_on_fresh_or_stale_heartbeat() {
         build_hash: "abc".to_string(),
         acquired_at: 1000,
         last_heartbeat: 1000,
+        holder_started_at: 0,
     };
     infigraph_mcp::mcp_lock::check_wedged_and_log(&stale, 1000 + wedged_secs_for_test() + 1);
 }

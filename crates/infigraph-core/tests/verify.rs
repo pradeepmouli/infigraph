@@ -71,6 +71,7 @@ fn unopenable_graph_is_a_fail_that_short_circuits() {
         build_hash: "test".to_string(),
         acquired_at: 0,
         last_heartbeat: 0,
+        holder_started_at: 0,
     };
     fs::write(
         db_lock_path(&graph_path),

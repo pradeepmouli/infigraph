@@ -24,6 +24,7 @@ fn write_holder_lock(lock_path: &Path, pid: u32) {
         build_hash: "test".to_string(),
         acquired_at: 0,
         last_heartbeat: 0,
+        holder_started_at: 0,
     };
     fs::write(lock_path, serde_json::to_string(&info).unwrap()).unwrap();
 }

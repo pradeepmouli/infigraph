@@ -325,6 +325,7 @@ mod tests {
                 build_hash: "some-old-build".to_string(),
                 acquired_at: 0,
                 last_heartbeat: 0,
+                holder_started_at: 0,
             },
         );
 
@@ -352,6 +353,7 @@ mod tests {
                 build_hash: crate::build_hash().to_string(),
                 acquired_at: 0,
                 last_heartbeat: 0,
+                holder_started_at: 0,
             },
         );
 
@@ -380,6 +382,7 @@ mod tests {
                 build_hash: "definitely-not-the-current-build".to_string(),
                 acquired_at: 0,
                 last_heartbeat: 0,
+                holder_started_at: 0,
             },
         );
 

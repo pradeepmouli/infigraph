@@ -350,11 +350,19 @@ fn check_one_lock(project_path: &Path, lock_name: &str, installed_build_hash: &s
         };
     };
 
-    if !is_pid_alive(holder.pid) {
+    if !lockfile::holder_is_alive(&holder) {
         return CheckResult::warn(
             LOCK_CATEGORY,
             label,
-            format!("holder PID {} is not running (stale lock)", holder.pid),
+            format!(
+                "holder PID {} is not running (stale lock{})",
+                holder.pid,
+                if holder.holder_started_at != 0 && is_pid_alive(holder.pid) {
+                    " -- the PID was recycled by an unrelated process"
+                } else {
+                    ""
+                }
+            ),
             "safe to delete -- the recorded holder process is gone",
         );
     }

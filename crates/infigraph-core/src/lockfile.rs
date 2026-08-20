@@ -37,6 +37,15 @@ pub struct LockInfo {
     /// callers must treat as "unknown," not "just acquired").
     #[serde(default)]
     pub last_heartbeat: u64,
+    /// Unix epoch seconds the holder OS PROCESS started, per the OS
+    /// process table (R2.1.2's PID-reuse guard) -- not when the lock was
+    /// acquired. `holder_is_alive` compares this against a fresh lookup of
+    /// the same PID: a recycled PID belongs to a different process with a
+    /// different start time, so it no longer masquerades as a live holder.
+    /// `#[serde(default)]` (0 = unknown) so locks written by older
+    /// binaries still parse; 0 falls back to PID-existence alone.
+    #[serde(default)]
+    pub holder_started_at: u64,
 }
 
 impl LockInfo {
@@ -48,7 +57,36 @@ impl LockInfo {
             build_hash: crate::build_hash().to_string(),
             acquired_at: now,
             last_heartbeat: now,
+            holder_started_at: own_start_time(),
         }
+    }
+}
+
+/// This process's own OS start time, memoized: it can never change for
+/// the life of the process, and the sysinfo lookup behind it is far too
+/// expensive for lock-acquisition hot paths (every graph write acquires).
+fn own_start_time() -> u64 {
+    static OWN_START: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *OWN_START.get_or_init(|| {
+        crate::instances::current_process_start_time(std::process::id()).unwrap_or(0)
+    })
+}
+
+/// Is the process a lock payload names still the SAME process that wrote
+/// it? PID existence alone is not enough: PIDs get recycled, and a lock
+/// consumer that mistakes a recycled PID for the original holder makes
+/// exactly the wrong call twice over -- doctor/ps report a dead holder as
+/// live, and the unreplayed-WAL guard (R3.1.3) skips its refusal because
+/// "the holder is still alive". Start-time match closes that (same
+/// semantics as `instances::is_stale`); a payload from an older binary
+/// (`holder_started_at == 0`) falls back to PID existence, which is the
+/// exact pre-R2.1.2 behavior, never worse.
+pub fn holder_is_alive(info: &LockInfo) -> bool {
+    let actual = crate::instances::current_process_start_time(info.pid);
+    match (info.holder_started_at, actual) {
+        (_, None) => false,
+        (0, Some(_)) => true,
+        (recorded, Some(actual)) => actual == recorded,
     }
 }
 

@@ -31,6 +31,12 @@ pub struct ProcessRow {
     pub uptime_secs: Option<u64>,
     /// Resident set size in bytes (alive rows only).
     pub rss_bytes: Option<u64>,
+    /// OS start time the durable state recorded for this pid (0 = a
+    /// pre-R2.1.2 payload that never captured one). When nonzero and it
+    /// disagrees with the live process table, the pid was RECYCLED by an
+    /// unrelated process -- the row reports dead, not the impostor's
+    /// uptime/RSS.
+    pub recorded_started_at: u64,
 }
 
 /// Lock files whose holder payload identifies a long-lived or in-flight
@@ -55,7 +61,7 @@ pub fn list_infigraph_processes(projects: &[&Path]) -> Vec<ProcessRow> {
     // (pid -> accumulating row), BTreeMap for stable pid ordering.
     let mut rows: BTreeMap<u32, ProcessRow> = BTreeMap::new();
 
-    let mut add = |pid: u32, role: String, project: String, evidence: String| {
+    let mut add = |pid: u32, role: String, project: String, evidence: String, started_at: u64| {
         let row = rows.entry(pid).or_insert_with(|| ProcessRow {
             pid,
             roles: vec![],
@@ -64,7 +70,11 @@ pub fn list_infigraph_processes(projects: &[&Path]) -> Vec<ProcessRow> {
             alive: false,
             uptime_secs: None,
             rss_bytes: None,
+            recorded_started_at: 0,
         });
+        if row.recorded_started_at == 0 {
+            row.recorded_started_at = started_at;
+        }
         if !row.roles.contains(&role) {
             row.roles.push(role);
         }
@@ -86,6 +96,7 @@ pub fn list_infigraph_processes(projects: &[&Path]) -> Vec<ProcessRow> {
             format!("mcp ({})", info.transport),
             info.project_path.clone(),
             evidence,
+            info.started_at,
         );
     }
 
@@ -99,6 +110,7 @@ pub fn list_infigraph_processes(projects: &[&Path]) -> Vec<ProcessRow> {
                     holder.role.clone(),
                     project.display().to_string(),
                     (*lock_name).to_string(),
+                    holder.holder_started_at,
                 );
             }
         }
@@ -114,6 +126,13 @@ pub fn list_infigraph_processes(projects: &[&Path]) -> Vec<ProcessRow> {
         .unwrap_or(0);
     for row in rows.values_mut() {
         if let Some(proc) = sys.process(sysinfo::Pid::from_u32(row.pid)) {
+            // R2.1.2 PID-reuse guard: a recorded start time that disagrees
+            // with the live process table means this is a DIFFERENT process
+            // wearing a recycled pid -- report the recorded holder as dead
+            // rather than the impostor's stats.
+            if row.recorded_started_at != 0 && proc.start_time() != row.recorded_started_at {
+                continue;
+            }
             row.alive = true;
             row.uptime_secs = Some(now.saturating_sub(proc.start_time()));
             row.rss_bytes = Some(proc.memory());
@@ -221,6 +240,7 @@ mod tests {
             build_hash: "test".to_string(),
             acquired_at: 0,
             last_heartbeat: 0,
+            holder_started_at: 0,
         };
         std::fs::write(ig.join(name), serde_json::to_string(&info).unwrap()).unwrap();
     }
@@ -320,5 +340,43 @@ mod tests {
             Err(KillRefusal::NotAnInfigraphProcess { .. }) => {}
             other => panic!("expected NotAnInfigraphProcess, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod pid_reuse_tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn recycled_pid_reads_as_dead_not_as_the_impostors_stats() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("instances");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("INFIGRAPH_INSTANCES_DIR", &dir);
+        let project = tmp.path().join("proj");
+        let ig = project.join(".infigraph");
+        std::fs::create_dir_all(&ig).unwrap();
+        // Our own live pid, but a recorded start time that can't match --
+        // the exact shape a recycled pid leaves behind.
+        let own_start = crate::instances::current_process_start_time(std::process::id()).unwrap();
+        let info = crate::lockfile::LockInfo {
+            pid: std::process::id(),
+            role: "infigraph daemon".to_string(),
+            build_hash: "test".to_string(),
+            acquired_at: 0,
+            last_heartbeat: 0,
+            holder_started_at: own_start + 999,
+        };
+        std::fs::write(ig.join("watch.lock"), serde_json::to_string(&info).unwrap()).unwrap();
+
+        let rows = list_infigraph_processes(&[Path::new(&project)]);
+
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert!(
+            !rows[0].alive,
+            "a recycled pid must report the recorded holder as dead: {rows:?}"
+        );
+        assert!(rows[0].rss_bytes.is_none(), "no impostor stats: {rows:?}");
     }
 }

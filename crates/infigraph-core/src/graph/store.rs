@@ -195,7 +195,7 @@ pub fn unclean_shutdown_wal_holder(db_path: &Path, lock_path: &Path) -> Option<u
         return None;
     }
     let holder = lockfile::read_holder(lock_path)?;
-    if crate::instances::current_process_start_time(holder.pid).is_some() {
+    if lockfile::holder_is_alive(&holder) {
         return None; // holder is alive -- not our call to intervene
     }
     Some(holder.pid)
@@ -592,6 +592,7 @@ mod tests {
             build_hash: "test".to_string(),
             acquired_at: 0,
             last_heartbeat: 0,
+            holder_started_at: 0,
         };
         std::fs::write(lock_path, serde_json::to_string(&info).unwrap()).unwrap();
     }

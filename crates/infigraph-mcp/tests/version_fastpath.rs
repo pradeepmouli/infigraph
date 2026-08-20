@@ -20,6 +20,7 @@ fn seed_incumbent_lock(lock_path: &std::path::Path) -> String {
         build_hash: "some-older-build".to_string(),
         acquired_at: 1_700_000_000,
         last_heartbeat: 1_700_000_000,
+        holder_started_at: 0,
     })
     .unwrap();
     fs::write(lock_path, &payload).unwrap();
