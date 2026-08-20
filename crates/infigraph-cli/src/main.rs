@@ -112,6 +112,21 @@ enum Commands {
         #[arg(long)]
         global: bool,
     },
+
+    /// Evict registry entries for projects that no longer exist (R7.1).
+    /// By default only entries whose path is gone are evicted; add
+    /// --stale-days to also evict projects not reindexed in N days.
+    /// Every eviction is recorded in ~/.infigraph/logs/audit.log.
+    Gc {
+        /// Show what would be evicted without changing anything
+        #[arg(long)]
+        dry_run: bool,
+        /// Also evict entries whose graph was last rebuilt at least this
+        /// many days ago (recoverable: `infigraph index` re-registers)
+        #[arg(long)]
+        stale_days: Option<u64>,
+    },
+
     /// List available languages
     Languages,
 
@@ -898,6 +913,10 @@ fn run(command: Commands, root: &Path) -> Result<()> {
         Commands::Stats => cmd_stats(root),
         Commands::Restore { id, yes } => cmd_restore(root, id.as_deref(), yes),
         Commands::Doctor { global } => cmd_doctor(root, global),
+        Commands::Gc {
+            dry_run,
+            stale_days,
+        } => cmd_gc(dry_run, stale_days),
         Commands::Languages => cmd_languages(Some(root)),
         Commands::Symbols { file } => cmd_symbols(root, &file),
         Commands::Skeleton { file } => cmd_skeleton(root, &file),

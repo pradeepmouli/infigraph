@@ -853,3 +853,68 @@ pub(crate) fn cmd_doctor(root: &Path, global: bool) -> Result<()> {
         CheckStatus::Fail => std::process::exit(2),
     }
 }
+
+/// `infigraph gc` (R7.1): evict registry entries for deleted projects,
+/// optionally also age-stale ones. Planning/mutation live in
+/// `infigraph_core::gc` (pure, tested there); this owns the user-facing
+/// report, the confirmation-free-but-auditable persistence, and the R6.3
+/// audit lines -- written only AFTER the registry save succeeds, so the
+/// audit never records an eviction that didn't actually persist.
+pub(crate) fn cmd_gc(dry_run: bool, stale_days: Option<u64>) -> Result<()> {
+    let mut registry = infigraph_core::multi::Registry::load()?;
+    let plan =
+        infigraph_core::gc::plan_registry_gc(&registry, stale_days, std::time::SystemTime::now());
+
+    if plan.is_empty() {
+        println!("Registry is clean -- nothing to evict.");
+        return Ok(());
+    }
+
+    for c in &plan.evictions {
+        println!("evict: {} ({}) -- {}", c.name, c.path.display(), c.reason);
+    }
+    for (group, member) in &plan.dangling_group_members {
+        println!("prune: group '{group}' member '{member}' (no longer registered)");
+    }
+
+    if dry_run {
+        println!(
+            "\nDry run -- nothing changed. Re-run without --dry-run to evict {} entr{}.",
+            plan.evictions.len(),
+            if plan.evictions.len() == 1 {
+                "y"
+            } else {
+                "ies"
+            }
+        );
+        return Ok(());
+    }
+
+    infigraph_core::gc::execute_registry_gc(&mut registry, &plan);
+    registry.save()?;
+
+    for c in &plan.evictions {
+        infigraph_core::audit::audit_log(
+            "gc",
+            "evict-registry-entry",
+            &c.reason.to_string(),
+            &c.path.display().to_string(),
+        );
+    }
+    for (group, member) in &plan.dangling_group_members {
+        infigraph_core::audit::audit_log(
+            "gc",
+            "prune-group-member",
+            "member no longer registered",
+            &format!("{group}/{member}"),
+        );
+    }
+
+    println!(
+        "\nEvicted {} registry entr{}, pruned {} group member(s). Audit: ~/.infigraph/logs/audit.log",
+        plan.evictions.len(),
+        if plan.evictions.len() == 1 { "y" } else { "ies" },
+        plan.dangling_group_members.len()
+    );
+    Ok(())
+}

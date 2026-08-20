@@ -234,7 +234,7 @@ fn check_registered_path_still_exists(entry: &RepoEntry) -> CheckResult {
                 "registry entry points at a path that no longer exists: {}",
                 entry.path.display()
             ),
-            "run `infigraph gc` to evict stale registry entries (R7.1, not yet implemented)",
+            "run `infigraph gc` to evict it (add --stale-days N to also evict long-unindexed projects)",
         )
     }
 }

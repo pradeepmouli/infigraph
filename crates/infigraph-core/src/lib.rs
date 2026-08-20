@@ -1,4 +1,5 @@
 mod analysis;
+pub mod audit;
 pub mod bench;
 pub mod bridges;
 pub mod check;
@@ -14,6 +15,7 @@ pub mod doctor;
 pub mod embed;
 pub mod export;
 pub mod extract;
+pub mod gc;
 pub mod graph;
 pub mod ignore_rules;
 pub mod instances;
