@@ -190,7 +190,7 @@ pub fn db_lock_path(db_path: &Path) -> PathBuf {
 /// holder" via `lockfile::read_holder` returning `None`, and does not flag
 /// -- conservative by design, since a false positive here means refusing
 /// to open a perfectly good graph.
-fn unclean_shutdown_wal_holder(db_path: &Path, lock_path: &Path) -> Option<u32> {
+pub fn unclean_shutdown_wal_holder(db_path: &Path, lock_path: &Path) -> Option<u32> {
     if wal_family_paths(db_path).is_empty() {
         return None;
     }

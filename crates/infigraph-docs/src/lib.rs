@@ -122,8 +122,17 @@ impl DocIndex {
         } else {
             let _ = std::fs::remove_file(&self.db_path);
         }
-        let _ = std::fs::remove_file(self.db_path.with_extension("wal"));
-        let _ = std::fs::remove_file(self.db_path.with_extension("lock"));
+        // APPENDED names, not with_extension: Kuzu's WAL/lock siblings for
+        // "docs.kuzu" are "docs.kuzu.wal"/"docs.kuzu.lock" -- with_extension
+        // computed "docs.wal"/"docs.lock", files Kuzu never wrote, so the
+        // real WAL survived every wipe. A leftover WAL carries the OLD
+        // database's ID and makes the freshly rebuilt database at this path
+        // permanently unopenable ("Database ID does not match"), and a
+        // leftover lock payload from a dead holder re-trips the
+        // unreplayed-WAL guard in DocStore::open, wedging init()'s
+        // wipe-and-rebuild recovery in a refuse->wipe->refuse loop.
+        infigraph_core::graph::remove_wal_family(&self.db_path);
+        let _ = std::fs::remove_file(infigraph_core::graph::db_lock_path(&self.db_path));
         let _ = std::fs::remove_file(tg_dir.join("docs_embeddings.bin"));
         let _ = std::fs::remove_file(tg_dir.join("docs_hnsw_index.usearch"));
         let _ = std::fs::remove_file(tg_dir.join("docs_hnsw_index.meta"));
