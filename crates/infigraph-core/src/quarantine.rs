@@ -18,6 +18,27 @@ const PREVIOUS_INFIX: &str = "previous";
 /// useful amount and each extra copy is a full graph's worth of disk.
 const PREVIOUS_RETENTION: usize = 1;
 
+/// Byte cap on a single CORRUPT-pool base image (R7.3 / #100). The sittir
+/// incident quarantined a 9.9G corrupt store (40x the healthy rebuild of
+/// the same repo) and filled the disk -- and a corrupt base image's pages
+/// are mostly worthless for forensics anyway; the WAL family plus a
+/// manifest carry the evidence that matters. An oversized base is
+/// therefore dropped (with an R6.3 audit line) in favor of its WAL
+/// siblings and a small manifest recording what was dropped.
+///
+/// The `previous` pool is deliberately NOT size-capped: retention=1
+/// already bounds it to one healthy rollback candidate of about the live
+/// graph's size, and truncating a healthy graph destroys its entire
+/// rollback value.
+///
+/// Overridable via `INFIGRAPH_QUARANTINE_MAX_BYTES` (0 disables the cap).
+fn quarantine_max_bytes() -> u64 {
+    std::env::var("INFIGRAPH_QUARANTINE_MAX_BYTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1024 * 1024 * 1024)
+}
+
 fn now_epoch_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -85,6 +106,38 @@ fn move_graph_aside(
     let quarantine_path = infigraph_dir.join(&quarantine_stem);
     let source = infigraph_dir.join(graph_name);
 
+    // Size cap, corrupt pool only (see `quarantine_max_bytes`). Runs
+    // before the rename so the oversized base never enters the pool at
+    // all: the WAL family still gets relocated below (it shares the stem
+    // with the manifest), preserving the actually-useful evidence.
+    let cap = quarantine_max_bytes();
+    if infix == CORRUPT_INFIX && cap > 0 {
+        let base_size = entry_size_bytes(&source);
+        if base_size > cap {
+            let manifest_path = infigraph_dir.join(format!("{quarantine_stem}.manifest.json"));
+            let manifest = serde_json::json!({
+                "dropped_base_image": source.display().to_string(),
+                "dropped_bytes": base_size,
+                "cap_bytes": cap,
+                "reason": "corrupt base image exceeded INFIGRAPH_QUARANTINE_MAX_BYTES;                            WAL-family siblings retained for forensics",
+                "dropped_at_epoch": ts,
+            });
+            let _ = std::fs::write(
+                &manifest_path,
+                serde_json::to_string_pretty(&manifest).unwrap_or_default(),
+            );
+            remove_entry(&source);
+            crate::audit::audit_log(
+                "quarantine",
+                "drop-oversized-corrupt-base",
+                &format!("{base_size} bytes exceeded the {cap}-byte quarantine cap"),
+                &source.display().to_string(),
+            );
+            relocate_wal_family(infigraph_dir, graph_name, &quarantine_stem, &source);
+            return Ok(manifest_path);
+        }
+    }
+
     std::fs::rename(&source, &quarantine_path).with_context(|| {
         format!(
             "quarantine: rename {} to {}",
@@ -114,7 +167,22 @@ fn move_graph_aside(
     // remove the original, so even a failure removing the original
     // afterward is harmless (the caller's fallback cleanup just finishes
     // that removal; quarantine already holds the evidence).
-    for path in crate::graph::wal_family_paths(&source) {
+    relocate_wal_family(infigraph_dir, graph_name, &quarantine_stem, &source);
+
+    Ok(quarantine_path)
+}
+
+/// Move every WAL-family sibling of `source` beside the pool entry, as
+/// flat files sharing its stem (e.g. "graph.corrupt.<ts>.wal") -- see the
+/// long comment at the call site in `move_graph_aside` for why the
+/// copy+remove fallback inside `move_wal_sibling` is load-bearing.
+fn relocate_wal_family(
+    infigraph_dir: &Path,
+    graph_name: &str,
+    quarantine_stem: &str,
+    source: &Path,
+) {
+    for path in crate::graph::wal_family_paths(source) {
         let name = path.file_name().unwrap_or_default().to_string_lossy();
         // name looks like "<graph_name>.wal" or "<graph_name>.wal.checkpoint";
         // keep everything after "<graph_name>" so the moved-aside name stays
@@ -129,8 +197,36 @@ fn move_graph_aside(
             );
         }
     }
+}
 
-    Ok(quarantine_path)
+/// Total size of a pool entry or source graph: the file's length, or a
+/// directory's recursive sum (legacy directory layout).
+fn entry_size_bytes(path: &Path) -> u64 {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return 0;
+    };
+    if !meta.is_dir() {
+        return meta.len();
+    }
+    let mut total = 0;
+    if let Ok(entries) = std::fs::read_dir(path) {
+        for e in entries.flatten() {
+            total += entry_size_bytes(&e.path());
+        }
+    }
+    total
+}
+
+/// Delete a base entry, dispatching on file-vs-directory (remove_dir_all
+/// errors on a plain file, and that error used to be silently swallowed
+/// elsewhere -- see evict_oldest_if_at_bound's same dispatch).
+fn remove_entry(path: &Path) {
+    let is_dir = std::fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false);
+    if is_dir {
+        let _ = std::fs::remove_dir_all(path);
+    } else {
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 /// First timestamp `>= start_ts` whose pool stem
