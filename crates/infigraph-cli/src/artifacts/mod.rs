@@ -92,6 +92,13 @@ pub(crate) fn apply_resolved_artifact(
         Strategy::Overwrite => {
             let content = resolved_content
                 .ok_or_else(|| anyhow::anyhow!("overwrite artifact has no content"))?;
+            // Substitute install-time tokens ONCE, here, so the bytes the
+            // ownership manifest hashes are the bytes actually on disk --
+            // recording the raw bundled content instead would make every
+            // token-carrying artifact read as "hand-edited" at uninstall
+            // and be preserved forever (caught by
+            // cmd_uninstall_removes_everything_cmd_install_wrote).
+            let content = strategy::substitute_install_tokens(&content).into_owned();
             let outcome = strategy::apply_overwrite(&target_path, &content)?;
             if matches!(outcome, ApplyOutcome::Written) {
                 ownership::record_written(home, &target_path, &content)?;
