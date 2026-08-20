@@ -64,15 +64,29 @@ pub(crate) fn cmd_index(root: &Path, full: bool, no_embed: bool) -> Result<()> {
             // 600s deadline and then reports an opaque timeout -- a
             // plausible everyday case whenever INFIGRAPH_BACKEND is
             // exported from a shell profile.
+            // The pre-dispatch auto-watch (main.rs -> ensure_watcher_running)
+            // SPAWNS the daemon but returns before the child has acquired
+            // watch.lock, so a one-shot liveness probe here raced it: the
+            // #100 incident saw "no daemon is running" moments after
+            // "[auto-watch] Watcher started", and the losing-half daemon
+            // then made the follow-up `infigraph daemon` report "another
+            // watcher is already running". Wait out the startup window
+            // first; if the daemon still isn't up (auto-watch skipped: CI,
+            // current_exe failure), make one explicit start attempt before
+            // giving up with the actionable message.
             let lock_path = root.join(".infigraph").join("watch.lock");
-            if !crate::info_commands::watcher_is_alive(&lock_path) {
-                anyhow::bail!(
-                    "INFIGRAPH_BACKEND=daemon is set but no daemon is running for {}, and a \
-                     full reindex can only be served by one. Start a daemon with \
-                     `infigraph daemon`, or unset INFIGRAPH_BACKEND to run the reindex \
-                     locally in this process.",
-                    root.display()
-                );
+            if !wait_for_daemon(&lock_path, std::time::Duration::from_secs(10)) {
+                ensure_watcher_running(root);
+                if !wait_for_daemon(&lock_path, std::time::Duration::from_secs(10)) {
+                    anyhow::bail!(
+                        "INFIGRAPH_BACKEND=daemon is set but no daemon came up for {} \
+                         (auto-start attempted), and a full reindex can only be served \
+                         by one. Check `infigraph ps` / the daemon log, start one with \
+                         `infigraph daemon`, or unset INFIGRAPH_BACKEND to run the \
+                         reindex locally in this process.",
+                        root.display()
+                    );
+                }
             }
 
             let staging_dir = root.join(".infigraph").join("requests");
@@ -587,6 +601,23 @@ pub(crate) fn ensure_watcher_running(root: &Path) {
             eprintln!("[auto-watch] Failed to start watcher: {e}");
         }
         infigraph_core::watch::daemon::DaemonStartOutcome::AlreadyRunning => {}
+    }
+}
+
+/// Polls `watcher_is_alive` until it turns true or `budget` elapses.
+/// Exists because daemon startup is asynchronous: `ensure_watcher_running`
+/// returns at spawn time, and the child needs a moment to acquire
+/// watch.lock (#100 item 3's race).
+pub(crate) fn wait_for_daemon(lock_path: &Path, budget: std::time::Duration) -> bool {
+    let start = std::time::Instant::now();
+    loop {
+        if crate::info_commands::watcher_is_alive(lock_path) {
+            return true;
+        }
+        if start.elapsed() >= budget {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
     }
 }
 
@@ -1223,6 +1254,55 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    /// #100 item 3: the daemon-liveness probe must tolerate the async gap
+    /// between `ensure_watcher_running` spawning the daemon and the child
+    /// acquiring watch.lock.
+    mod wait_for_daemon_startup_race {
+        use super::super::wait_for_daemon;
+        use std::time::Duration;
+
+        #[test]
+        fn held_lock_returns_true_immediately() {
+            let tmp = tempfile::tempdir().unwrap();
+            let lock_path = tmp.path().join("watch.lock");
+            let _held = infigraph_core::lockfile::try_acquire(&lock_path, "watcher")
+                .unwrap()
+                .unwrap();
+            assert!(wait_for_daemon(&lock_path, Duration::from_millis(50)));
+        }
+
+        #[test]
+        fn no_daemon_times_out_false() {
+            let tmp = tempfile::tempdir().unwrap();
+            let lock_path = tmp.path().join("watch.lock");
+            let start = std::time::Instant::now();
+            assert!(!wait_for_daemon(&lock_path, Duration::from_millis(300)));
+            assert!(start.elapsed() >= Duration::from_millis(300));
+        }
+
+        #[test]
+        fn daemon_coming_up_mid_wait_is_detected() {
+            let tmp = tempfile::tempdir().unwrap();
+            let lock_path = tmp.path().join("watch.lock");
+            let lock_path_clone = lock_path.clone();
+            // Simulates the freshly-spawned daemon acquiring its lock a
+            // beat after the probe starts -- the exact #100 race.
+            let holder = std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(300));
+                let guard = infigraph_core::lockfile::try_acquire(&lock_path_clone, "watcher")
+                    .unwrap()
+                    .unwrap();
+                std::thread::sleep(Duration::from_millis(2000));
+                drop(guard);
+            });
+            assert!(
+                wait_for_daemon(&lock_path, Duration::from_secs(5)),
+                "the probe must see the daemon that came up during the wait"
+            );
+            holder.join().unwrap();
+        }
+    }
 
     /// Regression test: `spawn_scip_child_process` respawns this binary with
     /// `scip_enrich_args(&langs)` as the argv tail. This previously hardcoded

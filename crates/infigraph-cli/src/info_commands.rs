@@ -452,8 +452,22 @@ pub(crate) fn watcher_is_alive(lock_path: &Path) -> bool {
 }
 
 pub(crate) fn acquire_watch_lock(lock_path: &Path) -> Result<infigraph_core::lockfile::LockFile> {
-    infigraph_core::lockfile::try_acquire(lock_path, "cli-watch")?
-        .ok_or_else(|| anyhow::anyhow!("another watcher is already running"))
+    infigraph_core::lockfile::try_acquire(lock_path, "cli-watch")?.ok_or_else(|| {
+        // Name the actual holder (#100 item 4's confusion: "another watcher
+        // is already running" fired right after an auto-watch had spawned
+        // one -- factually true, but unexplained). read_holder is
+        // best-effort: a mid-write payload still yields the generic form.
+        match infigraph_core::lockfile::read_holder(lock_path) {
+            Some(h) => anyhow::anyhow!(
+                "another watcher is already running: {} (PID {}) -- often the auto-watch \
+                 spawned by a recent infigraph command; `infigraph ps` lists it, \
+                 `infigraph watch-stop` stops it",
+                h.role,
+                h.pid
+            ),
+            None => anyhow::anyhow!("another watcher is already running"),
+        }
+    })
 }
 
 pub(crate) fn cmd_scip_import(root: &Path, index_path: &Path) -> Result<()> {
