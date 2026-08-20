@@ -1213,36 +1213,40 @@ where
     // `live_path` would point an operator at a path that's already gone and
     // never say where the real data actually went.
     let retired_path: Option<PathBuf> = if live_path.exists() {
-        // Same backup mechanism as the local `infigraph index --full` path
-        // (R3.2.1/docs/DESIGN-hardening.md §3.2) -- a whole-`.infigraph/`-tree
-        // snapshot, not just the graph file, so a restore brings back graph
-        // and sidecars together instead of leaving them mismatched.
-        // `create_snapshot` only copies; it doesn't remove the original, so
-        // the live graph's base image still needs an explicit removal below
-        // before the rename-swap can claim `live_path` (`fs::rename` can't
-        // reliably overwrite an existing destination on Windows). Its
-        // WAL-family siblings are cleaned up unconditionally further down.
+        // Two backup mechanisms, deliberately layered. create_snapshot gives
+        // a whole-`.infigraph/`-tree safety net matching the local
+        // `infigraph index --full` path (R3.2.1/docs/DESIGN-hardening.md
+        // §3.2), so a restore brings back graph and sidecars together.
+        // retire_previous_graph then does the actual move-aside of the live
+        // graph file -- a *rename*, not a delete, so a failure below (the
+        // swap-in rename itself, or the swapped-in graph failing to reopen)
+        // can restore the exact prior live graph with a single rename back
+        // (see `roll_back_to_retired`), rather than the graph having been
+        // permanently removed before the swap was even attempted -- the gap
+        // an earlier version of this function had, caught by adversarial
+        // review before it shipped.
         match crate::snapshot::create_snapshot(&infigraph_dir) {
-            Ok(dest) => match std::fs::remove_file(&live_path) {
-                Ok(()) => Some(dest),
-                Err(e) => {
-                    let result = crate::daemon_protocol::WriteResult::Err {
-                        message: format!(
-                            "full reindex rebuilt successfully and the pre-reindex state was \
-                             snapshotted to {}, but the live graph at {} could not be removed \
-                             to make way for the swap: {e:#}. The rebuilt graph remains at {}",
-                            dest.display(),
-                            live_path.display(),
-                            rebuilding_path.display()
-                        ),
-                    };
-                    if let Ok(json) = serde_json::to_string(&result) {
-                        let _ = crate::daemon_protocol::write_atomic(reply_path, &json);
+            Ok(_snapshot_dest) => {
+                match crate::quarantine::retire_previous_graph(&infigraph_dir, LIVE_NAME) {
+                    Ok(dest) => Some(dest),
+                    Err(e) => {
+                        let result = crate::daemon_protocol::WriteResult::Err {
+                            message: format!(
+                                "full reindex rebuilt successfully but could not move the old \
+                                 graph aside: {e:#}. The live graph at {} was left untouched; \
+                                 the rebuilt graph remains at {}",
+                                live_path.display(),
+                                rebuilding_path.display()
+                            ),
+                        };
+                        if let Ok(json) = serde_json::to_string(&result) {
+                            let _ = crate::daemon_protocol::write_atomic(reply_path, &json);
+                        }
+                        drop(graph_lock);
+                        return (Some(guard), None);
                     }
-                    drop(graph_lock);
-                    return (Some(guard), None);
                 }
-            },
+            }
             Err(e) => {
                 let result = crate::daemon_protocol::WriteResult::Err {
                     message: format!(
@@ -1297,20 +1301,50 @@ where
             }
         }
     }
+    if let Err(e) = &swap {
+        // The rebuilt graph is verified-good and still sitting at
+        // `rebuilding_path` -- nothing was lost. Roll the prior live graph
+        // back into place immediately, while `graph_lock` is still held
+        // (this is a plain rename, not a `GraphStore::open`, so no
+        // deadlock risk) -- a failed swap must not leave the project
+        // without a live graph at all, closing the outage window an
+        // earlier version of this function had (caught by adversarial
+        // review before it shipped).
+        let rollback_note = roll_back_to_retired(&live_path, &retired_path);
+        drop(graph_lock);
+        eprintln!(
+            "[daemon] full-reindex swap failed after a successful rebuild: {e} -- \
+             {rollback_note}; the rebuilt graph is at {} -- check both by hand",
+            rebuilding_path.display()
+        );
+        let result = crate::daemon_protocol::WriteResult::Err {
+            message: format!(
+                "full reindex rebuilt successfully but the swap failed: {e}. {rollback_note}; \
+                 the rebuilt graph is at {}",
+                rebuilding_path.display()
+            ),
+        };
+        if let Ok(json) = serde_json::to_string(&result) {
+            let _ = crate::daemon_protocol::write_atomic(reply_path, &json);
+        }
+        return (Some(guard), None);
+    }
+    // graph_lock must be released before watch_db below -- it opens a fresh
+    // GraphStore, which takes the same lock for schema init, and this
+    // process already holding it would deadlock against itself.
     drop(graph_lock);
 
-    match swap {
-        Ok(()) => {
-            // Reopen and reconcile embeddings against the NEW graph --
-            // update_embeddings queries the live symbol set and prunes
-            // anything not in it, so this converges embeddings.bin to the
-            // rebuilt graph regardless of whether it was wiped first (it
-            // wasn't, deliberately).
-            if let Ok(prism) = watch_db(root, make_registry, held) {
-                if let Some(backend) = prism.backend() {
-                    if let Err(e) = crate::embed::update_embeddings(backend, root, &[]) {
-                        eprintln!("[daemon] full-reindex: embedding update failed: {e}");
-                    }
+    // The swap succeeded -- verify the new graph actually opens before
+    // declaring success and discarding the ability to roll back.
+    match watch_db(root, make_registry, held) {
+        Ok(prism) => {
+            // Reconcile embeddings against the NEW graph -- update_embeddings
+            // queries the live symbol set and prunes anything not in it, so
+            // this converges embeddings.bin to the rebuilt graph regardless
+            // of whether it was wiped first (it wasn't, deliberately).
+            if let Some(backend) = prism.backend() {
+                if let Err(e) = crate::embed::update_embeddings(backend, root, &[]) {
+                    eprintln!("[daemon] full-reindex: embedding update failed: {e}");
                 }
             }
             let result = crate::daemon_protocol::WriteResult::FullReindexOk {
@@ -1323,29 +1357,36 @@ where
             }
             (Some(guard), Some(detected_languages))
         }
-        Err(e) => {
-            // The rebuilt graph is verified-good and still sitting at
-            // `rebuilding_path` -- nothing was lost. Report the old
-            // graph's real current location: the pre-reindex snapshot it
-            // was preserved in, or "no prior graph" if this was a
-            // from-scratch build.
-            let old_graph_location = match &retired_path {
-                Some(q) => format!(
-                    "the old graph was preserved in the pre-reindex snapshot at {}",
-                    q.display()
+        Err(reopen_err) => {
+            // The swapped-in graph doesn't even reopen. Quarantine it as
+            // verified-bad (R3.1.2) and roll the prior live graph back into
+            // place rather than leaving a broken graph live or the project
+            // graph-less. Re-acquire graph_lock just for these renames (no
+            // GraphStore::open happens here, so no deadlock risk against
+            // the lock dropped above) -- otherwise a concurrent single-file
+            // write could race the rollback, the same class of gap
+            // `full_reindex_wipe` closes on the local path.
+            let rollback_note = match crate::lockfile::acquire(
+                &live_path.with_extension("lock"),
+                "full-reindex-rollback",
+                std::time::Duration::from_secs(5),
+            ) {
+                Ok(_lock) => {
+                    let _ = crate::quarantine::quarantine_graph(&infigraph_dir, LIVE_NAME);
+                    roll_back_to_retired(&live_path, &retired_path)
+                }
+                Err(e) => format!(
+                    "could not acquire the graph lock to roll back: {e:#} -- manual recovery needed"
                 ),
-                None => "there was no prior graph to preserve".to_string(),
             };
             eprintln!(
-                "[daemon] full-reindex swap failed after a successful rebuild: {e} -- \
-                 {old_graph_location}; the rebuilt graph is at {} -- check both by hand",
-                rebuilding_path.display()
+                "[daemon] full-reindex: swapped-in graph failed to reopen: {reopen_err:#} -- \
+                 quarantined it; {rollback_note}"
             );
             let result = crate::daemon_protocol::WriteResult::Err {
                 message: format!(
-                    "full reindex rebuilt successfully but the swap failed: {e}. Manual \
-                     recovery needed: {old_graph_location}; the rebuilt graph is at {}",
-                    rebuilding_path.display()
+                    "full reindex swap completed but the new graph failed to reopen: \
+                     {reopen_err:#}. The broken graph was quarantined; {rollback_note}"
                 ),
             };
             if let Ok(json) = serde_json::to_string(&result) {
@@ -1353,6 +1394,28 @@ where
             }
             (Some(guard), None)
         }
+    }
+}
+
+/// Attempt to restore the graph `retire_previous_graph` moved aside (see
+/// `finish_full_reindex`'s `retired_path`) back to `live_path`, after
+/// either the swap-in rename failed or the swapped-in graph failed to
+/// reopen. Returns a human-readable note for both the daemon log and the
+/// `WriteResult` error message.
+fn roll_back_to_retired(live_path: &Path, retired_path: &Option<PathBuf>) -> String {
+    match retired_path {
+        Some(prev) if prev.exists() => match std::fs::rename(prev, live_path) {
+            Ok(()) => "the prior live graph was restored".to_string(),
+            Err(e) => format!(
+                "the prior live graph at {} could NOT be restored: {e:#} -- manual recovery needed",
+                prev.display()
+            ),
+        },
+        Some(prev) => format!(
+            "no prior graph to restore from (expected at {}, already gone)",
+            prev.display()
+        ),
+        None => "there was no prior graph to restore (this was a from-scratch build)".to_string(),
     }
 }
 

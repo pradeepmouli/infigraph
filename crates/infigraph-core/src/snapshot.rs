@@ -18,6 +18,9 @@ const SNAPSHOT_RETENTION: usize = 2;
 
 const SNAPSHOTS_DIR: &str = "snapshots";
 
+/// Staging area for an in-progress restore (see `restore_from_snapshot`).
+const RESTORE_STAGING_DIR: &str = "restore.staging";
+
 /// Base name of the live graph file within `.infigraph/` (matches
 /// `watch::mod::LIVE_NAME`; duplicated rather than shared because that
 /// constant is private to the daemon's swap logic).
@@ -32,13 +35,18 @@ fn now_epoch_secs() -> u64 {
 
 /// Entries never copied into -- or removed by -- a snapshot: the lock a
 /// caller holds across the wipe this precedes, the snapshots pool itself
-/// (never nest a snapshot inside its own future snapshot), and the
+/// (never nest a snapshot inside its own future snapshot), the
 /// quarantine/retired-previous pools (already-bounded backup data of their
 /// own -- folding them into every new snapshot would compound pool growth
-/// without adding recovery value, since they're independently restorable).
+/// without adding recovery value, since they're independently restorable),
+/// and an in-progress restore's staging area (it holds a restore point's
+/// full content outside the snapshots pool precisely so pool operations
+/// like eviction can't touch it -- folding it into a new snapshot or
+/// deleting it mid-wipe would defeat that).
 pub(crate) fn should_skip(name: &str) -> bool {
     name == "index.lock"
         || name == SNAPSHOTS_DIR
+        || name == RESTORE_STAGING_DIR
         || name.starts_with("graph.corrupt.")
         || name.starts_with("graph.previous.")
 }
@@ -243,10 +251,44 @@ fn restore_from_snapshot(infigraph_dir: &Path, timestamp: u64) -> Result<()> {
         anyhow::bail!("snapshot {timestamp} not found at {}", src.display());
     }
 
+    // Move the chosen snapshot OUT of the snapshots pool namespace before
+    // doing anything else. Two reasons, both found by adversarial review
+    // before this shipped:
+    //
+    // 1. The safety-net create_snapshot() call below evicts the pool down
+    //    to its retention bound as part of adding a new entry. If `src` is
+    //    the oldest of the (at most SNAPSHOT_RETENTION) retained snapshots
+    //    -- which is exactly what "restore the oldest one" means -- that
+    //    eviction would delete `src` before it's ever read, and the
+    //    function would then wipe live state and fail trying to read a
+    //    source that no longer exists, having already destroyed the live
+    //    graph with nothing to replace it.
+    // 2. Renaming (not copying) `src` out removes it from the pool's
+    //    eviction accounting entirely, so a different, non-selected
+    //    snapshot doesn't get silently evicted as a side effect of
+    //    restoring this one (copying instead of moving would leave `src`
+    //    counted as "still in the pool" and eligible for eviction if it's
+    //    the oldest, potentially evicting the *other* entry instead --
+    //    surprising and unrelated to what the caller asked to restore).
+    let staging = infigraph_dir.join(RESTORE_STAGING_DIR);
+    if staging.exists() {
+        std::fs::remove_dir_all(&staging)
+            .with_context(|| format!("restore: clear stale staging dir {}", staging.display()))?;
+    }
+    std::fs::rename(&src, &staging)
+        .with_context(|| format!("restore: stage {} to {}", src.display(), staging.display()))?;
+
     // Safety net: snapshot the current live state before overwriting it, so
-    // restoring the wrong point is itself just another restore away.
+    // restoring the wrong point is itself just another restore away. Safe
+    // now that the chosen point's content already lives in `staging`,
+    // independent of the pool this call's eviction touches.
     create_snapshot(infigraph_dir)?;
 
+    // Live state is only touched from here on, now that the full restored
+    // tree already exists independently in `staging` -- a failure partway
+    // through the wipe or the final copy below can no longer leave the
+    // project with neither the old state nor the new one; at worst, `staging`
+    // still holds the complete restored tree for manual recovery.
     if infigraph_dir.exists() {
         for entry in std::fs::read_dir(infigraph_dir)
             .with_context(|| format!("restore: read_dir {}", infigraph_dir.display()))?
@@ -266,12 +308,15 @@ fn restore_from_snapshot(infigraph_dir: &Path, timestamp: u64) -> Result<()> {
         }
     }
 
-    for entry in std::fs::read_dir(&src)
-        .with_context(|| format!("restore: read_dir {}", src.display()))?
+    for entry in std::fs::read_dir(&staging)
+        .with_context(|| format!("restore: read_dir {}", staging.display()))?
         .flatten()
     {
         copy_entry_recursive(&entry.path(), &infigraph_dir.join(entry.file_name()))?;
     }
+
+    std::fs::remove_dir_all(&staging)
+        .with_context(|| format!("restore: clean up staging dir {}", staging.display()))?;
 
     Ok(())
 }
@@ -439,12 +484,74 @@ mod tests {
             std::fs::read_to_string(tg.join("graph")).unwrap(),
             "old-live"
         );
-        // The pre-restore state was itself snapshotted before being wiped.
+        // The pre-restore state was itself snapshotted before being wiped,
+        // and the restored point is consumed (moved out of staging into
+        // live) rather than also lingering as a separate pool entry -- so
+        // exactly one snapshot remains: the fresh safety-net one.
         let snapshots_after: Vec<_> = std::fs::read_dir(tg.join(SNAPSHOTS_DIR))
             .unwrap()
             .flatten()
             .collect();
-        assert_eq!(snapshots_after.len(), 2);
+        assert_eq!(snapshots_after.len(), 1);
+        assert_eq!(
+            std::fs::read_to_string(snapshots_after[0].path().join("graph")).unwrap(),
+            "newer-live-to-be-discarded",
+            "the safety-net snapshot must hold the state that was live just before the restore"
+        );
+    }
+
+    #[test]
+    fn restore_from_oldest_snapshot_at_retention_bound_succeeds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tg = tmp.path().join(".infigraph");
+
+        write(&tg.join("graph"), "state-a");
+        let snap_a = create_snapshot(&tg).unwrap();
+        let ts_a: u64 = snap_a
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+
+        write(&tg.join("graph"), "state-b");
+        let snap_b = create_snapshot(&tg).unwrap();
+        let ts_b: u64 = snap_b
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+
+        // Pool is now at exactly SNAPSHOT_RETENTION (2) entries: snap_a
+        // (oldest), snap_b.
+        write(&tg.join("graph"), "state-c-current-live");
+
+        // Restoring the OLDEST snapshot must succeed even with the pool
+        // already at its retention bound. Adversarial review found that
+        // the safety-net create_snapshot() call inside restore_from_snapshot
+        // would otherwise evict snap_a -- the oldest pool member -- before
+        // it was ever read, so the function went on to wipe live state and
+        // then fail reading a source that no longer existed, leaving
+        // neither the old nor the new state intact.
+        let point = RestorePoint {
+            kind: RestorePointKind::Snapshot,
+            timestamp: ts_a,
+            path: snap_a.clone(),
+        };
+        restore(&tg, &point).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(tg.join("graph")).unwrap(),
+            "state-a",
+            "restoring the oldest snapshot at the retention bound must succeed and apply its content"
+        );
+        assert!(
+            tg.join(SNAPSHOTS_DIR).join(ts_b.to_string()).exists(),
+            "the non-selected snapshot must not be evicted as a side effect of the restore"
+        );
     }
 
     #[test]

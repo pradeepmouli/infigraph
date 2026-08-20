@@ -13,6 +13,21 @@ impl GraphStore {
     /// Removes old data for the file first (incremental update).
     pub fn upsert_file(&self, extraction: &FileExtraction) -> Result<()> {
         let lock = self.write_lock()?;
+
+        // Preflight disk headroom before any COPY/UNWIND write (see
+        // store_util::check_disk_headroom). This is the single-file write
+        // entry point `Infigraph::index_file` (a public API) reaches --
+        // distinct from, and not covered by, the bulk-path preflight in
+        // `KuzuBackend::upsert_files_bulk`.
+        if let Some(dir) = self.db_dir() {
+            let projected = super::store_util::estimate_extractions_write_bytes(
+                std::slice::from_ref(extraction),
+            );
+            if let Err(shortfall) = super::store_util::check_disk_headroom(dir, projected) {
+                anyhow::bail!("refusing to index -- {shortfall}");
+            }
+        }
+
         let conn = self.connection()?;
         self.upsert_file_conn(&conn, extraction, &lock)
     }

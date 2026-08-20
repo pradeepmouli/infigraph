@@ -261,3 +261,45 @@ fn test_full_reindex_wipe_snapshot_survives_the_wipe() {
         "index.lock must survive"
     );
 }
+
+/// `full_reindex_wipe` must serialize against `graph.lock` -- not just
+/// `index.lock` -- because `GraphStore::upsert_file` (reachable from the
+/// public `Infigraph::index_file` API) only takes `graph.lock`, so a
+/// concurrent single-file write is never blocked by `index.lock` alone.
+/// Caught by adversarial review before this shipped: without this,
+/// `full_reindex_wipe` could snapshot or delete graph state while another
+/// writer was actively modifying it.
+#[test]
+fn test_full_reindex_wipe_serializes_against_graph_lock_holder() {
+    let dir = TempDir::new().unwrap();
+    let tg_dir = dir.path().join(".infigraph");
+    std::fs::create_dir_all(&tg_dir).unwrap();
+    std::fs::write(tg_dir.join("graph"), b"live").unwrap();
+
+    // Simulate a concurrent single-file writer holding the same graph.lock
+    // that GraphStore::upsert_file/upsert_files_bulk take for every real
+    // write.
+    let graph_lock_path = infigraph_core::graph::store::db_lock_path(&tg_dir.join("graph"));
+    let held =
+        infigraph_core::lockfile::acquire(&graph_lock_path, "simulated-writer", Duration::ZERO)
+            .unwrap();
+
+    let tg_dir_clone = tg_dir.clone();
+    let handle = std::thread::spawn(move || full_reindex_wipe(&tg_dir_clone));
+
+    // Give the spawned call a moment to reach (and block on) lock
+    // acquisition -- it must not have completed yet, proving it's actually
+    // waiting on the same lock rather than racing ahead unprotected.
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(
+        !handle.is_finished(),
+        "full_reindex_wipe must block while graph.lock is held by another writer"
+    );
+
+    drop(held);
+    let result = handle.join().unwrap();
+    assert!(
+        result.is_ok(),
+        "full_reindex_wipe should proceed once the graph lock is released: {result:?}"
+    );
+}

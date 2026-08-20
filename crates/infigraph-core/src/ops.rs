@@ -118,7 +118,24 @@ pub fn wipe_infigraph_preserving_index_lock(tg_dir: &Path) -> std::io::Result<()
 /// Callers are responsible for holding whatever lock serializes writes to
 /// `tg_dir` before calling this (typically `index.lock` via
 /// `begin_index_op`) — mirrors `snapshot::create_snapshot`'s own contract.
+/// That lock alone is *not* sufficient, though: `index.lock` only coalesces
+/// callers that go through `begin_index_op` (full/incremental `index()`,
+/// group/multi-repo builds) — it does not cover `GraphStore::upsert_file`,
+/// which only takes the finer-grained `graph.lock` and is reachable from the
+/// public `Infigraph::index_file` API. Without also taking `graph.lock`
+/// here, a concurrent single-file write could run against the graph while
+/// this function is mid-copy or mid-delete (caught by adversarial review
+/// before this shipped). Acquiring it here blocks that class of writer out
+/// for the duration of the snapshot+wipe, same as every other graph writer.
 pub fn full_reindex_wipe(tg_dir: &Path) -> Result<()> {
+    let graph_lock_path = crate::graph::store::db_lock_path(&tg_dir.join("graph"));
+    let _graph_lock = crate::lockfile::acquire(
+        &graph_lock_path,
+        "full-reindex-wipe",
+        std::time::Duration::from_secs(30),
+    )
+    .context("could not acquire the graph write lock for the pre-reindex snapshot+wipe")?;
+
     crate::snapshot::create_snapshot(tg_dir)
         .context("pre-reindex snapshot failed; aborting full reindex")?;
 
