@@ -212,6 +212,13 @@ where
     let sentinel = root.join(".infigraph").join("watch.stop");
 
     const MAX_RESTARTS: u32 = 3;
+    // R7.4 (#84): above this many files in one debounce window, the batch
+    // coalesces into a single whole-project pass instead of per-file
+    // updates. Overridable via INFIGRAPH_STORM_THRESHOLD for tests/tuning.
+    let storm_threshold: usize = std::env::var("INFIGRAPH_STORM_THRESHOLD")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(200);
     let mut restart_count: u32 = 0;
 
     // Create initial watcher — factored into a closure for restart.
@@ -453,13 +460,7 @@ where
         if !batch.is_empty() && batch.is_ready() {
             let paths = batch.drain();
             let mut q = queue.lock().unwrap();
-            for path in paths {
-                let rel = path
-                    .strip_prefix(root)
-                    .map(|r| r.to_string_lossy().replace('\\', "/"))
-                    .unwrap_or_else(|_| path.to_string_lossy().replace('\\', "/"));
-                q.add_raw(rel);
-            }
+            flush_batch_into_queue(&mut q, paths, root, storm_threshold);
         }
 
         match rx.recv_timeout(Duration::from_millis(200)) {
@@ -886,7 +887,41 @@ where
     })
 }
 
-/// Open a short-lived Infigraph instance for batch work.
+// (open_transient below opens a short-lived Infigraph instance for batch work.)
+
+/// Feeds one drained debounce batch into the shared queue (R7.4, #84).
+/// A reindex storm (mass git checkout, branch switch) floods the batch
+/// with hundreds of per-file events; above `storm_threshold`, one
+/// whole-project pass beats N per-file extractions -- the drain's
+/// scan_changed_files hash-diffs the tree, so unchanged files cost a hash
+/// each while every actually-changed file is still picked up, including
+/// any the storm's event flood dropped or that arrived after the window
+/// closed, and the scan's stale-file sweep prunes removals too.
+fn flush_batch_into_queue(
+    q: &mut crate::watch::queue::IndexWorkQueue,
+    paths: Vec<PathBuf>,
+    root: &Path,
+    storm_threshold: usize,
+) {
+    if paths.len() > storm_threshold {
+        eprintln!(
+            "[watch] {} files changed in one debounce window (> {}) -- \
+             coalescing into a single whole-project pass",
+            paths.len(),
+            storm_threshold
+        );
+        q.mark_whole_project();
+        return;
+    }
+    for path in paths {
+        let rel = path
+            .strip_prefix(root)
+            .map(|r| r.to_string_lossy().replace('\\', "/"))
+            .unwrap_or_else(|_| path.to_string_lossy().replace('\\', "/"));
+        q.add_raw(rel);
+    }
+}
+
 fn open_transient(root: &Path, registry: &Arc<crate::lang::LanguageRegistry>) -> Result<Infigraph> {
     // Reuses the watch session's already-built registry (#58): building the
     // 62-pack registry takes seconds in debug builds, and doing it again
@@ -2059,5 +2094,51 @@ mod tests {
             Some(vec!["foo.py".to_string()]),
             "the waiter's own scoped paths must also be relative"
         );
+    }
+}
+
+#[cfg(test)]
+mod storm_coalescing {
+    use crate::watch::flush_batch_into_queue;
+    use crate::watch::queue::IndexWorkQueue;
+    use std::path::{Path, PathBuf};
+
+    fn paths(root: &Path, n: usize) -> Vec<PathBuf> {
+        (0..n).map(|i| root.join(format!("f{i}.py"))).collect()
+    }
+
+    #[test]
+    fn under_threshold_batches_enqueue_per_file_raw_items() {
+        let root = Path::new("/proj");
+        let mut q = IndexWorkQueue::new();
+        flush_batch_into_queue(&mut q, paths(root, 3), root, 200);
+        let drained = q.drain();
+        assert!(!drained.whole_project);
+        assert_eq!(drained.items.len(), 3);
+        assert!(drained.items.contains_key("f0.py"), "{:?}", drained.items);
+    }
+
+    #[test]
+    fn storm_sized_batches_coalesce_into_one_whole_project_pass() {
+        let root = Path::new("/proj");
+        let mut q = IndexWorkQueue::new();
+        flush_batch_into_queue(&mut q, paths(root, 201), root, 200);
+        let drained = q.drain();
+        assert!(drained.whole_project, "must fall back to one scan pass");
+        assert!(
+            drained.items.is_empty(),
+            "no per-file items alongside the whole-project pass: {:?}",
+            drained.items.len()
+        );
+    }
+
+    #[test]
+    fn threshold_is_exclusive_a_batch_exactly_at_it_stays_per_file() {
+        let root = Path::new("/proj");
+        let mut q = IndexWorkQueue::new();
+        flush_batch_into_queue(&mut q, paths(root, 200), root, 200);
+        let drained = q.drain();
+        assert!(!drained.whole_project);
+        assert_eq!(drained.items.len(), 200);
     }
 }
