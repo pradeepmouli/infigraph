@@ -204,10 +204,11 @@ pub trait GraphBackend: Send + Sync {
         Ok(())
     }
 
-    /// Current graph generation (R3.3.3/docs/DESIGN-hardening.md §3.3.3) --
-    /// a monotonically incremented counter bumped once per completed write.
-    /// Used by sidecar writers to record which generation they were built
-    /// from, so a stale sidecar can be detected rather than served.
+    /// Current AST generation (R3.3.3/docs/DESIGN-hardening.md §3.3.3) --
+    /// a monotonically incremented counter bumped once per completed write
+    /// (every reindex, including watcher batches). Used by sidecar writers
+    /// to record which generation they were built from, so a stale sidecar
+    /// can be detected rather than served.
     /// Default: 0, meaning "generation tracking unsupported/unknown" for
     /// this backend -- callers must treat 0 as a sentinel, not a real
     /// generation, and skip staleness comparison rather than treating every
@@ -215,7 +216,18 @@ pub trait GraphBackend: Send + Sync {
     /// (local, single-writer graphs are exactly what this tracks; remote
     /// Neo4j and the daemon client relay are out of scope, same as R7.2's
     /// disk-preflight coverage).
-    fn current_generation(&self) -> Result<i64> {
+    fn current_ast_generation(&self) -> Result<i64> {
+        Ok(0)
+    }
+
+    /// Current SCIP-enrichment generation (R3.3.4/docs/DESIGN-hardening.md
+    /// §3.3.4) -- a counter bumped only when `scip::import_scip_index`
+    /// actually runs, never by an ordinary AST reindex. Comparing this
+    /// against `current_ast_generation` is what lets `doctor` surface
+    /// "SCIP enrichment is behind the live-watched graph" instead of
+    /// leaving that drift silent. Same 0-is-a-sentinel contract and
+    /// `KuzuBackend`-only override as `current_ast_generation`.
+    fn current_scip_generation(&self) -> Result<i64> {
         Ok(0)
     }
 

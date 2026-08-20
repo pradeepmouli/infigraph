@@ -252,52 +252,55 @@ impl GraphStore {
         Ok(())
     }
 
-    /// Bump the graph's generation counter (R3.3.3/docs/DESIGN-hardening.md
+    /// Bump the graph's AST generation counter (R3.3.3/docs/DESIGN-hardening.md
     /// §3.3.3) by 1, creating it at 1 on the very first write, and return
-    /// the new value. Every real write path calls this once its write
-    /// succeeds, so a sidecar that records the generation it was built from
-    /// can detect drift against the live graph.
+    /// the new value. Every real AST write path calls this once its write
+    /// succeeds (full reindex, incremental, and watcher batches alike), so a
+    /// sidecar that records the generation it was built from can detect
+    /// drift against the live graph.
     ///
     /// Takes an already-open `conn` and the caller's `WriteLock` witness --
     /// mirrors the `_conn` convention used by `upsert_file_conn` etc., since
     /// every call site already holds both by the time its write completes.
-    pub(crate) fn bump_generation_conn(
+    pub fn bump_ast_generation_conn(
         &self,
         conn: &Connection<'_>,
         _witness: &WriteLock,
     ) -> Result<i64> {
-        conn.query(
-            "MERGE (g:GraphMeta {id: 'singleton'}) \
-             ON CREATE SET g.generation = 1 \
-             ON MATCH SET g.generation = g.generation + 1",
-        )
-        .map_err(|e| anyhow::anyhow!("failed to bump graph generation: {e}"))?;
-        let mut result = conn
-            .query("MATCH (g:GraphMeta {id: 'singleton'}) RETURN g.generation")
-            .map_err(|e| anyhow::anyhow!("failed to read graph generation after bump: {e}"))?;
-        let row = result
-            .next()
-            .context("GraphMeta singleton missing immediately after MERGE")?;
-        let val = row
-            .first()
-            .context("graph generation query returned an empty row")?;
-        val.to_string()
-            .parse()
-            .context("graph generation value is not a valid integer")
+        bump_generation_field(conn, "ast_generation")
     }
 
-    /// Read the graph's current generation without bumping it. Returns 0
+    /// Bump the graph's SCIP-enrichment generation counter
+    /// (R3.3.4/docs/DESIGN-hardening.md §3.3.4) by 1. Unlike
+    /// `ast_generation`, this only advances when `scip::import_scip_index`
+    /// actually runs -- the watcher's incremental reindex never calls it, so
+    /// `scip_generation` falling behind `ast_generation` is exactly the
+    /// staleness R3.3.4 exists to surface.
+    pub fn bump_scip_generation_conn(
+        &self,
+        conn: &Connection<'_>,
+        _witness: &WriteLock,
+    ) -> Result<i64> {
+        bump_generation_field(conn, "scip_generation")
+    }
+
+    /// Read the graph's current AST generation without bumping it. Returns 0
     /// for a graph that has never had a write bump the counter (e.g. a
     /// freshly opened, never-indexed database) -- callers comparing a
     /// sidecar's recorded generation against this should treat 0 as "no
     /// generation recorded yet", not a real generation value.
-    pub fn current_generation(&self) -> Result<i64> {
-        let conn = self.connection()?;
-        Ok(count_query(
-            &conn,
-            "MATCH (g:GraphMeta {id: 'singleton'}) RETURN g.generation",
-        )
-        .unwrap_or(0) as i64)
+    pub fn current_ast_generation(&self) -> Result<i64> {
+        read_generation_field(self, "ast_generation")
+    }
+
+    /// Read the graph's current SCIP-enrichment generation without bumping
+    /// it. Returns 0 both for "never indexed at all" and for "indexed, but
+    /// SCIP enrichment has never run" (e.g. no applicable SCIP indexer for
+    /// the project's languages) -- callers must not treat a bare 0 as
+    /// staleness on its own; see `doctor::check_scip_staleness` for the
+    /// actual "meaningfully behind" comparison.
+    pub fn current_scip_generation(&self) -> Result<i64> {
+        read_generation_field(self, "scip_generation")
     }
 
     pub fn connection(&self) -> Result<Connection<'_>> {
@@ -461,6 +464,64 @@ fn count_query(conn: &Connection, query: &str) -> Result<u64> {
     Ok(0)
 }
 
+/// Shared implementation behind `bump_ast_generation_conn`/
+/// `bump_scip_generation_conn`: increment the named `GraphMeta.<field>`
+/// column by 1 (creating the singleton row at 1 if it doesn't exist yet)
+/// and return the new value. `field` is always a `&'static str` literal
+/// passed by the two typed callers above, never external input, so
+/// interpolating it directly into the query is safe.
+///
+/// `ON CREATE` must initialize *both* GraphMeta columns, not just `field`:
+/// the singleton row is shared between the two counters, so if it doesn't
+/// exist yet, this could be the first bump of either one. Setting only the
+/// bumped field would leave the other one NULL, and a later bump of that
+/// other field would then compute `NULL + 1` = NULL (caught by
+/// `scip_generation_starts_at_zero_and_bumps_independently_of_ast_generation`
+/// before this shipped, in the exact sequence: two ast bumps create the row
+/// with only ast_generation set, then a scip bump found scip_generation
+/// NULL).
+fn bump_generation_field(conn: &Connection, field: &'static str) -> Result<i64> {
+    let (ast_init, scip_init) = match field {
+        "ast_generation" => (1, 0),
+        "scip_generation" => (0, 1),
+        other => unreachable!("bump_generation_field called with unexpected field {other:?}"),
+    };
+    conn.query(&format!(
+        "MERGE (g:GraphMeta {{id: 'singleton'}}) \
+         ON CREATE SET g.ast_generation = {ast_init}, g.scip_generation = {scip_init} \
+         ON MATCH SET g.{field} = g.{field} + 1"
+    ))
+    .map_err(|e| anyhow::anyhow!("failed to bump graph {field}: {e}"))?;
+    let mut result = conn
+        .query(&format!(
+            "MATCH (g:GraphMeta {{id: 'singleton'}}) RETURN g.{field}"
+        ))
+        .map_err(|e| anyhow::anyhow!("failed to read graph {field} after bump: {e}"))?;
+    let row = result
+        .next()
+        .context("GraphMeta singleton missing immediately after MERGE")?;
+    let val = row
+        .first()
+        .with_context(|| format!("graph {field} query returned an empty row"))?;
+    val.to_string()
+        .parse()
+        .with_context(|| format!("graph {field} value is not a valid integer"))
+}
+
+/// Shared implementation behind `current_ast_generation`/
+/// `current_scip_generation`: read `GraphMeta.<field>` without bumping it.
+/// Returns 0 (see both callers' doc comments for what 0 means for each
+/// field) when the singleton row doesn't exist or the field can't be
+/// parsed.
+fn read_generation_field(store: &GraphStore, field: &'static str) -> Result<i64> {
+    let conn = store.connection()?;
+    Ok(count_query(
+        &conn,
+        &format!("MATCH (g:GraphMeta {{id: 'singleton'}}) RETURN g.{field}"),
+    )
+    .unwrap_or(0) as i64)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -547,26 +608,53 @@ mod tests {
     }
 
     #[test]
-    fn generation_starts_at_zero_and_bumps_monotonically() {
+    fn ast_generation_starts_at_zero_and_bumps_monotonically() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("graph");
         let store = GraphStore::open(&db_path).unwrap();
 
         assert_eq!(
-            store.current_generation().unwrap(),
+            store.current_ast_generation().unwrap(),
             0,
-            "a never-bumped graph reports generation 0"
+            "a never-bumped graph reports ast_generation 0"
         );
 
         let lock = store.write_lock().unwrap();
         let conn = store.connection().unwrap();
 
-        let first = store.bump_generation_conn(&conn, &lock).unwrap();
+        let first = store.bump_ast_generation_conn(&conn, &lock).unwrap();
         assert_eq!(first, 1, "the first bump creates the counter at 1");
-        assert_eq!(store.current_generation().unwrap(), 1);
+        assert_eq!(store.current_ast_generation().unwrap(), 1);
 
-        let second = store.bump_generation_conn(&conn, &lock).unwrap();
+        let second = store.bump_ast_generation_conn(&conn, &lock).unwrap();
         assert_eq!(second, 2, "each subsequent bump increments by 1");
-        assert_eq!(store.current_generation().unwrap(), 2);
+        assert_eq!(store.current_ast_generation().unwrap(), 2);
+    }
+
+    #[test]
+    fn scip_generation_starts_at_zero_and_bumps_independently_of_ast_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("graph");
+        let store = GraphStore::open(&db_path).unwrap();
+
+        let lock = store.write_lock().unwrap();
+        let conn = store.connection().unwrap();
+
+        // AST-only writes (watcher batches, ordinary reindexes) must never
+        // move scip_generation -- that's the entire point of R3.3.4's split.
+        store.bump_ast_generation_conn(&conn, &lock).unwrap();
+        store.bump_ast_generation_conn(&conn, &lock).unwrap();
+        assert_eq!(store.current_ast_generation().unwrap(), 2);
+        assert_eq!(
+            store.current_scip_generation().unwrap(),
+            0,
+            "ast bumps must not advance scip_generation"
+        );
+
+        let scip_first = store.bump_scip_generation_conn(&conn, &lock).unwrap();
+        assert_eq!(scip_first, 1);
+        // And the reverse: a SCIP bump must not advance ast_generation.
+        assert_eq!(store.current_ast_generation().unwrap(), 2);
+        assert_eq!(store.current_scip_generation().unwrap(), 1);
     }
 }

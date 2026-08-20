@@ -21,6 +21,15 @@ pub const MIGRATIONS: &[&str] = &[
     // table of the same name would clash with that existing table's schema).
     "CREATE REL TABLE IF NOT EXISTS INJECTS_DEPENDENCY(FROM Symbol TO Symbol)",
     "CREATE REL TABLE IF NOT EXISTS REGISTERS_MIDDLEWARE(FROM Symbol TO Symbol)",
+    // R3.3.4 (docs/DESIGN-hardening.md §3.3.4): split the single R3.3.3
+    // `generation` counter into two, so SCIP-enrichment staleness relative
+    // to AST-only watcher reindexes is a distinguishable, surfaceable gap
+    // rather than folded into one number. Existing rows from the R3.3.3-only
+    // schema (shipped one commit earlier on this branch) get these columns
+    // via ALTER ADD; the old `generation` column is left as harmless,
+    // unused deadweight rather than attempting a Kuzu column rename/drop.
+    "ALTER TABLE GraphMeta ADD ast_generation INT64 DEFAULT 0",
+    "ALTER TABLE GraphMeta ADD scip_generation INT64 DEFAULT 0",
 ];
 
 /// Kuzu schema DDL for the infigraph graph.
@@ -114,13 +123,18 @@ pub const CREATE_SCHEMA: &[&str] = &[
     "CREATE REL TABLE IF NOT EXISTS HAS_CONFIG(FROM Symbol TO ConfigBinding)",
     "CREATE REL TABLE IF NOT EXISTS RESOLVES_TO(FROM Symbol TO Symbol, mechanism STRING, config_source STRING)",
     "CREATE REL TABLE IF NOT EXISTS TAINT_FLOW(FROM Symbol TO Symbol, source_kind STRING, sink_kind STRING, path STRING)",
-    // R3.3.3 (docs/DESIGN-hardening.md §3.3.3): a single-row table holding a
-    // monotonically incremented generation ID, bumped once per completed
-    // write to the graph. Sidecars (embeddings.bin etc.) record the
-    // generation they were built from; a sidecar from a stale generation is
-    // treated as unusable rather than served, so search results never
-    // silently drift from what's actually in the graph.
-    "CREATE NODE TABLE IF NOT EXISTS GraphMeta(id STRING, generation INT64, PRIMARY KEY(id))",
+    // R3.3.3/R3.3.4 (docs/DESIGN-hardening.md §3.3.3-4): a single-row table
+    // holding two monotonically incremented generation counters.
+    // `ast_generation` is bumped once per completed write to the graph
+    // (every reindex, including watcher batches) -- sidecars (embeddings.bin
+    // etc.) record the generation they were built from, so a sidecar from a
+    // stale generation is detectable rather than silently served.
+    // `scip_generation` is bumped only by an explicit SCIP-enrichment run,
+    // which the watcher's AST-only incremental reindex never triggers on its
+    // own -- comparing the two surfaces that drift (R3.3.4) instead of
+    // leaving INHERITS edges and other compiler-verified data silently out
+    // of sync with a live-watched codebase.
+    "CREATE NODE TABLE IF NOT EXISTS GraphMeta(id STRING, ast_generation INT64, scip_generation INT64, PRIMARY KEY(id))",
 ];
 
 use kuzu::Connection;

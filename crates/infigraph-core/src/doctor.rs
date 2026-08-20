@@ -661,6 +661,66 @@ pub fn check_sidecars(ctx: &DoctorContext) -> Vec<CheckResult> {
         .collect()
 }
 
+const SCIP_STALENESS_CATEGORY: &str = "scip-staleness";
+
+/// R3.3.4 (docs/DESIGN-hardening.md §3.3.4): compares a project's AST vs.
+/// SCIP generation counters (see `GraphStore::current_ast_generation`/
+/// `current_scip_generation`) and warns when SCIP enrichment has fallen
+/// behind the live-watched graph -- the watcher's incremental reindex is
+/// AST-only, so this drift is otherwise silent.
+///
+/// `scip_generation == 0` means SCIP enrichment has never run for this
+/// project at all (no applicable indexer for its languages, or it just
+/// hasn't happened yet) -- that's "not yet judged," not "stale," so it's
+/// deliberately not reported here at all rather than as a false-positive
+/// warning on every project without SCIP support.
+///
+/// Unlike every other doctor check, this one opens the project's graph
+/// (read-only) rather than just stat-ing files -- there's no cheaper way to
+/// read `GraphMeta`'s counters. Bounded by `projects_in_scope`, same as
+/// every other per-project check.
+fn check_one_project_scip_staleness(project_path: &Path) -> Option<CheckResult> {
+    let graph_path = project_path.join(".infigraph").join("graph");
+    if !graph_path.exists() {
+        return None;
+    }
+    let store = crate::graph::GraphStore::open_read_only(&graph_path).ok()?;
+    let ast_gen = store.current_ast_generation().ok()?;
+    let scip_gen = store.current_scip_generation().ok()?;
+
+    if scip_gen == 0 {
+        return None;
+    }
+
+    let label = format!("{}: SCIP enrichment", project_path.display());
+    if scip_gen < ast_gen {
+        let behind = ast_gen - scip_gen;
+        Some(CheckResult::warn(
+            SCIP_STALENESS_CATEGORY,
+            label,
+            format!(
+                "SCIP enrichment is {behind} AST generation{} behind the live graph -- \
+                 INHERITS edges and other compiler-verified data may be out of date",
+                if behind == 1 { "" } else { "s" }
+            ),
+            "run `infigraph index --full` (or re-trigger SCIP enrichment) to refresh it",
+        ))
+    } else {
+        Some(CheckResult::pass(
+            SCIP_STALENESS_CATEGORY,
+            label,
+            "up to date with the live graph",
+        ))
+    }
+}
+
+pub fn check_scip_staleness(ctx: &DoctorContext) -> Vec<CheckResult> {
+    projects_in_scope(ctx)
+        .iter()
+        .filter_map(|p| check_one_project_scip_staleness(p))
+        .collect()
+}
+
 const WORKTREE_CATEGORY: &str = "worktrees";
 
 /// Diffs the registry against live git worktrees (always a global scan,
@@ -718,6 +778,7 @@ pub fn run_doctor(ctx: DoctorContext) -> DoctorReport {
     checks.extend(check_watchers(&ctx));
     checks.extend(check_disk(&ctx));
     checks.extend(check_sidecars(&ctx));
+    checks.extend(check_scip_staleness(&ctx));
     checks.extend(check_worktrees(&ctx));
     checks.extend(check_toolchain(&ctx));
     DoctorReport {

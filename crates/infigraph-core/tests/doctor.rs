@@ -2,10 +2,11 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use infigraph_core::doctor::{
-    check_disk, check_locks, check_registry, check_sidecars, check_toolchain, check_watchers,
-    check_worktrees, find_repo_entry, format_report, projects_in_scope, run_doctor, CheckResult,
-    CheckStatus, DoctorContext, DoctorReport, DoctorScope,
+    check_disk, check_locks, check_registry, check_scip_staleness, check_sidecars, check_toolchain,
+    check_watchers, check_worktrees, find_repo_entry, format_report, projects_in_scope, run_doctor,
+    CheckResult, CheckStatus, DoctorContext, DoctorReport, DoctorScope,
 };
+use infigraph_core::graph::GraphStore;
 use infigraph_core::lockfile::LockInfo;
 use infigraph_core::multi::{Registry, RepoEntry};
 
@@ -939,4 +940,101 @@ fn check_worktrees_warns_on_teardown_candidate() {
         .as_ref()
         .unwrap()
         .contains("infigraph worktree teardown"));
+}
+
+fn project_with_graph(dir: &std::path::Path) -> (PathBuf, PathBuf) {
+    let project = dir.join("myproj");
+    let infigraph_dir = project.join(".infigraph");
+    std::fs::create_dir_all(&infigraph_dir).unwrap();
+    let graph_path = infigraph_dir.join("graph");
+    (project, graph_path)
+}
+
+#[test]
+fn check_scip_staleness_warns_when_scip_generation_behind_ast_generation() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (project, graph_path) = project_with_graph(dir.path());
+
+    {
+        let store = GraphStore::open(&graph_path).unwrap();
+        let lock = store.write_lock().unwrap();
+        let conn = store.connection().unwrap();
+        store.bump_ast_generation_conn(&conn, &lock).unwrap();
+        store.bump_scip_generation_conn(&conn, &lock).unwrap();
+        store.bump_ast_generation_conn(&conn, &lock).unwrap();
+        store.bump_ast_generation_conn(&conn, &lock).unwrap();
+        // ast_generation=3, scip_generation=1 -- 2 generations behind.
+    }
+
+    let ctx = ctx_for(DoctorScope::Project(project), Registry::default());
+    let results = check_scip_staleness(&ctx);
+    let check = results
+        .iter()
+        .find(|r| r.name.contains("SCIP enrichment"))
+        .expect("a check must be reported once SCIP has run at least once");
+    assert_eq!(check.status, CheckStatus::Warn);
+    assert!(
+        check.message.contains("2 AST generations behind"),
+        "message: {}",
+        check.message
+    );
+}
+
+#[test]
+fn check_scip_staleness_passes_when_caught_up() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (project, graph_path) = project_with_graph(dir.path());
+
+    {
+        let store = GraphStore::open(&graph_path).unwrap();
+        let lock = store.write_lock().unwrap();
+        let conn = store.connection().unwrap();
+        store.bump_ast_generation_conn(&conn, &lock).unwrap();
+        store.bump_scip_generation_conn(&conn, &lock).unwrap();
+        // ast_generation=1, scip_generation=1 -- fully caught up.
+    }
+
+    let ctx = ctx_for(DoctorScope::Project(project), Registry::default());
+    let results = check_scip_staleness(&ctx);
+    let check = results
+        .iter()
+        .find(|r| r.name.contains("SCIP enrichment"))
+        .unwrap();
+    assert_eq!(check.status, CheckStatus::Pass);
+}
+
+#[test]
+fn check_scip_staleness_is_silent_when_scip_has_never_run() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (project, graph_path) = project_with_graph(dir.path());
+
+    {
+        let store = GraphStore::open(&graph_path).unwrap();
+        let lock = store.write_lock().unwrap();
+        let conn = store.connection().unwrap();
+        store.bump_ast_generation_conn(&conn, &lock).unwrap();
+        store.bump_ast_generation_conn(&conn, &lock).unwrap();
+        // ast_generation=2, scip_generation=0 -- SCIP has never run, which
+        // is "not yet judged," not "stale" -- must not warn (e.g. a
+        // language with no applicable SCIP indexer would warn on every
+        // single doctor run otherwise).
+    }
+
+    let ctx = ctx_for(DoctorScope::Project(project), Registry::default());
+    let results = check_scip_staleness(&ctx);
+    assert!(
+        results.is_empty(),
+        "a project that has never run SCIP enrichment must not be reported at all: {results:?}"
+    );
+}
+
+#[test]
+fn check_scip_staleness_is_silent_when_no_graph_exists() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let project = dir.path().join("myproj");
+    std::fs::create_dir_all(&project).unwrap();
+
+    let ctx = ctx_for(DoctorScope::Project(project), Registry::default());
+    let results = check_scip_staleness(&ctx);
+    assert!(results.is_empty());
 }

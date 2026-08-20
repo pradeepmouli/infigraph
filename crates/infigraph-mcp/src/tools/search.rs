@@ -156,7 +156,7 @@ fn get_search_data_local(args: &Value, path: &str) -> Result<SearchData> {
         // search still serves what's on disk, but the operator gets a
         // signal that a reindex would refresh semantic ranking.
         if let (Ok(current_gen), Some(recorded_gen)) = (
-            backend.current_generation(),
+            backend.current_ast_generation(),
             embed::read_generation_marker(&emb_path),
         ) {
             if current_gen > 0 && recorded_gen < current_gen {

@@ -30,7 +30,7 @@ impl GraphStore {
 
         let conn = self.connection()?;
         self.upsert_file_conn(&conn, extraction, &lock)?;
-        self.bump_generation_conn(&conn, &lock)?;
+        self.bump_ast_generation_conn(&conn, &lock)?;
         Ok(())
     }
 

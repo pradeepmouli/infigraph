@@ -477,7 +477,7 @@ impl GraphBackend for KuzuBackend {
 
         // R3.3.3: bump once per completed write, so sidecars built from a
         // now-stale generation can be detected rather than served.
-        self.store.bump_generation_conn(&conn, &write_lock)?;
+        self.store.bump_ast_generation_conn(&conn, &write_lock)?;
 
         Ok(())
     }
@@ -486,8 +486,12 @@ impl GraphBackend for KuzuBackend {
         self.store.remove_file(file)
     }
 
-    fn current_generation(&self) -> Result<i64> {
-        self.store.current_generation()
+    fn current_ast_generation(&self) -> Result<i64> {
+        self.store.current_ast_generation()
+    }
+
+    fn current_scip_generation(&self) -> Result<i64> {
+        self.store.current_scip_generation()
     }
 
     fn derive_tested_by_edges(&self, _changed_files: Option<&[&str]>) -> Result<usize> {

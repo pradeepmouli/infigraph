@@ -57,7 +57,7 @@ fn generation_marker_path(sidecar_path: &Path) -> PathBuf {
 }
 
 /// Record which graph generation `sidecar_path` was just built from.
-/// `generation <= 0` (the sentinel `GraphBackend::current_generation`
+/// `generation <= 0` (the sentinel `GraphBackend::current_ast_generation`
 /// returns for "unsupported/unknown", e.g. remote/Neo4j or the daemon
 /// client relay) is a deliberate no-op -- writing a marker for an unknown
 /// generation would make a later real staleness check falsely conclude the
@@ -842,7 +842,7 @@ pub fn update_embeddings(
     // Best-effort: a failed marker write shouldn't fail an otherwise
     // successful embeddings rebuild -- worst case, a later staleness check
     // just can't judge this file (see `read_generation_marker`).
-    if let Ok(generation) = backend.current_generation() {
+    if let Ok(generation) = backend.current_ast_generation() {
         let _ = write_generation_marker(&emb_path, generation);
     }
 
