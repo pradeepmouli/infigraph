@@ -165,6 +165,42 @@ pub fn db_lock_path(db_path: &Path) -> PathBuf {
     PathBuf::from(format!("{}.lock", db_path.display()))
 }
 
+/// If `db_path`'s graph shows signs of an unclean shutdown that could make
+/// Kuzu's WAL-replay-on-open crash the whole process (R3.1.3,
+/// docs/DESIGN-hardening.md §3.1, github.com/pradeepmouli/infigraph#92),
+/// returns the dead holder's PID. `None` means it's safe to proceed to
+/// `Database::new` as normal.
+///
+/// Two signals together, deliberately not either alone:
+/// - A WAL-family sibling exists (`wal_family_paths`) -- Kuzu did not
+///   complete a clean checkpoint before this graph was last closed. This
+///   alone is completely routine: a live writer mid-transaction, or a
+///   replay that would succeed fine, both leave a WAL sibling in place.
+/// - The write lock's recorded holder is confirmed dead (the OS reports no
+///   such process running right now). This is what turns "needs replay"
+///   (routine) into "the process that would have driven that
+///   replay/checkpoint died before finishing it" (suspect) -- observed
+///   directly (2026-08-20, three matching macOS crash reports) to crash
+///   Kuzu's WAL replay with `SIGBUS` on exactly this on-disk state.
+///
+/// Requiring both keeps this from flagging the common, harmless case (a
+/// live writer's WAL, or a replay that would just work) while still
+/// catching the exact scenario that caused #92. A lock file that's absent,
+/// empty (cleanly released), or unparseable reads as "can't confirm a dead
+/// holder" via `lockfile::read_holder` returning `None`, and does not flag
+/// -- conservative by design, since a false positive here means refusing
+/// to open a perfectly good graph.
+fn unclean_shutdown_wal_holder(db_path: &Path, lock_path: &Path) -> Option<u32> {
+    if wal_family_paths(db_path).is_empty() {
+        return None;
+    }
+    let holder = lockfile::read_holder(lock_path)?;
+    if crate::instances::current_process_start_time(holder.pid).is_some() {
+        return None; // holder is alive -- not our call to intervene
+    }
+    Some(holder.pid)
+}
+
 /// Persistent graph store backed by Kuzu.
 pub struct GraphStore {
     db: Database,
@@ -184,6 +220,15 @@ impl GraphStore {
         }
         validate_db_file(path)?;
         let lock_path = db_lock_path(path);
+        if let Some(pid) = unclean_shutdown_wal_holder(path, &lock_path) {
+            anyhow::bail!(
+                "graph {} has an unreplayed WAL from process {pid}, which is no longer \
+                 running (unclean shutdown) -- refusing to open it directly since WAL replay \
+                 in this state has crashed the whole process before (see \
+                 github.com/pradeepmouli/infigraph#92); run `infigraph index --full` to rebuild",
+                path.display()
+            );
+        }
         let db = Database::new(path, SystemConfig::default())
             .map_err(|e| anyhow::anyhow!("failed to open kuzu db: {e}"))?;
         let store = Self { db, lock_path };
@@ -209,6 +254,17 @@ impl GraphStore {
     pub fn open_read_only(path: &Path) -> Result<Self> {
         validate_db_file(path)?;
         let lock_path = db_lock_path(path);
+        if let Some(pid) = unclean_shutdown_wal_holder(path, &lock_path) {
+            return Err(anyhow::Error::new(GraphCorruption {
+                detail: format!(
+                    "graph has an unreplayed WAL from process {pid}, which is no longer \
+                     running (unclean shutdown) -- refusing to open it directly since WAL \
+                     replay in this state has crashed the whole process before (see \
+                     github.com/pradeepmouli/infigraph#92); run `infigraph index --full` to \
+                     rebuild"
+                ),
+            }));
+        }
         // `throw_on_wal_replay_failure` defaults to true (unset here): a WAL
         // replay failure now surfaces as an error instead of being silently
         // tolerated and served as a torn base image.
@@ -525,6 +581,113 @@ fn read_generation_field(store: &GraphStore, field: &'static str) -> Result<i64>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn write_holder_lock(lock_path: &Path, pid: u32) {
+        if let Some(parent) = lock_path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        let info = lockfile::LockInfo {
+            pid,
+            role: "test".to_string(),
+            build_hash: "test".to_string(),
+            acquired_at: 0,
+            last_heartbeat: 0,
+        };
+        std::fs::write(lock_path, serde_json::to_string(&info).unwrap()).unwrap();
+    }
+
+    /// A PID essentially guaranteed not to be a running process, standing
+    /// in for "the write lock's recorded holder is dead" across these tests.
+    const DEAD_PID: u32 = 999_999;
+
+    #[test]
+    fn unclean_shutdown_wal_holder_flags_wal_plus_dead_holder() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("graph");
+        std::fs::write(dir.path().join("graph.wal"), b"wal").unwrap();
+        let lock_path = db_lock_path(&db_path);
+        write_holder_lock(&lock_path, DEAD_PID);
+
+        assert_eq!(
+            unclean_shutdown_wal_holder(&db_path, &lock_path),
+            Some(DEAD_PID)
+        );
+    }
+
+    #[test]
+    fn unclean_shutdown_wal_holder_ignores_a_live_holder() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("graph");
+        std::fs::write(dir.path().join("graph.wal"), b"wal").unwrap();
+        let lock_path = db_lock_path(&db_path);
+        write_holder_lock(&lock_path, std::process::id());
+
+        assert_eq!(
+            unclean_shutdown_wal_holder(&db_path, &lock_path),
+            None,
+            "a live writer's WAL is routine, not a signal to refuse opening"
+        );
+    }
+
+    #[test]
+    fn unclean_shutdown_wal_holder_ignores_no_wal_even_with_a_dead_holder() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("graph");
+        let lock_path = db_lock_path(&db_path);
+        write_holder_lock(&lock_path, DEAD_PID);
+
+        assert_eq!(
+            unclean_shutdown_wal_holder(&db_path, &lock_path),
+            None,
+            "a dead holder alone (no WAL) means nothing was left mid-replay"
+        );
+    }
+
+    #[test]
+    fn unclean_shutdown_wal_holder_ignores_a_wal_with_no_lock_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("graph");
+        std::fs::write(dir.path().join("graph.wal"), b"wal").unwrap();
+        let lock_path = db_lock_path(&db_path);
+
+        assert_eq!(
+            unclean_shutdown_wal_holder(&db_path, &lock_path),
+            None,
+            "can't confirm a dead holder without a lock payload to read -- conservative by design"
+        );
+    }
+
+    /// Regression test for github.com/pradeepmouli/infigraph#92: a stale WAL
+    /// from a dead process used to be handed straight to `kuzu::Database::new`,
+    /// which crashed the whole process with SIGBUS deep inside WAL replay --
+    /// before any `Result` existed to catch it. Both `open` and
+    /// `open_read_only` must refuse up front instead.
+    #[test]
+    fn open_refuses_a_graph_with_an_unreplayed_wal_from_a_dead_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("graph");
+        // Large enough to pass `validate_db_file`'s truncation check -- this
+        // test is about the WAL-replay guard, not that one.
+        std::fs::write(&db_path, vec![0u8; MIN_DB_FILE_SIZE as usize]).unwrap();
+        std::fs::write(dir.path().join("graph.wal"), b"wal").unwrap();
+        write_holder_lock(&db_lock_path(&db_path), DEAD_PID);
+
+        let err = GraphStore::open(&db_path)
+            .map(|_| ())
+            .expect_err("must refuse rather than attempt Database::new");
+        assert!(err.to_string().contains("unreplayed WAL"), "{err}");
+        assert!(err.to_string().contains(&DEAD_PID.to_string()), "{err}");
+
+        let err = GraphStore::open_read_only(&db_path)
+            .map(|_| ())
+            .expect_err("read-only open must refuse too");
+        assert!(err.to_string().contains("unreplayed WAL"), "{err}");
+        assert!(
+            err.downcast_ref::<GraphCorruption>().is_some(),
+            "read-only path's error must downcast to GraphCorruption so callers that route to \
+             quarantine (R3.1.2) can catch it: {err}"
+        );
+    }
 
     /// Regression test: a truncated graph file used to be handed straight to
     /// `kuzu::Database::new`, which parses a bogus size field from the header
