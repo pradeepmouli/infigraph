@@ -918,3 +918,83 @@ pub(crate) fn cmd_gc(dry_run: bool, stale_days: Option<u64>) -> Result<()> {
     );
     Ok(())
 }
+
+/// `infigraph ps` (R2.2.4): every process the durable state knows about.
+pub(crate) fn cmd_ps(root: &Path) -> Result<()> {
+    let registry = infigraph_core::multi::Registry::load().unwrap_or_default();
+    let canonical_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let scope = infigraph_core::ps::ps_scope(&registry, &canonical_root);
+    let scope_refs: Vec<&Path> = scope.iter().map(|p| p.as_path()).collect();
+    let rows = infigraph_core::ps::list_infigraph_processes(&scope_refs);
+
+    if rows.is_empty() {
+        println!("No infigraph processes recorded (no instance registrations, no lock holders).");
+        return Ok(());
+    }
+
+    println!(
+        "{:<8} {:<6} {:<10} {:<10} {:<28} PROJECT / EVIDENCE",
+        "PID", "STATE", "UPTIME", "RSS", "ROLE"
+    );
+    for r in &rows {
+        let state = if r.alive { "live" } else { "dead" };
+        let uptime = r
+            .uptime_secs
+            .map(format_uptime)
+            .unwrap_or_else(|| "-".to_string());
+        let rss = r
+            .rss_bytes
+            .map(|b| format!("{} MB", b / (1024 * 1024)))
+            .unwrap_or_else(|| "-".to_string());
+        println!(
+            "{:<8} {:<6} {:<10} {:<10} {:<28} {} [{}]",
+            r.pid,
+            state,
+            uptime,
+            rss,
+            r.roles.join(","),
+            r.projects.join(", "),
+            r.evidence.join(",")
+        );
+        if !r.alive {
+            println!(
+                "         ^ stale lock -- holder is gone; `infigraph doctor` explains, deleting the lock file is safe"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn format_uptime(secs: u64) -> String {
+    if secs >= 86_400 {
+        format!("{}d{}h", secs / 86_400, (secs % 86_400) / 3600)
+    } else if secs >= 3600 {
+        format!("{}h{}m", secs / 3600, (secs % 3600) / 60)
+    } else if secs >= 60 {
+        format!("{}m{}s", secs / 60, secs % 60)
+    } else {
+        format!("{secs}s")
+    }
+}
+
+/// `infigraph kill` (R2.2.4): guarded terminate, audited (R6.3).
+pub(crate) fn cmd_kill(pid: u32, force: bool) -> Result<()> {
+    match infigraph_core::ps::kill_infigraph_process(pid, force) {
+        Ok(name) => {
+            let how = if force { "SIGKILL" } else { "SIGTERM" };
+            infigraph_core::audit::audit_log(
+                "kill",
+                if force {
+                    "kill-forced"
+                } else {
+                    "kill-graceful"
+                },
+                "operator requested via infigraph kill",
+                &format!("pid={pid} name={name}"),
+            );
+            println!("Sent {how} to {name} (pid {pid}). Audit: ~/.infigraph/logs/audit.log");
+            Ok(())
+        }
+        Err(refusal) => anyhow::bail!("refusing to kill pid {pid}: {refusal}"),
+    }
+}

@@ -127,6 +127,22 @@ enum Commands {
         stale_days: Option<u64>,
     },
 
+    /// List all infigraph processes the durable state knows about (MCP
+    /// servers, watchers/daemons, in-flight index runs) with liveness,
+    /// uptime and memory -- including DEAD holders of stale locks (R2.2.4)
+    Ps,
+
+    /// Terminate an infigraph process by pid (SIGTERM; --force for
+    /// SIGKILL). Refuses pids whose binary is not verifiably infigraph's,
+    /// so a recycled pid never kills a bystander. Audited (R6.3).
+    Kill {
+        /// Process id (see `infigraph ps`)
+        pid: u32,
+        /// SIGKILL instead of the graceful SIGTERM
+        #[arg(long)]
+        force: bool,
+    },
+
     /// List available languages
     Languages,
 
@@ -917,6 +933,8 @@ fn run(command: Commands, root: &Path) -> Result<()> {
             dry_run,
             stale_days,
         } => cmd_gc(dry_run, stale_days),
+        Commands::Ps => cmd_ps(root),
+        Commands::Kill { pid, force } => cmd_kill(pid, force),
         Commands::Languages => cmd_languages(Some(root)),
         Commands::Symbols { file } => cmd_symbols(root, &file),
         Commands::Skeleton { file } => cmd_skeleton(root, &file),
