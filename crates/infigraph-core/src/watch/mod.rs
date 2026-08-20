@@ -281,6 +281,7 @@ where
                                 indexed_files: outcome.extractions.len(),
                                 extractions: outcome.extractions.clone(),
                                 resolve_stats: outcome.resolve_stats.clone(),
+                                skipped_errors: Vec::new(),
                             });
                         }
                     }
