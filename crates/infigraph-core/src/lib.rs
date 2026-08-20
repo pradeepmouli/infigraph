@@ -9,6 +9,7 @@ pub mod concerns;
 pub mod config;
 pub mod daemon_protocol;
 pub mod diff;
+pub mod dirty;
 pub mod doctor;
 pub mod embed;
 pub mod export;
@@ -606,6 +607,24 @@ impl Infigraph {
             );
             for f in &scan.stale_files {
                 let _ = backend.remove_file(f);
+            }
+        }
+
+        // R3.3.5: reconcile the persistent dirty set (docs/DESIGN-hardening.md
+        // §3.3.5) against what this hash-diff scan just found and wrote. Any
+        // path a crashed watcher left dirty is naturally rediscovered here --
+        // that's exactly what "changed since the graph's stored hash" means --
+        // so any manual `infigraph index`/`ln` run drains it without needing
+        // to special-case reading the dirty set before scanning. A no-op for
+        // a namespaced remote-mode path, whose dirty-log entry (if any) was
+        // recorded unprefixed by a local watcher; harmless, just misses the
+        // reconciliation for that case.
+        let mut reconciled: Vec<String> = scan.extractions.iter().map(|e| e.file.clone()).collect();
+        reconciled.extend(scan.stale_files.iter().cloned());
+        if !reconciled.is_empty() {
+            let infigraph_dir = self.root.join(".infigraph");
+            if let Err(e) = dirty::clear_dirty(&infigraph_dir, &reconciled) {
+                eprintln!("[index] failed to reconcile dirty set: {e}");
             }
         }
 

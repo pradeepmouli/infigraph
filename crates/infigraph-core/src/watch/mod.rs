@@ -159,6 +159,35 @@ where
     // executes.
     let queue = Arc::new(Mutex::new(crate::watch::queue::IndexWorkQueue::new()));
 
+    // R3.3.5: recover any dirty marks a prior run of this watcher left
+    // behind -- e.g. it crashed between a raw fsevent and the debounce
+    // window's flush, so the change never made it into a drain. A path
+    // still present on disk needs a fresh extraction; one that's gone was
+    // a removal that never got applied (`add_watch_removal` is safe either
+    // way -- its directory-prefix scan is a harmless no-op for a path that
+    // turns out to have been a file). This is what makes the recovery
+    // targeted at exactly the paths left mid-flight instead of requiring a
+    // full rescan.
+    let infigraph_dir = root.join(".infigraph");
+    match crate::dirty::pending_dirty(&infigraph_dir) {
+        Ok(leftover) if !leftover.is_empty() => {
+            eprintln!(
+                "[watch] recovering {} dirty path(s) left over from a prior run",
+                leftover.len()
+            );
+            let mut q = queue.lock().unwrap();
+            for rel in leftover {
+                if root.join(&rel).exists() {
+                    q.add_raw(rel);
+                } else {
+                    q.add_watch_removal(rel);
+                }
+            }
+        }
+        Ok(_) => {}
+        Err(e) => eprintln!("[watch] failed to read dirty set, skipping recovery: {e}"),
+    }
+
     // Drains run here instead of inline so a large one (a whole-project
     // reindex can take minutes) doesn't stop this loop from accepting
     // fsevents, periodic ticks and further requests for its whole duration.
@@ -224,11 +253,27 @@ where
                 handle,
                 prism,
                 waiter_replies,
+                removed_in_drain,
             } = drain_in_flight.take().expect("checked is_some just above");
             let (guard, outcome) = finish_drain(drain_rt.block_on(handle), &waiter_replies);
             match outcome {
                 Some(outcome) => {
                     changes_since_periodic += outcome.extractions.len();
+
+                    // R3.3.5: only extractions that actually made it into
+                    // `outcome` were confirmed written (a per-file read/parse
+                    // failure inside `extract_paths` silently drops that file
+                    // rather than failing the whole drain -- see its own doc
+                    // comment -- so it correctly stays dirty here for a later
+                    // retry instead of being cleared alongside its batch).
+                    let mut cleared: Vec<String> =
+                        outcome.extractions.iter().map(|e| e.file.clone()).collect();
+                    cleared.extend(removed_in_drain);
+                    if !cleared.is_empty() {
+                        if let Err(e) = crate::dirty::clear_dirty(&infigraph_dir, &cleared) {
+                            eprintln!("[watch] failed to clear dirty set: {e}");
+                        }
+                    }
                     if let Some(ref cb) = on_periodic {
                         if !outcome.extractions.is_empty() {
                             cb(&crate::IndexResult {
@@ -428,6 +473,14 @@ where
 
                     match watch_kind {
                         WatchEventKind::Removed => {
+                            // R3.3.5: persisted before the in-memory queue
+                            // add below, so a crash between the two still
+                            // leaves this path recoverable at next startup.
+                            if let Err(e) =
+                                crate::dirty::mark_dirty(&infigraph_dir, std::slice::from_ref(&rel))
+                            {
+                                eprintln!("[watch] failed to persist dirty mark for {rel}: {e}");
+                            }
                             // Deferred to the shared drain step below rather
                             // than touching the graph directly here -- this
                             // closes a pre-existing gap where watch-triggered
@@ -450,6 +503,18 @@ where
                             if path.is_dir() {
                                 let _ = register_watch_dirs(&mut watcher, &path);
                             } else if filter_registry.for_file(&rel).is_some() {
+                                // R3.3.5: persisted before this event enters
+                                // `batch` -- the in-memory accumulator a crash
+                                // could still lose between now and the
+                                // debounce-window flush below.
+                                if let Err(e) = crate::dirty::mark_dirty(
+                                    &infigraph_dir,
+                                    std::slice::from_ref(&rel),
+                                ) {
+                                    eprintln!(
+                                        "[watch] failed to persist dirty mark for {rel}: {e}"
+                                    );
+                                }
                                 batch.add(path);
                             }
                         }
@@ -523,6 +588,16 @@ where
                                 .iter()
                                 .map(|w| w.reply_path.clone())
                                 .collect();
+                            // R3.3.5: captured before `drained` moves into the
+                            // task -- `DrainOutcome` only reports successful
+                            // extractions, not removals, and a removal's
+                            // `backend.remove_file` error is already
+                            // swallowed by `execute_drain` itself (best-effort,
+                            // matching the rest of that code path), so "was
+                            // part of a drain that returned Ok" is the same
+                            // confidence level the removal path itself offers.
+                            let removed_in_drain: Vec<String> =
+                                drained.removals.iter().cloned().collect();
                             let task_prism = Arc::clone(&prism);
                             let handle = drain_rt.spawn_blocking(move || DrainTaskOutput {
                                 result: crate::watch::drain::execute_drain(&task_prism, drained),
@@ -532,6 +607,7 @@ where
                                 handle,
                                 prism,
                                 waiter_replies,
+                                removed_in_drain,
                             });
                         }
                         Err(e) => {
@@ -596,6 +672,12 @@ struct InFlightDrain {
     handle: tokio::task::JoinHandle<DrainTaskOutput>,
     prism: Arc<Infigraph>,
     waiter_replies: Vec<PathBuf>,
+    /// R3.3.5: paths this drain's `DrainedQueue.removals` named, captured
+    /// before the queue moved into the task -- cleared from the persistent
+    /// dirty set alongside `outcome.extractions` once the drain confirms
+    /// success. See the capture site's comment for why removals get this
+    /// same best-effort treatment rather than a stricter per-path check.
+    removed_in_drain: Vec<String>,
 }
 
 /// What the background drain task hands back. The `index.lock` guard rides
