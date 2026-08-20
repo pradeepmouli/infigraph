@@ -25,7 +25,11 @@ pub struct CheckResult {
 }
 
 impl CheckResult {
-    fn pass(category: &'static str, name: impl Into<String>, message: impl Into<String>) -> Self {
+    pub fn pass(
+        category: &'static str,
+        name: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
         Self {
             category,
             name: name.into(),
@@ -35,7 +39,7 @@ impl CheckResult {
         }
     }
 
-    fn warn(
+    pub fn warn(
         category: &'static str,
         name: impl Into<String>,
         message: impl Into<String>,
@@ -50,7 +54,7 @@ impl CheckResult {
         }
     }
 
-    fn fail(
+    pub fn fail(
         category: &'static str,
         name: impl Into<String>,
         message: impl Into<String>,

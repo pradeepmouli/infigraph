@@ -43,6 +43,7 @@ pub mod sequence;
 pub mod snapshot;
 pub mod structured;
 pub mod taint;
+pub mod verify;
 pub mod viz;
 pub mod vuln;
 pub mod watch;

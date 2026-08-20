@@ -127,6 +127,12 @@ enum Commands {
         stale_days: Option<u64>,
     },
 
+    /// Offline consistency check of this project's index (R3.4.1): the
+    /// graph opens cleanly, symbol->file references hold, sidecars parse
+    /// and match the graph's generation. Read-only; exit 0/1/2 =
+    /// pass/warn/fail for CI use.
+    Verify,
+
     /// List all infigraph processes the durable state knows about (MCP
     /// servers, watchers/daemons, in-flight index runs) with liveness,
     /// uptime and memory -- including DEAD holders of stale locks (R2.2.4)
@@ -933,6 +939,7 @@ fn run(command: Commands, root: &Path) -> Result<()> {
             dry_run,
             stale_days,
         } => cmd_gc(dry_run, stale_days),
+        Commands::Verify => cmd_verify(root),
         Commands::Ps => cmd_ps(root),
         Commands::Kill { pid, force } => cmd_kill(pid, force),
         Commands::Languages => cmd_languages(Some(root)),

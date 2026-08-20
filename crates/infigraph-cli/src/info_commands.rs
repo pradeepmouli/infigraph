@@ -998,3 +998,22 @@ pub(crate) fn cmd_kill(pid: u32, force: bool) -> Result<()> {
         Err(refusal) => anyhow::bail!("refusing to kill pid {pid}: {refusal}"),
     }
 }
+
+/// `infigraph verify` (R3.4.1): offline consistency check, doctor-style
+/// output, CI-friendly exit codes (0 pass / 1 warn / 2 fail).
+pub(crate) fn cmd_verify(root: &Path) -> Result<()> {
+    use infigraph_core::doctor::{format_report, CheckStatus, DoctorReport, DoctorScope};
+
+    let canonical_root = root.canonicalize().context("invalid project root")?;
+    let checks = infigraph_core::verify::run_verify(&canonical_root);
+    let report = DoctorReport {
+        checks,
+        scope: DoctorScope::Project(canonical_root),
+    };
+    print!("{}", format_report(&report, doctor_output_is_colorized()));
+    match report.worst_status() {
+        CheckStatus::Pass => Ok(()),
+        CheckStatus::Warn => anyhow::bail!("verify found warnings"),
+        CheckStatus::Fail => std::process::exit(2),
+    }
+}
