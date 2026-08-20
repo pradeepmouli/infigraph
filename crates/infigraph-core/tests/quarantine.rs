@@ -261,3 +261,36 @@ fn retirement_pool_keeps_only_the_most_recent_superseded_graph() {
         .count();
     assert_eq!(remaining, 1, "retirement pool must never exceed N=1");
 }
+
+/// Regression test for pradeepmouli/infigraph#89: two quarantines into the
+/// same pool within one wall-clock second used to compute the same
+/// destination name, and `fs::rename` on Unix silently REPLACES an existing
+/// regular-file destination -- so the second call destroyed the first
+/// entry's content. With the walk-forward fix, back-to-back quarantines
+/// always land on distinct entries with both contents intact. (When the
+/// clock happens to tick between the calls, no collision occurs and the
+/// assertions hold trivially -- the test never false-fails, and fails
+/// often without the fix.)
+#[test]
+fn same_second_quarantines_land_on_distinct_entries_without_data_loss() {
+    let dir = tempfile::tempdir().unwrap();
+    let ig = dir.path().join(".infigraph");
+    fs::create_dir_all(&ig).unwrap();
+
+    fs::write(ig.join("graph"), b"first corrupt graph").unwrap();
+    let first = quarantine_graph(&ig, "graph").unwrap();
+
+    fs::write(ig.join("graph"), b"second corrupt graph").unwrap();
+    let second = quarantine_graph(&ig, "graph").unwrap();
+
+    assert_ne!(
+        first, second,
+        "same-second quarantines must land on distinct pool entries"
+    );
+    assert_eq!(
+        fs::read(&first).unwrap(),
+        b"first corrupt graph",
+        "the first entry's content must survive the second quarantine"
+    );
+    assert_eq!(fs::read(&second).unwrap(), b"second corrupt graph");
+}

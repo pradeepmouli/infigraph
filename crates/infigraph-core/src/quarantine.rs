@@ -74,7 +74,13 @@ fn move_graph_aside(
 ) -> Result<PathBuf> {
     evict_oldest_if_at_bound(infigraph_dir, graph_name, infix, retention)?;
 
-    let ts = now_epoch_secs();
+    // now_epoch_secs() is second-granularity: two calls into the same pool
+    // within one wall-clock second would collide on the destination name,
+    // and fs::rename on Unix silently REPLACES an existing regular-file
+    // destination -- destroying the earlier entry in a module whose whole
+    // purpose is not losing data. Same bug class (and same fix) as
+    // snapshot::create_snapshot: walk forward to a genuinely free stem.
+    let ts = next_free_aside_ts(infigraph_dir, graph_name, infix, now_epoch_secs());
     let quarantine_stem = format!("{graph_name}.{infix}.{ts}");
     let quarantine_path = infigraph_dir.join(&quarantine_stem);
     let source = infigraph_dir.join(graph_name);
@@ -125,6 +131,38 @@ fn move_graph_aside(
     }
 
     Ok(quarantine_path)
+}
+
+/// First timestamp `>= start_ts` whose pool stem
+/// (`<graph_name>.<infix>.<ts>`) is genuinely unused: neither the base
+/// entry itself nor any sibling sharing the stem (e.g. `<stem>.wal`, a
+/// stray leftover from a partial earlier move) exists. Checking siblings
+/// too -- rather than a bare `exists()` on the base path -- matters
+/// because the WAL-relocation loop in `move_graph_aside` writes
+/// `<stem>.wal`-style names, and `move_wal_sibling`'s copy fallback would
+/// silently overwrite one just as `fs::rename` overwrites the base.
+///
+/// The `stem == name` / `starts_with("<stem>.")` split (not a plain
+/// `starts_with(stem)`) keeps `graph.corrupt.17` from falsely matching
+/// `graph.corrupt.170`'s entries.
+fn next_free_aside_ts(infigraph_dir: &Path, graph_name: &str, infix: &str, start_ts: u64) -> u64 {
+    let mut ts = start_ts;
+    loop {
+        let stem = format!("{graph_name}.{infix}.{ts}");
+        let stem_dot = format!("{stem}.");
+        let in_use = std::fs::read_dir(infigraph_dir)
+            .map(|entries| {
+                entries.flatten().any(|e| {
+                    let name = e.file_name().to_string_lossy().into_owned();
+                    name == stem || name.starts_with(&stem_dot)
+                })
+            })
+            .unwrap_or(false);
+        if !in_use {
+            return ts;
+        }
+        ts += 1;
+    }
 }
 
 /// Move a WAL-family sibling alongside the base image it belongs to: try an
@@ -204,4 +242,71 @@ fn evict_oldest_if_at_bound(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn next_free_aside_ts_returns_start_when_nothing_collides() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            next_free_aside_ts(dir.path(), "graph", "corrupt", 1000),
+            1000
+        );
+    }
+
+    #[test]
+    fn next_free_aside_ts_walks_past_an_existing_base_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("graph.corrupt.1000"), b"earlier entry").unwrap();
+        assert_eq!(
+            next_free_aside_ts(dir.path(), "graph", "corrupt", 1000),
+            1001
+        );
+    }
+
+    #[test]
+    fn next_free_aside_ts_walks_past_a_run_of_occupied_seconds() {
+        let dir = tempfile::tempdir().unwrap();
+        for ts in 1000..1003u64 {
+            std::fs::write(dir.path().join(format!("graph.corrupt.{ts}")), b"x").unwrap();
+        }
+        assert_eq!(
+            next_free_aside_ts(dir.path(), "graph", "corrupt", 1000),
+            1003
+        );
+    }
+
+    #[test]
+    fn next_free_aside_ts_treats_a_stray_wal_sibling_as_occupied() {
+        let dir = tempfile::tempdir().unwrap();
+        // Only the sibling exists (partial earlier move) -- the stem must
+        // still count as taken, or move_wal_sibling's copy fallback would
+        // silently overwrite it.
+        std::fs::write(dir.path().join("graph.corrupt.1000.wal"), b"stray").unwrap();
+        assert_eq!(
+            next_free_aside_ts(dir.path(), "graph", "corrupt", 1000),
+            1001
+        );
+    }
+
+    #[test]
+    fn next_free_aside_ts_does_not_false_match_a_longer_timestamp_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        // "graph.corrupt.100" must not be blocked by "graph.corrupt.1000".
+        std::fs::write(dir.path().join("graph.corrupt.1000"), b"other entry").unwrap();
+        assert_eq!(next_free_aside_ts(dir.path(), "graph", "corrupt", 100), 100);
+    }
+
+    #[test]
+    fn next_free_aside_ts_pools_do_not_block_each_other() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("graph.previous.1000"), b"retired").unwrap();
+        assert_eq!(
+            next_free_aside_ts(dir.path(), "graph", "corrupt", 1000),
+            1000
+        );
+    }
 }
