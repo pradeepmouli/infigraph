@@ -37,6 +37,10 @@ pub fn audit_log(role: &str, action: &str, why: &str, affected: &str) {
         why,
         affected
     );
+    // R7.3 (#83): the audit trail is append-only by design but not
+    // unbounded -- rotate at 5MB (one .1 generation retained; audit lines
+    // are ~150 bytes, so ~2x 30k destructive acts of history survive).
+    crate::logrotate::rotate_if_over(&path, 5 * 1024 * 1024);
     let result = std::fs::create_dir_all(path.parent().expect("audit path has a parent"))
         .and_then(|()| {
             std::fs::OpenOptions::new()

@@ -22,6 +22,7 @@ pub mod instances;
 pub mod lang;
 pub mod learned;
 pub mod lockfile;
+pub mod logrotate;
 pub mod manifest;
 pub mod meta;
 pub mod model;
