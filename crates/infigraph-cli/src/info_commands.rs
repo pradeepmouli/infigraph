@@ -386,7 +386,7 @@ pub(crate) fn cmd_daemon(root: &Path, debounce: u64) -> Result<()> {
         //
         // The original version of this watchdog used a flat 5s timer, which
         // conflated "wedged" with "still doing a legitimately long write" --
-        // a full reindex can take minutes (see watch_project_with_periodic's
+        // a full reindex can take minutes (see run_write_coordinator's
         // own shutdown comment), and killing straight through one corrupts
         // the graph exactly like any other unclean shutdown (an unreplayed
         // WAL left behind for the next opener to trip over -- see
@@ -478,7 +478,7 @@ pub(crate) fn cmd_daemon(root: &Path, debounce: u64) -> Result<()> {
     // site compiling unaffected by the signature change (see
     // docs/superpowers/plans/2026-08-21-daemon-watch-command-split.md task 4).
     let daemon_token = tokio_util::sync::CancellationToken::new();
-    infigraph_core::watch::watch_project_with_periodic(
+    infigraph_core::watch::run_write_coordinator(
         root,
         bundled_registry,
         debounce,

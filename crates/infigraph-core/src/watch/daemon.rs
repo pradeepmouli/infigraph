@@ -194,7 +194,7 @@ pub struct OrphanedDaemon {
 /// deleted, without touching any of them.
 ///
 /// This exists as a backstop for the watch loop's own self-check (see
-/// `watch_project_with_periodic`, which now shuts itself down once its root
+/// `run_write_coordinator`, which now shuts itself down once its root
 /// disappears): that check only runs while the loop is actually ticking, so
 /// a daemon that's wedged (stuck on a lock, a hung query) never reaches it.
 ///
@@ -688,7 +688,7 @@ mod tests {
     /// `is_orphaned_daemon` is the pure decision `find_orphaned_daemons`
     /// applies per live process -- exercised here directly with synthetic
     /// facts rather than a real spawned process, since a real daemon's own
-    /// self-check (`watch_project_with_periodic`'s root-existence check)
+    /// self-check (`run_write_coordinator`'s root-existence check)
     /// would race this test's own deletion the moment it's spawned.
     mod is_orphaned_daemon_tests {
         use super::super::is_orphaned_daemon;

@@ -5,9 +5,9 @@
 //! "What a code/docs `Task<()>` never touches directly".
 //!
 //! This is the async counterpart of the fsevent half of
-//! `watch_project_with_periodic`, extracted so watch activity can be started
+//! `run_write_coordinator`, extracted so watch activity can be started
 //! and stopped independently of the daemon process's own lifetime. It is
-//! deliberately landed unused: `watch_project_with_periodic` still runs its
+//! deliberately landed unused: `run_write_coordinator` still runs its
 //! own copy of this logic until the rewiring task retires it.
 
 use crate::watch::queue::IndexWorkQueue;

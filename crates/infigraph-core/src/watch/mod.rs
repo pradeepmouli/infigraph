@@ -107,7 +107,7 @@ where
     // daemon's own lifetime -- for now, a fresh, unparented token keeps this
     // thin wrapper's existing callers unaffected by the signature change.
     let token = CancellationToken::new();
-    watch_project_with_periodic(
+    run_write_coordinator(
         root,
         make_registry,
         debounce_ms,
@@ -122,7 +122,7 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn watch_project_with_periodic<MR, F>(
+pub fn run_write_coordinator<MR, F>(
     root: &Path,
     make_registry: MR,
     debounce_ms: u64,
@@ -973,7 +973,7 @@ fn open_transient(root: &Path, registry: &Arc<crate::lang::LanguageRegistry>) ->
 /// Acquires the watch session's shared DB connection, opening it if not
 /// already held. On non-Windows platforms this connection is reused across
 /// the whole watch session rather than reopened per batch/event — see
-/// `watch_project_with_periodic`'s doc comment for why that matters. If an
+/// `run_write_coordinator`'s doc comment for why that matters. If an
 /// operation on the returned connection fails, call `poison_watch_db` so the
 /// next call reopens fresh (e.g. after the on-disk database was replaced out
 /// from under a live connection, such as a concurrent `infigraph index
@@ -2024,7 +2024,7 @@ mod tests {
         }
     }
 
-    /// Regression test for a macOS-specific bug: `watch_project_with_periodic`
+    /// Regression test for a macOS-specific bug: `run_write_coordinator`
     /// used to compare raw filesystem-watch event paths against the caller's
     /// `root` exactly as given. FSEvents delivers absolute, symlink-resolved
     /// event paths, so a non-canonical `root` (e.g. a relative path, or one
@@ -2097,7 +2097,7 @@ mod tests {
             seen,
             "watch_project delivered no events for a change under a non-canonical \
              (symlinked) root — the root.canonicalize() call in \
-             watch_project_with_periodic may have regressed"
+             run_write_coordinator may have regressed"
         );
     }
 

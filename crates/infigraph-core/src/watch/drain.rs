@@ -216,7 +216,7 @@ mod tests {
     /// needed), against a real temp-dir project: `try_start_full_reindex`
     /// (loop-thread gating + spawning the background build) followed by
     /// `finish_full_reindex` (loop-thread swap), exactly like a real
-    /// `watch_project_with_periodic` tick's reap block, minus the loop
+    /// `run_write_coordinator` tick's reap block, minus the loop
     /// itself. Replaces the old direct call to `serve_full_reindex_request`,
     /// which ran everything inline on one thread and no longer exists now
     /// that the build runs on `drain_rt`.

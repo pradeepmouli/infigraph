@@ -54,7 +54,7 @@ pub fn walk_builder(root: &Path) -> WalkBuilder {
 /// there's no directory tree to walk. Built from the same safety list and
 /// the same `.gitignore`/`.infigraphignore` files `walk_builder` would
 /// discover -- rebuild when those files may have changed (the watcher
-/// rebuilds this on its periodic tick; see `watch_project_with_periodic`).
+/// rebuilds this on its periodic tick; see `run_write_coordinator`).
 pub struct IgnoreMatcher {
     root: std::path::PathBuf,
     gitignore: Gitignore,

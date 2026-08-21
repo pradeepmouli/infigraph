@@ -382,7 +382,7 @@ fn file_present_in_graph(project_dir: &std::path::Path, file: &str) -> bool {
 /// another operation (e.g. a concurrent `infigraph index --full`) believed
 /// it held exclusive access via `index.lock`.
 ///
-/// This drives `watch_project_with_periodic` directly in a background
+/// This drives `run_write_coordinator` directly in a background
 /// thread (the same in-process pattern
 /// `daemon_protocol_watcher_wiring.rs`'s sibling tests already use for this
 /// exact function -- no real daemon subprocess is needed to exercise the
@@ -458,7 +458,7 @@ fn watch_triggered_file_removal_contends_with_a_held_index_lock() {
     let daemon_token = tokio_util::sync::CancellationToken::new();
     let token_for_thread = daemon_token.clone();
     let handle = std::thread::spawn(move || {
-        infigraph_core::watch::watch_project_with_periodic(
+        infigraph_core::watch::run_write_coordinator(
             &root,
             || Ok(infigraph_languages::bundled_registry().unwrap()),
             50, // debounce_ms
@@ -552,7 +552,7 @@ fn watch_loop_shuts_down_when_its_root_directory_is_deleted() {
     let daemon_token = tokio_util::sync::CancellationToken::new();
     let token_for_thread = daemon_token.clone();
     let handle = std::thread::spawn(move || {
-        infigraph_core::watch::watch_project_with_periodic(
+        infigraph_core::watch::run_write_coordinator(
             &root,
             || Ok(infigraph_languages::bundled_registry().unwrap()),
             50, // debounce_ms
@@ -642,7 +642,7 @@ fn out_of_scope_write_request_contends_with_a_held_index_lock() {
     let daemon_token = tokio_util::sync::CancellationToken::new();
     let token_for_thread = daemon_token.clone();
     let handle = std::thread::spawn(move || {
-        infigraph_core::watch::watch_project_with_periodic(
+        infigraph_core::watch::run_write_coordinator(
             &root,
             || Ok(infigraph_languages::bundled_registry().unwrap()),
             50, // debounce_ms
@@ -727,7 +727,7 @@ fn out_of_scope_write_request_contends_with_a_held_index_lock() {
 /// mtime is unchanged (the swap never ran), and the loop still replies to the
 /// request (with an error) instead of hanging while reaping the cancelled
 /// task -- mirrors `out_of_scope_write_request_contends_with_a_held_index_lock`'s
-/// setup/drive/assert shape for driving `watch_project_with_periodic` against
+/// setup/drive/assert shape for driving `run_write_coordinator` against
 /// a real temp project with a real request file.
 #[test]
 fn full_reindex_build_task_can_be_cancelled_before_it_starts_the_swap() {
@@ -760,7 +760,7 @@ fn full_reindex_build_task_can_be_cancelled_before_it_starts_the_swap() {
     let (stop_tx, stop_rx) = std::sync::mpsc::channel();
     let root = project.path().to_path_buf();
     let handle = std::thread::spawn(move || {
-        infigraph_core::watch::watch_project_with_periodic(
+        infigraph_core::watch::run_write_coordinator(
             &root,
             || Ok(infigraph_languages::bundled_registry().unwrap()),
             50, // debounce_ms
@@ -834,7 +834,7 @@ fn full_reindex_build_task_can_be_cancelled_before_it_starts_the_swap() {
 /// vocabulary at all -- mirrors
 /// `full_reindex_build_task_can_be_cancelled_before_it_starts_the_swap`'s
 /// setup/drive/assert shape (real temp project, a real `.request` file
-/// driving `watch_project_with_periodic` on its own thread), adapted for the
+/// driving `run_write_coordinator` on its own thread), adapted for the
 /// SCIP path: unlike the full-reindex build, `daemon_token` can't be
 /// cancelled up front here, since `scip_in_flight`'s task is only scheduled
 /// *after* a successful full-reindex swap -- an already-cancelled
@@ -883,7 +883,7 @@ fn scip_enrichment_task_is_cancellable_via_daemon_token() {
     let (stop_tx, stop_rx) = std::sync::mpsc::channel();
     let root = project.path().to_path_buf();
     let handle = std::thread::spawn(move || {
-        infigraph_core::watch::watch_project_with_periodic(
+        infigraph_core::watch::run_write_coordinator(
             &root,
             || Ok(infigraph_languages::bundled_registry().unwrap()),
             50, // debounce_ms

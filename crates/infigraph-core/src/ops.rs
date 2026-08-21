@@ -62,7 +62,7 @@ fn index_lock_path(root: &Path) -> std::path::PathBuf {
 /// only one of them is safe to hard-kill. A full reindex can take
 /// minutes, so a fixed timeout can't make that call on its own; whether
 /// `begin_index_op`'s guard is still held by us is the same signal
-/// `watch_project_with_periodic`'s own shutdown path already waits on
+/// `run_write_coordinator`'s own shutdown path already waits on
 /// before it will let the process return.
 pub fn index_op_held_by_self(root: &Path) -> bool {
     lockfile::read_holder(&index_lock_path(root)).is_some_and(|h| h.pid == std::process::id())

@@ -17,7 +17,7 @@ fn watch_loop_serves_write_requests_when_serve_requests_is_true() {
     let daemon_token = tokio_util::sync::CancellationToken::new();
     let token_for_thread = daemon_token.clone();
     let handle = std::thread::spawn(move || {
-        infigraph_core::watch::watch_project_with_periodic(
+        infigraph_core::watch::run_write_coordinator(
             &root,
             || Ok(bundled_registry().unwrap()),
             50, // debounce_ms
@@ -58,7 +58,7 @@ fn watch_loop_does_not_serve_requests_when_serve_requests_is_false() {
     let daemon_token = tokio_util::sync::CancellationToken::new();
     let token_for_thread = daemon_token.clone();
     let handle = std::thread::spawn(move || {
-        infigraph_core::watch::watch_project_with_periodic(
+        infigraph_core::watch::run_write_coordinator(
             &root,
             || Ok(bundled_registry().unwrap()),
             50,
