@@ -524,6 +524,75 @@ fn watch_triggered_file_removal_contends_with_a_held_index_lock() {
     handle.join().unwrap().unwrap();
 }
 
+/// Regression test: a daemon whose watched root got deleted out from under
+/// it (a test's tempdir, a project someone `rm -rf`'d without `infigraph
+/// delete`) used to run forever, watching nothing -- `prune_stale_holder`
+/// only reaps a *dead* lock holder, and this process is very much alive.
+/// The watch loop must now notice its root is gone and shut itself down.
+#[test]
+fn watch_loop_shuts_down_when_its_root_directory_is_deleted() {
+    let project = tempfile::Builder::new()
+        .prefix("infigraph-watch-root-gone-test-")
+        .tempdir()
+        .unwrap();
+    std::fs::write(project.path().join("a.py"), "def a():\n    pass\n").unwrap();
+
+    {
+        let registry = infigraph_languages::bundled_registry().unwrap();
+        let mut boot = infigraph_core::Infigraph::open(project.path(), registry).unwrap();
+        boot.init().unwrap();
+        boot.index().unwrap();
+    }
+
+    let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+    let root = project.path().to_path_buf();
+    let handle = std::thread::spawn(move || {
+        infigraph_core::watch::watch_project_with_periodic(
+            &root,
+            || Ok(infigraph_languages::bundled_registry().unwrap()),
+            50, // debounce_ms
+            stop_rx,
+            |_evt| {},
+            0,
+            None::<fn(&infigraph_core::IndexResult)>,
+            false, // serve_requests
+            None,
+        )
+    });
+
+    // Give the watcher a moment to finish setup before pulling the rug --
+    // same generous window this file's other watch-loop tests use for a
+    // freshly spawned process.
+    std::thread::sleep(std::time::Duration::from_millis(1000));
+
+    // Keep the TempDir guard itself alive (so this test doesn't race its own
+    // Drop impl) but remove everything under it right now, from outside the
+    // watch loop.
+    std::fs::remove_dir_all(project.path()).unwrap();
+
+    // Bounded wait for self-shutdown -- the loop ticks at least every 200ms
+    // via its recv_timeout, so this should be fast; generous only to absorb
+    // scheduling noise under a loaded test run.
+    let mut exited = false;
+    for _ in 0..100 {
+        if handle.is_finished() {
+            exited = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(
+        exited,
+        "watch loop must shut itself down once its root directory is deleted, \
+         instead of running forever watching nothing"
+    );
+    // A clean shutdown that already returned, rather than one still
+    // blocked -- the send below would otherwise hang this test on a closed
+    // channel with no other signal of what went wrong.
+    let _ = stop_tx.send(());
+    handle.join().unwrap().unwrap();
+}
+
 /// Regression test for the Task 3 review finding: `route_or_serve_request`'s
 /// fallback paths (the 9 out-of-scope `WriteRequest` variants, plus
 /// malformed/corrupt requests) used to call `serve_one_request` directly

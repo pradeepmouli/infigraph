@@ -8,7 +8,7 @@
 //! `infigraph-mcp`, which has no `watch` subcommand of its own. Callers now
 //! pass the target binary path explicitly.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use anyhow::Result;
@@ -121,6 +121,101 @@ pub fn ensure_daemon_running(root: &Path, watch_binary: &Path) -> DaemonStartOut
             }
         }
         Err(e) => DaemonStartOutcome::Failed(e.to_string()),
+    }
+}
+
+/// One live process this sweep judged to be an orphaned daemon: an
+/// `infigraph daemon` still running against a root that no longer exists.
+#[derive(Debug, Clone)]
+pub struct OrphanedDaemon {
+    pub pid: u32,
+    pub cwd: PathBuf,
+}
+
+/// Find every live `infigraph daemon` process whose watched root has been
+/// deleted, without touching any of them.
+///
+/// This exists as a backstop for the watch loop's own self-check (see
+/// `watch_project_with_periodic`, which now shuts itself down once its root
+/// disappears): that check only runs while the loop is actually ticking, so
+/// a daemon that's wedged (stuck on a lock, a hung query) never reaches it.
+///
+/// A daemon's `watch.lock` -- the durable record `prune_stale_holder` and
+/// `infigraph doctor`/`infigraph ps` rely on -- lives *inside* the very
+/// directory tree the daemon watches. Once that directory is `rm -rf`'d (a
+/// deleted project, a test's tempdir), the lock file goes with it, so none
+/// of those lock-file-driven mechanisms can discover the orphan anymore --
+/// there is nothing left on disk pointing at it. The only remaining signal
+/// is the live process itself: its OS-reported working directory, set once
+/// at spawn by `build_daemon_command`'s `current_dir(root)`, still names
+/// the now-gone path.
+///
+/// Three independent signals must all agree before a process counts as an
+/// orphan (binary name, `daemon` in its own argv, and a genuinely missing
+/// cwd) -- the same "don't trust a bare identity match" discipline
+/// `prune_stale_holder` documents for its own PID-reuse guard.
+pub fn find_orphaned_daemons() -> Vec<OrphanedDaemon> {
+    let mut sys = sysinfo::System::new();
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+
+    let mut orphans = Vec::new();
+    for (pid, proc) in sys.processes() {
+        let cmd: Vec<String> = proc
+            .cmd()
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        if is_orphaned_daemon(&proc.name().to_string_lossy(), &cmd, proc.cwd()) {
+            orphans.push(OrphanedDaemon {
+                pid: pid.as_u32(),
+                // Checked non-None by `is_orphaned_daemon` just above.
+                cwd: proc
+                    .cwd()
+                    .expect("cwd checked by is_orphaned_daemon")
+                    .to_path_buf(),
+            });
+        }
+    }
+    orphans
+}
+
+/// The three-signal decision `find_orphaned_daemons` applies to each live
+/// process: binary name, `daemon` present in its own argv, and a `cwd` that
+/// genuinely no longer exists on disk. Factored out as a pure function of
+/// already-observed facts (rather than inline in the `sysinfo` loop above)
+/// so it's directly unit-testable without spawning a real process.
+fn is_orphaned_daemon(proc_name: &str, cmd: &[String], cwd: Option<&Path>) -> bool {
+    let looks_like_infigraph = {
+        let lower = proc_name.to_ascii_lowercase();
+        lower == "infigraph" || lower == "infigraph.exe"
+    };
+    if !looks_like_infigraph {
+        return false;
+    }
+    if !cmd.iter().any(|a| a == "daemon") {
+        return false;
+    }
+    match cwd {
+        Some(cwd) => !cwd.exists(),
+        None => false,
+    }
+}
+
+/// Terminate an orphaned daemon found by [`find_orphaned_daemons`]. Sends
+/// SIGTERM -- the same graceful path Ctrl-C/`infigraph kill` already use,
+/// which the watch loop already releases its lock cleanly on receipt of --
+/// never SIGKILL: a daemon that's merely slow to notice its root is gone
+/// still deserves the chance to shut down cleanly.
+pub fn kill_orphaned_daemon(pid: u32) {
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(pid as libc::pid_t, libc::SIGTERM);
+    }
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .args(["/PID", &pid.to_string()])
+            .output();
     }
 }
 
@@ -418,5 +513,91 @@ mod tests {
             contents, "previous daemon's output\n",
             "opening the log for a new spawn attempt must not truncate prior content"
         );
+    }
+
+    /// `is_orphaned_daemon` is the pure decision `find_orphaned_daemons`
+    /// applies per live process -- exercised here directly with synthetic
+    /// facts rather than a real spawned process, since a real daemon's own
+    /// self-check (`watch_project_with_periodic`'s root-existence check)
+    /// would race this test's own deletion the moment it's spawned.
+    mod is_orphaned_daemon_tests {
+        use super::super::is_orphaned_daemon;
+
+        #[test]
+        fn matches_a_daemon_process_whose_cwd_is_gone() {
+            let tmp = tempfile::tempdir().unwrap();
+            let gone = tmp.path().join("gone-project");
+            std::fs::create_dir_all(&gone).unwrap();
+            std::fs::remove_dir_all(&gone).unwrap();
+
+            assert!(is_orphaned_daemon(
+                "infigraph",
+                &["/usr/local/bin/infigraph".to_string(), "daemon".to_string()],
+                Some(&gone),
+            ));
+        }
+
+        #[test]
+        fn does_not_match_when_cwd_still_exists() {
+            let tmp = tempfile::tempdir().unwrap();
+            assert!(
+                !is_orphaned_daemon(
+                    "infigraph",
+                    &["/usr/local/bin/infigraph".to_string(), "daemon".to_string()],
+                    Some(tmp.path()),
+                ),
+                "a daemon watching a directory that still exists is healthy, not orphaned"
+            );
+        }
+
+        #[test]
+        fn does_not_match_a_differently_named_binary() {
+            let tmp = tempfile::tempdir().unwrap();
+            let gone = tmp.path().join("gone-project");
+            std::fs::create_dir_all(&gone).unwrap();
+            std::fs::remove_dir_all(&gone).unwrap();
+
+            assert!(
+                !is_orphaned_daemon(
+                    "infigraph-mcp",
+                    &[
+                        "/usr/local/bin/infigraph-mcp".to_string(),
+                        "daemon".to_string()
+                    ],
+                    Some(&gone),
+                ),
+                "must not match an unrelated binary that merely shares a substring, \
+                 same discipline prune_stale_holder's own guard documents"
+            );
+        }
+
+        #[test]
+        fn does_not_match_an_infigraph_process_that_is_not_the_daemon_role() {
+            let tmp = tempfile::tempdir().unwrap();
+            let gone = tmp.path().join("gone-project");
+            std::fs::create_dir_all(&gone).unwrap();
+            std::fs::remove_dir_all(&gone).unwrap();
+
+            assert!(
+                !is_orphaned_daemon(
+                    "infigraph",
+                    &["/usr/local/bin/infigraph".to_string(), "index".to_string()],
+                    Some(&gone),
+                ),
+                "a plain `infigraph index` invocation must never be mistaken for a daemon"
+            );
+        }
+
+        #[test]
+        fn does_not_match_when_cwd_could_not_be_determined() {
+            assert!(
+                !is_orphaned_daemon(
+                    "infigraph",
+                    &["/usr/local/bin/infigraph".to_string(), "daemon".to_string()],
+                    None,
+                ),
+                "no cwd signal at all must never be treated as proof the root is gone"
+            );
+        }
     }
 }

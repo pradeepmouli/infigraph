@@ -243,6 +243,25 @@ where
             break;
         }
 
+        // Self-terminate once the watched root is gone (`rm -rf`'d project,
+        // a test's tempdir, a removed worktree that skipped `worktree
+        // teardown`). No dedicated poll timer needed for this -- the loop
+        // already ticks at least every 200ms via the `recv_timeout` below
+        // regardless of whether a real fsevent fired, so this check rides
+        // that existing cadence for free. Without it, a daemon whose target
+        // directory disappeared keeps running forever: `prune_stale_holder`
+        // only reaps a *dead* holder, and this process is very much alive,
+        // just watching nothing. `infigraph gc --global` sweeps the
+        // registry for the same condition as a backstop for a daemon that's
+        // wedged and never reaches this check.
+        if !root.exists() {
+            eprintln!(
+                "[watch] {} no longer exists -- shutting down",
+                root.display()
+            );
+            break;
+        }
+
         // Shared drain step, in two halves: reap whatever finished since the
         // last tick (here), then schedule the next one (at the end of the
         // tick). The drain itself combines everything every producer below

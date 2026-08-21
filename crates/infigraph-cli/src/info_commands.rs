@@ -890,7 +890,16 @@ pub(crate) fn cmd_gc(dry_run: bool, stale_days: Option<u64>) -> Result<()> {
     let plan =
         infigraph_core::gc::plan_registry_gc(&registry, stale_days, std::time::SystemTime::now());
 
-    if plan.is_empty() {
+    // Independent of the registry plan above: a daemon can be watching a
+    // deleted directory (a test's ephemeral tempdir, a project someone
+    // `rm -rf`'d without `infigraph delete`) that was never a registry
+    // entry in the first place, so this must not be gated on
+    // `plan.is_empty()`. See `find_orphaned_daemons`'s doc comment for why
+    // this needs a live-process sweep rather than the registry/lock-file
+    // path the eviction above uses.
+    let orphaned_daemons = infigraph_core::watch::daemon::find_orphaned_daemons();
+
+    if plan.is_empty() && orphaned_daemons.is_empty() {
         println!("Registry is clean -- nothing to evict.");
         return Ok(());
     }
@@ -901,16 +910,21 @@ pub(crate) fn cmd_gc(dry_run: bool, stale_days: Option<u64>) -> Result<()> {
     for (group, member) in &plan.dangling_group_members {
         println!("prune: group '{group}' member '{member}' (no longer registered)");
     }
+    for d in &orphaned_daemons {
+        println!(
+            "kill: infigraph daemon pid {} -- watched root no longer exists ({})",
+            d.pid,
+            d.cwd.display()
+        );
+    }
 
     if dry_run {
         println!(
-            "\nDry run -- nothing changed. Re-run without --dry-run to evict {} entr{}.",
+            "\nDry run -- nothing changed. Re-run without --dry-run to evict {} entr{} and kill {} orphaned daemon{}.",
             plan.evictions.len(),
-            if plan.evictions.len() == 1 {
-                "y"
-            } else {
-                "ies"
-            }
+            if plan.evictions.len() == 1 { "y" } else { "ies" },
+            orphaned_daemons.len(),
+            if orphaned_daemons.len() == 1 { "" } else { "s" },
         );
         return Ok(());
     }
@@ -934,12 +948,23 @@ pub(crate) fn cmd_gc(dry_run: bool, stale_days: Option<u64>) -> Result<()> {
             &format!("{group}/{member}"),
         );
     }
+    for d in &orphaned_daemons {
+        infigraph_core::watch::daemon::kill_orphaned_daemon(d.pid);
+        infigraph_core::audit::audit_log(
+            "gc",
+            "kill-orphaned-daemon",
+            "watched root no longer exists",
+            &format!("pid {} ({})", d.pid, d.cwd.display()),
+        );
+    }
 
     println!(
-        "\nEvicted {} registry entr{}, pruned {} group member(s). Audit: ~/.infigraph/logs/audit.log",
+        "\nEvicted {} registry entr{}, pruned {} group member(s), killed {} orphaned daemon{}. Audit: ~/.infigraph/logs/audit.log",
         plan.evictions.len(),
         if plan.evictions.len() == 1 { "y" } else { "ies" },
-        plan.dangling_group_members.len()
+        plan.dangling_group_members.len(),
+        orphaned_daemons.len(),
+        if orphaned_daemons.len() == 1 { "" } else { "s" },
     );
     Ok(())
 }

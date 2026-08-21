@@ -1632,40 +1632,6 @@ mod tests {
     }
 
     #[test]
-    fn global_hook_exclusion_list_is_exhaustive() {
-        // Commands that should NOT trigger auto-watcher
-        let excluded = [
-            "daemon",
-            "watch-stop",
-            "watch-status",
-            "scip-enrich",
-            "delete",
-            "update",
-            "install",
-            "uninstall",
-            "init",
-            "languages",
-            "repos",
-            "clean-runtimes",
-        ];
-        // Verify none of these are index-dependent commands
-        for cmd in &excluded {
-            assert!(
-                ![
-                    "search",
-                    "callers",
-                    "callees",
-                    "dead-code",
-                    "stats",
-                    "impact"
-                ]
-                .contains(cmd),
-                "{cmd} should not be in exclusion list"
-            );
-        }
-    }
-
-    #[test]
     fn ensure_watcher_noop_when_ci_env_set() {
         std::env::set_var("CI", "true");
         let tmp = TempDir::new().unwrap();

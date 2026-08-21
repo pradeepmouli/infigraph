@@ -890,6 +890,37 @@ pub(crate) enum WorktreeAction {
     },
 }
 
+/// Whether `command` should trigger the pre-dispatch background-watcher
+/// auto-start (`index::ensure_watcher_running`).
+///
+/// Allow-list, not deny-list: auto-watch exists to keep the graph fresh
+/// after source content changes, so only commands that actually ingest
+/// source/content into this project's graph warrant it. A read-only
+/// command (search, stats, callers, query, ...) has no reason to spawn a
+/// background watcher as a side effect -- doing so is what caused
+/// long-lived orphaned daemons to accumulate under
+/// `INFIGRAPH_BACKEND=daemon` (one per invocation against a project, never
+/// reaped when the project goes away). `Commands::Group { .. }` is
+/// deliberately excluded here: `cmd_group`'s own `GroupAction::Index`
+/// already calls `ensure_watcher_running` per member repo after indexing
+/// each one, which is the precise case that matters -- this gate would
+/// only ever apply to the CLI invocation's own `root`, which is usually
+/// irrelevant for a `group` command acting on other registered repos by
+/// name. `ScipEnrich` is excluded too: it's a hidden internal command
+/// `cmd_index` itself spawns as a background subprocess, so the parent
+/// `index` invocation has already triggered auto-watch.
+pub(crate) fn should_auto_watch(command: &Commands) -> bool {
+    matches!(
+        command,
+        Commands::Index { .. }
+            | Commands::IndexDocs
+            | Commands::ReindexDocs
+            | Commands::IndexConfluence { .. }
+            | Commands::IndexManifests
+            | Commands::ScipImport { .. }
+    )
+}
+
 fn main() -> Result<()> {
     // ANTLR parsers recurse deeply; Rayon's default 2MB stack overflows.
     // Windows default main-thread stack is 1MB — also too small.
@@ -902,23 +933,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let root = cli.root.unwrap_or_else(|| PathBuf::from("."));
 
-    let should_auto_watch = !matches!(
-        cli.command,
-        Commands::Daemon { .. }
-            | Commands::WatchStop
-            | Commands::WatchStatus
-            | Commands::ScipEnrich { .. }
-            | Commands::Delete
-            | Commands::Clone { .. }
-            | Commands::Worktree { .. }
-            | Commands::Update
-            | Commands::Install { .. }
-            | Commands::Uninstall
-            | Commands::Init { .. }
-            | Commands::Languages
-            | Commands::Repos
-            | Commands::CleanRuntimes
-    );
+    let should_auto_watch = should_auto_watch(&cli.command);
 
     let result = std::thread::Builder::new()
         .stack_size(32 * 1024 * 1024)
@@ -1218,5 +1233,83 @@ fn run(command: Commands, root: &Path) -> Result<()> {
                 worktree_commands::cmd_worktree_reconcile(global)
             }
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn should_auto_watch_allows_only_source_ingesting_commands() {
+        assert!(should_auto_watch(&Commands::Index {
+            full: false,
+            no_embed: false,
+        }));
+        assert!(should_auto_watch(&Commands::IndexDocs));
+        assert!(should_auto_watch(&Commands::ReindexDocs));
+        assert!(should_auto_watch(&Commands::IndexManifests));
+        assert!(should_auto_watch(&Commands::ScipImport {
+            index: PathBuf::from("index.scip"),
+        }));
+        assert!(should_auto_watch(&Commands::IndexConfluence {
+            base_url: String::new(),
+            space: String::new(),
+            page_ids: None,
+            pat: None,
+            email: None,
+            api_token: None,
+            follow_links: false,
+            follow_depth: 1,
+            max_pages: 100,
+        }));
+    }
+
+    #[test]
+    fn should_auto_watch_excludes_read_only_and_management_commands() {
+        // A representative sample, not exhaustive: read-only queries,
+        // process/lifecycle management, and the two commands whose own
+        // handlers already trigger watching more precisely than this
+        // top-level gate could (see should_auto_watch's doc comment).
+        assert!(!should_auto_watch(&Commands::Search {
+            query: String::new(),
+            limit: 10,
+            alpha: 0.3,
+        }));
+        assert!(!should_auto_watch(&Commands::Stats));
+        assert!(!should_auto_watch(&Commands::Callers {
+            symbol: String::new(),
+        }));
+        assert!(!should_auto_watch(&Commands::Callees {
+            symbol: String::new(),
+        }));
+        assert!(!should_auto_watch(&Commands::DeadCode));
+        assert!(!should_auto_watch(&Commands::Impact {
+            symbol: String::new(),
+            depth: 3,
+        }));
+        assert!(!should_auto_watch(&Commands::Daemon { debounce: 500 }));
+        assert!(!should_auto_watch(&Commands::WatchStop));
+        assert!(!should_auto_watch(&Commands::WatchStatus));
+        assert!(!should_auto_watch(&Commands::Delete));
+        assert!(!should_auto_watch(&Commands::Update));
+        assert!(!should_auto_watch(&Commands::Init {
+            group: None,
+            quick: false,
+            yes: false,
+        }));
+        assert!(!should_auto_watch(&Commands::ScipEnrich {
+            languages: String::new(),
+        }));
+        // Group's own GroupAction::Index already calls
+        // ensure_watcher_running per member repo -- this top-level gate
+        // must stay out of the way regardless of which action is requested.
+        assert!(!should_auto_watch(&Commands::Group {
+            action: GroupAction::Query {
+                group: String::new(),
+                cypher: String::new(),
+                combined: false,
+            },
+        }));
     }
 }
