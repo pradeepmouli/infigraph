@@ -46,8 +46,9 @@ sysinfo = "0.39.6"
 # loop. The `neo4j`/`postgres` features used to pull this in optionally and
 # now share this one entry -- `rt-multi-thread` is the only feature either
 # of them ever asked for.
-# Features expanded for daemon/watch command split: time, process for CancellationToken.
-tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "time", "process"] }
+# Features expanded for daemon/watch command split: time, process for
+# CancellationToken; macros for the `tokio::select!` in watch::producer.
+tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "time", "process", "macros"] }
 tokio-util = "0.7"
 
 [target.'cfg(unix)'.dependencies]
@@ -73,8 +74,6 @@ features = ["postgres"]
 optional = true
 
 [dev-dependencies]
-# "macros" enables #[tokio::test]; kept dev-only since production code never needs it.
-tokio = { version = "1", features = ["macros"] }
 tree-sitter-python = "0.25"
 tree-sitter-kotlin-ng = "1.1"
 tree-sitter-dart = "0.2"

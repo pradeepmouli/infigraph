@@ -1,7 +1,8 @@
 pub mod batch;
 pub mod daemon;
 pub(crate) mod drain;
-pub(crate) mod queue;
+pub mod producer;
+pub mod queue;
 pub mod task;
 
 use std::path::{Path, PathBuf};
@@ -934,7 +935,7 @@ where
 /// each while every actually-changed file is still picked up, including
 /// any the storm's event flood dropped or that arrived after the window
 /// closed, and the scan's stale-file sweep prunes removals too.
-fn flush_batch_into_queue(
+pub(crate) fn flush_batch_into_queue(
     q: &mut crate::watch::queue::IndexWorkQueue,
     paths: Vec<PathBuf>,
     root: &Path,
@@ -1840,7 +1841,7 @@ fn has_cross_file_calls(prism: &Infigraph, rel_path: &str) -> bool {
     false
 }
 
-fn register_watch_dirs(watcher: &mut RecommendedWatcher, root: &Path) -> Result<()> {
+pub(crate) fn register_watch_dirs(watcher: &mut RecommendedWatcher, root: &Path) -> Result<()> {
     for result in crate::ignore_rules::walk_builder(root).build() {
         let Ok(entry) = result else { continue };
         if entry.file_type().is_some_and(|ft| ft.is_dir()) {

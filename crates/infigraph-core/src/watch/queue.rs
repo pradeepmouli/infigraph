@@ -69,8 +69,13 @@ pub(crate) struct DrainedQueue {
 /// ad-hoc `WriteRequest` variants). Has no timer of its own -- producers own
 /// their own timing (see the design spec's "Debounce ownership" section);
 /// this type just merges whatever's been contributed since the last drain.
+///
+/// Public only so `watch::producer::run_producer` can name it in its
+/// signature (and so integration tests can construct one); every method
+/// that mutates real index intent stays `pub(crate)` -- outside callers can
+/// create a queue and observe emptiness, nothing more.
 #[derive(Debug, Default)]
-pub(crate) struct IndexWorkQueue {
+pub struct IndexWorkQueue {
     items: HashMap<String, PendingIndexItem>,
     removals: HashSet<String>,
     removal_prefixes: HashSet<String>,
@@ -80,7 +85,7 @@ pub(crate) struct IndexWorkQueue {
 
 impl IndexWorkQueue {
     #[allow(dead_code)]
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self::default()
     }
 
@@ -166,7 +171,7 @@ impl IndexWorkQueue {
     }
 
     #[allow(dead_code)]
-    pub(crate) fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.items.is_empty()
             && self.removals.is_empty()
             && self.removal_prefixes.is_empty()
