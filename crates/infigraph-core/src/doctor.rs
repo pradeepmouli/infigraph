@@ -302,7 +302,8 @@ fn check_unregistered_projects(ctx: &DoctorContext) -> CheckResult {
                 ctx.scan_roots.len(),
                 unreadable_roots.join(", ")
             ),
-            "check that the scan root(s) exist and are readable",
+            "check that the scan root(s) exist and are readable, or edit INFIGRAPH_SCAN_ROOTS / \
+             ~/.infigraph/scan_roots.txt to remove them",
         )
     } else {
         CheckResult::pass(
@@ -803,7 +804,10 @@ fn check_one_sidecar(project_path: &Path, sidecar_name: &str) -> Option<CheckRes
                 "sidecar is {} minutes older than the graph",
                 staleness.as_secs() / 60
             ),
-            "reindex to refresh the sidecar",
+            format!(
+                "run `infigraph index {}` to refresh it",
+                project_path.display()
+            ),
         )),
         _ => Some(CheckResult::pass(
             SIDECAR_CATEGORY,
