@@ -114,7 +114,7 @@ pub enum WriteRequest {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum WatchRole {
     Code,
     Docs,
@@ -124,7 +124,7 @@ pub enum WatchRole {
     Daemon,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub enum WatchAction {
     Start,
     Stop,
