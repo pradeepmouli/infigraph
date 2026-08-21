@@ -2,6 +2,7 @@ pub mod batch;
 pub mod daemon;
 pub(crate) mod drain;
 pub(crate) mod queue;
+pub mod task;
 
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};

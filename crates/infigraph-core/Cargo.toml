@@ -73,6 +73,8 @@ features = ["postgres"]
 optional = true
 
 [dev-dependencies]
+# "macros" enables #[tokio::test]; kept dev-only since production code never needs it.
+tokio = { version = "1", features = ["macros"] }
 tree-sitter-python = "0.25"
 tree-sitter-kotlin-ng = "1.1"
 tree-sitter-dart = "0.2"
