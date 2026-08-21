@@ -46,7 +46,9 @@ sysinfo = "0.39.6"
 # loop. The `neo4j`/`postgres` features used to pull this in optionally and
 # now share this one entry -- `rt-multi-thread` is the only feature either
 # of them ever asked for.
-tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread"] }
+# Features expanded for daemon/watch command split: time, process for CancellationToken.
+tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "time", "process"] }
+tokio-util = "0.7"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
