@@ -131,6 +131,22 @@ cooperatively cancel via `daemon_token` rather than purely waited out — the wa
 polling mechanism (`index_op_held_by_self`, `watchdog_should_defer`, the grace/ceiling
 durations from R5.4) does not change, and drain-in-flight is still purely waited out as today.
 
+### Async subprocess spawning for SCIP indexers
+
+`run_scip_indexers` (Part A of a full reindex, per `cmd_daemon`'s own comment: "Part A
+(running the external indexer binaries) is deliberately unlocked... Part B [Kuzu
+import]... needs `index.lock`") has no Kuzu dependency at all — it's pure OS process
+management, currently done via `run_with_timeout`'s blocking `Command::spawn()` plus a
+busy-poll `try_wait()` loop. Unlike Part B (the Kuzu-touching build-fresh-then-swap, which
+stays `spawn_blocking`-wrapped inside `IndexingTask` — see below), Part A genuinely can become
+async: `tokio::process::Command` + `.wait().await` is a real non-blocking wait, integrated with
+the OS's process-exit notification via tokio's reactor, not a poll loop — a strict improvement
+over what's there today, and it lets indexer subprocesses for different languages run
+concurrently as real async tasks instead of each consuming a blocking-thread-pool slot.
+`run_scip_indexers` moves onto `tokio::process::Command`; `run_with_timeout`'s busy-poll
+`try_wait()` pattern is retired in favor of `tokio::time::timeout(...)` wrapping the async
+`.wait()`.
+
 ### Cancellation hierarchy
 
 ```
@@ -222,8 +238,9 @@ pausing a currently-live one.
   `CancellationToken`.
 - Widen `infigraph-core`'s existing `tokio` dependency (currently `default-features = false,
   features = ["rt", "rt-multi-thread"]`, used only for `drain_rt`'s `spawn_blocking` executor)
-  to add `"time"` (for `tokio::time::interval`/`sleep`) and confirm whether `tokio_util`
-  requires tokio's `"sync"` feature transitively — verify exact flags at implementation time.
+  to add `"time"` (for `tokio::time::interval`/`sleep`) and `"process"` (for
+  `tokio::process::Command`), and confirm whether `tokio_util` requires tokio's `"sync"`
+  feature transitively — verify exact flags at implementation time.
 
 ## Error handling / edge cases
 
@@ -257,6 +274,11 @@ pausing a currently-live one.
   of a real full-reindex/SCIP body — mirrors the existing per-variant test isolation but for
   the unified type. `InFlightDrain`'s existing tests are untouched, since the struct itself
   doesn't change.
+- Unit: `run_scip_indexers` on `tokio::process::Command` — a real short-lived child process,
+  confirm the non-blocking `.wait()` path and `tokio::time::timeout` cancellation behave
+  equivalently to today's `run_with_timeout` coverage (e.g.
+  `scip_enrich_exit_message_warns_on_nonzero_exit`), and that multiple language indexers
+  genuinely run concurrently rather than serially.
 - Unit: `watch_enabled("watch")` / `watch_enabled("watch_docs")` precedence (env var → config
   → default), mirroring the existing `auto_start_watch_on_boot_enabled_env_override_priority`
   test shape.
