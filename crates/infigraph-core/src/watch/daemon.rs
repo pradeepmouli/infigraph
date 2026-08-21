@@ -279,10 +279,21 @@ pub fn kill_orphaned_daemon(pid: u32) {
 
 /// If `lock_path`'s current holder is dead, or alive but running a
 /// different build than this process, terminate it and wait briefly for
-/// the lock to be released. Returns `true` if the holder was found to be
-/// stale (dead, or a live-but-outdated build that was signaled), `false`
-/// if the holder is live and current, or no holder identity could be read
-/// at all (nothing actionable to prune).
+/// it to actually exit. Returns `true` if the holder was found to be
+/// stale (already dead, or signaled and confirmed to have exited), `false`
+/// if the holder is live and current, no holder identity could be read at
+/// all (nothing actionable to prune), or a signaled holder is still alive
+/// once the wait budget runs out.
+///
+/// That last case matters: the lock file's payload disappearing is not
+/// proof the signaled process is gone (`Drop for LockFile` clears the
+/// payload and releases the flock before the process finishes unwinding
+/// and actually exits), so a caller that treats "lock content gone" as
+/// license to spawn a fresh daemon can end up racing a new watcher's
+/// startup against the old one's last few hundred ms of shutdown --
+/// or, if the signal was never delivered/handled at all, spawning a
+/// second permanent watcher alongside a first that never leaves. Waiting
+/// on the PID itself catches both.
 ///
 /// PID-reuse guard: `LockInfo` (unlike the MCP instance registry) carries
 /// no OS-reported process-start-time to re-verify against, so a bare PID
@@ -340,13 +351,28 @@ fn prune_stale_holder(lock_path: &Path) -> bool {
 
     const ATTEMPTS: u32 = 20;
     const DELAY: std::time::Duration = std::time::Duration::from_millis(100);
-    for _ in 0..ATTEMPTS {
-        if crate::lockfile::read_holder(lock_path).is_none() {
-            break;
+    wait_for_pid_exit(spid, &mut sys, ATTEMPTS, DELAY)
+}
+
+/// Poll `sys` for `pid` up to `attempts` times, `delay` apart. Returns
+/// `true` as soon as the PID is no longer found running, `false` if it's
+/// still alive after the last attempt. Split out from [`prune_stale_holder`]
+/// so the wait-then-confirm logic is testable against a real, deterministic
+/// child process instead of a live SIGTERM/signal-handling race.
+fn wait_for_pid_exit(
+    pid: sysinfo::Pid,
+    sys: &mut sysinfo::System,
+    attempts: u32,
+    delay: std::time::Duration,
+) -> bool {
+    for _ in 0..attempts {
+        sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
+        if sys.process(pid).is_none() {
+            return true;
         }
-        std::thread::sleep(DELAY);
+        std::thread::sleep(delay);
     }
-    true
+    false
 }
 
 /// Build (without spawning) the `Command` used to launch a detached
@@ -458,7 +484,7 @@ pub fn resolve_cli_binary_sibling_of(current_exe: &Path) -> Result<std::path::Pa
 
 #[cfg(test)]
 mod tests {
-    use super::{daemon_is_alive, prune_stale_holder};
+    use super::{daemon_is_alive, prune_stale_holder, wait_for_pid_exit};
     use crate::lockfile::LockInfo;
 
     fn write_lock_info(path: &std::path::Path, info: &LockInfo) {
@@ -592,6 +618,47 @@ mod tests {
             !prune_stale_holder(&lock_path),
             "a live PID whose process name doesn't look like infigraph must not be pruned/signaled"
         );
+    }
+
+    /// An already-exited (and reaped) PID must be reported as gone on the
+    /// very first check -- the ordinary "the signal worked" case.
+    #[test]
+    #[cfg(unix)]
+    fn wait_for_pid_exit_returns_true_once_the_child_actually_exits() {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = sysinfo::Pid::from_u32(child.id());
+        child.wait().unwrap(); // let it fully exit and reap before polling
+        let mut sys = sysinfo::System::new();
+
+        assert!(
+            wait_for_pid_exit(pid, &mut sys, 5, std::time::Duration::from_millis(10)),
+            "an already-exited (and reaped) PID must be reported as gone on the first check"
+        );
+    }
+
+    /// The gap the old code had: it treated the lock *file's* payload
+    /// disappearing as proof the signaled holder was gone, and always
+    /// returned `true` regardless -- so a caller could spawn a second
+    /// daemon while the first was still fully alive. A process still
+    /// running once the wait budget is exhausted must be reported as
+    /// NOT confirmed-exited.
+    #[test]
+    #[cfg(unix)]
+    fn wait_for_pid_exit_returns_false_when_the_process_outlives_the_budget() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .unwrap();
+        let pid = sysinfo::Pid::from_u32(child.id());
+        let mut sys = sysinfo::System::new();
+
+        assert!(
+            !wait_for_pid_exit(pid, &mut sys, 3, std::time::Duration::from_millis(20)),
+            "a process still running once the budget is exhausted must not be reported as exited"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     /// `build_daemon_command` must open `watch.log` in append mode: a losing
