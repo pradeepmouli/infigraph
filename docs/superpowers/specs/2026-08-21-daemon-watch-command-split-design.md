@@ -282,10 +282,27 @@ Ctrl-C to the PID recorded in `watch.lock`, caught by the daemon's existing hand
 in-process `DOC_WATCHERS` entry to touch once a daemon is alive).
 
 So the token hierarchy governs propagation *inside* the daemon process once triggered; it does
-not replace the sentinel mechanism, it sits behind it. Producer `Task<()>`s poll for their
-sentinel (in their `tokio::select!`, via `interval.tick()`, alongside `token.cancelled()`) and
-translate a sentinel's presence into cancelling their own local token — a targeted,
-sub-process-level analog of what a full OS signal does for `daemon stop`. Every *external*
+not replace the sentinel mechanism, it sits behind it. Producer `Task<()>`s detect their
+sentinel/config changes via a **second, narrow `notify::Watcher` registration scoped to
+`.infigraph/` itself** (non-recursive), feeding a common handler in the same `tokio::select!`
+alongside `token.cancelled()` — event-driven, not a poll timer. This needs its own registration
+because `.infigraph/` is deliberately excluded from the main project-content watch today
+(`register_watch_dirs` walks via `ignore_rules::walk_builder`, which sets `.hidden(true)` —
+watching the daemon's own constant writes to `graph`/`embeddings.bin`/WAL files/locks would be
+a feedback loop). The handler itself doesn't need to filter which file inside `.infigraph/`
+changed — any event there is cheap to treat as "wake up and recheck sentinel/`config.toml`
+state," so unfiltered churn from the daemon's own writes is harmless, just an extra
+near-free `sentinel.exists()`/config re-read per event. This is strictly better than the
+interval-poll alternative: near-instant reaction instead of bounded by a poll cadence, and no
+more complex to implement — one more `tokio::select!` arm, not per-path logic. (The
+ignore-matcher-rebuild ticker elsewhere stays a `tokio::time::interval`, since there's no
+natural event to hang that one on — it's about picking up edits to `.gitignore`/
+`.infigraphignore` themselves, which *are* covered by the main content watch, just not on a
+useful cadence for that purpose.)
+
+A sentinel's own presence/absence translates into cancelling the producer's own local token —
+a targeted, sub-process-level analog of what a full OS signal does for `daemon stop`. Every
+*external*
 caller (a fresh CLI process's `watch stop`/`watch-docs stop`, and both the existing and new MCP
 tools) funnels through this same file-based bridge when targeting an already-running external
 daemon. Only a *same-process* caller — MCP's own in-process, non-daemon-mode watcher; the
