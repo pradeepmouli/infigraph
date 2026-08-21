@@ -6,6 +6,13 @@ use anyhow::{Context, Result};
 use infigraph_core::graph::GraphBackend;
 use infigraph_core::Infigraph;
 use infigraph_languages::bundled_registry;
+use tokio_util::sync::CancellationToken;
+
+/// Per-indexer subprocess timeout for SCIP enrichment. Nothing before Task 6
+/// of the daemon/watch command split bounded a hung SCIP indexer at all --
+/// 10 minutes is generous enough for `rust-analyzer`'s cold-start
+/// `cargo metadata` resolution but still bounded rather than infinite.
+const SCIP_INDEXER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 
 pub(crate) fn cmd_index(root: &Path, full: bool, no_embed: bool) -> Result<()> {
     // Under the daemon backend this command performs no local graph writes:
@@ -888,6 +895,7 @@ pub(crate) fn cmd_scip_enrich(root: &Path, detected_languages: &std::collections
 pub(crate) fn run_scip_indexers(
     root: &Path,
     detected_languages: &std::collections::HashSet<String>,
+    token: &CancellationToken,
 ) -> Vec<(&'static str, PathBuf, bool)> {
     use crate::scip_download;
 
@@ -926,19 +934,79 @@ pub(crate) fn run_scip_indexers(
         return Vec::new();
     }
 
-    // Run indexers in parallel with per-indexer output paths
-    std::thread::scope(|s| {
-        let handles: Vec<_> = tasks
-            .iter()
+    // Run indexers on a small local runtime -- this function is called from
+    // `on_full_reindex`, which itself already runs inside a
+    // `Task::spawn_blocking` context (not on an async runtime), so it can't
+    // just `tokio::task::spawn` directly; it needs to bring its own runtime
+    // to drive that async work.
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("Auto-SCIP: failed to start local runtime for SCIP indexers: {e}");
+            let _ = std::fs::remove_dir_all(&scip_tmp);
+            return Vec::new();
+        }
+    };
+
+    let root = root.to_path_buf();
+    rt.block_on(async {
+        let jobs: Vec<IndexerJob> = tasks
+            .into_iter()
             .map(|(indexer, bin, output_path)| {
-                s.spawn(move || {
-                    let success = run_scip_indexer_to(root, bin, indexer, output_path);
-                    (indexer.binary_name, output_path.clone(), success)
-                })
+                let root = root.clone();
+                let output_path_for_fut = output_path.clone();
+                let fut: std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>> =
+                    Box::pin(async move {
+                        run_scip_indexer_to(&root, &bin, indexer, &output_path_for_fut).await
+                    });
+                (indexer.binary_name, output_path, fut)
             })
             .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
+        run_cancellable_indexer_batch(jobs, token).await
     })
+}
+
+type IndexerJob = (
+    &'static str,
+    PathBuf,
+    std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>,
+);
+
+/// Launches `jobs` as tokio tasks one at a time, checking `token` before
+/// each launch -- once cancelled, no further jobs are started, but every job
+/// already launched is still awaited and its result kept (a cancellation
+/// mid-batch must not discard indexers that already finished or are still
+/// running).
+async fn run_cancellable_indexer_batch(
+    jobs: Vec<IndexerJob>,
+    token: &CancellationToken,
+) -> Vec<(&'static str, PathBuf, bool)> {
+    let mut handles = Vec::with_capacity(jobs.len());
+    for (label, output_path, fut) in jobs {
+        if token.is_cancelled() {
+            eprintln!(
+                "Auto-SCIP: cancelled -- not launching remaining indexer(s), starting with {label}"
+            );
+            break;
+        }
+        handles.push((label, output_path, tokio::task::spawn(fut)));
+        // Give the runtime a scheduling turn before the next iteration's
+        // cancellation check -- without this, a tight loop of `spawn` calls
+        // never actually hands control back to the runtime, so a
+        // cancellation requested concurrently (e.g. daemon shutdown, driven
+        // by a separate task on this same runtime) would never be observed
+        // until every job had already been launched.
+        tokio::task::yield_now().await;
+    }
+
+    let mut results = Vec::with_capacity(handles.len());
+    for (label, output_path, handle) in handles {
+        results.push((label, output_path, handle.await.unwrap()));
+    }
+    results
 }
 
 /// Part B+C of SCIP enrichment: import each indexer's `.scip` results into
@@ -1031,7 +1099,12 @@ pub(crate) fn run_auto_scip_on(
     prism: &Infigraph,
     detected_languages: &std::collections::HashSet<String>,
 ) {
-    let results = run_scip_indexers(root, detected_languages);
+    // The standalone CLI path has no daemon-lifetime token to thread through
+    // -- a fresh, unparented one is never cancelled, matching this path's
+    // always-run-to-completion behavior from before Task 6's cancellation
+    // checkpoint existed.
+    let token = CancellationToken::new();
+    let results = run_scip_indexers(root, detected_languages, &token);
     if results.is_empty() {
         return;
     }
@@ -1092,7 +1165,7 @@ fn should_run_indexer(root: &Path, indexer: &crate::scip_download::ScipIndexer) 
     true
 }
 
-fn run_scip_indexer_to(
+async fn run_scip_indexer_to(
     root: &Path,
     bin: &Path,
     indexer: &crate::scip_download::ScipIndexer,
@@ -1110,10 +1183,18 @@ fn run_scip_indexer_to(
     };
 
     if indexer.binary_name == "scip-java" {
+        // `run_scip_java`'s gradle/maven primary+fallback retry logic is
+        // out of scope for Task 6 and stays on the synchronous
+        // `std::process::Command` path (`run_scip_indexer_cmd` below) -- it
+        // blocks this async task's worker thread for its duration. On the
+        // `current_thread` runtime `run_scip_indexers` wraps itself in, a
+        // scip-java run temporarily starves any other indexer tasks queued
+        // alongside it (no `SCIP_INDEXER_TIMEOUT` bound either). Documented
+        // as a known follow-up rather than silently left inconsistent.
         return run_scip_java(root, &cmd_str, output_path, extra_path);
     }
 
-    run_scip_indexer_cmd(
+    run_scip_indexer_cmd_async(
         root,
         &cmd_str,
         indexer.scip_args,
@@ -1121,7 +1202,9 @@ fn run_scip_indexer_to(
         extra_path,
         indexer.output_flag,
         output_path,
+        SCIP_INDEXER_TIMEOUT,
     )
+    .await
 }
 
 fn run_scip_java(root: &Path, cmd: &str, output_path: &Path, extra_path: Option<&str>) -> bool {
@@ -1236,6 +1319,84 @@ fn run_scip_indexer_cmd(
         }
         Err(e) => {
             eprintln!("Auto-SCIP: failed to run {label}: {e}");
+            false
+        }
+    }
+}
+
+/// Async, timeout-bounded equivalent of `run_scip_indexer_cmd` above, used
+/// by every non-`scip-java` indexer path (see `run_scip_indexer_to`).
+#[allow(clippy::too_many_arguments)]
+async fn run_scip_indexer_cmd_async(
+    root: &Path,
+    cmd: &str,
+    args: &[&str],
+    label: &str,
+    extra_path: Option<&str>,
+    output_flag: Option<&str>,
+    output_path: &Path,
+    timeout: std::time::Duration,
+) -> bool {
+    let mut command = tokio::process::Command::new(cmd);
+    // A timed-out run drops the in-flight `child.wait()` future below,
+    // dropping the `Child` itself -- without `kill_on_drop`, tokio leaves
+    // the orphaned process running rather than reaping it, which would
+    // defeat the point of adding a timeout at all.
+    command.args(args).current_dir(root).kill_on_drop(true);
+
+    if let Some(flag) = output_flag {
+        command.arg(flag).arg(output_path);
+    }
+
+    if let Some(extra) = extra_path {
+        let path = std::env::var("PATH").unwrap_or_default();
+        let sep = if cfg!(windows) { ";" } else { ":" };
+        command.env("PATH", format!("{extra}{sep}{path}"));
+    }
+
+    {
+        let ig = crate::scip_download::infigraph_dir();
+        let java_macos = ig.join("java").join("Contents").join("Home");
+        if java_macos.exists() {
+            command.env("JAVA_HOME", &java_macos);
+        } else {
+            let java_home = ig.join("java");
+            if java_home.join("bin").exists() {
+                command.env("JAVA_HOME", &java_home);
+            }
+        }
+        let dotnet_root = ig.join("dotnet");
+        if dotnet_root.exists() {
+            command.env("DOTNET_ROOT", &dotnet_root);
+        }
+    }
+
+    let run = async {
+        match command.status().await {
+            Ok(s) if s.success() => {
+                if output_flag.is_none() {
+                    let default_out = root.join("index.scip");
+                    if default_out.exists() && default_out != output_path {
+                        let _ = std::fs::rename(&default_out, output_path);
+                    }
+                }
+                output_path.exists()
+            }
+            Ok(s) => {
+                eprintln!("Auto-SCIP: {label} exited with {s}");
+                false
+            }
+            Err(e) => {
+                eprintln!("Auto-SCIP: failed to run {label}: {e}");
+                false
+            }
+        }
+    };
+
+    match tokio::time::timeout(timeout, run).await {
+        Ok(succeeded) => succeeded,
+        Err(_elapsed) => {
+            eprintln!("Auto-SCIP: {label} timed out after {timeout:?}");
             false
         }
     }
@@ -1367,6 +1528,185 @@ mod tests {
             msg.as_deref()
                 .is_some_and(|m| m.contains("failed to wait on scip-enrich")),
             "expected a warning about the wait() failure, got {msg:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_scip_indexer_cmd_async_reports_success_and_failure_like_today() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let output_path = root.join("out.scip");
+
+        // A command that succeeds and writes nothing meaningful -- exercises
+        // the `output_flag.is_none()` default-rename branch is NOT hit here
+        // since we pass an explicit flag-less no-op; assert only on the
+        // success/failure signal, matching today's `run_scip_indexer_cmd`
+        // contract (`Ok(s) if s.success() => output_path.exists()` -- a
+        // command with no output_flag and no default index.scip produced
+        // returns false here correctly, since output_path never gets created).
+        let succeeded = run_scip_indexer_cmd_async(
+            root,
+            if cfg!(windows) { "cmd" } else { "true" },
+            if cfg!(windows) {
+                &["/C", "exit", "0"]
+            } else {
+                &[]
+            },
+            "test-indexer",
+            None,
+            None,
+            &output_path,
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+        assert!(
+            !succeeded,
+            "no output_flag and no index.scip produced means false, matching today's contract"
+        );
+
+        let failing_succeeded = run_scip_indexer_cmd_async(
+            root,
+            if cfg!(windows) { "cmd" } else { "false" },
+            if cfg!(windows) {
+                &["/C", "exit", "1"]
+            } else {
+                &[]
+            },
+            "test-indexer",
+            None,
+            None,
+            &output_path,
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+        assert!(!failing_succeeded);
+    }
+
+    #[tokio::test]
+    async fn run_scip_indexer_cmd_async_times_out_a_hung_process() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let output_path = root.join("out.scip");
+
+        // `sleep 5` with a 200ms timeout -- must return false (or otherwise
+        // signal failure) within roughly the timeout, not wait the full 5s.
+        // This is new behavior: nothing today bounds a hung SCIP indexer at all.
+        let start = std::time::Instant::now();
+        let succeeded = run_scip_indexer_cmd_async(
+            root,
+            if cfg!(windows) { "cmd" } else { "sleep" },
+            if cfg!(windows) {
+                &["/C", "timeout", "/T", "5"]
+            } else {
+                &["5"]
+            },
+            "hung-indexer",
+            None,
+            None,
+            &output_path,
+            std::time::Duration::from_millis(200),
+        )
+        .await;
+        let elapsed = start.elapsed();
+        assert!(!succeeded, "a timed-out indexer must report failure");
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "must return promptly on timeout, not wait for the full process duration; took {elapsed:?}"
+        );
+    }
+
+    /// Part B (scope extension): `run_scip_indexers`' cancellation
+    /// checkpoint lives in `run_cancellable_indexer_batch` -- the loop that
+    /// launches each indexer job and checks `token` between launches. This
+    /// drives that loop directly with two real, fast shell-command
+    /// "indexers" (`true`, and a `sleep 5` that must never actually start),
+    /// with cancellation triggered by a separate, always-ready task (not
+    /// tied to either indexer's own completion, mirroring how a real daemon
+    /// shutdown arrives on its own, concurrently) so the test proves the
+    /// checkpoint stops launching further indexers without discarding the
+    /// result of the one that already ran.
+    #[tokio::test]
+    async fn run_cancellable_indexer_batch_stops_launching_after_cancellation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let out1 = tmp.path().join("first.scip");
+        let out2 = tmp.path().join("second.scip");
+
+        let token = tokio_util::sync::CancellationToken::new();
+        let second_started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let second_started_clone = std::sync::Arc::clone(&second_started);
+
+        // Simulates an external cancellation (e.g. daemon shutdown) arriving
+        // concurrently while the batch is still launching jobs. This task
+        // has no internal `.await`, so it runs to completion the first time
+        // the batch loop's `yield_now()` gives the runtime a scheduling
+        // turn -- deterministic, unlike racing against real subprocess
+        // completion timing.
+        let token_for_canceller = token.clone();
+        tokio::task::spawn(async move {
+            token_for_canceller.cancel();
+        });
+
+        let root1 = root.clone();
+        let out1_clone = out1.clone();
+        let first: IndexerJob = (
+            "first",
+            out1,
+            Box::pin(async move {
+                run_scip_indexer_cmd_async(
+                    &root1,
+                    if cfg!(windows) { "cmd" } else { "true" },
+                    if cfg!(windows) {
+                        &["/C", "exit", "0"]
+                    } else {
+                        &[]
+                    },
+                    "first",
+                    None,
+                    None,
+                    &out1_clone,
+                    std::time::Duration::from_secs(5),
+                )
+                .await
+            }),
+        );
+
+        let root2 = root.clone();
+        let out2_clone = out2.clone();
+        let second: IndexerJob = (
+            "second",
+            out2,
+            Box::pin(async move {
+                second_started_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+                run_scip_indexer_cmd_async(
+                    &root2,
+                    if cfg!(windows) { "cmd" } else { "sleep" },
+                    if cfg!(windows) {
+                        &["/C", "timeout", "/T", "5"]
+                    } else {
+                        &["5"]
+                    },
+                    "second",
+                    None,
+                    None,
+                    &out2_clone,
+                    std::time::Duration::from_secs(5),
+                )
+                .await
+            }),
+        );
+
+        let results = run_cancellable_indexer_batch(vec![first, second], &token).await;
+
+        assert_eq!(
+            results.len(),
+            1,
+            "only the first job's result should be present, got {results:?}"
+        );
+        assert_eq!(results[0].0, "first");
+        assert!(
+            !second_started.load(std::sync::atomic::Ordering::SeqCst),
+            "the second indexer must never be launched once the token is cancelled"
         );
     }
 

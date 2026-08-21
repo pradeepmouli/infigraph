@@ -71,7 +71,11 @@ impl std::fmt::Display for WatchEvent {
 /// however long any graph-independent work inside the callback takes --
 /// e.g. running external SCIP indexer binaries, which can take minutes on
 /// a real repo.
-pub type FullReindexCallback = dyn Fn(Arc<Infigraph>, Vec<String>) + Send + Sync;
+/// The `CancellationToken` is this callback's own child token (from the
+/// `Task::spawn_blocking` it runs inside) -- a cooperative-cancellation
+/// checkpoint for whatever synchronous, potentially long-running work the
+/// callback does (e.g. `run_scip_indexers`' between-indexer-launch check).
+pub type FullReindexCallback = dyn Fn(Arc<Infigraph>, Vec<String>, CancellationToken) + Send + Sync;
 
 /// Watch a project directory and auto-reindex on file changes.
 ///
@@ -407,8 +411,8 @@ where
                     // `try_start_full_reindex`'s identical need.
                     let task = {
                         let _guard = drain_rt.enter();
-                        Task::spawn_blocking(daemon_token, "scip-enrich", move |_token| {
-                            cb(prism, languages);
+                        Task::spawn_blocking(daemon_token, "scip-enrich", move |token| {
+                            cb(prism, languages, token);
                         })
                     };
                     scip_in_flight = Some(task);

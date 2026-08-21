@@ -66,6 +66,15 @@ fs2 = "0.4"
 tempfile = "3"
 toml = "0.8"
 tokio-util = "0.7"
+# SCIP indexer subprocesses run on tokio::process::Command with a per-indexer
+# timeout (Task 6 of the daemon/watch command split) -- process/rt/time is
+# the same feature set infigraph-core's Task 1 added for the same reason.
+tokio = { version = "1", default-features = false, features = ["process", "rt", "time"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[dev-dependencies]
+# "macros" enables #[tokio::test]; kept dev-only since production code never
+# needs it (mirrors infigraph-core's identical dev-dependency).
+tokio = { version = "1", features = ["macros"] }

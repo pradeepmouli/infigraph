@@ -434,15 +434,20 @@ pub(crate) fn cmd_daemon(root: &Path, debounce: u64) -> Result<()> {
     let on_full_reindex: std::sync::Arc<infigraph_core::watch::FullReindexCallback> =
         std::sync::Arc::new(
             move |prism: std::sync::Arc<infigraph_core::Infigraph>,
-                  detected_languages: Vec<String>| {
+                  detected_languages: Vec<String>,
+                  token: tokio_util::sync::CancellationToken| {
                 let languages: std::collections::HashSet<String> =
                     detected_languages.into_iter().collect();
                 let root = prism.root().to_path_buf();
                 // Part A (running the external indexer binaries) is
                 // deliberately unlocked -- it can take several minutes on a
                 // real multi-language repo and touches nothing in the graph.
-                // Only the import step below needs `index.lock`.
-                let results = crate::index::run_scip_indexers(&root, &languages);
+                // Only the import step below needs `index.lock`. `token` is
+                // this callback's own child of `daemon_token`, checked
+                // between each indexer launch so a daemon shutdown stops
+                // starting further indexers without discarding results from
+                // ones that already finished.
+                let results = crate::index::run_scip_indexers(&root, &languages, &token);
                 if results.is_empty() {
                     return;
                 }

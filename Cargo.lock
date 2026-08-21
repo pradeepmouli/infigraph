@@ -2440,6 +2440,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
+ "tokio",
  "tokio-util",
  "toml",
  "ureq 2.12.1",
