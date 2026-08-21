@@ -2,7 +2,7 @@
 
 **Status:** Draft — implementation underway; see "Implementation Status" below
 **Date:** 2026-07-20
-**Updated:** 2026-08-07
+**Updated:** 2026-08-21
 **Scope:** Process lifecycle, data integrity, error handling, reliability, observability, scalability, deployment/upgrade
 
 ---
@@ -51,6 +51,7 @@ _(none currently.)_
 - [ ] R5.5 — crash containment, scoped recovery ([#20](https://github.com/pradeepmouli/infigraph/issues/20))
 - [ ] R5.6 — no black-holed requests ([#21](https://github.com/pradeepmouli/infigraph/issues/21))
 - [ ] R5.7 — R5.6 does not cover the remote/HTTP transport ([#36](https://github.com/pradeepmouli/infigraph/issues/36))
+- [ ] R2.4.4–R2.4.6 — daemon-process vs. watch-activity lifecycle split, `Task<T>` cancellable-task primitive, `WatchControl` protocol unification — no issue filed yet; spec: `docs/superpowers/specs/2026-08-21-daemon-watch-command-split-design.md`; implementation plan not yet written
 
 ### Other hardening work landed since the 2026-07-20 draft (fixes for I-16–I-19)
 
@@ -152,6 +153,9 @@ The global `~/.infigraph/mcp.lock` + port `9749` genuinely gate exactly two thin
 - **R2.4.1 — Watcher owned by writer.** Watchers only run inside the process holding the writer lock (the primary, R2.3.1). If the lock is lost/released, the watcher stops.
 - **R2.4.2 — Resource ceilings.** Watcher backends declare and enforce an FD budget (kqueue) / watch-descriptor budget (inotify). Exceeding the budget degrades to directory-level watching or polling with a logged warning — never unbounded FD growth (I-1).
 - **R2.4.3 — Leak regression tests.** The existing kqueue FD regression test generalizes into a lifecycle test suite: start/stop/restart watcher 100×, assert FD count and thread count return to baseline.
+- **R2.4.4 — Daemon process lifecycle separate from watch-activity lifecycle.** `infigraph daemon` today conflates two independently-useful things in one blocking loop: `DaemonKuzu` write-serving (R2.1.3/R2.3.8) and filesystem watching. Stopping "watching" only ever means killing the whole process — write-serving included — because there is no independent control between them. Split into `infigraph daemon start|stop|restart` (process-level) and `infigraph watch`/`watch-docs enable|disable|start|stop|restart` (activity-level; code-watching and doc-watching controlled independently of each other and of write-serving). Fully specced in `docs/superpowers/specs/2026-08-21-daemon-watch-command-split-design.md`.
+- **R2.4.5 — `Task<T>`: one cancellable-task primitive, not several ad hoc ones.** Today's in-flight-work tracking is three duplicated hand-rolled structs (`InFlightDrain`, `InFlightFullReindex`, `InFlightScip`) plus a separate `Arc<AtomicBool>` pattern for `doc_thread`, none carrying a shared cancellation vocabulary. `Task<T>` (`tokio_util::sync::CancellationToken` + `spawn`/`spawn_blocking` constructors) generalizes both shapes it needs to cover: long-running producer loops (code/docs watching) and one-shot Kuzu-touching work (full-reindex build, SCIP enrichment) — the latter two gain real cooperative cancellation at existing checkpoints, meaningfully shortening `daemon stop`'s shutdown time. Drain and the full-reindex swap phase deliberately stay outside it (fast/frequent, and must-run-to-completion-once-started, respectively — a token would add risk, not value, in either case). Two-tier dedup (in-process `TaskRegistry`, cross-process via the existing `watch.lock` trial-flock) replaces three separately-maintained duplicate-prevention checks (`try_start_full_reindex`'s inline flags, `watcher_running`'s standalone logic, `auto_start_watch`/`auto_start_doc_watch`'s no-duplicates guarantees). Part of R2.4.4's spec.
+- **R2.4.6 — Watch-control unified into the existing `WriteRequest`/`route_or_serve_request` protocol.** `CancellationToken` is in-process-only; an external CLI invocation or MCP tool call needs a cross-process bridge to reach an already-running daemon. Rather than a bespoke sentinel-file convention (`watch.stop`/`watch.stop.docs`) living alongside the existing daemon-protocol request channel, a new `WriteRequest::WatchControl { role, action }` variant rides the same `.infigraph/requests/` directory and `route_or_serve_request` dispatcher every other write already uses — one protocol, one directory, one event-driven watch (replacing that channel's own per-tick poll too, as a side benefit). Part of R2.4.4's spec.
 
 ### 2.5 Child process hygiene (P1)
 
