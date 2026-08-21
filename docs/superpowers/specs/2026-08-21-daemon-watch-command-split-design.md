@@ -51,6 +51,13 @@ write-serving/drain-coordination logic, which stays exactly as it is today.
 
 ## Architecture
 
+**Naming note:** `watch_project_with_periodic` loses fsevent-watching (→ a producer `Task<()>`)
+and the periodic-ignore-rebuild ticker (→ inside that producer's own scheduling). What remains
+— drain-scheduling, request-serving, `held_prism` — isn't "watching" anymore; it's the write
+coordinator, and needs a name that says so (e.g. `run_daemon_write_coordinator` — exact name is
+an implementation-plan detail, not a spec-level decision, but the fact that it changes is not:
+the old name would be actively misleading once this ships).
+
 ### `Task<T>` — one shared primitive, not two
 
 `WatchableTask` and `IndexingTask<T>` from earlier drafts of this design collapse into a single
@@ -86,6 +93,32 @@ coordinator reaps a full-reindex-build or SCIP-enrichment `Task<T>` on its own t
 it reaps `InFlightFullReindex`/`InFlightScip` today — just through one generic type instead of
 two duplicated ad-hoc structs, and now carrying a `CancellationToken` neither of them had.
 `InFlightDrain` stays completely untouched, for the reasons below.
+
+### Where producer tasks run, and what they wrap
+
+Code/docs producer `Task<()>`s run on their own small dedicated runtime (`watch_rt`, a couple
+of worker threads), separate from `drain_rt` (used for `spawn_blocking` indexing work only).
+Deliberate isolation, not just tidiness: a bug in a producer's loop body stalling its worker
+thread can't also stall `drain_rt`'s ability to dispatch/reap indexing work, or vice versa —
+mirrors the watch-activity/indexing-activity boundary this whole design already draws
+everywhere else (separate commands, separate tokens, `IndexWorkQueue` as the only shared
+state). Cost is one more small runtime per daemon process; negligible, since these tasks are
+I/O-bound (waiting on channels/timers), not CPU-bound.
+
+**What a producer `Task<()>` wraps differs between the CLI daemon and MCP's in-process
+watcher, and that's fine — it's purely internal, no MCP tool surface change.** The CLI daemon's
+`code_token`/`docs_token` tasks are producer-*only*: they feed `queue`, and the coordinator
+(unchanged, still alive independently) does the actual draining. MCP's `tool_watch_project`/
+`tool_watch_docs` have no separate coordinator to defer to — today, even with
+`serve_requests: false`, that single call already does its own local drain-scheduling against
+its own `held_prism`, because nothing else will. Neither the coordinator nor its
+drain-scheduling logic is exposed as its own MCP tool anywhere, today or in this design — the
+tool surface stops at `watch_project`/`stop_watch`/`get_watch_status` (plus this design's new
+`enable_watch`/`disable_watch`/`restart_watch` and their `_docs` counterparts), so there's
+nothing external that ever needs to address "the coordinator" directly for MCP's case. MCP's
+`Task<()>` therefore wraps producer *and* local drain-coordination together as one internal
+unit, matching today's `watch_project` behavior exactly, just restructured to be
+cancellation-token-driven instead of `stop_rx`/sentinel-driven.
 
 ### Dedup — claiming a role before spawning
 
