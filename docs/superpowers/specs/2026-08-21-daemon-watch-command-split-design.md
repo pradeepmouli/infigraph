@@ -270,6 +270,39 @@ This removes the need to hand-wire which signals a given "stop" needs to hit (to
 + `doc_shutdown`, soon a third `code_token` if done by hand) — cancelling the daemon's token
 alone correctly tears down everything beneath it.
 
+### Crossing the process boundary: sentinels bridge into the token hierarchy
+
+`CancellationToken` is in-process-only. A separate `infigraph watch stop` CLI invocation, or an
+MCP tool call, is a different OS process from the running `infigraph daemon` — it cannot call
+`.cancel()` on anything living in that process's memory. Only two things cross a process
+boundary here: OS signals (how `daemon stop`'s full-process kill already works today — SIGTERM/
+Ctrl-C to the PID recorded in `watch.lock`, caught by the daemon's existing handler) and files
+— which is what the existing `watch.stop`/`watch.stop.docs` sentinel pattern already is
+(`tool_stop_watch_docs` writes `.infigraph/watch.stop.docs` specifically because there's no
+in-process `DOC_WATCHERS` entry to touch once a daemon is alive).
+
+So the token hierarchy governs propagation *inside* the daemon process once triggered; it does
+not replace the sentinel mechanism, it sits behind it. Producer `Task<()>`s poll for their
+sentinel (in their `tokio::select!`, via `interval.tick()`, alongside `token.cancelled()`) and
+translate a sentinel's presence into cancelling their own local token — a targeted,
+sub-process-level analog of what a full OS signal does for `daemon stop`. Every *external*
+caller (a fresh CLI process's `watch stop`/`watch-docs stop`, and both the existing and new MCP
+tools) funnels through this same file-based bridge when targeting an already-running external
+daemon. Only a *same-process* caller — MCP's own in-process, non-daemon-mode watcher; the
+daemon's own Ctrl-C handler — can skip the bridge and touch a token directly, because it's
+already living in the process that owns it.
+
+This also resolves the third case `tool_watch_project_respects_daemon_mode_toggle` surfaces:
+with `INFIGRAPH_BACKEND=daemon`, `tool_watch_project` never touches the in-process `WATCHERS`
+map at all — it delegates entirely to the external daemon via `ensure_daemon_watcher` and
+returns. No local `Task<()>` exists to control in that mode. So the new `enable_watch`/
+`disable_watch`/`restart_watch` MCP tools (and their `_docs` counterparts) must, like
+`tool_stop_watch`/`tool_stop_watch_docs` already do, detect daemon-mode and route through the
+sentinel/config-file bridge to the external daemon's `code_token`/`docs_token` rather than
+assume a local task exists — there are three cases in total, not two: the CLI daemon's
+producer-only task, MCP's in-process combined task (daemon-mode off), and MCP delegating
+entirely to an external daemon (daemon-mode on) with no local task of its own.
+
 ### Command surface
 
 **CLI**, three independently controllable things per project, all against the same
@@ -319,13 +352,15 @@ fn watch_enabled(section: &str) -> bool {  // section: "watch" | "watch_docs"
 
 `WatchConfig` in `session_context.rs` gains an `enabled: bool` field (default `true`) alongside
 the existing `auto_start_on_boot`; a new `WatchDocsConfig` mirrors it. `disable` writes the flag
-to `config.toml` *and* immediately cancels the live task's token (via its role); `enable` clears
-the flag and, if nothing is currently running for that role, does not itself start a task —
-consistent with `auto_start_on_boot` being a distinct, narrower toggle for *boot-time* startup
-specifically. Every opportunistic auto-start call site (`should_auto_watch`,
-`start_daemon_watcher_for_startup_dir`, `ensure_daemon_watcher`, `auto_start_doc_watch`) checks
-`watch_enabled(role)` before spawning, so `disable` also prevents future auto-starts, not just
-pausing a currently-live one.
+to `config.toml` — the persisted half — and, per the process-boundary bridge above, immediate
+effect on an already-live task requires the same sentinel mechanism `stop` uses (a same-process
+caller can cancel the token directly; an external CLI/MCP caller cannot, so it still needs the
+file-based signal). `enable` clears the flag and, if nothing is currently running for that
+role, does not itself start a task — consistent with `auto_start_on_boot` being a distinct,
+narrower toggle for *boot-time* startup specifically. Every opportunistic auto-start call site
+(`should_auto_watch`, `start_daemon_watcher_for_startup_dir`, `ensure_daemon_watcher`,
+`auto_start_doc_watch`) checks `watch_enabled(role)` before spawning, so `disable` also
+prevents future auto-starts, not just pausing a currently-live one.
 
 ## Dependencies
 
