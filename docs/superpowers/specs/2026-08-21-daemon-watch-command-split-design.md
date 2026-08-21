@@ -467,12 +467,18 @@ prevents future auto-starts, not just pausing a currently-live one.
   cooperative-cancel-at-checkpoint path) against a stub closure, independent of a real
   full-reindex/SCIP body — mirrors the existing per-variant test isolation but for the unified
   type. `InFlightDrain`'s existing tests are untouched, since the struct itself doesn't change.
-- Unit: `run_scip_indexer_cmd` on `tokio::process::Command` — a real short-lived child process,
-  confirm the non-blocking `.status().await` path behaves equivalently to today's
+- Unit: `run_scip_indexer_cmd` on `tokio::process::Command` — real child processes, using
+  short-lived stand-ins (`true`/`false`/a deliberately-hung `sleep`) as the *test's* fixtures,
+  not a claim that real SCIP indexers are short-lived — they aren't (rust-analyzer's cold-start
+  `cargo metadata` resolution alone can take minutes; that's precisely why a timeout matters).
+  Confirm the non-blocking `.status().await` path behaves equivalently to today's
   `std::process::Command::status()` (success/non-zero-exit/spawn-failure all report the same
   as today), that `tokio::time::timeout` actually bounds a deliberately-hung test process
-  (a genuinely new behavior — nothing today times out an indexer at all), and that multiple
-  language indexers run concurrently as tasks rather than one-OS-thread-per-indexer.
+  (a genuinely new behavior — nothing today times out an indexer at all, short- or long-running),
+  and that multiple language indexers run concurrently as tasks rather than
+  one-OS-thread-per-indexer — the latter matters *more*, not less, for genuinely long-running
+  indexers, since N dedicated OS threads blocked for minutes each is far more wasteful than N
+  lightweight async tasks awaiting the same durations.
 - Unit: `watch_enabled("watch")` / `watch_enabled("watch_docs")` precedence (env var → config
   → default), mirroring the existing `auto_start_watch_on_boot_enabled_env_override_priority`
   test shape.
