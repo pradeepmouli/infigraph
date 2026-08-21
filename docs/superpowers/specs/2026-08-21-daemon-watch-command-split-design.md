@@ -51,27 +51,43 @@ write-serving/drain-coordination logic, which stays exactly as it is today.
 
 ## Architecture
 
-### `WatchableTask` — the shared primitive
+### `Task<T>` — one shared primitive, not two
 
-One generic type, used identically for the code-watch producer and the doc-watch producer
-(and reusable for any future watchable activity), rather than two handwritten
-implementations:
+`WatchableTask` and `IndexingTask<T>` from earlier drafts of this design collapse into a single
+generic type. Both are "a cancellable tokio task carrying a role," differing only in which
+tokio constructor spawns them and whether a caller cares about the return value — not a reason
+for two named types:
 
 ```rust
-struct WatchableTask {
-    role: &'static str,           // "code" | "docs" — drives config section, lock role, logging
-    token: CancellationToken,     // this task's own cancellation token (a child of the daemon's)
-    handle: Option<JoinHandle<()>>,
+struct Task<T> {
+    role: &'static str,          // "code" | "docs" | "full-reindex-build" | "scip-enrich" — config
+                                  // section / lock role / logging, per use site
+    token: CancellationToken,    // this task's own token, a child of daemon_token
+    handle: JoinHandle<T>,
 }
 
-impl WatchableTask {
-    fn spawn(parent: &CancellationToken, root: &Path, role: &'static str, run: impl Future<Output = ()> + Send + 'static) -> Self
-    async fn stop(&mut self)     // cancel this task's token, await the join handle
-    async fn restart(&mut self, parent: &CancellationToken, root: &Path, run: impl Future<Output = ()> + Send + 'static)
+impl<T: Send + 'static> Task<T> {
+    // For a long-running async loop (the watch producers): T = ()
+    fn spawn(parent: &CancellationToken, role: &'static str, fut: impl Future<Output = T> + Send + 'static) -> Self
+
+    // For one-shot, Kuzu-touching work (build phase, SCIP enrichment's import step): runs on
+    // tokio's blocking-thread pool, since the closure makes synchronous FFI calls
+    fn spawn_blocking(parent: &CancellationToken, role: &'static str, f: impl FnOnce() -> T + Send + 'static) -> Self
+
+    async fn stop(self)              // cancel the token, await the handle, discard the result
+    fn is_finished(&self) -> bool    // for the coordinator's per-tick reap-or-not check
+    async fn join(self) -> Result<T, JoinError>
 }
 ```
 
-Each `run` future is a `tokio::task::spawn`ed async loop built around:
+`stop`/`restart` (`stop` then a fresh `spawn`) are how `watch`/`watch-docs enable|disable|
+start|stop|restart` act on the code/docs producers (`T = ()`). `is_finished`/`join` are how the
+coordinator reaps a full-reindex-build or SCIP-enrichment `Task<T>` on its own tick, exactly as
+it reaps `InFlightFullReindex`/`InFlightScip` today — just through one generic type instead of
+two duplicated ad-hoc structs, and now carrying a `CancellationToken` neither of them had.
+`InFlightDrain` stays completely untouched, for the reasons below.
+
+A code/docs producer's `fut` is a `tokio::task::spawn`ed async loop built around:
 
 ```rust
 loop {
@@ -90,41 +106,34 @@ and a `notify`-callback-bridged `tokio::sync::mpsc` channel in place of today's
 moves into this task unchanged in behavior, just expressed with `tokio::time::sleep` instead of
 `std::thread::sleep`.
 
-**What a `WatchableTask` never touches directly:** Kuzu, `held_prism`, or the drain-scheduling
-state. It only ever calls `queue.lock().unwrap()...` (mutate) `.drop()` — identical to what
-`route_or_serve_request` already does today from the coordinator side. This is what makes the
-split safe: the two sides only share one already-`Arc<Mutex<_>>`-wrapped piece of state, not
-raw Kuzu connections or in-flight-drain bookkeeping.
+**What a code/docs `Task<()>` never touches directly:** Kuzu, `held_prism`, or the
+drain-scheduling state. It only ever calls `queue.lock().unwrap()...` (mutate) `.drop()` —
+identical to what `route_or_serve_request` already does today from the coordinator side. This
+is what makes the split safe: the two sides only share one already-`Arc<Mutex<_>>`-wrapped
+piece of state, not raw Kuzu connections or in-flight-drain bookkeeping.
 
-### `IndexingTask` — for full-reindex and SCIP enrichment only
+### `Task<T>` for full-reindex and SCIP enrichment — and why drain is excluded
 
-The coordinator runs three kinds of work as `drain_rt.spawn_blocking(...)` tokio tasks: queue
-drains, full reindexes, and SCIP enrichment. Of these, only the latter two get `IndexingTask`
-treatment. **The drain (`InFlightDrain`) is deliberately left exactly as it is today, with no
-unification.** Reasoning: drain is the fast, frequent operation — scheduled whenever the queue
-has anything, reaped every tick — and today's "wait it out" behavior at shutdown is already
-fine for it. Full reindex and SCIP enrichment are the genuinely long-running ones (minutes,
-including running external SCIP indexer binaries) with natural internal checkpoints
-(build-fresh-then-swap phases; between each external indexer binary) where checking
-`token.is_cancelled()` and bailing early meaningfully shortens `daemon stop`'s shutdown time. A
-cancellation token buys real value there and none for drain, so it's added only where it pays
-for itself.
+The coordinator runs three kinds of work as `drain_rt.spawn_blocking(...)` tokio tasks today:
+queue drains, full reindexes, and SCIP enrichment. Of these, only the latter two get wrapped in
+`Task<T>` (via its `spawn_blocking` constructor). **The drain (`InFlightDrain`) is deliberately
+left exactly as it is today, with no unification.** Reasoning: drain is the fast, frequent
+operation — scheduled whenever the queue has anything, reaped every tick — and today's "wait it
+out" behavior at shutdown is already fine for it. Full reindex and SCIP enrichment are the
+genuinely long-running ones (minutes, including running external SCIP indexer binaries) with
+natural internal checkpoints (build-fresh-then-swap phases; between each external indexer
+binary) where checking `token.is_cancelled()` and bailing early meaningfully shortens `daemon
+stop`'s shutdown time. A cancellation token buys real value there and none for drain, so it's
+added only where it pays for itself.
 
-```rust
-struct IndexingTask<T> {
-    handle: JoinHandle<T>,
-    token: CancellationToken,   // child of daemon_token
-}
-```
+`InFlightFullReindex` and `InFlightScip` are replaced by `Task<FullReindexBuildOutcome>`/
+`Task<ScipOutcome>` (one shared generic type instead of two duplicated ad-hoc structs);
+`InFlightDrain` is untouched. The coordinator's scheduling logic is otherwise unchanged — it
+still decides synchronously, on its own thread, when to call `drain_rt.spawn_blocking(...)`,
+and still reaps each task the same way (`is_finished()`/`block_on` on `.join()`) it does today.
 
-`InFlightFullReindex` and `InFlightScip` are replaced by `IndexingTask<T>` (one shared type
-instead of two duplicated ones); `InFlightDrain` is untouched. The coordinator's scheduling
-logic is otherwise unchanged — it still decides synchronously, on its own thread, when to call
-`drain_rt.spawn_blocking(...)`, and still reaps each task's `handle` the same way
-(`is_finished()`/`block_on`) it does today.
-
-**"Full reindex" is really two phases, and only one of them becomes an `IndexingTask`.**
-`build_full_reindex` (the `IndexingTask<T>`-wrapped part) builds an entirely fresh graph at
+**"Full reindex" is really two phases, and only one of them becomes a `Task<T>`.**
+`build_full_reindex` (the `Task<T>`-wrapped part) builds an entirely fresh graph at
 `.infigraph/graph.rebuilding/` — its own connection, opened fresh; the live graph is never
 touched. Abandoning it mid-build via cancellation is always safe: there's nothing to roll back.
 Checked whether any of it can move off `spawn_blocking` the way SCIP's subprocess phase did —
@@ -132,24 +141,24 @@ no: it's filesystem cleanup (trivial), Kuzu FFI (`open_local_kuzu_at`/`upsert_fi
 `resolve_calls`/`derive_tested_by_edges` — irreducibly blocking), and AST extraction/parsing
 (CPU-bound, not I/O-bound — parallelism is `rayon`'s job, already a dependency, not
 async/await's). No external subprocess anywhere in it, unlike SCIP's Part A. It stays entirely
-inside `IndexingTask<T>`'s `spawn_blocking` closure.
+inside `Task<T>`'s `spawn_blocking` closure.
 
 `finish_full_reindex` (the swap phase — `poison_watch_db`, `graph.lock`, snapshot, retire,
-`rename`, reopen, reconcile embeddings) is **not** wrapped in `IndexingTask` at all, and gets
-no `CancellationToken`. It runs synchronously on the coordinator's own thread, after the build
+`rename`, reopen, reconcile embeddings) is **not** wrapped in `Task<T>` at all, and gets no
+`CancellationToken`. It runs synchronously on the coordinator's own thread, after the build
 task is reaped, exactly as it does today. This is deliberate, not an oversight: once the swap
 starts, it must run to completion (or use its own existing rollback path on failure) — a
 `CancellationToken` checked mid-swap would risk exactly the "no live, openable graph" outage
 window `roll_back_to_retired` exists to prevent. Naming it clearly as its own non-cancellable
-step (rather than folding it into `IndexingTask`'s vocabulary) is meant to stop a future reader
-from assuming it shares the build phase's cancellation semantics.
+step (rather than folding it into `Task<T>`'s vocabulary) is meant to stop a future reader from
+assuming it shares the build phase's cancellation semantics.
 
 This also gives the existing R5.4 shutdown watchdog (`c085be0`) a cleaner story for the
 long-running case specifically: today it polls `index_op_held_by_self` to decide whether to
 defer `daemon stop`'s hard exit while a write is genuinely in flight (any of the three). With
-`IndexingTask`, a live full-reindex or SCIP-enrichment task can additionally be asked to
-cooperatively cancel via `daemon_token` rather than purely waited out — the watchdog's actual
-polling mechanism (`index_op_held_by_self`, `watchdog_should_defer`, the grace/ceiling
+`Task<T>` in place, a live full-reindex-build or SCIP-enrichment task can additionally be asked
+to cooperatively cancel via `daemon_token` rather than purely waited out — the watchdog's
+actual polling mechanism (`index_op_held_by_self`, `watchdog_should_defer`, the grace/ceiling
 durations from R5.4) does not change, and drain-in-flight is still purely waited out as today.
 
 ### Async subprocess spawning for SCIP indexers
@@ -159,7 +168,7 @@ durations from R5.4) does not change, and drain-in-flight is still purely waited
 import]... needs `index.lock`") has no Kuzu dependency at all — it's pure OS process
 management, currently done via `run_with_timeout`'s blocking `Command::spawn()` plus a
 busy-poll `try_wait()` loop. Unlike Part B (the Kuzu-touching build-fresh-then-swap, which
-stays `spawn_blocking`-wrapped inside `IndexingTask` — see below), Part A genuinely can become
+stays `spawn_blocking`-wrapped inside `Task<T>` — see above), Part A genuinely can become
 async: `tokio::process::Command` + `.wait().await` is a real non-blocking wait, integrated with
 the OS's process-exit notification via tokio's reactor, not a poll loop — a strict improvement
 over what's there today, and it lets indexer subprocesses for different languages run
@@ -172,24 +181,24 @@ concurrently as real async tasks instead of each consuming a blocking-thread-poo
 
 ```
 daemon_token = CancellationToken::new()
-code_token   = daemon_token.child_token()   // WatchableTask (code-watch producer)
-docs_token   = daemon_token.child_token()   // WatchableTask (doc-watch producer)
-// full-reindex and SCIP-enrichment IndexingTasks also take daemon_token.child_token()
+code_token   = daemon_token.child_token()   // Task<()> — code-watch producer
+docs_token   = daemon_token.child_token()   // Task<()> — doc-watch producer
+// full-reindex-build and SCIP-enrichment Task<T>s also take daemon_token.child_token()
 // when the coordinator spawns them — one-shot, so no separate `watch`/`watch-docs`-style
 // command ever targets one directly; cancelled only via daemon_token. Drain has no token
 // at all (InFlightDrain, unchanged).
 ```
 
-- `daemon stop` cancels `daemon_token` → both `WatchableTask` children and any live
-  `IndexingTask` cancel/are-awaited accordingly → the coordinator (still checking `stop_rx`/the
-  existing `watch.stop` sentinel — unchanged) also exits → process exits. This is today's only
-  "stop everything" path, now reachable by a dedicated command instead of only via `kill <pid>`
-  or the old overloaded `watch-stop`.
+- `daemon stop` cancels `daemon_token` → both producer `Task<()>`s and any live
+  full-reindex-build/SCIP `Task<T>` cancel/are-awaited accordingly → the coordinator (still
+  checking `stop_rx`/the existing `watch.stop` sentinel — unchanged) also exits → process
+  exits. This is today's only "stop everything" path, now reachable by a dedicated command
+  instead of only via `kill <pid>` or the old overloaded `watch-stop`.
 - `watch stop` cancels `code_token` only. The coordinator, request-serving, and `docs_token`'s
   task are untouched — the daemon process stays alive, still serving `DaemonKuzu` writes.
 - `watch-docs stop` cancels `docs_token` only, symmetric.
 - `watch start` / `watch-docs start` spawn a fresh child token off `daemon_token` and a new
-  `WatchableTask`.
+  `Task<()>` via `Task::spawn`.
 - `restart` = `stop()` then `start()`.
 
 This removes the need to hand-wire which signals a given "stop" needs to hit (today: `stop_rx`
@@ -203,7 +212,7 @@ alone correctly tears down everything beneath it.
 
 | Command | Scope | Effect |
 |---|---|---|
-| `infigraph daemon start\|stop\|restart` | process | whole process: write-serving + both `WatchableTask`s |
+| `infigraph daemon start\|stop\|restart` | process | whole process: write-serving + both producer `Task<()>`s |
 | `infigraph watch enable\|disable\|start\|stop\|restart` | `code_token`'s task | fsevent-driven code reindexing only |
 | `infigraph watch-docs enable\|disable\|start\|stop\|restart` | `docs_token`'s task | doc-watch loop only |
 
@@ -219,7 +228,7 @@ subcommand under `watch`) is left to the implementation plan.
 
 Both the CLI command handlers and the MCP tool implementations are one generic
 role-parameterized function each (role = `"code"` or `"docs"`, selecting the config section,
-lock role string, and which `WatchableTask` to act on) — not two handwritten copies, per this
+lock role string, and which `Task<()>` to act on) — not two handwritten copies, per this
 repo's DRY-first convention.
 
 ### Persisted policy: `enable`/`disable`
@@ -265,7 +274,7 @@ pausing a currently-live one.
 
 ## Error handling / edge cases
 
-- A `WatchableTask` whose `run` future panics: `JoinHandle::await` returns `Err(JoinError)`;
+- A producer `Task<()>` whose `fut` panics: `JoinHandle::await` returns `Err(JoinError)`;
   `stop()`/`restart()` must not itself panic on a dead handle — log and treat as already-
   stopped, mirroring how `doc_thread.join()` is already tolerant of this today (`let _ =
   doc_thread.join();`).
@@ -278,8 +287,9 @@ pausing a currently-live one.
 - The coordinator's own shutdown watchdog (R5.4/`c085be0`'s in-flight-write-aware grace period)
   is unaffected in behavior — it already only fires on `daemon_token`'s cancellation path (full
   process exit), never on a `watch`/`watch-docs`-only stop. Only its internal vocabulary for
-  "is a write in flight" shifts to checking for a live `IndexingTask`, per above.
-- A full-reindex/SCIP `IndexingTask` whose `JoinHandle` is still running when `daemon_token`
+  "is a write in flight" shifts to checking for a live full-reindex-build/SCIP `Task<T>`, per
+  above.
+- A full-reindex-build/SCIP `Task<T>` whose `JoinHandle` is still running when `daemon_token`
   cancels: gets the cooperative-cancel opportunity described above at its next checkpoint, but
   the coordinator still falls back to waiting out the handle (`drain_rt.block_on(...)`) if it
   doesn't exit promptly — same fallback shape as today, just with an earlier-exit path added
@@ -288,13 +298,12 @@ pausing a currently-live one.
 
 ## Testing
 
-- Unit: `WatchableTask::spawn`/`stop`/`restart` lifecycle, independent of any real filesystem
-  watching (a no-op `run` future that just awaits `token.cancelled()`).
-- Unit: `IndexingTask<T>` reap behavior (finished/still-running/panicked, plus the
-  cooperative-cancel-at-checkpoint path) against a stub `spawn_blocking` closure, independent
-  of a real full-reindex/SCIP body — mirrors the existing per-variant test isolation but for
-  the unified type. `InFlightDrain`'s existing tests are untouched, since the struct itself
-  doesn't change.
+- Unit: `Task::spawn`/`stop`/`restart` lifecycle (the producer/`T = ()` path), independent of
+  any real filesystem watching (a no-op future that just awaits `token.cancelled()`).
+- Unit: `Task::spawn_blocking` reap behavior (finished/still-running/panicked, plus the
+  cooperative-cancel-at-checkpoint path) against a stub closure, independent of a real
+  full-reindex/SCIP body — mirrors the existing per-variant test isolation but for the unified
+  type. `InFlightDrain`'s existing tests are untouched, since the struct itself doesn't change.
 - Unit: `run_scip_indexers` on `tokio::process::Command` — a real short-lived child process,
   confirm the non-blocking `.wait()` path and `tokio::time::timeout` cancellation behave
   equivalently to today's `run_with_timeout` coverage (e.g.
@@ -317,7 +326,7 @@ pausing a currently-live one.
 - Kuzu/`lbug`'s multithreading support may eventually let concurrent writers bypass
   `IndexWorkQueue`'s single-drain-coordinator role. Not pursued here — the queue's batching
   (R3.3.5) and the cross-process single-writer invariant are separate concerns from Kuzu's raw
-  thread-safety, and this design's `WatchableTask` split works unchanged regardless of how the
-  queue evolves later.
+  thread-safety, and this design's `Task<T>` split works unchanged regardless of how the queue
+  evolves later.
 - Whether `infigraph install`/`update` should gracefully `daemon stop` known live daemons
   before swapping the binary — floated, not approved, separate feature.
