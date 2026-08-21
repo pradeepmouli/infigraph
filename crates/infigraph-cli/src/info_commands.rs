@@ -468,6 +468,11 @@ pub(crate) fn cmd_daemon(root: &Path, debounce: u64) -> Result<()> {
             },
         );
 
+    // Phase 3 of the daemon/watch command-surface split wires this to a real
+    // daemon-lifetime token; for now a fresh, unparented one keeps this call
+    // site compiling unaffected by the signature change (see
+    // docs/superpowers/plans/2026-08-21-daemon-watch-command-split.md task 4).
+    let daemon_token = tokio_util::sync::CancellationToken::new();
     infigraph_core::watch::watch_project_with_periodic(
         root,
         bundled_registry,
@@ -480,6 +485,7 @@ pub(crate) fn cmd_daemon(root: &Path, debounce: u64) -> Result<()> {
         None::<fn(&infigraph_core::IndexResult)>,
         true,
         Some(on_full_reindex),
+        &daemon_token,
     )?;
 
     doc_shutdown.store(true, std::sync::atomic::Ordering::Relaxed);

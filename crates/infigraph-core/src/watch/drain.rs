@@ -230,6 +230,10 @@ mod tests {
         MR: Fn() -> Result<crate::lang::LanguageRegistry>,
     {
         let drain_rt = tokio::runtime::Runtime::new().unwrap();
+        // Fresh, unparented token: none of this file's tests exercise
+        // cancellation, so there's no daemon-lifetime token to thread
+        // through this synchronous test helper.
+        let daemon_token = tokio_util::sync::CancellationToken::new();
         if let Some(in_flight) = crate::watch::try_start_full_reindex(
             root,
             request_path,
@@ -238,6 +242,7 @@ mod tests {
             false,
             false,
             &drain_rt,
+            &daemon_token,
         ) {
             let registry = std::sync::Arc::new(make_registry().unwrap());
             let (guard, _) = crate::watch::finish_full_reindex(
@@ -245,7 +250,7 @@ mod tests {
                 &in_flight.reply_path,
                 &registry,
                 held,
-                drain_rt.block_on(in_flight.handle),
+                drain_rt.block_on(in_flight.task.join()),
             );
             std::fs::remove_file(&in_flight.request_path).ok();
             drop(guard);

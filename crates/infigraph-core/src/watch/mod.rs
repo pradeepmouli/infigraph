@@ -10,8 +10,10 @@ use std::time::Duration;
 
 use anyhow::Result;
 use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use tokio_util::sync::CancellationToken;
 
 use crate::ops::{begin_index_op, IndexOpOutcome};
+use crate::watch::task::Task;
 use crate::Infigraph;
 use batch::ChangeBatch;
 
@@ -96,6 +98,10 @@ pub fn watch_project<MR>(
 where
     MR: Fn() -> Result<crate::lang::LanguageRegistry> + Send + 'static,
 {
+    // Phase 3 replaces this with a real token hierarchy passed down from the
+    // daemon's own lifetime -- for now, a fresh, unparented token keeps this
+    // thin wrapper's existing callers unaffected by the signature change.
+    let token = CancellationToken::new();
     watch_project_with_periodic(
         root,
         make_registry,
@@ -106,6 +112,7 @@ where
         None::<fn(&crate::IndexResult)>,
         false,
         None,
+        &token,
     )
 }
 
@@ -120,6 +127,7 @@ pub fn watch_project_with_periodic<MR, F>(
     on_periodic: Option<F>,
     serve_requests: bool,
     on_full_reindex: Option<Arc<FullReindexCallback>>,
+    daemon_token: &CancellationToken,
 ) -> Result<()>
 where
     MR: Fn() -> Result<crate::lang::LanguageRegistry> + Send + 'static,
@@ -207,7 +215,7 @@ where
         .thread_name("infigraph-drain")
         .build()?;
     let mut drain_in_flight: Option<InFlightDrain> = None;
-    let mut full_reindex_in_flight: Option<InFlightFullReindex> = None;
+    let mut full_reindex_in_flight: Option<PendingFullReindex> = None;
     let mut scip_in_flight: Option<InFlightScip> = None;
 
     let sentinel = root.join(".infigraph").join("watch.stop");
@@ -357,10 +365,10 @@ where
         // rebuild lands, not after SCIP also finishes.
         if full_reindex_in_flight
             .as_ref()
-            .is_some_and(|f| f.handle.is_finished())
+            .is_some_and(|f| f.task.is_finished())
         {
-            let InFlightFullReindex {
-                handle,
+            let PendingFullReindex {
+                task,
                 request_path,
                 reply_path,
             } = full_reindex_in_flight
@@ -371,7 +379,7 @@ where
                 &reply_path,
                 &shared_registry,
                 &mut held_prism,
-                drain_rt.block_on(handle),
+                drain_rt.block_on(task.join()),
             );
             std::fs::remove_file(&request_path).ok();
             drop(guard);
@@ -465,6 +473,7 @@ where
                             drain_in_flight.is_some(),
                             full_reindex_in_flight.is_some(),
                             &drain_rt,
+                            daemon_token,
                         ) {
                             full_reindex_in_flight = Some(started);
                         }
@@ -682,7 +691,7 @@ where
             &in_flight.reply_path,
             &shared_registry,
             &mut held_prism,
-            drain_rt.block_on(in_flight.handle),
+            drain_rt.block_on(in_flight.task.join()),
         );
         std::fs::remove_file(&in_flight.request_path).ok();
         drop(guard);
@@ -1068,10 +1077,12 @@ struct FullReindexTaskOutput {
     result: Result<FullReindexBuildOutcome>,
 }
 
-/// A full-reindex build executing on the background task, plus what the
-/// loop thread needs to finish it once it completes.
-struct InFlightFullReindex {
-    handle: tokio::task::JoinHandle<FullReindexTaskOutput>,
+/// A full-reindex build executing on the background `Task<T>`, plus what the
+/// loop thread needs to finish it once it completes. `Task<T>` itself
+/// doesn't carry the request/reply paths -- those are this loop's own
+/// bookkeeping, tracked alongside it.
+struct PendingFullReindex {
+    task: Task<FullReindexTaskOutput>,
     request_path: PathBuf,
     reply_path: PathBuf,
 }
@@ -1090,9 +1101,17 @@ struct InFlightScip {
 /// so it can run inside `spawn_blocking`'s `'static` closure. The live graph
 /// is never touched here; only `finish_full_reindex` (loop thread) swaps it
 /// in.
+///
+/// `token` is checked once, right after the cheap leftover-cleanup step and
+/// before the expensive Kuzu open+scan+upsert+resolve sequence -- abandoning
+/// the build at (or before) this point is always safe, since nothing that
+/// touches the live graph has happened yet. Nothing inside the expensive
+/// sequence itself is cancellation-aware; a cancellation observed after this
+/// checkpoint still runs to completion (still safe, just not responsive).
 fn build_full_reindex(
     root: &Path,
     registry: crate::lang::LanguageRegistry,
+    token: &CancellationToken,
 ) -> Result<FullReindexBuildOutcome> {
     const REBUILDING_NAME: &str = "graph.rebuilding";
     let rebuilding_path = root.join(".infigraph").join(REBUILDING_NAME);
@@ -1106,6 +1125,12 @@ fn build_full_reindex(
     let _ = std::fs::remove_dir_all(&rebuilding_path);
     let _ = std::fs::remove_file(&rebuilding_path);
     crate::graph::remove_wal_family(&rebuilding_path);
+
+    if token.is_cancelled() {
+        return Err(anyhow::anyhow!(
+            "full reindex build cancelled before starting"
+        ));
+    }
 
     let build_result = Infigraph::open_local_kuzu_at(root, registry, rebuilding_path.clone())
         .and_then(|fresh| {
@@ -1167,7 +1192,8 @@ fn try_start_full_reindex<MR>(
     drain_in_flight: bool,
     full_reindex_in_flight: bool,
     drain_rt: &tokio::runtime::Runtime,
-) -> Option<InFlightFullReindex>
+    daemon_token: &CancellationToken,
+) -> Option<PendingFullReindex>
 where
     MR: Fn() -> Result<crate::lang::LanguageRegistry>,
 {
@@ -1243,13 +1269,23 @@ where
     };
 
     let root_buf = root.to_path_buf();
-    let handle = drain_rt.spawn_blocking(move || FullReindexTaskOutput {
-        result: build_full_reindex(&root_buf, registry),
-        guard,
-    });
+    // `Task::spawn_blocking` dispatches via the ambient `tokio::task::
+    // spawn_blocking`, which needs a runtime context on this (plain OS)
+    // thread -- `drain_rt.enter()` scopes that context to just this call, so
+    // the task still runs on `drain_rt`'s blocking pool, matching every
+    // other `spawn_blocking` in this loop.
+    let task = {
+        let _guard = drain_rt.enter();
+        Task::spawn_blocking(daemon_token, "full-reindex-build", move |token| {
+            FullReindexTaskOutput {
+                result: build_full_reindex(&root_buf, registry, &token),
+                guard,
+            }
+        })
+    };
 
-    Some(InFlightFullReindex {
-        handle,
+    Some(PendingFullReindex {
+        task,
         request_path: path.to_path_buf(),
         reply_path,
     })
@@ -1573,7 +1609,8 @@ fn route_or_serve_request<MR>(
     drain_in_flight: bool,
     full_reindex_in_flight: bool,
     drain_rt: &tokio::runtime::Runtime,
-) -> Option<InFlightFullReindex>
+    daemon_token: &CancellationToken,
+) -> Option<PendingFullReindex>
 where
     MR: Fn() -> Result<crate::lang::LanguageRegistry>,
 {
@@ -1728,6 +1765,7 @@ where
             drain_in_flight,
             full_reindex_in_flight,
             drain_rt,
+            daemon_token,
         ),
         _ => {
             serve_request_locked(root, path, registry, held, drain_in_flight);
@@ -2088,6 +2126,7 @@ mod tests {
         let queue = Arc::new(Mutex::new(crate::watch::queue::IndexWorkQueue::new()));
         let mut held: Option<Arc<Infigraph>> = None;
         let drain_rt = tokio::runtime::Runtime::new().unwrap();
+        let daemon_token = CancellationToken::new();
         route_or_serve_request(
             &root,
             &request_path,
@@ -2098,6 +2137,7 @@ mod tests {
             false,
             false,
             &drain_rt,
+            &daemon_token,
         );
 
         let drained = queue.lock().unwrap().drain();

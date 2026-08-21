@@ -14,6 +14,8 @@ fn watch_loop_serves_write_requests_when_serve_requests_is_true() {
 
     let (stop_tx, stop_rx) = mpsc::channel();
     let root = project_dir.path().to_path_buf();
+    let daemon_token = tokio_util::sync::CancellationToken::new();
+    let token_for_thread = daemon_token.clone();
     let handle = std::thread::spawn(move || {
         infigraph_core::watch::watch_project_with_periodic(
             &root,
@@ -25,6 +27,7 @@ fn watch_loop_serves_write_requests_when_serve_requests_is_true() {
             None::<fn(&infigraph_core::IndexResult)>,
             true, // serve_requests
             None,
+            &token_for_thread,
         )
     });
 
@@ -52,6 +55,8 @@ fn watch_loop_does_not_serve_requests_when_serve_requests_is_false() {
     let project_dir = tempfile::tempdir().unwrap();
     let (stop_tx, stop_rx) = mpsc::channel();
     let root = project_dir.path().to_path_buf();
+    let daemon_token = tokio_util::sync::CancellationToken::new();
+    let token_for_thread = daemon_token.clone();
     let handle = std::thread::spawn(move || {
         infigraph_core::watch::watch_project_with_periodic(
             &root,
@@ -63,6 +68,7 @@ fn watch_loop_does_not_serve_requests_when_serve_requests_is_false() {
             None::<fn(&infigraph_core::IndexResult)>,
             false, // serve_requests
             None,
+            &token_for_thread,
         )
     });
 

@@ -455,6 +455,8 @@ fn watch_triggered_file_removal_contends_with_a_held_index_lock() {
 
     let (stop_tx, stop_rx) = std::sync::mpsc::channel();
     let root = project.path().to_path_buf();
+    let daemon_token = tokio_util::sync::CancellationToken::new();
+    let token_for_thread = daemon_token.clone();
     let handle = std::thread::spawn(move || {
         infigraph_core::watch::watch_project_with_periodic(
             &root,
@@ -470,6 +472,7 @@ fn watch_triggered_file_removal_contends_with_a_held_index_lock() {
             None::<fn(&infigraph_core::IndexResult)>,
             false, // serve_requests
             None,
+            &token_for_thread,
         )
     });
 
@@ -546,6 +549,8 @@ fn watch_loop_shuts_down_when_its_root_directory_is_deleted() {
 
     let (stop_tx, stop_rx) = std::sync::mpsc::channel();
     let root = project.path().to_path_buf();
+    let daemon_token = tokio_util::sync::CancellationToken::new();
+    let token_for_thread = daemon_token.clone();
     let handle = std::thread::spawn(move || {
         infigraph_core::watch::watch_project_with_periodic(
             &root,
@@ -557,6 +562,7 @@ fn watch_loop_shuts_down_when_its_root_directory_is_deleted() {
             None::<fn(&infigraph_core::IndexResult)>,
             false, // serve_requests
             None,
+            &token_for_thread,
         )
     });
 
@@ -633,6 +639,8 @@ fn out_of_scope_write_request_contends_with_a_held_index_lock() {
 
     let (stop_tx, stop_rx) = std::sync::mpsc::channel();
     let root = project.path().to_path_buf();
+    let daemon_token = tokio_util::sync::CancellationToken::new();
+    let token_for_thread = daemon_token.clone();
     let handle = std::thread::spawn(move || {
         infigraph_core::watch::watch_project_with_periodic(
             &root,
@@ -644,6 +652,7 @@ fn out_of_scope_write_request_contends_with_a_held_index_lock() {
             None::<fn(&infigraph_core::IndexResult)>,
             true, // serve_requests
             None,
+            &token_for_thread,
         )
     });
 
@@ -701,6 +710,117 @@ fn out_of_scope_write_request_contends_with_a_held_index_lock() {
         served,
         "expected the watcher to serve the deferred out-of-scope request once \
          index.lock was released"
+    );
+
+    stop_tx.send(()).unwrap();
+    handle.join().unwrap().unwrap();
+}
+
+/// Regression coverage for R2.4.5 (docs/DESIGN-hardening.md): the full-reindex
+/// build phase must be a genuinely cancellable `Task<T>`, not a bare
+/// `JoinHandle` with no token. Cancelling the daemon's token before the loop
+/// even reaps the request means `try_start_full_reindex`'s spawned task
+/// inherits an already-cancelled child token, so `build_full_reindex`'s
+/// checkpoint fires immediately after its cheap cleanup step -- before it
+/// ever opens Kuzu on `graph.rebuilding` -- which proves cancellation this
+/// early can never reach the swap. Two things are checked: the live graph's
+/// mtime is unchanged (the swap never ran), and the loop still replies to the
+/// request (with an error) instead of hanging while reaping the cancelled
+/// task -- mirrors `out_of_scope_write_request_contends_with_a_held_index_lock`'s
+/// setup/drive/assert shape for driving `watch_project_with_periodic` against
+/// a real temp project with a real request file.
+#[test]
+fn full_reindex_build_task_can_be_cancelled_before_it_starts_the_swap() {
+    let project = tempfile::Builder::new()
+        .prefix("infigraph-full-reindex-cancel-test-")
+        .tempdir()
+        .unwrap();
+    std::fs::write(project.path().join("main.py"), "def main():\n    pass\n").unwrap();
+
+    // Bootstrap so the live graph exists before the watcher opens its own connection.
+    {
+        let registry = infigraph_languages::bundled_registry().unwrap();
+        let mut boot = infigraph_core::Infigraph::open(project.path(), registry).unwrap();
+        boot.init().unwrap();
+        boot.index().unwrap();
+    }
+
+    let live_graph = project.path().join(".infigraph").join("graph");
+    let mtime_before = std::fs::metadata(&live_graph).unwrap().modified().unwrap();
+
+    // Cancelled up front, before the loop even starts: by the time
+    // `try_start_full_reindex` spawns the build task, its child token is
+    // already cancelled, so the build's checkpoint fires at its earliest
+    // possible point -- this is the strictest version of "cancel before the
+    // swap," since the build never even reaches `Infigraph::open_local_kuzu_at`.
+    let daemon_token = tokio_util::sync::CancellationToken::new();
+    daemon_token.cancel();
+    let token_for_thread = daemon_token.clone();
+
+    let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+    let root = project.path().to_path_buf();
+    let handle = std::thread::spawn(move || {
+        infigraph_core::watch::watch_project_with_periodic(
+            &root,
+            || Ok(infigraph_languages::bundled_registry().unwrap()),
+            50, // debounce_ms
+            stop_rx,
+            |_evt| {},
+            0,
+            None::<fn(&infigraph_core::IndexResult)>,
+            true, // serve_requests
+            None,
+            &token_for_thread,
+        )
+    });
+
+    // Let the loop start ticking before dropping a request file.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+
+    let requests_dir = project.path().join(".infigraph").join("requests");
+    let request_path = requests_dir.join("full-reindex-cancel-test.request");
+    let result_path = requests_dir.join("full-reindex-cancel-test.result");
+    infigraph_core::daemon_protocol::write_atomic(
+        &request_path,
+        &serde_json::to_string(&infigraph_core::daemon_protocol::WriteRequest::FullReindex)
+            .unwrap(),
+    )
+    .unwrap();
+
+    // Bounded wait for a reply -- proves the loop didn't hang reaping the
+    // cancelled build task (the same false-negative trap the sibling
+    // out-of-scope-request test above documents applies here too: a single
+    // fixed-delay check could false-pass if cold-start latency happened to
+    // land after the sampled instant, so this polls instead).
+    let mut replied = false;
+    for _ in 0..150 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        if result_path.exists() {
+            replied = true;
+            break;
+        }
+    }
+    assert!(
+        replied,
+        "expected a reply (even an error one) once the cancelled full-reindex build was \
+         reaped -- a missing reply means the loop hung"
+    );
+
+    let reply_contents = std::fs::read_to_string(&result_path).unwrap();
+    let reply: infigraph_core::daemon_protocol::WriteResult =
+        serde_json::from_str(&reply_contents).unwrap();
+    assert!(
+        matches!(
+            reply,
+            infigraph_core::daemon_protocol::WriteResult::Err { .. }
+        ),
+        "a cancelled build must reply with an error, not FullReindexOk: {reply:?}"
+    );
+
+    let mtime_after = std::fs::metadata(&live_graph).unwrap().modified().unwrap();
+    assert_eq!(
+        mtime_before, mtime_after,
+        "cancelling before the swap must leave the live graph untouched"
     );
 
     stop_tx.send(()).unwrap();
