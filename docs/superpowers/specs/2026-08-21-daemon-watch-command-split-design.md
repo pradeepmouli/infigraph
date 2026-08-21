@@ -123,6 +123,27 @@ logic is otherwise unchanged — it still decides synchronously, on its own thre
 `drain_rt.spawn_blocking(...)`, and still reaps each task's `handle` the same way
 (`is_finished()`/`block_on`) it does today.
 
+**"Full reindex" is really two phases, and only one of them becomes an `IndexingTask`.**
+`build_full_reindex` (the `IndexingTask<T>`-wrapped part) builds an entirely fresh graph at
+`.infigraph/graph.rebuilding/` — its own connection, opened fresh; the live graph is never
+touched. Abandoning it mid-build via cancellation is always safe: there's nothing to roll back.
+Checked whether any of it can move off `spawn_blocking` the way SCIP's subprocess phase did —
+no: it's filesystem cleanup (trivial), Kuzu FFI (`open_local_kuzu_at`/`upsert_files_bulk`/
+`resolve_calls`/`derive_tested_by_edges` — irreducibly blocking), and AST extraction/parsing
+(CPU-bound, not I/O-bound — parallelism is `rayon`'s job, already a dependency, not
+async/await's). No external subprocess anywhere in it, unlike SCIP's Part A. It stays entirely
+inside `IndexingTask<T>`'s `spawn_blocking` closure.
+
+`finish_full_reindex` (the swap phase — `poison_watch_db`, `graph.lock`, snapshot, retire,
+`rename`, reopen, reconcile embeddings) is **not** wrapped in `IndexingTask` at all, and gets
+no `CancellationToken`. It runs synchronously on the coordinator's own thread, after the build
+task is reaped, exactly as it does today. This is deliberate, not an oversight: once the swap
+starts, it must run to completion (or use its own existing rollback path on failure) — a
+`CancellationToken` checked mid-swap would risk exactly the "no live, openable graph" outage
+window `roll_back_to_retired` exists to prevent. Naming it clearly as its own non-cancellable
+step (rather than folding it into `IndexingTask`'s vocabulary) is meant to stop a future reader
+from assuming it shares the build phase's cancellation semantics.
+
 This also gives the existing R5.4 shutdown watchdog (`c085be0`) a cleaner story for the
 long-running case specifically: today it polls `index_op_held_by_self` to decide whether to
 defer `daemon stop`'s hard exit while a write is genuinely in flight (any of the three). With
