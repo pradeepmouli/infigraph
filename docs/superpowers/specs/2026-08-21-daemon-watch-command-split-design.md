@@ -271,7 +271,7 @@ This removes the need to hand-wire which signals a given "stop" needs to hit (to
 + `doc_shutdown`, soon a third `code_token` if done by hand) — cancelling the daemon's token
 alone correctly tears down everything beneath it.
 
-### Crossing the process boundary: sentinels bridge into the token hierarchy
+### Crossing the process boundary: `WatchControl` requests bridge into the token hierarchy
 
 `CancellationToken` is in-process-only. A separate `infigraph watch stop` CLI invocation, or an
 MCP tool call, is a different OS process from the running `infigraph daemon` — it cannot call
