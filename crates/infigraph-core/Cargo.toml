@@ -47,8 +47,11 @@ sysinfo = "0.39.6"
 # now share this one entry -- `rt-multi-thread` is the only feature either
 # of them ever asked for.
 # Features expanded for daemon/watch command split: time, process for
-# CancellationToken; macros for the `tokio::select!` in watch::producer.
-tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "time", "process", "macros"] }
+# CancellationToken; macros for the `tokio::select!` in watch::producer;
+# sync for its `tokio::sync::mpsc` fsevent bridge. `sync` is declared
+# explicitly rather than relied on via feature unification with tokio-util's
+# own request -- an implicit feature here already broke one build once.
+tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "time", "process", "macros", "sync"] }
 tokio-util = "0.7"
 
 [target.'cfg(unix)'.dependencies]

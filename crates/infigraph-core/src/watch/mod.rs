@@ -10,13 +10,21 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Result;
-use notify::{Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
+use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use tokio_util::sync::CancellationToken;
 
+use crate::daemon_protocol::{WatchAction, WatchRole};
 use crate::ops::{begin_index_op, IndexOpOutcome};
+use crate::watch::queue::IndexWorkQueue;
 use crate::watch::task::Task;
 use crate::Infigraph;
-use batch::ChangeBatch;
+
+/// How long one coordinator tick waits before looking again. The fsevent
+/// half moved to `producer::run_producer`, so this loop no longer blocks on
+/// a watch receiver -- but every remaining job it has (reaping finished
+/// background work, serving `.request` files, scheduling drains) is still
+/// polled, on the same ~200ms cadence `rx.recv_timeout` used to impose.
+const COORDINATOR_TICK: Duration = Duration::from_millis(200);
 
 /// A single file-change event emitted by the watcher.
 #[derive(Debug, Clone)]
@@ -78,6 +86,84 @@ impl std::fmt::Display for WatchEvent {
 /// callback does (e.g. `run_scip_indexers`' between-indexer-launch check).
 pub type FullReindexCallback = dyn Fn(Arc<Infigraph>, Vec<String>, CancellationToken) + Send + Sync;
 
+/// Caller-supplied hook that acts on a `WatchControl { role: Docs, .. }`
+/// request. Doc-watching lives in `infigraph-docs`, a crate this one does
+/// not depend on, and its loop is still driven by its own
+/// `Arc<AtomicBool>`/thread shape rather than a `Task<()>` -- so the
+/// coordinator dispatches the request and the owner of that thread (today:
+/// `cmd_daemon`) decides what start/stop actually mean for it. `Err(msg)`
+/// becomes the request's `WriteResult::Err`.
+pub type DocsControl = dyn Fn(WatchAction) -> std::result::Result<(), String> + Send + Sync;
+
+/// The coordinator's handle on the code-watch producer `Task<()>`: enough
+/// state to stop the live one, and enough to spawn a replacement when a
+/// `WatchControl { role: Code, action: Start|Restart }` request asks for
+/// one. Stopping cancels the *task's* own child token, leaving `token`
+/// (the `code_token` of the spec's hierarchy) intact and reusable -- which
+/// is what makes stop-then-start work without rebuilding the hierarchy.
+///
+/// Constructed by the coordinator rather than its caller because the
+/// producer needs the same `LanguageRegistry` the coordinator already built
+/// once for the whole session (#58): handing that construction to the
+/// caller would mean building the 62-pack registry twice per daemon start.
+struct CodeWatch {
+    /// Dedicated small runtime for producer tasks, deliberately separate
+    /// from `drain_rt` (blocking indexing work only) so a stalled producer
+    /// can't stall drain dispatch/reaping, or vice versa.
+    rt: tokio::runtime::Runtime,
+    token: CancellationToken,
+    task: Option<Task<()>>,
+    config: producer::ProducerConfig,
+    queue: Arc<Mutex<IndexWorkQueue>>,
+    on_event: Arc<dyn Fn(WatchEvent) + Send + Sync>,
+}
+
+impl CodeWatch {
+    fn new(
+        daemon_token: &CancellationToken,
+        config: producer::ProducerConfig,
+        queue: Arc<Mutex<IndexWorkQueue>>,
+        on_event: Arc<dyn Fn(WatchEvent) + Send + Sync>,
+    ) -> Result<Self> {
+        Ok(CodeWatch {
+            rt: tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .thread_name("infigraph-watch")
+                .enable_all()
+                .build()?,
+            token: daemon_token.child_token(),
+            task: None,
+            config,
+            queue,
+            on_event,
+        })
+    }
+
+    fn start(&mut self) {
+        if self.task.is_some() {
+            return;
+        }
+        let config = self.config.clone();
+        let queue = Arc::clone(&self.queue);
+        let on_event = Arc::clone(&self.on_event);
+        // `Task::spawn` dispatches via the ambient `tokio::task::spawn`,
+        // which needs a runtime context on this (plain OS) thread.
+        let _guard = self.rt.enter();
+        self.task = Some(Task::spawn(&self.token, "code-watch", move |token| {
+            producer::run_producer(config, queue, move |evt| on_event(evt), token)
+        }));
+    }
+
+    fn stop(&mut self) {
+        if let Some(task) = self.task.take() {
+            // Blocking here is bounded: a producer's `select!` loop has no
+            // long synchronous work to finish, so it observes the
+            // cancellation on its next poll.
+            self.rt.block_on(task.stop());
+        }
+    }
+}
+
 /// Watch a project directory and auto-reindex on file changes.
 ///
 /// On non-Windows platforms, holds one DB connection open for the whole
@@ -98,7 +184,7 @@ pub fn watch_project<MR>(
     make_registry: MR,
     debounce_ms: u64,
     stop_rx: mpsc::Receiver<()>,
-    on_event: impl Fn(WatchEvent) + Send + 'static,
+    on_event: impl Fn(WatchEvent) + Send + Sync + 'static,
 ) -> Result<()>
 where
     MR: Fn() -> Result<crate::lang::LanguageRegistry> + Send + 'static,
@@ -118,21 +204,36 @@ where
         false,
         None,
         &token,
+        None,
     )
 }
 
+/// The daemon's write coordinator: reaps and schedules index-shaped work
+/// (drains, full reindexes, SCIP enrichment), serves `.request` files, and
+/// owns the code-watch producer `Task<()>`'s lifecycle.
+///
+/// Filesystem watching itself is NOT done here -- it runs in
+/// `producer::run_producer` on `CodeWatch`'s own runtime, feeding the same
+/// `queue` this loop drains. That separation is the point: a
+/// `WatchControl { role: Code, action: Stop }` request stops the producer
+/// while this loop keeps running and keeps serving writes.
+///
+/// `docs_control` lets a caller that owns a doc-watch loop (the CLI daemon)
+/// have `WatchControl { role: Docs, .. }` requests dispatched to it; `None`
+/// answers those requests with an error instead.
 #[allow(clippy::too_many_arguments)]
 pub fn run_write_coordinator<MR, F>(
     root: &Path,
     make_registry: MR,
     debounce_ms: u64,
     stop_rx: mpsc::Receiver<()>,
-    on_event: impl Fn(WatchEvent) + Send + 'static,
+    on_event: impl Fn(WatchEvent) + Send + Sync + 'static,
     periodic_secs: u64,
     on_periodic: Option<F>,
     serve_requests: bool,
     on_full_reindex: Option<Arc<FullReindexCallback>>,
     daemon_token: &CancellationToken,
+    docs_control: Option<Arc<DocsControl>>,
 ) -> Result<()>
 where
     MR: Fn() -> Result<crate::lang::LanguageRegistry> + Send + 'static,
@@ -154,16 +255,9 @@ where
     // `make_registry()` call -- a rebuild takes far longer than a registry
     // build, so sharing buys nothing there.
     let shared_registry: Arc<crate::lang::LanguageRegistry> = Arc::new(make_registry()?);
-    let filter_registry = &shared_registry;
 
     let mut changes_since_periodic: usize = 0;
     let mut last_periodic = std::time::Instant::now();
-    let mut ignore_matcher = crate::ignore_rules::IgnoreMatcher::build(root);
-    let mut last_ignore_rebuild = std::time::Instant::now();
-
-    // Batch accumulator: collect file changes over a 1-second window
-    // then index them all at once using the bulk write path.
-    let mut batch = ChangeBatch::new(1000);
 
     // Shared DB connection for the watch session — see `watch_db`'s doc
     // comment for the platform split (held open on non-Windows, reopened
@@ -179,36 +273,40 @@ where
     // Shared rather than loop-local because the drain runs on a background
     // task: producers below keep filling it, under the mutex, while a drain
     // executes.
-    let queue = Arc::new(Mutex::new(crate::watch::queue::IndexWorkQueue::new()));
-
-    // R3.3.5: recover any dirty marks a prior run of this watcher left
-    // behind -- e.g. it crashed between a raw fsevent and the debounce
-    // window's flush, so the change never made it into a drain. A path
-    // still present on disk needs a fresh extraction; one that's gone was
-    // a removal that never got applied (`add_watch_removal` is safe either
-    // way -- its directory-prefix scan is a harmless no-op for a path that
-    // turns out to have been a file). This is what makes the recovery
-    // targeted at exactly the paths left mid-flight instead of requiring a
-    // full rescan.
+    let queue = Arc::new(Mutex::new(IndexWorkQueue::new()));
     let infigraph_dir = root.join(".infigraph");
-    match crate::dirty::pending_dirty(&infigraph_dir) {
-        Ok(leftover) if !leftover.is_empty() => {
-            eprintln!(
-                "[watch] recovering {} dirty path(s) left over from a prior run",
-                leftover.len()
-            );
-            let mut q = queue.lock().unwrap();
-            for rel in leftover {
-                if root.join(&rel).exists() {
-                    q.add_raw(rel);
-                } else {
-                    q.add_watch_removal(rel);
-                }
-            }
-        }
-        Ok(_) => {}
-        Err(e) => eprintln!("[watch] failed to read dirty set, skipping recovery: {e}"),
-    }
+
+    // R3.3.5's dirty-set recovery now runs inside `run_producer` (once per
+    // producer start), not here -- it is watch-side recovery, and keeping a
+    // second copy on this side would double-enqueue every recovered path
+    // the moment both halves run against the same queue.
+
+    // Code-watching runs as its own cancellable task feeding `queue`, so a
+    // `WatchControl { role: Code, .. }` request can stop and restart it
+    // without this loop noticing. Its registry is the same one built above:
+    // building a second would cost seconds in debug builds (#58).
+    let on_event_shared: Arc<dyn Fn(WatchEvent) + Send + Sync> = Arc::new(on_event);
+    let mut code_watch = CodeWatch::new(
+        daemon_token,
+        producer::ProducerConfig {
+            root: root.to_path_buf(),
+            registry: Arc::clone(&shared_registry),
+            debounce_ms,
+            // Callers with a periodic pass keep that pass's cadence for the
+            // ignore-matcher rebuild, exactly as this loop used to do
+            // inline. Callers without one (the daemon: `periodic_secs == 0`)
+            // used to never rebuild it at all; a 5-minute floor gives them
+            // mid-session `.gitignore` edits without a restart.
+            ignore_rebuild_secs: if periodic_secs > 0 {
+                periodic_secs
+            } else {
+                300
+            },
+        },
+        Arc::clone(&queue),
+        Arc::clone(&on_event_shared),
+    )?;
+    code_watch.start();
 
     // Drains run here instead of inline so a large one (a whole-project
     // reindex can take minutes) doesn't stop this loop from accepting
@@ -225,28 +323,6 @@ where
 
     let sentinel = root.join(".infigraph").join("watch.stop");
 
-    const MAX_RESTARTS: u32 = 3;
-    // R7.4 (#84): above this many files in one debounce window, the batch
-    // coalesces into a single whole-project pass instead of per-file
-    // updates. Overridable via INFIGRAPH_STORM_THRESHOLD for tests/tuning.
-    let storm_threshold: usize = std::env::var("INFIGRAPH_STORM_THRESHOLD")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(200);
-    let mut restart_count: u32 = 0;
-
-    // Create initial watcher — factored into a closure for restart.
-    let create_watcher =
-        |root: &Path| -> Result<(RecommendedWatcher, mpsc::Receiver<notify::Result<Event>>)> {
-            let (tx, rx) = mpsc::channel::<notify::Result<Event>>();
-            let config = Config::default().with_poll_interval(Duration::from_millis(debounce_ms));
-            let mut watcher = RecommendedWatcher::new(tx, config)?;
-            register_watch_dirs(&mut watcher, root)?;
-            Ok((watcher, rx))
-        };
-
-    let (mut watcher, mut rx) = create_watcher(root)?;
-
     loop {
         if stop_rx.try_recv().is_ok() {
             break;
@@ -254,6 +330,14 @@ where
 
         if sentinel.exists() {
             let _ = std::fs::remove_file(&sentinel);
+            break;
+        }
+
+        // A `WatchControl { role: Daemon, action: Stop }` request cancels
+        // `daemon_token` from inside `route_or_serve_request` below. Without
+        // this check the token would tear down every task beneath it while
+        // this loop kept spinning, and the process would never exit.
+        if daemon_token.is_cancelled() {
             break;
         }
 
@@ -306,7 +390,16 @@ where
             let (guard, outcome) = finish_drain(drain_rt.block_on(handle), &waiter_replies);
             match outcome {
                 Some(outcome) => {
-                    changes_since_periodic += outcome.extractions.len();
+                    // Removals are counted here rather than off a raw
+                    // fsevent (as they were before the producer split, when
+                    // this loop owned the watcher): `add_watch_removal`
+                    // writes into the same `queue` this drain came from, so
+                    // what the drain actually removed is a strictly better
+                    // signal than what an fsevent claimed -- and it is the
+                    // only one still visible from this side of the split.
+                    // Without it a removals-only session could never trip
+                    // the periodic whole-project pass below.
+                    changes_since_periodic += outcome.extractions.len() + removed_in_drain.len();
 
                     // R3.3.5: only extractions that actually made it into
                     // `outcome` were confirmed written (a per-file read/parse
@@ -349,7 +442,7 @@ where
                     for extraction in &outcome.extractions {
                         let cross = has_cross_file_calls(&prism, &extraction.file);
                         let abs_path = root.join(&extraction.file);
-                        on_event(WatchEvent {
+                        on_event_shared(WatchEvent {
                             kind: WatchEventKind::Modified,
                             path: abs_path,
                             has_cross_file_calls: cross,
@@ -431,14 +524,6 @@ where
             }
         }
 
-        // Periodically rebuild the ignore matcher so edits to .gitignore/
-        // .infigraphignore mid-watch take effect without a daemon restart.
-        if periodic_secs > 0 && last_ignore_rebuild.elapsed() >= Duration::from_secs(periodic_secs)
-        {
-            ignore_matcher = crate::ignore_rules::IgnoreMatcher::build(root);
-            last_ignore_rebuild = std::time::Instant::now();
-        }
-
         // Periodic SCIP refresh: if changes accumulated and enough time passed
         if periodic_secs > 0
             && changes_since_periodic > 0
@@ -461,11 +546,13 @@ where
 
         // Serve file-dropped write requests -- daemon-mode only (never from
         // in-process MCP watcher threads, which always pass
-        // serve_requests=false). Piggybacks on this loop's existing tick
-        // (at least every 200ms via the rx.recv_timeout below) rather than
-        // a separate notify-based watch on the requests directory --
-        // submit_write_request's own poll-with-backoff starts at 10ms and
-        // only reaches 200ms after several rounds, so this cadence is fine.
+        // serve_requests=false). Piggybacks on this loop's `COORDINATOR_TICK`
+        // cadence rather than a separate notify-based watch on the requests
+        // directory -- submit_write_request's own poll-with-backoff starts at
+        // 10ms and only reaches 200ms after several rounds, so this cadence
+        // is fine. The spec's event-driven upgrade (a second `notify::Watcher`
+        // scoped to `.infigraph/requests/`) is deferred: it needs a `select!`
+        // arm, and this coordinator is deliberately synchronous.
         if serve_requests {
             let requests_dir = root.join(".infigraph").join("requests");
             if let Ok(entries) = std::fs::read_dir(&requests_dir) {
@@ -483,134 +570,11 @@ where
                             full_reindex_in_flight.is_some(),
                             &drain_rt,
                             daemon_token,
+                            &mut code_watch,
+                            docs_control.as_ref(),
                         ) {
                             full_reindex_in_flight = Some(started);
                         }
-                    }
-                }
-            }
-        }
-
-        // Flush the batch when the window has closed -- feeds the shared
-        // queue rather than indexing directly; the drain step below is what
-        // actually executes it, combined with whatever else this tick's
-        // other producers also contributed.
-        if !batch.is_empty() && batch.is_ready() {
-            let paths = batch.drain();
-            let mut q = queue.lock().unwrap();
-            flush_batch_into_queue(&mut q, paths, root, storm_threshold);
-        }
-
-        match rx.recv_timeout(Duration::from_millis(200)) {
-            Ok(Ok(event)) => {
-                let watch_kind = match event.kind {
-                    EventKind::Create(_) => WatchEventKind::Created,
-                    EventKind::Modify(_) => WatchEventKind::Modified,
-                    EventKind::Remove(_) => WatchEventKind::Removed,
-                    _ => continue,
-                };
-
-                for path in event.paths {
-                    if ignore_matcher.is_ignored(&path, path.is_dir()) {
-                        continue;
-                    }
-
-                    let rel = match path.strip_prefix(root) {
-                        Ok(r) => r.to_string_lossy().replace('\\', "/"),
-                        Err(_) => continue,
-                    };
-
-                    match watch_kind {
-                        WatchEventKind::Removed => {
-                            // R3.3.5: persisted before the in-memory queue
-                            // add below, so a crash between the two still
-                            // leaves this path recoverable at next startup.
-                            if let Err(e) =
-                                crate::dirty::mark_dirty(&infigraph_dir, std::slice::from_ref(&rel))
-                            {
-                                eprintln!("[watch] failed to persist dirty mark for {rel}: {e}");
-                            }
-                            // Deferred to the shared drain step below rather
-                            // than touching the graph directly here -- this
-                            // closes a pre-existing gap where watch-triggered
-                            // removal never took `index.lock` at all.
-                            // `add_watch_removal` (not `add_removal`) because
-                            // this is a real filesystem removal event: `path`
-                            // is already gone from disk, so there is no way
-                            // to tell here whether it named a file or a
-                            // directory -- the drain step scans for and
-                            // removes anything nested under it too.
-                            queue.lock().unwrap().add_watch_removal(rel);
-                            changes_since_periodic += 1;
-                            on_event(WatchEvent {
-                                kind: watch_kind.clone(),
-                                path,
-                                has_cross_file_calls: false,
-                            });
-                        }
-                        WatchEventKind::Created | WatchEventKind::Modified => {
-                            if path.is_dir() {
-                                let _ = register_watch_dirs(&mut watcher, &path);
-                            } else if filter_registry.for_file(&rel).is_some() {
-                                // R3.3.5: persisted before this event enters
-                                // `batch` -- the in-memory accumulator a crash
-                                // could still lose between now and the
-                                // debounce-window flush below.
-                                if let Err(e) = crate::dirty::mark_dirty(
-                                    &infigraph_dir,
-                                    std::slice::from_ref(&rel),
-                                ) {
-                                    eprintln!(
-                                        "[watch] failed to persist dirty mark for {rel}: {e}"
-                                    );
-                                }
-                                batch.add(path);
-                            }
-                        }
-                        WatchEventKind::WatcherRestarted | WatchEventKind::WatcherDied => {}
-                    }
-                }
-            }
-            Ok(Err(e)) => eprintln!("watch error: {e}"),
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                // Watcher's internal thread died (e.g. kqueue panic on dir deletion).
-                // Attempt restart with backoff.
-                restart_count += 1;
-                if restart_count > MAX_RESTARTS {
-                    eprintln!("[watch] watcher died {restart_count} times, giving up");
-                    on_event(WatchEvent {
-                        kind: WatchEventKind::WatcherDied,
-                        path: root.to_path_buf(),
-                        has_cross_file_calls: false,
-                    });
-                    break;
-                }
-                let backoff = Duration::from_secs(restart_count as u64);
-                eprintln!(
-                    "[watch] watcher disconnected, restarting ({restart_count}/{MAX_RESTARTS}) after {}s",
-                    backoff.as_secs()
-                );
-                std::thread::sleep(backoff);
-                match create_watcher(root) {
-                    Ok((new_watcher, new_rx)) => {
-                        watcher = new_watcher;
-                        rx = new_rx;
-                        eprintln!("[watch] watcher restarted successfully");
-                        on_event(WatchEvent {
-                            kind: WatchEventKind::WatcherRestarted,
-                            path: root.to_path_buf(),
-                            has_cross_file_calls: false,
-                        });
-                    }
-                    Err(e) => {
-                        eprintln!("[watch] watcher restart failed: {e}");
-                        on_event(WatchEvent {
-                            kind: WatchEventKind::WatcherDied,
-                            path: root.to_path_buf(),
-                            has_cross_file_calls: false,
-                        });
-                        break;
                     }
                 }
             }
@@ -678,7 +642,14 @@ where
                 }
             }
         }
+
+        std::thread::sleep(COORDINATOR_TICK);
     }
+
+    // Stop the producer before waiting out the in-flight work below: it
+    // shares `queue`, and anything it adds after this point would be
+    // enqueued for a drain that is never going to run.
+    code_watch.stop();
 
     // A drain still running when the loop exits holds `index.lock` and a
     // connection to the graph. Wait it out rather than returning into a
@@ -1612,6 +1583,8 @@ fn route_or_serve_request<MR>(
     full_reindex_in_flight: bool,
     drain_rt: &tokio::runtime::Runtime,
     daemon_token: &CancellationToken,
+    code_watch: &mut CodeWatch,
+    docs_control: Option<&Arc<DocsControl>>,
 ) -> Option<PendingFullReindex>
 where
     MR: Fn() -> Result<crate::lang::LanguageRegistry>,
@@ -1769,10 +1742,76 @@ where
             drain_rt,
             daemon_token,
         ),
+        WriteRequest::WatchControl { role, action } => {
+            let outcome = match role {
+                // `Enable`/`Disable` differ from `Start`/`Stop` only in
+                // whether the *caller* also wrote the persisted flag in
+                // config.toml (Phase 4). Their effect on the live task is
+                // identical, so this arm treats them the same.
+                WatchRole::Code => {
+                    match action {
+                        WatchAction::Stop | WatchAction::Disable => code_watch.stop(),
+                        WatchAction::Start | WatchAction::Enable => code_watch.start(),
+                        WatchAction::Restart => {
+                            code_watch.stop();
+                            code_watch.start();
+                        }
+                    }
+                    Ok(())
+                }
+                WatchRole::Docs => match docs_control {
+                    Some(control) => control(action),
+                    None => {
+                        Err("this watcher does not own a doc-watch loop to control".to_string())
+                    }
+                },
+                // Only the process's own exit is expressible here: `Start`
+                // is meaningless (you are talking to a daemon, so one
+                // exists), and a real `Restart` is the *client's* job --
+                // this process can only stop itself. Both stop; the reply
+                // is written before cancelling so the caller still gets it.
+                WatchRole::Daemon => match action {
+                    WatchAction::Stop | WatchAction::Restart => Ok(()),
+                    _ => {
+                        Err("WatchControl { role: Daemon } only supports Stop/Restart".to_string())
+                    }
+                },
+            };
+            let daemon_stop = matches!(
+                (role, action, &outcome),
+                (
+                    WatchRole::Daemon,
+                    WatchAction::Stop | WatchAction::Restart,
+                    Ok(())
+                )
+            );
+            reply_to_watch_control(&reply_path, outcome);
+            std::fs::remove_file(path).ok();
+            if daemon_stop {
+                daemon_token.cancel();
+            }
+            None
+        }
         _ => {
             serve_request_locked(root, path, registry, held, drain_in_flight);
             None
         }
+    }
+}
+
+/// Answers a `WatchControl` request. Same `write_atomic`/`WriteResult`
+/// shape every other reply in this module uses; the counts are zero because
+/// watch-control moves no files through the graph.
+fn reply_to_watch_control(reply_path: &Path, outcome: std::result::Result<(), String>) {
+    let result = match outcome {
+        Ok(()) => crate::daemon_protocol::WriteResult::Ok {
+            total_files: 0,
+            indexed_files: 0,
+        },
+        Err(message) => crate::daemon_protocol::WriteResult::Err { message },
+    };
+    if let Ok(json) = serde_json::to_string(&result) {
+        let _ = crate::daemon_protocol::write_atomic(reply_path, &json);
     }
 }
 
@@ -2129,17 +2168,34 @@ mod tests {
         let mut held: Option<Arc<Infigraph>> = None;
         let drain_rt = tokio::runtime::Runtime::new().unwrap();
         let daemon_token = CancellationToken::new();
+        let registry = Arc::new(crate::lang::LanguageRegistry::new());
+        // Never started -- this test exercises request routing only, and a
+        // live producer would race it by queueing its own fsevents.
+        let mut code_watch = CodeWatch::new(
+            &daemon_token,
+            producer::ProducerConfig {
+                root: root.clone(),
+                registry: Arc::clone(&registry),
+                debounce_ms: 50,
+                ignore_rebuild_secs: 300,
+            },
+            Arc::clone(&queue),
+            Arc::new(|_evt| {}),
+        )
+        .unwrap();
         route_or_serve_request(
             &root,
             &request_path,
             &queue,
-            &Arc::new(crate::lang::LanguageRegistry::new()),
+            &registry,
             &|| Ok(crate::lang::LanguageRegistry::new()),
             &mut held,
             false,
             false,
             &drain_rt,
             &daemon_token,
+            &mut code_watch,
+            None,
         );
 
         let drained = queue.lock().unwrap().drain();

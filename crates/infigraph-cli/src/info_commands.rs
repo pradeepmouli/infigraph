@@ -374,10 +374,17 @@ pub(crate) fn cmd_daemon(root: &Path, debounce: u64) -> Result<()> {
     );
 
     let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+    // The daemon-lifetime token every cancellable task in this process hangs
+    // off: the code-watch producer (spawned inside run_write_coordinator),
+    // full-reindex builds, and SCIP enrichment. Cancelling it tears all of
+    // them down, and the coordinator's own loop exits on it too.
+    let daemon_token = tokio_util::sync::CancellationToken::new();
 
     let watchdog_root = root.to_path_buf();
+    let watchdog_token = daemon_token.clone();
     ctrlc::set_handler(move || {
         let _ = stop_tx.send(());
+        watchdog_token.cancel();
         // R5.4 (#79): bound the graceful path. The watch loop's shutdown
         // waits out in-flight drains; if one is wedged (stuck on a lock or
         // a hung query), that wait never ends and the daemon becomes an
@@ -418,18 +425,33 @@ pub(crate) fn cmd_daemon(root: &Path, debounce: u64) -> Result<()> {
     })
     .ok();
 
-    let doc_shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let doc_shutdown_for_thread = std::sync::Arc::clone(&doc_shutdown);
-    let doc_root = root.to_path_buf();
-    let doc_thread = std::thread::spawn(move || {
-        if let Err(e) = infigraph_docs::watch::watch_docs_daemon_loop(
-            &doc_root,
-            debounce,
-            doc_shutdown_for_thread,
-        ) {
-            eprintln!("[doc-watch-daemon] error: {e}");
-        }
-    });
+    let doc_watch = std::sync::Arc::new(std::sync::Mutex::new(DocWatchThread::new(
+        root.to_path_buf(),
+        debounce,
+    )));
+    doc_watch.lock().unwrap().start();
+
+    // Lets `WatchControl { role: Docs, .. }` requests reach this thread from
+    // the coordinator, which lives in infigraph-core and knows nothing about
+    // doc-watching. Doc-watching deliberately stays on its existing
+    // thread + `Arc<AtomicBool>` shape here: only its external control
+    // surface is unified in this pass, not its internals (those live in
+    // infigraph-docs).
+    let doc_watch_for_control = std::sync::Arc::clone(&doc_watch);
+    let docs_control: std::sync::Arc<infigraph_core::watch::DocsControl> =
+        std::sync::Arc::new(move |action| {
+            use infigraph_core::daemon_protocol::WatchAction;
+            let mut doc_watch = doc_watch_for_control.lock().unwrap();
+            match action {
+                WatchAction::Stop | WatchAction::Disable => doc_watch.stop(),
+                WatchAction::Start | WatchAction::Enable => doc_watch.start(),
+                WatchAction::Restart => {
+                    doc_watch.stop();
+                    doc_watch.start();
+                }
+            }
+            Ok(())
+        });
 
     let on_full_reindex: std::sync::Arc<infigraph_core::watch::FullReindexCallback> =
         std::sync::Arc::new(
@@ -473,12 +495,7 @@ pub(crate) fn cmd_daemon(root: &Path, debounce: u64) -> Result<()> {
             },
         );
 
-    // Phase 3 of the daemon/watch command-surface split wires this to a real
-    // daemon-lifetime token; for now a fresh, unparented one keeps this call
-    // site compiling unaffected by the signature change (see
-    // docs/superpowers/plans/2026-08-21-daemon-watch-command-split.md task 4).
-    let daemon_token = tokio_util::sync::CancellationToken::new();
-    infigraph_core::watch::run_write_coordinator(
+    let coordinator = infigraph_core::watch::run_write_coordinator(
         root,
         bundled_registry,
         debounce,
@@ -491,13 +508,64 @@ pub(crate) fn cmd_daemon(root: &Path, debounce: u64) -> Result<()> {
         true,
         Some(on_full_reindex),
         &daemon_token,
-    )?;
+        Some(docs_control),
+    );
 
-    doc_shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
-    let _ = doc_thread.join();
+    // Unconditional, so the paths that leave the loop without going through
+    // the token (stop_rx, the watch.stop sentinel, a vanished root) still
+    // tear down everything hanging off it.
+    daemon_token.cancel();
+    doc_watch.lock().unwrap().stop();
+    coordinator?;
 
     println!("Watch stopped.");
     Ok(())
+}
+
+/// The daemon's doc-watch thread and the shutdown flag it polls, bundled so
+/// a `WatchControl { role: Docs, .. }` request can stop and restart it. Each
+/// start gets a *fresh* flag: `watch_docs_daemon_loop` only ever reads it,
+/// and a reused one would still be latched at `true` from the last stop.
+struct DocWatchThread {
+    root: std::path::PathBuf,
+    debounce: u64,
+    shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl DocWatchThread {
+    fn new(root: std::path::PathBuf, debounce: u64) -> Self {
+        DocWatchThread {
+            root,
+            debounce,
+            shutdown: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            handle: None,
+        }
+    }
+
+    fn start(&mut self) {
+        if self.handle.is_some() {
+            return;
+        }
+        self.shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let root = self.root.clone();
+        let debounce = self.debounce;
+        let shutdown = std::sync::Arc::clone(&self.shutdown);
+        self.handle = Some(std::thread::spawn(move || {
+            if let Err(e) = infigraph_docs::watch::watch_docs_daemon_loop(&root, debounce, shutdown)
+            {
+                eprintln!("[doc-watch-daemon] error: {e}");
+            }
+        }));
+    }
+
+    fn stop(&mut self) {
+        self.shutdown
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
 }
 
 pub(crate) fn cmd_watch_stop(root: &Path) -> Result<()> {

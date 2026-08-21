@@ -5,10 +5,9 @@
 //! "What a code/docs `Task<()>` never touches directly".
 //!
 //! This is the async counterpart of the fsevent half of
-//! `run_write_coordinator`, extracted so watch activity can be started
-//! and stopped independently of the daemon process's own lifetime. It is
-//! deliberately landed unused: `run_write_coordinator` still runs its
-//! own copy of this logic until the rewiring task retires it.
+//! `run_write_coordinator`, which now spawns it as the `code` producer
+//! `Task<()>` so watch activity can be started and stopped independently of
+//! the daemon process's own lifetime.
 
 use crate::watch::queue::IndexWorkQueue;
 use crate::watch::{WatchEvent, WatchEventKind};
@@ -20,6 +19,32 @@ use tokio::sync::mpsc as tokio_mpsc;
 use tokio_util::sync::CancellationToken;
 
 const MAX_RESTARTS: u32 = 3;
+
+/// Everything a producer needs that is fixed for its whole lifetime. A
+/// struct rather than four more positional parameters because
+/// `run_write_coordinator` both spawns the initial producer and respawns
+/// one per `WatchControl { role: Code, action: Start|Restart }` request, and
+/// two u64s side by side are exactly the kind of argument pair a respawn
+/// site can silently transpose.
+#[derive(Clone)]
+pub struct ProducerConfig {
+    pub root: PathBuf,
+    /// Gates which Created/Modified paths get marked dirty and batched. A
+    /// path with no language pack behind it never produces a
+    /// `FileExtraction`, so marking it dirty leaves it dirty forever:
+    /// `clear_dirty` only clears what a drain's `outcome.extractions`
+    /// reported. Without this filter every README/lockfile/image touched
+    /// under `root` leaks into a permanently-growing dirty set.
+    pub registry: Arc<crate::lang::LanguageRegistry>,
+    /// Only read by notify's `PollWatcher` fallback -- the native backends
+    /// (FSEvents/inotify/ReadDirectoryChangesW) ignore it -- but the
+    /// synchronous coordinator passed it, so it is passed here too rather
+    /// than silently regressing whichever platform falls back to polling.
+    pub debounce_ms: u64,
+    /// How often to rebuild the ignore matcher so mid-watch edits to
+    /// `.gitignore`/`.infigraphignore` take effect without a daemon restart.
+    pub ignore_rebuild_secs: u64,
+}
 
 /// Cadence for the two things that still need a timer rather than an event:
 /// closing the `ChangeBatch` debounce window, and noticing the watched root
@@ -33,21 +58,23 @@ const TICK: Duration = Duration::from_millis(200);
 /// things that essentially never change.
 const ROOT_CHECK: Duration = Duration::from_secs(2);
 
-/// How often to rebuild the ignore matcher so mid-watch edits to
-/// `.gitignore`/`.infigraphignore` take effect without a daemon restart.
-const IGNORE_REBUILD: Duration = Duration::from_secs(300);
-
-/// Watch `root` for filesystem changes and feed them into `queue`.
+/// Watch `cfg.root` for filesystem changes and feed them into `queue`.
 ///
 /// Runs until `token` is cancelled, the watcher dies past `MAX_RESTARTS`
-/// restart attempts, or `root` stops existing. Spawnable via
-/// `Task::spawn(parent, role, |token| run_producer(root, queue, on_event, token))`.
+/// restart attempts, or the root stops existing. Spawnable via
+/// `Task::spawn(parent, role, |token| run_producer(cfg, queue, on_event, token))`.
 pub async fn run_producer(
-    root: PathBuf,
+    cfg: ProducerConfig,
     queue: Arc<Mutex<IndexWorkQueue>>,
     on_event: impl Fn(WatchEvent) + Send + 'static,
     token: CancellationToken,
 ) {
+    let ProducerConfig {
+        root,
+        registry,
+        debounce_ms,
+        ignore_rebuild_secs,
+    } = cfg;
     // Some watch backends (e.g. FSEvents on macOS) deliver absolute,
     // symlink-resolved event paths regardless of how `root` was specified.
     // If `root` is relative, or traverses a symlink (macOS temp dirs live
@@ -98,10 +125,20 @@ pub async fn run_producer(
         .and_then(|v| v.parse().ok())
         .unwrap_or(200);
 
-    let (mut watcher, mut rx) = match create_watcher(&root) {
+    let (mut watcher, mut rx) = match create_watcher(&root, debounce_ms) {
         Ok(pair) => pair,
         Err(e) => {
             eprintln!("[watch-producer] failed to start watcher: {e}");
+            // Same event every other terminal path emits. Without it a
+            // producer whose watcher never started is indistinguishable,
+            // from the coordinator's side, from one that shut down cleanly
+            // on cancellation -- the task just completes and nothing says
+            // watching never actually began.
+            on_event(WatchEvent {
+                kind: WatchEventKind::WatcherDied,
+                path: root.clone(),
+                has_cross_file_calls: false,
+            });
             return;
         }
     };
@@ -114,7 +151,7 @@ pub async fn run_producer(
     // from wherever the iteration actually ended.
     let mut tick = interval_after(TICK);
     let mut root_check = interval_after(ROOT_CHECK);
-    let mut ignore_rebuild = interval_after(IGNORE_REBUILD);
+    let mut ignore_rebuild = interval_after(Duration::from_secs(ignore_rebuild_secs.max(1)));
 
     loop {
         tokio::select! {
@@ -191,7 +228,7 @@ pub async fn run_producer(
                                 WatchEventKind::Created | WatchEventKind::Modified => {
                                     if path.is_dir() {
                                         let _ = crate::watch::register_watch_dirs(&mut watcher, &path);
-                                    } else {
+                                    } else if registry.for_file(&rel).is_some() {
                                         // R3.3.5: persisted before this event
                                         // enters `batch` -- the in-memory
                                         // accumulator a crash could still lose
@@ -235,7 +272,7 @@ pub async fn run_producer(
                             _ = token.cancelled() => break,
                             _ = tokio::time::sleep(backoff) => {}
                         }
-                        match create_watcher(&root) {
+                        match create_watcher(&root, debounce_ms) {
                             Ok((new_watcher, new_rx)) => {
                                 watcher = new_watcher;
                                 rx = new_rx;
@@ -282,6 +319,7 @@ fn interval_after(period: Duration) -> tokio::time::Interval {
 /// what produced `RecvTimeoutError::Disconnected` there.
 fn create_watcher(
     root: &Path,
+    debounce_ms: u64,
 ) -> anyhow::Result<(
     RecommendedWatcher,
     tokio_mpsc::UnboundedReceiver<notify::Result<Event>>,
@@ -293,7 +331,7 @@ fn create_watcher(
         move |evt| {
             let _ = tx.send(evt);
         },
-        Config::default(),
+        Config::default().with_poll_interval(Duration::from_millis(debounce_ms)),
     )?;
     crate::watch::register_watch_dirs(&mut watcher, root)?;
     Ok((watcher, rx))

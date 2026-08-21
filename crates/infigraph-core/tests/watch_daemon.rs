@@ -473,6 +473,7 @@ fn watch_triggered_file_removal_contends_with_a_held_index_lock() {
             false, // serve_requests
             None,
             &token_for_thread,
+            None,
         )
     });
 
@@ -563,6 +564,7 @@ fn watch_loop_shuts_down_when_its_root_directory_is_deleted() {
             false, // serve_requests
             None,
             &token_for_thread,
+            None,
         )
     });
 
@@ -653,6 +655,7 @@ fn out_of_scope_write_request_contends_with_a_held_index_lock() {
             true, // serve_requests
             None,
             &token_for_thread,
+            None,
         )
     });
 
@@ -771,6 +774,7 @@ fn full_reindex_build_task_can_be_cancelled_before_it_starts_the_swap() {
             true, // serve_requests
             None,
             &token_for_thread,
+            None,
         )
     });
 
@@ -894,6 +898,7 @@ fn scip_enrichment_task_is_cancellable_via_daemon_token() {
             true, // serve_requests
             Some(on_full_reindex),
             &token_for_thread,
+            None,
         )
     });
 
