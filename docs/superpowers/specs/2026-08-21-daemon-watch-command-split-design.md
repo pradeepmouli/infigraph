@@ -96,15 +96,19 @@ state. It only ever calls `queue.lock().unwrap()...` (mutate) `.drop()` — iden
 split safe: the two sides only share one already-`Arc<Mutex<_>>`-wrapped piece of state, not
 raw Kuzu connections or in-flight-drain bookkeeping.
 
-### `IndexingTask` — unifying the coordinator's in-flight work
+### `IndexingTask` — for full-reindex and SCIP enrichment only
 
-The coordinator already runs its actual work — draining the queue, building a full reindex,
-running SCIP enrichment — as genuine tokio tasks: `drain_rt.spawn_blocking(...)` returns a real
-`tokio::task::JoinHandle<T>` in all three cases (blocking, not plain `spawn`, because the work
-inside touches Kuzu and the filesystem synchronously — that doesn't change here). What's
-missing is a shared shape: today each of `InFlightDrain`, `InFlightFullReindex`, and
-`InFlightScip` is its own hand-rolled struct, reaped by its own ~30-60 line inline block in the
-loop, with no cancellation token and no common vocabulary with `WatchableTask`.
+The coordinator runs three kinds of work as `drain_rt.spawn_blocking(...)` tokio tasks: queue
+drains, full reindexes, and SCIP enrichment. Of these, only the latter two get `IndexingTask`
+treatment. **The drain (`InFlightDrain`) is deliberately left exactly as it is today, with no
+unification.** Reasoning: drain is the fast, frequent operation — scheduled whenever the queue
+has anything, reaped every tick — and today's "wait it out" behavior at shutdown is already
+fine for it. Full reindex and SCIP enrichment are the genuinely long-running ones (minutes,
+including running external SCIP indexer binaries) with natural internal checkpoints
+(build-fresh-then-swap phases; between each external indexer binary) where checking
+`token.is_cancelled()` and bailing early meaningfully shortens `daemon stop`'s shutdown time. A
+cancellation token buys real value there and none for drain, so it's added only where it pays
+for itself.
 
 ```rust
 struct IndexingTask<T> {
@@ -113,22 +117,19 @@ struct IndexingTask<T> {
 }
 ```
 
-The coordinator's scheduling logic is unchanged — it still decides synchronously, on its own
-thread, when to call `drain_rt.spawn_blocking(...)` for a drain, a full reindex, or SCIP
-enrichment, and still reaps each `IndexingTask`'s `handle` the same way (`is_finished()`/
-`block_on`) it reaps `InFlightDrain` et al. today. What changes is that all three now share one
-generic type instead of three duplicated ones, and each carries a `daemon_token.child_token()`
-— giving them the same cancellation vocabulary as `WatchableTask`, not just a bare
-`JoinHandle`.
+`InFlightFullReindex` and `InFlightScip` are replaced by `IndexingTask<T>` (one shared type
+instead of two duplicated ones); `InFlightDrain` is untouched. The coordinator's scheduling
+logic is otherwise unchanged — it still decides synchronously, on its own thread, when to call
+`drain_rt.spawn_blocking(...)`, and still reaps each task's `handle` the same way
+(`is_finished()`/`block_on`) it does today.
 
-This also gives the existing R5.4 shutdown watchdog (`c085be0`) a cleaner story: today it polls
-`index_op_held_by_self` to decide whether to defer `daemon stop`'s hard exit while a write is
-genuinely in flight. With `IndexingTask` in place, "a write is in flight" and "wait for it
-before hard-exiting" are expressed in the same terms as the rest of this design — a live
-`IndexingTask` under `daemon_token` — rather than a special case bolted onto the watchdog
-alone. The watchdog's actual polling mechanism (`index_op_held_by_self`, `watchdog_should_
-defer`, the grace/ceiling durations from R5.4) does not change; only the vocabulary describing
-what it's waiting for becomes uniform.
+This also gives the existing R5.4 shutdown watchdog (`c085be0`) a cleaner story for the
+long-running case specifically: today it polls `index_op_held_by_self` to decide whether to
+defer `daemon stop`'s hard exit while a write is genuinely in flight (any of the three). With
+`IndexingTask`, a live full-reindex or SCIP-enrichment task can additionally be asked to
+cooperatively cancel via `daemon_token` rather than purely waited out — the watchdog's actual
+polling mechanism (`index_op_held_by_self`, `watchdog_should_defer`, the grace/ceiling
+durations from R5.4) does not change, and drain-in-flight is still purely waited out as today.
 
 ### Cancellation hierarchy
 
@@ -136,9 +137,10 @@ what it's waiting for becomes uniform.
 daemon_token = CancellationToken::new()
 code_token   = daemon_token.child_token()   // WatchableTask (code-watch producer)
 docs_token   = daemon_token.child_token()   // WatchableTask (doc-watch producer)
-// each IndexingTask (drain / full-reindex / SCIP) also takes daemon_token.child_token()
-// when the coordinator spawns it — one-shot, so no separate `watch`/`watch-docs`-style
-// command ever targets an IndexingTask directly; it's cancelled only via daemon_token.
+// full-reindex and SCIP-enrichment IndexingTasks also take daemon_token.child_token()
+// when the coordinator spawns them — one-shot, so no separate `watch`/`watch-docs`-style
+// command ever targets one directly; cancelled only via daemon_token. Drain has no token
+// at all (InFlightDrain, unchanged).
 ```
 
 - `daemon stop` cancels `daemon_token` → both `WatchableTask` children and any live
@@ -239,20 +241,22 @@ pausing a currently-live one.
   is unaffected in behavior — it already only fires on `daemon_token`'s cancellation path (full
   process exit), never on a `watch`/`watch-docs`-only stop. Only its internal vocabulary for
   "is a write in flight" shifts to checking for a live `IndexingTask`, per above.
-- An `IndexingTask` whose `JoinHandle` is still running when `daemon_token` cancels: the
-  coordinator's existing drain-in-progress-at-shutdown handling (waiting out `drain_in_flight`/
-  `full_reindex_in_flight`/`scip_in_flight` via `drain_rt.block_on(...)` before returning) is
-  unchanged — `IndexingTask` only changes how the in-flight state is tracked, not the
-  wait-it-out-before-exiting behavior itself.
+- A full-reindex/SCIP `IndexingTask` whose `JoinHandle` is still running when `daemon_token`
+  cancels: gets the cooperative-cancel opportunity described above at its next checkpoint, but
+  the coordinator still falls back to waiting out the handle (`drain_rt.block_on(...)`) if it
+  doesn't exit promptly — same fallback shape as today, just with an earlier-exit path added
+  on top. `InFlightDrain` in-progress-at-shutdown handling is completely unchanged: purely
+  waited out, no token, no cooperative-cancel path.
 
 ## Testing
 
 - Unit: `WatchableTask::spawn`/`stop`/`restart` lifecycle, independent of any real filesystem
   watching (a no-op `run` future that just awaits `token.cancelled()`).
-- Unit: `IndexingTask<T>` reap behavior (finished/still-running/panicked) against a stub
-  `spawn_blocking` closure, independent of a real drain/full-reindex/SCIP body — mirrors the
-  existing per-variant tests (`build_daemon_command_appends_to_an_existing_log_instead_of_
-  truncating`-style isolation) but for the unified type.
+- Unit: `IndexingTask<T>` reap behavior (finished/still-running/panicked, plus the
+  cooperative-cancel-at-checkpoint path) against a stub `spawn_blocking` closure, independent
+  of a real full-reindex/SCIP body — mirrors the existing per-variant test isolation but for
+  the unified type. `InFlightDrain`'s existing tests are untouched, since the struct itself
+  doesn't change.
 - Unit: `watch_enabled("watch")` / `watch_enabled("watch_docs")` precedence (env var → config
   → default), mirroring the existing `auto_start_watch_on_boot_enabled_env_override_priority`
   test shape.
