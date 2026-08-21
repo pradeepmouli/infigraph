@@ -231,16 +231,23 @@ durations from R5.4) does not change, and drain-in-flight is still purely waited
 `run_scip_indexers` (Part A of a full reindex, per `cmd_daemon`'s own comment: "Part A
 (running the external indexer binaries) is deliberately unlocked... Part B [Kuzu
 import]... needs `index.lock`") has no Kuzu dependency at all — it's pure OS process
-management, currently done via `run_with_timeout`'s blocking `Command::spawn()` plus a
-busy-poll `try_wait()` loop. Unlike Part B (the Kuzu-touching build-fresh-then-swap, which
-stays `spawn_blocking`-wrapped inside `Task<T>` — see above), Part A genuinely can become
-async: `tokio::process::Command` + `.wait().await` is a real non-blocking wait, integrated with
-the OS's process-exit notification via tokio's reactor, not a poll loop — a strict improvement
-over what's there today, and it lets indexer subprocesses for different languages run
-concurrently as real async tasks instead of each consuming a blocking-thread-pool slot.
-`run_scip_indexers` moves onto `tokio::process::Command`; `run_with_timeout`'s busy-poll
-`try_wait()` pattern is retired in favor of `tokio::time::timeout(...)` wrapping the async
-`.wait()`.
+management. Traced the actual call chain (not `run_with_timeout`, a different, unrelated
+function in `infigraph-mcp/src/tools/index.rs` that an earlier draft of this spec incorrectly
+attributed here): `run_scip_indexers` spawns one real OS thread per detected-language indexer
+via `std::thread::scope`, each thread calling `run_scip_indexer_to` → `run_scip_indexer_cmd` →
+plain `std::process::Command::new(cmd)...command.status()` — a fully blocking wait with **no
+timeout at all**. That's a real, separate gap worth noting: an indexer that hangs today hangs
+that thread (and the full-reindex build's completion) forever.
+
+Unlike Part B (the Kuzu-touching build-fresh-then-swap, which stays `spawn_blocking`-wrapped
+inside `Task<T>` — see above), Part A genuinely can become async: `tokio::process::Command` +
+`.status().await` is a real non-blocking wait, integrated with the OS's process-exit
+notification via tokio's reactor. Two genuine improvements over today, not one: (1) N
+lightweight `tokio::task::spawn` tasks replace N full OS threads (`std::thread::scope`) — real
+resource savings on a project with many languages/indexers running concurrently; (2) wrapping
+each in `tokio::time::timeout(...)` **adds** a timeout that doesn't exist today at all, rather
+than replacing a poll loop that was never there. `run_scip_indexer_cmd` moves onto
+`tokio::process::Command`.
 
 ### Cancellation hierarchy
 
@@ -460,11 +467,12 @@ prevents future auto-starts, not just pausing a currently-live one.
   cooperative-cancel-at-checkpoint path) against a stub closure, independent of a real
   full-reindex/SCIP body — mirrors the existing per-variant test isolation but for the unified
   type. `InFlightDrain`'s existing tests are untouched, since the struct itself doesn't change.
-- Unit: `run_scip_indexers` on `tokio::process::Command` — a real short-lived child process,
-  confirm the non-blocking `.wait()` path and `tokio::time::timeout` cancellation behave
-  equivalently to today's `run_with_timeout` coverage (e.g.
-  `scip_enrich_exit_message_warns_on_nonzero_exit`), and that multiple language indexers
-  genuinely run concurrently rather than serially.
+- Unit: `run_scip_indexer_cmd` on `tokio::process::Command` — a real short-lived child process,
+  confirm the non-blocking `.status().await` path behaves equivalently to today's
+  `std::process::Command::status()` (success/non-zero-exit/spawn-failure all report the same
+  as today), that `tokio::time::timeout` actually bounds a deliberately-hung test process
+  (a genuinely new behavior — nothing today times out an indexer at all), and that multiple
+  language indexers run concurrently as tasks rather than one-OS-thread-per-indexer.
 - Unit: `watch_enabled("watch")` / `watch_enabled("watch_docs")` precedence (env var → config
   → default), mirroring the existing `auto_start_watch_on_boot_enabled_env_override_priority`
   test shape.
