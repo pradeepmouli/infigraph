@@ -875,7 +875,7 @@ pub(crate) fn cmd_doctor(root: &Path, global: bool) -> Result<()> {
 /// report, the confirmation-free-but-auditable persistence, and the R6.3
 /// audit lines -- written only AFTER the registry save succeeds, so the
 /// audit never records an eviction that didn't actually persist.
-pub(crate) fn cmd_gc(dry_run: bool, stale_days: Option<u64>) -> Result<()> {
+pub(crate) fn cmd_gc(root: &Path, dry_run: bool, stale_days: Option<u64>) -> Result<()> {
     let mut registry = infigraph_core::multi::Registry::load()?;
     let plan =
         infigraph_core::gc::plan_registry_gc(&registry, stale_days, std::time::SystemTime::now());
@@ -946,6 +946,17 @@ pub(crate) fn cmd_gc(dry_run: bool, stale_days: Option<u64>) -> Result<()> {
             "watched root no longer exists",
             &format!("pid {} ({})", d.pid, d.cwd.display()),
         );
+    }
+    // Every orphaned daemon killed above was already confirmed watching a
+    // directory that no longer exists, so there's provably no WAL left
+    // behind by *that* kill to find. This still runs, same as `kill`'s own
+    // call: it sweeps every project this process knows about, so it also
+    // catches damage from something else entirely (a `kill -9` run outside
+    // `infigraph kill`, a crashed process) -- the same reasoning `doctor`
+    // itself runs on every invocation rather than only after a change.
+    if !orphaned_daemons.is_empty() {
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        report_post_kill_wal_integrity(root);
     }
 
     println!(
@@ -1018,7 +1029,7 @@ fn format_uptime(secs: u64) -> String {
 }
 
 /// `infigraph kill` (R2.2.4): guarded terminate, audited (R6.3).
-pub(crate) fn cmd_kill(pid: u32, force: bool) -> Result<()> {
+pub(crate) fn cmd_kill(root: &Path, pid: u32, force: bool) -> Result<()> {
     match infigraph_core::ps::kill_infigraph_process(pid, force) {
         Ok(name) => {
             let how = if force { "SIGKILL" } else { "SIGTERM" };
@@ -1033,9 +1044,53 @@ pub(crate) fn cmd_kill(pid: u32, force: bool) -> Result<()> {
                 &format!("pid={pid} name={name}"),
             );
             println!("Sent {how} to {name} (pid {pid}). Audit: ~/.infigraph/logs/audit.log");
+
+            // A graceful SIGTERM needs a moment to actually exit before a WAL
+            // it left mid-write would even show up as "holder is dead" --
+            // give it the same window `ensure_daemon_running`'s own prune
+            // path allows. A forced SIGKILL is already dead by the time
+            // kill() returns, so there's nothing to wait for.
+            if !force {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+            report_post_kill_wal_integrity(root);
             Ok(())
         }
         Err(refusal) => anyhow::bail!("refusing to kill pid {pid}: {refusal}"),
+    }
+}
+
+/// Sweeps every project this process knows about (the registry, plus
+/// `root` if it isn't already registered) for a WAL a just-killed process
+/// left mid-write -- the exact damage `infigraph_core::doctor::
+/// check_one_wal_integrity` exists to catch, run here so a `kill`/`gc`
+/// action surfaces it immediately instead of waiting for the next `doctor`
+/// run (or, worse, the next unrelated command that happens to try opening
+/// that graph -- see github.com/pradeepmouli/infigraph#92). Cheap: this
+/// only stats/reads lock and WAL files, never opens the database.
+pub(crate) fn report_post_kill_wal_integrity(root: &Path) {
+    let registry = infigraph_core::multi::Registry::load().unwrap_or_default();
+    let mut projects: Vec<PathBuf> = registry.repos.values().map(|e| e.path.clone()).collect();
+    if let Ok(canonical_root) = root.canonicalize() {
+        if !projects.iter().any(|p| p == &canonical_root) {
+            projects.push(canonical_root);
+        }
+    }
+
+    let mut header_printed = false;
+    for project in &projects {
+        let result = infigraph_core::doctor::check_one_wal_integrity(project);
+        if result.status == infigraph_core::doctor::CheckStatus::Pass {
+            continue;
+        }
+        if !header_printed {
+            println!("\nPost-kill check found graph damage:");
+            header_printed = true;
+        }
+        println!("  ! {}: {}", result.name, result.message);
+        if let Some(remediation) = &result.remediation {
+            println!("    -> {remediation}");
+        }
     }
 }
 

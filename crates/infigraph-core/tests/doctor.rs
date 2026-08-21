@@ -3,8 +3,9 @@ use std::path::PathBuf;
 
 use infigraph_core::doctor::{
     check_disk, check_locks, check_registry, check_scip_staleness, check_sidecars, check_toolchain,
-    check_watchers, check_worktrees, find_repo_entry, format_report, projects_in_scope, run_doctor,
-    CheckResult, CheckStatus, DoctorContext, DoctorReport, DoctorScope,
+    check_wal_integrity, check_watchers, check_worktrees, find_repo_entry, format_report,
+    projects_in_scope, run_doctor, CheckResult, CheckStatus, DoctorContext, DoctorReport,
+    DoctorScope,
 };
 use infigraph_core::graph::GraphStore;
 use infigraph_core::lockfile::LockInfo;
@@ -1041,4 +1042,63 @@ fn check_scip_staleness_is_silent_when_no_graph_exists() {
     let ctx = ctx_for(DoctorScope::Project(project), Registry::default());
     let results = check_scip_staleness(&ctx);
     assert!(results.is_empty());
+}
+
+/// Regression test: the exact real-world incident this check exists for --
+/// a process holding `graph.lock` gets killed (via `infigraph kill`, `gc`'s
+/// orphaned-daemon sweep, or a bare `kill -9` outside infigraph entirely)
+/// mid-write, leaving an unreplayed WAL behind. `doctor` must surface this
+/// proactively rather than waiting for the next unrelated command to hit
+/// `GraphStore::open`'s own refusal (github.com/pradeepmouli/infigraph#92).
+#[test]
+fn check_wal_integrity_warns_on_a_wal_left_by_a_dead_holder() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let project = dir.path().join("myproj");
+    let infigraph_dir = project.join(".infigraph");
+    std::fs::create_dir_all(&infigraph_dir).unwrap();
+    std::fs::write(infigraph_dir.join("graph.wal"), b"wal").unwrap();
+
+    const DEAD_PID: u32 = 999_999;
+    write_lock_file(
+        &infigraph_dir.join("graph.lock"),
+        &LockInfo {
+            pid: DEAD_PID,
+            role: "graph-write".to_string(),
+            build_hash: "some-build".to_string(),
+            acquired_at: 1000,
+            last_heartbeat: 1000,
+            holder_started_at: 0,
+        },
+    );
+
+    let ctx = ctx_for(DoctorScope::Project(project), Registry::default());
+    let results = check_wal_integrity(&ctx);
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].status, CheckStatus::Warn);
+    assert!(
+        results[0].message.contains(&DEAD_PID.to_string()),
+        "message should name the dead holder: {}",
+        results[0].message
+    );
+    assert!(
+        results[0]
+            .remediation
+            .as_deref()
+            .unwrap_or("")
+            .contains("index --full"),
+        "remediation should say how to recover: {:?}",
+        results[0].remediation
+    );
+}
+
+#[test]
+fn check_wal_integrity_passes_with_no_wal() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let project = dir.path().join("myproj");
+    std::fs::create_dir_all(project.join(".infigraph")).unwrap();
+
+    let ctx = ctx_for(DoctorScope::Project(project), Registry::default());
+    let results = check_wal_integrity(&ctx);
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].status, CheckStatus::Pass);
 }

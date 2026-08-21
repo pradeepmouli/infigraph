@@ -23,6 +23,17 @@ pub struct InstanceInfo {
     pub project_path: String,
     pub transport: String,
     pub host_agent_hint: Option<String>,
+    /// This process's own `build_hash()` at registration time. Lets
+    /// `doctor` flag a live instance that predates the currently installed
+    /// binary -- the same staleness check `check_one_lock` already does for
+    /// `graph.lock`/`watch.lock` holders, extended to MCP server instances.
+    /// `#[serde(default)]` so a registry file written by a pre-this-field
+    /// instance still deserializes (as an empty string, which never equals
+    /// a real build hash and so is reported the same way an actual
+    /// mismatch would be -- accurate, since an unlabeled instance predates
+    /// this check's own build too).
+    #[serde(default)]
+    pub build_hash: String,
 }
 
 fn now_epoch_secs() -> u64 {
@@ -89,6 +100,7 @@ impl InstanceInfo {
             project_path: project_path.to_string(),
             transport: transport.to_string(),
             host_agent_hint: host_agent_hint(),
+            build_hash: crate::build_hash().to_string(),
         }
     }
 }

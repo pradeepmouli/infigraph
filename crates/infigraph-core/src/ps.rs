@@ -312,6 +312,7 @@ mod tests {
             project_path: "/some/project".to_string(),
             transport: "stdio".to_string(),
             host_agent_hint: None,
+            build_hash: "test-build".to_string(),
         };
         std::fs::write(
             dir.join(format!("{DEAD_PID}.json")),

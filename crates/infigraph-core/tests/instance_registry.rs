@@ -68,6 +68,7 @@ fn fake_entry(pid: u32, started_at: u64) -> (std::path::PathBuf, InstanceInfo) {
             project_path: "/fake/project".to_string(),
             transport: "stdio".to_string(),
             host_agent_hint: None,
+            build_hash: "test-build".to_string(),
         },
     )
 }
@@ -156,6 +157,7 @@ fn reap_orphan_never_kills_a_pid_reused_process() {
         project_path: "/fake/project".to_string(),
         transport: "stdio".to_string(),
         host_agent_hint: None,
+        build_hash: "test-build".to_string(),
     };
     let path = dir.path().join(format!("{pid}.json"));
     std::fs::write(&path, serde_json::to_string_pretty(&info).unwrap()).unwrap();

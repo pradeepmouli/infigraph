@@ -405,6 +405,46 @@ pub fn check_locks(ctx: &DoctorContext) -> Vec<CheckResult> {
     results
 }
 
+const WAL_CATEGORY: &str = "graph-integrity";
+
+/// Whether `project_path`'s graph has a WAL left by a holder that's no
+/// longer running -- the exact condition `GraphStore::open`/
+/// `open_read_only` already refuse to touch directly (see
+/// `crate::graph::unclean_shutdown_wal_holder`'s own doc comment and
+/// github.com/pradeepmouli/infigraph#92: replaying a torn WAL has crashed
+/// the whole process before, with no catchable `Result`). Proactively
+/// surfacing it here means a person finds out from `doctor`/`verify`, not
+/// from the next unrelated command that happens to open this graph.
+///
+/// This is exactly the state killing a graph-lock holder can leave behind
+/// mid-write -- see `kill`'s and `gc`'s own post-kill call into this same
+/// check.
+pub fn check_one_wal_integrity(project_path: &Path) -> CheckResult {
+    let db_path = project_path.join(".infigraph").join("graph");
+    let lock_path = crate::graph::db_lock_path(&db_path);
+    let label = format!("{}: graph WAL integrity", project_path.display());
+
+    match crate::graph::unclean_shutdown_wal_holder(&db_path, &lock_path) {
+        Some(pid) => CheckResult::warn(
+            WAL_CATEGORY,
+            label,
+            format!(
+                "unreplayed WAL left by dead process {pid} -- opening this graph directly \
+                 risks crashing (see github.com/pradeepmouli/infigraph#92)"
+            ),
+            "run `infigraph index --full` to rebuild",
+        ),
+        None => CheckResult::pass(WAL_CATEGORY, label, "no unreplayed WAL from a dead holder"),
+    }
+}
+
+pub fn check_wal_integrity(ctx: &DoctorContext) -> Vec<CheckResult> {
+    projects_in_scope(ctx)
+        .iter()
+        .map(|p| check_one_wal_integrity(p))
+        .collect()
+}
+
 const WATCHER_HEARTBEAT_STALE_SECS: u64 = 300;
 
 fn now_epoch_secs() -> u64 {
@@ -530,6 +570,73 @@ fn project_has_live_mcp_instance(project_path: &Path) -> bool {
 pub fn check_watchers(ctx: &DoctorContext) -> Vec<CheckResult> {
     let projects = projects_in_scope(ctx);
     projects.iter().map(|p| check_one_watcher(p)).collect()
+}
+
+const INSTANCES_CATEGORY: &str = "mcp-instances";
+
+fn check_one_instance(info: &instances::InstanceInfo, installed_build_hash: &str) -> CheckResult {
+    let label = format!("{} (PID {}): mcp instance", info.project_path, info.pid);
+
+    if info.build_hash != installed_build_hash {
+        return CheckResult::warn(
+            INSTANCES_CATEGORY,
+            label,
+            format!(
+                "instance (PID {}) is running build {}, installed binary is {}",
+                info.pid,
+                if info.build_hash.is_empty() {
+                    "unknown (registered before build tracking existed)"
+                } else {
+                    info.build_hash.as_str()
+                },
+                installed_build_hash
+            ),
+            "the running MCP server predates the currently installed binary; restart it to pick up the new build",
+        );
+    }
+
+    CheckResult::pass(
+        INSTANCES_CATEGORY,
+        label,
+        format!("live PID {} on the installed build", info.pid),
+    )
+}
+
+/// Flags a live MCP server instance still running an older build than the
+/// one currently installed -- the same staleness check `check_one_lock`
+/// already applies to `graph.lock`/`watch.lock` holders (which covers watch
+/// daemons), extended to cover MCP server instances too. Neither `gc` nor
+/// `check_watchers` can see this: an instance's registry file
+/// (`~/.infigraph/instances/<pid>.json`) records only pid/start-time/
+/// project/transport/build-hash, nothing about liveness relative to a
+/// *different* build being on disk now.
+///
+/// Project-scoped runs report only instances serving that project; a
+/// global run reports every live instance regardless of which project it's
+/// attached to, since the instance registry itself is machine-wide, not
+/// per-project.
+pub fn check_instances(ctx: &DoctorContext) -> Vec<CheckResult> {
+    let entries = instances::list_instances();
+    let classified =
+        instances::classify_instances(&entries, 0, instances::current_process_start_time);
+
+    let scope_project = match &ctx.scope {
+        DoctorScope::Project(p) => Some(p.canonicalize().unwrap_or_else(|_| p.clone())),
+        DoctorScope::Global => None,
+    };
+
+    classified
+        .iter()
+        .filter(|(_, _, status)| *status == instances::InstanceStatus::LivePeer)
+        .filter(|(_, info, _)| match &scope_project {
+            Some(target) => Path::new(&info.project_path)
+                .canonicalize()
+                .map(|p| &p == target)
+                .unwrap_or(false),
+            None => true,
+        })
+        .map(|(_, info, _)| check_one_instance(info, &ctx.installed_build_hash))
+        .collect()
 }
 
 const DISK_CATEGORY: &str = "disk";
@@ -787,7 +894,9 @@ pub fn run_doctor(ctx: DoctorContext) -> DoctorReport {
     let mut checks = Vec::new();
     checks.extend(check_registry(&ctx));
     checks.extend(check_locks(&ctx));
+    checks.extend(check_wal_integrity(&ctx));
     checks.extend(check_watchers(&ctx));
+    checks.extend(check_instances(&ctx));
     checks.extend(check_disk(&ctx));
     checks.extend(check_sidecars(&ctx));
     checks.extend(check_scip_staleness(&ctx));

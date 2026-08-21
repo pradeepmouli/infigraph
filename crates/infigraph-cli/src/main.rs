@@ -962,10 +962,10 @@ fn run(command: Commands, root: &Path) -> Result<()> {
         Commands::Gc {
             dry_run,
             stale_days,
-        } => cmd_gc(dry_run, stale_days),
+        } => cmd_gc(root, dry_run, stale_days),
         Commands::Verify => cmd_verify(root),
         Commands::Ps => cmd_ps(root),
-        Commands::Kill { pid, force } => cmd_kill(pid, force),
+        Commands::Kill { pid, force } => cmd_kill(root, pid, force),
         Commands::Languages => cmd_languages(Some(root)),
         Commands::Symbols { file } => cmd_symbols(root, &file),
         Commands::Skeleton { file } => cmd_skeleton(root, &file),
