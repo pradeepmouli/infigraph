@@ -328,6 +328,134 @@ fn check_locks_warns_on_build_hash_mismatch() {
     );
 }
 
+/// A stale-build `watch.lock` holder must point at the exact command that
+/// clears it, not just prose telling the reader to "restart it" -- doctor's
+/// standing convention is every warning/failure names the tool to run.
+#[test]
+fn check_locks_stale_watch_lock_remediation_names_watch_stop() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let project = dir.path().join("myproj");
+    std::fs::create_dir_all(&project).unwrap();
+    let lock_path = project.join(".infigraph").join("watch.lock");
+    write_lock_file(
+        &lock_path,
+        &LockInfo {
+            pid: std::process::id(),
+            role: "cli-watch".to_string(),
+            build_hash: "old-hash".to_string(),
+            acquired_at: 1000,
+            last_heartbeat: 1000,
+            holder_started_at: 0,
+        },
+    );
+    let ctx = DoctorContext {
+        registry: infigraph_core::multi::Registry::default(),
+        scope: DoctorScope::Project(project.clone()),
+        installed_build_hash: "new-hash".to_string(),
+        disk_free_bytes: None,
+        scan_roots: Vec::new(),
+    };
+
+    let results = check_locks(&ctx);
+    let watch_lock = results
+        .iter()
+        .find(|r| r.name.contains("watch.lock"))
+        .expect("must check watch.lock");
+    let remediation = watch_lock
+        .remediation
+        .as_deref()
+        .expect("a Warn result must carry remediation text");
+    assert!(
+        remediation.contains("infigraph watch-stop"),
+        "remediation should name the exact command to run: {remediation}"
+    );
+}
+
+/// `graph.lock` held by the watch daemon's own connection (role contains
+/// "watch") gets the same exact-command treatment as `watch.lock` itself.
+#[test]
+fn check_locks_stale_graph_lock_held_by_watch_role_names_watch_stop() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let project = dir.path().join("myproj");
+    std::fs::create_dir_all(&project).unwrap();
+    let lock_path = project.join(".infigraph").join("graph.lock");
+    write_lock_file(
+        &lock_path,
+        &LockInfo {
+            pid: std::process::id(),
+            role: "watch-daemon-probe".to_string(),
+            build_hash: "old-hash".to_string(),
+            acquired_at: 1000,
+            last_heartbeat: 1000,
+            holder_started_at: 0,
+        },
+    );
+    let ctx = DoctorContext {
+        registry: infigraph_core::multi::Registry::default(),
+        scope: DoctorScope::Project(project.clone()),
+        installed_build_hash: "new-hash".to_string(),
+        disk_free_bytes: None,
+        scan_roots: Vec::new(),
+    };
+
+    let results = check_locks(&ctx);
+    let graph_lock = results
+        .iter()
+        .find(|r| r.name.contains("graph.lock"))
+        .expect("must check graph.lock");
+    let remediation = graph_lock
+        .remediation
+        .as_deref()
+        .expect("a Warn result must carry remediation text");
+    assert!(
+        remediation.contains("infigraph watch-stop"),
+        "remediation should name the exact command to run: {remediation}"
+    );
+}
+
+/// `graph.lock` held by a non-watch, non-persistent operation (e.g. a plain
+/// write) gets a different exact command -- `infigraph kill`, not
+/// `watch-stop`, since there's no watcher to stop.
+#[test]
+fn check_locks_stale_graph_lock_non_watch_role_names_kill() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let project = dir.path().join("myproj");
+    std::fs::create_dir_all(&project).unwrap();
+    let lock_path = project.join(".infigraph").join("graph.lock");
+    write_lock_file(
+        &lock_path,
+        &LockInfo {
+            pid: std::process::id(),
+            role: "graph-write".to_string(),
+            build_hash: "old-hash".to_string(),
+            acquired_at: 1000,
+            last_heartbeat: 1000,
+            holder_started_at: 0,
+        },
+    );
+    let ctx = DoctorContext {
+        registry: infigraph_core::multi::Registry::default(),
+        scope: DoctorScope::Project(project.clone()),
+        installed_build_hash: "new-hash".to_string(),
+        disk_free_bytes: None,
+        scan_roots: Vec::new(),
+    };
+
+    let results = check_locks(&ctx);
+    let graph_lock = results
+        .iter()
+        .find(|r| r.name.contains("graph.lock"))
+        .expect("must check graph.lock");
+    let remediation = graph_lock
+        .remediation
+        .as_deref()
+        .expect("a Warn result must carry remediation text");
+    assert!(
+        remediation.contains("infigraph kill"),
+        "remediation should name the exact command to run: {remediation}"
+    );
+}
+
 #[test]
 fn check_locks_passes_on_cleanly_released_zero_byte_lock() {
     // `LockFile::Drop` truncates the payload to zero bytes on a clean

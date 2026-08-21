@@ -345,7 +345,10 @@ fn check_one_lock(project_path: &Path, lock_name: &str, installed_build_hash: &s
                 LOCK_CATEGORY,
                 label,
                 "lock file has an unreadable holder payload",
-                "if no infigraph process is running for this project, delete the lock file",
+                format!(
+                    "if no infigraph process is running for this project, delete {}",
+                    lock_path.display()
+                ),
             )
         };
     };
@@ -363,11 +366,35 @@ fn check_one_lock(project_path: &Path, lock_name: &str, installed_build_hash: &s
                     ""
                 }
             ),
-            "safe to delete -- the recorded holder process is gone",
+            format!(
+                "safe to delete -- the recorded holder process is gone: rm {}",
+                lock_path.display()
+            ),
         );
     }
 
     if holder.build_hash != installed_build_hash {
+        let remediation = if lock_name == "watch.lock" {
+            format!(
+                "run `infigraph watch-stop` from {} to stop it -- it restarts automatically \
+                 (now on the installed build) on the next indexing/search call",
+                project_path.display()
+            )
+        } else if holder.role.contains("watch") {
+            format!(
+                "held by the watch daemon (role: {}); run `infigraph watch-stop` from {} to \
+                 restart it on the installed build",
+                holder.role,
+                project_path.display()
+            )
+        } else {
+            format!(
+                "held by a `{}` operation, not a persistent watcher -- it releases on its own \
+                 once that command finishes; if it's actually stuck, run `infigraph kill {}` \
+                 (add --force for SIGKILL)",
+                holder.role, holder.pid
+            )
+        };
         return CheckResult::warn(
             LOCK_CATEGORY,
             label,
@@ -375,7 +402,7 @@ fn check_one_lock(project_path: &Path, lock_name: &str, installed_build_hash: &s
                 "holder (PID {}) is running build {}, installed binary is {}",
                 holder.pid, holder.build_hash, installed_build_hash
             ),
-            "the running process predates the currently installed binary; restart it to pick up the new build",
+            remediation,
         );
     }
 
@@ -477,7 +504,10 @@ fn check_one_watcher(project_path: &Path) -> CheckResult {
                 WATCHER_CATEGORY,
                 label,
                 "watch.lock has an unreadable holder payload",
-                "if no infigraph process is running for this project, delete the lock file",
+                format!(
+                    "if no infigraph process is running for this project, delete {}",
+                    lock_path.display()
+                ),
             )
         };
     };
@@ -487,7 +517,10 @@ fn check_one_watcher(project_path: &Path) -> CheckResult {
             WATCHER_CATEGORY,
             label,
             format!("watch.lock holder PID {} is not running", holder.pid),
-            "stale lock -- safe to delete if you don't expect a watcher here",
+            format!(
+                "stale lock -- safe to delete if you don't expect a watcher here: rm {}",
+                lock_path.display()
+            ),
         );
     }
 
@@ -518,7 +551,12 @@ fn check_one_watcher(project_path: &Path) -> CheckResult {
                 "watcher (PID {}) heartbeat is stale (>{}s)",
                 holder.pid, WATCHER_HEARTBEAT_STALE_SECS
             ),
-            "the watcher process is alive but not making progress -- consider restarting it",
+            format!(
+                "the watcher process is alive but not making progress -- run `infigraph watch-stop` \
+                 from {} to restart it, or `infigraph kill {}` if that doesn't clear it",
+                project_path.display(),
+                holder.pid
+            ),
         );
     }
 
@@ -531,9 +569,12 @@ fn check_one_watcher(project_path: &Path) -> CheckResult {
                  currently serving this project",
                 holder.pid
             ),
-            "likely left running from a closed MCP session -- if you're not also using it \
-             from a standalone CLI session, it's safe to stop; a future MCP session will \
-             restart it and catch up automatically",
+            format!(
+                "likely left running from a closed MCP session -- if you're not also using it \
+                 from a standalone CLI session, run `infigraph watch-stop` from {} to stop it; \
+                 a future MCP session will restart it and catch up automatically",
+                project_path.display()
+            ),
         );
     }
 
@@ -591,7 +632,12 @@ fn check_one_instance(info: &instances::InstanceInfo, installed_build_hash: &str
                 },
                 installed_build_hash
             ),
-            "the running MCP server predates the currently installed binary; restart it to pick up the new build",
+            format!(
+                "run `infigraph kill {}` to stop it -- your MCP client (e.g. `/mcp reconnect \
+                 infigraph` in Claude Code) will start a fresh instance on the installed build \
+                 the next time it's used",
+                info.pid
+            ),
         );
     }
 
