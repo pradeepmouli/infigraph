@@ -73,6 +73,57 @@ impl<T: Send + 'static> Task<T> {
     }
 }
 
+use std::collections::HashSet;
+use std::hash::Hash;
+use std::sync::{Arc, Mutex};
+
+pub struct TaskRegistry<K> {
+    active: Arc<Mutex<HashSet<K>>>,
+}
+
+impl<K> Default for TaskRegistry<K> {
+    fn default() -> Self {
+        TaskRegistry {
+            active: Arc::new(Mutex::new(HashSet::new())),
+        }
+    }
+}
+
+impl<K: Eq + Hash + Clone + Send + 'static> TaskRegistry<K> {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Atomically claim `key`. Returns `None` if it's already claimed --
+    /// the caller should treat that as "busy, decline to spawn a
+    /// duplicate" (mirrors `try_start_full_reindex`'s
+    /// `if drain_in_flight || full_reindex_in_flight { return None; }`,
+    /// generalized).
+    pub fn try_claim(&self, key: K) -> Option<Claim<K>> {
+        let mut active = self.active.lock().unwrap();
+        if active.contains(&key) {
+            None
+        } else {
+            active.insert(key.clone());
+            Some(Claim {
+                key,
+                active: Arc::clone(&self.active),
+            })
+        }
+    }
+}
+
+pub struct Claim<K: Eq + Hash> {
+    key: K,
+    active: Arc<Mutex<HashSet<K>>>,
+}
+
+impl<K: Eq + Hash> Drop for Claim<K> {
+    fn drop(&mut self) {
+        self.active.lock().unwrap().remove(&self.key);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -138,5 +189,61 @@ mod tests {
         }
         assert!(task.is_finished());
         task.join().await.unwrap();
+    }
+
+    #[test]
+    fn try_claim_declines_a_second_claim_on_the_same_key() {
+        let registry: TaskRegistry<&str> = TaskRegistry::new();
+        let first = registry
+            .try_claim("code")
+            .expect("first claim should succeed");
+        let second = registry.try_claim("code");
+        assert!(
+            second.is_none(),
+            "a live claim on the same key must decline a second one"
+        );
+        drop(first);
+    }
+
+    #[test]
+    fn try_claim_allows_a_fresh_claim_after_the_first_drops() {
+        let registry: TaskRegistry<&str> = TaskRegistry::new();
+        let first = registry.try_claim("code").unwrap();
+        drop(first);
+        let second = registry.try_claim("code");
+        assert!(
+            second.is_some(),
+            "dropping the first claim should free the key for a fresh one"
+        );
+    }
+
+    #[test]
+    fn different_keys_do_not_contend() {
+        let registry: TaskRegistry<&str> = TaskRegistry::new();
+        let code = registry.try_claim("code").unwrap();
+        let docs = registry.try_claim("docs");
+        assert!(
+            docs.is_some(),
+            "distinct keys must not contend with each other"
+        );
+        drop(code);
+    }
+
+    #[test]
+    fn claim_releases_even_if_the_holder_panics() {
+        let registry: TaskRegistry<&str> = TaskRegistry::new();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _claim = registry.try_claim("code").unwrap();
+            panic!("simulated panic while holding the claim");
+        }));
+        assert!(result.is_err());
+        // The Claim's Drop impl runs during unwind, so a fresh claim must
+        // now succeed -- this is what prevents an aborted/panicked task
+        // from leaving a permanent phantom "still running" entry.
+        let fresh = registry.try_claim("code");
+        assert!(
+            fresh.is_some(),
+            "a panicking holder must not leak its claim"
+        );
     }
 }
