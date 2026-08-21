@@ -87,6 +87,38 @@ it reaps `InFlightFullReindex`/`InFlightScip` today — just through one generic
 two duplicated ad-hoc structs, and now carrying a `CancellationToken` neither of them had.
 `InFlightDrain` stays completely untouched, for the reasons below.
 
+### Dedup — claiming a role before spawning
+
+Duplicate-spawn prevention exists today, scattered across at least three call sites with no
+shared implementation: `try_start_full_reindex`'s `if drain_in_flight || full_reindex_in_flight
+{ return None; }`, `watcher_running`'s two-tier check (in-process `WATCHERS` map via
+`is_watching()`, OR a trial flock on `.infigraph/watch.lock` for another process/another MCP
+worker), and the `auto_start_watch`/`auto_start_doc_watch` no-duplicates guarantees. These are
+two genuinely different tiers, not one problem wearing two hats, and `Task<T>` should not
+conflate them:
+
+- **In-process dedup** — "is a `Task<T>` for this role already running in this process." A
+  live `Task<T>` (or `Option<Task<T>>` per slot, for the coordinator's single-instance-per-role
+  cases like drain/full-reindex-build/SCIP) already carries this information — no separate
+  boolean needed once `Task<T>` exists. For roles that can have more than one instance per
+  process conceptually (there aren't any today, but the shape should not assume otherwise), a
+  small `TaskRegistry<K>` (`Mutex<HashSet<K>>`, `try_claim(key) -> Option<Claim<K>>` returning
+  `None` if already claimed, `Claim` releasing on `Drop` so an aborted/panicked task never
+  leaves a phantom entry) generalizes this.
+- **Cross-process dedup** — "is another process (another MCP worker, an external `infigraph
+  daemon`) already doing this for this root." This is what the trial flock on `.infigraph/
+  watch.lock` in `watcher_running` already does today, and it isn't something an in-memory
+  registry can answer on its own — it has to stay file-lock-based.
+
+`Task::spawn`/`spawn_blocking`'s dedup-aware variant does both checks in one call — in-process
+registry first (cheap), then the cross-process trial-flock (only for producer roles that have
+one, i.e. code/docs watching; full-reindex-build and SCIP enrichment are purely in-process,
+single-daemon-instance concerns and only need the first tier) — returning a single `Busy`/
+`AlreadyRunning` outcome instead of the caller hand-rolling both checks itself. This replaces
+`watcher_running`'s standalone logic, `try_start_full_reindex`'s inline flags, and gives
+`auto_start_watch`/`auto_start_doc_watch`'s no-duplicates guarantee for free rather than as a
+guarantee each call site has to separately uphold.
+
 A code/docs producer's `fut` is a `tokio::task::spawn`ed async loop built around:
 
 ```rust
@@ -300,6 +332,12 @@ pausing a currently-live one.
 
 - Unit: `Task::spawn`/`stop`/`restart` lifecycle (the producer/`T = ()` path), independent of
   any real filesystem watching (a no-op future that just awaits `token.cancelled()`).
+- Unit: `TaskRegistry::try_claim` — second claim on a live key returns `None`; the claim
+  releases (allowing a fresh one) after the guard drops, including on a panicking task.
+- Regression: dedup-aware spawn covers the existing duplicate-prevention tests'
+  scenarios — `test_second_watch_project_call_declines_when_already_watching` (cross-process,
+  via the trial-flock tier), `test_auto_start_watch_no_duplicates`/
+  `test_auto_start_doc_watch_no_duplicates` (in-process, via the registry tier).
 - Unit: `Task::spawn_blocking` reap behavior (finished/still-running/panicked, plus the
   cooperative-cancel-at-checkpoint path) against a stub closure, independent of a real
   full-reindex/SCIP body — mirrors the existing per-variant test isolation but for the unified
