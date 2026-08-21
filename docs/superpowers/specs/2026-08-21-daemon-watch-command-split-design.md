@@ -254,11 +254,12 @@ docs_token   = daemon_token.child_token()   // Task<()> — doc-watch producer
 // at all (InFlightDrain, unchanged).
 ```
 
-- `daemon stop` cancels `daemon_token` → both producer `Task<()>`s and any live
-  full-reindex-build/SCIP `Task<T>` cancel/are-awaited accordingly → the coordinator (still
-  checking `stop_rx`/the existing `watch.stop` sentinel — unchanged) also exits → process
-  exits. This is today's only "stop everything" path, now reachable by a dedicated command
-  instead of only via `kill <pid>` or the old overloaded `watch-stop`.
+- `daemon stop` submits `WatchControl { role: "daemon", action: Stop }` (see the process-
+  boundary section below), which cancels `daemon_token` → both producer `Task<()>`s and any
+  live full-reindex-build/SCIP `Task<T>` cancel/are-awaited accordingly → the coordinator
+  (still also checking `stop_rx`, for the manual-`kill`-as-fallback case) exits → process
+  exits. This replaces today's overloaded, undecorated `watch.stop` sentinel with a named
+  command instead of an unlabeled file drop.
 - `watch stop` cancels `code_token` only. The coordinator, request-serving, and `docs_token`'s
   task are untouched — the daemon process stays alive, still serving `DaemonKuzu` writes.
 - `watch-docs stop` cancels `docs_token` only, symmetric.
@@ -281,33 +282,64 @@ Ctrl-C to the PID recorded in `watch.lock`, caught by the daemon's existing hand
 (`tool_stop_watch_docs` writes `.infigraph/watch.stop.docs` specifically because there's no
 in-process `DOC_WATCHERS` entry to touch once a daemon is alive).
 
-So the token hierarchy governs propagation *inside* the daemon process once triggered; it does
-not replace the sentinel mechanism, it sits behind it. Producer `Task<()>`s detect their
-sentinel/config changes via a **second, narrow `notify::Watcher` registration scoped to
-`.infigraph/` itself** (non-recursive), feeding a common handler in the same `tokio::select!`
-alongside `token.cancelled()` — event-driven, not a poll timer. This needs its own registration
-because `.infigraph/` is deliberately excluded from the main project-content watch today
-(`register_watch_dirs` walks via `ignore_rules::walk_builder`, which sets `.hidden(true)` —
-watching the daemon's own constant writes to `graph`/`embeddings.bin`/WAL files/locks would be
-a feedback loop). The handler itself doesn't need to filter which file inside `.infigraph/`
-changed — any event there is cheap to treat as "wake up and recheck sentinel/`config.toml`
-state," so unfiltered churn from the daemon's own writes is harmless, just an extra
-near-free `sentinel.exists()`/config re-read per event. This is strictly better than the
-interval-poll alternative: near-instant reaction instead of bounded by a poll cadence, and no
-more complex to implement — one more `tokio::select!` arm, not per-path logic. (The
-ignore-matcher-rebuild ticker elsewhere stays a `tokio::time::interval`, since there's no
-natural event to hang that one on — it's about picking up edits to `.gitignore`/
-`.infigraphignore` themselves, which *are* covered by the main content watch, just not on a
-useful cadence for that purpose.)
+So the token hierarchy governs propagation *inside* the daemon process once triggered; the
+bridge is not a bespoke sentinel-file convention but the **existing `WriteRequest`/
+`route_or_serve_request` protocol**, extended with new watch-control variants. Concretely:
 
-A sentinel's own presence/absence translates into cancelling the producer's own local token —
-a targeted, sub-process-level analog of what a full OS signal does for `daemon stop`. Every
-*external*
-caller (a fresh CLI process's `watch stop`/`watch-docs stop`, and both the existing and new MCP
-tools) funnels through this same file-based bridge when targeting an already-running external
-daemon. Only a *same-process* caller — MCP's own in-process, non-daemon-mode watcher; the
-daemon's own Ctrl-C handler — can skip the bridge and touch a token directly, because it's
-already living in the process that owns it.
+```rust
+enum WriteRequest {
+    // ...Index, RemoveFiles, UpsertFilesBulk, ResolveCalls, FullReindex...
+    WatchControl { role: &'static str, action: WatchAction },  // role: "code" | "docs" | "daemon"
+}
+enum WatchAction { Start, Stop, Enable, Disable, Restart }
+```
+
+`role: "daemon"` (only `Stop`/`Restart` are meaningful for it) is what `daemon stop`/`daemon
+restart` submit, cancelling `daemon_token` itself. This matters because — checked
+`cmd_watch_stop`'s actual body — today's CLI stop command has *never* been OS-signal-based:
+`std::fs::write(&sentinel, b"")` is the entire implementation; a real SIGTERM/Ctrl-C only
+happens if someone manually runs `kill <pid>` against the daemon, which the CLI's own command
+doesn't do. Both are independently checked in the loop today (`stop_rx.try_recv()` for a real
+signal, `sentinel.exists()` for the file), and either currently breaks the one fused loop. So
+the coordinator's own full-exit belongs in this same unified protocol too — `role: "daemon"`
+replaces the *undecorated* `watch.stop` sentinel exactly as `role: "code"`/`"docs"` replace
+`watch.stop`/`watch.stop.docs`'s per-activity uses — rather than leaving it as a separate
+legacy mechanism sitting beside the new one. A manual `kill <pid>`/Ctrl-C remains available as
+an always-present fallback (still caught by the daemon's existing `ctrlc` handler, still
+feeding `stop_rx`), but it's a fallback, not what any command in this design's own surface
+actually sends.
+
+routed through `route_or_serve_request`'s existing `match request { ... }` alongside the other
+variants — not a parallel `sentinel.exists()` check. `route_or_serve_request`'s signature grows
+to also take a handle to the coordinator's producer `Task<()>`s (code/docs), the same way it
+already takes `queue`; the new arm cancels/respawns the named role's task (and, for `Enable`/
+`Disable`, also flips `config.toml`'s persisted flag) the same way the existing arms mutate
+`queue` or drive `try_start_full_reindex`. This **replaces** today's `watch.stop`/
+`watch.stop.docs` sentinel-file convention entirely rather than relocating it — one request
+protocol, one dispatcher, instead of a structured-request path and a bespoke sentinel-file path
+doing adjacent jobs side by side. `tool_stop_watch`/`tool_stop_watch_docs`'s daemon-alive branch
+(today: writes the sentinel file directly) becomes: submit a `WatchControl { role, action: Stop
+}` request the same way a client already submits `Index`/`FullReindex` — through the existing
+client-side submit-and-poll-for-reply helper, no new protocol shape for callers to learn.
+
+Detection is still event-driven, not a per-tick poll: the coordinator's existing
+`requests_dir` handling (`std::fs::read_dir(&requests_dir)` inside `if serve_requests`, every
+~200ms tick today regardless of whether anything changed) gets a **second, narrow
+`notify::Watcher` registration scoped to `.infigraph/requests/`** (non-recursive) feeding the
+same dispatch, rather than remaining a blind poll — a genuine improvement to the existing
+request-serving path, not just to watch-control specifically, since both now go through the
+identical `WriteRequest` shape. (The ignore-matcher-rebuild ticker elsewhere stays a
+`tokio::time::interval` — it's about picking up edits to `.gitignore`/`.infigraphignore` at the
+project root, which *are* already covered by the main content watch, just not on a useful
+cadence for that purpose, so there's no natural event to hang it on instead.)
+
+A `WatchControl { action: Stop }` request's arrival translates into cancelling the named
+producer's own local token — a targeted, sub-process-level analog of what a full OS signal does
+for `daemon stop`. Every *external* caller (a fresh CLI process's `watch stop`/`watch-docs
+stop`, and both the existing and new MCP tools) funnels through this same request-based bridge
+when targeting an already-running external daemon. Only a *same-process* caller — MCP's own
+in-process, non-daemon-mode watcher; the daemon's own Ctrl-C handler — can skip the bridge and
+touch a token directly, because it's already living in the process that owns it.
 
 This also resolves the third case `tool_watch_project_respects_daemon_mode_toggle` surfaces:
 with `INFIGRAPH_BACKEND=daemon`, `tool_watch_project` never touches the in-process `WATCHERS`
@@ -315,7 +347,7 @@ map at all — it delegates entirely to the external daemon via `ensure_daemon_w
 returns. No local `Task<()>` exists to control in that mode. So the new `enable_watch`/
 `disable_watch`/`restart_watch` MCP tools (and their `_docs` counterparts) must, like
 `tool_stop_watch`/`tool_stop_watch_docs` already do, detect daemon-mode and route through the
-sentinel/config-file bridge to the external daemon's `code_token`/`docs_token` rather than
+`WatchControl` request bridge to the external daemon's `code_token`/`docs_token` rather than
 assume a local task exists — there are three cases in total, not two: the CLI daemon's
 producer-only task, MCP's in-process combined task (daemon-mode off), and MCP delegating
 entirely to an external daemon (daemon-mode on) with no local task of its own.
@@ -370,9 +402,10 @@ fn watch_enabled(section: &str) -> bool {  // section: "watch" | "watch_docs"
 `WatchConfig` in `session_context.rs` gains an `enabled: bool` field (default `true`) alongside
 the existing `auto_start_on_boot`; a new `WatchDocsConfig` mirrors it. `disable` writes the flag
 to `config.toml` — the persisted half — and, per the process-boundary bridge above, immediate
-effect on an already-live task requires the same sentinel mechanism `stop` uses (a same-process
-caller can cancel the token directly; an external CLI/MCP caller cannot, so it still needs the
-file-based signal). `enable` clears the flag and, if nothing is currently running for that
+effect on an already-live task requires the same `WatchControl` request mechanism `stop` uses (a
+same-process caller can cancel the token directly; an external CLI/MCP caller cannot, so it
+still needs the request-based bridge). `enable` clears the flag and, if nothing is currently
+running for that
 role, does not itself start a task — consistent with `auto_start_on_boot` being a distinct,
 narrower toggle for *boot-time* startup specifically. Every opportunistic auto-start call site
 (`should_auto_watch`, `start_daemon_watcher_for_startup_dir`, `ensure_daemon_watcher`,
