@@ -216,7 +216,7 @@ where
         .build()?;
     let mut drain_in_flight: Option<InFlightDrain> = None;
     let mut full_reindex_in_flight: Option<PendingFullReindex> = None;
-    let mut scip_in_flight: Option<InFlightScip> = None;
+    let mut scip_in_flight: Option<Task<()>> = None;
 
     let sentinel = root.join(".infigraph").join("watch.stop");
 
@@ -400,10 +400,18 @@ where
                 } else if let (Some(cb), Some(prism)) =
                     (on_full_reindex.clone(), held_prism.clone())
                 {
-                    let handle = drain_rt.spawn_blocking(move || {
-                        cb(prism, languages);
-                    });
-                    scip_in_flight = Some(InFlightScip { handle });
+                    // `Task::spawn_blocking` dispatches via the ambient
+                    // `tokio::task::spawn_blocking`, which needs a runtime
+                    // context on this (plain OS) thread -- `drain_rt.enter()`
+                    // scopes that context to just this call, matching
+                    // `try_start_full_reindex`'s identical need.
+                    let task = {
+                        let _guard = drain_rt.enter();
+                        Task::spawn_blocking(daemon_token, "scip-enrich", move |_token| {
+                            cb(prism, languages);
+                        })
+                    };
+                    scip_in_flight = Some(task);
                 }
             }
         }
@@ -411,13 +419,9 @@ where
         // Reap a finished SCIP-enrichment task. Nobody is waiting on a reply for
         // this one -- it isn't client-requested -- so this only needs to log a
         // panic and free the slot.
-        if scip_in_flight
-            .as_ref()
-            .is_some_and(|s| s.handle.is_finished())
-        {
-            let InFlightScip { handle } =
-                scip_in_flight.take().expect("checked is_some just above");
-            if let Err(join_err) = drain_rt.block_on(handle) {
+        if scip_in_flight.as_ref().is_some_and(|s| s.is_finished()) {
+            let task = scip_in_flight.take().expect("checked is_some just above");
+            if let Err(join_err) = drain_rt.block_on(task.join()) {
                 eprintln!("[watch] scip-enrich task panicked: {join_err}");
             }
         }
@@ -697,7 +701,7 @@ where
         drop(guard);
     }
     if let Some(in_flight) = scip_in_flight.take() {
-        let _ = drain_rt.block_on(in_flight.handle);
+        let _ = drain_rt.block_on(in_flight.join());
     }
 
     Ok(())
@@ -1085,13 +1089,6 @@ struct PendingFullReindex {
     task: Task<FullReindexTaskOutput>,
     request_path: PathBuf,
     reply_path: PathBuf,
-}
-
-/// A background SCIP-enrichment task scheduled after a successful full
-/// reindex. Reaped for logging only -- nothing is waiting on a reply for
-/// this one (it isn't client-requested), so there's no waiter to answer.
-struct InFlightScip {
-    handle: tokio::task::JoinHandle<()>,
 }
 
 /// The expensive, `held`-independent part of a full reindex: build a fresh

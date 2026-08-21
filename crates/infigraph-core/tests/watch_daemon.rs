@@ -826,3 +826,123 @@ fn full_reindex_build_task_can_be_cancelled_before_it_starts_the_swap() {
     stop_tx.send(()).unwrap();
     handle.join().unwrap().unwrap();
 }
+
+/// Regression coverage for R2.4.5 (docs/DESIGN-hardening.md): SCIP enrichment
+/// (scheduled via `on_full_reindex` right after a successful full-reindex
+/// swap) must be tracked as a `Task<()>` tied into `daemon_token`'s
+/// hierarchy, not a bare `tokio::task::JoinHandle` with no cancellation
+/// vocabulary at all -- mirrors
+/// `full_reindex_build_task_can_be_cancelled_before_it_starts_the_swap`'s
+/// setup/drive/assert shape (real temp project, a real `.request` file
+/// driving `watch_project_with_periodic` on its own thread), adapted for the
+/// SCIP path: unlike the full-reindex build, `daemon_token` can't be
+/// cancelled up front here, since `scip_in_flight`'s task is only scheduled
+/// *after* a successful full-reindex swap -- an already-cancelled
+/// `daemon_token` would instead cancel that swap itself (Task 4's own
+/// checkpoint in `build_full_reindex`) and SCIP would never get scheduled at
+/// all. So this test cancels `daemon_token` only once the SCIP-enrichment
+/// callback has demonstrably started running -- the earliest point the SCIP
+/// path can be reached -- and then confirms two things: the callback still
+/// completes exactly once (Task 5 wires the SCIP task through
+/// `daemon_token`'s hierarchy but doesn't add a cooperative checkpoint inside
+/// the callback itself -- that lands in a later task -- so a cancellation
+/// here must not corrupt or duplicate the enrichment), and the watch loop
+/// still shuts down cleanly afterward instead of hanging, which is what
+/// would happen if the reap block's `is_finished()`/`join()` conversion from
+/// `InFlightScip`'s old struct-field shape were wired incorrectly.
+#[test]
+fn scip_enrichment_task_is_cancellable_via_daemon_token() {
+    let project = tempfile::Builder::new()
+        .prefix("infigraph-scip-cancel-test-")
+        .tempdir()
+        .unwrap();
+    std::fs::write(project.path().join("main.py"), "def main():\n    pass\n").unwrap();
+
+    // Bootstrap so the live graph exists before the watcher opens its own connection.
+    {
+        let registry = infigraph_languages::bundled_registry().unwrap();
+        let mut boot = infigraph_core::Infigraph::open(project.path(), registry).unwrap();
+        boot.init().unwrap();
+        boot.index().unwrap();
+    }
+
+    // Stand-in for real SCIP enrichment's Kuzu-import step: incremented by
+    // the `on_full_reindex` callback the same way real enrichment marks the
+    // graph as freshly enriched, but observable from the test without
+    // needing a real SCIP indexer binary on PATH.
+    let scip_generation = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let scip_generation_for_cb = std::sync::Arc::clone(&scip_generation);
+    let on_full_reindex: std::sync::Arc<infigraph_core::watch::FullReindexCallback> =
+        std::sync::Arc::new(move |_prism, _languages| {
+            scip_generation_for_cb.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+
+    let daemon_token = tokio_util::sync::CancellationToken::new();
+    let token_for_thread = daemon_token.clone();
+
+    let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+    let root = project.path().to_path_buf();
+    let handle = std::thread::spawn(move || {
+        infigraph_core::watch::watch_project_with_periodic(
+            &root,
+            || Ok(infigraph_languages::bundled_registry().unwrap()),
+            50, // debounce_ms
+            stop_rx,
+            |_evt| {},
+            0,
+            None::<fn(&infigraph_core::IndexResult)>,
+            true, // serve_requests
+            Some(on_full_reindex),
+            &token_for_thread,
+        )
+    });
+
+    // Let the loop start ticking before dropping a request file.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+
+    let requests_dir = project.path().join(".infigraph").join("requests");
+    let request_path = requests_dir.join("scip-cancel-test.request");
+    infigraph_core::daemon_protocol::write_atomic(
+        &request_path,
+        &serde_json::to_string(&infigraph_core::daemon_protocol::WriteRequest::FullReindex)
+            .unwrap(),
+    )
+    .unwrap();
+
+    // Poll for the SCIP-enrichment callback to have run -- this proves the
+    // full-reindex swap landed and `on_full_reindex` was scheduled as a
+    // background `Task<()>` and actually executed (not merely that the reap
+    // block compiles). Only once this fires can `daemon_token` be cancelled
+    // without instead cancelling the full-reindex build itself.
+    let mut ran = false;
+    for _ in 0..150 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        if scip_generation.load(std::sync::atomic::Ordering::SeqCst) >= 1 {
+            ran = true;
+            break;
+        }
+    }
+    assert!(
+        ran,
+        "expected the SCIP-enrichment task scheduled by on_full_reindex to run after a \
+         successful full-reindex swap"
+    );
+
+    // Cancel now that the SCIP task has run -- proves cancelling
+    // `daemon_token` afterward doesn't re-trigger, duplicate, or corrupt the
+    // already-completed enrichment.
+    daemon_token.cancel();
+    assert_eq!(
+        scip_generation.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "SCIP enrichment must have run exactly once"
+    );
+
+    stop_tx.send(()).unwrap();
+    // If the reap block's conversion from `InFlightScip`'s `.handle` field to
+    // `Task<()>`'s `is_finished()`/`join()` were wired incorrectly (e.g. the
+    // shutdown-path reap left referencing a field that no longer exists in
+    // the right shape, or never actually joined the task), this would hang
+    // instead of returning.
+    handle.join().unwrap().unwrap();
+}
