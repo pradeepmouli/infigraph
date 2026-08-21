@@ -431,7 +431,7 @@ pub(crate) fn cmd_watch_stop(root: &Path) -> Result<()> {
     let sentinel = root.join(".infigraph").join("watch.stop");
     let lock_path = root.join(".infigraph").join("watch.lock");
 
-    if !watcher_is_alive(&lock_path) {
+    if !infigraph_core::watch::daemon::daemon_is_alive(&lock_path) {
         println!("No watcher running.");
         return Ok(());
     }
@@ -444,22 +444,12 @@ pub(crate) fn cmd_watch_stop(root: &Path) -> Result<()> {
 pub(crate) fn cmd_watch_status(root: &Path) -> Result<()> {
     let lock_path = root.join(".infigraph").join("watch.lock");
 
-    if watcher_is_alive(&lock_path) {
+    if infigraph_core::watch::daemon::daemon_is_alive(&lock_path) {
         println!("Watcher is running.");
     } else {
         println!("No watcher running.");
     }
     Ok(())
-}
-
-pub(crate) fn watcher_is_alive(lock_path: &Path) -> bool {
-    if !lock_path.exists() {
-        return false;
-    }
-    infigraph_core::lockfile::try_acquire(lock_path, "watch-liveness-probe")
-        .ok()
-        .flatten()
-        .is_none()
 }
 
 pub(crate) fn acquire_watch_lock(lock_path: &Path) -> Result<infigraph_core::lockfile::LockFile> {
@@ -771,7 +761,7 @@ pub(crate) fn cmd_delete_project(root: &Path) -> Result<()> {
 
     // Stop watcher before removing data
     let lock_path = project_path.join(".infigraph").join("watch.lock");
-    if watcher_is_alive(&lock_path) {
+    if infigraph_core::watch::daemon::daemon_is_alive(&lock_path) {
         let sentinel = project_path.join(".infigraph").join("watch.stop");
         let _ = std::fs::write(&sentinel, b"");
         std::thread::sleep(std::time::Duration::from_millis(500));

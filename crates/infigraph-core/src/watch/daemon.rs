@@ -10,6 +10,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use anyhow::Result;
 
@@ -81,8 +82,33 @@ pub enum DaemonStartOutcome {
 /// probe below and the daemon's own lock acquisition at startup — this
 /// mirrors the original CLI implementation's behavior exactly and is not
 /// newly introduced here; closing it is out of scope for this plan.
+///
+/// Respects the CI/`INFIGRAPH_NO_WATCH` opt-out -- appropriate here, since
+/// every caller of this function wants a daemon purely for the file-watching
+/// *convenience*, which is fine to skip in CI/sandboxed environments. A
+/// caller for whom a daemon is a hard correctness requirement instead (i.e.
+/// `INFIGRAPH_BACKEND=daemon` was explicitly selected, so writes have
+/// nowhere to go without one) must use [`ensure_daemon_running_required`],
+/// which does not honor that opt-out.
 pub fn ensure_daemon_running(root: &Path, watch_binary: &Path) -> DaemonStartOutcome {
-    if is_ci_env() || is_remote_backend() {
+    if is_ci_env() {
+        return DaemonStartOutcome::AlreadyRunning;
+    }
+    ensure_daemon_running_required(root, watch_binary)
+}
+
+/// Like [`ensure_daemon_running`], but does not honor the CI/
+/// `INFIGRAPH_NO_WATCH` convenience opt-out -- for callers where a daemon is
+/// a hard requirement, not a nicety. `INFIGRAPH_BACKEND=daemon` is an
+/// explicit request that every write route through a daemon; suppressing
+/// the one thing that makes that possible because `INFIGRAPH_NO_WATCH`
+/// happened to also be set (e.g. leaked from a shared shell profile) used to
+/// mean every write silently blocked for its own multi-minute timeout
+/// instead of either working or failing fast. Still respects
+/// [`is_remote_backend`]: a daemon is meaningless under the Neo4j backend
+/// regardless of which opt-out is in play.
+pub fn ensure_daemon_running_required(root: &Path, watch_binary: &Path) -> DaemonStartOutcome {
+    if is_remote_backend() {
         return DaemonStartOutcome::AlreadyRunning;
     }
 
@@ -121,6 +147,38 @@ pub fn ensure_daemon_running(root: &Path, watch_binary: &Path) -> DaemonStartOut
             }
         }
         Err(e) => DaemonStartOutcome::Failed(e.to_string()),
+    }
+}
+
+/// Whether a daemon currently holds `lock_path` (i.e. is genuinely running,
+/// not just left a stale payload behind). The single canonical liveness
+/// check for `watch.lock` -- every caller across the CLI, MCP, and core that
+/// needs to know "is a daemon here" should use this rather than duplicating
+/// the try-acquire-and-release probe.
+pub fn daemon_is_alive(lock_path: &Path) -> bool {
+    if !lock_path.exists() {
+        return false;
+    }
+    crate::lockfile::try_acquire(lock_path, "daemon-liveness-probe")
+        .ok()
+        .flatten()
+        .is_none()
+}
+
+/// Poll [`daemon_is_alive`] until it turns true or `budget` elapses. Exists
+/// because daemon startup is asynchronous: `ensure_daemon_running`/
+/// `ensure_daemon_running_required` return at spawn time, and the child
+/// needs a moment to actually acquire `watch.lock`.
+pub fn wait_for_daemon_ready(lock_path: &Path, budget: Duration) -> bool {
+    let start = std::time::Instant::now();
+    loop {
+        if daemon_is_alive(lock_path) {
+            return true;
+        }
+        if start.elapsed() >= budget {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(200));
     }
 }
 
@@ -400,11 +458,56 @@ pub fn resolve_cli_binary_sibling_of(current_exe: &Path) -> Result<std::path::Pa
 
 #[cfg(test)]
 mod tests {
-    use super::prune_stale_holder;
+    use super::{daemon_is_alive, prune_stale_holder};
     use crate::lockfile::LockInfo;
 
     fn write_lock_info(path: &std::path::Path, info: &LockInfo) {
         std::fs::write(path, serde_json::to_string(info).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn daemon_is_alive_when_lock_held() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tg_dir = tmp.path().join(".infigraph");
+        std::fs::create_dir_all(&tg_dir).unwrap();
+        let lock_path = tg_dir.join("watch.lock");
+
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap();
+        use fs2::FileExt;
+        file.lock_exclusive().unwrap();
+
+        assert!(daemon_is_alive(&lock_path));
+
+        file.unlock().unwrap();
+        assert!(!daemon_is_alive(&lock_path));
+    }
+
+    #[test]
+    fn daemon_is_alive_no_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        // No `.infigraph` dir at all — simulates probing a project that was
+        // never indexed. `daemon_is_alive` must be a pure read: it must not
+        // create the lock file (or its parent dir) as a side effect of
+        // merely checking status.
+        let infigraph_dir = tmp.path().join(".infigraph");
+        let lock_path = infigraph_dir.join("watch.lock");
+        assert!(!infigraph_dir.exists());
+
+        assert!(!daemon_is_alive(&lock_path));
+
+        assert!(
+            !infigraph_dir.exists(),
+            "daemon_is_alive must not create .infigraph as a side effect of probing"
+        );
+        assert!(
+            !lock_path.exists(),
+            "daemon_is_alive must not create watch.lock as a side effect of probing"
+        );
     }
 
     /// A holder PID that no longer exists at all: the lock is simply stale

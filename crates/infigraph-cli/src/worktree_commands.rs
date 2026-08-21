@@ -31,7 +31,7 @@ pub(crate) fn cmd_worktree_teardown(path: &Path) -> Result<()> {
     // Stop the watcher, if any, before touching the registry -- mirrors the same
     // sentinel-based stop cmd_delete_project already uses in info_commands.rs.
     let lock_path = path.join(".infigraph").join("watch.lock");
-    if crate::info_commands::watcher_is_alive(&lock_path) {
+    if infigraph_core::watch::daemon::daemon_is_alive(&lock_path) {
         let sentinel = path.join(".infigraph").join("watch.stop");
         let _ = std::fs::write(&sentinel, b"");
         std::thread::sleep(std::time::Duration::from_millis(500));

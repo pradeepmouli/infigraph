@@ -604,21 +604,13 @@ pub(crate) fn ensure_watcher_running(root: &Path) {
     }
 }
 
-/// Polls `watcher_is_alive` until it turns true or `budget` elapses.
-/// Exists because daemon startup is asynchronous: `ensure_watcher_running`
-/// returns at spawn time, and the child needs a moment to acquire
-/// watch.lock (#100 item 3's race).
+/// Polls `daemon_is_alive` until it turns true or `budget` elapses. Exists
+/// because daemon startup is asynchronous: `ensure_watcher_running` returns
+/// at spawn time, and the child needs a moment to acquire watch.lock (#100
+/// item 3's race). Thin wrapper over the core primitive shared with
+/// `Infigraph::ensure_daemon_for_writes`'s own wait.
 pub(crate) fn wait_for_daemon(lock_path: &Path, budget: std::time::Duration) -> bool {
-    let start = std::time::Instant::now();
-    loop {
-        if crate::info_commands::watcher_is_alive(lock_path) {
-            return true;
-        }
-        if start.elapsed() >= budget {
-            return false;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(200));
-    }
+    infigraph_core::watch::daemon::wait_for_daemon_ready(lock_path, budget)
 }
 
 pub(crate) fn on_path(cmd: &str) -> bool {
@@ -1510,52 +1502,6 @@ mod tests {
     }
 
     #[test]
-    fn watcher_is_alive_when_lock_held() {
-        let tmp = TempDir::new().unwrap();
-        let tg_dir = tmp.path().join(".infigraph");
-        fs::create_dir_all(&tg_dir).unwrap();
-        let lock_path = tg_dir.join("watch.lock");
-
-        let file = fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(false)
-            .open(&lock_path)
-            .unwrap();
-        use fs2::FileExt;
-        file.lock_exclusive().unwrap();
-
-        assert!(crate::info_commands::watcher_is_alive(&lock_path));
-
-        file.unlock().unwrap();
-        assert!(!crate::info_commands::watcher_is_alive(&lock_path));
-    }
-
-    #[test]
-    fn watcher_is_alive_no_file() {
-        let tmp = TempDir::new().unwrap();
-        // No `.infigraph` dir at all — simulates probing a project that was
-        // never indexed. `watcher_is_alive` must be a pure read: it must not
-        // create the lock file (or its parent dir) as a side effect of
-        // merely checking status (see task-2-review.md, "create(true)
-        // side-effect claim").
-        let infigraph_dir = tmp.path().join(".infigraph");
-        let lock_path = infigraph_dir.join("watch.lock");
-        assert!(!infigraph_dir.exists());
-
-        assert!(!crate::info_commands::watcher_is_alive(&lock_path));
-
-        assert!(
-            !infigraph_dir.exists(),
-            "watcher_is_alive must not create .infigraph as a side effect of probing"
-        );
-        assert!(
-            !lock_path.exists(),
-            "watcher_is_alive must not create watch.lock as a side effect of probing"
-        );
-    }
-
-    #[test]
     fn watch_stop_creates_sentinel() {
         let tmp = TempDir::new().unwrap();
         let tg_dir = tmp.path().join(".infigraph");
@@ -1672,7 +1618,7 @@ mod tests {
         // Each repo should be checkable independently
         for repo in &repos {
             let lock_path = repo.path().join(".infigraph").join("watch.lock");
-            assert!(!crate::info_commands::watcher_is_alive(&lock_path));
+            assert!(!infigraph_core::watch::daemon::daemon_is_alive(&lock_path));
         }
     }
 
@@ -1707,8 +1653,8 @@ mod tests {
         file_a.lock_exclusive().unwrap();
 
         // Repo B should be unlocked
-        assert!(crate::info_commands::watcher_is_alive(&lock_a));
-        assert!(!crate::info_commands::watcher_is_alive(&lock_b));
+        assert!(infigraph_core::watch::daemon::daemon_is_alive(&lock_a));
+        assert!(!infigraph_core::watch::daemon::daemon_is_alive(&lock_b));
 
         file_a.unlock().unwrap();
     }
@@ -1746,7 +1692,7 @@ mod tests {
         file.lock_exclusive().unwrap();
 
         // Simulate what cmd_delete_project does: check alive → write sentinel
-        assert!(crate::info_commands::watcher_is_alive(&lock_path));
+        assert!(infigraph_core::watch::daemon::daemon_is_alive(&lock_path));
         let sentinel = tg_dir.join("watch.stop");
         fs::write(&sentinel, b"").unwrap();
         assert!(sentinel.exists());

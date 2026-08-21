@@ -944,3 +944,120 @@ fn full_reindex_with_no_daemon_fails_fast_instead_of_polling_for_ten_minutes() {
         "the request must not be submitted at all when there is nothing to serve it"
     );
 }
+
+/// Regression test for the sibling gap `--full`'s fix above didn't cover:
+/// a plain (non-`--full`) `infigraph index` under `INFIGRAPH_BACKEND=daemon`
+/// had no equivalent fail-fast guard at all -- `Infigraph::init()`'s
+/// `ensure_daemon_for_writes` used to fire-and-forget a daemon spawn attempt
+/// and return unconditionally, so if no daemon ever came up (e.g. the very
+/// first index of a fresh project, before `.infigraph` exists -- daemon
+/// auto-start is a benign no-op in that case, by design), the first write
+/// would silently block inside `submit_write_request` for its own ~600s
+/// timeout instead of failing here, within seconds, with an actionable
+/// message.
+///
+/// Deliberately runs the real binary (not `cmd_index`/`Infigraph::init()`
+/// directly): `resolve_cli_binary_sibling_of` and the daemon spawn path
+/// both depend on `current_exe()` resolving to the real `infigraph` binary,
+/// which only holds true inside a spawned child process, not this test
+/// binary itself.
+#[test]
+fn plain_index_on_a_never_indexed_project_fails_fast_under_daemon_backend() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(project.path().join("a.py"), "def a():\n    pass\n").unwrap();
+
+    // No bootstrap index here, deliberately: `.infigraph` must not exist yet
+    // when the daemon-backend `index` invocation below runs, so that
+    // `ensure_daemon_running_required`'s "not yet indexed" no-op is what's
+    // actually exercised (rather than a real spawn failure).
+    assert!(!project.path().join(".infigraph").exists());
+
+    const FAIL_FAST_BUDGET: Duration = Duration::from_secs(30);
+
+    let start = std::time::Instant::now();
+    let mut child = Command::new(cli_binary())
+        .arg("index")
+        .current_dir(project.path())
+        .env("INFIGRAPH_BACKEND", "daemon")
+        .env_remove("INFIGRAPH_WATCH_DAEMON")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        if start.elapsed() > FAIL_FAST_BUDGET {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "plain `index` on a never-indexed project under \
+                 INFIGRAPH_BACKEND=daemon did not fail within {FAIL_FAST_BUDGET:?}"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let output = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "must be a hard failure, not a silent success: {stderr}"
+    );
+    assert!(
+        stderr.contains("no daemon came up"),
+        "the error must say what's actually wrong and how to fix it, got: {stderr}"
+    );
+}
+
+/// Regression test: `INFIGRAPH_NO_WATCH` (a convenience opt-out -- "don't
+/// spawn a background watcher for me") must not also suppress
+/// `ensure_daemon_for_writes`'s auto-start, since `INFIGRAPH_BACKEND=daemon`
+/// is a hard requirement, not a convenience. This combination (both env
+/// vars set, e.g. `INFIGRAPH_NO_WATCH` leaked from a shared shell profile)
+/// is exactly what originally reproduced the hang: before the fix, the
+/// daemon auto-start was silently skipped and the write blocked for its own
+/// multi-minute timeout instead of either working or failing fast.
+#[test]
+fn plain_index_ignores_no_watch_opt_out_for_the_required_backend_daemon() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(project.path().join("a.py"), "def a():\n    pass\n").unwrap();
+
+    // Bootstrap first so `.infigraph` exists -- this test is about the
+    // NO_WATCH-suppresses-a-required-daemon gap specifically, not the
+    // separate never-indexed-yet case covered above.
+    let cli = cli_binary();
+    let status = Command::new(&cli)
+        .arg("index")
+        .current_dir(project.path())
+        .env_remove("INFIGRAPH_BACKEND")
+        .env_remove("INFIGRAPH_WATCH_DAEMON")
+        .status()
+        .unwrap();
+    assert!(status.success(), "bootstrap index failed");
+    std::fs::write(
+        project.path().join("a.py"),
+        "def a():\n    pass\ndef b():\n    pass\n",
+    )
+    .unwrap();
+
+    let output = Command::new(&cli)
+        .arg("index")
+        .current_dir(project.path())
+        .env("INFIGRAPH_BACKEND", "daemon")
+        .env("INFIGRAPH_NO_WATCH", "1")
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "INFIGRAPH_NO_WATCH must not block the daemon a selected backend \
+         actually requires -- got: {stderr}"
+    );
+
+    std::fs::write(project.path().join(".infigraph").join("watch.stop"), b"").unwrap();
+}
