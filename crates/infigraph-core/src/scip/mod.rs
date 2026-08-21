@@ -83,15 +83,22 @@ pub fn import_scip_index(
     // Used to detect when SCIP resolves differently (= a correction to learn from).
     let mut existing_calls: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
     if project_root.is_some() {
-        if let Ok(rows) = conn.query("MATCH (a:Symbol)-[:CALLS]->(b:Symbol) RETURN a.id, b.id") {
-            for row in rows {
-                if row.len() < 2 {
-                    continue;
-                }
-                let src = row[0].to_string().trim_matches('"').to_string();
-                let tgt = row[1].to_string().trim_matches('"').to_string();
-                existing_calls.entry(src).or_default().insert(tgt);
+        // Must propagate a query failure here rather than silently treating
+        // it as "no existing CALLS edges" -- that would make every SCIP
+        // resolution look like a correction to learn, corrupting the
+        // learned-pattern store on every enrichment cycle a query happens
+        // to fail (see the sibling preload below for the more severe half
+        // of this same bug class).
+        let rows = conn
+            .query("MATCH (a:Symbol)-[:CALLS]->(b:Symbol) RETURN a.id, b.id")
+            .context("SCIP import: failed to preload existing CALLS edges")?;
+        for row in rows {
+            if row.len() < 2 {
+                continue;
             }
+            let src = row[0].to_string().trim_matches('"').to_string();
+            let tgt = row[1].to_string().trim_matches('"').to_string();
+            existing_calls.entry(src).or_default().insert(tgt);
         }
     }
 
@@ -100,28 +107,40 @@ pub fn import_scip_index(
     let mut file_name_to_ids: HashMap<(String, String), Vec<String>> = HashMap::new();
     let mut file_symbols: HashMap<String, Vec<(u32, u32, String)>> = HashMap::new();
 
+    // Must propagate a query failure here rather than silently falling back
+    // to an empty map: every real symbol already in the graph would then
+    // look brand-new to Pass 1 below and get re-inserted via COPY, and this
+    // failure mode never self-heals -- the very next enrichment cycle
+    // repeats it from the same graph state. This is what caused sittir's
+    // graph to balloon: a large multi-language repo's `MATCH (s:Symbol)`
+    // scan (tens of thousands of rows) is exactly the kind of query that
+    // can fail under real-world resource pressure (buffer-manager
+    // contention with the daemon's own concurrent watcher writes), and
+    // `if let Ok(rows) = ...` was treating that failure identically to "this
+    // is a brand-new project with no symbols yet".
     let q = "MATCH (s:Symbol) RETURN s.id, s.file, s.name, s.start_line, s.end_line";
-    if let Ok(rows) = conn.query(q) {
-        for row in rows {
-            if row.len() < 5 {
-                continue;
-            }
-            let sid = row[0].to_string().trim_matches('"').to_string();
-            let sfile = row[1].to_string().trim_matches('"').to_string();
-            let sname = row[2].to_string().trim_matches('"').to_string();
-            let sstart: u32 = row[3].to_string().trim_matches('"').parse().unwrap_or(0);
-            let send: u32 = row[4].to_string().trim_matches('"').parse().unwrap_or(0);
-
-            file_name_to_ids
-                .entry((sfile.clone(), sname))
-                .or_default()
-                .push(sid.clone());
-
-            file_symbols
-                .entry(sfile)
-                .or_default()
-                .push((sstart, send, sid));
+    let rows = conn
+        .query(q)
+        .context("SCIP import: failed to preload existing symbols")?;
+    for row in rows {
+        if row.len() < 5 {
+            continue;
         }
+        let sid = row[0].to_string().trim_matches('"').to_string();
+        let sfile = row[1].to_string().trim_matches('"').to_string();
+        let sname = row[2].to_string().trim_matches('"').to_string();
+        let sstart: u32 = row[3].to_string().trim_matches('"').parse().unwrap_or(0);
+        let send: u32 = row[4].to_string().trim_matches('"').parse().unwrap_or(0);
+
+        file_name_to_ids
+            .entry((sfile.clone(), sname))
+            .or_default()
+            .push(sid.clone());
+
+        file_symbols
+            .entry(sfile)
+            .or_default()
+            .push((sstart, send, sid));
     }
 
     // Sort file_symbols by span size (smallest first) for containment lookup
@@ -1179,6 +1198,60 @@ mod tests {
             vec![("mintFn".to_string(), "helper".to_string())],
             "the CALLS edge must attribute to the real enclosing method, not be \
              dropped or misattributed to a suppressed parameter pseudo-symbol"
+        );
+    }
+
+    /// Regression test for the sittir graph-explosion incident: a failed
+    /// CALLS preload used to be silently treated as "no existing CALLS
+    /// edges", corrupting the learned-pattern store's correction detection
+    /// on every enrichment cycle a query happened to fail under real-world
+    /// resource pressure. It must now propagate as an error instead.
+    #[test]
+    fn import_scip_index_fails_loudly_when_the_calls_preload_query_errors() {
+        let env = TestEnv::new();
+        let conn = env.store.connection().unwrap();
+        conn.query("DROP TABLE CALLS").unwrap();
+
+        let bytes = make_scip_index("test.ts", "Dog", "Animal");
+        let index_path = env._dir.path().join("index.scip");
+        std::fs::write(&index_path, bytes).unwrap();
+
+        let result = import_scip_index(&index_path, &env.store, Some(env._dir.path()));
+        assert!(
+            result.is_err(),
+            "a failed CALLS preload must propagate as an error, not silently \
+             proceed with an empty existing_calls map"
+        );
+    }
+
+    /// Regression test for the sittir graph-explosion incident's more severe
+    /// half: a failed preload of existing Symbol rows used to be silently
+    /// treated as "this project has no symbols yet", which made every
+    /// already-indexed symbol look brand-new and re-inserted it via COPY --
+    /// non-self-healing, since the next enrichment cycle repeats the same
+    /// failure against the same graph state. Confirmed against sittir's own
+    /// watch.log: ~27,000 "new" symbols reported on every single background
+    /// enrichment cycle instead of converging toward zero.
+    #[test]
+    fn import_scip_index_fails_loudly_when_the_symbol_preload_query_errors() {
+        let env = TestEnv::new();
+        let conn = env.store.connection().unwrap();
+        // Break the exact columns `MATCH (s:Symbol) RETURN s.id, s.file,
+        // s.name, s.start_line, s.end_line` selects, without touching the
+        // table's usability for the initial write_lock()/connection() calls
+        // that must still succeed before this preload query ever runs.
+        conn.query("ALTER TABLE Symbol DROP start_line").unwrap();
+
+        let bytes = make_scip_index("test.ts", "Dog", "Animal");
+        let index_path = env._dir.path().join("index.scip");
+        std::fs::write(&index_path, bytes).unwrap();
+
+        let result = import_scip_index(&index_path, &env.store, None);
+        assert!(
+            result.is_err(),
+            "a failed Symbol preload must propagate as an error, not silently \
+             proceed with an empty file_name_to_ids map that makes every \
+             existing symbol look new"
         );
     }
 }
