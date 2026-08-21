@@ -311,6 +311,41 @@ pub(crate) fn cmd_test_coverage(root: &Path, file_filter: Option<&str>) -> Resul
     Ok(())
 }
 
+/// R5.4 (#79) daemon shutdown watchdog: the ordinary (nothing in flight)
+/// grace period before considering a hard exit.
+const SHUTDOWN_WATCHDOG_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
+/// Backstop ceiling for how long the watchdog will keep deferring while
+/// `index.lock` is genuinely still held by this process -- long enough for
+/// a real full reindex ("can take minutes"), short enough to still catch a
+/// truly stuck write eventually.
+const SHUTDOWN_WATCHDOG_IN_PROGRESS_CEILING: std::time::Duration =
+    std::time::Duration::from_secs(600);
+
+/// Whether the daemon shutdown watchdog should keep deferring its hard
+/// exit rather than kill the process now. Split out from the `ctrlc`
+/// handler so this budget-vs-in-flight-work decision is directly testable
+/// with synthetic durations, without spawning a real daemon and waiting
+/// out real timers.
+///
+/// True for the first `grace` (the original, unconditional R5.4 budget --
+/// covers the ordinary case where nothing is in flight and the loop is
+/// either already exiting or genuinely wedged for some other reason).
+/// After that, true only while `index_op_in_progress` is still reported,
+/// up to `in_progress_ceiling` -- confirmed real write work in progress is
+/// not evidence of a wedge, and killing through it is exactly what leaves
+/// an unreplayed WAL behind (github.com/pradeepmouli/infigraph#92).
+fn watchdog_should_defer(
+    elapsed_since_signal: std::time::Duration,
+    grace: std::time::Duration,
+    in_progress_ceiling: std::time::Duration,
+    index_op_in_progress: bool,
+) -> bool {
+    if elapsed_since_signal < grace {
+        return true;
+    }
+    index_op_in_progress && elapsed_since_signal < in_progress_ceiling
+}
+
 pub(crate) fn cmd_daemon(root: &Path, debounce: u64) -> Result<()> {
     // Belt-and-braces: spawn_daemon (watch/daemon.rs) already strips
     // INFIGRAPH_BACKEND when it spawns this process normally. This
@@ -340,17 +375,44 @@ pub(crate) fn cmd_daemon(root: &Path, debounce: u64) -> Result<()> {
 
     let (stop_tx, stop_rx) = std::sync::mpsc::channel();
 
+    let watchdog_root = root.to_path_buf();
     ctrlc::set_handler(move || {
         let _ = stop_tx.send(());
         // R5.4 (#79): bound the graceful path. The watch loop's shutdown
         // waits out in-flight drains; if one is wedged (stuck on a lock or
         // a hung query), that wait never ends and the daemon becomes an
         // unkillable-by-SIGTERM orphan -- exactly what graceful shutdown
-        // exists to prevent. 5s is the R5.4 budget; a hard exit still
-        // releases every flock with the process.
-        std::thread::spawn(|| {
-            std::thread::sleep(std::time::Duration::from_secs(5));
-            eprintln!("[daemon] graceful shutdown exceeded the 5s budget -- hard exit");
+        // exists to prevent.
+        //
+        // The original version of this watchdog used a flat 5s timer, which
+        // conflated "wedged" with "still doing a legitimately long write" --
+        // a full reindex can take minutes (see watch_project_with_periodic's
+        // own shutdown comment), and killing straight through one corrupts
+        // the graph exactly like any other unclean shutdown (an unreplayed
+        // WAL left behind for the next opener to trip over -- see
+        // github.com/pradeepmouli/infigraph#92; this is exactly how that
+        // hazard occurs, not just a theoretical risk). `index.lock` held by
+        // this same process is the same signal the watch loop's own
+        // shutdown path already waits on, so use it here too: give the
+        // ordinary (nothing in flight) case its original 5s budget, but
+        // defer the hard exit for as long as real write work is confirmed
+        // still in progress, up to a much longer ceiling that remains as a
+        // backstop against a genuinely stuck write.
+        let watchdog_root = watchdog_root.clone();
+        std::thread::spawn(move || {
+            const POLL: std::time::Duration = std::time::Duration::from_millis(500);
+
+            let start = std::time::Instant::now();
+            while watchdog_should_defer(
+                start.elapsed(),
+                SHUTDOWN_WATCHDOG_GRACE,
+                SHUTDOWN_WATCHDOG_IN_PROGRESS_CEILING,
+                infigraph_core::ops::index_op_held_by_self(&watchdog_root),
+            ) {
+                std::thread::sleep(POLL);
+            }
+
+            eprintln!("[daemon] graceful shutdown exceeded its budget -- hard exit");
             std::process::exit(1);
         });
     })
@@ -1110,5 +1172,72 @@ pub(crate) fn cmd_verify(root: &Path) -> Result<()> {
         CheckStatus::Pass => Ok(()),
         CheckStatus::Warn => anyhow::bail!("verify found warnings"),
         CheckStatus::Fail => std::process::exit(2),
+    }
+}
+
+#[cfg(test)]
+mod shutdown_watchdog_tests {
+    use super::{
+        watchdog_should_defer, SHUTDOWN_WATCHDOG_GRACE, SHUTDOWN_WATCHDOG_IN_PROGRESS_CEILING,
+    };
+    use std::time::Duration;
+
+    /// Within the ordinary grace period, defer regardless of whether any
+    /// write work is in progress -- this is the original, unconditional
+    /// R5.4 budget for the common (nothing in flight) case.
+    #[test]
+    fn defers_unconditionally_within_the_grace_period() {
+        assert!(watchdog_should_defer(
+            Duration::from_secs(1),
+            SHUTDOWN_WATCHDOG_GRACE,
+            SHUTDOWN_WATCHDOG_IN_PROGRESS_CEILING,
+            false,
+        ));
+        assert!(watchdog_should_defer(
+            Duration::from_secs(1),
+            SHUTDOWN_WATCHDOG_GRACE,
+            SHUTDOWN_WATCHDOG_IN_PROGRESS_CEILING,
+            true,
+        ));
+    }
+
+    /// Past the grace period with nothing in flight: this is the original
+    /// wedged-drain case the watchdog exists for -- must NOT keep
+    /// deferring, or a truly stuck daemon becomes unkillable again.
+    #[test]
+    fn does_not_defer_past_grace_with_nothing_in_flight() {
+        assert!(!watchdog_should_defer(
+            SHUTDOWN_WATCHDOG_GRACE + Duration::from_millis(1),
+            SHUTDOWN_WATCHDOG_GRACE,
+            SHUTDOWN_WATCHDOG_IN_PROGRESS_CEILING,
+            false,
+        ));
+    }
+
+    /// The actual bug being fixed: past the grace period, with `index.lock`
+    /// still held by this process (real write work in progress, e.g. a
+    /// multi-minute full reindex), the watchdog must keep deferring rather
+    /// than hard-kill mid-write and leave an unreplayed WAL behind.
+    #[test]
+    fn defers_past_grace_while_an_index_op_is_genuinely_in_progress() {
+        assert!(watchdog_should_defer(
+            SHUTDOWN_WATCHDOG_GRACE + Duration::from_secs(30),
+            SHUTDOWN_WATCHDOG_GRACE,
+            SHUTDOWN_WATCHDOG_IN_PROGRESS_CEILING,
+            true,
+        ));
+    }
+
+    /// Even confirmed in-progress write work doesn't defer forever -- the
+    /// ceiling remains as a backstop against a write that's actually stuck
+    /// (e.g. wedged on a lock while still technically holding index.lock).
+    #[test]
+    fn stops_deferring_once_the_in_progress_ceiling_is_exceeded() {
+        assert!(!watchdog_should_defer(
+            SHUTDOWN_WATCHDOG_IN_PROGRESS_CEILING + Duration::from_secs(1),
+            SHUTDOWN_WATCHDOG_GRACE,
+            SHUTDOWN_WATCHDOG_IN_PROGRESS_CEILING,
+            true,
+        ));
     }
 }

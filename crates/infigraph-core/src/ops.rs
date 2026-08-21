@@ -55,6 +55,19 @@ fn index_lock_path(root: &Path) -> std::path::PathBuf {
     root.join(".infigraph").join("index.lock")
 }
 
+/// Whether `index.lock` is currently held by this same process. Used by
+/// the watch daemon's shutdown watchdog (R5.4/#79) to tell "still doing a
+/// legitimately long write" apart from "wedged" -- both look identical
+/// from the outside (a graceful shutdown that hasn't returned yet), but
+/// only one of them is safe to hard-kill. A full reindex can take
+/// minutes, so a fixed timeout can't make that call on its own; whether
+/// `begin_index_op`'s guard is still held by us is the same signal
+/// `watch_project_with_periodic`'s own shutdown path already waits on
+/// before it will let the process return.
+pub fn index_op_held_by_self(root: &Path) -> bool {
+    lockfile::read_holder(&index_lock_path(root)).is_some_and(|h| h.pid == std::process::id())
+}
+
 pub fn begin_index_op(root: &Path, role: &str, wait: Duration) -> Result<IndexOpOutcome> {
     let path = index_lock_path(root);
     if wait.is_zero() {
@@ -156,4 +169,42 @@ pub fn full_reindex_wipe(tg_dir: &Path) -> Result<()> {
     }
 
     wipe_result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn index_op_held_by_self_is_false_with_no_lock_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(!index_op_held_by_self(tmp.path()));
+    }
+
+    /// The exact signal the daemon shutdown watchdog (R5.4/#79) relies on:
+    /// while `begin_index_op`'s guard is alive, `index_op_held_by_self` must
+    /// report true so the watchdog keeps deferring instead of hard-killing
+    /// a process mid-write.
+    #[test]
+    fn index_op_held_by_self_is_true_while_the_guard_is_held() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".infigraph")).unwrap();
+
+        let outcome = begin_index_op(tmp.path(), "test-op", Duration::ZERO).unwrap();
+        let IndexOpOutcome::Acquired(guard) = outcome else {
+            panic!("expected to acquire an uncontended index.lock");
+        };
+
+        assert!(
+            index_op_held_by_self(tmp.path()),
+            "index_op_held_by_self must be true while this process holds index.lock"
+        );
+
+        drop(guard);
+
+        assert!(
+            !index_op_held_by_self(tmp.path()),
+            "index_op_held_by_self must go false once the guard releases the lock"
+        );
+    }
 }
