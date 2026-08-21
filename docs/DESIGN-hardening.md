@@ -160,6 +160,7 @@ The global `~/.infigraph/mcp.lock` + port `9749` genuinely gate exactly two thin
 ### 2.5 Child process hygiene (P1)
 
 - **R2.5.1** — All spawned children (SCIP indexers, ANTLR/JVM bridge, grammar plugins) run with: a timeout, a kill-on-drop guard (process group kill so grandchildren die too), and captured stderr attached to any resulting error.
+  - **Known gap (tracked, not yet scheduled):** `run_scip_java` (`crates/infigraph-cli/src/index.rs`) is the one SCIP indexer still on the synchronous `run_scip_indexer_cmd` path — no `SCIP_INDEXER_TIMEOUT` bound, and because `run_scip_indexer_to` calls it directly rather than via a blocking-pool dispatch, it blocks `run_scip_indexers`' single-threaded `current_thread` runtime for its whole duration, starving any sibling indexer tasks queued in the same batch (bites when a repo's language set includes Java alongside another SCIP-covered language). Surfaced during R2.4.4/R2.4.6's implementation (task 6 of `docs/superpowers/plans/2026-08-21-daemon-watch-command-split.md`); converting `run_scip_java` to the async+timeout path needs its own task, since its gradle/maven primary+fallback retry logic doesn't map onto `run_scip_indexer_cmd_async`'s contract as directly as the other indexers did.
 - **R2.5.2** — Child invocations validate the *contract*, not just exit code: SCIP import asserts the output file exists, is non-empty, and parses, before replacing prior enrichment data (I-8).
 
 ---
