@@ -336,11 +336,32 @@ enum Commands {
         debounce: u64,
     },
 
-    /// Stop the background auto-watcher
+    /// Stop the background auto-watcher (legacy; writes the `.infigraph/watch.stop`
+    /// sentinel directly rather than going through the daemon protocol -- still honored
+    /// by the daemon's coordinator alongside `daemon stop`, see cmd_watch_stop). Prefer
+    /// `daemon stop`.
     WatchStop,
 
     /// Check if a background watcher is running
     WatchStatus,
+
+    /// Stop the daemon process (write-serving + all watching)
+    DaemonStop,
+
+    /// Restart the daemon process
+    DaemonRestart,
+
+    /// Control code-watching independently of the daemon process
+    Watch {
+        #[command(subcommand)]
+        action: WatchCliAction,
+    },
+
+    /// Control doc-watching independently of the daemon process
+    WatchDocs {
+        #[command(subcommand)]
+        action: WatchCliAction,
+    },
 
     /// Index documents (Markdown, PDF, DOCX, TXT, RST, HTML, etc.) into a document graph
     IndexDocs,
@@ -746,6 +767,20 @@ enum Commands {
     },
 }
 
+#[derive(Subcommand, Debug, Clone)]
+pub(crate) enum WatchCliAction {
+    /// Persist: enable this watch activity (survives restarts/reindex)
+    Enable,
+    /// Persist: disable this watch activity
+    Disable,
+    /// One-shot: start this watch activity now
+    Start,
+    /// One-shot: stop this watch activity now
+    Stop,
+    /// One-shot: stop then start
+    Restart,
+}
+
 #[derive(Subcommand)]
 pub(crate) enum GroupAction {
     /// Create a new repository group
@@ -1028,6 +1063,18 @@ fn run(command: Commands, root: &Path) -> Result<()> {
         Commands::Daemon { debounce } => cmd_daemon(root, debounce),
         Commands::WatchStop => cmd_watch_stop(root),
         Commands::WatchStatus => cmd_watch_status(root),
+        Commands::DaemonStop => cmd_daemon_stop(root),
+        Commands::DaemonRestart => cmd_daemon_restart(root),
+        Commands::Watch { action } => cmd_watch_control(
+            root,
+            infigraph_core::daemon_protocol::WatchRole::Code,
+            action,
+        ),
+        Commands::WatchDocs { action } => cmd_watch_control(
+            root,
+            infigraph_core::daemon_protocol::WatchRole::Docs,
+            action,
+        ),
         Commands::IndexDocs => {
             #[cfg(feature = "remote")]
             let doc_ns = if std::env::var("INFIGRAPH_BACKEND")
@@ -1291,6 +1338,14 @@ mod tests {
         assert!(!should_auto_watch(&Commands::Daemon { debounce: 500 }));
         assert!(!should_auto_watch(&Commands::WatchStop));
         assert!(!should_auto_watch(&Commands::WatchStatus));
+        assert!(!should_auto_watch(&Commands::DaemonStop));
+        assert!(!should_auto_watch(&Commands::DaemonRestart));
+        assert!(!should_auto_watch(&Commands::Watch {
+            action: WatchCliAction::Start,
+        }));
+        assert!(!should_auto_watch(&Commands::WatchDocs {
+            action: WatchCliAction::Start,
+        }));
         assert!(!should_auto_watch(&Commands::Delete));
         assert!(!should_auto_watch(&Commands::Update));
         assert!(!should_auto_watch(&Commands::Init {

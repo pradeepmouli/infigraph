@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use infigraph_core::daemon_protocol::{WatchAction, WatchRole};
 use infigraph_core::Infigraph;
 use infigraph_languages::bundled_registry;
 use serde_json::json;
@@ -591,6 +592,98 @@ pub(crate) fn cmd_watch_status(root: &Path) -> Result<()> {
     } else {
         println!("No watcher running.");
     }
+    Ok(())
+}
+
+/// How long the CLI waits for a running daemon to reply to a `WatchControl`
+/// request before giving up. The request/reply protocol's round trip is
+/// normally sub-second; this is generous headroom for a daemon that's
+/// mid-write on something else when the request lands.
+const WATCH_CONTROL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+pub(crate) fn cmd_daemon_stop(root: &Path) -> Result<()> {
+    let registry = bundled_registry()?;
+    let prism = Infigraph::open(root, registry)?;
+    prism.submit_watch_control_and_await(
+        WatchRole::Daemon,
+        WatchAction::Stop,
+        WATCH_CONTROL_TIMEOUT,
+    )?;
+    println!("Daemon stopped.");
+    Ok(())
+}
+
+pub(crate) fn cmd_daemon_restart(root: &Path) -> Result<()> {
+    let registry = bundled_registry()?;
+    let prism = Infigraph::open(root, registry)?;
+    // `WatchRole::Daemon`'s `Restart` action (per Task 10's
+    // route_or_serve_request arm) only cancels daemon_token -- the process
+    // exiting means there's nothing left to ask to "start itself" from
+    // inside. Re-spawn from the CLI side instead, mirroring
+    // `ensure_daemon_running`'s existing pattern.
+    prism.submit_watch_control_and_await(
+        WatchRole::Daemon,
+        WatchAction::Stop,
+        WATCH_CONTROL_TIMEOUT,
+    )?;
+
+    // Wait for the process to actually exit before respawning (poll
+    // watch.lock's liveness, matching wait_for_daemon_ready's shape in
+    // crates/infigraph-core/src/watch/daemon.rs).
+    let lock_path = root.join(".infigraph").join("watch.lock");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while infigraph_core::watch::daemon::daemon_is_alive(&lock_path) {
+        if std::time::Instant::now() > deadline {
+            anyhow::bail!("daemon did not exit within 10s of a stop request");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    let watch_binary = std::env::current_exe()?;
+    match infigraph_core::watch::daemon::ensure_daemon_running_required(root, &watch_binary) {
+        infigraph_core::watch::daemon::DaemonStartOutcome::Spawned => {
+            println!("Daemon restarted.");
+            Ok(())
+        }
+        infigraph_core::watch::daemon::DaemonStartOutcome::AlreadyRunning => {
+            println!("Daemon already running (unexpected after a confirmed stop).");
+            Ok(())
+        }
+        infigraph_core::watch::daemon::DaemonStartOutcome::Failed(e) => {
+            anyhow::bail!("failed to restart daemon: {e}")
+        }
+    }
+}
+
+// TODO(Task 14): replace with the real infigraph-core version in
+// crates/infigraph-core/src/watch/config.rs.
+fn write_watch_policy_to_config(_root: &Path, _role: WatchRole, _enabled: bool) -> Result<()> {
+    Ok(())
+}
+
+pub(crate) fn watch_cli_action_to_watch_action(action: &crate::WatchCliAction) -> WatchAction {
+    match action {
+        crate::WatchCliAction::Enable => WatchAction::Enable,
+        crate::WatchCliAction::Disable => WatchAction::Disable,
+        crate::WatchCliAction::Start => WatchAction::Start,
+        crate::WatchCliAction::Stop => WatchAction::Stop,
+        crate::WatchCliAction::Restart => WatchAction::Restart,
+    }
+}
+
+pub(crate) fn cmd_watch_control(
+    root: &Path,
+    role: WatchRole,
+    action: crate::WatchCliAction,
+) -> Result<()> {
+    let watch_action = watch_cli_action_to_watch_action(&action);
+    if matches!(watch_action, WatchAction::Enable | WatchAction::Disable) {
+        write_watch_policy_to_config(root, role, watch_action == WatchAction::Enable)?;
+    }
+    let registry = bundled_registry()?;
+    let prism = Infigraph::open(root, registry)?;
+    prism.submit_watch_control_and_await(role, watch_action, WATCH_CONTROL_TIMEOUT)?;
+    println!("{role:?}: {watch_action:?} sent.");
     Ok(())
 }
 
@@ -1319,5 +1412,36 @@ mod shutdown_watchdog_tests {
             SHUTDOWN_WATCHDOG_IN_PROGRESS_CEILING,
             true,
         ));
+    }
+}
+
+#[cfg(test)]
+mod watch_cli_action_tests {
+    use super::watch_cli_action_to_watch_action;
+    use crate::WatchCliAction;
+    use infigraph_core::daemon_protocol::WatchAction;
+
+    #[test]
+    fn maps_each_cli_action_to_its_protocol_counterpart() {
+        assert_eq!(
+            watch_cli_action_to_watch_action(&WatchCliAction::Enable),
+            WatchAction::Enable
+        );
+        assert_eq!(
+            watch_cli_action_to_watch_action(&WatchCliAction::Disable),
+            WatchAction::Disable
+        );
+        assert_eq!(
+            watch_cli_action_to_watch_action(&WatchCliAction::Start),
+            WatchAction::Start
+        );
+        assert_eq!(
+            watch_cli_action_to_watch_action(&WatchCliAction::Stop),
+            WatchAction::Stop
+        );
+        assert_eq!(
+            watch_cli_action_to_watch_action(&WatchCliAction::Restart),
+            WatchAction::Restart
+        );
     }
 }
