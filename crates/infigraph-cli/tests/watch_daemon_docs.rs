@@ -175,6 +175,210 @@ fn cmd_watch_daemon_also_indexes_docs_without_restart() {
     );
 }
 
+/// Spawns `infigraph daemon` as a genuine detached process against `root`
+/// and waits for it to acquire `watch.lock`, mirroring
+/// `cmd_watch_daemon_also_indexes_docs_without_restart`'s harness shape.
+/// Callers get back the `KillOnDrop`-guarded child plus its lock path so
+/// they can drive it with further real CLI subprocess invocations.
+fn spawn_ready_daemon(
+    bin: &std::path::Path,
+    root: &std::path::Path,
+) -> (KillOnDrop, std::path::PathBuf) {
+    let lock_path = root.join(".infigraph").join("watch.lock");
+
+    let mut daemon = KillOnDrop(
+        Command::new(bin)
+            .arg("daemon")
+            .arg("--debounce")
+            .arg("50")
+            .current_dir(root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("failed to spawn infigraph daemon"),
+    );
+
+    let stdout = daemon.stdout.take().unwrap();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            eprintln!("[daemon stdout] {line}");
+        }
+    });
+    let stderr = daemon.stderr.take().unwrap();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            eprintln!("[daemon stderr] {line}");
+        }
+    });
+
+    assert!(
+        infigraph_core::watch::daemon::wait_for_daemon_ready(&lock_path, Duration::from_secs(10)),
+        "daemon never acquired watch.lock after spawn"
+    );
+
+    (daemon, lock_path)
+}
+
+/// Real end-to-end test: the deprecated `Commands::WatchStop` alias
+/// (`infigraph watch-stop`, kebab-cased from its single-variant name --
+/// confirmed via the built binary's `--help` output, distinct from the
+/// nested `infigraph watch stop` subcommand covered below) still writes the
+/// raw `.infigraph/watch.stop` sentinel directly rather than going through
+/// the `WatchControl` protocol. `run_write_coordinator`'s single top-level
+/// loop (crates/infigraph-core/src/watch/mod.rs) treats that sentinel's
+/// mere existence as a full-loop `break` -- the SAME loop that also serves
+/// `.infigraph/requests/` write requests, code-watch, and doc-watch. So,
+/// unlike the newer per-role `WatchControl` protocol, this legacy path has
+/// no way to stop only code-watching: it brings the WHOLE daemon process
+/// down, exactly like `infigraph daemon-stop` does, just via a cruder
+/// mechanism -- which is exactly why its own doc comment says "Prefer
+/// `daemon stop`". `docs/DESIGN-hardening.md`'s R2.4.6 description confirms
+/// this was the known limitation of the pre-split design that this whole
+/// plan exists to work around for the new commands (not this legacy one).
+/// This test proves the deprecated sentinel path is still genuinely wired
+/// up (not dead code) and has the expected process-killing parity with
+/// `daemon-stop`, rather than silently no-op'ing.
+#[test]
+fn legacy_watch_stop_alias_brings_the_whole_daemon_down() {
+    let bin = cli_binary();
+    if !bin.exists() {
+        eprintln!(
+            "skipping: infigraph CLI binary not found at {} (needs a full `cargo build`/`cargo test --workspace` first)",
+            bin.display()
+        );
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(root.join(".infigraph")).unwrap();
+    std::fs::write(root.join("main.rs"), "fn main() {}").unwrap();
+
+    let (mut daemon, lock_path) = spawn_ready_daemon(&bin, &root);
+
+    let watch_stop_status = Command::new(&bin)
+        .arg("watch-stop")
+        .current_dir(&root)
+        .stdin(Stdio::null())
+        .status()
+        .expect("failed to run infigraph watch-stop");
+    assert!(
+        watch_stop_status.success(),
+        "infigraph watch-stop exited non-zero: {watch_stop_status:?}"
+    );
+
+    let mut still_alive = infigraph_core::watch::daemon::daemon_is_alive(&lock_path);
+    for _ in 0..50 {
+        if !still_alive {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        still_alive = infigraph_core::watch::daemon::daemon_is_alive(&lock_path);
+    }
+    assert!(
+        !still_alive,
+        "the legacy infigraph watch-stop alias should still bring the whole daemon process \
+         down (parity with infigraph daemon-stop) -- if this now fails, either the sentinel \
+         is no longer honored by run_write_coordinator, or its scope was deliberately \
+         narrowed and this test's premise needs updating alongside that change"
+    );
+
+    // The process has already exited on its own; reap it so `wait()` inside
+    // `KillOnDrop::drop` doesn't block, and so we don't send a redundant
+    // kill signal to an already-dead pid.
+    let _ = daemon.wait();
+}
+
+/// Real end-to-end test: the NEW nested `infigraph watch stop` subcommand
+/// (`Commands::Watch { action: WatchCliAction::Stop }`, dispatched as
+/// `cmd_watch_control(root, WatchRole::Code, Stop)` -- see main.rs's
+/// `Commands::Watch { action } =>` arm) goes through the `WatchControl`
+/// write-request protocol instead of the legacy sentinel file. This is the
+/// command actually designed to decouple code-watching from the daemon
+/// process (R2.4.4/R2.4.6 in docs/DESIGN-hardening.md) -- unlike the legacy
+/// `watch-stop` alias covered by
+/// `legacy_watch_stop_alias_brings_the_whole_daemon_down` above, this one
+/// must leave the daemon's PID alive. `infigraph daemon-stop` is then used
+/// to confirm the daemon can still be brought down cleanly afterward.
+///
+/// `crates/infigraph-core/tests/watch_control.rs` (a separate task in this
+/// same plan) proves the same underlying guarantee by submitting the
+/// `WatchControl` request directly in-process; this test complements it by
+/// proving the guarantee holds through real clap argument parsing and
+/// `main()` dispatch for the actual `infigraph watch stop` / `infigraph
+/// daemon-stop` CLI invocations, not just the internal handler functions.
+#[test]
+fn watch_action_stop_leaves_the_daemon_process_alive() {
+    let bin = cli_binary();
+    if !bin.exists() {
+        eprintln!(
+            "skipping: infigraph CLI binary not found at {} (needs a full `cargo build`/`cargo test --workspace` first)",
+            bin.display()
+        );
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(root.join(".infigraph")).unwrap();
+    std::fs::write(root.join("main.rs"), "fn main() {}").unwrap();
+
+    let (mut daemon, lock_path) = spawn_ready_daemon(&bin, &root);
+    let daemon_pid = daemon.id();
+
+    let watch_stop_status = Command::new(&bin)
+        .arg("watch")
+        .arg("stop")
+        .current_dir(&root)
+        .stdin(Stdio::null())
+        .status()
+        .expect("failed to run infigraph watch stop");
+    assert!(
+        watch_stop_status.success(),
+        "infigraph watch stop exited non-zero: {watch_stop_status:?}"
+    );
+
+    assert!(
+        infigraph_core::watch::daemon::daemon_is_alive(&lock_path),
+        "infigraph watch stop must not bring the daemon process down -- \
+         it only signals code-watching to stop, not the whole daemon"
+    );
+    assert!(
+        infigraph_mcp::lifecycle::process_alive(daemon_pid),
+        "daemon PID {daemon_pid} should still be alive after infigraph watch stop"
+    );
+
+    let daemon_stop_status = Command::new(&bin)
+        .arg("daemon-stop")
+        .current_dir(&root)
+        .stdin(Stdio::null())
+        .status()
+        .expect("failed to run infigraph daemon-stop");
+    assert!(
+        daemon_stop_status.success(),
+        "infigraph daemon-stop exited non-zero: {daemon_stop_status:?}"
+    );
+
+    let mut still_alive = infigraph_core::watch::daemon::daemon_is_alive(&lock_path);
+    for _ in 0..50 {
+        if !still_alive {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        still_alive = infigraph_core::watch::daemon::daemon_is_alive(&lock_path);
+    }
+    assert!(
+        !still_alive,
+        "infigraph daemon-stop should have brought the daemon process down"
+    );
+
+    // The process has already exited on its own; reap it so `wait()` inside
+    // `KillOnDrop::drop` doesn't block, and so we don't send a redundant
+    // kill signal to an already-dead pid.
+    let _ = daemon.wait();
+}
+
 /// Regression test for `KillOnDrop` itself: a panic while a spawned child is
 /// wrapped in the guard must still kill and reap the child. This is the
 /// scenario that used to leak real `infigraph daemon` processes above --
