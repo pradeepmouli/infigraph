@@ -602,8 +602,9 @@ fn tool_enable_watch_in_process_mode_writes_config_and_does_not_error() {
     let config_path = root.join(".infigraph").join("config.toml");
     let contents = std::fs::read_to_string(&config_path).unwrap_or_default();
     assert!(
-        contents.contains("enabled"),
-        "expected config.toml to record the enabled policy: {contents}"
+        contents.contains("enabled = true"),
+        "expected config.toml to record the policy as enabled (not just mention \
+         \"enabled\", which would also match a persisted `false`): {contents}"
     );
 
     stop_all_watchers();
