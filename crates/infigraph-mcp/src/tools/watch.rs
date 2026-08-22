@@ -132,7 +132,7 @@ fn auto_start_watch_inner(path: &str, skip_disabled_check: bool) -> Option<Strin
     }
 
     if infigraph_core::watch::daemon::watch_daemon_mode_enabled() {
-        return match ensure_daemon_watcher(&root) {
+        return match ensure_daemon_watcher(&root, "watch") {
             Ok(infigraph_core::watch::daemon::DaemonStartOutcome::Spawned) => {
                 eprintln!("[auto-watch] Started daemon watcher for {root_str}");
                 Some(format!("Daemon watcher started for {root_str}"))
@@ -168,14 +168,27 @@ fn auto_start_watch_inner(path: &str, skip_disabled_check: bool) -> Option<Strin
 
 /// Resolve the CLI binary next to this MCP binary and ask the shared daemon
 /// primitive to ensure a detached watcher is running for `root`. Shared by
-/// `tool_watch_project`'s explicit daemon-mode branch and the opportunistic
-/// `auto_start_watch_inner` path so CLI-binary resolution isn't duplicated
-/// between them — each caller still formats its own message/log from the
-/// returned outcome, since a silent auto-start and an explicit tool call
-/// want different things reported.
+/// both code-watch (`tool_watch_project`'s explicit daemon-mode branch,
+/// `auto_start_watch_inner`) and doc-watch (`tool_watch_docs`,
+/// `auto_start_doc_watch_inner`) callers so CLI-binary resolution isn't
+/// duplicated between them — each caller still formats its own message/log
+/// from the returned outcome, since a silent auto-start and an explicit tool
+/// call want different things reported.
+///
+/// `section` ("watch" or "watch_docs") is caller-supplied rather than
+/// inferred, since this one function backs both policies: hardcoding either
+/// section here would make the persisted disable policy for one section
+/// incorrectly suppress daemon spawns for the other (they share this same
+/// underlying daemon-process primitive, but the policy is per-section).
+/// Checked first, before any binary resolution or lock probing, so a
+/// disabled policy is a true no-op rather than doing work it then discards.
 pub(crate) fn ensure_daemon_watcher(
     root: &std::path::Path,
+    section: &str,
 ) -> Result<infigraph_core::watch::daemon::DaemonStartOutcome> {
+    if !infigraph_core::watch::config::watch_enabled(section) {
+        return Ok(infigraph_core::watch::daemon::DaemonStartOutcome::AlreadyRunning);
+    }
     let mcp_exe = std::env::current_exe().context("could not resolve current executable")?;
     let cli_binary = infigraph_core::watch::daemon::resolve_cli_binary_sibling_of(&mcp_exe)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -256,7 +269,7 @@ pub fn tool_watch_project(args: &Value) -> Result<String> {
     }
 
     if infigraph_core::watch::daemon::watch_daemon_mode_enabled() {
-        return match ensure_daemon_watcher(&root)? {
+        return match ensure_daemon_watcher(&root, "watch")? {
             infigraph_core::watch::daemon::DaemonStartOutcome::Spawned => {
                 Ok(format!("Daemon watcher started for {root_str}"))
             }

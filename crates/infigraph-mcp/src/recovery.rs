@@ -84,6 +84,7 @@ pub fn collect_reindex_targets(
 pub fn start_daemon_watcher_for_startup_dir(startup_dir: Option<&Path>) {
     if !infigraph_core::daemon_backend_selected()
         || !crate::session_context::auto_start_watch_on_boot_enabled()
+        || !infigraph_core::watch::config::watch_enabled("watch")
     {
         return;
     }

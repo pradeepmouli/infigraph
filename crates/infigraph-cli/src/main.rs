@@ -945,6 +945,9 @@ pub(crate) enum WorktreeAction {
 /// `cmd_index` itself spawns as a background subprocess, so the parent
 /// `index` invocation has already triggered auto-watch.
 pub(crate) fn should_auto_watch(command: &Commands) -> bool {
+    if !infigraph_core::watch::config::watch_enabled("watch") {
+        return false;
+    }
     matches!(
         command,
         Commands::Index { .. }
@@ -1287,8 +1290,15 @@ fn run(command: Commands, root: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// Serializes tests that mutate the process-global
+    /// `INFIGRAPH_WATCH_ENABLED` env var -- `should_auto_watch` now reads it
+    /// on every call, so even tests that never set it themselves must
+    /// coordinate with the one that does.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn should_auto_watch_allows_only_source_ingesting_commands() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         assert!(should_auto_watch(&Commands::Index {
             full: false,
             no_embed: false,
@@ -1314,6 +1324,7 @@ mod tests {
 
     #[test]
     fn should_auto_watch_excludes_read_only_and_management_commands() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // A representative sample, not exhaustive: read-only queries,
         // process/lifecycle management, and the two commands whose own
         // handlers already trigger watching more precisely than this
@@ -1366,5 +1377,20 @@ mod tests {
                 combined: false,
             },
         }));
+    }
+
+    /// With the persisted watch policy disabled, `should_auto_watch` must
+    /// return false even for a command that would otherwise auto-watch --
+    /// closes Task 12's stubbed `write_watch_policy_to_config` so
+    /// `infigraph watch disable` actually suppresses future auto-starts.
+    #[test]
+    fn should_auto_watch_respects_watch_enabled_policy() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("INFIGRAPH_WATCH_ENABLED", "0");
+        assert!(!should_auto_watch(&Commands::Index {
+            full: false,
+            no_embed: false,
+        }));
+        std::env::remove_var("INFIGRAPH_WATCH_ENABLED");
     }
 }

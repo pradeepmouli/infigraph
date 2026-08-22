@@ -108,6 +108,46 @@ fn start_daemon_watcher_for_startup_dir_respects_boot_toggle() {
     );
 }
 
+/// `start_daemon_watcher_for_startup_dir` must also respect the persisted
+/// `[watch].enabled` policy (`INFIGRAPH_WATCH_ENABLED`), distinct from the
+/// `[watch].auto_start_on_boot` toggle covered above -- closes Task 12's
+/// stubbed `write_watch_policy_to_config` so `infigraph watch disable`
+/// actually suppresses proactive startup watching, not just explicit
+/// `infigraph watch` invocations.
+#[test]
+fn start_daemon_watcher_for_startup_dir_respects_watch_enabled_policy() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let Ok(_cli) = infigraph_core::watch::daemon::resolve_cli_binary_sibling_of(
+        &std::env::current_exe().unwrap(),
+    ) else {
+        eprintln!("skipping: infigraph CLI binary not built in this target dir");
+        return;
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(root.join(".infigraph")).unwrap();
+    let lock_path = root.join(".infigraph").join("watch.lock");
+
+    std::env::set_var("INFIGRAPH_BACKEND", "daemon");
+    std::env::set_var("INFIGRAPH_AUTO_START_WATCH", "1");
+    std::env::set_var("INFIGRAPH_WATCH_ENABLED", "0");
+
+    infigraph_mcp::recovery::start_daemon_watcher_for_startup_dir(Some(&root));
+    let suppressed = !wait_for_watch_lock_state(&lock_path, true, Duration::from_millis(800));
+
+    std::env::remove_var("INFIGRAPH_WATCH_ENABLED");
+    std::env::remove_var("INFIGRAPH_AUTO_START_WATCH");
+    std::env::remove_var("INFIGRAPH_BACKEND");
+
+    assert!(
+        suppressed,
+        "INFIGRAPH_WATCH_ENABLED=0 must suppress proactive startup watching, \
+         but a daemon acquired watch.lock anyway"
+    );
+}
+
 /// Regression coverage for the scope-narrowing fix: a *different* directory
 /// that also has a real `.infigraph` (simulating some other registered
 /// project) must NOT get a daemon started for it just because

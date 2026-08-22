@@ -168,6 +168,95 @@ fn tool_watch_project_respects_daemon_mode_toggle() {
     std::env::remove_var("INFIGRAPH_BACKEND");
 }
 
+/// `tool_watch_project` must also respect the persisted `[watch].enabled`
+/// policy (`INFIGRAPH_WATCH_ENABLED`) -- distinct from the daemon-mode
+/// toggle above -- since `ensure_daemon_watcher` (the shared daemon-spawn
+/// primitive `tool_watch_project`'s daemon branch calls) now checks it.
+/// Closes Task 12's stubbed `write_watch_policy_to_config` for the explicit
+/// tool-call path, not just the opportunistic auto-start ones.
+#[test]
+fn tool_watch_project_respects_watch_enabled_policy() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    std::env::set_var("INFIGRAPH_BACKEND", "daemon");
+    std::env::set_var("INFIGRAPH_WATCH_ENABLED", "0");
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(root.join(".infigraph")).unwrap();
+    let path = root.to_string_lossy().to_string();
+
+    let args = serde_json::json!({ "path": path });
+    let result = infigraph_mcp::tools::watch::tool_watch_project(&args);
+
+    assert!(
+        !infigraph_mcp::tools::watch::is_watching(&path.replace('\\', "/")),
+        "a disabled watch policy must never populate the in-process WATCHERS map"
+    );
+    assert!(
+        result.is_ok(),
+        "a disabled policy is a documented no-op, not an error: {result:?}"
+    );
+
+    let lock_path = root.join(".infigraph").join("watch.lock");
+    let no_daemon_spawned = infigraph_core::lockfile::try_acquire(&lock_path, "test-probe")
+        .map(|g| g.is_some())
+        .unwrap_or(false);
+    assert!(
+        no_daemon_spawned,
+        "INFIGRAPH_WATCH_ENABLED=0 must prevent ensure_daemon_watcher from ever \
+         attempting a real daemon spawn, but watch.lock is held"
+    );
+
+    std::env::remove_var("INFIGRAPH_WATCH_ENABLED");
+    std::env::remove_var("INFIGRAPH_BACKEND");
+}
+
+/// Regression guard for a cross-section bug caught while wiring this policy:
+/// `ensure_daemon_watcher` is shared between the code-watch and doc-watch
+/// daemon-spawn paths, so it takes an explicit `section` rather than
+/// hardcoding "watch" -- a disabled *code*-watch policy must never suppress
+/// *doc*-watch daemon spawning. Requires a real `infigraph` CLI binary to
+/// spawn (skips otherwise, matching this file's other daemon-spawn tests).
+#[test]
+fn doc_watch_daemon_spawn_not_blocked_by_disabled_code_watch_policy() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let Ok(_cli) = infigraph_core::watch::daemon::resolve_cli_binary_sibling_of(
+        &std::env::current_exe().unwrap(),
+    ) else {
+        eprintln!("skipping: infigraph CLI binary not built in this target dir");
+        return;
+    };
+
+    std::env::set_var("INFIGRAPH_BACKEND", "daemon");
+    std::env::set_var("INFIGRAPH_WATCH_ENABLED", "0");
+    std::env::remove_var("INFIGRAPH_WATCH_DOCS_ENABLED");
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(root.join(".infigraph")).unwrap();
+    infigraph_docs::DocIndex::open(&root)
+        .unwrap()
+        .init()
+        .unwrap();
+    let path = root.to_string_lossy().to_string();
+
+    let args = serde_json::json!({ "path": path });
+    let result = infigraph_mcp::tools::docs::tool_watch_docs(&args);
+
+    if let Ok(msg) = &result {
+        assert!(
+            msg.contains("Daemon watcher"),
+            "doc-watch daemon spawn must not be suppressed by an unrelated \
+             disabled code-watch policy, got: {msg}"
+        );
+        let _ = infigraph_mcp::tools::watch::tool_stop_watch(&args);
+        wait_for_watch_locks_released(std::slice::from_ref(&path));
+    }
+
+    std::env::remove_var("INFIGRAPH_WATCH_ENABLED");
+    std::env::remove_var("INFIGRAPH_BACKEND");
+}
+
 #[test]
 fn stop_watch_by_path_reports_no_watcher_when_none_running() {
     let tmp = tempfile::tempdir().unwrap();
@@ -300,6 +389,38 @@ fn auto_start_doc_watch_respects_daemon_mode_toggle() {
     }
 
     std::env::remove_var("INFIGRAPH_BACKEND");
+}
+
+/// `auto_start_doc_watch` must also respect the persisted `[watch_docs].enabled`
+/// policy (`INFIGRAPH_WATCH_DOCS_ENABLED`) -- distinct from the daemon-mode
+/// toggle above, and checked unconditionally (not just under daemon mode) so
+/// it also suppresses the ordinary in-process doc-watch fallback. Closes
+/// Task 12's stubbed `write_watch_policy_to_config` for the doc-watch
+/// opportunistic auto-start path.
+#[test]
+fn auto_start_doc_watch_respects_watch_docs_enabled_policy() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    std::env::set_var("INFIGRAPH_WATCH_DOCS_ENABLED", "0");
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(root.join(".infigraph")).unwrap();
+    infigraph_docs::DocIndex::open(&root)
+        .unwrap()
+        .init()
+        .unwrap();
+    let path = root.to_string_lossy().to_string();
+
+    let result = infigraph_mcp::tools::docs::auto_start_doc_watch(&path);
+
+    assert!(
+        result.is_none(),
+        "a disabled watch_docs policy must suppress auto-start entirely, got: {result:?}"
+    );
+    assert!(!infigraph_mcp::tools::docs::is_doc_watching(
+        &path.replace('\\', "/")
+    ));
+
+    std::env::remove_var("INFIGRAPH_WATCH_DOCS_ENABLED");
 }
 
 /// `tool_watch_docs` (the explicit MCP tool) must also respect the daemon

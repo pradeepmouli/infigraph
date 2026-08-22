@@ -1,4 +1,5 @@
 pub mod batch;
+pub mod config;
 pub mod daemon;
 pub(crate) mod drain;
 pub mod producer;

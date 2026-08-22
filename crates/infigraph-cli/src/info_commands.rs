@@ -669,12 +669,6 @@ pub(crate) fn cmd_daemon_restart(root: &Path) -> Result<()> {
     }
 }
 
-// TODO(Task 14): replace with the real infigraph-core version in
-// crates/infigraph-core/src/watch/config.rs.
-fn write_watch_policy_to_config(_root: &Path, _role: WatchRole, _enabled: bool) -> Result<()> {
-    Ok(())
-}
-
 pub(crate) fn watch_cli_action_to_watch_action(action: &crate::WatchCliAction) -> WatchAction {
     match action {
         crate::WatchCliAction::Enable => WatchAction::Enable,
@@ -695,7 +689,11 @@ pub(crate) fn cmd_watch_control(
         // Persisted regardless of whether a daemon is currently running --
         // the policy is meant to survive restarts, so it must apply the
         // next time one starts even if none is up right now.
-        write_watch_policy_to_config(root, role, watch_action == WatchAction::Enable)?;
+        infigraph_core::watch::config::write_watch_policy(
+            root,
+            role,
+            watch_action == WatchAction::Enable,
+        )?;
     }
 
     // Same liveness check as cmd_daemon_stop/cmd_daemon_restart -- avoids a
@@ -1541,6 +1539,28 @@ mod daemon_liveness_guard_tests {
         assert!(
             result.is_ok(),
             "Enable's durable policy write must still succeed with no daemon running"
+        );
+    }
+
+    /// End-to-end: `cmd_watch_control(Disable)` must actually persist to
+    /// `config.toml`, readable back via `watch_enabled` -- closes Task 12's
+    /// stubbed `write_watch_policy_to_config` (which returned `Ok(())` and
+    /// wrote nothing, so the above test passed against the stub too; this
+    /// one fails against it).
+    #[test]
+    fn cmd_watch_control_disable_is_readable_back_via_watch_enabled() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".infigraph")).unwrap();
+        cmd_watch_control(tmp.path(), WatchRole::Code, WatchCliAction::Disable).unwrap();
+
+        let config_path = tmp.path().join(".infigraph").join("config.toml");
+        let contents = std::fs::read_to_string(&config_path)
+            .expect("cmd_watch_control(Disable) must write config.toml");
+        let doc: toml_edit::DocumentMut = contents.parse().unwrap();
+        assert_eq!(
+            doc["watch"]["enabled"].as_bool(),
+            Some(false),
+            "expected a persisted watch.enabled = false, got: {contents}"
         );
     }
 }

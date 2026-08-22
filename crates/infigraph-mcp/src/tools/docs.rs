@@ -65,6 +65,9 @@ fn auto_start_doc_watch_inner(path: &str, skip_disabled_check: bool) -> Option<S
     if is_remote_mode() {
         return None;
     }
+    if !infigraph_core::watch::config::watch_enabled("watch_docs") {
+        return None;
+    }
     if !skip_disabled_check && super::watch::watchers_disabled() {
         return None;
     }
@@ -80,7 +83,7 @@ fn auto_start_doc_watch_inner(path: &str, skip_disabled_check: bool) -> Option<S
     }
 
     if infigraph_core::watch::daemon::watch_daemon_mode_enabled() {
-        return match super::watch::ensure_daemon_watcher(&root) {
+        return match super::watch::ensure_daemon_watcher(&root, "watch_docs") {
             Ok(infigraph_core::watch::daemon::DaemonStartOutcome::Spawned) => {
                 eprintln!("[auto-watch] Started daemon watcher for {root_str}");
                 Some(format!("Daemon watcher started for {root_str}"))
@@ -584,7 +587,7 @@ pub fn tool_watch_docs(args: &Value) -> Result<String> {
     }
 
     if infigraph_core::watch::daemon::watch_daemon_mode_enabled() {
-        return match super::watch::ensure_daemon_watcher(&root)? {
+        return match super::watch::ensure_daemon_watcher(&root, "watch_docs")? {
             infigraph_core::watch::daemon::DaemonStartOutcome::Spawned => {
                 Ok(format!("Daemon watcher started for {root_str}"))
             }

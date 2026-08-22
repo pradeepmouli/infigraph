@@ -78,3 +78,4 @@ libc = "0.2"
 # "macros" enables #[tokio::test]; kept dev-only since production code never
 # needs it (mirrors infigraph-core's identical dev-dependency).
 tokio = { version = "1", features = ["macros"] }
+toml_edit = "0.22"
