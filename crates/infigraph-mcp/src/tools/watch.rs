@@ -465,7 +465,7 @@ pub fn restart_watch(args: &Value) -> Result<String> {
 /// daemon currently up, and a `daemon_is_alive` liveness probe runs before
 /// submitting so the everyday "no daemon running" case returns promptly
 /// instead of blocking for the full `WATCH_CONTROL_TIMEOUT`.
-fn watch_control(args: &Value, role: WatchRole, action: WatchAction) -> Result<String> {
+pub(crate) fn watch_control(args: &Value, role: WatchRole, action: WatchAction) -> Result<String> {
     let path = args
         .get("path")
         .and_then(|p| p.as_str())
@@ -524,6 +524,21 @@ fn watch_control(args: &Value, role: WatchRole, action: WatchAction) -> Result<S
             let _ = tool_stop_watch(&serde_json::json!({ "path": path }));
             tool_watch_project(&serde_json::json!({ "path": path }))?;
             Ok(format!("Code watching restarted for {root_str}"))
+        }
+        (WatchRole::Docs, WatchAction::Disable) => {
+            super::docs::tool_stop_watch_docs(&serde_json::json!({ "path": path }))?;
+            Ok(format!("Doc watching disabled for {root_str}"))
+        }
+        (WatchRole::Docs, WatchAction::Enable) => {
+            if !super::docs::is_doc_watching(&root_str) {
+                super::docs::tool_watch_docs(&serde_json::json!({ "path": path }))?;
+            }
+            Ok(format!("Doc watching enabled for {root_str}"))
+        }
+        (WatchRole::Docs, WatchAction::Restart) => {
+            let _ = super::docs::tool_stop_watch_docs(&serde_json::json!({ "path": path }));
+            super::docs::tool_watch_docs(&serde_json::json!({ "path": path }))?;
+            Ok(format!("Doc watching restarted for {root_str}"))
         }
         _ => anyhow::bail!(
             "unsupported role/action combination for the in-process case: {role:?}/{action:?}"

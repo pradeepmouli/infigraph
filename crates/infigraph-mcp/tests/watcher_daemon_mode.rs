@@ -61,6 +61,19 @@ fn wait_for_watch_locks_released(paths: &[String]) {
     }
 }
 
+/// Stop every in-process doc watcher. Unlike `stop_all_watchers`, doc
+/// watchers don't hold `.infigraph/watch.lock` (only code watchers do), so
+/// there's no lock-release wait needed -- sending the stop signal and
+/// draining the map is enough.
+fn stop_all_doc_watchers() {
+    let mut guard = infigraph_mcp::tools::docs::get_doc_watchers();
+    if let Some(map) = guard.as_mut() {
+        for (_, entry) in map.drain() {
+            let _ = entry.stop_tx.send(());
+        }
+    }
+}
+
 /// With the toggle OFF (default), auto_start_watch must behave exactly as
 /// before: an in-process thread, tracked in the WATCHERS map, with no
 /// external process spawned. This is the regression guard for "toggle
@@ -608,6 +621,67 @@ fn tool_enable_watch_in_process_mode_writes_config_and_does_not_error() {
     );
 
     stop_all_watchers();
+}
+
+/// `disable_watch_docs` mirrors `disable_watch`: in daemon mode it must
+/// never touch the in-process DOC_WATCHERS map, and must route through the
+/// WatchControl request bridge (or report cleanly if no daemon is running).
+#[test]
+fn tool_disable_watch_docs_respects_daemon_mode_toggle() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    std::env::set_var("INFIGRAPH_BACKEND", "daemon");
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(root.join(".infigraph")).unwrap();
+    let path = root.to_string_lossy().to_string();
+
+    let args = serde_json::json!({ "path": path });
+    let result = infigraph_mcp::tools::docs::disable_watch_docs(&args);
+
+    assert!(
+        !infigraph_mcp::tools::docs::is_doc_watching(&path.replace('\\', "/")),
+        "daemon mode must never populate the in-process DOC_WATCHERS map"
+    );
+    assert!(
+        result.is_ok(),
+        "disable_watch_docs should not error: {result:?}"
+    );
+
+    std::env::remove_var("INFIGRAPH_BACKEND");
+}
+
+/// `enable_watch_docs` in non-daemon mode must persist the enabled policy to
+/// `.infigraph/config.toml` and succeed even with no watcher currently
+/// running (mirrors `tool_enable_watch_in_process_mode_writes_config_and_does_not_error`).
+#[test]
+fn tool_enable_watch_docs_in_process_mode_writes_config_and_does_not_error() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    std::env::remove_var("INFIGRAPH_BACKEND");
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(root.join(".infigraph")).unwrap();
+    infigraph_docs::DocIndex::open(&root)
+        .unwrap()
+        .init()
+        .unwrap();
+    let path = root.to_string_lossy().to_string();
+
+    let args = serde_json::json!({ "path": path });
+    let result = infigraph_mcp::tools::docs::enable_watch_docs(&args);
+    assert!(
+        result.is_ok(),
+        "enable_watch_docs should succeed even with no watcher currently running: {result:?}"
+    );
+
+    let config_path = root.join(".infigraph").join("config.toml");
+    let contents = std::fs::read_to_string(&config_path).unwrap_or_default();
+    assert!(
+        contents.contains("enabled = true"),
+        "expected config.toml to record the policy as enabled (not just mention \
+         \"enabled\", which would also match a persisted `false`): {contents}"
+    );
+
+    stop_all_doc_watchers();
 }
 
 #[test]

@@ -5,6 +5,8 @@ use std::sync::{mpsc, Mutex};
 use anyhow::{Context, Result};
 use serde_json::Value;
 
+use infigraph_core::daemon_protocol::{WatchAction, WatchRole};
+
 use super::helpers::{find_infigraph_cli, open_prism, open_prism_read_only};
 
 // ---------------------------------------------------------------------------
@@ -685,6 +687,18 @@ pub fn tool_stop_watch_docs(args: &Value) -> Result<String> {
     }
 
     anyhow::bail!("missing 'watcher_id' or 'path'")
+}
+
+pub fn enable_watch_docs(args: &Value) -> Result<String> {
+    crate::tools::watch::watch_control(args, WatchRole::Docs, WatchAction::Enable)
+}
+
+pub fn disable_watch_docs(args: &Value) -> Result<String> {
+    crate::tools::watch::watch_control(args, WatchRole::Docs, WatchAction::Disable)
+}
+
+pub fn restart_watch_docs(args: &Value) -> Result<String> {
+    crate::tools::watch::watch_control(args, WatchRole::Docs, WatchAction::Restart)
 }
 
 pub fn tool_index_manifests(args: &Value) -> Result<String> {
