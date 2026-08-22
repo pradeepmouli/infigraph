@@ -578,6 +578,17 @@ pub fn tool_watch_docs(args: &Value) -> Result<String> {
     let root = PathBuf::from(path).canonicalize().context("invalid path")?;
     let root_str = root.to_string_lossy().replace('\\', "/");
 
+    // Explicit calls must respect the same coordination auto-start already
+    // does — without this, a direct watch_docs call bypasses the persisted
+    // enable/disable policy (auto_start_doc_watch_inner already checks it,
+    // but that only covers the opportunistic path, not this explicit one).
+    if !infigraph_core::watch::config::watch_enabled("watch_docs") {
+        return Ok(format!(
+            "Not starting a doc watcher for {root_str}: doc-watching is disabled \
+             (infigraph watch-docs enable to turn it back on)."
+        ));
+    }
+
     if super::watch::watchers_disabled() {
         return Ok(format!(
             "Not starting a doc watcher for {root_str}: this MCP instance is not primary \

@@ -256,10 +256,18 @@ pub fn tool_watch_project(args: &Value) -> Result<String> {
     let root_str = root.to_string_lossy().replace('\\', "/");
 
     // Explicit calls must respect the same coordination auto-start already
-    // does — without these two checks, a direct watch_project call bypasses
-    // both the daemon-mode toggle and primary/secondary gating, letting a
-    // competing in-process watcher race a properly daemon-spawned one for
-    // the same repo's index.lock.
+    // does — without these checks, a direct watch_project call bypasses the
+    // persisted enable/disable policy, the daemon-mode toggle, and
+    // primary/secondary gating, letting a competing in-process watcher race
+    // a properly daemon-spawned one for the same repo's index.lock (or start
+    // one the user explicitly asked infigraph to keep off).
+    if !infigraph_core::watch::config::watch_enabled("watch") {
+        return Ok(format!(
+            "Not starting a watcher for {root_str}: code-watching is disabled \
+             (infigraph watch enable to turn it back on)."
+        ));
+    }
+
     if watchers_disabled() {
         return Ok(format!(
             "Not starting a watcher for {root_str}: this MCP instance is not primary \

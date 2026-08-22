@@ -210,6 +210,68 @@ fn tool_watch_project_respects_watch_enabled_policy() {
     std::env::remove_var("INFIGRAPH_BACKEND");
 }
 
+/// `tool_watch_project_respects_watch_enabled_policy` above only exercises
+/// the daemon-mode branch (via `ensure_daemon_watcher`'s own guard). The
+/// non-daemon, in-process-watcher branch had no guard of its own until a
+/// task-14-review carry-forward finding closed it -- this pins that fix.
+#[test]
+fn tool_watch_project_non_daemon_branch_respects_watch_enabled_policy() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    std::env::remove_var("INFIGRAPH_BACKEND");
+    std::env::set_var("INFIGRAPH_WATCH_ENABLED", "0");
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(root.join(".infigraph")).unwrap();
+    let path = root.to_string_lossy().to_string();
+
+    let args = serde_json::json!({ "path": path });
+    let result = infigraph_mcp::tools::watch::tool_watch_project(&args);
+
+    assert!(
+        result.is_ok(),
+        "a disabled policy is a documented no-op, not an error: {result:?}"
+    );
+    assert!(
+        !infigraph_mcp::tools::watch::is_watching(&path.replace('\\', "/")),
+        "a disabled watch policy must never populate the in-process WATCHERS map \
+         on the non-daemon branch either"
+    );
+
+    std::env::remove_var("INFIGRAPH_WATCH_ENABLED");
+}
+
+/// Mirrors `tool_watch_project_non_daemon_branch_respects_watch_enabled_policy`
+/// for the doc-watch explicit tool call.
+#[test]
+fn tool_watch_docs_non_daemon_branch_respects_watch_docs_enabled_policy() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    std::env::remove_var("INFIGRAPH_BACKEND");
+    std::env::set_var("INFIGRAPH_WATCH_DOCS_ENABLED", "0");
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(root.join(".infigraph")).unwrap();
+    infigraph_docs::DocIndex::open(&root)
+        .unwrap()
+        .init()
+        .unwrap();
+    let path = root.to_string_lossy().to_string();
+
+    let args = serde_json::json!({ "path": path });
+    let result = infigraph_mcp::tools::docs::tool_watch_docs(&args);
+
+    assert!(
+        result.is_ok(),
+        "a disabled policy is a documented no-op, not an error: {result:?}"
+    );
+    assert!(
+        !infigraph_mcp::tools::docs::is_doc_watching(&path.replace('\\', "/")),
+        "a disabled watch_docs policy must never populate the in-process doc \
+         watchers map on the non-daemon explicit-tool-call branch either"
+    );
+
+    std::env::remove_var("INFIGRAPH_WATCH_DOCS_ENABLED");
+}
+
 /// Regression guard for a cross-section bug caught while wiring this policy:
 /// `ensure_daemon_watcher` is shared between the code-watch and doc-watch
 /// daemon-spawn paths, so it takes an explicit `section` rather than
