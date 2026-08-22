@@ -551,6 +551,64 @@ fn stop_watch_docs_by_path_writes_sentinel_when_daemon_alive() {
     );
 }
 
+/// `disable_watch` must respect the daemon-mode toggle the same way
+/// `tool_stop_watch`'s intent does -- but route through the real
+/// `WatchControl` request bridge (Task 11's `submit_watch_control_and_await`)
+/// rather than ever touching the in-process WATCHERS map.
+#[test]
+fn tool_disable_watch_respects_daemon_mode_toggle() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    std::env::set_var("INFIGRAPH_BACKEND", "daemon");
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(root.join(".infigraph")).unwrap();
+    let path = root.to_string_lossy().to_string();
+
+    let args = serde_json::json!({ "path": path });
+    let result = infigraph_mcp::tools::watch::disable_watch(&args);
+
+    // Must never touch the in-process WATCHERS map -- must route through
+    // the WatchControl request bridge to whatever external daemon is
+    // running (or report cleanly if none is), exactly like
+    // tool_stop_watch already does.
+    assert!(
+        !infigraph_mcp::tools::watch::is_watching(&path.replace('\\', "/")),
+        "daemon mode must never populate the in-process WATCHERS map"
+    );
+    assert!(result.is_ok(), "disable_watch should not error: {result:?}");
+
+    std::env::remove_var("INFIGRAPH_BACKEND");
+}
+
+/// `enable_watch` in non-daemon mode must persist the enabled policy to
+/// `.infigraph/config.toml` and succeed even with no watcher currently
+/// running (mirrors `tool_watch_project`'s existing no-op-friendly shape).
+#[test]
+fn tool_enable_watch_in_process_mode_writes_config_and_does_not_error() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    std::env::remove_var("INFIGRAPH_BACKEND");
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(root.join(".infigraph")).unwrap();
+    let path = root.to_string_lossy().to_string();
+
+    let args = serde_json::json!({ "path": path });
+    let result = infigraph_mcp::tools::watch::enable_watch(&args);
+    assert!(
+        result.is_ok(),
+        "enable_watch should succeed even with no watcher currently running: {result:?}"
+    );
+
+    let config_path = root.join(".infigraph").join("config.toml");
+    let contents = std::fs::read_to_string(&config_path).unwrap_or_default();
+    assert!(
+        contents.contains("enabled"),
+        "expected config.toml to record the enabled policy: {contents}"
+    );
+
+    stop_all_watchers();
+}
+
 #[test]
 fn stop_watch_docs_by_path_reports_no_watcher_when_lock_free() {
     let tmp = tempfile::tempdir().unwrap();

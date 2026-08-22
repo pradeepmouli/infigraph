@@ -5,7 +5,9 @@ use std::sync::{mpsc, Arc, Mutex};
 use anyhow::{Context, Result};
 use serde_json::Value;
 
+use infigraph_core::daemon_protocol::{WatchAction, WatchRole};
 use infigraph_core::watch::WatchEventKind;
+use infigraph_core::Infigraph;
 use infigraph_languages::bundled_registry;
 
 static WATCHERS_DISABLED: AtomicBool = AtomicBool::new(false);
@@ -431,6 +433,102 @@ pub fn tool_stop_watch(args: &Value) -> Result<String> {
     }
 
     anyhow::bail!("missing 'watcher_id' or 'path'")
+}
+
+/// How long to wait for a running daemon to reply to a `WatchControl`
+/// request before giving up. Mirrors `infigraph-cli::info_commands::
+/// WATCH_CONTROL_TIMEOUT` (30s) -- that constant is private to the CLI
+/// crate, so this is a deliberate duplicate of the value, not the item.
+const WATCH_CONTROL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+pub fn enable_watch(args: &Value) -> Result<String> {
+    watch_control(args, WatchRole::Code, WatchAction::Enable)
+}
+
+pub fn disable_watch(args: &Value) -> Result<String> {
+    watch_control(args, WatchRole::Code, WatchAction::Disable)
+}
+
+pub fn restart_watch(args: &Value) -> Result<String> {
+    watch_control(args, WatchRole::Code, WatchAction::Restart)
+}
+
+/// Shared, role-parameterized implementation behind enable_watch/
+/// disable_watch/restart_watch and their _docs counterparts (Task 16).
+/// Mirrors `tool_watch_project`'s three cases: not-primary decline,
+/// daemon-mode delegation (through the real `WatchControl` request bridge,
+/// not the `tool_stop_watch` sentinel -- that sentinel brings down the
+/// whole daemon process, not just this role's watch activity), and
+/// in-process (WATCHERS map / local producer state). Also mirrors the CLI's
+/// `cmd_watch_control` (`crates/infigraph-cli/src/info_commands.rs`): policy
+/// writes happen unconditionally so they survive a restart even with no
+/// daemon currently up, and a `daemon_is_alive` liveness probe runs before
+/// submitting so the everyday "no daemon running" case returns promptly
+/// instead of blocking for the full `WATCH_CONTROL_TIMEOUT`.
+fn watch_control(args: &Value, role: WatchRole, action: WatchAction) -> Result<String> {
+    let path = args
+        .get("path")
+        .and_then(|p| p.as_str())
+        .context("missing 'path'")?;
+    let root = std::path::PathBuf::from(path)
+        .canonicalize()
+        .context("invalid path")?;
+    let root_str = root.to_string_lossy().replace('\\', "/");
+
+    if watchers_disabled() {
+        return Ok(format!(
+            "Not controlling watch for {root_str}: this MCP instance is not primary \
+             (another instance holds mcp.lock and owns watchers for this machine)."
+        ));
+    }
+
+    if matches!(action, WatchAction::Enable | WatchAction::Disable) {
+        infigraph_core::watch::config::write_watch_policy(
+            &root,
+            role,
+            action == WatchAction::Enable,
+        )?;
+    }
+
+    if infigraph_core::watch::daemon::watch_daemon_mode_enabled() {
+        let lock_path = root.join(".infigraph").join("watch.lock");
+        if !infigraph_core::watch::daemon::daemon_is_alive(&lock_path) {
+            return Ok(
+                if matches!(action, WatchAction::Enable | WatchAction::Disable) {
+                    format!(
+                    "{role:?}: policy persisted for {root_str}; no daemon currently running to notify."
+                )
+                } else {
+                    format!("No daemon running for {root_str}.")
+                },
+            );
+        }
+        let registry = bundled_registry()?;
+        let prism = Infigraph::open(&root, registry)?;
+        prism.submit_watch_control_and_await(role, action, WATCH_CONTROL_TIMEOUT)?;
+        return Ok(format!("{role:?}: {action:?} sent for {root_str}."));
+    }
+
+    match (role, action) {
+        (WatchRole::Code, WatchAction::Disable) => {
+            tool_stop_watch(&serde_json::json!({ "path": path }))?;
+            Ok(format!("Code watching disabled for {root_str}"))
+        }
+        (WatchRole::Code, WatchAction::Enable) => {
+            if !is_watching(&root_str) {
+                tool_watch_project(&serde_json::json!({ "path": path }))?;
+            }
+            Ok(format!("Code watching enabled for {root_str}"))
+        }
+        (WatchRole::Code, WatchAction::Restart) => {
+            let _ = tool_stop_watch(&serde_json::json!({ "path": path }));
+            tool_watch_project(&serde_json::json!({ "path": path }))?;
+            Ok(format!("Code watching restarted for {root_str}"))
+        }
+        _ => anyhow::bail!(
+            "unsupported role/action combination for the in-process case: {role:?}/{action:?}"
+        ),
+    }
 }
 
 pub fn tool_get_watch_status(args: &Value) -> Result<String> {
