@@ -264,15 +264,16 @@ where
     // per call on Windows).
     let mut held_prism: Option<Arc<Infigraph>> = None;
 
-    // Accumulates index-shaped work from every producer below (periodic
-    // reindex, watch-triggered batch/removal, ad-hoc daemon-protocol
-    // requests) so it's drained as one combined execution per tick instead
-    // of each producer racing its own stale plan against the others -- see
+    // Accumulates index-shaped work from every producer (the code-watch
+    // task, the periodic mark below, ad-hoc daemon-protocol requests) so
+    // it's drained as one combined execution per tick instead of each
+    // producer racing its own stale plan against the others -- see
     // docs/superpowers/specs/2026-08-03-daemon-index-work-queue-design.md.
     //
-    // Shared rather than loop-local because the drain runs on a background
-    // task: producers below keep filling it, under the mutex, while a drain
-    // executes.
+    // `Arc<Mutex<_>>` because it is the ONLY state the code-watch task and
+    // this loop share -- no Kuzu connection, no `held_prism`, no drain
+    // bookkeeping crosses that boundary -- and because the drain itself runs
+    // on a background task while producers keep filling it under the mutex.
     let queue = Arc::new(Mutex::new(IndexWorkQueue::new()));
     let infigraph_dir = root.join(".infigraph");
 
@@ -323,6 +324,15 @@ where
 
     let sentinel = root.join(".infigraph").join("watch.stop");
 
+    // Set by a `WatchControl { role: Daemon, action: Stop|Restart }` request.
+    // Deliberately NOT derived from `daemon_token.is_cancelled()`:
+    // `daemon_token` is the root of the *background-work* cancellation
+    // hierarchy, and a caller is entitled to hand this loop an
+    // already-cancelled one to mean "run, but let nothing you spawn survive"
+    // -- reading it as a loop-exit signal would make that caller's very first
+    // tick a shutdown.
+    let mut shutdown_requested = false;
+
     loop {
         if stop_rx.try_recv().is_ok() {
             break;
@@ -333,20 +343,11 @@ where
             break;
         }
 
-        // A `WatchControl { role: Daemon, action: Stop }` request cancels
-        // `daemon_token` from inside `route_or_serve_request` below. Without
-        // this check the token would tear down every task beneath it while
-        // this loop kept spinning, and the process would never exit.
-        if daemon_token.is_cancelled() {
-            break;
-        }
-
         // Self-terminate once the watched root is gone (`rm -rf`'d project,
         // a test's tempdir, a removed worktree that skipped `worktree
         // teardown`). No dedicated poll timer needed for this -- the loop
-        // already ticks at least every 200ms via the `recv_timeout` below
-        // regardless of whether a real fsevent fired, so this check rides
-        // that existing cadence for free. Without it, a daemon whose target
+        // already ticks every `COORDINATOR_TICK`, so this check rides that
+        // existing cadence for free. Without it, a daemon whose target
         // directory disappeared keeps running forever: `prune_stale_holder`
         // only reaps a *dead* holder, and this process is very much alive,
         // just watching nothing. `infigraph gc --global` sweeps the
@@ -362,9 +363,9 @@ where
 
         // Shared drain step, in two halves: reap whatever finished since the
         // last tick (here), then schedule the next one (at the end of the
-        // tick). The drain itself combines everything every producer below
-        // (periodic mark, ad-hoc requests, batch flush, watch-triggered
-        // removal) contributed into ONE execution -- the actual fix for the
+        // tick). The drain itself combines everything every producer
+        // (periodic mark, ad-hoc requests, and the code-watch task's batch
+        // flushes and removals) contributed into ONE execution -- the fix for the
         // coalescing bug (see
         // docs/superpowers/specs/2026-08-03-daemon-index-work-queue-design.md).
         // Same lock, same role string, same cross-process contract the
@@ -572,12 +573,21 @@ where
                             daemon_token,
                             &mut code_watch,
                             docs_control.as_ref(),
+                            &mut shutdown_requested,
                         ) {
                             full_reindex_in_flight = Some(started);
                         }
                     }
                 }
             }
+        }
+
+        // Checked here rather than at the top of the next tick so a
+        // `WatchControl { role: Daemon, action: Stop }` reply isn't followed
+        // by another `COORDINATOR_TICK` of scheduling work the caller just
+        // asked this process to stop doing.
+        if shutdown_requested {
+            break;
         }
 
         // Schedule: only when nothing's in flight, so at most one drain runs
@@ -1585,6 +1595,9 @@ fn route_or_serve_request<MR>(
     daemon_token: &CancellationToken,
     code_watch: &mut CodeWatch,
     docs_control: Option<&Arc<DocsControl>>,
+    // Set to `true` when the request asks the whole daemon to stop; the
+    // coordinator's loop reads it to decide whether to break.
+    shutdown_requested: &mut bool,
 ) -> Option<PendingFullReindex>
 where
     MR: Fn() -> Result<crate::lang::LanguageRegistry>,
@@ -1788,6 +1801,12 @@ where
             reply_to_watch_control(&reply_path, outcome);
             std::fs::remove_file(path).ok();
             if daemon_stop {
+                // Two separate signals, deliberately: the token tears down
+                // whatever background work is still spawned beneath it, and
+                // the flag tells the coordinator's own loop to stop ticking.
+                // The loop must not infer the second from the first -- see
+                // `shutdown_requested`'s declaration.
+                *shutdown_requested = true;
                 daemon_token.cancel();
             }
             None
@@ -2196,6 +2215,7 @@ mod tests {
             &daemon_token,
             &mut code_watch,
             None,
+            &mut false,
         );
 
         let drained = queue.lock().unwrap().drain();

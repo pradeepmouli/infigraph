@@ -340,6 +340,16 @@ identical `WriteRequest` shape. (The ignore-matcher-rebuild ticker elsewhere sta
 project root, which *are* already covered by the main content watch, just not on a useful
 cadence for that purpose, so there's no natural event to hang it on instead.)
 
+**Deferred as implemented (Task 10).** The `.infigraph/requests/`-scoped `notify::Watcher`
+above did *not* land with the producer/coordinator split: `run_write_coordinator` is
+deliberately synchronous (Global Constraints), so a bridged `tokio::sync::mpsc` receiver has no
+`select!` arm to live in the way `producer.rs`'s does, and rebuilding the coordinator around a
+runtime purely for request detection is a materially larger change than the behavioral unlock
+it accompanies. The existing `std::fs::read_dir` poll (now on the coordinator's own ~200ms
+`COORDINATOR_TICK`) is kept — still correct, and already faster than
+`submit_write_request`'s own poll-with-backoff settles to. The event-driven upgrade is a
+separate follow-up task, not a silently dropped requirement.
+
 A `WatchControl { action: Stop }` request's arrival translates into cancelling the named
 producer's own local token — a targeted, sub-process-level analog of what a full OS signal does
 for `daemon stop`. Every *external* caller (a fresh CLI process's `watch stop`/`watch-docs

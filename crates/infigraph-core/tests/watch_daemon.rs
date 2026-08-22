@@ -951,3 +951,208 @@ fn scip_enrichment_task_is_cancellable_via_daemon_token() {
     // instead of returning.
     handle.join().unwrap().unwrap();
 }
+
+/// Coverage for the other half of `WatchControl`'s dispatch: `role: Daemon,
+/// action: Stop` must end the coordinator loop itself, not just the
+/// code-watch producer (`watch_control.rs` covers `role: Code`, whose whole
+/// point is the *opposite* -- the loop surviving).
+///
+/// Worth its own test because the loop-exit signal and the background-work
+/// cancellation signal are deliberately separate: `daemon_token` is the root
+/// of the task hierarchy and a caller may legitimately hand this loop an
+/// already-cancelled one (see
+/// `full_reindex_build_task_can_be_cancelled_before_it_starts_the_swap`), so
+/// the loop must NOT read `daemon_token.is_cancelled()` as "time to exit".
+/// Collapsing the two back into one signal would keep this test passing while
+/// breaking that one, and vice versa -- only both together pin the behavior.
+#[test]
+fn watch_control_daemon_stop_ends_the_coordinator_loop() {
+    let project = tempfile::Builder::new()
+        .prefix("infigraph-daemon-stop-test-")
+        .tempdir()
+        .unwrap();
+    std::fs::write(project.path().join("main.py"), "def main():\n    pass\n").unwrap();
+
+    {
+        let registry = infigraph_languages::bundled_registry().unwrap();
+        let mut boot = infigraph_core::Infigraph::open(project.path(), registry).unwrap();
+        boot.init().unwrap();
+        boot.index().unwrap();
+    }
+
+    // Live, uncancelled: the request itself is the only thing that may end
+    // this loop.
+    let daemon_token = tokio_util::sync::CancellationToken::new();
+    let token_for_thread = daemon_token.clone();
+
+    let (_stop_tx, stop_rx) = std::sync::mpsc::channel();
+    let root = project.path().to_path_buf();
+    let handle = std::thread::spawn(move || {
+        infigraph_core::watch::run_write_coordinator(
+            &root,
+            || Ok(infigraph_languages::bundled_registry().unwrap()),
+            50, // debounce_ms
+            stop_rx,
+            |_evt| {},
+            0,
+            None::<fn(&infigraph_core::IndexResult)>,
+            true, // serve_requests
+            None,
+            &token_for_thread,
+            None,
+        )
+    });
+
+    std::thread::sleep(std::time::Duration::from_millis(300));
+
+    let requests_dir = project.path().join(".infigraph").join("requests");
+    let request_path = requests_dir.join("daemon-stop-test.request");
+    let result_path = requests_dir.join("daemon-stop-test.result");
+    infigraph_core::daemon_protocol::write_atomic(
+        &request_path,
+        &serde_json::to_string(
+            &infigraph_core::daemon_protocol::WriteRequest::WatchControl {
+                role: infigraph_core::daemon_protocol::WatchRole::Daemon,
+                action: infigraph_core::daemon_protocol::WatchAction::Stop,
+            },
+        )
+        .unwrap(),
+    )
+    .unwrap();
+
+    // The reply is written before the loop breaks, so the caller learns the
+    // stop was accepted rather than timing out against a process on its way
+    // out.
+    let mut replied = false;
+    for _ in 0..150 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        if result_path.exists() {
+            replied = true;
+            break;
+        }
+    }
+    assert!(
+        replied,
+        "expected a reply to WatchControl {{ Daemon, Stop }} before the loop exits"
+    );
+    let reply: infigraph_core::daemon_protocol::WriteResult =
+        serde_json::from_str(&std::fs::read_to_string(&result_path).unwrap()).unwrap();
+    assert!(
+        matches!(
+            reply,
+            infigraph_core::daemon_protocol::WriteResult::Ok { .. }
+        ),
+        "WatchControl {{ Daemon, Stop }} must succeed: {reply:?}"
+    );
+
+    // `_stop_tx` is deliberately still alive and never sent on: nothing but
+    // the request is allowed to end this loop.
+    for _ in 0..150 {
+        if handle.is_finished() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert!(
+        handle.is_finished(),
+        "WatchControl {{ Daemon, Stop }} must end the coordinator loop"
+    );
+    handle.join().unwrap().unwrap();
+
+    assert!(
+        daemon_token.is_cancelled(),
+        "a daemon stop must also cancel the background-work hierarchy"
+    );
+}
+
+/// The companion to the test above, for a role the daemon cannot honour:
+/// `Start` has no meaning when you are already talking to a live daemon, so
+/// it must come back as an explicit error rather than a silent no-op -- and
+/// crucially must NOT end the loop.
+#[test]
+fn watch_control_daemon_start_is_rejected_without_stopping_the_loop() {
+    let project = tempfile::Builder::new()
+        .prefix("infigraph-daemon-start-reject-test-")
+        .tempdir()
+        .unwrap();
+    std::fs::write(project.path().join("main.py"), "def main():\n    pass\n").unwrap();
+
+    {
+        let registry = infigraph_languages::bundled_registry().unwrap();
+        let mut boot = infigraph_core::Infigraph::open(project.path(), registry).unwrap();
+        boot.init().unwrap();
+        boot.index().unwrap();
+    }
+
+    let daemon_token = tokio_util::sync::CancellationToken::new();
+    let token_for_thread = daemon_token.clone();
+
+    let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+    let root = project.path().to_path_buf();
+    let handle = std::thread::spawn(move || {
+        infigraph_core::watch::run_write_coordinator(
+            &root,
+            || Ok(infigraph_languages::bundled_registry().unwrap()),
+            50, // debounce_ms
+            stop_rx,
+            |_evt| {},
+            0,
+            None::<fn(&infigraph_core::IndexResult)>,
+            true, // serve_requests
+            None,
+            &token_for_thread,
+            None,
+        )
+    });
+
+    std::thread::sleep(std::time::Duration::from_millis(300));
+
+    let requests_dir = project.path().join(".infigraph").join("requests");
+    let request_path = requests_dir.join("daemon-start-reject-test.request");
+    let result_path = requests_dir.join("daemon-start-reject-test.result");
+    infigraph_core::daemon_protocol::write_atomic(
+        &request_path,
+        &serde_json::to_string(
+            &infigraph_core::daemon_protocol::WriteRequest::WatchControl {
+                role: infigraph_core::daemon_protocol::WatchRole::Daemon,
+                action: infigraph_core::daemon_protocol::WatchAction::Start,
+            },
+        )
+        .unwrap(),
+    )
+    .unwrap();
+
+    let mut replied = false;
+    for _ in 0..150 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        if result_path.exists() {
+            replied = true;
+            break;
+        }
+    }
+    assert!(
+        replied,
+        "expected a reply to WatchControl {{ Daemon, Start }}"
+    );
+    let reply: infigraph_core::daemon_protocol::WriteResult =
+        serde_json::from_str(&std::fs::read_to_string(&result_path).unwrap()).unwrap();
+    assert!(
+        matches!(
+            reply,
+            infigraph_core::daemon_protocol::WriteResult::Err { .. }
+        ),
+        "WatchControl {{ Daemon, Start }} is meaningless and must be an explicit error: {reply:?}"
+    );
+
+    assert!(
+        !handle.is_finished(),
+        "a rejected daemon-control request must not end the coordinator loop"
+    );
+    assert!(
+        !daemon_token.is_cancelled(),
+        "a rejected daemon-control request must not cancel background work"
+    );
+
+    stop_tx.send(()).unwrap();
+    handle.join().unwrap().unwrap();
+}

@@ -377,7 +377,8 @@ pub(crate) fn cmd_daemon(root: &Path, debounce: u64) -> Result<()> {
     // The daemon-lifetime token every cancellable task in this process hangs
     // off: the code-watch producer (spawned inside run_write_coordinator),
     // full-reindex builds, and SCIP enrichment. Cancelling it tears all of
-    // them down, and the coordinator's own loop exits on it too.
+    // them down; the coordinator's own loop exits on `stop_rx` instead, which
+    // the handler below sends alongside the cancel.
     let daemon_token = tokio_util::sync::CancellationToken::new();
 
     let watchdog_root = root.to_path_buf();
