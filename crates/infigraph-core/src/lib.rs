@@ -515,6 +515,28 @@ impl Infigraph {
         }
     }
 
+    /// Submit a WatchControl request to an already-running daemon and wait
+    /// for the reply. Returns success if the daemon processed the request.
+    /// This is the client-side entry point for CLI commands and MCP tools to
+    /// control the daemon's watch lifecycle (code-watching, doc-watching, or
+    /// the daemon process itself) from outside the process.
+    pub fn submit_watch_control_and_await(
+        &self,
+        role: crate::daemon_protocol::WatchRole,
+        action: crate::daemon_protocol::WatchAction,
+        timeout: std::time::Duration,
+    ) -> Result<()> {
+        let staging_dir = self.root.join(".infigraph").join("requests");
+        let request = crate::daemon_protocol::WriteRequest::WatchControl { role, action };
+        match crate::daemon_protocol::submit_write_request(&staging_dir, &request, timeout)? {
+            crate::daemon_protocol::WriteResult::Ok { .. } => Ok(()),
+            crate::daemon_protocol::WriteResult::Err { message } => Err(anyhow::anyhow!(message)),
+            other => Err(anyhow::anyhow!(
+                "unexpected WriteResult for WatchControl: {other:?}"
+            )),
+        }
+    }
+
     /// Import a SCIP index file into the graph. Thin wrapper matching
     /// index()/index_files()'s shape, so the daemon protocol has a single
     /// clean entry point rather than reaching for prism.backend() directly.
