@@ -140,9 +140,14 @@ impl CodeWatch {
     }
 
     fn start(&mut self) {
-        if self.task.is_some() {
+        if self.task.as_ref().is_some_and(|t| !t.is_finished()) {
             return;
         }
+        // A producer can self-terminate without cancellation (initial
+        // watcher-creation failure, restart budget exhausted, restart
+        // failure) -- drop a finished task before respawning, or Start
+        // would silently no-op forever after any of those.
+        self.task.take();
         let config = self.config.clone();
         let queue = Arc::clone(&self.queue);
         let on_event = Arc::clone(&self.on_event);
