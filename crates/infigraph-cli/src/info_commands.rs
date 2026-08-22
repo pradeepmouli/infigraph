@@ -602,6 +602,16 @@ pub(crate) fn cmd_watch_status(root: &Path) -> Result<()> {
 const WATCH_CONTROL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 pub(crate) fn cmd_daemon_stop(root: &Path) -> Result<()> {
+    // Without this check, submitting into an unattended staging dir just
+    // sits there until WATCH_CONTROL_TIMEOUT and then reports an opaque
+    // protocol error -- an everyday case (no daemon running yet), not a
+    // misconfiguration. Mirrors cmd_watch_stop's existing early-exit and
+    // index.rs's FullReindex path (see its own comment re: incident #100).
+    let lock_path = root.join(".infigraph").join("watch.lock");
+    if !infigraph_core::watch::daemon::daemon_is_alive(&lock_path) {
+        println!("No daemon running.");
+        return Ok(());
+    }
     let registry = bundled_registry()?;
     let prism = Infigraph::open(root, registry)?;
     prism.submit_watch_control_and_await(
@@ -614,29 +624,33 @@ pub(crate) fn cmd_daemon_stop(root: &Path) -> Result<()> {
 }
 
 pub(crate) fn cmd_daemon_restart(root: &Path) -> Result<()> {
-    let registry = bundled_registry()?;
-    let prism = Infigraph::open(root, registry)?;
-    // `WatchRole::Daemon`'s `Restart` action (per Task 10's
-    // route_or_serve_request arm) only cancels daemon_token -- the process
-    // exiting means there's nothing left to ask to "start itself" from
-    // inside. Re-spawn from the CLI side instead, mirroring
-    // `ensure_daemon_running`'s existing pattern.
-    prism.submit_watch_control_and_await(
-        WatchRole::Daemon,
-        WatchAction::Stop,
-        WATCH_CONTROL_TIMEOUT,
-    )?;
-
-    // Wait for the process to actually exit before respawning (poll
-    // watch.lock's liveness, matching wait_for_daemon_ready's shape in
-    // crates/infigraph-core/src/watch/daemon.rs).
+    // Same liveness check as cmd_daemon_stop -- if nothing is running,
+    // there is nothing to stop-and-wait-for, so skip straight to spawning.
     let lock_path = root.join(".infigraph").join("watch.lock");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while infigraph_core::watch::daemon::daemon_is_alive(&lock_path) {
-        if std::time::Instant::now() > deadline {
-            anyhow::bail!("daemon did not exit within 10s of a stop request");
+    if infigraph_core::watch::daemon::daemon_is_alive(&lock_path) {
+        let registry = bundled_registry()?;
+        let prism = Infigraph::open(root, registry)?;
+        // `WatchRole::Daemon`'s `Restart` action (per Task 10's
+        // route_or_serve_request arm) only cancels daemon_token -- the
+        // process exiting means there's nothing left to ask to "start
+        // itself" from inside. Re-spawn from the CLI side instead,
+        // mirroring `ensure_daemon_running`'s existing pattern.
+        prism.submit_watch_control_and_await(
+            WatchRole::Daemon,
+            WatchAction::Stop,
+            WATCH_CONTROL_TIMEOUT,
+        )?;
+
+        // Wait for the process to actually exit before respawning (poll
+        // watch.lock's liveness, matching wait_for_daemon_ready's shape in
+        // crates/infigraph-core/src/watch/daemon.rs).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while infigraph_core::watch::daemon::daemon_is_alive(&lock_path) {
+            if std::time::Instant::now() > deadline {
+                anyhow::bail!("daemon did not exit within 10s of a stop request");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
         }
-        std::thread::sleep(std::time::Duration::from_millis(100));
     }
 
     let watch_binary = std::env::current_exe()?;
@@ -678,8 +692,26 @@ pub(crate) fn cmd_watch_control(
 ) -> Result<()> {
     let watch_action = watch_cli_action_to_watch_action(&action);
     if matches!(watch_action, WatchAction::Enable | WatchAction::Disable) {
+        // Persisted regardless of whether a daemon is currently running --
+        // the policy is meant to survive restarts, so it must apply the
+        // next time one starts even if none is up right now.
         write_watch_policy_to_config(root, role, watch_action == WatchAction::Enable)?;
     }
+
+    // Same liveness check as cmd_daemon_stop/cmd_daemon_restart -- avoids a
+    // WATCH_CONTROL_TIMEOUT hang on the everyday "no daemon running" case.
+    // Enable/Disable already did their durable work above; Start/Stop/
+    // Restart have nothing to act on without a live daemon.
+    let lock_path = root.join(".infigraph").join("watch.lock");
+    if !infigraph_core::watch::daemon::daemon_is_alive(&lock_path) {
+        if matches!(watch_action, WatchAction::Enable | WatchAction::Disable) {
+            println!("{role:?}: policy persisted; no daemon currently running to notify.");
+        } else {
+            println!("No daemon running.");
+        }
+        return Ok(());
+    }
+
     let registry = bundled_registry()?;
     let prism = Infigraph::open(root, registry)?;
     prism.submit_watch_control_and_await(role, watch_action, WATCH_CONTROL_TIMEOUT)?;
@@ -1442,6 +1474,73 @@ mod watch_cli_action_tests {
         assert_eq!(
             watch_cli_action_to_watch_action(&WatchCliAction::Restart),
             WatchAction::Restart
+        );
+    }
+}
+
+#[cfg(test)]
+mod daemon_liveness_guard_tests {
+    use super::{cmd_daemon_stop, cmd_watch_control};
+    use crate::WatchCliAction;
+    use infigraph_core::daemon_protocol::WatchRole;
+
+    // Regression coverage for a Task 12 review finding: without an upfront
+    // daemon_is_alive check, these commands would submit into an unattended
+    // staging dir and block for the full WATCH_CONTROL_TIMEOUT (30s) before
+    // reporting an opaque protocol error -- the exact failure mode
+    // index.rs's FullReindex path already guards against (see its own
+    // comment re: incident #100). No daemon is ever started here; a bound
+    // far below the 30s timeout is what proves the guard actually fired
+    // rather than the call happening to return quickly for some other
+    // reason.
+    const GUARD_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
+
+    #[test]
+    fn cmd_daemon_stop_returns_promptly_when_no_daemon_is_running() {
+        let tmp = tempfile::tempdir().unwrap();
+        let start = std::time::Instant::now();
+        cmd_daemon_stop(tmp.path()).unwrap();
+        assert!(
+            start.elapsed() < GUARD_BOUND,
+            "cmd_daemon_stop should fail fast on a missing daemon, not wait out the protocol timeout"
+        );
+    }
+
+    // cmd_daemon_restart has no dedicated test here: once daemon_is_alive
+    // is false, it falls through to ensure_daemon_running_required, which
+    // actually spawns a detached daemon process -- not something to trigger
+    // from a fast unit test (would leak a real orphan process pointed at a
+    // tempdir). Its liveness guard is structurally identical to
+    // cmd_daemon_stop's (same check, same early condition), verified by
+    // code review rather than a spawning test.
+
+    #[test]
+    fn cmd_watch_control_start_returns_promptly_when_no_daemon_is_running() {
+        let tmp = tempfile::tempdir().unwrap();
+        let start = std::time::Instant::now();
+        cmd_watch_control(tmp.path(), WatchRole::Code, WatchCliAction::Start).unwrap();
+        assert!(
+            start.elapsed() < GUARD_BOUND,
+            "cmd_watch_control(Start) should fail fast on a missing daemon"
+        );
+    }
+
+    #[test]
+    fn cmd_watch_control_enable_still_persists_policy_when_no_daemon_is_running() {
+        let tmp = tempfile::tempdir().unwrap();
+        let start = std::time::Instant::now();
+        // Enable/Disable must not hang either, and -- unlike Start/Stop/
+        // Restart -- must still succeed: the policy is meant to survive
+        // restarts, so it has to apply the next time a daemon starts even
+        // if none is running right now.
+        let result = cmd_watch_control(tmp.path(), WatchRole::Code, WatchCliAction::Enable);
+        assert!(
+            start.elapsed() < GUARD_BOUND,
+            "cmd_watch_control(Enable) should not block on notifying a daemon that isn't running"
+        );
+        assert!(
+            result.is_ok(),
+            "Enable's durable policy write must still succeed with no daemon running"
         );
     }
 }
