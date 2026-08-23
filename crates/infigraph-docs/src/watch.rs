@@ -592,21 +592,37 @@ mod tests {
 
         // The stop must STICK -- a doc written now must not be indexed,
         // even though `resume` was armed earlier during the attached
-        // session. Give it the same margin as the sibling negative-result
-        // test, since a false pass here only shows up as a slow leak, not
-        // an immediate error.
-        std::fs::write(
-            root.join("after-stale-resume-stop.md"),
-            "# must not be indexed -- the stale resume must not have cancelled this stop",
-        )
-        .unwrap();
-        std::thread::sleep(Duration::from_millis(300));
-        assert_eq!(
-            chunk_count(&root),
-            0,
-            "an explicit stop must not be silently cancelled by a resume signal armed \
-             earlier during the attached session (a no-op start() call while already watching)"
-        );
+        // session. A single write shortly after a hypothetical re-attach
+        // is not a reliable negative probe: `notify` only reports changes
+        // from the point `watcher.watch()` is (re)called, and a write that
+        // lands too close to that registration can simply be missed --
+        // exactly the same timing sensitivity the sibling
+        // `resume_signal_reattaches_...` test's positive probe works around
+        // with a retry loop. Mirror that here, inverted: keep re-writing
+        // fresh content and re-checking for the whole window, so a bug that
+        // causes even a late, delayed re-attach still gets caught.
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let mut attempt = 0;
+        while std::time::Instant::now() < deadline {
+            attempt += 1;
+            std::fs::write(
+                root.join("after-stale-resume-stop.md"),
+                format!(
+                    "# must not be indexed -- the stale resume must not have \
+                     cancelled this stop (attempt {attempt})"
+                ),
+            )
+            .unwrap();
+            std::thread::sleep(Duration::from_millis(200));
+            assert_eq!(
+                chunk_count(&root),
+                0,
+                "an explicit stop must not be silently cancelled by a resume signal armed \
+                 earlier during the attached session (a no-op start() call while already \
+                 watching) -- got a non-zero chunk count on attempt {attempt}, meaning the \
+                 loop re-attached and indexed a post-stop write"
+            );
+        }
 
         shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
         handle.join().unwrap().unwrap();
