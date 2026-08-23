@@ -120,13 +120,20 @@ fn attach_poll_interval() -> Duration {
 /// (stops it) if that file disappears (e.g. after `clean_docs`) -- eligible
 /// to re-attach once it reappears -- or if `.infigraph/watch.stop.docs` is
 /// found -- NOT eligible to re-attach until docs.kuzu disappears and
-/// reappears, since that sentinel represents an explicit stop request, not
-/// an index-lifecycle event. Exits once `shutdown` is observed true.
-/// Blocks until then.
+/// reappears, or `resume` is signalled (see below), since that sentinel
+/// represents an explicit stop request, not an index-lifecycle event. Exits
+/// once `shutdown` is observed true. Blocks until then.
+///
+/// `resume`: an explicit Start/Enable (`DocWatchThread::start()` called
+/// while this loop is already running) has no file-lifecycle event to
+/// react to, so it sets this flag instead -- the one other way (besides
+/// `docs_kuzu` disappearing and reappearing) to clear
+/// `suppressed_until_absent` and let the loop re-attach immediately.
 pub fn watch_docs_daemon_loop(
     root: &Path,
     debounce_ms: u64,
     shutdown: Arc<AtomicBool>,
+    resume: Arc<AtomicBool>,
 ) -> Result<()> {
     let docs_kuzu = root.join(".infigraph").join("docs.kuzu");
     let stop_sentinel = root.join(".infigraph").join("watch.stop.docs");
@@ -142,12 +149,16 @@ pub fn watch_docs_daemon_loop(
         let exists = docs_kuzu.exists();
 
         if suppressed_until_absent {
-            if !exists {
+            if !exists || resume.swap(false, Ordering::Relaxed) {
                 suppressed_until_absent = false;
             }
             std::thread::sleep(poll);
             continue;
         }
+        // Consume a stale resume signal that arrived while attached (or
+        // before the first attach) -- it must not linger and immediately
+        // cancel a *future* suppression the moment one starts.
+        resume.store(false, Ordering::Relaxed);
 
         if !exists {
             std::thread::sleep(poll);
@@ -286,7 +297,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().canonicalize().unwrap();
         let shutdown = Arc::new(AtomicBool::new(true));
-        watch_docs_daemon_loop(&root, 50, shutdown).unwrap();
+        let resume = Arc::new(AtomicBool::new(false));
+        watch_docs_daemon_loop(&root, 50, shutdown, resume).unwrap();
         // No assertion beyond "returned" -- this test times out (fails) if
         // the loop doesn't check shutdown before ever attaching.
     }
@@ -299,7 +311,9 @@ mod tests {
         std::fs::create_dir_all(root.join(".infigraph")).unwrap();
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_clone = Arc::clone(&shutdown);
-        let handle = std::thread::spawn(move || watch_docs_daemon_loop(&root, 50, shutdown_clone));
+        let resume = Arc::new(AtomicBool::new(false));
+        let handle =
+            std::thread::spawn(move || watch_docs_daemon_loop(&root, 50, shutdown_clone, resume));
 
         std::thread::sleep(Duration::from_millis(150));
         // No docs.kuzu ever appeared -- the loop must still be polling, not
@@ -322,9 +336,11 @@ mod tests {
 
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_clone = Arc::clone(&shutdown);
+        let resume = Arc::new(AtomicBool::new(false));
         let root_clone = root.clone();
-        let handle =
-            std::thread::spawn(move || watch_docs_daemon_loop(&root_clone, 50, shutdown_clone));
+        let handle = std::thread::spawn(move || {
+            watch_docs_daemon_loop(&root_clone, 50, shutdown_clone, resume)
+        });
 
         // Not indexed yet -- give the poll loop a couple of ticks doing
         // nothing, then create a real (empty) doc index so docs.kuzu exists.
@@ -411,9 +427,12 @@ mod tests {
 
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_clone = Arc::clone(&shutdown);
+        let resume = Arc::new(AtomicBool::new(false));
+        let resume_clone = Arc::clone(&resume);
         let root_clone = root.clone();
-        let handle =
-            std::thread::spawn(move || watch_docs_daemon_loop(&root_clone, 50, shutdown_clone));
+        let handle = std::thread::spawn(move || {
+            watch_docs_daemon_loop(&root_clone, 50, shutdown_clone, resume_clone)
+        });
 
         // Let it attach.
         std::thread::sleep(Duration::from_millis(100));
@@ -435,6 +454,84 @@ mod tests {
         assert_eq!(
             chunks_while_suppressed, 0,
             "must stay detached after an explicit stop until docs.kuzu disappears and reappears"
+        );
+
+        shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+        handle.join().unwrap().unwrap();
+        clear_fast_poll();
+    }
+
+    /// Regression for the "doc-watcher can't recover from the
+    /// `watch.stop.docs` sentinel" bug: an explicit Start/Enable (modeled
+    /// here directly as setting `resume`, since `DocWatchThread::start()` is
+    /// what sets it in `infigraph-cli`) must be able to un-suppress a loop
+    /// that's parked after an explicit stop, without waiting for
+    /// `docs.kuzu` to disappear and reappear.
+    #[test]
+    fn resume_signal_reattaches_a_suppressed_loop_without_docs_kuzu_cycling() {
+        set_fast_poll();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join(".infigraph")).unwrap();
+        crate::DocIndex::open(&root).unwrap().init().unwrap();
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_clone = Arc::clone(&shutdown);
+        let resume = Arc::new(AtomicBool::new(false));
+        let resume_clone = Arc::clone(&resume);
+        let root_clone = root.clone();
+        let handle = std::thread::spawn(move || {
+            watch_docs_daemon_loop(&root_clone, 50, shutdown_clone, resume_clone)
+        });
+
+        // Let it attach, then stop it (same as the sibling test above).
+        std::thread::sleep(Duration::from_millis(100));
+        std::fs::write(root.join(".infigraph").join("watch.stop.docs"), b"").unwrap();
+        std::thread::sleep(Duration::from_millis(150));
+
+        // Confirm it's genuinely suppressed before resuming it -- otherwise
+        // this test would pass even if `resume` did nothing.
+        std::fs::write(root.join("while-suppressed.md"), "# not yet").unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            chunk_count(&root),
+            0,
+            "sanity check: must still be suppressed before signalling resume"
+        );
+
+        // Signal resume -- docs.kuzu never disappeared, so a naive
+        // "disappear and reappear" check alone would never re-attach.
+        resume.store(true, std::sync::atomic::Ordering::Relaxed);
+
+        // A file written before the freshly re-created `notify` watcher has
+        // actually finished registering produces no event (`notify` only
+        // reports changes from the point `watcher.watch()` is (re)called),
+        // and there's no external signal (unlike the initial-attach case)
+        // marking exactly when that registration completes. Rather than
+        // guess a fixed delay, keep re-touching the probe file with new
+        // content until either it gets indexed or the deadline passes --
+        // any one of these writes that lands after registration proves
+        // resume worked, and one that lands before it is simply a miss this
+        // loop recovers from on the next attempt.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut chunks = 0;
+        let mut attempt = 0;
+        while std::time::Instant::now() < deadline {
+            attempt += 1;
+            std::fs::write(
+                root.join("after-resume.md"),
+                format!("# should be indexed now (attempt {attempt})"),
+            )
+            .unwrap();
+            std::thread::sleep(Duration::from_millis(200));
+            chunks = chunk_count(&root);
+            if chunks > 0 {
+                break;
+            }
+        }
+        assert!(
+            chunks > 0,
+            "resume must re-attach the suppressed loop and pick up a post-resume doc change"
         );
 
         shutdown.store(true, std::sync::atomic::Ordering::Relaxed);

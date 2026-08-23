@@ -420,3 +420,151 @@ fn kill_on_drop_kills_child_on_panic() {
         "KillOnDrop must kill child pid {pid} even when dropped during a panic unwind"
     );
 }
+
+/// Real end-to-end regression test for the "doc-watcher can't recover from
+/// the `watch.stop.docs` sentinel" bug: the MCP `stop_watch_docs` tool
+/// (`tool_stop_watch_docs` in `infigraph-mcp`) stops daemon-mode doc
+/// watching by writing `.infigraph/watch.stop.docs` directly, rather than
+/// going through the `WatchControl` protocol `infigraph watch-docs stop`
+/// uses. That sentinel is consumed by `watch_docs_daemon_loop`
+/// (`infigraph-docs/src/watch.rs`) without ever exiting its thread -- it
+/// just sets an internal `suppressed_until_absent` flag and keeps polling.
+/// Before the fix, `DocWatchThread::start()` (`infigraph-cli`) returned
+/// early whenever `self.handle.is_some()`, which stays true the whole time
+/// (the thread never actually exits), so `infigraph watch-docs start` /
+/// `enable_watch_docs` was a permanent silent no-op after this sentinel
+/// path. This test writes that exact sentinel directly (there is no CLI
+/// command that does -- only the MCP tool does, but the on-disk contract is
+/// identical and this avoids spinning up a whole MCP server) against a real
+/// daemon subprocess, then proves `infigraph watch-docs start` genuinely
+/// resumes doc-watching afterward.
+#[test]
+fn watch_docs_start_resumes_after_a_sentinel_triggered_stop() {
+    let bin = cli_binary();
+    if !bin.exists() {
+        eprintln!(
+            "skipping: infigraph CLI binary not found at {} (needs a full `cargo build`/`cargo test --workspace` first)",
+            bin.display()
+        );
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(root.join(".infigraph")).unwrap();
+    std::fs::write(root.join("main.rs"), "fn main() {}").unwrap();
+    // Pre-create docs.kuzu so the daemon's doc thread attaches on its very
+    // first poll tick, rather than needing a second synchronization point
+    // for "docs.kuzu appeared mid-run" (already covered by
+    // cmd_watch_daemon_also_indexes_docs_without_restart above).
+    infigraph_docs::DocIndex::open(&root)
+        .unwrap()
+        .init()
+        .unwrap();
+
+    let mut daemon = KillOnDrop(
+        Command::new(&bin)
+            .arg("daemon")
+            .arg("--debounce")
+            .arg("50")
+            .env("INFIGRAPH_DOC_DAEMON_POLL_MS", "50")
+            .current_dir(&root)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("failed to spawn infigraph daemon"),
+    );
+
+    let (attach_tx, attach_rx) = mpsc::channel::<()>();
+    let (reindexed_tx, reindexed_rx) = mpsc::channel::<String>();
+
+    let stdout = daemon.stdout.take().unwrap();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            eprintln!("[daemon stdout] {line}");
+        }
+    });
+    let stderr = daemon.stderr.take().unwrap();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            eprintln!("[daemon stderr] {line}");
+            if line.contains("attaching doc watcher") {
+                let _ = attach_tx.send(());
+            }
+            if line.contains("reindexed:") {
+                let _ = reindexed_tx.send(line);
+            }
+        }
+    });
+
+    let lock_path = root.join(".infigraph").join("watch.lock");
+    assert!(
+        infigraph_core::watch::daemon::wait_for_daemon_ready(&lock_path, Duration::from_secs(10)),
+        "daemon never acquired watch.lock after spawn"
+    );
+
+    attach_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("daemon's doc thread never attached on startup (docs.kuzu pre-existed)");
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Baseline: prove doc-watching genuinely works before touching the
+    // sentinel at all.
+    std::fs::write(root.join("readme.md"), "# hello\n\nsome content").unwrap();
+    reindexed_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("baseline reindex before any stop must succeed");
+
+    // Simulate tool_stop_watch_docs's daemon-mode write directly.
+    std::fs::write(root.join(".infigraph").join("watch.stop.docs"), b"").unwrap();
+    let sentinel = root.join(".infigraph").join("watch.stop.docs");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while sentinel.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        !sentinel.exists(),
+        "sentinel must be consumed by the running daemon"
+    );
+
+    // Confirm it's genuinely suppressed: a doc written now must NOT be
+    // reindexed within a bounded wait (docs.kuzu never disappeared, so this
+    // is not a false negative from a detach/reattach race).
+    std::fs::write(root.join("while-stopped.md"), "# should not be indexed").unwrap();
+    assert!(
+        reindexed_rx.recv_timeout(Duration::from_secs(2)).is_err(),
+        "doc watching must stay stopped after the sentinel -- got an unexpected reindex"
+    );
+
+    // The actual regression check: infigraph watch-docs start must resume
+    // doc-watching despite the daemon's doc thread never having exited.
+    let start_status = Command::new(&bin)
+        .arg("watch-docs")
+        .arg("start")
+        .current_dir(&root)
+        .stdin(Stdio::null())
+        .status()
+        .expect("failed to run infigraph watch-docs start");
+    assert!(
+        start_status.success(),
+        "infigraph watch-docs start exited non-zero: {start_status:?}"
+    );
+
+    attach_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("doc watcher must re-attach after infigraph watch-docs start");
+    std::thread::sleep(Duration::from_millis(200));
+
+    std::fs::write(root.join("after-restart.md"), "# should be indexed now").unwrap();
+    let resumed = reindexed_rx.recv_timeout(Duration::from_secs(10));
+
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+
+    assert!(
+        resumed.is_ok(),
+        "infigraph watch-docs start must actually resume doc-watching after a prior \
+         sentinel-triggered stop, not silently no-op"
+    );
+}

@@ -1156,3 +1156,196 @@ fn watch_control_daemon_start_is_rejected_without_stopping_the_loop() {
     stop_tx.send(()).unwrap();
     handle.join().unwrap().unwrap();
 }
+
+/// Coverage for the `WatchRole::Docs` arm of `route_or_serve_request`'s
+/// `WatchControl` dispatch, which had no test in either direction before
+/// this: a request routes to the registered `docs_control` closure (passed
+/// as `Some(...)` to `run_write_coordinator`) exactly once per request, with
+/// the exact action requested, and the loop keeps running afterward -- Docs
+/// actions, unlike `role: Daemon`, must never end the coordinator loop.
+#[test]
+fn watch_control_docs_role_dispatches_to_the_registered_docs_control() {
+    let project = tempfile::Builder::new()
+        .prefix("infigraph-watch-control-docs-dispatch-test-")
+        .tempdir()
+        .unwrap();
+    std::fs::write(project.path().join("main.py"), "def main():\n    pass\n").unwrap();
+
+    {
+        let registry = infigraph_languages::bundled_registry().unwrap();
+        let mut boot = infigraph_core::Infigraph::open(project.path(), registry).unwrap();
+        boot.init().unwrap();
+        boot.index().unwrap();
+    }
+
+    let received: std::sync::Arc<
+        std::sync::Mutex<Vec<infigraph_core::daemon_protocol::WatchAction>>,
+    > = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let received_for_control = std::sync::Arc::clone(&received);
+    let docs_control: std::sync::Arc<infigraph_core::watch::DocsControl> =
+        std::sync::Arc::new(move |action| {
+            received_for_control.lock().unwrap().push(action);
+            Ok(())
+        });
+
+    let daemon_token = tokio_util::sync::CancellationToken::new();
+    let token_for_thread = daemon_token.clone();
+
+    let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+    let root = project.path().to_path_buf();
+    let handle = std::thread::spawn(move || {
+        infigraph_core::watch::run_write_coordinator(
+            &root,
+            || Ok(infigraph_languages::bundled_registry().unwrap()),
+            50, // debounce_ms
+            stop_rx,
+            |_evt| {},
+            0,
+            None::<fn(&infigraph_core::IndexResult)>,
+            true, // serve_requests
+            None,
+            &token_for_thread,
+            Some(docs_control),
+        )
+    });
+
+    std::thread::sleep(std::time::Duration::from_millis(300));
+
+    let requests_dir = project.path().join(".infigraph").join("requests");
+    let request_path = requests_dir.join("watch-control-docs-dispatch-test.request");
+    let result_path = requests_dir.join("watch-control-docs-dispatch-test.result");
+    infigraph_core::daemon_protocol::write_atomic(
+        &request_path,
+        &serde_json::to_string(
+            &infigraph_core::daemon_protocol::WriteRequest::WatchControl {
+                role: infigraph_core::daemon_protocol::WatchRole::Docs,
+                action: infigraph_core::daemon_protocol::WatchAction::Start,
+            },
+        )
+        .unwrap(),
+    )
+    .unwrap();
+
+    let mut replied = false;
+    for _ in 0..150 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        if result_path.exists() {
+            replied = true;
+            break;
+        }
+    }
+    assert!(
+        replied,
+        "expected a reply to WatchControl {{ Docs, Start }}"
+    );
+    let reply: infigraph_core::daemon_protocol::WriteResult =
+        serde_json::from_str(&std::fs::read_to_string(&result_path).unwrap()).unwrap();
+    assert!(
+        matches!(
+            reply,
+            infigraph_core::daemon_protocol::WriteResult::Ok { .. }
+        ),
+        "WatchControl {{ Docs, Start }} with a registered docs_control must succeed: {reply:?}"
+    );
+    assert_eq!(
+        *received.lock().unwrap(),
+        vec![infigraph_core::daemon_protocol::WatchAction::Start],
+        "the registered docs_control closure must have been called exactly once, with Start"
+    );
+
+    assert!(
+        !handle.is_finished(),
+        "a Docs-role watch-control request must not end the coordinator loop"
+    );
+
+    stop_tx.send(()).unwrap();
+    handle.join().unwrap().unwrap();
+}
+
+/// The other half of `WatchRole::Docs` coverage: with no `docs_control`
+/// registered (`None` passed to `run_write_coordinator`, matching a caller
+/// that never wired up doc-watching), the request must come back as an
+/// explicit error rather than silently doing nothing -- and must not end
+/// the loop either.
+#[test]
+fn watch_control_docs_role_without_a_registered_control_replies_with_an_error() {
+    let project = tempfile::Builder::new()
+        .prefix("infigraph-watch-control-docs-none-test-")
+        .tempdir()
+        .unwrap();
+    std::fs::write(project.path().join("main.py"), "def main():\n    pass\n").unwrap();
+
+    {
+        let registry = infigraph_languages::bundled_registry().unwrap();
+        let mut boot = infigraph_core::Infigraph::open(project.path(), registry).unwrap();
+        boot.init().unwrap();
+        boot.index().unwrap();
+    }
+
+    let daemon_token = tokio_util::sync::CancellationToken::new();
+    let token_for_thread = daemon_token.clone();
+
+    let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+    let root = project.path().to_path_buf();
+    let handle = std::thread::spawn(move || {
+        infigraph_core::watch::run_write_coordinator(
+            &root,
+            || Ok(infigraph_languages::bundled_registry().unwrap()),
+            50, // debounce_ms
+            stop_rx,
+            |_evt| {},
+            0,
+            None::<fn(&infigraph_core::IndexResult)>,
+            true, // serve_requests
+            None,
+            &token_for_thread,
+            None, // no docs_control registered
+        )
+    });
+
+    std::thread::sleep(std::time::Duration::from_millis(300));
+
+    let requests_dir = project.path().join(".infigraph").join("requests");
+    let request_path = requests_dir.join("watch-control-docs-none-test.request");
+    let result_path = requests_dir.join("watch-control-docs-none-test.result");
+    infigraph_core::daemon_protocol::write_atomic(
+        &request_path,
+        &serde_json::to_string(
+            &infigraph_core::daemon_protocol::WriteRequest::WatchControl {
+                role: infigraph_core::daemon_protocol::WatchRole::Docs,
+                action: infigraph_core::daemon_protocol::WatchAction::Stop,
+            },
+        )
+        .unwrap(),
+    )
+    .unwrap();
+
+    let mut replied = false;
+    for _ in 0..150 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        if result_path.exists() {
+            replied = true;
+            break;
+        }
+    }
+    assert!(replied, "expected a reply to WatchControl {{ Docs, Stop }}");
+    let reply: infigraph_core::daemon_protocol::WriteResult =
+        serde_json::from_str(&std::fs::read_to_string(&result_path).unwrap()).unwrap();
+    match &reply {
+        infigraph_core::daemon_protocol::WriteResult::Err { message } => {
+            assert!(
+                message.contains("does not own a doc-watch loop"),
+                "unexpected error message: {message}"
+            );
+        }
+        other => panic!("expected WriteResult::Err with no docs_control registered, got {other:?}"),
+    }
+
+    assert!(
+        !handle.is_finished(),
+        "a Docs-role watch-control request with no registered control must not end the loop"
+    );
+
+    stop_tx.send(()).unwrap();
+    handle.join().unwrap().unwrap();
+}

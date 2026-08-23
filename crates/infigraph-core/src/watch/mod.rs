@@ -313,7 +313,15 @@ where
         Arc::clone(&queue),
         Arc::clone(&on_event_shared),
     )?;
-    code_watch.start();
+    // Honor the persisted enable/disable policy on every start of this
+    // loop (fresh daemon, crash-restart, `daemon-restart`) -- not just when
+    // spawning a new daemon. Without this gate, `watch disable` stops a
+    // *live* daemon's code-watching but a restart silently resumes it,
+    // since the policy previously only gated whether a daemon got spawned
+    // at all, never what an already-running one does once it's up.
+    if config::watch_enabled_at(root, "watch") {
+        code_watch.start();
+    }
 
     // Drains run here instead of inline so a large one (a whole-project
     // reindex can take minutes) doesn't stop this loop from accepting

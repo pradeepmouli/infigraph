@@ -431,7 +431,14 @@ pub(crate) fn cmd_daemon(root: &Path, debounce: u64) -> Result<()> {
         root.to_path_buf(),
         debounce,
     )));
-    doc_watch.lock().unwrap().start();
+    // Honor the persisted enable/disable policy on every daemon start
+    // (fresh daemon, crash-restart, `daemon-restart`) -- mirrors the
+    // equivalent gate on `code_watch.start()` in `run_write_coordinator`.
+    // Without it, `watch-docs disable` stops a *live* daemon's doc-watching
+    // but a restart silently resumes it.
+    if infigraph_core::watch::config::watch_enabled_at(root, "watch_docs") {
+        doc_watch.lock().unwrap().start();
+    }
 
     // Lets `WatchControl { role: Docs, .. }` requests reach this thread from
     // the coordinator, which lives in infigraph-core and knows nothing about
@@ -524,14 +531,16 @@ pub(crate) fn cmd_daemon(root: &Path, debounce: u64) -> Result<()> {
     Ok(())
 }
 
-/// The daemon's doc-watch thread and the shutdown flag it polls, bundled so
-/// a `WatchControl { role: Docs, .. }` request can stop and restart it. Each
-/// start gets a *fresh* flag: `watch_docs_daemon_loop` only ever reads it,
-/// and a reused one would still be latched at `true` from the last stop.
+/// The daemon's doc-watch thread and the shutdown/resume flags it polls,
+/// bundled so a `WatchControl { role: Docs, .. }` request can stop and
+/// restart it. Each start gets *fresh* flags: `watch_docs_daemon_loop` only
+/// ever reads them, and reused ones would still be latched from the last
+/// stop/resume.
 struct DocWatchThread {
     root: std::path::PathBuf,
     debounce: u64,
     shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    resume: std::sync::Arc<std::sync::atomic::AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -541,20 +550,36 @@ impl DocWatchThread {
             root,
             debounce,
             shutdown: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            resume: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             handle: None,
         }
     }
 
     fn start(&mut self) {
-        if self.handle.is_some() {
+        // A self-terminated loop (panic; mirrors `CodeWatch::start()`'s
+        // `is_finished()` guard, commit c9dae4b) must be respawned rather
+        // than silently no-op'd forever.
+        if self.handle.as_ref().is_some_and(|h| !h.is_finished()) {
+            // Still running -- but it may be alive-and-suppressed (parked
+            // after an explicit stop via `.infigraph/watch.stop.docs`,
+            // which `watch_docs_daemon_loop` consumes without exiting the
+            // thread). An explicit Start/Enable must be able to un-suppress
+            // that, not silently no-op just because a thread happens to
+            // exist -- see `resume`'s doc comment on `watch_docs_daemon_loop`.
+            self.resume
+                .store(true, std::sync::atomic::Ordering::Relaxed);
             return;
         }
+        self.handle.take();
         self.shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.resume = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let root = self.root.clone();
         let debounce = self.debounce;
         let shutdown = std::sync::Arc::clone(&self.shutdown);
+        let resume = std::sync::Arc::clone(&self.resume);
         self.handle = Some(std::thread::spawn(move || {
-            if let Err(e) = infigraph_docs::watch::watch_docs_daemon_loop(&root, debounce, shutdown)
+            if let Err(e) =
+                infigraph_docs::watch::watch_docs_daemon_loop(&root, debounce, shutdown, resume)
             {
                 eprintln!("[doc-watch-daemon] error: {e}");
             }
@@ -1543,7 +1568,7 @@ mod daemon_liveness_guard_tests {
     }
 
     /// End-to-end: `cmd_watch_control(Disable)` must actually persist to
-    /// `config.toml`, readable back via `watch_enabled` -- closes Task 12's
+    /// `config.toml`, readable back via `watch_enabled_at` -- closes Task 12's
     /// stubbed `write_watch_policy_to_config` (which returned `Ok(())` and
     /// wrote nothing, so the above test passed against the stub too; this
     /// one fails against it).
