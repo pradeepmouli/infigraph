@@ -188,7 +188,7 @@ pub(crate) fn ensure_daemon_watcher(
     root: &std::path::Path,
     section: &str,
 ) -> Result<infigraph_core::watch::daemon::DaemonStartOutcome> {
-    if !infigraph_core::watch::config::watch_enabled(section) {
+    if !infigraph_core::watch::config::watch_enabled_at(root, section) {
         return Ok(infigraph_core::watch::daemon::DaemonStartOutcome::AlreadyRunning);
     }
     let mcp_exe = std::env::current_exe().context("could not resolve current executable")?;
@@ -263,7 +263,7 @@ pub fn tool_watch_project(args: &Value) -> Result<String> {
     // primary/secondary gating, letting a competing in-process watcher race
     // a properly daemon-spawned one for the same repo's index.lock (or start
     // one the user explicitly asked infigraph to keep off).
-    if !infigraph_core::watch::config::watch_enabled("watch") {
+    if !infigraph_core::watch::config::watch_enabled_at(&root, "watch") {
         return Ok(format!(
             "Not starting a watcher for {root_str}: code-watching is disabled \
              (infigraph watch enable to turn it back on)."

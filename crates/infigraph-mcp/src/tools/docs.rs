@@ -67,13 +67,13 @@ fn auto_start_doc_watch_inner(path: &str, skip_disabled_check: bool) -> Option<S
     if is_remote_mode() {
         return None;
     }
-    if !infigraph_core::watch::config::watch_enabled("watch_docs") {
+    let root = std::path::PathBuf::from(path).canonicalize().ok()?;
+    if !infigraph_core::watch::config::watch_enabled_at(&root, "watch_docs") {
         return None;
     }
     if !skip_disabled_check && super::watch::watchers_disabled() {
         return None;
     }
-    let root = std::path::PathBuf::from(path).canonicalize().ok()?;
     let root_str = root.to_string_lossy().replace('\\', "/");
 
     if is_doc_watching(&root_str) {
@@ -584,7 +584,7 @@ pub fn tool_watch_docs(args: &Value) -> Result<String> {
     // does — without this, a direct watch_docs call bypasses the persisted
     // enable/disable policy (auto_start_doc_watch_inner already checks it,
     // but that only covers the opportunistic path, not this explicit one).
-    if !infigraph_core::watch::config::watch_enabled("watch_docs") {
+    if !infigraph_core::watch::config::watch_enabled_at(&root, "watch_docs") {
         return Ok(format!(
             "Not starting a doc watcher for {root_str}: doc-watching is disabled \
              (infigraph watch-docs enable to turn it back on)."

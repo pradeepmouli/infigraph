@@ -84,7 +84,6 @@ pub fn collect_reindex_targets(
 pub fn start_daemon_watcher_for_startup_dir(startup_dir: Option<&Path>) {
     if !infigraph_core::daemon_backend_selected()
         || !crate::session_context::auto_start_watch_on_boot_enabled()
-        || !infigraph_core::watch::config::watch_enabled("watch")
     {
         return;
     }
@@ -92,6 +91,9 @@ pub fn start_daemon_watcher_for_startup_dir(startup_dir: Option<&Path>) {
     let Some(dir) = startup_dir else {
         return;
     };
+    if !infigraph_core::watch::config::watch_enabled_at(dir, "watch") {
+        return;
+    }
     // Must be a directory that's actually been indexed -- mirrors
     // `collect_reindex_targets`'s own guard, for the same reason: a fresh,
     // never-indexed cwd has no `.infigraph/watch.lock` home for a daemon to

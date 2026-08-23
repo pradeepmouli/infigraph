@@ -944,8 +944,8 @@ pub(crate) enum WorktreeAction {
 /// name. `ScipEnrich` is excluded too: it's a hidden internal command
 /// `cmd_index` itself spawns as a background subprocess, so the parent
 /// `index` invocation has already triggered auto-watch.
-pub(crate) fn should_auto_watch(command: &Commands) -> bool {
-    if !infigraph_core::watch::config::watch_enabled("watch") {
+pub(crate) fn should_auto_watch(command: &Commands, root: &Path) -> bool {
+    if !infigraph_core::watch::config::watch_enabled_at(root, "watch") {
         return false;
     }
     matches!(
@@ -971,7 +971,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let root = cli.root.unwrap_or_else(|| PathBuf::from("."));
 
-    let should_auto_watch = should_auto_watch(&cli.command);
+    let should_auto_watch = should_auto_watch(&cli.command, &root);
 
     let result = std::thread::Builder::new()
         .stack_size(32 * 1024 * 1024)
@@ -1299,84 +1299,127 @@ mod tests {
     #[test]
     fn should_auto_watch_allows_only_source_ingesting_commands() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        assert!(should_auto_watch(&Commands::Index {
-            full: false,
-            no_embed: false,
-        }));
-        assert!(should_auto_watch(&Commands::IndexDocs));
-        assert!(should_auto_watch(&Commands::ReindexDocs));
-        assert!(should_auto_watch(&Commands::IndexManifests));
-        assert!(should_auto_watch(&Commands::ScipImport {
-            index: PathBuf::from("index.scip"),
-        }));
-        assert!(should_auto_watch(&Commands::IndexConfluence {
-            base_url: String::new(),
-            space: String::new(),
-            page_ids: None,
-            pat: None,
-            email: None,
-            api_token: None,
-            follow_links: false,
-            follow_depth: 1,
-            max_pages: 100,
-        }));
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        assert!(should_auto_watch(
+            &Commands::Index {
+                full: false,
+                no_embed: false,
+            },
+            root
+        ));
+        assert!(should_auto_watch(&Commands::IndexDocs, root));
+        assert!(should_auto_watch(&Commands::ReindexDocs, root));
+        assert!(should_auto_watch(&Commands::IndexManifests, root));
+        assert!(should_auto_watch(
+            &Commands::ScipImport {
+                index: PathBuf::from("index.scip"),
+            },
+            root
+        ));
+        assert!(should_auto_watch(
+            &Commands::IndexConfluence {
+                base_url: String::new(),
+                space: String::new(),
+                page_ids: None,
+                pat: None,
+                email: None,
+                api_token: None,
+                follow_links: false,
+                follow_depth: 1,
+                max_pages: 100,
+            },
+            root
+        ));
     }
 
     #[test]
     fn should_auto_watch_excludes_read_only_and_management_commands() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
         // A representative sample, not exhaustive: read-only queries,
         // process/lifecycle management, and the two commands whose own
         // handlers already trigger watching more precisely than this
         // top-level gate could (see should_auto_watch's doc comment).
-        assert!(!should_auto_watch(&Commands::Search {
-            query: String::new(),
-            limit: 10,
-            alpha: 0.3,
-        }));
-        assert!(!should_auto_watch(&Commands::Stats));
-        assert!(!should_auto_watch(&Commands::Callers {
-            symbol: String::new(),
-        }));
-        assert!(!should_auto_watch(&Commands::Callees {
-            symbol: String::new(),
-        }));
-        assert!(!should_auto_watch(&Commands::DeadCode));
-        assert!(!should_auto_watch(&Commands::Impact {
-            symbol: String::new(),
-            depth: 3,
-        }));
-        assert!(!should_auto_watch(&Commands::Daemon { debounce: 500 }));
-        assert!(!should_auto_watch(&Commands::WatchStop));
-        assert!(!should_auto_watch(&Commands::WatchStatus));
-        assert!(!should_auto_watch(&Commands::DaemonStop));
-        assert!(!should_auto_watch(&Commands::DaemonRestart));
-        assert!(!should_auto_watch(&Commands::Watch {
-            action: WatchCliAction::Start,
-        }));
-        assert!(!should_auto_watch(&Commands::WatchDocs {
-            action: WatchCliAction::Start,
-        }));
-        assert!(!should_auto_watch(&Commands::Delete));
-        assert!(!should_auto_watch(&Commands::Update));
-        assert!(!should_auto_watch(&Commands::Init {
-            group: None,
-            quick: false,
-            yes: false,
-        }));
-        assert!(!should_auto_watch(&Commands::ScipEnrich {
-            languages: String::new(),
-        }));
+        assert!(!should_auto_watch(
+            &Commands::Search {
+                query: String::new(),
+                limit: 10,
+                alpha: 0.3,
+            },
+            root
+        ));
+        assert!(!should_auto_watch(&Commands::Stats, root));
+        assert!(!should_auto_watch(
+            &Commands::Callers {
+                symbol: String::new(),
+            },
+            root
+        ));
+        assert!(!should_auto_watch(
+            &Commands::Callees {
+                symbol: String::new(),
+            },
+            root
+        ));
+        assert!(!should_auto_watch(&Commands::DeadCode, root));
+        assert!(!should_auto_watch(
+            &Commands::Impact {
+                symbol: String::new(),
+                depth: 3,
+            },
+            root
+        ));
+        assert!(!should_auto_watch(
+            &Commands::Daemon { debounce: 500 },
+            root
+        ));
+        assert!(!should_auto_watch(&Commands::WatchStop, root));
+        assert!(!should_auto_watch(&Commands::WatchStatus, root));
+        assert!(!should_auto_watch(&Commands::DaemonStop, root));
+        assert!(!should_auto_watch(&Commands::DaemonRestart, root));
+        assert!(!should_auto_watch(
+            &Commands::Watch {
+                action: WatchCliAction::Start,
+            },
+            root
+        ));
+        assert!(!should_auto_watch(
+            &Commands::WatchDocs {
+                action: WatchCliAction::Start,
+            },
+            root
+        ));
+        assert!(!should_auto_watch(&Commands::Delete, root));
+        assert!(!should_auto_watch(&Commands::Update, root));
+        assert!(!should_auto_watch(
+            &Commands::Init {
+                group: None,
+                quick: false,
+                yes: false,
+            },
+            root
+        ));
+        assert!(!should_auto_watch(
+            &Commands::ScipEnrich {
+                languages: String::new(),
+            },
+            root
+        ));
         // Group's own GroupAction::Index already calls
         // ensure_watcher_running per member repo -- this top-level gate
         // must stay out of the way regardless of which action is requested.
-        assert!(!should_auto_watch(&Commands::Group {
-            action: GroupAction::Query {
-                group: String::new(),
-                cypher: String::new(),
-                combined: false,
+        assert!(!should_auto_watch(
+            &Commands::Group {
+                action: GroupAction::Query {
+                    group: String::new(),
+                    cypher: String::new(),
+                    combined: false,
+                },
             },
-        }));
+            root
+        ));
     }
 
     /// With the persisted watch policy disabled, `should_auto_watch` must
@@ -1386,11 +1429,39 @@ mod tests {
     #[test]
     fn should_auto_watch_respects_watch_enabled_policy() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
         std::env::set_var("INFIGRAPH_WATCH_ENABLED", "0");
-        assert!(!should_auto_watch(&Commands::Index {
-            full: false,
-            no_embed: false,
-        }));
+        assert!(!should_auto_watch(
+            &Commands::Index {
+                full: false,
+                no_embed: false,
+            },
+            tmp.path()
+        ));
         std::env::remove_var("INFIGRAPH_WATCH_ENABLED");
+    }
+
+    /// Regression for the read/write root mismatch: `should_auto_watch` must
+    /// consult the *given* root's persisted policy, not a cwd-based lookup --
+    /// `infigraph --root /project watch disable` run from an unrelated cwd
+    /// must still suppress auto-watch for `/project`.
+    #[test]
+    fn should_auto_watch_respects_policy_written_for_the_given_root() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("INFIGRAPH_WATCH_ENABLED");
+        let tmp = tempfile::tempdir().unwrap();
+        infigraph_core::watch::config::write_watch_policy(
+            tmp.path(),
+            infigraph_core::daemon_protocol::WatchRole::Code,
+            false,
+        )
+        .unwrap();
+        assert!(!should_auto_watch(
+            &Commands::Index {
+                full: false,
+                no_embed: false,
+            },
+            tmp.path()
+        ));
     }
 }
