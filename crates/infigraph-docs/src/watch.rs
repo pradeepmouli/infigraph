@@ -177,6 +177,16 @@ pub fn watch_docs_daemon_loop(
             poll,
             move |stop_rx| watch_docs(&root_owned, debounce_ms, stop_rx, "doc-watch-daemon"),
         );
+        if suppressed_until_absent {
+            // A `resume` armed at any point during the attached session just
+            // finished (e.g. a `start()` call while already watching, which
+            // is semantically a no-op) must not be allowed to immediately
+            // cancel the suppression that session's own explicit stop just
+            // requested -- only a resume arriving *after* suppression begins
+            // should count. The store above (before the attach) already
+            // covers the not-yet-attached case; this covers the other one.
+            resume.store(false, Ordering::Relaxed);
+        }
     }
 }
 
@@ -532,6 +542,70 @@ mod tests {
         assert!(
             chunks > 0,
             "resume must re-attach the suppressed loop and pick up a post-resume doc change"
+        );
+
+        shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+        handle.join().unwrap().unwrap();
+        clear_fast_poll();
+    }
+
+    /// Regression for a defect introduced by the fix above: a `resume`
+    /// armed while the loop is attached and running (a `start()`/`enable`
+    /// call arriving when doc-watching is already live -- semantically a
+    /// no-op) must NOT be allowed to silently cancel the *next* explicit
+    /// stop. Before this test's fix, the stale `resume` was consumed the
+    /// instant suppression began (on the suppressed branch's first tick),
+    /// undoing the stop the user just issued.
+    #[test]
+    fn a_resume_armed_while_attached_does_not_cancel_the_next_explicit_stop() {
+        set_fast_poll();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join(".infigraph")).unwrap();
+        crate::DocIndex::open(&root).unwrap().init().unwrap();
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_clone = Arc::clone(&shutdown);
+        let resume = Arc::new(AtomicBool::new(false));
+        let resume_clone = Arc::clone(&resume);
+        let root_clone = root.clone();
+        let handle = std::thread::spawn(move || {
+            watch_docs_daemon_loop(&root_clone, 50, shutdown_clone, resume_clone)
+        });
+
+        // Let it attach.
+        std::thread::sleep(Duration::from_millis(100));
+
+        // Arm resume WHILE ATTACHED -- this is the no-op `start()` call the
+        // bug is about. Nothing should observe this until a future
+        // suppression, and even then it must not count.
+        resume.store(true, std::sync::atomic::Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(50));
+
+        // Now request an explicit stop, same as the sibling test.
+        std::fs::write(root.join(".infigraph").join("watch.stop.docs"), b"").unwrap();
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(
+            !root.join(".infigraph").join("watch.stop.docs").exists(),
+            "sentinel must still be consumed (removed) once acted on"
+        );
+
+        // The stop must STICK -- a doc written now must not be indexed,
+        // even though `resume` was armed earlier during the attached
+        // session. Give it the same margin as the sibling negative-result
+        // test, since a false pass here only shows up as a slow leak, not
+        // an immediate error.
+        std::fs::write(
+            root.join("after-stale-resume-stop.md"),
+            "# must not be indexed -- the stale resume must not have cancelled this stop",
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            chunk_count(&root),
+            0,
+            "an explicit stop must not be silently cancelled by a resume signal armed \
+             earlier during the attached session (a no-op start() call while already watching)"
         );
 
         shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
