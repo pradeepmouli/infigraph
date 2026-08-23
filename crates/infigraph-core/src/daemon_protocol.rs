@@ -118,9 +118,11 @@ pub enum WriteRequest {
 pub enum WatchRole {
     Code,
     Docs,
-    /// Full-process stop/restart -- replaces the undecorated `watch.stop`
-    /// sentinel's role (see docs/superpowers/specs/2026-08-21-daemon-watch-
-    /// command-split-design.md, "Crossing the process boundary").
+    /// Full-process stop/restart -- a per-role alternative to the
+    /// undecorated `watch.stop` sentinel, which remains the mechanism the
+    /// legacy `watch-stop` CLI alias and `worktree_commands.rs` use (see
+    /// docs/superpowers/specs/2026-08-21-daemon-watch-command-split-design.md,
+    /// "Crossing the process boundary").
     Daemon,
 }
 

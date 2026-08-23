@@ -2475,6 +2475,23 @@ Constraints), so a bridged `tokio::sync::mpsc` receiver has no `select!` arm to 
 
 ---
 
+### Task 19: Non-daemon producer reap gap, and no paused-state observability (deferred out of the final-review fix pass)
+
+**Files:** `crates/infigraph-mcp/src/tools/watch.rs`, `crates/infigraph-cli/src/group_commands.rs`, `crates/infigraph-mcp/src/tools/watch.rs` (`tool_get_watch_status`), `crates/infigraph-core/src/watch/config.rs`
+
+The final whole-branch review of this plan (`.superpowers/sdd/2026-08-21-daemon-watch-command-split/final-review-report.md`) found two real, narrower gaps that the fix pass (`final-fix1-report.md`) deliberately did not address, per the review's own "reasonable follow-ups if you would rather not grow the branch further" framing. Both are genuine and should be picked up here rather than re-derived from scratch.
+
+**Gap A — the coordinator never reaps a self-terminated producer on the two non-daemon callers.** `CodeWatch::start()`'s `is_some_and(|t| !t.is_finished())` guard (commit `c9dae4b`) fixed this for `run_write_coordinator`'s own in-process code-watch task. But the two callers that spin up a watcher thread *outside* that coordinator — `crates/infigraph-mcp/src/tools/watch.rs`'s `tool_watch_project` (the in-process, non-daemon-mode spawned thread that calls `infigraph_core::watch::watch_project`/`watch_project_auto_resolve` and removes itself from `WATCHERS` only when that call returns), and `crates/infigraph-cli/src/group_commands.rs`'s equivalent per-member-repo watcher spawn — never got the same treatment. Before this plan, `watch_project` could return on permanent watcher death (restart budget exhausted, `WatchEventKind::WatcherDied`), and the caller's thread would exit and clean up its own `WATCHERS`/status entry. Check whether that invariant still holds after this plan's producer-split changes; if a watcher can now die permanently while its owning thread keeps blocking on something else (or the thread exits but nothing notices for a status-reporting purpose), `WATCHERS`/status tracking can leak a phantom "still running" entry after 3+ restart-budget-exhausted failures. Root-cause the exact current behavior first (read `tool_watch_project`'s and the group-commands watcher's current code against `WatchEventKind::WatcherDied`'s handling) before assuming the fix — it may already self-heal via the thread's own cleanup path, in which case this task is a verification + regression test, not a behavior change.
+
+**Gap B — no way to observe the new paused state.** `watch-status`/`get_watch_status` (`crates/infigraph-mcp/src/tools/watch.rs::tool_get_watch_status`) still only reports daemon-process liveness (is `watch.lock` held by a live PID), not per-role code/docs running-vs-paused-vs-disabled state. After this plan, a role can be in at least three states a caller might reasonably want to distinguish: actively running, explicitly disabled (persisted policy, see `watch::config::watch_enabled_at`), or paused/suppressed (e.g. the doc-watch sentinel-suppression state fixed in the final-fix1 pass, or a code-watch task that's been stopped via `WatchControl` but not disabled). Extend `tool_get_watch_status`'s output (and its CLI counterpart `cmd_watch_status`) to surface this distinction — the persisted policy is already readable via `watch_enabled_at`; the live running/paused distinction likely needs a small addition to `CodeWatch`/`DocWatchThread`'s public surface (e.g. an `is_running()` or `state()` accessor) rather than inferring it from outside.
+
+- [ ] **Step 1:** Root-cause Gap A: confirm whether `tool_watch_project`'s and `group_commands.rs`'s watcher threads still clean up `WATCHERS`/status on a permanent watcher death after this plan's changes, or whether that invariant broke. Write the finding down before touching code.
+- [ ] **Step 2:** If Gap A is real, fix the leak (either restore the old self-cleanup guarantee, or add an explicit `is_finished()`-style check at the relevant status-reporting call sites) and add a regression test pinning it.
+- [ ] **Step 3:** Design and add running/paused/disabled state exposure to `get_watch_status`/`cmd_watch_status` for Gap B, covering both `WatchRole::Code` and `WatchRole::Docs`.
+- [ ] **Step 4:** Add tests covering the new status output for at least: running, explicitly disabled via policy, and paused (stopped without disabling).
+
+---
+
 ## Self-Review
 
 **Spec coverage:**
