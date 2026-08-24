@@ -76,11 +76,16 @@ fn read_healthy_size(infigraph_dir: &Path) -> Option<u64> {
 }
 
 /// Refreshes the recorded "last known healthy size" baseline. Call this
-/// after any write that completes successfully (the same call sites that
-/// call `check_graph_growth_ratio` before the write), so the baseline
-/// tracks legitimate growth over time rather than freezing at whatever size
-/// the graph happened to be the first time this feature ran.
-pub(crate) fn stamp_healthy_graph_size(infigraph_dir: &Path, graph_path: &Path) {
+/// only after a *verified* healthy checkpoint -- a completed full rebuild
+/// (build-fresh-then-swap succeeded and the swapped-in graph reopened), not
+/// after an ordinary incremental write. Stamping on every incremental
+/// success would let the baseline ratchet forward with the same
+/// sub-threshold growth `check_graph_growth_ratio` exists to catch --
+/// successive writes each just under the cap could grow the graph without
+/// bound while every individual preflight passes (adversarial review
+/// finding on R3.1.4). `pub` (not `pub(crate)`): the CLI's non-daemon full
+/// reindex is the one call site outside this crate.
+pub fn stamp_healthy_graph_size(infigraph_dir: &Path, graph_path: &Path) {
     let Ok(meta) = std::fs::metadata(graph_path) else {
         return; // nothing written yet -- nothing to stamp
     };
@@ -91,19 +96,43 @@ pub(crate) fn stamp_healthy_graph_size(infigraph_dir: &Path, graph_path: &Path) 
     );
 }
 
+/// Bootstraps the baseline exactly once, after a project's very first
+/// successful write -- a no-op once any baseline already exists. Call this
+/// (unconditionally, it's cheap) after every ordinary write, alongside the
+/// preflight `check_graph_growth_ratio` call before it.
+///
+/// This exists because `check_graph_growth_ratio`'s own "no baseline yet"
+/// branch runs as a *preflight*, before the write it's guarding -- for a
+/// project's first-ever write, that captures the graph's pre-write (bare
+/// schema, no data) size, not what the graph actually looks like once
+/// healthy. Left uncorrected, that undersized baseline makes the *next*
+/// legitimate operation -- including a verified full rebuild -- look like
+/// runaway growth and get spuriously refused. This helper lets the first
+/// real post-write size win instead, without re-stamping (and so ratcheting)
+/// on every write after that, the way the removed unconditional per-write
+/// stamp used to.
+pub(crate) fn stamp_healthy_graph_size_if_unset(infigraph_dir: &Path, graph_path: &Path) {
+    if read_healthy_size(infigraph_dir).is_none() {
+        stamp_healthy_graph_size(infigraph_dir, graph_path);
+    }
+}
+
 /// Circuit breaker against the runaway-WAL-growth pattern from #100 (a live
 /// graph observed growing 40-70x its healthy size before crashing). This is
 /// NOT a fix for the underlying cause (why Kuzu's WAL isn't checkpointing
 /// under the observed workloads) -- only a refusal before a write can push
-/// the graph further into that pattern. The first call for a given
-/// `infigraph_dir` establishes the baseline rather than refusing -- there's
-/// nothing to compare against yet.
+/// the graph further into that pattern. Passes rather than refuses when no
+/// baseline exists yet -- there's nothing to compare against -- but
+/// deliberately does NOT establish one itself: this runs as a *preflight*,
+/// before the write it guards, so stamping here would capture the graph's
+/// pre-write size. `stamp_healthy_graph_size_if_unset`, called by the same
+/// write paths *after* their write completes, is what actually bootstraps
+/// the first real baseline.
 pub(crate) fn check_graph_growth_ratio(
     infigraph_dir: &Path,
     graph_path: &Path,
 ) -> Result<(), String> {
     let Some(healthy) = read_healthy_size(infigraph_dir) else {
-        stamp_healthy_graph_size(infigraph_dir, graph_path);
         return Ok(());
     };
     let Ok(meta) = std::fs::metadata(graph_path) else {
@@ -379,17 +408,38 @@ pub fn classify_file(file: &str) -> &'static str {
 mod tests {
     use super::{
         check_disk_headroom, check_graph_growth_ratio, classify_file, extract_bad_copy_value,
-        resolve_import_candidate, stamp_healthy_graph_size,
+        read_healthy_size, resolve_import_candidate, stamp_healthy_graph_size,
+        stamp_healthy_graph_size_if_unset,
     };
 
     #[test]
-    fn growth_check_establishes_a_baseline_on_first_call_rather_than_refusing() {
+    fn growth_check_passes_rather_than_refuses_with_no_baseline_yet() {
         let tmp = tempfile::tempdir().unwrap();
         let graph_path = tmp.path().join("graph");
         std::fs::write(&graph_path, vec![0u8; 1024]).unwrap();
 
+        // Deliberately does NOT establish a baseline itself -- this is a
+        // preflight, run before the write it guards, so stamping here would
+        // capture the pre-write size. See `stamp_healthy_graph_size_if_unset`.
         assert!(check_graph_growth_ratio(tmp.path(), &graph_path).is_ok());
-        assert!(tmp.path().join("graph.health.json").exists());
+        assert!(!tmp.path().join("graph.health.json").exists());
+    }
+
+    #[test]
+    fn stamp_if_unset_establishes_a_baseline_once_and_never_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let graph_path = tmp.path().join("graph");
+        std::fs::write(&graph_path, vec![0u8; 1024]).unwrap();
+
+        stamp_healthy_graph_size_if_unset(tmp.path(), &graph_path);
+        assert_eq!(read_healthy_size(tmp.path()), Some(1024));
+
+        // A later call must not overwrite an already-established baseline --
+        // that's the unconditional `stamp_healthy_graph_size`'s job, called
+        // only at a verified full-rebuild checkpoint.
+        std::fs::write(&graph_path, vec![0u8; 999_999]).unwrap();
+        stamp_healthy_graph_size_if_unset(tmp.path(), &graph_path);
+        assert_eq!(read_healthy_size(tmp.path()), Some(1024));
     }
 
     #[test]

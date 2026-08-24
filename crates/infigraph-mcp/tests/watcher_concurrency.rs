@@ -640,3 +640,37 @@ fn search_degrades_to_the_previous_snapshot_and_banners_it() {
         "expected a degrade banner, got: {out}"
     );
 }
+
+// Regression test (adversarial review of R3.1.4): the search-result cache
+// key is embeddings.bin's mtime, which a crash on the *graph* database
+// does not touch. A naive cache-hit check would keep serving the warm
+// in-memory result forever and never call open_read_only_or_degrade --
+// so no quarantine or recovery sentinel would ever get created.
+#[test]
+fn search_still_detects_a_crash_even_when_the_cache_is_warm() {
+    let _guard = WATCHER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _cleanup = WatcherCleanup;
+    stop_all_watchers();
+    init_watchers();
+    let (_dir, path) = make_project(&[("lib.py", "def compute(): return 42")]);
+    tool_index_project(&json!({"path": &path})).unwrap();
+    stop_all_watchers();
+
+    // Warm the cache with a healthy search first.
+    let out = tool_search(&json!({"path": &path, "query": "compute"})).unwrap();
+    assert!(
+        !out.contains("pre-crash snapshot"),
+        "must not degrade on a healthy first search: {out}"
+    );
+
+    // Simulate a crash without touching embeddings.bin -- the cache key
+    // search relies on is untouched, so a naive cache-hit check alone
+    // would never notice.
+    demote_live_graph_to_previous_and_seed_dead_holder_wal(&path);
+
+    let out = tool_search(&json!({"path": &path, "query": "compute"})).unwrap();
+    assert!(
+        out.contains("pre-crash snapshot"),
+        "a warm cache must still detect and surface a crash on the next search, got: {out}"
+    );
+}

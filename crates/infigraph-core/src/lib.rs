@@ -304,6 +304,30 @@ impl Infigraph {
                         self.backend_kind = BackendKind::Kuzu(kb);
                         Ok(())
                     } else {
+                        // R3.1.4d/#100: this write-mode auto-recovery independently
+                        // wipes and rebuilds a persistently-unopenable graph -- route
+                        // it through the same crash-loop bookkeeping the
+                        // read-triggered path (`open_read_only_or_degrade`) uses, so
+                        // a daemon-restart crash-rebuild cascade reaching this path on
+                        // its first queued write (before any read ever creates that
+                        // path's sentinel) still trips the breaker. Mirrors
+                        // `recovery::drain_recovery_sentinel`'s check-then-record
+                        // sequence (adversarial review finding).
+                        let infigraph_dir = self.db_path.parent().unwrap_or(&self.root);
+                        let attempts = crate::recovery::recent_recovery_attempts(infigraph_dir)
+                            .unwrap_or_default();
+                        if attempts.len() >= crate::recovery::CRASH_LOOP_THRESHOLD {
+                            let _ =
+                                crate::recovery::write_crash_loop_marker(infigraph_dir, &attempts);
+                            anyhow::bail!(
+                                "crash-loop detected: {} auto-rebuild attempts within the last \
+                                 hour -- refusing further automatic rebuilds. Investigate the \
+                                 underlying cause, then delete {} to reset and retry manually \
+                                 with `infigraph index --full`.",
+                                attempts.len(),
+                                crate::recovery::crash_loop_marker_path(infigraph_dir).display(),
+                            );
+                        }
                         eprintln!(
                             "[graph] open failed after {} attempts ({last_err}), wiping \
                              corrupt graph and rebuilding...",
@@ -315,6 +339,7 @@ impl Infigraph {
                         let kb = graph::KuzuBackend::open(&self.db_path).with_context(|| {
                             format!("graph still unreadable after wipe (was: {last_err})")
                         })?;
+                        let _ = crate::recovery::record_recovery_attempt(infigraph_dir);
                         self.backend_kind = BackendKind::Kuzu(kb);
                         Ok(())
                     }
@@ -1363,6 +1388,54 @@ mod tests {
             !db_path.exists() || GraphStore::open(&db_path).is_ok(),
             "the live db_path must either be gone or be the freshly rebuilt, openable database \
              -- never the old corrupt content left in place"
+        );
+    }
+
+    /// Regression test (adversarial review of R3.1.4): `init()`'s own
+    /// wipe-and-rebuild recovery (used above) independently retries,
+    /// quarantines, and rebuilds a persistently-unopenable graph -- but
+    /// never checked the crash-loop marker or recorded an attempt. A
+    /// restarted daemon reaching this path on its first queued write (before
+    /// any *read* ever creates the sentinel `open_read_only_or_degrade`'s
+    /// breaker watches) could repeat the crash-restart-rebuild cascade
+    /// forever without ever tripping it.
+    #[test]
+    fn init_trips_the_crash_loop_breaker_after_repeated_wipe_and_rebuild_cycles() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path();
+        let db_path = root.join(".infigraph").join("graph");
+
+        // The first two persistent-corruption-then-init cycles must each
+        // recover normally, exactly as `init_quarantines_instead_of_deleting_on_persistent_corruption`
+        // exercises in isolation -- CRASH_LOOP_THRESHOLD is 2.
+        for cycle in 0..2 {
+            {
+                let _store = GraphStore::open(&db_path).unwrap();
+            }
+            std::fs::write(&db_path, b"not a valid kuzu database file at all").unwrap();
+
+            let mut ig = Infigraph::open(root, LanguageRegistry::new()).unwrap();
+            let result = ig.init();
+            assert!(
+                result.is_ok(),
+                "cycle {cycle}: the first two wipe-and-rebuild cycles must still recover: {result:?}"
+            );
+        }
+
+        // A third occurrence within the crash-loop window must be refused
+        // instead of wiping and rebuilding yet again.
+        {
+            let _store = GraphStore::open(&db_path).unwrap();
+        }
+        std::fs::write(&db_path, b"not a valid kuzu database file at all").unwrap();
+
+        let mut ig = Infigraph::open(root, LanguageRegistry::new()).unwrap();
+        let err = ig
+            .init()
+            .expect_err("a third auto-rebuild within the crash-loop window must be refused");
+        assert!(
+            err.to_string().contains("crash-loop"),
+            "must be the distinct crash-loop wording, not another silent wipe-and-rebuild: {err}"
         );
     }
 

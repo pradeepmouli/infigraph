@@ -187,6 +187,19 @@ pub(crate) fn cmd_index(root: &Path, full: bool, no_embed: bool) -> Result<()> {
 
     println!("Indexing project...");
     let result = prism.index()?;
+
+    // R3.1.4d/#100: a completed local full reindex (the wipe above plus
+    // this successful rebuild) is a verified healthy checkpoint -- refresh
+    // the growth-ratio breaker's baseline here. Ordinary incremental
+    // `infigraph index` runs (this same call, `full == false`) deliberately
+    // do not -- see `stamp_healthy_graph_size`'s doc comment. The
+    // daemon-routed full-reindex branch above already does its own
+    // equivalent stamp and returns before reaching this point.
+    if full && !remote {
+        let dir = root.join(".infigraph");
+        infigraph_core::graph::stamp_healthy_graph_size(&dir, &dir.join("graph"));
+    }
+
     if result.indexed_files == 0 {
         println!(
             "All {} files up-to-date, nothing to reindex",

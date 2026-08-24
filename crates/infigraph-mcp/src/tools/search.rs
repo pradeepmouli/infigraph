@@ -63,6 +63,24 @@ fn is_remote_mode() -> bool {
     }
 }
 
+/// Cheap health check consulted before trusting a warm search-cache hit.
+/// The cache key is `embeddings.bin`'s mtime, which a daemon crash or a
+/// dead-holder WAL on the *graph* database does not touch -- without this,
+/// a warm cache could silently keep serving stale data forever and never
+/// execute `open_read_only_or_degrade`, so no quarantine or recovery
+/// sentinel would ever get created (R3.1.4 adversarial review finding).
+/// Mirrors the same dead-holder-WAL and crash-loop signals
+/// `GraphStore::open_read_only_or_degrade` checks on a miss, without
+/// opening the database itself.
+fn graph_needs_recovery(infigraph_dir: &std::path::Path) -> bool {
+    if infigraph_core::recovery::crash_loop_detected(infigraph_dir).is_some() {
+        return true;
+    }
+    let graph_path = infigraph_dir.join("graph");
+    let lock_path = infigraph_core::graph::db_lock_path(&graph_path);
+    infigraph_core::graph::unclean_shutdown_wal_holder(&graph_path, &lock_path).is_some()
+}
+
 fn remote_cache_key() -> SystemTime {
     #[cfg(feature = "remote")]
     {
@@ -100,13 +118,18 @@ fn get_or_build_search_ctx(
     {
         let guard = search_ctx_lock().lock().unwrap();
         if let Some(ctx) = guard.as_ref() {
-            if ctx.db_path == canon && ctx.db_mtime == mtime {
+            if ctx.db_path == canon
+                && ctx.db_mtime == mtime
+                && (is_remote || !graph_needs_recovery(&tg_root))
+            {
                 // A pure cache hit predates any crash this call could
                 // detect (a live connection isn't reopened) -- R3.1.4b's
                 // degrade banner only fires on an actual miss-path open
                 // below. A fresh crash surfaces on the next real miss
                 // (e.g. once the auto-rebuild completes and embeddings.bin's
-                // mtime changes).
+                // mtime changes) -- or, now, immediately: `graph_needs_recovery`
+                // above forces a miss the moment a dead-holder WAL or a
+                // tripped crash-loop breaker shows up, even mid-cache-hit.
                 return Ok((
                     CachedSearchData {
                         rows: Arc::clone(&ctx.rows),

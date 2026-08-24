@@ -35,6 +35,7 @@ pub use store::{
     db_lock_path, remove_wal_family, unclean_shutdown_wal_holder, validate_db_file,
     wal_family_paths, DegradeReason, GraphCorruption, GraphStats, GraphStore, WriteLock,
 };
+pub use store_util::stamp_healthy_graph_size;
 pub use test_templates::{test_templates_for, TestTemplate};
 
 pub fn schema_ddl() -> Vec<&'static str> {
