@@ -1230,3 +1230,35 @@ fn check_wal_integrity_passes_with_no_wal() {
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].status, CheckStatus::Pass);
 }
+
+/// R3.1.4e (#100 second incident): running doctor must never mutate the
+/// state it's inspecting -- no check may spawn a watcher, acquire a lock,
+/// or otherwise act as a side effect of diagnosing. A real, fully-indexed
+/// project (so every check family -- sidecars, SCIP staleness, WAL
+/// integrity, disk, locks -- has real data to look at, not just an empty
+/// directory) with no watcher ever started must still show no watch.lock
+/// after a full doctor run.
+#[test]
+fn doctor_never_creates_a_watch_lock_as_a_side_effect() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let project = dir.path().join("myproj");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(project.join("a.py"), "def a():\n    pass\n").unwrap();
+
+    let registry = infigraph_languages::bundled_registry().unwrap();
+    let mut prism = infigraph_core::Infigraph::open(&project, registry).unwrap();
+    prism.init().unwrap();
+    prism.index().unwrap();
+    drop(prism);
+
+    let watch_lock = project.join(".infigraph").join("watch.lock");
+    assert!(!watch_lock.exists(), "must not exist before doctor runs");
+
+    let ctx = ctx_for(DoctorScope::Project(project.clone()), Registry::default());
+    let _report = run_doctor(ctx);
+
+    assert!(
+        !watch_lock.exists(),
+        "running doctor must never spawn a watcher as a side effect"
+    );
+}
