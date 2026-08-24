@@ -1012,6 +1012,79 @@ fn plain_index_on_a_never_indexed_project_fails_fast_under_daemon_backend() {
     );
 }
 
+/// Sibling scenario to the test above, but distinct: a project that WAS
+/// already indexed (`.infigraph/` exists, real content) whose graph file
+/// was then deleted -- e.g. manually, or by a prior crash-recovery attempt.
+/// Plain `infigraph index` (non-`--full`) must auto-promote to a full
+/// rebuild rather than falling through to an incremental open that fails
+/// with Kuzu's own confusing read-only-mode error (#100 second-incident
+/// comment). Local (non-daemon) backend, since this fix applies before any
+/// daemon-routing decision is made.
+#[test]
+fn plain_index_auto_promotes_to_a_full_rebuild_when_the_graph_is_missing_but_infigraph_dir_exists()
+{
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(project.path().join("a.py"), "def a():\n    pass\n").unwrap();
+
+    // --no-embed on both invocations: it skips spawning the detached
+    // scip-enrich child (returns before that point in cmd_index), so the
+    // second invocation below can't race the bootstrap's own background
+    // child for index.lock -- this test is about the auto-promotion logic,
+    // not index.lock contention timing.
+    let status = Command::new(cli_binary())
+        .arg("index")
+        .arg("--no-embed")
+        .current_dir(project.path())
+        .env_remove("INFIGRAPH_BACKEND")
+        .env_remove("INFIGRAPH_WATCH_DAEMON")
+        .status()
+        .unwrap();
+    assert!(status.success(), "bootstrap index failed");
+    assert!(project.path().join(".infigraph").join("graph").exists());
+
+    std::fs::remove_file(project.path().join(".infigraph").join("graph")).unwrap();
+
+    let output = Command::new(cli_binary())
+        .arg("index")
+        .arg("--no-embed")
+        .current_dir(project.path())
+        .env_remove("INFIGRAPH_BACKEND")
+        .env_remove("INFIGRAPH_WATCH_DAEMON")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "plain index must auto-promote to a full rebuild, not fail: {stderr}"
+    );
+    assert!(project.path().join(".infigraph").join("graph").exists());
+
+    // A `.infigraph/index.lock` FILE persisting after a clean run is normal
+    // (this codebase's lockfile convention releases the OS-level flock but
+    // never deletes the file, matching watch.lock's identical pattern) --
+    // what actually matters is that the lock isn't still HELD, i.e. a fresh
+    // acquire eventually succeeds rather than blocking on a leaked holder.
+    // Retried with a bounded wait: the child process itself has already
+    // exited by the time `.output()` returns above, but under full-suite
+    // load an unrelated concurrently-running test in this same binary can
+    // transiently hold this lock for a moment via a detached grandchild.
+    let index_lock = project.path().join(".infigraph").join("index.lock");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut reacquired = None;
+    while std::time::Instant::now() < deadline {
+        reacquired = infigraph_core::lockfile::try_acquire(&index_lock, "test-verify").unwrap();
+        if reacquired.is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        reacquired.is_some(),
+        "index.lock must not still be held after a completed run"
+    );
+}
+
 /// Regression test: `INFIGRAPH_NO_WATCH` (a convenience opt-out -- "don't
 /// spawn a background watcher for me") must not also suppress
 /// `ensure_daemon_for_writes`'s auto-start, since `INFIGRAPH_BACKEND=daemon`

@@ -46,6 +46,19 @@ pub(crate) fn cmd_index(root: &Path, full: bool, no_embed: bool) -> Result<()> {
     #[cfg(not(feature = "remote"))]
     let remote = false;
 
+    // A previously-indexed project (`.infigraph/` exists) whose graph file
+    // is missing -- deleted manually, or by a prior crash-recovery attempt
+    // -- has nothing incremental to protect. Treat it exactly like `--full`
+    // rather than falling through to an incremental open that fails with
+    // Kuzu's own confusing "Cannot create an empty database under READ ONLY
+    // mode" error (#100 second-incident comment). Not a behavior change in
+    // outcome -- a full rebuild is what a human would run anyway -- only
+    // removes a confusing dead end.
+    let tg_dir_for_promotion_check = root.join(".infigraph");
+    let full = full
+        || (tg_dir_for_promotion_check.exists()
+            && !tg_dir_for_promotion_check.join("graph").exists());
+
     if full {
         if remote {
             // Remote mode: clear the Neo4j graph (local .infigraph/ is irrelevant)
