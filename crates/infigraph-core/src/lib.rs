@@ -31,6 +31,7 @@ pub mod ops;
 pub mod patterns;
 pub mod ps;
 pub mod quarantine;
+pub mod recovery;
 pub mod refactor;
 pub mod reflection;
 mod report;
