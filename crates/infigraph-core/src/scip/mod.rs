@@ -59,7 +59,14 @@ pub fn import_scip_index(
     let index = Index::parse_from_bytes(&bytes)
         .with_context(|| format!("failed to parse SCIP index: {}", index_path.display()))?;
 
-    let mut stats = ImportStats::default();
+    let mut stats = ImportStats {
+        touched_files: index
+            .documents
+            .iter()
+            .map(|d| d.relative_path.clone())
+            .collect(),
+        ..Default::default()
+    };
     let _lock = store.write_lock()?;
     let conn = store.connection()?;
 
@@ -720,6 +727,14 @@ pub struct ImportStats {
     pub relations_added: usize,
     pub references_added: usize,
     pub corrections_learned: usize,
+    /// Every document this SCIP index covered, relative to the project
+    /// root. Not filtered down to "only files that actually changed" --
+    /// SCIP analyzed all of these, so treating the whole set as touched is
+    /// the safe over-approximation for a caller that just wants to notify
+    /// downstream consumers (e.g. the daemon's `on_event` callback) about
+    /// cross-file-dependents awareness, not re-derive a precise per-file
+    /// diff from the enrichment/new-symbol passes above.
+    pub touched_files: Vec<String>,
 }
 
 #[cfg(test)]

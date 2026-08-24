@@ -175,6 +175,14 @@ where
     let mut drain_in_flight: Option<InFlightDrain> = None;
     let mut full_reindex_in_flight: Option<PendingFullReindex> = None;
     let mut scip_in_flight: Option<Task<()>> = None;
+    // A `WriteRequest::ScipImport` (client-submitted, or the daemon's own
+    // `on_full_reindex` callback submitting one after `run_scip_indexers`
+    // produces a `.scip` file) running in the background via
+    // `try_start_scip_import`, reaped by `finish_scip_import` below.
+    // Independent of `scip_in_flight` above -- that one tracks the OLD
+    // direct-callback SCIP-enrichment path's own background task, not this
+    // request-driven import.
+    let mut scip_import_in_flight: Option<PendingScipImport> = None;
 
     let sentinel = root.join(".infigraph").join("watch.stop");
 
@@ -381,6 +389,46 @@ where
             }
         }
 
+        // Reap a finished SCIP import the same way a full-reindex build is
+        // reaped: pull the handle, run the fast `held`-touching finish step
+        // on this thread (logging, embedding refresh, reply-write), then
+        // give the touched files the same `on_event` notification an
+        // ordinary drain gives its own extracted files -- otherwise a
+        // consumer relying on it (cross-file-dependents awareness) never
+        // learns these files changed, since a SCIP import writes directly
+        // to the graph rather than through `IndexWorkQueue`/`execute_drain`.
+        if scip_import_in_flight
+            .as_ref()
+            .is_some_and(|p| p.task.is_finished())
+        {
+            let PendingScipImport {
+                task,
+                request_path,
+                reply_path,
+            } = scip_import_in_flight
+                .take()
+                .expect("checked is_some just above");
+            let (guard, touched_files) = finish_scip_import(
+                root,
+                &reply_path,
+                &held_prism,
+                drain_rt.block_on(task.join()),
+            );
+            std::fs::remove_file(&request_path).ok();
+            drop(guard);
+
+            if let Some(prism) = held_prism.as_ref() {
+                for file in &touched_files {
+                    let cross = has_cross_file_calls(prism, file);
+                    on_event_shared(WatchEvent {
+                        kind: WatchEventKind::Modified,
+                        path: root.join(file),
+                        has_cross_file_calls: cross,
+                    });
+                }
+            }
+        }
+
         // Periodic SCIP refresh: if changes accumulated and enough time passed
         if periodic_secs > 0
             && changes_since_periodic > 0
@@ -439,8 +487,12 @@ where
                             &mut code_watch,
                             docs_control.as_ref(),
                             &mut shutdown_requested,
+                            scip_import_in_flight.is_some(),
                         ) {
-                            full_reindex_in_flight = Some(started);
+                            match started {
+                                PendingWork::FullReindex(p) => full_reindex_in_flight = Some(p),
+                                PendingWork::ScipImport(p) => scip_import_in_flight = Some(p),
+                            }
                         }
                     }
                 }
@@ -554,6 +606,20 @@ where
     }
     if let Some(in_flight) = scip_in_flight.take() {
         let _ = drain_rt.block_on(in_flight.join());
+    }
+    // Same reasoning again -- a SCIP import still running when the loop
+    // exits also holds `index.lock`. No `on_event_shared` notification pass
+    // here (unlike the tick-time reap block above): the process is already
+    // tearing down, nothing is left running to act on the notification.
+    if let Some(in_flight) = scip_import_in_flight.take() {
+        let (guard, _touched_files) = finish_scip_import(
+            root,
+            &in_flight.reply_path,
+            &held_prism,
+            drain_rt.block_on(in_flight.task.join()),
+        );
+        std::fs::remove_file(&in_flight.request_path).ok();
+        drop(guard);
     }
 
     Ok(())
@@ -795,6 +861,39 @@ struct PendingFullReindex {
     reply_path: PathBuf,
 }
 
+/// What the background SCIP-import task hands back. Mirrors
+/// `FullReindexTaskOutput`'s shape (the `index.lock` guard rides along so
+/// the loop thread keeps holding it across the reply-write step).
+struct ScipImportTaskOutput {
+    guard: crate::ops::IndexOpGuard,
+    result: Result<crate::scip::ImportStats>,
+}
+
+/// A `WriteRequest::ScipImport` executing on the background `Task<T>`, plus
+/// what the loop thread needs to finish it once it completes. Mirrors
+/// `PendingFullReindex` -- SCIP import used to run synchronously inside
+/// `serve_request_locked` (blocking the whole coordinator loop -- no
+/// draining, no other request-serving, nothing -- for the entire import
+/// duration on a large repo), the exact defect this background-task path
+/// fixes.
+struct PendingScipImport {
+    task: Task<ScipImportTaskOutput>,
+    request_path: PathBuf,
+    reply_path: PathBuf,
+}
+
+/// What `route_or_serve_request` hands back to the coordinator's main loop:
+/// either kind of background work it might have started this tick, so the
+/// loop can track and reap whichever one it is on a later tick. The two
+/// kinds are tracked as separate `Option` fields in the loop's own state
+/// (`full_reindex_in_flight`/`scip_import_in_flight`), not merged into one
+/// slot -- a full reindex and a client-submitted SCIP import are
+/// independent and can be in flight at the same time.
+enum PendingWork {
+    FullReindex(PendingFullReindex),
+    ScipImport(PendingScipImport),
+}
+
 /// The expensive, `held`-independent part of a full reindex: build a fresh
 /// database at `graph.rebuilding`, scan/extract/upsert/resolve every file,
 /// derive TESTED_BY edges. Runs entirely against its own connection, opened
@@ -990,6 +1089,160 @@ where
         request_path: path.to_path_buf(),
         reply_path,
     })
+}
+
+/// Loop-thread entry point for a `WriteRequest::ScipImport`. Mirrors
+/// `try_start_full_reindex`'s shape, but much simpler: a SCIP import writes
+/// directly into the live graph in place (`Infigraph::import_scip`'s own
+/// bulk COPY/UNWIND, protected by `GraphStore::write_lock`), there is no
+/// build-then-swap -- so no snapshot/retire/rollback machinery is needed
+/// here, only the background-task-plus-reply plumbing.
+///
+/// Returns `None` if nothing was started (busy, or an early failure already
+/// replied and cleaned up the request file itself); `Some` if an import was
+/// scheduled -- the caller must track the returned handle and reap it via
+/// `finish_scip_import` on a later tick.
+#[allow(clippy::too_many_arguments)]
+fn try_start_scip_import(
+    root: &Path,
+    path: &Path,
+    scip_path: PathBuf,
+    registry: &Arc<crate::lang::LanguageRegistry>,
+    held: &mut Option<Arc<Infigraph>>,
+    drain_in_flight: bool,
+    full_reindex_in_flight: bool,
+    scip_import_in_flight: bool,
+    drain_rt: &tokio::runtime::Runtime,
+    daemon_token: &CancellationToken,
+) -> Option<PendingScipImport> {
+    let reply_path = path.with_extension("result");
+
+    // Same "never overlap" reasoning as `try_start_full_reindex`'s gate --
+    // this writes the same live graph a drain or a full reindex writes.
+    // Two SCIP imports at once are also refused: `Infigraph::import_scip`
+    // itself serializes via `GraphStore::write_lock`, so a second one would
+    // just block inside the background task rather than run concurrently,
+    // silently doubling this loop's in-flight bookkeeping for no benefit.
+    if drain_in_flight || full_reindex_in_flight || scip_import_in_flight {
+        return None;
+    }
+
+    // Needs the daemon's own already-open connection -- `Infigraph::
+    // import_scip` must not open a second `Database` on the same live graph
+    // path (Kuzu only allows safe concurrent access within one process's
+    // `Database` object, not across two, even in the same process).
+    let prism = match watch_db(root, registry, held) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("[daemon] scip-import: failed to open graph connection, will retry: {e}");
+            return None;
+        }
+    };
+
+    let guard = match begin_index_op(
+        root,
+        "infigraph daemon (scip import)",
+        Duration::from_secs(30),
+    ) {
+        Ok(IndexOpOutcome::Acquired(guard)) => guard,
+        Ok(o @ IndexOpOutcome::AlreadyRunning(_)) => {
+            eprintln!(
+                "[daemon] scip-import busy ({}), retrying next tick",
+                o.skip_note().unwrap_or_default()
+            );
+            return None;
+        }
+        Err(e) => {
+            eprintln!("[daemon] scip-import busy ({e}), retrying next tick");
+            return None;
+        }
+    };
+
+    let task = {
+        let _guard = drain_rt.enter();
+        Task::spawn_blocking(daemon_token, "scip-import", move |_token| {
+            let result = prism.import_scip(&scip_path);
+            // Best-effort cleanup of the `.scip` file regardless of
+            // outcome, mirroring the old direct-write path's behavior.
+            let _ = std::fs::remove_file(&scip_path);
+            ScipImportTaskOutput { guard, result }
+        })
+    };
+
+    Some(PendingScipImport {
+        task,
+        request_path: path.to_path_buf(),
+        reply_path,
+    })
+}
+
+/// Loop-thread finish for a completed SCIP import: logs one structured
+/// completion line, refreshes embeddings for anything the import added,
+/// writes the reply, and returns the touched-files list (over-approximated
+/// -- every file the SCIP index covered, see `ImportStats::touched_files`)
+/// so the caller can give them the same `on_event` notification an ordinary
+/// drain gives its extracted files.
+fn finish_scip_import(
+    root: &Path,
+    reply_path: &Path,
+    held: &Option<Arc<Infigraph>>,
+    joined: std::result::Result<ScipImportTaskOutput, tokio::task::JoinError>,
+) -> (Option<crate::ops::IndexOpGuard>, Vec<String>) {
+    let ScipImportTaskOutput { guard, result } = match joined {
+        Ok(output) => output,
+        Err(join_err) => {
+            eprintln!("[daemon] scip-import task panicked: {join_err}");
+            let write_result = crate::daemon_protocol::WriteResult::Err {
+                message: format!("daemon scip-import task panicked: {join_err}"),
+            };
+            if let Ok(json) = serde_json::to_string(&write_result) {
+                let _ = crate::daemon_protocol::write_atomic(reply_path, &json);
+            }
+            return (None, Vec::new());
+        }
+    };
+
+    let touched_files = match result {
+        Ok(stats) => {
+            eprintln!(
+                "[daemon] SCIP import complete: {} symbols enriched, {} added, {} references, \
+                 {} corrections learned ({} files processed)",
+                stats.symbols_enriched,
+                stats.symbols_added,
+                stats.references_added,
+                stats.corrections_learned,
+                stats.files_processed
+            );
+            if let Some(prism) = held.as_ref() {
+                if let Some(backend) = prism.backend() {
+                    match crate::embed::update_embeddings(backend, root, &[]) {
+                        Ok(n) if n > 0 => {
+                            eprintln!("[daemon] scip-import: embedded {n} new symbols")
+                        }
+                        Ok(_) => {}
+                        Err(e) => eprintln!("[daemon] scip-import: embedding update failed: {e}"),
+                    }
+                }
+            }
+            let touched = stats.touched_files.clone();
+            let write_result = crate::daemon_protocol::WriteResult::ScipImportOk(stats);
+            if let Ok(json) = serde_json::to_string(&write_result) {
+                let _ = crate::daemon_protocol::write_atomic(reply_path, &json);
+            }
+            touched
+        }
+        Err(e) => {
+            let write_result = crate::daemon_protocol::WriteResult::Err {
+                message: format!("SCIP import failed: {e:#}"),
+            };
+            if let Ok(json) = serde_json::to_string(&write_result) {
+                let _ = crate::daemon_protocol::write_atomic(reply_path, &json);
+            }
+            Vec::new()
+        }
+    };
+
+    (Some(guard), touched_files)
 }
 
 /// Loop-thread finish for a completed full-reindex build: poison the
@@ -1323,7 +1576,8 @@ fn route_or_serve_request<MR>(
     // Set to `true` when the request asks the whole daemon to stop; the
     // coordinator's loop reads it to decide whether to break.
     shutdown_requested: &mut bool,
-) -> Option<PendingFullReindex>
+    scip_import_in_flight: bool,
+) -> Option<PendingWork>
 where
     MR: Fn() -> Result<crate::lang::LanguageRegistry>,
 {
@@ -1479,7 +1733,21 @@ where
             full_reindex_in_flight,
             drain_rt,
             daemon_token,
-        ),
+        )
+        .map(PendingWork::FullReindex),
+        WriteRequest::ScipImport { scip_path } => try_start_scip_import(
+            root,
+            path,
+            scip_path,
+            registry,
+            held,
+            drain_in_flight,
+            full_reindex_in_flight,
+            scip_import_in_flight,
+            drain_rt,
+            daemon_token,
+        )
+        .map(PendingWork::ScipImport),
         WriteRequest::WatchControl { role, action } => {
             let outcome = match role {
                 // `Enable`/`Disable` differ from `Start`/`Stop` only in
@@ -1594,6 +1862,7 @@ fn has_cross_file_calls(prism: &Infigraph, rel_path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use protobuf::Message as _;
 
     /// A drain runs on a background task, so a panic inside it unwinds on a
     /// thread the watch loop never sees. Nothing else would ever answer the
@@ -1821,6 +2090,7 @@ mod tests {
             &mut code_watch,
             None,
             &mut false,
+            false,
         );
 
         let drained = queue.lock().unwrap().drain();
@@ -1836,6 +2106,105 @@ mod tests {
             drained.waiters[0].paths,
             Some(vec!["foo.py".to_string()]),
             "the waiter's own scoped paths must also be relative"
+        );
+    }
+
+    /// Before the `Task<T>`-based background tracking added here,
+    /// `WriteRequest::ScipImport` fell through `route_or_serve_request`'s
+    /// match statement to its `_ =>` catch-all, which calls
+    /// `serve_request_locked` -> `serve_one_request` *synchronously* on the
+    /// coordinator's own thread -- blocking the whole tick loop for the
+    /// entire SCIP import. This pins the fix: routing a `ScipImport` request
+    /// must return `Some(PendingWork::ScipImport(_))` immediately, with the
+    /// `.result` reply not yet written, proving the import was handed off to
+    /// a background task rather than run inline.
+    #[test]
+    fn route_or_serve_scip_import_request_is_background_tracked_not_served_synchronously() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+
+        // An empty-but-valid SCIP index is enough to exercise the routing
+        // and completion path -- `import_scip_index`'s per-document handling
+        // isn't what this test is about.
+        let scip_path = root.join("index.scip");
+        let index = scip::types::Index::default();
+        std::fs::write(&scip_path, index.write_to_bytes().unwrap()).unwrap();
+
+        let request = crate::daemon_protocol::WriteRequest::ScipImport {
+            scip_path: scip_path.clone(),
+        };
+        let request_path = root.join("test.request");
+        std::fs::write(&request_path, serde_json::to_string(&request).unwrap()).unwrap();
+
+        let queue = Arc::new(Mutex::new(crate::daemon::queue::IndexWorkQueue::new()));
+        let mut held: Option<Arc<Infigraph>> = None;
+        let drain_rt = tokio::runtime::Runtime::new().unwrap();
+        let daemon_token = CancellationToken::new();
+        let registry = Arc::new(crate::lang::LanguageRegistry::new());
+        let mut code_watch = CodeWatch::new(
+            &daemon_token,
+            producer::ProducerConfig {
+                root: root.clone(),
+                registry: Arc::clone(&registry),
+                debounce_ms: 50,
+                ignore_rebuild_secs: 300,
+            },
+            Arc::clone(&queue),
+            Arc::new(|_evt| {}),
+        )
+        .unwrap();
+
+        let started = route_or_serve_request(
+            &root,
+            &request_path,
+            &queue,
+            &registry,
+            &|| Ok(crate::lang::LanguageRegistry::new()),
+            &mut held,
+            false,
+            false,
+            &drain_rt,
+            &daemon_token,
+            &mut code_watch,
+            None,
+            &mut false,
+            false,
+        );
+
+        let pending = match started {
+            Some(PendingWork::ScipImport(p)) => p,
+            Some(PendingWork::FullReindex(_)) => {
+                panic!("expected PendingWork::ScipImport, got PendingWork::FullReindex")
+            }
+            None => panic!(
+                "expected Some(PendingWork::ScipImport(_)) -- a None here means the request \
+                 fell through to the synchronous serve_request_locked path again"
+            ),
+        };
+
+        // The reply must not exist yet: if the import had run synchronously
+        // on this thread, `serve_one_request` would have already written it
+        // before `route_or_serve_request` returned.
+        assert!(
+            !pending.reply_path.exists(),
+            "reply was already written -- ScipImport was served synchronously, not backgrounded"
+        );
+
+        let joined = drain_rt.block_on(pending.task.join());
+        let (guard, _touched_files) = finish_scip_import(&root, &pending.reply_path, &held, joined);
+        assert!(
+            guard.is_some(),
+            "expected the index-op guard back on a successful import"
+        );
+        assert!(
+            pending.reply_path.exists(),
+            "finish_scip_import must write the .result reply"
+        );
+        let reply: crate::daemon_protocol::WriteResult =
+            serde_json::from_str(&std::fs::read_to_string(&pending.reply_path).unwrap()).unwrap();
+        assert!(
+            matches!(reply, crate::daemon_protocol::WriteResult::ScipImportOk(_)),
+            "expected WriteResult::ScipImportOk, got {reply:?}"
         );
     }
 }

@@ -542,23 +542,51 @@ pub(crate) fn cmd_daemon(root: &Path, debounce: u64) -> Result<()> {
                 if results.is_empty() {
                     return;
                 }
-                match infigraph_core::ops::begin_index_op(
-                    &root,
-                    "infigraph daemon (scip import)",
-                    std::time::Duration::from_secs(30),
-                ) {
-                    Ok(infigraph_core::ops::IndexOpOutcome::Acquired(guard)) => {
-                        crate::index::import_scip_results_and_embed(&root, &prism, &results);
-                        drop(guard);
+                // Submit each generated `.scip` file as a real
+                // `WriteRequest::ScipImport`, routed through the exact same
+                // background-task-and-reap machinery
+                // (`try_start_scip_import`/`finish_scip_import`) a
+                // client-submitted import goes through -- no separate
+                // direct-write code path for "the daemon triggered this
+                // itself" vs "an external caller asked for it". Blocking
+                // here on `submit_write_request`'s reply-poll is safe: this
+                // whole closure already runs on its own background
+                // `Task::spawn_blocking("scip-enrich", ...)`, not the
+                // coordinator's own tick thread -- unlike the coordinator
+                // loop, blocking here doesn't stall drains, other requests,
+                // or fsevents.
+                let requests_dir = root.join(".infigraph").join("requests");
+                for (label, scip_path, success) in results {
+                    if !success || !scip_path.exists() {
+                        let _ = std::fs::remove_file(&scip_path);
+                        continue;
                     }
-                    Ok(o @ infigraph_core::ops::IndexOpOutcome::AlreadyRunning(_)) => {
-                        eprintln!(
-                            "[daemon] scip-import busy ({}), skipping this round",
-                            o.skip_note().unwrap_or_default()
-                        );
-                    }
-                    Err(e) => {
-                        eprintln!("[daemon] scip-import busy ({e}), skipping this round");
+                    let request = infigraph_core::daemon_protocol::WriteRequest::ScipImport {
+                        scip_path: scip_path.clone(),
+                    };
+                    match infigraph_core::daemon_protocol::submit_write_request(
+                        &requests_dir,
+                        &request,
+                        // Generous: a large repo's SCIP import (COPY/UNWIND
+                        // against tens of thousands of symbols) can take
+                        // minutes, and this callback is not on the
+                        // coordinator's own tick thread, so waiting doesn't
+                        // stall anything else.
+                        std::time::Duration::from_secs(600),
+                    ) {
+                        Ok(infigraph_core::daemon_protocol::WriteResult::ScipImportOk(_)) => {
+                            // The coordinator's own `finish_scip_import` already
+                            // logged the structured completion line.
+                        }
+                        Ok(infigraph_core::daemon_protocol::WriteResult::Err { message }) => {
+                            eprintln!("[daemon] SCIP {label} import failed: {message}");
+                        }
+                        Ok(_) => {
+                            // ScipImport only ever replies ScipImportOk or Err.
+                        }
+                        Err(e) => {
+                            eprintln!("[daemon] SCIP {label} import request failed: {e}");
+                        }
                     }
                 }
             },
