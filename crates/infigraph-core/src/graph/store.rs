@@ -58,6 +58,20 @@ impl std::fmt::Display for GraphCorruption {
 
 impl std::error::Error for GraphCorruption {}
 
+/// Reason a read was served from something other than the live graph.
+#[derive(Debug, Clone)]
+pub enum DegradeReason {
+    /// The live graph had a dead-holder WAL and was quarantined; this read
+    /// was served from the most recent cleanly-retired graph instead, while
+    /// a rebuild has been signaled to the daemon coordinator in the
+    /// background. Callers should surface a staleness banner naming
+    /// `snapshot_path`'s age.
+    PreCrashSnapshot {
+        snapshot_path: PathBuf,
+        dead_pid: u32,
+    },
+}
+
 /// Minimum plausible size of a Kuzu database file. A freshly created
 /// database is at least one page (4 KiB); anything smaller is a
 /// truncated/corrupt file that Kuzu's own parser cannot be trusted with.
@@ -328,6 +342,88 @@ impl GraphStore {
         })?;
         refuse_newer_schema(&db, path)?;
         Ok(Self { db, lock_path })
+    }
+
+    /// Like [`open_read_only`](Self::open_read_only), but on a dead-holder
+    /// WAL, quarantines immediately and degrades to the most recent
+    /// `graph.previous.<ts>` entry (read-only) instead of failing outright
+    /// -- see R3.1.4b. Never triggers a write itself; it only quarantines (a
+    /// data-safety move, not a write to the live graph) and leaves a
+    /// sentinel for the daemon coordinator (`recovery::drain_recovery_sentinel`)
+    /// to act on asynchronously.
+    ///
+    /// Internal/test call sites that want the strict, non-degrading
+    /// behavior keep calling `open_read_only` directly -- it is unchanged.
+    pub fn open_read_only_or_degrade(path: &Path) -> Result<(Self, Option<DegradeReason>)> {
+        let infigraph_dir = path.parent().ok_or_else(|| {
+            anyhow::anyhow!("graph path {} has no parent directory", path.display())
+        })?;
+        let graph_name = path
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("graph path {} has no file name", path.display()))?
+            .to_string_lossy()
+            .into_owned();
+
+        // A tripped crash-loop breaker takes precedence over everything
+        // else -- a distinct, unambiguous refusal rather than another
+        // quarantine attempt or degrade lookup.
+        if let Some(attempts) = crate::recovery::crash_loop_detected(infigraph_dir) {
+            anyhow::bail!(
+                "crash-loop detected: {} auto-rebuild attempts within the last hour -- refusing \
+                 further automatic rebuilds. Investigate the underlying cause, then delete {} to \
+                 reset and retry manually with `infigraph index --full`.",
+                attempts.len(),
+                crate::recovery::crash_loop_marker_path(infigraph_dir).display(),
+            );
+        }
+
+        if path.exists() {
+            let lock_path = db_lock_path(path);
+            if let Some(pid) = unclean_shutdown_wal_holder(path, &lock_path) {
+                crate::quarantine::quarantine_graph(infigraph_dir, &graph_name)?;
+                crate::recovery::mark_recovery_needed(infigraph_dir, pid, path)?;
+                return Self::degrade_or_refuse(infigraph_dir, &graph_name, pid);
+            }
+            return Self::open_read_only(path).map(|s| (s, None));
+        }
+
+        // Missing path: either genuinely never indexed, or quarantined by
+        // an earlier call (this reader or another one) and not yet rebuilt.
+        if crate::recovery::pending_recovery(infigraph_dir) {
+            // dead_pid isn't recoverable here (the sentinel only round-trips
+            // it internally) -- 0 is an acceptable placeholder in the
+            // returned reason since callers only use it for banner wording,
+            // not logic.
+            return Self::degrade_or_refuse(infigraph_dir, &graph_name, 0);
+        }
+
+        anyhow::bail!(
+            "no graph exists yet at {} -- run `infigraph index` first",
+            path.display()
+        );
+    }
+
+    fn degrade_or_refuse(
+        infigraph_dir: &Path,
+        graph_name: &str,
+        dead_pid: u32,
+    ) -> Result<(Self, Option<DegradeReason>)> {
+        if let Some(previous) =
+            crate::recovery::find_most_recent_previous(infigraph_dir, graph_name)
+        {
+            let store = Self::open_read_only(&previous)?;
+            return Ok((
+                store,
+                Some(DegradeReason::PreCrashSnapshot {
+                    snapshot_path: previous,
+                    dead_pid,
+                }),
+            ));
+        }
+        anyhow::bail!(
+            "graph for {graph_name} is being automatically rebuilt after a detected crash -- \
+             retry shortly"
+        );
     }
 
     /// Acquire exclusive write lock. Waits up to 30s, returning `Busy` if
@@ -749,6 +845,80 @@ mod tests {
             err.downcast_ref::<GraphCorruption>().is_some(),
             "read-only path's error must downcast to GraphCorruption so callers that route to \
              quarantine (R3.1.2) can catch it: {err}"
+        );
+    }
+
+    #[test]
+    fn open_read_only_or_degrade_falls_back_to_the_previous_pool() {
+        let dir = tempfile::tempdir().unwrap();
+        let infigraph_dir = dir.path();
+        let db_path = infigraph_dir.join("graph");
+
+        // Seed a real, openable "previous" graph a full reindex would have
+        // retired -- open+init it via the normal write path, then rename it
+        // aside exactly as `quarantine::retire_previous_graph` would.
+        GraphStore::open(&db_path).unwrap();
+        let previous_path = infigraph_dir.join("graph.previous.111");
+        std::fs::rename(&db_path, &previous_path).unwrap();
+
+        // Recreate the live path as a dead-holder-WAL scenario.
+        std::fs::write(&db_path, vec![0u8; MIN_DB_FILE_SIZE as usize]).unwrap();
+        std::fs::write(infigraph_dir.join("graph.wal"), b"stub wal").unwrap();
+        write_holder_lock(&db_lock_path(&db_path), DEAD_PID);
+
+        let (store, reason) = GraphStore::open_read_only_or_degrade(&db_path).unwrap();
+        drop(store);
+
+        match reason {
+            Some(DegradeReason::PreCrashSnapshot { snapshot_path, .. }) => {
+                assert_eq!(snapshot_path, previous_path);
+            }
+            other => panic!("expected PreCrashSnapshot degrade, got {other:?}"),
+        }
+        assert!(
+            crate::recovery::pending_recovery(infigraph_dir),
+            "sentinel must be left for the daemon coordinator to pick up"
+        );
+        assert!(
+            !db_path.exists(),
+            "the dead-holder graph must have been quarantined"
+        );
+    }
+
+    #[test]
+    fn open_read_only_or_degrade_refuses_with_rebuild_in_progress_wording_when_no_fallback_exists()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let infigraph_dir = dir.path();
+        let db_path = infigraph_dir.join("graph");
+
+        std::fs::write(&db_path, vec![0u8; MIN_DB_FILE_SIZE as usize]).unwrap();
+        std::fs::write(infigraph_dir.join("graph.wal"), b"stub wal").unwrap();
+        write_holder_lock(&db_lock_path(&db_path), DEAD_PID);
+
+        let err = GraphStore::open_read_only_or_degrade(&db_path)
+            .map(|_| ())
+            .expect_err("no .previous. pool entry exists -- must refuse");
+        assert!(
+            err.to_string().contains("automatically rebuilt"),
+            "must say a rebuild is already in progress, not tell the human to run --full: {err}"
+        );
+    }
+
+    #[test]
+    fn open_read_only_or_degrade_refuses_distinctly_once_the_crash_loop_breaker_has_tripped() {
+        let dir = tempfile::tempdir().unwrap();
+        let infigraph_dir = dir.path();
+        std::fs::create_dir_all(infigraph_dir).unwrap();
+        crate::recovery::write_crash_loop_marker(infigraph_dir, &[1, 2]).unwrap();
+
+        let db_path = infigraph_dir.join("graph"); // doesn't need to exist for this path
+        let err = GraphStore::open_read_only_or_degrade(&db_path)
+            .map(|_| ())
+            .expect_err("crash-loop marker must short-circuit to a refusal");
+        assert!(
+            err.to_string().contains("crash-loop"),
+            "must be the distinct crash-loop wording, not the generic quarantine message: {err}"
         );
     }
 
