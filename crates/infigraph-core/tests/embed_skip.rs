@@ -219,3 +219,38 @@ fn deleted_file_still_prunes_embeddings() {
         "symbols from the deleted file must be pruned"
     );
 }
+
+// Regression test: `update_embeddings` used to return `Ok(0)` as soon as the
+// graph query came back empty, before loading or pruning `existing` at all.
+// Deleting the last indexed file (or symbol) hit that early-return, leaving
+// embeddings.bin's stale vectors on disk forever.
+#[test]
+fn deleting_every_indexed_file_prunes_embeddings_to_empty() {
+    let (dir, ig) = setup();
+    std::fs::remove_file(dir.path().join(FILE_A)).unwrap();
+    std::fs::remove_file(dir.path().join(FILE_ANCHOR)).unwrap();
+    ig.index().unwrap();
+    let count = reembed(dir.path(), &ig);
+    assert_eq!(count, 0, "no symbols remain once every file is deleted");
+    let entries = infigraph_core::embed::load_embeddings_hashed(&emb_path(dir.path())).unwrap();
+    assert!(
+        entries.is_empty(),
+        "embeddings.bin must be pruned to empty, found {} stale entries",
+        entries.len()
+    );
+}
+
+#[test]
+fn deleting_every_indexed_file_removes_a_stale_hnsw_index() {
+    let (dir, ig) = setup();
+    let hnsw_path = dir.path().join(".infigraph").join("hnsw_index.usearch");
+    std::fs::write(&hnsw_path, b"stale placeholder index").unwrap();
+    std::fs::remove_file(dir.path().join(FILE_A)).unwrap();
+    std::fs::remove_file(dir.path().join(FILE_ANCHOR)).unwrap();
+    ig.index().unwrap();
+    reembed(dir.path(), &ig);
+    assert!(
+        !hnsw_path.exists(),
+        "a stale HNSW index (referencing deleted symbols) must not survive an empty-graph re-embed"
+    );
+}

@@ -752,9 +752,6 @@ pub fn update_embeddings(
     use std::sync::Arc;
 
     let rows = backend.raw_query("MATCH (s:Symbol) RETURN s.id, s.name, s.kind, s.file, s.docstring, s.language, s.parameters, s.return_type")?;
-    if rows.is_empty() {
-        return Ok(0);
-    }
 
     let emb_path = root.join(".infigraph").join("embeddings.bin");
     // id -> (vector, input_hash); hash 0 = unknown (legacy/v2 files).
@@ -857,7 +854,13 @@ pub fn update_embeddings(
     let should_build = count >= HNSW_THRESHOLD || hnsw_path.exists();
     if should_build {
         invalidate_hnsw_cache();
-        if let Err(e) = build_hnsw_index(&symbol_embeddings, &hnsw_path, &emb_path) {
+        if count == 0 {
+            // build_hnsw_index no-ops on an empty embeddings slice, which
+            // would otherwise leave a stale index -- referencing symbols
+            // that no longer exist -- on disk indefinitely.
+            let _ = std::fs::remove_file(&hnsw_path);
+            let _ = std::fs::remove_file(hnsw_path.with_extension("meta"));
+        } else if let Err(e) = build_hnsw_index(&symbol_embeddings, &hnsw_path, &emb_path) {
             eprintln!("warning: HNSW index build failed ({e}), vector search will use brute-force");
         }
     }
