@@ -1085,6 +1085,60 @@ fn plain_index_auto_promotes_to_a_full_rebuild_when_the_graph_is_missing_but_inf
     );
 }
 
+/// R3.1.4g/#115: a crashed daemon's cause is only diagnosable if a human
+/// can tell which generation's output in the shared, appended-to watch.log
+/// is whose. Spawned via `ensure_daemon_running` (the opportunistic
+/// auto-start path both the CLI's `ensure_watcher_running` and MCP's
+/// `ensure_daemon_watcher` use, and the one #115's investigation found had
+/// no captured stderr) -- NOT `start_real_daemon`'s direct
+/// `Command::new(cli).arg("daemon")` spawn, which inherits the test
+/// process's own stdio rather than routing through `build_daemon_command`'s
+/// watch.log redirection, exactly the distinction this task's research
+/// found matters.
+#[test]
+fn opportunistic_daemon_spawn_writes_a_start_banner_naming_its_pid_to_watch_log() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(project.path().join("a.py"), "def a():\n    pass\n").unwrap();
+
+    let status = Command::new(cli_binary())
+        .arg("index")
+        .arg("--no-embed")
+        .current_dir(project.path())
+        .env_remove("INFIGRAPH_BACKEND")
+        .env_remove("INFIGRAPH_WATCH_DAEMON")
+        .status()
+        .unwrap();
+    assert!(status.success(), "bootstrap index failed");
+
+    let outcome =
+        infigraph_core::watch::daemon::ensure_daemon_running(project.path(), &cli_binary());
+    assert!(
+        matches!(
+            outcome,
+            infigraph_core::watch::daemon::DaemonStartOutcome::Spawned
+        ),
+        "expected a fresh spawn, got {outcome:?}"
+    );
+
+    let lock_path = project.path().join(".infigraph").join("watch.lock");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while std::time::Instant::now() < deadline
+        && !(lock_path.exists() && std::fs::metadata(&lock_path).unwrap().len() > 0)
+    {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let log = std::fs::read_to_string(project.path().join(".infigraph").join("watch.log"))
+        .unwrap_or_default();
+    assert!(
+        log.contains("[daemon-start]") && log.contains("pid="),
+        "expected a start banner naming a pid, got: {log:?}"
+    );
+
+    std::fs::write(project.path().join(".infigraph").join("watch.stop"), b"").unwrap();
+}
+
 /// Regression test: `INFIGRAPH_NO_WATCH` (a convenience opt-out -- "don't
 /// spawn a background watcher for me") must not also suppress
 /// `ensure_daemon_for_writes`'s auto-start, since `INFIGRAPH_BACKEND=daemon`

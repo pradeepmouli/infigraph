@@ -368,6 +368,24 @@ pub(crate) fn cmd_daemon(root: &Path, debounce: u64) -> Result<()> {
     let lock_path = root.join(".infigraph").join("watch.lock");
     let _lock = acquire_watch_lock(&lock_path)?;
 
+    // R3.1.4g/#115: a crash's cause is only diagnosable if a human (or
+    // future tooling) can tell which generation's output in the shared,
+    // appended-to watch.log is whose. `eprintln!` here lands in watch.log
+    // itself (build_daemon_command redirects this process's stderr there;
+    // stdout, where the `println!` calls below go, is discarded when
+    // spawned via that path) -- a banner naming this instance's pid,
+    // start time, and build gives every generation a clear, greppable
+    // boundary.
+    eprintln!(
+        "[daemon-start] pid={} started_at={} build_hash={}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+        infigraph_core::build_hash(),
+    );
+
     println!(
         "Watching {} (debounce {}ms) — Ctrl-C to stop",
         root.display(),

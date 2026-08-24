@@ -966,6 +966,14 @@ fn check_watchers_warns_when_alive_watcher_has_no_live_mcp_instance() {
         "message should explain no live MCP instance is serving this project: {}",
         watcher.message
     );
+    // R3.1.4g/#115: surfaces the watch.log path so a human diagnosing this
+    // exact "something's off" moment doesn't need to already know the
+    // per-project convention to find the watcher's log.
+    assert!(
+        watcher.message.contains("watch.log"),
+        "message should point at the watch.log path: {}",
+        watcher.message
+    );
 }
 
 /// The counterpart: a live MCP instance genuinely registered for this exact

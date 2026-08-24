@@ -567,8 +567,9 @@ fn check_one_watcher(project_path: &Path) -> CheckResult {
             label,
             format!(
                 "watcher (PID {}) is alive and healthy, but no MCP server instance is \
-                 currently serving this project",
-                holder.pid
+                 currently serving this project -- log: {}",
+                holder.pid,
+                project_path.join(".infigraph").join("watch.log").display()
             ),
             format!(
                 "likely left running from a closed MCP session -- if you're not also using it \
@@ -582,7 +583,11 @@ fn check_one_watcher(project_path: &Path) -> CheckResult {
     CheckResult::pass(
         WATCHER_CATEGORY,
         label,
-        format!("watcher (PID {}) alive with fresh heartbeat", holder.pid),
+        format!(
+            "watcher (PID {}) alive with fresh heartbeat -- log: {}",
+            holder.pid,
+            project_path.join(".infigraph").join("watch.log").display()
+        ),
     )
 }
 
