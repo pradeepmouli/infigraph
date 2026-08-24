@@ -10,7 +10,7 @@ use infigraph_core::embed;
 use infigraph_core::search::BM25Index;
 
 use super::docs::{open_doc_index, tool_search_docs};
-use super::helpers::find_containing_symbol;
+use super::helpers::{degrade_banner, find_containing_symbol};
 
 type SearchData = (Vec<Vec<String>>, Vec<(String, Vec<f32>)>);
 
@@ -75,7 +75,12 @@ fn remote_cache_key() -> SystemTime {
     std::time::UNIX_EPOCH
 }
 
-fn get_or_build_search_ctx(args: &Value) -> Result<CachedSearchData> {
+fn get_or_build_search_ctx(
+    args: &Value,
+) -> Result<(
+    CachedSearchData,
+    Option<infigraph_core::graph::DegradeReason>,
+)> {
     let raw_path = args.get("path").and_then(|p| p.as_str()).unwrap_or(".");
     let path = super::helpers::resolve_project_path(raw_path);
     let tg_root = PathBuf::from(&path).join(".infigraph");
@@ -96,18 +101,27 @@ fn get_or_build_search_ctx(args: &Value) -> Result<CachedSearchData> {
         let guard = search_ctx_lock().lock().unwrap();
         if let Some(ctx) = guard.as_ref() {
             if ctx.db_path == canon && ctx.db_mtime == mtime {
-                return Ok(CachedSearchData {
-                    rows: Arc::clone(&ctx.rows),
-                    bm25: Arc::clone(&ctx.bm25_unfiltered),
-                    docs: Arc::clone(&ctx.docs_unfiltered),
-                    symbol_embeddings: Arc::clone(&ctx.symbol_embeddings),
-                });
+                // A pure cache hit predates any crash this call could
+                // detect (a live connection isn't reopened) -- R3.1.4b's
+                // degrade banner only fires on an actual miss-path open
+                // below. A fresh crash surfaces on the next real miss
+                // (e.g. once the auto-rebuild completes and embeddings.bin's
+                // mtime changes).
+                return Ok((
+                    CachedSearchData {
+                        rows: Arc::clone(&ctx.rows),
+                        bm25: Arc::clone(&ctx.bm25_unfiltered),
+                        docs: Arc::clone(&ctx.docs_unfiltered),
+                        symbol_embeddings: Arc::clone(&ctx.symbol_embeddings),
+                    },
+                    None,
+                ));
             }
         }
     }
 
-    let (rows, symbol_embeddings) = if is_remote {
-        get_search_data_remote(&path)?
+    let ((rows, symbol_embeddings), degrade_reason) = if is_remote {
+        (get_search_data_remote(&path)?, None)
     } else {
         get_search_data_local(args, &path)?
     };
@@ -127,21 +141,30 @@ fn get_or_build_search_ctx(args: &Value) -> Result<CachedSearchData> {
         symbol_embeddings: Arc::clone(&symbol_embeddings),
     };
 
-    let mut guard = search_ctx_lock().lock().unwrap();
-    *guard = Some(SearchContext {
-        db_path: canon,
-        db_mtime: mtime,
-        rows,
-        bm25_unfiltered: bm25,
-        docs_unfiltered: docs,
-        symbol_embeddings,
-    });
+    // A degraded read is served from a demoted snapshot, not the live
+    // graph -- caching it under the live graph's mtime key would keep
+    // serving stale-snapshot data even after the background rebuild
+    // finishes and a fresh live graph exists. Cache only the healthy path.
+    if degrade_reason.is_none() {
+        let mut guard = search_ctx_lock().lock().unwrap();
+        *guard = Some(SearchContext {
+            db_path: canon,
+            db_mtime: mtime,
+            rows,
+            bm25_unfiltered: bm25,
+            docs_unfiltered: docs,
+            symbol_embeddings,
+        });
+    }
 
-    Ok(data)
+    Ok((data, degrade_reason))
 }
 
-fn get_search_data_local(args: &Value, path: &str) -> Result<SearchData> {
-    let prism = super::helpers::open_prism_read_only(args)?;
+fn get_search_data_local(
+    args: &Value,
+    path: &str,
+) -> Result<(SearchData, Option<infigraph_core::graph::DegradeReason>)> {
+    let (prism, degrade_reason) = super::helpers::open_prism_read_only_or_degrade(args)?;
     let backend = prism.backend().context("not initialized")?;
     let rows = backend.get_symbols_for_search()?;
 
@@ -187,7 +210,7 @@ fn get_search_data_local(args: &Value, path: &str) -> Result<SearchData> {
         })
         .collect();
 
-    Ok((rows, symbol_embeddings))
+    Ok(((rows, symbol_embeddings), degrade_reason))
 }
 
 #[allow(unused)]
@@ -248,7 +271,7 @@ pub fn tool_search(args: &Value) -> Result<String> {
     );
     let use_regex = args.get("regex").and_then(|v| v.as_bool()).unwrap_or(false);
 
-    let ctx = get_or_build_search_ctx(args)?;
+    let (ctx, degrade_reason) = get_or_build_search_ctx(args)?;
 
     let rows = ctx.rows;
     if rows.is_empty() {
@@ -552,6 +575,13 @@ pub fn tool_search(args: &Value) -> Result<String> {
         out.insert_str(0, &banner);
     }
 
+    // R3.1.4b: more severe than the staleness banner above (serving
+    // historical data from a demoted snapshot, not just a few files
+    // lagging the live index), so it goes first.
+    if let Some(ref reason) = degrade_reason {
+        out.insert_str(0, &degrade_banner(reason));
+    }
+
     Ok(out)
 }
 
@@ -583,7 +613,7 @@ pub fn tool_search_symbols(args: &Value) -> Result<String> {
         args.get("path").and_then(|p| p.as_str()).unwrap_or("."),
     );
 
-    let ctx = get_or_build_search_ctx(args)?;
+    let (ctx, _degrade_reason) = get_or_build_search_ctx(args)?;
     let rows = ctx.rows;
 
     if rows.is_empty() {
@@ -676,7 +706,7 @@ pub fn tool_semantic_search(args: &Value) -> Result<String> {
         args.get("path").and_then(|p| p.as_str()).unwrap_or("."),
     );
 
-    let ctx = get_or_build_search_ctx(args)?;
+    let (ctx, _degrade_reason) = get_or_build_search_ctx(args)?;
     let rows = ctx.rows;
 
     if rows.is_empty() {

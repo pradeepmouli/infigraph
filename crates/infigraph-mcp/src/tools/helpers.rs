@@ -83,6 +83,43 @@ pub fn open_prism_read_only(args: &Value) -> Result<Infigraph> {
     Ok(prism)
 }
 
+/// Like [`open_prism_read_only`], but degrades to a pre-crash snapshot
+/// instead of failing outright on a dead-holder WAL (R3.1.4b). A sibling
+/// function rather than a change to `open_prism_read_only` itself, so the
+/// other 47+ callers of that function are unaffected -- only the two call
+/// sites that render a degrade banner (`get_code_snippet`, `search`) use
+/// this one.
+pub fn open_prism_read_only_or_degrade(
+    args: &Value,
+) -> Result<(Infigraph, Option<infigraph_core::graph::DegradeReason>)> {
+    let raw_path = args
+        .get("path")
+        .and_then(|p| p.as_str())
+        .context("missing 'path' argument")?;
+    let path = resolve_project_path(raw_path);
+    let registry = bundled_registry()?;
+    let mut prism = Infigraph::open(&PathBuf::from(&path), registry)?;
+    let reason = prism.init_read_only_or_degrade()?;
+    apply_repo_filter(&mut prism, &path);
+    Ok((prism, reason))
+}
+
+/// Banner prepended to a tool's response when it served a degraded read
+/// (R3.1.4b) -- more severe than `search.rs`'s `staleness_banner` (that one
+/// warns about a few files lagging the index; this one means the whole
+/// graph is a pre-crash snapshot), so callers that compose both prepend
+/// this one first.
+pub fn degrade_banner(reason: &infigraph_core::graph::DegradeReason) -> String {
+    match reason {
+        infigraph_core::graph::DegradeReason::PreCrashSnapshot { snapshot_path, .. } => format!(
+            "⚠ serving results from a pre-crash snapshot ({}) -- a WAL corruption was just \
+             detected and an automatic rebuild has been triggered in the background; results \
+             may lag recent changes until it completes\n\n",
+            snapshot_path.display()
+        ),
+    }
+}
+
 /// In Neo4j (remote) mode, scope read queries to the repo matching this path.
 /// Read and write MUST agree on the `org/repo` key or repo-scoped queries return
 /// nothing (files/symbols show 0 while global folders/contains stay populated).

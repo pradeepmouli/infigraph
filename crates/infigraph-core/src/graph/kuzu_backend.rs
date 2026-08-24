@@ -36,6 +36,13 @@ impl KuzuBackend {
         Ok(Self { store })
     }
 
+    pub fn open_read_only_or_degrade(
+        path: &Path,
+    ) -> Result<(Self, Option<super::store::DegradeReason>)> {
+        let (store, reason) = GraphStore::open_read_only_or_degrade(path)?;
+        Ok((Self { store }, reason))
+    }
+
     /// Wrap an already-opened GraphStore (avoids double-open).
     pub fn from_store(store: GraphStore) -> Self {
         Self { store }

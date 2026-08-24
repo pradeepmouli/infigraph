@@ -565,3 +565,78 @@ fn test_no_stale_warning_with_cli_watcher() {
 
     lock_file.unlock().unwrap();
 }
+
+/// Writes a dead-holder identity payload directly to `lock_path`, mirroring
+/// `graph::store`'s own private `write_holder_lock` test helper (not `pub`,
+/// so this integration-test file needs its own copy -- `lockfile::LockInfo`
+/// itself is `pub`, which is all a payload-writer needs).
+fn write_dead_holder_lock(lock_path: &std::path::Path, pid: u32) {
+    if let Some(parent) = lock_path.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    let info = infigraph_core::lockfile::LockInfo {
+        pid,
+        role: "test".to_string(),
+        build_hash: "test".to_string(),
+        acquired_at: 0,
+        last_heartbeat: 0,
+        holder_started_at: 0,
+    };
+    std::fs::write(lock_path, serde_json::to_string(&info).unwrap()).unwrap();
+}
+
+/// Relocates a just-bootstrapped, real, openable graph to the `.previous.`
+/// pool, then recreates the live path as a dead-holder-WAL scenario --
+/// R3.1.4b's degrade fallback needs a real previous-pool entry to fall
+/// back to, and the bootstrap graph already has real symbol content.
+fn demote_live_graph_to_previous_and_seed_dead_holder_wal(project_path: &str) {
+    let infigraph_dir = std::path::PathBuf::from(project_path).join(".infigraph");
+    let graph_path = infigraph_dir.join("graph");
+    std::fs::rename(&graph_path, infigraph_dir.join("graph.previous.111")).unwrap();
+
+    std::fs::write(&graph_path, vec![0u8; 4096]).unwrap();
+    std::fs::write(infigraph_dir.join("graph.wal"), b"stub wal").unwrap();
+    write_dead_holder_lock(
+        &infigraph_core::graph::db_lock_path(&graph_path),
+        999_999_999,
+    );
+}
+
+#[test]
+fn get_code_snippet_degrades_to_the_previous_snapshot_and_banners_it() {
+    let _guard = WATCHER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _cleanup = WatcherCleanup;
+    stop_all_watchers();
+    init_watchers();
+    let (_dir, path) = make_project(&[("lib.py", "def compute(): return 42")]);
+    tool_index_project(&json!({"path": &path})).unwrap();
+    stop_all_watchers();
+
+    demote_live_graph_to_previous_and_seed_dead_holder_wal(&path);
+
+    let out =
+        tool_get_code_snippet(&json!({"path": &path, "symbol_id": "lib.py::compute"})).unwrap();
+    assert!(
+        out.contains("pre-crash snapshot"),
+        "expected a degrade banner, got: {out}"
+    );
+}
+
+#[test]
+fn search_degrades_to_the_previous_snapshot_and_banners_it() {
+    let _guard = WATCHER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _cleanup = WatcherCleanup;
+    stop_all_watchers();
+    init_watchers();
+    let (_dir, path) = make_project(&[("lib.py", "def compute(): return 42")]);
+    tool_index_project(&json!({"path": &path})).unwrap();
+    stop_all_watchers();
+
+    demote_live_graph_to_previous_and_seed_dead_holder_wal(&path);
+
+    let out = tool_search(&json!({"path": &path, "query": "compute"})).unwrap();
+    assert!(
+        out.contains("pre-crash snapshot"),
+        "expected a degrade banner, got: {out}"
+    );
+}

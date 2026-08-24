@@ -431,6 +431,35 @@ impl Infigraph {
         }
     }
 
+    /// Like [`init_read_only`](Self::init_read_only), but degrades to the
+    /// most recent pre-crash snapshot on a dead-holder WAL instead of
+    /// failing outright -- see `graph::store::open_read_only_or_degrade`.
+    /// Neo4j has no local-graph crash-recovery concept, so it always
+    /// returns `Ok(None)` there.
+    pub fn init_read_only_or_degrade(&mut self) -> Result<Option<graph::DegradeReason>> {
+        let backend_env = std::env::var("INFIGRAPH_BACKEND").unwrap_or_else(|_| "kuzu".into());
+        match backend_env.as_str() {
+            #[cfg(feature = "neo4j")]
+            "neo4j" => {
+                let neo = graph::Neo4jBackend::connect_from_env()?;
+                self.backend_kind = BackendKind::Neo4j(neo);
+                Ok(None)
+            }
+            #[cfg(not(feature = "neo4j"))]
+            "neo4j" => {
+                anyhow::bail!("neo4j backend requested but binary compiled without `neo4j` feature")
+            }
+            _ => {
+                let (kb, reason) = open_kuzu_with_retry(
+                    || graph::KuzuBackend::open_read_only_or_degrade(&self.db_path),
+                    std::time::Duration::from_secs(3),
+                )?;
+                self.backend_kind = BackendKind::Kuzu(kb);
+                Ok(reason)
+            }
+        }
+    }
+
     /// A full reindex is the most expensive operation in the write
     /// protocol -- on a large repo it can legitimately run for many
     /// minutes. `submit_write_request`'s timeout is a hard deadline (the

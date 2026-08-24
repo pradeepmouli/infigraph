@@ -8,7 +8,9 @@ use infigraph_core::graph::SessionStore;
 use infigraph_core::multi::Registry;
 use infigraph_languages::bundled_registry;
 
-use super::helpers::{glob_matches, open_prism_read_only};
+use super::helpers::{
+    degrade_banner, glob_matches, open_prism_read_only, open_prism_read_only_or_degrade,
+};
 
 pub fn tool_query_graph(args: &Value) -> Result<String> {
     let prism = open_prism_read_only(args)?;
@@ -64,7 +66,7 @@ pub fn tool_get_stats(args: &Value) -> Result<String> {
 }
 
 pub fn tool_get_code_snippet(args: &Value) -> Result<String> {
-    let prism = open_prism_read_only(args)?;
+    let (prism, degrade_reason) = open_prism_read_only_or_degrade(args)?;
     let symbol_id = args
         .get("symbol_id")
         .and_then(|s| s.as_str())
@@ -102,6 +104,9 @@ pub fn tool_get_code_snippet(args: &Value) -> Result<String> {
         detail.kind, detail.name, detail.file, detail.start_line, detail.end_line
     );
     out.push_str(&snippet);
+    if let Some(ref reason) = degrade_reason {
+        out = format!("{}{out}", degrade_banner(reason));
+    }
     Ok(out)
 }
 
