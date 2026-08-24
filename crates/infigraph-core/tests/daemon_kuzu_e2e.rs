@@ -1061,3 +1061,79 @@ fn plain_index_ignores_no_watch_opt_out_for_the_required_backend_daemon() {
 
     std::fs::write(project.path().join(".infigraph").join("watch.stop"), b"").unwrap();
 }
+
+#[test]
+fn a_dead_holder_wal_sentinel_triggers_an_automatic_full_reindex_via_the_real_daemon() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(project.path().join("a.py"), "def a():\n    pass\n").unwrap();
+
+    // start_real_daemon bootstrap-indexes and spawns a real, live daemon --
+    // `.infigraph/` and a real daemon-servable graph both exist by the time
+    // this returns, matching how a real crash would be discovered.
+    let daemon = start_real_daemon(project.path());
+
+    let infigraph_dir = project.path().join(".infigraph");
+    // Simulate what open_read_only_or_degrade does on detecting a
+    // dead-holder WAL, without a real crash: drop the sentinel directly.
+    infigraph_core::recovery::mark_recovery_needed(
+        &infigraph_dir,
+        999_999_999,
+        &infigraph_dir.join("graph.corrupt.stub"),
+    )
+    .unwrap();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let mut cleared = false;
+    while std::time::Instant::now() < deadline {
+        if !infigraph_core::recovery::pending_recovery(&infigraph_dir) {
+            cleared = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    assert!(
+        cleared,
+        "daemon must clear the recovery-needed sentinel within 30s"
+    );
+    assert_eq!(
+        infigraph_core::recovery::recent_recovery_attempts(&infigraph_dir)
+            .unwrap()
+            .len(),
+        1,
+        "exactly one auto-triggered rebuild must be recorded"
+    );
+
+    drop(daemon);
+}
+
+#[test]
+fn a_third_recovery_trigger_inside_the_window_trips_the_crash_loop_breaker_instead_of_rebuilding() {
+    let tmp = tempfile::tempdir().unwrap();
+    let infigraph_dir = tmp.path().join(".infigraph");
+    std::fs::create_dir_all(&infigraph_dir).unwrap();
+    for _ in 0..infigraph_core::recovery::CRASH_LOOP_THRESHOLD {
+        infigraph_core::recovery::record_recovery_attempt(&infigraph_dir).unwrap();
+    }
+    infigraph_core::recovery::mark_recovery_needed(
+        &infigraph_dir,
+        1,
+        &infigraph_dir.join("graph.corrupt.stub"),
+    )
+    .unwrap();
+
+    infigraph_core::recovery::drain_recovery_sentinel(&infigraph_dir).unwrap();
+
+    assert!(
+        infigraph_core::recovery::crash_loop_detected(&infigraph_dir).is_some(),
+        "breaker must trip at the threshold"
+    );
+    let requests: usize = std::fs::read_dir(infigraph_dir.join("requests"))
+        .map(|d| d.count())
+        .unwrap_or(0);
+    assert_eq!(
+        requests, 0,
+        "must not submit another FullReindex once tripped"
+    );
+}

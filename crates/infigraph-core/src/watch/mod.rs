@@ -569,7 +569,16 @@ where
         // scoped to `.infigraph/requests/`) is deferred: it needs a `select!`
         // arm, and this coordinator is deliberately synchronous.
         if serve_requests {
-            let requests_dir = root.join(".infigraph").join("requests");
+            // R3.1.4a/c: translate a pending dead-holder-WAL sentinel into a
+            // synthetic FullReindex request (or a crash-loop refusal) before
+            // scanning for requests below, so this same tick's scan picks
+            // the synthetic request up immediately rather than waiting a
+            // full COORDINATOR_TICK.
+            if let Err(e) = crate::recovery::drain_recovery_sentinel(&infigraph_dir) {
+                eprintln!("[watch] recovery-sentinel handling failed: {e}");
+            }
+
+            let requests_dir = infigraph_dir.join("requests");
             if let Ok(entries) = std::fs::read_dir(&requests_dir) {
                 for entry in entries.flatten() {
                     let path = entry.path();
