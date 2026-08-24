@@ -48,6 +48,86 @@ pub(crate) fn check_disk_headroom(dir: &Path, projected_write_bytes: u64) -> Res
     }
 }
 
+const GRAPH_GROWTH_MAX_RATIO_ENV: &str = "INFIGRAPH_GRAPH_GROWTH_MAX_RATIO";
+/// Observed pathological incidents (github.com/pradeepmouli/infigraph#100)
+/// were 40-70x a healthy graph's size; 10x gives wide headroom for
+/// legitimate growth (large refactors, new language support landing) while
+/// still catching the actual pattern well before it reaches disk-filling
+/// scale. Env-overridable following the exact precedent
+/// `quarantine::quarantine_max_bytes`'s `INFIGRAPH_QUARANTINE_MAX_BYTES`
+/// already sets.
+const DEFAULT_GRAPH_GROWTH_MAX_RATIO: u64 = 10;
+
+fn graph_growth_max_ratio() -> u64 {
+    std::env::var(GRAPH_GROWTH_MAX_RATIO_ENV)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_GRAPH_GROWTH_MAX_RATIO)
+}
+
+fn graph_health_path(infigraph_dir: &Path) -> std::path::PathBuf {
+    infigraph_dir.join("graph.health.json")
+}
+
+fn read_healthy_size(infigraph_dir: &Path) -> Option<u64> {
+    let content = std::fs::read_to_string(graph_health_path(infigraph_dir)).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&content).ok()?;
+    v.get("healthy_size_bytes")?.as_u64()
+}
+
+/// Refreshes the recorded "last known healthy size" baseline. Call this
+/// after any write that completes successfully (the same call sites that
+/// call `check_graph_growth_ratio` before the write), so the baseline
+/// tracks legitimate growth over time rather than freezing at whatever size
+/// the graph happened to be the first time this feature ran.
+pub(crate) fn stamp_healthy_graph_size(infigraph_dir: &Path, graph_path: &Path) {
+    let Ok(meta) = std::fs::metadata(graph_path) else {
+        return; // nothing written yet -- nothing to stamp
+    };
+    let payload = serde_json::json!({ "healthy_size_bytes": meta.len() });
+    let _ = crate::daemon_protocol::write_atomic(
+        &graph_health_path(infigraph_dir),
+        &serde_json::to_string_pretty(&payload).unwrap_or_default(),
+    );
+}
+
+/// Circuit breaker against the runaway-WAL-growth pattern from #100 (a live
+/// graph observed growing 40-70x its healthy size before crashing). This is
+/// NOT a fix for the underlying cause (why Kuzu's WAL isn't checkpointing
+/// under the observed workloads) -- only a refusal before a write can push
+/// the graph further into that pattern. The first call for a given
+/// `infigraph_dir` establishes the baseline rather than refusing -- there's
+/// nothing to compare against yet.
+pub(crate) fn check_graph_growth_ratio(
+    infigraph_dir: &Path,
+    graph_path: &Path,
+) -> Result<(), String> {
+    let Some(healthy) = read_healthy_size(infigraph_dir) else {
+        stamp_healthy_graph_size(infigraph_dir, graph_path);
+        return Ok(());
+    };
+    let Ok(meta) = std::fs::metadata(graph_path) else {
+        return Ok(()); // fresh/missing graph -- nothing to compare
+    };
+    let current = meta.len();
+    let max_allowed = healthy.saturating_mul(graph_growth_max_ratio());
+    if current > max_allowed {
+        return Err(format!(
+            "graph at {} is {} MB, {}x its recorded healthy size ({} MB) -- refusing further \
+             growth (cap: {}x, override with {GRAPH_GROWTH_MAX_RATIO_ENV}); this guards against \
+             the runaway-WAL-growth pattern from github.com/pradeepmouli/infigraph#100 -- if this \
+             growth is legitimate, delete {} to reset the baseline",
+            graph_path.display(),
+            current / (1024 * 1024),
+            current / healthy.max(1),
+            healthy / (1024 * 1024),
+            graph_growth_max_ratio(),
+            graph_health_path(infigraph_dir).display(),
+        ));
+    }
+    Ok(())
+}
+
 /// Serialized-size proxy for a batch of file extractions, used as the
 /// `check_disk_headroom` write estimate by bulk upsert/resolve paths that
 /// have no raw source-file byte count on hand (unlike SCIP import, which
@@ -298,8 +378,43 @@ pub fn classify_file(file: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        check_disk_headroom, classify_file, extract_bad_copy_value, resolve_import_candidate,
+        check_disk_headroom, check_graph_growth_ratio, classify_file, extract_bad_copy_value,
+        resolve_import_candidate, stamp_healthy_graph_size,
     };
+
+    #[test]
+    fn growth_check_establishes_a_baseline_on_first_call_rather_than_refusing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let graph_path = tmp.path().join("graph");
+        std::fs::write(&graph_path, vec![0u8; 1024]).unwrap();
+
+        assert!(check_graph_growth_ratio(tmp.path(), &graph_path).is_ok());
+        assert!(tmp.path().join("graph.health.json").exists());
+    }
+
+    #[test]
+    fn growth_check_refuses_once_current_size_exceeds_the_ratio() {
+        let tmp = tempfile::tempdir().unwrap();
+        let graph_path = tmp.path().join("graph");
+        std::fs::write(&graph_path, vec![0u8; 1_000_000]).unwrap();
+        stamp_healthy_graph_size(tmp.path(), &graph_path); // baseline: ~1MB
+
+        std::fs::write(&graph_path, vec![0u8; 20_000_000]).unwrap(); // 20x -- over the 10x default
+        let err = check_graph_growth_ratio(tmp.path(), &graph_path)
+            .expect_err("20x growth over a 1MB baseline must be refused at the 10x default");
+        assert!(err.contains("healthy size"), "unexpected message: {err}");
+    }
+
+    #[test]
+    fn growth_check_passes_for_ordinary_growth_under_the_ratio() {
+        let tmp = tempfile::tempdir().unwrap();
+        let graph_path = tmp.path().join("graph");
+        std::fs::write(&graph_path, vec![0u8; 1_000_000]).unwrap();
+        stamp_healthy_graph_size(tmp.path(), &graph_path);
+
+        std::fs::write(&graph_path, vec![0u8; 3_000_000]).unwrap(); // 3x -- under the 10x default
+        assert!(check_graph_growth_ratio(tmp.path(), &graph_path).is_ok());
+    }
 
     #[test]
     fn disk_headroom_passes_for_tiny_projected_write_on_real_dir() {

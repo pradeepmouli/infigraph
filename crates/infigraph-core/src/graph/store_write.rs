@@ -26,11 +26,19 @@ impl GraphStore {
             if let Err(shortfall) = super::store_util::check_disk_headroom(dir, projected) {
                 anyhow::bail!("refusing to index -- {shortfall}");
             }
+            // R3.1.4d/#100: circuit breaker against the runaway-graph-growth
+            // pattern, same call site as the disk-headroom preflight above.
+            if let Err(msg) = super::store_util::check_graph_growth_ratio(dir, &dir.join("graph")) {
+                anyhow::bail!("refusing to index -- {msg}");
+            }
         }
 
         let conn = self.connection()?;
         self.upsert_file_conn(&conn, extraction, &lock)?;
         self.bump_ast_generation_conn(&conn, &lock)?;
+        if let Some(dir) = self.db_dir() {
+            super::store_util::stamp_healthy_graph_size(dir, &dir.join("graph"));
+        }
         Ok(())
     }
 

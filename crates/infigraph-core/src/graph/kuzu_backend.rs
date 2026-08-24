@@ -447,6 +447,13 @@ impl GraphBackend for KuzuBackend {
             if let Err(shortfall) = crate::graph::store_util::check_disk_headroom(dir, projected) {
                 anyhow::bail!("refusing to index -- {shortfall}");
             }
+            // R3.1.4d/#100: circuit breaker against the runaway-graph-growth
+            // pattern, same call site as the disk-headroom preflight above.
+            if let Err(msg) =
+                crate::graph::store_util::check_graph_growth_ratio(dir, &dir.join("graph"))
+            {
+                anyhow::bail!("refusing to index -- {msg}");
+            }
         }
 
         let use_csv = existing_hashes_empty || extractions.len() > 100;
@@ -487,6 +494,10 @@ impl GraphBackend for KuzuBackend {
         // R3.3.3: bump once per completed write, so sidecars built from a
         // now-stale generation can be detected rather than served.
         self.store.bump_ast_generation_conn(&conn, &write_lock)?;
+
+        if let Some(dir) = self.store.db_dir() {
+            crate::graph::store_util::stamp_healthy_graph_size(dir, &dir.join("graph"));
+        }
 
         Ok(())
     }

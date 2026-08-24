@@ -72,6 +72,13 @@ pub fn import_scip_index(
         {
             anyhow::bail!("Auto-SCIP: refusing to import -- {shortfall}");
         }
+        // R3.1.4d/#100: circuit breaker against the runaway-graph-growth
+        // pattern, same call site as the disk-headroom preflight above.
+        if let Err(msg) =
+            crate::graph::store_util::check_graph_growth_ratio(dir, &dir.join("graph"))
+        {
+            anyhow::bail!("Auto-SCIP: refusing to import -- {msg}");
+        }
     }
 
     // Load learned pattern store for recording SCIP corrections
@@ -577,6 +584,10 @@ pub fn import_scip_index(
     // comparing this against ast_generation surfaces exactly the drift the
     // watcher's AST-only incremental reindex silently leaves behind.
     store.bump_scip_generation_conn(&conn, &_lock)?;
+
+    if let Some(dir) = store.db_dir() {
+        crate::graph::store_util::stamp_healthy_graph_size(dir, &dir.join("graph"));
+    }
 
     Ok(stats)
 }
