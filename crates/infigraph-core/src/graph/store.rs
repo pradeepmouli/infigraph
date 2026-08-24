@@ -23,6 +23,15 @@ const GRAPH_WRITE_ROLE: &str = "graph-write";
 /// are short; 30s of waiting means something is wedged — surface it.
 const GRAPH_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// Wait budget for `open_read_only_or_degrade`'s lock-then-recheck step
+/// before quarantining a dead-holder graph. Shorter than
+/// `GRAPH_WRITE_TIMEOUT`: this runs on read paths (MCP tool calls, CLI
+/// reads) that callers expect to be responsive, and a concurrent rebuild
+/// finishing within this window is the only case that changes the outcome
+/// -- past it, quarantining under the original (pre-lock) evidence is
+/// still correct, just delayed by however long the wait took.
+const QUARANTINE_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 impl WriteLock {
     fn acquire(lock_path: &Path) -> Result<Self> {
         Self::acquire_with_timeout(lock_path, GRAPH_WRITE_TIMEOUT)
@@ -380,8 +389,33 @@ impl GraphStore {
         if path.exists() {
             let lock_path = db_lock_path(path);
             if let Some(pid) = unclean_shutdown_wal_holder(path, &lock_path) {
+                // `quarantine_graph` requires the caller already hold
+                // `graph.lock` (same path as `lock_path` -- see
+                // `db_lock_path`'s doc comment): without it, a concurrent
+                // writer could replace this dead-holder graph with a
+                // healthy rebuild between the peek above and the
+                // quarantine call below, and this reader would then rename
+                // that healthy rebuild aside as corrupt (adversarial
+                // review finding on R3.1.4).
+                let graph_lock = crate::lockfile::acquire(
+                    &lock_path,
+                    "read-triggered-quarantine",
+                    QUARANTINE_LOCK_TIMEOUT,
+                )?;
+                // Acquiring the lock stamps our own identity into its
+                // payload, so the *holder* it now names is us -- re-check
+                // the on-disk condition directly instead. With the lock
+                // held, no other writer can be mid-rebuild, so a WAL
+                // sibling still present means the state genuinely wasn't
+                // fixed while this reader waited.
+                let still_dead = !wal_family_paths(path).is_empty();
+                if !still_dead {
+                    drop(graph_lock);
+                    return Self::open_read_only(path).map(|s| (s, None));
+                }
                 crate::quarantine::quarantine_graph(infigraph_dir, &graph_name)?;
                 crate::recovery::mark_recovery_needed(infigraph_dir, pid, path)?;
+                drop(graph_lock);
                 return Self::degrade_or_refuse(infigraph_dir, &graph_name, pid);
             }
             return Self::open_read_only(path).map(|s| (s, None));
@@ -919,6 +953,70 @@ mod tests {
         assert!(
             err.to_string().contains("crash-loop"),
             "must be the distinct crash-loop wording, not the generic quarantine message: {err}"
+        );
+    }
+
+    /// Regression test (adversarial review of R3.1.4): `open_read_only_or_degrade`
+    /// used to call `quarantine_graph` without holding `graph.lock`, despite
+    /// `quarantine_graph`'s explicit caller-holds-the-lock contract. A reader
+    /// that peeked a dead-holder WAL could still be racing a concurrent writer
+    /// that legitimately rebuilds the graph in the meantime -- destroying a
+    /// completed rebuild by quarantining it as if it were still corrupt.
+    #[test]
+    fn open_read_only_or_degrade_does_not_quarantine_a_graph_a_concurrent_writer_just_healed() {
+        let dir = tempfile::tempdir().unwrap();
+        let infigraph_dir = dir.path();
+        let db_path = infigraph_dir.join("graph");
+
+        // Seed the dead-holder-WAL scenario the initial (pre-lock) peek must see.
+        std::fs::write(&db_path, vec![0u8; MIN_DB_FILE_SIZE as usize]).unwrap();
+        std::fs::write(infigraph_dir.join("graph.wal"), b"stub wal").unwrap();
+        let lock_path = db_lock_path(&db_path);
+        write_holder_lock(&lock_path, DEAD_PID);
+
+        // Hold the raw OS flock ourselves -- deliberately bypassing
+        // `lockfile::acquire`'s identity stamp, which would overwrite the
+        // dead-pid payload the pre-lock peek below needs to still see.
+        // This forces the reader to block on acquisition exactly like a
+        // real concurrent writer would.
+        let held_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        fs2::FileExt::try_lock_exclusive(&held_file).unwrap();
+
+        let infigraph_dir_owned = infigraph_dir.to_path_buf();
+        let db_path_for_writer = db_path.clone();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            // Simulate a completed concurrent rebuild while still holding
+            // the raw flock, exactly as a real writer holds `graph.lock`
+            // for its whole rebuild: replace the stub with a real,
+            // cleanly-closed graph (no WAL sibling left behind), all
+            // before releasing. Using `GraphStore::open` here would
+            // self-deadlock -- it acquires this same lock internally.
+            std::fs::remove_file(&db_path_for_writer).unwrap();
+            std::fs::remove_file(infigraph_dir_owned.join("graph.wal")).unwrap();
+            Database::new(&db_path_for_writer, SystemConfig::default()).unwrap();
+            fs2::FileExt::unlock(&held_file).unwrap();
+        });
+
+        let (store, reason) = GraphStore::open_read_only_or_degrade(&db_path).unwrap();
+        writer.join().unwrap();
+        drop(store);
+
+        assert!(
+            reason.is_none(),
+            "graph was healed by the time the lock was acquired -- must open it normally, not degrade: {reason:?}"
+        );
+        assert!(
+            db_path.exists(),
+            "the concurrently-rebuilt graph must not have been quarantined"
+        );
+        assert!(
+            !crate::recovery::pending_recovery(infigraph_dir),
+            "no recovery sentinel should be left behind for a graph that was never actually quarantined"
         );
     }
 
