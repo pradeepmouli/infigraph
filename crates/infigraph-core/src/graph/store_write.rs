@@ -37,7 +37,7 @@ impl GraphStore {
         self.upsert_file_conn(&conn, extraction, &lock)?;
         self.bump_ast_generation_conn(&conn, &lock)?;
         if let Some(dir) = self.db_dir() {
-            super::store_util::stamp_healthy_graph_size(dir, &dir.join("graph"));
+            super::store_util::stamp_healthy_graph_size_if_unset(dir, &dir.join("graph"));
         }
         Ok(())
     }

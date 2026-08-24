@@ -1516,6 +1516,13 @@ fn finish_full_reindex(
     // declaring success and discarding the ability to roll back.
     match watch_db(root, registry, held) {
         Ok(prism) => {
+            // R3.1.4d/#100: this is a *verified* healthy checkpoint -- the
+            // swap succeeded and the swapped-in graph just reopened -- so
+            // it's the right moment to refresh the growth-ratio breaker's
+            // baseline. Ordinary incremental writes deliberately do not
+            // (see `stamp_healthy_graph_size`'s doc comment).
+            crate::graph::stamp_healthy_graph_size(&infigraph_dir, &live_path);
+
             // Reconcile embeddings against the NEW graph -- update_embeddings
             // queries the live symbol set and prunes anything not in it, so
             // this converges embeddings.bin to the rebuilt graph regardless

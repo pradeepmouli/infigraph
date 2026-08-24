@@ -496,7 +496,7 @@ impl GraphBackend for KuzuBackend {
         self.store.bump_ast_generation_conn(&conn, &write_lock)?;
 
         if let Some(dir) = self.store.db_dir() {
-            crate::graph::store_util::stamp_healthy_graph_size(dir, &dir.join("graph"));
+            crate::graph::store_util::stamp_healthy_graph_size_if_unset(dir, &dir.join("graph"));
         }
 
         Ok(())

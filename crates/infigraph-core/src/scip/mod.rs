@@ -586,7 +586,7 @@ pub fn import_scip_index(
     store.bump_scip_generation_conn(&conn, &_lock)?;
 
     if let Some(dir) = store.db_dir() {
-        crate::graph::store_util::stamp_healthy_graph_size(dir, &dir.join("graph"));
+        crate::graph::store_util::stamp_healthy_graph_size_if_unset(dir, &dir.join("graph"));
     }
 
     Ok(stats)
