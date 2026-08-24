@@ -569,7 +569,7 @@ fn check_one_watcher(project_path: &Path) -> CheckResult {
                 "watcher (PID {}) is alive and healthy, but no MCP server instance is \
                  currently serving this project -- log: {}",
                 holder.pid,
-                project_path.join(".infigraph").join("watch.log").display()
+                project_path.join(".infigraph").join("daemon.log").display()
             ),
             format!(
                 "likely left running from a closed MCP session -- if you're not also using it \
@@ -586,7 +586,7 @@ fn check_one_watcher(project_path: &Path) -> CheckResult {
         format!(
             "watcher (PID {}) alive with fresh heartbeat -- log: {}",
             holder.pid,
-            project_path.join(".infigraph").join("watch.log").display()
+            project_path.join(".infigraph").join("daemon.log").display()
         ),
     )
 }
@@ -729,6 +729,13 @@ fn path_size(path: &Path) -> u64 {
     }
 }
 
+fn disk_scope_label(ctx: &DoctorContext) -> String {
+    match &ctx.scope {
+        DoctorScope::Project(path) => path.display().to_string(),
+        DoctorScope::Global => "global".to_string(),
+    }
+}
+
 pub fn check_disk(ctx: &DoctorContext) -> Vec<CheckResult> {
     let mut results = Vec::new();
 
@@ -739,18 +746,40 @@ pub fn check_disk(ctx: &DoctorContext) -> Vec<CheckResult> {
             "could not determine free disk space",
             "check filesystem permissions",
         ),
-        Some(free) if free < DISK_FAIL_BYTES => CheckResult::fail(
-            DISK_CATEGORY,
-            "disk: free space",
-            format!("only {} MB free (below the 2GB floor)", free / (1024 * 1024)),
-            "free up disk space immediately -- low disk has already caused a real MCP server crash mid-index (see I-16/I-17 in DESIGN-hardening.md)",
-        ),
-        Some(free) if free < DISK_WARN_BYTES => CheckResult::warn(
-            DISK_CATEGORY,
-            "disk: free space",
-            format!("{} MB free (below the 10GB warn floor)", free / (1024 * 1024)),
-            "consider freeing disk space soon",
-        ),
+        Some(free) if free < DISK_FAIL_BYTES => {
+            let why = format!(
+                "only {} MB free (below the 2GB floor)",
+                free / (1024 * 1024)
+            );
+            // R3.1.4's exit-reason logging pass added this: a shrinking
+            // disk has already caused a real, hard-to-diagnose MCP process
+            // kill (an uncatchable SIGKILL logs nothing anywhere -- see
+            // the incident this traces back to). `doctor` only reports the
+            // *current* free-space number to whoever happens to run it;
+            // the audit trail is what lets a human later confirm the
+            // shrinking trend actually happened, at what point, well
+            // before the eventual kill.
+            crate::audit::audit_log("disk", "critical-free-space", &why, &disk_scope_label(ctx));
+            CheckResult::fail(
+                DISK_CATEGORY,
+                "disk: free space",
+                why,
+                "free up disk space immediately -- low disk has already caused a real MCP server crash mid-index (see I-16/I-17 in DESIGN-hardening.md)",
+            )
+        }
+        Some(free) if free < DISK_WARN_BYTES => {
+            let why = format!(
+                "{} MB free (below the 10GB warn floor)",
+                free / (1024 * 1024)
+            );
+            crate::audit::audit_log("disk", "low-free-space", &why, &disk_scope_label(ctx));
+            CheckResult::warn(
+                DISK_CATEGORY,
+                "disk: free space",
+                why,
+                "consider freeing disk space soon",
+            )
+        }
         Some(free) => CheckResult::pass(
             DISK_CATEGORY,
             "disk: free space",

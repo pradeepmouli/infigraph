@@ -619,21 +619,21 @@ fn scip_enrich_exit_message(
 }
 
 pub(crate) fn ensure_watcher_running(root: &Path) {
-    if infigraph_core::watch::daemon::is_ci_env() {
+    if infigraph_core::daemon::lifecycle::is_ci_env() {
         return;
     }
     let exe = match std::env::current_exe() {
         Ok(e) => e,
         Err(_) => return,
     };
-    match infigraph_core::watch::daemon::ensure_daemon_running(root, &exe) {
-        infigraph_core::watch::daemon::DaemonStartOutcome::Spawned => {
+    match infigraph_core::daemon::lifecycle::ensure_daemon_running(root, &exe) {
+        infigraph_core::daemon::lifecycle::DaemonStartOutcome::Spawned => {
             eprintln!("[auto-watch] Watcher started");
         }
-        infigraph_core::watch::daemon::DaemonStartOutcome::Failed(e) => {
+        infigraph_core::daemon::lifecycle::DaemonStartOutcome::Failed(e) => {
             eprintln!("[auto-watch] Failed to start watcher: {e}");
         }
-        infigraph_core::watch::daemon::DaemonStartOutcome::AlreadyRunning => {}
+        infigraph_core::daemon::lifecycle::DaemonStartOutcome::AlreadyRunning => {}
     }
 }
 
@@ -643,7 +643,7 @@ pub(crate) fn ensure_watcher_running(root: &Path) {
 /// item 3's race). Thin wrapper over the core primitive shared with
 /// `Infigraph::ensure_daemon_for_writes`'s own wait.
 pub(crate) fn wait_for_daemon(lock_path: &Path, budget: std::time::Duration) -> bool {
-    infigraph_core::watch::daemon::wait_for_daemon_ready(lock_path, budget)
+    infigraph_core::daemon::lifecycle::wait_for_daemon_ready(lock_path, budget)
 }
 
 pub(crate) fn on_path(cmd: &str) -> bool {
@@ -1984,7 +1984,9 @@ mod tests {
         // Each repo should be checkable independently
         for repo in &repos {
             let lock_path = repo.path().join(".infigraph").join("watch.lock");
-            assert!(!infigraph_core::watch::daemon::daemon_is_alive(&lock_path));
+            assert!(!infigraph_core::daemon::lifecycle::daemon_is_alive(
+                &lock_path
+            ));
         }
     }
 
@@ -2019,8 +2021,8 @@ mod tests {
         file_a.lock_exclusive().unwrap();
 
         // Repo B should be unlocked
-        assert!(infigraph_core::watch::daemon::daemon_is_alive(&lock_a));
-        assert!(!infigraph_core::watch::daemon::daemon_is_alive(&lock_b));
+        assert!(infigraph_core::daemon::lifecycle::daemon_is_alive(&lock_a));
+        assert!(!infigraph_core::daemon::lifecycle::daemon_is_alive(&lock_b));
 
         file_a.unlock().unwrap();
     }
@@ -2058,7 +2060,9 @@ mod tests {
         file.lock_exclusive().unwrap();
 
         // Simulate what cmd_delete_project does: check alive → write sentinel
-        assert!(infigraph_core::watch::daemon::daemon_is_alive(&lock_path));
+        assert!(infigraph_core::daemon::lifecycle::daemon_is_alive(
+            &lock_path
+        ));
         let sentinel = tg_dir.join("watch.stop");
         fs::write(&sentinel, b"").unwrap();
         assert!(sentinel.exists());

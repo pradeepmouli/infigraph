@@ -84,14 +84,14 @@ fn auto_start_doc_watch_inner(path: &str, skip_disabled_check: bool) -> Option<S
         return None;
     }
 
-    if infigraph_core::watch::daemon::watch_daemon_mode_enabled() {
+    if infigraph_core::daemon::lifecycle::watch_daemon_mode_enabled() {
         return match super::watch::ensure_daemon_watcher(&root, "watch_docs") {
-            Ok(infigraph_core::watch::daemon::DaemonStartOutcome::Spawned) => {
+            Ok(infigraph_core::daemon::lifecycle::DaemonStartOutcome::Spawned) => {
                 eprintln!("[auto-watch] Started daemon watcher for {root_str}");
                 Some(format!("Daemon watcher started for {root_str}"))
             }
-            Ok(infigraph_core::watch::daemon::DaemonStartOutcome::AlreadyRunning) => None,
-            Ok(infigraph_core::watch::daemon::DaemonStartOutcome::Failed(e)) => {
+            Ok(infigraph_core::daemon::lifecycle::DaemonStartOutcome::AlreadyRunning) => None,
+            Ok(infigraph_core::daemon::lifecycle::DaemonStartOutcome::Failed(e)) => {
                 eprintln!("[auto-watch] Failed to start daemon watcher: {e}");
                 None
             }
@@ -599,15 +599,15 @@ pub fn tool_watch_docs(args: &Value) -> Result<String> {
         ));
     }
 
-    if infigraph_core::watch::daemon::watch_daemon_mode_enabled() {
+    if infigraph_core::daemon::lifecycle::watch_daemon_mode_enabled() {
         return match super::watch::ensure_daemon_watcher(&root, "watch_docs")? {
-            infigraph_core::watch::daemon::DaemonStartOutcome::Spawned => {
+            infigraph_core::daemon::lifecycle::DaemonStartOutcome::Spawned => {
                 Ok(format!("Daemon watcher started for {root_str}"))
             }
-            infigraph_core::watch::daemon::DaemonStartOutcome::AlreadyRunning => {
+            infigraph_core::daemon::lifecycle::DaemonStartOutcome::AlreadyRunning => {
                 Ok(format!("Daemon watcher already running for {root_str}"))
             }
-            infigraph_core::watch::daemon::DaemonStartOutcome::Failed(e) => {
+            infigraph_core::daemon::lifecycle::DaemonStartOutcome::Failed(e) => {
                 Err(anyhow::anyhow!("Failed to start daemon watcher: {e}"))
             }
         };

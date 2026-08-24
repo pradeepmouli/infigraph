@@ -63,7 +63,7 @@ fn start_daemon_watcher_for_startup_dir_respects_boot_toggle() {
     // built without it, matching `watch_daemon.rs`'s
     // `init_daemon_backend_starts_a_daemon` precedent (infigraph-mcp has no
     // dev-dependency on infigraph-cli, so cargo won't build it for us).
-    let Ok(_cli) = infigraph_core::watch::daemon::resolve_cli_binary_sibling_of(
+    let Ok(_cli) = infigraph_core::daemon::lifecycle::resolve_cli_binary_sibling_of(
         &std::env::current_exe().unwrap(),
     ) else {
         eprintln!("skipping: infigraph CLI binary not built in this target dir");
@@ -118,7 +118,7 @@ fn start_daemon_watcher_for_startup_dir_respects_boot_toggle() {
 fn start_daemon_watcher_for_startup_dir_respects_watch_enabled_policy() {
     let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
-    let Ok(_cli) = infigraph_core::watch::daemon::resolve_cli_binary_sibling_of(
+    let Ok(_cli) = infigraph_core::daemon::lifecycle::resolve_cli_binary_sibling_of(
         &std::env::current_exe().unwrap(),
     ) else {
         eprintln!("skipping: infigraph CLI binary not built in this target dir");
@@ -159,7 +159,7 @@ fn start_daemon_watcher_for_startup_dir_respects_watch_enabled_policy() {
 fn start_daemon_watcher_for_startup_dir_never_touches_other_projects() {
     let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
-    let Ok(_cli) = infigraph_core::watch::daemon::resolve_cli_binary_sibling_of(
+    let Ok(_cli) = infigraph_core::daemon::lifecycle::resolve_cli_binary_sibling_of(
         &std::env::current_exe().unwrap(),
     ) else {
         eprintln!("skipping: infigraph CLI binary not built in this target dir");
@@ -212,7 +212,7 @@ fn start_daemon_watcher_for_startup_dir_never_touches_other_projects() {
 fn start_daemon_watcher_for_startup_dir_catches_drift_from_before_it_was_running() {
     let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
-    let Ok(_cli) = infigraph_core::watch::daemon::resolve_cli_binary_sibling_of(
+    let Ok(_cli) = infigraph_core::daemon::lifecycle::resolve_cli_binary_sibling_of(
         &std::env::current_exe().unwrap(),
     ) else {
         eprintln!("skipping: infigraph CLI binary not built in this target dir");

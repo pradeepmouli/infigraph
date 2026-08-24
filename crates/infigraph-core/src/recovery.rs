@@ -3,7 +3,7 @@
 //! `.infigraph/`, mirroring the short-lived-file-then-append-log shape
 //! `dirty.rs`/`audit.rs` already use elsewhere in this crate: a
 //! "recovery needed" sentinel the daemon coordinator polls for
-//! (`drain_recovery_sentinel`, called from `watch::run_write_coordinator`),
+//! (`drain_recovery_sentinel`, called from `daemon::run_write_coordinator`),
 //! and a rolling attempts log the coordinator consults before acting on it.
 //!
 //! The read path (`graph::store::open_read_only_or_degrade`) only ever
@@ -140,7 +140,7 @@ pub fn find_most_recent_previous(infigraph_dir: &Path, graph_name: &str) -> Opti
 }
 
 /// The daemon coordinator's one-line integration point (called from
-/// `watch::run_write_coordinator`'s `serve_requests` tick). No-op when no
+/// `daemon::run_write_coordinator`'s `serve_requests` tick). No-op when no
 /// sentinel is pending. Otherwise: under the crash-loop threshold, submits
 /// a synthetic `WriteRequest::FullReindex` request file (the SAME request
 /// type and code path `infigraph index --full` uses) for this same tick's

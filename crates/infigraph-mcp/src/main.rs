@@ -46,6 +46,28 @@ fn main() -> Result<()> {
     }
 
     // Supervisor mode: spawn self as --worker, monitor for segfault, auto-reindex.
+    // The worker already logs a reason for every exit path it controls
+    // (panic, signal, stdin EOF, idle grace, supervisor-gone); the
+    // supervisor itself had neither a panic hook nor a signal handler --
+    // its own death (a panic, or a signal delivered directly to it rather
+    // than the process group) was exactly as invisible as what an
+    // uncatchable SIGKILL leaves behind. The worker's own
+    // `spawn_parent_monitor` already notices and self-exits (logging that)
+    // once this process is gone, so this handler only needs to log its own
+    // reason and exit -- not explicitly clean up the worker.
+    install_panic_hook();
+    {
+        let pid = std::process::id();
+        ctrlc::set_handler(move || {
+            mcp_log(
+                "INFO",
+                &format!("supervisor (pid {pid}): termination signal received -- exiting"),
+            );
+            std::process::exit(0);
+        })
+        .ok();
+    }
+
     // Remember the repo we were launched in: it's the primary recovery target
     // even when the global registry is empty (standalone use).
     let startup_dir = std::env::current_dir().ok();

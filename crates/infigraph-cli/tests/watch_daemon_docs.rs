@@ -4,7 +4,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 fn cli_binary() -> std::path::PathBuf {
-    // Mirrors infigraph_core::watch::daemon::resolve_cli_binary_sibling_of's
+    // Mirrors infigraph_core::daemon::lifecycle::resolve_cli_binary_sibling_of's
     // grandparent fallback: integration-test binaries live one level below
     // the real build output directory.
     let exe = std::env::current_exe().unwrap();
@@ -213,7 +213,10 @@ fn spawn_ready_daemon(
     });
 
     assert!(
-        infigraph_core::watch::daemon::wait_for_daemon_ready(&lock_path, Duration::from_secs(10)),
+        infigraph_core::daemon::lifecycle::wait_for_daemon_ready(
+            &lock_path,
+            Duration::from_secs(10)
+        ),
         "daemon never acquired watch.lock after spawn"
     );
 
@@ -268,13 +271,13 @@ fn legacy_watch_stop_alias_brings_the_whole_daemon_down() {
         "infigraph watch-stop exited non-zero: {watch_stop_status:?}"
     );
 
-    let mut still_alive = infigraph_core::watch::daemon::daemon_is_alive(&lock_path);
+    let mut still_alive = infigraph_core::daemon::lifecycle::daemon_is_alive(&lock_path);
     for _ in 0..50 {
         if !still_alive {
             break;
         }
         std::thread::sleep(Duration::from_millis(100));
-        still_alive = infigraph_core::watch::daemon::daemon_is_alive(&lock_path);
+        still_alive = infigraph_core::daemon::lifecycle::daemon_is_alive(&lock_path);
     }
     assert!(
         !still_alive,
@@ -340,7 +343,7 @@ fn watch_action_stop_leaves_the_daemon_process_alive() {
     );
 
     assert!(
-        infigraph_core::watch::daemon::daemon_is_alive(&lock_path),
+        infigraph_core::daemon::lifecycle::daemon_is_alive(&lock_path),
         "infigraph watch stop must not bring the daemon process down -- \
          it only signals code-watching to stop, not the whole daemon"
     );
@@ -360,13 +363,13 @@ fn watch_action_stop_leaves_the_daemon_process_alive() {
         "infigraph daemon-stop exited non-zero: {daemon_stop_status:?}"
     );
 
-    let mut still_alive = infigraph_core::watch::daemon::daemon_is_alive(&lock_path);
+    let mut still_alive = infigraph_core::daemon::lifecycle::daemon_is_alive(&lock_path);
     for _ in 0..50 {
         if !still_alive {
             break;
         }
         std::thread::sleep(Duration::from_millis(100));
-        still_alive = infigraph_core::watch::daemon::daemon_is_alive(&lock_path);
+        still_alive = infigraph_core::daemon::lifecycle::daemon_is_alive(&lock_path);
     }
     assert!(
         !still_alive,
@@ -418,6 +421,61 @@ fn kill_on_drop_kills_child_on_panic() {
     assert!(
         !still_alive,
         "KillOnDrop must kill child pid {pid} even when dropped during a panic unwind"
+    );
+}
+
+/// `infigraph daemon` had no panic hook at all before R3.1.4's exit-reason
+/// logging pass: a panic anywhere in the process unwound silently, leaving
+/// the same blank trail an uncatchable SIGKILL does. `INFIGRAPH_TEST_DAEMON_PANIC`
+/// forces a deterministic panic right after the hook installs (mirroring
+/// infigraph-mcp's `FORCE_COMPRESS_PANIC`/`FORCE_DEDUP_PANIC`) so this test
+/// doesn't depend on finding a real internal panic to trigger.
+#[test]
+fn a_panic_in_the_daemon_process_is_logged_before_it_exits() {
+    let bin = cli_binary();
+    if !bin.exists() {
+        eprintln!(
+            "skipping: infigraph CLI binary not found at {} (needs a full `cargo build`/`cargo test --workspace` first)",
+            bin.display()
+        );
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::create_dir_all(root.join(".infigraph")).unwrap();
+
+    let mut daemon = KillOnDrop(
+        Command::new(&bin)
+            .arg("daemon")
+            .current_dir(&root)
+            .env("INFIGRAPH_TEST_DAEMON_PANIC", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("failed to spawn infigraph daemon"),
+    );
+
+    let stderr = daemon.stderr.take().unwrap();
+    let captured = std::thread::spawn(move || {
+        use std::io::Read;
+        let mut buf = String::new();
+        BufReader::new(stderr).read_to_string(&mut buf).ok();
+        buf
+    });
+
+    let status = daemon.wait().expect("failed to wait on daemon process");
+    assert!(
+        !status.success(),
+        "a forced panic must not exit as if nothing happened, got {status:?}"
+    );
+
+    let captured = captured.join().expect("stderr reader thread panicked");
+    assert!(
+        captured.contains("[daemon] PANIC:")
+            && captured.contains("INFIGRAPH_TEST_DAEMON_PANIC forced panic"),
+        "expected the panic hook's log line on stderr, got: {captured}"
     );
 }
 
@@ -500,7 +558,10 @@ fn watch_docs_start_resumes_after_a_sentinel_triggered_stop() {
 
     let lock_path = root.join(".infigraph").join("watch.lock");
     assert!(
-        infigraph_core::watch::daemon::wait_for_daemon_ready(&lock_path, Duration::from_secs(10)),
+        infigraph_core::daemon::lifecycle::wait_for_daemon_ready(
+            &lock_path,
+            Duration::from_secs(10)
+        ),
         "daemon never acquired watch.lock after spawn"
     );
 

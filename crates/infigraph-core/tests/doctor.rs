@@ -700,6 +700,71 @@ fn check_disk_passes_above_10gb() {
     assert_eq!(free_space.status, CheckStatus::Pass);
 }
 
+/// R3.1.4: a shrinking disk has already caused a real, undiagnosable MCP
+/// process kill (an uncatchable SIGKILL logs nothing anywhere). `doctor`
+/// only reports the *current* free-space number to whoever happens to run
+/// it -- the audit trail is what lets a human later confirm a low reading
+/// actually happened, well before the eventual kill. HOME-dependent (like
+/// `audit.rs`'s own test), so this sets/restores it around the call.
+#[test]
+fn check_disk_below_warn_floor_writes_an_audit_log_entry() {
+    let tmp = tempfile::tempdir().unwrap();
+    let old_home = std::env::var_os("HOME");
+    std::env::set_var("HOME", tmp.path());
+
+    let ctx = DoctorContext {
+        registry: infigraph_core::multi::Registry::default(),
+        scope: DoctorScope::Global,
+        installed_build_hash: "h".to_string(),
+        disk_free_bytes: Some(5 * 1024 * 1024 * 1024), // 5GB -- warn, not fail
+        scan_roots: Vec::new(),
+    };
+    check_disk(&ctx);
+
+    let content = std::fs::read_to_string(tmp.path().join(".infigraph/logs/audit.log")).unwrap();
+    if let Some(h) = old_home {
+        std::env::set_var("HOME", h);
+    }
+
+    assert!(
+        content.contains("role=disk") && content.contains("action=low-free-space"),
+        "expected a disk audit entry, got: {content}"
+    );
+}
+
+/// Companion to the warn-floor test above: a healthy disk must NOT spam
+/// the audit trail -- only an actual low reading is worth a permanent
+/// record.
+#[test]
+fn check_disk_above_warn_floor_writes_no_audit_log_entry() {
+    let tmp = tempfile::tempdir().unwrap();
+    let old_home = std::env::var_os("HOME");
+    std::env::set_var("HOME", tmp.path());
+
+    let ctx = DoctorContext {
+        registry: infigraph_core::multi::Registry::default(),
+        scope: DoctorScope::Global,
+        installed_build_hash: "h".to_string(),
+        disk_free_bytes: Some(50 * 1024 * 1024 * 1024), // 50GB -- healthy
+        scan_roots: Vec::new(),
+    };
+    check_disk(&ctx);
+
+    let audit_path = tmp.path().join(".infigraph/logs/audit.log");
+    let exists_and_nonempty = audit_path.exists()
+        && !std::fs::read_to_string(&audit_path)
+            .unwrap_or_default()
+            .is_empty();
+    if let Some(h) = old_home {
+        std::env::set_var("HOME", h);
+    }
+
+    assert!(
+        !exists_and_nonempty,
+        "a healthy disk reading must not write an audit entry"
+    );
+}
+
 #[test]
 fn check_sidecars_warns_when_embeddings_older_than_graph_by_over_an_hour() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -966,12 +1031,12 @@ fn check_watchers_warns_when_alive_watcher_has_no_live_mcp_instance() {
         "message should explain no live MCP instance is serving this project: {}",
         watcher.message
     );
-    // R3.1.4g/#115: surfaces the watch.log path so a human diagnosing this
+    // R3.1.4g/#115: surfaces the daemon.log path so a human diagnosing this
     // exact "something's off" moment doesn't need to already know the
     // per-project convention to find the watcher's log.
     assert!(
-        watcher.message.contains("watch.log"),
-        "message should point at the watch.log path: {}",
+        watcher.message.contains("daemon.log"),
+        "message should point at the daemon.log path: {}",
         watcher.message
     );
 }

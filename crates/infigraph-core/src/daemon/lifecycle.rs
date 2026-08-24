@@ -395,7 +395,7 @@ pub fn build_daemon_command(root: &Path, tg_dir: &Path, watch_binary: &Path) -> 
     // write atomically seek-to-end, so a losing child's short "another
     // watcher is already running" message lands after the winner's output
     // instead of truncating it away.
-    let log_path = tg_dir.join("watch.log");
+    let log_path = tg_dir.join("daemon.log");
     // R7.3 (#83): cap before handing the file to the child as its stderr.
     // Rotate-at-spawn is the only safe point -- once the fd is inherited,
     // the child appends for its whole lifetime.
@@ -661,7 +661,7 @@ mod tests {
         let _ = child.wait();
     }
 
-    /// `build_daemon_command` must open `watch.log` in append mode: a losing
+    /// `build_daemon_command` must open `daemon.log` in append mode: a losing
     /// spawn attempt racing against an already-running daemon (see
     /// `ensure_daemon_running`'s probe-then-spawn window) must not truncate
     /// away the winner's existing log content.
@@ -670,7 +670,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let tg_dir = tmp.path().join(".infigraph");
         std::fs::create_dir_all(&tg_dir).unwrap();
-        std::fs::write(tg_dir.join("watch.log"), b"previous daemon's output\n").unwrap();
+        std::fs::write(tg_dir.join("daemon.log"), b"previous daemon's output\n").unwrap();
 
         // Building the command opens (but doesn't write to) the log for the
         // child's stderr; drop it immediately, as a real spawn would hand
@@ -678,7 +678,7 @@ mod tests {
         let _cmd =
             super::build_daemon_command(tmp.path(), &tg_dir, std::path::Path::new("infigraph"));
 
-        let contents = std::fs::read_to_string(tg_dir.join("watch.log")).unwrap();
+        let contents = std::fs::read_to_string(tg_dir.join("daemon.log")).unwrap();
         assert_eq!(
             contents, "previous daemon's output\n",
             "opening the log for a new spawn attempt must not truncate prior content"

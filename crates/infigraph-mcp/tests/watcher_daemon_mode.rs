@@ -295,7 +295,7 @@ fn tool_watch_docs_non_daemon_branch_respects_watch_docs_enabled_policy() {
 fn doc_watch_daemon_spawn_not_blocked_by_disabled_code_watch_policy() {
     let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
-    let Ok(_cli) = infigraph_core::watch::daemon::resolve_cli_binary_sibling_of(
+    let Ok(_cli) = infigraph_core::daemon::lifecycle::resolve_cli_binary_sibling_of(
         &std::env::current_exe().unwrap(),
     ) else {
         eprintln!("skipping: infigraph CLI binary not built in this target dir");

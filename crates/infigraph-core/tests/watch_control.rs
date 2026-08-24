@@ -18,7 +18,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 fn cli_binary() -> std::path::PathBuf {
-    // Mirrors infigraph_core::watch::daemon::resolve_cli_binary_sibling_of's
+    // Mirrors infigraph_core::daemon::lifecycle::resolve_cli_binary_sibling_of's
     // grandparent fallback: integration-test binaries live one level below
     // the real build output directory.
     let exe = std::env::current_exe().unwrap();
@@ -128,7 +128,7 @@ fn daemon_survives_watch_control_stop_and_keeps_serving_writes() {
 
     let lock_path = root.join(".infigraph").join("watch.lock");
     let deadline = Instant::now() + Duration::from_secs(30);
-    while !infigraph_core::watch::daemon::daemon_is_alive(&lock_path) {
+    while !infigraph_core::daemon::lifecycle::daemon_is_alive(&lock_path) {
         assert!(
             Instant::now() < deadline,
             "daemon never became alive (watch.lock never showed a live holder)"

@@ -120,6 +120,15 @@ pub fn spawn_parent_monitor() {
                 !process_alive(pid)
             };
             if gone {
+                // `std::process::exit` skips Drop, so the `InstanceGuard`
+                // on `run()`'s stack never fires here -- deregister
+                // explicitly first, mirroring the SIGTERM handler's own
+                // signal-context cleanup (`instance_path` is `pub` for
+                // exactly this: neither this thread nor a signal handler
+                // can reach the guard).
+                let _ = std::fs::remove_file(infigraph_core::instances::instance_path(
+                    std::process::id(),
+                ));
                 crate::mcp_log(
                     "INFO",
                     &format!("supervisor (pid {pid}) is gone — worker exiting to avoid orphan"),

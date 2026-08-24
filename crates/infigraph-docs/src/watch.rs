@@ -115,7 +115,7 @@ fn attach_poll_interval() -> Duration {
 }
 
 /// Drive doc-watching for `root` as part of a merged code+doc watch daemon
-/// (see `infigraph_core::watch::daemon`). Dynamically attaches (starts a
+/// (see `infigraph_core::daemon::lifecycle`). Dynamically attaches (starts a
 /// `watch_docs` session) once `.infigraph/docs.kuzu` exists, detaches
 /// (stops it) if that file disappears (e.g. after `clean_docs`) -- eligible
 /// to re-attach once it reappears -- or if `.infigraph/watch.stop.docs` is

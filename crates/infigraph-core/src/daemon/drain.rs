@@ -1,7 +1,7 @@
+use crate::daemon::queue::{DrainedQueue, PendingIndexItem, WaiterKind};
 use crate::daemon_protocol::{write_atomic, WriteResult};
 use crate::model::FileExtraction;
 use crate::resolve::ResolveStats;
-use crate::watch::queue::{DrainedQueue, PendingIndexItem, WaiterKind};
 use crate::Infigraph;
 use anyhow::Result;
 use std::path::Path;
@@ -167,8 +167,8 @@ mod tests {
     //! process needed to prove the coalescing logic itself is correct. See
     //! docs/superpowers/specs/2026-08-03-daemon-index-work-queue-design.md.
     use super::*;
+    use crate::daemon::queue::{IndexWorkQueue, Waiter};
     use crate::lang::{LanguagePack, LanguageRegistry};
-    use crate::watch::queue::{IndexWorkQueue, Waiter};
     use std::fs;
 
     // `LanguageRegistry::new()` starts empty -- no language packs are
@@ -223,7 +223,7 @@ mod tests {
     fn drive_full_reindex_sync<MR>(
         root: &std::path::Path,
         request_path: &std::path::Path,
-        queue: &std::sync::Arc<std::sync::Mutex<crate::watch::queue::IndexWorkQueue>>,
+        queue: &std::sync::Arc<std::sync::Mutex<crate::daemon::queue::IndexWorkQueue>>,
         make_registry: &MR,
         held: &mut Option<std::sync::Arc<crate::Infigraph>>,
     ) where
@@ -234,7 +234,7 @@ mod tests {
         // cancellation, so there's no daemon-lifetime token to thread
         // through this synchronous test helper.
         let daemon_token = tokio_util::sync::CancellationToken::new();
-        if let Some(in_flight) = crate::watch::try_start_full_reindex(
+        if let Some(in_flight) = crate::daemon::try_start_full_reindex(
             root,
             request_path,
             queue,
@@ -245,7 +245,7 @@ mod tests {
             &daemon_token,
         ) {
             let registry = std::sync::Arc::new(make_registry().unwrap());
-            let (guard, _) = crate::watch::finish_full_reindex(
+            let (guard, _) = crate::daemon::finish_full_reindex(
                 root,
                 &in_flight.reply_path,
                 &registry,
@@ -372,7 +372,7 @@ mod tests {
         fs::write(root.join("new.py"), "def new_symbol():\n    pass\n").unwrap();
 
         let queue = std::sync::Arc::new(std::sync::Mutex::new(
-            crate::watch::queue::IndexWorkQueue::new(),
+            crate::daemon::queue::IndexWorkQueue::new(),
         ));
         let mut held: Option<std::sync::Arc<crate::Infigraph>> = None;
         let make_registry = || Ok(python_registry());
@@ -474,7 +474,7 @@ mod tests {
         );
 
         let queue = std::sync::Arc::new(std::sync::Mutex::new(
-            crate::watch::queue::IndexWorkQueue::new(),
+            crate::daemon::queue::IndexWorkQueue::new(),
         ));
         let mut held: Option<std::sync::Arc<crate::Infigraph>> = None;
         let make_registry = || Ok(python_registry());
@@ -531,7 +531,7 @@ mod tests {
         prism.index().unwrap();
 
         let queue = std::sync::Arc::new(std::sync::Mutex::new(
-            crate::watch::queue::IndexWorkQueue::new(),
+            crate::daemon::queue::IndexWorkQueue::new(),
         ));
         let mut held: Option<std::sync::Arc<crate::Infigraph>> = None;
         let make_registry = || Ok(python_registry());
@@ -583,7 +583,7 @@ mod tests {
         assert!(live_graph_path.exists());
 
         let queue = std::sync::Arc::new(std::sync::Mutex::new(
-            crate::watch::queue::IndexWorkQueue::new(),
+            crate::daemon::queue::IndexWorkQueue::new(),
         ));
         let mut held: Option<std::sync::Arc<crate::Infigraph>> = None;
         let make_registry = || Err(anyhow::anyhow!("injected registry failure"));
@@ -647,7 +647,7 @@ mod tests {
         prism.index().unwrap();
 
         let queue = std::sync::Arc::new(std::sync::Mutex::new(
-            crate::watch::queue::IndexWorkQueue::new(),
+            crate::daemon::queue::IndexWorkQueue::new(),
         ));
         // A request queued but not yet executing when FullReindex arrives.
         let superseded_reply = root.join(".infigraph").join("superseded.result");

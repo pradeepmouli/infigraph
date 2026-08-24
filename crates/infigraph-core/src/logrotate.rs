@@ -1,6 +1,6 @@
 //! Size-capped log rotation (R7.3, docs/DESIGN-hardening.md §7.3,
 //! github.com/pradeepmouli/infigraph#83): nothing in `.infigraph/` (or
-//! `~/.infigraph/`) may grow without a cap. Append-only logs (`watch.log`,
+//! `~/.infigraph/`) may grow without a cap. Append-only logs (`daemon.log`,
 //! `mcp.log`, `audit.log`) had none.
 //!
 //! Model: rotate-at-open, one generation. Before a writer opens a log for

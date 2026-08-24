@@ -614,29 +614,13 @@ pub fn build_tools_list() -> Vec<Value> {
 }
 
 pub fn mcp_log(level: &str, msg: &str) {
-    use std::io::Write;
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let line = format!("[{ts}] {level}: {msg}");
-    eprintln!("{line}");
-    let path = mcp_log_file_path();
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    // R7.3 (#83): size-cap the append-only log before each open.
-    infigraph_core::logrotate::rotate_if_over(&path, 10 * 1024 * 1024);
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-    {
-        let _ = writeln!(f, "{line}");
-    }
+    infigraph_core::proclog::write_log_line(&mcp_log_file_path(), level, msg);
 }
 
 fn mcp_log_file_path() -> std::path::PathBuf {
+    if let Some(p) = std::env::var_os("INFIGRAPH_MCP_LOG_PATH") {
+        return std::path::PathBuf::from(p);
+    }
     std::env::var_os("HOME")
         .map(std::path::PathBuf::from)
         .or_else(dirs_next::home_dir)
@@ -660,7 +644,7 @@ pub fn handle_initialize(id: &Value, is_primary: bool) -> Value {
             mcp_log("DEBUG", "init_doc_watchers start");
             tools::docs::init_doc_watchers();
 
-            let daemon_mode = infigraph_core::watch::daemon::watch_daemon_mode_enabled();
+            let daemon_mode = infigraph_core::daemon::lifecycle::watch_daemon_mode_enabled();
             if daemon_mode {
                 mcp_log(
                     "INFO",

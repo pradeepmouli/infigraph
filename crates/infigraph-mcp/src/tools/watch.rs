@@ -133,14 +133,14 @@ fn auto_start_watch_inner(path: &str, skip_disabled_check: bool) -> Option<Strin
         return None;
     }
 
-    if infigraph_core::watch::daemon::watch_daemon_mode_enabled() {
+    if infigraph_core::daemon::lifecycle::watch_daemon_mode_enabled() {
         return match ensure_daemon_watcher(&root, "watch") {
-            Ok(infigraph_core::watch::daemon::DaemonStartOutcome::Spawned) => {
+            Ok(infigraph_core::daemon::lifecycle::DaemonStartOutcome::Spawned) => {
                 eprintln!("[auto-watch] Started daemon watcher for {root_str}");
                 Some(format!("Daemon watcher started for {root_str}"))
             }
-            Ok(infigraph_core::watch::daemon::DaemonStartOutcome::AlreadyRunning) => None,
-            Ok(infigraph_core::watch::daemon::DaemonStartOutcome::Failed(e)) => {
+            Ok(infigraph_core::daemon::lifecycle::DaemonStartOutcome::AlreadyRunning) => None,
+            Ok(infigraph_core::daemon::lifecycle::DaemonStartOutcome::Failed(e)) => {
                 eprintln!("[auto-watch] Failed to start daemon watcher: {e}");
                 None
             }
@@ -187,14 +187,14 @@ fn auto_start_watch_inner(path: &str, skip_disabled_check: bool) -> Option<Strin
 pub(crate) fn ensure_daemon_watcher(
     root: &std::path::Path,
     section: &str,
-) -> Result<infigraph_core::watch::daemon::DaemonStartOutcome> {
+) -> Result<infigraph_core::daemon::lifecycle::DaemonStartOutcome> {
     if !infigraph_core::watch::config::watch_enabled_at(root, section) {
-        return Ok(infigraph_core::watch::daemon::DaemonStartOutcome::AlreadyRunning);
+        return Ok(infigraph_core::daemon::lifecycle::DaemonStartOutcome::AlreadyRunning);
     }
     let mcp_exe = std::env::current_exe().context("could not resolve current executable")?;
-    let cli_binary = infigraph_core::watch::daemon::resolve_cli_binary_sibling_of(&mcp_exe)
+    let cli_binary = infigraph_core::daemon::lifecycle::resolve_cli_binary_sibling_of(&mcp_exe)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
-    Ok(infigraph_core::watch::daemon::ensure_daemon_running(
+    Ok(infigraph_core::daemon::lifecycle::ensure_daemon_running(
         root,
         &cli_binary,
     ))
@@ -278,15 +278,15 @@ pub fn tool_watch_project(args: &Value) -> Result<String> {
         ));
     }
 
-    if infigraph_core::watch::daemon::watch_daemon_mode_enabled() {
+    if infigraph_core::daemon::lifecycle::watch_daemon_mode_enabled() {
         return match ensure_daemon_watcher(&root, "watch")? {
-            infigraph_core::watch::daemon::DaemonStartOutcome::Spawned => {
+            infigraph_core::daemon::lifecycle::DaemonStartOutcome::Spawned => {
                 Ok(format!("Daemon watcher started for {root_str}"))
             }
-            infigraph_core::watch::daemon::DaemonStartOutcome::AlreadyRunning => {
+            infigraph_core::daemon::lifecycle::DaemonStartOutcome::AlreadyRunning => {
                 Ok(format!("Daemon watcher already running for {root_str}"))
             }
-            infigraph_core::watch::daemon::DaemonStartOutcome::Failed(e) => {
+            infigraph_core::daemon::lifecycle::DaemonStartOutcome::Failed(e) => {
                 Err(anyhow::anyhow!("Failed to start daemon watcher: {e}"))
             }
         };
@@ -490,9 +490,9 @@ pub(crate) fn watch_control(args: &Value, role: WatchRole, action: WatchAction) 
         )?;
     }
 
-    if infigraph_core::watch::daemon::watch_daemon_mode_enabled() {
+    if infigraph_core::daemon::lifecycle::watch_daemon_mode_enabled() {
         let lock_path = root.join(".infigraph").join("watch.lock");
-        if !infigraph_core::watch::daemon::daemon_is_alive(&lock_path) {
+        if !infigraph_core::daemon::lifecycle::daemon_is_alive(&lock_path) {
             return Ok(
                 if matches!(action, WatchAction::Enable | WatchAction::Disable) {
                     format!(

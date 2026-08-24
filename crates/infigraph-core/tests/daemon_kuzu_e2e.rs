@@ -33,8 +33,10 @@ impl Drop for KillOnDrop {
 /// that var for a test binary's own crate-graph binaries). Resolve the CLI
 /// binary the same way Task 2's watch_daemon.rs test does.
 fn cli_binary() -> PathBuf {
-    infigraph_core::watch::daemon::resolve_cli_binary_sibling_of(&std::env::current_exe().unwrap())
-        .expect("infigraph CLI binary must already be built (shared target dir)")
+    infigraph_core::daemon::lifecycle::resolve_cli_binary_sibling_of(
+        &std::env::current_exe().unwrap(),
+    )
+    .expect("infigraph CLI binary must already be built (shared target dir)")
 }
 
 /// Bootstrap-index `project_dir` directly (BackendKind::Kuzu, no daemon
@@ -1086,17 +1088,17 @@ fn plain_index_auto_promotes_to_a_full_rebuild_when_the_graph_is_missing_but_inf
 }
 
 /// R3.1.4g/#115: a crashed daemon's cause is only diagnosable if a human
-/// can tell which generation's output in the shared, appended-to watch.log
+/// can tell which generation's output in the shared, appended-to daemon.log
 /// is whose. Spawned via `ensure_daemon_running` (the opportunistic
 /// auto-start path both the CLI's `ensure_watcher_running` and MCP's
 /// `ensure_daemon_watcher` use, and the one #115's investigation found had
 /// no captured stderr) -- NOT `start_real_daemon`'s direct
 /// `Command::new(cli).arg("daemon")` spawn, which inherits the test
 /// process's own stdio rather than routing through `build_daemon_command`'s
-/// watch.log redirection, exactly the distinction this task's research
+/// daemon.log redirection, exactly the distinction this task's research
 /// found matters.
 #[test]
-fn opportunistic_daemon_spawn_writes_a_start_banner_naming_its_pid_to_watch_log() {
+fn opportunistic_daemon_spawn_writes_a_start_banner_naming_its_pid_to_daemon_log() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let project = tempfile::tempdir().unwrap();
     std::fs::write(project.path().join("a.py"), "def a():\n    pass\n").unwrap();
@@ -1112,11 +1114,11 @@ fn opportunistic_daemon_spawn_writes_a_start_banner_naming_its_pid_to_watch_log(
     assert!(status.success(), "bootstrap index failed");
 
     let outcome =
-        infigraph_core::watch::daemon::ensure_daemon_running(project.path(), &cli_binary());
+        infigraph_core::daemon::lifecycle::ensure_daemon_running(project.path(), &cli_binary());
     assert!(
         matches!(
             outcome,
-            infigraph_core::watch::daemon::DaemonStartOutcome::Spawned
+            infigraph_core::daemon::lifecycle::DaemonStartOutcome::Spawned
         ),
         "expected a fresh spawn, got {outcome:?}"
     );
@@ -1129,7 +1131,7 @@ fn opportunistic_daemon_spawn_writes_a_start_banner_naming_its_pid_to_watch_log(
         std::thread::sleep(Duration::from_millis(50));
     }
 
-    let log = std::fs::read_to_string(project.path().join(".infigraph").join("watch.log"))
+    let log = std::fs::read_to_string(project.path().join(".infigraph").join("daemon.log"))
         .unwrap_or_default();
     assert!(
         log.contains("[daemon-start]") && log.contains("pid="),

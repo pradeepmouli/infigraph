@@ -4,8 +4,8 @@
 //! cancellation, WITHOUT any coordinator/drain logic running alongside it
 //! -- that's the whole point of the split.
 
+use infigraph_core::daemon::queue::IndexWorkQueue;
 use infigraph_core::watch::producer::ProducerConfig;
-use infigraph_core::watch::queue::IndexWorkQueue;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;

@@ -9,7 +9,7 @@
 //! `Task<()>` so watch activity can be started and stopped independently of
 //! the daemon process's own lifetime.
 
-use crate::watch::queue::IndexWorkQueue;
+use crate::daemon::queue::IndexWorkQueue;
 use crate::watch::{WatchEvent, WatchEventKind};
 use notify::{Config, Event, EventKind, RecommendedWatcher, Watcher};
 use std::path::{Path, PathBuf};

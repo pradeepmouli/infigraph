@@ -89,7 +89,7 @@ fn ordinary_incremental_writes_do_not_move_the_growth_ratio_baseline() {
 /// one after a legitimate rebuild.
 #[test]
 fn a_full_reindex_does_refresh_the_growth_ratio_baseline() {
-    let cli = infigraph_core::watch::daemon::resolve_cli_binary_sibling_of(
+    let cli = infigraph_core::daemon::lifecycle::resolve_cli_binary_sibling_of(
         &std::env::current_exe().unwrap(),
     )
     .expect("infigraph CLI binary must already be built (shared target dir)");

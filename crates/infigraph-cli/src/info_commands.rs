@@ -347,6 +347,32 @@ fn watchdog_should_defer(
     index_op_in_progress && elapsed_since_signal < in_progress_ceiling
 }
 
+/// Log a panic in this process before it unwinds, instead of leaving no
+/// trace at all -- `infigraph daemon` had neither a panic hook nor a
+/// signal handler until R3.1.4's hardening pass; the signal handler
+/// (`ctrlc::set_handler`, below in `cmd_daemon`) already existed, this was
+/// the missing half. `eprintln!` is deliberate, not a shortcut: this
+/// process's stderr is already redirected to `daemon.log` by
+/// `build_daemon_command`, so a second explicit file write would just
+/// double every line.
+fn install_daemon_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        let payload = if let Some(s) = info.payload().downcast_ref::<&str>() {
+            s.to_string()
+        } else if let Some(s) = info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "unknown panic".to_string()
+        };
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "unknown".to_string());
+        let bt = std::backtrace::Backtrace::force_capture();
+        eprintln!("[daemon] PANIC: {payload} at {location}\n{bt}");
+    }));
+}
+
 pub(crate) fn cmd_daemon(root: &Path, debounce: u64) -> Result<()> {
     // Belt-and-braces: spawn_daemon (watch/daemon.rs) already strips
     // INFIGRAPH_BACKEND when it spawns this process normally. This
@@ -357,7 +383,23 @@ pub(crate) fn cmd_daemon(root: &Path, debounce: u64) -> Result<()> {
     // itself and deadlock waiting on a request nothing serves.
     std::env::remove_var("INFIGRAPH_BACKEND");
 
-    if infigraph_core::watch::daemon::is_remote_backend() {
+    // The daemon otherwise has no panic hook at all: a panic anywhere in
+    // this process (this thread or any spawned one) unwinds silently past
+    // `build_daemon_command`'s redirected stderr with no line marking it
+    // happened, leaving exactly the same blank trail an uncatchable
+    // SIGKILL does. `eprintln!` here lands in daemon.log for free (see the
+    // `[daemon-start]` banner below for why) -- no separate log target
+    // needed.
+    install_daemon_panic_hook();
+
+    // Test-only: deterministically exercise the hook above without relying
+    // on a real, hard-to-trigger internal panic. Mirrors
+    // `FORCE_COMPRESS_PANIC`/`FORCE_DEDUP_PANIC` in infigraph-mcp.
+    if std::env::var_os("INFIGRAPH_TEST_DAEMON_PANIC").is_some() {
+        panic!("INFIGRAPH_TEST_DAEMON_PANIC forced panic");
+    }
+
+    if infigraph_core::daemon::lifecycle::is_remote_backend() {
         println!(
             "File watching is not supported in remote mode (Neo4j backend). \
              Reindexing is triggered via webhooks instead."
@@ -370,7 +412,7 @@ pub(crate) fn cmd_daemon(root: &Path, debounce: u64) -> Result<()> {
 
     // R3.1.4g/#115: a crash's cause is only diagnosable if a human (or
     // future tooling) can tell which generation's output in the shared,
-    // appended-to watch.log is whose. `eprintln!` here lands in watch.log
+    // appended-to daemon.log is whose. `eprintln!` here lands in daemon.log
     // itself (build_daemon_command redirects this process's stderr there;
     // stdout, where the `println!` calls below go, is discarded when
     // spawned via that path) -- a banner naming this instance's pid,
@@ -465,7 +507,7 @@ pub(crate) fn cmd_daemon(root: &Path, debounce: u64) -> Result<()> {
     // surface is unified in this pass, not its internals (those live in
     // infigraph-docs).
     let doc_watch_for_control = std::sync::Arc::clone(&doc_watch);
-    let docs_control: std::sync::Arc<infigraph_core::watch::DocsControl> =
+    let docs_control: std::sync::Arc<infigraph_core::daemon::DocsControl> =
         std::sync::Arc::new(move |action| {
             use infigraph_core::daemon_protocol::WatchAction;
             let mut doc_watch = doc_watch_for_control.lock().unwrap();
@@ -480,7 +522,7 @@ pub(crate) fn cmd_daemon(root: &Path, debounce: u64) -> Result<()> {
             Ok(())
         });
 
-    let on_full_reindex: std::sync::Arc<infigraph_core::watch::FullReindexCallback> =
+    let on_full_reindex: std::sync::Arc<infigraph_core::daemon::FullReindexCallback> =
         std::sync::Arc::new(
             move |prism: std::sync::Arc<infigraph_core::Infigraph>,
                   detected_languages: Vec<String>,
@@ -522,7 +564,7 @@ pub(crate) fn cmd_daemon(root: &Path, debounce: u64) -> Result<()> {
             },
         );
 
-    let coordinator = infigraph_core::watch::run_write_coordinator(
+    let coordinator = infigraph_core::daemon::run_write_coordinator(
         root,
         bundled_registry,
         debounce,
@@ -617,7 +659,7 @@ pub(crate) fn cmd_watch_stop(root: &Path) -> Result<()> {
     let sentinel = root.join(".infigraph").join("watch.stop");
     let lock_path = root.join(".infigraph").join("watch.lock");
 
-    if !infigraph_core::watch::daemon::daemon_is_alive(&lock_path) {
+    if !infigraph_core::daemon::lifecycle::daemon_is_alive(&lock_path) {
         println!("No watcher running.");
         return Ok(());
     }
@@ -630,7 +672,7 @@ pub(crate) fn cmd_watch_stop(root: &Path) -> Result<()> {
 pub(crate) fn cmd_watch_status(root: &Path) -> Result<()> {
     let lock_path = root.join(".infigraph").join("watch.lock");
 
-    if infigraph_core::watch::daemon::daemon_is_alive(&lock_path) {
+    if infigraph_core::daemon::lifecycle::daemon_is_alive(&lock_path) {
         println!("Watcher is running.");
     } else {
         println!("No watcher running.");
@@ -651,7 +693,7 @@ pub(crate) fn cmd_daemon_stop(root: &Path) -> Result<()> {
     // misconfiguration. Mirrors cmd_watch_stop's existing early-exit and
     // index.rs's FullReindex path (see its own comment re: incident #100).
     let lock_path = root.join(".infigraph").join("watch.lock");
-    if !infigraph_core::watch::daemon::daemon_is_alive(&lock_path) {
+    if !infigraph_core::daemon::lifecycle::daemon_is_alive(&lock_path) {
         println!("No daemon running.");
         return Ok(());
     }
@@ -670,7 +712,7 @@ pub(crate) fn cmd_daemon_restart(root: &Path) -> Result<()> {
     // Same liveness check as cmd_daemon_stop -- if nothing is running,
     // there is nothing to stop-and-wait-for, so skip straight to spawning.
     let lock_path = root.join(".infigraph").join("watch.lock");
-    if infigraph_core::watch::daemon::daemon_is_alive(&lock_path) {
+    if infigraph_core::daemon::lifecycle::daemon_is_alive(&lock_path) {
         let registry = bundled_registry()?;
         let prism = Infigraph::open(root, registry)?;
         // `WatchRole::Daemon`'s `Restart` action (per Task 10's
@@ -688,7 +730,7 @@ pub(crate) fn cmd_daemon_restart(root: &Path) -> Result<()> {
         // watch.lock's liveness, matching wait_for_daemon_ready's shape in
         // crates/infigraph-core/src/watch/daemon.rs).
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while infigraph_core::watch::daemon::daemon_is_alive(&lock_path) {
+        while infigraph_core::daemon::lifecycle::daemon_is_alive(&lock_path) {
             if std::time::Instant::now() > deadline {
                 anyhow::bail!("daemon did not exit within 10s of a stop request");
             }
@@ -697,16 +739,16 @@ pub(crate) fn cmd_daemon_restart(root: &Path) -> Result<()> {
     }
 
     let watch_binary = std::env::current_exe()?;
-    match infigraph_core::watch::daemon::ensure_daemon_running_required(root, &watch_binary) {
-        infigraph_core::watch::daemon::DaemonStartOutcome::Spawned => {
+    match infigraph_core::daemon::lifecycle::ensure_daemon_running_required(root, &watch_binary) {
+        infigraph_core::daemon::lifecycle::DaemonStartOutcome::Spawned => {
             println!("Daemon restarted.");
             Ok(())
         }
-        infigraph_core::watch::daemon::DaemonStartOutcome::AlreadyRunning => {
+        infigraph_core::daemon::lifecycle::DaemonStartOutcome::AlreadyRunning => {
             println!("Daemon already running (unexpected after a confirmed stop).");
             Ok(())
         }
-        infigraph_core::watch::daemon::DaemonStartOutcome::Failed(e) => {
+        infigraph_core::daemon::lifecycle::DaemonStartOutcome::Failed(e) => {
             anyhow::bail!("failed to restart daemon: {e}")
         }
     }
@@ -744,7 +786,7 @@ pub(crate) fn cmd_watch_control(
     // Enable/Disable already did their durable work above; Start/Stop/
     // Restart have nothing to act on without a live daemon.
     let lock_path = root.join(".infigraph").join("watch.lock");
-    if !infigraph_core::watch::daemon::daemon_is_alive(&lock_path) {
+    if !infigraph_core::daemon::lifecycle::daemon_is_alive(&lock_path) {
         if matches!(watch_action, WatchAction::Enable | WatchAction::Disable) {
             println!("{role:?}: policy persisted; no daemon currently running to notify.");
         } else {
@@ -1069,7 +1111,7 @@ pub(crate) fn cmd_delete_project(root: &Path) -> Result<()> {
 
     // Stop watcher before removing data
     let lock_path = project_path.join(".infigraph").join("watch.lock");
-    if infigraph_core::watch::daemon::daemon_is_alive(&lock_path) {
+    if infigraph_core::daemon::lifecycle::daemon_is_alive(&lock_path) {
         let sentinel = project_path.join(".infigraph").join("watch.stop");
         let _ = std::fs::write(&sentinel, b"");
         std::thread::sleep(std::time::Duration::from_millis(500));
@@ -1195,7 +1237,7 @@ pub(crate) fn cmd_gc(root: &Path, dry_run: bool, stale_days: Option<u64>) -> Res
     // `plan.is_empty()`. See `find_orphaned_daemons`'s doc comment for why
     // this needs a live-process sweep rather than the registry/lock-file
     // path the eviction above uses.
-    let orphaned_daemons = infigraph_core::watch::daemon::find_orphaned_daemons();
+    let orphaned_daemons = infigraph_core::daemon::lifecycle::find_orphaned_daemons();
 
     if plan.is_empty() && orphaned_daemons.is_empty() {
         println!("Registry is clean -- nothing to evict.");
@@ -1247,7 +1289,7 @@ pub(crate) fn cmd_gc(root: &Path, dry_run: bool, stale_days: Option<u64>) -> Res
         );
     }
     for d in &orphaned_daemons {
-        infigraph_core::watch::daemon::kill_orphaned_daemon(d.pid);
+        infigraph_core::daemon::lifecycle::kill_orphaned_daemon(d.pid);
         infigraph_core::audit::audit_log(
             "gc",
             "kill-orphaned-daemon",

@@ -8,6 +8,7 @@ pub mod clone;
 pub mod cluster;
 pub mod concerns;
 pub mod config;
+pub mod daemon;
 pub mod daemon_protocol;
 pub mod diff;
 pub mod dirty;
@@ -29,6 +30,7 @@ pub mod model;
 pub mod multi;
 pub mod ops;
 pub mod patterns;
+pub mod proclog;
 pub mod ps;
 pub mod quarantine;
 pub mod recovery;
@@ -158,7 +160,7 @@ pub fn daemon_backend_selected() -> bool {
 /// daemon). Off by default; only consulted under `INFIGRAPH_BACKEND=daemon`.
 ///
 /// Same `"1"`-means-on convention as
-/// `crate::watch::daemon::watch_daemon_mode_enabled`.
+/// `crate::daemon::lifecycle::watch_daemon_mode_enabled`.
 pub fn index_via_daemon_mode_enabled() -> bool {
     std::env::var("INFIGRAPH_INDEX_VIA_DAEMON")
         .map(|v| v == "1")
@@ -360,17 +362,17 @@ impl Infigraph {
     /// and letting the first write discover the problem 600s later.
     fn ensure_daemon_for_writes(&self) -> Result<()> {
         let lock_path = self.root.join(".infigraph").join("watch.lock");
-        if crate::watch::daemon::daemon_is_alive(&lock_path) {
+        if crate::daemon::lifecycle::daemon_is_alive(&lock_path) {
             return Ok(());
         }
 
         let watch_binary = std::env::current_exe()
             .map_err(anyhow::Error::from)
-            .and_then(|exe| crate::watch::daemon::resolve_cli_binary_sibling_of(&exe))
+            .and_then(|exe| crate::daemon::lifecycle::resolve_cli_binary_sibling_of(&exe))
             .context("could not locate the infigraph CLI binary to start a daemon")?;
 
-        if let crate::watch::daemon::DaemonStartOutcome::Failed(e) =
-            crate::watch::daemon::ensure_daemon_running_required(&self.root, &watch_binary)
+        if let crate::daemon::lifecycle::DaemonStartOutcome::Failed(e) =
+            crate::daemon::lifecycle::ensure_daemon_running_required(&self.root, &watch_binary)
         {
             anyhow::bail!(
                 "INFIGRAPH_BACKEND=daemon requires a running daemon for {}, but starting \
@@ -379,7 +381,7 @@ impl Infigraph {
             );
         }
 
-        if !crate::watch::daemon::wait_for_daemon_ready(
+        if !crate::daemon::lifecycle::wait_for_daemon_ready(
             &lock_path,
             std::time::Duration::from_secs(10),
         ) {

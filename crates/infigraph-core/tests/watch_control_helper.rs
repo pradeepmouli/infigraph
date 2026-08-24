@@ -97,7 +97,7 @@ fn submit_watch_control_and_await_reply_round_trips_against_a_real_daemon() {
     // Wait for the daemon to become ready.
     let lock_path = root.join(".infigraph").join("watch.lock");
     let deadline = Instant::now() + Duration::from_secs(30);
-    while !infigraph_core::watch::daemon::daemon_is_alive(&lock_path) {
+    while !infigraph_core::daemon::lifecycle::daemon_is_alive(&lock_path) {
         assert!(
             Instant::now() < deadline,
             "daemon never became alive (watch.lock never showed a live holder)"

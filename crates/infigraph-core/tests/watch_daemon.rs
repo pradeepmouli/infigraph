@@ -1,5 +1,5 @@
+use infigraph_core::daemon::lifecycle::{is_ci_env, is_remote_backend, watch_daemon_mode_enabled};
 use infigraph_core::graph::GraphBackend;
-use infigraph_core::watch::daemon::{is_ci_env, is_remote_backend, watch_daemon_mode_enabled};
 
 /// Serializes tests that mutate process-global env vars — cargo runs this
 /// binary's tests on parallel threads, so a lowered override in one test
@@ -56,13 +56,13 @@ fn ensure_daemon_running_noops_under_ci() {
     std::env::set_var("CI", "1");
     let tmp = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(tmp.path().join(".infigraph")).unwrap();
-    let outcome = infigraph_core::watch::daemon::ensure_daemon_running(
+    let outcome = infigraph_core::daemon::lifecycle::ensure_daemon_running(
         tmp.path(),
         std::path::Path::new("/nonexistent/infigraph"),
     );
     assert_eq!(
         outcome,
-        infigraph_core::watch::daemon::DaemonStartOutcome::AlreadyRunning
+        infigraph_core::daemon::lifecycle::DaemonStartOutcome::AlreadyRunning
     );
     std::env::remove_var("CI");
 }
@@ -92,13 +92,13 @@ fn ensure_daemon_running_noops_when_not_yet_indexed() {
     let tmp = tempfile::tempdir().unwrap();
     assert!(!tmp.path().join(".infigraph").exists());
 
-    let outcome = infigraph_core::watch::daemon::ensure_daemon_running(
+    let outcome = infigraph_core::daemon::lifecycle::ensure_daemon_running(
         tmp.path(),
         std::path::Path::new("/nonexistent/infigraph"),
     );
     assert_eq!(
         outcome,
-        infigraph_core::watch::daemon::DaemonStartOutcome::AlreadyRunning,
+        infigraph_core::daemon::lifecycle::DaemonStartOutcome::AlreadyRunning,
         "not-yet-indexed projects must no-op silently, not report Failed"
     );
 }
@@ -126,7 +126,7 @@ fn init_daemon_backend_starts_a_daemon() {
     // init()'s daemon arm re-execs the CLI binary; skip rather than fail if
     // this test binary was built without it (infigraph-core has no
     // dev-dependency on infigraph-cli, so cargo won't build it for us).
-    let Ok(_cli) = infigraph_core::watch::daemon::resolve_cli_binary_sibling_of(
+    let Ok(_cli) = infigraph_core::daemon::lifecycle::resolve_cli_binary_sibling_of(
         &std::env::current_exe().unwrap(),
     ) else {
         eprintln!("skipping: infigraph CLI binary not built in this target dir");
@@ -213,7 +213,7 @@ fn build_daemon_command_strips_infigraph_backend_env_var() {
     let tg_dir = project_dir.path().join(".infigraph");
     std::fs::create_dir_all(&tg_dir).unwrap();
 
-    let cmd = infigraph_core::watch::daemon::build_daemon_command(
+    let cmd = infigraph_core::daemon::lifecycle::build_daemon_command(
         project_dir.path(),
         &tg_dir,
         std::path::Path::new("/nonexistent/infigraph"),
@@ -249,19 +249,19 @@ fn spawn_daemon_child_still_starts_with_infigraph_backend_leaked_into_test_env()
     // back to the same sibling-binary resolution MCP uses, matching the
     // pattern in crates/infigraph-cli/tests/watch_daemon_docs.rs's
     // `cli_binary` helper.
-    let cli_binary = infigraph_core::watch::daemon::resolve_cli_binary_sibling_of(
+    let cli_binary = infigraph_core::daemon::lifecycle::resolve_cli_binary_sibling_of(
         &std::env::current_exe().unwrap(),
     )
     .expect("infigraph CLI binary must already be built (shared target dir)");
 
     std::env::set_var("INFIGRAPH_BACKEND", "daemon");
     let outcome =
-        infigraph_core::watch::daemon::ensure_daemon_running(project_dir.path(), &cli_binary);
+        infigraph_core::daemon::lifecycle::ensure_daemon_running(project_dir.path(), &cli_binary);
     std::env::remove_var("INFIGRAPH_BACKEND");
 
     assert_eq!(
         outcome,
-        infigraph_core::watch::daemon::DaemonStartOutcome::Spawned,
+        infigraph_core::daemon::lifecycle::DaemonStartOutcome::Spawned,
         "expected the daemon to spawn successfully despite INFIGRAPH_BACKEND=daemon in this test's own env"
     );
 
@@ -295,7 +295,7 @@ fn ensure_daemon_running_prunes_a_dead_stale_holder_and_spawns_fresh() {
     let project_dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(project_dir.path().join(".infigraph")).unwrap();
 
-    let cli_binary = infigraph_core::watch::daemon::resolve_cli_binary_sibling_of(
+    let cli_binary = infigraph_core::daemon::lifecycle::resolve_cli_binary_sibling_of(
         &std::env::current_exe().unwrap(),
     )
     .expect("infigraph CLI binary must already be built (shared target dir)");
@@ -317,12 +317,12 @@ fn ensure_daemon_running_prunes_a_dead_stale_holder_and_spawns_fresh() {
 
     std::env::set_var("INFIGRAPH_BACKEND", "daemon");
     let outcome =
-        infigraph_core::watch::daemon::ensure_daemon_running(project_dir.path(), &cli_binary);
+        infigraph_core::daemon::lifecycle::ensure_daemon_running(project_dir.path(), &cli_binary);
     std::env::remove_var("INFIGRAPH_BACKEND");
 
     assert_eq!(
         outcome,
-        infigraph_core::watch::daemon::DaemonStartOutcome::Spawned,
+        infigraph_core::daemon::lifecycle::DaemonStartOutcome::Spawned,
         "a dead stale holder must be pruned and a fresh daemon spawned, not reported as AlreadyRunning"
     );
 
@@ -458,7 +458,7 @@ fn watch_triggered_file_removal_contends_with_a_held_index_lock() {
     let daemon_token = tokio_util::sync::CancellationToken::new();
     let token_for_thread = daemon_token.clone();
     let handle = std::thread::spawn(move || {
-        infigraph_core::watch::run_write_coordinator(
+        infigraph_core::daemon::run_write_coordinator(
             &root,
             || Ok(infigraph_languages::bundled_registry().unwrap()),
             50, // debounce_ms
@@ -553,7 +553,7 @@ fn watch_loop_shuts_down_when_its_root_directory_is_deleted() {
     let daemon_token = tokio_util::sync::CancellationToken::new();
     let token_for_thread = daemon_token.clone();
     let handle = std::thread::spawn(move || {
-        infigraph_core::watch::run_write_coordinator(
+        infigraph_core::daemon::run_write_coordinator(
             &root,
             || Ok(infigraph_languages::bundled_registry().unwrap()),
             50, // debounce_ms
@@ -644,7 +644,7 @@ fn out_of_scope_write_request_contends_with_a_held_index_lock() {
     let daemon_token = tokio_util::sync::CancellationToken::new();
     let token_for_thread = daemon_token.clone();
     let handle = std::thread::spawn(move || {
-        infigraph_core::watch::run_write_coordinator(
+        infigraph_core::daemon::run_write_coordinator(
             &root,
             || Ok(infigraph_languages::bundled_registry().unwrap()),
             50, // debounce_ms
@@ -763,7 +763,7 @@ fn full_reindex_build_task_can_be_cancelled_before_it_starts_the_swap() {
     let (stop_tx, stop_rx) = std::sync::mpsc::channel();
     let root = project.path().to_path_buf();
     let handle = std::thread::spawn(move || {
-        infigraph_core::watch::run_write_coordinator(
+        infigraph_core::daemon::run_write_coordinator(
             &root,
             || Ok(infigraph_languages::bundled_registry().unwrap()),
             50, // debounce_ms
@@ -876,7 +876,7 @@ fn scip_enrichment_task_is_cancellable_via_daemon_token() {
     // needing a real SCIP indexer binary on PATH.
     let scip_generation = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let scip_generation_for_cb = std::sync::Arc::clone(&scip_generation);
-    let on_full_reindex: std::sync::Arc<infigraph_core::watch::FullReindexCallback> =
+    let on_full_reindex: std::sync::Arc<infigraph_core::daemon::FullReindexCallback> =
         std::sync::Arc::new(move |_prism, _languages, _token| {
             scip_generation_for_cb.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         });
@@ -887,7 +887,7 @@ fn scip_enrichment_task_is_cancellable_via_daemon_token() {
     let (stop_tx, stop_rx) = std::sync::mpsc::channel();
     let root = project.path().to_path_buf();
     let handle = std::thread::spawn(move || {
-        infigraph_core::watch::run_write_coordinator(
+        infigraph_core::daemon::run_write_coordinator(
             &root,
             || Ok(infigraph_languages::bundled_registry().unwrap()),
             50, // debounce_ms
@@ -988,7 +988,7 @@ fn watch_control_daemon_stop_ends_the_coordinator_loop() {
     let (_stop_tx, stop_rx) = std::sync::mpsc::channel();
     let root = project.path().to_path_buf();
     let handle = std::thread::spawn(move || {
-        infigraph_core::watch::run_write_coordinator(
+        infigraph_core::daemon::run_write_coordinator(
             &root,
             || Ok(infigraph_languages::bundled_registry().unwrap()),
             50, // debounce_ms
@@ -1090,7 +1090,7 @@ fn watch_control_daemon_start_is_rejected_without_stopping_the_loop() {
     let (stop_tx, stop_rx) = std::sync::mpsc::channel();
     let root = project.path().to_path_buf();
     let handle = std::thread::spawn(move || {
-        infigraph_core::watch::run_write_coordinator(
+        infigraph_core::daemon::run_write_coordinator(
             &root,
             || Ok(infigraph_languages::bundled_registry().unwrap()),
             50, // debounce_ms
@@ -1182,7 +1182,7 @@ fn watch_control_docs_role_dispatches_to_the_registered_docs_control() {
         std::sync::Mutex<Vec<infigraph_core::daemon_protocol::WatchAction>>,
     > = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let received_for_control = std::sync::Arc::clone(&received);
-    let docs_control: std::sync::Arc<infigraph_core::watch::DocsControl> =
+    let docs_control: std::sync::Arc<infigraph_core::daemon::DocsControl> =
         std::sync::Arc::new(move |action| {
             received_for_control.lock().unwrap().push(action);
             Ok(())
@@ -1194,7 +1194,7 @@ fn watch_control_docs_role_dispatches_to_the_registered_docs_control() {
     let (stop_tx, stop_rx) = std::sync::mpsc::channel();
     let root = project.path().to_path_buf();
     let handle = std::thread::spawn(move || {
-        infigraph_core::watch::run_write_coordinator(
+        infigraph_core::daemon::run_write_coordinator(
             &root,
             || Ok(infigraph_languages::bundled_registry().unwrap()),
             50, // debounce_ms
@@ -1288,7 +1288,7 @@ fn watch_control_docs_role_without_a_registered_control_replies_with_an_error() 
     let (stop_tx, stop_rx) = std::sync::mpsc::channel();
     let root = project.path().to_path_buf();
     let handle = std::thread::spawn(move || {
-        infigraph_core::watch::run_write_coordinator(
+        infigraph_core::daemon::run_write_coordinator(
             &root,
             || Ok(infigraph_languages::bundled_registry().unwrap()),
             50, // debounce_ms

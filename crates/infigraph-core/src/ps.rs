@@ -171,7 +171,7 @@ impl std::fmt::Display for KillRefusal {
 /// matches only -- a substring check would also match test binaries
 /// (`infigraph_core-<hash>`) and unrelated `infigraph-*` artifacts,
 /// defeating the PID-reuse guard (same reasoning as
-/// `watch::daemon::prune_stale_holder`).
+/// `daemon::lifecycle::prune_stale_holder`).
 fn is_infigraph_binary_name(name: &str) -> bool {
     matches!(
         name,
