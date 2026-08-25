@@ -724,6 +724,7 @@ fn load_embeddings_impl(path: &Path) -> Result<Vec<(String, Vec<f32>, u64)>> {
             pos + float_bytes <= payload.len(),
             "truncated embeddings file"
         );
+        #[allow(clippy::chunks_exact_to_as_chunks)]
         let vec: Vec<f32> = payload[pos..pos + float_bytes]
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes(c.try_into().unwrap()))

@@ -52,8 +52,8 @@ pub fn resolve_calls_incremental(
         symbol_map.entry(name).or_default().push((id, file, kind));
     }
 
-    let mut stats = resolve_with_map(&conn, extractions, &symbol_map, learned_store, &lock)?;
-    stats.inherits_resolved = resolve_inherits(&conn, extractions, &symbol_map, &lock)?;
+    let mut stats = resolve_with_map(store, &conn, extractions, &symbol_map, learned_store, &lock)?;
+    stats.inherits_resolved = resolve_inherits(store, extractions, &symbol_map, &lock)?;
     resolve_custom_edges(&conn, extractions, &symbol_map, &lock)?;
     // R3.3.3: bump once per completed write, so sidecars built from a
     // now-stale generation can be detected rather than served.
@@ -95,8 +95,8 @@ pub fn resolve_calls(
         }
     }
 
-    let mut stats = resolve_with_map(&conn, extractions, &symbol_map, learned_store, &lock)?;
-    stats.inherits_resolved = resolve_inherits(&conn, extractions, &symbol_map, &lock)?;
+    let mut stats = resolve_with_map(store, &conn, extractions, &symbol_map, learned_store, &lock)?;
+    stats.inherits_resolved = resolve_inherits(store, extractions, &symbol_map, &lock)?;
     resolve_custom_edges(&conn, extractions, &symbol_map, &lock)?;
     Ok(stats)
 }
@@ -252,6 +252,7 @@ fn write_external_calls(
 
 /// Caller must hold WriteLock.
 fn resolve_with_map(
+    store: &GraphStore,
     conn: &kuzu::Connection<'_>,
     extractions: &[FileExtraction],
     symbol_map: &HashMap<String, Vec<(String, String, String)>>,
@@ -630,7 +631,7 @@ fn resolve_with_map(
             .map(|(a, b)| (a.clone(), b.clone()))
             .collect();
         let pq_path = std::env::temp_dir().join("infigraph_resolve_calls.parquet");
-        copy_edges_with_bad_record_retry(conn, "CALLS", pairs, "Symbol", "Symbol", &pq_path);
+        copy_edges_with_bad_record_retry(store, "CALLS", pairs, "Symbol", "Symbol", &pq_path)?;
     }
 
     if !external_calls.is_empty() {
@@ -704,8 +705,15 @@ pub fn re_resolve_for_files(
         symbol_map.entry(name).or_default().push((id, file, kind));
     }
 
-    let mut stats = resolve_with_map(&conn, &filtered_owned, &symbol_map, learned_store, &lock)?;
-    stats.inherits_resolved = resolve_inherits(&conn, &filtered_owned, &symbol_map, &lock)?;
+    let mut stats = resolve_with_map(
+        store,
+        &conn,
+        &filtered_owned,
+        &symbol_map,
+        learned_store,
+        &lock,
+    )?;
+    stats.inherits_resolved = resolve_inherits(store, &filtered_owned, &symbol_map, &lock)?;
     // R3.3.3: bump once per completed write, so sidecars built from a
     // now-stale generation can be detected rather than served.
     store.bump_ast_generation_conn(&conn, &lock)?;
