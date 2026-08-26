@@ -291,22 +291,25 @@ fn run() -> Result<()> {
         infigraph_mcp::mcp_lock::AcquireOutcome::Secondary => {
             mcp_log(
                 "WARN",
-                "Another MCP instance holds mcp.lock — running without watchers",
+                "Another MCP instance holds mcp.lock — will not start a new watcher",
             );
             infigraph_mcp::tools::watch::disable_watchers();
             (false, None)
         }
     };
 
-    // `start_daemon_watcher_for_startup_dir` (and the library function it
-    // wraps) gate on daemon mode + the `[watch].auto_start_on_boot` config
-    // toggle internally -- `is_primary` is the one precondition that belongs
-    // here, since it's derived from the mcp.lock outcome above, not from
-    // config the library function can read for itself.
-    if is_primary {
-        let startup_dir = std::env::current_dir().ok();
-        start_daemon_watcher_for_startup_dir(startup_dir.as_deref());
-    }
+    // Unconditional, independent of `is_primary`: a secondary must still be
+    // able to prune a stale-build daemon for the project it was launched
+    // in, and must still run its own true-up reindex -- neither is "start a
+    // new watcher" (the thing `is_primary` actually needs to arbitrate).
+    // `start_daemon_watcher_for_startup_dir`'s own `auto_start_watch`/
+    // `auto_start_doc_watch` calls already no-op safely on a secondary via
+    // `watchers_disabled()` (set above), so calling this unconditionally
+    // can't produce a duplicate live watcher -- see that function's doc
+    // comment for the daemon-mode + `auto_start_on_boot` gating it still
+    // does internally.
+    let startup_dir = std::env::current_dir().ok();
+    start_daemon_watcher_for_startup_dir(startup_dir.as_deref());
 
     if let Some(mut lock) = mcp_lock {
         std::thread::spawn(move || loop {
