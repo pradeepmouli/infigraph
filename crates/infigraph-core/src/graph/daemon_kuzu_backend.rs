@@ -6,7 +6,9 @@ use crate::learned::LearnedStore;
 use crate::model::FileExtraction;
 use crate::resolve::ResolveStats;
 
-use super::backend::{CallsServiceEdge, CrossServiceEdgeCandidate, GraphBackend};
+use super::backend::{
+    CallsServiceEdge, Concern, CrossServiceEdgeCandidate, GraphBackend, ResolvesToEdge,
+};
 use super::kuzu_backend::KuzuBackend;
 use super::{
     ApiSymbol, ArchitectureStats, BranchInfo, ComplexityRow, DeadCodeRow, FileDeps, GraphStats,
@@ -540,6 +542,40 @@ impl GraphBackend for DaemonKuzuBackend {
             crate::daemon_protocol::WriteResult::Err { message } => Err(anyhow::anyhow!(message)),
             other => Err(anyhow::anyhow!(
                 "unexpected WriteResult for UpsertDependencies: {other:?}"
+            )),
+        }
+    }
+    fn replace_concerns(&self, concerns: &[Concern]) -> Result<()> {
+        let staging_dir = self.staging_dir();
+        let request = crate::daemon_protocol::WriteRequest::ReplaceConcerns {
+            concerns: concerns.to_vec(),
+        };
+        match crate::daemon_protocol::submit_write_request(
+            &staging_dir,
+            &request,
+            std::time::Duration::from_secs(30),
+        )? {
+            crate::daemon_protocol::WriteResult::Ok { .. } => Ok(()),
+            crate::daemon_protocol::WriteResult::Err { message } => Err(anyhow::anyhow!(message)),
+            other => Err(anyhow::anyhow!(
+                "unexpected WriteResult for ReplaceConcerns: {other:?}"
+            )),
+        }
+    }
+    fn replace_resolves_to(&self, edges: &[ResolvesToEdge]) -> Result<()> {
+        let staging_dir = self.staging_dir();
+        let request = crate::daemon_protocol::WriteRequest::ReplaceResolvesTo {
+            edges: edges.to_vec(),
+        };
+        match crate::daemon_protocol::submit_write_request(
+            &staging_dir,
+            &request,
+            std::time::Duration::from_secs(30),
+        )? {
+            crate::daemon_protocol::WriteResult::Ok { .. } => Ok(()),
+            crate::daemon_protocol::WriteResult::Err { message } => Err(anyhow::anyhow!(message)),
+            other => Err(anyhow::anyhow!(
+                "unexpected WriteResult for ReplaceResolvesTo: {other:?}"
             )),
         }
     }

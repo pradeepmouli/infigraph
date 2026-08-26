@@ -52,6 +52,16 @@ pub enum WriteRequest {
     UpsertDependencies {
         result: crate::manifest::ManifestResult,
     },
+    /// Replace every recorded `Concern`. Small, serde-serializable payload
+    /// -- rides inline in this envelope, no sibling file needed.
+    ReplaceConcerns {
+        concerns: Vec<crate::graph::Concern>,
+    },
+    /// Replace every recorded `RESOLVES_TO` edge. Small, serde-serializable
+    /// payload -- rides inline in this envelope, no sibling file needed.
+    ReplaceResolvesTo {
+        edges: Vec<crate::graph::ResolvesToEdge>,
+    },
     /// Store cluster-detection results. idx_to_id/community are already in
     /// memory on the caller's side by the time this is called -- small
     /// enough to ride inline, no sibling file needed.
@@ -642,6 +652,34 @@ pub fn serve_one_request(infigraph: &Infigraph, request_path: &Path) -> anyhow::
             }
             WriteRequest::UpsertDependencies { result } => match infigraph.backend() {
                 Some(b) => match b.upsert_dependencies(result) {
+                    Ok(()) => WriteResult::Ok {
+                        total_files: 0,
+                        indexed_files: 0,
+                    },
+                    Err(e) => WriteResult::Err {
+                        message: e.to_string(),
+                    },
+                },
+                None => WriteResult::Err {
+                    message: "graph not initialized".to_string(),
+                },
+            },
+            WriteRequest::ReplaceConcerns { concerns } => match infigraph.backend() {
+                Some(b) => match b.replace_concerns(concerns) {
+                    Ok(()) => WriteResult::Ok {
+                        total_files: 0,
+                        indexed_files: 0,
+                    },
+                    Err(e) => WriteResult::Err {
+                        message: e.to_string(),
+                    },
+                },
+                None => WriteResult::Err {
+                    message: "graph not initialized".to_string(),
+                },
+            },
+            WriteRequest::ReplaceResolvesTo { edges } => match infigraph.backend() {
+                Some(b) => match b.replace_resolves_to(edges) {
                     Ok(()) => WriteResult::Ok {
                         total_files: 0,
                         indexed_files: 0,
