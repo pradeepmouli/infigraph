@@ -82,9 +82,7 @@ pub fn collect_reindex_targets(
 /// can reach it -- `main.rs` compiles to a separate `[[bin]]` target with no
 /// unit-test history of its own.
 pub fn start_daemon_watcher_for_startup_dir(startup_dir: Option<&Path>) {
-    if !infigraph_core::daemon_backend_selected()
-        || !crate::session_context::auto_start_watch_on_boot_enabled()
-    {
+    if !infigraph_core::daemon_backend_selected() {
         return;
     }
 
@@ -99,6 +97,20 @@ pub fn start_daemon_watcher_for_startup_dir(startup_dir: Option<&Path>) {
     // never-indexed cwd has no `.infigraph/watch.lock` home for a daemon to
     // coordinate through, and there's nothing to watch yet regardless.
     if !dir.join(".infigraph").is_dir() {
+        return;
+    }
+
+    // Unconditional, independent of `auto_start_on_boot` below: if a daemon
+    // is already watching this root on a stale build, replace it with a
+    // fresh one. This is correctness upkeep on something already running,
+    // not new background activity, so it shouldn't share the gate that
+    // controls spawning a daemon from nothing -- see `prune_stale_daemon`'s
+    // doc comment. A pruned daemon leaves the root unwatched only until the
+    // `auto_start_watch` call below (if enabled) or the next opportunistic
+    // trigger (e.g. a `search` call) spawns a fresh one.
+    infigraph_core::daemon::lifecycle::prune_stale_daemon(&dir.join(".infigraph/watch.lock"));
+
+    if !crate::session_context::auto_start_watch_on_boot_enabled() {
         return;
     }
 

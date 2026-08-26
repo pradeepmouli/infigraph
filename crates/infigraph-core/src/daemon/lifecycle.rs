@@ -132,7 +132,7 @@ pub fn ensure_daemon_running_required(root: &Path, watch_binary: &Path) -> Daemo
             spawn_daemon(root, &tg_dir, watch_binary)
         }
         Ok(None) => {
-            if !prune_stale_holder(&lock_path) {
+            if !prune_stale_daemon(&lock_path) {
                 return DaemonStartOutcome::AlreadyRunning;
             }
             // The stale holder was pruned (or was already dead) and the
@@ -198,7 +198,7 @@ pub struct OrphanedDaemon {
 /// disappears): that check only runs while the loop is actually ticking, so
 /// a daemon that's wedged (stuck on a lock, a hung query) never reaches it.
 ///
-/// A daemon's `watch.lock` -- the durable record `prune_stale_holder` and
+/// A daemon's `watch.lock` -- the durable record `prune_stale_daemon` and
 /// `infigraph doctor`/`infigraph ps` rely on -- lives *inside* the very
 /// directory tree the daemon watches. Once that directory is `rm -rf`'d (a
 /// deleted project, a test's tempdir), the lock file goes with it, so none
@@ -211,7 +211,7 @@ pub struct OrphanedDaemon {
 /// Three independent signals must all agree before a process counts as an
 /// orphan (binary name, `daemon` in its own argv, and a genuinely missing
 /// cwd) -- the same "don't trust a bare identity match" discipline
-/// `prune_stale_holder` documents for its own PID-reuse guard.
+/// `prune_stale_daemon` documents for its own PID-reuse guard.
 pub fn find_orphaned_daemons() -> Vec<OrphanedDaemon> {
     let mut sys = sysinfo::System::new();
     sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
@@ -302,7 +302,15 @@ pub fn kill_orphaned_daemon(pid: u32) {
 /// any signal, this checks that the live process at that PID still looks
 /// like an infigraph binary — if the PID was recycled for something else
 /// entirely, it's left alone.
-fn prune_stale_holder(lock_path: &Path) -> bool {
+///
+/// `pub`: besides being `ensure_daemon_running_required`'s own internal
+/// step, this is also the right thing for a caller to run unconditionally
+/// whenever a daemon already exists for a root -- independent of whatever
+/// gate controls spawning a *new* daemon from nothing (e.g. MCP's
+/// `auto_start_on_boot` toggle). Replacing an already-running stale-build
+/// daemon with a fresh one is correctness upkeep, not new background
+/// activity, so it shouldn't share that toggle.
+pub fn prune_stale_daemon(lock_path: &Path) -> bool {
     let Some(holder) = crate::lockfile::read_holder(lock_path) else {
         return false;
     };
@@ -356,7 +364,7 @@ fn prune_stale_holder(lock_path: &Path) -> bool {
 
 /// Poll `sys` for `pid` up to `attempts` times, `delay` apart. Returns
 /// `true` as soon as the PID is no longer found running, `false` if it's
-/// still alive after the last attempt. Split out from [`prune_stale_holder`]
+/// still alive after the last attempt. Split out from [`prune_stale_daemon`]
 /// so the wait-then-confirm logic is testable against a real, deterministic
 /// child process instead of a live SIGTERM/signal-handling race.
 fn wait_for_pid_exit(
@@ -484,7 +492,7 @@ pub fn resolve_cli_binary_sibling_of(current_exe: &Path) -> Result<std::path::Pa
 
 #[cfg(test)]
 mod tests {
-    use super::{daemon_is_alive, prune_stale_holder, wait_for_pid_exit};
+    use super::{daemon_is_alive, prune_stale_daemon, wait_for_pid_exit};
     use crate::lockfile::LockInfo;
 
     fn write_lock_info(path: &std::path::Path, info: &LockInfo) {
@@ -541,7 +549,7 @@ mod tests {
     /// there's nothing to signal — but it must still be reported as prunable
     /// so the caller retries the acquisition.
     #[test]
-    fn prune_stale_holder_reports_dead_pid_as_prunable() {
+    fn prune_stale_daemon_reports_dead_pid_as_prunable() {
         let tmp = tempfile::tempdir().unwrap();
         let lock_path = tmp.path().join("watch.lock");
 
@@ -558,7 +566,7 @@ mod tests {
         );
 
         assert!(
-            prune_stale_holder(&lock_path),
+            prune_stale_daemon(&lock_path),
             "a dead holder PID must be reported as prunable"
         );
     }
@@ -569,7 +577,7 @@ mod tests {
     /// this incorrectly sent SIGTERM to our own PID, the test process would
     /// terminate here rather than reach the assertion.
     #[test]
-    fn prune_stale_holder_leaves_live_current_build_alone() {
+    fn prune_stale_daemon_leaves_live_current_build_alone() {
         let tmp = tempfile::tempdir().unwrap();
         let lock_path = tmp.path().join("watch.lock");
 
@@ -586,7 +594,7 @@ mod tests {
         );
 
         assert!(
-            !prune_stale_holder(&lock_path),
+            !prune_stale_daemon(&lock_path),
             "a live holder on the current build must not be pruned"
         );
     }
@@ -598,7 +606,7 @@ mod tests {
     /// binary (name never contains "infigraph") — so this must be a no-op,
     /// not a self-inflicted SIGTERM.
     #[test]
-    fn prune_stale_holder_does_not_signal_a_live_non_infigraph_process() {
+    fn prune_stale_daemon_does_not_signal_a_live_non_infigraph_process() {
         let tmp = tempfile::tempdir().unwrap();
         let lock_path = tmp.path().join("watch.lock");
 
@@ -615,7 +623,7 @@ mod tests {
         );
 
         assert!(
-            !prune_stale_holder(&lock_path),
+            !prune_stale_daemon(&lock_path),
             "a live PID whose process name doesn't look like infigraph must not be pruned/signaled"
         );
     }
@@ -737,7 +745,7 @@ mod tests {
                     Some(&gone),
                 ),
                 "must not match an unrelated binary that merely shares a substring, \
-                 same discipline prune_stale_holder's own guard documents"
+                 same discipline prune_stale_daemon's own guard documents"
             );
         }
 
