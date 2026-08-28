@@ -179,6 +179,85 @@ fn is_infigraph_binary_name(name: &str) -> bool {
     )
 }
 
+/// Name of a live process, if it exists. Used to label a lock holder or a
+/// file holder a doctor check found by pid.
+pub fn process_name(pid: u32) -> Option<String> {
+    let spid = sysinfo::Pid::from_u32(pid);
+    let mut sys = sysinfo::System::new();
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[spid]), true);
+    sys.process(spid)
+        .map(|p| p.name().to_string_lossy().to_string())
+}
+
+/// Whether `pid` is a live process running one of our binaries -- the same
+/// exact-name rule `kill_infigraph_process` enforces.
+pub fn is_infigraph_process(pid: u32) -> bool {
+    process_name(pid)
+        .map(|n| is_infigraph_binary_name(&n.to_ascii_lowercase()))
+        .unwrap_or(false)
+}
+
+/// Pids of live processes holding `path` open. Best-effort and
+/// platform-specific: `/proc/<pid>/fd` on Linux, `lsof -t` on macOS (absent
+/// `lsof`, or on other platforms, returns empty -- callers must treat empty
+/// as "unknown", not "nobody"). This is how `doctor` finds a daemon still
+/// pinning a quarantined graph's inode after the file was renamed away.
+pub fn pids_holding_file(path: &Path) -> Vec<u32> {
+    let Ok(target) = std::fs::canonicalize(path) else {
+        return Vec::new();
+    };
+    #[cfg(target_os = "linux")]
+    {
+        let mut out = Vec::new();
+        let Ok(procs) = std::fs::read_dir("/proc") else {
+            return out;
+        };
+        for entry in procs.flatten() {
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|s| s.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            let Ok(fds) = std::fs::read_dir(entry.path().join("fd")) else {
+                continue;
+            };
+            if fds
+                .flatten()
+                .any(|fd| std::fs::read_link(fd.path()).ok().as_deref() == Some(&*target))
+            {
+                out.push(pid);
+            }
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let Ok(output) = std::process::Command::new("lsof")
+            .arg("-t")
+            .arg("--")
+            .arg(&target)
+            .output()
+        else {
+            return Vec::new();
+        };
+        let mut out: Vec<u32> = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|l| l.trim().parse().ok())
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        Vec::new()
+    }
+}
+
 /// Terminate an infigraph process: SIGTERM by default (the watch loop and
 /// MCP server both release their locks cleanly on it -- R5.4's graceful
 /// path), SIGKILL with `force`. Refuses anything that isn't verifiably an

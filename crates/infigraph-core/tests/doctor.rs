@@ -2,10 +2,10 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use infigraph_core::doctor::{
-    check_disk, check_locks, check_registry, check_scip_staleness, check_sidecars, check_toolchain,
-    check_wal_integrity, check_watchers, check_worktrees, find_repo_entry, format_report,
-    projects_in_scope, run_doctor, CheckResult, CheckStatus, DoctorContext, DoctorReport,
-    DoctorScope,
+    check_disk, check_graph_holders, check_locks, check_registry, check_scip_staleness,
+    check_sidecars, check_toolchain, check_wal_integrity, check_watchers, check_worktrees,
+    find_repo_entry, format_report, projects_in_scope, run_doctor, CheckResult, CheckStatus,
+    DoctorContext, DoctorReport, DoctorScope,
 };
 use infigraph_core::graph::GraphStore;
 use infigraph_core::lockfile::LockInfo;
@@ -1333,5 +1333,136 @@ fn doctor_never_creates_a_watch_lock_as_a_side_effect() {
     assert!(
         !watch_lock.exists(),
         "running doctor must never spawn a watcher as a side effect"
+    );
+}
+
+fn project_ctx(project: &std::path::Path) -> DoctorContext {
+    DoctorContext {
+        registry: infigraph_core::multi::Registry::default(),
+        scope: DoctorScope::Project(project.to_path_buf()),
+        installed_build_hash: "any-hash".to_string(),
+        disk_free_bytes: None,
+        scan_roots: Vec::new(),
+    }
+}
+
+/// sittir, Aug 2026: a daemon kept a quarantined `graph.corrupt.<ts>` open
+/// for a day (7,600 fds, 78 MB unreclaimable) and `doctor` rated it
+/// healthy. Hold such a file open from this process and expect a WARN
+/// naming our pid.
+#[test]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn check_graph_holders_warns_when_a_quarantined_graph_is_still_held_open() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let project = dir.path().join("myproj");
+    let infigraph_dir = project.join(".infigraph");
+    std::fs::create_dir_all(&infigraph_dir).unwrap();
+    let quarantined = infigraph_dir.join("graph.corrupt.1787856394");
+    std::fs::write(&quarantined, vec![0u8; 4096]).unwrap();
+    let _held = std::fs::File::open(&quarantined).unwrap();
+
+    let results = check_graph_holders(&project_ctx(&project));
+    let hit = results
+        .iter()
+        .find(|r| r.name.ends_with("graph.corrupt.1787856394"))
+        .expect("must report the held quarantined file");
+    assert_eq!(hit.status, CheckStatus::Warn);
+    assert!(
+        hit.message.contains(&format!("PID {}", std::process::id())),
+        "must name the holding pid: {}",
+        hit.message
+    );
+    assert!(
+        hit.remediation
+            .as_deref()
+            .unwrap_or("")
+            .contains("infigraph kill"),
+        "remediation should point at `infigraph kill`: {:?}",
+        hit.remediation
+    );
+}
+
+#[test]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn check_graph_holders_is_quiet_for_an_unheld_quarantined_graph() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let project = dir.path().join("myproj");
+    let infigraph_dir = project.join(".infigraph");
+    std::fs::create_dir_all(&infigraph_dir).unwrap();
+    std::fs::write(infigraph_dir.join("graph.corrupt.1787856394"), b"x").unwrap();
+
+    let results = check_graph_holders(&project_ctx(&project));
+    assert!(
+        results.iter().all(|r| r.status == CheckStatus::Pass),
+        "an unheld quarantined file is not a finding: {results:?}"
+    );
+}
+
+/// Re-exec target: hold the graph at `HOLD_GRAPH_PATH` open until killed.
+/// (fcntl locks are per-process, so a holder in *this* process would not
+/// register as a conflict -- the doctor check needs a second process.)
+#[test]
+#[cfg(unix)]
+fn hold_graph_helper() {
+    let Ok(p) = std::env::var("HOLD_GRAPH_PATH") else {
+        return;
+    };
+    let _held = GraphStore::open(std::path::Path::new(&p)).expect("holder open");
+    std::thread::sleep(std::time::Duration::from_secs(60));
+}
+
+#[test]
+#[cfg(unix)]
+fn check_graph_holders_passes_for_a_free_live_graph_and_names_a_held_one() {
+    use infigraph_core::graph::lock_probe::{probe_graph_lock, LockProbe, ProbeFor};
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let project = dir.path().join("myproj");
+    let graph = project.join(".infigraph").join("graph");
+    drop(GraphStore::open(&graph).unwrap());
+
+    let free = check_graph_holders(&project_ctx(&project));
+    let lock = free
+        .iter()
+        .find(|r| r.name.ends_with("graph lock"))
+        .expect("must report the live graph's lock state");
+    assert_eq!(lock.status, CheckStatus::Pass);
+    assert!(lock.message.contains("not held"), "{}", lock.message);
+
+    // Held by a second process that is not an infigraph binary (this test
+    // binary): a finding, naming the pid.
+    let mut holder = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["hold_graph_helper", "--exact", "--nocapture"])
+        .env("HOLD_GRAPH_PATH", &graph)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while probe_graph_lock(&graph, ProbeFor::Write) == LockProbe::Free {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "holder never took the lock"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let held = check_graph_holders(&project_ctx(&project));
+    let _ = holder.kill();
+    let _ = holder.wait();
+
+    let lock = held
+        .iter()
+        .find(|r| r.name.ends_with("graph lock"))
+        .unwrap();
+    assert!(
+        lock.message.contains(&format!("PID {}", holder.id())),
+        "must name the holder: {}",
+        lock.message
+    );
+    assert_eq!(
+        lock.status,
+        CheckStatus::Warn,
+        "a non-infigraph holder is a finding: {}",
+        lock.message
     );
 }

@@ -1,3 +1,4 @@
+pub(crate) mod backoff;
 pub(crate) mod drain;
 pub mod lifecycle;
 pub mod queue;
@@ -10,6 +11,7 @@ use std::time::Duration;
 use anyhow::Result;
 use tokio_util::sync::CancellationToken;
 
+use crate::daemon::backoff::ReopenBackoff;
 use crate::daemon::queue::IndexWorkQueue;
 use crate::daemon::task::Task;
 use crate::daemon_protocol::{WatchAction, WatchRole};
@@ -109,6 +111,9 @@ where
     // comment for the platform split (held open on non-Windows, reopened
     // per call on Windows).
     let mut held_prism: Option<Arc<Infigraph>> = None;
+    // Paces reopen attempts after `watch_db` fails (typically: the graph is
+    // locked by another process) -- see `backoff::ReopenBackoff`.
+    let mut reopen_backoff = ReopenBackoff::new();
 
     // Accumulates index-shaped work from every producer (the code-watch
     // task, the periodic mark below, ad-hoc daemon-protocol requests) so
@@ -480,6 +485,7 @@ where
                             &shared_registry,
                             &make_registry,
                             &mut held_prism,
+                            &mut reopen_backoff,
                             drain_in_flight.is_some(),
                             full_reindex_in_flight.is_some(),
                             &drain_rt,
@@ -513,12 +519,14 @@ where
         // `index.lock`.
         if drain_in_flight.is_none()
             && full_reindex_in_flight.is_none()
+            && reopen_backoff.should_attempt()
             && !queue.lock().unwrap().is_empty()
         {
             match begin_index_op(root, "infigraph daemon", Duration::from_secs(30)) {
                 Ok(IndexOpOutcome::Acquired(guard)) => {
                     match watch_db(root, &shared_registry, &mut held_prism) {
                         Ok(prism) => {
+                            reopen_backoff.record_success();
                             // Drained here on the loop thread rather than
                             // inside the task, so a panicking task can't take
                             // its waiters down with it -- `waiter_replies`
@@ -551,9 +559,7 @@ where
                                 removed_in_drain,
                             });
                         }
-                        Err(e) => {
-                            eprintln!("[watch] failed to reopen graph connection, will retry: {e}")
-                        }
+                        Err(e) => log_reopen_failure("watch", &mut reopen_backoff, &e),
                     }
                 }
                 Ok(o @ IndexOpOutcome::AlreadyRunning(_)) => {
@@ -804,21 +810,23 @@ fn serve_request_locked(
     path: &Path,
     registry: &Arc<crate::lang::LanguageRegistry>,
     held: &mut Option<Arc<Infigraph>>,
+    reopen_backoff: &mut ReopenBackoff,
     drain_in_flight: bool,
 ) {
-    if drain_in_flight {
+    // While backing off, the `.request` file stays in place exactly as it
+    // does under lock contention below -- served on a later tick.
+    if drain_in_flight || !reopen_backoff.should_attempt() {
         return;
     }
     match begin_index_op(root, "infigraph daemon", Duration::from_secs(30)) {
         Ok(IndexOpOutcome::Acquired(_guard)) => match watch_db(root, registry, held) {
             Ok(prism) => {
+                reopen_backoff.record_success();
                 if let Err(e) = crate::daemon_protocol::serve_one_request(&prism, path) {
                     eprintln!("[daemon] failed to serve request {}: {e}", path.display());
                 }
             }
-            Err(e) => {
-                eprintln!("[daemon] failed to reopen graph connection, will retry: {e}");
-            }
+            Err(e) => log_reopen_failure("daemon", reopen_backoff, &e),
         },
         Ok(o @ IndexOpOutcome::AlreadyRunning(_)) => {
             eprintln!(
@@ -830,6 +838,21 @@ fn serve_request_locked(
             eprintln!("[daemon] request-serving busy ({e}), retrying next tick");
         }
     }
+}
+
+/// One log line per failed reopen, carrying the attempt count and the
+/// backoff delay so a stuck holder shows up in the daemon log as an
+/// escalating series rather than an identical line every tick. `{e:#}`
+/// prints the whole context chain, which is where `Infigraph::init`
+/// names the lock holder's pid.
+fn log_reopen_failure(tag: &str, backoff: &mut ReopenBackoff, e: &anyhow::Error) {
+    let delay = backoff.record_failure();
+    eprintln!(
+        "[{tag}] failed to reopen graph connection (consecutive failures: {}), next attempt in \
+         {}s: {e:#}",
+        backoff.consecutive_failures(),
+        delay.as_secs()
+    );
 }
 
 /// What the background full-reindex build task computes: a verified-good
@@ -1567,6 +1590,7 @@ fn route_or_serve_request<MR>(
     registry: &Arc<crate::lang::LanguageRegistry>,
     make_registry: &MR,
     held: &mut Option<Arc<Infigraph>>,
+    reopen_backoff: &mut ReopenBackoff,
     drain_in_flight: bool,
     full_reindex_in_flight: bool,
     drain_rt: &tokio::runtime::Runtime,
@@ -1592,7 +1616,7 @@ where
             // Malformed request JSON -- not this design's concern to
             // recover; hand off to serve_one_request, whose existing
             // corrupt-JSON handling (WriteResult::Err) already covers it.
-            serve_request_locked(root, path, registry, held, drain_in_flight);
+            serve_request_locked(root, path, registry, held, reopen_backoff, drain_in_flight);
             return None;
         }
     };
@@ -1676,7 +1700,7 @@ where
             Err(_) => {
                 // Sibling extractions file missing/corrupt -- fall
                 // through to serve_one_request's existing error path.
-                serve_request_locked(root, path, registry, held, drain_in_flight);
+                serve_request_locked(root, path, registry, held, reopen_backoff, drain_in_flight);
                 None
             }
         },
@@ -1720,7 +1744,7 @@ where
                 None
             }
             Err(_) => {
-                serve_request_locked(root, path, registry, held, drain_in_flight);
+                serve_request_locked(root, path, registry, held, reopen_backoff, drain_in_flight);
                 None
             }
         },
@@ -1805,7 +1829,7 @@ where
             None
         }
         _ => {
-            serve_request_locked(root, path, registry, held, drain_in_flight);
+            serve_request_locked(root, path, registry, held, reopen_backoff, drain_in_flight);
             None
         }
     }
@@ -2083,6 +2107,7 @@ mod tests {
             &registry,
             &|| Ok(crate::lang::LanguageRegistry::new()),
             &mut held,
+            &mut ReopenBackoff::new(),
             false,
             false,
             &drain_rt,
@@ -2161,6 +2186,7 @@ mod tests {
             &registry,
             &|| Ok(crate::lang::LanguageRegistry::new()),
             &mut held,
+            &mut ReopenBackoff::new(),
             false,
             false,
             &drain_rt,

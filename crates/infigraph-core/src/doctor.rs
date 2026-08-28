@@ -952,6 +952,133 @@ pub fn check_worktrees(ctx: &DoctorContext) -> Vec<CheckResult> {
     results
 }
 
+const GRAPH_HOLDERS_CATEGORY: &str = "graph-holders";
+
+/// Who has the graph open. Two conditions the lock/watcher checks can't
+/// see, both from the sittir incident (Aug 2026):
+///
+/// 1. A live process still holding a **quarantined** graph file open. The
+///    quarantine renames `graph` -> `graph.corrupt.<ts>`, but a daemon that
+///    had the old file open keeps its inode alive: the bytes are not
+///    reclaimable and the daemon keeps operating on a graph nobody else
+///    can see. `doctor` rated that daemon healthy for a day.
+/// 2. The live graph's fcntl lock held by a process that is not an
+///    infigraph binary at all.
+///
+/// Read-only: probes are `F_GETLK` / `lsof`-style lookups, never an lbug
+/// open (which would leak an fd on contention -- see `graph::lock_probe`).
+fn check_one_project_graph_holders(project_path: &Path) -> Vec<CheckResult> {
+    use crate::graph::lock_probe::{probe_graph_lock, LockProbe, ProbeFor};
+
+    let infigraph_dir = project_path.join(".infigraph");
+    let mut results = Vec::new();
+
+    // 1. Quarantined / superseded pool files still held open.
+    let mut pool_files: Vec<PathBuf> = std::fs::read_dir(&infigraph_dir)
+        .map(|rd| {
+            rd.flatten()
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.is_file()
+                        && p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+                            n.starts_with("graph.corrupt.") || n.starts_with("graph.previous.")
+                        })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    pool_files.sort();
+    for file in pool_files {
+        let holders = crate::ps::pids_holding_file(&file);
+        if holders.is_empty() {
+            continue;
+        }
+        let name = file
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let size = std::fs::metadata(&file).map(|m| m.len()).unwrap_or(0);
+        let who: Vec<String> = holders
+            .iter()
+            .map(|pid| {
+                format!(
+                    "PID {pid} ({})",
+                    crate::ps::process_name(*pid).unwrap_or_else(|| "unknown".into())
+                )
+            })
+            .collect();
+        results.push(CheckResult::warn(
+            GRAPH_HOLDERS_CATEGORY,
+            format!("{}: {name}", project_path.display()),
+            format!(
+                "quarantined graph file is still held open by {} -- {} MB not reclaimable, and \
+                 that process is working against a graph nobody else can see",
+                who.join(", "),
+                size / (1024 * 1024)
+            ),
+            format!(
+                "restart it: `infigraph kill {}` (it respawns on the current graph on the next \
+                 indexing/search call)",
+                holders
+                    .iter()
+                    .map(|p| p.to_string())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ),
+        ));
+    }
+
+    // 2. Live graph lock holder.
+    let graph = infigraph_dir.join("graph");
+    if graph.is_file() {
+        let label = format!("{}: graph lock", project_path.display());
+        results.push(match probe_graph_lock(&graph, ProbeFor::Write) {
+            LockProbe::Free => {
+                CheckResult::pass(GRAPH_HOLDERS_CATEGORY, label, "not held by any process")
+            }
+            LockProbe::Locked(Some(pid)) if crate::ps::is_infigraph_process(pid) => {
+                CheckResult::pass(
+                    GRAPH_HOLDERS_CATEGORY,
+                    label,
+                    format!(
+                        "held by PID {pid} ({})",
+                        crate::ps::process_name(pid).unwrap_or_default()
+                    ),
+                )
+            }
+            LockProbe::Locked(Some(pid)) => CheckResult::warn(
+                GRAPH_HOLDERS_CATEGORY,
+                label,
+                format!(
+                    "held by PID {pid} ({}), which is not an infigraph binary",
+                    crate::ps::process_name(pid).unwrap_or_else(|| "unknown".into())
+                ),
+                "every infigraph writer/reader will wait on and then fail against this lock; \
+                 find out what that process is doing with the graph file",
+            ),
+            LockProbe::Locked(None) => CheckResult::pass(
+                GRAPH_HOLDERS_CATEGORY,
+                label,
+                "held by another process (pid not reported by the OS)",
+            ),
+            LockProbe::Unsupported => CheckResult::pass(
+                GRAPH_HOLDERS_CATEGORY,
+                label,
+                "lock probe not supported on this platform",
+            ),
+        });
+    }
+
+    results
+}
+
+pub fn check_graph_holders(ctx: &DoctorContext) -> Vec<CheckResult> {
+    projects_in_scope(ctx)
+        .iter()
+        .flat_map(|p| check_one_project_graph_holders(p))
+        .collect()
+}
+
 const TOOLCHAIN_CATEGORY: &str = "toolchain";
 
 pub fn check_toolchain(ctx: &DoctorContext) -> Vec<CheckResult> {
@@ -979,6 +1106,7 @@ pub fn run_doctor(ctx: DoctorContext) -> DoctorReport {
     checks.extend(check_registry(&ctx));
     checks.extend(check_locks(&ctx));
     checks.extend(check_wal_integrity(&ctx));
+    checks.extend(check_graph_holders(&ctx));
     checks.extend(check_watchers(&ctx));
     checks.extend(check_instances(&ctx));
     checks.extend(check_disk(&ctx));

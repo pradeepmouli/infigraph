@@ -59,6 +59,7 @@ use anyhow::{Context, Result};
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 
+use graph::lock_probe::ProbeFor;
 use graph::GraphStore;
 use lang::LanguageRegistry;
 use model::FileExtraction;
@@ -86,6 +87,16 @@ fn is_lock_contention_error(err: &anyhow::Error) -> bool {
     err.to_string().contains("Could not set lock on file")
 }
 
+/// Context line for a lock-contention open failure, naming the holder
+/// when the OS can tell us (see `graph::lock_probe::describe_lock_holder`).
+fn lock_contention_context(db_path: &Path) -> String {
+    format!(
+        "graph is locked by another infigraph process ({}) -- not corrupted, so it was left \
+         untouched. Run `infigraph ps` / `infigraph watch-status` or try again in a moment.",
+        graph::lock_probe::describe_lock_holder(db_path, ProbeFor::Write)
+    )
+}
+
 /// Open the Kùzu graph, retrying briefly on lock contention (AIF3X-331 #36).
 ///
 /// The graph is single-writer: while a watcher's per-reindex write holds the
@@ -95,20 +106,46 @@ fn is_lock_contention_error(err: &anyhow::Error) -> bool {
 /// to `budget`, then surface the error. A genuinely stuck holder still fails
 /// after the budget. Non-lock errors (e.g. real corruption) return immediately
 /// so the caller's wipe/rebuild path isn't delayed.
+///
+/// Waiting is done with `probe` (see `graph::lock_probe`), NOT by calling
+/// `open` again: lbug leaks one file descriptor per open that loses the
+/// lock race, so a poll loop built on re-opening turns a long-held lock
+/// into an fd leak (7,600 fds on one daemon in the sittir incident). Only
+/// when the probe reports the lock free -- or when the platform has no
+/// probe (`LockProbe::Unsupported`) -- is `open` tried again.
 fn open_kuzu_with_retry<T>(
     mut open: impl FnMut() -> Result<T>,
+    mut probe: impl FnMut() -> graph::lock_probe::LockProbe,
     budget: std::time::Duration,
 ) -> Result<T> {
+    use graph::lock_probe::LockProbe;
     let start = std::time::Instant::now();
     let mut delay = std::time::Duration::from_millis(1);
+    let mut last_err = match open() {
+        Ok(v) => return Ok(v),
+        Err(e) if is_lock_contention_error(&e) => e,
+        Err(e) => return Err(e),
+    };
     loop {
+        let remaining = match budget.checked_sub(start.elapsed()) {
+            Some(r) if !r.is_zero() => r,
+            _ => return Err(last_err),
+        };
+        let mut backoff = || {
+            std::thread::sleep(delay.min(remaining));
+            delay = (delay * 2).min(std::time::Duration::from_millis(200));
+        };
+        match probe() {
+            LockProbe::Locked(_) => {
+                backoff();
+                continue;
+            }
+            LockProbe::Free => {}
+            LockProbe::Unsupported => backoff(),
+        }
         match open() {
             Ok(v) => return Ok(v),
-            Err(e) if is_lock_contention_error(&e) && start.elapsed() < budget => {
-                let remaining = budget.saturating_sub(start.elapsed());
-                std::thread::sleep(delay.min(remaining));
-                delay = (delay * 2).min(std::time::Duration::from_millis(200));
-            }
+            Err(e) if is_lock_contention_error(&e) => last_err = e,
             Err(e) => return Err(e),
         }
     }
@@ -253,6 +290,7 @@ impl Infigraph {
             }
             _ => match open_kuzu_with_retry(
                 || graph::KuzuBackend::open(&self.db_path),
+                || graph::lock_probe::probe_graph_lock(&self.db_path, ProbeFor::Write),
                 std::time::Duration::from_secs(3),
             ) {
                 Ok(kb) => {
@@ -263,11 +301,7 @@ impl Infigraph {
                     // Another live process (e.g. a running `infigraph watch`) holds
                     // this database open -- not corruption. Wiping here would destroy
                     // a perfectly good graph out from under that process.
-                    Err(first_err).with_context(|| {
-                        "graph is locked by another infigraph process (e.g. a running \
-                         `infigraph watch`) -- not corrupted, so it was left untouched. \
-                         Run `infigraph watch-status` or try again in a moment."
-                    })
+                    Err(first_err).with_context(|| lock_contention_context(&self.db_path))
                 }
                 Err(first_err) => {
                     // Some Kuzu IO errors (e.g. a short read while a concurrent
@@ -291,12 +325,8 @@ impl Infigraph {
                                 // Now unambiguously another live process holding the
                                 // db open, not a transient checkpoint race -- stop
                                 // retrying and report it as such.
-                                return Err(e).with_context(|| {
-                                    "graph is locked by another infigraph process (e.g. a \
-                                     running `infigraph watch`) -- not corrupted, so it was \
-                                     left untouched. Run `infigraph watch-status` or try \
-                                     again in a moment."
-                                });
+                                return Err(e)
+                                    .with_context(|| lock_contention_context(&self.db_path));
                             }
                             Err(e) => last_err = e,
                         }
@@ -450,6 +480,7 @@ impl Infigraph {
                 // hard-fail (AIF3X-331 #36).
                 let kb = open_kuzu_with_retry(
                     || graph::KuzuBackend::open_read_only(&self.db_path),
+                    || graph::lock_probe::probe_graph_lock(&self.db_path, ProbeFor::Read),
                     std::time::Duration::from_secs(3),
                 )?;
                 self.backend_kind = BackendKind::Kuzu(kb);
@@ -479,6 +510,7 @@ impl Infigraph {
             _ => {
                 let (kb, reason) = open_kuzu_with_retry(
                     || graph::KuzuBackend::open_read_only_or_degrade(&self.db_path),
+                    || graph::lock_probe::probe_graph_lock(&self.db_path, ProbeFor::Read),
                     std::time::Duration::from_secs(3),
                 )?;
                 self.backend_kind = BackendKind::Kuzu(kb);
@@ -1130,6 +1162,7 @@ mod tests {
                     Ok(n)
                 }
             },
+            || graph::lock_probe::LockProbe::Unsupported,
             std::time::Duration::from_secs(2),
         );
         assert_eq!(
@@ -1152,6 +1185,7 @@ mod tests {
                     "failed to open kuzu db: IO exception: Could not set lock on file : /x/.infigraph/graph"
                 ))
             },
+            || graph::lock_probe::LockProbe::Unsupported,
             std::time::Duration::from_millis(50),
         );
         assert!(
@@ -1178,6 +1212,7 @@ mod tests {
                     "failed to open kuzu db: Runtime exception: Database ID mismatch (corrupt)"
                 ))
             },
+            || graph::lock_probe::LockProbe::Unsupported,
             std::time::Duration::from_secs(5),
         );
         assert!(result.is_err());
@@ -1186,6 +1221,73 @@ mod tests {
             1,
             "a non-lock (corruption) error must not be retried"
         );
+    }
+
+    /// Regression for the sittir fd leak: while the probe says the lock is
+    /// still held, the retry loop must NOT call `open` again -- each losing
+    /// lbug open leaks a file descriptor.
+    #[test]
+    fn open_kuzu_retry_does_not_reopen_while_probe_reports_locked() {
+        let attempts = std::cell::Cell::new(0);
+        let probes = std::cell::Cell::new(0);
+        let result: Result<()> = open_kuzu_with_retry(
+            || {
+                attempts.set(attempts.get() + 1);
+                Err(anyhow::anyhow!(
+                    "failed to open kuzu db: IO exception: Could not set lock on file : /x/.infigraph/graph"
+                ))
+            },
+            || {
+                probes.set(probes.get() + 1);
+                graph::lock_probe::LockProbe::Locked(Some(4242))
+            },
+            std::time::Duration::from_millis(80),
+        );
+        assert!(is_lock_contention_error(&result.unwrap_err()));
+        assert_eq!(
+            attempts.get(),
+            1,
+            "a held lock must be waited out via the probe, never by re-opening"
+        );
+        assert!(probes.get() >= 2, "the wait must actually poll the probe");
+    }
+
+    /// Once the probe reports the lock free, exactly one more real open is
+    /// attempted (and succeeds here).
+    #[test]
+    fn open_kuzu_retry_reopens_once_when_probe_reports_free() {
+        let attempts = std::cell::Cell::new(0);
+        let probes = std::cell::Cell::new(0);
+        let result = open_kuzu_with_retry(
+            || {
+                let n = attempts.get() + 1;
+                attempts.set(n);
+                if n == 1 {
+                    Err(anyhow::anyhow!(
+                        "failed to open kuzu db: IO exception: Could not set lock on file : /x/.infigraph/graph"
+                    ))
+                } else {
+                    Ok(n)
+                }
+            },
+            || {
+                let n = probes.get() + 1;
+                probes.set(n);
+                if n < 3 {
+                    graph::lock_probe::LockProbe::Locked(None)
+                } else {
+                    graph::lock_probe::LockProbe::Free
+                }
+            },
+            std::time::Duration::from_secs(2),
+        );
+        assert_eq!(
+            result.unwrap(),
+            2,
+            "second open must run right after the probe reports free"
+        );
+        assert_eq!(attempts.get(), 2);
+        assert_eq!(probes.get(), 3);
     }
 
     /// Regression test for a second data-loss bug in the same area: a Kuzu

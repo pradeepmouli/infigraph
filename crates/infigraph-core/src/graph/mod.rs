@@ -2,6 +2,7 @@ mod backend;
 pub mod cozo_store;
 pub mod daemon_kuzu_backend;
 mod kuzu_backend;
+pub mod lock_probe;
 #[cfg(feature = "neo4j")]
 mod neo4j_backend;
 pub mod parquet_loader;
