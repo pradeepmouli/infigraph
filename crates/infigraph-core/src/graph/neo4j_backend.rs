@@ -264,6 +264,7 @@ impl Neo4jBackend {
                     );
                     m.insert("docstring".into(), s.docstring.clone().unwrap_or_default());
                     m.insert("parent".into(), s.parent.clone().unwrap_or_default());
+                    m.insert("scip_id".into(), s.scip_id.clone().unwrap_or_default());
                     m
                 })
                 .collect();
@@ -277,7 +278,8 @@ impl Neo4jBackend {
                          sym.visibility = s.visibility, sym.signature_hash = s.signature_hash, \
                          sym.complexity = toInteger(s.complexity), sym.language = s.language, \
                          sym.parameters = s.parameters, sym.return_type = s.return_type, \
-                         sym.docstring = s.docstring, sym.parent = s.parent",
+                         sym.docstring = s.docstring, sym.parent = s.parent, \
+                         sym.scip_id = s.scip_id",
                 )
                 .param("batch", params),
             ))
@@ -1588,6 +1590,7 @@ impl GraphBackend for Neo4jBackend {
                     );
                     m.insert("docstring".into(), s.docstring.clone().unwrap_or_default());
                     m.insert("parent".into(), s.parent.clone().unwrap_or_default());
+                    m.insert("scip_id".into(), s.scip_id.clone().unwrap_or_default());
                     m
                 })
             })
@@ -1602,7 +1605,8 @@ impl GraphBackend for Neo4jBackend {
                          sym.visibility = s.visibility, sym.signature_hash = s.signature_hash, \
                          sym.complexity = toInteger(s.complexity), sym.language = s.language, \
                          sym.parameters = s.parameters, sym.return_type = s.return_type, \
-                         sym.docstring = s.docstring, sym.parent = s.parent",
+                         sym.docstring = s.docstring, sym.parent = s.parent, \
+                         sym.scip_id = s.scip_id",
                 )
                 .param("batch", chunk.to_vec()),
             ))
