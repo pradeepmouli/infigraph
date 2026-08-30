@@ -192,6 +192,11 @@ recompilation exists today, so there is nothing to add here.
 
 ### Phase 2 — SCIP `(file, name)` key + tree-sitter `sym_seen` fix (Findings 1 & 2)
 
+**Part A (Finding 2, tree-sitter's own collapse) — implemented, commit `11ff3f0`.** Also
+persisted the disambiguation target: `Symbol.scip_id` was added across all three graph backends
+(Kuzu, Neo4j, Cozo) in commit `8e5d13c`, reviving originally-deferred item (a). **Part B
+(Finding 1, SCIP's lookup key) — not yet implemented**, tracked in `#126`.
+
 Signature-string disambiguation is ruled out: it's indexer/language-specific (mirrors the earlier
 finding that SCIP's own disambiguator can't be generically reconstructed), and demonstrably
 insufficient on its own (Finding 3's `Alpha::hello`/`Beta::hello` have identical signatures).
