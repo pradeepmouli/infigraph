@@ -192,21 +192,28 @@ recompilation exists today, so there is nothing to add here.
 
 ### Phase 2 — SCIP `(file, name)` key + tree-sitter `sym_seen` fix (Findings 1 & 2)
 
-Deferred pending a decision on the disambiguation axis. Signature-string disambiguation is ruled
-out: it's indexer/language-specific (mirrors the earlier finding that SCIP's own disambiguator
-can't be generically reconstructed), and demonstrably insufficient on its own (Finding 3's
-`Alpha::hello`/`Beta::hello` have identical signatures). Leaning toward a
-span/`start_line`-based uniqueness axis instead — already computed for every symbol regardless of
-extractor (tree-sitter span, SCIP's `occ.range` via `parse_range`, currently computed but unused
-for correlation), language- and indexer-agnostic, and would also fix the SCIP-to-tree-sitter
-correlation problem (match by span containment instead of `(file, name)` lookup).
+Signature-string disambiguation is ruled out: it's indexer/language-specific (mirrors the earlier
+finding that SCIP's own disambiguator can't be generically reconstructed), and demonstrably
+insufficient on its own (Finding 3's `Alpha::hello`/`Beta::hello` have identical signatures).
 
-**Open question, not yet resolved:** id stability under unrelated edits. Today's ids are pure
-name-based and stable across edits elsewhere in a file. A line-number-derived suffix — applied
-only to symbols that would otherwise collide, not universally — would only affect the (real but
-minority) colliding cases, but for those, an edit above them in the file would still shift their
-id. Needs its own investigation (e.g., an occurrence-ordinal suffix instead of a raw line number
-might be more stable, or might not be — not analyzed yet) before this phase is designed in full.
+**Disambiguation mechanism — decided.** A per-`(file, parent, name)` occurrence ordinal, not a raw
+`start_line` embed. Sort same-named symbols within the same `(file, parent)` group by start
+position (`Span.start_line`, tie-broken by `start_col` for the rare same-line case), assign each
+its rank, and append the ordinal to the id only when there's more than one in the group —
+everything else keeps its current, unsuffixed id. Ordinal beats a raw line number for stability:
+an edit *above* the colliding pair shifts both their line numbers equally (ordinal unaffected); an
+edit *between* them shifts only the second one's line number (ordinal still unaffected, since
+relative order didn't change). Ordinal only changes if the declarations are actually reordered
+relative to each other — a real identity change, not incidental edit noise.
+
+`file`, `parent`, and `name` are already three independent fields on every `Symbol` — this groups
+on values that already exist, nothing to reconstruct. It's also orthogonal to `parent`-correctness:
+it groups on whatever `(file, parent, name)` the id-construction code already computes at that
+point (Phase 1's fix included), not on some independently-verified ground truth, so it does not
+need to wait on Phase 3+4's per-language parent-scoping migration. The same span data (SCIP's
+`occ.range`, already parsed via `parse_range` but currently unused for correlation) also fixes the
+separate SCIP-to-tree-sitter correlation problem — match by span containment instead of
+`(file, name)` lookup.
 
 ### Phases 3+4 (merged) — Per-language migration off all remaining hardcoded walks
 
