@@ -33,6 +33,15 @@ use crate::model::{Span, SymbolKind};
 /// `#` (Type), or `().` (Method) per SCIP's descriptor grammar -- never a
 /// bare `)` -- so this never fires for a legitimately-new symbol; it can
 /// only match nested member descriptors.
+/// (file, name) -> candidate (start_line, end_line, symbol_id) tuples --
+/// see `file_name_to_ids` in `import_scip_index` for how this disambiguates
+/// same-named symbols by containment.
+type NameCandidates = HashMap<(String, String), Vec<(u32, u32, String)>>;
+
+/// A newly-created (SCIP-only) symbol row, in COPY column order: id, name,
+/// kind, file, start_line, end_line, docstring, scip_id.
+type NewSymbolRow = (String, String, String, String, u32, u32, String, String);
+
 fn is_member_of_known_symbol(scip_sym: &str, known: &HashMap<String, (String, String)>) -> bool {
     let Some(without_group) = scip_sym.strip_suffix(')') else {
         return false;
@@ -116,9 +125,15 @@ pub fn import_scip_index(
         }
     }
 
-    // Pre-load all symbols from graph into memory: (file, name) -> Vec<symbol_id>
-    // and file -> sorted Vec<(start_line, end_line, symbol_id)> for containment lookup
-    let mut file_name_to_ids: HashMap<(String, String), Vec<String>> = HashMap::new();
+    // Pre-load all symbols from graph into memory: (file, name) -> Vec<(start_line,
+    // end_line, symbol_id)> -- carries each candidate's span so Pass 1 can pick the
+    // SPECIFIC same-named symbol whose span contains a given occurrence, instead of
+    // enriching every same-named symbol in the file (the collision bug fixed by
+    // Phase 2's ordinal disambiguation in entities.rs now means genuinely distinct
+    // same-named symbols have distinct, non-overlapping spans to disambiguate by).
+    // file -> sorted Vec<(start_line, end_line, symbol_id)> for containment lookup
+    // (unfiltered by name -- used for Pass 2's caller-attribution only).
+    let mut file_name_to_ids: NameCandidates = HashMap::new();
     let mut file_symbols: HashMap<String, Vec<(u32, u32, String)>> = HashMap::new();
 
     // Must propagate a query failure here rather than silently falling back
@@ -149,7 +164,7 @@ pub fn import_scip_index(
         file_name_to_ids
             .entry((sfile.clone(), sname))
             .or_default()
-            .push(sid.clone());
+            .push((sstart, send, sid.clone()));
 
         file_symbols
             .entry(sfile)
@@ -187,8 +202,17 @@ pub fn import_scip_index(
     // never be written back over the tree-sitter-derived span (previously
     // it was, silently collapsing every enriched symbol's displayed source
     // to ~1 line).
-    let mut enrichments: Vec<(String, String)> = Vec::new();
-    let mut new_symbols: Vec<(String, String, String, String, u32, u32, String)> = Vec::new();
+    let mut enrichments: Vec<(String, String, String)> = Vec::new();
+    let mut new_symbols: Vec<NewSymbolRow> = Vec::new();
+
+    // SCIP moniker -> resolved tree-sitter Symbol.id, built as each definition
+    // occurrence below is correlated to a specific symbol (by containment for
+    // existing symbols, or its own fresh id for newly-created ones). A SCIP
+    // moniker string is self-consistent across every occurrence of that symbol
+    // within one index (definition AND every reference, disambiguator included),
+    // so Pass 2/3 can look up a reference's target directly here instead of
+    // re-deriving resolution through the lossy (file, name) map.
+    let mut scip_sym_to_ts_id: HashMap<String, String> = HashMap::new();
 
     for doc in &index.documents {
         let file = &doc.relative_path;
@@ -220,11 +244,25 @@ pub fn import_scip_index(
                 .unwrap_or("");
 
             let key = (file.clone(), name.clone());
-            if let Some(ids) = file_name_to_ids.get(&key) {
-                for sid in ids {
-                    enrichments.push((sid.clone(), docstring.to_string()));
-                    stats.symbols_enriched += 1;
-                }
+            // Among same-named candidates, pick the ONE whose span contains this
+            // occurrence's identifier token -- not every same-named candidate.
+            // Phase 2's ordinal disambiguation (entities.rs) means genuinely
+            // distinct same-named symbols now have distinct, non-overlapping
+            // spans, so containment reliably picks the right one; `.first()` as
+            // a fallback only matters for a span-computation edge case, not the
+            // common overload case this is designed for.
+            let matched = file_name_to_ids.get(&key).and_then(|candidates| {
+                candidates
+                    .iter()
+                    .find(|(s, e, _)| span.start_line >= *s && span.start_line <= *e)
+                    .or_else(|| candidates.first())
+                    .map(|(_, _, id)| id.clone())
+            });
+
+            if let Some(sid) = matched {
+                enrichments.push((sid.clone(), docstring.to_string(), scip_sym.clone()));
+                scip_sym_to_ts_id.insert(scip_sym.clone(), sid);
+                stats.symbols_enriched += 1;
             } else {
                 let kind = si
                     .map(|s| scip_kind_to_prism(&s.kind.enum_value_or_default()))
@@ -238,12 +276,15 @@ pub fn import_scip_index(
                     span.start_line,
                     span.end_line,
                     docstring.to_string(),
+                    scip_sym.clone(),
                 ));
                 stats.symbols_added += 1;
-                file_name_to_ids
-                    .entry(key)
-                    .or_default()
-                    .push(sym_id.clone());
+                scip_sym_to_ts_id.insert(scip_sym.clone(), sym_id.clone());
+                file_name_to_ids.entry(key).or_default().push((
+                    span.start_line,
+                    span.end_line,
+                    sym_id.clone(),
+                ));
                 file_symbols.entry(file.clone()).or_default().push((
                     span.start_line,
                     span.end_line,
@@ -303,8 +344,12 @@ pub fn import_scip_index(
                 .iter()
                 .map(|(_, _, _, _, sl, ..)| *sl as i64)
                 .collect();
-            let end_lines: Vec<i64> = remaining.iter().map(|(.., el, _)| *el as i64).collect();
-            let docs: Vec<&str> = remaining.iter().map(|(.., doc)| doc.as_str()).collect();
+            let end_lines: Vec<i64> = remaining.iter().map(|(.., el, _, _)| *el as i64).collect();
+            let docs: Vec<&str> = remaining.iter().map(|(.., doc, _)| doc.as_str()).collect();
+            let scip_ids: Vec<&str> = remaining
+                .iter()
+                .map(|(.., scip_id)| scip_id.as_str())
+                .collect();
             let n = remaining.len();
             let empty_str: Vec<&str> = vec![""; n];
             let scip_lang: Vec<&str> = vec!["scip"; n];
@@ -329,6 +374,7 @@ pub fn import_scip_index(
                     ("complexity", DataType::Int64),
                     ("parameters", DataType::Utf8),
                     ("return_type", DataType::Utf8),
+                    ("scip_id", DataType::Utf8),
                 ],
                 vec![
                     Arc::new(StringArray::from(ids)),
@@ -345,6 +391,7 @@ pub fn import_scip_index(
                     Arc::new(Int64Array::from(zeros)),
                     Arc::new(StringArray::from(empty_str2.clone())),
                     Arc::new(StringArray::from(empty_str2)),
+                    Arc::new(StringArray::from(scip_ids)),
                 ],
             )
             .is_ok();
@@ -355,7 +402,7 @@ pub fn import_scip_index(
             }
 
             match conn.query(&format!(
-                "COPY Symbol (id, name, kind, file, start_line, end_line, signature_hash, language, visibility, parent, docstring, complexity, parameters, return_type) FROM '{}'",
+                "COPY Symbol (id, name, kind, file, start_line, end_line, signature_hash, language, visibility, parent, docstring, complexity, parameters, return_type, scip_id) FROM '{}'",
                 fwd_slash_path(&sym_pq)
             )) {
                 Ok(_) => {
@@ -388,21 +435,22 @@ pub fn import_scip_index(
             for chunk in remaining.chunks(CHUNK) {
                 let rows: Vec<String> = chunk
                     .iter()
-                    .map(|(id, name, kind, file, start, end, doc)| {
+                    .map(|(id, name, kind, file, start, end, doc, scip_id)| {
                         format!(
-                            "{{id: '{}', name: '{}', kind: '{}', file: '{}', sl: {}, el: {}, doc: '{}'}}",
+                            "{{id: '{}', name: '{}', kind: '{}', file: '{}', sl: {}, el: {}, doc: '{}', scip: '{}'}}",
                             escape(id),
                             escape(name),
                             escape(kind),
                             escape(file),
                             start,
                             end,
-                            escape(doc)
+                            escape(doc),
+                            escape(scip_id)
                         )
                     })
                     .collect();
                 let _ = conn.query(&format!(
-                    "UNWIND [{}] AS s CREATE (:Symbol {{id: s.id, name: s.name, kind: s.kind, file: s.file, start_line: s.sl, end_line: s.el, signature_hash: '', language: 'scip', visibility: 'public', parent: '', docstring: s.doc, complexity: 0, parameters: '', return_type: ''}})",
+                    "UNWIND [{}] AS s CREATE (:Symbol {{id: s.id, name: s.name, kind: s.kind, file: s.file, start_line: s.sl, end_line: s.el, signature_hash: '', language: 'scip', visibility: 'public', parent: '', docstring: s.doc, complexity: 0, parameters: '', return_type: '', scip_id: s.scip}})",
                     rows.join(", ")
                 ));
             }
@@ -419,10 +467,17 @@ pub fn import_scip_index(
     for chunk in enrichments.chunks(CHUNK) {
         let rows: Vec<String> = chunk
             .iter()
-            .map(|(id, doc)| format!("{{id: '{}', doc: '{}'}}", escape(id), escape(doc)))
+            .map(|(id, doc, scip_id)| {
+                format!(
+                    "{{id: '{}', doc: '{}', scip: '{}'}}",
+                    escape(id),
+                    escape(doc),
+                    escape(scip_id)
+                )
+            })
             .collect();
         let _ = conn.query(&format!(
-            "UNWIND [{}] AS e MATCH (s:Symbol) WHERE s.id = e.id SET s.docstring = e.doc",
+            "UNWIND [{}] AS e MATCH (s:Symbol) WHERE s.id = e.id SET s.docstring = e.doc, s.scip_id = e.scip",
             rows.join(", ")
         ));
     }
@@ -456,15 +511,11 @@ pub fn import_scip_index(
                 continue;
             };
 
-            let target_id = if let Some((tfile, tname)) = scip_sym_to_file_name.get(&occ.symbol) {
-                file_name_to_ids
-                    .get(&(tfile.clone(), tname.clone()))
-                    .and_then(|ids| ids.first())
-                    .cloned()
-            } else {
-                None
-            };
-            let Some(target_id) = target_id else {
+            // Direct, exact lookup via the SCIP moniker itself -- built once in
+            // Pass 1 as each definition was correlated to its tree-sitter
+            // symbol, so this never suffers the (file, name) collision the old
+            // two-step scip_sym_to_file_name -> file_name_to_ids chain did.
+            let Some(target_id) = scip_sym_to_ts_id.get(&occ.symbol).cloned() else {
                 continue;
             };
 
@@ -537,14 +588,8 @@ pub fn import_scip_index(
             if si.symbol.starts_with("local ") || si.symbol.starts_with('<') {
                 continue;
             }
-            let Some((sfile, sname)) = scip_sym_to_file_name.get(&si.symbol) else {
-                continue;
-            };
-            let Some(source_id) = file_name_to_ids
-                .get(&(sfile.clone(), sname.clone()))
-                .and_then(|ids| ids.first())
-                .cloned()
-            else {
+            // Same direct scip_sym_to_ts_id lookup as Pass 2 -- see its comment.
+            let Some(source_id) = scip_sym_to_ts_id.get(&si.symbol).cloned() else {
                 continue;
             };
 
@@ -552,14 +597,7 @@ pub fn import_scip_index(
                 if !rel.is_implementation {
                     continue;
                 }
-                let Some((tfile, tname)) = scip_sym_to_file_name.get(&rel.symbol) else {
-                    continue;
-                };
-                let Some(target_id) = file_name_to_ids
-                    .get(&(tfile.clone(), tname.clone()))
-                    .and_then(|ids| ids.first())
-                    .cloned()
-                else {
+                let Some(target_id) = scip_sym_to_ts_id.get(&rel.symbol).cloned() else {
                     continue;
                 };
 
@@ -1237,6 +1275,127 @@ mod tests {
             vec![("mintFn".to_string(), "helper".to_string())],
             "the CALLS edge must attribute to the real enclosing method, not be \
              dropped or misattributed to a suppressed parameter pseudo-symbol"
+        );
+    }
+
+    /// Regression test for Phase 2's Part B: the old `.first()`-off-
+    /// file_name_to_ids resolution picked an arbitrary same-named symbol as
+    /// a CALLS edge's target whenever more than one existed in a file --
+    /// here, two distinct types (A, B) each with their own `foo` method
+    /// (same extracted name, different SCIP monikers, different spans).
+    /// A real call to specifically `B::foo` must resolve there, not fall
+    /// back to `A::foo` just because it happened to be inserted first.
+    #[test]
+    fn calls_edge_resolves_to_the_specific_same_named_target_not_first_in_file() {
+        let env = TestEnv::new();
+        let conn = env.store.connection().unwrap();
+
+        // Two pre-existing tree-sitter symbols with the SAME name but
+        // different parents/ids and non-overlapping spans -- exactly what
+        // Phase 2 Part A's ordinal disambiguation (or simply two distinct
+        // types) produces today.
+        conn.query(
+            "CREATE (:Symbol {id: 'test.ts::A::foo', name: 'foo', kind: 'method', \
+             file: 'test.ts', start_line: 1, end_line: 5, signature_hash: '', \
+             language: 'typescript', visibility: 'public', parent: 'test.ts::A', \
+             docstring: '', complexity: 0, parameters: '', return_type: ''})",
+        )
+        .unwrap();
+        conn.query(
+            "CREATE (:Symbol {id: 'test.ts::B::foo', name: 'foo', kind: 'method', \
+             file: 'test.ts', start_line: 10, end_line: 15, signature_hash: '', \
+             language: 'typescript', visibility: 'public', parent: 'test.ts::B', \
+             docstring: '', complexity: 0, parameters: '', return_type: ''})",
+        )
+        .unwrap();
+        conn.query(
+            "CREATE (:Symbol {id: 'test.ts::caller', name: 'caller', kind: 'function', \
+             file: 'test.ts', start_line: 20, end_line: 25, signature_hash: '', \
+             language: 'typescript', visibility: 'public', parent: '', docstring: '', \
+             complexity: 0, parameters: '', return_type: ''})",
+        )
+        .unwrap();
+
+        let file = "test.ts";
+        // A#foo and B#foo both extract to name "foo" via scip_sym_to_name
+        // (the `A#`/`B#` type-qualifier prefix is stripped) -- a realistic
+        // compiler-emitted collision, not a contrived string.
+        let a_foo_sym = "scip-test npm test 1.0.0 `test.ts`/A#foo().".to_string();
+        let b_foo_sym = "scip-test npm test 1.0.0 `test.ts`/B#foo().".to_string();
+        let caller_sym = "scip-test npm test 1.0.0 `test.ts`/caller().".to_string();
+
+        let doc = Document {
+            relative_path: file.to_string(),
+            occurrences: vec![
+                Occurrence {
+                    range: vec![1, 4, 7], // 1-based line 2, within A::foo's [1,5]
+                    symbol: a_foo_sym.clone(),
+                    symbol_roles: SymbolRole::Definition as i32,
+                    ..Default::default()
+                },
+                Occurrence {
+                    range: vec![10, 4, 7], // 1-based line 11, within B::foo's [10,15]
+                    symbol: b_foo_sym.clone(),
+                    symbol_roles: SymbolRole::Definition as i32,
+                    ..Default::default()
+                },
+                Occurrence {
+                    range: vec![20, 9, 15], // 1-based line 21, within caller's [20,25]
+                    symbol: caller_sym.clone(),
+                    symbol_roles: SymbolRole::Definition as i32,
+                    ..Default::default()
+                },
+                // A call to B::foo specifically, from inside caller's body.
+                Occurrence {
+                    range: vec![21, 2, 5],
+                    symbol: b_foo_sym.clone(),
+                    symbol_roles: 0, // reference, not definition
+                    ..Default::default()
+                },
+            ],
+            symbols: vec![
+                SymbolInformation {
+                    symbol: a_foo_sym.clone(),
+                    ..Default::default()
+                },
+                SymbolInformation {
+                    symbol: b_foo_sym.clone(),
+                    ..Default::default()
+                },
+                SymbolInformation {
+                    symbol: caller_sym.clone(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let index = Index {
+            documents: vec![doc],
+            ..Default::default()
+        };
+        let bytes = index.write_to_bytes().unwrap();
+        let index_path = env._dir.path().join("index.scip");
+        std::fs::write(&index_path, bytes).unwrap();
+
+        import_scip_index(&index_path, &env.store, None).unwrap();
+
+        let rows = conn
+            .query("MATCH (a:Symbol)-[:CALLS]->(b:Symbol) RETURN a.id, b.id")
+            .unwrap();
+        let pairs: Vec<(String, String)> = rows
+            .into_iter()
+            .map(|row| {
+                (
+                    row[0].to_string().trim_matches('"').to_string(),
+                    row[1].to_string().trim_matches('"').to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![("test.ts::caller".to_string(), "test.ts::B::foo".to_string())],
+            "the CALLS edge must resolve to the specific B::foo the reference \
+             actually pointed at, not arbitrarily pick A::foo"
         );
     }
 
