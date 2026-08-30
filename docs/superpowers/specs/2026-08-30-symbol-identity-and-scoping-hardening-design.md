@@ -192,10 +192,13 @@ recompilation exists today, so there is nothing to add here.
 
 ### Phase 2 — SCIP `(file, name)` key + tree-sitter `sym_seen` fix (Findings 1 & 2)
 
-**Part A (Finding 2, tree-sitter's own collapse) — implemented, commit `11ff3f0`.** Also
-persisted the disambiguation target: `Symbol.scip_id` was added across all three graph backends
-(Kuzu, Neo4j, Cozo) in commit `8e5d13c`, reviving originally-deferred item (a). **Part B
-(Finding 1, SCIP's lookup key) — not yet implemented**, tracked in `#126`.
+**Phase 2 complete.** `Symbol.scip_id` persisted across all three graph backends (Kuzu, Neo4j,
+Cozo) in commit `8e5d13c`, reviving originally-deferred item (a). **Part A** (Finding 2,
+tree-sitter's own collapse) implemented in commit `11ff3f0` — resolved `#125` as a side effect.
+**Part B** (Finding 1, SCIP's lookup key) implemented in commit `d14c982` — Pass 1 now builds
+`scip_sym_to_ts_id` by containment-matching each definition occurrence to its specific
+same-named candidate, and Pass 2/3 resolve `CALLS`/`INHERITS` targets via a direct, exact lookup
+on that map instead of the lossy `(file, name)` chain. `#126` closed.
 
 Signature-string disambiguation is ruled out: it's indexer/language-specific (mirrors the earlier
 finding that SCIP's own disambiguator can't be generically reconstructed), and demonstrably
@@ -268,9 +271,11 @@ independently without blocking on the others.
 
 ## Issue Tracking
 
-- Phase 1 — implemented directly (bounded), no tracking issue.
+- Phase 1 — implemented directly (bounded), no tracking issue. **Done** (`f29a1ea`).
 - Phase 1 residual gap (same-type overload collision) — `pradeepmouli/infigraph#125`.
-- Phase 2 (SCIP key + `sym_seen` fix) — `pradeepmouli/infigraph#126`.
+  **Closed** — resolved by Phase 2 Part A (`11ff3f0`).
+- Phase 2 (SCIP key + `sym_seen` fix) — `pradeepmouli/infigraph#126`. **Closed** — Part A
+  (`11ff3f0`) + `scip_id` persistence (`8e5d13c`) + Part B (`d14c982`).
 - Phases 3+4, merged (per-language migration of all remaining hardcoded walks) —
-  `pradeepmouli/infigraph#127`.
-- Phase 5 (`IMPLEMENTS` edge) — `pradeepmouli/infigraph#129`.
+  `pradeepmouli/infigraph#127`. Open.
+- Phase 5 (`IMPLEMENTS` edge) — `pradeepmouli/infigraph#129`. Open.
