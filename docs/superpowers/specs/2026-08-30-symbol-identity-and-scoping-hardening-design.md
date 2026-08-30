@@ -75,11 +75,15 @@ is parent scoping, not overload disambiguation.
 
 `find_enclosing_class` (`crates/infigraph-core/src/extract/relations.rs:354-384`) implements
 nearly identical `CLASS_KINDS`-walk logic to `find_parent_class`, copy-pasted into a separate
-file, used to qualify the source-class of a `CALLS`/reads/writes relation. The two have already
-drifted (this copy has an extra Pascal `declClass`/`declIntf` branch the other doesn't) — a live
-DRY violation. Both share the identical `impl_item` gap from Finding 3: a call made from inside
-*any* Rust impl method is likely mis-attributed on the relation-extraction side too, independent
-of the entity-id bug.
+file. The two have already drifted (this copy has an extra Pascal `declClass`/`declIntf` branch
+the other doesn't) — a live DRY violation regardless of its exact call sites. It shares the
+identical `impl_item` gap from Finding 3.
+
+**Correction (found while scoping Phase 1's implementation):** `find_enclosing_class` is used
+*only* to resolve `self`/`this`/`@` receivers to a class name for method-call resolution
+(`relations.rs:174`) — a narrower case than originally assumed here, not a general relation-source
+qualifier. It does **not** build a `CALLS` edge's caller-side id. That's a separate mechanism —
+see Finding 5's correction below.
 
 ### Finding 5 — The pattern generalizes: `find_enclosing_function` and C++ type-resolution walks
 
@@ -92,6 +96,19 @@ Pascal `defProc`/`genericDot` branch, and SQL `create_table`/`insert`/`cte` cont
 `find_field_type_in_enclosing_class` (`relations.rs:400-454`) and
 `find_param_type_in_enclosing_function` (`relations.rs:467-502`) are narrower, C++-only
 declared-type inference walks in the same imperative style.
+
+**Correction (found while scoping Phase 1's implementation):** a `CALLS` edge's caller-side id is
+built via `find_enclosing_function` returning the **bare** function/method name — never
+class-qualified — plus `format!("{}::{}", file, src)` (`relations.rs:165,208`), later reconciled
+in `resolve_calls.rs`'s `resolve_calls` against a `symbol_map` keyed purely by bare name across
+the whole file. This means Rust's `impl_item` gap has a real consequence here too, but a
+*different* one than Finding 4 originally claimed: before Phase 1, `Alpha::hello`/`Beta::hello`
+collapse into one bogus node, so `symbol_map["hello"]` has exactly one candidate — no visible
+ambiguity, just a wrong node. After Phase 1 correctly makes them distinct symbols,
+`symbol_map["hello"]` has *two* legitimate same-file candidates, and `find_enclosing_function`
+still never returns anything class-qualified — a call made from inside either impl's `hello` body
+can be attributed to the wrong one. This is scoped to Phase 3+4 (issue tracking below), not
+Phase 1.
 
 Structurally, **none of `infigraph-core/src/extract/{entities,relations}.rs` is organized per
 language** — confirmed via directory listing: `crates/infigraph-core/src/extract/` contains only
@@ -156,8 +173,12 @@ recompilation exists today, so there is nothing to add here.
 - Add `type: (_) @method.parent` to Rust's `entities.scm` impl-method pattern; resolve it via
   `resolve_inherit_text` + the pack's existing `inherit_decompose_query` (Finding 7's mechanism,
   reused not duplicated).
-- Fixes both the entity-id collapse (Finding 3) and the parallel `CALLS`-edge caller-attribution
-  bug (Finding 4) in one change.
+- Fixes the entity-id collapse (Finding 3). **Correction:** an earlier version of this spec
+  claimed this phase also fixes a parallel `CALLS`-edge caller-attribution bug — that was wrong.
+  `find_enclosing_class` (the function this phase consolidates) is used only for `self`/`this`
+  receiver resolution, not caller-attribution; the real caller-attribution gap (Finding 5's
+  correction) lives in `find_enclosing_function`, out of scope for Phase 1, tracked under
+  Phase 3+4 instead.
 - No schema change, purely additive to `entities.scm`/`entities.rs`; does not touch
   `relations.scm`. Clean for both fork and upstream.
 - **Known residual gap, explicitly not fixed by this phase:** a single type with two same-named
