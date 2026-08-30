@@ -187,19 +187,19 @@ minority) colliding cases, but for those, an edit above them in the file would s
 id. Needs its own investigation (e.g., an occurrence-ordinal suffix instead of a raw line number
 might be more stable, or might not be — not analyzed yet) before this phase is designed in full.
 
-### Phase 3 — Per-language migration off the class-scoping walk
+### Phases 3+4 (merged) — Per-language migration off all remaining hardcoded walks
 
-One language at a time: `entities.scm`/`relations.scm` gains a `@*.parent` capture (ancestor
-pattern for most languages, sibling-field pattern for C++'s out-of-line-method shape), verified
-against that language's real bundled `node-types.json` — same discipline as the existing
-Kotlin/Dart params-coverage work. The consolidated Phase-1 walk function is deleted only once
-every language it currently serves has migrated.
-
-### Phase 4 — `find_enclosing_function` and the C++ type-resolution walks
-
-Same philosophy as Phase 3, larger due to accumulated per-language special-casing (C# accessor
-indirection, Pascal, SQL container handling) that needs individual query-pattern verification,
-not a mechanical swap. Own follow-up, not bundled with Phase 3.
+Originally split into "class-scoping" (Phase 3) and "`find_enclosing_function`/C++
+type-resolution" (Phase 4), merged into a single per-language effort: the two walks don't cover
+identical language sets, but wherever they overlap (C#, C++, Pascal), verifying that language's
+grammar and touching its query files once is strictly better than two disconnected global sweeps.
+Organized by language/case, not by walk-type — see the tracking issue for the full checklist.
+Each case is capture-with-fallback (optional `@*.parent`/`@*.enclosing` capture, consumed
+preferentially, old walk kept until every consuming case has migrated), verified against that
+language's real bundled `node-types.json` before writing captures — same discipline as the
+existing Kotlin/Dart params-coverage work. The consolidated Phase-1 walk function, and
+`find_enclosing_function`/the C++ type-resolution walks, are deleted only once every case they
+serve has migrated.
 
 ### Phase 5 — `IMPLEMENTS` edge (Finding 6)
 
@@ -225,7 +225,19 @@ not a mechanical swap. Own follow-up, not bundled with Phase 3.
 
 **Confidence: High** on all seven findings (each verified against source; Finding 3 additionally
 verified by empirical reproduction) and on Phase 1's design. **Medium** on Phase 2's exact
-disambiguation mechanism (the open question above is real and unresolved). **Recommendation:**
-proceed with Phase 1 as a bounded implementation now; track Phases 2–5 as separate GitHub issues
-referencing this spec, so each can be picked up and scoped independently without blocking on the
-others.
+disambiguation mechanism (the open question above is real and unresolved — current lean is a
+per-`(file, parent, name)` occurrence ordinal rather than a raw `start_line` embed, since ordinal
+is stable against edits that shift line numbers without reordering the colliding declarations
+themselves; only symbols that would otherwise collide get a suffix at all). **Recommendation:**
+proceed with Phase 1 as a bounded implementation now; track Phase 2 and Phases 3+4 (merged) and
+Phase 5 as separate GitHub issues referencing this spec, so each can be picked up and scoped
+independently without blocking on the others.
+
+## Issue Tracking
+
+- Phase 1 — implemented directly (bounded), no tracking issue.
+- Phase 1 residual gap (same-type overload collision) — `pradeepmouli/infigraph#125`.
+- Phase 2 (SCIP key + `sym_seen` fix) — `pradeepmouli/infigraph#126`.
+- Phases 3+4, merged (per-language migration of all remaining hardcoded walks) —
+  `pradeepmouli/infigraph#127`.
+- Phase 5 (`IMPLEMENTS` edge) — `pradeepmouli/infigraph#129`.
