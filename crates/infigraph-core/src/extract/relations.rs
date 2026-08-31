@@ -310,7 +310,16 @@ fn find_enclosing_function(
             if let Some(prop) = n.parent().and_then(|list| list.parent()) {
                 if prop.kind() == "property_declaration" {
                     if let Some(name_node) = prop.child_by_field_name("name") {
-                        return Some(node_text(name_node, source));
+                        let name = node_text(name_node, source);
+                        // Qualify with the enclosing class, same as the
+                        // generic func_kinds branch above -- without this,
+                        // two same-named properties on different types in
+                        // one file collide exactly like the unqualified
+                        // method case (issue #127's C# line item).
+                        return Some(match find_parent_class(prop, source, decompose_query) {
+                            Some(class) => format!("{}::{}", class, name),
+                            None => name,
+                        });
                     }
                 }
             }

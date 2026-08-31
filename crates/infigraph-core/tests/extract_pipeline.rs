@@ -789,21 +789,89 @@ class MainWin {
         .find(|r| r.kind == RelationKind::Calls && r.target_id.ends_with("::Initialize"))
         .expect("Initialize call site should be extracted");
 
-    // find_enclosing_function returns the raw constructor name ("MainWin"),
-    // combined with the file as "{file}::{name}" — this is the pre-class-
-    // scoping shape relations use for source attribution (resolve_calls.rs's
-    // fixed_pairs step reconciles it against the real class-scoped symbol id
-    // at resolution time). The bug this test guards against produced a
+    // find_enclosing_function now qualifies with the enclosing class (issue
+    // #127's caller-attribution fix), so source_id already matches the real
+    // class-scoped constructor symbol id directly at extraction time —
+    // resolve_calls.rs no longer needs to reconcile a bare "{file}::MainWin"
+    // against it. The bug this test originally guarded against produced a
     // corrupted "MainWin.cs::MainWin.cs" (the whole filename duplicated as
-    // the "name"), not this — confirming the constructor body is now a real,
-    // distinct enclosing scope instead of falling through to a file-level
-    // catch-all.
+    // the "name"); this confirms the constructor body is a real, correctly
+    // class-scoped enclosing symbol, not a file-level catch-all.
     assert_eq!(
-        call.source_id, "MainWin.cs::MainWin",
+        call.source_id, "MainWin.cs::MainWin::MainWin",
         "a call inside a constructor body must be attributed to the \
-         constructor itself, not a corrupted file-scoped fallback"
+         class-scoped constructor symbol itself"
     );
     assert_eq!(call.receiver.as_deref(), Some("MainViewModel"));
+}
+
+/// Issue #127's C# line item: two same-named methods on different types in
+/// one file must get distinct, class-scoped ids -- previously
+/// method_declaration/constructor_declaration had no @method.parent capture
+/// at all, relying entirely on the generic find_parent_class walk (which
+/// happens to already work for C# since class_declaration has a real "name"
+/// field, unlike Rust's impl_item) rather than a declarative per-language
+/// capture, per the migration this issue tracks.
+#[test]
+fn test_csharp_same_named_methods_on_different_types_get_distinct_ids() {
+    let src = br#"
+class Alpha {
+    public void Hello() {}
+}
+struct Beta {
+    public void Hello() {}
+}
+"#;
+    let registry = infigraph_languages::bundled_registry().unwrap();
+    let pack = registry.for_extension(".cs").unwrap();
+    let ext = extract_file("shapes.cs", src, pack).unwrap();
+
+    let mut hello_ids: Vec<&str> = ext
+        .symbols
+        .iter()
+        .filter(|s| s.name == "Hello" && s.kind == SymbolKind::Method)
+        .map(|s| s.id.as_str())
+        .collect();
+    hello_ids.sort();
+
+    assert_eq!(
+        hello_ids,
+        vec!["shapes.cs::Alpha::Hello", "shapes.cs::Beta::Hello"],
+        "both types' Hello methods must survive as distinct, class-scoped symbols"
+    );
+}
+
+/// Issue #127's C# line item: a call made from inside a property GETTER
+/// (accessor_declaration -> property_declaration, a separate code path from
+/// the generic method/constructor func_kinds branch) must also be qualified
+/// with the enclosing class -- previously this branch returned only the
+/// bare property name, so two same-named properties on different types in
+/// one file would collide exactly like the pre-fix method case.
+#[test]
+fn test_csharp_call_inside_property_getter_gets_class_qualified_source_id() {
+    let src = br#"
+class Alpha {
+    public int Value {
+        get { return Helper(); }
+    }
+    private int Helper() { return 1; }
+}
+"#;
+    let registry = infigraph_languages::bundled_registry().unwrap();
+    let pack = registry.for_extension(".cs").unwrap();
+    let ext = extract_file("props.cs", src, pack).unwrap();
+
+    let call = ext
+        .relations
+        .iter()
+        .find(|r| r.kind == RelationKind::Calls && r.target_id.ends_with("::Helper"))
+        .expect("Helper() call site inside the getter should be extracted");
+
+    assert_eq!(
+        call.source_id, "props.cs::Alpha::Value",
+        "a call inside a property getter must be attributed to the class-scoped property, \
+         not a bare unqualified name"
+    );
 }
 
 #[test]
