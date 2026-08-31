@@ -64,10 +64,19 @@ fn cli_binary() -> PathBuf {
 fn start_real_daemon(project_dir: &Path) -> KillOnDrop {
     let cli = cli_binary();
 
+    // INFIGRAPH_NO_WATCH: plain `index` triggers main.rs's pre-dispatch
+    // `should_auto_watch` regardless of backend, which opportunistically
+    // spawns its own REAL detached watcher via the same
+    // `ensure_watcher_running` this function calls explicitly below --
+    // without this, every one of this function's 10 callers got a second,
+    // unmanaged daemon process from this bootstrap step alone, entirely
+    // separate from (and not cleaned up by) the KillOnDrop guard around
+    // the daemon spawned further down. Root cause of pradeepmouli/infigraph#133.
     let status = Command::new(&cli)
         .arg("index")
         .current_dir(project_dir)
         .env_remove("INFIGRAPH_BACKEND")
+        .env("INFIGRAPH_NO_WATCH", "1")
         .status()
         .unwrap();
     assert!(status.success(), "bootstrap index failed");
@@ -925,13 +934,15 @@ fn full_reindex_with_no_daemon_fails_fast_instead_of_polling_for_ten_minutes() {
     std::fs::write(project.path().join("a.py"), "def a():\n    pass\n").unwrap();
 
     // Bootstrap a `.infigraph/` locally so the failure under test is
-    // genuinely "no daemon", not "no project".
+    // genuinely "no daemon", not "no project". INFIGRAPH_NO_WATCH: plain,
+    // unrelated setup -- must not opportunistically spawn its own watcher.
     let cli = cli_binary();
     let status = Command::new(&cli)
         .arg("index")
         .current_dir(project.path())
         .env_remove("INFIGRAPH_BACKEND")
         .env_remove("INFIGRAPH_WATCH_DAEMON")
+        .env("INFIGRAPH_NO_WATCH", "1")
         .status()
         .unwrap();
     assert!(status.success(), "bootstrap index failed");
@@ -1087,6 +1098,7 @@ fn plain_index_auto_promotes_to_a_full_rebuild_when_the_graph_is_missing_but_inf
         .current_dir(project.path())
         .env_remove("INFIGRAPH_BACKEND")
         .env_remove("INFIGRAPH_WATCH_DAEMON")
+        .env("INFIGRAPH_NO_WATCH", "1")
         .status()
         .unwrap();
     assert!(status.success(), "bootstrap index failed");
@@ -1100,6 +1112,7 @@ fn plain_index_auto_promotes_to_a_full_rebuild_when_the_graph_is_missing_but_inf
         .current_dir(project.path())
         .env_remove("INFIGRAPH_BACKEND")
         .env_remove("INFIGRAPH_WATCH_DAEMON")
+        .env("INFIGRAPH_NO_WATCH", "1")
         .output()
         .unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1150,12 +1163,18 @@ fn opportunistic_daemon_spawn_writes_a_start_banner_naming_its_pid_to_daemon_log
     let project = tempfile::tempdir().unwrap();
     std::fs::write(project.path().join("a.py"), "def a():\n    pass\n").unwrap();
 
+    // INFIGRAPH_NO_WATCH: without this, the bootstrap's own pre-dispatch
+    // auto-watch could win the lock race before the explicit
+    // ensure_daemon_running call below ever runs, making the `Spawned`
+    // assertion flaky (it would see `AlreadyRunning` instead) and leaking
+    // an extra, unmanaged daemon this test never tracks or kills.
     let status = Command::new(cli_binary())
         .arg("index")
         .arg("--no-embed")
         .current_dir(project.path())
         .env_remove("INFIGRAPH_BACKEND")
         .env_remove("INFIGRAPH_WATCH_DAEMON")
+        .env("INFIGRAPH_NO_WATCH", "1")
         .status()
         .unwrap();
     assert!(status.success(), "bootstrap index failed");
@@ -1224,13 +1243,18 @@ fn plain_index_ignores_no_watch_opt_out_for_the_required_backend_daemon() {
 
     // Bootstrap first so `.infigraph` exists -- this test is about the
     // NO_WATCH-suppresses-a-required-daemon gap specifically, not the
-    // separate never-indexed-yet case covered above.
+    // separate never-indexed-yet case covered above. INFIGRAPH_NO_WATCH
+    // here too: this bootstrap step is plain, unrelated setup, so it
+    // should not opportunistically spawn its own watcher via main.rs's
+    // pre-dispatch should_auto_watch -- that's the mechanism under test
+    // below, deliberately, only for the *second* command.
     let cli = cli_binary();
     let status = Command::new(&cli)
         .arg("index")
         .current_dir(project.path())
         .env_remove("INFIGRAPH_BACKEND")
         .env_remove("INFIGRAPH_WATCH_DAEMON")
+        .env("INFIGRAPH_NO_WATCH", "1")
         .status()
         .unwrap();
     assert!(status.success(), "bootstrap index failed");
@@ -1255,7 +1279,26 @@ fn plain_index_ignores_no_watch_opt_out_for_the_required_backend_daemon() {
          actually requires -- got: {stderr}"
     );
 
-    std::fs::write(project.path().join(".infigraph").join("watch.stop"), b"").unwrap();
+    // This command really did spawn a real, required daemon (that's the
+    // whole point of the test) -- via ensure_daemon_for_writes, a THIRD
+    // auto-start entry point distinct from both ensure_watcher_running and
+    // ensure_daemon_running, with no Child handle for this test to own.
+    // Clean it up properly: KillPidOnDrop as the guarantee, plus the real
+    // full-process-stop mechanism (not `watch.stop`, which only stops the
+    // watch thread) for the graceful path.
+    let lock_path = project.path().join(".infigraph").join("watch.lock");
+    if let Some(holder) = infigraph_core::lockfile::read_holder(&lock_path) {
+        let _kill_guard = KillPidOnDrop(holder.pid);
+        let staging_dir = project.path().join(".infigraph").join("requests");
+        let _ = infigraph_core::daemon_protocol::submit_write_request(
+            &staging_dir,
+            &infigraph_core::daemon_protocol::WriteRequest::WatchControl {
+                role: infigraph_core::daemon_protocol::WatchRole::Daemon,
+                action: infigraph_core::daemon_protocol::WatchAction::Stop,
+            },
+            Duration::from_secs(10),
+        );
+    }
 }
 
 #[test]
