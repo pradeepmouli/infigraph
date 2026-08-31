@@ -20,9 +20,10 @@ Full current inventory of the 47 vars: see the "Inventory" section below.
 
 ## Convention
 
-- A settings group is declared once, at a module's entry point, e.g.:
+- A settings group is declared once, at a module's entry point, with one explicit token — its **category** — plus the field list:
   ```rust
   settings! {
+      category: mcp,
       struct Settings {
           idle_grace_secs: u64 = 300,
           idle_poll_secs: u64 = 5,
@@ -31,20 +32,18 @@ Full current inventory of the 47 vars: see the "Inventory" section below.
       }
   }
   ```
-- **Group prefix** = the last segment of `module_path!()` at the macro's call site, with two adjustments:
-  - If that last segment is literally `config` (e.g. a `watch/config.rs` submodule), use the segment above it instead — so both a flat `watch.rs` and a `watch/config.rs` layout produce prefix `watch`.
-  - A leading `infigraph_` crate-root segment is stripped (e.g. `infigraph_mcp` → `mcp`).
-- **Env var name**: `INFIGRAPH_{PREFIX}_{FIELD}` (upper-cased), e.g. `watch` + `idle_grace_secs` → `INFIGRAPH_WATCH_IDLE_GRACE_SECS`. Where a field already carries the group name for historical reasons (e.g. today's `INFIGRAPH_MCP_IDLE_GRACE_SECS`), the migrated field is named without the redundant prefix (`idle_grace_secs`) since the macro supplies `MCP_` from the module path — the generated env var name is unchanged.
-- **TOML section**: nested under a section named after the prefix, via serde's ordinary field-name matching — no macro support needed for this part at all.
+- **Why an explicit `category` token, not silent `module_path!()` inference:** `paste!` (needed for CLI flag qualification — see below) can only paste together *tokens* available to the macro at compile time. `module_path!()`'s value is a string literal that's only splittable (extract last segment, apply the `config`-skip/`infigraph_`-strip rules) with ordinary runtime Rust code — `macro_rules!`/`paste!` cannot parse or re-tokenize it without a proc-macro (`syn`/`quote`), which this design explicitly avoids. So the category can't be silently inferred purely from file location while also driving `paste!`-based CLI flags. Requiring the caller to state it once per *group* (not per field) keeps the "zero per-field attributes" property intact — it's one token, once — while giving `paste!`, the env-var-name builder, and the TOML section name a single, unambiguous, compile-time-available source of truth that can never drift apart.
+- **Env var name**: `INFIGRAPH_{CATEGORY}_{FIELD}` (upper-cased), e.g. `watch` + `idle_grace_secs` → `INFIGRAPH_WATCH_IDLE_GRACE_SECS`. Where a field already carries the group name for historical reasons (e.g. today's `INFIGRAPH_MCP_IDLE_GRACE_SECS`), the migrated field is named without the redundant prefix (`idle_grace_secs`) since the macro supplies `MCP_` from the category — the generated env var name is unchanged.
+- **TOML section**: nested under a section named after the category, via serde's ordinary field-name matching — no macro support needed for this part at all.
 - **CLI flag**: see "CLI flag qualification" below.
-- **`watch` vs `watch_docs`**: collapsed into one `watch` group, distinguished by field name (`watch_docs_enabled`, `watch_code_enabled`) rather than by two separate groups/prefixes.
+- **`watch` vs `watch_docs`**: collapsed into one `watch` category, distinguished by field name (`watch_docs_enabled`, `watch_code_enabled`) rather than by two separate groups/categories.
 - **Merge precedence**: CLI > env > TOML > hardcoded default, applied per field via `Option<T>` fields internally and a generated merge method chaining `Option::or()`.
 
 ## CLI flag qualification
 
 Naively letting clap auto-derive `--long` from each field's bare name only works while a single settings group's flags are the only ones on a given command. Since multiple groups are commonly combined into one CLI surface (`#[command(flatten)]` is the standard clap pattern for composing structs), two groups both having a field like `enabled` would otherwise collide on `--enabled`.
 
-Fix: the macro uses the `paste` crate (small, extremely common, near-zero-risk — used purely for its ident-pasting, not adopting it as an architecture) to generate the underlying struct's *field* as the already-prefixed identifier `{prefix}_{field}` (e.g. `watch_idle_grace_secs`), and lets clap's own standard field-name → kebab-case flag derivation do the rest for free, producing `--watch-idle-grace-secs`. `macro_rules!` alone cannot paste two tokens into a new identifier (no stable `concat_idents!`), which is why `paste` is needed — this is exactly the problem it exists to solve. No runtime string-building, no fighting clap's attribute parser (which wants a literal, not a computed value, for `#[arg(long = "...")]`).
+Fix: the macro uses the `paste` crate (small, extremely common, near-zero-risk — used purely for its ident-pasting, not adopting it as an architecture) to generate the underlying struct's *field* as the already-qualified identifier `{category}_{field}` (e.g. `mcp_idle_grace_secs`), using the explicit `category` token from the macro invocation, and lets clap's own standard field-name → kebab-case flag derivation do the rest for free, producing `--mcp-idle-grace-secs`. `macro_rules!` alone cannot paste two tokens into a new identifier (no stable `concat_idents!`), which is why `paste` is needed — this is exactly the problem it exists to solve. No runtime string-building, no fighting clap's attribute parser (which wants a literal, not a computed value, for `#[arg(long = "...")]`).
 
 This is a new dependency addition (`paste`) for `infigraph-core`, `infigraph-cli`, and (if adopting clap there — see Open Questions) `infigraph-mcp`.
 
@@ -53,16 +52,16 @@ This is a new dependency addition (`paste`) for `infigraph-core`, `infigraph-cli
 ```rust
 #[derive(Parser, Deserialize, Default)]
 struct RawSettings {
-    #[arg(long)] // field name is already prefixed via paste!, e.g. watch_idle_grace_secs
-    watch_idle_grace_secs: Option<u64>,
+    #[arg(long)] // field name is already category-qualified via paste!, e.g. mcp_idle_grace_secs
+    mcp_idle_grace_secs: Option<u64>,
     // ...
 }
 
 impl Settings {
     fn resolve() -> Self {
         let cli = RawSettings::parse();
-        let env = RawSettings::from_env(); // per-field INFIGRAPH_{PREFIX}_{FIELD} lookup
-        let toml = RawSettings::from_toml_section("watch");
+        let env = RawSettings::from_env(); // per-field INFIGRAPH_{CATEGORY}_{FIELD} lookup
+        let toml = RawSettings::from_toml_section("mcp");
         cli.merge(env).merge(toml).merge(Self::defaults())
     }
 }
