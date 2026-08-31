@@ -87,6 +87,26 @@ fn is_lock_contention_error(err: &anyhow::Error) -> bool {
     err.to_string().contains("Could not set lock on file")
 }
 
+/// A `Database::new` open failure (`"failed to open kuzu db"` /
+/// `"failed to open kuzu db (read-only)"`, `GraphStore::open`/`open_read_only`'s
+/// own wrapping) that mentions the WAL. Distinct from `unclean_shutdown_wal_holder`'s
+/// deliberately different-worded dead-holder bail ("...unreplayed WAL from
+/// process {pid}, which is no longer running...", raised *before* `Database::new`
+/// is ever called) -- that one is genuine, already-diagnosed corruption and must
+/// not retry.
+///
+/// A live writer actively checkpointing/rotating the WAL can make a
+/// concurrent read-only open transiently fail this way (observed: "Runtime
+/// exception: Corrupted wal file. Read out invalid WAL record type." against
+/// a graph `doctor` calls healthy moments later, with a live write-lock
+/// holder) -- retrying briefly lets that resolve instead of hard-failing
+/// (or, on the write path, escalating straight to a wipe-and-rebuild) on
+/// what may just be a race.
+fn is_transient_wal_open_race_error(err: &anyhow::Error) -> bool {
+    let msg = err.to_string();
+    msg.contains("failed to open kuzu db") && msg.to_lowercase().contains("wal")
+}
+
 /// Context line for a lock-contention open failure, naming the holder
 /// when the OS can tell us (see `graph::lock_probe::describe_lock_holder`).
 fn lock_contention_context(db_path: &Path) -> String {
@@ -123,7 +143,7 @@ fn open_kuzu_with_retry<T>(
     let mut delay = std::time::Duration::from_millis(1);
     let mut last_err = match open() {
         Ok(v) => return Ok(v),
-        Err(e) if is_lock_contention_error(&e) => e,
+        Err(e) if is_lock_contention_error(&e) || is_transient_wal_open_race_error(&e) => e,
         Err(e) => return Err(e),
     };
     loop {
@@ -145,7 +165,9 @@ fn open_kuzu_with_retry<T>(
         }
         match open() {
             Ok(v) => return Ok(v),
-            Err(e) if is_lock_contention_error(&e) => last_err = e,
+            Err(e) if is_lock_contention_error(&e) || is_transient_wal_open_race_error(&e) => {
+                last_err = e
+            }
             Err(e) => return Err(e),
         }
     }
@@ -1169,6 +1191,62 @@ mod tests {
             result.unwrap(),
             4,
             "should retry past the transient lock window and succeed on the 4th open"
+        );
+    }
+
+    #[test]
+    fn open_kuzu_retry_retries_a_transient_wal_open_race_and_succeeds() {
+        use std::cell::Cell;
+        // A live writer mid-checkpoint can make a concurrent read-only open
+        // transiently fail this way (the sittir self-graph incident,
+        // 2026-08-31) -- must retry past it, not hard-fail immediately.
+        let attempts = Cell::new(0);
+        let result = open_kuzu_with_retry(
+            || {
+                let n = attempts.get() + 1;
+                attempts.set(n);
+                if n <= 2 {
+                    Err(anyhow::anyhow!(
+                        "failed to open kuzu db (read-only): Runtime exception: Corrupted wal \
+                         file. Read out invalid WAL record type."
+                    ))
+                } else {
+                    Ok(n)
+                }
+            },
+            || graph::lock_probe::LockProbe::Unsupported,
+            std::time::Duration::from_secs(2),
+        );
+        assert_eq!(
+            result.unwrap(),
+            3,
+            "should retry past the transient WAL race and succeed once the writer's checkpoint finishes"
+        );
+    }
+
+    #[test]
+    fn open_kuzu_retry_does_not_retry_a_dead_holder_wal_corruption_message() {
+        // unclean_shutdown_wal_holder's own bail (raised before Database::new
+        // is ever called) is deliberately worded differently and is genuine,
+        // already-diagnosed corruption -- must not be mistaken for the
+        // transient live-writer race and retried away.
+        let attempts = std::cell::Cell::new(0);
+        let result: Result<()> = open_kuzu_with_retry(
+            || {
+                attempts.set(attempts.get() + 1);
+                Err(anyhow::anyhow!(
+                    "graph has an unreplayed WAL from process 1234, which is no longer running \
+                     (unclean shutdown) -- refusing to open it directly"
+                ))
+            },
+            || graph::lock_probe::LockProbe::Unsupported,
+            std::time::Duration::from_secs(2),
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            attempts.get(),
+            1,
+            "a dead-holder corruption message must not be retried"
         );
     }
 
