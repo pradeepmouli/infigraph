@@ -19,18 +19,17 @@ use infigraph_core::lockfile::{self, LockFile};
 use serde::{Deserialize, Serialize};
 
 infigraph_core::settings! {
-    category: mcp,
-    struct LockSettings {
-        lock_heartbeat_secs: u64 = 15,
-        lock_wedged_secs: u64 = 60,
-        lock_takeover_poll_secs: u64 = 1,
-        lock_takeover_timeout_secs: u64 = 10,
+    mcp_lock {
+        heartbeat_secs: u64 = 15,
+        wedged_secs: u64 = 60,
+        takeover_poll_secs: u64 = 1,
+        takeover_timeout_secs: u64 = 10,
     }
 }
 
-fn resolved_lock_settings() -> LockSettings {
-    let cli = RawLockSettings::parse_from(std::iter::empty::<String>());
-    LockSettings::resolve(cli, None)
+fn resolved_lock_settings() -> McpLock {
+    let cli = RawMcpLock::parse_from(std::iter::empty::<String>());
+    McpLock::resolve(cli, None)
 }
 
 /// Full path to `mcp.lock`. Overridable via `INFIGRAPH_MCP_LOCK_PATH`
@@ -50,13 +49,13 @@ pub fn lock_path() -> PathBuf {
 /// `last_heartbeat` and checks for a pending handover request.
 /// Overridable via `INFIGRAPH_MCP_LOCK_HEARTBEAT_SECS`.
 pub fn heartbeat_interval() -> Duration {
-    Duration::from_secs(resolved_lock_settings().lock_heartbeat_secs)
+    Duration::from_secs(resolved_lock_settings().heartbeat_secs)
 }
 
 /// How stale a holder's heartbeat must be before it's logged as possibly
 /// wedged. Overridable via `INFIGRAPH_MCP_LOCK_WEDGED_SECS`.
 pub fn wedged_threshold_secs() -> u64 {
-    resolved_lock_settings().lock_wedged_secs
+    resolved_lock_settings().wedged_secs
 }
 
 /// Non-blocking: try to become mcp.lock's primary. `None` if another
@@ -194,14 +193,14 @@ fn live_handover_request() -> Option<HandoverRequest> {
 /// the lock while waiting for the incumbent to honor the request.
 /// Overridable via `INFIGRAPH_MCP_LOCK_TAKEOVER_POLL_SECS`.
 pub fn takeover_poll_interval() -> Duration {
-    Duration::from_secs(resolved_lock_settings().lock_takeover_poll_secs)
+    Duration::from_secs(resolved_lock_settings().takeover_poll_secs)
 }
 
 /// How long a challenger waits for a handover request to be honored
 /// before giving up and falling back to Secondary. Overridable via
 /// `INFIGRAPH_MCP_LOCK_TAKEOVER_TIMEOUT_SECS`.
 pub fn takeover_wait_timeout() -> Duration {
-    Duration::from_secs(resolved_lock_settings().lock_takeover_timeout_secs)
+    Duration::from_secs(resolved_lock_settings().takeover_timeout_secs)
 }
 
 /// Ceiling on the automatically-derived part of the takeover wait. The whole

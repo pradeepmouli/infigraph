@@ -16,10 +16,9 @@ const DEFAULT_GRACE_SECS: u64 = 300;
 const DEFAULT_POLL_SECS: u64 = 10;
 
 infigraph_core::settings! {
-    category: mcp,
-    struct IdleSettings {
-        idle_grace_secs: u64 = DEFAULT_GRACE_SECS,
-        idle_poll_secs: u64 = DEFAULT_POLL_SECS,
+    mcp_idle {
+        grace_secs: u64 = DEFAULT_GRACE_SECS,
+        poll_secs: u64 = DEFAULT_POLL_SECS,
     }
 }
 
@@ -27,16 +26,16 @@ infigraph_core::settings! {
 /// process exits, if it's still alive only to serve the local UI.
 /// Overridable via `INFIGRAPH_MCP_IDLE_GRACE_SECS` (seconds).
 pub fn idle_grace_period() -> Duration {
-    let cli = RawIdleSettings::parse_from(std::iter::empty::<String>());
-    Duration::from_secs(IdleSettings::resolve(cli, None).idle_grace_secs)
+    let cli = RawMcpIdle::parse_from(std::iter::empty::<String>());
+    Duration::from_secs(McpIdle::resolve(cli, None).grace_secs)
 }
 
 /// How often the post-EOF loop wakes to re-check the grace period.
 /// Overridable via `INFIGRAPH_MCP_IDLE_POLL_SECS` (seconds) — kept small in
 /// tests so they don't wait a full production-sized interval.
 pub fn idle_poll_interval() -> Duration {
-    let cli = RawIdleSettings::parse_from(std::iter::empty::<String>());
-    Duration::from_secs(IdleSettings::resolve(cli, None).idle_poll_secs)
+    let cli = RawMcpIdle::parse_from(std::iter::empty::<String>());
+    Duration::from_secs(McpIdle::resolve(cli, None).poll_secs)
 }
 
 /// Pure: has `elapsed` (time since the MCP client's stdin closed) reached

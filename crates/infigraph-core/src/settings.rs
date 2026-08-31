@@ -28,11 +28,17 @@ impl FromTomlItem for u64 {
     }
 }
 
-/// Declares a settings group. `category` names the group for env var names
+/// Declares a settings group. `$category` (a single, possibly-underscored
+/// identifier, e.g. `mcp_idle`) names the group for env var names
 /// (`INFIGRAPH_{CATEGORY}_{FIELD}`), category-qualified CLI flags (via
 /// `paste!`, so `--{category}-{field}` falls out of clap's own kebab-case
-/// derivation with zero explicit `long = "..."` attributes), and the TOML
-/// section it reads from. `category` is an explicit token rather than
+/// derivation with zero explicit `long = "..."` attributes), the TOML
+/// section it reads from, *and* the generated struct's name (via `paste!`'s
+/// `:camel` case conversion, e.g. `mcp_idle` -> `McpIdle`/`RawMcpIdle`) --
+/// one identifier serves all four roles, so two settings groups that want
+/// to share a common namespace (e.g. `mcp_idle` and `mcp_lock`, both under
+/// "mcp") stay distinct simply by being different identifiers, without a
+/// separate struct-name token. `$category` is an explicit token rather than
 /// derived from `module_path!()` because `paste!` can only paste compile-time
 /// tokens, and `module_path!()`'s value is a runtime string macro_rules!
 /// cannot re-tokenize without a proc-macro -- see the spec's "Convention"
@@ -40,33 +46,31 @@ impl FromTomlItem for u64 {
 #[macro_export]
 macro_rules! settings {
     (
-        category: $category:ident,
-        struct $name:ident {
+        $category:ident {
             $( $field:ident : $ty:ty = $default:expr ),+ $(,)?
         }
     ) => {
         $crate::paste::paste! {
             #[derive(Debug, Clone, Default, clap::Parser, serde::Deserialize)]
-            pub struct [<Raw $name>] {
+            pub struct [<Raw $category:camel>] {
                 $(
                     #[arg(long)]
                     pub [<$category _ $field>]: Option<$ty>,
                 )+
             }
-        }
 
-        #[derive(Debug, Clone, PartialEq)]
-        pub struct $name {
-            $( pub $field: $ty, )+
-        }
+            #[derive(Debug, Clone, PartialEq)]
+            pub struct [<$category:camel>] {
+                $( pub $field: $ty, )+
+            }
 
-        $crate::paste::paste! {
-            impl $name {
+            impl [<$category:camel>] {
                 /// Resolves this group's settings: CLI > env > TOML > default,
                 /// per field. `toml_section` is this group's own section
-                /// (e.g. `doc.get("mcp")`), or `None` if absent/not consulted.
+                /// (e.g. `doc.get("mcp_idle")`), or `None` if absent/not
+                /// consulted.
                 pub fn resolve(
-                    cli: [<Raw $name>],
+                    cli: [<Raw $category:camel>],
                     toml_section: Option<&$crate::toml_edit::Item>,
                 ) -> Self {
                     Self {
@@ -102,8 +106,7 @@ mod tests {
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     crate::settings! {
-        category: toy,
-        struct ToySettings {
+        toy_group {
             grace_secs: u64 = 300,
         }
     }
@@ -111,52 +114,78 @@ mod tests {
     #[test]
     fn resolves_hardcoded_default_when_nothing_else_set() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::remove_var("INFIGRAPH_TOY_GRACE_SECS");
-        let cli = RawToySettings::parse_from(["test"]);
-        assert_eq!(ToySettings::resolve(cli, None).grace_secs, 300);
+        std::env::remove_var("INFIGRAPH_TOY_GROUP_GRACE_SECS");
+        let cli = RawToyGroup::parse_from(["test"]);
+        assert_eq!(ToyGroup::resolve(cli, None).grace_secs, 300);
     }
 
     #[test]
     fn env_overrides_hardcoded_default() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("INFIGRAPH_TOY_GRACE_SECS", "42");
-        let cli = RawToySettings::parse_from(["test"]);
-        assert_eq!(ToySettings::resolve(cli, None).grace_secs, 42);
-        std::env::remove_var("INFIGRAPH_TOY_GRACE_SECS");
+        std::env::set_var("INFIGRAPH_TOY_GROUP_GRACE_SECS", "42");
+        let cli = RawToyGroup::parse_from(["test"]);
+        assert_eq!(ToyGroup::resolve(cli, None).grace_secs, 42);
+        std::env::remove_var("INFIGRAPH_TOY_GROUP_GRACE_SECS");
     }
 
     #[test]
     fn toml_overrides_default_but_env_still_wins() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::remove_var("INFIGRAPH_TOY_GRACE_SECS");
+        std::env::remove_var("INFIGRAPH_TOY_GROUP_GRACE_SECS");
         let doc: toml_edit::DocumentMut = "grace_secs = 99".parse().unwrap();
         let toml_item = doc.as_item();
 
-        let cli = RawToySettings::parse_from(["test"]);
+        let cli = RawToyGroup::parse_from(["test"]);
         assert_eq!(
-            ToySettings::resolve(cli.clone(), Some(toml_item)).grace_secs,
+            ToyGroup::resolve(cli.clone(), Some(toml_item)).grace_secs,
             99
         );
 
-        std::env::set_var("INFIGRAPH_TOY_GRACE_SECS", "42");
-        assert_eq!(ToySettings::resolve(cli, Some(toml_item)).grace_secs, 42);
-        std::env::remove_var("INFIGRAPH_TOY_GRACE_SECS");
+        std::env::set_var("INFIGRAPH_TOY_GROUP_GRACE_SECS", "42");
+        assert_eq!(ToyGroup::resolve(cli, Some(toml_item)).grace_secs, 42);
+        std::env::remove_var("INFIGRAPH_TOY_GROUP_GRACE_SECS");
     }
 
     #[test]
     fn cli_overrides_everything() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        std::env::set_var("INFIGRAPH_TOY_GRACE_SECS", "42");
-        let cli = RawToySettings::parse_from(["test", "--toy-grace-secs", "7"]);
-        assert_eq!(ToySettings::resolve(cli, None).grace_secs, 7);
-        std::env::remove_var("INFIGRAPH_TOY_GRACE_SECS");
+        std::env::set_var("INFIGRAPH_TOY_GROUP_GRACE_SECS", "42");
+        let cli = RawToyGroup::parse_from(["test", "--toy-group-grace-secs", "7"]);
+        assert_eq!(ToyGroup::resolve(cli, None).grace_secs, 7);
+        std::env::remove_var("INFIGRAPH_TOY_GROUP_GRACE_SECS");
     }
 
     #[test]
     fn cli_flag_is_category_qualified_not_bare() {
-        let bare = RawToySettings::try_parse_from(["test", "--grace-secs", "1"]);
+        let bare = RawToyGroup::try_parse_from(["test", "--grace-secs", "1"]);
         assert!(bare.is_err(), "bare --grace-secs must not be accepted");
-        let qualified = RawToySettings::parse_from(["test", "--toy-grace-secs", "1"]);
-        assert_eq!(qualified.toy_grace_secs, Some(1));
+        let qualified = RawToyGroup::parse_from(["test", "--toy-group-grace-secs", "1"]);
+        assert_eq!(qualified.toy_group_grace_secs, Some(1));
+    }
+
+    // Two settings groups sharing a common namespace prefix ("toy_a"/"toy_b")
+    // must not collide -- this is the whole point of folding category and
+    // struct name into one identifier (see idle.rs's "mcp_idle" vs
+    // mcp_lock.rs's "mcp_lock" for the real, shipped case this covers).
+    crate::settings! {
+        toy_a {
+            value: u64 = 1,
+        }
+    }
+    crate::settings! {
+        toy_b {
+            value: u64 = 2,
+        }
+    }
+
+    #[test]
+    fn two_groups_sharing_a_namespace_prefix_do_not_collide() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("INFIGRAPH_TOY_A_VALUE");
+        std::env::remove_var("INFIGRAPH_TOY_B_VALUE");
+        let a = ToyA::resolve(RawToyA::parse_from(["test"]), None);
+        let b = ToyB::resolve(RawToyB::parse_from(["test"]), None);
+        assert_eq!(a.value, 1);
+        assert_eq!(b.value, 2);
     }
 }

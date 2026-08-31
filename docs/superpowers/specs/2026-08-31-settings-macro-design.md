@@ -20,20 +20,24 @@ Full current inventory of the 47 vars: see the "Inventory" section below.
 
 ## Convention
 
-- A settings group is declared once, at a module's entry point, with one explicit token — its **category** — plus the field list:
+- A settings group is declared once, at a module's entry point, as a single identifier — its **category** — followed by the field list:
   ```rust
   settings! {
-      category: mcp,
-      struct Settings {
-          idle_grace_secs: u64 = 300,
-          idle_poll_secs: u64 = 5,
-          lock_heartbeat_secs: u64 = 10,
+      mcp_idle {
+          grace_secs: u64 = 300,
+          poll_secs: u64 = 5,
+      }
+  }
+  settings! {
+      mcp_lock {
+          heartbeat_secs: u64 = 10,
           // ...
       }
   }
   ```
-- **Why an explicit `category` token, not silent `module_path!()` inference:** `paste!` (needed for CLI flag qualification — see below) can only paste together *tokens* available to the macro at compile time. `module_path!()`'s value is a string literal that's only splittable (extract last segment, apply the `config`-skip/`infigraph_`-strip rules) with ordinary runtime Rust code — `macro_rules!`/`paste!` cannot parse or re-tokenize it without a proc-macro (`syn`/`quote`), which this design explicitly avoids. So the category can't be silently inferred purely from file location while also driving `paste!`-based CLI flags. Requiring the caller to state it once per *group* (not per field) keeps the "zero per-field attributes" property intact — it's one token, once — while giving `paste!`, the env-var-name builder, and the TOML section name a single, unambiguous, compile-time-available source of truth that can never drift apart.
-- **Env var name**: `INFIGRAPH_{CATEGORY}_{FIELD}` (upper-cased), e.g. `watch` + `idle_grace_secs` → `INFIGRAPH_WATCH_IDLE_GRACE_SECS`. Where a field already carries the group name for historical reasons (e.g. today's `INFIGRAPH_MCP_IDLE_GRACE_SECS`), the migrated field is named without the redundant prefix (`idle_grace_secs`) since the macro supplies `MCP_` from the category — the generated env var name is unchanged.
+- **One identifier, four roles.** `$category` (e.g. `mcp_idle`) names the group's env var prefix (`INFIGRAPH_{CATEGORY}_{FIELD}`), its category-qualified CLI flags (via `paste!`), its TOML section, *and* the generated struct's name — via `paste!`'s `:camel` case conversion (`mcp_idle` → `McpIdle`/`RawMcpIdle`). Folding all four into one token (rather than a separate `category: X, struct Y` pair) means two settings groups that share a common namespace — `mcp_idle` and `mcp_lock`, both logically "under mcp" — stay distinct simply by being different identifiers, with no extra struct-name token to keep in sync. Verified directly: `crates/infigraph-core/src/settings.rs`'s own test suite declares `toy_a`/`toy_b` groups side by side and confirms they resolve independently with no collision.
+- **Why an explicit `category` token, not silent `module_path!()` inference:** `paste!` (needed for CLI flag qualification — see below) can only paste together *tokens* available to the macro at compile time. `module_path!()`'s value is a string literal that's only splittable (extract last segment, apply the `config`-skip/`infigraph_`-strip rules) with ordinary runtime Rust code — `macro_rules!`/`paste!` cannot parse or re-tokenize it without a proc-macro (`syn`/`quote`), which this design explicitly avoids. So the category can't be silently inferred purely from file location while also driving `paste!`-based CLI flags and the generated struct name.
+- **Env var name**: `INFIGRAPH_{CATEGORY}_{FIELD}` (upper-cased), e.g. category `mcp_idle` + field `grace_secs` → `INFIGRAPH_MCP_IDLE_GRACE_SECS`. Since env var construction is plain string concatenation, this is byte-identical to what a two-token `category: mcp` + field `idle_grace_secs` would have produced — folding the group's own name into the category costs nothing here, it just relocates which token contributes the `IDLE_`/`LOCK_` fragment.
 - **TOML section**: nested under a section named after the category, via serde's ordinary field-name matching — no macro support needed for this part at all.
 - **CLI flag**: see "CLI flag qualification" below.
 - **`watch` vs `watch_docs`**: collapsed into one `watch` category, distinguished by field name (`watch_docs_enabled`, `watch_code_enabled`) rather than by two separate groups/categories.
@@ -43,30 +47,51 @@ Full current inventory of the 47 vars: see the "Inventory" section below.
 
 Naively letting clap auto-derive `--long` from each field's bare name only works while a single settings group's flags are the only ones on a given command. Since multiple groups are commonly combined into one CLI surface (`#[command(flatten)]` is the standard clap pattern for composing structs), two groups both having a field like `enabled` would otherwise collide on `--enabled`.
 
-Fix: the macro uses the `paste` crate (small, extremely common, near-zero-risk — used purely for its ident-pasting, not adopting it as an architecture) to generate the underlying struct's *field* as the already-qualified identifier `{category}_{field}` (e.g. `mcp_idle_grace_secs`), using the explicit `category` token from the macro invocation, and lets clap's own standard field-name → kebab-case flag derivation do the rest for free, producing `--mcp-idle-grace-secs`. `macro_rules!` alone cannot paste two tokens into a new identifier (no stable `concat_idents!`), which is why `paste` is needed — this is exactly the problem it exists to solve. No runtime string-building, no fighting clap's attribute parser (which wants a literal, not a computed value, for `#[arg(long = "...")]`).
+Fix: the macro uses the `paste` crate (small, extremely common, near-zero-risk — used purely for its ident-pasting, not adopting it as an architecture) to generate the underlying struct's *field* as the already-qualified identifier `{category}_{field}` (e.g. `mcp_idle_grace_secs`), using the `$category` token from the macro invocation, and lets clap's own standard field-name → kebab-case flag derivation do the rest for free, producing `--mcp-idle-grace-secs`. `macro_rules!` alone cannot paste two tokens into a new identifier (no stable `concat_idents!`), which is why `paste` is needed — this is exactly the problem it exists to solve. No runtime string-building, no fighting clap's attribute parser (which wants a literal, not a computed value, for `#[arg(long = "...")]`).
 
-This is a new dependency addition (`paste`) for `infigraph-core`, `infigraph-cli`, and (if adopting clap there — see Open Questions) `infigraph-mcp`.
+This is a new dependency addition (`paste`) for `infigraph-core` (re-exported — see below) and `clap` for `infigraph-core` (dev-only, for the macro's own tests) plus every crate that declares a settings group (`infigraph-cli` already had it; `infigraph-mcp` gained it — see Resolved decisions).
 
-## Generated shape (sketch, not final)
+`toml_edit::Item` (the type `resolve()`'s TOML parameter uses) is likewise a literal path in the generated code, so `infigraph-core` also re-exports `toml_edit` (`pub use toml_edit;`) and the macro references it as `$crate::toml_edit::Item` — otherwise every settings!-consuming crate would need its own direct `toml_edit` dependency just to satisfy that one signature. Same reasoning as the `paste` re-export; discovered when migrating `idle.rs`, the macro's first real cross-crate consumer.
+
+## Generated shape (implemented)
 
 ```rust
-#[derive(Parser, Deserialize, Default)]
-struct RawSettings {
-    #[arg(long)] // field name is already category-qualified via paste!, e.g. mcp_idle_grace_secs
-    mcp_idle_grace_secs: Option<u64>,
-    // ...
-}
-
-impl Settings {
-    fn resolve() -> Self {
-        let cli = RawSettings::parse();
-        let env = RawSettings::from_env(); // per-field INFIGRAPH_{CATEGORY}_{FIELD} lookup
-        let toml = RawSettings::from_toml_section("mcp");
-        cli.merge(env).merge(toml).merge(Self::defaults())
+settings! {
+    mcp_idle {
+        grace_secs: u64 = 300,
+        poll_secs: u64 = 5,
     }
 }
 ```
-Exact generated method names/shapes (`resolve_env`, `merge_with`, etc.) are an implementation detail to finalize during the first spike, not part of this spec's contract.
+expands to (via `paste!`'s `:camel` case conversion of `mcp_idle` → `McpIdle`):
+```rust
+#[derive(Debug, Clone, Default, clap::Parser, serde::Deserialize)]
+pub struct RawMcpIdle {
+    #[arg(long)]
+    pub mcp_idle_grace_secs: Option<u64>,
+    #[arg(long)]
+    pub mcp_idle_poll_secs: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct McpIdle {
+    pub grace_secs: u64,
+    pub poll_secs: u64,
+}
+
+impl McpIdle {
+    pub fn resolve(cli: RawMcpIdle, toml_section: Option<&toml_edit::Item>) -> Self {
+        Self {
+            grace_secs: cli.mcp_idle_grace_secs
+                .or_else(|| infigraph_core::settings::env_override("mcp_idle", "grace_secs"))
+                .or_else(|| toml_section.and_then(|s| s.get("grace_secs")).and_then(FromTomlItem::from_toml_item))
+                .unwrap_or(300),
+            poll_secs: /* same shape */ 5,
+        }
+    }
+}
+```
+See `crates/infigraph-core/src/settings.rs` for the exact macro source and its own test suite (including the `toy_a`/`toy_b` no-collision proof).
 
 ## Inventory (47 settings, current state)
 
