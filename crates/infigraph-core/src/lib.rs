@@ -55,9 +55,11 @@ pub mod watch;
 pub mod worktree;
 
 /// Re-exported so a downstream crate's `infigraph_core::settings!` expansion
-/// can reach `paste::paste!` via `$crate::paste::paste!` without needing its
-/// own direct `paste` dependency.
+/// can reach `paste::paste!` via `$crate::paste::paste!`, and `toml_edit::Item`
+/// via `$crate::toml_edit::Item`, without needing their own direct
+/// dependency on either crate.
 pub use paste;
+pub use toml_edit;
 
 use std::path::{Path, PathBuf};
 

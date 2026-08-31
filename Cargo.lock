@@ -2621,6 +2621,7 @@ name = "infigraph-mcp"
 version = "3.2.16"
 dependencies = [
  "anyhow",
+ "clap",
  "ctrlc",
  "dirs-next",
  "fs2",

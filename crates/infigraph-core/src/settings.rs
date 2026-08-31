@@ -67,7 +67,7 @@ macro_rules! settings {
                 /// (e.g. `doc.get("mcp")`), or `None` if absent/not consulted.
                 pub fn resolve(
                     cli: [<Raw $name>],
-                    toml_section: Option<&toml_edit::Item>,
+                    toml_section: Option<&$crate::toml_edit::Item>,
                 ) -> Self {
                     Self {
                         $(
