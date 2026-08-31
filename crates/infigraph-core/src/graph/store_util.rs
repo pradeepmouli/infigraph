@@ -137,19 +137,34 @@ pub(crate) fn check_graph_growth_ratio(
     let Some(healthy) = read_healthy_size(infigraph_dir) else {
         return Ok(());
     };
-    let Ok(meta) = std::fs::metadata(graph_path) else {
+    let graph_size = std::fs::metadata(graph_path).map(|m| m.len()).unwrap_or(0);
+    // The checkpointed `graph` file alone isn't the whole story -- a
+    // sittir incident (2026-08-31) crashed with `graph.wal` grown to ~97GB
+    // while `graph` itself stayed small, which this check would have missed
+    // entirely before this fix (it only ever stat'd `graph_path`). Sum in
+    // every WAL-family sibling too, so uncommitted growth is caught, not
+    // just checkpointed growth.
+    let wal_size: u64 = crate::graph::store::wal_family_paths(graph_path)
+        .iter()
+        .filter_map(|p| std::fs::metadata(p).ok())
+        .map(|m| m.len())
+        .sum();
+    if graph_size == 0 && wal_size == 0 {
         return Ok(()); // fresh/missing graph -- nothing to compare
-    };
-    let current = meta.len();
+    }
+    let current = graph_size + wal_size;
     let max_allowed = healthy.saturating_mul(graph_growth_max_ratio());
     if current > max_allowed {
         return Err(format!(
-            "graph at {} is {} MB, {}x its recorded healthy size ({} MB) -- refusing further \
-             growth (cap: {}x, override with {GRAPH_GROWTH_MAX_RATIO_ENV}); this guards against \
-             the runaway-WAL-growth pattern from github.com/pradeepmouli/infigraph#100 -- if this \
-             growth is legitimate, delete {} to reset the baseline",
+            "graph at {} is {} MB ({} MB graph + {} MB WAL), {}x its recorded healthy size \
+             ({} MB) -- refusing further growth (cap: {}x, override with \
+             {GRAPH_GROWTH_MAX_RATIO_ENV}); this guards against the runaway-WAL-growth pattern \
+             from github.com/pradeepmouli/infigraph#100 -- if this growth is legitimate, delete \
+             {} to reset the baseline",
             graph_path.display(),
             current / (1024 * 1024),
+            graph_size / (1024 * 1024),
+            wal_size / (1024 * 1024),
             current / healthy.max(1),
             healthy / (1024 * 1024),
             graph_growth_max_ratio(),
@@ -480,6 +495,29 @@ mod tests {
 
         std::fs::write(&graph_path, vec![0u8; 3_000_000]).unwrap(); // 3x -- under the 10x default
         assert!(check_graph_growth_ratio(tmp.path(), &graph_path).is_ok());
+    }
+
+    #[test]
+    fn growth_check_catches_runaway_wal_even_when_the_checkpointed_graph_stays_small() {
+        // Reproduces the sittir incident (2026-08-31): `graph` itself never
+        // grew past a healthy size, but `graph.wal` (uncommitted) ballooned
+        // to ~97GB. Before this fix, check_graph_growth_ratio only ever
+        // stat'd `graph_path` and would have passed this case cleanly.
+        let tmp = tempfile::tempdir().unwrap();
+        let graph_path = tmp.path().join("graph");
+        std::fs::write(&graph_path, vec![0u8; 1_000_000]).unwrap();
+        stamp_healthy_graph_size(tmp.path(), &graph_path); // baseline: ~1MB
+
+        // graph stays small...
+        std::fs::write(&graph_path, vec![0u8; 1_000_000]).unwrap();
+        // ...but its WAL balloons to 20x the baseline.
+        let wal_path = tmp.path().join("graph.wal");
+        std::fs::write(&wal_path, vec![0u8; 20_000_000]).unwrap();
+
+        let err = check_graph_growth_ratio(tmp.path(), &graph_path)
+            .expect_err("a runaway WAL must be caught even when the checkpointed graph is small");
+        assert!(err.contains("MB graph"), "unexpected message: {err}");
+        assert!(err.contains("MB WAL"), "unexpected message: {err}");
     }
 
     #[test]
