@@ -866,3 +866,88 @@ fn test_learned_resolves_interface_dispatch() {
         "should NOT resolve to WalletPaymentProcessor"
     );
 }
+
+// ---------- same-file, same-named-method collision (issue #127, Rust caller-attribution) ----------
+
+fn rust_sym(id: &str, name: &str, start: u32, end: u32) -> Symbol {
+    Symbol {
+        scip_id: None,
+        id: id.to_string(),
+        name: name.to_string(),
+        kind: SymbolKind::Method,
+        span: span("shapes.rs", start, end),
+        signature_hash: format!("h_{id}"),
+        parent: None,
+        language: "rust".to_string(),
+        visibility: Some("public".to_string()),
+        docstring: None,
+        complexity: 1,
+        parameters: None,
+        return_type: None,
+    }
+}
+
+/// Reproduces the bug fixed alongside issue #127's Rust line item: two impls
+/// in one file (`Alpha`/`Beta`, e.g. an inherent + trait impl of the same
+/// method, or simply two unrelated types) each define a same-named method
+/// (`helper`) and call it from another same-named method (`hello`) via an
+/// unqualified/self call. Before the fix, `find_enclosing_function` never
+/// qualified the caller's name, so both calls' `source_id` collapsed to the
+/// same bare `shapes.rs::hello`, and `resolve_with_map`'s bare-name
+/// `local_callables`/`local_symbols` maps resolved every `helper()` call to
+/// whichever one won the collision -- regardless of which impl's body the
+/// call actually came from. Both the source (caller) and target (callee)
+/// sides must resolve to the type they actually belong to.
+#[test]
+fn self_call_resolves_to_the_method_on_its_own_type_not_a_same_named_sibling() {
+    let extractions = vec![FileExtraction {
+        file: "shapes.rs".to_string(),
+        language: "rust".to_string(),
+        content_hash: "a".to_string(),
+        symbols: vec![
+            rust_sym("shapes.rs::Alpha::hello", "hello", 1, 3),
+            rust_sym("shapes.rs::Alpha::helper", "helper", 4, 6),
+            rust_sym("shapes.rs::Beta::hello", "hello", 10, 12),
+            rust_sym("shapes.rs::Beta::helper", "helper", 13, 15),
+        ],
+        relations: vec![
+            // Simulates extraction post-fix: source_id is class-qualified
+            // (find_enclosing_function), target_id is bare (call.func only
+            // ever captures the called method's bare name).
+            call("shapes.rs::Alpha::hello", "shapes.rs::helper"),
+            call("shapes.rs::Beta::hello", "shapes.rs::helper"),
+        ],
+        statements: vec![],
+    }];
+
+    let env = TestEnv::new(&extractions);
+    let stats = resolve::resolve_calls(&env.store, &extractions, None).unwrap();
+    assert_eq!(stats.resolved, 2, "both self-calls must resolve");
+
+    let conn = env.store.connection().unwrap();
+    let q = infigraph_core::graph::GraphQuery::new(&conn);
+
+    let alpha_callees = q.callees_of("shapes.rs::Alpha::hello").unwrap();
+    assert!(
+        alpha_callees.contains(&"shapes.rs::Alpha::helper".to_string()),
+        "Alpha::hello must call Alpha::helper, got: {:?}",
+        alpha_callees
+    );
+    assert!(
+        !alpha_callees.contains(&"shapes.rs::Beta::helper".to_string()),
+        "Alpha::hello must NOT call Beta::helper, got: {:?}",
+        alpha_callees
+    );
+
+    let beta_callees = q.callees_of("shapes.rs::Beta::hello").unwrap();
+    assert!(
+        beta_callees.contains(&"shapes.rs::Beta::helper".to_string()),
+        "Beta::hello must call Beta::helper, got: {:?}",
+        beta_callees
+    );
+    assert!(
+        !beta_callees.contains(&"shapes.rs::Alpha::helper".to_string()),
+        "Beta::hello must NOT call Alpha::helper, got: {:?}",
+        beta_callees
+    );
+}

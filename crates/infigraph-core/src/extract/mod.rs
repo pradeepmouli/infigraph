@@ -38,7 +38,11 @@ pub(super) fn find_qualified_identifier(node: Node) -> Option<Node> {
 /// one had struct_specifier and the C++ out-of-line-method branch, the other had
 /// Elixir's `defmodule` and Pascal's `declClass`/`declIntf`. This is the union of
 /// both, so both extraction passes now use the same, correctly-scoped answer.
-pub(super) fn find_parent_class(node: Node, source: &[u8]) -> Option<String> {
+pub(super) fn find_parent_class(
+    node: Node,
+    source: &[u8],
+    decompose_query: Option<&Query>,
+) -> Option<String> {
     const CLASS_KINDS: &[&str] = &[
         "class_definition",  // Python
         "class_declaration", // Java, TS, JS, C#, Kotlin, Swift
@@ -51,7 +55,20 @@ pub(super) fn find_parent_class(node: Node, source: &[u8]) -> Option<String> {
     ];
     let mut current = node.parent();
     while let Some(n) = current {
-        if CLASS_KINDS.contains(&n.kind()) {
+        // Rust's impl_item has no "name" field (only body/trait/type/type_parameters —
+        // see the symbol-identity-and-scoping-hardening spec's Finding 3) — resolve
+        // its "type" field instead, through the same decompose mechanism entities.scm's
+        // @method.parent capture uses, so a generic `impl<T> Foo<T> for Vec<Bar>` still
+        // bottoms out at "Bar" rather than returning None or a raw compound string.
+        if n.kind() == "impl_item" {
+            if let Some(type_node) = n.child_by_field_name("type") {
+                return Some(resolve_compound_node_text(
+                    type_node,
+                    source,
+                    decompose_query,
+                ));
+            }
+        } else if CLASS_KINDS.contains(&n.kind()) {
             if let Some(name_node) = n.child_by_field_name("name") {
                 return Some(node_text(name_node, source));
             }

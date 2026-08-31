@@ -223,7 +223,7 @@ pub fn extract_entities(
             // e.g. Rust's impl_item) over the generic ancestor walk.
             let parent_class = parent_capture
                 .map(|n| resolve_compound_node_text(n, source, decompose_query))
-                .or_else(|| find_parent_class(node, source));
+                .or_else(|| find_parent_class(node, source, decompose_query));
             let id = if let Some(ref cls) = parent_class {
                 format!("{}::{}::{}", file, cls, name)
             } else {

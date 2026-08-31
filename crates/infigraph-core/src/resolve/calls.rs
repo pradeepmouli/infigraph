@@ -328,6 +328,18 @@ fn resolve_with_map(
                 .map(|s| (s.name.as_str(), s.id.as_str()))
                 .collect();
 
+            // Every real symbol id in this file, used to short-circuit the
+            // bare-name source-id fixup below: once rel.source_id is ALREADY
+            // one of these (the common case, and the only case once
+            // find_enclosing_function class-qualifies it), the bare-name
+            // `local_symbols` lookup must be skipped entirely rather than
+            // "fixing up" an already-correct id — local_symbols collapses to
+            // one entry per bare name, so with two same-named methods in this
+            // file it would silently overwrite a correct qualified source_id
+            // with whichever one happened to win that collision.
+            let local_ids: std::collections::HashSet<&str> =
+                ext.symbols.iter().map(|s| s.id.as_str()).collect();
+
             // Callable-only view of local_symbols, keyed the same way, used to
             // gate the same-class fast path below: a call target must resolve
             // to something invocable (Method/Function), never a field/variable
@@ -370,6 +382,11 @@ fn resolve_with_map(
 
                 let target_name = rel.target_id.rsplit("::").next().unwrap_or(&rel.target_id);
 
+                // Non-None once find_enclosing_function actually qualifies
+                // rel.source_id with a class/impl name (see relations.rs).
+                // Used here and by Strategy 2 further below.
+                let caller_class = rel.source_id.rsplit("::").nth(1).map(|s| s.to_string());
+
                 // Same-class fast path only applies when the call is unqualified
                 // (`method()`) or explicitly self-referential (`this.method()`,
                 // `self.method()`) — a receiver like `chain` or `exchange` means
@@ -383,32 +400,71 @@ fn resolve_with_map(
                 );
 
                 if is_self_receiver {
-                    if let Some(&target_id) = local_callables.get(target_name) {
-                        // Target resolves locally by bare name. Normally the
-                        // initial bulk write (store_bulk.rs) already created this
-                        // edge using rel.source_id/rel.target_id verbatim, so the
-                        // common case is a no-op continue. But when rel.source_id
-                        // is itself bare — extraction's find_enclosing_function
-                        // only ever returns an unqualified name (see relations.rs),
+                    // Prefer a class-qualified lookup over the bare-name
+                    // local_callables map: local_callables collapses to one
+                    // entry per bare name, so when two same-named methods
+                    // exist in this file (e.g. an inherent + trait impl of
+                    // the same Rust method, or two impls sharing a helper
+                    // name) it always resolves self.helper() to the SAME
+                    // one candidate regardless of which impl's body the call
+                    // actually came from. class_method_map is keyed by
+                    // "Class::method", so it disambiguates correctly once
+                    // the caller's own id is class-qualified.
+                    let target_id = caller_class
+                        .as_deref()
+                        .and_then(|cls| class_method_map.get(&format!("{}::{}", cls, target_name)))
+                        .and_then(|matches| {
+                            matches
+                                .iter()
+                                .find(|(_, f)| f == &ext.file)
+                                .map(|(id, _)| id.as_str())
+                        })
+                        .or_else(|| local_callables.get(target_name).copied());
+
+                    if let Some(target_id) = target_id {
+                        // Determine the correct source id: if rel.source_id is
+                        // already one of this file's real ids (the common case,
+                        // and the only case once find_enclosing_function
+                        // class-qualifies it), use it as-is -- do NOT run it
+                        // through the bare-name local_symbols map, which
+                        // collapses to one candidate per name and would
+                        // silently overwrite an already-correct qualified
+                        // source_id with whichever same-named symbol it
+                        // collided with (e.g. picking Beta::hello's id for a
+                        // call that actually came from Alpha::hello's body).
+                        //
+                        // Otherwise, rel.source_id is bare — extraction's
+                        // find_enclosing_function only ever returns an
+                        // unqualified name for languages/cases whose enclosing
+                        // method has no resolvable class (see relations.rs),
                         // e.g. "DebugViewModel.cs::ExecuteCrashManagedBackground"
                         // rather than the real qualified
                         // "...::DebugViewModel::ExecuteCrashManagedBackground" —
-                        // that bulk write's MATCH never finds a node and the edge
-                        // silently never gets created (dropping every local
-                        // same-class call, e.g. a WPF event handler's body calling
-                        // another method on the same class). Detect that case by
-                        // checking whether fixing up the source actually changes
-                        // it; only then push a pair, so an already-correct
-                        // source_id (the common case) stays a plain continue with
-                        // no double-counted resolution.
-                        let source_name =
-                            rel.source_id.rsplit("::").next().unwrap_or(&rel.source_id);
-                        if let Some(&fixed_source_id) = local_symbols.get(source_name) {
-                            if fixed_source_id != rel.source_id {
-                                res.pairs
-                                    .push((fixed_source_id.to_string(), target_id.to_string()));
-                                res.resolved += 1;
-                            }
+                        // fix it up via the bare-name map in that case.
+                        let final_source_id: &str = if local_ids.contains(rel.source_id.as_str()) {
+                            rel.source_id.as_str()
+                        } else {
+                            let source_name =
+                                rel.source_id.rsplit("::").next().unwrap_or(&rel.source_id);
+                            local_symbols
+                                .get(source_name)
+                                .copied()
+                                .unwrap_or(rel.source_id.as_str())
+                        };
+
+                        // The initial bulk write (store_bulk.rs) already
+                        // created this edge using rel.source_id/rel.target_id
+                        // verbatim when both were already correct (true only
+                        // for an unqualified caller calling an unqualified
+                        // callee, e.g. two top-level functions) -- a genuine
+                        // no-op in that case. target_id is virtually always
+                        // resolved/qualified and so differs from the bare
+                        // rel.target_id whenever the callee is class-scoped,
+                        // which is exactly when this push is needed.
+                        if final_source_id != rel.source_id || target_id != rel.target_id {
+                            res.pairs
+                                .push((final_source_id.to_string(), target_id.to_string()));
+                            res.resolved += 1;
                         }
                         continue;
                     }
@@ -461,9 +517,7 @@ fn resolve_with_map(
                     }
                 }
 
-                // Strategy 2: Enclosing-class preference.
-                let caller_class = rel.source_id.rsplit("::").nth(1).map(|s| s.to_string());
-
+                // Strategy 2: Enclosing-class preference (caller_class computed above).
                 if let Some(candidates) = symbol_map.get(target_name) {
                     let cross_file: Vec<_> = candidates
                         .iter()

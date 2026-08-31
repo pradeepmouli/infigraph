@@ -133,7 +133,8 @@ pub fn extract_relations_with_custom_edges(
                     src
                 } else if let Some(site) = custom_site_node {
                     // No explicit source — infer from enclosing function
-                    find_enclosing_function(site, source).unwrap_or_else(|| file.to_string())
+                    find_enclosing_function(site, source, decompose_query)
+                        .unwrap_or_else(|| file.to_string())
                 } else {
                     file.to_string()
                 };
@@ -162,8 +163,8 @@ pub fn extract_relations_with_custom_edges(
 
         if rel_kind == Some(RelationKind::Calls) && source_name.is_none() {
             if let Some(site) = site_node {
-                source_name =
-                    find_enclosing_function(site, source).or_else(|| Some(file.to_string()));
+                source_name = find_enclosing_function(site, source, decompose_query)
+                    .or_else(|| Some(file.to_string()));
             }
         }
 
@@ -172,7 +173,7 @@ pub fn extract_relations_with_custom_edges(
             if let Some(ref recv) = receiver_text {
                 if recv == "self" || recv == "this" || recv == "@" {
                     if let Some(site) = site_node {
-                        if let Some(cls) = find_parent_class(site, source) {
+                        if let Some(cls) = find_parent_class(site, source, decompose_query) {
                             receiver_text = Some(cls);
                         }
                     }
@@ -250,7 +251,11 @@ fn rightmost_identifier(node: Node) -> Node {
     }
 }
 
-fn find_enclosing_function(node: Node, source: &[u8]) -> Option<String> {
+fn find_enclosing_function(
+    node: Node,
+    source: &[u8],
+    decompose_query: Option<&Query>,
+) -> Option<String> {
     let func_kinds = [
         "function_definition",     // Python, JS, Lua, VB6 Function
         "function_item",           // Rust
@@ -270,7 +275,20 @@ fn find_enclosing_function(node: Node, source: &[u8]) -> Option<String> {
     while let Some(n) = current {
         if func_kinds.contains(&n.kind()) {
             if let Some(name_node) = n.child_by_field_name("name") {
-                return Some(node_text(name_node, source));
+                let name = node_text(name_node, source);
+                // Qualify with the enclosing class/impl, when one exists, so a
+                // caller-side id (built as `format!("{file}::{src}")` by this
+                // function's callers) actually matches the callee-side id
+                // format (`file::Class::method`) instead of colliding with
+                // every other same-named method in the file once two classes
+                // share a method name (e.g. an inherent + trait impl of the
+                // same method on one Rust type, or two impls in one file) --
+                // see the symbol-identity-and-scoping-hardening spec's
+                // Finding 5 correction.
+                return Some(match find_parent_class(n, source, decompose_query) {
+                    Some(class) => format!("{}::{}", class, name),
+                    None => name,
+                });
             }
         }
         // C#: a call inside a property accessor body (get/set, or a lambda
@@ -575,4 +593,105 @@ fn strip_type_qualifiers(raw: String) -> String {
         .unwrap_or(&cleaned)
         .trim()
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tree_sitter::Parser;
+
+    /// Mirrors rust/relations.scm's bare-call pattern and
+    /// rust/inherit_decompose.scm exactly -- hand-built for the same reason
+    /// entities.rs's rust_entity_query() is: a dev-dependency cycle with
+    /// infigraph-languages makes bundled_registry()'s ParserBackend a
+    /// distinct type from this crate's own, so the real registry can't be
+    /// used from an inline unit test.
+    fn rust_relations_query() -> (tree_sitter::Language, Query, Query) {
+        let grammar: tree_sitter::Language = tree_sitter_rust::LANGUAGE.into();
+        let call_query = Query::new(
+            &grammar,
+            "(call_expression function: (identifier) @call.func) @call.site",
+        )
+        .unwrap();
+        let decompose_query = Query::new(
+            &grammar,
+            "[(_ name: (_) @candidate) (_ type: (_) @candidate)]",
+        )
+        .unwrap();
+        (grammar, call_query, decompose_query)
+    }
+
+    /// Regression test for issue #127's Rust caller-attribution line item:
+    /// find_enclosing_function used to return only the bare method name
+    /// ("hello"), never class-qualified, so the caller-side id of a call
+    /// made from inside a Rust impl method collided with any other
+    /// same-named method elsewhere in the file once Phase 1 made same-name
+    /// methods under different impls distinct symbols. It must now be
+    /// qualified with the enclosing impl's type, matching the id format
+    /// entities.rs actually assigns that method (`file::Type::method`).
+    #[test]
+    fn test_rust_call_inside_impl_method_gets_class_qualified_source_id() {
+        let (grammar, query, decompose_query) = rust_relations_query();
+        let src =
+            b"struct Alpha;\nimpl Alpha {\n    fn hello(&self) {\n        helper();\n    }\n}\n";
+
+        let mut parser = Parser::new();
+        parser.set_language(&grammar).unwrap();
+        let tree = parser.parse(src, None).unwrap();
+
+        let relations = extract_relations_with_custom_edges(
+            "src/main.rs",
+            src,
+            tree.root_node(),
+            &query,
+            &[],
+            Some(&decompose_query),
+        );
+
+        let calls: Vec<&Relation> = relations
+            .iter()
+            .filter(|r| r.kind == RelationKind::Calls)
+            .collect();
+        assert_eq!(calls.len(), 1, "expected exactly one CALLS relation");
+        assert_eq!(
+            calls[0].source_id, "src/main.rs::Alpha::hello",
+            "caller-side id must be class-qualified, not just the bare method name"
+        );
+    }
+
+    /// Two impls in one file sharing a method name (an inherent + trait impl
+    /// of the same method on one type, or two unrelated types) must produce
+    /// distinctly-qualified caller ids for calls made from each -- not both
+    /// collapsing to the same bare "hello".
+    #[test]
+    fn test_rust_same_named_methods_in_different_impls_get_distinct_source_ids() {
+        let (grammar, query, decompose_query) = rust_relations_query();
+        let src = b"struct Alpha;\nstruct Beta;\n\nimpl Alpha {\n    fn hello(&self) {\n        helper();\n    }\n}\n\nimpl Beta {\n    fn hello(&self) {\n        helper();\n    }\n}\n";
+
+        let mut parser = Parser::new();
+        parser.set_language(&grammar).unwrap();
+        let tree = parser.parse(src, None).unwrap();
+
+        let relations = extract_relations_with_custom_edges(
+            "src/main.rs",
+            src,
+            tree.root_node(),
+            &query,
+            &[],
+            Some(&decompose_query),
+        );
+
+        let mut source_ids: Vec<&str> = relations
+            .iter()
+            .filter(|r| r.kind == RelationKind::Calls)
+            .map(|r| r.source_id.as_str())
+            .collect();
+        source_ids.sort();
+
+        assert_eq!(
+            source_ids,
+            vec!["src/main.rs::Alpha::hello", "src/main.rs::Beta::hello"],
+            "each impl's call must attribute to its own type, not collapse to one bare id"
+        );
+    }
 }
