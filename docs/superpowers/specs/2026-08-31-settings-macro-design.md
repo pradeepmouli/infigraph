@@ -104,8 +104,11 @@ Do **not** attempt all 47 in one PR. Sequence:
 - Env var **names** must not change as part of migration — existing tests that `set_var`/`env_remove` a given `INFIGRAPH_*` name must keep working unmodified.
 - Each migrated group needs a focused test asserting the full precedence chain (CLI > env > TOML > default) resolves correctly, plus a test that the group prefix derives correctly from `module_path!()` including the `config`-segment-skip rule.
 
+## Resolved decisions
+
+- **`infigraph-mcp` adopts `clap`.** It has no clap dependency today (hand-parses `std::env::args()` for `--mcp`/`--worker`), but that CLI surface is already tiny and fixed, so adding clap is low-cost. This keeps the `settings!` macro's generated code identical across every crate — no conditional/hand-rolled arg-scanner path, no special-casing for `mcp`-owned groups. Prerequisite for migrating any `mcp`-group setting that should also be CLI-settable: add `clap` (`derive`+`env` features, matching `infigraph-cli`'s existing dependency) to `infigraph-mcp`'s `Cargo.toml` before or alongside the first `mcp`-group migration.
+
 ## Open questions
 
-- Does `infigraph-mcp` need to adopt `clap` as part of this work? It has no clap dependency today (hand-parses `std::env::args()`). The settings macro's CLI-flag-generation piece assumes clap's derive is available in whatever binary uses it — this needs a decision before migrating any `mcp`-group setting that should also be CLI-settable.
 - `INFIGRAPH_TEST_DAEMON_PANIC` and similar test-only escape hatches: migrate them into the macro (for consistency) or leave them as raw `std::env::var` reads (since they're intentionally undocumented and not meant to look like first-class settings)?
 - `INFIGRAPH_BUILD_HASH` is read via the compile-time `env!()` macro, not `std::env::var` — out of scope for a runtime-settings macro entirely; listed here only for completeness of the inventory.
