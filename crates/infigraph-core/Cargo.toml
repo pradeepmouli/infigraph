@@ -24,6 +24,7 @@ rayon = "1"
 sha2 = "0.10"
 toml = "0.8"
 toml_edit = "0.22"
+paste = "1"
 glob = "0.3"
 regex = "1"
 dirs-next = "2"
@@ -78,6 +79,7 @@ features = ["postgres"]
 optional = true
 
 [dev-dependencies]
+clap = { version = "4", features = ["derive"] }
 tree-sitter-python = "0.25"
 tree-sitter-kotlin-ng = "1.1"
 tree-sitter-dart = "0.2"

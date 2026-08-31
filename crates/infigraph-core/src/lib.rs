@@ -44,6 +44,7 @@ pub mod scip;
 pub mod search;
 pub mod security;
 pub mod sequence;
+pub mod settings;
 pub mod snapshot;
 pub mod structured;
 pub mod taint;
@@ -52,6 +53,11 @@ pub mod viz;
 pub mod vuln;
 pub mod watch;
 pub mod worktree;
+
+/// Re-exported so a downstream crate's `infigraph_core::settings!` expansion
+/// can reach `paste::paste!` via `$crate::paste::paste!` without needing its
+/// own direct `paste` dependency.
+pub use paste;
 
 use std::path::{Path, PathBuf};
 
