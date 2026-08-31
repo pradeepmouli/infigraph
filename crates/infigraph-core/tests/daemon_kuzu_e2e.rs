@@ -28,6 +28,25 @@ impl Drop for KillOnDrop {
     }
 }
 
+/// Same guarantee as `KillOnDrop`, for the one spawn path that can't own a
+/// `Child`: `ensure_daemon_running` (production's "opportunistic auto-start")
+/// hands back no process handle at all -- real callers want a detached,
+/// independent daemon, not something to babysit. Without this, a panic
+/// between that spawn and a test's own `watch.stop` sentinel write leaks a
+/// real `infigraph daemon` process indefinitely -- exactly how 19 leaked
+/// daemon processes (some running for days) were found and killed during a
+/// disk-space incident on 2026-08-31. Kills by PID via
+/// `ps::kill_infigraph_process`, which refuses anything that isn't
+/// verifiably an infigraph binary, so this can't ever kill an unrelated
+/// process even if the PID were somehow stale/recycled.
+struct KillPidOnDrop(u32);
+
+impl Drop for KillPidOnDrop {
+    fn drop(&mut self) {
+        let _ = infigraph_core::ps::kill_infigraph_process(self.0, false);
+    }
+}
+
 /// infigraph-core has no dev-dependency on infigraph-cli, so
 /// `env!("CARGO_BIN_EXE_infigraph")` isn't available here (cargo only sets
 /// that var for a test binary's own crate-graph binaries). Resolve the CLI
@@ -95,7 +114,22 @@ fn open_daemon_client(project_dir: &Path) -> Infigraph {
 
 /// Stop the daemon via its sentinel file, falling back to a kill.
 fn stop_daemon(project_dir: &Path, daemon: &mut KillOnDrop) {
-    std::fs::write(project_dir.join(".infigraph").join("watch.stop"), "").unwrap();
+    // `watch.stop` only stops the watch *thread*, leaving the daemon
+    // process itself alive (see `WatchStop`'s doc in
+    // infigraph-cli/src/main.rs) -- ending the whole process needs a
+    // `WatchControl { role: Daemon, action: Stop }` request instead, the
+    // same mechanism `cmd_daemon_stop` uses. Before this fix, every call
+    // here silently waited out the full 5s below before falling back to a
+    // hard kill, since the process was never going to exit on its own.
+    let staging_dir = project_dir.join(".infigraph").join("requests");
+    let _ = infigraph_core::daemon_protocol::submit_write_request(
+        &staging_dir,
+        &infigraph_core::daemon_protocol::WriteRequest::WatchControl {
+            role: infigraph_core::daemon_protocol::WatchRole::Daemon,
+            action: infigraph_core::daemon_protocol::WatchAction::Stop,
+        },
+        Duration::from_secs(5),
+    );
     let start = std::time::Instant::now();
     loop {
         if let Ok(Some(_)) = daemon.0.try_wait() {
@@ -1131,6 +1165,12 @@ fn opportunistic_daemon_spawn_writes_a_start_banner_naming_its_pid_to_daemon_log
         std::thread::sleep(Duration::from_millis(50));
     }
 
+    // Acquired immediately once the daemon is known to be running, BEFORE
+    // the assertion below that could panic -- see KillPidOnDrop's doc.
+    let holder = infigraph_core::lockfile::read_holder(&lock_path)
+        .expect("watch.lock must have a readable holder payload once held");
+    let _kill_guard = KillPidOnDrop(holder.pid);
+
     let log = std::fs::read_to_string(project.path().join(".infigraph").join("daemon.log"))
         .unwrap_or_default();
     assert!(
@@ -1138,7 +1178,21 @@ fn opportunistic_daemon_spawn_writes_a_start_banner_naming_its_pid_to_daemon_log
         "expected a start banner naming a pid, got: {log:?}"
     );
 
-    std::fs::write(project.path().join(".infigraph").join("watch.stop"), b"").unwrap();
+    // Clean up: `watch.stop` only stops the watch *thread*, leaving the
+    // daemon process itself alive (see `WatchStop`'s doc in
+    // infigraph-cli/src/main.rs and `watch_action_stop_leaves_the_daemon_process_alive`)
+    // -- ending the whole process needs a `WatchControl { role: Daemon,
+    // action: Stop }` request, the same mechanism `cmd_daemon_stop` uses.
+    // Best-effort: KillPidOnDrop above is the real cleanup guarantee.
+    let staging_dir = project.path().join(".infigraph").join("requests");
+    let _ = infigraph_core::daemon_protocol::submit_write_request(
+        &staging_dir,
+        &infigraph_core::daemon_protocol::WriteRequest::WatchControl {
+            role: infigraph_core::daemon_protocol::WatchRole::Daemon,
+            action: infigraph_core::daemon_protocol::WatchAction::Stop,
+        },
+        Duration::from_secs(10),
+    );
 }
 
 /// Regression test: `INFIGRAPH_NO_WATCH` (a convenience opt-out -- "don't

@@ -7,6 +7,26 @@ use infigraph_core::graph::GraphBackend;
 /// tests and PR5's idle-decision tests).
 static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// RAII guard killing a daemon spawned via `ensure_daemon_running` by PID --
+/// that function hands back no `Child` at all (production's "opportunistic
+/// auto-start" wants a detached, independent daemon, not a handle to
+/// babysit). Without this, a panic between the spawn and a test's own
+/// `watch.stop` sentinel write leaks a real `infigraph daemon` process
+/// indefinitely -- exactly how 19 leaked daemon processes (some running for
+/// days) were found and killed during a disk-space incident on 2026-08-31.
+/// Mirrors `daemon_kuzu_e2e.rs`'s own copy (kept separate: a different test
+/// binary, same small-helper-duplication precedent as `KillOnDrop` already
+/// uses across crates). `kill_infigraph_process` refuses anything that
+/// isn't verifiably an infigraph binary, so this can't kill an unrelated
+/// process even if the PID were somehow stale/recycled.
+struct KillPidOnDrop(u32);
+
+impl Drop for KillPidOnDrop {
+    fn drop(&mut self) {
+        let _ = infigraph_core::ps::kill_infigraph_process(self.0, false);
+    }
+}
+
 #[test]
 fn is_remote_backend_only_true_for_explicit_neo4j() {
     let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -278,8 +298,27 @@ fn spawn_daemon_child_still_starts_with_infigraph_backend_leaked_into_test_env()
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
 
-    // Clean up: signal the spawned daemon to stop.
-    std::fs::write(project_dir.path().join(".infigraph").join("watch.stop"), "").unwrap();
+    // Acquired immediately once the daemon is known to be running, as a
+    // fallback in case the sentinel write below doesn't get noticed -- see
+    // KillPidOnDrop's doc.
+    let holder = infigraph_core::lockfile::read_holder(&lock_path)
+        .expect("watch.lock must have a readable holder payload once held");
+    let _kill_guard = KillPidOnDrop(holder.pid);
+
+    // Clean up: `watch.stop` only stops the watch *thread*, leaving the
+    // daemon process itself alive -- ending the whole process needs a
+    // `WatchControl { role: Daemon, action: Stop }` request instead, the
+    // same mechanism `cmd_daemon_stop` uses. Best-effort: KillPidOnDrop
+    // above is the real cleanup guarantee.
+    let staging_dir = project_dir.path().join(".infigraph").join("requests");
+    let _ = infigraph_core::daemon_protocol::submit_write_request(
+        &staging_dir,
+        &infigraph_core::daemon_protocol::WriteRequest::WatchControl {
+            role: infigraph_core::daemon_protocol::WatchRole::Daemon,
+            action: infigraph_core::daemon_protocol::WatchAction::Stop,
+        },
+        std::time::Duration::from_secs(10),
+    );
 }
 
 /// End-to-end proof that `ensure_daemon_running` prunes a stale watch.lock
@@ -344,6 +383,9 @@ fn ensure_daemon_running_prunes_a_dead_stale_holder_and_spawns_fresh() {
     // *real* daemon took over -- proven by a live PID distinct from the
     // fake one, on a build_hash distinct from the fake stale payload.
     let holder = holder.expect("expected a fresh daemon to have acquired watch.lock");
+    // Acquired immediately, before the assertions below that could panic --
+    // see KillPidOnDrop's doc.
+    let _kill_guard = KillPidOnDrop(holder.pid);
     assert_ne!(
         holder.build_hash, "some-old-build-that-no-longer-exists",
         "the fake stale payload must have been replaced by a real daemon's own identity"
@@ -354,8 +396,20 @@ fn ensure_daemon_running_prunes_a_dead_stale_holder_and_spawns_fresh() {
         "the lock must now be held by a real spawned process, not the fake stale PID"
     );
 
-    // Clean up: signal the spawned daemon to stop.
-    std::fs::write(project_dir.path().join(".infigraph").join("watch.stop"), "").unwrap();
+    // Clean up: `watch.stop` only stops the watch *thread*, leaving the
+    // daemon process itself alive -- ending the whole process needs a
+    // `WatchControl { role: Daemon, action: Stop }` request instead, the
+    // same mechanism `cmd_daemon_stop` uses. Best-effort: KillPidOnDrop
+    // above is the real cleanup guarantee.
+    let staging_dir = project_dir.path().join(".infigraph").join("requests");
+    let _ = infigraph_core::daemon_protocol::submit_write_request(
+        &staging_dir,
+        &infigraph_core::daemon_protocol::WriteRequest::WatchControl {
+            role: infigraph_core::daemon_protocol::WatchRole::Daemon,
+            action: infigraph_core::daemon_protocol::WatchAction::Stop,
+        },
+        std::time::Duration::from_secs(10),
+    );
 }
 
 /// Independent, freshly-opened read-only check of what actually landed on
