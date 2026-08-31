@@ -940,12 +940,25 @@ fn full_reindex_with_no_daemon_fails_fast_instead_of_polling_for_ten_minutes() {
     // liveness probe that this can't pass by luck.
     const FAIL_FAST_BUDGET: Duration = Duration::from_secs(30);
 
+    // INFIGRAPH_NO_WATCH suppresses `ensure_watcher_running`'s auto-start
+    // fallback (index.rs's own `is_ci_env` check) the same way real CI
+    // does. Without this, outside CI the first wait_for_daemon(10s) fails
+    // (nothing running yet), auto-start successfully spawns one, the
+    // second wait_for_daemon(10s) succeeds, and the reindex completes
+    // normally -- the auto-start-then-retry fallback #100 intentionally
+    // added, not a bug. This test is specifically about the OTHER branch
+    // (auto-start also unavailable/suppressed), so it must force that
+    // branch deterministically rather than relying on ambient CI
+    // detection -- previously this test only passed in real CI and failed
+    // locally every time, miscategorized as "flaky" rather than
+    // environment-dependent.
     let start = std::time::Instant::now();
     let mut child = Command::new(&cli)
         .arg("index")
         .arg("--full")
         .current_dir(project.path())
         .env("INFIGRAPH_BACKEND", "daemon")
+        .env("INFIGRAPH_NO_WATCH", "1")
         .env_remove("INFIGRAPH_WATCH_DAEMON")
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -972,7 +985,7 @@ fn full_reindex_with_no_daemon_fails_fast_instead_of_polling_for_ten_minutes() {
         "must be a hard failure, not a silent success: {stderr}"
     );
     assert!(
-        stderr.contains("no daemon is running"),
+        stderr.contains("no daemon came up"),
         "the error must say what's actually wrong and how to fix it, got: {stderr}"
     );
     assert!(
