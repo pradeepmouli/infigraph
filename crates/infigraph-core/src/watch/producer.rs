@@ -11,6 +11,7 @@
 
 use crate::daemon::queue::IndexWorkQueue;
 use crate::watch::{WatchEvent, WatchEventKind};
+use clap::Parser;
 use notify::{Config, Event, EventKind, RecommendedWatcher, Watcher};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -119,11 +120,9 @@ pub async fn run_producer(
 
     // R7.4 (#84): above this many files in one debounce window, the batch
     // coalesces into a single whole-project pass instead of per-file
-    // updates. Overridable via INFIGRAPH_STORM_THRESHOLD for tests/tuning.
-    let storm_threshold: usize = std::env::var("INFIGRAPH_STORM_THRESHOLD")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(200);
+    // updates. Overridable via INFIGRAPH_WATCH_STORM_THRESHOLD for tests/tuning.
+    let cli = crate::watch::RawWatch::parse_from(std::iter::empty::<String>());
+    let storm_threshold: usize = crate::watch::Watch::resolve(cli, None).storm_threshold as usize;
 
     let (mut watcher, mut rx) = match create_watcher(&root, debounce_ms) {
         Ok(pair) => pair,

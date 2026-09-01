@@ -14,6 +14,16 @@ use crate::daemon::run_write_coordinator;
 use crate::daemon::task::Task;
 use crate::Infigraph;
 
+crate::settings! {
+    watch {
+        doc_daemon_poll_ms: u64 = 1000,
+        index_via_daemon: crate::settings::Toggle = crate::settings::Toggle(false),
+        auto_start: crate::settings::Toggle = crate::settings::Toggle(true),
+        reap_scan_secs: u64 = 600,
+        storm_threshold: u64 = 200,
+    }
+}
+
 /// A single file-change event emitted by the watcher.
 #[derive(Debug, Clone)]
 pub struct WatchEvent {

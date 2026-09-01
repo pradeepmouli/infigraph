@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
+use clap::Parser;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -192,13 +193,10 @@ pub fn classify_instances(
 }
 
 /// How often the periodic orphan scan runs. Overridable via
-/// `INFIGRAPH_REAP_SCAN_SECS` (seconds).
+/// `INFIGRAPH_WATCH_REAP_SCAN_SECS` (seconds).
 pub fn reap_scan_interval() -> Duration {
-    std::env::var("INFIGRAPH_REAP_SCAN_SECS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .map(Duration::from_secs)
-        .unwrap_or(Duration::from_secs(600))
+    let cli = crate::watch::RawWatch::parse_from(std::iter::empty::<String>());
+    Duration::from_secs(crate::watch::Watch::resolve(cli, None).reap_scan_secs)
 }
 
 /// Removes a stale registry file. This is remove-file-only, on purpose —
