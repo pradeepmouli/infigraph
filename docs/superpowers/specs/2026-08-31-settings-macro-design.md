@@ -118,7 +118,7 @@ Grouped by natural target settings-group (inferred from name/usage — the actua
 Do **not** attempt all 47 in one PR. Sequence:
 
 1. **Spike** the macro against the `mcp` idle/lock group (`crates/infigraph-mcp/src/idle.rs` + `mcp_lock.rs`) — smallest, cleanest existing worked example, validates the shape (including the `paste!`-based CLI qualification) end-to-end before committing further. — done (`docs/superpowers/plans/2026-08-31-settings-macro-mcp-spike.md`)
-2. Migrate **`backend`** next — highest duplication payoff (15+ call sites collapse to one `Settings::backend()` accessor), and the biggest DRY win in the codebase per the user's global #1 rule.
+2. Migrate **`backend`** next — highest duplication payoff (15+ call sites collapse to one `Settings::backend()` accessor), and the biggest DRY win in the codebase per the user's global #1 rule. — done (`docs/superpowers/plans/2026-08-31-backend-settings-migration.md`). Also consolidated the ~10 duplicate `is_remote_mode()`/`is_neo4j_backend()` helpers found still live across infigraph-mcp/infigraph-cli/infigraph-docs/infigraph-core onto the pre-existing (but previously unused-for-this-purpose) `daemon::lifecycle::is_remote_backend()`.
 3. Remaining groups (`watch`, `graph`, `registry`, `llm`, `session`) follow once the pattern is proven, each as its own PR.
 4. Leave the "ungrouped" bucket as-is unless a specific need to formalize one arises later — not every env var needs to become a first-class "setting."
 
