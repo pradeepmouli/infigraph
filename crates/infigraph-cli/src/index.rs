@@ -42,7 +42,7 @@ pub(crate) fn cmd_index(root: &Path, full: bool, no_embed: bool) -> Result<()> {
     };
 
     #[cfg(feature = "remote")]
-    let remote = is_neo4j_backend();
+    let remote = infigraph_core::daemon::lifecycle::is_remote_backend();
     #[cfg(not(feature = "remote"))]
     let remote = false;
 
@@ -335,7 +335,7 @@ pub(crate) fn cmd_index(root: &Path, full: bool, no_embed: bool) -> Result<()> {
     }
 
     #[cfg(feature = "remote")]
-    if is_neo4j_backend() {
+    if infigraph_core::daemon::lifecycle::is_remote_backend() {
         println!("Registered '{}' in Postgres registry", repo_name);
 
         // Create Repo node in Neo4j keyed by the org/repo namespace (matching f.repo),
@@ -375,7 +375,7 @@ pub(crate) fn cmd_index(root: &Path, full: bool, no_embed: bool) -> Result<()> {
         let mut done = false;
 
         #[cfg(feature = "remote")]
-        if is_neo4j_backend() {
+        if infigraph_core::daemon::lifecycle::is_remote_backend() {
             let backend = prism.backend().context("graph not initialized")?;
             let pg = infigraph_core::meta::PostgresMetaStore::connect_from_env_cached()?;
             pg.init_schema()?;
@@ -579,24 +579,6 @@ fn spawn_scip_child_process(root: &Path, detected_languages: &std::collections::
 /// without spawning a process.
 fn scip_enrich_args(langs: &str) -> Vec<String> {
     vec!["scip-enrich".to_string(), langs.to_string()]
-}
-
-/// Whether the active backend is remote Neo4j (vs. the default local Kùzu).
-///
-/// `Infigraph::backend()` used to return `None` for the default Kùzu
-/// backend, so `if let Some(backend) = prism.backend()` doubled as a de
-/// facto "are we in remote mode" check. Once `backend()` was made universal
-/// (returning `Some` for every backend kind, including local Kùzu), that
-/// check silently broke: the Postgres-embeddings branch below started
-/// firing on every `remote`-feature build regardless of backend, attempting
-/// a Postgres connection even for plain local indexing and failing the
-/// whole `index` command with a connection-refused error. Extracted so the
-/// exact condition can be unit-tested independently of a real backend.
-#[cfg(feature = "remote")]
-fn is_neo4j_backend() -> bool {
-    std::env::var("INFIGRAPH_BACKEND")
-        .map(|v| v == "neo4j")
-        .unwrap_or(false)
 }
 
 /// Decides what (if anything) to warn about after waiting on the detached
@@ -1075,7 +1057,7 @@ pub(crate) fn import_scip_results_and_embed(
     #[allow(unused_mut)]
     let mut done = false;
     #[cfg(feature = "remote")]
-    if is_neo4j_backend() {
+    if infigraph_core::daemon::lifecycle::is_remote_backend() {
         if let Ok(pg) = infigraph_core::meta::PostgresMetaStore::connect_from_env_cached() {
             match infigraph_core::embed::update_embeddings_remote(backend, pg, &[]) {
                 Ok(n) => {
@@ -1742,28 +1724,29 @@ mod tests {
     /// turned `if let Some(backend) = prism.backend()` into an always-true
     /// check gating the Postgres-embeddings branch — so `infigraph index`
     /// tried to connect to Postgres and failed even for plain local
-    /// indexing with no remote backend configured. `is_neo4j_backend()`
-    /// replaces that check with the same explicit `INFIGRAPH_BACKEND`
-    /// check already used a few lines above it (repo registration) —
-    /// asserts it's only true for an explicit `neo4j` value.
+    /// indexing with no remote backend configured.
+    /// `daemon::lifecycle::is_remote_backend()` replaces that check with the
+    /// same explicit `INFIGRAPH_BACKEND` check already used a few lines
+    /// above it (repo registration) — asserts it's only true for an
+    /// explicit `neo4j` value.
     #[test]
     #[cfg(feature = "remote")]
     fn is_neo4j_backend_only_true_for_explicit_neo4j_env() {
         std::env::remove_var("INFIGRAPH_BACKEND");
         assert!(
-            !is_neo4j_backend(),
+            !infigraph_core::daemon::lifecycle::is_remote_backend(),
             "unset INFIGRAPH_BACKEND must not select Postgres"
         );
 
         std::env::set_var("INFIGRAPH_BACKEND", "kuzu");
         assert!(
-            !is_neo4j_backend(),
+            !infigraph_core::daemon::lifecycle::is_remote_backend(),
             "explicit kuzu backend must not select Postgres"
         );
 
         std::env::set_var("INFIGRAPH_BACKEND", "neo4j");
         assert!(
-            is_neo4j_backend(),
+            infigraph_core::daemon::lifecycle::is_remote_backend(),
             "explicit neo4j backend must select Postgres"
         );
 

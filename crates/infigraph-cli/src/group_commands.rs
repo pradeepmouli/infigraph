@@ -452,9 +452,7 @@ pub(crate) fn cmd_group(root: &Path, action: GroupAction) -> Result<()> {
             let is_remote = {
                 #[cfg(feature = "remote")]
                 {
-                    std::env::var("INFIGRAPH_BACKEND")
-                        .map(|v| v == "neo4j")
-                        .unwrap_or(false)
+                    infigraph_core::daemon::lifecycle::is_remote_backend()
                 }
                 #[cfg(not(feature = "remote"))]
                 {

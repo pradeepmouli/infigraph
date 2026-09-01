@@ -1080,10 +1080,7 @@ fn run(command: Commands, root: &Path) -> Result<()> {
         ),
         Commands::IndexDocs => {
             #[cfg(feature = "remote")]
-            let doc_ns = if std::env::var("INFIGRAPH_BACKEND")
-                .map(|v| v == "neo4j")
-                .unwrap_or(false)
-            {
+            let doc_ns = if infigraph_core::daemon::lifecycle::is_remote_backend() {
                 infigraph_core::multi::Registry::load()
                     .ok()
                     .and_then(|reg| reg.resolve_repo_namespace(root))

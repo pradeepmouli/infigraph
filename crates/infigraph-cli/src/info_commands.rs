@@ -883,9 +883,7 @@ pub(crate) fn cmd_index_docs(root: &Path, namespace: Option<&str>) -> Result<()>
     }
 
     #[cfg(feature = "remote")]
-    let is_remote = std::env::var("INFIGRAPH_BACKEND")
-        .map(|v| v == "neo4j")
-        .unwrap_or(false);
+    let is_remote = infigraph_core::daemon::lifecycle::is_remote_backend();
     #[cfg(not(feature = "remote"))]
     let is_remote = false;
 
