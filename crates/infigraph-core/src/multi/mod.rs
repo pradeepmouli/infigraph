@@ -79,7 +79,7 @@ impl Registry {
     pub fn load() -> Result<Self> {
         #[cfg(feature = "postgres")]
         {
-            if is_remote_mode() {
+            if crate::daemon::lifecycle::is_remote_backend() {
                 let pg = PostgresMetaStore::connect_from_env_cached()?;
                 pg.init_schema()?;
                 return pg.load_registry();
@@ -98,7 +98,7 @@ impl Registry {
     pub fn save(&self) -> Result<()> {
         #[cfg(feature = "postgres")]
         {
-            if is_remote_mode() {
+            if crate::daemon::lifecycle::is_remote_backend() {
                 let pg = PostgresMetaStore::connect_from_env_cached()?;
                 pg.init_schema()?;
                 return pg.save_registry(self);
@@ -715,11 +715,7 @@ pub fn index_group(
     let mut skipped: Vec<String> = Vec::new();
 
     #[cfg(feature = "neo4j")]
-    let neo4j_backend = if !full
-        && std::env::var("INFIGRAPH_BACKEND")
-            .map(|v| v == "neo4j")
-            .unwrap_or(false)
-    {
+    let neo4j_backend = if !full && crate::daemon::lifecycle::is_remote_backend() {
         crate::graph::Neo4jBackend::connect_from_env().ok()
     } else {
         None
@@ -785,9 +781,7 @@ pub fn index_group(
     }
 
     // Neo4j backend supports concurrent writes — safe to parallelize
-    let use_parallel = std::env::var("INFIGRAPH_BACKEND")
-        .map(|v| v == "neo4j")
-        .unwrap_or(false);
+    let use_parallel = crate::daemon::lifecycle::is_remote_backend();
 
     let org = group.org.clone();
     // Build once and share across repos — bundled_registry() compiles ~62
@@ -981,20 +975,11 @@ pub fn qualified_group_name(org: &str, name: &str) -> String {
 /// `repo_name`, even with an empty org, so "is org empty" alone is NOT a
 /// valid signal for "is this graph namespaced".
 pub(crate) fn remote_namespace(org: &str, repo_name: &str) -> Option<String> {
-    let in_remote = std::env::var("INFIGRAPH_BACKEND")
-        .map(|v| v == "neo4j")
-        .unwrap_or(false);
+    let in_remote = crate::daemon::lifecycle::is_remote_backend();
     if !in_remote {
         return None;
     }
     Some(qualified_group_name(org, repo_name))
-}
-
-#[cfg(feature = "postgres")]
-fn is_remote_mode() -> bool {
-    std::env::var("INFIGRAPH_BACKEND")
-        .map(|v| v == "neo4j")
-        .unwrap_or(false)
 }
 
 pub fn git_head_commit(repo_path: &Path) -> Option<String> {
