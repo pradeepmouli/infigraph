@@ -675,6 +675,14 @@ enum Commands {
         languages: String,
     },
 
+    /// Print this binary's build hash and exit (dev/internal use — lets a
+    /// running daemon detect it's stale relative to whatever binary is
+    /// currently on disk, since its own in-process build_hash() is a
+    /// compile-time constant that can't observe a rebuild that happened
+    /// after it started).
+    #[command(hide = true)]
+    PrintBuildHash,
+
     /// Remove cached SCIP runtime binaries (Node.js, JRE, .NET SDK, Dart SDK, PHP)
     CleanRuntimes,
 
@@ -959,6 +967,17 @@ pub(crate) fn should_auto_watch(command: &Commands, root: &Path) -> bool {
     )
 }
 
+/// See `Commands::PrintBuildHash`'s doc comment for why this exists.
+fn cmd_print_build_hash() {
+    if let Ok(path) = std::env::var("INFIGRAPH_TEST_BUILD_HASH_OVERRIDE_FILE") {
+        if let Ok(contents) = std::fs::read_to_string(&path) {
+            println!("{}", contents.trim());
+            return;
+        }
+    }
+    println!("{}", infigraph_core::build_hash());
+}
+
 fn main() -> Result<()> {
     // ANTLR parsers recurse deeply; Rayon's default 2MB stack overflows.
     // Windows default main-thread stack is 1MB — also too small.
@@ -1197,6 +1216,10 @@ fn run(command: Commands, root: &Path) -> Result<()> {
                 .filter(|s| !s.is_empty())
                 .collect();
             index::cmd_scip_enrich(root, &detected);
+            Ok(())
+        }
+        Commands::PrintBuildHash => {
+            cmd_print_build_hash();
             Ok(())
         }
         Commands::CleanRuntimes => {
