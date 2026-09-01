@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 use tempfile::TempDir;
 
-/// Serializes the tests that read or mutate INFIGRAPH_SLOW_LOCK_MS — the
+/// Serializes the tests that read or mutate INFIGRAPH_GRAPH_SLOW_LOCK_MS — the
 /// threshold is process-global, so a lowered value must not leak into a
 /// concurrently-running test's window.
 static SLOW_LOCK_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -204,7 +204,7 @@ fn test_slow_wait_recorded_and_drained() {
     // >50ms contended wait (contended tests end in Busy, which must NOT
     // record), so cross-test interference is limited to extra entries we
     // filter out by path.
-    std::env::set_var("INFIGRAPH_SLOW_LOCK_MS", "50");
+    std::env::set_var("INFIGRAPH_GRAPH_SLOW_LOCK_MS", "50");
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("slow.lock");
 
@@ -232,7 +232,7 @@ fn test_slow_wait_recorded_and_drained() {
             .all(|w| w.lock_path != path),
         "take_slow_waits must drain recorded events"
     );
-    std::env::remove_var("INFIGRAPH_SLOW_LOCK_MS");
+    std::env::remove_var("INFIGRAPH_GRAPH_SLOW_LOCK_MS");
 }
 
 #[test]

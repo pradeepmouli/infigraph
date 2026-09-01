@@ -50,21 +50,18 @@ pub(crate) fn check_disk_headroom(dir: &Path, projected_write_bytes: u64) -> Res
     }
 }
 
+/// Kept for `check_graph_growth_ratio`'s user-facing "override with ..."
+/// hint; the value itself resolves through the `graph` settings group.
 const GRAPH_GROWTH_MAX_RATIO_ENV: &str = "INFIGRAPH_GRAPH_GROWTH_MAX_RATIO";
-/// Observed pathological incidents (github.com/pradeepmouli/infigraph#100)
-/// were 40-70x a healthy graph's size; 10x gives wide headroom for
-/// legitimate growth (large refactors, new language support landing) while
-/// still catching the actual pattern well before it reaches disk-filling
-/// scale. Env-overridable following the exact precedent
-/// `quarantine::quarantine_max_bytes`'s `INFIGRAPH_QUARANTINE_MAX_BYTES`
-/// already sets.
-const DEFAULT_GRAPH_GROWTH_MAX_RATIO: u64 = 10;
 
+/// Observed pathological incidents (github.com/pradeepmouli/infigraph#100)
+/// were 40-70x a healthy graph's size; the default 10x gives wide headroom
+/// for legitimate growth (large refactors, new language support landing)
+/// while still catching the actual pattern well before it reaches
+/// disk-filling scale. Resolved via the `graph` settings group
+/// (`INFIGRAPH_GRAPH_GROWTH_MAX_RATIO`).
 fn graph_growth_max_ratio() -> u64 {
-    std::env::var(GRAPH_GROWTH_MAX_RATIO_ENV)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(DEFAULT_GRAPH_GROWTH_MAX_RATIO)
+    crate::graph::Graph::resolve(crate::graph::RawGraph::default(), None).growth_max_ratio
 }
 
 fn graph_health_path(infigraph_dir: &Path) -> std::path::PathBuf {

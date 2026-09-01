@@ -40,6 +40,26 @@ pub use store::{
 pub use store_util::stamp_healthy_graph_size;
 pub use test_templates::{test_templates_for, TestTemplate};
 
+// Graph-store tunables. The `settings!` field pattern has no attribute
+// capture, so per-field docs live on each accessor instead:
+// - growth_max_ratio: runaway-growth circuit breaker
+//   (`store_util::graph_growth_max_ratio`, #100)
+// - quarantine_max_bytes: corrupt-base-image byte cap, 0 disables
+//   (`quarantine::quarantine_max_bytes`, R7.3 / #100)
+// - slow_lock_ms: slow-acquire recording threshold
+//   (`lockfile::slow_wait_threshold`)
+// - doc_hnsw_threshold: combined-docs HNSW build threshold; also readable
+//   by its pre-macro upstream name `INFIGRAPH_DOC_HNSW_THRESHOLD`
+//   (`infigraph-docs` `combined_hnsw_threshold`)
+crate::settings! {
+    graph {
+        growth_max_ratio: u64 = 10,
+        quarantine_max_bytes: u64 = 1024 * 1024 * 1024,
+        slow_lock_ms: u64 = 2000,
+        doc_hnsw_threshold: u64 = 200_000,
+    }
+}
+
 pub fn schema_ddl() -> Vec<&'static str> {
     let mut all: Vec<&str> = schema::CREATE_SCHEMA.to_vec();
     all.extend_from_slice(schema::MIGRATIONS);

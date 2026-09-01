@@ -151,13 +151,17 @@ static SLOW_WAITS: std::sync::Mutex<Vec<SlowWait>> = std::sync::Mutex::new(Vec::
 const SLOW_WAITS_CAP: usize = 16;
 
 /// Threshold above which a successful-but-slow acquisition is recorded.
-/// Milliseconds, overridable via `INFIGRAPH_SLOW_LOCK_MS` (tests).
+/// Resolved via the `graph` settings group (`INFIGRAPH_GRAPH_SLOW_LOCK_MS`,
+/// milliseconds; tests lower it).
+///
+/// `RawGraph::default()` (all CLI slots `None`), not `parse_from(empty)`:
+/// this runs on every successful acquire while the lock is still held, and
+/// building a clap `Command` there lengthened every hold enough to push
+/// contended waiters into `acquire`'s backoff sleeps (caught by
+/// `write_lock_perf`'s contended-throughput guard).
 pub fn slow_wait_threshold() -> Duration {
-    std::env::var("INFIGRAPH_SLOW_LOCK_MS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .map(Duration::from_millis)
-        .unwrap_or(Duration::from_secs(2))
+    let cli = crate::graph::RawGraph::default();
+    Duration::from_millis(crate::graph::Graph::resolve(cli, None).slow_lock_ms)
 }
 
 fn record_slow_wait(path: &Path, waited: Duration) {

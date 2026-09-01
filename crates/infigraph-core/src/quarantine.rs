@@ -31,12 +31,10 @@ const PREVIOUS_RETENTION: usize = 1;
 /// graph's size, and truncating a healthy graph destroys its entire
 /// rollback value.
 ///
-/// Overridable via `INFIGRAPH_QUARANTINE_MAX_BYTES` (0 disables the cap).
+/// Resolved via the `graph` settings group
+/// (`INFIGRAPH_GRAPH_QUARANTINE_MAX_BYTES`; 0 disables the cap).
 fn quarantine_max_bytes() -> u64 {
-    std::env::var("INFIGRAPH_QUARANTINE_MAX_BYTES")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(1024 * 1024 * 1024)
+    crate::graph::Graph::resolve(crate::graph::RawGraph::default(), None).quarantine_max_bytes
 }
 
 fn now_epoch_secs() -> u64 {
@@ -119,7 +117,7 @@ fn move_graph_aside(
                 "dropped_base_image": source.display().to_string(),
                 "dropped_bytes": base_size,
                 "cap_bytes": cap,
-                "reason": "corrupt base image exceeded INFIGRAPH_QUARANTINE_MAX_BYTES;                            WAL-family siblings retained for forensics",
+                "reason": "corrupt base image exceeded INFIGRAPH_GRAPH_QUARANTINE_MAX_BYTES;                            WAL-family siblings retained for forensics",
                 "dropped_at_epoch": ts,
             });
             let _ = std::fs::write(

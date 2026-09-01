@@ -8,18 +8,18 @@ use infigraph_core::quarantine::{quarantine_graph, retire_previous_graph};
 use std::fs;
 use std::sync::{Mutex, MutexGuard};
 
-/// These tests mutate the process-global INFIGRAPH_QUARANTINE_MAX_BYTES;
+/// These tests mutate the process-global INFIGRAPH_GRAPH_QUARANTINE_MAX_BYTES;
 /// serialize them so parallel test threads can't race the env var.
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 fn with_cap(bytes: &str) -> MutexGuard<'static, ()> {
     let guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    std::env::set_var("INFIGRAPH_QUARANTINE_MAX_BYTES", bytes);
+    std::env::set_var("INFIGRAPH_GRAPH_QUARANTINE_MAX_BYTES", bytes);
     guard
 }
 
 fn clear_cap(guard: MutexGuard<'_, ()>) {
-    std::env::remove_var("INFIGRAPH_QUARANTINE_MAX_BYTES");
+    std::env::remove_var("INFIGRAPH_GRAPH_QUARANTINE_MAX_BYTES");
     drop(guard);
 }
 

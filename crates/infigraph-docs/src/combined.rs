@@ -313,11 +313,20 @@ pub fn build_combined_docs(registry: &Registry, group_name: &str) -> Result<Comb
     })
 }
 
+/// Embedding count above which the combined store builds an HNSW index.
+/// Resolved via core's `graph` settings group. `INFIGRAPH_DOC_HNSW_THRESHOLD`
+/// predates the macro (and exists upstream), so it is read by its legacy
+/// name and seeded into the CLI slot -- which still outranks the macro's
+/// own env/TOML/default layers -- exactly as `selected_backend()` does for
+/// `INFIGRAPH_BACKEND`.
 fn combined_hnsw_threshold() -> usize {
-    std::env::var("INFIGRAPH_DOC_HNSW_THRESHOLD")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(200_000)
+    let cli = infigraph_core::graph::RawGraph {
+        graph_doc_hnsw_threshold: std::env::var("INFIGRAPH_DOC_HNSW_THRESHOLD")
+            .ok()
+            .and_then(|v| v.parse().ok()),
+        ..Default::default()
+    };
+    infigraph_core::graph::Graph::resolve(cli, None).doc_hnsw_threshold as usize
 }
 
 fn acquire_build_lock(graph_dir: &Path) -> Result<std::fs::File> {
@@ -670,5 +679,25 @@ mod tests {
         assert!(second.try_lock_exclusive().is_err());
         FileExt::unlock(&first).unwrap();
         second.try_lock_exclusive().unwrap();
+    }
+
+    /// `INFIGRAPH_DOC_HNSW_THRESHOLD` predates the settings macro and is
+    /// upstream-inherited, so its name must keep working; the macro's own
+    /// canonical name works too, and the legacy name wins when both are set
+    /// (it is seeded into the CLI slot, which outranks env).
+    #[test]
+    fn hnsw_threshold_honors_legacy_name_over_canonical_name() {
+        std::env::remove_var("INFIGRAPH_DOC_HNSW_THRESHOLD");
+        std::env::remove_var("INFIGRAPH_GRAPH_DOC_HNSW_THRESHOLD");
+        assert_eq!(combined_hnsw_threshold(), 200_000);
+
+        std::env::set_var("INFIGRAPH_GRAPH_DOC_HNSW_THRESHOLD", "7");
+        assert_eq!(combined_hnsw_threshold(), 7);
+
+        std::env::set_var("INFIGRAPH_DOC_HNSW_THRESHOLD", "3");
+        assert_eq!(combined_hnsw_threshold(), 3, "legacy name must win");
+
+        std::env::remove_var("INFIGRAPH_DOC_HNSW_THRESHOLD");
+        std::env::remove_var("INFIGRAPH_GRAPH_DOC_HNSW_THRESHOLD");
     }
 }
