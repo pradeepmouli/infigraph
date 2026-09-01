@@ -98,7 +98,7 @@ impl DaemonKuzuBackend {
     /// extraction through one of these, and the daemon only writes its
     /// `.result` once the whole batch commits -- matching the 600s
     /// `Infigraph::index()` allows for the same work under the
-    /// `INFIGRAPH_INDEX_VIA_DAEMON` path.
+    /// `INFIGRAPH_WATCH_INDEX_VIA_DAEMON` path.
     const BULK_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 }
 

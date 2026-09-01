@@ -249,13 +249,10 @@ pub fn daemon_backend_selected() -> bool {
 /// daemon as a single `WriteRequest::Index`, instead of the default (parse
 /// locally, let the individual graph writes route themselves through the
 /// daemon). Off by default; only consulted under `INFIGRAPH_BACKEND=daemon`.
-///
-/// Same `"1"`-means-on convention as
-/// `crate::daemon::lifecycle::watch_daemon_mode_enabled`.
+/// Overridable via `INFIGRAPH_WATCH_INDEX_VIA_DAEMON`.
 pub fn index_via_daemon_mode_enabled() -> bool {
-    std::env::var("INFIGRAPH_INDEX_VIA_DAEMON")
-        .map(|v| v == "1")
-        .unwrap_or(false)
+    let cli = watch::RawWatch::parse_from(std::iter::empty::<String>());
+    watch::Watch::resolve(cli, None).index_via_daemon.0
 }
 
 impl Infigraph {
@@ -620,7 +617,7 @@ impl Infigraph {
 
     /// Ask the daemon to do the indexing on its own write-mode connection.
     ///
-    /// Opt-in via `INFIGRAPH_INDEX_VIA_DAEMON=1` (see
+    /// Opt-in via `INFIGRAPH_WATCH_INDEX_VIA_DAEMON=1` (see
     /// `delegates_whole_index_to_daemon`); `index_file` also uses it
     /// unconditionally, since `upsert_file` is still a Tier-3 stub.
     ///

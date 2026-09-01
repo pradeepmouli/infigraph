@@ -252,7 +252,7 @@ fn file_is_in_graph(project_dir: &Path, file: &str) -> bool {
 /// daemon's request-serving loop and so both hit the same lock:
 ///  - the default, where the client parses locally and only the graph
 ///    writes (`upsert_files_bulk`/`remove_file`/`resolve_calls`) route; and
-///  - `INFIGRAPH_INDEX_VIA_DAEMON=1`, where the whole job is one
+///  - `INFIGRAPH_WATCH_INDEX_VIA_DAEMON=1`, where the whole job is one
 ///    `WriteRequest::Index` and the daemon redoes the scan itself.
 #[test]
 fn real_cli_index_against_a_real_daemon_completes_and_writes() {
@@ -313,10 +313,13 @@ fn real_cli_index_against_a_real_daemon_completes_and_writes() {
         "function opt_in_marker()\nend\n",
     )
     .unwrap();
-    let opt_in_output = run_cli_index(project_dir.path(), &[("INFIGRAPH_INDEX_VIA_DAEMON", "1")]);
+    let opt_in_output = run_cli_index(
+        project_dir.path(),
+        &[("INFIGRAPH_WATCH_INDEX_VIA_DAEMON", "1")],
+    );
     assert!(
         !has_language_breakdown(&opt_in_output),
-        "under INFIGRAPH_INDEX_VIA_DAEMON the daemon does the parsing and the protocol \
+        "under INFIGRAPH_WATCH_INDEX_VIA_DAEMON the daemon does the parsing and the protocol \
          deliberately doesn't ship extractions back, so there is nothing to break down \
          by language:\n{opt_in_output}"
     );
@@ -436,7 +439,7 @@ fn index_and_index_files_route_through_the_daemon() {
 }
 
 /// The exact scenario reproduced live while confirming the predecessor fix
-/// (fix/daemonkuzu-index-routing): under INFIGRAPH_INDEX_VIA_DAEMON=1,
+/// (fix/daemonkuzu-index-routing): under INFIGRAPH_WATCH_INDEX_VIA_DAEMON=1,
 /// creating a file and immediately running `infigraph index` -- no
 /// settling delay for the daemon's own watcher debounce -- used to produce
 /// a Kuzu duplicate-primary-key error, because the daemon's own
@@ -478,7 +481,7 @@ fn ad_hoc_index_request_racing_the_watchers_own_debounce_does_not_duplicate_key(
         .arg("index")
         .arg("--no-embed")
         .env("INFIGRAPH_BACKEND", "daemon")
-        .env("INFIGRAPH_INDEX_VIA_DAEMON", "1")
+        .env("INFIGRAPH_WATCH_INDEX_VIA_DAEMON", "1")
         .output()
         .unwrap();
 
@@ -611,7 +614,7 @@ fn producers_keep_accepting_work_while_a_drain_is_in_flight() {
     // land in the middle of.
     let slow = std::thread::spawn({
         let dir = project.path().to_path_buf();
-        move || run_cli_index(&dir, &[("INFIGRAPH_INDEX_VIA_DAEMON", "1")])
+        move || run_cli_index(&dir, &[("INFIGRAPH_WATCH_INDEX_VIA_DAEMON", "1")])
     });
 
     // Give the daemon a moment to actually pick the request up and start
@@ -625,7 +628,7 @@ fn producers_keep_accepting_work_while_a_drain_is_in_flight() {
     )
     .unwrap();
     let second_started = std::time::Instant::now();
-    run_cli_index(project.path(), &[("INFIGRAPH_INDEX_VIA_DAEMON", "1")]);
+    run_cli_index(project.path(), &[("INFIGRAPH_WATCH_INDEX_VIA_DAEMON", "1")]);
     let second_elapsed = second_started.elapsed();
 
     slow.join().expect("the slow whole-project index panicked");
@@ -694,7 +697,7 @@ fn a_queued_request_racing_a_full_reindex_gets_a_superseded_reply_not_a_hang() {
         .arg("--no-embed")
         .current_dir(project.path())
         .env("INFIGRAPH_BACKEND", "daemon")
-        .env("INFIGRAPH_INDEX_VIA_DAEMON", "1")
+        .env("INFIGRAPH_WATCH_INDEX_VIA_DAEMON", "1")
         .spawn()
         .unwrap();
 
