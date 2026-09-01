@@ -26,6 +26,51 @@ use crate::Infigraph;
 /// polled, on the same ~200ms cadence `rx.recv_timeout` used to impose.
 const COORDINATOR_TICK: Duration = Duration::from_millis(200);
 
+/// How often the coordinator loop re-checks whether the on-disk binary has
+/// changed since this process started. Deliberately independent of
+/// `periodic_secs` (which can be 0 for the plain `infigraph daemon` -- see
+/// its call site) -- staleness detection must run even when no other
+/// periodic pass is configured.
+const BUILD_HASH_CHECK_INTERVAL: Duration = Duration::from_secs(300);
+
+fn build_hash_check_interval() -> Duration {
+    std::env::var("INFIGRAPH_TEST_BUILD_HASH_CHECK_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .map(Duration::from_secs)
+        .unwrap_or(BUILD_HASH_CHECK_INTERVAL)
+}
+
+/// Spawns a fresh `infigraph print-build-hash` subprocess and returns its
+/// trimmed stdout, or `None` if the spawn failed or it exited non-zero.
+/// `None` means "couldn't check this time," not "confirmed stale" -- the
+/// caller must not treat a failed check as a mismatch.
+///
+/// Test-only escape hatch: when `INFIGRAPH_TEST_BUILD_HASH_OVERRIDE_FILE`
+/// is set, reads that file directly instead of spawning a subprocess.
+/// `std::env::current_exe()` inside a `cargo test` binary resolves to the
+/// test harness, not the real `infigraph` binary, so tests that exercise
+/// this loop directly (rather than a real spawned daemon process) have no
+/// other way to simulate a mismatch; `print-build-hash`'s own handling of
+/// this same env var is covered separately (`crates/infigraph-cli/tests/
+/// print_build_hash.rs`), so this doesn't lose coverage of that path.
+fn current_on_disk_build_hash() -> Option<String> {
+    if let Ok(path) = std::env::var("INFIGRAPH_TEST_BUILD_HASH_OVERRIDE_FILE") {
+        return std::fs::read_to_string(path)
+            .ok()
+            .map(|s| s.trim().to_string());
+    }
+    let exe = std::env::current_exe().ok()?;
+    let output = std::process::Command::new(exe)
+        .arg("print-build-hash")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
 /// Callback for in-process SCIP enrichment after a successful daemon full
 /// reindex. Takes the daemon's own (already-open, already-reopened-post-swap)
 /// connection -- the callback must NOT open a second `Infigraph`/`Database`
@@ -200,6 +245,9 @@ where
     // tick a shutdown.
     let mut shutdown_requested = false;
 
+    let build_hash_check_interval = build_hash_check_interval();
+    let mut last_build_hash_check = std::time::Instant::now();
+
     loop {
         if stop_rx.try_recv().is_ok() {
             eprintln!("[watch] stop channel signaled -- shutting down");
@@ -228,6 +276,33 @@ where
                 root.display()
             );
             break;
+        }
+
+        // Self-terminate if the on-disk binary has changed since this
+        // process started (#134) -- prune_stale_daemon already handles
+        // this correctly for a daemon someone is actively trying to
+        // (re)start, but a long-idle project's daemon never gets that
+        // lazy check triggered. This rides its own coarse interval rather
+        // than every COORDINATOR_TICK, since it spawns a real subprocess.
+        if last_build_hash_check.elapsed() >= build_hash_check_interval {
+            last_build_hash_check = std::time::Instant::now();
+            match current_on_disk_build_hash() {
+                Some(current) if current != crate::build_hash() => {
+                    eprintln!(
+                        "[watch] running build {} but the current binary on disk is {} -- \
+                         shutting down so the next request starts a fresh daemon",
+                        crate::build_hash(),
+                        current
+                    );
+                    break;
+                }
+                Some(_) => {}
+                None => {
+                    eprintln!(
+                        "[watch] build-hash self-check couldn't run this interval, will retry"
+                    );
+                }
+            }
         }
 
         // Shared drain step, in two halves: reap whatever finished since the
