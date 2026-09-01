@@ -130,7 +130,10 @@ pub fn ensure_daemon_running_required(root: &Path, watch_binary: &Path) -> Daemo
             spawn_daemon(root, &tg_dir, watch_binary)
         }
         Ok(None) => {
-            if !prune_stale_daemon(&lock_path) {
+            // Judge staleness against the binary we would spawn, not this
+            // process's own build -- see `holder_is_stale_build`.
+            let installed = crate::daemon::installed_build_hash_of(watch_binary);
+            if !prune_stale_daemon(&lock_path, installed.as_deref()) {
                 return DaemonStartOutcome::AlreadyRunning;
             }
             // The stale holder was pruned (or was already dead) and the
@@ -308,7 +311,23 @@ pub fn kill_orphaned_daemon(pid: u32) {
 /// `auto_start_on_boot` toggle). Replacing an already-running stale-build
 /// daemon with a fresh one is correctness upkeep, not new background
 /// activity, so it shouldn't share that toggle.
-pub fn prune_stale_daemon(lock_path: &Path) -> bool {
+/// Pure decision: is a live holder recording `holder_build_hash` stale
+/// relative to `installed_build_hash` -- the hash of the binary a fresh
+/// daemon would be spawned from (see `daemon::installed_build_hash_of`)?
+/// Deliberately NOT relative to `crate::build_hash()`: that is the judging
+/// process's own build, which is exactly wrong when the judge is the
+/// out-of-date one (#135 -- an `infigraph-mcp` started before an install
+/// was SIGTERMing every daemon on the *new* build and respawning it from
+/// the on-disk binary it would judge stale again). `None` (couldn't
+/// determine what's installed) never justifies signalling a live process.
+pub fn holder_is_stale_build(holder_build_hash: &str, installed_build_hash: Option<&str>) -> bool {
+    match installed_build_hash {
+        Some(installed) => holder_build_hash != installed,
+        None => false,
+    }
+}
+
+pub fn prune_stale_daemon(lock_path: &Path, installed_build_hash: Option<&str>) -> bool {
     let Some(holder) = crate::lockfile::read_holder(lock_path) else {
         return false;
     };
@@ -324,8 +343,8 @@ pub fn prune_stale_daemon(lock_path: &Path) -> bool {
         return true;
     };
 
-    if holder.build_hash == crate::build_hash() {
-        return false; // live and current -- nothing to prune
+    if !holder_is_stale_build(&holder.build_hash, installed_build_hash) {
+        return false; // live and current (relative to what's installed) -- nothing to prune
     }
 
     // Exact match against the real CLI binary names only -- a substring
@@ -490,7 +509,7 @@ pub fn resolve_cli_binary_sibling_of(current_exe: &Path) -> Result<std::path::Pa
 
 #[cfg(test)]
 mod tests {
-    use super::{daemon_is_alive, prune_stale_daemon, wait_for_pid_exit};
+    use super::{daemon_is_alive, holder_is_stale_build, prune_stale_daemon, wait_for_pid_exit};
     use crate::lockfile::LockInfo;
 
     fn write_lock_info(path: &std::path::Path, info: &LockInfo) {
@@ -564,7 +583,7 @@ mod tests {
         );
 
         assert!(
-            prune_stale_daemon(&lock_path),
+            prune_stale_daemon(&lock_path, Some(crate::build_hash())),
             "a dead holder PID must be reported as prunable"
         );
     }
@@ -592,9 +611,36 @@ mod tests {
         );
 
         assert!(
-            !prune_stale_daemon(&lock_path),
+            !prune_stale_daemon(&lock_path, Some(crate::build_hash())),
             "a live holder on the current build must not be pruned"
         );
+    }
+
+    /// #135: staleness is relative to the *installed* binary, never to this
+    /// process's own build. A holder on the installed build is current even
+    /// when the judge was built from something else; an unknown installed
+    /// hash never justifies a signal.
+    #[test]
+    fn holder_is_stale_build_is_relative_to_the_installed_binary_only() {
+        assert!(
+            !holder_is_stale_build("installed-hash-X", Some("installed-hash-X")),
+            "holder on the installed build is current, whatever this judge was built from"
+        );
+        assert!(
+            holder_is_stale_build("older-hash", Some("installed-hash-X")),
+            "holder on a different build than what's installed is stale"
+        );
+        assert!(
+            !holder_is_stale_build("anything", None),
+            "unknown installed hash must never be treated as stale"
+        );
+        // The judge's own hash is irrelevant: a holder matching what's
+        // installed is current even though it differs from crate::build_hash().
+        assert_ne!("installed-hash-X", crate::build_hash());
+        assert!(!holder_is_stale_build(
+            "installed-hash-X",
+            Some("installed-hash-X")
+        ));
     }
 
     /// PID-reuse guard: a live PID with a mismatched build_hash is only
@@ -621,7 +667,7 @@ mod tests {
         );
 
         assert!(
-            !prune_stale_daemon(&lock_path),
+            !prune_stale_daemon(&lock_path, Some(crate::build_hash())),
             "a live PID whose process name doesn't look like infigraph must not be pruned/signaled"
         );
     }

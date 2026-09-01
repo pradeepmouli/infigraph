@@ -41,27 +41,31 @@ fn build_hash_check_interval() -> Duration {
         .unwrap_or(BUILD_HASH_CHECK_INTERVAL)
 }
 
-/// Spawns a fresh `infigraph print-build-hash` subprocess and returns its
-/// trimmed stdout, or `None` if the spawn failed or it exited non-zero.
-/// `None` means "couldn't check this time," not "confirmed stale" -- the
-/// caller must not treat a failed check as a mismatch.
+/// Build hash of the binary at `binary`, as a fresh subprocess of it reports
+/// via the hidden `print-build-hash` subcommand: trimmed stdout, or `None` if
+/// the spawn failed or it exited non-zero. `None` means "couldn't check,"
+/// not "confirmed stale" -- callers must never treat it as a mismatch.
+///
+/// This is the only way to learn what is *installed*: `crate::build_hash()`
+/// is a compile-time constant baked into whichever process is asking, which
+/// is exactly wrong when that process is the out-of-date one -- an
+/// `infigraph-mcp` started before an install judging a daemon spawned after
+/// it (#135), or a daemon judging itself after a rebuild (#134).
 ///
 /// Test-only escape hatch: when `INFIGRAPH_TEST_BUILD_HASH_OVERRIDE_FILE`
 /// is set, reads that file directly instead of spawning a subprocess.
 /// `std::env::current_exe()` inside a `cargo test` binary resolves to the
 /// test harness, not the real `infigraph` binary, so tests that exercise
-/// this loop directly (rather than a real spawned daemon process) have no
-/// other way to simulate a mismatch; `print-build-hash`'s own handling of
-/// this same env var is covered separately (`crates/infigraph-cli/tests/
-/// print_build_hash.rs`), so this doesn't lose coverage of that path.
-fn current_on_disk_build_hash() -> Option<String> {
+/// these paths in-process have no other way to simulate a mismatch;
+/// `print-build-hash`'s own handling of this same env var is covered
+/// separately (`crates/infigraph-cli/tests/print_build_hash.rs`).
+pub fn installed_build_hash_of(binary: &std::path::Path) -> Option<String> {
     if let Ok(path) = std::env::var("INFIGRAPH_TEST_BUILD_HASH_OVERRIDE_FILE") {
         return std::fs::read_to_string(path)
             .ok()
             .map(|s| s.trim().to_string());
     }
-    let exe = std::env::current_exe().ok()?;
-    let output = std::process::Command::new(exe)
+    let output = std::process::Command::new(binary)
         .arg("print-build-hash")
         .output()
         .ok()?;
@@ -69,6 +73,13 @@ fn current_on_disk_build_hash() -> Option<String> {
         return None;
     }
     Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// The daemon's own view: what does the binary it was launched from report
+/// now? (The binary on disk may have been replaced since this process
+/// started -- that is the whole point of the check.)
+fn current_on_disk_build_hash() -> Option<String> {
+    installed_build_hash_of(&std::env::current_exe().ok()?)
 }
 
 /// Callback for in-process SCIP enrichment after a successful daemon full

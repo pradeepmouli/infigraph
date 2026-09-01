@@ -108,7 +108,18 @@ pub fn start_daemon_watcher_for_startup_dir(startup_dir: Option<&Path>) {
     // doc comment. A pruned daemon leaves the root unwatched only until the
     // `auto_start_watch` call below (if enabled) or the next opportunistic
     // trigger (e.g. a `search` call) spawns a fresh one.
-    infigraph_core::daemon::lifecycle::prune_stale_daemon(&dir.join(".infigraph/watch.lock"));
+    // Judge staleness against the CLI binary a fresh daemon would be spawned
+    // from, never against this MCP process's own build (#135): an MCP started
+    // before an install would otherwise SIGTERM every daemon on the new
+    // build. `None` (binary not resolvable) never prunes on hash grounds.
+    let installed = std::env::current_exe()
+        .ok()
+        .and_then(|exe| infigraph_core::daemon::lifecycle::resolve_cli_binary_sibling_of(&exe).ok())
+        .and_then(|cli| infigraph_core::daemon::installed_build_hash_of(&cli));
+    infigraph_core::daemon::lifecycle::prune_stale_daemon(
+        &dir.join(".infigraph/watch.lock"),
+        installed.as_deref(),
+    );
 
     if !crate::session_context::auto_start_watch_on_boot_enabled() {
         return;

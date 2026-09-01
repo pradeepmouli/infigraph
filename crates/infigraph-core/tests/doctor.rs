@@ -32,6 +32,28 @@ fn ctx_for(scope: DoctorScope, registry: Registry) -> DoctorContext {
     }
 }
 
+/// #135: `installed_build_hash` must describe the binary on disk, not the
+/// process running doctor -- an `infigraph-mcp` started before an install
+/// used to report its own (stale) hash as "installed", inverting every
+/// stale-build warning. Uses #134's test hatch to stand in for the
+/// `print-build-hash` subprocess.
+#[test]
+fn installed_build_hash_comes_from_the_installed_binary_not_the_judge() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let override_path = dir.path().join("build-hash.txt");
+    std::fs::write(&override_path, "on-disk-hash\n").unwrap();
+    std::env::set_var("INFIGRAPH_TEST_BUILD_HASH_OVERRIDE_FILE", &override_path);
+
+    let ctx = infigraph_core::doctor::assemble_context(DoctorScope::Global);
+
+    std::env::remove_var("INFIGRAPH_TEST_BUILD_HASH_OVERRIDE_FILE");
+    assert_eq!(
+        ctx.installed_build_hash, "on-disk-hash",
+        "must come from the installed binary, not crate::build_hash()"
+    );
+    assert_ne!(ctx.installed_build_hash, infigraph_core::build_hash());
+}
+
 #[test]
 fn find_repo_entry_matches_canonicalized_path() {
     let dir = tempfile::TempDir::new().unwrap();

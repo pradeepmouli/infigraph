@@ -131,9 +131,27 @@ pub(crate) fn scan_roots_from_env() -> Vec<PathBuf> {
     Vec::new()
 }
 
+/// Build hash of the installed `infigraph` CLI binary -- the one daemons get
+/// spawned from -- queried from the binary itself (`daemon::installed_build_hash_of`),
+/// never taken from this process's own compile-time `build_hash()`: doctor
+/// may be running inside an `infigraph-mcp` that predates the install, in
+/// which case its own hash is the stale one and every "holder is running
+/// build X, installed binary is Y" line would be inverted (#135). Resolves
+/// the CLI as a sibling of the current executable (for the CLI itself that
+/// is itself). `None` if the binary can't be located or queried.
+fn installed_cli_build_hash() -> Option<String> {
+    let exe = std::env::current_exe().ok()?;
+    let cli = crate::daemon::lifecycle::resolve_cli_binary_sibling_of(&exe).ok()?;
+    crate::daemon::installed_build_hash_of(&cli)
+}
+
 /// Assembles the context once: one registry load, one disk-free check, one
 /// binary-info lookup. Individual check functions never touch the
 /// filesystem/registry directly -- only this function does.
+///
+/// `installed_build_hash` falls back to this process's own build only when
+/// the installed CLI binary cannot be queried at all (see
+/// `installed_cli_build_hash`).
 pub fn assemble_context(scope: DoctorScope) -> DoctorContext {
     let registry = Registry::load().unwrap_or_default();
     let disk_dir = match &scope {
@@ -144,7 +162,8 @@ pub fn assemble_context(scope: DoctorScope) -> DoctorContext {
     DoctorContext {
         registry,
         scope,
-        installed_build_hash: crate::build_hash().to_string(),
+        installed_build_hash: installed_cli_build_hash()
+            .unwrap_or_else(|| crate::build_hash().to_string()),
         disk_free_bytes,
         scan_roots: scan_roots_from_env(),
     }
