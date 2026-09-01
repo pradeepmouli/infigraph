@@ -64,6 +64,7 @@ pub use toml_edit;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use clap::Parser;
 use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 
@@ -206,6 +207,31 @@ enum BackendKind {
     DaemonKuzu(graph::DaemonKuzuBackend),
 }
 
+crate::settings! {
+    backend {
+        selected: String = "kuzu".to_string(),
+    }
+}
+
+/// Resolves the active backend selector: CLI > env > TOML > default
+/// (`"kuzu"`). The single source of truth for `INFIGRAPH_BACKEND` --
+/// `daemon_backend_selected()` and `daemon::lifecycle::is_remote_backend()`
+/// are both thin wrappers over this.
+///
+/// `INFIGRAPH_BACKEND` predates the `settings!` macro and has no field
+/// suffix, so it can't go through the macro's generic
+/// `INFIGRAPH_{CATEGORY}_{FIELD}` env lookup (that would read
+/// `INFIGRAPH_BACKEND_SELECTED` instead). Read it directly and seed it into
+/// the CLI slot instead, which still outranks env/TOML/default in the
+/// macro's own precedence chain.
+pub fn selected_backend() -> String {
+    let mut cli = RawBackend::parse_from(std::iter::empty::<String>());
+    cli.backend_selected = cli
+        .backend_selected
+        .or_else(|| std::env::var("INFIGRAPH_BACKEND").ok());
+    Backend::resolve(cli, None).selected
+}
+
 /// Whether `INFIGRAPH_BACKEND` selects the daemon backend. This is the exact
 /// condition `Infigraph::init` dispatches `BackendKind::DaemonKuzu` on,
 /// exposed for callers that must know *before* `init()` -- notably
@@ -216,9 +242,7 @@ enum BackendKind {
 /// instance; that reports what was actually opened rather than what was
 /// requested.
 pub fn daemon_backend_selected() -> bool {
-    std::env::var("INFIGRAPH_BACKEND")
-        .map(|v| v == "daemon")
-        .unwrap_or(false)
+    selected_backend() == "daemon"
 }
 
 /// Opt-in toggle for handing a whole `index()`/`index_files()` job to the
@@ -304,7 +328,7 @@ impl Infigraph {
             return Ok(());
         }
 
-        let backend_env = std::env::var("INFIGRAPH_BACKEND").unwrap_or_else(|_| "kuzu".into());
+        let backend_env = selected_backend();
 
         match backend_env.as_str() {
             #[cfg(feature = "neo4j")]
@@ -491,7 +515,7 @@ impl Infigraph {
     /// - `neo4j`: connects to remote Neo4j sidecar (no local DB)
     /// - default: opens embedded Kùzu in read-only mode
     pub fn init_read_only(&mut self) -> Result<()> {
-        let backend_env = std::env::var("INFIGRAPH_BACKEND").unwrap_or_else(|_| "kuzu".into());
+        let backend_env = selected_backend();
 
         match backend_env.as_str() {
             #[cfg(feature = "neo4j")]
@@ -525,7 +549,7 @@ impl Infigraph {
     /// Neo4j has no local-graph crash-recovery concept, so it always
     /// returns `Ok(None)` there.
     pub fn init_read_only_or_degrade(&mut self) -> Result<Option<graph::DegradeReason>> {
-        let backend_env = std::env::var("INFIGRAPH_BACKEND").unwrap_or_else(|_| "kuzu".into());
+        let backend_env = selected_backend();
         match backend_env.as_str() {
             #[cfg(feature = "neo4j")]
             "neo4j" => {

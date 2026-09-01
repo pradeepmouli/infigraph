@@ -16,6 +16,7 @@ serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
+clap = { version = "4", features = ["derive"] }
 # lbug is a maintained fork of Kuzu (columnar embedded graph DB), published to crates.io.
 # Aliased as `kuzu` to match the upstream Kuzu API surface used throughout the codebase.
 kuzu = { package = "lbug", version = "= 0.19.1" }
@@ -79,7 +80,6 @@ features = ["postgres"]
 optional = true
 
 [dev-dependencies]
-clap = { version = "4", features = ["derive"] }
 tree-sitter-python = "0.25"
 tree-sitter-kotlin-ng = "1.1"
 tree-sitter-dart = "0.2"
