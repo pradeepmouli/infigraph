@@ -2453,6 +2453,7 @@ version = "3.2.16"
 dependencies = [
  "anyhow",
  "chrono",
+ "infigraph-core",
  "infigraph-docs",
  "regex",
  "serde",
