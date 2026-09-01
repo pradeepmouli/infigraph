@@ -291,6 +291,16 @@ pub trait GraphBackend: Send + Sync {
         Ok(0)
     }
 
+    /// Every distinct `Module.language` in the graph -- the same field a
+    /// full-reindex scan derives its detected-language list from, so the
+    /// daemon's staleness-triggered SCIP re-enrichment (R3.3.4a) asks for
+    /// the same indexers a post-reindex enrichment would. Unordered.
+    /// Default: empty (nothing to enrich), `KuzuBackend`-only override like
+    /// the generation counters above.
+    fn distinct_languages(&self) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+
     /// Create a Repo node and link all File nodes to it via BELONGS_TO.
     /// Sets `repo` property on File nodes for scoped queries.
     /// Default: no-op (only meaningful for Neo4j multi-repo graphs).

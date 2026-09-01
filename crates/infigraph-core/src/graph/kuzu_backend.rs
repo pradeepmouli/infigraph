@@ -516,6 +516,17 @@ impl GraphBackend for KuzuBackend {
         self.store.current_scip_generation()
     }
 
+    fn distinct_languages(&self) -> Result<Vec<String>> {
+        let conn = self.store.connection()?;
+        let rows =
+            GraphQuery::new(&conn).raw_query("MATCH (m:Module) RETURN DISTINCT m.language")?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|r| r.into_iter().next())
+            .filter(|l| !l.is_empty())
+            .collect())
+    }
+
     fn derive_tested_by_edges(&self, _changed_files: Option<&[&str]>) -> Result<usize> {
         self.store.derive_tested_by_edges()
     }

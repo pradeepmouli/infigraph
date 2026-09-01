@@ -111,6 +111,8 @@ Grouped by natural target settings-group (inferred from name/usage — the actua
 
 **`session`** — done (`crates/infigraph-mcp/src/session_context.rs`): `INFIGRAPH_COMPRESSION_LEVEL`, `INFIGRAPH_ML_COMPRESSION`, `INFIGRAPH_DEDUP`, `INFIGRAPH_TOKEN_BUDGET`, `INFIGRAPH_KOMPRESS_DIR` — all upstream-inherited, all shimmed (canonical `INFIGRAPH_SESSION_*`). Three of them have a `config.toml` layer between env and default that `resolve()` cannot express, so consumers read the CLI/env layer via `session_cli()` and fall through to config by hand (the `auto_start_watch_on_boot_enabled` pattern). `DEDUP` became a `Toggle` ("false" now off; previously only "0"). Correction: `INFIGRAPH_MODEL_DIR` is the embedding model dir, now its own **`embed`** group (`crates/infigraph-core/src/embed/mod.rs`, `embed_settings()`; inherited, shimmed; canonical `INFIGRAPH_EMBED_MODEL_DIR`).
 
+**`scip`** — new group (not a migration; added 2026-09-01 with R3.3.4a's automatic SCIP re-enrichment), declared in `crates/infigraph-core/src/daemon/mod.rs` next to the coordinator that reads it, `scip_settings()`: `INFIGRAPH_SCIP_INDEX_STALENESS_THRESHOLD` (u64, default 50 AST generations, 0 disables), `INFIGRAPH_SCIP_INDEX_STALENESS_CHECK_SECS` (u64, default 300). Fork-only, convention names from day one, no shims.
+
 **Ungrouped / likely stay as raw env reads** (build-time constants, debug toggles, or genuinely test-only — see Open Questions): `INFIGRAPH_BUILD_HASH` (compile-time `env!`, not runtime), `INFIGRAPH_DEBUG`, `INFIGRAPH_DRIVER_JAR`, `INFIGRAPH_SCAN_ROOTS`
 
 ## Migration approach

@@ -561,3 +561,15 @@ fn test_filter_dead_code_drops_vendored_paths() {
     );
     assert_eq!(filtered[0].name, "orphan");
 }
+
+#[test]
+fn test_backend_distinct_languages_lists_each_module_language_once() {
+    let (_dir, backend) = make_backend();
+    let mut files = fixture();
+    files[1].language = "rust".to_string();
+    backend.upsert_files_bulk(&files, true).expect("bulk");
+
+    let mut languages = backend.distinct_languages().expect("query");
+    languages.sort();
+    assert_eq!(languages, vec!["python".to_string(), "rust".to_string()]);
+}

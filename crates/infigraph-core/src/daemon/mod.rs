@@ -41,6 +41,75 @@ fn build_hash_check_interval() -> Duration {
         .unwrap_or(BUILD_HASH_CHECK_INTERVAL)
 }
 
+crate::settings! {
+    scip {
+        // R3.3.4a: how many AST generations SCIP enrichment may lag before
+        // the daemon re-runs it on its own. 0 disables the automatic
+        // trigger entirely (`infigraph index --full` still enriches).
+        index_staleness_threshold: u64 = 50,
+        // How often the coordinator compares the two counters -- the same
+        // coarse cadence as the build-hash self-check, and for the same
+        // reason: the check itself is cheap, what it can start is not.
+        index_staleness_check_secs: u64 = 300,
+    }
+}
+
+/// Resolved `scip` settings (env > TOML > default; no CLI surface today).
+/// `RawScip::default()` rather than a clap parse: nothing on this path
+/// takes command-line flags, and the daemon reads this once at startup.
+pub fn scip_settings() -> Scip {
+    Scip::resolve(RawScip::default(), None)
+}
+
+/// The pure decision behind R3.3.4a's automatic SCIP re-enrichment: is the
+/// graph's SCIP data stale enough to re-run the indexers *now*?
+///
+/// - `threshold == 0` disables the feature.
+/// - `scip_generation <= 0` means SCIP has never run on this graph
+///   (doctor's own R3.3.4 rule): a project that never opted into SCIP must
+///   not have the daemon start running external indexers for it.
+/// - `last_attempt_ast_generation` is the AST generation at which the
+///   daemon last *started* an enrichment. Until the graph moves past it,
+///   no retry -- otherwise a project whose indexers are missing or whose
+///   import keeps failing would re-run them every check interval forever,
+///   since a failed attempt never bumps `scip_generation`.
+pub(crate) fn scip_enrichment_due(
+    ast_generation: i64,
+    scip_generation: i64,
+    last_attempt_ast_generation: Option<i64>,
+    threshold: u64,
+) -> bool {
+    if threshold == 0 || scip_generation <= 0 {
+        return false;
+    }
+    if last_attempt_ast_generation.is_some_and(|last| ast_generation <= last) {
+        return false;
+    }
+    let threshold = i64::try_from(threshold).unwrap_or(i64::MAX);
+    ast_generation.saturating_sub(scip_generation) >= threshold
+}
+
+/// Starts SCIP enrichment as its own background task on `drain_rt`. The
+/// one code path behind both triggers -- a just-finished full reindex and
+/// the R3.3.4a staleness check -- so they can never drift apart.
+/// `Task::spawn_blocking` dispatches via the ambient
+/// `tokio::task::spawn_blocking`, which needs a runtime context on the
+/// coordinator's (plain OS) thread -- `drain_rt.enter()` scopes that
+/// context to just this call, matching `try_start_full_reindex`'s
+/// identical need.
+fn spawn_scip_enrich(
+    drain_rt: &tokio::runtime::Runtime,
+    daemon_token: &CancellationToken,
+    cb: Arc<FullReindexCallback>,
+    prism: Arc<Infigraph>,
+    languages: Vec<String>,
+) -> Task<()> {
+    let _guard = drain_rt.enter();
+    Task::spawn_blocking(daemon_token, "scip-enrich", move |token| {
+        cb(prism, languages, token);
+    })
+}
+
 /// Build hash of the binary at `binary`, as a fresh subprocess of it reports
 /// via the hidden `print-build-hash` subcommand: trimmed stdout, or `None` if
 /// the spawn failed or it exited non-zero. `None` means "couldn't check,"
@@ -259,6 +328,18 @@ where
     let build_hash_check_interval = build_hash_check_interval();
     let mut last_build_hash_check = std::time::Instant::now();
 
+    // R3.3.4a: automatic SCIP re-enrichment. Read once here, like the
+    // build-hash interval above -- a settings change takes a daemon
+    // restart, which is how every other daemon setting behaves.
+    let scip_settings = scip_settings();
+    let scip_staleness_threshold = scip_settings.index_staleness_threshold;
+    let scip_staleness_check_interval =
+        Duration::from_secs(scip_settings.index_staleness_check_secs);
+    let mut last_scip_staleness_check = std::time::Instant::now();
+    // The AST generation at which the last enrichment attempt (either
+    // trigger) started -- see `scip_enrichment_due` for why it gates retries.
+    let mut last_scip_attempt_ast_generation: Option<i64> = None;
+
     loop {
         if stop_rx.try_recv().is_ok() {
             eprintln!("[watch] stop channel signaled -- shutting down");
@@ -454,18 +535,20 @@ where
                 } else if let (Some(cb), Some(prism)) =
                     (on_full_reindex.clone(), held_prism.clone())
                 {
-                    // `Task::spawn_blocking` dispatches via the ambient
-                    // `tokio::task::spawn_blocking`, which needs a runtime
-                    // context on this (plain OS) thread -- `drain_rt.enter()`
-                    // scopes that context to just this call, matching
-                    // `try_start_full_reindex`'s identical need.
-                    let task = {
-                        let _guard = drain_rt.enter();
-                        Task::spawn_blocking(daemon_token, "scip-enrich", move |token| {
-                            cb(prism, languages, token);
-                        })
-                    };
-                    scip_in_flight = Some(task);
+                    // The swapped-in graph has fresh counters; the staleness
+                    // trigger's retry gate must not carry over from the old
+                    // one. `finish_full_reindex` only hands back languages on
+                    // a successful swap+reopen, so `prism` is the new graph.
+                    last_scip_attempt_ast_generation = prism
+                        .backend()
+                        .and_then(|b| b.current_ast_generation().ok());
+                    scip_in_flight = Some(spawn_scip_enrich(
+                        &drain_rt,
+                        daemon_token,
+                        cb,
+                        prism,
+                        languages,
+                    ));
                 }
             }
         }
@@ -477,6 +560,93 @@ where
             let task = scip_in_flight.take().expect("checked is_some just above");
             if let Err(join_err) = drain_rt.block_on(task.join()) {
                 eprintln!("[watch] scip-enrich task panicked: {join_err}");
+            }
+        }
+
+        // R3.3.4a: re-run SCIP enrichment on the daemon's own initiative once
+        // the graph's AST generation has drifted `scip_staleness_threshold`
+        // past its SCIP generation. Until this existed, enrichment only ever
+        // ran after a full reindex (the `periodic_secs` branch below is dead
+        // for every caller, and marks an AST rescan anyway, not SCIP). Rides
+        // its own coarse interval like the build-hash check: the comparison
+        // is two cheap reads, but what it can start (external indexer runs,
+        // a multi-minute import) is not. Only when nothing else is in
+        // flight and the queue is empty -- enrichment is heavy, and
+        // starting it into an edit storm just makes it stale again before
+        // it lands. Same guard set the post-full-reindex trigger has for
+        // `scip_in_flight` (never two enrichments against one connection).
+        if serve_requests
+            && on_full_reindex.is_some()
+            && scip_staleness_threshold > 0
+            && last_scip_staleness_check.elapsed() >= scip_staleness_check_interval
+        {
+            last_scip_staleness_check = std::time::Instant::now();
+            let idle = drain_in_flight.is_none()
+                && full_reindex_in_flight.is_none()
+                && scip_in_flight.is_none()
+                && scip_import_in_flight.is_none()
+                && queue.lock().unwrap().is_empty();
+            if idle && reopen_backoff.should_attempt() {
+                // `watch_db` rather than `held_prism` alone: a daemon that
+                // has served no writes yet holds nothing open, and the
+                // graph can be stale from before this process started.
+                match watch_db(root, &shared_registry, &mut held_prism) {
+                    Ok(prism) => {
+                        reopen_backoff.record_success();
+                        let due = prism.backend().and_then(|backend| {
+                            let ast = backend.current_ast_generation();
+                            let scip = backend.current_scip_generation();
+                            match (ast, scip) {
+                                (Ok(ast), Ok(scip)) => scip_enrichment_due(
+                                    ast,
+                                    scip,
+                                    last_scip_attempt_ast_generation,
+                                    scip_staleness_threshold,
+                                )
+                                .then(|| (ast, scip, backend.distinct_languages())),
+                                (Err(e), _) | (_, Err(e)) => {
+                                    eprintln!(
+                                        "[daemon] SCIP staleness check couldn't read the \
+                                         generation counters: {e}"
+                                    );
+                                    None
+                                }
+                            }
+                        });
+                        match due {
+                            Some((ast, scip, Ok(languages))) if !languages.is_empty() => {
+                                eprintln!(
+                                    "[daemon] SCIP enrichment is {} AST generations behind \
+                                     (threshold {}) -- re-enriching {}",
+                                    ast - scip,
+                                    scip_staleness_threshold,
+                                    languages.join(", ")
+                                );
+                                last_scip_attempt_ast_generation = Some(ast);
+                                let cb = on_full_reindex.clone().expect("checked is_some above");
+                                scip_in_flight = Some(spawn_scip_enrich(
+                                    &drain_rt,
+                                    daemon_token,
+                                    cb,
+                                    prism,
+                                    languages,
+                                ));
+                            }
+                            // An empty graph has nothing to enrich; leave the
+                            // retry gate alone so a later populated graph gets
+                            // its chance.
+                            Some((_, _, Ok(_))) => {}
+                            Some((_, _, Err(e))) => {
+                                eprintln!(
+                                    "[daemon] SCIP staleness check couldn't list the graph's \
+                                     languages: {e}"
+                                );
+                            }
+                            None => {}
+                        }
+                    }
+                    Err(e) => log_reopen_failure("watch", &mut reopen_backoff, &e),
+                }
             }
         }
 
@@ -2318,5 +2488,42 @@ mod tests {
             matches!(reply, crate::daemon_protocol::WriteResult::ScipImportOk(_)),
             "expected WriteResult::ScipImportOk, got {reply:?}"
         );
+    }
+
+    // --- SCIP staleness auto-re-enrichment: the pure decision ---
+
+    #[test]
+    fn scip_enrichment_due_when_gap_reaches_threshold() {
+        assert!(scip_enrichment_due(60, 10, None, 50));
+        assert!(!scip_enrichment_due(59, 10, None, 50), "gap 49 < 50");
+    }
+
+    #[test]
+    fn scip_enrichment_never_due_when_threshold_is_zero() {
+        assert!(!scip_enrichment_due(1_000, 1, None, 0));
+    }
+
+    #[test]
+    fn scip_enrichment_never_due_for_a_never_enriched_graph() {
+        // scip_generation == 0 means SCIP has never run here (doctor's
+        // R3.3.4 rule) -- the daemon must not start running external
+        // indexers on a project that never opted into them.
+        assert!(!scip_enrichment_due(1_000, 0, None, 50));
+    }
+
+    #[test]
+    fn scip_enrichment_not_retried_until_the_graph_moves_past_the_last_attempt() {
+        // An attempt was already made at ast_generation 60 and SCIP did not
+        // catch up (indexers missing, import failed). Same generation: no
+        // retry. One more write: retry.
+        assert!(!scip_enrichment_due(60, 10, Some(60), 50));
+        assert!(scip_enrichment_due(61, 10, Some(60), 50));
+    }
+
+    #[test]
+    fn scip_settings_defaults() {
+        let s = scip_settings();
+        assert_eq!(s.index_staleness_threshold, 50);
+        assert_eq!(s.index_staleness_check_secs, 300);
     }
 }
