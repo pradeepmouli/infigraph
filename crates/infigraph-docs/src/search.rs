@@ -204,7 +204,7 @@ pub fn hybrid_doc_search(
     alpha: f32,
 ) -> Result<Vec<DocSearchResult>> {
     #[cfg(feature = "remote")]
-    if is_remote_mode() {
+    if infigraph_core::daemon::lifecycle::is_remote_backend() {
         return hybrid_doc_search_remote(query, store, limit, alpha);
     }
     hybrid_doc_search_in_dir(query, store, &root.join(".infigraph"), limit, alpha)
@@ -388,13 +388,6 @@ fn tokenize(text: &str) -> Vec<String> {
         .filter(|s| s.len() > 1)
         .map(String::from)
         .collect()
-}
-
-#[cfg(feature = "remote")]
-fn is_remote_mode() -> bool {
-    std::env::var("INFIGRAPH_BACKEND")
-        .map(|v| v == "neo4j")
-        .unwrap_or(false)
 }
 
 #[cfg(feature = "remote")]

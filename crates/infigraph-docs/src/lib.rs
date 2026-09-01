@@ -24,12 +24,6 @@ use store::DocStore;
 
 pub mod links;
 
-fn is_remote_mode() -> bool {
-    std::env::var("INFIGRAPH_BACKEND")
-        .map(|v| v == "neo4j")
-        .unwrap_or(false)
-}
-
 pub struct DocIndex {
     root: PathBuf,
     db_path: PathBuf,
@@ -54,7 +48,7 @@ pub struct DocIndexResult {
 impl DocIndex {
     pub fn open(root: &Path) -> Result<Self> {
         let tg_dir = root.join(".infigraph");
-        if !is_remote_mode() {
+        if !infigraph_core::daemon::lifecycle::is_remote_backend() {
             std::fs::create_dir_all(&tg_dir)?;
         }
         let db_path = tg_dir.join("docs.kuzu");
@@ -75,7 +69,7 @@ impl DocIndex {
 
     pub fn init(&mut self) -> Result<()> {
         #[cfg(feature = "remote")]
-        if is_remote_mode() {
+        if infigraph_core::daemon::lifecycle::is_remote_backend() {
             let neo = neo4j_store::Neo4jDocStore::connect_from_env()?;
             neo.init_schema()?;
             self.store = Some(Box::new(neo));
@@ -231,7 +225,7 @@ impl DocIndex {
             let all_chunks: Vec<&Chunk> = results.iter().flat_map(|(_, c)| c.iter()).collect();
             let changed_files: Vec<&str> = results.iter().map(|(d, _)| d.file.as_str()).collect();
             #[cfg(feature = "remote")]
-            if is_remote_mode() {
+            if infigraph_core::daemon::lifecycle::is_remote_backend() {
                 if let Ok(pg) = infigraph_core::meta::PostgresMetaStore::connect_from_env_cached() {
                     embed::update_doc_embeddings_remote(store, &pg, &all_chunks, &changed_files)?;
                 } else {
