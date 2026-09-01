@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
 
+use clap::Parser;
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -312,14 +313,25 @@ pub fn get_ml_compression_mode() -> String {
 /// Whether the MCP server should proactively start watching every
 /// already-registered project on boot (daemon mode only), rather than only
 /// ever starting a watcher reactively after some write happens to touch
-/// that project. Priority: env var, then config.toml
-/// `[watch].auto_start_on_boot`, then the hardcoded default (on). Reads the
-/// config file fresh rather than going through the session-cached
-/// `SESSION` static, since this must be callable from `main.rs::run()` at
-/// raw process startup, before any per-session context exists.
+/// that project. Priority: env var (`INFIGRAPH_WATCH_AUTO_START`), then
+/// config.toml `[watch].auto_start_on_boot`, then the hardcoded default
+/// (on). Reads the config file fresh rather than going through the
+/// session-cached `SESSION` static, since this must be callable from
+/// `main.rs::run()` at raw process startup, before any per-session context
+/// exists.
+///
+/// Deliberately does NOT go through `watch::Watch::resolve()`'s own
+/// hardcoded default: that would skip the `config.toml` layer entirely
+/// (`resolve()` only knows CLI > env > compile-time default, with no room
+/// for an externally-loaded fallback in between). Reads the CLI/env layer
+/// directly instead, falling through to `load_config_file()` by hand.
 pub fn auto_start_watch_on_boot_enabled() -> bool {
-    if let Ok(v) = std::env::var("INFIGRAPH_AUTO_START_WATCH") {
-        return v != "0" && v.to_lowercase() != "false";
+    let cli = infigraph_core::watch::RawWatch::parse_from(std::iter::empty::<String>());
+    if let Some(v) = cli
+        .watch_auto_start
+        .or_else(|| infigraph_core::settings::env_override("watch", "auto_start"))
+    {
+        return v.0;
     }
     load_config_file().watch.auto_start_on_boot
 }
