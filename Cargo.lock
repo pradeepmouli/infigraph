@@ -2517,6 +2517,7 @@ dependencies = [
  "arrow",
  "calamine",
  "chrono",
+ "clap",
  "fs2",
  "infigraph-core",
  "lbug",
