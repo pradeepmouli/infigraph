@@ -34,6 +34,31 @@ impl FromTomlItem for String {
     }
 }
 
+/// A settings-group boolean field with permissive truthy parsing: anything
+/// except a literal "0" or case-insensitive "false" is true. Stricter
+/// stdlib `bool::from_str` (only "true"/"false") would silently break the
+/// "1"-means-on convention several existing `INFIGRAPH_*` toggles use.
+///
+/// Derives `serde::Deserialize` because the macro's generated `RawXxx`
+/// struct derives it too (for every field's `Option<$ty>`), even though
+/// `resolve()` doesn't actually exercise that path today -- the derive
+/// bound still has to be satisfied for `RawXxx` to compile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
+pub struct Toggle(pub bool);
+
+impl std::str::FromStr for Toggle {
+    type Err = std::convert::Infallible;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Toggle(s != "0" && s.to_lowercase() != "false"))
+    }
+}
+
+impl FromTomlItem for Toggle {
+    fn from_toml_item(item: &toml_edit::Item) -> Option<Self> {
+        item.as_bool().map(Toggle)
+    }
+}
+
 /// Declares a settings group. `$category` (a single, possibly-underscored
 /// identifier, e.g. `mcp_idle`) names the group for env var names
 /// (`INFIGRAPH_{CATEGORY}_{FIELD}`), category-qualified CLI flags (via
@@ -103,6 +128,7 @@ macro_rules! settings {
 
 #[cfg(test)]
 mod tests {
+    use super::Toggle;
     use clap::Parser;
     use std::sync::Mutex;
 
@@ -209,5 +235,43 @@ mod tests {
         let toml_item = doc.as_item();
         let cli = RawToyStr::parse_from(["test"]);
         assert_eq!(ToyStr::resolve(cli, Some(toml_item)).name, "from-toml");
+    }
+
+    crate::settings! {
+        toy_toggle {
+            flag: Toggle = Toggle(true),
+        }
+    }
+
+    #[test]
+    fn toggle_field_uses_permissive_truthy_parsing() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("INFIGRAPH_TOY_TOGGLE_FLAG", "1");
+        let cli = RawToyToggle::parse_from(["test"]);
+        assert!(
+            ToyToggle::resolve(cli, None).flag.0,
+            "\"1\" must be treated as true"
+        );
+
+        std::env::set_var("INFIGRAPH_TOY_TOGGLE_FLAG", "0");
+        let cli = RawToyToggle::parse_from(["test"]);
+        assert!(
+            !ToyToggle::resolve(cli, None).flag.0,
+            "\"0\" must be treated as false"
+        );
+
+        std::env::set_var("INFIGRAPH_TOY_TOGGLE_FLAG", "false");
+        let cli = RawToyToggle::parse_from(["test"]);
+        assert!(
+            !ToyToggle::resolve(cli, None).flag.0,
+            "\"false\" (any case) must be treated as false"
+        );
+
+        std::env::remove_var("INFIGRAPH_TOY_TOGGLE_FLAG");
+        let cli = RawToyToggle::parse_from(["test"]);
+        assert!(
+            ToyToggle::resolve(cli, None).flag.0,
+            "unset must fall through to the hardcoded default (true)"
+        );
     }
 }
