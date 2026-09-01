@@ -12,6 +12,7 @@ description = "Document indexing and search for Infigraph — PDF, DOCX, PPTX, X
 
 [dependencies]
 infigraph-core = { path = "../infigraph-core" }
+clap = { version = "4", features = ["derive"] }
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true

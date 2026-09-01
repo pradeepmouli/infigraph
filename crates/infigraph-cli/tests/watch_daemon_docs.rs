@@ -98,7 +98,7 @@ fn cmd_watch_daemon_also_indexes_docs_without_restart() {
             .arg("50")
             // Fast daemon attach-poll so this test doesn't wait through the
             // production default (1000ms) to notice docs.kuzu appearing.
-            .env("INFIGRAPH_DOC_DAEMON_POLL_MS", "50")
+            .env("INFIGRAPH_WATCH_DOC_DAEMON_POLL_MS", "50")
             .current_dir(&root)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -525,7 +525,7 @@ fn watch_docs_start_resumes_after_a_sentinel_triggered_stop() {
             .arg("daemon")
             .arg("--debounce")
             .arg("50")
-            .env("INFIGRAPH_DOC_DAEMON_POLL_MS", "50")
+            .env("INFIGRAPH_WATCH_DOC_DAEMON_POLL_MS", "50")
             .current_dir(&root)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())

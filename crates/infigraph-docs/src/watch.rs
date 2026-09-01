@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use clap::Parser;
 use notify::{Config, RecursiveMode, Watcher};
 
 use crate::{is_document_file, DocIndex};
@@ -105,13 +106,10 @@ pub fn watch_docs(
 /// How often the daemon loop polls for `.infigraph/docs.kuzu`'s existence
 /// and the per-handler stop sentinel while deciding whether to attach or
 /// detach a `watch_docs` session. Overridable via
-/// `INFIGRAPH_DOC_DAEMON_POLL_MS` so tests don't wait through a real 1s tick.
+/// `INFIGRAPH_WATCH_DOC_DAEMON_POLL_MS` so tests don't wait through a real 1s tick.
 fn attach_poll_interval() -> Duration {
-    std::env::var("INFIGRAPH_DOC_DAEMON_POLL_MS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .map(Duration::from_millis)
-        .unwrap_or(Duration::from_millis(1000))
+    let cli = infigraph_core::watch::RawWatch::parse_from(std::iter::empty::<String>());
+    Duration::from_millis(infigraph_core::watch::Watch::resolve(cli, None).doc_daemon_poll_ms)
 }
 
 /// Drive doc-watching for `root` as part of a merged code+doc watch daemon
@@ -263,11 +261,19 @@ mod tests {
     use std::time::Duration;
 
     fn set_fast_poll() {
-        std::env::set_var("INFIGRAPH_DOC_DAEMON_POLL_MS", "20");
+        std::env::set_var("INFIGRAPH_WATCH_DOC_DAEMON_POLL_MS", "20");
     }
 
     fn clear_fast_poll() {
-        std::env::remove_var("INFIGRAPH_DOC_DAEMON_POLL_MS");
+        std::env::remove_var("INFIGRAPH_WATCH_DOC_DAEMON_POLL_MS");
+    }
+
+    #[test]
+    fn attach_poll_interval_reads_renamed_env_var() {
+        std::env::set_var("INFIGRAPH_WATCH_DOC_DAEMON_POLL_MS", "77");
+        assert_eq!(attach_poll_interval().as_millis(), 77);
+        std::env::remove_var("INFIGRAPH_WATCH_DOC_DAEMON_POLL_MS");
+        assert_eq!(attach_poll_interval().as_millis(), 1000);
     }
 
     /// `DocIndex` has no `chunk_count()` accessor; the real path is
