@@ -329,7 +329,7 @@ mod tests {
     fn isolated_instances_dir(tmp: &tempfile::TempDir) -> PathBuf {
         let dir = tmp.path().join("instances");
         std::fs::create_dir_all(&dir).unwrap();
-        std::env::set_var("INFIGRAPH_INSTANCES_DIR", &dir);
+        std::env::set_var("INFIGRAPH_REGISTRY_INSTANCES_DIR", &dir);
         dir
     }
 
@@ -433,7 +433,7 @@ mod pid_reuse_tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("instances");
         std::fs::create_dir_all(&dir).unwrap();
-        std::env::set_var("INFIGRAPH_INSTANCES_DIR", &dir);
+        std::env::set_var("INFIGRAPH_REGISTRY_INSTANCES_DIR", &dir);
         let project = tmp.path().join("proj");
         let ig = project.join(".infigraph");
         std::fs::create_dir_all(&ig).unwrap();

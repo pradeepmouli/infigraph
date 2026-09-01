@@ -321,9 +321,9 @@ pub fn build_combined_docs(registry: &Registry, group_name: &str) -> Result<Comb
 /// `INFIGRAPH_BACKEND`.
 fn combined_hnsw_threshold() -> usize {
     let cli = infigraph_core::graph::RawGraph {
-        graph_doc_hnsw_threshold: std::env::var("INFIGRAPH_DOC_HNSW_THRESHOLD")
-            .ok()
-            .and_then(|v| v.parse().ok()),
+        graph_doc_hnsw_threshold: infigraph_core::settings::legacy_env(
+            "INFIGRAPH_DOC_HNSW_THRESHOLD",
+        ),
         ..Default::default()
     };
     infigraph_core::graph::Graph::resolve(cli, None).doc_hnsw_threshold as usize

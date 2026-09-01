@@ -44,10 +44,37 @@ fn now_epoch_secs() -> u64 {
         .unwrap_or(0)
 }
 
+// Registry/instance plumbing. Declared here rather than in `multi` (where
+// `registry_path` lives) because `multi::Registry` -- the registry data
+// type -- would collide with the `Registry` struct this generates.
+// - home: INFIGRAPH_REGISTRY_HOME (fits the convention); empty = $HOME
+// - instances_dir: INFIGRAPH_REGISTRY_INSTANCES_DIR (renamed from the
+//   fork-only INFIGRAPH_INSTANCES_DIR); empty = $HOME/.infigraph/instances
+// - org: INFIGRAPH_ORG (upstream-inherited, seeded from the legacy name;
+//   canonical INFIGRAPH_REGISTRY_ORG also works, legacy wins); empty = no
+//   org scoping
+crate::settings! {
+    registry {
+        home: String = String::new(),
+        instances_dir: String = String::new(),
+        org: String = String::new(),
+    }
+}
+
+/// Resolves the `registry` group -- see the group's declaration above.
+pub fn registry_settings() -> Registry {
+    let cli = RawRegistry {
+        registry_org: crate::settings::legacy_env("INFIGRAPH_ORG"),
+        ..Default::default()
+    };
+    Registry::resolve(cli, None)
+}
+
 /// Directory holding one JSON file per live-or-recently-live instance.
-/// Overridable via `INFIGRAPH_INSTANCES_DIR` (tests).
+/// Overridable via `INFIGRAPH_REGISTRY_INSTANCES_DIR` (tests).
 pub fn instances_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("INFIGRAPH_INSTANCES_DIR") {
+    let dir = registry_settings().instances_dir;
+    if !dir.is_empty() {
         return PathBuf::from(dir);
     }
     std::env::var("HOME")

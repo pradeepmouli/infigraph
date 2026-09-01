@@ -3,7 +3,7 @@ use infigraph_core::instances::{
     register_instance, InstanceInfo,
 };
 
-/// Serializes tests that mutate the process-global INFIGRAPH_INSTANCES_DIR
+/// Serializes tests that mutate the process-global INFIGRAPH_REGISTRY_INSTANCES_DIR
 /// env var — cargo runs this binary's tests on parallel threads, so one
 /// test's override must not leak into another's window (same lesson as the
 /// IDLE_ENV mutex in the R2.2.3 idle-self-termination test suite).
@@ -36,7 +36,7 @@ fn current_process_start_time_finds_self() {
 fn register_and_list_round_trip() {
     let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempfile::tempdir().expect("tempdir");
-    std::env::set_var("INFIGRAPH_INSTANCES_DIR", dir.path());
+    std::env::set_var("INFIGRAPH_REGISTRY_INSTANCES_DIR", dir.path());
 
     assert_eq!(instances_dir(), dir.path());
 
@@ -53,7 +53,7 @@ fn register_and_list_round_trip() {
         "dropping the guard must remove the instance file (clean-shutdown path)"
     );
 
-    std::env::remove_var("INFIGRAPH_INSTANCES_DIR");
+    std::env::remove_var("INFIGRAPH_REGISTRY_INSTANCES_DIR");
 }
 
 use infigraph_core::instances::{classify_instances, InstanceStatus};
@@ -107,7 +107,7 @@ fn classify_instances_distinguishes_live_dead_and_reused() {
 fn list_instances_skips_unparseable_entries() {
     let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempfile::tempdir().expect("tempdir");
-    std::env::set_var("INFIGRAPH_INSTANCES_DIR", dir.path());
+    std::env::set_var("INFIGRAPH_REGISTRY_INSTANCES_DIR", dir.path());
 
     std::fs::write(dir.path().join("99999999.json"), b"not valid json").unwrap();
     let info = InstanceInfo::current("/tmp/some-project", "stdio");
@@ -121,7 +121,7 @@ fn list_instances_skips_unparseable_entries() {
     );
     assert_eq!(listed[0].1, info);
 
-    std::env::remove_var("INFIGRAPH_INSTANCES_DIR");
+    std::env::remove_var("INFIGRAPH_REGISTRY_INSTANCES_DIR");
 }
 
 /// Regression test for a Critical bug: `reap_orphan` used to send real
@@ -140,7 +140,7 @@ fn list_instances_skips_unparseable_entries() {
 fn reap_orphan_never_kills_a_pid_reused_process() {
     let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempfile::tempdir().expect("tempdir");
-    std::env::set_var("INFIGRAPH_INSTANCES_DIR", dir.path());
+    std::env::set_var("INFIGRAPH_REGISTRY_INSTANCES_DIR", dir.path());
 
     let mut child = std::process::Command::new("sleep")
         .arg("30")
@@ -182,5 +182,5 @@ fn reap_orphan_never_kills_a_pid_reused_process() {
 
     child.kill().expect("kill spawned child");
     child.wait().expect("wait for spawned child");
-    std::env::remove_var("INFIGRAPH_INSTANCES_DIR");
+    std::env::remove_var("INFIGRAPH_REGISTRY_INSTANCES_DIR");
 }

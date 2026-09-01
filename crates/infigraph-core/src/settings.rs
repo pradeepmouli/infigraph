@@ -14,6 +14,17 @@ pub fn env_override<T: std::str::FromStr>(category: &str, field: &str) -> Option
     std::env::var(key).ok().and_then(|v| v.parse().ok())
 }
 
+/// Reads a pre-macro env var by its legacy, non-convention name (e.g.
+/// `INFIGRAPH_ORG`) for seeding into a settings group's CLI slot before
+/// `resolve()`. The CLI slot outranks the macro's own env/TOML/default
+/// layers, so the legacy name keeps winning without a second lookup
+/// mechanism -- see `selected_backend()` for the precedent. Only for names
+/// that exist upstream (they must keep working unchanged); fork-only names
+/// are renamed to the convention instead.
+pub fn legacy_env<T: std::str::FromStr>(name: &str) -> Option<T> {
+    std::env::var(name).ok().and_then(|v| v.parse().ok())
+}
+
 /// Reads a single field out of a `toml_edit` section by name. Implemented
 /// per concrete type actually used by a settings group -- add an impl the
 /// first time a group needs a new field type, rather than speculatively

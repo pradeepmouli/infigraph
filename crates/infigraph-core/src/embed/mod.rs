@@ -81,6 +81,24 @@ pub fn read_generation_marker(sidecar_path: &Path) -> Option<i64> {
     Some(i64::from_le_bytes(arr))
 }
 
+// `INFIGRAPH_MODEL_DIR` predates the macro and exists upstream, so
+// `embed_settings` seeds it from the legacy name; the canonical
+// `INFIGRAPH_EMBED_MODEL_DIR` also works, legacy wins. Empty means "unset"
+// -- `find_model_dir` falls through to the installed/repo model dirs.
+crate::settings! {
+    embed {
+        model_dir: String = String::new(),
+    }
+}
+
+/// Resolves the `embed` group -- see the group's declaration above.
+pub fn embed_settings() -> Embed {
+    let cli = RawEmbed {
+        embed_model_dir: crate::settings::legacy_env("INFIGRAPH_MODEL_DIR"),
+    };
+    Embed::resolve(cli, None)
+}
+
 struct CachedEmbeddings {
     path: PathBuf,
     modified: std::time::SystemTime,
@@ -334,9 +352,11 @@ impl Model2VecEmbedder {
     }
 
     fn find_model_dir() -> Result<std::path::PathBuf> {
-        // 1. Check env var override
-        if let Ok(p) = std::env::var("INFIGRAPH_MODEL_DIR") {
-            let pb = std::path::PathBuf::from(p);
+        // 1. Check the settings override (legacy INFIGRAPH_MODEL_DIR /
+        //    canonical INFIGRAPH_EMBED_MODEL_DIR)
+        let override_dir = embed_settings().model_dir;
+        if !override_dir.is_empty() {
+            let pb = std::path::PathBuf::from(override_dir);
             if pb.exists() {
                 return Ok(pb);
             }

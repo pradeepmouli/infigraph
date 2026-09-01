@@ -973,7 +973,7 @@ fn format_report_uses_plain_glyphs_by_color_flag() {
     assert!(colored.contains("1 PASS, 1 WARN, 1 FAIL"));
 }
 
-/// Serializes tests that mutate `INFIGRAPH_INSTANCES_DIR` (process-global),
+/// Serializes tests that mutate `INFIGRAPH_REGISTRY_INSTANCES_DIR` (process-global),
 /// mirroring the `ENV_LOCK` convention used by other integration test
 /// binaries in this workspace (e.g. `startup_watch.rs`) -- not reusable
 /// across files since each `tests/*.rs` compiles to its own crate.
@@ -1014,12 +1014,12 @@ fn check_watchers_warns_when_alive_watcher_has_no_live_mcp_instance() {
 
     let instances_dir = dir.path().join("instances");
     std::fs::create_dir_all(&instances_dir).unwrap();
-    std::env::set_var("INFIGRAPH_INSTANCES_DIR", &instances_dir);
+    std::env::set_var("INFIGRAPH_REGISTRY_INSTANCES_DIR", &instances_dir);
 
     let ctx = ctx_for(DoctorScope::Project(project.clone()), Registry::default());
     let results = check_watchers(&ctx);
 
-    std::env::remove_var("INFIGRAPH_INSTANCES_DIR");
+    std::env::remove_var("INFIGRAPH_REGISTRY_INSTANCES_DIR");
 
     let watcher = results
         .iter()
@@ -1057,7 +1057,7 @@ fn check_watchers_passes_when_alive_watcher_has_a_live_mcp_instance() {
 
     let instances_dir = dir.path().join("instances");
     std::fs::create_dir_all(&instances_dir).unwrap();
-    std::env::set_var("INFIGRAPH_INSTANCES_DIR", &instances_dir);
+    std::env::set_var("INFIGRAPH_REGISTRY_INSTANCES_DIR", &instances_dir);
 
     // A live "MCP instance" for this project -- this test process itself
     // stands in for one, since the check only needs a PID/start-time that's
@@ -1073,7 +1073,7 @@ fn check_watchers_passes_when_alive_watcher_has_a_live_mcp_instance() {
     let ctx = ctx_for(DoctorScope::Project(project.clone()), Registry::default());
     let results = check_watchers(&ctx);
 
-    std::env::remove_var("INFIGRAPH_INSTANCES_DIR");
+    std::env::remove_var("INFIGRAPH_REGISTRY_INSTANCES_DIR");
 
     let watcher = results
         .iter()

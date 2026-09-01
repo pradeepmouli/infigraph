@@ -245,6 +245,33 @@ pub fn daemon_backend_selected() -> bool {
     selected_backend() == "daemon"
 }
 
+// Self-update / install plumbing (`infigraph install`, `infigraph update`,
+// the MCP webhook's exec path). `dir` empty means "unset" -- callers fall
+// back to `~/.local/bin`. `INFIGRAPH_INSTALL_DIR` already fits the
+// convention; the other three predate the macro and exist upstream (and in
+// install.sh/release.sh), so `install_settings` seeds them from their
+// legacy names. Canonical `INFIGRAPH_INSTALL_{BIN,GH_HOST,GH_OWNER}` also
+// work; legacy wins.
+crate::settings! {
+    install {
+        dir: String = String::new(),
+        bin: String = "/app/infigraph".to_string(),
+        gh_host: String = "github.com".to_string(),
+        gh_owner: String = "intuit".to_string(),
+    }
+}
+
+/// Resolves the `install` group -- see the group's declaration above.
+pub fn install_settings() -> Install {
+    let cli = RawInstall {
+        install_bin: settings::legacy_env("INFIGRAPH_BIN"),
+        install_gh_host: settings::legacy_env("INFIGRAPH_GH_HOST"),
+        install_gh_owner: settings::legacy_env("INFIGRAPH_GH_OWNER"),
+        ..Default::default()
+    };
+    Install::resolve(cli, None)
+}
+
 /// Opt-in toggle for handing a whole `index()`/`index_files()` job to the
 /// daemon as a single `WriteRequest::Index`, instead of the default (parse
 /// locally, let the individual graph writes route themselves through the

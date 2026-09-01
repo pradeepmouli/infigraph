@@ -1524,8 +1524,8 @@ mod kompress {
     }
 
     fn model_dir() -> PathBuf {
-        if let Ok(p) = std::env::var("INFIGRAPH_KOMPRESS_DIR") {
-            return PathBuf::from(p);
+        if let Some(p) = crate::session_context::kompress_dir_override() {
+            return p;
         }
         let home = std::env::var("HOME")
             .or_else(|_| std::env::var("USERPROFILE"))

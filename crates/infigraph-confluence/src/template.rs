@@ -428,10 +428,9 @@ fn build_extraction_prompt(content: &str, title: &str, missing_fields: &[&str]) 
 
 fn call_claude_extract(prompt: &str) -> Option<Value> {
     let api_key = std::env::var("ANTHROPIC_API_KEY").ok()?;
-    let model = std::env::var("INFIGRAPH_LLM_MODEL")
-        .unwrap_or_else(|_| "claude-sonnet-4-20250514".to_string());
-    let base_url = std::env::var("INFIGRAPH_LLM_BASE_URL")
-        .unwrap_or_else(|_| "https://api.anthropic.com".to_string());
+    let llm = infigraph_core::review::llm::llm_settings();
+    let model = llm.model;
+    let base_url = llm.base_url;
 
     let body = serde_json::json!({
         "model": model,
@@ -466,7 +465,7 @@ fn call_claude_extract(prompt: &str) -> Option<Value> {
 }
 
 pub fn fill_with_llm(record: &mut PipelineRecord, content: &str, title: &str) -> usize {
-    if std::env::var("INFIGRAPH_LLM_EXTRACT").is_err() {
+    if !infigraph_core::review::llm::llm_settings().extract.0 {
         return 0;
     }
 

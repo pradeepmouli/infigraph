@@ -9,6 +9,47 @@ use serde_json::Value;
 const DEFAULT_STALENESS_WINDOW: usize = 6;
 const DEFAULT_TOKEN_BUDGET: usize = 150_000;
 
+// Session/compression tunables. All five predate the macro and exist
+// upstream, so each is read by its legacy name (then the canonical
+// `INFIGRAPH_SESSION_*` name) via `session_cli`; legacy wins. Three of them
+// (ml_compression, dedup, token_budget) have a config.toml layer between
+// env and the default, which `resolve()` cannot express -- so every
+// consumer reads the CLI/env layer from `session_cli()` and falls through
+// to config by hand (the `auto_start_watch_on_boot_enabled` pattern). The
+// defaults declared here document the effective defaults.
+infigraph_core::settings! {
+    session {
+        compression_level: String = String::new(),
+        ml_compression: String = "extractive".to_string(),
+        dedup: infigraph_core::settings::Toggle = infigraph_core::settings::Toggle(true),
+        token_budget: u64 = DEFAULT_TOKEN_BUDGET as u64,
+        kompress_dir: String = String::new(),
+    }
+}
+
+/// The `session` group's CLI/env layer only -- `None` means "not set at
+/// this layer", so callers can consult config.toml next.
+fn session_cli() -> RawSession {
+    use infigraph_core::settings::{env_override, legacy_env};
+    RawSession {
+        session_compression_level: legacy_env("INFIGRAPH_COMPRESSION_LEVEL")
+            .or_else(|| env_override("session", "compression_level")),
+        session_ml_compression: legacy_env("INFIGRAPH_ML_COMPRESSION")
+            .or_else(|| env_override("session", "ml_compression")),
+        session_dedup: legacy_env("INFIGRAPH_DEDUP").or_else(|| env_override("session", "dedup")),
+        session_token_budget: legacy_env("INFIGRAPH_TOKEN_BUDGET")
+            .or_else(|| env_override("session", "token_budget")),
+        session_kompress_dir: legacy_env("INFIGRAPH_KOMPRESS_DIR")
+            .or_else(|| env_override("session", "kompress_dir")),
+    }
+}
+
+/// `INFIGRAPH_KOMPRESS_DIR` / `INFIGRAPH_SESSION_KOMPRESS_DIR` override for
+/// the kompress model directory; `None` when unset.
+pub fn kompress_dir_override() -> Option<PathBuf> {
+    session_cli().session_kompress_dir.map(PathBuf::from)
+}
+
 static SESSION: Mutex<Option<SessionContext>> = Mutex::new(None);
 
 #[cfg(test)]
@@ -197,9 +238,9 @@ struct SessionContext {
 impl SessionContext {
     fn new() -> Self {
         let cfg = load_config();
-        let budget = std::env::var("INFIGRAPH_TOKEN_BUDGET")
-            .ok()
-            .and_then(|v| v.parse().ok())
+        let budget = session_cli()
+            .session_token_budget
+            .map(|b| b as usize)
             .or(cfg.token_budget)
             .unwrap_or(DEFAULT_TOKEN_BUDGET);
         let staleness = cfg.staleness_window.unwrap_or(DEFAULT_STALENESS_WINDOW);
@@ -299,7 +340,7 @@ fn parse_level_str(s: &str) -> Option<CompressionLevel> {
 /// Get ML compression mode: "off", "extractive" (default), or "kompress".
 /// Priority: env var INFIGRAPH_ML_COMPRESSION > config.toml > "extractive".
 pub fn get_ml_compression_mode() -> String {
-    if let Ok(v) = std::env::var("INFIGRAPH_ML_COMPRESSION") {
+    if let Some(v) = session_cli().session_ml_compression {
         return v.to_lowercase();
     }
     let guard = SESSION.lock().unwrap_or_else(|e| e.into_inner());
@@ -337,8 +378,8 @@ pub fn auto_start_watch_on_boot_enabled() -> bool {
 }
 
 fn parse_level_override() -> Option<CompressionLevel> {
-    std::env::var("INFIGRAPH_COMPRESSION_LEVEL")
-        .ok()
+    session_cli()
+        .session_compression_level
         .and_then(|v| parse_level_str(&v))
 }
 
@@ -363,7 +404,7 @@ pub fn apply_seen_dedup(compressed: &str, tool_name: &str, args: &Value) -> Stri
         return compressed.to_string();
     }
 
-    let env_dedup = std::env::var("INFIGRAPH_DEDUP").ok().map(|v| v != "0");
+    let env_dedup = session_cli().session_dedup.map(|t| t.0);
     let config_dedup = {
         let guard = SESSION.lock().unwrap_or_else(|e| e.into_inner());
         guard

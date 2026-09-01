@@ -79,7 +79,7 @@ fn decide_webhook(body: &str, signature: Option<&str>, reindexing: bool) -> Webh
 
     let clone_dir = std::env::var("CLONE_DIR").unwrap_or_else(|_| "/app/data/repos".to_string());
     let group = std::env::var("GROUP_NAME").unwrap_or_else(|_| "org".to_string());
-    let bin = std::env::var("INFIGRAPH_BIN").unwrap_or_else(|_| "/app/infigraph".to_string());
+    let bin = infigraph_core::install_settings().bin;
 
     WebhookDecision::Accepted {
         repo: repo_name,
@@ -270,8 +270,24 @@ fn handle_mcp_post(
     serve_json(response)
 }
 
+// HTTP-transport bearer auth. `INFIGRAPH_API_KEY` predates the macro and
+// exists upstream, so `api_key` seeds it from the legacy name; the canonical
+// `INFIGRAPH_WEB_API_KEY` also works, legacy wins. Empty disables auth.
+infigraph_core::settings! {
+    web {
+        api_key: String = String::new(),
+    }
+}
+
+fn api_key() -> Option<String> {
+    let cli = RawWeb {
+        web_api_key: infigraph_core::settings::legacy_env("INFIGRAPH_API_KEY"),
+    };
+    Some(Web::resolve(cli, None).api_key).filter(|k| !k.is_empty())
+}
+
 fn check_auth(request: &tiny_http::Request) -> bool {
-    let key = std::env::var("INFIGRAPH_API_KEY").ok();
+    let key = api_key();
     match key {
         None => true,
         Some(k) => request.headers().iter().any(|h| {

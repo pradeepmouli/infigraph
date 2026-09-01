@@ -267,22 +267,33 @@ impl Default for LlmConfig {
     }
 }
 
+// Every field already fit the `INFIGRAPH_LLM_{FIELD}` convention, so no
+// legacy-name shims. `extract` gates Confluence's LLM fallback extraction
+// (`infigraph-confluence` `fill_with_llm`); as a `Toggle`, "0"/"false" now
+// mean off (previously any value enabled it).
+crate::settings! {
+    llm {
+        model: String = "claude-sonnet-4-20250514".to_string(),
+        base_url: String = "https://api.anthropic.com".to_string(),
+        max_tokens: u64 = 16384,
+        extract: crate::settings::Toggle = crate::settings::Toggle(false),
+    }
+}
+
+/// Resolves the `llm` group -- see the group's declaration above.
+pub fn llm_settings() -> Llm {
+    Llm::resolve(RawLlm::default(), None)
+}
+
 impl LlmConfig {
     pub fn from_env() -> Result<Self> {
         let api_key = std::env::var("ANTHROPIC_API_KEY").context("ANTHROPIC_API_KEY not set")?;
-        let model = std::env::var("INFIGRAPH_LLM_MODEL")
-            .unwrap_or_else(|_| "claude-sonnet-4-20250514".to_string());
-        let base_url = std::env::var("INFIGRAPH_LLM_BASE_URL")
-            .unwrap_or_else(|_| "https://api.anthropic.com".to_string());
-        let max_tokens: u32 = std::env::var("INFIGRAPH_LLM_MAX_TOKENS")
-            .unwrap_or_else(|_| "16384".to_string())
-            .parse()
-            .unwrap_or(16384);
+        let llm = llm_settings();
         Ok(Self {
             api_key,
-            model,
-            max_tokens,
-            base_url,
+            model: llm.model,
+            max_tokens: u32::try_from(llm.max_tokens).unwrap_or(16384),
+            base_url: llm.base_url,
         })
     }
 }

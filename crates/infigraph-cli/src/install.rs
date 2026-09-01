@@ -358,21 +358,22 @@ pub(crate) fn self_update(version: &str) -> Result<()> {
     let asset_name = format!("infigraph-{target}.{archive_ext}");
     let tag = format!("v{version}");
 
-    let gh_host = std::env::var("INFIGRAPH_GH_HOST").unwrap_or_else(|_| "github.com".to_string());
-    let gh_owner = std::env::var("INFIGRAPH_GH_OWNER").unwrap_or_else(|_| "intuit".to_string());
+    let install = infigraph_core::install_settings();
+    let gh_host = install.gh_host;
+    let gh_owner = install.gh_owner;
     let gh_repo = "infigraph";
     let full_repo = format!("{gh_host}/{gh_owner}/{gh_repo}");
 
     println!("Downloading {asset_name} from release {tag}...");
 
-    let install_dir = std::env::var("INFIGRAPH_INSTALL_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            dirs::home_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join(".local")
-                .join("bin")
-        });
+    let install_dir = if install.dir.is_empty() {
+        dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".local")
+            .join("bin")
+    } else {
+        PathBuf::from(install.dir)
+    };
 
     let tmp_dir = std::env::temp_dir();
     let download_path = tmp_dir.join(&asset_name);
@@ -592,8 +593,9 @@ pub(crate) fn update_cache_path() -> Option<PathBuf> {
 }
 
 pub(crate) fn fetch_latest_version() -> Option<String> {
-    let gh_host = std::env::var("INFIGRAPH_GH_HOST").unwrap_or_else(|_| "github.com".to_string());
-    let gh_owner = std::env::var("INFIGRAPH_GH_OWNER").unwrap_or_else(|_| "intuit".to_string());
+    let install = infigraph_core::install_settings();
+    let gh_host = install.gh_host;
+    let gh_owner = install.gh_owner;
     let gh_repo = "infigraph";
 
     let mut args = vec!["api"];
@@ -725,8 +727,9 @@ pub(crate) fn cmd_update() -> Result<()> {
     // Fallback: install script
     println!("Downloading latest install script and running it.\n");
 
-    let gh_host = std::env::var("INFIGRAPH_GH_HOST").unwrap_or_else(|_| "github.com".to_string());
-    let gh_owner = std::env::var("INFIGRAPH_GH_OWNER").unwrap_or_else(|_| "intuit".to_string());
+    let install = infigraph_core::install_settings();
+    let gh_host = install.gh_host;
+    let gh_owner = install.gh_owner;
     let gh_repo = "infigraph";
 
     let is_ghe = gh_host != "github.com";

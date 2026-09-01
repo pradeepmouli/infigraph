@@ -932,8 +932,9 @@ pub fn index_group(
 }
 
 pub fn registry_path() -> Result<PathBuf> {
-    if let Some(override_dir) = std::env::var_os("INFIGRAPH_REGISTRY_HOME") {
-        return Ok(PathBuf::from(override_dir)
+    let home_override = crate::instances::registry_settings().home;
+    if !home_override.is_empty() {
+        return Ok(PathBuf::from(home_override)
             .join(".infigraph")
             .join("registry.json"));
     }
@@ -954,9 +955,10 @@ fn registry_lock_path() -> Result<PathBuf> {
 
 const REGISTRY_LOCK_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Default org from `INFIGRAPH_ORG` env var. Empty string means no org scoping.
+/// Default org (`registry` settings group: legacy `INFIGRAPH_ORG`, or
+/// canonical `INFIGRAPH_REGISTRY_ORG`). Empty string means no org scoping.
 pub fn default_org() -> String {
-    std::env::var("INFIGRAPH_ORG").unwrap_or_default()
+    crate::instances::registry_settings().org
 }
 
 /// Build the group key: `org/name` when org is non-empty, `name` otherwise.

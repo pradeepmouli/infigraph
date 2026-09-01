@@ -2,7 +2,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 /// Spawns the real infigraph-mcp binary and asserts it writes its own
-/// instance file under INFIGRAPH_INSTANCES_DIR while running, and removes
+/// instance file under INFIGRAPH_REGISTRY_INSTANCES_DIR while running, and removes
 /// it again after a clean stdin-close shutdown (the same idle-grace path
 /// R2.2.3 already exercises, with a short grace so this test stays fast).
 #[test]
@@ -12,7 +12,7 @@ fn worker_registers_and_deregisters_instance_file() {
 
     let mut child = Command::new(exe)
         .args(["--worker", "--ui", "--mcp", "--port=0"])
-        .env("INFIGRAPH_INSTANCES_DIR", dir.path())
+        .env("INFIGRAPH_REGISTRY_INSTANCES_DIR", dir.path())
         .env("INFIGRAPH_MCP_IDLE_GRACE_SECS", "2")
         .env("INFIGRAPH_MCP_IDLE_POLL_SECS", "1")
         .stdin(Stdio::piped())
@@ -75,7 +75,7 @@ fn worker_reaps_stale_instance_file_on_startup() {
 
     let mut child = Command::new(exe)
         .args(["--worker", "--ui", "--mcp", "--port=0"])
-        .env("INFIGRAPH_INSTANCES_DIR", dir.path())
+        .env("INFIGRAPH_REGISTRY_INSTANCES_DIR", dir.path())
         .env("INFIGRAPH_MCP_IDLE_GRACE_SECS", "2")
         .env("INFIGRAPH_MCP_IDLE_POLL_SECS", "1")
         .stdin(Stdio::piped())
