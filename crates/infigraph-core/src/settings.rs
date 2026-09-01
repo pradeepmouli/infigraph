@@ -28,6 +28,12 @@ impl FromTomlItem for u64 {
     }
 }
 
+impl FromTomlItem for String {
+    fn from_toml_item(item: &toml_edit::Item) -> Option<Self> {
+        item.as_str().map(str::to_string)
+    }
+}
+
 /// Declares a settings group. `$category` (a single, possibly-underscored
 /// identifier, e.g. `mcp_idle`) names the group for env var names
 /// (`INFIGRAPH_{CATEGORY}_{FIELD}`), category-qualified CLI flags (via
@@ -187,5 +193,21 @@ mod tests {
         let b = ToyB::resolve(RawToyB::parse_from(["test"]), None);
         assert_eq!(a.value, 1);
         assert_eq!(b.value, 2);
+    }
+
+    crate::settings! {
+        toy_str {
+            name: String = "default".to_string(),
+        }
+    }
+
+    #[test]
+    fn string_field_resolves_from_toml() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("INFIGRAPH_TOY_STR_NAME");
+        let doc: toml_edit::DocumentMut = r#"name = "from-toml""#.parse().unwrap();
+        let toml_item = doc.as_item();
+        let cli = RawToyStr::parse_from(["test"]);
+        assert_eq!(ToyStr::resolve(cli, Some(toml_item)).name, "from-toml");
     }
 }
