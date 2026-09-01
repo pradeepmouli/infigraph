@@ -131,7 +131,7 @@ pub fn degrade_banner(reason: &infigraph_core::graph::DegradeReason) -> String {
 /// registry lookup is preferred.
 #[cfg(feature = "remote")]
 fn apply_repo_filter(prism: &mut Infigraph, raw_path: &str) {
-    if std::env::var("INFIGRAPH_BACKEND").as_deref() != Ok("neo4j") {
+    if !infigraph_core::daemon::lifecycle::is_remote_backend() {
         return;
     }
     let path = std::path::Path::new(raw_path);

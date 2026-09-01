@@ -50,19 +50,6 @@ struct CachedSearchData {
     symbol_embeddings: Arc<Vec<(String, Vec<f32>)>>,
 }
 
-fn is_remote_mode() -> bool {
-    #[cfg(feature = "remote")]
-    {
-        std::env::var("INFIGRAPH_BACKEND")
-            .map(|v| v == "neo4j")
-            .unwrap_or(false)
-    }
-    #[cfg(not(feature = "remote"))]
-    {
-        false
-    }
-}
-
 /// Cheap health check consulted before trusting a warm search-cache hit.
 /// The cache key is `embeddings.bin`'s mtime, which a daemon crash or a
 /// dead-holder WAL on the *graph* database does not touch -- without this,
@@ -104,7 +91,7 @@ fn get_or_build_search_ctx(
     let tg_root = PathBuf::from(&path).join(".infigraph");
     let canon = tg_root.canonicalize().unwrap_or_else(|_| tg_root.clone());
 
-    let is_remote = is_remote_mode();
+    let is_remote = infigraph_core::daemon::lifecycle::is_remote_backend();
 
     let mtime = if is_remote {
         remote_cache_key()
@@ -350,7 +337,7 @@ pub fn tool_search(args: &Value) -> Result<String> {
 
     // Compute raw scores once, blend with both alphas
     let oversample = limit * 2;
-    let is_remote = is_remote_mode();
+    let is_remote = infigraph_core::daemon::lifecycle::is_remote_backend();
     let tg_dir = PathBuf::from(path).join(".infigraph");
     let hnsw_path = tg_dir.join("hnsw_index.usearch");
     let emb_path = tg_dir.join("embeddings.bin");
@@ -645,7 +632,7 @@ pub fn tool_search_symbols(args: &Value) -> Result<String> {
 
     let embedder = embed::best_embedder();
 
-    let (hnsw_path, emb_path) = if is_remote_mode() {
+    let (hnsw_path, emb_path) = if infigraph_core::daemon::lifecycle::is_remote_backend() {
         (None, None)
     } else {
         let tg_dir = PathBuf::from(path).join(".infigraph");
@@ -787,7 +774,7 @@ pub fn tool_semantic_search(args: &Value) -> Result<String> {
     let hnsw_path = tg_dir.join("hnsw_index.usearch");
     let emb_path = tg_dir.join("embeddings.bin");
     let (hnsw_opt, emb_opt): (Option<&std::path::Path>, Option<&std::path::Path>) =
-        if is_remote_mode() {
+        if infigraph_core::daemon::lifecycle::is_remote_backend() {
             (None, None)
         } else {
             (Some(hnsw_path.as_path()), Some(emb_path.as_path()))

@@ -120,7 +120,7 @@ pub fn auto_start_watch_opportunistic(path: &str) -> Option<String> {
 }
 
 fn auto_start_watch_inner(path: &str, skip_disabled_check: bool) -> Option<String> {
-    if is_remote_mode() {
+    if infigraph_core::daemon::lifecycle::is_remote_backend() {
         return None;
     }
     if !skip_disabled_check && watchers_disabled() {
@@ -224,14 +224,8 @@ fn acquire_project_watch_lock(
     Err(last_err.unwrap())
 }
 
-fn is_remote_mode() -> bool {
-    std::env::var("INFIGRAPH_BACKEND")
-        .map(|v| v == "neo4j")
-        .unwrap_or(false)
-}
-
 pub fn tool_watch_project(args: &Value) -> Result<String> {
-    if is_remote_mode() {
+    if infigraph_core::daemon::lifecycle::is_remote_backend() {
         return Ok(
             "File watching is not supported in remote mode (Neo4j backend). \
                     Reindexing is triggered via webhooks instead."

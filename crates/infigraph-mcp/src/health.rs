@@ -75,12 +75,6 @@ const WATCHER_LIFECYCLE_TOOLS: &[&str] = &[
     "stop_watch_docs",
 ];
 
-fn is_remote_mode() -> bool {
-    std::env::var("INFIGRAPH_BACKEND")
-        .map(|v| v == "neo4j")
-        .unwrap_or(false)
-}
-
 pub fn gather_signals(state: &HealthState, tool_name: &str, project: Option<&Path>) -> Signals {
     let mut sig = Signals {
         worker_restarted: state.restart_beacon(),
@@ -102,7 +96,9 @@ pub fn gather_signals(state: &HealthState, tool_name: &str, project: Option<&Pat
         // Watcher and HNSW are local-filesystem concepts; in remote mode
         // (Neo4j backend) neither applies. A project without .infigraph
         // has nothing to be stale against.
-        if !is_remote_mode() && root.join(".infigraph").is_dir() {
+        if !infigraph_core::daemon::lifecycle::is_remote_backend()
+            && root.join(".infigraph").is_dir()
+        {
             if !WATCHER_LIFECYCLE_TOOLS.contains(&tool_name) {
                 sig.watcher_missing = !crate::tools::watch::watcher_running(root);
             }

@@ -9,13 +9,6 @@ use infigraph_languages::bundled_registry;
 
 use super::watch::auto_start_watch_opportunistic as auto_start_watch;
 
-#[cfg(feature = "remote")]
-fn is_remote_mode() -> bool {
-    std::env::var("INFIGRAPH_BACKEND")
-        .map(|v| v == "neo4j")
-        .unwrap_or(false)
-}
-
 pub fn tool_group_list(_args: &Value) -> Result<String> {
     let registry = Registry::load()?;
 
@@ -289,7 +282,7 @@ pub fn tool_group_link_docs(args: &Value) -> Result<String> {
         .context("missing 'group_name' argument")?;
 
     #[cfg(feature = "remote")]
-    if is_remote_mode() {
+    if infigraph_core::daemon::lifecycle::is_remote_backend() {
         return Ok(format!(
             "Skipped combined doc store for group '{}' — in remote mode, \
              docs are stored in shared Neo4j. Use search_docs or group_search_docs instead.",
@@ -327,7 +320,7 @@ pub fn tool_group_search(args: &Value) -> Result<String> {
     let deep = args.get("deep").and_then(|d| d.as_bool()).unwrap_or(false);
 
     #[cfg(feature = "remote")]
-    if is_remote_mode() {
+    if infigraph_core::daemon::lifecycle::is_remote_backend() {
         let registry = Registry::load()?;
         let group = registry
             .groups
@@ -390,7 +383,7 @@ pub fn tool_group_search_docs(args: &Value) -> Result<String> {
     let alpha = args.get("alpha").and_then(|a| a.as_f64()).unwrap_or(0.5) as f32;
 
     #[cfg(feature = "remote")]
-    if is_remote_mode() {
+    if infigraph_core::daemon::lifecycle::is_remote_backend() {
         let registry = Registry::load()?;
         let group = registry
             .groups
@@ -489,9 +482,7 @@ pub fn tool_group_build(args: &Value) -> Result<String> {
     let is_remote = {
         #[cfg(feature = "remote")]
         {
-            std::env::var("INFIGRAPH_BACKEND")
-                .map(|v| v == "neo4j")
-                .unwrap_or(false)
+            infigraph_core::daemon::lifecycle::is_remote_backend()
         }
         #[cfg(not(feature = "remote"))]
         {

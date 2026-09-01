@@ -57,14 +57,8 @@ pub fn auto_start_doc_watch_opportunistic(path: &str) -> Option<String> {
     auto_start_doc_watch_inner(path, true)
 }
 
-fn is_remote_mode() -> bool {
-    std::env::var("INFIGRAPH_BACKEND")
-        .map(|v| v == "neo4j")
-        .unwrap_or(false)
-}
-
 fn auto_start_doc_watch_inner(path: &str, skip_disabled_check: bool) -> Option<String> {
-    if is_remote_mode() {
+    if infigraph_core::daemon::lifecycle::is_remote_backend() {
         return None;
     }
     let root = std::path::PathBuf::from(path).canonicalize().ok()?;
@@ -560,7 +554,7 @@ pub fn tool_index_confluence_pages(args: &Value) -> Result<String> {
 }
 
 pub fn tool_watch_docs(args: &Value) -> Result<String> {
-    if is_remote_mode() {
+    if infigraph_core::daemon::lifecycle::is_remote_backend() {
         return Ok(
             "Doc watching is not supported in remote mode (Neo4j backend). \
              Reindexing is triggered via webhooks instead."

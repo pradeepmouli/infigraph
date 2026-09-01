@@ -7,13 +7,6 @@ use super::docs::{auto_start_doc_watch_opportunistic as auto_start_doc_watch, op
 use super::helpers::{find_infigraph_cli, open_prism};
 use super::watch::auto_start_watch_opportunistic as auto_start_watch;
 
-#[cfg(feature = "remote")]
-fn is_remote_mode() -> bool {
-    std::env::var("INFIGRAPH_BACKEND")
-        .map(|v| v == "neo4j")
-        .unwrap_or(false)
-}
-
 /// Anchored empirically: this repo's own reindex takes ~10s cold, so 3 minutes
 /// comfortably covers real large-repo indexing while still catching a hang far
 /// short of the hour-plus incidents this session's own corrupted-graph events
@@ -200,7 +193,7 @@ pub fn tool_index_project(args: &Value) -> Result<String> {
     #[allow(unused_mut)]
     let mut prism = open_prism(args)?;
     #[cfg(feature = "remote")]
-    if is_remote_mode() {
+    if infigraph_core::daemon::lifecycle::is_remote_backend() {
         let repo_name = std::path::Path::new(path)
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
@@ -244,7 +237,7 @@ pub fn tool_index_project(args: &Value) -> Result<String> {
         #[allow(unused_mut)]
         let mut embed_done = false;
         #[cfg(feature = "remote")]
-        if is_remote_mode() {
+        if infigraph_core::daemon::lifecycle::is_remote_backend() {
             if let Ok(pg) = infigraph_core::meta::PostgresMetaStore::connect_from_env_cached() {
                 match embed::update_embeddings_remote(backend, pg, &changed) {
                     Ok(n) => out.push_str(&format!("Saved {} embeddings to pgvector\n", n)),
