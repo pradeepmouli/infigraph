@@ -323,9 +323,27 @@ pub fn is_storage_version_mismatch_error(err: &anyhow::Error) -> bool {
 /// `open_combined_graph`); `Infigraph::init` distinguishes the classes
 /// itself because it retries the transient one.
 pub fn open_failure_is_not_corruption(err: &anyhow::Error) -> bool {
+    is_transient_open_error(err) || is_storage_version_mismatch_error(err)
+}
+
+/// lbug refuses a read-only open while a writer's checkpoint is running
+/// ("Cannot open database in read-only mode while checkpoint is in
+/// progress. Please retry later.") -- its own retry-later signal. Seen on
+/// sittir (2026-09-02) right after the daemon accepted a write: every
+/// post-write read-only open in `infigraph index` failed on it, including
+/// the registration step.
+pub fn is_checkpoint_in_progress_error(err: &anyhow::Error) -> bool {
+    err.to_string().contains("checkpoint is in progress")
+}
+
+/// The one list of open failures worth retrying: another process holds the
+/// file lock, a live writer is mid-checkpoint, or the WAL is being rotated
+/// under a concurrent open. Every retry loop and every "is this corruption?"
+/// decision consults this, never its parts.
+pub fn is_transient_open_error(err: &anyhow::Error) -> bool {
     is_lock_contention_error(err)
+        || is_checkpoint_in_progress_error(err)
         || is_transient_wal_open_race_error(err)
-        || is_storage_version_mismatch_error(err)
 }
 
 /// Context line for a lock-contention open failure, naming the holder
@@ -359,6 +377,12 @@ pub fn storage_version_mismatch_context(db_path: &Path) -> String {
 pub fn non_corruption_open_context(err: &anyhow::Error, db_path: &Path) -> String {
     if is_lock_contention_error(err) {
         lock_contention_context(db_path)
+    } else if is_checkpoint_in_progress_error(err) {
+        format!(
+            "{} is being checkpointed by a live writer -- not corrupted, so it was left \
+             untouched; retry in a moment.",
+            db_path.display()
+        )
     } else if is_storage_version_mismatch_error(err) {
         storage_version_mismatch_context(db_path)
     } else {
