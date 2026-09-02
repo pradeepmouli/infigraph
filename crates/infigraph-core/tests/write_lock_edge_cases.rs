@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use infigraph_core::graph::GraphStore;
+use infigraph_core::graph::{db_lock_path, GraphStore};
 use tempfile::TempDir;
 
 fn make_store() -> (TempDir, GraphStore) {
@@ -58,7 +58,7 @@ fn test_lock_file_deleted_while_held() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("delfile.db");
     let store = GraphStore::open(&db_path).unwrap();
-    let lock_path = db_path.with_extension("lock");
+    let lock_path = db_lock_path(&db_path);
 
     let lock = store.write_lock().unwrap();
 
@@ -79,7 +79,7 @@ fn test_lock_file_permissions_readonly() {
     let dir = TempDir::new().unwrap();
     let db_path = dir.path().join("readonly.db");
     let _ = GraphStore::open(&db_path).unwrap();
-    let lock_path = db_path.with_extension("lock");
+    let lock_path = db_lock_path(&db_path);
 
     // Create lock file with readonly perms
     std::fs::write(&lock_path, "").unwrap();
@@ -136,7 +136,7 @@ fn test_lock_survives_store_reopen() {
     let _lock = store1.write_lock().unwrap();
 
     // Verify lock is held via the lock file directly
-    let lock_path = db_path.with_extension("lock");
+    let lock_path = db_lock_path(&db_path);
     let file = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
@@ -285,7 +285,7 @@ fn test_lock_after_db_corruption_recovery() {
     drop(store);
 
     // "Corrupt" by deleting a DB file (lock file is separate)
-    let lock_path = db_path.with_extension("lock");
+    let lock_path = db_lock_path(&db_path);
     if db_path.exists() {
         let _ = std::fs::remove_dir_all(&db_path);
     }

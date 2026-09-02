@@ -1340,6 +1340,32 @@ mod tests {
         );
     }
 
+    /// #137: the five `write_lock*.rs` tests computed their expected lock
+    /// path with `db_path.with_extension("lock")`, which REPLACES an
+    /// extension -- so on their "x.db" fixtures they watched "x.lock" while
+    /// the store locked "x.db.lock" and never saw the lock as held. Pin the
+    /// append-not-replace rule so the two can't drift apart again.
+    #[test]
+    fn db_lock_path_appends_rather_than_replacing_the_extension() {
+        assert_eq!(
+            db_lock_path(Path::new("/p/.infigraph/graph")),
+            PathBuf::from("/p/.infigraph/graph.lock")
+        );
+        assert_eq!(
+            db_lock_path(Path::new("/p/.infigraph/docs.kuzu")),
+            PathBuf::from("/p/.infigraph/docs.kuzu.lock")
+        );
+        assert_eq!(
+            db_lock_path(Path::new("/p/cross_thread.db")),
+            PathBuf::from("/p/cross_thread.db.lock")
+        );
+        assert_ne!(
+            db_lock_path(Path::new("/p/graph.rebuilding")),
+            db_lock_path(Path::new("/p/graph")),
+            "a rebuild scratch graph must not share the live graph's lock"
+        );
+    }
+
     #[test]
     fn wal_family_of_a_db_that_never_existed_is_empty_and_removal_is_a_no_op() {
         let dir = tempfile::tempdir().unwrap();

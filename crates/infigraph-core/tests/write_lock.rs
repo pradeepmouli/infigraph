@@ -1,4 +1,4 @@
-use infigraph_core::graph::GraphStore;
+use infigraph_core::graph::{db_lock_path, GraphStore};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
@@ -76,7 +76,7 @@ fn test_write_lock_cross_thread_blocking() {
 
     let lock = store.write_lock().unwrap();
 
-    let lock_path = db_path.with_extension("lock");
+    let lock_path = db_lock_path(&db_path);
     let handle = std::thread::spawn(move || {
         let file = std::fs::OpenOptions::new()
             .create(true)
@@ -133,7 +133,7 @@ fn test_write_lock_stamps_identity_and_busy_on_timeout() {
     let store = GraphStore::open(&db_path).unwrap();
 
     let _held = store.write_lock().unwrap();
-    let holder = infigraph_core::lockfile::read_holder(&db_path.with_extension("lock"))
+    let holder = infigraph_core::lockfile::read_holder(&db_lock_path(&db_path))
         .expect("write lock should stamp identity");
     assert_eq!(holder.pid, std::process::id());
     assert_eq!(holder.role, "graph-write");
