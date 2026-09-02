@@ -31,6 +31,14 @@ cargo clippy --all-targets -- -D warnings
 echo '+cargo test -p infigraph-core --test write_lock_perf -- --ignored'
 cargo test -p infigraph-core --test write_lock_perf -- --ignored
 
+# groups_watch_perf spawns the `infigraph` CLI binary next to the test
+# executable, and infigraph-mcp has no dependency on infigraph-cli, so
+# `cargo test -p infigraph-mcp` never rebuilds it. A binary left over from
+# another branch (different lbug version) makes the test fail silently
+# ("No results across repos"). Building it here costs one link step.
+echo '+cargo build -p infigraph-cli'
+cargo build -p infigraph-cli
+
 echo '+cargo test -p infigraph-mcp --test groups_watch_perf -- --ignored'
 cargo test -p infigraph-mcp --test groups_watch_perf -- --ignored
 
