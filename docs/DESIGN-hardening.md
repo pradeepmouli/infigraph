@@ -38,6 +38,10 @@ Each item below is tracked as a GitHub issue (label `hardening`) once it moves p
 
 - [x] R2.2.5 — daemon self-detects a stale build ([#134](https://github.com/pradeepmouli/infigraph/issues/134)) — `crates/infigraph-core/src/daemon/mod.rs`: `run_write_coordinator`'s loop periodically spawns `infigraph print-build-hash` (a new hidden subcommand, `crates/infigraph-cli/src/main.rs`) via its own `current_exe()` and self-exits on a mismatch against its own compile-time `build_hash()`, closing the gap where `prune_stale_daemon`'s existing lazy check never fires for a long-idle project nobody is actively touching. Tests: `crates/infigraph-cli/tests/print_build_hash.rs`, `crates/infigraph-core/tests/daemon_stale_build_self_check.rs`.
 - [x] R2.2.6 — stale-build judgments compare against the installed binary, not the judge's own build ([#135](https://github.com/pradeepmouli/infigraph/issues/135)) — `prune_stale_daemon` (`crates/infigraph-core/src/daemon/lifecycle.rs`, via the pure `holder_is_stale_build`) and `doctor::assemble_context` used `crate::build_hash()`, i.e. the *judging process's* compile-time hash; an `infigraph-mcp` started before an install therefore SIGTERMed every daemon on the new build (`recovery.rs` at startup, `ensure_daemon_running_required` on contention) and respawned it from the on-disk binary it would judge stale again, and doctor's "installed binary is …" lines were inverted. Both now query the installed CLI binary via `daemon::installed_build_hash_of` (#134's `print-build-hash` subprocess, promoted to a shared primitive); an undeterminable installed hash never prunes on hash grounds. Tests: `lifecycle.rs` unit (`holder_is_stale_build_is_relative_to_the_installed_binary_only`), `crates/infigraph-core/tests/doctor.rs` (`installed_build_hash_comes_from_the_installed_binary_not_the_judge`).
+- [x] R3.4.1 — `infigraph verify` ([#10](https://github.com/pradeepmouli/infigraph/issues/10)) — `crates/infigraph-core/src/verify.rs` (`run_verify`) + `cmd_verify`: graph opens cleanly, symbol→file references (the check that caught #114), embeddings parse + generation; doctor-style output, CI exit codes 0/1/2. Registry-path checks live in `doctor`'s registry section; bm25/hnsw generations are #91.
+- [x] R2.2.4 — `infigraph ps` / `infigraph kill` ([#11](https://github.com/pradeepmouli/infigraph/issues/11)) — `crates/infigraph-core/src/ps.rs` + `cmd_kill`: lists live instances, watchers and dead holders of stale locks; kill is guarded against pid recycling and audited (R6.3).
+- [x] R7.1 — Registry GC, `infigraph gc` ([#12](https://github.com/pradeepmouli/infigraph/issues/12)) — `crates/infigraph-core/src/gc.rs`: evicts registry entries whose path is gone or stale, every eviction on `~/.infigraph/logs/audit.log`; `doctor` surfaces the candidates.
+- [x] R3.3.6 — surface index staleness in search results ([#26](https://github.com/pradeepmouli/infigraph/issues/26)) — `staleness_banner` in `crates/infigraph-mcp/src/tools/search.rs`, prepended to `search`/`get_code_snippet` results, built on the persistent dirty set (R3.3.5) instead of the mtime walk originally sketched.
 
 ### In progress
 
@@ -45,11 +49,7 @@ _(none currently.)_
 
 ### Not started
 
-- [ ] R3.4.1 — `infigraph verify` ([#10](https://github.com/pradeepmouli/infigraph/issues/10))
-- [ ] R2.2.4 — `infigraph ps` / `infigraph kill` ([#11](https://github.com/pradeepmouli/infigraph/issues/11))
-- [ ] R7.1 — Registry GC, `infigraph gc` ([#12](https://github.com/pradeepmouli/infigraph/issues/12)) — `doctor` (now shipped, see above) surfaces stale registry entries pointing at deleted paths as WARN, but nothing actually evicts them yet; still accumulate indefinitely
 - [ ] R6.1 — structured `tracing` JSON logging ([#14](https://github.com/pradeepmouli/infigraph/issues/14)) — zero `tracing::` call sites; logging is still ad-hoc `eprintln!`/`mcp_log`/`watch_log`
-- [ ] R3.3.6 — surface index staleness in search results ([#26](https://github.com/pradeepmouli/infigraph/issues/26)) — depends on R3.3.3/R3.3.4; can ship a filesystem-mtime version standalone first
 - [ ] R4.1 — full error taxonomy ([#17](https://github.com/pradeepmouli/infigraph/issues/17)) — only `lockfile::Busy` exists as a structured variant; the rest is stringly-typed `anyhow` errors
 - [ ] R5.1 — crash-safe startup ([#18](https://github.com/pradeepmouli/infigraph/issues/18))
 - [ ] R5.2 — self-watchdog ([#19](https://github.com/pradeepmouli/infigraph/issues/19))

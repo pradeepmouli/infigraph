@@ -460,31 +460,32 @@ impl GraphBackend for KuzuBackend {
 
         let use_csv = existing_hashes_empty || extractions.len() > 100;
 
+        // Both branches run their delete(+insert) inside
+        // `GraphStore::transaction` (#119): a failed upsert rolls the whole
+        // batch back instead of leaving a half-applied batch open on a
+        // connection that is about to be dropped.
         if use_csv {
             // Parquet bulk path: delete stale → COPY FROM → folders
             if !existing_hashes_empty {
-                let conn = self.store.connection()?;
-                conn.query("BEGIN TRANSACTION")
-                    .context("failed to begin delete transaction")?;
-                self.delete_files_data(&conn, extractions)?;
-                conn.query("COMMIT")
-                    .context("failed to commit delete transaction")?;
+                self.store
+                    .transaction(|conn| self.delete_files_data(conn, extractions))
+                    .context("delete transaction for the bulk-index batch")?;
             }
             let conn = self.store.connection()?;
             self.store
                 .upsert_all_parquet_conn(&conn, extractions, &write_lock)?;
         } else {
             // Per-file UNWIND path for small incremental updates
-            let conn = self.store.connection()?;
-            conn.query("BEGIN TRANSACTION")
-                .context("failed to begin index transaction")?;
-            self.delete_files_data(&conn, extractions)?;
-            for extraction in extractions {
-                self.store
-                    .upsert_file_conn_no_delete(&conn, extraction, &write_lock)?;
-            }
-            conn.query("COMMIT")
-                .context("failed to commit index transaction")?;
+            self.store
+                .transaction(|conn| {
+                    self.delete_files_data(conn, extractions)?;
+                    for extraction in extractions {
+                        self.store
+                            .upsert_file_conn_no_delete(conn, extraction, &write_lock)?;
+                    }
+                    Ok(())
+                })
+                .context("index transaction for the incremental batch")?;
         }
 
         // Upsert folder hierarchy
