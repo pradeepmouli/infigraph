@@ -11,6 +11,24 @@ use tokio_util::sync::CancellationToken;
 /// Per-indexer subprocess timeout for SCIP enrichment. Nothing before Task 6
 /// of the daemon/watch command split bounded a hung SCIP indexer at all --
 /// 10 minutes is generous enough for `rust-analyzer`'s cold-start
+/// The `.infigraphignore` entries `infigraph index` suggests when a project
+/// has none. Only build *output* belongs here: the index never extracts a
+/// compiled binary anyway (no language pack claims an extension-less,
+/// `.exe`, `.o` or `.so` file), so a "binaries" entry buys nothing -- and
+/// an unanchored one like `bin/` matches at any depth and hid Rust's
+/// `src/bin/` binary targets from the index (#145).
+pub(crate) const SUGGESTED_INFIGRAPHIGNORE: &[(&str, &str)] = &[
+    ("target/", "Rust build output"),
+    ("build/", "build output (Gradle, CMake, etc.)"),
+    ("dist/", "distribution bundles"),
+    ("out/", "compiler/IDE output"),
+    ("vendor/", "vendored dependencies (Go, Ruby)"),
+    ("obj/", "intermediate build objects (.NET, C++)"),
+    ("generated/", "auto-generated code"),
+    ("third_party/", "third-party source copies"),
+    ("CMakeFiles/", "CMake internal files"),
+];
+
 /// `cargo metadata` resolution but still bounded rather than infinite.
 const SCIP_INDEXER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 
@@ -351,16 +369,9 @@ pub(crate) fn cmd_index(root: &Path, full: bool, no_embed: bool) -> Result<()> {
     if !root.join(".infigraphignore").exists() {
         eprintln!("\nhint: Create .infigraphignore in the project root to exclude non-source directories.");
         eprintln!("      Common entries:");
-        eprintln!("        target/        # Rust build output");
-        eprintln!("        build/         # build output (Gradle, CMake, etc.)");
-        eprintln!("        dist/          # distribution bundles");
-        eprintln!("        out/           # compiler/IDE output");
-        eprintln!("        vendor/        # vendored dependencies (Go, Ruby)");
-        eprintln!("        bin/           # compiled binaries");
-        eprintln!("        obj/           # intermediate build objects (.NET, C++)");
-        eprintln!("        generated/     # auto-generated code");
-        eprintln!("        third_party/   # third-party source copies");
-        eprintln!("        CMakeFiles/    # CMake internal files");
+        for (pattern, why) in SUGGESTED_INFIGRAPHIGNORE {
+            eprintln!("        {pattern:<15}# {why}");
+        }
         eprintln!("      One entry per line. Lines starting with # are comments.");
     }
 
@@ -2246,5 +2257,50 @@ mod tests {
         // No .infigraph — should report not running without error
         let result = crate::info_commands::cmd_watch_status(tmp.path());
         assert!(result.is_ok());
+    }
+    /// #145: `bin/` in the suggested `.infigraphignore` matched a directory
+    /// named `bin` at any depth, so Rust's `src/bin/` binary targets vanished
+    /// from the index (only their SCIP-created orphans were ever visible).
+    /// The list must never hide a source layout; compiled binaries need no
+    /// entry at all -- no language pack claims an extension-less or `.exe`
+    /// file, so they are never extracted in the first place.
+    #[test]
+    fn suggested_infigraphignore_entries_never_hide_rust_binary_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let body: String = SUGGESTED_INFIGRAPHIGNORE
+            .iter()
+            .map(|(pattern, _)| format!("{pattern}\n"))
+            .collect();
+        std::fs::write(dir.path().join(".infigraphignore"), body).unwrap();
+        for (rel, content) in [
+            ("crates/x/src/bin/tool.rs", "fn main() {}"),
+            ("src/lib.rs", "pub fn f() {}"),
+            ("target/debug/tool", "\u{7f}ELF"),
+        ] {
+            let p = dir.path().join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, content).unwrap();
+        }
+        let walked: Vec<String> = infigraph_core::ignore_rules::walk_builder(dir.path())
+            .build()
+            .flatten()
+            .filter(|e| e.file_type().is_some_and(|ft| ft.is_file()))
+            .map(|e| {
+                e.path()
+                    .strip_prefix(dir.path())
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        assert!(
+            walked.iter().any(|p| p == "crates/x/src/bin/tool.rs"),
+            "a Rust src/bin target must be indexed: {walked:?}"
+        );
+        assert!(walked.iter().any(|p| p == "src/lib.rs"));
+        assert!(
+            !walked.iter().any(|p| p.starts_with("target/")),
+            "build output stays excluded: {walked:?}"
+        );
     }
 }

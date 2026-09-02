@@ -207,8 +207,9 @@ fn walk_and_count(
         if path.is_dir() {
             match name_str.as_ref() {
                 "node_modules" | "target" | "dist" | "build" | "vendor" | "__pycache__"
-                | "venv" | ".venv" | "out" | "bin" | "obj" | "generated" | "third_party"
-                | "CMakeFiles" => continue,
+                | "venv" | ".venv" | "out" | "obj" | "generated" | "third_party" | "CMakeFiles" => {
+                    continue
+                }
                 _ => {}
             }
             walk_and_count(&path, _root, ext_map, counts, depth + 1);

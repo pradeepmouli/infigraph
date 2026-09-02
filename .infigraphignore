@@ -16,8 +16,6 @@ dist/
 out/
 # vendored dependencies (Go, Ruby)
 vendor/
-# compiled binaries
-bin/
 # intermediate build objects (.NET, C++)
 obj/
 # auto-generated code
