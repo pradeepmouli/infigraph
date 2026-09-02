@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::Path;
 
 use anyhow::Result;
@@ -299,6 +300,69 @@ pub(crate) fn unwind_edges_from_pairs(
     }
 }
 
+/// The COPY error Kuzu reports when an edge endpoint names no row in the
+/// node table. Shared by `extract_bad_copy_value` and the endpoint
+/// pre-filter so the two can never drift apart.
+const MISSING_PK_MARKER: &str = "Unable to find primary key value ";
+
+/// Every primary key currently present in `label`'s node table.
+///
+/// One scan of the id column. Only ever called after a COPY has already
+/// failed with a missing endpoint, so the happy path never pays for it.
+fn existing_ids(conn: &Connection, label: &str) -> Result<HashSet<String>> {
+    let result = conn
+        .query(&format!("MATCH (n:{label}) RETURN n.id"))
+        .map_err(|e| anyhow::anyhow!("failed to read {label} ids: {e}"))?;
+    let mut ids = HashSet::new();
+    for row in result {
+        if let Some(v) = row.first() {
+            ids.insert(unquote(v.to_string()));
+        }
+    }
+    Ok(ids)
+}
+
+/// Kuzu renders a STRING value with surrounding double quotes; ids come back
+/// through `Value::to_string` so strip one matched pair, and only a matched
+/// pair -- an id that genuinely starts or ends with a quote must survive.
+fn unquote(s: String) -> String {
+    match s.strip_prefix('"').and_then(|r| r.strip_suffix('"')) {
+        Some(inner) => inner.to_string(),
+        None => s,
+    }
+}
+
+/// Drop every pair whose source or target names no existing node, in a
+/// single pass over both id sets.
+///
+/// `extract_bad_copy_value` names only *one* offending value per COPY
+/// failure, so draining a batch that way costs one whole re-COPY per bad
+/// endpoint and cannot converge within `MAX_BAD_RECORD_RETRIES` when there
+/// are more bad endpoints than retries. sittir's SCIP import hit exactly
+/// that: attempts 17-20 dropped 254, 1, 2 and 253 records and still ran out,
+/// dumping a 113k-edge batch into the slow fallback. Two id-column scans
+/// settle it in one retry instead.
+fn prefilter_pairs_against_existing(
+    store: &GraphStore,
+    pairs: &mut Vec<(String, String)>,
+    src_label: &str,
+    dst_label: &str,
+) -> Result<()> {
+    // A fresh connection, not the one that just failed: a caught COPY
+    // failure can leave that connection's transaction bookkeeping wedged
+    // (see this function's caller).
+    let conn = store.connection()?;
+    let src_ids = existing_ids(&conn, src_label)?;
+    let dst_ids = if src_label == dst_label {
+        None
+    } else {
+        Some(existing_ids(&conn, dst_label)?)
+    };
+    let dst_ids = dst_ids.as_ref().unwrap_or(&src_ids);
+    pairs.retain(|(a, b)| src_ids.contains(a) && dst_ids.contains(b));
+    Ok(())
+}
+
 /// Extract the offending value from a Kuzu COPY-failure error message, if it
 /// looks like a bad-primary-key error recoverable by dropping just that
 /// record and retrying -- a duplicate id within the batch (or one that
@@ -306,10 +370,7 @@ pub(crate) fn unwind_edges_from_pairs(
 /// any existing row. Returns `None` for errors that don't name a specific
 /// value, so callers know to fall back rather than retry blindly.
 pub(crate) fn extract_bad_copy_value(err: &str) -> Option<&str> {
-    for marker in [
-        "duplicated primary key value ",
-        "Unable to find primary key value ",
-    ] {
+    for marker in ["duplicated primary key value ", MISSING_PK_MARKER] {
         if let Some(idx) = err.find(marker) {
             let rest = &err[idx + marker.len()..];
             let end = rest.find(", which").unwrap_or(rest.len());
@@ -351,6 +412,11 @@ pub(crate) fn copy_edges_with_bad_record_retry(
     // Every attempt is a whole new COPY -- re-check growth each time
     // (#132 gap 1) rather than trusting the caller's once-per-call preflight.
     let mut gate = store.growth_gate(1);
+    // The endpoint pre-filter is a whole-batch fix, so it is worth at most
+    // one attempt; if a missing endpoint is still reported afterwards the
+    // cause is something the id sets cannot see, and the per-value drops
+    // below take over.
+    let mut prefiltered = false;
     for attempt in 0..MAX_BAD_RECORD_RETRIES {
         if pairs.is_empty() {
             return Ok(());
@@ -371,6 +437,25 @@ pub(crate) fn copy_edges_with_bad_record_retry(
             }
             Err(e) => {
                 let msg = e.to_string();
+                if !prefiltered && msg.contains(MISSING_PK_MARKER) {
+                    prefiltered = true;
+                    let before = pairs.len();
+                    match prefilter_pairs_against_existing(store, &mut pairs, src_label, dst_label)
+                    {
+                        Ok(()) if pairs.len() < before => {
+                            eprintln!(
+                                "warn: COPY {table} dropped {} pair(s) with a missing endpoint in one pass (attempt {}/{MAX_BAD_RECORD_RETRIES}), retrying",
+                                before - pairs.len(),
+                                attempt + 1
+                            );
+                            continue;
+                        }
+                        Ok(()) => {}
+                        Err(pe) => eprintln!(
+                            "warn: COPY {table} endpoint pre-filter failed ({pe}), falling back to per-value retries"
+                        ),
+                    }
+                }
                 if let Some(bad) = extract_bad_copy_value(&msg) {
                     let before = pairs.len();
                     pairs.retain(|(a, b)| a != bad && b != bad);
@@ -406,6 +491,12 @@ pub(crate) fn copy_edges_with_bad_record_retry(
 /// per batch; sittir's 71-file incremental write spun a daemon at 100%
 /// CPU for over 15 minutes on a 130k-symbol graph. This form plans as two
 /// QUERY_PRIMARY_KEY_LOOKUPs (verified with EXPLAIN; see the test).
+///
+/// The split is needed *only* because `p.a` is a variable. A literal id
+/// is pushed into a primary-key scan from either layout, so the
+/// single-edge `MATCH (a:X), (b:Y) WHERE a.id = '..' AND b.id = '..'`
+/// writes elsewhere in this crate are already optimal -- see
+/// `only_variable_id_joins_need_the_split_match_form`.
 pub(crate) fn pair_edge_statement(
     src_label: &str,
     dst_label: &str,
@@ -484,10 +575,99 @@ pub fn classify_file(file: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        check_disk_headroom, check_graph_growth_ratio, classify_file, extract_bad_copy_value,
+        check_disk_headroom, check_graph_growth_ratio, classify_file,
+        copy_edges_with_bad_record_retry, extract_bad_copy_value, prefilter_pairs_against_existing,
         read_healthy_size, resolve_import_candidate, stamp_healthy_graph_size,
-        stamp_healthy_graph_size_if_unset,
+        stamp_healthy_graph_size_if_unset, MAX_BAD_RECORD_RETRIES,
     };
+
+    /// A store holding Symbol nodes `s0..s{n}` and nothing else.
+    fn store_with_symbols(dir: &std::path::Path, n: usize) -> super::super::GraphStore {
+        let store = super::super::GraphStore::open(&dir.join("graph")).unwrap();
+        {
+            let conn = store.connection().unwrap();
+            for i in 0..n {
+                conn.query(&format!(
+                    "CREATE (s:Symbol {{id: 'a.py::s{i}', name: 's{i}', kind: 'Function', file: 'a.py'}})"
+                ))
+                .unwrap();
+            }
+        }
+        store
+    }
+
+    fn calls_edge_count(store: &super::super::GraphStore) -> usize {
+        let conn = store.connection().unwrap();
+        let mut r = conn
+            .query("MATCH ()-[r:CALLS]->() RETURN count(r)")
+            .unwrap();
+        r.next()
+            .and_then(|row| row.first().map(|v| v.to_string()))
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap()
+    }
+
+    #[test]
+    fn prefilter_drops_every_pair_with_a_missing_endpoint_in_one_pass() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store_with_symbols(tmp.path(), 3);
+
+        let mut pairs: Vec<(String, String)> = vec![
+            ("a.py::s0".into(), "a.py::s1".into()),
+            ("a.py::s0".into(), "a.py::ghost".into()),
+            ("a.py::ghost".into(), "a.py::s2".into()),
+            ("a.py::s1".into(), "a.py::s2".into()),
+        ];
+        prefilter_pairs_against_existing(&store, &mut pairs, "Symbol", "Symbol").unwrap();
+
+        assert_eq!(
+            pairs,
+            vec![
+                ("a.py::s0".to_string(), "a.py::s1".to_string()),
+                ("a.py::s1".to_string(), "a.py::s2".to_string()),
+            ],
+            "both directions of a missing endpoint must go, and only those"
+        );
+    }
+
+    /// The wedge behind sittir's 21-minute SCIP import (2026-09-02): a COPY
+    /// error names one bad value, so dropping them one re-COPY at a time
+    /// cannot converge once the batch holds more bad endpoints than
+    /// `MAX_BAD_RECORD_RETRIES`. It then dumped the whole batch into the slow
+    /// UNWIND fallback. The pre-filter must settle it and keep every good
+    /// pair.
+    #[test]
+    fn copy_edges_converges_with_more_bad_endpoints_than_retries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store_with_symbols(tmp.path(), 4);
+
+        let good: Vec<(String, String)> = vec![
+            ("a.py::s0".into(), "a.py::s1".into()),
+            ("a.py::s1".into(), "a.py::s2".into()),
+            ("a.py::s2".into(), "a.py::s3".into()),
+        ];
+        let bad_endpoints = MAX_BAD_RECORD_RETRIES * 3;
+        let mut pairs = good.clone();
+        for i in 0..bad_endpoints {
+            pairs.push(("a.py::s0".into(), format!("a.py::ghost{i}")));
+        }
+
+        copy_edges_with_bad_record_retry(
+            &store,
+            "CALLS",
+            pairs,
+            "Symbol",
+            "Symbol",
+            &tmp.path().join("edges.parquet"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            calls_edge_count(&store),
+            good.len(),
+            "every good pair must survive, and no ghost edge may be invented"
+        );
+    }
 
     #[test]
     fn growth_check_passes_rather_than_refuses_with_no_baseline_yet() {
@@ -744,6 +924,78 @@ mod tests {
         assert!(
             p.contains("PRIMARY_KEY_SCAN_NODE_TABLE"),
             "fan-out edge plan:\n{p}"
+        );
+    }
+
+    /// Which statement shapes lbug can plan as primary-key lookups, pinned
+    /// against the planner itself.
+    ///
+    /// The rule is about the *id expression*, not the `MATCH` layout: a
+    /// literal id is pushed into a PRIMARY_KEY_SCAN_NODE_TABLE whether it is
+    /// written as one comma-separated `MATCH` or two, so the many
+    /// single-edge `MATCH (a:X), (b:Y) WHERE a.id = '..' AND b.id = '..'`
+    /// writes across this crate are already optimal and must not be churned
+    /// "for consistency". A *variable* id (`a.id = p.a`, from `UNWIND`)
+    /// cannot be pushed down: written as one `MATCH` it plans as
+    /// CROSS_PRODUCT over full scans of both node tables and is what wedged
+    /// sittir's SCIP import for 21 minutes. Split into two `MATCH` clauses
+    /// (`pair_edge_statement`) the join disappears entirely.
+    ///
+    /// The CROSS_PRODUCT left in the constant-id plans joins two one-row
+    /// inputs, so it is free -- counting full scans, not cross products, is
+    /// what separates the two classes.
+    #[test]
+    fn only_variable_id_joins_need_the_split_match_form() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store_with_symbols(tmp.path(), 200);
+        let conn = store.connection().unwrap();
+        let full_scans = |q: &str| -> usize {
+            let p = conn
+                .query(&format!("EXPLAIN {q}"))
+                .unwrap()
+                .map(|row| {
+                    row.iter()
+                        .map(|v| v.to_string())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            p.matches("SCAN_NODE_TABLE").count() - p.matches("PRIMARY_KEY_SCAN_NODE_TABLE").count()
+        };
+
+        // Literal ids: both layouts already plan as key lookups.
+        assert_eq!(
+            full_scans(
+                "MATCH (a:Symbol), (b:Symbol) WHERE a.id = 'a.py::s1' AND b.id = 'a.py::s2' \
+                 CREATE (a)-[:CALLS]->(b)"
+            ),
+            0
+        );
+        assert_eq!(
+            full_scans(
+                "MATCH (a:Symbol) WHERE a.id = 'a.py::s1' MATCH (b:Symbol) WHERE b.id = 'a.py::s2' \
+                 CREATE (a)-[:CALLS]->(b)"
+            ),
+            0
+        );
+
+        // Variable ids: the layout is the whole difference.
+        let lit = "{a: 'a.py::s1', b: 'a.py::s2'}, {a: 'a.py::s1', b: 'a.py::s3'}";
+        assert_eq!(
+            full_scans(&format!(
+                "UNWIND [{lit}] AS p MATCH (a:Symbol), (b:Symbol) \
+                 WHERE a.id = p.a AND b.id = p.b CREATE (a)-[:CALLS]->(b)"
+            )),
+            2,
+            "if this stops full-scanning, lbug's planner improved and \
+             `pair_edge_statement` may be redundant"
+        );
+        assert_eq!(
+            full_scans(&super::pair_edge_statement(
+                "Symbol", "Symbol", "CALLS", lit
+            )),
+            0
         );
     }
 }
