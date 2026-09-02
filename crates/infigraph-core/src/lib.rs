@@ -92,7 +92,7 @@ pub fn build_hash() -> &'static str {
 // (R3.1.1, #143). `init()` below is the one caller that tells the classes
 // apart, because it retries the transient one.
 use graph::store::{
-    is_lock_contention_error, is_storage_version_mismatch_error, is_transient_wal_open_race_error,
+    is_lock_contention_error, is_storage_version_mismatch_error, is_transient_open_error,
     lock_contention_context, storage_version_mismatch_context,
 };
 
@@ -122,7 +122,7 @@ fn open_kuzu_with_retry<T>(
     let mut delay = std::time::Duration::from_millis(1);
     let mut last_err = match open() {
         Ok(v) => return Ok(v),
-        Err(e) if is_lock_contention_error(&e) || is_transient_wal_open_race_error(&e) => e,
+        Err(e) if is_transient_open_error(&e) => e,
         Err(e) => return Err(e),
     };
     loop {
@@ -144,9 +144,7 @@ fn open_kuzu_with_retry<T>(
         }
         match open() {
             Ok(v) => return Ok(v),
-            Err(e) if is_lock_contention_error(&e) || is_transient_wal_open_race_error(&e) => {
-                last_err = e
-            }
+            Err(e) if is_transient_open_error(&e) => last_err = e,
             Err(e) => return Err(e),
         }
     }
@@ -1223,7 +1221,25 @@ mod tests {
         );
         assert!(is_storage_version_mismatch_error(&err));
         assert!(!is_lock_contention_error(&err));
-        assert!(!is_transient_wal_open_race_error(&err));
+        assert!(!graph::store::is_transient_wal_open_race_error(&err));
+    }
+
+    /// A live writer's checkpoint makes a concurrent read-only open fail
+    /// with lbug's own "retry later" message (sittir, 2026-09-02: every
+    /// post-write read-only open in `infigraph index`, registration
+    /// included, died on it seconds after the daemon accepted the write).
+    /// It must be retried like lock contention and never read as
+    /// corruption by the wipe-on-open recovery.
+    #[test]
+    fn checkpoint_in_progress_is_transient_not_corruption() {
+        let err = anyhow::anyhow!(
+            "failed to open kuzu db (read-only): Runtime exception: Cannot open database in \
+             read-only mode while checkpoint is in progress. Please retry later."
+        );
+        assert!(graph::store::is_checkpoint_in_progress_error(&err));
+        assert!(is_transient_open_error(&err));
+        assert!(graph::open_failure_is_not_corruption(&err));
+        assert!(!is_lock_contention_error(&err));
     }
 
     #[test]
