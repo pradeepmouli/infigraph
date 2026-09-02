@@ -1,6 +1,7 @@
 mod backend;
 pub mod cozo_store;
 pub mod daemon_kuzu_backend;
+pub(crate) mod growth_gate;
 mod kuzu_backend;
 pub mod lock_probe;
 #[cfg(feature = "neo4j")]

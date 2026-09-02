@@ -33,6 +33,7 @@ impl GraphStore {
             }
         }
 
+        let _phase = crate::write_phase::enter(&"index-file: upsert", 1);
         let conn = self.connection()?;
         self.upsert_file_conn(&conn, extraction, &lock)?;
         self.bump_ast_generation_conn(&conn, &lock)?;

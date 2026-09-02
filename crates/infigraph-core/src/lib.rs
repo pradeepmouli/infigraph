@@ -53,6 +53,7 @@ pub mod viz;
 pub mod vuln;
 pub mod watch;
 pub mod worktree;
+pub mod write_phase;
 
 /// Re-exported so a downstream crate's `infigraph_core::settings!` expansion
 /// can reach `paste::paste!` via `$crate::paste::paste!`, and `toml_edit::Item`

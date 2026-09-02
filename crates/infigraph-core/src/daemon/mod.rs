@@ -1135,6 +1135,7 @@ fn watch_db(
     held: &mut Option<Arc<Infigraph>>,
 ) -> Result<Arc<Infigraph>> {
     if held.is_none() {
+        let _phase = crate::write_phase::enter(&"daemon: open graph", 0);
         *held = Some(Arc::new(open_transient(root, registry)?));
     }
     Ok(Arc::clone(held.as_ref().unwrap()))
@@ -1157,6 +1158,9 @@ fn watch_db(
 /// Drops the watch session's shared DB connection so the next `watch_db`
 /// call reopens fresh. See `watch_db`'s doc comment for when to call this.
 fn poison_watch_db(held: &mut Option<Arc<Infigraph>>) {
+    // Dropping the last `Arc` closes the lbug Database, which checkpoints
+    // on close -- name it in case that is where the process aborts (#132).
+    let _phase = crate::write_phase::enter(&"daemon: drop held graph (checkpoint on close)", 0);
     *held = None;
 }
 

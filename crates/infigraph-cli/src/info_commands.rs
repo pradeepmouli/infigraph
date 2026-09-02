@@ -391,6 +391,11 @@ pub(crate) fn cmd_daemon(root: &Path, debounce: u64) -> Result<()> {
     // `[daemon-start]` banner below for why) -- no separate log target
     // needed.
     install_daemon_panic_hook();
+    // The panic hook cannot see an uncaught C++ exception inside lbug --
+    // that aborts the process. This handler prints the in-flight
+    // `write_phase` from SIGABRT so the abort at least names its phase
+    // (#132), then lets the abort proceed.
+    infigraph_core::write_phase::install_abort_breadcrumb();
 
     // Test-only: deterministically exercise the hook above without relying
     // on a real, hard-to-trigger internal panic. Mirrors

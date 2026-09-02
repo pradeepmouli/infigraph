@@ -398,8 +398,13 @@ impl GraphStore {
                 path.display()
             );
         }
-        let db = Database::new(path, SystemConfig::default())
-            .map_err(|e| anyhow::anyhow!("failed to open kuzu db: {e}"))?;
+        let db = {
+            // Opening replays the WAL and may checkpoint -- transaction-
+            // manager code with no Rust frame above it to catch anything.
+            let _phase = crate::write_phase::enter(&"open graph (WAL replay)", 0);
+            Database::new(path, SystemConfig::default())
+                .map_err(|e| anyhow::anyhow!("failed to open kuzu db: {e}"))?
+        };
         refuse_newer_schema(&db, path)?;
         let store = Self { db, lock_path };
         let lock = WriteLock::acquire_with_timeout(&store.lock_path, timeout)?;
@@ -703,11 +708,15 @@ impl GraphStore {
             .map_err(|e| anyhow::anyhow!("failed to begin transaction: {e}"))?;
         match f(&conn) {
             Ok(value) => {
+                // COMMIT is where lbug runs its forced/auto checkpoint --
+                // the step most worth naming if the process aborts (#132).
+                let _phase = crate::write_phase::enter(&"transaction: COMMIT", 0);
                 conn.query("COMMIT")
                     .map_err(|e| anyhow::anyhow!("failed to commit transaction: {e}"))?;
                 Ok(value)
             }
             Err(e) => {
+                let _phase = crate::write_phase::enter(&"transaction: ROLLBACK", 0);
                 let _ = conn.query("ROLLBACK");
                 Err(e)
             }
@@ -727,6 +736,7 @@ impl GraphStore {
         file: &str,
         _witness: &WriteLock,
     ) -> Result<()> {
+        let _phase = crate::write_phase::enter(&"remove-file", 1);
         let _ = conn.query(&format!(
             "MATCH (f:File)-[:DEFINES]->(s:Symbol)-[:HAS_STATEMENT]->(st:Statement) WHERE f.id = '{}' DETACH DELETE st",
             escape(file)

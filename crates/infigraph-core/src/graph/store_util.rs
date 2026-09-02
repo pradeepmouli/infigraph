@@ -340,10 +340,14 @@ pub(crate) fn copy_edges_with_bad_record_retry(
     dst_label: &str,
     edge_pq: &Path,
 ) -> Result<()> {
+    // Every attempt is a whole new COPY -- re-check growth each time
+    // (#132 gap 1) rather than trusting the caller's once-per-call preflight.
+    let mut gate = store.growth_gate(1);
     for attempt in 0..MAX_BAD_RECORD_RETRIES {
         if pairs.is_empty() {
             return Ok(());
         }
+        gate.tick()?;
         let conn = store.connection()?;
         let refs: Vec<(&str, &str)> = pairs
             .iter()

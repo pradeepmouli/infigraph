@@ -459,27 +459,36 @@ impl GraphBackend for KuzuBackend {
         }
 
         let use_csv = existing_hashes_empty || extractions.len() > 100;
+        let batch = extractions.len() as u64;
 
         // Both branches run their delete(+insert) inside
         // `GraphStore::transaction` (#119): a failed upsert rolls the whole
         // batch back instead of leaving a half-applied batch open on a
-        // connection that is about to be dropped.
+        // connection that is about to be dropped. Each lbug call is
+        // bracketed by a `write_phase` so a C++ abort names it (#132).
         if use_csv {
             // Parquet bulk path: delete stale → COPY FROM → folders
             if !existing_hashes_empty {
+                let _phase = crate::write_phase::enter(&"bulk-index: delete batch", batch);
                 self.store
                     .transaction(|conn| self.delete_files_data(conn, extractions))
                     .context("delete transaction for the bulk-index batch")?;
             }
+            let _phase = crate::write_phase::enter(&"bulk-index: COPY FROM parquet", batch);
             let conn = self.store.connection()?;
             self.store
                 .upsert_all_parquet_conn(&conn, extractions, &write_lock)?;
         } else {
-            // Per-file UNWIND path for small incremental updates
+            // Per-file UNWIND path for small incremental updates. The gate
+            // re-runs the growth check every few files (#132 gap 1): the
+            // preflight above only saw the graph once, before the batch.
+            let _phase = crate::write_phase::enter(&"bulk-index: per-file UNWIND", batch);
+            let mut gate = self.store.growth_gate(GROWTH_CHECK_EVERY_FILES);
             self.store
                 .transaction(|conn| {
                     self.delete_files_data(conn, extractions)?;
                     for extraction in extractions {
+                        gate.tick()?;
                         self.store
                             .upsert_file_conn_no_delete(conn, extraction, &write_lock)?;
                     }
@@ -489,6 +498,7 @@ impl GraphBackend for KuzuBackend {
         }
 
         // Upsert folder hierarchy
+        let _phase = crate::write_phase::enter(&"bulk-index: folders + generation bump", batch);
         let file_paths: Vec<&str> = extractions.iter().map(|e| e.file.as_str()).collect();
         let conn = self.store.connection()?;
         self.store
@@ -842,6 +852,11 @@ impl GraphBackend for KuzuBackend {
         crate::structured::ingest_directory(&conn, schema, dir)
     }
 }
+
+/// How many files the incremental per-file loop writes between growth
+/// checks (`GrowthGate`). Two `stat`s per check; 25 keeps that under one
+/// percent of the per-file cost while still bounding a runaway batch.
+const GROWTH_CHECK_EVERY_FILES: usize = 25;
 
 impl KuzuBackend {
     /// Delete all graph data for the given files. Caller manages the transaction.

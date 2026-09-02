@@ -155,9 +155,11 @@ pub fn import_scip_index_enriched_at(
     // `if let Ok(rows) = ...` was treating that failure identically to "this
     // is a brand-new project with no symbols yet".
     let q = "MATCH (s:Symbol) RETURN s.id, s.file, s.name, s.start_line, s.end_line";
-    let rows = conn
-        .query(q)
-        .context("SCIP import: failed to preload existing symbols")?;
+    let rows = {
+        let _phase = crate::write_phase::enter(&"scip-import: preload symbols", 0);
+        conn.query(q)
+            .context("SCIP import: failed to preload existing symbols")?
+    };
     for row in rows {
         if row.len() < 5 {
             continue;
@@ -430,10 +432,17 @@ pub fn import_scip_index_enriched_at(
             .filter(|(id, ..)| seen_ids.insert(id.clone()))
             .collect();
 
+        // Re-check growth on every attempt (#132 gap 1): each retry is a
+        // whole new COPY, and a retry loop is exactly the shape that can
+        // outgrow a once-per-call preflight.
+        let mut gate = store.growth_gate(1);
         for attempt in 0..MAX_SYMBOL_RETRIES {
             if remaining.is_empty() {
                 break;
             }
+            gate.tick()?;
+            let _phase =
+                crate::write_phase::enter(&"scip-import: COPY Symbol", remaining.len() as u64);
 
             // Fresh connection every attempt -- a caught COPY failure can
             // leave Kùzu's internal transaction bookkeeping wedged for
@@ -548,6 +557,11 @@ pub fn import_scip_index_enriched_at(
             // COPY on whatever connection it was using.
             let conn = store.connection()?;
             for chunk in remaining.chunks(CHUNK) {
+                gate.tick()?;
+                let _phase = crate::write_phase::enter(
+                    &"scip-import: UNWIND Symbol fallback",
+                    chunk.len() as u64,
+                );
                 let rows: Vec<String> = chunk
                     .iter()
                     .map(|(id, name, kind, file, start, end, doc, scip_id)| {
@@ -579,7 +593,10 @@ pub fn import_scip_index_enriched_at(
     // Fresh connection: the Symbol-COPY block above may have just failed a
     // COPY on whatever connection it was using.
     let conn = store.connection()?;
+    let mut gate = store.growth_gate(1);
     for chunk in enrichments.chunks(CHUNK) {
+        gate.tick()?;
+        let _phase = crate::write_phase::enter(&"scip-import: enrich UNWIND", chunk.len() as u64);
         let rows: Vec<String> = chunk
             .iter()
             .map(|(id, doc, scip_id)| {
@@ -679,6 +696,8 @@ pub fn import_scip_index_enriched_at(
         let tmp = std::env::temp_dir();
         let edge_pq = tmp.join("infigraph_scip_calls.parquet");
         stats.references_added = calls_to_create.len();
+        let _phase =
+            crate::write_phase::enter(&"scip-import: COPY CALLS", stats.references_added as u64);
         copy_edges_with_bad_record_retry(
             store,
             "CALLS",
@@ -745,6 +764,8 @@ pub fn import_scip_index_enriched_at(
             std::process::id()
         ));
         stats.relations_added = inherits_to_create.len();
+        let _phase =
+            crate::write_phase::enter(&"scip-import: COPY INHERITS", stats.relations_added as u64);
         copy_edges_with_bad_record_retry(
             store,
             "INHERITS",
