@@ -5,6 +5,7 @@ use std::sync::Mutex;
 use infigraph_core::lang::{LanguagePack, LanguageRegistry};
 use infigraph_core::multi::combined::{
     build_combined_graph, combined_graph_path, combined_query, has_combined_graph,
+    open_combined_graph,
 };
 use infigraph_core::multi::{Group, Registry, RepoEntry};
 use infigraph_core::Infigraph;
@@ -217,6 +218,48 @@ def health_check():
     );
 
     (registry, dir_a, dir_b)
+}
+
+/// #143 (same class as #140): `open_combined_graph` used to wipe the
+/// combined graph on *any* open failure. A graph written on a lbug storage
+/// version this build cannot read is not corruption -- it must be refused
+/// with both versions named and the file left untouched, so `group build`
+/// on the right binary (or a rebuild) still has it.
+#[test]
+fn open_combined_graph_refuses_a_different_storage_version_instead_of_wiping() {
+    let _guard = COMBINED_LOCK.lock().unwrap();
+    let home = tempfile::TempDir::new().unwrap();
+    let orig_home = std::env::var("HOME").unwrap_or_default();
+    let (registry, _dir_a, _dir_b) = setup_two_repo_group(&home);
+    build_combined_graph(&registry, "test-platform").expect("build combined graph");
+    let path = combined_graph_path("test-platform").unwrap();
+    assert!(
+        path.exists(),
+        "combined graph must exist before re-stamping"
+    );
+
+    let current = kuzu::get_storage_version();
+    let foreign = current + 1;
+    let mut bytes = std::fs::read(&path).unwrap();
+    assert_eq!(&bytes[..4], b"LBUG", "unexpected database header layout");
+    bytes[4..12].copy_from_slice(&foreign.to_le_bytes());
+    std::fs::write(&path, &bytes).unwrap();
+
+    let err = open_combined_graph("test-platform")
+        .map(|_| ())
+        .expect_err("a storage-version mismatch must be refused, not wiped");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains(&foreign.to_string()) && msg.contains(&current.to_string()),
+        "the refusal must name both storage versions: {msg}"
+    );
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        bytes,
+        "the combined graph must be left byte-for-byte untouched"
+    );
+
+    std::env::set_var("HOME", orig_home);
 }
 
 #[test]

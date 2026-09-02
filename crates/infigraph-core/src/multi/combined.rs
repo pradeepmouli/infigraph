@@ -998,6 +998,13 @@ pub fn open_combined_graph(group_name: &str) -> Result<GraphStore> {
     }
     match GraphStore::open(&path) {
         Ok(store) => Ok(store),
+        Err(first_err) if crate::graph::open_failure_is_not_corruption(&first_err) => {
+            // R3.1.1 / #143: busy, mid-race, or written on another lbug
+            // version -- none of which the wipe below could fix, and all of
+            // which it would destroy.
+            let ctx = crate::graph::non_corruption_open_context(&first_err, &path);
+            Err(first_err.context(ctx))
+        }
         Err(first_err) => {
             eprintln!(
                 "[combined-graph] open failed for group '{group_name}' ({first_err}), \

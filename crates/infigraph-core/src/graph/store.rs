@@ -260,6 +260,116 @@ fn refuse_newer_schema(db: &Database, db_path: &Path) -> Result<()> {
     Ok(())
 }
 
+// ---- Open-failure classification (R3.1.1) ----
+//
+// `Database::new` collapses every failure into one stringified error before
+// it reaches any caller, so the only way to tell "not corruption -- leave the
+// file alone" from "durably unopenable" is the text. These are the classes
+// every wipe-on-open-failure path (`Infigraph::init`, `DocIndex::init`,
+// `open_combined_graph`, the combined-docs generation) must recognise BEFORE
+// taking a destructive branch. They live here, next to the open itself,
+// precisely so that each of those paths does not grow its own partial list
+// (#143 found two that had none at all).
+
+/// Kuzu's IO-layer error for "another process holds this database's lock"
+/// (see docs.ladybugdb.com/concurrency) is lock contention, not corruption.
+/// This was previously indistinguishable from genuine corruption, so a
+/// second `infigraph` process opening a graph while a watcher already had
+/// it open would trigger `wipe_graph`, destroying the watcher's live data.
+pub fn is_lock_contention_error(err: &anyhow::Error) -> bool {
+    err.to_string().contains("Could not set lock on file")
+}
+
+/// A `Database::new` open failure (`"failed to open kuzu db"` /
+/// `"failed to open kuzu db (read-only)"`, `GraphStore::open`/`open_read_only`'s
+/// own wrapping) that mentions the WAL. Distinct from `unclean_shutdown_wal_holder`'s
+/// deliberately different-worded dead-holder bail ("...unreplayed WAL from
+/// process {pid}, which is no longer running...", raised *before* `Database::new`
+/// is ever called) -- that one is genuine, already-diagnosed corruption and must
+/// not retry.
+///
+/// A live writer actively checkpointing/rotating the WAL can make a
+/// concurrent read-only open transiently fail this way (observed: "Runtime
+/// exception: Corrupted wal file. Read out invalid WAL record type." against
+/// a graph `doctor` calls healthy moments later, with a live write-lock
+/// holder) -- retrying briefly lets that resolve instead of hard-failing
+/// (or, on the write path, escalating straight to a wipe-and-rebuild) on
+/// what may just be a race.
+pub fn is_transient_wal_open_race_error(err: &anyhow::Error) -> bool {
+    let msg = err.to_string();
+    msg.contains("failed to open kuzu db") && msg.to_lowercase().contains("wal")
+}
+
+/// lbug's `DatabaseHeader` refusal for a data file stamped with a storage
+/// version this build cannot read ("Trying to read a database file with a
+/// different version. Database file version: N, Current build storage
+/// version: M"). `Database::new` raises it on any non-empty file (via
+/// `Checkpointer::readCheckpoint`), so it arrives through the same "failed
+/// to open ... kuzu db" wrapping as every other open failure. It is neither
+/// transient nor corruption: the database was written by an `infigraph` on
+/// a different lbug version (typically a stale binary still on the old one,
+/// or a file left behind by a newer install) and this process simply cannot
+/// read it. Wiping it would destroy a perfectly good database and serve an
+/// empty one back as healthy (#140).
+pub fn is_storage_version_mismatch_error(err: &anyhow::Error) -> bool {
+    err.to_string()
+        .contains("Trying to read a database file with a different version")
+}
+
+/// Every open failure that must never trigger a wipe or quarantine: the
+/// file is either busy, mid-race with a live writer, or written on a lbug
+/// version this build cannot read. The single guard for callers whose only
+/// choices are "refuse" or "destroy and rebuild" (`DocIndex::init`,
+/// `open_combined_graph`); `Infigraph::init` distinguishes the classes
+/// itself because it retries the transient one.
+pub fn open_failure_is_not_corruption(err: &anyhow::Error) -> bool {
+    is_lock_contention_error(err)
+        || is_transient_wal_open_race_error(err)
+        || is_storage_version_mismatch_error(err)
+}
+
+/// Context line for a lock-contention open failure, naming the holder
+/// when the OS can tell us (see `lock_probe::describe_lock_holder`).
+pub fn lock_contention_context(db_path: &Path) -> String {
+    format!(
+        "{} is locked by another infigraph process ({}) -- not corrupted, so it was left \
+         untouched. Run `infigraph ps` / `infigraph watch-status` or try again in a moment.",
+        db_path.display(),
+        super::lock_probe::describe_lock_holder(db_path, super::lock_probe::ProbeFor::Write)
+    )
+}
+
+/// Context line for a storage-version refusal. lbug's own message (kept as
+/// the cause) already names both versions; this adds which build is
+/// speaking, that nothing was touched, and the two ways out.
+pub fn storage_version_mismatch_context(db_path: &Path) -> String {
+    format!(
+        "{} was written on a different lbug storage version than this build (v{}) can read \
+         -- not corrupted, so it was left untouched. Every process touching this project must \
+         run the same installed infigraph build (`infigraph doctor` / `infigraph ps` show mixed \
+         builds); to rebuild on this build's version instead, run `infigraph index --full`.",
+        db_path.display(),
+        kuzu::get_storage_version()
+    )
+}
+
+/// Context line for any [`open_failure_is_not_corruption`] failure, so a
+/// caller that refuses instead of wiping explains *why* the file was left
+/// alone in the same words `Infigraph::init` uses.
+pub fn non_corruption_open_context(err: &anyhow::Error, db_path: &Path) -> String {
+    if is_lock_contention_error(err) {
+        lock_contention_context(db_path)
+    } else if is_storage_version_mismatch_error(err) {
+        storage_version_mismatch_context(db_path)
+    } else {
+        format!(
+            "{} failed to open on what looks like a transient WAL race with a live writer -- \
+             not corrupted, so it was left untouched; try again in a moment",
+            db_path.display()
+        )
+    }
+}
+
 /// Persistent graph store backed by Kuzu.
 pub struct GraphStore {
     db: Database,

@@ -81,6 +81,17 @@ impl DocIndex {
                 self.store = Some(Box::new(store));
                 Ok(())
             }
+            Err(first_err) if infigraph_core::graph::open_failure_is_not_corruption(&first_err) => {
+                // R3.1.1 / #143: a live holder's lock, a transient WAL race,
+                // or a store written on another lbug version is not
+                // corruption. Wiping here used to unlink a live doc
+                // watcher's store out from under it (its later writes went
+                // to an orphaned inode) and silently downgrade a
+                // newer-version store; refuse and say why instead.
+                let ctx =
+                    infigraph_core::graph::non_corruption_open_context(&first_err, &self.db_path);
+                Err(first_err.context(ctx))
+            }
             Err(first_err) => {
                 eprintln!(
                     "[docs] open failed ({first_err}), wiping corrupt doc index and rebuilding..."

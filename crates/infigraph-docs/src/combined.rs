@@ -420,6 +420,11 @@ pub fn combined_doc_search(
         .and_then(|store| hybrid_doc_search_in_dir(query, &store, &artifact_dir, limit, alpha))
     {
         Ok(results) => Ok(results),
+        Err(first_err) if infigraph_core::graph::open_failure_is_not_corruption(&first_err) => {
+            // R3.1.1 / #143: not corruption -- leave the generation alone.
+            let ctx = infigraph_core::graph::non_corruption_open_context(&first_err, &store_path);
+            Err(first_err.context(ctx))
+        }
         Err(first_err) => {
             eprintln!(
                 "[combined-docs] search failed for group '{group_name}' ({first_err}), \
@@ -446,6 +451,14 @@ pub fn combined_doc_query(group_name: &str, cypher: &str) -> Result<Vec<Vec<Stri
     });
     match result {
         Ok(rows) => Ok(rows),
+        Err(first_err) if infigraph_core::graph::open_failure_is_not_corruption(&first_err) => {
+            // R3.1.1 / #143: not corruption -- leave the generation alone.
+            let ctx = match combined_docs_path(group_name) {
+                Ok(path) => infigraph_core::graph::non_corruption_open_context(&first_err, &path),
+                Err(_) => "combined document store left untouched".to_string(),
+            };
+            Err(first_err.context(ctx))
+        }
         Err(first_err) if has_combined_docs(group_name) => {
             eprintln!(
                 "[combined-docs] query failed for group '{group_name}' ({first_err}), \
