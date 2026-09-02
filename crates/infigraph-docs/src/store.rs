@@ -74,9 +74,14 @@ static DB_LOCK: Mutex<()> = Mutex::new(());
 
 impl DocStore {
     pub fn open(path: &Path) -> Result<Self> {
+        // The mutex guards nothing but exclusivity, so a panic while a
+        // store was open leaves no invalid state behind it. Treating the
+        // poison as an open failure used to cascade: every later open in the
+        // process failed, and `DocIndex::init` read that failure as
+        // corruption and wiped the docs store (#144).
         let guard = DB_LOCK
             .lock()
-            .map_err(|e| anyhow::anyhow!("doc store lock poisoned: {e}"))?;
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -363,14 +368,16 @@ impl DocStore {
             .map(|id| format!("'{}'", escape_str(id)))
             .collect::<Vec<_>>()
             .join(", ");
-        let _ = conn.query(&format!(
+        conn.query(&format!(
             "MATCH (c:Chunk) WHERE c.doc_file IN [{}] DETACH DELETE c",
             id_list
-        ));
-        let _ = conn.query(&format!(
+        ))
+        .map_err(|e| anyhow::anyhow!("delete stale chunks: {e}"))?;
+        conn.query(&format!(
             "MATCH (d:Document) WHERE d.id IN [{}] DETACH DELETE d",
             id_list
-        ));
+        ))
+        .map_err(|e| anyhow::anyhow!("delete stale documents: {e}"))?;
         Ok(())
     }
 

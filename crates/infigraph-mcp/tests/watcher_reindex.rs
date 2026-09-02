@@ -91,6 +91,30 @@ fn wait_for_watch_locks_released(paths: &[String]) {
     }
 }
 
+/// The doc ids currently in the project's doc store -- the only witness
+/// that a doc-watcher reindex actually ran. Polling `search_docs` for a
+/// term proves nothing: its header line echoes the query verbatim
+/// (`Document search: '<query>' ...`), so `contains(query)` is true on the
+/// first call, before any reindex -- which is how these tests used to stop
+/// the watcher before it had reindexed and report a prune bug that did not
+/// exist (#144).
+fn doc_store_keys(path: &str) -> Vec<String> {
+    let mut idx = infigraph_docs::DocIndex::open(std::path::Path::new(path)).unwrap();
+    idx.init().unwrap();
+    let store = idx.store().unwrap();
+    store
+        .get_doc_hashes()
+        .unwrap_or_default()
+        .into_keys()
+        .collect()
+}
+
+/// `search_docs` output minus its query-echoing header line (see
+/// `doc_store_keys`), so a `contains` check matches result rows only.
+fn search_body(out: &str) -> &str {
+    out.split_once("\n\n").map(|(_, body)| body).unwrap_or("")
+}
+
 fn poll_until<F: Fn() -> bool>(check: F, timeout: Duration, desc: &str) -> bool {
     let start = Instant::now();
     while start.elapsed() < timeout {
@@ -313,24 +337,21 @@ fn test_doc_watcher_reindexes_new_doc() {
     .unwrap();
     eprintln!("wrote new doc: {}", new_doc.display());
 
-    // Poll until the new doc is searchable
+    // Poll the store itself until the watcher's reindex has landed the doc.
     let found = poll_until(
-        || {
-            tool_search_docs(&json!({"path": &path, "query": "xylophone_zebra_unicorn"}))
-                .map(|r| {
-                    let has = r.contains("xylophone_zebra_unicorn") || r.contains("Unique Guide");
-                    if !has {
-                        eprintln!("search_docs result: {r}");
-                    }
-                    has
-                })
-                .unwrap_or(false)
-        },
+        || doc_store_keys(&path).iter().any(|k| k == "docs/guide.md"),
         Duration::from_secs(15),
-        "xylophone_zebra_unicorn should be searchable after doc watcher reindex",
+        "docs/guide.md should be in the doc store after the doc watcher reindexes",
     );
-
     assert!(found, "doc watcher should have reindexed new document");
+
+    let result =
+        tool_search_docs(&json!({"path": &path, "query": "xylophone_zebra_unicorn"})).unwrap();
+    let body = search_body(&result);
+    assert!(
+        body.contains("xylophone_zebra_unicorn") || body.contains("Unique Guide"),
+        "new doc should be searchable after reindex: {result}"
+    );
 }
 
 /// Doc watcher without concurrent readers — isolates whether WAL error is from concurrency.
@@ -371,8 +392,9 @@ fn test_doc_watcher_reindexes_no_concurrent_read() {
     let result =
         tool_search_docs(&json!({"path": &path, "query": "alpha_beta_gamma_unique"})).unwrap();
     eprintln!("search result: {result}");
+    let body = search_body(&result);
     assert!(
-        result.contains("alpha_beta_gamma") || result.contains("No Concurrent"),
+        body.contains("alpha_beta_gamma") || body.contains("No Concurrent"),
         "doc watcher should have reindexed without concurrent readers: {result}"
     );
 }
@@ -547,17 +569,24 @@ fn test_doc_watcher_reindexes_new_doc_new_dir() {
 
     let found = poll_until(
         || {
-            tool_search_docs(&json!({"path": &path, "query": "quantum_flux_capacitor"}))
-                .map(|r| r.contains("quantum_flux_capacitor") || r.contains("Getting Started"))
-                .unwrap_or(false)
+            doc_store_keys(&path)
+                .iter()
+                .any(|k| k == "docs/tutorials/getting-started.md")
         },
         Duration::from_secs(15),
-        "quantum_flux_capacitor should be searchable after doc watcher picks up new subdir",
+        "docs/tutorials/getting-started.md should be in the doc store after the watcher picks up the new subdir",
     );
-
     assert!(
         found,
         "doc watcher should reindex docs in new subdirectories (recursive mode)"
+    );
+
+    let result =
+        tool_search_docs(&json!({"path": &path, "query": "quantum_flux_capacitor"})).unwrap();
+    let body = search_body(&result);
+    assert!(
+        body.contains("quantum_flux_capacitor") || body.contains("Getting Started"),
+        "new subdir doc should be searchable after reindex: {result}"
     );
 }
 
@@ -982,10 +1011,11 @@ fn test_doc_watcher_prunes_stale_docs() {
     // Initial doc index — both docs indexed
     tool_index_docs(&json!({"path": &path})).expect("initial doc index");
 
-    let result = tool_search_docs(&json!({"path": &path, "query": "stale_prune_target"})).unwrap();
     assert!(
-        result.contains("stale_prune_target") || result.contains("Delete Me"),
-        "delete_me.md should be indexed initially: {result}"
+        doc_store_keys(&path)
+            .iter()
+            .any(|k| k == "docs/delete_me.md"),
+        "delete_me.md should be indexed initially"
     );
 
     // Delete the file from disk
@@ -1006,40 +1036,29 @@ fn test_doc_watcher_prunes_stale_docs() {
     )
     .unwrap();
 
-    // Wait for reindex to complete
-    let reindexed = poll_until(
+    // Wait for the watcher's reindex: its full-walk prune is what removes
+    // the deleted doc's row, so the store losing that key IS the reindex.
+    let pruned = poll_until(
         || {
-            tool_search_docs(&json!({"path": &path, "query": "trigger reindex"}))
-                .map(|r| r.contains("trigger reindex") || r.contains("Updated"))
-                .unwrap_or(false)
+            !doc_store_keys(&path)
+                .iter()
+                .any(|k| k == "docs/delete_me.md")
         },
         Duration::from_secs(15),
-        "keeper doc should reflect update after reindex",
+        "docs/delete_me.md should be pruned once the doc watcher reindexes",
     );
 
     stop_all_doc_watchers();
 
-    assert!(reindexed, "doc watcher should have reindexed after change");
-
-    // Verify stale doc is pruned from the graph store directly
-    // (search_docs uses HNSW embeddings on disk which aren't pruned yet)
-    {
-        let mut idx = infigraph_docs::DocIndex::open(std::path::Path::new(&path)).unwrap();
-        idx.init().unwrap();
-        let store = idx.store().unwrap();
-        let hashes = store.get_doc_hashes().unwrap_or_default();
-
-        assert!(
-            !hashes.contains_key("docs/delete_me.md"),
-            "deleted doc should be pruned from doc store, found keys: {:?}",
-            hashes.keys().collect::<Vec<_>>()
-        );
-
-        assert!(
-            hashes.contains_key("docs/keep.md"),
-            "kept doc should still be in doc store"
-        );
-    }
+    let keys = doc_store_keys(&path);
+    assert!(
+        pruned,
+        "deleted doc should be pruned from doc store, found keys: {keys:?}"
+    );
+    assert!(
+        keys.iter().any(|k| k == "docs/keep.md"),
+        "kept doc should still be in doc store: {keys:?}"
+    );
 }
 
 /// auto_start_watch should not create duplicate watchers when called multiple times.

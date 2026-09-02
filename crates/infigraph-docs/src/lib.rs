@@ -169,7 +169,13 @@ impl DocIndex {
             });
         }
 
-        let existing_hashes = store.get_doc_hashes().unwrap_or_default();
+        // Never treat a failed hash load as "no documents yet": that
+        // re-embeds every doc and, worse, turns the stale-doc prune below
+        // into a silent no-op (#144) -- the same failure shape as the SCIP
+        // symbol preload that once ballooned a graph.
+        let existing_hashes = store
+            .get_doc_hashes()
+            .context("doc index: failed to load existing document hashes")?;
 
         let done = AtomicUsize::new(0);
         let root = &self.root;
@@ -280,7 +286,9 @@ impl DocIndex {
             if !stale.is_empty() {
                 eprintln!("Doc pruning: removing {} stale doc(s)", stale.len());
                 let stale_refs: Vec<&str> = stale.iter().map(|s| s.as_str()).collect();
-                let _ = store.delete_docs_by_ids(&stale_refs);
+                if let Err(e) = store.delete_docs_by_ids(&stale_refs) {
+                    eprintln!("warn: doc pruning failed, stale docs remain: {e:#}");
+                }
             }
         }
 
