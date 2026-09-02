@@ -160,13 +160,11 @@ pub fn tool_index_project(args: &Value) -> Result<String> {
         let mut out = combined;
 
         // Register in global registry so watchers auto-start on next MCP init
-        if let Ok(prism) = open_prism(args) {
-            let project_name = std::path::Path::new(path)
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_else(|| path.to_string());
-            let mut registry = infigraph_core::multi::Registry::load().unwrap_or_default();
-            let _ = registry.register_repo(&project_name, &std::path::PathBuf::from(path), &prism);
+        match open_prism(args) {
+            Ok(prism) => register_project_or_warn(path, &prism, &mut out),
+            Err(e) => out.push_str(&format!(
+                "\nwarning: could not open {path} to register it in the registry: {e:#}"
+            )),
         }
 
         if let Some(msg) = auto_start_watch(path) {
@@ -259,14 +257,7 @@ pub fn tool_index_project(args: &Value) -> Result<String> {
     out.push_str(&format!("\n{}", stats));
 
     // Register in global registry so watchers auto-start on next MCP init
-    {
-        let project_name = std::path::Path::new(path)
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| path.to_string());
-        let mut registry = infigraph_core::multi::Registry::load().unwrap_or_default();
-        let _ = registry.register_repo(&project_name, &std::path::PathBuf::from(path), &prism);
-    }
+    register_project_or_warn(path, &prism, &mut out);
 
     if let Some(msg) = auto_start_watch(path) {
         out.push_str(&format!("\n{}", msg));
@@ -317,6 +308,25 @@ pub fn tool_get_dependencies(args: &Value) -> Result<String> {
         out.push_str(&format!("  {}@{}{}\n", d.name, d.version, dev_tag));
     }
     Ok(out)
+}
+
+/// Registers the project after an index. A failure lands in the tool
+/// output instead of being dropped: the silent `let _` this replaces was
+/// one way a rebuilt project could vanish from `doctor`'s registry check
+/// for good (#100).
+fn register_project_or_warn(path: &str, prism: &infigraph_core::Infigraph, out: &mut String) {
+    let project_name = std::path::Path::new(path)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.to_string());
+    let result = infigraph_core::multi::Registry::load().and_then(|mut registry| {
+        registry.register_repo(&project_name, &std::path::PathBuf::from(path), prism)
+    });
+    if let Err(e) = result {
+        out.push_str(&format!(
+            "\nwarning: could not register {path} in the registry: {e:#}"
+        ));
+    }
 }
 
 pub fn tool_scip_import(args: &Value) -> Result<String> {

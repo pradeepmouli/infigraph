@@ -11,6 +11,21 @@ use tokio_util::sync::CancellationToken;
 /// Per-indexer subprocess timeout for SCIP enrichment. Nothing before Task 6
 /// of the daemon/watch command split bounded a hung SCIP indexer at all --
 /// 10 minutes is generous enough for `rust-analyzer`'s cold-start
+/// Registers `root` in the repo registry (~/.infigraph/registry.json
+/// locally, Postgres in remote mode) so `infigraph repos` and `infigraph
+/// doctor` see it, and returns the name it was registered under. Every
+/// index path must reach this -- see `cmd_index`'s daemon-routed branch.
+pub(crate) fn register_project(root: &Path, prism: &Infigraph) -> Result<String> {
+    let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let repo_name = canonical
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let mut registry = infigraph_core::multi::Registry::load()?;
+    registry.register_repo(&repo_name, root, prism)?;
+    Ok(repo_name)
+}
+
 /// The `.infigraphignore` entries `infigraph index` suggests when a project
 /// has none. Only build *output* belongs here: the index never extracts a
 /// compiled binary anyway (no language pack claims an extension-less,
@@ -156,8 +171,24 @@ pub(crate) fn cmd_index(root: &Path, full: bool, no_embed: bool) -> Result<()> {
                     anyhow::bail!("full reindex returned an unexpected result: {other:?}");
                 }
             }
-            // The daemon already did the full reindex -- nothing left for
-            // this process to do.
+            // The daemon rebuilt the graph, but registering the project is
+            // still this process's job (#100: this branch used to return
+            // here, so a project whose every rebuild went through the daemon
+            // never came back into registry.json). Open the swapped-in graph
+            // read-only for the stats the registry records; a failure is a
+            // warning, the rebuild itself succeeded.
+            let registered = bundled_registry()
+                .and_then(|registry| Infigraph::open(root, registry))
+                .and_then(|mut prism| {
+                    prism.init_read_only()?;
+                    register_project(root, &prism)
+                });
+            if let Err(e) = registered {
+                eprintln!(
+                    "warning: could not register {} in the registry: {e:#}",
+                    root.display()
+                );
+            }
             return Ok(());
         } else {
             let tg_dir = root.join(".infigraph");
@@ -340,17 +371,9 @@ pub(crate) fn cmd_index(root: &Path, full: bool, no_embed: bool) -> Result<()> {
     let stats = prism.stats()?;
     println!("\n{}", stats);
 
-    // Register this repo in the registry (~/.infigraph/registry.json locally,
-    // Postgres in remote mode) so `infigraph repos` and `infigraph doctor` see it.
-    let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-    let repo_name = canonical
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| "unknown".to_string());
-    {
-        let mut registry = infigraph_core::multi::Registry::load()?;
-        registry.register_repo(&repo_name, root, &prism)?;
-    }
+    // Only the remote-mode block below reads the name back.
+    #[cfg_attr(not(feature = "remote"), allow(unused_variables))]
+    let repo_name = register_project(root, &prism)?;
 
     #[cfg(feature = "remote")]
     if infigraph_core::daemon::lifecycle::is_remote_backend() {
