@@ -145,18 +145,22 @@ impl GraphStore {
                 .iter()
                 .map(|s| format!("'{}'", escape(&s.id)))
                 .collect();
-            let contains_batch = format!(
-                "MATCH (m:Module), (s:Symbol) WHERE m.id = '{}' AND s.id IN [{}] CREATE (m)-[:CONTAINS]->(s)",
-                escape(module_id),
-                sym_ids.join(", ")
+            let contains_batch = super::store_util::fanout_edge_statement(
+                "Module",
+                "Symbol",
+                "CONTAINS",
+                &escape(module_id),
+                &sym_ids.join(", "),
             );
             let _ = conn.query(&contains_batch);
 
             // Batch DEFINES edges: file -> symbols
-            let defines_batch = format!(
-                "MATCH (f:File), (s:Symbol) WHERE f.id = '{}' AND s.id IN [{}] CREATE (f)-[:DEFINES]->(s)",
-                escape(&extraction.file),
-                sym_ids.join(", ")
+            let defines_batch = super::store_util::fanout_edge_statement(
+                "File",
+                "Symbol",
+                "DEFINES",
+                &escape(&extraction.file),
+                &sym_ids.join(", "),
             );
             let _ = conn.query(&defines_batch);
         }
@@ -208,10 +212,11 @@ impl GraphStore {
                 .iter()
                 .map(|(a, b)| format!("{{a: '{}', b: '{}'}}", escape(a), escape(b)))
                 .collect();
-            let batch_rel = format!(
-                "UNWIND [{}] AS p MATCH (a:Symbol), (b:Symbol) WHERE a.id = p.a AND b.id = p.b CREATE (a)-[:{}]->(b)",
-                pair_list.join(", "),
-                rel_type
+            let batch_rel = super::store_util::pair_edge_statement(
+                "Symbol",
+                "Symbol",
+                rel_type,
+                &pair_list.join(", "),
             );
             let _ = conn.query(&batch_rel);
         }
@@ -220,9 +225,11 @@ impl GraphStore {
                 .iter()
                 .map(|(a, b)| format!("{{a: '{}', b: '{}'}}", escape(a), escape(b)))
                 .collect();
-            let _ = conn.query(&format!(
-                "UNWIND [{}] AS p MATCH (a:Module), (b:Module) WHERE a.id = p.a AND b.id = p.b CREATE (a)-[:IMPORTS]->(b)",
-                pair_list.join(", ")
+            let _ = conn.query(&super::store_util::pair_edge_statement(
+                "Module",
+                "Module",
+                "IMPORTS",
+                &pair_list.join(", "),
             ));
         }
         for (edge_name, pairs) in &custom_pairs {
@@ -234,10 +241,11 @@ impl GraphStore {
                 .iter()
                 .map(|(a, b)| format!("{{a: '{}', b: '{}'}}", escape(a), escape(b)))
                 .collect();
-            let _ = conn.query(&format!(
-                "UNWIND [{}] AS p MATCH (a:Symbol), (b:Symbol) WHERE a.id = p.a AND b.id = p.b CREATE (a)-[:{}]->(b)",
-                pair_list.join(", "),
-                edge_name
+            let _ = conn.query(&super::store_util::pair_edge_statement(
+                "Symbol",
+                "Symbol",
+                edge_name,
+                &pair_list.join(", "),
             ));
         }
 
@@ -266,9 +274,11 @@ impl GraphStore {
                     )
                 })
                 .collect();
-            let _ = conn.query(&format!(
-                "UNWIND [{}] AS p MATCH (a:Symbol), (b:Statement) WHERE a.id = p.a AND b.id = p.b CREATE (a)-[:HAS_STATEMENT]->(b)",
-                edge_rows.join(", ")
+            let _ = conn.query(&super::store_util::pair_edge_statement(
+                "Symbol",
+                "Statement",
+                "HAS_STATEMENT",
+                &edge_rows.join(", "),
             ));
         }
 

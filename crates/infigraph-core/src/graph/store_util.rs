@@ -390,6 +390,43 @@ pub(crate) fn copy_edges_with_bad_record_retry(
     Ok(())
 }
 
+/// The statement that creates one edge per `{a: <src id>, b: <dst id>}`
+/// row of `pairs_literal` (already escaped). Written as two `MATCH`
+/// clauses on purpose: `MATCH (a:X), (b:Y) WHERE a.id = p.a AND b.id = p.b`
+/// -- the shape every write path used until 2026-09-02 -- is planned by
+/// lbug as CROSS_PRODUCT over full scans of both node tables, N x |X| x |Y|
+/// per batch; sittir's 71-file incremental write spun a daemon at 100%
+/// CPU for over 15 minutes on a 130k-symbol graph. This form plans as two
+/// QUERY_PRIMARY_KEY_LOOKUPs (verified with EXPLAIN; see the test).
+pub(crate) fn pair_edge_statement(
+    src_label: &str,
+    dst_label: &str,
+    rel: &str,
+    pairs_literal: &str,
+) -> String {
+    format!(
+        "UNWIND [{pairs_literal}] AS p MATCH (a:{src_label}) WHERE a.id = p.a \
+         MATCH (b:{dst_label}) WHERE b.id = p.b CREATE (a)-[:{rel}]->(b)"
+    )
+}
+
+/// One parent to many children (CONTAINS, DEFINES): the parent by primary
+/// key, then each child id of `child_ids_literal` (already escaped, quoted)
+/// by primary-key lookup -- not `s.id IN [...]`, which full-scans the
+/// child table under a FILTER. See `pair_edge_statement`.
+pub(crate) fn fanout_edge_statement(
+    parent_label: &str,
+    child_label: &str,
+    rel: &str,
+    parent_id_escaped: &str,
+    child_ids_literal: &str,
+) -> String {
+    format!(
+        "MATCH (m:{parent_label}) WHERE m.id = '{parent_id_escaped}' UNWIND [{child_ids_literal}] \
+         AS cid MATCH (s:{child_label}) WHERE s.id = cid CREATE (m)-[:{rel}]->(s)"
+    )
+}
+
 pub fn classify_file(file: &str) -> &'static str {
     let fl = file.to_ascii_lowercase();
     if fl.ends_with("-lock.yaml")
@@ -644,6 +681,61 @@ mod tests {
         assert_eq!(
             resolve_import_candidate("other.pkg.constants", &candidates),
             None
+        );
+    }
+
+    /// The wedge behind sittir's incremental-write timeouts (2026-09-02): an
+    /// edge batch written as `MATCH (a), (b) WHERE a.id = p.a AND b.id =
+    /// p.b` plans as CROSS_PRODUCT over full scans of both node tables,
+    /// N x |A| x |B| per batch; a 71-file write on a 130k-symbol graph spun
+    /// for 15+ minutes. The helpers must plan as primary-key lookups.
+    #[test]
+    fn edge_statements_plan_as_primary_key_lookups_not_cross_products() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = super::super::GraphStore::open(&tmp.path().join("graph")).unwrap();
+        let conn = store.connection().unwrap();
+        let plan = |statement: &str| -> String {
+            conn.query(&format!("EXPLAIN {statement}"))
+                .unwrap()
+                .map(|row| {
+                    row.iter()
+                        .map(|v| v.to_string())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let pair = super::pair_edge_statement(
+            "Symbol",
+            "Symbol",
+            "CALLS",
+            "{a: 'a.py::f', b: 'a.py::g'}, {a: 'a.py::f', b: 'b.py::h'}",
+        );
+        let p = plan(&pair);
+        assert!(!p.contains("CROSS_PRODUCT"), "pair edge plan:\n{p}");
+        assert_eq!(
+            p.matches("QUERY_PRIMARY_KEY_LOOKUP").count(),
+            2,
+            "pair edge plan:\n{p}"
+        );
+
+        let fanout = super::fanout_edge_statement(
+            "File",
+            "Symbol",
+            "DEFINES",
+            "a.py",
+            "'a.py::f', 'a.py::g'",
+        );
+        let p = plan(&fanout);
+        assert!(!p.contains("CROSS_PRODUCT"), "fan-out edge plan:\n{p}");
+        assert!(
+            p.contains("QUERY_PRIMARY_KEY_LOOKUP"),
+            "fan-out edge plan:\n{p}"
+        );
+        assert!(
+            p.contains("PRIMARY_KEY_SCAN_NODE_TABLE"),
+            "fan-out edge plan:\n{p}"
         );
     }
 }

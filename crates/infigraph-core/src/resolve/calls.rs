@@ -181,10 +181,11 @@ fn resolve_custom_edges(
                 .iter()
                 .map(|(a, b)| format!("{{a: '{}', b: '{}'}}", escape(a), escape(b)))
                 .collect();
-            let _ = conn.query(&format!(
-                "UNWIND [{}] AS p MATCH (a:Symbol), (b:Symbol) WHERE a.id = p.a AND b.id = p.b CREATE (a)-[:{}]->(b)",
-                pair_list.join(", "),
-                edge_name
+            let _ = conn.query(&crate::graph::store_util::pair_edge_statement(
+                "Symbol",
+                "Symbol",
+                edge_name,
+                &pair_list.join(", "),
             ));
         }
     }

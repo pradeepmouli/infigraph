@@ -85,14 +85,16 @@ impl GraphStore {
             .iter()
             .flat_map(|e| {
                 e.symbols.iter().map(move |sym| {
-                    format!("{{m: '{}', s: '{}'}}", escape(&e.file), escape(&sym.id))
+                    format!("{{a: '{}', b: '{}'}}", escape(&e.file), escape(&sym.id))
                 })
             })
             .collect();
         for chunk in contains_pairs.chunks(SYM_CHUNK) {
-            let _ = conn.query(&format!(
-                "UNWIND [{}] AS p MATCH (m:Module), (s:Symbol) WHERE m.id = p.m AND s.id = p.s CREATE (m)-[:CONTAINS]->(s)",
-                chunk.join(", ")
+            let _ = conn.query(&super::store_util::pair_edge_statement(
+                "Module",
+                "Symbol",
+                "CONTAINS",
+                &chunk.join(", "),
             ));
         }
 
@@ -101,14 +103,16 @@ impl GraphStore {
             .iter()
             .flat_map(|e| {
                 e.symbols.iter().map(move |sym| {
-                    format!("{{f: '{}', s: '{}'}}", escape(&e.file), escape(&sym.id))
+                    format!("{{a: '{}', b: '{}'}}", escape(&e.file), escape(&sym.id))
                 })
             })
             .collect();
         for chunk in defines_pairs.chunks(SYM_CHUNK) {
-            let _ = conn.query(&format!(
-                "UNWIND [{}] AS p MATCH (f:File), (s:Symbol) WHERE f.id = p.f AND s.id = p.s CREATE (f)-[:DEFINES]->(s)",
-                chunk.join(", ")
+            let _ = conn.query(&super::store_util::pair_edge_statement(
+                "File",
+                "Symbol",
+                "DEFINES",
+                &chunk.join(", "),
             ));
         }
 
@@ -209,16 +213,20 @@ impl GraphStore {
             (&writes_pairs, "WRITES"),
         ] {
             for chunk in pairs.chunks(SYM_CHUNK) {
-                let _ = conn.query(&format!(
-                    "UNWIND [{}] AS p MATCH (a:Symbol), (b:Symbol) WHERE a.id = p.a AND b.id = p.b CREATE (a)-[:{rel_type}]->(b)",
-                    chunk.join(", ")
+                let _ = conn.query(&super::store_util::pair_edge_statement(
+                    "Symbol",
+                    "Symbol",
+                    rel_type,
+                    &chunk.join(", "),
                 ));
             }
         }
         for chunk in imports_pairs.chunks(SYM_CHUNK) {
-            let _ = conn.query(&format!(
-                "UNWIND [{}] AS p MATCH (a:Module), (b:Module) WHERE a.id = p.a AND b.id = p.b CREATE (a)-[:IMPORTS]->(b)",
-                chunk.join(", ")
+            let _ = conn.query(&super::store_util::pair_edge_statement(
+                "Module",
+                "Module",
+                "IMPORTS",
+                &chunk.join(", "),
             ));
         }
         for (edge_name, pairs) in &custom_pairs {
@@ -227,10 +235,11 @@ impl GraphStore {
             }
             let _ = ensure_custom_edge_table(conn, edge_name);
             for chunk in pairs.chunks(SYM_CHUNK) {
-                let _ = conn.query(&format!(
-                    "UNWIND [{}] AS p MATCH (a:Symbol), (b:Symbol) WHERE a.id = p.a AND b.id = p.b CREATE (a)-[:{}]->(b)",
-                    chunk.join(", "),
-                    edge_name
+                let _ = conn.query(&super::store_util::pair_edge_statement(
+                    "Symbol",
+                    "Symbol",
+                    edge_name,
+                    &chunk.join(", "),
                 ));
             }
         }
@@ -262,9 +271,11 @@ impl GraphStore {
             })
             .collect();
         for chunk in stmt_edges.chunks(SYM_CHUNK) {
-            let _ = conn.query(&format!(
-                "UNWIND [{}] AS p MATCH (a:Symbol), (b:Statement) WHERE a.id = p.a AND b.id = p.b CREATE (a)-[:HAS_STATEMENT]->(b)",
-                chunk.join(", ")
+            let _ = conn.query(&super::store_util::pair_edge_statement(
+                "Symbol",
+                "Statement",
+                "HAS_STATEMENT",
+                &chunk.join(", "),
             ));
         }
 
