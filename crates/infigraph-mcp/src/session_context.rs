@@ -144,7 +144,11 @@ fn find_config_file_with_home_fallback() -> Option<PathBuf> {
 const DEDUP_STATE_FILE: &str = "dedup_state.json";
 const PERSIST_INTERVAL: usize = 5;
 
-fn dedup_state_path() -> Option<PathBuf> {
+/// Where the dedup seen-hashes persist: `dedup_state.json` in the nearest
+/// ancestor `.infigraph/` of the process cwd, or `None` when there is none.
+/// Public so tests that exercise dedup end to end (`compression_eval.rs`)
+/// can start from, and leave behind, a clean slate (#136).
+pub fn dedup_state_path() -> Option<PathBuf> {
     let cwd = std::env::current_dir().ok()?;
     let mut dir = cwd.as_path();
     loop {
@@ -690,16 +694,19 @@ pub fn get_compression_stats() -> String {
     out
 }
 
-/// Reset session state (for testing).
-#[cfg(test)]
+/// Reset session state (for testing). Not `cfg(test)`-gated: the
+/// integration tests (`tests/compression_eval.rs`, #136) need it too, and
+/// a `cfg(test)` item is compiled out of the library those link against.
+#[doc(hidden)]
 pub fn reset_session() {
     let mut guard = SESSION.lock().unwrap_or_else(|e| e.into_inner());
     *guard = None;
 }
 
 /// Cross-module serialisation lock for tests that mutate the global SESSION.
-/// Both session_context::tests and compress::tests share this to prevent races.
-#[cfg(test)]
+/// session_context::tests, compress::tests and the integration tests share
+/// this to prevent races. Same reason as `reset_session` for being ungated.
+#[doc(hidden)]
 pub static SESSION_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 #[cfg(test)]

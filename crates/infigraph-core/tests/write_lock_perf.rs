@@ -75,13 +75,22 @@ fn test_lock_overhead_under_1ms() {
     );
 }
 
-#[test]
-#[ignore] // perf test — run via pre-commit hook, not CI
-fn test_contended_lock_throughput() {
-    let (_dir, store) = make_store();
-    let store = Arc::new(store);
+/// Upper bound on the contended/single-thread wall-clock ratio the *median*
+/// sample must stay under. Overridable via `INFIGRAPH_TEST_LOCK_CONTENTION_RATIO`
+/// for a machine known to be loaded (#142); the default stays tight, since a
+/// real regression (a clap `Command` built inside the held lock region)
+/// tripped the old single-sample gate 5/5 on the day #142 was filed and must
+/// keep tripping this one.
+fn contended_ratio_bound() -> f64 {
+    std::env::var("INFIGRAPH_TEST_LOCK_CONTENTION_RATIO")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(8.0)
+}
 
-    // Single-thread baseline
+/// One sample: 100 uncontended lock/unlock cycles, then 4 threads doing 100
+/// each. Returns `(single_thread, four_threads)` elapsed.
+fn contended_throughput_sample(store: &Arc<GraphStore>) -> (Duration, Duration) {
     let start = Instant::now();
     for _ in 0..100 {
         let lock = store.write_lock().unwrap();
@@ -90,11 +99,10 @@ fn test_contended_lock_throughput() {
     }
     let single_thread = start.elapsed();
 
-    // 4 threads contending
     let start = Instant::now();
     let handles: Vec<_> = (0..4)
         .map(|_| {
-            let s = Arc::clone(&store);
+            let s = Arc::clone(store);
             std::thread::spawn(move || {
                 for _ in 0..100 {
                     let lock = s.write_lock().unwrap();
@@ -107,14 +115,48 @@ fn test_contended_lock_throughput() {
     for h in handles {
         h.join().unwrap();
     }
-    let multi_thread = start.elapsed();
+    (single_thread, start.elapsed())
+}
 
-    // 4 threads doing 4x total work — should be < 8x single-thread time
+#[test]
+#[ignore] // perf test — run via pre-commit hook, not CI
+fn test_contended_lock_throughput() {
+    let (_dir, store) = make_store();
+    let store = Arc::new(store);
+
+    // Warm up (same reason as test_lock_overhead_under_1ms): first-touch
+    // costs would otherwise land in whichever sample runs first.
+    for _ in 0..100 {
+        drop(store.write_lock().unwrap());
+    }
+
+    // Median of 5 samples, not one: a single 100-iteration sample on a busy
+    // dev machine (load average 6-9) landed anywhere from 3x to 11x with no
+    // code change and failed 2 of 3 commits (#142). The median discards the
+    // scheduler-jitter outliers without loosening the bound itself -- 4
+    // threads doing 4x the work should still finish well under 8x.
+    const SAMPLES: usize = 5;
+    let samples: Vec<(Duration, Duration)> = (0..SAMPLES)
+        .map(|_| contended_throughput_sample(&store))
+        .collect();
+    let mut ratios: Vec<f64> = samples
+        .iter()
+        .map(|(single, multi)| multi.as_secs_f64() / single.as_secs_f64().max(f64::EPSILON))
+        .collect();
+    ratios.sort_by(|a, b| a.total_cmp(b));
+    let median = ratios[SAMPLES / 2];
+    let bound = contended_ratio_bound();
+    eprintln!(
+        "contended lock throughput: median 4-thread/single ratio {median:.2}x (bound {bound}x), \
+         samples (single, 4-thread): {samples:?}"
+    );
+
     assert!(
-        multi_thread < single_thread * 8,
-        "contended throughput too slow: single={:?}, 4-thread={:?}",
-        single_thread,
-        multi_thread
+        median < bound,
+        "contended throughput too slow: median 4-thread/single ratio {median:.2}x is not under \
+         {bound}x across {SAMPLES} samples {samples:?}. A median far beyond the bound is a real \
+         regression in the lock path; on a machine known to be heavily loaded, widen it with \
+         INFIGRAPH_TEST_LOCK_CONTENTION_RATIO (see pradeepmouli/infigraph#142)."
     );
 }
 

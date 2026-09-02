@@ -218,6 +218,32 @@ fn phase3_dedup_eval() {
     // Enable dedup for this test
     std::env::set_var("INFIGRAPH_DEDUP", "1");
 
+    // #136: dedup persists its seen-hashes into the nearest ancestor
+    // `.infigraph/` of the cwd (`crates/infigraph-mcp/.infigraph/` or the
+    // repo root's) every fifth call, so a previous run's file made the very
+    // first call here return the "(seen)" placeholder. Start from a clean
+    // session and leave nothing behind, even on a failed assertion.
+    struct CleanDedupState(Option<std::path::PathBuf>);
+    impl CleanDedupState {
+        fn clear(&self) {
+            if let Some(p) = &self.0 {
+                let _ = std::fs::remove_file(p);
+            }
+        }
+    }
+    impl Drop for CleanDedupState {
+        fn drop(&mut self) {
+            self.clear();
+            infigraph_mcp::session_context::reset_session();
+        }
+    }
+    let _session_guard = infigraph_mcp::session_context::SESSION_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let clean_state = CleanDedupState(infigraph_mcp::session_context::dedup_state_path());
+    clean_state.clear();
+    infigraph_mcp::session_context::reset_session();
+
     let p = project_root;
 
     // Phase 3 eval: measure dedup savings by calling same tools twice
