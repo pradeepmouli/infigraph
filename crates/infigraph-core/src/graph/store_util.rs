@@ -270,7 +270,13 @@ pub(crate) fn resolve_import_candidate<'a>(
     }
 }
 
-/// Batch-insert edges via UNWIND in chunks of 500.
+/// Batch-insert edges via UNWIND in chunks of 500, each chunk built by
+/// `pair_edge_statement` so it plans as primary-key lookups. This is the
+/// terminal fallback of `copy_edges_with_bad_record_retry`, so it runs on
+/// exactly the batches COPY could not take -- the largest ones. It kept the
+/// pre-2026-09-02 cross-product shape after the other write paths moved off
+/// it, which wedged a sittir SCIP import at 100% CPU for 15+ minutes on a
+/// 130k-symbol graph (500 pairs x |A| x |B| per chunk).
 pub(crate) fn unwind_edges_from_pairs(
     conn: &Connection,
     pairs: &[(&str, &str)],
@@ -284,9 +290,11 @@ pub(crate) fn unwind_edges_from_pairs(
             .iter()
             .map(|(a, b)| format!("{{a: '{}', b: '{}'}}", escape(a), escape(b)))
             .collect();
-        let _ = conn.query(&format!(
-            "UNWIND [{}] AS p MATCH (a:{src_label}), (b:{dst_label}) WHERE a.id = p.a AND b.id = p.b CREATE (a)-[:{rel_type}]->(b)",
-            pair_list.join(", ")
+        let _ = conn.query(&pair_edge_statement(
+            src_label,
+            dst_label,
+            rel_type,
+            &pair_list.join(", "),
         ));
     }
 }
