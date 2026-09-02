@@ -467,12 +467,12 @@ fn compare_f16_vs_int8_quality() {
         eprintln!(
             "  {:>3} {:>30} {:.6} {:>28}{} {:.6} {:>28}{} {:.6}",
             i + 1,
-            &f32_name[..f32_name.len().min(30)],
+            head(f32_name, 30),
             f32_top[i].1,
-            &f16_name[..f16_name.len().min(28)],
+            head(f16_name, 28),
             f16_match,
             f16_top[i].1,
-            &int8_name[..int8_name.len().min(28)],
+            head(int8_name, 28),
             int8_match,
             int8_top[i].1
         );
@@ -520,4 +520,23 @@ fn compare_f16_vs_int8_quality() {
         "int8 top-5 recall too low: {:.1}%",
         int8_top5 * 100.0
     );
+}
+
+/// The first `n` chars of `s`, never splitting a multi-byte character. A
+/// byte slice (`&s[..30]`) panicked whenever a symbol name in the sampled
+/// top-K happened to put e.g. a `✅` across the cut (#46).
+fn head(s: &str, n: usize) -> &str {
+    match s.char_indices().nth(n) {
+        Some((byte, _)) => &s[..byte],
+        None => s,
+    }
+}
+
+#[test]
+fn head_never_splits_a_multibyte_char() {
+    let s = "abc✅def";
+    assert_eq!(head(s, 3), "abc");
+    assert_eq!(head(s, 4), "abc✅");
+    assert_eq!(head(s, 100), s);
+    assert_eq!(head("", 5), "");
 }
