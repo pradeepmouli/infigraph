@@ -38,7 +38,9 @@ fn stale_project() -> tempfile::TempDir {
         let store = GraphStore::open(&graph_path).unwrap();
         let lock = store.write_lock().unwrap();
         let conn = store.connection().unwrap();
-        store.stamp_scip_generation_conn(&conn, &lock).unwrap();
+        store
+            .stamp_scip_generation_conn(&conn, &lock, None)
+            .unwrap();
         for _ in 0..3 {
             store.bump_ast_generation_conn(&conn, &lock).unwrap();
         }
@@ -67,11 +69,12 @@ fn coordinator_triggers_scip_enrichment_once_when_staleness_exceeds_threshold() 
     std::env::set_var("INFIGRAPH_SCIP_INDEX_STALENESS_THRESHOLD", "2");
     std::env::set_var("INFIGRAPH_SCIP_INDEX_STALENESS_CHECK_SECS", "1");
 
-    let calls: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
+    let calls: Arc<Mutex<Vec<infigraph_core::daemon::ScipEnrichJob>>> =
+        Arc::new(Mutex::new(Vec::new()));
     let calls_for_cb = Arc::clone(&calls);
     let on_full_reindex: Arc<infigraph_core::daemon::FullReindexCallback> =
-        Arc::new(move |_prism, languages, _token| {
-            calls_for_cb.lock().unwrap().push(languages);
+        Arc::new(move |_prism, job, _token| {
+            calls_for_cb.lock().unwrap().push(job);
         });
 
     let (stop_tx, stop_rx) = mpsc::channel();
@@ -114,7 +117,11 @@ fn coordinator_triggers_scip_enrichment_once_when_staleness_exceeds_threshold() 
             1,
             "expected exactly one enrichment request, got {recorded:?}"
         );
-        assert_eq!(recorded[0], vec!["rust".to_string()]);
+        assert_eq!(recorded[0].languages, vec!["rust".to_string()]);
+        // The job carries the generation enrichment started from, so the
+        // import can stamp that rather than whatever the graph is at by the
+        // time the indexers finish (see `stamp_scip_generation_conn`).
+        assert_eq!(recorded[0].ast_generation, 4, "1 upsert + 3 bumps");
     }
 
     // The fake callback never bumps scip_generation, so the gap is still

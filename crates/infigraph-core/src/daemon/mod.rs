@@ -69,10 +69,13 @@ pub fn scip_settings() -> Scip {
 ///   (doctor's own R3.3.4 rule): a project that never opted into SCIP must
 ///   not have the daemon start running external indexers for it.
 /// - `last_attempt_ast_generation` is the AST generation at which the
-///   daemon last *started* an enrichment. Until the graph moves past it,
-///   no retry -- otherwise a project whose indexers are missing or whose
-///   import keeps failing would re-run them every check interval forever,
-///   since a failed attempt never bumps `scip_generation`.
+///   daemon last *started* an enrichment. Until the graph has moved a
+///   further `threshold` past it, no retry -- otherwise a project whose
+///   indexers are missing or whose import keeps failing would re-run
+///   minutes of external indexers on every check interval for as long as
+///   the user keeps editing, since a failed attempt never stamps
+///   `scip_generation`. (A successful one does, so this gate only ever
+///   bites after a failure.)
 pub(crate) fn scip_enrichment_due(
     ast_generation: i64,
     scip_generation: i64,
@@ -82,11 +85,24 @@ pub(crate) fn scip_enrichment_due(
     if threshold == 0 || scip_generation <= 0 {
         return false;
     }
-    if last_attempt_ast_generation.is_some_and(|last| ast_generation <= last) {
+    let threshold = i64::try_from(threshold).unwrap_or(i64::MAX);
+    if last_attempt_ast_generation
+        .is_some_and(|last| ast_generation.saturating_sub(last) < threshold)
+    {
         return false;
     }
-    let threshold = i64::try_from(threshold).unwrap_or(i64::MAX);
     ast_generation.saturating_sub(scip_generation) >= threshold
+}
+
+/// What one SCIP-enrichment run is asked to cover: which languages'
+/// indexers to run, and the AST generation the graph was at when the run
+/// was decided -- the value the eventual import stamps as enriched (see
+/// `GraphStore::stamp_scip_generation_conn`), since the graph keeps moving
+/// while the indexers run.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScipEnrichJob {
+    pub languages: Vec<String>,
+    pub ast_generation: i64,
 }
 
 /// Starts SCIP enrichment as its own background task on `drain_rt`. The
@@ -102,11 +118,11 @@ fn spawn_scip_enrich(
     daemon_token: &CancellationToken,
     cb: Arc<FullReindexCallback>,
     prism: Arc<Infigraph>,
-    languages: Vec<String>,
+    job: ScipEnrichJob,
 ) -> Task<()> {
     let _guard = drain_rt.enter();
     Task::spawn_blocking(daemon_token, "scip-enrich", move |token| {
-        cb(prism, languages, token);
+        cb(prism, job, token);
     })
 }
 
@@ -170,7 +186,8 @@ fn current_on_disk_build_hash() -> Option<String> {
 /// `Task::spawn_blocking` it runs inside) -- a cooperative-cancellation
 /// checkpoint for whatever synchronous, potentially long-running work the
 /// callback does (e.g. `run_scip_indexers`' between-indexer-launch check).
-pub type FullReindexCallback = dyn Fn(Arc<Infigraph>, Vec<String>, CancellationToken) + Send + Sync;
+pub type FullReindexCallback =
+    dyn Fn(Arc<Infigraph>, ScipEnrichJob, CancellationToken) + Send + Sync;
 
 /// Caller-supplied hook that acts on a `WatchControl { role: Docs, .. }`
 /// request. Doc-watching lives in `infigraph-docs`, a crate this one does
@@ -520,6 +537,12 @@ where
             drop(guard);
 
             if let Some(languages) = scheduled_languages {
+                // The swapped-in graph has fresh counters, so the staleness
+                // trigger's retry gate from the old graph is meaningless --
+                // whether or not enrichment gets spawned below. Left in
+                // place it would suppress the trigger on the new graph
+                // until its counter climbed past the old one's.
+                last_scip_attempt_ast_generation = None;
                 if scip_in_flight.is_some() {
                     // A previous full reindex's SCIP task is still running --
                     // don't overwrite its tracked handle (we'd lose the ability to
@@ -535,19 +558,23 @@ where
                 } else if let (Some(cb), Some(prism)) =
                     (on_full_reindex.clone(), held_prism.clone())
                 {
-                    // The swapped-in graph has fresh counters; the staleness
-                    // trigger's retry gate must not carry over from the old
-                    // one. `finish_full_reindex` only hands back languages on
-                    // a successful swap+reopen, so `prism` is the new graph.
-                    last_scip_attempt_ast_generation = prism
+                    // `finish_full_reindex` only hands back languages on a
+                    // successful swap+reopen, so `prism` is the new graph
+                    // and this is its generation.
+                    let ast_generation = prism
                         .backend()
-                        .and_then(|b| b.current_ast_generation().ok());
+                        .and_then(|b| b.current_ast_generation().ok())
+                        .unwrap_or(0);
+                    last_scip_attempt_ast_generation = Some(ast_generation);
                     scip_in_flight = Some(spawn_scip_enrich(
                         &drain_rt,
                         daemon_token,
                         cb,
                         prism,
-                        languages,
+                        ScipEnrichJob {
+                            languages,
+                            ast_generation,
+                        },
                     ));
                 }
             }
@@ -629,7 +656,10 @@ where
                                     daemon_token,
                                     cb,
                                     prism,
-                                    languages,
+                                    ScipEnrichJob {
+                                        languages,
+                                        ast_generation: ast,
+                                    },
                                 ));
                             }
                             // An empty graph has nothing to enrich; leave the
@@ -866,8 +896,14 @@ where
         std::fs::remove_file(&in_flight.request_path).ok();
         drop(guard);
     }
+    // Cancel before waiting, not just wait: the callback's indexer runner
+    // checks its token between launches, so a shutdown that lands mid-run
+    // stops starting further multi-minute indexers instead of finishing
+    // the whole set first. (Its `submit_write_request` poll does not yet
+    // observe the token -- an import request it has already dropped for a
+    // loop that no longer serves it still waits out that call's timeout.)
     if let Some(in_flight) = scip_in_flight.take() {
-        let _ = drain_rt.block_on(in_flight.join());
+        drain_rt.block_on(in_flight.stop());
     }
     // Same reasoning again -- a SCIP import still running when the loop
     // exits also holds `index.lock`. No `on_event_shared` notification pass
@@ -1386,6 +1422,7 @@ fn try_start_scip_import(
     root: &Path,
     path: &Path,
     scip_path: PathBuf,
+    enriched_ast_generation: Option<i64>,
     registry: &Arc<crate::lang::LanguageRegistry>,
     held: &mut Option<Arc<Infigraph>>,
     drain_in_flight: bool,
@@ -1440,7 +1477,7 @@ fn try_start_scip_import(
     let task = {
         let _guard = drain_rt.enter();
         Task::spawn_blocking(daemon_token, "scip-import", move |_token| {
-            let result = prism.import_scip(&scip_path);
+            let result = prism.import_scip_enriched_at(&scip_path, enriched_ast_generation);
             // Best-effort cleanup of the `.scip` file regardless of
             // outcome, mirroring the old direct-write path's behavior.
             let _ = std::fs::remove_file(&scip_path);
@@ -2020,10 +2057,14 @@ where
             daemon_token,
         )
         .map(PendingWork::FullReindex),
-        WriteRequest::ScipImport { scip_path } => try_start_scip_import(
+        WriteRequest::ScipImport {
+            scip_path,
+            enriched_ast_generation,
+        } => try_start_scip_import(
             root,
             path,
             scip_path,
+            enriched_ast_generation,
             registry,
             held,
             drain_in_flight,
@@ -2418,6 +2459,7 @@ mod tests {
 
         let request = crate::daemon_protocol::WriteRequest::ScipImport {
             scip_path: scip_path.clone(),
+            enriched_ast_generation: None,
         };
         let request_path = root.join("test.request");
         std::fs::write(&request_path, serde_json::to_string(&request).unwrap()).unwrap();
@@ -2517,12 +2559,17 @@ mod tests {
     }
 
     #[test]
-    fn scip_enrichment_not_retried_until_the_graph_moves_past_the_last_attempt() {
+    fn scip_enrichment_not_retried_until_a_full_threshold_of_writes_since_the_last_attempt() {
         // An attempt was already made at ast_generation 60 and SCIP did not
-        // catch up (indexers missing, import failed). Same generation: no
-        // retry. One more write: retry.
+        // catch up (indexers missing, import failed). A single write is not
+        // grounds to re-run minutes of external indexers -- the gap must
+        // have grown by another `threshold` since that attempt. Otherwise a
+        // project whose indexer is broken re-runs it every check interval
+        // for as long as the user keeps editing.
         assert!(!scip_enrichment_due(60, 10, Some(60), 50));
-        assert!(scip_enrichment_due(61, 10, Some(60), 50));
+        assert!(!scip_enrichment_due(61, 10, Some(60), 50));
+        assert!(!scip_enrichment_due(109, 10, Some(60), 50));
+        assert!(scip_enrichment_due(110, 10, Some(60), 50));
     }
 
     #[test]

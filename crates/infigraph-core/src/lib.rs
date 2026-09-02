@@ -708,8 +708,18 @@ impl Infigraph {
     /// index()/index_files()'s shape, so the daemon protocol has a single
     /// clean entry point rather than reaching for prism.backend() directly.
     pub fn import_scip(&self, scip_path: &Path) -> Result<crate::scip::ImportStats> {
+        self.import_scip_enriched_at(scip_path, None)
+    }
+
+    /// `import_scip` that records which AST generation the enrichment
+    /// started from -- see `GraphBackend::import_scip_index_enriched_at`.
+    pub fn import_scip_enriched_at(
+        &self,
+        scip_path: &Path,
+        enriched_ast_generation: Option<i64>,
+    ) -> Result<crate::scip::ImportStats> {
         let backend = self.backend().context("call init() first")?;
-        backend.import_scip_index(scip_path, Some(&self.root))
+        backend.import_scip_index_enriched_at(scip_path, Some(&self.root), enriched_ast_generation)
     }
 
     /// Scans every file under `self.root`, hash-diffs against what the

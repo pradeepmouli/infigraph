@@ -525,10 +525,10 @@ pub(crate) fn cmd_daemon(root: &Path, debounce: u64) -> Result<()> {
     let on_full_reindex: std::sync::Arc<infigraph_core::daemon::FullReindexCallback> =
         std::sync::Arc::new(
             move |prism: std::sync::Arc<infigraph_core::Infigraph>,
-                  detected_languages: Vec<String>,
+                  job: infigraph_core::daemon::ScipEnrichJob,
                   token: tokio_util::sync::CancellationToken| {
                 let languages: std::collections::HashSet<String> =
-                    detected_languages.into_iter().collect();
+                    job.languages.into_iter().collect();
                 let root = prism.root().to_path_buf();
                 // Part A (running the external indexer binaries) is
                 // deliberately unlocked -- it can take several minutes on a
@@ -561,8 +561,13 @@ pub(crate) fn cmd_daemon(root: &Path, debounce: u64) -> Result<()> {
                         let _ = std::fs::remove_file(&scip_path);
                         continue;
                     }
+                    // Stamp the generation this run started from, not the
+                    // one the graph reaches by the time the import lands --
+                    // drains that arrived while the indexers ran are not in
+                    // this `.scip` file.
                     let request = infigraph_core::daemon_protocol::WriteRequest::ScipImport {
                         scip_path: scip_path.clone(),
+                        enriched_ast_generation: Some(job.ast_generation),
                     };
                     match infigraph_core::daemon_protocol::submit_write_request(
                         &requests_dir,

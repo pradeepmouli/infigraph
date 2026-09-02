@@ -96,6 +96,32 @@ fn serve_one_request_writes_err_result_on_corrupt_request_json() {
     );
 }
 
+/// A `ScipImport` request written by a client that predates the
+/// `enriched_ast_generation` field (or by the CLI/MCP paths, which have no
+/// start generation to report) must still parse -- the field is optional
+/// on the wire, and `None` means "stamp the current generation".
+#[test]
+fn scip_import_request_without_enriched_generation_still_parses() {
+    let legacy = r#"{"ScipImport":{"scip_path":"idx.scip"}}"#;
+    let parsed: WriteRequest = serde_json::from_str(legacy).unwrap();
+    assert_eq!(
+        parsed,
+        WriteRequest::ScipImport {
+            scip_path: "idx.scip".into(),
+            enriched_ast_generation: None,
+        }
+    );
+    let tagged = r#"{"ScipImport":{"scip_path":"idx.scip","enriched_ast_generation":42}}"#;
+    let parsed: WriteRequest = serde_json::from_str(tagged).unwrap();
+    assert!(matches!(
+        parsed,
+        WriteRequest::ScipImport {
+            enriched_ast_generation: Some(42),
+            ..
+        }
+    ));
+}
+
 #[test]
 fn serve_one_request_handles_scip_import() {
     let project_dir = tempfile::tempdir().unwrap();
@@ -115,6 +141,7 @@ fn serve_one_request_handles_scip_import() {
         &request_path,
         &serde_json::to_string(&WriteRequest::ScipImport {
             scip_path: "does/not/exist.scip".into(),
+            enriched_ast_generation: None,
         })
         .unwrap(),
     )

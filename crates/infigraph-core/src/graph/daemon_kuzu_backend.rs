@@ -414,11 +414,20 @@ impl GraphBackend for DaemonKuzuBackend {
     fn import_scip_index(
         &self,
         index_path: &Path,
+        project_root: Option<&Path>,
+    ) -> Result<crate::scip::ImportStats> {
+        self.import_scip_index_enriched_at(index_path, project_root, None)
+    }
+    fn import_scip_index_enriched_at(
+        &self,
+        index_path: &Path,
         _project_root: Option<&Path>,
+        enriched_ast_generation: Option<i64>,
     ) -> Result<crate::scip::ImportStats> {
         let staging_dir = self.staging_dir();
         let request = crate::daemon_protocol::WriteRequest::ScipImport {
             scip_path: index_path.to_path_buf(),
+            enriched_ast_generation,
         };
         match crate::daemon_protocol::submit_write_request(
             &staging_dir,

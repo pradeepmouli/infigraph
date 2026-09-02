@@ -395,6 +395,19 @@ pub trait GraphBackend: Send + Sync {
         project_root: Option<&Path>,
     ) -> Result<ImportStats>;
 
+    /// `import_scip_index` that records which AST generation the
+    /// enrichment started from (see `GraphStore::stamp_scip_generation_conn`).
+    /// Default: ignores the generation and stamps the current one, which is
+    /// right for any backend without generation tracking.
+    fn import_scip_index_enriched_at(
+        &self,
+        index_path: &Path,
+        project_root: Option<&Path>,
+        _enriched_ast_generation: Option<i64>,
+    ) -> Result<ImportStats> {
+        self.import_scip_index(index_path, project_root)
+    }
+
     // ── Structured ingestion ────────────────────────────────────────
 
     fn ingest_structured_data(

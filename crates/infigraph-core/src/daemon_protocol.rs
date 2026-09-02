@@ -17,8 +17,16 @@ use std::time::{Duration, Instant};
 pub enum WriteRequest {
     /// Index specific files. `None` means a full project reindex.
     Index { paths: Option<Vec<PathBuf>> },
-    /// Import a SCIP index file at the given path.
-    ScipImport { scip_path: PathBuf },
+    /// Import a SCIP index file at the given path. `enriched_ast_generation`
+    /// is the AST generation the enrichment started from, when the
+    /// submitter knows it (the daemon's own R3.3.4a trigger and
+    /// post-reindex enrichment); optional on the wire so older clients and
+    /// the CLI/MCP paths, which stamp the current generation, keep working.
+    ScipImport {
+        scip_path: PathBuf,
+        #[serde(default)]
+        enriched_ast_generation: Option<i64>,
+    },
     /// Ingest structured data using a schema already discoverable by the
     /// daemon itself (via discover_schemas) -- looked up by schema_id, not
     /// serialized into the request.
@@ -548,7 +556,10 @@ pub fn serve_one_request(infigraph: &Infigraph, request_path: &Path) -> anyhow::
                     message: e.to_string(),
                 },
             },
-            WriteRequest::ScipImport { scip_path } => match infigraph.import_scip(scip_path) {
+            WriteRequest::ScipImport {
+                scip_path,
+                enriched_ast_generation,
+            } => match infigraph.import_scip_enriched_at(scip_path, *enriched_ast_generation) {
                 Ok(stats) => WriteResult::ScipImportOk(stats),
                 Err(e) => WriteResult::Err {
                     message: e.to_string(),

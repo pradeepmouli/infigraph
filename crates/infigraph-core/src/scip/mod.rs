@@ -62,6 +62,20 @@ pub fn import_scip_index(
     store: &GraphStore,
     project_root: Option<&Path>,
 ) -> Result<ImportStats> {
+    import_scip_index_enriched_at(index_path, store, project_root, None)
+}
+
+/// `import_scip_index`, stamping `scip_generation` to
+/// `enriched_ast_generation` -- the AST generation the enrichment started
+/// from -- instead of the current one. See
+/// `GraphStore::stamp_scip_generation_conn` for why that matters when the
+/// indexers ran unlocked while the graph kept moving (the daemon's case).
+pub fn import_scip_index_enriched_at(
+    index_path: &Path,
+    store: &GraphStore,
+    project_root: Option<&Path>,
+    enriched_ast_generation: Option<i64>,
+) -> Result<ImportStats> {
     let bytes = std::fs::read(index_path)
         .with_context(|| format!("failed to read {}", index_path.display()))?;
 
@@ -708,10 +722,10 @@ pub fn import_scip_index(
         }
     }
 
-    // R3.3.4: bump only here -- never on an ordinary AST reindex -- so
+    // R3.3.4: stamp only here -- never on an ordinary AST reindex -- so
     // comparing this against ast_generation surfaces exactly the drift the
     // watcher's AST-only incremental reindex silently leaves behind.
-    store.stamp_scip_generation_conn(&conn, &_lock)?;
+    store.stamp_scip_generation_conn(&conn, &_lock, enriched_ast_generation)?;
 
     if let Some(dir) = store.db_dir() {
         crate::graph::store_util::stamp_healthy_graph_size_if_unset(dir, &dir.join("graph"));

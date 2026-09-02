@@ -797,6 +797,20 @@ impl GraphBackend for KuzuBackend {
         crate::scip::import_scip_index(index_path, &self.store, project_root)
     }
 
+    fn import_scip_index_enriched_at(
+        &self,
+        index_path: &std::path::Path,
+        project_root: Option<&std::path::Path>,
+        enriched_ast_generation: Option<i64>,
+    ) -> Result<crate::scip::ImportStats> {
+        crate::scip::import_scip_index_enriched_at(
+            index_path,
+            &self.store,
+            project_root,
+            enriched_ast_generation,
+        )
+    }
+
     fn ingest_structured_data(
         &self,
         schema: &crate::structured::SchemaMeta,
