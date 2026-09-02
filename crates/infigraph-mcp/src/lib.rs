@@ -5,6 +5,7 @@ pub mod lifecycle;
 pub mod mcp_lock;
 pub mod recovery;
 pub mod session_context;
+pub mod signal_sender;
 pub mod tools;
 pub mod web;
 

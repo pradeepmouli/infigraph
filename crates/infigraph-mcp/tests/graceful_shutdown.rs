@@ -136,11 +136,14 @@ fn sigterm_to_the_supervisor_logs_why_and_exits_promptly_and_the_worker_follows(
         std::thread::sleep(Duration::from_millis(100));
     }
 
-    let term = Command::new("kill")
+    // Spawn rather than `.status()` so the sender's pid is known: #123 has
+    // the supervisor name whoever signalled it in the exit-reason line.
+    let mut term = Command::new("kill")
         .args(["-TERM", &supervisor_pid.to_string()])
-        .status()
+        .spawn()
         .unwrap();
-    assert!(term.success());
+    let kill_pid = term.id();
+    assert!(term.wait().unwrap().success());
 
     let start = Instant::now();
     let status = loop {
@@ -161,9 +164,10 @@ fn sigterm_to_the_supervisor_logs_why_and_exits_promptly_and_the_worker_follows(
     let log = std::fs::read_to_string(&log_path).unwrap_or_default();
     assert!(
         log.contains(&format!(
-            "supervisor (pid {supervisor_pid}): termination signal received -- exiting"
+            "supervisor (pid {supervisor_pid}): termination signal received \
+             (signal from PID {kill_pid}"
         )),
-        "expected an exit-reason log line, got: {log}"
+        "expected an exit-reason log line naming the sender (#123), got: {log}"
     );
 
     // No signal was delivered to the worker directly (`kill -TERM <pid>`

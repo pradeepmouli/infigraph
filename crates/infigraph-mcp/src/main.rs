@@ -61,11 +61,16 @@ fn main() -> Result<()> {
         ctrlc::set_handler(move || {
             mcp_log(
                 "INFO",
-                &format!("supervisor (pid {pid}): termination signal received -- exiting"),
+                &format!(
+                    "supervisor (pid {pid}): termination signal received{} -- exiting",
+                    infigraph_mcp::signal_sender::describe()
+                ),
             );
             std::process::exit(0);
         })
         .ok();
+        // #123: after ctrlc, so the sender-capturing handler chains to it.
+        infigraph_mcp::signal_sender::install();
     }
 
     // Remember the repo we were launched in: it's the primary recovery target
@@ -346,11 +351,16 @@ fn run() -> Result<()> {
             let _ = std::fs::remove_file(infigraph_core::instances::instance_path(pid));
             mcp_log(
                 "INFO",
-                "termination signal received -- instance deregistered, exiting",
+                &format!(
+                    "termination signal received{} -- instance deregistered, exiting",
+                    infigraph_mcp::signal_sender::describe()
+                ),
             );
             std::process::exit(0);
         })
         .ok();
+        // #123: after ctrlc, so the sender-capturing handler chains to it.
+        infigraph_mcp::signal_sender::install();
     }
 
     let reaped = infigraph_core::instances::reap_orphans_once(std::process::id());
