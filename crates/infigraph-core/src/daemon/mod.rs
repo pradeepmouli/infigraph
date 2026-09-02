@@ -1494,9 +1494,14 @@ fn finish_scip_import(
             );
             if let Some(prism) = held.as_ref() {
                 if let Some(backend) = prism.backend() {
+                    // `update_embeddings` returns the total embedding count
+                    // on disk after reconciling, not how many it re-embedded
+                    // (unchanged inputs are skipped by hash) -- log it as
+                    // exactly that, so four imports in a row printing the
+                    // same ~11k don't read as four full re-embeds.
                     match crate::embed::update_embeddings(backend, root, &[]) {
                         Ok(n) if n > 0 => {
-                            eprintln!("[daemon] scip-import: embedded {n} new symbols")
+                            eprintln!("[daemon] scip-import: embeddings reconciled ({n} symbols)")
                         }
                         Ok(_) => {}
                         Err(e) => eprintln!("[daemon] scip-import: embedding update failed: {e}"),

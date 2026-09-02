@@ -711,7 +711,7 @@ pub fn import_scip_index(
     // R3.3.4: bump only here -- never on an ordinary AST reindex -- so
     // comparing this against ast_generation surfaces exactly the drift the
     // watcher's AST-only incremental reindex silently leaves behind.
-    store.bump_scip_generation_conn(&conn, &_lock)?;
+    store.stamp_scip_generation_conn(&conn, &_lock)?;
 
     if let Some(dir) = store.db_dir() {
         crate::graph::store_util::stamp_healthy_graph_size_if_unset(dir, &dir.join("graph"));

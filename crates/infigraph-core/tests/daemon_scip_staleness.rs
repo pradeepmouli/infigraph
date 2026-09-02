@@ -38,7 +38,7 @@ fn stale_project() -> tempfile::TempDir {
         let store = GraphStore::open(&graph_path).unwrap();
         let lock = store.write_lock().unwrap();
         let conn = store.connection().unwrap();
-        store.bump_scip_generation_conn(&conn, &lock).unwrap();
+        store.stamp_scip_generation_conn(&conn, &lock).unwrap();
         for _ in 0..3 {
             store.bump_ast_generation_conn(&conn, &lock).unwrap();
         }

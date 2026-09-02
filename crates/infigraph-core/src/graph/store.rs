@@ -518,18 +518,28 @@ impl GraphStore {
         bump_generation_field(conn, "ast_generation")
     }
 
-    /// Bump the graph's SCIP-enrichment generation counter
-    /// (R3.3.4/docs/DESIGN-hardening.md §3.3.4) by 1. Unlike
-    /// `ast_generation`, this only advances when `scip::import_scip_index`
-    /// actually runs -- the watcher's incremental reindex never calls it, so
-    /// `scip_generation` falling behind `ast_generation` is exactly the
-    /// staleness R3.3.4 exists to surface.
-    pub fn bump_scip_generation_conn(
+    /// Stamp the graph's SCIP-enrichment generation
+    /// (R3.3.4/docs/DESIGN-hardening.md §3.3.4) to the *current*
+    /// `ast_generation` and return it. Only `scip::import_scip_index` calls
+    /// this -- the watcher's incremental reindex never does -- so
+    /// `ast_generation - scip_generation` is "AST writes since the last
+    /// enrichment", which is what doctor reports and what the daemon's
+    /// R3.3.4a auto-re-enrichment compares against its threshold.
+    ///
+    /// A stamp, not a `+1` bump: an import counter can never catch up with
+    /// the AST counter (an enrichment after 700 writes would still read as
+    /// 699 behind), so the gap would be meaningless and the daemon would
+    /// re-enrich after every write burst. Caught on this repo's own graph
+    /// the first time R3.3.4a fired for real.
+    ///
+    /// Lands at 1 (never 0) on a graph with no AST writes yet:
+    /// `scip_generation == 0` is the "SCIP never ran" sentinel everywhere.
+    pub fn stamp_scip_generation_conn(
         &self,
         conn: &Connection<'_>,
         _witness: &WriteLock,
     ) -> Result<i64> {
-        bump_generation_field(conn, "scip_generation")
+        stamp_scip_generation(conn)
     }
 
     /// Read the graph's current AST generation without bumping it. Returns 0
@@ -757,22 +767,48 @@ fn count_query(conn: &Connection, query: &str) -> Result<u64> {
 /// with only ast_generation set, then a scip bump found scip_generation
 /// NULL).
 fn bump_generation_field(conn: &Connection, field: &'static str) -> Result<i64> {
-    let (ast_init, scip_init) = match field {
-        "ast_generation" => (1, 0),
-        "scip_generation" => (0, 1),
-        other => unreachable!("bump_generation_field called with unexpected field {other:?}"),
-    };
+    assert_eq!(
+        field, "ast_generation",
+        "bump_generation_field only bumps ast_generation; scip_generation is stamped"
+    );
+    write_generation_field(
+        conn,
+        field,
+        "ON CREATE SET g.ast_generation = 1, g.scip_generation = 0 \
+         ON MATCH SET g.ast_generation = g.ast_generation + 1",
+    )
+}
+
+/// Shared implementation behind `stamp_scip_generation_conn`: copy the
+/// current `ast_generation` into `scip_generation` (floored at 1 so the
+/// result never reads as the "never ran" sentinel), creating the singleton
+/// with both fields set for the same NULL-arithmetic reason as above.
+fn stamp_scip_generation(conn: &Connection) -> Result<i64> {
+    write_generation_field(
+        conn,
+        "scip_generation",
+        "ON CREATE SET g.ast_generation = 0, g.scip_generation = 1 \
+         ON MATCH SET g.scip_generation = \
+         CASE WHEN g.ast_generation < 1 THEN 1 ELSE g.ast_generation END",
+    )
+}
+
+/// Runs `MERGE (g:GraphMeta {id: 'singleton'}) <set_clauses>` and reads
+/// back `g.<field>`.
+fn write_generation_field(
+    conn: &Connection,
+    field: &'static str,
+    set_clauses: &str,
+) -> Result<i64> {
     conn.query(&format!(
-        "MERGE (g:GraphMeta {{id: 'singleton'}}) \
-         ON CREATE SET g.ast_generation = {ast_init}, g.scip_generation = {scip_init} \
-         ON MATCH SET g.{field} = g.{field} + 1"
+        "MERGE (g:GraphMeta {{id: 'singleton'}}) {set_clauses}"
     ))
-    .map_err(|e| anyhow::anyhow!("failed to bump graph {field}: {e}"))?;
+    .map_err(|e| anyhow::anyhow!("failed to write graph {field}: {e}"))?;
     let mut result = conn
         .query(&format!(
             "MATCH (g:GraphMeta {{id: 'singleton'}}) RETURN g.{field}"
         ))
-        .map_err(|e| anyhow::anyhow!("failed to read graph {field} after bump: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("failed to read graph {field} after write: {e}"))?;
     let row = result
         .next()
         .context("GraphMeta singleton missing immediately after MERGE")?;
@@ -1219,7 +1255,7 @@ mod tests {
     }
 
     #[test]
-    fn scip_generation_starts_at_zero_and_bumps_independently_of_ast_generation() {
+    fn scip_generation_starts_at_zero_and_stamps_to_the_ast_generation_it_enriched() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("graph");
         let store = GraphStore::open(&db_path).unwrap();
@@ -1238,11 +1274,36 @@ mod tests {
             "ast bumps must not advance scip_generation"
         );
 
-        let scip_first = store.bump_scip_generation_conn(&conn, &lock).unwrap();
-        assert_eq!(scip_first, 1);
-        // And the reverse: a SCIP bump must not advance ast_generation.
+        // A SCIP import records WHICH ast generation it enriched, so
+        // `ast_generation - scip_generation` is "writes since the last
+        // enrichment" (what doctor and the daemon's R3.3.4a trigger compare)
+        // -- not a running count of imports, which could never catch up.
+        let stamped = store.stamp_scip_generation_conn(&conn, &lock).unwrap();
+        assert_eq!(stamped, 2);
+        assert_eq!(store.current_scip_generation().unwrap(), 2);
+        // And the reverse: a SCIP stamp must not advance ast_generation.
         assert_eq!(store.current_ast_generation().unwrap(), 2);
+
+        // Two more AST writes: 2 behind. Re-enrich: caught up again.
+        store.bump_ast_generation_conn(&conn, &lock).unwrap();
+        store.bump_ast_generation_conn(&conn, &lock).unwrap();
+        assert_eq!(store.current_scip_generation().unwrap(), 2);
+        assert_eq!(store.stamp_scip_generation_conn(&conn, &lock).unwrap(), 4);
+    }
+
+    #[test]
+    fn scip_stamp_on_a_graph_with_no_ast_writes_still_reads_as_enriched() {
+        // scip_generation == 0 is the "SCIP never ran" sentinel everywhere
+        // (doctor, the daemon's staleness trigger). A stamp taken before any
+        // AST write must therefore land at 1, not copy ast_generation's 0.
+        let dir = tempfile::tempdir().unwrap();
+        let store = GraphStore::open(&dir.path().join("graph")).unwrap();
+        let lock = store.write_lock().unwrap();
+        let conn = store.connection().unwrap();
+
+        assert_eq!(store.stamp_scip_generation_conn(&conn, &lock).unwrap(), 1);
         assert_eq!(store.current_scip_generation().unwrap(), 1);
+        assert_eq!(store.current_ast_generation().unwrap(), 0);
     }
 
     /// Regression test: `open_read_only` on a nonexistent graph must fail

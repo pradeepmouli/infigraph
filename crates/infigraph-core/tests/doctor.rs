@@ -1188,7 +1188,7 @@ fn check_scip_staleness_warns_when_scip_generation_behind_ast_generation() {
         let lock = store.write_lock().unwrap();
         let conn = store.connection().unwrap();
         store.bump_ast_generation_conn(&conn, &lock).unwrap();
-        store.bump_scip_generation_conn(&conn, &lock).unwrap();
+        store.stamp_scip_generation_conn(&conn, &lock).unwrap();
         store.bump_ast_generation_conn(&conn, &lock).unwrap();
         store.bump_ast_generation_conn(&conn, &lock).unwrap();
         // ast_generation=3, scip_generation=1 -- 2 generations behind.
@@ -1218,7 +1218,7 @@ fn check_scip_staleness_passes_when_caught_up() {
         let lock = store.write_lock().unwrap();
         let conn = store.connection().unwrap();
         store.bump_ast_generation_conn(&conn, &lock).unwrap();
-        store.bump_scip_generation_conn(&conn, &lock).unwrap();
+        store.stamp_scip_generation_conn(&conn, &lock).unwrap();
         // ast_generation=1, scip_generation=1 -- fully caught up.
     }
 
