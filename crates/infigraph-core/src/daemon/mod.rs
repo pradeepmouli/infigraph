@@ -234,6 +234,43 @@ pub type FullReindexCallback =
 /// becomes the request's `WriteResult::Err`.
 pub type DocsControl = dyn Fn(WatchAction) -> std::result::Result<(), String> + Send + Sync;
 
+/// `(device, inode)` of the directory at `dir`, or `None` if it is gone or
+/// the platform has no such identity. Cheap (one `stat`), so it can ride the
+/// coordinator's `COORDINATOR_TICK` cadence.
+fn directory_identity(dir: &Path) -> Option<(u64, u64)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(dir).ok().map(|m| (m.dev(), m.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        None
+    }
+}
+
+/// Whether the watched root should be treated as gone: nothing exists at the
+/// path any more, or (unix) the directory there is not the one the daemon
+/// started on. The second case is what leaks daemons (#136): a test's
+/// `TempDir` is removed while the daemon is still writing into `.infigraph/`
+/// (health beacon, logs, a reindex reacting to the deletions themselves),
+/// every one of those writes goes through `create_dir_all`, and the root is
+/// resurrected under the same path -- so an `exists()` check keeps passing
+/// and the daemon watches a directory nobody owns, forever (415 such roots
+/// and a dozen daemons were found on one dev machine). Comparing against
+/// the identity captured at startup catches the resurrected root; on
+/// platforms with no directory identity it degrades to `exists()`.
+fn root_is_gone(root: &Path, original: Option<(u64, u64)>) -> bool {
+    if !root.exists() {
+        return true;
+    }
+    match (original, directory_identity(root)) {
+        (Some(started_on), Some(now)) => started_on != now,
+        _ => false,
+    }
+}
+
 /// The daemon's write coordinator: reaps and schedules index-shaped work
 /// (drains, full reindexes, SCIP enrichment), serves `.request` files, and
 /// owns the code-watch producer `Task<()>`'s lifecycle.
@@ -393,6 +430,10 @@ where
     // trigger) started -- see `scip_enrichment_due` for why it gates retries.
     let mut last_scip_attempt_ast_generation: Option<i64> = None;
 
+    // Which directory this daemon started on, not just whether *a* directory
+    // exists at that path -- see `root_is_gone`.
+    let root_identity = directory_identity(root);
+
     loop {
         if stop_rx.try_recv().is_ok() {
             eprintln!("[watch] stop channel signaled -- shutting down");
@@ -407,7 +448,9 @@ where
 
         // Self-terminate once the watched root is gone (`rm -rf`'d project,
         // a test's tempdir, a removed worktree that skipped `worktree
-        // teardown`). No dedicated poll timer needed for this -- the loop
+        // teardown`) -- including a root that was deleted and then recreated
+        // at the same path, which `exists()` alone cannot see (#136). No
+        // dedicated poll timer needed for this -- the loop
         // already ticks every `COORDINATOR_TICK`, so this check rides that
         // existing cadence for free. Without it, a daemon whose target
         // directory disappeared keeps running forever: `prune_stale_holder`
@@ -415,9 +458,9 @@ where
         // just watching nothing. `infigraph gc --global` sweeps the
         // registry for the same condition as a backstop for a daemon that's
         // wedged and never reaches this check.
-        if !root.exists() {
+        if root_is_gone(root, root_identity) {
             eprintln!(
-                "[watch] {} no longer exists -- shutting down",
+                "[watch] {} no longer exists (or was deleted and recreated) -- shutting down",
                 root.display()
             );
             break;
@@ -2613,5 +2656,57 @@ mod tests {
         let s = scip_settings();
         assert_eq!(s.index_staleness_threshold, 50);
         assert_eq!(s.index_staleness_check_secs, 300);
+    }
+}
+
+#[cfg(test)]
+mod root_identity_tests {
+    use super::*;
+
+    #[test]
+    fn an_untouched_root_is_not_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("proj");
+        std::fs::create_dir(&root).unwrap();
+        let started_on = directory_identity(&root);
+        assert!(!root_is_gone(&root, started_on));
+    }
+
+    #[test]
+    fn a_deleted_root_is_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("proj");
+        std::fs::create_dir(&root).unwrap();
+        let started_on = directory_identity(&root);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(root_is_gone(&root, started_on));
+    }
+
+    /// The #136 shape: the root vanishes and something (a `create_dir_all`
+    /// under `.infigraph/`) puts a new directory back at the same path.
+    #[cfg(unix)]
+    #[test]
+    fn a_deleted_and_recreated_root_is_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("proj");
+        std::fs::create_dir(&root).unwrap();
+        let started_on = directory_identity(&root);
+        std::fs::remove_dir_all(&root).unwrap();
+        std::fs::create_dir_all(root.join(".infigraph")).unwrap();
+        assert!(
+            root.exists(),
+            "the recreated root exists -- exists() alone would keep the daemon alive"
+        );
+        assert!(root_is_gone(&root, started_on));
+    }
+
+    #[test]
+    fn without_a_captured_identity_it_degrades_to_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("proj");
+        std::fs::create_dir(&root).unwrap();
+        assert!(!root_is_gone(&root, None));
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(root_is_gone(&root, None));
     }
 }

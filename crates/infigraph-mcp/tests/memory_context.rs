@@ -13,6 +13,8 @@ use infigraph_mcp::tools::graph::{tool_get_doc_context, tool_symbol_context};
 use infigraph_mcp::tools::index::tool_index_project;
 use infigraph_mcp::tools::memory_context::{build_symbol_clusters, tool_memory_context};
 use infigraph_mcp::tools::search::tool_search;
+
+mod support;
 use infigraph_mcp::tools::session::{
     tool_consolidate_memory, tool_save_session, tool_search_sessions,
 };
@@ -28,7 +30,9 @@ unsafe impl Sync for SharedProject {}
 
 fn shared_project() -> &'static SharedProject {
     PROJECT.get_or_init(|| {
+        support::disable_background_watchers();
         let dir = tempfile::TempDir::new().expect("tmpdir");
+        support::remove_at_exit(dir.path()); // a static is never dropped
         let files: &[(&str, &str)] = &[
             (
                 "src/auth.py",
@@ -1169,6 +1173,7 @@ fn auto_escalation_l1_to_l2() {
 #[test]
 fn confidence_decay_ranking() {
     let _guard = MEMORY_LOCK.lock().unwrap();
+    support::disable_background_watchers();
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().to_string_lossy().to_string();
 
@@ -1258,6 +1263,7 @@ fn confidence_decay_ranking() {
 #[test]
 fn archive_threshold_excludes_stale() {
     let _guard = MEMORY_LOCK.lock().unwrap();
+    support::disable_background_watchers();
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().to_string_lossy().to_string();
 
@@ -1336,6 +1342,7 @@ fn archive_threshold_excludes_stale() {
 #[test]
 fn touch_on_access_updates_last_accessed() {
     let _guard = MEMORY_LOCK.lock().unwrap();
+    support::disable_background_watchers();
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().to_string_lossy().to_string();
 
@@ -1596,6 +1603,7 @@ fn anchor_boost_score_verification() {
 #[test]
 fn confidence_times_relevance_scoring() {
     let _guard = MEMORY_LOCK.lock().unwrap();
+    support::disable_background_watchers();
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().to_string_lossy().to_string();
 
@@ -1781,6 +1789,7 @@ fn always_include_ordering() {
 #[test]
 fn auto_injection_symbol_context() {
     let _guard = MEMORY_LOCK.lock().unwrap();
+    support::disable_background_watchers();
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().to_string_lossy().to_string();
 
@@ -1847,6 +1856,7 @@ fn auto_injection_symbol_context() {
 #[test]
 fn auto_injection_doc_context() {
     let _guard = MEMORY_LOCK.lock().unwrap();
+    support::disable_background_watchers();
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().to_string_lossy().to_string();
 
@@ -1903,6 +1913,7 @@ fn auto_injection_doc_context() {
 #[test]
 fn auto_injection_skips_low_confidence() {
     let _guard = MEMORY_LOCK.lock().unwrap();
+    support::disable_background_watchers();
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().to_string_lossy().to_string();
 
@@ -1961,6 +1972,7 @@ fn auto_injection_skips_low_confidence() {
 #[test]
 fn selective_indexing_confidence_scoring() {
     let _guard = MEMORY_LOCK.lock().unwrap();
+    support::disable_background_watchers();
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().to_string_lossy().to_string();
 
@@ -2018,6 +2030,7 @@ fn selective_indexing_confidence_scoring() {
 #[test]
 fn selective_indexing_mid_tier() {
     let _guard = MEMORY_LOCK.lock().unwrap();
+    support::disable_background_watchers();
     let dir = tempfile::TempDir::new().unwrap();
     let path = dir.path().to_string_lossy().to_string();
 

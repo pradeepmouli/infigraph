@@ -5,6 +5,8 @@ use serde_json::json;
 use infigraph_mcp::tools::index::tool_index_project;
 use infigraph_mcp::tools::search::tool_search;
 
+mod support;
+
 // set_current_dir is process-global — tests that change CWD must not run in parallel.
 static CWD_LOCK: Mutex<()> = Mutex::new(());
 
@@ -14,6 +16,7 @@ static CWD_LOCK: Mutex<()> = Mutex::new(());
 fn test_search_works_from_parent_cwd() {
     let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // Create a project inside a parent directory
+    support::disable_background_watchers();
     let parent = tempfile::TempDir::new().expect("parent tmpdir");
     let project_dir = parent.path().join("myproject");
     std::fs::create_dir_all(project_dir.join("src")).unwrap();
@@ -60,6 +63,7 @@ fn test_search_works_from_parent_cwd() {
 #[test]
 fn test_search_with_dot_path_uses_cwd() {
     let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    support::disable_background_watchers();
     let parent = tempfile::TempDir::new().expect("parent tmpdir");
     let project_dir = parent.path().join("subproject");
     std::fs::create_dir_all(project_dir.join("src")).unwrap();
@@ -91,6 +95,7 @@ fn test_search_with_dot_path_uses_cwd() {
 #[test]
 fn test_search_dot_path_from_parent_finds_via_registry() {
     let _lock = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    support::disable_background_watchers();
     let parent = tempfile::TempDir::new().expect("parent tmpdir");
     let project_dir = parent.path().join("child");
     std::fs::create_dir_all(project_dir.join("src")).unwrap();

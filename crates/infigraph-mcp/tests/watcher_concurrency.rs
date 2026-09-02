@@ -8,6 +8,8 @@ use infigraph_mcp::tools::index::tool_index_project;
 use infigraph_mcp::tools::search::tool_search;
 use infigraph_mcp::tools::watch::*;
 
+mod support;
+
 // All tests mutate the process-global WATCHERS map, so they must run sequentially.
 static WATCHER_LOCK: Mutex<()> = Mutex::new(());
 
@@ -19,16 +21,12 @@ impl Drop for WatcherCleanup {
     }
 }
 
-fn make_project(files: &[(&str, &str)]) -> (tempfile::TempDir, String) {
-    let dir = tempfile::TempDir::new().expect("tmpdir");
-    for (name, content) in files {
-        let p = dir.path().join(name);
-        if let Some(parent) = p.parent() {
-            std::fs::create_dir_all(parent).unwrap();
-        }
-        std::fs::write(&p, content).unwrap();
-    }
-    let path = dir.path().to_string_lossy().to_string();
+/// The returned guard stops the project's daemon (spawned by `infigraph
+/// index`'s auto-watch) before the directory is removed -- see
+/// `support::TestProject` (#136).
+fn make_project(files: &[(&str, &str)]) -> (support::TestProject, String) {
+    let dir = support::TestProject::with_files(files);
+    let path = dir.path_string();
     (dir, path)
 }
 

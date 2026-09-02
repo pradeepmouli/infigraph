@@ -9,6 +9,8 @@ use infigraph_mcp::tools::helpers::log_activity;
 use infigraph_mcp::tools::index::tool_index_project;
 use infigraph_mcp::tools::search::tool_search;
 
+mod support;
+
 static PROJECT: OnceLock<SharedProject> = OnceLock::new();
 
 struct SharedProject {
@@ -20,7 +22,9 @@ unsafe impl Sync for SharedProject {}
 
 fn shared_project() -> &'static SharedProject {
     PROJECT.get_or_init(|| {
+        support::disable_background_watchers();
         let dir = tempfile::TempDir::new().expect("tmpdir");
+        support::remove_at_exit(dir.path()); // a static is never dropped
         let files: &[(&str, &str)] = &[
             (
                 "src/main.py",
@@ -368,6 +372,7 @@ fn test_graph_tools() {
     assert!(result.contains("typescript"), "should list typescript");
 
     // --- delete_project (uses separate project, must run last) ---
+    support::disable_background_watchers();
     let del_dir = tempfile::TempDir::new().expect("tmpdir");
     let dp = del_dir.path().join("hello.py");
     std::fs::write(&dp, "def hello(): pass").unwrap();

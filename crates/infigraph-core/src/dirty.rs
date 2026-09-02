@@ -55,8 +55,14 @@ pub fn mark_dirty(infigraph_dir: &Path, rel_paths: &[String]) -> Result<()> {
     if rel_paths.is_empty() {
         return Ok(());
     }
-    std::fs::create_dir_all(infigraph_dir)
-        .with_context(|| format!("create {}", infigraph_dir.display()))?;
+    // Never create `.infigraph/` here. No `.infigraph/` means no indexed
+    // project, so there is no graph state for these paths to be stale
+    // against; and creating it is exactly how a watcher's last events,
+    // delivered after the project directory was removed, resurrected the
+    // root under the same path and kept a daemon alive on it (#136).
+    if !infigraph_dir.is_dir() {
+        return Ok(());
+    }
     let _lock =
         crate::lockfile::acquire(&dirty_lock_path(infigraph_dir), "dirty-mark", LOCK_TIMEOUT)
             .context("acquire dirty-set lock for mark")?;
@@ -132,7 +138,21 @@ mod tests {
     fn tmp_infigraph_dir() -> (tempfile::TempDir, PathBuf) {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join(".infigraph");
+        // An indexed project's `.infigraph/` already exists; `mark_dirty`
+        // deliberately never creates it (see the #136 note there).
+        std::fs::create_dir_all(&dir).unwrap();
         (tmp, dir)
+    }
+
+    /// #136: a mark against a root whose `.infigraph/` is gone (the watcher's
+    /// last events after a project was removed) must not bring it back.
+    #[test]
+    fn mark_dirty_does_not_create_a_missing_infigraph_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("gone").join(".infigraph");
+        mark_dirty(&dir, &["a.py".to_string()]).unwrap();
+        assert!(!dir.exists(), "mark_dirty must not resurrect .infigraph/");
+        assert!(!tmp.path().join("gone").exists());
     }
 
     #[test]
