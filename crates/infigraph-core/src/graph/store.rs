@@ -213,6 +213,51 @@ pub fn db_lock_path(db_path: &Path) -> PathBuf {
 /// holder" via `lockfile::read_holder` returning `None`, and does not flag
 /// -- conservative by design, since a false positive here means refusing
 /// to open a perfectly good graph.
+/// Decide whether a failed read-only open means the graph is *damaged* or
+/// merely *busy*.
+///
+/// `open_read_only` refuses a dead-holder WAL before it ever reaches
+/// `Database::new`, so a WAL-related failure past that point means the lock
+/// holder is either absent or ALIVE. A live writer's uncheckpointed WAL
+/// simply is not readable from outside -- a concurrency artifact, not damage.
+///
+/// This used to return `GraphCorruption` for *any* message mentioning a WAL,
+/// while `is_transient_wal_open_race_error` tested essentially the same
+/// condition and called it retryable: two predicates, one input, opposite
+/// verdicts. Because `GraphCorruption` is the downcast target that routes to
+/// quarantine, the corruption reading also meant `infigraph verify` told the
+/// user to rebuild a perfectly healthy graph. Reproduced on sittir
+/// 2026-09-02: an idle daemon holding a 690 KB WAL produced "Corrupted wal
+/// file. Read out invalid WAL record type." on three consecutive runs;
+/// stopping that daemon checkpointed the WAL away and the same untouched
+/// file verified 4 PASS / 0 WARN / 0 FAIL.
+///
+/// The busy wording keeps the "failed to open kuzu db" prefix so
+/// `is_transient_wal_open_race_error` still recognises it as retryable.
+fn classify_read_only_open_failure(msg: String, live_holder: Option<u32>) -> anyhow::Error {
+    if !msg.to_lowercase().contains("wal") {
+        return anyhow::anyhow!(msg);
+    }
+    match live_holder {
+        Some(pid) => anyhow::anyhow!(
+            "{msg} -- the graph is held by a live writer (PID {pid}) whose WAL has not been \
+             checkpointed yet, so it cannot be read from outside. This is not corruption: \
+             retry once the writer is idle (`infigraph ps` / `infigraph watch-status`)."
+        ),
+        None => anyhow::Error::new(GraphCorruption { detail: msg }),
+    }
+}
+
+/// PID currently holding `lock_path`, if that process is still running.
+///
+/// The complement of the dead-holder case `unclean_shutdown_wal_holder`
+/// reports: used to tell "a writer is mid-transaction" apart from "the graph
+/// is damaged" when a read-only open fails.
+pub fn live_lock_holder(lock_path: &Path) -> Option<u32> {
+    let holder = lockfile::read_holder(lock_path)?;
+    lockfile::holder_is_alive(&holder).then_some(holder.pid)
+}
+
 pub fn unclean_shutdown_wal_holder(db_path: &Path, lock_path: &Path) -> Option<u32> {
     if wal_family_paths(db_path).is_empty() {
         return None;
@@ -481,12 +526,10 @@ impl GraphStore {
         // tolerated and served as a torn base image.
         let config = SystemConfig::default().read_only(true);
         let db = Database::new(path, config).map_err(|e| {
-            let msg = format!("failed to open kuzu db (read-only): {e}");
-            if msg.to_lowercase().contains("wal") {
-                anyhow::Error::new(GraphCorruption { detail: msg })
-            } else {
-                anyhow::anyhow!(msg)
-            }
+            classify_read_only_open_failure(
+                format!("failed to open kuzu db (read-only): {e}"),
+                live_lock_holder(&lock_path),
+            )
         })?;
         refuse_newer_schema(&db, path)?;
         Ok(Self { db, lock_path })
@@ -1558,6 +1601,62 @@ mod tests {
     /// with a clear, actionable error rather than falling through to Kuzu's
     /// own confusing "Cannot create an empty database under READ ONLY mode"
     /// (read-only mode can never create a database).
+    /// The exact message lbug produced on sittir 2026-09-02 while an idle
+    /// daemon held an uncheckpointed WAL. `infigraph verify` called it
+    /// corruption three runs running and advised `index --full`; stopping
+    /// that daemon checkpointed the WAL away and the same untouched file
+    /// verified 4 PASS / 0 WARN / 0 FAIL. The graph was never damaged.
+    const LIVE_WRITER_WAL_ERROR: &str =
+        "failed to open kuzu db (read-only): Runtime exception: Corrupted wal file. \
+         Read out invalid WAL record type.";
+
+    #[test]
+    fn a_live_writers_unreadable_wal_is_busy_not_corruption() {
+        let err = classify_read_only_open_failure(LIVE_WRITER_WAL_ERROR.to_string(), Some(4242));
+
+        assert!(
+            err.downcast_ref::<GraphCorruption>().is_none(),
+            "must not downcast to GraphCorruption -- that is the quarantine/rotate \
+             signal, and this graph is merely busy: {err}"
+        );
+        assert!(
+            is_transient_open_error(&err),
+            "must stay retryable so open_kuzu_with_retry and verify treat it as a race: {err}"
+        );
+        assert!(
+            err.to_string().contains("4242"),
+            "must name the holder: {err}"
+        );
+        assert!(
+            err.to_string().contains("not corruption"),
+            "must say so in as many words, since the raw lbug text says 'Corrupted': {err}"
+        );
+    }
+
+    #[test]
+    fn the_same_wal_failure_with_no_live_holder_is_still_corruption() {
+        let err = classify_read_only_open_failure(LIVE_WRITER_WAL_ERROR.to_string(), None);
+        assert!(
+            err.downcast_ref::<GraphCorruption>().is_some(),
+            "with nobody holding the graph there is no race to blame -- real damage must \
+             still reach the quarantine path: {err}"
+        );
+    }
+
+    #[test]
+    fn a_non_wal_open_failure_is_never_corruption_either_way() {
+        for holder in [Some(4242), None] {
+            let err = classify_read_only_open_failure(
+                "failed to open kuzu db (read-only): Permission denied".to_string(),
+                holder,
+            );
+            assert!(
+                err.downcast_ref::<GraphCorruption>().is_none(),
+                "an unrelated open failure must not be dressed up as corruption: {err}"
+            );
+        }
+    }
+
     #[test]
     fn open_read_only_on_missing_graph_gives_a_clear_error() {
         let dir = tempfile::tempdir().unwrap();

@@ -41,6 +41,20 @@ pub fn run_verify(root: &Path) -> Vec<CheckResult> {
             results.push(CheckResult::pass(CATEGORY, "graph: open", "opens cleanly"));
             b
         }
+        Err(e) if crate::graph::is_transient_open_error(&e) => {
+            // A live writer mid-transaction, a checkpoint in progress, or
+            // lock contention -- the graph is not answerable right now, but
+            // it is not damaged either. Telling the user to rebuild here
+            // would destroy a healthy graph over a passing race.
+            results.push(CheckResult::warn(
+                CATEGORY,
+                "graph: open",
+                format!("{e:#}"),
+                "not a corruption signal -- re-run once the writer is idle \
+                 (`infigraph ps` / `infigraph watch-status`)",
+            ));
+            return results; // nothing below is answerable without the graph
+        }
         Err(e) => {
             results.push(CheckResult::fail(
                 CATEGORY,
