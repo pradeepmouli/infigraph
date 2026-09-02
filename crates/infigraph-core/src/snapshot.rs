@@ -51,15 +51,116 @@ pub(crate) fn should_skip(name: &str) -> bool {
         || name.starts_with("graph.previous.")
 }
 
+/// Below this many bytes a WAL is never judged pathological, so a fresh
+/// or tiny project's ordinary WAL (bounded by lbug's auto-checkpoint
+/// threshold) can't trip the rule just because its graph is smaller still.
+const PATHOLOGICAL_WAL_FLOOR_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Written into a snapshot in place of a WAL the snapshot deliberately left
+/// out, so `restore` users can see the snapshot holds the last checkpoint
+/// rather than the live WAL's uncheckpointed tail.
+pub(crate) const WAL_OMITTED_NOTE: &str = "graph.wal.omitted.json";
+
+/// The runaway-WAL pattern (#100, #130, #132): a healthy WAL is bounded by
+/// lbug's auto-checkpoint threshold, so one that has outgrown the
+/// checkpointed graph itself is not data worth preserving twice -- it is
+/// the thing that filled the disk. `floor` keeps small graphs out of it.
+pub(crate) fn wal_is_pathological(graph_bytes: u64, wal_bytes: u64, floor: u64) -> bool {
+    wal_bytes > graph_bytes.max(floor)
+}
+
+/// What `create_snapshot` is about to copy, decided before any byte moves
+/// so the disk-headroom preflight can see the real projected size (#130:
+/// the 29 GB snapshot that drove a volume to ENOSPC was a faithful copy of
+/// a 27 GB runaway WAL nobody had looked at first).
+pub(crate) struct SnapshotPlan {
+    /// `(source path, destination file name)` for every entry to copy.
+    entries: Vec<(PathBuf, std::ffi::OsString)>,
+    pub(crate) projected_bytes: u64,
+    /// `Some((graph_bytes, wal_bytes))` when the WAL family was left out.
+    pub(crate) omitted_wal: Option<(u64, u64)>,
+}
+
+pub(crate) fn plan_snapshot(infigraph_dir: &Path, wal_floor: u64) -> Result<SnapshotPlan> {
+    let mut plan = SnapshotPlan {
+        entries: Vec::new(),
+        projected_bytes: 0,
+        omitted_wal: None,
+    };
+    if !infigraph_dir.exists() {
+        return Ok(plan);
+    }
+    let wal_prefix = format!("{LIVE_GRAPH_NAME}.wal");
+    let mut wal_entries: Vec<(PathBuf, std::ffi::OsString, u64)> = Vec::new();
+    let mut graph_bytes = 0u64;
+    for entry in std::fs::read_dir(infigraph_dir)
+        .with_context(|| format!("snapshot: read_dir {}", infigraph_dir.display()))?
+        .flatten()
+    {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy().into_owned();
+        if should_skip(&name_str) {
+            continue;
+        }
+        let path = entry.path();
+        let bytes = entry_size(&path);
+        if name_str == wal_prefix || name_str.starts_with(&format!("{wal_prefix}.")) {
+            wal_entries.push((path, name, bytes));
+            continue;
+        }
+        if name_str == LIVE_GRAPH_NAME {
+            graph_bytes = bytes;
+        }
+        plan.projected_bytes += bytes;
+        plan.entries.push((path, name));
+    }
+    let wal_bytes: u64 = wal_entries.iter().map(|(_, _, b)| *b).sum();
+    if wal_is_pathological(graph_bytes, wal_bytes, wal_floor) {
+        plan.omitted_wal = Some((graph_bytes, wal_bytes));
+    } else {
+        for (path, name, bytes) in wal_entries {
+            plan.projected_bytes += bytes;
+            plan.entries.push((path, name));
+        }
+    }
+    Ok(plan)
+}
+
+/// Total bytes under `path` (a file's length, or a directory's recursive
+/// sum); 0 for anything unreadable, which only makes the preflight lenient.
+fn entry_size(path: &Path) -> u64 {
+    match std::fs::symlink_metadata(path) {
+        Ok(m) if m.is_dir() => std::fs::read_dir(path)
+            .map(|rd| rd.flatten().map(|e| entry_size(&e.path())).sum())
+            .unwrap_or(0),
+        Ok(m) => m.len(),
+        Err(_) => 0,
+    }
+}
+
 /// Snapshot the current `.infigraph/` state into `.infigraph/snapshots/<ts>/`
 /// before a destructive full-reindex wipe (R3.2.1). Copies everything except
 /// what `should_skip` excludes -- a real, independent copy per file (see
-/// `copy_entry_recursive` for why a plain hard link isn't safe here).
+/// `copy_entry_recursive` for why a plain hard link isn't safe here) -- and
+/// except a runaway WAL (see `wal_is_pathological`), which is recorded in
+/// `WAL_OMITTED_NOTE` instead of copied. Refuses, before writing anything,
+/// when the volume lacks headroom for the projected copy (R7.2, #130).
 ///
 /// Callers are responsible for holding whatever lock serializes writes to
 /// `infigraph_dir` before calling this -- mirrors `quarantine`'s contract;
 /// snapshotting itself does not lock.
 pub fn create_snapshot(infigraph_dir: &Path) -> Result<PathBuf> {
+    create_snapshot_with_wal_floor(infigraph_dir, PATHOLOGICAL_WAL_FLOOR_BYTES)
+}
+
+fn create_snapshot_with_wal_floor(infigraph_dir: &Path, wal_floor: u64) -> Result<PathBuf> {
+    let plan = plan_snapshot(infigraph_dir, wal_floor)?;
+    if let Err(shortfall) =
+        crate::graph::store_util::check_disk_headroom(infigraph_dir, plan.projected_bytes)
+    {
+        anyhow::bail!("pre-write snapshot refused -- {shortfall}");
+    }
+
     evict_oldest_if_at_bound(infigraph_dir)?;
 
     // now_epoch_secs() is second-granularity, so two calls within the same
@@ -78,17 +179,29 @@ pub fn create_snapshot(infigraph_dir: &Path) -> Result<PathBuf> {
     std::fs::create_dir_all(&dest)
         .with_context(|| format!("snapshot: create {}", dest.display()))?;
 
-    if infigraph_dir.exists() {
-        for entry in std::fs::read_dir(infigraph_dir)
-            .with_context(|| format!("snapshot: read_dir {}", infigraph_dir.display()))?
-            .flatten()
-        {
-            let name = entry.file_name();
-            if should_skip(&name.to_string_lossy()) {
-                continue;
-            }
-            copy_entry_recursive(&entry.path(), &dest.join(&name))?;
-        }
+    for (src, name) in &plan.entries {
+        copy_entry_recursive(src, &dest.join(name))?;
+    }
+
+    if let Some((graph_bytes, wal_bytes)) = plan.omitted_wal {
+        let reason = format!(
+            "graph.wal ({} MB) had outgrown the checkpointed graph ({} MB): the runaway-WAL \
+             pattern (github.com/pradeepmouli/infigraph#130); this snapshot holds the last \
+             checkpoint, not the WAL's uncheckpointed tail",
+            wal_bytes / (1024 * 1024),
+            graph_bytes / (1024 * 1024)
+        );
+        eprintln!("warn: snapshot {}: {reason}", dest.display());
+        let note = serde_json::json!({
+            "graph_bytes": graph_bytes,
+            "wal_bytes": wal_bytes,
+            "reason": reason,
+        });
+        std::fs::write(
+            dest.join(WAL_OMITTED_NOTE),
+            serde_json::to_string_pretty(&note)?,
+        )
+        .with_context(|| format!("snapshot: write {}", dest.join(WAL_OMITTED_NOTE).display()))?;
     }
 
     Ok(dest)
@@ -437,6 +550,94 @@ mod tests {
         );
         assert!(!dest.join("index.lock").exists());
         assert!(!dest.join("graph.corrupt.111").exists());
+    }
+
+    #[test]
+    fn a_wal_larger_than_the_graph_and_the_floor_is_pathological() {
+        // #130: a healthy WAL is bounded by the auto-checkpoint threshold,
+        // so one that outgrows the checkpointed graph itself is the runaway
+        // pattern -- unless the graph is tiny, where the floor keeps a
+        // normal WAL of a fresh project from tripping it.
+        assert!(!wal_is_pathological(1_000, 500, 100));
+        assert!(!wal_is_pathological(1_000, 1_000, 100));
+        assert!(wal_is_pathological(1_000, 1_001, 100));
+        assert!(
+            !wal_is_pathological(10, 50, 100),
+            "below the floor is never pathological"
+        );
+        assert!(wal_is_pathological(10, 101, 100));
+    }
+
+    #[test]
+    fn snapshot_omits_a_pathological_wal_and_records_why() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tg = tmp.path().join(".infigraph");
+        write(&tg.join("graph"), "graph");
+        write(&tg.join("graph.wal"), &"w".repeat(4096));
+        write(&tg.join("graph.wal.checkpoint"), "ckpt");
+        write(&tg.join("embeddings.bin"), "embed");
+
+        let dest = create_snapshot_with_wal_floor(&tg, 0).unwrap();
+
+        assert!(dest.join("graph").exists());
+        assert!(dest.join("embeddings.bin").exists());
+        assert!(
+            !dest.join("graph.wal").exists(),
+            "the runaway WAL is not copied"
+        );
+        assert!(
+            !dest.join("graph.wal.checkpoint").exists(),
+            "nor its siblings"
+        );
+        let note: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dest.join(WAL_OMITTED_NOTE)).unwrap())
+                .unwrap();
+        assert_eq!(note["graph_bytes"], 5);
+        assert_eq!(note["wal_bytes"], 4100);
+        assert!(note["reason"].as_str().unwrap().contains("#130"));
+    }
+
+    #[test]
+    fn snapshot_keeps_a_wal_that_is_smaller_than_its_graph() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tg = tmp.path().join(".infigraph");
+        write(&tg.join("graph"), &"g".repeat(4096));
+        write(&tg.join("graph.wal"), "wal");
+        write(&tg.join("graph.wal.checkpoint"), "ckpt");
+
+        let dest = create_snapshot_with_wal_floor(&tg, 0).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(dest.join("graph.wal")).unwrap(),
+            "wal"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dest.join("graph.wal.checkpoint")).unwrap(),
+            "ckpt"
+        );
+        assert!(!dest.join(WAL_OMITTED_NOTE).exists());
+    }
+
+    #[test]
+    fn snapshot_plan_projects_exactly_the_bytes_it_will_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tg = tmp.path().join(".infigraph");
+        write(&tg.join("graph"), "12345"); // 5
+        write(&tg.join("graph.wal"), "123456789"); // 9, pathological at floor 0 -> omitted
+        write(&tg.join("sessions").join("a.json"), "1234567"); // 7
+        write(&tg.join("index.lock"), "xxxx"); // skipped
+        write(&tg.join("graph.corrupt.1"), "xxxxxxxx"); // skipped
+
+        let plan = plan_snapshot(&tg, 0).unwrap();
+        assert_eq!(plan.projected_bytes, 12, "graph + sessions/a.json only");
+        assert_eq!(plan.omitted_wal, Some((5, 9)));
+
+        let plan = plan_snapshot(&tg, 1024).unwrap();
+        assert_eq!(
+            plan.projected_bytes, 21,
+            "below the floor the WAL is copied too"
+        );
+        assert_eq!(plan.omitted_wal, None);
     }
 
     #[test]
