@@ -6,6 +6,8 @@ use infigraph_mcp::tools::groups::*;
 use infigraph_mcp::tools::index::tool_index_project;
 use infigraph_mcp::tools::watch::*;
 
+mod support;
+
 // Two microservice projects for group testing
 struct GroupFixture {
     _home_dir: tempfile::TempDir,
@@ -37,6 +39,7 @@ fn group_fixture() -> &'static GroupFixture {
         std::env::remove_var("INFIGRAPH_BACKEND");
 
         let home_dir = tempfile::TempDir::new().expect("tmpdir for home");
+        support::remove_at_exit(home_dir.path()); // static fixture: never dropped (#136)
         let orig_home = std::env::var("HOME").unwrap_or_default();
         std::env::set_var("HOME", home_dir.path());
         std::env::set_var("INFIGRAPH_REGISTRY_HOME", home_dir.path());
@@ -63,6 +66,7 @@ fn group_fixture() -> &'static GroupFixture {
 
         // Service A: a Flask-like Python API
         let svc_a_dir = tempfile::TempDir::new().expect("svc_a");
+        support::remove_at_exit(svc_a_dir.path());
         let svc_a_files: &[(&str, &str)] = &[
             (
                 "app.py",
@@ -115,6 +119,7 @@ def test_process_order():
 
         // Service B: a user service
         let svc_b_dir = tempfile::TempDir::new().expect("svc_b");
+        support::remove_at_exit(svc_b_dir.path());
         let svc_b_files: &[(&str, &str)] = &[(
             "app.py",
             "\
@@ -391,7 +396,7 @@ fn test_groups_watch_perf() {
     // ==================== INDEX PERFORMANCE ====================
 
     // Create a moderately sized project
-    let perf_dir = tempfile::TempDir::new().expect("perf_dir");
+    let perf_dir = support::TestProject::new();
     for i in 0..50 {
         let name = format!("module_{i}.py");
         let mut code = format!("class Service{i}:\n");
