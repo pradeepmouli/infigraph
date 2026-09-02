@@ -41,6 +41,26 @@ fn group_fixture() -> &'static GroupFixture {
         std::env::set_var("HOME", home_dir.path());
         std::env::set_var("INFIGRAPH_REGISTRY_HOME", home_dir.path());
 
+        // #141: this fixture indexes by spawning the `infigraph` CLI that
+        // `tool_index_project` resolves next to this test executable (or on
+        // PATH). `cargo test -p infigraph-mcp` never rebuilds that binary, so
+        // after a branch switch across lbug versions a stale one writes a
+        // graph this process cannot read and the test fails far downstream
+        // ("No results across repos"). Fail here, loudly, instead.
+        let cli = infigraph_mcp::tools::helpers::find_infigraph_cli()
+            .expect("an `infigraph` CLI binary next to the test executable or on PATH");
+        let cli_hash = infigraph_core::daemon::installed_build_hash_of(&cli)
+            .unwrap_or_else(|| panic!("{} did not report a build hash", cli.display()));
+        assert_eq!(
+            cli_hash,
+            infigraph_core::build_hash(),
+            "stale `infigraph` CLI at {}: it is build {cli_hash} but this test is build {} -- \
+             run `cargo build -p infigraph-cli` (same profile) first, or the fixture indexes on \
+             another lbug storage version (pradeepmouli/infigraph#141)",
+            cli.display(),
+            infigraph_core::build_hash()
+        );
+
         // Service A: a Flask-like Python API
         let svc_a_dir = tempfile::TempDir::new().expect("svc_a");
         let svc_a_files: &[(&str, &str)] = &[

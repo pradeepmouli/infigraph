@@ -208,30 +208,27 @@ fn reindex_path(cli_path: &std::path::Path, path: &std::path::Path) {
     }
 }
 
+/// The CLI the supervisor spawns for a crash-recovery reindex: next to this
+/// executable (the same resolution every other spawn path uses), else the
+/// default install location. Build-checked once against this process (#141).
 fn find_infigraph_cli_for_reindex() -> Option<std::path::PathBuf> {
-    let bin_name = if cfg!(windows) {
-        "infigraph.exe"
-    } else {
-        "infigraph"
-    };
-    // Check next to current exe
-    if let Ok(exe) = std::env::current_exe() {
-        let sibling = exe.parent()?.join(bin_name);
-        if sibling.exists() {
-            return Some(sibling);
-        }
-    }
-    // Check common install locations
-    let home = std::env::var_os("HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(dirs_next::home_dir);
-    if let Some(ref h) = home {
-        let local_bin = h.join(".local").join("bin").join(bin_name);
-        if local_bin.exists() {
-            return Some(local_bin);
-        }
-    }
-    None
+    let found = std::env::current_exe()
+        .ok()
+        .and_then(|exe| infigraph_core::daemon::lifecycle::resolve_cli_binary_sibling_of(&exe).ok())
+        .or_else(|| {
+            let bin_name = if cfg!(windows) {
+                "infigraph.exe"
+            } else {
+                "infigraph"
+            };
+            let home = std::env::var_os("HOME")
+                .map(std::path::PathBuf::from)
+                .or_else(dirs_next::home_dir)?;
+            let local_bin = home.join(".local").join("bin").join(bin_name);
+            local_bin.exists().then_some(local_bin)
+        })?;
+    infigraph_core::daemon::warn_if_cli_build_differs(&found);
+    Some(found)
 }
 
 fn run_worker() -> Result<()> {

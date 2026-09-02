@@ -157,29 +157,23 @@ fn apply_repo_filter(prism: &mut Infigraph, raw_path: &str) {
 #[cfg(not(feature = "remote"))]
 fn apply_repo_filter(_prism: &mut Infigraph, _raw_path: &str) {}
 
+/// The `infigraph` CLI this server spawns for indexing: a sibling of this
+/// executable (or one directory up, the `cargo test` layout -- the same
+/// resolution the daemon spawn path uses, `resolve_cli_binary_sibling_of`),
+/// falling back to whatever `infigraph` is on PATH. Whichever is found is
+/// checked against this process's own build once (#141): a stale binary
+/// here writes a graph on another lbug storage version, which this server
+/// then cannot read.
 pub fn find_infigraph_cli() -> Option<std::path::PathBuf> {
-    let bin_name = if cfg!(windows) {
-        "infigraph.exe"
-    } else {
-        "infigraph"
-    };
+    let found = std::env::current_exe()
+        .ok()
+        .and_then(|exe| infigraph_core::daemon::lifecycle::resolve_cli_binary_sibling_of(&exe).ok())
+        .or_else(find_infigraph_cli_on_path)?;
+    infigraph_core::daemon::warn_if_cli_build_differs(&found);
+    Some(found)
+}
 
-    // Check same directory as this binary first, then parent (target/debug/deps/ → target/debug/)
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let sibling = dir.join(bin_name);
-            if sibling.exists() {
-                return Some(sibling);
-            }
-            if let Some(parent) = dir.parent() {
-                let in_parent = parent.join(bin_name);
-                if in_parent.exists() {
-                    return Some(in_parent);
-                }
-            }
-        }
-    }
-    // Fall back to PATH
+fn find_infigraph_cli_on_path() -> Option<std::path::PathBuf> {
     let which_cmd = if cfg!(windows) { "where" } else { "which" };
     if let Ok(out) = std::process::Command::new(which_cmd)
         .arg("infigraph")

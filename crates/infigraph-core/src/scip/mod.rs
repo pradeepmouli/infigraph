@@ -700,8 +700,19 @@ pub fn import_scip_index_enriched_at(
     // Bulk write INHERITS edges via Parquet COPY FROM, dropping any bad-PK
     // record and retrying rather than falling back to UNWIND for the batch.
     if !inherits_to_create.is_empty() {
-        let tmp = std::env::temp_dir();
-        let edge_pq = tmp.join("infigraph_scip_inherits.parquet");
+        // Run-unique name (#139): two concurrent imports -- a user-run
+        // `scip-enrich`/`index --full` alongside the daemon's own
+        // staleness-triggered enrichment -- must not COPY from, or delete,
+        // each other's edge file. `copy_edges_with_bad_record_retry` removes
+        // it when done, so nothing accumulates on the happy path.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let edge_pq = std::env::temp_dir().join(format!(
+            "infigraph_scip_inherits.{}.{nanos}.parquet",
+            std::process::id()
+        ));
         stats.relations_added = inherits_to_create.len();
         copy_edges_with_bad_record_retry(
             store,

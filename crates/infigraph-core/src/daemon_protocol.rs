@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio_util::sync::CancellationToken;
 
 /// A request for the daemon to perform a write. Carries references (paths),
 /// never pre-computed data -- the daemon does its own parsing/extraction
@@ -275,6 +276,55 @@ pub fn submit_write_request_named(
     request: &WriteRequest,
     timeout: Duration,
 ) -> anyhow::Result<WriteResult> {
+    submit_write_request_named_cancellable(staging_dir, name, request, timeout, None)
+}
+
+/// [`submit_write_request`] for a caller that can be told to stop waiting:
+/// `cancel` is checked between polls, and once it is cancelled the request
+/// file is withdrawn and a [`WriteRequestCancelled`] error is returned
+/// promptly instead of waiting out `timeout` (#138). The daemon's own
+/// SCIP-enrichment callback uses this: when the coordinator loop exits
+/// (`daemon stop`, the build-hash self-check, the `watch.stop` sentinel),
+/// nothing will ever serve the import it submitted, and the loop's exit
+/// joins that callback -- so a 600s poll here was a 600s shutdown hang, and
+/// the next daemon inherited the orphaned `.request`.
+pub fn submit_write_request_cancellable(
+    staging_dir: &Path,
+    request: &WriteRequest,
+    timeout: Duration,
+    cancel: &CancellationToken,
+) -> anyhow::Result<WriteResult> {
+    let name = generate_request_name();
+    submit_write_request_named_cancellable(staging_dir, &name, request, timeout, Some(cancel))
+}
+
+/// Marker error: the caller's [`CancellationToken`] fired before a daemon
+/// answered, and the request file was withdrawn. Downcast target for callers
+/// that clean up differently on cancellation than on timeout.
+#[derive(Debug)]
+pub struct WriteRequestCancelled {
+    pub request_path: PathBuf,
+}
+
+impl std::fmt::Display for WriteRequestCancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "write request cancelled before a daemon responded ({})",
+            self.request_path.display()
+        )
+    }
+}
+
+impl std::error::Error for WriteRequestCancelled {}
+
+fn submit_write_request_named_cancellable(
+    staging_dir: &Path,
+    name: &str,
+    request: &WriteRequest,
+    timeout: Duration,
+    cancel: Option<&CancellationToken>,
+) -> anyhow::Result<WriteResult> {
     std::fs::create_dir_all(staging_dir)?;
     let request_path = staging_dir.join(format!("{name}.request"));
     let result_path = staging_dir.join(format!("{name}.result"));
@@ -289,6 +339,10 @@ pub fn submit_write_request_named(
             std::fs::remove_file(&result_path).ok();
             return Ok(serde_json::from_str(&contents)?);
         }
+        if cancel.is_some_and(|t| t.is_cancelled()) {
+            std::fs::remove_file(&request_path).ok();
+            return Err(anyhow::Error::new(WriteRequestCancelled { request_path }));
+        }
         if start.elapsed() >= timeout {
             std::fs::remove_file(&request_path).ok();
             anyhow::bail!(
@@ -299,6 +353,74 @@ pub fn submit_write_request_named(
         }
         std::thread::sleep(delay.min(timeout.saturating_sub(start.elapsed())));
         delay = (delay * 2).min(Duration::from_millis(200));
+    }
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+
+    /// #138: a cancelled token must end the poll promptly and withdraw the
+    /// request, instead of waiting out the (deliberately huge) timeout.
+    #[test]
+    fn cancelled_submit_returns_promptly_and_withdraws_the_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let token = CancellationToken::new();
+        let waiter = {
+            let staging = dir.path().to_path_buf();
+            let token = token.clone();
+            std::thread::spawn(move || {
+                submit_write_request_cancellable(
+                    &staging,
+                    &WriteRequest::FullReindex,
+                    Duration::from_secs(600),
+                    &token,
+                )
+            })
+        };
+        std::thread::sleep(Duration::from_millis(150));
+        let cancelled_at = Instant::now();
+        token.cancel();
+
+        let err = waiter
+            .join()
+            .unwrap()
+            .expect_err("nothing served the request, so cancellation must surface as an error");
+        assert!(
+            cancelled_at.elapsed() < Duration::from_secs(5),
+            "poll must observe the cancellation within its backoff cap, took {:?}",
+            cancelled_at.elapsed()
+        );
+        let cancelled = err
+            .downcast_ref::<WriteRequestCancelled>()
+            .expect("must be the typed cancellation marker, not the timeout wording");
+        assert!(
+            !cancelled.request_path.exists(),
+            "the withdrawn request file must not be left for the next daemon to inherit"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name())
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "staging dir must be clean: {leftovers:?}"
+        );
+    }
+
+    /// The non-cancellable entry points keep their exact timeout behavior.
+    #[test]
+    fn uncancellable_submit_still_times_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = submit_write_request(
+            dir.path(),
+            &WriteRequest::FullReindex,
+            Duration::from_millis(50),
+        )
+        .expect_err("no daemon, must time out");
+        assert!(err.to_string().contains("no daemon responded"), "{err}");
+        assert!(err.downcast_ref::<WriteRequestCancelled>().is_none());
     }
 }
 

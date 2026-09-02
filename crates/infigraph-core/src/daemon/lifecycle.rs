@@ -466,6 +466,9 @@ pub fn build_daemon_command(root: &Path, tg_dir: &Path, watch_binary: &Path) -> 
 }
 
 fn spawn_daemon(root: &Path, tg_dir: &Path, watch_binary: &Path) -> DaemonStartOutcome {
+    // #141: say so up front if the daemon we are about to launch is not the
+    // build we are (one subprocess, once per binary path per process).
+    crate::daemon::warn_if_cli_build_differs(watch_binary);
     let mut cmd = build_daemon_command(root, tg_dir, watch_binary);
     match cmd.spawn() {
         Ok(_) => DaemonStartOutcome::Spawned,

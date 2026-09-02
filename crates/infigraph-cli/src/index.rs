@@ -900,6 +900,89 @@ pub(crate) fn cmd_scip_enrich(root: &Path, detected_languages: &std::collections
 /// Returns `(label, scip_output_path, succeeded)` per indexer that was
 /// actually run. An empty result means there was nothing to import --
 /// callers should skip acquiring any lock at all in that case.
+/// Run-unique suffix for this process's SCIP scratch files (#139): pid plus
+/// a nanosecond timestamp. A user-run `infigraph scip-enrich`/`index --full`
+/// and the daemon's own staleness-triggered enrichment can now run the same
+/// indexer at the same time; with a fixed `<indexer>.scip` name one side
+/// imported the other's half-written file or found it already deleted.
+fn scip_run_id() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("{}-{nanos}", std::process::id())
+}
+
+/// Age past which a `.scip` scratch file is assumed orphaned by a producer
+/// that crashed before importing it. Deliberately generous: a live
+/// concurrent run's output must never be swept, and no indexer runs for
+/// hours on any repo this tool targets.
+const SCIP_SCRATCH_STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(6 * 3600);
+
+/// Remove `.scip` leftovers older than [`SCIP_SCRATCH_STALE_AFTER`] from
+/// `scip_tmp`, so a crashed producer does not accumulate files forever.
+/// Anything younger belongs (or may belong) to a run still in progress.
+fn sweep_stale_scip_scratch(scip_tmp: &Path) {
+    let Ok(entries) = std::fs::read_dir(scip_tmp) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("scip") {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age > SCIP_SCRATCH_STALE_AFTER);
+        if stale {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
+#[cfg(test)]
+mod scip_scratch_tests {
+    use super::*;
+
+    #[test]
+    fn run_ids_are_unique_within_a_process() {
+        let a = scip_run_id();
+        let b = scip_run_id();
+        assert!(a.starts_with(&format!("{}-", std::process::id())));
+        assert_ne!(a, b, "two runs in one process must not share scratch names");
+    }
+
+    #[test]
+    fn sweep_removes_only_old_scip_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let fresh = dir.path().join("rust-analyzer.1-1.scip");
+        let old = dir.path().join("scip-python.2-2.scip");
+        let unrelated_old = dir.path().join("notes.txt");
+        for p in [&fresh, &old, &unrelated_old] {
+            std::fs::write(p, b"x").unwrap();
+        }
+        let long_ago = std::time::SystemTime::now() - (SCIP_SCRATCH_STALE_AFTER * 2);
+        for p in [&old, &unrelated_old] {
+            std::fs::File::options()
+                .write(true)
+                .open(p)
+                .unwrap()
+                .set_modified(long_ago)
+                .unwrap();
+        }
+
+        sweep_stale_scip_scratch(dir.path());
+
+        assert!(fresh.exists(), "a young file may belong to a live run");
+        assert!(!old.exists(), "an hours-old .scip is an orphan");
+        assert!(unrelated_old.exists(), "only .scip files are swept");
+    }
+}
+
 pub(crate) fn run_scip_indexers(
     root: &Path,
     detected_languages: &std::collections::HashSet<String>,
@@ -924,6 +1007,8 @@ pub(crate) fn run_scip_indexers(
     // Filter to runnable indexers and build per-indexer tasks
     let scip_tmp = root.join(".infigraph").join("scip-tmp");
     let _ = std::fs::create_dir_all(&scip_tmp);
+    sweep_stale_scip_scratch(&scip_tmp);
+    let run_id = scip_run_id();
 
     let tasks: Vec<_> = binaries
         .into_iter()
@@ -932,13 +1017,13 @@ pub(crate) fn run_scip_indexers(
             if !should_run_indexer(root, indexer) {
                 return None;
             }
-            let output_path = scip_tmp.join(format!("{}.scip", indexer.binary_name));
+            let output_path = scip_tmp.join(format!("{}.{run_id}.scip", indexer.binary_name));
             Some((indexer, bin, output_path))
         })
         .collect();
 
     if tasks.is_empty() {
-        let _ = std::fs::remove_dir_all(&scip_tmp);
+        let _ = std::fs::remove_dir(&scip_tmp);
         return Vec::new();
     }
 
@@ -954,7 +1039,7 @@ pub(crate) fn run_scip_indexers(
         Ok(rt) => rt,
         Err(e) => {
             eprintln!("Auto-SCIP: failed to start local runtime for SCIP indexers: {e}");
-            let _ = std::fs::remove_dir_all(&scip_tmp);
+            let _ = std::fs::remove_dir(&scip_tmp);
             return Vec::new();
         }
     };
@@ -1022,7 +1107,9 @@ async fn run_cancellable_indexer_batch(
 /// on post-import graph state, so this must run after import, under the
 /// same lock). This is the part that actually touches the graph -- callers
 /// under daemon mode must hold `index.lock` for (only) this call, not for
-/// `run_scip_indexers` above. Cleans up `scip_tmp`'s contents as it goes.
+/// `run_scip_indexers` above. Removes only *this run's* `.scip` files as it
+/// goes (and the directory once it is empty): a concurrent producer's files
+/// in the same `scip-tmp` are never touched (#139).
 pub(crate) fn import_scip_results_and_embed(
     root: &Path,
     prism: &Infigraph,
@@ -1031,7 +1118,10 @@ pub(crate) fn import_scip_results_and_embed(
     let scip_tmp = root.join(".infigraph").join("scip-tmp");
 
     let Some(backend) = prism.backend() else {
-        let _ = std::fs::remove_dir_all(&scip_tmp);
+        for (_, scip_path, _) in results {
+            let _ = std::fs::remove_file(scip_path);
+        }
+        let _ = std::fs::remove_dir(&scip_tmp);
         return;
     };
     for (label, scip_path, success) in results {
@@ -1046,7 +1136,7 @@ pub(crate) fn import_scip_results_and_embed(
         }
         let _ = std::fs::remove_file(scip_path);
     }
-    let _ = std::fs::remove_dir_all(&scip_tmp);
+    let _ = std::fs::remove_dir(&scip_tmp);
 
     // Embed any new symbols SCIP added (skips existing embeddings)
     let root_buf = root.to_path_buf();

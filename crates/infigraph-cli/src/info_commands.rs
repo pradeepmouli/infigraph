@@ -561,6 +561,15 @@ pub(crate) fn cmd_daemon(root: &Path, debounce: u64) -> Result<()> {
                         let _ = std::fs::remove_file(&scip_path);
                         continue;
                     }
+                    // #138: once the coordinator loop is exiting nothing will
+                    // ever serve this import, and the loop's exit joins this
+                    // very callback -- so don't submit into the void, and
+                    // don't leave the `.scip` for the next daemon to inherit.
+                    if token.is_cancelled() {
+                        let _ = std::fs::remove_file(&scip_path);
+                        eprintln!("[daemon] SCIP {label} import skipped: daemon shutting down");
+                        continue;
+                    }
                     // Stamp the generation this run started from, not the
                     // one the graph reaches by the time the import lands --
                     // drains that arrived while the indexers ran are not in
@@ -569,15 +578,17 @@ pub(crate) fn cmd_daemon(root: &Path, debounce: u64) -> Result<()> {
                         scip_path: scip_path.clone(),
                         enriched_ast_generation: Some(job.ast_generation),
                     };
-                    match infigraph_core::daemon_protocol::submit_write_request(
+                    match infigraph_core::daemon_protocol::submit_write_request_cancellable(
                         &requests_dir,
                         &request,
                         // Generous: a large repo's SCIP import (COPY/UNWIND
                         // against tens of thousands of symbols) can take
                         // minutes, and this callback is not on the
                         // coordinator's own tick thread, so waiting doesn't
-                        // stall anything else.
+                        // stall anything else. The token bounds it instead:
+                        // a daemon shutdown ends the wait within one poll.
                         std::time::Duration::from_secs(600),
+                        &token,
                     ) {
                         Ok(infigraph_core::daemon_protocol::WriteResult::ScipImportOk(_)) => {
                             // The coordinator's own `finish_scip_import` already
@@ -588,6 +599,19 @@ pub(crate) fn cmd_daemon(root: &Path, debounce: u64) -> Result<()> {
                         }
                         Ok(_) => {
                             // ScipImport only ever replies ScipImportOk or Err.
+                        }
+                        Err(e)
+                            if e
+                                .downcast_ref::<
+                                    infigraph_core::daemon_protocol::WriteRequestCancelled,
+                                >()
+                                .is_some() =>
+                        {
+                            let _ = std::fs::remove_file(&scip_path);
+                            eprintln!(
+                                "[daemon] SCIP {label} import abandoned: daemon shut down before \
+                                 the coordinator served it"
+                            );
                         }
                         Err(e) => {
                             eprintln!("[daemon] SCIP {label} import request failed: {e}");

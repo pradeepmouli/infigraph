@@ -160,6 +160,42 @@ pub fn installed_build_hash_of(binary: &std::path::Path) -> Option<String> {
     Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// Warn, once per binary path per process, when the `infigraph` CLI this
+/// process is about to spawn reports a different build than this process
+/// itself (#141). Mixed builds are how a graph gets written on one lbug
+/// storage version and read on another (#140): a `cargo test` binary next
+/// to a stale `<target-dir>/debug/infigraph`, or an `infigraph-mcp` that
+/// outlived an install. A silent mismatch used to surface only as "No
+/// results across repos"; this names both hashes and the path up front.
+/// Never refuses -- an undeterminable hash, or a genuinely mixed install,
+/// is the caller's decision (`prune_stale_daemon` judges the daemon side).
+pub fn warn_if_cli_build_differs(cli: &std::path::Path) {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static CHECKED: OnceLock<Mutex<HashSet<std::path::PathBuf>>> = OnceLock::new();
+    let first_time = CHECKED
+        .get_or_init(Default::default)
+        .lock()
+        .map(|mut seen| seen.insert(cli.to_path_buf()))
+        .unwrap_or(false);
+    if !first_time {
+        return;
+    }
+    let Some(theirs) = installed_build_hash_of(cli) else {
+        return;
+    };
+    if theirs != crate::build_hash() {
+        eprintln!(
+            "[build] warning: {} reports build {theirs}, but this process is build {} -- \
+             mixed builds index on one lbug storage version and read on another; rebuild or \
+             reinstall so every infigraph binary matches (for a test target dir: \
+             `cargo build -p infigraph-cli`; see pradeepmouli/infigraph#141)",
+            cli.display(),
+            crate::build_hash()
+        );
+    }
+}
+
 /// The daemon's own view: what does the binary it was launched from report
 /// now? (The binary on disk may have been replaced since this process
 /// started -- that is the whole point of the check.)
