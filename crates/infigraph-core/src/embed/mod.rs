@@ -563,50 +563,13 @@ fn embeddings_header(header: &[u8]) -> Result<(usize, u8)> {
 /// followed by an 8-byte trailing checksum (std DefaultHasher) over everything
 /// from `count` through the last entry (i.e. everything after the magic+version).
 pub fn save_embeddings(path: &Path, embeddings: &[(String, Vec<f32>)]) -> Result<()> {
-    use std::hash::Hasher;
-    let tmp_path = atomic_tmp_path(path);
-    {
-        let file = std::fs::File::create(&tmp_path).context("create temp embeddings file")?;
-        let mut w = BufWriter::new(file);
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-
-        w.write_all(&EMBEDDINGS_MAGIC)?;
-        w.write_all(&[EMBEDDINGS_FORMAT_VERSION])?;
-
-        // NOTE: hash bytes via `Hasher::write` (raw, streaming-composable
-        // concatenation of bytes) rather than the `Hash` trait's `.hash()`
-        // method — `Hash for [T]`/`Hash for [T; N]` length-prefixes every
-        // call, so hashing several small chunks here would NOT reproduce
-        // the same digest as `load_embeddings` hashing the whole payload
-        // buffer in one call. `Hasher::write` has no such prefix and is
-        // safe to split across arbitrarily many calls.
-        let count_bytes = (embeddings.len() as u32).to_le_bytes();
-        w.write_all(&count_bytes)?;
-        hasher.write(&count_bytes);
-
-        for (id, vec) in embeddings {
-            let id_bytes = id.as_bytes();
-            let id_len_bytes = (id_bytes.len() as u32).to_le_bytes();
-            w.write_all(&id_len_bytes)?;
-            hasher.write(&id_len_bytes);
-            w.write_all(id_bytes)?;
-            hasher.write(id_bytes);
-            let dim_bytes = (vec.len() as u32).to_le_bytes();
-            w.write_all(&dim_bytes)?;
-            hasher.write(&dim_bytes);
-            for &v in vec {
-                let f_bytes = v.to_le_bytes();
-                w.write_all(&f_bytes)?;
-                hasher.write(&f_bytes);
-            }
-        }
-
-        w.write_all(&hasher.finish().to_le_bytes())?;
-        w.flush().context("flush temp embeddings file")?;
-    }
-    std::fs::rename(&tmp_path, path).context("atomically replace embeddings file")?;
-    invalidate_embeddings_cache();
-    Ok(())
+    write_embeddings_file(
+        path,
+        EMBEDDINGS_FORMAT_VERSION,
+        embeddings
+            .iter()
+            .map(|(id, vec)| (id.as_str(), vec.as_slice(), None)),
+    )
 }
 
 /// Save symbol embeddings plus a per-entry input-text hash to a binary file
@@ -615,6 +578,26 @@ pub fn save_embeddings(path: &Path, embeddings: &[(String, Vec<f32>)]) -> Result
 /// by the same trailing checksum scheme as `save_embeddings`. The hash lets
 /// callers skip re-embedding symbols whose source text hasn't changed.
 pub fn save_embeddings_hashed(path: &Path, entries: &[(String, Vec<f32>, u64)]) -> Result<()> {
+    write_embeddings_file(
+        path,
+        EMBEDDINGS_FORMAT_VERSION_HASHED,
+        entries
+            .iter()
+            .map(|(id, vec, h)| (id.as_str(), vec.as_slice(), Some(*h))),
+    )
+}
+
+/// The one writer behind `save_embeddings` (v2) and `save_embeddings_hashed`
+/// (v3): the formats differ only in the version byte and in whether each
+/// entry carries an `input_hash:u64` between its id and its vector, so the
+/// entry stream says which (`Some(hash)` for v3, `None` for v2) and
+/// everything else -- temp file, header, checksum, atomic rename, cache
+/// invalidation -- is written once (#59).
+fn write_embeddings_file<'a>(
+    path: &Path,
+    version: u8,
+    entries: impl ExactSizeIterator<Item = (&'a str, &'a [f32], Option<u64>)>,
+) -> Result<()> {
     use std::hash::Hasher;
     let tmp_path = atomic_tmp_path(path);
     {
@@ -623,31 +606,32 @@ pub fn save_embeddings_hashed(path: &Path, entries: &[(String, Vec<f32>, u64)]) 
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
 
         w.write_all(&EMBEDDINGS_MAGIC)?;
-        w.write_all(&[EMBEDDINGS_FORMAT_VERSION_HASHED])?;
+        w.write_all(&[version])?;
 
-        // NOTE: see `save_embeddings` for why hashing must go through the
-        // raw, streaming-composable `Hasher::write` rather than `.hash()`.
-        let count_bytes = (entries.len() as u32).to_le_bytes();
-        w.write_all(&count_bytes)?;
-        hasher.write(&count_bytes);
+        // NOTE: hash bytes via `Hasher::write` (raw, streaming-composable
+        // concatenation of bytes) rather than the `Hash` trait's `.hash()`
+        // method — `Hash for [T]`/`Hash for [T; N]` length-prefixes every
+        // call, so hashing several small chunks here would NOT reproduce
+        // the same digest as `load_embeddings` hashing the whole payload
+        // buffer in one call. `Hasher::write` has no such prefix and is
+        // safe to split across arbitrarily many calls.
+        let mut put = |w: &mut BufWriter<std::fs::File>, bytes: &[u8]| -> Result<()> {
+            w.write_all(bytes)?;
+            hasher.write(bytes);
+            Ok(())
+        };
 
-        for (id, vec, h) in entries {
+        put(&mut w, &(entries.len() as u32).to_le_bytes())?;
+        for (id, vec, input_hash) in entries {
             let id_bytes = id.as_bytes();
-            let id_len_bytes = (id_bytes.len() as u32).to_le_bytes();
-            w.write_all(&id_len_bytes)?;
-            hasher.write(&id_len_bytes);
-            w.write_all(id_bytes)?;
-            hasher.write(id_bytes);
-            let hash_bytes = h.to_le_bytes();
-            w.write_all(&hash_bytes)?;
-            hasher.write(&hash_bytes);
-            let dim_bytes = (vec.len() as u32).to_le_bytes();
-            w.write_all(&dim_bytes)?;
-            hasher.write(&dim_bytes);
+            put(&mut w, &(id_bytes.len() as u32).to_le_bytes())?;
+            put(&mut w, id_bytes)?;
+            if let Some(h) = input_hash {
+                put(&mut w, &h.to_le_bytes())?;
+            }
+            put(&mut w, &(vec.len() as u32).to_le_bytes())?;
             for &v in vec {
-                let f_bytes = v.to_le_bytes();
-                w.write_all(&f_bytes)?;
-                hasher.write(&f_bytes);
+                put(&mut w, &v.to_le_bytes())?;
             }
         }
 
