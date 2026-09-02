@@ -836,36 +836,50 @@ pub fn check_disk(ctx: &DoctorContext) -> Vec<CheckResult> {
 const SIDECAR_CATEGORY: &str = "sidecars";
 const SIDECAR_STALE_SECS: u64 = 60 * 60; // 1 hour
 
+/// The store a sidecar is derived from, i.e. the file whose mtime its
+/// freshness is judged against, and the command that rebuilds it.
+/// `embeddings.bin` comes from the code graph; `docs_embeddings.bin` from
+/// the doc store (#64) -- a code-only reindex moves `graph` but never
+/// `docs.kuzu`, so judging the doc sidecar against `graph` produced a WARN
+/// that no `index-docs` run could ever clear.
+fn sidecar_anchor(sidecar_name: &str) -> (&'static str, &'static str) {
+    match sidecar_name {
+        "docs_embeddings.bin" => ("docs.kuzu", "index-docs"),
+        _ => ("graph", "index"),
+    }
+}
+
 fn check_one_sidecar(project_path: &Path, sidecar_name: &str) -> Option<CheckResult> {
     let infigraph_dir = project_path.join(".infigraph");
-    let graph_path = infigraph_dir.join("graph");
+    let (anchor_name, refresh_command) = sidecar_anchor(sidecar_name);
+    let anchor_path = infigraph_dir.join(anchor_name);
     let sidecar_path = infigraph_dir.join(sidecar_name);
 
-    if !sidecar_path.exists() || !graph_path.exists() {
+    if !sidecar_path.exists() || !anchor_path.exists() {
         return None;
     }
 
-    let graph_mtime = std::fs::metadata(&graph_path).ok()?.modified().ok()?;
+    let anchor_mtime = std::fs::metadata(&anchor_path).ok()?.modified().ok()?;
     let sidecar_mtime = std::fs::metadata(&sidecar_path).ok()?.modified().ok()?;
 
     let label = format!("{}: {}", project_path.display(), sidecar_name);
-    match graph_mtime.duration_since(sidecar_mtime) {
+    match anchor_mtime.duration_since(sidecar_mtime) {
         Ok(staleness) if staleness.as_secs() > SIDECAR_STALE_SECS => Some(CheckResult::warn(
             SIDECAR_CATEGORY,
             label,
             format!(
-                "sidecar is {} minutes older than the graph",
+                "sidecar is {} minutes older than {anchor_name}",
                 staleness.as_secs() / 60
             ),
             format!(
-                "run `infigraph index {}` to refresh it",
+                "run `infigraph {refresh_command} {}` to refresh it",
                 project_path.display()
             ),
         )),
         _ => Some(CheckResult::pass(
             SIDECAR_CATEGORY,
             label,
-            "fresh relative to graph",
+            format!("fresh relative to {anchor_name}"),
         )),
     }
 }
@@ -1191,4 +1205,96 @@ pub fn format_report(report: &DoctorReport, color: bool) -> String {
 
     out.push_str(&format!("{pass} PASS, {warn} WARN, {fail} FAIL\n"));
     out
+}
+
+#[cfg(test)]
+mod sidecar_anchor_tests {
+    use super::*;
+    use std::time::{Duration, SystemTime};
+
+    fn touch(path: &Path, age: Duration) {
+        std::fs::write(path, b"x").unwrap();
+        let f = std::fs::File::options().write(true).open(path).unwrap();
+        f.set_modified(SystemTime::now() - age).unwrap();
+    }
+
+    const HOURS: u64 = 60 * 60;
+
+    /// #64: a code-only reindex moved `graph` (fresh) while `docs.kuzu` and
+    /// the doc sidecar built from it stayed put. The doc sidecar is current.
+    #[test]
+    fn docs_sidecar_is_judged_against_the_doc_store_not_the_code_graph() {
+        let dir = tempfile::tempdir().unwrap();
+        let ig = dir.path().join(".infigraph");
+        std::fs::create_dir_all(&ig).unwrap();
+        touch(&ig.join("graph"), Duration::ZERO);
+        touch(&ig.join("docs.kuzu"), Duration::from_secs(3 * HOURS));
+        touch(
+            &ig.join("docs_embeddings.bin"),
+            Duration::from_secs(2 * HOURS),
+        );
+
+        let result = check_one_sidecar(dir.path(), "docs_embeddings.bin").unwrap();
+        assert_eq!(
+            result.status,
+            CheckStatus::Pass,
+            "doc sidecar newer than docs.kuzu must pass even though graph is newer: {}",
+            result.message
+        );
+        assert!(result.message.contains("docs.kuzu"), "{}", result.message);
+    }
+
+    #[test]
+    fn docs_sidecar_older_than_the_doc_store_warns_with_the_doc_reindex_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        let ig = dir.path().join(".infigraph");
+        std::fs::create_dir_all(&ig).unwrap();
+        touch(&ig.join("docs.kuzu"), Duration::ZERO);
+        touch(
+            &ig.join("docs_embeddings.bin"),
+            Duration::from_secs(2 * HOURS),
+        );
+
+        let result = check_one_sidecar(dir.path(), "docs_embeddings.bin").unwrap();
+        assert_eq!(result.status, CheckStatus::Warn, "{}", result.message);
+        assert!(result.message.contains("docs.kuzu"), "{}", result.message);
+        assert!(
+            result
+                .remediation
+                .as_deref()
+                .unwrap_or("")
+                .contains("index-docs"),
+            "{:?}",
+            result.remediation
+        );
+    }
+
+    #[test]
+    fn code_sidecar_is_still_judged_against_the_code_graph() {
+        let dir = tempfile::tempdir().unwrap();
+        let ig = dir.path().join(".infigraph");
+        std::fs::create_dir_all(&ig).unwrap();
+        touch(&ig.join("graph"), Duration::ZERO);
+        touch(&ig.join("embeddings.bin"), Duration::from_secs(2 * HOURS));
+
+        let result = check_one_sidecar(dir.path(), "embeddings.bin").unwrap();
+        assert_eq!(result.status, CheckStatus::Warn, "{}", result.message);
+        assert!(result.message.contains("graph"), "{}", result.message);
+    }
+
+    /// Without the doc store there is nothing to compare against; the check
+    /// stays silent rather than falling back to the wrong anchor.
+    #[test]
+    fn docs_sidecar_without_a_doc_store_is_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let ig = dir.path().join(".infigraph");
+        std::fs::create_dir_all(&ig).unwrap();
+        touch(&ig.join("graph"), Duration::ZERO);
+        touch(
+            &ig.join("docs_embeddings.bin"),
+            Duration::from_secs(2 * HOURS),
+        );
+
+        assert!(check_one_sidecar(dir.path(), "docs_embeddings.bin").is_none());
+    }
 }
