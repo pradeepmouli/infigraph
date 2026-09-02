@@ -1599,15 +1599,7 @@ fn finish_scip_import(
 
     let touched_files = match result {
         Ok(stats) => {
-            eprintln!(
-                "[daemon] SCIP import complete: {} symbols enriched, {} added, {} references, \
-                 {} corrections learned ({} files processed)",
-                stats.symbols_enriched,
-                stats.symbols_added,
-                stats.references_added,
-                stats.corrections_learned,
-                stats.files_processed
-            );
+            eprintln!("[daemon] SCIP import complete: {stats}");
             if let Some(prism) = held.as_ref() {
                 if let Some(backend) = prism.backend() {
                     // `update_embeddings` returns the total embedding count

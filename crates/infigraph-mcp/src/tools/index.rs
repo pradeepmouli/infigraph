@@ -335,15 +335,7 @@ pub fn tool_scip_import(args: &Value) -> Result<String> {
     };
 
     let stats = backend.import_scip_index(&index_path, Some(&root))?;
-    let mut out = format!(
-        "SCIP import complete:\n  files processed: {}\n  symbols added: {}\n  symbols enriched: {}\n  relations added: {}\n  references added: {}\n  corrections learned: {}",
-        stats.files_processed,
-        stats.symbols_added,
-        stats.symbols_enriched,
-        stats.relations_added,
-        stats.references_added,
-        stats.corrections_learned,
-    );
+    let mut out = stats.report();
     let path = args.get("path").and_then(|p| p.as_str()).unwrap_or(".");
     if let Some(msg) = auto_start_watch(path) {
         out.push_str(&format!("\n{}", msg));

@@ -82,14 +82,7 @@ pub fn import_scip_index_enriched_at(
     let index = Index::parse_from_bytes(&bytes)
         .with_context(|| format!("failed to parse SCIP index: {}", index_path.display()))?;
 
-    let mut stats = ImportStats {
-        touched_files: index
-            .documents
-            .iter()
-            .map(|d| d.relative_path.clone())
-            .collect(),
-        ..Default::default()
-    };
+    let mut stats = ImportStats::default();
     let _lock = store.write_lock()?;
     let conn = store.connection()?;
 
@@ -191,6 +184,44 @@ pub fn import_scip_index_enriched_at(
         syms.sort_by_key(|(s, e, _)| *e as i64 - *s as i64);
     }
 
+    // #114: only documents whose file the graph already knows are imported.
+    // The File set IS the ignore filter (the AST index applied
+    // `.gitignore`/`.infigraphignore` when it created them) and also
+    // excludes files deleted since the indexer ran -- the daemon runs
+    // indexers unlocked while the graph keeps moving, so the index on disk
+    // can name files the graph has since removed. Everything else would
+    // become a Symbol with no File node: see `ImportStats::files_skipped`.
+    // Propagated on failure for the same reason as the preloads above: an
+    // empty set would silently skip every document.
+    let known_files: std::collections::HashSet<String> = conn
+        .query("MATCH (f:File) RETURN f.id")
+        .context("SCIP import: failed to preload File nodes")?
+        .filter_map(|row| {
+            row.first()
+                .map(|v| v.to_string().trim_matches('"').to_string())
+        })
+        .collect();
+    let (documents, skipped): (Vec<_>, Vec<_>) = index
+        .documents
+        .iter()
+        .partition(|d| known_files.contains(&d.relative_path));
+    stats.files_skipped = skipped.len();
+    // Not filtered down to "only files that actually changed" -- SCIP
+    // analyzed all of these, so treating the whole imported set as touched
+    // is the safe over-approximation for a caller that just wants to notify
+    // downstream consumers (e.g. the daemon's `on_event` callback) about
+    // cross-file-dependents awareness.
+    stats.touched_files = documents.iter().map(|d| d.relative_path.clone()).collect();
+    if let Some(first) = skipped.first() {
+        eprintln!(
+            "Auto-SCIP: skipping {} document(s) whose file has no File node in the graph \
+             (excluded by the index's ignore rules, or deleted since the indexer ran) -- \
+             first: {}",
+            skipped.len(),
+            first.relative_path
+        );
+    }
+
     // Snapshot of what existed in the graph BEFORE this import pass -- used
     // below to scope the `.first()` fallback to genuinely pre-existing
     // ambiguity (a span-computation edge case against one already-known
@@ -206,7 +237,7 @@ pub fn import_scip_index_enriched_at(
 
     // Build SCIP symbol -> definition file mapping (cross-file resolution)
     let mut scip_sym_to_file_name: HashMap<String, (String, String)> = HashMap::new();
-    for doc in &index.documents {
+    for doc in &documents {
         let file = &doc.relative_path;
         for occ in &doc.occurrences {
             if (occ.symbol_roles & SymbolRole::Definition as i32) == 0 {
@@ -241,7 +272,7 @@ pub fn import_scip_index_enriched_at(
     // re-deriving resolution through the lossy (file, name) map.
     let mut scip_sym_to_ts_id: HashMap<String, String> = HashMap::new();
 
-    for doc in &index.documents {
+    for doc in &documents {
         let file = &doc.relative_path;
 
         let sym_info_map: HashMap<&str, &scip::types::SymbolInformation> = doc
@@ -571,7 +602,7 @@ pub fn import_scip_index_enriched_at(
     let mut seen_edges: std::collections::HashSet<(String, String)> =
         std::collections::HashSet::new();
 
-    for doc in &index.documents {
+    for doc in &documents {
         let file = &doc.relative_path;
 
         for occ in &doc.occurrences {
@@ -667,7 +698,7 @@ pub fn import_scip_index_enriched_at(
     let mut seen_inherits: std::collections::HashSet<(String, String)> =
         std::collections::HashSet::new();
 
-    for doc in &index.documents {
+    for doc in &documents {
         for si in &doc.symbols {
             if si.symbol.starts_with("local ") || si.symbol.starts_with('<') {
                 continue;
@@ -881,6 +912,55 @@ pub struct ImportStats {
     /// cross-file-dependents awareness, not re-derive a precise per-file
     /// diff from the enrichment/new-symbol passes above.
     pub touched_files: Vec<String>,
+    /// Documents the indexer analyzed whose file has no `File` node in the
+    /// graph, skipped whole rather than imported (#114). A SCIP indexer
+    /// runs over the entire checkout and never reads `.gitignore`/
+    /// `.infigraphignore`, so its output covers paths the AST index
+    /// deliberately excluded (`dist/`, nested worktrees under an ignored
+    /// `scratchpad/`) plus any file deleted after the indexer ran. Symbols
+    /// created for those have no DEFINES edge, are invisible to file-scoped
+    /// queries, are never reached by the file/prefix removal paths (which
+    /// find files via File nodes), come back on every enrichment after an
+    /// `index --full`, and fail `infigraph verify`.
+    #[serde(default)]
+    pub files_skipped: usize,
+}
+
+impl ImportStats {
+    /// The multi-line, label-per-line form `infigraph scip-import` and the
+    /// `scip_import` MCP tool print.
+    pub fn report(&self) -> String {
+        format!(
+            "SCIP import complete:\n  files processed: {}\n  files skipped (no File node): {}\n  \
+             symbols added: {}\n  symbols enriched: {}\n  relations added: {}\n  \
+             references added: {}\n  corrections learned: {}",
+            self.files_processed,
+            self.files_skipped,
+            self.symbols_added,
+            self.symbols_enriched,
+            self.relations_added,
+            self.references_added,
+            self.corrections_learned,
+        )
+    }
+}
+
+/// The one-line form every `Auto-SCIP:`/daemon log line uses.
+impl std::fmt::Display for ImportStats {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "enriched {} symbols, {} new symbols, {} references, {} inherits edges, \
+             {} corrections learned ({} files processed, {} skipped: no File node)",
+            self.symbols_enriched,
+            self.symbols_added,
+            self.references_added,
+            self.relations_added,
+            self.corrections_learned,
+            self.files_processed,
+            self.files_skipped,
+        )
+    }
 }
 
 #[cfg(test)]
@@ -1035,11 +1115,88 @@ mod tests {
             let store = GraphStore::open(&dir.path().join("graph")).unwrap();
             Self { _dir: dir, store }
         }
+
+        /// Registers `file` as a file the AST index knows about. SCIP
+        /// enrichment only ever runs after AST indexing, so every real
+        /// document arrives with its File node already present (#114) --
+        /// each import test mirrors that precondition explicitly.
+        fn add_file(&self, file: &str) {
+            let conn = self.store.connection().unwrap();
+            conn.query(&format!(
+                "CREATE (:File {{id: '{file}', name: '{file}', path: '{file}', \
+                 language: 'typescript', symbol_count: 0}})"
+            ))
+            .unwrap();
+        }
+    }
+
+    /// Regression test for #114: a SCIP indexer runs over the whole
+    /// checkout and never reads `.gitignore`/`.infigraphignore`, so its
+    /// index carries documents for paths the AST index deliberately skipped
+    /// (`dist/`, a gitignored `scratchpad/` of nested worktrees) -- or for
+    /// files deleted after the indexer ran. Creating symbols for those used
+    /// to leave rows whose `file` names no File node: no DEFINES edge,
+    /// invisible to file-scoped queries, never reached by the file/prefix
+    /// removal paths (they find files via File nodes), recreated by every
+    /// daemon enrichment after each `index --full`, and a permanent
+    /// `infigraph verify` FAIL. Such documents must be skipped whole.
+    #[test]
+    fn documents_for_files_the_graph_does_not_know_are_skipped_not_orphaned() {
+        let env = TestEnv::new();
+        env.add_file("src/app.ts");
+
+        let known_doc = two_same_named_defs_doc(
+            "src/app.ts",
+            "scip-test npm test 1.0.0 `src/app.ts`/A#foo().",
+            "scip-test npm test 1.0.0 `src/app.ts`/B#foo().",
+        );
+        let ignored_doc = two_same_named_defs_doc(
+            "dist/app.d.ts",
+            "scip-test npm test 1.0.0 `dist/app.d.ts`/A#foo().",
+            "scip-test npm test 1.0.0 `dist/app.d.ts`/B#foo().",
+        );
+        let index = Index {
+            documents: vec![ignored_doc, known_doc],
+            ..Default::default()
+        };
+        let index_path = env._dir.path().join("index.scip");
+        std::fs::write(&index_path, index.write_to_bytes().unwrap()).unwrap();
+
+        let stats = import_scip_index(&index_path, &env.store, None).unwrap();
+        assert_eq!(stats.files_processed, 1, "only the known file is imported");
+        assert_eq!(
+            stats.files_skipped, 1,
+            "the unknown file is counted, not imported"
+        );
+        assert_eq!(
+            stats.symbols_added, 2,
+            "both symbols of the known file are added"
+        );
+        assert_eq!(
+            stats.touched_files,
+            vec!["src/app.ts".to_string()],
+            "downstream consumers must not be told about a file the graph never imported"
+        );
+
+        let conn = env.store.connection().unwrap();
+        let rows = conn
+            .query("MATCH (s:Symbol) RETURN DISTINCT s.file ORDER BY s.file")
+            .unwrap();
+        let files: Vec<String> = rows
+            .into_iter()
+            .map(|row| row[0].to_string().trim_matches('"').to_string())
+            .collect();
+        assert_eq!(
+            files,
+            vec!["src/app.ts".to_string()],
+            "no Symbol row may name a file that has no File node"
+        );
     }
 
     #[test]
     fn is_implementation_relationship_creates_inherits_edge() {
         let env = TestEnv::new();
+        env.add_file("test.ts");
         let bytes = make_scip_index("test.ts", "Dog", "Animal");
 
         let index_path = env._dir.path().join("index.scip");
@@ -1067,6 +1224,7 @@ mod tests {
     #[test]
     fn non_implementation_relationship_does_not_create_inherits_edge() {
         let env = TestEnv::new();
+        env.add_file("test.ts");
         let file = "test.ts";
         let child_sym = scip_symbol("Dog", file);
         let parent_sym = scip_symbol("Animal", file);
@@ -1126,6 +1284,7 @@ mod tests {
     #[test]
     fn enrichment_does_not_overwrite_existing_symbol_span() {
         let env = TestEnv::new();
+        env.add_file("test.ts");
         let conn = env.store.connection().unwrap();
 
         // Simulate tree-sitter's correct full-body extraction: a function
@@ -1194,6 +1353,7 @@ mod tests {
     #[test]
     fn scip_parameter_descriptor_does_not_become_a_new_symbol() {
         let env = TestEnv::new();
+        env.add_file("test.ts");
         let file = "test.ts";
         // Real scip-typescript shape, verified against real output: a
         // parameter's moniker is exactly its enclosing method's own moniker
@@ -1260,6 +1420,7 @@ mod tests {
     #[test]
     fn calls_edge_still_attributes_to_enclosing_method_when_a_parameter_is_suppressed() {
         let env = TestEnv::new();
+        env.add_file("test.ts");
         let conn = env.store.connection().unwrap();
 
         // Seed two pre-existing tree-sitter symbols with real full-body
@@ -1383,6 +1544,7 @@ mod tests {
     #[test]
     fn calls_edge_resolves_to_the_specific_same_named_target_not_first_in_file() {
         let env = TestEnv::new();
+        env.add_file("test.ts");
         let conn = env.store.connection().unwrap();
 
         // Two pre-existing tree-sitter symbols with the SAME name but
@@ -1502,6 +1664,7 @@ mod tests {
     #[test]
     fn import_scip_index_fails_loudly_when_the_calls_preload_query_errors() {
         let env = TestEnv::new();
+        env.add_file("test.ts");
         let conn = env.store.connection().unwrap();
         conn.query("DROP TABLE CALLS").unwrap();
 
@@ -1528,6 +1691,7 @@ mod tests {
     #[test]
     fn import_scip_index_fails_loudly_when_the_symbol_preload_query_errors() {
         let env = TestEnv::new();
+        env.add_file("test.ts");
         let conn = env.store.connection().unwrap();
         // Break the exact columns `MATCH (s:Symbol) RETURN s.id, s.file,
         // s.name, s.start_line, s.end_line` selects, without touching the
@@ -1593,6 +1757,7 @@ mod tests {
     #[test]
     fn two_new_same_named_symbols_in_one_file_both_survive_with_distinct_ordinal_ids() {
         let env = TestEnv::new();
+        env.add_file("test.ts");
         let file = "test.ts";
         let a_foo_sym = "scip-test npm test 1.0.0 `test.ts`/A#foo().".to_string();
         let b_foo_sym = "scip-test npm test 1.0.0 `test.ts`/B#foo().".to_string();
@@ -1652,6 +1817,7 @@ mod tests {
     #[test]
     fn new_symbol_colliding_with_two_preexisting_same_named_symbols_gets_next_ordinal() {
         let env = TestEnv::new();
+        env.add_file("test.ts");
         let conn = env.store.connection().unwrap();
         conn.query(
             "CREATE (:Symbol {id: 'test.ts::foo#1', name: 'foo', kind: 'method', \

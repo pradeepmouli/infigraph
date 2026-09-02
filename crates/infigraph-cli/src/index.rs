@@ -651,10 +651,7 @@ pub(crate) fn import_scip_and_cleanup(
 
     if let Some(backend) = existing_backend {
         match backend.import_scip_index(&scip_out, Some(root)) {
-            Ok(stats) => println!(
-                "Auto-SCIP: enriched {} symbols, {} added, {} references, {} new symbols, {} corrections learned",
-                stats.symbols_enriched, stats.relations_added, stats.references_added, stats.symbols_added, stats.corrections_learned
-            ),
+            Ok(stats) => println!("Auto-SCIP: {stats}"),
             Err(e) => eprintln!("Auto-SCIP: import failed: {e}"),
         }
         let _ = std::fs::remove_file(&scip_out);
@@ -683,10 +680,7 @@ pub(crate) fn import_scip_and_cleanup(
         None => return,
     };
     match backend.import_scip_index(&scip_out, Some(root)) {
-        Ok(stats) => println!(
-            "Auto-SCIP: enriched {} symbols, {} added, {} references, {} new symbols, {} corrections learned",
-            stats.symbols_enriched, stats.relations_added, stats.references_added, stats.symbols_added, stats.corrections_learned
-        ),
+        Ok(stats) => println!("Auto-SCIP: {stats}"),
         Err(e) => eprintln!("Auto-SCIP: import failed: {e}"),
     }
     let _ = std::fs::remove_file(&scip_out);
@@ -1127,10 +1121,7 @@ pub(crate) fn import_scip_results_and_embed(
     for (label, scip_path, success) in results {
         if *success && scip_path.exists() {
             match backend.import_scip_index(scip_path, Some(root)) {
-                Ok(stats) => eprintln!(
-                    "Auto-SCIP: {label} enriched {} symbols, {} added, {} references, {} new symbols, {} corrections learned",
-                    stats.symbols_enriched, stats.relations_added, stats.references_added, stats.symbols_added, stats.corrections_learned
-                ),
+                Ok(stats) => eprintln!("Auto-SCIP: {label} {stats}"),
                 Err(e) => eprintln!("Auto-SCIP: {label} import failed: {e}"),
             }
         }
