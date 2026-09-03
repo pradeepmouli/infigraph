@@ -943,9 +943,23 @@ mod tests {
     /// deleted file must be pruned") the moment the indexes were added on
     /// lbug 0.20.2.
     ///
+    /// A drop-the-index / bulk-load / rebuild-the-index bracket was built and
+    /// then abandoned (2026-09-03). It does repair the index -- a rebuild
+    /// reindexes rows already inserted by COPY -- but two things killed it.
+    /// The rebuild has to run on every exit path of every bulk-load
+    /// function, and the SCIP importer's early return (nothing to enrich)
+    /// left the indexes simply absent, so in practice a normal `index` run
+    /// ended with no indexes at all. Worse, a full index of a 2000-file /
+    /// 62k-symbol corpus built with that bracket produced a graph where
+    /// *every* query, `MATCH (s:Symbol) RETURN count(s)` included, aborted
+    /// the process with a stack overflow; the identical corpus indexed by
+    /// the same binary without the bracket answered 62000 and stayed
+    /// healthy. Whatever the mechanism, ART indexes are not currently safe
+    /// to carry on this schema at real scale.
+    ///
     /// This test asserts the *bug*, so it starts failing once lbug fixes
-    /// index maintenance under COPY -- at which point the indexes become
-    /// safe to add and this test should be replaced by them.
+    /// index maintenance under COPY. That is the signal to retry -- and to
+    /// re-check the abort above on a full-size corpus before trusting it.
     #[test]
     fn copy_does_not_maintain_art_indexes_so_they_cannot_be_added_yet() {
         let tmp = tempfile::tempdir().unwrap();
