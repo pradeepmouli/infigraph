@@ -2,13 +2,21 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, feat/hardening]
   pull_request:
-    branches: [main]
+    branches: [main, feat/hardening]
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 0
+  # The ubuntu runner runs out of disk linking this workspace's test binaries
+  # -- upstream sees `ld terminated with signal 7 [Bus error]` and outright
+  # "No space left on device" on several PRs, even with the free-disk step
+  # below. Debug info dominates target/debug and CI never reads the symbols.
+  # Try `line-tables-only` instead once a run has proved to fit; that keeps
+  # line numbers in panics at a fraction of full DWARF.
+  CARGO_PROFILE_DEV_DEBUG: 0
 
 jobs:
   fmt:
