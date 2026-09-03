@@ -927,6 +927,67 @@ mod tests {
         );
     }
 
+    /// Why `Symbol.file` and `Symbol.name` do NOT carry ART secondary
+    /// indexes, despite an index being worth 3.4x on the incremental
+    /// reindex path (a 71-file cycle over a 130k-symbol graph: 2.88s ->
+    /// 0.86s, ~20ms to build, ~2% write overhead).
+    ///
+    /// lbug's bulk `COPY` does not maintain ART indexes. The rows land and
+    /// the primary key finds them, but an index-backed lookup on the copied
+    /// column returns **zero rows, silently**. Every write path in this
+    /// crate bulk-loads, so adding the index would make `WHERE s.file =
+    /// '<literal>'` blind to every symbol in the graph -- and because
+    /// `remove_file_conn` swallows its query errors, the per-file prune
+    /// would simply stop deleting anything, with no error anywhere.
+    /// Observed as three failures in `embed_skip.rs` ("symbols from the
+    /// deleted file must be pruned") the moment the indexes were added on
+    /// lbug 0.20.2.
+    ///
+    /// This test asserts the *bug*, so it starts failing once lbug fixes
+    /// index maintenance under COPY -- at which point the indexes become
+    /// safe to add and this test should be replaced by them.
+    #[test]
+    fn copy_does_not_maintain_art_indexes_so_they_cannot_be_added_yet() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = super::super::GraphStore::open(&tmp.path().join("graph")).unwrap();
+        let conn = store.connection().unwrap();
+        conn.query("CREATE ART INDEX ix_probe_file FOR (n:Symbol) ON (n.file)")
+            .unwrap();
+
+        let csv = tmp.path().join("symbols.csv");
+        std::fs::write(
+            &csv,
+            (0..3)
+                .map(|i| format!("a.py::s{i},s{i},Function,a.py\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+        conn.query(&format!(
+            "COPY Symbol (id, name, kind, file) FROM '{}'",
+            csv.to_string_lossy()
+        ))
+        .expect("the COPY itself succeeds -- that is what makes this silent");
+
+        let count = |q: &str| conn.query(q).unwrap().count();
+        assert_eq!(
+            count("MATCH (s:Symbol) RETURN s.id"),
+            3,
+            "the rows really are in the table"
+        );
+        assert_eq!(
+            count("MATCH (s:Symbol) WHERE s.id = 'a.py::s1' RETURN s.id"),
+            1,
+            "and the primary-key index sees them"
+        );
+        assert_eq!(
+            count("MATCH (s:Symbol) WHERE s.file = 'a.py' RETURN s.id"),
+            0,
+            "but the ART index does not -- if this now returns 3, lbug has fixed \
+             index maintenance under COPY and Symbol.file/Symbol.name should be \
+             indexed (see this test's doc comment for the measured win)"
+        );
+    }
+
     /// Which statement shapes lbug can plan as primary-key lookups, pinned
     /// against the planner itself.
     ///
