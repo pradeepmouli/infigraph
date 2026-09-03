@@ -943,23 +943,38 @@ mod tests {
     /// deleted file must be pruned") the moment the indexes were added on
     /// lbug 0.20.2.
     ///
-    /// A drop-the-index / bulk-load / rebuild-the-index bracket was built and
-    /// then abandoned (2026-09-03). It does repair the index -- a rebuild
-    /// reindexes rows already inserted by COPY -- but two things killed it.
-    /// The rebuild has to run on every exit path of every bulk-load
-    /// function, and the SCIP importer's early return (nothing to enrich)
-    /// left the indexes simply absent, so in practice a normal `index` run
-    /// ended with no indexes at all. Worse, a full index of a 2000-file /
-    /// 62k-symbol corpus built with that bracket produced a graph where
-    /// *every* query, `MATCH (s:Symbol) RETURN count(s)` included, aborted
-    /// the process with a stack overflow; the identical corpus indexed by
-    /// the same binary without the bracket answered 62000 and stayed
-    /// healthy. Whatever the mechanism, ART indexes are not currently safe
-    /// to carry on this schema at real scale.
+    /// A drop-the-index / bulk-load / rebuild-the-index bracket was built
+    /// and then abandoned (2026-09-03). The bracket itself is sound -- a
+    /// rebuild does reindex rows already inserted by COPY -- and ART indexes
+    /// are NOT unsafe at scale: one index, two indexes, three rounds of
+    /// drop/recreate churn and a reopen were all verified healthy over 62k
+    /// COPY-loaded rows. An earlier note here claimed otherwise on the
+    /// strength of a single failing run; that was wrong. (The abort it saw
+    /// came from wiring the rebuild into `init_schema`, which then ran on
+    /// every open including the `graph.rebuilding` scratch graph. A minimal
+    /// bracket at the bulk-write site alone produced a perfectly healthy
+    /// 62k-symbol graph.)
     ///
-    /// This test asserts the *bug*, so it starts failing once lbug fixes
-    /// index maintenance under COPY. That is the signal to retry -- and to
-    /// re-check the abort above on a full-size corpus before trusting it.
+    /// What actually killed it is that the win is not there. Measured
+    /// end-to-end on a 2000-file / 62k-symbol corpus through the real
+    /// pipeline:
+    ///
+    /// | | full reindex | 71-file incremental |
+    /// |---|---|---|
+    /// | no index | 6.29s | 4.22s |
+    /// | one ART index on `Symbol.file` | 7.84s | 4.39s |
+    ///
+    /// The incremental cycle is dominated by parsing, bulk COPY and
+    /// resolution; the per-file `WHERE s.file = '<literal>'` deletes and
+    /// reads that an index accelerates are a rounding error inside it. The
+    /// 3.4x that motivated all of this came from timing those queries alone
+    /// in a tight loop, which is not a workload this product runs.
+    ///
+    /// So: correct, but pointless, and it costs ~25% on a full reindex.
+    ///
+    /// This test still asserts the underlying COPY defect, because that is
+    /// worth knowing. But a fix landing upstream is NOT on its own a reason
+    /// to add indexes -- re-measure the pipeline first.
     #[test]
     fn copy_does_not_maintain_art_indexes_so_they_cannot_be_added_yet() {
         let tmp = tempfile::tempdir().unwrap();
