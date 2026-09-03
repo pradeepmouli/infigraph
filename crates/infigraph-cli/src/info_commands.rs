@@ -487,6 +487,14 @@ pub(crate) fn cmd_daemon(root: &Path, debounce: u64) -> Result<()> {
             }
 
             eprintln!("[daemon] graceful shutdown exceeded its budget -- hard exit");
+            // #146: a hard exit mid-write leaves an unreplayed WAL, which the
+            // dead-holder guard refuses. Record that this was *our own*
+            // deliberate exit, and what was in flight, so the next opener can
+            // say what happened instead of implying the graph is corrupt.
+            infigraph_core::recovery::record_unclean_exit(
+                &watchdog_root.join(".infigraph"),
+                "daemon graceful shutdown exceeded its budget",
+            );
             std::process::exit(1);
         });
     })

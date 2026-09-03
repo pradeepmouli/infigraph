@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const RECOVERY_NEEDED_FILE: &str = "recovery-needed";
+const UNCLEAN_EXIT_FILE: &str = "unclean-exit.json";
 const RECOVERY_ATTEMPTS_LOG: &str = "recovery-attempts.log";
 const CRASH_LOOP_MARKER_FILE: &str = "recovery-crash-loop";
 
@@ -100,6 +101,68 @@ pub fn record_recovery_attempt(infigraph_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Where a deliberate hard exit records itself (#146).
+pub fn unclean_exit_marker_path(infigraph_dir: &Path) -> PathBuf {
+    infigraph_dir.join(UNCLEAN_EXIT_FILE)
+}
+
+/// What a process was doing when it hard-exited, for the next opener.
+#[derive(Debug, Clone)]
+pub struct UncleanExit {
+    pub pid: u32,
+    pub reason: String,
+    /// The lbug write in flight at the time, from `write_phase::current`.
+    pub phase: Option<String>,
+    pub at: u64,
+}
+
+/// Record that this process is about to hard-exit, and why (#146).
+///
+/// A hard exit mid-write leaves an unreplayed WAL, which the dead-holder
+/// guard then refuses -- correctly, but with no way to tell a deliberate
+/// self-initiated exit apart from an unexplained death, so the user is told
+/// their graph may be corrupt when in fact the daemon shut itself down. This
+/// marker is what lets the refusal say what actually happened.
+///
+/// Best-effort and never fatal: it runs on the way out of a process that is
+/// already giving up, so a failure here must not preempt the exit.
+pub fn record_unclean_exit(infigraph_dir: &Path, reason: &str) {
+    let payload = serde_json::json!({
+        "pid": std::process::id(),
+        "reason": reason,
+        "phase": crate::write_phase::current().map(|(p, n)| format!("{p} (x{n})")),
+        "at": now_epoch_secs(),
+    });
+    if let Ok(text) = serde_json::to_string_pretty(&payload) {
+        let _ =
+            crate::daemon_protocol::write_atomic(&unclean_exit_marker_path(infigraph_dir), &text);
+    }
+}
+
+/// The recorded hard exit, if it was this `pid`.
+///
+/// Matched on pid so a stale marker from an older, unrelated exit cannot
+/// explain away a genuinely unexplained death.
+pub fn unclean_exit_for_pid(infigraph_dir: &Path, pid: u32) -> Option<UncleanExit> {
+    let text = std::fs::read_to_string(unclean_exit_marker_path(infigraph_dir)).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let recorded = u32::try_from(v.get("pid")?.as_u64()?).ok()?;
+    if recorded != pid {
+        return None;
+    }
+    Some(UncleanExit {
+        pid: recorded,
+        reason: v.get("reason")?.as_str()?.to_string(),
+        phase: v.get("phase").and_then(|p| p.as_str()).map(str::to_string),
+        at: v.get("at").and_then(|a| a.as_u64()).unwrap_or(0),
+    })
+}
+
+/// Drop the marker once the graph it explains has been rebuilt.
+pub fn clear_unclean_exit(infigraph_dir: &Path) {
+    let _ = std::fs::remove_file(unclean_exit_marker_path(infigraph_dir));
+}
+
 pub fn crash_loop_marker_path(infigraph_dir: &Path) -> PathBuf {
     infigraph_dir.join(CRASH_LOOP_MARKER_FILE)
 }
@@ -180,6 +243,45 @@ pub fn drain_recovery_sentinel(infigraph_dir: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    /// #146 round trip: a hard exit records itself, including whatever lbug
+    /// write was in flight, and only answers for its own pid.
+    #[test]
+    fn record_unclean_exit_round_trips_with_the_in_flight_phase() {
+        let dir = tempfile::tempdir().unwrap();
+        let me = std::process::id();
+
+        {
+            let _phase = crate::write_phase::enter(&"scip-import", 113_000);
+            record_unclean_exit(dir.path(), "daemon graceful shutdown exceeded its budget");
+        }
+
+        let exit = unclean_exit_for_pid(dir.path(), me).expect("recorded for this process");
+        assert_eq!(exit.pid, me);
+        assert_eq!(exit.reason, "daemon graceful shutdown exceeded its budget");
+        let phase = exit.phase.expect("the in-flight write must be captured");
+        assert!(phase.contains("scip-import"), "{phase}");
+        assert!(phase.contains("113000"), "and how far in: {phase}");
+
+        assert!(
+            unclean_exit_for_pid(dir.path(), me.wrapping_add(1)).is_none(),
+            "a marker must not explain a different process's death"
+        );
+
+        clear_unclean_exit(dir.path());
+        assert!(unclean_exit_for_pid(dir.path(), me).is_none());
+    }
+
+    /// Outside a write, there is no phase to report -- the marker still
+    /// records the reason.
+    #[test]
+    fn record_unclean_exit_with_no_write_in_flight_still_records_the_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        record_unclean_exit(dir.path(), "stale build self-check");
+        let exit = unclean_exit_for_pid(dir.path(), std::process::id()).unwrap();
+        assert_eq!(exit.reason, "stale build self-check");
+        assert!(exit.phase.is_none());
+    }
     use super::*;
 
     #[test]

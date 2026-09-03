@@ -248,6 +248,35 @@ fn classify_read_only_open_failure(msg: String, live_holder: Option<u32>) -> any
     }
 }
 
+/// How a dead WAL holder died, phrased for the refusal message (#146).
+///
+/// A deliberate hard exit mid-write manufactures exactly the dead-holder
+/// state the R3.1.3 guard refuses, and the guard cannot tell it apart from an
+/// unexplained death. The rebuild is required either way -- the WAL is still
+/// unreplayable -- but "the daemon shut itself down mid-import" reads very
+/// differently from "your graph may be corrupt". Empty when nothing was
+/// recorded, or when the record names a different process.
+fn hard_exit_explanation(db_path: &Path, pid: u32) -> String {
+    let Some(exit) = db_path
+        .parent()
+        .and_then(|dir| crate::recovery::unclean_exit_for_pid(dir, pid))
+    else {
+        return String::new();
+    };
+    match exit.phase {
+        Some(phase) => format!(
+            " -- that process hard-exited on purpose ({}) while writing {phase}, so this is an \
+             interrupted write rather than damage",
+            exit.reason
+        ),
+        None => format!(
+            " -- that process hard-exited on purpose ({}), so this is an interrupted write \
+             rather than damage",
+            exit.reason
+        ),
+    }
+}
+
 /// PID currently holding `lock_path`, if that process is still running.
 ///
 /// The complement of the dead-holder case `unclean_shutdown_wal_holder`
@@ -459,10 +488,11 @@ impl GraphStore {
         validate_db_file(path)?;
         let lock_path = db_lock_path(path);
         if let Some(pid) = unclean_shutdown_wal_holder(path, &lock_path) {
+            let explanation = hard_exit_explanation(path, pid);
             anyhow::bail!(
                 "graph {} has an unreplayed WAL from process {pid}, which is no longer \
-                 running (unclean shutdown) -- refusing to open it directly since WAL replay \
-                 in this state has crashed the whole process before (see \
+                 running (unclean shutdown){explanation} -- refusing to open it directly since \
+                 WAL replay in this state has crashed the whole process before (see \
                  github.com/pradeepmouli/infigraph#92); run `infigraph index --full` to rebuild",
                 path.display()
             );
@@ -478,6 +508,13 @@ impl GraphStore {
         let store = Self { db, lock_path };
         let lock = WriteLock::acquire_with_timeout(&store.lock_path, timeout)?;
         store.init_schema(&lock)?;
+        // #146: a hard-exit marker only ever explains a dead-holder WAL, and
+        // this function refuses one above -- so reaching here proves the state
+        // the marker described is over. Drop it rather than let it outlive
+        // what it explains and mislabel some later, unrelated death.
+        if let Some(dir) = path.parent() {
+            crate::recovery::clear_unclean_exit(dir);
+        }
         drop(lock);
         Ok(store)
     }
@@ -511,11 +548,16 @@ impl GraphStore {
         }
         let lock_path = db_lock_path(path);
         if let Some(pid) = unclean_shutdown_wal_holder(path, &lock_path) {
+            // #146: if that death was a deliberate hard exit we recorded, say
+            // so. The rebuild is required either way -- the WAL is still
+            // unreplayable -- but "the daemon shut itself down mid-import" is
+            // a very different thing to read than "your graph may be corrupt".
+            let explanation = hard_exit_explanation(path, pid);
             return Err(anyhow::Error::new(GraphCorruption {
                 detail: format!(
                     "graph has an unreplayed WAL from process {pid}, which is no longer \
-                     running (unclean shutdown) -- refusing to open it directly since WAL \
-                     replay in this state has crashed the whole process before (see \
+                     running (unclean shutdown){explanation} -- refusing to open it directly \
+                     since WAL replay in this state has crashed the whole process before (see \
                      github.com/pradeepmouli/infigraph#92); run `infigraph index --full` to \
                      rebuild"
                 ),
@@ -1655,6 +1697,113 @@ mod tests {
                 "an unrelated open failure must not be dressed up as corruption: {err}"
             );
         }
+    }
+
+    /// #146: a deliberate hard exit mid-write manufactures exactly the
+    /// dead-holder state the R3.1.3 guard refuses, and the guard cannot tell
+    /// it apart from an unexplained death -- so the user is told their graph
+    /// may be corrupt when in fact the daemon shut itself down. The rebuild
+    /// is still required (the WAL is still unreplayable), but the refusal
+    /// must say which happened.
+    #[test]
+    fn a_recorded_hard_exit_explains_itself_in_the_dead_holder_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("graph");
+        std::fs::write(&db_path, vec![0u8; MIN_DB_FILE_SIZE as usize]).unwrap();
+        std::fs::write(dir.path().join("graph.wal"), b"wal").unwrap();
+        write_holder_lock(&db_lock_path(&db_path), DEAD_PID);
+
+        // Without a marker: the bare refusal, as before.
+        let err = GraphStore::open_read_only(&db_path)
+            .map(|_| ())
+            .unwrap_err();
+        assert!(err.to_string().contains("unreplayed WAL"), "{err}");
+        assert!(
+            !err.to_string().contains("on purpose"),
+            "nothing recorded, so nothing to explain: {err}"
+        );
+
+        // With a marker naming that pid: the refusal says what happened.
+        let payload = serde_json::json!({
+            "pid": DEAD_PID,
+            "reason": "daemon graceful shutdown exceeded its budget",
+            "phase": "scip-import (x113000)",
+            "at": 1_788_400_000u64,
+        });
+        std::fs::write(
+            crate::recovery::unclean_exit_marker_path(dir.path()),
+            serde_json::to_string(&payload).unwrap(),
+        )
+        .unwrap();
+
+        let err = GraphStore::open_read_only(&db_path)
+            .map(|_| ())
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("hard-exited on purpose"), "{msg}");
+        assert!(
+            msg.contains("graceful shutdown exceeded its budget"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("scip-import"),
+            "must name the write in flight: {msg}"
+        );
+        assert!(
+            msg.contains("rather than damage"),
+            "must not leave the reader thinking the graph is corrupt: {msg}"
+        );
+        assert!(
+            msg.contains("index --full"),
+            "the rebuild is still required either way: {msg}"
+        );
+        assert!(
+            err.downcast_ref::<GraphCorruption>().is_some(),
+            "still routes to quarantine -- the WAL really is unreplayable"
+        );
+    }
+
+    /// A marker from some *other* process must not explain away this death.
+    #[test]
+    fn a_hard_exit_marker_for_a_different_pid_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("graph");
+        std::fs::write(&db_path, vec![0u8; MIN_DB_FILE_SIZE as usize]).unwrap();
+        std::fs::write(dir.path().join("graph.wal"), b"wal").unwrap();
+        write_holder_lock(&db_lock_path(&db_path), DEAD_PID);
+        std::fs::write(
+            crate::recovery::unclean_exit_marker_path(dir.path()),
+            serde_json::json!({
+                "pid": DEAD_PID + 1,
+                "reason": "someone else's exit",
+                "phase": serde_json::Value::Null,
+                "at": 1u64,
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let err = GraphStore::open_read_only(&db_path)
+            .map(|_| ())
+            .unwrap_err();
+        assert!(
+            !err.to_string().contains("on purpose"),
+            "a marker for another pid must not be used to explain this one: {err}"
+        );
+    }
+
+    /// The marker is inert once the WAL is gone, so it must not survive to
+    /// mislabel a later death.
+    #[test]
+    fn a_stale_hard_exit_marker_is_cleared_by_an_open_with_no_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("graph");
+        drop(GraphStore::open(&db_path).unwrap());
+        let marker = crate::recovery::unclean_exit_marker_path(dir.path());
+        std::fs::write(&marker, serde_json::json!({"pid": DEAD_PID}).to_string()).unwrap();
+
+        drop(GraphStore::open(&db_path).unwrap());
+        assert!(!marker.exists(), "a WAL-free open must clear it");
     }
 
     #[test]
