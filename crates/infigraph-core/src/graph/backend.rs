@@ -28,6 +28,18 @@ pub struct CallsServiceEdge {
     pub path: String,
 }
 
+/// One detected taint flow, to be written as a `TAINT_FLOW` self-edge on
+/// the symbol the flow was found in. Only the four properties the edge
+/// actually stores travel here -- the richer `taint::TaintFlow` keeps the
+/// file, line numbers, category and sanitizer for reporting.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct TaintFlowEdge {
+    pub symbol_id: String,
+    pub source_kind: String,
+    pub sink_kind: String,
+    pub path: String,
+}
+
 /// A code-smell/concern match, to be written as a `Concern` node linked to
 /// its symbol via `HAS_CONCERN`.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -331,6 +343,18 @@ pub trait GraphBackend: Send + Sync {
     /// span calls; Neo4j: transactions are driver-level, not Cypher), so
     /// the delete-then-recreate was never actually atomic. A crash mid-loop
     /// could delete all concerns and only recreate some of them.
+    /// Replace every recorded `TAINT_FLOW` edge with `flows` as a single
+    /// atomic operation. Same design and same prior non-atomicity as
+    /// `replace_concerns`: the delete and the per-flow creates each went
+    /// through `raw_query`, which hands out a fresh connection per call, so
+    /// a crash mid-loop could delete every flow and recreate only some.
+    ///
+    /// It was also the single largest cost of an incremental reindex --
+    /// ~4.5 ms per flow, 2.5 s for a 557-flow corpus, against 0.022 s to
+    /// compute those same flows. Clearing is unconditional: a run that finds
+    /// no taint must still drop the previous run's edges.
+    fn replace_taint_flows(&self, flows: &[TaintFlowEdge]) -> Result<()>;
+
     fn replace_concerns(&self, concerns: &[Concern]) -> Result<()>;
 
     /// Replace every recorded `RESOLVES_TO` edge with `edges` as a single

@@ -9,6 +9,7 @@ use crate::resolve::ResolveStats;
 
 use super::backend::{
     CallsServiceEdge, Concern, CrossServiceEdgeCandidate, GraphBackend, ResolvesToEdge,
+    TaintFlowEdge,
 };
 use super::queries::GraphQuery;
 use super::store::GraphStore;
@@ -557,6 +558,25 @@ impl GraphBackend for KuzuBackend {
                      CREATE (s)-[:CALLS_SERVICE {{method: '{method_esc}', path: '{path_esc}', target_service: ''}}]->(t)"
                 ))
                 .map_err(|e| anyhow::anyhow!("failed to create CALLS_SERVICE edge: {e}"))?;
+            }
+            Ok(())
+        })
+    }
+
+    fn replace_taint_flows(&self, flows: &[TaintFlowEdge]) -> Result<()> {
+        self.store.transaction(|conn| {
+            conn.query("MATCH ()-[r:TAINT_FLOW]->() DELETE r")
+                .map_err(|e| anyhow::anyhow!("failed to clear existing taint flows: {e}"))?;
+            for flow in flows {
+                let sym_esc = crate::escape_str(&flow.symbol_id);
+                let src_esc = crate::escape_str(&flow.source_kind);
+                let sink_esc = crate::escape_str(&flow.sink_kind);
+                let path_esc = crate::escape_str(&flow.path);
+                conn.query(&format!(
+                    "MATCH (s:Symbol) WHERE s.id = '{sym_esc}' \
+                     CREATE (s)-[:TAINT_FLOW {{source_kind: '{src_esc}', sink_kind: '{sink_esc}', path: '{path_esc}'}}]->(s)"
+                ))
+                .map_err(|e| anyhow::anyhow!("failed to create TAINT_FLOW edge: {e}"))?;
             }
             Ok(())
         })

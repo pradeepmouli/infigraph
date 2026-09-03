@@ -13,6 +13,7 @@ use crate::resolve::ResolveStats;
 
 use super::backend::{
     CallsServiceEdge, Concern, CrossServiceEdgeCandidate, GraphBackend, ResolvesToEdge,
+    TaintFlowEdge,
 };
 use super::{
     ApiSymbol, ArchitectureStats, BranchInfo, ComplexityRow, DeadCodeRow, FileDeps, FileHotspot,
@@ -1862,6 +1863,38 @@ impl GraphBackend for Neo4jBackend {
             ),
         )
         .map_err(|e| anyhow::anyhow!("write_calls_service_edges failed: {e}"))?;
+        Ok(())
+    }
+
+    fn replace_taint_flows(&self, flows: &[TaintFlowEdge]) -> Result<()> {
+        let flow_maps: Vec<HashMap<&str, String>> = flows
+            .iter()
+            .map(|f| {
+                let mut m = HashMap::new();
+                m.insert("symbol_id", f.symbol_id.clone());
+                m.insert("source_kind", f.source_kind.clone());
+                m.insert("sink_kind", f.sink_kind.clone());
+                m.insert("path", f.path.clone());
+                m
+            })
+            .collect();
+        // One statement, same reasoning as `replace_concerns`: Neo4j
+        // auto-commits a single Cypher statement atomically, and the delete
+        // still runs when `flows` is empty so a clean run clears the
+        // previous one's edges.
+        self.block_on(
+            self.graph.run(
+                query(
+                    "MATCH ()-[r:TAINT_FLOW]->() DELETE r \
+                     WITH 1 AS _cleared \
+                     UNWIND $flows AS m \
+                     MATCH (s:Symbol) WHERE s.id = m.symbol_id \
+                     CREATE (s)-[:TAINT_FLOW {source_kind: m.source_kind, sink_kind: m.sink_kind, path: m.path}]->(s)",
+                )
+                .param("flows", flow_maps),
+            ),
+        )
+        .map_err(|e| anyhow::anyhow!("replace_taint_flows failed: {e}"))?;
         Ok(())
     }
 

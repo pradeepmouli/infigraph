@@ -20,7 +20,7 @@ pub mod test_templates;
 
 pub use backend::{
     filter_dead_code_candidates, CallsServiceEdge, Concern, CrossServiceEdgeCandidate,
-    GraphBackend, ResolvesToEdge,
+    GraphBackend, ResolvesToEdge, TaintFlowEdge,
 };
 pub use cozo_store::CozoStore;
 pub use daemon_kuzu_backend::DaemonKuzuBackend;

@@ -8,6 +8,7 @@ use crate::resolve::ResolveStats;
 
 use super::backend::{
     CallsServiceEdge, Concern, CrossServiceEdgeCandidate, GraphBackend, ResolvesToEdge,
+    TaintFlowEdge,
 };
 use super::kuzu_backend::KuzuBackend;
 use super::{
@@ -554,6 +555,24 @@ impl GraphBackend for DaemonKuzuBackend {
             )),
         }
     }
+    fn replace_taint_flows(&self, flows: &[TaintFlowEdge]) -> Result<()> {
+        let staging_dir = self.staging_dir();
+        let request = crate::daemon_protocol::WriteRequest::ReplaceTaintFlows {
+            flows: flows.to_vec(),
+        };
+        match crate::daemon_protocol::submit_write_request(
+            &staging_dir,
+            &request,
+            std::time::Duration::from_secs(30),
+        )? {
+            crate::daemon_protocol::WriteResult::Ok { .. } => Ok(()),
+            crate::daemon_protocol::WriteResult::Err { message } => Err(anyhow::anyhow!(message)),
+            other => Err(anyhow::anyhow!(
+                "unexpected WriteResult for ReplaceTaintFlows: {other:?}"
+            )),
+        }
+    }
+
     fn replace_concerns(&self, concerns: &[Concern]) -> Result<()> {
         let staging_dir = self.staging_dir();
         let request = crate::daemon_protocol::WriteRequest::ReplaceConcerns {

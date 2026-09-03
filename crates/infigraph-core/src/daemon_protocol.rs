@@ -66,6 +66,11 @@ pub enum WriteRequest {
     ReplaceConcerns {
         concerns: Vec<crate::graph::Concern>,
     },
+    /// Replace every recorded `TAINT_FLOW` edge. Small, serde-serializable
+    /// payload -- rides inline in this envelope, no sibling file needed.
+    ReplaceTaintFlows {
+        flows: Vec<crate::graph::TaintFlowEdge>,
+    },
     /// Replace every recorded `RESOLVES_TO` edge. Small, serde-serializable
     /// payload -- rides inline in this envelope, no sibling file needed.
     ReplaceResolvesTo {
@@ -785,6 +790,20 @@ pub fn serve_one_request(infigraph: &Infigraph, request_path: &Path) -> anyhow::
             }
             WriteRequest::UpsertDependencies { result } => match infigraph.backend() {
                 Some(b) => match b.upsert_dependencies(result) {
+                    Ok(()) => WriteResult::Ok {
+                        total_files: 0,
+                        indexed_files: 0,
+                    },
+                    Err(e) => WriteResult::Err {
+                        message: e.to_string(),
+                    },
+                },
+                None => WriteResult::Err {
+                    message: "graph not initialized".to_string(),
+                },
+            },
+            WriteRequest::ReplaceTaintFlows { flows } => match infigraph.backend() {
+                Some(b) => match b.replace_taint_flows(flows) {
                     Ok(()) => WriteResult::Ok {
                         total_files: 0,
                         indexed_files: 0,
