@@ -2,6 +2,7 @@ mod analysis;
 pub mod audit;
 pub mod bench;
 pub mod bridges;
+pub mod byte_reader;
 pub mod check;
 pub mod claude_md;
 pub mod clone;

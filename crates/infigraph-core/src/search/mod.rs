@@ -5,6 +5,7 @@ use anyhow::Result;
 use rayon::prelude::*;
 use regex::Regex;
 
+use crate::byte_reader::ByteReader;
 use crate::embed::{self, EmbedProvider};
 
 /// A search result with combined score.
@@ -173,76 +174,51 @@ impl BM25Index {
         Ok(())
     }
 
+    /// Bounds-checked deserialization. Any structural problem is an `Err`
+    /// (never a panic, never an abort): callers treat a bad cache as a miss
+    /// and rebuild it. Driven by [`ByteReader`], which is shared with the
+    /// embeddings loaders and `infigraph-docs`'s copy of this same format --
+    /// this reader previously sliced raw and validated nothing, which is how
+    /// a corrupt cache could reserve ~100GB and abort the process.
+    ///
+    /// The `min_entry_bytes` arguments below are each format's floor with
+    /// every variable-length part empty: a doc is two length prefixes, a
+    /// term is its own prefix plus a posting count, and a posting is exactly
+    /// a `u32` index plus an `f32` frequency.
     pub fn load(path: &Path) -> Result<Self> {
+        const DOC_MIN_BYTES: usize = 4 + 4;
+        const TERM_MIN_BYTES: usize = 4 + 4;
+        const POSTING_BYTES: usize = 4 + 4;
+
         let data = std::fs::read(path).map_err(|e| anyhow::anyhow!("read bm25 cache: {}", e))?;
-        anyhow::ensure!(
-            !data.is_empty() && data[0] == 1,
-            "unsupported bm25 cache version"
-        );
-        anyhow::ensure!(data.len() >= 9, "bm25 cache too small");
-        let avg_doc_len = f32::from_le_bytes(data[1..5].try_into().unwrap());
-        let doc_count = u32::from_le_bytes(data[5..9].try_into().unwrap()) as usize;
-        let mut pos = 9usize;
-        // Counts here come straight off disk, so a corrupt cache can name up
-        // to u32::MAX entries. Pre-reserving that many asks the allocator for
-        // ~100GB, which glibc refuses and Rust's allocation-failure handler
-        // turns into a process abort -- no `Result`, nothing for a caller to
-        // catch, the whole test binary or daemon gone. (The sibling loader in
-        // `infigraph-docs::search` was hardened against exactly this; this
-        // copy never was.)
-        //
-        // Bound each count by what the remaining bytes could possibly hold
-        // rather than by a magic constant: every doc costs at least two
-        // 4-byte length prefixes, and every term at least its own length
-        // prefix plus a posting count. A larger count cannot describe this
-        // file, so it is corruption and belongs in the error path.
-        const MIN_ENTRY_BYTES: usize = 8;
-        let entry_cap = |remaining: usize| remaining / MIN_ENTRY_BYTES;
-        anyhow::ensure!(
-            doc_count <= entry_cap(data.len() - pos),
-            "bm25 cache claims {doc_count} docs but is only {} bytes — corrupt",
-            data.len()
-        );
+        let mut r = ByteReader::new(&data, "bm25 cache");
+        anyhow::ensure!(r.u8()? == 1, "unsupported bm25 cache version");
+
+        let avg_doc_len = r.f32()?;
+        let doc_count = r.count(DOC_MIN_BYTES)?;
         let mut docs = Vec::with_capacity(doc_count);
         for _ in 0..doc_count {
-            let id_len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
-            pos += 4;
-            let id = String::from_utf8_lossy(&data[pos..pos + id_len]).into_owned();
-            pos += id_len;
-            let text_len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
-            pos += 4;
-            let text = String::from_utf8_lossy(&data[pos..pos + text_len]).into_owned();
-            pos += text_len;
+            let id = r.string_u32()?;
+            let text = r.string_u32()?;
             docs.push((id, text));
         }
-        let term_count = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
-        pos += 4;
-        anyhow::ensure!(
-            term_count <= entry_cap(data.len() - pos),
-            "bm25 cache claims {term_count} terms but is only {} bytes — corrupt",
-            data.len()
-        );
+
+        let term_count = r.count(TERM_MIN_BYTES)?;
         let mut inverted = HashMap::with_capacity(term_count);
         for _ in 0..term_count {
-            let tl = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
-            pos += 4;
-            let term = String::from_utf8_lossy(&data[pos..pos + tl]).into_owned();
-            pos += tl;
-            let pc = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
-            pos += 4;
-            // Each posting is a 4-byte doc index plus a 4-byte term
-            // frequency, so this bound is exact rather than conservative.
-            anyhow::ensure!(
-                pc <= (data.len() - pos) / 8,
-                "bm25 cache claims {pc} postings but is only {} bytes — corrupt",
-                data.len()
-            );
+            let term = r.string_u32()?;
+            let pc = r.count(POSTING_BYTES)?;
             let mut postings = Vec::with_capacity(pc);
             for _ in 0..pc {
-                let doc_idx = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
-                pos += 4;
-                let tf = f32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
-                pos += 4;
+                let doc_idx = r.u32()? as usize;
+                let tf = r.f32()?;
+                // A posting index is used to subscript `self.docs` during
+                // scoring, so an out-of-range one from a corrupt cache would
+                // panic later, inside `search`, far from the file that caused
+                // it. `infigraph-docs`'s copy of this format already checked
+                // this; this one did not -- another divergence the shared
+                // reader exists to stop recurring.
+                anyhow::ensure!(doc_idx < docs.len(), "bm25 cache posting out of range");
                 postings.push((doc_idx, tf));
             }
             inverted.insert(term, postings);

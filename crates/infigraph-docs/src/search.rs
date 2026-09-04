@@ -7,6 +7,7 @@ use rayon::prelude::*;
 use infigraph_core::embed::{cosine_similarity, doc_embedder, load_embeddings_cached, search_hnsw};
 
 use crate::backend::DocBackend;
+use infigraph_core::byte_reader::ByteReader;
 
 #[derive(Debug, Clone)]
 pub struct DocSearchResult {
@@ -135,54 +136,43 @@ impl DocBM25Index {
 
     /// Bounds-checked deserialization. Any structural problem is an `Err`
     /// (never a panic): callers treat a bad cache as a miss and rebuild.
+    ///
+    /// Shares [`ByteReader`] with `infigraph-core`'s copy of this same
+    /// format. This loader used to carry its own `read_u32`/`read_f32`/
+    /// `read_str` closures; the core one sliced raw and checked nothing, so
+    /// the hardening here never reached it and a corrupt cache there aborted
+    /// the process. One reader now, so a fix cannot land in only one of them.
     pub fn load(path: &Path) -> Result<Self> {
+        const DOC_MIN_BYTES: usize = 4 + 4;
+        const TERM_MIN_BYTES: usize = 4 + 4;
+        const POSTING_BYTES: usize = 4 + 4;
+
         let data =
             std::fs::read(path).map_err(|e| anyhow::anyhow!("read doc bm25 cache: {}", e))?;
+        let mut r = ByteReader::new(&data, "doc bm25 cache");
         anyhow::ensure!(
-            !data.is_empty() && data[0] == DOC_BM25_CACHE_VERSION,
+            r.u8()? == DOC_BM25_CACHE_VERSION,
             "unsupported doc bm25 cache version"
         );
-        let mut pos = 1usize;
-        let read_u32 = |data: &[u8], pos: &mut usize| -> Result<u32> {
-            let end = pos.checked_add(4).filter(|&e| e <= data.len());
-            let end = end.ok_or_else(|| anyhow::anyhow!("truncated doc bm25 cache"))?;
-            let v = u32::from_le_bytes(data[*pos..end].try_into().unwrap());
-            *pos = end;
-            Ok(v)
-        };
-        let read_f32 = |data: &[u8], pos: &mut usize| -> Result<f32> {
-            let end = pos.checked_add(4).filter(|&e| e <= data.len());
-            let end = end.ok_or_else(|| anyhow::anyhow!("truncated doc bm25 cache"))?;
-            let v = f32::from_le_bytes(data[*pos..end].try_into().unwrap());
-            *pos = end;
-            Ok(v)
-        };
-        let read_str = |data: &[u8], pos: &mut usize| -> Result<String> {
-            let len = read_u32(data, pos)? as usize;
-            let end = pos.checked_add(len).filter(|&e| e <= data.len());
-            let end = end.ok_or_else(|| anyhow::anyhow!("truncated doc bm25 cache"))?;
-            let s = String::from_utf8_lossy(&data[*pos..end]).into_owned();
-            *pos = end;
-            Ok(s)
-        };
 
-        let avg_doc_len = read_f32(&data, &mut pos)?;
-        let doc_count = read_u32(&data, &mut pos)? as usize;
-        let mut docs = Vec::with_capacity(doc_count.min(1 << 20));
+        let avg_doc_len = r.f32()?;
+        let doc_count = r.count(DOC_MIN_BYTES)?;
+        let mut docs = Vec::with_capacity(doc_count);
         for _ in 0..doc_count {
-            let id = read_str(&data, &mut pos)?;
-            let text = read_str(&data, &mut pos)?;
+            let id = r.string_u32()?;
+            let text = r.string_u32()?;
             docs.push((id, text));
         }
-        let term_count = read_u32(&data, &mut pos)? as usize;
-        let mut inverted = HashMap::with_capacity(term_count.min(1 << 20));
+
+        let term_count = r.count(TERM_MIN_BYTES)?;
+        let mut inverted = HashMap::with_capacity(term_count);
         for _ in 0..term_count {
-            let term = read_str(&data, &mut pos)?;
-            let pc = read_u32(&data, &mut pos)? as usize;
-            let mut postings = Vec::with_capacity(pc.min(1 << 20));
+            let term = r.string_u32()?;
+            let pc = r.count(POSTING_BYTES)?;
+            let mut postings = Vec::with_capacity(pc);
             for _ in 0..pc {
-                let doc_idx = read_u32(&data, &mut pos)? as usize;
-                let tf = read_f32(&data, &mut pos)?;
+                let doc_idx = r.u32()? as usize;
+                let tf = r.f32()?;
                 anyhow::ensure!(doc_idx < docs.len(), "doc bm25 cache posting out of range");
                 postings.push((doc_idx, tf));
             }
