@@ -60,5 +60,15 @@ jobs:
           cache-on-failure: true
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
+      # Windows runs Clippy but not the tests: lbug's build script emits
+      # `cargo:rustc-link-lib=ssl`/`=crypto`, so every test binary needs
+      # OpenSSL to link, and windows-latest puts no libssl.lib on MSVC's
+      # path (LNK1181). Release builds are unaffected and Windows assets
+      # still ship -- the release job builds only the two binary crates, in
+      # release, and links fine. Compiling Windows is still worth doing: 7 of
+      # the 14 defects found when this fork's CI was first switched on were
+      # Windows compile failures, none of them reachable from macOS.
+      # Tracked in pradeepmouli/infigraph#147.
       - name: Test
+        if: runner.os != 'Windows'
         run: cargo test --all
