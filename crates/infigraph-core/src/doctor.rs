@@ -988,6 +988,85 @@ pub fn check_worktrees(ctx: &DoctorContext) -> Vec<CheckResult> {
     results
 }
 
+const RECOVERY_CATEGORY: &str = "graph-recovery";
+
+/// Two states a project can sit in indefinitely without any other check
+/// noticing, both found live on 2026-09-04:
+///
+/// 1. A pending `recovery-needed` sentinel. The auto-rebuild that consumes
+///    it runs only on a daemon's `serve_requests` tick, so a project served
+///    by nothing but an in-process MCP watcher never drains it -- one had
+///    been waiting five hours with an empty `requests/` directory and no
+///    code graph at all.
+/// 2. A graph that opens cleanly and contains nothing. The corruption
+///    recovery path quarantines the old graph and opens a fresh EMPTY one
+///    without re-indexing, so "recovered" and "has no symbols" look
+///    identical to every other check here. One project had been serving a
+///    0-symbol graph since a wipe twelve days earlier.
+fn check_one_project_recovery(project_path: &Path) -> Vec<CheckResult> {
+    let infigraph_dir = project_path.join(".infigraph");
+    if !infigraph_dir.is_dir() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+
+    if crate::recovery::pending_recovery(&infigraph_dir) {
+        out.push(CheckResult::fail(
+            RECOVERY_CATEGORY,
+            format!("{}: pending recovery", project_path.display()),
+            "a corrupt graph was quarantined and a full reindex was requested, but nothing has performed it -- only a daemon drains this, so a project with no daemon stays empty indefinitely",
+            format!(
+                "run `cd {} && infigraph daemon` to drain it, or `cd {} && infigraph index --full`",
+                project_path.display(),
+                project_path.display()
+            ),
+        ));
+    }
+
+    // An empty-but-openable graph is the recovery path's silent outcome, so
+    // judge it by content rather than by whether the file opens.
+    if let Ok(symbols) = graph_symbol_count(&infigraph_dir) {
+        if symbols == 0 {
+            out.push(CheckResult::fail(
+                RECOVERY_CATEGORY,
+                format!("{}: empty graph", project_path.display()),
+                "the graph opens cleanly but contains no symbols -- the usual cause is a corruption wipe that started a fresh graph and never re-indexed",
+                format!(
+                    "run `cd {} && infigraph index --full` to repopulate it",
+                    project_path.display()
+                ),
+            ));
+        }
+    }
+    out
+}
+
+/// Symbol count from a read-only open, `Err` when the graph is absent or
+/// unopenable -- both of which other checks already report, so this one
+/// stays silent rather than double-reporting them.
+fn graph_symbol_count(infigraph_dir: &Path) -> anyhow::Result<usize> {
+    let graph_path = infigraph_dir.join("graph");
+    if !graph_path.exists() {
+        anyhow::bail!("no graph");
+    }
+    use crate::graph::GraphBackend;
+    let store = crate::graph::KuzuBackend::open_read_only(&graph_path)?;
+    let rows = store.raw_query("MATCH (s:Symbol) RETURN count(s)")?;
+    let n = rows
+        .first()
+        .and_then(|r| r.first())
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(0);
+    Ok(n)
+}
+
+pub fn check_recovery(ctx: &DoctorContext) -> Vec<CheckResult> {
+    projects_in_scope(ctx)
+        .iter()
+        .flat_map(|p| check_one_project_recovery(p))
+        .collect()
+}
+
 const GRAPH_HOLDERS_CATEGORY: &str = "graph-holders";
 
 /// Who has the graph open. Two conditions the lock/watcher checks can't
@@ -1149,6 +1228,7 @@ pub fn run_doctor(ctx: DoctorContext) -> DoctorReport {
     checks.extend(check_sidecars(&ctx));
     checks.extend(check_scip_staleness(&ctx));
     checks.extend(check_worktrees(&ctx));
+    checks.extend(check_recovery(&ctx));
     checks.extend(check_toolchain(&ctx));
     DoctorReport {
         checks,

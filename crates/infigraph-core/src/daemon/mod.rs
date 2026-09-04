@@ -891,6 +891,29 @@ where
                     }
                 }
             }
+        } else if crate::recovery::pending_recovery(&infigraph_dir) {
+            // A pending sentinel asks for a full reindex, and only the
+            // request-serving branch above can grant it: the drain works by
+            // writing a `FullReindex` request file that nothing else
+            // consumes. Draining it here would clear the sentinel and leave
+            // the request unread -- strictly worse than not draining, since
+            // the signal would be gone.
+            //
+            // So say so instead of failing silently. A project watched only
+            // by an in-process MCP thread otherwise sits with a quarantined
+            // graph and no symbols indefinitely, which is exactly how one was
+            // found five hours after its graph went away.
+            static WARNED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                eprintln!(
+                    "[watch] {} has a pending recovery (its graph was quarantined and needs a \
+                     full reindex), but this watcher does not serve write requests -- run \
+                     `infigraph daemon` in that directory, or `infigraph index --full`, or it \
+                     will stay empty",
+                    root.display()
+                );
+            }
         }
 
         // Checked here rather than at the top of the next tick so a

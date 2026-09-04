@@ -421,18 +421,45 @@ impl Infigraph {
                                 crate::recovery::crash_loop_marker_path(infigraph_dir).display(),
                             );
                         }
+                        // Say what this actually does. It quarantines the
+                        // unreadable graph and opens a fresh, EMPTY one -- it
+                        // does not re-index anything, so the caller continues
+                        // against a graph with zero symbols until a reindex
+                        // runs. The old wording ("rebuilding...") promised a
+                        // rebuild this path has never performed, and a project
+                        // was found sitting on a 0-symbol graph whose
+                        // "rebuild" had in fact succeeded.
                         eprintln!(
-                            "[graph] open failed after {} attempts ({last_err}), wiping \
-                             corrupt graph and rebuilding...",
+                            "[graph] open failed after {} attempts ({last_err}), quarantining \
+                             the corrupt graph and starting an EMPTY one -- the project has no \
+                             symbols until a full reindex runs",
                             Self::OPEN_RETRY_BACKOFF_MS.len() + 1
                         );
+                        // Record the attempt BEFORE the open that can fail.
+                        // It used to be recorded only after a successful
+                        // open, so a rebuild that kept failing never
+                        // incremented the counter and the crash-loop breaker
+                        // could not trip on the one failure mode it exists
+                        // for. Observed: a project whose recovery-attempts.log
+                        // was missing the very attempt that left it with no
+                        // graph file at all.
+                        let _ = crate::recovery::record_recovery_attempt(infigraph_dir);
                         Self::wipe_graph(&self.db_path).with_context(|| {
                             "refusing to wipe: graph write lock is held by a live process"
                         })?;
+                        // Ask for the reindex this path cannot do itself. A
+                        // daemon's `serve_requests` tick drains this sentinel
+                        // into a real `FullReindex`; without it the empty
+                        // graph below is simply the project's new state and
+                        // nothing ever refills it. `dead_pid` is 0 because
+                        // this path is reached on any durable open failure,
+                        // not only a dead holder -- `drain_recovery_sentinel`
+                        // keys off the sentinel's existence, not that field.
+                        let _ =
+                            crate::recovery::mark_recovery_needed(infigraph_dir, 0, &self.db_path);
                         let kb = graph::KuzuBackend::open(&self.db_path).with_context(|| {
                             format!("graph still unreadable after wipe (was: {last_err})")
                         })?;
-                        let _ = crate::recovery::record_recovery_attempt(infigraph_dir);
                         self.backend_kind = BackendKind::Kuzu(kb);
                         Ok(())
                     }
