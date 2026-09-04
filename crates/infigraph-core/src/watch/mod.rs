@@ -368,7 +368,14 @@ pub(crate) fn register_watch_dirs(watcher: &mut RecommendedWatcher, root: &Path)
 
 #[cfg(test)]
 mod tests {
+    // The only test below is macOS-gated, so on every other platform this
+    // module compiles empty and these imports are unused -- which `-D
+    // warnings` makes a hard error. Gate the imports the same way rather
+    // than gating the whole module, so a future cross-platform test added
+    // here still compiles and runs everywhere.
+    #[cfg(target_os = "macos")]
     use super::*;
+    #[cfg(target_os = "macos")]
     use std::time::Duration;
 
     /// Regression test for a macOS-specific bug: `run_write_coordinator`
