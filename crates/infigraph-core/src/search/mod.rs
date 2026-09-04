@@ -183,6 +183,26 @@ impl BM25Index {
         let avg_doc_len = f32::from_le_bytes(data[1..5].try_into().unwrap());
         let doc_count = u32::from_le_bytes(data[5..9].try_into().unwrap()) as usize;
         let mut pos = 9usize;
+        // Counts here come straight off disk, so a corrupt cache can name up
+        // to u32::MAX entries. Pre-reserving that many asks the allocator for
+        // ~100GB, which glibc refuses and Rust's allocation-failure handler
+        // turns into a process abort -- no `Result`, nothing for a caller to
+        // catch, the whole test binary or daemon gone. (The sibling loader in
+        // `infigraph-docs::search` was hardened against exactly this; this
+        // copy never was.)
+        //
+        // Bound each count by what the remaining bytes could possibly hold
+        // rather than by a magic constant: every doc costs at least two
+        // 4-byte length prefixes, and every term at least its own length
+        // prefix plus a posting count. A larger count cannot describe this
+        // file, so it is corruption and belongs in the error path.
+        const MIN_ENTRY_BYTES: usize = 8;
+        let entry_cap = |remaining: usize| remaining / MIN_ENTRY_BYTES;
+        anyhow::ensure!(
+            doc_count <= entry_cap(data.len() - pos),
+            "bm25 cache claims {doc_count} docs but is only {} bytes — corrupt",
+            data.len()
+        );
         let mut docs = Vec::with_capacity(doc_count);
         for _ in 0..doc_count {
             let id_len = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
@@ -197,6 +217,11 @@ impl BM25Index {
         }
         let term_count = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
         pos += 4;
+        anyhow::ensure!(
+            term_count <= entry_cap(data.len() - pos),
+            "bm25 cache claims {term_count} terms but is only {} bytes — corrupt",
+            data.len()
+        );
         let mut inverted = HashMap::with_capacity(term_count);
         for _ in 0..term_count {
             let tl = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
@@ -205,6 +230,13 @@ impl BM25Index {
             pos += tl;
             let pc = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
             pos += 4;
+            // Each posting is a 4-byte doc index plus a 4-byte term
+            // frequency, so this bound is exact rather than conservative.
+            anyhow::ensure!(
+                pc <= (data.len() - pos) / 8,
+                "bm25 cache claims {pc} postings but is only {} bytes — corrupt",
+                data.len()
+            );
             let mut postings = Vec::with_capacity(pc);
             for _ in 0..pc {
                 let doc_idx = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap()) as usize;
