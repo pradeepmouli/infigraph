@@ -40,8 +40,14 @@ fn coordinator_self_exits_when_build_hash_check_detects_a_mismatch() {
         )
     });
 
-    // Let the daemon complete at least one "everything matches" check
-    // cycle first (proves this isn't just "it happened to exit anyway").
+    // Give the daemon a window to complete an "everything matches" check
+    // cycle, then prove it has NOT exited at the moment the mismatch is
+    // introduced -- so the exit polled for below is attributable to the
+    // mismatch and not to "it happened to exit anyway". On a slow debug
+    // build this window may be spent entirely in startup, in which case the
+    // assertion still holds (the coordinator is alive at flip time); only
+    // the "completed a matching cycle" half degrades, and the exit-after
+    // -mismatch claim below is the one that actually guards the regression.
     std::thread::sleep(Duration::from_millis(1500));
     assert!(
         !handle.is_finished(),
@@ -53,11 +59,30 @@ fn coordinator_self_exits_when_build_hash_check_detects_a_mismatch() {
     // spawns will read this file and report something different.
     std::fs::write(&override_path, "totally-different-fake-hash").unwrap();
 
-    // Wait past at least one more check interval.
-    std::thread::sleep(Duration::from_millis(2500));
+    // Poll for the exit rather than sleeping a fixed 2.5s. The check runs on
+    // a 1s interval only *once the loop is running*, and reaching the loop is
+    // not instant: `run_write_coordinator` builds the whole bundled language
+    // registry up front, which its own comment notes costs seconds in a debug
+    // build. On a loaded CI runner that startup can swallow this test's
+    // entire former budget -- it failed on both macOS and ubuntu having
+    // printed no `[watch]` output at all, i.e. the loop had not ticked once,
+    // so the old fixed sleep was really asserting whether the coordinator had
+    // finished booting, not whether it detects a mismatch.
+    let wait_start = std::time::Instant::now();
+    let deadline = wait_start + Duration::from_secs(60);
+    while !handle.is_finished() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let waited = wait_start.elapsed();
+    if waited > Duration::from_secs(5) {
+        // Surfaces the real startup cost on whichever machine ran this, so a
+        // future budget decision is made from a measurement rather than a guess.
+        eprintln!("[test] coordinator took {waited:?} to self-exit after the mismatch");
+    }
     assert!(
         handle.is_finished(),
-        "coordinator should have self-exited after detecting the build-hash mismatch"
+        "coordinator should have self-exited after detecting the build-hash mismatch \
+         (waited {waited:?})"
     );
     handle
         .join()
