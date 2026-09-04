@@ -830,6 +830,14 @@ mod staleness_banner_tests {
     fn pending_dirty_files_yield_a_banner_naming_count_and_sample() {
         let tmp = tempfile::tempdir().unwrap();
         let ig = tmp.path().join(".infigraph");
+        // `mark_dirty` returns Ok WITHOUT recording anything when
+        // `.infigraph/` is absent -- deliberately, so a watcher's last events
+        // after a project is deleted cannot resurrect the root (#136). These
+        // tests are about the banner, not that guard (which has its own test,
+        // `dirty::mark_dirty_does_not_create_a_missing_infigraph_dir`), so the
+        // directory has to exist or the mark below is a silent no-op and the
+        // banner has nothing to report.
+        std::fs::create_dir_all(&ig).unwrap();
         infigraph_core::dirty::mark_dirty(
             &ig,
             &[
@@ -861,6 +869,8 @@ mod staleness_banner_tests {
     fn banner_clears_once_the_dirty_set_is_drained() {
         let tmp = tempfile::tempdir().unwrap();
         let ig = tmp.path().join(".infigraph");
+        // Must exist before marking -- see the note in the test above.
+        std::fs::create_dir_all(&ig).unwrap();
         infigraph_core::dirty::mark_dirty(&ig, &["a.py".to_string()]).unwrap();
         assert!(staleness_banner(tmp.path()).is_some());
         infigraph_core::dirty::clear_dirty(&ig, &["a.py".to_string()]).unwrap();
