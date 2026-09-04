@@ -234,8 +234,11 @@ fn check_project_registration(registry: &Registry, project_path: &Path) -> Check
             CATEGORY,
             format!("{}: registration", project_path.display()),
             "project has .infigraph state but is not in the instance registry",
+            // `infigraph index` takes no path argument -- it always acts on
+            // the current directory -- so a remediation naming one is not
+            // copy-pasteable. Emit a form that actually runs.
             format!(
-                "run `infigraph index {}` to re-register it",
+                "run `cd {} && infigraph index` to re-register it",
                 project_path.display()
             ),
         ),
@@ -309,7 +312,7 @@ fn check_unregistered_projects(ctx: &DoctorContext) -> CheckResult {
                 "{} project(s) have .infigraph state but are not in the registry",
                 unregistered.len()
             ),
-            "run `infigraph index <path>` on each to register it",
+            "run `cd <path> && infigraph index` in each to register it",
         )
     } else if !unreadable_roots.is_empty() {
         CheckResult::warn(
@@ -872,7 +875,7 @@ fn check_one_sidecar(project_path: &Path, sidecar_name: &str) -> Option<CheckRes
                 staleness.as_secs() / 60
             ),
             format!(
-                "run `infigraph {refresh_command} {}` to refresh it",
+                "run `cd {} && infigraph {refresh_command}` to refresh it",
                 project_path.display()
             ),
         )),

@@ -1012,6 +1012,52 @@ fn raw_query_prism(prism: &Infigraph, cypher: &str) -> Result<Vec<Vec<String>>> 
 mod tests {
     use super::*;
 
+    /// Serializes the tests below that persist a `Registry`, since
+    /// `INFIGRAPH_REGISTRY_HOME` is process-global and cargo runs this
+    /// binary's tests on parallel threads.
+    static REGISTRY_HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Points `INFIGRAPH_REGISTRY_HOME` at a throwaway directory for the
+    /// caller's scope, restoring the previous value on drop.
+    ///
+    /// `create_group_with_org` ends in `self.save()`, and `save()` falls back
+    /// to `$HOME/.infigraph/registry.json` when this variable is unset. So a
+    /// test that looks purely in-memory -- build a `Registry::default()`, add
+    /// a group, assert on the map -- actually writes that default, with its
+    /// EMPTY `repos`, straight over the developer's real registry. Running
+    /// `cargo test -p infigraph-core --lib` deregistered every project on
+    /// this machine and left two `team-*/backend` fixture groups behind,
+    /// which `infigraph doctor` then reported as "project has .infigraph
+    /// state but is not in the instance registry".
+    struct IsolatedRegistryHome {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        _dir: tempfile::TempDir,
+        prev: Option<std::ffi::OsString>,
+    }
+
+    impl IsolatedRegistryHome {
+        fn acquire() -> Self {
+            let lock = REGISTRY_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let prev = std::env::var_os("INFIGRAPH_REGISTRY_HOME");
+            let dir = tempfile::tempdir().expect("registry scratch dir");
+            std::env::set_var("INFIGRAPH_REGISTRY_HOME", dir.path());
+            Self {
+                _lock: lock,
+                _dir: dir,
+                prev,
+            }
+        }
+    }
+
+    impl Drop for IsolatedRegistryHome {
+        fn drop(&mut self) {
+            match self.prev.take() {
+                Some(v) => std::env::set_var("INFIGRAPH_REGISTRY_HOME", v),
+                None => std::env::remove_var("INFIGRAPH_REGISTRY_HOME"),
+            }
+        }
+    }
+
     #[test]
     fn test_qualified_group_name_no_org() {
         assert_eq!(qualified_group_name("", "backend"), "backend");
@@ -1027,6 +1073,7 @@ mod tests {
 
     #[test]
     fn test_create_group_with_org_stores_qualified_key() {
+        let _home = IsolatedRegistryHome::acquire();
         let mut registry = Registry::default();
         registry.create_group_with_org("backend", "team-a").unwrap();
         assert!(registry.groups.contains_key("team-a/backend"));
@@ -1037,6 +1084,7 @@ mod tests {
 
     #[test]
     fn test_create_group_with_empty_org_stores_plain_key() {
+        let _home = IsolatedRegistryHome::acquire();
         let mut registry = Registry::default();
         registry.create_group_with_org("backend", "").unwrap();
         assert!(registry.groups.contains_key("backend"));
@@ -1046,6 +1094,7 @@ mod tests {
 
     #[test]
     fn test_org_isolation_different_orgs_same_name() {
+        let _home = IsolatedRegistryHome::acquire();
         let mut registry = Registry::default();
         registry.create_group_with_org("backend", "team-a").unwrap();
         registry.create_group_with_org("backend", "team-b").unwrap();
@@ -1056,6 +1105,7 @@ mod tests {
 
     #[test]
     fn test_create_group_duplicate_with_org_fails() {
+        let _home = IsolatedRegistryHome::acquire();
         let mut registry = Registry::default();
         registry.create_group_with_org("backend", "team-a").unwrap();
         let result = registry.create_group_with_org("backend", "team-a");
@@ -1064,6 +1114,7 @@ mod tests {
 
     #[test]
     fn test_default_create_group_uses_default_org() {
+        let _home = IsolatedRegistryHome::acquire();
         let mut registry = Registry::default();
         registry.create_group("my-group").unwrap();
         assert!(registry.groups.contains_key("my-group"));
