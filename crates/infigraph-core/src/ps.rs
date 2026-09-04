@@ -203,6 +203,14 @@ pub fn is_infigraph_process(pid: u32) -> bool {
 /// as "unknown", not "nobody"). This is how `doctor` finds a daemon still
 /// pinning a quarantined graph's inode after the file was renamed away.
 pub fn pids_holding_file(path: &Path) -> Vec<u32> {
+    // Only the Linux and macOS branches below read `target`; every other
+    // platform returns empty, so the binding is genuinely unused there. The
+    // canonicalize still runs on all platforms on purpose -- an unresolvable
+    // path must return empty everywhere, not only where we can inspect fds.
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "macos")),
+        allow(unused_variables)
+    )]
     let Ok(target) = std::fs::canonicalize(path) else {
         return Vec::new();
     };
