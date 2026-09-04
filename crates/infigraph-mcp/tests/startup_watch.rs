@@ -27,6 +27,54 @@ use std::time::{Duration, Instant};
 /// test binaries, since each `tests/*.rs` file compiles to its own crate).
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+/// RAII guard suppressing the CI/`INFIGRAPH_NO_WATCH` opt-out, restoring
+/// every variable it removed on drop.
+///
+/// `start_daemon_watcher_for_startup_dir` reaches a spawn through
+/// `auto_start_watch` -> `ensure_daemon_watcher` -> `ensure_daemon_running`,
+/// and that last call returns `AlreadyRunning` without doing anything
+/// whenever any CI variable is set. GitHub Actions sets both `CI` and
+/// `GITHUB_ACTIONS` on every runner, so every "a daemon must start"
+/// assertion below is unreachable under CI on every platform without this --
+/// and every "no daemon must start" assertion passes vacuously, which is
+/// worse, because it stays green while testing nothing.
+///
+/// Applied to all four `start_daemon_watcher_for_startup_dir_*` tests rather
+/// than only the two that failed:
+/// `..._catches_drift_from_before_it_was_running` passes today by accident,
+/// because its true-up index routes through `ensure_daemon_for_writes` (the
+/// *required* variant, which deliberately ignores this opt-out) and happens
+/// to leave a daemon holding the lock. Which sub-path bypasses the opt-out
+/// is not a property worth resting a test on.
+///
+/// Callers must already hold `ENV_LOCK` -- process env is global. Mirrors
+/// the copies in `infigraph-core`'s daemon tests; each `tests/*.rs` compiles
+/// to its own crate, so this cannot be shared (the same reason this file's
+/// `ENV_LOCK` is itself a copy of `watcher_daemon_mode.rs`'s).
+struct CiOptOutSuppressed(Vec<(&'static str, std::ffi::OsString)>);
+
+impl CiOptOutSuppressed {
+    fn new() -> Self {
+        let vars = infigraph_core::daemon::lifecycle::CI_ENV_VARS;
+        let saved = vars
+            .iter()
+            .filter_map(|v| std::env::var_os(v).map(|old| (*v, old)))
+            .collect();
+        for v in vars {
+            std::env::remove_var(v);
+        }
+        Self(saved)
+    }
+}
+
+impl Drop for CiOptOutSuppressed {
+    fn drop(&mut self) {
+        for (v, old) in self.0.drain(..) {
+            std::env::set_var(v, old);
+        }
+    }
+}
+
 fn wait_for_watch_lock_state(
     lock_path: &std::path::Path,
     want_held: bool,
@@ -57,6 +105,7 @@ fn wait_for_watch_lock_state(
 #[test]
 fn start_daemon_watcher_for_startup_dir_respects_boot_toggle() {
     let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _ci = CiOptOutSuppressed::new();
 
     // This test needs a real `infigraph` CLI binary to spawn (daemon-mode
     // watching re-execs it) — skip rather than fail if this test binary was
@@ -117,6 +166,7 @@ fn start_daemon_watcher_for_startup_dir_respects_boot_toggle() {
 #[test]
 fn start_daemon_watcher_for_startup_dir_respects_watch_enabled_policy() {
     let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _ci = CiOptOutSuppressed::new();
 
     let Ok(_cli) = infigraph_core::daemon::lifecycle::resolve_cli_binary_sibling_of(
         &std::env::current_exe().unwrap(),
@@ -158,6 +208,7 @@ fn start_daemon_watcher_for_startup_dir_respects_watch_enabled_policy() {
 #[test]
 fn start_daemon_watcher_for_startup_dir_never_touches_other_projects() {
     let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _ci = CiOptOutSuppressed::new();
 
     let Ok(_cli) = infigraph_core::daemon::lifecycle::resolve_cli_binary_sibling_of(
         &std::env::current_exe().unwrap(),
@@ -211,6 +262,7 @@ fn start_daemon_watcher_for_startup_dir_never_touches_other_projects() {
 #[test]
 fn start_daemon_watcher_for_startup_dir_catches_drift_from_before_it_was_running() {
     let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _ci = CiOptOutSuppressed::new();
 
     let Ok(_cli) = infigraph_core::daemon::lifecycle::resolve_cli_binary_sibling_of(
         &std::env::current_exe().unwrap(),
