@@ -557,6 +557,20 @@ fn watch_docs_start_resumes_after_a_sentinel_triggered_stop() {
 
     let (attach_tx, attach_rx) = mpsc::channel::<()>();
     let (reindexed_tx, reindexed_rx) = mpsc::channel::<String>();
+    // Deleting the stop sentinel means "request received", NOT "watcher has
+    // stopped": `run_attached_cycle` removes the file, *then* signals
+    // `stop_tx`, *then* joins the watch thread. And `watch_docs` only tests
+    // its stop channel at the top of its loop, so once signalled it still
+    // finishes the current iteration -- blocking in `recv_timeout` for up to
+    // 500ms and running one final debounced reindex of whatever arrived in
+    // the meantime. Waiting on the sentinel alone therefore lets a doc
+    // written straight afterwards be legitimately indexed by the not-yet-
+    // stopped watcher, which is what made this test fail under CI load while
+    // passing on an idle machine. `[doc-watch-daemon] stopped` is printed at
+    // the exact instant that loop breaks, so it is the real teardown-complete
+    // signal -- the stop-side counterpart to the "attaching doc watcher" line
+    // this test already syncs its re-attach half on.
+    let (stopped_tx, stopped_rx) = mpsc::channel::<()>();
 
     let stdout = daemon.stdout.take().unwrap();
     std::thread::spawn(move || {
@@ -570,6 +584,9 @@ fn watch_docs_start_resumes_after_a_sentinel_triggered_stop() {
             eprintln!("[daemon stderr] {line}");
             if line.contains("attaching doc watcher") {
                 let _ = attach_tx.send(());
+            }
+            if line.contains("[doc-watch-daemon] stopped") {
+                let _ = stopped_tx.send(());
             }
             if line.contains("reindexed:") {
                 let _ = reindexed_tx.send(line);
@@ -609,6 +626,11 @@ fn watch_docs_start_resumes_after_a_sentinel_triggered_stop() {
         !sentinel.exists(),
         "sentinel must be consumed by the running daemon"
     );
+    // ...and only now is the watcher genuinely torn down, so a doc written
+    // after this point can no longer be indexed by a still-running watcher.
+    stopped_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("doc watcher must report it stopped after consuming the sentinel");
 
     // Confirm it's genuinely suppressed: a doc written now must NOT be
     // reindexed within a bounded wait (docs.kuzu never disappeared, so this
