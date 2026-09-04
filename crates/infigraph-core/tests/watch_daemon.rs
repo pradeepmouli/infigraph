@@ -507,19 +507,6 @@ fn watch_triggered_file_removal_contends_with_a_held_index_lock() {
         "bootstrap must have indexed doomed.py before the removal race starts"
     );
 
-    // Hold index.lock externally, simulating another in-flight operation
-    // (e.g. a concurrent `infigraph index --full`).
-    let held = infigraph_core::ops::begin_index_op(
-        project.path(),
-        "test-holder",
-        std::time::Duration::ZERO,
-    )
-    .unwrap();
-    let held_guard = match held {
-        infigraph_core::ops::IndexOpOutcome::Acquired(g) => g,
-        _ => panic!("expected to acquire index.lock in this fresh test dir"),
-    };
-
     // Independent detection signal, decoupled from whether the graph write
     // has actually happened: `on_event` fires unconditionally right after
     // the removal is queued (both before and after this fix -- see
@@ -533,7 +520,14 @@ fn watch_triggered_file_removal_contends_with_a_held_index_lock() {
     // binary process varies widely enough, several seconds observed, that
     // a fixed window can't reliably tell "not yet detected" apart from
     // "detected and correctly deferred").
-    let removed_event_count = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+    #[derive(Default)]
+    struct EventCounts {
+        /// Any event at all -- proof the watcher is actually subscribed.
+        any: usize,
+        /// Removal events specifically, the thing under test.
+        removed: usize,
+    }
+    let removed_event_count = std::sync::Arc::new(std::sync::Mutex::new(EventCounts::default()));
     let removed_event_count_clone = removed_event_count.clone();
 
     let (stop_tx, stop_rx) = std::sync::mpsc::channel();
@@ -547,8 +541,10 @@ fn watch_triggered_file_removal_contends_with_a_held_index_lock() {
             50, // debounce_ms
             stop_rx,
             move |evt| {
+                let mut counts = removed_event_count_clone.lock().unwrap();
+                counts.any += 1;
                 if evt.kind == infigraph_core::watch::WatchEventKind::Removed {
-                    *removed_event_count_clone.lock().unwrap() += 1;
+                    counts.removed += 1;
                 }
             },
             0,
@@ -560,12 +556,65 @@ fn watch_triggered_file_removal_contends_with_a_held_index_lock() {
         )
     });
 
-    // Let the watcher register before triggering the removal. A freshly
-    // spawned process's FSEvents subscription (as opposed to one already
-    // running inside a warm `--lib` unit-test binary) can take noticeably
-    // longer than a few hundred ms to start reliably delivering events --
-    // empirically confirmed while writing this test.
-    std::thread::sleep(std::time::Duration::from_millis(3000));
+    // Wait for the watcher to be demonstrably subscribed before triggering
+    // the removal, rather than assuming a fixed delay is enough.
+    //
+    // A fixed 3s sleep used to stand here, and it was the reason this test
+    // failed on both macOS and ubuntu in every CI run: the removal landed
+    // before the watcher existed, so no event was ever generated and the
+    // 15s detection wait below could not recover one. Subscription is not
+    // instant -- `run_write_coordinator` builds the entire bundled language
+    // registry before it starts watching, which its own comment notes costs
+    // seconds in a debug build, and FSEvents in a freshly spawned process
+    // then takes its own time on top.
+    //
+    // Touching a probe file until an event comes back proves the watcher is
+    // live. It is the same trick the detection loop below already uses for
+    // delivery latency, applied to the subscription that has to precede it.
+    let probe_path = project.path().join("probe.py");
+    let subscribe_deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let mut subscribed = false;
+    while std::time::Instant::now() < subscribe_deadline {
+        std::fs::write(&probe_path, format!("# {:?}\n", std::time::Instant::now())).unwrap();
+        for _ in 0..10 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            if removed_event_count.lock().unwrap().any > 0 {
+                subscribed = true;
+                break;
+            }
+        }
+        if subscribed {
+            break;
+        }
+    }
+    assert!(
+        subscribed,
+        "watcher never delivered any event -- it never subscribed, so the \
+         removal below could not be observed either"
+    );
+
+    // Only now hold index.lock externally, simulating another in-flight
+    // operation (e.g. a concurrent `infigraph index --full`). It must be
+    // held across the removal, which is what this test asserts gets
+    // deferred -- but NOT before the subscription probe above, because a
+    // newly-created file can only reach `on_event` through the indexing
+    // path, and that path is exactly what a held lock blocks. Acquiring it
+    // first (as this test used to) left no way to tell "the watcher is not
+    // subscribed yet" apart from "the watcher is subscribed and correctly
+    // deferring" -- the very distinction the test rests on.
+    // Hold index.lock externally, simulating another in-flight operation
+    // (e.g. a concurrent `infigraph index --full`).
+    let held = infigraph_core::ops::begin_index_op(
+        project.path(),
+        "test-holder",
+        std::time::Duration::ZERO,
+    )
+    .unwrap();
+    let held_guard = match held {
+        infigraph_core::ops::IndexOpOutcome::Acquired(g) => g,
+        _ => panic!("expected to acquire index.lock in this fresh test dir"),
+    };
+
     std::fs::remove_file(&file_path).unwrap();
 
     // Bounded wait for detection -- generous, since FSEvents delivery
@@ -574,7 +623,7 @@ fn watch_triggered_file_removal_contends_with_a_held_index_lock() {
     let mut detected = false;
     for _ in 0..150 {
         std::thread::sleep(std::time::Duration::from_millis(100));
-        if *removed_event_count.lock().unwrap() > 0 {
+        if removed_event_count.lock().unwrap().removed > 0 {
             detected = true;
             break;
         }
