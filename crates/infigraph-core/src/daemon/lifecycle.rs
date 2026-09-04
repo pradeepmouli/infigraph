@@ -512,7 +512,10 @@ pub fn resolve_cli_binary_sibling_of(current_exe: &Path) -> Result<std::path::Pa
 
 #[cfg(test)]
 mod tests {
-    use super::{daemon_is_alive, holder_is_stale_build, prune_stale_daemon, wait_for_pid_exit};
+    use super::{daemon_is_alive, holder_is_stale_build, prune_stale_daemon};
+    // Only the `cfg(unix)` tests below call this.
+    #[cfg(unix)]
+    use super::wait_for_pid_exit;
     use crate::lockfile::LockInfo;
 
     fn write_lock_info(path: &std::path::Path, info: &LockInfo) {

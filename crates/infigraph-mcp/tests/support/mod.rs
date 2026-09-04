@@ -82,27 +82,38 @@ fn sweep_stale_registry_homes(base: &Path) {
 pub fn remove_at_exit(path: &Path) {
     use std::sync::Mutex;
     static PATHS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
-    static REGISTERED: OnceLock<()> = OnceLock::new();
-
-    extern "C" fn cleanup() {
-        if let Ok(paths) = PATHS.lock() {
-            for p in paths.iter() {
-                stop_daemon_for(p);
-                let _ = std::fs::remove_dir_all(p);
-            }
-        }
-    }
 
     if let Ok(mut paths) = PATHS.lock() {
         paths.push(path.to_path_buf());
     }
-    REGISTERED.get_or_init(|| {
-        // SAFETY: `cleanup` is a plain `extern "C" fn()` with no arguments,
-        // exactly what atexit expects; it runs once, at process exit.
-        unsafe {
-            libc::atexit(cleanup);
+
+    // `libc` is a unix-only dependency of this crate (see Cargo.toml's
+    // `[target.'cfg(unix)'.dependencies]`), so this whole registration --
+    // the handler and the OnceLock guarding it included -- is unix-only.
+    // Windows leaves the temp directories to the OS: this hook is a
+    // tidiness measure for long-lived `OnceLock` fixtures, not a
+    // correctness guarantee any test depends on.
+    #[cfg(unix)]
+    {
+        static REGISTERED: OnceLock<()> = OnceLock::new();
+
+        extern "C" fn cleanup() {
+            if let Ok(paths) = PATHS.lock() {
+                for p in paths.iter() {
+                    stop_daemon_for(p);
+                    let _ = std::fs::remove_dir_all(p);
+                }
+            }
         }
-    });
+
+        REGISTERED.get_or_init(|| {
+            // SAFETY: `cleanup` is a plain `extern "C" fn()` with no arguments,
+            // exactly what atexit expects; it runs once, at process exit.
+            unsafe {
+                libc::atexit(cleanup);
+            }
+        });
+    }
 }
 
 /// A project directory whose daemon is stopped before the directory is

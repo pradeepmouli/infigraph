@@ -19,8 +19,11 @@ static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// uses across crates). `kill_infigraph_process` refuses anything that
 /// isn't verifiably an infigraph binary, so this can't kill an unrelated
 /// process even if the PID were somehow stale/recycled.
+/// Only the `cfg(unix)` tests below construct this.
+#[cfg(unix)]
 struct KillPidOnDrop(u32);
 
+#[cfg(unix)]
 impl Drop for KillPidOnDrop {
     fn drop(&mut self) {
         let _ = infigraph_core::ps::kill_infigraph_process(self.0, false);

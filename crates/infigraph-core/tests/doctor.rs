@@ -2,11 +2,15 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use infigraph_core::doctor::{
-    check_disk, check_graph_holders, check_locks, check_registry, check_scip_staleness,
-    check_sidecars, check_toolchain, check_wal_integrity, check_watchers, check_worktrees,
-    find_repo_entry, format_report, projects_in_scope, run_doctor, CheckResult, CheckStatus,
-    DoctorContext, DoctorReport, DoctorScope,
+    check_disk, check_locks, check_registry, check_scip_staleness, check_sidecars, check_toolchain,
+    check_wal_integrity, check_watchers, check_worktrees, find_repo_entry, format_report,
+    projects_in_scope, run_doctor, CheckResult, CheckStatus, DoctorContext, DoctorReport,
+    DoctorScope,
 };
+// Only the Linux/macOS-gated tests below use these -- `check_graph_holders`
+// inspects /proc or lsof, neither of which exists on Windows.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use infigraph_core::doctor::check_graph_holders;
 use infigraph_core::graph::GraphStore;
 use infigraph_core::lockfile::LockInfo;
 use infigraph_core::multi::{Registry, RepoEntry};
@@ -1362,6 +1366,7 @@ fn doctor_never_creates_a_watch_lock_as_a_side_effect() {
     );
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn project_ctx(project: &std::path::Path) -> DoctorContext {
     DoctorContext {
         registry: infigraph_core::multi::Registry::default(),
