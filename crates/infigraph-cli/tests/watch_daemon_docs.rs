@@ -1,7 +1,40 @@
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// Polls `still_alive` until it reports false, or the budget runs out.
+/// Returns how long the wait took, or `None` if it never went away.
+///
+/// The budget is 30s, not the 5s these three waits used to allow. A debug
+/// build of the daemon spends seconds building its 62-language registry
+/// before its coordinator loop starts -- and therefore before it can notice a
+/// stop sentinel at all -- so on a loaded runner a 5s budget expires while
+/// the daemon is still starting up, not because it ignored the stop. That is
+/// the same reasoning, and the same 30s, as the watch-loop reply budget noted
+/// in CLAUDE.md. This first failed on Linux CI, where the whole suite runs
+/// under more contention than a dev machine.
+///
+/// Prints when a wait exceeds the old 5s budget, so a CI log distinguishes
+/// "needed more time" from "was never going to stop".
+fn wait_until_gone(what: &str, mut still_alive: impl FnMut() -> bool) -> Option<Duration> {
+    const BUDGET: Duration = Duration::from_secs(30);
+    const STEP: Duration = Duration::from_millis(100);
+    let start = Instant::now();
+    loop {
+        if !still_alive() {
+            let waited = start.elapsed();
+            if waited > Duration::from_secs(5) {
+                eprintln!("[test] {what} took {waited:?} to go away (over the old 5s budget)");
+            }
+            return Some(waited);
+        }
+        if start.elapsed() >= BUDGET {
+            return None;
+        }
+        std::thread::sleep(STEP);
+    }
+}
 
 fn cli_binary() -> std::path::PathBuf {
     // Mirrors infigraph_core::daemon::lifecycle::resolve_cli_binary_sibling_of's
@@ -271,16 +304,12 @@ fn legacy_watch_stop_alias_brings_the_whole_daemon_down() {
         "infigraph watch-stop exited non-zero: {watch_stop_status:?}"
     );
 
-    let mut still_alive = infigraph_core::daemon::lifecycle::daemon_is_alive(&lock_path);
-    for _ in 0..50 {
-        if !still_alive {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-        still_alive = infigraph_core::daemon::lifecycle::daemon_is_alive(&lock_path);
-    }
+    let stopped = wait_until_gone("the daemon", || {
+        infigraph_core::daemon::lifecycle::daemon_is_alive(&lock_path)
+    })
+    .is_some();
     assert!(
-        !still_alive,
+        stopped,
         "the legacy infigraph watch-stop alias should still bring the whole daemon process \
          down (parity with infigraph daemon-stop) -- if this now fails, either the sentinel \
          is no longer honored by run_write_coordinator, or its scope was deliberately \
@@ -363,16 +392,12 @@ fn watch_action_stop_leaves_the_daemon_process_alive() {
         "infigraph daemon-stop exited non-zero: {daemon_stop_status:?}"
     );
 
-    let mut still_alive = infigraph_core::daemon::lifecycle::daemon_is_alive(&lock_path);
-    for _ in 0..50 {
-        if !still_alive {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-        still_alive = infigraph_core::daemon::lifecycle::daemon_is_alive(&lock_path);
-    }
+    let stopped = wait_until_gone("the daemon", || {
+        infigraph_core::daemon::lifecycle::daemon_is_alive(&lock_path)
+    })
+    .is_some();
     assert!(
-        !still_alive,
+        stopped,
         "infigraph daemon-stop should have brought the daemon process down"
     );
 
@@ -410,16 +435,12 @@ fn kill_on_drop_kills_child_on_panic() {
 
     // Give the OS a brief moment to finish tearing the process down after
     // the guard's Drop sends the kill signal during unwind.
-    let mut still_alive = infigraph_mcp::lifecycle::process_alive(pid);
-    for _ in 0..50 {
-        if !still_alive {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-        still_alive = infigraph_mcp::lifecycle::process_alive(pid);
-    }
+    let stopped = wait_until_gone("the child process", || {
+        infigraph_mcp::lifecycle::process_alive(pid)
+    })
+    .is_some();
     assert!(
-        !still_alive,
+        stopped,
         "KillOnDrop must kill child pid {pid} even when dropped during a panic unwind"
     );
 }
