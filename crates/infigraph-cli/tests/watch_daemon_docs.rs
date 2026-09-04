@@ -632,6 +632,20 @@ fn watch_docs_start_resumes_after_a_sentinel_triggered_stop() {
         .recv_timeout(Duration::from_secs(10))
         .expect("doc watcher must report it stopped after consuming the sentinel");
 
+    // Waiting for "stopped" closes the future; this closes the past. Once
+    // `stop_tx` is signalled, `watch_docs` still finishes the iteration it is
+    // already in: its loop is `check stop -> recv -> reindex`, so it prints
+    // one last `reindexed:` and only sees the stop on the *next* pass. That
+    // trailing line is already queued here by the time "stopped" arrives, and
+    // would otherwise satisfy the negative check below for something that
+    // happened before the stop rather than after it.
+    //
+    // The drain is race-free rather than merely likely to work: a single
+    // stderr reader thread feeds both channels in line order, so having
+    // received "stopped" proves every earlier `reindexed:` line was already
+    // sent, and the watcher's loop has broken so none can follow.
+    while reindexed_rx.try_recv().is_ok() {}
+
     // Confirm it's genuinely suppressed: a doc written now must NOT be
     // reindexed within a bounded wait (docs.kuzu never disappeared, so this
     // is not a false negative from a detach/reattach race).
