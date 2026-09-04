@@ -33,6 +33,11 @@ jobs:
     name: Check (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
+      # Report every platform independently. With fail-fast on, the first
+      # platform to fail cancels the others, so a run tells you about one
+      # platform at a time -- which turned a batch of cross-platform defects
+      # into one CI cycle each.
+      fail-fast: false
       matrix:
         os: [macos-latest, ubuntu-latest, windows-latest]
     steps:
