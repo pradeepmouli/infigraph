@@ -260,19 +260,45 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    fn set_fast_poll() {
-        std::env::set_var("INFIGRAPH_WATCH_DOC_DAEMON_POLL_MS", "20");
+    const POLL_MS_VAR: &str = "INFIGRAPH_WATCH_DOC_DAEMON_POLL_MS";
+
+    /// Serializes every test that touches [`POLL_MS_VAR`]. Process env is
+    /// global and cargo runs this binary's tests on parallel threads, so
+    /// without this one test's value lands inside another's read window.
+    /// That is exactly how `attach_poll_interval_reads_renamed_env_var`
+    /// failed on both macOS and ubuntu in CI: it set 77 and read back
+    /// whatever a concurrent fast-poll test had just written or removed.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Holds [`ENV_LOCK`] and sets the fast poll interval for the caller's
+    /// scope, clearing it on drop. Replaces the old
+    /// `set_fast_poll`/`clear_fast_poll` pair: a guard cannot be left
+    /// unpaired by an early return or a panic, and holding the lock for the
+    /// whole scope is what makes the value a test sets the value it reads.
+    struct FastPoll {
+        _lock: std::sync::MutexGuard<'static, ()>,
     }
 
-    fn clear_fast_poll() {
-        std::env::remove_var("INFIGRAPH_WATCH_DOC_DAEMON_POLL_MS");
+    impl FastPoll {
+        fn acquire() -> Self {
+            let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            std::env::set_var(POLL_MS_VAR, "20");
+            Self { _lock: lock }
+        }
+    }
+
+    impl Drop for FastPoll {
+        fn drop(&mut self) {
+            std::env::remove_var(POLL_MS_VAR);
+        }
     }
 
     #[test]
     fn attach_poll_interval_reads_renamed_env_var() {
-        std::env::set_var("INFIGRAPH_WATCH_DOC_DAEMON_POLL_MS", "77");
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var(POLL_MS_VAR, "77");
         assert_eq!(attach_poll_interval().as_millis(), 77);
-        std::env::remove_var("INFIGRAPH_WATCH_DOC_DAEMON_POLL_MS");
+        std::env::remove_var(POLL_MS_VAR);
         assert_eq!(attach_poll_interval().as_millis(), 1000);
     }
 
@@ -321,7 +347,7 @@ mod tests {
 
     #[test]
     fn does_not_attach_without_docs_kuzu() {
-        set_fast_poll();
+        let _poll = FastPoll::acquire();
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().canonicalize().unwrap();
         std::fs::create_dir_all(root.join(".infigraph")).unwrap();
@@ -340,12 +366,11 @@ mod tests {
         // the real proof is the next test, which asserts actual indexing).
         shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
         handle.join().unwrap().unwrap();
-        clear_fast_poll();
     }
 
     #[test]
     fn attaches_and_indexes_once_docs_kuzu_appears() {
-        set_fast_poll();
+        let _poll = FastPoll::acquire();
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().canonicalize().unwrap();
         std::fs::create_dir_all(root.join(".infigraph")).unwrap();
@@ -384,7 +409,6 @@ mod tests {
 
         shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
         handle.join().unwrap().unwrap();
-        clear_fast_poll();
     }
 
     /// Regression test for a real infinite-loop bug (#52): `notify`'s
@@ -435,7 +459,7 @@ mod tests {
 
     #[test]
     fn detaches_on_stop_sentinel_and_does_not_immediately_reattach() {
-        set_fast_poll();
+        let _poll = FastPoll::acquire();
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().canonicalize().unwrap();
         std::fs::create_dir_all(root.join(".infigraph")).unwrap();
@@ -474,7 +498,6 @@ mod tests {
 
         shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
         handle.join().unwrap().unwrap();
-        clear_fast_poll();
     }
 
     /// Regression for the "doc-watcher can't recover from the
@@ -485,7 +508,7 @@ mod tests {
     /// `docs.kuzu` to disappear and reappear.
     #[test]
     fn resume_signal_reattaches_a_suppressed_loop_without_docs_kuzu_cycling() {
-        set_fast_poll();
+        let _poll = FastPoll::acquire();
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().canonicalize().unwrap();
         std::fs::create_dir_all(root.join(".infigraph")).unwrap();
@@ -552,7 +575,6 @@ mod tests {
 
         shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
         handle.join().unwrap().unwrap();
-        clear_fast_poll();
     }
 
     /// Regression for a defect introduced by the fix above: a `resume`
@@ -564,7 +586,7 @@ mod tests {
     /// undoing the stop the user just issued.
     #[test]
     fn a_resume_armed_while_attached_does_not_cancel_the_next_explicit_stop() {
-        set_fast_poll();
+        let _poll = FastPoll::acquire();
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().canonicalize().unwrap();
         std::fs::create_dir_all(root.join(".infigraph")).unwrap();
@@ -632,7 +654,6 @@ mod tests {
 
         shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
         handle.join().unwrap().unwrap();
-        clear_fast_poll();
     }
 
     #[test]
