@@ -234,14 +234,37 @@ pub type FullReindexCallback =
 /// becomes the request's `WriteResult::Err`.
 pub type DocsControl = dyn Fn(WatchAction) -> std::result::Result<(), String> + Send + Sync;
 
-/// `(device, inode)` of the directory at `dir`, or `None` if it is gone or
-/// the platform has no such identity. Cheap (one `stat`), so it can ride the
-/// coordinator's `COORDINATOR_TICK` cadence.
-fn directory_identity(dir: &Path) -> Option<(u64, u64)> {
+/// A directory's identity: `(device, inode)` plus its birth time where the
+/// platform and filesystem report one. `None` if the directory is gone or the
+/// platform has no such notion. Cheap (one `stat`/`statx`), so it can ride
+/// the coordinator's `COORDINATOR_TICK` cadence.
+///
+/// `(dev, ino)` alone is not enough. Linux recycles inode numbers eagerly --
+/// deleting a directory and creating another at the same path routinely lands
+/// on the same inode -- so the pair compares equal and a replaced root reads
+/// as unchanged, which is precisely the #136 case this exists to catch. macOS
+/// does not recycle as readily, which is why the gap survived until this tree
+/// was first built and tested on Linux.
+///
+/// Birth time is an *additional* discriminator, never a replacement:
+/// `Metadata::created()` is `statx(STATX_BTIME)` on Linux and is `Err` on
+/// filesystems that record no birth time, in which case the identity degrades
+/// to the previous `(dev, ino)` behaviour rather than failing open or closed.
+///
+/// Status-change time (`ctime`) is deliberately NOT used, despite also moving
+/// on recreation: it moves whenever a subdirectory is created inside the root
+/// too -- which the resurrection path itself does -- so it would report a
+/// live root as gone. A false "the root vanished" shutdown is worse than the
+/// missed detection this is fixing.
+type DirectoryIdentity = (u64, u64, Option<std::time::SystemTime>);
+
+fn directory_identity(dir: &Path) -> Option<DirectoryIdentity> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        std::fs::metadata(dir).ok().map(|m| (m.dev(), m.ino()))
+        std::fs::metadata(dir)
+            .ok()
+            .map(|m| (m.dev(), m.ino(), m.created().ok()))
     }
     #[cfg(not(unix))]
     {
@@ -261,7 +284,7 @@ fn directory_identity(dir: &Path) -> Option<(u64, u64)> {
 /// and a dozen daemons were found on one dev machine). Comparing against
 /// the identity captured at startup catches the resurrected root; on
 /// platforms with no directory identity it degrades to `exists()`.
-fn root_is_gone(root: &Path, original: Option<(u64, u64)>) -> bool {
+fn root_is_gone(root: &Path, original: Option<DirectoryIdentity>) -> bool {
     if !root.exists() {
         return true;
     }
@@ -2693,7 +2716,18 @@ mod root_identity_tests {
             root.exists(),
             "the recreated root exists -- exists() alone would keep the daemon alive"
         );
-        assert!(root_is_gone(&root, started_on));
+        // If this ever fails, the message says why rather than just that it
+        // did: the two ways the identity can come up equal are the inode
+        // being recycled (Linux does this) and the filesystem reporting no
+        // birth time to break the tie.
+        let started = started_on.expect("identity captured while the root existed");
+        let now = directory_identity(&root).expect("the recreated root exists");
+        assert!(
+            root_is_gone(&root, started_on),
+            "a recreated root was not detected as gone.\n               started: {started:?}\n  now:     {now:?}\n               inode recycled: {}\n  birth time available: {}",
+            started.1 == now.1,
+            started.2.is_some() && now.2.is_some(),
+        );
     }
 
     #[test]

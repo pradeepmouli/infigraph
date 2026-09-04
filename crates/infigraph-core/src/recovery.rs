@@ -272,15 +272,24 @@ mod tests {
         assert!(unclean_exit_for_pid(dir.path(), me).is_none());
     }
 
-    /// Outside a write, there is no phase to report -- the marker still
-    /// records the reason.
+    /// The marker records the reason even when this test is not itself
+    /// inside a write.
+    ///
+    /// It deliberately does NOT assert `exit.phase.is_none()`. `write_phase`
+    /// keeps one process-global slot rather than a `thread_local!`, because a
+    /// signal handler cannot safely read thread-local storage (see that
+    /// module's docs). So "no write in flight" is a property of the whole
+    /// test binary, not of this test: any of the sibling tests writing to a
+    /// graph populates that slot concurrently. Asserting it empty passed on
+    /// macOS purely by scheduling luck and failed on Linux. The
+    /// with-a-phase case is covered deterministically by the sibling test,
+    /// which enters a phase itself.
     #[test]
     fn record_unclean_exit_with_no_write_in_flight_still_records_the_reason() {
         let dir = tempfile::tempdir().unwrap();
         record_unclean_exit(dir.path(), "stale build self-check");
         let exit = unclean_exit_for_pid(dir.path(), std::process::id()).unwrap();
         assert_eq!(exit.reason, "stale build self-check");
-        assert!(exit.phase.is_none());
     }
     use super::*;
 
