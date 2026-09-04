@@ -69,6 +69,14 @@ jobs:
       # the 14 defects found when this fork's CI was first switched on were
       # Windows compile failures, none of them reachable from macOS.
       # Tracked in pradeepmouli/infigraph#147.
+      # --no-fail-fast for the same reason `fail-fast: false` is set on the
+      # matrix above, one level down: `cargo test` stops after the first
+      # failing test *target*, so a run reports one failing suite per
+      # platform and every fix silently promotes the next never-executed
+      # suite into view. Three consecutive runs each surfaced exactly one
+      # new suite that had never run in this CI at all
+      # (daemon_kuzu_e2e -> daemon_stale_build_self_check -> verify /
+      # watch_daemon), turning one batch of defects into one CI cycle each.
       - name: Test
         if: runner.os != 'Windows'
-        run: cargo test --all
+        run: cargo test --all --no-fail-fast
