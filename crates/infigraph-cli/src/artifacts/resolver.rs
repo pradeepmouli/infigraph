@@ -157,7 +157,12 @@ pub(crate) fn run_resolver_from_script(
     run_resolver(&resolver_cmd, tmp.path(), mcp_path, home)
 }
 
-#[cfg(test)]
+// Every test here writes a `#!/usr/bin/env bash` script and marks it
+// executable, so the whole module is unix-only -- unlike a module where only
+// some tests are platform-specific, there is nothing here a Windows run
+// could meaningfully execute. A Windows equivalent would need an entirely
+// different fixture (a .cmd/.ps1 resolver), not a cfg on these.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::io::Write as _;
