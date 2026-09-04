@@ -14,7 +14,15 @@ use std::time::Duration;
 
 use anyhow::Result;
 
-const CI_ENV_VARS: &[&str] = &[
+/// Every variable whose mere presence means "don't opportunistically start a
+/// watcher here" -- the CI detectors plus the explicit `INFIGRAPH_NO_WATCH`
+/// opt-out. Public because tests that exercise the opportunistic auto-start
+/// path have to suppress exactly this set to reach it (GitHub Actions sets
+/// both `CI` and `GITHUB_ACTIONS` on every runner, so an
+/// `ensure_daemon_running` == `Spawned` assertion is otherwise unreachable
+/// under CI on every platform). Exporting it keeps those tests driven by
+/// this list rather than by hand-copied duplicates that drift out of sync.
+pub const CI_ENV_VARS: &[&str] = &[
     "CI",
     "GITHUB_ACTIONS",
     "JENKINS_URL",

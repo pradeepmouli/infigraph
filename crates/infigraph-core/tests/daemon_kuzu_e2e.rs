@@ -10,7 +10,61 @@ use infigraph_core::Infigraph;
 /// `open_daemon_client` must not overlap between the tests in this binary --
 /// otherwise one test's `remove_var` lands inside another's window and that
 /// client silently opens a direct Kuzu backend instead of DaemonKuzu.
+///
+/// Always acquire it as `.unwrap_or_else(|e| e.into_inner())`, never a plain
+/// `.unwrap()`. This guards process-global env vars, not invariant-bearing
+/// data, so a poisoned lock carries no information beyond "an earlier test
+/// panicked" -- and propagating it turns one genuine failure into a cascade
+/// of `PoisonError`s in every test that runs afterwards. A CI run on
+/// 2026-09-04 reported four failing tests here when only one had actually
+/// failed; the other three were poison from the first, and the real fault
+/// was buried under them.
 static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+/// RAII guard suppressing the CI/`INFIGRAPH_NO_WATCH` opt-out that
+/// `ensure_daemon_running` honours, restoring every variable it removed on
+/// drop. A test asserting `DaemonStartOutcome::Spawned` exercises the
+/// *opportunistic* auto-start path, whose documented precondition is "not
+/// under CI" -- and GitHub Actions sets both `CI` and `GITHUB_ACTIONS` on
+/// every runner, so without this the assertion is unreachable under CI on
+/// every platform. It fails as `expected a fresh spawn, got AlreadyRunning`,
+/// which the heavily-overloaded `AlreadyRunning` variant (already-alive / CI
+/// opt-out / remote backend / not-yet-indexed) makes read like lock
+/// contention rather than the opt-out it actually is.
+///
+/// Driven by `lifecycle::CI_ENV_VARS` rather than a hand-copied list, so a
+/// variable added there is covered here automatically. Restoring on drop
+/// matters as much as the removal: a test that clears these and walks away
+/// de-CI-ifies the whole test binary for every test that runs after it --
+/// exactly what was masking this same bug in `watch_daemon.rs`.
+///
+/// Callers must already hold `ENV_LOCK` -- process env is global. Mirrors
+/// `watch_daemon.rs`'s own copy (a different test binary: cargo compiles
+/// each `tests/*.rs` as its own crate, the same small-helper-duplication
+/// precedent `KillOnDrop` already uses).
+struct CiOptOutSuppressed(Vec<(&'static str, std::ffi::OsString)>);
+
+impl CiOptOutSuppressed {
+    fn new() -> Self {
+        let vars = infigraph_core::daemon::lifecycle::CI_ENV_VARS;
+        let saved = vars
+            .iter()
+            .filter_map(|v| std::env::var_os(v).map(|old| (*v, old)))
+            .collect();
+        for v in vars {
+            std::env::remove_var(v);
+        }
+        Self(saved)
+    }
+}
+
+impl Drop for CiOptOutSuppressed {
+    fn drop(&mut self) {
+        for (v, old) in self.0.drain(..) {
+            std::env::set_var(v, old);
+        }
+    }
+}
 
 /// RAII guard that kills and reaps a spawned child process on drop, so a
 /// panic anywhere in this test (not just the happy path) can't leave a real
@@ -448,7 +502,7 @@ fn index_and_index_files_route_through_the_daemon() {
 /// this must complete successfully, not error.
 #[test]
 fn ad_hoc_index_request_racing_the_watchers_own_debounce_does_not_duplicate_key() {
-    let _guard = ENV_LOCK.lock().unwrap();
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let project = tempfile::tempdir().unwrap();
     std::fs::write(project.path().join("main.py"), "def main():\n    pass\n").unwrap();
 
@@ -677,7 +731,7 @@ fn producers_keep_accepting_work_while_a_drain_is_in_flight() {
 /// explicit reply rather than hanging until its own client-side timeout.
 #[test]
 fn a_queued_request_racing_a_full_reindex_gets_a_superseded_reply_not_a_hang() {
-    let _guard = ENV_LOCK.lock().unwrap();
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let project = tempfile::tempdir().unwrap();
     std::fs::write(project.path().join("a.py"), "def a():\n    pass\n").unwrap();
 
@@ -755,9 +809,18 @@ fn a_queued_request_racing_a_full_reindex_gets_a_superseded_reply_not_a_hang() {
     // against, and `wait_with_output` above already proves it didn't hang.
     let index_stderr = String::from_utf8_lossy(&index_output.stderr);
     if !index_output.status.success() {
+        // Report the exit status and stdout too, not just stderr: this
+        // assertion once failed in CI with completely empty stderr, printing
+        // its message and nothing after it, which says only "not superseded"
+        // and gives no way to tell an unexpected error from a process killed
+        // by a signal under runner memory pressure (the two have very
+        // different fixes).
+        let index_stdout = String::from_utf8_lossy(&index_output.stdout);
         assert!(
             index_stderr.contains("superseded"),
-            "if the ad-hoc index failed, it must be because it was superseded, not some other error:\n{index_stderr}"
+            "if the ad-hoc index failed, it must be because it was superseded, \
+             not some other error -- status={:?}\nstderr={index_stderr}\nstdout={index_stdout}",
+            index_output.status
         );
     }
 
@@ -769,7 +832,7 @@ fn a_queued_request_racing_a_full_reindex_gets_a_superseded_reply_not_a_hang() {
 /// unaffected by an in-progress full reindex, not just assumed to be.
 #[test]
 fn a_read_during_full_reindex_sees_the_old_graph_not_an_error() {
-    let _guard = ENV_LOCK.lock().unwrap();
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let project = tempfile::tempdir().unwrap();
     // Enough files that the rebuild takes real wall time, giving a window
     // for a concurrent read to land mid-rebuild.
@@ -835,7 +898,7 @@ fn a_read_during_full_reindex_sees_the_old_graph_not_an_error() {
 /// over wipe-in-place.
 #[test]
 fn a_failed_rebuild_leaves_the_live_graph_untouched() {
-    let _guard = ENV_LOCK.lock().unwrap();
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let project = tempfile::tempdir().unwrap();
     std::fs::write(project.path().join("a.py"), "def a():\n    pass\n").unwrap();
 
@@ -1163,6 +1226,13 @@ fn plain_index_auto_promotes_to_a_full_rebuild_when_the_graph_is_missing_but_inf
 #[test]
 fn opportunistic_daemon_spawn_writes_a_start_banner_naming_its_pid_to_daemon_log() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // `ensure_daemon_running` short-circuits to `AlreadyRunning` whenever any
+    // CI variable is set, so the `Spawned` assertion below is unreachable on
+    // a GitHub Actions runner (which sets `CI` and `GITHUB_ACTIONS`) without
+    // this. The bootstrap child below is unaffected: it sets
+    // `INFIGRAPH_NO_WATCH` on its own Command, which is itself one of these
+    // variables, so it still declines to auto-watch.
+    let _ci = CiOptOutSuppressed::new();
     let project = tempfile::tempdir().unwrap();
     std::fs::write(project.path().join("a.py"), "def a():\n    pass\n").unwrap();
 

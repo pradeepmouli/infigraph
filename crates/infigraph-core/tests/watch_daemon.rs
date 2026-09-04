@@ -1,4 +1,6 @@
-use infigraph_core::daemon::lifecycle::{is_ci_env, is_remote_backend, watch_daemon_mode_enabled};
+use infigraph_core::daemon::lifecycle::{
+    is_ci_env, is_remote_backend, watch_daemon_mode_enabled, CI_ENV_VARS,
+};
 use infigraph_core::graph::GraphBackend;
 
 /// Serializes tests that mutate process-global env vars — cargo runs this
@@ -6,6 +8,50 @@ use infigraph_core::graph::GraphBackend;
 /// must not leak into another test's window (same lesson as PR6's lockfile
 /// tests and PR5's idle-decision tests).
 static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// RAII guard suppressing the CI/`INFIGRAPH_NO_WATCH` opt-out that
+/// `ensure_daemon_running` honours, restoring every variable it removed on
+/// drop. A test asserting `DaemonStartOutcome::Spawned` exercises the
+/// *opportunistic* auto-start path, whose documented precondition is "not
+/// under CI" -- and GitHub Actions sets both `CI` and `GITHUB_ACTIONS` on
+/// every runner, so without this the assertion is unreachable under CI on
+/// every platform.
+///
+/// The `Spawned` tests below used to pass in CI only by accident: this
+/// binary's `is_ci_env_detects_any_known_ci_var` removed `CI` and
+/// `GITHUB_ACTIONS` without restoring them, de-CI-ifying the whole process
+/// for whichever tests happened to run afterwards. That made correctness
+/// depend on test *ordering*, and left the identical bug unmasked (and
+/// failing) in `daemon_kuzu_e2e.rs`, a binary with no such test. Restoring
+/// on drop is what removes the ordering dependency.
+///
+/// Driven by `CI_ENV_VARS` rather than a hand-copied list, so a variable
+/// added there is covered here automatically. Callers must already hold
+/// `ENV_LOCK` -- process env is global. Mirrors `daemon_kuzu_e2e.rs`'s copy
+/// (a different test binary: cargo compiles each `tests/*.rs` as its own
+/// crate, the same precedent `KillPidOnDrop` below already follows).
+struct CiOptOutSuppressed(Vec<(&'static str, std::ffi::OsString)>);
+
+impl CiOptOutSuppressed {
+    fn new() -> Self {
+        let saved = CI_ENV_VARS
+            .iter()
+            .filter_map(|v| std::env::var_os(v).map(|old| (*v, old)))
+            .collect();
+        for v in CI_ENV_VARS {
+            std::env::remove_var(v);
+        }
+        Self(saved)
+    }
+}
+
+impl Drop for CiOptOutSuppressed {
+    fn drop(&mut self) {
+        for (v, old) in self.0.drain(..) {
+            std::env::set_var(v, old);
+        }
+    }
+}
 
 /// RAII guard killing a daemon spawned via `ensure_daemon_running` by PID --
 /// that function hands back no `Child` at all (production's "opportunistic
@@ -45,16 +91,10 @@ fn is_remote_backend_only_true_for_explicit_neo4j() {
 #[test]
 fn is_ci_env_detects_any_known_ci_var() {
     let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    for v in [
-        "CI",
-        "GITHUB_ACTIONS",
-        "JENKINS_URL",
-        "BUILDKITE",
-        "GITLAB_CI",
-        "INFIGRAPH_NO_WATCH",
-    ] {
-        std::env::remove_var(v);
-    }
+    // Restores the ambient CI vars on drop -- under real CI this test used to
+    // strip them from the process permanently, silently changing the
+    // environment every later test in this binary observed.
+    let _ci = CiOptOutSuppressed::new();
     assert!(!is_ci_env());
     std::env::set_var("INFIGRAPH_NO_WATCH", "1");
     assert!(is_ci_env());
@@ -76,6 +116,9 @@ fn watch_daemon_mode_is_opt_in_off_by_default() {
 #[test]
 fn ensure_daemon_running_noops_under_ci() {
     let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // Take the guard first so the `remove_var` below restores whatever the
+    // ambient environment had, rather than unsetting a real runner's `CI`.
+    let _ci = CiOptOutSuppressed::new();
     std::env::set_var("CI", "1");
     let tmp = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(tmp.path().join(".infigraph")).unwrap();
@@ -87,7 +130,6 @@ fn ensure_daemon_running_noops_under_ci() {
         outcome,
         infigraph_core::daemon::lifecycle::DaemonStartOutcome::AlreadyRunning
     );
-    std::env::remove_var("CI");
 }
 
 /// A project that hasn't been indexed yet (no `.infigraph` at `root`) is a
@@ -101,17 +143,8 @@ fn ensure_daemon_running_noops_under_ci() {
 #[test]
 fn ensure_daemon_running_noops_when_not_yet_indexed() {
     let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    for v in [
-        "CI",
-        "GITHUB_ACTIONS",
-        "JENKINS_URL",
-        "BUILDKITE",
-        "GITLAB_CI",
-        "INFIGRAPH_NO_WATCH",
-        "INFIGRAPH_BACKEND",
-    ] {
-        std::env::remove_var(v);
-    }
+    let _ci = CiOptOutSuppressed::new();
+    std::env::remove_var("INFIGRAPH_BACKEND");
     let tmp = tempfile::tempdir().unwrap();
     assert!(!tmp.path().join(".infigraph").exists());
 
@@ -134,17 +167,8 @@ fn ensure_daemon_running_noops_when_not_yet_indexed() {
 #[test]
 fn init_daemon_backend_starts_a_daemon() {
     let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    for v in [
-        "CI",
-        "GITHUB_ACTIONS",
-        "JENKINS_URL",
-        "BUILDKITE",
-        "GITLAB_CI",
-        "INFIGRAPH_NO_WATCH",
-        "INFIGRAPH_BACKEND",
-    ] {
-        std::env::remove_var(v);
-    }
+    let _ci = CiOptOutSuppressed::new();
+    std::env::remove_var("INFIGRAPH_BACKEND");
 
     // init()'s daemon arm re-execs the CLI binary; skip rather than fail if
     // this test binary was built without it (infigraph-core has no
@@ -263,6 +287,7 @@ fn build_daemon_command_strips_infigraph_backend_env_var() {
 #[cfg(unix)]
 fn spawn_daemon_child_still_starts_with_infigraph_backend_leaked_into_test_env() {
     let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _ci = CiOptOutSuppressed::new();
     let project_dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(project_dir.path().join(".infigraph")).unwrap();
 
@@ -334,6 +359,7 @@ fn spawn_daemon_child_still_starts_with_infigraph_backend_leaked_into_test_env()
 #[cfg(unix)]
 fn ensure_daemon_running_prunes_a_dead_stale_holder_and_spawns_fresh() {
     let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _ci = CiOptOutSuppressed::new();
     let project_dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(project_dir.path().join(".infigraph")).unwrap();
 
