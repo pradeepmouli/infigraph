@@ -287,6 +287,49 @@ pub fn live_lock_holder(lock_path: &Path) -> Option<u32> {
     lockfile::holder_is_alive(&holder).then_some(holder.pid)
 }
 
+/// Pick a live writer from the two signals available, preferring the lock
+/// payload and falling back to whoever actually has the database file open.
+///
+/// Pure so the decision is testable without a live writer to arrange.
+/// `file_holders` must already exclude this process and non-infigraph pids --
+/// see [`live_graph_writer`].
+fn live_graph_writer_from(payload_holder: Option<u32>, file_holders: &[u32]) -> Option<u32> {
+    payload_holder.or_else(|| file_holders.first().copied())
+}
+
+/// PID of a live writer of `db_path`, if there is one.
+///
+/// The lock payload is the precise signal, but it is not the only state a
+/// live writer can be in. A daemon keeps the database open across its whole
+/// session while taking `graph.lock` only around write transactions, and the
+/// lockfile blanks the payload on release -- so between transactions the file
+/// is open, the WAL is uncheckpointed, and the payload is empty.
+///
+/// That third state used to read as "no live holder", which
+/// [`classify_read_only_open_failure`] turns into `GraphCorruption`: a
+/// healthy, actively-served graph reported as damaged. It is the same
+/// symptom d6a742f fixed for the payload-names-a-pid case, recurring through
+/// the one door that fix left open -- observed live on 2026-09-04, where
+/// `lsof` showed the daemon holding a 135MB graph with a 1.2MB uncheckpointed
+/// WAL while `graph.lock` was zero bytes.
+///
+/// `pids_holding_file` is best-effort and returns empty for "unknown" as well
+/// as "nobody" (it has no implementation outside Linux/macOS), so this can
+/// only ever add confidence that a writer exists -- never prove one absent.
+/// Where it cannot tell, behaviour is exactly as before.
+fn live_graph_writer(db_path: &Path, lock_path: &Path) -> Option<u32> {
+    let payload_holder = live_lock_holder(lock_path);
+    if payload_holder.is_some() {
+        return payload_holder;
+    }
+    let me = std::process::id();
+    let holders: Vec<u32> = crate::ps::pids_holding_file(db_path)
+        .into_iter()
+        .filter(|&pid| pid != me && crate::ps::is_infigraph_process(pid))
+        .collect();
+    live_graph_writer_from(payload_holder, &holders)
+}
+
 pub fn unclean_shutdown_wal_holder(db_path: &Path, lock_path: &Path) -> Option<u32> {
     if wal_family_paths(db_path).is_empty() {
         return None;
@@ -570,7 +613,7 @@ impl GraphStore {
         let db = Database::new(path, config).map_err(|e| {
             classify_read_only_open_failure(
                 format!("failed to open kuzu db (read-only): {e}"),
-                live_lock_holder(&lock_path),
+                live_graph_writer(path, &lock_path),
             )
         })?;
         refuse_newer_schema(&db, path)?;
@@ -1673,6 +1716,40 @@ mod tests {
             err.to_string().contains("not corruption"),
             "must say so in as many words, since the raw lbug text says 'Corrupted': {err}"
         );
+    }
+
+    /// The gap d6a742f left open, seen live on 2026-09-04.
+    ///
+    /// A daemon keeps the database open for its whole session but takes
+    /// `graph.lock` only around write transactions, and the lockfile blanks
+    /// the payload on release. Between transactions the file is open, the WAL
+    /// is uncheckpointed, and the payload is empty -- so the payload alone
+    /// reports "no live holder" and a healthy graph gets classified as
+    /// corrupt. `lsof` showed exactly this: the daemon holding a 135MB graph
+    /// with a 1.2MB WAL while `graph.lock` was zero bytes.
+    #[test]
+    fn an_open_file_stands_in_for_an_empty_lock_payload() {
+        assert_eq!(
+            live_graph_writer_from(None, &[10642]),
+            Some(10642),
+            "an empty payload must not outrank a process demonstrably holding the graph open"
+        );
+    }
+
+    /// The payload is the precise signal, so it wins when it has one --
+    /// the file probe only ever fills the gap where it does not.
+    #[test]
+    fn the_lock_payload_outranks_the_file_probe() {
+        assert_eq!(live_graph_writer_from(Some(4242), &[10642]), Some(4242));
+    }
+
+    /// `pids_holding_file` returns empty for "unknown" (no implementation
+    /// outside Linux/macOS) as well as for "nobody", so an empty list must
+    /// leave the verdict exactly where it was -- this probe can add
+    /// confidence that a writer exists, never prove one absent.
+    #[test]
+    fn no_holders_at_all_changes_nothing() {
+        assert_eq!(live_graph_writer_from(None, &[]), None);
     }
 
     #[test]
