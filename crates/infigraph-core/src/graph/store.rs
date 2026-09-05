@@ -277,43 +277,6 @@ fn hard_exit_explanation(db_path: &Path, pid: u32) -> String {
     }
 }
 
-/// How long a read-only open waits for a writer to go idle before opening
-/// anyway. Deliberately short: reads are interactive (MCP tool calls, CLI
-/// queries), and proceeding is the pre-existing behaviour, so a busy writer
-/// costs a little latency rather than an unavailable read. A full reindex
-/// can hold the lock far longer than this, and failing every read for its
-/// duration would be a much worse regression than the rare crash this
-/// guards against.
-const OPEN_PROBE_BUDGET: std::time::Duration = std::time::Duration::from_millis(2000);
-
-/// Block until nobody holds `lock_path`, or `budget` elapses.
-///
-/// Best-effort by construction: the return is deliberately `()` because
-/// there is no useful action on timeout -- the caller proceeds either way.
-/// Acquires and immediately drops rather than holding, so the lock payload
-/// is not stamped with a reader's identity (see `open_read_only`).
-fn wait_for_writer_idle(lock_path: &Path, budget: std::time::Duration) {
-    let deadline = std::time::Instant::now() + budget;
-    loop {
-        match lockfile::try_acquire(lock_path, "graph-read-open-probe") {
-            // Free: nothing is mid-transaction. Drop immediately.
-            Ok(Some(guard)) => {
-                drop(guard);
-                return;
-            }
-            // Held by a writer -- wait for it.
-            Ok(None) => {}
-            // Can't tell (I/O error): proceed rather than stall a read on a
-            // probe that is only ever an optimisation.
-            Err(_) => return,
-        }
-        if std::time::Instant::now() >= deadline {
-            return;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-}
-
 /// PID currently holding `lock_path`, if that process is still running.
 ///
 /// The complement of the dead-holder case `unclean_shutdown_wal_holder`
@@ -643,32 +606,6 @@ impl GraphStore {
                 ),
             }));
         }
-        // Wait for any in-flight write transaction to finish before handing
-        // the file to Kuzu.
-        //
-        // Constructing a read-only `Database` against a graph a writer is
-        // part-way through can segfault, which no `Result` and no
-        // `catch_unwind` can rescue -- the process simply dies. Observed in
-        // CI: a reader in its own process completed 390 open/query/drop
-        // cycles against a concurrently-reindexing writer and died on the
-        // 391st, inside this open. Not the query, not the teardown.
-        //
-        // Every write path takes the same `graph.lock` (see `WriteLock`), so
-        // a free lock means no transaction is in flight right now. Probe it
-        // rather than HOLDING it: `lockfile::acquire` stamps the holder's
-        // identity into the payload, so a reader that died holding it would
-        // leave a payload naming a dead "holder", and the next opener would
-        // read that as a dead-holder WAL and quarantine a perfectly healthy
-        // graph -- a far worse failure than the one being avoided. The
-        // acquire-and-immediately-drop probe is the same one
-        // `daemon_is_alive` already uses.
-        //
-        // This NARROWS the race, it does not close it: a writer can take the
-        // lock in the instant between the probe and `Database::new`. It
-        // removes the case that actually reproduces -- opening in the middle
-        // of a long write -- and cannot make anything worse.
-        wait_for_writer_idle(&lock_path, OPEN_PROBE_BUDGET);
-
         // `throw_on_wal_replay_failure` defaults to true (unset here): a WAL
         // replay failure now surfaces as an error instead of being silently
         // tolerated and served as a torn base image.
@@ -1778,48 +1715,6 @@ mod tests {
         assert!(
             err.to_string().contains("not corruption"),
             "must say so in as many words, since the raw lbug text says 'Corrupted': {err}"
-        );
-    }
-
-    /// The probe must return promptly when nothing holds the lock, so an
-    /// uncontended read pays essentially nothing for the guard.
-    #[test]
-    fn the_open_probe_returns_immediately_when_no_writer_holds_the_lock() {
-        let dir = tempfile::tempdir().unwrap();
-        let lock_path = dir.path().join("graph.lock");
-        let start = std::time::Instant::now();
-        wait_for_writer_idle(&lock_path, std::time::Duration::from_secs(5));
-        assert!(
-            start.elapsed() < std::time::Duration::from_millis(500),
-            "an idle graph must not pay the probe budget: {:?}",
-            start.elapsed()
-        );
-    }
-
-    /// A held lock must cost the budget and then PROCEED, never fail the
-    /// read. A full reindex can hold the write lock for minutes, and making
-    /// every read unavailable for that long would be a far worse regression
-    /// than the rare open-time crash the probe exists to narrow.
-    #[test]
-    fn the_open_probe_gives_up_and_proceeds_while_a_writer_holds_the_lock() {
-        let dir = tempfile::tempdir().unwrap();
-        let lock_path = dir.path().join("graph.lock");
-        let _held = lockfile::try_acquire(&lock_path, "test-writer")
-            .unwrap()
-            .expect("fresh lock must be acquirable");
-
-        let budget = std::time::Duration::from_millis(200);
-        let start = std::time::Instant::now();
-        wait_for_writer_idle(&lock_path, budget);
-        let waited = start.elapsed();
-
-        assert!(
-            waited >= budget,
-            "must actually wait for the writer: {waited:?}"
-        );
-        assert!(
-            waited < budget * 10,
-            "must give up near the budget rather than block on the writer: {waited:?}"
         );
     }
 
