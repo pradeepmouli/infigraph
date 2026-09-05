@@ -461,12 +461,14 @@ mod tests {
             .expect("a real directory tree must register cleanly");
     }
 
-    // The only test below is macOS-gated, so on every other platform this
-    // module compiles empty and these imports are unused -- which `-D
-    // warnings` makes a hard error. Gate the imports the same way rather
-    // than gating the whole module, so a future cross-platform test added
-    // here still compiles and runs everywhere.
-    #[cfg(target_os = "macos")]
+    // `use super::*` is no longer gated: the cross-platform tests below need
+    // it, notably for notify's `Watcher` trait, since `RecommendedWatcher::new`
+    // is a trait method rather than an inherent one. This is the case the old
+    // comment here anticipated -- it gated the imports rather than the whole
+    // module precisely "so a future cross-platform test added here still
+    // compiles and runs everywhere". `Duration` stays gated because only the
+    // macOS test uses it, and an unused import is a hard error under
+    // `-D warnings`.
     use super::*;
     #[cfg(target_os = "macos")]
     use std::time::Duration;
