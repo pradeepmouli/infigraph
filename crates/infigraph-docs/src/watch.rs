@@ -43,11 +43,7 @@ pub fn watch_docs(
 
         match rx.recv_timeout(Duration::from_millis(500)) {
             Ok(Ok(event)) => {
-                if event
-                    .paths
-                    .iter()
-                    .any(|p| is_document_file(p) && !ignore_matcher.is_ignored(p, false))
-                {
+                if paths_warrant_reindex(&event.paths, &ignore_matcher) {
                     pending = true;
                 }
             }
@@ -101,6 +97,44 @@ pub fn watch_docs(
     }
 
     Ok(())
+}
+
+/// Whether a watch event touching `paths` should schedule a reindex.
+///
+/// A document file is the obvious case. A newly created DIRECTORY is the
+/// non-obvious one, and it is why a doc added in a brand-new subdirectory
+/// used to be missed on Linux entirely.
+///
+/// `notify`'s inotify backend installs recursive watches one directory at a
+/// time: when it sees a directory created it adds a watch for it, but any
+/// file created inside during that gap generates an event nobody is
+/// listening for yet. `mkdir docs/tutorials && echo ... > docs/tutorials/x.md`
+/// loses the file event, and since a directory has no extension
+/// `is_document_file` rejected the directory event too -- so nothing marked
+/// the tree dirty and the document stayed unindexed until something else
+/// happened to touch the project. A `git checkout` that adds a docs
+/// subdirectory hits this squarely.
+///
+/// macOS FSEvents watches the subtree rather than individual directories and
+/// reports the file path itself, so the same code worked there -- which is
+/// why this only ever failed on Linux.
+///
+/// Treating the directory itself as reason enough is safe because the
+/// reindex is a full re-collect: whatever landed inside during the gap is
+/// picked up. Ignored directories (`target/`, `node_modules/`) are still
+/// excluded, and directory creation is far rarer than the file writes the
+/// storm guard above worries about.
+pub(crate) fn paths_warrant_reindex(
+    paths: &[std::path::PathBuf],
+    ignore_matcher: &infigraph_core::ignore_rules::IgnoreMatcher,
+) -> bool {
+    paths.iter().any(|p| {
+        let is_dir = p.is_dir();
+        if ignore_matcher.is_ignored(p, is_dir) {
+            return false;
+        }
+        is_document_file(p) || is_dir
+    })
 }
 
 /// How often the daemon loop polls for `.infigraph/docs.kuzu`'s existence
@@ -291,6 +325,48 @@ mod tests {
         fn drop(&mut self) {
             std::env::remove_var(POLL_MS_VAR);
         }
+    }
+
+    /// The regression this exists for: a brand-new directory must itself be
+    /// reason enough to rescan, because with inotify a file created inside
+    /// one races the recursive watch being installed and its event is lost.
+    #[test]
+    fn a_new_directory_warrants_a_reindex_even_though_it_is_not_a_document() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ignore = infigraph_core::ignore_rules::IgnoreMatcher::build(tmp.path());
+        let new_dir = tmp.path().join("docs").join("tutorials");
+        std::fs::create_dir_all(&new_dir).unwrap();
+
+        assert!(
+            !is_document_file(&new_dir),
+            "precondition: a directory has no document extension, which is why \
+             filtering on that alone dropped it"
+        );
+        assert!(
+            paths_warrant_reindex(&[new_dir], &ignore),
+            "a new directory may already contain documents whose own events were lost"
+        );
+    }
+
+    #[test]
+    fn a_document_file_warrants_a_reindex() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ignore = infigraph_core::ignore_rules::IgnoreMatcher::build(tmp.path());
+        let doc = tmp.path().join("readme.md");
+        std::fs::write(&doc, "# hi\n").unwrap();
+        assert!(paths_warrant_reindex(&[doc], &ignore));
+    }
+
+    /// The widening must not become "reindex on anything": a non-document
+    /// file still does not qualify, or every build artifact would trigger a
+    /// full doc reindex.
+    #[test]
+    fn a_non_document_file_still_warrants_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ignore = infigraph_core::ignore_rules::IgnoreMatcher::build(tmp.path());
+        let src = tmp.path().join("main.rs");
+        std::fs::write(&src, "fn main() {}\n").unwrap();
+        assert!(!paths_warrant_reindex(&[src], &ignore));
     }
 
     #[test]
