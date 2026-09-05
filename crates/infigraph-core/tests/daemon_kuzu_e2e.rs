@@ -746,12 +746,35 @@ fn a_queued_request_racing_a_full_reindex_gets_a_superseded_reply_not_a_hang() {
     std::fs::write(project.path().join("b.py"), "def b():\n    pass\n").unwrap();
 
     let cli = cli_binary();
+
+    // Capture each child's output to FILES rather than inheriting stdio.
+    //
+    // Both children used to inherit, and the code below then called
+    // `wait_with_output()` on them -- which returns empty buffers for a child
+    // that was never given pipes. So `index_stderr` was unconditionally "",
+    // `contains("superseded")` was unconditionally false, and the branch this
+    // test declares acceptable ("failed because it was superseded") could
+    // never be satisfied: ANY non-zero exit failed it, including exactly the
+    // outcome the test says is fine. It also explains the empty stderr this
+    // assertion reported from CI -- the child was not silent, nothing was
+    // ever captured.
+    //
+    // Files rather than `Stdio::piped()` because the loops below poll
+    // `try_wait` without draining: a child that outgrew the pipe buffer
+    // (~64KB) would block on write and never exit, turning a diagnostic into
+    // the hang this test exists to catch.
+    let out_path = |name: &str| project.path().join(name);
+    let capture =
+        |name: &str| std::process::Stdio::from(std::fs::File::create(out_path(name)).unwrap());
+
     let mut index_child = std::process::Command::new(&cli)
         .arg("index")
         .arg("--no-embed")
         .current_dir(project.path())
         .env("INFIGRAPH_BACKEND", "daemon")
         .env("INFIGRAPH_WATCH_INDEX_VIA_DAEMON", "1")
+        .stdout(capture("index.out"))
+        .stderr(capture("index.err"))
         .spawn()
         .unwrap();
 
@@ -761,6 +784,8 @@ fn a_queued_request_racing_a_full_reindex_gets_a_superseded_reply_not_a_hang() {
         .arg("--no-embed")
         .current_dir(project.path())
         .env("INFIGRAPH_BACKEND", "daemon")
+        .stdout(capture("full.out"))
+        .stderr(capture("full.err"))
         .spawn()
         .unwrap();
 
@@ -780,7 +805,7 @@ fn a_queued_request_racing_a_full_reindex_gets_a_superseded_reply_not_a_hang() {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    let full_output = full_child.wait_with_output().unwrap();
+    let full_status = full_child.wait().unwrap();
 
     let index_start = std::time::Instant::now();
     loop {
@@ -794,33 +819,31 @@ fn a_queued_request_racing_a_full_reindex_gets_a_superseded_reply_not_a_hang() {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    let index_output = index_child.wait_with_output().unwrap();
+    let index_status = index_child.wait().unwrap();
+    let read = |name: &str| std::fs::read_to_string(out_path(name)).unwrap_or_default();
 
     // Both must complete within the deadline (neither hangs), regardless
     // of which one the daemon happened to serve first.
     assert!(
-        full_output.status.success(),
-        "full reindex must succeed:\nstderr={}",
-        String::from_utf8_lossy(&full_output.stderr)
+        full_status.success(),
+        "full reindex must succeed -- status={full_status:?}\nstderr={}\nstdout={}",
+        read("full.err"),
+        read("full.out")
     );
     // The ad-hoc index either succeeded normally or failed with the
     // superseded message -- both are acceptable outcomes; a hang (the
     // process still running past this point) is what this test guards
     // against, and `wait_with_output` above already proves it didn't hang.
-    let index_stderr = String::from_utf8_lossy(&index_output.stderr);
-    if !index_output.status.success() {
-        // Report the exit status and stdout too, not just stderr: this
-        // assertion once failed in CI with completely empty stderr, printing
-        // its message and nothing after it, which says only "not superseded"
-        // and gives no way to tell an unexpected error from a process killed
-        // by a signal under runner memory pressure (the two have very
-        // different fixes).
-        let index_stdout = String::from_utf8_lossy(&index_output.stdout);
+    if !index_status.success() {
+        // "superseded" can appear on either stream, so check both: the
+        // client prints it as an error, but which stream that reaches has
+        // changed before and is not what this test is about.
+        let index_stderr = read("index.err");
+        let index_stdout = read("index.out");
         assert!(
-            index_stderr.contains("superseded"),
+            index_stderr.contains("superseded") || index_stdout.contains("superseded"),
             "if the ad-hoc index failed, it must be because it was superseded, \
-             not some other error -- status={:?}\nstderr={index_stderr}\nstdout={index_stdout}",
-            index_output.status
+             not some other error -- status={index_status:?}\nstderr={index_stderr}\nstdout={index_stdout}"
         );
     }
 
