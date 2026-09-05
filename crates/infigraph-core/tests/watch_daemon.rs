@@ -1051,18 +1051,39 @@ fn scip_enrichment_task_is_cancellable_via_daemon_token() {
     // background `Task<()>` and actually executed (not merely that the reap
     // block compiles). Only once this fires can `daemon_token` be cancelled
     // without instead cancelling the full-reindex build itself.
+    // Budget generously, because this test pays for TWO bundled-registry
+    // builds before the callback can possibly run: `run_write_coordinator`
+    // builds one before entering its loop, and `build_full_reindex` keeps
+    // its own fresh `make_registry()` call (daemon/mod.rs:341 explains why).
+    // Each costs seconds in a debug build -- CLAUDE.md notes registry
+    // construction alone can approach several seconds on a loaded machine.
+    //
+    // The old budget was 300ms + 150 * 100ms = 15.3s for all of that plus
+    // the parse, write, swap and callback. It failed on ubuntu with the
+    // second `Parsing: 1/1 (100%)` visible in the captured output but no
+    // `Writing:` line -- i.e. the reindex had genuinely started and simply
+    // ran out of clock, which is the signature of a budget that never
+    // accounted for the registry builds rather than of anything broken.
+    let wait_start = std::time::Instant::now();
+    let deadline = wait_start + std::time::Duration::from_secs(120);
     let mut ran = false;
-    for _ in 0..150 {
-        std::thread::sleep(std::time::Duration::from_millis(100));
+    while std::time::Instant::now() < deadline {
         if scip_generation.load(std::sync::atomic::Ordering::SeqCst) >= 1 {
             ran = true;
             break;
         }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let waited = wait_start.elapsed();
+    if waited > std::time::Duration::from_secs(15) {
+        // Surfaces the real cost on whichever machine ran this, so the next
+        // budget decision is made from a measurement rather than a guess.
+        eprintln!("[test] SCIP-enrichment callback took {waited:?} to run");
     }
     assert!(
         ran,
         "expected the SCIP-enrichment task scheduled by on_full_reindex to run after a \
-         successful full-reindex swap"
+         successful full-reindex swap (waited {waited:?})"
     );
 
     // Cancel now that the SCIP task has run -- proves cancelling
