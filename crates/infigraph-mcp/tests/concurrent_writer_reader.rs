@@ -83,29 +83,50 @@ fn concurrent_reader_helper() {
     let mut samples: Vec<String> = Vec::new();
     let deadline = Instant::now() + READER_CEILING;
 
+    // Progress goes to STDERR, deliberately, and one line per phase.
+    //
+    // This child segfaulted on the macOS runner and its stdout carried only
+    // "running 1 test" -- nothing about how far it got. That is not because
+    // it printed nothing: Rust's stdout is BLOCK-buffered when it is a pipe
+    // (which it is here, the parent captures it), so a SIGSEGV takes the
+    // whole buffer with it. Rust's stderr is unbuffered, so the last line
+    // written survives the crash.
+    //
+    // Three phases rather than one heartbeat, because they have different
+    // causes: `open` constructs a `Database` against a file another process
+    // is writing, `query` reads through it, and `drop` tears the connection
+    // down -- and closing a database while a writer is mid-transaction is
+    // just as plausible a crash site as opening one. Whichever phase the
+    // last surviving line names is where it died.
     while !stop.exists() && Instant::now() < deadline {
         counts.attempts += 1;
+        eprintln!("READER_AT n={} phase=open", counts.attempts);
         match KuzuBackend::open_read_only(&db_path) {
-            Ok(reader) => match reader.get_symbols_for_search() {
-                Ok(rows) if rows.iter().any(|r| r[1] == "stable_marker_fn") => {
-                    counts.correct += 1;
-                }
-                Ok(rows) => {
-                    counts.wrong += 1;
-                    if samples.len() < 3 {
-                        samples.push(format!(
-                            "query succeeded but missing stable_marker_fn ({} rows)",
-                            rows.len()
-                        ));
+            Ok(reader) => {
+                eprintln!("READER_AT n={} phase=query", counts.attempts);
+                match reader.get_symbols_for_search() {
+                    Ok(rows) if rows.iter().any(|r| r[1] == "stable_marker_fn") => {
+                        counts.correct += 1;
+                    }
+                    Ok(rows) => {
+                        counts.wrong += 1;
+                        if samples.len() < 3 {
+                            samples.push(format!(
+                                "query succeeded but missing stable_marker_fn ({} rows)",
+                                rows.len()
+                            ));
+                        }
+                    }
+                    Err(e) => {
+                        counts.clean_errors += 1;
+                        if samples.len() < 3 {
+                            samples.push(format!("query error: {e}"));
+                        }
                     }
                 }
-                Err(e) => {
-                    counts.clean_errors += 1;
-                    if samples.len() < 3 {
-                        samples.push(format!("query error: {e}"));
-                    }
-                }
-            },
+                eprintln!("READER_AT n={} phase=drop", counts.attempts);
+                drop(reader);
+            }
             Err(e) => {
                 counts.clean_errors += 1;
                 if samples.len() < 3 {
@@ -114,6 +135,10 @@ fn concurrent_reader_helper() {
             }
         }
     }
+    // Reaching here at all distinguishes "finished the window" from "died
+    // mid-loop": without it, a crash on the final attempt and a clean exit
+    // would leave identical trailing output.
+    eprintln!("READER_AT done n={}", counts.attempts);
 
     // Machine-readable single line: the parent asserts on these numbers, so
     // they have to survive the harness's output handling intact.
@@ -124,6 +149,13 @@ fn concurrent_reader_helper() {
     for s in &samples {
         println!("READER_SAMPLE {s}");
     }
+}
+
+/// Last `n` lines of `text`, for reporting where the child got to without
+/// pasting a few thousand progress lines into the failure message.
+fn tail(text: &str, n: usize) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    lines[lines.len().saturating_sub(n)..].join("\n")
 }
 
 fn parse_counts(stdout: &str) -> Option<ReaderCounts> {
@@ -220,7 +252,11 @@ fn concurrent_writer_reader_raw_query_correctness_under_load() {
         .wait_with_output()
         .expect("reader child output");
     let stdout = String::from_utf8_lossy(&out.stdout);
-    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stderr_full = String::from_utf8_lossy(&out.stderr);
+    // The child emits a READER_AT line per phase per attempt, so its stderr
+    // runs to thousands of lines. Only the tail matters: the last surviving
+    // line names the attempt and the phase it died in.
+    let stderr = tail(&stderr_full, 12);
 
     assert!(
         out.status.success(),
