@@ -571,11 +571,34 @@ fn watch_triggered_file_removal_contends_with_a_held_index_lock() {
     // Touching a probe file until an event comes back proves the watcher is
     // live. It is the same trick the detection loop below already uses for
     // delivery latency, applied to the subscription that has to precede it.
+    // Probe with a DELETION, not a write.
+    //
+    // `on_event` is only ever called for `Removed` file events and for
+    // watcher lifecycle events (see producer.rs) -- the `Created`/`Modified`
+    // arm marks the path dirty and adds it to the debounce batch without
+    // notifying anyone. So a probe that merely writes a file cannot produce
+    // a callback on any platform.
+    //
+    // An earlier version of this probe did exactly that and still passed on
+    // macOS, which is what made the mistake hard to see: FSEvents coalescing
+    // reports a rewrite of an existing path with a Remove flag, so repeatedly
+    // writing the SAME file happens to yield `Removed` there. inotify emits
+    // MODIFY and never does, so on Linux that probe could not succeed no
+    // matter how long it waited -- and its failure message blamed the
+    // watcher for never subscribing when the watcher was fine.
+    //
+    // Creating and then removing a throwaway file produces a real removal on
+    // both backends, and is the same kind of event this test goes on to
+    // depend on.
     let probe_path = project.path().join("probe.py");
     let subscribe_deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     let mut subscribed = false;
     while std::time::Instant::now() < subscribe_deadline {
-        std::fs::write(&probe_path, format!("# {:?}\n", std::time::Instant::now())).unwrap();
+        std::fs::write(&probe_path, "# probe\n").unwrap();
+        // Let the create land before the remove, so the two are not coalesced
+        // into a single event that reports only the creation.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let _ = std::fs::remove_file(&probe_path);
         for _ in 0..10 {
             std::thread::sleep(std::time::Duration::from_millis(100));
             if removed_event_count.lock().unwrap().any > 0 {
@@ -589,8 +612,9 @@ fn watch_triggered_file_removal_contends_with_a_held_index_lock() {
     }
     assert!(
         subscribed,
-        "watcher never delivered any event -- it never subscribed, so the \
-         removal below could not be observed either"
+        "watcher delivered no event for a probe file created and deleted under the watched \
+         root within 60s -- it is not receiving filesystem events, so the removal below \
+         could not be observed either"
     );
 
     // Only now hold index.lock externally, simulating another in-flight
