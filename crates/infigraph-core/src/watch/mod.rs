@@ -356,18 +356,111 @@ fn get_cross_file_dependents(
 
     dependents.into_iter().collect()
 }
+/// Subscribe `watcher` to every non-ignored directory under `root`.
+///
+/// Registers each directory NonRecursive rather than the tree Recursive, so
+/// `.gitignore`/`.infigraphignore` are honoured -- a recursive subscription
+/// has no exclusions and would fire on `target/`, `node_modules/` and the
+/// rest.
+///
+/// A per-directory failure is tolerated (one unreadable directory should not
+/// stop the rest being watched) but NOT ignored: watching zero directories
+/// is returned as an error rather than `Ok`. Every call used to be `let _ =`
+/// and this function always returned `Ok(())`, so a watcher that subscribed
+/// to nothing was indistinguishable from a healthy one -- it simply never
+/// delivered an event, with no error anywhere to explain why. That is the
+/// shape of `watch_triggered_file_removal_contends_with_a_held_index_lock`'s
+/// ubuntu failure, where a 60s probe saw zero callbacks.
+///
+/// Linux is where this matters. Each watched directory costs an inotify
+/// watch descriptor and each `RecommendedWatcher` an inotify instance, both
+/// capped per user (`fs.inotify.max_user_watches`,
+/// `max_user_instances` -- often 128). Exhausting either makes `watch()`
+/// fail for every directory at once. macOS's FSEvents has no equivalent
+/// per-user cap, which is why a silent total failure would present as
+/// Linux-only.
 pub(crate) fn register_watch_dirs(watcher: &mut RecommendedWatcher, root: &Path) -> Result<()> {
+    let mut watched = 0usize;
+    let mut failed = 0usize;
+    let mut first_err: Option<String> = None;
+
     for result in crate::ignore_rules::walk_builder(root).build() {
         let Ok(entry) = result else { continue };
         if entry.file_type().is_some_and(|ft| ft.is_dir()) {
-            let _ = watcher.watch(entry.path(), RecursiveMode::NonRecursive);
+            match watcher.watch(entry.path(), RecursiveMode::NonRecursive) {
+                Ok(()) => watched += 1,
+                Err(e) => {
+                    failed += 1;
+                    if first_err.is_none() {
+                        first_err = Some(format!("{}: {e}", entry.path().display()));
+                    }
+                }
+            }
         }
+    }
+
+    if watched == 0 {
+        anyhow::bail!(
+            "failed to watch any directory under {} ({failed} attempt(s) failed) -- a watcher \
+             subscribed to nothing silently delivers no events forever. First failure: {}. On \
+             Linux this is usually an exhausted inotify budget: check \
+             `fs.inotify.max_user_watches` and `fs.inotify.max_user_instances`.",
+            root.display(),
+            first_err.as_deref().unwrap_or("none reported")
+        );
+    }
+    if failed > 0 {
+        eprintln!(
+            "[watch] warning: watching {watched} director(ies) under {} but {failed} failed \
+             (first: {}) -- changes under those paths will not be noticed",
+            root.display(),
+            first_err.as_deref().unwrap_or("none reported")
+        );
     }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
+    /// A watcher that subscribed to nothing must be an error, not a silent
+    /// success. Every `watch()` call here used to be `let _ =` with an
+    /// unconditional `Ok(())`, so total failure was indistinguishable from
+    /// health: no events, ever, and nothing anywhere saying why.
+    ///
+    /// A nonexistent root reaches that state deterministically and without
+    /// needing to exhaust a real inotify budget -- the walker yields no
+    /// directories, so nothing is watched.
+    #[test]
+    fn watching_no_directories_at_all_is_an_error_not_a_silent_ok() {
+        let mut watcher =
+            notify::RecommendedWatcher::new(|_evt| {}, notify::Config::default()).unwrap();
+        let missing = std::path::Path::new("/definitely/not/a/real/path/for/infigraph/tests");
+
+        let err = super::register_watch_dirs(&mut watcher, missing)
+            .expect_err("subscribing to zero directories must not report success");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("failed to watch any directory"),
+            "must say plainly that nothing is being watched: {msg}"
+        );
+        assert!(
+            msg.contains("inotify"),
+            "must point at the usual Linux cause so the reader knows what to check: {msg}"
+        );
+    }
+
+    /// The ordinary case still succeeds, so the check above cannot be
+    /// satisfied by simply refusing everything.
+    #[test]
+    fn watching_a_real_directory_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("nested")).unwrap();
+        let mut watcher =
+            notify::RecommendedWatcher::new(|_evt| {}, notify::Config::default()).unwrap();
+        super::register_watch_dirs(&mut watcher, dir.path())
+            .expect("a real directory tree must register cleanly");
+    }
+
     // The only test below is macOS-gated, so on every other platform this
     // module compiles empty and these imports are unused -- which `-D
     // warnings` makes a hard error. Gate the imports the same way rather

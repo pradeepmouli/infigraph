@@ -226,7 +226,21 @@ pub async fn run_producer(
                                 }
                                 WatchEventKind::Created | WatchEventKind::Modified => {
                                     if path.is_dir() {
-                                        let _ = crate::watch::register_watch_dirs(&mut watcher, &path);
+                                        // A new subdirectory needs its own
+                                        // subscription (these are registered
+                                        // NonRecursive). Log a failure rather
+                                        // than discarding it: silently not
+                                        // watching a new directory means
+                                        // every later change under it is
+                                        // missed with nothing to explain why.
+                                        if let Err(e) =
+                                            crate::watch::register_watch_dirs(&mut watcher, &path)
+                                        {
+                                            eprintln!(
+                                                "[watch-producer] failed to watch new directory {}: {e}",
+                                                path.display()
+                                            );
+                                        }
                                     } else if registry.for_file(&rel).is_some() {
                                         // R3.3.5: persisted before this event
                                         // enters `batch` -- the in-memory
