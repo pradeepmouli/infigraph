@@ -50,6 +50,50 @@ fn run_worktree_reconcile(
         .unwrap()
 }
 
+/// Removes a worktree that has been indexed, without racing infigraph's own
+/// writer.
+///
+/// `git worktree remove --force` failed intermittently on macOS runners with
+/// `failed to delete '...': Directory not empty`. Nothing here is ignored by
+/// git -- the fixture repo has no `.gitignore` -- so `--force` really does
+/// delete the untracked `.infigraph/` scratch. "Not empty" means a file
+/// reappeared between git's delete pass and its final `rmdir`: indexing a
+/// root auto-starts a daemon for it, and that daemon goes on writing into
+/// `.infigraph/` after `infigraph index` has already exited.
+///
+/// So stop the writer rather than retry around it. The stop is asynchronous
+/// (the CLI's own wording is that the process exits "within ~1 second"),
+/// which is the only thing the bounded retry below is for -- and if it never
+/// succeeds, it reports git's actual stderr rather than a bare "failed".
+fn remove_worktree(
+    main: &std::path::Path,
+    worktree: &std::path::Path,
+    fake_home: &std::path::Path,
+) {
+    let _ = Command::new(env!("CARGO_BIN_EXE_infigraph"))
+        .args(["--root", worktree.to_str().unwrap(), "daemon-stop"])
+        .env("HOME", fake_home)
+        .env("INFIGRAPH_NO_WATCH", "1")
+        .env_remove("INFIGRAPH_BACKEND")
+        .output();
+
+    let args = ["worktree", "remove", "--force", worktree.to_str().unwrap()];
+    let mut last = String::new();
+    for attempt in 0..10 {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(main)
+            .output()
+            .unwrap();
+        if out.status.success() {
+            return;
+        }
+        last = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        std::thread::sleep(std::time::Duration::from_millis(200 * (attempt + 1)));
+    }
+    panic!("git {args:?} never succeeded after stopping the daemon; last stderr: {last}");
+}
+
 #[test]
 fn reconcile_acts_on_teardown_but_only_reports_bootstrap() {
     let fake_home = tempfile::tempdir().unwrap();
@@ -79,15 +123,7 @@ fn reconcile_acts_on_teardown_but_only_reports_bootstrap() {
     );
     let out = run_index(&removed_wt, fake_home.path());
     assert!(out.status.success());
-    git(
-        &[
-            "worktree",
-            "remove",
-            "--force",
-            removed_wt.to_str().unwrap(),
-        ],
-        main.path(),
-    );
+    remove_worktree(main.path(), &removed_wt, fake_home.path());
 
     // Bootstrap candidate: create a worktree but never index it.
     let new_wt = parent.path().join("new-wt");
