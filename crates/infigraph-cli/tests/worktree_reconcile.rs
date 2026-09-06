@@ -1,12 +1,29 @@
 use std::process::Command;
 
+/// Runs a git command, and on failure reports what git actually said.
+///
+/// This used to call `.status()`, which sends git's output to the test
+/// harness's own stdio and keeps none of it, so a failure could only ever
+/// panic with "git [...] failed" -- no exit code, no message. When
+/// `worktree remove --force` failed once on a macOS runner that was the
+/// entire evidence, and the reason (a still-open file? a locked worktree?
+/// a path git recorded differently under /private/var?) was unrecoverable
+/// after the fact. Capturing it costs nothing and makes the next
+/// occurrence diagnosable from the CI log alone.
 fn git(args: &[&str], cwd: &std::path::Path) {
-    let status = Command::new("git")
+    let out = Command::new("git")
         .args(args)
         .current_dir(cwd)
-        .status()
+        .output()
         .unwrap();
-    assert!(status.success(), "git {:?} failed", args);
+    assert!(
+        out.status.success(),
+        "git {:?} failed ({})\nstdout: {}\nstderr: {}",
+        args,
+        out.status,
+        String::from_utf8_lossy(&out.stdout).trim(),
+        String::from_utf8_lossy(&out.stderr).trim(),
+    );
 }
 
 fn run_index(root: &std::path::Path, fake_home: &std::path::Path) -> std::process::Output {
