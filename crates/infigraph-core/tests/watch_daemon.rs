@@ -3,11 +3,28 @@ use infigraph_core::daemon::lifecycle::{
 };
 use infigraph_core::graph::GraphBackend;
 
-/// Serializes tests that mutate process-global env vars — cargo runs this
-/// binary's tests on parallel threads, so a lowered override in one test
-/// must not leak into another test's window (same lesson as PR6's lockfile
-/// tests and PR5's idle-decision tests).
-static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// Guards process-global env vars against this binary's parallel test
+/// threads (same lesson as PR6's lockfile tests and PR5's idle-decision
+/// tests). A `RwLock`, not a `Mutex`, because there are two roles and only
+/// one of them was ever protected:
+///
+/// - tests that MUTATE an env var take `write()` -- they must exclude
+///   everyone;
+/// - tests that merely READ one, via any code path that consults
+///   `INFIGRAPH_BACKEND`/`CI`/`INFIGRAPH_NO_WATCH` (every
+///   `Infigraph::open`/`init` and every watch loop below), take `read()`.
+///
+/// A plain `Mutex` held only by the mutators protected them from each other
+/// and from nobody else, so a long test could bootstrap in the window where
+/// `init_daemon_backend_starts_a_daemon` had `INFIGRAPH_BACKEND=daemon`
+/// set. That is not hypothetical: it failed CI on ubuntu as
+/// `out_of_scope_write_request_contends_with_a_held_index_lock` panicking
+/// with "INFIGRAPH_BACKEND=daemon is set but no daemon came up ... within
+/// 10s", in a test that never mentions the variable, and again as
+/// `full_reindex_build_task_can_be_cancelled_before_it_starts_the_swap`.
+/// Readers share the lock with each other, so the slow tests still run in
+/// parallel; they only serialise against an actual mutation.
+static ENV_LOCK: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
 /// RAII guard suppressing the CI/`INFIGRAPH_NO_WATCH` opt-out that
 /// `ensure_daemon_running` honours, restoring every variable it removed on
@@ -78,7 +95,7 @@ impl Drop for KillPidOnDrop {
 
 #[test]
 fn is_remote_backend_only_true_for_explicit_neo4j() {
-    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _g = ENV_LOCK.write().unwrap_or_else(|e| e.into_inner());
     std::env::remove_var("INFIGRAPH_BACKEND");
     assert!(!is_remote_backend());
     std::env::set_var("INFIGRAPH_BACKEND", "kuzu");
@@ -90,7 +107,7 @@ fn is_remote_backend_only_true_for_explicit_neo4j() {
 
 #[test]
 fn is_ci_env_detects_any_known_ci_var() {
-    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _g = ENV_LOCK.write().unwrap_or_else(|e| e.into_inner());
     // Restores the ambient CI vars on drop -- under real CI this test used to
     // strip them from the process permanently, silently changing the
     // environment every later test in this binary observed.
@@ -103,7 +120,7 @@ fn is_ci_env_detects_any_known_ci_var() {
 
 #[test]
 fn watch_daemon_mode_is_opt_in_off_by_default() {
-    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _g = ENV_LOCK.write().unwrap_or_else(|e| e.into_inner());
     std::env::remove_var("INFIGRAPH_BACKEND");
     assert!(!watch_daemon_mode_enabled());
     std::env::set_var("INFIGRAPH_BACKEND", "daemon");
@@ -115,7 +132,7 @@ fn watch_daemon_mode_is_opt_in_off_by_default() {
 
 #[test]
 fn ensure_daemon_running_noops_under_ci() {
-    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _g = ENV_LOCK.write().unwrap_or_else(|e| e.into_inner());
     // Take the guard first so the `remove_var` below restores whatever the
     // ambient environment had, rather than unsetting a real runner's `CI`.
     let _ci = CiOptOutSuppressed::new();
@@ -142,7 +159,7 @@ fn ensure_daemon_running_noops_under_ci() {
 /// use prints a spurious failure line. See task-3-review.md Finding 1.
 #[test]
 fn ensure_daemon_running_noops_when_not_yet_indexed() {
-    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _g = ENV_LOCK.write().unwrap_or_else(|e| e.into_inner());
     let _ci = CiOptOutSuppressed::new();
     std::env::remove_var("INFIGRAPH_BACKEND");
     let tmp = tempfile::tempdir().unwrap();
@@ -166,7 +183,7 @@ fn ensure_daemon_running_noops_when_not_yet_indexed() {
 /// not merely that `ensure_daemon_running` is called.
 #[test]
 fn init_daemon_backend_starts_a_daemon() {
-    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _g = ENV_LOCK.write().unwrap_or_else(|e| e.into_inner());
     let _ci = CiOptOutSuppressed::new();
     std::env::remove_var("INFIGRAPH_BACKEND");
 
@@ -286,7 +303,7 @@ fn build_daemon_command_strips_infigraph_backend_env_var() {
 #[test]
 #[cfg(unix)]
 fn spawn_daemon_child_still_starts_with_infigraph_backend_leaked_into_test_env() {
-    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _g = ENV_LOCK.write().unwrap_or_else(|e| e.into_inner());
     let _ci = CiOptOutSuppressed::new();
     let project_dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(project_dir.path().join(".infigraph")).unwrap();
@@ -358,7 +375,7 @@ fn spawn_daemon_child_still_starts_with_infigraph_backend_leaked_into_test_env()
 #[test]
 #[cfg(unix)]
 fn ensure_daemon_running_prunes_a_dead_stale_holder_and_spawns_fresh() {
-    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _g = ENV_LOCK.write().unwrap_or_else(|e| e.into_inner());
     let _ci = CiOptOutSuppressed::new();
     let project_dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(project_dir.path().join(".infigraph")).unwrap();
@@ -480,6 +497,10 @@ fn file_present_in_graph(project_dir: &std::path::Path, file: &str) -> bool {
 /// removal completes.
 #[test]
 fn watch_triggered_file_removal_contends_with_a_held_index_lock() {
+    // Shared with other readers, exclusive against any test mutating
+    // process env: this test consults `INFIGRAPH_BACKEND` indirectly and
+    // must not observe another test's temporary value.
+    let _env = ENV_LOCK.read().unwrap_or_else(|e| e.into_inner());
     // A custom, non-dot-leading prefix: `tempfile::tempdir()`'s default
     // prefix starts with a dot, and `should_ignore` (this file's watcher)
     // treats ANY path component starting with '.' as ignored -- including
@@ -704,6 +725,10 @@ fn watch_triggered_file_removal_contends_with_a_held_index_lock() {
 /// The watch loop must now notice its root is gone and shut itself down.
 #[test]
 fn watch_loop_shuts_down_when_its_root_directory_is_deleted() {
+    // Shared with other readers, exclusive against any test mutating
+    // process env: this test consults `INFIGRAPH_BACKEND` indirectly and
+    // must not observe another test's temporary value.
+    let _env = ENV_LOCK.read().unwrap_or_else(|e| e.into_inner());
     let project = tempfile::Builder::new()
         .prefix("infigraph-watch-root-gone-test-")
         .tempdir()
@@ -783,6 +808,10 @@ fn watch_loop_shuts_down_when_its_root_directory_is_deleted() {
 /// served.
 #[test]
 fn out_of_scope_write_request_contends_with_a_held_index_lock() {
+    // Shared with other readers, exclusive against any test mutating
+    // process env: this test consults `INFIGRAPH_BACKEND` indirectly and
+    // must not observe another test's temporary value.
+    let _env = ENV_LOCK.read().unwrap_or_else(|e| e.into_inner());
     let project = tempfile::Builder::new()
         .prefix("infigraph-watch-lock-oos-test-")
         .tempdir()
@@ -903,6 +932,10 @@ fn out_of_scope_write_request_contends_with_a_held_index_lock() {
 /// a real temp project with a real request file.
 #[test]
 fn full_reindex_build_task_can_be_cancelled_before_it_starts_the_swap() {
+    // Shared with other readers, exclusive against any test mutating
+    // process env: this test consults `INFIGRAPH_BACKEND` indirectly and
+    // must not observe another test's temporary value.
+    let _env = ENV_LOCK.read().unwrap_or_else(|e| e.into_inner());
     let project = tempfile::Builder::new()
         .prefix("infigraph-full-reindex-cancel-test-")
         .tempdir()
@@ -1025,6 +1058,10 @@ fn full_reindex_build_task_can_be_cancelled_before_it_starts_the_swap() {
 /// `InFlightScip`'s old struct-field shape were wired incorrectly.
 #[test]
 fn scip_enrichment_task_is_cancellable_via_daemon_token() {
+    // Shared with other readers, exclusive against any test mutating
+    // process env: this test consults `INFIGRAPH_BACKEND` indirectly and
+    // must not observe another test's temporary value.
+    let _env = ENV_LOCK.read().unwrap_or_else(|e| e.into_inner());
     let project = tempfile::Builder::new()
         .prefix("infigraph-scip-cancel-test-")
         .tempdir()
@@ -1157,6 +1194,10 @@ fn scip_enrichment_task_is_cancellable_via_daemon_token() {
 /// breaking that one, and vice versa -- only both together pin the behavior.
 #[test]
 fn watch_control_daemon_stop_ends_the_coordinator_loop() {
+    // Shared with other readers, exclusive against any test mutating
+    // process env: this test consults `INFIGRAPH_BACKEND` indirectly and
+    // must not observe another test's temporary value.
+    let _env = ENV_LOCK.read().unwrap_or_else(|e| e.into_inner());
     let project = tempfile::Builder::new()
         .prefix("infigraph-daemon-stop-test-")
         .tempdir()
@@ -1261,6 +1302,10 @@ fn watch_control_daemon_stop_ends_the_coordinator_loop() {
 /// crucially must NOT end the loop.
 #[test]
 fn watch_control_daemon_start_is_rejected_without_stopping_the_loop() {
+    // Shared with other readers, exclusive against any test mutating
+    // process env: this test consults `INFIGRAPH_BACKEND` indirectly and
+    // must not observe another test's temporary value.
+    let _env = ENV_LOCK.read().unwrap_or_else(|e| e.into_inner());
     let project = tempfile::Builder::new()
         .prefix("infigraph-daemon-start-reject-test-")
         .tempdir()
@@ -1355,6 +1400,10 @@ fn watch_control_daemon_start_is_rejected_without_stopping_the_loop() {
 /// actions, unlike `role: Daemon`, must never end the coordinator loop.
 #[test]
 fn watch_control_docs_role_dispatches_to_the_registered_docs_control() {
+    // Shared with other readers, exclusive against any test mutating
+    // process env: this test consults `INFIGRAPH_BACKEND` indirectly and
+    // must not observe another test's temporary value.
+    let _env = ENV_LOCK.read().unwrap_or_else(|e| e.into_inner());
     let project = tempfile::Builder::new()
         .prefix("infigraph-watch-control-docs-dispatch-test-")
         .tempdir()
@@ -1459,6 +1508,10 @@ fn watch_control_docs_role_dispatches_to_the_registered_docs_control() {
 /// the loop either.
 #[test]
 fn watch_control_docs_role_without_a_registered_control_replies_with_an_error() {
+    // Shared with other readers, exclusive against any test mutating
+    // process env: this test consults `INFIGRAPH_BACKEND` indirectly and
+    // must not observe another test's temporary value.
+    let _env = ENV_LOCK.read().unwrap_or_else(|e| e.into_inner());
     let project = tempfile::Builder::new()
         .prefix("infigraph-watch-control-docs-none-test-")
         .tempdir()
