@@ -276,6 +276,53 @@ pub fn try_acquire(path: &Path, role: &str) -> Result<Option<LockFile>> {
     }
 }
 
+/// Shared (reader) acquisition, blocking with a wait budget.
+///
+/// The exclusive path above is the write lock: one holder, identity payload
+/// stamped so a wedged holder can be identified. This is the other half --
+/// many concurrent holders, excluded only by an exclusive holder. It exists
+/// for the checkpoint race (ladybug#666): a read-only `Database::new` racing
+/// the writer's checkpoint segfaults, measured at 13-15 ms before the WAL
+/// fold across three independent runs, so readers must be able to say "not
+/// during a checkpoint" without saying "not while any writer exists".
+///
+/// Deliberately stamps NO payload. A shared lock has many holders, so a
+/// single-identity payload could only ever be misleading, and writing to the
+/// file at all would race the other readers holding it.
+pub fn acquire_shared(path: &Path, timeout: Duration) -> Result<LockFile> {
+    let start = Instant::now();
+    let mut delay = Duration::from_millis(1);
+    loop {
+        let file = open_lock_file(path)?;
+        // Explicit trait call: std stabilised an inherent `File::try_lock_shared`
+        // whose error type differs from fs2's, and the inherent method would
+        // otherwise win over the trait the rest of this module uses.
+        match fs2::FileExt::try_lock_shared(&file) {
+            Ok(()) => {
+                record_slow_wait(path, start.elapsed());
+                return Ok(LockFile {
+                    file,
+                    path: path.to_path_buf(),
+                    info: LockInfo::current("shared-reader"),
+                });
+            }
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::WouldBlock || e.raw_os_error() == Some(33) => {}
+            Err(e) => return Err(anyhow::anyhow!("lock error on {}: {e}", path.display())),
+        }
+        if start.elapsed() >= timeout {
+            return Err(anyhow::Error::new(Busy {
+                lock_path: path.to_path_buf(),
+                holder: read_holder(path),
+                waited: start.elapsed(),
+            }));
+        }
+        let remaining = timeout.saturating_sub(start.elapsed());
+        std::thread::sleep(delay.min(remaining));
+        delay = (delay * 2).min(Duration::from_millis(500));
+    }
+}
+
 /// Pure: has a lock holder's heartbeat gone stale enough to suspect it's
 /// wedged (still holding the flock -- so not dead in the liveness sense --
 /// but not doing whatever periodic work it's supposed to be doing)?

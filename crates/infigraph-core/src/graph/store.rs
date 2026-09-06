@@ -371,6 +371,31 @@ fn write_buffer_pool_bytes() -> u64 {
     parse_write_buffer_pool(std::env::var(WRITE_BUFFER_POOL_ENV).ok().as_deref())
 }
 
+/// Coordination lock for the checkpoint window (ladybug#666).
+///
+/// A file of its own, deliberately NOT `graph.lock`. The write lock is held
+/// for a whole write operation, and the 2026-07-31 design rejected the
+/// ordering fix precisely because a writer keeps its `Database` open for its
+/// entire session -- readers waiting on that would wait forever. This lock is
+/// held only across the two moments that actually collide: a reader's
+/// `Database::new` (shared) and the writer's explicit `CHECKPOINT`
+/// (exclusive).
+fn checkpoint_lock_path(db_path: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.ckpt.lock", db_path.display()))
+}
+
+/// How long a reader waits for an in-progress checkpoint before opening
+/// anyway. Checkpoints are short (the measured collision window is ~15 ms),
+/// so this is generous; on expiry the read proceeds unguarded rather than
+/// failing, because a wedged writer must not take reads down with it.
+const CHECKPOINT_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// WAL size above which the next write pauses to fold it into the base
+/// image. With `auto_checkpoint(false)` the database never checkpoints on
+/// its own, so this is the only thing keeping the WAL bounded -- and an
+/// unbounded WAL is the #100 runaway this codebase already has scars from.
+const CHECKPOINT_WAL_BYTES: u64 = 1024 * 1024;
+
 /// PID currently holding `lock_path`, if that process is still running.
 ///
 /// The complement of the dead-holder case `unclean_shutdown_wal_holder`
@@ -648,7 +673,22 @@ impl GraphStore {
             let _phase = crate::write_phase::enter(&"open graph (WAL replay)", 0);
             Database::new(
                 path,
-                SystemConfig::default().buffer_pool_size(write_buffer_pool_bytes()),
+                // Both settings, and neither is optional. The buffer-pool
+                // budget is what keeps a shared machine's daemon out of
+                // lbug's 0.8-of-physical-RAM auto-detect (two daemons were
+                // found at ~39GB); `buffer pool is full and no memory could
+                // be freed` showed up again in the 2026-09-09 incident, so
+                // dropping it here would re-open that runaway.
+                //
+                // Checkpoints must happen only inside `checkpoint_now`'s
+                // exclusive window (ladybug#666): a reader's `Database::new`
+                // racing one segfaults, measured at 13-15 ms before the WAL
+                // fold across three independent runs. An automatic
+                // checkpoint fires wherever Kuzu likes, which is necessarily
+                // outside any lock we hold.
+                SystemConfig::default()
+                    .buffer_pool_size(write_buffer_pool_bytes())
+                    .auto_checkpoint(false),
             )
             .map_err(|e| anyhow::anyhow!("failed to open kuzu db: {e}"))?
         };
@@ -728,6 +768,21 @@ impl GraphStore {
         let config = SystemConfig::default()
             .read_only(true)
             .buffer_pool_size(READ_ONLY_BUFFER_POOL_BYTES);
+        // Shared for the duration of the open only -- not the queries after
+        // it. This excludes an in-progress checkpoint and nothing else:
+        // other readers hold it concurrently, and a writer that is merely
+        // writing (not checkpointing) never takes it.
+        let _ckpt = match lockfile::acquire_shared(&checkpoint_lock_path(path), CHECKPOINT_WAIT) {
+            Ok(guard) => Some(guard),
+            Err(e) => {
+                // Never fail a read on this. The guard is an improvement on
+                // an unguarded open, not a precondition for one.
+                eprintln!(
+                    "warn: proceeding with an unguarded read open -- checkpoint lock unavailable: {e}"
+                );
+                None
+            }
+        };
         let db = Database::new(path, config).map_err(|e| {
             classify_read_only_open_failure(
                 format!("failed to open kuzu db (read-only): {e}"),
@@ -884,9 +939,61 @@ impl GraphStore {
         );
     }
 
+    /// Fold the WAL into the base image, holding the checkpoint lock
+    /// exclusively for exactly that window.
+    ///
+    /// Every write path reaches this through `write_lock`, which is the point:
+    /// hooking each write entry point individually is how a guard ends up
+    /// covering three of four call sites, which has happened four times in
+    /// this codebase already.
+    fn checkpoint_now(&self, db_path: &Path) -> Result<()> {
+        let _exclusive = lockfile::acquire(
+            &checkpoint_lock_path(db_path),
+            "graph-checkpoint",
+            CHECKPOINT_WAIT,
+        )?;
+        let _phase = crate::write_phase::enter(&"checkpoint", 0);
+        let conn = self.connection()?;
+        conn.query("CHECKPOINT")
+            .map_err(|e| anyhow::anyhow!("checkpoint failed: {e}"))?;
+        // The one moment the growth baseline can honestly be taken: the WAL
+        // has just been folded in, so the base image reflects real data.
+        // `stamp_healthy_graph_size`'s own doc asks for exactly this ("only
+        // after a *verified* healthy checkpoint"); before explicit
+        // checkpoints existed there was no such moment to hook.
+        if let Some(dir) = self.db_dir() {
+            super::store_util::stamp_healthy_graph_size_if_unset(dir, db_path);
+        }
+        Ok(())
+    }
+
+    /// Checkpoint if the WAL has grown past `CHECKPOINT_WAL_BYTES`.
+    ///
+    /// Called before handing out the write lock rather than after releasing
+    /// it: at that moment this thread is about to hold the lock anyway, so no
+    /// other writer is mid-operation, and a failure can still be reported.
+    fn checkpoint_if_wal_large(&self) {
+        let Some(dir) = self.db_dir() else { return };
+        let db_path = dir.join("graph");
+        let wal: u64 = wal_family_paths(&db_path)
+            .iter()
+            .filter_map(|p| std::fs::metadata(p).ok())
+            .map(|m| m.len())
+            .sum();
+        if wal < CHECKPOINT_WAL_BYTES {
+            return;
+        }
+        // Best-effort: a failed checkpoint must not fail the write. It
+        // leaves the WAL large, which the #100 growth breaker still guards.
+        if let Err(e) = self.checkpoint_now(&db_path) {
+            eprintln!("warn: {e}");
+        }
+    }
+
     /// Acquire exclusive write lock. Waits up to 30s, returning `Busy` if
     /// still held at expiry.
     pub fn write_lock(&self) -> Result<WriteLock> {
+        self.checkpoint_if_wal_large();
         WriteLock::acquire(&self.lock_path)
     }
 
