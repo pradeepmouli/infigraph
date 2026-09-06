@@ -1,4 +1,3 @@
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -9,18 +8,10 @@ use kuzu::Connection;
 use super::parquet_loader;
 use super::store::{GraphStore, WriteLock};
 use super::store_util::{
-    copy_edges_with_bad_record_retry, escape, fwd_slash_path, unwind_edges_from_pairs,
+    copy_edges_with_bad_record_retry, escape, fwd_slash_path, staging_parquet,
+    unwind_edges_from_pairs,
 };
 use crate::model::{FileExtraction, RelationKind};
-
-fn unique_tmp_dir() -> std::path::PathBuf {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let pid = std::process::id();
-    let dir = std::env::temp_dir().join(format!("infigraph_pq_{}_{}", pid, id));
-    let _ = std::fs::create_dir_all(&dir);
-    dir
-}
 
 impl GraphStore {
     /// Create Folder nodes and edges for a set of file paths in bulk.
@@ -55,7 +46,7 @@ impl GraphStore {
         }
 
         // Write Folder nodes to parquet
-        let folder_pq = unique_tmp_dir().join("infigraph_folders.parquet");
+        let folder_pq = staging_parquet("infigraph_folders");
         {
             let ids: Vec<&str> = all_folders.iter().map(|s| s.as_str()).collect();
             let names: Vec<&str> = all_folders
@@ -115,7 +106,7 @@ impl GraphStore {
 
         if copy_ok {
             // Write edge parquet files and COPY FROM
-            let cf_pq = unique_tmp_dir().join("infigraph_contains_folder.parquet");
+            let cf_pq = staging_parquet("infigraph_contains_folder");
             let cf_refs: Vec<(&str, &str)> = cf_pairs
                 .iter()
                 .map(|(a, b)| (a.as_str(), b.as_str()))
@@ -130,7 +121,7 @@ impl GraphStore {
             }
             let _ = std::fs::remove_file(&cf_pq);
 
-            let cfile_pq = unique_tmp_dir().join("infigraph_contains_file.parquet");
+            let cfile_pq = staging_parquet("infigraph_contains_file");
             let cfile_refs: Vec<(&str, &str)> = cfile_pairs
                 .iter()
                 .map(|(a, b)| (a.as_str(), b.as_str()))
@@ -201,8 +192,6 @@ impl GraphStore {
         if extractions.is_empty() {
             return Ok(());
         }
-
-        let tmp = unique_tmp_dir();
 
         let mut known_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
         for e in extractions {
@@ -417,7 +406,7 @@ impl GraphStore {
         }
 
         // Write node parquet files
-        let mod_pq = tmp.join("infigraph_index_modules.parquet");
+        let mod_pq = staging_parquet("infigraph_index_modules");
         parquet_loader::write_node_parquet(
             &mod_pq,
             &[
@@ -438,7 +427,7 @@ impl GraphStore {
             ],
         )?;
 
-        let file_pq = tmp.join("infigraph_index_files.parquet");
+        let file_pq = staging_parquet("infigraph_index_files");
         parquet_loader::write_node_parquet(
             &file_pq,
             &[
@@ -457,7 +446,7 @@ impl GraphStore {
             ],
         )?;
 
-        let sym_pq = tmp.join("infigraph_index_symbols.parquet");
+        let sym_pq = staging_parquet("infigraph_index_symbols");
         parquet_loader::write_node_parquet(
             &sym_pq,
             &[
@@ -508,7 +497,7 @@ impl GraphStore {
             fwd_slash_path(&sym_pq)
         )).map_err(|e| anyhow::anyhow!("COPY Symbol failed: {e}"))?;
 
-        let stmt_pq = tmp.join("infigraph_index_statements.parquet");
+        let stmt_pq = staging_parquet("infigraph_index_statements");
         if !stmt_ids.is_empty() {
             parquet_loader::write_node_parquet(
                 &stmt_pq,
@@ -556,7 +545,7 @@ impl GraphStore {
             if pairs.is_empty() {
                 continue;
             }
-            let edge_pq = tmp.join(format!("infigraph_index_{}.parquet", table.to_lowercase()));
+            let edge_pq = staging_parquet(&format!("infigraph_index_{}", table.to_lowercase()));
             copy_edges_with_bad_record_retry(
                 self,
                 table,
@@ -573,10 +562,7 @@ impl GraphStore {
                 continue;
             }
             let _ = super::schema::ensure_custom_edge_table(conn, edge_name);
-            let edge_pq = tmp.join(format!(
-                "infigraph_index_{}.parquet",
-                edge_name.to_lowercase()
-            ));
+            let edge_pq = staging_parquet(&format!("infigraph_index_{}", edge_name.to_lowercase()));
             copy_edges_with_bad_record_retry(
                 self,
                 edge_name,

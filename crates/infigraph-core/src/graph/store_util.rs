@@ -1,11 +1,51 @@
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Result;
 use kuzu::Connection;
 
 use crate::graph::parquet_loader;
 use crate::graph::store::GraphStore;
+
+/// A Parquet staging path for a bulk COPY, unique to this run.
+///
+/// Every bulk write here works the same way: serialise rows to a Parquet
+/// file, then `COPY FROM` it, then delete it. The file is therefore *live*
+/// between the write and the copy, and whoever owns the name owns those
+/// rows. Two writers sharing one filename each copy the other's data into
+/// their own graph and each delete a file the other is still reading.
+///
+/// This is not theoretical, and it is not confined to tests. The daemon's
+/// staleness-triggered SCIP enrichment runs alongside a user's
+/// `scip-enrich`, which is exactly why the INHERITS staging file was given
+/// a run-unique name (#139) -- but the symbol and call staging beside it
+/// kept fixed, machine-wide names, as did both resolve paths. The result
+/// was silent cross-contamination: a concurrent import's symbols landing
+/// wholesale in an unrelated graph, with no error anywhere, because the
+/// `symbols_added` count is taken from the in-memory batch and never from
+/// the file. CI surfaced it only as one test seeing another test's nodes.
+///
+/// Uniqueness comes from the pid (across processes), a monotonic counter
+/// (across threads and repeat calls within a process), and the wall clock
+/// (so a file orphaned by a crash cannot collide with a later run that
+/// recycles the pid). The caller removes the file once the COPY is done.
+///
+/// Prefer this to hand-rolling a unique name at the call site: fixing one
+/// site and leaving its neighbours is how the original bug survived in a
+/// file that already documented the hazard.
+pub fn staging_parquet(name: &str) -> PathBuf {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    std::env::temp_dir().join(format!(
+        "{name}.{}-{nanos}-{id}.parquet",
+        std::process::id()
+    ))
+}
 
 /// How many bad-record-drop-and-retry cycles a bulk COPY gets before giving
 /// up and falling back to the slow per-row UNWIND path for whatever remains.

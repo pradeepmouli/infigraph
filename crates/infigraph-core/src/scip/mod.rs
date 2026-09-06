@@ -11,6 +11,7 @@ use scip::types::{symbol_information, Index, SymbolRole};
 use crate::graph::parquet_loader;
 use crate::graph::store_util::{
     copy_edges_with_bad_record_retry, escape, extract_bad_copy_value, fwd_slash_path,
+    staging_parquet,
 };
 use crate::graph::GraphStore;
 use crate::model::{Span, SymbolKind};
@@ -423,8 +424,7 @@ pub fn import_scip_index_enriched_at(
     const CHUNK: usize = 2000;
     const MAX_SYMBOL_RETRIES: usize = 20;
     if !new_symbols.is_empty() {
-        let tmp = std::env::temp_dir();
-        let sym_pq = tmp.join("infigraph_scip_symbols.parquet");
+        let sym_pq = staging_parquet("infigraph_scip_symbols");
 
         let mut seen_ids = std::collections::HashSet::with_capacity(new_symbols.len());
         let mut remaining: Vec<_> = new_symbols
@@ -693,8 +693,7 @@ pub fn import_scip_index_enriched_at(
     // Bulk write CALLS edges via Parquet COPY FROM, dropping any bad-PK
     // record and retrying rather than falling back to UNWIND for the batch.
     if !calls_to_create.is_empty() {
-        let tmp = std::env::temp_dir();
-        let edge_pq = tmp.join("infigraph_scip_calls.parquet");
+        let edge_pq = staging_parquet("infigraph_scip_calls");
         stats.references_added = calls_to_create.len();
         let _phase =
             crate::write_phase::enter(&"scip-import: COPY CALLS", stats.references_added as u64);
@@ -755,14 +754,7 @@ pub fn import_scip_index_enriched_at(
         // staleness-triggered enrichment -- must not COPY from, or delete,
         // each other's edge file. `copy_edges_with_bad_record_retry` removes
         // it when done, so nothing accumulates on the happy path.
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let edge_pq = std::env::temp_dir().join(format!(
-            "infigraph_scip_inherits.{}.{nanos}.parquet",
-            std::process::id()
-        ));
+        let edge_pq = staging_parquet("infigraph_scip_inherits");
         stats.relations_added = inherits_to_create.len();
         let _phase =
             crate::write_phase::enter(&"scip-import: COPY INHERITS", stats.relations_added as u64);
@@ -1436,6 +1428,86 @@ mod tests {
             "no node should exist for the parameter descriptor, and its name must not \
              leak through as a raw unparsed moniker on any node"
         );
+    }
+
+    /// Regression: two SCIP imports running at the same time must not copy
+    /// each other's rows.
+    ///
+    /// The bulk symbol path writes a Parquet file and then `COPY FROM`s it,
+    /// so the file is live between those two steps. Both staging paths here
+    /// were fixed, machine-wide filenames, which made that window shared:
+    /// one import overwrote the file another was about to read, and the
+    /// second import's graph silently gained the first's symbols. CI found
+    /// it as one test observing a sibling test's nodes, but `cargo test`'s
+    /// threads are not the only concurrent writers -- the daemon's
+    /// staleness-triggered enrichment runs alongside a user's `scip-enrich`
+    /// (the same collision #139 fixed for the INHERITS file, and only that
+    /// file).
+    ///
+    /// Each thread imports into its own store with its own symbol names, so
+    /// any row from another thread is unambiguous contamination rather than
+    /// a timing artefact. The symbol count is well past the COPY threshold
+    /// to keep the write window wide enough to overlap.
+    #[test]
+    fn concurrent_imports_do_not_copy_each_others_symbols() {
+        const THREADS: usize = 4;
+        const SYMS: usize = 200;
+
+        let envs: Vec<TestEnv> = (0..THREADS).map(|_| TestEnv::new()).collect();
+        std::thread::scope(|scope| {
+            for (t, env) in envs.iter().enumerate() {
+                scope.spawn(move || {
+                    env.add_file("test.ts");
+                    let mut occurrences = Vec::with_capacity(SYMS);
+                    let mut symbols = Vec::with_capacity(SYMS);
+                    for i in 0..SYMS {
+                        let sym = format!("scip-test npm test 1.0.0 `test.ts`/t{t}s{i}().");
+                        occurrences.push(Occurrence {
+                            range: vec![i as i32, 0, 4],
+                            symbol: sym.clone(),
+                            symbol_roles: SymbolRole::Definition as i32,
+                            ..Default::default()
+                        });
+                        symbols.push(SymbolInformation {
+                            symbol: sym,
+                            ..Default::default()
+                        });
+                    }
+                    let index = Index {
+                        documents: vec![Document {
+                            relative_path: "test.ts".to_string(),
+                            occurrences,
+                            symbols,
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    };
+                    let path = env._dir.path().join("index.scip");
+                    std::fs::write(&path, index.write_to_bytes().unwrap()).unwrap();
+                    import_scip_index(&path, &env.store, None).unwrap();
+                });
+            }
+        });
+
+        for (t, env) in envs.iter().enumerate() {
+            let conn = env.store.connection().unwrap();
+            let rows = conn.query("MATCH (s:Symbol) RETURN s.name").unwrap();
+            let names: Vec<String> = rows
+                .into_iter()
+                .map(|row| row[0].to_string().trim_matches('"').to_string())
+                .collect();
+            let mine = format!("t{t}s");
+            let foreign: Vec<&String> = names.iter().filter(|n| !n.starts_with(&mine)).collect();
+            assert!(
+                foreign.is_empty(),
+                "import {t} copied another import's staging file: {foreign:?}"
+            );
+            assert_eq!(
+                names.len(),
+                SYMS,
+                "import {t} should hold exactly its own symbols"
+            );
+        }
     }
 
     #[test]

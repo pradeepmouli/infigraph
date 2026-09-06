@@ -4,7 +4,7 @@ use anyhow::Result;
 use rayon::prelude::*;
 
 use crate::graph::store::{GraphStore, WriteLock};
-use crate::graph::store_util::copy_edges_with_bad_record_retry;
+use crate::graph::store_util::{copy_edges_with_bad_record_retry, staging_parquet};
 use crate::learned::LearnedStore;
 use crate::model::{FileExtraction, RelationKind};
 
@@ -685,7 +685,7 @@ fn resolve_with_map(
             .into_iter()
             .map(|(a, b)| (a.clone(), b.clone()))
             .collect();
-        let pq_path = std::env::temp_dir().join("infigraph_resolve_calls.parquet");
+        let pq_path = staging_parquet("infigraph_resolve_calls");
         copy_edges_with_bad_record_retry(store, "CALLS", pairs, "Symbol", "Symbol", &pq_path)?;
     }
 
