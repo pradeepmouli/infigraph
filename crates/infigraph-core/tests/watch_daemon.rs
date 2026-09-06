@@ -626,17 +626,30 @@ fn watch_triggered_file_removal_contends_with_a_held_index_lock() {
     // first (as this test used to) left no way to tell "the watcher is not
     // subscribed yet" apart from "the watcher is subscribed and correctly
     // deferring" -- the very distinction the test rests on.
-    // Hold index.lock externally, simulating another in-flight operation
-    // (e.g. a concurrent `infigraph index --full`).
-    let held = infigraph_core::ops::begin_index_op(
+    //
+    // For the same reason, this waits rather than passing `Duration::ZERO`.
+    // The probe drives the indexing path, that path takes this very lock,
+    // and demanding it with no patience raced the watcher's still-draining
+    // probe work -- failing on Linux as "expected to acquire index.lock in
+    // this fresh test dir" when the directory was fresh and the lock simply
+    // was not free *yet*. This test needs to hold the lock across the
+    // removal below, which is the deferral it asserts; it never needed the
+    // lock to be free instantly. (The sibling test that keeps
+    // `Duration::ZERO` takes its lock before any watcher starts, where an
+    // occupied lock really would be a defect.)
+    let held_guard = match infigraph_core::ops::begin_index_op(
         project.path(),
         "test-holder",
-        std::time::Duration::ZERO,
-    )
-    .unwrap();
-    let held_guard = match held {
-        infigraph_core::ops::IndexOpOutcome::Acquired(g) => g,
-        _ => panic!("expected to acquire index.lock in this fresh test dir"),
+        std::time::Duration::from_secs(30),
+    ) {
+        Ok(infigraph_core::ops::IndexOpOutcome::Acquired(g)) => g,
+        // Unreachable while a non-zero wait blocks instead of reporting the
+        // holder -- matched so a later change to `begin_index_op` cannot
+        // quietly turn contention into a skipped assertion.
+        Ok(infigraph_core::ops::IndexOpOutcome::AlreadyRunning(holder)) => {
+            panic!("index.lock still held after 30s by {holder:?}")
+        }
+        Err(e) => panic!("could not acquire index.lock within 30s: {e}"),
     };
 
     std::fs::remove_file(&file_path).unwrap();

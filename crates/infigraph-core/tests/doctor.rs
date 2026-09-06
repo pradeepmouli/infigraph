@@ -735,8 +735,7 @@ fn check_disk_passes_above_10gb() {
 #[test]
 fn check_disk_below_warn_floor_writes_an_audit_log_entry() {
     let tmp = tempfile::tempdir().unwrap();
-    let old_home = std::env::var_os("HOME");
-    std::env::set_var("HOME", tmp.path());
+    let _home = HomeOverride::set(tmp.path());
 
     let ctx = DoctorContext {
         registry: infigraph_core::multi::Registry::default(),
@@ -748,9 +747,6 @@ fn check_disk_below_warn_floor_writes_an_audit_log_entry() {
     check_disk(&ctx);
 
     let content = std::fs::read_to_string(tmp.path().join(".infigraph/logs/audit.log")).unwrap();
-    if let Some(h) = old_home {
-        std::env::set_var("HOME", h);
-    }
 
     assert!(
         content.contains("role=disk") && content.contains("action=low-free-space"),
@@ -764,8 +760,7 @@ fn check_disk_below_warn_floor_writes_an_audit_log_entry() {
 #[test]
 fn check_disk_above_warn_floor_writes_no_audit_log_entry() {
     let tmp = tempfile::tempdir().unwrap();
-    let old_home = std::env::var_os("HOME");
-    std::env::set_var("HOME", tmp.path());
+    let _home = HomeOverride::set(tmp.path());
 
     let ctx = DoctorContext {
         registry: infigraph_core::multi::Registry::default(),
@@ -781,9 +776,6 @@ fn check_disk_above_warn_floor_writes_no_audit_log_entry() {
         && !std::fs::read_to_string(&audit_path)
             .unwrap_or_default()
             .is_empty();
-    if let Some(h) = old_home {
-        std::env::set_var("HOME", h);
-    }
 
     assert!(
         !exists_and_nonempty,
@@ -999,11 +991,56 @@ fn format_report_uses_plain_glyphs_by_color_flag() {
     assert!(colored.contains("1 PASS, 1 WARN, 1 FAIL"));
 }
 
-/// Serializes tests that mutate `INFIGRAPH_REGISTRY_INSTANCES_DIR` (process-global),
-/// mirroring the `ENV_LOCK` convention used by other integration test
-/// binaries in this workspace (e.g. `startup_watch.rs`) -- not reusable
-/// across files since each `tests/*.rs` compiles to its own crate.
+/// Serializes tests that mutate a process-global environment variable --
+/// `INFIGRAPH_REGISTRY_INSTANCES_DIR` and `HOME` -- mirroring the `ENV_LOCK`
+/// convention used by other integration test binaries in this workspace
+/// (e.g. `startup_watch.rs`); not reusable across files, since each
+/// `tests/*.rs` compiles to its own crate.
+///
+/// Poison-tolerant: one test panicking while holding this must not convert
+/// every later test in the binary into a second, misleading failure.
 static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Points `HOME` at `path` for as long as it is held, restoring the previous
+/// value on drop, and holds [`ENV_LOCK`] for that whole window.
+///
+/// Both parts are load-bearing. `HOME` is process-global, so two tests
+/// overriding it concurrently both write their audit log under whichever
+/// value won: one then reads a path that was never created ("No such file
+/// or directory"), and the other finds an audit entry it never asked for
+/// and fails accusing a healthy disk of writing one. Those are precisely
+/// the two `check_disk_*` audit tests, which between them failed on macOS
+/// in four of five consecutive CI runs.
+///
+/// Restoring on *drop* rather than at the end of the test body matters
+/// just as much: the previous code restored only after its assertions, so
+/// the first failure left `HOME` pointing into a deleted tempdir for every
+/// later test in this binary -- turning one real failure into a cascade.
+struct HomeOverride {
+    previous: Option<std::ffi::OsString>,
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+impl HomeOverride {
+    fn set(path: &std::path::Path) -> Self {
+        let guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::var_os("HOME");
+        std::env::set_var("HOME", path);
+        Self {
+            previous,
+            _guard: guard,
+        }
+    }
+}
+
+impl Drop for HomeOverride {
+    fn drop(&mut self) {
+        match self.previous.take() {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+}
 
 fn write_alive_watch_lock(lock_path: &std::path::Path) {
     let now = std::time::SystemTime::now()
