@@ -2,6 +2,22 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+/// Buffer-pool budget for a doc store.
+///
+/// The default is 0, meaning auto-detect a fraction of system RAM. Doc
+/// stores are opened per operation across the CLI, MCP tools and the doc
+/// watcher rather than held, so several can be live at once, and lbug treats
+/// `Database` instances as a bounded resource -- its own test config lowers
+/// `max_db_size` noting that it "limits the number of databases which can be
+/// open in a single process".
+///
+/// Unlike the graph's read-only budget this handle also serves bulk
+/// indexing, so it is set larger and was measured rather than assumed: the
+/// `combined_docs` + `doc_bm25_cache` suites, which do real doc indexing,
+/// showed no regression. The largest `docs.kuzu` on hand is ~70MB, so a
+/// realistic working set still fits entirely.
+const DOC_POOL_BYTES: u64 = 512 * 1024 * 1024;
+
 use anyhow::{Context, Result};
 use arrow::array::{Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -114,8 +130,11 @@ impl DocStore {
             .ok()
             .flatten();
 
-        let db = Database::new(path, SystemConfig::default())
-            .map_err(|e| anyhow::anyhow!("failed to open docs kuzu db: {e}"))?;
+        let db = Database::new(
+            path,
+            SystemConfig::default().buffer_pool_size(DOC_POOL_BYTES),
+        )
+        .map_err(|e| anyhow::anyhow!("failed to open docs kuzu db: {e}"))?;
         let store = Self {
             db,
             _db_guard: guard,

@@ -171,8 +171,24 @@ impl SessionStore {
         Ok(())
     }
 
+    /// Buffer-pool budget for the legacy sessions read. Small on purpose: this
+    /// runs one query against a small file, once, during migration.
+    const LEGACY_SESSION_READ_POOL_BYTES: u64 = 64 * 1024 * 1024;
+
     fn read_kuzu_sessions(db_path: &Path) -> Vec<SessionData> {
-        let db = match kuzu::Database::new(db_path, kuzu::SystemConfig::default()) {
+        // Read-only, and with a bounded pool. This is a one-off migration
+        // READ of a legacy store: opening it writable takes Kuzu's
+        // cross-process writer-exclusivity lock for no reason, and would
+        // create the database as a side effect if it were missing -- a read
+        // that creates a database is a bug, not a feature. `migrate_from_kuzu`
+        // already returns early unless the path exists, so read-only cannot
+        // fail here for want of creation. The default pool is auto-detected
+        // from system RAM, which is wildly out of proportion for one query
+        // against a legacy sessions file.
+        let config = kuzu::SystemConfig::default()
+            .read_only(true)
+            .buffer_pool_size(Self::LEGACY_SESSION_READ_POOL_BYTES);
+        let db = match kuzu::Database::new(db_path, config) {
             Ok(db) => db,
             Err(_) => return Vec::new(),
         };
