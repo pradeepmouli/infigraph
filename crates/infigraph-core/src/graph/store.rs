@@ -277,6 +277,30 @@ fn hard_exit_explanation(db_path: &Path, pid: u32) -> String {
     }
 }
 
+/// Buffer-pool budget for a read-only open.
+///
+/// `SystemConfig`'s default is 0, meaning "auto-detect" -- a fraction of
+/// system RAM, sized for a long-lived database. Read handles here are the
+/// opposite: short-lived and opened per read, because a held read-only
+/// `Database` never observes another process's later commits and so cannot
+/// be reused (see `DaemonKuzuBackend::open_read`; measured directly -- a
+/// cached handle saw 2 distinct values of a symbol the writer renamed on
+/// every iteration, where per-read reopening saw 104-121).
+///
+/// lbug treats `Database` instances as a bounded resource for exactly this
+/// reason: its own test config lowers `max_db_size` with the note that it
+/// "limits the number of databases which can be open in a single process".
+/// Leaving every short-lived reader to claim an auto-sized pool is the same
+/// resource class as the "Buffer manager exception: Mmap for size ... failed"
+/// failures seen under parallel test runs, and as the buffer-pool exhaustion
+/// that killed a daemon before the 0.20.2 bump.
+///
+/// 256MB is a budget, not a cap on graph size: the pool is a cache over the
+/// file, so a larger graph still reads correctly, just with more I/O once
+/// the working set exceeds it. The largest graphs on this machine are
+/// ~160MB, so a realistic working set still fits entirely.
+const READ_ONLY_BUFFER_POOL_BYTES: u64 = 256 * 1024 * 1024;
+
 /// PID currently holding `lock_path`, if that process is still running.
 ///
 /// The complement of the dead-holder case `unclean_shutdown_wal_holder`
@@ -609,7 +633,9 @@ impl GraphStore {
         // `throw_on_wal_replay_failure` defaults to true (unset here): a WAL
         // replay failure now surfaces as an error instead of being silently
         // tolerated and served as a torn base image.
-        let config = SystemConfig::default().read_only(true);
+        let config = SystemConfig::default()
+            .read_only(true)
+            .buffer_pool_size(READ_ONLY_BUFFER_POOL_BYTES);
         let db = Database::new(path, config).map_err(|e| {
             classify_read_only_open_failure(
                 format!("failed to open kuzu db (read-only): {e}"),

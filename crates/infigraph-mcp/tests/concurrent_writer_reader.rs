@@ -61,6 +61,12 @@ struct ReaderCounts {
     correct: usize,
     clean_errors: usize,
     wrong: usize,
+    /// Distinct `churn_fn_N` symbols the reader observed. The writer renames
+    /// that symbol every iteration, so this is the freshness signal:
+    /// `correct` counts only `stable_marker_fn`, which is present in every
+    /// version of the graph and therefore cannot distinguish a current read
+    /// from a stale snapshot.
+    distinct_churn: usize,
 }
 
 /// Re-exec helper: the reader half, in its own process.
@@ -81,6 +87,7 @@ fn concurrent_reader_helper() {
 
     let mut counts = ReaderCounts::default();
     let mut samples: Vec<String> = Vec::new();
+    let mut seen_churn: std::collections::HashSet<String> = std::collections::HashSet::new();
     let deadline = Instant::now() + READER_CEILING;
 
     // Progress goes to STDERR, deliberately, and one line per phase.
@@ -107,6 +114,18 @@ fn concurrent_reader_helper() {
                 match reader.get_symbols_for_search() {
                     Ok(rows) if rows.iter().any(|r| r[1] == "stable_marker_fn") => {
                         counts.correct += 1;
+                        // Freshness probe: the writer renames the churn symbol
+                        // on every iteration, so the number of DISTINCT churn
+                        // names this reader observes says whether it is seeing
+                        // new commits or replaying one snapshot.
+                        // `stable_marker_fn` alone cannot tell those apart --
+                        // it is present in every version of the graph, stale
+                        // or current.
+                        for r in &rows {
+                            if r[1].starts_with("churn_fn_") {
+                                seen_churn.insert(r[1].clone());
+                            }
+                        }
                     }
                     Ok(rows) => {
                         counts.wrong += 1;
@@ -143,8 +162,12 @@ fn concurrent_reader_helper() {
     // Machine-readable single line: the parent asserts on these numbers, so
     // they have to survive the harness's output handling intact.
     println!(
-        "READER_RESULT attempts={} correct={} clean_errors={} wrong={}",
-        counts.attempts, counts.correct, counts.clean_errors, counts.wrong
+        "READER_RESULT attempts={} correct={} clean_errors={} wrong={} distinct_churn={}",
+        counts.attempts,
+        counts.correct,
+        counts.clean_errors,
+        counts.wrong,
+        seen_churn.len()
     );
     for s in &samples {
         println!("READER_SAMPLE {s}");
@@ -171,6 +194,7 @@ fn parse_counts(stdout: &str) -> Option<ReaderCounts> {
             "correct" => c.correct = v,
             "clean_errors" => c.clean_errors = v,
             "wrong" => c.wrong = v,
+            "distinct_churn" => c.distinct_churn = v,
             _ => {}
         }
     }
@@ -271,8 +295,8 @@ fn concurrent_writer_reader_raw_query_correctness_under_load() {
 
     println!(
         "RESULT: {} concurrent read attempts (separate process) while writer actively reindexed \
-         -- {} correct, {} clean errors, {} silently wrong",
-        counts.attempts, counts.correct, counts.clean_errors, counts.wrong
+         -- {} correct, {} clean errors, {} silently wrong, {} distinct churn symbols seen",
+        counts.attempts, counts.correct, counts.clean_errors, counts.wrong, counts.distinct_churn
     );
     for line in stdout
         .lines()
