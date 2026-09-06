@@ -50,6 +50,16 @@ const WRITE_WINDOW: Duration = Duration::from_secs(6);
 /// sentinel cannot leave it running forever.
 const READER_CEILING: Duration = Duration::from_secs(60);
 
+/// Wall-clock microseconds. The reader child and the checkpoint sampler run
+/// in different processes, so only an absolute clock can line their events
+/// up; `Instant` cannot cross a process boundary.
+fn now_micros() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_micros()
+}
+
 fn write_fixture(dir: &Path, filename: &str, content: &str) {
     std::fs::write(dir.join(filename), content).expect("write fixture file");
 }
@@ -107,10 +117,18 @@ fn concurrent_reader_helper() {
     // last surviving line names is where it died.
     while !stop.exists() && Instant::now() < deadline {
         counts.attempts += 1;
-        eprintln!("READER_AT n={} phase=open", counts.attempts);
+        eprintln!(
+            "READER_AT n={} phase=open t={}",
+            counts.attempts,
+            now_micros()
+        );
         match KuzuBackend::open_read_only(&db_path) {
             Ok(reader) => {
-                eprintln!("READER_AT n={} phase=query", counts.attempts);
+                eprintln!(
+                    "READER_AT n={} phase=query t={}",
+                    counts.attempts,
+                    now_micros()
+                );
                 match reader.get_symbols_for_search() {
                     Ok(rows) if rows.iter().any(|r| r[1] == "stable_marker_fn") => {
                         counts.correct += 1;
@@ -143,7 +161,11 @@ fn concurrent_reader_helper() {
                         }
                     }
                 }
-                eprintln!("READER_AT n={} phase=drop", counts.attempts);
+                eprintln!(
+                    "READER_AT n={} phase=drop t={}",
+                    counts.attempts,
+                    now_micros()
+                );
                 drop(reader);
             }
             Err(e) => {
@@ -235,6 +257,43 @@ fn concurrent_writer_reader_raw_query_correctness_under_load() {
         );
     }
 
+    // --- Checkpoint sampler ---
+    //
+    // The question this instrumentation exists to answer: does the reader die
+    // *inside* a checkpoint? ladybug#666 describes the hazard as the writer's
+    // checkpoint shrinking or reusing pages under a reader, and our crash is
+    // always at `phase=open` -- consistent with that, but consistent is not
+    // proven, and the whole shape of any fix (a shared lock held only across
+    // `Database::new`, with the writer taking it exclusively only to
+    // checkpoint) depends on the answer.
+    //
+    // Kuzu checkpoints on its own schedule, so this observes rather than
+    // controls: a checkpoint folds the WAL into the base image and truncates
+    // it, so a sharp drop in `graph.wal` is a checkpoint completing. Sampling
+    // is passive -- no lock, no query, nothing that would perturb the race
+    // being measured.
+    let wal_path = std::path::PathBuf::from(format!("{}.wal", db_path.display()));
+    let checkpoints: std::sync::Arc<std::sync::Mutex<Vec<(u128, u64, u64)>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sampler_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let sampler = {
+        let checkpoints = std::sync::Arc::clone(&checkpoints);
+        let stop = std::sync::Arc::clone(&sampler_stop);
+        std::thread::spawn(move || {
+            let mut last: u64 = 0;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let now = std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
+                // A fold: the WAL shrank materially. Anything else is growth
+                // from ordinary commits and is not a checkpoint.
+                if now + 4096 < last {
+                    checkpoints.lock().unwrap().push((now_micros(), last, now));
+                }
+                last = now;
+                std::thread::sleep(Duration::from_micros(200));
+            }
+        })
+    };
+
     // --- Reader: a separate process, started before the writer so its reads
     // straddle the whole write window. ---
     let reader_child = std::process::Command::new(std::env::current_exe().unwrap())
@@ -282,11 +341,45 @@ fn concurrent_writer_reader_raw_query_correctness_under_load() {
     // line names the attempt and the phase it died in.
     let stderr = tail(&stderr_full, 12);
 
-    assert!(
-        out.status.success(),
-        "the reader process must exit cleanly -- a crash here is the finding, not a flake.\n\
-         status: {:?}\nstdout:\n{stdout}\nstderr:\n{stderr}",
-        out.status
+    sampler_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = sampler.join();
+    let checkpoints = checkpoints.lock().unwrap().clone();
+
+    if !out.status.success() {
+        // Correlate: how close was the reader's last breadcrumb to a
+        // checkpoint? If crashes cluster inside checkpoint windows, a shared
+        // lock around `Database::new` (writer exclusive only while
+        // checkpointing) is justified. If they scatter, that design is wrong
+        // and this says so before anyone builds it.
+        let died_at: Option<u128> = stderr_full
+            .lines()
+            .rev()
+            .find_map(|l| l.rsplit_once("t=").and_then(|(_, t)| t.trim().parse().ok()));
+        let nearest = died_at.and_then(|d| {
+            checkpoints
+                .iter()
+                .map(|(t, _, _)| (d as i128 - *t as i128).abs())
+                .min()
+        });
+        panic!(
+            "the reader process must exit cleanly -- a crash here is the finding, not a flake.\n\
+             status: {:?}\n\
+             CHECKPOINT CORRELATION: died_at={died_at:?} us, {} checkpoint(s) observed, \
+             nearest checkpoint {} us away\n\
+             checkpoints (t, wal_before, wal_after): {:?}\n\
+             stdout:\n{stdout}\nstderr:\n{stderr}",
+            out.status,
+            checkpoints.len(),
+            nearest
+                .map(|d| d.to_string())
+                .unwrap_or_else(|| "n/a".to_string()),
+            checkpoints.iter().rev().take(8).collect::<Vec<_>>(),
+        );
+    }
+
+    println!(
+        "CHECKPOINTS OBSERVED: {} (wal folds during the write window)",
+        checkpoints.len()
     );
 
     let counts = parse_counts(&stdout).unwrap_or_else(|| {
