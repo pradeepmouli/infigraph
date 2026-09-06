@@ -319,25 +319,57 @@ pub(crate) fn resolve_import_candidate<'a>(
 /// it, which wedged a sittir SCIP import at 100% CPU for 15+ minutes on a
 /// 130k-symbol graph (500 pairs x |A| x |B| per chunk).
 pub(crate) fn unwind_edges_from_pairs(
+    store: &GraphStore,
     conn: &Connection,
     pairs: &[(&str, &str)],
     rel_type: &str,
     src_label: &str,
     dst_label: &str,
-) {
+) -> Result<()> {
     const CHUNK: usize = 500;
+    // Re-check growth per chunk, like every other long write loop here
+    // (#132 gap 1). This loop had no gate at all, which is the one place it
+    // was least affordable: by its own contract above it runs on the
+    // batches COPY could not take -- the largest ones -- and it reaches
+    // them precisely when something is already wrong, which on sittir was
+    // `COPY ... failed (Transaction committed successfully, but the
+    // post-commit checkpoint failed)`. A graph that cannot checkpoint is
+    // exactly the graph that must not be handed thousands more writes: it
+    // grew to 39 GB, 643x its 65 MB baseline, and was quarantined and
+    // dropped whole (41 GB) twice in two days. The gate could not be added
+    // by accident, either -- this took only a `&Connection`, so it had no
+    // way to reach the store the check needs.
+    let mut gate = store.growth_gate(1);
+    let mut failed = 0usize;
+    let mut sent = 0usize;
     for chunk in pairs.chunks(CHUNK) {
+        gate.tick()?;
+        sent += 1;
         let pair_list: Vec<String> = chunk
             .iter()
             .map(|(a, b)| format!("{{a: '{}', b: '{}'}}", escape(a), escape(b)))
             .collect();
-        let _ = conn.query(&pair_edge_statement(
-            src_label,
-            dst_label,
-            rel_type,
-            &pair_list.join(", "),
-        ));
+        // Per-chunk failures stay non-fatal: this is the terminal
+        // fallback and a chunk can legitimately fail on a bad endpoint.
+        // But counting them turns "silently wrote nothing, at length" into
+        // something a log can show -- every chunk failing looks identical
+        // to success today.
+        if conn
+            .query(&pair_edge_statement(
+                src_label,
+                dst_label,
+                rel_type,
+                &pair_list.join(", "),
+            ))
+            .is_err()
+        {
+            failed += 1;
+        }
     }
+    if failed > 0 {
+        eprintln!("warn: UNWIND fallback for {rel_type}: {failed}/{sent} chunk(s) failed");
+    }
+    Ok(())
 }
 
 /// The COPY error Kuzu reports when an edge endpoint names no row in the
@@ -518,9 +550,9 @@ pub(crate) fn copy_edges_with_bad_record_retry(
         .iter()
         .map(|(a, b)| (a.as_str(), b.as_str()))
         .collect();
-    unwind_edges_from_pairs(&conn, &refs, table, src_label, dst_label);
+    let outcome = unwind_edges_from_pairs(store, &conn, &refs, table, src_label, dst_label);
     let _ = std::fs::remove_file(edge_pq);
-    Ok(())
+    outcome
 }
 
 /// The statement that creates one edge per `{a: <src id>, b: <dst id>}`
@@ -614,11 +646,13 @@ pub fn classify_file(file: &str) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use crate::GraphStore;
+
     use super::{
         check_disk_headroom, check_graph_growth_ratio, classify_file,
         copy_edges_with_bad_record_retry, extract_bad_copy_value, prefilter_pairs_against_existing,
         read_healthy_size, resolve_import_candidate, stamp_healthy_graph_size,
-        stamp_healthy_graph_size_if_unset, MAX_BAD_RECORD_RETRIES,
+        stamp_healthy_graph_size_if_unset, unwind_edges_from_pairs, MAX_BAD_RECORD_RETRIES,
     };
 
     /// A store holding Symbol nodes `s0..s{n}` and nothing else.
@@ -737,6 +771,45 @@ mod tests {
         std::fs::write(&graph_path, vec![0u8; 999_999]).unwrap();
         stamp_healthy_graph_size_if_unset(tmp.path(), &graph_path);
         assert_eq!(read_healthy_size(tmp.path()), Some(1024));
+    }
+
+    /// The runaway that reached 39 GB got there through this fallback.
+    ///
+    /// `copy_edges_with_bad_record_retry` re-checks growth on every COPY
+    /// attempt, but its terminal UNWIND fallback ran outside that gate --
+    /// and the fallback is reached exactly when the graph is already
+    /// misbehaving (on sittir, a COPY whose post-commit checkpoint failed).
+    /// So the one path that ran on the largest batches, at the worst moment,
+    /// was the one path with no brake. It must refuse, not write through.
+    #[test]
+    fn the_unwind_fallback_refuses_rather_than_writing_through_runaway_growth() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("graph");
+        let store = GraphStore::open(&db_path).unwrap();
+        let conn = store.connection().unwrap();
+
+        // A deliberately tiny baseline, so the real graph is already far past
+        // the 10x cap -- honest and cheap, versus staging gigabytes on disk.
+        std::fs::write(
+            dir.path().join("graph.health.json"),
+            r#"{"healthy_size_bytes": 1024}"#,
+        )
+        .unwrap();
+
+        let pairs: Vec<(String, String)> = (0..600)
+            .map(|i| (format!("a{i}"), format!("b{i}")))
+            .collect();
+        let refs: Vec<(&str, &str)> = pairs
+            .iter()
+            .map(|(a, b)| (a.as_str(), b.as_str()))
+            .collect();
+
+        let err = unwind_edges_from_pairs(&store, &conn, &refs, "CALLS", "Symbol", "Symbol")
+            .expect_err("the fallback must refuse once the graph is past the growth cap");
+        assert!(
+            err.to_string().contains("refusing to index"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

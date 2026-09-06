@@ -117,7 +117,14 @@ impl GraphStore {
                 fwd_slash_path(&cf_pq)
             )) {
                 eprintln!("warn: COPY CONTAINS_FOLDER failed ({e}), using UNWIND fallback");
-                unwind_edges_from_pairs(conn, &cf_refs, "CONTAINS_FOLDER", "Folder", "Folder");
+                unwind_edges_from_pairs(
+                    self,
+                    conn,
+                    &cf_refs,
+                    "CONTAINS_FOLDER",
+                    "Folder",
+                    "Folder",
+                )?;
             }
             let _ = std::fs::remove_file(&cf_pq);
 
@@ -132,7 +139,14 @@ impl GraphStore {
                 fwd_slash_path(&cfile_pq)
             )) {
                 eprintln!("warn: COPY CONTAINS_FILE failed ({e}), using UNWIND fallback");
-                unwind_edges_from_pairs(conn, &cfile_refs, "CONTAINS_FILE", "Folder", "File");
+                unwind_edges_from_pairs(
+                    self,
+                    conn,
+                    &cfile_refs,
+                    "CONTAINS_FILE",
+                    "Folder",
+                    "File",
+                )?;
             }
             let _ = std::fs::remove_file(&cfile_pq);
         } else {
@@ -160,12 +174,12 @@ impl GraphStore {
                 .iter()
                 .map(|(a, b)| (a.as_str(), b.as_str()))
                 .collect();
-            unwind_edges_from_pairs(conn, &cf_refs, "CONTAINS_FOLDER", "Folder", "Folder");
+            unwind_edges_from_pairs(self, conn, &cf_refs, "CONTAINS_FOLDER", "Folder", "Folder")?;
             let cfile_refs: Vec<(&str, &str)> = cfile_pairs
                 .iter()
                 .map(|(a, b)| (a.as_str(), b.as_str()))
                 .collect();
-            unwind_edges_from_pairs(conn, &cfile_refs, "CONTAINS_FILE", "Folder", "File");
+            unwind_edges_from_pairs(self, conn, &cfile_refs, "CONTAINS_FILE", "Folder", "File")?;
         }
 
         let _ = std::fs::remove_file(&folder_pq);
