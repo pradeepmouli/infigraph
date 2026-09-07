@@ -320,6 +320,57 @@ fn hard_exit_explanation(db_path: &Path, pid: u32) -> String {
 /// ~160MB, so a realistic working set still fits entirely.
 const READ_ONLY_BUFFER_POOL_BYTES: u64 = 256 * 1024 * 1024;
 
+/// Buffer-pool budget for a WRITE open.
+///
+/// The write handle used to take `SystemConfig::default()`, and lbug reads a
+/// `bufferPoolSize` of 0 as "auto-detect": `main/database.cpp` multiplies
+/// physical memory by `BufferPoolConstants::DEFAULT_PHY_MEM_SIZE_RATIO_FOR_BM`,
+/// which `common/constants.h` defines as **0.8**. That is a reasonable default
+/// for a database process that owns its machine, and a bad one for a watch
+/// daemon that shares it with an editor, a compiler and several other daemons.
+///
+/// It is also, precisely, the runaway: 0.8 x 48GB = 38.4GB on the machine where
+/// two daemons were found at ~39GB, each preceded in the log by "buffer pool is
+/// full and no memory could be freed". A restarted daemon was measured climbing
+/// 160MB -> 4.78GB in 18 minutes on the way there, while two sibling daemons
+/// with smaller working sets sat at ~0.3GB and never grew into the pool.
+///
+/// Like [`READ_ONLY_BUFFER_POOL_BYTES`] this is a budget, not a cap on graph
+/// size -- the pool is a cache over the file, so a graph larger than the budget
+/// still reads and writes correctly, just with more I/O once the working set
+/// exceeds it. 2GB is deliberately roomier than the 256MB read budget, since a
+/// write also carries COPY staging and index-build working set, and it is still
+/// more than 12x the largest graph on this machine (~160MB).
+///
+/// Override with [`WRITE_BUFFER_POOL_ENV`] for a genuinely large repository on
+/// a machine that can afford it.
+const WRITE_BUFFER_POOL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Override for [`WRITE_BUFFER_POOL_BYTES`], in megabytes.
+const WRITE_BUFFER_POOL_ENV: &str = "INFIGRAPH_WRITE_BUFFER_POOL_MB";
+
+/// Parse [`WRITE_BUFFER_POOL_ENV`]. Pure so it is testable without racing
+/// every other test that touches the process environment.
+///
+/// Anything unparseable or zero falls back to the default rather than reaching
+/// lbug, because zero is exactly the value that means "auto-detect" -- a typo
+/// in the override must not silently restore the 0.8-of-RAM behaviour this
+/// constant exists to prevent.
+fn parse_write_buffer_pool(raw: Option<&str>) -> u64 {
+    match raw.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(s) => match s.parse::<u64>() {
+            Ok(mb) if mb > 0 => mb.saturating_mul(1024 * 1024),
+            _ => WRITE_BUFFER_POOL_BYTES,
+        },
+        None => WRITE_BUFFER_POOL_BYTES,
+    }
+}
+
+/// [`WRITE_BUFFER_POOL_BYTES`], with [`WRITE_BUFFER_POOL_ENV`] applied.
+fn write_buffer_pool_bytes() -> u64 {
+    parse_write_buffer_pool(std::env::var(WRITE_BUFFER_POOL_ENV).ok().as_deref())
+}
+
 /// PID currently holding `lock_path`, if that process is still running.
 ///
 /// The complement of the dead-holder case `unclean_shutdown_wal_holder`
@@ -587,8 +638,11 @@ impl GraphStore {
             // Opening replays the WAL and may checkpoint -- transaction-
             // manager code with no Rust frame above it to catch anything.
             let _phase = crate::write_phase::enter(&"open graph (WAL replay)", 0);
-            Database::new(path, SystemConfig::default())
-                .map_err(|e| anyhow::anyhow!("failed to open kuzu db: {e}"))?
+            Database::new(
+                path,
+                SystemConfig::default().buffer_pool_size(write_buffer_pool_bytes()),
+            )
+            .map_err(|e| anyhow::anyhow!("failed to open kuzu db: {e}"))?
         };
         refuse_newer_schema(&db, path)?;
         let store = Self { db, lock_path };
@@ -1984,5 +2038,43 @@ mod tests {
         drop(GraphStore::open(&db_path).unwrap());
 
         GraphStore::open_read_only(&db_path).unwrap();
+    }
+
+    /// The write pool must never be left at lbug's auto-detected size.
+    ///
+    /// A `bufferPoolSize` of 0 makes lbug take 0.8 x physical memory
+    /// (`DEFAULT_PHY_MEM_SIZE_RATIO_FOR_BM` in `common/constants.h`). On the
+    /// 48GB machine where this was found that is 38.4GB, and two daemons were
+    /// caught at ~39GB. So zero is not merely a small value here -- it is the
+    /// one value that restores the bug.
+    #[test]
+    fn a_write_pool_override_never_resolves_to_lbugs_auto_detect() {
+        // Absent, empty and whitespace: the default, not 0.
+        for raw in [None, Some(""), Some("   ")] {
+            assert_eq!(parse_write_buffer_pool(raw), WRITE_BUFFER_POOL_BYTES);
+        }
+        // Unparseable or explicitly zero must fall back, NOT pass 0 through:
+        // a typo in the override must not silently re-enable 0.8-of-RAM.
+        for raw in ["0", "nonsense", "-1", "2.5", "512MB"] {
+            assert_eq!(
+                parse_write_buffer_pool(Some(raw)),
+                WRITE_BUFFER_POOL_BYTES,
+                "{raw:?} must fall back to the default"
+            );
+        }
+        assert_ne!(
+            WRITE_BUFFER_POOL_BYTES, 0,
+            "the default itself must never be lbug's auto-detect sentinel"
+        );
+    }
+
+    /// A valid override is honoured, in megabytes, without overflowing.
+    #[test]
+    fn a_valid_write_pool_override_is_honoured_in_megabytes() {
+        assert_eq!(parse_write_buffer_pool(Some("512")), 512 * 1024 * 1024);
+        assert_eq!(parse_write_buffer_pool(Some(" 64 ")), 64 * 1024 * 1024);
+        // Absurd input saturates rather than wrapping to something small --
+        // wrapping could land back near zero and re-enable auto-detect.
+        assert!(parse_write_buffer_pool(Some(&u64::MAX.to_string())) > WRITE_BUFFER_POOL_BYTES);
     }
 }
