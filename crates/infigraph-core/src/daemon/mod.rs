@@ -307,6 +307,94 @@ fn root_is_gone(root: &Path, original: Option<DirectoryIdentity>) -> bool {
 /// `docs_control` lets a caller that owns a doc-watch loop (the CLI daemon)
 /// have `WatchControl { role: Docs, .. }` requests dispatched to it; `None`
 /// answers those requests with an error instead.
+/// Markers that make a directory a *project* rather than a place projects
+/// live. Deliberately broader than "has a `.git` directory", which would be
+/// wrong twice over: a git worktree's `.git` is a FILE, not a directory (this
+/// repo's own `scratchpad/wt-*` worktrees are indexed), and a subdirectory of
+/// a repo has no `.git` at all yet is a perfectly ordinary root to index
+/// (`crates/infigraph-mcp` here has its own graph).
+fn looks_like_a_project(dir: &Path) -> bool {
+    // A VCS marker in any form -- `.git` may be a directory (clone) or a file
+    // (worktree, submodule).
+    for vcs in [".git", ".hg", ".svn", ".jj"] {
+        if dir.join(vcs).exists() {
+            return true;
+        }
+    }
+    for manifest in [
+        "Cargo.toml",
+        "package.json",
+        "pyproject.toml",
+        "setup.py",
+        "go.mod",
+        "pom.xml",
+        "build.gradle",
+        "build.gradle.kts",
+        "composer.json",
+        "Gemfile",
+        "mix.exs",
+        "CMakeLists.txt",
+    ] {
+        if dir.join(manifest).is_file() {
+            return true;
+        }
+    }
+    // Already indexed on purpose at some point -- respect that decision.
+    dir.join(".infigraph").join("graph").exists()
+}
+
+/// Set to bypass [`ensure_watchable_root`] for a root that really is meant to
+/// be watched as one project despite containing several.
+pub const ALLOW_CONTAINER_ROOT_ENV: &str = "INFIGRAPH_ALLOW_CONTAINER_ROOT";
+
+/// Refuse to watch a directory that is a *container of projects* rather than a
+/// project.
+///
+/// A stale MCP instance was found on this machine rooted at
+/// `~/GitHub.nosync` -- 57 sibling repositories -- where it would treat the
+/// whole tree as a single project: one graph spanning everything, every
+/// repo's `node_modules` and `target` reachable, and each repo's own
+/// `.gitignore` out of scope because the root is above all of them.
+///
+/// The check is deliberately NOT "does this have a `.git` directory". That
+/// test rejects worktrees (whose `.git` is a file) and repo subdirectories
+/// (which have none), both of which are indexed here today. What actually
+/// went wrong is narrower and is what this tests for: the root is not itself
+/// a project, yet several of its immediate children are.
+///
+/// One child is allowed: a directory holding a single project is an ordinary
+/// way to lay out a checkout, and refusing it would be surprising.
+pub fn ensure_watchable_root(root: &Path) -> Result<()> {
+    if std::env::var_os(ALLOW_CONTAINER_ROOT_ENV).is_some() || looks_like_a_project(root) {
+        return Ok(());
+    }
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Ok(()); // unreadable is someone else's error to report
+    };
+    let mut children: Vec<String> = entries
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .filter(|e| looks_like_a_project(&e.path()))
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    if children.len() < 2 {
+        return Ok(());
+    }
+    children.sort();
+    let shown: Vec<&str> = children.iter().take(3).map(|s| s.as_str()).collect();
+    anyhow::bail!(
+        "refusing to watch {} -- it is not a project itself, but {} of its subdirectories are \
+         ({}{}). Watching it would index them all into one graph, with each project's own \
+         ignore rules out of scope. Point the watcher at a project, or set {}=1 if this really \
+         is meant to be one project.",
+        root.display(),
+        children.len(),
+        shown.join(", "),
+        if children.len() > 3 { ", ..." } else { "" },
+        ALLOW_CONTAINER_ROOT_ENV,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn run_write_coordinator<MR, F>(
     root: &Path,
@@ -331,6 +419,13 @@ where
     // under /var, itself a symlink to /private/var), `path.strip_prefix(root)`
     // below silently fails for every event and all changes are dropped.
     let root = &root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+
+    // Before anything else: a root that is really a folder of repositories
+    // must not become one graph. Checked here rather than at each caller --
+    // `watch_project`, `watch_project_auto_resolve` and the daemon all funnel
+    // through this function, and guarding call sites individually is how a
+    // guard ends up covering three of four of them.
+    ensure_watchable_root(root)?;
 
     // Build the registry ONCE for the whole watch session (#58): it serves
     // both file-extension filtering here and every `watch_db` open below
@@ -2698,6 +2793,80 @@ mod tests {
         let s = scip_settings();
         assert_eq!(s.index_staleness_threshold, 50);
         assert_eq!(s.index_staleness_check_secs, 300);
+    }
+}
+
+#[cfg(test)]
+mod watchable_root_tests {
+    use super::{ensure_watchable_root, ALLOW_CONTAINER_ROOT_ENV};
+
+    fn project(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+        let p = dir.join(name);
+        std::fs::create_dir_all(&p).unwrap();
+        std::fs::write(p.join("Cargo.toml"), "[package]\n").unwrap();
+        p
+    }
+
+    /// The case this exists for: a stale instance was found rooted at
+    /// `~/GitHub.nosync`, 57 sibling repositories, which it would have
+    /// indexed as one project.
+    #[test]
+    fn a_directory_of_several_projects_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        project(tmp.path(), "repo-a");
+        project(tmp.path(), "repo-b");
+        let err = ensure_watchable_root(tmp.path())
+            .expect_err("a folder holding several projects must not be watched as one");
+        let msg = err.to_string();
+        assert!(msg.contains("repo-a") && msg.contains("repo-b"), "{msg}");
+        assert!(
+            msg.contains(ALLOW_CONTAINER_ROOT_ENV),
+            "must name the override: {msg}"
+        );
+    }
+
+    /// A git WORKTREE's `.git` is a file, not a directory. This repo indexes
+    /// its own `scratchpad/wt-*` worktrees, so a naive `is_dir` test on
+    /// `.git` would refuse roots that work today.
+    #[test]
+    fn a_worktree_whose_dot_git_is_a_file_is_allowed() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join(".git"),
+            "gitdir: /elsewhere/.git/worktrees/wt",
+        )
+        .unwrap();
+        project(tmp.path(), "child-a");
+        project(tmp.path(), "child-b");
+        ensure_watchable_root(tmp.path())
+            .expect("a worktree is a project even though its .git is a file");
+    }
+
+    /// A subdirectory of a repo has no VCS marker at all and is still an
+    /// ordinary root -- `crates/infigraph-mcp` in this very workspace is
+    /// indexed that way.
+    #[test]
+    fn a_repo_subdirectory_with_only_a_manifest_is_allowed() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("Cargo.toml"), "[package]\n").unwrap();
+        project(tmp.path(), "sub-a");
+        project(tmp.path(), "sub-b");
+        ensure_watchable_root(tmp.path()).expect("a manifest makes this a project");
+    }
+
+    /// One project inside a plain directory is an ordinary checkout layout,
+    /// not the container mistake -- refusing it would be surprising.
+    #[test]
+    fn a_directory_holding_a_single_project_is_allowed() {
+        let tmp = tempfile::tempdir().unwrap();
+        project(tmp.path(), "only-repo");
+        ensure_watchable_root(tmp.path()).expect("one child is not a container");
+    }
+
+    #[test]
+    fn an_empty_directory_is_allowed() {
+        let tmp = tempfile::tempdir().unwrap();
+        ensure_watchable_root(tmp.path()).expect("nothing to conflate");
     }
 }
 
