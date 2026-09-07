@@ -314,6 +314,18 @@ fn root_is_gone(root: &Path, original: Option<DirectoryIdentity>) -> bool {
 /// a repo has no `.git` at all yet is a perfectly ordinary root to index
 /// (`crates/infigraph-mcp` here has its own graph).
 fn looks_like_a_project(dir: &Path) -> bool {
+    // An already-indexed directory counts as a project when identifying
+    // CHILDREN -- someone chose to index it. It must NOT count for the root
+    // under test: `init()` creates `.infigraph/graph` before `index()` runs,
+    // so a root that failed this check once would pass it forever after.
+    // That is not hypothetical -- it let a test index 33,683 files across 57
+    // sibling repositories, the exact outcome the check exists to prevent.
+    has_project_marker(dir) || dir.join(".infigraph").join("graph").exists()
+}
+
+/// The durable markers only: a VCS root in any form, or a build manifest.
+/// Deliberately excludes "has already been indexed" -- see above.
+fn has_project_marker(dir: &Path) -> bool {
     // A VCS marker in any form -- `.git` may be a directory (clone) or a file
     // (worktree, submodule).
     for vcs in [".git", ".hg", ".svn", ".jj"] {
@@ -339,8 +351,7 @@ fn looks_like_a_project(dir: &Path) -> bool {
             return true;
         }
     }
-    // Already indexed on purpose at some point -- respect that decision.
-    dir.join(".infigraph").join("graph").exists()
+    false
 }
 
 /// Set to bypass [`ensure_watchable_root`] for a root that really is meant to
@@ -365,7 +376,7 @@ pub const ALLOW_CONTAINER_ROOT_ENV: &str = "INFIGRAPH_ALLOW_CONTAINER_ROOT";
 /// One child is allowed: a directory holding a single project is an ordinary
 /// way to lay out a checkout, and refusing it would be surprising.
 pub fn ensure_watchable_root(root: &Path) -> Result<()> {
-    if std::env::var_os(ALLOW_CONTAINER_ROOT_ENV).is_some() || looks_like_a_project(root) {
+    if std::env::var_os(ALLOW_CONTAINER_ROOT_ENV).is_some() || has_project_marker(root) {
         return Ok(());
     }
     let Ok(entries) = std::fs::read_dir(root) else {

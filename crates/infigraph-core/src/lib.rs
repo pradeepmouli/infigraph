@@ -310,6 +310,11 @@ impl Infigraph {
     /// - `kuzu` (default): embedded Kùzu graph DB
     /// - `neo4j`: remote Neo4j sidecar via Bolt (requires `neo4j` feature)
     pub fn init(&mut self) -> Result<()> {
+        // Refuse a folder of repositories HERE, not in `index()`: `init` is
+        // what creates `.infigraph/graph`, and the check must run before that
+        // file exists. Guarding only `index()` was useless -- `init` had
+        // already made the root look indexed by the time it ran.
+        crate::daemon::ensure_watchable_root(&self.root)?;
         if daemon_backend_selected() {
             let dk = graph::DaemonKuzuBackend::open(&self.root)?;
             self.backend_kind = BackendKind::DaemonKuzu(dk);
@@ -642,6 +647,14 @@ impl Infigraph {
     /// Index all supported files in the project, building the graph.
     /// Skips files whose content hash matches the stored hash (incremental).
     pub fn index(&self) -> Result<IndexResult> {
+        // Also checked in `init` (before the graph exists, which is the
+        // load-bearing one). Kept here as the belt to that braces: found when
+        // Codex spawned two `infigraph-mcp` servers rooted at
+        // `~/GitHub.nosync` (57 sibling repos), because that config names no
+        // project and the binary takes its root from the cwd. Indexing there
+        // pulls every repo into one graph, with each project's own ignore
+        // rules out of scope because the root sits above all of them.
+        crate::daemon::ensure_watchable_root(&self.root)?;
         if self.delegates_whole_index_to_daemon() {
             return self.index_via_daemon(None, Self::DAEMON_FULL_REINDEX_TIMEOUT);
         }

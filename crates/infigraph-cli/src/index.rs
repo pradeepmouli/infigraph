@@ -48,6 +48,12 @@ pub(crate) const SUGGESTED_INFIGRAPHIGNORE: &[(&str, &str)] = &[
 const SCIP_INDEXER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 
 pub(crate) fn cmd_index(root: &Path, full: bool, no_embed: bool) -> Result<()> {
+    // Before ANY destructive work. `Infigraph::init` performs the same check,
+    // but `--full` wipes `.infigraph/` here first -- so a root that was going
+    // to be refused still had its directory cleared before the refusal was
+    // raised. Observed doing exactly that: "Cleaned .infigraph/ for full
+    // reindex" immediately followed by "refusing to watch ...".
+    infigraph_core::daemon::ensure_watchable_root(root)?;
     // Under the daemon backend this command performs no local graph writes:
     // each one is routed to the daemon, which takes this very
     // .infigraph/index.lock to serve it. Holding the lock here deadlocks --
