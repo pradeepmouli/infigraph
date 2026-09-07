@@ -101,6 +101,18 @@ pub(crate) fn try_recover_by_setting_wal_aside_with(
         // already being judged on its own.
         return false;
     }
+
+    // Ask whether the image is ALREADY FINE before touching its WAL. Setting a
+    // healthy WAL aside is not a recovery -- it silently discards every change
+    // committed since the last checkpoint. Of fourteen quarantined images found
+    // on one machine, SEVEN opened cleanly WITH their WAL still attached: for
+    // those the caller's open failed for a reason that had nothing to do with
+    // the WAL (a concurrent writer mid-checkpoint outlasting the retry budget),
+    // and "recovering" them would have thrown away good data to fix a graph
+    // that was never broken.
+    if probe(&source) {
+        return false;
+    }
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -577,6 +589,59 @@ mod tests {
         assert_eq!(
             next_free_aside_ts(dir.path(), "graph", "corrupt", 1000),
             1000
+        );
+    }
+
+    /// A graph that opens fine AS IT STANDS must be left completely alone --
+    /// its WAL included.
+    ///
+    /// Setting a WAL aside is only a recovery when the WAL is what blocks the
+    /// open. Do it to a healthy graph and it is data loss: everything
+    /// committed since the last checkpoint lives in that file and nowhere
+    /// else. Seven of the fourteen quarantined images found on one machine
+    /// opened cleanly WITH their WAL attached, so this is not a hypothetical
+    /// input -- it is the single most common shape reaching this function.
+    #[test]
+    fn a_graph_that_already_opens_keeps_its_wal_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = dir.path().join("graph");
+        {
+            let store = crate::graph::GraphStore::open(&graph).unwrap();
+            let conn = store.connection().unwrap();
+            conn.query(
+                "CREATE (:File {id: 'a.rs', name: 'a.rs', path: 'a.rs', \
+                 language: 'rust', symbol_count: 0})",
+            )
+            .unwrap();
+        }
+        // A WAL that is present and perfectly readable -- the state a graph is
+        // in whenever a writer checkpointed and left the file behind.
+        let wal = dir.path().join("graph.wal");
+        std::fs::write(&wal, b"").unwrap();
+        assert!(
+            in_process_probe(&graph),
+            "precondition: this graph opens with its WAL in place, or the test \
+             proves nothing"
+        );
+
+        assert!(
+            !try_recover_by_setting_wal_aside_with(dir.path(), "graph", in_process_probe),
+            "a graph that already opens needs no recovery, so this must decline"
+        );
+        assert!(
+            wal.exists(),
+            "the WAL of a healthy graph must still be there -- moving it aside \
+             discards every change committed since the last checkpoint"
+        );
+        let filed: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains("torn-wal"))
+            .collect();
+        assert!(
+            filed.is_empty(),
+            "nothing should have been filed: {filed:?}"
         );
     }
 }

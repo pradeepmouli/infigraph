@@ -454,6 +454,37 @@ impl Infigraph {
                                 return Ok(());
                             }
                         }
+                        // Last question before destroying the image: ask a
+                        // FRESH PROCESS to open it. Every error-string
+                        // classification has already had its say -- the retry
+                        // loop returned early on lock contention and on a
+                        // storage-version mismatch, and the WAL-aside recovery
+                        // above has ruled on a torn tail. What is left is a
+                        // corruption verdict derived entirely from an error
+                        // THIS process happened to see, and of fourteen
+                        // quarantined images found on one machine, SEVEN open
+                        // cleanly with their WAL still attached. Nothing was
+                        // ever torn in those: something transient outlasted the
+                        // backoff and a healthy graph was discarded for it.
+                        //
+                        // The probe has to be out-of-process. A genuinely
+                        // damaged image can take the reader down with SIGBUS or
+                        // SIGSEGV, which no `Result` exists to catch -- an
+                        // in-process "just try opening it again" would turn a
+                        // false quarantine into a crash. It is also inert
+                        // (returns false) until `mark_probe_capable` runs, so
+                        // test binaries never spawn libtest as a probe child.
+                        if crate::probe::graph_opens(&self.db_path) {
+                            return Err(last_err).context(format!(
+                                "the graph at {} did not open here, but a fresh probe process \
+                                 opened AND scanned it successfully -- it is not corrupt. \
+                                 Something transient (most likely a concurrent writer \
+                                 mid-checkpoint) outlasted the retry budget. Refusing to \
+                                 quarantine a healthy graph; retry the operation.",
+                                self.db_path.display()
+                            ));
+                        }
+
                         eprintln!(
                             "[graph] open failed after {} attempts ({last_err}), quarantining \
                              the corrupt graph and starting an EMPTY one -- the project has no \
