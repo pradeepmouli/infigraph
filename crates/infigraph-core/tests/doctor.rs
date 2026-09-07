@@ -677,6 +677,17 @@ fn check_watchers_warns_on_genuinely_unparseable_lock() {
 
 #[test]
 fn check_disk_fails_below_2gb() {
+    // Isolate HOME even though this test asserts nothing about the audit
+    // trail: `check_disk` WRITES one below the warn floor. Without this the
+    // entry goes to the developer's real ~/.infigraph/logs/audit.log, and --
+    // because HOME is process-global -- into whichever sibling test happens
+    // to be holding an override at the time. That is precisely how
+    // `check_disk_above_warn_floor_writes_no_audit_log_entry` failed on
+    // ubuntu CI: it found this test's "5120 MB free" entry in its own temp
+    // HOME.
+    let tmp = tempfile::tempdir().unwrap();
+    let _home = HomeOverride::set(tmp.path());
+
     let ctx = DoctorContext {
         registry: infigraph_core::multi::Registry::default(),
         scope: DoctorScope::Global,
@@ -694,6 +705,17 @@ fn check_disk_fails_below_2gb() {
 
 #[test]
 fn check_disk_warns_below_10gb() {
+    // Isolate HOME even though this test asserts nothing about the audit
+    // trail: `check_disk` WRITES one below the warn floor. Without this the
+    // entry goes to the developer's real ~/.infigraph/logs/audit.log, and --
+    // because HOME is process-global -- into whichever sibling test happens
+    // to be holding an override at the time. That is precisely how
+    // `check_disk_above_warn_floor_writes_no_audit_log_entry` failed on
+    // ubuntu CI: it found this test's "5120 MB free" entry in its own temp
+    // HOME.
+    let tmp = tempfile::tempdir().unwrap();
+    let _home = HomeOverride::set(tmp.path());
+
     let ctx = DoctorContext {
         registry: infigraph_core::multi::Registry::default(),
         scope: DoctorScope::Global,
@@ -771,15 +793,27 @@ fn check_disk_above_warn_floor_writes_no_audit_log_entry() {
     };
     check_disk(&ctx);
 
+    // Assert about DISK entries specifically, not "the audit log is empty".
+    //
+    // `audit_log` is written by quarantine, recovery, instance registration
+    // and snapshot as well as by `check_disk`, and its path is derived from
+    // `HOME` -- which this test overrides. Any sibling test in this binary
+    // that happens to write an audit entry while that override is live lands
+    // in this temp file, and an "is the log empty?" assertion then fails over
+    // an entry that has nothing to do with disk. That is exactly how this
+    // test failed in CI. The claim it is actually making is narrower and is
+    // what it now checks; the sibling above already matches on `role=disk`
+    // the same way.
     let audit_path = tmp.path().join(".infigraph/logs/audit.log");
-    let exists_and_nonempty = audit_path.exists()
-        && !std::fs::read_to_string(&audit_path)
-            .unwrap_or_default()
-            .is_empty();
+    let content = std::fs::read_to_string(&audit_path).unwrap_or_default();
+    let disk_entries: Vec<&str> = content
+        .lines()
+        .filter(|l| l.contains("role=disk"))
+        .collect();
 
     assert!(
-        !exists_and_nonempty,
-        "a healthy disk reading must not write an audit entry"
+        disk_entries.is_empty(),
+        "a healthy disk reading must not write a disk audit entry, got: {disk_entries:?}"
     );
 }
 
