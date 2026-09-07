@@ -235,8 +235,27 @@ pub fn db_lock_path(db_path: &Path) -> PathBuf {
 /// The busy wording keeps the "failed to open kuzu db" prefix so
 /// `is_transient_wal_open_race_error` still recognises it as retryable.
 fn classify_read_only_open_failure(msg: String, live_holder: Option<u32>) -> anyhow::Error {
-    if !msg.to_lowercase().contains("wal") {
+    let lower = msg.to_lowercase();
+    if !lower.contains("wal") {
         return anyhow::anyhow!(msg);
+    }
+    // A WAL that is *absent* is never damage -- it is the normal, fully
+    // checkpointed state. Kuzu reports this when the file disappears between
+    // the open deciding to read it and actually opening it: a checkpoint
+    // completing underneath a concurrent reader.
+    //
+    // Caught in CI as `graph corruption detected: failed to open kuzu db
+    // (read-only): IO exception: Cannot open file .../graph.wal: No such file
+    // or directory`. Because `GraphCorruption` is the downcast target that
+    // routes to quarantine, that verdict would wipe a healthy graph over a
+    // file that was removed precisely because the data was safely folded in.
+    // The live-holder arm below cannot catch it: a checkpoint that has just
+    // finished may leave no live holder at all.
+    if lower.contains("no such file or directory") {
+        return anyhow::anyhow!(
+            "{msg} -- the WAL was removed while this open was in flight (a checkpoint \
+             completing under a concurrent reader). This is not corruption: retry."
+        );
     }
     match live_holder {
         Some(pid) => anyhow::anyhow!(
@@ -703,6 +722,13 @@ impl GraphStore {
                 // fixed while this reader waited.
                 let still_dead = !wal_family_paths(path).is_empty();
                 if !still_dead {
+                    drop(graph_lock);
+                    return Self::open_read_only(path).map(|s| (s, None));
+                }
+                // Same last chance as the write path: if the base image
+                // opens once the torn WAL is set aside, this graph is not
+                // corrupt and must not be quarantined.
+                if crate::quarantine::try_recover_by_setting_wal_aside(infigraph_dir, &graph_name) {
                     drop(graph_lock);
                     return Self::open_read_only(path).map(|s| (s, None));
                 }
@@ -1333,6 +1359,32 @@ mod tests {
         assert!(
             err.to_string().contains("crash-loop"),
             "must be the distinct crash-loop wording, not the generic quarantine message: {err}"
+        );
+    }
+
+    /// A WAL that no longer exists is not corruption.
+    ///
+    /// CI produced `graph corruption detected: failed to open kuzu db
+    /// (read-only): IO exception: Cannot open file .../graph.wal: No such
+    /// file or directory` -- a verdict that routes to quarantine, over a file
+    /// that was removed *because* its contents were safely checkpointed in.
+    /// The live-holder arm cannot cover it: a checkpoint that just finished
+    /// may leave no holder at all, which is exactly the `None` case here.
+    #[test]
+    fn a_wal_that_vanished_mid_open_is_retryable_not_corruption() {
+        let err = classify_read_only_open_failure(
+            "failed to open kuzu db (read-only): IO exception: Cannot open file \
+             /tmp/x/.infigraph/graph.wal: No such file or directory"
+                .to_string(),
+            None,
+        );
+        assert!(
+            err.downcast_ref::<GraphCorruption>().is_none(),
+            "a missing WAL must not be classified as corruption: {err}"
+        );
+        assert!(
+            is_transient_wal_open_race_error(&err),
+            "and it must stay recognisable as retryable: {err}"
         );
     }
 
