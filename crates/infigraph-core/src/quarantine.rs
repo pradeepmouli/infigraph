@@ -54,6 +54,95 @@ fn now_epoch_secs() -> u64 {
 /// `graph_name` before calling this — quarantine itself does not lock,
 /// mirroring `wipe_graph`'s existing contract where the caller already
 /// acquired `graph.lock` before deciding to wipe.
+/// Try to save a graph whose open is failing by setting its WAL aside.
+///
+/// Returns `true` when the base image opened without the WAL, in which case
+/// the graph file is left exactly where it is and only the WAL family has
+/// moved -- the caller must NOT quarantine.
+///
+/// Why this exists: of thirteen quarantined images found on one machine,
+/// **twelve were recoverable**. Five failed with their WAL attached and
+/// opened cleanly without it -- a torn WAL tail over an intact base image,
+/// where the right outcome is to lose the uncommitted tail rather than the
+/// entire index. (Seven more opened even *with* their WAL, meaning they were
+/// discarded over something transient; that is a separate gap this does not
+/// address.) Between them, eight repositories lost indexes over five weeks
+/// that did not need to be lost.
+///
+/// The probe runs out of process ([`crate::probe`]) because the thirteenth
+/// image exits with SIGBUS rather than returning an error. Probing inline
+/// would turn a recoverable situation into a crash loop.
+///
+/// On failure the WAL is put back, so a caller that goes on to quarantine
+/// still preserves the complete picture for diagnosis.
+///
+/// Same locking contract as [`quarantine_graph`]: the caller already holds
+/// `graph.lock`.
+pub fn try_recover_by_setting_wal_aside(infigraph_dir: &Path, graph_name: &str) -> bool {
+    try_recover_by_setting_wal_aside_with(infigraph_dir, graph_name, crate::probe::graph_opens)
+}
+
+/// [`try_recover_by_setting_wal_aside`] with the probe injected, so tests can
+/// exercise the file shuffling without spawning a process. A test binary must
+/// never reach the real probe: `current_exe()` there is libtest's harness,
+/// which re-runs the whole suite instead of probing.
+pub(crate) fn try_recover_by_setting_wal_aside_with(
+    infigraph_dir: &Path,
+    graph_name: &str,
+    probe: impl Fn(&Path) -> bool,
+) -> bool {
+    let source = infigraph_dir.join(graph_name);
+    if !source.exists() {
+        return false;
+    }
+    let wal_paths = crate::graph::wal_family_paths(&source);
+    if wal_paths.is_empty() {
+        // Nothing to set aside, so nothing this can do -- the base image is
+        // already being judged on its own.
+        return false;
+    }
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let mut moved: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for path in &wal_paths {
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        let suffix = name.strip_prefix(graph_name).unwrap_or(&name).to_owned();
+        let dest = crate::probe::torn_wal_path(infigraph_dir, graph_name, &suffix, ts);
+        if std::fs::rename(path, &dest).is_err() {
+            // Could not stage the experiment cleanly -- undo and decline
+            // rather than leave the WAL family half-moved.
+            for (from, to) in moved.iter().rev() {
+                let _ = std::fs::rename(to, from);
+            }
+            return false;
+        }
+        moved.push((path.clone(), dest));
+    }
+
+    if probe(&source) {
+        eprintln!(
+            "[graph] recovered: the base image opens once its WAL is set aside -- keeping the \
+             graph and filing the torn WAL as {} (uncommitted changes since the last checkpoint \
+             are lost; the index is not)",
+            moved
+                .first()
+                .map(|(_, to)| to.display().to_string())
+                .unwrap_or_default()
+        );
+        return true;
+    }
+
+    // Base image is bad too. Restore the WAL so the quarantine that follows
+    // preserves everything.
+    for (from, to) in moved.iter().rev() {
+        let _ = std::fs::rename(to, from);
+    }
+    false
+}
+
 pub fn quarantine_graph(infigraph_dir: &Path, graph_name: &str) -> Result<PathBuf> {
     move_graph_aside(
         infigraph_dir,
@@ -356,6 +445,78 @@ fn evict_oldest_if_at_bound(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Tests probe IN PROCESS. The real probe re-invokes `current_exe()`,
+    /// which in a test binary is libtest -- it would re-run this whole suite
+    /// per call. That is exactly the fork bomb `PROBE_CAPABLE` now prevents;
+    /// this keeps the tests honest about the file shuffling either way.
+    fn in_process_probe(graph: &Path) -> bool {
+        crate::graph::GraphStore::open_read_only(graph).is_ok()
+    }
+
+    /// A real graph with a deliberately corrupted WAL must be RECOVERED, not
+    /// quarantined: the base image is intact and only the uncommitted tail is
+    /// lost.
+    ///
+    /// This is the shape twelve of thirteen real quarantined images on this
+    /// machine turned out to have -- indexes destroyed across eight repos
+    /// over five weeks for a torn tail.
+    #[test]
+    fn a_torn_wal_over_an_intact_base_image_is_recovered_not_quarantined() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = dir.path().join("graph");
+        {
+            let store = crate::graph::GraphStore::open(&graph).unwrap();
+            let conn = store.connection().unwrap();
+            conn.query(
+                "CREATE (:File {id: 'a.rs', name: 'a.rs', path: 'a.rs', \
+                 language: 'rust', symbol_count: 0})",
+            )
+            .unwrap();
+        }
+        // Garbage where a WAL record header belongs.
+        std::fs::write(dir.path().join("graph.wal"), b"not a wal record at all").unwrap();
+
+        let before = std::fs::metadata(&graph).unwrap().len();
+        assert!(
+            try_recover_by_setting_wal_aside_with(dir.path(), "graph", in_process_probe),
+            "the base image opens without the WAL, so this must recover"
+        );
+
+        assert!(graph.exists(), "the graph itself must be left in place");
+        assert_eq!(
+            std::fs::metadata(&graph).unwrap().len(),
+            before,
+            "recovery must not rewrite the base image"
+        );
+        let names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names.iter().any(|n| n.contains("torn-wal")),
+            "the torn WAL must be kept as evidence, got: {names:?}"
+        );
+        assert!(
+            !names.iter().any(|n| n.contains("corrupt")),
+            "nothing should have been quarantined, got: {names:?}"
+        );
+    }
+
+    /// With no WAL at all there is nothing to set aside, so the caller must
+    /// fall through to its normal verdict rather than be told "recovered".
+    #[test]
+    fn a_graph_with_no_wal_is_not_claimed_as_recovered() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = dir.path().join("graph");
+        drop(crate::graph::GraphStore::open(&graph).unwrap());
+        assert!(!try_recover_by_setting_wal_aside_with(
+            dir.path(),
+            "graph",
+            in_process_probe
+        ));
+    }
 
     #[test]
     fn next_free_aside_ts_returns_start_when_nothing_collides() {

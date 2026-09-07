@@ -6,6 +6,13 @@ use serde_json::{json, Value};
 use infigraph_mcp::web;
 
 fn main() -> Result<()> {
+    // A probe child must answer before anything else initialises: it exists
+    // only to find out whether one graph file opens, out of process, so a
+    // damaged image cannot take a real daemon down with it.
+    if infigraph_core::probe::run_if_probe_child() {
+        return Ok(());
+    }
+
     let args: Vec<String> = std::env::args().collect();
 
     // Pure introspection MUST be answered before any supervisor/worker/

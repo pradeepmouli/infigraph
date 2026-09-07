@@ -31,6 +31,7 @@ pub mod model;
 pub mod multi;
 pub mod ops;
 pub mod patterns;
+pub mod probe;
 pub mod proclog;
 pub mod ps;
 pub mod quarantine;
@@ -429,6 +430,25 @@ impl Infigraph {
                         // rebuild this path has never performed, and a project
                         // was found sitting on a 0-symbol graph whose
                         // "rebuild" had in fact succeeded.
+                        // Try recovery BEFORE announcing a quarantine. The
+                        // message below is load-bearing for operators, and
+                        // printing "quarantining ... starting an EMPTY one"
+                        // and then silently recovering would be worse than
+                        // saying nothing.
+                        if let (Some(parent), Some(name)) =
+                            (self.db_path.parent(), self.db_path.file_name())
+                        {
+                            if self.db_path.exists()
+                                && crate::quarantine::try_recover_by_setting_wal_aside(
+                                    parent,
+                                    &name.to_string_lossy(),
+                                )
+                            {
+                                let kb = crate::graph::KuzuBackend::open(&self.db_path)?;
+                                self.backend_kind = BackendKind::Kuzu(kb);
+                                return Ok(());
+                            }
+                        }
                         eprintln!(
                             "[graph] open failed after {} attempts ({last_err}), quarantining \
                              the corrupt graph and starting an EMPTY one -- the project has no \
