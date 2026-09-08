@@ -730,6 +730,21 @@ impl GraphStore {
     /// Internal/test call sites that want the strict, non-degrading
     /// behavior keep calling `open_read_only` directly -- it is unchanged.
     pub fn open_read_only_or_degrade(path: &Path) -> Result<(Self, Option<DegradeReason>)> {
+        Self::open_read_only_or_degrade_with(path, crate::probe::graph_opens)
+    }
+
+    /// [`open_read_only_or_degrade`](Self::open_read_only_or_degrade) with the
+    /// health probe injected, so tests can exercise the quarantine decision.
+    ///
+    /// A test binary must never reach the real probe: `current_exe()` there is
+    /// libtest's harness, which re-runs the whole suite instead of probing
+    /// (see [`crate::probe`]). The real probe is also inert until
+    /// `mark_probe_capable` runs, so without this seam every test would take
+    /// the "probe says no" branch and the interesting one would be unreachable.
+    pub(crate) fn open_read_only_or_degrade_with(
+        path: &Path,
+        probe: impl Fn(&Path) -> bool,
+    ) -> Result<(Self, Option<DegradeReason>)> {
         let infigraph_dir = path.parent().ok_or_else(|| {
             anyhow::anyhow!("graph path {} has no parent directory", path.display())
         })?;
@@ -779,13 +794,26 @@ impl GraphStore {
                     drop(graph_lock);
                     return Self::open_read_only(path).map(|s| (s, None));
                 }
-                // Same last chance as the write path: if the base image
-                // opens once the torn WAL is set aside, this graph is not
-                // corrupt and must not be quarantined.
-                if crate::quarantine::try_recover_by_setting_wal_aside(infigraph_dir, &graph_name) {
+                // Same last chance as the write path -- but ALL THREE of its
+                // answers matter here. Only one of them permits a quarantine.
+                let verdict = crate::quarantine::try_recover_by_setting_wal_aside_with(
+                    infigraph_dir,
+                    &graph_name,
+                    &probe,
+                );
+                if verdict.is_usable() {
+                    // Open while the lock is STILL HELD. `lockfile::acquire`
+                    // stamped our identity into the payload, so the holder it
+                    // names is this live process and `open_read_only`'s
+                    // dead-holder guard stays quiet -- which matters for
+                    // `AlreadyHealthy`, where the WAL is legitimately still
+                    // there. Dropping the lock first would put the graph back
+                    // into the exact shape that sent us down this branch.
+                    let store = Self::open_read_only(path)?;
                     drop(graph_lock);
-                    return Self::open_read_only(path).map(|s| (s, None));
+                    return Ok((store, None));
                 }
+                debug_assert!(verdict.permits_quarantine());
                 crate::quarantine::quarantine_graph(infigraph_dir, &graph_name)?;
                 crate::recovery::mark_recovery_needed(infigraph_dir, pid, path)?;
                 drop(graph_lock);
@@ -1503,6 +1531,70 @@ mod tests {
         assert!(
             !crate::recovery::pending_recovery(infigraph_dir),
             "no recovery sentinel should be left behind for a graph that was never actually quarantined"
+        );
+    }
+
+    /// Probes IN PROCESS. The real probe re-invokes `current_exe()`, which in
+    /// a test binary is libtest -- it would re-run this whole suite per call.
+    /// Same open path the real probe child takes, so the dead-holder guard
+    /// behaves identically.
+    fn in_process_probe(graph: &Path) -> bool {
+        GraphStore::open_read_only(graph).is_ok()
+    }
+
+    /// A graph the probe opens AS IT STANDS must never be quarantined, even
+    /// though the pre-lock peek saw a dead holder.
+    ///
+    /// The reason this arises at all is `lockfile::acquire`: it stamps THIS
+    /// process's identity into `graph.lock` before the recovery attempt runs,
+    /// so by the time the probe opens the image the holder it reads is alive
+    /// and `open_read_only`'s dead-holder guard no longer fires. Verified
+    /// against the installed binary on one healthy graph + WAL: probing it
+    /// with a dead pid in the lock is refused, with a live pid it opens.
+    ///
+    /// `try_recover_by_setting_wal_aside` therefore answers "already healthy"
+    /// here -- which used to be the same `false` it returns for "not
+    /// recoverable", and this call site quarantined a perfectly good index on
+    /// the strength of it. `Infigraph::init` never showed the bug because it
+    /// re-probed itself afterwards; this path had no such backstop.
+    #[test]
+    fn open_read_only_or_degrade_keeps_a_healthy_graph_whose_dead_holder_was_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let infigraph_dir = dir.path();
+        let db_path = infigraph_dir.join("graph");
+
+        {
+            let store = GraphStore::open(&db_path).unwrap();
+            let conn = store.connection().unwrap();
+            conn.query(
+                "CREATE (:File {id: 'a.rs', name: 'a.rs', path: 'a.rs', \
+                 language: 'rust', symbol_count: 0})",
+            )
+            .unwrap();
+        }
+        // The two signals `unclean_shutdown_wal_holder` requires: a WAL
+        // sibling that is present but perfectly readable, and a lock naming a
+        // holder that is gone.
+        std::fs::write(infigraph_dir.join("graph.wal"), b"").unwrap();
+        write_holder_lock(&db_lock_path(&db_path), DEAD_PID);
+
+        let (store, _) = GraphStore::open_read_only_or_degrade_with(&db_path, in_process_probe)
+            .expect("a graph the probe opens must not be quarantined");
+        drop(store);
+
+        let names: Vec<String> = std::fs::read_dir(infigraph_dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !names.iter().any(|n| n.contains("corrupt")),
+            "a graph that opens must not be quarantined, got: {names:?}"
+        );
+        assert!(db_path.exists(), "the graph itself must still be there");
+        assert!(
+            !crate::recovery::pending_recovery(infigraph_dir),
+            "no recovery sentinel should be left for a graph that was never corrupt"
         );
     }
 

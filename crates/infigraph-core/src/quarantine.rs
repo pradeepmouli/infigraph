@@ -54,20 +54,28 @@ fn now_epoch_secs() -> u64 {
 /// `graph_name` before calling this — quarantine itself does not lock,
 /// mirroring `wipe_graph`'s existing contract where the caller already
 /// acquired `graph.lock` before deciding to wipe.
-/// Try to save a graph whose open is failing by setting its WAL aside.
+/// Decide what a graph whose open is failing actually needs -- and, where that
+/// is a torn WAL, fix it by setting the WAL aside.
 ///
-/// Returns `true` when the base image opened without the WAL, in which case
-/// the graph file is left exactly where it is and only the WAL family has
-/// moved -- the caller must NOT quarantine.
+/// See [`WalRecovery`] for the three answers. Two of them forbid a quarantine,
+/// so callers must match on the verdict rather than test it for truthiness.
 ///
-/// Why this exists: of thirteen quarantined images found on one machine,
-/// **twelve were recoverable**. Five failed with their WAL attached and
-/// opened cleanly without it -- a torn WAL tail over an intact base image,
-/// where the right outcome is to lose the uncommitted tail rather than the
-/// entire index. (Seven more opened even *with* their WAL, meaning they were
-/// discarded over something transient; that is a separate gap this does not
-/// address.) Between them, eight repositories lost indexes over five weeks
-/// that did not need to be lost.
+/// Why this exists: of the twelve quarantined images currently retained on
+/// this machine, re-probed on 2026-09-07, **none was corrupt**. They split
+/// 7 / 5:
+///
+/// - **7 torn WAL** -- failed with their WAL attached, opened cleanly without
+///   it. An intact base image under a torn tail, where the right outcome is to
+///   lose the uncommitted tail rather than the entire index.
+/// - **5 already healthy** -- opened exactly as they stood. Discarded over
+///   something transient that outlasted the caller's retry budget.
+///
+/// Eight repositories lost indexes over five weeks that did not need to be
+/// lost. (An earlier count here said 5 / 7 the other way. It described a
+/// thirteen-image population that also held the one genuinely damaged image
+/// ever seen -- the SIGBUS one below -- since evicted by
+/// `QUARANTINE_RETENTION`. Treat these numbers as a dated sample, not an
+/// invariant: the pool turns over.)
 ///
 /// The probe runs out of process ([`crate::probe`]) because the thirteenth
 /// image exits with SIGBUS rather than returning an error. Probing inline
@@ -78,8 +86,48 @@ fn now_epoch_secs() -> u64 {
 ///
 /// Same locking contract as [`quarantine_graph`]: the caller already holds
 /// `graph.lock`.
-pub fn try_recover_by_setting_wal_aside(infigraph_dir: &Path, graph_name: &str) -> bool {
+pub fn try_recover_by_setting_wal_aside(infigraph_dir: &Path, graph_name: &str) -> WalRecovery {
     try_recover_by_setting_wal_aside_with(infigraph_dir, graph_name, crate::probe::graph_opens)
+}
+
+/// What [`try_recover_by_setting_wal_aside`] concluded about a graph.
+///
+/// This is deliberately not a `bool`. It used to be, and two of the three
+/// outcomes collapsed onto `false` -- "the image is fine, leave it alone" and
+/// "the image is beyond saving, go ahead and quarantine", which are opposite
+/// instructions to the caller. `Infigraph::init` compensated by re-probing
+/// after a `false`; `GraphStore::open_read_only_or_degrade` did not, and
+/// quarantined healthy graphs. Splitting the verdict is what stops a third
+/// caller from having to rediscover that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalRecovery {
+    /// The image opens exactly as it stands, WAL included. Nothing was wrong
+    /// with it and nothing was touched. The caller MUST NOT quarantine: its
+    /// own open failed for a reason that had nothing to do with this graph.
+    AlreadyHealthy,
+    /// The base image opened once a torn WAL was set aside. The WAL family has
+    /// been filed as `<graph>.torn-wal.<ts>` evidence and the graph is usable.
+    /// The caller MUST NOT quarantine. Changes committed since the last
+    /// checkpoint are lost; the index is not.
+    Recovered,
+    /// The image does not open with its WAL or without it. Any WAL that was
+    /// moved has been put back, so a quarantine now preserves the complete
+    /// picture for diagnosis.
+    NotRecoverable,
+}
+
+impl WalRecovery {
+    /// Whether the caller may go on to quarantine. Only one outcome permits
+    /// it; prefer this over matching `!= Recovered`, which is the exact
+    /// mistake the old `bool` invited.
+    pub fn permits_quarantine(self) -> bool {
+        matches!(self, Self::NotRecoverable)
+    }
+
+    /// Whether the graph is usable right now without further recovery work.
+    pub fn is_usable(self) -> bool {
+        matches!(self, Self::AlreadyHealthy | Self::Recovered)
+    }
 }
 
 /// [`try_recover_by_setting_wal_aside`] with the probe injected, so tests can
@@ -90,28 +138,29 @@ pub(crate) fn try_recover_by_setting_wal_aside_with(
     infigraph_dir: &Path,
     graph_name: &str,
     probe: impl Fn(&Path) -> bool,
-) -> bool {
+) -> WalRecovery {
     let source = infigraph_dir.join(graph_name);
     if !source.exists() {
-        return false;
-    }
-    let wal_paths = crate::graph::wal_family_paths(&source);
-    if wal_paths.is_empty() {
-        // Nothing to set aside, so nothing this can do -- the base image is
-        // already being judged on its own.
-        return false;
+        return WalRecovery::NotRecoverable;
     }
 
-    // Ask whether the image is ALREADY FINE before touching its WAL. Setting a
+    // Ask whether the image is ALREADY FINE before anything else. Setting a
     // healthy WAL aside is not a recovery -- it silently discards every change
-    // committed since the last checkpoint. Of fourteen quarantined images found
-    // on one machine, SEVEN opened cleanly WITH their WAL still attached: for
-    // those the caller's open failed for a reason that had nothing to do with
-    // the WAL (a concurrent writer mid-checkpoint outlasting the retry budget),
-    // and "recovering" them would have thrown away good data to fix a graph
-    // that was never broken.
+    // committed since the last checkpoint.
+    //
+    // This runs BEFORE the WAL check below, not after, because "is this graph
+    // healthy?" has nothing to do with whether a WAL happens to exist. Asking
+    // in the other order meant a healthy graph with no WAL fell out as "not
+    // recoverable" without ever being examined, and each caller had to re-probe
+    // for itself to avoid quarantining it -- which only one of them did.
     if probe(&source) {
-        return false;
+        return WalRecovery::AlreadyHealthy;
+    }
+
+    let wal_paths = crate::graph::wal_family_paths(&source);
+    if wal_paths.is_empty() {
+        // Does not open, and has no WAL to blame for it.
+        return WalRecovery::NotRecoverable;
     }
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -129,7 +178,7 @@ pub(crate) fn try_recover_by_setting_wal_aside_with(
             for (from, to) in moved.iter().rev() {
                 let _ = std::fs::rename(to, from);
             }
-            return false;
+            return WalRecovery::NotRecoverable;
         }
         moved.push((path.clone(), dest));
     }
@@ -144,7 +193,7 @@ pub(crate) fn try_recover_by_setting_wal_aside_with(
                 .map(|(_, to)| to.display().to_string())
                 .unwrap_or_default()
         );
-        return true;
+        return WalRecovery::Recovered;
     }
 
     // Base image is bad too. Restore the WAL so the quarantine that follows
@@ -152,7 +201,7 @@ pub(crate) fn try_recover_by_setting_wal_aside_with(
     for (from, to) in moved.iter().rev() {
         let _ = std::fs::rename(to, from);
     }
-    false
+    WalRecovery::NotRecoverable
 }
 
 pub fn quarantine_graph(infigraph_dir: &Path, graph_name: &str) -> Result<PathBuf> {
@@ -490,8 +539,9 @@ mod tests {
         std::fs::write(dir.path().join("graph.wal"), b"not a wal record at all").unwrap();
 
         let before = std::fs::metadata(&graph).unwrap().len();
-        assert!(
+        assert_eq!(
             try_recover_by_setting_wal_aside_with(dir.path(), "graph", in_process_probe),
+            WalRecovery::Recovered,
             "the base image opens without the WAL, so this must recover"
         );
 
@@ -516,18 +566,36 @@ mod tests {
         );
     }
 
-    /// With no WAL at all there is nothing to set aside, so the caller must
-    /// fall through to its normal verdict rather than be told "recovered".
+    /// A healthy graph with no WAL is `AlreadyHealthy`, not "recovered" and
+    /// not "unrecoverable".
+    ///
+    /// The health question is asked BEFORE the WAL question precisely so this
+    /// case gets a real answer. While the order was the other way round, a
+    /// graph like this fell out as an undifferentiated `false` -- and five of
+    /// the twelve quarantined images on this machine are exactly this shape:
+    /// no WAL sibling at all, opening perfectly well.
     #[test]
-    fn a_graph_with_no_wal_is_not_claimed_as_recovered() {
+    fn a_healthy_graph_with_no_wal_reports_already_healthy() {
         let dir = tempfile::tempdir().unwrap();
         let graph = dir.path().join("graph");
         drop(crate::graph::GraphStore::open(&graph).unwrap());
-        assert!(!try_recover_by_setting_wal_aside_with(
-            dir.path(),
-            "graph",
-            in_process_probe
-        ));
+        let verdict = try_recover_by_setting_wal_aside_with(dir.path(), "graph", in_process_probe);
+        assert_eq!(verdict, WalRecovery::AlreadyHealthy);
+        assert!(
+            !verdict.permits_quarantine(),
+            "a graph that opens must never license a quarantine"
+        );
+    }
+
+    /// The complement: no WAL and the image really is unopenable. Nothing to
+    /// set aside, nothing to save -- the caller's quarantine is correct.
+    #[test]
+    fn an_unopenable_graph_with_no_wal_is_not_recoverable() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("graph"), b"not a database").unwrap();
+        let verdict = try_recover_by_setting_wal_aside_with(dir.path(), "graph", in_process_probe);
+        assert_eq!(verdict, WalRecovery::NotRecoverable);
+        assert!(verdict.permits_quarantine());
     }
 
     #[test]
@@ -624,9 +692,12 @@ mod tests {
              proves nothing"
         );
 
-        assert!(
-            !try_recover_by_setting_wal_aside_with(dir.path(), "graph", in_process_probe),
-            "a graph that already opens needs no recovery, so this must decline"
+        assert_eq!(
+            try_recover_by_setting_wal_aside_with(dir.path(), "graph", in_process_probe),
+            WalRecovery::AlreadyHealthy,
+            "a graph that already opens needs no recovery, so this must decline -- \
+             and must say WHY it declined, or the caller cannot tell this apart \
+             from an image that is beyond saving"
         );
         assert!(
             wal.exists(),
