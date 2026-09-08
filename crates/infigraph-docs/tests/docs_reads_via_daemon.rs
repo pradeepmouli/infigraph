@@ -148,16 +148,23 @@ fn doc_index_routes_reads_through_the_daemon_when_the_daemon_store_is_selected()
     svc.shutdown();
 }
 
-/// Reads are daemon-mandatory for documents too: with the daemon backend
-/// selected and nothing listening, a read must fail rather than silently
-/// opening `docs.kuzu` beside the daemon's own handle.
+/// Reads are daemon-mandatory for documents, so `DocIndex::init` must
+/// *ensure* a daemon rather than leave the first read to discover there is
+/// none. With nothing running beforehand, init starts one and the read
+/// succeeds.
 #[test]
-fn a_routed_document_read_fails_when_no_daemon_is_listening() {
+fn doc_index_starts_a_daemon_when_none_is_running() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
     seed_one_document(root);
+
+    let lock = root.join(".infigraph").join("watch.lock");
+    assert!(
+        !infigraph_core::daemon::lifecycle::daemon_is_alive(&lock),
+        "no daemon may be running before this test starts"
+    );
 
     std::env::set_var("INFIGRAPH_BACKEND", "daemon");
     let mut idx = infigraph_docs::DocIndex::open(root).unwrap();
@@ -166,9 +173,14 @@ fn a_routed_document_read_fails_when_no_daemon_is_listening() {
         .and_then(|()| idx.store().expect("a backend").get_doc_hashes());
     std::env::remove_var("INFIGRAPH_BACKEND");
 
+    // Stop it before the tempdir goes away, so no daemon is left watching a
+    // directory nobody owns (#133).
+    stop_daemon(root);
+
+    let hashes = got.expect("init must start a daemon and the read must then succeed");
     assert!(
-        got.is_err(),
-        "no daemon must be an error, not a silent direct open: {got:?}"
+        hashes.contains_key("a.md"),
+        "the routed read must return the seeded document: {hashes:?}"
     );
 }
 
@@ -204,6 +216,29 @@ fn seed_one_document(root: &Path) {
          content_hash: 'h', page_count: 0, chunk_count: 1})",
     )
     .unwrap();
+}
+
+/// Stop a daemon started by a test, so it does not outlive the tempdir it
+/// watches. The `watch.stop` sentinel is the coordinator's cooperative exit.
+fn stop_daemon(root: &Path) {
+    let infigraph_dir = root.join(".infigraph");
+    let lock = infigraph_dir.join("watch.lock");
+    if !infigraph_core::daemon::lifecycle::daemon_is_alive(&lock) {
+        return;
+    }
+    let _ = std::fs::write(infigraph_dir.join("watch.stop"), "");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    while std::time::Instant::now() < deadline {
+        if !infigraph_core::daemon::lifecycle::daemon_is_alive(&lock) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    if let Some(holder) = infigraph_core::lockfile::read_holder(&lock) {
+        if holder.pid != std::process::id() {
+            let _ = infigraph_core::ps::kill_infigraph_process(holder.pid, false);
+        }
+    }
 }
 
 /// The graph half of the service. These tests are about the docs half, but

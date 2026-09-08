@@ -90,6 +90,11 @@ impl DocIndex {
         // which would deadlock, since indexing reads through a store it is
         // holding and `DocStore::open` takes the process-wide `DB_LOCK`.
         if infigraph_core::daemon_backend_selected() {
+            // Same hard requirement the code graph has: with reads routed,
+            // no daemon means no document reads at all. Start one (or fail
+            // with an actionable message) rather than letting the first
+            // read discover it.
+            infigraph_core::daemon::lifecycle::ensure_daemon_for_routed_access(&self.root)?;
             self.store = Some(Box::new(daemon_store::DaemonDocStore::new(&self.root)));
             return Ok(());
         }

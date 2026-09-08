@@ -328,11 +328,13 @@ impl Infigraph {
             let dk = graph::DaemonKuzuBackend::open(&self.root)?;
             self.backend_kind = BackendKind::DaemonKuzu(dk);
             // Selecting this backend implies daemon-mode watching: every
-            // covered write routes through a daemon, so without one
-            // running each would block for its full timeout before
-            // failing. Reads (already wired above) don't depend on it,
-            // hence the ordering.
-            self.ensure_daemon_for_writes()?;
+            // covered write routes through a daemon, so without one running
+            // each would block for its full timeout before failing.
+            //
+            // Reads depend on it too now. They did not when this was
+            // written -- `open_read` opened the graph file directly -- but
+            // since reads were routed, no daemon means no reads at all.
+            crate::daemon::lifecycle::ensure_daemon_for_routed_access(&self.root)?;
             return Ok(());
         }
 
@@ -526,53 +528,6 @@ impl Infigraph {
                 }
             },
         }
-    }
-
-    /// "A daemon exists to serve this backend's writes" -- not a convenience,
-    /// a hard requirement: `INFIGRAPH_BACKEND=daemon` means every covered
-    /// write routes through one, so no daemon means every write blocks
-    /// forever (well, until its own multi-minute timeout) with nothing ever
-    /// consuming the request. This must therefore both (a) attempt to start
-    /// one regardless of the CI/`INFIGRAPH_NO_WATCH` opt-out -- that opt-out
-    /// exists to skip an optional convenience, and a backend the caller
-    /// explicitly selected is not optional -- and (b) fail fast with an
-    /// actionable message if none comes up, rather than silently returning
-    /// and letting the first write discover the problem 600s later.
-    fn ensure_daemon_for_writes(&self) -> Result<()> {
-        let lock_path = self.root.join(".infigraph").join("watch.lock");
-        if crate::daemon::lifecycle::daemon_is_alive(&lock_path) {
-            return Ok(());
-        }
-
-        let watch_binary = std::env::current_exe()
-            .map_err(anyhow::Error::from)
-            .and_then(|exe| crate::daemon::lifecycle::resolve_cli_binary_sibling_of(&exe))
-            .context("could not locate the infigraph CLI binary to start a daemon")?;
-
-        if let crate::daemon::lifecycle::DaemonStartOutcome::Failed(e) =
-            crate::daemon::lifecycle::ensure_daemon_running_required(&self.root, &watch_binary)
-        {
-            anyhow::bail!(
-                "INFIGRAPH_BACKEND=daemon requires a running daemon for {}, but starting \
-                 one failed: {e}. Start one manually with `infigraph daemon`.",
-                self.root.display()
-            );
-        }
-
-        if !crate::daemon::lifecycle::wait_for_daemon_ready(
-            &lock_path,
-            std::time::Duration::from_secs(10),
-        ) {
-            anyhow::bail!(
-                "INFIGRAPH_BACKEND=daemon is set but no daemon came up for {} within 10s \
-                 (auto-start attempted) -- every write would otherwise block until its own \
-                 timeout instead of failing here. Check `infigraph ps` / the daemon log, \
-                 start one with `infigraph daemon`, or unset INFIGRAPH_BACKEND to write \
-                 locally in this process.",
-                self.root.display()
-            );
-        }
-        Ok(())
     }
 
     fn wipe_graph(db_path: &Path) -> Result<()> {
