@@ -56,6 +56,12 @@ sysinfo = "0.39.6"
 # own request -- an implicit feature here already broke one build once.
 tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "time", "process", "macros", "sync"] }
 tokio-util = "0.7"
+# Portable local sockets for the daemon's read service: Unix domain socket
+# on Unix, named pipe on Windows, behind one API. `std` has no named-pipe
+# support, and a socket path under `.infigraph/` would overflow macOS's
+# ~104-byte `sun_path` for this repo's own `scratchpad/wt-*` worktrees --
+# see `daemon::read_endpoint`. Sync only; the async half needs `tokio`.
+interprocess = { version = "2.4.4", default-features = false }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

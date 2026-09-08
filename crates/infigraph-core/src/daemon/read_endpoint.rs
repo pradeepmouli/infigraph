@@ -7,7 +7,11 @@
 //! named pipes are not filesystem paths at all, so the identifier is opaque
 //! from the outset.
 
+use std::io::{self, Read, Write};
 use std::path::Path;
+
+use interprocess::local_socket::traits::{Listener as _, ListenerExt as _, Stream as _};
+use interprocess::local_socket::{GenericNamespaced, ListenerOptions, ToNsName};
 
 /// An opaque local-socket identity for one project's read service.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,6 +40,72 @@ impl ReadEndpoint {
     /// The transport-level name. Fixed length regardless of project depth.
     pub fn as_name(&self) -> String {
         self.name.clone()
+    }
+
+    /// Listen on this endpoint. Server side; the daemon calls this once.
+    pub fn bind(&self) -> io::Result<ReadListener> {
+        let name = self.name.as_str().to_ns_name::<GenericNamespaced>()?;
+        Ok(ReadListener {
+            inner: ListenerOptions::new().name(name).create_sync()?,
+        })
+    }
+
+    /// Open a connection to a listening read service. Client side.
+    pub fn connect(&self) -> io::Result<ReadStream> {
+        let name = self.name.as_str().to_ns_name::<GenericNamespaced>()?;
+        Ok(ReadStream {
+            inner: interprocess::local_socket::Stream::connect(name)?,
+        })
+    }
+}
+
+/// A bound read-service listener.
+///
+/// A newtype rather than a re-export of `interprocess`'s `Listener` for two
+/// reasons: it keeps the transport crate an implementation detail of this
+/// module (the one place its API shape appears), and `interprocess`'s API is
+/// trait-based -- an integration test in `tests/` links `infigraph_core` but
+/// not `infigraph_core`'s dependencies, so it could not bring those traits
+/// into scope to call `accept` at all.
+pub struct ReadListener {
+    inner: interprocess::local_socket::Listener,
+}
+
+impl ReadListener {
+    /// Block until one client connects.
+    pub fn accept(&self) -> io::Result<ReadStream> {
+        Ok(ReadStream {
+            inner: self.inner.accept()?,
+        })
+    }
+
+    /// Every client connection, in arrival order, forever.
+    pub fn incoming(&self) -> impl Iterator<Item = io::Result<ReadStream>> + '_ {
+        self.inner
+            .incoming()
+            .map(|s| s.map(|inner| ReadStream { inner }))
+    }
+}
+
+/// One client connection to the read service. `Read + Write`, so the
+/// framing in `read_protocol` works over it without knowing the transport.
+pub struct ReadStream {
+    inner: interprocess::local_socket::Stream,
+}
+
+impl Read for ReadStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.inner.read(buf)
+    }
+}
+
+impl Write for ReadStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
     }
 }
 
