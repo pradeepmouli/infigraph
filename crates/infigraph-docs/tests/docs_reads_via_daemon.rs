@@ -111,6 +111,84 @@ fn the_source_does_not_hold_the_store_open_between_reads() {
     svc.shutdown();
 }
 
+/// Serialises the env mutations below, following the pattern in
+/// infigraph-core's `settings.rs` tests.
+static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Under `INFIGRAPH_BACKEND=daemon`, `DocIndex` must pick the routed
+/// backend and its reads must be answered by the daemon -- not by opening
+/// `docs.kuzu` in this process.
+#[test]
+fn doc_index_routes_reads_through_the_daemon_when_the_daemon_store_is_selected() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    seed_one_document(root);
+
+    let docs = infigraph_docs::daemon_source::daemon_row_source(root).unwrap();
+    let svc = ReadService::start_with_sources(root, graph_source(root), Some(docs), 2).unwrap();
+
+    std::env::set_var("INFIGRAPH_BACKEND", "daemon");
+    let mut idx = infigraph_docs::DocIndex::open(root).unwrap();
+    let init = idx.init();
+    let hashes = init.and_then(|()| {
+        idx.store()
+            .expect("a backend must be selected")
+            .get_doc_hashes()
+    });
+    std::env::remove_var("INFIGRAPH_BACKEND");
+
+    let hashes = hashes.expect("a routed read must succeed against a live daemon");
+    assert!(
+        hashes.contains_key("a.md"),
+        "the routed read must return the seeded document: {hashes:?}"
+    );
+
+    svc.shutdown();
+}
+
+/// Reads are daemon-mandatory for documents too: with the daemon backend
+/// selected and nothing listening, a read must fail rather than silently
+/// opening `docs.kuzu` beside the daemon's own handle.
+#[test]
+fn a_routed_document_read_fails_when_no_daemon_is_listening() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    seed_one_document(root);
+
+    std::env::set_var("INFIGRAPH_BACKEND", "daemon");
+    let mut idx = infigraph_docs::DocIndex::open(root).unwrap();
+    let got = idx
+        .init()
+        .and_then(|()| idx.store().expect("a backend").get_doc_hashes());
+    std::env::remove_var("INFIGRAPH_BACKEND");
+
+    assert!(
+        got.is_err(),
+        "no daemon must be an error, not a silent direct open: {got:?}"
+    );
+}
+
+/// Documents have no daemon write protocol (unlike the code graph's
+/// file-drop WriteRequest), so a client-side write is refused explicitly
+/// rather than opening `docs.kuzu` beside the daemon's handle. Neo4j, being
+/// a real client/server DB, routes writes; the daemon cannot yet.
+#[test]
+fn a_routed_document_write_is_refused_with_an_explanation() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let backend = infigraph_docs::daemon_store::DaemonDocStore::new(root);
+    let err = infigraph_docs::backend::DocBackend::ensure_document_node(&backend, "a.md")
+        .expect_err("a write must be refused");
+    assert!(
+        err.to_string().contains("not routed through the daemon"),
+        "the refusal must say why: {err}"
+    );
+}
+
 // ── helpers ──────────────────────────────────────────────────────────
 
 /// Seed one document through the docs store's own open path, then drop it:

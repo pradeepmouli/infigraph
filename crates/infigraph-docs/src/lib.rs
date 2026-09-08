@@ -2,6 +2,7 @@ pub mod backend;
 pub mod chunk;
 pub mod combined;
 pub mod daemon_source;
+pub mod daemon_store;
 pub mod embed;
 pub mod extract;
 #[cfg(feature = "remote")]
@@ -75,6 +76,21 @@ impl DocIndex {
             let neo = neo4j_store::Neo4jDocStore::connect_from_env()?;
             neo.init_schema()?;
             self.store = Some(Box::new(neo));
+            return Ok(());
+        }
+
+        // Daemon-routed documents. Checked after the remote branch above:
+        // `INFIGRAPH_BACKEND` holds one value, so `neo4j` and `daemon` are
+        // mutually exclusive and Neo4j (a real client/server DB, which
+        // routes writes too) wins outright.
+        //
+        // The daemon process itself is spawned with `INFIGRAPH_BACKEND`
+        // removed (`daemon::lifecycle`), so it falls through to the local
+        // `DocStore` below and never routes into its own read service --
+        // which would deadlock, since indexing reads through a store it is
+        // holding and `DocStore::open` takes the process-wide `DB_LOCK`.
+        if infigraph_core::daemon_backend_selected() {
+            self.store = Some(Box::new(daemon_store::DaemonDocStore::new(&self.root)));
             return Ok(());
         }
 
