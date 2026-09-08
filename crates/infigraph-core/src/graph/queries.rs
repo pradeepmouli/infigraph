@@ -5,13 +5,31 @@ use serde::Serialize;
 use super::test_templates::{test_templates_for, TestTemplate};
 
 /// High-level graph query interface for analysis.
-pub struct GraphQuery<'a, 'db> {
-    conn: &'a Connection<'db>,
+///
+/// Read-only by construction: it runs on a [`QueryExec`], which is either a
+/// local Kuzu connection or the daemon's read service. The one method that
+/// used to write from here (`derive_tested_by_edges`) is now the free
+/// function [`derive_tested_by_edges`] taking a connection directly, because
+/// a write has no meaning over a read executor.
+pub struct GraphQuery<E: crate::graph::query_exec::QueryExec> {
+    exec: E,
 }
 
-impl<'a, 'db> GraphQuery<'a, 'db> {
+impl<'a, 'db> GraphQuery<crate::graph::query_exec::LocalExec<'a, 'db>> {
+    /// Build over a local Kuzu connection. Unchanged signature: every
+    /// existing call site keeps working, which is why the executor is owned
+    /// and generic rather than a borrowed trait object.
     pub fn new(conn: &'a Connection<'db>) -> Self {
-        Self { conn }
+        Self {
+            exec: crate::graph::query_exec::LocalExec::new(conn),
+        }
+    }
+}
+
+impl<E: crate::graph::query_exec::QueryExec> GraphQuery<E> {
+    /// Build over any executor -- notably the daemon's read service.
+    pub fn new_with(exec: E) -> Self {
+        Self { exec }
     }
 
     /// Find all symbols in a file.
@@ -21,8 +39,8 @@ impl<'a, 'db> GraphQuery<'a, 'db> {
             file.replace('\'', "\\'")
         );
         let result = self
-            .conn
-            .query(&query)
+            .exec
+            .query_rows(&query)
             .map_err(|e| anyhow::anyhow!("query failed: {e}"))?;
 
         let mut rows = Vec::new();
@@ -69,8 +87,8 @@ impl<'a, 'db> GraphQuery<'a, 'db> {
             symbol_id.replace('\'', "\\'")
         );
         let result = self
-            .conn
-            .query(&query)
+            .exec
+            .query_rows(&query)
             .map_err(|e| anyhow::anyhow!("branches_of failed: {e}"))?;
         let mut branches = Vec::new();
         for row in result {
@@ -95,8 +113,8 @@ impl<'a, 'db> GraphQuery<'a, 'db> {
             symbol_id.replace('\'', "\\'")
         );
         let result = self
-            .conn
-            .query(&query)
+            .exec
+            .query_rows(&query)
             .map_err(|e| anyhow::anyhow!("query failed: {e}"))?;
 
         let mut rows = Vec::new();
@@ -122,8 +140,8 @@ impl<'a, 'db> GraphQuery<'a, 'db> {
             start
         );
         let result = self
-            .conn
-            .query(&query)
+            .exec
+            .query_rows(&query)
             .map_err(|e| anyhow::anyhow!("query failed: {e}"))?;
 
         let mut rows = Vec::new();
@@ -148,12 +166,12 @@ impl<'a, 'db> GraphQuery<'a, 'db> {
             "MATCH (s:Symbol) WHERE s.id = '{}' RETURN s.id, s.name, s.kind, s.file, s.start_line, s.end_line",
             symbol_id.replace('\'', "\\'")
         );
-        let mut result = self
-            .conn
-            .query(&query)
+        let result = self
+            .exec
+            .query_rows(&query)
             .map_err(|e| anyhow::anyhow!("query failed: {e}"))?;
 
-        if let Some(row) = result.next() {
+        if let Some(row) = result.into_iter().next() {
             if row.len() >= 6 {
                 return Ok(Some(SymbolDetail {
                     id: row[0].to_string(),
@@ -178,8 +196,8 @@ impl<'a, 'db> GraphQuery<'a, 'db> {
             symbol_id.replace('\'', "\\'")
         );
         let result = self
-            .conn
-            .query(&q)
+            .exec
+            .query_rows(&q)
             .map_err(|e| anyhow::anyhow!("query failed: {e}"))?;
         let mut rows = Vec::new();
         for row in result {
@@ -203,8 +221,8 @@ impl<'a, 'db> GraphQuery<'a, 'db> {
                  RETURN s.id, s.name, s.kind, s.file, s.start_line, s.visibility, s.docstring \
                  ORDER BY s.file, s.start_line";
         let result = self
-            .conn
-            .query(q)
+            .exec
+            .query_rows(q)
             .map_err(|e| anyhow::anyhow!("query failed: {e}"))?;
         let mut rows = Vec::new();
         for row in result {
@@ -233,8 +251,8 @@ impl<'a, 'db> GraphQuery<'a, 'db> {
             esc
         );
         let r = self
-            .conn
-            .query(&q_out)
+            .exec
+            .query_rows(&q_out)
             .map_err(|e| anyhow::anyhow!("query failed: {e}"))?;
         let mut imports = Vec::new();
         for row in r {
@@ -252,8 +270,8 @@ impl<'a, 'db> GraphQuery<'a, 'db> {
             esc
         );
         let r2 = self
-            .conn
-            .query(&q_in)
+            .exec
+            .query_rows(&q_in)
             .map_err(|e| anyhow::anyhow!("query failed: {e}"))?;
         let mut imported_by = Vec::new();
         for row in r2 {
@@ -284,8 +302,8 @@ impl<'a, 'db> GraphQuery<'a, 'db> {
             max_depth, esc
         );
         let r = self
-            .conn
-            .query(&q_up)
+            .exec
+            .query_rows(&q_up)
             .map_err(|e| anyhow::anyhow!("query failed: {e}"))?;
         let mut ancestors = Vec::new();
         for row in r {
@@ -307,8 +325,8 @@ impl<'a, 'db> GraphQuery<'a, 'db> {
             max_depth, esc
         );
         let r2 = self
-            .conn
-            .query(&q_down)
+            .exec
+            .query_rows(&q_down)
             .map_err(|e| anyhow::anyhow!("query failed: {e}"))?;
         let mut descendants = Vec::new();
         for row in r2 {
@@ -345,8 +363,8 @@ impl<'a, 'db> GraphQuery<'a, 'db> {
                          WHERE s.kind IN ['Function','Method','Class','Struct','Trait','Interface'] \
                          RETURN DISTINCT s.id, s.name, s.kind, s.file, t.id";
         let r = self
-            .conn
-            .query(q_covered)
+            .exec
+            .query_rows(q_covered)
             .map_err(|e| anyhow::anyhow!("query failed: {e}"))?;
         let mut covered = Vec::new();
         for row in r {
@@ -367,8 +385,8 @@ impl<'a, 'db> GraphQuery<'a, 'db> {
                            RETURN s.id, s.name, s.kind, s.file \
                            ORDER BY s.file, s.start_line";
         let r2 = self
-            .conn
-            .query(q_uncovered)
+            .exec
+            .query_rows(q_uncovered)
             .map_err(|e| anyhow::anyhow!("query failed: {e}"))?;
         let mut uncovered = Vec::new();
         for row in r2 {
@@ -397,7 +415,7 @@ impl<'a, 'db> GraphQuery<'a, 'db> {
 
     pub fn cross_cutting_for(&self, symbol_id: &str) -> Result<Vec<(String, String)>> {
         let esc = crate::escape_str(symbol_id);
-        let result = self.conn.query(&format!(
+        let result = self.exec.query_rows(&format!(
             "MATCH (s:Symbol)-[:HAS_CONCERN]->(c:Concern) WHERE s.id = '{}' RETURN c.kind, c.detail",
             esc
         )).map_err(|e| anyhow::anyhow!("cross_cutting query failed: {e}"))?;
@@ -405,7 +423,7 @@ impl<'a, 'db> GraphQuery<'a, 'db> {
         let mut out = Vec::new();
         for row in result {
             if row.len() >= 2 {
-                out.push((row[0].to_string(), row[1].to_string()));
+                out.push((row[0].clone(), row[1].clone()));
             }
         }
         Ok(out)
@@ -413,42 +431,273 @@ impl<'a, 'db> GraphQuery<'a, 'db> {
 
     /// Run a raw Cypher query and return string results.
     pub fn raw_query(&self, cypher: &str) -> Result<Vec<Vec<String>>> {
-        let result = self
-            .conn
-            .query(cypher)
-            .map_err(|e| anyhow::anyhow!("query failed: {e}"))?;
-
-        let mut rows = Vec::new();
-        for row in result {
-            let string_row: Vec<String> = row.iter().map(|v| v.to_string()).collect();
-            rows.push(string_row);
-        }
-        Ok(rows)
+        // The single point where this type reaches its executor. Note the
+        // direction: `QueryExec` is the primitive and this is the thin
+        // wrapper. An executor delegating back into `GraphQuery` would
+        // recurse forever, since `GraphQuery` is generic over `QueryExec`.
+        self.exec.query_rows(cypher)
     }
 
-    /// Derive TESTED_BY edges from CALLS: if a Test symbol calls a non-test symbol,
-    /// create (called)-[:TESTED_BY]->(test). Returns number of edges created.
-    pub fn derive_tested_by_edges(&self) -> Result<usize> {
-        let _ = self
-            .conn
-            .query("MATCH (s:Symbol)-[r:TESTED_BY]->(t:Symbol) DELETE r");
-        self.conn
-            .query(
-                "MATCH (t:Symbol)-[:CALLS]->(s:Symbol) \
-             WHERE t.kind = 'Test' AND s.kind <> 'Test' \
-             CREATE (s)-[:TESTED_BY]->(t)",
+    // ── Reads moved down from `GraphStore` ───────────────────────────
+    //
+    // Same reasoning as the block below: these were Cypher plus row-parsing
+    // living on the store, which the remote path has no access to.
+
+    /// Node and edge counts.
+    ///
+    /// Seven separate counts, exactly as `GraphStore::stats` has always
+    /// issued them -- deliberately not folded into one query, so behaviour
+    /// is unchanged by the move.
+    pub fn stats(&self) -> Result<super::GraphStats> {
+        let count = |cypher: &str| -> Result<u64> {
+            Ok(self
+                .raw_query(cypher)?
+                .first()
+                .and_then(|row| row.first())
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0))
+        };
+        Ok(super::GraphStats {
+            symbols: count("MATCH (s:Symbol) RETURN count(s)")?,
+            modules: count("MATCH (m:Module) RETURN count(m)")?,
+            files: count("MATCH (f:File) RETURN count(f)")?,
+            folders: count("MATCH (d:Folder) RETURN count(d)")?,
+            calls: count("MATCH ()-[r:CALLS]->() RETURN count(r)")?,
+            inherits: count("MATCH ()-[r:INHERITS]->() RETURN count(r)")?,
+            contains: count("MATCH ()-[r:CONTAINS]->() RETURN count(r)")?,
+        })
+    }
+
+    /// `file -> content_hash` for every indexed module.
+    pub fn get_file_hashes(&self) -> Result<std::collections::HashMap<String, String>> {
+        let rows = self.raw_query("MATCH (m:Module) RETURN m.file, m.content_hash")?;
+        Ok(rows
+            .into_iter()
+            .filter(|r| r.len() >= 2)
+            .map(|r| (r[0].clone(), r[1].clone()))
+            .collect())
+    }
+
+    /// Every symbol as `(name, id, file, kind)` -- used by resolve_calls.
+    pub fn get_all_symbols(&self) -> Result<Vec<(String, String, String, String)>> {
+        let rows = self.raw_query("MATCH (s:Symbol) RETURN s.name, s.id, s.file, s.kind")?;
+        Ok(rows
+            .into_iter()
+            .filter(|r| r.len() >= 4)
+            .map(|r| (r[0].clone(), r[1].clone(), r[2].clone(), r[3].clone()))
+            .collect())
+    }
+
+    /// All symbols with 7 columns in fixed order:
+    /// `[id, name, kind, file, docstring, start_line, end_line]`.
+    pub fn get_symbols_for_search(&self) -> Result<Vec<Vec<String>>> {
+        self.raw_query(
+            "MATCH (s:Symbol) RETURN s.id, s.name, s.kind, s.file, s.docstring, s.start_line, s.end_line",
+        )
+    }
+
+    // ── Reads moved down from `KuzuBackend` ──────────────────────────
+    //
+    // These were written against `KuzuBackend` but only ever used
+    // `raw_query` plus row-parsing, so they belong here with every other
+    // read query. Keeping them upstairs meant the daemon's remote path
+    // would have had to re-implement each one over `RemoteExec` -- exactly
+    // the duplication this seam exists to avoid. `KuzuBackend` now
+    // delegates to them like its other read methods already do.
+
+    pub fn symbol_metadata(&self, id: &str) -> Result<Option<SymbolMeta>> {
+        let eid = crate::escape_str(id);
+        let meta_rows = self.raw_query(&format!(
+            "MATCH (s:Symbol) WHERE s.id = '{}' RETURN s.docstring, s.complexity",
+            eid
+        ))?;
+        if meta_rows.is_empty() {
+            return Ok(None);
+        }
+        let row = &meta_rows[0];
+        let docstring = row.first().cloned().unwrap_or_default();
+        let complexity: u32 = row.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+
+        let parent_rows = self.raw_query(&format!(
+            "MATCH (parent)-[:CONTAINS]->(s:Symbol) WHERE s.id = '{}' RETURN parent.id, parent.name",
+            eid
+        ))?;
+        let (parent_id, parent_name) = if let Some(pr) = parent_rows.first() {
+            (pr.first().cloned(), pr.get(1).cloned())
+        } else {
+            (None, None)
+        };
+
+        Ok(Some(SymbolMeta {
+            docstring,
+            complexity,
+            parent_id,
+            parent_name,
+        }))
+    }
+
+    pub fn get_architecture_stats(&self) -> Result<ArchitectureStats> {
+        let lang_rows =
+            self.raw_query("MATCH (m:Module) RETURN m.language, count(m) ORDER BY count(m) DESC")?;
+        let languages: Vec<LanguageCount> = lang_rows
+            .into_iter()
+            .filter_map(|r| {
+                Some(LanguageCount {
+                    language: r.first()?.clone(),
+                    count: r.get(1)?.parse().unwrap_or(0),
+                })
+            })
+            .collect();
+
+        let kind_rows =
+            self.raw_query("MATCH (s:Symbol) RETURN s.kind, count(s) ORDER BY count(s) DESC")?;
+        let kind_counts: Vec<KindCount> = kind_rows
+            .into_iter()
+            .filter_map(|r| {
+                Some(KindCount {
+                    kind: r.first()?.clone(),
+                    count: r.get(1)?.parse().unwrap_or(0),
+                })
+            })
+            .collect();
+
+        let hotspot_rows = self.raw_query(
+            "MATCH (s:Symbol) RETURN s.file, count(s) AS cnt ORDER BY cnt DESC LIMIT 10",
+        )?;
+        let hotspot_files: Vec<FileHotspot> = hotspot_rows
+            .into_iter()
+            .filter_map(|r| {
+                Some(FileHotspot {
+                    file: r.first()?.clone(),
+                    count: r.get(1)?.parse().unwrap_or(0),
+                })
+            })
+            .collect();
+
+        let hub_rows = self.raw_query(
+            "MATCH ()-[r:CALLS]->(s:Symbol) RETURN s.name, s.file, count(r) AS calls \
+             ORDER BY calls DESC LIMIT 10",
+        )?;
+        let hub_functions: Vec<HubFunction> = hub_rows
+            .into_iter()
+            .filter_map(|r| {
+                Some(HubFunction {
+                    name: r.first()?.clone(),
+                    file: r.get(1)?.clone(),
+                    calls: r.get(2)?.parse().unwrap_or(0),
+                })
+            })
+            .collect();
+
+        let entry_rows = self.raw_query(
+            "MATCH (s:Symbol)-[:CALLS]->() WHERE s.kind IN ['Function', 'Method'] \
+             AND NOT EXISTS { MATCH ()-[:CALLS]->(s) } \
+             RETURN DISTINCT s.id, s.name, s.kind, s.file ORDER BY s.file, s.name LIMIT 20",
+        )?;
+        let entry_points: Vec<DeadCodeRow> = entry_rows
+            .into_iter()
+            .filter_map(|r| {
+                Some(DeadCodeRow {
+                    id: r.first()?.clone(),
+                    name: r.get(1)?.clone(),
+                    kind: r.get(2)?.clone(),
+                    file: r.get(3)?.clone(),
+                })
+            })
+            .collect();
+
+        Ok(ArchitectureStats {
+            languages,
+            kind_counts,
+            hotspot_files,
+            hub_functions,
+            entry_points,
+        })
+    }
+
+    pub fn get_complexity_ranking(&self, file_filter: Option<&str>) -> Result<Vec<ComplexityRow>> {
+        let cypher = if let Some(f) = file_filter {
+            format!(
+                "MATCH (s:Symbol) WHERE (s.kind = 'Function' OR s.kind = 'Method' OR s.kind = 'Test') \
+                 AND s.file CONTAINS '{}' RETURN s.name, s.file, s.start_line, s.complexity \
+                 ORDER BY s.complexity DESC",
+                crate::escape_str(f)
             )
-            .map_err(|e| anyhow::anyhow!("derive TESTED_BY failed: {e}"))?;
-        let mut r = self
-            .conn
-            .query("MATCH ()-[r:TESTED_BY]->() RETURN count(r)")
-            .map_err(|e| anyhow::anyhow!("count TESTED_BY failed: {e}"))?;
-        let count = r
-            .next()
-            .and_then(|row| row.first().map(|v| v.to_string()))
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(0);
-        Ok(count)
+        } else {
+            "MATCH (s:Symbol) WHERE (s.kind = 'Function' OR s.kind = 'Method' OR s.kind = 'Test') \
+             RETURN s.name, s.file, s.start_line, s.complexity ORDER BY s.complexity DESC"
+                .to_string()
+        };
+        let rows = self.raw_query(&cypher)?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|r| {
+                Some(ComplexityRow {
+                    name: r.first()?.clone(),
+                    file: r.get(1)?.clone(),
+                    start_line: r.get(2)?.parse().unwrap_or(0),
+                    complexity: r.get(3)?.parse().unwrap_or(0),
+                })
+            })
+            .collect())
+    }
+
+    pub fn list_indexed_files(&self) -> Result<Vec<String>> {
+        let rows = self.raw_query("MATCH (s:Symbol) RETURN DISTINCT s.file ORDER BY s.file")?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|r| r.into_iter().next())
+            .collect())
+    }
+
+    pub fn find_uncalled_symbols(&self) -> Result<Vec<DeadCodeRow>> {
+        let rows = self.raw_query(
+            "MATCH (s:Symbol) WHERE s.kind IN ['Function', 'Method'] \
+             AND NOT EXISTS { MATCH ()-[:CALLS]->(s) } \
+             RETURN s.id, s.name, s.kind, s.file ORDER BY s.file, s.name",
+        )?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|r| {
+                Some(DeadCodeRow {
+                    id: r.first()?.clone(),
+                    name: r.get(1)?.clone(),
+                    kind: r.get(2)?.clone(),
+                    file: r.get(3)?.clone(),
+                })
+            })
+            .collect())
+    }
+
+    pub fn symbols_with_docstring(
+        &self,
+        kind_filter: Option<&[&str]>,
+    ) -> Result<Vec<SymbolWithDocstring>> {
+        let cypher = if let Some(kinds) = kind_filter {
+            let cond: Vec<String> = kinds
+                .iter()
+                .map(|k| format!("s.kind = '{}'", crate::escape_str(k)))
+                .collect();
+            format!(
+                "MATCH (s:Symbol) WHERE ({}) RETURN s.id, s.name, s.kind, s.file, s.docstring",
+                cond.join(" OR ")
+            )
+        } else {
+            "MATCH (s:Symbol) RETURN s.id, s.name, s.kind, s.file, s.docstring".to_string()
+        };
+        let rows = self.raw_query(&cypher)?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|r| {
+                Some(SymbolWithDocstring {
+                    id: r.first()?.clone(),
+                    name: r.get(1)?.clone(),
+                    kind: r.get(2)?.clone(),
+                    file: r.get(3)?.clone(),
+                    docstring: r.get(4).cloned().unwrap_or_default(),
+                })
+            })
+            .collect())
     }
 
     pub fn skeleton(&self, file: &str) -> Result<String> {
@@ -547,8 +796,8 @@ impl<'a, 'db> GraphQuery<'a, 'db> {
              ORDER BY s.complexity DESC, s.file, s.start_line",
         );
         let result = self
-            .conn
-            .query(&q)
+            .exec
+            .query_rows(&q)
             .map_err(|e| anyhow::anyhow!("generate_test_context query failed: {e}"))?;
 
         let mut targets = Vec::new();
@@ -612,8 +861,8 @@ impl<'a, 'db> GraphQuery<'a, 'db> {
     fn detect_test_framework(&self) -> Result<String> {
         let q = "MATCH (s:Symbol) WHERE s.kind = 'Test' RETURN s.docstring LIMIT 20";
         let result = self
-            .conn
-            .query(q)
+            .exec
+            .query_rows(q)
             .map_err(|e| anyhow::anyhow!("detect_test_framework failed: {e}"))?;
 
         let mut frameworks = std::collections::HashMap::new();
@@ -647,9 +896,9 @@ impl<'a, 'db> GraphQuery<'a, 'db> {
         }
 
         let q2 = "MATCH (d:Dependency) WHERE d.is_dev = true RETURN d.name LIMIT 100";
-        if let Ok(r2) = self.conn.query(q2) {
+        if let Ok(r2) = self.exec.query_rows(q2) {
             for row in r2 {
-                let dep = row.first().map(|v| v.to_string()).unwrap_or_default();
+                let dep = row.first().cloned().unwrap_or_default();
                 match dep.as_str() {
                     "jest" | "vitest" | "mocha" | "ava" | "tap" | "cypress" => {
                         return Ok(format!("javascript ({})", dep))
@@ -686,9 +935,9 @@ impl<'a, 'db> GraphQuery<'a, 'db> {
 
         let q3 = "MATCH (s:Symbol) WHERE s.kind = 'Test' \
                    RETURN s.language, count(s) ORDER BY count(s) DESC LIMIT 1";
-        if let Ok(mut r3) = self.conn.query(q3) {
-            if let Some(row) = r3.next() {
-                let lang = row.first().map(|v| v.to_string()).unwrap_or_default();
+        if let Ok(r3) = self.exec.query_rows(q3) {
+            if let Some(row) = r3.first() {
+                let lang = row.first().cloned().unwrap_or_default();
                 let fw = match lang.as_str() {
                     "go" => "go (go test)",
                     "elixir" => "elixir (ExUnit)",
@@ -732,12 +981,12 @@ impl<'a, 'db> GraphQuery<'a, 'db> {
                 .to_string()
         };
 
-        let mut result = self
-            .conn
-            .query(&q)
+        let result = self
+            .exec
+            .query_rows(&q)
             .map_err(|e| anyhow::anyhow!("find_example_test failed: {e}"))?;
 
-        if let Some(row) = result.next() {
+        if let Some(row) = result.into_iter().next() {
             if row.len() >= 5 {
                 return Ok(Some(ExampleTest {
                     symbol_id: row[0].to_string(),
@@ -752,18 +1001,40 @@ impl<'a, 'db> GraphQuery<'a, 'db> {
     }
 
     fn collect_strings(&self, query: &str) -> Result<Vec<String>> {
-        let result = self
-            .conn
-            .query(query)
-            .map_err(|e| anyhow::anyhow!("query failed: {e}"))?;
+        let result = self.exec.query_rows(query)?;
         let mut out = Vec::new();
         for row in result {
             if let Some(val) = row.first() {
-                out.push(val.to_string());
+                out.push(val.clone());
             }
         }
         Ok(out)
     }
+}
+
+/// Derive TESTED_BY edges from CALLS: if a Test symbol calls a non-test
+/// symbol, create (called)-[:TESTED_BY]->(test). Returns edges created.
+///
+/// A free function taking a connection, not a `GraphQuery` method: this is
+/// the only write that ever lived on that type, and `GraphQuery` now runs on
+/// a read-only executor that would refuse it.
+pub fn derive_tested_by_edges(conn: &Connection) -> Result<usize> {
+    let _ = conn.query("MATCH (s:Symbol)-[r:TESTED_BY]->(t:Symbol) DELETE r");
+    conn.query(
+        "MATCH (t:Symbol)-[:CALLS]->(s:Symbol) \
+         WHERE t.kind = 'Test' AND s.kind <> 'Test' \
+         CREATE (s)-[:TESTED_BY]->(t)",
+    )
+    .map_err(|e| anyhow::anyhow!("derive TESTED_BY failed: {e}"))?;
+    let mut r = conn
+        .query("MATCH ()-[r:TESTED_BY]->() RETURN count(r)")
+        .map_err(|e| anyhow::anyhow!("count TESTED_BY failed: {e}"))?;
+    let count = r
+        .next()
+        .and_then(|row| row.first().map(|v| v.to_string()))
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(0);
+    Ok(count)
 }
 
 #[derive(Debug, Serialize)]

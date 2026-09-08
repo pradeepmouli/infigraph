@@ -76,7 +76,16 @@ use graph::GraphStore;
 use lang::LanguageRegistry;
 use model::FileExtraction;
 
-pub(crate) fn escape_str(s: &str) -> String {
+/// Escape a value for interpolation into a Cypher string literal.
+///
+/// Backslash first, then quote -- reversing the order would re-escape the
+/// backslashes just inserted. Escaping only the quote is not merely weaker
+/// but wrong: Kuzu's literal parser consumes an unescaped backslash as an
+/// escape sequence, so the value stored is not the value given (Windows
+/// paths, raw-string literals in symbol names). Two hand-rolled quote-only
+/// copies of this existed and both were bugs; `infigraph-docs` now shares
+/// this one, which is why it is `pub`.
+pub fn escape_str(s: &str) -> String {
     s.replace('\\', "\\\\").replace('\'', "\\'")
 }
 
@@ -319,11 +328,13 @@ impl Infigraph {
             let dk = graph::DaemonKuzuBackend::open(&self.root)?;
             self.backend_kind = BackendKind::DaemonKuzu(dk);
             // Selecting this backend implies daemon-mode watching: every
-            // covered write routes through a daemon, so without one
-            // running each would block for its full timeout before
-            // failing. Reads (already wired above) don't depend on it,
-            // hence the ordering.
-            self.ensure_daemon_for_writes()?;
+            // covered write routes through a daemon, so without one running
+            // each would block for its full timeout before failing.
+            //
+            // Reads depend on it too now. They did not when this was
+            // written -- `open_read` opened the graph file directly -- but
+            // since reads were routed, no daemon means no reads at all.
+            crate::daemon::lifecycle::ensure_daemon_for_routed_access(&self.root)?;
             return Ok(());
         }
 
@@ -519,53 +530,6 @@ impl Infigraph {
         }
     }
 
-    /// "A daemon exists to serve this backend's writes" -- not a convenience,
-    /// a hard requirement: `INFIGRAPH_BACKEND=daemon` means every covered
-    /// write routes through one, so no daemon means every write blocks
-    /// forever (well, until its own multi-minute timeout) with nothing ever
-    /// consuming the request. This must therefore both (a) attempt to start
-    /// one regardless of the CI/`INFIGRAPH_NO_WATCH` opt-out -- that opt-out
-    /// exists to skip an optional convenience, and a backend the caller
-    /// explicitly selected is not optional -- and (b) fail fast with an
-    /// actionable message if none comes up, rather than silently returning
-    /// and letting the first write discover the problem 600s later.
-    fn ensure_daemon_for_writes(&self) -> Result<()> {
-        let lock_path = self.root.join(".infigraph").join("watch.lock");
-        if crate::daemon::lifecycle::daemon_is_alive(&lock_path) {
-            return Ok(());
-        }
-
-        let watch_binary = std::env::current_exe()
-            .map_err(anyhow::Error::from)
-            .and_then(|exe| crate::daemon::lifecycle::resolve_cli_binary_sibling_of(&exe))
-            .context("could not locate the infigraph CLI binary to start a daemon")?;
-
-        if let crate::daemon::lifecycle::DaemonStartOutcome::Failed(e) =
-            crate::daemon::lifecycle::ensure_daemon_running_required(&self.root, &watch_binary)
-        {
-            anyhow::bail!(
-                "INFIGRAPH_BACKEND=daemon requires a running daemon for {}, but starting \
-                 one failed: {e}. Start one manually with `infigraph daemon`.",
-                self.root.display()
-            );
-        }
-
-        if !crate::daemon::lifecycle::wait_for_daemon_ready(
-            &lock_path,
-            std::time::Duration::from_secs(10),
-        ) {
-            anyhow::bail!(
-                "INFIGRAPH_BACKEND=daemon is set but no daemon came up for {} within 10s \
-                 (auto-start attempted) -- every write would otherwise block until its own \
-                 timeout instead of failing here. Check `infigraph ps` / the daemon log, \
-                 start one with `infigraph daemon`, or unset INFIGRAPH_BACKEND to write \
-                 locally in this process.",
-                self.root.display()
-            );
-        }
-        Ok(())
-    }
-
     fn wipe_graph(db_path: &Path) -> Result<()> {
         // A wipe must never race a live writer: take the same per-graph lock
         // writers hold. Busy here means a live process -- refuse, don't destroy.
@@ -600,6 +564,19 @@ impl Infigraph {
     /// - `neo4j`: connects to remote Neo4j sidecar (no local DB)
     /// - default: opens embedded Kùzu in read-only mode
     pub fn init_read_only(&mut self) -> Result<()> {
+        // Reads are daemon-routed too, not just writes. Without this the
+        // read-only entry points -- which is most of the CLI and both of
+        // infigraph-mcp's helpers -- would keep opening the graph file
+        // directly under INFIGRAPH_BACKEND=daemon, and "the daemon is the
+        // only process that opens the graph" would be false for nearly
+        // every read.
+        if daemon_backend_selected() {
+            crate::daemon::lifecycle::ensure_daemon_for_routed_access(&self.root)?;
+            let dk = graph::DaemonKuzuBackend::open(&self.root)?;
+            self.backend_kind = BackendKind::DaemonKuzu(dk);
+            return Ok(());
+        }
+
         let backend_env = selected_backend();
 
         match backend_env.as_str() {
@@ -634,6 +611,21 @@ impl Infigraph {
     /// Neo4j has no local-graph crash-recovery concept, so it always
     /// returns `Ok(None)` there.
     pub fn init_read_only_or_degrade(&mut self) -> Result<Option<graph::DegradeReason>> {
+        // Reads are daemon-routed too, not just writes. Without this the
+        // read-only entry points -- which is most of the CLI and both of
+        // infigraph-mcp's helpers -- would keep opening the graph file
+        // directly under INFIGRAPH_BACKEND=daemon, and "the daemon is the
+        // only process that opens the graph" would be false for nearly
+        // every read.
+        if daemon_backend_selected() {
+            crate::daemon::lifecycle::ensure_daemon_for_routed_access(&self.root)?;
+            let dk = graph::DaemonKuzuBackend::open(&self.root)?;
+            self.backend_kind = BackendKind::DaemonKuzu(dk);
+            // No local graph file to degrade from -- the daemon owns it, the
+            // same reason the Neo4j arm returns None.
+            return Ok(None);
+        }
+
         let backend_env = selected_backend();
         match backend_env.as_str() {
             #[cfg(feature = "neo4j")]
@@ -1015,6 +1007,20 @@ impl Infigraph {
             #[cfg(feature = "neo4j")]
             BackendKind::Neo4j(neo) => Some(neo),
             BackendKind::DaemonKuzu(dk) => Some(dk),
+        }
+    }
+
+    /// The embedded graph store behind this instance, when there is one.
+    ///
+    /// `None` for `Uninit`, and for the Neo4j and DaemonKuzu backends, which
+    /// own no local `Database`. The daemon uses this to hand its read
+    /// service the SAME store its write path uses -- there must be exactly
+    /// one `Database` per graph file in a process, because a second handle
+    /// cannot see the first's uncommitted WAL (#149).
+    pub fn graph_store(&self) -> Option<std::sync::Arc<graph::GraphStore>> {
+        match &self.backend_kind {
+            BackendKind::Kuzu(kb) => Some(kb.store()),
+            _ => None,
         }
     }
 

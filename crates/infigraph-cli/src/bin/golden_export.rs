@@ -213,7 +213,9 @@ struct Samples {
     inherits_ids: Vec<String>,
 }
 
-fn pick_samples(q: &GraphQuery) -> Result<Samples> {
+fn pick_samples<E: infigraph_core::graph::query_exec::QueryExec>(
+    q: &GraphQuery<E>,
+) -> Result<Samples> {
     // Top 5 most-called symbols
     let top_called: Vec<Vec<String>> = q.raw_query(
         "MATCH (caller:Symbol)-[:CALLS]->(target:Symbol) \

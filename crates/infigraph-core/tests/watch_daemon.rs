@@ -574,6 +574,7 @@ fn watch_triggered_file_removal_contends_with_a_held_index_lock() {
             None,
             &token_for_thread,
             None,
+            None,
         )
     });
 
@@ -759,6 +760,7 @@ fn watch_loop_shuts_down_when_its_root_directory_is_deleted() {
             None,
             &token_for_thread,
             None,
+            None,
         )
     });
 
@@ -853,6 +855,7 @@ fn out_of_scope_write_request_contends_with_a_held_index_lock() {
             true, // serve_requests
             None,
             &token_for_thread,
+            None,
             None,
         )
     });
@@ -976,6 +979,7 @@ fn full_reindex_build_task_can_be_cancelled_before_it_starts_the_swap() {
             true, // serve_requests
             None,
             &token_for_thread,
+            None,
             None,
         )
     });
@@ -1105,6 +1109,7 @@ fn scip_enrichment_task_is_cancellable_via_daemon_token() {
             Some(on_full_reindex),
             &token_for_thread,
             None,
+            None,
         )
     });
 
@@ -1231,6 +1236,7 @@ fn watch_control_daemon_stop_ends_the_coordinator_loop() {
             None,
             &token_for_thread,
             None,
+            None,
         )
     });
 
@@ -1336,6 +1342,7 @@ fn watch_control_daemon_start_is_rejected_without_stopping_the_loop() {
             true, // serve_requests
             None,
             &token_for_thread,
+            None,
             None,
         )
     });
@@ -1445,6 +1452,7 @@ fn watch_control_docs_role_dispatches_to_the_registered_docs_control() {
             None,
             &token_for_thread,
             Some(docs_control),
+            None,
         )
     });
 
@@ -1543,6 +1551,7 @@ fn watch_control_docs_role_without_a_registered_control_replies_with_an_error() 
             None,
             &token_for_thread,
             None, // no docs_control registered
+            None, // no docs read source
         )
     });
 

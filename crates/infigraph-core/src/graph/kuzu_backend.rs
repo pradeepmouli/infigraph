@@ -14,10 +14,49 @@ use super::backend::{
 use super::queries::GraphQuery;
 use super::store::GraphStore;
 use super::{
-    ApiSymbol, ArchitectureStats, BranchInfo, ComplexityRow, DeadCodeRow, FileDeps, FileHotspot,
-    GraphStats, HubFunction, ImpactRow, KindCount, LanguageCount, ReferenceRow, SymbolDetail,
-    SymbolMeta, SymbolRow, SymbolWithDocstring, TestContext, TestCoverage, TypeHierarchy,
+    ApiSymbol, ArchitectureStats, BranchInfo, ComplexityRow, DeadCodeRow, FileDeps, GraphStats,
+    ImpactRow, ReferenceRow, SymbolDetail, SymbolMeta, SymbolRow, SymbolWithDocstring, TestContext,
+    TestCoverage, TypeHierarchy,
 };
+
+/// Whether `query` is a bare transaction-control statement.
+///
+/// These are no-ops on every path that opens a fresh connection per call:
+/// the transaction dies with the connection that opened it, so a later
+/// COMMIT would fail with "No active transaction". Extracted so the local
+/// backend and `DaemonKuzuBackend`'s daemon-routed reads answer identically
+/// rather than drifting.
+pub(crate) fn is_transaction_control(query: &str) -> bool {
+    let trimmed = query.trim_end_matches(';').trim();
+    trimmed.eq_ignore_ascii_case("BEGIN TRANSACTION")
+        || trimmed.eq_ignore_ascii_case("BEGIN")
+        || trimmed.eq_ignore_ascii_case("COMMIT")
+        || trimmed.eq_ignore_ascii_case("ROLLBACK")
+}
+
+/// The body of `KuzuBackend::raw_query`, reachable with only a store.
+///
+/// The daemon's read service serves from an `Arc<GraphStore>` and has no
+/// `KuzuBackend` to call the trait method on, but must not re-derive this:
+/// the transaction-control no-op below is load-bearing, and a hand-rolled
+/// connection + stringify in the read service would silently drop it.
+///
+/// Each call opens a fresh Connection (see GraphStore::connection), so
+/// BEGIN TRANSACTION/COMMIT/ROLLBACK issued through this method can never
+/// span multiple statements -- the transaction dies with the connection that
+/// opened it, and a later call's COMMIT then fails with "No active
+/// transaction." Kuzu auto-commits each statement individually outside an
+/// explicit transaction, so no-op these exactly like Neo4jBackend::raw_query
+/// already does, rather than let every multi-statement "transactional" write
+/// silently break.
+pub(crate) fn raw_query_on(store: &GraphStore, query: &str) -> Result<Vec<Vec<String>>> {
+    if is_transaction_control(query) {
+        return Ok(Vec::new());
+    }
+    let conn = store.connection()?;
+    let q = GraphQuery::new(&conn);
+    q.raw_query(query)
+}
 
 /// Kùzu-backed graph storage (embedded, local mode).
 ///
@@ -25,30 +64,46 @@ use super::{
 /// the write lock internally. Single-writer — concurrent `upsert_files_bulk`
 /// calls will serialize on the lock.
 pub struct KuzuBackend {
-    store: GraphStore,
+    /// Shared, so the daemon's read service can serve from the SAME
+    /// `Database` this backend writes through. There must be exactly one
+    /// `Database` per graph file in a process: a second handle cannot see
+    /// the first's uncommitted WAL and silently serves stale or empty
+    /// results (#149, and `tests/read_service.rs` pins it).
+    store: std::sync::Arc<GraphStore>,
 }
 
 impl KuzuBackend {
     pub fn open(path: &Path) -> Result<Self> {
         let store = GraphStore::open(path)?;
-        Ok(Self { store })
+        Ok(Self::from_store(store))
     }
 
     pub fn open_read_only(path: &Path) -> Result<Self> {
         let store = GraphStore::open_read_only(path)?;
-        Ok(Self { store })
+        Ok(Self::from_store(store))
     }
 
     pub fn open_read_only_or_degrade(
         path: &Path,
     ) -> Result<(Self, Option<super::store::DegradeReason>)> {
         let (store, reason) = GraphStore::open_read_only_or_degrade(path)?;
-        Ok((Self { store }, reason))
+        Ok((Self::from_store(store), reason))
     }
 
     /// Wrap an already-opened GraphStore (avoids double-open).
+    ///
+    /// Still takes the store by value: all 21 call sites hand over an owned
+    /// one, and sharing is this type's business, not theirs.
     pub fn from_store(store: GraphStore) -> Self {
-        Self { store }
+        Self {
+            store: std::sync::Arc::new(store),
+        }
+    }
+
+    /// A handle to this backend's store, so the daemon's read service can
+    /// serve from the same `Database` the write path uses.
+    pub fn store(&self) -> std::sync::Arc<GraphStore> {
+        self.store.clone()
     }
 
     /// Access underlying GraphStore (escape hatch for callers that
@@ -56,10 +111,6 @@ impl KuzuBackend {
     pub fn inner(&self) -> &GraphStore {
         &self.store
     }
-}
-
-fn escape(s: &str) -> String {
-    s.replace('\'', "\\'")
 }
 
 impl GraphBackend for KuzuBackend {
@@ -181,202 +232,34 @@ impl GraphBackend for KuzuBackend {
     // ── Read: raw query ──────────────────────────────────────────────
 
     fn raw_query(&self, query: &str) -> Result<Vec<Vec<String>>> {
-        // Each call opens a fresh Connection (see GraphStore::connection), so
-        // BEGIN TRANSACTION/COMMIT/ROLLBACK issued through this method can
-        // never span multiple statements -- the transaction dies with the
-        // connection that opened it, and a later call's COMMIT then fails
-        // with "No active transaction." Kuzu auto-commits each statement
-        // individually outside an explicit transaction, so no-op these
-        // exactly like Neo4jBackend::raw_query already does, rather than
-        // let every multi-statement "transactional" write silently break.
-        let trimmed = query.trim_end_matches(';').trim();
-        if trimmed.eq_ignore_ascii_case("BEGIN TRANSACTION")
-            || trimmed.eq_ignore_ascii_case("BEGIN")
-            || trimmed.eq_ignore_ascii_case("COMMIT")
-            || trimmed.eq_ignore_ascii_case("ROLLBACK")
-        {
-            return Ok(Vec::new());
-        }
-        let conn = self.store.connection()?;
-        let q = GraphQuery::new(&conn);
-        q.raw_query(query)
+        raw_query_on(&self.store, query)
     }
 
     // ── Phase-2: backend-agnostic query methods ──────────────────────
 
     fn symbol_metadata(&self, id: &str) -> Result<Option<SymbolMeta>> {
         let conn = self.store.connection()?;
-        let q = GraphQuery::new(&conn);
-        let eid = escape(id);
-        let meta_rows = q.raw_query(&format!(
-            "MATCH (s:Symbol) WHERE s.id = '{}' RETURN s.docstring, s.complexity",
-            eid
-        ))?;
-        if meta_rows.is_empty() {
-            return Ok(None);
-        }
-        let row = &meta_rows[0];
-        let docstring = row.first().cloned().unwrap_or_default();
-        let complexity: u32 = row.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
-
-        let parent_rows = q.raw_query(&format!(
-            "MATCH (parent)-[:CONTAINS]->(s:Symbol) WHERE s.id = '{}' RETURN parent.id, parent.name",
-            eid
-        ))?;
-        let (parent_id, parent_name) = if let Some(pr) = parent_rows.first() {
-            (pr.first().cloned(), pr.get(1).cloned())
-        } else {
-            (None, None)
-        };
-
-        Ok(Some(SymbolMeta {
-            docstring,
-            complexity,
-            parent_id,
-            parent_name,
-        }))
+        GraphQuery::new(&conn).symbol_metadata(id)
     }
 
     fn get_complexity_ranking(&self, file_filter: Option<&str>) -> Result<Vec<ComplexityRow>> {
         let conn = self.store.connection()?;
-        let q = GraphQuery::new(&conn);
-        let cypher = if let Some(f) = file_filter {
-            format!(
-                "MATCH (s:Symbol) WHERE (s.kind = 'Function' OR s.kind = 'Method' OR s.kind = 'Test') \
-                 AND s.file CONTAINS '{}' RETURN s.name, s.file, s.start_line, s.complexity \
-                 ORDER BY s.complexity DESC",
-                escape(f)
-            )
-        } else {
-            "MATCH (s:Symbol) WHERE (s.kind = 'Function' OR s.kind = 'Method' OR s.kind = 'Test') \
-             RETURN s.name, s.file, s.start_line, s.complexity ORDER BY s.complexity DESC"
-                .to_string()
-        };
-        let rows = q.raw_query(&cypher)?;
-        Ok(rows
-            .into_iter()
-            .filter_map(|r| {
-                Some(ComplexityRow {
-                    name: r.first()?.clone(),
-                    file: r.get(1)?.clone(),
-                    start_line: r.get(2)?.parse().unwrap_or(0),
-                    complexity: r.get(3)?.parse().unwrap_or(0),
-                })
-            })
-            .collect())
+        GraphQuery::new(&conn).get_complexity_ranking(file_filter)
     }
 
     fn list_indexed_files(&self) -> Result<Vec<String>> {
         let conn = self.store.connection()?;
-        let q = GraphQuery::new(&conn);
-        let rows = q.raw_query("MATCH (s:Symbol) RETURN DISTINCT s.file ORDER BY s.file")?;
-        Ok(rows
-            .into_iter()
-            .filter_map(|r| r.into_iter().next())
-            .collect())
+        GraphQuery::new(&conn).list_indexed_files()
     }
 
     fn find_uncalled_symbols(&self) -> Result<Vec<DeadCodeRow>> {
         let conn = self.store.connection()?;
-        let q = GraphQuery::new(&conn);
-        let rows = q.raw_query(
-            "MATCH (s:Symbol) WHERE s.kind IN ['Function', 'Method'] \
-             AND NOT EXISTS { MATCH ()-[:CALLS]->(s) } \
-             RETURN s.id, s.name, s.kind, s.file ORDER BY s.file, s.name",
-        )?;
-        Ok(rows
-            .into_iter()
-            .filter_map(|r| {
-                Some(DeadCodeRow {
-                    id: r.first()?.clone(),
-                    name: r.get(1)?.clone(),
-                    kind: r.get(2)?.clone(),
-                    file: r.get(3)?.clone(),
-                })
-            })
-            .collect())
+        GraphQuery::new(&conn).find_uncalled_symbols()
     }
 
     fn get_architecture_stats(&self) -> Result<ArchitectureStats> {
         let conn = self.store.connection()?;
-        let q = GraphQuery::new(&conn);
-
-        let lang_rows =
-            q.raw_query("MATCH (m:Module) RETURN m.language, count(m) ORDER BY count(m) DESC")?;
-        let languages: Vec<LanguageCount> = lang_rows
-            .into_iter()
-            .filter_map(|r| {
-                Some(LanguageCount {
-                    language: r.first()?.clone(),
-                    count: r.get(1)?.parse().unwrap_or(0),
-                })
-            })
-            .collect();
-
-        let kind_rows =
-            q.raw_query("MATCH (s:Symbol) RETURN s.kind, count(s) ORDER BY count(s) DESC")?;
-        let kind_counts: Vec<KindCount> = kind_rows
-            .into_iter()
-            .filter_map(|r| {
-                Some(KindCount {
-                    kind: r.first()?.clone(),
-                    count: r.get(1)?.parse().unwrap_or(0),
-                })
-            })
-            .collect();
-
-        let hotspot_rows = q.raw_query(
-            "MATCH (s:Symbol) RETURN s.file, count(s) AS cnt ORDER BY cnt DESC LIMIT 10",
-        )?;
-        let hotspot_files: Vec<FileHotspot> = hotspot_rows
-            .into_iter()
-            .filter_map(|r| {
-                Some(FileHotspot {
-                    file: r.first()?.clone(),
-                    count: r.get(1)?.parse().unwrap_or(0),
-                })
-            })
-            .collect();
-
-        let hub_rows = q.raw_query(
-            "MATCH ()-[r:CALLS]->(s:Symbol) RETURN s.name, s.file, count(r) AS calls \
-             ORDER BY calls DESC LIMIT 10",
-        )?;
-        let hub_functions: Vec<HubFunction> = hub_rows
-            .into_iter()
-            .filter_map(|r| {
-                Some(HubFunction {
-                    name: r.first()?.clone(),
-                    file: r.get(1)?.clone(),
-                    calls: r.get(2)?.parse().unwrap_or(0),
-                })
-            })
-            .collect();
-
-        let entry_rows = q.raw_query(
-            "MATCH (s:Symbol)-[:CALLS]->() WHERE s.kind IN ['Function', 'Method'] \
-             AND NOT EXISTS { MATCH ()-[:CALLS]->(s) } \
-             RETURN DISTINCT s.id, s.name, s.kind, s.file ORDER BY s.file, s.name LIMIT 20",
-        )?;
-        let entry_points: Vec<DeadCodeRow> = entry_rows
-            .into_iter()
-            .filter_map(|r| {
-                Some(DeadCodeRow {
-                    id: r.first()?.clone(),
-                    name: r.get(1)?.clone(),
-                    kind: r.get(2)?.clone(),
-                    file: r.get(3)?.clone(),
-                })
-            })
-            .collect();
-
-        Ok(ArchitectureStats {
-            languages,
-            kind_counts,
-            hotspot_files,
-            hub_functions,
-            entry_points,
-        })
+        GraphQuery::new(&conn).get_architecture_stats()
     }
 
     fn symbols_with_docstring(
@@ -384,32 +267,7 @@ impl GraphBackend for KuzuBackend {
         kind_filter: Option<&[&str]>,
     ) -> Result<Vec<SymbolWithDocstring>> {
         let conn = self.store.connection()?;
-        let q = GraphQuery::new(&conn);
-        let cypher = if let Some(kinds) = kind_filter {
-            let cond: Vec<String> = kinds
-                .iter()
-                .map(|k| format!("s.kind = '{}'", escape(k)))
-                .collect();
-            format!(
-                "MATCH (s:Symbol) WHERE ({}) RETURN s.id, s.name, s.kind, s.file, s.docstring",
-                cond.join(" OR ")
-            )
-        } else {
-            "MATCH (s:Symbol) RETURN s.id, s.name, s.kind, s.file, s.docstring".to_string()
-        };
-        let rows = q.raw_query(&cypher)?;
-        Ok(rows
-            .into_iter()
-            .filter_map(|r| {
-                Some(SymbolWithDocstring {
-                    id: r.first()?.clone(),
-                    name: r.get(1)?.clone(),
-                    kind: r.get(2)?.clone(),
-                    file: r.get(3)?.clone(),
-                    docstring: r.get(4).cloned().unwrap_or_default(),
-                })
-            })
-            .collect())
+        GraphQuery::new(&conn).symbols_with_docstring(kind_filter)
     }
 
     fn upsert_similar_edge(&self, id_a: &str, id_b: &str, score: f32) -> Result<()> {
@@ -417,8 +275,8 @@ impl GraphBackend for KuzuBackend {
         conn.query(&format!(
             "MATCH (a:Symbol), (b:Symbol) WHERE a.id = '{}' AND b.id = '{}' \
              MERGE (a)-[r:SIMILAR_TO]->(b) SET r.score = {}",
-            escape(id_a),
-            escape(id_b),
+            crate::escape_str(id_a),
+            crate::escape_str(id_b),
             score
         ))
         .map_err(|e| anyhow::anyhow!("upsert_similar_edge failed: {}", e))?;
@@ -627,14 +485,14 @@ impl GraphBackend for KuzuBackend {
     fn write_cross_service_edges(&self, candidates: &[CrossServiceEdgeCandidate]) -> Result<usize> {
         let mut created = 0;
         for c in candidates {
-            let target_id = escape(&c.target_id);
-            let target_name = escape(&c.target_name);
-            let docstring = escape(&c.docstring);
-            let caller_sym = escape(&c.caller_symbol_id);
-            let method = escape(&c.method);
-            let path = escape(&c.path);
-            let target_svc = escape(&c.target_service);
-            let protocol = escape(&c.protocol);
+            let target_id = crate::escape_str(&c.target_id);
+            let target_name = crate::escape_str(&c.target_name);
+            let docstring = crate::escape_str(&c.docstring);
+            let caller_sym = crate::escape_str(&c.caller_symbol_id);
+            let method = crate::escape_str(&c.method);
+            let path = crate::escape_str(&c.path);
+            let target_svc = crate::escape_str(&c.target_service);
+            let protocol = crate::escape_str(&c.protocol);
 
             let create_target = format!(
                 "MERGE (t:Symbol {{id: '{target_id}'}}) \
@@ -668,20 +526,20 @@ impl GraphBackend for KuzuBackend {
             let id = format!("{}::{}", dep.ecosystem, dep.name);
             let check = format!(
                 "MATCH (d:Dependency) WHERE d.id = '{}' RETURN d.id",
-                escape(&id)
+                crate::escape_str(&id)
             );
             let existing = self.raw_query(&check)?;
             if existing.is_empty() {
                 let insert = format!(
                     "CREATE (d:Dependency {{id: '{}', name: '{}', version: '{}', ecosystem: '{}', is_dev: {}}})",
-                    escape(&id), escape(&dep.name), escape(&dep.version), escape(&dep.ecosystem), dep.is_dev
+                    crate::escape_str(&id), crate::escape_str(&dep.name), crate::escape_str(&dep.version), crate::escape_str(&dep.ecosystem), dep.is_dev
                 );
                 self.raw_query(&insert)?;
             } else {
                 let update = format!(
                     "MATCH (d:Dependency) WHERE d.id = '{}' SET d.version = '{}', d.is_dev = {}",
-                    escape(&id),
-                    escape(&dep.version),
+                    crate::escape_str(&id),
+                    crate::escape_str(&dep.version),
                     dep.is_dev
                 );
                 self.raw_query(&update)?;
@@ -690,21 +548,22 @@ impl GraphBackend for KuzuBackend {
             // Scope the DEPENDS_ON edge to THIS repo's modules. Without the repo guard,
             // `m.file CONTAINS 'pyproject.toml'` matches every repo's manifest module in a
             // shared graph, cross-linking one repo's deps onto all others.
-            let manifest_base = escape(result.manifest_file.rsplit('/').next().unwrap_or(""));
+            let manifest_base =
+                crate::escape_str(result.manifest_file.rsplit('/').next().unwrap_or(""));
             let rel = if let Some(repo) = self.repo_filter() {
-                let r = escape(repo);
+                let r = crate::escape_str(repo);
                 format!(
                     "MATCH (m:Module), (d:Dependency) \
                      WHERE m.file STARTS WITH '{r}/' AND m.file CONTAINS '{manifest_base}' AND d.id = '{}' \
                      CREATE (m)-[:DEPENDS_ON {{is_dev: {}}}]->(d)",
-                    escape(&id),
+                    crate::escape_str(&id),
                     dep.is_dev
                 )
             } else {
                 format!(
                     "MATCH (m:Module), (d:Dependency) WHERE m.file CONTAINS '{manifest_base}' AND d.id = '{}' \
                      CREATE (m)-[:DEPENDS_ON {{is_dev: {}}}]->(d)",
-                    escape(&id),
+                    crate::escape_str(&id),
                     dep.is_dev
                 )
             };
@@ -751,9 +610,9 @@ impl GraphBackend for KuzuBackend {
 
             let create_cluster = format!(
                 "CREATE (c:Cluster {{id: '{}', name: '{}', description: '{}'}})",
-                escape(&cluster_id),
-                escape(&cluster_name),
-                escape(&description),
+                crate::escape_str(&cluster_id),
+                crate::escape_str(&cluster_name),
+                crate::escape_str(&description),
             );
             self.raw_query(&create_cluster)?;
 
@@ -761,8 +620,8 @@ impl GraphBackend for KuzuBackend {
                 let sym_id = &idx_to_id[node];
                 let create_edge = format!(
                     "MATCH (s:Symbol), (c:Cluster) WHERE s.id = '{}' AND c.id = '{}' CREATE (s)-[:MEMBER_OF]->(c)",
-                    escape(sym_id),
-                    escape(&cluster_id),
+                    crate::escape_str(sym_id),
+                    crate::escape_str(&cluster_id),
                 );
                 self.raw_query(&create_edge)?;
             }
@@ -887,7 +746,7 @@ impl KuzuBackend {
     ) -> Result<()> {
         let file_list: Vec<String> = extractions
             .iter()
-            .map(|e| format!("'{}'", escape(&e.file)))
+            .map(|e| format!("'{}'", crate::escape_str(&e.file)))
             .collect();
         let files_in = file_list.join(", ");
 

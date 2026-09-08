@@ -634,6 +634,21 @@ pub(crate) fn cmd_daemon(root: &Path, debounce: u64) -> Result<()> {
             },
         );
 
+    // The document half of the read service. Opened here because
+    // `infigraph-core` cannot name `DocStore`. A failure is not fatal: the
+    // daemon still serves the code graph, and a document read then gets an
+    // explicit refusal rather than silently opening `docs.kuzu` itself.
+    let docs_reads = match infigraph_docs::daemon_source::daemon_row_source(root) {
+        Ok(source) => Some(source),
+        Err(e) => {
+            eprintln!(
+                "[read] document reads unavailable for {}: {e:#}",
+                root.display()
+            );
+            None
+        }
+    };
+
     let coordinator = infigraph_core::daemon::run_write_coordinator(
         root,
         bundled_registry,
@@ -648,6 +663,7 @@ pub(crate) fn cmd_daemon(root: &Path, debounce: u64) -> Result<()> {
         Some(on_full_reindex),
         &daemon_token,
         Some(docs_control),
+        docs_reads,
     );
 
     // Unconditional, so the paths that leave the loop without going through

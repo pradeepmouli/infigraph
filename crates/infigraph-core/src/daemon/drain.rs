@@ -225,7 +225,7 @@ mod tests {
         request_path: &std::path::Path,
         queue: &std::sync::Arc<std::sync::Mutex<crate::daemon::queue::IndexWorkQueue>>,
         make_registry: &MR,
-        held: &mut Option<std::sync::Arc<crate::Infigraph>>,
+        held: &mut crate::daemon::HeldPrism,
     ) where
         MR: Fn() -> Result<crate::lang::LanguageRegistry>,
     {
@@ -374,7 +374,7 @@ mod tests {
         let queue = std::sync::Arc::new(std::sync::Mutex::new(
             crate::daemon::queue::IndexWorkQueue::new(),
         ));
-        let mut held: Option<std::sync::Arc<crate::Infigraph>> = None;
+        let mut held = crate::daemon::HeldPrism::new();
         let make_registry = || Ok(python_registry());
 
         let request_path = root.join(".infigraph").join("fullreindex.request");
@@ -476,7 +476,7 @@ mod tests {
         let queue = std::sync::Arc::new(std::sync::Mutex::new(
             crate::daemon::queue::IndexWorkQueue::new(),
         ));
-        let mut held: Option<std::sync::Arc<crate::Infigraph>> = None;
+        let mut held = crate::daemon::HeldPrism::new();
         let make_registry = || Ok(python_registry());
 
         let request_path = infigraph_dir.join("fullreindex.request");
@@ -533,7 +533,7 @@ mod tests {
         let queue = std::sync::Arc::new(std::sync::Mutex::new(
             crate::daemon::queue::IndexWorkQueue::new(),
         ));
-        let mut held: Option<std::sync::Arc<crate::Infigraph>> = None;
+        let mut held = crate::daemon::HeldPrism::new();
         let make_registry = || Ok(python_registry());
 
         let request_path = root.join(".infigraph").join("fullreindex.request");
@@ -585,7 +585,7 @@ mod tests {
         let queue = std::sync::Arc::new(std::sync::Mutex::new(
             crate::daemon::queue::IndexWorkQueue::new(),
         ));
-        let mut held: Option<std::sync::Arc<crate::Infigraph>> = None;
+        let mut held = crate::daemon::HeldPrism::new();
         let make_registry = || Err(anyhow::anyhow!("injected registry failure"));
 
         let request_path = root.join(".infigraph").join("fullreindex.request");
@@ -658,7 +658,7 @@ mod tests {
             paths: None,
         });
 
-        let mut held: Option<std::sync::Arc<crate::Infigraph>> = None;
+        let mut held = crate::daemon::HeldPrism::new();
         let make_registry = || Ok(python_registry());
 
         let request_path = root.join(".infigraph").join("fullreindex.request");

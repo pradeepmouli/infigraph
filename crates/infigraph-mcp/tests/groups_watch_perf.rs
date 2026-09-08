@@ -296,19 +296,18 @@ fn test_groups_watch_perf() {
 
     // ==================== WATCHER TOOLS ====================
 
-    // Stop any watchers started by group_index auto_start_watch
-    {
-        let mut guard = get_watchers();
-        if let Some(map) = guard.as_mut() {
-            let ids: Vec<String> = map.keys().cloned().collect();
-            for id in ids {
-                if let Some(entry) = map.remove(&id) {
-                    let _ = entry.stop_tx.send(());
-                }
-            }
-        }
-    }
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    // Stop any watchers started by group_index auto_start_watch.
+    //
+    // This used to send `stop_tx` and sleep a fixed 200ms, which lost a
+    // race: a stopped watcher notices `stop_rx` on its own poll cadence and
+    // may still be mid-reindex, so `.infigraph/watch.lock` is not released
+    // when the signal is sent. `tool_watch_project` below then failed with
+    // "another watcher is already running" -- the cross-process lock probe,
+    // not the in-process map, which the drain had already emptied.
+    // `stop_in_process_watchers_for` is the shared helper that waits for the
+    // lock, and these two repos are exactly the ones group_index watched.
+    support::stop_in_process_watchers_for(std::path::Path::new(&fix.svc_a_path));
+    support::stop_in_process_watchers_for(std::path::Path::new(&fix.svc_b_path));
 
     // --- watch_project ---
     let result = tool_watch_project(&json!({

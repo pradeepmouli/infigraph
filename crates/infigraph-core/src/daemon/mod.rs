@@ -2,6 +2,10 @@ pub(crate) mod backoff;
 pub(crate) mod drain;
 pub mod lifecycle;
 pub mod queue;
+pub mod read_endpoint;
+pub mod read_guard;
+pub mod read_protocol;
+pub mod read_service;
 pub mod task;
 
 use std::path::{Path, PathBuf};
@@ -25,6 +29,10 @@ use crate::Infigraph;
 /// background work, serving `.request` files, scheduling drains) is still
 /// polled, on the same ~200ms cadence `rx.recv_timeout` used to impose.
 const COORDINATOR_TICK: Duration = Duration::from_millis(200);
+
+/// Read-service workers. Fixed so a burst of clients waits for a free
+/// worker instead of spawning unbounded threads inside the daemon.
+const READ_SERVICE_WORKERS: usize = 8;
 
 /// How often the coordinator loop re-checks whether the on-disk binary has
 /// changed since this process started. Deliberately independent of
@@ -406,6 +414,68 @@ pub fn ensure_watchable_root(root: &Path) -> Result<()> {
     )
 }
 
+/// A read-only view of the coordinator's *current* `Infigraph`, shared with
+/// the daemon's read service.
+///
+/// `Option` because the coordinator opens its prism lazily and drops it
+/// again on `poison_watch_db`; the read service must cope with both.
+pub type PrismBeacon = Arc<Mutex<Option<Arc<Infigraph>>>>;
+
+/// The watch session's shared `Infigraph`, together with the beacon that
+/// publishes it to the read service.
+///
+/// A newtype rather than a bare `Option<Arc<Infigraph>>` so that publishing
+/// cannot be forgotten. The prism is opened lazily by `watch_db` and dropped
+/// by `poison_watch_db` -- after a full reindex swaps the graph file, for
+/// instance -- and a read service that captured the handle it saw at startup
+/// would keep serving a replaced `Database`. That is the second-handle
+/// failure `tests/read_service.rs` pins, and it is silent: stale or empty
+/// rows, no error. Every mutation here goes through `set`/`clear`, which
+/// update the beacon in the same breath.
+pub(crate) struct HeldPrism {
+    held: Option<Arc<Infigraph>>,
+    beacon: PrismBeacon,
+}
+
+impl HeldPrism {
+    pub(crate) fn new() -> Self {
+        Self {
+            held: None,
+            beacon: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// A handle the read service resolves per request.
+    pub(crate) fn beacon(&self) -> PrismBeacon {
+        self.beacon.clone()
+    }
+
+    pub(crate) fn current(&self) -> Option<Arc<Infigraph>> {
+        self.held.clone()
+    }
+
+    pub(crate) fn as_ref(&self) -> Option<&Arc<Infigraph>> {
+        self.held.as_ref()
+    }
+
+    pub(crate) fn is_none(&self) -> bool {
+        self.held.is_none()
+    }
+
+    pub(crate) fn set(&mut self, prism: Arc<Infigraph>) {
+        self.held = Some(Arc::clone(&prism));
+        *self.beacon.lock().unwrap_or_else(|e| e.into_inner()) = Some(prism);
+    }
+
+    pub(crate) fn clear(&mut self) {
+        // Beacon first, so the last `Arc` still drops inside
+        // `poison_watch_db`'s `write_phase` breadcrumb (#132) rather than on
+        // whichever read-service thread happened to hold the final clone.
+        *self.beacon.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        self.held = None;
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn run_write_coordinator<MR, F>(
     root: &Path,
@@ -419,6 +489,11 @@ pub fn run_write_coordinator<MR, F>(
     on_full_reindex: Option<Arc<FullReindexCallback>>,
     daemon_token: &CancellationToken,
     docs_control: Option<Arc<DocsControl>>,
+    // Serves `Store::Docs` reads. `None` leaves the daemon graph-only, and a
+    // document read then gets an explicit refusal rather than silently
+    // opening `docs.kuzu` in the client. Supplied by the caller because
+    // `infigraph-docs` depends on this crate, not the reverse.
+    docs_reads: Option<read_service::RowSource>,
 ) -> Result<()>
 where
     MR: Fn() -> Result<crate::lang::LanguageRegistry> + Send + 'static,
@@ -438,6 +513,54 @@ where
     // guard ends up covering three of four of them.
     ensure_watchable_root(root)?;
 
+    // Bound here, before the language-registry build below, which costs
+    // seconds in a debug build. The CLI takes `watch.lock` -- every
+    // caller's "daemon is ready" signal -- well before this function is
+    // even entered, so anything slower than this leaves a window where the
+    // daemon looks ready but answers no reads. The store is resolved per
+    // request, so binding does not need it to exist yet.
+    let mut held_prism = HeldPrism::new();
+
+    // The read service: bound here, alongside the write coordinator, and
+    // torn down when this function returns (`ReadService` shuts down on
+    // drop, so every early return is covered).
+    //
+    // It resolves the store per request through the beacon rather than
+    // capturing one, because `held_prism` is opened lazily and dropped again
+    // on `poison_watch_db`. It shares nothing else with the write pipeline:
+    // no `index.lock`, no work queue, no place on this loop.
+    //
+    // A bind failure is logged, not fatal. The daemon's write duties are
+    // independent of it, and killing the daemon here would stop writes too;
+    // a client that cannot reach the service gets an explicit "no daemon
+    // read service is listening" from `RemoteExec` rather than a silent
+    // wrong answer.
+    let _read_service = {
+        let beacon = held_prism.beacon();
+        let source: read_service::StoreSource = Arc::new(move || {
+            beacon
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .and_then(|prism| prism.graph_store())
+        });
+        match read_service::ReadService::start_with_sources(
+            root,
+            source,
+            docs_reads,
+            READ_SERVICE_WORKERS,
+        ) {
+            Ok(svc) => Some(svc),
+            Err(e) => {
+                eprintln!(
+                    "[read] could not bind the read service for {}: {e:#}",
+                    root.display()
+                );
+                None
+            }
+        }
+    };
+
     // Build the registry ONCE for the whole watch session (#58): it serves
     // both file-extension filtering here and every `watch_db` open below
     // via `Infigraph::open_shared`. It used to be built twice serially
@@ -448,13 +571,26 @@ where
     // build, so sharing buys nothing there.
     let shared_registry: Arc<crate::lang::LanguageRegistry> = Arc::new(make_registry()?);
 
+    // Open the graph now rather than on the first write.
+    //
+    // `watch_db` is lazy by design: when the daemon only served writes,
+    // holding no `Database` until there was work to do was free. Now that
+    // reads route through this process, "the daemon holds the graph" has to
+    // be true from startup -- otherwise a freshly started daemon on an
+    // already-indexed repo refuses every read until something happens to
+    // trigger a write. Best-effort: a failure here (no graph yet, or another
+    // process still holding it) is not fatal, and the loop's existing
+    // `reopen_backoff` path retries on demand exactly as before.
+    if let Err(e) = watch_db(root, &shared_registry, &mut held_prism) {
+        eprintln!("[read] graph not open at daemon start (will retry on demand): {e:#}");
+    }
+
     let mut changes_since_periodic: usize = 0;
     let mut last_periodic = std::time::Instant::now();
 
     // Shared DB connection for the watch session — see `watch_db`'s doc
     // comment for the platform split (held open on non-Windows, reopened
     // per call on Windows).
-    let mut held_prism: Option<Arc<Infigraph>> = None;
     // Paces reopen attempts after `watch_db` fails (typically: the graph is
     // locked by another process) -- see `backoff::ReopenBackoff`.
     let mut reopen_backoff = ReopenBackoff::new();
@@ -764,7 +900,7 @@ where
                         languages.join(", ")
                     );
                 } else if let (Some(cb), Some(prism)) =
-                    (on_full_reindex.clone(), held_prism.clone())
+                    (on_full_reindex.clone(), held_prism.current())
                 {
                     // `finish_full_reindex` only hands back languages on a
                     // successful swap+reopen, so `prism` is the new graph
@@ -1284,13 +1420,13 @@ fn open_transient(root: &Path, registry: &Arc<crate::lang::LanguageRegistry>) ->
 fn watch_db(
     root: &Path,
     registry: &Arc<crate::lang::LanguageRegistry>,
-    held: &mut Option<Arc<Infigraph>>,
+    held: &mut HeldPrism,
 ) -> Result<Arc<Infigraph>> {
     if held.is_none() {
         let _phase = crate::write_phase::enter(&"daemon: open graph", 0);
-        *held = Some(Arc::new(open_transient(root, registry)?));
+        held.set(Arc::new(open_transient(root, registry)?));
     }
-    Ok(Arc::clone(held.as_ref().unwrap()))
+    Ok(held.current().expect("just set"))
 }
 
 /// Windows' mandatory file locking prevents a second concurrent connection
@@ -1301,19 +1437,19 @@ fn watch_db(
 fn watch_db(
     root: &Path,
     registry: &Arc<crate::lang::LanguageRegistry>,
-    held: &mut Option<Arc<Infigraph>>,
+    held: &mut HeldPrism,
 ) -> Result<Arc<Infigraph>> {
-    *held = Some(Arc::new(open_transient(root, registry)?));
-    Ok(Arc::clone(held.as_ref().unwrap()))
+    held.set(Arc::new(open_transient(root, registry)?));
+    Ok(held.current().expect("just set"))
 }
 
 /// Drops the watch session's shared DB connection so the next `watch_db`
 /// call reopens fresh. See `watch_db`'s doc comment for when to call this.
-fn poison_watch_db(held: &mut Option<Arc<Infigraph>>) {
+fn poison_watch_db(held: &mut HeldPrism) {
     // Dropping the last `Arc` closes the lbug Database, which checkpoints
     // on close -- name it in case that is where the process aborts (#132).
     let _phase = crate::write_phase::enter(&"daemon: drop held graph (checkpoint on close)", 0);
-    *held = None;
+    held.clear();
 }
 
 /// Serves a single `.request` file via `serve_one_request`, wrapped in the
@@ -1336,7 +1472,7 @@ fn serve_request_locked(
     root: &Path,
     path: &Path,
     registry: &Arc<crate::lang::LanguageRegistry>,
-    held: &mut Option<Arc<Infigraph>>,
+    held: &mut HeldPrism,
     reopen_backoff: &mut ReopenBackoff,
     drain_in_flight: bool,
 ) {
@@ -1659,7 +1795,7 @@ fn try_start_scip_import(
     scip_path: PathBuf,
     enriched_ast_generation: Option<i64>,
     registry: &Arc<crate::lang::LanguageRegistry>,
-    held: &mut Option<Arc<Infigraph>>,
+    held: &mut HeldPrism,
     drain_in_flight: bool,
     full_reindex_in_flight: bool,
     scip_import_in_flight: bool,
@@ -1736,7 +1872,7 @@ fn try_start_scip_import(
 fn finish_scip_import(
     root: &Path,
     reply_path: &Path,
-    held: &Option<Arc<Infigraph>>,
+    held: &HeldPrism,
     joined: std::result::Result<ScipImportTaskOutput, tokio::task::JoinError>,
 ) -> (Option<crate::ops::IndexOpGuard>, Vec<String>) {
     let ScipImportTaskOutput { guard, result } = match joined {
@@ -1810,7 +1946,7 @@ fn finish_full_reindex(
     root: &Path,
     reply_path: &Path,
     registry: &Arc<crate::lang::LanguageRegistry>,
-    held: &mut Option<Arc<Infigraph>>,
+    held: &mut HeldPrism,
     joined: std::result::Result<FullReindexTaskOutput, tokio::task::JoinError>,
 ) -> (Option<crate::ops::IndexOpGuard>, Option<Vec<String>>) {
     let FullReindexTaskOutput { guard, result } = match joined {
@@ -2114,7 +2250,7 @@ fn route_or_serve_request<MR>(
     queue: &Arc<Mutex<crate::daemon::queue::IndexWorkQueue>>,
     registry: &Arc<crate::lang::LanguageRegistry>,
     make_registry: &MR,
-    held: &mut Option<Arc<Infigraph>>,
+    held: &mut HeldPrism,
     reopen_backoff: &mut ReopenBackoff,
     drain_in_flight: bool,
     full_reindex_in_flight: bool,
@@ -2611,7 +2747,7 @@ mod tests {
         std::fs::write(&request_path, serde_json::to_string(&request).unwrap()).unwrap();
 
         let queue = Arc::new(Mutex::new(crate::daemon::queue::IndexWorkQueue::new()));
-        let mut held: Option<Arc<Infigraph>> = None;
+        let mut held = HeldPrism::new();
         let drain_rt = tokio::runtime::Runtime::new().unwrap();
         let daemon_token = CancellationToken::new();
         let registry = Arc::new(crate::lang::LanguageRegistry::new());
@@ -2692,7 +2828,7 @@ mod tests {
         std::fs::write(&request_path, serde_json::to_string(&request).unwrap()).unwrap();
 
         let queue = Arc::new(Mutex::new(crate::daemon::queue::IndexWorkQueue::new()));
-        let mut held: Option<Arc<Infigraph>> = None;
+        let mut held = HeldPrism::new();
         let drain_rt = tokio::runtime::Runtime::new().unwrap();
         let daemon_token = CancellationToken::new();
         let registry = Arc::new(crate::lang::LanguageRegistry::new());

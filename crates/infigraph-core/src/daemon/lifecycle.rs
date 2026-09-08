@@ -113,6 +113,54 @@ pub fn ensure_daemon_running(root: &Path, watch_binary: &Path) -> DaemonStartOut
 /// instead of either working or failing fast. Still respects
 /// [`is_remote_backend`]: a daemon is meaningless under the Neo4j backend
 /// regardless of which opt-out is in play.
+/// "A daemon exists to serve this root's routed access" -- not a
+/// convenience, a hard requirement.
+///
+/// `INFIGRAPH_BACKEND=daemon` means every covered write *and, since reads
+/// were routed, every read* goes through a daemon. No daemon means a write
+/// blocks until its own multi-minute timeout with nothing consuming the
+/// request, and a read fails outright. So this both (a) attempts to start
+/// one regardless of the CI/`INFIGRAPH_NO_WATCH` opt-out -- that opt-out
+/// skips an optional convenience, and a backend the caller explicitly
+/// selected is not optional -- and (b) fails fast with an actionable
+/// message rather than letting the first access discover the problem.
+///
+/// Shared by `Infigraph::init` (code graph) and `DocIndex::init`
+/// (documents), so both routed stores get the same guarantee.
+pub fn ensure_daemon_for_routed_access(root: &Path) -> anyhow::Result<()> {
+    use anyhow::Context;
+
+    let lock_path = root.join(".infigraph").join("watch.lock");
+    if daemon_is_alive(&lock_path) {
+        return Ok(());
+    }
+
+    let watch_binary = std::env::current_exe()
+        .map_err(anyhow::Error::from)
+        .and_then(|exe| resolve_cli_binary_sibling_of(&exe))
+        .context("could not locate the infigraph CLI binary to start a daemon")?;
+
+    if let DaemonStartOutcome::Failed(e) = ensure_daemon_running_required(root, &watch_binary) {
+        anyhow::bail!(
+            "INFIGRAPH_BACKEND=daemon requires a running daemon for {}, but starting one \
+             failed: {e}. Start one manually with `infigraph daemon`.",
+            root.display()
+        );
+    }
+
+    if !wait_for_daemon_ready(&lock_path, std::time::Duration::from_secs(10)) {
+        anyhow::bail!(
+            "INFIGRAPH_BACKEND=daemon is set but no daemon came up for {} within 10s \
+             (auto-start attempted) -- reads would fail and writes would block until their \
+             own timeout instead of failing here. Check `infigraph ps` / the daemon log, \
+             start one with `infigraph daemon`, or unset INFIGRAPH_BACKEND to work locally \
+             in this process.",
+            root.display()
+        );
+    }
+    Ok(())
+}
+
 pub fn ensure_daemon_running_required(root: &Path, watch_binary: &Path) -> DaemonStartOutcome {
     if is_remote_backend() {
         return DaemonStartOutcome::AlreadyRunning;
