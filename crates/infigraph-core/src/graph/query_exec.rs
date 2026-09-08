@@ -54,6 +54,41 @@ impl QueryExec for LocalExec<'_, '_> {
 mod tests {
     use super::*;
 
+    /// Identifier escaping must survive a backslash.
+    ///
+    /// `kuzu_backend` carried its own `escape` that replaced only `'`, while
+    /// `crate::escape_str` replaces `\\` first and then `'`. The quote-only
+    /// version produces malformed Cypher for any identifier containing a
+    /// backslash -- a Windows path, or a raw-string literal in a symbol name
+    /// -- so the two were unified on the stronger one. Order matters:
+    /// escaping quotes first would re-escape the backslashes just inserted.
+    #[test]
+    fn an_identifier_containing_a_backslash_round_trips_through_a_literal() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::graph::GraphStore::open(&dir.path().join("graph")).unwrap();
+        let conn = store.connection().unwrap();
+
+        let id = r"src\\win\\a.rs";
+        let escaped = crate::escape_str(id);
+        conn.query(&format!(
+            "CREATE (:File {{id: '{escaped}', name: 'a.rs', path: '{escaped}', \
+             language: 'rust', symbol_count: 0}})"
+        ))
+        .expect("a backslash-bearing id must produce valid Cypher");
+
+        let exec = LocalExec::new(&conn);
+        let rows = exec
+            .query_rows(&format!(
+                "MATCH (f:File) WHERE f.id = '{escaped}' RETURN f.id"
+            ))
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![vec![id.to_string()]],
+            "the escaped literal must match the value it was built from"
+        );
+    }
+
     /// A `GraphQuery` built over `LocalExec` must return exactly what it
     /// returned when it borrowed the connection directly.
     #[test]

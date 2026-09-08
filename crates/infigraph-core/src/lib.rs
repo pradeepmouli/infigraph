@@ -76,7 +76,16 @@ use graph::GraphStore;
 use lang::LanguageRegistry;
 use model::FileExtraction;
 
-pub(crate) fn escape_str(s: &str) -> String {
+/// Escape a value for interpolation into a Cypher string literal.
+///
+/// Backslash first, then quote -- reversing the order would re-escape the
+/// backslashes just inserted. Escaping only the quote is not merely weaker
+/// but wrong: Kuzu's literal parser consumes an unescaped backslash as an
+/// escape sequence, so the value stored is not the value given (Windows
+/// paths, raw-string literals in symbol names). Two hand-rolled quote-only
+/// copies of this existed and both were bugs; `infigraph-docs` now shares
+/// this one, which is why it is `pub`.
+pub fn escape_str(s: &str) -> String {
     s.replace('\\', "\\\\").replace('\'', "\\'")
 }
 

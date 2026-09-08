@@ -29,6 +29,9 @@ use parquet::file::properties::WriterProperties;
 use crate::backend::DocBackend;
 use crate::chunk::Chunk;
 use crate::extract::ExtractedDoc;
+// The one Cypher escaper, shared with infigraph-core: this crate used to
+// carry a quote-only copy, which silently dropped backslashes.
+use infigraph_core::escape_str;
 
 fn fwd_slash_path(p: &Path) -> String {
     p.to_string_lossy().replace('\\', "/")
@@ -996,10 +999,6 @@ fn count_query(conn: &Connection<'_>, query: &str) -> usize {
         .ok()
         .and_then(|mut r| r.next().map(|row| row[0].to_string().parse().unwrap_or(0)))
         .unwrap_or(0)
-}
-
-fn escape_str(s: &str) -> String {
-    s.replace('\'', "\\'")
 }
 
 /// Parse a Kuzu STRING[] column rendered via `.to_string()`.

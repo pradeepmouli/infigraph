@@ -103,10 +103,6 @@ impl KuzuBackend {
     }
 }
 
-fn escape(s: &str) -> String {
-    s.replace('\'', "\\'")
-}
-
 impl GraphBackend for KuzuBackend {
     // ── Lifecycle / metadata ─────────────────────────────────────────
 
@@ -234,7 +230,7 @@ impl GraphBackend for KuzuBackend {
     fn symbol_metadata(&self, id: &str) -> Result<Option<SymbolMeta>> {
         let conn = self.store.connection()?;
         let q = GraphQuery::new(&conn);
-        let eid = escape(id);
+        let eid = crate::escape_str(id);
         let meta_rows = q.raw_query(&format!(
             "MATCH (s:Symbol) WHERE s.id = '{}' RETURN s.docstring, s.complexity",
             eid
@@ -272,7 +268,7 @@ impl GraphBackend for KuzuBackend {
                 "MATCH (s:Symbol) WHERE (s.kind = 'Function' OR s.kind = 'Method' OR s.kind = 'Test') \
                  AND s.file CONTAINS '{}' RETURN s.name, s.file, s.start_line, s.complexity \
                  ORDER BY s.complexity DESC",
-                escape(f)
+                crate::escape_str(f)
             )
         } else {
             "MATCH (s:Symbol) WHERE (s.kind = 'Function' OR s.kind = 'Method' OR s.kind = 'Test') \
@@ -415,7 +411,7 @@ impl GraphBackend for KuzuBackend {
         let cypher = if let Some(kinds) = kind_filter {
             let cond: Vec<String> = kinds
                 .iter()
-                .map(|k| format!("s.kind = '{}'", escape(k)))
+                .map(|k| format!("s.kind = '{}'", crate::escape_str(k)))
                 .collect();
             format!(
                 "MATCH (s:Symbol) WHERE ({}) RETURN s.id, s.name, s.kind, s.file, s.docstring",
@@ -444,8 +440,8 @@ impl GraphBackend for KuzuBackend {
         conn.query(&format!(
             "MATCH (a:Symbol), (b:Symbol) WHERE a.id = '{}' AND b.id = '{}' \
              MERGE (a)-[r:SIMILAR_TO]->(b) SET r.score = {}",
-            escape(id_a),
-            escape(id_b),
+            crate::escape_str(id_a),
+            crate::escape_str(id_b),
             score
         ))
         .map_err(|e| anyhow::anyhow!("upsert_similar_edge failed: {}", e))?;
@@ -654,14 +650,14 @@ impl GraphBackend for KuzuBackend {
     fn write_cross_service_edges(&self, candidates: &[CrossServiceEdgeCandidate]) -> Result<usize> {
         let mut created = 0;
         for c in candidates {
-            let target_id = escape(&c.target_id);
-            let target_name = escape(&c.target_name);
-            let docstring = escape(&c.docstring);
-            let caller_sym = escape(&c.caller_symbol_id);
-            let method = escape(&c.method);
-            let path = escape(&c.path);
-            let target_svc = escape(&c.target_service);
-            let protocol = escape(&c.protocol);
+            let target_id = crate::escape_str(&c.target_id);
+            let target_name = crate::escape_str(&c.target_name);
+            let docstring = crate::escape_str(&c.docstring);
+            let caller_sym = crate::escape_str(&c.caller_symbol_id);
+            let method = crate::escape_str(&c.method);
+            let path = crate::escape_str(&c.path);
+            let target_svc = crate::escape_str(&c.target_service);
+            let protocol = crate::escape_str(&c.protocol);
 
             let create_target = format!(
                 "MERGE (t:Symbol {{id: '{target_id}'}}) \
@@ -695,20 +691,20 @@ impl GraphBackend for KuzuBackend {
             let id = format!("{}::{}", dep.ecosystem, dep.name);
             let check = format!(
                 "MATCH (d:Dependency) WHERE d.id = '{}' RETURN d.id",
-                escape(&id)
+                crate::escape_str(&id)
             );
             let existing = self.raw_query(&check)?;
             if existing.is_empty() {
                 let insert = format!(
                     "CREATE (d:Dependency {{id: '{}', name: '{}', version: '{}', ecosystem: '{}', is_dev: {}}})",
-                    escape(&id), escape(&dep.name), escape(&dep.version), escape(&dep.ecosystem), dep.is_dev
+                    crate::escape_str(&id), crate::escape_str(&dep.name), crate::escape_str(&dep.version), crate::escape_str(&dep.ecosystem), dep.is_dev
                 );
                 self.raw_query(&insert)?;
             } else {
                 let update = format!(
                     "MATCH (d:Dependency) WHERE d.id = '{}' SET d.version = '{}', d.is_dev = {}",
-                    escape(&id),
-                    escape(&dep.version),
+                    crate::escape_str(&id),
+                    crate::escape_str(&dep.version),
                     dep.is_dev
                 );
                 self.raw_query(&update)?;
@@ -717,21 +713,22 @@ impl GraphBackend for KuzuBackend {
             // Scope the DEPENDS_ON edge to THIS repo's modules. Without the repo guard,
             // `m.file CONTAINS 'pyproject.toml'` matches every repo's manifest module in a
             // shared graph, cross-linking one repo's deps onto all others.
-            let manifest_base = escape(result.manifest_file.rsplit('/').next().unwrap_or(""));
+            let manifest_base =
+                crate::escape_str(result.manifest_file.rsplit('/').next().unwrap_or(""));
             let rel = if let Some(repo) = self.repo_filter() {
-                let r = escape(repo);
+                let r = crate::escape_str(repo);
                 format!(
                     "MATCH (m:Module), (d:Dependency) \
                      WHERE m.file STARTS WITH '{r}/' AND m.file CONTAINS '{manifest_base}' AND d.id = '{}' \
                      CREATE (m)-[:DEPENDS_ON {{is_dev: {}}}]->(d)",
-                    escape(&id),
+                    crate::escape_str(&id),
                     dep.is_dev
                 )
             } else {
                 format!(
                     "MATCH (m:Module), (d:Dependency) WHERE m.file CONTAINS '{manifest_base}' AND d.id = '{}' \
                      CREATE (m)-[:DEPENDS_ON {{is_dev: {}}}]->(d)",
-                    escape(&id),
+                    crate::escape_str(&id),
                     dep.is_dev
                 )
             };
@@ -778,9 +775,9 @@ impl GraphBackend for KuzuBackend {
 
             let create_cluster = format!(
                 "CREATE (c:Cluster {{id: '{}', name: '{}', description: '{}'}})",
-                escape(&cluster_id),
-                escape(&cluster_name),
-                escape(&description),
+                crate::escape_str(&cluster_id),
+                crate::escape_str(&cluster_name),
+                crate::escape_str(&description),
             );
             self.raw_query(&create_cluster)?;
 
@@ -788,8 +785,8 @@ impl GraphBackend for KuzuBackend {
                 let sym_id = &idx_to_id[node];
                 let create_edge = format!(
                     "MATCH (s:Symbol), (c:Cluster) WHERE s.id = '{}' AND c.id = '{}' CREATE (s)-[:MEMBER_OF]->(c)",
-                    escape(sym_id),
-                    escape(&cluster_id),
+                    crate::escape_str(sym_id),
+                    crate::escape_str(&cluster_id),
                 );
                 self.raw_query(&create_edge)?;
             }
@@ -914,7 +911,7 @@ impl KuzuBackend {
     ) -> Result<()> {
         let file_list: Vec<String> = extractions
             .iter()
-            .map(|e| format!("'{}'", escape(&e.file)))
+            .map(|e| format!("'{}'", crate::escape_str(&e.file)))
             .collect();
         let files_in = file_list.join(", ");
 
