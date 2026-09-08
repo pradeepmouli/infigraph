@@ -42,6 +42,16 @@ pub type StoreSource = Arc<dyn Fn() -> Option<Arc<crate::graph::GraphStore>> + S
 /// `read_guard::ensure_read_only` is public.
 pub type RowSource = Arc<dyn Fn(&str) -> Result<Vec<Vec<String>>> + Send + Sync>;
 
+/// Marker in the error frame sent when the daemon is up and listening but
+/// has not opened its graph yet.
+///
+/// A distinct, retryable condition rather than a generic failure: the
+/// endpoint binds before the daemon builds its language registry (seconds in
+/// a debug build), so a client can connect successfully and still arrive
+/// before there is anything to read. `RemoteExec` waits this out within the
+/// same bounded, daemon-alive-gated grace it uses for connect failures.
+pub const NOT_READY: &str = "the daemon has no graph open yet";
+
 pub struct ReadService {
     stop: Arc<AtomicBool>,
     accept: Option<std::thread::JoinHandle<()>>,
@@ -182,9 +192,7 @@ fn serve_one<S: std::io::Read + std::io::Write>(
     let Some(store) = source() else {
         write_frame(
             &mut stream,
-            &ReadFrame::Error(
-                "the daemon has no graph open yet; retry once indexing has started".to_string(),
-            ),
+            &ReadFrame::Error(format!("{NOT_READY}; retry once indexing has started")),
         )?;
         return Ok(());
     };

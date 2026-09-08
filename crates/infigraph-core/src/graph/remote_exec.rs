@@ -79,8 +79,9 @@ impl RemoteExec {
     }
 }
 
-impl QueryExec for RemoteExec {
-    fn query_rows(&self, cypher: &str) -> Result<Vec<Vec<String>>> {
+impl RemoteExec {
+    /// One request/response round trip.
+    fn attempt(&self, cypher: &str) -> Result<Vec<Vec<String>>> {
         let mut stream = self.connect_allowing_for_startup()?;
         write_request(
             &mut stream,
@@ -92,5 +93,36 @@ impl QueryExec for RemoteExec {
             },
         )?;
         collect_rows(&mut stream)
+    }
+
+    fn daemon_is_alive(&self) -> bool {
+        crate::daemon::lifecycle::daemon_is_alive(&self.root.join(".infigraph").join("watch.lock"))
+    }
+}
+
+impl QueryExec for RemoteExec {
+    fn query_rows(&self, cypher: &str) -> Result<Vec<Vec<String>>> {
+        // Two distinct startup windows, both bounded by the same grace and
+        // both gated on a daemon actually being alive: not yet listening
+        // (handled in `connect_allowing_for_startup`), and listening but
+        // with no graph open yet, which the endpoint binding before the
+        // language-registry build makes reachable.
+        let deadline = std::time::Instant::now() + DAEMON_STARTUP_GRACE;
+        loop {
+            let result = self.attempt(cypher);
+            let retry = match &result {
+                Err(e) => {
+                    e.to_string()
+                        .contains(crate::daemon::read_service::NOT_READY)
+                        && std::time::Instant::now() < deadline
+                        && self.daemon_is_alive()
+                }
+                Ok(_) => false,
+            };
+            if !retry {
+                return result;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
     }
 }
