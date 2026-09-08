@@ -254,7 +254,7 @@ git commit -m "refactor(core): GraphQuery runs on a QueryExec, not a connection"
 - Produces: `ReadEndpoint` (opaque), `ReadEndpoint::for_root(root: &Path) -> ReadEndpoint`, `ReadEndpoint::as_name(&self) -> String`.
 - Consumes: nothing.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```rust
 #[cfg(test)]
@@ -294,12 +294,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run to verify it fails**
+- [x] **Step 2: Run to verify it fails**
 
 Run: `cargo test -p infigraph-core --lib daemon::read_endpoint -- --test-threads=1`
 Expected: FAIL to compile — `ReadEndpoint` not defined.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 ```rust
 //! Naming for the daemon's read-service endpoint.
@@ -341,12 +341,12 @@ impl ReadEndpoint {
 
 Add `pub mod read_endpoint;` to `crates/infigraph-core/src/daemon/mod.rs`.
 
-- [ ] **Step 4: Run to verify it passes**
+- [x] **Step 4: Run to verify it passes**
 
 Run: `cargo test -p infigraph-core --lib daemon::read_endpoint -- --test-threads=1`
 Expected: PASS, `3 passed`.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/infigraph-core/src/daemon/read_endpoint.rs crates/infigraph-core/src/daemon/mod.rs
@@ -367,11 +367,11 @@ The plan does not assume this crate's exact API surface. Establish it with a smo
 - Produces: a verified minimal bind/connect/echo pattern that Tasks 5 and 7 copy.
 - Consumes: `ReadEndpoint` from Task 2.
 
-- [ ] **Step 1: Add the dependency**
+- [x] **Step 1: Add the dependency**
 
 In `crates/infigraph-core/Cargo.toml` under `[dependencies]`, add `interprocess` at the current 2.x release. Pin the exact version you resolve (`cargo add interprocess` then record it here in this step before continuing).
 
-- [ ] **Step 2: Write the smoke test**
+- [x] **Step 2: Write the smoke test**
 
 ```rust
 //! Establishes the local-socket API this crate will use, on the platform
@@ -410,16 +410,16 @@ fn a_local_socket_round_trips_one_line() {
 
 Write `bind_listener` and `connect` as two small helpers in this test file using `interprocess`'s local-socket API for the version you pinned. They are the only two places the crate's API shape appears.
 
-- [ ] **Step 3: Run it**
+- [x] **Step 3: Run it**
 
 Run: `cargo test -p infigraph-core --test read_socket_smoke -- --test-threads=1`
 Expected: PASS. If the API differs from your first attempt, fix the two helpers until it passes — that is the point of this task.
 
-- [ ] **Step 4: Promote the helpers**
+- [x] **Step 4: Promote the helpers**
 
 Move `bind_listener` and `connect` into `crates/infigraph-core/src/daemon/read_endpoint.rs` as `ReadEndpoint::bind(&self)` and `ReadEndpoint::connect(&self)`, returning the crate's listener and stream types. Update the smoke test to call them.
 
-- [ ] **Step 5: Re-run and commit**
+- [x] **Step 5: Re-run and commit**
 
 Run: `cargo test -p infigraph-core --test read_socket_smoke -- --test-threads=1`
 Expected: PASS.
@@ -443,7 +443,7 @@ git commit -m "feat(core): pin interprocess and prove the local-socket round tri
 - Produces: `fn ensure_read_only(conn: &kuzu::Connection, cypher: &str) -> anyhow::Result<kuzu::PreparedStatement>`.
 - Consumes: nothing.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```rust
 #[cfg(test)]
@@ -496,12 +496,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run to verify it fails**
+- [x] **Step 2: Run to verify it fails**
 
 Run: `cargo test -p infigraph-core --lib daemon::read_guard -- --test-threads=1`
 Expected: FAIL to compile — `ensure_read_only` not defined.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 ```rust
 //! Read-only enforcement for the daemon's read service.
@@ -534,12 +534,12 @@ pub fn ensure_read_only(
 }
 ```
 
-- [ ] **Step 4: Run to verify it passes**
+- [x] **Step 4: Run to verify it passes**
 
 Run: `cargo test -p infigraph-core --lib daemon::read_guard -- --test-threads=1`
 Expected: PASS, `3 passed`.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/infigraph-core/src/daemon/read_guard.rs crates/infigraph-core/src/daemon/mod.rs
@@ -560,7 +560,7 @@ git commit -m "feat(core): DB-enforced read-only gate for the read service"
 
 Framing is length-prefixed JSON. Arrow is the *result* encoding inside `Rows` in a later optimisation; the frame boundary is what makes truncation detectable, which is this task's real purpose.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```rust
 #[cfg(test)]
@@ -609,12 +609,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run to verify it fails**
+- [x] **Step 2: Run to verify it fails**
 
 Run: `cargo test -p infigraph-core --lib daemon::read_protocol -- --test-threads=1`
 Expected: FAIL to compile.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 ```rust
 //! Framing for the daemon read service.
@@ -706,12 +706,12 @@ pub fn collect_rows<R: Read>(r: &mut R) -> Result<Vec<Vec<String>>> {
 }
 ```
 
-- [ ] **Step 4: Run to verify it passes**
+- [x] **Step 4: Run to verify it passes**
 
 Run: `cargo test -p infigraph-core --lib daemon::read_protocol -- --test-threads=1`
 Expected: PASS, `3 passed`.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/infigraph-core/src/daemon/read_protocol.rs crates/infigraph-core/src/daemon/mod.rs
@@ -744,7 +744,7 @@ daemon, and it would pass every test that starts a service and queries it, becau
 those tests have no concurrent writer. There must be exactly one `Database` in the
 process, reached through the daemon's existing store.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 `crates/infigraph-core/tests/read_service.rs`:
 
@@ -801,12 +801,12 @@ fn a_write_sent_to_the_read_service_is_refused() {
 
 Write `open_shared_database` (opens the graph read-write with the bounded write buffer pool, matching `GraphStore::open`) and `client_query` (connects via `ReadEndpoint::connect`, writes a `ReadRequest`, calls `collect_rows`) as helpers at the bottom of this test file.
 
-- [ ] **Step 2: Run to verify it fails**
+- [x] **Step 2: Run to verify it fails**
 
 Run: `cargo test -p infigraph-core --test read_service -- --test-threads=1`
 Expected: FAIL to compile — `ReadService` not defined.
 
-- [ ] **Step 3: Implement the service**
+- [x] **Step 3: Implement the service**
 
 ```rust
 //! The daemon's read service.
@@ -908,12 +908,12 @@ fn serve_one<S: std::io::Read + std::io::Write>(
 
 Implement `threadpool_of(workers)` as a small fixed-size worker pool over a channel — do not add a thread-pool dependency for this; the crate already spawns threads directly elsewhere. The pool must be fixed-size, not unbounded, so a burst of clients cannot spawn unbounded threads inside the daemon.
 
-- [ ] **Step 4: Run to verify it passes**
+- [x] **Step 4: Run to verify it passes**
 
 Run: `cargo test -p infigraph-core --test read_service -- --test-threads=1`
 Expected: PASS, `2 passed`.
 
-- [ ] **Step 5: Decide the BEGIN/COMMIT ordering, deliberately**
+- [x] **Step 5: Decide the BEGIN/COMMIT ordering, deliberately**
 
 `ensure_read_only` runs *before* `raw_query`, so a bare `COMMIT` — which
 `raw_query` today silently no-ops — will instead be refused as not-read-only.
@@ -942,7 +942,7 @@ fn a_bare_commit_sent_to_the_read_service_is_refused_not_silently_accepted() {
 }
 ```
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add crates/infigraph-core/src/daemon/read_service.rs \
@@ -963,7 +963,7 @@ The concurrency property is the entire justification for a separate service. Ass
 **Interfaces:**
 - Consumes: everything from Task 6.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 ```rust
 /// Reads must be served in parallel *while* an index operation holds
@@ -1016,7 +1016,7 @@ fn reads_are_served_concurrently_while_an_index_operation_holds_the_lock() {
 }
 ```
 
-- [ ] **Step 2: Write the same-`Database` visibility test**
+- [x] **Step 2: Write the same-`Database` visibility test**
 
 This is the test that catches the whole class of "the read service opened its
 own handle". A second handle passes every test that has no concurrent writer.
@@ -1069,12 +1069,12 @@ fn a_write_is_visible_to_the_next_read_through_the_service() {
 }
 ```
 
-- [ ] **Step 3: Run both**
+- [x] **Step 3: Run both**
 
 Run: `cargo test -p infigraph-core --test read_service -- --test-threads=1`
 Expected: PASS. If the elapsed-time assertion fails, the service is taking a lock it must not take — fix the service, never the bound. If the visibility assertion returns an empty result, the service is on its own `Database` — fix the ownership, never the assertion.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add crates/infigraph-core/tests/read_service.rs
@@ -1093,7 +1093,7 @@ git commit -m "test(core): reads are concurrent and see the daemon's own writes"
 - Produces: `RemoteExec::new(root: &Path) -> RemoteExec`, implementing `QueryExec` from Task 1.
 - Consumes: `ReadEndpoint` (Task 2), `read_protocol` (Task 5), `QueryExec` (Task 1).
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Add to `crates/infigraph-core/tests/read_service.rs`:
 
@@ -1131,12 +1131,12 @@ fn remote_exec_satisfies_query_exec_against_a_live_service() {
 }
 ```
 
-- [ ] **Step 2: Run to verify it fails**
+- [x] **Step 2: Run to verify it fails**
 
 Run: `cargo test -p infigraph-core --test read_service remote_exec -- --test-threads=1`
 Expected: FAIL to compile — `RemoteExec` not defined.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 ```rust
 //! Client-side `QueryExec` that runs queries on the daemon's read service.
@@ -1194,12 +1194,12 @@ impl QueryExec for RemoteExec {
 }
 ```
 
-- [ ] **Step 4: Run to verify it passes**
+- [x] **Step 4: Run to verify it passes**
 
 Run: `cargo test -p infigraph-core --test read_service -- --test-threads=1`
 Expected: PASS, all four tests.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/infigraph-core/src/graph/remote_exec.rs crates/infigraph-core/src/graph/mod.rs \
@@ -1214,7 +1214,7 @@ git commit -m "feat(core): RemoteExec runs GraphQuery against the daemon read se
 **Files:**
 - Modify: `crates/infigraph-core/tests/read_service.rs`
 
-- [ ] **Step 1: Write the test**
+- [x] **Step 1: Write the test**
 
 ```rust
 /// Killing the service mid-response must surface an error, never a
@@ -1239,12 +1239,12 @@ fn a_service_that_dies_mid_response_produces_an_error_not_an_empty_result() {
 }
 ```
 
-- [ ] **Step 2: Run it**
+- [x] **Step 2: Run it**
 
 Run: `cargo test -p infigraph-core --test read_service -- --test-threads=1`
 Expected: PASS.
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add crates/infigraph-core/tests/read_service.rs
@@ -1279,7 +1279,7 @@ graph file cannot see the first's uncommitted WAL even inside one process — #1
 reproduced inside the daemon, and invisible to any test without a concurrent writer.
 Task 7's visibility test exists to catch exactly this.
 
-- [ ] **Step 1: Make `KuzuBackend` hold `Arc<GraphStore>`**
+- [x] **Step 1: Make `KuzuBackend` hold `Arc<GraphStore>`**
 
 ```rust
 pub struct KuzuBackend {
@@ -1298,20 +1298,20 @@ impl KuzuBackend {
 Wrap the store in the constructor(s). Existing `self.store.connection()` call sites
 compile unchanged through `Deref`.
 
-- [ ] **Step 2: Confirm the ownership change is inert**
+- [x] **Step 2: Confirm the ownership change is inert**
 
 Run: `cargo test -p infigraph-core -- --test-threads=1`
 Expected: PASS with unchanged counts. This is a pure ownership change; any movement
 means something depended on `GraphStore` being owned by value.
 
-- [ ] **Step 3: Locate the startup site**
+- [x] **Step 3: Locate the startup site**
 
 Run: `rg -n "run_write_coordinator" crates/infigraph-core/src/daemon/mod.rs crates/infigraph-cli/src/main.rs`
 
 The read service starts in the same function that starts the write coordinator, before
 it enters its loop, and shuts down when that function returns.
 
-- [ ] **Step 4: Write the failing test**
+- [x] **Step 4: Write the failing test**
 
 ```rust
 /// A real daemon must answer reads on its endpoint. Without this the service
@@ -1336,24 +1336,24 @@ Write `spawn_daemon_and_wait` and `stop_daemon` using the pattern
 `crates/infigraph-core/tests/watch_daemon.rs` already uses to start a daemon and await
 its `watch.lock`; do not invent a new mechanism.
 
-- [ ] **Step 5: Run to verify it fails**
+- [x] **Step 5: Run to verify it fails**
 
 Run: `cargo test -p infigraph-core --test read_service -- --ignored a_running_daemon --test-threads=1`
 Expected: FAIL — nothing is listening on the endpoint.
 
-- [ ] **Step 6: Wire it in**
+- [x] **Step 6: Wire it in**
 
 Start `ReadService::start(root, backend.store(), 8)` where the daemon already holds its
 `Infigraph`, keeping the `ReadService` alive for the daemon's lifetime and calling
 `shutdown()` on exit. The store handle comes from the daemon's existing backend — never
 from a fresh `GraphStore::open`.
 
-- [ ] **Step 7: Run to verify it passes**
+- [x] **Step 7: Run to verify it passes**
 
 Run: `cargo test -p infigraph-core --test read_service -- --ignored a_running_daemon --test-threads=1`
 Expected: PASS.
 
-- [ ] **Step 8: Commit**
+- [x] **Step 8: Commit**
 
 ```bash
 git add crates/infigraph-core/src/graph/kuzu_backend.rs \
@@ -1374,7 +1374,7 @@ git commit -m "feat(core): daemon shares one GraphStore with its read service"
 
 `open_read` has fan-in 260 — every one of the ~30 read methods delegates to it. It is the single site that decides local-vs-remote.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Add to `crates/infigraph-core/src/graph/daemon_kuzu_backend.rs`'s test module:
 
@@ -1409,26 +1409,26 @@ fn the_escape_hatch_restores_a_direct_read_when_set() {
 
 Note: this test mutates process environment. Guard it with the crate's existing `ENV_LOCK` (see `crates/infigraph-core/src/graph/store.rs` tests for the established pattern) so it cannot race other env-mutating tests.
 
-- [ ] **Step 2: Run to verify it fails**
+- [x] **Step 2: Run to verify it fails**
 
 Run: `cargo test -p infigraph-core --lib daemon_kuzu_backend -- --test-threads=1`
 Expected: FAIL — `stats()` currently succeeds by opening the file directly.
 
-- [ ] **Step 3: Implement**
+- [x] **Step 3: Implement**
 
 Replace `open_read`'s body so that it returns a backend whose `GraphQuery` runs on `RemoteExec`, unless `INFIGRAPH_DIRECT_READS` is set, in which case it keeps today's `KuzuBackend::open_read_only` behaviour. Document at the call site why the hatch is explicit rather than automatic, citing 5818aa1.
 
-- [ ] **Step 4: Run to verify it passes**
+- [x] **Step 4: Run to verify it passes**
 
 Run: `cargo test -p infigraph-core --lib daemon_kuzu_backend -- --test-threads=1`
 Expected: PASS.
 
-- [ ] **Step 5: Full suite**
+- [x] **Step 5: Full suite**
 
 Run: `cargo test -p infigraph-core -- --test-threads=1`
 Expected: PASS.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add crates/infigraph-core/src/graph/daemon_kuzu_backend.rs
@@ -1445,11 +1445,11 @@ git commit -m "feat(core): DaemonKuzuBackend reads route through the daemon"
 
 `search` with `scope='all'` touches both stores in one call, so routing only the graph leaves the flagship read tool still opening `docs.kuzu` directly. `docs.kuzu` has its own lock file and its own wipe-on-any-open-failure history (#143).
 
-- [ ] **Step 1: Read the docs backend**
+- [x] **Step 1: Read the docs backend**
 
 Run: `cargo run -q -p infigraph-cli -- --root . get-skeleton crates/infigraph-docs/src/backend.rs` or read the file directly. Identify the read entry points and whether they, like `KuzuBackend`, funnel through a single connection call.
 
-- [ ] **Step 2: Write the failing test**
+- [x] **Step 2: Write the failing test**
 
 Create `crates/infigraph-docs/tests/docs_reads_via_daemon.rs`:
 
@@ -1506,21 +1506,21 @@ fn document_reads_fail_without_a_daemon_unless_the_hatch_is_set() {
 
 Write `seed_one_document` and `open_shared_docs_database` as helpers at the bottom of this file, using `infigraph-docs`'s own store-open path (the same one `crates/infigraph-docs/tests/wal_guard.rs` uses) rather than constructing a Kuzu database by hand.
 
-- [ ] **Step 3: Run to verify it fails**
+- [x] **Step 3: Run to verify it fails**
 
 Run: `cargo test -p infigraph-docs --test docs_reads_via_daemon -- --test-threads=1`
 Expected: FAIL — `RemoteExec::for_docs` reads are not wired into the docs backend yet.
 
-- [ ] **Step 4: Route the docs read path**
+- [x] **Step 4: Route the docs read path**
 
 In `crates/infigraph-docs/src/backend.rs`, change the read entry points identified in Step 1 to obtain rows through `RemoteExec::for_docs(root)` rather than a locally-opened store, honouring the same `INFIGRAPH_DIRECT_READS` escape hatch as Task 11. Do not duplicate the hatch check — factor it into one helper shared with `DaemonKuzuBackend::open_read` if it is not already one.
 
-- [ ] **Step 5: Run to verify it passes**
+- [x] **Step 5: Run to verify it passes**
 
 Run: `cargo test -p infigraph-docs -- --test-threads=1`
 Expected: PASS.
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add crates/infigraph-docs/
@@ -1536,21 +1536,21 @@ Do this last and separately: it is deletion, and it must not be entangled with t
 **Files:**
 - Modify: `crates/infigraph-core/src/graph/store.rs` (`classify_read_only_open_failure`, `live_graph_writer`, `READ_ONLY_BUFFER_POOL_BYTES`, `open_read_only_or_degrade`)
 
-- [ ] **Step 1: Confirm each is genuinely unreachable**
+- [x] **Step 1: Confirm each is genuinely unreachable**
 
 For each of `classify_read_only_open_failure`, `live_graph_writer`, `open_read_only_or_degrade`, `degrade_or_refuse` and `READ_ONLY_BUFFER_POOL_BYTES`, run `rg -n "<name>" crates/` and confirm the only remaining callers are the escape-hatch path and tests. Anything still reachable from a non-hatch path stays.
 
-- [ ] **Step 2: Remove only what is provably dead, one item per commit**
+- [x] **Step 2: Remove only what is provably dead, one item per commit**
 
 Each removal is its own commit with its own full-suite run, so a bisect lands on exactly one deletion.
 
 Run after each: `cargo test -p infigraph-core -- --test-threads=1`
 
-- [ ] **Step 3: Update the invariants in CLAUDE.md**
+- [x] **Step 3: Update the invariants in CLAUDE.md**
 
 The "Cross-cutting invariants" section states that the graph DB is single-writer and that write paths take an advisory lock. Add that reads no longer open the store outside the daemon, and that `INFIGRAPH_DIRECT_READS` is the sole exception.
 
-- [ ] **Step 4: Close the issues this retires**
+- [x] **Step 4: Close the issues this retires**
 
 `#149` (idle daemon's WAL blocks external readers) and `#124` (PID-liveness polling) are both resolved by this work. Comment on each with the commit that closed it rather than closing silently.
 
@@ -1585,3 +1585,58 @@ first draft and fixed:
    inverting it recurses forever. Task 1 Step 6 now fixes the direction explicitly.
 
 **Type consistency.** `QueryExec::query_rows(&self, &str) -> Result<Vec<Vec<String>>>` is defined in Task 1 (as built, `e162b0b`) and used identically in Tasks 6 and 8; `GraphQuery` is generic over an owned `E: QueryExec`, so executors are passed by value (a blanket `impl QueryExec for &T` covers the borrowed case). `ReadEndpoint::for_root`/`as_name` (Task 2) gain `bind`/`connect` in Task 3 and are used in Tasks 6 and 8. `ReadRequest`/`ReadFrame`/`collect_rows` (Task 5) are used in Tasks 6, 8 and 9. `ReadService::start(root: &Path, store: Arc<GraphStore>, workers: usize)`/`shutdown` (Task 6) is used identically in Tasks 7-10; `KuzuBackend::store() -> Arc<GraphStore>` (Task 10) is what supplies it.
+
+---
+
+## Execution record (2026-09-08)
+
+All tasks executed. Four places where the plan was wrong or incomplete, and
+what was done instead:
+
+1. **Task 10** assumed "the daemon already holds its `Infigraph`". It does
+   not: the CLI holds none, and the store lives only in
+   `run_write_coordinator`'s local `held_prism`, opened lazily by `watch_db`
+   and dropped by `poison_watch_db`. Resolved with a `HeldPrism` newtype
+   carrying a beacon (so publishing cannot be forgotten) and
+   `ReadService::start_with_source` resolving the store per request. The
+   daemon also now opens its graph eagerly at startup — laziness was free
+   when it only served writes, but a freshly started daemon would otherwise
+   refuse every read until something triggered a write.
+
+2. **Task 11** was described as a one-line change to `open_read`. Only 16 of
+   the 26 routed reads existed on `GraphQuery`; the other 10 held their
+   Cypher and row-parsing on `KuzuBackend` (6), `GraphStore` (3) and a trait
+   default (1). All were moved down into `GraphQuery` so one query body
+   serves both paths. Two real races surfaced and were fixed: the endpoint
+   now binds before the language-registry build (the CLI takes `watch.lock`,
+   every caller's readiness signal, long before `run_write_coordinator` is
+   entered), and `RemoteExec` tolerates a starting daemon for 30s but only
+   while `watch.lock` says one is alive.
+
+3. **Task 12 Step 4** would have deadlocked the daemon. Routing `DocStore`'s
+   read methods means `DocIndex` re-enters the read service while *holding* a
+   store (`get_doc_hashes` during indexing), and `DocStore::open` blocks on
+   the process-wide `DB_LOCK`. Done as backend selection instead —
+   `DaemonDocStore`, chosen in `DocIndex::init` beside the Neo4j branch — so
+   the daemon keeps the local store. Document *writes* are refused rather
+   than routed: documents have no equivalent of the code graph's file-drop
+   `WriteRequest` protocol.
+
+4. **Task 13 retires nothing.** Its own Step 1 says anything reachable from a
+   non-hatch path stays, and all of them are:
+   `classify_read_only_open_failure`, `live_graph_writer` and
+   `READ_ONLY_BUFFER_POOL_BYTES` all live inside `GraphStore::open_read_only`
+   (used by the escape hatch, `doctor` and `drain`), and
+   `open_read_only_or_degrade` — with `degrade_or_refuse` — is still called by
+   the public `Infigraph::init_read_only_or_degrade`. Deleting any would break
+   `doctor`, `drain` and read-only init.
+
+**Deviation from the spec that still stands:** rows cross the wire as JSON
+`Vec<Vec<String>>`, not Arrow. Framing, chunking and truncation semantics are
+in place, so substituting Arrow inside `ReadFrame::Rows` remains a contained
+change.
+
+**Bugs found and fixed en route, unrelated to the plan:** a `groups_watch_perf`
+teardown race that blocked every commit (`9e0228b`), and a Cypher escaper that
+dropped backslashes so the value stored was not the value given (`e1a66bf`).
+**Filed, not fixed:** #151, #152, #153, #154.
