@@ -5,78 +5,42 @@
 //! module supplies it.
 
 use std::path::Path;
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::Arc;
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 
 use crate::query::DocQuery;
 use crate::store::DocStore;
 
-type Reply = mpsc::Sender<Result<Vec<Vec<String>>>>;
-type Job = (String, Reply);
-
-/// Open `docs.kuzu` once and return a `RowSource` that reads through it.
+/// A `RowSource` that opens `docs.kuzu` per request.
 ///
-/// The store lives on its own thread rather than behind an `Arc` shared
-/// with the read service's worker pool, because `DocStore` holds the
-/// process-wide `DB_LOCK` as a `MutexGuard` and is therefore `!Send`.
+/// Per request, deliberately, and this is the opposite of the graph side --
+/// which insists on one long-lived `Arc<GraphStore>` because a second
+/// `Database` cannot see the live writer's uncommitted WAL (#149). The
+/// asymmetry is real: on the docs side there *is* no long-lived writer. The
+/// doc watcher opens a `DocIndex` per reindex and drops it (`watch.rs`), so
+/// everything it wrote is committed by the time it lets go.
 ///
-/// Opening a fresh `DocStore` per request would sidestep that, and would be
-/// wrong for the same reason the graph path refuses it: a second `Database`
-/// on one file cannot see the writer's uncommitted WAL, so it serves stale
-/// or empty rows with no error (#149, and `tests/read_service.rs` pins the
-/// graph-side equivalent). One store, one thread, one `Database`.
+/// Holding one open here instead would deadlock the daemon. `DocStore::open`
+/// takes the process-wide `DB_LOCK` and holds the guard for the store's
+/// lifetime, so a store kept for the daemon's lifetime would block the doc
+/// watcher's next `DocIndex::init()` forever.
 ///
-/// The cost is that document reads serialise on that thread. Acceptable:
-/// documents are far lower volume than the code graph, and this is the
-/// trade that keeps the invariant.
+/// Keeping the store inside the closure also means it never crosses a thread
+/// boundary, which matters because that `MutexGuard` makes `DocStore`
+/// `!Send`.
 pub fn daemon_row_source(root: &Path) -> Result<infigraph_core::daemon::read_service::RowSource> {
     let path = root.join(".infigraph").join("docs.kuzu");
-    let (tx, rx) = mpsc::channel::<Job>();
-    let (ready_tx, ready_rx) = mpsc::channel::<Result<()>>();
+    // Fail fast if the store cannot be opened at all, rather than at the
+    // first read: the daemon logs this once and serves the graph only.
+    drop(DocStore::open(&path)?);
 
-    std::thread::Builder::new()
-        .name("infigraph-docs-reads".to_string())
-        .spawn(move || {
-            let store = match DocStore::open(&path) {
-                Ok(store) => {
-                    let _ = ready_tx.send(Ok(()));
-                    store
-                }
-                Err(e) => {
-                    let _ = ready_tx.send(Err(e));
-                    return;
-                }
-            };
-            // Ends when the last sender drops, i.e. when the daemon drops
-            // the `RowSource`.
-            for (cypher, reply) in rx {
-                let _ = reply.send(run_one(&store, &cypher));
-            }
-        })?;
-
-    ready_rx
-        .recv()
-        .map_err(|_| anyhow!("document read thread exited before reporting readiness"))??;
-
-    // `Mutex` because a `RowSource` must be `Sync` and `mpsc::Sender` is not.
-    let tx = Mutex::new(tx);
     Ok(Arc::new(move |cypher: &str| {
-        let (reply_tx, reply_rx) = mpsc::channel();
-        tx.lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .send((cypher.to_string(), reply_tx))
-            .map_err(|_| anyhow!("the document read thread is gone"))?;
-        reply_rx
-            .recv()
-            .map_err(|_| anyhow!("the document read thread dropped the reply"))?
+        let store = DocStore::open(&path)?;
+        let conn = store.connection()?;
+        // The guard runs here, where the connection is, so the verdict
+        // still comes from the database's own parser.
+        infigraph_core::daemon::read_guard::ensure_read_only(&conn, cypher)?;
+        DocQuery::new(&conn).raw_query(cypher)
     }))
-}
-
-/// The guard runs here, not in the read service: this side holds the
-/// connection, and the verdict must come from the database's own parser.
-fn run_one(store: &DocStore, cypher: &str) -> Result<Vec<Vec<String>>> {
-    let conn = store.connection()?;
-    infigraph_core::daemon::read_guard::ensure_read_only(&conn, cypher)?;
-    DocQuery::new(&conn).raw_query(cypher)
 }

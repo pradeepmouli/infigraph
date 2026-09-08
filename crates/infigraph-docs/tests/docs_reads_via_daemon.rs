@@ -68,6 +68,49 @@ fn document_reads_fail_without_a_daemon() {
     );
 }
 
+/// The source must not hold `docs.kuzu` open between reads.
+///
+/// `DocStore::open` takes the process-wide `DB_LOCK` and holds the guard for
+/// the store's lifetime, so a source that kept one open for the daemon's
+/// lifetime would block the doc watcher's next `DocIndex::init()` forever --
+/// which is exactly what the first version of this did.
+#[test]
+fn the_source_does_not_hold_the_store_open_between_reads() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    seed_one_document(root);
+
+    let docs = infigraph_docs::daemon_source::daemon_row_source(root).unwrap();
+    let svc = ReadService::start_with_sources(root, graph_source(root), Some(docs), 2).unwrap();
+
+    // Checked BEFORE any read: if the source holds DB_LOCK, a read blocks
+    // inside the service and the client waits on the socket forever, so
+    // probing the lock first is what turns this into a clean failure
+    // instead of a hung test.
+    //
+    // With the service live, another `DocStore` must be openable -- as the
+    // doc watcher does on every reindex.
+    let path = root.join(".infigraph").join("docs.kuzu");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(DocStore::open(&path).is_ok());
+    });
+    let opened = rx
+        .recv_timeout(std::time::Duration::from_secs(20))
+        .expect("opening a second DocStore blocked -- the source is holding DB_LOCK");
+    assert!(
+        opened,
+        "the doc watcher must still be able to open the store"
+    );
+
+    // And reads work with the service live.
+    let exec = RemoteExec::for_docs(root);
+    let rows = exec.query_rows("MATCH (d:Document) RETURN d.id").unwrap();
+    assert_eq!(rows, vec![vec!["a.md".to_string()]]);
+
+    svc.shutdown();
+}
+
 // ── helpers ──────────────────────────────────────────────────────────
 
 /// Seed one document through the docs store's own open path, then drop it:
