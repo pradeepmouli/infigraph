@@ -535,7 +535,15 @@ where
     // a client that cannot reach the service gets an explicit "no daemon
     // read service is listening" from `RemoteExec` rather than a silent
     // wrong answer.
-    let _read_service = {
+    // Only a daemon serves reads. `run_write_coordinator` also drives plain
+    // in-process watching (`watch_project`, serve_requests=false), which is
+    // not a daemon: it must not bind this project's read endpoint -- a real
+    // daemon may already own it -- and must not hold the graph open, or an
+    // ordinary local `infigraph index` is locked out for the watcher's
+    // whole lifetime.
+    let _read_service = if !serve_requests {
+        None
+    } else {
         let beacon = held_prism.beacon();
         let source: read_service::StoreSource = Arc::new(move || {
             beacon
@@ -581,8 +589,10 @@ where
     // trigger a write. Best-effort: a failure here (no graph yet, or another
     // process still holding it) is not fatal, and the loop's existing
     // `reopen_backoff` path retries on demand exactly as before.
-    if let Err(e) = watch_db(root, &shared_registry, &mut held_prism) {
-        eprintln!("[read] graph not open at daemon start (will retry on demand): {e:#}");
+    if serve_requests {
+        if let Err(e) = watch_db(root, &shared_registry, &mut held_prism) {
+            eprintln!("[read] graph not open at daemon start (will retry on demand): {e:#}");
+        }
     }
 
     let mut changes_since_periodic: usize = 0;
