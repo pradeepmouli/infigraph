@@ -26,6 +26,9 @@ pub use backend::{
 pub use cozo_store::CozoStore;
 pub use daemon_kuzu_backend::DaemonKuzuBackend;
 pub use kuzu_backend::KuzuBackend;
+// The daemon's read service serves from a bare `Arc<GraphStore>`; this is
+// how it reaches `raw_query`'s transaction-control handling without one.
+pub(crate) use kuzu_backend::raw_query_on;
 #[cfg(feature = "neo4j")]
 pub use neo4j_backend::Neo4jBackend;
 pub use queries::{

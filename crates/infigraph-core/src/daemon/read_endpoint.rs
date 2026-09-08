@@ -61,12 +61,11 @@ impl ReadEndpoint {
 
 /// A bound read-service listener.
 ///
-/// A newtype rather than a re-export of `interprocess`'s `Listener` for two
-/// reasons: it keeps the transport crate an implementation detail of this
-/// module (the one place its API shape appears), and `interprocess`'s API is
-/// trait-based -- an integration test in `tests/` links `infigraph_core` but
-/// not `infigraph_core`'s dependencies, so it could not bring those traits
-/// into scope to call `accept` at all.
+/// A newtype rather than a re-export of `interprocess`'s `Listener`, so this
+/// module stays the only place the transport crate's API shape appears.
+/// `interprocess` is trait-based (`accept` comes from `ListenerExt`), and
+/// re-exporting the raw type would push that import onto every caller and
+/// spread the dependency across the crate.
 pub struct ReadListener {
     inner: interprocess::local_socket::Listener,
 }
