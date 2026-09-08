@@ -166,12 +166,24 @@ fn doc_index_starts_a_daemon_when_none_is_running() {
         "no daemon may be running before this test starts"
     );
 
+    // Starting a real daemon registers the project globally, so point the
+    // registry at a scratch home for the duration -- otherwise every run of
+    // this test leaves a `.tmpXXXX` entry in ~/.infigraph/registry.json that
+    // `doctor` later reports as a removed worktree. Same reason
+    // infigraph-mcp's tests call `isolate_registry`.
+    let registry_home = tempfile::tempdir().unwrap();
+    let prior_home = std::env::var("INFIGRAPH_REGISTRY_HOME").ok();
+    std::env::set_var("INFIGRAPH_REGISTRY_HOME", registry_home.path());
     std::env::set_var("INFIGRAPH_BACKEND", "daemon");
     let mut idx = infigraph_docs::DocIndex::open(root).unwrap();
     let got = idx
         .init()
         .and_then(|()| idx.store().expect("a backend").get_doc_hashes());
     std::env::remove_var("INFIGRAPH_BACKEND");
+    match prior_home {
+        Some(v) => std::env::set_var("INFIGRAPH_REGISTRY_HOME", v),
+        None => std::env::remove_var("INFIGRAPH_REGISTRY_HOME"),
+    }
 
     // Stop it before the tempdir goes away, so no daemon is left watching a
     // directory nobody owns (#133).
