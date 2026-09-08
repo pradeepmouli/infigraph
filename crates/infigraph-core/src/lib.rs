@@ -564,6 +564,19 @@ impl Infigraph {
     /// - `neo4j`: connects to remote Neo4j sidecar (no local DB)
     /// - default: opens embedded Kùzu in read-only mode
     pub fn init_read_only(&mut self) -> Result<()> {
+        // Reads are daemon-routed too, not just writes. Without this the
+        // read-only entry points -- which is most of the CLI and both of
+        // infigraph-mcp's helpers -- would keep opening the graph file
+        // directly under INFIGRAPH_BACKEND=daemon, and "the daemon is the
+        // only process that opens the graph" would be false for nearly
+        // every read.
+        if daemon_backend_selected() {
+            crate::daemon::lifecycle::ensure_daemon_for_routed_access(&self.root)?;
+            let dk = graph::DaemonKuzuBackend::open(&self.root)?;
+            self.backend_kind = BackendKind::DaemonKuzu(dk);
+            return Ok(());
+        }
+
         let backend_env = selected_backend();
 
         match backend_env.as_str() {
@@ -598,6 +611,21 @@ impl Infigraph {
     /// Neo4j has no local-graph crash-recovery concept, so it always
     /// returns `Ok(None)` there.
     pub fn init_read_only_or_degrade(&mut self) -> Result<Option<graph::DegradeReason>> {
+        // Reads are daemon-routed too, not just writes. Without this the
+        // read-only entry points -- which is most of the CLI and both of
+        // infigraph-mcp's helpers -- would keep opening the graph file
+        // directly under INFIGRAPH_BACKEND=daemon, and "the daemon is the
+        // only process that opens the graph" would be false for nearly
+        // every read.
+        if daemon_backend_selected() {
+            crate::daemon::lifecycle::ensure_daemon_for_routed_access(&self.root)?;
+            let dk = graph::DaemonKuzuBackend::open(&self.root)?;
+            self.backend_kind = BackendKind::DaemonKuzu(dk);
+            // No local graph file to degrade from -- the daemon owns it, the
+            // same reason the Neo4j arm returns None.
+            return Ok(None);
+        }
+
         let backend_env = selected_backend();
         match backend_env.as_str() {
             #[cfg(feature = "neo4j")]

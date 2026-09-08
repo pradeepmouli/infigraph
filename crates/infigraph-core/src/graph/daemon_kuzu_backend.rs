@@ -13,7 +13,6 @@ use super::backend::{
     CallsServiceEdge, Concern, CrossServiceEdgeCandidate, GraphBackend, ResolvesToEdge,
     TaintFlowEdge,
 };
-use super::kuzu_backend::KuzuBackend;
 use super::{
     ApiSymbol, ArchitectureStats, BranchInfo, ComplexityRow, DeadCodeRow, FileDeps, GraphStats,
     ImpactRow, ReferenceRow, SymbolDetail, SymbolMeta, SymbolRow, SymbolWithDocstring, TestContext,
@@ -43,22 +42,21 @@ pub struct DaemonKuzuBackend {
 impl DaemonKuzuBackend {
     pub fn open(root: &Path) -> Result<Self> {
         let db_path = root.join(".infigraph").join("graph");
-        // Validation probe only -- immediately dropped. Reads open their own
-        // connection, but callers (notably `Infigraph::init`'s "daemon" arm,
-        // which propagates this `?`) rely on `open` failing eagerly when the
-        // graph is missing or unopenable rather than surfacing that on some
-        // later read.
+        // No validation probe here any more.
         //
-        // Skipped entirely when the graph doesn't exist yet -- a brand-new
-        // project being indexed for the first time. Read-only mode can never
-        // create a database (Kuzu itself refuses with "Cannot create an
-        // empty database under READ ONLY mode"), so probing here would
-        // always fail even though the daemon's own write path creates the
-        // graph fine on the first real index. Only probe when there's
-        // something on disk to actually validate.
-        if db_path.exists() {
-            drop(KuzuBackend::open_read_only(&db_path)?);
-        }
+        // This used to `drop(KuzuBackend::open_read_only(&db_path)?)` so a
+        // missing or unopenable graph failed eagerly rather than on a later
+        // read. Since reads route through the daemon that is both pointless
+        // and harmful: pointless because no read opens this file any more,
+        // and harmful because a read-only open fails while the daemon holds
+        // an uncheckpointed WAL ("Corrupted wal file ... held by a live
+        // writer", #149) -- so the probe broke routed reads exactly when the
+        // daemon was busy writing, which is when routing matters most.
+        //
+        // The eager check that replaces it is reachability, not openability:
+        // `Infigraph::init`/`init_read_only` call
+        // `lifecycle::ensure_daemon_for_routed_access`, which starts a daemon
+        // or fails with an actionable message.
         Ok(Self {
             db_path,
             root: root.to_path_buf(),
