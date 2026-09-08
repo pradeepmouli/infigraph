@@ -5,6 +5,7 @@ pub mod embed;
 pub mod extract;
 #[cfg(feature = "remote")]
 pub mod neo4j_store;
+pub mod query;
 pub mod search;
 pub mod store;
 pub mod watch;

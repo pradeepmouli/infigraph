@@ -162,16 +162,7 @@ impl DocStore {
 
     pub fn get_doc_hashes(&self) -> Result<HashMap<String, String>> {
         let conn = self.connection()?;
-        let result = conn
-            .query("MATCH (d:Document) RETURN d.file, d.content_hash")
-            .map_err(|e| anyhow::anyhow!("query doc hashes: {e}"))?;
-        let mut hashes = HashMap::new();
-        for row in result {
-            if row.len() >= 2 {
-                hashes.insert(row[0].to_string(), row[1].to_string());
-            }
-        }
-        Ok(hashes)
+        crate::query::DocQuery::new(&conn).get_doc_hashes()
     }
 
     pub fn upsert_all_parquet(&self, docs: &[&ExtractedDoc], chunks: &[&Chunk]) -> Result<()> {
@@ -365,19 +356,7 @@ impl DocStore {
 
     pub fn get_docs_by_source(&self, source_id: &str) -> Result<Vec<String>> {
         let conn = self.connection()?;
-        let result = conn
-            .query(&format!(
-                "MATCH (d:Document)-[:FROM_SOURCE]->(s:Source) WHERE s.id = '{}' RETURN d.id",
-                escape_str(source_id)
-            ))
-            .map_err(|e| anyhow::anyhow!("query docs by source: {e}"))?;
-        let mut ids = Vec::new();
-        for row in result {
-            if !row.is_empty() {
-                ids.insert(ids.len(), row[0].to_string());
-            }
-        }
-        Ok(ids)
+        crate::query::DocQuery::new(&conn).get_docs_by_source(source_id)
     }
 
     pub fn delete_docs_by_ids(&self, doc_ids: &[&str]) -> Result<()> {
@@ -444,17 +423,9 @@ impl DocStore {
 
     pub fn stats(&self) -> Result<DocStoreStats> {
         let conn = self.connection()?;
-        let doc_count = count_query(&conn, "MATCH (d:Document) RETURN count(d)");
-        let chunk_count = count_query(&conn, "MATCH (c:Chunk) RETURN count(c)");
-        Ok(DocStoreStats {
-            document_count: doc_count,
-            chunk_count,
-        })
+        crate::query::DocQuery::new(&conn).stats()
     }
 
-    // ── PipelineCore methods ──────────────────────────────────────────────
-
-    /// Create a per-plugin node table from schema definition.
     pub fn ensure_plugin_table(&self, plugin_id: &str, columns: &[(String, String)]) -> Result<()> {
         let conn = self.connection()?;
         let mut col_defs = String::from("id STRING");
@@ -594,145 +565,24 @@ impl DocStore {
         plugin_id: Option<&str>,
     ) -> Result<Vec<PipelineCoreRecord>> {
         let conn = self.connection()?;
-        let query = match plugin_id {
-            Some(pid) => format!(
-                "MATCH (p:PipelineCore) WHERE p.plugin_id = '{}' RETURN p.id, p.name, p.doc_id, p.plugin_id, p.inputs, p.outputs",
-                escape_str(pid)
-            ),
-            None => "MATCH (p:PipelineCore) RETURN p.id, p.name, p.doc_id, p.plugin_id, p.inputs, p.outputs".to_string(),
-        };
-        let result = conn
-            .query(&query)
-            .map_err(|e| anyhow::anyhow!("query pipeline cores: {e}"))?;
-        let mut records = Vec::new();
-        for row in result {
-            if row.len() >= 6 {
-                records.push(PipelineCoreRecord {
-                    id: row[0].to_string(),
-                    name: row[1].to_string(),
-                    doc_id: row[2].to_string(),
-                    plugin_id: row[3].to_string(),
-                    inputs: parse_string_list(&row[4].to_string()),
-                    outputs: parse_string_list(&row[5].to_string()),
-                });
-            }
-        }
-        Ok(records)
+        crate::query::DocQuery::new(&conn).get_all_pipeline_cores(plugin_id)
     }
 
-    /// Get a PipelineCore record by id.
     pub fn get_pipeline_core(&self, pipeline_id: &str) -> Result<Option<PipelineCoreRecord>> {
         let conn = self.connection()?;
-        let mut result = conn
-            .query(&format!(
-                "MATCH (p:PipelineCore) WHERE p.id = '{}' RETURN p.id, p.name, p.doc_id, p.plugin_id, p.inputs, p.outputs",
-                escape_str(pipeline_id)
-            ))
-            .map_err(|e| anyhow::anyhow!("query pipeline core: {e}"))?;
-        if let Some(row) = result.next() {
-            if row.len() >= 6 {
-                return Ok(Some(PipelineCoreRecord {
-                    id: row[0].to_string(),
-                    name: row[1].to_string(),
-                    doc_id: row[2].to_string(),
-                    plugin_id: row[3].to_string(),
-                    inputs: parse_string_list(&row[4].to_string()),
-                    outputs: parse_string_list(&row[5].to_string()),
-                }));
-            }
-        }
-        Ok(None)
+        crate::query::DocQuery::new(&conn).get_pipeline_core(pipeline_id)
     }
 
-    /// Impact analysis using PipelineCore inputs/outputs.
     pub fn impact_analysis(&self, table_name: &str, max_depth: u32) -> Result<Vec<ImpactResult>> {
         let conn = self.connection()?;
-        let esc = escape_str(table_name);
-        let mut results = Vec::new();
-
-        // Direct impact: pipelines that consume this table
-        let direct = conn
-            .query(&format!(
-                "MATCH (p:PipelineCore) WHERE list_contains(p.inputs, '{}') RETURN p.id, p.name",
-                esc
-            ))
-            .map_err(|e| anyhow::anyhow!("impact_analysis direct: {e}"))?;
-        let mut affected_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
-        for row in direct {
-            if row.len() >= 2 {
-                let id = row[0].to_string();
-                let name = row[1].to_string();
-                affected_ids.insert(id.clone());
-                results.push(ImpactResult {
-                    pipeline_id: id,
-                    pipeline_name: name,
-                    impact_type: "direct".to_string(),
-                    depth: 1,
-                    path: table_name.to_string(),
-                });
-            }
-        }
-
-        // Transitive impact via DEPENDS_ON edges
-        if max_depth > 1 && !affected_ids.is_empty() {
-            for depth in 2..=max_depth {
-                let current_ids: Vec<String> = affected_ids.iter().cloned().collect();
-                let mut new_ids = Vec::new();
-
-                for src_id in &current_ids {
-                    let trans = conn
-                        .query(&format!(
-                            "MATCH (a:PipelineCore)-[:DEPENDS_ON]->(b:PipelineCore) WHERE b.id = '{}' RETURN a.id, a.name",
-                            escape_str(src_id)
-                        ))
-                        .map_err(|e| anyhow::anyhow!("impact_analysis transitive: {e}"))?;
-
-                    for row in trans {
-                        if row.len() >= 2 {
-                            let id = row[0].to_string();
-                            if !affected_ids.contains(&id) {
-                                results.push(ImpactResult {
-                                    pipeline_id: id.clone(),
-                                    pipeline_name: row[1].to_string(),
-                                    impact_type: "transitive".to_string(),
-                                    depth,
-                                    path: format!("{} → ... (depth {})", table_name, depth),
-                                });
-                                new_ids.push(id);
-                            }
-                        }
-                    }
-                }
-
-                if new_ids.is_empty() {
-                    break;
-                }
-                affected_ids.extend(new_ids);
-            }
-        }
-
-        Ok(results)
+        crate::query::DocQuery::new(&conn).impact_analysis(table_name, max_depth)
     }
 
-    /// Get all DEPENDS_ON edges as (from_name, to_name, dep_type) tuples.
     pub fn get_pipeline_deps(&self) -> Result<Vec<(String, String, String)>> {
         let conn = self.connection()?;
-        let result = conn
-            .query(
-                "MATCH (c:PipelineCore)-[r:DEPENDS_ON]->(p:PipelineCore) \
-                 RETURN c.name, p.name, r.dep_type",
-            )
-            .map_err(|e| anyhow::anyhow!("query pipeline deps: {e}"))?;
-        let mut deps = Vec::new();
-        for row in result {
-            if row.len() >= 3 {
-                deps.push((row[0].to_string(), row[1].to_string(), row[2].to_string()));
-            }
-        }
-        Ok(deps)
+        crate::query::DocQuery::new(&conn).get_pipeline_deps()
     }
 
-    /// Query a plugin-specific table by field value.
     pub fn query_plugin_table(
         &self,
         plugin_id: &str,
@@ -740,99 +590,27 @@ impl DocStore {
         value: &str,
     ) -> Result<Vec<serde_json::Value>> {
         let conn = self.connection()?;
-        let table = format!("Pipeline_{}", plugin_id);
-        let esc_val = escape_str(value);
-        let result = conn
-            .query(&format!(
-                "MATCH (p:{}) WHERE lower(p.{}) CONTAINS lower('{}') RETURN p.*",
-                table, field, esc_val
-            ))
-            .map_err(|e| anyhow::anyhow!("query plugin table: {e}"))?;
-        let mut rows = Vec::new();
-        for row in result {
-            let vals: Vec<serde_json::Value> = row
-                .iter()
-                .map(|v| serde_json::Value::String(v.to_string()))
-                .collect();
-            rows.push(serde_json::Value::Array(vals));
-        }
-        Ok(rows)
+        crate::query::DocQuery::new(&conn).query_plugin_table(plugin_id, field, value)
     }
 
-    /// Pipeline count for stats (using PipelineCore).
     pub fn pipeline_core_count(&self) -> Result<usize> {
         let conn = self.connection()?;
-        Ok(count_query(&conn, "MATCH (p:PipelineCore) RETURN count(p)"))
+        crate::query::DocQuery::new(&conn).pipeline_core_count()
     }
 
     pub fn get_all_chunks(&self) -> Result<Vec<(String, String)>> {
         let conn = self.connection()?;
-        let result = conn
-            .query("MATCH (c:Chunk) RETURN c.id, c.text")
-            .map_err(|e| anyhow::anyhow!("query chunks: {e}"))?;
-        let mut chunks = Vec::new();
-        for row in result {
-            if row.len() >= 2 {
-                chunks.push((row[0].to_string(), row[1].to_string()));
-            }
-        }
-        Ok(chunks)
+        crate::query::DocQuery::new(&conn).get_all_chunks()
     }
 
     pub fn get_chunk_ids(&self) -> Result<std::collections::HashSet<String>> {
         let conn = self.connection()?;
-        let result = conn
-            .query("MATCH (c:Chunk) RETURN c.id")
-            .map_err(|e| anyhow::anyhow!("query chunk ids: {e}"))?;
-        let mut ids = std::collections::HashSet::new();
-        for row in result {
-            if !row.is_empty() {
-                ids.insert(row[0].to_string());
-            }
-        }
-        Ok(ids)
+        crate::query::DocQuery::new(&conn).get_chunk_ids()
     }
 
     pub fn get_chunk_details(&self, chunk_ids: &[&str]) -> Result<Vec<ChunkDetail>> {
         let conn = self.connection()?;
-        let id_list: String = chunk_ids
-            .iter()
-            .map(|id| format!("'{}'", escape_str(id)))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let query = format!(
-            "MATCH (c:Chunk) WHERE c.id IN [{}] RETURN c.id, c.doc_file, c.idx, c.heading, c.text, c.start_offset, c.end_offset, c.page",
-            id_list
-        );
-        let result = conn
-            .query(&query)
-            .map_err(|e| anyhow::anyhow!("chunk details: {e}"))?;
-        let mut details = Vec::new();
-        for row in result {
-            if row.len() >= 8 {
-                let heading_str = row[3].to_string();
-                let page_val: i64 = row[7].to_string().parse().unwrap_or(0);
-                details.push(ChunkDetail {
-                    id: row[0].to_string(),
-                    doc_file: row[1].to_string(),
-                    index: row[2].to_string().parse().unwrap_or(0),
-                    heading: if heading_str.is_empty() {
-                        None
-                    } else {
-                        Some(heading_str)
-                    },
-                    text: row[4].to_string(),
-                    start_offset: row[5].to_string().parse().unwrap_or(0),
-                    end_offset: row[6].to_string().parse().unwrap_or(0),
-                    page: if page_val > 0 {
-                        Some(page_val as usize)
-                    } else {
-                        None
-                    },
-                });
-            }
-        }
-        Ok(details)
+        crate::query::DocQuery::new(&conn).get_chunk_details(chunk_ids)
     }
 }
 
@@ -994,16 +772,9 @@ impl DocBackend for DocStore {
     }
 }
 
-fn count_query(conn: &Connection<'_>, query: &str) -> usize {
-    conn.query(query)
-        .ok()
-        .and_then(|mut r| r.next().map(|row| row[0].to_string().parse().unwrap_or(0)))
-        .unwrap_or(0)
-}
-
 /// Parse a Kuzu STRING[] column rendered via `.to_string()`.
 /// Kuzu returns STRING[] as "[val1,val2,val3]".
-fn parse_string_list(s: &str) -> Vec<String> {
+pub(crate) fn parse_string_list(s: &str) -> Vec<String> {
     let trimmed = s.trim_matches(|c| c == '[' || c == ']');
     if trimmed.is_empty() {
         return Vec::new();
