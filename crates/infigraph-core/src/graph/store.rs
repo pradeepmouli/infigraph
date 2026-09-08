@@ -1104,8 +1104,10 @@ impl GraphStore {
     pub fn derive_tested_by_edges(&self) -> Result<usize> {
         let _lock = self.write_lock()?;
         let conn = self.connection()?;
-        let q = super::queries::GraphQuery::new(&conn);
-        q.derive_tested_by_edges()
+        // A free function, not a GraphQuery method: GraphQuery now runs on a
+        // read-only executor, and this path holds the write lock precisely
+        // because it writes.
+        super::queries::derive_tested_by_edges(&conn)
     }
 
     pub fn stats(&self) -> Result<GraphStats> {
