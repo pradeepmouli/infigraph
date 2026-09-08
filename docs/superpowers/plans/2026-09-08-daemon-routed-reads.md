@@ -152,7 +152,28 @@ impl<'a> GraphQuery<'a> {
 
 Then mechanically replace every `self.conn.query(&query)` + row-collection in this file with `self.exec.query_rows(&query)?`. There are ~40 such sites. Do not change any Cypher string, any struct field, or any parsing logic — only how rows are obtained.
 
-- [ ] **Step 6: Update `GraphQuery::new` call sites**
+- [ ] **Step 6: Point `GraphQuery::raw_query` at the executor**
+
+`GraphQuery` already has a `raw_query` method, and `KuzuBackend::raw_query`
+delegates to it. Make it the one place that reaches the executor:
+
+```rust
+    /// Execute arbitrary read Cypher and return stringly rows.
+    ///
+    /// This is the primitive every other method in this file is built on
+    /// once `GraphQuery` runs on a `QueryExec`.
+    pub fn raw_query(&self, query: &str) -> Result<Vec<Vec<String>>> {
+        self.exec.query_rows(query)
+    }
+```
+
+Note the direction of dependency, because inverting it deadlocks the design:
+`LocalExec::query_rows` must do the `conn.query()` + stringify itself and must
+NOT delegate to `GraphQuery::raw_query`. `GraphQuery` is generic over
+`QueryExec`, so an executor calling back into it would recurse forever.
+`QueryExec` is the primitive; `GraphQuery::raw_query` is the thin wrapper.
+
+- [ ] **Step 7: Update `GraphQuery::new` call sites**
 
 `KuzuBackend` (`crates/infigraph-core/src/graph/kuzu_backend.rs`) creates a connection per read method (`let conn = self.store.connection()?;` at lines 83, 89, 95, 101, 109, 115, 121, 127, 133, 139, 147, 153, 159, and onwards). At each, wrap it:
 
@@ -162,14 +183,14 @@ let exec = crate::graph::query_exec::LocalExec::new(&conn);
 let q = GraphQuery::new_with(&exec);
 ```
 
-- [ ] **Step 7: Run the whole core suite**
+- [ ] **Step 8: Run the whole core suite**
 
 Run: `cargo test -p infigraph-core --lib -- --test-threads=1`
 Expected: PASS, same count as before the task (565 at the time of writing) plus the one new test.
 
 This is the task's real gate: a pure refactor that changes no behaviour must not change any test outcome.
 
-- [ ] **Step 8: Commit**
+- [ ] **Step 9: Commit**
 
 ```bash
 git add crates/infigraph-core/src/graph/query_exec.rs \
@@ -665,10 +686,21 @@ git commit -m "feat(core): framed read protocol where truncation is not an empty
 - Test: `crates/infigraph-core/tests/read_service.rs`
 
 **Interfaces:**
-- Produces: `ReadService::start(root: &Path, db: Arc<kuzu::Database>, workers: usize) -> Result<ReadService>`, `ReadService::shutdown(self)`.
-- Consumes: `ReadEndpoint` (Task 2), `ensure_read_only` (Task 4), `read_protocol` (Task 5).
+- Produces: `ReadService::start(root: &Path, store: Arc<GraphStore>, workers: usize) -> Result<ReadService>`, `ReadService::shutdown(self)`.
+- Consumes: `ReadEndpoint` (Task 2), `ensure_read_only` (Task 4), `read_protocol` (Task 5), the daemon's existing `GraphStore` (Task 10).
 
-The service owns nothing the write coordinator owns: no `index.lock`, no queue, no watch-loop coupling. Each accepted connection is handed to a worker which creates a `kuzu::Connection` from the shared `Database`.
+The service owns nothing the write coordinator owns: no `index.lock`, no queue, no watch-loop coupling.
+
+**It takes `Arc<GraphStore>`, never a bare `kuzu::Database`, and this is load-bearing.**
+`GraphStore` is not a thin wrapper: opening through it carries `validate_db_file`'s
+truncation preflight (the guard against Kuzu parsing a bogus size field and aborting
+the process), `refuse_newer_schema`, the bounded write buffer pool from 13b4065, and
+the `write_phase::enter` breadcrumbs. A read service holding its own `Database`
+re-derives none of that — and, worse, a second handle on the same file cannot see the
+writer's uncommitted WAL even inside one process. That is #149 reproduced inside the
+daemon, and it would pass every test that starts a service and queries it, because
+those tests have no concurrent writer. There must be exactly one `Database` in the
+process, reached through the daemon's existing store.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -758,7 +790,7 @@ pub struct ReadService {
 }
 
 impl ReadService {
-    pub fn start(root: &Path, db: Arc<kuzu::Database>, workers: usize) -> Result<Self> {
+    pub fn start(root: &Path, store: Arc<crate::graph::GraphStore>, workers: usize) -> Result<Self> {
         let endpoint = ReadEndpoint::for_root(root);
         let listener = endpoint.bind()?;
         let stop = Arc::new(AtomicBool::new(false));
@@ -771,9 +803,9 @@ impl ReadService {
                     break;
                 }
                 let Ok(stream) = stream else { continue };
-                let db = db.clone();
+                let store = store.clone();
                 pool.execute(move || {
-                    if let Err(e) = serve_one(&db, stream) {
+                    if let Err(e) = serve_one(&store, stream) {
                         eprintln!("[read] connection failed: {e:#}");
                     }
                 });
@@ -798,12 +830,13 @@ impl ReadService {
 }
 
 fn serve_one<S: std::io::Read + std::io::Write>(
-    db: &kuzu::Database,
+    store: &crate::graph::GraphStore,
     mut stream: S,
 ) -> Result<()> {
     let req = read_request(&mut stream)?;
-    let conn = kuzu::Connection::new(db)
-        .map_err(|e| anyhow::anyhow!("failed to create connection: {e}"))?;
+    // Same call the write path uses (store.rs:976) -- one Database, one
+    // buffer pool, one WAL.
+    let conn = store.connection()?;
 
     match super::read_guard::ensure_read_only(&conn, &req.query) {
         Err(e) => {
@@ -813,8 +846,12 @@ fn serve_one<S: std::io::Read + std::io::Write>(
         Ok(_stmt) => {}
     }
 
-    let exec = crate::graph::query_exec::LocalExec::new(&conn);
-    match crate::graph::query_exec::QueryExec::query_rows(&exec, &req.query) {
+    // Execute through the EXISTING backend API, not a hand-rolled
+    // connection + stringify. `KuzuBackend::raw_query` already returns
+    // `Vec<Vec<String>>` -- the exact wire shape -- and already no-ops bare
+    // BEGIN/COMMIT/ROLLBACK, which a fresh-connection-per-call design must
+    // do and which a hand-rolled path here would silently drop.
+    match backend.raw_query(&req.query) {
         Ok(rows) => {
             for chunk in rows.chunks(req.chunk_size.max(1)) {
                 write_frame(&mut stream, &ReadFrame::Rows(chunk.to_vec()))?;
@@ -834,7 +871,36 @@ Implement `threadpool_of(workers)` as a small fixed-size worker pool over a chan
 Run: `cargo test -p infigraph-core --test read_service -- --test-threads=1`
 Expected: PASS, `2 passed`.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 5: Decide the BEGIN/COMMIT ordering, deliberately**
+
+`ensure_read_only` runs *before* `raw_query`, so a bare `COMMIT` — which
+`raw_query` today silently no-ops — will instead be refused as not-read-only.
+For a read service that is arguably correct, but it is a behaviour change and
+must be a decision, not an accident. Add a test pinning whichever you choose:
+
+```rust
+#[test]
+fn a_bare_commit_sent_to_the_read_service_is_refused_not_silently_accepted() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let graph = root.join(".infigraph").join("graph");
+    std::fs::create_dir_all(graph.parent().unwrap()).unwrap();
+    drop(infigraph_core::graph::GraphStore::open(&graph).unwrap());
+    let store = std::sync::Arc::new(infigraph_core::graph::GraphStore::open(&graph).unwrap());
+    let svc = infigraph_core::daemon::read_service::ReadService::start(root, store, 2).unwrap();
+
+    let got = client_query(root, "COMMIT");
+    assert!(
+        got.is_err(),
+        "a transaction control statement has no meaning on the read service and must \
+         be refused rather than silently returning an empty result"
+    );
+
+    svc.shutdown();
+}
+```
+
+- [ ] **Step 6: Commit**
 
 ```bash
 git add crates/infigraph-core/src/daemon/read_service.rs \
@@ -908,16 +974,69 @@ fn reads_are_served_concurrently_while_an_index_operation_holds_the_lock() {
 }
 ```
 
-- [ ] **Step 2: Run it**
+- [ ] **Step 2: Write the same-`Database` visibility test**
+
+This is the test that catches the whole class of "the read service opened its
+own handle". A second handle passes every test that has no concurrent writer.
+
+```rust
+/// A write committed by the daemon must be visible to the very next read.
+///
+/// If the read service ever holds its own `Database` -- even in the same
+/// process -- it cannot see the writer's uncommitted WAL, and this fails.
+/// That is #149 reproduced inside the daemon, and no test without a
+/// concurrent writer would notice.
+#[test]
+fn a_write_is_visible_to_the_next_read_through_the_service() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let graph = root.join(".infigraph").join("graph");
+    std::fs::create_dir_all(graph.parent().unwrap()).unwrap();
+
+    let store = std::sync::Arc::new(
+        infigraph_core::graph::GraphStore::open(&graph).unwrap(),
+    );
+    let svc = infigraph_core::daemon::read_service::ReadService::start(
+        root,
+        store.clone(),
+        4,
+    )
+    .unwrap();
+
+    assert!(client_query(root, "MATCH (f:File) RETURN f.id").unwrap().is_empty());
+
+    // Write through the SAME store the service holds, without checkpointing.
+    {
+        let conn = store.connection().unwrap();
+        conn.query(
+            "CREATE (:File {id: 'fresh.rs', name: 'fresh.rs', path: 'fresh.rs', \
+             language: 'rust', symbol_count: 0})",
+        )
+        .unwrap();
+    }
+
+    let rows = client_query(root, "MATCH (f:File) RETURN f.id").unwrap();
+    assert_eq!(
+        rows,
+        vec![vec!["fresh.rs".to_string()]],
+        "the read service must observe the daemon's own uncheckpointed write; \
+         if this is empty, the service is holding a second Database handle"
+    );
+
+    svc.shutdown();
+}
+```
+
+- [ ] **Step 3: Run both**
 
 Run: `cargo test -p infigraph-core --test read_service -- --test-threads=1`
-Expected: PASS. If it fails on the elapsed-time assertion, the service is taking a lock it must not take — fix the service, never the bound.
+Expected: PASS. If the elapsed-time assertion fails, the service is taking a lock it must not take — fix the service, never the bound. If the visibility assertion returns an empty result, the service is on its own `Database` — fix the ownership, never the assertion.
 
-- [ ] **Step 3: Commit**
+- [ ] **Step 4: Commit**
 
 ```bash
 git add crates/infigraph-core/tests/read_service.rs
-git commit -m "test(core): reads are served concurrently under a held index.lock"
+git commit -m "test(core): reads are concurrent and see the daemon's own writes"
 ```
 
 ---
@@ -1090,60 +1209,113 @@ git commit -m "test(core): a truncated read stream is an error, not an empty res
 
 ---
 
-### Task 10: Start the read service with the daemon
+### Task 10: Share the daemon's `GraphStore` and start the read service
+
+This is where the single-`Database` invariant is actually established. It is two
+things — threading ownership, then starting the service — kept as one task because
+starting the service without the shared store is exactly the mistake this plan exists
+to prevent.
 
 **Files:**
-- Modify: `crates/infigraph-core/src/daemon/mod.rs` (the daemon's startup path, alongside where the write coordinator is started)
+- Modify: `crates/infigraph-core/src/graph/kuzu_backend.rs` (`KuzuBackend` holds `Arc<GraphStore>`)
+- Modify: `crates/infigraph-core/src/daemon/mod.rs` (daemon startup, alongside the write coordinator)
+- Test: `crates/infigraph-core/tests/read_service.rs`
 
 **Interfaces:**
-- Consumes: `ReadService::start` (Task 6).
+- Produces: `KuzuBackend::store(&self) -> Arc<GraphStore>`.
+- Consumes: `ReadService::start(root, store, workers)` (Task 6).
 
-- [ ] **Step 1: Locate the startup site**
+**The ownership problem.** The daemon reaches its store through
+`Infigraph → BackendKind::Kuzu(KuzuBackend) → GraphStore`, and `KuzuBackend` owns it
+by value (`pub struct KuzuBackend { store: GraphStore }`). The read service needs a
+handle to that same store, so ownership must become shared.
+
+Do **not** solve this by opening a second store in the daemon. A second handle on one
+graph file cannot see the first's uncommitted WAL even inside one process — #149
+reproduced inside the daemon, and invisible to any test without a concurrent writer.
+Task 7's visibility test exists to catch exactly this.
+
+- [ ] **Step 1: Make `KuzuBackend` hold `Arc<GraphStore>`**
+
+```rust
+pub struct KuzuBackend {
+    store: std::sync::Arc<GraphStore>,
+}
+
+impl KuzuBackend {
+    /// A handle to this backend's store, so the daemon's read service can
+    /// serve from the SAME `Database` the write path uses.
+    pub fn store(&self) -> std::sync::Arc<GraphStore> {
+        self.store.clone()
+    }
+}
+```
+
+Wrap the store in the constructor(s). Existing `self.store.connection()` call sites
+compile unchanged through `Deref`.
+
+- [ ] **Step 2: Confirm the ownership change is inert**
+
+Run: `cargo test -p infigraph-core -- --test-threads=1`
+Expected: PASS with unchanged counts. This is a pure ownership change; any movement
+means something depended on `GraphStore` being owned by value.
+
+- [ ] **Step 3: Locate the startup site**
 
 Run: `rg -n "run_write_coordinator" crates/infigraph-core/src/daemon/mod.rs crates/infigraph-cli/src/main.rs`
 
-The read service starts in the same function that starts the write coordinator, before it enters its loop, and is shut down when that function returns.
+The read service starts in the same function that starts the write coordinator, before
+it enters its loop, and shuts down when that function returns.
 
-- [ ] **Step 2: Write the failing test**
-
-`crates/infigraph-core/tests/read_service.rs`:
+- [ ] **Step 4: Write the failing test**
 
 ```rust
-/// A real daemon must be answering reads on its endpoint. Without this the
-/// service exists but nothing starts it.
+/// A real daemon must answer reads on its endpoint. Without this the service
+/// exists but nothing starts it.
 #[test]
 #[ignore = "spawns a real daemon; run explicitly"]
 fn a_running_daemon_answers_reads_on_its_endpoint() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    // Index one file through the normal path so a graph exists.
-    // ... spawn `infigraph --root <root> daemon`, wait for watch.lock ...
+    std::fs::write(root.join("a.rs"), "pub fn hello() {}\n").unwrap();
+
+    let daemon = spawn_daemon_and_wait(root);
+
     let rows = client_query(root, "MATCH (f:File) RETURN f.id").unwrap();
-    assert!(!rows.is_empty());
+    assert!(!rows.is_empty(), "a running daemon must serve reads");
+
+    stop_daemon(daemon);
 }
 ```
 
-Fill in the daemon spawn using the same pattern `crates/infigraph-core/tests/watch_daemon.rs` already uses to start and await a daemon; do not invent a new one.
+Write `spawn_daemon_and_wait` and `stop_daemon` using the pattern
+`crates/infigraph-core/tests/watch_daemon.rs` already uses to start a daemon and await
+its `watch.lock`; do not invent a new mechanism.
 
-- [ ] **Step 3: Run to verify it fails**
+- [ ] **Step 5: Run to verify it fails**
 
 Run: `cargo test -p infigraph-core --test read_service -- --ignored a_running_daemon --test-threads=1`
-Expected: FAIL — nothing is listening.
+Expected: FAIL — nothing is listening on the endpoint.
 
-- [ ] **Step 4: Wire it in**
+- [ ] **Step 6: Wire it in**
 
-Start `ReadService::start(root, db, workers)` where the daemon already holds its `Database`, keeping the handle alive for the daemon's lifetime and calling `shutdown()` on exit. Worker count: 8.
+Start `ReadService::start(root, backend.store(), 8)` where the daemon already holds its
+`Infigraph`, keeping the `ReadService` alive for the daemon's lifetime and calling
+`shutdown()` on exit. The store handle comes from the daemon's existing backend — never
+from a fresh `GraphStore::open`.
 
-- [ ] **Step 5: Run to verify it passes**
+- [ ] **Step 7: Run to verify it passes**
 
 Run: `cargo test -p infigraph-core --test read_service -- --ignored a_running_daemon --test-threads=1`
 Expected: PASS.
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 8: Commit**
 
 ```bash
-git add crates/infigraph-core/src/daemon/mod.rs crates/infigraph-core/tests/read_service.rs
-git commit -m "feat(core): the daemon starts its read service"
+git add crates/infigraph-core/src/graph/kuzu_backend.rs \
+        crates/infigraph-core/src/daemon/mod.rs \
+        crates/infigraph-core/tests/read_service.rs
+git commit -m "feat(core): daemon shares one GraphStore with its read service"
 ```
 
 ---
@@ -1351,4 +1523,21 @@ The "Cross-cutting invariants" section states that the graph DB is single-writer
 3. **Group/multi-repo reads are not covered.** Spec Open Question 2, untouched here.
 4. **The escape hatch trusts the operator.** Spec Open Question 3; this plan does not require the daemon to be provably unstartable.
 
-**Type consistency.** `QueryExec::query_rows(&self, &str) -> Result<Vec<Vec<String>>>` is defined in Task 1 and used identically in Tasks 6 and 8. `ReadEndpoint::for_root`/`as_name` (Task 2) gain `bind`/`connect` in Task 3 and are used in Tasks 6 and 8. `ReadRequest`/`ReadFrame`/`collect_rows` (Task 5) are used in Tasks 6, 8 and 9. `ReadService::start(root, db, workers)`/`shutdown` (Task 6) is used in Tasks 7-10.
+**Corrections applied after review (2026-09-08).** Three defects were found in the
+first draft and fixed:
+
+1. `ReadService` took a bare `Arc<kuzu::Database>`. That discarded everything
+   `GraphStore` guarantees (truncation preflight, schema refusal, the bounded pool
+   from 13b4065, `write_phase` breadcrumbs) and left the handle's provenance
+   unspecified — inviting a second `Database` in the daemon, which cannot see the
+   writer's uncommitted WAL and would have reproduced #149 inside the process. Now
+   `Arc<GraphStore>`, threaded from the daemon's own backend in Task 10, with Task 7's
+   visibility test to catch any regression.
+2. `serve_one` hand-rolled connection + stringify instead of calling the existing
+   `KuzuBackend::raw_query`, which already returns the exact wire shape and already
+   no-ops bare `BEGIN`/`COMMIT`/`ROLLBACK`. The hand-rolled path would have silently
+   dropped that handling.
+3. The `QueryExec` / `GraphQuery::raw_query` dependency direction was unstated, and
+   inverting it recurses forever. Task 1 Step 6 now fixes the direction explicitly.
+
+**Type consistency.** `QueryExec::query_rows(&self, &str) -> Result<Vec<Vec<String>>>` is defined in Task 1 and used identically in Tasks 6 and 8. `ReadEndpoint::for_root`/`as_name` (Task 2) gain `bind`/`connect` in Task 3 and are used in Tasks 6 and 8. `ReadRequest`/`ReadFrame`/`collect_rows` (Task 5) are used in Tasks 6, 8 and 9. `ReadService::start(root: &Path, store: Arc<GraphStore>, workers: usize)`/`shutdown` (Task 6) is used identically in Tasks 7-10; `KuzuBackend::store() -> Arc<GraphStore>` (Task 10) is what supplies it.
