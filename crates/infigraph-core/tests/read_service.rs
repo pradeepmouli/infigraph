@@ -87,6 +87,97 @@ fn a_bare_commit_returns_an_empty_result_exactly_as_the_local_backend_does() {
     svc.shutdown();
 }
 
+/// Reads must be served in parallel *while* an index operation holds
+/// `index.lock`. If reads ever queue behind indexing, the read service has
+/// been wired into the write pipeline by mistake and the whole point is
+/// lost.
+#[test]
+fn reads_are_served_concurrently_while_an_index_operation_holds_the_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let graph = root.join(".infigraph").join("graph");
+    std::fs::create_dir_all(graph.parent().unwrap()).unwrap();
+    {
+        let store = GraphStore::open(&graph).unwrap();
+        let conn = store.connection().unwrap();
+        conn.query(
+            "CREATE (:File {id: 'a.rs', name: 'a.rs', path: 'a.rs', \
+             language: 'rust', symbol_count: 0})",
+        )
+        .unwrap();
+    }
+    let store = open_shared_store(&graph);
+    let svc = infigraph_core::daemon::read_service::ReadService::start(root, store, 8).unwrap();
+
+    // Hold index.lock for the duration, as a real index operation would.
+    let _index_lock = infigraph_core::lockfile::acquire(
+        &root.join(".infigraph").join("index.lock"),
+        "test-index-op",
+        std::time::Duration::from_secs(5),
+    )
+    .expect("acquire index.lock");
+
+    let start = std::time::Instant::now();
+    let handles: Vec<_> = (0..8)
+        .map(|_| {
+            let root = root.to_path_buf();
+            std::thread::spawn(move || client_query(&root, "MATCH (f:File) RETURN f.id"))
+        })
+        .collect();
+    for h in handles {
+        assert_eq!(h.join().unwrap().unwrap(), vec![vec!["a.rs".to_string()]]);
+    }
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(5),
+        "8 reads took {:?} with index.lock held -- they are queueing behind it",
+        start.elapsed()
+    );
+
+    svc.shutdown();
+}
+
+/// A write committed by the daemon must be visible to the very next read.
+///
+/// If the read service ever holds its own `Database` -- even in the same
+/// process -- it cannot see the writer's uncommitted WAL, and this fails.
+/// That is #149 reproduced inside the daemon, and no test without a
+/// concurrent writer would notice.
+#[test]
+fn a_write_is_visible_to_the_next_read_through_the_service() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let graph = root.join(".infigraph").join("graph");
+    std::fs::create_dir_all(graph.parent().unwrap()).unwrap();
+
+    let store = open_shared_store(&graph);
+    let svc =
+        infigraph_core::daemon::read_service::ReadService::start(root, store.clone(), 4).unwrap();
+
+    assert!(client_query(root, "MATCH (f:File) RETURN f.id")
+        .unwrap()
+        .is_empty());
+
+    // Write through the SAME store the service holds, without checkpointing.
+    {
+        let conn = store.connection().unwrap();
+        conn.query(
+            "CREATE (:File {id: 'fresh.rs', name: 'fresh.rs', path: 'fresh.rs', \
+             language: 'rust', symbol_count: 0})",
+        )
+        .unwrap();
+    }
+
+    let rows = client_query(root, "MATCH (f:File) RETURN f.id").unwrap();
+    assert_eq!(
+        rows,
+        vec![vec!["fresh.rs".to_string()]],
+        "the read service must observe the daemon's own uncheckpointed write; \
+         if this is empty, the service is holding a second Database handle"
+    );
+
+    svc.shutdown();
+}
+
 // ── helpers ──────────────────────────────────────────────────────────
 
 /// The one `GraphStore` the service serves from.
