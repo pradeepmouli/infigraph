@@ -4,6 +4,7 @@ pub mod lifecycle;
 pub mod queue;
 pub mod read_endpoint;
 pub mod read_guard;
+pub mod read_protocol;
 pub mod task;
 
 use std::path::{Path, PathBuf};
