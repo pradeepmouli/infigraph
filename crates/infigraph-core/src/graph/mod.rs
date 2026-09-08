@@ -9,6 +9,7 @@ mod neo4j_backend;
 pub mod parquet_loader;
 mod queries;
 pub mod query_exec;
+pub mod remote_exec;
 pub(crate) mod schema;
 mod session_store;
 pub mod store;

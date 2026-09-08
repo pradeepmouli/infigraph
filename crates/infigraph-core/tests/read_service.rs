@@ -178,6 +178,43 @@ fn a_write_is_visible_to_the_next_read_through_the_service() {
     svc.shutdown();
 }
 
+/// The client-side executor speaks the same protocol the service serves,
+/// and satisfies the same `QueryExec` trait `GraphQuery` runs on -- which is
+/// what lets all 1045 lines of Cypher serve both paths unchanged.
+#[test]
+fn remote_exec_satisfies_query_exec_against_a_live_service() {
+    use infigraph_core::graph::query_exec::QueryExec;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let graph = root.join(".infigraph").join("graph");
+    std::fs::create_dir_all(graph.parent().unwrap()).unwrap();
+    {
+        let store = GraphStore::open(&graph).unwrap();
+        let conn = store.connection().unwrap();
+        conn.query(
+            "CREATE (:File {id: 'a.rs', name: 'a.rs', path: 'a.rs', \
+             language: 'rust', symbol_count: 0})",
+        )
+        .unwrap();
+    }
+    let store = open_shared_store(&graph);
+    let svc = infigraph_core::daemon::read_service::ReadService::start(root, store, 2).unwrap();
+
+    // `RemoteExec` satisfies `QueryExec`, so it can be handed to
+    // `GraphQuery::new_with(exec)` by value exactly like `LocalExec`.
+    let exec = infigraph_core::graph::remote_exec::RemoteExec::new(root);
+    let rows = exec.query_rows("MATCH (f:File) RETURN f.id").unwrap();
+    assert_eq!(rows, vec![vec!["a.rs".to_string()]]);
+
+    // And the point of the trait: a real `GraphQuery` runs over it unchanged.
+    let q = infigraph_core::graph::GraphQuery::new_with(exec);
+    let via_graph_query = q.raw_query("MATCH (f:File) RETURN f.id").unwrap();
+    assert_eq!(via_graph_query, rows);
+
+    svc.shutdown();
+}
+
 // ── helpers ──────────────────────────────────────────────────────────
 
 /// The one `GraphStore` the service serves from.
