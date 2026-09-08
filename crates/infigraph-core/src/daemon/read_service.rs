@@ -22,6 +22,16 @@ use std::sync::{mpsc, Arc, Mutex};
 use super::read_endpoint::ReadEndpoint;
 use super::read_protocol::{read_request, write_frame, ReadFrame, Store};
 
+/// Resolves the store to serve a request from, at request time.
+///
+/// Deliberately not a captured `Arc<GraphStore>`: the daemon opens its
+/// `Infigraph` lazily and drops it again on `poison_watch_db` (after a full
+/// reindex swaps the graph file, say), so a service holding the store it saw
+/// at startup would go on serving a replaced `Database`. Resolving per
+/// request is what keeps the "exactly one `Database`" invariant true over
+/// the daemon's whole lifetime, not just at its first instant.
+pub type StoreSource = Arc<dyn Fn() -> Option<Arc<crate::graph::GraphStore>> + Send + Sync>;
+
 pub struct ReadService {
     stop: Arc<AtomicBool>,
     accept: Option<std::thread::JoinHandle<()>>,
@@ -29,15 +39,25 @@ pub struct ReadService {
 }
 
 impl ReadService {
-    /// Bind the endpoint for `root` and start serving reads from `store`.
+    /// Bind the endpoint for `root` and serve reads from one fixed store.
     ///
-    /// Binding happens before this returns, so a client that connects
-    /// immediately afterwards cannot race the listener into existence.
+    /// For callers that genuinely own the store for the service's whole
+    /// lifetime -- tests, mostly. The daemon uses [`start_with_source`].
+    ///
+    /// [`start_with_source`]: ReadService::start_with_source
     pub fn start(
         root: &Path,
         store: Arc<crate::graph::GraphStore>,
         workers: usize,
     ) -> Result<Self> {
+        Self::start_with_source(root, Arc::new(move || Some(store.clone())), workers)
+    }
+
+    /// Bind the endpoint for `root` and resolve the store per request.
+    ///
+    /// Binding happens before this returns, so a client that connects
+    /// immediately afterwards cannot race the listener into existence.
+    pub fn start_with_source(root: &Path, source: StoreSource, workers: usize) -> Result<Self> {
         let endpoint = ReadEndpoint::for_root(root);
         let listener = endpoint.bind()?;
         let stop = Arc::new(AtomicBool::new(false));
@@ -50,9 +70,9 @@ impl ReadService {
                     break;
                 }
                 let Ok(stream) = stream else { continue };
-                let store = store.clone();
+                let source = source.clone();
                 pool.execute(move || {
-                    if let Err(e) = serve_one(&store, stream) {
+                    if let Err(e) = serve_one(&source, stream) {
                         eprintln!("[read] connection failed: {e:#}");
                     }
                 });
@@ -70,21 +90,47 @@ impl ReadService {
         })
     }
 
+    /// Stop accepting and join the accept thread.
+    ///
+    /// Also runs on drop, so every early return from the daemon's
+    /// coordinator tears the service down without a bespoke exit path.
     pub fn shutdown(mut self) {
+        self.stop_and_join();
+    }
+
+    fn stop_and_join(&mut self) {
+        // Idempotent: once the handle is taken there is nothing to join, so
+        // an explicit `shutdown()` followed by the drop is a no-op.
+        let Some(h) = self.accept.take() else { return };
         self.stop.store(true, Ordering::Relaxed);
         // Unblock `accept` by connecting to ourselves once.
         let _ = self.endpoint.connect();
-        if let Some(h) = self.accept.take() {
-            let _ = h.join();
-        }
+        let _ = h.join();
     }
 }
 
-fn serve_one<S: std::io::Read + std::io::Write>(
-    store: &crate::graph::GraphStore,
-    mut stream: S,
-) -> Result<()> {
+impl Drop for ReadService {
+    fn drop(&mut self) {
+        self.stop_and_join();
+    }
+}
+
+fn serve_one<S: std::io::Read + std::io::Write>(source: &StoreSource, mut stream: S) -> Result<()> {
     let req = read_request(&mut stream)?;
+
+    // Resolved now, not at startup, and held for this one request -- so a
+    // concurrent `poison_watch_db` cannot close the `Database` underneath a
+    // read already in flight.
+    let Some(store) = source() else {
+        write_frame(
+            &mut stream,
+            &ReadFrame::Error(
+                "the daemon has no graph open yet; retry once indexing has started".to_string(),
+            ),
+        )?;
+        return Ok(());
+    };
+    let store = store.as_ref();
 
     if req.store != Store::Graph {
         write_frame(

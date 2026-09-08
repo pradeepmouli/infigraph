@@ -1018,6 +1018,20 @@ impl Infigraph {
         }
     }
 
+    /// The embedded graph store behind this instance, when there is one.
+    ///
+    /// `None` for `Uninit`, and for the Neo4j and DaemonKuzu backends, which
+    /// own no local `Database`. The daemon uses this to hand its read
+    /// service the SAME store its write path uses -- there must be exactly
+    /// one `Database` per graph file in a process, because a second handle
+    /// cannot see the first's uncommitted WAL (#149).
+    pub fn graph_store(&self) -> Option<std::sync::Arc<graph::GraphStore>> {
+        match &self.backend_kind {
+            BackendKind::Kuzu(kb) => Some(kb.store()),
+            _ => None,
+        }
+    }
+
     /// Access the language registry.
     pub fn registry(&self) -> &LanguageRegistry {
         &self.registry

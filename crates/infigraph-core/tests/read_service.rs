@@ -241,6 +241,69 @@ fn a_service_that_dies_mid_response_produces_an_error_not_an_empty_result() {
     );
 }
 
+/// A real write coordinator must answer reads on its endpoint. Without this
+/// the service exists but nothing starts it.
+///
+/// Asserts only that the read *succeeds*, not that it returns rows. Whether
+/// the daemon has indexed anything yet is a separate concern, and on macOS
+/// a `TempDir` root is symlinked, where watch-driven indexing currently
+/// delivers no events at all (#151). The property this task introduces is
+/// that the daemon binds the endpoint and serves from its own store, and
+/// only the daemon can answer here -- nothing else binds this name.
+#[test]
+#[ignore = "drives a real write coordinator; run explicitly"]
+fn a_running_daemon_answers_reads_on_its_endpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    std::fs::write(root.join("a.rs"), "pub fn hello() {}\n").unwrap();
+
+    let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+    let token = tokio_util::sync::CancellationToken::new();
+    let token_for_thread = token.clone();
+    let root_for_thread = root.clone();
+    let handle = std::thread::spawn(move || {
+        infigraph_core::daemon::run_write_coordinator(
+            &root_for_thread,
+            || Ok(infigraph_languages::bundled_registry().unwrap()),
+            50,
+            stop_rx,
+            |_| {},
+            0,
+            None::<fn(&infigraph_core::IndexResult)>,
+            true, // serve_requests
+            None,
+            &token_for_thread,
+            None,
+        )
+    });
+
+    // Generous: the coordinator builds the whole bundled language registry
+    // before it opens anything, which its own comment notes costs seconds in
+    // a debug build.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+    let mut served = false;
+    let mut last_err = None;
+    while std::time::Instant::now() < deadline {
+        match client_query(&root, "MATCH (f:File) RETURN f.id") {
+            Ok(_) => {
+                served = true;
+                break;
+            }
+            Err(e) => last_err = Some(e),
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+
+    token.cancel();
+    let _ = stop_tx.send(());
+    let _ = handle.join();
+
+    assert!(
+        served,
+        "a running daemon must serve reads on its endpoint; last error: {last_err:?}"
+    );
+}
+
 // ── helpers ──────────────────────────────────────────────────────────
 
 /// The one `GraphStore` the service serves from.

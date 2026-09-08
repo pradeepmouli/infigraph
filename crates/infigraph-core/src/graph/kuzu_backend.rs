@@ -54,30 +54,46 @@ pub(crate) fn raw_query_on(store: &GraphStore, query: &str) -> Result<Vec<Vec<St
 /// the write lock internally. Single-writer — concurrent `upsert_files_bulk`
 /// calls will serialize on the lock.
 pub struct KuzuBackend {
-    store: GraphStore,
+    /// Shared, so the daemon's read service can serve from the SAME
+    /// `Database` this backend writes through. There must be exactly one
+    /// `Database` per graph file in a process: a second handle cannot see
+    /// the first's uncommitted WAL and silently serves stale or empty
+    /// results (#149, and `tests/read_service.rs` pins it).
+    store: std::sync::Arc<GraphStore>,
 }
 
 impl KuzuBackend {
     pub fn open(path: &Path) -> Result<Self> {
         let store = GraphStore::open(path)?;
-        Ok(Self { store })
+        Ok(Self::from_store(store))
     }
 
     pub fn open_read_only(path: &Path) -> Result<Self> {
         let store = GraphStore::open_read_only(path)?;
-        Ok(Self { store })
+        Ok(Self::from_store(store))
     }
 
     pub fn open_read_only_or_degrade(
         path: &Path,
     ) -> Result<(Self, Option<super::store::DegradeReason>)> {
         let (store, reason) = GraphStore::open_read_only_or_degrade(path)?;
-        Ok((Self { store }, reason))
+        Ok((Self::from_store(store), reason))
     }
 
     /// Wrap an already-opened GraphStore (avoids double-open).
+    ///
+    /// Still takes the store by value: all 21 call sites hand over an owned
+    /// one, and sharing is this type's business, not theirs.
     pub fn from_store(store: GraphStore) -> Self {
-        Self { store }
+        Self {
+            store: std::sync::Arc::new(store),
+        }
+    }
+
+    /// A handle to this backend's store, so the daemon's read service can
+    /// serve from the same `Database` the write path uses.
+    pub fn store(&self) -> std::sync::Arc<GraphStore> {
+        self.store.clone()
     }
 
     /// Access underlying GraphStore (escape hatch for callers that
