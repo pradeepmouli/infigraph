@@ -215,6 +215,32 @@ fn remote_exec_satisfies_query_exec_against_a_live_service() {
     svc.shutdown();
 }
 
+/// Killing the service mid-response must surface an error, never a
+/// successful empty result. This is the one failure mode with a precedent
+/// in this codebase: `Infigraph::init` once served a 0-symbol graph as
+/// healthy after a "successful" rebuild.
+///
+/// Note this is the frame-boundary case, not the mid-frame one: the bytes
+/// written here are a complete, well-formed `Rows` frame and nothing more,
+/// so the stream is byte-identical to a valid response that simply has not
+/// finished. Only the absent `End` distinguishes it from an empty result.
+#[test]
+fn a_service_that_dies_mid_response_produces_an_error_not_an_empty_result() {
+    use infigraph_core::daemon::read_protocol::{collect_rows, write_frame, ReadFrame};
+
+    // Simulate the wire directly: rows, then the connection dies.
+    let mut buf = Vec::new();
+    write_frame(&mut buf, &ReadFrame::Rows(vec![vec!["a.rs".to_string()]])).unwrap();
+    // No End frame -- the peer went away.
+
+    let err =
+        collect_rows(&mut buf.as_slice()).expect_err("a stream with no End frame must be an error");
+    assert!(
+        err.to_string().contains("not an empty result set"),
+        "the error must say plainly that this is not an empty result: {err}"
+    );
+}
+
 // ── helpers ──────────────────────────────────────────────────────────
 
 /// The one `GraphStore` the service serves from.
