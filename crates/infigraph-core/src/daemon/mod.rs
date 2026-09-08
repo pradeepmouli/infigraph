@@ -489,6 +489,11 @@ pub fn run_write_coordinator<MR, F>(
     on_full_reindex: Option<Arc<FullReindexCallback>>,
     daemon_token: &CancellationToken,
     docs_control: Option<Arc<DocsControl>>,
+    // Serves `Store::Docs` reads. `None` leaves the daemon graph-only, and a
+    // document read then gets an explicit refusal rather than silently
+    // opening `docs.kuzu` in the client. Supplied by the caller because
+    // `infigraph-docs` depends on this crate, not the reverse.
+    docs_reads: Option<read_service::RowSource>,
 ) -> Result<()>
 where
     MR: Fn() -> Result<crate::lang::LanguageRegistry> + Send + 'static,
@@ -539,7 +544,12 @@ where
                 .as_ref()
                 .and_then(|prism| prism.graph_store())
         });
-        match read_service::ReadService::start_with_source(root, source, READ_SERVICE_WORKERS) {
+        match read_service::ReadService::start_with_sources(
+            root,
+            source,
+            docs_reads,
+            READ_SERVICE_WORKERS,
+        ) {
             Ok(svc) => Some(svc),
             Err(e) => {
                 eprintln!(

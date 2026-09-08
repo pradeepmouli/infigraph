@@ -32,6 +32,16 @@ use super::read_protocol::{read_request, write_frame, ReadFrame, Store};
 /// the daemon's whole lifetime, not just at its first instant.
 pub type StoreSource = Arc<dyn Fn() -> Option<Arc<crate::graph::GraphStore>> + Send + Sync>;
 
+/// Executes one read query against a store this crate cannot name.
+///
+/// `infigraph-docs` depends on `infigraph-core`, not the reverse, so the
+/// daemon cannot hold a `DocStore` directly. It holds this instead: a
+/// closure supplied by whoever owns that store, which runs the query and
+/// returns the same stringly rows the graph path does. The closure is
+/// responsible for its own read-only guard -- it has the connection, and
+/// `read_guard::ensure_read_only` is public.
+pub type RowSource = Arc<dyn Fn(&str) -> Result<Vec<Vec<String>>> + Send + Sync>;
+
 pub struct ReadService {
     stop: Arc<AtomicBool>,
     accept: Option<std::thread::JoinHandle<()>>,
@@ -58,6 +68,23 @@ impl ReadService {
     /// Binding happens before this returns, so a client that connects
     /// immediately afterwards cannot race the listener into existence.
     pub fn start_with_source(root: &Path, source: StoreSource, workers: usize) -> Result<Self> {
+        Self::start_with_sources(root, source, None, workers)
+    }
+
+    /// As [`start_with_source`], plus a document-store source.
+    ///
+    /// `search` with `scope='all'` touches both stores in one call, so
+    /// routing only the graph would leave that read still opening
+    /// `docs.kuzu` directly -- which has its own lock file and its own
+    /// wipe-on-any-open-failure history (#143).
+    ///
+    /// [`start_with_source`]: ReadService::start_with_source
+    pub fn start_with_sources(
+        root: &Path,
+        source: StoreSource,
+        docs: Option<RowSource>,
+        workers: usize,
+    ) -> Result<Self> {
         let endpoint = ReadEndpoint::for_root(root);
         let listener = endpoint.bind()?;
         let stop = Arc::new(AtomicBool::new(false));
@@ -71,8 +98,9 @@ impl ReadService {
                 }
                 let Ok(stream) = stream else { continue };
                 let source = source.clone();
+                let docs = docs.clone();
                 pool.execute(move || {
-                    if let Err(e) = serve_one(&source, stream) {
+                    if let Err(e) = serve_one(&source, docs.as_ref(), stream) {
                         eprintln!("[read] connection failed: {e:#}");
                     }
                 });
@@ -115,8 +143,38 @@ impl Drop for ReadService {
     }
 }
 
-fn serve_one<S: std::io::Read + std::io::Write>(source: &StoreSource, mut stream: S) -> Result<()> {
+fn serve_one<S: std::io::Read + std::io::Write>(
+    source: &StoreSource,
+    docs: Option<&RowSource>,
+    mut stream: S,
+) -> Result<()> {
     let req = read_request(&mut stream)?;
+
+    // The document store is a separate `Database` with its own lock file and
+    // its own wipe-on-open-failure history (#143), reached through a closure
+    // because this crate cannot name `DocStore`.
+    if req.store == Store::Docs {
+        let Some(docs) = docs else {
+            write_frame(
+                &mut stream,
+                &ReadFrame::Error(
+                    "this daemon has no document store registered; it serves the code graph only"
+                        .to_string(),
+                ),
+            )?;
+            return Ok(());
+        };
+        match docs(&req.query) {
+            Ok(rows) => {
+                for chunk in rows.chunks(req.chunk_size.max(1)) {
+                    write_frame(&mut stream, &ReadFrame::Rows(chunk.to_vec()))?;
+                }
+                write_frame(&mut stream, &ReadFrame::End)?;
+            }
+            Err(e) => write_frame(&mut stream, &ReadFrame::Error(e.to_string()))?,
+        }
+        return Ok(());
+    }
 
     // Resolved now, not at startup, and held for this one request -- so a
     // concurrent `poison_watch_db` cannot close the `Database` underneath a
@@ -131,17 +189,6 @@ fn serve_one<S: std::io::Read + std::io::Write>(source: &StoreSource, mut stream
         return Ok(());
     };
     let store = store.as_ref();
-
-    if req.store != Store::Graph {
-        write_frame(
-            &mut stream,
-            &ReadFrame::Error(
-                "this read service serves the code graph only; no document store is registered"
-                    .to_string(),
-            ),
-        )?;
-        return Ok(());
-    }
 
     // Same call the write path uses -- one Database, one buffer pool, one
     // WAL.

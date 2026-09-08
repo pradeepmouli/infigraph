@@ -1,6 +1,7 @@
 pub mod backend;
 pub mod chunk;
 pub mod combined;
+pub mod daemon_source;
 pub mod embed;
 pub mod extract;
 #[cfg(feature = "remote")]

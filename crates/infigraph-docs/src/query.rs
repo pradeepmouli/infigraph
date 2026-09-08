@@ -38,6 +38,12 @@ impl<E: QueryExec> DocQuery<E> {
         Self { exec }
     }
 
+    /// Execute arbitrary read Cypher and return stringly rows. The
+    /// primitive every method here is built on.
+    pub fn raw_query(&self, cypher: &str) -> Result<Vec<Vec<String>>> {
+        self.exec.query_rows(cypher)
+    }
+
     /// `count(...)` for a single-row, single-column count query. Replaces
     /// `store::count_query`, which needed a connection.
     fn count(&self, cypher: &str) -> usize {

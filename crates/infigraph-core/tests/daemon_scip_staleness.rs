@@ -95,6 +95,7 @@ fn coordinator_triggers_scip_enrichment_once_when_staleness_exceeds_threshold() 
             Some(on_full_reindex),
             &token_for_thread,
             None,
+            None,
         )
     });
 

@@ -176,6 +176,7 @@ where
         None,
         &token,
         None,
+        None,
     )
 }
 /// Like `watch_project` but automatically re-resolves cross-file call edges

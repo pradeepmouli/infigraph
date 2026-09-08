@@ -37,6 +37,7 @@ fn coordinator_self_exits_when_build_hash_check_detects_a_mismatch() {
             None,
             &token_for_thread,
             None,
+            None,
         )
     });
 

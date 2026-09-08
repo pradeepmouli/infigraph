@@ -274,6 +274,7 @@ fn a_running_daemon_answers_reads_on_its_endpoint() {
             None,
             &token_for_thread,
             None,
+            None,
         )
     });
 
