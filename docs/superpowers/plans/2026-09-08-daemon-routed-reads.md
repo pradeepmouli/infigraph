@@ -31,13 +31,38 @@ Pure refactor. No behaviour change; the deliverable is that every existing test 
 - Modify: `crates/infigraph-core/src/graph/queries.rs:1-16` (imports and the `GraphQuery` struct/constructor)
 - Modify: `crates/infigraph-core/src/graph/mod.rs` (add `pub mod query_exec;`)
 
-**Interfaces:**
-- Produces: `QueryExec` trait with `fn query_rows(&self, cypher: &str) -> anyhow::Result<Vec<Vec<String>>>`; `LocalExec<'a,'db>` implementing it over `&'a kuzu::Connection<'db>`; `GraphQuery::new_with(exec: &'a dyn QueryExec)`.
+**Interfaces (AS BUILT — commit `e162b0b`; this task is COMPLETE):**
+- Produces:
+  - `QueryExec` trait: `fn query_rows(&self, cypher: &str) -> anyhow::Result<Vec<Vec<String>>>`
+  - `LocalExec<'a,'db>::new(&'a kuzu::Connection<'db>)`, implementing it
+  - blanket `impl<T: QueryExec + ?Sized> QueryExec for &T`, so a borrowed executor
+    can be passed where an owned one is expected
+  - `GraphQuery<E: QueryExec>` — **generic over an OWNED executor**, with
+    `GraphQuery::new(&conn)` retained for the local case and
+    `GraphQuery::new_with(exec)` taking `E` **by value**
+  - free function `queries::derive_tested_by_edges(conn: &Connection) -> Result<usize>`
 - Consumes: nothing.
+
+**Two deviations from this plan's original text, already applied.** Later tasks
+must use the as-built signatures above.
+
+1. The plan specified a borrowed `&'a dyn QueryExec`, which forces
+   `let exec = LocalExec::new(&conn);` at every construction site. The true site
+   count is **94**, not the ~29 assumed here — 65 in `tests/graph_queries.rs`
+   alone. With an owned generic and `new` retained, every existing site compiled
+   unchanged: of 8 files staged, 3 came out byte-identical.
+2. `GraphQuery` was not purely reads. `derive_tested_by_edges` issued `DELETE`
+   and `CREATE`, and routing it through a read-only executor would make the
+   remote path refuse a legitimate local write. It was the only writer among 21
+   methods and is now a free function taking a connection.
+   `GraphStore::derive_tested_by_edges` takes the write lock before calling it,
+   and the indexer reaches it post-indexing via
+   `WriteRequest::DeriveTestedBy` — squarely write-path, so the read service
+   never sees it.
 
 Row shape is `Vec<Vec<String>>` because that is already how `GraphQuery` consumes results — e.g. `queries.rs:32-38` does `row[0].to_string()` and `row[3].to_string().parse().unwrap_or(0)`. `GraphBackend::raw_query` already returns `Result<Vec<Vec<String>>>`, so this matches the established shape rather than inventing one.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Create `crates/infigraph-core/src/graph/query_exec.rs` with only the test module at first:
 
@@ -67,12 +92,12 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Run it to verify it fails**
+- [x] **Step 2: Run it to verify it fails**
 
 Run: `cargo test -p infigraph-core --lib graph::query_exec -- --test-threads=1`
 Expected: FAIL to compile — `LocalExec` not defined.
 
-- [ ] **Step 3: Write the trait and the local implementation**
+- [x] **Step 3: Write the trait and the local implementation**
 
 Above the test module in the same file:
 
@@ -127,32 +152,49 @@ Add to `crates/infigraph-core/src/graph/mod.rs`:
 pub mod query_exec;
 ```
 
-- [ ] **Step 4: Run it to verify it passes**
+- [x] **Step 4: Run it to verify it passes**
 
 Run: `cargo test -p infigraph-core --lib graph::query_exec -- --test-threads=1`
 Expected: PASS, `1 passed`.
 
-- [ ] **Step 5: Convert `GraphQuery` to hold a `&dyn QueryExec`**
+- [x] **Step 5: Make `GraphQuery` generic over an owned executor**
 
 In `queries.rs`, replace the struct and constructor:
 
 ```rust
-pub struct GraphQuery<'a> {
-    exec: &'a dyn crate::graph::query_exec::QueryExec,
+pub struct GraphQuery<E: crate::graph::query_exec::QueryExec> {
+    exec: E,
 }
 
-impl<'a> GraphQuery<'a> {
-    /// Build over any executor -- a local connection or the daemon's read
-    /// service.
-    pub fn new_with(exec: &'a dyn crate::graph::query_exec::QueryExec) -> Self {
-        Self { exec }
+impl<'a, 'db> GraphQuery<crate::graph::query_exec::LocalExec<'a, 'db>> {
+    /// Build over a local Kuzu connection. Unchanged signature: every
+    /// existing call site keeps working, which is why the executor is owned
+    /// and generic rather than a borrowed trait object.
+    pub fn new(conn: &'a Connection<'db>) -> Self {
+        Self {
+            exec: crate::graph::query_exec::LocalExec::new(conn),
+        }
     }
 }
+
+impl<E: crate::graph::query_exec::QueryExec> GraphQuery<E> {
+    /// Build over any executor -- notably the daemon's read service.
+    pub fn new_with(exec: E) -> Self {
+        Self { exec }
+    }
 ```
 
-Then mechanically replace every `self.conn.query(&query)` + row-collection in this file with `self.exec.query_rows(&query)?`. There are ~40 such sites. Do not change any Cypher string, any struct field, or any parsing logic — only how rows are obtained.
+Then replace every connection use in this file with `self.exec.query_rows(...)`.
+There are **16**, and they matter: rustfmt splits them across lines, so a
+single-line search for `self.conn` reports 4. Search for `.conn` alone.
+`query_rows` also returns a `Result`, so existing `.map_err(...)?` tails stay
+valid; the only downstream changes are that rows are now `Vec<String>` (so
+`.next()` on a result becomes `.into_iter().next()`, and `row[0].to_string()`
+may become `row[0].clone()`).
 
-- [ ] **Step 6: Point `GraphQuery::raw_query` at the executor**
+Do not change any Cypher string or any parsing logic — only how rows are obtained.
+
+- [x] **Step 6: Point `GraphQuery::raw_query` at the executor**
 
 `GraphQuery` already has a `raw_query` method, and `KuzuBackend::raw_query`
 delegates to it. Make it the one place that reaches the executor:
@@ -173,7 +215,7 @@ NOT delegate to `GraphQuery::raw_query`. `GraphQuery` is generic over
 `QueryExec`, so an executor calling back into it would recurse forever.
 `QueryExec` is the primitive; `GraphQuery::raw_query` is the thin wrapper.
 
-- [ ] **Step 7: Update `GraphQuery::new` call sites**
+- [x] **Step 7: Update `GraphQuery::new` call sites**
 
 `KuzuBackend` (`crates/infigraph-core/src/graph/kuzu_backend.rs`) creates a connection per read method (`let conn = self.store.connection()?;` at lines 83, 89, 95, 101, 109, 115, 121, 127, 133, 139, 147, 153, 159, and onwards). At each, wrap it:
 
@@ -183,14 +225,14 @@ let exec = crate::graph::query_exec::LocalExec::new(&conn);
 let q = GraphQuery::new_with(&exec);
 ```
 
-- [ ] **Step 8: Run the whole core suite**
+- [x] **Step 8: Run the whole core suite**
 
 Run: `cargo test -p infigraph-core --lib -- --test-threads=1`
 Expected: PASS, same count as before the task (565 at the time of writing) plus the one new test.
 
 This is the task's real gate: a pure refactor that changes no behaviour must not change any test outcome.
 
-- [ ] **Step 9: Commit**
+- [x] **Step 9: Commit**
 
 ```bash
 git add crates/infigraph-core/src/graph/query_exec.rs \
@@ -1079,6 +1121,8 @@ fn remote_exec_satisfies_query_exec_against_a_live_service() {
     let db = std::sync::Arc::new(open_shared_database(&graph));
     let svc = infigraph_core::daemon::read_service::ReadService::start(root, db, 2).unwrap();
 
+    // `RemoteExec` satisfies `QueryExec`, so it can be handed to
+    // `GraphQuery::new_with(exec)` by value exactly like `LocalExec`.
     let exec = infigraph_core::graph::remote_exec::RemoteExec::new(root);
     let rows = exec.query_rows("MATCH (f:File) RETURN f.id").unwrap();
     assert_eq!(rows, vec![vec!["a.rs".to_string()]]);
@@ -1540,4 +1584,4 @@ first draft and fixed:
 3. The `QueryExec` / `GraphQuery::raw_query` dependency direction was unstated, and
    inverting it recurses forever. Task 1 Step 6 now fixes the direction explicitly.
 
-**Type consistency.** `QueryExec::query_rows(&self, &str) -> Result<Vec<Vec<String>>>` is defined in Task 1 and used identically in Tasks 6 and 8. `ReadEndpoint::for_root`/`as_name` (Task 2) gain `bind`/`connect` in Task 3 and are used in Tasks 6 and 8. `ReadRequest`/`ReadFrame`/`collect_rows` (Task 5) are used in Tasks 6, 8 and 9. `ReadService::start(root: &Path, store: Arc<GraphStore>, workers: usize)`/`shutdown` (Task 6) is used identically in Tasks 7-10; `KuzuBackend::store() -> Arc<GraphStore>` (Task 10) is what supplies it.
+**Type consistency.** `QueryExec::query_rows(&self, &str) -> Result<Vec<Vec<String>>>` is defined in Task 1 (as built, `e162b0b`) and used identically in Tasks 6 and 8; `GraphQuery` is generic over an owned `E: QueryExec`, so executors are passed by value (a blanket `impl QueryExec for &T` covers the borrowed case). `ReadEndpoint::for_root`/`as_name` (Task 2) gain `bind`/`connect` in Task 3 and are used in Tasks 6 and 8. `ReadRequest`/`ReadFrame`/`collect_rows` (Task 5) are used in Tasks 6, 8 and 9. `ReadService::start(root: &Path, store: Arc<GraphStore>, workers: usize)`/`shutdown` (Task 6) is used identically in Tasks 7-10; `KuzuBackend::store() -> Arc<GraphStore>` (Task 10) is what supplies it.
