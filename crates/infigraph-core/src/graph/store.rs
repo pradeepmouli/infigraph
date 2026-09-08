@@ -1068,36 +1068,13 @@ impl GraphStore {
     /// Used by incremental indexing to skip unchanged files.
     pub fn get_file_hashes(&self) -> Result<HashMap<String, String>> {
         let conn = self.connection()?;
-        let result = conn
-            .query("MATCH (m:Module) RETURN m.file, m.content_hash")
-            .map_err(|e| anyhow::anyhow!("get_file_hashes failed: {e}"))?;
-        let mut map = HashMap::new();
-        for row in result {
-            if row.len() >= 2 {
-                map.insert(row[0].to_string(), row[1].to_string());
-            }
-        }
-        Ok(map)
+        super::GraphQuery::new(&conn).get_file_hashes()
     }
 
     /// Return all symbols as (name, id, file, kind) tuples -- used by resolve_calls.
     pub fn get_all_symbols(&self) -> Result<Vec<(String, String, String, String)>> {
         let conn = self.connection()?;
-        let result = conn
-            .query("MATCH (s:Symbol) RETURN s.name, s.id, s.file, s.kind")
-            .map_err(|e| anyhow::anyhow!("get_all_symbols failed: {e}"))?;
-        let mut symbols = Vec::new();
-        for row in result {
-            if row.len() >= 4 {
-                symbols.push((
-                    row[0].to_string(),
-                    row[1].to_string(),
-                    row[2].to_string(),
-                    row[3].to_string(),
-                ));
-            }
-        }
-        Ok(symbols)
+        super::GraphQuery::new(&conn).get_all_symbols()
     }
 
     /// Get total counts for stats.
@@ -1112,24 +1089,7 @@ impl GraphStore {
 
     pub fn stats(&self) -> Result<GraphStats> {
         let conn = self.connection()?;
-
-        let symbol_count = count_query(&conn, "MATCH (s:Symbol) RETURN count(s)")?;
-        let module_count = count_query(&conn, "MATCH (m:Module) RETURN count(m)")?;
-        let file_count = count_query(&conn, "MATCH (f:File) RETURN count(f)")?;
-        let folder_count = count_query(&conn, "MATCH (d:Folder) RETURN count(d)")?;
-        let calls_count = count_query(&conn, "MATCH ()-[r:CALLS]->() RETURN count(r)")?;
-        let inherits_count = count_query(&conn, "MATCH ()-[r:INHERITS]->() RETURN count(r)")?;
-        let contains_count = count_query(&conn, "MATCH ()-[r:CONTAINS]->() RETURN count(r)")?;
-
-        Ok(GraphStats {
-            symbols: symbol_count,
-            modules: module_count,
-            files: file_count,
-            folders: folder_count,
-            calls: calls_count,
-            inherits: inherits_count,
-            contains: contains_count,
-        })
+        super::GraphQuery::new(&conn).stats()
     }
 }
 

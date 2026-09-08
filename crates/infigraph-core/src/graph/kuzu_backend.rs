@@ -14,10 +14,25 @@ use super::backend::{
 use super::queries::GraphQuery;
 use super::store::GraphStore;
 use super::{
-    ApiSymbol, ArchitectureStats, BranchInfo, ComplexityRow, DeadCodeRow, FileDeps, FileHotspot,
-    GraphStats, HubFunction, ImpactRow, KindCount, LanguageCount, ReferenceRow, SymbolDetail,
-    SymbolMeta, SymbolRow, SymbolWithDocstring, TestContext, TestCoverage, TypeHierarchy,
+    ApiSymbol, ArchitectureStats, BranchInfo, ComplexityRow, DeadCodeRow, FileDeps, GraphStats,
+    ImpactRow, ReferenceRow, SymbolDetail, SymbolMeta, SymbolRow, SymbolWithDocstring, TestContext,
+    TestCoverage, TypeHierarchy,
 };
+
+/// Whether `query` is a bare transaction-control statement.
+///
+/// These are no-ops on every path that opens a fresh connection per call:
+/// the transaction dies with the connection that opened it, so a later
+/// COMMIT would fail with "No active transaction". Extracted so the local
+/// backend and `DaemonKuzuBackend`'s daemon-routed reads answer identically
+/// rather than drifting.
+pub(crate) fn is_transaction_control(query: &str) -> bool {
+    let trimmed = query.trim_end_matches(';').trim();
+    trimmed.eq_ignore_ascii_case("BEGIN TRANSACTION")
+        || trimmed.eq_ignore_ascii_case("BEGIN")
+        || trimmed.eq_ignore_ascii_case("COMMIT")
+        || trimmed.eq_ignore_ascii_case("ROLLBACK")
+}
 
 /// The body of `KuzuBackend::raw_query`, reachable with only a store.
 ///
@@ -35,12 +50,7 @@ use super::{
 /// already does, rather than let every multi-statement "transactional" write
 /// silently break.
 pub(crate) fn raw_query_on(store: &GraphStore, query: &str) -> Result<Vec<Vec<String>>> {
-    let trimmed = query.trim_end_matches(';').trim();
-    if trimmed.eq_ignore_ascii_case("BEGIN TRANSACTION")
-        || trimmed.eq_ignore_ascii_case("BEGIN")
-        || trimmed.eq_ignore_ascii_case("COMMIT")
-        || trimmed.eq_ignore_ascii_case("ROLLBACK")
-    {
+    if is_transaction_control(query) {
         return Ok(Vec::new());
     }
     let conn = store.connection()?;
@@ -229,177 +239,27 @@ impl GraphBackend for KuzuBackend {
 
     fn symbol_metadata(&self, id: &str) -> Result<Option<SymbolMeta>> {
         let conn = self.store.connection()?;
-        let q = GraphQuery::new(&conn);
-        let eid = crate::escape_str(id);
-        let meta_rows = q.raw_query(&format!(
-            "MATCH (s:Symbol) WHERE s.id = '{}' RETURN s.docstring, s.complexity",
-            eid
-        ))?;
-        if meta_rows.is_empty() {
-            return Ok(None);
-        }
-        let row = &meta_rows[0];
-        let docstring = row.first().cloned().unwrap_or_default();
-        let complexity: u32 = row.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
-
-        let parent_rows = q.raw_query(&format!(
-            "MATCH (parent)-[:CONTAINS]->(s:Symbol) WHERE s.id = '{}' RETURN parent.id, parent.name",
-            eid
-        ))?;
-        let (parent_id, parent_name) = if let Some(pr) = parent_rows.first() {
-            (pr.first().cloned(), pr.get(1).cloned())
-        } else {
-            (None, None)
-        };
-
-        Ok(Some(SymbolMeta {
-            docstring,
-            complexity,
-            parent_id,
-            parent_name,
-        }))
+        GraphQuery::new(&conn).symbol_metadata(id)
     }
 
     fn get_complexity_ranking(&self, file_filter: Option<&str>) -> Result<Vec<ComplexityRow>> {
         let conn = self.store.connection()?;
-        let q = GraphQuery::new(&conn);
-        let cypher = if let Some(f) = file_filter {
-            format!(
-                "MATCH (s:Symbol) WHERE (s.kind = 'Function' OR s.kind = 'Method' OR s.kind = 'Test') \
-                 AND s.file CONTAINS '{}' RETURN s.name, s.file, s.start_line, s.complexity \
-                 ORDER BY s.complexity DESC",
-                crate::escape_str(f)
-            )
-        } else {
-            "MATCH (s:Symbol) WHERE (s.kind = 'Function' OR s.kind = 'Method' OR s.kind = 'Test') \
-             RETURN s.name, s.file, s.start_line, s.complexity ORDER BY s.complexity DESC"
-                .to_string()
-        };
-        let rows = q.raw_query(&cypher)?;
-        Ok(rows
-            .into_iter()
-            .filter_map(|r| {
-                Some(ComplexityRow {
-                    name: r.first()?.clone(),
-                    file: r.get(1)?.clone(),
-                    start_line: r.get(2)?.parse().unwrap_or(0),
-                    complexity: r.get(3)?.parse().unwrap_or(0),
-                })
-            })
-            .collect())
+        GraphQuery::new(&conn).get_complexity_ranking(file_filter)
     }
 
     fn list_indexed_files(&self) -> Result<Vec<String>> {
         let conn = self.store.connection()?;
-        let q = GraphQuery::new(&conn);
-        let rows = q.raw_query("MATCH (s:Symbol) RETURN DISTINCT s.file ORDER BY s.file")?;
-        Ok(rows
-            .into_iter()
-            .filter_map(|r| r.into_iter().next())
-            .collect())
+        GraphQuery::new(&conn).list_indexed_files()
     }
 
     fn find_uncalled_symbols(&self) -> Result<Vec<DeadCodeRow>> {
         let conn = self.store.connection()?;
-        let q = GraphQuery::new(&conn);
-        let rows = q.raw_query(
-            "MATCH (s:Symbol) WHERE s.kind IN ['Function', 'Method'] \
-             AND NOT EXISTS { MATCH ()-[:CALLS]->(s) } \
-             RETURN s.id, s.name, s.kind, s.file ORDER BY s.file, s.name",
-        )?;
-        Ok(rows
-            .into_iter()
-            .filter_map(|r| {
-                Some(DeadCodeRow {
-                    id: r.first()?.clone(),
-                    name: r.get(1)?.clone(),
-                    kind: r.get(2)?.clone(),
-                    file: r.get(3)?.clone(),
-                })
-            })
-            .collect())
+        GraphQuery::new(&conn).find_uncalled_symbols()
     }
 
     fn get_architecture_stats(&self) -> Result<ArchitectureStats> {
         let conn = self.store.connection()?;
-        let q = GraphQuery::new(&conn);
-
-        let lang_rows =
-            q.raw_query("MATCH (m:Module) RETURN m.language, count(m) ORDER BY count(m) DESC")?;
-        let languages: Vec<LanguageCount> = lang_rows
-            .into_iter()
-            .filter_map(|r| {
-                Some(LanguageCount {
-                    language: r.first()?.clone(),
-                    count: r.get(1)?.parse().unwrap_or(0),
-                })
-            })
-            .collect();
-
-        let kind_rows =
-            q.raw_query("MATCH (s:Symbol) RETURN s.kind, count(s) ORDER BY count(s) DESC")?;
-        let kind_counts: Vec<KindCount> = kind_rows
-            .into_iter()
-            .filter_map(|r| {
-                Some(KindCount {
-                    kind: r.first()?.clone(),
-                    count: r.get(1)?.parse().unwrap_or(0),
-                })
-            })
-            .collect();
-
-        let hotspot_rows = q.raw_query(
-            "MATCH (s:Symbol) RETURN s.file, count(s) AS cnt ORDER BY cnt DESC LIMIT 10",
-        )?;
-        let hotspot_files: Vec<FileHotspot> = hotspot_rows
-            .into_iter()
-            .filter_map(|r| {
-                Some(FileHotspot {
-                    file: r.first()?.clone(),
-                    count: r.get(1)?.parse().unwrap_or(0),
-                })
-            })
-            .collect();
-
-        let hub_rows = q.raw_query(
-            "MATCH ()-[r:CALLS]->(s:Symbol) RETURN s.name, s.file, count(r) AS calls \
-             ORDER BY calls DESC LIMIT 10",
-        )?;
-        let hub_functions: Vec<HubFunction> = hub_rows
-            .into_iter()
-            .filter_map(|r| {
-                Some(HubFunction {
-                    name: r.first()?.clone(),
-                    file: r.get(1)?.clone(),
-                    calls: r.get(2)?.parse().unwrap_or(0),
-                })
-            })
-            .collect();
-
-        let entry_rows = q.raw_query(
-            "MATCH (s:Symbol)-[:CALLS]->() WHERE s.kind IN ['Function', 'Method'] \
-             AND NOT EXISTS { MATCH ()-[:CALLS]->(s) } \
-             RETURN DISTINCT s.id, s.name, s.kind, s.file ORDER BY s.file, s.name LIMIT 20",
-        )?;
-        let entry_points: Vec<DeadCodeRow> = entry_rows
-            .into_iter()
-            .filter_map(|r| {
-                Some(DeadCodeRow {
-                    id: r.first()?.clone(),
-                    name: r.get(1)?.clone(),
-                    kind: r.get(2)?.clone(),
-                    file: r.get(3)?.clone(),
-                })
-            })
-            .collect();
-
-        Ok(ArchitectureStats {
-            languages,
-            kind_counts,
-            hotspot_files,
-            hub_functions,
-            entry_points,
-        })
+        GraphQuery::new(&conn).get_architecture_stats()
     }
 
     fn symbols_with_docstring(
@@ -407,32 +267,7 @@ impl GraphBackend for KuzuBackend {
         kind_filter: Option<&[&str]>,
     ) -> Result<Vec<SymbolWithDocstring>> {
         let conn = self.store.connection()?;
-        let q = GraphQuery::new(&conn);
-        let cypher = if let Some(kinds) = kind_filter {
-            let cond: Vec<String> = kinds
-                .iter()
-                .map(|k| format!("s.kind = '{}'", crate::escape_str(k)))
-                .collect();
-            format!(
-                "MATCH (s:Symbol) WHERE ({}) RETURN s.id, s.name, s.kind, s.file, s.docstring",
-                cond.join(" OR ")
-            )
-        } else {
-            "MATCH (s:Symbol) RETURN s.id, s.name, s.kind, s.file, s.docstring".to_string()
-        };
-        let rows = q.raw_query(&cypher)?;
-        Ok(rows
-            .into_iter()
-            .filter_map(|r| {
-                Some(SymbolWithDocstring {
-                    id: r.first()?.clone(),
-                    name: r.get(1)?.clone(),
-                    kind: r.get(2)?.clone(),
-                    file: r.get(3)?.clone(),
-                    docstring: r.get(4).cloned().unwrap_or_default(),
-                })
-            })
-            .collect())
+        GraphQuery::new(&conn).symbols_with_docstring(kind_filter)
     }
 
     fn upsert_similar_edge(&self, id_a: &str, id_b: &str, score: f32) -> Result<()> {

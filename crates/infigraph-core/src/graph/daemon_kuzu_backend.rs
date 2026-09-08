@@ -1,4 +1,7 @@
 use anyhow::Result;
+
+use crate::graph::queries::GraphQuery;
+use crate::graph::query_exec::QueryExec;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -62,26 +65,45 @@ impl DaemonKuzuBackend {
         })
     }
 
-    /// A fresh read-only connection for a single read call.
+    /// Reads no longer reopen the graph per call.
     ///
-    /// Reopening per read is what makes reads see daemon-side commits at
-    /// all: a Kuzu embedded read-only `Database` serves the snapshot it
-    /// loaded at open time and never observes another process's later
-    /// commits, so one connection held for this wrapper's (potentially very
-    /// long) lifetime goes permanently stale the moment the daemon writes --
-    /// including writes from the daemon's own watcher-driven reindexing or
-    /// another client, not just this instance's. A fresh `Connection` on a
-    /// held `Database` is not enough; the `Database` itself must be reopened.
+    /// `open_read` used to reopen the whole `Database` for every read, because
+    /// an embedded read-only Kuzu `Database` serves the snapshot it loaded at
+    /// open time and never observes another process's later commits -- so a
+    /// held handle went permanently stale the moment the daemon wrote. That
+    /// problem is gone rather than solved: the read service answers from the
+    /// daemon's own live `Database`, so a read sees the daemon's writes by
+    /// construction. The hatch arm below still reopens, and inherits the old
+    /// staleness caveat.
+    /// Run one read against the daemon's read service, or -- only when the
+    /// escape hatch is set -- directly against the graph file.
     ///
-    /// Measured at ~12.6ms, trivial against this backend's 30s-600s write
-    /// timeouts. This does not reintroduce the write-amplification bug from
-    /// upstream PR #43: that came from reopening a *write* connection, whose
-    /// close triggers `forceCheckpointOnClose` and flushes accumulated WAL
-    /// into the base file. A read-only connection never writes, so it has
-    /// nothing to checkpoint -- verified empirically as zero bytes of file
-    /// growth over 100 open/close cycles against a real indexed graph.
-    fn open_read(&self) -> Result<KuzuBackend> {
-        KuzuBackend::open_read_only(&self.db_path)
+    /// This is the single place that decides local-vs-remote, and every read
+    /// method above goes through it. Because `GraphQuery` is generic over
+    /// `QueryExec`, both arms run the *same* query bodies; there is no
+    /// second implementation of any read to drift.
+    ///
+    /// Reads are daemon-mandatory. The hatch exists so a graph stays
+    /// recoverable when the daemon itself is broken, and it is deliberately
+    /// explicit rather than an automatic fallback: a silent fallback keeps
+    /// both paths permanently live, which is how `Infigraph::init` and
+    /// `GraphStore::open_read_only_or_degrade` drifted apart until one
+    /// quarantined healthy graphs (5818aa1).
+    fn with_reader<T>(
+        &self,
+        f: impl FnOnce(&GraphQuery<&dyn QueryExec>) -> Result<T>,
+    ) -> Result<T> {
+        if direct_reads_enabled() {
+            let store = crate::graph::GraphStore::open_read_only(&self.db_path)?;
+            let conn = store.connection()?;
+            let local = crate::graph::query_exec::LocalExec::new(&conn);
+            let exec: &dyn QueryExec = &local;
+            f(&GraphQuery::new_with(exec))
+        } else {
+            let remote = crate::graph::remote_exec::RemoteExec::new(&self.root);
+            let exec: &dyn QueryExec = &remote;
+            f(&GraphQuery::new_with(exec))
+        }
     }
 
     fn not_supported(method: &str, alternative: &str) -> anyhow::Error {
@@ -112,55 +134,55 @@ impl GraphBackend for DaemonKuzuBackend {
     //    connection (see `open_read` for why it is not held open) ──
 
     fn stats(&self) -> Result<GraphStats> {
-        self.open_read()?.stats()
+        self.with_reader(|q| q.stats())
     }
     fn get_file_hashes(&self) -> Result<HashMap<String, String>> {
-        self.open_read()?.get_file_hashes()
+        self.with_reader(|q| q.get_file_hashes())
     }
     fn get_all_symbols(&self) -> Result<Vec<(String, String, String, String)>> {
-        self.open_read()?.get_all_symbols()
+        self.with_reader(|q| q.get_all_symbols())
     }
     fn symbols_in_file(&self, file: &str) -> Result<Vec<SymbolRow>> {
-        self.open_read()?.symbols_in_file(file)
+        self.with_reader(|q| q.symbols_in_file(file))
     }
     fn find_symbol_by_id(&self, id: &str) -> Result<Option<SymbolDetail>> {
-        self.open_read()?.find_symbol_by_id(id)
+        self.with_reader(|q| q.find_symbol_by_id(id))
     }
     fn symbols_in_range(&self, file: &str, start: u32, end: u32) -> Result<Vec<SymbolDetail>> {
-        self.open_read()?.symbols_in_range(file, start, end)
+        self.with_reader(|q| q.symbols_in_range(file, start, end))
     }
     fn skeleton(&self, file: &str) -> Result<String> {
-        self.open_read()?.skeleton(file)
+        self.with_reader(|q| q.skeleton(file))
     }
     fn callers_of(&self, symbol_id: &str) -> Result<Vec<String>> {
-        self.open_read()?.callers_of(symbol_id)
+        self.with_reader(|q| q.callers_of(symbol_id))
     }
     fn callees_of(&self, symbol_id: &str) -> Result<Vec<String>> {
-        self.open_read()?.callees_of(symbol_id)
+        self.with_reader(|q| q.callees_of(symbol_id))
     }
     fn branches_of(&self, symbol_id: &str) -> Result<Vec<BranchInfo>> {
-        self.open_read()?.branches_of(symbol_id)
+        self.with_reader(|q| q.branches_of(symbol_id))
     }
     fn transitive_impact(&self, id: &str, max_depth: u32) -> Result<Vec<ImpactRow>> {
-        self.open_read()?.transitive_impact(id, max_depth)
+        self.with_reader(|q| q.transitive_impact(id, max_depth))
     }
     fn find_all_references(&self, id: &str) -> Result<Vec<ReferenceRow>> {
-        self.open_read()?.find_all_references(id)
+        self.with_reader(|q| q.find_all_references(id))
     }
     fn cross_cutting_for(&self, id: &str) -> Result<Vec<(String, String)>> {
-        self.open_read()?.cross_cutting_for(id)
+        self.with_reader(|q| q.cross_cutting_for(id))
     }
     fn get_api_surface(&self) -> Result<Vec<ApiSymbol>> {
-        self.open_read()?.get_api_surface()
+        self.with_reader(|q| q.get_api_surface())
     }
     fn get_file_deps(&self, file: &str) -> Result<FileDeps> {
-        self.open_read()?.get_file_deps(file)
+        self.with_reader(|q| q.get_file_deps(file))
     }
     fn get_type_hierarchy(&self, id: &str, max_depth: u32) -> Result<TypeHierarchy> {
-        self.open_read()?.get_type_hierarchy(id, max_depth)
+        self.with_reader(|q| q.get_type_hierarchy(id, max_depth))
     }
     fn get_test_coverage(&self) -> Result<TestCoverage> {
-        self.open_read()?.get_test_coverage()
+        self.with_reader(|q| q.get_test_coverage())
     }
     fn generate_test_context(
         &self,
@@ -168,35 +190,39 @@ impl GraphBackend for DaemonKuzuBackend {
         limit: usize,
         test_type: Option<&str>,
     ) -> Result<TestContext> {
-        self.open_read()?
-            .generate_test_context(file_filter, limit, test_type)
+        self.with_reader(|q| q.generate_test_context(file_filter, limit, test_type))
     }
     fn raw_query(&self, query: &str) -> Result<Vec<Vec<String>>> {
-        self.open_read()?.raw_query(query)
+        if crate::graph::is_transaction_control(query) {
+            // Same answer the local backend gives, and the same answer the
+            // read service gives (it reaches `raw_query_on` too).
+            return Ok(Vec::new());
+        }
+        self.with_reader(|q| q.raw_query(query))
     }
     fn get_symbols_for_search(&self) -> Result<Vec<Vec<String>>> {
-        self.open_read()?.get_symbols_for_search()
+        self.with_reader(|q| q.get_symbols_for_search())
     }
     fn symbol_metadata(&self, id: &str) -> Result<Option<SymbolMeta>> {
-        self.open_read()?.symbol_metadata(id)
+        self.with_reader(|q| q.symbol_metadata(id))
     }
     fn get_complexity_ranking(&self, file_filter: Option<&str>) -> Result<Vec<ComplexityRow>> {
-        self.open_read()?.get_complexity_ranking(file_filter)
+        self.with_reader(|q| q.get_complexity_ranking(file_filter))
     }
     fn list_indexed_files(&self) -> Result<Vec<String>> {
-        self.open_read()?.list_indexed_files()
+        self.with_reader(|q| q.list_indexed_files())
     }
     fn find_uncalled_symbols(&self) -> Result<Vec<DeadCodeRow>> {
-        self.open_read()?.find_uncalled_symbols()
+        self.with_reader(|q| q.find_uncalled_symbols())
     }
     fn get_architecture_stats(&self) -> Result<ArchitectureStats> {
-        self.open_read()?.get_architecture_stats()
+        self.with_reader(|q| q.get_architecture_stats())
     }
     fn symbols_with_docstring(
         &self,
         kind_filter: Option<&[&str]>,
     ) -> Result<Vec<SymbolWithDocstring>> {
-        self.open_read()?.symbols_with_docstring(kind_filter)
+        self.with_reader(|q| q.symbols_with_docstring(kind_filter))
     }
     /// `KuzuBackend` never overrides `repo_filter`; it inherits the trait
     /// default, which is unconditionally `None` (Kuzu is single-repo by
@@ -682,9 +708,54 @@ impl GraphBackend for DaemonKuzuBackend {
     }
 }
 
+/// Whether reads bypass the daemon and open the graph file directly.
+///
+/// Set `INFIGRAPH_DIRECT_READS=1` to recover a graph when the daemon itself
+/// is broken. Any value but empty or `0` enables it.
+pub fn direct_reads_enabled() -> bool {
+    std::env::var_os("INFIGRAPH_DIRECT_READS").is_some_and(|v| !v.is_empty() && v != "0")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Serialises the env mutation below against other env-mutating tests,
+    /// following the pattern in `settings.rs` and `multi/mod.rs`.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Reads are daemon-mandatory. The escape hatch exists so a graph is
+    /// recoverable when the daemon itself is broken, and is deliberately
+    /// explicit: a silent fallback would keep both paths permanently live,
+    /// which is how `Infigraph::init` and
+    /// `GraphStore::open_read_only_or_degrade` drifted apart until one
+    /// quarantined healthy graphs (5818aa1).
+    #[test]
+    fn the_escape_hatch_restores_a_direct_read_when_set() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let graph = root.join(".infigraph").join("graph");
+        std::fs::create_dir_all(graph.parent().unwrap()).unwrap();
+        drop(crate::graph::GraphStore::open(&graph).unwrap());
+
+        // No daemon is running, so without the hatch this must fail.
+        let backend = DaemonKuzuBackend::open(root).unwrap();
+        assert!(
+            backend.stats().is_err(),
+            "with no daemon and no escape hatch, a read must fail rather than silently \
+             opening the file directly"
+        );
+
+        std::env::set_var("INFIGRAPH_DIRECT_READS", "1");
+        let got = backend.stats();
+        std::env::remove_var("INFIGRAPH_DIRECT_READS");
+        assert!(
+            got.is_ok(),
+            "the escape hatch must restore a direct read: {got:?}"
+        );
+    }
 
     /// Regression test: `open` used to eagerly probe with
     /// `KuzuBackend::open_read_only` unconditionally, which fails on any

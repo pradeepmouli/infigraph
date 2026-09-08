@@ -508,37 +508,13 @@ where
     // guard ends up covering three of four of them.
     ensure_watchable_root(root)?;
 
-    // Build the registry ONCE for the whole watch session (#58): it serves
-    // both file-extension filtering here and every `watch_db` open below
-    // via `Infigraph::open_shared`. It used to be built twice serially
-    // (filter + first drain's open), which alone consumed ~5s in debug
-    // builds and pushed the daemon's first request reply past callers'
-    // timeouts. The full-reindex side-path build keeps its own fresh
-    // `make_registry()` call -- a rebuild takes far longer than a registry
-    // build, so sharing buys nothing there.
-    let shared_registry: Arc<crate::lang::LanguageRegistry> = Arc::new(make_registry()?);
-
-    let mut changes_since_periodic: usize = 0;
-    let mut last_periodic = std::time::Instant::now();
-
-    // Shared DB connection for the watch session — see `watch_db`'s doc
-    // comment for the platform split (held open on non-Windows, reopened
-    // per call on Windows).
+    // Bound here, before the language-registry build below, which costs
+    // seconds in a debug build. The CLI takes `watch.lock` -- every
+    // caller's "daemon is ready" signal -- well before this function is
+    // even entered, so anything slower than this leaves a window where the
+    // daemon looks ready but answers no reads. The store is resolved per
+    // request, so binding does not need it to exist yet.
     let mut held_prism = HeldPrism::new();
-
-    // Open the graph now rather than on the first write.
-    //
-    // `watch_db` is lazy by design: when the daemon only served writes,
-    // holding no `Database` until there was work to do was free. Now that
-    // reads route through this process, "the daemon holds the graph" has to
-    // be true from startup -- otherwise a freshly started daemon on an
-    // already-indexed repo refuses every read until something happens to
-    // trigger a write. Best-effort: a failure here (no graph yet, or another
-    // process still holding it) is not fatal, and the loop's existing
-    // `reopen_backoff` path retries on demand exactly as before.
-    if let Err(e) = watch_db(root, &shared_registry, &mut held_prism) {
-        eprintln!("[read] graph not open at daemon start (will retry on demand): {e:#}");
-    }
 
     // The read service: bound here, alongside the write coordinator, and
     // torn down when this function returns (`ReadService` shuts down on
@@ -574,6 +550,37 @@ where
             }
         }
     };
+
+    // Build the registry ONCE for the whole watch session (#58): it serves
+    // both file-extension filtering here and every `watch_db` open below
+    // via `Infigraph::open_shared`. It used to be built twice serially
+    // (filter + first drain's open), which alone consumed ~5s in debug
+    // builds and pushed the daemon's first request reply past callers'
+    // timeouts. The full-reindex side-path build keeps its own fresh
+    // `make_registry()` call -- a rebuild takes far longer than a registry
+    // build, so sharing buys nothing there.
+    let shared_registry: Arc<crate::lang::LanguageRegistry> = Arc::new(make_registry()?);
+
+    // Open the graph now rather than on the first write.
+    //
+    // `watch_db` is lazy by design: when the daemon only served writes,
+    // holding no `Database` until there was work to do was free. Now that
+    // reads route through this process, "the daemon holds the graph" has to
+    // be true from startup -- otherwise a freshly started daemon on an
+    // already-indexed repo refuses every read until something happens to
+    // trigger a write. Best-effort: a failure here (no graph yet, or another
+    // process still holding it) is not fatal, and the loop's existing
+    // `reopen_backoff` path retries on demand exactly as before.
+    if let Err(e) = watch_db(root, &shared_registry, &mut held_prism) {
+        eprintln!("[read] graph not open at daemon start (will retry on demand): {e:#}");
+    }
+
+    let mut changes_since_periodic: usize = 0;
+    let mut last_periodic = std::time::Instant::now();
+
+    // Shared DB connection for the watch session — see `watch_db`'s doc
+    // comment for the platform split (held open on non-Windows, reopened
+    // per call on Windows).
     // Paces reopen attempts after `watch_db` fails (typically: the graph is
     // locked by another process) -- see `backoff::ReopenBackoff`.
     let mut reopen_backoff = ReopenBackoff::new();
