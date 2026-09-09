@@ -46,21 +46,67 @@ fn init_selects_daemon_kuzu_backend_when_env_var_set() {
     assert!(result.is_ok(), "init() failed: {result:?}");
 }
 
+/// The counterpart to `init_selects_daemon_kuzu_backend_when_env_var_set`:
+/// both selections are now asserted explicitly, and neither depends on
+/// which one happens to be the default.
+///
+/// This used to be `init_selects_kuzu_backend_by_default` and leant on the
+/// variable being absent. #159 flipped that default, and the assertion that
+/// defines it now lives in exactly one place --
+/// `selected_backend.rs::defaults_to_daemon_when_unset`. Restoring an
+/// unset-means-local assumption here would also make this test spawn a real
+/// daemon against a tempdir, since `init`'s daemon arm auto-starts one.
 #[test]
-fn init_selects_kuzu_backend_by_default() {
+fn init_selects_kuzu_backend_when_pinned_local() {
     let _guard = ENV_LOCK.lock().unwrap();
     let project_dir = tempfile::tempdir().unwrap();
-    // Deliberately UNSET, not pinned: this test is about what the default
-    // is. It is one of the two assertions #159's step 3 has to rewrite when
-    // the default flips (the other is `defaults_to_kuzu_when_unset` in
-    // selected_backend.rs); everywhere else now pins the backend
-    // explicitly so that flip cannot change its meaning silently.
-    std::env::remove_var("INFIGRAPH_BACKEND");
+    std::env::set_var(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND);
     let registry = bundled_registry().unwrap();
     let mut infigraph = Infigraph::open(project_dir.path(), registry).unwrap();
     infigraph.init().unwrap();
     assert!(
         infigraph.store().is_some(),
         "expected a real KuzuBackend, no store() handle"
+    );
+}
+
+/// #159: with routing as the default, a project that has never been indexed
+/// has to be able to bootstrap itself.
+///
+/// It could not. `DaemonKuzuBackend::open` takes a *read-only* Kùzu
+/// connection and a read-only connection cannot create a database, so
+/// daemon-mode `init()` structurally requires the graph to already exist --
+/// which a fresh project can never reach through the routed path.
+/// `ensure_daemon_running_required` compounded it by treating "no
+/// `.infigraph/` yet" as `AlreadyRunning`, so nothing was spawned and the
+/// 10s readiness wait then failed. The observed result was `infigraph index`
+/// on a new project dying after 10s with a message claiming
+/// `INFIGRAPH_BACKEND=daemon is set` when the user had set nothing at all.
+#[test]
+fn init_bootstraps_a_never_indexed_project_under_the_default_backend() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let project_dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        project_dir.path().join("main.py"),
+        "def hello():\n    pass\n",
+    )
+    .unwrap();
+
+    // The default, stated rather than assumed, so this test keeps testing
+    // bootstrap rather than silently becoming a local-mode test.
+    std::env::set_var(infigraph_core::BACKEND_ENV, infigraph_core::DAEMON_BACKEND);
+    let registry = bundled_registry().unwrap();
+    let mut infigraph = Infigraph::open(project_dir.path(), registry).unwrap();
+    let result = infigraph.init();
+    std::env::set_var(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND);
+
+    assert!(
+        result.is_ok(),
+        "a never-indexed project must be able to bootstrap under the routed default, \
+         got: {result:?}"
+    );
+    assert!(
+        project_dir.path().join(".infigraph").join("graph").exists(),
+        "bootstrap must leave a real graph on disk for the daemon to serve"
     );
 }

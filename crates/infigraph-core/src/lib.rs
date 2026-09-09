@@ -206,9 +206,14 @@ pub const BACKEND_ENV: &str = "INFIGRAPH_BACKEND";
 /// file it was asked about.
 pub const LOCAL_BACKEND: &str = "kuzu";
 
+/// The backend value meaning "route through this project's daemon". Named
+/// here so the one place that decides the default and the one place that
+/// tests for it cannot drift apart.
+pub const DAEMON_BACKEND: &str = "daemon";
+
 crate::settings! {
     backend {
-        selected: String = LOCAL_BACKEND.to_string(),
+        selected: String = DAEMON_BACKEND.to_string(),
     }
 }
 
@@ -241,7 +246,7 @@ pub fn selected_backend() -> String {
 /// instance; that reports what was actually opened rather than what was
 /// requested.
 pub fn daemon_backend_selected() -> bool {
-    selected_backend() == "daemon"
+    selected_backend() == DAEMON_BACKEND
 }
 
 // Self-update / install plumbing (`infigraph install`, `infigraph update`,
@@ -332,11 +337,57 @@ impl Infigraph {
         })
     }
 
+    /// Create the graph in this process when there is nothing yet to route
+    /// to, so a never-indexed project can bootstrap under the routed default
+    /// (#159).
+    ///
+    /// Routing cannot bootstrap itself, in two independent ways.
+    /// `DaemonKuzuBackend::open` takes a *read-only* Kùzu connection and a
+    /// read-only connection cannot create a database; and
+    /// `ensure_daemon_running_required` declines to spawn anything while
+    /// `.infigraph/` is absent, since "not indexed yet" used to mean "no
+    /// daemon needed". Together those made `infigraph index` on a new
+    /// project fail after the 10s readiness wait, reporting that
+    /// `INFIGRAPH_BACKEND=daemon is set` to a user who had set nothing.
+    ///
+    /// Doing it here rather than teaching the daemon to bootstrap keeps the
+    /// creating write in the process that asked for it: the daemon's own
+    /// `init` runs pinned to [`LOCAL_BACKEND`], so a daemon spawned against
+    /// an empty project would work too -- but only after this process had
+    /// already waited out a spawn it had no way to know was needed.
+    ///
+    /// A no-op once the graph exists, which is every call after the first.
+    fn bootstrap_graph_for_routing(&self) -> Result<()> {
+        if self.db_path.exists() {
+            return Ok(());
+        }
+        if let Some(parent) = self.db_path.parent() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "could not create {} to bootstrap the graph",
+                    parent.display()
+                )
+            })?;
+        }
+        // Opening creates the database and its schema; dropping it
+        // checkpoints and releases the write lock, so the daemon that starts
+        // next inherits a complete, foldable graph rather than a live WAL.
+        drop(graph::KuzuBackend::open(&self.db_path).with_context(|| {
+            format!(
+                "could not create the graph at {} to bootstrap routed access",
+                self.db_path.display()
+            )
+        })?);
+        Ok(())
+    }
+
     /// Initialize the graph store (creates DB on first run).
     /// On corruption, wipes the graph directory and retries.
     ///
     /// Backend selection via `INFIGRAPH_BACKEND` env var:
-    /// - `kuzu` (default): embedded Kùzu graph DB
+    /// - `daemon` (default): route reads and writes through this project's
+    ///   daemon, auto-starting one if none is listening (#159)
+    /// - `kuzu`: open the embedded Kùzu graph DB in this process
     /// - `neo4j`: remote Neo4j sidecar via Bolt (requires `neo4j` feature)
     pub fn init(&mut self) -> Result<()> {
         // Refuse a folder of repositories HERE, not in `index()`: `init` is
@@ -345,6 +396,7 @@ impl Infigraph {
         // already made the root look indexed by the time it ran.
         crate::daemon::ensure_watchable_root(&self.root)?;
         if daemon_backend_selected() {
+            self.bootstrap_graph_for_routing()?;
             let dk = graph::DaemonKuzuBackend::open(&self.root)?;
             self.backend_kind = BackendKind::DaemonKuzu(dk);
             // Selecting this backend implies daemon-mode watching: every

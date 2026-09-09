@@ -26,7 +26,7 @@ Index 30+ repositories into a shared code intelligence graph using Neo4j and Pos
 
 ### Backend Selection
 
-Set `INFIGRAPH_BACKEND=neo4j` to activate remote mode. Default is `kuzu` (embedded, local).
+Set `INFIGRAPH_BACKEND=neo4j` to activate remote mode. The default is `daemon` (reads and writes route through this project's daemon, which is auto-started if none is listening); `kuzu` opens the embedded local graph in the calling process.
 
 | Component | Local Mode (default) | Remote Mode (`neo4j`) |
 |-----------|---------------------|----------------------|

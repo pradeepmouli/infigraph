@@ -1096,14 +1096,24 @@ fn full_reindex_with_no_daemon_fails_fast_instead_of_polling_for_ten_minutes() {
 
 /// Regression test for the sibling gap `--full`'s fix above didn't cover:
 /// a plain (non-`--full`) `infigraph index` under `INFIGRAPH_BACKEND=daemon`
-/// had no equivalent fail-fast guard at all -- `Infigraph::init()`'s
+/// had no equivalent guard at all -- `Infigraph::init()`'s
 /// `ensure_daemon_for_writes` used to fire-and-forget a daemon spawn attempt
 /// and return unconditionally, so if no daemon ever came up (e.g. the very
-/// first index of a fresh project, before `.infigraph` exists -- daemon
-/// auto-start is a benign no-op in that case, by design), the first write
-/// would silently block inside `submit_write_request` for its own ~600s
-/// timeout instead of failing here, within seconds, with an actionable
-/// message.
+/// first index of a fresh project, before `.infigraph` exists) the first
+/// write would silently block inside `submit_write_request` for its own
+/// ~600s timeout.
+///
+/// The property under test is that outcome's *shape*: bounded, and
+/// definite. The answer used to be a fast, actionable failure, because
+/// bootstrap through the routed path is impossible -- `DaemonKuzuBackend`
+/// takes a read-only connection, and `ensure_daemon_running_required`
+/// declines to spawn while `.infigraph/` is absent. Since #159 made routing
+/// the default, that answer stopped being good enough: it would have meant
+/// `infigraph index` on any new project failing, and blaming an environment
+/// variable the user never set. `Infigraph::init` now creates the graph
+/// in-process when there is nothing to route to, so the bounded, definite
+/// outcome is a successful index. The budget stays, and still guards the
+/// thing that actually hurt: the ~600s silent block.
 ///
 /// Deliberately runs the real binary (not `cmd_index`/`Infigraph::init()`
 /// directly): `resolve_cli_binary_sibling_of` and the daemon spawn path
@@ -1111,15 +1121,14 @@ fn full_reindex_with_no_daemon_fails_fast_instead_of_polling_for_ten_minutes() {
 /// which only holds true inside a spawned child process, not this test
 /// binary itself.
 #[test]
-fn plain_index_on_a_never_indexed_project_fails_fast_under_daemon_backend() {
+fn plain_index_on_a_never_indexed_project_bootstraps_under_daemon_backend() {
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let project = tempfile::tempdir().unwrap();
     std::fs::write(project.path().join("a.py"), "def a():\n    pass\n").unwrap();
 
     // No bootstrap index here, deliberately: `.infigraph` must not exist yet
-    // when the daemon-backend `index` invocation below runs, so that
-    // `ensure_daemon_running_required`'s "not yet indexed" no-op is what's
-    // actually exercised (rather than a real spawn failure).
+    // when the daemon-backend `index` invocation below runs, so that the
+    // never-indexed path is what's actually exercised.
     assert!(!project.path().join(".infigraph").exists());
 
     const FAIL_FAST_BUDGET: Duration = Duration::from_secs(30);
@@ -1143,7 +1152,8 @@ fn plain_index_on_a_never_indexed_project_fails_fast_under_daemon_backend() {
             let _ = child.wait();
             panic!(
                 "plain `index` on a never-indexed project under \
-                 INFIGRAPH_BACKEND=daemon did not fail within {FAIL_FAST_BUDGET:?}"
+                 INFIGRAPH_BACKEND=daemon did not finish within {FAIL_FAST_BUDGET:?} -- \
+                 the ~600s silent block inside submit_write_request is back"
             );
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -1152,12 +1162,13 @@ fn plain_index_on_a_never_indexed_project_fails_fast_under_daemon_backend() {
     let output = child.wait_with_output().unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        !output.status.success(),
-        "must be a hard failure, not a silent success: {stderr}"
+        output.status.success(),
+        "a never-indexed project must bootstrap under the routed backend rather than \
+         failing, got: {stderr}"
     );
     assert!(
-        stderr.contains("no daemon came up"),
-        "the error must say what's actually wrong and how to fix it, got: {stderr}"
+        project.path().join(".infigraph").join("graph").exists(),
+        "bootstrap must leave a real graph on disk for the daemon to serve, got: {stderr}"
     );
 }
 
