@@ -380,6 +380,12 @@ fn write_buffer_pool_bytes() -> u64 {
 /// held only across the two moments that actually collide: a reader's
 /// `Database::new` (shared) and the writer's explicit `CHECKPOINT`
 /// (exclusive).
+/// How long a WAL must sit unwritten before the daemon folds it (#149);
+/// 0 disables. See `GraphStore::checkpoint_if_idle`.
+pub(crate) fn checkpoint_idle_secs() -> u64 {
+    crate::graph::Graph::resolve(crate::graph::RawGraph::default(), None).checkpoint_idle_secs
+}
+
 fn checkpoint_lock_path(db_path: &Path) -> PathBuf {
     PathBuf::from(format!("{}.ckpt.lock", db_path.display()))
 }
@@ -391,9 +397,9 @@ fn checkpoint_lock_path(db_path: &Path) -> PathBuf {
 const CHECKPOINT_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// WAL size above which the next write pauses to fold it into the base
-/// image. With `auto_checkpoint(false)` the database never checkpoints on
-/// its own, so this is the only thing keeping the WAL bounded -- and an
-/// unbounded WAL is the #100 runaway this codebase already has scars from.
+/// image. Belt-and-braces alongside Kuzu's own automatic checkpointing (see
+/// `Database::new`) and the daemon's idle fold: an unbounded WAL is the #100
+/// runaway this codebase already has scars from.
 const CHECKPOINT_WAL_BYTES: u64 = 1024 * 1024;
 
 /// PID currently holding `lock_path`, if that process is still running.
@@ -673,22 +679,35 @@ impl GraphStore {
             let _phase = crate::write_phase::enter(&"open graph (WAL replay)", 0);
             Database::new(
                 path,
-                // Both settings, and neither is optional. The buffer-pool
-                // budget is what keeps a shared machine's daemon out of
-                // lbug's 0.8-of-physical-RAM auto-detect (two daemons were
+                // The buffer-pool budget keeps a shared machine's daemon out
+                // of lbug's 0.8-of-physical-RAM auto-detect (two daemons were
                 // found at ~39GB); `buffer pool is full and no memory could
                 // be freed` showed up again in the 2026-09-09 incident, so
-                // dropping it here would re-open that runaway.
+                // dropping it would re-open that runaway.
                 //
-                // Checkpoints must happen only inside `checkpoint_now`'s
-                // exclusive window (ladybug#666): a reader's `Database::new`
-                // racing one segfaults, measured at 13-15 ms before the WAL
-                // fold across three independent runs. An automatic
-                // checkpoint fires wherever Kuzu likes, which is necessarily
-                // outside any lock we hold.
+                // Automatic checkpointing stays ON, deliberately, and this is
+                // a correction to ca6cfde. That branch disabled it so every
+                // fold would happen inside `checkpoint_now`'s exclusive
+                // window, closing the ladybug#666 race where a reader's
+                // `Database::new` racing a fold segfaults (measured at 13-15
+                // ms across three runs). But with it off, the ONLY folds are
+                // `checkpoint_if_wal_large` (next write, and only past 1MB)
+                // and the daemon's idle fold -- so a short-lived non-daemon
+                // writer that commits under 1MB and exits leaves its data in
+                // an unfolded WAL, invisible to every new read-only open.
+                // `full_reindex_replies_with_an_error_and_leaves_the_old_
+                // graph_untouched_when_the_registry_build_fails` catches
+                // exactly that: it fails with `auto_checkpoint(false)` and
+                // passes with it on. Folding on `Drop` is not the way out --
+                // a `TransactionManagerException` reaching `std::terminate`
+                // from a destructor is precisely #132's abort class.
+                //
+                // So the ladybug#666 race stays open (it is pre-existing, and
+                // tracked separately); losing committed data from readers
+                // would not be.
                 SystemConfig::default()
                     .buffer_pool_size(write_buffer_pool_bytes())
-                    .auto_checkpoint(false),
+                    .auto_checkpoint(true),
             )
             .map_err(|e| anyhow::anyhow!("failed to open kuzu db: {e}"))?
         };
@@ -973,8 +992,13 @@ impl GraphStore {
     /// it: at that moment this thread is about to hold the lock anyway, so no
     /// other writer is mid-operation, and a failure can still be reported.
     fn checkpoint_if_wal_large(&self) {
-        let Some(dir) = self.db_dir() else { return };
-        let db_path = dir.join("graph");
+        if self.db_dir().is_none() {
+            return; // in-memory store: nothing to fold
+        }
+        // This store's OWN file, never `db_dir().join("graph")` (#156): a
+        // full reindex builds at `graph.rebuilding` and shares `graph.lock`,
+        // so deriving the canonical name here would fold the wrong file.
+        let db_path = self.db_path().to_path_buf();
         let wal: u64 = wal_family_paths(&db_path)
             .iter()
             .filter_map(|p| std::fs::metadata(p).ok())
@@ -987,6 +1011,70 @@ impl GraphStore {
         // leaves the WAL large, which the #100 growth breaker still guards.
         if let Err(e) = self.checkpoint_now(&db_path) {
             eprintln!("warn: {e}");
+        }
+    }
+
+    /// Fold an idle WAL into the base image (#149).
+    ///
+    /// [`checkpoint_if_wal_large`] rides `write_lock`, so it only ever fires
+    /// on the NEXT WRITE -- which an idle daemon, by definition, never
+    /// performs. That is the "hook location wrong" of ca6cfde, and it is the
+    /// whole of #149: a daemon that has gone quiet keeps an uncheckpointed
+    /// WAL indefinitely, and while it does, every *new* external read-only
+    /// open is refused (`Corrupted wal file` / "held by a live writer"),
+    /// recoverable only by restarting the daemon. Readers that already hold
+    /// the graph are unaffected, so it presents as "some tools work, new
+    /// ones fail". Observed on sittir with a 6.6MB WAL over ~45 minutes, and
+    /// three more times on 2026-09-09.
+    ///
+    /// Idleness is read from the WAL's own mtime rather than tracked state:
+    /// it needs no bookkeeping, and it is true of *any* writer's WAL, not
+    /// just one this process happens to know about.
+    ///
+    /// Best-effort throughout. A WAL that cannot be stat'd, a checkpoint
+    /// that fails, or a busy checkpoint window all simply leave the WAL
+    /// unfolded for the next tick -- this runs on a timer, so there is
+    /// always a next chance, and a failure here must never take down the
+    /// daemon loop that calls it.
+    pub(crate) fn checkpoint_if_idle(&self, idle_after: std::time::Duration) {
+        if idle_after.is_zero() && checkpoint_idle_secs() == 0 {
+            // 0 in settings disables the behaviour entirely; a zero argument
+            // from a test still means "fold now", hence both conditions.
+            return;
+        }
+        if self.db_dir().is_none() {
+            return; // in-memory store
+        }
+        let db_path = self.db_path().to_path_buf();
+        let wal_paths = wal_family_paths(&db_path);
+
+        let mut wal_bytes = 0u64;
+        let mut newest_write: Option<std::time::SystemTime> = None;
+        for p in &wal_paths {
+            let Ok(meta) = std::fs::metadata(p) else {
+                continue;
+            };
+            wal_bytes += meta.len();
+            if let Ok(m) = meta.modified() {
+                newest_write = Some(newest_write.map_or(m, |cur| cur.max(m)));
+            }
+        }
+        if wal_bytes == 0 {
+            return; // nothing to fold
+        }
+        let Some(newest_write) = newest_write else {
+            return; // no usable mtime -- do not guess at idleness
+        };
+        let idle_for = newest_write.elapsed().unwrap_or_default();
+        if idle_for < idle_after {
+            return; // still being written
+        }
+
+        if let Err(e) = self.checkpoint_now(&db_path) {
+            // Not fatal, and not even worth a warning on every tick: the
+            // common cause is another process holding the checkpoint window,
+            // which resolves itself.
+            eprintln!("warn: idle checkpoint skipped: {e}");
         }
     }
 
@@ -1352,6 +1440,91 @@ fn read_generation_field_conn(conn: &Connection, field: &'static str) -> Result<
 
 #[cfg(test)]
 mod tests {
+
+    /// #149: an idle daemon used to sit indefinitely on an uncheckpointed
+    /// WAL, and while it did, every NEW external read-only open was refused
+    /// -- observed on sittir with a 6.6MB WAL held for ~45 minutes, and
+    /// again three times on 2026-09-09. Readers already holding the graph
+    /// were unaffected, so it presented as "some tools work, new ones fail".
+    /// Only a `daemon-restart` cleared it, because idleness is precisely
+    /// what fails to trigger a fold.
+    ///
+    /// The cherry-picked checkpoint window only folded on the NEXT WRITE
+    /// (`checkpoint_if_wal_large` via `write_lock`), which an idle daemon by
+    /// definition never performs -- the "hook location wrong" of ca6cfde.
+    #[test]
+    fn an_idle_wal_is_folded_into_the_base_image() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = dir.path().join("graph");
+        let store = super::GraphStore::open(&graph).unwrap();
+        {
+            let conn = store.connection().unwrap();
+            for i in 0..200 {
+                conn.query(&format!(
+                    "CREATE (:File {{id: 'f{i}.rs', name: 'f{i}.rs', path: 'f{i}.rs', \
+                     language: 'rust', symbol_count: 0}})"
+                ))
+                .unwrap();
+            }
+        }
+
+        let wal_before: u64 = super::wal_family_paths(&graph)
+            .iter()
+            .filter_map(|p| std::fs::metadata(p).ok())
+            .map(|m| m.len())
+            .sum();
+        assert!(
+            wal_before > 0,
+            "precondition: writes must leave an unfolded WAL (auto_checkpoint is off)"
+        );
+
+        // Zero threshold: the WAL is idle the instant nothing is writing.
+        store.checkpoint_if_idle(std::time::Duration::ZERO);
+
+        let wal_after: u64 = super::wal_family_paths(&graph)
+            .iter()
+            .filter_map(|p| std::fs::metadata(p).ok())
+            .map(|m| m.len())
+            .sum();
+        assert!(
+            wal_after < wal_before,
+            "an idle WAL must be folded into the base image, leaving new readers \
+             able to open it (was {wal_before} bytes, now {wal_after})"
+        );
+    }
+
+    /// A still-busy WAL must be left alone: folding under an active writer is
+    /// what the checkpoint window exists to serialize, not something to do
+    /// opportunistically.
+    #[test]
+    fn a_recently_written_wal_is_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = dir.path().join("graph");
+        let store = super::GraphStore::open(&graph).unwrap();
+        {
+            let conn = store.connection().unwrap();
+            conn.query(
+                "CREATE (:File {id: 'a.rs', name: 'a.rs', path: 'a.rs', \
+                 language: 'rust', symbol_count: 0})",
+            )
+            .unwrap();
+        }
+        let before: u64 = super::wal_family_paths(&graph)
+            .iter()
+            .filter_map(|p| std::fs::metadata(p).ok())
+            .map(|m| m.len())
+            .sum();
+
+        // An hour of required idleness: this WAL was written milliseconds ago.
+        store.checkpoint_if_idle(std::time::Duration::from_secs(3600));
+
+        let after: u64 = super::wal_family_paths(&graph)
+            .iter()
+            .filter_map(|p| std::fs::metadata(p).ok())
+            .map(|m| m.len())
+            .sum();
+        assert_eq!(before, after, "a WAL written just now must not be folded");
+    }
     use super::*;
 
     fn write_holder_lock(lock_path: &Path, pid: u32) {

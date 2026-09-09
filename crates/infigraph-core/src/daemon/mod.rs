@@ -34,6 +34,11 @@ const COORDINATOR_TICK: Duration = Duration::from_millis(200);
 /// worker instead of spawning unbounded threads inside the daemon.
 const READ_SERVICE_WORKERS: usize = 8;
 
+/// How often the coordinator considers folding an idle WAL (#149). Coarse on
+/// purpose: the fold itself takes the exclusive checkpoint window, so probing
+/// it at `COORDINATOR_TICK` would contend with readers for no benefit.
+const IDLE_CHECKPOINT_PROBE: Duration = Duration::from_secs(2);
+
 /// How often the coordinator loop re-checks whether the on-disk binary has
 /// changed since this process started. Deliberately independent of
 /// `periodic_secs` (which can be 0 for the plain `infigraph daemon` -- see
@@ -520,6 +525,8 @@ where
     // daemon looks ready but answers no reads. The store is resolved per
     // request, so binding does not need it to exist yet.
     let mut held_prism = HeldPrism::new();
+    // #149's idle-WAL fold, on its own interval rather than every tick.
+    let mut last_idle_checkpoint = std::time::Instant::now();
 
     // The read service: bound here, alongside the write coordinator, and
     // torn down when this function returns (`ReadService` shuts down on
@@ -1236,6 +1243,25 @@ where
                 }
                 Err(e) => {
                     eprintln!("[watch] index operation busy ({e}), retrying next tick");
+                }
+            }
+        }
+
+        // #149: fold an idle WAL so NEW external readers can open the graph.
+        // `checkpoint_if_wal_large` rides `write_lock` and so only fires on
+        // the next write, which an idle daemon never performs -- that gap is
+        // the whole issue, and it left a 6.6MB WAL blocking every fresh
+        // read-only open for ~45 minutes on sittir. Rides this loop's tick
+        // like the other periodic checks, but on its own coarse interval:
+        // a checkpoint takes the exclusive window, so probing every 200ms
+        // would be pure contention. `checkpoint_if_idle` re-checks the WAL's
+        // mtime itself, so a busy graph is skipped rather than serialized.
+        if last_idle_checkpoint.elapsed() >= IDLE_CHECKPOINT_PROBE {
+            last_idle_checkpoint = std::time::Instant::now();
+            let idle_after = Duration::from_secs(crate::graph::store::checkpoint_idle_secs());
+            if !idle_after.is_zero() {
+                if let Some(store) = held_prism.as_ref().and_then(|p| p.graph_store()) {
+                    store.checkpoint_if_idle(idle_after);
                 }
             }
         }

@@ -55,6 +55,9 @@ pub use test_templates::{test_templates_for, TestTemplate};
 // capture, so per-field docs live on each accessor instead:
 // - growth_max_ratio: runaway-growth circuit breaker
 //   (`store_util::graph_growth_max_ratio`, #100)
+// - checkpoint_idle_secs: how long a WAL must sit unwritten before the
+//   daemon folds it into the base image, 0 disables
+//   (`GraphStore::checkpoint_if_idle`, #149)
 // - max_bytes: absolute ceiling on the live graph (+ its WAL), 0 disables
 //   (`store_util::graph_max_bytes`, #153). Unlike growth_max_ratio this is
 //   not relative to a baseline and applies even before one is recorded --
@@ -71,6 +74,7 @@ crate::settings! {
     graph {
         growth_max_ratio: u64 = 10,
         max_bytes: u64 = 8 * 1024 * 1024 * 1024,
+        checkpoint_idle_secs: u64 = 5,
         quarantine_max_bytes: u64 = 1024 * 1024 * 1024,
         slow_lock_ms: u64 = 2000,
         doc_hnsw_threshold: u64 = 200_000,

@@ -159,25 +159,21 @@ pub fn stamp_healthy_graph_size(infigraph_dir: &Path, graph_path: &Path) {
 /// on every write after that, the way the removed unconditional per-write
 /// stamp used to.
 pub(crate) fn stamp_healthy_graph_size_if_unset(infigraph_dir: &Path, graph_path: &Path) {
-    // Never bootstrap a baseline while data is still sitting in the WAL. The
-    // base image has not absorbed it yet, so it measures near-empty, and
-    // every later comparison is then against ~0 -- which makes ordinary
-    // growth read as runaway and refuses perfectly healthy writes.
+    // ca6cfde added a "skip while the WAL is non-empty" guard here, on the
+    // reasoning that a base image which has not absorbed the WAL measures
+    // near-empty and would anchor every later ratio against ~0. That is sound
+    // ONLY under `auto_checkpoint(false)`, where the graph file stays at
+    // schema size until an explicit fold -- and that config was reverted (see
+    // `Database::new`), because it hid committed data from every new
+    // read-only open.
     //
-    // This was invisible while Kuzu checkpointed on its own schedule, because
-    // the base image was never far behind. With `auto_checkpoint(false)` (the
-    // checkpoint-window lock, ladybug#666) it is exactly wrong: the graph file
-    // stays at schema size until the first explicit checkpoint. Skipping the
-    // stamp leaves no baseline, and `check_graph_growth_ratio` already passes
-    // when there is none -- strictly better than a baseline of zero.
-    let wal: u64 = crate::graph::store::wal_family_paths(graph_path)
-        .iter()
-        .filter_map(|p| std::fs::metadata(p).ok())
-        .map(|m| m.len())
-        .sum();
-    if wal > 0 {
-        return;
-    }
+    // With Kuzu checkpointing on its own schedule again the base image is
+    // never far behind, and the guard's cost is concrete: a WAL is routinely
+    // non-empty right after the first index, so the baseline never got
+    // bootstrapped at all -- caught by
+    // `ordinary_incremental_writes_do_not_move_the_growth_ratio_baseline`.
+    // A too-early baseline is also self-correcting, since a verified full
+    // rebuild re-stamps unconditionally; never having one is not.
     if read_healthy_size(infigraph_dir).is_none() {
         stamp_healthy_graph_size(infigraph_dir, graph_path);
     }
