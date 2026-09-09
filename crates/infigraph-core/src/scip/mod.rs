@@ -25,6 +25,30 @@ type NameCandidates = HashMap<(String, String), Vec<(u32, u32, String)>>;
 /// kind, file, start_line, end_line, docstring, scip_id.
 type NewSymbolRow = (String, String, String, String, u32, u32, String, String);
 
+/// Drop rows whose id already exists in the graph, in a single pass.
+///
+/// #153: the `COPY Symbol` retry loop drops exactly ONE id per failure,
+/// because Kuzu names one bad value per error. A batch holding N ids that
+/// already exist therefore costs N full re-COPYs of the entire batch --
+/// and each attempt commits durable data before its post-commit checkpoint
+/// fails, so every one of them grows the file. sittir reached 42GB
+/// (375x its baseline) through thirteen such re-COPYs of a 66k-symbol
+/// batch on 2026-09-09, filling the disk; the growth breaker did fire, but
+/// only between attempts, by which point tens of GB were already written.
+///
+/// The edge path has settled this in one pass since the sittir wedge
+/// (`store_util::prefilter_pairs_against_existing`). This is the node
+/// equivalent, and it costs nothing extra: the ids come from the symbol
+/// preload this import already performs.
+fn drop_ids_already_in_graph(
+    rows: Vec<NewSymbolRow>,
+    existing: &std::collections::HashSet<String>,
+) -> Vec<NewSymbolRow> {
+    rows.into_iter()
+        .filter(|(id, ..)| !existing.contains(id))
+        .collect()
+}
+
 /// True when `scip_sym` is a member (e.g. a parameter) of a symbol we
 /// already know about, per SCIP's own descriptor grammar: strip a single
 /// trailing `(...)` group and check whether what remains is a moniker
@@ -159,11 +183,16 @@ pub fn import_scip_index_enriched_at(
         conn.query(q)
             .context("SCIP import: failed to preload existing symbols")?
     };
+    // Every id already in the graph, gathered from the preload rows this
+    // import is reading anyway -- see `drop_ids_already_in_graph` (#153).
+    let mut existing_symbol_ids: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
     for row in rows {
         if row.len() < 5 {
             continue;
         }
         let sid = row[0].to_string().trim_matches('"').to_string();
+        existing_symbol_ids.insert(sid.clone());
         let sfile = row[1].to_string().trim_matches('"').to_string();
         let sname = row[2].to_string().trim_matches('"').to_string();
         let sstart: u32 = row[3].to_string().trim_matches('"').parse().unwrap_or(0);
@@ -424,6 +453,10 @@ pub fn import_scip_index_enriched_at(
     if !new_symbols.is_empty() {
         let sym_pq = staging_parquet("infigraph_scip_symbols");
 
+        // Collisions with rows already in the graph are removed up front, in
+        // one pass, rather than one-per-failed-COPY (#153) -- `seen_ids`
+        // still guards against a literal duplicate within this batch.
+        let new_symbols = drop_ids_already_in_graph(new_symbols, &existing_symbol_ids);
         let mut seen_ids = std::collections::HashSet::with_capacity(new_symbols.len());
         let mut remaining: Vec<_> = new_symbols
             .into_iter()
@@ -971,6 +1004,56 @@ impl std::fmt::Display for ImportStats {
             self.files_processed,
             self.files_skipped,
         )
+    }
+}
+
+#[cfg(test)]
+mod prefilter_tests {
+    use super::drop_ids_already_in_graph;
+
+    fn row(id: &str) -> super::NewSymbolRow {
+        (
+            id.to_string(),
+            "n".into(),
+            "function".into(),
+            "f.rs".into(),
+            1,
+            2,
+            String::new(),
+            String::new(),
+        )
+    }
+
+    /// #153's real mechanism, reproduced live on sittir 2026-09-09: the COPY
+    /// retry loop drops exactly ONE id per failure, because Kuzu names one
+    /// bad value per error. A batch holding N ids that already exist
+    /// therefore costs N full re-COPYs of the WHOLE batch, and each attempt
+    /// commits durable data before its checkpoint fails -- thirteen such
+    /// re-COPYs of a 66k-symbol batch took that graph to 42GB. The edge path
+    /// has settled this in one pass since the sittir wedge
+    /// (`prefilter_pairs_against_existing`); nodes must too.
+    #[test]
+    fn a_symbol_batch_is_prefiltered_against_ids_already_in_the_graph() {
+        let existing: std::collections::HashSet<String> =
+            ["a", "c"].iter().map(|s| s.to_string()).collect();
+        let kept =
+            drop_ids_already_in_graph(vec![row("a"), row("b"), row("c"), row("d")], &existing);
+
+        let ids: Vec<&str> = kept.iter().map(|(id, ..)| id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["b", "d"],
+            "every id already in the graph must be gone in ONE pass -- leaving even one \
+             costs a full re-COPY of the entire batch"
+        );
+    }
+
+    /// Nothing to drop must not disturb the batch.
+    #[test]
+    fn a_batch_with_no_collisions_is_untouched() {
+        let existing = std::collections::HashSet::new();
+        let kept = drop_ids_already_in_graph(vec![row("x"), row("y")], &existing);
+        assert_eq!(kept.len(), 2);
     }
 }
 

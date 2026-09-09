@@ -55,6 +55,11 @@ pub use test_templates::{test_templates_for, TestTemplate};
 // capture, so per-field docs live on each accessor instead:
 // - growth_max_ratio: runaway-growth circuit breaker
 //   (`store_util::graph_growth_max_ratio`, #100)
+// - max_bytes: absolute ceiling on the live graph (+ its WAL), 0 disables
+//   (`store_util::graph_max_bytes`, #153). Unlike growth_max_ratio this is
+//   not relative to a baseline and applies even before one is recorded --
+//   the ratio guard is only consulted between operations, so a single
+//   runaway operation can overshoot it by orders of magnitude.
 // - quarantine_max_bytes: corrupt-base-image byte cap, 0 disables
 //   (`quarantine::quarantine_max_bytes`, R7.3 / #100)
 // - slow_lock_ms: slow-acquire recording threshold
@@ -65,6 +70,7 @@ pub use test_templates::{test_templates_for, TestTemplate};
 crate::settings! {
     graph {
         growth_max_ratio: u64 = 10,
+        max_bytes: u64 = 8 * 1024 * 1024 * 1024,
         quarantine_max_bytes: u64 = 1024 * 1024 * 1024,
         slow_lock_ms: u64 = 2000,
         doc_hnsw_threshold: u64 = 200_000,

@@ -94,6 +94,7 @@ pub(crate) fn check_disk_headroom(dir: &Path, projected_write_bytes: u64) -> Res
 /// Kept for `check_graph_growth_ratio`'s user-facing "override with ..."
 /// hint; the value itself resolves through the `graph` settings group.
 const GRAPH_GROWTH_MAX_RATIO_ENV: &str = "INFIGRAPH_GRAPH_GROWTH_MAX_RATIO";
+const GRAPH_MAX_BYTES_ENV: &str = "INFIGRAPH_GRAPH_MAX_BYTES";
 
 /// Observed pathological incidents (github.com/pradeepmouli/infigraph#100)
 /// were 40-70x a healthy graph's size; the default 10x gives wide headroom
@@ -103,6 +104,12 @@ const GRAPH_GROWTH_MAX_RATIO_ENV: &str = "INFIGRAPH_GRAPH_GROWTH_MAX_RATIO";
 /// (`INFIGRAPH_GRAPH_GROWTH_MAX_RATIO`).
 fn graph_growth_max_ratio() -> u64 {
     crate::graph::Graph::resolve(crate::graph::RawGraph::default(), None).growth_max_ratio
+}
+
+/// Absolute ceiling on the live graph plus its WAL family; 0 disables it
+/// (`INFIGRAPH_GRAPH_MAX_BYTES`). See `check_graph_growth_ratio`.
+fn graph_max_bytes() -> u64 {
+    crate::graph::Graph::resolve(crate::graph::RawGraph::default(), None).max_bytes
 }
 
 fn graph_health_path(infigraph_dir: &Path) -> std::path::PathBuf {
@@ -172,9 +179,6 @@ pub(crate) fn check_graph_growth_ratio(
     infigraph_dir: &Path,
     graph_path: &Path,
 ) -> Result<(), String> {
-    let Some(healthy) = read_healthy_size(infigraph_dir) else {
-        return Ok(());
-    };
     let graph_size = std::fs::metadata(graph_path).map(|m| m.len()).unwrap_or(0);
     // The checkpointed `graph` file alone isn't the whole story -- a
     // sittir incident (2026-08-31) crashed with `graph.wal` grown to ~97GB
@@ -191,6 +195,30 @@ pub(crate) fn check_graph_growth_ratio(
         return Ok(()); // fresh/missing graph -- nothing to compare
     }
     let current = graph_size + wal_size;
+
+    // Absolute ceiling first (#153). The ratio guard below is relative to a
+    // recorded baseline AND is only consulted between operations, so a
+    // single runaway operation can blow past it by orders of magnitude
+    // before anything looks again -- sittir's SCIP import reached 42GB
+    // against a 107MB baseline and filled the disk, with the ratio breaker
+    // firing only after 20GB had been written. This bound is not relative
+    // to anything and deliberately applies even when no baseline exists.
+    let ceiling = graph_max_bytes();
+    if ceiling > 0 && current > ceiling {
+        return Err(format!(
+            "graph at {} is {} MB, past the absolute ceiling of {} MB -- refusing further \
+             growth (override with {GRAPH_MAX_BYTES_ENV}, 0 disables). ALL indexing is blocked \
+             until this is resolved -- run `infigraph index --full` to rebuild the graph \
+             compactly and re-stamp the baseline",
+            graph_path.display(),
+            current / (1024 * 1024),
+            ceiling / (1024 * 1024),
+        ));
+    }
+
+    let Some(healthy) = read_healthy_size(infigraph_dir) else {
+        return Ok(());
+    };
     let max_allowed = healthy.saturating_mul(graph_growth_max_ratio());
     if current > max_allowed {
         return Err(format!(
@@ -654,7 +682,8 @@ mod tests {
         check_disk_headroom, check_graph_growth_ratio, classify_file,
         copy_edges_with_bad_record_retry, extract_bad_copy_value, prefilter_pairs_against_existing,
         read_healthy_size, resolve_import_candidate, stamp_healthy_graph_size,
-        stamp_healthy_graph_size_if_unset, unwind_edges_from_pairs, MAX_BAD_RECORD_RETRIES,
+        stamp_healthy_graph_size_if_unset, unwind_edges_from_pairs, GRAPH_MAX_BYTES_ENV,
+        MAX_BAD_RECORD_RETRIES,
     };
 
     /// A store holding Symbol nodes `s0..s{n}` and nothing else.
@@ -845,6 +874,45 @@ mod tests {
             err.contains("index --full"),
             "the refusal must name the remedy that actually recovers the graph: {err}"
         );
+    }
+
+    /// #153, second guard: the ratio breaker is relative to a recorded
+    /// baseline and is only consulted BETWEEN operations, so a single
+    /// runaway operation can overshoot it by orders of magnitude before
+    /// anything looks again -- sittir reached 42GB against a 107MB baseline
+    /// on 2026-09-09 and filled the disk. An absolute ceiling bounds the
+    /// damage regardless of ratio, and unlike the ratio it must apply even
+    /// when no baseline has been recorded yet.
+    #[test]
+    fn an_absolute_ceiling_refuses_even_with_no_baseline_recorded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let graph_path = tmp.path().join("graph");
+        std::fs::write(&graph_path, vec![0u8; 4_000_000]).unwrap();
+        // No graph.health.json at all: the ratio check has nothing to say.
+        assert!(read_healthy_size(tmp.path()).is_none());
+
+        std::env::set_var(GRAPH_MAX_BYTES_ENV, "1000000");
+        let err = check_graph_growth_ratio(tmp.path(), &graph_path)
+            .expect_err("4MB must be refused against a 1MB absolute ceiling");
+        std::env::remove_var(GRAPH_MAX_BYTES_ENV);
+
+        assert!(
+            err.contains("absolute"),
+            "the refusal must say which guard tripped: {err}"
+        );
+    }
+
+    /// The ceiling is opt-outable, and 0 means disabled.
+    #[test]
+    fn an_absolute_ceiling_of_zero_is_disabled() {
+        let tmp = tempfile::tempdir().unwrap();
+        let graph_path = tmp.path().join("graph");
+        std::fs::write(&graph_path, vec![0u8; 4_000_000]).unwrap();
+
+        std::env::set_var(GRAPH_MAX_BYTES_ENV, "0");
+        let out = check_graph_growth_ratio(tmp.path(), &graph_path);
+        std::env::remove_var(GRAPH_MAX_BYTES_ENV);
+        assert!(out.is_ok(), "0 must disable the ceiling: {out:?}");
     }
 
     #[test]
