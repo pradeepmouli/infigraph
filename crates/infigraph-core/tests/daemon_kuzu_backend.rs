@@ -1,8 +1,26 @@
-use infigraph_core::graph::{DaemonKuzuBackend, GraphBackend};
+use infigraph_core::daemon::read_service::ReadService;
+use infigraph_core::graph::{DaemonKuzuBackend, GraphBackend, GraphStore};
 use infigraph_core::structured::SchemaMeta;
 use infigraph_core::Infigraph;
 use infigraph_languages::bundled_registry;
 use std::path::Path;
+use std::sync::Arc;
+
+/// Stands up the daemon's read service for `project_dir` -- the read-side
+/// counterpart of `spawn_one_request_server` below.
+///
+/// Since reads became daemon-routed, `DaemonKuzuBackend` sends every read
+/// over the local socket instead of opening the graph itself, so a test
+/// that reads through it has to supply the listener too; without one the
+/// read fails with "no daemon read service is listening for this project",
+/// which is the designed behaviour, not a defect. `INFIGRAPH_DIRECT_READS=1`
+/// is the documented escape hatch, but it has its own unit test and would
+/// bypass the very routing these tests exist to exercise.
+fn start_read_service(project_dir: &Path) -> ReadService {
+    let graph = project_dir.join(".infigraph").join("graph");
+    let store = Arc::new(GraphStore::open(&graph).unwrap());
+    ReadService::start(project_dir, store, 2).unwrap()
+}
 
 /// Spawns a background thread that watches `staging_dir` for the next
 /// `.request` file to appear and serves exactly one request against a
@@ -46,6 +64,7 @@ fn read_only_connection_rejects_write_statements() {
     infigraph.init().unwrap(); // opens direct Kuzu, creates the graph on disk
     drop(infigraph); // release the write connection so the read-only open below can succeed
 
+    let svc = start_read_service(project_dir.path());
     let dk = DaemonKuzuBackend::open(project_dir.path()).unwrap();
     let result = dk.raw_query("CREATE (n:Symbol {id: 'should-not-be-written'})");
 
@@ -65,6 +84,8 @@ fn read_only_connection_rejects_write_statements() {
         rows.is_empty(),
         "the rejected CREATE must not have partially applied"
     );
+
+    svc.shutdown();
 }
 
 #[test]
@@ -81,12 +102,15 @@ fn read_methods_pass_through_to_a_real_connection() {
     infigraph.index().unwrap();
     drop(infigraph);
 
+    let svc = start_read_service(project_dir.path());
     let dk = DaemonKuzuBackend::open(project_dir.path()).unwrap();
     let stats = dk.stats().unwrap();
     assert!(
         stats.symbols > 0,
         "expected real read access to the already-indexed graph"
     );
+
+    svc.shutdown();
 }
 
 #[test]
