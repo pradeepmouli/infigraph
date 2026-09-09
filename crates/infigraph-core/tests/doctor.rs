@@ -2,10 +2,10 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use infigraph_core::doctor::{
-    check_disk, check_locks, check_registry, check_scip_staleness, check_sidecars, check_toolchain,
-    check_wal_integrity, check_watchers, check_worktrees, find_repo_entry, format_report,
-    projects_in_scope, run_doctor, CheckResult, CheckStatus, DoctorContext, DoctorReport,
-    DoctorScope,
+    check_disk, check_growth_breaker, check_locks, check_registry, check_scip_staleness,
+    check_sidecars, check_toolchain, check_wal_integrity, check_watchers, check_worktrees,
+    find_repo_entry, format_report, projects_in_scope, run_doctor, CheckResult, CheckStatus,
+    DoctorContext, DoctorReport, DoctorScope,
 };
 // Only the Linux/macOS-gated tests below use these -- `check_graph_holders`
 // inspects /proc or lsof, neither of which exists on Windows.
@@ -1566,5 +1566,76 @@ fn check_graph_holders_passes_for_a_free_live_graph_and_names_a_held_one() {
         CheckStatus::Warn,
         "a non-infigraph holder is a finding: {}",
         lock.message
+    );
+}
+
+// ---------- Growth breaker (#153) ----------
+
+/// #153 defect 2: when the runaway-growth breaker latches, every write is
+/// refused, so indexing stops completely. The only trace was a line in
+/// `.infigraph/daemon.log`, which nobody reads -- the tool wedged silently
+/// for hours. `doctor` is where a user goes when something feels wrong, so
+/// a latched breaker has to be a FAIL there, not an absent check.
+#[test]
+fn doctor_fails_when_the_growth_breaker_is_latched() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let ig = dir.path().join(".infigraph");
+    std::fs::create_dir_all(&ig).unwrap();
+    std::fs::write(ig.join("graph"), vec![0u8; 20_000_000]).unwrap();
+    // Baseline 1MB against a 20MB graph: 20x, past the 10x default.
+    std::fs::write(
+        ig.join("graph.health.json"),
+        r#"{"healthy_size_bytes": 1000000}"#,
+    )
+    .unwrap();
+
+    let ctx = ctx_for(
+        DoctorScope::Project(dir.path().to_path_buf()),
+        Registry::default(),
+    );
+    let checks = check_growth_breaker(&ctx);
+
+    let latched = checks
+        .iter()
+        .find(|c| c.status == CheckStatus::Fail)
+        .expect("a latched growth breaker must be reported as FAIL");
+    assert!(
+        latched.message.contains("refusing"),
+        "the check should say writes are being refused: {}",
+        latched.message
+    );
+    assert!(
+        latched
+            .remediation
+            .as_deref()
+            .unwrap_or_default()
+            .contains("index --full"),
+        "the remediation must name the rebuild: {:?}",
+        latched.remediation
+    );
+}
+
+/// The companion case: a graph comfortably under the cap must not be
+/// reported as a problem.
+#[test]
+fn doctor_passes_when_the_graph_is_within_the_growth_cap() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let ig = dir.path().join(".infigraph");
+    std::fs::create_dir_all(&ig).unwrap();
+    std::fs::write(ig.join("graph"), vec![0u8; 3_000_000]).unwrap();
+    std::fs::write(
+        ig.join("graph.health.json"),
+        r#"{"healthy_size_bytes": 1000000}"#,
+    )
+    .unwrap();
+
+    let ctx = ctx_for(
+        DoctorScope::Project(dir.path().to_path_buf()),
+        Registry::default(),
+    );
+    let checks = check_growth_breaker(&ctx);
+    assert!(
+        checks.iter().all(|c| c.status == CheckStatus::Pass),
+        "3x growth is under the 10x cap: {checks:?}"
     );
 }

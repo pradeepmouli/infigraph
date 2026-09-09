@@ -97,6 +97,12 @@ impl GraphStore {
             })
             .collect();
 
+        // #153: same gap as the node COPYs in `upsert_all_parquet_conn` --
+        // these three run straight through `conn.query` rather than through
+        // the self-gating `copy_edges_with_bad_record_retry`, so nothing
+        // re-checked growth between them.
+        let mut gate = self.growth_gate(1);
+        gate.tick()?;
         let copy_ok = conn
             .query(&format!(
                 "COPY Folder FROM '{}'",
@@ -112,6 +118,7 @@ impl GraphStore {
                 .map(|(a, b)| (a.as_str(), b.as_str()))
                 .collect();
             parquet_loader::write_edge_parquet(&cf_pq, &cf_refs)?;
+            gate.tick()?;
             if let Err(e) = conn.query(&format!(
                 "COPY CONTAINS_FOLDER FROM '{}'",
                 fwd_slash_path(&cf_pq)
@@ -134,6 +141,7 @@ impl GraphStore {
                 .map(|(a, b)| (a.as_str(), b.as_str()))
                 .collect();
             parquet_loader::write_edge_parquet(&cfile_pq, &cfile_refs)?;
+            gate.tick()?;
             if let Err(e) = conn.query(&format!(
                 "COPY CONTAINS_FILE FROM '{}'",
                 fwd_slash_path(&cfile_pq)
@@ -501,11 +509,27 @@ impl GraphStore {
             ],
         )?;
 
-        // COPY FROM parquet -- node tables first
+        // COPY FROM parquet -- node tables first.
+        //
+        // #153: these four node COPYs are the last writes in this crate that
+        // ran with nothing re-checking growth between them. `kuzu_backend`'s
+        // preflight sees the graph exactly once, before the whole batch, and
+        // this is the branch it takes for every full reindex and every batch
+        // over 100 files -- so a single call could carry the graph far past
+        // the cap (21MB -> 18486MB on 2026-09-08) before anything looked
+        // again. The edge COPYs below already gate themselves inside
+        // `copy_edges_with_bad_record_retry`; that gate firing first is what
+        // made this look guarded while every node row had already landed --
+        // and, unlike the delete half in `kuzu_backend`, outside any
+        // transaction that could roll them back.
+        let mut gate = self.growth_gate(1);
+        gate.tick()?;
         conn.query(&format!("COPY Module FROM '{}'", fwd_slash_path(&mod_pq)))
             .map_err(|e| anyhow::anyhow!("COPY Module failed: {e}"))?;
+        gate.tick()?;
         conn.query(&format!("COPY File FROM '{}'", fwd_slash_path(&file_pq)))
             .map_err(|e| anyhow::anyhow!("COPY File failed: {e}"))?;
+        gate.tick()?;
         conn.query(&format!(
             "COPY Symbol (id, name, kind, file, start_line, end_line, signature_hash, language, visibility, parent, docstring, complexity, parameters, return_type, category, scip_id) FROM '{}'",
             fwd_slash_path(&sym_pq)
@@ -534,6 +558,7 @@ impl GraphStore {
                     Arc::new(StringArray::from(stmt_parents_sym)),
                 ],
             )?;
+            gate.tick()?;
             conn.query(&format!(
                 "COPY Statement FROM '{}'",
                 fwd_slash_path(&stmt_pq)

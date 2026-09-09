@@ -495,6 +495,46 @@ pub fn check_wal_integrity(ctx: &DoctorContext) -> Vec<CheckResult> {
         .collect()
 }
 
+const GROWTH_CATEGORY: &str = "graph growth";
+
+/// #153: once the runaway-growth breaker (#100) latches, every write path
+/// refuses, so indexing stops completely -- but the refusal only ever went
+/// to `.infigraph/daemon.log`. On 2026-09-08 this repo sat wedged with a
+/// 18486MB graph through 133 refused watcher drains; the only user-visible
+/// symptom was `search` saying results "may be stale". A latched breaker is
+/// a hard failure of the tool's core function, so it reports as `Fail`.
+///
+/// Observe-only, like every other check: this stats the graph and reads the
+/// recorded baseline, and opens nothing.
+pub fn check_one_growth_breaker(project_path: &Path) -> Option<CheckResult> {
+    let infigraph_dir = project_path.join(".infigraph");
+    let graph_path = infigraph_dir.join("graph");
+    if !graph_path.exists() {
+        return None; // nothing indexed here -- not this check's business
+    }
+    let label = format!("{}: graph growth breaker", project_path.display());
+    match crate::graph::store_util::check_graph_growth_ratio(&infigraph_dir, &graph_path) {
+        Ok(()) => Some(CheckResult::pass(
+            GROWTH_CATEGORY,
+            label,
+            "graph is within the growth cap",
+        )),
+        Err(msg) => Some(CheckResult::fail(
+            GROWTH_CATEGORY,
+            label,
+            format!("the growth breaker has latched and ALL indexing is blocked -- {msg}"),
+            "run `infigraph index --full` to rebuild the graph compactly and re-stamp the baseline",
+        )),
+    }
+}
+
+pub fn check_growth_breaker(ctx: &DoctorContext) -> Vec<CheckResult> {
+    projects_in_scope(ctx)
+        .iter()
+        .filter_map(|p| check_one_growth_breaker(p))
+        .collect()
+}
+
 const WATCHER_HEARTBEAT_STALE_SECS: u64 = 300;
 
 fn now_epoch_secs() -> u64 {
@@ -1221,6 +1261,7 @@ pub fn run_doctor(ctx: DoctorContext) -> DoctorReport {
     checks.extend(check_registry(&ctx));
     checks.extend(check_locks(&ctx));
     checks.extend(check_wal_integrity(&ctx));
+    checks.extend(check_growth_breaker(&ctx));
     checks.extend(check_graph_holders(&ctx));
     checks.extend(check_watchers(&ctx));
     checks.extend(check_instances(&ctx));

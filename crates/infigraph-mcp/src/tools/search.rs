@@ -606,6 +606,24 @@ fn staleness_banner(root: &std::path::Path) -> Option<String> {
     names.sort_unstable();
     let sample = names.iter().take(3).copied().collect::<Vec<_>>().join(", ");
     let more = if names.len() > 3 { ", ..." } else { "" };
+
+    // #153: distinguish "behind" from "blocked". Once the runaway-growth
+    // breaker latches, every write path refuses, so the watcher will never
+    // drain these -- promising that it will is the line that let this repo
+    // sit wedged for hours with no other user-visible symptom. Reuses
+    // doctor's own check rather than re-deriving the condition here.
+    if infigraph_core::doctor::check_one_growth_breaker(root)
+        .is_some_and(|c| c.status == infigraph_core::doctor::CheckStatus::Fail)
+    {
+        return Some(format!(
+            "⚠ indexing is BLOCKED -- {} file(s) changed since the last index ({sample}{more}), \
+             and the runaway-growth breaker is refusing every write, so the watcher cannot \
+             drain them. Run `infigraph index --full` to rebuild and unblock; `infigraph \
+             doctor` has the details.\n\n",
+            names.len()
+        ));
+    }
+
     Some(format!(
         "⚠ results may be stale -- {} file(s) changed since the last index ({sample}{more}); \
          the watcher drains these shortly, or run index_project to force it\n\n",
@@ -819,6 +837,41 @@ pub fn tool_semantic_search(args: &Value) -> Result<String> {
 #[cfg(test)]
 mod staleness_banner_tests {
     use super::staleness_banner;
+
+    /// #153 defect 2: a latched growth breaker means the watcher will never
+    /// drain -- indexing is refused outright, not merely behind. Telling the
+    /// caller "the watcher drains these shortly" is then actively wrong, and
+    /// it was the only user-visible symptom while this repo sat wedged for
+    /// hours on 2026-09-08.
+    #[test]
+    fn a_latched_growth_breaker_says_blocked_not_merely_stale() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ig = tmp.path().join(".infigraph");
+        std::fs::create_dir_all(&ig).unwrap();
+        infigraph_core::dirty::mark_dirty(&ig, &["a.py".to_string()]).unwrap();
+
+        // 20MB graph against a 1MB baseline: 20x, past the 10x default.
+        std::fs::write(ig.join("graph"), vec![0u8; 20_000_000]).unwrap();
+        std::fs::write(
+            ig.join("graph.health.json"),
+            r#"{"healthy_size_bytes": 1000000}"#,
+        )
+        .unwrap();
+
+        let banner = staleness_banner(tmp.path()).expect("dirty files must still yield a banner");
+        assert!(
+            banner.to_lowercase().contains("blocked"),
+            "must say indexing is blocked, not just stale: {banner}"
+        );
+        assert!(
+            banner.contains("index --full"),
+            "must name the remedy that unblocks it: {banner}"
+        );
+        assert!(
+            !banner.contains("drains these shortly"),
+            "must not promise a drain that cannot happen: {banner}"
+        );
+    }
 
     #[test]
     fn empty_or_absent_dirty_set_yields_no_banner() {

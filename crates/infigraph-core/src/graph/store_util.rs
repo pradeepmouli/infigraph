@@ -197,8 +197,10 @@ pub(crate) fn check_graph_growth_ratio(
             "graph at {} is {} MB ({} MB graph + {} MB WAL), {}x its recorded healthy size \
              ({} MB) -- refusing further growth (cap: {}x, override with \
              {GRAPH_GROWTH_MAX_RATIO_ENV}); this guards against the runaway-WAL-growth pattern \
-             from github.com/pradeepmouli/infigraph#100 -- if this growth is legitimate, delete \
-             {} to reset the baseline",
+             from github.com/pradeepmouli/infigraph#100. ALL indexing is blocked until this is \
+             resolved -- run `infigraph index --full` to rebuild the graph compactly and \
+             re-stamp the baseline, or, if this growth is legitimate, delete {} to reset the \
+             baseline without rebuilding",
             graph_path.display(),
             current / (1024 * 1024),
             graph_size / (1024 * 1024),
@@ -823,6 +825,26 @@ mod tests {
         let err = check_graph_growth_ratio(tmp.path(), &graph_path)
             .expect_err("20x growth over a 1MB baseline must be refused at the 10x default");
         assert!(err.contains("healthy size"), "unexpected message: {err}");
+    }
+
+    /// #153 defect 2: when the breaker latches, indexing stops entirely, so
+    /// the refusal is the one place a user is guaranteed to see. It named
+    /// only "delete the baseline file", which resets the guard without
+    /// fixing the graph. `index --full` rebuilds compactly and re-stamps the
+    /// baseline -- on the 2026-09-08 incident it took 18486MB back to 23MB.
+    #[test]
+    fn growth_refusal_names_the_rebuild_remedy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let graph_path = tmp.path().join("graph");
+        std::fs::write(&graph_path, vec![0u8; 1_000_000]).unwrap();
+        stamp_healthy_graph_size(tmp.path(), &graph_path);
+
+        std::fs::write(&graph_path, vec![0u8; 20_000_000]).unwrap();
+        let err = check_graph_growth_ratio(tmp.path(), &graph_path).expect_err("must refuse");
+        assert!(
+            err.contains("index --full"),
+            "the refusal must name the remedy that actually recovers the graph: {err}"
+        );
     }
 
     #[test]

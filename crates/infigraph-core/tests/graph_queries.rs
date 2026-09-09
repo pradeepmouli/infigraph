@@ -1011,6 +1011,104 @@ fn test_upsert_folders_bulk() {
     assert!(ids.iter().any(|id| id.contains("tests")));
 }
 
+// ---------- Growth breaker: the bulk Parquet path (#153) ----------
+
+/// Force a deliberately tiny recorded baseline, so any real graph file is
+/// already far past the breaker's 10x cap. Mirrors what
+/// `stamp_healthy_graph_size` writes, without needing a real healthy graph.
+fn force_tiny_baseline(dir: &std::path::Path) {
+    std::fs::write(
+        dir.join("graph.health.json"),
+        r#"{"healthy_size_bytes": 1024}"#,
+    )
+    .unwrap();
+}
+
+/// A batch that collides with nothing already in the fixture graph, so a
+/// second bulk write fails (or not) on the growth check alone.
+fn fresh_extraction(tag: &str) -> Vec<FileExtraction> {
+    let file = format!("src/{tag}.py");
+    let id = format!("{file}::{tag}");
+    vec![FileExtraction {
+        file: file.clone(),
+        language: "python".to_string(),
+        content_hash: tag.to_string(),
+        symbols: vec![sym(&id, tag, SymbolKind::Function, &file, 1, 3)],
+        relations: vec![],
+        statements: vec![],
+    }]
+}
+
+/// #153: `upsert_all_parquet_conn` is the "backend bulk" write -- the branch
+/// `kuzu_backend`'s `use_csv` takes for every full reindex and every batch
+/// over 100 files. #132 gap 1 put a `GrowthGate` in the *other* branch (the
+/// per-file UNWIND loop), the SCIP loops and the edge-COPY retry loop, and
+/// missed this one, which does the largest writes of the four. With only the
+/// caller's once-per-call preflight guarding it, a single call ran its node
+/// COPYs unchecked; the 2026-09-08 incident went 21MB -> 18486MB inside one
+/// such stretch, with the recorded baseline still reading 21MB afterwards.
+#[test]
+fn bulk_parquet_write_rechecks_growth_during_the_call() {
+    let tg = TestGraph::new();
+    let extractions = fixture_extractions();
+
+    // A first write with no baseline recorded yet: nothing to compare
+    // against, so this must succeed and leave a real graph on disk.
+    tg.store.upsert_all_parquet(&extractions).unwrap();
+
+    force_tiny_baseline(tg.store.db_dir().unwrap());
+
+    // A *different* batch: `upsert_all_parquet` has no delete step of its
+    // own (its caller does the deleting), so re-COPYing the same rows would
+    // fail on duplicate primary keys long before the growth check and prove
+    // nothing about the gate.
+    let err = tg
+        .store
+        .upsert_all_parquet(&fresh_extraction("widget"))
+        .expect_err("the bulk parquet write must re-check growth itself, not trust its caller");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("refusing to index"),
+        "expected the growth breaker's refusal, got: {msg}"
+    );
+
+    // The refusal has to come *before* the node COPYs, not after them. The
+    // edge COPYs already route through the gated
+    // `copy_edges_with_bad_record_retry`, so an ungated node half still
+    // surfaces a refusal from further down the call -- having already
+    // written every Module/File/Symbol/Statement row of the batch, and
+    // (unlike the delete half in `kuzu_backend`) outside any transaction
+    // that could roll them back. Assert on what actually landed.
+    let conn = tg.store.connection().unwrap();
+    let q = GraphQuery::new(&conn);
+    let rows = q
+        .raw_query("MATCH (s:Symbol) WHERE s.file = 'src/widget.py' RETURN s.id")
+        .unwrap();
+    assert!(
+        rows.is_empty(),
+        "a refused bulk write must not have already COPYed its node rows, found: {rows:?}"
+    );
+}
+
+/// Companion: the folder half of the bulk path runs its own three COPYs and
+/// is reachable directly (`upsert_folders_bulk`), so it needs the same gate.
+#[test]
+fn bulk_folder_write_rechecks_growth_during_the_call() {
+    let tg = TestGraph::new();
+    tg.store.upsert_all_parquet(&fixture_extractions()).unwrap();
+
+    force_tiny_baseline(tg.store.db_dir().unwrap());
+
+    let err = tg
+        .store
+        .upsert_folders_bulk(&["src/main.py", "tests/test_main.py"])
+        .expect_err("the bulk folder write must re-check growth itself");
+    assert!(
+        err.to_string().contains("refusing to index"),
+        "expected the growth breaker's refusal, got: {err}"
+    );
+}
+
 // ---------- Custom edge support ----------
 
 #[test]
