@@ -2182,7 +2182,33 @@ fn finish_full_reindex(
 
     // The swap succeeded -- verify the new graph actually opens before
     // declaring success and discarding the ability to roll back.
-    match watch_db(root, registry, held) {
+    let mut reopened = watch_db(root, registry, held);
+    // #148: a single failed open in a single process is not a corruption
+    // verdict. Examine the image out of process first; if it is fine (or
+    // was made fine by setting a torn WAL aside) the reopen gets one more
+    // try, and only a genuinely unopenable image is quarantined.
+    let mut swap_reopen = None;
+    if reopened.is_err() {
+        let outcome = recover_or_quarantine_swapped_in_graph(
+            &infigraph_dir,
+            LIVE_NAME,
+            &live_path,
+            &retired_path,
+        );
+        if matches!(outcome, SwapReopen::GraphIsHealthy) {
+            // Worth a line even when the retry then succeeds: on the
+            // `Recovered` verdict a torn WAL was just filed aside, and an
+            // operator reading `FullReindexOk` alone would never know.
+            eprintln!(
+                "[daemon] full-reindex: the swapped-in graph opens in a fresh probe process, \
+                 so the failed reopen was not its fault -- retrying rather than quarantining a \
+                 healthy graph (#148)"
+            );
+            reopened = watch_db(root, registry, held);
+        }
+        swap_reopen = Some(outcome);
+    }
+    match reopened {
         Ok(prism) => {
             // R3.1.4d/#100: this is a *verified* healthy checkpoint -- the
             // swap succeeded and the swapped-in graph just reopened -- so
@@ -2211,35 +2237,35 @@ fn finish_full_reindex(
             (Some(guard), Some(detected_languages))
         }
         Err(reopen_err) => {
-            // The swapped-in graph doesn't even reopen. Quarantine it as
-            // verified-bad (R3.1.2) and roll the prior live graph back into
-            // place rather than leaving a broken graph live or the project
-            // graph-less. Re-acquire graph_lock just for these renames (no
-            // GraphStore::open happens here, so no deadlock risk against
-            // the lock dropped above) -- otherwise a concurrent single-file
-            // write could race the rollback, the same class of gap
-            // `full_reindex_wipe` closes on the local path.
-            let rollback_note = match crate::lockfile::acquire(
-                &live_path.with_extension("lock"),
-                "full-reindex-rollback",
-                std::time::Duration::from_secs(5),
-            ) {
-                Ok(_lock) => {
-                    let _ = crate::quarantine::quarantine_graph(&infigraph_dir, LIVE_NAME);
-                    roll_back_to_retired(&live_path, &retired_path)
-                }
-                Err(e) => format!(
-                    "could not acquire the graph lock to roll back: {e:#} -- manual recovery needed"
+            // Say what actually happened to the graph, per verdict. The
+            // old wording announced a quarantine unconditionally, which
+            // was already untrue on the lock-failure path and is untrue
+            // for every healthy image now that one is possible.
+            let disposition = match swap_reopen {
+                Some(SwapReopen::Quarantined { rollback_note }) => format!(
+                    "the graph opens neither with its WAL nor without it, so it was \
+                     quarantined as corruption evidence; {rollback_note}"
                 ),
+                Some(SwapReopen::GraphIsHealthy) => format!(
+                    "a fresh probe process opened AND scanned the swapped-in graph at {} \
+                     successfully -- it is not corrupt, and it is still live. Something \
+                     transient outlasted two reopen attempts here; refusing to quarantine a \
+                     healthy graph. Retry the reindex, or restart the daemon.",
+                    live_path.display()
+                ),
+                Some(SwapReopen::Undecided { note }) => note,
+                // Unreachable: `swap_reopen` is set on every path that can
+                // leave `reopened` an Err.
+                None => "no verdict was reached".to_string(),
             };
             eprintln!(
                 "[daemon] full-reindex: swapped-in graph failed to reopen: {reopen_err:#} -- \
-                 quarantined it; {rollback_note}"
+                 {disposition}"
             );
             let result = crate::daemon_protocol::WriteResult::Err {
                 message: format!(
                     "full reindex swap completed but the new graph failed to reopen: \
-                     {reopen_err:#}. The broken graph was quarantined; {rollback_note}"
+                     {reopen_err:#}. {disposition}"
                 ),
             };
             if let Ok(json) = serde_json::to_string(&result) {
@@ -2247,6 +2273,92 @@ fn finish_full_reindex(
             }
             (Some(guard), None)
         }
+    }
+}
+
+/// What became of a graph the daemon swapped in but could not reopen.
+#[derive(Debug)]
+enum SwapReopen {
+    /// A fresh process opens the graph, so our own reopen failed for a
+    /// reason that had nothing to do with the image. Nothing was moved
+    /// aside and the rebuilt graph is still live; the caller should try
+    /// reopening once more (#148).
+    GraphIsHealthy,
+    /// The graph opens neither with its WAL nor without it. It has been
+    /// filed as corruption evidence and the prior live graph rolled back
+    /// into place; the note describes how that rollback went.
+    Quarantined { rollback_note: String },
+    /// The lock guarding those renames could not be taken, so no verdict
+    /// was reached and nothing was moved aside.
+    Undecided { note: String },
+}
+
+/// `finish_full_reindex` swapped a freshly built graph in and then could not
+/// reopen it. Decide what that means for the image and act on it: quarantine
+/// it as verified-bad (R3.1.2) and roll the prior live graph back into place
+/// rather than leaving a broken graph live or the project graph-less.
+///
+/// Takes `graph.lock` itself for those renames -- no `GraphStore::open`
+/// happens here, so there is no deadlock risk against the lock
+/// `finish_full_reindex` dropped before reopening. Without it a concurrent
+/// single-file write could race the rollback, the same class of gap
+/// `full_reindex_wipe` closes on the local path.
+fn recover_or_quarantine_swapped_in_graph(
+    infigraph_dir: &Path,
+    graph_name: &str,
+    live_path: &Path,
+    retired_path: &Option<PathBuf>,
+) -> SwapReopen {
+    recover_or_quarantine_swapped_in_graph_with(
+        infigraph_dir,
+        graph_name,
+        live_path,
+        retired_path,
+        crate::probe::graph_opens,
+    )
+}
+
+/// [`recover_or_quarantine_swapped_in_graph`] with the health probe
+/// injected. A test binary must never reach the real probe: `current_exe()`
+/// there is libtest's harness, which re-runs the whole suite instead of
+/// probing (see [`crate::probe`]).
+fn recover_or_quarantine_swapped_in_graph_with(
+    infigraph_dir: &Path,
+    graph_name: &str,
+    live_path: &Path,
+    retired_path: &Option<PathBuf>,
+    probe: impl Fn(&Path) -> bool,
+) -> SwapReopen {
+    match crate::lockfile::acquire(
+        &live_path.with_extension("lock"),
+        "full-reindex-rollback",
+        std::time::Duration::from_secs(5),
+    ) {
+        Ok(_lock) => {
+            // Ask the same question the other two quarantine sites ask,
+            // through the same verdict type, rather than inferring
+            // corruption from the one open that happened to fail here.
+            // Only `NotRecoverable` permits a quarantine; the other two
+            // outcomes mean the image is fine and the caller may retry.
+            let verdict = crate::quarantine::try_recover_by_setting_wal_aside_with(
+                infigraph_dir,
+                graph_name,
+                probe,
+            );
+            if verdict.is_usable() {
+                return SwapReopen::GraphIsHealthy;
+            }
+            debug_assert!(verdict.permits_quarantine());
+            let _ = crate::quarantine::quarantine_graph(infigraph_dir, graph_name);
+            SwapReopen::Quarantined {
+                rollback_note: roll_back_to_retired(live_path, retired_path),
+            }
+        }
+        Err(e) => SwapReopen::Undecided {
+            note: format!(
+                "could not acquire the graph lock to roll back: {e:#} -- manual recovery needed"
+            ),
+        },
     }
 }
 
@@ -3113,5 +3225,101 @@ mod root_identity_tests {
         assert!(!root_is_gone(&root, None));
         std::fs::remove_dir_all(&root).unwrap();
         assert!(root_is_gone(&root, None));
+    }
+}
+
+/// #148: the full-reindex swap is the last quarantine site that used to
+/// infer a corruption verdict from a single failed open in a single process
+/// -- the defect class fixed for the read path in 5818aa1 and for
+/// `Infigraph::init` in d511a0b. The probe is injected here for the reason
+/// [`crate::probe`] documents: in a test binary `current_exe()` is libtest's
+/// harness, so the real probe re-runs the whole suite instead of probing.
+#[cfg(test)]
+mod swapped_in_graph_reopen_tests {
+    use super::*;
+
+    /// `.infigraph/` holding a freshly swapped-in `graph` and the prior live
+    /// graph already retired to the `previous` pool -- the exact on-disk
+    /// state `finish_full_reindex` is in when its reopen fails.
+    fn after_a_swap() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let infigraph_dir = dir.path().join(".infigraph");
+        std::fs::create_dir_all(&infigraph_dir).unwrap();
+        let live = infigraph_dir.join("graph");
+        std::fs::write(&live, b"the freshly rebuilt graph").unwrap();
+        let retired = infigraph_dir.join("graph.previous.1");
+        std::fs::write(&retired, b"the stale prior graph").unwrap();
+        (dir, infigraph_dir, live, retired)
+    }
+
+    fn corrupt_pool_entries(infigraph_dir: &Path) -> Vec<String> {
+        std::fs::read_dir(infigraph_dir)
+            .unwrap()
+            .filter_map(|e| Some(e.ok()?.file_name().to_string_lossy().into_owned()))
+            .filter(|n| n.starts_with("graph.corrupt."))
+            .collect()
+    }
+
+    #[test]
+    fn a_swapped_in_graph_a_fresh_process_can_open_is_not_quarantined() {
+        let (_dir, infigraph_dir, live, retired) = after_a_swap();
+
+        let outcome = recover_or_quarantine_swapped_in_graph_with(
+            &infigraph_dir,
+            "graph",
+            &live,
+            &Some(retired.clone()),
+            |_| true,
+        );
+
+        assert!(
+            matches!(outcome, SwapReopen::GraphIsHealthy),
+            "a graph a fresh process opens is not why our own reopen failed, got {outcome:?}"
+        );
+        assert_eq!(
+            std::fs::read(&live).unwrap(),
+            b"the freshly rebuilt graph",
+            "the rebuild must still be live -- it was never shown to be bad"
+        );
+        assert!(
+            corrupt_pool_entries(&infigraph_dir).is_empty(),
+            "a healthy graph must never be filed as corruption evidence"
+        );
+        assert!(
+            retired.exists(),
+            "the rollback candidate must be left where it is"
+        );
+    }
+
+    #[test]
+    fn a_swapped_in_graph_no_process_can_open_is_quarantined_and_rolled_back() {
+        let (_dir, infigraph_dir, live, retired) = after_a_swap();
+
+        let outcome = recover_or_quarantine_swapped_in_graph_with(
+            &infigraph_dir,
+            "graph",
+            &live,
+            &Some(retired.clone()),
+            |_| false,
+        );
+
+        match outcome {
+            SwapReopen::Quarantined { rollback_note } => assert!(
+                rollback_note.contains("restored"),
+                "unexpected rollback note: {rollback_note}"
+            ),
+            other => panic!("expected a quarantine verdict, got {other:?}"),
+        }
+        assert_eq!(
+            corrupt_pool_entries(&infigraph_dir).len(),
+            1,
+            "the unopenable graph belongs in the corruption-evidence pool"
+        );
+        assert!(!retired.exists(), "the retired graph was rolled back");
+        assert_eq!(
+            std::fs::read(&live).unwrap(),
+            b"the stale prior graph",
+            "the prior live graph is back in place"
+        );
     }
 }
