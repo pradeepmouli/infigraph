@@ -457,7 +457,10 @@ pub(crate) fn cmd_index(root: &Path, full: bool, no_embed: bool) -> Result<()> {
     drop(op_guard);
 
     // SCIP enrichment in a detached child process — parent returns immediately.
-    spawn_scip_child_process(root, &detected_languages);
+    // A full reindex is not really finished until its enrichment is: pass
+    // the same `full && !remote` condition that gated the stamp above, so
+    // the child re-stamps once the enriched graph is the real one.
+    spawn_scip_child_process(root, &detected_languages, full && !remote);
 
     if let Err(e) = infigraph_core::claude_md::ensure_project_claude_md(root) {
         eprintln!("warning: failed to update project CLAUDE.md: {e}");
@@ -551,7 +554,11 @@ fn format_timestamp(epoch_secs: u64) -> String {
         .unwrap_or_else(|| format!("epoch {epoch_secs}"))
 }
 
-fn spawn_scip_child_process(root: &Path, detected_languages: &std::collections::HashSet<String>) {
+fn spawn_scip_child_process(
+    root: &Path,
+    detected_languages: &std::collections::HashSet<String>,
+    restamp_baseline: bool,
+) {
     use crate::scip_download;
 
     let indexers = scip_download::indexers_for_languages(detected_languages);
@@ -584,7 +591,7 @@ fn spawn_scip_child_process(root: &Path, detected_languages: &std::collections::
     };
 
     match std::process::Command::new(exe)
-        .args(scip_enrich_args(&langs))
+        .args(scip_enrich_args(&langs, restamp_baseline))
         .current_dir(root)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -617,8 +624,12 @@ fn spawn_scip_child_process(root: &Path, detected_languages: &std::collections::
 /// `languages` is a positional argument on `Commands::ScipEnrich`, not a
 /// flag — extracted so tests can assert these parse under that definition
 /// without spawning a process.
-fn scip_enrich_args(langs: &str) -> Vec<String> {
-    vec!["scip-enrich".to_string(), langs.to_string()]
+fn scip_enrich_args(langs: &str, restamp_baseline: bool) -> Vec<String> {
+    let mut args = vec!["scip-enrich".to_string(), langs.to_string()];
+    if restamp_baseline {
+        args.push("--restamp-baseline".to_string());
+    }
+    args
 }
 
 /// Decides what (if anything) to warn about after waiting on the detached
@@ -894,7 +905,11 @@ pub(crate) fn run_scip_indexer(
 }
 
 /// Entry point for the hidden `scip-enrich` subcommand (spawned by `index`).
-pub(crate) fn cmd_scip_enrich(root: &Path, detected_languages: &std::collections::HashSet<String>) {
+pub(crate) fn cmd_scip_enrich(
+    root: &Path,
+    detected_languages: &std::collections::HashSet<String>,
+    restamp_baseline: bool,
+) {
     // Same deadlock as `cmd_index` (see its comment): under the daemon
     // backend, `import_scip_index` routes the `ScipImport` write to the
     // daemon, which needs this very `.infigraph/index.lock` to serve it.
@@ -919,6 +934,20 @@ pub(crate) fn cmd_scip_enrich(root: &Path, detected_languages: &std::collections
         }
     };
     auto_scip_background(root, detected_languages);
+
+    // `cmd_index` stamps the growth-ratio baseline immediately after the
+    // rebuild, which is before this enrichment has run -- so the recorded
+    // "healthy" size describes a graph missing everything SCIP adds. sittir
+    // stamped 61MB and then reached 140MB on enrichment alone, permanently
+    // spending ~2.2x of its 10x headroom on entirely expected growth. Only a
+    // full reindex sets this flag, so this stays within
+    // `stamp_healthy_graph_size`'s contract (after a verified full rebuild,
+    // never after an ordinary incremental write) -- a full rebuild simply is
+    // not complete until its enrichment is.
+    if restamp_baseline {
+        let dir = root.join(".infigraph");
+        infigraph_core::graph::stamp_healthy_graph_size(&dir, &dir.join("graph"));
+    }
 }
 
 /// Part A of SCIP enrichment: find indexers for `detected_languages`,
@@ -1600,14 +1629,42 @@ mod tests {
 
         let langs = "typescript,python";
         let mut argv = vec!["infigraph".to_string()];
-        argv.extend(scip_enrich_args(langs));
+        argv.extend(scip_enrich_args(langs, false));
 
         let cli = crate::Cli::try_parse_from(&argv)
             .expect("scip_enrich_args must parse under the ScipEnrich clap definition");
 
         assert!(
-            matches!(&cli.command, crate::Commands::ScipEnrich { languages } if languages == langs),
-            "expected Commands::ScipEnrich {{ languages: {langs:?} }}"
+            matches!(&cli.command, crate::Commands::ScipEnrich { languages, restamp_baseline: false } if languages == langs),
+            "expected Commands::ScipEnrich {{ languages: {langs:?}, restamp_baseline: false }}"
+        );
+    }
+
+    /// The growth-ratio baseline is stamped by `cmd_index` right after the
+    /// rebuild, but SCIP enrichment runs afterwards in a detached child and
+    /// adds a large, entirely legitimate chunk of the graph. sittir stamped
+    /// 61MB and then grew to 140MB on enrichment alone, permanently spending
+    /// ~2.2x of its 10x headroom on growth that is expected. The decision to
+    /// re-stamp has to reach that detached child, so it travels in its argv.
+    #[test]
+    fn scip_enrich_args_carry_the_restamp_decision_to_the_detached_child() {
+        use clap::Parser;
+
+        let mut argv = vec!["infigraph".to_string()];
+        argv.extend(scip_enrich_args("rust", true));
+
+        let cli = crate::Cli::try_parse_from(&argv)
+            .expect("the restamp form must parse under the ScipEnrich clap definition");
+
+        assert!(
+            matches!(
+                &cli.command,
+                crate::Commands::ScipEnrich {
+                    restamp_baseline: true,
+                    ..
+                }
+            ),
+            "a full reindex's enrichment must tell the child to re-stamp the baseline"
         );
     }
 

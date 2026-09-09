@@ -435,6 +435,57 @@ pub fn prune_stale_daemon(lock_path: &Path, installed_build_hash: Option<&str>) 
     wait_for_pid_exit(spid, &mut sys, ATTEMPTS, DELAY)
 }
 
+/// Confirm a daemon that was asked to stop is *really* gone: the lock must
+/// be free AND the process that held it must have left the process table.
+///
+/// [`daemon_is_alive`] alone is not enough. A daemon releases `watch.lock`
+/// while it is still draining in-flight work and closing the graph, so a
+/// caller polling only the lock can spawn a replacement while the old
+/// process still has the graph open read-write -- two writers on one graph,
+/// and the orphan is invisible to `infigraph ps`, which enumerates lock
+/// holders and so cannot see a process that has already let go of one.
+/// Observed on sittir (2026-09-08): a `daemon-restart` landing while the old
+/// daemon was importing SCIP results left it alive holding `graph` and
+/// `docs.kuzu`, and the replacement logged `init error: ... locked by PID
+/// <orphan>` on every document change until the orphan was killed by hand.
+///
+/// `holder_pid` must be read from the lock *before* the stop request is
+/// sent -- by the time this matters the payload naming it is already gone.
+/// `None` means the caller could not determine a holder, in which case a
+/// free lock is the only available evidence.
+pub fn confirm_daemon_exited(
+    lock_path: &Path,
+    holder_pid: Option<u32>,
+    budget: std::time::Duration,
+) -> bool {
+    const DELAY: std::time::Duration = std::time::Duration::from_millis(100);
+    let attempts = (budget.as_millis() / DELAY.as_millis()).max(1) as u32;
+
+    // The lock half first: it is the cheap check, and until it clears the
+    // holder has not even begun releasing.
+    let mut lock_free = false;
+    for _ in 0..attempts {
+        if !daemon_is_alive(lock_path) {
+            lock_free = true;
+            break;
+        }
+        std::thread::sleep(DELAY);
+    }
+    if !lock_free {
+        return false;
+    }
+
+    // Then the process half, via the same helper `prune_stale_daemon` uses
+    // after its own SIGTERM -- one definition of "wait for a pid to go".
+    match holder_pid {
+        None => true,
+        Some(pid) => {
+            let mut sys = sysinfo::System::new();
+            wait_for_pid_exit(sysinfo::Pid::from_u32(pid), &mut sys, attempts, DELAY)
+        }
+    }
+}
+
 /// Poll `sys` for `pid` up to `attempts` times, `delay` apart. Returns
 /// `true` as soon as the PID is no longer found running, `false` if it's
 /// still alive after the last attempt. Split out from [`prune_stale_daemon`]
@@ -571,6 +622,7 @@ mod tests {
     use super::{daemon_is_alive, holder_is_stale_build, prune_stale_daemon};
     // Only the `cfg(unix)` tests below call this.
     #[cfg(unix)]
+    use super::confirm_daemon_exited;
     use super::wait_for_pid_exit;
     use crate::lockfile::LockInfo;
 
@@ -731,6 +783,62 @@ mod tests {
         assert!(
             !prune_stale_daemon(&lock_path, Some(crate::build_hash())),
             "a live PID whose process name doesn't look like infigraph must not be pruned/signaled"
+        );
+    }
+
+    /// The daemon-restart orphan (observed on sittir, 2026-09-08):
+    /// `cmd_daemon_restart` confirmed the old daemon was gone by polling
+    /// `daemon_is_alive(&lock_path)` -- a check on the LOCK, not on the
+    /// process. A stopping daemon releases `watch.lock` while it is still
+    /// draining in-flight work and closing the graph, so that wait returned
+    /// early and a replacement was spawned while the old process still had
+    /// the graph open read-write. The orphan was invisible to `infigraph
+    /// ps` (which enumerates lock holders) and blocked every doc reindex
+    /// behind it. A free lock must never be accepted as proof on its own.
+    #[test]
+    #[cfg(unix)]
+    fn confirm_daemon_exited_is_false_while_the_recorded_holder_still_runs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lock_path = tmp.path().join("watch.lock");
+        std::fs::write(&lock_path, b"").unwrap();
+
+        let mut child = std::process::Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .unwrap();
+        assert!(
+            !daemon_is_alive(&lock_path),
+            "precondition: the lock itself must look free, as it does mid-shutdown"
+        );
+
+        assert!(
+            !confirm_daemon_exited(
+                &lock_path,
+                Some(child.id()),
+                std::time::Duration::from_millis(300)
+            ),
+            "a free lock must not be accepted as proof the holder process has exited"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// The ordinary case: lock free and the holder really gone.
+    #[test]
+    #[cfg(unix)]
+    fn confirm_daemon_exited_is_true_once_the_holder_is_gone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lock_path = tmp.path().join("watch.lock");
+        std::fs::write(&lock_path, b"").unwrap();
+
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+
+        assert!(
+            confirm_daemon_exited(&lock_path, Some(pid), std::time::Duration::from_secs(3)),
+            "a free lock plus an exited holder is a confirmed shutdown"
         );
     }
 

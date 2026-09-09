@@ -799,6 +799,9 @@ pub(crate) fn cmd_daemon_restart(root: &Path) -> Result<()> {
     // there is nothing to stop-and-wait-for, so skip straight to spawning.
     let lock_path = root.join(".infigraph").join("watch.lock");
     if infigraph_core::daemon::lifecycle::daemon_is_alive(&lock_path) {
+        // Read the holder BEFORE asking it to stop: the lock payload naming
+        // it is gone by the time we need it to confirm the exit.
+        let holder_pid = infigraph_core::lockfile::read_holder(&lock_path).map(|h| h.pid);
         let registry = bundled_registry()?;
         let prism = Infigraph::open(root, registry)?;
         // `WatchRole::Daemon`'s `Restart` action (per Task 10's
@@ -812,15 +815,31 @@ pub(crate) fn cmd_daemon_restart(root: &Path) -> Result<()> {
             WATCH_CONTROL_TIMEOUT,
         )?;
 
-        // Wait for the process to actually exit before respawning (poll
-        // watch.lock's liveness, matching wait_for_daemon_ready's shape in
-        // crates/infigraph-core/src/watch/daemon.rs).
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while infigraph_core::daemon::lifecycle::daemon_is_alive(&lock_path) {
-            if std::time::Instant::now() > deadline {
-                anyhow::bail!("daemon did not exit within 10s of a stop request");
+        // Wait for the PROCESS to exit, not merely for the lock to look
+        // free. A daemon releases `watch.lock` while it is still draining
+        // in-flight work and closing the graph, so polling liveness alone
+        // used to return early and spawn a replacement alongside a daemon
+        // that still had the graph open read-write (sittir, 2026-09-08 --
+        // the orphan was invisible to `infigraph ps`, which enumerates lock
+        // holders, and blocked every doc reindex behind it). Refusing to
+        // spawn is strictly better than quietly creating a second writer.
+        if !infigraph_core::daemon::lifecycle::confirm_daemon_exited(
+            &lock_path,
+            holder_pid,
+            std::time::Duration::from_secs(10),
+        ) {
+            match holder_pid {
+                Some(pid) => anyhow::bail!(
+                    "daemon {pid} did not exit within 10s of a stop request, so it may still \
+                     hold the graph -- refusing to start a second one alongside it. Check \
+                     `infigraph ps` (which will not list it once it has released watch.lock) \
+                     and, if it is still running, `infigraph kill {pid}`, then retry."
+                ),
+                None => anyhow::bail!(
+                    "daemon did not exit within 10s of a stop request -- refusing to start a \
+                     second one alongside it"
+                ),
             }
-            std::thread::sleep(std::time::Duration::from_millis(100));
         }
     }
 

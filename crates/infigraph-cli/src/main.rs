@@ -673,6 +673,12 @@ enum Commands {
     ScipEnrich {
         /// Comma-separated detected languages
         languages: String,
+        /// Re-stamp the growth-ratio baseline once enrichment finishes.
+        /// Set only when this enrichment follows a full reindex: the
+        /// baseline `index --full` stamps captures the graph before
+        /// enrichment has added its (legitimate) share of it.
+        #[arg(long, default_value_t = false)]
+        restamp_baseline: bool,
     },
 
     /// Print this binary's build hash and exit (dev/internal use — lets a
@@ -1216,13 +1222,16 @@ fn run(command: Commands, root: &Path) -> Result<()> {
         Commands::DetectPatterns { pattern, json } => {
             cmd_detect_patterns(root, pattern.as_deref(), json)
         }
-        Commands::ScipEnrich { languages } => {
+        Commands::ScipEnrich {
+            languages,
+            restamp_baseline,
+        } => {
             let detected: std::collections::HashSet<String> = languages
                 .split(',')
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .collect();
-            index::cmd_scip_enrich(root, &detected);
+            index::cmd_scip_enrich(root, &detected, restamp_baseline);
             Ok(())
         }
         Commands::PrintBuildHash => {
@@ -1431,6 +1440,7 @@ mod tests {
         assert!(!should_auto_watch(
             &Commands::ScipEnrich {
                 languages: String::new(),
+                restamp_baseline: false,
             },
             root
         ));
