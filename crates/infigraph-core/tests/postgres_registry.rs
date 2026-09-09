@@ -262,7 +262,7 @@ fn test_registry_load_save_postgres_mode() {
     // Set env var and load via Registry::load()
     std::env::set_var("INFIGRAPH_BACKEND", "neo4j");
     let registry = Registry::load().expect("load via env");
-    std::env::remove_var("INFIGRAPH_BACKEND");
+    std::env::set_var(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND);
 
     assert!(registry.repos.contains_key("env-test-repo"));
     assert!(registry.groups.contains_key("env-test-group"));

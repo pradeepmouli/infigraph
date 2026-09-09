@@ -129,7 +129,7 @@ fn start_real_daemon(project_dir: &Path) -> KillOnDrop {
     let status = Command::new(&cli)
         .arg("index")
         .current_dir(project_dir)
-        .env_remove("INFIGRAPH_BACKEND")
+        .env(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND)
         .env("INFIGRAPH_NO_WATCH", "1")
         .status()
         .unwrap();
@@ -139,7 +139,7 @@ fn start_real_daemon(project_dir: &Path) -> KillOnDrop {
         Command::new(&cli)
             .arg("daemon")
             .current_dir(project_dir)
-            .env_remove("INFIGRAPH_BACKEND")
+            .env(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND)
             .spawn()
             .unwrap(),
     );
@@ -168,7 +168,7 @@ fn open_daemon_client(project_dir: &Path) -> Infigraph {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("INFIGRAPH_BACKEND", "daemon");
         let r = client.init();
-        std::env::remove_var("INFIGRAPH_BACKEND");
+        std::env::set_var(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND);
         r
     };
     init_result.unwrap();
@@ -515,7 +515,7 @@ fn ad_hoc_index_request_racing_the_watchers_own_debounce_does_not_duplicate_key(
         .arg(project.path())
         .arg("index")
         .arg("--no-embed")
-        .env_remove("INFIGRAPH_BACKEND")
+        .env(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND)
         .status()
         .unwrap();
     assert!(bootstrap.success());
@@ -1029,7 +1029,7 @@ fn full_reindex_with_no_daemon_fails_fast_instead_of_polling_for_ten_minutes() {
     let status = Command::new(&cli)
         .arg("index")
         .current_dir(project.path())
-        .env_remove("INFIGRAPH_BACKEND")
+        .env(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND)
         .env_remove("INFIGRAPH_WATCH_DAEMON")
         .env("INFIGRAPH_NO_WATCH", "1")
         .status()
@@ -1185,7 +1185,7 @@ fn plain_index_auto_promotes_to_a_full_rebuild_when_the_graph_is_missing_but_inf
         .arg("index")
         .arg("--no-embed")
         .current_dir(project.path())
-        .env_remove("INFIGRAPH_BACKEND")
+        .env(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND)
         .env_remove("INFIGRAPH_WATCH_DAEMON")
         .env("INFIGRAPH_NO_WATCH", "1")
         .status()
@@ -1199,7 +1199,7 @@ fn plain_index_auto_promotes_to_a_full_rebuild_when_the_graph_is_missing_but_inf
         .arg("index")
         .arg("--no-embed")
         .current_dir(project.path())
-        .env_remove("INFIGRAPH_BACKEND")
+        .env(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND)
         .env_remove("INFIGRAPH_WATCH_DAEMON")
         .env("INFIGRAPH_NO_WATCH", "1")
         .output()
@@ -1268,7 +1268,7 @@ fn opportunistic_daemon_spawn_writes_a_start_banner_naming_its_pid_to_daemon_log
         .arg("index")
         .arg("--no-embed")
         .current_dir(project.path())
-        .env_remove("INFIGRAPH_BACKEND")
+        .env(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND)
         .env_remove("INFIGRAPH_WATCH_DAEMON")
         .env("INFIGRAPH_NO_WATCH", "1")
         .status()
@@ -1348,7 +1348,7 @@ fn plain_index_ignores_no_watch_opt_out_for_the_required_backend_daemon() {
     let status = Command::new(&cli)
         .arg("index")
         .current_dir(project.path())
-        .env_remove("INFIGRAPH_BACKEND")
+        .env(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND)
         .env_remove("INFIGRAPH_WATCH_DAEMON")
         .env("INFIGRAPH_NO_WATCH", "1")
         .status()

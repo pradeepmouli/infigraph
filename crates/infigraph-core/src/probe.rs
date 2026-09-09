@@ -104,9 +104,12 @@ pub fn graph_opens(graph_path: &Path) -> bool {
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
-    // A probe child must never inherit a backend override that would send it
-    // somewhere other than this file.
-    cmd.env_remove("INFIGRAPH_BACKEND");
+    // A probe child must never inherit -- or default into -- a backend that
+    // would send it somewhere other than this file. The whole question being
+    // asked is "does THIS file open?", so it is pinned, not merely unset:
+    // once local stops being the default (#159) an unset variable routes the
+    // probe to a daemon and it reports on a socket instead.
+    cmd.env(crate::BACKEND_ENV, crate::LOCAL_BACKEND);
     match cmd.status() {
         Ok(status) => status.success(),
         Err(_) => false,

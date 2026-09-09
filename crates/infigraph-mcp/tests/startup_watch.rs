@@ -148,7 +148,7 @@ fn start_daemon_watcher_for_startup_dir_respects_boot_toggle() {
     wait_for_watch_lock_state(&lock_path, false, Duration::from_secs(15));
 
     std::env::remove_var("INFIGRAPH_WATCH_AUTO_START");
-    std::env::remove_var("INFIGRAPH_BACKEND");
+    std::env::set_var(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND);
 
     assert!(
         started,
@@ -189,7 +189,7 @@ fn start_daemon_watcher_for_startup_dir_respects_watch_enabled_policy() {
 
     std::env::remove_var("INFIGRAPH_WATCH_ENABLED");
     std::env::remove_var("INFIGRAPH_WATCH_AUTO_START");
-    std::env::remove_var("INFIGRAPH_BACKEND");
+    std::env::set_var(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND);
 
     assert!(
         suppressed,
@@ -239,7 +239,7 @@ fn start_daemon_watcher_for_startup_dir_never_touches_other_projects() {
     wait_for_watch_lock_state(&startup_lock, false, Duration::from_secs(15));
 
     std::env::remove_var("INFIGRAPH_WATCH_AUTO_START");
-    std::env::remove_var("INFIGRAPH_BACKEND");
+    std::env::set_var(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND);
 
     assert!(
         started,
@@ -321,7 +321,7 @@ fn start_daemon_watcher_for_startup_dir_catches_drift_from_before_it_was_running
     wait_for_watch_lock_state(&lock_path, false, Duration::from_secs(15));
 
     std::env::remove_var("INFIGRAPH_WATCH_AUTO_START");
-    std::env::remove_var("INFIGRAPH_BACKEND");
+    std::env::set_var(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND);
 
     assert!(started, "expected a daemon to start for the startup dir");
     assert!(

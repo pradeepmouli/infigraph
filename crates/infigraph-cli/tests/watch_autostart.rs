@@ -39,7 +39,7 @@ fn first_ever_index_on_fresh_project_does_not_print_watcher_failure() {
         .env_remove("BUILDKITE")
         .env_remove("GITLAB_CI")
         .env_remove("INFIGRAPH_NO_WATCH")
-        .env_remove("INFIGRAPH_BACKEND")
+        .env(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND)
         .output()
         .expect("failed to run infigraph index");
 

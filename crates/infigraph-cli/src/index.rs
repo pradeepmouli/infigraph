@@ -1910,7 +1910,7 @@ mod tests {
     #[test]
     #[cfg(feature = "remote")]
     fn is_neo4j_backend_only_true_for_explicit_neo4j_env() {
-        std::env::remove_var("INFIGRAPH_BACKEND");
+        std::env::set_var(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND);
         assert!(
             !infigraph_core::daemon::lifecycle::is_remote_backend(),
             "unset INFIGRAPH_BACKEND must not select Postgres"
@@ -1928,7 +1928,7 @@ mod tests {
             "explicit neo4j backend must select Postgres"
         );
 
-        std::env::remove_var("INFIGRAPH_BACKEND");
+        std::env::set_var(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND);
     }
 
     #[test]
@@ -2130,7 +2130,7 @@ mod tests {
         ensure_watcher_running(tmp.path());
         assert!(!tg_dir.join("watch.lock").exists());
 
-        std::env::remove_var("INFIGRAPH_BACKEND");
+        std::env::set_var(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND);
     }
 
     #[test]

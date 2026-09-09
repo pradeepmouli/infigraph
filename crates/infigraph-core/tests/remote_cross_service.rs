@@ -273,7 +273,7 @@ fn test_group_build_links_cross_service_call_neo4j_postgres() {
     neo.raw_query("MATCH (n) DETACH DELETE n")
         .expect("clear neo4j graph after test");
     clean_pg(&pg);
-    std::env::remove_var("INFIGRAPH_BACKEND");
+    std::env::set_var(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND);
 }
 
 // gRPC producer/consumer fixtures for the remote gRPC test (AIF3X-331 #35).
@@ -393,5 +393,5 @@ fn test_group_build_links_grpc_cross_service_call_neo4j_postgres() {
     neo.raw_query("MATCH (n) DETACH DELETE n")
         .expect("clear neo4j graph after test");
     clean_pg(&pg);
-    std::env::remove_var("INFIGRAPH_BACKEND");
+    std::env::set_var(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND);
 }

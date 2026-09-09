@@ -35,7 +35,7 @@ fn run_flag(flag: &str) -> (std::process::Output, tempfile::TempDir, String) {
     let output = Command::new(env!("CARGO_BIN_EXE_infigraph-mcp"))
         .arg(flag)
         .env("INFIGRAPH_MCP_LOCK_PATH", &lock_path)
-        .env_remove("INFIGRAPH_BACKEND")
+        .env(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND)
         .env_remove("INFIGRAPH_WATCH_DAEMON")
         .output()
         .expect("failed to spawn infigraph-mcp");

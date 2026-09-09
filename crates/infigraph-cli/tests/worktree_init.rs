@@ -14,7 +14,7 @@ fn run_index(root: &std::path::Path, fake_home: &std::path::Path) -> std::proces
         .args(["--root", root.to_str().unwrap(), "index"])
         .env("HOME", fake_home)
         .env("INFIGRAPH_NO_WATCH", "1")
-        .env_remove("INFIGRAPH_BACKEND")
+        .env(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND)
         .output()
         .unwrap()
 }
@@ -28,7 +28,7 @@ fn run_worktree(
         .args(["worktree", action, path.to_str().unwrap()])
         .env("HOME", fake_home)
         .env("INFIGRAPH_NO_WATCH", "1")
-        .env_remove("INFIGRAPH_BACKEND")
+        .env(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND)
         .output()
         .unwrap()
 }

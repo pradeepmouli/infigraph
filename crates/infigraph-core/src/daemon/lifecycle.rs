@@ -547,7 +547,10 @@ pub fn build_daemon_command(root: &Path, tg_dir: &Path, watch_binary: &Path) -> 
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(stderr_target)
-        .env_remove("INFIGRAPH_BACKEND");
+        // Pin, don't unset: the daemon must open the graph itself, and
+        // once local stops being the default (#159) an unset variable
+        // means "route", i.e. route to the daemon we are spawning.
+        .env(crate::BACKEND_ENV, crate::LOCAL_BACKEND);
 
     #[cfg(unix)]
     {

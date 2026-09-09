@@ -17,6 +17,12 @@ env:
   # Try `line-tables-only` instead once a run has proved to fit; that keeps
   # line numbers in panics at a fraction of full DWARF.
   CARGO_PROFILE_DEV_DEBUG: 0
+  # Pin the backend for every test process rather than relying on the
+  # variable being absent (#159). Tests build throwaway projects in
+  # tempdirs, where a routed read would mean auto-starting a daemon per
+  # project; local is what they want. Once local stops being the default,
+  # "absent" stops meaning local -- so say it.
+  INFIGRAPH_BACKEND: kuzu
 
 jobs:
   fmt:

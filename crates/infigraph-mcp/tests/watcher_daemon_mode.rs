@@ -81,7 +81,7 @@ fn stop_all_doc_watchers() {
 #[test]
 fn daemon_mode_off_by_default_uses_in_process_thread() {
     let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::remove_var("INFIGRAPH_BACKEND");
+    std::env::set_var(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND);
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().canonicalize().unwrap();
     std::fs::create_dir_all(root.join(".infigraph")).unwrap();
@@ -140,7 +140,7 @@ fn daemon_mode_on_does_not_populate_in_process_watchers_map() {
         wait_for_watch_locks_released(std::slice::from_ref(&path));
     }
 
-    std::env::remove_var("INFIGRAPH_BACKEND");
+    std::env::set_var(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND);
 }
 
 /// `tool_watch_project` (the explicit MCP tool a client can call directly,
@@ -178,7 +178,7 @@ fn tool_watch_project_respects_daemon_mode_toggle() {
         wait_for_watch_locks_released(std::slice::from_ref(&path));
     }
 
-    std::env::remove_var("INFIGRAPH_BACKEND");
+    std::env::set_var(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND);
 }
 
 /// `tool_watch_project` must also respect the persisted `[watch].enabled`
@@ -220,7 +220,7 @@ fn tool_watch_project_respects_watch_enabled_policy() {
     );
 
     std::env::remove_var("INFIGRAPH_WATCH_ENABLED");
-    std::env::remove_var("INFIGRAPH_BACKEND");
+    std::env::set_var(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND);
 }
 
 /// `tool_watch_project_respects_watch_enabled_policy` above only exercises
@@ -230,7 +230,7 @@ fn tool_watch_project_respects_watch_enabled_policy() {
 #[test]
 fn tool_watch_project_non_daemon_branch_respects_watch_enabled_policy() {
     let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::remove_var("INFIGRAPH_BACKEND");
+    std::env::set_var(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND);
     std::env::set_var("INFIGRAPH_WATCH_ENABLED", "0");
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().canonicalize().unwrap();
@@ -258,7 +258,7 @@ fn tool_watch_project_non_daemon_branch_respects_watch_enabled_policy() {
 #[test]
 fn tool_watch_docs_non_daemon_branch_respects_watch_docs_enabled_policy() {
     let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::remove_var("INFIGRAPH_BACKEND");
+    std::env::set_var(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND);
     std::env::set_var("INFIGRAPH_WATCH_DOCS_ENABLED", "0");
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().canonicalize().unwrap();
@@ -329,7 +329,7 @@ fn doc_watch_daemon_spawn_not_blocked_by_disabled_code_watch_policy() {
     }
 
     std::env::remove_var("INFIGRAPH_WATCH_ENABLED");
-    std::env::remove_var("INFIGRAPH_BACKEND");
+    std::env::set_var(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND);
 }
 
 #[test]
@@ -463,7 +463,7 @@ fn auto_start_doc_watch_respects_daemon_mode_toggle() {
         );
     }
 
-    std::env::remove_var("INFIGRAPH_BACKEND");
+    std::env::set_var(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND);
 }
 
 /// `auto_start_doc_watch` must also respect the persisted `[watch_docs].enabled`
@@ -527,7 +527,7 @@ fn tool_watch_docs_respects_daemon_mode_toggle() {
         );
     }
 
-    std::env::remove_var("INFIGRAPH_BACKEND");
+    std::env::set_var(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND);
 }
 
 /// `tool_stop_watch_docs` must accept a `path` argument (today it only
@@ -590,7 +590,7 @@ fn tool_disable_watch_respects_daemon_mode_toggle() {
     );
     assert!(result.is_ok(), "disable_watch should not error: {result:?}");
 
-    std::env::remove_var("INFIGRAPH_BACKEND");
+    std::env::set_var(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND);
 }
 
 /// `enable_watch` in non-daemon mode must persist the enabled policy to
@@ -599,7 +599,7 @@ fn tool_disable_watch_respects_daemon_mode_toggle() {
 #[test]
 fn tool_enable_watch_in_process_mode_writes_config_and_does_not_error() {
     let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::remove_var("INFIGRAPH_BACKEND");
+    std::env::set_var(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND);
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().canonicalize().unwrap();
     std::fs::create_dir_all(root.join(".infigraph")).unwrap();
@@ -647,7 +647,7 @@ fn tool_disable_watch_docs_respects_daemon_mode_toggle() {
         "disable_watch_docs should not error: {result:?}"
     );
 
-    std::env::remove_var("INFIGRAPH_BACKEND");
+    std::env::set_var(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND);
 }
 
 /// `enable_watch_docs` in non-daemon mode must persist the enabled policy to
@@ -656,7 +656,7 @@ fn tool_disable_watch_docs_respects_daemon_mode_toggle() {
 #[test]
 fn tool_enable_watch_docs_in_process_mode_writes_config_and_does_not_error() {
     let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    std::env::remove_var("INFIGRAPH_BACKEND");
+    std::env::set_var(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND);
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().canonicalize().unwrap();
     std::fs::create_dir_all(root.join(".infigraph")).unwrap();

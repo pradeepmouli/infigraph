@@ -29,7 +29,7 @@ fn index_registers_repo_in_local_registry() {
         .env_remove("JENKINS_URL")
         .env_remove("BUILDKITE")
         .env_remove("GITLAB_CI")
-        .env_remove("INFIGRAPH_BACKEND")
+        .env(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND)
         .output()
         .expect("failed to run infigraph index");
 
@@ -110,7 +110,7 @@ fn daemon_routed_full_index_registers_repo_in_local_registry() {
         .arg("--no-embed")
         .env("HOME", fake_home.path())
         .env("INFIGRAPH_NO_WATCH", "1")
-        .env_remove("INFIGRAPH_BACKEND")
+        .env(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND)
         .env_remove("INFIGRAPH_WATCH_DAEMON")
         .output()
         .expect("failed to run the initial infigraph index");

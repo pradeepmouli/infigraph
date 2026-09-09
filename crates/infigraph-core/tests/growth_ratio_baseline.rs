@@ -101,7 +101,7 @@ fn a_full_reindex_does_refresh_the_growth_ratio_baseline() {
         .arg("index")
         .arg("--no-embed")
         .current_dir(dir.path())
-        .env_remove("INFIGRAPH_BACKEND")
+        .env(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND)
         .env_remove("INFIGRAPH_WATCH_DAEMON")
         .status()
         .unwrap();
@@ -127,7 +127,7 @@ fn a_full_reindex_does_refresh_the_growth_ratio_baseline() {
         .arg("--full")
         .arg("--no-embed")
         .current_dir(dir.path())
-        .env_remove("INFIGRAPH_BACKEND")
+        .env(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND)
         .env_remove("INFIGRAPH_WATCH_DAEMON")
         .status()
         .unwrap();

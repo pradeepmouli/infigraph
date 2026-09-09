@@ -96,13 +96,13 @@ impl Drop for KillPidOnDrop {
 #[test]
 fn is_remote_backend_only_true_for_explicit_neo4j() {
     let _g = ENV_LOCK.write().unwrap_or_else(|e| e.into_inner());
-    std::env::remove_var("INFIGRAPH_BACKEND");
+    std::env::set_var(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND);
     assert!(!is_remote_backend());
     std::env::set_var("INFIGRAPH_BACKEND", "kuzu");
     assert!(!is_remote_backend());
     std::env::set_var("INFIGRAPH_BACKEND", "neo4j");
     assert!(is_remote_backend());
-    std::env::remove_var("INFIGRAPH_BACKEND");
+    std::env::set_var(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND);
 }
 
 #[test]
@@ -121,13 +121,13 @@ fn is_ci_env_detects_any_known_ci_var() {
 #[test]
 fn watch_daemon_mode_is_opt_in_off_by_default() {
     let _g = ENV_LOCK.write().unwrap_or_else(|e| e.into_inner());
-    std::env::remove_var("INFIGRAPH_BACKEND");
+    std::env::set_var(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND);
     assert!(!watch_daemon_mode_enabled());
     std::env::set_var("INFIGRAPH_BACKEND", "daemon");
     assert!(watch_daemon_mode_enabled());
     std::env::set_var("INFIGRAPH_BACKEND", "kuzu");
     assert!(!watch_daemon_mode_enabled());
-    std::env::remove_var("INFIGRAPH_BACKEND");
+    std::env::set_var(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND);
 }
 
 #[test]
@@ -161,7 +161,7 @@ fn ensure_daemon_running_noops_under_ci() {
 fn ensure_daemon_running_noops_when_not_yet_indexed() {
     let _g = ENV_LOCK.write().unwrap_or_else(|e| e.into_inner());
     let _ci = CiOptOutSuppressed::new();
-    std::env::remove_var("INFIGRAPH_BACKEND");
+    std::env::set_var(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND);
     let tmp = tempfile::tempdir().unwrap();
     assert!(!tmp.path().join(".infigraph").exists());
 
@@ -185,7 +185,7 @@ fn ensure_daemon_running_noops_when_not_yet_indexed() {
 fn init_daemon_backend_starts_a_daemon() {
     let _g = ENV_LOCK.write().unwrap_or_else(|e| e.into_inner());
     let _ci = CiOptOutSuppressed::new();
-    std::env::remove_var("INFIGRAPH_BACKEND");
+    std::env::set_var(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND);
 
     // init()'s daemon arm re-execs the CLI binary; skip rather than fail if
     // this test binary was built without it (infigraph-core has no
@@ -224,7 +224,7 @@ fn init_daemon_backend_starts_a_daemon() {
     let registry = infigraph_languages::bundled_registry().unwrap();
     let mut client = infigraph_core::Infigraph::open(project_dir.path(), registry).unwrap();
     let init_result = client.init();
-    std::env::remove_var("INFIGRAPH_BACKEND");
+    std::env::set_var(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND);
     init_result.unwrap();
 
     // The spawned daemon is detached (setsid), so there's no Child handle to
@@ -265,14 +265,18 @@ fn init_daemon_backend_starts_a_daemon() {
 /// builds (via the `pub` `build_daemon_command` helper): its env mutations
 /// must include an explicit removal of `INFIGRAPH_BACKEND`, regardless of
 /// what leaked into the *test's own* environment. `Command::get_envs()`
-/// (stable since Rust 1.57) iterates a command's explicit env mutations,
-/// where a removed var appears as `(key, None)` — so this proves
-/// `env_remove("INFIGRAPH_BACKEND")` was actually applied to the command
-/// that will be exec'd. Delete that call from `build_daemon_command` and
-/// this assertion fails; keep it and the test passes — no timing, no OS
-/// tool dependency, no reliance on a placeholder backend panicking.
+/// (stable since Rust 1.57) iterates a command's explicit env mutations, so
+/// this proves the override was actually applied to the command that will be
+/// exec'd — no timing, no OS tool dependency, no reliance on a placeholder
+/// backend panicking.
+///
+/// It asserts the *outcome* (the child is pinned to the local backend), not
+/// the mechanism. Removing the variable used to be equivalent, because the
+/// default was local; under #159's flipped default it means the opposite, so
+/// a test that pinned `env_remove` would have kept passing while the daemon
+/// selected `DaemonKuzu` on itself and deadlocked.
 #[test]
-fn build_daemon_command_strips_infigraph_backend_env_var() {
+fn build_daemon_command_pins_the_daemon_to_the_local_backend() {
     let project_dir = tempfile::tempdir().unwrap();
     let tg_dir = project_dir.path().join(".infigraph");
     std::fs::create_dir_all(&tg_dir).unwrap();
@@ -283,12 +287,18 @@ fn build_daemon_command_strips_infigraph_backend_env_var() {
         std::path::Path::new("/nonexistent/infigraph"),
     );
 
-    let removed = cmd
-        .get_envs()
-        .any(|(key, value)| key == "INFIGRAPH_BACKEND" && value.is_none());
+    let pinned = cmd.get_envs().any(|(key, value)| {
+        key == infigraph_core::BACKEND_ENV
+            && value == Some(std::ffi::OsStr::new(infigraph_core::LOCAL_BACKEND))
+    });
     assert!(
-        removed,
-        "expected build_daemon_command's Command to explicitly remove INFIGRAPH_BACKEND from its env"
+        pinned,
+        "expected build_daemon_command's Command to set {}={} explicitly -- the daemon must \
+         open the graph itself, and inheriting or defaulting to the daemon backend makes it \
+         route to itself and deadlock. Saw: {:?}",
+        infigraph_core::BACKEND_ENV,
+        infigraph_core::LOCAL_BACKEND,
+        cmd.get_envs().collect::<Vec<_>>()
     );
 }
 
@@ -322,7 +332,7 @@ fn spawn_daemon_child_still_starts_with_infigraph_backend_leaked_into_test_env()
     std::env::set_var("INFIGRAPH_BACKEND", "daemon");
     let outcome =
         infigraph_core::daemon::lifecycle::ensure_daemon_running(project_dir.path(), &cli_binary);
-    std::env::remove_var("INFIGRAPH_BACKEND");
+    std::env::set_var(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND);
 
     assert_eq!(
         outcome,
@@ -403,7 +413,7 @@ fn ensure_daemon_running_prunes_a_dead_stale_holder_and_spawns_fresh() {
     std::env::set_var("INFIGRAPH_BACKEND", "daemon");
     let outcome =
         infigraph_core::daemon::lifecycle::ensure_daemon_running(project_dir.path(), &cli_binary);
-    std::env::remove_var("INFIGRAPH_BACKEND");
+    std::env::set_var(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND);
 
     assert_eq!(
         outcome,

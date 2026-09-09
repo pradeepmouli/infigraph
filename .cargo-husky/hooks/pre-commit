@@ -7,7 +7,12 @@ set -e
 # subprocesses -- a shell profile that sets them globally otherwise makes
 # tests like groups_watch_perf fail with "Cannot create an empty database
 # under READ ONLY mode" for reasons unrelated to the change being committed.
-unset INFIGRAPH_BACKEND INFIGRAPH_WATCH_DAEMON INFIGRAPH_INDEX_VIA_DAEMON
+#
+# INFIGRAPH_BACKEND is PINNED rather than unset (#159): unsetting it only
+# means "run locally" for as long as local is the default, and that is the
+# thing #159 flips. The other two have no such default to invert.
+export INFIGRAPH_BACKEND=kuzu
+unset INFIGRAPH_WATCH_DAEMON INFIGRAPH_INDEX_VIA_DAEMON
 
 # `cargo clippy --all-targets` alone forces a full workspace rebuild (100+
 # crates, including native lbug/kuzu builds) -- wasted work for a docs-only

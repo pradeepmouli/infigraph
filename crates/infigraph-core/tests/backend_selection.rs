@@ -24,7 +24,7 @@ fn init_selects_daemon_kuzu_backend_when_env_var_set() {
     // init() first; here we simulate that by initializing with the
     // default Kuzu backend and dropping it before switching to daemon
     // mode.
-    std::env::remove_var("INFIGRAPH_BACKEND");
+    std::env::set_var(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND);
     let registry = bundled_registry().unwrap();
     let mut infigraph = Infigraph::open(project_dir.path(), registry).unwrap();
     infigraph.init().unwrap();
@@ -40,7 +40,7 @@ fn init_selects_daemon_kuzu_backend_when_env_var_set() {
     let registry = bundled_registry().unwrap();
     let mut infigraph = Infigraph::open(project_dir.path(), registry).unwrap();
     let result = infigraph.init();
-    std::env::remove_var("INFIGRAPH_BACKEND");
+    std::env::set_var(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND);
     std::env::remove_var("INFIGRAPH_NO_WATCH");
 
     assert!(result.is_ok(), "init() failed: {result:?}");
@@ -50,6 +50,11 @@ fn init_selects_daemon_kuzu_backend_when_env_var_set() {
 fn init_selects_kuzu_backend_by_default() {
     let _guard = ENV_LOCK.lock().unwrap();
     let project_dir = tempfile::tempdir().unwrap();
+    // Deliberately UNSET, not pinned: this test is about what the default
+    // is. It is one of the two assertions #159's step 3 has to rewrite when
+    // the default flips (the other is `defaults_to_kuzu_when_unset` in
+    // selected_backend.rs); everywhere else now pins the backend
+    // explicitly so that flip cannot change its meaning silently.
     std::env::remove_var("INFIGRAPH_BACKEND");
     let registry = bundled_registry().unwrap();
     let mut infigraph = Infigraph::open(project_dir.path(), registry).unwrap();

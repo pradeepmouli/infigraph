@@ -24,7 +24,7 @@ fn full_reindex_succeeds_under_daemon_backend_with_a_real_running_daemon() {
         .arg("index")
         .current_dir(project.path())
         .env("HOME", fake_home.path())
-        .env_remove("INFIGRAPH_BACKEND")
+        .env(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND)
         .status()
         .expect("failed to run bootstrap infigraph index");
     assert!(bootstrap.success(), "bootstrap index must succeed");
@@ -34,7 +34,7 @@ fn full_reindex_succeeds_under_daemon_backend_with_a_real_running_daemon() {
         .arg("daemon")
         .current_dir(project.path())
         .env("HOME", fake_home.path())
-        .env_remove("INFIGRAPH_BACKEND")
+        .env(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND)
         .spawn()
         .expect("failed to spawn daemon");
 

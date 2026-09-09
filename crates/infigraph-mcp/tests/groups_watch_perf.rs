@@ -36,7 +36,7 @@ fn group_fixture() -> &'static GroupFixture {
         // now-retired INFIGRAPH_WATCH_DAEMON toggle; daemon-mode watching
         // is controlled solely by INFIGRAPH_BACKEND=daemon now.)
         let orig_watch_daemon = std::env::var("INFIGRAPH_BACKEND").ok();
-        std::env::remove_var("INFIGRAPH_BACKEND");
+        std::env::set_var(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND);
 
         let home_dir = tempfile::TempDir::new().expect("tmpdir for home");
         support::remove_at_exit(home_dir.path()); // static fixture: never dropped (#136)

@@ -381,7 +381,7 @@ pub(crate) fn cmd_daemon(root: &Path, debounce: u64) -> Result<()> {
     // without this, the daemon's own Infigraph::open (reached via
     // watch_project -> open_transient) would select DaemonKuzu on
     // itself and deadlock waiting on a request nothing serves.
-    std::env::remove_var("INFIGRAPH_BACKEND");
+    std::env::set_var(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND);
 
     // The daemon otherwise has no panic hook at all: a panic anywhere in
     // this process (this thread or any spawned one) unwinds silently past

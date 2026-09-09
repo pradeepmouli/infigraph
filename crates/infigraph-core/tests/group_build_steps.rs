@@ -724,7 +724,7 @@ mod remote {
         clean_pg(&pg);
         let neo = connect_neo4j();
         let _ = neo.raw_query("MATCH (n) DETACH DELETE n");
-        std::env::remove_var("INFIGRAPH_BACKEND");
+        std::env::set_var(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND);
     }
 
     /// Step 1 (remote): index_group against live Neo4j, both repos indexed.
@@ -936,7 +936,7 @@ mod remote {
 
         neo.raw_query("MATCH (n) DETACH DELETE n").ok();
         clean_pg(&pg);
-        std::env::remove_var("INFIGRAPH_BACKEND");
+        std::env::set_var(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND);
     }
 
     /// Step 3 (remote), THE regression guard — remote mirror of the local

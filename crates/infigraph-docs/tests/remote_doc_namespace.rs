@@ -218,5 +218,5 @@ fn test_docindex_set_namespace_isolates_end_to_end() {
     );
 
     clear_store(&store_for_cleanup);
-    std::env::remove_var("INFIGRAPH_BACKEND");
+    std::env::set_var(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND);
 }

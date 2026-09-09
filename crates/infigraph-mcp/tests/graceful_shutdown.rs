@@ -25,7 +25,7 @@ fn sigterm_deregisters_the_instance_and_exits_promptly() {
         .env("INFIGRAPH_MCP_LOCK_PATH", tmp.path().join("mcp.lock"))
         .env("INFIGRAPH_REGISTRY_INSTANCES_DIR", &instances_dir)
         .env("CI", "true")
-        .env_remove("INFIGRAPH_BACKEND")
+        .env(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND)
         .env_remove("INFIGRAPH_WATCH_DAEMON")
         .stdin(Stdio::piped()) // held open -- stdin-close is the OTHER exit path
         .stdout(Stdio::null())
@@ -105,7 +105,7 @@ fn sigterm_to_the_supervisor_logs_why_and_exits_promptly_and_the_worker_follows(
         .env("INFIGRAPH_REGISTRY_INSTANCES_DIR", &instances_dir)
         .env("INFIGRAPH_MCP_LOG_PATH", &log_path)
         .env("CI", "true")
-        .env_remove("INFIGRAPH_BACKEND")
+        .env(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND)
         .env_remove("INFIGRAPH_WATCH_DAEMON")
         .stdin(Stdio::piped())
         .stdout(Stdio::null())

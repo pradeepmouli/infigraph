@@ -186,9 +186,29 @@ enum BackendKind {
     DaemonKuzu(graph::DaemonKuzuBackend),
 }
 
+/// The `INFIGRAPH_BACKEND` variable's name, as a constant. It predates the
+/// `settings!` macro's `INFIGRAPH_{CATEGORY}_{FIELD}` convention, so it is a
+/// bare name that has to be spelled out; spell it out once.
+pub const BACKEND_ENV: &str = "INFIGRAPH_BACKEND";
+
+/// The backend value meaning "open the graph in this process", as opposed to
+/// routing through a daemon.
+///
+/// Prefer setting this explicitly over *unsetting* [`BACKEND_ENV`] when a
+/// process or child must not route. The two are equivalent only for as long
+/// as local is also the default, and #159 flips that -- at which point every
+/// `env_remove` that meant "run locally" quietly starts meaning the
+/// opposite. The daemon spawning itself (`daemon::lifecycle`), `infigraph
+/// daemon` run by hand (`info_commands`), and the out-of-process health
+/// probe ([`crate::probe`]) all depend on the local backend for
+/// correctness, not preference: routing there means a daemon that routes to
+/// itself and deadlocks, or a probe that reports on a socket instead of the
+/// file it was asked about.
+pub const LOCAL_BACKEND: &str = "kuzu";
+
 crate::settings! {
     backend {
-        selected: String = "kuzu".to_string(),
+        selected: String = LOCAL_BACKEND.to_string(),
     }
 }
 
@@ -1896,7 +1916,7 @@ mod tests {
         std::env::set_var("INFIGRAPH_BACKEND", "daemon");
         let registry = LanguageRegistry::new();
         let prism = Infigraph::open_local_kuzu_at(root, registry, custom_db_path.clone()).unwrap();
-        std::env::remove_var("INFIGRAPH_BACKEND");
+        std::env::set_var(crate::BACKEND_ENV, crate::LOCAL_BACKEND);
 
         assert!(
             !prism.is_daemon_backend(),

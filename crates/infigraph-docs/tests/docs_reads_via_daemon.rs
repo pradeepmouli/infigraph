@@ -137,7 +137,7 @@ fn doc_index_routes_reads_through_the_daemon_when_the_daemon_store_is_selected()
             .expect("a backend must be selected")
             .get_doc_hashes()
     });
-    std::env::remove_var("INFIGRAPH_BACKEND");
+    std::env::set_var(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND);
 
     let hashes = hashes.expect("a routed read must succeed against a live daemon");
     assert!(
@@ -179,7 +179,7 @@ fn doc_index_starts_a_daemon_when_none_is_running() {
     let got = idx
         .init()
         .and_then(|()| idx.store().expect("a backend").get_doc_hashes());
-    std::env::remove_var("INFIGRAPH_BACKEND");
+    std::env::set_var(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND);
     match prior_home {
         Some(v) => std::env::set_var("INFIGRAPH_REGISTRY_HOME", v),
         None => std::env::remove_var("INFIGRAPH_REGISTRY_HOME"),
