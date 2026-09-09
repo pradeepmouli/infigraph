@@ -28,7 +28,7 @@ impl GraphStore {
             }
             // R3.1.4d/#100: circuit breaker against the runaway-graph-growth
             // pattern, same call site as the disk-headroom preflight above.
-            if let Err(msg) = super::store_util::check_graph_growth_ratio(dir, &dir.join("graph")) {
+            if let Err(msg) = super::store_util::check_graph_growth_ratio(dir, self.db_path()) {
                 anyhow::bail!("refusing to index -- {msg}");
             }
         }

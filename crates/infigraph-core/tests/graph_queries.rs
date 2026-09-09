@@ -1109,6 +1109,35 @@ fn bulk_folder_write_rechecks_growth_during_the_call() {
     );
 }
 
+/// #156: a full reindex builds the replacement at a side path
+/// (`.infigraph/graph.rebuilding`) and swaps it in on success. Both the
+/// preflight and every `GrowthGate` used to derive the graph they measure
+/// as `db_dir().join("graph")` -- and `db_lock_path("graph.rebuilding")`
+/// resolves to the same `graph.lock`, so `db_dir()` is the same directory
+/// either way. The rebuild was therefore measured against the bloated graph
+/// it was about to discard, which is over the cap by definition since that
+/// is why the rebuild was requested. Confirmed by A/B against a real daemon:
+/// routed `index --full` refused at 368x while the same state rebuilt fine
+/// with `INFIGRAPH_BACKEND` unset (which takes the wipe-first local branch).
+#[test]
+fn a_rebuild_at_a_side_path_is_measured_against_itself_not_the_graph_it_replaces() {
+    let dir = tempfile::TempDir::new().unwrap();
+
+    // The latched state: a large existing `graph` and a small baseline.
+    std::fs::write(dir.path().join("graph"), vec![0u8; 20_000_000]).unwrap();
+    std::fs::write(
+        dir.path().join("graph.health.json"),
+        r#"{"healthy_size_bytes": 1000000}"#,
+    )
+    .unwrap();
+
+    // The rebuild opens its own store beside it and writes there.
+    let store = GraphStore::open(&dir.path().join("graph.rebuilding")).unwrap();
+    store.upsert_all_parquet(&fixture_extractions()).expect(
+        "a rebuild into a side path must be measured against that side path --          refusing it because the graph it replaces is over the cap makes the          documented remedy for a latched breaker impossible to run",
+    );
+}
+
 // ---------- Custom edge support ----------
 
 #[test]

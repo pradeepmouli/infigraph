@@ -98,9 +98,7 @@ pub fn import_scip_index_enriched_at(
         }
         // R3.1.4d/#100: circuit breaker against the runaway-graph-growth
         // pattern, same call site as the disk-headroom preflight above.
-        if let Err(msg) =
-            crate::graph::store_util::check_graph_growth_ratio(dir, &dir.join("graph"))
-        {
+        if let Err(msg) = crate::graph::store_util::check_graph_growth_ratio(dir, store.db_path()) {
             anyhow::bail!("Auto-SCIP: refusing to import -- {msg}");
         }
     }

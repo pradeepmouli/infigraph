@@ -48,8 +48,12 @@ impl GraphStore {
         every: usize,
     ) -> GrowthGate<impl FnMut() -> std::result::Result<(), String> + '_> {
         let dir = self.db_dir();
+        // This store's own file, not the canonical `graph` name: a full
+        // reindex builds at `graph.rebuilding` and must be measured against
+        // that, not against the graph it is replacing (#156).
+        let graph_path = self.db_path().to_path_buf();
         GrowthGate::new(every, move || match dir {
-            Some(d) => super::store_util::check_graph_growth_ratio(d, &d.join("graph")),
+            Some(d) => super::store_util::check_graph_growth_ratio(d, &graph_path),
             None => Ok(()),
         })
     }

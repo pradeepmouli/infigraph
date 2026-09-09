@@ -609,6 +609,14 @@ pub fn non_corruption_open_context(err: &anyhow::Error, db_path: &Path) -> Strin
 pub struct GraphStore {
     db: Database,
     lock_path: PathBuf,
+    /// This store's own database file. NOT derivable from `lock_path`:
+    /// `db_lock_path("graph.rebuilding")` deliberately resolves to the same
+    /// `graph.lock` as `graph` does, so a full reindex building at the side
+    /// path shares the canonical lock. Growth checks must measure *this*
+    /// file rather than the canonical `graph` name (#156) -- otherwise a
+    /// rebuild is measured against the bloated graph it is about to
+    /// discard, and the documented remedy for a latched breaker cannot run.
+    db_path: PathBuf,
 }
 
 impl GraphStore {
@@ -645,7 +653,11 @@ impl GraphStore {
             .map_err(|e| anyhow::anyhow!("failed to open kuzu db: {e}"))?
         };
         refuse_newer_schema(&db, path)?;
-        let store = Self { db, lock_path };
+        let store = Self {
+            db,
+            lock_path,
+            db_path: path.to_path_buf(),
+        };
         let lock = WriteLock::acquire_with_timeout(&store.lock_path, timeout)?;
         store.init_schema(&lock)?;
         // #146: a hard-exit marker only ever explains a dead-holder WAL, and
@@ -668,6 +680,13 @@ impl GraphStore {
     /// space mid-COPY and crashed the process).
     pub fn db_dir(&self) -> Option<&Path> {
         self.lock_path.parent()
+    }
+
+    /// The database file this store actually opened. Use this, never
+    /// `db_dir().join("graph")`, whenever measuring the store's own size --
+    /// see the field's own comment and #156.
+    pub fn db_path(&self) -> &Path {
+        &self.db_path
     }
 
     /// Open an existing Kuzu database in read-only mode.
@@ -716,7 +735,11 @@ impl GraphStore {
             )
         })?;
         refuse_newer_schema(&db, path)?;
-        Ok(Self { db, lock_path })
+        Ok(Self {
+            db,
+            lock_path,
+            db_path: path.to_path_buf(),
+        })
     }
 
     /// Like [`open_read_only`](Self::open_read_only), but on a dead-holder
