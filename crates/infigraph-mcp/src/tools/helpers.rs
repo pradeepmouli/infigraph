@@ -189,18 +189,21 @@ fn find_infigraph_cli_on_path() -> Option<std::path::PathBuf> {
     None
 }
 
-pub fn find_containing_symbol<'a>(
-    intervals: &'a [(&str, usize, usize, &str)],
+/// The id of the narrowest interval in `file` that contains `line`.
+///
+/// Narrowest, not first: symbols nest (a method inside its class inside its
+/// file's module), and the first match in row order is usually the outermost
+/// one, which says nothing about where the line actually is (#167).
+pub fn find_containing_symbol<'id>(
+    intervals: &[(&str, usize, usize, &'id str)],
     file: &str,
     line: usize,
-) -> Option<&'a str> {
-    intervals.iter().find_map(|(f, start, end, id)| {
-        if *f == file && *start <= line && line <= *end {
-            Some(*id)
-        } else {
-            None
-        }
-    })
+) -> Option<&'id str> {
+    intervals
+        .iter()
+        .filter(|(f, start, end, _)| *f == file && *start <= line && line <= *end)
+        .min_by_key(|(_, start, end, _)| end - start)
+        .map(|(_, _, _, id)| *id)
 }
 
 pub fn save_analysis(path: &str, tool_name: &str, content: &str) -> Result<String> {

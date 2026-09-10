@@ -187,7 +187,7 @@ fn compress_search(raw: &str, _args: &Value, level: CompressionLevel) -> String 
             doc_section.push('\n');
         } else {
             let trimmed = line.trim_start();
-            if trimmed.is_empty() || trimmed.starts_with("grep:") || trimmed.starts_with('"') {
+            if trimmed.is_empty() || trimmed.starts_with('"') {
                 continue;
             }
             symbol_lines.push(line.to_string());
@@ -1936,18 +1936,17 @@ mod tests {
     }
 
     #[test]
-    fn test_compress_search_strips_docstrings_and_grep() {
+    fn test_compress_search_strips_docstrings_but_keeps_every_text_match() {
         let raw = r#"Search: 'auth login' (3 symbol results, 1 text matches)
 
 0.950  Function login (crates/auth/src/lib.rs:L23-45)
        "Authenticate a user with username and password"
-       grep: crates/auth/src/lib.rs:23: pub fn login(username: &str) {
 0.870  Function verify_token (crates/auth/src/lib.rs:L47-55)
 0.820  Test test_login (crates/auth/tests/auth_test.rs:L10-30)
 
 ---
 Text matches:
-crates/auth/src/lib.rs:23: pub fn login(username: &str) {
+crates/auth/src/lib.rs:23: pub fn login(username: &str) {  (in login)
 
 ---
 Document matches:
@@ -1964,11 +1963,12 @@ Document matches:
         assert!(compressed.contains("0.950  Function login"));
         assert!(compressed.contains("0.870  Function verify_token"));
         assert!(compressed.contains("0.820  Test test_login"));
-        // Should strip docstrings and grep
+        // Should strip docstrings
         assert!(!compressed.contains("Authenticate a user"));
-        assert!(!compressed.contains("grep:"));
-        // Should keep text matches
+        // Should keep every text match, with its symbol (#167: this section is
+        // the only place `search` reports them, precisely so they survive here)
         assert!(compressed.contains("Text matches:"));
+        assert!(compressed.contains("lib.rs:23: pub fn login(username: &str) {  (in login)"));
         // Should keep doc file references but strip snippets
         assert!(compressed.contains("[docs/AUTH.md]"));
         assert!(!compressed.contains("The login flow starts"));

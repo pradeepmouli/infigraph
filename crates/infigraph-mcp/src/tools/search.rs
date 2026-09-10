@@ -395,38 +395,9 @@ pub fn tool_search(args: &Value) -> Result<String> {
             .collect::<String>()
     };
     let grep_results =
-        infigraph_core::search::grep_search(&root, &grep_pattern, file_pattern, limit)
+        infigraph_core::search::grep_search(&root, &grep_pattern, file_pattern, TEXT_MATCH_CAP)
             .unwrap_or_default();
-
-    // Build interval index for grep-to-symbol correlation
-    let intervals: Vec<(&str, usize, usize, &str)> = rows
-        .iter()
-        .filter_map(|row| {
-            let start: usize = row.get(5)?.parse().ok()?;
-            let end: usize = row.get(6)?.parse().ok()?;
-            Some((row[3].as_str(), start, end, row[0].as_str()))
-        })
-        .collect();
-
-    // Correlate grep matches to symbols
-    let mut grep_by_symbol: std::collections::HashMap<
-        String,
-        Vec<&infigraph_core::search::GrepMatch>,
-    > = std::collections::HashMap::new();
-    let mut grep_standalone: Vec<&infigraph_core::search::GrepMatch> = Vec::new();
-    for gm in &grep_results {
-        if let Some(sym_id) = find_containing_symbol(&intervals, &gm.file, gm.line_number) {
-            if let Some(sr) = merged.get_mut(sym_id) {
-                sr.score += 0.05;
-            }
-            grep_by_symbol
-                .entry(sym_id.to_string())
-                .or_default()
-                .push(gm);
-        } else {
-            grep_standalone.push(gm);
-        }
-    }
+    let text_hits = attribute_text_hits(&rows, &grep_results);
 
     // Sort merged results
     let mut symbol_results: Vec<infigraph_core::search::SearchResult> =
@@ -479,18 +450,23 @@ pub fn tool_search(args: &Value) -> Result<String> {
         });
     }
 
-    symbol_results.truncate(limit);
+    let symbol_results = rank_with_text_hits(symbol_results, &text_hits, &rows, limit, use_regex);
 
     // Build row lookup
     let row_map: std::collections::HashMap<&str, &Vec<String>> =
         rows.iter().map(|row| (row[0].as_str(), row)).collect();
 
     // Format output
+    let text_count = if grep_results.len() >= TEXT_MATCH_CAP {
+        format!("{TEXT_MATCH_CAP}+")
+    } else {
+        text_hits.len().to_string()
+    };
     let mut out = format!(
         "Search: '{}' ({} symbol results, {} text matches)\n\n",
         query,
         symbol_results.len(),
-        grep_standalone.len()
+        text_count
     );
 
     for r in &symbol_results {
@@ -511,30 +487,14 @@ pub fn tool_search(args: &Value) -> Result<String> {
                 let preview: String = doc.chars().take(120).collect();
                 out.push_str(&format!("       \"{}\"\n", preview));
             }
-            if let Some(gms) = grep_by_symbol.get(r.symbol_id.as_str()) {
-                for gm in gms.iter().take(3) {
-                    out.push_str(&format!(
-                        "       grep: {}:{}: {}\n",
-                        gm.file,
-                        gm.line_number,
-                        gm.line_text.trim()
-                    ));
-                }
-            }
         }
     }
 
-    if !grep_standalone.is_empty() {
-        out.push_str("\n---\nText matches:\n");
-        for gm in grep_standalone.iter().take(limit) {
-            out.push_str(&format!(
-                "{}:{}: {}\n",
-                gm.file,
-                gm.line_number,
-                gm.line_text.trim()
-            ));
-        }
-    }
+    out.push_str(&render_text_matches(
+        &text_hits,
+        &rows,
+        text_matches_shown(limit, use_regex),
+    ));
 
     // scope="all": append document results
     if scope == "all" {
@@ -593,6 +553,148 @@ pub fn tool_search(args: &Value) -> Result<String> {
     }
 
     Ok(out)
+}
+
+/// Most lines one search collects from its text leg. Far above any display
+/// `limit` on purpose: the header's count has to be honest, and hits are
+/// ranked before they are cut for display, not cut first in whatever order
+/// the directory walk found them (#167).
+const TEXT_MATCH_CAP: usize = 500;
+
+/// A text-search hit and the symbol it falls inside, if any.
+struct TextHit<'a> {
+    hit: &'a infigraph_core::search::GrepMatch,
+    symbol: Option<&'a str>,
+}
+
+/// Attribute each hit to the narrowest symbol containing it.
+///
+/// `Module` symbols are left out: every line of a file sits inside its
+/// whole-file module, so attributing to one would make every hit belong to a
+/// symbol nobody searched for -- which is how nearly every hit used to be
+/// classed as "inside a symbol" and then dropped (#167). A line inside no
+/// narrower symbol is a plain text match.
+fn attribute_text_hits<'a>(
+    rows: &'a [Vec<String>],
+    hits: &'a [infigraph_core::search::GrepMatch],
+) -> Vec<TextHit<'a>> {
+    let intervals: Vec<(&str, usize, usize, &str)> = rows
+        .iter()
+        .filter(|row| !row[2].eq_ignore_ascii_case("module"))
+        .filter_map(|row| {
+            let start: usize = row.get(5)?.parse().ok()?;
+            let end: usize = row.get(6)?.parse().ok()?;
+            Some((row[3].as_str(), start, end, row[0].as_str()))
+        })
+        .collect();
+    hits.iter()
+        .map(|hit| TextHit {
+            hit,
+            symbol: find_containing_symbol(&intervals, &hit.file, hit.line_number),
+        })
+        .collect()
+}
+
+/// Order the symbol results, putting symbols that contain a text hit first,
+/// then truncate to `limit`.
+///
+/// A literal the caller typed that actually occurs is stronger evidence than
+/// any semantic neighbour, so its symbols lead -- and are added when they did
+/// not rank at all (at score 1.0, since the match is exact). For a plain query
+/// only while the literal is specific: more hits than `limit` means something
+/// like `error`, and promoting those would evict every semantic result. Such
+/// hits are still listed by [`render_text_matches`], just not ranked. A
+/// `regex` search is the caller asking for the text itself, so it always
+/// ranks its hits first.
+fn rank_with_text_hits(
+    mut results: Vec<infigraph_core::search::SearchResult>,
+    hits: &[TextHit<'_>],
+    rows: &[Vec<String>],
+    limit: usize,
+    regex: bool,
+) -> Vec<infigraph_core::search::SearchResult> {
+    let mut ranked = Vec::new();
+    if regex || hits.len() <= limit {
+        let mut seen = std::collections::HashSet::new();
+        for id in hits.iter().filter_map(|h| h.symbol) {
+            if !seen.insert(id) {
+                continue;
+            }
+            if let Some(pos) = results.iter().position(|r| r.symbol_id == id) {
+                ranked.push(results.remove(pos));
+            } else if let Some(row) = rows.iter().find(|row| row[0] == id) {
+                ranked.push(infigraph_core::search::SearchResult {
+                    symbol_id: row[0].clone(),
+                    name: row[1].clone(),
+                    kind: row[2].clone(),
+                    file: row[3].clone(),
+                    score: 1.0,
+                    bm25_score: 0.0,
+                    vector_score: 0.0,
+                    docstring: row.get(4).filter(|d| !d.is_empty()).cloned(),
+                });
+            }
+        }
+    }
+    ranked.extend(results);
+    ranked.truncate(limit);
+    ranked
+}
+
+/// How many text matches a search lists: every one it collected for a `regex`
+/// search, the first `limit` otherwise.
+///
+/// `regex: true` is how a caller enumerates -- every call site before a
+/// rename -- and cutting that at `limit` (which also sizes the symbol list)
+/// would send them to `search_code` for the rest. A plain query wants the
+/// best few lines alongside its symbols, not a wall of them.
+fn text_matches_shown(limit: usize, regex: bool) -> usize {
+    if regex {
+        TEXT_MATCH_CAP
+    } else {
+        limit
+    }
+}
+
+/// The `Text matches:` section: every hit up to `limit`, each naming the symbol
+/// it falls in.
+///
+/// One section rather than a `grep:` line under each symbol: search output is
+/// compressed at `Summary`, and `compress_search` keeps this section but drops
+/// indented lines, so per-symbol lines vanished for exactly the callers who
+/// most needed them.
+fn render_text_matches(hits: &[TextHit<'_>], rows: &[Vec<String>], limit: usize) -> String {
+    if hits.is_empty() {
+        return String::new();
+    }
+    let names: std::collections::HashMap<&str, &str> = hits
+        .iter()
+        .filter_map(|h| h.symbol)
+        .filter_map(|id| {
+            let row = rows.iter().find(|row| row[0] == id)?;
+            Some((id, row[1].as_str()))
+        })
+        .collect();
+    let mut out = String::from("\n---\nText matches:\n");
+    for h in hits.iter().take(limit) {
+        out.push_str(&format!(
+            "{}:{}: {}",
+            h.hit.file,
+            h.hit.line_number,
+            h.hit.line_text.trim()
+        ));
+        if let Some(name) = h.symbol.and_then(|id| names.get(id)) {
+            out.push_str(&format!("  (in {name})"));
+        }
+        out.push('\n');
+    }
+    if hits.len() > limit {
+        out.push_str(&format!(
+            "  ... ({} more text matches)\n",
+            hits.len() - limit
+        ));
+    }
+    out
 }
 
 /// One-line warning when the project's persistent dirty set (R3.3.5) says
@@ -931,5 +1033,216 @@ mod staleness_banner_tests {
             staleness_banner(tmp.path()).is_none(),
             "a drained dirty set must stop warning"
         );
+    }
+}
+
+/// #167: `search`'s text matches were computed and then almost always
+/// discarded -- a hit counted only if it fell outside every symbol (never,
+/// given whole-file `Module` symbols), and a hit inside a symbol showed only
+/// if that symbol had already ranked semantically.
+#[cfg(test)]
+mod text_match_tests {
+    use super::{
+        attribute_text_hits, rank_with_text_hits, render_text_matches, text_matches_shown, TextHit,
+        TEXT_MATCH_CAP,
+    };
+    use infigraph_core::search::{GrepMatch, SearchResult};
+
+    /// A row as `get_or_build_search_ctx` produces it:
+    /// `[id, name, kind, file, docstring, start_line, end_line]`.
+    fn row(id: &str, kind: &str, file: &str, start: usize, end: usize) -> Vec<String> {
+        let name = id.rsplit("::").next().unwrap();
+        vec![
+            id.into(),
+            name.into(),
+            kind.into(),
+            file.into(),
+            String::new(),
+            start.to_string(),
+            end.to_string(),
+        ]
+    }
+
+    fn hit(file: &str, line: usize, text: &str) -> GrepMatch {
+        GrepMatch {
+            file: file.into(),
+            line_number: line,
+            line_text: text.into(),
+        }
+    }
+
+    fn result(id: &str, score: f32) -> SearchResult {
+        SearchResult {
+            symbol_id: id.into(),
+            name: id.into(),
+            kind: "Function".into(),
+            file: "x.rs".into(),
+            score,
+            bm25_score: 0.0,
+            vector_score: 0.0,
+            docstring: None,
+        }
+    }
+
+    fn ids(results: &[SearchResult]) -> Vec<&str> {
+        results.iter().map(|r| r.symbol_id.as_str()).collect()
+    }
+
+    /// Every line of a file sits inside its `Module` symbol, so the module
+    /// can never be the answer -- the narrowest symbol around the line is.
+    #[test]
+    fn a_hit_belongs_to_the_innermost_symbol_not_the_whole_file_module() {
+        let rows = vec![
+            row("a.rs::crate", "Module", "a.rs", 0, 300),
+            row("a.rs::Outer", "Class", "a.rs", 10, 200),
+            row("a.rs::Outer::inner", "Method", "a.rs", 50, 60),
+        ];
+        let hits = vec![hit("a.rs", 55, "the literal")];
+        let attributed = attribute_text_hits(&rows, &hits);
+        assert_eq!(attributed[0].symbol, Some("a.rs::Outer::inner"));
+    }
+
+    #[test]
+    fn a_hit_outside_every_narrower_symbol_is_a_plain_text_match() {
+        let rows = vec![
+            row("a.rs::crate", "Module", "a.rs", 0, 300),
+            row("a.rs::f", "Function", "a.rs", 10, 20),
+        ];
+        let hits = vec![hit("a.rs", 3, "use the::literal;")];
+        assert_eq!(attribute_text_hits(&rows, &hits)[0].symbol, None);
+    }
+
+    /// The reported case: the literal exists, but the function holding it did
+    /// not rank semantically. It must now appear, ahead of the neighbours.
+    #[test]
+    fn a_specific_literal_pulls_its_unranked_symbol_into_the_results_first() {
+        let rows = vec![
+            row("d.rs::run_write_coordinator", "Function", "d.rs", 485, 1400),
+            row("d.rs::COORDINATOR_TICK", "Variable", "d.rs", 31, 31),
+        ];
+        let hits = vec![hit("d.rs", 1134, "// Piggybacks on this loop's tick")];
+        let semantic = vec![
+            result("d.rs::COORDINATOR_TICK", 0.97),
+            result("z.rs::other", 0.85),
+        ];
+
+        let ranked = rank_with_text_hits(
+            semantic,
+            &attribute_text_hits(&rows, &hits),
+            &rows,
+            5,
+            false,
+        );
+
+        assert_eq!(
+            ids(&ranked),
+            [
+                "d.rs::run_write_coordinator",
+                "d.rs::COORDINATOR_TICK",
+                "z.rs::other"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_symbol_already_ranked_is_moved_up_not_duplicated() {
+        let rows = vec![row("a.rs::f", "Function", "a.rs", 1, 9)];
+        let hits = vec![hit("a.rs", 4, "literal"), hit("a.rs", 5, "literal again")];
+        let semantic = vec![result("b.rs::g", 0.9), result("a.rs::f", 0.6)];
+
+        let ranked = rank_with_text_hits(
+            semantic,
+            &attribute_text_hits(&rows, &hits),
+            &rows,
+            5,
+            false,
+        );
+
+        assert_eq!(ids(&ranked), ["a.rs::f", "b.rs::g"]);
+    }
+
+    /// A literal matching more lines than the caller asked for is not specific
+    /// evidence (think `error`); promoting its symbols would evict every
+    /// semantic result. Its lines are still listed, just not ranked.
+    #[test]
+    fn a_common_literal_leaves_the_semantic_order_alone() {
+        let rows = vec![
+            row("a.rs::f", "Function", "a.rs", 1, 9),
+            row("a.rs::g", "Function", "a.rs", 10, 19),
+        ];
+        let hits = vec![
+            hit("a.rs", 2, "error"),
+            hit("a.rs", 11, "error"),
+            hit("a.rs", 12, "error"),
+        ];
+        let semantic = vec![result("b.rs::best", 0.9), result("b.rs::next", 0.8)];
+
+        let ranked = rank_with_text_hits(
+            semantic,
+            &attribute_text_hits(&rows, &hits),
+            &rows,
+            2,
+            false,
+        );
+
+        assert_eq!(ids(&ranked), ["b.rs::best", "b.rs::next"]);
+    }
+
+    /// `regex: true` is the caller saying "I want the text", so the specificity
+    /// guard above does not apply: a pattern matching 13 call sites must list
+    /// their symbols, not semantic neighbours of the pattern's words.
+    #[test]
+    fn a_regex_search_ranks_its_hit_symbols_first_however_many_there_are() {
+        let rows = vec![
+            row("a.rs::f", "Function", "a.rs", 1, 9),
+            row("a.rs::g", "Function", "a.rs", 10, 19),
+        ];
+        let hits = vec![
+            hit("a.rs", 2, "x"),
+            hit("a.rs", 11, "x"),
+            hit("a.rs", 12, "x"),
+        ];
+        let semantic = vec![result("b.rs::best", 0.9), result("b.rs::next", 0.8)];
+
+        let ranked =
+            rank_with_text_hits(semantic, &attribute_text_hits(&rows, &hits), &rows, 2, true);
+
+        assert_eq!(ids(&ranked), ["a.rs::f", "a.rs::g"]);
+    }
+
+    /// Search output is compressed at `Summary`, which strips indented lines
+    /// under a symbol but keeps the `Text matches:` section -- so every hit,
+    /// attributed or not, is rendered there, naming its symbol.
+    #[test]
+    fn every_hit_is_listed_in_the_text_matches_section_with_its_symbol() {
+        let rows = vec![row("a.rs::f", "Function", "a.rs", 1, 9)];
+        let hits = vec![hit("a.rs", 4, "  inside f  "), hit("b.rs", 7, "top level")];
+        let attributed: Vec<TextHit> = attribute_text_hits(&rows, &hits);
+
+        let section = render_text_matches(&attributed, &rows, 10);
+
+        assert!(section.starts_with("\n---\nText matches:\n"), "{section}");
+        assert!(section.contains("a.rs:4: inside f  (in f)"), "{section}");
+        assert!(section.contains("b.rs:7: top level\n"), "{section}");
+        assert!(!section.contains("grep:"), "{section}");
+    }
+
+    #[test]
+    fn the_rendered_section_is_capped_at_the_limit_and_says_how_many_it_left_out() {
+        let rows: Vec<Vec<String>> = Vec::new();
+        let hits: Vec<GrepMatch> = (1..=5).map(|n| hit("a.rs", n, "x")).collect();
+        let section = render_text_matches(&attribute_text_hits(&rows, &hits), &rows, 2);
+        assert_eq!(section.matches("a.rs:").count(), 2, "{section}");
+        assert!(section.contains("3 more"), "{section}");
+    }
+
+    /// `regex: true` is how a caller enumerates -- every call site before a
+    /// rename -- so it lists every match the search collected, not the first
+    /// `limit` (which also sizes the symbol list). That is what lets `search`
+    /// stand in for `search_code` rather than send callers to a second tool.
+    #[test]
+    fn a_regex_search_lists_every_collected_match_and_a_plain_one_stops_at_the_limit() {
+        assert_eq!(text_matches_shown(20, true), TEXT_MATCH_CAP);
+        assert_eq!(text_matches_shown(20, false), 20);
     }
 }
