@@ -109,7 +109,18 @@ pub(crate) fn apply_resolved_artifact(
             // The ownership manifest already existed for exactly this
             // comparison (it's what protects hand-edits on uninstall) but was
             // never consulted here, on the write side. --force bypasses this.
-            if !force && ownership::hand_edited_since_install(home, &target_path)? {
+            //
+            // A file already identical to what this install writes is not an
+            // edit to protect, whatever the manifest says: that is a local fix
+            // the bundled artifact has caught up to (#169). Writing it re-records
+            // the hash, so the file is tracked as installed again rather than
+            // skipped -- along with every later change to it -- forever.
+            let already_current =
+                std::fs::read(&target_path).is_ok_and(|on_disk| on_disk == content);
+            if !force
+                && !already_current
+                && ownership::hand_edited_since_install(home, &target_path)?
+            {
                 return Ok(ApplyOutcome::Skipped {
                     reason: format!(
                         "{} was changed since infigraph last installed it -- not overwriting. Re-run with --force to overwrite anyway.",
@@ -570,6 +581,45 @@ resolver = ["./resolve-zed-path.sh"]
             std::fs::read_to_string(&hook_path).unwrap(),
             "#!/usr/bin/env bash\necho original\n",
             "force=true should overwrite back to the bundled content"
+        );
+    }
+
+    /// #169: a local edit that the bundled artifact later catches up to is no
+    /// longer an edit worth preserving. Without this, a fix made by hand and
+    /// then upstreamed stays "hand-edited" forever -- the manifest still holds
+    /// the pre-fix hash -- and every later install silently skips the file and
+    /// every future change to it.
+    #[test]
+    fn a_hand_edit_the_bundled_artifact_catches_up_to_is_adopted_not_preserved() {
+        let user_dir = tempfile::tempdir().unwrap();
+        let home_dir = tempfile::tempdir().unwrap();
+        let home = home_dir.path();
+        let mcp_path = "/opt/infigraph/bin/infigraph-mcp";
+        let hook_path = home.join(".claude/hooks/infigraph-enforce.sh");
+        let apply = |content: &'static [u8]| {
+            let bundled: &[(&str, &[u8])] =
+                &[("claude-code/.claude/hooks/infigraph-enforce.sh", content)];
+            let artifacts = discover_artifacts(bundled, user_dir.path(), mcp_path).unwrap();
+            apply_resolved_artifact(&artifacts[0], home, mcp_path, false).unwrap()
+        };
+
+        assert!(matches!(apply(b"echo v1\n"), ApplyOutcome::Written));
+        std::fs::write(&hook_path, "echo v2\n").unwrap();
+
+        // The new release ships exactly the hand-edited content.
+        let outcome = apply(b"echo v2\n");
+        assert!(
+            matches!(outcome, ApplyOutcome::Written),
+            "an on-disk file identical to what install writes has nothing to preserve: {outcome:?}"
+        );
+
+        // And it is tracked as installed again: a genuine edit from here on is
+        // still protected, which only holds if the manifest now has v2's hash.
+        std::fs::write(&hook_path, "echo v3 local\n").unwrap();
+        assert!(matches!(apply(b"echo v2\n"), ApplyOutcome::Skipped { .. }));
+        assert_eq!(
+            std::fs::read_to_string(&hook_path).unwrap(),
+            "echo v3 local\n"
         );
     }
 
@@ -1164,5 +1214,127 @@ resolver = ["./resolve-zed-path.sh"]
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(written["context_servers"]["infigraph"]["command"], mcp_path);
         assert_eq!(written["context_servers"]["infigraph"]["args"][0], "--mcp");
+    }
+
+    /// #169: the bundled SessionEnd cleanup hook used to `kill -9` every
+    /// infigraph-mcp that appeared after SessionStart -- including one a
+    /// *different* session had just started, which killed that session's live
+    /// MCP server mid-conversation. It must kill only processes owned by this
+    /// session's own `claude` process (its child, or the worker one hop below)
+    /// and leave an unrelated server alone.
+    ///
+    /// This test process stands in for `claude`: its pid is the recorded
+    /// marker. Every kill the hook can make is confined to processes this test
+    /// parented, so it is safe on a machine running real infigraph servers.
+    #[cfg(unix)]
+    #[test]
+    fn bundled_session_cleanup_kills_only_this_sessions_mcp_processes() {
+        if std::process::Command::new("jq")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("skipping: the hook needs jq, which is not installed");
+            return;
+        }
+        let user_dir = tempfile::tempdir().unwrap();
+        let home_dir = tempfile::tempdir().unwrap();
+        let mcp_path = "/opt/infigraph/bin/infigraph-mcp";
+        let artifacts =
+            discover_artifacts(BUNDLED_INTEGRATIONS, user_dir.path(), mcp_path).unwrap();
+        let cleanup = artifacts
+            .iter()
+            .find(|a| {
+                a.target_relative_path.as_deref()
+                    == Some(".claude/hooks/infigraph-process-cleanup.sh")
+            })
+            .unwrap();
+        apply_resolved_artifact(cleanup, home_dir.path(), mcp_path, false).unwrap();
+        let hook = home_dir
+            .path()
+            .join(".claude/hooks/infigraph-process-cleanup.sh");
+
+        // A stand-in server whose `ps` line matches the hook's pattern
+        // (`/infigraph-mcp --mcp`). Short sleeps, so the child a SIGKILLed
+        // script leaves behind is gone within a second.
+        let scratch = tempfile::tempdir().unwrap();
+        let fake = scratch.path().join("infigraph-mcp");
+        std::fs::write(&fake, "#!/bin/sh\nwhile :; do sleep 1; done\n").unwrap();
+        make_executable(&fake).unwrap();
+
+        // This session's own server: a direct child of the stand-in `claude`.
+        let mut ours = std::process::Command::new(&fake)
+            .arg("--mcp")
+            .spawn()
+            .unwrap();
+        // Another session's server: started from a shell that exits at once,
+        // so it is reparented away from this process entirely.
+        let unrelated_pid_file = scratch.path().join("unrelated.pid");
+        std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!(
+                "'{}' --mcp >/dev/null 2>&1 & echo $! > '{}'",
+                fake.display(),
+                unrelated_pid_file.display()
+            ))
+            .status()
+            .unwrap();
+        let unrelated: i32 = std::fs::read_to_string(&unrelated_pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let alive = |pid: i32| unsafe { libc::kill(pid, 0) } == 0;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let track_dir = tmp.path().join("infigraph-proc-track");
+        std::fs::create_dir_all(&track_dir).unwrap();
+        std::fs::write(
+            track_dir.join("t169.claude_pid"),
+            std::process::id().to_string(),
+        )
+        .unwrap();
+
+        let mut run = std::process::Command::new(&hook)
+            .env("TMPDIR", tmp.path())
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        {
+            use std::io::Write;
+            run.stdin
+                .take()
+                .unwrap()
+                .write_all(br#"{"session_id":"t169"}"#)
+                .unwrap();
+        }
+        let hook_status = run.wait().unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let ours_gone = loop {
+            if ours.try_wait().unwrap().is_some() {
+                break true;
+            }
+            if std::time::Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        let unrelated_survived = alive(unrelated);
+
+        // Clean up before asserting, so a failure cannot leak either process.
+        let _ = ours.kill();
+        let _ = ours.wait();
+        unsafe { libc::kill(unrelated, libc::SIGKILL) };
+
+        assert!(hook_status.success(), "the hook must exit 0");
+        assert!(
+            ours_gone,
+            "this session's own MCP server (a child of the recorded claude pid) must be killed"
+        );
+        assert!(
+            unrelated_survived,
+            "a server this session does not own must never be killed"
+        );
     }
 }
