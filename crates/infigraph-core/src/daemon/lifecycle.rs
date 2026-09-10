@@ -161,6 +161,86 @@ pub fn ensure_daemon_for_routed_access(root: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Make this process lead its own process group, so its descendants can be
+/// killed as a unit without any risk of reaching anything else.
+///
+/// A daemon spawned by [`spawn_daemon`] already leads one (`setsid`), but
+/// `infigraph daemon` run straight from a shell does not -- it would sit in
+/// that shell job's group, alongside whatever else the user has in the
+/// pipeline. [`kill_own_process_group`] refuses to fire unless leadership
+/// actually holds, and this is what makes it hold.
+///
+/// Best-effort: `setpgid` returns `EPERM` when the caller is already a
+/// session leader, which is the success case arriving by another name.
+pub fn lead_own_process_group() {
+    #[cfg(unix)]
+    unsafe {
+        libc::setpgid(0, 0);
+    }
+}
+
+/// Whether this process leads its own process group -- i.e. whether the
+/// group contains this process and its descendants and nothing else.
+pub fn leads_own_process_group() -> bool {
+    #[cfg(unix)]
+    {
+        // SAFETY: both are argument-less getters that cannot fail.
+        unsafe { libc::getpgrp() == libc::getpid() }
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
+/// Kill every descendant of this process, for an exit path that will not
+/// run any destructor.
+///
+/// SCIP indexers are spawned with `tokio::process` and `kill_on_drop(true)`,
+/// which reaps them when the future is dropped. The daemon's shutdown
+/// watchdog does not drop anything -- it calls `std::process::exit`, and
+/// that runs no destructors at all. So `kill_on_drop` never fires, and a
+/// `rust-analyzer` run outlives the daemon that wanted it: on sittir one
+/// kept going for 51 minutes after its parent was gone, finished, wrote
+/// 65 MB of `.scip` nobody would ever read, and left the graph un-enriched
+/// (#163). This is the same shape as the read socket, whose `reclaim_name`
+/// is also a `Drop` and was defeated by the same hard exit.
+///
+/// Kills the *group*, not the direct children: `rust-analyzer` spawns
+/// `cargo metadata`, so reaping only what we launched leaves grandchildren
+/// behind.
+///
+/// Refuses unless [`leads_own_process_group`] holds. Without that check, an
+/// `infigraph daemon` started from an interactive shell would signal that
+/// shell job's whole group.
+///
+/// Deliberately has no unit test. Exercising it means sending `SIGKILL` to
+/// the caller's own process group, and a test binary that happened to lead
+/// its group would kill the whole test run -- a test that can destroy the
+/// suite running it is worse than no test. The precondition it rests on
+/// (`pgid == pid` for a real daemon) is verifiable from outside, and the
+/// behaviour is verified end to end against a live daemon.
+pub fn kill_own_process_group() -> bool {
+    #[cfg(unix)]
+    {
+        if !leads_own_process_group() {
+            return false;
+        }
+        // SAFETY: 0 means "this process's group", which the guard above has
+        // just established is ours alone. This kills us too, which is the
+        // intent -- the caller is on its way to `exit` regardless, and
+        // anything that must happen first must already have happened.
+        unsafe {
+            libc::killpg(0, libc::SIGKILL);
+        }
+        true
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
 pub fn ensure_daemon_running_required(root: &Path, watch_binary: &Path) -> DaemonStartOutcome {
     if is_remote_backend() {
         return DaemonStartOutcome::AlreadyRunning;

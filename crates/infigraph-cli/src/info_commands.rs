@@ -383,6 +383,13 @@ pub(crate) fn cmd_daemon(root: &Path, debounce: u64) -> Result<()> {
     // itself and deadlock waiting on a request nothing serves.
     std::env::set_var(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND);
 
+    // Lead our own process group, so the hard-exit path below can kill
+    // every descendant as a unit with no chance of reaching anything else.
+    // A daemon spawned by `spawn_daemon` already leads one (setsid); this
+    // covers `infigraph daemon` run by hand from a shell, where the group
+    // would otherwise be that shell job's.
+    infigraph_core::daemon::lifecycle::lead_own_process_group();
+
     // The daemon otherwise has no panic hook at all: a panic anywhere in
     // this process (this thread or any spawned one) unwinds silently past
     // `build_daemon_command`'s redirected stderr with no line marking it
@@ -502,6 +509,21 @@ pub(crate) fn cmd_daemon(root: &Path, debounce: u64) -> Result<()> {
             // the other half of this pair; this half spares every reader in
             // between a refused connection.
             infigraph_core::daemon::read_endpoint::ReadEndpoint::for_root(&watchdog_root).unlink();
+            // Reap descendants the same way, and for the same reason (#163).
+            // SCIP indexers run under `tokio::process` with
+            // `kill_on_drop(true)`, which fires from `Drop` -- and
+            // `std::process::exit` runs no destructors, so it never does. A
+            // rust-analyzer run outlived its daemon by 51 minutes this way,
+            // finished, and wrote 65 MB of `.scip` nobody would read. Kills
+            // the group rather than known children: rust-analyzer spawns
+            // `cargo metadata`, so reaping only direct children strands
+            // grandchildren. This kills us too, hence last.
+            if !infigraph_core::daemon::lifecycle::kill_own_process_group() {
+                eprintln!(
+                    "[daemon] not a process-group leader, so any SCIP indexer still running \
+                     will outlive this exit -- see `infigraph ps`"
+                );
+            }
             std::process::exit(1);
         });
     })

@@ -128,6 +128,84 @@ impl ReadEndpoint {
     }
 }
 
+/// Prefix every read endpoint's socket shares. Also what makes a sweep
+/// safe: anything else in the directory is somebody else's.
+const ENDPOINT_PREFIX: &str = "infigraph-read-";
+
+/// Remove read-service sockets no daemon is listening on, across every
+/// directory a `GenericNamespaced` socket can land in.
+///
+/// `ReadEndpoint::unlink` and `cmd_kill`'s sweep only reach endpoints
+/// somebody still knows about -- the daemon's own on its way out, or a root
+/// in the registry. A daemon for an *unregistered* root, overwhelmingly a
+/// test tempdir, is covered by neither, so its socket outlives it forever.
+/// 120 had accumulated before this was noticed, and ten more appeared
+/// within half an hour of clearing them (#162).
+///
+/// Returns how many were removed. Best-effort throughout: this runs on a
+/// startup path where a directory that cannot be read is not worth failing
+/// over.
+pub fn sweep_orphaned_endpoints(older_than: std::time::Duration) -> usize {
+    #[cfg(unix)]
+    {
+        ReadEndpoint::namespace_dirs()
+            .iter()
+            .map(|d| sweep_orphaned_endpoints_in(d, older_than))
+            .sum()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = older_than;
+        0
+    }
+}
+
+/// [`sweep_orphaned_endpoints`] for one directory, so tests can point it at
+/// a tempdir instead of the real namespace.
+///
+/// Liveness is decided by *connecting*: a listening daemon accepts, an
+/// orphan refuses. That needs no external tooling and no pid bookkeeping,
+/// and it cannot mistake a live endpoint for a dead one.
+///
+/// `older_than` is the floor that keeps this from racing daemon startup --
+/// an endpoint that has been bound but has not yet reached `accept` refuses
+/// a connection and is otherwise indistinguishable from an orphan.
+pub fn sweep_orphaned_endpoints_in(dir: &Path, older_than: std::time::Duration) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.starts_with(ENDPOINT_PREFIX) {
+            // Not ours.
+            continue;
+        }
+        let path = entry.path();
+        let recent = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .and_then(|t| t.elapsed().map_err(std::io::Error::other))
+            .map(|age| age < older_than)
+            .unwrap_or(true); // unreadable age -- leave it alone
+        if recent {
+            continue;
+        }
+        // Connect to *this file*, not to the name. `ReadEndpoint::connect`
+        // resolves through the namespace, which ignores `dir` entirely --
+        // so it would answer for a different socket than the one about to
+        // be deleted. Caught by the test that sweeps a tempdir: both
+        // sockets came back dead and the live one was removed.
+        if std::os::unix::net::UnixStream::connect(&path).is_ok() {
+            continue; // somebody is listening
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
 /// A bound read-service listener.
 ///
 /// A newtype rather than a re-export of `interprocess`'s `Listener`, so this
@@ -264,6 +342,64 @@ mod tests {
         for p in before {
             assert!(!p.exists(), "unlink must remove {}", p.display());
         }
+    }
+
+    /// #162: `unlink` and `cmd_kill`'s sweep only cover endpoints somebody
+    /// still knows about -- a root in the registry, or the daemon's own on
+    /// its way out. A daemon for an *unregistered* root (overwhelmingly a
+    /// test tempdir) is covered by neither, so its socket outlives it
+    /// forever. 120 had accumulated before this was noticed, and ten more
+    /// appeared within half an hour of clearing them.
+    ///
+    /// A live listener accepts a connection; an orphan refuses it. That is
+    /// the distinction, and it needs no external tooling to make.
+    #[test]
+    fn sweep_removes_an_orphaned_socket_and_spares_a_live_one() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // `std`'s UnixListener deliberately does NOT unlink on drop, which
+        // is exactly the corpse a hard-exiting daemon leaves.
+        let orphan = dir.path().join("infigraph-read-0000000000000001");
+        drop(std::os::unix::net::UnixListener::bind(&orphan).unwrap());
+        assert!(
+            orphan.exists(),
+            "test setup: std must leave the socket file"
+        );
+
+        let live = dir.path().join("infigraph-read-0000000000000002");
+        let _listener = std::os::unix::net::UnixListener::bind(&live).unwrap();
+
+        // Something that merely shares the directory must be left alone.
+        let bystander = dir.path().join("something-else.sock");
+        std::fs::write(&bystander, b"not ours").unwrap();
+
+        let removed = sweep_orphaned_endpoints_in(dir.path(), std::time::Duration::ZERO);
+
+        assert_eq!(removed, 1, "exactly the orphan");
+        assert!(!orphan.exists(), "the orphan must go");
+        assert!(
+            live.exists(),
+            "a socket someone is still listening on must not"
+        );
+        assert!(bystander.exists(), "and nothing that isn't ours");
+    }
+
+    /// The age floor exists to avoid racing a daemon that has bound its
+    /// endpoint but not yet reached `accept` -- it would refuse a
+    /// connection and look exactly like an orphan.
+    #[test]
+    fn sweep_leaves_a_socket_younger_than_the_floor_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let fresh = dir.path().join("infigraph-read-0000000000000003");
+        drop(std::os::unix::net::UnixListener::bind(&fresh).unwrap());
+
+        let removed = sweep_orphaned_endpoints_in(dir.path(), std::time::Duration::from_secs(3600));
+
+        assert_eq!(removed, 0);
+        assert!(
+            fresh.exists(),
+            "a just-bound endpoint must survive the sweep, or startup races itself"
+        );
     }
 
     /// Two different roots must not collide onto one endpoint.

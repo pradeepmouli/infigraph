@@ -559,6 +559,18 @@ where
                 .as_ref()
                 .and_then(|prism| prism.graph_store())
         });
+        // Collect endpoints abandoned by daemons that died without
+        // cleaning up (#162). Neither `ReadEndpoint::unlink` nor
+        // `cmd_kill`'s sweep reaches a root nobody registered, so those
+        // sockets otherwise accumulate forever. The age floor keeps this
+        // from racing a peer daemon that has just bound its own endpoint
+        // and not yet reached `accept`.
+        const ORPHAN_SOCKET_AGE: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
+        let swept = read_endpoint::sweep_orphaned_endpoints(ORPHAN_SOCKET_AGE);
+        if swept > 0 {
+            eprintln!("[read] swept {swept} read endpoint(s) left by daemons that are gone");
+        }
+
         match read_service::ReadService::start_with_sources(
             root,
             source,
