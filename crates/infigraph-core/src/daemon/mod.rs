@@ -802,9 +802,9 @@ where
                 waiter_replies,
                 removed_in_drain,
             } = drain_in_flight.take().expect("checked is_some just above");
-            let (guard, outcome) = finish_drain(drain_rt.block_on(handle), &waiter_replies);
-            match outcome {
-                Some(outcome) => {
+            let (guard, finish) = finish_drain(drain_rt.block_on(handle), &waiter_replies);
+            match finish {
+                DrainFinish::Completed(outcome) => {
                     // Removals are counted here rather than off a raw
                     // fsevent (as they were before the producer split, when
                     // this loop owned the watcher): `add_watch_removal`
@@ -864,8 +864,16 @@ where
                         });
                     }
                 }
+                // A preflight declined this write before it reached the
+                // graph, so the handle it would have used is untouched.
+                // Dropping it here is what turned "your project is too
+                // large to write to" into "your project cannot be read at
+                // all" -- only a *successful* drain restores the handle,
+                // and the guard that refused this one guarantees none is
+                // coming (#161). `finish_drain` already logged and replied.
+                DrainFinish::Refused => {}
                 // `finish_drain` already logged and replied to the waiters.
-                None => poison_watch_db(&mut held_prism),
+                DrainFinish::Failed => poison_watch_db(&mut held_prism),
             }
             drop(guard);
         }
@@ -1352,9 +1360,26 @@ struct DrainTaskOutput {
     result: Result<crate::daemon::drain::DrainOutcome>,
 }
 
+/// How a drain ended, from the perspective of the one decision that turns
+/// on it: whether the daemon's shared read handle is still trustworthy.
+enum DrainFinish {
+    /// The drain ran. `Box` keeps this enum small -- `DrainOutcome` carries
+    /// every extraction from the batch, and clippy rightly objects to a
+    /// variant that dwarfs its siblings.
+    Completed(Box<crate::daemon::drain::DrainOutcome>),
+    /// A preflight guard declined the write before it touched the graph
+    /// (`is_write_refusal`). Nothing was written, so the read handle is
+    /// exactly as valid as it was -- keep it. Poisoning here is what made a
+    /// too-large graph unreadable instead of merely un-writable (#161).
+    Refused,
+    /// The drain failed in a way that may have left the handle stale, or
+    /// panicked out of an unknown state. Poison it.
+    Failed,
+}
+
 /// Collects a finished drain task. Returns the index-op guard to keep held
 /// (absent if the task panicked, since it was dropped during the unwind)
-/// and the outcome, if the drain produced one.
+/// and what became of the drain.
 ///
 /// Both failure modes -- a panic, and an `execute_drain` error -- answer
 /// every waiter with `WriteResult::Err`. Without that a client blocks until
@@ -1364,22 +1389,24 @@ struct DrainTaskOutput {
 fn finish_drain(
     joined: std::result::Result<DrainTaskOutput, tokio::task::JoinError>,
     waiter_replies: &[PathBuf],
-) -> (
-    Option<crate::ops::IndexOpGuard>,
-    Option<crate::daemon::drain::DrainOutcome>,
-) {
+) -> (Option<crate::ops::IndexOpGuard>, DrainFinish) {
     match joined {
         Ok(DrainTaskOutput {
             guard,
             result: Ok(outcome),
-        }) => (Some(guard), Some(outcome)),
+        }) => (Some(guard), DrainFinish::Completed(Box::new(outcome))),
         Ok(DrainTaskOutput {
             guard,
             result: Err(e),
         }) => {
             eprintln!("[watch] drain failed: {e}");
             reply_err_to_waiters(waiter_replies, &format!("daemon drain failed: {e}"));
-            (Some(guard), None)
+            let finish = if crate::graph::growth_gate::is_write_refusal(&e) {
+                DrainFinish::Refused
+            } else {
+                DrainFinish::Failed
+            };
+            (Some(guard), finish)
         }
         Err(join_err) => {
             eprintln!("[watch] drain task panicked: {join_err}");
@@ -1387,7 +1414,9 @@ fn finish_drain(
                 waiter_replies,
                 &format!("daemon drain task panicked: {join_err}"),
             );
-            (None, None)
+            // A panic can unwind out of anything, including mid-write --
+            // assume the handle is suspect.
+            (None, DrainFinish::Failed)
         }
     }
 }
@@ -2735,13 +2764,17 @@ mod tests {
             "test setup is wrong: the drain task did not actually panic"
         );
 
-        let (guard, outcome) = finish_drain(joined, &[first.clone(), second.clone()]);
+        let (guard, finish) = finish_drain(joined, &[first.clone(), second.clone()]);
         assert!(
             guard.is_none(),
             "a panicking task drops its index-op guard during the unwind, \
              so there is none left to hand back"
         );
-        assert!(outcome.is_none(), "a panicked drain produced no outcome");
+        assert!(
+            matches!(finish, DrainFinish::Failed),
+            "a panic can unwind out of a half-finished write, so the shared \
+             read handle must be treated as suspect"
+        );
 
         for reply_path in [&first, &second] {
             let contents = std::fs::read_to_string(reply_path).unwrap_or_else(|e| {
@@ -2847,9 +2880,12 @@ mod tests {
                 guard,
                 result: Err(err),
             });
-        let (guard, outcome) = finish_drain(joined, &[ok_reply.clone(), fail_reply.clone()]);
+        let (guard, finish) = finish_drain(joined, &[ok_reply.clone(), fail_reply.clone()]);
         assert!(guard.is_some());
-        assert!(outcome.is_none());
+        assert!(matches!(finish, DrainFinish::Failed));
+
+        // #161: a *refused* drain is a different animal. See
+        // `refused_drain_keeps_the_read_handle` below.
 
         let ok_after: crate::daemon_protocol::WriteResult =
             serde_json::from_str(&std::fs::read_to_string(&ok_reply).unwrap()).unwrap();
@@ -3162,6 +3198,68 @@ mod watchable_root_tests {
     fn an_empty_directory_is_allowed() {
         let tmp = tempfile::tempdir().unwrap();
         ensure_watchable_root(tmp.path()).expect("nothing to conflate");
+    }
+}
+
+/// #161: the daemon poisons its shared read handle on drain failure, which
+/// is right for a failure that could have left it stale and wrong for a
+/// refusal.
+///
+/// Every `refusing to index --` guard declines *before* the write reaches
+/// the graph, so the handle is exactly as valid as it was. Treating that as
+/// a failure is what turned a too-large graph from un-writable into
+/// unreadable: each refused drain dropped the handle, and only a
+/// *successful* drain restores one, which the breaker that refused it
+/// guarantees will never arrive. sittir logged 15 refusals and answered
+/// every read with "the daemon has no graph open yet", advising a retry
+/// that could not help.
+#[cfg(test)]
+mod refused_drain_tests {
+    use super::*;
+    use crate::ops::{begin_index_op, IndexOpOutcome};
+    use std::time::Duration;
+
+    fn drain_err(root: &std::path::Path, err: anyhow::Error) -> DrainFinish {
+        let guard = match begin_index_op(root, "test", Duration::ZERO).unwrap() {
+            IndexOpOutcome::Acquired(g) => g,
+            IndexOpOutcome::AlreadyRunning(_) => panic!("test setup is wrong: lock contended"),
+        };
+        let joined: std::result::Result<DrainTaskOutput, tokio::task::JoinError> =
+            Ok(DrainTaskOutput {
+                guard,
+                result: Err(err),
+            });
+        finish_drain(joined, &[]).1
+    }
+
+    #[test]
+    fn a_refused_drain_keeps_the_read_handle() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".infigraph")).unwrap();
+
+        let refusal = anyhow::anyhow!(
+            "{}graph at /x/graph is 2019 MB, 31x its recorded healthy size (63 MB)",
+            crate::graph::growth_gate::WRITE_REFUSED_PREFIX
+        );
+        assert!(
+            matches!(drain_err(tmp.path(), refusal), DrainFinish::Refused),
+            "a preflight refusal never touched the graph, so the read handle \
+             must survive it"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_drain_failure_still_poisons() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".infigraph")).unwrap();
+
+        let failure =
+            anyhow::anyhow!("Query execution failed: Invalid transaction type to rollback.");
+        assert!(
+            matches!(drain_err(tmp.path(), failure), DrainFinish::Failed),
+            "the distinction must stay narrow -- poisoning exists for a graph \
+             replaced under a live connection, and that case must keep working"
+        );
     }
 }
 

@@ -24,12 +24,15 @@ impl GraphStore {
                 std::slice::from_ref(extraction),
             );
             if let Err(shortfall) = super::store_util::check_disk_headroom(dir, projected) {
-                anyhow::bail!("refusing to index -- {shortfall}");
+                anyhow::bail!(
+                    "{}{shortfall}",
+                    crate::graph::growth_gate::WRITE_REFUSED_PREFIX
+                );
             }
             // R3.1.4d/#100: circuit breaker against the runaway-graph-growth
             // pattern, same call site as the disk-headroom preflight above.
             if let Err(msg) = super::store_util::check_graph_growth_ratio(dir, self.db_path()) {
-                anyhow::bail!("refusing to index -- {msg}");
+                anyhow::bail!("{}{msg}", crate::graph::growth_gate::WRITE_REFUSED_PREFIX);
             }
         }
 

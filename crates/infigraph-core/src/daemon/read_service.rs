@@ -192,7 +192,17 @@ fn serve_one<S: std::io::Read + std::io::Write>(
     let Some(store) = source() else {
         write_frame(
             &mut stream,
-            &ReadFrame::Error(format!("{NOT_READY}; retry once indexing has started")),
+            // Advice, not a promise. "retry once indexing has started" named
+            // a precondition that could never arrive whenever the daemon was
+            // not going to index again -- with the #100 breaker engaged, for
+            // instance, every drain is refused and there is no "once" to wait
+            // for. `RemoteExec` matches on `NOT_READY` alone, so this text is
+            // free to say something true instead.
+            &ReadFrame::Error(format!(
+                "{NOT_READY}; the endpoint binds before the graph opens, so this usually \
+                 clears within seconds. If it persists, check `infigraph ps` and the \
+                 daemon log for why the graph did not open"
+            )),
         )?;
         return Ok(());
     };

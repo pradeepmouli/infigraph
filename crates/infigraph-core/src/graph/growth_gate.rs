@@ -19,6 +19,35 @@ use anyhow::{anyhow, Result};
 
 use super::GraphStore;
 
+/// How every preflight guard words its refusal. One constant because the
+/// wording is now load-bearing: [`is_write_refusal`] classifies on it.
+pub(crate) const WRITE_REFUSED_PREFIX: &str = "refusing to index -- ";
+
+/// Whether a failed write was *refused by a preflight guard* rather than
+/// having actually gone wrong.
+///
+/// The distinction matters to exactly one caller and matters a lot there
+/// (#161). The daemon poisons its shared read handle whenever a drain
+/// fails, which is right for a failure that could have left the handle
+/// stale -- a graph replaced under a live connection by a concurrent
+/// `index --full` is the case it exists for. It is wrong for a refusal: a
+/// preflight declines *before* the write touches the graph, so the handle
+/// is exactly as valid as it was a moment earlier.
+///
+/// Getting that backwards made a too-large graph unreadable rather than
+/// merely un-writable. Every drain was refused by the growth breaker, every
+/// refusal dropped the read handle, and only a *successful* drain restores
+/// it -- which the breaker guarantees will never come. sittir logged 15
+/// such refusals and served "the daemon has no graph open yet" to every
+/// read, advising a retry that could not help.
+///
+/// Walks the cause chain: the error reaches the drain-failure path wrapped
+/// in context, so matching only the outermost message would miss it.
+pub(crate) fn is_write_refusal(err: &anyhow::Error) -> bool {
+    err.chain()
+        .any(|cause| cause.to_string().contains(WRITE_REFUSED_PREFIX))
+}
+
 pub(crate) struct GrowthGate<F: FnMut() -> std::result::Result<(), String>> {
     every: usize,
     seen: usize,
@@ -40,7 +69,7 @@ impl<F: FnMut() -> std::result::Result<(), String>> GrowthGate<F> {
     pub(crate) fn tick(&mut self) -> Result<()> {
         self.seen += 1;
         if self.every > 0 && self.seen.is_multiple_of(self.every) {
-            (self.check)().map_err(|msg| anyhow!("refusing to index -- {msg}"))?;
+            (self.check)().map_err(|msg| anyhow!("{WRITE_REFUSED_PREFIX}{msg}"))?;
         }
         Ok(())
     }
@@ -163,6 +192,7 @@ impl GraphStore {
 #[cfg(test)]
 mod tests {
     use super::{CopyRetryBudget, GrowthGate};
+    use anyhow::{anyhow, Context};
 
     /// #157: `MAX_*_RETRIES` bounds a COPY retry loop by attempt count, and
     /// every attempt re-COPYs the whole remaining batch -- so the cost of
@@ -259,6 +289,47 @@ mod tests {
             }
         }
         assert_eq!(calls, 2, "checked after the 3rd and 6th tick");
+    }
+
+    /// #161: a refused write must be distinguishable from a failed one.
+    /// Every `refusing to index --` site declines *before* touching the
+    /// graph, so the daemon's live read handle is untouched -- but the
+    /// drain-failure path poisoned it regardless, and only a *successful*
+    /// drain restores it. With the breaker engaged that never comes, so a
+    /// project that was merely too large became unreadable.
+    #[test]
+    fn a_gate_refusal_is_recognised_as_a_refusal_not_a_failure() {
+        let mut gate = GrowthGate::new(1, || Err("graph is 31x its healthy size".to_string()));
+        let err = gate.tick().unwrap_err();
+        assert!(
+            super::is_write_refusal(&err),
+            "the gate's own error must classify as a refusal: {err}"
+        );
+    }
+
+    /// The error reaches the drain-failure path wrapped in context, so
+    /// matching only the outermost message would miss it.
+    #[test]
+    fn a_refusal_is_still_recognised_under_added_context() {
+        let mut gate = GrowthGate::new(1, || Err("graph is 31x its healthy size".to_string()));
+        let err = gate
+            .tick()
+            .context("drain batch 3")
+            .context("watch loop")
+            .unwrap_err();
+        assert!(
+            super::is_write_refusal(&err),
+            "must walk the cause chain, not just the top: {err}"
+        );
+    }
+
+    /// The distinction has to be narrow, or it silences the poisoning that
+    /// exists for real staleness -- a graph replaced under a live
+    /// connection by a concurrent `index --full`.
+    #[test]
+    fn an_ordinary_failure_is_not_a_refusal() {
+        let err = anyhow!("Query execution failed: Invalid transaction type to rollback.");
+        assert!(!super::is_write_refusal(&err));
     }
 
     #[test]
