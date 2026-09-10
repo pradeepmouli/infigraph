@@ -63,6 +63,10 @@ pub use test_templates::{test_templates_for, TestTemplate};
 //   not relative to a baseline and applies even before one is recorded --
 //   the ratio guard is only consulted between operations, so a single
 //   runaway operation can overshoot it by orders of magnitude.
+// - copy_retry_max_batch_multiple: how many times a COPY retry loop may
+//   re-spend its own batch before falling back, 0 disables
+//   (`store_util::copy_retry_max_batch_multiple`, #157). Bounds one loop,
+//   where growth_max_ratio/max_bytes bound the whole store.
 // - quarantine_max_bytes: corrupt-base-image byte cap, 0 disables
 //   (`quarantine::quarantine_max_bytes`, R7.3 / #100)
 // - slow_lock_ms: slow-acquire recording threshold
@@ -75,6 +79,7 @@ crate::settings! {
         growth_max_ratio: u64 = 10,
         max_bytes: u64 = 8 * 1024 * 1024 * 1024,
         checkpoint_idle_secs: u64 = 5,
+        copy_retry_max_batch_multiple: u64 = 8,
         quarantine_max_bytes: u64 = 1024 * 1024 * 1024,
         slow_lock_ms: u64 = 2000,
         doc_hnsw_threshold: u64 = 200_000,

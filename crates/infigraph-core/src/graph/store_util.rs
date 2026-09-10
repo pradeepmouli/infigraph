@@ -112,6 +112,23 @@ fn graph_max_bytes() -> u64 {
     crate::graph::Graph::resolve(crate::graph::RawGraph::default(), None).max_bytes
 }
 
+/// How many times a COPY retry loop may re-spend its own batch before
+/// giving up and taking the caller's fallback path; 0 disables the budget
+/// (`INFIGRAPH_GRAPH_COPY_RETRY_MAX_BATCH_MULTIPLE`). See
+/// [`crate::graph::growth_gate::CopyRetryBudget`].
+///
+/// 8 against a bound of 20 attempts, each of which re-COPYs the whole
+/// remaining batch. Deliberately generous rather than tight: the batch is
+/// measured as *Parquet*, which is compressed and columnar, so the graph
+/// bytes one COPY produces are some larger multiple of it -- a factor this
+/// cannot know and should not pretend to. Erring generous costs a later
+/// stop; erring tight sends a converging loop to the slow UNWIND path,
+/// which is correct but much slower, and silently so.
+pub(crate) fn copy_retry_max_batch_multiple() -> u64 {
+    crate::graph::Graph::resolve(crate::graph::RawGraph::default(), None)
+        .copy_retry_max_batch_multiple
+}
+
 fn graph_health_path(infigraph_dir: &Path) -> std::path::PathBuf {
     infigraph_dir.join("graph.health.json")
 }
@@ -190,22 +207,38 @@ pub(crate) fn stamp_healthy_graph_size_if_unset(infigraph_dir: &Path, graph_path
 /// pre-write size. `stamp_healthy_graph_size_if_unset`, called by the same
 /// write paths *after* their write completes, is what actually bootstraps
 /// the first real baseline.
+/// Bytes of the base image alone, split out only because
+/// `check_graph_growth_ratio`'s message reports the two halves separately.
+fn graph_base_bytes(graph_path: &Path) -> u64 {
+    std::fs::metadata(graph_path).map(|m| m.len()).unwrap_or(0)
+}
+
+/// Bytes of every WAL-family sibling of `graph_path`.
+///
+/// The checkpointed `graph` file alone isn't the whole story -- a sittir
+/// incident (2026-08-31) crashed with `graph.wal` grown to ~97GB while
+/// `graph` itself stayed small, which the growth check missed entirely
+/// before this was summed in. Any new measurement of "how big is this
+/// graph" belongs on [`graph_family_bytes`] for the same reason.
+fn graph_wal_bytes(graph_path: &Path) -> u64 {
+    crate::graph::store::wal_family_paths(graph_path)
+        .iter()
+        .filter_map(|p| std::fs::metadata(p).ok())
+        .map(|m| m.len())
+        .sum()
+}
+
+/// The graph's total on-disk footprint: base image plus uncommitted WAL.
+pub(crate) fn graph_family_bytes(graph_path: &Path) -> u64 {
+    graph_base_bytes(graph_path).saturating_add(graph_wal_bytes(graph_path))
+}
+
 pub(crate) fn check_graph_growth_ratio(
     infigraph_dir: &Path,
     graph_path: &Path,
 ) -> Result<(), String> {
-    let graph_size = std::fs::metadata(graph_path).map(|m| m.len()).unwrap_or(0);
-    // The checkpointed `graph` file alone isn't the whole story -- a
-    // sittir incident (2026-08-31) crashed with `graph.wal` grown to ~97GB
-    // while `graph` itself stayed small, which this check would have missed
-    // entirely before this fix (it only ever stat'd `graph_path`). Sum in
-    // every WAL-family sibling too, so uncommitted growth is caught, not
-    // just checkpointed growth.
-    let wal_size: u64 = crate::graph::store::wal_family_paths(graph_path)
-        .iter()
-        .filter_map(|p| std::fs::metadata(p).ok())
-        .map(|m| m.len())
-        .sum();
+    let graph_size = graph_base_bytes(graph_path);
+    let wal_size = graph_wal_bytes(graph_path);
     if graph_size == 0 && wal_size == 0 {
         return Ok(()); // fresh/missing graph -- nothing to compare
     }
@@ -529,6 +562,11 @@ pub(crate) fn copy_edges_with_bad_record_retry(
     // Every attempt is a whole new COPY -- re-check growth each time
     // (#132 gap 1) rather than trusting the caller's once-per-call preflight.
     let mut gate = store.growth_gate(1);
+    // ...and bound what the *loop* may spend, not just how big the store may
+    // get (#157). Every attempt below re-COPYs the whole remaining batch, so
+    // exhausting the attempt count costs `batch x MAX_BAD_RECORD_RETRIES`
+    // with no bound in bytes.
+    let mut budget = store.copy_retry_budget();
     // The endpoint pre-filter is a whole-batch fix, so it is worth at most
     // one attempt; if a missing endpoint is still reported afterwards the
     // cause is something the id sets cannot see, and the per-value drops
@@ -545,6 +583,18 @@ pub(crate) fn copy_edges_with_bad_record_retry(
             .map(|(a, b)| (a.as_str(), b.as_str()))
             .collect();
         if parquet_loader::write_edge_parquet(edge_pq, &refs).is_err() {
+            break;
+        }
+        // Arms on the first attempt only; never fires on it, so a loop that
+        // succeeds outright -- or that the pre-filter settles in one retry --
+        // is untouched.
+        budget.arm(std::fs::metadata(edge_pq).map(|m| m.len()).unwrap_or(0));
+        if let Some(why) = budget.exceeded() {
+            eprintln!(
+                "warn: COPY {table} abandoning retries at attempt {}/{MAX_BAD_RECORD_RETRIES} -- \
+                 {why}; falling back to UNWIND",
+                attempt + 1
+            );
             break;
         }
         match conn.query(&format!("COPY {table} FROM '{}'", fwd_slash_path(edge_pq))) {

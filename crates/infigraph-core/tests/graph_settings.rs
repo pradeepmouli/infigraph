@@ -17,6 +17,7 @@ fn graph_group_defaults_match_the_pre_migration_values() {
         "INFIGRAPH_GRAPH_QUARANTINE_MAX_BYTES",
         "INFIGRAPH_GRAPH_SLOW_LOCK_MS",
         "INFIGRAPH_GRAPH_DOC_HNSW_THRESHOLD",
+        "INFIGRAPH_GRAPH_COPY_RETRY_MAX_BATCH_MULTIPLE",
     ] {
         std::env::remove_var(var);
     }
@@ -25,6 +26,29 @@ fn graph_group_defaults_match_the_pre_migration_values() {
     assert_eq!(g.quarantine_max_bytes, 1024 * 1024 * 1024);
     assert_eq!(g.slow_lock_ms, 2000);
     assert_eq!(g.doc_hnsw_threshold, 200_000);
+}
+
+/// #157's budget is only useful if it is reachable and overridable the same
+/// way the other graph bounds are -- it exists precisely for the case where
+/// the default turns out to be wrong for a workload.
+#[test]
+fn copy_retry_max_batch_multiple_defaults_and_reads_its_env_var() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    std::env::remove_var("INFIGRAPH_GRAPH_COPY_RETRY_MAX_BATCH_MULTIPLE");
+    assert_eq!(
+        resolve_graph().copy_retry_max_batch_multiple,
+        8,
+        "generous against the 20-attempt bound, because the batch is measured \
+         as compressed Parquet -- see the accessor's doc comment"
+    );
+
+    std::env::set_var("INFIGRAPH_GRAPH_COPY_RETRY_MAX_BATCH_MULTIPLE", "0");
+    assert_eq!(
+        resolve_graph().copy_retry_max_batch_multiple,
+        0,
+        "0 must be reachable -- it is how the budget is turned off"
+    );
+    std::env::remove_var("INFIGRAPH_GRAPH_COPY_RETRY_MAX_BATCH_MULTIPLE");
 }
 
 #[test]

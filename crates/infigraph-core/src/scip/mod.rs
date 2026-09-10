@@ -467,6 +467,12 @@ pub fn import_scip_index_enriched_at(
         // whole new COPY, and a retry loop is exactly the shape that can
         // outgrow a once-per-call preflight.
         let mut gate = store.growth_gate(1);
+        // ...and bound what this loop may spend, not just how big the store
+        // may get (#157). This is the loop from the #153 incident: 13
+        // retries carried the graph to 42GB, because each attempt re-COPYs
+        // the whole remaining batch and a failed COPY still commits durable
+        // data.
+        let mut budget = store.copy_retry_budget();
         for attempt in 0..MAX_SYMBOL_RETRIES {
             if remaining.is_empty() {
                 break;
@@ -553,6 +559,16 @@ pub fn import_scip_index_enriched_at(
 
             if !pq_ok {
                 eprintln!("Auto-SCIP: parquet write failed, falling back to UNWIND");
+                break;
+            }
+            // Arms on the first attempt only; never fires on it.
+            budget.arm(std::fs::metadata(&sym_pq).map(|m| m.len()).unwrap_or(0));
+            if let Some(why) = budget.exceeded() {
+                eprintln!(
+                    "Auto-SCIP: COPY Symbol abandoning retries at attempt {}/{MAX_SYMBOL_RETRIES} \
+                     -- {why}; falling back to UNWIND",
+                    attempt + 1
+                );
                 break;
             }
 
