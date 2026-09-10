@@ -51,17 +51,24 @@ pub fn watch_enabled_at(root: &Path, section: &str) -> bool {
         return v != "0" && v.to_lowercase() != "false";
     }
 
-    let config_path = root.join(".infigraph").join("config.toml");
-    let Ok(contents) = std::fs::read_to_string(&config_path) else {
-        return true;
-    };
-    let Ok(doc) = contents.parse::<toml_edit::DocumentMut>() else {
-        return true;
-    };
-    doc.get(section)
-        .and_then(|s| s.get("enabled"))
-        .and_then(|v| v.as_bool())
+    // Project layer, then user layer, then the default -- see
+    // `crate::settings_file` for why `$HOME` is a layer here rather than a
+    // fallback, and why this reader keeps taking an explicit root.
+    enabled_in(&crate::settings_file::project_config_path(root), section)
+        .or_else(|| crate::settings_file::user_config_path().and_then(|p| enabled_in(&p, section)))
         .unwrap_or(true)
+}
+
+/// `[section].enabled` as stated by one config file, or `None` when the
+/// file is missing, unparseable, or simply says nothing about it.
+///
+/// `None` rather than a default is the whole point: it is what lets the
+/// layer below have its say, and an unparseable file must not be read as a
+/// deliberate `false`.
+fn enabled_in(config_path: &Path, section: &str) -> Option<bool> {
+    let contents = std::fs::read_to_string(config_path).ok()?;
+    let doc = contents.parse::<toml_edit::DocumentMut>().ok()?;
+    doc.get(section)?.get("enabled")?.as_bool()
 }
 
 /// Persist `enabled` for `role` into `root/.infigraph/config.toml`, leaving
@@ -79,7 +86,7 @@ pub fn write_watch_policy(root: &Path, role: WatchRole, enabled: bool) -> Result
     let section = section_for_role(role)?;
     let ig_dir = root.join(".infigraph");
     std::fs::create_dir_all(&ig_dir)?;
-    let config_path = ig_dir.join("config.toml");
+    let config_path = crate::settings_file::project_config_path(root);
 
     let mut doc: toml_edit::DocumentMut = match std::fs::read_to_string(&config_path) {
         Ok(contents) => contents
@@ -105,6 +112,77 @@ mod tests {
     /// `INFIGRAPH_*_ENABLED` concurrently would race.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+    /// Pins `$HOME` at an empty directory for the guard's lifetime. The
+    /// user layer is real config now, so a test that does not do this reads
+    /// whatever the developer running it happens to have in
+    /// `~/.infigraph/config.toml`.
+    struct PinnedHome {
+        _dir: tempfile::TempDir,
+        orig: Option<String>,
+    }
+
+    impl PinnedHome {
+        fn empty() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let orig = std::env::var("HOME").ok();
+            std::env::set_var("HOME", dir.path());
+            Self { _dir: dir, orig }
+        }
+
+        fn with(section: &str, enabled: bool) -> Self {
+            let pinned = Self::empty();
+            let ig = std::path::Path::new(&std::env::var("HOME").unwrap()).join(".infigraph");
+            std::fs::create_dir_all(&ig).unwrap();
+            std::fs::write(
+                ig.join("config.toml"),
+                format!("[{section}]\nenabled = {enabled}\n"),
+            )
+            .unwrap();
+            pinned
+        }
+    }
+
+    impl Drop for PinnedHome {
+        fn drop(&mut self) {
+            match &self.orig {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+
+    /// #160: the two readers of `.infigraph/config.toml` disagreed about
+    /// whether `~/.infigraph/config.toml` counts. This module's original
+    /// objection to it was that a machine-wide value would apply "with no
+    /// per-project override" -- true of a *fallback*, false of a *layer*,
+    /// because the project wins every key it states (see the test below).
+    #[test]
+    fn watch_enabled_at_falls_through_to_the_user_layer() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("INFIGRAPH_WATCH_ENABLED");
+        let _home = PinnedHome::with("watch", false);
+        let project = tempfile::tempdir().unwrap();
+
+        assert!(
+            !watch_enabled_at(project.path(), "watch"),
+            "a project that states no policy must inherit the user's"
+        );
+    }
+
+    #[test]
+    fn watch_enabled_at_lets_the_project_override_the_user_layer() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("INFIGRAPH_WATCH_ENABLED");
+        let _home = PinnedHome::with("watch", false);
+        let project = tempfile::tempdir().unwrap();
+        write_watch_policy(project.path(), WatchRole::Code, true).unwrap();
+
+        assert!(
+            watch_enabled_at(project.path(), "watch"),
+            "the per-project override is what makes a user layer safe here"
+        );
+    }
+
     #[test]
     fn watch_enabled_at_env_override_priority() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -121,6 +199,7 @@ mod tests {
     #[test]
     fn watch_enabled_at_defaults_to_true_with_nothing_set() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _home = PinnedHome::empty();
         let tmp = tempfile::tempdir().unwrap();
         std::env::remove_var("INFIGRAPH_WATCH_ENABLED");
         std::env::remove_var("INFIGRAPH_WATCH_DOCS_ENABLED");
@@ -141,6 +220,7 @@ mod tests {
     #[test]
     fn watch_enabled_at_reads_given_root_not_an_unrelated_directory() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _home = PinnedHome::empty();
         std::env::remove_var("INFIGRAPH_WATCH_ENABLED");
         let project = tempfile::tempdir().unwrap();
         let decoy = tempfile::tempdir().unwrap();

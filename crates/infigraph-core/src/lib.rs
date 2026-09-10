@@ -47,6 +47,7 @@ pub mod search;
 pub mod security;
 pub mod sequence;
 pub mod settings;
+pub mod settings_file;
 pub mod snapshot;
 pub mod structured;
 pub mod taint;

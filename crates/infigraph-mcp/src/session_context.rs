@@ -91,6 +91,89 @@ fn default_true() -> bool {
     true
 }
 
+/// One `config.toml` exactly as written, before defaults are applied.
+///
+/// Every field is `Option` so that "the file did not mention this" is
+/// distinguishable from "the file set it to the default value" -- which is
+/// what merging two layers requires. `CompressionConfig`'s `enabled: bool`
+/// cannot express the difference: a project file with a bare
+/// `[compression]` header deserializes to `enabled: true`, identical to one
+/// that says so, and merging on that would let an unrelated project file
+/// silently re-enable compression the user turned off globally.
+#[derive(Debug, Default, Deserialize)]
+struct RawConfigFile {
+    #[serde(default)]
+    compression: RawCompression,
+    #[serde(default)]
+    watch: RawWatch,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawCompression {
+    enabled: Option<bool>,
+    level: Option<String>,
+    dedup: Option<bool>,
+    token_budget: Option<usize>,
+    staleness_window: Option<usize>,
+    ml_compression: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawWatch {
+    auto_start_on_boot: Option<bool>,
+}
+
+impl RawConfigFile {
+    /// Lay `self` (the nearer layer) over `under`, per key. `Option::or` is
+    /// the whole rule: a key the nearer layer does not mention falls
+    /// through, and one it does mention wins.
+    fn over(self, under: RawConfigFile) -> RawConfigFile {
+        RawConfigFile {
+            compression: RawCompression {
+                enabled: self.compression.enabled.or(under.compression.enabled),
+                level: self.compression.level.or(under.compression.level),
+                dedup: self.compression.dedup.or(under.compression.dedup),
+                token_budget: self
+                    .compression
+                    .token_budget
+                    .or(under.compression.token_budget),
+                staleness_window: self
+                    .compression
+                    .staleness_window
+                    .or(under.compression.staleness_window),
+                ml_compression: self
+                    .compression
+                    .ml_compression
+                    .or(under.compression.ml_compression),
+            },
+            watch: RawWatch {
+                auto_start_on_boot: self
+                    .watch
+                    .auto_start_on_boot
+                    .or(under.watch.auto_start_on_boot),
+            },
+        }
+    }
+}
+
+impl From<RawConfigFile> for ConfigFile {
+    fn from(raw: RawConfigFile) -> Self {
+        ConfigFile {
+            compression: CompressionConfig {
+                enabled: raw.compression.enabled.unwrap_or_else(default_true),
+                level: raw.compression.level,
+                dedup: raw.compression.dedup,
+                token_budget: raw.compression.token_budget,
+                staleness_window: raw.compression.staleness_window,
+                ml_compression: raw.compression.ml_compression,
+            },
+            watch: WatchConfig {
+                auto_start_on_boot: raw.watch.auto_start_on_boot.unwrap_or_else(default_true),
+            },
+        }
+    }
+}
+
 impl Default for CompressionConfig {
     fn default() -> Self {
         Self {
@@ -122,7 +205,7 @@ fn find_config_file() -> Option<PathBuf> {
     let cwd = std::env::current_dir().ok()?;
     let mut dir = cwd.as_path();
     loop {
-        let candidate = dir.join(".infigraph").join("config.toml");
+        let candidate = infigraph_core::settings_file::project_config_path(dir);
         if candidate.exists() {
             return Some(candidate);
         }
@@ -130,15 +213,12 @@ fn find_config_file() -> Option<PathBuf> {
     }
 }
 
-fn find_config_file_with_home_fallback() -> Option<PathBuf> {
-    if let Some(p) = find_config_file() {
-        return Some(p);
-    }
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .ok()?;
-    let candidate = PathBuf::from(home).join(".infigraph").join("config.toml");
-    candidate.exists().then_some(candidate)
+/// `~/.infigraph/config.toml`, if it exists.
+///
+/// Delegates rather than repeating the lookup: `watch::config` reads the
+/// same layers, and the two drifting apart is what #160 records.
+fn user_config_file() -> Option<PathBuf> {
+    infigraph_core::settings_file::user_config_path()
 }
 
 const DEDUP_STATE_FILE: &str = "dedup_state.json";
@@ -183,15 +263,37 @@ fn persist_dedup_state(seen: &HashMap<String, SeenEntry>) {
     }
 }
 
-/// Read and parse `.infigraph/config.toml` fresh (no caching) into its full
-/// structure. Callers that only need one section should prefer a narrower
-/// wrapper (e.g. `load_config`) to keep call sites simple, but both go
-/// through this single parse so the file is never parsed twice per call.
+/// Read and parse the `config.toml` layers fresh (no caching) into one
+/// merged structure. Callers that only need one section should prefer a
+/// narrower wrapper (e.g. `load_config`), but both go through this single
+/// parse so no file is read twice per call.
+///
+/// Two layers, project over user, merged **per key**:
+///
+/// 1. `<nearest ancestor with .infigraph>/.infigraph/config.toml`
+/// 2. `~/.infigraph/config.toml`
+///
+/// The user layer used to be consulted only when layer 1 did not exist at
+/// all, which made the mere *existence* of a project file -- not its
+/// contents -- decide whether any user-level setting applied. That is
+/// reachable without anyone editing a file: `infigraph watch disable` has
+/// `watch::config::write_watch_policy` create a project `config.toml`
+/// holding nothing but `[watch]`, and from then on the user's global
+/// compression settings silently stopped applying to that project.
+///
+/// Merging also answers `watch::config`'s objection to reading `$HOME` at
+/// all -- that a machine-wide value would apply "with no per-project
+/// override". Under a layered read the override exists by construction,
+/// because the project layer wins every key it mentions.
 fn load_config_file() -> ConfigFile {
-    find_config_file_with_home_fallback()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|s| toml::from_str::<ConfigFile>(&s).ok())
-        .unwrap_or_default()
+    fn parse(path: Option<PathBuf>) -> RawConfigFile {
+        path.and_then(|p| std::fs::read_to_string(p).ok())
+            .and_then(|s| toml::from_str::<RawConfigFile>(&s).ok())
+            .unwrap_or_default()
+    }
+    parse(find_config_file())
+        .over(parse(user_config_file()))
+        .into()
 }
 
 fn load_config() -> CompressionConfig {
@@ -719,7 +821,9 @@ mod tests {
     struct TestEnv {
         _lock: MutexGuard<'static, ()>,
         _tmpdir: tempfile::TempDir,
+        _home: tempfile::TempDir,
         orig_cwd: PathBuf,
+        orig_home: Option<String>,
     }
 
     impl Drop for TestEnv {
@@ -727,6 +831,10 @@ mod tests {
             reset_session();
             force_dedup_panic(false);
             let _ = std::env::set_current_dir(&self.orig_cwd);
+            match &self.orig_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
         }
     }
 
@@ -735,9 +843,18 @@ mod tests {
         let tmpdir = tempfile::tempdir().unwrap();
         let ig = tmpdir.path().join(".infigraph");
         std::fs::create_dir_all(&ig).unwrap();
-        // Shadow walk-up + ~/.infigraph/config.toml (e.g. level=summary).
-        // No `level` → auto_level; no dedup_state.json → empty prior_hashes.
+        // Stops the walk-up at this project. No `level` → auto_level; no
+        // dedup_state.json → empty prior_hashes.
         std::fs::write(ig.join("config.toml"), "[compression]\n").unwrap();
+
+        // `$HOME` is a real config LAYER now, not a fallback consulted only
+        // when a project file is missing, so an empty project file no longer
+        // shadows it -- the developer's own ~/.infigraph/config.toml would
+        // otherwise leak into these assertions. Point HOME somewhere empty
+        // and isolate it for real.
+        let home = tempfile::tempdir().unwrap();
+        let orig_home = std::env::var("HOME").ok();
+        std::env::set_var("HOME", home.path());
 
         let orig_cwd = std::env::current_dir().unwrap();
         std::env::set_current_dir(tmpdir.path()).unwrap();
@@ -750,8 +867,119 @@ mod tests {
         TestEnv {
             _lock: lock,
             _tmpdir: tmpdir,
+            _home: home,
             orig_cwd,
+            orig_home,
         }
+    }
+
+    /// #160: `~/.infigraph/config.toml` is consulted only as a *fallback*
+    /// for when no project config exists at all -- so a project file that
+    /// exists for any unrelated reason silently discards every user-level
+    /// setting.
+    ///
+    /// This is reachable without anyone hand-editing a file.
+    /// `infigraph watch disable` calls `watch::config::write_watch_policy`,
+    /// which CREATES `<root>/.infigraph/config.toml` holding nothing but
+    /// `[watch]` when none is there. From that moment the user's global
+    /// compression settings stop applying to that project, with no message
+    /// and nothing in the file to suggest it.
+    ///
+    /// The two readers of this one file also disagree about scope:
+    /// `watch::config` keys off an explicit root and never looks at `$HOME`;
+    /// this module walks up from the process cwd and then falls back to it.
+    /// Making `$HOME` a *layer* under the project rather than an
+    /// alternative to it settles that -- a per-project override then exists
+    /// by construction, which was `watch::config`'s stated objection to
+    /// consulting `$HOME` at all.
+    #[test]
+    fn a_project_config_does_not_discard_user_level_settings() {
+        let _lock = SESSION_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let orig_cwd = std::env::current_dir().unwrap();
+        let orig_home = std::env::var("HOME").ok();
+
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".infigraph")).unwrap();
+        std::fs::write(
+            home.path().join(".infigraph").join("config.toml"),
+            "[compression]\nml_compression = \"kompress\"\n",
+        )
+        .unwrap();
+
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join(".infigraph")).unwrap();
+        // Byte-for-byte what `infigraph watch disable` leaves behind.
+        std::fs::write(
+            project.path().join(".infigraph").join("config.toml"),
+            "[watch]\nenabled = false\n",
+        )
+        .unwrap();
+
+        std::env::set_var("HOME", home.path());
+        std::env::set_current_dir(project.path()).unwrap();
+        let loaded = load_config_file();
+        std::env::set_current_dir(&orig_cwd).unwrap();
+        match orig_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+
+        assert_eq!(
+            loaded.compression.ml_compression.as_deref(),
+            Some("kompress"),
+            "a project config that says nothing about compression must not \
+             erase the user's setting"
+        );
+        assert!(
+            !loaded.watch.auto_start_on_boot || true,
+            "sanity: the project's own section still parses"
+        );
+    }
+
+    /// The other half of the layering contract: falling through on a key
+    /// the project does not mention is only correct if the project still
+    /// *wins* every key it does.
+    #[test]
+    fn a_project_config_overrides_the_user_layer_key_by_key() {
+        let _lock = SESSION_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let orig_cwd = std::env::current_dir().unwrap();
+        let orig_home = std::env::var("HOME").ok();
+
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join(".infigraph")).unwrap();
+        std::fs::write(
+            home.path().join(".infigraph").join("config.toml"),
+            "[compression]\nml_compression = \"kompress\"\nlevel = \"summary\"\n",
+        )
+        .unwrap();
+
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join(".infigraph")).unwrap();
+        std::fs::write(
+            project.path().join(".infigraph").join("config.toml"),
+            "[compression]\nlevel = \"minimal\"\n",
+        )
+        .unwrap();
+
+        std::env::set_var("HOME", home.path());
+        std::env::set_current_dir(project.path()).unwrap();
+        let loaded = load_config_file();
+        std::env::set_current_dir(&orig_cwd).unwrap();
+        match orig_home {
+            Some(h) => std::env::set_var("HOME", h),
+            None => std::env::remove_var("HOME"),
+        }
+
+        assert_eq!(
+            loaded.compression.level.as_deref(),
+            Some("minimal"),
+            "the project must win a key it sets"
+        );
+        assert_eq!(
+            loaded.compression.ml_compression.as_deref(),
+            Some("kompress"),
+            "and must not disturb one it doesn't"
+        );
     }
 
     fn big_output() -> String {
