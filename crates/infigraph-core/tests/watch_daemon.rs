@@ -489,7 +489,7 @@ fn file_present_in_graph(project_dir: &std::path::Path, file: &str) -> bool {
 /// `prism.remove_file`/`remove_files_by_prefix` directly, with no
 /// `begin_index_op` call at all -- unlike every other write path in the
 /// watch loop, a watch-triggered file removal could mutate the graph while
-/// another operation (e.g. a concurrent `infigraph index --full`) believed
+/// another operation (e.g. a concurrent `infigraph rebuild`) believed
 /// it held exclusive access via `index.lock`.
 ///
 /// This drives `run_write_coordinator` directly in a background
@@ -650,7 +650,7 @@ fn watch_triggered_file_removal_contends_with_a_held_index_lock() {
     );
 
     // Only now hold index.lock externally, simulating another in-flight
-    // operation (e.g. a concurrent `infigraph index --full`). It must be
+    // operation (e.g. a concurrent `infigraph rebuild`). It must be
     // held across the removal, which is what this test asserts gets
     // deferred -- but NOT before the subscription probe above, because a
     // newly-created file can only reach `on_event` through the indexing
@@ -837,7 +837,7 @@ fn out_of_scope_write_request_contends_with_a_held_index_lock() {
     }
 
     // Hold index.lock externally, simulating another in-flight operation
-    // (e.g. a concurrent `infigraph index --full`).
+    // (e.g. a concurrent `infigraph rebuild`).
     let held = infigraph_core::ops::begin_index_op(
         project.path(),
         "test-holder",

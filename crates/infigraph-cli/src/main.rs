@@ -77,9 +77,22 @@ enum Commands {
 
     /// Parse all files and build the code graph
     Index {
-        /// Clean .infigraph and rebuild from scratch
-        #[arg(long)]
+        /// Deprecated: use `infigraph rebuild`
+        #[arg(long, hide = true)]
         full: bool,
+        /// Skip embedding generation (faster, disables semantic search)
+        #[arg(long)]
+        no_embed: bool,
+    },
+
+    /// Rebuild the graph from scratch and swap it in -- the repair for a
+    /// graph that is corrupt, wedged, or has outgrown its size guard
+    ///
+    /// Unlike `index`, this builds a brand-new graph at a scratch path,
+    /// takes a restore-point snapshot of the current one, atomically swaps
+    /// the new one in, and re-records the growth baseline. `index --full`
+    /// is the old spelling and still works.
+    Rebuild {
         /// Skip embedding generation (faster, disables semantic search)
         #[arg(long)]
         no_embed: bool,
@@ -965,6 +978,7 @@ pub(crate) fn should_auto_watch(command: &Commands, root: &Path) -> bool {
     matches!(
         command,
         Commands::Index { .. }
+            | Commands::Rebuild { .. }
             | Commands::IndexDocs
             | Commands::ReindexDocs
             | Commands::IndexConfluence { .. }
@@ -1026,6 +1040,8 @@ fn run(command: Commands, root: &Path) -> Result<()> {
     match command {
         Commands::Init { group, quick, yes } => cmd_init(root, group.as_deref(), quick, yes),
         Commands::Index { full, no_embed } => cmd_index(root, full, no_embed),
+        // `rebuild` *is* a full index -- one implementation, two spellings.
+        Commands::Rebuild { no_embed } => cmd_index(root, true, no_embed),
         Commands::Stats => cmd_stats(root),
         Commands::Restore { id, yes } => cmd_restore(root, id.as_deref(), yes),
         Commands::Doctor { global } => cmd_doctor(root, global),
@@ -1331,6 +1347,48 @@ mod tests {
     /// on every call, so even tests that never set it themselves must
     /// coordinate with the one that does.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// #154: `index --full` reads as "index, but more thorough". What it
+    /// does is build a brand-new graph at a scratch path, snapshot the old
+    /// one, swap, and re-record the growth baseline -- a rebuild. It is
+    /// also the *repair* for a wedged or bloated graph, and nothing in the
+    /// name leads anyone there. sittir hit exactly that: the growth breaker
+    /// refused every write and the remediation it printed named a flag on
+    /// an unrelated-sounding command.
+    #[test]
+    fn rebuild_is_the_primary_spelling_and_index_full_still_works() {
+        use clap::Parser;
+
+        let rebuild = Cli::try_parse_from(["infigraph", "rebuild"]).unwrap();
+        assert!(
+            matches!(rebuild.command, Commands::Rebuild { no_embed: false }),
+            "`rebuild` must be a command in its own right"
+        );
+
+        // The old spelling keeps working -- hidden, not removed. Scripts and
+        // muscle memory outlive a rename.
+        let legacy = Cli::try_parse_from(["infigraph", "index", "--full"]).unwrap();
+        assert!(matches!(
+            legacy.command,
+            Commands::Index {
+                full: true,
+                no_embed: false
+            }
+        ));
+    }
+
+    /// A rebuild ingests source exactly as `index` does, so it must not be
+    /// left out of the auto-watch gate just because it is spelled
+    /// differently.
+    #[test]
+    fn rebuild_auto_watches_like_index() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(should_auto_watch(
+            &Commands::Rebuild { no_embed: false },
+            tmp.path()
+        ));
+    }
 
     #[test]
     fn should_auto_watch_allows_only_source_ingesting_commands() {

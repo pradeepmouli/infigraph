@@ -206,7 +206,7 @@ pub fn find_most_recent_previous(infigraph_dir: &Path, graph_name: &str) -> Opti
 /// `daemon::run_write_coordinator`'s `serve_requests` tick). No-op when no
 /// sentinel is pending. Otherwise: under the crash-loop threshold, submits
 /// a synthetic `WriteRequest::FullReindex` request file (the SAME request
-/// type and code path `infigraph index --full` uses) for this same tick's
+/// type and code path `infigraph rebuild` uses) for this same tick's
 /// existing request-directory scan to pick up; at or over the threshold,
 /// writes the crash-loop marker instead and submits nothing.
 pub fn drain_recovery_sentinel(infigraph_dir: &Path) -> Result<()> {

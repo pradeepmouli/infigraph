@@ -618,7 +618,7 @@ fn staleness_banner(root: &std::path::Path) -> Option<String> {
         return Some(format!(
             "⚠ indexing is BLOCKED -- {} file(s) changed since the last index ({sample}{more}), \
              and the runaway-growth breaker is refusing every write, so the watcher cannot \
-             drain them. Run `infigraph index --full` to rebuild and unblock; `infigraph \
+             drain them. Run `infigraph rebuild` to rebuild and unblock; `infigraph \
              doctor` has the details.\n\n",
             names.len()
         ));
@@ -864,7 +864,7 @@ mod staleness_banner_tests {
             "must say indexing is blocked, not just stale: {banner}"
         );
         assert!(
-            banner.contains("index --full"),
+            banner.contains("infigraph rebuild"),
             "must name the remedy that unblocks it: {banner}"
         );
         assert!(

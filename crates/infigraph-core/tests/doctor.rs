@@ -1387,7 +1387,7 @@ fn check_wal_integrity_warns_on_a_wal_left_by_a_dead_holder() {
             .remediation
             .as_deref()
             .unwrap_or("")
-            .contains("index --full"),
+            .contains("infigraph rebuild"),
         "remediation should say how to recover: {:?}",
         results[0].remediation
     );
@@ -1609,7 +1609,7 @@ fn doctor_fails_when_the_growth_breaker_is_latched() {
             .remediation
             .as_deref()
             .unwrap_or_default()
-            .contains("index --full"),
+            .contains("infigraph rebuild"),
         "the remediation must name the rebuild: {:?}",
         latched.remediation
     );

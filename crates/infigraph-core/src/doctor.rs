@@ -482,7 +482,7 @@ pub fn check_one_wal_integrity(project_path: &Path) -> CheckResult {
                 "unreplayed WAL left by dead process {pid} -- opening this graph directly \
                  risks crashing (see github.com/pradeepmouli/infigraph#92)"
             ),
-            "run `infigraph index --full` to rebuild",
+            "run `infigraph rebuild`",
         ),
         None => CheckResult::pass(WAL_CATEGORY, label, "no unreplayed WAL from a dead holder"),
     }
@@ -523,7 +523,7 @@ pub fn check_one_growth_breaker(project_path: &Path) -> Option<CheckResult> {
             GROWTH_CATEGORY,
             label,
             format!("the growth breaker has latched and ALL indexing is blocked -- {msg}"),
-            "run `infigraph index --full` to rebuild the graph compactly and re-stamp the baseline",
+            "run `infigraph rebuild`, which rebuilds compactly and re-stamps the baseline",
         )),
     }
 }
@@ -982,7 +982,7 @@ fn check_one_project_scip_staleness(project_path: &Path) -> Option<CheckResult> 
                  INHERITS edges and other compiler-verified data may be out of date",
                 if behind == 1 { "" } else { "s" }
             ),
-            "run `infigraph index --full` (or re-trigger SCIP enrichment) to refresh it",
+            "run `infigraph rebuild` (or re-trigger SCIP enrichment) to refresh it",
         ))
     } else {
         Some(CheckResult::pass(

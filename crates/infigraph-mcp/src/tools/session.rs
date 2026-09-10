@@ -143,6 +143,7 @@ pub fn tool_save_session(args: &Value) -> Result<String> {
     let root = PathBuf::from(path);
     let sessions_dir = root.join(".infigraph").join("sessions");
 
+    let wrote_narrative;
     let (session_id, session_count) = {
         let _session_lock = lockfile::acquire(
             &sessions_dir.join("sessions.lock"),
@@ -218,7 +219,8 @@ pub fn tool_save_session(args: &Value) -> Result<String> {
 
         store.save(&session)?;
 
-        if !narrative.is_empty() {
+        wrote_narrative = !narrative.is_empty();
+        if wrote_narrative {
             let md_path = sessions_dir.join(format!("{session_id}.md"));
             use std::io::Write;
             let mut f = std::fs::OpenOptions::new()
@@ -245,6 +247,7 @@ pub fn tool_save_session(args: &Value) -> Result<String> {
 
         (session_id, emb_store.len())
     };
+
     // `_session_lock` is dropped here (end of block), released before the
     // auto-consolidation call below — tool_consolidate_memory acquires the
     // same sessions.lock itself (Task 3), so holding it across that call
@@ -262,6 +265,18 @@ pub fn tool_save_session(args: &Value) -> Result<String> {
     } else {
         format!("Session saved: {session_id} (name: {session_name})")
     };
+
+    // Say which sidecar this call wrote. Without it, a save that omitted
+    // the narrative *on purpose* -- which the periodic auto-save hook
+    // instructs -- is indistinguishable from one whose narrative silently
+    // failed, and the only way to tell them apart is to go read the file.
+    // A sittir session did exactly that, concluded the sidecar was broken,
+    // and hand-appended what it had never asked the tool to write.
+    result.push_str(if wrote_narrative {
+        " (narrative appended)"
+    } else {
+        " (narrative omitted)"
+    });
 
     if let Some(consolidation_msg) = auto_consolidated {
         result.push_str(&format!(
@@ -1002,6 +1017,47 @@ mod tests {
             store.save(s).unwrap();
         }
         (dir, store)
+    }
+
+    /// A save that omits the narrative and one whose narrative silently
+    /// failed to write produce identical output today: a bare
+    /// "Session saved". The periodic auto-save hook *instructs* the model to
+    /// omit it, so the common case looks exactly like a bug -- and did: a
+    /// sittir session concluded the sidecar was broken, went looking, and
+    /// hand-appended what the tool had never been asked to write.
+    #[test]
+    fn save_session_says_whether_it_wrote_the_narrative() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_string_lossy().to_string();
+
+        let without = tool_save_session(&serde_json::json!({
+            "path": root,
+            "summary": "a periodic backstop save",
+        }))
+        .unwrap();
+        assert!(
+            without.contains("narrative omitted"),
+            "an omitted narrative must be stated, not left to be inferred from an \
+             unchanged file: {without}"
+        );
+
+        let with = tool_save_session(&serde_json::json!({
+            "path": root,
+            "summary": "a milestone save",
+            "narrative": "explored the thing, found the other thing",
+        }))
+        .unwrap();
+        assert!(
+            with.contains("narrative appended"),
+            "and a written one must say so: {with}"
+        );
+
+        let md: Vec<_> = std::fs::read_dir(dir.path().join(".infigraph").join("sessions"))
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().extension().is_some_and(|x| x == "md"))
+            .collect();
+        assert_eq!(md.len(), 1, "exactly the one narrative was written");
     }
 
     #[test]

@@ -60,7 +60,7 @@ pub fn run_verify(root: &Path) -> Vec<CheckResult> {
                 CATEGORY,
                 "graph: open",
                 format!("{e:#}"),
-                "run `infigraph index --full` to rebuild (a snapshot is taken first)",
+                "run `infigraph rebuild` (a snapshot is taken first)",
             ));
             return results; // nothing below is answerable without the graph
         }
@@ -108,7 +108,7 @@ fn check_symbol_file_references(backend: &crate::graph::KuzuBackend) -> CheckRes
                         orphaned.len(),
                         orphaned.first().unwrap_or(&"?")
                     ),
-                    "run `infigraph index --full` to rebuild consistently",
+                    "run `infigraph rebuild` -- it rebuilds from source consistently",
                 )
             }
         }
@@ -116,7 +116,7 @@ fn check_symbol_file_references(backend: &crate::graph::KuzuBackend) -> CheckRes
             CATEGORY,
             label,
             format!("could not query the graph: {e:#}"),
-            "if this persists, the graph may be corrupt -- `infigraph index --full` rebuilds",
+            "if this persists, the graph may be corrupt -- `infigraph rebuild` repairs it",
         ),
     }
 }

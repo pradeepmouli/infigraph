@@ -607,7 +607,7 @@ pub fn storage_version_mismatch_context(db_path: &Path) -> String {
         "{} was written on a different lbug storage version than this build (v{}) can read \
          -- not corrupted, so it was left untouched. Every process touching this project must \
          run the same installed infigraph build (`infigraph doctor` / `infigraph ps` show mixed \
-         builds); to rebuild on this build's version instead, run `infigraph index --full`.",
+         builds); to rebuild on this build's version instead, run `infigraph rebuild`.",
         db_path.display(),
         kuzu::get_storage_version()
     )
@@ -669,7 +669,7 @@ impl GraphStore {
                 "graph {} has an unreplayed WAL from process {pid}, which is no longer \
                  running (unclean shutdown){explanation} -- refusing to open it directly since \
                  WAL replay in this state has crashed the whole process before (see \
-                 github.com/pradeepmouli/infigraph#92); run `infigraph index --full` to rebuild",
+                 github.com/pradeepmouli/infigraph#92); run `infigraph rebuild` to rebuild",
                 path.display()
             );
         }
@@ -776,7 +776,7 @@ impl GraphStore {
                     "graph has an unreplayed WAL from process {pid}, which is no longer \
                      running (unclean shutdown){explanation} -- refusing to open it directly \
                      since WAL replay in this state has crashed the whole process before (see \
-                     github.com/pradeepmouli/infigraph#92); run `infigraph index --full` to \
+                     github.com/pradeepmouli/infigraph#92); run `infigraph rebuild` to \
                      rebuild"
                 ),
             }));
@@ -858,7 +858,7 @@ impl GraphStore {
             anyhow::bail!(
                 "crash-loop detected: {} auto-rebuild attempts within the last hour -- refusing \
                  further automatic rebuilds. Investigate the underlying cause, then delete {} to \
-                 reset and retry manually with `infigraph index --full`.",
+                 reset and retry manually with `infigraph rebuild`.",
                 attempts.len(),
                 crate::recovery::crash_loop_marker_path(infigraph_dir).display(),
             );
@@ -2320,7 +2320,7 @@ mod tests {
             "must not leave the reader thinking the graph is corrupt: {msg}"
         );
         assert!(
-            msg.contains("index --full"),
+            msg.contains("infigraph rebuild"),
             "the rebuild is still required either way: {msg}"
         );
         assert!(

@@ -229,7 +229,7 @@ fn test_wipe_preserves_backup_pools() {
 /// `full_reindex_wipe` must snapshot the live state before wiping it, and
 /// that snapshot must itself survive the wipe -- end-to-end coverage of the
 /// bug the two fixes above were built to close (caught via a manual CLI run
-/// of `infigraph index --full` before this test existed: the snapshot was
+/// of `infigraph rebuild` before this test existed: the snapshot was
 /// silently deleted by the wipe that followed it).
 #[test]
 fn test_full_reindex_wipe_snapshot_survives_the_wipe() {

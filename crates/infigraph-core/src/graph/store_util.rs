@@ -256,7 +256,7 @@ pub(crate) fn check_graph_growth_ratio(
         return Err(format!(
             "graph at {} is {} MB, past the absolute ceiling of {} MB -- refusing further \
              growth (override with {GRAPH_MAX_BYTES_ENV}, 0 disables). ALL indexing is blocked \
-             until this is resolved -- run `infigraph index --full` to rebuild the graph \
+             until this is resolved -- run `infigraph rebuild`, which rebuilds the graph \
              compactly and re-stamp the baseline",
             graph_path.display(),
             current / (1024 * 1024),
@@ -274,8 +274,8 @@ pub(crate) fn check_graph_growth_ratio(
              ({} MB) -- refusing further growth (cap: {}x, override with \
              {GRAPH_GROWTH_MAX_RATIO_ENV}); this guards against the runaway-WAL-growth pattern \
              from github.com/pradeepmouli/infigraph#100. ALL indexing is blocked until this is \
-             resolved -- run `infigraph index --full` to rebuild the graph compactly and \
-             re-stamp the baseline, or, if this growth is legitimate, delete {} to reset the \
+             resolved -- run `infigraph rebuild`, which rebuilds the graph compactly and \
+             re-stamps the baseline, or, if this growth is legitimate, delete {} to reset the \
              baseline without rebuilding",
             graph_path.display(),
             current / (1024 * 1024),
@@ -936,7 +936,7 @@ mod tests {
         std::fs::write(&graph_path, vec![0u8; 20_000_000]).unwrap();
         let err = check_graph_growth_ratio(tmp.path(), &graph_path).expect_err("must refuse");
         assert!(
-            err.contains("index --full"),
+            err.contains("infigraph rebuild"),
             "the refusal must name the remedy that actually recovers the graph: {err}"
         );
     }

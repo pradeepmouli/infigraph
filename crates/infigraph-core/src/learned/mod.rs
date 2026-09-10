@@ -28,7 +28,7 @@ pub struct LearnedPattern {
 /// Persistent store for learned resolution patterns.
 ///
 /// Stored as `.infigraph/learned/patterns.json`, separate from the graph DB
-/// so it survives `infigraph index --full` and graph rebuilds.
+/// so it survives `infigraph rebuild` and graph rebuilds.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct LearnedStore {
     pub patterns: Vec<LearnedPattern>,

@@ -3,7 +3,7 @@
 //! Distinct from `quarantine`'s two pools (`graph.corrupt.<ts>` for
 //! corruption evidence, `graph.previous.<ts>` for the daemon's
 //! build-then-swap full reindex): this module covers the *local, in-place*
-//! full-reindex path (`infigraph index --full`), which today wipes the
+//! full-reindex path (`infigraph rebuild`), which today wipes the
 //! entire `.infigraph/` tree via `ops::wipe_infigraph_preserving_index_lock`
 //! with no backup at all. `create_snapshot` fills that gap; `restore` then
 //! unifies all three pools behind one CLI-facing interface (R3.2.2), since

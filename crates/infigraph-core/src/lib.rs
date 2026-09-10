@@ -506,7 +506,7 @@ impl Infigraph {
                                 "crash-loop detected: {} auto-rebuild attempts within the last \
                                  hour -- refusing further automatic rebuilds. Investigate the \
                                  underlying cause, then delete {} to reset and retry manually \
-                                 with `infigraph index --full`.",
+                                 with `infigraph rebuild`.",
                                 attempts.len(),
                                 crate::recovery::crash_loop_marker_path(infigraph_dir).display(),
                             );

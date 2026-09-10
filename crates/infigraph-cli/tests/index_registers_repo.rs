@@ -65,7 +65,7 @@ fn index_registers_repo_in_local_registry() {
     );
 }
 
-/// Stops the daemon `infigraph index --full` auto-started under
+/// Stops the daemon `infigraph rebuild` auto-started under
 /// `INFIGRAPH_BACKEND=daemon`, whether the test passes or panics.
 struct StopDaemonOnDrop {
     root: std::path::PathBuf,

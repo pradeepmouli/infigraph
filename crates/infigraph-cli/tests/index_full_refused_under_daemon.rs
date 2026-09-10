@@ -1,4 +1,4 @@
-//! `infigraph index --full` under `INFIGRAPH_BACKEND=daemon` now works by
+//! `infigraph rebuild` under `INFIGRAPH_BACKEND=daemon` now works by
 //! routing through the daemon's own build-fresh-then-swap handler, instead
 //! of refusing. See
 //! docs/superpowers/specs/2026-08-04-daemon-routed-full-reindex-design.md
@@ -69,7 +69,7 @@ fn full_reindex_succeeds_under_daemon_backend_with_a_real_running_daemon() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         output.status.success(),
-        "expected `infigraph index --full` to succeed under the daemon backend, but it failed:\nstdout={}\nstderr={stderr}",
+        "expected `infigraph rebuild` to succeed under the daemon backend, but it failed:\nstdout={}\nstderr={stderr}",
         String::from_utf8_lossy(&output.stdout),
     );
     assert!(

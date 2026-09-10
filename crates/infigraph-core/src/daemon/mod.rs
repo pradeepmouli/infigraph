@@ -58,7 +58,7 @@ crate::settings! {
     scip {
         // R3.3.4a: how many AST generations SCIP enrichment may lag before
         // the daemon re-runs it on its own. 0 disables the automatic
-        // trigger entirely (`infigraph index --full` still enriches).
+        // trigger entirely (`infigraph rebuild` still enriches).
         index_staleness_threshold: u64 = 50,
         // How often the coordinator compares the two counters -- the same
         // coarse cadence as the build-hash self-check, and for the same
@@ -1188,7 +1188,7 @@ where
                 eprintln!(
                     "[watch] {} has a pending recovery (its graph was quarantined and needs a \
                      full reindex), but this watcher does not serve write requests -- run \
-                     `infigraph daemon` in that directory, or `infigraph index --full`, or it \
+                     `infigraph daemon` in that directory, or `infigraph rebuild`, or it \
                      will stay empty",
                     root.display()
                 );
@@ -1536,7 +1536,7 @@ fn poison_watch_db(held: &mut HeldPrism) {
 /// but its fallback paths (out-of-scope variants, malformed JSON, corrupt
 /// sibling extractions files) still execute immediately here -- doing so
 /// unlocked would let them race the periodic reindex, the queue's own drain,
-/// or a concurrent CLI `infigraph index --full`, violating the single-writer
+/// or a concurrent CLI `infigraph rebuild`, violating the single-writer
 /// invariant. On contention the `.request` file is left in place (not
 /// deleted) so it's retried on a later tick, matching the old behavior.
 /// Does nothing while this daemon's own drain is in flight. That drain holds
@@ -2102,7 +2102,7 @@ fn finish_full_reindex(
     let retired_path: Option<PathBuf> = if live_path.exists() {
         // Two backup mechanisms, deliberately layered. create_snapshot gives
         // a whole-`.infigraph/`-tree safety net matching the local
-        // `infigraph index --full` path (R3.2.1/docs/DESIGN-hardening.md
+        // `infigraph rebuild` path (R3.2.1/docs/DESIGN-hardening.md
         // §3.2), so a restore brings back graph and sidecars together.
         // retire_previous_graph then does the actual move-aside of the live
         // graph file -- a *rename*, not a delete, so a failure below (the
