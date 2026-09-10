@@ -495,6 +495,13 @@ pub(crate) fn cmd_daemon(root: &Path, debounce: u64) -> Result<()> {
                 &watchdog_root.join(".infigraph"),
                 "daemon graceful shutdown exceeded its budget",
             );
+            // Release the read endpoint by hand: exiting here skips every
+            // `Drop`, including the listener's, and the socket it leaves
+            // behind is what locks the *next* daemon out of this project
+            // with `Address already in use`. `bind`'s `try_overwrite` is
+            // the other half of this pair; this half spares every reader in
+            // between a refused connection.
+            infigraph_core::daemon::read_endpoint::ReadEndpoint::for_root(&watchdog_root).unlink();
             std::process::exit(1);
         });
     })
@@ -1499,6 +1506,7 @@ pub(crate) fn cmd_kill(root: &Path, pid: u32, force: bool) -> Result<()> {
                 std::thread::sleep(std::time::Duration::from_millis(500));
             }
             report_post_kill_wal_integrity(root);
+            sweep_orphaned_read_endpoints(root);
             Ok(())
         }
         Err(refusal) => anyhow::bail!("refusing to kill pid {pid}: {refusal}"),
@@ -1536,6 +1544,41 @@ pub(crate) fn report_post_kill_wal_integrity(root: &Path) {
         if let Some(remediation) = &result.remediation {
             println!("    -> {remediation}");
         }
+    }
+}
+
+/// Remove the read-service socket of every known project that no longer
+/// has a live daemon.
+///
+/// Killing a daemon is exactly when these become garbage. A SIGTERM the
+/// daemon handles drops its listener and cleans up on its own; a SIGKILL,
+/// or a shutdown that overruns its budget and hard-exits, runs no code at
+/// all and leaves the socket bound. The next daemon for that project then
+/// fails to bind and every routed read for it reports "no daemon read
+/// service is listening" -- 120 such sockets had accumulated in `/tmp`
+/// before this was found.
+///
+/// Gated on the daemon actually being gone: unlinking a *live* daemon's
+/// endpoint would take a working project offline. Sweeping every project
+/// rather than just the killed pid's is deliberate and free -- the pid
+/// alone does not name a root, the same projects are already being walked
+/// for `report_post_kill_wal_integrity`, and this is the natural moment to
+/// collect litter left by earlier kills.
+pub(crate) fn sweep_orphaned_read_endpoints(root: &Path) {
+    let registry = infigraph_core::multi::Registry::load().unwrap_or_default();
+    let mut projects: Vec<PathBuf> = registry.repos.values().map(|e| e.path.clone()).collect();
+    if let Ok(canonical_root) = root.canonicalize() {
+        if !projects.iter().any(|p| p == &canonical_root) {
+            projects.push(canonical_root);
+        }
+    }
+
+    for project in &projects {
+        let lock_path = project.join(".infigraph").join("watch.lock");
+        if infigraph_core::daemon::lifecycle::daemon_is_alive(&lock_path) {
+            continue;
+        }
+        infigraph_core::daemon::read_endpoint::ReadEndpoint::for_root(project).unlink();
     }
 }
 
