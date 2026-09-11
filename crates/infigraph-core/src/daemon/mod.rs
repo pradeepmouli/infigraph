@@ -456,6 +456,7 @@ pub(crate) struct HeldPrism {
 
 /// How long `watch_db` waits for a released graph handle to be dropped by
 /// its last other holder before giving up for this attempt.
+#[cfg_attr(windows, allow(dead_code))]
 const RETIRED_STORE_WAIT: Duration = Duration::from_secs(30);
 
 impl HeldPrism {
@@ -515,6 +516,8 @@ impl HeldPrism {
     /// refusal in `finish_full_reindex` would roll back a good rebuild. Counts
     /// holders through the `Weak` without upgrading it, so this never becomes
     /// the last owner and closes the `Database` here by accident.
+    // Only the held-connection `watch_db` waits; see `is_none`.
+    #[cfg_attr(windows, allow(dead_code))]
     fn wait_for_retired_store(&mut self, budget: Duration) -> Result<()> {
         let Some(retired) = &self.retired else {
             return Ok(());
