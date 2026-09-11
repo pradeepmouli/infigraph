@@ -49,6 +49,39 @@ fn drop_ids_already_in_graph(
         .collect()
 }
 
+/// Existing `(:Symbol)-[table]->(:Symbol)` pairs, keyed by source id.
+type SymbolEdges = HashMap<String, std::collections::HashSet<String>>;
+
+/// Every `table` edge between symbols already in the graph (#176).
+///
+/// CALLS and INHERITS are keyless rel tables, so a COPY appends whatever it
+/// is handed: an import that does not filter against this re-appends every
+/// edge it (or tree-sitter) already wrote, once per enrichment round. A
+/// query failure propagates rather than reading as "no edges" -- that would
+/// duplicate every edge, and for CALLS also make every SCIP resolution look
+/// like a correction to learn.
+fn preload_symbol_edges(conn: &kuzu::Connection<'_>, table: &str) -> Result<SymbolEdges> {
+    let rows = conn
+        .query(&format!(
+            "MATCH (a:Symbol)-[:{table}]->(b:Symbol) RETURN a.id, b.id"
+        ))
+        .with_context(|| format!("SCIP import: failed to preload existing {table} edges"))?;
+    let mut edges = SymbolEdges::new();
+    for row in rows {
+        if row.len() < 2 {
+            continue;
+        }
+        let src = row[0].to_string().trim_matches('"').to_string();
+        let tgt = row[1].to_string().trim_matches('"').to_string();
+        edges.entry(src).or_default().insert(tgt);
+    }
+    Ok(edges)
+}
+
+fn edge_exists(edges: &SymbolEdges, (src, dst): &(String, String)) -> bool {
+    edges.get(src).is_some_and(|targets| targets.contains(dst))
+}
+
 /// True when `scip_sym` is a member (e.g. a parameter) of a symbol we
 /// already know about, per SCIP's own descriptor grammar: strip a single
 /// trailing `(...)` group and check whether what remains is a moniker
@@ -132,28 +165,13 @@ pub fn import_scip_index_enriched_at(
         .map(crate::learned::LearnedStore::load)
         .unwrap_or_default();
 
-    // Pre-load existing CALLS edges from tree-sitter resolution.
-    // Used to detect when SCIP resolves differently (= a correction to learn from).
-    let mut existing_calls: HashMap<String, std::collections::HashSet<String>> = HashMap::new();
-    if project_root.is_some() {
-        // Must propagate a query failure here rather than silently treating
-        // it as "no existing CALLS edges" -- that would make every SCIP
-        // resolution look like a correction to learn, corrupting the
-        // learned-pattern store on every enrichment cycle a query happens
-        // to fail (see the sibling preload below for the more severe half
-        // of this same bug class).
-        let rows = conn
-            .query("MATCH (a:Symbol)-[:CALLS]->(b:Symbol) RETURN a.id, b.id")
-            .context("SCIP import: failed to preload existing CALLS edges")?;
-        for row in rows {
-            if row.len() < 2 {
-                continue;
-            }
-            let src = row[0].to_string().trim_matches('"').to_string();
-            let tgt = row[1].to_string().trim_matches('"').to_string();
-            existing_calls.entry(src).or_default().insert(tgt);
-        }
-    }
+    // Pre-load the edges already in the graph: the CALLS and INHERITS written
+    // below are filtered against them (#176), and CALLS also shows when SCIP
+    // resolves a call differently from tree-sitter (= a correction to learn
+    // from). See the sibling Symbol preload below for why a failure here must
+    // propagate.
+    let existing_calls = preload_symbol_edges(&conn, "CALLS")?;
+    let existing_inherits = preload_symbol_edges(&conn, "INHERITS")?;
 
     // Pre-load all symbols from graph into memory: (file, name) -> Vec<(start_line,
     // end_line, symbol_id)> -- carries each candidate's span so Pass 1 can pick the
@@ -735,7 +753,7 @@ pub fn import_scip_index_enriched_at(
             }
 
             let edge = (container_id, target_id);
-            if seen_edges.insert(edge.clone()) {
+            if !edge_exists(&existing_calls, &edge) && seen_edges.insert(edge.clone()) {
                 calls_to_create.push(edge);
             }
         }
@@ -790,7 +808,7 @@ pub fn import_scip_index_enriched_at(
                 }
 
                 let edge = (source_id.clone(), target_id);
-                if seen_inherits.insert(edge.clone()) {
+                if !edge_exists(&existing_inherits, &edge) && seen_inherits.insert(edge.clone()) {
                     inherits_to_create.push(edge);
                 }
             }
@@ -1319,19 +1337,7 @@ mod tests {
         let stats = import_scip_index(&index_path, &env.store, None).unwrap();
         assert_eq!(stats.relations_added, 1);
 
-        let conn = env.store.connection().unwrap();
-        let rows = conn
-            .query("MATCH (a:Symbol)-[:INHERITS]->(b:Symbol) RETURN a.name, b.name")
-            .unwrap();
-        let pairs: Vec<(String, String)> = rows
-            .into_iter()
-            .map(|row| {
-                (
-                    row[0].to_string().trim_matches('"').to_string(),
-                    row[1].to_string().trim_matches('"').to_string(),
-                )
-            })
-            .collect();
+        let pairs = edge_pairs(&env, "INHERITS", "name");
         assert_eq!(pairs, vec![("Dog".to_string(), "Animal".to_string())]);
     }
 
@@ -1735,8 +1741,9 @@ mod tests {
     /// (same extracted name, different SCIP monikers, different spans).
     /// A real call to specifically `B::foo` must resolve there, not fall
     /// back to `A::foo` just because it happened to be inserted first.
-    #[test]
-    fn calls_edge_resolves_to_the_specific_same_named_target_not_first_in_file() {
+    /// A caller whose one reference resolves to `B::foo`, beside a same-named
+    /// `A::foo` -- the tree-sitter symbols in the graph plus the `.scip` for them.
+    fn caller_of_b_foo_fixture() -> (TestEnv, std::path::PathBuf) {
         let env = TestEnv::new();
         env.add_file("test.ts");
         let conn = env.store.connection().unwrap();
@@ -1827,26 +1834,95 @@ mod tests {
         let bytes = index.write_to_bytes().unwrap();
         let index_path = env._dir.path().join("index.scip");
         std::fs::write(&index_path, bytes).unwrap();
+        drop(conn); // it borrows `env.store`, which moves out below
+        (env, index_path)
+    }
+
+    /// `table` edges between symbols, as `(source, target)` values of `prop`.
+    fn edge_pairs(env: &TestEnv, table: &str, prop: &str) -> Vec<(String, String)> {
+        let conn = env.store.connection().unwrap();
+        conn.query(&format!(
+            "MATCH (a:Symbol)-[:{table}]->(b:Symbol) RETURN a.{prop}, b.{prop}"
+        ))
+        .unwrap()
+        .map(|row| {
+            (
+                row[0].to_string().trim_matches('"').to_string(),
+                row[1].to_string().trim_matches('"').to_string(),
+            )
+        })
+        .collect()
+    }
+
+    #[test]
+    fn calls_edge_resolves_to_the_specific_same_named_target_not_first_in_file() {
+        let (env, index_path) = caller_of_b_foo_fixture();
 
         import_scip_index(&index_path, &env.store, None).unwrap();
 
-        let rows = conn
-            .query("MATCH (a:Symbol)-[:CALLS]->(b:Symbol) RETURN a.id, b.id")
-            .unwrap();
-        let pairs: Vec<(String, String)> = rows
-            .into_iter()
-            .map(|row| {
-                (
-                    row[0].to_string().trim_matches('"').to_string(),
-                    row[1].to_string().trim_matches('"').to_string(),
-                )
-            })
-            .collect();
+        let pairs = edge_pairs(&env, "CALLS", "id");
         assert_eq!(
             pairs,
             vec![("test.ts::caller".to_string(), "test.ts::B::foo".to_string())],
             "the CALLS edge must resolve to the specific B::foo the reference \
              actually pointed at, not arbitrarily pick A::foo"
+        );
+    }
+
+    /// #176: CALLS is a keyless rel table, so an import that did not filter
+    /// against the graph appended a copy of every edge on each enrichment
+    /// round -- including the tree-sitter edge SCIP merely confirms.
+    #[test]
+    fn reimporting_an_index_does_not_duplicate_calls_edges() {
+        let (env, index_path) = caller_of_b_foo_fixture();
+        let expected = vec![("test.ts::caller".to_string(), "test.ts::B::foo".to_string())];
+
+        let first = import_scip_index(&index_path, &env.store, None).unwrap();
+        assert_eq!(first.references_added, 1);
+        let second = import_scip_index(&index_path, &env.store, None).unwrap();
+        assert_eq!(edge_pairs(&env, "CALLS", "id"), expected);
+        assert_eq!(
+            second.references_added, 0,
+            "the edge is already in the graph"
+        );
+    }
+
+    /// #176, the tree-sitter half: an edge the AST pass already wrote is not
+    /// written again by the first SCIP import that agrees with it.
+    #[test]
+    fn an_edge_tree_sitter_already_wrote_is_not_copied_again() {
+        let (env, index_path) = caller_of_b_foo_fixture();
+        env.store
+            .connection()
+            .unwrap()
+            .query(
+                "MATCH (a:Symbol {id: 'test.ts::caller'}), (b:Symbol {id: 'test.ts::B::foo'}) \
+                 CREATE (a)-[:CALLS]->(b)",
+            )
+            .unwrap();
+
+        let stats = import_scip_index(&index_path, &env.store, None).unwrap();
+        assert_eq!(edge_pairs(&env, "CALLS", "id").len(), 1);
+        assert_eq!(stats.references_added, 0);
+    }
+
+    /// #176: INHERITS is keyless too.
+    #[test]
+    fn reimporting_an_index_does_not_duplicate_inherits_edges() {
+        let env = TestEnv::new();
+        env.add_file("test.ts");
+        let index_path = env._dir.path().join("index.scip");
+        std::fs::write(&index_path, make_scip_index("test.ts", "Dog", "Animal")).unwrap();
+
+        import_scip_index(&index_path, &env.store, None).unwrap();
+        let second = import_scip_index(&index_path, &env.store, None).unwrap();
+        assert_eq!(
+            edge_pairs(&env, "INHERITS", "name"),
+            vec![("Dog".to_string(), "Animal".to_string())]
+        );
+        assert_eq!(
+            second.relations_added, 0,
+            "the edge is already in the graph"
         );
     }
 

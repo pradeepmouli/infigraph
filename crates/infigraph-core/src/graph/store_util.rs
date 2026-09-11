@@ -444,8 +444,10 @@ pub(crate) fn unwind_edges_from_pairs(
         // But counting them turns "silently wrote nothing, at length" into
         // something a log can show -- every chunk failing looks identical
         // to success today.
+        // MERGE: this runs on a batch a failed COPY may already have partly
+        // committed ("a failed COPY still commits durable data").
         if conn
-            .query(&pair_edge_statement(
+            .query(&pair_edge_merge_statement(
                 src_label,
                 dst_label,
                 rel_type,
@@ -686,9 +688,32 @@ pub(crate) fn pair_edge_statement(
     rel: &str,
     pairs_literal: &str,
 ) -> String {
+    pair_edge_statement_with("CREATE", src_label, dst_label, rel, pairs_literal)
+}
+
+/// [`pair_edge_statement`] with `MERGE`: for a batch that may already be
+/// partly in the graph, where a keyless rel table would take a second copy
+/// of every edge `CREATE` re-applies (#176). The ordinary write paths delete
+/// a file's edges before re-creating them and keep the cheaper `CREATE`.
+pub(crate) fn pair_edge_merge_statement(
+    src_label: &str,
+    dst_label: &str,
+    rel: &str,
+    pairs_literal: &str,
+) -> String {
+    pair_edge_statement_with("MERGE", src_label, dst_label, rel, pairs_literal)
+}
+
+fn pair_edge_statement_with(
+    clause: &str,
+    src_label: &str,
+    dst_label: &str,
+    rel: &str,
+    pairs_literal: &str,
+) -> String {
     format!(
         "UNWIND [{pairs_literal}] AS p MATCH (a:{src_label}) WHERE a.id = p.a \
-         MATCH (b:{dst_label}) WHERE b.id = p.b CREATE (a)-[:{rel}]->(b)"
+         MATCH (b:{dst_label}) WHERE b.id = p.b {clause} (a)-[:{rel}]->(b)"
     )
 }
 
