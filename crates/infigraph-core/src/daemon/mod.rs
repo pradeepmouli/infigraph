@@ -480,6 +480,9 @@ impl HeldPrism {
         self.held.as_ref()
     }
 
+    // Windows' `watch_db` reopens on every call and never asks; only the
+    // held-connection variant and tests do.
+    #[cfg_attr(windows, allow(dead_code))]
     pub(crate) fn is_none(&self) -> bool {
         self.held.is_none()
     }

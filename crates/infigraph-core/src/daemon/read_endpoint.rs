@@ -132,6 +132,7 @@ impl ReadEndpoint {
 
 /// Prefix every read endpoint's socket shares. Also what makes a sweep
 /// safe: anything else in the directory is somebody else's.
+#[cfg(unix)]
 const ENDPOINT_PREFIX: &str = "infigraph-read-";
 
 /// Remove read-service sockets no daemon is listening on, across every
