@@ -146,6 +146,23 @@ fn resolve_content_file(
     })
 }
 
+/// A single `content_file` is used byte for byte. A list is joined with one
+/// blank line between parts and a final newline, so a part that happens to
+/// lack a trailing newline cannot glue its last line onto the next part's
+/// first (a heading, typically).
+fn compose_content_parts(mut texts: Vec<String>) -> String {
+    if texts.len() == 1 {
+        return texts.remove(0);
+    }
+    let mut joined = texts
+        .iter()
+        .map(|t| t.trim_end_matches('\n'))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    joined.push('\n');
+    joined
+}
+
 fn normalize_relative_path(path: &str) -> String {
     let mut parts: Vec<&str> = Vec::new();
     for segment in path.split('/') {
@@ -242,14 +259,18 @@ pub(crate) fn discover_artifacts(
             };
 
             let content = match &entry.content_file {
-                Some(content_file) => {
-                    let raw = resolve_content_file(&files, integration_dir, content_file)?;
-                    let normalized_content_file =
-                        normalize_relative_path(&format!("{integration_dir}/{content_file}"));
-                    manifest_claimed.insert(normalized_content_file);
-                    let text = String::from_utf8(raw).with_context(|| {
-                        format!("content_file \"{content_file}\" is not valid UTF-8")
-                    })?;
+                Some(content_files) => {
+                    let mut texts = Vec::with_capacity(content_files.parts().len());
+                    for content_file in content_files.parts() {
+                        let raw = resolve_content_file(&files, integration_dir, content_file)?;
+                        manifest_claimed.insert(normalize_relative_path(&format!(
+                            "{integration_dir}/{content_file}"
+                        )));
+                        texts.push(String::from_utf8(raw).with_context(|| {
+                            format!("content_file \"{content_file}\" is not valid UTF-8")
+                        })?);
+                    }
+                    let text = compose_content_parts(texts);
                     // Format is derived from the artifact's *strategy*, not its
                     // (possibly absent) path -- a resolver-only artifact like
                     // VS Code's has no static path but still needs a JSON
@@ -465,6 +486,60 @@ content_file = "../shared/agents.md"
             String::from_utf8(artifacts[0].content.clone().unwrap()).unwrap(),
             "## Infigraph instructions"
         );
+    }
+
+    /// #168: one source file can feed several artifacts. A list composes its
+    /// parts in order -- how the tool-routing guidance becomes both a skill
+    /// (its own frontmatter + the shared body) and part of an editor's rules
+    /// file (the shared instructions + the same body) without a second copy.
+    #[test]
+    fn a_content_file_list_composes_its_parts_in_order() {
+        let bundled: &[(&str, &[u8])] = &[
+            (
+                "cursor/config.toml",
+                br#"label = "Cursor"
+
+[[artifact]]
+path = ".cursor/rules/infigraph.mdc"
+strategy = "overwrite"
+content_file = ["../shared/agents.md", "../shared/tool-routing.md"]
+"#,
+            ),
+            ("shared/agents.md", b"## Instructions\n"),
+            // No trailing newline: the join must not glue the next part on.
+            ("shared/tool-routing.md", b"## Which tool"),
+        ];
+        let user_dir = tempfile::tempdir().unwrap();
+
+        let artifacts = discover_artifacts(bundled, user_dir.path(), "/bin/infigraph-mcp").unwrap();
+
+        assert_eq!(
+            artifacts.len(),
+            1,
+            "shared parts must not become artifacts themselves"
+        );
+        assert_eq!(
+            String::from_utf8(artifacts[0].content.clone().unwrap()).unwrap(),
+            "## Instructions\n\n## Which tool\n"
+        );
+    }
+
+    #[test]
+    fn a_missing_part_of_a_content_file_list_is_an_error_naming_it() {
+        let bundled: &[(&str, &[u8])] = &[
+            (
+                "codex/config.toml",
+                br#"[[artifact]]
+path = ".codex/skills/x/SKILL.md"
+strategy = "overwrite"
+content_file = ["../shared/present.md", "../shared/absent.md"]
+"#,
+            ),
+            ("shared/present.md", b"x"),
+        ];
+        let user_dir = tempfile::tempdir().unwrap();
+        let err = discover_artifacts(bundled, user_dir.path(), "/bin/infigraph-mcp").unwrap_err();
+        assert!(format!("{err:#}").contains("absent.md"), "{err:#}");
     }
 
     #[test]

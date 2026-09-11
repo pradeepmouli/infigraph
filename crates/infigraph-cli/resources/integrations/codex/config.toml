@@ -10,3 +10,8 @@ content_file = "mcp-section.toml"
 path = ".codex/skills/infigraph-reindex/SKILL.md"
 strategy = "overwrite"
 content_file = "../shared/skills/infigraph-reindex/SKILL.md"
+
+[[artifact]]
+path = ".codex/skills/infigraph-tool-routing/SKILL.md"
+strategy = "overwrite"
+content_file = ["../shared/skills/infigraph-tool-routing/SKILL.md", "../shared/tool-routing.md"]

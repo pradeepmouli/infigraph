@@ -623,6 +623,70 @@ resolver = ["./resolve-zed-path.sh"]
         );
     }
 
+    /// #168: tool-routing guidance has one source, `shared/tool-routing.md`,
+    /// composed into every place an agent reads it: a skill where skills are
+    /// supported, the always-loaded rules file where they are not. Before, the
+    /// same guidance was hand-copied into three places and all three drifted.
+    #[test]
+    fn tool_routing_guidance_is_composed_from_one_source_into_every_agent() {
+        let user_dir = tempfile::tempdir().unwrap();
+        let artifacts =
+            discover_artifacts(BUNDLED_INTEGRATIONS, user_dir.path(), "/bin/infigraph-mcp")
+                .unwrap();
+        let content_of = |path: &str| {
+            let artifact = artifacts
+                .iter()
+                .find(|a| a.target_relative_path.as_deref() == Some(path))
+                .unwrap_or_else(|| panic!("no bundled artifact for {path}"));
+            String::from_utf8(artifact.content.clone().unwrap()).unwrap()
+        };
+        let routing_heading = "## Infigraph — which tool answers which question";
+
+        for skill in [
+            ".claude/skills/infigraph-tool-routing/SKILL.md",
+            ".codex/skills/infigraph-tool-routing/SKILL.md",
+        ] {
+            let body = content_of(skill);
+            assert!(
+                body.starts_with("---\nname: infigraph-tool-routing\n"),
+                "{skill} must open with the skill's own frontmatter:\n{body}"
+            );
+            assert!(
+                body.contains(routing_heading),
+                "{skill} lacks the routing body"
+            );
+        }
+        for rules in [
+            ".cursor/rules/infigraph.mdc",
+            ".windsurf/rules/infigraph.md",
+        ] {
+            let body = content_of(rules);
+            assert!(
+                body.contains("Primary Code Intelligence"),
+                "{rules} lacks the instructions"
+            );
+            assert!(
+                body.contains(routing_heading),
+                "{rules} lacks the inlined routing body"
+            );
+        }
+        // `infigraph init`'s project-level targets draw on the same files.
+        assert!(crate::agent::infigraph_instructions().contains(routing_heading));
+
+        let sources: Vec<&str> = BUNDLED_INTEGRATIONS
+            .iter()
+            .filter(|(_, bytes)| {
+                std::str::from_utf8(bytes).is_ok_and(|text| text.contains(routing_heading))
+            })
+            .map(|(path, _)| *path)
+            .collect();
+        assert_eq!(
+            sources,
+            ["shared/tool-routing.md"],
+            "the routing body must have one source"
+        );
+    }
+
     #[test]
     fn bundled_gemini_cli_mcp_fragment_applies_correctly() {
         let user_dir = tempfile::tempdir().unwrap();
@@ -1065,23 +1129,30 @@ resolver = ["./resolve-zed-path.sh"]
 
         let artifacts =
             discover_artifacts(BUNDLED_INTEGRATIONS, user_dir.path(), mcp_path).unwrap();
+        // The rules compose agents.md with the bundled routing body.
+        const OVERRIDE_THEN_ROUTING: &str =
+            "## Overridden instructions\n\n## Infigraph — which tool answers which question";
 
         let cursor_rules = artifacts
             .iter()
             .find(|a| a.target_relative_path.as_deref() == Some(".cursor/rules/infigraph.mdc"))
             .unwrap();
-        assert_eq!(
-            String::from_utf8(cursor_rules.content.clone().unwrap()).unwrap(),
-            "## Overridden instructions"
+        assert!(
+            String::from_utf8(cursor_rules.content.clone().unwrap())
+                .unwrap()
+                .starts_with(OVERRIDE_THEN_ROUTING),
+            "the override must lead the composed rules, followed by the routing body"
         );
 
         let windsurf_rules = artifacts
             .iter()
             .find(|a| a.target_relative_path.as_deref() == Some(".windsurf/rules/infigraph.md"))
             .unwrap();
-        assert_eq!(
-            String::from_utf8(windsurf_rules.content.clone().unwrap()).unwrap(),
-            "## Overridden instructions"
+        assert!(
+            String::from_utf8(windsurf_rules.content.clone().unwrap())
+                .unwrap()
+                .starts_with(OVERRIDE_THEN_ROUTING),
+            "the override must lead the composed rules, followed by the routing body"
         );
     }
 
@@ -1229,38 +1300,14 @@ resolver = ["./resolve-zed-path.sh"]
     #[cfg(unix)]
     #[test]
     fn bundled_session_cleanup_kills_only_this_sessions_mcp_processes() {
-        if std::process::Command::new("jq")
-            .arg("--version")
-            .output()
-            .is_err()
-        {
-            eprintln!("skipping: the hook needs jq, which is not installed");
+        if hook_tools_missing() {
             return;
         }
-        let user_dir = tempfile::tempdir().unwrap();
-        let home_dir = tempfile::tempdir().unwrap();
-        let mcp_path = "/opt/infigraph/bin/infigraph-mcp";
-        let artifacts =
-            discover_artifacts(BUNDLED_INTEGRATIONS, user_dir.path(), mcp_path).unwrap();
-        let cleanup = artifacts
-            .iter()
-            .find(|a| {
-                a.target_relative_path.as_deref()
-                    == Some(".claude/hooks/infigraph-process-cleanup.sh")
-            })
-            .unwrap();
-        apply_resolved_artifact(cleanup, home_dir.path(), mcp_path, false).unwrap();
-        let hook = home_dir
-            .path()
-            .join(".claude/hooks/infigraph-process-cleanup.sh");
+        let (_home, hook) = install_bundled_claude_hook("infigraph-process-cleanup.sh");
 
-        // A stand-in server whose `ps` line matches the hook's pattern
-        // (`/infigraph-mcp --mcp`). Short sleeps, so the child a SIGKILLed
-        // script leaves behind is gone within a second.
+        // Its `ps` line matches the hook's pattern (`/infigraph-mcp --mcp`).
         let scratch = tempfile::tempdir().unwrap();
-        let fake = scratch.path().join("infigraph-mcp");
-        std::fs::write(&fake, "#!/bin/sh\nwhile :; do sleep 1; done\n").unwrap();
-        make_executable(&fake).unwrap();
+        let fake = fake_mcp_server(scratch.path());
 
         // This session's own server: a direct child of the stand-in `claude`.
         let mut ours = std::process::Command::new(&fake)
@@ -1295,20 +1342,7 @@ resolver = ["./resolve-zed-path.sh"]
         )
         .unwrap();
 
-        let mut run = std::process::Command::new(&hook)
-            .env("TMPDIR", tmp.path())
-            .stdin(std::process::Stdio::piped())
-            .spawn()
-            .unwrap();
-        {
-            use std::io::Write;
-            run.stdin
-                .take()
-                .unwrap()
-                .write_all(br#"{"session_id":"t169"}"#)
-                .unwrap();
-        }
-        let hook_status = run.wait().unwrap();
+        let hook_status = run_hook(&hook, tmp.path(), r#"{"session_id":"t169"}"#).status;
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let ours_gone = loop {
@@ -1336,5 +1370,205 @@ resolver = ["./resolve-zed-path.sh"]
             unrelated_survived,
             "a server this session does not own must never be killed"
         );
+    }
+
+    /// #168: the enforcement hook's denials name the tool that answers the
+    /// question and never offer the agent a bypass it can write for itself --
+    /// agents took that bypass as a routine workaround. And a command word
+    /// the shell never runs, inside quotes or a heredoc body, must not block
+    /// a command: that is how `gh issue create --title "..grep.."` and commit
+    /// messages mentioning rg were refused.
+    #[cfg(unix)]
+    #[test]
+    fn bundled_enforce_hook_routes_searches_and_ignores_unexecuted_text() {
+        if hook_tools_missing() {
+            return;
+        }
+        let (_home, hook) = install_bundled_claude_hook("infigraph-enforce.sh");
+        // The hook allows everything while no infigraph-mcp process exists.
+        let scratch = tempfile::tempdir().unwrap();
+        let mut server = std::process::Command::new(fake_mcp_server(scratch.path()))
+            .spawn()
+            .unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join(".infigraph")).unwrap();
+        let cwd = project.path().to_str().unwrap();
+
+        // The denial reason, or None when the call is allowed.
+        let decide = |tool: &str, tool_input: serde_json::Value| -> Option<String> {
+            let input =
+                serde_json::json!({"tool_name": tool, "cwd": cwd, "tool_input": tool_input});
+            let out = run_hook(&hook, scratch.path(), &input.to_string());
+            assert!(out.status.success(), "the hook must exit 0: {out:?}");
+            let stdout = String::from_utf8(out.stdout).unwrap();
+            (!stdout.trim().is_empty()).then(|| {
+                let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+                v["hookSpecificOutput"]["permissionDecisionReason"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+        };
+        let bash = |cmd: &str| decide("Bash", serde_json::json!({ "command": cmd }));
+        let source = format!("{cwd}/src/lib.rs");
+
+        // (case, decision, what a denial must name -- None means allowed)
+        let decisions = [
+            (
+                "Grep",
+                decide("Grep", serde_json::json!({"pattern": "foo"})),
+                Some("regex=true"),
+            ),
+            ("bare grep", bash("grep -rn foo src"), Some("regex=true")),
+            ("rg after &&", bash("cd src && rg foo"), Some("regex=true")),
+            (
+                "grep after a heredoc ends",
+                bash("cat <<EOF > notes.txt\nrg is text here\nEOF\ngrep -rn foo src"),
+                Some("regex=true"),
+            ),
+            (
+                "find -name",
+                bash("find . -name '*.rs'"),
+                Some("list_files"),
+            ),
+            (
+                "Glob",
+                decide("Glob", serde_json::json!({"pattern": "**/*.rs"})),
+                Some("list_files"),
+            ),
+            (
+                "Read without offset",
+                decide("Read", serde_json::json!({ "file_path": source })),
+                Some("get_symbols_in_file"),
+            ),
+            ("piped filter", bash("cargo test 2>&1 | grep FAILED"), None),
+            (
+                "word in a quoted title",
+                bash(r#"gh issue create --title "grep and rg are blocked" --body-file b.md"#),
+                None,
+            ),
+            (
+                "word in a heredoc body",
+                bash("git commit -F - <<'EOF'\nfix: rg false positive\ngrep in the body\nEOF"),
+                None,
+            ),
+            (
+                "heredoc with quotes inside a quoted substitution",
+                bash("git commit -m \"$(cat <<'EOF'\nsearch: \"grep\" quoted\nEOF\n)\""),
+                None,
+            ),
+            (
+                "word in a multi-line quoted message",
+                bash("git commit -m \"subject\n\ngrep in the body\""),
+                None,
+            ),
+            ("quoted find", bash("echo 'find . -name x'"), None),
+            (
+                "Read with offset",
+                decide(
+                    "Read",
+                    serde_json::json!({ "file_path": source, "offset": 10 }),
+                ),
+                None,
+            ),
+        ];
+
+        // Stop the stand-in before asserting, so a failure cannot leak it.
+        let _ = server.kill();
+        let _ = server.wait();
+
+        for (case, decision, names) in decisions {
+            match (decision, names) {
+                (None, None) => {}
+                (Some(reason), Some(names)) => {
+                    assert!(
+                        reason.contains(names),
+                        "{case}: denial must name {names}: {reason}"
+                    );
+                    assert!(
+                        reason.contains("infigraph-tool-routing")
+                            && reason.contains("tell the user"),
+                        "{case}: denial must point at the skill and the user: {reason}"
+                    );
+                    assert!(
+                        !reason.contains(".search-fallback-allowed"),
+                        "{case}: denial must not offer a self-written bypass: {reason}"
+                    );
+                }
+                (decision, names) => {
+                    panic!("{case}: expected denial naming {names:?}, got {decision:?}")
+                }
+            }
+        }
+    }
+
+    /// Hook behaviour tests need the tools the bundled hooks call.
+    #[cfg(unix)]
+    fn hook_tools_missing() -> bool {
+        let missing = ["jq", "pgrep"].into_iter().find(|tool| {
+            std::process::Command::new(tool)
+                .arg("--version")
+                .output()
+                .is_err()
+        });
+        if let Some(tool) = missing {
+            eprintln!("skipping: the hook needs {tool}, which is not installed");
+        }
+        missing.is_some()
+    }
+
+    /// Install one bundled Claude Code hook into a fresh home directory. The
+    /// returned directory must outlive the script path.
+    #[cfg(unix)]
+    fn install_bundled_claude_hook(name: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let user_dir = tempfile::tempdir().unwrap();
+        let home_dir = tempfile::tempdir().unwrap();
+        let mcp_path = "/opt/infigraph/bin/infigraph-mcp";
+        let rel = format!(".claude/hooks/{name}");
+        let artifacts =
+            discover_artifacts(BUNDLED_INTEGRATIONS, user_dir.path(), mcp_path).unwrap();
+        let artifact = artifacts
+            .iter()
+            .find(|a| a.target_relative_path.as_deref() == Some(rel.as_str()))
+            .unwrap_or_else(|| panic!("{rel} is not a bundled artifact"));
+        apply_resolved_artifact(artifact, home_dir.path(), mcp_path, false).unwrap();
+        let path = home_dir.path().join(rel);
+        (home_dir, path)
+    }
+
+    /// A stand-in MCP server: a script named `infigraph-mcp`, which is what
+    /// the hooks' process checks look for. Short sleeps, so the child a
+    /// SIGKILLed script leaves behind is gone within a second.
+    #[cfg(unix)]
+    fn fake_mcp_server(dir: &std::path::Path) -> std::path::PathBuf {
+        let fake = dir.join("infigraph-mcp");
+        std::fs::write(&fake, "#!/bin/sh\nwhile :; do sleep 1; done\n").unwrap();
+        make_executable(&fake).unwrap();
+        fake
+    }
+
+    /// Run a hook on `stdin` (its JSON input) with `TMPDIR` pointed at `tmp`.
+    #[cfg(unix)]
+    fn run_hook(
+        hook: &std::path::Path,
+        tmp: &std::path::Path,
+        stdin: &str,
+    ) -> std::process::Output {
+        use std::io::Write;
+        use std::process::Stdio;
+        let mut child = std::process::Command::new(hook)
+            .env("TMPDIR", tmp)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(stdin.as_bytes())
+            .unwrap();
+        child.wait_with_output().unwrap()
     }
 }

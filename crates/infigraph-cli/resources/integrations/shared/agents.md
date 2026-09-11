@@ -1,10 +1,10 @@
 ## Infigraph — Primary Code Intelligence
 
-Infigraph MCP is indexed. Use Infigraph tools FIRST for all code tasks. Fall back to grep/Read only if Infigraph returns nothing or for non-code files.
+Infigraph MCP is indexed. Use Infigraph tools FIRST for all code tasks. Read non-code files directly. If an Infigraph tool is unavailable or errors, tell the user rather than working around the enforcement hook.
 
 ### Rules
 1. Check `list_projects` before indexing — don't re-index
-2. **`search`** for ALL code search — hybrid BM25+vector+grep in one call, auto-escalates
+2. **`search`** for ALL code search — ranked symbols plus every line containing the text, in one call; **`regex=true`** lists every occurrence (e.g. all call sites) rather than the top `limit`. Constants: `get_symbols_in_file`. Full routing, and what to do when a tool is unavailable: the `infigraph-tool-routing` skill (inlined below where skills aren't supported)
 3. **`get_doc_context`** before editing any function — returns source+callers+callees in one call
 4. **`trace_callers`** / **`find_all_references`** before refactoring — never grep for callers
 5. **`trace_callees`** / **`transitive_impact`** for blast radius — never manually trace call chains
@@ -19,7 +19,7 @@ Infigraph MCP is indexed. Use Infigraph tools FIRST for all code tasks. Fall bac
 
 ### Subagents — infigraph-indexed projects
 Do NOT spawn these agent types for code tasks — they lack MCP access and will fall back to grep/glob:
-- **Explore** → use `search`, `search_code`, `search_symbols` directly instead
+- **Explore** → use `search` (with `regex=true` to enumerate) and `get_symbols_in_file` directly instead
 - **Plan** → use `get_architecture`, `get_skeleton`, `get_stats` directly instead
 - **code-reviewer** → use `get_doc_context`, `get_code_snippet`, `review` directly instead
 

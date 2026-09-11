@@ -3,4 +3,4 @@ label = "Windsurf"
 [[artifact]]
 path = ".windsurf/rules/infigraph.md"
 strategy = "overwrite"
-content_file = "../shared/agents.md"
+content_file = ["../shared/agents.md", "../shared/tool-routing.md"]

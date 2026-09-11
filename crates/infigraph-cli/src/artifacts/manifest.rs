@@ -19,11 +19,29 @@ pub(crate) struct ArtifactEntry {
     #[serde(default)]
     pub end: Option<String>,
     #[serde(default)]
-    pub content_file: Option<String>,
+    pub content_file: Option<ContentFiles>,
     #[serde(default)]
     pub key_path: Option<Vec<String>>,
     #[serde(default)]
     pub resolver: Option<Vec<String>>,
+}
+
+/// `content_file`: one file, or a list composed in order (#168) -- so a single
+/// shared source can feed several artifacts without being copied into each.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub(crate) enum ContentFiles {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl ContentFiles {
+    pub(crate) fn parts(&self) -> &[String] {
+        match self {
+            ContentFiles::One(one) => std::slice::from_ref(one),
+            ContentFiles::Many(many) => many,
+        }
+    }
 }
 
 pub(crate) fn parse_manifest(content: &str) -> Result<IntegrationManifest> {
@@ -57,7 +75,10 @@ content_file = "../shared/agents.md"
             Some("<!-- infigraph-primary-search -->")
         );
         assert_eq!(a.end.as_deref(), Some("<!-- /infigraph-primary-search -->"));
-        assert_eq!(a.content_file.as_deref(), Some("../shared/agents.md"));
+        assert_eq!(
+            a.content_file.as_ref().map(|c| c.parts()),
+            Some(&["../shared/agents.md".to_string()][..])
+        );
         assert!(a.key_path.is_none());
         assert!(a.resolver.is_none());
     }
