@@ -5,11 +5,13 @@ use std::sync::Mutex;
 // tests that set them.
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-const VARS: [&str; 4] = [
+const VARS: [&str; 5] = [
     "INFIGRAPH_REGISTRY_HOME",
     "INFIGRAPH_REGISTRY_INSTANCES_DIR",
     "INFIGRAPH_REGISTRY_ORG",
     "INFIGRAPH_ORG",
+    // Set by cargo (`.cargo/config.toml`); `restore` puts it back.
+    "INFIGRAPH_REGISTRY_REAL_HOME_REDIRECT",
 ];
 
 /// The environment this process started with, captured before any test
@@ -28,10 +30,8 @@ fn clear() {
     }
 }
 
-/// Put back what the process started with -- notably cargo's
-/// `INFIGRAPH_REGISTRY_HOME` (`.cargo/config.toml`), which keeps every other
-/// test away from the real registry. Removing it instead would leave this
-/// binary pointed at `$HOME/.infigraph`.
+/// Put back what the process started with, rather than stripping it: a
+/// developer's own `INFIGRAPH_REGISTRY_HOME` must survive these tests.
 fn restore() {
     for (v, value) in baseline() {
         match value {
@@ -105,6 +105,30 @@ fn tests_never_resolve_the_real_registry() {
             real.display()
         );
     }
+}
+
+/// The redirect guards only the real home. A test that isolates itself by
+/// pointing `HOME` at a tempdir -- and the CLI children it spawns with that
+/// `HOME` -- must find the registry there, not in cargo's scratch directory:
+/// a redirect that outranked `HOME` broke exactly those tests.
+#[test]
+fn a_home_pointed_elsewhere_is_not_redirected() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    clear();
+    let fake_home = tempfile::tempdir().unwrap();
+    let orig_home = std::env::var_os("HOME");
+    std::env::set_var("INFIGRAPH_REGISTRY_REAL_HOME_REDIRECT", "/tmp/ig-redirect");
+    std::env::set_var("HOME", fake_home.path());
+    let resolved = infigraph_core::multi::registry_path().unwrap();
+    match orig_home {
+        Some(h) => std::env::set_var("HOME", h),
+        None => std::env::remove_var("HOME"),
+    }
+    restore();
+    assert_eq!(
+        resolved,
+        fake_home.path().join(".infigraph").join("registry.json")
+    );
 }
 
 #[test]

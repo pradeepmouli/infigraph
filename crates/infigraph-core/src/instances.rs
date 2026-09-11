@@ -53,11 +53,14 @@ fn now_epoch_secs() -> u64 {
 // - org: INFIGRAPH_ORG (upstream-inherited, seeded from the legacy name;
 //   canonical INFIGRAPH_REGISTRY_ORG also works, legacy wins); empty = no
 //   org scoping
+// - real_home_redirect: INFIGRAPH_REGISTRY_REAL_HOME_REDIRECT; the home to
+//   use instead of the account's real one (see `infigraph_home`); empty = none
 crate::settings! {
     registry {
         home: String = String::new(),
         instances_dir: String = String::new(),
         org: String = String::new(),
+        real_home_redirect: String = String::new(),
     }
 }
 
@@ -75,17 +78,74 @@ pub fn registry_settings() -> Registry {
 /// relocates all three together, so one override isolates a test (or a
 /// scratch install) completely -- before this the lock and the instance files
 /// ignored it and stayed in the real home.
+///
+/// `INFIGRAPH_REGISTRY_REAL_HOME_REDIRECT` is weaker: it applies only when
+/// the home this process would otherwise use *is the account's real home*.
+/// Cargo sets it for every process it runs (`.cargo/config.toml`), so a test
+/// that never isolated itself cannot touch the developer's registry, while a
+/// test that points `HOME` at a tempdir keeps exactly that isolation. An
+/// override that outranked `HOME` broke those tests: the CLI children they
+/// spawn with a fake `HOME` wrote the registry somewhere else.
 pub fn infigraph_home() -> PathBuf {
-    let home = registry_settings().home;
-    let base = if home.is_empty() {
-        std::env::var_os("HOME")
+    let settings = registry_settings();
+    let base = if settings.home.is_empty() {
+        let home = std::env::var_os("HOME")
             .map(PathBuf::from)
             .or_else(dirs_next::home_dir)
-            .unwrap_or_else(|| PathBuf::from("."))
+            .unwrap_or_else(|| PathBuf::from("."));
+        if !settings.real_home_redirect.is_empty() && is_account_home(&home) {
+            PathBuf::from(settings.real_home_redirect)
+        } else {
+            home
+        }
     } else {
-        PathBuf::from(home)
+        PathBuf::from(settings.home)
     };
     base.join(".infigraph")
+}
+
+/// Whether `home` is the account's real home directory, judged by the OS
+/// rather than by `HOME` (which is exactly what a test overrides): the
+/// passwd entry on Unix, the profile known folder on Windows.
+fn is_account_home(home: &Path) -> bool {
+    let Some(account) = account_home() else {
+        return false;
+    };
+    home == account
+        || matches!(
+            (home.canonicalize(), account.canonicalize()),
+            (Ok(a), Ok(b)) if a == b
+        )
+}
+
+#[cfg(unix)]
+fn account_home() -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt as _;
+    let mut buf = vec![0 as libc::c_char; 16 * 1024];
+    // SAFETY: `passwd` is plain C data, valid zeroed; `getpwuid_r` fills it
+    // with pointers into `buf`, which outlives every read below.
+    let mut entry: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut found: *mut libc::passwd = std::ptr::null_mut();
+    let rc = unsafe {
+        libc::getpwuid_r(
+            libc::getuid(),
+            &mut entry,
+            buf.as_mut_ptr(),
+            buf.len(),
+            &mut found,
+        )
+    };
+    if rc != 0 || found.is_null() || entry.pw_dir.is_null() {
+        return None;
+    }
+    let dir = unsafe { std::ffi::CStr::from_ptr(entry.pw_dir) };
+    Some(PathBuf::from(std::ffi::OsStr::from_bytes(dir.to_bytes())))
+}
+
+#[cfg(not(unix))]
+fn account_home() -> Option<PathBuf> {
+    // `dirs_next` asks Windows for the profile folder; it never reads `HOME`.
+    dirs_next::home_dir()
 }
 
 /// Directory holding one JSON file per live-or-recently-live instance.
