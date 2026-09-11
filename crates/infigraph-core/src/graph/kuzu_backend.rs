@@ -414,9 +414,11 @@ impl GraphBackend for KuzuBackend {
                 let tgt_esc = crate::escape_str(&edge.target_id);
                 let method_esc = crate::escape_str(&edge.method);
                 let path_esc = crate::escape_str(&edge.path);
+                // MERGE, not CREATE: a repeat of the same edge must converge,
+                // or every re-link grows the table by the whole batch (#166).
                 conn.query(&format!(
                     "MATCH (s:Symbol), (t:Symbol) WHERE s.id = '{src_esc}' AND t.id = '{tgt_esc}' \
-                     CREATE (s)-[:CALLS_SERVICE {{method: '{method_esc}', path: '{path_esc}', target_service: ''}}]->(t)"
+                     MERGE (s)-[:CALLS_SERVICE {{method: '{method_esc}', path: '{path_esc}', target_service: ''}}]->(t)"
                 ))
                 .map_err(|e| anyhow::anyhow!("failed to create CALLS_SERVICE edge: {e}"))?;
             }
@@ -551,6 +553,11 @@ impl GraphBackend for KuzuBackend {
             // Scope the DEPENDS_ON edge to THIS repo's modules. Without the repo guard,
             // `m.file CONTAINS 'pyproject.toml'` matches every repo's manifest module in a
             // shared graph, cross-linking one repo's deps onto all others.
+            //
+            // MERGE on the endpoints, then SET: one edge per module and dependency,
+            // updated in place. An unconditional CREATE added an edge on every run
+            // (#166), and merging on `is_dev` too would add a second edge whenever
+            // a dependency moved between dev and regular.
             let manifest_base =
                 crate::escape_str(result.manifest_file.rsplit('/').next().unwrap_or(""));
             let rel = if let Some(repo) = self.repo_filter() {
@@ -558,14 +565,14 @@ impl GraphBackend for KuzuBackend {
                 format!(
                     "MATCH (m:Module), (d:Dependency) \
                      WHERE m.file STARTS WITH '{r}/' AND m.file CONTAINS '{manifest_base}' AND d.id = '{}' \
-                     CREATE (m)-[:DEPENDS_ON {{is_dev: {}}}]->(d)",
+                     MERGE (m)-[e:DEPENDS_ON]->(d) SET e.is_dev = {}",
                     crate::escape_str(&id),
                     dep.is_dev
                 )
             } else {
                 format!(
                     "MATCH (m:Module), (d:Dependency) WHERE m.file CONTAINS '{manifest_base}' AND d.id = '{}' \
-                     CREATE (m)-[:DEPENDS_ON {{is_dev: {}}}]->(d)",
+                     MERGE (m)-[e:DEPENDS_ON]->(d) SET e.is_dev = {}",
                     crate::escape_str(&id),
                     dep.is_dev
                 )

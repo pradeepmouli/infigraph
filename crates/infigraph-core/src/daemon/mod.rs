@@ -133,12 +133,12 @@ fn spawn_scip_enrich(
     drain_rt: &tokio::runtime::Runtime,
     daemon_token: &CancellationToken,
     cb: Arc<FullReindexCallback>,
-    prism: Arc<Infigraph>,
+    root: PathBuf,
     job: ScipEnrichJob,
 ) -> Task<()> {
     let _guard = drain_rt.enter();
     Task::spawn_blocking(daemon_token, "scip-enrich", move |token| {
-        cb(prism, job, token);
+        cb(root, job, token);
     })
 }
 
@@ -220,11 +220,11 @@ fn current_on_disk_build_hash() -> Option<String> {
 }
 
 /// Callback for in-process SCIP enrichment after a successful daemon full
-/// reindex. Takes the daemon's own (already-open, already-reopened-post-swap)
-/// connection -- the callback must NOT open a second `Infigraph`/`Database`
-/// on the same live graph path; Kuzu only allows safe concurrent access
-/// within one process's `Database` object, not across two, even in the same
-/// process.
+/// reindex, or when enrichment falls too far behind. It must NOT open an
+/// `Infigraph`/`Database` on the live graph path -- Kuzu only allows safe
+/// concurrent access within one process's `Database` object, not across two,
+/// even in the same process -- so it writes by submitting a
+/// `WriteRequest::ScipImport`, which the coordinator serves on its own handle.
 ///
 /// The loop that invokes this callback does NOT hold `index.lock` around
 /// the call -- the callback is responsible for acquiring it itself, scoped
@@ -238,8 +238,13 @@ fn current_on_disk_build_hash() -> Option<String> {
 /// `Task::spawn_blocking` it runs inside) -- a cooperative-cancellation
 /// checkpoint for whatever synchronous, potentially long-running work the
 /// callback does (e.g. `run_scip_indexers`' between-indexer-launch check).
-pub type FullReindexCallback =
-    dyn Fn(Arc<Infigraph>, ScipEnrichJob, CancellationToken) + Send + Sync;
+///
+/// It receives the project root, not the daemon's `Infigraph`: enrichment
+/// runs external indexers for minutes and submits its import as a request,
+/// so it never needs the graph -- and holding the prism for that long kept
+/// its `Database` alive past `poison_watch_db`, which is how a reopen came to
+/// open a second `Database` on the same file (#166).
+pub type FullReindexCallback = dyn Fn(PathBuf, ScipEnrichJob, CancellationToken) + Send + Sync;
 
 /// Caller-supplied hook that acts on a `WatchControl { role: Docs, .. }`
 /// request. Doc-watching lives in `infigraph-docs`, a crate this one does
@@ -443,13 +448,22 @@ pub type PrismBeacon = Arc<Mutex<Option<Arc<Infigraph>>>>;
 pub(crate) struct HeldPrism {
     held: Option<Arc<Infigraph>>,
     beacon: PrismBeacon,
+    /// The store `clear` let go of, for as long as anything else holds it.
+    /// `GraphStore` rather than `Infigraph` because the store owns the
+    /// `Database` and is shared on its own (`Infigraph::graph_store`).
+    retired: Option<std::sync::Weak<crate::graph::GraphStore>>,
 }
+
+/// How long `watch_db` waits for a released graph handle to be dropped by
+/// its last other holder before giving up for this attempt.
+const RETIRED_STORE_WAIT: Duration = Duration::from_secs(30);
 
 impl HeldPrism {
     pub(crate) fn new() -> Self {
         Self {
             held: None,
             beacon: Arc::new(Mutex::new(None)),
+            retired: None,
         }
     }
 
@@ -480,7 +494,42 @@ impl HeldPrism {
         // `poison_watch_db`'s `write_phase` breadcrumb (#132) rather than on
         // whichever read-service thread happened to hold the final clone.
         *self.beacon.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        self.retired = self
+            .held
+            .as_ref()
+            .and_then(|p| p.graph_store())
+            .map(|store| Arc::downgrade(&store));
         self.held = None;
+    }
+
+    /// Wait until no one still holds the store `clear` released, so that
+    /// opening a new one cannot put two `Database`s on one file in this
+    /// process (#149, #166). A reader mid-request or a background task can
+    /// hold a clone past `poison_watch_db`; after a full-reindex swap the old
+    /// handle still addresses its WAL by the *live* path.
+    ///
+    /// Waits rather than refuses: holders are normally brief (a read), and a
+    /// refusal in `finish_full_reindex` would roll back a good rebuild. Counts
+    /// holders through the `Weak` without upgrading it, so this never becomes
+    /// the last owner and closes the `Database` here by accident.
+    fn wait_for_retired_store(&mut self, budget: Duration) -> Result<()> {
+        let Some(retired) = &self.retired else {
+            return Ok(());
+        };
+        let start = std::time::Instant::now();
+        while std::sync::Weak::strong_count(retired) > 0 {
+            if start.elapsed() >= budget {
+                anyhow::bail!(
+                    "the previously released graph handle is still held by {} other owner(s) \
+                     after {}s -- not opening a second Database on the same file (#166)",
+                    std::sync::Weak::strong_count(retired),
+                    budget.as_secs()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        self.retired = None;
+        Ok(())
     }
 }
 
@@ -626,6 +675,22 @@ where
     // Paces reopen attempts after `watch_db` fails (typically: the graph is
     // locked by another process) -- see `backoff::ReopenBackoff`.
     let mut reopen_backoff = ReopenBackoff::new();
+    // Paces idle folds that did not happen (#166). Separate from
+    // `reopen_backoff` and deliberately surviving a reopen: a fold that
+    // cannot succeed would otherwise run again on every fresh handle, and
+    // sittir logged ~1,600 of them two seconds apart.
+    let mut fold_backoff = ReopenBackoff::new();
+    // The last reason a fold was skipped, so an unchanged reason is logged
+    // once rather than once per attempt.
+    let mut last_fold_skip: Option<String> = None;
+    // What the graph weighed at the last growth sample, and whether a fold
+    // was attempted since -- see `growth_note` (#166).
+    let live_graph = root.join(".infigraph").join("graph");
+    let mut growth_sample = (
+        std::time::Instant::now(),
+        crate::graph::store_util::graph_family_bytes(&live_graph),
+    );
+    let mut folded_since_sample = false;
 
     // Accumulates index-shaped work from every producer (the code-watch
     // task, the periodic mark below, ad-hoc daemon-protocol requests) so
@@ -954,7 +1019,7 @@ where
                         &drain_rt,
                         daemon_token,
                         cb,
-                        prism,
+                        root.to_path_buf(),
                         ScipEnrichJob {
                             languages,
                             ast_generation,
@@ -1039,7 +1104,7 @@ where
                                     &drain_rt,
                                     daemon_token,
                                     cb,
-                                    prism,
+                                    root.to_path_buf(),
                                     ScipEnrichJob {
                                         languages,
                                         ast_generation: ast,
@@ -1279,16 +1344,56 @@ where
         // a checkpoint takes the exclusive window, so probing every 200ms
         // would be pure contention. `checkpoint_if_idle` re-checks the WAL's
         // mtime itself, so a busy graph is skipped rather than serialized.
-        if last_idle_checkpoint.elapsed() >= IDLE_CHECKPOINT_PROBE {
+        if last_idle_checkpoint.elapsed() >= IDLE_CHECKPOINT_PROBE && fold_backoff.should_attempt()
+        {
             last_idle_checkpoint = std::time::Instant::now();
             let idle_after = Duration::from_secs(crate::graph::store::checkpoint_idle_secs(
                 crate::settings_file::ConfigScope::Project(root),
             ));
-            if !idle_after.is_zero() {
-                if let Some(store) = held_prism.as_ref().and_then(|p| p.graph_store()) {
-                    store.checkpoint_if_idle(idle_after);
-                }
+            let fold = (!idle_after.is_zero())
+                .then(|| held_prism.as_ref().and_then(|p| p.graph_store()))
+                .flatten()
+                .map(|store| store.checkpoint_if_idle(idle_after));
+            folded_since_sample |= matches!(
+                fold,
+                Some(
+                    crate::graph::store::IdleFold::Folded
+                        | crate::graph::store::IdleFold::NotFolded(_)
+                )
+            );
+            let settled = settle_idle_fold(fold, &mut fold_backoff, &mut last_fold_skip);
+            if let Some(line) = settled.log {
+                eprintln!("{line}");
             }
+            if settled.reopen {
+                // A handle that must not fold again: reopen, exactly as a
+                // failed drain does. Closing it still runs lbug's
+                // checkpoint-on-close, which its Rust `SystemConfig` (0.20.4)
+                // has no switch for -- the exposure the drain path already
+                // carries, under the same breadcrumb.
+                poison_watch_db(&mut held_prism);
+            }
+        }
+
+        if growth_sample.0.elapsed() >= GROWTH_SAMPLE_EVERY {
+            let now = crate::graph::store_util::graph_family_bytes(&live_graph);
+            let active: Vec<&str> = [
+                (drain_in_flight.is_some(), "drain"),
+                (full_reindex_in_flight.is_some(), "full reindex"),
+                (scip_import_in_flight.is_some(), "SCIP import"),
+                (scip_in_flight.is_some(), "SCIP enrichment"),
+                (folded_since_sample, "idle fold"),
+            ]
+            .into_iter()
+            .filter_map(|(on, what)| on.then_some(what))
+            .collect();
+            if let Some(line) =
+                growth_note(growth_sample.1, now, growth_sample.0.elapsed(), &active)
+            {
+                eprintln!("{line}");
+            }
+            growth_sample = (std::time::Instant::now(), now);
+            folded_since_sample = false;
         }
 
         std::thread::sleep(COORDINATOR_TICK);
@@ -1505,6 +1610,7 @@ fn watch_db(
     held: &mut HeldPrism,
 ) -> Result<Arc<Infigraph>> {
     if held.is_none() {
+        held.wait_for_retired_store(RETIRED_STORE_WAIT)?;
         let _phase = crate::write_phase::enter(&"daemon: open graph", 0);
         held.set(Arc::new(open_transient(root, registry)?));
     }
@@ -1532,6 +1638,103 @@ fn poison_watch_db(held: &mut HeldPrism) {
     // on close -- name it in case that is where the process aborts (#132).
     let _phase = crate::write_phase::enter(&"daemon: drop held graph (checkpoint on close)", 0);
     held.clear();
+}
+
+/// How often the coordinator samples the graph's on-disk size.
+const GROWTH_SAMPLE_EVERY: Duration = Duration::from_secs(10);
+
+/// Growth between two samples that earns a log line.
+const GROWTH_NOTE_MIN_BYTES: u64 = 64 * 1024 * 1024;
+
+/// A daemon-log line for a jump in the graph's on-disk size, naming what was
+/// in flight when it happened -- or `None` for ordinary growth.
+///
+/// #166 could not say which operation took sittir from 2 GB to 21 GB: the
+/// breakers only run on write paths, and the log recorded refusals after the
+/// fact, never the growth itself. Sampling from the coordinator catches
+/// growth from any path -- a drain, SCIP, a fold, lbug's own automatic
+/// checkpoint -- without instrumenting each one.
+fn growth_note(before: u64, after: u64, over: Duration, active: &[&str]) -> Option<String> {
+    const MB: u64 = 1024 * 1024;
+    let grew = after.checked_sub(before)?;
+    if grew < GROWTH_NOTE_MIN_BYTES {
+        return None;
+    }
+    let during = if active.is_empty() {
+        "nothing tracked in flight (a write between samples, or lbug's own checkpoint)".to_string()
+    } else {
+        active.join(", ")
+    };
+    Some(format!(
+        "[growth] graph grew {} MB -> {} MB (+{} MB) in {}s during: {during}",
+        before / MB,
+        after / MB,
+        grew / MB,
+        over.as_secs()
+    ))
+}
+
+/// What the coordinator does after one idle-fold probe (#166).
+#[derive(Debug, PartialEq)]
+struct IdleFoldAction {
+    /// A line for the daemon log.
+    log: Option<String>,
+    /// The held graph must be reopened: its handle may not fold again.
+    reopen: bool,
+}
+
+/// Book-keeping for one idle-fold probe (#166).
+///
+/// - `Folded` resets the backoff.
+/// - `Busy` (another process's fold, or a writer mid-transaction) is
+///   transient: no backoff, nothing logged.
+/// - `Guarded` backs off and logs once per distinct reason, since the same
+///   refusal on every attempt says nothing new; `last_skip` keeps it.
+/// - `Failed`/`Disabled` back off, always log, and ask for a reopen. The
+///   backoff survives the reopen, so a fold that cannot succeed runs at most
+///   once per backoff period rather than once per probe -- sittir logged
+///   ~1,600 of them two seconds apart.
+fn settle_idle_fold(
+    fold: Option<crate::graph::store::IdleFold>,
+    backoff: &mut ReopenBackoff,
+    last_skip: &mut Option<String>,
+) -> IdleFoldAction {
+    use crate::graph::store::{FoldError, IdleFold};
+    let quiet = IdleFoldAction {
+        log: None,
+        reopen: false,
+    };
+    let e = match fold {
+        None | Some(IdleFold::NotDue) | Some(IdleFold::NotFolded(FoldError::Busy(_))) => {
+            return quiet
+        }
+        Some(IdleFold::Folded) => {
+            backoff.record_success();
+            *last_skip = None;
+            return quiet;
+        }
+        Some(IdleFold::NotFolded(e)) => e,
+    };
+    let delay = backoff.record_failure();
+    let reason = e.to_string();
+    let line = format!(
+        "[daemon] idle fold not done (consecutive: {}, next attempt in {}s): {reason}",
+        backoff.consecutive_failures(),
+        delay.as_secs()
+    );
+    if let FoldError::Guarded(_) = e {
+        let repeat = last_skip.as_deref() == Some(reason.as_str());
+        *last_skip = Some(reason);
+        return IdleFoldAction {
+            log: (!repeat).then_some(line),
+            reopen: false,
+        };
+    }
+    *last_skip = None;
+    IdleFoldAction {
+        log: Some(line),
+        reopen: true,
+    }
 }
 
 /// Serves a single `.request` file via `serve_one_request`, wrapped in the
@@ -1878,6 +2081,7 @@ fn try_start_scip_import(
     enriched_ast_generation: Option<i64>,
     registry: &Arc<crate::lang::LanguageRegistry>,
     held: &mut HeldPrism,
+    reopen_backoff: &mut ReopenBackoff,
     drain_in_flight: bool,
     full_reindex_in_flight: bool,
     scip_import_in_flight: bool,
@@ -1892,7 +2096,15 @@ fn try_start_scip_import(
     // itself serializes via `GraphStore::write_lock`, so a second one would
     // just block inside the background task rather than run concurrently,
     // silently doubling this loop's in-flight bookkeeping for no benefit.
-    if drain_in_flight || full_reindex_in_flight || scip_import_in_flight {
+    // While backing off a failed reopen the request stays in place, served
+    // on a later tick -- the same contract as `serve_request_locked`.
+    // Without this a pending import with nothing held reopened the graph on
+    // every 200ms tick (#166).
+    if drain_in_flight
+        || full_reindex_in_flight
+        || scip_import_in_flight
+        || !reopen_backoff.should_attempt()
+    {
         return None;
     }
 
@@ -1901,9 +2113,12 @@ fn try_start_scip_import(
     // path (Kuzu only allows safe concurrent access within one process's
     // `Database` object, not across two, even in the same process).
     let prism = match watch_db(root, registry, held) {
-        Ok(p) => p,
+        Ok(p) => {
+            reopen_backoff.record_success();
+            p
+        }
         Err(e) => {
-            eprintln!("[daemon] scip-import: failed to open graph connection, will retry: {e}");
+            log_reopen_failure("daemon scip-import", reopen_backoff, &e);
             return None;
         }
     };
@@ -2624,6 +2839,7 @@ where
             enriched_ast_generation,
             registry,
             held,
+            reopen_backoff,
             drain_in_flight,
             full_reindex_in_flight,
             scip_import_in_flight,
@@ -2746,6 +2962,156 @@ fn has_cross_file_calls(prism: &Infigraph, rel_path: &str) -> bool {
 mod tests {
     use super::*;
     use protobuf::Message as _;
+
+    /// #166: a store `clear` released must not be reopened over while
+    /// something still holds it -- two `Database`s on one file in a process
+    /// (#149). The wait ends as soon as the last other holder drops it, and
+    /// gives up with an error, rather than opening anyway, when it never does.
+    #[test]
+    fn a_released_store_still_held_elsewhere_blocks_a_reopen_until_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(crate::graph::GraphStore::open(&dir.path().join("graph")).unwrap());
+        let mut held = HeldPrism::new();
+        held.retired = Some(Arc::downgrade(&store));
+
+        let err = held
+            .wait_for_retired_store(Duration::from_millis(200))
+            .expect_err("a store still held elsewhere must block the reopen");
+        assert!(err.to_string().contains("still held by 1"), "{err}");
+        assert!(held.retired.is_some(), "a failed wait keeps watching it");
+
+        let holder = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            drop(store);
+        });
+        held.wait_for_retired_store(Duration::from_secs(10))
+            .expect("the wait must end once the last holder drops the store");
+        assert!(held.retired.is_none());
+        holder.join().unwrap();
+    }
+
+    /// #166: a jump in the graph's size is logged with what was running, and
+    /// ordinary growth or shrinkage is not.
+    #[test]
+    fn growth_is_noted_only_past_the_threshold_and_names_the_work_in_flight() {
+        const MB: u64 = 1024 * 1024;
+        let s = Duration::from_secs(10);
+        assert_eq!(
+            growth_note(100 * MB, 120 * MB, s, &["drain"]),
+            None,
+            "small growth"
+        );
+        assert_eq!(
+            growth_note(2000 * MB, 70 * MB, s, &[]),
+            None,
+            "a rebuild shrinks it"
+        );
+
+        let line = growth_note(2000 * MB, 2900 * MB, s, &["SCIP import", "idle fold"]).unwrap();
+        assert!(line.contains("2000 MB -> 2900 MB (+900 MB)"), "{line}");
+        assert!(line.contains("SCIP import, idle fold"), "{line}");
+
+        let quiet = growth_note(0, 100 * MB, s, &[]).unwrap();
+        assert!(quiet.contains("nothing tracked in flight"), "{quiet}");
+    }
+
+    mod idle_fold {
+        use super::super::{settle_idle_fold, ReopenBackoff};
+        use crate::graph::store::{FoldError, IdleFold};
+
+        fn failed(why: &str) -> Option<IdleFold> {
+            Some(IdleFold::NotFolded(FoldError::Failed(why.into())))
+        }
+        fn guarded(why: &str) -> Option<IdleFold> {
+            Some(IdleFold::NotFolded(FoldError::Guarded(why.into())))
+        }
+
+        /// #166: a fold that fails asks for a reopen -- its handle may not
+        /// fold again -- and backs off, so the next attempt waits instead of
+        /// following two seconds later on the fresh handle. Sittir logged
+        /// ~1,600 failing folds at that cadence.
+        #[test]
+        fn a_failed_fold_reopens_the_graph_and_backs_off() {
+            let mut backoff = ReopenBackoff::new();
+            let mut last_skip = None;
+
+            let action =
+                settle_idle_fold(failed("buffer pool is full"), &mut backoff, &mut last_skip);
+
+            assert!(action.reopen, "a failed handle must be reopened");
+            assert!(action
+                .log
+                .as_deref()
+                .is_some_and(|l| l.contains("buffer pool is full")));
+            assert!(
+                !backoff.should_attempt(),
+                "the next fold must wait out the backoff"
+            );
+            assert_eq!(backoff.consecutive_failures(), 1);
+        }
+
+        /// The reopen request is for the probe that failed only. A later probe
+        /// that finds nothing due -- a fresh handle, a busy WAL -- must not
+        /// reopen a healthy graph just because the failure count is raised.
+        #[test]
+        fn only_the_failing_probe_asks_for_a_reopen() {
+            let mut backoff = ReopenBackoff::new();
+            let mut last_skip = None;
+            settle_idle_fold(failed("io"), &mut backoff, &mut last_skip);
+
+            for later in [None, Some(IdleFold::NotDue)] {
+                let action = settle_idle_fold(later, &mut backoff, &mut last_skip);
+                assert!(!action.reopen && action.log.is_none(), "{action:?}");
+            }
+        }
+
+        /// A guard refusing the same thing on every attempt is logged once,
+        /// and never reopens: the handle is fine, the graph or disk is not.
+        #[test]
+        fn a_repeated_guard_is_logged_once_and_never_reopens() {
+            let mut backoff = ReopenBackoff::new();
+            let mut last_skip = None;
+
+            let first = settle_idle_fold(guarded("disk full"), &mut backoff, &mut last_skip);
+            let second = settle_idle_fold(guarded("disk full"), &mut backoff, &mut last_skip);
+            let changed =
+                settle_idle_fold(guarded("past the ceiling"), &mut backoff, &mut last_skip);
+
+            assert!(first.log.is_some() && !first.reopen);
+            assert!(second.log.is_none() && !second.reopen, "{second:?}");
+            assert!(changed.log.is_some(), "a new reason is news");
+            assert_eq!(
+                backoff.consecutive_failures(),
+                3,
+                "every refusal still backs off"
+            );
+        }
+
+        /// Busy is another process's fold or a writer mid-transaction: it
+        /// resolves itself, so it neither backs off nor logs. A successful
+        /// fold clears the backoff.
+        #[test]
+        fn busy_is_silent_and_a_successful_fold_resets_the_backoff() {
+            let mut backoff = ReopenBackoff::new();
+            let mut last_skip = None;
+            settle_idle_fold(guarded("disk full"), &mut backoff, &mut last_skip);
+
+            let busy = settle_idle_fold(
+                Some(IdleFold::NotFolded(FoldError::Busy(anyhow::anyhow!(
+                    "held"
+                )))),
+                &mut backoff,
+                &mut last_skip,
+            );
+            assert!(busy.log.is_none() && !busy.reopen);
+            assert_eq!(backoff.consecutive_failures(), 1, "busy must not back off");
+
+            settle_idle_fold(Some(IdleFold::Folded), &mut backoff, &mut last_skip);
+            assert!(backoff.should_attempt());
+            assert_eq!(backoff.consecutive_failures(), 0);
+            assert!(last_skip.is_none());
+        }
+    }
 
     /// A drain runs on a background task, so a panic inside it unwinds on a
     /// thread the watch loop never sees. Nothing else would ever answer the
@@ -3009,6 +3375,81 @@ mod tests {
     /// must return `Some(PendingWork::ScipImport(_))` immediately, with the
     /// `.result` reply not yet written, proving the import was handed off to
     /// a background task rather than run inline.
+    /// #166: while a failed reopen is backing off, a pending SCIP import must
+    /// wait in place like every other request -- it used to call `watch_db`
+    /// on every 200ms tick regardless, reopening the graph five times a
+    /// second for as long as the open kept failing.
+    #[test]
+    fn a_scip_import_waits_out_the_reopen_backoff_without_opening_the_graph() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let scip_path = root.join("index.scip");
+        std::fs::write(
+            &scip_path,
+            scip::types::Index::default().write_to_bytes().unwrap(),
+        )
+        .unwrap();
+        let request_path = root.join("test.request");
+        std::fs::write(
+            &request_path,
+            serde_json::to_string(&crate::daemon_protocol::WriteRequest::ScipImport {
+                scip_path,
+                enriched_ast_generation: None,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        let queue = Arc::new(Mutex::new(crate::daemon::queue::IndexWorkQueue::new()));
+        let mut held = HeldPrism::new();
+        let drain_rt = tokio::runtime::Runtime::new().unwrap();
+        let daemon_token = CancellationToken::new();
+        let registry = Arc::new(crate::lang::LanguageRegistry::new());
+        let mut code_watch = CodeWatch::new(
+            &daemon_token,
+            producer::ProducerConfig {
+                root: root.clone(),
+                registry: Arc::clone(&registry),
+                debounce_ms: 50,
+                ignore_rebuild_secs: 300,
+            },
+            Arc::clone(&queue),
+            Arc::new(|_evt| {}),
+        )
+        .unwrap();
+        let mut backing_off = ReopenBackoff::new();
+        backing_off.record_failure();
+
+        let started = route_or_serve_request(
+            &root,
+            &request_path,
+            &queue,
+            &registry,
+            &|| Ok(crate::lang::LanguageRegistry::new()),
+            &mut held,
+            &mut backing_off,
+            false,
+            false,
+            &drain_rt,
+            &daemon_token,
+            &mut code_watch,
+            None,
+            &mut false,
+            false,
+        );
+
+        assert!(started.is_none(), "nothing may start while backing off");
+        assert!(held.is_none(), "the graph must not have been opened");
+        assert!(
+            request_path.exists(),
+            "the request must wait for a later tick"
+        );
+        assert!(
+            !root.join(".infigraph").join("graph").exists(),
+            "no graph file may have been created by a reopen attempt"
+        );
+    }
+
     #[test]
     fn route_or_serve_scip_import_request_is_background_tracked_not_served_synchronously() {
         let tmp = tempfile::tempdir().unwrap();

@@ -97,6 +97,13 @@ pub(crate) fn check_disk_headroom(dir: &Path, projected_write_bytes: u64) -> Res
 const GRAPH_GROWTH_MAX_RATIO_ENV: &str = "INFIGRAPH_GRAPH_GROWTH_MAX_RATIO";
 const GRAPH_MAX_BYTES_ENV: &str = "INFIGRAPH_GRAPH_MAX_BYTES";
 
+/// Serializes the tests that set, or would be defeated by,
+/// [`GRAPH_MAX_BYTES_ENV`]: one test setting "0" disables every other test's
+/// ceiling for as long as it holds. Crate-visible because the ceiling is
+/// consulted outside this module too (the fold guard in `store`).
+#[cfg(test)]
+pub(crate) static MAX_BYTES_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Observed pathological incidents (github.com/pradeepmouli/infigraph#100)
 /// were 40-70x a healthy graph's size; the default 10x gives wide headroom
 /// for legitimate growth (large refactors, new language support landing)
@@ -221,7 +228,7 @@ fn graph_base_bytes(graph_path: &Path) -> u64 {
 /// `graph` itself stayed small, which the growth check missed entirely
 /// before this was summed in. Any new measurement of "how big is this
 /// graph" belongs on [`graph_family_bytes`] for the same reason.
-fn graph_wal_bytes(graph_path: &Path) -> u64 {
+pub(crate) fn graph_wal_bytes(graph_path: &Path) -> u64 {
     crate::graph::store::wal_family_paths(graph_path)
         .iter()
         .filter_map(|p| std::fs::metadata(p).ok())
@@ -987,10 +994,7 @@ mod tests {
         assert!(out.is_ok(), "0 must disable the ceiling: {out:?}");
     }
 
-    /// Serializes the tests that set, or would be defeated by,
-    /// `INFIGRAPH_GRAPH_MAX_BYTES`: one test setting "0" disables every
-    /// other test's ceiling for as long as it holds.
-    static MAX_BYTES_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    use super::MAX_BYTES_ENV_LOCK;
 
     /// #160: the ceiling is reachable from the project's own config file,
     /// which is the whole case for a per-project graph bound -- one repo's

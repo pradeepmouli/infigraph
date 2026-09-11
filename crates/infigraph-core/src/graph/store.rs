@@ -648,6 +648,66 @@ pub struct GraphStore {
     /// rebuild is measured against the bloated graph it is about to
     /// discard, and the documented remedy for a latched breaker cannot run.
     db_path: PathBuf,
+    /// Why a `CHECKPOINT` on this `Database` failed, once one has (#166).
+    /// Latched for the handle's lifetime: see [`FoldError::Disabled`].
+    fold_failure: std::sync::OnceLock<String>,
+}
+
+/// Why [`GraphStore::checkpoint_now`] did not fold.
+#[derive(Debug)]
+pub(crate) enum FoldError {
+    /// Another process holds the checkpoint window. Transient.
+    Busy(anyhow::Error),
+    /// Folding now would do harm: the graph is already refusing growth, or
+    /// the volume lacks the headroom a fold needs. A fold writes WAL pages
+    /// into the base image, and the one that hit ENOSPC mid-write on sittir
+    /// left a WAL the next open called corrupt, quarantining the graph.
+    Guarded(String),
+    /// A `CHECKPOINT` on this handle already failed, so it will not issue
+    /// another. Doing so is how the process dies: ladybug#924's post-cap
+    /// `CHECKPOINT` segfaulted mid-fold and left the file unopenable, and
+    /// an explicit `CHECKPOINT` after a failed automatic one SIGBUS'd in a
+    /// local reproduction. Only a fresh `Database` recovers.
+    Disabled(String),
+    /// The `CHECKPOINT` itself failed; this handle is now `Disabled`.
+    Failed(String),
+}
+
+impl std::fmt::Display for FoldError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Busy(e) => write!(f, "checkpoint window busy: {e}"),
+            Self::Guarded(why) => write!(f, "fold skipped: {why}"),
+            Self::Disabled(why) => write!(
+                f,
+                "fold disabled on this handle after an earlier failure ({why}); \
+                 reopen the graph to fold again"
+            ),
+            Self::Failed(e) => write!(f, "checkpoint failed: {e}"),
+        }
+    }
+}
+
+/// Whether a failed `CHECKPOINT` only found the database busy.
+///
+/// lbug waits for active transactions to leave before folding and gives up
+/// with "Timeout waiting for active write transactions to leave the system
+/// before checkpointing" (or "read transactions"): a writer mid-transaction,
+/// not a damaged handle. Latching that as a failure would reopen a healthy
+/// graph just because a write was in progress. Matched on lbug's text
+/// because it raises no distinct error kind -- the same approach as
+/// `is_storage_version_mismatch_error`.
+fn is_transient_checkpoint_failure(message: &str) -> bool {
+    message.contains("Timeout waiting for active")
+}
+
+/// What [`GraphStore::checkpoint_if_idle`] did.
+#[derive(Debug)]
+pub(crate) enum IdleFold {
+    /// No WAL, a still-busy one, or idle folding is disabled.
+    NotDue,
+    Folded,
+    NotFolded(FoldError),
 }
 
 impl GraphStore {
@@ -716,6 +776,7 @@ impl GraphStore {
             db,
             lock_path,
             db_path: path.to_path_buf(),
+            fold_failure: std::sync::OnceLock::new(),
         };
         let lock = WriteLock::acquire_with_timeout(&store.lock_path, timeout)?;
         store.init_schema(&lock)?;
@@ -813,6 +874,7 @@ impl GraphStore {
             db,
             lock_path,
             db_path: path.to_path_buf(),
+            fold_failure: std::sync::OnceLock::new(),
         })
     }
 
@@ -965,16 +1027,38 @@ impl GraphStore {
     /// hooking each write entry point individually is how a guard ends up
     /// covering three of four call sites, which has happened four times in
     /// this codebase already.
-    fn checkpoint_now(&self, db_path: &Path) -> Result<()> {
+    ///
+    /// Refuses rather than folds when folding is known to do harm -- see
+    /// [`FoldError`] -- so both callers get the same guards (#166).
+    fn checkpoint_now(&self, db_path: &Path) -> std::result::Result<(), FoldError> {
+        if let Some(why) = self.fold_failure.get() {
+            return Err(FoldError::Disabled(why.clone()));
+        }
+        if let Some(dir) = self.db_dir() {
+            // Growth past the ceiling or ratio is refused on the write paths;
+            // the fold must honour the same verdict, or it is the one path
+            // left that grows a graph already judged runaway.
+            super::store_util::check_graph_growth_ratio(dir, db_path)
+                .map_err(FoldError::Guarded)?;
+            let wal = super::store_util::graph_wal_bytes(db_path);
+            super::store_util::check_disk_headroom(dir, wal).map_err(FoldError::Guarded)?;
+        }
         let _exclusive = lockfile::acquire(
             &checkpoint_lock_path(db_path),
             "graph-checkpoint",
             CHECKPOINT_WAIT,
-        )?;
+        )
+        .map_err(FoldError::Busy)?;
         let _phase = crate::write_phase::enter(&"checkpoint", 0);
-        let conn = self.connection()?;
-        conn.query("CHECKPOINT")
-            .map_err(|e| anyhow::anyhow!("checkpoint failed: {e}"))?;
+        let conn = self.connection().map_err(FoldError::Busy)?;
+        if let Err(e) = conn.query("CHECKPOINT") {
+            let why = e.to_string();
+            if is_transient_checkpoint_failure(&why) {
+                return Err(FoldError::Busy(anyhow::anyhow!(why)));
+            }
+            let _ = self.fold_failure.set(why.clone());
+            return Err(FoldError::Failed(why));
+        }
         // The one moment the growth baseline can honestly be taken: the WAL
         // has just been folded in, so the base image reflects real data.
         // `stamp_healthy_graph_size`'s own doc asks for exactly this ("only
@@ -999,18 +1083,16 @@ impl GraphStore {
         // full reindex builds at `graph.rebuilding` and shares `graph.lock`,
         // so deriving the canonical name here would fold the wrong file.
         let db_path = self.db_path().to_path_buf();
-        let wal: u64 = wal_family_paths(&db_path)
-            .iter()
-            .filter_map(|p| std::fs::metadata(p).ok())
-            .map(|m| m.len())
-            .sum();
-        if wal < CHECKPOINT_WAL_BYTES {
+        if super::store_util::graph_wal_bytes(&db_path) < CHECKPOINT_WAL_BYTES {
             return;
         }
         // Best-effort: a failed checkpoint must not fail the write. It
         // leaves the WAL large, which the #100 growth breaker still guards.
-        if let Err(e) = self.checkpoint_now(&db_path) {
-            eprintln!("warn: {e}");
+        match self.checkpoint_now(&db_path) {
+            // Already reported when the handle was disabled; saying so on
+            // every write would bury the one line that matters.
+            Ok(()) | Err(FoldError::Disabled(_)) => {}
+            Err(e) => eprintln!("warn: {e}"),
         }
     }
 
@@ -1031,20 +1113,20 @@ impl GraphStore {
     /// it needs no bookkeeping, and it is true of *any* writer's WAL, not
     /// just one this process happens to know about.
     ///
-    /// Best-effort throughout. A WAL that cannot be stat'd, a checkpoint
-    /// that fails, or a busy checkpoint window all simply leave the WAL
-    /// unfolded for the next tick -- this runs on a timer, so there is
-    /// always a next chance, and a failure here must never take down the
-    /// daemon loop that calls it.
-    pub(crate) fn checkpoint_if_idle(&self, idle_after: std::time::Duration) {
+    /// Never fails its caller: a WAL that cannot be stat'd is `NotDue`, and
+    /// every reason a fold did not happen comes back as `NotFolded` for the
+    /// caller to act on -- the daemon backs off, and reopens the graph after
+    /// a `Failed` fold (#166), rather than probing again in 2 seconds, which
+    /// is how sittir logged ~1,600 failing folds.
+    pub(crate) fn checkpoint_if_idle(&self, idle_after: std::time::Duration) -> IdleFold {
         let scope = crate::settings_file::ConfigScope::of_infigraph_dir(self.db_dir());
         if idle_after.is_zero() && checkpoint_idle_secs(scope) == 0 {
             // 0 in settings disables the behaviour entirely; a zero argument
             // from a test still means "fold now", hence both conditions.
-            return;
+            return IdleFold::NotDue;
         }
         if self.db_dir().is_none() {
-            return; // in-memory store
+            return IdleFold::NotDue; // in-memory store
         }
         let db_path = self.db_path().to_path_buf();
         let wal_paths = wal_family_paths(&db_path);
@@ -1061,21 +1143,19 @@ impl GraphStore {
             }
         }
         if wal_bytes == 0 {
-            return; // nothing to fold
+            return IdleFold::NotDue; // nothing to fold
         }
         let Some(newest_write) = newest_write else {
-            return; // no usable mtime -- do not guess at idleness
+            return IdleFold::NotDue; // no usable mtime -- do not guess at idleness
         };
         let idle_for = newest_write.elapsed().unwrap_or_default();
         if idle_for < idle_after {
-            return; // still being written
+            return IdleFold::NotDue; // still being written
         }
 
-        if let Err(e) = self.checkpoint_now(&db_path) {
-            // Not fatal, and not even worth a warning on every tick: the
-            // common cause is another process holding the checkpoint window,
-            // which resolves itself.
-            eprintln!("warn: idle checkpoint skipped: {e}");
+        match self.checkpoint_now(&db_path) {
+            Ok(()) => IdleFold::Folded,
+            Err(e) => IdleFold::NotFolded(e),
         }
     }
 
@@ -1525,6 +1605,133 @@ mod tests {
             .map(|m| m.len())
             .sum();
         assert_eq!(before, after, "a WAL written just now must not be folded");
+    }
+
+    /// #166: once a `CHECKPOINT` on a handle has failed, that handle never
+    /// issues another -- the one after a failure is what crashed (ladybug#924
+    /// segfaulted mid-fold; a local reproduction SIGBUS'd) -- and both fold
+    /// paths honour it, leaving the WAL for a fresh handle to fold.
+    #[test]
+    fn a_handle_whose_fold_failed_never_folds_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = dir.path().join("graph");
+        let store = super::GraphStore::open(&graph).unwrap();
+        store
+            .connection()
+            .unwrap()
+            .query(
+                "CREATE (:File {id: 'a.rs', name: 'a.rs', path: 'a.rs', \
+                 language: 'rust', symbol_count: 0})",
+            )
+            .unwrap();
+        let wal_before = super::super::store_util::graph_wal_bytes(&graph);
+        assert!(wal_before > 0, "test setup: the write must leave a WAL");
+
+        let _ = store
+            .fold_failure
+            .set("Buffer manager exception: the buffer pool is full".into());
+
+        match store.checkpoint_if_idle(std::time::Duration::ZERO) {
+            super::IdleFold::NotFolded(super::FoldError::Disabled(why)) => {
+                assert!(why.contains("buffer pool is full"), "{why}")
+            }
+            other => panic!("a failed handle must refuse to fold, got {other:?}"),
+        }
+        assert_eq!(
+            super::super::store_util::graph_wal_bytes(&graph),
+            wal_before,
+            "a disabled handle must leave the WAL untouched"
+        );
+    }
+
+    /// A `CHECKPOINT` that times out behind an open write transaction only
+    /// found the database busy. It must not latch the handle, or the daemon
+    /// reopens a healthy graph whenever a fold races a write.
+    #[test]
+    fn a_fold_blocked_by_an_open_transaction_is_busy_not_a_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = dir.path().join("graph");
+        let store = super::GraphStore::open(&graph).unwrap();
+        let writer = store.connection().unwrap();
+        writer.query("BEGIN TRANSACTION").unwrap();
+        writer
+            .query(
+                "CREATE (:File {id: 'a.rs', name: 'a.rs', path: 'a.rs', \
+                 language: 'rust', symbol_count: 0})",
+            )
+            .unwrap();
+
+        let blocked = store.checkpoint_now(&graph);
+        writer.query("ROLLBACK").unwrap();
+
+        assert!(
+            matches!(blocked, Err(super::FoldError::Busy(_))),
+            "an open transaction must read as busy: {blocked:?}"
+        );
+        assert!(store.fold_failure.get().is_none(), "busy must not latch");
+        assert!(
+            store.checkpoint_now(&graph).is_ok(),
+            "once the transaction is gone the same handle must fold"
+        );
+    }
+
+    /// The classifier, on lbug's real messages: the busy timeout observed
+    /// above, and the two failures from sittir's daemon log that preceded a
+    /// corrupt WAL.
+    #[test]
+    fn only_a_transaction_timeout_is_a_transient_checkpoint_failure() {
+        assert!(super::is_transient_checkpoint_failure(
+            "Query execution failed: Timeout waiting for active write transactions to leave \
+             the system before checkpointing. If you have an open write transaction, please \
+             close it and try again."
+        ));
+        for fatal in [
+            "Query execution failed: Buffer manager exception: Unable to allocate memory! The \
+             buffer pool is full and no memory could be freed!",
+            "Query execution failed: IO exception: Cannot read from file: graph \
+             fileDescriptor: 5 numBytesRead: 0",
+        ] {
+            assert!(!super::is_transient_checkpoint_failure(fatal), "{fatal}");
+        }
+    }
+
+    /// A graph already past its absolute ceiling is refused growth on every
+    /// write path; the fold must honour the same verdict rather than be the
+    /// one path left writing into it (#166). A refusal is a guard, not a
+    /// failure: the handle stays usable once the graph is back in bounds.
+    #[test]
+    fn a_fold_past_the_absolute_ceiling_is_guarded_not_attempted() {
+        let _env = super::super::store_util::MAX_BYTES_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // The project layer (#160) applies only to a store inside a real
+        // `.infigraph`; one byte is a ceiling any graph exceeds.
+        let root = tempfile::tempdir().unwrap();
+        let graph = root.path().join(".infigraph").join("graph");
+        let store = super::GraphStore::open(&graph).unwrap();
+        store
+            .connection()
+            .unwrap()
+            .query(
+                "CREATE (:File {id: 'a.rs', name: 'a.rs', path: 'a.rs', \
+                 language: 'rust', symbol_count: 0})",
+            )
+            .unwrap();
+        std::fs::write(
+            crate::settings_file::project_config_path(root.path()),
+            "[graph]\nmax_bytes = 1\n",
+        )
+        .unwrap();
+
+        let fold = store.checkpoint_if_idle(std::time::Duration::ZERO);
+
+        match fold {
+            super::IdleFold::NotFolded(super::FoldError::Guarded(why)) => {
+                assert!(why.contains("absolute ceiling"), "{why}")
+            }
+            other => panic!("expected a guarded fold, got {other:?}"),
+        }
+        assert!(store.fold_failure.get().is_none(), "a guard must not latch");
     }
 
     /// Pins ladybug#924, fixed in lbug 0.20.3 (#166). Every `CHECKPOINT`

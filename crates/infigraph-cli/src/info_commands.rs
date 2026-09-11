@@ -579,12 +579,11 @@ pub(crate) fn cmd_daemon(root: &Path, debounce: u64) -> Result<()> {
 
     let on_full_reindex: std::sync::Arc<infigraph_core::daemon::FullReindexCallback> =
         std::sync::Arc::new(
-            move |prism: std::sync::Arc<infigraph_core::Infigraph>,
+            move |root: std::path::PathBuf,
                   job: infigraph_core::daemon::ScipEnrichJob,
                   token: tokio_util::sync::CancellationToken| {
                 let languages: std::collections::HashSet<String> =
                     job.languages.into_iter().collect();
-                let root = prism.root().to_path_buf();
                 // Part A (running the external indexer binaries) is
                 // deliberately unlocked -- it can take several minutes on a
                 // real multi-language repo and touches nothing in the graph.

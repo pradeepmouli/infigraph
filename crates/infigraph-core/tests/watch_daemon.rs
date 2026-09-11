@@ -1120,7 +1120,7 @@ fn scip_enrichment_task_is_cancellable_via_daemon_token() {
     let scip_generation = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let scip_generation_for_cb = std::sync::Arc::clone(&scip_generation);
     let on_full_reindex: std::sync::Arc<infigraph_core::daemon::FullReindexCallback> =
-        std::sync::Arc::new(move |_prism, _languages, _token| {
+        std::sync::Arc::new(move |_root, _languages, _token| {
             scip_generation_for_cb.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         });
 

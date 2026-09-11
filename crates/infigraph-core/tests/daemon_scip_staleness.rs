@@ -73,7 +73,7 @@ fn coordinator_triggers_scip_enrichment_once_when_staleness_exceeds_threshold() 
         Arc::new(Mutex::new(Vec::new()));
     let calls_for_cb = Arc::clone(&calls);
     let on_full_reindex: Arc<infigraph_core::daemon::FullReindexCallback> =
-        Arc::new(move |_prism, job, _token| {
+        Arc::new(move |_root, job, _token| {
             calls_for_cb.lock().unwrap().push(job);
         });
 

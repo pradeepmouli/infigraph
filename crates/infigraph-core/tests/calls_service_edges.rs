@@ -104,3 +104,32 @@ fn write_calls_service_edges_empty_is_a_noop() {
     let backend = KuzuBackend::open(&tmp.path().join("graph")).unwrap();
     backend.write_calls_service_edges(&[]).unwrap();
 }
+
+/// #166: writing the same edges again must converge, not add a second copy of
+/// each. The write used `MATCH ... CREATE` with no prior delete, so every
+/// repeat of the same input -- a re-link, a retried request -- grew the
+/// CALLS_SERVICE table by the whole batch, unbounded over time.
+#[test]
+fn write_calls_service_edges_twice_does_not_duplicate_edges() {
+    let tmp = tempfile::tempdir().unwrap();
+    let backend = KuzuBackend::open(&tmp.path().join("graph")).unwrap();
+    seed_two_symbols(&backend);
+    let edges = vec![CallsServiceEdge {
+        symbol_id: "caller.py::handler".to_string(),
+        target_id: "target.py::endpoint".to_string(),
+        method: "GET".to_string(),
+        path: "/api/one".to_string(),
+    }];
+
+    backend.write_calls_service_edges(&edges).unwrap();
+    backend.write_calls_service_edges(&edges).unwrap();
+
+    let rows = backend
+        .raw_query("MATCH (:Symbol)-[r:CALLS_SERVICE]->(:Symbol) RETURN r.method, r.path")
+        .unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "a repeated write must not duplicate: {rows:?}"
+    );
+}

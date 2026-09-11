@@ -1857,7 +1857,7 @@ impl GraphBackend for Neo4jBackend {
                 query(
                     "UNWIND $edges AS e \
                      MATCH (s:Symbol), (t:Symbol) WHERE s.id = e.symbol_id AND t.id = e.target_id \
-                     CREATE (s)-[:CALLS_SERVICE {method: e.method, path: e.path, target_service: ''}]->(t)",
+                     MERGE (s)-[:CALLS_SERVICE {method: e.method, path: e.path, target_service: ''}]->(t)",
                 )
                 .param("edges", edge_maps),
             ),
@@ -2049,13 +2049,13 @@ impl GraphBackend for Neo4jBackend {
                 "UNWIND $batch AS p \
                  MATCH (m:Module), (d:Dependency {{id: p.id}}) \
                  WHERE m.file STARTS WITH '{r}/' AND m.file CONTAINS $manifest_base \
-                 MERGE (m)-[:DEPENDS_ON {{is_dev: (p.is_dev = 'true')}}]->(d)"
+                 MERGE (m)-[e:DEPENDS_ON]->(d) SET e.is_dev = (p.is_dev = 'true')"
             )
         } else {
             "UNWIND $batch AS p \
              MATCH (m:Module), (d:Dependency {id: p.id}) \
              WHERE m.file CONTAINS $manifest_base \
-             MERGE (m)-[:DEPENDS_ON {is_dev: (p.is_dev = 'true')}]->(d)"
+             MERGE (m)-[e:DEPENDS_ON]->(d) SET e.is_dev = (p.is_dev = 'true')"
                 .to_string()
         };
         self.block_on(
