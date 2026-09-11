@@ -97,7 +97,9 @@ impl ReadEndpoint {
     /// Where a `GenericNamespaced` socket can land on Unix.
     ///
     /// `interprocess` resolves the pseudo-namespace to `$TMPDIR` when set
-    /// and `/tmp` otherwise. Both are checked rather than one picked,
+    /// and `/tmp` otherwise -- except on Linux, where it uses the abstract
+    /// namespace and there is no file anywhere, so every lookup here comes
+    /// up empty and `unlink` and the sweep are no-ops. Both are checked rather than one picked,
     /// because the daemon and whatever later cleans up after it do not
     /// reliably share an environment: a detached daemon does not inherit
     /// the per-user `TMPDIR` launchd gives a login shell, which is why the
@@ -170,6 +172,7 @@ pub fn sweep_orphaned_endpoints(older_than: std::time::Duration) -> usize {
 /// `older_than` is the floor that keeps this from racing daemon startup --
 /// an endpoint that has been bound but has not yet reached `accept` refuses
 /// a connection and is otherwise indistinguishable from an orphan.
+#[cfg(unix)]
 pub fn sweep_orphaned_endpoints_in(dir: &Path, older_than: std::time::Duration) -> usize {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return 0;
@@ -291,6 +294,12 @@ mod tests {
     /// `reclaim_name` (on by default) does not cover this: it unlinks the
     /// socket when the listener is *dropped*, which is exactly what a hard
     /// exit skips.
+    // Only where `GenericNamespaced` is a socket *file*. On Linux it is the
+    // abstract namespace: there is no file to leave behind or unlink, and a
+    // dead process releases the name by itself, so the hazard these pin does
+    // not exist there -- while `mem::forget` in this same process keeps the
+    // name bound, and the second bind rightly fails with `AddrInUse`.
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
     #[test]
     fn bind_reclaims_a_socket_left_behind_by_a_hard_exit() {
         let root = tempfile::tempdir().unwrap();
@@ -317,6 +326,12 @@ mod tests {
     /// subsumes the other: `SIGKILL` runs no code, so only `bind` covers
     /// that, while only this keeps the namespace clean for endpoints no
     /// daemon returns to.
+    // Only where `GenericNamespaced` is a socket *file*. On Linux it is the
+    // abstract namespace: there is no file to leave behind or unlink, and a
+    // dead process releases the name by itself, so the hazard these pin does
+    // not exist there -- while `mem::forget` in this same process keeps the
+    // name bound, and the second bind rightly fails with `AddrInUse`.
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
     #[test]
     fn unlink_removes_the_socket_a_hard_exiting_daemon_would_leave() {
         let root = tempfile::tempdir().unwrap();
@@ -353,6 +368,7 @@ mod tests {
     ///
     /// A live listener accepts a connection; an orphan refuses it. That is
     /// the distinction, and it needs no external tooling to make.
+    #[cfg(unix)]
     #[test]
     fn sweep_removes_an_orphaned_socket_and_spares_a_live_one() {
         let dir = tempfile::tempdir().unwrap();
@@ -387,6 +403,7 @@ mod tests {
     /// The age floor exists to avoid racing a daemon that has bound its
     /// endpoint but not yet reached `accept` -- it would refuse a
     /// connection and look exactly like an orphan.
+    #[cfg(unix)]
     #[test]
     fn sweep_leaves_a_socket_younger_than_the_floor_alone() {
         let dir = tempfile::tempdir().unwrap();

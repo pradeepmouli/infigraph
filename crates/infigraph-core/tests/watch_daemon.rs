@@ -964,7 +964,19 @@ fn full_reindex_build_task_can_be_cancelled_before_it_starts_the_swap() {
     }
 
     let live_graph = project.path().join(".infigraph").join("graph");
-    let mtime_before = std::fs::metadata(&live_graph).unwrap().modified().unwrap();
+    // "Untouched" means not swapped, and a swap replaces the file -- so the
+    // file's identity is the evidence, not its mtime. The coordinator writes
+    // the live graph in place for legitimate reasons (the idle WAL fold,
+    // #149), and on a slow runner one lands before the check below: CI saw
+    // the mtime move 13s after this baseline with no swap involved.
+    #[cfg(unix)]
+    let identity = |p: &std::path::Path| {
+        use std::os::unix::fs::MetadataExt;
+        let m = std::fs::metadata(p).unwrap();
+        (m.dev(), m.ino())
+    };
+    #[cfg(unix)]
+    let identity_before = identity(&live_graph);
 
     // Cancelled up front, before the loop even starts: by the time
     // `try_start_full_reindex` spawns the build task, its child token is
@@ -1037,10 +1049,21 @@ fn full_reindex_build_task_can_be_cancelled_before_it_starts_the_swap() {
         "a cancelled build must reply with an error, not FullReindexOk: {reply:?}"
     );
 
-    let mtime_after = std::fs::metadata(&live_graph).unwrap().modified().unwrap();
+    #[cfg(unix)]
     assert_eq!(
-        mtime_before, mtime_after,
-        "cancelling before the swap must leave the live graph untouched"
+        identity_before,
+        identity(&live_graph),
+        "cancelling before the swap must leave the live graph file in place"
+    );
+    let swap_leftovers: Vec<String> = std::fs::read_dir(project.path().join(".infigraph"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("graph.previous"))
+        .collect();
+    assert!(
+        swap_leftovers.is_empty(),
+        "a cancelled build must not have retired the live graph: {swap_leftovers:?}"
     );
 
     stop_tx.send(()).unwrap();

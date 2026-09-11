@@ -128,6 +128,17 @@ fn doc_index_routes_reads_through_the_daemon_when_the_daemon_store_is_selected()
 
     let docs = infigraph_docs::daemon_source::daemon_row_source(root).unwrap();
     let svc = ReadService::start_with_sources(root, graph_source(root), Some(docs), 2).unwrap();
+    // A daemon serves reads while holding `watch.lock`, and that lock is what
+    // `DocIndex::init`'s auto-start (#159) checks. Without it this service does
+    // not count as running: init spawned a real daemon, whose bind took over
+    // the endpoint, so `svc.shutdown()` woke that daemon instead of its own
+    // accept loop and hung forever -- leaking the daemon on every run.
+    let _daemon_lock = infigraph_core::lockfile::acquire(
+        &root.join(".infigraph").join("watch.lock"),
+        "read-service test",
+        std::time::Duration::from_secs(5),
+    )
+    .unwrap();
 
     std::env::set_var("INFIGRAPH_BACKEND", "daemon");
     let mut idx = infigraph_docs::DocIndex::open(root).unwrap();
