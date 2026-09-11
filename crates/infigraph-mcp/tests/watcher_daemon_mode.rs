@@ -540,10 +540,10 @@ fn stop_watch_docs_by_path_writes_sentinel_when_daemon_alive() {
     let root = tmp.path().canonicalize().unwrap();
     let ig = root.join(".infigraph");
     std::fs::create_dir_all(&ig).unwrap();
-    infigraph_docs::DocIndex::open(&root)
-        .unwrap()
-        .init()
-        .unwrap();
+    // No `DocIndex::init()`: `tool_stop_watch_docs` reads only `watch.lock`,
+    // and an init under the default daemon backend (#159) auto-starts a REAL
+    // daemon that takes `watch.lock` before the line below can -- failing
+    // this test on CI (where the backend is unset) and leaking that daemon.
 
     // Simulate a live daemon: hold watch.lock for the duration of this test.
     let lock_path = ig.join("watch.lock");

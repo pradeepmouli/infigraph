@@ -932,25 +932,13 @@ pub fn index_group(
 }
 
 pub fn registry_path() -> Result<PathBuf> {
-    let home_override = crate::instances::registry_settings().home;
-    if !home_override.is_empty() {
-        return Ok(PathBuf::from(home_override)
-            .join(".infigraph")
-            .join("registry.json"));
-    }
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .or_else(dirs_next::home_dir)
-        .context("cannot determine home directory")?;
-    Ok(home.join(".infigraph").join("registry.json"))
+    Ok(crate::instances::infigraph_home().join("registry.json"))
 }
 
+/// Beside the registry it guards, so an isolated registry is also locked in
+/// isolation (it used to be `$HOME` regardless of `INFIGRAPH_REGISTRY_HOME`).
 fn registry_lock_path() -> Result<PathBuf> {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .or_else(dirs_next::home_dir)
-        .context("cannot determine home directory")?;
-    Ok(home.join(".infigraph").join("registry.lock"))
+    Ok(crate::instances::infigraph_home().join("registry.lock"))
 }
 
 const REGISTRY_LOCK_TIMEOUT: Duration = Duration::from_secs(10);

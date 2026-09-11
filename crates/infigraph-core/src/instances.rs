@@ -70,18 +70,33 @@ pub fn registry_settings() -> Registry {
     Registry::resolve(cli, crate::settings_file::ConfigScope::User)
 }
 
+/// The `.infigraph` directory holding machine-wide state: the project
+/// registry, its lock, and instance registrations. `INFIGRAPH_REGISTRY_HOME`
+/// relocates all three together, so one override isolates a test (or a
+/// scratch install) completely -- before this the lock and the instance files
+/// ignored it and stayed in the real home.
+pub fn infigraph_home() -> PathBuf {
+    let home = registry_settings().home;
+    let base = if home.is_empty() {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .or_else(dirs_next::home_dir)
+            .unwrap_or_else(|| PathBuf::from("."))
+    } else {
+        PathBuf::from(home)
+    };
+    base.join(".infigraph")
+}
+
 /// Directory holding one JSON file per live-or-recently-live instance.
-/// Overridable via `INFIGRAPH_REGISTRY_INSTANCES_DIR` (tests).
+/// Overridable via `INFIGRAPH_REGISTRY_INSTANCES_DIR`; otherwise under
+/// [`infigraph_home`].
 pub fn instances_dir() -> PathBuf {
     let dir = registry_settings().instances_dir;
     if !dir.is_empty() {
         return PathBuf::from(dir);
     }
-    std::env::var("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("."))
-        .join(".infigraph")
-        .join("instances")
+    infigraph_home().join("instances")
 }
 
 /// The registration file path for `pid` (pub for R5.4's signal-time

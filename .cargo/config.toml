@@ -1,3 +1,15 @@
+# Every process cargo runs -- test binaries and the CLI/daemon children they
+# spawn, the pre-commit hook, CI -- keeps its project registry, registry lock
+# and instance files in the checkout instead of the developer's real
+# ~/.infigraph. A test that saved an in-memory `Registry` (index_group ends in
+# `registry.save()`) overwrote the real registry with its fixtures and
+# deregistered every project on the machine; a per-test guard existed but only
+# covered one module. A test that sets its own INFIGRAPH_REGISTRY_HOME still
+# wins. `cargo run` here gets the scratch registry too: use the installed
+# binary for real work.
+[env]
+INFIGRAPH_REGISTRY_HOME = { value = "target/test-registry-home", relative = true }
+
 # usearch and lbug both vendor simsimd, causing duplicate symbol errors on Linux
 # where the linker treats them as hard errors. Allow multiple definitions so the
 # linker picks the first and discards duplicates (matches macOS/Windows behavior).
