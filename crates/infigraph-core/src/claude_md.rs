@@ -4,6 +4,8 @@ use anyhow::Result;
 
 /// Bump whenever the block's text changes: a project whose file already holds
 /// this version's marker is left alone, so an unbumped edit never reaches it.
+/// A bumped one reaches a project when it is next indexed or its daemon next
+/// starts.
 const VERSION: u32 = 3;
 
 /// Write/update project-level `.claude/CLAUDE.md` with infigraph instructions.

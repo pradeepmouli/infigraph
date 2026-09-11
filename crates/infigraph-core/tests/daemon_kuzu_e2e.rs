@@ -116,6 +116,12 @@ fn cli_binary() -> PathBuf {
 /// involved, so `.infigraph/` exists), then start a real detached
 /// `infigraph daemon` against it and wait until it holds `watch.lock`.
 fn start_real_daemon(project_dir: &Path) -> KillOnDrop {
+    bootstrap_index(project_dir);
+    spawn_real_daemon(project_dir)
+}
+
+/// The indexing half of `start_real_daemon`.
+fn bootstrap_index(project_dir: &Path) {
     let cli = cli_binary();
 
     // INFIGRAPH_NO_WATCH: plain `index` triggers main.rs's pre-dispatch
@@ -134,9 +140,13 @@ fn start_real_daemon(project_dir: &Path) -> KillOnDrop {
         .status()
         .unwrap();
     assert!(status.success(), "bootstrap index failed");
+}
 
+/// The daemon half of `start_real_daemon`: `project_dir` must already be
+/// indexed.
+fn spawn_real_daemon(project_dir: &Path) -> KillOnDrop {
     let daemon = KillOnDrop(
-        Command::new(&cli)
+        Command::new(cli_binary())
             .arg("daemon")
             .current_dir(project_dir)
             .env(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND)
@@ -383,6 +393,48 @@ fn real_cli_index_against_a_real_daemon_completes_and_writes() {
     );
 
     stop_daemon(project_dir.path(), &mut daemon);
+}
+
+/// A changed managed `.claude/CLAUDE.md` block used to reach a project only
+/// when it was reindexed, so a `claude_md` `VERSION` bump left every existing
+/// project on the old text -- five on one machine after #168. The daemon now
+/// refreshes the block when it starts, keeping the user's own content around
+/// it.
+#[test]
+fn a_starting_daemon_refreshes_a_stale_project_claude_md_block() {
+    let project_dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        project_dir.path().join("main.py"),
+        "def hello():\n    pass\n",
+    )
+    .unwrap();
+    bootstrap_index(project_dir.path());
+    let claude_md = project_dir.path().join(".claude").join("CLAUDE.md");
+    // What indexing writes is, by definition, the current block.
+    let current = std::fs::read_to_string(&claude_md).unwrap();
+    let stale = "<!-- BEGIN INFIGRAPH v1 -->\nFall back to grep.\n<!-- END INFIGRAPH -->\n";
+    std::fs::write(&claude_md, format!("# My notes\n\n{stale}\nMore notes\n")).unwrap();
+
+    let mut daemon = spawn_real_daemon(project_dir.path());
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let refreshed = loop {
+        let text = std::fs::read_to_string(&claude_md).unwrap();
+        if !text.contains("v1 -->") || std::time::Instant::now() >= deadline {
+            break text;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    stop_daemon(project_dir.path(), &mut daemon);
+
+    assert!(
+        refreshed.contains(current.trim()),
+        "the stale block must be replaced by the current one: {refreshed}"
+    );
+    assert!(
+        refreshed.starts_with("# My notes\n") && refreshed.ends_with("More notes\n"),
+        "content outside the managed block must survive: {refreshed}"
+    );
+    assert!(!refreshed.contains("Fall back to grep"), "{refreshed}");
 }
 
 /// End-to-end proof that a real spawned `infigraph daemon` process and a
