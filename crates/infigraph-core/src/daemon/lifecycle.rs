@@ -142,23 +142,39 @@ pub fn ensure_daemon_for_routed_access(root: &Path) -> anyhow::Result<()> {
 
     if let DaemonStartOutcome::Failed(e) = ensure_daemon_running_required(root, &watch_binary) {
         anyhow::bail!(
-            "INFIGRAPH_BACKEND=daemon requires a running daemon for {}, but starting one \
-             failed: {e}. Start one manually with `infigraph daemon`.",
-            root.display()
+            "reads and writes for {} go through a daemon (the default backend), but starting \
+             one failed: {e}. Start one manually with `infigraph daemon`, or set {}={} to \
+             work locally in this process.",
+            root.display(),
+            crate::BACKEND_ENV,
+            crate::LOCAL_BACKEND
         );
     }
 
     if !wait_for_daemon_ready(&lock_path, std::time::Duration::from_secs(10)) {
-        anyhow::bail!(
-            "INFIGRAPH_BACKEND=daemon is set but no daemon came up for {} within 10s \
-             (auto-start attempted) -- reads would fail and writes would block until their \
-             own timeout instead of failing here. Check `infigraph ps` / the daemon log, \
-             start one with `infigraph daemon`, or unset INFIGRAPH_BACKEND to work locally \
-             in this process.",
-            root.display()
-        );
+        return Err(no_daemon_came_up(
+            root,
+            "reads would fail and writes would block until their own timeout instead of \
+             failing here",
+        ));
     }
     Ok(())
+}
+
+/// The error for a daemon-routed operation when no daemon came up after an
+/// auto-start attempt -- one wording for every caller, with `consequence`
+/// saying what this caller cannot do without one. The opt-out is spelled as
+/// an explicit local backend: since #159 an *unset* `INFIGRAPH_BACKEND` is
+/// the daemon backend, so "unset it to work locally" is wrong advice.
+pub fn no_daemon_came_up(root: &Path, consequence: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "no daemon came up for {} (auto-start attempted), and {consequence}. Check \
+         `infigraph ps` / the daemon log, start one with `infigraph daemon`, or set {}={} \
+         to work locally in this process.",
+        root.display(),
+        crate::BACKEND_ENV,
+        crate::LOCAL_BACKEND
+    )
 }
 
 /// Make this process lead its own process group, so its descendants can be

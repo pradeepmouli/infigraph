@@ -1056,7 +1056,7 @@ fn check_one_project_recovery(project_path: &Path) -> Vec<CheckResult> {
             format!("{}: pending recovery", project_path.display()),
             "a corrupt graph was quarantined and a full reindex was requested, but nothing has performed it -- only a daemon drains this, so a project with no daemon stays empty indefinitely",
             format!(
-                "run `cd {} && infigraph daemon` to drain it, or `cd {} && infigraph index --full`",
+                "run `cd {} && infigraph daemon` to drain it, or `cd {} && infigraph rebuild`",
                 project_path.display(),
                 project_path.display()
             ),
@@ -1072,7 +1072,7 @@ fn check_one_project_recovery(project_path: &Path) -> Vec<CheckResult> {
                 format!("{}: empty graph", project_path.display()),
                 "the graph opens cleanly but contains no symbols -- the usual cause is a corruption wipe that started a fresh graph and never re-indexed",
                 format!(
-                    "run `cd {} && infigraph index --full` to repopulate it",
+                    "run `cd {} && infigraph rebuild` to repopulate it",
                     project_path.display()
                 ),
             ));

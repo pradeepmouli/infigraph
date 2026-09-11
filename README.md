@@ -353,7 +353,7 @@ The first time you run Infigraph on a project, it indexes all source files and b
 ```bash
 cd /path/to/project
 infigraph index              # Builds graph (~30s–2min depending on size)
-infigraph index --full       # Clean rebuild from scratch
+infigraph rebuild            # Clean rebuild from scratch
 ```
 
 ### Common Tasks

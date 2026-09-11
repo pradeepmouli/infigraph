@@ -120,9 +120,8 @@ pub(crate) fn cmd_index(root: &Path, full: bool, no_embed: bool) -> Result<()> {
             // this branch returns before `Infigraph::open`, so the usual
             // auto-start path never runs. Without this check, submitting
             // into an unattended staging dir just sits there until the
-            // 600s deadline and then reports an opaque timeout -- a
-            // plausible everyday case whenever INFIGRAPH_BACKEND is
-            // exported from a shell profile.
+            // 600s deadline and then reports an opaque timeout -- an
+            // everyday case, since the daemon backend is the default.
             // The pre-dispatch auto-watch (main.rs -> ensure_watcher_running)
             // SPAWNS the daemon but returns before the child has acquired
             // watch.lock, so a one-shot liveness probe here raced it: the
@@ -137,14 +136,10 @@ pub(crate) fn cmd_index(root: &Path, full: bool, no_embed: bool) -> Result<()> {
             if !wait_for_daemon(&lock_path, std::time::Duration::from_secs(10)) {
                 ensure_watcher_running(root);
                 if !wait_for_daemon(&lock_path, std::time::Duration::from_secs(10)) {
-                    anyhow::bail!(
-                        "INFIGRAPH_BACKEND=daemon is set but no daemon came up for {} \
-                         (auto-start attempted), and a full reindex can only be served \
-                         by one. Check `infigraph ps` / the daemon log, start one with \
-                         `infigraph daemon`, or unset INFIGRAPH_BACKEND to run the \
-                         reindex locally in this process.",
-                        root.display()
-                    );
+                    return Err(infigraph_core::daemon::lifecycle::no_daemon_came_up(
+                        root,
+                        "a rebuild can only be served by one",
+                    ));
                 }
             }
 
