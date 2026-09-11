@@ -616,6 +616,10 @@ pub(crate) fn copy_edges_with_bad_record_retry(
             }
             Err(e) => {
                 let msg = e.to_string();
+                if let Some(stop) = store.stop_if_committed_but_fold_failed(&msg) {
+                    let _ = std::fs::remove_file(edge_pq);
+                    return Err(stop);
+                }
                 if !prefiltered && msg.contains(MISSING_PK_MARKER) {
                     prefiltered = true;
                     let before = pairs.len();

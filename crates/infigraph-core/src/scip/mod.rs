@@ -582,6 +582,10 @@ pub fn import_scip_index_enriched_at(
                 }
                 Err(e) => {
                     let msg = e.to_string();
+                    if let Some(stop) = store.stop_if_committed_but_fold_failed(&msg) {
+                        let _ = std::fs::remove_file(&sym_pq);
+                        return Err(stop);
+                    }
                     if let Some(bad) = extract_bad_copy_value(&msg) {
                         let before = remaining.len();
                         remaining.retain(|(id, ..)| id != bad);

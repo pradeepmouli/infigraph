@@ -701,6 +701,15 @@ fn is_transient_checkpoint_failure(message: &str) -> bool {
     message.contains("Timeout waiting for active")
 }
 
+/// Whether a failed statement was in fact committed, and only lbug's
+/// post-commit auto-checkpoint failed: "Transaction committed successfully,
+/// but the post-commit checkpoint failed. The committed data is durable
+/// ...". lbug raises it after publishing the commit. Matched on text for the
+/// same reason as [`is_transient_checkpoint_failure`].
+fn is_committed_but_fold_failed(message: &str) -> bool {
+    message.contains("post-commit checkpoint failed")
+}
+
 /// What [`GraphStore::checkpoint_if_idle`] did.
 #[derive(Debug)]
 pub(crate) enum IdleFold {
@@ -1018,6 +1027,27 @@ impl GraphStore {
             "graph for {graph_name} is being automatically rebuilt after a detected crash -- \
              retry shortly"
         );
+    }
+
+    /// Classify a failed write statement (#177): `Some` with the error the
+    /// caller must stop with when lbug committed the statement and only its
+    /// post-commit checkpoint failed, `None` for any other failure.
+    ///
+    /// Such a statement's rows are durable, so retrying it -- or falling back
+    /// to an UNWIND of the same rows -- applies them a second time, which on a
+    /// keyless edge table is a duplicate batch. And the fold that failed
+    /// leaves the handle in the state `checkpoint_now` latches on (ladybug#924):
+    /// this latches it the same way, so the daemon's next fold probe reopens
+    /// the graph instead of folding on it again.
+    pub(crate) fn stop_if_committed_but_fold_failed(&self, message: &str) -> Option<anyhow::Error> {
+        if !is_committed_but_fold_failed(message) {
+            return None;
+        }
+        let _ = self.fold_failure.set(message.to_string());
+        Some(anyhow::anyhow!(
+            "{message} -- the write is durable, so it is not retried, and this graph handle \
+             will not fold again until it is reopened (#177)"
+        ))
     }
 
     /// Fold the WAL into the base image, holding the checkpoint lock
@@ -1642,6 +1672,68 @@ mod tests {
             wal_before,
             "a disabled handle must leave the WAL untouched"
         );
+    }
+
+    /// #177: lbug's "committed, but the post-commit checkpoint failed" means
+    /// the rows are durable -- the one COPY failure that must be neither
+    /// retried nor replayed through a fallback -- and nothing else does.
+    #[test]
+    fn only_a_post_commit_checkpoint_failure_counts_as_committed() {
+        assert!(super::is_committed_but_fold_failed(
+            "Query execution failed: Transaction committed successfully, but the post-commit \
+             checkpoint failed. The committed data is durable and will be recovered on restart: \
+             Buffer manager exception: Unable to allocate memory! The buffer pool is full and no \
+             memory could be freed!"
+        ));
+        for other in [
+            "Timeout waiting for active write transactions to leave the system before checkpointing.",
+            "Copy exception: Found duplicated primary key value abc, which violates the uniqueness \
+             constraint of the primary key column.",
+            "IO exception: Cannot read from file: graph fileDescriptor: 6",
+            "Buffer manager exception: Unable to allocate memory! The buffer pool is full and no \
+             memory could be freed!",
+        ] {
+            assert!(!super::is_committed_but_fold_failed(other), "{other}");
+        }
+    }
+
+    /// #177: stopping on a committed write whose fold failed latches the
+    /// handle exactly as a failed `CHECKPOINT` does, so the daemon reopens it
+    /// instead of folding on it again; any other failure leaves it alone.
+    #[test]
+    fn a_committed_write_whose_fold_failed_stops_and_latches_the_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = super::GraphStore::open(&dir.path().join("graph")).unwrap();
+        store
+            .connection()
+            .unwrap()
+            .query(
+                "CREATE (:File {id: 'a.rs', name: 'a.rs', path: 'a.rs', \
+                 language: 'rust', symbol_count: 0})",
+            )
+            .unwrap();
+
+        assert!(store
+            .stop_if_committed_but_fold_failed("Copy exception: duplicated primary key value")
+            .is_none());
+        assert!(
+            store.fold_failure.get().is_none(),
+            "an ordinary COPY failure must not latch"
+        );
+
+        let stop = store
+            .stop_if_committed_but_fold_failed(
+                "Transaction committed successfully, but the post-commit checkpoint failed. \
+                 The committed data is durable and will be recovered on restart",
+            )
+            .expect("a committed write must stop its caller");
+        assert!(stop.to_string().contains("not retried"), "{stop}");
+        match store.checkpoint_if_idle(std::time::Duration::ZERO) {
+            super::IdleFold::NotFolded(super::FoldError::Disabled(why)) => {
+                assert!(why.contains("post-commit checkpoint failed"), "{why}")
+            }
+            other => panic!("the latched handle must refuse to fold, got {other:?}"),
+        }
     }
 
     /// A `CHECKPOINT` that times out behind an open write transaction only
