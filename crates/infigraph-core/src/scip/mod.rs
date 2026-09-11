@@ -11,7 +11,7 @@ use scip::types::{symbol_information, Index, SymbolRole};
 use crate::graph::parquet_loader;
 use crate::graph::store_util::{
     copy_edges_with_bad_record_retry, escape, extract_bad_copy_value, fwd_slash_path,
-    literal_round_trip, staging_parquet,
+    literal_round_trip, raw_string, staging_parquet,
 };
 use crate::graph::GraphStore;
 use crate::model::{Span, SymbolKind};
@@ -71,25 +71,16 @@ fn preload_symbol_edges(conn: &kuzu::Connection<'_>, table: &str) -> Result<Symb
         if row.len() < 2 {
             continue;
         }
-        let src = row[0].to_string().trim_matches('"').to_string();
-        let tgt = row[1].to_string().trim_matches('"').to_string();
-        edges.entry(src).or_default().insert(tgt);
+        edges
+            .entry(raw_string(&row[0]).to_string())
+            .or_default()
+            .insert(raw_string(&row[1]).to_string());
     }
     Ok(edges)
 }
 
 fn edge_exists(edges: &SymbolEdges, (src, dst): &(String, String)) -> bool {
     edges.get(src).is_some_and(|targets| targets.contains(dst))
-}
-
-/// A string property exactly as stored -- `Value`'s `Display` escapes and
-/// quotes, so it would never compare equal to the value about to be written.
-/// NULL reads as "", the import's own default for an absent docstring.
-fn raw_string(value: &kuzu::Value) -> &str {
-    match value {
-        kuzu::Value::String(s) => s,
-        _ => "",
-    }
 }
 
 /// A symbol's enrichment as one comparable value (#178): a re-import skips
@@ -236,14 +227,14 @@ pub fn import_scip_index_enriched_at(
         if row.len() < 7 {
             continue;
         }
-        let sid = row[0].to_string().trim_matches('"').to_string();
+        let sid = raw_string(&row[0]).to_string();
         existing_symbol_ids.insert(sid.clone());
         existing_enrichment.insert(
             sid.clone(),
             enrichment_hash(raw_string(&row[5]), raw_string(&row[6])),
         );
-        let sfile = row[1].to_string().trim_matches('"').to_string();
-        let sname = row[2].to_string().trim_matches('"').to_string();
+        let sfile = raw_string(&row[1]).to_string();
+        let sname = raw_string(&row[2]).to_string();
         let sstart: u32 = row[3].to_string().trim_matches('"').parse().unwrap_or(0);
         let send: u32 = row[4].to_string().trim_matches('"').parse().unwrap_or(0);
 
@@ -275,10 +266,7 @@ pub fn import_scip_index_enriched_at(
     let known_files: std::collections::HashSet<String> = conn
         .query("MATCH (f:File) RETURN f.id")
         .context("SCIP import: failed to preload File nodes")?
-        .filter_map(|row| {
-            row.first()
-                .map(|v| v.to_string().trim_matches('"').to_string())
-        })
+        .filter_map(|row| row.first().map(|v| raw_string(v).to_string()))
         .collect();
     let (documents, skipped): (Vec<_>, Vec<_>) = index
         .documents
@@ -1924,8 +1912,8 @@ mod tests {
         .unwrap()
         .map(|row| {
             (
-                row[0].to_string().trim_matches('"').to_string(),
-                row[1].to_string().trim_matches('"').to_string(),
+                raw_string(&row[0]).to_string(),
+                raw_string(&row[1]).to_string(),
             )
         })
         .collect()
@@ -1981,6 +1969,41 @@ mod tests {
         let stats = import_scip_index(&index_path, &env.store, None).unwrap();
         assert_eq!(edge_pairs(&env, "CALLS", "id").len(), 1);
         assert_eq!(stats.references_added, 0);
+    }
+
+    /// #179: an id really can start or end with a quote -- SCIP names quoted
+    /// descriptors -- and the preloads must read it as stored. The old
+    /// `trim_matches('"')` turned `test.ts::"a"` into `test.ts::"a`, which
+    /// matched nothing in the graph: the Symbol pre-filter missed such ids and
+    /// sittir's import retried its whole COPY once per miss, 17 times a round.
+    #[test]
+    fn preloads_keep_a_quote_that_is_part_of_the_id() {
+        let env = TestEnv::new();
+        env.add_file("test.ts");
+        let conn = env.store.connection().unwrap();
+        let (a, b) = (r#"test.ts::"a""#, r#"test.ts::"b""#);
+        for id in [a, b] {
+            conn.query(&format!(
+                "CREATE (:Symbol {{id: '{}', name: 'n', kind: 'function', file: 'test.ts', \
+                 start_line: 1, end_line: 2, signature_hash: '', language: 'typescript', \
+                 visibility: 'public', parent: '', docstring: '', complexity: 0, \
+                 parameters: '', return_type: ''}})",
+                escape(id)
+            ))
+            .unwrap();
+        }
+        conn.query(&format!(
+            "MATCH (x:Symbol {{id: '{}'}}), (y:Symbol {{id: '{}'}}) CREATE (x)-[:CALLS]->(y)",
+            escape(a),
+            escape(b)
+        ))
+        .unwrap();
+
+        let edges = preload_symbol_edges(&conn, "CALLS").unwrap();
+        assert!(
+            edge_exists(&edges, &(a.to_string(), b.to_string())),
+            "the preload must hold the ids exactly: {edges:?}"
+        );
     }
 
     /// #176: INHERITS is keyless too.

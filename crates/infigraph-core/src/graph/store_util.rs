@@ -316,6 +316,22 @@ pub(crate) fn estimate_extractions_write_bytes(
         .unwrap_or(0)
 }
 
+/// A string property exactly as stored; NULL (or any non-string) reads as "".
+///
+/// Use this rather than `value.to_string().trim_matches('"')`: lbug's
+/// `Display` already writes a string raw, so the trim only ever removes a
+/// quote that is *part of the value*. SCIP names quoted descriptors, so ids
+/// like `grammar.ts::"_anonymous_'"` are real -- trimmed, they no longer match
+/// the graph, and the SCIP Symbol preload's pre-filter missed exactly those,
+/// costing sittir's import 17 whole-batch COPY retries on duplicate keys
+/// every round (#179).
+pub(crate) fn raw_string(value: &kuzu::Value) -> &str {
+    match value {
+        kuzu::Value::String(s) => s,
+        _ => "",
+    }
+}
+
 /// Escape single quotes and control characters for Kuzu string literals.
 pub(crate) fn escape(s: &str) -> String {
     literal_round_trip(s)
