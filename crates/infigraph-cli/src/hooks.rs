@@ -5,20 +5,37 @@ pub fn allowed_tools() -> Vec<String> {
     infigraph_mcp::allowed_tools_from_names()
 }
 
-pub(crate) fn install_claude_allowlist(home: &std::path::Path) -> Result<()> {
+/// Plan the Claude Code permission allowlist: every Infigraph MCP tool in
+/// `permissions.allow` of `~/.claude/settings.local.json`, other entries and
+/// keys kept. Planned rather than written so `install --dry-run` previews it
+/// with the artifacts (#170).
+pub(crate) fn plan_claude_allowlist(
+    home: &std::path::Path,
+) -> Result<(std::path::PathBuf, crate::artifacts::Plan)> {
+    use crate::artifacts::Plan;
     let settings_path = home.join(".claude").join("settings.local.json");
-    let mut settings: serde_json::Value = if settings_path.is_file() {
-        let content = std::fs::read_to_string(&settings_path)?;
-        serde_json::from_str(&content).unwrap_or(json!({}))
-    } else {
-        json!({})
+    let skip = |why: String| Plan::Skip {
+        reason: format!(
+            "{} {why} -- not adding the Infigraph tool allowlist",
+            settings_path.display()
+        ),
+        manual_snippet: String::new(),
+    };
+    let raw = crate::artifacts::read_if_present(&settings_path)?;
+    let mut settings: serde_json::Value = match &raw {
+        None => json!({}),
+        Some(bytes) => match serde_json::from_slice(bytes) {
+            Ok(value) => value,
+            // Rebuilding it from `{}`, as install once did, destroys the file.
+            Err(e) => {
+                let plan = skip(format!("is not valid JSON ({e})"));
+                return Ok((settings_path, plan));
+            }
+        },
     };
 
-    if settings.get("permissions").is_none() {
-        settings["permissions"] = json!({});
-    }
-    let existing: Vec<String> = settings["permissions"]
-        .get("allow")
+    let existing: Vec<String> = settings
+        .pointer("/permissions/allow")
         .and_then(|v| v.as_array())
         .map(|arr| {
             arr.iter()
@@ -26,43 +43,33 @@ pub(crate) fn install_claude_allowlist(home: &std::path::Path) -> Result<()> {
                 .collect()
         })
         .unwrap_or_default();
-
     let existing_set: std::collections::HashSet<&str> =
         existing.iter().map(|s| s.as_str()).collect();
-    let mut allow_list = existing.clone();
-    let mut added = 0usize;
-    for tool in allowed_tools() {
-        if !existing_set.contains(tool.as_str()) {
-            allow_list.push(tool);
-            added += 1;
-        }
+    let missing: Vec<String> = allowed_tools()
+        .into_iter()
+        .filter(|tool| !existing_set.contains(tool.as_str()))
+        .collect();
+    if let (true, Some(raw)) = (missing.is_empty(), &raw) {
+        // Byte-for-byte, so an up-to-date file is reported unchanged rather
+        // than "updated" by re-serialization.
+        return Ok((settings_path, Plan::Write(raw.clone())));
     }
 
-    if added > 0 {
-        settings["permissions"]["allow"] = serde_json::Value::Array(
-            allow_list
-                .into_iter()
-                .map(serde_json::Value::String)
-                .collect(),
-        );
-        if let Some(parent) = settings_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let pretty = serde_json::to_string_pretty(&settings)?;
-        std::fs::write(&settings_path, pretty)?;
-        println!(
-            "  Added {} Infigraph MCP tools to Claude Code allowlist ({})",
-            added,
-            settings_path.display()
-        );
-    } else {
-        println!(
-            "  Claude Code allowlist already up to date ({})",
-            settings_path.display()
-        );
-    }
-
-    Ok(())
+    let Some(permissions) = settings
+        .as_object_mut()
+        .map(|root| root.entry("permissions").or_insert_with(|| json!({})))
+        .and_then(|p| p.as_object_mut())
+    else {
+        let plan = skip("has no JSON object at `permissions`".to_string());
+        return Ok((settings_path, plan));
+    };
+    let allow = existing.into_iter().chain(missing);
+    permissions.insert(
+        "allow".to_string(),
+        serde_json::Value::Array(allow.map(serde_json::Value::String).collect()),
+    );
+    let pretty = serde_json::to_string_pretty(&settings)?;
+    Ok((settings_path, Plan::Write(pretty.into_bytes())))
 }
 
 pub(crate) fn uninstall_claude_allowlist(home: &std::path::Path) -> Result<()> {

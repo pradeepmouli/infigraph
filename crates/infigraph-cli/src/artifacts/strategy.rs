@@ -26,13 +26,104 @@ impl Strategy {
     }
 }
 
+/// What applying an artifact did to its target -- or, in `Mode::Preview`,
+/// what it would do.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum ApplyOutcome {
-    Written,
+    /// The target did not exist.
+    Created,
+    /// The target's content changes; `diff` is unified, current -> new.
+    Updated { diff: String },
+    /// The target already holds exactly what install writes.
+    Unchanged,
+    /// A hand-edited `overwrite` target, left in place. `diff` is on-disk ->
+    /// what install would write, so the user can merge or `--force` knowingly
+    /// (#170): a bare "not overwriting" hid a real bug fix (#169).
+    Preserved { reason: String, diff: String },
     Skipped {
         reason: String,
         manual_snippet: String,
     },
+}
+
+impl ApplyOutcome {
+    /// The target holds what install writes, whether or not this run wrote it.
+    pub(crate) fn configured(&self) -> bool {
+        matches!(self, Self::Created | Self::Updated { .. } | Self::Unchanged)
+    }
+}
+
+/// Whether settling a plan writes its target or only reports what it would
+/// write. Both run the same planning code, so a preview cannot drift from
+/// what install actually does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Mode {
+    Apply,
+    Preview,
+}
+
+/// A strategy's decision for one target, computed without writing it.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Plan {
+    /// The target's complete new content.
+    Write(Vec<u8>),
+    Skip {
+        reason: String,
+        manual_snippet: String,
+    },
+}
+
+/// Carry out `plan` against `target_path` (in `Mode::Apply`), classifying the
+/// change against what is on disk now.
+pub(crate) fn settle(target_path: &Path, plan: Plan, mode: Mode) -> Result<ApplyOutcome> {
+    let content = match plan {
+        Plan::Write(content) => content,
+        Plan::Skip {
+            reason,
+            manual_snippet,
+        } => {
+            return Ok(ApplyOutcome::Skipped {
+                reason,
+                manual_snippet,
+            })
+        }
+    };
+    let outcome = match read_if_present(target_path)? {
+        None => ApplyOutcome::Created,
+        Some(current) if current == content => return Ok(ApplyOutcome::Unchanged),
+        Some(current) => ApplyOutcome::Updated {
+            diff: unified_diff(target_path, &current, &content),
+        },
+    };
+    if mode == Mode::Apply {
+        ensure_parent_dir(target_path)?;
+        std::fs::write(target_path, &content)
+            .with_context(|| format!("failed to write {}", target_path.display()))?;
+    }
+    Ok(outcome)
+}
+
+/// The file's bytes, or `None` when there is no file.
+pub(crate) fn read_if_present(path: &Path) -> Result<Option<Vec<u8>>> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("failed to read {}", path.display())),
+    }
+}
+
+/// A unified diff from `current` to `new`, headed with `path`.
+pub(crate) fn unified_diff(path: &Path, current: &[u8], new: &[u8]) -> String {
+    let current = String::from_utf8_lossy(current);
+    let new = String::from_utf8_lossy(new);
+    let (from, to) = (
+        format!("{} (current)", path.display()),
+        format!("{} (install)", path.display()),
+    );
+    similar::TextDiff::from_lines(current.as_ref(), new.as_ref())
+        .unified_diff()
+        .header(&from, &to)
+        .to_string()
 }
 
 fn ensure_parent_dir(path: &Path) -> Result<()> {
@@ -141,10 +232,7 @@ fn remove_json_keys(target: &mut serde_json::Value, fragment: &serde_json::Value
     removed_any
 }
 
-pub(crate) fn apply_json_deep_merge(
-    target_path: &Path,
-    fragment_content: &str,
-) -> Result<ApplyOutcome> {
+pub(crate) fn plan_json_deep_merge(target_path: &Path, fragment_content: &str) -> Result<Plan> {
     let fragment: serde_json::Value = serde_json::from_str(fragment_content).context(
         "bundled/user fragment is not valid JSON (this is an infigraph bug, please report)",
     )?;
@@ -155,7 +243,7 @@ pub(crate) fn apply_json_deep_merge(
         match serde_json::from_str(&raw) {
             Ok(v) => v,
             Err(e) => {
-                return Ok(ApplyOutcome::Skipped {
+                return Ok(Plan::Skip {
                     reason: format!(
                         "{} is not valid JSON ({e}) -- possibly hand-edited with comments or trailing commas",
                         target_path.display()
@@ -169,19 +257,9 @@ pub(crate) fn apply_json_deep_merge(
     };
 
     merge_json(&mut target, &fragment);
-
-    ensure_parent_dir(target_path)?;
-    let pretty = serde_json::to_string_pretty(&target)?;
-    std::fs::write(target_path, pretty)
-        .with_context(|| format!("failed to write {}", target_path.display()))?;
-    Ok(ApplyOutcome::Written)
-}
-
-pub(crate) fn apply_overwrite(target_path: &Path, content: &[u8]) -> Result<ApplyOutcome> {
-    ensure_parent_dir(target_path)?;
-    std::fs::write(target_path, content)
-        .with_context(|| format!("failed to write {}", target_path.display()))?;
-    Ok(ApplyOutcome::Written)
+    Ok(Plan::Write(
+        serde_json::to_string_pretty(&target)?.into_bytes(),
+    ))
 }
 
 /// Install-time token substitution (R8.3, #87): a bundled text artifact
@@ -232,12 +310,12 @@ pub(crate) fn remove_overwrite(target_path: &Path) -> Result<bool> {
     Ok(true)
 }
 
-pub(crate) fn apply_marker_delimited(
+pub(crate) fn plan_marker_delimited(
     target_path: &Path,
     start: &str,
     end: &str,
     content: &str,
-) -> Result<ApplyOutcome> {
+) -> Result<Plan> {
     let existing = if target_path.is_file() {
         std::fs::read_to_string(target_path)
             .with_context(|| format!("failed to read {}", target_path.display()))?
@@ -265,7 +343,7 @@ pub(crate) fn apply_marker_delimited(
             // "the block ends at EOF" would silently destroy every byte of
             // real user content after the start marker -- refuse instead,
             // same as the JSON-parse-failure bail path.
-            return Ok(ApplyOutcome::Skipped {
+            return Ok(Plan::Skip {
                 reason: format!(
                     "{} has the start marker \"{start}\" but not a matching end marker \"{end}\" -- refusing to guess where the managed block ends",
                     target_path.display()
@@ -282,11 +360,7 @@ pub(crate) fn apply_marker_delimited(
             format!("{existing}{sep}{block}\n")
         }
     };
-
-    ensure_parent_dir(target_path)?;
-    std::fs::write(target_path, new_content)
-        .with_context(|| format!("failed to write {}", target_path.display()))?;
-    Ok(ApplyOutcome::Written)
+    Ok(Plan::Write(new_content.into_bytes()))
 }
 
 pub(crate) fn remove_marker_delimited(target_path: &Path, start: &str, end: &str) -> Result<bool> {
@@ -366,11 +440,11 @@ fn find_toml_section_bounds(content: &str, header: &str) -> Option<(usize, usize
     Some((start, end))
 }
 
-pub(crate) fn apply_toml_section(
+pub(crate) fn plan_toml_section(
     target_path: &Path,
     key_path: &[String],
     body: &str,
-) -> Result<ApplyOutcome> {
+) -> Result<Plan> {
     anyhow::ensure!(
         !key_path.is_empty(),
         "toml_section requires a non-empty key_path"
@@ -394,11 +468,7 @@ pub(crate) fn apply_toml_section(
             format!("{existing}{sep}\n{section}")
         }
     };
-
-    ensure_parent_dir(target_path)?;
-    std::fs::write(target_path, new_content)
-        .with_context(|| format!("failed to write {}", target_path.display()))?;
-    Ok(ApplyOutcome::Written)
+    Ok(Plan::Write(new_content.into_bytes()))
 }
 
 pub(crate) fn remove_toml_section(target_path: &Path, key_path: &[String]) -> Result<bool> {
@@ -449,11 +519,11 @@ fn navigate_to_parent<'a>(
     cursor.as_object_mut().expect("just ensured object")
 }
 
-pub(crate) fn apply_json_key_path(
+pub(crate) fn plan_json_key_path(
     target_path: &Path,
     key_path: &[String],
     value_content: &str,
-) -> Result<ApplyOutcome> {
+) -> Result<Plan> {
     anyhow::ensure!(
         !key_path.is_empty(),
         "json_key_path requires a non-empty key_path"
@@ -468,7 +538,7 @@ pub(crate) fn apply_json_key_path(
         match serde_json::from_str(&raw) {
             Ok(v) => v,
             Err(e) => {
-                return Ok(ApplyOutcome::Skipped {
+                return Ok(Plan::Skip {
                     reason: format!(
                         "{} is not valid JSON ({e}) -- possibly hand-edited with comments or trailing commas",
                         target_path.display()
@@ -483,12 +553,9 @@ pub(crate) fn apply_json_key_path(
 
     let leaf_key = key_path.last().expect("checked non-empty above").clone();
     navigate_to_parent(&mut target, key_path).insert(leaf_key, value);
-
-    ensure_parent_dir(target_path)?;
-    let pretty = serde_json::to_string_pretty(&target)?;
-    std::fs::write(target_path, pretty)
-        .with_context(|| format!("failed to write {}", target_path.display()))?;
-    Ok(ApplyOutcome::Written)
+    Ok(Plan::Write(
+        serde_json::to_string_pretty(&target)?.into_bytes(),
+    ))
 }
 
 pub(crate) fn remove_json_key_path(target_path: &Path, key_path: &[String]) -> Result<bool> {
@@ -532,6 +599,47 @@ mod tests {
     use super::*;
     use std::path::Path;
 
+    fn apply_json_deep_merge(target: &Path, fragment: &str) -> Result<ApplyOutcome> {
+        settle(target, plan_json_deep_merge(target, fragment)?, Mode::Apply)
+    }
+
+    fn apply_overwrite(target: &Path, content: &[u8]) -> Result<ApplyOutcome> {
+        settle(target, Plan::Write(content.to_vec()), Mode::Apply)
+    }
+
+    fn apply_marker_delimited(
+        target: &Path,
+        start: &str,
+        end: &str,
+        content: &str,
+    ) -> Result<ApplyOutcome> {
+        settle(
+            target,
+            plan_marker_delimited(target, start, end, content)?,
+            Mode::Apply,
+        )
+    }
+
+    fn apply_toml_section(target: &Path, key_path: &[String], body: &str) -> Result<ApplyOutcome> {
+        settle(
+            target,
+            plan_toml_section(target, key_path, body)?,
+            Mode::Apply,
+        )
+    }
+
+    fn apply_json_key_path(
+        target: &Path,
+        key_path: &[String],
+        value: &str,
+    ) -> Result<ApplyOutcome> {
+        settle(
+            target,
+            plan_json_key_path(target, key_path, value)?,
+            Mode::Apply,
+        )
+    }
+
     fn read_json(path: &Path) -> serde_json::Value {
         serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
     }
@@ -545,7 +653,7 @@ mod tests {
             r#"{"mcpServers":{"infigraph":{"command":"/bin/infigraph-mcp","args":["--mcp"]}}}"#,
         )
         .unwrap();
-        assert!(matches!(outcome, ApplyOutcome::Written));
+        assert!(matches!(outcome, ApplyOutcome::Created));
         let v = read_json(&target);
         assert_eq!(
             v["mcpServers"]["infigraph"]["command"],
@@ -682,7 +790,7 @@ mod tests {
                 assert!(reason.contains("not valid JSON"));
                 assert!(manual_snippet.contains("infigraph"));
             }
-            ApplyOutcome::Written => panic!("must not write on parse failure"),
+            other => panic!("must not write on parse failure: {other:?}"),
         }
         let after = std::fs::read_to_string(&target).unwrap();
         assert_eq!(before, after, "file must be untouched on parse failure");
@@ -693,7 +801,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("hooks").join("infigraph-enforce.sh");
         let outcome = apply_overwrite(&target, b"#!/usr/bin/env bash\necho hi\n").unwrap();
-        assert!(matches!(outcome, ApplyOutcome::Written));
+        assert!(matches!(outcome, ApplyOutcome::Created));
         assert_eq!(
             std::fs::read(&target).unwrap(),
             b"#!/usr/bin/env bash\necho hi\n"
@@ -922,7 +1030,7 @@ mod tests {
             ApplyOutcome::Skipped { reason, .. } => {
                 assert!(reason.contains("end marker"));
             }
-            ApplyOutcome::Written => panic!("must not write when the end marker is missing"),
+            other => panic!("must not write when the end marker is missing: {other:?}"),
         }
         let after = std::fs::read_to_string(&target).unwrap();
         assert_eq!(

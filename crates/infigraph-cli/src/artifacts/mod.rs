@@ -23,7 +23,7 @@ mod template;
 
 pub(crate) use discovery::{discover_artifacts, ResolvedArtifact};
 pub(crate) use step::InstallStep;
-pub(crate) use strategy::{ApplyOutcome, Strategy};
+pub(crate) use strategy::{read_if_present, settle, ApplyOutcome, Mode, Plan, Strategy};
 
 /// Outcome of removing one resolved artifact during uninstall.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,6 +46,27 @@ pub(crate) fn apply_resolved_artifact(
     mcp_path: &str,
     force: bool,
 ) -> anyhow::Result<ApplyOutcome> {
+    settle_resolved_artifact(artifact, home, mcp_path, force, Mode::Apply).map(|s| s.outcome)
+}
+
+/// An artifact's outcome and the path it applies to.
+pub(crate) struct Settled {
+    /// `None` only when a resolver skipped before choosing a path.
+    pub target: Option<std::path::PathBuf>,
+    pub outcome: ApplyOutcome,
+}
+
+/// Plan one artifact against its target and, in `Mode::Apply`, write it.
+/// `Mode::Preview` runs every step up to the write -- resolvers included,
+/// which only compute a path -- so `install --dry-run` reports exactly what
+/// install would do (#170).
+pub(crate) fn settle_resolved_artifact(
+    artifact: &ResolvedArtifact,
+    home: &std::path::Path,
+    mcp_path: &str,
+    force: bool,
+    mode: Mode,
+) -> anyhow::Result<Settled> {
     let (target_path, resolved_content) = match &artifact.resolver {
         Some(spec) => {
             let output = resolver::run_resolver_from_script(
@@ -65,9 +86,12 @@ pub(crate) fn apply_resolved_artifact(
                     (std::path::PathBuf::from(data.path), content)
                 }
                 resolver::ResolverOutput::Skip { message } => {
-                    return Ok(ApplyOutcome::Skipped {
-                        reason: format!("resolver reported skip: {message}"),
-                        manual_snippet: String::new(),
+                    return Ok(Settled {
+                        target: None,
+                        outcome: ApplyOutcome::Skipped {
+                            reason: format!("resolver reported skip: {message}"),
+                            manual_snippet: String::new(),
+                        },
                     });
                 }
                 resolver::ResolverOutput::Error { message } => {
@@ -82,13 +106,28 @@ pub(crate) fn apply_resolved_artifact(
             (home.join(relative), artifact.content.clone())
         }
     };
+    let outcome = settle_strategy(artifact, home, &target_path, resolved_content, force, mode)?;
+    Ok(Settled {
+        target: Some(target_path),
+        outcome,
+    })
+}
 
+fn settle_strategy(
+    artifact: &ResolvedArtifact,
+    home: &std::path::Path,
+    target_path: &std::path::Path,
+    resolved_content: Option<Vec<u8>>,
+    force: bool,
+    mode: Mode,
+) -> anyhow::Result<ApplyOutcome> {
     match artifact.strategy {
         Strategy::JsonDeepMerge => {
             let content = resolved_content
                 .ok_or_else(|| anyhow::anyhow!("json_deep_merge artifact has no content"))?;
             let text = std::str::from_utf8(&content)?;
-            strategy::apply_json_deep_merge(&target_path, text)
+            let plan = strategy::plan_json_deep_merge(target_path, text)?;
+            strategy::settle(target_path, plan, mode)
         }
         Strategy::Overwrite => {
             let content = resolved_content
@@ -116,25 +155,29 @@ pub(crate) fn apply_resolved_artifact(
             // the hash, so the file is tracked as installed again rather than
             // skipped -- along with every later change to it -- forever.
             let already_current =
-                std::fs::read(&target_path).is_ok_and(|on_disk| on_disk == content);
+                std::fs::read(target_path).is_ok_and(|on_disk| on_disk == content);
             if !force
                 && !already_current
-                && ownership::hand_edited_since_install(home, &target_path)?
+                && ownership::hand_edited_since_install(home, target_path)?
             {
-                return Ok(ApplyOutcome::Skipped {
+                let on_disk = strategy::read_if_present(target_path)?.unwrap_or_default();
+                return Ok(ApplyOutcome::Preserved {
                     reason: format!(
                         "{} was changed since infigraph last installed it -- not overwriting. Re-run with --force to overwrite anyway.",
                         target_path.display()
                     ),
-                    manual_snippet: String::new(),
+                    diff: strategy::unified_diff(target_path, &on_disk, &content),
                 });
             }
 
-            let outcome = strategy::apply_overwrite(&target_path, &content)?;
-            if matches!(outcome, ApplyOutcome::Written) {
-                ownership::record_written(home, &target_path, &content)?;
+            let outcome =
+                strategy::settle(target_path, strategy::Plan::Write(content.clone()), mode)?;
+            if mode == Mode::Apply {
+                // Recorded even when unchanged: that is how a hand edit the
+                // bundled artifact caught up to is adopted (#169).
+                ownership::record_written(home, target_path, &content)?;
                 if target_path.components().any(|c| c.as_os_str() == "hooks") {
-                    make_executable(&target_path)?;
+                    make_executable(target_path)?;
                 }
             }
             Ok(outcome)
@@ -151,7 +194,8 @@ pub(crate) fn apply_resolved_artifact(
                 .end
                 .as_deref()
                 .ok_or_else(|| anyhow::anyhow!("marker_delimited artifact missing end marker"))?;
-            strategy::apply_marker_delimited(&target_path, start, end, text)
+            let plan = strategy::plan_marker_delimited(target_path, start, end, text)?;
+            strategy::settle(target_path, plan, mode)
         }
         Strategy::TomlSection => {
             let content = resolved_content
@@ -161,7 +205,8 @@ pub(crate) fn apply_resolved_artifact(
                 .key_path
                 .as_deref()
                 .ok_or_else(|| anyhow::anyhow!("toml_section artifact missing key_path"))?;
-            strategy::apply_toml_section(&target_path, key_path, text)
+            let plan = strategy::plan_toml_section(target_path, key_path, text)?;
+            strategy::settle(target_path, plan, mode)
         }
         Strategy::JsonKeyPath => {
             let content = resolved_content
@@ -171,7 +216,8 @@ pub(crate) fn apply_resolved_artifact(
                 .key_path
                 .as_deref()
                 .ok_or_else(|| anyhow::anyhow!("json_key_path artifact missing key_path"))?;
-            strategy::apply_json_key_path(&target_path, key_path, text)
+            let plan = strategy::plan_json_key_path(target_path, key_path, text)?;
+            strategy::settle(target_path, plan, mode)
         }
     }
 }
@@ -330,7 +376,7 @@ content_file = "mcp-section.toml"
         for artifact in &artifacts {
             let outcome = apply_resolved_artifact(artifact, home, mcp_path, false).unwrap();
             assert!(
-                matches!(outcome, ApplyOutcome::Written),
+                outcome.configured(),
                 "{:?} failed to apply",
                 artifact.target_relative_path
             );
@@ -457,7 +503,7 @@ resolver = ["./resolve-zed-path.sh"]
 
         let outcome =
             apply_resolved_artifact(&artifacts[0], home_dir.path(), mcp_path, false).unwrap();
-        assert!(matches!(outcome, ApplyOutcome::Written));
+        assert!(matches!(outcome, ApplyOutcome::Created));
 
         let written: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(home_dir.path().join("zed-settings.json")).unwrap(),
@@ -496,7 +542,7 @@ resolver = ["./resolve-zed-path.sh"]
 
         for artifact in &artifacts {
             let outcome = apply_resolved_artifact(artifact, home, mcp_path, false).unwrap();
-            assert!(matches!(outcome, ApplyOutcome::Written));
+            assert!(outcome.configured());
         }
 
         let hook_path = home.join(".claude/hooks/infigraph-enforce.sh");
@@ -553,7 +599,7 @@ resolver = ["./resolve-zed-path.sh"]
         let artifact = &artifacts[0];
 
         let outcome = apply_resolved_artifact(artifact, home, mcp_path, false).unwrap();
-        assert!(matches!(outcome, ApplyOutcome::Written));
+        assert!(matches!(outcome, ApplyOutcome::Created));
 
         let hook_path = home.join(".claude/hooks/infigraph-enforce.sh");
         std::fs::write(
@@ -565,8 +611,8 @@ resolver = ["./resolve-zed-path.sh"]
         // A plain reinstall must not clobber it.
         let outcome = apply_resolved_artifact(artifact, home, mcp_path, false).unwrap();
         assert!(
-            matches!(outcome, ApplyOutcome::Skipped { .. }),
-            "hand-edited hook should have been skipped, not overwritten: {outcome:?}"
+            matches!(outcome, ApplyOutcome::Preserved { .. }),
+            "hand-edited hook should have been preserved, not overwritten: {outcome:?}"
         );
         assert_eq!(
             std::fs::read_to_string(&hook_path).unwrap(),
@@ -576,7 +622,7 @@ resolver = ["./resolve-zed-path.sh"]
 
         // --force overrides the guard.
         let outcome = apply_resolved_artifact(artifact, home, mcp_path, true).unwrap();
-        assert!(matches!(outcome, ApplyOutcome::Written));
+        assert!(matches!(outcome, ApplyOutcome::Updated { .. }));
         assert_eq!(
             std::fs::read_to_string(&hook_path).unwrap(),
             "#!/usr/bin/env bash\necho original\n",
@@ -603,20 +649,23 @@ resolver = ["./resolve-zed-path.sh"]
             apply_resolved_artifact(&artifacts[0], home, mcp_path, false).unwrap()
         };
 
-        assert!(matches!(apply(b"echo v1\n"), ApplyOutcome::Written));
+        assert!(matches!(apply(b"echo v1\n"), ApplyOutcome::Created));
         std::fs::write(&hook_path, "echo v2\n").unwrap();
 
         // The new release ships exactly the hand-edited content.
         let outcome = apply(b"echo v2\n");
         assert!(
-            matches!(outcome, ApplyOutcome::Written),
+            matches!(outcome, ApplyOutcome::Unchanged),
             "an on-disk file identical to what install writes has nothing to preserve: {outcome:?}"
         );
 
         // And it is tracked as installed again: a genuine edit from here on is
         // still protected, which only holds if the manifest now has v2's hash.
         std::fs::write(&hook_path, "echo v3 local\n").unwrap();
-        assert!(matches!(apply(b"echo v2\n"), ApplyOutcome::Skipped { .. }));
+        assert!(matches!(
+            apply(b"echo v2\n"),
+            ApplyOutcome::Preserved { .. }
+        ));
         assert_eq!(
             std::fs::read_to_string(&hook_path).unwrap(),
             "echo v3 local\n"
@@ -1236,7 +1285,7 @@ resolver = ["./resolve-zed-path.sh"]
         assert!(vscode.resolver.is_some());
 
         let outcome = apply_resolved_artifact(vscode, home_dir.path(), mcp_path, false).unwrap();
-        assert!(matches!(outcome, ApplyOutcome::Written));
+        assert!(matches!(outcome, ApplyOutcome::Created));
 
         // The resolver branches on OS -- assert against whichever path it
         // actually resolved to for the OS running this test.
@@ -1272,7 +1321,7 @@ resolver = ["./resolve-zed-path.sh"]
         assert!(zed.target_relative_path.is_none());
 
         let outcome = apply_resolved_artifact(zed, home_dir.path(), mcp_path, false).unwrap();
-        assert!(matches!(outcome, ApplyOutcome::Written));
+        assert!(matches!(outcome, ApplyOutcome::Created));
 
         let expected_suffix = match std::env::consts::OS {
             "macos" => "Library/Application Support/Zed/settings.json",

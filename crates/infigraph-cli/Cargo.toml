@@ -70,6 +70,7 @@ tokio-util = "0.7"
 # timeout (Task 6 of the daemon/watch command split) -- process/rt/time is
 # the same feature set infigraph-core's Task 1 added for the same reason.
 tokio = { version = "1", default-features = false, features = ["process", "rt", "time"] }
+similar = "2"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

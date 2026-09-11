@@ -239,9 +239,15 @@ enum Commands {
     Install {
         /// Overwrite hooks/config even if changed since the last install
         /// (by default, a file that no longer matches what infigraph last
-        /// wrote is left alone and reported as skipped)
+        /// wrote is left alone and reported with a diff)
         #[arg(long)]
         force: bool,
+
+        /// Show what install would create, update or leave alone, with a
+        /// diff for every change and every preserved hand-edited file,
+        /// without writing anything
+        #[arg(long)]
+        dry_run: bool,
     },
 
     /// Uninstall infigraph MCP server config from AI coding agents
@@ -1075,7 +1081,7 @@ fn run(command: Commands, root: &Path) -> Result<()> {
         Commands::Callees { symbol } => cmd_callees(root, &symbol),
         Commands::DeadCode => cmd_dead_code(root),
         Commands::Impact { symbol, depth } => cmd_impact(root, &symbol, depth),
-        Commands::Install { force } => cmd_install(force),
+        Commands::Install { force, dry_run } => cmd_install(force, dry_run),
         Commands::Uninstall => cmd_uninstall(),
         Commands::Bench { n } => {
             let registry = bundled_registry()?;

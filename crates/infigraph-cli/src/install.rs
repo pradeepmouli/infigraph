@@ -2,9 +2,35 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
+use crate::artifacts::{ApplyOutcome, Mode};
+
+/// What `run_install` did -- or, in `Mode::Preview`, would do -- to each target.
 pub(crate) struct InstallReport {
-    pub written: Vec<String>,
-    pub skipped: Vec<(String, String, String)>, // (path, reason, manual_snippet)
+    pub entries: Vec<InstallEntry>,
+}
+
+pub(crate) struct InstallEntry {
+    /// The integration the target belongs to (e.g. "Claude Code").
+    pub integration: String,
+    /// The target, for display: its path, or the integration's resolver
+    /// when that resolver skipped before choosing one.
+    pub target: String,
+    pub outcome: ApplyOutcome,
+}
+
+impl InstallReport {
+    /// The integrations with at least one target holding what install writes.
+    fn configured_integrations(&self) -> Vec<String> {
+        let mut labels: Vec<String> = self
+            .entries
+            .iter()
+            .filter(|e| e.outcome.configured())
+            .map(|e| e.integration.clone())
+            .collect();
+        labels.sort();
+        labels.dedup();
+        labels
+    }
 }
 
 /// Result of `run_uninstall`: which artifacts were removed, and which
@@ -50,29 +76,27 @@ pub(crate) fn find_mcp_binary() -> Result<PathBuf> {
     )
 }
 
-pub(crate) fn cmd_install(force: bool) -> Result<()> {
+pub(crate) fn cmd_install(force: bool, dry_run: bool) -> Result<()> {
     let mcp_path = find_mcp_binary()?;
     println!("Found infigraph-mcp at: {}", mcp_path.to_string_lossy());
 
     let home = dirs::home_dir().context("Could not determine home directory")?;
-
-    let report = run_install(&mcp_path, &home, force)?;
-
-    if report.written.is_empty() {
-        println!("No agents were configured.");
-    } else {
-        for path in &report.written {
-            println!("  Configured: {}", home.join(path).display());
-        }
-        let configured_labels = configured_integration_labels(&mcp_path, &home, &report)?;
-        print_capabilities_summary(&configured_labels);
+    let mode = if dry_run { Mode::Preview } else { Mode::Apply };
+    if dry_run {
+        println!("Dry run: nothing is written.");
     }
 
-    for (path, reason, manual_snippet) in &report.skipped {
-        eprintln!("  Skipped {}: {}", home.join(path).display(), reason);
-        if !manual_snippet.is_empty() {
-            eprintln!("    Add this manually:\n{manual_snippet}");
-        }
+    let report = run_install(&mcp_path, &home, force, mode)?;
+    print_install_report(&report, mode);
+    if dry_run {
+        return Ok(());
+    }
+
+    let configured_labels = report.configured_integrations();
+    if configured_labels.is_empty() {
+        println!("No agents were configured.");
+    } else {
+        print_capabilities_summary(&configured_labels);
     }
 
     // Copy model files to ~/.infigraph/models/ -- unchanged, not artifact-based.
@@ -81,9 +105,55 @@ pub(crate) fn cmd_install(force: bool) -> Result<()> {
     Ok(())
 }
 
+/// One line per target. A diff follows every preserved hand-edited file, so
+/// the user can merge the change or `--force` it knowingly (#170), and in a
+/// preview every update too.
+fn print_install_report(report: &InstallReport, mode: Mode) {
+    let preview = mode == Mode::Preview;
+    let indent = |text: &str| -> String { text.lines().map(|l| format!("      {l}\n")).collect() };
+    for InstallEntry {
+        target, outcome, ..
+    } in &report.entries
+    {
+        match outcome {
+            ApplyOutcome::Created => {
+                let verb = if preview { "Would create" } else { "Created" };
+                println!("  {verb}: {target}");
+            }
+            ApplyOutcome::Updated { diff } => {
+                let verb = if preview { "Would update" } else { "Updated" };
+                println!("  {verb}: {target}");
+                if preview {
+                    print!("{}", indent(diff));
+                }
+            }
+            ApplyOutcome::Unchanged => println!("  Up to date: {target}"),
+            ApplyOutcome::Preserved { reason, diff } => {
+                eprintln!("  Preserved (hand-edited): {reason}");
+                eprint!("{}", indent(diff));
+            }
+            ApplyOutcome::Skipped {
+                reason,
+                manual_snippet,
+            } => {
+                eprintln!("  Skipped {target}: {reason}");
+                if !manual_snippet.is_empty() {
+                    eprintln!("    Add this manually:\n{manual_snippet}");
+                }
+            }
+        }
+    }
+}
+
 /// The actual artifact-engine install logic, factored out from `cmd_install`
 /// so it's testable against a fake `$HOME` without touching the real one.
-pub(crate) fn run_install(mcp_path: &Path, home: &Path, force: bool) -> Result<InstallReport> {
+/// `Mode::Preview` runs the same planning and writes nothing.
+pub(crate) fn run_install(
+    mcp_path: &Path,
+    home: &Path,
+    force: bool,
+    mode: Mode,
+) -> Result<InstallReport> {
     let mcp_path_str = mcp_path.to_string_lossy().to_string();
     let user_override_dir = home.join(".infigraph").join("integrations");
 
@@ -93,14 +163,10 @@ pub(crate) fn run_install(mcp_path: &Path, home: &Path, force: bool) -> Result<I
         &mcp_path_str,
     )?;
 
-    let mut report = InstallReport {
-        written: Vec::new(),
-        skipped: Vec::new(),
-    };
-
+    let mut entries = Vec::with_capacity(artifacts.len() + 1);
     for artifact in &artifacts {
-        let outcome =
-            crate::artifacts::apply_resolved_artifact(artifact, home, &mcp_path_str, force)
+        let settled =
+            crate::artifacts::settle_resolved_artifact(artifact, home, &mcp_path_str, force, mode)
                 .with_context(|| {
                     format!(
                         "applying {} artifact for {}",
@@ -111,70 +177,31 @@ pub(crate) fn run_install(mcp_path: &Path, home: &Path, force: bool) -> Result<I
                             .unwrap_or("(resolver-determined path)")
                     )
                 })?;
-        let label = artifact
-            .target_relative_path
-            .clone()
-            .unwrap_or_else(|| format!("{} (resolver-determined)", artifact.integration_label));
-        match outcome {
-            crate::artifacts::ApplyOutcome::Written => report.written.push(label),
-            crate::artifacts::ApplyOutcome::Skipped {
-                reason,
-                manual_snippet,
-            } => report.skipped.push((label, reason, manual_snippet)),
-        }
+        let target = match settled.target {
+            Some(path) => path.display().to_string(),
+            None => format!("{} resolver", artifact.integration_label),
+        };
+        entries.push(InstallEntry {
+            integration: artifact.integration_label.clone(),
+            target,
+            outcome: settled.outcome,
+        });
     }
 
-    write_claude_allowlist_and_hooks_extras(home)?;
+    // The Claude Code permission allowlist stays outside the artifact
+    // mechanism (a grant list, not "content deployed to a path" -- see the
+    // design spec), but is planned and settled the same way.
+    let (allowlist_path, plan) = crate::hooks::plan_claude_allowlist(home)?;
+    entries.push(InstallEntry {
+        integration: "Claude Code".to_string(),
+        target: allowlist_path.display().to_string(),
+        outcome: crate::artifacts::settle(&allowlist_path, plan, mode)?,
+    });
 
-    Ok(report)
+    Ok(InstallReport { entries })
 }
 
-/// Everything the artifact engine doesn't cover: the Claude Code permission
-/// allowlist (a grant list, not "content deployed to a path" -- see the
-/// design spec's "stays outside the artifact mechanism").
-fn write_claude_allowlist_and_hooks_extras(home: &Path) -> Result<()> {
-    crate::hooks::install_claude_allowlist(home)?;
-    Ok(())
-}
-
-/// Derives the human-readable "Configured for: X, Y, Z" summary from which
-/// integrations actually had at least one artifact written -- replaces the
-/// old per-`AgentTarget` `configured.push(target.label)` bookkeeping now that
-/// artifacts (not agent targets) are the unit of installation.
-fn configured_integration_labels(
-    mcp_path: &Path,
-    home: &Path,
-    report: &InstallReport,
-) -> Result<Vec<String>> {
-    let mcp_path_str = mcp_path.to_string_lossy().to_string();
-    let user_override_dir = home.join(".infigraph").join("integrations");
-    let artifacts = crate::artifacts::discover_artifacts(
-        crate::artifacts::BUNDLED_INTEGRATIONS,
-        &user_override_dir,
-        &mcp_path_str,
-    )?;
-
-    let written_set: std::collections::HashSet<&str> =
-        report.written.iter().map(|s| s.as_str()).collect();
-
-    let mut labels: Vec<String> = artifacts
-        .iter()
-        .filter(|a| {
-            let key = a
-                .target_relative_path
-                .as_deref()
-                .map(|p| p.to_string())
-                .unwrap_or_else(|| format!("{} (resolver-determined)", a.integration_label));
-            written_set.contains(key.as_str())
-        })
-        .map(|a| a.integration_label.clone())
-        .collect();
-    labels.sort();
-    labels.dedup();
-    Ok(labels)
-}
-
-pub(crate) fn install_models(mcp_path: &Path, home: &Path) -> Result<()> {
+fn install_models(mcp_path: &Path, home: &Path) -> Result<()> {
     let dest = home
         .join(".infigraph")
         .join("models")
@@ -698,7 +725,8 @@ fn reinstall_hooks() -> Result<()> {
     // force=false: this runs automatically after a binary self-update (see
     // cmd_update below), with no user present to answer for a hand-edited
     // hook -- respect the same guard a manual `infigraph install` would.
-    run_install(&mcp_path, &home, false)?;
+    let report = run_install(&mcp_path, &home, false, Mode::Apply)?;
+    print_install_report(&report, Mode::Apply);
     Ok(())
 }
 
@@ -827,16 +855,19 @@ mod tests {
         let home_dir = tempfile::tempdir().unwrap();
         let mcp_path = "/opt/infigraph/bin/infigraph-mcp";
 
-        let report =
-            run_install(&std::path::PathBuf::from(mcp_path), home_dir.path(), false).unwrap();
+        let report = install(home_dir.path(), false, Mode::Apply);
 
-        assert!(report.written.iter().any(|p| p == ".claude.json"));
-        assert!(report.written.iter().any(|p| p == ".gemini/settings.json"));
-        assert!(report.written.iter().any(|p| p == ".codex/config.toml"));
-        assert!(
-            report.skipped.is_empty(),
-            "nothing should be skipped against an empty $HOME"
-        );
+        for relative in [
+            ".claude.json",
+            ".gemini/settings.json",
+            ".codex/config.toml",
+        ] {
+            assert_eq!(
+                outcome_for(&report, &home_dir.path().join(relative)),
+                &ApplyOutcome::Created
+            );
+        }
+        assert_every_target_is_created(&report);
 
         let claude_json: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(home_dir.path().join(".claude.json")).unwrap(),
@@ -850,8 +881,20 @@ mod tests {
         let home_dir = tempfile::tempdir().unwrap();
         let mcp_path = "/opt/infigraph/bin/infigraph-mcp";
 
-        run_install(&std::path::PathBuf::from(mcp_path), home_dir.path(), false).unwrap();
-        run_install(&std::path::PathBuf::from(mcp_path), home_dir.path(), false).unwrap();
+        run_install(
+            &std::path::PathBuf::from(mcp_path),
+            home_dir.path(),
+            false,
+            Mode::Apply,
+        )
+        .unwrap();
+        run_install(
+            &std::path::PathBuf::from(mcp_path),
+            home_dir.path(),
+            false,
+            Mode::Apply,
+        )
+        .unwrap();
 
         let claude_json: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(home_dir.path().join(".claude.json")).unwrap(),
@@ -871,7 +914,13 @@ mod tests {
         let home_dir = tempfile::tempdir().unwrap();
         let mcp_path = "/opt/infigraph/bin/infigraph-mcp";
 
-        run_install(&std::path::PathBuf::from(mcp_path), home_dir.path(), false).unwrap();
+        run_install(
+            &std::path::PathBuf::from(mcp_path),
+            home_dir.path(),
+            false,
+            Mode::Apply,
+        )
+        .unwrap();
         assert!(home_dir.path().join(".claude.json").exists());
 
         run_uninstall(&std::path::PathBuf::from(mcp_path), home_dir.path()).unwrap();
@@ -889,6 +938,167 @@ mod tests {
         let codex_toml =
             std::fs::read_to_string(home_dir.path().join(".codex/config.toml")).unwrap();
         assert!(!codex_toml.contains("[mcp_servers.infigraph]"));
+    }
+
+    const TEST_MCP_PATH: &str = "/opt/infigraph/bin/infigraph-mcp";
+
+    fn install(home: &Path, force: bool, mode: Mode) -> InstallReport {
+        run_install(Path::new(TEST_MCP_PATH), home, force, mode).unwrap()
+    }
+
+    fn outcome_for<'r>(report: &'r InstallReport, target: &Path) -> &'r ApplyOutcome {
+        let target = target.display().to_string();
+        &report
+            .entries
+            .iter()
+            .find(|e| e.target == target)
+            .unwrap_or_else(|| panic!("no install entry for {target}"))
+            .outcome
+    }
+
+    fn assert_every_target_is_created(report: &InstallReport) {
+        let not_created: Vec<_> = report
+            .entries
+            .iter()
+            .filter(|e| e.outcome != ApplyOutcome::Created)
+            .map(|e| (&e.target, &e.outcome))
+            .collect();
+        assert!(
+            not_created.is_empty(),
+            "every target is created against an empty $HOME: {not_created:?}"
+        );
+    }
+
+    /// Every file under `dir`, with its bytes.
+    fn snapshot(dir: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+        let mut files = std::collections::BTreeMap::new();
+        let mut pending = vec![dir.to_path_buf()];
+        while let Some(next) = pending.pop() {
+            for entry in std::fs::read_dir(&next).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else {
+                    files.insert(path.clone(), std::fs::read(&path).unwrap());
+                }
+            }
+        }
+        files
+    }
+
+    /// #170: a preview of a fresh home lists every target as created and
+    /// writes nothing -- and it reports the same outcomes a real install then
+    /// produces, because both run the same planning code.
+    #[test]
+    fn a_dry_run_on_a_fresh_home_lists_every_target_as_created_and_writes_nothing() {
+        let home_dir = tempfile::tempdir().unwrap();
+
+        let preview = install(home_dir.path(), false, Mode::Preview);
+
+        assert_every_target_is_created(&preview);
+        assert!(
+            snapshot(home_dir.path()).is_empty(),
+            "a dry run must not write under $HOME"
+        );
+        let applied = install(home_dir.path(), false, Mode::Apply);
+        let outcomes = |r: &InstallReport| -> Vec<(String, ApplyOutcome)> {
+            r.entries
+                .iter()
+                .map(|e| (e.target.clone(), e.outcome.clone()))
+                .collect()
+        };
+        assert_eq!(outcomes(&preview), outcomes(&applied));
+        assert!(
+            install(home_dir.path(), false, Mode::Preview)
+                .entries
+                .iter()
+                .all(|e| e.outcome == ApplyOutcome::Unchanged),
+            "after an install, a preview finds nothing to change"
+        );
+    }
+
+    /// #170: a hand-edited hook is preserved with a diff showing exactly what
+    /// install would change, and a dry run leaves the file and the ownership
+    /// manifest byte-identical.
+    #[test]
+    fn a_hand_edited_hook_is_preserved_with_its_diff_and_a_dry_run_changes_nothing() {
+        let home_dir = tempfile::tempdir().unwrap();
+        install(home_dir.path(), false, Mode::Apply);
+        let hook = home_dir.path().join(".claude/hooks/infigraph-enforce.sh");
+        let installed = std::fs::read_to_string(&hook).unwrap();
+        std::fs::write(&hook, format!("{installed}# a local fix\n")).unwrap();
+        let before = snapshot(home_dir.path());
+
+        for mode in [Mode::Preview, Mode::Apply] {
+            let report = install(home_dir.path(), false, mode);
+            match outcome_for(&report, &hook) {
+                ApplyOutcome::Preserved { reason, diff } => {
+                    assert!(reason.contains("--force"), "{reason}");
+                    assert!(diff.contains("-# a local fix"), "{diff}");
+                }
+                other => panic!("{mode:?}: expected Preserved, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            snapshot(home_dir.path()),
+            before,
+            "neither a dry run nor an install may touch a hand-edited hook or the manifest"
+        );
+    }
+
+    /// #170: a merge-strategy preview diffs only what install owns -- the
+    /// user's other settings appear as context, never as removals.
+    #[test]
+    fn a_settings_merge_preview_changes_only_the_keys_install_owns() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let settings = home_dir.path().join(".claude/settings.json");
+        std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        let user_settings = serde_json::to_string_pretty(&serde_json::json!({
+            "model": "opus",
+            "env": {"MY_VAR": "1"}
+        }))
+        .unwrap();
+        std::fs::write(&settings, &user_settings).unwrap();
+
+        let report = install(home_dir.path(), false, Mode::Preview);
+
+        let ApplyOutcome::Updated { diff } = outcome_for(&report, &settings) else {
+            panic!("expected an update to {}", settings.display());
+        };
+        let removed: Vec<&str> = diff
+            .lines()
+            .filter(|l| l.starts_with('-') && !l.starts_with("---"))
+            .collect();
+        assert!(
+            removed
+                .iter()
+                .all(|l| !l.contains("MY_VAR") && !l.contains("opus")),
+            "the user's own keys must not be removed: {removed:?}"
+        );
+        assert!(diff.contains("+"), "{diff}");
+        assert_eq!(std::fs::read_to_string(&settings).unwrap(), user_settings);
+    }
+
+    /// An unparseable `settings.local.json` used to be rebuilt from `{}`,
+    /// destroying its content; it is now skipped like any other unparseable
+    /// merge target.
+    #[test]
+    fn an_unparseable_claude_allowlist_file_is_skipped_not_rebuilt() {
+        let home_dir = tempfile::tempdir().unwrap();
+        let local = home_dir.path().join(".claude/settings.local.json");
+        std::fs::create_dir_all(local.parent().unwrap()).unwrap();
+        std::fs::write(&local, "{ // a comment\n}").unwrap();
+
+        let report = install(home_dir.path(), false, Mode::Apply);
+
+        assert!(matches!(
+            outcome_for(&report, &local),
+            ApplyOutcome::Skipped { .. }
+        ));
+        assert_eq!(
+            std::fs::read_to_string(&local).unwrap(),
+            "{ // a comment\n}"
+        );
     }
 
     #[test]
