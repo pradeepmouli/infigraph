@@ -87,9 +87,13 @@ fn registry_path_honors_registry_home() {
 fn tests_never_resolve_the_real_registry() {
     let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     restore();
+    // Resolved the way `infigraph_home` resolves an unset override: `HOME`
+    // is not always set on Windows.
     let real = std::env::var_os("HOME")
-        .map(|h| PathBuf::from(h).join(".infigraph"))
-        .expect("HOME");
+        .map(PathBuf::from)
+        .or_else(dirs_next::home_dir)
+        .expect("a home directory")
+        .join(".infigraph");
     for path in [
         infigraph_core::multi::registry_path().unwrap(),
         infigraph_core::instances::instances_dir(),

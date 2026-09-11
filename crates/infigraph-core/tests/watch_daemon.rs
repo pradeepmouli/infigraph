@@ -1049,6 +1049,10 @@ fn full_reindex_build_task_can_be_cancelled_before_it_starts_the_swap() {
         "a cancelled build must reply with an error, not FullReindexOk: {reply:?}"
     );
 
+    assert!(
+        live_graph.is_file(),
+        "cancelling before the swap must leave a live graph behind"
+    );
     #[cfg(unix)]
     assert_eq!(
         identity_before,
