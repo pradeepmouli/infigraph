@@ -150,22 +150,24 @@ static SLOW_WAITS: std::sync::Mutex<Vec<SlowWait>> = std::sync::Mutex::new(Vec::
 /// (the CLI) must not grow this without bound.
 const SLOW_WAITS_CAP: usize = 16;
 
-/// Threshold above which a successful-but-slow acquisition is recorded.
-/// Resolved via the `graph` settings group (`INFIGRAPH_GRAPH_SLOW_LOCK_MS`,
-/// milliseconds; tests lower it).
+/// Threshold above which a successful-but-slow acquisition of `lock_path`
+/// is recorded. Resolved via the `graph` settings group
+/// (`INFIGRAPH_GRAPH_SLOW_LOCK_MS`, milliseconds; tests lower it), scoped to
+/// the project whose `.infigraph/` holds the lock.
 ///
-/// `RawGraph::default()` (all CLI slots `None`), not `parse_from(empty)`:
-/// this runs on every successful acquire while the lock is still held, and
-/// building a clap `Command` there lengthened every hold enough to push
-/// contended waiters into `acquire`'s backoff sleeps (caught by
-/// `write_lock_perf`'s contended-throughput guard).
-pub fn slow_wait_threshold() -> Duration {
+/// Callers resolve it *before* they start waiting, never once the lock is
+/// held: work inside the held region lengthens every hold, which pushes
+/// contended waiters into `acquire`'s backoff sleeps. A clap `Command` built
+/// there was caught by `write_lock_perf`'s contended-throughput guard, which
+/// is also why this takes `RawGraph::default()` rather than a clap parse.
+pub fn slow_wait_threshold(lock_path: &Path) -> Duration {
     let cli = crate::graph::RawGraph::default();
-    Duration::from_millis(crate::graph::Graph::resolve(cli, None).slow_lock_ms)
+    let scope = crate::settings_file::ConfigScope::of_infigraph_dir(lock_path.parent());
+    Duration::from_millis(crate::graph::Graph::resolve(cli, scope).slow_lock_ms)
 }
 
-fn record_slow_wait(path: &Path, waited: Duration) {
-    if waited < slow_wait_threshold() {
+fn record_slow_wait(path: &Path, waited: Duration, threshold: Duration) {
+    if waited < threshold {
         return;
     }
     if let Ok(mut buf) = SLOW_WAITS.lock() {
@@ -290,6 +292,7 @@ pub fn try_acquire(path: &Path, role: &str) -> Result<Option<LockFile>> {
 /// single-identity payload could only ever be misleading, and writing to the
 /// file at all would race the other readers holding it.
 pub fn acquire_shared(path: &Path, timeout: Duration) -> Result<LockFile> {
+    let slow_after = slow_wait_threshold(path);
     let start = Instant::now();
     let mut delay = Duration::from_millis(1);
     loop {
@@ -299,7 +302,7 @@ pub fn acquire_shared(path: &Path, timeout: Duration) -> Result<LockFile> {
         // otherwise win over the trait the rest of this module uses.
         match fs2::FileExt::try_lock_shared(&file) {
             Ok(()) => {
-                record_slow_wait(path, start.elapsed());
+                record_slow_wait(path, start.elapsed(), slow_after);
                 return Ok(LockFile {
                     file,
                     path: path.to_path_buf(),
@@ -335,11 +338,12 @@ pub fn is_holder_wedged(last_heartbeat: u64, now: u64, threshold_secs: u64) -> b
 /// backoff (1ms doubling to a 500ms cap). On expiry returns a `Busy`
 /// error carrying the holder identity when the payload is readable.
 pub fn acquire(path: &Path, role: &str, timeout: Duration) -> Result<LockFile> {
+    let slow_after = slow_wait_threshold(path);
     let start = Instant::now();
     let mut delay = Duration::from_millis(1);
     loop {
         if let Some(guard) = try_acquire(path, role)? {
-            record_slow_wait(path, start.elapsed());
+            record_slow_wait(path, start.elapsed(), slow_after);
             return Ok(guard);
         }
         if start.elapsed() >= timeout {

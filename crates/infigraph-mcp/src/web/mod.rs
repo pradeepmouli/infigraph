@@ -283,7 +283,8 @@ fn api_key() -> Option<String> {
     let cli = RawWeb {
         web_api_key: infigraph_core::settings::legacy_env("INFIGRAPH_API_KEY"),
     };
-    Some(Web::resolve(cli, None).api_key).filter(|k| !k.is_empty())
+    Some(Web::resolve(cli, infigraph_core::settings_file::ConfigScope::User).api_key)
+        .filter(|k| !k.is_empty())
 }
 
 fn check_auth(request: &tiny_http::Request) -> bool {

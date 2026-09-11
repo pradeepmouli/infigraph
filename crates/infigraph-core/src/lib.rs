@@ -234,7 +234,7 @@ pub fn selected_backend() -> String {
     cli.backend_selected = cli
         .backend_selected
         .or_else(|| std::env::var("INFIGRAPH_BACKEND").ok());
-    Backend::resolve(cli, None).selected
+    Backend::resolve(cli, settings_file::ConfigScope::User).selected
 }
 
 /// Whether `INFIGRAPH_BACKEND` selects the daemon backend. This is the exact
@@ -274,7 +274,7 @@ pub fn install_settings() -> Install {
         install_gh_owner: settings::legacy_env("INFIGRAPH_GH_OWNER"),
         ..Default::default()
     };
-    Install::resolve(cli, None)
+    Install::resolve(cli, settings_file::ConfigScope::User)
 }
 
 /// Opt-in toggle for handing a whole `index()`/`index_files()` job to the
@@ -284,7 +284,9 @@ pub fn install_settings() -> Install {
 /// Overridable via `INFIGRAPH_WATCH_INDEX_VIA_DAEMON`.
 pub fn index_via_daemon_mode_enabled() -> bool {
     let cli = watch::RawWatch::parse_from(std::iter::empty::<String>());
-    watch::Watch::resolve(cli, None).index_via_daemon.0
+    watch::Watch::resolve(cli, settings_file::ConfigScope::User)
+        .index_via_daemon
+        .0
 }
 
 impl Infigraph {

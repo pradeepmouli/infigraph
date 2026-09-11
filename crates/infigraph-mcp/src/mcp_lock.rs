@@ -29,7 +29,7 @@ infigraph_core::settings! {
 
 fn resolved_lock_settings() -> McpLock {
     let cli = RawMcpLock::parse_from(std::iter::empty::<String>());
-    McpLock::resolve(cli, None)
+    McpLock::resolve(cli, infigraph_core::settings_file::ConfigScope::User)
 }
 
 /// Full path to `mcp.lock`. Overridable via `INFIGRAPH_MCP_LOCK_PATH`

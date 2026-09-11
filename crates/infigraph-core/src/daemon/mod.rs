@@ -70,8 +70,11 @@ crate::settings! {
 /// Resolved `scip` settings (env > TOML > default; no CLI surface today).
 /// `RawScip::default()` rather than a clap parse: nothing on this path
 /// takes command-line flags, and the daemon reads this once at startup.
-pub fn scip_settings() -> Scip {
-    Scip::resolve(RawScip::default(), None)
+pub fn scip_settings(root: &Path) -> Scip {
+    Scip::resolve(
+        RawScip::default(),
+        crate::settings_file::ConfigScope::Project(root),
+    )
 }
 
 /// The pure decision behind R3.3.4a's automatic SCIP re-enrichment: is the
@@ -715,7 +718,7 @@ where
     // R3.3.4a: automatic SCIP re-enrichment. Read once here, like the
     // build-hash interval above -- a settings change takes a daemon
     // restart, which is how every other daemon setting behaves.
-    let scip_settings = scip_settings();
+    let scip_settings = scip_settings(root);
     let scip_staleness_threshold = scip_settings.index_staleness_threshold;
     let scip_staleness_check_interval =
         Duration::from_secs(scip_settings.index_staleness_check_secs);
@@ -1278,7 +1281,9 @@ where
         // mtime itself, so a busy graph is skipped rather than serialized.
         if last_idle_checkpoint.elapsed() >= IDLE_CHECKPOINT_PROBE {
             last_idle_checkpoint = std::time::Instant::now();
-            let idle_after = Duration::from_secs(crate::graph::store::checkpoint_idle_secs());
+            let idle_after = Duration::from_secs(crate::graph::store::checkpoint_idle_secs(
+                crate::settings_file::ConfigScope::Project(root),
+            ));
             if !idle_after.is_zero() {
                 if let Some(store) = held_prism.as_ref().and_then(|p| p.graph_store()) {
                     store.checkpoint_if_idle(idle_after);
@@ -3133,7 +3138,7 @@ mod tests {
 
     #[test]
     fn scip_settings_defaults() {
-        let s = scip_settings();
+        let s = scip_settings(tempfile::tempdir().unwrap().path());
         assert_eq!(s.index_staleness_threshold, 50);
         assert_eq!(s.index_staleness_check_secs, 300);
     }

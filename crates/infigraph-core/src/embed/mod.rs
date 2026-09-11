@@ -97,7 +97,7 @@ pub fn embed_settings() -> Embed {
     let cli = RawEmbed {
         embed_model_dir: crate::settings::legacy_env("INFIGRAPH_MODEL_DIR"),
     };
-    Embed::resolve(cli, None)
+    Embed::resolve(cli, crate::settings_file::ConfigScope::User)
 }
 
 struct CachedEmbeddings {

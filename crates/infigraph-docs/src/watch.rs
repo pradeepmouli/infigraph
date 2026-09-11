@@ -141,9 +141,15 @@ pub(crate) fn paths_warrant_reindex(
 /// and the per-handler stop sentinel while deciding whether to attach or
 /// detach a `watch_docs` session. Overridable via
 /// `INFIGRAPH_WATCH_DOC_DAEMON_POLL_MS` so tests don't wait through a real 1s tick.
-fn attach_poll_interval() -> Duration {
+fn attach_poll_interval(root: &Path) -> Duration {
     let cli = infigraph_core::watch::RawWatch::parse_from(std::iter::empty::<String>());
-    Duration::from_millis(infigraph_core::watch::Watch::resolve(cli, None).doc_daemon_poll_ms)
+    Duration::from_millis(
+        infigraph_core::watch::Watch::resolve(
+            cli,
+            infigraph_core::settings_file::ConfigScope::Project(root),
+        )
+        .doc_daemon_poll_ms,
+    )
 }
 
 /// Drive doc-watching for `root` as part of a merged code+doc watch daemon
@@ -169,7 +175,7 @@ pub fn watch_docs_daemon_loop(
 ) -> Result<()> {
     let docs_kuzu = root.join(".infigraph").join("docs.kuzu");
     let stop_sentinel = root.join(".infigraph").join("watch.stop.docs");
-    let poll = attach_poll_interval();
+    let poll = attach_poll_interval(root);
 
     let mut suppressed_until_absent = false;
 
@@ -372,10 +378,11 @@ mod tests {
     #[test]
     fn attach_poll_interval_reads_renamed_env_var() {
         let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
         std::env::set_var(POLL_MS_VAR, "77");
-        assert_eq!(attach_poll_interval().as_millis(), 77);
+        assert_eq!(attach_poll_interval(tmp.path()).as_millis(), 77);
         std::env::remove_var(POLL_MS_VAR);
-        assert_eq!(attach_poll_interval().as_millis(), 1000);
+        assert_eq!(attach_poll_interval(tmp.path()).as_millis(), 1000);
     }
 
     /// `DocIndex` has no `chunk_count()` accessor; the real path is

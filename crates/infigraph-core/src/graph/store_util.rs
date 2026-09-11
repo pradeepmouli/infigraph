@@ -7,6 +7,7 @@ use kuzu::Connection;
 
 use crate::graph::parquet_loader;
 use crate::graph::store::GraphStore;
+use crate::settings_file::ConfigScope;
 
 /// A Parquet staging path for a bulk COPY, unique to this run.
 ///
@@ -102,14 +103,14 @@ const GRAPH_MAX_BYTES_ENV: &str = "INFIGRAPH_GRAPH_MAX_BYTES";
 /// while still catching the actual pattern well before it reaches
 /// disk-filling scale. Resolved via the `graph` settings group
 /// (`INFIGRAPH_GRAPH_GROWTH_MAX_RATIO`).
-fn graph_growth_max_ratio() -> u64 {
-    crate::graph::Graph::resolve(crate::graph::RawGraph::default(), None).growth_max_ratio
+fn graph_growth_max_ratio(scope: ConfigScope<'_>) -> u64 {
+    crate::graph::Graph::resolve(crate::graph::RawGraph::default(), scope).growth_max_ratio
 }
 
 /// Absolute ceiling on the live graph plus its WAL family; 0 disables it
 /// (`INFIGRAPH_GRAPH_MAX_BYTES`). See `check_graph_growth_ratio`.
-fn graph_max_bytes() -> u64 {
-    crate::graph::Graph::resolve(crate::graph::RawGraph::default(), None).max_bytes
+fn graph_max_bytes(scope: ConfigScope<'_>) -> u64 {
+    crate::graph::Graph::resolve(crate::graph::RawGraph::default(), scope).max_bytes
 }
 
 /// How many times a COPY retry loop may re-spend its own batch before
@@ -124,8 +125,8 @@ fn graph_max_bytes() -> u64 {
 /// cannot know and should not pretend to. Erring generous costs a later
 /// stop; erring tight sends a converging loop to the slow UNWIND path,
 /// which is correct but much slower, and silently so.
-pub(crate) fn copy_retry_max_batch_multiple() -> u64 {
-    crate::graph::Graph::resolve(crate::graph::RawGraph::default(), None)
+pub(crate) fn copy_retry_max_batch_multiple(scope: ConfigScope<'_>) -> u64 {
+    crate::graph::Graph::resolve(crate::graph::RawGraph::default(), scope)
         .copy_retry_max_batch_multiple
 }
 
@@ -251,13 +252,15 @@ pub(crate) fn check_graph_growth_ratio(
     // against a 107MB baseline and filled the disk, with the ratio breaker
     // firing only after 20GB had been written. This bound is not relative
     // to anything and deliberately applies even when no baseline exists.
-    let ceiling = graph_max_bytes();
+    let scope = crate::settings_file::ConfigScope::of_infigraph_dir(Some(infigraph_dir));
+    let ceiling = graph_max_bytes(scope);
     if ceiling > 0 && current > ceiling {
         return Err(format!(
             "graph at {} is {} MB, past the absolute ceiling of {} MB -- refusing further \
-             growth (override with {GRAPH_MAX_BYTES_ENV}, 0 disables). ALL indexing is blocked \
-             until this is resolved -- run `infigraph rebuild`, which rebuilds the graph \
-             compactly and re-stamp the baseline",
+             growth (override with {GRAPH_MAX_BYTES_ENV} or `[graph] max_bytes` in \
+             .infigraph/config.toml, 0 disables). ALL indexing is blocked until this is \
+             resolved -- run `infigraph rebuild`, which rebuilds the graph compactly and \
+             re-stamps the baseline",
             graph_path.display(),
             current / (1024 * 1024),
             ceiling / (1024 * 1024),
@@ -267,12 +270,14 @@ pub(crate) fn check_graph_growth_ratio(
     let Some(healthy) = read_healthy_size(infigraph_dir) else {
         return Ok(());
     };
-    let max_allowed = healthy.saturating_mul(graph_growth_max_ratio());
+    let ratio = graph_growth_max_ratio(scope);
+    let max_allowed = healthy.saturating_mul(ratio);
     if current > max_allowed {
         return Err(format!(
             "graph at {} is {} MB ({} MB graph + {} MB WAL), {}x its recorded healthy size \
              ({} MB) -- refusing further growth (cap: {}x, override with \
-             {GRAPH_GROWTH_MAX_RATIO_ENV}); this guards against the runaway-WAL-growth pattern \
+             {GRAPH_GROWTH_MAX_RATIO_ENV} or `[graph] growth_max_ratio` in \
+             .infigraph/config.toml); this guards against the runaway-WAL-growth pattern \
              from github.com/pradeepmouli/infigraph#100. ALL indexing is blocked until this is \
              resolved -- run `infigraph rebuild`, which rebuilds the graph compactly and \
              re-stamps the baseline, or, if this growth is legitimate, delete {} to reset the \
@@ -283,7 +288,7 @@ pub(crate) fn check_graph_growth_ratio(
             wal_size / (1024 * 1024),
             current / healthy.max(1),
             healthy / (1024 * 1024),
-            graph_growth_max_ratio(),
+            ratio,
             graph_health_path(infigraph_dir).display(),
         ));
     }
@@ -950,6 +955,7 @@ mod tests {
     /// when no baseline has been recorded yet.
     #[test]
     fn an_absolute_ceiling_refuses_even_with_no_baseline_recorded() {
+        let _g = MAX_BYTES_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let graph_path = tmp.path().join("graph");
         std::fs::write(&graph_path, vec![0u8; 4_000_000]).unwrap();
@@ -970,6 +976,7 @@ mod tests {
     /// The ceiling is opt-outable, and 0 means disabled.
     #[test]
     fn an_absolute_ceiling_of_zero_is_disabled() {
+        let _g = MAX_BYTES_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
         let graph_path = tmp.path().join("graph");
         std::fs::write(&graph_path, vec![0u8; 4_000_000]).unwrap();
@@ -978,6 +985,43 @@ mod tests {
         let out = check_graph_growth_ratio(tmp.path(), &graph_path);
         std::env::remove_var(GRAPH_MAX_BYTES_ENV);
         assert!(out.is_ok(), "0 must disable the ceiling: {out:?}");
+    }
+
+    /// Serializes the tests that set, or would be defeated by,
+    /// `INFIGRAPH_GRAPH_MAX_BYTES`: one test setting "0" disables every
+    /// other test's ceiling for as long as it holds.
+    static MAX_BYTES_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// #160: the ceiling is reachable from the project's own config file,
+    /// which is the whole case for a per-project graph bound -- one repo's
+    /// legitimately huge graph should not force the bound up for every
+    /// other project on the machine. The scope comes from the store's
+    /// `.infigraph` directory, so the graph must live in one.
+    #[test]
+    fn a_project_config_file_sets_the_absolute_ceiling() {
+        let _g = MAX_BYTES_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var(GRAPH_MAX_BYTES_ENV);
+        let tmp = tempfile::tempdir().unwrap();
+        let infigraph_dir = tmp.path().join(".infigraph");
+        std::fs::create_dir_all(&infigraph_dir).unwrap();
+        let graph_path = infigraph_dir.join("graph");
+        std::fs::write(&graph_path, vec![0u8; 4_000_000]).unwrap();
+        assert!(
+            check_graph_growth_ratio(&infigraph_dir, &graph_path).is_ok(),
+            "4MB is far under the 8GiB default"
+        );
+
+        std::fs::write(
+            infigraph_dir.join("config.toml"),
+            "[graph]\nmax_bytes = 1000000\n",
+        )
+        .unwrap();
+        let err = check_graph_growth_ratio(&infigraph_dir, &graph_path)
+            .expect_err("4MB must be refused against the project's 1MB ceiling");
+        assert!(
+            err.contains("`[graph] max_bytes`"),
+            "the refusal must point at the config key, not only the env var: {err}"
+        );
     }
 
     #[test]

@@ -27,7 +27,9 @@ infigraph_core::settings! {
 /// Overridable via `INFIGRAPH_MCP_IDLE_GRACE_SECS` (seconds).
 pub fn idle_grace_period() -> Duration {
     let cli = RawMcpIdle::parse_from(std::iter::empty::<String>());
-    Duration::from_secs(McpIdle::resolve(cli, None).grace_secs)
+    Duration::from_secs(
+        McpIdle::resolve(cli, infigraph_core::settings_file::ConfigScope::User).grace_secs,
+    )
 }
 
 /// How often the post-EOF loop wakes to re-check the grace period.
@@ -35,7 +37,9 @@ pub fn idle_grace_period() -> Duration {
 /// tests so they don't wait a full production-sized interval.
 pub fn idle_poll_interval() -> Duration {
     let cli = RawMcpIdle::parse_from(std::iter::empty::<String>());
-    Duration::from_secs(McpIdle::resolve(cli, None).poll_secs)
+    Duration::from_secs(
+        McpIdle::resolve(cli, infigraph_core::settings_file::ConfigScope::User).poll_secs,
+    )
 }
 
 /// Pure: has `elapsed` (time since the MCP client's stdin closed) reached

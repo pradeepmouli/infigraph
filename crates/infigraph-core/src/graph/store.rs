@@ -371,6 +371,12 @@ fn write_buffer_pool_bytes() -> u64 {
     parse_write_buffer_pool(std::env::var(WRITE_BUFFER_POOL_ENV).ok().as_deref())
 }
 
+/// How long a WAL must sit unwritten before the daemon folds it (#149);
+/// 0 disables. See `GraphStore::checkpoint_if_idle`.
+pub(crate) fn checkpoint_idle_secs(scope: crate::settings_file::ConfigScope<'_>) -> u64 {
+    crate::graph::Graph::resolve(crate::graph::RawGraph::default(), scope).checkpoint_idle_secs
+}
+
 /// Coordination lock for the checkpoint window (ladybug#666).
 ///
 /// A file of its own, deliberately NOT `graph.lock`. The write lock is held
@@ -380,12 +386,6 @@ fn write_buffer_pool_bytes() -> u64 {
 /// held only across the two moments that actually collide: a reader's
 /// `Database::new` (shared) and the writer's explicit `CHECKPOINT`
 /// (exclusive).
-/// How long a WAL must sit unwritten before the daemon folds it (#149);
-/// 0 disables. See `GraphStore::checkpoint_if_idle`.
-pub(crate) fn checkpoint_idle_secs() -> u64 {
-    crate::graph::Graph::resolve(crate::graph::RawGraph::default(), None).checkpoint_idle_secs
-}
-
 fn checkpoint_lock_path(db_path: &Path) -> PathBuf {
     PathBuf::from(format!("{}.ckpt.lock", db_path.display()))
 }
@@ -1037,7 +1037,8 @@ impl GraphStore {
     /// always a next chance, and a failure here must never take down the
     /// daemon loop that calls it.
     pub(crate) fn checkpoint_if_idle(&self, idle_after: std::time::Duration) {
-        if idle_after.is_zero() && checkpoint_idle_secs() == 0 {
+        let scope = crate::settings_file::ConfigScope::of_infigraph_dir(self.db_dir());
+        if idle_after.is_zero() && checkpoint_idle_secs(scope) == 0 {
             // 0 in settings disables the behaviour entirely; a zero argument
             // from a test still means "fold now", hence both conditions.
             return;

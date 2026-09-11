@@ -6,7 +6,7 @@ static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 fn resolve_graph() -> infigraph_core::graph::Graph {
     let cli = infigraph_core::graph::RawGraph::parse_from(std::iter::empty::<String>());
-    infigraph_core::graph::Graph::resolve(cli, None)
+    infigraph_core::graph::Graph::resolve_layers(cli, &[])
 }
 
 #[test]

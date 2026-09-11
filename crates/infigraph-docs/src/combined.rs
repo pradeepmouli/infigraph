@@ -326,7 +326,8 @@ fn combined_hnsw_threshold() -> usize {
         ),
         ..Default::default()
     };
-    infigraph_core::graph::Graph::resolve(cli, None).doc_hnsw_threshold as usize
+    infigraph_core::graph::Graph::resolve(cli, infigraph_core::settings_file::ConfigScope::User)
+        .doc_hnsw_threshold as usize
 }
 
 fn acquire_build_lock(graph_dir: &Path) -> Result<std::fs::File> {

@@ -108,12 +108,33 @@ macro_rules! settings {
 
             impl [<$category:camel>] {
                 /// Resolves this group's settings: CLI > env > TOML > default,
-                /// per field. `toml_section` is this group's own section
-                /// (e.g. `doc.get("mcp_idle")`), or `None` if absent/not
-                /// consulted.
+                /// per field. The TOML layer is this group's `[category]`
+                /// section of each `config.toml` that `scope` consults (see
+                /// `settings_file`).
+                ///
+                /// Loading the files here rather than taking a section
+                /// parameter is the point of #160: when the section was a
+                /// parameter, every production caller passed `None` and no
+                /// config file ever reached a setting.
+                // A group only ever driven through `resolve_layers` (the
+                // test-only toy groups) leaves this unused.
+                #[allow(dead_code)]
                 pub fn resolve(
                     cli: [<Raw $category:camel>],
-                    toml_section: Option<&$crate::toml_edit::Item>,
+                    scope: $crate::settings_file::ConfigScope<'_>,
+                ) -> Self {
+                    let docs = $crate::settings_file::layers(scope);
+                    let layers: Vec<&$crate::toml_edit::Item> =
+                        docs.iter().flatten().map(|doc| doc.as_item()).collect();
+                    Self::resolve_layers(cli, &layers)
+                }
+
+                /// [`resolve`](Self::resolve) over explicit config documents,
+                /// nearest layer first. A key the nearer layer does not state
+                /// falls through to the next one.
+                pub fn resolve_layers(
+                    cli: [<Raw $category:camel>],
+                    layers: &[&$crate::toml_edit::Item],
                 ) -> Self {
                     Self {
                         $(
@@ -124,9 +145,11 @@ macro_rules! settings {
                                     stringify!($field),
                                 ))
                                 .or_else(|| {
-                                    toml_section
-                                        .and_then(|s| s.get(stringify!($field)))
-                                        .and_then(<$ty as $crate::settings::FromTomlItem>::from_toml_item)
+                                    layers.iter().find_map(|doc| {
+                                        doc.get(stringify!($category))
+                                            .and_then(|s| s.get(stringify!($field)))
+                                            .and_then(<$ty as $crate::settings::FromTomlItem>::from_toml_item)
+                                    })
                                 })
                                 .unwrap_or($default),
                         )+
@@ -159,7 +182,7 @@ mod tests {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var("INFIGRAPH_TOY_GROUP_GRACE_SECS");
         let cli = RawToyGroup::parse_from(["test"]);
-        assert_eq!(ToyGroup::resolve(cli, None).grace_secs, 300);
+        assert_eq!(ToyGroup::resolve_layers(cli, &[]).grace_secs, 300);
     }
 
     #[test]
@@ -167,7 +190,7 @@ mod tests {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("INFIGRAPH_TOY_GROUP_GRACE_SECS", "42");
         let cli = RawToyGroup::parse_from(["test"]);
-        assert_eq!(ToyGroup::resolve(cli, None).grace_secs, 42);
+        assert_eq!(ToyGroup::resolve_layers(cli, &[]).grace_secs, 42);
         std::env::remove_var("INFIGRAPH_TOY_GROUP_GRACE_SECS");
     }
 
@@ -175,18 +198,74 @@ mod tests {
     fn toml_overrides_default_but_env_still_wins() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var("INFIGRAPH_TOY_GROUP_GRACE_SECS");
-        let doc: toml_edit::DocumentMut = "grace_secs = 99".parse().unwrap();
-        let toml_item = doc.as_item();
+        let doc: toml_edit::DocumentMut = "[toy_group]\ngrace_secs = 99".parse().unwrap();
+        let layers = [doc.as_item()];
 
         let cli = RawToyGroup::parse_from(["test"]);
         assert_eq!(
-            ToyGroup::resolve(cli.clone(), Some(toml_item)).grace_secs,
+            ToyGroup::resolve_layers(cli.clone(), &layers).grace_secs,
             99
         );
 
         std::env::set_var("INFIGRAPH_TOY_GROUP_GRACE_SECS", "42");
-        assert_eq!(ToyGroup::resolve(cli, Some(toml_item)).grace_secs, 42);
+        assert_eq!(ToyGroup::resolve_layers(cli, &layers).grace_secs, 42);
         std::env::remove_var("INFIGRAPH_TOY_GROUP_GRACE_SECS");
+    }
+
+    crate::settings! {
+        toy_pair {
+            near: u64 = 1,
+            far: u64 = 2,
+        }
+    }
+
+    /// #160: two layers merge per key. The nearer layer wins the key it
+    /// states, and a key it is silent on falls through to the layer below
+    /// rather than to the default -- that is what separates a layer from a
+    /// fallback (see `settings_file`).
+    #[test]
+    fn the_nearer_layer_wins_per_key_and_its_silence_falls_through() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("INFIGRAPH_TOY_PAIR_NEAR");
+        std::env::remove_var("INFIGRAPH_TOY_PAIR_FAR");
+        let project: toml_edit::DocumentMut = "[toy_pair]\nnear = 10".parse().unwrap();
+        let user: toml_edit::DocumentMut = "[toy_pair]\nnear = 20\nfar = 30".parse().unwrap();
+
+        let got = ToyPair::resolve_layers(
+            RawToyPair::parse_from(["test"]),
+            &[project.as_item(), user.as_item()],
+        );
+        assert_eq!(got, ToyPair { near: 10, far: 30 });
+    }
+
+    /// A group reads only its own `[category]` section: the same key under
+    /// another group's header, or at the top level, is not its setting.
+    #[test]
+    fn a_group_reads_only_its_own_section() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("INFIGRAPH_TOY_GROUP_GRACE_SECS");
+        let doc: toml_edit::DocumentMut = "grace_secs = 1\n[toy_other]\ngrace_secs = 2"
+            .parse()
+            .unwrap();
+        let got = ToyGroup::resolve_layers(RawToyGroup::parse_from(["test"]), &[doc.as_item()]);
+        assert_eq!(got.grace_secs, 300);
+    }
+
+    /// End to end through the file loader: a real
+    /// `<root>/.infigraph/config.toml` reaches `resolve`. Before #160 every
+    /// production caller passed `None` here, so no file ever did.
+    #[test]
+    fn resolve_reads_the_project_config_file() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("INFIGRAPH_TOY_GROUP_GRACE_SECS");
+        let tmp = tempfile::tempdir().unwrap();
+        let path = crate::settings_file::project_config_path(tmp.path());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "[toy_group]\ngrace_secs = 99\n").unwrap();
+
+        let cli = RawToyGroup::parse_from(["test"]);
+        let scope = crate::settings_file::ConfigScope::Project(tmp.path());
+        assert_eq!(ToyGroup::resolve(cli, scope).grace_secs, 99);
     }
 
     #[test]
@@ -194,7 +273,7 @@ mod tests {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("INFIGRAPH_TOY_GROUP_GRACE_SECS", "42");
         let cli = RawToyGroup::parse_from(["test", "--toy-group-grace-secs", "7"]);
-        assert_eq!(ToyGroup::resolve(cli, None).grace_secs, 7);
+        assert_eq!(ToyGroup::resolve_layers(cli, &[]).grace_secs, 7);
         std::env::remove_var("INFIGRAPH_TOY_GROUP_GRACE_SECS");
     }
 
@@ -226,8 +305,8 @@ mod tests {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var("INFIGRAPH_TOY_A_VALUE");
         std::env::remove_var("INFIGRAPH_TOY_B_VALUE");
-        let a = ToyA::resolve(RawToyA::parse_from(["test"]), None);
-        let b = ToyB::resolve(RawToyB::parse_from(["test"]), None);
+        let a = ToyA::resolve_layers(RawToyA::parse_from(["test"]), &[]);
+        let b = ToyB::resolve_layers(RawToyB::parse_from(["test"]), &[]);
         assert_eq!(a.value, 1);
         assert_eq!(b.value, 2);
     }
@@ -242,10 +321,12 @@ mod tests {
     fn string_field_resolves_from_toml() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var("INFIGRAPH_TOY_STR_NAME");
-        let doc: toml_edit::DocumentMut = r#"name = "from-toml""#.parse().unwrap();
-        let toml_item = doc.as_item();
+        let doc: toml_edit::DocumentMut = "[toy_str]\nname = \"from-toml\"".parse().unwrap();
         let cli = RawToyStr::parse_from(["test"]);
-        assert_eq!(ToyStr::resolve(cli, Some(toml_item)).name, "from-toml");
+        assert_eq!(
+            ToyStr::resolve_layers(cli, &[doc.as_item()]).name,
+            "from-toml"
+        );
     }
 
     crate::settings! {
@@ -260,28 +341,28 @@ mod tests {
         std::env::set_var("INFIGRAPH_TOY_TOGGLE_FLAG", "1");
         let cli = RawToyToggle::parse_from(["test"]);
         assert!(
-            ToyToggle::resolve(cli, None).flag.0,
+            ToyToggle::resolve_layers(cli, &[]).flag.0,
             "\"1\" must be treated as true"
         );
 
         std::env::set_var("INFIGRAPH_TOY_TOGGLE_FLAG", "0");
         let cli = RawToyToggle::parse_from(["test"]);
         assert!(
-            !ToyToggle::resolve(cli, None).flag.0,
+            !ToyToggle::resolve_layers(cli, &[]).flag.0,
             "\"0\" must be treated as false"
         );
 
         std::env::set_var("INFIGRAPH_TOY_TOGGLE_FLAG", "false");
         let cli = RawToyToggle::parse_from(["test"]);
         assert!(
-            !ToyToggle::resolve(cli, None).flag.0,
+            !ToyToggle::resolve_layers(cli, &[]).flag.0,
             "\"false\" (any case) must be treated as false"
         );
 
         std::env::remove_var("INFIGRAPH_TOY_TOGGLE_FLAG");
         let cli = RawToyToggle::parse_from(["test"]);
         assert!(
-            ToyToggle::resolve(cli, None).flag.0,
+            ToyToggle::resolve_layers(cli, &[]).flag.0,
             "unset must fall through to the hardcoded default (true)"
         );
     }

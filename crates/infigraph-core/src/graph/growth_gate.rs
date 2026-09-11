@@ -177,7 +177,9 @@ impl GraphStore {
         let graph_path = self.db_path().to_path_buf();
         let on_disk = self.db_dir().is_some();
         CopyRetryBudget::new(
-            super::store_util::copy_retry_max_batch_multiple(),
+            super::store_util::copy_retry_max_batch_multiple(
+                crate::settings_file::ConfigScope::of_infigraph_dir(self.db_dir()),
+            ),
             move || {
                 if on_disk {
                     super::store_util::graph_family_bytes(&graph_path)

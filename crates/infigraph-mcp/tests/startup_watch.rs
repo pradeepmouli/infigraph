@@ -4,7 +4,7 @@
 //! (`INFIGRAPH_BACKEND=daemon`), the directory it was launched in must
 //! start being watched immediately, without waiting for some future write
 //! to trigger `auto_start_watch` reactively — and the new
-//! `[watch].auto_start_on_boot` / `INFIGRAPH_WATCH_AUTO_START` toggle must
+//! `[watch].auto_start_on_boot` / `INFIGRAPH_WATCH_AUTO_START_ON_BOOT` toggle must
 //! actually suppress that effect when turned off, not just exist as an
 //! unused config knob. Deliberately scoped to just the startup directory,
 //! not the whole project registry -- an earlier version swept the registry
@@ -100,7 +100,7 @@ fn wait_for_watch_lock_state(
 /// it on its own — proving proactive startup watching actually works, not
 /// just that some helper exists. Folds in the negative case in the same
 /// test (same setup, same lock-file observable): with
-/// `INFIGRAPH_WATCH_AUTO_START=0`, the identical call must NOT spawn a
+/// `INFIGRAPH_WATCH_AUTO_START_ON_BOOT=0`, the identical call must NOT spawn a
 /// daemon — the config toggle must really suppress the effect.
 #[test]
 fn start_daemon_watcher_for_startup_dir_respects_boot_toggle() {
@@ -127,18 +127,18 @@ fn start_daemon_watcher_for_startup_dir_respects_boot_toggle() {
     std::env::set_var("INFIGRAPH_BACKEND", "daemon");
 
     // --- Negative case: boot toggle explicitly off. ---
-    std::env::set_var("INFIGRAPH_WATCH_AUTO_START", "0");
+    std::env::set_var("INFIGRAPH_WATCH_AUTO_START_ON_BOOT", "0");
     infigraph_mcp::recovery::start_daemon_watcher_for_startup_dir(Some(&root));
     assert!(
         !wait_for_watch_lock_state(&lock_path, true, Duration::from_millis(800)),
-        "INFIGRAPH_WATCH_AUTO_START=0 must suppress proactive startup watching, \
+        "INFIGRAPH_WATCH_AUTO_START_ON_BOOT=0 must suppress proactive startup watching, \
          but a daemon acquired watch.lock anyway"
     );
 
     // --- Positive case: boot toggle on (explicit, not relying on default \
     // resolution against whatever config.toml might be discoverable from \
     // this test binary's cwd). ---
-    std::env::set_var("INFIGRAPH_WATCH_AUTO_START", "1");
+    std::env::set_var("INFIGRAPH_WATCH_AUTO_START_ON_BOOT", "1");
     infigraph_mcp::recovery::start_daemon_watcher_for_startup_dir(Some(&root));
     let started = wait_for_watch_lock_state(&lock_path, true, Duration::from_secs(15));
 
@@ -147,7 +147,7 @@ fn start_daemon_watcher_for_startup_dir_respects_boot_toggle() {
     std::fs::write(root.join(".infigraph").join("watch.stop"), "").unwrap();
     wait_for_watch_lock_state(&lock_path, false, Duration::from_secs(15));
 
-    std::env::remove_var("INFIGRAPH_WATCH_AUTO_START");
+    std::env::remove_var("INFIGRAPH_WATCH_AUTO_START_ON_BOOT");
     std::env::set_var(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND);
 
     assert!(
@@ -181,14 +181,14 @@ fn start_daemon_watcher_for_startup_dir_respects_watch_enabled_policy() {
     let lock_path = root.join(".infigraph").join("watch.lock");
 
     std::env::set_var("INFIGRAPH_BACKEND", "daemon");
-    std::env::set_var("INFIGRAPH_WATCH_AUTO_START", "1");
+    std::env::set_var("INFIGRAPH_WATCH_AUTO_START_ON_BOOT", "1");
     std::env::set_var("INFIGRAPH_WATCH_ENABLED", "0");
 
     infigraph_mcp::recovery::start_daemon_watcher_for_startup_dir(Some(&root));
     let suppressed = !wait_for_watch_lock_state(&lock_path, true, Duration::from_millis(800));
 
     std::env::remove_var("INFIGRAPH_WATCH_ENABLED");
-    std::env::remove_var("INFIGRAPH_WATCH_AUTO_START");
+    std::env::remove_var("INFIGRAPH_WATCH_AUTO_START_ON_BOOT");
     std::env::set_var(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND);
 
     assert!(
@@ -228,7 +228,7 @@ fn start_daemon_watcher_for_startup_dir_never_touches_other_projects() {
     let other_lock = other_root.join(".infigraph").join("watch.lock");
 
     std::env::set_var("INFIGRAPH_BACKEND", "daemon");
-    std::env::set_var("INFIGRAPH_WATCH_AUTO_START", "1");
+    std::env::set_var("INFIGRAPH_WATCH_AUTO_START_ON_BOOT", "1");
 
     infigraph_mcp::recovery::start_daemon_watcher_for_startup_dir(Some(&startup_root));
     let started = wait_for_watch_lock_state(&startup_lock, true, Duration::from_secs(15));
@@ -238,7 +238,7 @@ fn start_daemon_watcher_for_startup_dir_never_touches_other_projects() {
     std::fs::write(startup_root.join(".infigraph").join("watch.stop"), "").unwrap();
     wait_for_watch_lock_state(&startup_lock, false, Duration::from_secs(15));
 
-    std::env::remove_var("INFIGRAPH_WATCH_AUTO_START");
+    std::env::remove_var("INFIGRAPH_WATCH_AUTO_START_ON_BOOT");
     std::env::set_var(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND);
 
     assert!(
@@ -301,7 +301,7 @@ fn start_daemon_watcher_for_startup_dir_catches_drift_from_before_it_was_running
     .unwrap();
 
     std::env::set_var("INFIGRAPH_BACKEND", "daemon");
-    std::env::set_var("INFIGRAPH_WATCH_AUTO_START", "1");
+    std::env::set_var("INFIGRAPH_WATCH_AUTO_START_ON_BOOT", "1");
 
     infigraph_mcp::recovery::start_daemon_watcher_for_startup_dir(Some(&root));
     let started = wait_for_watch_lock_state(&lock_path, true, Duration::from_secs(15));
@@ -320,7 +320,7 @@ fn start_daemon_watcher_for_startup_dir_catches_drift_from_before_it_was_running
     std::fs::write(root.join(".infigraph").join("watch.stop"), "").unwrap();
     wait_for_watch_lock_state(&lock_path, false, Duration::from_secs(15));
 
-    std::env::remove_var("INFIGRAPH_WATCH_AUTO_START");
+    std::env::remove_var("INFIGRAPH_WATCH_AUTO_START_ON_BOOT");
     std::env::set_var(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND);
 
     assert!(started, "expected a daemon to start for the startup dir");
@@ -332,21 +332,37 @@ fn start_daemon_watcher_for_startup_dir_catches_drift_from_before_it_was_running
     );
 }
 
-/// `auto_start_watch_on_boot_enabled` itself: env var overrides config file
-/// overrides the hardcoded default (on), matching the priority convention
-/// documented on `get_ml_compression_mode` in the same file.
+/// `auto_start_watch_on_boot_enabled` itself: env var overrides the
+/// project's config file, which overrides the hardcoded default (on).
 #[test]
 fn auto_start_watch_on_boot_enabled_env_override_priority() {
+    use infigraph_mcp::session_context::auto_start_watch_on_boot_enabled;
     let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let project = tempfile::tempdir().unwrap();
+    let root = project.path();
 
-    std::env::set_var("INFIGRAPH_WATCH_AUTO_START", "0");
-    assert!(!infigraph_mcp::session_context::auto_start_watch_on_boot_enabled());
+    std::env::remove_var("INFIGRAPH_WATCH_AUTO_START_ON_BOOT");
+    assert!(auto_start_watch_on_boot_enabled(root), "default is on");
 
-    std::env::set_var("INFIGRAPH_WATCH_AUTO_START", "false");
-    assert!(!infigraph_mcp::session_context::auto_start_watch_on_boot_enabled());
+    let config = infigraph_core::settings_file::project_config_path(root);
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    std::fs::write(&config, "[watch]\nauto_start_on_boot = false\n").unwrap();
+    assert!(
+        !auto_start_watch_on_boot_enabled(root),
+        "the project's config file must reach the setting (#160)"
+    );
 
-    std::env::set_var("INFIGRAPH_WATCH_AUTO_START", "1");
-    assert!(infigraph_mcp::session_context::auto_start_watch_on_boot_enabled());
+    std::env::set_var("INFIGRAPH_WATCH_AUTO_START_ON_BOOT", "1");
+    assert!(
+        auto_start_watch_on_boot_enabled(root),
+        "env outranks the config file"
+    );
 
-    std::env::remove_var("INFIGRAPH_WATCH_AUTO_START");
+    std::env::set_var("INFIGRAPH_WATCH_AUTO_START_ON_BOOT", "0");
+    assert!(!auto_start_watch_on_boot_enabled(root));
+
+    std::env::set_var("INFIGRAPH_WATCH_AUTO_START_ON_BOOT", "false");
+    assert!(!auto_start_watch_on_boot_enabled(root));
+
+    std::env::remove_var("INFIGRAPH_WATCH_AUTO_START_ON_BOOT");
 }

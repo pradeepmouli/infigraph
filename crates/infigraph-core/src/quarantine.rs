@@ -33,8 +33,9 @@ const PREVIOUS_RETENTION: usize = 1;
 ///
 /// Resolved via the `graph` settings group
 /// (`INFIGRAPH_GRAPH_QUARANTINE_MAX_BYTES`; 0 disables the cap).
-fn quarantine_max_bytes() -> u64 {
-    crate::graph::Graph::resolve(crate::graph::RawGraph::default(), None).quarantine_max_bytes
+fn quarantine_max_bytes(infigraph_dir: &Path) -> u64 {
+    let scope = crate::settings_file::ConfigScope::of_infigraph_dir(Some(infigraph_dir));
+    crate::graph::Graph::resolve(crate::graph::RawGraph::default(), scope).quarantine_max_bytes
 }
 
 fn now_epoch_secs() -> u64 {
@@ -258,7 +259,7 @@ fn move_graph_aside(
     // before the rename so the oversized base never enters the pool at
     // all: the WAL family still gets relocated below (it shares the stem
     // with the manifest), preserving the actually-useful evidence.
-    let cap = quarantine_max_bytes();
+    let cap = quarantine_max_bytes(infigraph_dir);
     if infix == CORRUPT_INFIX && cap > 0 {
         let base_size = entry_size_bytes(&source);
         if base_size > cap {

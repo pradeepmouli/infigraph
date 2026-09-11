@@ -67,7 +67,7 @@ pub fn registry_settings() -> Registry {
         registry_org: crate::settings::legacy_env("INFIGRAPH_ORG"),
         ..Default::default()
     };
-    Registry::resolve(cli, None)
+    Registry::resolve(cli, crate::settings_file::ConfigScope::User)
 }
 
 /// Directory holding one JSON file per live-or-recently-live instance.
@@ -223,7 +223,9 @@ pub fn classify_instances(
 /// `INFIGRAPH_WATCH_REAP_SCAN_SECS` (seconds).
 pub fn reap_scan_interval() -> Duration {
     let cli = crate::watch::RawWatch::parse_from(std::iter::empty::<String>());
-    Duration::from_secs(crate::watch::Watch::resolve(cli, None).reap_scan_secs)
+    Duration::from_secs(
+        crate::watch::Watch::resolve(cli, crate::settings_file::ConfigScope::User).reap_scan_secs,
+    )
 }
 
 /// Removes a stale registry file. This is remove-file-only, on purpose —

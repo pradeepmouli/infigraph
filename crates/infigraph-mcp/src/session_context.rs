@@ -13,10 +13,11 @@ const DEFAULT_TOKEN_BUDGET: usize = 150_000;
 // upstream, so each is read by its legacy name (then the canonical
 // `INFIGRAPH_SESSION_*` name) via `session_cli`; legacy wins. Three of them
 // (ml_compression, dedup, token_budget) have a config.toml layer between
-// env and the default, which `resolve()` cannot express -- so every
-// consumer reads the CLI/env layer from `session_cli()` and falls through
-// to config by hand (the `auto_start_watch_on_boot_enabled` pattern). The
-// defaults declared here document the effective defaults.
+// env and the default, but under `[compression]` rather than this group's
+// own `[session]` section, so `resolve()`'s TOML layer cannot reach them --
+// every consumer reads the CLI/env layer from `session_cli()` and falls
+// through to `load_config_file()` by hand. The defaults declared here
+// document the effective defaults.
 infigraph_core::settings! {
     session {
         compression_level: String = String::new(),
@@ -67,8 +68,6 @@ pub fn force_dedup_panic(enabled: bool) {
 struct ConfigFile {
     #[serde(default)]
     compression: CompressionConfig,
-    #[serde(default)]
-    watch: WatchConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -104,8 +103,6 @@ fn default_true() -> bool {
 struct RawConfigFile {
     #[serde(default)]
     compression: RawCompression,
-    #[serde(default)]
-    watch: RawWatch,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -116,11 +113,6 @@ struct RawCompression {
     token_budget: Option<usize>,
     staleness_window: Option<usize>,
     ml_compression: Option<String>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-struct RawWatch {
-    auto_start_on_boot: Option<bool>,
 }
 
 impl RawConfigFile {
@@ -146,12 +138,6 @@ impl RawConfigFile {
                     .ml_compression
                     .or(under.compression.ml_compression),
             },
-            watch: RawWatch {
-                auto_start_on_boot: self
-                    .watch
-                    .auto_start_on_boot
-                    .or(under.watch.auto_start_on_boot),
-            },
         }
     }
 }
@@ -167,9 +153,6 @@ impl From<RawConfigFile> for ConfigFile {
                 staleness_window: raw.compression.staleness_window,
                 ml_compression: raw.compression.ml_compression,
             },
-            watch: WatchConfig {
-                auto_start_on_boot: raw.watch.auto_start_on_boot.unwrap_or_else(default_true),
-            },
         }
     }
 }
@@ -183,20 +166,6 @@ impl Default for CompressionConfig {
             token_budget: None,
             staleness_window: None,
             ml_compression: None,
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-struct WatchConfig {
-    #[serde(default = "default_true")]
-    auto_start_on_boot: bool,
-}
-
-impl Default for WatchConfig {
-    fn default() -> Self {
-        Self {
-            auto_start_on_boot: true,
         }
     }
 }
@@ -457,30 +426,21 @@ pub fn get_ml_compression_mode() -> String {
         .to_lowercase()
 }
 
-/// Whether the MCP server should proactively start watching every
-/// already-registered project on boot (daemon mode only), rather than only
-/// ever starting a watcher reactively after some write happens to touch
-/// that project. Priority: env var (`INFIGRAPH_WATCH_AUTO_START`), then
-/// config.toml `[watch].auto_start_on_boot`, then the hardcoded default
-/// (on). Reads the config file fresh rather than going through the
-/// session-cached `SESSION` static, since this must be callable from
-/// `main.rs::run()` at raw process startup, before any per-session context
-/// exists.
+/// Whether the MCP server should proactively start watching `root`, the
+/// project it was launched in, on boot (daemon mode only), rather than only
+/// ever starting a watcher reactively after some write happens to touch it.
+/// The `watch` group's `auto_start_on_boot`: CLI, env
+/// (`INFIGRAPH_WATCH_AUTO_START_ON_BOOT`), `[watch] auto_start_on_boot` in
+/// `root`'s config over the user's, then on.
 ///
-/// Deliberately does NOT go through `watch::Watch::resolve()`'s own
-/// hardcoded default: that would skip the `config.toml` layer entirely
-/// (`resolve()` only knows CLI > env > compile-time default, with no room
-/// for an externally-loaded fallback in between). Reads the CLI/env layer
-/// directly instead, falling through to `load_config_file()` by hand.
-pub fn auto_start_watch_on_boot_enabled() -> bool {
+/// This used to replay that precedence by hand against a cwd-discovered
+/// config file, because `resolve()` could not read TOML (#160).
+pub fn auto_start_watch_on_boot_enabled(root: &std::path::Path) -> bool {
     let cli = infigraph_core::watch::RawWatch::parse_from(std::iter::empty::<String>());
-    if let Some(v) = cli
-        .watch_auto_start
-        .or_else(|| infigraph_core::settings::env_override("watch", "auto_start"))
-    {
-        return v.0;
-    }
-    load_config_file().watch.auto_start_on_boot
+    let scope = infigraph_core::settings_file::ConfigScope::Project(root);
+    infigraph_core::watch::Watch::resolve(cli, scope)
+        .auto_start_on_boot
+        .0
 }
 
 fn parse_level_override() -> Option<CompressionLevel> {
@@ -929,10 +889,6 @@ mod tests {
             Some("kompress"),
             "a project config that says nothing about compression must not \
              erase the user's setting"
-        );
-        assert!(
-            !loaded.watch.auto_start_on_boot || true,
-            "sanity: the project's own section still parses"
         );
     }
 

@@ -58,7 +58,7 @@ pub fn collect_reindex_targets(
 /// in, rather than only ever starting a watcher reactively after some write
 /// happens to touch it. Only takes effect when both daemon mode
 /// (`INFIGRAPH_BACKEND=daemon`) and the `[watch].auto_start_on_boot`
-/// config toggle (env override: `INFIGRAPH_WATCH_AUTO_START`) are on. Runs
+/// config toggle (env override: `INFIGRAPH_WATCH_AUTO_START_ON_BOOT`) are on. Runs
 /// a true-up reindex first (see the "True-up" comment inline below) so the
 /// watcher starts from a caught-up baseline instead of only ever reacting
 /// to changes from this point forward.
@@ -121,7 +121,7 @@ pub fn start_daemon_watcher_for_startup_dir(startup_dir: Option<&Path>) {
         installed.as_deref(),
     );
 
-    if !crate::session_context::auto_start_watch_on_boot_enabled() {
+    if !crate::session_context::auto_start_watch_on_boot_enabled(dir) {
         return;
     }
 
