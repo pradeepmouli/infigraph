@@ -64,8 +64,13 @@ jobs:
           key: ci-${{ matrix.os }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-on-failure: true
+      # --keep-going: the lint pass stops at the first target that fails,
+      # the same one-defect-per-cycle trap `--no-fail-fast` fixes for Test
+      # below. On Windows, the only place this job's lint is not also
+      # checked locally, three consecutive runs each surfaced one new
+      # unix-only-code warning that the previous failure had hidden.
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets --keep-going -- -D warnings
       # Windows runs Clippy but not the tests: lbug's build script emits
       # `cargo:rustc-link-lib=ssl`/`=crypto`, so every test binary needs
       # OpenSSL to link, and windows-latest puts no libssl.lib on MSVC's
