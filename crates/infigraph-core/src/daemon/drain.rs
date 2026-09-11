@@ -346,30 +346,22 @@ mod tests {
         );
     }
 
-    /// Drives a `FullReindex` request directly (no real daemon process)
-    /// against a real temp-dir project: seeds a graph, submits FullReindex,
-    /// confirms the old content is genuinely gone and the graph is rebuilt,
-    /// and confirms the old graph directory was quarantined (renamed aside),
-    /// not deleted.
-    #[test]
-    fn full_reindex_rebuilds_the_graph_and_quarantines_the_old_one() {
-        use crate::graph::GraphBackend;
-
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path();
+    /// Index `old.py`, replace it with `new.py` -- the "the codebase moved on"
+    /// case a full reindex exists for -- and drive a full reindex through the
+    /// coordinator's path. `before_reindex` runs on the project root just
+    /// before the request is submitted.
+    fn full_reindex_after_old_py_moves_to_new_py(
+        root: &std::path::Path,
+        before_reindex: impl FnOnce(&std::path::Path),
+    ) -> crate::daemon_protocol::WriteResult {
         fs::write(root.join("old.py"), "def old_symbol():\n    pass\n").unwrap();
-
         let prism = open_project(root);
         prism.index().unwrap();
+        assert!(root.join(".infigraph").join("graph").exists());
 
-        let old_graph_path = root.join(".infigraph").join("graph");
-        assert!(old_graph_path.exists());
-
-        // Simulate what changed between the bootstrap index and the full
-        // reindex request: old.py is replaced by new.py, matching a real
-        // "the codebase moved on" scenario a full reindex is meant to catch.
         fs::remove_file(root.join("old.py")).unwrap();
         fs::write(root.join("new.py"), "def new_symbol():\n    pass\n").unwrap();
+        before_reindex(root);
 
         let queue = std::sync::Arc::new(std::sync::Mutex::new(
             crate::daemon::queue::IndexWorkQueue::new(),
@@ -387,8 +379,71 @@ mod tests {
         drive_full_reindex_sync(root, &request_path, &queue, &make_registry, &mut held);
 
         let reply_path = request_path.with_extension("result");
-        let reply: crate::daemon_protocol::WriteResult =
-            serde_json::from_str(&fs::read_to_string(&reply_path).unwrap()).unwrap();
+        serde_json::from_str(&fs::read_to_string(&reply_path).unwrap()).unwrap()
+    }
+
+    /// Names in `.infigraph/` set aside into the retirement or corruption pool.
+    fn set_aside_names(root: &std::path::Path) -> Vec<String> {
+        fs::read_dir(root.join(".infigraph"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("graph.previous.") || n.starts_with("graph.corrupt."))
+            .collect()
+    }
+
+    /// #175: a superseded graph that was past its growth guard is kept aside
+    /// only until the swap is verified, then discarded -- as a restore point it
+    /// is the bloat the rebuild removed, at full size.
+    #[test]
+    fn full_reindex_discards_a_superseded_graph_that_was_past_its_growth_guard() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let reply = full_reindex_after_old_py_moves_to_new_py(root, |root| {
+            // The sittir shape: a live graph far past a realistic baseline,
+            // while the rebuild itself lands well under it. The extension is
+            // sparse, so no page the store reads is rewritten.
+            let tg = root.join(".infigraph");
+            fs::write(
+                tg.join("graph.health.json"),
+                r#"{"healthy_size_bytes": 1048576}"#,
+            )
+            .unwrap();
+            fs::OpenOptions::new()
+                .write(true)
+                .open(tg.join("graph"))
+                .unwrap()
+                .set_len(64 * 1024 * 1024)
+                .unwrap();
+        });
+
+        assert!(
+            matches!(
+                reply,
+                crate::daemon_protocol::WriteResult::FullReindexOk { .. }
+            ),
+            "expected FullReindexOk, got {reply:?}"
+        );
+        assert_eq!(
+            set_aside_names(root),
+            Vec::<String>::new(),
+            "the bloated superseded graph must not be retained"
+        );
+    }
+
+    /// Drives a `FullReindex` request directly (no real daemon process)
+    /// against a real temp-dir project: seeds a graph, submits FullReindex,
+    /// confirms the old content is genuinely gone and the graph is rebuilt,
+    /// and confirms the old graph directory was quarantined (renamed aside),
+    /// not deleted.
+    #[test]
+    fn full_reindex_rebuilds_the_graph_and_quarantines_the_old_one() {
+        use crate::graph::GraphBackend;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let old_graph_path = root.join(".infigraph").join("graph");
+        let reply = full_reindex_after_old_py_moves_to_new_py(root, |_| {});
         match reply {
             crate::daemon_protocol::WriteResult::FullReindexOk { indexed_files, .. } => {
                 assert_eq!(
@@ -413,12 +468,7 @@ mod tests {
             "rebuilt graph must not contain the old symbol"
         );
 
-        let aside: Vec<String> = fs::read_dir(root.join(".infigraph"))
-            .unwrap()
-            .flatten()
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|n| n.starts_with("graph.previous.") || n.starts_with("graph.corrupt."))
-            .collect();
+        let aside = set_aside_names(root);
         // Count only BASE pool entries ("graph.previous.<ts>", all digits
         // after the infix): the retire also relocates WAL-family siblings
         // sharing the stem ("graph.previous.<ts>.wal"), which are part of

@@ -61,6 +61,11 @@ const PATHOLOGICAL_WAL_FLOOR_BYTES: u64 = 64 * 1024 * 1024;
 /// rather than the live WAL's uncheckpointed tail.
 pub(crate) const WAL_OMITTED_NOTE: &str = "graph.wal.omitted.json";
 
+/// Written into a snapshot in place of a live graph (and its WAL) that was
+/// past its growth guard (#175), so `restore` users can see the snapshot holds
+/// the sidecars but no graph.
+pub(crate) const GRAPH_OMITTED_NOTE: &str = "graph.omitted.json";
+
 /// The runaway-WAL pattern (#100, #130, #132): a healthy WAL is bounded by
 /// lbug's auto-checkpoint threshold, so one that has outgrown the
 /// checkpointed graph itself is not data worth preserving twice -- it is
@@ -79,6 +84,9 @@ pub(crate) struct SnapshotPlan {
     pub(crate) projected_bytes: u64,
     /// `Some((graph_bytes, wal_bytes))` when the WAL family was left out.
     pub(crate) omitted_wal: Option<(u64, u64)>,
+    /// `Some((graph_bytes, wal_bytes, refusal))` when the whole graph family
+    /// was left out because the graph was past its growth guard.
+    pub(crate) omitted_graph: Option<(u64, u64, String)>,
 }
 
 pub(crate) fn plan_snapshot(infigraph_dir: &Path, wal_floor: u64) -> Result<SnapshotPlan> {
@@ -86,10 +94,21 @@ pub(crate) fn plan_snapshot(infigraph_dir: &Path, wal_floor: u64) -> Result<Snap
         entries: Vec::new(),
         projected_bytes: 0,
         omitted_wal: None,
+        omitted_graph: None,
     };
     if !infigraph_dir.exists() {
         return Ok(plan);
     }
+    // #175: a graph past its growth guard -- the same check that refuses
+    // every write to it -- is exactly what the rebuild this snapshot precedes
+    // replaces. It is derived from source, a restore would only bring the
+    // bloat back, and copying it wrote 2.9 GB for a 68 MB project. The
+    // sidecars are still copied.
+    let graph_refusal = crate::graph::store_util::check_graph_growth_ratio(
+        infigraph_dir,
+        &infigraph_dir.join(LIVE_GRAPH_NAME),
+    )
+    .err();
     let wal_prefix = format!("{LIVE_GRAPH_NAME}.wal");
     let mut wal_entries: Vec<(PathBuf, std::ffi::OsString, u64)> = Vec::new();
     let mut graph_bytes = 0u64;
@@ -110,12 +129,18 @@ pub(crate) fn plan_snapshot(infigraph_dir: &Path, wal_floor: u64) -> Result<Snap
         }
         if name_str == LIVE_GRAPH_NAME {
             graph_bytes = bytes;
+            if graph_refusal.is_some() {
+                continue;
+            }
         }
         plan.projected_bytes += bytes;
         plan.entries.push((path, name));
     }
     let wal_bytes: u64 = wal_entries.iter().map(|(_, _, b)| *b).sum();
-    if wal_is_pathological(graph_bytes, wal_bytes, wal_floor) {
+    if let Some(refusal) = graph_refusal {
+        // The WAL goes with its graph: without the base image it restores nothing.
+        plan.omitted_graph = Some((graph_bytes, wal_bytes, refusal));
+    } else if wal_is_pathological(graph_bytes, wal_bytes, wal_floor) {
         plan.omitted_wal = Some((graph_bytes, wal_bytes));
     } else {
         for (path, name, bytes) in wal_entries {
@@ -191,20 +216,38 @@ fn create_snapshot_with_wal_floor(infigraph_dir: &Path, wal_floor: u64) -> Resul
             wal_bytes / (1024 * 1024),
             graph_bytes / (1024 * 1024)
         );
-        eprintln!("warn: snapshot {}: {reason}", dest.display());
-        let note = serde_json::json!({
-            "graph_bytes": graph_bytes,
-            "wal_bytes": wal_bytes,
-            "reason": reason,
-        });
-        std::fs::write(
-            dest.join(WAL_OMITTED_NOTE),
-            serde_json::to_string_pretty(&note)?,
-        )
-        .with_context(|| format!("snapshot: write {}", dest.join(WAL_OMITTED_NOTE).display()))?;
+        write_omission_note(&dest, WAL_OMITTED_NOTE, graph_bytes, wal_bytes, &reason)?;
+    }
+    if let Some((graph_bytes, wal_bytes, refusal)) = &plan.omitted_graph {
+        let reason = format!(
+            "the graph ({} MB) was past its growth guard, so it is what the rebuild replaces \
+             and was not copied (github.com/pradeepmouli/infigraph#175); this snapshot holds \
+             the sidecars but no graph -- after restoring it, run `infigraph rebuild`. \
+             Guard: {refusal}",
+            graph_bytes / (1024 * 1024)
+        );
+        write_omission_note(&dest, GRAPH_OMITTED_NOTE, *graph_bytes, *wal_bytes, &reason)?;
     }
 
     Ok(dest)
+}
+
+/// Record in a snapshot why part of the live state was left out, and say so.
+fn write_omission_note(
+    dest: &Path,
+    note: &str,
+    graph_bytes: u64,
+    wal_bytes: u64,
+    reason: &str,
+) -> Result<()> {
+    eprintln!("warn: snapshot {}: {reason}", dest.display());
+    let body = serde_json::json!({
+        "graph_bytes": graph_bytes,
+        "wal_bytes": wal_bytes,
+        "reason": reason,
+    });
+    std::fs::write(dest.join(note), serde_json::to_string_pretty(&body)?)
+        .with_context(|| format!("snapshot: write {}", dest.join(note).display()))
 }
 
 fn copy_entry_recursive(src: &Path, dest: &Path) -> Result<()> {
@@ -406,6 +449,14 @@ fn restore_from_snapshot(infigraph_dir: &Path, timestamp: u64) -> Result<()> {
     }
     std::fs::rename(&src, &staging)
         .with_context(|| format!("restore: stage {} to {}", src.display(), staging.display()))?;
+
+    if staging.join(GRAPH_OMITTED_NOTE).exists() {
+        eprintln!(
+            "warn: snapshot {timestamp} holds no graph -- it was past its growth guard when the \
+             snapshot was taken (see {GRAPH_OMITTED_NOTE}); run `infigraph rebuild` after this \
+             restore"
+        );
+    }
 
     // Safety net: snapshot the current live state before overwriting it, so
     // restoring the wrong point is itself just another restore away. Safe
@@ -616,6 +667,35 @@ mod tests {
             "ckpt"
         );
         assert!(!dest.join(WAL_OMITTED_NOTE).exists());
+    }
+
+    /// #175: a graph past its growth guard is what the rebuild this snapshot
+    /// precedes replaces, so the snapshot keeps the sidecars, leaves the graph
+    /// and its WAL out, and records why.
+    #[test]
+    fn snapshot_omits_a_graph_past_its_growth_guard_and_records_why() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tg = tmp.path().join(".infigraph");
+        write(&tg.join("graph"), "g");
+        crate::graph::stamp_healthy_graph_size(&tg, &tg.join("graph"));
+        write(&tg.join("graph"), &"g".repeat(4096)); // 4096x its 1-byte baseline
+        write(&tg.join("graph.wal"), "wal");
+        write(&tg.join("embeddings.bin"), "embed");
+
+        let dest = create_snapshot_with_wal_floor(&tg, 0).unwrap();
+
+        assert!(dest.join("embeddings.bin").exists());
+        assert!(
+            !dest.join("graph").exists(),
+            "the bloated graph is not copied"
+        );
+        assert!(!dest.join("graph.wal").exists(), "nor its WAL");
+        assert!(!dest.join(WAL_OMITTED_NOTE).exists());
+        let note: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dest.join(GRAPH_OMITTED_NOTE)).unwrap())
+                .unwrap();
+        assert_eq!(note["graph_bytes"], 4096);
+        assert!(note["reason"].as_str().unwrap().contains("#175"));
     }
 
     #[test]

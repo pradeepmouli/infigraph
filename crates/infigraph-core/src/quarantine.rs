@@ -475,33 +475,33 @@ fn evict_oldest_if_at_bound(
     // enough of the oldest entries to land at retention - 1 before the new
     // one is created (bringing the total back to retention).
     let to_evict = existing.len() - (retention - 1);
-    for (ts, path) in existing.into_iter().take(to_evict) {
-        // The quarantine target is typically a plain FILE (Kuzu's on-disk
-        // graph is a single file, not a directory -- see `wipe_graph`), so
-        // `remove_dir_all` alone silently no-ops here (it errors on a
-        // non-directory path and that error was being swallowed): dispatch
-        // on the actual entry type instead of assuming a directory.
-        let is_dir = std::fs::metadata(&path)
-            .map(|m| m.is_dir())
-            .unwrap_or(false);
-        if is_dir {
-            let _ = std::fs::remove_dir_all(&path);
-        } else {
-            let _ = std::fs::remove_file(&path);
-        }
-        // Also evict any WAL-family siblings quarantined alongside this
-        // entry (e.g. "<name>.corrupt.<ts>.wal", "...wal.checkpoint") so
-        // the pool doesn't leak unbounded copies of those either.
-        let sibling_prefix = format!("{graph_name}.{infix}.{ts}.");
-        if let Ok(entries) = std::fs::read_dir(infigraph_dir) {
-            for e in entries.flatten() {
-                if e.file_name().to_string_lossy().starts_with(&sibling_prefix) {
-                    let _ = std::fs::remove_file(e.path());
-                }
+    for (_, path) in existing.into_iter().take(to_evict) {
+        discard_set_aside(&path);
+    }
+    Ok(())
+}
+
+/// Delete an entry `move_graph_aside` set aside, together with the
+/// WAL-family siblings moved alongside it (`<entry>.wal`,
+/// `<entry>.wal.checkpoint`, ...), so neither pool eviction nor a discard
+/// leaks copies of those.
+///
+/// The entry is typically a plain FILE (lbug's graph is a single file), so
+/// this dispatches on its type -- `remove_dir_all` alone errors on a file,
+/// and that error used to be swallowed, evicting nothing.
+pub(crate) fn discard_set_aside(entry: &Path) {
+    remove_entry(entry);
+    let (Some(dir), Some(name)) = (entry.parent(), entry.file_name()) else {
+        return;
+    };
+    let sibling_prefix = format!("{}.", name.to_string_lossy());
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for e in entries.flatten() {
+            if e.file_name().to_string_lossy().starts_with(&sibling_prefix) {
+                let _ = std::fs::remove_file(e.path());
             }
         }
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -649,6 +649,34 @@ mod tests {
         // "graph.corrupt.100" must not be blocked by "graph.corrupt.1000".
         std::fs::write(dir.path().join("graph.corrupt.1000"), b"other entry").unwrap();
         assert_eq!(next_free_aside_ts(dir.path(), "graph", "corrupt", 100), 100);
+    }
+
+    #[test]
+    fn discarding_a_set_aside_graph_takes_its_wal_family_and_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in [
+            "graph",
+            "graph.previous.100",
+            "graph.previous.100.wal",
+            "graph.previous.100.wal.checkpoint",
+            "graph.previous.1000",
+        ] {
+            std::fs::write(dir.path().join(name), b"x").unwrap();
+        }
+
+        discard_set_aside(&dir.path().join("graph.previous.100"));
+
+        let mut left: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            vec!["graph", "graph.previous.1000"],
+            "neither the live graph nor a longer timestamp sharing the prefix"
+        );
     }
 
     #[test]

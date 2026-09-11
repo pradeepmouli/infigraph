@@ -2341,6 +2341,12 @@ fn finish_full_reindex(
     // exists (it's now this destination), so an error message that names
     // `live_path` would point an operator at a path that's already gone and
     // never say where the real data actually went.
+    // #175: judged now, against the baseline this rebuild replaces. A graph
+    // past its growth guard is kept aside only for rollback, and discarded
+    // once the swap is verified below -- as a restore point it is the bloat
+    // the rebuild exists to remove, at its full size.
+    let retired_refusal =
+        crate::graph::store_util::check_graph_growth_ratio(&infigraph_dir, &live_path).err();
     let retired_path: Option<PathBuf> = if live_path.exists() {
         // Two backup mechanisms, deliberately layered. create_snapshot gives
         // a whole-`.infigraph/`-tree safety net matching the local
@@ -2499,6 +2505,14 @@ fn finish_full_reindex(
             // baseline. Ordinary incremental writes deliberately do not
             // (see `stamp_healthy_graph_size`'s doc comment).
             crate::graph::stamp_healthy_graph_size(&infigraph_dir, &live_path);
+            if let (Some(refusal), Some(retired)) = (&retired_refusal, &retired_path) {
+                eprintln!(
+                    "[daemon] full-reindex: discarding the retired graph {} -- it was past its \
+                     growth guard, so it is no restore point worth its disk (#175): {refusal}",
+                    retired.display()
+                );
+                crate::quarantine::discard_set_aside(retired);
+            }
 
             // Reconcile embeddings against the NEW graph -- update_embeddings
             // queries the live symbol set and prunes anything not in it, so
