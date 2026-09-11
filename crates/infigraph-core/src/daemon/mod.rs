@@ -1350,8 +1350,11 @@ where
         // a checkpoint takes the exclusive window, so probing every 200ms
         // would be pure contention. `checkpoint_if_idle` re-checks the WAL's
         // mtime itself, so a busy graph is skipped rather than serialized.
-        if last_idle_checkpoint.elapsed() >= IDLE_CHECKPOINT_PROBE && fold_backoff.should_attempt()
-        {
+        if idle_fold_probe_due(
+            last_idle_checkpoint.elapsed(),
+            &fold_backoff,
+            scip_import_in_flight.is_some(),
+        ) {
             last_idle_checkpoint = std::time::Instant::now();
             let idle_after = Duration::from_secs(crate::graph::store::checkpoint_idle_secs(
                 crate::settings_file::ConfigScope::Project(root),
@@ -1687,6 +1690,19 @@ struct IdleFoldAction {
     log: Option<String>,
     /// The held graph must be reopened: its handle may not fold again.
     reopen: bool,
+}
+
+/// Whether the coordinator should probe for an idle fold now: its interval
+/// has passed, the fold backoff (#166) allows an attempt, and no SCIP import
+/// is writing (#178). An import commits statement by statement for minutes,
+/// and a fold squeezed between two of them folds a half-written import --
+/// and adds its own checkpoint to the import's post-commit ones (#179).
+fn idle_fold_probe_due(
+    since_last_probe: Duration,
+    backoff: &ReopenBackoff,
+    scip_import_running: bool,
+) -> bool {
+    since_last_probe >= IDLE_CHECKPOINT_PROBE && backoff.should_attempt() && !scip_import_running
 }
 
 /// Book-keeping for one idle-fold probe (#166).
@@ -3022,7 +3038,23 @@ mod tests {
     }
 
     mod idle_fold {
-        use super::super::{settle_idle_fold, ReopenBackoff};
+        use super::super::{
+            idle_fold_probe_due, settle_idle_fold, ReopenBackoff, IDLE_CHECKPOINT_PROBE,
+        };
+
+        /// #178: the idle fold waits while a SCIP import is writing, and
+        /// otherwise keeps its interval.
+        #[test]
+        fn the_idle_fold_waits_out_a_running_scip_import() {
+            let backoff = ReopenBackoff::new();
+            assert!(idle_fold_probe_due(IDLE_CHECKPOINT_PROBE, &backoff, false));
+            assert!(!idle_fold_probe_due(IDLE_CHECKPOINT_PROBE, &backoff, true));
+            assert!(!idle_fold_probe_due(
+                IDLE_CHECKPOINT_PROBE / 2,
+                &backoff,
+                false
+            ));
+        }
         use crate::graph::store::{FoldError, IdleFold};
 
         fn failed(why: &str) -> Option<IdleFold> {

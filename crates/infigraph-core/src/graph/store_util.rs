@@ -318,11 +318,17 @@ pub(crate) fn estimate_extractions_write_bytes(
 
 /// Escape single quotes and control characters for Kuzu string literals.
 pub(crate) fn escape(s: &str) -> String {
-    s.replace('\\', "\\\\")
+    literal_round_trip(s)
+        .replace('\\', "\\\\")
         .replace('\'', "\\'")
-        .replace('\n', " ")
-        .replace('\r', "")
-        .replace('\t', " ")
+}
+
+/// What a string [`escape`]d into a literal reads back as: the parser undoes
+/// the backslash and quote escapes, not the whitespace folding. Compare this,
+/// not the original, when asking whether a write would change a stored value
+/// (#178) -- a multi-line docstring never equals its stored form.
+pub(crate) fn literal_round_trip(s: &str) -> String {
+    s.replace('\n', " ").replace('\r', "").replace('\t', " ")
 }
 
 /// Convert a path to forward-slash form (needed on Windows for Kuzu COPY FROM).

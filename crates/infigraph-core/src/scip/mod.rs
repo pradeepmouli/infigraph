@@ -11,7 +11,7 @@ use scip::types::{symbol_information, Index, SymbolRole};
 use crate::graph::parquet_loader;
 use crate::graph::store_util::{
     copy_edges_with_bad_record_retry, escape, extract_bad_copy_value, fwd_slash_path,
-    staging_parquet,
+    literal_round_trip, staging_parquet,
 };
 use crate::graph::GraphStore;
 use crate::model::{Span, SymbolKind};
@@ -80,6 +80,30 @@ fn preload_symbol_edges(conn: &kuzu::Connection<'_>, table: &str) -> Result<Symb
 
 fn edge_exists(edges: &SymbolEdges, (src, dst): &(String, String)) -> bool {
     edges.get(src).is_some_and(|targets| targets.contains(dst))
+}
+
+/// A string property exactly as stored -- `Value`'s `Display` escapes and
+/// quotes, so it would never compare equal to the value about to be written.
+/// NULL reads as "", the import's own default for an absent docstring.
+fn raw_string(value: &kuzu::Value) -> &str {
+    match value {
+        kuzu::Value::String(s) => s,
+        _ => "",
+    }
+}
+
+/// A symbol's enrichment as one comparable value (#178): a re-import skips
+/// the `SET` for a symbol whose docstring and scip_id already match, so an
+/// unchanged index stops rewriting every enriched row each round. A hash
+/// rather than the strings keeps the preload from holding every docstring
+/// in memory; both sides are hashed in this process, so `DefaultHasher`'s
+/// per-build keys are consistent.
+fn enrichment_hash(docstring: &str, scip_id: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    // The stored form: the enrichment SET writes through `escape`.
+    (literal_round_trip(docstring), literal_round_trip(scip_id)).hash(&mut hasher);
+    hasher.finish()
 }
 
 /// True when `scip_sym` is a member (e.g. a parameter) of a symbol we
@@ -195,7 +219,8 @@ pub fn import_scip_index_enriched_at(
     // contention with the daemon's own concurrent watcher writes), and
     // `if let Ok(rows) = ...` was treating that failure identically to "this
     // is a brand-new project with no symbols yet".
-    let q = "MATCH (s:Symbol) RETURN s.id, s.file, s.name, s.start_line, s.end_line";
+    let q = "MATCH (s:Symbol) RETURN s.id, s.file, s.name, s.start_line, s.end_line, \
+             s.docstring, s.scip_id";
     let rows = {
         let _phase = crate::write_phase::enter(&"scip-import: preload symbols", 0);
         conn.query(q)
@@ -205,12 +230,18 @@ pub fn import_scip_index_enriched_at(
     // import is reading anyway -- see `drop_ids_already_in_graph` (#153).
     let mut existing_symbol_ids: std::collections::HashSet<String> =
         std::collections::HashSet::new();
+    // What each symbol is already enriched with -- see `enrichment_hash`.
+    let mut existing_enrichment: HashMap<String, u64> = HashMap::new();
     for row in rows {
-        if row.len() < 5 {
+        if row.len() < 7 {
             continue;
         }
         let sid = row[0].to_string().trim_matches('"').to_string();
         existing_symbol_ids.insert(sid.clone());
+        existing_enrichment.insert(
+            sid.clone(),
+            enrichment_hash(raw_string(&row[5]), raw_string(&row[6])),
+        );
         let sfile = row[1].to_string().trim_matches('"').to_string();
         let sname = row[2].to_string().trim_matches('"').to_string();
         let sstart: u32 = row[3].to_string().trim_matches('"').parse().unwrap_or(0);
@@ -380,9 +411,11 @@ pub fn import_scip_index_enriched_at(
                 });
 
             if let Some(sid) = matched {
-                enrichments.push((sid.clone(), docstring.to_string(), scip_sym.clone()));
+                if existing_enrichment.get(&sid) != Some(&enrichment_hash(docstring, scip_sym)) {
+                    enrichments.push((sid.clone(), docstring.to_string(), scip_sym.clone()));
+                    stats.symbols_enriched += 1;
+                }
                 scip_sym_to_ts_id.insert(scip_sym.clone(), sid);
-                stats.symbols_enriched += 1;
             } else {
                 let kind = si
                     .map(|s| scip_kind_to_prism(&s.kind.enum_value_or_default()))
@@ -1401,6 +1434,71 @@ mod tests {
         assert!(rows.into_iter().next().is_none());
     }
 
+    /// An index holding one definition of `widen` in `test.ts`, on 0-based
+    /// line 9 (inside a tree-sitter span starting at line 10), documented as
+    /// `documentation`.
+    fn widen_index(documentation: &str) -> Vec<u8> {
+        let sym = scip_symbol("widen", "test.ts");
+        let doc = Document {
+            relative_path: "test.ts".to_string(),
+            occurrences: vec![Occurrence {
+                range: vec![9, 9, 9, 14],
+                symbol: sym.clone(),
+                symbol_roles: SymbolRole::Definition as i32,
+                ..Default::default()
+            }],
+            symbols: vec![SymbolInformation {
+                symbol: sym,
+                documentation: vec![documentation.to_string()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        Index {
+            documents: vec![doc],
+            ..Default::default()
+        }
+        .write_to_bytes()
+        .unwrap()
+    }
+
+    /// #178: a re-import of an unchanged index rewrote every enriched symbol
+    /// each round. It must skip one whose docstring and scip_id already match
+    /// -- including a docstring with the quotes and newlines lbug's value
+    /// formatting could otherwise make look different.
+    #[test]
+    fn reimporting_an_unchanged_index_rewrites_no_enrichment() {
+        let env = TestEnv::new();
+        env.add_file("test.ts");
+        env.store
+            .connection()
+            .unwrap()
+            .query(
+                "CREATE (:Symbol {id: 'test.ts::widen', name: 'widen', kind: 'function', \
+                 file: 'test.ts', start_line: 10, end_line: 50, signature_hash: '', \
+                 language: 'typescript', visibility: 'public', parent: '', docstring: '', \
+                 complexity: 0, parameters: '', return_type: ''})",
+            )
+            .unwrap();
+        let index_path = env._dir.path().join("index.scip");
+        std::fs::write(&index_path, widen_index("Widens a \"quoted\"\nvalue.")).unwrap();
+
+        let first = import_scip_index(&index_path, &env.store, None).unwrap();
+        assert_eq!(first.symbols_enriched, 1);
+        let second = import_scip_index(&index_path, &env.store, None).unwrap();
+        assert_eq!(
+            second.symbols_enriched, 0,
+            "nothing changed, so nothing is rewritten"
+        );
+
+        std::fs::write(&index_path, widen_index("Widens a value, differently.")).unwrap();
+        let third = import_scip_index(&index_path, &env.store, None).unwrap();
+        assert_eq!(
+            third.symbols_enriched, 1,
+            "a changed docstring is still written"
+        );
+    }
+
     #[test]
     fn enrichment_does_not_overwrite_existing_symbol_span() {
         let env = TestEnv::new();
@@ -1419,29 +1517,8 @@ mod tests {
 
         // SCIP's definition occurrence for the same symbol only spans the
         // identifier token itself (a single line) -- never the full body.
-        let sym = scip_symbol("widen", "test.ts");
-        let doc = Document {
-            relative_path: "test.ts".to_string(),
-            occurrences: vec![Occurrence {
-                range: vec![9, 9, 9, 14], // 0-based line 9 == 1-based line 10
-                symbol: sym.clone(),
-                symbol_roles: SymbolRole::Definition as i32,
-                ..Default::default()
-            }],
-            symbols: vec![SymbolInformation {
-                symbol: sym,
-                documentation: vec!["Widens a value.".to_string()],
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
-        let index = Index {
-            documents: vec![doc],
-            ..Default::default()
-        };
-        let bytes = index.write_to_bytes().unwrap();
         let index_path = env._dir.path().join("index.scip");
-        std::fs::write(&index_path, bytes).unwrap();
+        std::fs::write(&index_path, widen_index("Widens a value.")).unwrap();
 
         let stats = import_scip_index(&index_path, &env.store, None).unwrap();
         assert_eq!(stats.symbols_enriched, 1, "enrichment path must have run");
