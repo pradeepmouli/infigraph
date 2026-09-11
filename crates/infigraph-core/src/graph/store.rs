@@ -1526,6 +1526,44 @@ mod tests {
             .sum();
         assert_eq!(before, after, "a WAL written just now must not be folded");
     }
+
+    /// Pins ladybug#924, fixed in lbug 0.20.3 (#166). Every `CHECKPOINT`
+    /// orphaned its shadow-file handle, and the frame groups each handle
+    /// allocates were never reclaimed, so a long-lived writer that folds
+    /// often -- the daemon's idle fold runs after every quiet write -- leaked
+    /// until the buffer manager refused. Issuing `CHECKPOINT` on a handle in
+    /// that state then crashed mid-fold and left the file unopenable. Sittir
+    /// logged ~1,600 failing folds with "the buffer pool is full" before its
+    /// WAL was found corrupt.
+    ///
+    /// The shape is upstream's own test: 50 write + `CHECKPOINT` cycles under
+    /// a 64 MiB `max_db_size`, which 0.20.2 exhausts on the 7th fold. It runs
+    /// against the raw `Database` so it pins the dependency, not our wrapper:
+    /// an lbug bump that regresses this fails here, not on a user's daemon.
+    #[test]
+    fn repeated_checkpoints_do_not_exhaust_the_database_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::new(
+            dir.path().join("graph"),
+            SystemConfig::default()
+                .buffer_pool_size(32 * 1024 * 1024)
+                .max_db_size(64 * 1024 * 1024),
+        )
+        .unwrap();
+        let conn = Connection::new(&db).unwrap();
+        conn.query("CREATE NODE TABLE Node(id STRING, payload STRING, PRIMARY KEY(id))")
+            .unwrap();
+        let payload = "x".repeat(200);
+        for cycle in 0..50 {
+            conn.query(&format!(
+                "MERGE (n:Node {{id: 'node-{}'}}) SET n.payload = '{payload}'",
+                cycle % 5
+            ))
+            .unwrap_or_else(|e| panic!("write {cycle} failed: {e}"));
+            conn.query("CHECKPOINT")
+                .unwrap_or_else(|e| panic!("checkpoint {cycle} failed: {e}"));
+        }
+    }
     use super::*;
 
     fn write_holder_lock(lock_path: &Path, pid: u32) {
