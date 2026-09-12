@@ -147,6 +147,20 @@ fn read_healthy_size(infigraph_dir: &Path) -> Option<u64> {
     v.get("healthy_size_bytes")?.as_u64()
 }
 
+/// Whether a growth baseline has been recorded for this project at all
+/// (#180 ask 5).
+///
+/// [`check_graph_growth_ratio`] collapses "within the cap" and "nothing to
+/// compare against" into the same `Ok(())`. That is right for a *write path* --
+/// both mean proceed -- and wrong for a *reporter*: `doctor` was mapping that
+/// `Ok` onto a PASS reading "graph is within the growth cap", which asserts the
+/// result of a comparison that never happened. This predicate lets a reporter
+/// tell the two apart without giving all eight write-path call sites a richer
+/// return type they would only have to ignore.
+pub(crate) fn healthy_baseline_recorded(infigraph_dir: &Path) -> bool {
+    read_healthy_size(infigraph_dir).is_some()
+}
+
 /// Refreshes the recorded "last known healthy size" baseline. Call this
 /// only after a *verified* healthy checkpoint -- a completed full rebuild
 /// (build-fresh-then-swap succeeded and the swapped-in graph reopened), not
@@ -307,8 +321,8 @@ pub(crate) fn check_graph_growth_ratio(
              .infigraph/config.toml); this guards against the runaway-WAL-growth pattern \
              from github.com/pradeepmouli/infigraph#100. ALL indexing is blocked until this is \
              resolved -- run `infigraph rebuild`, which rebuilds the graph compactly and \
-             re-stamps the baseline, or, if this growth is legitimate, delete {} to reset the \
-             baseline without rebuilding",
+             re-stamps the baseline, or, if this growth is legitimate, \
+             `infigraph restamp-baseline` to accept the current size as the new baseline",
             graph_path.display(),
             current / (1024 * 1024),
             graph_size / (1024 * 1024),
@@ -316,7 +330,6 @@ pub(crate) fn check_graph_growth_ratio(
             current / healthy.max(1),
             healthy / (1024 * 1024),
             ratio,
-            graph_health_path(infigraph_dir).display(),
         ));
     }
     Ok(())
@@ -1041,6 +1054,33 @@ mod tests {
         assert!(
             err.contains("infigraph rebuild"),
             "the refusal must name the remedy that actually recovers the graph: {err}"
+        );
+    }
+
+    /// #180 ask 5: the refusal used to offer "delete graph.health.json to reset
+    /// the baseline without rebuilding". Following that advice does not reset the
+    /// guard, it defeats it -- the next write finds no baseline and passes, then
+    /// `stamp_healthy_graph_size_if_unset` anchors a *new* baseline to the
+    /// already-bloated size, so the cap silently becomes 10x the bloat. The
+    /// visible `restamp-baseline` command (d06679f) makes accepting the current
+    /// size an explicit act instead of a side effect of `rm`.
+    #[test]
+    fn growth_refusal_offers_an_explicit_restamp_not_a_file_deletion() {
+        let tmp = tempfile::tempdir().unwrap();
+        let graph_path = tmp.path().join("graph");
+        std::fs::write(&graph_path, vec![0u8; 1_000_000]).unwrap();
+        stamp_healthy_graph_size(tmp.path(), &graph_path);
+
+        std::fs::write(&graph_path, vec![0u8; 20_000_000]).unwrap();
+        let err = check_graph_growth_ratio(tmp.path(), &graph_path).expect_err("must refuse");
+        assert!(
+            err.contains("restamp-baseline"),
+            "the refusal must name the explicit restamp command: {err}"
+        );
+        assert!(
+            !err.contains("delete"),
+            "it must not advise deleting the baseline, which re-anchors the guard \
+             to the bloated size rather than resetting it: {err}"
         );
     }
 

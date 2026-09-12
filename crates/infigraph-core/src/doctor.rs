@@ -514,6 +514,23 @@ pub fn check_one_growth_breaker(project_path: &Path) -> Option<CheckResult> {
     }
     let label = format!("{}: graph growth breaker", project_path.display());
     match crate::graph::store_util::check_graph_growth_ratio(&infigraph_dir, &graph_path) {
+        // #180 ask 5: `Ok` means "proceed", and for a write path that correctly
+        // covers both "within the cap" and "no baseline exists, so nothing was
+        // compared". Reporting the second as a PASS reading "within the growth
+        // cap" states the result of a comparison that never happened -- the same
+        // false-assurance shape as a gate whose own docs claim it runs when it
+        // does not. The absolute ceiling does still apply with no baseline, so
+        // this is a WARN rather than a FAIL.
+        Ok(()) if !crate::graph::store_util::healthy_baseline_recorded(&infigraph_dir) => {
+            Some(CheckResult::warn(
+                GROWTH_CATEGORY,
+                label,
+                "no growth baseline is recorded, so the ratio guard is not in effect -- \
+                 only the absolute ceiling is protecting this graph",
+                "run `infigraph rebuild` to rebuild compactly and record a baseline, or \
+                 `infigraph restamp-baseline` to accept the current graph as healthy",
+            ))
+        }
         Ok(()) => Some(CheckResult::pass(
             GROWTH_CATEGORY,
             label,

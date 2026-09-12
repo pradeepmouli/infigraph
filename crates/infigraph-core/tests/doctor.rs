@@ -1639,3 +1639,48 @@ fn doctor_passes_when_the_graph_is_within_the_growth_cap() {
         "3x growth is under the 10x cap: {checks:?}"
     );
 }
+
+/// #180 ask 5: with no baseline recorded, `check_graph_growth_ratio` returns
+/// `Ok` because there is nothing to compare against. That is right for a write
+/// path -- it should proceed. It was wrong for `doctor`, which mapped it onto a
+/// PASS reading "graph is within the growth cap": a claim about the outcome of a
+/// comparison that never ran. Only the absolute ceiling guards such a graph, so
+/// the honest verdict is WARN -- and it must not be accompanied by a PASS, since
+/// removing the false assurance is the entire point.
+#[test]
+fn doctor_warns_when_no_growth_baseline_is_recorded() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let ig = dir.path().join(".infigraph");
+    std::fs::create_dir_all(&ig).unwrap();
+    // A real graph, deliberately with no `graph.health.json` beside it.
+    std::fs::write(ig.join("graph"), vec![0u8; 3_000_000]).unwrap();
+
+    let ctx = ctx_for(
+        DoctorScope::Project(dir.path().to_path_buf()),
+        Registry::default(),
+    );
+    let checks = check_growth_breaker(&ctx);
+
+    let warned = checks
+        .iter()
+        .find(|c| c.status == CheckStatus::Warn)
+        .expect("a graph with no recorded baseline must WARN, not PASS");
+    assert!(
+        warned.message.contains("no growth baseline"),
+        "the check must say why it cannot judge: {}",
+        warned.message
+    );
+    assert!(
+        !checks.iter().any(|c| c.status == CheckStatus::Pass),
+        "it must not also report the graph as within the cap: {checks:?}"
+    );
+    assert!(
+        warned
+            .remediation
+            .as_deref()
+            .unwrap_or_default()
+            .contains("restamp-baseline"),
+        "the remediation should offer the explicit restamp: {:?}",
+        warned.remediation
+    );
+}
