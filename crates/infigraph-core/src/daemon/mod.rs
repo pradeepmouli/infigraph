@@ -3058,6 +3058,16 @@ mod tests {
 
         /// #178: the idle fold waits while a SCIP import is writing, and
         /// otherwise keeps its interval.
+        ///
+        /// "Writing" means the *import*, specifically. The enrichment task
+        /// tracked by `scip_in_flight` only runs the external indexer
+        /// binaries, which the callback driving them documents as
+        /// "deliberately unlocked -- it can take several minutes on a real
+        /// multi-language repo and touches nothing in the graph"
+        /// (`infigraph-cli/src/info_commands.rs`). That callback then submits
+        /// each `.scip` as an ordinary `WriteRequest::ScipImport`, which is
+        /// what sets `scip_import_in_flight`. So this single flag already
+        /// covers every graph write, the daemon's own enrichment included.
         #[test]
         fn the_idle_fold_waits_out_a_running_scip_import() {
             let backoff = ReopenBackoff::new();
@@ -3068,6 +3078,33 @@ mod tests {
                 &backoff,
                 false
             ));
+        }
+
+        /// #178 also asked for `scip_in_flight` to gate this probe. It must
+        /// not, and this test exists so that ask cannot be implemented from
+        /// the issue text without first confronting why it is wrong.
+        ///
+        /// During an indexer run nothing is writing the graph, so
+        /// `scip_import_running` is false by construction and a fold is due
+        /// -- which is what this asserts. Withholding the fold for the whole
+        /// multi-minute indexer window would reintroduce #149: an unfolded
+        /// WAL refuses every NEW read-only open, seen on sittir as 6.6MB held
+        /// for ~45 minutes, three times in one day, clearing only on a
+        /// daemon restart.
+        ///
+        /// Note this asserts the same boolean as the first assertion above.
+        /// Its value is the name and this reasoning, not extra mechanical
+        /// coverage: the guard is against a plausible-looking change, not
+        /// against a code path the other test misses.
+        #[test]
+        fn an_indexer_run_does_not_block_the_idle_fold() {
+            let backoff = ReopenBackoff::new();
+            assert!(
+                idle_fold_probe_due(IDLE_CHECKPOINT_PROBE, &backoff, false),
+                "a fold must stay due while only the external indexers run: \
+                 they write nothing to the graph, and withholding a fold for \
+                 minutes is the #149 regression"
+            );
         }
         use crate::graph::store::{FoldError, IdleFold};
 
