@@ -2037,6 +2037,107 @@ mod tests {
     /// a 64 MiB `max_db_size`, which 0.20.2 exhausts on the 7th fold. It runs
     /// against the raw `Database` so it pins the dependency, not our wrapper:
     /// an lbug bump that regresses this fails here, not on a user's daemon.
+    /// #183 research probe: does the ENGINE accept a compaction statement,
+    /// even though lbug 0.20.4's Rust bindings expose none?
+    ///
+    /// The bindings' whole public surface is query/prepare/execute/arrow +
+    /// `SystemConfig`'s seven knobs -- no vacuum, compact or reclaim. But
+    /// `Connection::query` passes arbitrary statements through (this repo
+    /// already issues `CHECKPOINT` that way), and lbug's extensions are
+    /// dynamically-loaded C++ libraries rather than typed Rust, so any such
+    /// capability would arrive as a *statement*. That is what this checks.
+    ///
+    /// Interpretation rule, fixed before running so the output cannot be read
+    /// selectively: a **parser** error means the statement does not exist; a
+    /// **semantic** error (unknown table, wrong arity) means it DOES exist and
+    /// was called wrongly. Those are opposite conclusions, so full error text
+    /// is printed rather than a pass/fail.
+    ///
+    /// `CALL storage_info` is the one worth hoping for: if it reports page
+    /// counts, #183's central question stops being an inference from file size
+    /// and becomes a direct measurement of whether freed pages get reused.
+    ///
+    /// Run: `cargo test -p infigraph-core --lib -- --ignored --nocapture
+    /// does_the_engine_accept_a_compaction_statement`
+    #[test]
+    #[ignore = "research probe for #183: prints engine capabilities, asserts only the controls"]
+    fn does_the_engine_accept_a_compaction_statement() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = dir.path().join("graph");
+        let db = Database::new(&graph, SystemConfig::default()).unwrap();
+        let conn = Connection::new(&db).unwrap();
+
+        conn.query("CREATE NODE TABLE Node(id STRING, payload STRING, PRIMARY KEY(id))")
+            .unwrap();
+
+        // Churn first, so a statement that does exist can be measured for
+        // whether it actually reclaims -- not merely whether it parses.
+        let payload = "x".repeat(2_000);
+        for i in 0..2_000 {
+            conn.query(&format!(
+                "CREATE (:Node {{id: 'n{i}', payload: '{payload}'}})"
+            ))
+            .unwrap();
+        }
+        conn.query("MATCH (n:Node) DELETE n").unwrap();
+        conn.query("CHECKPOINT").unwrap();
+        let after_churn = std::fs::metadata(&graph).map(|m| m.len()).unwrap_or(0);
+        println!("[#183] size after insert+delete+checkpoint: {after_churn}");
+
+        // Controls first: if these fail, the harness is wrong and nothing
+        // below can be trusted.
+        // Table functions need a RETURN: a bare `CALL db_version()` fails with
+        // "Only standalone table functions can be called without return
+        // statement", which is a *binder* error proving the function exists.
+        for control in ["CHECKPOINT", "CALL db_version() RETURN *"] {
+            let r = conn.query(control);
+            println!(
+                "[#183] CONTROL {control:<28} => {}",
+                match &r {
+                    Ok(_) => "OK".to_string(),
+                    Err(e) => format!("ERR: {e}"),
+                }
+            );
+            assert!(
+                r.is_ok(),
+                "control statement {control} must succeed, else the probe proves nothing"
+            );
+        }
+
+        for candidate in [
+            "VACUUM",
+            "COMPACT",
+            "OPTIMIZE",
+            "CALL vacuum() RETURN *",
+            "CALL compact() RETURN *",
+            "CALL force_checkpoint() RETURN *",
+            "CALL storage_info('Node') RETURN *",
+            "CALL show_tables() RETURN *",
+            "CALL show_functions() RETURN *",
+        ] {
+            match conn.query(candidate) {
+                Ok(res) => {
+                    // `QueryResult` *is* an Iterator (see `LocalExec::query_rows`
+                    // and `existing_ids`), so it is consumed directly.
+                    let rows: Vec<String> = res
+                        .map(|row| {
+                            row.iter()
+                                .map(|v| v.to_string())
+                                .collect::<Vec<_>>()
+                                .join(" | ")
+                        })
+                        .take(8)
+                        .collect();
+                    let size = std::fs::metadata(&graph).map(|m| m.len()).unwrap_or(0);
+                    println!(
+                        "[#183] ACCEPTED {candidate:<28} => size {size} (was {after_churn}); rows: {rows:?}"
+                    );
+                }
+                Err(e) => println!("[#183] rejected {candidate:<28} => {e}"),
+            }
+        }
+    }
+
     #[test]
     fn repeated_checkpoints_do_not_exhaust_the_database_budget() {
         let dir = tempfile::tempdir().unwrap();
