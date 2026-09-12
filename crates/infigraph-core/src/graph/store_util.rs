@@ -158,10 +158,30 @@ fn read_healthy_size(infigraph_dir: &Path) -> Option<u64> {
 /// finding on R3.1.4). `pub` (not `pub(crate)`): the CLI's non-daemon full
 /// reindex is the one call site outside this crate.
 pub fn stamp_healthy_graph_size(infigraph_dir: &Path, graph_path: &Path) {
-    let Ok(meta) = std::fs::metadata(graph_path) else {
+    // Measures the SAME quantity `check_graph_growth_ratio` compares against:
+    // base image *plus* WAL. Recording the base alone was a real bug, not a
+    // simplification. Right after a first index the data still sits in an
+    // unfolded WAL, so the base is bare-schema size and this stamped ~0 --
+    // after which the check measured 3MB of entirely legitimate data against a
+    // 0MB baseline and refused every further write, since `0 * 10 == 0`. It
+    // surfaced as an intermittent macOS-only CI failure in
+    // `concurrent_writer_reader_raw_query_correctness_under_load`: whether Kuzu
+    // had folded the WAL by stamp time decided whether the baseline came out
+    // realistic or zero, which is exactly the kind of thing that differs
+    // between a loaded CI runner and a developer's machine.
+    //
+    // This is what ca6cfde's reverted "skip while the WAL is non-empty" guard
+    // was reaching for (see `stamp_healthy_graph_size_if_unset`'s comment),
+    // without that guard's cost of never bootstrapping a baseline at all.
+    // Comparing like with like satisfies both constraints at once.
+    //
+    // The baseline does come out larger than before, so the ratio guard is
+    // marginally more permissive -- bounded deliberately by `graph_max_bytes`,
+    // the absolute ceiling that applies with or without a baseline.
+    if graph_base_bytes(graph_path) == 0 && graph_wal_bytes(graph_path) == 0 {
         return; // nothing written yet -- nothing to stamp
-    };
-    let payload = serde_json::json!({ "healthy_size_bytes": meta.len() });
+    }
+    let payload = serde_json::json!({ "healthy_size_bytes": graph_family_bytes(graph_path) });
     let _ = crate::daemon_protocol::write_atomic(
         &graph_health_path(infigraph_dir),
         &serde_json::to_string_pretty(&payload).unwrap_or_default(),
@@ -1131,6 +1151,54 @@ mod tests {
             .expect_err("a runaway WAL must be caught even when the checkpointed graph is small");
         assert!(err.contains("MB graph"), "unexpected message: {err}");
         assert!(err.contains("MB WAL"), "unexpected message: {err}");
+    }
+
+    /// The guard must stamp and check the *same* quantity. It did not:
+    /// `check_graph_growth_ratio` compares base + WAL, while
+    /// `stamp_healthy_graph_size` recorded the base alone. A baseline taken
+    /// right after a first index -- while the data is still in an unfolded WAL
+    /// and the base is bare-schema size -- therefore recorded ~nothing, and
+    /// every later legitimate write was measured against it. `0 * 10 == 0`
+    /// refuses everything.
+    ///
+    /// This surfaced as an intermittent macOS-only CI failure in
+    /// `concurrent_writer_reader_raw_query_correctness_under_load` (run
+    /// 34700794085): "4 MB (3 MB graph + 0 MB WAL), 10x its recorded healthy
+    /// size (0 MB)". Intermittent because whether Kuzu had folded the WAL by
+    /// stamp time decides whether the baseline comes out realistic or zero --
+    /// which differs between a loaded CI runner and a developer's machine, so
+    /// it passed locally every time.
+    ///
+    /// Deliberately reproduces the near-zero baseline rather than a merely
+    /// smaller one: this test fails against a base-only stamp.
+    #[test]
+    fn a_baseline_stamped_while_the_wal_is_pending_still_admits_the_folded_graph() {
+        let tmp = tempfile::tempdir().unwrap();
+        let graph_path = tmp.path().join("graph");
+        let wal_path = tmp.path().join("graph.wal");
+
+        // The state `stamp_healthy_graph_size_if_unset` actually fires in:
+        // bare-schema base, real data still pending in the WAL.
+        std::fs::write(&graph_path, vec![0u8; 4_096]).unwrap();
+        std::fs::write(&wal_path, vec![0u8; 3_000_000]).unwrap();
+        stamp_healthy_graph_size(tmp.path(), &graph_path);
+
+        assert_eq!(
+            read_healthy_size(tmp.path()),
+            Some(4_096 + 3_000_000),
+            "the baseline must measure base + WAL -- the same quantity \
+             check_graph_growth_ratio compares against"
+        );
+
+        // Now Kuzu folds the WAL into the base image: the same bytes, moved.
+        // Nothing grew, so the guard must not refuse.
+        std::fs::write(&graph_path, vec![0u8; 3_004_096]).unwrap();
+        std::fs::remove_file(&wal_path).unwrap();
+        assert!(
+            check_graph_growth_ratio(tmp.path(), &graph_path).is_ok(),
+            "folding a WAL into the base image moves bytes without adding any; \
+             a base-only baseline made that look like runaway growth"
+        );
     }
 
     #[test]
