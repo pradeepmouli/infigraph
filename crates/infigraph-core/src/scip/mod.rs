@@ -1182,6 +1182,118 @@ impl std::fmt::Display for ImportStats {
     }
 }
 
+/// The completion line for a SCIP import, naming the indexer behind it when
+/// one is known.
+///
+/// The daemon already labels every SCIP *failure* path -- `SCIP {label} import
+/// skipped`/`failed`/`abandoned` (`infigraph-cli/src/info_commands.rs`) -- and
+/// dropped the label only on success, so a completed import could not be
+/// attributed to a language (#186). This joins that family rather than adding
+/// a sixth phrasing for one concept.
+///
+/// The caller supplies its own prefix (`[daemon] ` for the coordinator,
+/// `Auto-SCIP: ` for the CLI path), so this deliberately carries neither.
+///
+/// `None` for an import with no indexer behind it -- a user's own
+/// `scip-import --index <path>` -- which prints the original unlabelled form.
+pub fn scip_import_log_line(label: Option<&str>, stats: &ImportStats) -> String {
+    match label {
+        Some(label) => format!("SCIP {label} import complete: {stats}"),
+        None => format!("SCIP import complete: {stats}"),
+    }
+}
+
+/// The indexer that produced a SCIP scratch file, recovered from its path.
+///
+/// `run_scip_indexers` names every scratch file `<binary>.<pid>-<nanos>.scip`
+/// under `.infigraph/scip-tmp` (`infigraph-cli/src/index.rs`, #139). This is
+/// the complement of that module's `scip_run_pid`, which takes the run-id half
+/// of the same `rsplit_once('.')` -- the two must agree, so both read the name
+/// the same way.
+///
+/// Recovering the label from the path is what lets the daemon's import log
+/// name its indexer (#186) without adding a field to the serde-serialized
+/// `WriteRequest::ScipImport`, whose shape older clients still depend on.
+///
+/// `None` for anything that is not a scratch file: a user's own
+/// `scip-import --index <path>` has no indexer behind it, and a dot in its
+/// stem must not be misread as one.
+pub fn scratch_indexer_label(scip_path: &Path) -> Option<&str> {
+    if scip_path.parent()?.file_name()?.to_str()? != "scip-tmp" {
+        return None;
+    }
+    let (binary, _run_id) = scip_path.file_stem()?.to_str()?.rsplit_once('.')?;
+    Some(binary)
+}
+
+#[cfg(test)]
+mod import_log_line_tests {
+    use super::{scip_import_log_line, ImportStats};
+
+    fn stats() -> ImportStats {
+        ImportStats {
+            files_processed: 3,
+            symbols_enriched: 7,
+            ..Default::default()
+        }
+    }
+
+    /// The daemon already labels every SCIP *failure* path -- `[daemon] SCIP
+    /// {label} import skipped/failed/abandoned` (`info_commands.rs`) -- and
+    /// dropped the label only on success (#186). A completed import joins
+    /// that family rather than inventing a sixth phrasing.
+    #[test]
+    fn a_labelled_import_names_its_indexer_in_the_daemon_log_family() {
+        let line = scip_import_log_line(Some("scip-typescript"), &stats());
+        assert!(
+            line.starts_with("SCIP scip-typescript import complete: "),
+            "expected the `SCIP {{label}} import ...` shape, got: {line}"
+        );
+        assert!(line.contains("7 symbols"), "stats must survive: {line}");
+    }
+
+    /// A user's own `scip-import --index <path>` has no indexer behind it, so
+    /// the line must degrade to the unlabelled wording rather than print an
+    /// empty slot or a bogus name.
+    #[test]
+    fn an_unlabelled_import_omits_the_indexer_slot_entirely() {
+        let line = scip_import_log_line(None, &stats());
+        assert!(
+            line.starts_with("SCIP import complete: "),
+            "expected the unlabelled shape, got: {line}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod scratch_label_tests {
+    use super::scratch_indexer_label;
+    use std::path::Path;
+
+    /// `run_scip_indexers` names every scratch file
+    /// `<binary>.<pid>-<nanos>.scip` (`infigraph-cli/src/index.rs`, #139), so
+    /// the indexer behind an import is recoverable from the path alone. That
+    /// is what lets the daemon's log name it (#186) without adding a field to
+    /// the serde-serialized `WriteRequest::ScipImport`.
+    #[test]
+    fn names_the_indexer_that_produced_a_scratch_file() {
+        assert_eq!(
+            scratch_indexer_label(Path::new(
+                "/repo/.infigraph/scip-tmp/scip-typescript.999999-3.scip"
+            )),
+            Some("scip-typescript"),
+        );
+    }
+
+    /// A user's own `scip-import --index <path>` is not a scratch file, and a
+    /// dot inside its stem must not be misread as an indexer name -- without
+    /// the directory check, `my.index.scip` would be labelled `my`.
+    #[test]
+    fn declines_to_name_an_indexer_for_a_user_supplied_index() {
+        assert_eq!(scratch_indexer_label(Path::new("/tmp/my.index.scip")), None);
+    }
+}
+
 #[cfg(test)]
 mod prefilter_tests {
     use super::drop_ids_already_in_graph;

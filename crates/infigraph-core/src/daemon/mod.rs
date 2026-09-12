@@ -1170,6 +1170,7 @@ where
                 task,
                 request_path,
                 reply_path,
+                indexer_label,
             } = scip_import_in_flight
                 .take()
                 .expect("checked is_some just above");
@@ -1177,6 +1178,7 @@ where
                 root,
                 &reply_path,
                 &held_prism,
+                indexer_label.as_deref(),
                 drain_rt.block_on(task.join()),
             );
             std::fs::remove_file(&request_path).ok();
@@ -1475,6 +1477,7 @@ where
             root,
             &in_flight.reply_path,
             &held_prism,
+            in_flight.indexer_label.as_deref(),
             drain_rt.block_on(in_flight.task.join()),
         );
         std::fs::remove_file(&in_flight.request_path).ok();
@@ -1892,6 +1895,13 @@ struct PendingScipImport {
     task: Task<ScipImportTaskOutput>,
     request_path: PathBuf,
     reply_path: PathBuf,
+    /// The indexer this import came from, recovered from the scratch file's
+    /// run-unique name (#139) before the task consumes and deletes it. Rides
+    /// here rather than on `ScipImportTaskOutput` so it survives a task
+    /// panic -- the arm where knowing which indexer died matters most (#186).
+    /// `None` for a user's own `scip-import --index <path>`, which has no
+    /// indexer behind it.
+    indexer_label: Option<String>,
 }
 
 /// What `route_or_serve_request` hands back to the coordinator's main loop:
@@ -2183,6 +2193,11 @@ fn try_start_scip_import(
         }
     };
 
+    // Read the indexer off the scratch name before the closure takes
+    // ownership -- the task deletes the file, so there is nothing left to
+    // derive it from by the time the reap path logs (#186).
+    let indexer_label = crate::scip::scratch_indexer_label(&scip_path).map(str::to_owned);
+
     let task = {
         let _guard = drain_rt.enter();
         Task::spawn_blocking(daemon_token, "scip-import", move |_token| {
@@ -2198,6 +2213,7 @@ fn try_start_scip_import(
         task,
         request_path: path.to_path_buf(),
         reply_path,
+        indexer_label,
     })
 }
 
@@ -2211,12 +2227,19 @@ fn finish_scip_import(
     root: &Path,
     reply_path: &Path,
     held: &HeldPrism,
+    indexer_label: Option<&str>,
     joined: std::result::Result<ScipImportTaskOutput, tokio::task::JoinError>,
 ) -> (Option<crate::ops::IndexOpGuard>, Vec<String>) {
+    // `SCIP {label} ...` matches the family `info_commands.rs` already prints
+    // for every skipped/failed/abandoned import (#186).
+    let labelled = |verb: &str| match indexer_label {
+        Some(label) => format!("SCIP {label} {verb}"),
+        None => format!("SCIP {verb}"),
+    };
     let ScipImportTaskOutput { guard, result } = match joined {
         Ok(output) => output,
         Err(join_err) => {
-            eprintln!("[daemon] scip-import task panicked: {join_err}");
+            eprintln!("[daemon] {} panicked: {join_err}", labelled("import task"));
             let write_result = crate::daemon_protocol::WriteResult::Err {
                 message: format!("daemon scip-import task panicked: {join_err}"),
             };
@@ -2229,7 +2252,10 @@ fn finish_scip_import(
 
     let touched_files = match result {
         Ok(stats) => {
-            eprintln!("[daemon] SCIP import complete: {stats}");
+            eprintln!(
+                "[daemon] {}",
+                crate::scip::scip_import_log_line(indexer_label, &stats)
+            );
             if let Some(prism) = held.as_ref() {
                 if let Some(backend) = prism.backend() {
                     // `update_embeddings` returns the total embedding count
@@ -3633,7 +3659,13 @@ mod tests {
         );
 
         let joined = drain_rt.block_on(pending.task.join());
-        let (guard, _touched_files) = finish_scip_import(&root, &pending.reply_path, &held, joined);
+        let (guard, _touched_files) = finish_scip_import(
+            &root,
+            &pending.reply_path,
+            &held,
+            pending.indexer_label.as_deref(),
+            joined,
+        );
         assert!(
             guard.is_some(),
             "expected the index-op guard back on a successful import"
