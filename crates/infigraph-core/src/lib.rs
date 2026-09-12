@@ -1311,7 +1311,12 @@ impl Infigraph {
             };
             if entry.file_type().is_some_and(|ft| ft.is_file()) {
                 let path = entry.path();
-                if self.registry.for_file(&path.to_string_lossy()).is_some() {
+                let as_str = path.to_string_lossy();
+                // Dependency lockfiles never enter the graph: machine-generated,
+                // huge, and `index_manifests` already covers their manifests.
+                if !crate::graph::store_util::is_lockfile(&as_str)
+                    && self.registry.for_file(&as_str).is_some()
+                {
                     files.push(path.to_path_buf());
                 }
             }

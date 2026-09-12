@@ -19,6 +19,59 @@ fn config(root: PathBuf) -> ProducerConfig {
     }
 }
 
+/// A dependency lockfile must not be queued *even though a language pack
+/// genuinely claims it*. `pnpm-lock.yaml` is matched by the bundled YAML
+/// pack, so `registry.for_file` does NOT stop it -- it sailed through and got
+/// indexed, which is how sittir accumulated 3,498 symbols from one lockfile.
+///
+/// Contrast `producer_ignores_files_no_language_pack_claims` below: that is
+/// the registry filter doing its job for an extension nothing claims. This is
+/// the case the registry filter cannot reach, and therefore the one that
+/// needed `store_util::is_lockfile` beside it at the same call site.
+#[tokio::test]
+async fn producer_ignores_dependency_lockfiles_a_language_pack_does_claim() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    std::fs::create_dir_all(root.join(".infigraph")).unwrap();
+
+    let queue = Arc::new(Mutex::new(IndexWorkQueue::new()));
+    let token = CancellationToken::new();
+
+    let queue_clone = Arc::clone(&queue);
+    let cfg = config(root.clone());
+    let token_clone = token.clone();
+    let handle = tokio::task::spawn(async move {
+        infigraph_core::watch::producer::run_producer(cfg, queue_clone, |_evt| {}, token_clone)
+            .await;
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    // Real, parseable YAML: if this is skipped it is because it is a
+    // lockfile, not because nothing could claim or parse it.
+    std::fs::write(
+        root.join("pnpm-lock.yaml"),
+        "lockfileVersion: '9.0'\nimporters:\n  .:\n    dependencies:\n      left-pad:\n        version: 1.3.0\n",
+    )
+    .unwrap();
+
+    // Same budget as the sibling test: the 1s debounce plus several flush
+    // ticks, so a missing filter would have queued the path well inside it.
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    assert!(
+        queue.lock().unwrap().is_empty(),
+        "a dependency lockfile must not be queued even though the YAML pack claims it"
+    );
+
+    let dirty = infigraph_core::dirty::pending_dirty(&root.join(".infigraph")).unwrap();
+    assert!(
+        dirty.is_empty(),
+        "nor may it be persisted as dirty, got: {dirty:?}"
+    );
+
+    token.cancel();
+    handle.await.unwrap();
+}
+
 #[tokio::test]
 async fn producer_feeds_the_queue_on_a_real_file_change() {
     let tmp = tempfile::tempdir().unwrap();

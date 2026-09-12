@@ -756,16 +756,36 @@ pub(crate) fn fanout_edge_statement(
     )
 }
 
-pub fn classify_file(file: &str) -> &'static str {
+/// Whether `file` is a dependency lockfile: machine-generated, often enormous,
+/// and of no navigational value -- `index_manifests` already extracts the
+/// dependency data from the manifests these are locked against. sittir's
+/// `pnpm-lock.yaml` alone contributed 3,498 symbols.
+///
+/// Consulted at file discovery (`Infigraph::collect_files` and the watch
+/// producer) so these never enter the graph, and still consulted by
+/// [`classify_file`] for anything an older index already stored.
+///
+/// Note on reach: discovery gates on `registry.for_file`, so an extension with
+/// no language pack is already filtered before this is asked. In practice that
+/// means this only changes the outcome for `pnpm-lock.yaml` (a `.yaml` pack)
+/// and `package-lock.json` (a `.json` pack). `.lock` and `go.sum` are listed
+/// for complete *classification*, not because they alter discovery today.
+pub fn is_lockfile(file: &str) -> bool {
     let fl = file.to_ascii_lowercase();
-    if fl.ends_with("-lock.yaml")
+    fl.ends_with("-lock.yaml")
         || fl.ends_with(".lock")
+        || fl == "go.sum"
+        || fl.ends_with("/go.sum")
         || fl.contains("pnpm-lock")
         || fl.contains("package-lock")
         || fl.contains("yarn.lock")
-    {
+}
+
+pub fn classify_file(file: &str) -> &'static str {
+    if is_lockfile(file) {
         return "config";
     }
+    let fl = file.to_ascii_lowercase();
     if fl.ends_with(".md") || fl.contains("/docs/") || fl.contains("/doc/") {
         return "docs";
     }
@@ -808,10 +828,10 @@ mod tests {
 
     use super::{
         check_disk_headroom, check_graph_growth_ratio, classify_file,
-        copy_edges_with_bad_record_retry, extract_bad_copy_value, prefilter_pairs_against_existing,
-        read_healthy_size, resolve_import_candidate, stamp_healthy_graph_size,
-        stamp_healthy_graph_size_if_unset, unwind_edges_from_pairs, GRAPH_MAX_BYTES_ENV,
-        MAX_BAD_RECORD_RETRIES,
+        copy_edges_with_bad_record_retry, extract_bad_copy_value, is_lockfile,
+        prefilter_pairs_against_existing, read_healthy_size, resolve_import_candidate,
+        stamp_healthy_graph_size, stamp_healthy_graph_size_if_unset, unwind_edges_from_pairs,
+        GRAPH_MAX_BYTES_ENV, MAX_BAD_RECORD_RETRIES,
     };
 
     /// A store holding Symbol nodes `s0..s{n}` and nothing else.
@@ -1194,6 +1214,44 @@ mod tests {
         assert_eq!(classify_file("package-lock.json"), "config");
         assert_eq!(classify_file("yarn.lock"), "config");
         assert_eq!(classify_file("docker-compose.yml"), "config");
+    }
+
+    /// The set discovery refuses. `go.sum` is the one this adds over the
+    /// branch that used to live inline in `classify_file`.
+    #[test]
+    fn lockfiles_are_recognized() {
+        for f in [
+            "Cargo.lock",
+            "poetry.lock",
+            "Gemfile.lock",
+            "yarn.lock",
+            "pnpm-lock.yaml",
+            "package-lock.json",
+            "go.sum",
+            "services/api/go.sum",
+            "packages/web/pnpm-lock.yaml",
+        ] {
+            assert!(is_lockfile(f), "{f} must be treated as a lockfile");
+        }
+    }
+
+    /// The boundary matters because these patterns are substring matches: a
+    /// source file that merely *talks about* locking must still be indexed.
+    /// `crates/infigraph-core/src/lockfile.rs` is this crate's own advisory
+    /// lock module, and skipping it would silently drop real code.
+    #[test]
+    fn source_files_are_not_lockfiles() {
+        for f in [
+            "crates/infigraph-core/src/lockfile.rs",
+            "src/lock.rs",
+            "src/locks/mod.rs",
+            "tests/lockfile.rs",
+            "docs/go.sum.md",
+            "src/main.rs",
+            "package.json",
+        ] {
+            assert!(!is_lockfile(f), "{f} must not be treated as a lockfile");
+        }
     }
 
     #[test]

@@ -34,8 +34,14 @@ pub struct ProducerConfig {
     /// path with no language pack behind it never produces a
     /// `FileExtraction`, so marking it dirty leaves it dirty forever:
     /// `clear_dirty` only clears what a drain's `outcome.extractions`
-    /// reported. Without this filter every README/lockfile/image touched
-    /// under `root` leaks into a permanently-growing dirty set.
+    /// reported. Without this filter every README/image touched under `root`
+    /// leaks into a permanently-growing dirty set.
+    ///
+    /// It does **not** cover dependency lockfiles, and used to claim it did:
+    /// `pnpm-lock.yaml` and `package-lock.json` are claimed by the bundled
+    /// YAML and JSON packs, so they pass this gate and were indexed in full
+    /// (3,498 symbols from one lockfile on sittir). `store_util::is_lockfile`,
+    /// checked beside this at the call site, is what stops those.
     pub registry: Arc<crate::lang::LanguageRegistry>,
     /// Only read by notify's `PollWatcher` fallback -- the native backends
     /// (FSEvents/inotify/ReadDirectoryChangesW) ignore it -- but the
@@ -243,7 +249,9 @@ pub async fn run_producer(
                                                 path.display()
                                             );
                                         }
-                                    } else if registry.for_file(&rel).is_some() {
+                                    } else if !crate::graph::store_util::is_lockfile(&rel)
+                                        && registry.for_file(&rel).is_some()
+                                    {
                                         // R3.3.5: persisted before this event
                                         // enters `batch` -- the in-memory
                                         // accumulator a crash could still lose
