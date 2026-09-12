@@ -47,6 +47,21 @@ pub(crate) const SUGGESTED_INFIGRAPHIGNORE: &[(&str, &str)] = &[
 /// `cargo metadata` resolution but still bounded rather than infinite.
 const SCIP_INDEXER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 
+/// Re-record the growth-ratio breaker's baseline (#100/R3.1.4d) from the
+/// graph exactly as it stands now.
+///
+/// Three callers need the same two paths -- `cmd_index` after a verified full
+/// rebuild, `cmd_scip_enrich` once enrichment has added its legitimate share,
+/// and the `restamp-baseline` command when an operator judges the current
+/// graph healthy -- so the `.infigraph`/`graph` layout is spelled once here
+/// instead of at each site. See `stamp_healthy_graph_size`'s doc for the
+/// contract this must stay inside: only after a verified-healthy checkpoint,
+/// never after an ordinary incremental write.
+pub(crate) fn restamp_growth_baseline(root: &Path) {
+    let dir = root.join(".infigraph");
+    infigraph_core::graph::stamp_healthy_graph_size(&dir, &dir.join("graph"));
+}
+
 pub(crate) fn cmd_index(root: &Path, full: bool, no_embed: bool) -> Result<()> {
     // Before ANY destructive work. `Infigraph::init` performs the same check,
     // but `--full` wipes `.infigraph/` here first -- so a root that was going
@@ -246,8 +261,7 @@ pub(crate) fn cmd_index(root: &Path, full: bool, no_embed: bool) -> Result<()> {
     // daemon-routed full-reindex branch above already does its own
     // equivalent stamp and returns before reaching this point.
     if full && !remote {
-        let dir = root.join(".infigraph");
-        infigraph_core::graph::stamp_healthy_graph_size(&dir, &dir.join("graph"));
+        restamp_growth_baseline(root);
     }
 
     if result.indexed_files == 0 {
@@ -940,8 +954,7 @@ pub(crate) fn cmd_scip_enrich(
     // never after an ordinary incremental write) -- a full rebuild simply is
     // not complete until its enrichment is.
     if restamp_baseline {
-        let dir = root.join(".infigraph");
-        infigraph_core::graph::stamp_healthy_graph_size(&dir, &dir.join("graph"));
+        restamp_growth_baseline(root);
     }
 }
 

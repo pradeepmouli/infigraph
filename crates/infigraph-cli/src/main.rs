@@ -98,6 +98,18 @@ enum Commands {
         no_embed: bool,
     },
 
+    /// Re-record the growth guard's baseline from the graph as it stands now
+    ///
+    /// The guard (#100) refuses a write once the graph passes a multiple of
+    /// its recorded healthy size. `rebuild` re-records that baseline as one
+    /// step of its work; this exposes the same step on its own, for when the
+    /// current graph is known-good and a stale baseline is the only thing
+    /// refusing writes. It rewrites one number in
+    /// `.infigraph/graph.health.json` and touches no graph data -- so use it
+    /// only on a graph you have reason to believe is healthy, since it also
+    /// silences the guard for a graph that genuinely has bloated.
+    RestampBaseline,
+
     /// Show graph statistics
     Stats,
 
@@ -1048,6 +1060,15 @@ fn run(command: Commands, root: &Path) -> Result<()> {
         Commands::Index { full, no_embed } => cmd_index(root, full, no_embed),
         // `rebuild` *is* a full index -- one implementation, two spellings.
         Commands::Rebuild { no_embed } => cmd_index(root, true, no_embed),
+        // The baseline step `rebuild` performs, on its own.
+        Commands::RestampBaseline => {
+            index::restamp_growth_baseline(root);
+            println!(
+                "Growth-guard baseline re-recorded from the current graph ({}).",
+                root.join(".infigraph").join("graph.health.json").display()
+            );
+            Ok(())
+        }
         Commands::Stats => cmd_stats(root),
         Commands::Restore { id, yes } => cmd_restore(root, id.as_deref(), yes),
         Commands::Doctor { global } => cmd_doctor(root, global),
@@ -1451,6 +1472,10 @@ mod tests {
             root
         ));
         assert!(!should_auto_watch(&Commands::Stats, root));
+        // Management, not indexing: it rewrites one number in
+        // `graph.health.json` and reads no source, so starting a watcher
+        // would be a pure side effect.
+        assert!(!should_auto_watch(&Commands::RestampBaseline, root));
         assert!(!should_auto_watch(
             &Commands::Callers {
                 symbol: String::new(),
