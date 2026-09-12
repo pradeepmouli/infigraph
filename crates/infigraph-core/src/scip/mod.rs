@@ -1203,13 +1203,34 @@ pub fn scip_import_log_line(label: Option<&str>, stats: &ImportStats) -> String 
     }
 }
 
+/// The directory SCIP indexers write their scratch output to, under a
+/// project's `.infigraph/`.
+pub const SCIP_SCRATCH_DIR: &str = "scip-tmp";
+
+/// `<root>/.infigraph/scip-tmp` -- where every SCIP indexer's scratch output
+/// lands, and the only directory [`scratch_indexer_label`] will name an
+/// indexer from.
+pub fn scip_scratch_dir(root: &Path) -> std::path::PathBuf {
+    root.join(".infigraph").join(SCIP_SCRATCH_DIR)
+}
+
+/// The run-unique name for one indexer's scratch output (#139): `run_id` is
+/// `<pid>-<nanos>`, so the daemon's own staleness-triggered enrichment cannot
+/// collide with a user's concurrent `scip-enrich`/`index --full`.
+///
+/// Paired with [`scratch_indexer_label`], which reads the indexer back out of
+/// it. Keep them together: a divergence between the two surfaces only as a
+/// silently missing label, never as a failure.
+pub fn scratch_file_name(binary_name: &str, run_id: &str) -> String {
+    format!("{binary_name}.{run_id}.scip")
+}
+
 /// The indexer that produced a SCIP scratch file, recovered from its path.
 ///
-/// `run_scip_indexers` names every scratch file `<binary>.<pid>-<nanos>.scip`
-/// under `.infigraph/scip-tmp` (`infigraph-cli/src/index.rs`, #139). This is
-/// the complement of that module's `scip_run_pid`, which takes the run-id half
-/// of the same `rsplit_once('.')` -- the two must agree, so both read the name
-/// the same way.
+/// Reads back what [`scratch_file_name`] wrote (#139), and is the complement
+/// of `infigraph-cli`'s `scip_run_pid`, which takes the run-id half of the
+/// same `rsplit_once('.')` -- the two must agree, so both read the name the
+/// same way.
 ///
 /// Recovering the label from the path is what lets the daemon's import log
 /// name its indexer (#186) without adding a field to the serde-serialized
@@ -1219,9 +1240,24 @@ pub fn scip_import_log_line(label: Option<&str>, stats: &ImportStats) -> String 
 /// `scip-import --index <path>` has no indexer behind it, and a dot in its
 /// stem must not be misread as one.
 pub fn scratch_indexer_label(scip_path: &Path) -> Option<&str> {
-    if scip_path.parent()?.file_name()?.to_str()? != "scip-tmp" {
+    if scip_path.parent()?.file_name()?.to_str()? != SCIP_SCRATCH_DIR {
         return None;
     }
+    scratch_file_indexer(scip_path)
+}
+
+/// The indexer a scratch file's *name* belongs to, without asking where the
+/// file lives.
+///
+/// For callers already scanning the scratch directory -- `adoptable_scip_output`
+/// is handed the directory to scan, so re-checking its name is both redundant
+/// and wrong. [`scratch_indexer_label`] is the guarded reading, for callers
+/// holding a path of unknown provenance. One parse, two policies: the format
+/// itself is read here and nowhere else.
+///
+/// Reads `.partial` as readily as `.scip` -- the reclaim paths (#180 ask 3)
+/// inspect both.
+pub fn scratch_file_indexer(scip_path: &Path) -> Option<&str> {
     let (binary, _run_id) = scip_path.file_stem()?.to_str()?.rsplit_once('.')?;
     Some(binary)
 }
@@ -1261,6 +1297,58 @@ mod import_log_line_tests {
         assert!(
             line.starts_with("SCIP import complete: "),
             "expected the unlabelled shape, got: {line}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod scratch_name_tests {
+    use super::{scip_scratch_dir, scratch_file_indexer, scratch_file_name, scratch_indexer_label};
+    use std::path::Path;
+
+    /// The parse and the directory guard are separate concerns, and conflating
+    /// them broke adoption: `adoptable_scip_output` scans a directory it was
+    /// handed and already knows is the scratch dir, so re-checking that
+    /// directory's *name* is both redundant and wrong -- its own test hands it
+    /// a bare temp dir. Callers holding an arbitrary path (the daemon, which
+    /// may be given a user's `scip-import --index`) want the guarded reading;
+    /// callers already inside the scratch dir want the plain one. One parse,
+    /// two policies.
+    #[test]
+    fn the_unguarded_reading_names_an_indexer_the_guarded_one_refuses() {
+        let path = Path::new("/tmp/whatever/scip-python.999999-3.scip");
+        assert_eq!(scratch_file_indexer(path), Some("scip-python"));
+        assert_eq!(scratch_indexer_label(path), None);
+    }
+
+    /// The point of owning both halves in one place: a name built by the
+    /// producer must read back through the parser. Before this, the format
+    /// lived in four hand-rolled copies across `infigraph-cli` (the `format!`
+    /// in `run_scip_indexers`, `adoptable_scip_output`, `scip_run_pid`) and
+    /// nothing would have caught them drifting apart -- a divergence only
+    /// shows up as a silently missing label, never as a failure.
+    #[test]
+    fn a_produced_scratch_name_reads_back_as_its_own_indexer() {
+        let path = scip_scratch_dir(Path::new("/repo"))
+            .join(scratch_file_name("scip-typescript", "999999-3"));
+        assert_eq!(scratch_indexer_label(&path), Some("scip-typescript"));
+    }
+
+    /// `.partial` is the same name with a different extension (#180 ask 3), so
+    /// the parser must read it too -- reclaim paths inspect both.
+    #[test]
+    fn a_partial_scratch_name_still_names_its_indexer() {
+        let path = scip_scratch_dir(Path::new("/repo")).join("rust-analyzer.4242-7.partial");
+        assert_eq!(scratch_indexer_label(&path), Some("rust-analyzer"));
+    }
+
+    /// The scratch directory is `<root>/.infigraph/scip-tmp` -- built by hand
+    /// at four sites in `index.rs` before this.
+    #[test]
+    fn the_scratch_dir_hangs_off_the_projects_infigraph_dir() {
+        assert_eq!(
+            scip_scratch_dir(Path::new("/repo")),
+            Path::new("/repo/.infigraph/scip-tmp")
         );
     }
 }

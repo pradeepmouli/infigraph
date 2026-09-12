@@ -1051,7 +1051,7 @@ fn scip_run_pid(path: &Path) -> Option<u32> {
 /// skipped, so a recycled pid costs a deferred cleanup (the 6h sweep still gets
 /// it) rather than a live run's file. Returns `(groups reaped, partials removed)`.
 pub(crate) fn reclaim_dead_scip_runs(root: &Path) -> (usize, usize) {
-    let scip_tmp = root.join(".infigraph").join("scip-tmp");
+    let scip_tmp = infigraph_core::scip::scip_scratch_dir(root);
     let Ok(entries) = std::fs::read_dir(&scip_tmp) else {
         return (0, 0);
     };
@@ -1092,7 +1092,7 @@ pub(crate) fn reclaim_dead_scip_runs(root: &Path) -> (usize, usize) {
 /// This process's own in-flight scratch files, so an exit that abandons them
 /// can say what it is abandoning (#180 ask 1).
 pub(crate) fn own_pending_scip_scratch(root: &Path) -> Vec<PathBuf> {
-    let scip_tmp = root.join(".infigraph").join("scip-tmp");
+    let scip_tmp = infigraph_core::scip::scip_scratch_dir(root);
     let Ok(entries) = std::fs::read_dir(&scip_tmp) else {
         return Vec::new();
     };
@@ -1265,10 +1265,7 @@ fn adoptable_scip_output(scip_tmp: &Path, binary_name: &str) -> Option<PathBuf> 
         .map(|e| e.path())
         .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("scip"))
         .filter(|p| {
-            p.file_stem()
-                .and_then(|s| s.to_str())
-                .and_then(|s| s.rsplit_once('.'))
-                .is_some_and(|(prefix, _)| prefix == binary_name)
+            infigraph_core::scip::scratch_file_indexer(p).is_some_and(|name| name == binary_name)
         })
         .find(|p| {
             scip_run_pid(p).is_some_and(|pid| {
@@ -1300,7 +1297,7 @@ pub(crate) fn run_scip_indexers(
     });
 
     // Filter to runnable indexers and build per-indexer tasks
-    let scip_tmp = root.join(".infigraph").join("scip-tmp");
+    let scip_tmp = infigraph_core::scip::scip_scratch_dir(root);
     let _ = std::fs::create_dir_all(&scip_tmp);
     sweep_stale_scip_scratch(&scip_tmp);
     let run_id = scip_run_id();
@@ -1329,7 +1326,10 @@ pub(crate) fn run_scip_indexers(
                 adopted.push((indexer.binary_name, path, true));
                 return None;
             }
-            let output_path = scip_tmp.join(format!("{}.{run_id}.scip", indexer.binary_name));
+            let output_path = scip_tmp.join(infigraph_core::scip::scratch_file_name(
+                indexer.binary_name,
+                &run_id,
+            ));
             Some((indexer, bin, output_path))
         })
         .collect();
