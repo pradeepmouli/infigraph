@@ -81,9 +81,12 @@ pub fn query_deps(backend: &dyn GraphBackend) -> Result<Vec<DepEntry>> {
     for row in &rows {
         if row.len() >= 4 {
             deps.push(DepEntry {
-                name: row[0].trim_matches('"').to_string(),
-                version: row[1].trim_matches('"').to_string(),
-                ecosystem: row[2].trim_matches('"').to_string(),
+                // #181: `raw_query` rows are already plain strings with no
+                // added quotes, so trimming could only damage a name or
+                // version that genuinely contains one.
+                name: row[0].to_string(),
+                version: row[1].to_string(),
+                ecosystem: row[2].to_string(),
                 is_dev: row[3] == "True" || row[3] == "true",
             });
         }

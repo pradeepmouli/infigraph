@@ -66,6 +66,59 @@ impl TestGraph {
     }
 }
 
+/// #181: a graph read must not strip a quote that is part of the value.
+///
+/// `get_file_deps` converted rows with `v.to_string().trim_matches('"')`, and
+/// `trim_matches` strips leading and trailing quote characters
+/// *independently* -- so a value merely ending in `"` loses it. `scip/mod.rs`
+/// records the same shape: it "turned `test.ts::\"a\"` into `test.ts::\"a`".
+///
+/// Both executors behind this read return bare, unquoted strings --
+/// `LocalExec::query_rows` maps `v.to_string()`, and the daemon-routed path
+/// forwards those same strings verbatim (`raw_query_on` -> frames ->
+/// `collect_rows`) -- so there is never an added quote for the trim to
+/// remove. `get_architecture_stats` already reads identical `raw_query` rows
+/// with a plain `.clone()` and no trim; the trims are the anomaly.
+///
+/// A `Module.file` ending in a quote is admittedly contrived; the realistic
+/// instance is Symbol ids, of which sittir's graph holds 294 JSON and 17 SCIP
+/// examples like `examples/foo.json::"17-dogfood.generated.ts"`. The defect is
+/// in the conversion, not the column, so exercising it here is equivalent.
+///
+/// Unaffected, deliberately: `store_util::unquote` strips only a *matched*
+/// pair, so a value that merely ends in a quote passes through it intact.
+#[test]
+fn get_file_deps_keeps_a_quote_that_is_part_of_the_file_name() {
+    let g = TestGraph::new();
+    let conn = g.store.connection().expect("connection");
+
+    // Neither value contains a single quote, so no Cypher escaping is needed.
+    let plain = "src/a.ts";
+    let quoted = r#"src/b.ts::"generated""#;
+
+    for f in [plain, quoted] {
+        conn.query(&format!(
+            "CREATE (:Module {{id: '{f}', name: 'm', file: '{f}', \
+             language: 'typescript', content_hash: 'h'}})"
+        ))
+        .expect("create module");
+    }
+    conn.query(&format!(
+        "MATCH (x:Module), (y:Module) WHERE x.file = '{plain}' AND y.file = '{quoted}' \
+         CREATE (x)-[:IMPORTS]->(y)"
+    ))
+    .expect("create IMPORTS edge");
+
+    let q = GraphQuery::new(&conn);
+    let deps = q.get_file_deps(plain).expect("get_file_deps");
+
+    assert_eq!(
+        deps.imports,
+        vec![quoted.to_string()],
+        "the trailing quote is part of the file name and must survive the read"
+    );
+}
+
 fn fixture_extractions() -> Vec<FileExtraction> {
     vec![
         FileExtraction {

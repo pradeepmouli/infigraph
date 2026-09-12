@@ -278,8 +278,11 @@ pub fn detect_cross_cutting(backend: &dyn GraphBackend) -> Result<Vec<ConcernMat
                 if row.len() < 2 {
                     continue;
                 }
-                let source_id = row[0].trim_matches('"');
-                let target_id = row[1].trim_matches('"');
+                // #181: no trim -- these are Symbol ids, which genuinely end
+                // in a quote when SCIP or JSON produced them, and
+                // `raw_query` adds none of its own.
+                let source_id = row[0].as_str();
+                let target_id = row[1].as_str();
                 matches.push(ConcernMatch {
                     symbol_id: target_id.to_string(),
                     kind: concern_kind,

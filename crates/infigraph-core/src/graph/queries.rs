@@ -257,7 +257,14 @@ impl<E: crate::graph::query_exec::QueryExec> GraphQuery<E> {
         let mut imports = Vec::new();
         for row in r {
             if let Some(v) = row.first() {
-                let s = v.to_string().trim_matches('"').to_string();
+                // #181: no trim. Rows reach here already stringified by
+                // `QueryExec` (`v` is a `String`), and neither executor adds
+                // a quote -- `LocalExec` maps `Value::to_string()`, whose
+                // `Display` writes strings raw, and the routed path forwards
+                // those same strings verbatim. `trim_matches('"')` strips
+                // leading and trailing quotes *independently*, so it only
+                // ever removed a quote that was part of the value.
+                let s = v.clone();
                 if !s.is_empty() {
                     imports.push(s);
                 }
@@ -276,7 +283,14 @@ impl<E: crate::graph::query_exec::QueryExec> GraphQuery<E> {
         let mut imported_by = Vec::new();
         for row in r2 {
             if let Some(v) = row.first() {
-                let s = v.to_string().trim_matches('"').to_string();
+                // #181: no trim. Rows reach here already stringified by
+                // `QueryExec` (`v` is a `String`), and neither executor adds
+                // a quote -- `LocalExec` maps `Value::to_string()`, whose
+                // `Display` writes strings raw, and the routed path forwards
+                // those same strings verbatim. `trim_matches('"')` strips
+                // leading and trailing quotes *independently*, so it only
+                // ever removed a quote that was part of the value.
+                let s = v.clone();
                 if !s.is_empty() {
                     imported_by.push(s);
                 }

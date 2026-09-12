@@ -204,11 +204,15 @@ impl SessionStore {
         };
         let mut collected = Vec::new();
         for row in result {
+            // #181: unlike the `QueryExec`-backed reads, this queries the
+            // connection directly, so `row.get(i)` is a `kuzu::Value` rather
+            // than a `String`. `raw_string` takes the stored string as-is;
+            // the previous `trim_matches('"')` stripped any quote a summary
+            // or field genuinely began or ended with.
             let get = |i: usize| {
                 row.get(i)
-                    .map(|v| v.to_string())
+                    .map(crate::graph::store_util::raw_string)
                     .unwrap_or_default()
-                    .trim_matches('"')
                     .to_string()
             };
             let id = get(0);
