@@ -1,6 +1,16 @@
 #!/bin/sh
 set -e
 
+# EDITING THIS FILE IS NOT ENOUGH. cargo-husky copies it to
+# `.git/hooks/pre-commit` with its own version marker stamped on top, and
+# rewrites that copy only when the marker changes -- so once an installed copy
+# exists at the same cargo-husky version, later edits here are silently never
+# propagated, with no warning. That is not hypothetical: the #183 gate at the
+# bottom was added and committed, and never ran on a single commit, while the
+# test it guards documented itself as hook-enforced. To install a change:
+# `rm .git/hooks/pre-commit` and rebuild so cargo-husky writes it again, then
+# confirm the new step actually appears in the next commit's hook output.
+
 # Dev-loop env vars that opt a shell into daemon-backed indexing
 # (INFIGRAPH_BACKEND=daemon) or watcher auto-start (INFIGRAPH_WATCH_DAEMON)
 # are meant for interactive use, not for this hook's own test/build
@@ -50,11 +60,17 @@ cargo test -p infigraph-mcp --test groups_watch_perf -- --ignored
 echo '+cargo test -p infigraph-core --test index_perf -- --ignored'
 cargo test -p infigraph-core --test index_perf -- --ignored
 
-# #183: lbug reclaims freed pages only partially, so a graph under repeated
-# delete/recreate churn grows without bound. This is the invariant whose
-# absence let #175-#179 each ship one at a time -- the growth breaker (#100)
-# is a ratio tripwire consulted *between* operations, so it cannot express
-# "this round changed nothing and should have cost ~nothing".
+# #183: re-upserting byte-identical content still grows the graph, measured at
+# 5.98x over 40 rounds. Not because reclamation is partial -- the row count
+# holds at exactly 2000 and the free list never accumulates -- but because
+# deleted row versions keep occupying pages the table itself owns, never reach
+# the free-space manager, and nothing compacts them. `measure_churn` prints the
+# per-table page and row series that establish this.
+#
+# This is the invariant whose absence let #175-#179 each ship one at a time --
+# the growth breaker (#100) is a ratio tripwire consulted *between*
+# operations, so it cannot express "this round changed nothing and should have
+# cost ~nothing".
 #
 # `--lib`, not `--test`: it is a unit test, because the size it measures comes
 # from `store_util::graph_family_bytes`, which is `pub(crate)`.
