@@ -1592,6 +1592,119 @@ mod tests {
     /// Returns `(round 0 bytes, final bytes)` so the invariant test below can
     /// assert on the same run the measurements print, rather than carrying a
     /// second copy of this loop.
+    /// Run a one-row, one-column aggregate and return it, or the engine's own
+    /// error text.
+    ///
+    /// Aggregating inside Cypher, by column *name*, is the whole point. The
+    /// first cut of this instrument read `storage_info`'s columns positionally
+    /// and summed index 2 -- which holds a legitimate `0` -- so it reported
+    /// "0 pages" for a 21MB graph holding 2000 symbols, took none of its three
+    /// error paths, and looked exactly like confirmation of the hypothesis it
+    /// was built to test. `RETURN sum(num_pages)` names the column instead, so
+    /// a reshaped output fails loudly here rather than quietly summing the
+    /// wrong integer. lbug's own `storage_info`/`fsm_info` tests query these
+    /// results the same way (`where column_name = ... and num_pages > 1`), so
+    /// this is the engine's intended access path, not a trick.
+    ///
+    /// Callers must wrap the aggregate in `CAST(... AS INT64)`. lbug sums a
+    /// UINT64 column into a wider logical type its own Rust binding cannot
+    /// convert, and the binding *panics* (`Unsupported type
+    /// LogicalTypeID(43)`, `logical_type.rs`) while materialising the row --
+    /// so no `map_err` here can catch it. lbug's FSM test casts for the same
+    /// reason (`cast(min as uint64)`).
+    fn scalar_u64(conn: &Connection<'_>, cypher: &str) -> std::result::Result<u64, String> {
+        let mut res = conn.query(cypher).map_err(|e| e.to_string())?;
+        let row = res.next().ok_or_else(|| "no rows".to_string())?;
+        let raw = row
+            .first()
+            .ok_or_else(|| "no columns".to_string())?
+            .to_string();
+        // `sum()` over an empty table is NULL, and that is a real answer here:
+        // no pages. Anything else that fails to parse is not.
+        if raw.is_empty() || raw.eq_ignore_ascii_case("null") {
+            return Ok(0);
+        }
+        raw.parse::<u64>()
+            .map_err(|_| format!("expected an integer, got {raw:?}"))
+    }
+
+    /// Live pages: `num_pages` per entry in `tables`, positionally -- the space
+    /// the graph actually holds data in, as opposed to the space it has claimed
+    /// from the filesystem.
+    ///
+    /// Returned per-table rather than summed because the sum answered the wrong
+    /// question. Forty byte-identical rounds grew live pages 3.96x, which rules
+    /// out "the engine just isn't giving pages back" but says nothing about
+    /// *which* table is growing -- and that is what names the write path at
+    /// fault.
+    ///
+    /// Read through `GraphStore::connection` rather than a second `Database`,
+    /// because there is exactly one `Database` per graph file per process: a
+    /// second handle cannot see the first's uncommitted WAL and silently
+    /// serves stale or empty rows (#149). Here that would read as "pages never
+    /// grew" and falsely confirm the hypothesis under test.
+    ///
+    /// Panics rather than degrading to 0. A measurement whose failure mode
+    /// mimics its hoped-for result is worse than no measurement at all.
+    fn live_pages(store: &super::GraphStore, tables: &[&str]) -> Vec<u64> {
+        let conn = store
+            .connection()
+            .expect("page accounting needs a connection on the already-open store");
+        tables
+            .iter()
+            .map(|t| {
+                scalar_u64(
+                    &conn,
+                    &format!("CALL storage_info('{t}') RETURN CAST(sum(num_pages) AS INT64)"),
+                )
+                .unwrap_or_else(|e| panic!("storage_info('{t}') RETURN sum(num_pages) failed: {e}"))
+            })
+            .collect()
+    }
+
+    /// Free pages still held inside the file, straight from the free-space
+    /// manager. This is #183's quantity measured rather than inferred: lbug
+    /// frees pages into the FSM but returns them to the filesystem only by
+    /// truncating a *trailing* free range, so climbing bytes alongside a
+    /// climbing free-page count is retained slack, not data the graph holds.
+    ///
+    /// `None` (rendered "n/a") when the engine has no `fsm_info`; it appears in
+    /// lbug's own FSM tests but may postdate our pinned v0.20.4. Deliberately
+    /// not 0 -- "zero pages are being retained" and "this engine cannot tell
+    /// me" are opposite conclusions, and conflating them is exactly the bug
+    /// this instrument already made once.
+    fn free_pages(store: &super::GraphStore) -> Option<u64> {
+        let conn = store.connection().ok()?;
+        scalar_u64(
+            &conn,
+            "CALL fsm_info() RETURN CAST(sum(num_pages) AS INT64)",
+        )
+        .ok()
+    }
+
+    /// Live `Symbol` rows. This separates the two explanations for Symbol's
+    /// page growth that a page count alone cannot distinguish, and which imply
+    /// opposite fixes: genuinely duplicated rows (ours -- a write path
+    /// re-appending data, the #176/#178 class) versus rows deleted each round
+    /// whose node-group pages stay attributed to the table (the engine's, a
+    /// per-table reclamation question). Re-upserting identical content must
+    /// leave this flat at `symbols`; if it does, the pages are tombstoned
+    /// space, not duplicate data.
+    fn symbol_rows(store: &super::GraphStore) -> u64 {
+        let conn = store
+            .connection()
+            .expect("row count needs a connection on the already-open store");
+        scalar_u64(&conn, "MATCH (s:Symbol) RETURN CAST(count(*) AS INT64)")
+            .unwrap_or_else(|e| panic!("Symbol row count failed: {e}"))
+    }
+
+    /// The node tables this fixture's `upsert_file` can write. `Module` and
+    /// `Statement` stay in the list although the extraction carries empty
+    /// vectors for them: an empty table still reports its pages, so a
+    /// regression that starts writing them shows up here rather than hiding
+    /// inside the byte total.
+    const ACCOUNTED_TABLES: &[&str] = &["Symbol", "File", "Module", "Statement"];
+
     fn measure_churn(label: &str, rounds: usize, symbols: usize, vary: bool) -> (u64, u64) {
         // Both of `upsert_file`'s guards resolve project-scoped settings.
         let _env = super::super::store_util::MAX_BYTES_ENV_LOCK
@@ -1620,6 +1733,9 @@ mod tests {
 
         let mut round_zero = 0u64;
         let mut prev = 0u64;
+        let mut page_zero: Vec<u64> = Vec::new();
+        let mut prev_pages: Vec<u64> = Vec::new();
+        let mut prev_free: Option<u64> = None;
         let mut deltas: Vec<i64> = Vec::new();
         for round in 0..rounds {
             let tag = if vary {
@@ -1667,15 +1783,46 @@ mod tests {
             let total = super::super::store_util::graph_family_bytes(&graph);
             let wal = super::super::store_util::graph_wal_bytes(&graph);
             let base = total.saturating_sub(wal);
+            let per_table = live_pages(&store, ACCOUNTED_TABLES);
+            let pages: u64 = per_table.iter().sum();
+            let free = free_pages(&store);
+            let rows = symbol_rows(&store);
+            // Identical rounds re-upsert the same ids, so a correct upsert
+            // leaves exactly `symbols` rows. This is the assertion that
+            // separates the two explanations for page growth -- rows we
+            // duplicated (ours) versus dead versions retained in pages the
+            // table owns (the engine's) -- which produce the same curve and
+            // need opposite fixes. #183 spent an entire investigation on that
+            // distinction; this keeps it from having to be repeated.
+            if !vary {
+                assert_eq!(
+                    rows as usize, symbols,
+                    "[{label}] round {round}: re-upserting identical content must leave \
+                     exactly {symbols} Symbol rows, found {rows} -- a write path is \
+                     duplicating rows rather than replacing them"
+                );
+            }
+            let free_s = free.map_or_else(|| "n/a".to_string(), |f| f.to_string());
             if round == 0 {
                 round_zero = total;
+                page_zero = per_table.clone();
             } else {
                 deltas.push(total as i64 - prev as i64);
             }
             prev = total;
+            prev_pages = per_table;
+            prev_free = free;
+            // Per-table, because the sum cannot say which table is growing.
+            let breakdown = ACCOUNTED_TABLES
+                .iter()
+                .zip(&prev_pages)
+                .map(|(t, n)| format!("{t} {n}"))
+                .collect::<Vec<_>>()
+                .join(" ");
             println!(
                 "[{label}] round {round:>2}: base {base:>10}  wal {wal:>9}  \
-                 total {total:>10}  ({:.2}x round 0)",
+                 total {total:>10}  rows {rows:>6}  live_pages {pages:>7}  free_pages {free_s:>7}  \
+                 ({:.2}x round 0)  [{breakdown}]",
                 total as f64 / round_zero.max(1) as f64
             );
         }
@@ -1698,12 +1845,36 @@ mod tests {
             tail.len(),
             tail_avg
         );
+        // #183's question, put directly rather than inferred from file size.
+        // Measured answer, which refuted the guess this instrument was built to
+        // confirm: live pages do NOT stay flat (3.96x over 40 byte-identical
+        // rounds) and free pages do NOT accumulate (they oscillate in a band),
+        // so the curve is mostly real data pages, not retained slack. That puts
+        // it in the #176/#178 class -- a write path re-appending data the graph
+        // already holds -- rather than anything about engine reclamation.
+        let first_pages: u64 = page_zero.iter().sum();
+        let last_pages: u64 = prev_pages.iter().sum();
+        println!(
+            "[{label}] SUMMARY: {first_pages} -> {last_pages} live pages ({:.2}x), \
+             {} free pages at the end, while bytes grew {:.2}x over the same {rounds} rounds",
+            last_pages as f64 / first_pages.max(1) as f64,
+            prev_free.map_or_else(|| "n/a".to_string(), |f| f.to_string()),
+            prev as f64 / round_zero.max(1) as f64
+        );
+        // The attribution: one table at ~4x with the rest flat names the write
+        // path to audit.
+        for ((table, first), last) in ACCOUNTED_TABLES.iter().zip(&page_zero).zip(&prev_pages) {
+            println!(
+                "[{label}] SUMMARY: {table:<10} {first:>7} -> {last:>7} pages ({:.2}x)",
+                *last as f64 / (*first).max(1) as f64
+            );
+        }
 
         (round_zero, prev)
     }
 
     #[test]
-    #[ignore = "measurement: prints a growth curve, asserts nothing"]
+    #[ignore = "measurement: prints a growth curve, asserts only the row invariant"]
     fn identical_content_churn_page_reuse() {
         measure_churn("identical", 40, 2_000, false);
     }
@@ -1727,10 +1898,26 @@ mod tests {
     /// that matters -- #153 carried one graph 21MB -> 18486MB inside a single
     /// call, about 880x.
     ///
-    /// Deliberately NOT a no-growth assertion. #183 establishes that lbug
-    /// reclaims freed pages only partially, so *some* growth under churn is
-    /// expected; what must not regress is its order of magnitude. Tighten
-    /// this bound if #183 is fixed.
+    /// Deliberately NOT a no-growth assertion. #183's measurements settled why,
+    /// after this comment twice asserted a wrong cause -- both retractions are
+    /// kept here, because the distinction they turn on is easy to re-lose.
+    ///
+    /// Four series over 40 byte-identical rounds: the `Symbol` row count holds
+    /// at exactly 2000, `Symbol`'s `num_pages` grows 4.05x, `fsm_info`'s free
+    /// list oscillates with no trend, and file bytes grow 5.98x. Rows flat means
+    /// `upsert_file` is logically correct and duplicates nothing. So the page
+    /// growth is *deleted row versions still occupying pages the table itself
+    /// owns* -- they never reach the free-space manager, which is exactly why
+    /// the free list stays flat while Symbol's pages quadruple, and nothing
+    /// compacts them. That is neither the "lbug reclaims freed pages only
+    /// partially" story this comment told first, nor the "a write path
+    /// re-appends data (the #176/#178 class)" story it told second.
+    ///
+    /// Hence *some* growth under identical churn is expected, and what must not
+    /// regress is its order of magnitude. Tighten this bound only if the engine
+    /// gains a compaction path: v0.20.4 has none, which
+    /// `does_the_engine_accept_a_compaction_statement` pins, leaving
+    /// rebuild-and-swap (`infigraph rebuild`) as the only reclamation route.
     ///
     /// `#[ignore]`d because 40 rounds costs ~26s; the pre-commit hook runs it
     /// explicitly, alongside the other perf gates.
@@ -1743,8 +1930,10 @@ mod tests {
             ratio < 10.0,
             "40 rounds of re-upserting identical content grew the graph {first} -> {last} \
              bytes ({ratio:.2}x round 0), past the 10x bound. Measured at 5.98x when #183 \
-             was filed. Either page reclamation regressed, or a write path started \
-             re-appending data the graph already had (the #176/#178 class)."
+             was filed. `measure_churn` asserts the row count separately, so this is about \
+             space rather than correctness: expect either more dead space retained per round \
+             in the `Symbol` table, or fresh allocation overhead on top of it. The per-table \
+             page and free-page lines in the output say which."
         );
     }
 
