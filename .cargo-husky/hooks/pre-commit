@@ -49,3 +49,14 @@ cargo test -p infigraph-mcp --test groups_watch_perf -- --ignored
 
 echo '+cargo test -p infigraph-core --test index_perf -- --ignored'
 cargo test -p infigraph-core --test index_perf -- --ignored
+
+# #183: lbug reclaims freed pages only partially, so a graph under repeated
+# delete/recreate churn grows without bound. This is the invariant whose
+# absence let #175-#179 each ship one at a time -- the growth breaker (#100)
+# is a ratio tripwire consulted *between* operations, so it cannot express
+# "this round changed nothing and should have cost ~nothing".
+#
+# `--lib`, not `--test`: it is a unit test, because the size it measures comes
+# from `store_util::graph_family_bytes`, which is `pub(crate)`.
+echo '+cargo test -p infigraph-core --lib -- --ignored unchanged_content_churn_stays_within_its_measured_bound'
+cargo test -p infigraph-core --lib -- --ignored unchanged_content_churn_stays_within_its_measured_bound

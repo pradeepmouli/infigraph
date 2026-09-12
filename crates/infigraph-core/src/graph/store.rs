@@ -1552,6 +1552,202 @@ fn read_generation_field_conn(conn: &Connection, field: &'static str) -> Result<
 #[cfg(test)]
 mod tests {
 
+    /// Measurement instrument, not an assertion (#182 / #179).
+    ///
+    /// The open question behind the whole growth run: when a file's symbols
+    /// are deleted and re-created -- what sittir's watcher does every time a
+    /// generated file is regenerated -- does lbug reuse the freed pages, or
+    /// does the graph file only ever grow? Five fixes (#175-#179) removed
+    /// every *error* symptom (no bad-PK retries, no post-commit checkpoint
+    /// failures, no growth jumps, WAL 0), and sittir still went 77MB -> 438MB
+    /// across rounds that all reported clean, ~35-60MB per round. Shallow
+    /// indexing (#182) is a real fix only if the answer here is "reused". If
+    /// it is "never reclaimed", #182 buys a smaller constant on a leak that
+    /// still runs forever, and the fix belongs at the storage layer instead.
+    ///
+    /// Each round re-upserts the SAME extraction: `upsert_file` DETACH
+    /// DELETEs that file's Symbol/Module/File nodes and re-creates them, so
+    /// every round after the first leaves the graph's logical content
+    /// identical. Each round is then folded via `checkpoint_if_idle(ZERO)`,
+    /// so the printed figure is a settled base image rather than an unfolded
+    /// WAL. Flat after the first round or two => pages are reused. A linear
+    /// climb => monotonic growth, and the fork is answered.
+    ///
+    /// Print-only and `#[ignore]`d deliberately. The CI invariant this is
+    /// groundwork for -- "a round that changes nothing adds ~nothing", the
+    /// assertion whose absence let #175-#179 each ship -- needs a *measured*
+    /// bound; inventing one before the first run would just be a coin flip.
+    ///
+    /// Two variants share one body. `identical` re-upserts byte-identical
+    /// content: the most reuse-friendly case that exists, and therefore an
+    /// optimistic bound. `changing` gives every round fresh symbol ids and a
+    /// fresh content hash, which is what sittir actually does when a
+    /// generated file is regenerated -- the same symbol count, entirely new
+    /// identities. If `changing` leaks faster than `identical`, then identity
+    /// churn rather than volume alone is the driver, and #182's volume
+    /// reduction is treating a symptom.
+    ///
+    /// Run: `cargo test -p infigraph-core --lib -- --ignored --nocapture
+    /// page_reuse`
+    /// Returns `(round 0 bytes, final bytes)` so the invariant test below can
+    /// assert on the same run the measurements print, rather than carrying a
+    /// second copy of this loop.
+    fn measure_churn(label: &str, rounds: usize, symbols: usize, vary: bool) -> (u64, u64) {
+        // Both of `upsert_file`'s guards resolve project-scoped settings.
+        let _env = super::super::store_util::MAX_BYTES_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        const FILE: &str = "src/generated/transport.rs";
+
+        let dir = tempfile::tempdir().unwrap();
+        let graph = dir.path().join("graph");
+
+        // The growth-ratio preflight reads `<db_dir>/graph.health.json`, and
+        // `stamp_healthy_graph_size_if_unset` would otherwise anchor the
+        // baseline to round 0's size -- at 10x, that refuses a write partway
+        // through and truncates the curve being measured. A huge pre-written
+        // baseline keeps the guard asleep without touching env vars.
+        // (`max_bytes` defaults to 8GiB, far beyond fixture scale, so the
+        // absolute ceiling needs no handling.)
+        std::fs::write(
+            dir.path().join("graph.health.json"),
+            r#"{"healthy_size_bytes": 999999999}"#,
+        )
+        .unwrap();
+
+        let store = super::GraphStore::open(&graph).unwrap();
+
+        let mut round_zero = 0u64;
+        let mut prev = 0u64;
+        let mut deltas: Vec<i64> = Vec::new();
+        for round in 0..rounds {
+            let tag = if vary {
+                format!("r{round}_")
+            } else {
+                String::new()
+            };
+            let syms: Vec<crate::model::Symbol> = (0..symbols)
+                .map(|i| crate::model::Symbol {
+                    id: format!("{FILE}::{tag}sym{i}"),
+                    name: format!("{tag}sym{i}"),
+                    kind: crate::model::SymbolKind::Function,
+                    span: crate::model::Span {
+                        file: FILE.to_string(),
+                        start_line: i as u32,
+                        start_col: 0,
+                        end_line: i as u32 + 1,
+                        end_col: 0,
+                    },
+                    signature_hash: format!("{tag}h{i}"),
+                    parent: None,
+                    language: "rust".to_string(),
+                    visibility: Some("public".to_string()),
+                    docstring: None,
+                    complexity: 1,
+                    parameters: None,
+                    return_type: None,
+                    scip_id: None,
+                })
+                .collect();
+            let extraction = crate::model::FileExtraction {
+                file: FILE.to_string(),
+                language: "rust".to_string(),
+                content_hash: format!("{tag}fixed"),
+                symbols: syms,
+                relations: Vec::new(),
+                statements: Vec::new(),
+            };
+
+            store
+                .upsert_file(&extraction)
+                .unwrap_or_else(|e| panic!("[{label}] round {round} upsert failed: {e}"));
+            store.checkpoint_if_idle(std::time::Duration::ZERO);
+
+            let total = super::super::store_util::graph_family_bytes(&graph);
+            let wal = super::super::store_util::graph_wal_bytes(&graph);
+            let base = total.saturating_sub(wal);
+            if round == 0 {
+                round_zero = total;
+            } else {
+                deltas.push(total as i64 - prev as i64);
+            }
+            prev = total;
+            println!(
+                "[{label}] round {round:>2}: base {base:>10}  wal {wal:>9}  \
+                 total {total:>10}  ({:.2}x round 0)",
+                total as f64 / round_zero.max(1) as f64
+            );
+        }
+
+        // The plateau-vs-leak question in one line: a tail average near zero
+        // means the residual is asymptotic; one that holds steady means the
+        // graph grows without bound under churn, just slowly.
+        let tail: Vec<i64> = deltas.iter().rev().take(10).copied().collect();
+        let tail_avg = if tail.is_empty() {
+            0.0
+        } else {
+            tail.iter().sum::<i64>() as f64 / tail.len() as f64
+        };
+        println!(
+            "[{label}] SUMMARY: {} -> {} bytes ({:.2}x) over {rounds} rounds; \
+             last {} rounds averaged {:+.0} bytes/round",
+            round_zero,
+            prev,
+            prev as f64 / round_zero.max(1) as f64,
+            tail.len(),
+            tail_avg
+        );
+
+        (round_zero, prev)
+    }
+
+    #[test]
+    #[ignore = "measurement: prints a growth curve, asserts nothing"]
+    fn identical_content_churn_page_reuse() {
+        measure_churn("identical", 40, 2_000, false);
+    }
+
+    #[test]
+    #[ignore = "measurement: prints a growth curve, asserts nothing"]
+    fn changing_content_churn_page_reuse() {
+        measure_churn("changing", 40, 2_000, true);
+    }
+
+    /// The invariant whose absence let #175-#179 each ship one at a time
+    /// (#183). The growth breaker (#100) is a *ratio tripwire consulted
+    /// between operations*, so it cannot express "this round changed nothing
+    /// and should therefore have cost ~nothing" -- which is how sittir
+    /// reported four consecutive clean rounds while going 77MB -> 388MB.
+    ///
+    /// The bound is measured, not guessed: 40 rounds of re-upserting
+    /// byte-identical content settle at 5.98x round 0 on lbug today (see
+    /// `identical_content_churn_page_reuse` for the full curve). 10x leaves
+    /// real headroom above that while still catching the regression class
+    /// that matters -- #153 carried one graph 21MB -> 18486MB inside a single
+    /// call, about 880x.
+    ///
+    /// Deliberately NOT a no-growth assertion. #183 establishes that lbug
+    /// reclaims freed pages only partially, so *some* growth under churn is
+    /// expected; what must not regress is its order of magnitude. Tighten
+    /// this bound if #183 is fixed.
+    ///
+    /// `#[ignore]`d because 40 rounds costs ~26s; the pre-commit hook runs it
+    /// explicitly, alongside the other perf gates.
+    #[test]
+    #[ignore = "perf gate: ~26s, run by the pre-commit hook"]
+    fn unchanged_content_churn_stays_within_its_measured_bound() {
+        let (first, last) = measure_churn("bound", 40, 2_000, false);
+        let ratio = last as f64 / first.max(1) as f64;
+        assert!(
+            ratio < 10.0,
+            "40 rounds of re-upserting identical content grew the graph {first} -> {last} \
+             bytes ({ratio:.2}x round 0), past the 10x bound. Measured at 5.98x when #183 \
+             was filed. Either page reclamation regressed, or a write path started \
+             re-appending data the graph already had (the #176/#178 class)."
+        );
+    }
+
     /// #149: an idle daemon used to sit indefinitely on an uncheckpointed
     /// WAL, and while it did, every NEW external read-only open was refused
     /// -- observed on sittir with a 6.6MB WAL held for ~45 minutes, and
@@ -1586,7 +1782,9 @@ mod tests {
             .sum();
         assert!(
             wal_before > 0,
-            "precondition: writes must leave an unfolded WAL (auto_checkpoint is off)"
+            "precondition: 200 writes must outrun lbug's own fold schedule. \
+             auto_checkpoint is ON (see Database::new) -- this races it rather \
+             than relying on it being disabled, which ca6cfde's revert undid"
         );
 
         // Zero threshold: the WAL is idle the instant nothing is writing.
