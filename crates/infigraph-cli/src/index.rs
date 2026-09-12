@@ -1000,7 +1000,11 @@ fn sweep_stale_scip_scratch(scip_tmp: &Path) {
     let now = std::time::SystemTime::now();
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("scip") {
+        // `.partial` too: a run killed mid-write leaves one, and if its pid is
+        // ever recycled `reclaim_dead_scip_runs` will read the producer as
+        // alive and skip it, so age remains the backstop for both kinds.
+        let ext = path.extension().and_then(|e| e.to_str());
+        if ext != Some("scip") && ext != Some("partial") {
             continue;
         }
         let stale = entry
@@ -1013,6 +1017,96 @@ fn sweep_stale_scip_scratch(scip_tmp: &Path) {
             let _ = std::fs::remove_file(&path);
         }
     }
+}
+
+/// The pid that produced a scratch file, from its run-unique name
+/// (`<indexer>.<pid>-<nanos>.scip`, or the `.partial` it was written as).
+///
+/// Parses the segment after the *last* `.` in the stem: indexer binary names
+/// contain `-` (`rust-analyzer`, `scip-python`) but never `.`, so the last dot
+/// is always the one [`scip_run_id`] introduced.
+fn scip_run_pid(path: &Path) -> Option<u32> {
+    let stem = path.file_stem()?.to_str()?;
+    let run_id = stem.rsplit_once('.')?.1;
+    run_id.split_once('-')?.0.parse().ok()
+}
+
+/// Reap what a daemon that died without running any destructor left behind
+/// (#180 ask 2), and drop the output that cannot be trusted.
+///
+/// Two things outlive a `SIGKILL` or an lbug `SIGABRT` (#132): the SCIP indexer
+/// process itself, and whatever it had written so far. The hard-exit path
+/// handles its own descendants, but by definition those signals run no code, so
+/// a *fresh* daemon is the first thing in a position to clean up.
+///
+/// Works entirely from the pid embedded in each scratch filename. A pid whose
+/// process is gone means that run is dead, so its group is reaped -- the group
+/// id outlives its leader while any member is alive, which is exactly the
+/// orphaned-indexer case. A `.partial` from a dead run is then deleted: it was
+/// being streamed when its producer died, so it is truncated by construction.
+/// A completed `.scip` is deliberately *kept*, for [`run_scip_indexers`] to
+/// adopt rather than redo the work (#180 ask 3).
+///
+/// Conservative in the one direction that matters: a pid that reads as alive is
+/// skipped, so a recycled pid costs a deferred cleanup (the 6h sweep still gets
+/// it) rather than a live run's file. Returns `(groups reaped, partials removed)`.
+pub(crate) fn reclaim_dead_scip_runs(root: &Path) -> (usize, usize) {
+    let scip_tmp = root.join(".infigraph").join("scip-tmp");
+    let Ok(entries) = std::fs::read_dir(&scip_tmp) else {
+        return (0, 0);
+    };
+    let own = std::process::id();
+    let mut dead_pids: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let mut partials: Vec<PathBuf> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let ext = path.extension().and_then(|e| e.to_str());
+        if ext != Some("scip") && ext != Some("partial") {
+            continue;
+        }
+        let Some(pid) = scip_run_pid(&path) else {
+            continue; // unrecognised name -- leave it to the age-based sweep
+        };
+        if pid == own || infigraph_core::instances::current_process_start_time(pid).is_some() {
+            continue; // ours, or a producer that is still running
+        }
+        dead_pids.insert(pid);
+        if ext == Some("partial") {
+            partials.push(path);
+        }
+    }
+
+    // Reap before deleting: while a group member is still writing, removing the
+    // file only unlinks it and the orphan keeps filling a deleted inode.
+    let killed = dead_pids
+        .iter()
+        .filter(|pid| infigraph_core::daemon::lifecycle::kill_process_group(**pid))
+        .count();
+    let removed = partials
+        .iter()
+        .filter(|path| std::fs::remove_file(path).is_ok())
+        .count();
+    (killed, removed)
+}
+
+/// This process's own in-flight scratch files, so an exit that abandons them
+/// can say what it is abandoning (#180 ask 1).
+pub(crate) fn own_pending_scip_scratch(root: &Path) -> Vec<PathBuf> {
+    let scip_tmp = root.join(".infigraph").join("scip-tmp");
+    let Ok(entries) = std::fs::read_dir(&scip_tmp) else {
+        return Vec::new();
+    };
+    let own = std::process::id();
+    entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            matches!(
+                p.extension().and_then(|e| e.to_str()),
+                Some("scip") | Some("partial")
+            ) && scip_run_pid(p) == Some(own)
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1052,6 +1146,136 @@ mod scip_scratch_tests {
         assert!(!old.exists(), "an hours-old .scip is an orphan");
         assert!(unrelated_old.exists(), "only .scip files are swept");
     }
+
+    #[test]
+    fn sweep_removes_an_old_partial_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join("rust-analyzer.5-5.partial");
+        std::fs::write(&old, b"x").unwrap();
+        let long_ago = std::time::SystemTime::now() - (SCIP_SCRATCH_STALE_AFTER * 2);
+        std::fs::File::options()
+            .write(true)
+            .open(&old)
+            .unwrap()
+            .set_modified(long_ago)
+            .unwrap();
+
+        sweep_stale_scip_scratch(dir.path());
+
+        assert!(
+            !old.exists(),
+            "an hours-old .partial is an orphan too -- age is the backstop for \
+             when a producer's pid has been recycled"
+        );
+    }
+
+    #[test]
+    fn run_pid_is_parsed_from_either_scratch_extension() {
+        let scip = PathBuf::from("/t/rust-analyzer.4321-99.scip");
+        assert_eq!(scip_run_pid(&scip), Some(4321));
+        // The indexer name contains `-`, the run id separator, so parsing must
+        // key off the last `.` rather than the first `-`.
+        let partial = PathBuf::from("/t/scip-python.7-1.partial");
+        assert_eq!(scip_run_pid(&partial), Some(7));
+        // No run id at all (a hand-placed file), and something not ours.
+        assert_eq!(scip_run_pid(&PathBuf::from("/t/index.scip")), None);
+        assert_eq!(scip_run_pid(&PathBuf::from("/t/notes.txt")), None);
+    }
+
+    #[test]
+    fn reclaim_drops_a_dead_runs_partial_and_keeps_its_completed_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let scip_tmp = dir.path().join(".infigraph").join("scip-tmp");
+        std::fs::create_dir_all(&scip_tmp).unwrap();
+
+        // Our own pid is alive by definition, so it stands in for a live run.
+        let live = scip_tmp.join(format!("rust-analyzer.{}-1.partial", std::process::id()));
+        // 999999 is the repo's conventional can't-be-alive pid (see
+        // `lockfile.rs`'s tests); it also stays positive as an `i32`, so the
+        // reap cannot hand `killpg` a nonsense argument.
+        let dead_partial = scip_tmp.join("scip-python.999999-2.partial");
+        let dead_complete = scip_tmp.join("scip-typescript.999999-3.scip");
+        for p in [&live, &dead_partial, &dead_complete] {
+            std::fs::write(p, b"x").unwrap();
+        }
+
+        let (_, removed) = reclaim_dead_scip_runs(dir.path());
+
+        assert_eq!(removed, 1, "only the dead run's partial may be removed");
+        assert!(live.exists(), "a live producer's partial must survive");
+        assert!(
+            !dead_partial.exists(),
+            "a .partial from a dead run is truncated by construction"
+        );
+        assert!(
+            dead_complete.exists(),
+            "a dead run's completed .scip is kept for adoption, not deleted"
+        );
+    }
+
+    /// Adoption decides whether to *skip* running an indexer, so a wrong answer
+    /// either throws away minutes of work or imports something it should not.
+    /// Each rejection path gets pinned.
+    #[test]
+    fn only_a_dead_runs_completed_output_is_adoptable() {
+        let dir = tempfile::tempdir().unwrap();
+        let own = std::process::id();
+
+        // A live producer's completed output: that run will import it itself.
+        let live = dir.path().join(format!("rust-analyzer.{own}-1.scip"));
+        // A dead run's incomplete output: truncated by construction.
+        let dead_partial = dir.path().join("rust-analyzer.999999-2.partial");
+        // A dead run's completed output, for a different indexer.
+        let other = dir.path().join("scip-python.999999-3.scip");
+        for p in [&live, &dead_partial, &other] {
+            std::fs::write(p, b"x").unwrap();
+        }
+
+        assert_eq!(
+            adoptable_scip_output(dir.path(), "rust-analyzer"),
+            None,
+            "a live producer's .scip and a dead run's .partial are both off limits"
+        );
+        assert_eq!(
+            adoptable_scip_output(dir.path(), "scip-python"),
+            Some(other),
+            "a dead run's completed .scip for this indexer is exactly what adoption is for"
+        );
+        assert_eq!(
+            adoptable_scip_output(dir.path(), "scip-typescript"),
+            None,
+            "another indexer's output must never be adopted under the wrong label"
+        );
+    }
+}
+
+/// A completed `.scip` for `binary_name` left behind by a run whose producer is
+/// gone -- the output of an indexer that finished after its daemon died (#180
+/// ask 3).
+///
+/// Complete by construction rather than by inspection: `run_scip_indexer_to`
+/// renames `.partial` into place only once the indexer has exited successfully,
+/// so a `.scip` existing at all means it ran to completion. The one gap is a
+/// file written by a build from before that rename existed, which could be
+/// truncated; the age-based sweep clears those, and the window is one upgrade.
+fn adoptable_scip_output(scip_tmp: &Path, binary_name: &str) -> Option<PathBuf> {
+    std::fs::read_dir(scip_tmp)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("scip"))
+        .filter(|p| {
+            p.file_stem()
+                .and_then(|s| s.to_str())
+                .and_then(|s| s.rsplit_once('.'))
+                .is_some_and(|(prefix, _)| prefix == binary_name)
+        })
+        .find(|p| {
+            scip_run_pid(p).is_some_and(|pid| {
+                pid != std::process::id()
+                    && infigraph_core::instances::current_process_start_time(pid).is_none()
+            })
+        })
 }
 
 pub(crate) fn run_scip_indexers(
@@ -1081,11 +1305,28 @@ pub(crate) fn run_scip_indexers(
     sweep_stale_scip_scratch(&scip_tmp);
     let run_id = scip_run_id();
 
+    // #180 ask 3: re-running an indexer whose previous output is sitting right
+    // there, complete, would redo minutes of work to produce the same bytes --
+    // rust-analyzer's cold start alone is slow. Adopt it instead. The adopted
+    // entry is shaped exactly like a fresh result, so
+    // `import_scip_results_and_embed` imports and deletes it on identical
+    // terms, under the same lock, with no new plumbing.
+    let mut adopted: Vec<(&'static str, PathBuf, bool)> = Vec::new();
+
     let tasks: Vec<_> = binaries
         .into_iter()
         .filter_map(|(indexer, bin_path)| {
             let bin = bin_path?;
             if !should_run_indexer(root, indexer) {
+                return None;
+            }
+            if let Some(path) = adoptable_scip_output(&scip_tmp, indexer.binary_name) {
+                eprintln!(
+                    "Auto-SCIP: adopting {} output from a dead run ({})",
+                    indexer.binary_name,
+                    path.file_name().unwrap_or_default().to_string_lossy()
+                );
+                adopted.push((indexer.binary_name, path, true));
                 return None;
             }
             let output_path = scip_tmp.join(format!("{}.{run_id}.scip", indexer.binary_name));
@@ -1094,8 +1335,13 @@ pub(crate) fn run_scip_indexers(
         .collect();
 
     if tasks.is_empty() {
-        let _ = std::fs::remove_dir(&scip_tmp);
-        return Vec::new();
+        // Only tidy the directory away when nothing was adopted out of it --
+        // `remove_dir` is a no-op on a non-empty one, but being explicit keeps
+        // the intent readable.
+        if adopted.is_empty() {
+            let _ = std::fs::remove_dir(&scip_tmp);
+        }
+        return adopted;
     }
 
     // Run indexers on a small local runtime -- this function is called from
@@ -1110,13 +1356,17 @@ pub(crate) fn run_scip_indexers(
         Ok(rt) => rt,
         Err(e) => {
             eprintln!("Auto-SCIP: failed to start local runtime for SCIP indexers: {e}");
-            let _ = std::fs::remove_dir(&scip_tmp);
-            return Vec::new();
+            if adopted.is_empty() {
+                let _ = std::fs::remove_dir(&scip_tmp);
+            }
+            // Anything already adopted is still importable without a runtime.
+            return adopted;
         }
     };
 
     let root = root.to_path_buf();
-    rt.block_on(async {
+    let mut results = adopted;
+    results.extend(rt.block_on(async {
         let jobs: Vec<IndexerJob> = tasks
             .into_iter()
             .map(|(indexer, bin, output_path)| {
@@ -1130,7 +1380,8 @@ pub(crate) fn run_scip_indexers(
             })
             .collect();
         run_cancellable_indexer_batch(jobs, token).await
-    })
+    }));
+    results
 }
 
 type IndexerJob = (
@@ -1348,7 +1599,20 @@ async fn run_scip_indexer_to(
         Some(extra.as_str())
     };
 
-    if indexer.binary_name == "scip-java" {
+    // Write to a `.partial` sibling and rename only on success. Rename within
+    // one directory is atomic, so the mere *existence* of a `.scip` then means
+    // "an indexer ran to completion" -- which is what makes it safe for a later
+    // run to adopt one left behind by a daemon that died (#180 ask 3).
+    //
+    // Without this there is no on-disk completeness signal at all: the indexer
+    // streams protobuf straight into the final name and success is reported out
+    // of band, in a `bool` that dies with the process. A truncated file is not
+    // even reliably a parse error -- SCIP's `Index.documents` is a repeated
+    // field, so a stream cut at a document boundary parses as a valid index
+    // with fewer documents, and would import silently as partial enrichment.
+    let partial = output_path.with_extension("partial");
+
+    let produced = if indexer.binary_name == "scip-java" {
         // `run_scip_java`'s gradle/maven primary+fallback retry logic is
         // out of scope for Task 6 and stays on the synchronous
         // `std::process::Command` path (`run_scip_indexer_cmd` below) -- it
@@ -1357,20 +1621,27 @@ async fn run_scip_indexer_to(
         // scip-java run temporarily starves any other indexer tasks queued
         // alongside it (no `SCIP_INDEXER_TIMEOUT` bound either). Documented
         // as a known follow-up rather than silently left inconsistent.
-        return run_scip_java(root, &cmd_str, output_path, extra_path);
-    }
+        run_scip_java(root, &cmd_str, &partial, extra_path)
+    } else {
+        run_scip_indexer_cmd_async(
+            root,
+            &cmd_str,
+            indexer.scip_args,
+            label,
+            extra_path,
+            indexer.output_flag,
+            &partial,
+            SCIP_INDEXER_TIMEOUT,
+        )
+        .await
+    };
 
-    run_scip_indexer_cmd_async(
-        root,
-        &cmd_str,
-        indexer.scip_args,
-        label,
-        extra_path,
-        indexer.output_flag,
-        output_path,
-        SCIP_INDEXER_TIMEOUT,
-    )
-    .await
+    if produced && std::fs::rename(&partial, output_path).is_ok() {
+        return true;
+    }
+    // Failed, timed out, or the rename lost: leave nothing adoptable behind.
+    let _ = std::fs::remove_file(&partial);
+    false
 }
 
 fn run_scip_java(root: &Path, cmd: &str, output_path: &Path, extra_path: Option<&str>) -> bool {

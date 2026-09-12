@@ -440,6 +440,20 @@ pub(crate) fn cmd_daemon(root: &Path, debounce: u64) -> Result<()> {
         infigraph_core::build_hash(),
     );
 
+    // #180 ask 2: a SIGKILL, or an lbug SIGABRT (#132), runs no code at all, so
+    // the dying daemon cannot reap its own SCIP indexer or drop the half-written
+    // output. A fresh daemon is the first thing in a position to. Placed after
+    // `acquire_watch_lock` above, so only the daemon that actually won this
+    // project reclaims, and before the coordinator starts below, so an adoptable
+    // `.scip` is still on disk for the enrichment that follows.
+    let (reaped, dropped) = crate::index::reclaim_dead_scip_runs(root);
+    if reaped > 0 || dropped > 0 {
+        eprintln!(
+            "[daemon-start] reclaimed SCIP scratch left by dead runs: reaped {reaped} process \
+             group(s), dropped {dropped} truncated file(s)"
+        );
+    }
+
     // Indexing is otherwise the only thing that rewrites the project's managed
     // `.claude/CLAUDE.md` block, so a changed block (a `VERSION` bump) never
     // reached a project until someone reindexed it. Every indexed project
@@ -531,6 +545,27 @@ pub(crate) fn cmd_daemon(root: &Path, debounce: u64) -> Result<()> {
             // the group rather than known children: rust-analyzer spawns
             // `cargo metadata`, so reaping only direct children strands
             // grandchildren. This kills us too, hence last.
+            // #180 ask 1: say what this exit abandons. The only other
+            // "abandoned" line (below) covers the `ScipImport` cancellation
+            // arm, so a hard exit dropped a SCIP generation with no trace at
+            // all -- the 51-minute orphan in #163 was invisible in the log.
+            // Names the files rather than counting them: each carries its
+            // indexer and run id, which is what makes the leftovers in
+            // `.infigraph/scip-tmp` interpretable afterwards.
+            let abandoned = crate::index::own_pending_scip_scratch(&watchdog_root);
+            if !abandoned.is_empty() {
+                let names: Vec<String> = abandoned
+                    .iter()
+                    .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+                    .collect();
+                eprintln!(
+                    "[daemon] abandoning {} in-flight SCIP scratch file(s) on hard exit: {} \
+                     -- the next daemon adopts a completed one and drops a `.partial` as \
+                     truncated",
+                    names.len(),
+                    names.join(", ")
+                );
+            }
             if !infigraph_core::daemon::lifecycle::kill_own_process_group() {
                 eprintln!(
                     "[daemon] not a process-group leader, so any SCIP indexer still running \

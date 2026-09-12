@@ -257,6 +257,50 @@ pub fn kill_own_process_group() -> bool {
     }
 }
 
+/// Kill the process group led by `pid` -- for reaping a *dead* daemon's
+/// descendants from a fresh one (#180 ask 2).
+///
+/// [`kill_own_process_group`] can only signal the caller's own group, which is
+/// no help on the death paths that run no code at all: a `SIGKILL`, or an lbug
+/// `SIGABRT` (#132). Those leave the SCIP indexer alive with its output
+/// orphaned, and nothing reaps it -- the 6h scratch sweep only deletes files,
+/// it never kills processes.
+///
+/// `pid` doubles as the group id for any real daemon, because
+/// [`lead_own_process_group`] makes `pgid == pid`. That is what lets a fresh
+/// daemon reap an old run knowing nothing but the pid recorded in its scratch
+/// filenames. The group id stays valid while any member lives, so this still
+/// reaches the orphans after the leader itself is gone.
+///
+/// Refuses three cases: our own pid, our own group (which
+/// [`kill_own_process_group`] exists for, and which would kill the caller), and
+/// pid 0 or 1 -- `killpg(0, ...)` means "every process in the caller's session".
+/// Returns whether a signal was actually sent.
+pub fn kill_process_group(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        if pid <= 1 || pid == std::process::id() {
+            return false;
+        }
+        // SAFETY: argument-less getter that cannot fail.
+        if unsafe { libc::getpgrp() } == pid as i32 {
+            return false;
+        }
+        // SAFETY: `pid` is a positive group id, and is neither ours nor
+        // reserved -- both checked above. A group that is already gone fails
+        // with ESRCH, which is the no-op case arriving as an error.
+        unsafe {
+            libc::killpg(pid as i32, libc::SIGKILL);
+        }
+        true
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
 pub fn ensure_daemon_running_required(root: &Path, watch_binary: &Path) -> DaemonStartOutcome {
     if is_remote_backend() {
         return DaemonStartOutcome::AlreadyRunning;
