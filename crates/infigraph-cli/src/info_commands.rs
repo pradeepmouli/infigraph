@@ -644,7 +644,8 @@ pub(crate) fn cmd_daemon(root: &Path, debounce: u64) -> Result<()> {
                 // coordinator's own tick thread -- unlike the coordinator
                 // loop, blocking here doesn't stall drains, other requests,
                 // or fsevents.
-                let requests_dir = root.join(".infigraph").join("requests");
+                let infigraph_dir = root.join(".infigraph");
+                let requests_dir = infigraph_dir.join("requests");
                 for (label, scip_path, success) in results {
                     if !success || !scip_path.exists() {
                         let _ = std::fs::remove_file(&scip_path);
@@ -657,6 +658,30 @@ pub(crate) fn cmd_daemon(root: &Path, debounce: u64) -> Result<()> {
                     if token.is_cancelled() {
                         let _ = std::fs::remove_file(&scip_path);
                         eprintln!("[daemon] SCIP {label} import skipped: daemon shutting down");
+                        continue;
+                    }
+                    // #184: the trigger is a pure generation-drift test, so
+                    // the indexers re-run whether or not they produce
+                    // anything new. Hashing the output here buys the skip
+                    // the trigger can't: an unchanged `.scip` costs a parse
+                    // and a full document walk to discover it changes
+                    // nothing. `None` means the file couldn't be read, which
+                    // must import rather than skip -- and the generation
+                    // half of the check means a rebuilt graph never skips,
+                    // since its enrichment is genuinely gone.
+                    let scip_hash = infigraph_core::scip::scip_output_hash(&scip_path);
+                    if infigraph_core::scip::scip_import_should_skip(
+                        &infigraph_dir,
+                        label,
+                        scip_hash,
+                        job.scip_generation,
+                    ) {
+                        let _ = std::fs::remove_file(&scip_path);
+                        eprintln!(
+                            "[daemon] SCIP {label} import skipped: output unchanged since the \
+                             import that enriched generation {}",
+                            job.scip_generation
+                        );
                         continue;
                     }
                     // Stamp the generation this run started from, not the
@@ -682,6 +707,21 @@ pub(crate) fn cmd_daemon(root: &Path, debounce: u64) -> Result<()> {
                         Ok(infigraph_core::daemon_protocol::WriteResult::ScipImportOk(_)) => {
                             // The coordinator's own `finish_scip_import` already
                             // logged the structured completion line.
+                            //
+                            // Record only on success, and record the
+                            // generation this import *stamped* (the one it
+                            // was asked to enrich), not the one the graph
+                            // was at beforehand -- that stamped value is
+                            // what a later run will read back as the
+                            // graph's current `scip_generation`.
+                            if let Some(hash) = scip_hash {
+                                infigraph_core::scip::record_scip_import(
+                                    &infigraph_dir,
+                                    label,
+                                    hash,
+                                    job.ast_generation,
+                                );
+                            }
                         }
                         Ok(infigraph_core::daemon_protocol::WriteResult::Err { message }) => {
                             eprintln!("[daemon] SCIP {label} import failed: {message}");

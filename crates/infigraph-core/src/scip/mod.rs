@@ -97,6 +97,122 @@ fn enrichment_hash(docstring: &str, scip_id: &str) -> u64 {
     hasher.finish()
 }
 
+/// Where the per-indexer `.scip` content ledger lives (#184).
+///
+/// A sidecar rather than a `GraphMeta` column: the number of entries is the
+/// number of indexers rather than a fixed set of columns; the only reader is
+/// the daemon's enrichment callback, which holds a path and no graph handle;
+/// and a `GraphMeta` write would need the `index.lock` that callback
+/// deliberately does not hold while the external indexers run. Same
+/// `write_atomic` contract and same directory as `graph.health.json`.
+fn scip_ledger_path(infigraph_dir: &Path) -> std::path::PathBuf {
+    infigraph_dir.join("scip-imports.json")
+}
+
+/// A whole-file fingerprint of one indexer's `.scip` output, sitting a layer
+/// *above* `enrichment_hash`: that one asks "is this symbol already
+/// enriched" once the index is parsed and walked, this one decides whether
+/// to parse it at all.
+///
+/// `None` when the file can't be read. Callers must treat that as "not known
+/// to be unchanged" and import anyway -- never as "unchanged", which would
+/// turn an I/O error into silently skipped enrichment.
+pub fn scip_output_hash(scip_path: &Path) -> Option<u64> {
+    Some(crate::embed::fnv1a64(&std::fs::read(scip_path).ok()?))
+}
+
+/// True only when `label`'s output last hashed to `hash` *and* the graph
+/// still carries the `scip_generation` that import stamped.
+///
+/// The second half is what makes a sidecar safe. A hash-only check keeps
+/// answering "unchanged, skip it" after a rebuild, a quarantine, or a
+/// restore from the `previous` pool has reset `scip_generation` -- skipping
+/// an import the now-unenriched graph genuinely needs, which is worse than
+/// the wasted indexer run this is meant to avoid. Every path that can cost
+/// the graph its enrichment also moves that generation off the recorded
+/// value, so this one equality test covers all of them, including any added
+/// later.
+pub fn scip_import_is_redundant(
+    infigraph_dir: &Path,
+    label: &str,
+    hash: u64,
+    current_scip_generation: i64,
+) -> bool {
+    // 0 is the "SCIP has never run here" sentinel everywhere (see
+    // `stamp_scip_generation_conn`); nothing can be redundant against it.
+    if current_scip_generation <= 0 {
+        return false;
+    }
+    let Ok(text) = std::fs::read_to_string(scip_ledger_path(infigraph_dir)) else {
+        return false;
+    };
+    let Ok(ledger) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return false;
+    };
+    let Some(entry) = ledger.get(label) else {
+        return false;
+    };
+    entry.get("hash").and_then(serde_json::Value::as_u64) == Some(hash)
+        && entry
+            .get("scip_generation")
+            .and_then(serde_json::Value::as_i64)
+            == Some(current_scip_generation)
+}
+
+/// The whole per-result decision in one place: skip only a hash we actually
+/// computed *and* found redundant.
+///
+/// This exists so the rule that matters most -- an unreadable `.scip` must
+/// cost an import, never a silent skip -- is a tested function rather than an
+/// `is_some_and` buried in the daemon's enrichment closure, where no test can
+/// reach it.
+pub fn scip_import_should_skip(
+    infigraph_dir: &Path,
+    label: &str,
+    hash: Option<u64>,
+    current_scip_generation: i64,
+) -> bool {
+    hash.is_some_and(|hash| {
+        scip_import_is_redundant(infigraph_dir, label, hash, current_scip_generation)
+    })
+}
+
+/// Record that `label`'s output, hashing to `hash`, was imported and stamped
+/// `stamped_scip_generation`.
+///
+/// Call this only after the import actually succeeded: a hash recorded for a
+/// failed import would suppress the retry, which is the one way this
+/// optimisation could lose data rather than just time.
+pub fn record_scip_import(
+    infigraph_dir: &Path,
+    label: &str,
+    hash: u64,
+    stamped_scip_generation: i64,
+) {
+    let path = scip_ledger_path(infigraph_dir);
+    let mut ledger = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .filter(serde_json::Value::is_object)
+        .unwrap_or_else(|| serde_json::json!({}));
+    // Insert through `as_object_mut`, never `ledger[label] = ...`: indexing a
+    // missing key on a `Value` inserts null as a side effect, which has
+    // corrupted a real settings file in this repo before.
+    if let Some(map) = ledger.as_object_mut() {
+        map.insert(
+            label.to_string(),
+            serde_json::json!({
+                "hash": hash,
+                "scip_generation": stamped_scip_generation,
+            }),
+        );
+    }
+    let _ = crate::daemon_protocol::write_atomic(
+        &path,
+        &serde_json::to_string_pretty(&ledger).unwrap_or_default(),
+    );
+}
+
 /// True when `scip_sym` is a member (e.g. a parameter) of a symbol we
 /// already know about, per SCIP's own descriptor grammar: strip a single
 /// trailing `(...)` group and check whether what remains is a moniker
@@ -1120,6 +1236,109 @@ mod prefilter_tests {
 mod tests {
     use super::*;
     use scip::types::{Document, Occurrence, Relationship, SymbolInformation};
+
+    #[test]
+    fn an_unchanged_scip_is_redundant_only_while_the_graph_keeps_that_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let ig = dir.path();
+        record_scip_import(ig, "scip-rust", 42, 7);
+
+        assert!(
+            scip_import_is_redundant(ig, "scip-rust", 42, 7),
+            "same bytes and the same enrichment still in the graph: skip"
+        );
+        assert!(
+            !scip_import_is_redundant(ig, "scip-rust", 42, 0),
+            "a rebuilt graph reads generation 0 -- the enrichment those bytes \
+             produced is gone, so it must be re-imported, not skipped"
+        );
+        assert!(
+            !scip_import_is_redundant(ig, "scip-rust", 42, 8),
+            "the graph moved past the generation this hash was recorded \
+             against; re-import rather than assume"
+        );
+    }
+
+    #[test]
+    fn a_scip_we_could_not_hash_is_imported_rather_than_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let ig = dir.path();
+        record_scip_import(ig, "scip-rust", 42, 7);
+
+        assert!(
+            scip_import_should_skip(ig, "scip-rust", Some(42), 7),
+            "a hash we computed, matching, with the generation intact: skip"
+        );
+        assert!(
+            !scip_import_should_skip(ig, "scip-rust", None, 7),
+            "an unreadable `.scip` must cost an import -- treating 'could not \
+             read' as 'unchanged' would silently drop enrichment"
+        );
+    }
+
+    #[test]
+    fn a_different_scip_or_indexer_is_never_redundant() {
+        let dir = tempfile::tempdir().unwrap();
+        let ig = dir.path();
+        record_scip_import(ig, "scip-rust", 42, 7);
+
+        assert!(!scip_import_is_redundant(ig, "scip-rust", 43, 7));
+        assert!(
+            !scip_import_is_redundant(ig, "scip-python", 42, 7),
+            "one indexer's ledger entry must never answer for another's"
+        );
+    }
+
+    #[test]
+    fn an_absent_or_unreadable_ledger_is_never_redundant() {
+        let dir = tempfile::tempdir().unwrap();
+        let ig = dir.path();
+        assert!(
+            !scip_import_is_redundant(ig, "scip-rust", 42, 7),
+            "no ledger means nothing is known to be unchanged"
+        );
+
+        std::fs::write(ig.join("scip-imports.json"), "{ not json").unwrap();
+        assert!(
+            !scip_import_is_redundant(ig, "scip-rust", 42, 7),
+            "a corrupt ledger must fall back to importing, not skipping"
+        );
+    }
+
+    #[test]
+    fn recording_one_indexer_leaves_the_others_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let ig = dir.path();
+        record_scip_import(ig, "scip-rust", 1, 5);
+        record_scip_import(ig, "scip-python", 2, 5);
+        record_scip_import(ig, "scip-rust", 9, 6);
+
+        assert!(scip_import_is_redundant(ig, "scip-python", 2, 5));
+        assert!(scip_import_is_redundant(ig, "scip-rust", 9, 6));
+        assert!(
+            !scip_import_is_redundant(ig, "scip-rust", 1, 5),
+            "the rust entry was replaced, not accumulated"
+        );
+    }
+
+    #[test]
+    fn scip_output_hash_reads_content_and_reports_an_unreadable_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.scip");
+        let b = dir.path().join("b.scip");
+        std::fs::write(&a, b"same bytes").unwrap();
+        std::fs::write(&b, b"same bytes").unwrap();
+        assert_eq!(scip_output_hash(&a), scip_output_hash(&b));
+
+        std::fs::write(&b, b"other bytes").unwrap();
+        assert_ne!(scip_output_hash(&a), scip_output_hash(&b));
+
+        assert_eq!(
+            scip_output_hash(&dir.path().join("missing.scip")),
+            None,
+            "callers must be able to tell 'could not read' from a real hash"
+        );
+    }
 
     #[test]
     fn scip_sym_to_name_strips_trailing_suffix_markers() {

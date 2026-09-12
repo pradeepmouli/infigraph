@@ -115,10 +115,19 @@ pub(crate) fn scip_enrichment_due(
 /// was decided -- the value the eventual import stamps as enriched (see
 /// `GraphStore::stamp_scip_generation_conn`), since the graph keeps moving
 /// while the indexers run.
+///
+/// `scip_generation` is the graph's enrichment stamp as it stood when the
+/// run was decided, carried alongside so the import can tell whether the
+/// graph still holds the enrichment a previous identical `.scip` produced
+/// (#184, `scip::scip_import_is_redundant`). It is read at the trigger
+/// rather than at import time on purpose: by the time minutes of indexer
+/// work finish, a rebuild may have reset it, and that reset is exactly the
+/// signal that a skip would be unsafe.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ScipEnrichJob {
     pub languages: Vec<String>,
     pub ast_generation: i64,
+    pub scip_generation: i64,
 }
 
 /// Starts SCIP enrichment as its own background task on `drain_rt`. The
@@ -1020,6 +1029,14 @@ where
                         .backend()
                         .and_then(|b| b.current_ast_generation().ok())
                         .unwrap_or(0);
+                    // A freshly rebuilt graph reads 0 here, which can never
+                    // match a recorded value -- so the #184 content check
+                    // always re-imports after a rebuild, with no special
+                    // case for it.
+                    let scip_generation = prism
+                        .backend()
+                        .and_then(|b| b.current_scip_generation().ok())
+                        .unwrap_or(0);
                     last_scip_attempt_ast_generation = Some(ast_generation);
                     scip_in_flight = Some(spawn_scip_enrich(
                         &drain_rt,
@@ -1029,6 +1046,7 @@ where
                         ScipEnrichJob {
                             languages,
                             ast_generation,
+                            scip_generation,
                         },
                     ));
                 }
@@ -1114,6 +1132,7 @@ where
                                     ScipEnrichJob {
                                         languages,
                                         ast_generation: ast,
+                                        scip_generation: scip,
                                     },
                                 ));
                             }
