@@ -58,3 +58,34 @@ fn growth_max_ratio_reads_its_env_var() {
     assert_eq!(resolve_graph().growth_max_ratio, 3);
     std::env::remove_var("INFIGRAPH_GRAPH_GROWTH_MAX_RATIO");
 }
+
+/// #183: automatic compaction ships opt-in. On by default would have the
+/// daemon seize the single-writer lock for a full reindex on projects whose
+/// owners never asked for it, so the default that matters is the feature
+/// being off -- the thresholds only bite once someone enables it.
+#[test]
+fn compaction_defaults_are_off_with_conservative_thresholds() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    for var in [
+        "INFIGRAPH_GRAPH_COMPACTION",
+        "INFIGRAPH_GRAPH_COMPACTION_DRIFT_RATIO",
+        "INFIGRAPH_GRAPH_COMPACTION_ESCALATE_PCT",
+    ] {
+        std::env::remove_var(var);
+    }
+    let g = resolve_graph();
+    assert!(
+        !g.compaction.0,
+        "compaction must ship opt-in, off by default"
+    );
+    assert_eq!(
+        g.compaction_drift_ratio, 3,
+        "measured churn reached 4.05x pages-per-row with rows flat, so 3 fires \
+         while churn is still climbing rather than after it plateaus"
+    );
+    assert_eq!(
+        g.compaction_escalate_pct, 50,
+        "half of growth_max_ratio -- a percentage, not an absolute, so raising \
+         the cap still escalates at the same relative distance from refusal"
+    );
+}

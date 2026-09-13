@@ -74,6 +74,17 @@ pub use test_templates::{test_templates_for, TestTemplate};
 // - doc_hnsw_threshold: combined-docs HNSW build threshold; also readable
 //   by its pre-macro upstream name `INFIGRAPH_DOC_HNSW_THRESHOLD`
 //   (`infigraph-docs` `combined_hnsw_threshold`)
+// - compaction: opt-in automatic rebuild once dead space accumulates
+//   (`graph::compaction`, #183). Off by default: on would have the daemon
+//   take the single-writer lock for a full reindex unasked.
+// - compaction_drift_ratio: how far a table's pages-per-row may drift above
+//   its post-rebuild baseline before a rebuild is due. Measured churn
+//   reached 4.05x with rows flat, so 3 fires while churn is still climbing
+//   rather than after it plateaus.
+// - compaction_escalate_pct: percent of `growth_max_ratio` at which a
+//   rebuild is forced regardless of idleness -- being refused blocks all
+//   indexing, so an interruption is the lesser harm. A percentage, not an
+//   absolute, so raising the cap keeps the same relative distance.
 crate::settings! {
     graph {
         growth_max_ratio: u64 = 10,
@@ -83,6 +94,9 @@ crate::settings! {
         quarantine_max_bytes: u64 = 1024 * 1024 * 1024,
         slow_lock_ms: u64 = 2000,
         doc_hnsw_threshold: u64 = 200_000,
+        compaction: crate::settings::Toggle = crate::settings::Toggle(false),
+        compaction_drift_ratio: u64 = 3,
+        compaction_escalate_pct: u64 = 50,
     }
 }
 
