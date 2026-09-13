@@ -552,6 +552,107 @@ pub fn check_growth_breaker(ctx: &DoctorContext) -> Vec<CheckResult> {
         .collect()
 }
 
+const COMPACTION_CATEGORY: &str = "graph compaction";
+
+/// Per-table pages-per-row against the last rebuild's baseline (#183).
+///
+/// Reads the sidecar and opens the graph read-only, changing nothing. Note
+/// the contrast with [`check_one_growth_breaker`] directly above, which
+/// opens *nothing*: drift cannot be answered from file sizes, so this one
+/// does open the graph. Read-only and precedented --
+/// `check_one_project_scip_staleness` does the same.
+///
+/// Reported whether or not automatic compaction is enabled. Naming the table
+/// that is bloating is useful either way; the toggle only decides who acts
+/// on it.
+pub fn check_one_compaction_drift(project_path: &Path) -> Option<CheckResult> {
+    let infigraph_dir = project_path.join(".infigraph");
+    let graph_path = infigraph_dir.join("graph");
+    if !graph_path.exists() {
+        return None; // nothing indexed here -- not this check's business
+    }
+    let label = format!("{}: graph compaction drift", project_path.display());
+
+    let baseline = crate::graph::compaction::read_compaction_baseline(&infigraph_dir);
+    if baseline.tables.is_empty() {
+        return Some(CheckResult::warn(
+            COMPACTION_CATEGORY,
+            label,
+            "no compaction baseline is recorded, so drift cannot be measured",
+            "run `infigraph rebuild`, which records one after rebuilding compactly",
+        ));
+    }
+
+    let store = crate::graph::GraphStore::open_read_only(&graph_path).ok()?;
+    let tables: Vec<&str> = crate::graph::compaction::ACCOUNTED_TABLES.to_vec();
+    let now = crate::graph::compaction::table_page_stats(&store, &tables)?;
+
+    let scope = crate::settings_file::ConfigScope::of_infigraph_dir(Some(&infigraph_dir));
+    let cfg = crate::graph::Graph::resolve(crate::graph::RawGraph::default(), scope);
+
+    // `f64` here, unlike `compaction_due`'s cross-multiplication, and both are
+    // right: the predicate must not round a genuine 2.9x down to 2, while this
+    // is formatting a fraction for a human. The float ban applies to settings
+    // fields, which must implement `FromStr + FromTomlItem`, not to local
+    // arithmetic.
+    let worst = now
+        .iter()
+        .filter_map(|(name, cur)| {
+            let base = baseline.tables.get(name)?;
+            if cur.rows == 0 || base.rows == 0 || base.pages == 0 {
+                return None;
+            }
+            let drift =
+                (cur.pages as f64 / cur.rows as f64) / (base.pages as f64 / base.rows as f64);
+            Some((name.clone(), drift))
+        })
+        .max_by(|a, b| a.1.total_cmp(&b.1));
+
+    let due = crate::graph::compaction::compaction_due(
+        &now,
+        &baseline,
+        cfg.compaction_drift_ratio,
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+    );
+
+    match worst {
+        Some((table, drift)) if due => Some(CheckResult::warn(
+            COMPACTION_CATEGORY,
+            label,
+            format!(
+                "`{table}` holds {drift:.2}x the pages per row it did after the last \
+                 rebuild -- that space is dead row versions nothing reclaims"
+            ),
+            if cfg.compaction.0 {
+                "automatic compaction is enabled; the daemon will rebuild when idle"
+            } else {
+                "run `infigraph rebuild`, or enable `[graph] compaction` to have the \
+                 daemon do it when idle"
+            },
+        )),
+        Some((table, drift)) => Some(CheckResult::pass(
+            COMPACTION_CATEGORY,
+            label,
+            format!("worst drift is `{table}` at {drift:.2}x its post-rebuild baseline"),
+        )),
+        None => Some(CheckResult::pass(
+            COMPACTION_CATEGORY,
+            label,
+            "no table has enough rows to measure drift yet",
+        )),
+    }
+}
+
+pub fn check_compaction_drift(ctx: &DoctorContext) -> Vec<CheckResult> {
+    projects_in_scope(ctx)
+        .iter()
+        .filter_map(|p| check_one_compaction_drift(p))
+        .collect()
+}
+
 const WATCHER_HEARTBEAT_STALE_SECS: u64 = 300;
 
 fn now_epoch_secs() -> u64 {
@@ -1279,6 +1380,7 @@ pub fn run_doctor(ctx: DoctorContext) -> DoctorReport {
     checks.extend(check_locks(&ctx));
     checks.extend(check_wal_integrity(&ctx));
     checks.extend(check_growth_breaker(&ctx));
+    checks.extend(check_compaction_drift(&ctx));
     checks.extend(check_graph_holders(&ctx));
     checks.extend(check_watchers(&ctx));
     checks.extend(check_instances(&ctx));

@@ -1684,3 +1684,12 @@ fn doctor_warns_when_no_growth_baseline_is_recorded() {
         warned.remediation
     );
 }
+
+/// #183: drift is measured against a graph, so a directory that was never
+/// indexed is not this check's business -- it must stay silent rather than
+/// report a missing baseline for something that has no graph at all.
+#[test]
+fn compaction_drift_is_not_reported_for_an_unindexed_project() {
+    let dir = tempfile::tempdir().unwrap();
+    assert!(infigraph_core::doctor::check_one_compaction_drift(dir.path()).is_none());
+}
