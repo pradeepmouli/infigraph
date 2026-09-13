@@ -719,6 +719,10 @@ where
     // on a background task while producers keep filling it under the mutex.
     let queue = Arc::new(Mutex::new(IndexWorkQueue::new()));
     let infigraph_dir = root.join(".infigraph");
+    // #183: the live graph file, for the compaction escalation check below.
+    // Derived once rather than per tick -- it is two `join`s, but the check
+    // runs every `COORDINATOR_TICK`.
+    let graph_path = infigraph_dir.join("graph");
 
     // R3.3.5's dirty-set recovery now runs inside `run_producer` (once per
     // producer start), not here -- it is watch-side recovery, and keeping a
@@ -780,6 +784,20 @@ where
     // direct-callback SCIP-enrichment path's own background task, not this
     // request-driven import.
     let mut scip_import_in_flight: Option<PendingScipImport> = None;
+    // #183: when the per-table compaction drift was last sampled. `None`
+    // until the first sample, so the first idle tick measures immediately
+    // rather than waiting out a full interval.
+    let mut last_compaction_sample: Option<std::time::Instant> = None;
+    // Resolved once, like `scip_settings` below: enabling compaction takes a
+    // daemon restart, which is how every other daemon-lifetime setting
+    // behaves. The thresholds it consults are re-read per call, because those
+    // are the numbers an operator tunes while watching a graph misbehave.
+    let compaction_enabled = crate::graph::Graph::resolve(
+        crate::graph::RawGraph::default(),
+        crate::settings_file::ConfigScope::of_infigraph_dir(Some(&infigraph_dir)),
+    )
+    .compaction
+    .0;
 
     let sentinel = root.join(".infigraph").join("watch.stop");
 
@@ -1233,6 +1251,88 @@ where
             // full COORDINATOR_TICK.
             if let Err(e) = crate::recovery::drain_recovery_sentinel(&infigraph_dir) {
                 eprintln!("[watch] recovery-sentinel handling failed: {e}");
+            }
+
+            // #183: scheduled compaction. Deliberately inside `serve_requests`
+            // -- only a real daemon submits. An in-process watcher thread
+            // dropping a discretionary `FullReindex` would put a rebuild
+            // outside the single-writer reasoning this whole design rests on.
+            //
+            // Escalation runs every tick because it is two file stats on
+            // bytes already known. The per-table measurement runs only while
+            // idle and at most every `COMPACTION_SAMPLE_INTERVAL`, so the
+            // expensive read cannot land at a bad moment by construction.
+            if compaction_enabled {
+                let escalate = escalation_due(&infigraph_dir, &graph_path);
+                // The same idleness the SCIP staleness probe above computes,
+                // including `scip_in_flight` (a distinct task from
+                // `scip_import_in_flight`) and an empty queue. Compaction is
+                // heavier than enrichment, so it takes the stricter guard,
+                // never a looser one.
+                let idle = drain_in_flight.is_none()
+                    && full_reindex_in_flight.is_none()
+                    && scip_in_flight.is_none()
+                    && scip_import_in_flight.is_none()
+                    && queue.lock().unwrap().is_empty();
+                let sample_due = last_compaction_sample
+                    .is_none_or(|t| t.elapsed() >= COMPACTION_SAMPLE_INTERVAL);
+
+                // Skipped entirely when escalating: the rebuild is already
+                // decided, and measuring would only cost a read to confirm it.
+                let drift = if idle && sample_due && !escalate {
+                    last_compaction_sample = Some(std::time::Instant::now());
+                    // Only measures a graph the daemon already holds open.
+                    // Deliberately not `watch_db`, which the SCIP staleness
+                    // probe uses to force an open -- opening the graph purely
+                    // to decide whether to rebuild it is a worse trade than
+                    // waiting for the next sample.
+                    held_prism
+                        .as_ref()
+                        .and_then(|p| p.graph_store())
+                        .and_then(|store| {
+                            let now = crate::graph::compaction::table_page_stats(
+                                &store,
+                                crate::graph::compaction::ACCOUNTED_TABLES,
+                            )?;
+                            let baseline =
+                                crate::graph::compaction::read_compaction_baseline(&infigraph_dir);
+                            let scope = crate::settings_file::ConfigScope::of_infigraph_dir(Some(
+                                &infigraph_dir,
+                            ));
+                            let cfg = crate::graph::Graph::resolve(
+                                crate::graph::RawGraph::default(),
+                                scope,
+                            );
+                            Some(crate::graph::compaction::compaction_due(
+                                &now,
+                                &baseline,
+                                cfg.compaction_drift_ratio,
+                                std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_secs())
+                                    .unwrap_or(0),
+                            ))
+                        })
+                        .unwrap_or(false)
+                } else {
+                    false
+                };
+
+                if escalate || drift {
+                    let projected = crate::graph::store_util::graph_family_bytes(&graph_path);
+                    match crate::graph::store_util::check_disk_headroom(&infigraph_dir, projected) {
+                        Ok(()) => {
+                            eprintln!(
+                                "[daemon] compaction: requesting a rebuild ({})",
+                                if escalate { "escalated" } else { "drift" }
+                            );
+                            if let Err(e) = submit_compaction_rebuild(&infigraph_dir) {
+                                eprintln!("[daemon] compaction: could not submit rebuild: {e}");
+                            }
+                        }
+                        Err(e) => eprintln!("[daemon] compaction: skipped, {e}"),
+                    }
+                }
             }
 
             let requests_dir = infigraph_dir.join("requests");
@@ -2113,6 +2213,59 @@ where
     })
 }
 
+/// How long the coordinator waits between per-table compaction samples
+/// (#183). A constant, not a setting: nothing suggests a project-specific
+/// value, and a graph cannot cross from below the drift ratio to past the
+/// escalation point inside one interval -- the fastest movement observed is
+/// tens of megabytes per import against hundreds of megabytes of headroom.
+const COMPACTION_SAMPLE_INTERVAL: Duration = Duration::from_secs(600);
+
+/// Whether the graph is close enough to refusal that a rebuild should happen
+/// regardless of idleness (#183).
+///
+/// Being refused blocks *all* indexing, so an interruption is the lesser
+/// harm. Costs no new measurement: `graph_growth_ratio` reads bytes already
+/// stat'd on every write path, which is why this can run every tick while
+/// the per-table drift sample cannot.
+///
+/// Settings are resolved per call rather than once before the loop, unlike
+/// `scip_settings` above. The read is a small TOML and this runs on a 200ms
+/// tick; the trade is that a `compaction_escalate_pct` change takes effect
+/// without a daemon restart, where a SCIP settings change does not.
+fn escalation_due(infigraph_dir: &Path, graph_path: &Path) -> bool {
+    let scope = crate::settings_file::ConfigScope::of_infigraph_dir(Some(infigraph_dir));
+    let cfg = crate::graph::Graph::resolve(crate::graph::RawGraph::default(), scope);
+    let Some(ratio) = crate::graph::store_util::graph_growth_ratio(infigraph_dir, graph_path)
+    else {
+        return false; // no baseline -- nothing to be close to
+    };
+    ratio.saturating_mul(100)
+        >= cfg
+            .growth_max_ratio
+            .saturating_mul(cfg.compaction_escalate_pct)
+}
+
+/// Ask the coordinator to rebuild, the same way `drain_recovery_sentinel`
+/// does: drop a `WriteRequest::FullReindex` into the requests directory, for
+/// this same tick's scan to pick up. Submitting no new *kind* of write is
+/// what keeps single-writer true by construction (#183).
+///
+/// Deliberately does NOT call `recovery::record_recovery_attempt`. That
+/// budget protects corruption recovery, which is not discretionary; a
+/// compaction rebuild spending it could leave a genuinely corrupt graph
+/// unrecovered. Compaction rate-limits itself through `stamped_at` in its
+/// own sidecar -- see `graph::compaction::MIN_REBUILD_INTERVAL`.
+///
+/// Errors propagate rather than being swallowed, unlike
+/// `stamp_compaction_baseline`: a lost baseline costs one re-measured cycle,
+/// a lost submission costs the rebuild itself, so the caller logs it.
+fn submit_compaction_rebuild(infigraph_dir: &Path) -> Result<()> {
+    let request_path = infigraph_dir.join("requests").join("compaction.request");
+    let serialized = serde_json::to_string(&crate::daemon_protocol::WriteRequest::FullReindex)
+        .expect("WriteRequest::FullReindex always serializes");
+    crate::daemon_protocol::write_atomic(&request_path, &serialized)
+}
+
 /// Loop-thread entry point for a `WriteRequest::ScipImport`. Mirrors
 /// `try_start_full_reindex`'s shape, but much simpler: a SCIP import writes
 /// directly into the live graph in place (`Infigraph::import_scip`'s own
@@ -2550,6 +2703,20 @@ fn finish_full_reindex(
             // baseline. Ordinary incremental writes deliberately do not
             // (see `stamp_healthy_graph_size`'s doc comment).
             crate::graph::stamp_healthy_graph_size(&infigraph_dir, &live_path);
+            // #183: the same verified checkpoint re-stamps the compaction
+            // baseline. This is what makes `MIN_REBUILD_INTERVAL` work at
+            // all -- `stamped_at` is the rate limiter, so a baseline that
+            // never advances leaves the one-hour floor silently disengaged.
+            // Measured after the swap and reopen, so the numbers describe the
+            // graph that is now live rather than the one just retired.
+            if let Some(store) = prism.graph_store() {
+                if let Some(stats) = crate::graph::compaction::table_page_stats(
+                    &store,
+                    crate::graph::compaction::ACCOUNTED_TABLES,
+                ) {
+                    crate::graph::compaction::stamp_compaction_baseline(&infigraph_dir, &stats);
+                }
+            }
             if let (Some(refusal), Some(retired)) = (&retired_refusal, &retired_path) {
                 eprintln!(
                     "[daemon] full-reindex: discarding the retired graph {} -- it was past its \
@@ -3094,6 +3261,41 @@ mod tests {
 
         let quiet = growth_note(0, 100 * MB, s, &[]).unwrap();
         assert!(quiet.contains("nothing tracked in flight"), "{quiet}");
+    }
+
+    /// #183: escalation must fire on the byte ratio alone, with no per-table
+    /// measurement and no compaction baseline -- that is the whole point of
+    /// having a second, always-current signal. Drift asks "is this worth
+    /// doing while nobody is looking"; escalation asks "has waiting become
+    /// unsafe", and being refused blocks all indexing.
+    #[test]
+    fn escalation_fires_on_the_byte_ratio_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let infigraph_dir = tmp.path().to_path_buf();
+        let graph_path = infigraph_dir.join("graph");
+        std::fs::write(&graph_path, vec![0u8; 4096]).unwrap();
+        crate::graph::stamp_healthy_graph_size(&infigraph_dir, &graph_path);
+        std::fs::write(&graph_path, vec![0u8; 4096 * 6]).unwrap();
+
+        assert!(
+            escalation_due(&infigraph_dir, &graph_path),
+            "6x against a 10x cap is past the 50% escalation point"
+        );
+    }
+
+    #[test]
+    fn escalation_does_not_fire_below_the_threshold() {
+        let tmp = tempfile::tempdir().unwrap();
+        let infigraph_dir = tmp.path().to_path_buf();
+        let graph_path = infigraph_dir.join("graph");
+        std::fs::write(&graph_path, vec![0u8; 4096]).unwrap();
+        crate::graph::stamp_healthy_graph_size(&infigraph_dir, &graph_path);
+        std::fs::write(&graph_path, vec![0u8; 4096 * 3]).unwrap();
+
+        assert!(
+            !escalation_due(&infigraph_dir, &graph_path),
+            "3x is below the 5x escalation point"
+        );
     }
 
     mod idle_fold {

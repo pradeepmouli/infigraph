@@ -180,12 +180,6 @@ pub(crate) fn healthy_baseline_recorded(infigraph_dir: &Path) -> bool {
 /// against hundreds of megabytes of headroom.
 ///
 /// Costs no new measurement -- these bytes are already stat'd on every write.
-// TEMPORARY: the only non-test caller is the coordinator's `escalation_due`,
-// which lands with the tick wiring. `allow` rather than `expect` because
-// `--all-targets` compiles this crate both with and without `cfg(test)`, and
-// an expectation the test target fulfils but the lib target does not would
-// itself fail the build. Delete this line when that caller arrives.
-#[allow(dead_code)]
 pub(crate) fn graph_growth_ratio(infigraph_dir: &Path, graph_path: &Path) -> Option<u64> {
     let healthy = read_healthy_size(infigraph_dir)?;
     if healthy == 0 {
