@@ -140,7 +140,11 @@ That project reached 5× a few hours after a rebuild, so it would fire several t
 | no baseline | bootstrap it; do not rebuild |
 | `rows == 0` | skip that table |
 | insufficient disk | skip and log; `check_disk_headroom` already refuses rather than filling the disk |
-| repeated rebuilds | the existing crash-loop breaker caps at 2 per hour |
+| repeated rebuilds | the baseline's own `stamped_at` gates a minimum of one hour between automatic rebuilds |
+
+**Compaction keeps its own rate limit rather than using `recovery.rs`'s crash-loop breaker**, despite that breaker being `pub` and a close fit (`CRASH_LOOP_THRESHOLD = 2` within `CRASH_LOOP_WINDOW = 1h`). Its budget protects *corruption recovery*, which is not discretionary. If a compaction rebuild spent it, a subsequent real corruption would trip the breaker, write a crash-loop marker, and leave the graph unrecovered pending human intervention — a discretionary trigger starving an essential one.
+
+Since the baseline is re-stamped after every rebuild, recording `stamped_at` inside it makes the sidecar its own rate limiter: no second log, and no dependence on file mtime.
 
 Rebuild peak disk is old + new simultaneously (`PREVIOUS_RETENTION = 1`), so a rebuild needs free space roughly equal to the current graph.
 
