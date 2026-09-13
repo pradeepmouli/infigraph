@@ -162,6 +162,60 @@ pub fn stamp_compaction_baseline(infigraph_dir: &Path, stats: &[(String, TableSt
     let _ = crate::daemon_protocol::write_atomic(&compaction_baseline_path(infigraph_dir), &json);
 }
 
+/// Minimum wall-clock gap between automatic rebuilds.
+///
+/// One hour, matching `recovery::CRASH_LOOP_WINDOW` in spirit while
+/// deliberately keeping a separate budget: compaction is discretionary and
+/// must never be able to starve corruption recovery, which is not.
+pub const MIN_REBUILD_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// Whether any table's pages-per-row has drifted `drift_ratio`x above its
+/// post-rebuild baseline, and enough time has passed since the last rebuild.
+///
+/// Pure, like `daemon::scip_enrichment_due` -- the caller owns the I/O, so
+/// the decision itself is table-testable. `now_secs` is injected for the
+/// same reason.
+///
+/// Compared by cross-multiplication rather than division: settings fields
+/// cannot be floats, and integer division would round a genuine 2.9x down.
+/// The products are widened to `u128` because `pages * rows * ratio`
+/// overflows `u64` at realistic page counts.
+///
+/// The retry gate is checked before the per-table loop, so "a rebuild just
+/// happened" is an unconditional veto no amount of drift can override --
+/// otherwise a rebuild that failed to reclaim would re-trigger itself
+/// immediately on the very same numbers.
+pub fn compaction_due(
+    now: &[(String, TableStats)],
+    baseline: &CompactionBaseline,
+    drift_ratio: u64,
+    now_secs: u64,
+) -> bool {
+    if baseline.tables.is_empty() || drift_ratio == 0 {
+        return false;
+    }
+    // Saturating, not plain subtraction: a baseline stamped in the future
+    // (clock skew, a restored backup) would underflow into a huge elapsed
+    // time and make compaction permanently due. Zero elapsed defers instead.
+    if now_secs.saturating_sub(baseline.stamped_at) < MIN_REBUILD_INTERVAL.as_secs() {
+        return false;
+    }
+    now.iter().any(|(table, cur)| {
+        let Some(base) = baseline.tables.get(table) else {
+            return false; // absent from the baseline -- not measured then
+        };
+        // A zero-row table has no meaningful pages-per-row, and a zero-page
+        // baseline would make every later reading infinite drift.
+        if cur.rows == 0 || base.rows == 0 || base.pages == 0 {
+            return false;
+        }
+        // cur.pages/cur.rows > drift_ratio * base.pages/base.rows
+        let lhs = (cur.pages as u128) * (base.rows as u128);
+        let rhs = (drift_ratio as u128) * (base.pages as u128) * (cur.rows as u128);
+        lhs > rhs
+    })
+}
+
 #[cfg(test)]
 mod measurement_tests {
     use super::table_page_stats;
@@ -224,5 +278,117 @@ mod baseline_tests {
                 rows: 2400
             })
         );
+    }
+}
+
+#[cfg(test)]
+mod predicate_tests {
+    use super::{compaction_due, CompactionBaseline, TableStats};
+
+    fn base(stamped_at: u64, entries: &[(&str, u64, u64)]) -> CompactionBaseline {
+        CompactionBaseline {
+            stamped_at,
+            tables: entries
+                .iter()
+                .map(|(n, pages, rows)| {
+                    (
+                        (*n).to_string(),
+                        TableStats {
+                            pages: *pages,
+                            rows: *rows,
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    fn now(entries: &[(&str, u64, u64)]) -> Vec<(String, TableStats)> {
+        entries
+            .iter()
+            .map(|(n, pages, rows)| {
+                (
+                    (*n).to_string(),
+                    TableStats {
+                        pages: *pages,
+                        rows: *rows,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    const LATER: u64 = 100_000;
+
+    /// The measured shape of #183: rows flat, pages climbing. 2000 rows in
+    /// 100 pages became 2000 rows in 405 pages over 40 identical rounds.
+    #[test]
+    fn pages_climbing_on_flat_rows_is_due() {
+        assert!(compaction_due(
+            &now(&[("Symbol", 405, 2000)]),
+            &base(1, &[("Symbol", 100, 2000)]),
+            3,
+            LATER,
+        ));
+    }
+
+    /// Genuine new code raises pages AND rows, leaving the ratio flat. A
+    /// rebuild reclaims nothing, so it must not fire however large the graph.
+    #[test]
+    fn proportional_growth_is_not_due() {
+        assert!(!compaction_due(
+            &now(&[("Symbol", 1000, 20_000)]),
+            &base(1, &[("Symbol", 100, 2000)]),
+            3,
+            LATER,
+        ));
+    }
+
+    /// Without a baseline there is nothing to compare against.
+    #[test]
+    fn an_absent_baseline_is_never_due() {
+        assert!(!compaction_due(
+            &now(&[("Symbol", 999, 1)]),
+            &CompactionBaseline::default(),
+            3,
+            LATER,
+        ));
+    }
+
+    /// A zero-row table makes pages-per-row infinite. This is the growth
+    /// guard's near-zero-denominator bug one component over: skip the table
+    /// rather than divide by it.
+    #[test]
+    fn a_zero_row_table_is_skipped_not_treated_as_infinite_drift() {
+        assert!(!compaction_due(
+            &now(&[("Statement", 50, 0)]),
+            &base(1, &[("Statement", 0, 0)]),
+            3,
+            LATER,
+        ));
+    }
+
+    /// Per-table precisely so one bloated table is not averaged away.
+    #[test]
+    fn one_drifting_table_among_several_is_due() {
+        assert!(compaction_due(
+            &now(&[("Symbol", 110, 1000), ("File", 40, 100)]),
+            &base(1, &[("Symbol", 100, 1000), ("File", 10, 100)]),
+            3,
+            LATER,
+        ));
+    }
+
+    /// The retry gate. Rebuilding again immediately after the last one would
+    /// loop on a graph whose drift a rebuild cannot fix, so a rebuild inside
+    /// MIN_REBUILD_INTERVAL is never due -- however bad the drift looks.
+    #[test]
+    fn a_recent_rebuild_defers_however_bad_the_drift() {
+        assert!(!compaction_due(
+            &now(&[("Symbol", 9999, 2000)]),
+            &base(LATER - 60, &[("Symbol", 100, 2000)]),
+            3,
+            LATER,
+        ));
     }
 }
