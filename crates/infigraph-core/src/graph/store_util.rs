@@ -161,6 +161,42 @@ pub(crate) fn healthy_baseline_recorded(infigraph_dir: &Path) -> bool {
     read_healthy_size(infigraph_dir).is_some()
 }
 
+/// How many times its recorded healthy size the graph currently is, or
+/// `None` when no baseline exists (#183).
+///
+/// Not a variant of [`check_graph_growth_ratio`] despite the near-identical
+/// name, and the distinction is the point: that one answers *pass or refuse*,
+/// this one answers *how far*. Compaction needs the distance so it can act
+/// before the refusal rather than after -- being refused blocks all indexing.
+/// A named accessor rather than a richer return type on that function, whose
+/// eight write-path call sites would only have to ignore it: the same
+/// reasoning as [`healthy_baseline_recorded`] (#180 ask 5).
+///
+/// Lives here rather than in `graph::compaction` because [`read_healthy_size`]
+/// is private to this module, and one caller is not reason enough to widen it.
+///
+/// Integer division, so 4.9x reads as 4. That errs toward *not* escalating,
+/// which is the safe direction: the next sample catches it minutes later,
+/// against hundreds of megabytes of headroom.
+///
+/// Costs no new measurement -- these bytes are already stat'd on every write.
+// TEMPORARY: the only non-test caller is the coordinator's `escalation_due`,
+// which lands with the tick wiring. `allow` rather than `expect` because
+// `--all-targets` compiles this crate both with and without `cfg(test)`, and
+// an expectation the test target fulfils but the lib target does not would
+// itself fail the build. Delete this line when that caller arrives.
+#[allow(dead_code)]
+pub(crate) fn graph_growth_ratio(infigraph_dir: &Path, graph_path: &Path) -> Option<u64> {
+    let healthy = read_healthy_size(infigraph_dir)?;
+    if healthy == 0 {
+        // The `0 * 10 == 0` case documented on `stamp_healthy_graph_size`
+        // below: a baseline stamped before the WAL folded once refused 3MB of
+        // entirely legitimate data. Unknown must not read as infinite drift.
+        return None;
+    }
+    Some(graph_family_bytes(graph_path) / healthy)
+}
+
 /// Refreshes the recorded "last known healthy size" baseline. Call this
 /// only after a *verified* healthy checkpoint -- a completed full rebuild
 /// (build-fresh-then-swap succeeded and the swapped-in graph reopened), not
@@ -861,7 +897,7 @@ mod tests {
 
     use super::{
         check_disk_headroom, check_graph_growth_ratio, classify_file,
-        copy_edges_with_bad_record_retry, extract_bad_copy_value, is_lockfile,
+        copy_edges_with_bad_record_retry, extract_bad_copy_value, graph_growth_ratio, is_lockfile,
         prefilter_pairs_against_existing, read_healthy_size, resolve_import_candidate,
         stamp_healthy_graph_size, stamp_healthy_graph_size_if_unset, unwind_edges_from_pairs,
         GRAPH_MAX_BYTES_ENV, MAX_BAD_RECORD_RETRIES,
@@ -983,6 +1019,26 @@ mod tests {
         std::fs::write(&graph_path, vec![0u8; 999_999]).unwrap();
         stamp_healthy_graph_size_if_unset(tmp.path(), &graph_path);
         assert_eq!(read_healthy_size(tmp.path()), Some(1024));
+    }
+
+    /// #183: compaction escalates on *how close to refusal* the graph is, so
+    /// absence of a baseline must read as "unknown", never as a ratio.
+    #[test]
+    fn growth_ratio_is_none_without_a_baseline() {
+        let tmp = tempfile::tempdir().unwrap();
+        let graph_path = tmp.path().join("graph");
+        std::fs::write(&graph_path, vec![0u8; 4096]).unwrap();
+        assert_eq!(graph_growth_ratio(tmp.path(), &graph_path), None);
+    }
+
+    #[test]
+    fn growth_ratio_reports_how_far_past_the_baseline_the_graph_is() {
+        let tmp = tempfile::tempdir().unwrap();
+        let graph_path = tmp.path().join("graph");
+        std::fs::write(&graph_path, vec![0u8; 4096]).unwrap();
+        stamp_healthy_graph_size(tmp.path(), &graph_path);
+        std::fs::write(&graph_path, vec![0u8; 4096 * 5]).unwrap();
+        assert_eq!(graph_growth_ratio(tmp.path(), &graph_path), Some(5));
     }
 
     /// The runaway that reached 39 GB got there through this fallback.
