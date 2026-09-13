@@ -5,6 +5,8 @@
 //! `does_the_engine_accept_a_compaction_statement`), so rebuild-and-swap is
 //! the only reclamation route and this module only decides *when*.
 
+use std::path::Path;
+
 use super::GraphStore;
 use kuzu::Connection;
 
@@ -98,6 +100,68 @@ pub fn table_page_stats(store: &GraphStore, tables: &[&str]) -> Option<Vec<(Stri
         .collect()
 }
 
+/// Per-table stats as of the last verified rebuild, plus when they were
+/// recorded.
+///
+/// `stamped_at` is load-bearing beyond documentation: it is how the policy
+/// rate-limits itself, deliberately *not* by consuming `recovery.rs`'s
+/// crash-loop budget. That budget protects corruption recovery, which is not
+/// discretionary -- a compaction rebuild that exhausted it could leave a
+/// genuinely corrupt graph unrecovered.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct CompactionBaseline {
+    #[serde(default)]
+    pub stamped_at: u64,
+    #[serde(default)]
+    pub tables: std::collections::BTreeMap<String, TableStats>,
+}
+
+fn compaction_baseline_path(infigraph_dir: &Path) -> std::path::PathBuf {
+    infigraph_dir.join("graph.compaction.json")
+}
+
+fn now_epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// The recorded baseline, or an empty one.
+///
+/// Empty is a real answer meaning "no comparison is possible";
+/// `compaction_due` returns false on it rather than treating absence as
+/// drift. Missing, unreadable and corrupt all collapse here deliberately:
+/// each means the same thing to the policy, and the worst outcome is a
+/// missed cycle rather than a rebuild fired on a number nobody recorded.
+pub fn read_compaction_baseline(infigraph_dir: &Path) -> CompactionBaseline {
+    std::fs::read_to_string(compaction_baseline_path(infigraph_dir))
+        .ok()
+        .and_then(|c| serde_json::from_str(&c).ok())
+        .unwrap_or_default()
+}
+
+/// Record a new baseline, replacing any existing one.
+///
+/// Call only after a *verified* rebuild -- build-fresh-then-swap succeeded
+/// and the swapped-in graph reopened -- never after an ordinary write. See
+/// `store_util::stamp_healthy_graph_size`: stamping on every write lets the
+/// baseline ratchet forward with the very growth it exists to catch.
+///
+/// Failures are swallowed rather than propagated. A baseline that does not
+/// persist costs one re-measured cycle; returning an error here would let a
+/// full disk abort a rebuild that has already succeeded.
+pub fn stamp_compaction_baseline(infigraph_dir: &Path, stats: &[(String, TableStats)]) {
+    let baseline = CompactionBaseline {
+        stamped_at: now_epoch_secs(),
+        tables: stats.iter().cloned().collect(),
+    };
+    let Ok(json) = serde_json::to_string_pretty(&baseline) else {
+        return;
+    };
+    let _ = crate::daemon_protocol::write_atomic(&compaction_baseline_path(infigraph_dir), &json);
+}
+
 #[cfg(test)]
 mod measurement_tests {
     use super::table_page_stats;
@@ -113,5 +177,52 @@ mod measurement_tests {
         assert_eq!(stats.len(), 1);
         assert_eq!(stats[0].0, "Symbol");
         assert_eq!(stats[0].1.rows, 0);
+    }
+}
+
+#[cfg(test)]
+mod baseline_tests {
+    use super::{read_compaction_baseline, stamp_compaction_baseline, TableStats};
+
+    fn t(name: &str, pages: u64, rows: u64) -> (String, TableStats) {
+        (name.to_string(), TableStats { pages, rows })
+    }
+
+    #[test]
+    fn a_stamped_baseline_reads_back_with_a_timestamp() {
+        let dir = tempfile::tempdir().unwrap();
+        stamp_compaction_baseline(dir.path(), &[t("Symbol", 100, 2000)]);
+        let back = read_compaction_baseline(dir.path());
+        assert_eq!(
+            back.tables.get("Symbol"),
+            Some(&TableStats {
+                pages: 100,
+                rows: 2000
+            })
+        );
+        assert!(back.stamped_at > 0, "must record when it was stamped");
+    }
+
+    #[test]
+    fn no_sidecar_reads_as_empty_rather_than_failing() {
+        let dir = tempfile::tempdir().unwrap();
+        let back = read_compaction_baseline(dir.path());
+        assert!(back.tables.is_empty());
+        assert_eq!(back.stamped_at, 0);
+    }
+
+    #[test]
+    fn stamping_replaces_the_previous_baseline() {
+        let dir = tempfile::tempdir().unwrap();
+        stamp_compaction_baseline(dir.path(), &[t("Symbol", 100, 2000)]);
+        stamp_compaction_baseline(dir.path(), &[t("Symbol", 120, 2400)]);
+        let back = read_compaction_baseline(dir.path());
+        assert_eq!(
+            back.tables.get("Symbol"),
+            Some(&TableStats {
+                pages: 120,
+                rows: 2400
+            })
+        );
     }
 }
