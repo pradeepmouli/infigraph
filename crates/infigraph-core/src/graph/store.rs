@@ -1551,82 +1551,7 @@ fn read_generation_field_conn(conn: &Connection, field: &'static str) -> Result<
 
 #[cfg(test)]
 mod tests {
-
-    /// Measurement instrument, not an assertion (#182 / #179).
-    ///
-    /// The open question behind the whole growth run: when a file's symbols
-    /// are deleted and re-created -- what sittir's watcher does every time a
-    /// generated file is regenerated -- does lbug reuse the freed pages, or
-    /// does the graph file only ever grow? Five fixes (#175-#179) removed
-    /// every *error* symptom (no bad-PK retries, no post-commit checkpoint
-    /// failures, no growth jumps, WAL 0), and sittir still went 77MB -> 438MB
-    /// across rounds that all reported clean, ~35-60MB per round. Shallow
-    /// indexing (#182) is a real fix only if the answer here is "reused". If
-    /// it is "never reclaimed", #182 buys a smaller constant on a leak that
-    /// still runs forever, and the fix belongs at the storage layer instead.
-    ///
-    /// Each round re-upserts the SAME extraction: `upsert_file` DETACH
-    /// DELETEs that file's Symbol/Module/File nodes and re-creates them, so
-    /// every round after the first leaves the graph's logical content
-    /// identical. Each round is then folded via `checkpoint_if_idle(ZERO)`,
-    /// so the printed figure is a settled base image rather than an unfolded
-    /// WAL. Flat after the first round or two => pages are reused. A linear
-    /// climb => monotonic growth, and the fork is answered.
-    ///
-    /// Print-only and `#[ignore]`d deliberately. The CI invariant this is
-    /// groundwork for -- "a round that changes nothing adds ~nothing", the
-    /// assertion whose absence let #175-#179 each ship -- needs a *measured*
-    /// bound; inventing one before the first run would just be a coin flip.
-    ///
-    /// Two variants share one body. `identical` re-upserts byte-identical
-    /// content: the most reuse-friendly case that exists, and therefore an
-    /// optimistic bound. `changing` gives every round fresh symbol ids and a
-    /// fresh content hash, which is what sittir actually does when a
-    /// generated file is regenerated -- the same symbol count, entirely new
-    /// identities. If `changing` leaks faster than `identical`, then identity
-    /// churn rather than volume alone is the driver, and #182's volume
-    /// reduction is treating a symptom.
-    ///
-    /// Run: `cargo test -p infigraph-core --lib -- --ignored --nocapture
-    /// page_reuse`
-    /// Returns `(round 0 bytes, final bytes)` so the invariant test below can
-    /// assert on the same run the measurements print, rather than carrying a
-    /// second copy of this loop.
-    /// Run a one-row, one-column aggregate and return it, or the engine's own
-    /// error text.
-    ///
-    /// Aggregating inside Cypher, by column *name*, is the whole point. The
-    /// first cut of this instrument read `storage_info`'s columns positionally
-    /// and summed index 2 -- which holds a legitimate `0` -- so it reported
-    /// "0 pages" for a 21MB graph holding 2000 symbols, took none of its three
-    /// error paths, and looked exactly like confirmation of the hypothesis it
-    /// was built to test. `RETURN sum(num_pages)` names the column instead, so
-    /// a reshaped output fails loudly here rather than quietly summing the
-    /// wrong integer. lbug's own `storage_info`/`fsm_info` tests query these
-    /// results the same way (`where column_name = ... and num_pages > 1`), so
-    /// this is the engine's intended access path, not a trick.
-    ///
-    /// Callers must wrap the aggregate in `CAST(... AS INT64)`. lbug sums a
-    /// UINT64 column into a wider logical type its own Rust binding cannot
-    /// convert, and the binding *panics* (`Unsupported type
-    /// LogicalTypeID(43)`, `logical_type.rs`) while materialising the row --
-    /// so no `map_err` here can catch it. lbug's FSM test casts for the same
-    /// reason (`cast(min as uint64)`).
-    fn scalar_u64(conn: &Connection<'_>, cypher: &str) -> std::result::Result<u64, String> {
-        let mut res = conn.query(cypher).map_err(|e| e.to_string())?;
-        let row = res.next().ok_or_else(|| "no rows".to_string())?;
-        let raw = row
-            .first()
-            .ok_or_else(|| "no columns".to_string())?
-            .to_string();
-        // `sum()` over an empty table is NULL, and that is a real answer here:
-        // no pages. Anything else that fails to parse is not.
-        if raw.is_empty() || raw.eq_ignore_ascii_case("null") {
-            return Ok(0);
-        }
-        raw.parse::<u64>()
-            .map_err(|_| format!("expected an integer, got {raw:?}"))
-    }
+    use crate::graph::compaction::{scalar_u64, ACCOUNTED_TABLES};
 
     /// Live pages: `num_pages` per entry in `tables`, positionally -- the space
     /// the graph actually holds data in, as opposed to the space it has claimed
@@ -1698,13 +1623,46 @@ mod tests {
             .unwrap_or_else(|e| panic!("Symbol row count failed: {e}"))
     }
 
-    /// The node tables this fixture's `upsert_file` can write. `Module` and
-    /// `Statement` stay in the list although the extraction carries empty
-    /// vectors for them: an empty table still reports its pages, so a
-    /// regression that starts writing them shows up here rather than hiding
-    /// inside the byte total.
-    const ACCOUNTED_TABLES: &[&str] = &["Symbol", "File", "Module", "Statement"];
-
+    /// Measurement instrument, not an assertion (#182 / #179).
+    ///
+    /// The open question behind the whole growth run: when a file's symbols
+    /// are deleted and re-created -- what sittir's watcher does every time a
+    /// generated file is regenerated -- does lbug reuse the freed pages, or
+    /// does the graph file only ever grow? Five fixes (#175-#179) removed
+    /// every *error* symptom (no bad-PK retries, no post-commit checkpoint
+    /// failures, no growth jumps, WAL 0), and sittir still went 77MB -> 438MB
+    /// across rounds that all reported clean, ~35-60MB per round. Shallow
+    /// indexing (#182) is a real fix only if the answer here is "reused". If
+    /// it is "never reclaimed", #182 buys a smaller constant on a leak that
+    /// still runs forever, and the fix belongs at the storage layer instead.
+    ///
+    /// Each round re-upserts the SAME extraction: `upsert_file` DETACH
+    /// DELETEs that file's Symbol/Module/File nodes and re-creates them, so
+    /// every round after the first leaves the graph's logical content
+    /// identical. Each round is then folded via `checkpoint_if_idle(ZERO)`,
+    /// so the printed figure is a settled base image rather than an unfolded
+    /// WAL. Flat after the first round or two => pages are reused. A linear
+    /// climb => monotonic growth, and the fork is answered.
+    ///
+    /// Print-only and `#[ignore]`d deliberately. The CI invariant this is
+    /// groundwork for -- "a round that changes nothing adds ~nothing", the
+    /// assertion whose absence let #175-#179 each ship -- needs a *measured*
+    /// bound; inventing one before the first run would just be a coin flip.
+    ///
+    /// Two variants share one body. `identical` re-upserts byte-identical
+    /// content: the most reuse-friendly case that exists, and therefore an
+    /// optimistic bound. `changing` gives every round fresh symbol ids and a
+    /// fresh content hash, which is what sittir actually does when a
+    /// generated file is regenerated -- the same symbol count, entirely new
+    /// identities. If `changing` leaks faster than `identical`, then identity
+    /// churn rather than volume alone is the driver, and #182's volume
+    /// reduction is treating a symptom.
+    ///
+    /// Run: `cargo test -p infigraph-core --lib -- --ignored --nocapture
+    /// page_reuse`
+    /// Returns `(round 0 bytes, final bytes)` so the invariant test below can
+    /// assert on the same run the measurements print, rather than carrying a
+    /// second copy of this loop.
     fn measure_churn(label: &str, rounds: usize, symbols: usize, vary: bool) -> (u64, u64) {
         // Both of `upsert_file`'s guards resolve project-scoped settings.
         let _env = super::super::store_util::MAX_BYTES_ENV_LOCK

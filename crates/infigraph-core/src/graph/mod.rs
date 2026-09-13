@@ -1,4 +1,5 @@
 mod backend;
+pub mod compaction;
 pub mod cozo_store;
 pub mod daemon_kuzu_backend;
 pub(crate) mod growth_gate;
