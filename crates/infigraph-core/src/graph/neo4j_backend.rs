@@ -562,6 +562,61 @@ fn extract_column_name(expr: &str) -> String {
     expr.trim().to_string()
 }
 
+/// Build a "clear everything, then recreate it from `$param`" statement.
+///
+/// `clear` is the `OPTIONAL MATCH ... DELETE` clause, `unwind` the
+/// `UNWIND $param AS x` that feeds the rewrite, and `tail` is everything
+/// after it.
+///
+/// The `WITH count(*)` between them is load-bearing and must not be
+/// simplified back to a literal. `WITH 1 AS _cleared` preserves the clear
+/// clause's cardinality: with nothing to clear the match yields zero rows,
+/// so the `UNWIND` and everything after it never run and the backend writes
+/// nothing at all; with N rows already present every item is created N
+/// times. An aggregation with no grouping key always yields exactly one row
+/// -- for N = 0 as well as N > 1 -- so the tail runs exactly once either
+/// way. It counts rows rather than the just-deleted variable, which Neo4j
+/// can refuse to access after a DELETE.
+fn replace_all_query(clear: &str, unwind: &str, tail: &str) -> String {
+    format!("{clear} WITH count(*) AS _cleared {unwind} {tail}")
+}
+
+/// The Cypher that replaces every recorded `TAINT_FLOW` edge.
+///
+/// Extracted, like its two siblings below, so the statement's shape can be
+/// asserted without a live Neo4j: the whole backend is behind the `neo4j`
+/// feature, so the default test suite never runs these against a database.
+fn replace_taint_flows_cypher() -> String {
+    replace_all_query(
+        "OPTIONAL MATCH ()-[r:TAINT_FLOW]->() DELETE r",
+        "UNWIND $flows AS m",
+        "MATCH (s:Symbol) WHERE s.id = m.symbol_id \
+         CREATE (s)-[:TAINT_FLOW {source_kind: m.source_kind, sink_kind: m.sink_kind, path: m.path}]->(s)",
+    )
+}
+
+/// The Cypher that replaces every recorded `Concern` and its `HAS_CONCERN` edges.
+fn replace_concerns_cypher() -> String {
+    replace_all_query(
+        "OPTIONAL MATCH (c:Concern) DETACH DELETE c",
+        "UNWIND $concerns AS m",
+        "CREATE (c:Concern {id: m.id, kind: m.kind, detail: m.detail}) \
+         WITH c, m \
+         MATCH (s:Symbol) WHERE s.id = m.symbol_id \
+         CREATE (s)-[:HAS_CONCERN]->(c)",
+    )
+}
+
+/// The Cypher that replaces every recorded `RESOLVES_TO` edge.
+fn replace_resolves_to_cypher() -> String {
+    replace_all_query(
+        "OPTIONAL MATCH ()-[r:RESOLVES_TO]->() DELETE r",
+        "UNWIND $edges AS e",
+        "MATCH (s:Symbol), (t:Symbol) WHERE s.id = e.caller_symbol AND t.id = e.target \
+         CREATE (s)-[:RESOLVES_TO {mechanism: e.mechanism, config_source: e.config_source}]->(t)",
+    )
+}
+
 impl GraphBackend for Neo4jBackend {
     fn repo_filter(&self) -> Option<&str> {
         self.repo_filter.as_deref()
@@ -1883,16 +1938,8 @@ impl GraphBackend for Neo4jBackend {
         // still runs when `flows` is empty so a clean run clears the
         // previous one's edges.
         self.block_on(
-            self.graph.run(
-                query(
-                    "MATCH ()-[r:TAINT_FLOW]->() DELETE r \
-                     WITH 1 AS _cleared \
-                     UNWIND $flows AS m \
-                     MATCH (s:Symbol) WHERE s.id = m.symbol_id \
-                     CREATE (s)-[:TAINT_FLOW {source_kind: m.source_kind, sink_kind: m.sink_kind, path: m.path}]->(s)",
-                )
-                .param("flows", flow_maps),
-            ),
+            self.graph
+                .run(query(&replace_taint_flows_cypher()).param("flows", flow_maps)),
         )
         .map_err(|e| anyhow::anyhow!("replace_taint_flows failed: {e}"))?;
         Ok(())
@@ -1913,22 +1960,12 @@ impl GraphBackend for Neo4jBackend {
         // Single query: Neo4j auto-commits one Cypher statement atomically,
         // so the delete and the recreate either both land or neither does --
         // no driver-level transaction needed (same reasoning as
-        // `write_calls_service_edges`). Correct even when `concerns` is
-        // empty: the DETACH DELETE still runs, UNWIND over an empty list
-        // just contributes zero rows to what follows it.
+        // `write_calls_service_edges`). Correct for an empty `concerns` and
+        // for an already-empty graph alike -- see `replace_all_query` for
+        // why the aggregation between the two halves is what guarantees it.
         self.block_on(
-            self.graph.run(
-                query(
-                    "MATCH (c:Concern) DETACH DELETE c \
-                     WITH 1 AS _cleared \
-                     UNWIND $concerns AS m \
-                     CREATE (c:Concern {id: m.id, kind: m.kind, detail: m.detail}) \
-                     WITH c, m \
-                     MATCH (s:Symbol) WHERE s.id = m.symbol_id \
-                     CREATE (s)-[:HAS_CONCERN]->(c)",
-                )
-                .param("concerns", concern_maps),
-            ),
+            self.graph
+                .run(query(&replace_concerns_cypher()).param("concerns", concern_maps)),
         )
         .map_err(|e| anyhow::anyhow!("replace_concerns failed: {e}"))?;
         Ok(())
@@ -1947,16 +1984,8 @@ impl GraphBackend for Neo4jBackend {
             })
             .collect();
         self.block_on(
-            self.graph.run(
-                query(
-                    "MATCH ()-[r:RESOLVES_TO]->() DELETE r \
-                     WITH 1 AS _cleared \
-                     UNWIND $edges AS e \
-                     MATCH (s:Symbol), (t:Symbol) WHERE s.id = e.caller_symbol AND t.id = e.target \
-                     CREATE (s)-[:RESOLVES_TO {mechanism: e.mechanism, config_source: e.config_source}]->(t)",
-                )
-                .param("edges", edge_maps),
-            ),
+            self.graph
+                .run(query(&replace_resolves_to_cypher()).param("edges", edge_maps)),
         )
         .map_err(|e| anyhow::anyhow!("replace_resolves_to failed: {e}"))?;
         Ok(())
@@ -2779,5 +2808,33 @@ mod tests {
         assert_eq!(extract_column_name("s.id AS id"), "id");
         assert_eq!(extract_column_name("count(s) AS cnt"), "cnt");
         assert_eq!(extract_column_name("s.name"), "s.name");
+    }
+
+    /// Every "clear, then recreate" statement must collapse the clear
+    /// clause's cardinality before its `UNWIND`.
+    ///
+    /// `WITH 1 AS _cleared` preserves the preceding match's row count. On a
+    /// graph with nothing to clear that count is zero, so the `UNWIND` and
+    /// everything after it never execute and the backend writes nothing at
+    /// all; with N rows already present every item is created N times. Only
+    /// an aggregation with no grouping key yields exactly one row for both
+    /// N = 0 and N > 1.
+    #[test]
+    fn replace_statements_collapse_cardinality_before_the_unwind() {
+        for (name, cypher) in [
+            ("replace_taint_flows", replace_taint_flows_cypher()),
+            ("replace_concerns", replace_concerns_cypher()),
+            ("replace_resolves_to", replace_resolves_to_cypher()),
+        ] {
+            assert!(
+                !cypher.contains("WITH 1 AS"),
+                "{name} pins cardinality with a literal, so a graph with nothing \
+                 to clear never reaches the UNWIND and no rows are ever written"
+            );
+            assert!(
+                cypher.contains("count(*)"),
+                "{name} must aggregate between the DELETE and the UNWIND"
+            );
+        }
     }
 }
