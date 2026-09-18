@@ -1899,8 +1899,8 @@ impl GraphBackend for Neo4jBackend {
         self.block_on(
             self.graph.run(
                 query(
-                    "MATCH (c:Concern) DETACH DELETE c \
-                     WITH 1 AS _cleared \
+                    "OPTIONAL MATCH (c:Concern) DETACH DELETE c \
+                     WITH count(*) AS _cleared \
                      UNWIND $concerns AS m \
                      CREATE (c:Concern {id: m.id, kind: m.kind, detail: m.detail}) \
                      WITH c, m \
@@ -1929,8 +1929,8 @@ impl GraphBackend for Neo4jBackend {
         self.block_on(
             self.graph.run(
                 query(
-                    "MATCH ()-[r:RESOLVES_TO]->() DELETE r \
-                     WITH 1 AS _cleared \
+                    "OPTIONAL MATCH ()-[r:RESOLVES_TO]->() DELETE r \
+                     WITH count(*) AS _cleared \
                      UNWIND $edges AS e \
                      MATCH (s:Symbol), (t:Symbol) WHERE s.id = e.caller_symbol AND t.id = e.target \
                      CREATE (s)-[:RESOLVES_TO {mechanism: e.mechanism, config_source: e.config_source}]->(t)",
