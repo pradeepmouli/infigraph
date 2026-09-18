@@ -1879,8 +1879,8 @@ impl GraphBackend for Neo4jBackend {
         self.block_on(
             self.graph.run(
                 query(
-                    "MATCH ()-[r:TAINT_FLOW]->() DELETE r \
-                     WITH 1 AS _cleared \
+                    "OPTIONAL MATCH ()-[r:TAINT_FLOW]->() DELETE r \
+                     WITH count(*) AS _cleared \
                      UNWIND $flows AS m \
                      MATCH (s:Symbol) WHERE s.id = m.symbol_id \
                      CREATE (s)-[:TAINT_FLOW {source_kind: m.source_kind, sink_kind: m.sink_kind, path: m.path}]->(s)",
