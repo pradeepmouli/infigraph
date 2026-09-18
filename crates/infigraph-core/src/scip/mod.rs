@@ -11,6 +11,7 @@ use scip::types::{symbol_information, Index, SymbolRole};
 use crate::graph::parquet_loader;
 use crate::graph::store_util::{
     copy_edges_with_bad_record_retry, escape, extract_bad_copy_value, fwd_slash_path,
+    unique_tmp_dir,
 };
 use crate::graph::GraphStore;
 use crate::model::{Span, SymbolKind};
@@ -232,8 +233,7 @@ pub fn import_scip_index(
     const CHUNK: usize = 2000;
     const MAX_SYMBOL_RETRIES: usize = 20;
     if !new_symbols.is_empty() {
-        let tmp = std::env::temp_dir();
-        let sym_pq = tmp.join("infigraph_scip_symbols.parquet");
+        let sym_pq = unique_tmp_dir().join("infigraph_scip_symbols.parquet");
 
         let mut seen_ids = std::collections::HashSet::with_capacity(new_symbols.len());
         let mut remaining: Vec<_> = new_symbols
@@ -477,8 +477,7 @@ pub fn import_scip_index(
     // Bulk write CALLS edges via Parquet COPY FROM, dropping any bad-PK
     // record and retrying rather than falling back to UNWIND for the batch.
     if !calls_to_create.is_empty() {
-        let tmp = std::env::temp_dir();
-        let edge_pq = tmp.join("infigraph_scip_calls.parquet");
+        let edge_pq = unique_tmp_dir().join("infigraph_scip_calls.parquet");
         stats.references_added = calls_to_create.len();
         copy_edges_with_bad_record_retry(
             store,
@@ -545,8 +544,7 @@ pub fn import_scip_index(
     // Bulk write INHERITS edges via Parquet COPY FROM, dropping any bad-PK
     // record and retrying rather than falling back to UNWIND for the batch.
     if !inherits_to_create.is_empty() {
-        let tmp = std::env::temp_dir();
-        let edge_pq = tmp.join("infigraph_scip_inherits.parquet");
+        let edge_pq = unique_tmp_dir().join("infigraph_scip_inherits.parquet");
         stats.relations_added = inherits_to_create.len();
         copy_edges_with_bad_record_retry(
             store,

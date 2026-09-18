@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use anyhow::Result;
 
 use crate::graph::store::GraphStore;
-use crate::graph::store_util::copy_edges_with_bad_record_retry;
+use crate::graph::store_util::{copy_edges_with_bad_record_retry, unique_tmp_dir};
 use crate::model::{FileExtraction, RelationKind};
 
 use super::shortest_id;
@@ -183,7 +183,7 @@ pub(crate) fn resolve_inherits(
         .into_iter()
         .map(|(a, b)| (a.clone(), b.clone()))
         .collect();
-    let pq_path = std::env::temp_dir().join("infigraph_resolve_inherits.parquet");
+    let pq_path = unique_tmp_dir().join("infigraph_resolve_inherits.parquet");
     copy_edges_with_bad_record_retry(store, "INHERITS", pairs, "Symbol", "Symbol", &pq_path)?;
 
     Ok(count)

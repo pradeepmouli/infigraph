@@ -1,10 +1,29 @@
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Result;
 use kuzu::Connection;
 
 use crate::graph::parquet_loader;
 use crate::graph::store::GraphStore;
+
+/// A scratch directory unique to this call, for a bulk-load parquet file.
+///
+/// Every bulk COPY stages through a parquet file on disk, and the path must
+/// not be shared. Two writers that pick the same fixed path race between the
+/// write and the COPY, so one bulk-loads the other's rows: across processes
+/// that cross-contaminates two projects' graphs (a daemon reindex alongside a
+/// CLI index is the normal configuration), and inside one process it makes
+/// tests in the same binary clobber each other. Keyed on both pid and a
+/// per-call counter so neither case can collide.
+pub(crate) fn unique_tmp_dir() -> std::path::PathBuf {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id();
+    let dir = std::env::temp_dir().join(format!("infigraph_pq_{}_{}", pid, id));
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
 
 /// How many bad-record-drop-and-retry cycles a bulk COPY gets before giving
 /// up and falling back to the slow per-row UNWIND path for whatever remains.
@@ -301,6 +320,7 @@ pub fn classify_file(file: &str) -> &'static str {
 mod tests {
     use super::{
         check_disk_headroom, classify_file, extract_bad_copy_value, resolve_import_candidate,
+        unique_tmp_dir,
     };
 
     #[test]
@@ -426,6 +446,25 @@ mod tests {
         assert_eq!(
             resolve_import_candidate("other.pkg.constants", &candidates),
             None
+        );
+    }
+
+    /// Two bulk loads must never stage through the same parquet path.
+    ///
+    /// The fixed `temp_dir().join("infigraph_*.parquet")` this replaced let a
+    /// second writer overwrite the file between the first writer's write and
+    /// its COPY, so the first bulk-loaded the second's rows. Across processes
+    /// that mixes two projects' graphs; inside one process it made sibling
+    /// tests in the same binary clobber each other.
+    #[test]
+    fn unique_tmp_dir_never_hands_out_the_same_path_twice() {
+        let paths: Vec<_> = (0..64).map(|_| unique_tmp_dir()).collect();
+        let distinct: std::collections::HashSet<_> = paths.iter().collect();
+        assert_eq!(
+            distinct.len(),
+            paths.len(),
+            "unique_tmp_dir handed out a duplicate; two concurrent bulk loads \
+             would stage through the same file and overwrite each other"
         );
     }
 }

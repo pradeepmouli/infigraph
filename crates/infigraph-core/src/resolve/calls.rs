@@ -4,7 +4,7 @@ use anyhow::Result;
 use rayon::prelude::*;
 
 use crate::graph::store::GraphStore;
-use crate::graph::store_util::copy_edges_with_bad_record_retry;
+use crate::graph::store_util::{copy_edges_with_bad_record_retry, unique_tmp_dir};
 use crate::learned::LearnedStore;
 use crate::model::{FileExtraction, RelationKind};
 
@@ -786,7 +786,7 @@ fn write_resolved_calls(
     } = resolve_pairs(extractions, symbol_map, learned_store);
 
     if !pairs.is_empty() {
-        let pq_path = std::env::temp_dir().join("infigraph_resolve_calls.parquet");
+        let pq_path = unique_tmp_dir().join("infigraph_resolve_calls.parquet");
         copy_edges_with_bad_record_retry(store, "CALLS", pairs, "Symbol", "Symbol", &pq_path)?;
     }
 
