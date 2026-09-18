@@ -836,7 +836,7 @@ pub fn import_scip_index_enriched_at(
                 continue;
             }
 
-            let ref_line = occ.range.first().copied().unwrap_or(0) as u32;
+            let ref_line = scip_line_to_1based(occ.range.first().copied().unwrap_or(0));
 
             let container_id = if let Some(syms) = file_symbols.get(file.as_str()) {
                 syms.iter()
@@ -995,6 +995,18 @@ pub fn import_scip_index_enriched_at(
     Ok(stats)
 }
 
+/// SCIP line numbers are 0-based; every line stored in the graph is 1-based,
+/// because tree-sitter extraction writes `row + 1` (see `entities.rs`).
+///
+/// Convert at the boundary where SCIP data enters rather than at the sites
+/// that compare the two. Converting at a comparison instead would leave
+/// SCIP-created symbols *stored* 0-based while tree-sitter ones are 1-based,
+/// so the graph would keep holding mixed-base rows and the next import would
+/// hit the same mismatch from the other direction.
+fn scip_line_to_1based(line: i32) -> u32 {
+    (line.max(0) as u32).saturating_add(1)
+}
+
 fn parse_range(range: &[i32], file: &str) -> Span {
     let (start_line, start_col, end_line, end_col) = match range.len() {
         4 => (range[0], range[1], range[2], range[3]),
@@ -1003,9 +1015,9 @@ fn parse_range(range: &[i32], file: &str) -> Span {
     };
     Span {
         file: file.to_string(),
-        start_line: start_line as u32,
+        start_line: scip_line_to_1based(start_line),
         start_col: start_col as u32,
-        end_line: end_line as u32,
+        end_line: scip_line_to_1based(end_line),
         end_col: end_col as u32,
     }
 }
@@ -2583,11 +2595,16 @@ mod tests {
                 )
             })
             .collect();
+        // 2 and 11, not 1 and 10: the fixture's occurrences are at 0-based
+        // SCIP lines 1 and 10, and SCIP-created symbols are now stored 1-based
+        // like every other row in the graph. What this test actually pins --
+        // two distinct ordinal-suffixed ids ordered by span position -- is
+        // unchanged.
         assert_eq!(
             ids,
             vec![
-                ("test.ts::foo#1".to_string(), "1".to_string()),
-                ("test.ts::foo#2".to_string(), "10".to_string()),
+                ("test.ts::foo#1".to_string(), "2".to_string()),
+                ("test.ts::foo#2".to_string(), "11".to_string()),
             ],
             "both symbols must survive as distinct, ordinal-suffixed rows sorted by span position"
         );
@@ -2668,5 +2685,89 @@ mod tests {
             "the new symbol must continue the ordinal sequence, not collide with either \
              pre-existing row"
         );
+    }
+
+    /// SCIP line numbers are 0-based; tree-sitter spans are stored 1-based
+    /// (`entities.rs` writes `row + 1`). The containment match compares the
+    /// two directly, so it fails whenever the definition identifier sits on
+    /// the symbol's first line -- which is the dominant shape (`fn foo(`,
+    /// `def foo():`).
+    ///
+    /// A single candidate hides this, because the `.first()` fallback rescues
+    /// it. With two same-named candidates the fallback correctly refuses, the
+    /// occurrence takes the new-symbol path, and a duplicate Symbol row is
+    /// inserted for a symbol that was already indexed.
+    #[test]
+    fn scip_definition_matches_a_symbol_whose_identifier_is_on_its_first_line() {
+        let env = TestEnv::new();
+        // #114: a document whose file has no File node is skipped wholesale,
+        // so the precondition has to be mirrored explicitly.
+        env.add_file("a.rs");
+        let conn = env.store.connection().unwrap();
+
+        for (id, start, end) in [("a.rs::A::foo", 10, 15), ("a.rs::B::foo", 20, 25)] {
+            conn.query(&format!(
+                "CREATE (:Symbol {{id: '{id}', name: 'foo', kind: 'function', \
+                 file: 'a.rs', start_line: {start}, end_line: {end}, signature_hash: '', \
+                 language: 'rust', visibility: 'public', parent: '', docstring: '', \
+                 complexity: 0, parameters: '', return_type: ''}})"
+            ))
+            .unwrap();
+        }
+
+        // Definition occurrences on each symbol's FIRST line, 0-based:
+        // 1-based 10 and 20 are 0-based 9 and 19.
+        let mut occurrences = Vec::new();
+        let mut symbols = Vec::new();
+        for (scip_name, line) in [("A#foo", 9), ("B#foo", 19)] {
+            let sym = scip_symbol(scip_name, "a.rs");
+            occurrences.push(Occurrence {
+                range: vec![line, 7, line, 10],
+                symbol: sym.clone(),
+                symbol_roles: SymbolRole::Definition as i32,
+                ..Default::default()
+            });
+            symbols.push(SymbolInformation {
+                symbol: sym,
+                documentation: vec![format!("docs for {scip_name}")],
+                ..Default::default()
+            });
+        }
+        let index = Index {
+            documents: vec![Document {
+                relative_path: "a.rs".to_string(),
+                occurrences,
+                symbols,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let index_path = env._dir.path().join("index.scip");
+        std::fs::write(&index_path, index.write_to_bytes().unwrap()).unwrap();
+
+        let stats = import_scip_index(&index_path, &env.store, None).unwrap();
+
+        let rows = conn
+            .query("MATCH (s:Symbol) WHERE s.name = 'foo' RETURN count(*)")
+            .unwrap();
+        let count: i64 = rows
+            .into_iter()
+            .next()
+            .map(|r| r[0].to_string().trim_matches('"').parse().unwrap_or(-1))
+            .unwrap_or(-1);
+
+        assert_eq!(
+            count,
+            2,
+            "both definitions were already indexed, so containment must match \
+             them; instead {} duplicate row(s) were inserted (symbols_added={})",
+            count - 2,
+            stats.symbols_added
+        );
+        assert_eq!(
+            stats.symbols_added, 0,
+            "no occurrence here is a genuinely new symbol"
+        );
+        assert_eq!(stats.symbols_enriched, 2, "both symbols must be enriched");
     }
 }
