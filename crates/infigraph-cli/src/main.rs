@@ -1033,7 +1033,13 @@ fn main() -> Result<()> {
     let update_handle = install::check_for_update_background();
 
     let cli = Cli::parse();
-    let root = cli.root.unwrap_or_else(|| PathBuf::from("."));
+    // Resolve to the project that owns the cwd, not the cwd itself. Taking
+    // the cwd verbatim is what created a separate store, daemon and socket
+    // for every subdirectory anyone ever ran a command from.
+    let root = cli.root.unwrap_or_else(|| {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        infigraph_core::project::resolve_project_root(&cwd)
+    });
 
     let should_auto_watch = should_auto_watch(&cli.command, &root);
 

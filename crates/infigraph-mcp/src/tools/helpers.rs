@@ -15,46 +15,27 @@ pub use super::session::{session_date_id, session_epoch};
 /// 4. Fall back to the original path (let downstream error).
 pub fn resolve_project_path(path: &str) -> String {
     let start = if path == "." {
-        std::env::current_dir()
-            .and_then(|p| p.canonicalize())
-            .unwrap_or_else(|_| PathBuf::from("."))
+        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
     } else {
         PathBuf::from(path)
-            .canonicalize()
-            .unwrap_or_else(|_| PathBuf::from(path))
     };
 
-    // A project .infigraph/ contains a "graph" subdir but NOT registry.json.
-    // The global ~/.infigraph/ has registry.json — skip it during walk-up.
-    let is_project_infigraph = |p: &std::path::Path| {
-        let ig = p.join(".infigraph");
-        ig.join("graph").exists() && !ig.join("registry.json").exists()
-    };
+    let resolved = infigraph_core::project::resolve_project_root(&start);
 
-    // Direct match
-    if is_project_infigraph(&start) {
-        return start.to_string_lossy().to_string();
-    }
-
-    // Walk up (CWD is inside a project subdir)
-    let mut current = start.as_path();
-    while let Some(parent) = current.parent() {
-        if is_project_infigraph(parent) {
-            return parent.to_string_lossy().to_string();
-        }
-        current = parent;
-    }
-
-    // Check registry for child projects under this path
-    if let Ok(registry) = infigraph_core::multi::Registry::load() {
-        for entry in registry.repos.values() {
-            if entry.path.starts_with(&start) {
-                return entry.path.to_string_lossy().to_string();
+    // The registry fallback stays here: it answers "an indexed project lives
+    // *below* the path I was given", which is a lookup against global state
+    // rather than a property of the path itself.
+    if resolved == start && !start.join(".infigraph").join("graph").exists() {
+        if let Ok(registry) = infigraph_core::multi::Registry::load() {
+            for entry in registry.repos.values() {
+                if entry.path.starts_with(&start) {
+                    return entry.path.to_string_lossy().to_string();
+                }
             }
         }
     }
 
-    path.to_string()
+    resolved.to_string_lossy().to_string()
 }
 
 pub fn open_prism(args: &Value) -> Result<Infigraph> {

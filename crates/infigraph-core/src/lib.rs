@@ -33,6 +33,7 @@ pub mod ops;
 pub mod patterns;
 pub mod probe;
 pub mod proclog;
+pub mod project;
 pub mod ps;
 pub mod quarantine;
 pub mod recovery;
