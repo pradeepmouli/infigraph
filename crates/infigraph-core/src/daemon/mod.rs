@@ -683,6 +683,13 @@ where
 
     let mut changes_since_periodic: usize = 0;
     let mut last_periodic = std::time::Instant::now();
+    /// How often the watcher re-checks pending dirty marks against the
+    /// filesystem. Only reads a small log, and only acts when a marked path
+    /// has vanished, so it is cheap to run often; the cost of running it
+    /// rarely is a stale-results banner that stays up until the next watcher
+    /// restart.
+    const DIRTY_SWEEP_INTERVAL: Duration = Duration::from_secs(300);
+    let mut last_dirty_sweep = std::time::Instant::now();
 
     // Shared DB connection for the watch session — see `watch_db`'s doc
     // comment for the platform split (held open on non-Windows, reopened
@@ -1211,6 +1218,37 @@ where
                         has_cross_file_calls: cross,
                     });
                 }
+            }
+        }
+
+        // R3.3.5: sweep dirty marks whose file no longer exists.
+        //
+        // `watch::producer`'s startup recovery already resolves these, but
+        // only once per watcher lifetime, and the periodic pass below cannot
+        // help because it is gated on `changes_since_periodic > 0` -- an
+        // orphaned mark produces no changes, so a quiet project never trips
+        // it. A watcher that stays up for days therefore keeps reporting
+        // "results may be stale" for a file that will never drain.
+        //
+        // Queues removals rather than clearing directly: a vanished file
+        // whose rows are still in the graph is *genuine* staleness, and the
+        // removal is the work that reconciles it. The drain clears the mark
+        // once it has actually run.
+        if last_dirty_sweep.elapsed() >= DIRTY_SWEEP_INTERVAL {
+            last_dirty_sweep = std::time::Instant::now();
+            match crate::dirty::orphaned_dirty(&infigraph_dir, root) {
+                Ok(gone) if !gone.is_empty() => {
+                    eprintln!(
+                        "[watch] sweeping {} dirty mark(s) whose file is gone",
+                        gone.len()
+                    );
+                    let mut q = queue.lock().unwrap();
+                    for rel in gone {
+                        q.add_watch_removal(rel);
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => eprintln!("[watch] dirty sweep failed: {e}"),
             }
         }
 

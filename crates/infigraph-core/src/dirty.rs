@@ -93,6 +93,35 @@ pub fn pending_dirty(infigraph_dir: &Path) -> Result<HashSet<String>> {
     Ok(parse_lines(&content).map(str::to_string).collect())
 }
 
+/// Pending paths that no longer exist under `root`.
+///
+/// A mark goes orphaned when the create was observed but the matching delete
+/// was not — macOS FSEvents can coalesce a rapid create-then-delete, so a
+/// short-lived temp file leaves a mark with no removal behind it. Nothing in
+/// the steady-state loop resolves that: the drain only clears what it wrote
+/// or removed, and `Infigraph::index_via_backend` only reconciles against
+/// files it scanned plus graph rows it pruned — a path that is on neither
+/// disk nor in the graph appears in neither list.
+///
+/// `watch::producer`'s startup recovery already resolves these correctly, by
+/// existence, but only once per watcher lifetime. A watcher that stays up for
+/// days therefore reports "results may be stale" for a file that will never
+/// drain. This is that same existence test, exposed so the watcher can sweep
+/// periodically instead of only at startup.
+///
+/// Returns paths to queue as removals, not paths to clear directly: a mark
+/// whose file is gone but whose rows are still in the graph is *genuine*
+/// staleness, and the removal is what actually reconciles it. Clearing here
+/// would drop that work on the floor.
+pub fn orphaned_dirty(infigraph_dir: &Path, root: &Path) -> Result<Vec<String>> {
+    let mut gone: Vec<String> = pending_dirty(infigraph_dir)?
+        .into_iter()
+        .filter(|rel| !root.join(rel).exists())
+        .collect();
+    gone.sort_unstable();
+    Ok(gone)
+}
+
 /// Clear `rel_paths` from the pending dirty set. Callers must only pass
 /// paths whose graph state they have *confirmed* was written -- see the
 /// module-level contract. Also compacts the log (dedupes, drops cleared
@@ -256,5 +285,34 @@ mod tests {
             !dirty_log_path(&dir).exists(),
             "20 mark/clear cycles for the same path must not leave a growing log behind"
         );
+    }
+
+    #[test]
+    fn orphaned_dirty_reports_marks_whose_file_is_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let ig = root.join(".infigraph");
+        std::fs::create_dir_all(&ig).unwrap();
+        std::fs::write(root.join("kept.ts"), b"x").unwrap();
+        mark_dirty(&ig, &["kept.ts".to_string(), "_fx.tmp.ts".to_string()]).unwrap();
+
+        assert_eq!(
+            orphaned_dirty(&ig, root).unwrap(),
+            vec!["_fx.tmp.ts".to_string()],
+            "only the vanished path is orphaned; a pending file still on disk \
+             is ordinary un-drained work"
+        );
+    }
+
+    #[test]
+    fn orphaned_dirty_is_empty_when_every_pending_path_still_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let ig = root.join(".infigraph");
+        std::fs::create_dir_all(&ig).unwrap();
+        std::fs::write(root.join("a.ts"), b"x").unwrap();
+        mark_dirty(&ig, &["a.ts".to_string()]).unwrap();
+
+        assert!(orphaned_dirty(&ig, root).unwrap().is_empty());
     }
 }
