@@ -70,6 +70,44 @@ impl FromTomlItem for Toggle {
     }
 }
 
+/// A settings-group list-of-paths field: zero or more root-relative paths.
+/// TOML states it as an array of strings; the env layer has only a flat
+/// string, so there it is comma-separated, with entries trimmed and empty
+/// ones dropped. Dropping empties is not tidiness -- an empty entry used as
+/// a path prefix would match every path.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Deserialize)]
+pub struct PathList(pub Vec<String>);
+
+impl std::str::FromStr for PathList {
+    type Err = std::convert::Infallible;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(PathList(
+            s.split(',')
+                .map(str::trim)
+                .filter(|entry| !entry.is_empty())
+                .map(str::to_string)
+                .collect(),
+        ))
+    }
+}
+
+impl FromTomlItem for PathList {
+    /// A non-array item states nothing rather than erroring, matching every
+    /// other impl here: a malformed value falls through to the next layer.
+    fn from_toml_item(item: &toml_edit::Item) -> Option<Self> {
+        let array = item.as_array()?;
+        Some(PathList(
+            array
+                .iter()
+                .filter_map(|value| value.as_str())
+                .map(str::trim)
+                .filter(|entry| !entry.is_empty())
+                .map(str::to_string)
+                .collect(),
+        ))
+    }
+}
+
 /// Declares a settings group. `$category` (a single, possibly-underscored
 /// identifier, e.g. `mcp_idle`) names the group for env var names
 /// (`INFIGRAPH_{CATEGORY}_{FIELD}`), category-qualified CLI flags (via
@@ -162,7 +200,7 @@ macro_rules! settings {
 
 #[cfg(test)]
 mod tests {
-    use super::Toggle;
+    use super::{PathList, Toggle};
     use clap::Parser;
     use std::sync::Mutex;
 
@@ -365,5 +403,63 @@ mod tests {
             ToyToggle::resolve_layers(cli, &[]).flag.0,
             "unset must fall through to the hardcoded default (true)"
         );
+    }
+
+    crate::settings! {
+        toy_paths {
+            include: PathList = PathList(Vec::new()),
+        }
+    }
+
+    #[test]
+    fn path_list_field_resolves_from_a_toml_array() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("INFIGRAPH_TOY_PATHS_INCLUDE");
+        let doc: toml_edit::DocumentMut =
+            "[toy_paths]\ninclude = [\"node_modules/lib\", \"vendor/sdk\"]"
+                .parse()
+                .unwrap();
+        let cli = RawToyPaths::parse_from(["test"]);
+        assert_eq!(
+            ToyPaths::resolve_layers(cli, &[doc.as_item()]).include,
+            PathList(vec![
+                "node_modules/lib".to_string(),
+                "vendor/sdk".to_string()
+            ]),
+        );
+    }
+
+    /// The env layer has only a flat string to work with, so a list needs a
+    /// separator. Comma, and entries are trimmed -- an env var written with
+    /// spaces after the commas is the obvious way to get this wrong.
+    #[test]
+    fn path_list_parses_a_comma_separated_env_var() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var(
+            "INFIGRAPH_TOY_PATHS_INCLUDE",
+            "node_modules/lib, vendor/sdk",
+        );
+        let cli = RawToyPaths::parse_from(["test"]);
+        let got = ToyPaths::resolve_layers(cli, &[]).include;
+        std::env::remove_var("INFIGRAPH_TOY_PATHS_INCLUDE");
+        assert_eq!(
+            got,
+            PathList(vec![
+                "node_modules/lib".to_string(),
+                "vendor/sdk".to_string()
+            ]),
+        );
+    }
+
+    /// An empty env var means "no entries", not one empty entry -- an empty
+    /// path would otherwise match every path as a prefix.
+    #[test]
+    fn path_list_treats_an_empty_env_var_as_no_entries() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("INFIGRAPH_TOY_PATHS_INCLUDE", "");
+        let cli = RawToyPaths::parse_from(["test"]);
+        let got = ToyPaths::resolve_layers(cli, &[]).include;
+        std::env::remove_var("INFIGRAPH_TOY_PATHS_INCLUDE");
+        assert_eq!(got, PathList(Vec::new()));
     }
 }

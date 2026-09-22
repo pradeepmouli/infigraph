@@ -175,6 +175,35 @@ A file is indexed if:
 2. It's not a binary file
 3. It's under configurable size limits
 
+Directories are excluded by `.gitignore`, `.infigraphignore`, and a fixed
+safety list (`node_modules`, `target`, `vendor`, `dist`, `build`, …) that
+applies regardless of what either file says.
+
+#### Indexing a directory those rules exclude
+
+`[index] include` in `.infigraph/config.toml` names directories to index
+anyway — a vendored reference library worth having in the graph:
+
+```toml
+[index]
+include = ["node_modules/@acme/reference-lib", "vendor/upstream-sdk"]
+```
+
+Entries are project-root-relative directory paths matched literally — not
+globs, so list each one. An absolute path or one climbing out with `..` is
+rejected rather than resolved: an include can never widen indexing beyond
+its own project.
+
+An include drops only the rules coming from *above* the named directory.
+Inside it, `.git/` and a nested `node_modules/` are still excluded, and a
+`.gitignore` within it still applies. The file watcher honors the same
+list, so edits in an included directory trigger reindexing like any other.
+
+The equivalent env var is comma-separated
+(`INFIGRAPH_INDEX_INCLUDE=node_modules/lib,vendor/sdk`), and a project's
+`.infigraph/config.toml` wins over `~/.infigraph/config.toml` when both
+declare the key.
+
 ### Parallel processing
 
 Files are processed in parallel using `rayon`'s `par_iter` for extraction and hashing.
