@@ -52,7 +52,8 @@ pub fn resolve_calls_incremental(
         symbol_map.entry(name).or_default().push((id, file, kind));
     }
 
-    let mut stats = resolve_with_map(store, &conn, extractions, &symbol_map, learned_store, &lock)?;
+    let mut stats =
+        write_resolved_calls(store, &conn, extractions, &symbol_map, learned_store, &lock)?;
     stats.inherits_resolved = resolve_inherits(store, extractions, &symbol_map, &lock)?;
     resolve_custom_edges(&conn, extractions, &symbol_map, &lock)?;
     // R3.3.3: bump once per completed write, so sidecars built from a
@@ -95,14 +96,15 @@ pub fn resolve_calls(
         }
     }
 
-    let mut stats = resolve_with_map(store, &conn, extractions, &symbol_map, learned_store, &lock)?;
+    let mut stats =
+        write_resolved_calls(store, &conn, extractions, &symbol_map, learned_store, &lock)?;
     stats.inherits_resolved = resolve_inherits(store, extractions, &symbol_map, &lock)?;
     resolve_custom_edges(&conn, extractions, &symbol_map, &lock)?;
     Ok(stats)
 }
 
 /// Cross-file resolution for `RelationKind::Custom` edges (AIF3X-331 #16:
-/// INJECTS_DEPENDENCY, REGISTERS_MIDDLEWARE), mirroring what `resolve_with_map`
+/// INJECTS_DEPENDENCY, REGISTERS_MIDDLEWARE), mirroring what `resolve_pairs`
 /// does for CALLS. Extraction always scopes a custom edge's target_id to its
 /// own file (`{file}::{name}`) since it has no cross-file symbol table to
 /// consult at parse time — same as a raw dangling CALLS target. Without this
@@ -143,7 +145,7 @@ fn resolve_custom_edges(
             }
 
             // Cross-file: look up by bare name in the global symbol table,
-            // same single-candidate-only policy resolve_with_map uses before
+            // same single-candidate-only policy resolve_pairs uses before
             // falling back to import-scope disambiguation — collision
             // handling across multiple same-named candidates is intentionally
             // out of scope for this pass (see AIF3X-331 #16 design doc).
@@ -251,15 +253,27 @@ fn write_external_calls(
     }
 }
 
-/// Caller must hold WriteLock.
-fn resolve_with_map(
-    store: &GraphStore,
-    conn: &kuzu::Connection<'_>,
+/// Pure decision result of [`resolve_pairs`] — no backend write yet.
+pub(crate) struct ResolvedCalls {
+    pub(crate) pairs: Vec<(String, String)>,
+    pub(crate) external_calls: Vec<(String, String, String)>,
+    pub(crate) stats: ResolveStats,
+}
+
+/// Backend-agnostic call-resolution decision loop, shared by Kuzu and Neo4j
+/// so the two backends can never drift into two hand-synced copies of the
+/// same disambiguation logic again (see git history on
+/// `Neo4jBackend::resolve_calls` for what that drift costs: a missing
+/// same-class fast path, a missing bare-source-id reconciliation, and a
+/// cruder tiebreak, each found and ported separately over several passes).
+/// Touches no `Connection`/backend handle — callers do their own write
+/// (Kuzu: parquet bulk copy; Neo4j: batched Cypher UNWIND/MERGE) using the
+/// `pairs`/`external_calls` this returns.
+pub(crate) fn resolve_pairs(
     extractions: &[FileExtraction],
     symbol_map: &HashMap<String, Vec<(String, String, String)>>,
     learned_store: Option<&LearnedStore>,
-    _witness: &WriteLock,
-) -> Result<ResolveStats> {
+) -> ResolvedCalls {
     let mut resolved = 0;
     let mut unresolved = 0;
     let mut total_dangling = 0;
@@ -323,40 +337,42 @@ fn resolve_with_map(
                 external_calls: Vec::new(),
             };
 
-            let local_symbols: HashMap<&str, &str> = ext
-                .symbols
-                .iter()
-                .map(|s| (s.name.as_str(), s.id.as_str()))
-                .collect();
-
-            // Every real symbol id in this file, used to short-circuit the
-            // bare-name source-id fixup below: once rel.source_id is ALREADY
-            // one of these (the common case, and the only case once
-            // find_enclosing_function class-qualifies it), the bare-name
-            // `local_symbols` lookup must be skipped entirely rather than
-            // "fixing up" an already-correct id — local_symbols collapses to
-            // one entry per bare name, so with two same-named methods in this
-            // file it would silently overwrite a correct qualified source_id
-            // with whichever one happened to win that collision.
-            let local_ids: std::collections::HashSet<&str> =
-                ext.symbols.iter().map(|s| s.id.as_str()).collect();
+            // Keeps every candidate per bare name, same reason as
+            // local_callables below: a file can have two distinct symbols
+            // sharing a bare name (e.g. a class and a same-named free
+            // function/method), and collapsing them to one id keyed by
+            // insertion order made both the source-id fixup and the caller's
+            // enclosing-class lookup depend on extraction order.
+            let mut local_symbols: HashMap<&str, Vec<&str>> = HashMap::new();
+            for s in &ext.symbols {
+                local_symbols
+                    .entry(s.name.as_str())
+                    .or_default()
+                    .push(s.id.as_str());
+            }
 
             // Callable-only view of local_symbols, keyed the same way, used to
             // gate the same-class fast path below: a call target must resolve
             // to something invocable (Method/Function), never a field/variable
             // that happens to share the name (e.g. a `builder` field beside a
-            // `builder()` method).
-            let local_callables: HashMap<&str, &str> = ext
-                .symbols
-                .iter()
-                .filter(|s| {
-                    matches!(
-                        s.kind,
-                        crate::model::SymbolKind::Method | crate::model::SymbolKind::Function
-                    )
-                })
-                .map(|s| (s.name.as_str(), s.id.as_str()))
-                .collect();
+            // `builder()` method). Keeps every candidate per bare name (not
+            // just one) — a file can legally have both a free function and a
+            // same-named method (e.g. a static helper `DoOneBatchStream()`
+            // alongside `SanitizerApp::DoOneBatchStream`), and collapsing them
+            // to a single id keyed by insertion order made the fast path's
+            // pick depend on extraction order, which isn't stable run-to-run.
+            let mut local_callables: HashMap<&str, Vec<&str>> = HashMap::new();
+            for s in ext.symbols.iter().filter(|s| {
+                matches!(
+                    s.kind,
+                    crate::model::SymbolKind::Method | crate::model::SymbolKind::Function
+                )
+            }) {
+                local_callables
+                    .entry(s.name.as_str())
+                    .or_default()
+                    .push(s.id.as_str());
+            }
 
             let imported_stems: std::collections::HashSet<String> = ext
                 .relations
@@ -376,17 +392,33 @@ fn resolve_with_map(
 
             let source_is_sql = ext.file.ends_with(".sql");
 
+            // rel.source_id is routinely bare (extraction's
+            // find_enclosing_function only ever returns an unqualified name,
+            // see the comment further below) — derive the caller's real
+            // qualified id from local_symbols so a bare source_id like
+            // "widget.py::render" still resolves its own enclosing class
+            // ("Widget") instead of looking classless just because the raw
+            // source_id had no class segment. If the bare source name is
+            // itself ambiguous (two symbols in this file share it), there's
+            // no way to know which one made the call — fall back to the raw
+            // source_id as-is rather than guessing. Shared by the fast path
+            // and Strategy 2 below so both derive the caller's class the
+            // same way instead of one reading it off the raw (often-bare)
+            // source_id directly.
+            let qualified_source_id = |source_id: &str| -> String {
+                let source_name = source_id.rsplit("::").next().unwrap_or(source_id);
+                match local_symbols.get(source_name) {
+                    Some(ids) if ids.len() == 1 => ids[0].to_string(),
+                    _ => source_id.to_string(),
+                }
+            };
+
             for rel in &ext.relations {
                 if rel.kind != RelationKind::Calls {
                     continue;
                 }
 
                 let target_name = rel.target_id.rsplit("::").next().unwrap_or(&rel.target_id);
-
-                // Non-None once find_enclosing_function actually qualifies
-                // rel.source_id with a class/impl name (see relations.rs).
-                // Used here and by Strategy 2 further below.
-                let caller_class = rel.source_id.rsplit("::").nth(1).map(|s| s.to_string());
 
                 // Same-class fast path only applies when the call is unqualified
                 // (`method()`) or explicitly self-referential (`this.method()`,
@@ -401,67 +433,100 @@ fn resolve_with_map(
                 );
 
                 if is_self_receiver {
-                    // Prefer a class-qualified lookup over the bare-name
-                    // local_callables map: local_callables collapses to one
-                    // entry per bare name, so when two same-named methods
-                    // exist in this file (e.g. an inherent + trait impl of
-                    // the same Rust method, or two impls sharing a helper
-                    // name) it always resolves self.helper() to the SAME
-                    // one candidate regardless of which impl's body the call
-                    // actually came from. class_method_map is keyed by
-                    // "Class::method", so it disambiguates correctly once
-                    // the caller's own id is class-qualified.
-                    let target_id = caller_class
-                        .as_deref()
-                        .and_then(|cls| class_method_map.get(&format!("{}::{}", cls, target_name)))
-                        .and_then(|matches| {
-                            matches
-                                .iter()
-                                .find(|(_, f)| f == &ext.file)
-                                .map(|(id, _)| id.as_str())
-                        })
-                        .or_else(|| local_callables.get(target_name).copied());
-
-                    if let Some(target_id) = target_id {
-                        // Determine the correct source id: if rel.source_id is
-                        // already one of this file's real ids (the common case,
-                        // and the only case once find_enclosing_function
-                        // class-qualifies it), use it as-is -- do NOT run it
-                        // through the bare-name local_symbols map, which
-                        // collapses to one candidate per name and would
-                        // silently overwrite an already-correct qualified
-                        // source_id with whichever same-named symbol it
-                        // collided with (e.g. picking Beta::hello's id for a
-                        // call that actually came from Alpha::hello's body).
-                        //
-                        // Otherwise, rel.source_id is bare — extraction's
-                        // find_enclosing_function only ever returns an
-                        // unqualified name for languages/cases whose enclosing
-                        // method has no resolvable class (see relations.rs),
-                        // e.g. "DebugViewModel.cs::ExecuteCrashManagedBackground"
-                        // rather than the real qualified
-                        // "...::DebugViewModel::ExecuteCrashManagedBackground" —
-                        // fix it up via the bare-name map in that case.
-                        let final_source_id: &str = if local_ids.contains(rel.source_id.as_str()) {
-                            rel.source_id.as_str()
+                    if let Some(candidates) = local_callables.get(target_name) {
+                        // Multiple candidates share this bare name in the same
+                        // file (free function + same-named method, or
+                        // overloads). Resolve using real scoping semantics: an
+                        // unqualified/self call inside a method is shadowed by
+                        // that method's own class first; only if the caller
+                        // isn't in a matching class does the free-standing
+                        // candidate apply. A candidate is free-standing iff
+                        // its id is exactly "{file}::{name}" (no class
+                        // segment) — checked structurally, not by counting
+                        // "::" occurrences, since file paths can contain them.
+                        let target_id = if candidates.len() == 1 {
+                            Some(candidates[0])
                         } else {
-                            let source_name =
-                                rel.source_id.rsplit("::").next().unwrap_or(&rel.source_id);
-                            local_symbols
-                                .get(source_name)
-                                .copied()
-                                .unwrap_or(rel.source_id.as_str())
+                            let qualified_source = qualified_source_id(&rel.source_id);
+                            let caller_class = qualified_source.rsplit("::").nth(1);
+
+                            let method_match = caller_class.and_then(|cls| {
+                                let pattern = format!("::{cls}::{target_name}");
+                                let mut it = candidates
+                                    .iter()
+                                    .copied()
+                                    .filter(|id| id.ends_with(&pattern));
+                                let first = it.next();
+                                if first.is_some() && it.next().is_none() {
+                                    first
+                                } else {
+                                    None
+                                }
+                            });
+
+                            if method_match.is_some() {
+                                method_match
+                            } else {
+                                let free_standing_id = format!("{}::{target_name}", ext.file);
+                                let free_standing: Vec<&str> = candidates
+                                    .iter()
+                                    .copied()
+                                    .filter(|id| *id == free_standing_id)
+                                    .collect();
+                                if free_standing.len() == 1 {
+                                    Some(free_standing[0])
+                                } else {
+                                    // Ambiguous (multiple overloads, or no
+                                    // scoping signal to break the tie) —
+                                    // abstain rather than guess.
+                                    None
+                                }
+                            }
                         };
 
-                        // The initial bulk write (store_bulk.rs) already
-                        // created this edge using rel.source_id/rel.target_id
-                        // verbatim when both were already correct (true only
-                        // for an unqualified caller calling an unqualified
-                        // callee, e.g. two top-level functions) -- a genuine
-                        // no-op in that case. target_id is virtually always
-                        // resolved/qualified and so differs from the bare
-                        // rel.target_id whenever the callee is class-scoped,
-                        // which is exactly when this push is needed.
+                        let Some(target_id) = target_id else {
+                            continue;
+                        };
+
+                        // Which of this file's symbols made the call.
+                        //
+                        // A unique bare source name is fixed up to its real id
+                        // -- extraction's find_enclosing_function still returns
+                        // an unqualified name for a caller whose class it
+                        // cannot resolve (e.g.
+                        // "DebugViewModel.cs::ExecuteCrashManagedBackground"
+                        // for the real "...::DebugViewModel::Execute...").
+                        //
+                        // An ambiguous name whose source_id already names one
+                        // of the candidates exactly is correct as-is: that is
+                        // the class-qualified caller id find_enclosing_function
+                        // now produces, and two same-named methods (Alpha::hello
+                        // beside Beta::hello) must each keep their own.
+                        //
+                        // Anything else -- an ambiguous bare name, or a source
+                        // that is no symbol of this file -- abstains rather
+                        // than guesses, same as the target-side ambiguity above.
+                        let source_name =
+                            rel.source_id.rsplit("::").next().unwrap_or(&rel.source_id);
+                        let final_source_id: &str =
+                            match local_symbols.get(source_name).map(Vec::as_slice) {
+                                Some([only]) => only,
+                                Some(ids) if ids.contains(&rel.source_id.as_str()) => {
+                                    rel.source_id.as_str()
+                                }
+                                _ => continue,
+                            };
+
+                        // The initial bulk write (store_bulk.rs) created this
+                        // edge from rel.source_id/rel.target_id verbatim, which
+                        // lands only when both were already real ids. Push
+                        // whenever EITHER side had to be resolved: with caller
+                        // ids now class-qualified at extraction, the common
+                        // case is a correct source and a bare target that had
+                        // to be qualified (`self.helper()` inside Alpha::hello
+                        // naming "f.rs::helper" for the real
+                        // "f.rs::Alpha::helper"), and a source-only test would
+                        // silently drop every one of those edges.
                         if final_source_id != rel.source_id || target_id != rel.target_id {
                             res.pairs
                                 .push((final_source_id.to_string(), target_id.to_string()));
@@ -518,7 +583,18 @@ fn resolve_with_map(
                     }
                 }
 
-                // Strategy 2: Enclosing-class preference (caller_class computed above).
+                // Strategy 2: Enclosing-class preference. Derive caller_class
+                // from the qualified source id (via qualified_source_id), not
+                // the raw rel.source_id directly — a bare source_id's
+                // rsplit("::").nth(1) resolves to the file path segment, not
+                // a real class name, which silently defeated the same-class
+                // match below for the common bare-source case (falling
+                // through to import_scope_match instead — deterministic, but
+                // missing a real same-class candidate whenever no import
+                // covers it).
+                let qualified_source = qualified_source_id(&rel.source_id);
+                let caller_class = qualified_source.rsplit("::").nth(1).map(|s| s.to_string());
+
                 if let Some(candidates) = symbol_map.get(target_name) {
                     let cross_file: Vec<_> = candidates
                         .iter()
@@ -614,77 +690,132 @@ fn resolve_with_map(
         external_calls.extend(fr.external_calls);
     }
 
-    // Batch insert resolved CALLS edges via COPY FROM parquet
-    if !resolved_pairs.is_empty() {
-        let mut known_ids: std::collections::HashSet<&str> = symbol_map
-            .values()
-            .flat_map(|v| v.iter().map(|(id, _, _)| id.as_str()))
-            .collect();
-        for ext in extractions {
-            for sym in &ext.symbols {
-                known_ids.insert(&sym.id);
+    // Reconcile bare source ids before returning. `rel.source_id` comes from
+    // extraction's find_enclosing_function, which can return an unqualified
+    // name (e.g. "{file}::ParseFIRegistryDetailResponse" instead of the real
+    // "{file}::Import::ParseFIRegistryDetailResponse") — a caller's write-time
+    // MATCH on the bare id would silently match zero rows, dropping an
+    // otherwise-correctly-resolved edge with no trace. Pure logic, shared by
+    // both backends' writers.
+    let mut known_ids: std::collections::HashSet<&str> = symbol_map
+        .values()
+        .flat_map(|v| v.iter().map(|(id, _, _)| id.as_str()))
+        .collect();
+    for ext in extractions {
+        for sym in &ext.symbols {
+            known_ids.insert(&sym.id);
+        }
+    }
+    let mut file_name_to_ids: HashMap<(String, String), Vec<String>> = HashMap::new();
+    for ext in extractions {
+        for sym in &ext.symbols {
+            file_name_to_ids
+                .entry((ext.file.clone(), sym.name.clone()))
+                .or_default()
+                .push(sym.id.clone());
+        }
+    }
+    for candidates in symbol_map.values() {
+        for (id, file, _kind) in candidates {
+            let name = id.rsplit("::").next().unwrap_or(id);
+            file_name_to_ids
+                .entry((file.clone(), name.to_string()))
+                .or_default()
+                .push(id.clone());
+        }
+    }
+
+    let fix_source = |src: &String| -> Vec<String> {
+        if known_ids.contains(src.as_str()) {
+            return vec![src.clone()];
+        }
+        if let Some(sep) = src.rfind("::") {
+            let file_part = &src[..sep];
+            let name_part = &src[sep + 2..];
+            if let Some(ids) = file_name_to_ids.get(&(file_part.to_string(), name_part.to_string()))
+            {
+                return ids
+                    .iter()
+                    .filter(|id| known_ids.contains(id.as_str()))
+                    .cloned()
+                    .collect();
             }
         }
-        let mut file_name_to_ids: HashMap<(String, String), Vec<String>> = HashMap::new();
-        for ext in extractions {
-            for sym in &ext.symbols {
-                file_name_to_ids
-                    .entry((ext.file.clone(), sym.name.clone()))
-                    .or_default()
-                    .push(sym.id.clone());
-            }
-        }
-        for candidates in symbol_map.values() {
-            for (id, file, _kind) in candidates {
-                let name = id.rsplit("::").next().unwrap_or(id);
-                file_name_to_ids
-                    .entry((file.clone(), name.to_string()))
-                    .or_default()
-                    .push(id.clone());
-            }
-        }
+        vec![src.clone()]
+    };
 
-        let fixed_pairs: Vec<(String, String)> = resolved_pairs
-            .iter()
-            .flat_map(|(src, tgt)| {
-                if known_ids.contains(src.as_str()) {
-                    vec![(src.clone(), tgt.clone())]
-                } else if let Some(sep) = src.rfind("::") {
-                    let file_part = &src[..sep];
-                    let name_part = &src[sep + 2..];
-                    if let Some(ids) =
-                        file_name_to_ids.get(&(file_part.to_string(), name_part.to_string()))
-                    {
-                        ids.iter()
-                            .filter(|id| known_ids.contains(id.as_str()))
-                            .map(|id| (id.clone(), tgt.clone()))
-                            .collect::<Vec<_>>()
-                    } else {
-                        vec![(src.clone(), tgt.clone())]
-                    }
-                } else {
-                    vec![(src.clone(), tgt.clone())]
-                }
-            })
-            .collect();
+    let fixed_pairs: Vec<(String, String)> = resolved_pairs
+        .iter()
+        .flat_map(|(src, tgt)| {
+            fix_source(src)
+                .into_iter()
+                .map(|fixed_src| (fixed_src, tgt.clone()))
+                .collect::<Vec<_>>()
+        })
+        .collect();
 
-        // file_name_to_ids can carry the same id twice for one (file, name) key
-        // (populated once from extractions and once from symbol_map), which
-        // would otherwise fan a single call site out into duplicate CALLS edges.
-        let mut seen_pairs: std::collections::HashSet<&(String, String)> =
-            std::collections::HashSet::new();
-        let valid_pairs: Vec<&(String, String)> = fixed_pairs
-            .iter()
-            .filter(|(src, tgt)| {
-                known_ids.contains(src.as_str()) && known_ids.contains(tgt.as_str())
-            })
-            .filter(|pair| seen_pairs.insert(pair))
-            .collect();
+    // file_name_to_ids can carry the same id twice for one (file, name) key
+    // (populated once from extractions and once from symbol_map), which
+    // would otherwise fan a single call site out into duplicate CALLS edges.
+    let mut seen_pairs: std::collections::HashSet<&(String, String)> =
+        std::collections::HashSet::new();
+    let pairs: Vec<(String, String)> = fixed_pairs
+        .iter()
+        .filter(|(src, tgt)| known_ids.contains(src.as_str()) && known_ids.contains(tgt.as_str()))
+        .filter(|pair| seen_pairs.insert(pair))
+        .cloned()
+        .collect();
 
-        let pairs: Vec<(String, String)> = valid_pairs
-            .into_iter()
-            .map(|(a, b)| (a.clone(), b.clone()))
-            .collect();
+    let fixed_external: Vec<(String, String, String)> = external_calls
+        .iter()
+        .flat_map(|(caller, receiver, method)| {
+            fix_source(caller)
+                .into_iter()
+                .map(|fixed_caller| (fixed_caller, receiver.clone(), method.clone()))
+                .collect::<Vec<_>>()
+        })
+        .filter(|(caller, _, _)| known_ids.contains(caller.as_str()))
+        .collect();
+    let mut seen_external: std::collections::HashSet<&(String, String, String)> =
+        std::collections::HashSet::new();
+    let external_calls: Vec<(String, String, String)> = fixed_external
+        .iter()
+        .filter(|triple| seen_external.insert(triple))
+        .cloned()
+        .collect();
+
+    ResolvedCalls {
+        pairs,
+        external_calls,
+        stats: ResolveStats {
+            total_calls: total_dangling,
+            resolved,
+            unresolved,
+            learned_resolved,
+            inherits_resolved: 0,
+        },
+    }
+}
+
+/// Kuzu's write wrapper around [`resolve_pairs`]: runs the shared decision
+/// loop, then does the parquet-bulk-copy write and ExternalRef/EXTERNAL_CALL
+/// write that only Kuzu's embedded `Connection` can do.
+/// Caller must hold WriteLock.
+fn write_resolved_calls(
+    store: &GraphStore,
+    conn: &kuzu::Connection<'_>,
+    extractions: &[FileExtraction],
+    symbol_map: &HashMap<String, Vec<(String, String, String)>>,
+    learned_store: Option<&LearnedStore>,
+    _witness: &WriteLock,
+) -> Result<ResolveStats> {
+    let ResolvedCalls {
+        pairs,
+        external_calls,
+        stats,
+    } = resolve_pairs(extractions, symbol_map, learned_store);
+
+    if !pairs.is_empty() {
         let pq_path = staging_parquet("infigraph_resolve_calls");
         copy_edges_with_bad_record_retry(store, "CALLS", pairs, "Symbol", "Symbol", &pq_path)?;
     }
@@ -693,13 +824,7 @@ fn resolve_with_map(
         write_external_calls(conn, &external_calls, symbol_map, extractions);
     }
 
-    Ok(ResolveStats {
-        total_calls: total_dangling,
-        resolved,
-        unresolved,
-        learned_resolved,
-        inherits_resolved: 0,
-    })
+    Ok(stats)
 }
 
 /// Targeted re-resolution for a subset of files.
@@ -760,7 +885,7 @@ pub fn re_resolve_for_files(
         symbol_map.entry(name).or_default().push((id, file, kind));
     }
 
-    let mut stats = resolve_with_map(
+    let mut stats = write_resolved_calls(
         store,
         &conn,
         &filtered_owned,
@@ -775,7 +900,7 @@ pub fn re_resolve_for_files(
     Ok(stats)
 }
 
-fn import_scope_match(
+pub(crate) fn import_scope_match(
     cross_file: &[&(String, String, String)],
     imported_stems: &std::collections::HashSet<String>,
     source_is_sql: bool,
@@ -807,7 +932,7 @@ fn import_scope_match(
     }
 }
 
-fn shortest_id2<'a, I, F>(iter: I, pred: F) -> Option<String>
+pub(crate) fn shortest_id2<'a, I, F>(iter: I, pred: F) -> Option<String>
 where
     I: Iterator<Item = &'a (String, String)>,
     F: Fn(&(String, String)) -> bool,
