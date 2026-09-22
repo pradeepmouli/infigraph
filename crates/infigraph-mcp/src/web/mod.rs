@@ -105,6 +105,19 @@ use handlers_chat::api_chat;
 use handlers_git::api_git_summary;
 use handlers_symbol::*;
 
+/// `host:port` for a server to bind: loopback unless `env_var` names another
+/// host. Both servers go through this, so exposing either to the network is
+/// always a deliberate, named opt-in rather than a default (ADV-2598). An
+/// empty value counts as unset -- binding host `""` is never what someone
+/// who exported an empty variable meant.
+pub fn bind_addr(env_var: &str, port: u16) -> String {
+    let host = std::env::var(env_var)
+        .ok()
+        .filter(|host| !host.is_empty())
+        .unwrap_or_else(|| "127.0.0.1".to_string());
+    format!("{host}:{port}")
+}
+
 /// Start the web UI server on the given port. Runs in a background thread.
 ///
 /// Binds to loopback (`127.0.0.1`) by default so the unauthenticated Web UI/API
@@ -112,8 +125,7 @@ use handlers_symbol::*;
 /// hosts on the network. Set `INFIGRAPH_UI_BIND` to override the bind address
 /// (e.g. `0.0.0.0`) when intentionally exposing the UI.
 pub fn start_ui_server(port: u16) -> bool {
-    let host = std::env::var("INFIGRAPH_UI_BIND").unwrap_or_else(|_| "127.0.0.1".to_string());
-    let addr = format!("{}:{}", host, port);
+    let addr = bind_addr("INFIGRAPH_UI_BIND", port);
     // Pre-check: try binding before spawning thread so caller knows outcome
     let server = match Server::http(&addr) {
         Ok(s) => s,
@@ -166,8 +178,13 @@ pub fn start_ui_server(port: u16) -> bool {
     true
 }
 
+/// Binds to loopback by default for the same reason as [`start_ui_server`]
+/// (ADV-2598): `POST /tools/mcp` is the whole tool surface, raw Cypher
+/// included, and `check_auth` passes everything when no API key is set.
+/// `--serve` exists to be reached over the network, so a real deployment
+/// sets `INFIGRAPH_MCP_BIND` (e.g. `0.0.0.0`) -- together with an API key.
 pub fn start_mcp_http_server(port: u16, is_primary: bool, health_path: &str) -> bool {
-    let addr = format!("0.0.0.0:{}", port);
+    let addr = bind_addr("INFIGRAPH_MCP_BIND", port);
     let server = match Server::http(&addr) {
         Ok(s) => s,
         Err(_) => return false,
@@ -925,6 +942,62 @@ mod tests {
             TcpListener::bind(format!("0.0.0.0:{}", port)).is_ok(),
             "UI server must not bind 0.0.0.0 by default (ADV-2598)"
         );
+    }
+
+    /// Same exposure as ADV-2598, on the other server. `--serve` puts the
+    /// whole MCP tool surface at `POST /tools/mcp` -- raw Cypher included --
+    /// behind an auth check that is off when no API key is set, and
+    /// `GET /webhook/status` behind none at all. Upstream's ADV-2598 fix moved
+    /// only the UI server to loopback; this is the same probe for this one.
+    #[test]
+    fn test_mcp_http_server_binds_loopback_not_wildcard_by_default() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("INFIGRAPH_MCP_BIND");
+        }
+        let port = free_port();
+        assert!(
+            start_mcp_http_server(port, false, "/health"),
+            "MCP HTTP server should start on loopback"
+        );
+        thread::sleep(std::time::Duration::from_millis(100));
+
+        let (status, _) = http_get(port, "/health");
+        assert!(
+            status == 200 || status == 503,
+            "MCP HTTP server should be reachable on 127.0.0.1, got {status}"
+        );
+        assert!(
+            TcpListener::bind(format!("0.0.0.0:{}", port)).is_ok(),
+            "MCP HTTP server must not bind 0.0.0.0 by default"
+        );
+    }
+
+    /// One rule for both servers: loopback unless an override names another
+    /// host. An empty override is treated as unset -- binding host `""` is
+    /// never what someone who exported an empty variable meant.
+    #[test]
+    fn bind_addr_defaults_to_loopback_and_honors_its_override() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let var = "INFIGRAPH_TEST_BIND_ADDR";
+        unsafe {
+            std::env::remove_var(var);
+        }
+        assert_eq!(bind_addr(var, 8642), "127.0.0.1:8642");
+
+        unsafe {
+            std::env::set_var(var, "0.0.0.0");
+        }
+        assert_eq!(bind_addr(var, 8642), "0.0.0.0:8642");
+
+        unsafe {
+            std::env::set_var(var, "");
+        }
+        assert_eq!(bind_addr(var, 8642), "127.0.0.1:8642");
+
+        unsafe {
+            std::env::remove_var(var);
+        }
     }
 
     #[test]

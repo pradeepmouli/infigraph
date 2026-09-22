@@ -211,15 +211,25 @@ This means:
 Serve Infigraph as a **remote MCP server** over HTTP, giving your entire team access to the code intelligence graph without local setup.
 
 ```bash
-# Start HTTP server (default port 8642)
+# Start HTTP server on this machine only (default port 8642, 127.0.0.1)
 infigraph-mcp --serve
 
-# Custom port + API key auth
-INFIGRAPH_API_KEY=your-secret infigraph-mcp --serve --mcp-port=9000
+# Serve your team: bind all interfaces, with API key auth
+INFIGRAPH_MCP_BIND=0.0.0.0 INFIGRAPH_API_KEY=your-secret infigraph-mcp --serve --mcp-port=9000
 
 # Combine with stdio MCP (serve both transports)
 infigraph-mcp --mcp --serve
 ```
+
+Both HTTP servers bind **loopback by default** and are exposed to the
+network only when you say so: `INFIGRAPH_MCP_BIND` for `--serve`, and
+`INFIGRAPH_UI_BIND` for the web UI (ADV-2598). Set an API key whenever you
+do — `POST /tools/mcp` is the whole tool surface, raw Cypher queries
+included, and with no key configured it accepts every request.
+
+> **Upgrading a remote deployment:** before this default existed, `--serve`
+> bound `0.0.0.0`. A deployment that relied on that stops accepting remote
+> connections until it sets `INFIGRAPH_MCP_BIND=0.0.0.0`.
 
 ### Connect from Claude Code
 
