@@ -710,6 +710,44 @@ mod tests {
         assert!(!matcher.is_ignored(&lib.join("src/api.ts"), false));
     }
 
+    /// pnpm's real store lives under `node_modules/.pnpm/`, and a package
+    /// there is named by the exact path a project's own imports use. The
+    /// walker runs with `hidden(true)`, so an include root under a
+    /// dot-prefixed ancestor is worth pinning down: it works because the
+    /// added root is where the walk *starts*, leaving `.pnpm` itself never
+    /// visited as an entry -- but only until someone makes the filter look
+    /// at ancestors.
+    #[test]
+    fn an_include_root_under_a_hidden_ancestor_is_walked() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join(".gitignore"), "node_modules/\n").unwrap();
+        fs::create_dir_all(dir.path().join(".infigraph")).unwrap();
+        fs::write(
+            dir.path().join(".infigraph/config.toml"),
+            "[index]\ninclude = [\"node_modules/.pnpm/pkg@1.0.0/node_modules/pkg\"]\n",
+        )
+        .unwrap();
+        let pkg = dir
+            .path()
+            .join("node_modules/.pnpm/pkg@1.0.0/node_modules/pkg");
+        fs::create_dir_all(&pkg).unwrap();
+        fs::write(pkg.join("grammar.js"), "module.exports = grammar({});").unwrap();
+        fs::write(pkg.join(".hidden.js"), "// still hidden").unwrap();
+
+        let found = walked_files(dir.path());
+        assert!(
+            found.iter().any(|p| p.ends_with("pkg/grammar.js")),
+            "a `.pnpm` ancestor must not hide an include root: {found:?}"
+        );
+        assert!(
+            !found.iter().any(|p| p.ends_with(".hidden.js")),
+            "hidden(true) still applies to entries *within* an include root: {found:?}"
+        );
+
+        let matcher = IgnoreMatcher::build(dir.path());
+        assert!(!matcher.is_ignored(&pkg.join("grammar.js"), false));
+    }
+
     /// pnpm lays `node_modules/<pkg>` out as a symlink into `.pnpm/`, so
     /// the real-world include root is a link, not a directory. The walker
     /// runs with `follow_links(false)`, and whether that also refuses an
