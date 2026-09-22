@@ -189,20 +189,47 @@ anyway — a vendored reference library worth having in the graph:
 include = ["node_modules/@acme/reference-lib", "vendor/upstream-sdk"]
 ```
 
-Entries are project-root-relative directory paths matched literally — not
-globs, so list each one. An absolute path or one climbing out with `..` is
-rejected rather than resolved: an include can never widen indexing beyond
-its own project.
+Entries are directory paths matched literally — not globs, so list each
+one. A pnpm-style symlinked directory works as an entry.
 
-An include drops only the rules coming from *above* the named directory.
-Inside it, `.git/` and a nested `node_modules/` are still excluded, and a
-`.gitignore` within it still applies. The file watcher honors the same
-list, so edits in an included directory trigger reindexing like any other.
+**What an include overrides, and what it does not.** `.gitignore` says
+"not under source control"; that is what an include is for. Your
+`.infigraphignore` says "not worth indexing"; an include does not override
+that. The project's `.infigraphignore` keeps applying inside an included
+directory, matched against the path *relative to* it — so `node_modules/`
+no longer matches (the include works) while `src/parser.c` still does:
 
-The equivalent env var is comma-separated
-(`INFIGRAPH_INDEX_INCLUDE=node_modules/lib,vendor/sdk`), and a project's
-`.infigraph/config.toml` wins over `~/.infigraph/config.toml` when both
-declare the key.
+```
+# .infigraphignore
+node_modules/        # the include overrides this
+src/parser.c         # this still applies inside the included directory
+```
+
+`.git/` and a nested `node_modules/` are always excluded, and a
+`.gitignore` *inside* the included directory still applies. The file
+watcher honors the same rules, so edits there reindex like any other file.
+
+**An include must still resolve inside the project root.** File identity
+in the graph is the path relative to that root (`scan_changed_files`
+drops anything `strip_prefix(root)` rejects), so a directory living
+elsewhere has no key and cannot be indexed by this mechanism at all. To
+index a dependency's source — a crate in the cargo registry, say — index
+it as its own project and join the two with a group
+(`group_create` / `group_add` / `group_link`); that is what the multi-repo
+machinery is for. See `docs/REMOTE-MULTI-REPO.md`.
+
+What the layers differ on is *trust*, not reach. A project's own
+`.infigraph/config.toml` may not write an absolute entry or one climbing
+out with `..`, so a repository you clone cannot point your indexer
+anywhere; `~/.infigraph/config.toml` and the environment may, since those
+are yours. Either way the entry has to land inside the project being
+walked, or it is dropped.
+
+The two layers **union** rather than override, unlike a scalar setting:
+"always index this" and "index this vendored library" are both true at
+once. The env var `INFIGRAPH_INDEX_INCLUDE` is comma-separated and
+replaces both. An entry naming no directory warns once per process rather
+than silently indexing nothing.
 
 ### Parallel processing
 

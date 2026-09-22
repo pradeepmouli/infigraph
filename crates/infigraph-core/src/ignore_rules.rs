@@ -64,25 +64,106 @@ fn is_safety_excluded(name: &str) -> bool {
 /// whole project or one subdirectory of it (`walk_and_search` does the
 /// latter). An entry outside this particular walk is dropped: walking
 /// `src/` must not drag in a reference library under `node_modules/`.
-fn include_roots(root: &Path) -> Vec<PathBuf> {
+/// Which config layer an `[index] include` entry came from. Only a layer
+/// the user themself controls may name a path outside the project: their
+/// own `~/.infigraph/config.toml` can point at a dependency's source in the
+/// cargo registry, while a config file inside a repository they merely
+/// cloned must not be able to name anything at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Trust {
+    /// A project's own `.infigraph/config.toml`.
+    Project,
+    /// `~/.infigraph/config.toml`, or this process's environment.
+    User,
+}
+
+impl Trust {
+    fn may_leave_the_project(self) -> bool {
+        matches!(self, Trust::User)
+    }
+}
+
+/// The include roots for a walk of `root`, plus the rules that still apply
+/// inside them.
+struct Includes {
+    /// Spelled as `root`-relative joins so they share `root`'s exact prefix
+    /// -- every entry a walker yields is `root` joined with components, so
+    /// comparing against a differently-spelled (e.g. canonicalized) path
+    /// would silently never match.
+    roots: Vec<PathBuf>,
+    /// The project's own `.infigraphignore`, matched against the path
+    /// *relative to* an include root.
+    ///
+    /// This is the seam between the two ignore files. `.gitignore` says
+    /// "not under source control", which is exactly what an include is
+    /// overriding. `.infigraphignore` says "not worth indexing", which an
+    /// include has no business overriding. Matching the relative tail is
+    /// what lets both hold at once: `node_modules/` no longer matches
+    /// (so the include works), while `src/parser.c` still does (so
+    /// megabytes of generated parser tables stay out).
+    tail_rules: std::sync::Arc<Gitignore>,
+}
+
+/// Every configured `[index] include` entry, paired with the trust of the
+/// layer that stated it.
+///
+/// The layers are read separately rather than through `Index::resolve`
+/// because merging them would lose exactly the provenance `Trust` needs.
+/// They also union rather than override, unlike a scalar setting: a user
+/// saying "always index this dependency" and a project saying "index this
+/// vendored library" are both true at once, and letting either silence the
+/// other would serve nobody.
+fn configured_includes(project_root: &Path) -> Vec<(String, Trust)> {
+    // The environment is this process's own, so it is trusted -- and it
+    // replaces the files entirely, keeping the macro's usual precedence.
+    if let Some(from_env) = crate::settings::env_override::<PathList>("index", "include") {
+        return from_env.0.into_iter().map(|e| (e, Trust::User)).collect();
+    }
+
+    let docs = crate::settings_file::layers(ConfigScope::Project(project_root));
+    let [project, user] = docs;
+    let entries_of = |doc: Option<std::sync::Arc<toml_edit::DocumentMut>>, trust: Trust| {
+        doc.map(|doc| {
+            Index::resolve_layers(RawIndex::default(), &[doc.as_item()])
+                .include
+                .0
+        })
+        .unwrap_or_default()
+        .into_iter()
+        .map(move |entry| (entry, trust))
+    };
+
+    let mut all: Vec<(String, Trust)> = entries_of(user, Trust::User).collect();
+    for entry in entries_of(project, Trust::Project) {
+        if !all.iter().any(|(existing, _)| *existing == entry.0) {
+            all.push(entry);
+        }
+    }
+    all
+}
+
+fn include_roots(root: &Path) -> Includes {
     let project_root = crate::project::resolve_project_root(root);
-    let settings = Index::resolve(RawIndex::default(), ConfigScope::Project(&project_root));
-    if settings.include.0.is_empty() {
-        return Vec::new();
+    let configured = configured_includes(&project_root);
+    if configured.is_empty() {
+        return Includes {
+            roots: Vec::new(),
+            tail_rules: std::sync::Arc::new(Gitignore::empty()),
+        };
     }
     let walk_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
 
-    settings
-        .include
-        .0
+    let roots = configured
         .iter()
-        .filter_map(|entry| match classify_include(&project_root, entry) {
-            Ok(absolute) => Some(absolute),
-            Err(problem) => {
-                warn_about_unusable_include(entry, problem);
-                None
-            }
-        })
+        .filter_map(
+            |(entry, trust)| match classify_include(&project_root, entry, *trust) {
+                Ok(absolute) => Some(absolute),
+                Err(problem) => {
+                    warn_about_unusable_include(entry, problem);
+                    None
+                }
+            },
+        )
         // Re-spell against this walk's root, and drop anything outside it:
         // walking `src/` must not drag in a library under `node_modules/`.
         // This is a scope check, not a mistake, so it warns about nothing.
@@ -90,15 +171,20 @@ fn include_roots(root: &Path) -> Vec<PathBuf> {
             let relative = absolute.strip_prefix(&walk_root).ok()?;
             Some(root.join(relative))
         })
-        .collect()
+        .collect();
+
+    let mut tail = GitignoreBuilder::new(&project_root);
+    let _ = tail.add(project_root.join(".infigraphignore"));
+    Includes {
+        roots,
+        tail_rules: std::sync::Arc::new(tail.build().unwrap_or_else(|_| Gitignore::empty())),
+    }
 }
 
 /// Why an `[index] include` entry cannot be used.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum IncludeProblem {
-    /// Absolute, or climbing out with `..`. Rejected rather than resolved:
-    /// a project's config file must not be able to widen indexing past its
-    /// own project.
+    /// Points outside the project, from a layer not allowed to do that.
     OutsideProject,
     /// Names nothing, or names a file. Almost always a typo or a path left
     /// behind by a dependency bump.
@@ -106,15 +192,21 @@ enum IncludeProblem {
 }
 
 /// Resolves one `[index] include` entry against `project_root`.
-fn classify_include(project_root: &Path, entry: &str) -> Result<PathBuf, IncludeProblem> {
+fn classify_include(
+    project_root: &Path,
+    entry: &str,
+    trust: Trust,
+) -> Result<PathBuf, IncludeProblem> {
     let relative = Path::new(entry);
-    if !relative.is_relative()
+    let leaves_the_project = relative.is_absolute()
         || relative
             .components()
-            .any(|c| matches!(c, std::path::Component::ParentDir))
-    {
+            .any(|c| matches!(c, std::path::Component::ParentDir));
+    if leaves_the_project && !trust.may_leave_the_project() {
         return Err(IncludeProblem::OutsideProject);
     }
+    // An absolute entry replaces the base, which is what makes a trusted
+    // absolute path resolve to itself.
     let absolute = project_root.join(relative);
     if !absolute.is_dir() {
         return Err(IncludeProblem::NotADirectory);
@@ -139,7 +231,9 @@ fn warn_about_unusable_include(entry: &str, problem: IncludeProblem) {
         return;
     }
     let reason = match problem {
-        IncludeProblem::OutsideProject => "must be a path inside the project (no leading / or ..)",
+        IncludeProblem::OutsideProject => {
+            "must be inside the project (an absolute path or `..` is allowed              only from ~/.infigraph/config.toml)"
+        }
         IncludeProblem::NotADirectory => "names no directory",
     };
     eprintln!("warning: [index] include entry {entry:?} {reason}; ignoring it");
@@ -163,17 +257,26 @@ fn warn_about_unusable_include(entry: &str, problem: IncludeProblem) {
 /// and once as its own root, and duplicate entries mean duplicate indexing.
 /// Reaching it at depth 0 means it *is* the added root; any greater depth
 /// is the ordinary descent arriving, and that arrival is the one to drop.
-fn apply_filter_and_includes(builder: &mut WalkBuilder, includes: Vec<PathBuf>) {
-    if !includes.is_empty() {
+fn apply_filter_and_includes(builder: &mut WalkBuilder, includes: Includes) {
+    let Includes { roots, tail_rules } = includes;
+    if !roots.is_empty() {
         builder.parents(false);
-        for include in &includes {
+        for include in &roots {
             builder.add(include);
         }
     }
 
     builder.filter_entry(move |entry| {
-        if entry.depth() > 0 && includes.iter().any(|root| root == entry.path()) {
+        let path = entry.path();
+        if entry.depth() > 0 && roots.iter().any(|root| root == path) {
             return false;
+        }
+        if let Some(root) = roots.iter().find(|root| path.starts_with(root)) {
+            let tail = path.strip_prefix(root).unwrap_or(path);
+            let is_dir = entry.file_type().is_some_and(|ft| ft.is_dir());
+            if !tail.as_os_str().is_empty() && tail_rules.matched(tail, is_dir).is_ignore() {
+                return false;
+            }
         }
         !is_safety_excluded(&entry.file_name().to_string_lossy())
     });
@@ -206,6 +309,11 @@ pub struct IgnoreMatcher {
     /// paths handed to `is_ignored` are, so `starts_with` can compare them
     /// without canonicalizing on every call.
     includes: Vec<PathBuf>,
+    /// The project's `.infigraphignore`, matched against the path relative
+    /// to an include root -- the point-wise twin of the walker's tail
+    /// check, so the watcher does not mark a generated file the indexer
+    /// skips.
+    tail_rules: std::sync::Arc<Gitignore>,
     /// Rules from only those ignore files living at or below an include
     /// root. Inside an include root this replaces `gitignore`, which is the
     /// point-wise twin of the walker's `parents(false)`: the project-level
@@ -237,13 +345,15 @@ impl IgnoreMatcher {
         let mut inside_builder = GitignoreBuilder::new(&root);
 
         let includes = include_roots(&root);
+        let include_roots = includes.roots.clone();
+        let tail_rules = includes.tail_rules.clone();
         let mut discovery = WalkBuilder::new(&root);
         discovery
             .hidden(false)
             .git_ignore(true)
             .require_git(false)
             .add_custom_ignore_filename(".infigraphignore");
-        apply_filter_and_includes(&mut discovery, includes.clone());
+        apply_filter_and_includes(&mut discovery, includes);
 
         for result in discovery.build() {
             let Ok(entry) = result else { continue };
@@ -252,7 +362,10 @@ impl IgnoreMatcher {
                 continue;
             }
             let _ = gi_builder.add(entry.path());
-            if includes.iter().any(|root| entry.path().starts_with(root)) {
+            if include_roots
+                .iter()
+                .any(|root| entry.path().starts_with(root))
+            {
                 let _ = inside_builder.add(entry.path());
             }
         }
@@ -264,7 +377,8 @@ impl IgnoreMatcher {
         IgnoreMatcher {
             root,
             gitignore,
-            includes,
+            includes: include_roots,
+            tail_rules,
             inside_includes,
         }
     }
@@ -288,6 +402,14 @@ impl IgnoreMatcher {
         if checked
             .components()
             .any(|c| is_safety_excluded(&c.as_os_str().to_string_lossy()))
+        {
+            return true;
+        }
+        // The project's own "not worth indexing" rules survive an include,
+        // matched against the tail exactly as the walker matches them.
+        if include.is_some()
+            && !checked.as_os_str().is_empty()
+            && self.tail_rules.matched(checked, is_dir).is_ignore()
         {
             return true;
         }
@@ -588,6 +710,116 @@ mod tests {
         assert!(!matcher.is_ignored(&lib.join("src/api.ts"), false));
     }
 
+    /// pnpm lays `node_modules/<pkg>` out as a symlink into `.pnpm/`, so
+    /// the real-world include root is a link, not a directory. The walker
+    /// runs with `follow_links(false)`, and whether that also refuses an
+    /// added root is the kind of thing to check rather than assume.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_include_root_is_walked() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join(".gitignore"), "node_modules/\n").unwrap();
+        fs::create_dir_all(dir.path().join(".infigraph")).unwrap();
+        fs::write(
+            dir.path().join(".infigraph/config.toml"),
+            "[index]\ninclude = [\"node_modules/linked-lib\"]\n",
+        )
+        .unwrap();
+        fs::create_dir_all(dir.path().join("node_modules/.store/linked-lib")).unwrap();
+        fs::write(
+            dir.path().join("node_modules/.store/linked-lib/grammar.js"),
+            "module.exports = grammar({});",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            dir.path().join("node_modules/.store/linked-lib"),
+            dir.path().join("node_modules/linked-lib"),
+        )
+        .unwrap();
+
+        let found = walked_files(dir.path());
+        assert!(
+            found.iter().any(|p| p.ends_with("grammar.js")),
+            "a pnpm-style symlinked include root must still be walked: {found:?}"
+        );
+
+        let matcher = IgnoreMatcher::build(dir.path());
+        assert!(
+            !matcher.is_ignored(
+                &dir.path().join("node_modules/linked-lib/grammar.js"),
+                false
+            ),
+            "the matcher must agree about a symlinked include root"
+        );
+    }
+
+    /// The seam between the two ignore files. `.gitignore` says "not under
+    /// source control", which is exactly what an include overrides;
+    /// `.infigraphignore` says "not worth indexing", which it has no
+    /// business overriding. So the project's own `.infigraphignore` keeps
+    /// applying inside an include root -- matched against the path
+    /// *relative* to that root, so `node_modules/` stops matching (the
+    /// include works) while `src/parser.c` still bites (2.7MB of generated
+    /// parser tables stay out).
+    #[test]
+    fn the_project_infigraphignore_still_applies_inside_an_include_root() {
+        let dir = make_include_fixture();
+        fs::write(
+            dir.path().join(".infigraphignore"),
+            "node_modules/\nsrc/parser.c\n",
+        )
+        .unwrap();
+        let lib = dir.path().join("node_modules/reference-lib");
+        fs::write(lib.join("src/parser.c"), "// 2.7MB of tables, pretend").unwrap();
+
+        let found = walked_files(dir.path());
+        assert!(
+            found
+                .iter()
+                .any(|p| p == "node_modules/reference-lib/src/api.ts"),
+            "`node_modules/` must not match the tail, or the include is dead: {found:?}"
+        );
+        assert!(
+            !found.iter().any(|p| p.ends_with("parser.c")),
+            "a project .infigraphignore rule must reach inside an include root: {found:?}"
+        );
+
+        let matcher = IgnoreMatcher::build(dir.path());
+        assert!(matcher.is_ignored(&lib.join("src/parser.c"), false));
+        assert!(!matcher.is_ignored(&lib.join("src/api.ts"), false));
+    }
+
+    /// An entry may point outside the project only when it came from a
+    /// layer the user controls. Their own `~/.infigraph/config.toml` may
+    /// name a dependency's source in the cargo registry; a config file
+    /// inside a repository they cloned may not name anything at all.
+    #[test]
+    fn an_entry_may_leave_the_project_only_from_a_trusted_layer() {
+        let dir = make_include_fixture();
+        let root = dir.path();
+        let outside = root.join("node_modules");
+
+        assert_eq!(
+            classify_include(root, &outside.to_string_lossy(), Trust::User),
+            Ok(outside.clone()),
+            "the user's own config may name an absolute path"
+        );
+        assert_eq!(
+            classify_include(root, &outside.to_string_lossy(), Trust::Project),
+            Err(IncludeProblem::OutsideProject),
+            "a project's config may not"
+        );
+        assert_eq!(
+            classify_include(root, "../elsewhere", Trust::Project),
+            Err(IncludeProblem::OutsideProject),
+        );
+        assert_eq!(
+            classify_include(root, "node_modules/reference-lib", Trust::Project),
+            Ok(root.join("node_modules/reference-lib")),
+            "a relative in-project entry is fine from either layer"
+        );
+    }
+
     /// A misspelled or stale entry is the likeliest way to use this feature
     /// wrong, and the symptom -- nothing gets indexed -- looks exactly like
     /// the feature not working. Each rejection carries the reason so the
@@ -598,24 +830,28 @@ mod tests {
         let root = dir.path();
 
         assert_eq!(
-            classify_include(root, "node_modules/reference-lib"),
+            classify_include(root, "node_modules/reference-lib", Trust::Project),
             Ok(root.join("node_modules/reference-lib")),
         );
         assert_eq!(
-            classify_include(root, "node_modules/no-such-lib"),
+            classify_include(root, "node_modules/no-such-lib", Trust::Project),
             Err(IncludeProblem::NotADirectory),
         );
         assert_eq!(
-            classify_include(root, "node_modules/reference-lib/src/api.ts"),
+            classify_include(
+                root,
+                "node_modules/reference-lib/src/api.ts",
+                Trust::Project
+            ),
             Err(IncludeProblem::NotADirectory),
             "include names directories; a file entry is a mistake, not a one-file include"
         );
         assert_eq!(
-            classify_include(root, "../elsewhere"),
+            classify_include(root, "../elsewhere", Trust::Project),
             Err(IncludeProblem::OutsideProject),
         );
         assert_eq!(
-            classify_include(root, "/etc"),
+            classify_include(root, "/etc", Trust::Project),
             Err(IncludeProblem::OutsideProject),
         );
     }
