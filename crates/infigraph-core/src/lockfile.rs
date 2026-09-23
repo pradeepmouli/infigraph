@@ -256,6 +256,19 @@ pub fn read_holder(path: &Path) -> Option<LockInfo> {
     serde_json::from_str(buf.trim()).ok()
 }
 
+/// Clear the identity payload of a lock *this process holds*, without
+/// releasing it -- what `LockFile`'s `Drop` does first, for an exit that
+/// skips `Drop`. `std::process::exit` runs no destructors, so a daemon's
+/// hard-exit watchdog used to leave `watch.lock` naming its dead pid, which
+/// looks exactly like a live holder to anyone diagnosing a stuck daemon
+/// (#188). The flock itself dies with the process. Best-effort: every
+/// caller is on an exit path.
+pub fn clear_payload(path: &Path) {
+    if let Ok(file) = std::fs::OpenOptions::new().write(true).open(path) {
+        let _ = file.set_len(0);
+    }
+}
+
 /// Non-blocking acquisition. `Ok(None)` when another open file description
 /// holds the flock. On success the identity payload is stamped.
 pub fn try_acquire(path: &Path, role: &str) -> Result<Option<LockFile>> {
