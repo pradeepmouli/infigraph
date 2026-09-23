@@ -14,6 +14,7 @@ use anyhow::Context;
 
 mod convention;
 mod discovery;
+pub(crate) mod json_edit;
 mod manifest;
 mod ownership;
 mod resolver;
@@ -23,7 +24,9 @@ mod template;
 
 pub(crate) use discovery::{discover_artifacts, ResolvedArtifact};
 pub(crate) use step::InstallStep;
-pub(crate) use strategy::{read_if_present, settle, ApplyOutcome, Mode, Plan, Strategy};
+pub(crate) use strategy::{
+    read_if_present, read_json_doc, settle, write_json_doc, ApplyOutcome, Mode, Plan, Strategy,
+};
 
 /// Outcome of removing one resolved artifact during uninstall.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

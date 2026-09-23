@@ -2,6 +2,8 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
+use super::json_edit::JsonDoc;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Strategy {
     JsonDeepMerge,
@@ -232,34 +234,39 @@ fn remove_json_keys(target: &mut serde_json::Value, fragment: &serde_json::Value
     removed_any
 }
 
+/// Read a JSON target for editing: `Ok(Err(_))` names a parse failure (the
+/// caller skips rather than rebuilding the user's file), and a missing file is
+/// a new, empty document.
+pub(crate) fn read_json_doc(path: &Path) -> Result<Result<JsonDoc, String>> {
+    let text = read_if_present(path)?
+        .map(String::from_utf8)
+        .transpose()
+        .map_err(|e| anyhow::anyhow!("{} is not UTF-8: {e}", path.display()))?;
+    Ok(JsonDoc::parse_or_new(text.as_deref()))
+}
+
+pub(crate) fn write_json_doc(path: &Path, doc: JsonDoc) -> Result<()> {
+    std::fs::write(path, doc.render())
+        .with_context(|| format!("failed to write {}", path.display()))
+}
+
 pub(crate) fn plan_json_deep_merge(target_path: &Path, fragment_content: &str) -> Result<Plan> {
     let fragment: serde_json::Value = serde_json::from_str(fragment_content).context(
         "bundled/user fragment is not valid JSON (this is an infigraph bug, please report)",
     )?;
 
-    let mut target: serde_json::Value = if target_path.is_file() {
-        let raw = std::fs::read_to_string(target_path)
-            .with_context(|| format!("failed to read {}", target_path.display()))?;
-        match serde_json::from_str(&raw) {
-            Ok(v) => v,
-            Err(e) => {
-                return Ok(Plan::Skip {
-                    reason: format!(
-                        "{} is not valid JSON ({e}) -- possibly hand-edited with comments or trailing commas",
-                        target_path.display()
-                    ),
-                    manual_snippet: fragment_content.to_string(),
-                });
-            }
+    let mut target = match read_json_doc(target_path)? {
+        Ok(doc) => doc,
+        Err(e) => {
+            return Ok(Plan::Skip {
+                reason: format!("{} is not valid JSON ({e})", target_path.display()),
+                manual_snippet: fragment_content.to_string(),
+            });
         }
-    } else {
-        serde_json::json!({})
     };
 
-    merge_json(&mut target, &fragment);
-    Ok(Plan::Write(
-        serde_json::to_string_pretty(&target)?.into_bytes(),
-    ))
+    merge_json(&mut target.value, &fragment);
+    Ok(Plan::Write(target.render().into_bytes()))
 }
 
 /// Install-time token substitution (R8.3, #87): a bundled text artifact
@@ -285,18 +292,13 @@ pub(crate) fn remove_json_deep_merge(target_path: &Path, fragment_content: &str)
     let fragment: serde_json::Value = serde_json::from_str(fragment_content).context(
         "bundled/user fragment is not valid JSON (this is an infigraph bug, please report)",
     )?;
-    let raw = std::fs::read_to_string(target_path)
-        .with_context(|| format!("failed to read {}", target_path.display()))?;
-    let mut target: serde_json::Value = match serde_json::from_str(&raw) {
-        Ok(v) => v,
-        Err(_) => return Ok(false),
+    let Ok(mut target) = read_json_doc(target_path)? else {
+        return Ok(false);
     };
 
-    let removed = remove_json_keys(&mut target, &fragment);
+    let removed = remove_json_keys(&mut target.value, &fragment);
     if removed {
-        let pretty = serde_json::to_string_pretty(&target)?;
-        std::fs::write(target_path, pretty)
-            .with_context(|| format!("failed to write {}", target_path.display()))?;
+        write_json_doc(target_path, target)?;
     }
     Ok(removed)
 }
@@ -532,30 +534,19 @@ pub(crate) fn plan_json_key_path(
         "resolver/content value is not valid JSON (this is an infigraph bug, please report)",
     )?;
 
-    let mut target: serde_json::Value = if target_path.is_file() {
-        let raw = std::fs::read_to_string(target_path)
-            .with_context(|| format!("failed to read {}", target_path.display()))?;
-        match serde_json::from_str(&raw) {
-            Ok(v) => v,
-            Err(e) => {
-                return Ok(Plan::Skip {
-                    reason: format!(
-                        "{} is not valid JSON ({e}) -- possibly hand-edited with comments or trailing commas",
-                        target_path.display()
-                    ),
-                    manual_snippet: format!("{}: {}", key_path.join("."), value_content),
-                });
-            }
+    let mut target = match read_json_doc(target_path)? {
+        Ok(doc) => doc,
+        Err(e) => {
+            return Ok(Plan::Skip {
+                reason: format!("{} is not valid JSON ({e})", target_path.display()),
+                manual_snippet: format!("{}: {}", key_path.join("."), value_content),
+            });
         }
-    } else {
-        serde_json::json!({})
     };
 
     let leaf_key = key_path.last().expect("checked non-empty above").clone();
-    navigate_to_parent(&mut target, key_path).insert(leaf_key, value);
-    Ok(Plan::Write(
-        serde_json::to_string_pretty(&target)?.into_bytes(),
-    ))
+    navigate_to_parent(&mut target.value, key_path).insert(leaf_key, value);
+    Ok(Plan::Write(target.render().into_bytes()))
 }
 
 pub(crate) fn remove_json_key_path(target_path: &Path, key_path: &[String]) -> Result<bool> {
@@ -566,14 +557,11 @@ pub(crate) fn remove_json_key_path(target_path: &Path, key_path: &[String]) -> R
     if !target_path.is_file() {
         return Ok(false);
     }
-    let raw = std::fs::read_to_string(target_path)
-        .with_context(|| format!("failed to read {}", target_path.display()))?;
-    let mut target: serde_json::Value = match serde_json::from_str(&raw) {
-        Ok(v) => v,
-        Err(_) => return Ok(false),
+    let Ok(mut target) = read_json_doc(target_path)? else {
+        return Ok(false);
     };
 
-    let mut cursor = &mut target;
+    let mut cursor = &mut target.value;
     for key in &key_path[..key_path.len() - 1] {
         let Some(next) = cursor.get_mut(key) else {
             return Ok(false);
@@ -587,9 +575,7 @@ pub(crate) fn remove_json_key_path(target_path: &Path, key_path: &[String]) -> R
     let removed = map.remove(leaf_key).is_some();
 
     if removed {
-        let pretty = serde_json::to_string_pretty(&target)?;
-        std::fs::write(target_path, pretty)
-            .with_context(|| format!("failed to write {}", target_path.display()))?;
+        write_json_doc(target_path, target)?;
     }
     Ok(removed)
 }
@@ -777,8 +763,7 @@ mod tests {
     fn json_deep_merge_parse_failure_returns_skipped_not_write() {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("settings.json");
-        // Trailing comma + comment: invalid strict JSON, plausible hand-edited JSONC.
-        std::fs::write(&target, "{\n  // a comment\n  \"foo\": \"bar\",\n}\n").unwrap();
+        std::fs::write(&target, "{\n  \"foo\": \"bar\",\n  \"broken\": \n").unwrap();
         let before = std::fs::read_to_string(&target).unwrap();
 
         let outcome = apply_json_deep_merge(&target, r#"{"mcpServers":{"infigraph":{}}}"#).unwrap();
@@ -794,6 +779,46 @@ mod tests {
         }
         let after = std::fs::read_to_string(&target).unwrap();
         assert_eq!(before, after, "file must be untouched on parse failure");
+    }
+
+    /// #171: a hand-edited JSONC file (comment, trailing comma) is merged into,
+    /// not skipped -- and its comment survives.
+    #[test]
+    fn json_deep_merge_edits_jsonc_and_keeps_its_comments() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("settings.json");
+        std::fs::write(&target, "{\n  // a comment\n  \"foo\": \"bar\",\n}\n").unwrap();
+
+        apply_json_deep_merge(&target, r#"{"mcpServers":{"infigraph":{"command":"x"}}}"#).unwrap();
+
+        let after = std::fs::read_to_string(&target).unwrap();
+        assert!(
+            after.starts_with("{\n  // a comment\n  \"foo\": \"bar\","),
+            "{after}"
+        );
+        assert!(after.contains("\"infigraph\""), "{after}");
+    }
+
+    /// #171: install used to re-sort every key in the file and re-print its
+    /// floats. Only the keys install owns may change.
+    #[test]
+    fn json_deep_merge_keeps_the_users_key_order_and_number_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("settings.json");
+        let user = "{\n  \"zeta\": 1,\n  \"lastCost\": 124.35806450000003,\n  \"alpha\": {\n    \"b\": 2,\n    \"a\": 1\n  }\n}";
+        std::fs::write(&target, user).unwrap();
+
+        apply_json_deep_merge(&target, r#"{"mcpServers":{"infigraph":{"command":"x"}}}"#).unwrap();
+
+        let after = std::fs::read_to_string(&target).unwrap();
+        assert!(
+            after.starts_with(&user[..user.len() - 2]),
+            "the user's part of the file changed:\n{after}"
+        );
+        assert_eq!(
+            read_json(&target)["mcpServers"]["infigraph"]["command"],
+            "x"
+        );
     }
 
     #[test]

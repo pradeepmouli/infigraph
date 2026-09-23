@@ -71,6 +71,9 @@ tokio-util = "0.7"
 # the same feature set infigraph-core's Task 1 added for the same reason.
 tokio = { version = "1", default-features = false, features = ["process", "rt", "time"] }
 similar = "2"
+# Install edits users' JSON config files through a CST so that only the keys it
+# owns change -- key order, number text and comments elsewhere survive (#171).
+jsonc-parser = { version = "0.33", features = ["cst", "serde_json"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

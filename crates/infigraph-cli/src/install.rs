@@ -1065,15 +1065,23 @@ mod tests {
         let ApplyOutcome::Updated { diff } = outcome_for(&report, &settings) else {
             panic!("expected an update to {}", settings.display());
         };
+        // A `-` line may only be the same line gaining the comma that JSON
+        // needs once install appends a key after it (#171) -- never a real
+        // removal or rewrite of the user's content.
+        let bare = |l: &str| l[1..].trim_end_matches(',').to_string();
+        let added: Vec<String> = diff
+            .lines()
+            .filter(|l| l.starts_with('+') && !l.starts_with("+++"))
+            .map(bare)
+            .collect();
         let removed: Vec<&str> = diff
             .lines()
             .filter(|l| l.starts_with('-') && !l.starts_with("---"))
+            .filter(|l| !added.contains(&bare(l)))
             .collect();
         assert!(
-            removed
-                .iter()
-                .all(|l| !l.contains("MY_VAR") && !l.contains("opus")),
-            "the user's own keys must not be removed: {removed:?}"
+            removed.is_empty(),
+            "the user's own keys must not be removed or rewritten: {removed:?}\n{diff}"
         );
         assert!(diff.contains("+"), "{diff}");
         assert_eq!(std::fs::read_to_string(&settings).unwrap(), user_settings);
@@ -1081,13 +1089,14 @@ mod tests {
 
     /// An unparseable `settings.local.json` used to be rebuilt from `{}`,
     /// destroying its content; it is now skipped like any other unparseable
-    /// merge target.
+    /// merge target. (A comment no longer makes it unparseable: #171 edits
+    /// JSONC in place.)
     #[test]
     fn an_unparseable_claude_allowlist_file_is_skipped_not_rebuilt() {
         let home_dir = tempfile::tempdir().unwrap();
         let local = home_dir.path().join(".claude/settings.local.json");
         std::fs::create_dir_all(local.parent().unwrap()).unwrap();
-        std::fs::write(&local, "{ // a comment\n}").unwrap();
+        std::fs::write(&local, "{ \"permissions\": \n}").unwrap();
 
         let report = install(home_dir.path(), false, Mode::Apply);
 
@@ -1097,7 +1106,7 @@ mod tests {
         ));
         assert_eq!(
             std::fs::read_to_string(&local).unwrap(),
-            "{ // a comment\n}"
+            "{ \"permissions\": \n}"
         );
     }
 

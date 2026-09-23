@@ -1,6 +1,8 @@
 use anyhow::Result;
 use serde_json::json;
 
+use crate::artifacts::{read_json_doc, write_json_doc};
+
 pub fn allowed_tools() -> Vec<String> {
     infigraph_mcp::allowed_tools_from_names()
 }
@@ -21,18 +23,15 @@ pub(crate) fn plan_claude_allowlist(
         ),
         manual_snippet: String::new(),
     };
-    let raw = crate::artifacts::read_if_present(&settings_path)?;
-    let mut settings: serde_json::Value = match &raw {
-        None => json!({}),
-        Some(bytes) => match serde_json::from_slice(bytes) {
-            Ok(value) => value,
-            // Rebuilding it from `{}`, as install once did, destroys the file.
-            Err(e) => {
-                let plan = skip(format!("is not valid JSON ({e})"));
-                return Ok((settings_path, plan));
-            }
-        },
+    let mut doc = match read_json_doc(&settings_path)? {
+        Ok(doc) => doc,
+        // Rebuilding it from `{}`, as install once did, destroys the file.
+        Err(e) => {
+            let plan = skip(format!("is not valid JSON ({e})"));
+            return Ok((settings_path, plan));
+        }
     };
+    let settings = &mut doc.value;
 
     let existing: Vec<String> = settings
         .pointer("/permissions/allow")
@@ -49,11 +48,6 @@ pub(crate) fn plan_claude_allowlist(
         .into_iter()
         .filter(|tool| !existing_set.contains(tool.as_str()))
         .collect();
-    if let (true, Some(raw)) = (missing.is_empty(), &raw) {
-        // Byte-for-byte, so an up-to-date file is reported unchanged rather
-        // than "updated" by re-serialization.
-        return Ok((settings_path, Plan::Write(raw.clone())));
-    }
 
     let Some(permissions) = settings
         .as_object_mut()
@@ -68,8 +62,7 @@ pub(crate) fn plan_claude_allowlist(
         "allow".to_string(),
         serde_json::Value::Array(allow.map(serde_json::Value::String).collect()),
     );
-    let pretty = serde_json::to_string_pretty(&settings)?;
-    Ok((settings_path, Plan::Write(pretty.into_bytes())))
+    Ok((settings_path, Plan::Write(doc.render().into_bytes())))
 }
 
 pub(crate) fn uninstall_claude_allowlist(home: &std::path::Path) -> Result<()> {
@@ -78,8 +71,10 @@ pub(crate) fn uninstall_claude_allowlist(home: &std::path::Path) -> Result<()> {
         return Ok(());
     }
 
-    let content = std::fs::read_to_string(&settings_path)?;
-    let mut settings: serde_json::Value = serde_json::from_str(&content).unwrap_or(json!({}));
+    let Ok(mut doc) = read_json_doc(&settings_path)? else {
+        return Ok(());
+    };
+    let settings = &mut doc.value;
 
     let existing: Vec<String> = settings["permissions"]
         .get("allow")
@@ -111,8 +106,7 @@ pub(crate) fn uninstall_claude_allowlist(home: &std::path::Path) -> Result<()> {
                 .map(serde_json::Value::String)
                 .collect(),
         );
-        let pretty = serde_json::to_string_pretty(&settings)?;
-        std::fs::write(&settings_path, pretty)?;
+        write_json_doc(&settings_path, doc)?;
         println!(
             "  Removed Infigraph MCP tools from Claude Code allowlist ({})",
             settings_path.display()
@@ -125,8 +119,8 @@ pub(crate) fn uninstall_claude_allowlist(home: &std::path::Path) -> Result<()> {
 pub(crate) fn uninstall_hooks(home: &std::path::Path) -> Result<()> {
     let settings_path = home.join(".claude").join("settings.json");
     if settings_path.is_file() {
-        let content = std::fs::read_to_string(&settings_path)?;
-        if let Ok(mut settings) = serde_json::from_str::<serde_json::Value>(&content) {
+        if let Ok(mut doc) = read_json_doc(&settings_path)? {
+            let settings = &mut doc.value;
             let infigraph_hook = |entry: &serde_json::Value| -> bool {
                 entry
                     .get("hooks")
@@ -172,8 +166,7 @@ pub(crate) fn uninstall_hooks(home: &std::path::Path) -> Result<()> {
                 }
             }
             if changed {
-                let pretty = serde_json::to_string_pretty(&settings)?;
-                std::fs::write(&settings_path, pretty)?;
+                write_json_doc(&settings_path, doc)?;
             }
         }
     }
