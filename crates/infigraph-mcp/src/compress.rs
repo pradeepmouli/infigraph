@@ -64,6 +64,15 @@ pub fn compress_tool_output_with_level(
     args: &Value,
     level: CompressionLevel,
 ) -> String {
+    // Banners ride above the output untouched; the compressors only ever
+    // see the tool's own output (#173).
+    let (banners, body) = crate::banner::split(raw);
+    if !banners.is_empty() {
+        return format!(
+            "{banners}{}",
+            compress_tool_output_with_level(body, tool_name, args, level)
+        );
+    }
     if level == CompressionLevel::Off {
         return raw.to_string();
     }
@@ -2597,6 +2606,37 @@ Callees (3):
         let result =
             compress_tool_output_with_level(&raw, "search", &json!({}), CompressionLevel::Off);
         assert_eq!(result, raw);
+    }
+
+    /// #173: a staleness or degraded-read banner above the output used to
+    /// make `compress_search` miss its `Search:` header and pass everything
+    /// through -- 0% savings for any project with pending edits. With the
+    /// banners set aside, the output compresses exactly as it would without
+    /// them, and they come back on top.
+    #[test]
+    fn banners_neither_disable_compression_nor_get_lost() {
+        let mut body = String::from("Search: 'foo' (40 symbol results, 0 text matches)\n\n");
+        for i in 0..40 {
+            body.push_str(&format!(
+                "0.{:02}  Function f{i} (src/f{i}.rs:L1-5)\n       \"a long docstring for f{i} that summary drops\"\n",
+                99 - i
+            ));
+        }
+        let plain =
+            compress_tool_output_with_level(&body, "search", &json!({}), CompressionLevel::Summary);
+        assert_ne!(plain, body, "test setup: the sample must actually compress");
+
+        let mut bannered = body.clone();
+        crate::banner::prepend(&mut bannered, "results may be stale -- 1 file(s) changed");
+        crate::banner::prepend(&mut bannered, "serving results from a pre-crash snapshot");
+        let (banners, _) = crate::banner::split(&bannered);
+        let compressed = compress_tool_output_with_level(
+            &bannered,
+            "search",
+            &json!({}),
+            CompressionLevel::Summary,
+        );
+        assert_eq!(compressed, format!("{banners}{plain}"));
     }
 
     #[test]

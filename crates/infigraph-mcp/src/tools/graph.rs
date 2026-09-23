@@ -105,7 +105,7 @@ pub fn tool_get_code_snippet(args: &Value) -> Result<String> {
     );
     out.push_str(&snippet);
     if let Some(ref reason) = degrade_reason {
-        out = format!("{}{out}", degrade_banner(reason));
+        crate::banner::prepend(&mut out, &degrade_banner(reason));
     }
     Ok(out)
 }

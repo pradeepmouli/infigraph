@@ -1,3 +1,4 @@
+pub mod banner;
 pub mod compress;
 pub mod health;
 pub mod idle;

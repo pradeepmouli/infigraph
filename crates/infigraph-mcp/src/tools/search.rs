@@ -541,15 +541,15 @@ pub fn tool_search(args: &Value) -> Result<String> {
     // filesystem-mtime walk R3.3.6 originally sketched (files with no
     // watcher observation are covered by the auto-start above: the next
     // edits get marked). Prepended so a truncating client still sees it.
-    if let Some(banner) = staleness_banner(&root) {
-        out.insert_str(0, &banner);
+    if let Some(banner) = staleness_banner(&root, &rows) {
+        crate::banner::prepend(&mut out, &banner);
     }
 
     // R3.1.4b: more severe than the staleness banner above (serving
     // historical data from a demoted snapshot, not just a few files
     // lagging the live index), so it goes first.
     if let Some(ref reason) = degrade_reason {
-        out.insert_str(0, &degrade_banner(reason));
+        crate::banner::prepend(&mut out, &degrade_banner(reason));
     }
 
     Ok(out)
@@ -699,8 +699,30 @@ fn render_text_matches(hits: &[TextHit<'_>], rows: &[Vec<String>], limit: usize)
 
 /// One-line warning when the project's persistent dirty set (R3.3.5) says
 /// edits are awaiting reindex; `None` when everything known is drained.
-fn staleness_banner(root: &std::path::Path) -> Option<String> {
-    let pending = infigraph_core::dirty::pending_dirty(&root.join(".infigraph")).ok()?;
+/// `indexed` is the search's own symbol rows (file in column 3).
+///
+/// A mark for a file that is on neither disk nor in those rows has no work
+/// behind it (#189): a create-then-delete FSEvents coalesced, typically an
+/// editor's temp file. Nothing can make a search result stale on its
+/// account, and the drain the banner promises will never come for it --
+/// the periodic sweep retires it instead -- so it is left out. A vanished
+/// file whose symbols are still indexed is kept: that is genuine
+/// staleness, search can still return it. The lookup runs only when some
+/// pending path is missing from disk, so a search pays nothing for it in
+/// the common case.
+fn staleness_banner(root: &std::path::Path, indexed: &[Vec<String>]) -> Option<String> {
+    let mut pending: Vec<String> = infigraph_core::dirty::pending_dirty(&root.join(".infigraph"))
+        .ok()?
+        .into_iter()
+        .collect();
+    if pending.iter().any(|rel| !root.join(rel).exists()) {
+        let in_index: std::collections::HashSet<&str> = indexed
+            .iter()
+            .filter_map(|row| row.get(3))
+            .map(String::as_str)
+            .collect();
+        pending.retain(|rel| root.join(rel).exists() || in_index.contains(rel.as_str()));
+    }
     if pending.is_empty() {
         return None;
     }
@@ -718,17 +740,17 @@ fn staleness_banner(root: &std::path::Path) -> Option<String> {
         .is_some_and(|c| c.status == infigraph_core::doctor::CheckStatus::Fail)
     {
         return Some(format!(
-            "⚠ indexing is BLOCKED -- {} file(s) changed since the last index ({sample}{more}), \
+            "indexing is BLOCKED -- {} file(s) changed since the last index ({sample}{more}), \
              and the runaway-growth breaker is refusing every write, so the watcher cannot \
              drain them. Run `infigraph rebuild` to rebuild and unblock; `infigraph \
-             doctor` has the details.\n\n",
+             doctor` has the details.",
             names.len()
         ));
     }
 
     Some(format!(
-        "⚠ results may be stale -- {} file(s) changed since the last index ({sample}{more}); \
-         the watcher drains these shortly, or run index_project to force it\n\n",
+        "results may be stale -- {} file(s) changed since the last index ({sample}{more}); \
+         the watcher drains these shortly, or run index_project to force it",
         names.len()
     ))
 }
@@ -960,7 +982,8 @@ mod staleness_banner_tests {
         )
         .unwrap();
 
-        let banner = staleness_banner(tmp.path()).expect("dirty files must still yield a banner");
+        let banner = staleness_banner(tmp.path(), &indexed(&["a.py"]))
+            .expect("dirty files must still yield a banner");
         assert!(
             banner.to_lowercase().contains("blocked"),
             "must say indexing is blocked, not just stale: {banner}"
@@ -978,7 +1001,7 @@ mod staleness_banner_tests {
     #[test]
     fn empty_or_absent_dirty_set_yields_no_banner() {
         let tmp = tempfile::tempdir().unwrap();
-        assert!(staleness_banner(tmp.path()).is_none());
+        assert!(staleness_banner(tmp.path(), &[]).is_none());
     }
 
     #[test]
@@ -1004,7 +1027,8 @@ mod staleness_banner_tests {
         )
         .unwrap();
 
-        let banner = staleness_banner(tmp.path()).expect("4 pending files must warn");
+        let banner = staleness_banner(tmp.path(), &indexed(&["a.py", "b.py", "c.py", "d.py"]))
+            .expect("4 pending files must warn");
         assert!(banner.contains("4 file(s)"), "{banner}");
         assert!(
             banner.contains("a.py"),
@@ -1013,10 +1037,6 @@ mod staleness_banner_tests {
         assert!(
             banner.contains("..."),
             "overflow marker for >3 files: {banner}"
-        );
-        assert!(
-            banner.starts_with('\u{26a0}'),
-            "must be a visible warning: {banner}"
         );
     }
 
@@ -1027,11 +1047,74 @@ mod staleness_banner_tests {
         // Must exist before marking -- see the note in the test above.
         std::fs::create_dir_all(&ig).unwrap();
         infigraph_core::dirty::mark_dirty(&ig, &["a.py".to_string()]).unwrap();
-        assert!(staleness_banner(tmp.path()).is_some());
+        assert!(staleness_banner(tmp.path(), &indexed(&["a.py"])).is_some());
         infigraph_core::dirty::clear_dirty(&ig, &["a.py".to_string()]).unwrap();
         assert!(
-            staleness_banner(tmp.path()).is_none(),
+            staleness_banner(tmp.path(), &indexed(&["a.py"])).is_none(),
             "a drained dirty set must stop warning"
+        );
+    }
+
+    /// Symbol rows naming `files`, in the search's column layout (file in 3).
+    fn indexed(files: &[&str]) -> Vec<Vec<String>> {
+        files
+            .iter()
+            .map(|f| {
+                vec![
+                    format!("{f}::sym"),
+                    "sym".into(),
+                    "Function".into(),
+                    f.to_string(),
+                ]
+            })
+            .collect()
+    }
+
+    fn marked(files: &[&str]) -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        let ig = tmp.path().join(".infigraph");
+        std::fs::create_dir_all(&ig).unwrap();
+        let files: Vec<String> = files.iter().map(|f| f.to_string()).collect();
+        infigraph_core::dirty::mark_dirty(&ig, &files).unwrap();
+        tmp
+    }
+
+    /// #189: a mark for a file on neither disk nor in the index -- an
+    /// editor's temp file whose delete FSEvents coalesced away -- has no work
+    /// behind it, so it promises no drain.
+    #[test]
+    fn a_mark_on_neither_disk_nor_the_index_yields_no_banner() {
+        let tmp = marked(&[".!12647!Cargo.toml"]);
+        assert!(staleness_banner(tmp.path(), &indexed(&["src/lib.rs"])).is_none());
+    }
+
+    /// A new file awaiting its first index is on disk but not yet in the
+    /// index: real pending work.
+    #[test]
+    fn a_new_file_awaiting_its_first_index_still_warns() {
+        let tmp = marked(&["new.py"]);
+        std::fs::write(tmp.path().join("new.py"), "def f(): pass\n").unwrap();
+        let banner = staleness_banner(tmp.path(), &[]).expect("a new file is pending work");
+        assert!(
+            banner.contains("1 file(s)") && banner.contains("new.py"),
+            "{banner}"
+        );
+    }
+
+    /// Orphaned marks drop out of the count; real pending work stays.
+    #[test]
+    fn orphaned_marks_are_left_out_of_the_count() {
+        let tmp = marked(&["gone.py", "deleted_but_indexed.py", "edited.py", "4913"]);
+        std::fs::write(tmp.path().join("edited.py"), "x = 1\n").unwrap();
+        let banner = staleness_banner(
+            tmp.path(),
+            &indexed(&["deleted_but_indexed.py", "edited.py"]),
+        )
+        .expect("two files are genuinely pending");
+        assert!(banner.contains("2 file(s)"), "{banner}");
+        assert!(
+            !banner.contains("gone.py") && !banner.contains("4913"),
+            "{banner}"
         );
     }
 }

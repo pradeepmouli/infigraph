@@ -145,17 +145,17 @@ pub fn open_prism_read_only_or_degrade(
     Ok((prism, reason))
 }
 
-/// Banner prepended to a tool's response when it served a degraded read
-/// (R3.1.4b) -- more severe than `search.rs`'s `staleness_banner` (that one
-/// warns about a few files lagging the index; this one means the whole
-/// graph is a pre-crash snapshot), so callers that compose both prepend
-/// this one first.
+/// Banner for a response that served a degraded read (R3.1.4b), for
+/// `crate::banner::prepend` -- more severe than `search.rs`'s
+/// `staleness_banner` (that one warns about a few files lagging the index;
+/// this one means the whole graph is a pre-crash snapshot), so callers that
+/// compose both prepend this one last, putting it first.
 pub fn degrade_banner(reason: &infigraph_core::graph::DegradeReason) -> String {
     match reason {
         infigraph_core::graph::DegradeReason::PreCrashSnapshot { snapshot_path, .. } => format!(
-            "⚠ serving results from a pre-crash snapshot ({}) -- a WAL corruption was just \
+            "serving results from a pre-crash snapshot ({}) -- a WAL corruption was just \
              detected and an automatic rebuild has been triggered in the background; results \
-             may lag recent changes until it completes\n\n",
+             may lag recent changes until it completes",
             snapshot_path.display()
         ),
     }
