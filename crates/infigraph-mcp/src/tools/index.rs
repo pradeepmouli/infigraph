@@ -101,11 +101,29 @@ fn run_with_timeout(
 /// caution warns about for other subsystems). A `Result::Err` from `attempt` itself
 /// (e.g. a genuine spawn failure) propagates immediately without retrying -- only a
 /// `TimedOut` outcome triggers the retry/escalate sequence.
+///
+/// None of that applies when `daemon_backend` is set (#165). The CLI then only
+/// hands the work to the project's daemon, so a timeout says the daemon is busy
+/// or stuck -- not that this process's graph is corrupt -- and each retry queues
+/// the same work on it again, the escalation a whole rebuild. So: one attempt,
+/// and a timeout is reported as the daemon's.
 fn run_with_recovery(
     mut attempt: impl FnMut(bool) -> Result<RunOutcome>,
     full: bool,
     timeout: std::time::Duration,
+    daemon_backend: bool,
 ) -> Result<(bool, String)> {
+    if daemon_backend {
+        return match attempt(full)? {
+            RunOutcome::Completed { success, output } => Ok((success, output)),
+            RunOutcome::TimedOut => Err(anyhow::anyhow!(
+                "the project's infigraph daemon did not finish indexing within {timeout:?} -- \
+                 it is busy or stuck, and nothing was resubmitted. `infigraph doctor` reports \
+                 its state and .infigraph/daemon.log what it is doing; `infigraph rebuild` \
+                 once it is healthy."
+            )),
+        };
+    }
     let attempts = [full, full, true];
     for (i, &attempt_full) in attempts.iter().enumerate() {
         match attempt(attempt_full)? {
@@ -152,6 +170,7 @@ pub fn tool_index_project(args: &Value) -> Result<String> {
             |attempt_full| run_with_timeout(&mut build_cmd(attempt_full), INDEX_SUBPROCESS_TIMEOUT),
             full,
             INDEX_SUBPROCESS_TIMEOUT,
+            infigraph_core::daemon_backend_selected(),
         )?;
 
         if !success {
@@ -416,6 +435,7 @@ mod tests {
             },
             false,
             Duration::from_secs(1),
+            false,
         );
         assert!(result.is_ok());
         let (success, output) = result.unwrap();
@@ -443,6 +463,7 @@ mod tests {
             },
             false,
             Duration::from_millis(1),
+            false,
         );
         assert!(result.is_ok());
         let (success, output) = result.unwrap();
@@ -474,6 +495,7 @@ mod tests {
             },
             false,
             Duration::from_millis(1),
+            false,
         );
         assert!(result.is_ok());
         let (success, _) = result.unwrap();
@@ -498,6 +520,7 @@ mod tests {
             },
             true,
             Duration::from_millis(1),
+            false,
         );
         assert!(result.is_err());
         assert_eq!(calls, vec![true, true, true]);
@@ -509,6 +532,7 @@ mod tests {
             |_full| Ok(RunOutcome::TimedOut),
             false,
             Duration::from_millis(1),
+            false,
         );
         let err = result.expect_err("three consecutive timeouts must return Err");
         let msg = err.to_string();
@@ -532,11 +556,36 @@ mod tests {
             },
             false,
             Duration::from_secs(1),
+            false,
         );
         assert!(result.is_err());
         assert_eq!(
             calls, 1,
             "a genuine spawn error (not a timeout) must not trigger the retry/escalate loop"
+        );
+    }
+
+    /// #165: under the daemon backend a timeout means the daemon is busy or
+    /// stuck. Retrying queues the same work again and escalating to
+    /// `--full` queues a rebuild; two skill runs once left six. One attempt,
+    /// and the error says where to look.
+    #[test]
+    fn run_with_recovery_against_a_daemon_neither_retries_nor_escalates() {
+        let mut calls: Vec<bool> = Vec::new();
+        let result = run_with_recovery(
+            |full| {
+                calls.push(full);
+                Ok(RunOutcome::TimedOut)
+            },
+            false,
+            Duration::from_millis(1),
+            true,
+        );
+        assert_eq!(calls, vec![false], "exactly one attempt, never --full");
+        let msg = result.expect_err("a timeout is an error").to_string();
+        assert!(
+            msg.contains("daemon"),
+            "name the daemon as the one not answering: {msg}"
         );
     }
 }
