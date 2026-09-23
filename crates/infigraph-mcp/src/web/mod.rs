@@ -545,6 +545,25 @@ mod tests {
 
     static TEST_LOCK: Mutex<()> = Mutex::new(());
 
+    /// Serializes these tests. The lock guards no data, only ordering, so a
+    /// test that panicked holding it must not fail every later test with a
+    /// `PoisonError` (#191) -- that buried the one real failure under ~15.
+    fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+        TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    #[test]
+    fn a_poisoned_test_lock_still_serializes_the_next_test() {
+        let _ = std::thread::spawn(|| {
+            let _guard = test_lock();
+            panic!("poisoning TEST_LOCK on purpose");
+        })
+        .join();
+        drop(test_lock());
+    }
+
     fn free_port() -> u16 {
         TcpListener::bind("127.0.0.1:0")
             .unwrap()
@@ -575,7 +594,7 @@ mod tests {
 
     #[test]
     fn test_health_default_path() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = test_lock();
         let port = free_port();
         set_ready(true);
         assert!(start_mcp_http_server(port, false, "/health"));
@@ -588,7 +607,7 @@ mod tests {
 
     #[test]
     fn test_health_custom_path() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = test_lock();
         let port = free_port();
         set_ready(true);
         assert!(start_mcp_http_server(port, false, "/health/full"));
@@ -601,7 +620,7 @@ mod tests {
 
     #[test]
     fn test_health_returns_503_when_not_ready() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = test_lock();
         let port = free_port();
         set_ready(false);
         assert!(start_mcp_http_server(port, false, "/health"));
@@ -615,7 +634,7 @@ mod tests {
 
     #[test]
     fn test_health_wrong_path_not_matched() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = test_lock();
         let port = free_port();
         set_ready(true);
         assert!(start_mcp_http_server(port, false, "/health/full"));
@@ -641,7 +660,7 @@ mod tests {
 
     #[test]
     fn test_valid_signature_accepted() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = test_lock();
         let secret = "test-secret-123";
         let body = r#"{"ref":"refs/heads/main"}"#;
         unsafe {
@@ -656,7 +675,7 @@ mod tests {
 
     #[test]
     fn test_wrong_signature_rejected() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = test_lock();
         unsafe {
             std::env::set_var("WEBHOOK_SECRET", "real-secret");
         }
@@ -669,7 +688,7 @@ mod tests {
 
     #[test]
     fn test_missing_signature_rejected() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = test_lock();
         unsafe {
             std::env::set_var("WEBHOOK_SECRET", "some-secret");
         }
@@ -681,7 +700,7 @@ mod tests {
 
     #[test]
     fn test_no_secret_configured_passes() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = test_lock();
         unsafe {
             std::env::remove_var("WEBHOOK_SECRET");
         }
@@ -691,7 +710,7 @@ mod tests {
 
     #[test]
     fn test_missing_sha256_prefix_rejected() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = test_lock();
         unsafe {
             std::env::set_var("WEBHOOK_SECRET", "secret");
         }
@@ -703,7 +722,7 @@ mod tests {
 
     #[test]
     fn test_non_hex_signature_rejected() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = test_lock();
         unsafe {
             std::env::set_var("WEBHOOK_SECRET", "secret");
         }
@@ -731,7 +750,7 @@ mod tests {
 
     #[test]
     fn test_bad_json_returns_bad_json() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = test_lock();
         unsafe {
             std::env::remove_var("WEBHOOK_SECRET");
         }
@@ -741,7 +760,7 @@ mod tests {
 
     #[test]
     fn test_non_default_branch_ignored() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = test_lock();
         unsafe {
             std::env::remove_var("WEBHOOK_SECRET");
         }
@@ -757,7 +776,7 @@ mod tests {
 
     #[test]
     fn test_default_branch_push_accepted() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = test_lock();
         unsafe {
             std::env::remove_var("WEBHOOK_SECRET");
         }
@@ -773,7 +792,7 @@ mod tests {
 
     #[test]
     fn test_already_reindexing_queued() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = test_lock();
         unsafe {
             std::env::remove_var("WEBHOOK_SECRET");
         }
@@ -784,7 +803,7 @@ mod tests {
 
     #[test]
     fn test_missing_repo_name_uses_empty() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = test_lock();
         unsafe {
             std::env::remove_var("WEBHOOK_SECRET");
         }
@@ -800,7 +819,7 @@ mod tests {
 
     #[test]
     fn test_custom_default_branch() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = test_lock();
         unsafe {
             std::env::remove_var("WEBHOOK_SECRET");
         }
@@ -816,7 +835,7 @@ mod tests {
 
     #[test]
     fn test_reject401_on_bad_signature() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = test_lock();
         unsafe {
             std::env::set_var("WEBHOOK_SECRET", "real-secret");
         }
@@ -859,7 +878,7 @@ mod tests {
 
     #[test]
     fn test_webhook_post_valid_returns_200_accepted() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = test_lock();
         unsafe {
             std::env::remove_var("WEBHOOK_SECRET");
         }
@@ -882,7 +901,7 @@ mod tests {
 
     #[test]
     fn test_webhook_post_bad_sig_returns_401() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = test_lock();
         unsafe {
             std::env::set_var("WEBHOOK_SECRET", "my-secret");
         }
@@ -910,7 +929,7 @@ mod tests {
 
     #[test]
     fn test_webhook_status_endpoint() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = test_lock();
         let port = free_port();
         set_ready(true);
         assert!(start_mcp_http_server(port, false, "/health"));
@@ -923,7 +942,7 @@ mod tests {
 
     #[test]
     fn test_ui_server_binds_loopback_not_wildcard_by_default() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = test_lock();
         unsafe {
             std::env::remove_var("INFIGRAPH_UI_BIND");
         }
@@ -951,7 +970,7 @@ mod tests {
     /// only the UI server to loopback; this is the same probe for this one.
     #[test]
     fn test_mcp_http_server_binds_loopback_not_wildcard_by_default() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = test_lock();
         unsafe {
             std::env::remove_var("INFIGRAPH_MCP_BIND");
         }
@@ -978,7 +997,7 @@ mod tests {
     /// never what someone who exported an empty variable meant.
     #[test]
     fn bind_addr_defaults_to_loopback_and_honors_its_override() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = test_lock();
         let var = "INFIGRAPH_TEST_BIND_ADDR";
         unsafe {
             std::env::remove_var(var);
@@ -1002,7 +1021,7 @@ mod tests {
 
     #[test]
     fn test_reindexing_flag_cleared_after_spawn() {
-        let _guard = TEST_LOCK.lock().unwrap();
+        let _guard = test_lock();
         unsafe {
             std::env::remove_var("WEBHOOK_SECRET");
         }
