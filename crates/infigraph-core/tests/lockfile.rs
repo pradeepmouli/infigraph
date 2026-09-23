@@ -381,3 +381,24 @@ mod holder_is_alive_pid_reuse {
         assert!(holder_is_alive(&holder));
     }
 }
+
+/// #188: a hard exit (`std::process::exit`) skips `LockFile`'s `Drop`, so
+/// the daemon's shutdown watchdog clears the payload by path. The lock must
+/// then name no holder, while the flock itself stays held until the process
+/// is gone.
+#[test]
+fn clearing_a_held_locks_payload_leaves_it_held_but_naming_no_holder() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("watch.lock");
+    let held = lockfile::try_acquire(&path, "cli-watch").unwrap().unwrap();
+    assert!(lockfile::read_holder(&path).is_some());
+
+    lockfile::clear_payload(&path);
+
+    assert!(lockfile::read_holder(&path).is_none());
+    assert!(
+        lockfile::try_acquire(&path, "cli-watch").unwrap().is_none(),
+        "clearing the payload must not release the lock"
+    );
+    drop(held);
+}

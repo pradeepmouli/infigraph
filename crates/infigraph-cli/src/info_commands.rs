@@ -482,6 +482,7 @@ pub(crate) fn cmd_daemon(root: &Path, debounce: u64) -> Result<()> {
     let daemon_token = tokio_util::sync::CancellationToken::new();
 
     let watchdog_root = root.to_path_buf();
+    let watchdog_lock = lock_path.clone();
     let watchdog_token = daemon_token.clone();
     ctrlc::set_handler(move || {
         let _ = stop_tx.send(());
@@ -507,6 +508,7 @@ pub(crate) fn cmd_daemon(root: &Path, debounce: u64) -> Result<()> {
         // still in progress, up to a much longer ceiling that remains as a
         // backstop against a genuinely stuck write.
         let watchdog_root = watchdog_root.clone();
+        let watchdog_lock = watchdog_lock.clone();
         std::thread::spawn(move || {
             const POLL: std::time::Duration = std::time::Duration::from_millis(500);
 
@@ -536,6 +538,10 @@ pub(crate) fn cmd_daemon(root: &Path, debounce: u64) -> Result<()> {
             // the other half of this pair; this half spares every reader in
             // between a refused connection.
             infigraph_core::daemon::read_endpoint::ReadEndpoint::for_root(&watchdog_root).unlink();
+            // Likewise the lock's payload: `LockFile`'s `Drop` clears it, and
+            // this exit skips that too, leaving `watch.lock` naming a dead pid
+            // that reads as a live daemon to whoever is diagnosing one (#188).
+            infigraph_core::lockfile::clear_payload(&watchdog_lock);
             // Reap descendants the same way, and for the same reason (#163).
             // SCIP indexers run under `tokio::process` with
             // `kill_on_drop(true)`, which fires from `Drop` -- and
