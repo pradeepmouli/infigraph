@@ -361,6 +361,133 @@ fn submit_write_request_named_cancellable(
     }
 }
 
+/// Whether the client that submitted `request_path` is gone, so the request
+/// is owed to nobody (#164).
+///
+/// A killed client withdraws nothing: `index_project` killed its timed-out
+/// `infigraph index` children three times per invocation during the sittir
+/// ENOSPC stall, leaving six `FullReindex` requests whose owners were dead,
+/// and the daemon ran every one once space freed. A name from
+/// [`generate_request_name`] carries its submitter's pid and creation time,
+/// so the check is exact: the pid must be running, and must have started no
+/// later than the request was written -- a later start is a recycled pid.
+///
+/// Any other name (`compaction.request`, `auto-recovery.request`, a test's
+/// fixture) is the daemon's own or unattributable, and is never gone.
+pub fn request_client_is_gone(request_path: &Path) -> bool {
+    let Some(name) = request_path.file_stem().and_then(|s| s.to_str()) else {
+        return false;
+    };
+    let mut parts = name.splitn(3, '-');
+    let (Some(pid), Some(nanos), Some(_counter)) = (parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    let (Ok(pid), Ok(nanos)) = (pid.parse::<u32>(), nanos.parse::<u128>()) else {
+        return false;
+    };
+    let written_at = (nanos / 1_000_000_000) as u64;
+    match crate::instances::current_process_start_time(pid) {
+        None => true,
+        // Start times are whole seconds, so a process that started within
+        // the same second as the request is still its submitter.
+        Some(started_at) => started_at > written_at,
+    }
+}
+
+/// Remove a request and every file that shares its name -- its sidecars
+/// (`<name>.extractions.json`, `<name>.edges.arrow`) and any reply.
+pub fn discard_request(request_path: &Path) {
+    let (Some(dir), Some(stem)) = (
+        request_path.parent(),
+        request_path.file_stem().and_then(|s| s.to_str()),
+    ) else {
+        return;
+    };
+    let prefix = format!("{stem}.");
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            if entry.file_name().to_string_lossy().starts_with(&prefix) {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod request_client_tests {
+    use super::*;
+
+    fn named(dir: &Path, name: &str) -> PathBuf {
+        dir.join(format!("{name}.request"))
+    }
+
+    #[test]
+    fn a_request_from_this_live_process_is_not_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!request_client_is_gone(&named(
+            dir.path(),
+            &generate_request_name()
+        )));
+    }
+
+    #[test]
+    fn a_request_from_an_exited_process_is_gone() {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        assert!(request_client_is_gone(&named(
+            dir.path(),
+            &format!("{pid}-{nanos}-0")
+        )));
+    }
+
+    #[test]
+    fn a_request_older_than_the_process_holding_its_pid_is_gone() {
+        // Written in 1970 by "this pid": the process running now started
+        // long after, so it cannot be the submitter.
+        let dir = tempfile::tempdir().unwrap();
+        let name = format!("{}-1000000000-0", std::process::id());
+        assert!(request_client_is_gone(&named(dir.path(), &name)));
+    }
+
+    #[test]
+    fn a_name_that_is_not_a_generated_one_is_never_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["compaction", "auto-recovery", "test", "1-2"] {
+            assert!(!request_client_is_gone(&named(dir.path(), name)), "{name}");
+        }
+    }
+
+    #[test]
+    fn discarding_a_request_removes_its_sidecars_and_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path();
+        for f in [
+            "1-2-3.request",
+            "1-2-3.extractions.json",
+            "1-2-3.edges.arrow",
+            "1-2-30.request",
+            "other.request",
+        ] {
+            std::fs::write(d.join(f), "x").unwrap();
+        }
+        discard_request(&d.join("1-2-3.request"));
+        let mut left: Vec<String> = std::fs::read_dir(d)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(left, vec!["1-2-30.request", "other.request"]);
+    }
+}
+
 #[cfg(test)]
 mod cancellation_tests {
     use super::*;

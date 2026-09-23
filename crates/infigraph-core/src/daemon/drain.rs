@@ -240,14 +240,13 @@ mod tests {
             queue,
             make_registry,
             false,
-            false,
             &drain_rt,
             &daemon_token,
         ) {
             let registry = std::sync::Arc::new(make_registry().unwrap());
             let (guard, _) = crate::daemon::finish_full_reindex(
                 root,
-                &in_flight.reply_path,
+                &in_flight.reply_paths,
                 &registry,
                 held,
                 drain_rt.block_on(in_flight.task.join()),

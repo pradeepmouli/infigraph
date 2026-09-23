@@ -1046,13 +1046,13 @@ where
             let PendingFullReindex {
                 task,
                 request_path,
-                reply_path,
+                reply_paths,
             } = full_reindex_in_flight
                 .take()
                 .expect("checked is_some just above");
             let (guard, scheduled_languages) = finish_full_reindex(
                 root,
-                &reply_path,
+                &reply_paths,
                 &shared_registry,
                 &mut held_prism,
                 drain_rt.block_on(task.join()),
@@ -1422,7 +1422,7 @@ where
                             &mut held_prism,
                             &mut reopen_backoff,
                             drain_in_flight.is_some(),
-                            full_reindex_in_flight.is_some(),
+                            &mut full_reindex_in_flight,
                             &drain_rt,
                             daemon_token,
                             &mut code_watch,
@@ -1624,7 +1624,7 @@ where
     if let Some(in_flight) = full_reindex_in_flight.take() {
         let (guard, _) = finish_full_reindex(
             root,
-            &in_flight.reply_path,
+            &in_flight.reply_paths,
             &shared_registry,
             &mut held_prism,
             drain_rt.block_on(in_flight.task.join()),
@@ -2046,7 +2046,25 @@ struct FullReindexTaskOutput {
 struct PendingFullReindex {
     task: Task<FullReindexTaskOutput>,
     request_path: PathBuf,
-    reply_path: PathBuf,
+    /// Every client owed this rebuild's result: the request that started it,
+    /// then each `FullReindex` that arrived while it ran (#164).
+    reply_paths: Vec<PathBuf>,
+}
+
+impl PendingFullReindex {
+    /// Answer another `FullReindex` request with this rebuild's result. The
+    /// request file is removed once it is accepted, like a queued waiter's;
+    /// the running rebuild's own file is left for its finish to remove.
+    fn join(&mut self, request_path: &Path) {
+        if request_path == self.request_path {
+            return;
+        }
+        let reply_path = request_path.with_extension("result");
+        if !self.reply_paths.contains(&reply_path) {
+            self.reply_paths.push(reply_path);
+        }
+        std::fs::remove_file(request_path).ok();
+    }
 }
 
 /// What the background SCIP-import task hands back. Mirrors
@@ -2168,9 +2186,10 @@ fn build_full_reindex(
     build_result
 }
 
-/// Loop-thread entry point for a `WriteRequest::FullReindex`. Does the
-/// cheap, synchronous gating (never overlap a queue drain or another full
-/// reindex -- both write the same live graph) and, if clear, acquires
+/// Loop-thread entry point for a `WriteRequest::FullReindex` when none is
+/// running (`route_or_serve_request` joins one that is, #164). Does the
+/// cheap, synchronous gating (never overlap a queue drain -- both write the
+/// same live graph) and, if clear, acquires
 /// `index.lock` and hands the expensive build off to `drain_rt` so this loop
 /// keeps ticking (accepting fsevents, other requests, the stop signal) for
 /// the whole multi-minute rebuild instead of blocking on it. Returns `None`
@@ -2185,7 +2204,6 @@ fn try_start_full_reindex<MR>(
     queue: &Arc<Mutex<crate::daemon::queue::IndexWorkQueue>>,
     make_registry: &MR,
     drain_in_flight: bool,
-    full_reindex_in_flight: bool,
     drain_rt: &tokio::runtime::Runtime,
     daemon_token: &CancellationToken,
 ) -> Option<PendingFullReindex>
@@ -2194,9 +2212,9 @@ where
 {
     let reply_path = path.with_extension("result");
 
-    // Never overlap a queue drain or another full reindex -- same
-    // invariant every locked write path in this loop preserves; both
-    // touch the same live graph. Deferring here (rather than blocking)
+    // Never overlap a queue drain -- same invariant every locked write path
+    // in this loop preserves; both touch the same live graph. (A second full
+    // reindex never gets here: it joins the running one, #164.) Deferring here (rather than blocking)
     // gets "wait for whichever is in progress to finish first" for free:
     // `begin_index_op` below serializes on the same `index.lock` either
     // one takes regardless, but skipping the attempt when we already know
@@ -2211,7 +2229,7 @@ where
     // reintroduce the exact regression this split fixed: SCIP's slow,
     // graph-independent indexer-running phase blocking every other write
     // for its entire duration.
-    if drain_in_flight || full_reindex_in_flight {
+    if drain_in_flight {
         return None;
     }
 
@@ -2282,7 +2300,7 @@ where
     Some(PendingFullReindex {
         task,
         request_path: path.to_path_buf(),
-        reply_path,
+        reply_paths: vec![reply_path],
     })
 }
 
@@ -2519,6 +2537,20 @@ fn finish_scip_import(
     (Some(guard), touched_files)
 }
 
+/// Write one rebuild's result to every client waiting on it (#164). Unlike
+/// `reply_err_to_waiters`, nothing is skipped: each waiter is owed exactly
+/// this answer.
+fn reply_to_all(reply_paths: &[PathBuf], json: &str) {
+    for reply_path in reply_paths {
+        if let Err(e) = crate::daemon_protocol::write_atomic(reply_path, json) {
+            eprintln!(
+                "[daemon] could not write full-reindex reply to {}: {e}",
+                reply_path.display()
+            );
+        }
+    }
+}
+
 /// Loop-thread finish for a completed full-reindex build: poison the
 /// daemon's own connection, swap the verified-good rebuilt graph in for the
 /// live one (still under `graph.lock`, not `index.lock` -- see the
@@ -2534,7 +2566,7 @@ fn finish_scip_import(
 /// didn't actually land.
 fn finish_full_reindex(
     root: &Path,
-    reply_path: &Path,
+    reply_paths: &[PathBuf],
     registry: &Arc<crate::lang::LanguageRegistry>,
     held: &mut HeldPrism,
     joined: std::result::Result<FullReindexTaskOutput, tokio::task::JoinError>,
@@ -2547,7 +2579,7 @@ fn finish_full_reindex(
                 message: format!("daemon full-reindex task panicked: {join_err}"),
             };
             if let Ok(json) = serde_json::to_string(&result) {
-                let _ = crate::daemon_protocol::write_atomic(reply_path, &json);
+                reply_to_all(reply_paths, &json);
             }
             return (None, None);
         }
@@ -2560,7 +2592,7 @@ fn finish_full_reindex(
                 message: format!("full reindex failed: {e:#}"),
             };
             if let Ok(json) = serde_json::to_string(&result) {
-                let _ = crate::daemon_protocol::write_atomic(reply_path, &json);
+                reply_to_all(reply_paths, &json);
             }
             return (Some(guard), None);
         }
@@ -2601,7 +2633,7 @@ fn finish_full_reindex(
                 ),
             };
             if let Ok(json) = serde_json::to_string(&result) {
-                let _ = crate::daemon_protocol::write_atomic(reply_path, &json);
+                reply_to_all(reply_paths, &json);
             }
             return (Some(guard), None);
         }
@@ -2646,7 +2678,7 @@ fn finish_full_reindex(
                             ),
                         };
                         if let Ok(json) = serde_json::to_string(&result) {
-                            let _ = crate::daemon_protocol::write_atomic(reply_path, &json);
+                            reply_to_all(reply_paths, &json);
                         }
                         drop(graph_lock);
                         return (Some(guard), None);
@@ -2664,7 +2696,7 @@ fn finish_full_reindex(
                     ),
                 };
                 if let Ok(json) = serde_json::to_string(&result) {
-                    let _ = crate::daemon_protocol::write_atomic(reply_path, &json);
+                    reply_to_all(reply_paths, &json);
                 }
                 drop(graph_lock);
                 return (Some(guard), None);
@@ -2731,7 +2763,7 @@ fn finish_full_reindex(
             ),
         };
         if let Ok(json) = serde_json::to_string(&result) {
-            let _ = crate::daemon_protocol::write_atomic(reply_path, &json);
+            reply_to_all(reply_paths, &json);
         }
         return (Some(guard), None);
     }
@@ -2814,7 +2846,7 @@ fn finish_full_reindex(
                 detected_languages: detected_languages.clone(),
             };
             if let Ok(json) = serde_json::to_string(&result) {
-                let _ = crate::daemon_protocol::write_atomic(reply_path, &json);
+                reply_to_all(reply_paths, &json);
             }
             (Some(guard), Some(detected_languages))
         }
@@ -2851,7 +2883,7 @@ fn finish_full_reindex(
                 ),
             };
             if let Ok(json) = serde_json::to_string(&result) {
-                let _ = crate::daemon_protocol::write_atomic(reply_path, &json);
+                reply_to_all(reply_paths, &json);
             }
             (Some(guard), None)
         }
@@ -2983,7 +3015,7 @@ fn route_or_serve_request<MR>(
     held: &mut HeldPrism,
     reopen_backoff: &mut ReopenBackoff,
     drain_in_flight: bool,
-    full_reindex_in_flight: bool,
+    full_reindex_in_flight: &mut Option<PendingFullReindex>,
     drain_rt: &tokio::runtime::Runtime,
     daemon_token: &CancellationToken,
     code_watch: &mut CodeWatch,
@@ -2996,6 +3028,16 @@ fn route_or_serve_request<MR>(
 where
     MR: Fn() -> Result<crate::lang::LanguageRegistry>,
 {
+    // #164: a killed client withdraws nothing, and a request nobody waits
+    // for must not cost a rebuild. Checked before anything is parsed or run.
+    if crate::daemon_protocol::request_client_is_gone(path) {
+        eprintln!(
+            "[daemon] discarding {}: the client that sent it has exited",
+            path.display()
+        );
+        crate::daemon_protocol::discard_request(path);
+        return None;
+    }
     let reply_path = path.with_extension("result");
     let contents = match std::fs::read_to_string(path) {
         Ok(c) => c,
@@ -3139,17 +3181,25 @@ where
                 None
             }
         },
-        WriteRequest::FullReindex => try_start_full_reindex(
-            root,
-            path,
-            queue,
-            make_registry,
-            drain_in_flight,
-            full_reindex_in_flight,
-            drain_rt,
-            daemon_token,
-        )
-        .map(PendingWork::FullReindex),
+        // #164: only one rebuild, ever. One already running answers this
+        // request too; a second would rebuild the same tree again, and any
+        // file that changes meanwhile reaches the graph through the watcher.
+        WriteRequest::FullReindex => match full_reindex_in_flight.as_mut() {
+            Some(running) => {
+                running.join(path);
+                None
+            }
+            None => try_start_full_reindex(
+                root,
+                path,
+                queue,
+                make_registry,
+                drain_in_flight,
+                drain_rt,
+                daemon_token,
+            )
+            .map(PendingWork::FullReindex),
+        },
         WriteRequest::ScipImport {
             scip_path,
             enriched_ast_generation,
@@ -3162,7 +3212,7 @@ where
             held,
             reopen_backoff,
             drain_in_flight,
-            full_reindex_in_flight,
+            full_reindex_in_flight.is_some(),
             scip_import_in_flight,
             drain_rt,
             daemon_token,
@@ -3283,6 +3333,81 @@ fn has_cross_file_calls(prism: &Infigraph, rel_path: &str) -> bool {
 mod tests {
     use super::*;
     use protobuf::Message as _;
+
+    /// Everything `route_or_serve_request` needs, for tests that route
+    /// requests without a coordinator loop. The code-watch producer is never
+    /// started: a live one would race the test by queueing its own fsevents.
+    struct Router {
+        root: PathBuf,
+        queue: Arc<Mutex<crate::daemon::queue::IndexWorkQueue>>,
+        held: HeldPrism,
+        drain_rt: tokio::runtime::Runtime,
+        daemon_token: CancellationToken,
+        registry: Arc<crate::lang::LanguageRegistry>,
+        code_watch: CodeWatch,
+        backoff: ReopenBackoff,
+        full_reindex: Option<PendingFullReindex>,
+    }
+
+    impl Router {
+        fn new(root: &Path) -> Self {
+            let queue = Arc::new(Mutex::new(crate::daemon::queue::IndexWorkQueue::new()));
+            let daemon_token = CancellationToken::new();
+            let registry = Arc::new(crate::lang::LanguageRegistry::new());
+            let code_watch = CodeWatch::new(
+                &daemon_token,
+                producer::ProducerConfig {
+                    root: root.to_path_buf(),
+                    registry: Arc::clone(&registry),
+                    debounce_ms: 50,
+                    ignore_rebuild_secs: 300,
+                },
+                Arc::clone(&queue),
+                Arc::new(|_evt| {}),
+            )
+            .unwrap();
+            Self {
+                root: root.to_path_buf(),
+                queue,
+                held: HeldPrism::new(),
+                drain_rt: tokio::runtime::Runtime::new().unwrap(),
+                daemon_token,
+                registry,
+                code_watch,
+                backoff: ReopenBackoff::new(),
+                full_reindex: None,
+            }
+        }
+
+        /// Route one request. A `FullReindex` it starts is kept as the
+        /// in-flight rebuild, exactly as the coordinator loop keeps it.
+        fn route(&mut self, path: &Path) -> Option<PendingWork> {
+            let started = route_or_serve_request(
+                &self.root,
+                path,
+                &self.queue,
+                &self.registry,
+                &|| Ok(crate::lang::LanguageRegistry::new()),
+                &mut self.held,
+                &mut self.backoff,
+                false,
+                &mut self.full_reindex,
+                &self.drain_rt,
+                &self.daemon_token,
+                &mut self.code_watch,
+                None,
+                &mut false,
+                false,
+            );
+            match started {
+                Some(PendingWork::FullReindex(p)) => {
+                    self.full_reindex = Some(p);
+                    None
+                }
+                other => other,
+            }
+        }
+    }
 
     /// #166: a store `clear` released must not be reopened over while
     /// something still holds it -- two `Database`s on one file in a process
@@ -3722,44 +3847,10 @@ mod tests {
         let request_path = root.join("test.request");
         std::fs::write(&request_path, serde_json::to_string(&request).unwrap()).unwrap();
 
-        let queue = Arc::new(Mutex::new(crate::daemon::queue::IndexWorkQueue::new()));
-        let mut held = HeldPrism::new();
-        let drain_rt = tokio::runtime::Runtime::new().unwrap();
-        let daemon_token = CancellationToken::new();
-        let registry = Arc::new(crate::lang::LanguageRegistry::new());
-        // Never started -- this test exercises request routing only, and a
-        // live producer would race it by queueing its own fsevents.
-        let mut code_watch = CodeWatch::new(
-            &daemon_token,
-            producer::ProducerConfig {
-                root: root.clone(),
-                registry: Arc::clone(&registry),
-                debounce_ms: 50,
-                ignore_rebuild_secs: 300,
-            },
-            Arc::clone(&queue),
-            Arc::new(|_evt| {}),
-        )
-        .unwrap();
-        route_or_serve_request(
-            &root,
-            &request_path,
-            &queue,
-            &registry,
-            &|| Ok(crate::lang::LanguageRegistry::new()),
-            &mut held,
-            &mut ReopenBackoff::new(),
-            false,
-            false,
-            &drain_rt,
-            &daemon_token,
-            &mut code_watch,
-            None,
-            &mut false,
-            false,
-        );
+        let mut router = Router::new(&root);
+        router.route(&request_path);
 
-        let drained = queue.lock().unwrap().drain();
+        let drained = router.queue.lock().unwrap().drain();
         assert_eq!(drained.items.len(), 1, "expected exactly one queued item");
         assert!(
             drained.items.contains_key("foo.py"),
@@ -3772,6 +3863,119 @@ mod tests {
             drained.waiters[0].paths,
             Some(vec!["foo.py".to_string()]),
             "the waiter's own scoped paths must also be relative"
+        );
+    }
+
+    fn write_request(
+        dir: &Path,
+        name: &str,
+        request: &crate::daemon_protocol::WriteRequest,
+    ) -> PathBuf {
+        let path = dir.join(format!("{name}.request"));
+        std::fs::write(&path, serde_json::to_string(request).unwrap()).unwrap();
+        path
+    }
+
+    /// #164: a `FullReindex` arriving while one runs joins it -- one
+    /// rebuild, every client answered with its result -- instead of waiting
+    /// its turn to rebuild the same tree again. Six such requests once ran
+    /// back to back on sittir.
+    #[test]
+    fn a_full_reindex_requested_while_one_runs_joins_it_instead_of_queuing_another() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        std::fs::write(root.join("a.py"), "def a():\n    pass\n").unwrap();
+        let requests = root.join(".infigraph").join("requests");
+        std::fs::create_dir_all(&requests).unwrap();
+        let full = crate::daemon_protocol::WriteRequest::FullReindex;
+        let first = write_request(
+            &requests,
+            &crate::daemon_protocol::generate_request_name(),
+            &full,
+        );
+        let second = write_request(
+            &requests,
+            &crate::daemon_protocol::generate_request_name(),
+            &full,
+        );
+
+        let mut router = Router::new(&root);
+        router.route(&first);
+        assert!(
+            router.full_reindex.is_some(),
+            "the first request starts a rebuild"
+        );
+        router.route(&second);
+        // The loop re-reads the running rebuild's own request every tick.
+        router.route(&first);
+
+        let running = router.full_reindex.take().expect("still the one rebuild");
+        assert_eq!(
+            running.reply_paths,
+            vec![
+                first.with_extension("result"),
+                second.with_extension("result")
+            ],
+            "the second request must join the running rebuild, once"
+        );
+        assert!(
+            !second.exists(),
+            "a joined request is accepted, not left to run later"
+        );
+
+        let joined = router.drain_rt.block_on(running.task.join());
+        let (guard, _) = finish_full_reindex(
+            &root,
+            &running.reply_paths,
+            &router.registry,
+            &mut router.held,
+            joined,
+        );
+        drop(guard);
+        let replies: Vec<String> = running
+            .reply_paths
+            .iter()
+            .map(|p| std::fs::read_to_string(p).expect("every waiter is answered"))
+            .collect();
+        assert_eq!(replies[0], replies[1], "both get the one rebuild's result");
+    }
+
+    /// #164: a request whose client has exited is owed to nobody. It is
+    /// dropped, sidecars and all, without being served.
+    #[test]
+    fn a_request_whose_client_is_gone_is_discarded_without_being_served() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let requests = root.join(".infigraph").join("requests");
+        std::fs::create_dir_all(&requests).unwrap();
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let dead = child.id();
+        child.wait().unwrap();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let name = format!("{dead}-{nanos}-0");
+        let request = write_request(
+            &requests,
+            &name,
+            &crate::daemon_protocol::WriteRequest::Index { paths: None },
+        );
+        let sidecar = requests.join(format!("{name}.extractions.json"));
+        std::fs::write(&sidecar, "[]").unwrap();
+
+        let mut router = Router::new(&root);
+        assert!(router.route(&request).is_none());
+
+        assert!(!request.exists(), "the request must be discarded");
+        assert!(!sidecar.exists(), "and its sidecar with it");
+        assert!(
+            !request.with_extension("result").exists(),
+            "nobody is waiting for a reply"
+        );
+        assert!(
+            router.queue.lock().unwrap().drain().waiters.is_empty(),
+            "nothing may be queued for a client that is gone"
         );
     }
 
@@ -3809,46 +4013,13 @@ mod tests {
         )
         .unwrap();
 
-        let queue = Arc::new(Mutex::new(crate::daemon::queue::IndexWorkQueue::new()));
-        let mut held = HeldPrism::new();
-        let drain_rt = tokio::runtime::Runtime::new().unwrap();
-        let daemon_token = CancellationToken::new();
-        let registry = Arc::new(crate::lang::LanguageRegistry::new());
-        let mut code_watch = CodeWatch::new(
-            &daemon_token,
-            producer::ProducerConfig {
-                root: root.clone(),
-                registry: Arc::clone(&registry),
-                debounce_ms: 50,
-                ignore_rebuild_secs: 300,
-            },
-            Arc::clone(&queue),
-            Arc::new(|_evt| {}),
-        )
-        .unwrap();
-        let mut backing_off = ReopenBackoff::new();
-        backing_off.record_failure();
+        let mut router = Router::new(&root);
+        router.backoff.record_failure();
 
-        let started = route_or_serve_request(
-            &root,
-            &request_path,
-            &queue,
-            &registry,
-            &|| Ok(crate::lang::LanguageRegistry::new()),
-            &mut held,
-            &mut backing_off,
-            false,
-            false,
-            &drain_rt,
-            &daemon_token,
-            &mut code_watch,
-            None,
-            &mut false,
-            false,
-        );
+        let started = router.route(&request_path);
 
         assert!(started.is_none(), "nothing may start while backing off");
-        assert!(held.is_none(), "the graph must not have been opened");
+        assert!(router.held.is_none(), "the graph must not have been opened");
         assert!(
             request_path.exists(),
             "the request must wait for a later tick"
@@ -3878,41 +4049,9 @@ mod tests {
         let request_path = root.join("test.request");
         std::fs::write(&request_path, serde_json::to_string(&request).unwrap()).unwrap();
 
-        let queue = Arc::new(Mutex::new(crate::daemon::queue::IndexWorkQueue::new()));
-        let mut held = HeldPrism::new();
-        let drain_rt = tokio::runtime::Runtime::new().unwrap();
-        let daemon_token = CancellationToken::new();
-        let registry = Arc::new(crate::lang::LanguageRegistry::new());
-        let mut code_watch = CodeWatch::new(
-            &daemon_token,
-            producer::ProducerConfig {
-                root: root.clone(),
-                registry: Arc::clone(&registry),
-                debounce_ms: 50,
-                ignore_rebuild_secs: 300,
-            },
-            Arc::clone(&queue),
-            Arc::new(|_evt| {}),
-        )
-        .unwrap();
+        let mut router = Router::new(&root);
 
-        let started = route_or_serve_request(
-            &root,
-            &request_path,
-            &queue,
-            &registry,
-            &|| Ok(crate::lang::LanguageRegistry::new()),
-            &mut held,
-            &mut ReopenBackoff::new(),
-            false,
-            false,
-            &drain_rt,
-            &daemon_token,
-            &mut code_watch,
-            None,
-            &mut false,
-            false,
-        );
+        let started = router.route(&request_path);
 
         let pending = match started {
             Some(PendingWork::ScipImport(p)) => p,
@@ -3933,11 +4072,11 @@ mod tests {
             "reply was already written -- ScipImport was served synchronously, not backgrounded"
         );
 
-        let joined = drain_rt.block_on(pending.task.join());
+        let joined = router.drain_rt.block_on(pending.task.join());
         let (guard, _touched_files) = finish_scip_import(
             &root,
             &pending.reply_path,
-            &held,
+            &router.held,
             pending.indexer_label.as_deref(),
             joined,
         );
