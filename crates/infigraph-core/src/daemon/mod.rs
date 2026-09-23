@@ -264,9 +264,10 @@ pub type FullReindexCallback = dyn Fn(PathBuf, ScipEnrichJob, CancellationToken)
 /// becomes the request's `WriteResult::Err`.
 pub type DocsControl = dyn Fn(WatchAction) -> std::result::Result<(), String> + Send + Sync;
 
-/// A directory's identity: `(device, inode)` plus its birth time where the
-/// platform and filesystem report one. `None` if the directory is gone or the
-/// platform has no such notion. Cheap (one `stat`/`statx`), so it can ride
+/// A path's identity: `(device, inode)` plus its birth time where the
+/// platform and filesystem report one. `None` if nothing is there or the
+/// platform has no such notion. Used for the watched root directory and for
+/// the read service's socket file (#187). Cheap (one `stat`/`statx`), so it can ride
 /// the coordinator's `COORDINATOR_TICK` cadence.
 ///
 /// `(dev, ino)` alone is not enough. Linux recycles inode numbers eagerly --
@@ -286,9 +287,9 @@ pub type DocsControl = dyn Fn(WatchAction) -> std::result::Result<(), String> + 
 /// too -- which the resurrection path itself does -- so it would report a
 /// live root as gone. A false "the root vanished" shutdown is worse than the
 /// missed detection this is fixing.
-type DirectoryIdentity = (u64, u64, Option<std::time::SystemTime>);
+type PathIdentity = (u64, u64, Option<std::time::SystemTime>);
 
-fn directory_identity(dir: &Path) -> Option<DirectoryIdentity> {
+fn path_identity(dir: &Path) -> Option<PathIdentity> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -303,9 +304,9 @@ fn directory_identity(dir: &Path) -> Option<DirectoryIdentity> {
     }
 }
 
-/// Whether the watched root should be treated as gone: nothing exists at the
-/// path any more, or (unix) the directory there is not the one the daemon
-/// started on. The second case is what leaks daemons (#136): a test's
+/// Whether a path should be treated as gone: nothing exists there any more,
+/// or (unix) what is there is not what `original` identified. For the
+/// watched root, the second case is what leaks daemons (#136): a test's
 /// `TempDir` is removed while the daemon is still writing into `.infigraph/`
 /// (health beacon, logs, a reindex reacting to the deletions themselves),
 /// every one of those writes goes through `create_dir_all`, and the root is
@@ -313,12 +314,12 @@ fn directory_identity(dir: &Path) -> Option<DirectoryIdentity> {
 /// and the daemon watches a directory nobody owns, forever (415 such roots
 /// and a dozen daemons were found on one dev machine). Comparing against
 /// the identity captured at startup catches the resurrected root; on
-/// platforms with no directory identity it degrades to `exists()`.
-fn root_is_gone(root: &Path, original: Option<DirectoryIdentity>) -> bool {
+/// platforms with no identity it degrades to `exists()`.
+fn path_is_gone(root: &Path, original: Option<PathIdentity>) -> bool {
     if !root.exists() {
         return true;
     }
-    match (original, directory_identity(root)) {
+    match (original, path_identity(root)) {
         (Some(started_on), Some(now)) => started_on != now,
         _ => false,
     }
@@ -615,45 +616,54 @@ where
     // daemon may already own it -- and must not hold the graph open, or an
     // ordinary local `infigraph index` is locked out for the watcher's
     // whole lifetime.
-    let _read_service = if !serve_requests {
-        None
-    } else {
-        let beacon = held_prism.beacon();
-        let source: read_service::StoreSource = Arc::new(move || {
-            beacon
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .as_ref()
-                .and_then(|prism| prism.graph_store())
-        });
-        // Collect endpoints abandoned by daemons that died without
-        // cleaning up (#162). Neither `ReadEndpoint::unlink` nor
-        // `cmd_kill`'s sweep reaches a root nobody registered, so those
-        // sockets otherwise accumulate forever. The age floor keeps this
-        // from racing a peer daemon that has just bound its own endpoint
-        // and not yet reached `accept`.
-        const ORPHAN_SOCKET_AGE: std::time::Duration = std::time::Duration::from_secs(6 * 60 * 60);
-        let swept = read_endpoint::sweep_orphaned_endpoints(ORPHAN_SOCKET_AGE);
-        if swept > 0 {
-            eprintln!("[read] swept {swept} read endpoint(s) left by daemons that are gone");
-        }
-
-        match read_service::ReadService::start_with_sources(
-            root,
-            source,
-            docs_reads,
-            READ_SERVICE_WORKERS,
-        ) {
-            Ok(svc) => Some(svc),
-            Err(e) => {
-                eprintln!(
-                    "[read] could not bind the read service for {}: {e:#}",
-                    root.display()
-                );
-                None
+    //
+    // Bound through `bind_read_service` so the tick below can bind it again
+    // when its socket file is removed (#187).
+    let mut bind_read_service: Box<dyn FnMut() -> Option<read_service::ReadService>> =
+        if !serve_requests {
+            Box::new(|| None)
+        } else {
+            let beacon = held_prism.beacon();
+            let source: read_service::StoreSource = Arc::new(move || {
+                beacon
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .as_ref()
+                    .and_then(|prism| prism.graph_store())
+            });
+            // Collect endpoints abandoned by daemons that died without
+            // cleaning up (#162). Neither `ReadEndpoint::unlink` nor
+            // `cmd_kill`'s sweep reaches a root nobody registered, so those
+            // sockets otherwise accumulate forever. The age floor keeps this
+            // from racing a peer daemon that has just bound its own endpoint
+            // and not yet reached `accept`.
+            const ORPHAN_SOCKET_AGE: std::time::Duration =
+                std::time::Duration::from_secs(6 * 60 * 60);
+            let swept = read_endpoint::sweep_orphaned_endpoints(ORPHAN_SOCKET_AGE);
+            if swept > 0 {
+                eprintln!("[read] swept {swept} read endpoint(s) left by daemons that are gone");
             }
-        }
-    };
+
+            let root = root.to_path_buf();
+            Box::new(move || {
+                match read_service::ReadService::start_with_sources(
+                    &root,
+                    source.clone(),
+                    docs_reads.clone(),
+                    READ_SERVICE_WORKERS,
+                ) {
+                    Ok(svc) => Some(svc),
+                    Err(e) => {
+                        eprintln!(
+                            "[read] could not bind the read service for {}: {e:#}",
+                            root.display()
+                        );
+                        None
+                    }
+                }
+            })
+        };
+    let mut read_service = bind_read_service();
 
     // Build the registry ONCE for the whole watch session (#58): it serves
     // both file-extension filtering here and every `watch_db` open below
@@ -833,8 +843,8 @@ where
     let mut last_scip_attempt_ast_generation: Option<i64> = None;
 
     // Which directory this daemon started on, not just whether *a* directory
-    // exists at that path -- see `root_is_gone`.
-    let root_identity = directory_identity(root);
+    // exists at that path -- see `path_is_gone`.
+    let root_identity = path_identity(root);
 
     loop {
         if stop_rx.try_recv().is_ok() {
@@ -860,12 +870,37 @@ where
         // just watching nothing. `infigraph gc --global` sweeps the
         // registry for the same condition as a backstop for a daemon that's
         // wedged and never reaches this check.
-        if root_is_gone(root, root_identity) {
+        if path_is_gone(root, root_identity) {
             eprintln!(
                 "[watch] {} no longer exists (or was deleted and recreated) -- shutting down",
                 root.display()
             );
             break;
+        }
+
+        // Rebind the read service if its socket file was removed (#187):
+        // macOS reaps `/tmp` entries older than about three days, after which
+        // this process kept its fd, `watch.lock` and every sign of health
+        // while no client could connect -- for five days, on two projects,
+        // before anyone noticed. The old service is dropped (and its accept
+        // thread joined) *before* binding again: dropping a listener unlinks
+        // its path by name, which would otherwise delete the new socket.
+        // Rebinding rather than exiting keeps this daemon watching; exiting
+        // is the fallback, leaving the next request to start a fresh one.
+        if read_service
+            .as_ref()
+            .is_some_and(|svc| !svc.socket_intact())
+        {
+            eprintln!("[read] the read endpoint's socket file was removed -- rebinding it");
+            drop(read_service.take());
+            read_service = bind_read_service();
+            if read_service.is_none() {
+                eprintln!(
+                    "[read] could not rebind the read endpoint -- shutting down so the next \
+                     request starts a fresh daemon"
+                );
+                break;
+            }
         }
 
         // Self-terminate if the on-disk binary has changed since this
@@ -4110,29 +4145,29 @@ mod root_identity_tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("proj");
         std::fs::create_dir(&root).unwrap();
-        let started_on = directory_identity(&root);
-        assert!(!root_is_gone(&root, started_on));
+        let started_on = path_identity(&root);
+        assert!(!path_is_gone(&root, started_on));
     }
 
     #[test]
-    fn a_deleted_root_is_gone() {
+    fn a_deleted_path_is_gone() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("proj");
         std::fs::create_dir(&root).unwrap();
-        let started_on = directory_identity(&root);
+        let started_on = path_identity(&root);
         std::fs::remove_dir_all(&root).unwrap();
-        assert!(root_is_gone(&root, started_on));
+        assert!(path_is_gone(&root, started_on));
     }
 
     /// The #136 shape: the root vanishes and something (a `create_dir_all`
     /// under `.infigraph/`) puts a new directory back at the same path.
     #[cfg(unix)]
     #[test]
-    fn a_deleted_and_recreated_root_is_gone() {
+    fn a_deleted_and_recreated_path_is_gone() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("proj");
         std::fs::create_dir(&root).unwrap();
-        let started_on = directory_identity(&root);
+        let started_on = path_identity(&root);
         std::fs::remove_dir_all(&root).unwrap();
         std::fs::create_dir_all(root.join(".infigraph")).unwrap();
         assert!(
@@ -4144,9 +4179,9 @@ mod root_identity_tests {
         // being recycled (Linux does this) and the filesystem reporting no
         // birth time to break the tie.
         let started = started_on.expect("identity captured while the root existed");
-        let now = directory_identity(&root).expect("the recreated root exists");
+        let now = path_identity(&root).expect("the recreated root exists");
         assert!(
-            root_is_gone(&root, started_on),
+            path_is_gone(&root, started_on),
             "a recreated root was not detected as gone.\n               started: {started:?}\n  now:     {now:?}\n               inode recycled: {}\n  birth time available: {}",
             started.1 == now.1,
             started.2.is_some() && now.2.is_some(),
@@ -4158,9 +4193,9 @@ mod root_identity_tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("proj");
         std::fs::create_dir(&root).unwrap();
-        assert!(!root_is_gone(&root, None));
+        assert!(!path_is_gone(&root, None));
         std::fs::remove_dir_all(&root).unwrap();
-        assert!(root_is_gone(&root, None));
+        assert!(path_is_gone(&root, None));
     }
 }
 

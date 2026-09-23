@@ -305,6 +305,114 @@ fn a_running_daemon_answers_reads_on_its_endpoint() {
     );
 }
 
+/// #187: the service knows when its socket file is gone, and can still be
+/// shut down then -- stopping it used to rely on connecting to itself, which
+/// hangs the join forever once the file is removed.
+#[test]
+fn a_service_notices_its_socket_file_was_removed_and_still_shuts_down() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    let graph = root.join(".infigraph").join("graph");
+    std::fs::create_dir_all(graph.parent().unwrap()).unwrap();
+    drop(GraphStore::open(&graph).unwrap());
+    let svc = infigraph_core::daemon::read_service::ReadService::start(
+        root,
+        open_shared_store(&graph),
+        1,
+    )
+    .unwrap();
+    assert!(svc.socket_intact());
+
+    let Some(socket) = ReadEndpoint::for_root(root).socket_path() else {
+        svc.shutdown();
+        return; // no socket file on this platform (Linux, Windows): nothing to reap
+    };
+    std::fs::remove_file(&socket).unwrap();
+    assert!(!svc.socket_intact());
+    assert!(client_query(root, "MATCH (f:File) RETURN f.id").is_err());
+
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        svc.shutdown();
+        let _ = done_tx.send(());
+    });
+    assert!(
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .is_ok(),
+        "shutdown must not hang once the socket file is gone"
+    );
+}
+
+/// #187: a daemon whose socket file is removed out from under it (macOS
+/// reaps `/tmp` entries older than ~3 days) must serve reads again, not sit
+/// alive, holding `watch.lock`, while every client is refused forever.
+#[test]
+#[ignore = "drives a real write coordinator; run explicitly"]
+fn a_running_daemon_rebinds_a_socket_that_was_removed() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    std::fs::write(root.join("a.rs"), "pub fn hello() {}\n").unwrap();
+
+    let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+    let token = tokio_util::sync::CancellationToken::new();
+    let token_for_thread = token.clone();
+    let root_for_thread = root.clone();
+    let handle = std::thread::spawn(move || {
+        infigraph_core::daemon::run_write_coordinator(
+            &root_for_thread,
+            || Ok(infigraph_languages::bundled_registry().unwrap()),
+            50,
+            stop_rx,
+            |_| {},
+            0,
+            None::<fn(&infigraph_core::IndexResult)>,
+            true, // serve_requests
+            None,
+            &token_for_thread,
+            None,
+            None,
+        )
+    });
+
+    let served_within = |secs: u64| {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+        let mut last_err = None;
+        while std::time::Instant::now() < deadline {
+            match client_query(&root, "MATCH (f:File) RETURN f.id") {
+                Ok(_) => return Ok(()),
+                Err(e) => last_err = Some(e),
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+        Err(last_err)
+    };
+
+    let first = served_within(90);
+    let Some(socket) = ReadEndpoint::for_root(&root).socket_path() else {
+        token.cancel();
+        let _ = stop_tx.send(());
+        let _ = handle.join();
+        return; // no socket file on this platform (Linux, Windows): nothing to reap
+    };
+    std::fs::remove_file(&socket).unwrap();
+    assert!(
+        client_query(&root, "MATCH (f:File) RETURN f.id").is_err(),
+        "with its socket file gone, no client can reach the daemon"
+    );
+    let again = served_within(30);
+
+    token.cancel();
+    let _ = stop_tx.send(());
+    let _ = handle.join();
+
+    assert!(first.is_ok(), "the daemon never served at all: {first:?}");
+    assert!(
+        again.is_ok(),
+        "the daemon must serve again after its socket file was removed: {again:?}"
+    );
+}
+
 // ── helpers ──────────────────────────────────────────────────────────
 
 /// The one `GraphStore` the service serves from.

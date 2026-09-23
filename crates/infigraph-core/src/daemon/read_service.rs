@@ -56,7 +56,15 @@ pub struct ReadService {
     stop: Arc<AtomicBool>,
     accept: Option<std::thread::JoinHandle<()>>,
     endpoint: ReadEndpoint,
+    /// The socket file bound at start and its identity then, for
+    /// [`socket_intact`](Self::socket_intact). `None` where the transport
+    /// has no file.
+    socket: Option<(std::path::PathBuf, Option<super::PathIdentity>)>,
 }
+
+/// How long the accept loop waits for a client before re-checking its stop
+/// flag, and so the most a shutdown waits on an idle service.
+const ACCEPT_POLL: std::time::Duration = std::time::Duration::from_millis(250);
 
 impl ReadService {
     /// Bind the endpoint for `root` and serve reads from one fixed store.
@@ -97,16 +105,18 @@ impl ReadService {
     ) -> Result<Self> {
         let endpoint = ReadEndpoint::for_root(root);
         let listener = endpoint.bind()?;
+        let socket = endpoint
+            .socket_path()
+            .map(|path| (path.clone(), super::path_identity(&path)));
         let stop = Arc::new(AtomicBool::new(false));
 
         let pool = Pool::new(workers);
         let accept_stop = stop.clone();
         let accept = std::thread::spawn(move || {
-            for stream in listener.incoming() {
-                if accept_stop.load(Ordering::Relaxed) {
-                    break;
-                }
-                let Ok(stream) = stream else { continue };
+            while !accept_stop.load(Ordering::Relaxed) {
+                let Ok(Some(stream)) = listener.accept_timeout(ACCEPT_POLL) else {
+                    continue;
+                };
                 let source = source.clone();
                 let docs = docs.clone();
                 pool.execute(move || {
@@ -125,7 +135,20 @@ impl ReadService {
             stop,
             accept: Some(accept),
             endpoint,
+            socket,
         })
+    }
+
+    /// Whether a client can still reach this service: its socket file is
+    /// still the one it bound. `false` once the file is removed or replaced
+    /// -- macOS reaps `/tmp` after about three days, and anything else may
+    /// delete it -- after which every connect fails while this process looks
+    /// perfectly healthy (#187). Always `true` for a transport with no file.
+    pub fn socket_intact(&self) -> bool {
+        match &self.socket {
+            Some((path, identity)) => !super::path_is_gone(path, *identity),
+            None => true,
+        }
     }
 
     /// Stop accepting and join the accept thread.
@@ -141,7 +164,10 @@ impl ReadService {
         // an explicit `shutdown()` followed by the drop is a no-op.
         let Some(h) = self.accept.take() else { return };
         self.stop.store(true, Ordering::Relaxed);
-        // Unblock `accept` by connecting to ourselves once.
+        // The accept loop sees the flag within `ACCEPT_POLL` on its own; the
+        // self-connect only makes that immediate, and is the whole mechanism
+        // on Windows, where accept blocks. It fails harmlessly once the
+        // socket file is gone, which is the case the poll exists for (#187).
         let _ = self.endpoint.connect();
         let _ = h.join();
     }

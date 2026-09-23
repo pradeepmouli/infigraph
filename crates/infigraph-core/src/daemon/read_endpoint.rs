@@ -10,7 +10,7 @@
 use std::io::{self, Read, Write};
 use std::path::Path;
 
-use interprocess::local_socket::traits::{Listener as _, ListenerExt as _, Stream as _};
+use interprocess::local_socket::traits::{Listener as _, Stream as _};
 use interprocess::local_socket::{GenericNamespaced, ListenerOptions, ToNsName};
 
 /// An opaque local-socket identity for one project's read service.
@@ -94,31 +94,48 @@ impl ReadEndpoint {
         }
     }
 
-    /// Where a `GenericNamespaced` socket can land on Unix.
+    /// Where a `GenericNamespaced` socket can land on Unix, in the order
+    /// `interprocess` tries them: `/run/user/<uid>/`, then `/tmp/`
+    /// (`uds_local_socket.rs`, `write_run_user` falling back to `tmpdir()`).
+    /// `$TMPDIR` is consulted only on Android. On macOS `/run/user` does not
+    /// exist, so every socket is in `/tmp` -- which is why orphans were found
+    /// there while `$TMPDIR` pointed at `/var/folders/.../T/`, and why macOS's
+    /// three-day `/tmp` reaping can remove a live daemon's socket (#187).
     ///
-    /// `interprocess` resolves the pseudo-namespace to `$TMPDIR` when set
-    /// and `/tmp` otherwise -- except on Linux, where it uses the abstract
-    /// namespace and there is no file anywhere, so every lookup here comes
-    /// up empty and `unlink` and the sweep are no-ops. Both are checked rather than one picked,
-    /// because the daemon and whatever later cleans up after it do not
-    /// reliably share an environment: a detached daemon does not inherit
-    /// the per-user `TMPDIR` launchd gives a login shell, which is why the
-    /// orphaned sockets on the machine where this was found sat in `/tmp`
-    /// while `$TMPDIR` pointed at `/var/folders/.../T/`.
-    ///
+    /// On Linux the namespace is abstract and there is no file anywhere, so
+    /// every lookup here comes up empty and `unlink` and the sweep are no-ops.
     /// Windows named pipes are not files; there is nothing to remove, and
     /// they vanish with the process that made them.
     #[cfg(unix)]
     fn namespace_dirs() -> Vec<std::path::PathBuf> {
-        let mut dirs = Vec::with_capacity(2);
-        if let Some(t) = std::env::var_os("TMPDIR") {
-            dirs.push(std::path::PathBuf::from(t));
+        // SAFETY: getuid cannot fail.
+        let uid = unsafe { libc::getuid() };
+        vec![
+            std::path::PathBuf::from(format!("/run/user/{uid}")),
+            std::path::PathBuf::from("/tmp"),
+        ]
+    }
+
+    /// The socket file this endpoint currently has on disk, or `None` --
+    /// nothing bound, or a transport with no file at all (Linux's abstract
+    /// namespace, Windows named pipes).
+    ///
+    /// Exists so a daemon can notice the file being removed out from under
+    /// its live listener. macOS reaps `/tmp` entries older than about three
+    /// days, and a daemon that outlived that kept its fd, its `watch.lock`
+    /// and every sign of health while no client could reach it (#187).
+    pub fn socket_path(&self) -> Option<std::path::PathBuf> {
+        #[cfg(unix)]
+        {
+            Self::namespace_dirs()
+                .into_iter()
+                .map(|dir| dir.join(&self.name))
+                .find(|path| path.exists())
         }
-        let slash_tmp = std::path::PathBuf::from("/tmp");
-        if !dirs.contains(&slash_tmp) {
-            dirs.push(slash_tmp);
+        #[cfg(not(unix))]
+        {
+            None
         }
-        dirs
     }
 
     /// Open a connection to a listening read service. Client side.
@@ -214,7 +231,7 @@ pub fn sweep_orphaned_endpoints_in(dir: &Path, older_than: std::time::Duration) 
 ///
 /// A newtype rather than a re-export of `interprocess`'s `Listener`, so this
 /// module stays the only place the transport crate's API shape appears.
-/// `interprocess` is trait-based (`accept` comes from `ListenerExt`), and
+/// `interprocess` is trait-based (`accept` comes from its `Listener` trait), and
 /// re-exporting the raw type would push that import onto every caller and
 /// spread the dependency across the crate.
 pub struct ReadListener {
@@ -229,11 +246,44 @@ impl ReadListener {
         })
     }
 
-    /// Every client connection, in arrival order, forever.
-    pub fn incoming(&self) -> impl Iterator<Item = io::Result<ReadStream>> + '_ {
-        self.inner
-            .incoming()
-            .map(|s| s.map(|inner| ReadStream { inner }))
+    /// Wait at most `timeout` for a client: `Ok(None)` if none came.
+    ///
+    /// What lets the accept loop see its stop flag without being woken by a
+    /// connection. `ReadService` used to stop a blocking `accept` by
+    /// connecting to its own endpoint, which cannot work once the socket
+    /// file is gone (#187) -- the join then waits forever, and the listener
+    /// is never dropped, so a replacement could not be bound safely either.
+    ///
+    /// Windows falls back to a blocking `accept`: a named pipe cannot be
+    /// removed from under its server, so the self-connect still reaches it.
+    pub fn accept_timeout(&self, timeout: std::time::Duration) -> io::Result<Option<ReadStream>> {
+        #[cfg(unix)]
+        {
+            use std::os::fd::{AsFd as _, AsRawFd as _};
+            let interprocess::local_socket::Listener::UdSocket(listener) = &self.inner;
+            let mut pollfd = libc::pollfd {
+                fd: listener.as_fd().as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let millis = libc::c_int::try_from(timeout.as_millis()).unwrap_or(libc::c_int::MAX);
+            // SAFETY: one valid pollfd, borrowed from a listener that
+            // outlives the call.
+            match unsafe { libc::poll(&mut pollfd, 1, millis) } {
+                0 => return Ok(None),
+                n if n < 0 => {
+                    let err = io::Error::last_os_error();
+                    return match err.kind() {
+                        io::ErrorKind::Interrupted => Ok(None),
+                        _ => Err(err),
+                    };
+                }
+                _ => {}
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = timeout;
+        self.accept().map(Some)
     }
 }
 
