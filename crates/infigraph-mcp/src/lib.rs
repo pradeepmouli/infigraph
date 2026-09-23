@@ -4,6 +4,7 @@ pub mod health;
 pub mod idle;
 pub mod lifecycle;
 pub mod mcp_lock;
+pub mod proxy;
 pub mod recovery;
 pub mod session_context;
 pub mod signal_sender;
@@ -728,6 +729,16 @@ pub fn handle_tools_call(id: &Value, request: &Value) -> Value {
     );
 
     tools::helpers::log_activity(tool_name, &args);
+
+    // Test hook for R5.6 (#21), debug builds only: a call that never
+    // returns, so the supervisor's deadline and crash answers can be
+    // exercised against a real worker.
+    #[cfg(debug_assertions)]
+    if std::env::var("INFIGRAPH_MCP_DEBUG_STALL_TOOL").is_ok_and(|t| t == tool_name) {
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(3600));
+        }
+    }
 
     let metrics_enabled = std::env::var("INFIGRAPH_METRICS").is_ok_and(|v| v == "1");
 

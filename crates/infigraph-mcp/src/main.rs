@@ -80,52 +80,278 @@ fn main() -> Result<()> {
         infigraph_mcp::signal_sender::install();
     }
 
+    if serves_stdio(&args) {
+        return supervise_stdio(&args);
+    }
+
+    // `--serve`/`--ui` only: the worker reads no stdin, so there is no
+    // request to proxy (R5.7/#36 covers the HTTP transport).
     let mut crashes = infigraph_mcp::recovery::WorkerCrashes::default();
     loop {
-        let exe = std::env::current_exe()?;
-        let mut cmd = std::process::Command::new(&exe);
-        cmd.arg("--worker");
-        for arg in args.iter().skip(1).filter(|a| *a != "--worker") {
-            cmd.arg(arg);
-        }
-        // Let the worker detect supervisor death and exit instead of
-        // lingering as an orphan holding the instance lock.
-        cmd.env(
-            infigraph_mcp::lifecycle::SUPERVISOR_PID_ENV,
-            std::process::id().to_string(),
-        );
-        cmd.stdin(std::process::Stdio::inherit())
+        let status = worker_command(&args)
+            .stdin(std::process::Stdio::inherit())
             .stdout(std::process::Stdio::inherit())
-            .stderr(std::process::Stdio::inherit());
+            .stderr(std::process::Stdio::inherit())
+            .status()?;
+        match worker_crash(&status) {
+            Some(how) => restart_after_crash(&mut crashes, &how),
+            None => std::process::exit(status.code().unwrap_or(1)),
+        }
+    }
+}
 
-        let status = cmd.status()?;
+/// The worker, as the supervisor spawns it.
+fn worker_command(args: &[String]) -> std::process::Command {
+    let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from(&args[0]));
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("--worker");
+    for arg in args.iter().skip(1).filter(|a| *a != "--worker") {
+        cmd.arg(arg);
+    }
+    // Let the worker detect supervisor death and exit instead of
+    // lingering as an orphan holding the instance lock.
+    cmd.env(
+        infigraph_mcp::lifecycle::SUPERVISOR_PID_ENV,
+        std::process::id().to_string(),
+    );
+    cmd
+}
 
-        // #20: a crash restarts the worker and touches no project. It used to
-        // wipe and reindex every registered project (I-14); see
-        // `WorkerCrashes` for why that never repaired anything.
-        if let Some(how) = worker_crash(&status) {
-            if crashes.record(std::time::Instant::now()) {
-                mcp_log(
-                    "CRASH",
-                    &format!(
-                        "worker crashed ({how}) -- restarting it; no project graph is touched"
-                    ),
-                );
-                eprintln!("infigraph-mcp: worker crashed ({how}), restarting it");
-                continue;
+/// #20: a crash restarts the worker and touches no project. It used to wipe
+/// and reindex every registered project (I-14); see `WorkerCrashes` for why
+/// that never repaired anything. Returns only if the worker should restart.
+fn restart_after_crash(crashes: &mut infigraph_mcp::recovery::WorkerCrashes, how: &str) {
+    if crashes.record(std::time::Instant::now()) {
+        mcp_log(
+            "CRASH",
+            &format!("worker crashed ({how}) -- restarting it; no project graph is touched"),
+        );
+        eprintln!("infigraph-mcp: worker crashed ({how}), restarting it");
+        return;
+    }
+    let why = format!(
+        "worker crashed ({how}) {} times within {}s -- a crash loop; giving up",
+        infigraph_mcp::recovery::WORKER_CRASH_LOOP_LIMIT,
+        infigraph_mcp::recovery::WORKER_CRASH_LOOP_WINDOW.as_secs()
+    );
+    mcp_log("CRASH", &why);
+    eprintln!("infigraph-mcp: {why}");
+    std::process::exit(1);
+}
+
+/// Whether the worker serves MCP over stdio -- the same branches `run`
+/// takes: `--mcp`, or neither `--ui` nor `--serve` to park it elsewhere.
+fn serves_stdio(args: &[String]) -> bool {
+    args.iter().any(|a| a == "--mcp")
+        || (!ui_enabled_from(args) && !args.iter().any(|a| a == "--serve"))
+}
+
+enum Event {
+    Client(String),
+    ClientClosed,
+    Worker(u64, String),
+    WorkerClosed(u64),
+}
+
+/// How often the supervisor checks the worker and the deadline while idle.
+const SUPERVISE_TICK: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// R5.6 (#21): stand between the client and the worker so that no request
+/// is ever left unanswered -- see `infigraph_mcp::proxy`. Worker generations
+/// number each spawn, so output from a worker already replaced is ignored.
+fn supervise_stdio(args: &[String]) -> Result<()> {
+    use infigraph_mcp::proxy::Outstanding;
+    use std::sync::mpsc::RecvTimeoutError;
+
+    let (tx, rx) = std::sync::mpsc::channel::<Event>();
+    {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            for line in io::stdin().lock().lines() {
+                let Ok(line) = line else { break };
+                if tx.send(Event::Client(line)).is_err() {
+                    return;
+                }
             }
-            let why = format!(
-                "worker crashed ({how}) {} times within {}s -- a crash loop; giving up",
-                infigraph_mcp::recovery::WORKER_CRASH_LOOP_LIMIT,
-                infigraph_mcp::recovery::WORKER_CRASH_LOOP_WINDOW.as_secs()
-            );
-            mcp_log("CRASH", &why);
-            eprintln!("infigraph-mcp: {why}");
-            std::process::exit(1);
+            let _ = tx.send(Event::ClientClosed);
+        });
+    }
+
+    let deadline = infigraph_mcp::proxy::call_timeout();
+    let mut outstanding = Outstanding::default();
+    let mut crashes = infigraph_mcp::recovery::WorkerCrashes::default();
+    let mut client_open = true;
+    let mut backlog: Vec<String> = Vec::new();
+    let mut generation = 0u64;
+
+    loop {
+        generation += 1;
+        let mut child = worker_command(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()?;
+        let mut to_worker = Some(spawn_worker_writer(child.stdin.take().expect("piped")));
+        spawn_worker_reader(child.stdout.take().expect("piped"), generation, tx.clone());
+        for line in backlog.drain(..) {
+            if let Some(w) = &to_worker {
+                let _ = w.send(line);
+            }
+        }
+        if !client_open {
+            to_worker = None;
         }
 
-        std::process::exit(status.code().unwrap_or(1));
+        let mut worker_out_open = true;
+        let ended = loop {
+            match rx.recv_timeout(SUPERVISE_TICK) {
+                Ok(Event::Client(line)) => {
+                    outstanding.track(&line, std::time::Instant::now());
+                    if let Some(w) = &to_worker {
+                        let _ = w.send(line);
+                    }
+                }
+                Ok(Event::ClientClosed) => {
+                    client_open = false;
+                    to_worker = None;
+                }
+                Ok(Event::Worker(g, line)) if g == generation => {
+                    if outstanding.settle(&line) {
+                        write_line(&line)?;
+                    }
+                }
+                Ok(Event::WorkerClosed(g)) if g == generation => worker_out_open = false,
+                Ok(_) | Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => {
+                    unreachable!("the supervisor holds a sender")
+                }
+            }
+            if let Some(status) = child.try_wait()? {
+                // Replies the worker wrote before exiting are still in its
+                // pipe; deliver them before failing what is left.
+                let drain_until = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                while worker_out_open && std::time::Instant::now() < drain_until {
+                    match rx.recv_timeout(SUPERVISE_TICK) {
+                        Ok(Event::Worker(g, line)) if g == generation => {
+                            if outstanding.settle(&line) {
+                                write_line(&line)?;
+                            }
+                        }
+                        Ok(Event::WorkerClosed(g)) if g == generation => worker_out_open = false,
+                        Ok(Event::Client(line)) => {
+                            outstanding.track(&line, std::time::Instant::now());
+                            backlog.push(line);
+                        }
+                        Ok(Event::ClientClosed) => client_open = false,
+                        _ => {}
+                    }
+                }
+                break Ended::Exited(status);
+            }
+            if let Some(late) = outstanding.overdue(std::time::Instant::now(), deadline) {
+                break Ended::Overdue(late);
+            }
+        };
+
+        match ended {
+            Ended::Exited(status) => {
+                let crash = worker_crash(&status);
+                let cause = match &crash {
+                    Some(how) => format!("the worker crashed ({how})"),
+                    None => format!("the worker exited ({status})"),
+                };
+                for reply in outstanding
+                    .fail_all(|c| format!("{cause} while serving {}; it was not completed", c.what))
+                {
+                    write_line(&reply.to_string())?;
+                }
+                match crash {
+                    Some(how) if client_open => restart_after_crash(&mut crashes, &how),
+                    _ => std::process::exit(status.code().unwrap_or(1)),
+                }
+            }
+            Ended::Overdue(late) => {
+                let why = format!(
+                    "{} got no reply within {}s -- restarting the worker",
+                    late.what,
+                    deadline.as_secs()
+                );
+                mcp_log("TIMEOUT", &why);
+                eprintln!("infigraph-mcp: {why}");
+                let _ = child.kill();
+                let _ = child.wait();
+                for reply in outstanding.fail_all(|c| {
+                    if c.id == late.id {
+                        format!(
+                            "{} got no reply within {}s (INFIGRAPH_MCP_CALL_TIMEOUT_SECS); the \
+                             worker was restarted",
+                            c.what,
+                            deadline.as_secs()
+                        )
+                    } else {
+                        format!(
+                            "{} was queued behind a {} call that hung; the worker was \
+                             restarted before it ran",
+                            c.what, late.what
+                        )
+                    }
+                }) {
+                    write_line(&reply.to_string())?;
+                }
+                if !client_open {
+                    std::process::exit(0);
+                }
+            }
+        }
     }
+}
+
+enum Ended {
+    Exited(std::process::ExitStatus),
+    Overdue(infigraph_mcp::proxy::Call),
+}
+
+/// Lines for the worker go through a thread of their own: a worker stuck
+/// on a call stops reading, and once its pipe fills a direct write would
+/// block the supervisor too -- deadline and all.
+fn spawn_worker_writer(mut stdin: std::process::ChildStdin) -> std::sync::mpsc::Sender<String> {
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        for line in rx {
+            if writeln!(stdin, "{line}")
+                .and_then(|()| stdin.flush())
+                .is_err()
+            {
+                return;
+            }
+        }
+    });
+    tx
+}
+
+fn spawn_worker_reader(
+    stdout: std::process::ChildStdout,
+    generation: u64,
+    tx: std::sync::mpsc::Sender<Event>,
+) {
+    std::thread::spawn(move || {
+        for line in io::BufReader::new(stdout).lines() {
+            let Ok(line) = line else { break };
+            if tx.send(Event::Worker(generation, line)).is_err() {
+                return;
+            }
+        }
+        let _ = tx.send(Event::WorkerClosed(generation));
+    });
+}
+
+/// One line to the client. A client that is gone ends the supervisor.
+fn write_line(line: &str) -> Result<()> {
+    let mut out = io::stdout().lock();
+    out.write_all(line.as_bytes())?;
+    out.write_all(b"\n")?;
+    out.flush()?;
+    Ok(())
 }
 
 /// How the worker crashed, if its exit was a crash: SIGSEGV on Unix, an
