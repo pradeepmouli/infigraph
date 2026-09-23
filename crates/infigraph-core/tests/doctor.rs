@@ -1693,3 +1693,34 @@ fn compaction_drift_is_not_reported_for_an_unindexed_project() {
     let dir = tempfile::tempdir().unwrap();
     assert!(infigraph_core::doctor::check_one_compaction_drift(dir.path()).is_none());
 }
+
+/// #165: a fault the project's daemon has latched fails the check with the
+/// daemon's own error and the class's remedy; a project without one gets no
+/// extra line.
+#[test]
+fn check_one_daemon_fault_reports_a_live_fault_and_nothing_otherwise() {
+    use infigraph_core::daemon::fault::{record, FaultClass};
+    let dir = tempfile::tempdir().unwrap();
+    let infigraph_dir = dir.path().join(".infigraph");
+    std::fs::create_dir_all(&infigraph_dir).unwrap();
+    assert!(infigraph_core::doctor::check_one_daemon_fault(dir.path()).is_none());
+
+    // This test process stands in for the daemon, so its record is live.
+    record(
+        &infigraph_dir,
+        FaultClass::DiskFull,
+        "No space left on device (os error 28)",
+    );
+    let result = infigraph_core::doctor::check_one_daemon_fault(dir.path())
+        .expect("a live fault is reported");
+    assert_eq!(result.status, infigraph_core::doctor::CheckStatus::Fail);
+    assert!(
+        result.message.contains("No space left on device"),
+        "{}",
+        result.message
+    );
+    assert!(
+        result.remediation.unwrap().contains("infigraph rebuild"),
+        "names the command that replaces a stuck daemon"
+    );
+}

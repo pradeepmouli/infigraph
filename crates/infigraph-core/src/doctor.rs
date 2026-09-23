@@ -796,7 +796,34 @@ fn project_has_live_mcp_instance(project_path: &Path) -> bool {
 
 pub fn check_watchers(ctx: &DoctorContext) -> Vec<CheckResult> {
     let projects = projects_in_scope(ctx);
-    projects.iter().map(|p| check_one_watcher(p)).collect()
+    projects
+        .iter()
+        .flat_map(|p| std::iter::once(check_one_watcher(p)).chain(check_one_daemon_fault(p)))
+        .collect()
+}
+
+/// A failure the project's daemon has latched and keeps retrying past no
+/// further (#165): the one state in which every write a client sends it
+/// fails, and which its log reports only as a retry every tick.
+pub fn check_one_daemon_fault(project_path: &Path) -> Option<CheckResult> {
+    use crate::daemon::fault::FaultClass;
+    let fault = crate::daemon::fault::live_fault(&project_path.join(".infigraph"))?;
+    let remediation = match fault.class {
+        FaultClass::DiskFull => {
+            "free disk space, then `infigraph rebuild`: it replaces the stuck daemon, which \
+             releases any deleted graph it still holds open"
+        }
+        FaultClass::OpenFailed => "`infigraph rebuild` replaces the stuck daemon",
+        FaultClass::GrowthRefused => {
+            "`infigraph rebuild` -- the daemon still accepts it, and it clears the refusal"
+        }
+    };
+    Some(CheckResult::fail(
+        WATCHER_CATEGORY,
+        format!("{}: daemon fault", project_path.display()),
+        fault.to_string(),
+        remediation,
+    ))
 }
 
 const INSTANCES_CATEGORY: &str = "mcp-instances";

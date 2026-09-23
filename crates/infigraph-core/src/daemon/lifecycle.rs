@@ -527,7 +527,63 @@ pub fn prune_stale_daemon(lock_path: &Path, installed_build_hash: Option<&str>) 
     let Some(holder) = crate::lockfile::read_holder(lock_path) else {
         return false;
     };
+    // Live and current (relative to what's installed): nothing to prune.
+    end_daemon_if(
+        &holder,
+        |h| holder_is_stale_build(&h.build_hash, installed_build_hash),
+        std::time::Duration::from_secs(2),
+    )
+}
 
+/// End the daemon `watch.lock` names under `root` if it has latched a fault
+/// that a fresh process can clear (#165) -- a full disk it may itself be
+/// holding through an unlinked graph, or a graph it cannot reopen. Called
+/// by `rebuild` only: a healthy daemon, or one refusing writes for growth,
+/// is never ended, because build-fresh-then-swap exists so readers keep the
+/// old graph throughout a rebuild.
+///
+/// Returns the fault it acted on once that daemon has exited, `Ok(None)`
+/// when there was nothing to do, and an error when the daemon would not
+/// exit. The caller starts the replacement.
+pub fn end_faulted_daemon(
+    root: &Path,
+) -> anyhow::Result<Option<crate::daemon::fault::DaemonFault>> {
+    let infigraph_dir = root.join(".infigraph");
+    let Some(fault) =
+        crate::daemon::fault::live_fault(&infigraph_dir).filter(|f| f.class.cleared_by_restart())
+    else {
+        return Ok(None);
+    };
+    // Only the daemon that recorded the fault: a record is never grounds to
+    // end some other process holding the lock.
+    let lock_path = infigraph_dir.join("watch.lock");
+    let Some(holder) =
+        crate::lockfile::read_holder(&lock_path).filter(|h| h.pid == fault.holder.pid)
+    else {
+        return Ok(None);
+    };
+    // `daemon-restart`'s budget: a daemon asked to stop first waits out
+    // whatever it has in flight.
+    if end_daemon_if(&holder, |_| true, std::time::Duration::from_secs(10)) {
+        Ok(Some(fault))
+    } else {
+        anyhow::bail!(
+            "the daemon (pid {}) is stuck ({fault}) and did not exit when asked -- \
+             `infigraph kill {}`, then retry",
+            holder.pid,
+            holder.pid
+        )
+    }
+}
+
+/// End the daemon `holder` names when `should_end` says to, and report
+/// whether it is gone within `budget`. A pid that is no longer running is
+/// already gone.
+fn end_daemon_if(
+    holder: &crate::lockfile::LockInfo,
+    should_end: impl FnOnce(&crate::lockfile::LockInfo) -> bool,
+    budget: std::time::Duration,
+) -> bool {
     let spid = sysinfo::Pid::from_u32(holder.pid);
     let mut sys = sysinfo::System::new();
     sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[spid]), true);
@@ -539,8 +595,8 @@ pub fn prune_stale_daemon(lock_path: &Path, installed_build_hash: Option<&str>) 
         return true;
     };
 
-    if !holder_is_stale_build(&holder.build_hash, installed_build_hash) {
-        return false; // live and current (relative to what's installed) -- nothing to prune
+    if !should_end(holder) {
+        return false;
     }
 
     // Exact match against the real CLI binary names only -- a substring
@@ -556,9 +612,9 @@ pub fn prune_stale_daemon(lock_path: &Path, installed_build_hash: Option<&str>) 
         return false;
     }
 
-    // Alive, current binary differs: ask it to exit. The watch loop already
-    // releases watch.lock cleanly on SIGTERM (the same path Ctrl-C/`kill`
-    // already trigger), so this is not a hard kill.
+    // Ask it to exit. The watch loop already releases watch.lock cleanly on
+    // SIGTERM (the same path Ctrl-C/`kill` already trigger), so this is not
+    // a hard kill.
     #[cfg(unix)]
     unsafe {
         libc::kill(holder.pid as libc::pid_t, libc::SIGTERM);
@@ -570,9 +626,9 @@ pub fn prune_stale_daemon(lock_path: &Path, installed_build_hash: Option<&str>) 
             .output();
     }
 
-    const ATTEMPTS: u32 = 20;
     const DELAY: std::time::Duration = std::time::Duration::from_millis(100);
-    wait_for_pid_exit(spid, &mut sys, ATTEMPTS, DELAY)
+    let attempts = (budget.as_millis() / DELAY.as_millis()).max(1) as u32;
+    wait_for_pid_exit(spid, &mut sys, attempts, DELAY)
 }
 
 /// Confirm a daemon that was asked to stop is *really* gone: the lock must

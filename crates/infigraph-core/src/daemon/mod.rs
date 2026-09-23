@@ -1,5 +1,6 @@
 pub(crate) mod backoff;
 pub(crate) mod drain;
+pub mod fault;
 pub mod lifecycle;
 pub mod queue;
 pub mod read_endpoint;
@@ -462,6 +463,8 @@ pub(crate) struct HeldPrism {
     /// `GraphStore` rather than `Infigraph` because the store owns the
     /// `Database` and is shared on its own (`Infigraph::graph_store`).
     retired: Option<std::sync::Weak<crate::graph::GraphStore>>,
+    /// The graph file `held` was opened on -- see [`HeldPrism::graph_replaced`].
+    graph_identity: Option<PathIdentity>,
 }
 
 /// How long `watch_db` waits for a released graph handle to be dropped by
@@ -475,6 +478,7 @@ impl HeldPrism {
             held: None,
             beacon: Arc::new(Mutex::new(None)),
             retired: None,
+            graph_identity: None,
         }
     }
 
@@ -498,7 +502,8 @@ impl HeldPrism {
         self.held.is_none()
     }
 
-    pub(crate) fn set(&mut self, prism: Arc<Infigraph>) {
+    pub(crate) fn set(&mut self, prism: Arc<Infigraph>, graph_path: &Path) {
+        self.graph_identity = path_identity(graph_path);
         self.held = Some(Arc::clone(&prism));
         *self.beacon.lock().unwrap_or_else(|e| e.into_inner()) = Some(prism);
     }
@@ -514,6 +519,17 @@ impl HeldPrism {
             .and_then(|p| p.graph_store())
             .map(|store| Arc::downgrade(&store));
         self.held = None;
+        self.graph_identity = None;
+    }
+
+    /// Whether the graph file this prism was opened on has since been
+    /// deleted or replaced (#165). The handle then serves, and writes into,
+    /// an unlinked file nobody else can see, and pins its disk space: the
+    /// sittir daemon held ~11GB of deleted `graph` and `graph.shadow` open
+    /// through its ENOSPC stall. lbug checkpoints in place, so a changed
+    /// identity only ever means another process swapped the file.
+    pub(crate) fn graph_replaced(&self, graph_path: &Path) -> bool {
+        self.held.is_some() && path_is_gone(graph_path, self.graph_identity)
     }
 
     /// Wait until no one still holds the store `clear` released, so that
@@ -903,6 +919,25 @@ where
             }
         }
 
+        // Let go of a graph file that was deleted or replaced under the held
+        // handle (#165), so the next open reaches the file actually on disk
+        // and the unlinked one's space is freed. Only between tasks: each
+        // in-flight one holds its own clone of the handle, and `watch_db`
+        // waits for those to drop before reopening. A reopen that cannot
+        // happen latches an `OpenFailed` fault for a rebuild to act on.
+        if drain_in_flight.is_none()
+            && full_reindex_in_flight.is_none()
+            && scip_import_in_flight.is_none()
+            && held_prism.graph_replaced(&graph_path)
+        {
+            eprintln!(
+                "[watch] {} was deleted or replaced under the open graph handle -- releasing it \
+                 so the next write reopens the file on disk",
+                graph_path.display()
+            );
+            poison_watch_db(&mut held_prism);
+        }
+
         // Self-terminate if the on-disk binary has changed since this
         // process started (#134) -- prune_stale_daemon already handles
         // this correctly for a daemon someone is actively trying to
@@ -957,9 +992,11 @@ where
                 waiter_replies,
                 removed_in_drain,
             } = drain_in_flight.take().expect("checked is_some just above");
-            let (guard, finish) = finish_drain(drain_rt.block_on(handle), &waiter_replies);
+            let (guard, finish) =
+                finish_drain(&infigraph_dir, drain_rt.block_on(handle), &waiter_replies);
             match finish {
                 DrainFinish::Completed(outcome) => {
+                    fault::clear(&infigraph_dir, None);
                     // Removals are counted here rather than off a raw
                     // fsevent (as they were before the producer split, when
                     // this loop owned the watcher): `add_watch_removal`
@@ -1531,6 +1568,7 @@ where
                 }
                 Err(e) => {
                     eprintln!("[watch] index operation busy ({e}), retrying next tick");
+                    fault::record_if_fault(&root.join(".infigraph"), &e, fault::FaultClass::of);
                 }
             }
         }
@@ -1612,6 +1650,7 @@ where
     // process teardown that would drop both mid-write.
     if let Some(in_flight) = drain_in_flight.take() {
         let (guard, _) = finish_drain(
+            &infigraph_dir,
             drain_rt.block_on(in_flight.handle),
             &in_flight.waiter_replies,
         );
@@ -1713,6 +1752,7 @@ enum DrainFinish {
 /// writes replies as its last step, so a failure anywhere before that
 /// leaves them unwritten.
 fn finish_drain(
+    infigraph_dir: &Path,
     joined: std::result::Result<DrainTaskOutput, tokio::task::JoinError>,
     waiter_replies: &[PathBuf],
 ) -> (Option<crate::ops::IndexOpGuard>, DrainFinish) {
@@ -1726,6 +1766,7 @@ fn finish_drain(
             result: Err(e),
         }) => {
             eprintln!("[watch] drain failed: {e}");
+            fault::record_if_fault(infigraph_dir, &e, fault::FaultClass::of);
             reply_err_to_waiters(waiter_replies, &format!("daemon drain failed: {e}"));
             let finish = if crate::graph::growth_gate::is_write_refusal(&e) {
                 DrainFinish::Refused
@@ -1814,9 +1855,13 @@ fn watch_db(
     held: &mut HeldPrism,
 ) -> Result<Arc<Infigraph>> {
     if held.is_none() {
-        held.wait_for_retired_store(RETIRED_STORE_WAIT)?;
-        let _phase = crate::write_phase::enter(&"daemon: open graph", 0);
-        held.set(Arc::new(open_transient(root, registry)?));
+        let opened = held
+            .wait_for_retired_store(RETIRED_STORE_WAIT)
+            .and_then(|()| {
+                let _phase = crate::write_phase::enter(&"daemon: open graph", 0);
+                open_transient(root, registry)
+            });
+        held.set(Arc::new(note_open(root, opened)?), &graph_path(root));
     }
     Ok(held.current().expect("just set"))
 }
@@ -1831,8 +1876,29 @@ fn watch_db(
     registry: &Arc<crate::lang::LanguageRegistry>,
     held: &mut HeldPrism,
 ) -> Result<Arc<Infigraph>> {
-    held.set(Arc::new(open_transient(root, registry)?));
+    held.set(
+        Arc::new(note_open(root, open_transient(root, registry))?),
+        &graph_path(root),
+    );
     Ok(held.current().expect("just set"))
+}
+
+/// The live graph file the daemon's prism opens.
+fn graph_path(root: &Path) -> PathBuf {
+    root.join(".infigraph").join("graph")
+}
+
+/// Publish how an open of the daemon's graph went (#165): a failure the
+/// backoff cannot outwait latches an `OpenFailed` fault -- including a
+/// released handle that never lets go, which is how a daemon ends up
+/// pinning a deleted graph -- and a success clears it.
+fn note_open(root: &Path, opened: Result<Infigraph>) -> Result<Infigraph> {
+    let infigraph_dir = root.join(".infigraph");
+    match &opened {
+        Ok(_) => fault::clear(&infigraph_dir, Some(fault::FaultClass::OpenFailed)),
+        Err(e) => fault::record_if_fault(&infigraph_dir, e, fault::FaultClass::of_open_failure),
+    }
+    opened
 }
 
 /// Drops the watch session's shared DB connection so the next `watch_db`
@@ -2001,6 +2067,7 @@ fn serve_request_locked(
         }
         Err(e) => {
             eprintln!("[daemon] request-serving busy ({e}), retrying next tick");
+            fault::record_if_fault(&root.join(".infigraph"), &e, fault::FaultClass::of);
         }
     }
 }
@@ -2248,6 +2315,7 @@ where
         }
         Err(e) => {
             eprintln!("[daemon] full-reindex busy ({e}), retrying next tick");
+            fault::record_if_fault(&root.join(".infigraph"), &e, fault::FaultClass::of);
             return None;
         }
     };
@@ -2433,6 +2501,7 @@ fn try_start_scip_import(
         }
         Err(e) => {
             eprintln!("[daemon] scip-import busy ({e}), retrying next tick");
+            fault::record_if_fault(&root.join(".infigraph"), &e, fault::FaultClass::of);
             return None;
         }
     };
@@ -2588,6 +2657,7 @@ fn finish_full_reindex(
     let (indexed_files, detected_languages) = match result {
         Ok(outcome) => (outcome.indexed_files, outcome.detected_languages),
         Err(e) => {
+            fault::record_if_fault(&root.join(".infigraph"), &e, fault::FaultClass::of);
             let result = crate::daemon_protocol::WriteResult::Err {
                 message: format!("full reindex failed: {e:#}"),
             };
@@ -2808,6 +2878,7 @@ fn finish_full_reindex(
             // baseline. Ordinary incremental writes deliberately do not
             // (see `stamp_healthy_graph_size`'s doc comment).
             crate::graph::stamp_healthy_graph_size(&infigraph_dir, &live_path);
+            fault::clear(&infigraph_dir, None);
             // #183: the same verified checkpoint re-stamps the compaction
             // baseline. This is what makes `MIN_REBUILD_INTERVAL` work at
             // all -- `stamped_at` is the rate limiter, so a baseline that
@@ -3413,6 +3484,37 @@ mod tests {
     /// something still holds it -- two `Database`s on one file in a process
     /// (#149). The wait ends as soon as the last other holder drops it, and
     /// gives up with an error, rather than opening anyway, when it never does.
+    /// #165: a graph file swapped under the daemon's held handle is noticed,
+    /// so the coordinator can let go of the unlinked one; an untouched graph,
+    /// and a released handle, are not.
+    #[cfg(not(windows))]
+    #[test]
+    fn a_graph_replaced_under_the_held_handle_is_noticed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let registry = Arc::new(crate::lang::LanguageRegistry::new());
+        let mut held = HeldPrism::new();
+        watch_db(root, &registry, &mut held).unwrap();
+        let graph = graph_path(root);
+        assert!(
+            !held.graph_replaced(&graph),
+            "nothing has touched the graph yet"
+        );
+
+        // What a local-backend `index --full` amounts to: another file now
+        // answers to the same path.
+        let aside = root.join("graph.aside");
+        std::fs::rename(&graph, &aside).unwrap();
+        std::fs::copy(&aside, &graph).unwrap();
+        assert!(held.graph_replaced(&graph));
+
+        poison_watch_db(&mut held);
+        assert!(
+            !held.graph_replaced(&graph),
+            "a released handle pins nothing"
+        );
+    }
+
     #[test]
     fn a_released_store_still_held_elsewhere_blocks_a_reopen_until_dropped() {
         let dir = tempfile::tempdir().unwrap();
@@ -3681,7 +3783,7 @@ mod tests {
             "test setup is wrong: the drain task did not actually panic"
         );
 
-        let (guard, finish) = finish_drain(joined, &[first.clone(), second.clone()]);
+        let (guard, finish) = finish_drain(tmp.path(), joined, &[first.clone(), second.clone()]);
         assert!(
             guard.is_none(),
             "a panicking task drops its index-op guard during the unwind, \
@@ -3797,7 +3899,8 @@ mod tests {
                 guard,
                 result: Err(err),
             });
-        let (guard, finish) = finish_drain(joined, &[ok_reply.clone(), fail_reply.clone()]);
+        let (guard, finish) =
+            finish_drain(tmp.path(), joined, &[ok_reply.clone(), fail_reply.clone()]);
         assert!(guard.is_some());
         assert!(matches!(finish, DrainFinish::Failed));
 
@@ -4241,7 +4344,7 @@ mod refused_drain_tests {
                 guard,
                 result: Err(err),
             });
-        finish_drain(joined, &[]).1
+        finish_drain(root, joined, &[]).1
     }
 
     #[test]

@@ -148,6 +148,15 @@ pub(crate) fn cmd_index(root: &Path, full: bool, no_embed: bool) -> Result<()> {
             // current_exe failure), make one explicit start attempt before
             // giving up with the actionable message.
             let lock_path = root.join(".infigraph").join("watch.lock");
+            // #165: a daemon latched on a fault a fresh process can clear (a
+            // full disk it may be pinning through an unlinked graph, a graph
+            // it cannot reopen) would fail this rebuild the same way. End it
+            // and start a fresh one first; a healthy daemon is left serving
+            // reads throughout the rebuild.
+            if let Some(fault) = infigraph_core::daemon::lifecycle::end_faulted_daemon(root)? {
+                eprintln!("Stopped a daemon that could not recover on its own ({fault}); starting a fresh one.");
+                ensure_watcher_running(root);
+            }
             if !wait_for_daemon(&lock_path, std::time::Duration::from_secs(10)) {
                 ensure_watcher_running(root);
                 if !wait_for_daemon(&lock_path, std::time::Duration::from_secs(10)) {

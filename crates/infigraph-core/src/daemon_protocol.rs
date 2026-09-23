@@ -323,6 +323,29 @@ impl std::fmt::Display for WriteRequestCancelled {
 
 impl std::error::Error for WriteRequestCancelled {}
 
+/// Marker error: the daemon has latched a failure it cannot retry past
+/// (#165), so the request was not left waiting on it. Carries the daemon's
+/// own record, so the caller reports the real cause -- a full disk, a
+/// graph that will not open -- instead of a timeout.
+#[derive(Debug)]
+pub struct DaemonFaulted(pub crate::daemon::fault::DaemonFault);
+
+impl std::fmt::Display for DaemonFaulted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl std::error::Error for DaemonFaulted {}
+
+/// The latched fault that should stop `request` from waiting on the daemon
+/// that serves `staging_dir`, if any. The fault record sits beside the
+/// staging directory, in `.infigraph/`.
+fn blocking_fault(staging_dir: &Path, request: &WriteRequest) -> Option<DaemonFaulted> {
+    let fault = crate::daemon::fault::live_fault(staging_dir.parent()?)?;
+    (!fault.class.admits(request)).then_some(DaemonFaulted(fault))
+}
+
 fn submit_write_request_named_cancellable(
     staging_dir: &Path,
     name: &str,
@@ -330,6 +353,9 @@ fn submit_write_request_named_cancellable(
     timeout: Duration,
     cancel: Option<&CancellationToken>,
 ) -> anyhow::Result<WriteResult> {
+    if let Some(faulted) = blocking_fault(staging_dir, request) {
+        return Err(anyhow::Error::new(faulted));
+    }
     std::fs::create_dir_all(staging_dir)?;
     let request_path = staging_dir.join(format!("{name}.request"));
     let result_path = staging_dir.join(format!("{name}.result"));
@@ -347,6 +373,12 @@ fn submit_write_request_named_cancellable(
         if cancel.is_some_and(|t| t.is_cancelled()) {
             std::fs::remove_file(&request_path).ok();
             return Err(anyhow::Error::new(WriteRequestCancelled { request_path }));
+        }
+        // Checked while waiting too, not only up front: the daemon may hit
+        // the fault on this very request.
+        if let Some(faulted) = blocking_fault(staging_dir, request) {
+            std::fs::remove_file(&request_path).ok();
+            return Err(anyhow::Error::new(faulted));
         }
         if start.elapsed() >= timeout {
             std::fs::remove_file(&request_path).ok();
@@ -698,8 +730,86 @@ mod tests {
 
 #[cfg(test)]
 mod submit_tests {
-    use super::{submit_write_request, write_atomic, WriteRequest, WriteResult};
-    use std::time::Duration;
+    use super::{submit_write_request, write_atomic, DaemonFaulted, WriteRequest, WriteResult};
+    use std::path::Path;
+    use std::time::{Duration, Instant};
+
+    fn staging_with_fault(class: crate::daemon::fault::FaultClass) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        // This test process stands in for the daemon: its record is live
+        // for exactly as long as the writer runs.
+        crate::daemon::fault::record(dir.path(), class, "No space left on device (os error 28)");
+        dir
+    }
+
+    fn request_files(staging_dir: &Path) -> usize {
+        std::fs::read_dir(staging_dir)
+            .map(|d| d.filter_map(|e| e.ok()).count())
+            .unwrap_or(0)
+    }
+
+    /// #165: a daemon latched on a full disk fails a submit at once, with its
+    /// own error, instead of letting it wait out the timeout.
+    #[test]
+    fn a_latched_fault_fails_a_submit_fast_with_the_daemons_error() {
+        let dir = staging_with_fault(crate::daemon::fault::FaultClass::DiskFull);
+        let staging_dir = dir.path().join("requests");
+        let start = Instant::now();
+        let err = submit_write_request(
+            &staging_dir,
+            &WriteRequest::FullReindex,
+            Duration::from_secs(600),
+        )
+        .expect_err("a latched fault must fail the submit");
+        assert!(start.elapsed() < Duration::from_secs(5));
+        assert!(err.downcast_ref::<DaemonFaulted>().is_some(), "{err:#}");
+        assert!(
+            err.to_string().contains("No space left on device"),
+            "{err:#}"
+        );
+        assert_eq!(request_files(&staging_dir), 0, "nothing is left behind");
+    }
+
+    /// A fault the daemon latches while a client waits ends the wait too, and
+    /// withdraws the request.
+    #[test]
+    fn a_fault_latched_mid_wait_ends_the_wait_and_withdraws_the_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging_dir = dir.path().join("requests");
+        let infigraph_dir = dir.path().to_path_buf();
+        let daemon = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            crate::daemon::fault::record(
+                &infigraph_dir,
+                crate::daemon::fault::FaultClass::OpenFailed,
+                "graph will not open",
+            );
+        });
+        let err = submit_write_request(
+            &staging_dir,
+            &WriteRequest::Index { paths: None },
+            Duration::from_secs(30),
+        )
+        .expect_err("the fault must end the wait");
+        daemon.join().unwrap();
+        assert!(err.downcast_ref::<DaemonFaulted>().is_some(), "{err:#}");
+        assert_eq!(request_files(&staging_dir), 0, "the request was withdrawn");
+    }
+
+    /// A growth refusal still lets a full reindex through: it is the remedy.
+    #[test]
+    fn a_growth_refusal_still_admits_a_full_reindex() {
+        let dir = staging_with_fault(crate::daemon::fault::FaultClass::GrowthRefused);
+        let staging_dir = dir.path().join("requests");
+        let err = submit_write_request(
+            &staging_dir,
+            &WriteRequest::FullReindex,
+            Duration::from_millis(300),
+        )
+        .expect_err("no daemon answers in this test");
+        assert!(err.downcast_ref::<DaemonFaulted>().is_none(), "{err:#}");
+        assert!(err.to_string().contains("no daemon responded"), "{err:#}");
+    }
 
     #[test]
     fn submit_write_request_writes_request_file_and_returns_matching_result() {
