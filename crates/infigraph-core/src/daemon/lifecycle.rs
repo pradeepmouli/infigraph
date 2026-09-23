@@ -306,6 +306,20 @@ pub fn ensure_daemon_running_required(root: &Path, watch_binary: &Path) -> Daemo
         return DaemonStartOutcome::AlreadyRunning;
     }
 
+    // A daemon belongs to a project, never to a directory inside one (#196).
+    // Starting one on a subdirectory used to leave `daemon.log` and
+    // `watch.lock` in it: the child resolved its cwd back to the project
+    // root and lost the race for the real daemon's lock, every time.
+    let canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let owner = crate::project::resolve_project_root(&canonical);
+    if owner != canonical {
+        return DaemonStartOutcome::Failed(format!(
+            "{} is inside the project at {} -- a daemon runs only at a project root",
+            root.display(),
+            owner.display()
+        ));
+    }
+
     let tg_dir = root.join(".infigraph");
     if !tg_dir.exists() {
         // Not yet indexed (e.g. the very first `infigraph index` on a fresh
@@ -716,13 +730,6 @@ pub fn build_daemon_command(root: &Path, tg_dir: &Path, watch_binary: &Path) -> 
     // write atomically seek-to-end, so a losing child's short "another
     // watcher is already running" message lands after the winner's output
     // instead of truncating it away.
-    // Append, never truncate: multiple spawn attempts can race to acquire
-    // watch.lock (see ensure_daemon_running's probe-then-spawn window), and
-    // every attempt -- winner and losers alike -- opens this same file for
-    // its child's stderr before the race is decided. O_APPEND makes each
-    // write atomically seek-to-end, so a losing child's short "another
-    // watcher is already running" message lands after the winner's output
-    // instead of truncating it away.
     let log_path = tg_dir.join("daemon.log");
     // R7.3 (#83): cap before handing the file to the child as its stderr.
     // Rotate-at-spawn is the only safe point -- once the fd is inherited,
@@ -877,6 +884,32 @@ mod tests {
     /// (the process crashed or was `kill -9`'d without releasing it), so
     /// there's nothing to signal — but it must still be reported as prunable
     /// so the caller retries the acquisition.
+    /// #196: a daemon is never started for a directory inside a project --
+    /// not even when a stray `.infigraph/` there passes the "has a store"
+    /// precondition -- and the refusal leaves no `daemon.log` behind.
+    #[test]
+    fn a_daemon_is_never_started_inside_a_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::create_dir_all(root.join(".infigraph")).unwrap();
+        std::fs::write(root.join(".infigraph").join("graph"), b"").unwrap();
+        let sub = root.join("packages").join("src");
+        std::fs::create_dir_all(sub.join(".infigraph")).unwrap();
+
+        let outcome = super::ensure_daemon_running_required(
+            &sub,
+            std::path::Path::new("/nonexistent/infigraph"),
+        );
+        match outcome {
+            super::DaemonStartOutcome::Failed(msg) => {
+                assert!(msg.contains("inside the project"), "{msg}")
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        assert!(!sub.join(".infigraph").join("daemon.log").exists());
+    }
+
     #[test]
     fn prune_stale_daemon_reports_dead_pid_as_prunable() {
         let tmp = tempfile::tempdir().unwrap();

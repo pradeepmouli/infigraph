@@ -234,8 +234,8 @@ fn run() -> Result<()> {
     // can't produce a duplicate live watcher -- see that function's doc
     // comment for the daemon-mode + `auto_start_on_boot` gating it still
     // does internally.
-    let startup_dir = std::env::current_dir().ok();
-    start_daemon_watcher_for_startup_dir(startup_dir.as_deref());
+    let project = infigraph_mcp::tools::helpers::startup_project();
+    start_daemon_watcher_for_startup_dir(Some(&project));
 
     if let Some(mut lock) = mcp_lock {
         std::thread::spawn(move || loop {
@@ -250,9 +250,7 @@ fn run() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let mcp_mode = args.iter().any(|a| a == "--mcp");
     let transport = if mcp_mode { "stdio" } else { "http" };
-    let project_path = std::env::current_dir()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|_| "unknown".to_string());
+    let project_path = project.to_string_lossy().to_string();
     let instance_info = infigraph_core::instances::InstanceInfo::current(&project_path, transport);
     let _instance_guard = match infigraph_core::instances::register_instance(&instance_info) {
         Ok(guard) => Some(guard),

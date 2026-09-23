@@ -12,9 +12,7 @@ pub fn tool_doctor(args: &Value) -> anyhow::Result<String> {
             .get("path")
             .and_then(|v| v.as_str())
             .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| {
-                std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
-            });
+            .unwrap_or_else(super::helpers::startup_project);
         let canonical = path.canonicalize().unwrap_or(path);
         DoctorScope::Project(canonical)
     };

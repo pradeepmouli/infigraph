@@ -38,6 +38,66 @@ pub fn resolve_project_path(path: &str) -> String {
     resolved.to_string_lossy().to_string()
 }
 
+/// The project this MCP process belongs to: the directory it was launched
+/// in, resolved once at startup to the project that owns it (#196). A
+/// session started in `packages/foo/src` is a session on the repo, not on
+/// that directory, so everything that asks "which project am I" -- startup
+/// watching, instance registration, `doctor`'s default, a tool call with no
+/// `path` or `path: "."` -- gets the same answer the CLI's `main` gives.
+pub fn startup_project() -> PathBuf {
+    static PROJECT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    PROJECT
+        .get_or_init(|| PathBuf::from(resolve_project_path(".")))
+        .clone()
+}
+
+/// Tools whose `path` is required and never defaulted or resolved: each
+/// acts on exactly the store it names. `delete_project` resolving "this
+/// stray subdirectory store" to the project root would delete the
+/// project's index.
+pub const EXPLICIT_PATH_TOOLS: &[&str] = &["delete_project"];
+
+/// Whether `tool_name`'s schema takes a `path`, from the advertised tool
+/// list itself so the two cannot drift.
+fn takes_path(tool_name: &str) -> bool {
+    static WITH_PATH: std::sync::OnceLock<std::collections::HashSet<String>> =
+        std::sync::OnceLock::new();
+    WITH_PATH
+        .get_or_init(|| {
+            crate::build_tools_list()
+                .iter()
+                .filter(|t| t["inputSchema"]["properties"].get("path").is_some())
+                .filter_map(|t| t["name"].as_str().map(str::to_string))
+                .collect()
+        })
+        .contains(tool_name)
+}
+
+/// Scope a tool call to its project, once, before anything acts on it
+/// (#196). Every tool's `path` names the project the call is about, but
+/// agents pass whatever directory they are working in, and each helper that
+/// saw the raw value decided on its own whether to resolve it. The ones that
+/// did not created `.infigraph/` in the subdirectory and started a daemon
+/// on it. Resolving here, at dispatch, makes a project root the only thing
+/// downstream code ever receives -- and an omitted `path` means this
+/// server's own project.
+pub fn scope_to_project(tool_name: &str, mut args: Value) -> Value {
+    if EXPLICIT_PATH_TOOLS.contains(&tool_name) || !takes_path(tool_name) {
+        return args;
+    }
+    let resolved = match args.get("path").and_then(|p| p.as_str()) {
+        Some(path) => resolve_project_path(path),
+        None => startup_project().to_string_lossy().to_string(),
+    };
+    if args.is_null() {
+        args = json!({});
+    }
+    if let Some(obj) = args.as_object_mut() {
+        obj.insert("path".to_string(), json!(resolved));
+    }
+    args
+}
+
 pub fn open_prism(args: &Value) -> Result<Infigraph> {
     let raw_path = args
         .get("path")
@@ -223,7 +283,13 @@ pub fn log_activity(tool_name: &str, args: &Value) {
     if path.is_empty() {
         return;
     }
-    let sessions_dir = PathBuf::from(path).join(".infigraph").join("sessions");
+    // Record into a project's store, never create one: an activity log is
+    // not a reason for a directory to become a project (#196).
+    let store = PathBuf::from(path).join(".infigraph");
+    if !store.is_dir() {
+        return;
+    }
+    let sessions_dir = store.join("sessions");
     if std::fs::create_dir_all(&sessions_dir).is_err() {
         return;
     }

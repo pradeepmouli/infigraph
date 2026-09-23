@@ -359,6 +359,13 @@ pub fn dispatch_tool(tool_name: &str, args: &Value) -> Result<String, anyhow::Er
 }
 
 fn tool_def(name: &str, description: &str, props: Value, required: &[&str]) -> Value {
+    // `path` is optional everywhere it can be defaulted: dispatch fills in
+    // this server's project (`scope_to_project`, #196).
+    let required: Vec<&str> = required
+        .iter()
+        .copied()
+        .filter(|r| *r != "path" || tools::helpers::EXPLICIT_PATH_TOOLS.contains(&name))
+        .collect();
     json!({
         "name": name,
         "description": description,
@@ -375,7 +382,7 @@ fn p(path: bool, symbol: bool, file: bool, extra: Value) -> Value {
     if path {
         obj.insert(
             "path".into(),
-            json!({"type":"string","description":"Project root path"}),
+            json!({"type":"string","description":"Project root path. Optional: defaults to the project this server was started in; a subdirectory resolves to the project that owns it"}),
         );
     }
     if symbol {
@@ -714,7 +721,10 @@ pub fn handle_tools_list(id: &Value) -> Value {
 pub fn handle_tools_call(id: &Value, request: &Value) -> Value {
     let params = request.get("params").cloned().unwrap_or(Value::Null);
     let tool_name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
-    let args = params.get("arguments").cloned().unwrap_or(json!({}));
+    let args = tools::helpers::scope_to_project(
+        tool_name,
+        params.get("arguments").cloned().unwrap_or(json!({})),
+    );
 
     tools::helpers::log_activity(tool_name, &args);
 
