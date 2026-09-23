@@ -52,7 +52,7 @@ fn main() -> Result<()> {
         return run_worker();
     }
 
-    // Supervisor mode: spawn self as --worker, monitor for segfault, auto-reindex.
+    // Supervisor mode: spawn self as --worker, and restart it if it crashes.
     // The worker already logs a reason for every exit path it controls
     // (panic, signal, stdin EOF, idle grace, supervisor-gone); the
     // supervisor itself had neither a panic hook nor a signal handler --
@@ -80,9 +80,7 @@ fn main() -> Result<()> {
         infigraph_mcp::signal_sender::install();
     }
 
-    // Remember the repo we were launched in: it's the primary recovery target
-    // even when the global registry is empty (standalone use).
-    let startup_dir = std::env::current_dir().ok();
+    let mut crashes = infigraph_mcp::recovery::WorkerCrashes::default();
     loop {
         let exe = std::env::current_exe()?;
         let mut cmd = std::process::Command::new(&exe);
@@ -102,83 +100,48 @@ fn main() -> Result<()> {
 
         let status = cmd.status()?;
 
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::ExitStatusExt;
-            if status.signal() == Some(11) {
-                // SIGSEGV — likely corrupt DB, reindex all registered projects
+        // #20: a crash restarts the worker and touches no project. It used to
+        // wipe and reindex every registered project (I-14); see
+        // `WorkerCrashes` for why that never repaired anything.
+        if let Some(how) = worker_crash(&status) {
+            if crashes.record(std::time::Instant::now()) {
                 mcp_log(
                     "CRASH",
-                    "SIGSEGV detected — triggering auto-reindex of registered projects (code + docs)",
+                    &format!(
+                        "worker crashed ({how}) -- restarting it; no project graph is touched"
+                    ),
                 );
-                eprintln!("infigraph-mcp: crash detected (SIGSEGV), auto-reindexing code+docs...");
-                auto_reindex_all(startup_dir.as_deref());
-                // Respawn worker after reindex
+                eprintln!("infigraph-mcp: worker crashed ({how}), restarting it");
                 continue;
             }
-        }
-
-        #[cfg(windows)]
-        {
-            if let Some(code) = status.code() {
-                if code < 0 {
-                    // Negative exit code on Windows = unhandled exception (e.g. access violation)
-                    mcp_log(
-                        "CRASH",
-                        &format!(
-                            "Crash detected (exit {code}) — triggering auto-reindex of code+docs"
-                        ),
-                    );
-                    eprintln!("infigraph-mcp: crash detected, auto-reindexing code+docs...");
-                    auto_reindex_all(startup_dir.as_deref());
-                    continue;
-                }
-            }
+            let why = format!(
+                "worker crashed ({how}) {} times within {}s -- a crash loop; giving up",
+                infigraph_mcp::recovery::WORKER_CRASH_LOOP_LIMIT,
+                infigraph_mcp::recovery::WORKER_CRASH_LOOP_WINDOW.as_secs()
+            );
+            mcp_log("CRASH", &why);
+            eprintln!("infigraph-mcp: {why}");
+            std::process::exit(1);
         }
 
         std::process::exit(status.code().unwrap_or(1));
     }
 }
 
-fn auto_reindex_all(startup_dir: Option<&std::path::Path>) {
-    let cli = find_infigraph_cli_for_reindex();
-    let cli_path = match cli {
-        Some(p) => p,
-        None => {
-            mcp_log("ERROR", "Cannot find infigraph CLI for auto-reindex");
-            return;
-        }
-    };
-
-    // Registry repos are optional extras: an empty/broken registry must not
-    // prevent recovery of the repo this MCP server was launched in.
-    let registry_paths: Vec<std::path::PathBuf> = match infigraph_core::multi::Registry::load() {
-        Ok(r) => r.repos.values().map(|e| e.path.clone()).collect(),
-        Err(e) => {
-            mcp_log(
-                "ERROR",
-                &format!("Registry load failed during reindex: {e}"),
-            );
-            Vec::new()
-        }
-    };
-
-    let groups_dir = std::env::var_os("HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(dirs_next::home_dir)
-        .map(|h| h.join(".infigraph").join("groups"));
-
-    let targets = infigraph_mcp::recovery::collect_reindex_targets(
-        startup_dir,
-        &registry_paths,
-        groups_dir.as_deref(),
-    );
-    if targets.is_empty() {
-        mcp_log("WARN", "Auto-reindex found no targets with .infigraph");
-        return;
+/// How the worker crashed, if its exit was a crash: SIGSEGV on Unix, an
+/// unhandled exception (a negative exit code) on Windows.
+fn worker_crash(status: &std::process::ExitStatus) -> Option<String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        (status.signal() == Some(libc::SIGSEGV)).then(|| "SIGSEGV".to_string())
     }
-    for path in &targets {
-        reindex_path(&cli_path, path);
+    #[cfg(windows)]
+    {
+        status
+            .code()
+            .filter(|code| *code < 0)
+            .map(|code| format!("exit {code}"))
     }
 }
 
@@ -195,52 +158,6 @@ fn start_daemon_watcher_for_startup_dir(startup_dir: Option<&std::path::Path>) {
     std::thread::spawn(move || {
         infigraph_mcp::recovery::start_daemon_watcher_for_startup_dir(startup_dir.as_deref());
     });
-}
-
-fn reindex_path(cli_path: &std::path::Path, path: &std::path::Path) {
-    let path_str = path.to_string_lossy().to_string();
-    mcp_log("INFO", &format!("Auto-reindexing: {path_str}"));
-
-    if let Err(e) = infigraph_mcp::recovery::wipe_code_and_docs(path) {
-        mcp_log("ERROR", &format!("Reindex wipe skipped: {path_str}: {e:#}"));
-        return;
-    }
-
-    let result = std::process::Command::new(cli_path)
-        .arg("index")
-        .current_dir(path)
-        .status();
-    match result {
-        Ok(s) if s.success() => mcp_log("INFO", &format!("Reindex OK: {path_str}")),
-        Ok(s) => mcp_log(
-            "ERROR",
-            &format!("Reindex failed (exit {:?}): {path_str}", s.code()),
-        ),
-        Err(e) => mcp_log("ERROR", &format!("Reindex spawn failed: {e}")),
-    }
-}
-
-/// The CLI the supervisor spawns for a crash-recovery reindex: next to this
-/// executable (the same resolution every other spawn path uses), else the
-/// default install location. Build-checked once against this process (#141).
-fn find_infigraph_cli_for_reindex() -> Option<std::path::PathBuf> {
-    let found = std::env::current_exe()
-        .ok()
-        .and_then(|exe| infigraph_core::daemon::lifecycle::resolve_cli_binary_sibling_of(&exe).ok())
-        .or_else(|| {
-            let bin_name = if cfg!(windows) {
-                "infigraph.exe"
-            } else {
-                "infigraph"
-            };
-            let home = std::env::var_os("HOME")
-                .map(std::path::PathBuf::from)
-                .or_else(dirs_next::home_dir)?;
-            let local_bin = home.join(".local").join("bin").join(bin_name);
-            local_bin.exists().then_some(local_bin)
-        })?;
-    infigraph_core::daemon::warn_if_cli_build_differs(&found);
-    Some(found)
 }
 
 fn run_worker() -> Result<()> {
