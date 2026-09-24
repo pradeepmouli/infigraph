@@ -130,6 +130,19 @@ Do **not** attempt all 47 in one PR. Sequence:
 - Env var **names** must not change as part of migration — existing tests that `set_var`/`env_remove` a given `INFIGRAPH_*` name must keep working unmodified.
 - Each migrated group needs a focused test asserting the full precedence chain (CLI > env > TOML > default) resolves correctly, plus a test that the group prefix derives correctly from `module_path!()` including the `config`-segment-skip rule.
 
+## Strictness, optional defaults, legacy names, enums (implemented, #74)
+
+The `resolve` sketch above is the original shape; it is superseded as follows (see `settings.rs` for the source):
+
+- **`= default` is optional.** `name: Type` declares a required setting; leaving it unset is an error.
+- **`resolve()`/`resolve_layers()` are strict** and return `Result<Self, SettingsError>`. A value that does not parse (env var, including an empty one, or a wrongly-typed config.toml key) is an error naming where it came from, the value and why, and every bad value in the group is reported at once. `FromTomlItem::from_toml_item` returns `Result<Self, String>`.
+- **Fallback is generated only where a default is declared.** A group whose every field has a default also gets `impl Default` and `resolve_or_default()`/`resolve_layers_or_default()`, which log a bad value and use that field's default. This is a separate macro arm, so calling `Default` on a group with a required field is a compile error. Infallible helpers inside long-lived processes use `resolve_or_default`, so a config file edited mid-run cannot take a daemon down.
+- **`#[legacy = "NAME"]`** on a field reads a pre-macro env var name, ranking just below the CLI: CLI > legacy name > `INFIGRAPH_{CATEGORY}_{FIELD}` > TOML > default. It replaces seeding the CLI slot by hand (`legacy_env`, removed), which also swallowed parse errors.
+- **`env_layer()`** returns the environment layer alone, for the two callers that consult their own config source next (`session`, `[index] include`).
+- **`settings_enum!`** declares an enum-valued field type from each variant's spelling (`Kuzu = "kuzu"`), generating `FromStr` (its error lists the valid spellings), `as_str`/`Display`, `FromTomlItem` and `Deserialize`.
+- **Backend:** `backend.selected` is a `BackendChoice { Kuzu, Daemon, Neo4j }` with `#[legacy = "INFIGRAPH_BACKEND"]`. `validated_backend()` is strict and gates every `Infigraph::init*` (an exhaustive match, so no catch-all can open Kuzu), and `check_backend_at_startup()` gates the CLI (all commands but `doctor`) and the MCP supervisor, pinging Neo4j when it is selected. `selected_backend()` stays infallible for the bool helpers.
+- **Not yet:** only the backend is checked at startup; other groups warn and fall back at runtime. A startup `check_all` over every group is tracked as a follow-up issue.
+
 ## Resolved decisions
 
 - **`infigraph-mcp` adopts `clap`.** It has no clap dependency today (hand-parses `std::env::args()` for `--mcp`/`--worker`), but that CLI surface is already tiny and fixed, so adding clap is low-cost. This keeps the `settings!` macro's generated code identical across every crate — no conditional/hand-rolled arg-scanner path, no special-casing for `mcp`-owned groups. Prerequisite for migrating any `mcp`-group setting that should also be CLI-settable: add `clap` (`derive`+`env` features, matching `infigraph-cli`'s existing dependency) to `infigraph-mcp`'s `Cargo.toml` before or alongside the first `mcp`-group migration.
