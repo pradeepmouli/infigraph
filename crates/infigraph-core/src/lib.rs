@@ -56,6 +56,7 @@ pub mod verify;
 pub mod viz;
 pub mod vuln;
 pub mod watch;
+pub mod watchdog;
 pub mod worktree;
 pub mod write_phase;
 

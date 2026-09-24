@@ -147,6 +147,44 @@ pub fn spawn_parent_monitor() {
     }
 }
 
+/// Exit code a worker uses when its watchdog restarts it (R5.2, #19): the
+/// supervisor starts a fresh worker instead of exiting. EX_TEMPFAIL.
+pub const WATCHDOG_RESTART_EXIT: i32 = 75;
+
+/// Read-held while the worker runs a tool call (calls over HTTP can run
+/// concurrently). The watchdog takes it for writing before restarting the
+/// worker, so a restart happens between calls, never inside one.
+pub static SERVING: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+/// R5.2 (#19): watch this worker's own memory, descriptors and threads.
+/// Over a soft ceiling, drop the search caches (rebuilt on the next
+/// search); over a hard ceiling, wait for the call in progress to finish
+/// and exit with [`WATCHDOG_RESTART_EXIT`] so the supervisor starts a
+/// fresh worker. Everything a worker holds is rebuilt from disk.
+pub fn spawn_self_watch() {
+    std::thread::spawn(|| {
+        let mut watch = infigraph_core::watchdog::SelfWatch::new("mcp");
+        loop {
+            std::thread::sleep(Duration::from_secs(1));
+            match watch.check(std::time::Instant::now()) {
+                infigraph_core::watchdog::Action::DropCaches => {
+                    crate::tools::search::drop_search_cache();
+                    infigraph_core::embed::invalidate_hnsw_cache();
+                }
+                infigraph_core::watchdog::Action::Restart(why) => {
+                    let _between_calls = SERVING.write().unwrap_or_else(|e| e.into_inner());
+                    crate::mcp_log("WATCHDOG", &format!("{why} -- restarting the worker"));
+                    let _ = std::fs::remove_file(infigraph_core::instances::instance_path(
+                        std::process::id(),
+                    ));
+                    std::process::exit(WATCHDOG_RESTART_EXIT);
+                }
+                infigraph_core::watchdog::Action::None => {}
+            }
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

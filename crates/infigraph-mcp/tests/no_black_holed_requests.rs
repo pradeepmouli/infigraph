@@ -8,11 +8,13 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, ChildStdin, Stdio};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
+
+mod support;
 
 const STALLED: &str = "get_stats";
 
@@ -37,23 +39,14 @@ fn start(extra_env: &[(&str, &str)]) -> Server {
     let root = tmp.path().to_path_buf();
     let startup = root.join("startup");
     std::fs::create_dir_all(&startup).unwrap();
-    let registry_home = root.join("registry-home");
-    std::fs::create_dir_all(&registry_home).unwrap();
     let instances = root.join("instances");
-    std::fs::create_dir_all(&instances).unwrap();
 
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_infigraph-mcp"));
+    let mut cmd = support::isolated_mcp_command(&root);
     cmd.arg("--mcp")
         .current_dir(&startup)
-        .env("HOME", root.join("home"))
-        .env("INFIGRAPH_REGISTRY_HOME", &registry_home)
-        .env("INFIGRAPH_MCP_LOCK_PATH", root.join("mcp.lock"))
-        .env("INFIGRAPH_REGISTRY_INSTANCES_DIR", &instances)
-        .env("INFIGRAPH_MCP_LOG_PATH", root.join("mcp.log"))
         .env("INFIGRAPH_MCP_DEBUG_STALL_TOOL", STALLED)
         .env("CI", "true")
         .env(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND)
-        .env_remove("INFIGRAPH_WATCH_DAEMON")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
@@ -199,4 +192,23 @@ fn a_call_in_flight_when_the_worker_crashes_is_answered_naming_the_crash() {
 
     s.call(3, "list_languages");
     assert!(s.reply(3, Duration::from_secs(60)).get("result").is_some());
+}
+
+/// R5.2 (#19): a worker over its hard ceiling restarts itself between
+/// calls, and the supervisor starts a fresh worker rather than exiting.
+/// A thread ceiling of 1 is breached by any process.
+#[test]
+fn a_worker_over_its_hard_ceiling_is_replaced_and_the_supervisor_stays_up() {
+    let mut s = start(&[
+        ("INFIGRAPH_WATCHDOG_THREADS_SOFT", "1"),
+        ("INFIGRAPH_WATCHDOG_THREADS_HARD", "1"),
+        ("INFIGRAPH_WATCHDOG_INTERVAL_SECS", "1"),
+    ]);
+    let first = registered_worker(&s.instances, None);
+    let second = registered_worker(&s.instances, Some(first));
+    assert_ne!(first, second);
+    assert!(
+        s.child.try_wait().unwrap().is_none(),
+        "a watchdog restart is not a reason for the supervisor to exit"
+    );
 }

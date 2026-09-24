@@ -861,6 +861,8 @@ where
     // Which directory this daemon started on, not just whether *a* directory
     // exists at that path -- see `path_is_gone`.
     let root_identity = path_identity(root);
+    let mut self_watch = crate::watchdog::SelfWatch::new("watch");
+    let mut restart_for: Option<String> = None;
 
     loop {
         if stop_rx.try_recv().is_ok() {
@@ -962,6 +964,38 @@ where
                         "[watch] build-hash self-check couldn't run this interval, will retry"
                     );
                 }
+            }
+        }
+
+        // R5.2 (#19): the daemon watches its own resident memory, open file
+        // descriptors and threads. Over a soft ceiling it drops what can be
+        // rebuilt -- the HNSW cache, and the graph handle when nothing is
+        // using it, which frees lbug's buffer pool; the next request reopens
+        // it. Over a hard ceiling it leaves through the same clean shutdown
+        // as the build-hash check above, but only once no drain, full
+        // reindex or SCIP task is in flight: a write is never cut off, and
+        // the next request starts a fresh daemon.
+        let idle = drain_in_flight.is_none()
+            && full_reindex_in_flight.is_none()
+            && scip_in_flight.is_none()
+            && scip_import_in_flight.is_none();
+        match self_watch.check(std::time::Instant::now()) {
+            crate::watchdog::Action::DropCaches => {
+                crate::embed::invalidate_hnsw_cache();
+                if idle {
+                    poison_watch_db(&mut held_prism);
+                }
+            }
+            crate::watchdog::Action::Restart(why) => restart_for = Some(why),
+            crate::watchdog::Action::None => {}
+        }
+        if idle {
+            if let Some(why) = &restart_for {
+                eprintln!(
+                    "[watch] watchdog: {why} -- shutting down so the next request starts a \
+                     fresh daemon"
+                );
+                break;
             }
         }
 

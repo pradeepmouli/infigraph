@@ -29,6 +29,12 @@ fn search_ctx_lock() -> &'static Mutex<Option<SearchContext>> {
     SEARCH_CTX.get_or_init(|| Mutex::new(None))
 }
 
+/// Drop the cached search context; the next search rebuilds it from disk.
+/// The watchdog's soft response (#19).
+pub fn drop_search_cache() {
+    *search_ctx_lock().lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
 fn build_docs_from_rows(rows: &[Vec<String>]) -> Vec<(String, String)> {
     rows.iter()
         .map(|row| {

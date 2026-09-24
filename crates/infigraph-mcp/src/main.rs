@@ -95,6 +95,7 @@ fn main() -> Result<()> {
             .status()?;
         match worker_crash(&status) {
             Some(how) => restart_after_crash(&mut crashes, &how),
+            None if watchdog_restart(&status) => continue,
             None => std::process::exit(status.code().unwrap_or(1)),
         }
     }
@@ -258,6 +259,9 @@ fn supervise_stdio(args: &[String]) -> Result<()> {
                 let crash = worker_crash(&status);
                 let cause = match &crash {
                     Some(how) => format!("the worker crashed ({how})"),
+                    None if watchdog_restart(&status) => {
+                        "the worker restarted to recover resources (see mcp.log)".to_string()
+                    }
                     None => format!("the worker exited ({status})"),
                 };
                 for reply in outstanding
@@ -267,6 +271,7 @@ fn supervise_stdio(args: &[String]) -> Result<()> {
                 }
                 match crash {
                     Some(how) if client_open => restart_after_crash(&mut crashes, &how),
+                    None if client_open && watchdog_restart(&status) => {}
                     _ => std::process::exit(status.code().unwrap_or(1)),
                 }
             }
@@ -352,6 +357,11 @@ fn write_line(line: &str) -> Result<()> {
     out.write_all(b"\n")?;
     out.flush()?;
     Ok(())
+}
+
+/// Whether the worker exited so its watchdog could restart it (#19).
+fn watchdog_restart(status: &std::process::ExitStatus) -> bool {
+    status.code() == Some(infigraph_mcp::lifecycle::WATCHDOG_RESTART_EXIT)
 }
 
 /// How the worker crashed, if its exit was a crash: SIGSEGV on Unix, an
@@ -518,6 +528,8 @@ fn run() -> Result<()> {
             &format!("Reaped {reaped} orphaned instance(s) on startup"),
         );
     }
+
+    infigraph_mcp::lifecycle::spawn_self_watch();
 
     std::thread::spawn(|| loop {
         std::thread::sleep(infigraph_core::instances::reap_scan_interval());

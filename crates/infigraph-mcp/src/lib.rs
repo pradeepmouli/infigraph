@@ -729,6 +729,7 @@ pub fn handle_tools_call(id: &Value, request: &Value) -> Value {
     );
 
     tools::helpers::log_activity(tool_name, &args);
+    let _serving = lifecycle::SERVING.read().unwrap_or_else(|e| e.into_inner());
 
     // Test hook for R5.6 (#21), debug builds only: a call that never
     // returns, so the supervisor's deadline and crash answers can be
