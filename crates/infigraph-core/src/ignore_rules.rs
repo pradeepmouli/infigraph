@@ -116,11 +116,7 @@ struct Includes {
 fn configured_includes(project_root: &Path) -> Vec<(String, Trust)> {
     // The environment is this process's own, so it is trusted -- and it
     // replaces the files entirely, keeping the macro's usual precedence.
-    let env = Index::env_layer().unwrap_or_else(|e| {
-        eprintln!("warning: {e}; ignoring the environment for [index] include");
-        RawIndex::default()
-    });
-    if let Some(from_env) = env.index_include {
+    if let Some(from_env) = Index::env_layer().index_include {
         return from_env.0.into_iter().map(|e| (e, Trust::User)).collect();
     }
 

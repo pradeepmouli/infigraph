@@ -30,6 +30,21 @@ impl std::fmt::Display for SettingsError {
 
 impl std::error::Error for SettingsError {}
 
+/// Prints `warning: {message}` to stderr the first time this process sees
+/// `message`, and returns whether it printed. The fallback resolvers run in
+/// daemon loops and on every MCP request, where the same bad value would
+/// otherwise repeat its warning on every call.
+pub fn warn_once(message: &str) -> bool {
+    static SEEN: std::sync::Mutex<std::collections::BTreeSet<String>> =
+        std::sync::Mutex::new(std::collections::BTreeSet::new());
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    if !seen.insert(message.to_string()) {
+        return false;
+    }
+    eprintln!("warning: {message}");
+    true
+}
+
 /// `INFIGRAPH_{CATEGORY}_{FIELD}`, both upper-cased.
 pub fn env_name(category: &str, field: &str) -> String {
     format!(
@@ -247,7 +262,7 @@ macro_rules! settings {
                                 Ok(Some(value)) => value,
                                 Ok(None) => $default,
                                 Err(e) => {
-                                    eprintln!("warning: {e}; using the default");
+                                    $crate::settings::warn_once(&format!("{e}; using the default"));
                                     $default
                                 }
                             },
@@ -351,26 +366,18 @@ macro_rules! settings {
 
                 /// The env layer alone (legacy name, then convention name),
                 /// as a raw struct -- for a caller that consults its own
-                /// config source next.
+                /// config source next. A value that does not parse is
+                /// warned about and left unset; the group's other fields
+                /// keep theirs.
                 #[allow(dead_code)]
-                pub fn env_layer(
-                ) -> Result<[<Raw $category:camel>], $crate::settings::SettingsError> {
-                    let mut errors = Vec::new();
-                    let raw = [<Raw $category:camel>] {
+                pub fn env_layer() -> [<Raw $category:camel>] {
+                    [<Raw $category:camel>] {
                         $(
-                            [<$category _ $field>]: match Self::[<env_ $field>]() {
-                                Ok(value) => value,
-                                Err(e) => {
-                                    errors.push(e);
-                                    None
-                                }
-                            },
+                            [<$category _ $field>]: Self::[<env_ $field>]().unwrap_or_else(|e| {
+                                $crate::settings::warn_once(&format!("{e}; ignoring it"));
+                                None
+                            }),
                         )+
-                    };
-                    if errors.is_empty() {
-                        Ok(raw)
-                    } else {
-                        Err($crate::settings::SettingsError(errors))
                     }
                 }
 
@@ -913,5 +920,32 @@ mod tests {
         let err = ToyEnum::resolve_layers(RawToyEnum::parse_from(["test"]), &[]).unwrap_err();
         std::env::remove_var("INFIGRAPH_TOY_ENUM_COLOR");
         assert!(err.to_string().contains("red, blue"), "{err}");
+    }
+
+    /// Review fix: one bad variable must not take the group's good ones
+    /// with it -- `session`'s five legacy names used to all vanish because
+    /// `INFIGRAPH_TOKEN_BUDGET` alone did not parse.
+    #[test]
+    fn env_layer_drops_only_the_bad_field() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("INFIGRAPH_TOY_PAIR_NEAR", "x");
+        std::env::set_var("INFIGRAPH_TOY_PAIR_FAR", "20");
+        let raw = ToyPair::env_layer();
+        std::env::remove_var("INFIGRAPH_TOY_PAIR_NEAR");
+        std::env::remove_var("INFIGRAPH_TOY_PAIR_FAR");
+        assert_eq!(raw.toy_pair_near, None);
+        assert_eq!(raw.toy_pair_far, Some(20));
+    }
+
+    /// Review fix: `resolve_or_default` runs in daemon loops and on every
+    /// MCP request, so the same bad value must warn once, not every call.
+    #[test]
+    fn warn_once_prints_each_message_once() {
+        let message = "warn_once_prints_each_message_once: unique message";
+        assert!(super::warn_once(message));
+        assert!(!super::warn_once(message));
+        assert!(super::warn_once(
+            "warn_once_prints_each_message_once: another"
+        ));
     }
 }

@@ -34,13 +34,9 @@ infigraph_core::settings! {
 }
 
 /// The `session` group's env layer only -- `None` means "not set at this
-/// layer", so callers can consult config.toml next. A value that does not
-/// parse is reported and treated as unset.
+/// layer", so callers can consult config.toml next.
 fn session_cli() -> RawSession {
-    Session::env_layer().unwrap_or_else(|e| {
-        eprintln!("warning: {e}; ignoring the environment for session settings");
-        RawSession::default()
-    })
+    Session::env_layer()
 }
 
 /// `INFIGRAPH_KOMPRESS_DIR` / `INFIGRAPH_SESSION_KOMPRESS_DIR` override for

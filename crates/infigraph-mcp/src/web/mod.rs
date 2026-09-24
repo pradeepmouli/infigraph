@@ -303,27 +303,45 @@ infigraph_core::settings! {
     }
 }
 
-fn api_key() -> Option<String> {
-    Some(
-        Web::resolve_or_default(
-            RawWeb::default(),
-            infigraph_core::settings_file::ConfigScope::User,
-        )
-        .api_key,
+/// Strict, unlike most settings: an auth secret that does not resolve must
+/// not fall back to the empty default, which means "auth off".
+fn api_key() -> Result<Option<String>, infigraph_core::settings::SettingsError> {
+    Web::resolve(
+        RawWeb::default(),
+        infigraph_core::settings_file::ConfigScope::User,
     )
-    .filter(|k| !k.is_empty())
+    .map(|web| Some(web.api_key).filter(|k| !k.is_empty()))
+}
+
+/// The auth decision on its own: no key allows everything, a key requires
+/// the matching bearer token, and a key that does not resolve denies
+/// everything (fails closed).
+fn authorized(
+    key: Result<Option<String>, infigraph_core::settings::SettingsError>,
+    authorization: Option<&str>,
+) -> bool {
+    match key {
+        Err(e) => {
+            infigraph_core::settings::warn_once(&format!("{e}; denying every web request"));
+            false
+        }
+        Ok(None) => true,
+        Ok(Some(k)) => authorization == Some(format!("Bearer {k}").as_str()),
+    }
 }
 
 fn check_auth(request: &tiny_http::Request) -> bool {
-    let key = api_key();
-    match key {
-        None => true,
-        Some(k) => request.headers().iter().any(|h| {
-            let field: &str = h.field.as_str().as_str();
-            field.eq_ignore_ascii_case("authorization")
-                && h.value.as_str() == format!("Bearer {}", k).as_str()
-        }),
-    }
+    let authorization = request
+        .headers()
+        .iter()
+        .find(|h| {
+            h.field
+                .as_str()
+                .as_str()
+                .eq_ignore_ascii_case("authorization")
+        })
+        .map(|h| h.value.as_str());
+    authorized(api_key(), authorization)
 }
 
 fn handle_cors_preflight() -> Response<std::io::Cursor<Vec<u8>>> {
@@ -1045,5 +1063,37 @@ mod tests {
             !REINDEXING.load(Ordering::SeqCst),
             "REINDEXING flag should be cleared even after failure"
         );
+    }
+}
+
+#[cfg(test)]
+mod auth_tests {
+    use super::authorized;
+
+    fn bad_key() -> Result<Option<String>, infigraph_core::settings::SettingsError> {
+        Err(infigraph_core::settings::SettingsError(vec![
+            infigraph_core::settings::SettingError {
+                setting: "[web] api_key in config.toml".to_string(),
+                problem: "expected a string".to_string(),
+            },
+        ]))
+    }
+
+    /// Review fix: an API key that does not resolve (say `api_key = 12345`
+    /// in config.toml) must deny every request -- it used to fall back to
+    /// the empty default, which means "auth off".
+    #[test]
+    fn an_unresolvable_api_key_fails_closed() {
+        assert!(!authorized(bad_key(), None));
+        assert!(!authorized(bad_key(), Some("Bearer 12345")));
+    }
+
+    #[test]
+    fn no_key_allows_and_a_key_requires_the_matching_bearer() {
+        assert!(authorized(Ok(None), None));
+        let key = || Ok(Some("s3cret".to_string()));
+        assert!(authorized(key(), Some("Bearer s3cret")));
+        assert!(!authorized(key(), Some("Bearer wrong")));
+        assert!(!authorized(key(), None));
     }
 }
