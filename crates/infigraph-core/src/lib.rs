@@ -194,6 +194,18 @@ enum BackendKind {
 /// bare name that has to be spelled out; spell it out once.
 pub const BACKEND_ENV: &str = "INFIGRAPH_BACKEND";
 
+crate::settings_enum! {
+    /// Which graph backend a process uses (`INFIGRAPH_BACKEND`).
+    pub enum BackendChoice {
+        /// Open the graph in this process.
+        Kuzu = "kuzu",
+        /// Route reads and writes through this project's daemon.
+        Daemon = "daemon",
+        /// Remote Neo4j + Postgres.
+        Neo4j = "neo4j",
+    }
+}
+
 /// The backend value meaning "open the graph in this process", as opposed to
 /// routing through a daemon.
 ///
@@ -207,33 +219,36 @@ pub const BACKEND_ENV: &str = "INFIGRAPH_BACKEND";
 /// correctness, not preference: routing there means a daemon that routes to
 /// itself and deadlocks, or a probe that reports on a socket instead of the
 /// file it was asked about.
-pub const LOCAL_BACKEND: &str = "kuzu";
+pub const LOCAL_BACKEND: &str = BackendChoice::Kuzu.as_str();
 
 /// The backend value meaning "route through this project's daemon". Named
 /// here so the one place that decides the default and the one place that
 /// tests for it cannot drift apart.
-pub const DAEMON_BACKEND: &str = "daemon";
+pub const DAEMON_BACKEND: &str = BackendChoice::Daemon.as_str();
 
 crate::settings! {
     backend {
         #[legacy = "INFIGRAPH_BACKEND"]
-        selected: String = DAEMON_BACKEND.to_string(),
+        selected: BackendChoice = BackendChoice::Daemon,
     }
 }
 
-/// Resolves the active backend selector: CLI > env > TOML > default
-/// (`"kuzu"`). The single source of truth for `INFIGRAPH_BACKEND` --
-/// `daemon_backend_selected()` and `daemon::lifecycle::is_remote_backend()`
-/// are both thin wrappers over this.
-///
-/// `INFIGRAPH_BACKEND` predates the `settings!` macro and has no field
-/// suffix, so it can't go through the macro's generic
-/// `INFIGRAPH_{CATEGORY}_{FIELD}` env lookup (that would read
-/// `INFIGRAPH_BACKEND_SELECTED` instead). Read it directly and seed it into
-/// the CLI slot instead, which still outranks env/TOML/default in the
-/// macro's own precedence chain.
-pub fn selected_backend() -> String {
+/// The active backend, for callers that cannot fail: a value that does not
+/// parse is logged and the default used. `daemon_backend_selected()` and
+/// `daemon::lifecycle::is_remote_backend()` are thin wrappers over this.
+/// Anything about to open a store goes through [`validated_backend`]
+/// instead, so a typo stops the process rather than silently picking a
+/// backend (#74).
+pub fn selected_backend() -> BackendChoice {
     Backend::resolve_or_default(RawBackend::default(), settings_file::ConfigScope::User).selected
+}
+
+/// The active backend, or a Config error naming the bad value and the valid
+/// ones. Called at CLI/MCP startup and by every `Infigraph::init*`.
+pub fn validated_backend() -> Result<BackendChoice> {
+    Backend::resolve(RawBackend::default(), settings_file::ConfigScope::User)
+        .map(|backend| backend.selected)
+        .map_err(|e| anyhow::anyhow!("invalid backend setting: {e}"))
 }
 
 /// Whether `INFIGRAPH_BACKEND` selects the daemon backend. This is the exact
@@ -246,7 +261,7 @@ pub fn selected_backend() -> String {
 /// instance; that reports what was actually opened rather than what was
 /// requested.
 pub fn daemon_backend_selected() -> bool {
-    selected_backend() == DAEMON_BACKEND
+    selected_backend() == BackendChoice::Daemon
 }
 
 // Self-update / install plumbing (`infigraph install`, `infigraph update`,
@@ -394,36 +409,35 @@ impl Infigraph {
         // file exists. Guarding only `index()` was useless -- `init` had
         // already made the root look indexed by the time it ran.
         crate::daemon::ensure_watchable_root(&self.root)?;
-        if daemon_backend_selected() {
-            self.bootstrap_graph_for_routing()?;
-            let dk = graph::DaemonKuzuBackend::open(&self.root)?;
-            self.backend_kind = BackendKind::DaemonKuzu(dk);
-            // Selecting this backend implies daemon-mode watching: every
-            // covered write routes through a daemon, so without one running
-            // each would block for its full timeout before failing.
-            //
-            // Reads depend on it too now. They did not when this was
-            // written -- `open_read` opened the graph file directly -- but
-            // since reads were routed, no daemon means no reads at all.
-            crate::daemon::lifecycle::ensure_daemon_for_routed_access(&self.root)?;
-            return Ok(());
-        }
-
-        let backend_env = selected_backend();
-
-        match backend_env.as_str() {
+        // Validated, not `selected_backend()`: a value that does not parse
+        // must stop here rather than open some backend (#74).
+        match validated_backend()? {
+            BackendChoice::Daemon => {
+                self.bootstrap_graph_for_routing()?;
+                let dk = graph::DaemonKuzuBackend::open(&self.root)?;
+                self.backend_kind = BackendKind::DaemonKuzu(dk);
+                // Selecting this backend implies daemon-mode watching: every
+                // covered write routes through a daemon, so without one running
+                // each would block for its full timeout before failing.
+                //
+                // Reads depend on it too now. They did not when this was
+                // written -- `open_read` opened the graph file directly -- but
+                // since reads were routed, no daemon means no reads at all.
+                crate::daemon::lifecycle::ensure_daemon_for_routed_access(&self.root)?;
+                Ok(())
+            }
             #[cfg(feature = "neo4j")]
-            "neo4j" => {
+            BackendChoice::Neo4j => {
                 let neo = graph::Neo4jBackend::connect_from_env()?;
                 neo.init_schema()?;
                 self.backend_kind = BackendKind::Neo4j(neo);
                 Ok(())
             }
             #[cfg(not(feature = "neo4j"))]
-            "neo4j" => {
+            BackendChoice::Neo4j => {
                 anyhow::bail!("neo4j backend requested but binary compiled without `neo4j` feature")
             }
-            _ => match open_kuzu_with_retry(
+            BackendChoice::Kuzu => match open_kuzu_with_retry(
                 || graph::KuzuBackend::open(&self.db_path),
                 || graph::lock_probe::probe_graph_lock(&self.db_path, ProbeFor::Write),
                 std::time::Duration::from_secs(3),
@@ -641,27 +655,26 @@ impl Infigraph {
         // directly under INFIGRAPH_BACKEND=daemon, and "the daemon is the
         // only process that opens the graph" would be false for nearly
         // every read.
-        if daemon_backend_selected() {
-            crate::daemon::lifecycle::ensure_daemon_for_routed_access(&self.root)?;
-            let dk = graph::DaemonKuzuBackend::open(&self.root)?;
-            self.backend_kind = BackendKind::DaemonKuzu(dk);
-            return Ok(());
-        }
-
-        let backend_env = selected_backend();
-
-        match backend_env.as_str() {
+        // Validated, not `selected_backend()`: a value that does not parse
+        // must stop here rather than open some backend (#74).
+        match validated_backend()? {
+            BackendChoice::Daemon => {
+                crate::daemon::lifecycle::ensure_daemon_for_routed_access(&self.root)?;
+                let dk = graph::DaemonKuzuBackend::open(&self.root)?;
+                self.backend_kind = BackendKind::DaemonKuzu(dk);
+                Ok(())
+            }
             #[cfg(feature = "neo4j")]
-            "neo4j" => {
+            BackendChoice::Neo4j => {
                 let neo = graph::Neo4jBackend::connect_from_env()?;
                 self.backend_kind = BackendKind::Neo4j(neo);
                 Ok(())
             }
             #[cfg(not(feature = "neo4j"))]
-            "neo4j" => {
+            BackendChoice::Neo4j => {
                 anyhow::bail!("neo4j backend requested but binary compiled without `neo4j` feature")
             }
-            _ => {
+            BackendChoice::Kuzu => {
                 // Retry briefly on lock contention: a reader landing during a
                 // watcher's per-reindex write window should wait it out, not
                 // hard-fail (AIF3X-331 #36).
@@ -688,28 +701,28 @@ impl Infigraph {
         // directly under INFIGRAPH_BACKEND=daemon, and "the daemon is the
         // only process that opens the graph" would be false for nearly
         // every read.
-        if daemon_backend_selected() {
-            crate::daemon::lifecycle::ensure_daemon_for_routed_access(&self.root)?;
-            let dk = graph::DaemonKuzuBackend::open(&self.root)?;
-            self.backend_kind = BackendKind::DaemonKuzu(dk);
-            // No local graph file to degrade from -- the daemon owns it, the
-            // same reason the Neo4j arm returns None.
-            return Ok(None);
-        }
-
-        let backend_env = selected_backend();
-        match backend_env.as_str() {
+        // Validated, not `selected_backend()`: a value that does not parse
+        // must stop here rather than open some backend (#74).
+        match validated_backend()? {
+            BackendChoice::Daemon => {
+                crate::daemon::lifecycle::ensure_daemon_for_routed_access(&self.root)?;
+                let dk = graph::DaemonKuzuBackend::open(&self.root)?;
+                self.backend_kind = BackendKind::DaemonKuzu(dk);
+                // No local graph file to degrade from -- the daemon owns it, the
+                // same reason the Neo4j arm returns None.
+                Ok(None)
+            }
             #[cfg(feature = "neo4j")]
-            "neo4j" => {
+            BackendChoice::Neo4j => {
                 let neo = graph::Neo4jBackend::connect_from_env()?;
                 self.backend_kind = BackendKind::Neo4j(neo);
                 Ok(None)
             }
             #[cfg(not(feature = "neo4j"))]
-            "neo4j" => {
+            BackendChoice::Neo4j => {
                 anyhow::bail!("neo4j backend requested but binary compiled without `neo4j` feature")
             }
-            _ => {
+            BackendChoice::Kuzu => {
                 let (kb, reason) = open_kuzu_with_retry(
                     || graph::KuzuBackend::open_read_only_or_degrade(&self.db_path),
                     || graph::lock_probe::probe_graph_lock(&self.db_path, ProbeFor::Read),

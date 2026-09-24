@@ -423,6 +423,72 @@ macro_rules! settings {
     };
 }
 
+/// Declares an enum-valued setting type: each variant with the exact
+/// spelling it has in env vars, CLI flags and config.toml. Generates
+/// `FromStr` (whose error lists every valid spelling), `as_str`, `Display`,
+/// `FromTomlItem` and `Deserialize` -- everything a `settings!` field type
+/// needs.
+#[macro_export]
+macro_rules! settings_enum {
+    (
+        $(#[$meta:meta])*
+        $vis:vis enum $name:ident {
+            $( $(#[$vmeta:meta])* $variant:ident = $text:literal ),+ $(,)?
+        }
+    ) => {
+        $(#[$meta])*
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        $vis enum $name {
+            $( $(#[$vmeta])* $variant, )+
+        }
+
+        impl $name {
+            #[allow(dead_code)]
+            pub const ALL: &'static [Self] = &[$(Self::$variant),+];
+
+            pub const fn as_str(self) -> &'static str {
+                match self {
+                    $( Self::$variant => $text, )+
+                }
+            }
+        }
+
+        impl ::std::fmt::Display for $name {
+            fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+                f.write_str(self.as_str())
+            }
+        }
+
+        impl ::std::str::FromStr for $name {
+            type Err = String;
+            fn from_str(s: &str) -> Result<Self, String> {
+                match s {
+                    $( $text => Ok(Self::$variant), )+
+                    other => Err(format!(
+                        "unknown value {other:?}; expected one of: {}",
+                        [$($text),+].join(", ")
+                    )),
+                }
+            }
+        }
+
+        impl $crate::settings::FromTomlItem for $name {
+            fn from_toml_item(item: &$crate::toml_edit::Item) -> Result<Self, String> {
+                item.as_str()
+                    .ok_or_else(|| "expected a string".to_string())?
+                    .parse()
+            }
+        }
+
+        impl<'de> serde::Deserialize<'de> for $name {
+            fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+                let raw = <String as serde::Deserialize>::deserialize(d)?;
+                raw.parse().map_err(serde::de::Error::custom)
+            }
+        }
+    };
+}
+
 #[cfg(test)]
 mod tests {
     use super::{PathList, Toggle};
@@ -797,5 +863,55 @@ mod tests {
         assert!(
             ToyPaths::resolve_layers(RawToyPaths::parse_from(["test"]), &[doc.as_item()]).is_err()
         );
+    }
+
+    crate::settings_enum! {
+        pub enum ToyColor {
+            Red = "red",
+            Blue = "blue",
+        }
+    }
+
+    crate::settings! {
+        toy_enum {
+            color: ToyColor = ToyColor::Red,
+        }
+    }
+
+    #[test]
+    fn enum_parses_its_spelling_and_lists_valid_values_on_error() {
+        assert_eq!("blue".parse::<ToyColor>(), Ok(ToyColor::Blue));
+        assert_eq!(ToyColor::Blue.as_str(), "blue");
+        assert_eq!(ToyColor::Blue.to_string(), "blue");
+        let err = "green".parse::<ToyColor>().unwrap_err();
+        assert!(
+            err.contains("\"green\"") && err.contains("red, blue"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn enum_field_resolves_from_env_toml_and_cli() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("INFIGRAPH_TOY_ENUM_COLOR");
+        let doc: toml_edit::DocumentMut = "[toy_enum]\ncolor = \"blue\"".parse().unwrap();
+        let cli = RawToyEnum::parse_from(["test"]);
+        assert_eq!(
+            ToyEnum::resolve_layers(cli, &[doc.as_item()])
+                .unwrap()
+                .color,
+            ToyColor::Blue
+        );
+        let cli = RawToyEnum::parse_from(["test", "--toy-enum-color", "red"]);
+        assert_eq!(
+            ToyEnum::resolve_layers(cli, &[doc.as_item()])
+                .unwrap()
+                .color,
+            ToyColor::Red
+        );
+        std::env::set_var("INFIGRAPH_TOY_ENUM_COLOR", "green");
+        let err = ToyEnum::resolve_layers(RawToyEnum::parse_from(["test"]), &[]).unwrap_err();
+        std::env::remove_var("INFIGRAPH_TOY_ENUM_COLOR");
+        assert!(err.to_string().contains("red, blue"), "{err}");
     }
 }

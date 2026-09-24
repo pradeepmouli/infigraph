@@ -45,7 +45,7 @@ pub fn is_ci_env() -> bool {
 /// File watching is meaningless under remote mode: reindexing there is
 /// driven by webhooks, not local file-change events.
 pub fn is_remote_backend() -> bool {
-    crate::selected_backend() == "neo4j"
+    crate::selected_backend() == crate::BackendChoice::Neo4j
 }
 
 /// Whether daemon-mode watching is active. Aliases `daemon_backend_selected`
