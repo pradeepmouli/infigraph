@@ -1,5 +1,7 @@
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
+
+mod support;
 
 /// Spawns the real infigraph-mcp binary and asserts it writes its own
 /// instance file under INFIGRAPH_REGISTRY_INSTANCES_DIR while running, and removes
@@ -7,10 +9,10 @@ use std::time::{Duration, Instant};
 /// R2.2.3 already exercises, with a short grace so this test stays fast).
 #[test]
 fn worker_registers_and_deregisters_instance_file() {
-    let exe = env!("CARGO_BIN_EXE_infigraph-mcp");
     let dir = tempfile::tempdir().expect("tempdir");
+    let scratch = tempfile::tempdir().expect("scratch");
 
-    let mut child = Command::new(exe)
+    let mut child = support::isolated_mcp_command(scratch.path())
         .args(["--worker", "--ui", "--mcp", "--port=0"])
         .env("INFIGRAPH_REGISTRY_INSTANCES_DIR", dir.path())
         .env("INFIGRAPH_MCP_IDLE_GRACE_SECS", "2")
@@ -60,8 +62,8 @@ fn worker_registers_and_deregisters_instance_file() {
 /// scan-and-reap wiring runs, not just the pure logic it's built from.
 #[test]
 fn worker_reaps_stale_instance_file_on_startup() {
-    let exe = env!("CARGO_BIN_EXE_infigraph-mcp");
     let dir = tempfile::tempdir().expect("tempdir");
+    let scratch = tempfile::tempdir().expect("scratch");
 
     // A PID essentially guaranteed not to be a running process, with an
     // arbitrary recorded start time — current_process_start_time(999999)
@@ -73,7 +75,7 @@ fn worker_reaps_stale_instance_file_on_startup() {
     )
     .unwrap();
 
-    let mut child = Command::new(exe)
+    let mut child = support::isolated_mcp_command(scratch.path())
         .args(["--worker", "--ui", "--mcp", "--port=0"])
         .env("INFIGRAPH_REGISTRY_INSTANCES_DIR", dir.path())
         .env("INFIGRAPH_MCP_IDLE_GRACE_SECS", "2")

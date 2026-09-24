@@ -1,5 +1,7 @@
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
+
+mod support;
 
 /// Spawns the real infigraph-mcp binary in --worker --ui --mcp mode,
 /// closes its stdin immediately (simulating the MCP client disconnecting
@@ -9,8 +11,8 @@ use std::time::{Duration, Instant};
 /// this test runs in seconds, not minutes.
 #[test]
 fn worker_exits_after_idle_grace_following_stdin_close() {
-    let exe = env!("CARGO_BIN_EXE_infigraph-mcp");
-    let mut child = Command::new(exe)
+    let scratch = tempfile::tempdir().expect("scratch");
+    let mut child = support::isolated_mcp_command(scratch.path())
         .args(["--worker", "--ui", "--mcp", "--port=0"])
         .env("INFIGRAPH_MCP_IDLE_GRACE_SECS", "2")
         .env("INFIGRAPH_MCP_IDLE_POLL_SECS", "1")
@@ -50,8 +52,8 @@ fn worker_exits_after_idle_grace_following_stdin_close() {
 /// the test can report "still running" for the wrong reason.
 #[test]
 fn ui_only_daemon_without_mcp_flag_is_unaffected_by_idle_grace() {
-    let exe = env!("CARGO_BIN_EXE_infigraph-mcp");
-    let mut child = Command::new(exe)
+    let scratch = tempfile::tempdir().expect("scratch");
+    let mut child = support::isolated_mcp_command(scratch.path())
         .args(["--worker", "--ui", "--port=0"])
         .env("INFIGRAPH_MCP_IDLE_GRACE_SECS", "2")
         .env("INFIGRAPH_MCP_IDLE_POLL_SECS", "1")

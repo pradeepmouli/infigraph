@@ -280,3 +280,29 @@ fn wait_until_released(lock: &Path, budget: Duration) -> bool {
     }
     !daemon_is_alive(lock)
 }
+
+/// The real `infigraph-mcp` binary, unable to touch the developer's own
+/// server (#197). Without its own `INFIGRAPH_MCP_LOCK_PATH` a spawned
+/// worker competes for the live `~/.infigraph/mcp.lock`, and because a test
+/// build's hash never matches the installed one, it asks the live server to
+/// hand over -- which then exits -- and burns its own startup budget
+/// waiting on the takeover. Everything a worker writes outside its project
+/// goes under `scratch`: lock, log, instance registry, registry home and
+/// `HOME`; background watchers are off. Callers may override any of it.
+pub fn isolated_mcp_command(scratch: &Path) -> std::process::Command {
+    let instances = scratch.join("instances");
+    let registry = scratch.join("registry-home");
+    let home = scratch.join("home");
+    for dir in [&instances, &registry, &home] {
+        std::fs::create_dir_all(dir).expect("scratch dir for an isolated infigraph-mcp");
+    }
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_infigraph-mcp"));
+    cmd.env("INFIGRAPH_MCP_LOCK_PATH", scratch.join("mcp.lock"))
+        .env("INFIGRAPH_MCP_LOG_PATH", scratch.join("mcp.log"))
+        .env("INFIGRAPH_REGISTRY_INSTANCES_DIR", &instances)
+        .env("INFIGRAPH_REGISTRY_HOME", &registry)
+        .env("HOME", &home)
+        .env("INFIGRAPH_NO_WATCH", "1")
+        .env_remove("INFIGRAPH_WATCH_DAEMON");
+    cmd
+}
