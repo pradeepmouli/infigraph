@@ -28,7 +28,8 @@ infigraph_core::settings! {
 pub fn idle_grace_period() -> Duration {
     let cli = RawMcpIdle::parse_from(std::iter::empty::<String>());
     Duration::from_secs(
-        McpIdle::resolve(cli, infigraph_core::settings_file::ConfigScope::User).grace_secs,
+        McpIdle::resolve_or_default(cli, infigraph_core::settings_file::ConfigScope::User)
+            .grace_secs,
     )
 }
 
@@ -38,7 +39,8 @@ pub fn idle_grace_period() -> Duration {
 pub fn idle_poll_interval() -> Duration {
     let cli = RawMcpIdle::parse_from(std::iter::empty::<String>());
     Duration::from_secs(
-        McpIdle::resolve(cli, infigraph_core::settings_file::ConfigScope::User).poll_secs,
+        McpIdle::resolve_or_default(cli, infigraph_core::settings_file::ConfigScope::User)
+            .poll_secs,
     )
 }
 

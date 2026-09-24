@@ -128,9 +128,11 @@ pub async fn run_producer(
     // coalesces into a single whole-project pass instead of per-file
     // updates. Overridable via INFIGRAPH_WATCH_STORM_THRESHOLD for tests/tuning.
     let cli = crate::watch::RawWatch::parse_from(std::iter::empty::<String>());
-    let storm_threshold: usize =
-        crate::watch::Watch::resolve(cli, crate::settings_file::ConfigScope::Project(&root))
-            .storm_threshold as usize;
+    let storm_threshold: usize = crate::watch::Watch::resolve_or_default(
+        cli,
+        crate::settings_file::ConfigScope::Project(&root),
+    )
+    .storm_threshold as usize;
 
     let (mut watcher, mut rx) = match create_watcher(&root, debounce_ms) {
         Ok(pair) => pair,

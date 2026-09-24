@@ -35,7 +35,8 @@ const PREVIOUS_RETENTION: usize = 1;
 /// (`INFIGRAPH_GRAPH_QUARANTINE_MAX_BYTES`; 0 disables the cap).
 fn quarantine_max_bytes(infigraph_dir: &Path) -> u64 {
     let scope = crate::settings_file::ConfigScope::of_infigraph_dir(Some(infigraph_dir));
-    crate::graph::Graph::resolve(crate::graph::RawGraph::default(), scope).quarantine_max_bytes
+    crate::graph::Graph::resolve_or_default(crate::graph::RawGraph::default(), scope)
+        .quarantine_max_bytes
 }
 
 fn now_epoch_secs() -> u64 {

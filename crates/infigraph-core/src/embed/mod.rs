@@ -88,16 +88,14 @@ pub fn read_generation_marker(sidecar_path: &Path) -> Option<i64> {
 // -- `find_model_dir` falls through to the installed/repo model dirs.
 crate::settings! {
     embed {
+        #[legacy = "INFIGRAPH_MODEL_DIR"]
         model_dir: String = String::new(),
     }
 }
 
 /// Resolves the `embed` group -- see the group's declaration above.
 pub fn embed_settings() -> Embed {
-    let cli = RawEmbed {
-        embed_model_dir: crate::settings::legacy_env("INFIGRAPH_MODEL_DIR"),
-    };
-    Embed::resolve(cli, crate::settings_file::ConfigScope::User)
+    Embed::resolve_or_default(RawEmbed::default(), crate::settings_file::ConfigScope::User)
 }
 
 struct CachedEmbeddings {

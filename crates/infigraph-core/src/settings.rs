@@ -2,46 +2,83 @@
 //! (clap), env vars, and TOML config with zero per-field naming attributes.
 //! See docs/superpowers/specs/2026-08-31-settings-macro-design.md.
 
-/// Reads `INFIGRAPH_{CATEGORY}_{FIELD}` (both upper-cased) and parses it.
-/// Returns `None` if unset or unparseable -- the caller falls through to
-/// the next precedence layer (TOML, then hardcoded default) in that case.
-pub fn env_override<T: std::str::FromStr>(category: &str, field: &str) -> Option<T> {
-    let key = format!(
+/// One setting that could not be resolved: `setting` names where it came
+/// from (`INFIGRAPH_X_Y`, or `[x] y in config.toml`), `problem` says why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettingError {
+    pub setting: String,
+    pub problem: String,
+}
+
+impl std::fmt::Display for SettingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.setting, self.problem)
+    }
+}
+
+/// Every setting in a group that could not be resolved -- all of them, so
+/// one run shows every typo rather than one per attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettingsError(pub Vec<SettingError>);
+
+impl std::fmt::Display for SettingsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let parts: Vec<String> = self.0.iter().map(ToString::to_string).collect();
+        f.write_str(&parts.join("; "))
+    }
+}
+
+impl std::error::Error for SettingsError {}
+
+/// `INFIGRAPH_{CATEGORY}_{FIELD}`, both upper-cased.
+pub fn env_name(category: &str, field: &str) -> String {
+    format!(
         "INFIGRAPH_{}_{}",
         category.to_ascii_uppercase(),
         field.to_ascii_uppercase()
-    );
-    std::env::var(key).ok().and_then(|v| v.parse().ok())
+    )
 }
 
-/// Reads a pre-macro env var by its legacy, non-convention name (e.g.
-/// `INFIGRAPH_ORG`) for seeding into a settings group's CLI slot before
-/// `resolve()`. The CLI slot outranks the macro's own env/TOML/default
-/// layers, so the legacy name keeps winning without a second lookup
-/// mechanism -- see `selected_backend()` for the precedent. Only for names
-/// that exist upstream (they must keep working unchanged); fork-only names
-/// are renamed to the convention instead.
-pub fn legacy_env<T: std::str::FromStr>(name: &str) -> Option<T> {
-    std::env::var(name).ok().and_then(|v| v.parse().ok())
+/// Reads and parses env var `name`. Unset is `Ok(None)`; set but
+/// unparseable -- including empty -- is an error naming the variable and
+/// the value, never a silent fall-through to the next layer.
+pub fn env_value<T: std::str::FromStr>(name: &str) -> Result<Option<T>, SettingError>
+where
+    T::Err: std::fmt::Display,
+{
+    match std::env::var(name) {
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(SettingError {
+            setting: name.to_string(),
+            problem: "is not valid UTF-8".to_string(),
+        }),
+        Ok(raw) => raw.parse().map(Some).map_err(|e| SettingError {
+            setting: name.to_string(),
+            problem: format!("{raw:?} is not valid: {e}"),
+        }),
+    }
 }
 
-/// Reads a single field out of a `toml_edit` section by name. Implemented
-/// per concrete type actually used by a settings group -- add an impl the
-/// first time a group needs a new field type, rather than speculatively
-/// covering every possible type up front.
+/// Reads one field out of a `toml_edit` item. `Err` carries why the value
+/// is unusable; a key that is absent never reaches this. Implemented per
+/// concrete type a settings group actually uses -- add an impl the first
+/// time a group needs a new field type.
 pub trait FromTomlItem: Sized {
-    fn from_toml_item(item: &toml_edit::Item) -> Option<Self>;
+    fn from_toml_item(item: &toml_edit::Item) -> Result<Self, String>;
 }
 
 impl FromTomlItem for u64 {
-    fn from_toml_item(item: &toml_edit::Item) -> Option<Self> {
-        item.as_integer().and_then(|i| u64::try_from(i).ok())
+    fn from_toml_item(item: &toml_edit::Item) -> Result<Self, String> {
+        let i = item.as_integer().ok_or("expected an integer")?;
+        u64::try_from(i).map_err(|_| format!("{i} must not be negative"))
     }
 }
 
 impl FromTomlItem for String {
-    fn from_toml_item(item: &toml_edit::Item) -> Option<Self> {
-        item.as_str().map(str::to_string)
+    fn from_toml_item(item: &toml_edit::Item) -> Result<Self, String> {
+        item.as_str()
+            .map(str::to_string)
+            .ok_or_else(|| "expected a string".to_string())
     }
 }
 
@@ -65,8 +102,10 @@ impl std::str::FromStr for Toggle {
 }
 
 impl FromTomlItem for Toggle {
-    fn from_toml_item(item: &toml_edit::Item) -> Option<Self> {
-        item.as_bool().map(Toggle)
+    fn from_toml_item(item: &toml_edit::Item) -> Result<Self, String> {
+        item.as_bool()
+            .map(Toggle)
+            .ok_or_else(|| "expected true or false".to_string())
     }
 }
 
@@ -92,20 +131,32 @@ impl std::str::FromStr for PathList {
 }
 
 impl FromTomlItem for PathList {
-    /// A non-array item states nothing rather than erroring, matching every
-    /// other impl here: a malformed value falls through to the next layer.
-    fn from_toml_item(item: &toml_edit::Item) -> Option<Self> {
-        let array = item.as_array()?;
-        Some(PathList(
-            array
-                .iter()
-                .filter_map(|value| value.as_str())
-                .map(str::trim)
-                .filter(|entry| !entry.is_empty())
-                .map(str::to_string)
-                .collect(),
-        ))
+    /// Anything but an array of strings is an error: a lone string is the
+    /// likely mistake (`include = "vendor"`), and silently reading it as no
+    /// entries would hide it.
+    fn from_toml_item(item: &toml_edit::Item) -> Result<Self, String> {
+        const EXPECTED: &str = "expected an array of strings";
+        let array = item.as_array().ok_or(EXPECTED)?;
+        let mut entries = Vec::new();
+        for value in array.iter() {
+            let entry = value.as_str().ok_or(EXPECTED)?.trim();
+            if !entry.is_empty() {
+                entries.push(entry.to_string());
+            }
+        }
+        Ok(PathList(entries))
     }
+}
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! __settings_default {
+    () => {
+        None
+    };
+    ($default:expr) => {
+        Some($default)
+    };
 }
 
 /// Declares a settings group. `$category` (a single, possibly-underscored
@@ -123,13 +174,102 @@ impl FromTomlItem for PathList {
 /// tokens, and `module_path!()`'s value is a runtime string macro_rules!
 /// cannot re-tokenize without a proc-macro -- see the spec's "Convention"
 /// section for the full reasoning.
+///
+/// Each field is `name: Type = default` or, for a required setting, just
+/// `name: Type`. A field may carry `#[legacy = "NAME"]` for a pre-macro env
+/// var name that must keep working; it ranks just below the CLI.
+/// Precedence: CLI > legacy name > `INFIGRAPH_{CATEGORY}_{FIELD}` > TOML
+/// (nearest layer first) > declared default.
+///
+/// `resolve` is strict: a value that does not parse, or a required field
+/// left unset, is an error, and every one in the group is reported. Only a
+/// group whose every field declares a default also gets `impl Default` and
+/// `resolve_or_default`, which logs a bad value and uses that field's
+/// default -- a group with a required field has no default to fall back to:
+///
+/// ```compile_fail
+/// infigraph_core::settings! { doc_req { name: String } }
+/// let _ = DocReq::default();
+/// ```
+///
+/// ```
+/// infigraph_core::settings! { doc_def { name: String = String::new() } }
+/// let _ = DocDef::default();
+/// ```
 #[macro_export]
 macro_rules! settings {
+    // Every field declares a default: the group also gets `Default` and the
+    // logged-fallback resolvers. Tried first; a group with any required
+    // field fails to match this arm and takes the next one.
     (
         $category:ident {
-            $( $field:ident : $ty:ty = $default:expr ),+ $(,)?
+            $( $(#[legacy = $legacy:literal])? $field:ident : $ty:ty = $default:expr ),+ $(,)?
         }
     ) => {
+        $crate::settings!(@group $category {
+            $( $(#[legacy = $legacy])? $field : $ty = $default ),+
+        });
+
+        $crate::paste::paste! {
+            impl Default for [<$category:camel>] {
+                fn default() -> Self {
+                    Self { $( $field: $default, )+ }
+                }
+            }
+
+            impl [<$category:camel>] {
+                /// [`resolve`](Self::resolve), but a value that does not
+                /// parse is logged and replaced by that field's declared
+                /// default instead of failing -- for the infallible helpers
+                /// that run inside long-lived processes, where a config file
+                /// edited mid-run must not take the process down.
+                #[allow(dead_code)]
+                pub fn resolve_or_default(
+                    cli: [<Raw $category:camel>],
+                    scope: $crate::settings_file::ConfigScope<'_>,
+                ) -> Self {
+                    let docs = $crate::settings_file::layers(scope);
+                    let layers: Vec<&$crate::toml_edit::Item> =
+                        docs.iter().flatten().map(|doc| doc.as_item()).collect();
+                    Self::resolve_layers_or_default(cli, &layers)
+                }
+
+                /// [`resolve_or_default`](Self::resolve_or_default) over
+                /// explicit config documents, nearest layer first.
+                #[allow(dead_code)]
+                pub fn resolve_layers_or_default(
+                    cli: [<Raw $category:camel>],
+                    layers: &[&$crate::toml_edit::Item],
+                ) -> Self {
+                    Self {
+                        $(
+                            $field: match Self::[<resolve_ $field>](&cli, layers) {
+                                Ok(Some(value)) => value,
+                                Ok(None) => $default,
+                                Err(e) => {
+                                    eprintln!("warning: {e}; using the default");
+                                    $default
+                                }
+                            },
+                        )+
+                    }
+                }
+            }
+        }
+    };
+    // Some field is required (no `= default`): strict resolution only.
+    (
+        $category:ident {
+            $( $(#[legacy = $legacy:literal])? $field:ident : $ty:ty $(= $default:expr)? ),+ $(,)?
+        }
+    ) => {
+        $crate::settings!(@group $category {
+            $( $(#[legacy = $legacy])? $field : $ty $(= $default)? ),+
+        });
+    };
+    (@group $category:ident {
+        $( $(#[legacy = $legacy:literal])? $field:ident : $ty:ty $(= $default:expr)? ),+
+    }) => {
         $crate::paste::paste! {
             #[derive(Debug, Clone, Default, clap::Parser, serde::Deserialize)]
             pub struct [<Raw $category:camel>] {
@@ -145,22 +285,20 @@ macro_rules! settings {
             }
 
             impl [<$category:camel>] {
-                /// Resolves this group's settings: CLI > env > TOML > default,
-                /// per field. The TOML layer is this group's `[category]`
-                /// section of each `config.toml` that `scope` consults (see
-                /// `settings_file`).
+                /// Resolves this group: CLI > legacy env name > convention
+                /// env name > TOML (nearest layer first) > declared default.
+                /// Every value that does not parse, and every required field
+                /// left unset, is reported -- all of them at once.
                 ///
                 /// Loading the files here rather than taking a section
                 /// parameter is the point of #160: when the section was a
                 /// parameter, every production caller passed `None` and no
                 /// config file ever reached a setting.
-                // A group only ever driven through `resolve_layers` (the
-                // test-only toy groups) leaves this unused.
                 #[allow(dead_code)]
                 pub fn resolve(
                     cli: [<Raw $category:camel>],
                     scope: $crate::settings_file::ConfigScope<'_>,
-                ) -> Self {
+                ) -> Result<Self, $crate::settings::SettingsError> {
                     let docs = $crate::settings_file::layers(scope);
                     let layers: Vec<&$crate::toml_edit::Item> =
                         docs.iter().flatten().map(|doc| doc.as_item()).collect();
@@ -170,29 +308,116 @@ macro_rules! settings {
                 /// [`resolve`](Self::resolve) over explicit config documents,
                 /// nearest layer first. A key the nearer layer does not state
                 /// falls through to the next one.
+                #[allow(dead_code)]
                 pub fn resolve_layers(
                     cli: [<Raw $category:camel>],
                     layers: &[&$crate::toml_edit::Item],
-                ) -> Self {
-                    Self {
+                ) -> Result<Self, $crate::settings::SettingsError> {
+                    let mut errors = Vec::new();
+                    $(
+                        let $field: Option<$ty> = match Self::[<resolve_ $field>](&cli, layers) {
+                            Ok(Some(value)) => Some(value),
+                            Ok(None) => {
+                                let default: Option<$ty> =
+                                    $crate::__settings_default!($($default)?);
+                                if default.is_none() {
+                                    errors.push($crate::settings::SettingError {
+                                        setting: $crate::settings::env_name(
+                                            stringify!($category),
+                                            stringify!($field),
+                                        ),
+                                        problem: format!(
+                                            "is required (or set [{}] {} in config.toml)",
+                                            stringify!($category),
+                                            stringify!($field),
+                                        ),
+                                    });
+                                }
+                                default
+                            }
+                            Err(e) => {
+                                errors.push(e);
+                                None
+                            }
+                        };
+                    )+
+                    if !errors.is_empty() {
+                        return Err($crate::settings::SettingsError(errors));
+                    }
+                    Ok(Self {
+                        $( $field: $field.expect("no error means every field resolved"), )+
+                    })
+                }
+
+                /// The env layer alone (legacy name, then convention name),
+                /// as a raw struct -- for a caller that consults its own
+                /// config source next.
+                #[allow(dead_code)]
+                pub fn env_layer(
+                ) -> Result<[<Raw $category:camel>], $crate::settings::SettingsError> {
+                    let mut errors = Vec::new();
+                    let raw = [<Raw $category:camel>] {
                         $(
-                            $field: cli.[<$category _ $field>]
-                                .clone()
-                                .or_else(|| $crate::settings::env_override(
-                                    stringify!($category),
-                                    stringify!($field),
-                                ))
-                                .or_else(|| {
-                                    layers.iter().find_map(|doc| {
-                                        doc.get(stringify!($category))
-                                            .and_then(|s| s.get(stringify!($field)))
-                                            .and_then(<$ty as $crate::settings::FromTomlItem>::from_toml_item)
-                                    })
-                                })
-                                .unwrap_or($default),
+                            [<$category _ $field>]: match Self::[<env_ $field>]() {
+                                Ok(value) => value,
+                                Err(e) => {
+                                    errors.push(e);
+                                    None
+                                }
+                            },
                         )+
+                    };
+                    if errors.is_empty() {
+                        Ok(raw)
+                    } else {
+                        Err($crate::settings::SettingsError(errors))
                     }
                 }
+
+                $(
+                    fn [<env_ $field>](
+                    ) -> Result<Option<$ty>, $crate::settings::SettingError> {
+                        $(
+                            if let Some(value) = $crate::settings::env_value::<$ty>($legacy)? {
+                                return Ok(Some(value));
+                            }
+                        )?
+                        $crate::settings::env_value::<$ty>(&$crate::settings::env_name(
+                            stringify!($category),
+                            stringify!($field),
+                        ))
+                    }
+
+                    fn [<resolve_ $field>](
+                        cli: &[<Raw $category:camel>],
+                        layers: &[&$crate::toml_edit::Item],
+                    ) -> Result<Option<$ty>, $crate::settings::SettingError> {
+                        if let Some(value) = cli.[<$category _ $field>].clone() {
+                            return Ok(Some(value));
+                        }
+                        if let Some(value) = Self::[<env_ $field>]()? {
+                            return Ok(Some(value));
+                        }
+                        for doc in layers {
+                            if let Some(item) = doc
+                                .get(stringify!($category))
+                                .and_then(|section| section.get(stringify!($field)))
+                            {
+                                return <$ty as $crate::settings::FromTomlItem>::from_toml_item(item)
+                                    .map(Some)
+                                    .map_err(|problem| $crate::settings::SettingError {
+                                        setting: format!(
+                                            "[{}] {} in config.toml",
+                                            stringify!($category),
+                                            stringify!($field),
+                                        ),
+                                        problem,
+                                    });
+                            }
+                        }
+                        Ok(None)
+                    }
+                )+
             }
         }
     };
@@ -220,7 +445,7 @@ mod tests {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var("INFIGRAPH_TOY_GROUP_GRACE_SECS");
         let cli = RawToyGroup::parse_from(["test"]);
-        assert_eq!(ToyGroup::resolve_layers(cli, &[]).grace_secs, 300);
+        assert_eq!(ToyGroup::resolve_layers(cli, &[]).unwrap().grace_secs, 300);
     }
 
     #[test]
@@ -228,7 +453,7 @@ mod tests {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("INFIGRAPH_TOY_GROUP_GRACE_SECS", "42");
         let cli = RawToyGroup::parse_from(["test"]);
-        assert_eq!(ToyGroup::resolve_layers(cli, &[]).grace_secs, 42);
+        assert_eq!(ToyGroup::resolve_layers(cli, &[]).unwrap().grace_secs, 42);
         std::env::remove_var("INFIGRAPH_TOY_GROUP_GRACE_SECS");
     }
 
@@ -241,12 +466,17 @@ mod tests {
 
         let cli = RawToyGroup::parse_from(["test"]);
         assert_eq!(
-            ToyGroup::resolve_layers(cli.clone(), &layers).grace_secs,
+            ToyGroup::resolve_layers(cli.clone(), &layers)
+                .unwrap()
+                .grace_secs,
             99
         );
 
         std::env::set_var("INFIGRAPH_TOY_GROUP_GRACE_SECS", "42");
-        assert_eq!(ToyGroup::resolve_layers(cli, &layers).grace_secs, 42);
+        assert_eq!(
+            ToyGroup::resolve_layers(cli, &layers).unwrap().grace_secs,
+            42
+        );
         std::env::remove_var("INFIGRAPH_TOY_GROUP_GRACE_SECS");
     }
 
@@ -272,7 +502,8 @@ mod tests {
         let got = ToyPair::resolve_layers(
             RawToyPair::parse_from(["test"]),
             &[project.as_item(), user.as_item()],
-        );
+        )
+        .unwrap();
         assert_eq!(got, ToyPair { near: 10, far: 30 });
     }
 
@@ -285,7 +516,8 @@ mod tests {
         let doc: toml_edit::DocumentMut = "grace_secs = 1\n[toy_other]\ngrace_secs = 2"
             .parse()
             .unwrap();
-        let got = ToyGroup::resolve_layers(RawToyGroup::parse_from(["test"]), &[doc.as_item()]);
+        let got =
+            ToyGroup::resolve_layers(RawToyGroup::parse_from(["test"]), &[doc.as_item()]).unwrap();
         assert_eq!(got.grace_secs, 300);
     }
 
@@ -303,7 +535,7 @@ mod tests {
 
         let cli = RawToyGroup::parse_from(["test"]);
         let scope = crate::settings_file::ConfigScope::Project(tmp.path());
-        assert_eq!(ToyGroup::resolve(cli, scope).grace_secs, 99);
+        assert_eq!(ToyGroup::resolve(cli, scope).unwrap().grace_secs, 99);
     }
 
     #[test]
@@ -311,7 +543,7 @@ mod tests {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("INFIGRAPH_TOY_GROUP_GRACE_SECS", "42");
         let cli = RawToyGroup::parse_from(["test", "--toy-group-grace-secs", "7"]);
-        assert_eq!(ToyGroup::resolve_layers(cli, &[]).grace_secs, 7);
+        assert_eq!(ToyGroup::resolve_layers(cli, &[]).unwrap().grace_secs, 7);
         std::env::remove_var("INFIGRAPH_TOY_GROUP_GRACE_SECS");
     }
 
@@ -343,8 +575,8 @@ mod tests {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var("INFIGRAPH_TOY_A_VALUE");
         std::env::remove_var("INFIGRAPH_TOY_B_VALUE");
-        let a = ToyA::resolve_layers(RawToyA::parse_from(["test"]), &[]);
-        let b = ToyB::resolve_layers(RawToyB::parse_from(["test"]), &[]);
+        let a = ToyA::resolve_layers(RawToyA::parse_from(["test"]), &[]).unwrap();
+        let b = ToyB::resolve_layers(RawToyB::parse_from(["test"]), &[]).unwrap();
         assert_eq!(a.value, 1);
         assert_eq!(b.value, 2);
     }
@@ -362,7 +594,7 @@ mod tests {
         let doc: toml_edit::DocumentMut = "[toy_str]\nname = \"from-toml\"".parse().unwrap();
         let cli = RawToyStr::parse_from(["test"]);
         assert_eq!(
-            ToyStr::resolve_layers(cli, &[doc.as_item()]).name,
+            ToyStr::resolve_layers(cli, &[doc.as_item()]).unwrap().name,
             "from-toml"
         );
     }
@@ -379,28 +611,28 @@ mod tests {
         std::env::set_var("INFIGRAPH_TOY_TOGGLE_FLAG", "1");
         let cli = RawToyToggle::parse_from(["test"]);
         assert!(
-            ToyToggle::resolve_layers(cli, &[]).flag.0,
+            ToyToggle::resolve_layers(cli, &[]).unwrap().flag.0,
             "\"1\" must be treated as true"
         );
 
         std::env::set_var("INFIGRAPH_TOY_TOGGLE_FLAG", "0");
         let cli = RawToyToggle::parse_from(["test"]);
         assert!(
-            !ToyToggle::resolve_layers(cli, &[]).flag.0,
+            !ToyToggle::resolve_layers(cli, &[]).unwrap().flag.0,
             "\"0\" must be treated as false"
         );
 
         std::env::set_var("INFIGRAPH_TOY_TOGGLE_FLAG", "false");
         let cli = RawToyToggle::parse_from(["test"]);
         assert!(
-            !ToyToggle::resolve_layers(cli, &[]).flag.0,
+            !ToyToggle::resolve_layers(cli, &[]).unwrap().flag.0,
             "\"false\" (any case) must be treated as false"
         );
 
         std::env::remove_var("INFIGRAPH_TOY_TOGGLE_FLAG");
         let cli = RawToyToggle::parse_from(["test"]);
         assert!(
-            ToyToggle::resolve_layers(cli, &[]).flag.0,
+            ToyToggle::resolve_layers(cli, &[]).unwrap().flag.0,
             "unset must fall through to the hardcoded default (true)"
         );
     }
@@ -421,7 +653,9 @@ mod tests {
                 .unwrap();
         let cli = RawToyPaths::parse_from(["test"]);
         assert_eq!(
-            ToyPaths::resolve_layers(cli, &[doc.as_item()]).include,
+            ToyPaths::resolve_layers(cli, &[doc.as_item()])
+                .unwrap()
+                .include,
             PathList(vec![
                 "node_modules/lib".to_string(),
                 "vendor/sdk".to_string()
@@ -440,7 +674,7 @@ mod tests {
             "node_modules/lib, vendor/sdk",
         );
         let cli = RawToyPaths::parse_from(["test"]);
-        let got = ToyPaths::resolve_layers(cli, &[]).include;
+        let got = ToyPaths::resolve_layers(cli, &[]).unwrap().include;
         std::env::remove_var("INFIGRAPH_TOY_PATHS_INCLUDE");
         assert_eq!(
             got,
@@ -458,8 +692,110 @@ mod tests {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("INFIGRAPH_TOY_PATHS_INCLUDE", "");
         let cli = RawToyPaths::parse_from(["test"]);
-        let got = ToyPaths::resolve_layers(cli, &[]).include;
+        let got = ToyPaths::resolve_layers(cli, &[]).unwrap().include;
         std::env::remove_var("INFIGRAPH_TOY_PATHS_INCLUDE");
         assert_eq!(got, PathList(Vec::new()));
+    }
+
+    crate::settings! {
+        toy_req {
+            name: String,
+            count: u64 = 3,
+        }
+    }
+
+    crate::settings! {
+        toy_legacy {
+            #[legacy = "INFIGRAPH_TOY_OLD_NAME"]
+            value: u64 = 1,
+        }
+    }
+
+    #[test]
+    fn a_bad_env_value_is_an_error_naming_the_variable_and_value() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("INFIGRAPH_TOY_GROUP_GRACE_SECS", "soon");
+        let err = ToyGroup::resolve_layers(RawToyGroup::parse_from(["test"]), &[]).unwrap_err();
+        std::env::remove_var("INFIGRAPH_TOY_GROUP_GRACE_SECS");
+        let msg = err.to_string();
+        assert!(msg.contains("INFIGRAPH_TOY_GROUP_GRACE_SECS"), "{msg}");
+        assert!(msg.contains("\"soon\""), "{msg}");
+    }
+
+    #[test]
+    fn a_bad_toml_value_is_an_error_naming_the_key() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("INFIGRAPH_TOY_GROUP_GRACE_SECS");
+        let doc: toml_edit::DocumentMut = "[toy_group]\ngrace_secs = \"soon\"".parse().unwrap();
+        let err = ToyGroup::resolve_layers(RawToyGroup::parse_from(["test"]), &[doc.as_item()])
+            .unwrap_err();
+        assert!(err.to_string().contains("[toy_group] grace_secs"), "{err}");
+    }
+
+    #[test]
+    fn every_bad_value_is_reported_not_just_the_first() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("INFIGRAPH_TOY_PAIR_NEAR", "x");
+        std::env::set_var("INFIGRAPH_TOY_PAIR_FAR", "y");
+        let err = ToyPair::resolve_layers(RawToyPair::parse_from(["test"]), &[]).unwrap_err();
+        std::env::remove_var("INFIGRAPH_TOY_PAIR_NEAR");
+        std::env::remove_var("INFIGRAPH_TOY_PAIR_FAR");
+        assert_eq!(err.0.len(), 2, "{err}");
+    }
+
+    #[test]
+    fn a_required_field_that_is_unset_is_an_error() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("INFIGRAPH_TOY_REQ_NAME");
+        let err = ToyReq::resolve_layers(RawToyReq::parse_from(["test"]), &[]).unwrap_err();
+        assert!(err.to_string().contains("INFIGRAPH_TOY_REQ_NAME"), "{err}");
+        assert!(err.to_string().contains("required"), "{err}");
+
+        std::env::set_var("INFIGRAPH_TOY_REQ_NAME", "x");
+        let got = ToyReq::resolve_layers(RawToyReq::parse_from(["test"]), &[]).unwrap();
+        std::env::remove_var("INFIGRAPH_TOY_REQ_NAME");
+        assert_eq!((got.name.as_str(), got.count), ("x", 3));
+    }
+
+    #[test]
+    fn legacy_name_outranks_the_convention_name() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("INFIGRAPH_TOY_OLD_NAME", "7");
+        std::env::set_var("INFIGRAPH_TOY_LEGACY_VALUE", "9");
+        let got = ToyLegacy::resolve_layers(RawToyLegacy::parse_from(["test"]), &[]).unwrap();
+        std::env::remove_var("INFIGRAPH_TOY_LEGACY_VALUE");
+        assert_eq!(got.value, 7);
+
+        std::env::set_var("INFIGRAPH_TOY_OLD_NAME", "seven");
+        let err = ToyLegacy::resolve_layers(RawToyLegacy::parse_from(["test"]), &[]).unwrap_err();
+        std::env::remove_var("INFIGRAPH_TOY_OLD_NAME");
+        assert!(err.to_string().contains("INFIGRAPH_TOY_OLD_NAME"), "{err}");
+    }
+
+    #[test]
+    fn resolve_or_default_uses_the_default_for_a_bad_value() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("INFIGRAPH_TOY_PAIR_NEAR", "x");
+        std::env::set_var("INFIGRAPH_TOY_PAIR_FAR", "20");
+        let got = ToyPair::resolve_layers_or_default(RawToyPair::parse_from(["test"]), &[]);
+        std::env::remove_var("INFIGRAPH_TOY_PAIR_NEAR");
+        std::env::remove_var("INFIGRAPH_TOY_PAIR_FAR");
+        // Only the bad field falls back; the good one keeps its value.
+        assert_eq!(got, ToyPair { near: 1, far: 20 });
+    }
+
+    #[test]
+    fn default_impl_is_built_from_the_declared_defaults() {
+        assert_eq!(ToyPair::default(), ToyPair { near: 1, far: 2 });
+    }
+
+    #[test]
+    fn a_non_array_path_list_in_toml_is_an_error() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("INFIGRAPH_TOY_PATHS_INCLUDE");
+        let doc: toml_edit::DocumentMut = "[toy_paths]\ninclude = \"vendor\"".parse().unwrap();
+        assert!(
+            ToyPaths::resolve_layers(RawToyPaths::parse_from(["test"]), &[doc.as_item()]).is_err()
+        );
     }
 }

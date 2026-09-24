@@ -163,7 +163,7 @@ const SLOW_WAITS_CAP: usize = 16;
 pub fn slow_wait_threshold(lock_path: &Path) -> Duration {
     let cli = crate::graph::RawGraph::default();
     let scope = crate::settings_file::ConfigScope::of_infigraph_dir(lock_path.parent());
-    Duration::from_millis(crate::graph::Graph::resolve(cli, scope).slow_lock_ms)
+    Duration::from_millis(crate::graph::Graph::resolve_or_default(cli, scope).slow_lock_ms)
 }
 
 fn record_slow_wait(path: &Path, waited: Duration, threshold: Duration) {

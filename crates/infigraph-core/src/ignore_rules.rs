@@ -116,7 +116,11 @@ struct Includes {
 fn configured_includes(project_root: &Path) -> Vec<(String, Trust)> {
     // The environment is this process's own, so it is trusted -- and it
     // replaces the files entirely, keeping the macro's usual precedence.
-    if let Some(from_env) = crate::settings::env_override::<PathList>("index", "include") {
+    let env = Index::env_layer().unwrap_or_else(|e| {
+        eprintln!("warning: {e}; ignoring the environment for [index] include");
+        RawIndex::default()
+    });
+    if let Some(from_env) = env.index_include {
         return from_env.0.into_iter().map(|e| (e, Trust::User)).collect();
     }
 
@@ -124,7 +128,7 @@ fn configured_includes(project_root: &Path) -> Vec<(String, Trust)> {
     let [project, user] = docs;
     let entries_of = |doc: Option<std::sync::Arc<toml_edit::DocumentMut>>, trust: Trust| {
         doc.map(|doc| {
-            Index::resolve_layers(RawIndex::default(), &[doc.as_item()])
+            Index::resolve_layers_or_default(RawIndex::default(), &[doc.as_item()])
                 .include
                 .0
         })

@@ -282,7 +282,7 @@ crate::settings! {
 
 /// Resolves the `llm` group -- see the group's declaration above.
 pub fn llm_settings() -> Llm {
-    Llm::resolve(RawLlm::default(), crate::settings_file::ConfigScope::User)
+    Llm::resolve_or_default(RawLlm::default(), crate::settings_file::ConfigScope::User)
 }
 
 impl LlmConfig {

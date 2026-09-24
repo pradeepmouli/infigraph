@@ -59,6 +59,7 @@ crate::settings! {
     registry {
         home: String = String::new(),
         instances_dir: String = String::new(),
+        #[legacy = "INFIGRAPH_ORG"]
         org: String = String::new(),
         real_home_redirect: String = String::new(),
     }
@@ -66,11 +67,10 @@ crate::settings! {
 
 /// Resolves the `registry` group -- see the group's declaration above.
 pub fn registry_settings() -> Registry {
-    let cli = RawRegistry {
-        registry_org: crate::settings::legacy_env("INFIGRAPH_ORG"),
-        ..Default::default()
-    };
-    Registry::resolve(cli, crate::settings_file::ConfigScope::User)
+    Registry::resolve_or_default(
+        RawRegistry::default(),
+        crate::settings_file::ConfigScope::User,
+    )
 }
 
 /// The `.infigraph` directory holding machine-wide state: the project
@@ -299,7 +299,8 @@ pub fn classify_instances(
 pub fn reap_scan_interval() -> Duration {
     let cli = crate::watch::RawWatch::parse_from(std::iter::empty::<String>());
     Duration::from_secs(
-        crate::watch::Watch::resolve(cli, crate::settings_file::ConfigScope::User).reap_scan_secs,
+        crate::watch::Watch::resolve_or_default(cli, crate::settings_file::ConfigScope::User)
+            .reap_scan_secs,
     )
 }
 

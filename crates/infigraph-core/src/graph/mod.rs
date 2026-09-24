@@ -94,6 +94,7 @@ crate::settings! {
         copy_retry_max_batch_multiple: u64 = 8,
         quarantine_max_bytes: u64 = 1024 * 1024 * 1024,
         slow_lock_ms: u64 = 2000,
+        #[legacy = "INFIGRAPH_DOC_HNSW_THRESHOLD"]
         doc_hnsw_threshold: u64 = 200_000,
         compaction: crate::settings::Toggle = crate::settings::Toggle(false),
         compaction_drift_ratio: u64 = 3,

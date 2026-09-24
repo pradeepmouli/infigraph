@@ -20,29 +20,27 @@ const DEFAULT_TOKEN_BUDGET: usize = 150_000;
 // document the effective defaults.
 infigraph_core::settings! {
     session {
+        #[legacy = "INFIGRAPH_COMPRESSION_LEVEL"]
         compression_level: String = String::new(),
+        #[legacy = "INFIGRAPH_ML_COMPRESSION"]
         ml_compression: String = "extractive".to_string(),
+        #[legacy = "INFIGRAPH_DEDUP"]
         dedup: infigraph_core::settings::Toggle = infigraph_core::settings::Toggle(true),
+        #[legacy = "INFIGRAPH_TOKEN_BUDGET"]
         token_budget: u64 = DEFAULT_TOKEN_BUDGET as u64,
+        #[legacy = "INFIGRAPH_KOMPRESS_DIR"]
         kompress_dir: String = String::new(),
     }
 }
 
-/// The `session` group's CLI/env layer only -- `None` means "not set at
-/// this layer", so callers can consult config.toml next.
+/// The `session` group's env layer only -- `None` means "not set at this
+/// layer", so callers can consult config.toml next. A value that does not
+/// parse is reported and treated as unset.
 fn session_cli() -> RawSession {
-    use infigraph_core::settings::{env_override, legacy_env};
-    RawSession {
-        session_compression_level: legacy_env("INFIGRAPH_COMPRESSION_LEVEL")
-            .or_else(|| env_override("session", "compression_level")),
-        session_ml_compression: legacy_env("INFIGRAPH_ML_COMPRESSION")
-            .or_else(|| env_override("session", "ml_compression")),
-        session_dedup: legacy_env("INFIGRAPH_DEDUP").or_else(|| env_override("session", "dedup")),
-        session_token_budget: legacy_env("INFIGRAPH_TOKEN_BUDGET")
-            .or_else(|| env_override("session", "token_budget")),
-        session_kompress_dir: legacy_env("INFIGRAPH_KOMPRESS_DIR")
-            .or_else(|| env_override("session", "kompress_dir")),
-    }
+    Session::env_layer().unwrap_or_else(|e| {
+        eprintln!("warning: {e}; ignoring the environment for session settings");
+        RawSession::default()
+    })
 }
 
 /// `INFIGRAPH_KOMPRESS_DIR` / `INFIGRAPH_SESSION_KOMPRESS_DIR` override for
@@ -438,7 +436,7 @@ pub fn get_ml_compression_mode() -> String {
 pub fn auto_start_watch_on_boot_enabled(root: &std::path::Path) -> bool {
     let cli = infigraph_core::watch::RawWatch::parse_from(std::iter::empty::<String>());
     let scope = infigraph_core::settings_file::ConfigScope::Project(root);
-    infigraph_core::watch::Watch::resolve(cli, scope)
+    infigraph_core::watch::Watch::resolve_or_default(cli, scope)
         .auto_start_on_boot
         .0
 }

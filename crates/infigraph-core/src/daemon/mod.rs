@@ -72,7 +72,7 @@ crate::settings! {
 /// `RawScip::default()` rather than a clap parse: nothing on this path
 /// takes command-line flags, and the daemon reads this once at startup.
 pub fn scip_settings(root: &Path) -> Scip {
-    Scip::resolve(
+    Scip::resolve_or_default(
         RawScip::default(),
         crate::settings_file::ConfigScope::Project(root),
     )
@@ -825,7 +825,7 @@ where
     // daemon restart, which is how every other daemon-lifetime setting
     // behaves. The thresholds it consults are re-read per call, because those
     // are the numbers an operator tunes while watching a graph misbehave.
-    let compaction_enabled = crate::graph::Graph::resolve(
+    let compaction_enabled = crate::graph::Graph::resolve_or_default(
         crate::graph::RawGraph::default(),
         crate::settings_file::ConfigScope::of_infigraph_dir(Some(&infigraph_dir)),
     )
@@ -1443,7 +1443,7 @@ where
                             let scope = crate::settings_file::ConfigScope::of_infigraph_dir(Some(
                                 &infigraph_dir,
                             ));
-                            let cfg = crate::graph::Graph::resolve(
+                            let cfg = crate::graph::Graph::resolve_or_default(
                                 crate::graph::RawGraph::default(),
                                 scope,
                             );
@@ -2427,7 +2427,7 @@ const COMPACTION_SAMPLE_INTERVAL: Duration = Duration::from_secs(600);
 /// without a daemon restart, where a SCIP settings change does not.
 fn escalation_due(infigraph_dir: &Path, graph_path: &Path) -> bool {
     let scope = crate::settings_file::ConfigScope::of_infigraph_dir(Some(infigraph_dir));
-    let cfg = crate::graph::Graph::resolve(crate::graph::RawGraph::default(), scope);
+    let cfg = crate::graph::Graph::resolve_or_default(crate::graph::RawGraph::default(), scope);
     let Some(ratio) = crate::graph::store_util::graph_growth_ratio(infigraph_dir, graph_path)
     else {
         return false; // no baseline -- nothing to be close to

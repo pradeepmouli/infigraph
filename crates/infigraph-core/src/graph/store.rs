@@ -374,7 +374,8 @@ fn write_buffer_pool_bytes() -> u64 {
 /// How long a WAL must sit unwritten before the daemon folds it (#149);
 /// 0 disables. See `GraphStore::checkpoint_if_idle`.
 pub(crate) fn checkpoint_idle_secs(scope: crate::settings_file::ConfigScope<'_>) -> u64 {
-    crate::graph::Graph::resolve(crate::graph::RawGraph::default(), scope).checkpoint_idle_secs
+    crate::graph::Graph::resolve_or_default(crate::graph::RawGraph::default(), scope)
+        .checkpoint_idle_secs
 }
 
 /// Coordination lock for the checkpoint window (ladybug#666).

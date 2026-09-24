@@ -32,7 +32,8 @@ infigraph_core::settings! {
 pub fn call_timeout() -> Duration {
     let cli = RawMcpCall::parse_from(std::iter::empty::<String>());
     Duration::from_secs(
-        McpCall::resolve(cli, infigraph_core::settings_file::ConfigScope::User).timeout_secs,
+        McpCall::resolve_or_default(cli, infigraph_core::settings_file::ConfigScope::User)
+            .timeout_secs,
     )
 }
 

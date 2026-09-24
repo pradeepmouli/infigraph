@@ -111,13 +111,14 @@ pub(crate) static MAX_BYTES_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::n
 /// disk-filling scale. Resolved via the `graph` settings group
 /// (`INFIGRAPH_GRAPH_GROWTH_MAX_RATIO`).
 fn graph_growth_max_ratio(scope: ConfigScope<'_>) -> u64 {
-    crate::graph::Graph::resolve(crate::graph::RawGraph::default(), scope).growth_max_ratio
+    crate::graph::Graph::resolve_or_default(crate::graph::RawGraph::default(), scope)
+        .growth_max_ratio
 }
 
 /// Absolute ceiling on the live graph plus its WAL family; 0 disables it
 /// (`INFIGRAPH_GRAPH_MAX_BYTES`). See `check_graph_growth_ratio`.
 fn graph_max_bytes(scope: ConfigScope<'_>) -> u64 {
-    crate::graph::Graph::resolve(crate::graph::RawGraph::default(), scope).max_bytes
+    crate::graph::Graph::resolve_or_default(crate::graph::RawGraph::default(), scope).max_bytes
 }
 
 /// How many times a COPY retry loop may re-spend its own batch before
@@ -133,7 +134,7 @@ fn graph_max_bytes(scope: ConfigScope<'_>) -> u64 {
 /// stop; erring tight sends a converging loop to the slow UNWIND path,
 /// which is correct but much slower, and silently so.
 pub(crate) fn copy_retry_max_batch_multiple(scope: ConfigScope<'_>) -> u64 {
-    crate::graph::Graph::resolve(crate::graph::RawGraph::default(), scope)
+    crate::graph::Graph::resolve_or_default(crate::graph::RawGraph::default(), scope)
         .copy_retry_max_batch_multiple
 }
 

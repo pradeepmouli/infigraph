@@ -144,7 +144,7 @@ pub(crate) fn paths_warrant_reindex(
 fn attach_poll_interval(root: &Path) -> Duration {
     let cli = infigraph_core::watch::RawWatch::parse_from(std::iter::empty::<String>());
     Duration::from_millis(
-        infigraph_core::watch::Watch::resolve(
+        infigraph_core::watch::Watch::resolve_or_default(
             cli,
             infigraph_core::settings_file::ConfigScope::Project(root),
         )

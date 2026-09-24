@@ -588,7 +588,7 @@ pub fn check_one_compaction_drift(project_path: &Path) -> Option<CheckResult> {
     let now = crate::graph::compaction::table_page_stats(&store, &tables)?;
 
     let scope = crate::settings_file::ConfigScope::of_infigraph_dir(Some(&infigraph_dir));
-    let cfg = crate::graph::Graph::resolve(crate::graph::RawGraph::default(), scope);
+    let cfg = crate::graph::Graph::resolve_or_default(crate::graph::RawGraph::default(), scope);
 
     // `f64` here, unlike `compaction_due`'s cross-multiplication, and both are
     // right: the predicate must not round a genuine 2.9x down to 2, while this

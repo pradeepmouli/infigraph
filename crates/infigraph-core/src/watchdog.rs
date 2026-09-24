@@ -32,7 +32,7 @@ crate::settings! {
 
 fn settings() -> Watchdog {
     let cli = RawWatchdog::parse_from(std::iter::empty::<String>());
-    Watchdog::resolve(cli, crate::settings_file::ConfigScope::User)
+    Watchdog::resolve_or_default(cli, crate::settings_file::ConfigScope::User)
 }
 
 /// What a process is using right now. `None` where the platform cannot

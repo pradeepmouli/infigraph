@@ -216,6 +216,7 @@ pub const DAEMON_BACKEND: &str = "daemon";
 
 crate::settings! {
     backend {
+        #[legacy = "INFIGRAPH_BACKEND"]
         selected: String = DAEMON_BACKEND.to_string(),
     }
 }
@@ -232,11 +233,7 @@ crate::settings! {
 /// the CLI slot instead, which still outranks env/TOML/default in the
 /// macro's own precedence chain.
 pub fn selected_backend() -> String {
-    let mut cli = RawBackend::parse_from(std::iter::empty::<String>());
-    cli.backend_selected = cli
-        .backend_selected
-        .or_else(|| std::env::var("INFIGRAPH_BACKEND").ok());
-    Backend::resolve(cli, settings_file::ConfigScope::User).selected
+    Backend::resolve_or_default(RawBackend::default(), settings_file::ConfigScope::User).selected
 }
 
 /// Whether `INFIGRAPH_BACKEND` selects the daemon backend. This is the exact
@@ -262,21 +259,18 @@ pub fn daemon_backend_selected() -> bool {
 crate::settings! {
     install {
         dir: String = String::new(),
+        #[legacy = "INFIGRAPH_BIN"]
         bin: String = "/app/infigraph".to_string(),
+        #[legacy = "INFIGRAPH_GH_HOST"]
         gh_host: String = "github.com".to_string(),
+        #[legacy = "INFIGRAPH_GH_OWNER"]
         gh_owner: String = "intuit".to_string(),
     }
 }
 
 /// Resolves the `install` group -- see the group's declaration above.
 pub fn install_settings() -> Install {
-    let cli = RawInstall {
-        install_bin: settings::legacy_env("INFIGRAPH_BIN"),
-        install_gh_host: settings::legacy_env("INFIGRAPH_GH_HOST"),
-        install_gh_owner: settings::legacy_env("INFIGRAPH_GH_OWNER"),
-        ..Default::default()
-    };
-    Install::resolve(cli, settings_file::ConfigScope::User)
+    Install::resolve_or_default(RawInstall::default(), settings_file::ConfigScope::User)
 }
 
 /// Opt-in toggle for handing a whole `index()`/`index_files()` job to the
@@ -286,7 +280,7 @@ pub fn install_settings() -> Install {
 /// Overridable via `INFIGRAPH_WATCH_INDEX_VIA_DAEMON`.
 pub fn index_via_daemon_mode_enabled() -> bool {
     let cli = watch::RawWatch::parse_from(std::iter::empty::<String>());
-    watch::Watch::resolve(cli, settings_file::ConfigScope::User)
+    watch::Watch::resolve_or_default(cli, settings_file::ConfigScope::User)
         .index_via_daemon
         .0
 }

@@ -314,20 +314,14 @@ pub fn build_combined_docs(registry: &Registry, group_name: &str) -> Result<Comb
 }
 
 /// Embedding count above which the combined store builds an HNSW index.
-/// Resolved via core's `graph` settings group. `INFIGRAPH_DOC_HNSW_THRESHOLD`
-/// predates the macro (and exists upstream), so it is read by its legacy
-/// name and seeded into the CLI slot -- which still outranks the macro's
-/// own env/TOML/default layers -- exactly as `selected_backend()` does for
-/// `INFIGRAPH_BACKEND`.
+/// Resolved via core's `graph` settings group, whose field carries the
+/// upstream-inherited legacy name `INFIGRAPH_DOC_HNSW_THRESHOLD`.
 fn combined_hnsw_threshold() -> usize {
-    let cli = infigraph_core::graph::RawGraph {
-        graph_doc_hnsw_threshold: infigraph_core::settings::legacy_env(
-            "INFIGRAPH_DOC_HNSW_THRESHOLD",
-        ),
-        ..Default::default()
-    };
-    infigraph_core::graph::Graph::resolve(cli, infigraph_core::settings_file::ConfigScope::User)
-        .doc_hnsw_threshold as usize
+    infigraph_core::graph::Graph::resolve_or_default(
+        infigraph_core::graph::RawGraph::default(),
+        infigraph_core::settings_file::ConfigScope::User,
+    )
+    .doc_hnsw_threshold as usize
 }
 
 fn acquire_build_lock(graph_dir: &Path) -> Result<std::fs::File> {

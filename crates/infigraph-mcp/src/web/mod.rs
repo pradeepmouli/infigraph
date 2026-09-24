@@ -298,16 +298,20 @@ fn handle_mcp_post(
 // `INFIGRAPH_WEB_API_KEY` also works, legacy wins. Empty disables auth.
 infigraph_core::settings! {
     web {
+        #[legacy = "INFIGRAPH_API_KEY"]
         api_key: String = String::new(),
     }
 }
 
 fn api_key() -> Option<String> {
-    let cli = RawWeb {
-        web_api_key: infigraph_core::settings::legacy_env("INFIGRAPH_API_KEY"),
-    };
-    Some(Web::resolve(cli, infigraph_core::settings_file::ConfigScope::User).api_key)
-        .filter(|k| !k.is_empty())
+    Some(
+        Web::resolve_or_default(
+            RawWeb::default(),
+            infigraph_core::settings_file::ConfigScope::User,
+        )
+        .api_key,
+    )
+    .filter(|k| !k.is_empty())
 }
 
 fn check_auth(request: &tiny_http::Request) -> bool {
