@@ -332,19 +332,30 @@ mod tests {
         std::fs::write(ig.join(name), serde_json::to_string(&info).unwrap()).unwrap();
     }
 
+    /// Serializes every test that points the process-wide instances-dir
+    /// variable somewhere: run in parallel, one test's `list_instances`
+    /// read another's tempdir and saw its `999999.json` row.
+    static INSTANCES_DIR_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// Points the instance registry at an empty tempdir so the host
-    /// machine's real MCP instances never leak into these assertions.
-    fn isolated_instances_dir(tmp: &tempfile::TempDir) -> PathBuf {
+    /// machine's real MCP instances never leak into these assertions. Hold
+    /// the returned guard for the whole test.
+    pub(super) fn isolated_instances_dir(
+        tmp: &tempfile::TempDir,
+    ) -> (std::sync::MutexGuard<'static, ()>, PathBuf) {
+        let guard = INSTANCES_DIR_ENV
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let dir = tmp.path().join("instances");
         std::fs::create_dir_all(&dir).unwrap();
         std::env::set_var("INFIGRAPH_REGISTRY_INSTANCES_DIR", &dir);
-        dir
+        (guard, dir)
     }
 
     #[test]
     fn live_and_dead_lock_holders_are_both_listed_with_liveness() {
         let tmp = tempfile::tempdir().unwrap();
-        isolated_instances_dir(&tmp);
+        let (_env, _) = isolated_instances_dir(&tmp);
         let project = tmp.path().join("proj");
         let ig = project.join(".infigraph");
         write_lock(&ig, "watch.lock", std::process::id(), "infigraph daemon");
@@ -369,7 +380,7 @@ mod tests {
     #[test]
     fn one_pid_holding_several_locks_merges_into_one_row() {
         let tmp = tempfile::tempdir().unwrap();
-        isolated_instances_dir(&tmp);
+        let (_env, _) = isolated_instances_dir(&tmp);
         let project = tmp.path().join("proj");
         let ig = project.join(".infigraph");
         write_lock(&ig, "watch.lock", std::process::id(), "infigraph daemon");
@@ -392,7 +403,7 @@ mod tests {
     #[test]
     fn instance_registry_entries_are_listed_as_mcp_rows() {
         let tmp = tempfile::tempdir().unwrap();
-        let dir = isolated_instances_dir(&tmp);
+        let (_env, dir) = isolated_instances_dir(&tmp);
         let info = crate::instances::InstanceInfo {
             pid: DEAD_PID,
             started_at: 0,
@@ -439,9 +450,7 @@ mod pid_reuse_tests {
     #[test]
     fn recycled_pid_reads_as_dead_not_as_the_impostors_stats() {
         let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join("instances");
-        std::fs::create_dir_all(&dir).unwrap();
-        std::env::set_var("INFIGRAPH_REGISTRY_INSTANCES_DIR", &dir);
+        let (_env, _) = super::tests::isolated_instances_dir(&tmp);
         let project = tmp.path().join("proj");
         let ig = project.join(".infigraph");
         std::fs::create_dir_all(&ig).unwrap();
