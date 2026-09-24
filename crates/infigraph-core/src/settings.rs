@@ -450,7 +450,6 @@ macro_rules! settings_enum {
         }
 
         impl $name {
-            #[allow(dead_code)]
             pub const ALL: &'static [Self] = &[$(Self::$variant),+];
 
             pub const fn as_str(self) -> &'static str {
@@ -473,7 +472,7 @@ macro_rules! settings_enum {
                     $( $text => Ok(Self::$variant), )+
                     other => Err(format!(
                         "unknown value {other:?}; expected one of: {}",
-                        [$($text),+].join(", ")
+                        Self::ALL.iter().map(|v| v.as_str()).collect::<Vec<_>>().join(", ")
                     )),
                 }
             }

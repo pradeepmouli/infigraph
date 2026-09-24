@@ -53,3 +53,23 @@ fn doctor_runs_and_reports_an_invalid_backend() {
     );
     assert!(text.contains("kuzuu"), "{text}");
 }
+
+/// Review minor: installing and updating are how a user gets a fixed build,
+/// so a bad backend setting must not block them -- and they never open a
+/// store. `--dry-run` with an isolated HOME keeps this read-only.
+#[test]
+fn install_is_not_blocked_by_a_bad_backend() {
+    let tmp = tempfile::tempdir().unwrap();
+    let out = infigraph()
+        .current_dir(tmp.path())
+        .env("HOME", tmp.path())
+        .env("INFIGRAPH_BACKEND", "kuzuu")
+        .args(["install", "--dry-run"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("invalid backend setting"),
+        "install must not be gated on the backend: {stderr}"
+    );
+}

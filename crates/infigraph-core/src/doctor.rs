@@ -1394,7 +1394,7 @@ pub fn check_backend_setting() -> Vec<CheckResult> {
             CONFIG_CATEGORY,
             "backend setting",
             format!("{e:#}"),
-            "set INFIGRAPH_BACKEND to kuzu, daemon or neo4j (or unset it)",
+            "fix the setting named above: kuzu, daemon or neo4j (or unset it for the default)",
         ),
     }]
 }

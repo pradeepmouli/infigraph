@@ -251,15 +251,6 @@ pub fn validated_backend() -> Result<BackendChoice> {
         .map_err(|e| anyhow::anyhow!("invalid backend setting: {e}"))
 }
 
-/// Whether `INFIGRAPH_BACKEND` selects the daemon backend. This is the exact
-/// condition `Infigraph::init` dispatches `BackendKind::DaemonKuzu` on,
-/// exposed for callers that must know *before* `init()` -- notably
-/// `cmd_index`, which otherwise takes `.infigraph/index.lock` and deadlocks
-/// against the daemon that needs that same lock to serve its writes.
-///
-/// Prefer `Infigraph::is_daemon_backend` once you have an initialized
-/// instance; that reports what was actually opened rather than what was
-/// requested.
 /// Startup check for the CLI and the MCP server (#74): the backend setting
 /// must parse, and a remote backend must answer. Returns the choice so the
 /// caller can log it.
@@ -269,11 +260,20 @@ pub fn check_backend_at_startup() -> Result<BackendChoice> {
     if backend == BackendChoice::Neo4j {
         graph::Neo4jBackend::connect_from_env()?
             .ping()
-            .context("INFIGRAPH_BACKEND=neo4j but Neo4j is not reachable")?;
+            .context("the neo4j backend is selected but Neo4j is not reachable")?;
     }
     Ok(backend)
 }
 
+/// Whether `INFIGRAPH_BACKEND` selects the daemon backend. This is the exact
+/// condition `Infigraph::init` dispatches `BackendKind::DaemonKuzu` on,
+/// exposed for callers that must know *before* `init()` -- notably
+/// `cmd_index`, which otherwise takes `.infigraph/index.lock` and deadlocks
+/// against the daemon that needs that same lock to serve its writes.
+///
+/// Prefer `Infigraph::is_daemon_backend` once you have an initialized
+/// instance; that reports what was actually opened rather than what was
+/// requested.
 pub fn daemon_backend_selected() -> bool {
     selected_backend() == BackendChoice::Daemon
 }
@@ -282,9 +282,9 @@ pub fn daemon_backend_selected() -> bool {
 // the MCP webhook's exec path). `dir` empty means "unset" -- callers fall
 // back to `~/.local/bin`. `INFIGRAPH_INSTALL_DIR` already fits the
 // convention; the other three predate the macro and exist upstream (and in
-// install.sh/release.sh), so `install_settings` seeds them from their
-// legacy names. Canonical `INFIGRAPH_INSTALL_{BIN,GH_HOST,GH_OWNER}` also
-// work; legacy wins.
+// install.sh/release.sh), so their fields carry `#[legacy]` names.
+// Canonical `INFIGRAPH_INSTALL_{BIN,GH_HOST,GH_OWNER}` also work; legacy
+// wins.
 crate::settings! {
     install {
         dir: String = String::new(),
