@@ -1379,6 +1379,26 @@ pub fn check_graph_holders(ctx: &DoctorContext) -> Vec<CheckResult> {
         .collect()
 }
 
+const CONFIG_CATEGORY: &str = "config";
+
+/// #74: a bad `INFIGRAPH_BACKEND` stops every other command at startup, so
+/// doctor -- exempt from that check -- is where it gets explained.
+pub fn check_backend_setting() -> Vec<CheckResult> {
+    vec![match crate::validated_backend() {
+        Ok(backend) => CheckResult::pass(
+            CONFIG_CATEGORY,
+            "backend setting",
+            format!("backend: {backend}"),
+        ),
+        Err(e) => CheckResult::fail(
+            CONFIG_CATEGORY,
+            "backend setting",
+            format!("{e:#}"),
+            "set INFIGRAPH_BACKEND to kuzu, daemon or neo4j (or unset it)",
+        ),
+    }]
+}
+
 const TOOLCHAIN_CATEGORY: &str = "toolchain";
 
 pub fn check_toolchain(ctx: &DoctorContext) -> Vec<CheckResult> {
@@ -1416,6 +1436,7 @@ pub fn run_doctor(ctx: DoctorContext) -> DoctorReport {
     checks.extend(check_scip_staleness(&ctx));
     checks.extend(check_worktrees(&ctx));
     checks.extend(check_recovery(&ctx));
+    checks.extend(check_backend_setting());
     checks.extend(check_toolchain(&ctx));
     DoctorReport {
         checks,

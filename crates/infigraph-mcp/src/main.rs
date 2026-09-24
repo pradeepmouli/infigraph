@@ -52,6 +52,18 @@ fn main() -> Result<()> {
         return run_worker();
     }
 
+    // #74: once per start, in the supervisor -- a worker failing this would
+    // only be restarted into the same failure. Workers still validate in
+    // every `Infigraph::init*`.
+    match infigraph_core::check_backend_at_startup() {
+        Ok(backend) => mcp_log("INFO", &format!("backend: {backend}")),
+        Err(e) => {
+            mcp_log("ERROR", &format!("{e:#}"));
+            eprintln!("infigraph-mcp: {e:#}");
+            std::process::exit(2);
+        }
+    }
+
     // Supervisor mode: spawn self as --worker, and restart it if it crashes.
     // The worker already logs a reason for every exit path it controls
     // (panic, signal, stdin EOF, idle grace, supervisor-gone); the

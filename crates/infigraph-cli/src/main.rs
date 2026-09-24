@@ -1033,6 +1033,11 @@ fn main() -> Result<()> {
     let update_handle = install::check_for_update_background();
 
     let cli = Cli::parse();
+    // #74: refuse a bad backend setting before any work -- except doctor,
+    // whose job is to report exactly that.
+    if !matches!(cli.command, Commands::Doctor { .. }) {
+        infigraph_core::check_backend_at_startup()?;
+    }
     // Resolve to the project that owns the cwd, not the cwd itself. Taking
     // the cwd verbatim is what created a separate store, daemon and socket
     // for every subdirectory anyone ever ran a command from.

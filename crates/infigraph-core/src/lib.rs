@@ -260,6 +260,20 @@ pub fn validated_backend() -> Result<BackendChoice> {
 /// Prefer `Infigraph::is_daemon_backend` once you have an initialized
 /// instance; that reports what was actually opened rather than what was
 /// requested.
+/// Startup check for the CLI and the MCP server (#74): the backend setting
+/// must parse, and a remote backend must answer. Returns the choice so the
+/// caller can log it.
+pub fn check_backend_at_startup() -> Result<BackendChoice> {
+    let backend = validated_backend()?;
+    #[cfg(feature = "neo4j")]
+    if backend == BackendChoice::Neo4j {
+        graph::Neo4jBackend::connect_from_env()?
+            .ping()
+            .context("INFIGRAPH_BACKEND=neo4j but Neo4j is not reachable")?;
+    }
+    Ok(backend)
+}
+
 pub fn daemon_backend_selected() -> bool {
     selected_backend() == BackendChoice::Daemon
 }

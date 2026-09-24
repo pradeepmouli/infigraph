@@ -78,6 +78,12 @@ impl Neo4jBackend {
         Self::connect(&uri, &user, &password)
     }
 
+    /// One round trip, so a wrong URI or a server that is down surfaces at
+    /// startup instead of on the first query (#74).
+    pub fn ping(&self) -> Result<()> {
+        self.run_void("RETURN 1")
+    }
+
     pub fn set_repo_filter(&mut self, repo: &str) {
         self.repo_filter = Some(repo.to_string());
     }
