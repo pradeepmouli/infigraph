@@ -142,6 +142,31 @@ pub fn list_infigraph_processes(projects: &[&Path]) -> Vec<ProcessRow> {
     rows.into_values().collect()
 }
 
+/// Rows for processes *other than this one* holding a project's
+/// `watch.lock`: watcher daemons and CLI `infigraph watch` runs, live or
+/// dead (a dead one left a stale lock behind). This process's own watchers
+/// are excluded because the caller already knows them by id (#37).
+pub fn other_watcher_processes(projects: &[&Path]) -> Vec<ProcessRow> {
+    let me = std::process::id();
+    list_infigraph_processes(projects)
+        .into_iter()
+        .filter(|r| r.pid != me && r.evidence.iter().any(|e| e == "watch.lock"))
+        .collect()
+}
+
+/// Compact uptime ("2d3h", "4h5m", "6m7s", "8s") for process listings.
+pub fn format_uptime(secs: u64) -> String {
+    if secs >= 86_400 {
+        format!("{}d{}h", secs / 86_400, (secs % 86_400) / 3600)
+    } else if secs >= 3600 {
+        format!("{}h{}m", secs / 3600, (secs % 3600) / 60)
+    } else if secs >= 60 {
+        format!("{}m{}s", secs / 60, secs % 60)
+    } else {
+        format!("{secs}s")
+    }
+}
+
 /// Why a kill request was refused.
 #[derive(Debug, PartialEq, Eq)]
 pub enum KillRefusal {

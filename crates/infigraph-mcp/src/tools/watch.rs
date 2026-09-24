@@ -611,7 +611,20 @@ pub fn tool_get_watch_status(args: &Value) -> Result<String> {
         return Ok(format!("No watcher found with ID: {id}"));
     }
 
-    // List all watchers from both registries
+    let registry = infigraph_core::multi::Registry::load().unwrap_or_default();
+    let current = std::env::current_dir()
+        .and_then(|d| d.canonicalize())
+        .unwrap_or_default();
+    let scope = infigraph_core::ps::ps_scope(&registry, &current);
+    let scope_refs: Vec<&std::path::Path> = scope.iter().map(|p| p.as_path()).collect();
+    Ok(list_all_watchers(&scope_refs))
+}
+
+/// Every watcher this worker can see: its own in-process code and doc
+/// watchers (by id), then watchers running in other processes -- daemons
+/// and CLI `infigraph watch` runs -- found through each `projects` entry's
+/// `watch.lock`, the same source `infigraph ps` reads (#37).
+pub fn list_all_watchers(projects: &[&std::path::Path]) -> String {
     let mut total = 0usize;
     let mut out = String::new();
 
@@ -641,11 +654,38 @@ pub fn tool_get_watch_status(args: &Value) -> Result<String> {
         }
     }
 
-    if total == 0 {
-        return Ok("No watchers running.".to_string());
+    let mut stale = String::new();
+    for row in infigraph_core::ps::other_watcher_processes(projects) {
+        let project = row.projects.join(", ");
+        if row.alive {
+            total += 1;
+            let uptime = row
+                .uptime_secs
+                .map(infigraph_core::ps::format_uptime)
+                .unwrap_or_else(|| "?".to_string());
+            out.push_str(&format!(
+                "  PID {} — [{}] {project} (up {uptime})\n",
+                row.pid,
+                row.roles.join(",")
+            ));
+        } else {
+            stale.push_str(&format!(
+                "  PID {} — {project}: holder is gone, stale watch.lock \
+                 (`infigraph doctor` explains; deleting the lock file is safe)\n",
+                row.pid
+            ));
+        }
     }
 
-    Ok(format!("{total} watcher(s) running:\n{out}"))
+    let mut result = if total == 0 {
+        "No watchers running.".to_string()
+    } else {
+        format!("{total} watcher(s) running:\n{out}")
+    };
+    if !stale.is_empty() {
+        result.push_str(&format!("\nDead watchers:\n{stale}"));
+    }
+    result
 }
 
 #[cfg(test)]

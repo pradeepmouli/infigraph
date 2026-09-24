@@ -528,7 +528,7 @@ pub fn build_tools_list() -> Vec<Value> {
             p(true,false,false,json!({"debounce_ms":{"type":"integer","default":500,"description":"Debounce interval in ms before reindexing a changed file"},"auto_resolve":{"type":"boolean","default":false,"description":"If true, automatically runs full index_project when cross-file call edges are affected by a change"}})), &["path"]),
         tool_def("stop_watch", "Stop a running file watcher started by watch_project.",
             p(false,false,false,json!({"watcher_id":{"type":"string","description":"Watcher ID returned by watch_project"}})), &["watcher_id"]),
-        tool_def("get_watch_status", "Check the status of running watchers. Shows pending files that need a full reindex due to cross-file call edge changes. Omit watcher_id to list all watchers.",
+        tool_def("get_watch_status", "Check the status of running watchers. Shows pending files that need a full reindex due to cross-file call edge changes. Omit watcher_id to list all watchers: this worker's own (by ID) plus watcher daemons and CLI watchers in other processes (by PID), and any dead holder that left a stale watch.lock.",
             p(false,false,false,json!({"watcher_id":{"type":"string","description":"Specific watcher ID to check (optional — omit to list all)"}})), &[]),
         tool_def("enable_watch", "Enable code-watching for a project: persists the enabled policy to .infigraph/config.toml and starts a watcher if none is running. Works whether a daemon is running or not.",
             p(true,false,false,json!({})), &["path"]),

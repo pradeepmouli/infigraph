@@ -387,6 +387,63 @@ fn write_stale_lock_payload(lock_path: &std::path::Path) {
     std::fs::write(lock_path, serde_json::to_string(&stale).unwrap()).unwrap();
 }
 
+fn write_watch_lock_payload(root: &std::path::Path, pid: u32, role: &str) {
+    let ig = root.join(".infigraph");
+    std::fs::create_dir_all(&ig).unwrap();
+    let info = infigraph_core::lockfile::LockInfo {
+        pid,
+        role: role.to_string(),
+        build_hash: "test".to_string(),
+        acquired_at: 0,
+        last_heartbeat: 0,
+        holder_started_at: 0,
+    };
+    std::fs::write(ig.join("watch.lock"), serde_json::to_string(&info).unwrap()).unwrap();
+}
+
+/// #37: listing every watcher must include watchers held by *other*
+/// processes (daemons, CLI `infigraph watch`), not only this worker's
+/// in-process maps -- it used to say "No watchers running" while 16 watcher
+/// processes were alive. A dead holder is reported separately as stale;
+/// this process's own `watch.lock` rows are left to the in-process listing.
+#[cfg(unix)]
+#[test]
+fn listing_all_watchers_includes_other_processes_and_flags_dead_ones() {
+    let tmp = tempfile::tempdir().unwrap();
+    let live = tmp.path().join("live");
+    let dead = tmp.path().join("dead");
+    let mine = tmp.path().join("mine");
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    write_watch_lock_payload(&live, child.id(), "infigraph daemon");
+    write_watch_lock_payload(&dead, 999_999, "infigraph daemon");
+    write_watch_lock_payload(&mine, std::process::id(), "mcp-watch");
+
+    let out = infigraph_mcp::tools::watch::list_all_watchers(&[&live, &dead, &mine]);
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert!(
+        out.contains(&format!(
+            "PID {} — [infigraph daemon] {}",
+            child.id(),
+            live.display()
+        )),
+        "live daemon watcher must be listed: {out}"
+    );
+    assert!(!out.starts_with("No watchers running"), "{out}");
+    let (_, dead_section) = out
+        .split_once("Dead watchers:")
+        .unwrap_or_else(|| panic!("dead holder must be reported: {out}"));
+    assert!(dead_section.contains("PID 999999"), "{out}");
+    assert!(
+        !out.contains(&format!("PID {}", std::process::id())),
+        "this process's own lock rows belong to the in-process listing: {out}"
+    );
+}
+
 /// C2 regression test: a stale `LockInfo` payload with no live flock holder
 /// must NOT be reported as an active watcher. Fails against the pre-fix
 /// implementation, which used `read_holder` alone as the liveness signal

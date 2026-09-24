@@ -1558,7 +1558,7 @@ pub(crate) fn cmd_ps(root: &Path) -> Result<()> {
         let state = if r.alive { "live" } else { "dead" };
         let uptime = r
             .uptime_secs
-            .map(format_uptime)
+            .map(infigraph_core::ps::format_uptime)
             .unwrap_or_else(|| "-".to_string());
         let rss = r
             .rss_bytes
@@ -1581,18 +1581,6 @@ pub(crate) fn cmd_ps(root: &Path) -> Result<()> {
         }
     }
     Ok(())
-}
-
-fn format_uptime(secs: u64) -> String {
-    if secs >= 86_400 {
-        format!("{}d{}h", secs / 86_400, (secs % 86_400) / 3600)
-    } else if secs >= 3600 {
-        format!("{}h{}m", secs / 3600, (secs % 3600) / 60)
-    } else if secs >= 60 {
-        format!("{}m{}s", secs / 60, secs % 60)
-    } else {
-        format!("{secs}s")
-    }
 }
 
 /// `infigraph kill` (R2.2.4): guarded terminate, audited (R6.3).
