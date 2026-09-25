@@ -185,6 +185,116 @@ pub fn spawn_self_watch() {
     });
 }
 
+// #18: startup phases. Every phase that must finish before the worker
+// serves has a time limit, so a hung one fails startup naming itself
+// instead of blocking the MCP handshake; work that need not finish first
+// runs in the background.
+infigraph_core::settings! {
+    mcp_startup {
+        phase_secs: u64 = 30,
+    }
+}
+
+/// Exit code of a worker whose required startup phase hung or panicked. A
+/// plain exit, not a crash or a watchdog restart, so the supervisor exits
+/// with it too instead of restarting into the same hang.
+pub const STARTUP_PHASE_FAILED_EXIT: i32 = 3;
+
+/// Test hook: the startup phase named here hangs, the way
+/// `INFIGRAPH_MCP_DEBUG_STALL_TOOL` stalls a tool.
+const STALL_STARTUP_PHASE_ENV: &str = "INFIGRAPH_MCP_DEBUG_STALL_STARTUP_PHASE";
+
+fn stall_if_requested(name: &str) {
+    if std::env::var(STALL_STARTUP_PHASE_ENV).ok().as_deref() == Some(name) {
+        crate::mcp_log("DEBUG", &format!("stalling startup phase `{name}`"));
+        loop {
+            std::thread::sleep(Duration::from_secs(3600));
+        }
+    }
+}
+
+/// Time limit for each required startup phase
+/// (`INFIGRAPH_MCP_STARTUP_PHASE_SECS`, default 30s).
+pub fn startup_phase_budget() -> Duration {
+    let settings = McpStartup::resolve_or_default(
+        RawMcpStartup::default(),
+        infigraph_core::settings_file::ConfigScope::User,
+    );
+    Duration::from_secs(settings.phase_secs)
+}
+
+/// Runs startup phase `name` on its own thread and waits at most `budget`
+/// for it. A phase that overruns keeps running detached -- a thread cannot
+/// be cancelled -- but startup no longer waits on it.
+pub fn startup_phase<T: Send + 'static>(
+    name: &'static str,
+    budget: Duration,
+    phase: impl FnOnce() -> T + Send + 'static,
+) -> anyhow::Result<T> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let started = std::time::Instant::now();
+    std::thread::Builder::new()
+        .name(format!("startup:{name}"))
+        .spawn(move || {
+            stall_if_requested(name);
+            let _ = tx.send(phase());
+        })?;
+    match rx.recv_timeout(budget) {
+        Ok(value) => {
+            crate::mcp_log(
+                "INFO",
+                &format!("startup phase `{name}` took {:?}", started.elapsed()),
+            );
+            Ok(value)
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(anyhow::anyhow!(
+            "startup phase `{name}` did not finish within {}s",
+            budget.as_secs_f64()
+        )),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Err(anyhow::anyhow!("startup phase `{name}` panicked"))
+        }
+    }
+}
+
+/// A phase the worker cannot serve without: on a timeout or panic, log it
+/// by name and exit with [`STARTUP_PHASE_FAILED_EXIT`].
+pub fn required_startup_phase<T: Send + 'static>(
+    name: &'static str,
+    phase: impl FnOnce() -> T + Send + 'static,
+) -> T {
+    match startup_phase(name, startup_phase_budget(), phase) {
+        Ok(value) => value,
+        Err(e) => {
+            crate::mcp_log("ERROR", &format!("{e:#} -- exiting"));
+            eprintln!("infigraph-mcp: {e:#}");
+            std::process::exit(STARTUP_PHASE_FAILED_EXIT);
+        }
+    }
+}
+
+/// A phase that must not delay serving (the startup true-up reindex can
+/// take minutes): runs on its own named thread and logs its duration.
+pub fn background_startup_phase(name: &'static str, phase: impl FnOnce() + Send + 'static) {
+    let spawned = std::thread::Builder::new()
+        .name(format!("startup:{name}"))
+        .spawn(move || {
+            let started = std::time::Instant::now();
+            stall_if_requested(name);
+            phase();
+            crate::mcp_log(
+                "INFO",
+                &format!("startup phase `{name}` finished in {:?}", started.elapsed()),
+            );
+        });
+    if let Err(e) = spawned {
+        crate::mcp_log(
+            "WARN",
+            &format!("could not start startup phase `{name}`: {e}"),
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -209,5 +319,37 @@ mod tests {
             !process_alive(pid),
             "reaped child pid {pid} must be reported dead"
         );
+    }
+
+    #[test]
+    fn a_startup_phase_that_finishes_returns_its_value() {
+        let got = startup_phase("quick", Duration::from_secs(5), || 42).unwrap();
+        assert_eq!(got, 42);
+    }
+
+    /// #18: a phase that hangs must fail, naming itself, once its budget is
+    /// spent -- not block startup (and the MCP handshake) indefinitely.
+    #[test]
+    fn a_hung_startup_phase_fails_naming_itself_within_its_budget() {
+        let started = std::time::Instant::now();
+        let err = startup_phase("stuck_phase", Duration::from_millis(200), || {
+            std::thread::sleep(Duration::from_secs(30));
+        })
+        .unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(err.to_string().contains("stuck_phase"), "{err}");
+    }
+
+    #[test]
+    fn a_panicking_startup_phase_fails_naming_itself() {
+        let err = startup_phase("boom_phase", Duration::from_secs(5), || -> u32 {
+            panic!("phase blew up")
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("boom_phase"), "{err}");
     }
 }

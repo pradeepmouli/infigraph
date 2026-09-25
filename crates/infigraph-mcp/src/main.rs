@@ -58,7 +58,13 @@ fn main() -> Result<()> {
     let startup_root = infigraph_core::project::resolve_project_root(
         &std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
     );
-    match infigraph_core::check_settings_at_startup(&startup_root) {
+    let checked = infigraph_mcp::lifecycle::startup_phase(
+        "settings",
+        infigraph_mcp::lifecycle::startup_phase_budget(),
+        move || infigraph_core::check_settings_at_startup(&startup_root),
+    )
+    .and_then(|checked| checked);
+    match checked {
         Ok(backend) => mcp_log("INFO", &format!("backend: {backend}")),
         Err(e) => {
             mcp_log("ERROR", &format!("{e:#}"));
@@ -406,7 +412,7 @@ fn worker_crash(status: &std::process::ExitStatus) -> Option<String> {
 /// serve the MCP client's `initialize` handshake.
 fn start_daemon_watcher_for_startup_dir(startup_dir: Option<&std::path::Path>) {
     let startup_dir = startup_dir.map(|p| p.to_path_buf());
-    std::thread::spawn(move || {
+    infigraph_mcp::lifecycle::background_startup_phase("startup_true_up", move || {
         infigraph_mcp::recovery::start_daemon_watcher_for_startup_dir(startup_dir.as_deref());
     });
 }
@@ -459,7 +465,10 @@ fn ui_enabled_from(args: &[String]) -> bool {
 }
 
 fn run() -> Result<()> {
-    let mcp_lock_outcome = infigraph_mcp::mcp_lock::acquire_with_takeover();
+    let mcp_lock_outcome = infigraph_mcp::lifecycle::required_startup_phase(
+        "mcp_lock",
+        infigraph_mcp::mcp_lock::acquire_with_takeover,
+    );
     let (is_primary, mcp_lock) = match mcp_lock_outcome {
         infigraph_mcp::mcp_lock::AcquireOutcome::Primary(lock) => {
             mcp_log("INFO", "Acquired mcp.lock — running as primary");
@@ -503,13 +512,16 @@ fn run() -> Result<()> {
     let transport = if mcp_mode { "stdio" } else { "http" };
     let project_path = project.to_string_lossy().to_string();
     let instance_info = infigraph_core::instances::InstanceInfo::current(&project_path, transport);
-    let _instance_guard = match infigraph_core::instances::register_instance(&instance_info) {
-        Ok(guard) => Some(guard),
-        Err(e) => {
-            mcp_log("WARN", &format!("Failed to register instance: {e:#}"));
-            None
-        }
-    };
+    let _instance_guard =
+        match infigraph_mcp::lifecycle::required_startup_phase("register_instance", move || {
+            infigraph_core::instances::register_instance(&instance_info)
+        }) {
+            Ok(guard) => Some(guard),
+            Err(e) => {
+                mcp_log("WARN", &format!("Failed to register instance: {e:#}"));
+                None
+            }
+        };
 
     // R5.4 (#79): SIGTERM/SIGINT must deregister this instance and exit
     // cleanly. Without a handler the signal kills the process mid-anything
@@ -536,7 +548,10 @@ fn run() -> Result<()> {
         infigraph_mcp::signal_sender::install();
     }
 
-    let reaped = infigraph_core::instances::reap_orphans_once(std::process::id());
+    let pid = std::process::id();
+    let reaped = infigraph_mcp::lifecycle::required_startup_phase("reap_orphans", move || {
+        infigraph_core::instances::reap_orphans_once(pid)
+    });
     if reaped > 0 {
         mcp_log(
             "INFO",
