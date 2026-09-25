@@ -1,3 +1,5 @@
+mod support;
+
 use std::collections::HashSet;
 
 use serde_json::json;
@@ -31,10 +33,19 @@ fn advertised_tools_match_mcp_tool_names() {
     );
 }
 
+/// Calls every tool for real, so it must not do so against a real project:
+/// with no `path`, a tool defaults to the process's cwd -- this crate's own
+/// directory -- and `index_project`/`watch_project` then indexed
+/// `crates/infigraph-mcp` and left a daemon running on it after every run
+/// (plus `enable_watch`/`disable_watch` rewriting its watch policy). A
+/// throwaway project that stops its daemon on drop, with watchers off.
 #[test]
 fn dispatch_handles_all_mcp_tool_names() {
+    support::disable_background_watchers();
+    let project = support::TestProject::new();
+    let args = json!({ "path": project.path_string() });
     for tool_name in infigraph_mcp::MCP_TOOL_NAMES {
-        let result = infigraph_mcp::dispatch_tool(tool_name, &json!({}));
+        let result = infigraph_mcp::dispatch_tool(tool_name, &args);
         if let Err(e) = result {
             let msg = e.to_string();
             assert!(
