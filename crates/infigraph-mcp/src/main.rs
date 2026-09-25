@@ -52,10 +52,13 @@ fn main() -> Result<()> {
         return run_worker();
     }
 
-    // #74: once per start, in the supervisor -- a worker failing this would
+    // #74/#199: once per start, in the supervisor -- a worker failing this would
     // only be restarted into the same failure. Workers still validate in
     // every `Infigraph::init*`.
-    match infigraph_core::check_backend_at_startup() {
+    let startup_root = infigraph_core::project::resolve_project_root(
+        &std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+    );
+    match infigraph_core::check_settings_at_startup(&startup_root) {
         Ok(backend) => mcp_log("INFO", &format!("backend: {backend}")),
         Err(e) => {
             mcp_log("ERROR", &format!("{e:#}"));

@@ -1033,15 +1033,6 @@ fn main() -> Result<()> {
     let update_handle = install::check_for_update_background();
 
     let cli = Cli::parse();
-    // #74: refuse a bad backend setting before any work -- except doctor,
-    // whose job is to report exactly that, and install/update/uninstall,
-    // which never open a store and are how a user gets a fixed build.
-    if !matches!(
-        cli.command,
-        Commands::Doctor { .. } | Commands::Install { .. } | Commands::Update | Commands::Uninstall
-    ) {
-        infigraph_core::check_backend_at_startup()?;
-    }
     // Resolve to the project that owns the cwd, not the cwd itself. Taking
     // the cwd verbatim is what created a separate store, daemon and socket
     // for every subdirectory anyone ever ran a command from.
@@ -1049,6 +1040,15 @@ fn main() -> Result<()> {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         infigraph_core::project::resolve_project_root(&cwd)
     });
+    // #74/#199: refuse a bad setting before any work -- except doctor,
+    // whose job is to report exactly that, and install/update/uninstall,
+    // which never open a store and are how a user gets a fixed build.
+    if !matches!(
+        cli.command,
+        Commands::Doctor { .. } | Commands::Install { .. } | Commands::Update | Commands::Uninstall
+    ) {
+        infigraph_core::check_settings_at_startup(&root)?;
+    }
 
     let should_auto_watch = should_auto_watch(&cli.command, &root);
 

@@ -45,6 +45,35 @@ pub fn warn_once(message: &str) -> bool {
     true
 }
 
+/// One `settings!` group, registered by the macro so [`check_all`] covers
+/// every group linked into the binary -- including one added later that
+/// nobody remembered to list (#199).
+pub struct RegisteredGroup {
+    pub category: &'static str,
+    pub check: fn(crate::settings_file::ConfigScope<'_>) -> Vec<SettingError>,
+}
+
+inventory::collect!(RegisteredGroup);
+
+/// The categories of every registered group, sorted.
+pub fn registered_categories() -> Vec<&'static str> {
+    let mut categories: Vec<&'static str> = inventory::iter::<RegisteredGroup>
+        .into_iter()
+        .map(|group| group.category)
+        .collect();
+    categories.sort_unstable();
+    categories
+}
+
+/// Strictly resolves every registered group against `scope`, returning
+/// every value that does not parse and every required field left unset.
+pub fn check_all(scope: crate::settings_file::ConfigScope<'_>) -> Vec<SettingError> {
+    inventory::iter::<RegisteredGroup>
+        .into_iter()
+        .flat_map(|group| (group.check)(scope))
+        .collect()
+}
+
 /// `INFIGRAPH_{CATEGORY}_{FIELD}`, both upper-cased.
 pub fn env_name(category: &str, field: &str) -> String {
     format!(
@@ -297,6 +326,22 @@ macro_rules! settings {
             #[derive(Debug, Clone, PartialEq)]
             pub struct [<$category:camel>] {
                 $( pub $field: $ty, )+
+            }
+
+            fn [<__settings_check_ $category>](
+                scope: $crate::settings_file::ConfigScope<'_>,
+            ) -> Vec<$crate::settings::SettingError> {
+                match [<$category:camel>]::resolve([<Raw $category:camel>]::default(), scope) {
+                    Ok(_) => Vec::new(),
+                    Err(e) => e.0,
+                }
+            }
+
+            $crate::inventory::submit! {
+                $crate::settings::RegisteredGroup {
+                    category: stringify!($category),
+                    check: [<__settings_check_ $category>],
+                }
             }
 
             impl [<$category:camel>] {
@@ -946,5 +991,27 @@ mod tests {
         assert!(super::warn_once(
             "warn_once_prints_each_message_once: another"
         ));
+    }
+
+    /// #199: every `settings!` group registers itself, so a startup check
+    /// covers groups nobody remembered to list.
+    #[test]
+    fn check_all_reports_a_bad_value_in_any_registered_group() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("INFIGRAPH_TOY_A_VALUE", "x");
+        let errors = super::check_all(crate::settings_file::ConfigScope::User);
+        std::env::remove_var("INFIGRAPH_TOY_A_VALUE");
+        assert!(
+            errors.iter().any(|e| e.setting == "INFIGRAPH_TOY_A_VALUE"),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn groups_declared_anywhere_in_the_crate_are_registered() {
+        let categories = super::registered_categories();
+        for category in ["backend", "graph", "watch", "toy_a"] {
+            assert!(categories.contains(&category), "{category}: {categories:?}");
+        }
     }
 }

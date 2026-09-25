@@ -64,6 +64,7 @@ pub mod write_phase;
 /// can reach `paste::paste!` via `$crate::paste::paste!`, and `toml_edit::Item`
 /// via `$crate::toml_edit::Item`, without needing their own direct
 /// dependency on either crate.
+pub use inventory;
 pub use paste;
 pub use toml_edit;
 
@@ -251,10 +252,15 @@ pub fn validated_backend() -> Result<BackendChoice> {
         .map_err(|e| anyhow::anyhow!("invalid backend setting: {e}"))
 }
 
-/// Startup check for the CLI and the MCP server (#74): the backend setting
-/// must parse, and a remote backend must answer. Returns the choice so the
+/// Startup check for the CLI and the MCP server: every registered settings
+/// group must resolve for the project at `root` (#199; the backend among
+/// them, #74), and a remote backend must answer. Returns the backend so the
 /// caller can log it.
-pub fn check_backend_at_startup() -> Result<BackendChoice> {
+pub fn check_settings_at_startup(root: &Path) -> Result<BackendChoice> {
+    let errors = settings::check_all(settings_file::ConfigScope::Project(root));
+    if !errors.is_empty() {
+        anyhow::bail!("invalid settings: {}", settings::SettingsError(errors));
+    }
     let backend = validated_backend()?;
     #[cfg(feature = "neo4j")]
     if backend == BackendChoice::Neo4j {

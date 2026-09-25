@@ -141,7 +141,7 @@ The `resolve` sketch above is the original shape; it is superseded as follows (s
 - **`env_layer()`** returns the environment layer alone, for the two callers that consult their own config source next (`session`, `[index] include`).
 - **`settings_enum!`** declares an enum-valued field type from each variant's spelling (`Kuzu = "kuzu"`), generating `FromStr` (its error lists the valid spellings), `as_str`/`Display`, `FromTomlItem` and `Deserialize`.
 - **Backend:** `backend.selected` is a `BackendChoice { Kuzu, Daemon, Neo4j }` with `#[legacy = "INFIGRAPH_BACKEND"]`. `validated_backend()` is strict and gates every `Infigraph::init*` (an exhaustive match, so no catch-all can open Kuzu), and `check_backend_at_startup()` gates the CLI (all commands but `doctor`) and the MCP supervisor, pinging Neo4j when it is selected. `selected_backend()` stays infallible for the bool helpers.
-- **Not yet:** only the backend is checked at startup; other groups warn and fall back at runtime. A startup `check_all` over every group is tracked as a follow-up issue.
+- **Every group is checked at startup (#199).** `settings!` registers each group through `inventory`, so `settings::check_all(scope)` strictly resolves every group linked into the binary -- a group added later is covered without being listed anywhere. `check_settings_at_startup(root)` runs it for the CLI (all commands but `doctor`/`install`/`update`/`uninstall`) and the MCP supervisor, then pings Neo4j when selected; `doctor` reports each bad setting. At runtime, infallible helpers still use `resolve_or_default` and warn once.
 
 ## Resolved decisions
 

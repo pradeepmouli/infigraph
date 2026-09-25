@@ -48,7 +48,7 @@ fn doctor_runs_and_reports_an_invalid_backend() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(
-        text.contains("backend setting"),
+        text.contains("INFIGRAPH_BACKEND"),
         "doctor must run and report it: {text}"
     );
     assert!(text.contains("kuzuu"), "{text}");
@@ -71,5 +71,34 @@ fn install_is_not_blocked_by_a_bad_backend() {
     assert!(
         !stderr.contains("invalid backend setting"),
         "install must not be gated on the backend: {stderr}"
+    );
+}
+
+/// #199: not just the backend -- a bad value in any settings group stops
+/// the CLI at startup, naming it, and doctor (exempt) reports it.
+#[test]
+fn a_bad_value_in_any_settings_group_fails_startup_and_doctor_reports_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let run = |command: &str| {
+        let out = infigraph()
+            .current_dir(tmp.path())
+            .env("INFIGRAPH_GRAPH_MAX_BYTES", "lots")
+            .arg(command)
+            .output()
+            .unwrap();
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        (out.status.success(), text)
+    };
+    let (ok, text) = run("watch-status");
+    assert!(!ok, "a bad setting must stop startup: {text}");
+    assert!(text.contains("INFIGRAPH_GRAPH_MAX_BYTES"), "{text}");
+    let (_, text) = run("doctor");
+    assert!(
+        text.contains("INFIGRAPH_GRAPH_MAX_BYTES") && text.contains("\"lots\""),
+        "doctor must report it: {text}"
     );
 }

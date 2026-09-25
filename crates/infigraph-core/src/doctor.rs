@@ -1381,22 +1381,33 @@ pub fn check_graph_holders(ctx: &DoctorContext) -> Vec<CheckResult> {
 
 const CONFIG_CATEGORY: &str = "config";
 
-/// #74: a bad `INFIGRAPH_BACKEND` stops every other command at startup, so
-/// doctor -- exempt from that check -- is where it gets explained.
-pub fn check_backend_setting() -> Vec<CheckResult> {
-    vec![match crate::validated_backend() {
-        Ok(backend) => CheckResult::pass(
+/// #74/#199: a bad setting stops every other command at startup, so doctor
+/// -- exempt from that check -- is where each one gets explained.
+pub fn check_settings(ctx: &DoctorContext) -> Vec<CheckResult> {
+    let scope = match &ctx.scope {
+        DoctorScope::Project(root) => crate::settings_file::ConfigScope::Project(root),
+        DoctorScope::Global => crate::settings_file::ConfigScope::User,
+    };
+    let errors = crate::settings::check_all(scope);
+    if errors.is_empty() {
+        let backend = crate::selected_backend();
+        return vec![CheckResult::pass(
             CONFIG_CATEGORY,
-            "backend setting",
-            format!("backend: {backend}"),
-        ),
-        Err(e) => CheckResult::fail(
-            CONFIG_CATEGORY,
-            "backend setting",
-            format!("{e:#}"),
-            "fix the setting named above: kuzu, daemon or neo4j (or unset it for the default)",
-        ),
-    }]
+            "settings",
+            format!("all settings valid (backend: {backend})"),
+        )];
+    }
+    errors
+        .into_iter()
+        .map(|e| {
+            CheckResult::fail(
+                CONFIG_CATEGORY,
+                e.setting.clone(),
+                e.problem.clone(),
+                "fix or unset this setting (env var or config.toml)",
+            )
+        })
+        .collect()
 }
 
 const TOOLCHAIN_CATEGORY: &str = "toolchain";
@@ -1436,7 +1447,7 @@ pub fn run_doctor(ctx: DoctorContext) -> DoctorReport {
     checks.extend(check_scip_staleness(&ctx));
     checks.extend(check_worktrees(&ctx));
     checks.extend(check_recovery(&ctx));
-    checks.extend(check_backend_setting());
+    checks.extend(check_settings(&ctx));
     checks.extend(check_toolchain(&ctx));
     DoctorReport {
         checks,
