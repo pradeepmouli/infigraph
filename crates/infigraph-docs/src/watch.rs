@@ -33,7 +33,14 @@ pub fn watch_docs(
 
     let debounce = Duration::from_millis(debounce_ms);
     let mut last_reindex = Instant::now();
-    let mut pending = false;
+    // Start with one catch-up reindex, run once the watch above is live. A
+    // document written before then -- while no watcher was attached, or in
+    // the gap between attaching and the stream starting -- produced an
+    // event nobody received, and would otherwise stay unindexed until some
+    // other change happened to touch the tree (#198). The reindex is
+    // incremental, so unchanged files cost a hash check. The code watcher
+    // catches up the same way (`catches_drift_from_before_it_was_running`).
+    let mut pending = true;
 
     loop {
         if stop_rx.try_recv().is_ok() {
