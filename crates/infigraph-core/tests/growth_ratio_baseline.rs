@@ -102,6 +102,10 @@ fn a_full_reindex_does_refresh_the_growth_ratio_baseline() {
         .arg("--no-embed")
         .current_dir(dir.path())
         .env(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND)
+        // No auto-watch daemon: this test is about the baseline, and a
+        // daemon still writing into the tree makes `TempDir`'s removal fail
+        // part-way, leaving a live root the daemon then watches forever.
+        .env("INFIGRAPH_NO_WATCH", "1")
         .env_remove("INFIGRAPH_WATCH_DAEMON")
         .status()
         .unwrap();
@@ -128,6 +132,10 @@ fn a_full_reindex_does_refresh_the_growth_ratio_baseline() {
         .arg("--no-embed")
         .current_dir(dir.path())
         .env(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND)
+        // No auto-watch daemon: this test is about the baseline, and a
+        // daemon still writing into the tree makes `TempDir`'s removal fail
+        // part-way, leaving a live root the daemon then watches forever.
+        .env("INFIGRAPH_NO_WATCH", "1")
         .env_remove("INFIGRAPH_WATCH_DAEMON")
         .status()
         .unwrap();
