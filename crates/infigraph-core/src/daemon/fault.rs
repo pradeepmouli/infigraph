@@ -126,7 +126,18 @@ pub fn fault_path(infigraph_dir: &Path) -> PathBuf {
 
 /// Record `class` for this process. Rewrites only when the class changes,
 /// so a daemon failing every tick writes once and keeps its `since`.
+///
+/// A missing `infigraph_dir` records nothing: the project is gone, and
+/// writing would `create_dir_all` it back into existence -- which is what
+/// keeps a daemon on a deleted root alive forever (#136).
 pub fn record(infigraph_dir: &Path, class: FaultClass, error: &str) {
+    if !infigraph_dir.is_dir() {
+        eprintln!(
+            "[daemon] not recording a {class:?} fault: {} is gone ({error})",
+            infigraph_dir.display()
+        );
+        return;
+    }
     let path = fault_path(infigraph_dir);
     if read(&path).is_some_and(|f| f.holder.pid == std::process::id() && f.class == class) {
         return;
@@ -276,5 +287,26 @@ mod tests {
         )
         .unwrap();
         assert!(live_fault(dir.path()).is_none());
+    }
+
+    /// A daemon whose project was deleted records `OpenFailed` ("invalid
+    /// project root") -- and writing that record used to `create_dir_all`
+    /// the `.infigraph/` it lives in, resurrecting the deleted root. The
+    /// daemon's root-gone check then saw a directory and kept running
+    /// forever (the #136 leak, reintroduced by #165). No `.infigraph/`
+    /// means no project, so there is nothing to record.
+    #[test]
+    fn recording_never_recreates_a_deleted_infigraph_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let infigraph_dir = tmp.path().join("project").join(".infigraph");
+        record(
+            &infigraph_dir,
+            FaultClass::OpenFailed,
+            "invalid project root",
+        );
+        assert!(
+            !tmp.path().join("project").exists(),
+            "recording a fault must not resurrect the project root"
+        );
     }
 }
