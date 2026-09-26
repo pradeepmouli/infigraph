@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 
 use super::read_endpoint::ReadEndpoint;
-use super::read_protocol::{read_request, write_frame, ReadFrame, Store};
+use super::read_protocol::{read_client_frame, write_frame, ClientFrame, ReadFrame, Store};
 
 /// Resolves the store to serve a request from, at request time.
 ///
@@ -184,7 +184,9 @@ fn serve_one<S: std::io::Read + std::io::Write>(
     docs: Option<&RowSource>,
     mut stream: S,
 ) -> Result<()> {
-    let req = read_request(&mut stream)?;
+    let ClientFrame::Read(req) = read_client_frame(&mut stream)? else {
+        anyhow::bail!("unexpected attach");
+    };
 
     // The document store is a separate `Database` with its own lock file and
     // its own wipe-on-open-failure history (#143), reached through a closure
