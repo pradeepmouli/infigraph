@@ -142,6 +142,28 @@ fn graph_health_path(infigraph_dir: &Path) -> std::path::PathBuf {
     infigraph_dir.join("graph.health.json")
 }
 
+/// Written beside `graph.health.json` the first time a baseline lands, and
+/// never removed by anything short of the full-reindex wipe that also removes
+/// the graph it vouched for (#185). Its only job is to outlive the baseline:
+/// without it, a baseline that was deleted reads exactly like one that was
+/// never recorded, and the guard must pass the second (a first index) while
+/// refusing the first.
+fn baseline_marker_path(infigraph_dir: &Path) -> std::path::PathBuf {
+    infigraph_dir.join("graph.health.recorded")
+}
+
+fn mark_baseline_recorded(infigraph_dir: &Path) {
+    let marker = baseline_marker_path(infigraph_dir);
+    if !marker.exists() {
+        let _ = crate::daemon_protocol::write_atomic(
+            &marker,
+            "A growth baseline (graph.health.json) has been recorded for this graph. \
+             While this file exists, a missing graph.health.json refuses writes; run \
+             `infigraph restamp-baseline` or `infigraph rebuild` to record one again.\n",
+        );
+    }
+}
+
 fn read_healthy_size(infigraph_dir: &Path) -> Option<u64> {
     let content = std::fs::read_to_string(graph_health_path(infigraph_dir)).ok()?;
     let v: serde_json::Value = serde_json::from_str(&content).ok()?;
@@ -227,10 +249,14 @@ pub fn stamp_healthy_graph_size(infigraph_dir: &Path, graph_path: &Path) {
         return; // nothing written yet -- nothing to stamp
     }
     let payload = serde_json::json!({ "healthy_size_bytes": graph_family_bytes(graph_path) });
-    let _ = crate::daemon_protocol::write_atomic(
+    if crate::daemon_protocol::write_atomic(
         &graph_health_path(infigraph_dir),
         &serde_json::to_string_pretty(&payload).unwrap_or_default(),
-    );
+    )
+    .is_ok()
+    {
+        mark_baseline_recorded(infigraph_dir);
+    }
 }
 
 /// Bootstraps the baseline exactly once, after a project's very first
@@ -264,7 +290,16 @@ pub(crate) fn stamp_healthy_graph_size_if_unset(infigraph_dir: &Path, graph_path
     // `ordinary_incremental_writes_do_not_move_the_growth_ratio_baseline`.
     // A too-early baseline is also self-correcting, since a verified full
     // rebuild re-stamps unconditionally; never having one is not.
-    if read_healthy_size(infigraph_dir).is_none() {
+    //
+    // #185: a baseline that is missing *after* the marker says one existed is
+    // not "unset" but lost, and bootstrapping over it would anchor the guard at
+    // whatever size the graph has reached -- the ratchet. Only the explicit
+    // `stamp_healthy_graph_size` may record it again. A baseline that is
+    // present gets the marker here, which is how projects whose baseline
+    // predates the marker acquire one: on their next ordinary write.
+    if read_healthy_size(infigraph_dir).is_some() {
+        mark_baseline_recorded(infigraph_dir);
+    } else if !baseline_marker_path(infigraph_dir).exists() {
         stamp_healthy_graph_size(infigraph_dir, graph_path);
     }
 }
@@ -274,7 +309,8 @@ pub(crate) fn stamp_healthy_graph_size_if_unset(infigraph_dir: &Path, graph_path
 /// NOT a fix for the underlying cause (why Kuzu's WAL isn't checkpointing
 /// under the observed workloads) -- only a refusal before a write can push
 /// the graph further into that pattern. Passes rather than refuses when no
-/// baseline exists yet -- there's nothing to compare against -- but
+/// baseline exists yet -- there's nothing to compare against, unless
+/// `graph.health.recorded` says one existed and was lost (#185) -- but
 /// deliberately does NOT establish one itself: this runs as a *preflight*,
 /// before the write it guards, so stamping here would capture the graph's
 /// pre-write size. `stamp_healthy_graph_size_if_unset`, called by the same
@@ -340,6 +376,26 @@ pub(crate) fn check_graph_growth_ratio(
     }
 
     let Some(healthy) = read_healthy_size(infigraph_dir) else {
+        // #185: no baseline is a first index, and passes -- unless the marker
+        // says one was recorded, in which case it was lost and this graph's
+        // size is unvouched for. Only the live graph is held to that: a rebuild
+        // at a side path is fresh from source, and is the remedy named below.
+        if baseline_marker_path(infigraph_dir).exists() && graph_path == infigraph_dir.join("graph")
+        {
+            return Err(format!(
+                "graph at {} is {} MB, and its growth baseline ({}) is missing or \
+                 unreadable although {} records that one existed -- refusing further \
+                 growth rather than re-anchoring the guard at a size nothing has \
+                 vouched for. ALL indexing is blocked until this is resolved -- run \
+                 `infigraph rebuild`, which rebuilds the graph compactly and re-stamps \
+                 the baseline, or, if the current graph is known to be healthy, \
+                 `infigraph restamp-baseline` to accept its size as the baseline",
+                graph_path.display(),
+                current / (1024 * 1024),
+                graph_health_path(infigraph_dir).display(),
+                baseline_marker_path(infigraph_dir).display(),
+            ));
+        }
         return Ok(());
     };
     let ratio = graph_growth_max_ratio(scope);
@@ -1014,6 +1070,71 @@ mod tests {
         std::fs::write(&graph_path, vec![0u8; 999_999]).unwrap();
         stamp_healthy_graph_size_if_unset(tmp.path(), &graph_path);
         assert_eq!(read_healthy_size(tmp.path()), Some(1024));
+    }
+
+    /// #185: a baseline that existed and is now gone is not a first index.
+    /// Following the old "delete graph.health.json" advice, or losing the file
+    /// any other way, used to pass every preflight and then let
+    /// `stamp_healthy_graph_size_if_unset` anchor a new baseline at the
+    /// bloated size. The preflight must refuse instead, and say how to recover.
+    #[test]
+    fn growth_check_refuses_when_a_recorded_baseline_has_gone_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let graph_path = tmp.path().join("graph");
+        std::fs::write(&graph_path, vec![0u8; 1024]).unwrap();
+        stamp_healthy_graph_size_if_unset(tmp.path(), &graph_path);
+        assert!(check_graph_growth_ratio(tmp.path(), &graph_path).is_ok());
+
+        std::fs::remove_file(tmp.path().join("graph.health.json")).unwrap();
+        let err = check_graph_growth_ratio(tmp.path(), &graph_path)
+            .expect_err("a baseline that once existed and is gone must refuse, not pass");
+        assert!(
+            err.contains("restamp-baseline") && err.contains("infigraph rebuild"),
+            "the refusal must name both ways to record a baseline again: {err}"
+        );
+
+        // Nor may the post-write bootstrap quietly re-anchor it.
+        stamp_healthy_graph_size_if_unset(tmp.path(), &graph_path);
+        assert!(read_healthy_size(tmp.path()).is_none());
+
+        // The explicit restamp is the way back.
+        stamp_healthy_graph_size(tmp.path(), &graph_path);
+        assert!(check_graph_growth_ratio(tmp.path(), &graph_path).is_ok());
+    }
+
+    /// #185 migration: a project whose baseline predates the marker must
+    /// have it recorded by its next ordinary write, or deleting that baseline
+    /// would still read as a first index.
+    #[test]
+    fn a_baseline_recorded_before_the_marker_existed_gains_one_on_the_next_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let graph_path = tmp.path().join("graph");
+        std::fs::write(&graph_path, vec![0u8; 1024]).unwrap();
+        std::fs::write(
+            tmp.path().join("graph.health.json"),
+            r#"{"healthy_size_bytes": 1024}"#,
+        )
+        .unwrap();
+
+        stamp_healthy_graph_size_if_unset(tmp.path(), &graph_path);
+        std::fs::remove_file(tmp.path().join("graph.health.json")).unwrap();
+        assert!(check_graph_growth_ratio(tmp.path(), &graph_path).is_err());
+    }
+
+    /// #185: `infigraph rebuild` is the remedy the refusal names, and under
+    /// the daemon it builds at a side path. That build is fresh from source,
+    /// so a lost baseline for the graph it replaces says nothing about it.
+    #[test]
+    fn a_lost_baseline_does_not_refuse_a_rebuild_at_a_side_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let live = tmp.path().join("graph");
+        std::fs::write(&live, vec![0u8; 1024]).unwrap();
+        stamp_healthy_graph_size(tmp.path(), &live);
+        std::fs::remove_file(tmp.path().join("graph.health.json")).unwrap();
+
+        let side = tmp.path().join("graph.rebuilding");
+        std::fs::write(&side, vec![0u8; 1024]).unwrap();
+        assert!(check_graph_growth_ratio(tmp.path(), &side).is_ok());
     }
 
     /// #183: compaction escalates on *how close to refusal* the graph is, so
