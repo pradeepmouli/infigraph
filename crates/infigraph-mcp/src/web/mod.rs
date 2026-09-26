@@ -118,14 +118,69 @@ pub fn bind_addr(env_var: &str, port: u16) -> String {
     format!("{host}:{port}")
 }
 
+/// What a server may do at `addr` (#190).
+#[derive(Debug, PartialEq, Eq)]
+enum BindVerdict {
+    /// Only this host can reach it, or every request must authenticate.
+    Serve,
+    /// Beyond loopback and unauthenticated, but the operator said so.
+    Warn,
+    /// Beyond loopback and unauthenticated, with no one having said so.
+    Refuse,
+}
+
+/// The exposure decision both servers share: an address that reaches
+/// anything but this host may serve only authenticated requests unless
+/// `allow_unauthenticated` says otherwise. An address that does not resolve
+/// counts as beyond loopback -- the bind would fail anyway, and failing
+/// closed here costs nothing.
+fn bind_verdict(addr: &str, authenticated: bool, allow_unauthenticated: bool) -> BindVerdict {
+    use std::net::ToSocketAddrs;
+    let loopback_only = addr
+        .to_socket_addrs()
+        .map(|mut resolved| {
+            let mut any = false;
+            resolved.all(|a| {
+                any = true;
+                a.ip().is_loopback()
+            }) && any
+        })
+        .unwrap_or(false);
+    if loopback_only || authenticated {
+        BindVerdict::Serve
+    } else if allow_unauthenticated {
+        BindVerdict::Warn
+    } else {
+        BindVerdict::Refuse
+    }
+}
+
+/// Why a [`BindVerdict::Warn`] or [`BindVerdict::Refuse`] is one.
+fn unauthenticated_exposure(env_var: &str, addr: &str) -> String {
+    format!(
+        "{env_var} binds {addr}, beyond loopback, and nothing authenticates its requests: \
+         anyone who can reach it can run raw Cypher against the graph"
+    )
+}
+
 /// Start the web UI server on the given port. Runs in a background thread.
 ///
 /// Binds to loopback (`127.0.0.1`) by default so the unauthenticated Web UI/API
 /// (including `/api/query`, which runs raw Cypher) is not reachable from other
 /// hosts on the network. Set `INFIGRAPH_UI_BIND` to override the bind address
 /// (e.g. `0.0.0.0`) when intentionally exposing the UI.
+///
+/// The UI checks no API key, so beyond loopback it always warns (#190). It
+/// never refuses: it is opted into with `--ui` and serves less than
+/// `--serve`.
 pub fn start_ui_server(port: u16) -> bool {
     let addr = bind_addr("INFIGRAPH_UI_BIND", port);
+    if bind_verdict(&addr, false, true) == BindVerdict::Warn {
+        let message = unauthenticated_exposure("INFIGRAPH_UI_BIND", &addr);
+        if infigraph_core::settings::warn_once(&message) {
+            crate::mcp_log("WARN", &message);
+        }
+    }
     // Pre-check: try binding before spawning thread so caller knows outcome
     let server = match Server::http(&addr) {
         Ok(s) => s,
@@ -183,11 +238,39 @@ pub fn start_ui_server(port: u16) -> bool {
 /// included, and `check_auth` passes everything when no API key is set.
 /// `--serve` exists to be reached over the network, so a real deployment
 /// sets `INFIGRAPH_MCP_BIND` (e.g. `0.0.0.0`) -- together with an API key.
-pub fn start_mcp_http_server(port: u16, is_primary: bool, health_path: &str) -> bool {
+///
+/// Forgetting the key used to serve the network unauthenticated; now that
+/// refuses to start, before binding, unless
+/// `INFIGRAPH_ALLOW_UNAUTHENTICATED=1` says it is meant (#190). `Ok(false)`
+/// is a port already in use.
+pub fn start_mcp_http_server(port: u16, is_primary: bool, health_path: &str) -> Result<bool> {
     let addr = bind_addr("INFIGRAPH_MCP_BIND", port);
+    let authenticated = !matches!(api_key(), Ok(None));
+    match bind_verdict(&addr, authenticated, allow_unauthenticated()) {
+        BindVerdict::Serve => {}
+        BindVerdict::Warn => {
+            let message = format!(
+                "{} (INFIGRAPH_ALLOW_UNAUTHENTICATED is set)",
+                unauthenticated_exposure("INFIGRAPH_MCP_BIND", &addr)
+            );
+            if infigraph_core::settings::warn_once(&message) {
+                crate::mcp_log("WARN", &message);
+            }
+        }
+        BindVerdict::Refuse => {
+            let message = format!(
+                "refusing to serve: {}. Set an API key (INFIGRAPH_API_KEY, or [web] api_key \
+                 in ~/.infigraph/config.toml), bind loopback, or set \
+                 INFIGRAPH_ALLOW_UNAUTHENTICATED=1 to serve it unauthenticated anyway",
+                unauthenticated_exposure("INFIGRAPH_MCP_BIND", &addr)
+            );
+            crate::mcp_log("ERROR", &message);
+            anyhow::bail!(message);
+        }
+    }
     let server = match Server::http(&addr) {
         Ok(s) => s,
-        Err(_) => return false,
+        Err(_) => return Ok(false),
     };
     let health_path = health_path.to_string();
     thread::spawn(move || {
@@ -256,7 +339,7 @@ pub fn start_mcp_http_server(port: u16, is_primary: bool, health_path: &str) -> 
             let _ = request.respond(response);
         }
     });
-    true
+    Ok(true)
 }
 
 fn handle_mcp_post(
@@ -296,10 +379,17 @@ fn handle_mcp_post(
 // HTTP-transport bearer auth. `INFIGRAPH_API_KEY` predates the macro and
 // exists upstream, so `api_key` seeds it from the legacy name; the canonical
 // `INFIGRAPH_WEB_API_KEY` also works, legacy wins. Empty disables auth.
+// `allow_unauthenticated` lets `--serve` bind beyond loopback with no key
+// (#190); it reads as `INFIGRAPH_ALLOW_UNAUTHENTICATED`, the name the refusal
+// tells people to set, as well as the canonical
+// `INFIGRAPH_WEB_ALLOW_UNAUTHENTICATED`.
 infigraph_core::settings! {
     web {
         #[legacy = "INFIGRAPH_API_KEY"]
         api_key: String = String::new(),
+        #[legacy = "INFIGRAPH_ALLOW_UNAUTHENTICATED"]
+        allow_unauthenticated: infigraph_core::settings::Toggle =
+            infigraph_core::settings::Toggle(false),
     }
 }
 
@@ -311,6 +401,15 @@ fn api_key() -> Result<Option<String>, infigraph_core::settings::SettingsError> 
         infigraph_core::settings_file::ConfigScope::User,
     )
     .map(|web| Some(web.api_key).filter(|k| !k.is_empty()))
+}
+
+/// Fails closed like [`api_key`]: a group that does not resolve is no opt-out.
+fn allow_unauthenticated() -> bool {
+    Web::resolve(
+        RawWeb::default(),
+        infigraph_core::settings_file::ConfigScope::User,
+    )
+    .is_ok_and(|web| web.allow_unauthenticated.0)
 }
 
 /// The auth decision on its own: no key allows everything, a key requires
@@ -619,7 +718,7 @@ mod tests {
         let _guard = test_lock();
         let port = free_port();
         set_ready(true);
-        assert!(start_mcp_http_server(port, false, "/health"));
+        assert!(start_mcp_http_server(port, false, "/health").unwrap());
         thread::sleep(std::time::Duration::from_millis(100));
 
         let (status, body) = http_get(port, "/health");
@@ -632,7 +731,7 @@ mod tests {
         let _guard = test_lock();
         let port = free_port();
         set_ready(true);
-        assert!(start_mcp_http_server(port, false, "/health/full"));
+        assert!(start_mcp_http_server(port, false, "/health/full").unwrap());
         thread::sleep(std::time::Duration::from_millis(100));
 
         let (status, body) = http_get(port, "/health/full");
@@ -645,7 +744,7 @@ mod tests {
         let _guard = test_lock();
         let port = free_port();
         set_ready(false);
-        assert!(start_mcp_http_server(port, false, "/health"));
+        assert!(start_mcp_http_server(port, false, "/health").unwrap());
         thread::sleep(std::time::Duration::from_millis(100));
 
         let (status, body) = http_get(port, "/health");
@@ -659,7 +758,7 @@ mod tests {
         let _guard = test_lock();
         let port = free_port();
         set_ready(true);
-        assert!(start_mcp_http_server(port, false, "/health/full"));
+        assert!(start_mcp_http_server(port, false, "/health/full").unwrap());
         thread::sleep(std::time::Duration::from_millis(100));
 
         let (status, _) = http_get(port, "/health");
@@ -907,7 +1006,7 @@ mod tests {
         REINDEXING.store(false, Ordering::SeqCst);
         let port = free_port();
         set_ready(true);
-        assert!(start_mcp_http_server(port, false, "/health"));
+        assert!(start_mcp_http_server(port, false, "/health").unwrap());
         thread::sleep(std::time::Duration::from_millis(100));
 
         let body = push_event("test-repo", "refs/heads/main", "main");
@@ -930,7 +1029,7 @@ mod tests {
         REINDEXING.store(false, Ordering::SeqCst);
         let port = free_port();
         set_ready(true);
-        assert!(start_mcp_http_server(port, false, "/health"));
+        assert!(start_mcp_http_server(port, false, "/health").unwrap());
         thread::sleep(std::time::Duration::from_millis(100));
 
         let body = push_event("test-repo", "refs/heads/main", "main");
@@ -954,7 +1053,7 @@ mod tests {
         let _guard = test_lock();
         let port = free_port();
         set_ready(true);
-        assert!(start_mcp_http_server(port, false, "/health"));
+        assert!(start_mcp_http_server(port, false, "/health").unwrap());
         thread::sleep(std::time::Duration::from_millis(100));
 
         let (status, body) = http_get(port, "/webhook/status");
@@ -998,7 +1097,7 @@ mod tests {
         }
         let port = free_port();
         assert!(
-            start_mcp_http_server(port, false, "/health"),
+            start_mcp_http_server(port, false, "/health").unwrap(),
             "MCP HTTP server should start on loopback"
         );
         thread::sleep(std::time::Duration::from_millis(100));
@@ -1011,6 +1110,45 @@ mod tests {
         assert!(
             TcpListener::bind(format!("0.0.0.0:{}", port)).is_ok(),
             "MCP HTTP server must not bind 0.0.0.0 by default"
+        );
+    }
+
+    /// #190: `INFIGRAPH_MCP_BIND=0.0.0.0` with no API key used to serve the
+    /// whole tool surface to the network unauthenticated. It now refuses
+    /// before binding, and the error names the variables that resolve it.
+    #[test]
+    fn test_mcp_http_server_refuses_to_bind_beyond_loopback_without_a_key() {
+        let _guard = test_lock();
+        let unset = [
+            "INFIGRAPH_API_KEY",
+            "INFIGRAPH_WEB_API_KEY",
+            "INFIGRAPH_ALLOW_UNAUTHENTICATED",
+            "INFIGRAPH_WEB_ALLOW_UNAUTHENTICATED",
+        ];
+        unsafe {
+            for var in unset {
+                std::env::remove_var(var);
+            }
+            std::env::set_var("INFIGRAPH_MCP_BIND", "0.0.0.0");
+        }
+        let port = free_port();
+        let result = start_mcp_http_server(port, false, "/health");
+        unsafe {
+            std::env::remove_var("INFIGRAPH_MCP_BIND");
+        }
+
+        let err = result.expect_err("no key beyond loopback must refuse");
+        let msg = format!("{err:#}");
+        for named in [
+            "INFIGRAPH_MCP_BIND",
+            "INFIGRAPH_API_KEY",
+            "INFIGRAPH_ALLOW_UNAUTHENTICATED",
+        ] {
+            assert!(msg.contains(named), "error should name {named}: {msg}");
+        }
+        assert!(
+            TcpListener::bind(format!("0.0.0.0:{port}")).is_ok(),
+            "a refused server must not have bound its port"
         );
     }
 
@@ -1050,7 +1188,7 @@ mod tests {
         REINDEXING.store(false, Ordering::SeqCst);
         let port = free_port();
         set_ready(true);
-        assert!(start_mcp_http_server(port, false, "/health"));
+        assert!(start_mcp_http_server(port, false, "/health").unwrap());
         thread::sleep(std::time::Duration::from_millis(100));
 
         let body = push_event("nonexistent-repo", "refs/heads/main", "main");
@@ -1068,7 +1206,62 @@ mod tests {
 
 #[cfg(test)]
 mod auth_tests {
-    use super::authorized;
+    use super::{authorized, bind_verdict, BindVerdict};
+
+    /// #190: only an address that reaches nothing but this host may serve
+    /// without an API key. Wildcards, a LAN address and anything that does
+    /// not resolve all count as beyond loopback.
+    #[test]
+    fn no_key_serves_only_on_loopback() {
+        // `::1:8642` is what an unbracketed `INFIGRAPH_MCP_BIND=::1` yields;
+        // it resolves (and binds) as `[::1]:8642`.
+        for addr in [
+            "127.0.0.1:8642",
+            "127.1.2.3:8642",
+            "[::1]:8642",
+            "::1:8642",
+            "localhost:8642",
+        ] {
+            assert_eq!(
+                bind_verdict(addr, false, false),
+                BindVerdict::Serve,
+                "{addr}"
+            );
+        }
+        for addr in ["0.0.0.0:8642", "[::]:8642", "192.168.1.20:8642", ":8642"] {
+            assert_eq!(
+                bind_verdict(addr, false, false),
+                BindVerdict::Refuse,
+                "{addr}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_key_serves_on_any_address() {
+        for addr in [
+            "0.0.0.0:8642",
+            "[::]:8642",
+            "192.168.1.20:8642",
+            "127.0.0.1:8642",
+        ] {
+            assert_eq!(
+                bind_verdict(addr, true, false),
+                BindVerdict::Serve,
+                "{addr}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_opt_out_serves_beyond_loopback_but_warns() {
+        assert_eq!(bind_verdict("0.0.0.0:8642", false, true), BindVerdict::Warn);
+        assert_eq!(
+            bind_verdict("127.0.0.1:8642", false, true),
+            BindVerdict::Serve
+        );
+        assert_eq!(bind_verdict("0.0.0.0:8642", true, true), BindVerdict::Serve);
+    }
 
     fn bad_key() -> Result<Option<String>, infigraph_core::settings::SettingsError> {
         Err(infigraph_core::settings::SettingsError(vec![

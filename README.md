@@ -225,7 +225,11 @@ Both HTTP servers bind **loopback by default** and are exposed to the
 network only when you say so: `INFIGRAPH_MCP_BIND` for `--serve`, and
 `INFIGRAPH_UI_BIND` for the web UI (ADV-2598). Set an API key whenever you
 do — `POST /tools/mcp` is the whole tool surface, raw Cypher queries
-included, and with no key configured it accepts every request.
+included, and with no key configured it accepts every request. `--serve`
+therefore refuses to start beyond loopback without a key, unless
+`INFIGRAPH_ALLOW_UNAUTHENTICATED=1` says an open server is intended (it
+then starts with a warning). The web UI checks no key at all, so beyond
+loopback it always starts with a warning on stderr and in the MCP log.
 
 > **Upgrading a remote deployment:** before this default existed, `--serve`
 > bound `0.0.0.0`. A deployment that relied on that stops accepting remote
