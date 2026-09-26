@@ -262,6 +262,10 @@ fn serve_one(
             park_lease(leases.clone(), attach_pid, stream);
             return Ok(());
         }
+        ClientFrame::Status(_) | ClientFrame::Control(_) => {
+            // Served from Task 3 on.
+            return Ok(());
+        }
     };
     leases.liveness.touch();
 

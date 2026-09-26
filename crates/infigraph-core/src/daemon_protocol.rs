@@ -138,26 +138,9 @@ pub enum WriteRequest {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub enum WatchRole {
-    Code,
-    Docs,
-    /// Full-process stop/restart -- a per-role alternative to the
-    /// undecorated `watch.stop` sentinel, which remains the mechanism the
-    /// legacy `watch-stop` CLI alias and `worktree_commands.rs` use (see
-    /// docs/superpowers/specs/2026-08-21-daemon-watch-command-split-design.md,
-    /// "Crossing the process boundary").
-    Daemon,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub enum WatchAction {
-    Start,
-    Stop,
-    Enable,
-    Disable,
-    Restart,
-}
+/// Moved to the read protocol with #155; re-exported so existing paths keep
+/// working.
+pub use crate::daemon::read_protocol::{WatchAction, WatchRole};
 
 /// Where IngestStructured's data comes from. `Inline` carries no data
 /// itself -- the actual array lives in a sibling `.data.json` file next to
