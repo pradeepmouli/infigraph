@@ -616,7 +616,7 @@ fn run() -> Result<()> {
     }
 
     if serve_mode {
-        if web::start_mcp_http_server(mcp_port, is_primary, &health_path) {
+        if web::start_mcp_http_server(mcp_port, is_primary, &health_path)? {
             eprintln!(
                 "Infigraph MCP HTTP server at http://{}",
                 web::bind_addr("INFIGRAPH_MCP_BIND", mcp_port)
