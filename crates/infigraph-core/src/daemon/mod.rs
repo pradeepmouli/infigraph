@@ -689,6 +689,7 @@ where
                     docs_reads.clone(),
                     READ_SERVICE_WORKERS,
                     liveness.clone(),
+                    None,
                 ) {
                     Ok(svc) => Some(svc),
                     Err(e) => {

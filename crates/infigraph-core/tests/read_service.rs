@@ -488,7 +488,7 @@ fn a_lease_is_counted_while_held_and_released_on_drop() {
     let (project, source) = indexed_project_and_source();
     let liveness = Arc::new(Liveness::new());
     let _svc =
-        ReadService::start_serving(project.path(), source, None, 2, liveness.clone()).unwrap();
+        ReadService::start_serving(project.path(), source, None, 2, liveness.clone(), None).unwrap();
     let lease = attach(project.path());
     assert!(
         wait_for(|| liveness.leases() == 1),
@@ -507,7 +507,7 @@ fn more_leases_than_workers_do_not_starve_reads() {
     let (project, source) = indexed_project_and_source();
     let liveness = Arc::new(Liveness::new());
     let workers = 2;
-    let _svc = ReadService::start_serving(project.path(), source, None, workers, liveness.clone())
+    let _svc = ReadService::start_serving(project.path(), source, None, workers, liveness.clone(), None)
         .unwrap();
     let leases: Vec<_> = (0..workers + 2).map(|_| attach(project.path())).collect();
     assert!(wait_for(|| liveness.leases() == workers + 2));
@@ -525,7 +525,7 @@ fn a_read_touches_liveness() {
     let (project, source) = indexed_project_and_source();
     let liveness = Arc::new(Liveness::new());
     let _svc =
-        ReadService::start_serving(project.path(), source, None, 2, liveness.clone()).unwrap();
+        ReadService::start_serving(project.path(), source, None, 2, liveness.clone(), None).unwrap();
     liveness.last_activity_for_test(liveness::now_secs() - 500);
     client_query(project.path(), "MATCH (f:File) RETURN count(f)").unwrap();
     assert!(liveness.idle_for(liveness::now_secs()).unwrap() < std::time::Duration::from_secs(5));
@@ -540,7 +540,7 @@ fn dropping_the_service_releases_its_leases() {
     let (project, source) = indexed_project_and_source();
     let liveness = Arc::new(Liveness::new());
     let svc =
-        ReadService::start_serving(project.path(), source, None, 2, liveness.clone()).unwrap();
+        ReadService::start_serving(project.path(), source, None, 2, liveness.clone(), None).unwrap();
     let mut lease = attach(project.path());
     assert!(wait_for(|| liveness.leases() == 1));
     drop(svc);
@@ -572,7 +572,7 @@ fn hold_attaches_once_and_is_idempotent() {
     let (project, source) = indexed_project_and_source();
     let liveness = Arc::new(Liveness::new());
     let _svc =
-        ReadService::start_serving(project.path(), source, None, 2, liveness.clone()).unwrap();
+        ReadService::start_serving(project.path(), source, None, 2, liveness.clone(), None).unwrap();
     lease::hold(project.path());
     lease::hold(project.path());
     assert!(wait_for(|| liveness.leases() == 1));
@@ -590,7 +590,7 @@ fn hold_is_a_noop_for_the_process_own_daemon_root() {
     let (project, source) = indexed_project_and_source();
     let liveness = Arc::new(Liveness::new());
     let _svc =
-        ReadService::start_serving(project.path(), source, None, 2, liveness.clone()).unwrap();
+        ReadService::start_serving(project.path(), source, None, 2, liveness.clone(), None).unwrap();
     lease::mark_self_daemon(project.path());
     lease::hold(project.path());
     std::thread::sleep(std::time::Duration::from_millis(300));
@@ -645,14 +645,14 @@ fn hold_reattaches_to_a_successor_service() {
     // One Liveness across both services, exactly as the coordinator shares it
     // across a #187 rebind -- so this also pins Review Focus 5.
     let liveness = Arc::new(Liveness::new());
-    let svc = ReadService::start_serving(project.path(), source.clone(), None, 2, liveness.clone())
+    let svc = ReadService::start_serving(project.path(), source.clone(), None, 2, liveness.clone(), None)
         .unwrap();
     lease::hold(project.path());
     assert!(wait_for(|| liveness.leases() == 1));
     drop(svc); // ends its parked leases, so the client sees EOF
     assert!(wait_for(|| liveness.leases() == 0));
     let _svc2 =
-        ReadService::start_serving(project.path(), source, None, 2, liveness.clone()).unwrap();
+        ReadService::start_serving(project.path(), source, None, 2, liveness.clone(), None).unwrap();
     assert!(
         wait_for(|| liveness.leases() == 1),
         "the lease must follow the daemon across a restart"
@@ -709,4 +709,168 @@ fn a_daemon_that_rejects_attach_is_not_reconnected_in_a_loop() {
         wait_for(|| !lease::is_held(project.path())),
         "the root must be forgotten, so a later hold can try again"
     );
+}
+
+// ---- #155: Status and Control on the read socket ----
+
+use infigraph_core::daemon::control_port::{ControlMsg, ControlPort, BUSY, CONTROL_QUEUE};
+use infigraph_core::daemon::read_protocol::{
+    read_reply, write_op, ControlFrame, ControlRequest, OpReply, RoleState, StatusFrame,
+    StatusReport, WatchAction, WatchRole,
+};
+
+/// A service with a control port and no graph at all.
+fn control_service(
+    root: &Path,
+) -> (
+    ReadService,
+    Arc<ControlPort>,
+    std::sync::mpsc::Receiver<ControlMsg>,
+    Arc<Liveness>,
+) {
+    let liveness = Arc::new(Liveness::new());
+    let (port, rx) = ControlPort::new(1800, 60);
+    let svc = ReadService::start_serving(
+        root,
+        Arc::new(|| None),
+        None,
+        4,
+        liveness.clone(),
+        Some(port.clone()),
+    )
+    .unwrap();
+    (svc, port, rx, liveness)
+}
+
+fn status(root: &Path) -> OpReply<StatusReport> {
+    let mut s = ReadEndpoint::for_root(root).connect().unwrap();
+    write_op(&mut s, &StatusFrame::default()).unwrap();
+    read_reply(&mut s).unwrap().expect("a reply frame")
+}
+
+fn control_frame(role: WatchRole, action: WatchAction) -> ControlFrame {
+    ControlFrame {
+        control: ControlRequest { role, action },
+    }
+}
+
+fn control(root: &Path, role: WatchRole, action: WatchAction) -> OpReply<()> {
+    let mut s = ReadEndpoint::for_root(root).connect().unwrap();
+    write_op(&mut s, &control_frame(role, action)).unwrap();
+    read_reply(&mut s).unwrap().expect("a reply frame")
+}
+
+#[test]
+fn status_answers_before_any_graph_is_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let (svc, port, _rx, _l) = control_service(dir.path());
+    port.state.set_role(WatchRole::Code, RoleState::Running);
+    let OpReply::Ok(r) = status(dir.path()) else {
+        panic!("status must answer")
+    };
+    assert_eq!(r.code, RoleState::Running);
+    assert_eq!(r.pid, std::process::id());
+    svc.shutdown();
+}
+
+#[test]
+fn status_and_control_do_not_count_as_activity_but_a_read_does() {
+    let dir = tempfile::tempdir().unwrap();
+    let (svc, _port, rx, liveness) = control_service(dir.path());
+    let answer = std::thread::spawn(move || {
+        let msg = rx.recv().unwrap();
+        msg.reply.send(Ok(())).unwrap();
+    });
+    let then = liveness::now_secs() - 100;
+    liveness.last_activity_for_test(then);
+    let _ = status(dir.path());
+    let _ = control(dir.path(), WatchRole::Code, WatchAction::Start);
+    answer.join().unwrap();
+    assert!(liveness.idle_for(liveness::now_secs()).unwrap().as_secs() >= 100);
+    // A read with no graph is refused, but it still counts: it was a use.
+    let _ = client_query(dir.path(), "RETURN 1");
+    assert!(liveness.idle_for(liveness::now_secs()).unwrap().as_secs() < 100);
+    svc.shutdown();
+}
+
+#[test]
+fn a_control_reply_carries_the_coordinators_outcome() {
+    let dir = tempfile::tempdir().unwrap();
+    let (svc, _port, rx, _l) = control_service(dir.path());
+    let answer = std::thread::spawn(move || {
+        let ok = rx.recv().unwrap();
+        assert_eq!(ok.request.action, WatchAction::Stop);
+        ok.reply.send(Ok(())).unwrap();
+        let err = rx.recv().unwrap();
+        err.reply.send(Err("no doc-watch loop".into())).unwrap();
+    });
+    assert!(matches!(
+        control(dir.path(), WatchRole::Code, WatchAction::Stop),
+        OpReply::Ok(())
+    ));
+    assert!(matches!(
+        control(dir.path(), WatchRole::Docs, WatchAction::Stop),
+        OpReply::Err(m) if m == "no doc-watch loop"
+    ));
+    answer.join().unwrap();
+    svc.shutdown();
+}
+
+#[test]
+fn control_beyond_the_queue_is_refused_at_once_and_status_still_answers() {
+    let dir = tempfile::tempdir().unwrap();
+    let (svc, port, rx, _l) = control_service(dir.path());
+    // Nobody drains `rx`: a wedged coordinator. Fill the queue.
+    let streams: Vec<_> = (0..CONTROL_QUEUE)
+        .map(|_| {
+            let mut s = ReadEndpoint::for_root(dir.path()).connect().unwrap();
+            write_op(&mut s, &control_frame(WatchRole::Code, WatchAction::Stop)).unwrap();
+            s // keep the connection open
+        })
+        .collect();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while port.in_flight() < CONTROL_QUEUE && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let started = std::time::Instant::now();
+    assert!(matches!(
+        control(dir.path(), WatchRole::Code, WatchAction::Stop),
+        OpReply::Err(m) if m == BUSY
+    ));
+    assert!(started.elapsed() < std::time::Duration::from_millis(500));
+    let started = std::time::Instant::now();
+    assert!(matches!(status(dir.path()), OpReply::Ok(_)));
+    assert!(started.elapsed() < std::time::Duration::from_millis(500));
+    drop(rx); // pending control threads now see "shutting down" and finish
+    drop(streams);
+    svc.shutdown();
+}
+
+#[test]
+fn dropping_the_service_does_not_wait_for_a_pending_control() {
+    let dir = tempfile::tempdir().unwrap();
+    let (svc, port, _rx, _l) = control_service(dir.path());
+    let mut s = ReadEndpoint::for_root(dir.path()).connect().unwrap();
+    write_op(&mut s, &control_frame(WatchRole::Code, WatchAction::Stop)).unwrap();
+    while port.in_flight() == 0 {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let started = std::time::Instant::now();
+    drop(svc);
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "a #187 rebind drops the service on the coordinator's thread; it must not wait for control"
+    );
+}
+
+#[test]
+fn a_service_without_a_port_refuses_status_and_control() {
+    let dir = tempfile::tempdir().unwrap();
+    let svc = ReadService::start_with_sources(dir.path(), Arc::new(|| None), None, 2).unwrap();
+    assert!(matches!(status(dir.path()), OpReply::Err(_)));
+    assert!(matches!(
+        control(dir.path(), WatchRole::Code, WatchAction::Stop),
+        OpReply::Err(_)
+    ));
+    svc.shutdown();
 }
