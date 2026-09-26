@@ -116,7 +116,7 @@ fn main() -> Result<()> {
             .status()?;
         match worker_crash(&status) {
             Some(how) => restart_after_crash(&mut crashes, &how),
-            None if watchdog_restart(&status) => continue,
+            None if planned_restart(&status).is_some() => continue,
             None => std::process::exit(status.code().unwrap_or(1)),
         }
     }
@@ -136,6 +136,9 @@ fn worker_command(args: &[String]) -> std::process::Command {
         infigraph_mcp::lifecycle::SUPERVISOR_PID_ENV,
         std::process::id().to_string(),
     );
+    if YIELDED_LOCK.load(std::sync::atomic::Ordering::Relaxed) {
+        cmd.env(infigraph_mcp::mcp_lock::YIELDED_ENV, "1");
+    }
     cmd
 }
 
@@ -280,10 +283,10 @@ fn supervise_stdio(args: &[String]) -> Result<()> {
                 let crash = worker_crash(&status);
                 let cause = match &crash {
                     Some(how) => format!("the worker crashed ({how})"),
-                    None if watchdog_restart(&status) => {
-                        "the worker restarted to recover resources (see mcp.log)".to_string()
-                    }
-                    None => format!("the worker exited ({status})"),
+                    None => match planned_restart(&status) {
+                        Some(why) => why.to_string(),
+                        None => format!("the worker exited ({status})"),
+                    },
                 };
                 for reply in outstanding
                     .fail_all(|c| format!("{cause} while serving {}; it was not completed", c.what))
@@ -292,7 +295,7 @@ fn supervise_stdio(args: &[String]) -> Result<()> {
                 }
                 match crash {
                     Some(how) if client_open => restart_after_crash(&mut crashes, &how),
-                    None if client_open && watchdog_restart(&status) => {}
+                    None if client_open && planned_restart(&status).is_some() => {}
                     _ => std::process::exit(status.code().unwrap_or(1)),
                 }
             }
@@ -380,9 +383,25 @@ fn write_line(line: &str) -> Result<()> {
     Ok(())
 }
 
-/// Whether the worker exited so its watchdog could restart it (#19).
-fn watchdog_restart(status: &std::process::ExitStatus) -> bool {
-    status.code() == Some(infigraph_mcp::lifecycle::WATCHDOG_RESTART_EXIT)
+/// Set once a worker of this supervisor hands `mcp.lock` over; every
+/// later worker is spawned with `mcp_lock::YIELDED_ENV` so it never asks
+/// for the lock back.
+static YIELDED_LOCK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Why the worker exited so the supervisor would start a fresh one, if it
+/// did: its watchdog (#19), or a handover of `mcp.lock` to a newer build
+/// (R2.3.2), which must not take this session's server down with it.
+fn planned_restart(status: &std::process::ExitStatus) -> Option<&'static str> {
+    match status.code() {
+        Some(infigraph_mcp::lifecycle::WATCHDOG_RESTART_EXIT) => {
+            Some("the worker restarted to recover resources (see mcp.log)")
+        }
+        Some(infigraph_mcp::lifecycle::HANDOVER_EXIT) => {
+            YIELDED_LOCK.store(true, std::sync::atomic::Ordering::Relaxed);
+            Some("the worker handed mcp.lock to a newer build and restarted")
+        }
+        _ => None,
+    }
 }
 
 /// How the worker crashed, if its exit was a crash: SIGSEGV on Unix, an
@@ -501,8 +520,10 @@ fn run() -> Result<()> {
         std::thread::spawn(move || loop {
             std::thread::sleep(infigraph_mcp::mcp_lock::heartbeat_interval());
             if infigraph_mcp::mcp_lock::heartbeat_and_check_handover(&mut lock) {
-                drop(lock);
-                std::process::exit(0);
+                infigraph_mcp::mcp_lock::release_to_successor(lock);
+                infigraph_mcp::lifecycle::exit_between_calls(
+                    infigraph_mcp::lifecycle::HANDOVER_EXIT,
+                );
             }
         });
     }

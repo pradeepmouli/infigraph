@@ -247,6 +247,13 @@ fn handover_request_stale_secs() -> u64 {
         .saturating_mul(2)
 }
 
+/// Set on every worker a supervisor starts after one of its workers handed
+/// `mcp.lock` over. Such a worker never requests a handover itself: its
+/// supervisor respawns it from whatever binary is at its own path, which
+/// need not be the build that just took the lock, and two sessions on two
+/// builds would otherwise take the lock from each other forever.
+pub const YIELDED_ENV: &str = "INFIGRAPH_MCP_YIELDED_LOCK";
+
 /// Result of attempting to become mcp.lock's primary.
 pub enum AcquireOutcome {
     Primary(LockFile),
@@ -286,6 +293,17 @@ pub fn acquire_with_takeover_using(own_build: &str) -> AcquireOutcome {
     check_wedged_and_log(&holder, now_epoch_secs());
 
     if !build_hash_mismatch(own_build, &holder.build_hash) {
+        return AcquireOutcome::Secondary;
+    }
+    if std::env::var_os(YIELDED_ENV).is_some() {
+        crate::mcp_log(
+            "INFO",
+            &format!(
+                "mcp.lock held by PID {} on build {} (ours: {own_build}) -- this session \
+                 already handed the lock over once, so not asking for it back",
+                holder.pid, holder.build_hash
+            ),
+        );
         return AcquireOutcome::Secondary;
     }
 
@@ -333,9 +351,10 @@ pub fn acquire_with_takeover_using(own_build: &str) -> AcquireOutcome {
 
 /// One heartbeat tick for the primary: refresh `last_heartbeat`, then
 /// check for a pending handover request. Returns `true` if one was found
-/// and honored -- the caller must drop `lock` and exit the process. This
-/// is a release-and-exit, not a graceful drain of in-flight work (that's
-/// out of scope here).
+/// and honored -- the caller must pass `lock` to `release_to_successor` and
+/// exit with `lifecycle::HANDOVER_EXIT`, which the supervisor answers with a
+/// fresh worker (R2.3.2: the handover moves the lock, not the session's
+/// server).
 pub fn heartbeat_and_check_handover(lock: &mut LockFile) -> bool {
     heartbeat_tick(lock);
     if let Some(req) = live_handover_request() {
@@ -350,4 +369,26 @@ pub fn heartbeat_and_check_handover(lock: &mut LockFile) -> bool {
         return true;
     }
     false
+}
+
+/// Release `lock` and return once another process holds it, or once the
+/// challenger's own wait has run out. Exiting straight after the release
+/// would have the supervisor's fresh worker find the lock free and take it
+/// back before the challenger's next poll, which then times out as
+/// secondary: the handover would move nothing.
+pub fn release_to_successor(lock: LockFile) {
+    drop(lock);
+    let path = lock_path();
+    let own = std::process::id();
+    let deadline = Instant::now() + effective_takeover_wait_timeout();
+    while Instant::now() < deadline {
+        if lockfile::read_holder(&path).is_some_and(|h| h.pid != own) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    crate::mcp_log(
+        "WARN",
+        "mcp.lock handed over but no successor took it -- restarting the worker anyway",
+    );
 }

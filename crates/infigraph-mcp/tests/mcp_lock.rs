@@ -279,6 +279,39 @@ fn no_handover_request_written_when_build_hash_matches() {
     std::env::remove_var("INFIGRAPH_MCP_LOCK_TAKEOVER_TIMEOUT_SECS");
 }
 
+/// A worker whose session already handed the lock over is respawned from
+/// whatever binary sits at its supervisor's path, which need not be the
+/// build that took the lock. It must not ask for the lock back on a build
+/// mismatch, or two sessions on two builds take it from each other forever.
+#[test]
+fn a_session_that_yielded_the_lock_never_requests_it_back() {
+    let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::env::set_var("INFIGRAPH_MCP_LOCK_PATH", dir.path().join("mcp.lock"));
+    std::env::set_var(infigraph_mcp::mcp_lock::YIELDED_ENV, "1");
+
+    let _incumbent = infigraph_mcp::mcp_lock::acquire_primary().expect("free");
+
+    let started = Instant::now();
+    let outcome = infigraph_mcp::mcp_lock::acquire_with_takeover_using("some-other-build");
+    let elapsed = started.elapsed();
+    std::env::remove_var(infigraph_mcp::mcp_lock::YIELDED_ENV);
+    std::env::remove_var("INFIGRAPH_MCP_LOCK_PATH");
+
+    assert!(
+        matches!(outcome, infigraph_mcp::mcp_lock::AcquireOutcome::Secondary),
+        "a session that yielded the lock must stay secondary"
+    );
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "must not wait on a handover it never requested (took {elapsed:?})"
+    );
+    assert!(
+        !dir.path().join("mcp.lock.handover").exists(),
+        "no handover request may be written"
+    );
+}
+
 /// Regression: the raw `takeover_wait_timeout()` default (10s) is SHORTER
 /// than the `heartbeat_interval()` default (15s), so a challenger would give
 /// up before the incumbent's next tick could ever read the request -- the
