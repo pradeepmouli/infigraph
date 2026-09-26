@@ -7,7 +7,6 @@ use serde_json::Value;
 
 use infigraph_core::daemon_protocol::{WatchAction, WatchRole};
 use infigraph_core::watch::WatchEventKind;
-use infigraph_core::Infigraph;
 use infigraph_languages::bundled_registry;
 
 static WATCHERS_DISABLED: AtomicBool = AtomicBool::new(false);
@@ -429,12 +428,6 @@ pub fn tool_stop_watch(args: &Value) -> Result<String> {
     anyhow::bail!("missing 'watcher_id' or 'path'")
 }
 
-/// How long to wait for a running daemon to reply to a `WatchControl`
-/// request before giving up. Mirrors `infigraph-cli::info_commands::
-/// WATCH_CONTROL_TIMEOUT` (30s) -- that constant is private to the CLI
-/// crate, so this is a deliberate duplicate of the value, not the item.
-const WATCH_CONTROL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-
 pub fn enable_watch(args: &Value) -> Result<String> {
     watch_control(args, WatchRole::Code, WatchAction::Enable)
 }
@@ -497,10 +490,8 @@ pub(crate) fn watch_control(args: &Value, role: WatchRole, action: WatchAction) 
                 },
             );
         }
-        let registry = bundled_registry()?;
-        let prism = Infigraph::open(&root, registry)?;
-        prism.submit_watch_control_and_await(role, action, WATCH_CONTROL_TIMEOUT)?;
-        return Ok(format!("{role:?}: {action:?} sent for {root_str}."));
+        infigraph_core::daemon::control::send_control(&root, role, action)?;
+        return Ok(format!("{role:?}: {action:?} done for {root_str}."));
     }
 
     match (role, action) {

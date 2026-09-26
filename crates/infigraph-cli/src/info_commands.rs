@@ -882,7 +882,6 @@ impl DocWatchThread {
 }
 
 pub(crate) fn cmd_watch_stop(root: &Path) -> Result<()> {
-    let sentinel = root.join(".infigraph").join("watch.stop");
     let lock_path = root.join(".infigraph").join("watch.lock");
 
     if !infigraph_core::daemon::lifecycle::daemon_is_alive(&lock_path) {
@@ -890,8 +889,15 @@ pub(crate) fn cmd_watch_stop(root: &Path) -> Result<()> {
         return Ok(());
     }
 
-    std::fs::write(&sentinel, b"")?;
+    stop_via_sentinel(root)?;
     println!("Stop signal sent. Watcher will exit within ~1 second.");
+    Ok(())
+}
+
+/// The out-of-band stop (#155): works when the daemon cannot take a control
+/// frame, because the coordinator checks for this file on its own.
+pub(crate) fn stop_via_sentinel(root: &Path) -> Result<()> {
+    std::fs::write(root.join(".infigraph").join("watch.stop"), b"")?;
     Ok(())
 }
 
@@ -906,31 +912,26 @@ pub(crate) fn cmd_watch_status(root: &Path) -> Result<()> {
     Ok(())
 }
 
-/// How long the CLI waits for a running daemon to reply to a `WatchControl`
-/// request before giving up. The request/reply protocol's round trip is
-/// normally sub-second; this is generous headroom for a daemon that's
-/// mid-write on something else when the request lands.
-const WATCH_CONTROL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-
 pub(crate) fn cmd_daemon_stop(root: &Path) -> Result<()> {
-    // Without this check, submitting into an unattended staging dir just
-    // sits there until WATCH_CONTROL_TIMEOUT and then reports an opaque
-    // protocol error -- an everyday case (no daemon running yet), not a
-    // misconfiguration. Mirrors cmd_watch_stop's existing early-exit and
-    // index.rs's FullReindex path (see its own comment re: incident #100).
+    // The everyday "no daemon running yet" case answers at once rather than
+    // going through the control client's startup grace.
     let lock_path = root.join(".infigraph").join("watch.lock");
     if !infigraph_core::daemon::lifecycle::daemon_is_alive(&lock_path) {
         println!("No daemon running.");
         return Ok(());
     }
-    let registry = bundled_registry()?;
-    let prism = Infigraph::open(root, registry)?;
-    prism.submit_watch_control_and_await(
-        WatchRole::Daemon,
-        WatchAction::Stop,
-        WATCH_CONTROL_TIMEOUT,
-    )?;
-    println!("Daemon stopped.");
+    use infigraph_core::daemon::control::{send_control, ControlError};
+    match send_control(root, WatchRole::Daemon, WatchAction::Stop) {
+        Ok(()) => println!("Daemon stopped."),
+        Err(ControlError::NoDaemon) => println!("No daemon running."),
+        Err(e @ (ControlError::Incompatible | ControlError::Unresponsive)) => {
+            stop_via_sentinel(root)?;
+            println!(
+                "Daemon did not take the stop request ({e}); wrote the stop sentinel instead."
+            );
+        }
+        Err(e) => return Err(e.into()),
+    }
     Ok(())
 }
 
@@ -942,18 +943,21 @@ pub(crate) fn cmd_daemon_restart(root: &Path) -> Result<()> {
         // Read the holder BEFORE asking it to stop: the lock payload naming
         // it is gone by the time we need it to confirm the exit.
         let holder_pid = infigraph_core::lockfile::read_holder(&lock_path).map(|h| h.pid);
-        let registry = bundled_registry()?;
-        let prism = Infigraph::open(root, registry)?;
         // `WatchRole::Daemon`'s `Restart` action (per Task 10's
         // route_or_serve_request arm) only cancels daemon_token -- the
         // process exiting means there's nothing left to ask to "start
         // itself" from inside. Re-spawn from the CLI side instead,
         // mirroring `ensure_daemon_running`'s existing pattern.
-        prism.submit_watch_control_and_await(
-            WatchRole::Daemon,
-            WatchAction::Stop,
-            WATCH_CONTROL_TIMEOUT,
-        )?;
+        use infigraph_core::daemon::control::{send_control, ControlError};
+        match send_control(root, WatchRole::Daemon, WatchAction::Stop) {
+            Ok(()) | Err(ControlError::NoDaemon) => {}
+            // It could not take the request: stop it out of band, then let
+            // the confirmation below decide whether it actually went.
+            Err(ControlError::Incompatible | ControlError::Unresponsive) => {
+                stop_via_sentinel(root)?
+            }
+            Err(e) => return Err(e.into()),
+        }
 
         // Wait for the PROCESS to exit, not merely for the lock to look
         // free. A daemon releases `watch.lock` while it is still draining
@@ -1040,10 +1044,8 @@ pub(crate) fn cmd_watch_control(
         return Ok(());
     }
 
-    let registry = bundled_registry()?;
-    let prism = Infigraph::open(root, registry)?;
-    prism.submit_watch_control_and_await(role, watch_action, WATCH_CONTROL_TIMEOUT)?;
-    println!("{role:?}: {watch_action:?} sent.");
+    infigraph_core::daemon::control::send_control(root, role, watch_action)?;
+    println!("{role:?}: {watch_action:?} done.");
     Ok(())
 }
 
