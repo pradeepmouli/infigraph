@@ -132,6 +132,7 @@ pub fn ensure_daemon_for_routed_access(root: &Path) -> anyhow::Result<()> {
 
     let lock_path = root.join(".infigraph").join("watch.lock");
     if daemon_is_alive(&lock_path) {
+        crate::daemon::lease::hold(root);
         return Ok(());
     }
 
@@ -302,6 +303,24 @@ pub fn kill_process_group(pid: u32) -> bool {
 }
 
 pub fn ensure_daemon_running_required(root: &Path, watch_binary: &Path) -> DaemonStartOutcome {
+    let outcome = start_or_find_daemon(root, watch_binary);
+    // Lease whatever daemon now serves this root (#38): every client passes
+    // through here or `ensure_daemon_for_routed_access`, so this is what
+    // keeps a daemon alive for as long as anyone uses it. `AlreadyRunning`
+    // also covers "not indexed" and "remote", hence the liveness check.
+    match &outcome {
+        DaemonStartOutcome::Spawned => crate::daemon::lease::hold_spawned(root),
+        DaemonStartOutcome::AlreadyRunning
+            if daemon_is_alive(&root.join(".infigraph").join("watch.lock")) =>
+        {
+            crate::daemon::lease::hold(root)
+        }
+        _ => {}
+    }
+    outcome
+}
+
+fn start_or_find_daemon(root: &Path, watch_binary: &Path) -> DaemonStartOutcome {
     if is_remote_backend() {
         return DaemonStartOutcome::AlreadyRunning;
     }
@@ -1222,5 +1241,49 @@ mod tests {
                 "no cwd signal at all must never be treated as proof the root is gone"
             );
         }
+    }
+}
+
+/// #38: every client funnels through these two entry points; both must
+/// lease, or a future caller path silently never keeps a daemon alive.
+#[cfg(test)]
+mod lease_entry_point_tests {
+    /// A project root with a live daemon, as far as `daemon_is_alive` can
+    /// tell: `watch.lock` held by this process. No socket is bound, so the
+    /// background attach keeps retrying for its startup grace -- which keeps
+    /// `is_held` true for the assertion.
+    fn root_with_live_daemon() -> (tempfile::TempDir, crate::lockfile::LockFile) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::create_dir_all(root.join(".infigraph")).unwrap();
+        let lock =
+            crate::lockfile::try_acquire(&root.join(".infigraph").join("watch.lock"), "test")
+                .unwrap()
+                .unwrap();
+        (dir, lock)
+    }
+
+    #[test]
+    fn the_routed_access_entry_point_leases_a_live_daemon() {
+        let (dir, _lock) = root_with_live_daemon();
+        super::ensure_daemon_for_routed_access(dir.path()).unwrap();
+        assert!(
+            crate::daemon::lease::is_held(dir.path()),
+            "routed access must hold a lease"
+        );
+    }
+
+    #[test]
+    fn the_required_entry_point_leases_a_live_daemon() {
+        let (dir, _lock) = root_with_live_daemon();
+        let _ = super::ensure_daemon_running_required(
+            dir.path(),
+            std::path::Path::new("/nonexistent/infigraph"),
+        );
+        assert!(
+            crate::daemon::lease::is_held(dir.path()),
+            "the required entry point must hold a lease"
+        );
     }
 }

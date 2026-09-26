@@ -1,7 +1,9 @@
 pub(crate) mod backoff;
 pub(crate) mod drain;
 pub mod fault;
+pub mod lease;
 pub mod lifecycle;
+pub mod liveness;
 pub mod queue;
 pub mod read_endpoint;
 pub mod read_guard;
@@ -74,6 +76,26 @@ crate::settings! {
 pub fn scip_settings(root: &Path) -> Scip {
     Scip::resolve_or_default(
         RawScip::default(),
+        crate::settings_file::ConfigScope::Project(root),
+    )
+}
+
+crate::settings! {
+    daemon_idle {
+        // #38: how long a daemon with no lease and no request waits before
+        // exiting. 0 disables idle exit -- a watcher that never stops.
+        grace_secs: u64 = 1800,
+        // How often the coordinator evaluates it. Coarse: the check is
+        // cheap, but an exit an extra minute late costs nothing.
+        check_secs: u64 = 60,
+    }
+}
+
+/// Resolved `daemon_idle` settings. Read once at coordinator start, like
+/// every other daemon-lifetime setting.
+pub fn daemon_idle_settings(root: &Path) -> DaemonIdle {
+    DaemonIdle::resolve_or_default(
+        RawDaemonIdle::default(),
         crate::settings_file::ConfigScope::Project(root),
     )
 }
@@ -629,6 +651,9 @@ where
     //
     // Bound through `bind_read_service` so the tick below can bind it again
     // when its socket file is removed (#187).
+    // #38: who still needs this daemon. Owned here, not by the service, so a
+    // #187 rebind keeps counting into the same place.
+    let liveness = Arc::new(liveness::Liveness::new());
     let mut bind_read_service: Box<dyn FnMut() -> Option<read_service::ReadService>> =
         if !serve_requests {
             Box::new(|| None)
@@ -655,12 +680,14 @@ where
             }
 
             let root = root.to_path_buf();
+            let liveness = liveness.clone();
             Box::new(move || {
-                match read_service::ReadService::start_with_sources(
+                match read_service::ReadService::start_serving(
                     &root,
                     source.clone(),
                     docs_reads.clone(),
                     READ_SERVICE_WORKERS,
+                    liveness.clone(),
                 ) {
                     Ok(svc) => Some(svc),
                     Err(e) => {
@@ -858,6 +885,11 @@ where
     let mut self_watch = crate::watchdog::SelfWatch::new("watch");
     let mut restart_for: Option<String> = None;
 
+    let idle = daemon_idle_settings(root);
+    let idle_grace = Duration::from_secs(idle.grace_secs);
+    let idle_check = Duration::from_secs(idle.check_secs.max(1));
+    let mut last_idle_check = std::time::Instant::now();
+
     loop {
         if stop_rx.try_recv().is_ok() {
             eprintln!("[watch] stop channel signaled -- shutting down");
@@ -888,6 +920,26 @@ where
                 root.display()
             );
             break;
+        }
+
+        // #38: nobody holds a lease and nothing has touched this daemon for
+        // its grace -- leave through the same clean shutdown as a vanished
+        // root. Never mid-write: in-flight work defers the exit.
+        if serve_requests && last_idle_check.elapsed() >= idle_check {
+            last_idle_check = std::time::Instant::now();
+            let work_in_flight = drain_in_flight.is_some()
+                || full_reindex_in_flight.is_some()
+                || scip_in_flight.is_some()
+                || scip_import_in_flight.is_some();
+            let idle_for = liveness.idle_for(liveness::now_secs());
+            if liveness::idle_exit_due(idle_for, idle_grace, work_in_flight) {
+                eprintln!(
+                    "[watch] idle for {}s with no lease on {} -- shutting down",
+                    idle_for.map(|d| d.as_secs()).unwrap_or(0),
+                    root.display()
+                );
+                break;
+            }
         }
 
         // Rebind the read service if its socket file was removed (#187):
@@ -1478,6 +1530,9 @@ where
                 for entry in entries.flatten() {
                     let path = entry.path();
                     if path.extension().is_some_and(|ext| ext == "request") {
+                        // A write is activity (#38): a CLI that only writes
+                        // keeps the daemon up through its grace too.
+                        liveness.touch();
                         if let Some(started) = route_or_serve_request(
                             root,
                             &path,

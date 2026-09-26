@@ -421,6 +421,10 @@ pub(crate) fn cmd_daemon(root: &Path, debounce: u64) -> Result<()> {
     // Hold exclusive lock for lifetime — signals liveness to ensure_watcher_running.
     let lock_path = root.join(".infigraph").join("watch.lock");
     let _lock = acquire_watch_lock(&lock_path)?;
+    // #38: a daemon never leases itself -- one that did would never idle
+    // out. Nothing in this process reaches a lifecycle entry point today
+    // (the backend is pinned local above); this makes that structural.
+    infigraph_core::daemon::lease::mark_self_daemon(root);
 
     // R3.1.4g/#115: a crash's cause is only diagnosable if a human (or
     // future tooling) can tell which generation's output in the shared,

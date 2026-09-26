@@ -439,3 +439,274 @@ fn client_query(root: &Path, cypher: &str) -> anyhow::Result<Vec<Vec<String>>> {
     )?;
     collect_rows(&mut stream)
 }
+
+// ── leases (#38, #124) ───────────────────────────────────────────────
+
+use infigraph_core::daemon::liveness::{self, Liveness};
+use infigraph_core::daemon::read_protocol::write_attach;
+use infigraph_core::daemon::read_service::{ReadService, StoreSource};
+
+/// A temp project whose graph holds one `File` node, and a `StoreSource`
+/// serving it -- the shape the daemon hands `start_serving`.
+fn indexed_project_and_source() -> (tempfile::TempDir, StoreSource) {
+    let dir = tempfile::tempdir().unwrap();
+    let graph = dir.path().join(".infigraph").join("graph");
+    std::fs::create_dir_all(graph.parent().unwrap()).unwrap();
+    {
+        let store = GraphStore::open(&graph).unwrap();
+        let conn = store.connection().unwrap();
+        conn.query(
+            "CREATE (:File {id: 'a.rs', name: 'a.rs', path: 'a.rs', \
+             language: 'rust', symbol_count: 0})",
+        )
+        .unwrap();
+    }
+    let store = open_shared_store(&graph);
+    let source: StoreSource = Arc::new(move || Some(store.clone()));
+    (dir, source)
+}
+
+fn wait_for(mut cond: impl FnMut() -> bool) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if cond() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    false
+}
+
+fn attach(root: &Path) -> infigraph_core::daemon::read_endpoint::ReadStream {
+    let mut s = ReadEndpoint::for_root(root).connect().unwrap();
+    write_attach(&mut s, std::process::id()).unwrap();
+    s
+}
+
+#[test]
+fn a_lease_is_counted_while_held_and_released_on_drop() {
+    let (project, source) = indexed_project_and_source();
+    let liveness = Arc::new(Liveness::new());
+    let _svc =
+        ReadService::start_serving(project.path(), source, None, 2, liveness.clone()).unwrap();
+    let lease = attach(project.path());
+    assert!(
+        wait_for(|| liveness.leases() == 1),
+        "attach must be counted"
+    );
+    drop(lease);
+    assert!(
+        wait_for(|| liveness.leases() == 0),
+        "EOF must release the lease"
+    );
+}
+
+/// Review Focus 2: leases must never occupy pool workers.
+#[test]
+fn more_leases_than_workers_do_not_starve_reads() {
+    let (project, source) = indexed_project_and_source();
+    let liveness = Arc::new(Liveness::new());
+    let workers = 2;
+    let _svc = ReadService::start_serving(project.path(), source, None, workers, liveness.clone())
+        .unwrap();
+    let leases: Vec<_> = (0..workers + 2).map(|_| attach(project.path())).collect();
+    assert!(wait_for(|| liveness.leases() == workers + 2));
+    let rows = client_query(project.path(), "MATCH (f:File) RETURN count(f)").unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "a read must still be served with every worker's worth of leases held"
+    );
+    drop(leases);
+}
+
+#[test]
+fn a_read_touches_liveness() {
+    let (project, source) = indexed_project_and_source();
+    let liveness = Arc::new(Liveness::new());
+    let _svc =
+        ReadService::start_serving(project.path(), source, None, 2, liveness.clone()).unwrap();
+    liveness.last_activity_for_test(liveness::now_secs() - 500);
+    client_query(project.path(), "MATCH (f:File) RETURN count(f)").unwrap();
+    assert!(liveness.idle_for(liveness::now_secs()).unwrap() < std::time::Duration::from_secs(5));
+}
+
+/// A service going away must end its parked leases, so each client sees EOF
+/// and can follow the daemon to a successor. That matters for an in-process
+/// service (tests, a #187 rebind); a real daemon's exit closes them anyway.
+#[cfg(unix)]
+#[test]
+fn dropping_the_service_releases_its_leases() {
+    let (project, source) = indexed_project_and_source();
+    let liveness = Arc::new(Liveness::new());
+    let svc =
+        ReadService::start_serving(project.path(), source, None, 2, liveness.clone()).unwrap();
+    let mut lease = attach(project.path());
+    assert!(wait_for(|| liveness.leases() == 1));
+    drop(svc);
+    assert!(
+        wait_for(|| liveness.leases() == 0),
+        "shutdown must end parked leases"
+    );
+    assert!(
+        matches!(
+            infigraph_core::daemon::read_protocol::read_frame(&mut lease),
+            Ok(Some(infigraph_core::daemon::read_protocol::ReadFrame::End))
+        ),
+        "a parked lease is acknowledged"
+    );
+    let mut buf = [0u8; 1];
+    assert_eq!(
+        std::io::Read::read(&mut lease, &mut buf).unwrap_or(0),
+        0,
+        "the client must see EOF"
+    );
+}
+
+// ── client leases (#38, #124) ────────────────────────────────────────
+
+use infigraph_core::daemon::lease;
+
+#[test]
+fn hold_attaches_once_and_is_idempotent() {
+    let (project, source) = indexed_project_and_source();
+    let liveness = Arc::new(Liveness::new());
+    let _svc =
+        ReadService::start_serving(project.path(), source, None, 2, liveness.clone()).unwrap();
+    lease::hold(project.path());
+    lease::hold(project.path());
+    assert!(wait_for(|| liveness.leases() == 1));
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert_eq!(
+        liveness.leases(),
+        1,
+        "a second hold must not open a second lease"
+    );
+    assert!(lease::is_held(project.path()));
+}
+
+#[test]
+fn hold_is_a_noop_for_the_process_own_daemon_root() {
+    let (project, source) = indexed_project_and_source();
+    let liveness = Arc::new(Liveness::new());
+    let _svc =
+        ReadService::start_serving(project.path(), source, None, 2, liveness.clone()).unwrap();
+    lease::mark_self_daemon(project.path());
+    lease::hold(project.path());
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert_eq!(liveness.leases(), 0);
+    assert!(!lease::is_held(project.path()));
+}
+
+#[test]
+fn hold_with_no_daemon_forgets_the_root() {
+    let project = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(project.path().join(".infigraph")).unwrap();
+    lease::hold(project.path());
+    assert!(wait_for(|| !lease::is_held(project.path())));
+}
+
+/// The case where a synchronous attach would hang its caller: a daemon that
+/// holds `watch.lock` but has not bound its socket yet makes
+/// `connect_allowing_for_startup` wait out its 30s grace. `hold` sits on
+/// every `Infigraph::init`, so it must return regardless.
+#[test]
+fn hold_never_blocks_on_a_daemon_that_is_still_starting() {
+    let project = tempfile::tempdir().unwrap();
+    let lock_path = project.path().join(".infigraph").join("watch.lock");
+    std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+    let _lock = infigraph_core::lockfile::try_acquire(&lock_path, "test-daemon")
+        .unwrap()
+        .unwrap();
+    let t = std::time::Instant::now();
+    lease::hold(project.path());
+    assert!(
+        t.elapsed() < std::time::Duration::from_secs(2),
+        "hold must return at once, not wait for the daemon: took {:?}",
+        t.elapsed()
+    );
+    assert!(
+        lease::is_held(project.path()),
+        "the attach is still pending"
+    );
+}
+
+/// Review Focus 1: a restarted daemon is re-attached to without any new
+/// `hold`. `daemon_is_alive` needs `watch.lock` held, so hold it here the way
+/// a daemon does.
+#[cfg(unix)]
+#[test]
+fn hold_reattaches_to_a_successor_service() {
+    let (project, source) = indexed_project_and_source();
+    let lock_path = project.path().join(".infigraph").join("watch.lock");
+    let _lock = infigraph_core::lockfile::try_acquire(&lock_path, "test-daemon")
+        .unwrap()
+        .unwrap();
+    // One Liveness across both services, exactly as the coordinator shares it
+    // across a #187 rebind -- so this also pins Review Focus 5.
+    let liveness = Arc::new(Liveness::new());
+    let svc = ReadService::start_serving(project.path(), source.clone(), None, 2, liveness.clone())
+        .unwrap();
+    lease::hold(project.path());
+    assert!(wait_for(|| liveness.leases() == 1));
+    drop(svc); // ends its parked leases, so the client sees EOF
+    assert!(wait_for(|| liveness.leases() == 0));
+    let _svc2 =
+        ReadService::start_serving(project.path(), source, None, 2, liveness.clone()).unwrap();
+    assert!(
+        wait_for(|| liveness.leases() == 1),
+        "the lease must follow the daemon across a restart"
+    );
+}
+
+/// Final-review C1: a daemon that does not understand `Attach` -- a build
+/// from before leases -- reads the frame, fails to parse it and closes. The
+/// lease thread must take that as "no leases here" and stop, not reconnect
+/// in a tight loop (each attempt also logs a line in that daemon's log).
+#[test]
+fn a_daemon_that_rejects_attach_is_not_reconnected_in_a_loop() {
+    let project = tempfile::tempdir().unwrap();
+    let lock = project.path().join(".infigraph").join("watch.lock");
+    std::fs::create_dir_all(lock.parent().unwrap()).unwrap();
+    // A lock file, so the lease thread waits out its grace between attempts
+    // rather than giving up because no daemon ever ran here.
+    std::fs::write(&lock, b"").unwrap();
+
+    let listener = ReadEndpoint::for_root(project.path()).bind().unwrap();
+    let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stub = {
+        let (accepted, stop) = (accepted.clone(), stop.clone());
+        std::thread::spawn(move || {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let Ok(Some(mut stream)) =
+                    listener.accept_timeout(std::time::Duration::from_millis(50))
+                else {
+                    continue;
+                };
+                accepted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // An old daemon: one frame read, not understood, closed.
+                let mut len = [0u8; 4];
+                let _ = std::io::Read::read_exact(&mut stream, &mut len);
+                drop(stream);
+            }
+        })
+    };
+
+    lease::hold(project.path());
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    let n = accepted.load(std::sync::atomic::Ordering::Relaxed);
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    stub.join().unwrap();
+    // One retry is allowed: a single un-acked EOF is also what a daemon that
+    // is shutting down looks like, and a restart must be followed (see
+    // `hold_reattaches_to_a_successor_service`). Twice in a row is a refusal.
+    assert!(
+        n <= 2,
+        "a rejected Attach must end the lease attempt, got {n} connections in 2s"
+    );
+    assert!(
+        wait_for(|| !lease::is_held(project.path())),
+        "the root must be forgotten, so a later hold can try again"
+    );
+}

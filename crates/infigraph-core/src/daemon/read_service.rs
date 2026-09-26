@@ -19,8 +19,10 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 
+use super::liveness::Liveness;
 use super::read_endpoint::ReadEndpoint;
-use super::read_protocol::{read_request, write_frame, ReadFrame, Store};
+use super::read_endpoint::ReadStream;
+use super::read_protocol::{read_client_frame, write_frame, Attach, ClientFrame, ReadFrame, Store};
 
 /// Resolves the store to serve a request from, at request time.
 ///
@@ -60,6 +62,56 @@ pub struct ReadService {
     /// [`socket_intact`](Self::socket_intact). `None` where the transport
     /// has no file.
     socket: Option<(std::path::PathBuf, Option<super::PathIdentity>)>,
+    /// Leases parked on this service, ended when it stops (#38, #124).
+    leases: Arc<LeaseBook>,
+}
+
+/// This service's parked leases and the daemon-wide `Liveness` they count
+/// into. Per service, so dropping a service ends exactly its own leases --
+/// each client then sees EOF and follows the daemon to its successor.
+struct LeaseBook {
+    liveness: Arc<Liveness>,
+    book: Mutex<Book>,
+    #[cfg(unix)]
+    next: std::sync::atomic::AtomicU64,
+}
+
+#[derive(Default)]
+struct Book {
+    /// Set by `end_all`: a lease that reaches `park_lease` afterwards -- an
+    /// `Attach` still queued in the pool while the service stops -- is
+    /// dropped unacked, so its client retries against the successor rather
+    /// than holding a lease nothing will ever end.
+    closing: bool,
+    #[cfg(unix)]
+    handles: std::collections::HashMap<u64, super::read_endpoint::LeaseShutdown>,
+}
+
+impl LeaseBook {
+    fn new(liveness: Arc<Liveness>) -> Self {
+        Self {
+            liveness,
+            book: Mutex::new(Book::default()),
+            #[cfg(unix)]
+            next: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Book> {
+        self.book.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Refuse further leases and end every one still parked. Under the lock,
+    /// so no lease thread can drop its stream (and free the fd) between
+    /// lookup and shutdown, and no `park_lease` can slip in after it.
+    fn end_all(&self) {
+        let mut book = self.lock();
+        book.closing = true;
+        #[cfg(unix)]
+        for handle in book.handles.values() {
+            handle.shutdown();
+        }
+    }
 }
 
 /// How long the accept loop waits for a client before re-checking its stop
@@ -103,6 +155,22 @@ impl ReadService {
         docs: Option<RowSource>,
         workers: usize,
     ) -> Result<Self> {
+        Self::start_serving(root, source, docs, workers, Arc::new(Liveness::new()))
+    }
+
+    /// As [`start_with_sources`], counting leases and activity into
+    /// `liveness` -- the daemon's, which outlives any one service (#187).
+    ///
+    /// [`start_with_sources`]: ReadService::start_with_sources
+    pub fn start_serving(
+        root: &Path,
+        source: StoreSource,
+        docs: Option<RowSource>,
+        workers: usize,
+        liveness: Arc<Liveness>,
+    ) -> Result<Self> {
+        let leases = Arc::new(LeaseBook::new(liveness));
+        let accept_leases = leases.clone();
         let endpoint = ReadEndpoint::for_root(root);
         let listener = endpoint.bind()?;
         let socket = endpoint
@@ -119,8 +187,9 @@ impl ReadService {
                 };
                 let source = source.clone();
                 let docs = docs.clone();
+                let leases = accept_leases.clone();
                 pool.execute(move || {
-                    if let Err(e) = serve_one(&source, docs.as_ref(), stream) {
+                    if let Err(e) = serve_one(&source, docs.as_ref(), &leases, stream) {
                         eprintln!("[read] connection failed: {e:#}");
                     }
                 });
@@ -136,6 +205,7 @@ impl ReadService {
             accept: Some(accept),
             endpoint,
             socket,
+            leases,
         })
     }
 
@@ -164,6 +234,7 @@ impl ReadService {
         // an explicit `shutdown()` followed by the drop is a no-op.
         let Some(h) = self.accept.take() else { return };
         self.stop.store(true, Ordering::Relaxed);
+        self.leases.end_all();
         // The accept loop sees the flag within `ACCEPT_POLL` on its own; the
         // self-connect only makes that immediate, and is the whole mechanism
         // on Windows, where accept blocks. It fails harmlessly once the
@@ -179,12 +250,20 @@ impl Drop for ReadService {
     }
 }
 
-fn serve_one<S: std::io::Read + std::io::Write>(
+fn serve_one(
     source: &StoreSource,
     docs: Option<&RowSource>,
-    mut stream: S,
+    leases: &Arc<LeaseBook>,
+    mut stream: ReadStream,
 ) -> Result<()> {
-    let req = read_request(&mut stream)?;
+    let req = match read_client_frame(&mut stream)? {
+        ClientFrame::Read(req) => req,
+        ClientFrame::Attach(Attach { attach_pid }) => {
+            park_lease(leases.clone(), attach_pid, stream);
+            return Ok(());
+        }
+    };
+    leases.liveness.touch();
 
     // The document store is a separate `Database` with its own lock file and
     // its own wipe-on-open-failure history (#143), reached through a closure
@@ -259,6 +338,65 @@ fn serve_one<S: std::io::Read + std::io::Write>(
         Err(e) => write_frame(&mut stream, &ReadFrame::Error(e.to_string()))?,
     }
     Ok(())
+}
+
+/// Holds one lease until its client goes away, on its own thread so a held
+/// lease never occupies a pool worker (a handful of idle sessions would
+/// otherwise starve every read). Detached: it ends on EOF, on `end_all`, or
+/// with the process.
+fn park_lease(leases: Arc<LeaseBook>, pid: u32, mut stream: ReadStream) {
+    // Held across the spawn and the registration: the lease thread's
+    // deregistration waits for it, a failed spawn -- which drops the stream
+    // inside `spawn` -- never has a handle registered, and `end_all` can
+    // neither miss this lease nor shut down an fd number since reused.
+    #[cfg(unix)]
+    let mut book = leases.lock();
+    #[cfg(not(unix))]
+    let book = leases.lock();
+    if book.closing {
+        return; // dropped unacked: the client retries against a successor
+    }
+    #[cfg(unix)]
+    let id = leases.next.fetch_add(1, Ordering::Relaxed);
+    #[cfg(unix)]
+    let handle = stream.lease_shutdown();
+    // Counted before the thread exists, so its `lease_closed` can never run
+    // first and underflow the count, on any platform.
+    leases.liveness.lease_opened();
+    let owner = leases.clone();
+    let spawned = std::thread::Builder::new()
+        .name("infigraph-lease".into())
+        .spawn(move || {
+            // Acknowledge first: a client that sees EOF with no ack is
+            // talking to a daemon without leases (or one that could not park
+            // this one) and stops, instead of reconnecting in a loop.
+            let _ = write_frame(&mut stream, &ReadFrame::End);
+            // A lease client never writes after Attach: any frame, EOF or
+            // error ends the lease.
+            let _ = super::read_protocol::read_len_prefixed(&mut stream);
+            #[cfg(unix)]
+            owner.lock().handles.remove(&id);
+            drop(stream); // only once its shutdown handle is gone
+            owner.liveness.lease_closed();
+            eprintln!(
+                "[lease] released pid {pid} ({} held)",
+                owner.liveness.leases()
+            );
+        });
+    if spawned.is_err() {
+        leases.liveness.lease_closed();
+        eprintln!("[lease] could not park a lease for pid {pid}; dropping it");
+        return;
+    }
+    #[cfg(unix)]
+    if let Some(handle) = handle {
+        book.handles.insert(id, handle);
+    }
+    drop(book);
+    eprintln!(
+        "[lease] attached pid {pid} ({} held)",
+        leases.liveness.leases()
+    );
 }
 
 type Job = Box<dyn FnOnce() + Send + 'static>;

@@ -24,6 +24,25 @@ pub struct ReadRequest {
     pub chunk_size: usize,
 }
 
+/// A lease (#38, #124): sent as the first and only frame on a connection the
+/// client holds for as long as it uses the daemon. The daemon answers nothing;
+/// the connection exists so its EOF -- which the kernel delivers even when the
+/// client is SIGKILLed -- tells the daemon a user went away.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Attach {
+    pub attach_pid: u32,
+}
+
+/// The first frame of every connection. `untagged` keeps a `ReadRequest`
+/// byte-identical on the wire, so clients from before leases still parse;
+/// `Attach`'s field is one no `ReadRequest` has, so the two never collide.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ClientFrame {
+    Attach(Attach),
+    Read(ReadRequest),
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ReadFrame {
     Rows(Vec<Vec<String>>),
@@ -38,7 +57,7 @@ fn write_len_prefixed<W: Write>(w: &mut W, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn read_len_prefixed<R: Read>(r: &mut R) -> Result<Option<Vec<u8>>> {
+pub(crate) fn read_len_prefixed<R: Read>(r: &mut R) -> Result<Option<Vec<u8>>> {
     let mut len = [0u8; 4];
     match r.read_exact(&mut len) {
         Ok(()) => {}
@@ -56,7 +75,11 @@ pub fn write_request<W: Write>(w: &mut W, req: &ReadRequest) -> Result<()> {
     write_len_prefixed(w, &serde_json::to_vec(req)?)
 }
 
-pub fn read_request<R: Read>(r: &mut R) -> Result<ReadRequest> {
+pub fn write_attach<W: Write>(w: &mut W, pid: u32) -> Result<()> {
+    write_len_prefixed(w, &serde_json::to_vec(&Attach { attach_pid: pid })?)
+}
+
+pub fn read_client_frame<R: Read>(r: &mut R) -> Result<ClientFrame> {
     let body = read_len_prefixed(r)?.ok_or_else(|| anyhow::anyhow!("no request"))?;
     Ok(serde_json::from_slice(&body)?)
 }
@@ -102,9 +125,34 @@ mod tests {
         };
         let mut buf = Vec::new();
         write_request(&mut buf, &req).unwrap();
-        let got = read_request(&mut buf.as_slice()).unwrap();
+        let ClientFrame::Read(got) = read_client_frame(&mut buf.as_slice()).unwrap() else {
+            panic!("a ReadRequest must parse as ClientFrame::Read");
+        };
         assert_eq!(got.query, req.query);
         assert_eq!(got.store, Store::Graph);
+    }
+
+    #[test]
+    fn an_attach_round_trips() {
+        let mut buf = Vec::new();
+        write_attach(&mut buf, 4242).unwrap();
+        let ClientFrame::Attach(a) = read_client_frame(&mut buf.as_slice()).unwrap() else {
+            panic!("expected Attach");
+        };
+        assert_eq!(a.attach_pid, 4242);
+    }
+
+    /// Wire compatibility: an old client's request JSON, written by hand, must
+    /// still parse as a read. If this breaks, every pre-lease client breaks.
+    #[test]
+    fn an_old_client_request_still_parses_as_a_read() {
+        let json = br#"{"store":"Graph","query":"RETURN 1","params":[],"chunk_size":8}"#;
+        let mut buf = (json.len() as u32).to_le_bytes().to_vec();
+        buf.extend_from_slice(json);
+        assert!(matches!(
+            read_client_frame(&mut buf.as_slice()).unwrap(),
+            ClientFrame::Read(_)
+        ));
     }
 
     /// A stream that ends without an `End` frame must be an error, never an
