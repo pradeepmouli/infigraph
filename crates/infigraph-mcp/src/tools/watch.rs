@@ -536,30 +536,10 @@ pub fn tool_get_watch_status(args: &Value) -> Result<String> {
         let root = std::path::PathBuf::from(path)
             .canonicalize()
             .context("invalid path")?;
-        let lock_path = root.join(".infigraph").join("watch.lock");
-        if !lock_path.exists() {
-            return Ok(format!("No watcher running for {path}."));
-        }
-        let alive = infigraph_core::lockfile::try_acquire(&lock_path, "watch-liveness-probe")
-            .ok()
-            .flatten()
-            .is_none();
-        if !alive {
-            return Ok(format!("No watcher running for {path}."));
-        }
-        return Ok(match infigraph_core::lockfile::read_holder(&lock_path) {
-            Some(info) => format!(
-                "Watcher active for {path}\nHeld by PID {} (role: {}) since epoch {}\n\
-                 Note: pending-reindex tracking is not available across processes in \
-                 daemon mode — use index_project if unsure whether a reindex is needed.",
-                info.pid, info.role, info.acquired_at
-            ),
-            None => format!(
-                "Watcher active for {path} (holder identity unavailable)\n\
-                 Note: pending-reindex tracking is not available across processes in \
-                 daemon mode — use index_project if unsure whether a reindex is needed."
-            ),
-        });
+        let result = infigraph_core::daemon::control::query_status(&root);
+        return Ok(infigraph_core::daemon::control::describe_status(
+            &root, &result,
+        ));
     }
 
     let watcher_id = args.get("watcher_id").and_then(|v| v.as_str());

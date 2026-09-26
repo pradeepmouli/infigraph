@@ -890,13 +890,11 @@ pub(crate) fn stop_via_sentinel(root: &Path) -> Result<()> {
 }
 
 pub(crate) fn cmd_watch_status(root: &Path) -> Result<()> {
-    let lock_path = root.join(".infigraph").join("watch.lock");
-
-    if infigraph_core::daemon::lifecycle::daemon_is_alive(&lock_path) {
-        println!("Watcher is running.");
-    } else {
-        println!("No watcher running.");
-    }
+    let result = infigraph_core::daemon::control::query_status(root);
+    println!(
+        "{}",
+        infigraph_core::daemon::control::describe_status(root, &result)
+    );
     Ok(())
 }
 
@@ -1558,11 +1556,25 @@ pub(crate) fn cmd_ps(root: &Path) -> Result<()> {
         return Ok(());
     }
 
+    // #155: ask every live daemon how it is doing, all at once.
+    let daemon_rows: Vec<(usize, std::path::PathBuf)> = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.alive && r.evidence.iter().any(|e| e.contains("watch.lock")))
+        .filter_map(|(i, r)| r.projects.first().map(|p| (i, std::path::PathBuf::from(p))))
+        .collect();
+    let roots: Vec<_> = daemon_rows.iter().map(|(_, p)| p.clone()).collect();
+    let statuses: std::collections::HashMap<usize, _> = daemon_rows
+        .iter()
+        .map(|(i, _)| *i)
+        .zip(infigraph_core::daemon::control::query_status_many(&roots))
+        .collect();
+
     println!(
-        "{:<8} {:<6} {:<10} {:<10} {:<28} PROJECT / EVIDENCE",
-        "PID", "STATE", "UPTIME", "RSS", "ROLE"
+        "{:<8} {:<6} {:<10} {:<10} {:<28} {:<12} {:<7} {:<9} {:<9} PROJECT / EVIDENCE",
+        "PID", "STATE", "UPTIME", "RSS", "ROLE", "LEASES", "IDLE", "CODE", "DOCS"
     );
-    for r in &rows {
+    for (i, r) in rows.iter().enumerate() {
         let state = if r.alive { "live" } else { "dead" };
         let uptime = r
             .uptime_secs
@@ -1572,13 +1584,18 @@ pub(crate) fn cmd_ps(root: &Path) -> Result<()> {
             .rss_bytes
             .map(|b| format!("{} MB", b / (1024 * 1024)))
             .unwrap_or_else(|| "-".to_string());
+        let [leases, idle, code, docs] = ps_status_cells(statuses.get(&i));
         println!(
-            "{:<8} {:<6} {:<10} {:<10} {:<28} {} [{}]",
+            "{:<8} {:<6} {:<10} {:<10} {:<28} {:<12} {:<7} {:<9} {:<9} {} [{}]",
             r.pid,
             state,
             uptime,
             rss,
             r.roles.join(","),
+            leases,
+            idle,
+            code,
+            docs,
             r.projects.join(", "),
             r.evidence.join(",")
         );
@@ -1589,6 +1606,39 @@ pub(crate) fn cmd_ps(root: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// `ps`'s LEASES, IDLE, CODE and DOCS cells for one row: `None` for a row
+/// that is not a live daemon.
+fn ps_status_cells(
+    status: Option<
+        &std::result::Result<
+            infigraph_core::daemon::read_protocol::StatusReport,
+            infigraph_core::daemon::control::ControlError,
+        >,
+    >,
+) -> [String; 4] {
+    use infigraph_core::daemon::control::ControlError;
+    use infigraph_core::daemon::read_protocol::RoleState;
+    let role = |s: RoleState| match s {
+        RoleState::NotOwned => "-".to_string(),
+        s => s.to_string(),
+    };
+    match status {
+        None => ["-".into(), "-".into(), "-".into(), "-".into()],
+        Some(Ok(r)) => [
+            r.leases.to_string(),
+            r.idle_secs
+                .map(|s| format!("{s}s"))
+                .unwrap_or_else(|| "-".into()),
+            role(r.code),
+            role(r.docs),
+        ],
+        Some(Err(ControlError::Incompatible)) => {
+            ["incompatible".into(), "".into(), "".into(), "".into()]
+        }
+        Some(Err(_)) => ["no reply".into(), "".into(), "".into(), "".into()],
+    }
 }
 
 /// `infigraph kill` (R2.2.4): guarded terminate, audited (R6.3).
@@ -1895,6 +1945,49 @@ mod daemon_liveness_guard_tests {
             doc["watch"]["enabled"].as_bool(),
             Some(false),
             "expected a persisted watch.enabled = false, got: {contents}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod ps_status_tests {
+    use super::ps_status_cells;
+    use infigraph_core::daemon::control::ControlError;
+    use infigraph_core::daemon::read_protocol::{RoleState, StatusReport};
+
+    fn report() -> StatusReport {
+        StatusReport {
+            pid: 1,
+            build: "b".into(),
+            leases: 3,
+            idle_secs: Some(42),
+            grace_secs: 1800,
+            idle_check_secs: 60,
+            work_in_flight: false,
+            code: RoleState::Running,
+            docs: RoleState::NotOwned,
+        }
+    }
+
+    #[test]
+    fn ps_cells_cover_every_status_outcome() {
+        assert_eq!(ps_status_cells(None), ["-", "-", "-", "-"]);
+        assert_eq!(
+            ps_status_cells(Some(&Ok(report()))),
+            ["3", "42s", "running", "-"]
+        );
+        let leased = StatusReport {
+            idle_secs: None,
+            ..report()
+        };
+        assert_eq!(ps_status_cells(Some(&Ok(leased)))[1], "-");
+        assert_eq!(
+            ps_status_cells(Some(&Err(ControlError::Incompatible)))[0],
+            "incompatible"
+        );
+        assert_eq!(
+            ps_status_cells(Some(&Err(ControlError::Unresponsive)))[0],
+            "no reply"
         );
     }
 }
