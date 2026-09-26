@@ -469,7 +469,6 @@ pub(crate) struct HeldPrism {
 
 /// How long `watch_db` waits for a released graph handle to be dropped by
 /// its last other holder before giving up for this attempt.
-#[cfg_attr(windows, allow(dead_code))]
 const RETIRED_STORE_WAIT: Duration = Duration::from_secs(30);
 
 impl HeldPrism {
@@ -495,9 +494,6 @@ impl HeldPrism {
         self.held.as_ref()
     }
 
-    // Windows' `watch_db` reopens on every call and never asks; only the
-    // held-connection variant and tests do.
-    #[cfg_attr(windows, allow(dead_code))]
     pub(crate) fn is_none(&self) -> bool {
         self.held.is_none()
     }
@@ -542,8 +538,6 @@ impl HeldPrism {
     /// refusal in `finish_full_reindex` would roll back a good rebuild. Counts
     /// holders through the `Weak` without upgrading it, so this never becomes
     /// the last owner and closes the `Database` here by accident.
-    // Only the held-connection `watch_db` waits; see `is_none`.
-    #[cfg_attr(windows, allow(dead_code))]
     fn wait_for_retired_store(&mut self, budget: Duration) -> Result<()> {
         let Some(retired) = &self.retired else {
             return Ok(());
@@ -1882,8 +1876,20 @@ fn open_transient(root: &Path, registry: &Arc<crate::lang::LanguageRegistry>) ->
 /// `Database` (see `GraphStore::connection`), which is the concurrency
 /// pattern lbug documents as safe. Opening a second `Database` on the same
 /// file for the drain would be a materially weaker guarantee.
-#[cfg(not(windows))]
 fn watch_db(
+    root: &Path,
+    registry: &Arc<crate::lang::LanguageRegistry>,
+    held: &mut HeldPrism,
+) -> Result<Arc<Infigraph>> {
+    if cfg!(windows) {
+        return reopen_watch_db(root, registry, held);
+    }
+    open_watch_db(root, registry, held)
+}
+
+/// The held connection, opened first if `poison_watch_db` (or nothing yet)
+/// left none -- but only once the store it released is gone (#166).
+fn open_watch_db(
     root: &Path,
     registry: &Arc<crate::lang::LanguageRegistry>,
     held: &mut HeldPrism,
@@ -1900,21 +1906,24 @@ fn watch_db(
     Ok(held.current().expect("just set"))
 }
 
-/// Windows' mandatory file locking prevents a second concurrent connection
-/// while another handle on the same file is open elsewhere, so each call
-/// opens (and the previous one closes) fresh rather than holding one open
-/// across the whole session — see `open_transient`.
-#[cfg(windows)]
-fn watch_db(
+/// Windows' `watch_db`: release the held connection and open a fresh one on
+/// every call, which Windows' mandatory file locking was once thought to
+/// need. Whether it still does is unverified (#174); either way the handle
+/// stays held *between* calls, so this never freed the file for other
+/// processes.
+///
+/// Release, then open, never the reverse (#174): opening first put a second
+/// `Database` on the graph file beside the held one on every call -- the
+/// #149 invariant -- for as long as a drain or a read still held a clone.
+/// The read service sees no prism for the open's duration, which
+/// `RemoteExec` retries as `NOT_READY`.
+fn reopen_watch_db(
     root: &Path,
     registry: &Arc<crate::lang::LanguageRegistry>,
     held: &mut HeldPrism,
 ) -> Result<Arc<Infigraph>> {
-    held.set(
-        Arc::new(note_open(root, open_transient(root, registry))?),
-        &graph_path(root),
-    );
-    Ok(held.current().expect("just set"))
+    poison_watch_db(held);
+    open_watch_db(root, registry, held)
 }
 
 /// The live graph file the daemon's prism opens.
@@ -3569,6 +3578,39 @@ mod tests {
         held.wait_for_retired_store(Duration::from_secs(10))
             .expect("the wait must end once the last holder drops the store");
         assert!(held.retired.is_none());
+        holder.join().unwrap();
+    }
+
+    /// #174: Windows' per-call reopen releases the held store, and waits for
+    /// every other holder of it to let go, before it opens the next one --
+    /// never two `Database`s on one file in this process (#149). A drain task
+    /// or an in-flight read holding a clone is exactly such a holder.
+    #[test]
+    fn a_reopen_opens_nothing_until_the_previous_store_is_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let registry = Arc::new(crate::lang::LanguageRegistry::new());
+        let mut held = HeldPrism::new();
+        let first = reopen_watch_db(root, &registry, &mut held).unwrap();
+        let first_store = Arc::downgrade(&first.graph_store().unwrap());
+
+        const HOLD: Duration = Duration::from_millis(1500);
+        let holder = std::thread::spawn(move || {
+            std::thread::sleep(HOLD);
+            drop(first);
+        });
+        let started = std::time::Instant::now();
+        let second = reopen_watch_db(root, &registry, &mut held).unwrap();
+        assert_eq!(
+            first_store.strong_count(),
+            0,
+            "the reopen returned while the previous store was still alive"
+        );
+        assert!(
+            started.elapsed() >= HOLD,
+            "the reopen did not wait for the holder"
+        );
+        assert!(Arc::ptr_eq(&second, &held.current().unwrap()));
         holder.join().unwrap();
     }
 

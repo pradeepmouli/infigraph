@@ -145,9 +145,8 @@ impl CodeWatch {
 /// that turns a long session into thousands of forced checkpoints, which was
 /// found to cause severe embedded-graph-file bloat over time (multi-GB
 /// write amplification per cycle at scale, independent of actual data
-/// growth). On Windows, mandatory file locking prevents a second concurrent
-/// connection while another handle on the same file is open elsewhere, so
-/// the original per-batch open/close behavior is kept there.
+/// growth). Windows keeps the original per-batch close/reopen -- see
+/// `reopen_watch_db` for why, and for whether it is still needed (#174).
 ///
 /// Blocks until `stop_rx` receives a signal.
 pub fn watch_project<MR>(
