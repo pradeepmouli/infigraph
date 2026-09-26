@@ -71,17 +71,44 @@ pub struct ReadService {
 /// each client then sees EOF and follows the daemon to its successor.
 struct LeaseBook {
     liveness: Arc<Liveness>,
+    book: Mutex<Book>,
     #[cfg(unix)]
-    open: Mutex<std::collections::HashMap<u64, super::read_endpoint::LeaseShutdown>>,
     next: std::sync::atomic::AtomicU64,
 }
 
+#[derive(Default)]
+struct Book {
+    /// Set by `end_all`: a lease that reaches `park_lease` afterwards -- an
+    /// `Attach` still queued in the pool while the service stops -- is
+    /// dropped unacked, so its client retries against the successor rather
+    /// than holding a lease nothing will ever end.
+    closing: bool,
+    #[cfg(unix)]
+    handles: std::collections::HashMap<u64, super::read_endpoint::LeaseShutdown>,
+}
+
 impl LeaseBook {
-    /// End every lease still parked. Under the lock, so no lease thread can
-    /// drop its stream (and free the fd) between lookup and shutdown.
+    fn new(liveness: Arc<Liveness>) -> Self {
+        Self {
+            liveness,
+            book: Mutex::new(Book::default()),
+            #[cfg(unix)]
+            next: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Book> {
+        self.book.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Refuse further leases and end every one still parked. Under the lock,
+    /// so no lease thread can drop its stream (and free the fd) between
+    /// lookup and shutdown, and no `park_lease` can slip in after it.
     fn end_all(&self) {
+        let mut book = self.lock();
+        book.closing = true;
         #[cfg(unix)]
-        for handle in self.open.lock().unwrap_or_else(|e| e.into_inner()).values() {
+        for handle in book.handles.values() {
             handle.shutdown();
         }
     }
@@ -142,12 +169,7 @@ impl ReadService {
         workers: usize,
         liveness: Arc<Liveness>,
     ) -> Result<Self> {
-        let leases = Arc::new(LeaseBook {
-            liveness,
-            #[cfg(unix)]
-            open: Mutex::new(std::collections::HashMap::new()),
-            next: std::sync::atomic::AtomicU64::new(0),
-        });
+        let leases = Arc::new(LeaseBook::new(liveness));
         let accept_leases = leases.clone();
         let endpoint = ReadEndpoint::for_root(root);
         let listener = endpoint.bind()?;
@@ -323,35 +345,42 @@ fn serve_one(
 /// otherwise starve every read). Detached: it ends on EOF, on `end_all`, or
 /// with the process.
 fn park_lease(leases: Arc<LeaseBook>, pid: u32, mut stream: ReadStream) {
+    // Held across the spawn and the registration: the lease thread's
+    // deregistration waits for it, a failed spawn -- which drops the stream
+    // inside `spawn` -- never has a handle registered, and `end_all` can
+    // neither miss this lease nor shut down an fd number since reused.
+    #[cfg(unix)]
+    let mut book = leases.lock();
+    #[cfg(not(unix))]
+    let book = leases.lock();
+    if book.closing {
+        return; // dropped unacked: the client retries against a successor
+    }
+    #[cfg(unix)]
     let id = leases.next.fetch_add(1, Ordering::Relaxed);
     #[cfg(unix)]
     let handle = stream.lease_shutdown();
-    // Held across the spawn: the lease thread's deregistration waits for the
-    // registration below, and a failed spawn -- which drops the stream inside
-    // `spawn` -- never has a handle registered. Either way `end_all` can
-    // never shut down an fd number that has since been reused.
-    #[cfg(unix)]
-    let mut open = leases.open.lock().unwrap_or_else(|e| e.into_inner());
     // Counted before the thread exists, so its `lease_closed` can never run
     // first and underflow the count, on any platform.
     leases.liveness.lease_opened();
-    let book = leases.clone();
+    let owner = leases.clone();
     let spawned = std::thread::Builder::new()
         .name("infigraph-lease".into())
         .spawn(move || {
+            // Acknowledge first: a client that sees EOF with no ack is
+            // talking to a daemon without leases (or one that could not park
+            // this one) and stops, instead of reconnecting in a loop.
+            let _ = write_frame(&mut stream, &ReadFrame::End);
             // A lease client never writes after Attach: any frame, EOF or
             // error ends the lease.
             let _ = super::read_protocol::read_len_prefixed(&mut stream);
             #[cfg(unix)]
-            book.open
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&id);
-            drop(stream);
-            book.liveness.lease_closed();
+            owner.lock().handles.remove(&id);
+            drop(stream); // only once its shutdown handle is gone
+            owner.liveness.lease_closed();
             eprintln!(
                 "[lease] released pid {pid} ({} held)",
-                book.liveness.leases()
+                owner.liveness.leases()
             );
         });
     if spawned.is_err() {
@@ -361,10 +390,9 @@ fn park_lease(leases: Arc<LeaseBook>, pid: u32, mut stream: ReadStream) {
     }
     #[cfg(unix)]
     if let Some(handle) = handle {
-        open.insert(id, handle);
+        book.handles.insert(id, handle);
     }
-    #[cfg(unix)]
-    drop(open);
+    drop(book);
     eprintln!(
         "[lease] attached pid {pid} ({} held)",
         leases.liveness.leases()

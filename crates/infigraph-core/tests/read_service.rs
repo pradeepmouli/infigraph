@@ -548,6 +548,13 @@ fn dropping_the_service_releases_its_leases() {
         wait_for(|| liveness.leases() == 0),
         "shutdown must end parked leases"
     );
+    assert!(
+        matches!(
+            infigraph_core::daemon::read_protocol::read_frame(&mut lease),
+            Ok(Some(infigraph_core::daemon::read_protocol::ReadFrame::End))
+        ),
+        "a parked lease is acknowledged"
+    );
     let mut buf = [0u8; 1];
     assert_eq!(
         std::io::Read::read(&mut lease, &mut buf).unwrap_or(0),
@@ -649,5 +656,57 @@ fn hold_reattaches_to_a_successor_service() {
     assert!(
         wait_for(|| liveness.leases() == 1),
         "the lease must follow the daemon across a restart"
+    );
+}
+
+/// Final-review C1: a daemon that does not understand `Attach` -- a build
+/// from before leases -- reads the frame, fails to parse it and closes. The
+/// lease thread must take that as "no leases here" and stop, not reconnect
+/// in a tight loop (each attempt also logs a line in that daemon's log).
+#[test]
+fn a_daemon_that_rejects_attach_is_not_reconnected_in_a_loop() {
+    let project = tempfile::tempdir().unwrap();
+    let lock = project.path().join(".infigraph").join("watch.lock");
+    std::fs::create_dir_all(lock.parent().unwrap()).unwrap();
+    // A lock file, so the lease thread waits out its grace between attempts
+    // rather than giving up because no daemon ever ran here.
+    std::fs::write(&lock, b"").unwrap();
+
+    let listener = ReadEndpoint::for_root(project.path()).bind().unwrap();
+    let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stub = {
+        let (accepted, stop) = (accepted.clone(), stop.clone());
+        std::thread::spawn(move || {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let Ok(Some(mut stream)) =
+                    listener.accept_timeout(std::time::Duration::from_millis(50))
+                else {
+                    continue;
+                };
+                accepted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // An old daemon: one frame read, not understood, closed.
+                let mut len = [0u8; 4];
+                let _ = std::io::Read::read_exact(&mut stream, &mut len);
+                drop(stream);
+            }
+        })
+    };
+
+    lease::hold(project.path());
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    let n = accepted.load(std::sync::atomic::Ordering::Relaxed);
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    stub.join().unwrap();
+    // One retry is allowed: a single un-acked EOF is also what a daemon that
+    // is shutting down looks like, and a restart must be followed (see
+    // `hold_reattaches_to_a_successor_service`). Twice in a row is a refusal.
+    assert!(
+        n <= 2,
+        "a rejected Attach must end the lease attempt, got {n} connections in 2s"
+    );
+    assert!(
+        wait_for(|| !lease::is_held(project.path())),
+        "the root must be forgotten, so a later hold can try again"
     );
 }

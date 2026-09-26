@@ -91,6 +91,12 @@ fn hold_until_no_daemon(root: &Path, just_spawned: bool) {
     } else {
         std::time::Duration::ZERO
     };
+    // Consecutive attaches that ended without an ack. One is ambiguous -- a
+    // daemon shutting down (its listener still bound until its accept thread
+    // is joined) looks exactly like one that refuses leases -- so it earns a
+    // pause and a retry, which reaches the successor after a restart. Two in
+    // a row is a daemon that does not support leases: stop.
+    let mut unacked = 0;
     loop {
         let Some(mut stream) = connect_within(root, budget) else {
             return;
@@ -98,6 +104,24 @@ fn hold_until_no_daemon(root: &Path, just_spawned: bool) {
         if super::read_protocol::write_attach(&mut stream, std::process::id()).is_err() {
             return;
         }
+        // The daemon acks a parked lease. EOF without one means it does not
+        // support leases (a build from before them) or could not park this
+        // one: stop, and let the next `hold` try again, rather than
+        // reconnecting in a loop -- each attempt also costs that daemon a
+        // log line.
+        if !matches!(
+            super::read_protocol::read_frame(&mut stream),
+            Ok(Some(super::read_protocol::ReadFrame::End))
+        ) {
+            unacked += 1;
+            if unacked >= 2 {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            budget = super::read_endpoint::DAEMON_STARTUP_GRACE;
+            continue;
+        }
+        unacked = 0;
         // Blocks until the daemon closes the connection.
         let _ = super::read_protocol::read_len_prefixed(&mut stream);
         budget = super::read_endpoint::DAEMON_STARTUP_GRACE;
@@ -126,7 +150,6 @@ fn connect_within(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
 
     /// `daemon_is_alive` probes by briefly taking `watch.lock`, so a lease
     /// thread that probed it would make other probers in this process -- the
@@ -166,7 +189,7 @@ mod tests {
         let graph = root.join(".infigraph").join("graph");
         std::fs::create_dir_all(graph.parent().unwrap()).unwrap();
         drop(crate::graph::GraphStore::open(&graph).unwrap());
-        let store = Arc::new(crate::graph::GraphStore::open(&graph).unwrap());
+        let store = std::sync::Arc::new(crate::graph::GraphStore::open(&graph).unwrap());
 
         hold_spawned(&root);
         std::thread::sleep(std::time::Duration::from_millis(500));
@@ -175,10 +198,10 @@ mod tests {
         let _lock = crate::lockfile::try_acquire(&root.join(".infigraph").join("watch.lock"), "t")
             .unwrap()
             .unwrap();
-        let liveness = Arc::new(super::super::liveness::Liveness::new());
+        let liveness = std::sync::Arc::new(super::super::liveness::Liveness::new());
         let _svc = super::super::read_service::ReadService::start_serving(
             &root,
-            Arc::new(move || Some(store.clone())),
+            std::sync::Arc::new(move || Some(store.clone())),
             None,
             2,
             liveness.clone(),
