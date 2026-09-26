@@ -61,17 +61,7 @@ fn hold_inner(root: &Path, just_spawned: bool) {
         .spawn({
             let root = root.clone();
             move || {
-                let lock = root.join(".infigraph").join("watch.lock");
-                if just_spawned
-                    && !super::lifecycle::wait_for_daemon_ready(
-                        &lock,
-                        super::read_endpoint::DAEMON_STARTUP_GRACE,
-                    )
-                {
-                    with_held(|h| h.remove(&root));
-                    return;
-                }
-                hold_until_no_daemon(&root);
+                hold_until_no_daemon(&root, just_spawned);
                 with_held(|h| h.remove(&root));
             }
         });
@@ -81,14 +71,28 @@ fn hold_inner(root: &Path, just_spawned: bool) {
 }
 
 /// Attach, wait for the daemon to go away, and attach again to a successor
-/// while `watch.lock` says there is one (a `daemon-restart`, a build-mismatch
+/// that binds within the startup grace (a `daemon-restart`, a build-mismatch
 /// respawn) -- so a session that never queries keeps its lease across
 /// restarts. Returns once no daemon is left to lease from; the caller's next
 /// `hold` (every `Infigraph::init`) starts over.
-fn hold_until_no_daemon(root: &Path) {
-    let lock = root.join(".infigraph").join("watch.lock");
+///
+/// Never probes `watch.lock`. `daemon_is_alive` probes by briefly *taking*
+/// the lock, so a lease thread that probed would make other probers in this
+/// process -- the caller's own `wait_for_daemon_ready` right after a spawn --
+/// read "alive" while no daemon holds it, and could take the lock out from
+/// under a daemon that is starting. A successful connect is the one signal
+/// that is both conclusive and free of side effects.
+fn hold_until_no_daemon(root: &Path, just_spawned: bool) {
+    // With no `watch.lock` file no daemon has ever run here: nothing to wait
+    // for. Existence is a stat, not a probe. A spawn's trial lock creates the
+    // file, but a spawned daemon is waited for regardless.
+    let mut budget = if just_spawned || root.join(".infigraph").join("watch.lock").exists() {
+        super::read_endpoint::DAEMON_STARTUP_GRACE
+    } else {
+        std::time::Duration::ZERO
+    };
     loop {
-        let Ok(mut stream) = super::read_endpoint::connect_allowing_for_startup(root) else {
+        let Some(mut stream) = connect_within(root, budget) else {
             return;
         };
         if super::read_protocol::write_attach(&mut stream, std::process::id()).is_err() {
@@ -96,12 +100,26 @@ fn hold_until_no_daemon(root: &Path) {
         }
         // Blocks until the daemon closes the connection.
         let _ = super::read_protocol::read_len_prefixed(&mut stream);
-        if !super::lifecycle::wait_for_daemon_ready(
-            &lock,
-            super::read_endpoint::DAEMON_STARTUP_GRACE,
-        ) {
-            return;
+        budget = super::read_endpoint::DAEMON_STARTUP_GRACE;
+    }
+}
+
+/// Connect to `root`'s read endpoint, retrying until `budget` runs out (one
+/// attempt for a zero budget).
+fn connect_within(
+    root: &Path,
+    budget: std::time::Duration,
+) -> Option<super::read_endpoint::ReadStream> {
+    let endpoint = super::read_endpoint::ReadEndpoint::for_root(root);
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        if let Ok(stream) = endpoint.connect() {
+            return Some(stream);
         }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
     }
 }
 
@@ -109,6 +127,33 @@ fn hold_until_no_daemon(root: &Path) {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    /// `daemon_is_alive` probes by briefly taking `watch.lock`, so a lease
+    /// thread that probed it would make other probers in this process -- the
+    /// caller's own `wait_for_daemon_ready` right after a spawn -- read
+    /// "alive" while no daemon holds it (the docs daemon-start test failed
+    /// 2/3 this way), and could take the lock from a daemon that is starting.
+    /// A successful probe stamps its role into the file and its drop clears
+    /// it again, so an unchanged mtime proves the lease thread never took it.
+    #[test]
+    fn a_pending_lease_never_probes_watch_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join(".infigraph")).unwrap();
+        let lock = root.join(".infigraph").join("watch.lock");
+        // As after a spawn: the spawn path's trial probe leaves the file
+        // behind, unlocked, before the child takes it.
+        std::fs::write(&lock, b"").unwrap();
+        let before = std::fs::metadata(&lock).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        hold_spawned(&root);
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        assert_eq!(
+            std::fs::metadata(&lock).unwrap().modified().unwrap(),
+            before,
+            "the lease thread took watch.lock (a probe stamped and cleared it)"
+        );
+    }
 
     /// A just-spawned daemon has no `watch.lock` yet; `hold_spawned` must
     /// wait for it rather than give up, or MCP boot's fresh spawn is never
