@@ -2,6 +2,7 @@ pub(crate) mod backoff;
 pub(crate) mod drain;
 pub mod fault;
 pub mod lifecycle;
+pub mod liveness;
 pub mod queue;
 pub mod read_endpoint;
 pub mod read_guard;
