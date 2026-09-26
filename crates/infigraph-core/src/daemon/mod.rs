@@ -1,6 +1,7 @@
 pub(crate) mod backoff;
 pub(crate) mod drain;
 pub mod fault;
+pub mod lease;
 pub mod lifecycle;
 pub mod liveness;
 pub mod queue;

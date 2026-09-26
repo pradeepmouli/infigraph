@@ -555,3 +555,99 @@ fn dropping_the_service_releases_its_leases() {
         "the client must see EOF"
     );
 }
+
+// ── client leases (#38, #124) ────────────────────────────────────────
+
+use infigraph_core::daemon::lease;
+
+#[test]
+fn hold_attaches_once_and_is_idempotent() {
+    let (project, source) = indexed_project_and_source();
+    let liveness = Arc::new(Liveness::new());
+    let _svc =
+        ReadService::start_serving(project.path(), source, None, 2, liveness.clone()).unwrap();
+    lease::hold(project.path());
+    lease::hold(project.path());
+    assert!(wait_for(|| liveness.leases() == 1));
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert_eq!(
+        liveness.leases(),
+        1,
+        "a second hold must not open a second lease"
+    );
+    assert!(lease::is_held(project.path()));
+}
+
+#[test]
+fn hold_is_a_noop_for_the_process_own_daemon_root() {
+    let (project, source) = indexed_project_and_source();
+    let liveness = Arc::new(Liveness::new());
+    let _svc =
+        ReadService::start_serving(project.path(), source, None, 2, liveness.clone()).unwrap();
+    lease::mark_self_daemon(project.path());
+    lease::hold(project.path());
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert_eq!(liveness.leases(), 0);
+    assert!(!lease::is_held(project.path()));
+}
+
+#[test]
+fn hold_with_no_daemon_forgets_the_root() {
+    let project = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(project.path().join(".infigraph")).unwrap();
+    lease::hold(project.path());
+    assert!(wait_for(|| !lease::is_held(project.path())));
+}
+
+/// The case where a synchronous attach would hang its caller: a daemon that
+/// holds `watch.lock` but has not bound its socket yet makes
+/// `connect_allowing_for_startup` wait out its 30s grace. `hold` sits on
+/// every `Infigraph::init`, so it must return regardless.
+#[test]
+fn hold_never_blocks_on_a_daemon_that_is_still_starting() {
+    let project = tempfile::tempdir().unwrap();
+    let lock_path = project.path().join(".infigraph").join("watch.lock");
+    std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+    let _lock = infigraph_core::lockfile::try_acquire(&lock_path, "test-daemon")
+        .unwrap()
+        .unwrap();
+    let t = std::time::Instant::now();
+    lease::hold(project.path());
+    assert!(
+        t.elapsed() < std::time::Duration::from_secs(2),
+        "hold must return at once, not wait for the daemon: took {:?}",
+        t.elapsed()
+    );
+    assert!(
+        lease::is_held(project.path()),
+        "the attach is still pending"
+    );
+}
+
+/// Review Focus 1: a restarted daemon is re-attached to without any new
+/// `hold`. `daemon_is_alive` needs `watch.lock` held, so hold it here the way
+/// a daemon does.
+#[cfg(unix)]
+#[test]
+fn hold_reattaches_to_a_successor_service() {
+    let (project, source) = indexed_project_and_source();
+    let lock_path = project.path().join(".infigraph").join("watch.lock");
+    let _lock = infigraph_core::lockfile::try_acquire(&lock_path, "test-daemon")
+        .unwrap()
+        .unwrap();
+    // One Liveness across both services, exactly as the coordinator shares it
+    // across a #187 rebind -- so this also pins Review Focus 5.
+    let liveness = Arc::new(Liveness::new());
+    let svc = ReadService::start_serving(project.path(), source.clone(), None, 2, liveness.clone())
+        .unwrap();
+    lease::hold(project.path());
+    assert!(wait_for(|| liveness.leases() == 1));
+    drop(svc); // ends its parked leases, so the client sees EOF
+    assert!(wait_for(|| liveness.leases() == 0));
+    let _svc2 =
+        ReadService::start_serving(project.path(), source, None, 2, liveness.clone()).unwrap();
+    assert!(
+        wait_for(|| liveness.leases() == 1),
+        "the lease must follow the daemon across a restart"
+    );
+}
