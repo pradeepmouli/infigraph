@@ -185,7 +185,20 @@ fn cmd_watch_daemon_also_indexes_docs_without_restart() {
 
     std::fs::write(root.join("readme.md"), "# hello\n\nsome content").unwrap();
 
-    let reindex_line = reindexed_rx.recv_timeout(Duration::from_secs(10));
+    // Wait for the reindex that actually indexed a file. Under load the
+    // watcher can report an empty reindex first -- a filesystem event from
+    // the setup above (the tempdir, `docs.kuzu`) delivered after the watch
+    // registered -- and taking the first `reindexed:` line then read that
+    // as "readme.md was not indexed" (seen 2/6 at load ~30, before #155 too).
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let reindex_line = loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        match reindexed_rx.recv_timeout(left) {
+            Ok(line) if files_indexed(&line) > 0 => break Ok(line),
+            Ok(_) => continue,
+            Err(e) => break Err(e),
+        }
+    };
 
     // Kill the daemon now rather than waiting for `child` to drop at end of
     // scope, so it can't still be writing reindex lines during the
@@ -198,14 +211,17 @@ fn cmd_watch_daemon_also_indexes_docs_without_restart() {
         "the running watch daemon's doc thread must have logged a reindex of readme.md \
          without a restart (timed out waiting for a 'reindexed:' line on its stderr)",
     );
-    let indexed_files: u32 = reindex_line
-        .split_whitespace()
-        .find_map(|tok| tok.parse::<u32>().ok())
-        .unwrap_or(0);
     assert!(
-        indexed_files > 0,
+        files_indexed(&reindex_line) > 0,
         "expected a real reindex of readme.md, got: {reindex_line}"
     );
+}
+
+/// The file count in a `[doc-watch-daemon] reindexed: N files, M chunks` line.
+fn files_indexed(line: &str) -> u32 {
+    line.split_whitespace()
+        .find_map(|tok| tok.parse::<u32>().ok())
+        .unwrap_or(0)
 }
 
 /// Spawns `infigraph daemon` as a genuine detached process against `root`
@@ -500,25 +516,18 @@ fn a_panic_in_the_daemon_process_is_logged_before_it_exits() {
     );
 }
 
-/// Real end-to-end regression test for the "doc-watcher can't recover from
-/// the `watch.stop.docs` sentinel" bug: the MCP `stop_watch_docs` tool
-/// (`tool_stop_watch_docs` in `infigraph-mcp`) stops daemon-mode doc
-/// watching by writing `.infigraph/watch.stop.docs` directly, rather than
-/// going through the `WatchControl` protocol `infigraph watch-docs stop`
-/// uses. That sentinel is consumed by `watch_docs_daemon_loop`
-/// (`infigraph-docs/src/watch.rs`) without ever exiting its thread -- it
-/// just sets an internal `suppressed_until_absent` flag and keeps polling.
-/// Before the fix, `DocWatchThread::start()` (`infigraph-cli`) returned
-/// early whenever `self.handle.is_some()`, which stays true the whole time
-/// (the thread never actually exits), so `infigraph watch-docs start` /
-/// `enable_watch_docs` was a permanent silent no-op after this sentinel
-/// path. This test writes that exact sentinel directly (there is no CLI
-/// command that does -- only the MCP tool does, but the on-disk contract is
-/// identical and this avoids spinning up a whole MCP server) against a real
-/// daemon subprocess, then proves `infigraph watch-docs start` genuinely
-/// resumes doc-watching afterward.
+/// Real end-to-end test for doc-watch control (#155, D7): a docs Stop and
+/// Start sent to a real daemon subprocess over its socket are visible in its
+/// `Status` report, a stopped watcher really stops indexing, and a started
+/// one really resumes.
+///
+/// It replaces the test for the `watch.stop.docs` sentinel bug: that
+/// sentinel parked the doc loop in a state `Status` could not see, and #155
+/// removed it. Stop is now `DocWatchThread::stop()` (the thread is joined)
+/// and Start respawns it, so there is no paused-but-alive state to recover
+/// from.
 #[test]
-fn watch_docs_start_resumes_after_a_sentinel_triggered_stop() {
+fn watch_docs_stop_and_start_over_control_are_visible_in_status() {
     let bin = cli_binary();
     if !bin.exists() {
         eprintln!(
@@ -615,22 +624,15 @@ fn watch_docs_start_resumes_after_a_sentinel_triggered_stop() {
         .recv_timeout(Duration::from_secs(10))
         .expect("baseline reindex before any stop must succeed");
 
-    // Simulate tool_stop_watch_docs's daemon-mode write directly.
-    std::fs::write(root.join(".infigraph").join("watch.stop.docs"), b"").unwrap();
-    let sentinel = root.join(".infigraph").join("watch.stop.docs");
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while sentinel.exists() && std::time::Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    assert!(
-        !sentinel.exists(),
-        "sentinel must be consumed by the running daemon"
-    );
-    // ...and only now is the watcher genuinely torn down, so a doc written
-    // after this point can no longer be indexed by a still-running watcher.
+    use infigraph_core::daemon::control::{query_status, send_control};
+    use infigraph_core::daemon::read_protocol::{RoleState, WatchAction, WatchRole};
+    send_control(&root, WatchRole::Docs, WatchAction::Stop).unwrap();
+    assert_eq!(query_status(&root).unwrap().docs, RoleState::Stopped);
+    // The reply comes after `DocWatchThread::stop()` joined the thread, so
+    // the watcher has already printed "stopped".
     stopped_rx
         .recv_timeout(Duration::from_secs(10))
-        .expect("doc watcher must report it stopped after consuming the sentinel");
+        .expect("doc watcher must report it stopped");
 
     // Waiting for "stopped" closes the future; this closes the past. Once
     // `stop_tx` is signalled, `watch_docs` still finishes the iteration it is
@@ -646,32 +648,21 @@ fn watch_docs_start_resumes_after_a_sentinel_triggered_stop() {
     // sent, and the watcher's loop has broken so none can follow.
     while reindexed_rx.try_recv().is_ok() {}
 
-    // Confirm it's genuinely suppressed: a doc written now must NOT be
+    // Confirm it's genuinely stopped: a doc written now must NOT be
     // reindexed within a bounded wait (docs.kuzu never disappeared, so this
     // is not a false negative from a detach/reattach race).
     std::fs::write(root.join("while-stopped.md"), "# should not be indexed").unwrap();
     assert!(
         reindexed_rx.recv_timeout(Duration::from_secs(2)).is_err(),
-        "doc watching must stay stopped after the sentinel -- got an unexpected reindex"
+        "doc watching must stay stopped after a docs Stop -- got an unexpected reindex"
     );
 
-    // The actual regression check: infigraph watch-docs start must resume
-    // doc-watching despite the daemon's doc thread never having exited.
-    let start_status = Command::new(&bin)
-        .arg("watch-docs")
-        .arg("start")
-        .current_dir(&root)
-        .stdin(Stdio::null())
-        .status()
-        .expect("failed to run infigraph watch-docs start");
-    assert!(
-        start_status.success(),
-        "infigraph watch-docs start exited non-zero: {start_status:?}"
-    );
+    send_control(&root, WatchRole::Docs, WatchAction::Start).unwrap();
+    assert_eq!(query_status(&root).unwrap().docs, RoleState::Running);
 
     attach_rx
         .recv_timeout(Duration::from_secs(5))
-        .expect("doc watcher must re-attach after infigraph watch-docs start");
+        .expect("doc watcher must re-attach after a docs Start");
     std::thread::sleep(Duration::from_millis(200));
 
     std::fs::write(root.join("after-restart.md"), "# should be indexed now").unwrap();
@@ -682,7 +673,6 @@ fn watch_docs_start_resumes_after_a_sentinel_triggered_stop() {
 
     assert!(
         resumed.is_ok(),
-        "infigraph watch-docs start must actually resume doc-watching after a prior \
-         sentinel-triggered stop, not silently no-op"
+        "a docs Start must actually resume doc-watching after a docs Stop"
     );
 }
