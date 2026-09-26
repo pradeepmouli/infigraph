@@ -589,7 +589,7 @@ fn tool_watch_docs_respects_daemon_mode_toggle() {
 
 /// `disable_watch` must respect the daemon-mode toggle the same way
 /// `tool_stop_watch`'s intent does -- but route through the real
-/// `WatchControl` request bridge (Task 11's `submit_watch_control_and_await`)
+/// socket control (`daemon::control::send_control`, #155)
 /// rather than ever touching the in-process WATCHERS map.
 #[test]
 fn tool_disable_watch_respects_daemon_mode_toggle() {

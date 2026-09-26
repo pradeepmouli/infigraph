@@ -15,6 +15,13 @@ struct Daemon {
 }
 
 fn start(root: &Path) -> Daemon {
+    start_with_docs(root, None)
+}
+
+fn start_with_docs(
+    root: &Path,
+    docs: Option<std::sync::Arc<dyn infigraph_core::daemon::DocsHandle>>,
+) -> Daemon {
     std::fs::write(root.join("main.py"), "def main():\n    pass\n").unwrap();
     let (stop_tx, stop_rx) = std::sync::mpsc::channel();
     let token = tokio_util::sync::CancellationToken::new();
@@ -32,7 +39,7 @@ fn start(root: &Path) -> Daemon {
             true,
             None,
             &t,
-            None,
+            docs,
             None,
         )
     });
@@ -179,5 +186,67 @@ fn a_stalled_coordinator_still_answers_status_and_refuses_control_when_full() {
         assert_eq!(q.join().unwrap(), Ok(()));
     }
     std::env::remove_var("INFIGRAPH_TEST_COORDINATOR_STALL_FILE");
+    stop(d);
+}
+
+/// A pre-#155 client drops a file-drop `WatchControl`. The daemon must answer
+/// it promptly with an error -- not honour it, and not leave the client
+/// waiting out its 30s timeout.
+#[test]
+fn a_legacy_watch_control_request_file_gets_a_prompt_error() {
+    let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let d = start(dir.path());
+    let requests = dir.path().join(".infigraph").join("requests");
+    std::fs::create_dir_all(&requests).unwrap();
+    // Exactly what a pre-#155 client wrote.
+    infigraph_core::daemon_protocol::write_atomic(
+        &requests.join("legacy.request"),
+        r#"{"WatchControl":{"role":"Daemon","action":"Stop"}}"#,
+    )
+    .unwrap();
+    let result = requests.join("legacy.result");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !result.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let reply =
+        std::fs::read_to_string(&result).expect("a prompt reply, not a 30s client timeout");
+    assert!(reply.contains("Err"), "{reply}");
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        !d.handle.is_finished(),
+        "a legacy stop must not be honoured"
+    );
+    stop(d);
+}
+
+/// Records every docs action it is asked to perform.
+struct Recorder(std::sync::Arc<std::sync::Mutex<Vec<WatchAction>>>);
+
+impl infigraph_core::daemon::DocsHandle for Recorder {
+    fn control(&self, action: WatchAction) -> Result<(), String> {
+        self.0.lock().unwrap().push(action);
+        Ok(())
+    }
+    fn is_running(&self) -> bool {
+        false
+    }
+}
+
+#[test]
+fn docs_control_reaches_the_registered_docs_handle() {
+    let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let d = start_with_docs(
+        dir.path(),
+        Some(std::sync::Arc::new(Recorder(received.clone()))),
+    );
+    assert_eq!(
+        send_control(dir.path(), WatchRole::Docs, WatchAction::Start),
+        Ok(())
+    );
+    assert_eq!(*received.lock().unwrap(), vec![WatchAction::Start]);
     stop(d);
 }

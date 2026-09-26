@@ -64,7 +64,7 @@ impl std::fmt::Display for WatchEvent {
 }
 /// The coordinator's handle on the code-watch producer `Task<()>`: enough
 /// state to stop the live one, and enough to spawn a replacement when a
-/// `WatchControl { role: Code, action: Start|Restart }` request asks for
+/// `Control { role: Code, action: Start|Restart }` request asks for
 /// one. Stopping cancels the *task's* own child token, leaving `token`
 /// (the `code_token` of the spec's hierarchy) intact and reusable -- which
 /// is what makes stop-then-start work without rebuilding the hierarchy.

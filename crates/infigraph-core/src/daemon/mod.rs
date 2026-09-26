@@ -358,11 +358,11 @@ fn path_is_gone(root: &Path, original: Option<PathIdentity>) -> bool {
 /// Filesystem watching itself is NOT done here -- it runs in
 /// `producer::run_producer` on `CodeWatch`'s own runtime, feeding the same
 /// `queue` this loop drains. That separation is the point: a
-/// `WatchControl { role: Code, action: Stop }` request stops the producer
+/// `Control { role: Code, action: Stop }` request stops the producer
 /// while this loop keeps running and keeps serving writes.
 ///
 /// `docs_control` lets a caller that owns a doc-watch loop (the CLI daemon)
-/// have `WatchControl { role: Docs, .. }` requests dispatched to it; `None`
+/// have `Control { role: Docs, .. }` requests dispatched to it; `None`
 /// answers those requests with an error instead.
 /// Markers that make a directory a *project* rather than a place projects
 /// live. Deliberately broader than "has a `.git` directory", which would be
@@ -794,7 +794,7 @@ where
     // the moment both halves run against the same queue.
 
     // Code-watching runs as its own cancellable task feeding `queue`, so a
-    // `WatchControl { role: Code, .. }` request can stop and restart it
+    // `Control { role: Code, .. }` request can stop and restart it
     // without this loop noticing. Its registry is the same one built above:
     // building a second would cost seconds in debug builds (#58).
     let on_event_shared: Arc<dyn Fn(WatchEvent) + Send + Sync> = Arc::new(on_event);
@@ -865,7 +865,8 @@ where
 
     let sentinel = root.join(".infigraph").join("watch.stop");
 
-    // Set by a `WatchControl { role: Daemon, action: Stop|Restart }` request.
+    // Set by a `Control { role: Daemon, action: Stop|Restart }` request, which
+    // the loop takes at its bottom and leaves on at once (#155).
     // Deliberately NOT derived from `daemon_token.is_cancelled()`:
     // `daemon_token` is the root of the *background-work* cancellation
     // hierarchy, and a caller is entitled to hand this loop an
@@ -1563,9 +1564,6 @@ where
                             &mut full_reindex_in_flight,
                             &drain_rt,
                             daemon_token,
-                            &mut code_watch,
-                            docs_control.as_ref(),
-                            &mut shutdown_requested,
                             scip_import_in_flight.is_some(),
                         ) {
                             match started {
@@ -1599,15 +1597,6 @@ where
                     root.display()
                 );
             }
-        }
-
-        // Checked here rather than at the top of the next tick so a
-        // `WatchControl { role: Daemon, action: Stop }` reply isn't followed
-        // by another `COORDINATOR_TICK` of scheduling work the caller just
-        // asked this process to stop doing.
-        if shutdown_requested {
-            eprintln!("[watch] daemon.stop request received -- shutting down");
-            break;
         }
 
         // Schedule: only when nothing's in flight, so at most one drain runs
@@ -3257,11 +3246,6 @@ fn route_or_serve_request<MR>(
     full_reindex_in_flight: &mut Option<PendingFullReindex>,
     drain_rt: &tokio::runtime::Runtime,
     daemon_token: &CancellationToken,
-    code_watch: &mut CodeWatch,
-    docs_control: Option<&Arc<dyn DocsHandle>>,
-    // Set to `true` when the request asks the whole daemon to stop; the
-    // coordinator's loop reads it to decide whether to break.
-    shutdown_requested: &mut bool,
     scip_import_in_flight: bool,
 ) -> Option<PendingWork>
 where
@@ -3457,22 +3441,6 @@ where
             daemon_token,
         )
         .map(PendingWork::ScipImport),
-        WriteRequest::WatchControl { role, action } => {
-            let outcome = apply_watch_control(role, action, code_watch, docs_control);
-            let daemon_stop = is_daemon_stop(role, action, &outcome);
-            reply_to_watch_control(&reply_path, outcome);
-            std::fs::remove_file(path).ok();
-            if daemon_stop {
-                // Two separate signals, deliberately: the token tears down
-                // whatever background work is still spawned beneath it, and
-                // the flag tells the coordinator's own loop to stop ticking.
-                // The loop must not infer the second from the first -- see
-                // `shutdown_requested`'s declaration.
-                *shutdown_requested = true;
-                daemon_token.cancel();
-            }
-            None
-        }
         _ => {
             serve_request_locked(root, path, registry, held, reopen_backoff, drain_in_flight);
             None
@@ -3521,7 +3489,7 @@ fn apply_watch_control(
         WatchRole::Daemon => match action {
             WatchAction::Stop | WatchAction::Restart => Ok(()),
             _ => {
-                Err("WatchControl { role: Daemon } only supports Stop/Restart".to_string())
+                Err("Control { role: Daemon } only supports Stop/Restart".to_string())
             }
         },
     }
@@ -3570,19 +3538,6 @@ fn read_policy(root: &Path) -> [bool; 2] {
     ]
 }
 
-fn reply_to_watch_control(reply_path: &Path, outcome: std::result::Result<(), String>) {
-    let result = match outcome {
-        Ok(()) => crate::daemon_protocol::WriteResult::Ok {
-            total_files: 0,
-            indexed_files: 0,
-        },
-        Err(message) => crate::daemon_protocol::WriteResult::Err { message },
-    };
-    if let Ok(json) = serde_json::to_string(&result) {
-        let _ = crate::daemon_protocol::write_atomic(reply_path, &json);
-    }
-}
-
 /// Returns true if the file has any resolved CALLS edges to/from symbols in other files.
 fn has_cross_file_calls(prism: &Infigraph, rel_path: &str) -> bool {
     let backend = match prism.backend() {
@@ -3621,8 +3576,7 @@ mod tests {
     use protobuf::Message as _;
 
     /// Everything `route_or_serve_request` needs, for tests that route
-    /// requests without a coordinator loop. The code-watch producer is never
-    /// started: a live one would race the test by queueing its own fsevents.
+    /// requests without a coordinator loop.
     struct Router {
         root: PathBuf,
         queue: Arc<Mutex<crate::daemon::queue::IndexWorkQueue>>,
@@ -3630,7 +3584,6 @@ mod tests {
         drain_rt: tokio::runtime::Runtime,
         daemon_token: CancellationToken,
         registry: Arc<crate::lang::LanguageRegistry>,
-        code_watch: CodeWatch,
         backoff: ReopenBackoff,
         full_reindex: Option<PendingFullReindex>,
     }
@@ -3640,18 +3593,6 @@ mod tests {
             let queue = Arc::new(Mutex::new(crate::daemon::queue::IndexWorkQueue::new()));
             let daemon_token = CancellationToken::new();
             let registry = Arc::new(crate::lang::LanguageRegistry::new());
-            let code_watch = CodeWatch::new(
-                &daemon_token,
-                producer::ProducerConfig {
-                    root: root.to_path_buf(),
-                    registry: Arc::clone(&registry),
-                    debounce_ms: 50,
-                    ignore_rebuild_secs: 300,
-                },
-                Arc::clone(&queue),
-                Arc::new(|_evt| {}),
-            )
-            .unwrap();
             Self {
                 root: root.to_path_buf(),
                 queue,
@@ -3659,7 +3600,6 @@ mod tests {
                 drain_rt: tokio::runtime::Runtime::new().unwrap(),
                 daemon_token,
                 registry,
-                code_watch,
                 backoff: ReopenBackoff::new(),
                 full_reindex: None,
             }
@@ -3680,9 +3620,6 @@ mod tests {
                 &mut self.full_reindex,
                 &self.drain_rt,
                 &self.daemon_token,
-                &mut self.code_watch,
-                None,
-                &mut false,
                 false,
             );
             match started {
