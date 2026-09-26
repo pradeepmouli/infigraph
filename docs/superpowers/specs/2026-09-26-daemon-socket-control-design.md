@@ -46,15 +46,17 @@ Success criteria:
 - Polling `Status` (doctor, `ps`, `watch-status`) never extends a daemon's life.
 - `watch-status`, `get_watch_status`, doctor and `ps` all read one
   `StatusReport`.
-- Exactly one control path exists. The file-drop `WatchControl` is deleted.
+- Exactly one control path exists. The file-drop `WatchControl` and the
+  docs-only `watch.stop.docs` sentinel are both deleted.
 
 ## Non-goals
 
 - **Data write requests** (`Index`, `FullReindex`, `ScipImport`, …) stay on
-  file-drop. They coalesce by design, and the latency fix they would want is
-  event-driven detection of `.infigraph/requests/` (Task 18 of the 08-21 plan).
-  It is filed as its own follow-up issue before implementation starts, and the
-  plan links it.
+  file-drop, and the coordinator's per-tick `read_dir` poll that picks them up
+  is kept as it is. Its worst case is one 200ms tick in front of work that runs
+  for seconds or minutes. Moving write requests onto the socket, which would
+  leave one transport and remove `requests/` entirely, is **#204**. It reuses
+  this design's channel, reply sender and in-flight count.
 - **Task 19 Gap A** (non-daemon watcher reaping) is unchanged. It remains a
   written task in the 08-21 plan.
 - **Mixed-build operation** is not supported beyond getting a daemon stopped: a
@@ -71,6 +73,7 @@ Success criteria:
 | D4 | `Status` is answered on the read-service thread from shared state, never through the coordinator | It has to answer when the coordinator can't, and a wedged coordinator is exactly when a status check matters. |
 | D5 | `ps` asks each live daemon for its `StatusReport`, in parallel, with a 500ms deadline | Shows wedged and overdue daemons, and the total time stays bounded however many daemons are running. |
 | D6 | A reply-less EOF is `Incompatible` (not "too old") | The daemon could not parse the frame. That happens whether its build is older or newer. |
+| D7 | Delete the `watch.stop.docs` sentinel. MCP `stop_watch_docs` sends `Control(Docs, Stop)`. | It is a second control path, and the only one: it parks the doc-watch loop in a "suppressed" state the daemon cannot see, so `Status` would report a paused loop as `Running`. The daemon-wide `watch.stop` remains the out-of-band stop. |
 
 ## Wire protocol (`daemon/read_protocol.rs`)
 
@@ -249,6 +252,24 @@ The `Status` handler builds the report from `DaemonState`, `Liveness`
   `cmd_daemon` implements it over its existing `Arc<Mutex<DocWatchThread>>`.
   `None` still means the daemon owns no doc-watch loop (`RoleState::NotOwned`).
 
+### Doc-watch stop without a sentinel (D7)
+
+Today the doc-watch loop (`infigraph-docs::watch::watch_docs_daemon_loop`)
+polls for two files: `docs.kuzu` (attach once it exists, detach if it goes)
+and `watch.stop.docs` (detach and stay suppressed until `docs.kuzu` cycles or
+a `resume` flag is set). The second is written only by MCP `stop_watch_docs`,
+and the suppression it causes is invisible outside the loop.
+
+After this change:
+- The loop takes only `shutdown`. `run_attached_cycle` no longer takes a stop
+  sentinel or returns a "sticky" flag. `suppressed_until_absent` and the
+  `resume` flag are deleted.
+- A docs Stop is `DocWatchThread::stop()`, which sets `shutdown` and joins the
+  thread. A docs Start respawns it. There is no paused-but-alive state left,
+  so `DocsHandle::is_running` is exact.
+- The `docs.kuzu` existence poll stays. It watches an index-lifecycle
+  condition, not a control signal.
+
 ### Shutdown ordering
 
 A Daemon Stop reply reaches the control thread before the coordinator starts
@@ -293,6 +314,7 @@ pub fn send_control(root: &Path, role: WatchRole, action: WatchAction)
 | `cmd_daemon_restart` | the same, then the existing `confirm_daemon_exited` | the sentinel, then the same confirmation; still refuses to spawn beside a survivor |
 | `cmd_watch_control`, MCP `watch_control` | `send_control(role, action)` | error: "daemon is an incompatible build / not responding — run `infigraph daemon-restart`" |
 | `cmd_watch_status`, MCP `get_watch_status(path)` | `query_status`, printed through one `impl Display for StatusReport` shared by both | "not responding (pid N holds watch.lock)" / "incompatible build" |
+| MCP `stop_watch_docs(path)` | `send_control(Docs, Stop)` instead of writing `watch.stop.docs` | error, as for `watch_control` |
 | doctor `check_one_watcher` | uses `query_status` instead of `project_has_live_mcp_instance` (deleted) | warn with the sentinel stop hint |
 | `infigraph ps` | queries each live daemon row in parallel, and adds `LEASES IDLE CODE DOCS` | `no reply` / `incompatible` |
 
@@ -373,6 +395,13 @@ the sentinel stay.
 - Accept and never reply → `Unresponsive` within the deadline.
 - `cmd_daemon_stop` against the incompatible fake writes the `watch.stop`
   sentinel.
+
+**Doc watching (D7):**
+- A real daemon: docs Stop over control gives `docs == Stopped` in `Status`,
+  and docs Start gives `Running` again, with a doc edit indexed afterwards.
+- The docs loop ignores a stray `watch.stop.docs` file (the sentinel is gone).
+- MCP `stop_watch_docs(path)` with no daemon still answers "No watcher running."
+  and writes no file.
 
 **Doctor and `ps`:**
 - `watcher_verdict` unit tests for all five verdicts, including in-flight work

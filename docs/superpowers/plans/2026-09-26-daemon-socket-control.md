@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- Exactly one control path when done: `WriteRequest::WatchControl`, `reply_to_watch_control` and `Infigraph::submit_watch_control_and_await` are deleted in Task 8 (spec D1).
+- Exactly one control path when done: `WriteRequest::WatchControl`, `reply_to_watch_control` and `Infigraph::submit_watch_control_and_await` are deleted in Task 9 (spec D1), and the `watch.stop.docs` sentinel in Task 7 (spec D7).
 - Every op declares `const KEEPS_ALIVE: bool` with no default. `ReadRequest` = `true`, `StatusFrame` = `false`, `ControlFrame` = `false` (spec D2).
 - `Status` never goes through the coordinator (spec D4). `Control` never runs on a read-pool worker.
 - Neither client function takes a lease or calls `ensure_daemon_*`.
@@ -20,10 +20,10 @@
 - Control channel capacity: `CONTROL_QUEUE = 8` (`sync_channel`, `try_send`).
 - An EOF before any reply is `ControlError::Incompatible` (spec D6), never "too old".
 - The `watch.stop` sentinel stays. `daemon stop`/`daemon-restart` fall back to it on `Incompatible` or `Unresponsive`.
-- Data write requests (`Index`, `FullReindex`, `ScipImport`, …) stay on file-drop.
+- Data write requests (`Index`, `FullReindex`, `ScipImport`, …) stay on file-drop, and the coordinator's `read_dir` poll is kept unchanged. Moving them is #204, not this plan.
 - Run tests as `env -u INFIGRAPH_WATCH_DAEMON INFIGRAPH_BACKEND=kuzu cargo test … -- --test-threads=1` (the `.zshrc` leak: an unset backend means daemon since #159).
 - Before any `-p infigraph-mcp` test that spawns the CLI: `cargo build -p infigraph-cli`.
-- Commit each task with `--no-verify` (concurrent perf gates flake under contention). Task 9 runs the full hook once on the finished branch.
+- Commit each task with `--no-verify` (concurrent perf gates flake under contention). Task 10 runs the full hook once on the finished branch.
 - Commit trailer, on every commit:
   ```
   Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
@@ -37,7 +37,7 @@
 2. **A #187 socket rebind while a control request is in flight.** Dropping the old `ReadService` runs on the coordinator's thread, so it must never wait for a control thread that is waiting on that coordinator. Pinned by Task 3's `dropping_the_service_does_not_wait_for_a_pending_control`.
 3. **A daemon that is listening but has no graph open yet** (it binds before the registry build). `Status` must still answer, because it reads no store. Pinned by Task 3's `status_answers_before_any_graph_is_open`.
 4. **A client whose deadline passes against a wedged daemon** must not leave a thread blocked on the socket forever. That matters for the long-lived MCP process polling `get_watch_status`. Pinned on unix by Task 4's `an_unresponsive_daemon_sees_the_client_hang_up`.
-5. **A pre-#155 client dropping a file-drop `WatchControl`** into a post-#155 daemon must get a prompt error reply, not a 30s timeout. Pinned by Task 8's `a_legacy_watch_control_request_file_gets_a_prompt_error`.
+5. **A pre-#155 client dropping a file-drop `WatchControl`** into a post-#155 daemon must get a prompt error reply, not a 30s timeout. Pinned by Task 9's `a_legacy_watch_control_request_file_gets_a_prompt_error`.
 
 ---
 
@@ -46,7 +46,7 @@
 | File | Responsibility |
 |---|---|
 | `crates/infigraph-core/src/daemon/read_protocol.rs` (modify) | Wire types: `WatchRole`/`WatchAction` (moved here), `StatusFrame`, `ControlFrame`, `ControlRequest`, `OpReply<T>`, `StatusReport`, `RoleState`, `DaemonOp`, frame I/O helpers |
-| `crates/infigraph-core/src/daemon_protocol.rs` (modify) | Re-exports `WatchRole`/`WatchAction`. Loses `WriteRequest::WatchControl` (Task 8) |
+| `crates/infigraph-core/src/daemon_protocol.rs` (modify) | Re-exports `WatchRole`/`WatchAction`. Loses `WriteRequest::WatchControl` (Task 9) |
 | `crates/infigraph-core/src/daemon/control_port.rs` (create) | Daemon side: `DaemonState`, `ControlPort` (bounded channel, in-flight count), `role_state` |
 | `crates/infigraph-core/src/daemon/read_service.rs` (modify) | Dispatches `Status` (pool) and `Control` (own thread) |
 | `crates/infigraph-core/src/daemon/control.rs` (create) | Client side: `ControlError`, `query_status`, `send_control`, `query_status_many`, `describe_status` |
@@ -56,31 +56,8 @@
 | `crates/infigraph-mcp/src/tools/watch.rs` (modify) | `watch_control`, `tool_get_watch_status` |
 | `crates/infigraph-core/src/doctor.rs` (modify) | `watcher_verdict` replaces `project_has_live_mcp_instance` |
 | `crates/infigraph-core/tests/daemon_control.rs` (create) | Real-coordinator socket-control integration tests |
-
----
-
-### Task 0: File the write-request follow-up issue
-
-The spec's non-goals promise this issue exists before implementation starts.
-
-- [ ] **Step 1: File it on the fork.** Filing is outward-facing: confirm the user has approved it before running this. If they haven't, stop and ask.
-
-```bash
-gh issue create --repo pradeepmouli/infigraph \
-  --title "Detect .infigraph/requests/ writes by event, not the coordinator's read_dir poll" \
-  --body "Follow-up to #155 (docs/superpowers/specs/2026-09-26-daemon-socket-control-design.md, Non-goals).
-
-#155 moved WatchControl onto the read socket, and the coordinator now wakes on a control channel via recv_timeout. Data write requests (Index, FullReindex, ScipImport, …) deliberately stay on file-drop, because they coalesce. They are still detected only by the coordinator's per-tick read_dir sweep, so each one still waits up to one COORDINATOR_TICK before it is picked up.
-
-This is Task 18 of docs/superpowers/plans/2026-08-21-daemon-watch-command-split.md: a notify watcher on .infigraph/requests/ that wakes the coordinator through the same channel #155 added (or a sibling one), with the read_dir sweep kept as a slow backstop."
-```
-
-- [ ] **Step 2: Record the number.** Add a line `**Follow-up issue:** #<n>` under the spec's Non-goals bullet about data write requests, and commit:
-
-```bash
-git add docs/superpowers/specs/2026-09-26-daemon-socket-control-design.md
-git commit --no-verify -m "docs(spec): link the write-request detection follow-up (#155)"
-```
+| `crates/infigraph-docs/src/watch.rs` (modify) | The doc-watch loop loses the `watch.stop.docs` sentinel, its suppression state and `resume` |
+| `crates/infigraph-mcp/src/tools/docs.rs` (modify) | `stop_watch_docs(path)` sends `Control(Docs, Stop)` |
 
 ---
 
@@ -1601,7 +1578,7 @@ fn is_daemon_stop(role: WatchRole, action: WatchAction, outcome: &std::result::R
 }
 ```
 
-The file-drop arm becomes (it is deleted in Task 8):
+The file-drop arm becomes (it is deleted in Task 9):
 
 ```rust
         WriteRequest::WatchControl { role, action } => {
@@ -1722,7 +1699,7 @@ Before the loop: `let mut policy = read_policy(root); publish_roles(&control_por
         }
 ```
 
-`shutdown_requested` is the loop's local `let mut shutdown_requested = false;` (~L865), so it is assigned directly here. The file-drop arm's `Enable`/`Disable` does not refresh `policy`; it does not need to, because Task 8 deletes that arm.
+`shutdown_requested` is the loop's local `let mut shutdown_requested = false;` (~L865), so it is assigned directly here. The file-drop arm's `Enable`/`Disable` does not refresh `policy`; it does not need to, because Task 9 deletes that arm.
 
 (e) Directly after the loop ends (before `code_watch.stop();`, ~L1728):
 
@@ -1740,7 +1717,7 @@ Before the loop: `let mut policy = read_policy(root); publish_roles(&control_por
 Run: the Step 2 command.
 Expected: 6 passed.
 
-- [ ] **Step 8: Run the existing coordinator suites** (the file-drop path still works until Task 8)
+- [ ] **Step 8: Run the existing coordinator suites** (the file-drop path still works until Task 9)
 
 Run: `env -u INFIGRAPH_WATCH_DAEMON INFIGRAPH_BACKEND=kuzu cargo test -p infigraph-core --test watch_daemon --test watch_control --test watch_control_helper --test read_service --test daemon_protocol_watcher_wiring -- --test-threads=1`
 Then: `cargo build -p infigraph-cli && env -u INFIGRAPH_WATCH_DAEMON INFIGRAPH_BACKEND=kuzu cargo test -p infigraph-cli --test watch_daemon_docs -- --test-threads=1`
@@ -1880,7 +1857,203 @@ git commit --no-verify -m "feat(cli,mcp): control goes over the socket, stop fal
 
 ---
 
-### Task 7: Status consumers: `watch-status`, `get_watch_status`, doctor, `ps`
+### Task 7: Doc-watch stop goes over control; delete `watch.stop.docs`
+
+Spec D7. The sentinel is a second control path that parks the doc-watch loop in a suppressed state `Status` cannot see.
+
+**Files:**
+- Modify: `crates/infigraph-docs/src/watch.rs`:
+  - `watch_docs_daemon_loop` and its doc comment, L162-236
+  - `run_attached_cycle`, L237-301
+  - tests: `returns_immediately_when_shutdown_already_set` L428, `does_not_attach_without_docs_kuzu` L439, `attaches_and_indexes_once_docs_kuzu_appears` L462, and L551-783
+- Modify: `crates/infigraph-cli/src/info_commands.rs` (`DocWatchThread` L811-862: drop `resume`)
+- Modify: `crates/infigraph-mcp/src/tools/docs.rs` (`tool_stop_watch_docs`'s `path` branch, L660-679)
+- Modify: `crates/infigraph-mcp/tests/watcher_daemon_mode.rs` (delete `stop_watch_docs_by_path_writes_sentinel_when_daemon_alive` L595-622; keep `…_reports_no_watcher_when_lock_free` L745-758)
+- Modify: `crates/infigraph-cli/tests/watch_daemon_docs.rs` (`watch_docs_start_resumes_after_a_sentinel_triggered_stop` L521-688)
+
+**Interfaces:**
+- Consumes: `control::{send_control, query_status, ControlError}`, `RoleState`, Task 5's `DocsHandle` impl (`DocWatchHandle`)
+- Produces: `pub fn watch_docs_daemon_loop(root: &Path, debounce_ms: u64, shutdown: Arc<AtomicBool>) -> Result<()>` (no `resume`), and `fn run_attached_cycle<F>(docs_kuzu: &Path, shutdown: &Arc<AtomicBool>, poll: Duration, watch_fn: F)` (no sentinel, returns `()`)
+
+- [ ] **Step 1: Write the failing tests.**
+
+In `crates/infigraph-docs/src/watch.rs`'s tests, delete these three tests: they pin behaviour this task removes.
+- `detaches_on_stop_sentinel_and_does_not_immediately_reattach`
+- `resume_signal_reattaches_a_suppressed_loop_without_docs_kuzu_cycling`
+- `a_resume_armed_while_attached_does_not_cancel_the_next_explicit_stop`
+
+Then add, reusing that module's `FastPoll` guard and the setup lines the deleted tests used:
+
+```rust
+    #[test]
+    fn a_stray_stop_docs_file_no_longer_detaches_the_loop() {
+        let _poll = FastPoll::acquire();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join(".infigraph")).unwrap();
+        crate::DocIndex::open(&root).unwrap().init().unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_clone = Arc::clone(&shutdown);
+        let root_clone = root.clone();
+        let handle = std::thread::spawn(move || {
+            watch_docs_daemon_loop(&root_clone, 50, shutdown_clone)
+        });
+        std::thread::sleep(Duration::from_millis(300));
+        // What a pre-#155 MCP server would have written.
+        std::fs::write(root.join(".infigraph").join("watch.stop.docs"), b"").unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            root.join(".infigraph").join("watch.stop.docs").exists(),
+            "the loop must not consume (or act on) the retired sentinel"
+        );
+        shutdown.store(true, Ordering::Relaxed);
+        handle.join().unwrap().unwrap();
+    }
+```
+
+Change `run_attached_cycle_reports_non_sticky_when_watch_fn_exits_unrequested` (L750) to `run_attached_cycle_returns_when_watch_fn_exits_unrequested`: drop the `stop_sentinel` argument and the `sticky` assertion, and keep its "returns rather than blocking forever" assertion. Update the other three calls at L433, L448 and L473 to drop their `resume` argument.
+
+In `crates/infigraph-cli/tests/watch_daemon_docs.rs`, rename `watch_docs_start_resumes_after_a_sentinel_triggered_stop` to `watch_docs_stop_and_start_over_control_are_visible_in_status`. Keep its daemon harness and its "a doc edit after restart gets indexed" assertion. Replace the sentinel write and whatever it used to trigger the resume (around L619-640) with:
+
+```rust
+    infigraph_core::daemon::control::send_control(
+        &root,
+        infigraph_core::daemon::read_protocol::WatchRole::Docs,
+        infigraph_core::daemon::read_protocol::WatchAction::Stop,
+    )
+    .unwrap();
+    assert_eq!(
+        infigraph_core::daemon::control::query_status(&root).unwrap().docs,
+        infigraph_core::daemon::read_protocol::RoleState::Stopped
+    );
+    infigraph_core::daemon::control::send_control(
+        &root,
+        infigraph_core::daemon::read_protocol::WatchRole::Docs,
+        infigraph_core::daemon::read_protocol::WatchAction::Start,
+    )
+    .unwrap();
+    assert_eq!(
+        infigraph_core::daemon::control::query_status(&root).unwrap().docs,
+        infigraph_core::daemon::read_protocol::RoleState::Running
+    );
+```
+
+Update the test's doc comment to say what it now pins.
+
+In `crates/infigraph-mcp/tests/watcher_daemon_mode.rs`:
+- delete `stop_watch_docs_by_path_writes_sentinel_when_daemon_alive`;
+- in `stop_watch_docs_by_path_reports_no_watcher_when_lock_free`, keep its assertions (`"No watcher running."`, and no `watch.stop.docs` file).
+
+- [ ] **Step 2: Run them and check they fail**
+
+Run: `env -u INFIGRAPH_WATCH_DAEMON INFIGRAPH_BACKEND=kuzu cargo test -p infigraph-docs --lib watch -- --test-threads=1`
+Expected: compile errors (`watch_docs_daemon_loop` still takes `resume`).
+
+- [ ] **Step 3: Simplify the loop.** In `crates/infigraph-docs/src/watch.rs`:
+
+```rust
+/// Drive doc-watching for `root` as part of the merged code+doc daemon (see
+/// `infigraph_core::daemon::lifecycle`). Attaches a `watch_docs` session once
+/// `.infigraph/docs.kuzu` exists, detaches if that file disappears (e.g.
+/// after `clean_docs`) and re-attaches when it comes back. Exits once
+/// `shutdown` is set. Blocks until then.
+///
+/// Stopping and starting doc-watching is the daemon's `Control(Docs, …)`
+/// (#155): stop sets `shutdown` and joins this thread, start spawns a new
+/// one. There is deliberately no stop file: a loop paused by a file is a
+/// state the daemon cannot report.
+pub fn watch_docs_daemon_loop(
+    root: &Path,
+    debounce_ms: u64,
+    shutdown: Arc<AtomicBool>,
+) -> Result<()> {
+    let docs_kuzu = root.join(".infigraph").join("docs.kuzu");
+    let poll = attach_poll_interval(root);
+    loop {
+        if shutdown.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        if !docs_kuzu.exists() {
+            std::thread::sleep(poll);
+            continue;
+        }
+        let root_owned = root.to_path_buf();
+        eprintln!(
+            "[doc-watch-daemon] attaching doc watcher for {}",
+            root.display()
+        );
+        run_attached_cycle(&docs_kuzu, &shutdown, poll, move |stop_rx| {
+            watch_docs(&root_owned, debounce_ms, stop_rx, "doc-watch-daemon")
+        });
+    }
+}
+```
+
+In `run_attached_cycle`, remove the `stop_sentinel` parameter, the `if stop_sentinel.exists() { … }` block and the `bool` return (every `return false;` becomes `return;`). Rewrite its doc comment's last paragraph: it returns when `watch_fn` exits on its own, on `shutdown`, or when `docs_kuzu` disappears.
+
+- [ ] **Step 4: `DocWatchThread` loses `resume`.** In `info_commands.rs`, delete the `resume` field and its initialisations. `start()` becomes:
+
+```rust
+    fn start(&mut self) {
+        // Running already: nothing to do -- there is no paused-but-alive
+        // state any more (#155 removed the stop file that created one).
+        if self.is_running() {
+            return;
+        }
+        // A self-terminated loop (panic) is respawned, mirroring
+        // `CodeWatch::start()`'s `is_finished()` guard (c9dae4b).
+        self.handle.take();
+        self.shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let root = self.root.clone();
+        let debounce = self.debounce;
+        let shutdown = std::sync::Arc::clone(&self.shutdown);
+        self.handle = Some(std::thread::spawn(move || {
+            if let Err(e) = infigraph_docs::watch::watch_docs_daemon_loop(&root, debounce, shutdown) {
+                eprintln!("[doc-watch-daemon] error: {e}");
+            }
+        }));
+    }
+```
+
+Update the struct's doc comment: it bundles the thread and its shutdown flag, and each start gets a fresh flag.
+
+- [ ] **Step 5: MCP `stop_watch_docs(path)` goes over control.** Replace the `path` branch body after `let root_str = …;` (the lock probe and sentinel write, L662-679) with:
+
+```rust
+        use infigraph_core::daemon::control::{send_control, ControlError};
+        return match send_control(&root, WatchRole::Docs, WatchAction::Stop) {
+            Ok(()) => Ok(format!(
+                "Doc watcher on {root_str} stopped (the code watcher, if any, is unaffected)."
+            )),
+            Err(ControlError::NoDaemon) => Ok("No watcher running.".to_string()),
+            Err(e) => Err(e.into()),
+        };
+```
+
+(`WatchRole`/`WatchAction` are already imported in this file for `enable_watch_docs`.)
+
+- [ ] **Step 6: Check nothing else references the sentinel**
+
+Run `mcp__infigraph__search` with `regex=true` for `watch\.stop\.docs|suppressed_until_absent`.
+Expected: matches only in `docs/`, plus the new test's string literal.
+
+- [ ] **Step 7: Run the tests and check they pass**
+
+Run: `env -u INFIGRAPH_WATCH_DAEMON INFIGRAPH_BACKEND=kuzu cargo test -p infigraph-docs -- --test-threads=1`
+Then: `cargo build -p infigraph-cli && env -u INFIGRAPH_WATCH_DAEMON INFIGRAPH_BACKEND=kuzu cargo test -p infigraph-cli --test watch_daemon_docs -- --test-threads=1`
+Then: `env -u INFIGRAPH_WATCH_DAEMON INFIGRAPH_BACKEND=kuzu cargo test -p infigraph-mcp --test watcher_daemon_mode -- --test-threads=1`
+Expected: all pass.
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add crates/infigraph-docs/src/watch.rs crates/infigraph-cli/src/info_commands.rs crates/infigraph-cli/tests/watch_daemon_docs.rs crates/infigraph-mcp/src/tools/docs.rs crates/infigraph-mcp/tests/watcher_daemon_mode.rs
+git commit --no-verify -m "refactor: doc-watch stop goes over control; delete the watch.stop.docs sentinel (#155)"
+```
+
+---
+
+### Task 8: Status consumers: `watch-status`, `get_watch_status`, doctor, `ps`
 
 **Files:**
 - Modify: `crates/infigraph-cli/src/info_commands.rs` (`cmd_watch_status` L884-893, `cmd_ps` L1545-1588)
@@ -2084,7 +2257,7 @@ git commit --no-verify -m "feat: watch-status, get_watch_status, doctor and ps r
 
 ---
 
-### Task 8: Delete the file-drop control path
+### Task 9: Delete the file-drop control path
 
 **Files:**
 - Modify: `crates/infigraph-core/src/daemon_protocol.rs` (the `WatchControl` variant at L135-137, its `serve_one_request` arm ~L1177, and the tests `watch_control_request_round_trips_through_json` / `watch_control_covers_all_role_action_combinations_without_panicking_on_serialize` L703-728)
@@ -2169,7 +2342,7 @@ git commit --no-verify -m "refactor(core): delete the file-drop WatchControl pat
 
 ---
 
-### Task 9: Whole-workspace gate and docs
+### Task 10: Whole-workspace gate and docs
 
 **Files:**
 - Modify: `CLAUDE.md` (the "Cross-cutting invariants" bullet on daemon leases: add one sentence)
