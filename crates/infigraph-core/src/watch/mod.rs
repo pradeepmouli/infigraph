@@ -134,6 +134,12 @@ impl CodeWatch {
             self.rt.block_on(task.stop());
         }
     }
+
+    /// Whether a producer is live. The same check `start()` makes, so a
+    /// producer that ended by itself reads as not running.
+    pub(crate) fn is_running(&self) -> bool {
+        self.task.as_ref().is_some_and(|t| !t.is_finished())
+    }
 }
 /// Watch a project directory and auto-reindex on file changes.
 ///

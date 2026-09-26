@@ -600,27 +600,11 @@ pub(crate) fn cmd_daemon(root: &Path, debounce: u64) -> Result<()> {
         doc_watch.lock().unwrap().start();
     }
 
-    // Lets `WatchControl { role: Docs, .. }` requests reach this thread from
-    // the coordinator, which lives in infigraph-core and knows nothing about
-    // doc-watching. Doc-watching deliberately stays on its existing
-    // thread + `Arc<AtomicBool>` shape here: only its external control
-    // surface is unified in this pass, not its internals (those live in
-    // infigraph-docs).
-    let doc_watch_for_control = std::sync::Arc::clone(&doc_watch);
-    let docs_control: std::sync::Arc<infigraph_core::daemon::DocsControl> =
-        std::sync::Arc::new(move |action| {
-            use infigraph_core::daemon_protocol::WatchAction;
-            let mut doc_watch = doc_watch_for_control.lock().unwrap();
-            match action {
-                WatchAction::Stop | WatchAction::Disable => doc_watch.stop(),
-                WatchAction::Start | WatchAction::Enable => doc_watch.start(),
-                WatchAction::Restart => {
-                    doc_watch.stop();
-                    doc_watch.start();
-                }
-            }
-            Ok(())
-        });
+    // Lets `Control { role: Docs, .. }` reach this thread from the
+    // coordinator, which lives in infigraph-core and knows nothing about
+    // doc-watching (#155).
+    let docs_control: std::sync::Arc<dyn infigraph_core::daemon::DocsHandle> =
+        std::sync::Arc::new(DocWatchHandle(std::sync::Arc::clone(&doc_watch)));
 
     let on_full_reindex: std::sync::Arc<infigraph_core::daemon::FullReindexCallback> =
         std::sync::Arc::new(
@@ -816,7 +800,37 @@ struct DocWatchThread {
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
+/// `cmd_daemon`'s doc-watch thread as the coordinator's `DocsHandle`.
+struct DocWatchHandle(std::sync::Arc<std::sync::Mutex<DocWatchThread>>);
+
+impl infigraph_core::daemon::DocsHandle for DocWatchHandle {
+    fn control(
+        &self,
+        action: infigraph_core::daemon_protocol::WatchAction,
+    ) -> std::result::Result<(), String> {
+        use infigraph_core::daemon_protocol::WatchAction;
+        let mut doc_watch = self.0.lock().unwrap();
+        match action {
+            WatchAction::Stop | WatchAction::Disable => doc_watch.stop(),
+            WatchAction::Start | WatchAction::Enable => doc_watch.start(),
+            WatchAction::Restart => {
+                doc_watch.stop();
+                doc_watch.start();
+            }
+        }
+        Ok(())
+    }
+
+    fn is_running(&self) -> bool {
+        self.0.lock().unwrap().is_running()
+    }
+}
+
 impl DocWatchThread {
+    fn is_running(&self) -> bool {
+        self.handle.as_ref().is_some_and(|h| !h.is_finished())
+    }
+
     fn new(root: std::path::PathBuf, debounce: u64) -> Self {
         DocWatchThread {
             root,

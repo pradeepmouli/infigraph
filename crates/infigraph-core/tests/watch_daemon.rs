@@ -1464,12 +1464,23 @@ fn watch_control_docs_role_dispatches_to_the_registered_docs_control() {
     let received: std::sync::Arc<
         std::sync::Mutex<Vec<infigraph_core::daemon_protocol::WatchAction>>,
     > = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    let received_for_control = std::sync::Arc::clone(&received);
-    let docs_control: std::sync::Arc<infigraph_core::daemon::DocsControl> =
-        std::sync::Arc::new(move |action| {
-            received_for_control.lock().unwrap().push(action);
+    struct Recorder(
+        std::sync::Arc<std::sync::Mutex<Vec<infigraph_core::daemon_protocol::WatchAction>>>,
+    );
+    impl infigraph_core::daemon::DocsHandle for Recorder {
+        fn control(
+            &self,
+            action: infigraph_core::daemon_protocol::WatchAction,
+        ) -> Result<(), String> {
+            self.0.lock().unwrap().push(action);
             Ok(())
-        });
+        }
+        fn is_running(&self) -> bool {
+            false
+        }
+    }
+    let docs_control: std::sync::Arc<dyn infigraph_core::daemon::DocsHandle> =
+        std::sync::Arc::new(Recorder(std::sync::Arc::clone(&received)));
 
     let daemon_token = tokio_util::sync::CancellationToken::new();
     let token_for_thread = daemon_token.clone();

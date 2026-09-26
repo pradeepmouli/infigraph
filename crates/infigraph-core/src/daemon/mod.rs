@@ -280,14 +280,15 @@ fn current_on_disk_build_hash() -> Option<String> {
 /// open a second `Database` on the same file (#166).
 pub type FullReindexCallback = dyn Fn(PathBuf, ScipEnrichJob, CancellationToken) + Send + Sync;
 
-/// Caller-supplied hook that acts on a `WatchControl { role: Docs, .. }`
-/// request. Doc-watching lives in `infigraph-docs`, a crate this one does
-/// not depend on, and its loop is still driven by its own
-/// `Arc<AtomicBool>`/thread shape rather than a `Task<()>` -- so the
-/// coordinator dispatches the request and the owner of that thread (today:
-/// `cmd_daemon`) decides what start/stop actually mean for it. `Err(msg)`
-/// becomes the request's `WriteResult::Err`.
-pub type DocsControl = dyn Fn(WatchAction) -> std::result::Result<(), String> + Send + Sync;
+/// Caller-supplied handle on doc-watching, which lives in `infigraph-docs`,
+/// a crate this one does not depend on. The coordinator dispatches
+/// `Control { role: Docs, .. }` to it and asks it whether the loop is live
+/// for `Status`; the owner of that loop (today: `cmd_daemon`) decides what
+/// start/stop mean for it. `Err(msg)` is the reply the client gets.
+pub trait DocsHandle: Send + Sync {
+    fn control(&self, action: WatchAction) -> std::result::Result<(), String>;
+    fn is_running(&self) -> bool;
+}
 
 /// A path's identity: `(device, inode)` plus its birth time where the
 /// platform and filesystem report one. `None` if nothing is there or the
@@ -595,7 +596,7 @@ pub fn run_write_coordinator<MR, F>(
     serve_requests: bool,
     on_full_reindex: Option<Arc<FullReindexCallback>>,
     daemon_token: &CancellationToken,
-    docs_control: Option<Arc<DocsControl>>,
+    docs_control: Option<Arc<dyn DocsHandle>>,
     // Serves `Store::Docs` reads. `None` leaves the daemon graph-only, and a
     // document read then gets an explicit refusal rather than silently
     // opening `docs.kuzu` in the client. Supplied by the caller because
@@ -656,6 +657,11 @@ where
     // #38: who still needs this daemon. Owned here, not by the service, so a
     // #187 rebind keeps counting into the same place.
     let liveness = Arc::new(liveness::Liveness::new());
+    let idle = daemon_idle_settings(root);
+    // #155: what `Status` reads, and the channel `Control` reaches this loop
+    // through. Owned here, like `liveness`, so a #187 rebind keeps it.
+    let (control_port, control_rx) =
+        control_port::ControlPort::new(idle.grace_secs, idle.check_secs.max(1));
     let mut bind_read_service: Box<dyn FnMut() -> Option<read_service::ReadService>> =
         if !serve_requests {
             Box::new(|| None)
@@ -683,6 +689,7 @@ where
 
             let root = root.to_path_buf();
             let liveness = liveness.clone();
+            let control_port = control_port.clone();
             Box::new(move || {
                 match read_service::ReadService::start_serving(
                     &root,
@@ -690,7 +697,7 @@ where
                     docs_reads.clone(),
                     READ_SERVICE_WORKERS,
                     liveness.clone(),
-                    None,
+                    Some(control_port.clone()),
                 ) {
                     Ok(svc) => Some(svc),
                     Err(e) => {
@@ -888,12 +895,20 @@ where
     let mut self_watch = crate::watchdog::SelfWatch::new("watch");
     let mut restart_for: Option<String> = None;
 
-    let idle = daemon_idle_settings(root);
     let idle_grace = Duration::from_secs(idle.grace_secs);
     let idle_check = Duration::from_secs(idle.check_secs.max(1));
     let mut last_idle_check = std::time::Instant::now();
 
+    let mut policy = read_policy(root);
+    publish_roles(&control_port.state, &code_watch, docs_control.as_ref(), policy);
+
     loop {
+        // Test-only: park the loop so tests can observe a busy coordinator.
+        if let Ok(stall) = std::env::var("INFIGRAPH_TEST_COORDINATOR_STALL_FILE") {
+            while Path::new(&stall).exists() {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
         if stop_rx.try_recv().is_ok() {
             eprintln!("[watch] stop channel signaled -- shutting down");
             break;
@@ -1723,7 +1738,59 @@ where
             folded_since_sample = false;
         }
 
-        std::thread::sleep(COORDINATOR_TICK);
+        control_port.state.set_work_in_flight(
+            drain_in_flight.is_some()
+                || full_reindex_in_flight.is_some()
+                || scip_in_flight.is_some()
+                || scip_import_in_flight.is_some(),
+        );
+        publish_roles(&control_port.state, &code_watch, docs_control.as_ref(), policy);
+
+        // #155: wait on the control channel instead of sleeping, so a control
+        // request wakes the loop at once. Everything queued is served now.
+        let mut next = control_rx.recv_timeout(COORDINATOR_TICK).ok();
+        while let Some(msg) = next.take() {
+            let control_port::ControlMsg { request, reply } = msg;
+            let outcome = apply_watch_control(
+                request.role,
+                request.action,
+                &mut code_watch,
+                docs_control.as_ref(),
+            );
+            let daemon_stop = is_daemon_stop(request.role, request.action, &outcome);
+            if matches!(request.action, WatchAction::Enable | WatchAction::Disable) {
+                policy = read_policy(root);
+            }
+            publish_roles(&control_port.state, &code_watch, docs_control.as_ref(), policy);
+            // Replied before any teardown starts, so the client learns the
+            // stop was accepted.
+            let _ = reply.send(outcome);
+            if daemon_stop {
+                // Two separate signals, deliberately: the token tears down
+                // background work, the flag ends this loop. See
+                // `shutdown_requested`'s declaration.
+                shutdown_requested = true;
+                daemon_token.cancel();
+                break;
+            }
+            next = control_rx.try_recv().ok();
+        }
+        // The loop's own `if shutdown_requested` check sits mid-body, after
+        // work that could start a drain; leave now instead.
+        if shutdown_requested {
+            eprintln!("[watch] daemon stop requested over control -- shutting down");
+            break;
+        }
+    }
+
+    // Refuse new control requests, and let the ones in flight finish writing
+    // their replies (a Daemon Stop's above all) before teardown and exit.
+    drop(control_rx);
+    if !control_port.wait_idle(Duration::from_secs(2)) {
+        eprintln!(
+            "[control] {} control reply(s) still in flight at shutdown",
+            control_port.in_flight()
+        );
     }
 
     // Stop the producer before waiting out the in-flight work below: it
@@ -3191,7 +3258,7 @@ fn route_or_serve_request<MR>(
     drain_rt: &tokio::runtime::Runtime,
     daemon_token: &CancellationToken,
     code_watch: &mut CodeWatch,
-    docs_control: Option<&Arc<DocsControl>>,
+    docs_control: Option<&Arc<dyn DocsHandle>>,
     // Set to `true` when the request asks the whole daemon to stop; the
     // coordinator's loop reads it to decide whether to break.
     shutdown_requested: &mut bool,
@@ -3391,48 +3458,8 @@ where
         )
         .map(PendingWork::ScipImport),
         WriteRequest::WatchControl { role, action } => {
-            let outcome = match role {
-                // `Enable`/`Disable` differ from `Start`/`Stop` only in
-                // whether the *caller* also wrote the persisted flag in
-                // config.toml (Phase 4). Their effect on the live task is
-                // identical, so this arm treats them the same.
-                WatchRole::Code => {
-                    match action {
-                        WatchAction::Stop | WatchAction::Disable => code_watch.stop(),
-                        WatchAction::Start | WatchAction::Enable => code_watch.start(),
-                        WatchAction::Restart => {
-                            code_watch.stop();
-                            code_watch.start();
-                        }
-                    }
-                    Ok(())
-                }
-                WatchRole::Docs => match docs_control {
-                    Some(control) => control(action),
-                    None => {
-                        Err("this watcher does not own a doc-watch loop to control".to_string())
-                    }
-                },
-                // Only the process's own exit is expressible here: `Start`
-                // is meaningless (you are talking to a daemon, so one
-                // exists), and a real `Restart` is the *client's* job --
-                // this process can only stop itself. Both stop; the reply
-                // is written before cancelling so the caller still gets it.
-                WatchRole::Daemon => match action {
-                    WatchAction::Stop | WatchAction::Restart => Ok(()),
-                    _ => {
-                        Err("WatchControl { role: Daemon } only supports Stop/Restart".to_string())
-                    }
-                },
-            };
-            let daemon_stop = matches!(
-                (role, action, &outcome),
-                (
-                    WatchRole::Daemon,
-                    WatchAction::Stop | WatchAction::Restart,
-                    Ok(())
-                )
-            );
+            let outcome = apply_watch_control(role, action, code_watch, docs_control);
+            let daemon_stop = is_daemon_stop(role, action, &outcome);
             reply_to_watch_control(&reply_path, outcome);
             std::fs::remove_file(path).ok();
             if daemon_stop {
@@ -3456,6 +3483,93 @@ where
 /// Answers a `WatchControl` request. Same `write_atomic`/`WriteResult`
 /// shape every other reply in this module uses; the counts are zero because
 /// watch-control moves no files through the graph.
+/// What a `Control` request does to this daemon's watch roles. `Daemon`'s
+/// Stop/Restart only answer `Ok` here; the caller ends the loop.
+fn apply_watch_control(
+    role: WatchRole,
+    action: WatchAction,
+    code_watch: &mut CodeWatch,
+    docs: Option<&Arc<dyn DocsHandle>>,
+) -> std::result::Result<(), String> {
+    match role {
+        // `Enable`/`Disable` differ from `Start`/`Stop` only in
+        // whether the *caller* also wrote the persisted flag in
+        // config.toml (Phase 4). Their effect on the live task is
+        // identical, so this arm treats them the same.
+        WatchRole::Code => {
+            match action {
+                WatchAction::Stop | WatchAction::Disable => code_watch.stop(),
+                WatchAction::Start | WatchAction::Enable => code_watch.start(),
+                WatchAction::Restart => {
+                    code_watch.stop();
+                    code_watch.start();
+                }
+            }
+            Ok(())
+        }
+        WatchRole::Docs => match docs {
+            Some(handle) => handle.control(action),
+            None => {
+                Err("this watcher does not own a doc-watch loop to control".to_string())
+            }
+        },
+        // Only the process's own exit is expressible here: `Start`
+        // is meaningless (you are talking to a daemon, so one
+        // exists), and a real `Restart` is the *client's* job --
+        // this process can only stop itself. Both stop; the reply
+        // is written before cancelling so the caller still gets it.
+        WatchRole::Daemon => match action {
+            WatchAction::Stop | WatchAction::Restart => Ok(()),
+            _ => {
+                Err("WatchControl { role: Daemon } only supports Stop/Restart".to_string())
+            }
+        },
+    }
+}
+
+fn is_daemon_stop(
+    role: WatchRole,
+    action: WatchAction,
+    outcome: &std::result::Result<(), String>,
+) -> bool {
+    matches!(
+        (role, action, outcome),
+        (
+            WatchRole::Daemon,
+            WatchAction::Stop | WatchAction::Restart,
+            Ok(())
+        )
+    )
+}
+
+/// Publish the watch roles' state for `Status`. Cheap: two atomics; the
+/// policy is read by the caller only when it can have changed.
+fn publish_roles(
+    state: &control_port::DaemonState,
+    code_watch: &CodeWatch,
+    docs: Option<&Arc<dyn DocsHandle>>,
+    policy: [bool; 2],
+) {
+    state.set_role(
+        WatchRole::Code,
+        control_port::role_state(code_watch.is_running(), policy[0]),
+    );
+    state.set_role(
+        WatchRole::Docs,
+        match docs {
+            Some(d) => control_port::role_state(d.is_running(), policy[1]),
+            None => crate::daemon::read_protocol::RoleState::NotOwned,
+        },
+    );
+}
+
+fn read_policy(root: &Path) -> [bool; 2] {
+    [
+        config::watch_enabled_at(root, "watch"),
+        config::watch_enabled_at(root, "watch_docs"),
+    ]
+}
+
 fn reply_to_watch_control(reply_path: &Path, outcome: std::result::Result<(), String>) {
     let result = match outcome {
         Ok(()) => crate::daemon_protocol::WriteResult::Ok {
