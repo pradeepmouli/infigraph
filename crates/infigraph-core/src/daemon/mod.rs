@@ -1,5 +1,6 @@
 pub(crate) mod backoff;
 pub(crate) mod drain;
+pub mod control_port;
 pub mod fault;
 pub mod lease;
 pub mod lifecycle;
