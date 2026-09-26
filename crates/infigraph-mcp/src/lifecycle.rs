@@ -151,10 +151,24 @@ pub fn spawn_parent_monitor() {
 /// supervisor starts a fresh worker instead of exiting. EX_TEMPFAIL.
 pub const WATCHDOG_RESTART_EXIT: i32 = 75;
 
+/// Exit code a worker uses after handing `mcp.lock` to a newer build
+/// (R2.3.2): the supervisor starts a fresh worker -- from the binary now on
+/// disk -- instead of following it out, so the session keeps its server.
+pub const HANDOVER_EXIT: i32 = 76;
+
 /// Read-held while the worker runs a tool call (calls over HTTP can run
 /// concurrently). The watchdog takes it for writing before restarting the
 /// worker, so a restart happens between calls, never inside one.
 pub static SERVING: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+/// Exit with `code` for the supervisor to start a fresh worker: once the
+/// call in progress, if any, has finished, and with this worker's instance
+/// registration removed.
+pub fn exit_between_calls(code: i32) -> ! {
+    let _between_calls = SERVING.write().unwrap_or_else(|e| e.into_inner());
+    let _ = std::fs::remove_file(infigraph_core::instances::instance_path(std::process::id()));
+    std::process::exit(code);
+}
 
 /// R5.2 (#19): watch this worker's own memory, descriptors and threads.
 /// Over a soft ceiling, drop the search caches (rebuilt on the next
@@ -172,12 +186,8 @@ pub fn spawn_self_watch() {
                     infigraph_core::embed::invalidate_hnsw_cache();
                 }
                 infigraph_core::watchdog::Action::Restart(why) => {
-                    let _between_calls = SERVING.write().unwrap_or_else(|e| e.into_inner());
                     crate::mcp_log("WATCHDOG", &format!("{why} -- restarting the worker"));
-                    let _ = std::fs::remove_file(infigraph_core::instances::instance_path(
-                        std::process::id(),
-                    ));
-                    std::process::exit(WATCHDOG_RESTART_EXIT);
+                    exit_between_calls(WATCHDOG_RESTART_EXIT);
                 }
                 infigraph_core::watchdog::Action::None => {}
             }
