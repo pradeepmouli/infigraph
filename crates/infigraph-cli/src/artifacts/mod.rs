@@ -1494,6 +1494,14 @@ resolver = ["./resolve-zed-path.sh"]
                 Some("get_symbols_in_file"),
             ),
             ("piped filter", bash("cargo test 2>&1 | grep FAILED"), None),
+            ("piped rg", bash("git diff | rg foo"), None),
+            ("|& piped grep", bash("cargo build |& grep error"), None),
+            ("|& piped rg", bash("cargo build |&rg warning"), None),
+            (
+                "grep reading a file, then piped",
+                bash("grep -n foo src/lib.rs | head"),
+                Some("regex=true"),
+            ),
             (
                 "word in a quoted title",
                 bash(r#"gh issue create --title "grep and rg are blocked" --body-file b.md"#),

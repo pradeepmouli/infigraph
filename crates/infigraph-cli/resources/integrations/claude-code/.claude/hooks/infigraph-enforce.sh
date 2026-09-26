@@ -120,11 +120,12 @@ case "$tool" in
   Bash)
     cmd=$(echo "$input" | jq -r '.tool_input.command // empty')
     # Only flag grep/rg-family tools when NOT immediately preceded by a pipe --
-    # `cmd 2>&1 | grep -iE "error"` filters another command's output (allowed,
-    # matches this repo's own CLAUDE.md guidance); a bare/leading grep call is
-    # a code search and should go through mcp__infigraph__search instead.
+    # `cmd 2>&1 | grep -iE "error"` or `cmd |& rg warn` filters another
+    # command's output (allowed, matches this repo's own CLAUDE.md guidance);
+    # a bare/leading grep call is a code search and should go through
+    # mcp__infigraph__search instead. `|&` is bash/zsh shorthand for `2>&1 |`.
     scannable=$(printf '%s\n' "$cmd" | strip_unexecuted_text)
-    cmd_without_piped_grep=$(printf '%s\n' "$scannable" | sed -E 's/\|[[:space:]]*(grep|egrep|fgrep|rg|ripgrep|ag|ack)([[:space:]]|$)[^|]*/|/g')
+    cmd_without_piped_grep=$(printf '%s\n' "$scannable" | sed -E 's/\|&?[[:space:]]*(grep|egrep|fgrep|rg|ripgrep|ag|ack)([[:space:]]|$)[^|]*/|/g')
     if echo "$cmd_without_piped_grep" | grep -qE '(^|\s|/)(grep|egrep|fgrep|rg|ripgrep|ag|ack)(\s|$)'; then
       deny "BLOCKED: grep/rg on indexed code. $search_hint $routing"
     fi
