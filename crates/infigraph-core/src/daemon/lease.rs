@@ -33,6 +33,17 @@ pub fn is_held(root: &Path) -> bool {
 /// Lease `root`'s daemon for the rest of this process's life. Returns at
 /// once; the attach happens on a background thread.
 pub fn hold(root: &Path) {
+    hold_inner(root, false);
+}
+
+/// As [`hold`], for a daemon this process has just spawned: the child takes
+/// `watch.lock` only once it is up, so the attach first waits for it (up to
+/// the startup grace) instead of concluding there is no daemon.
+pub(crate) fn hold_spawned(root: &Path) {
+    hold_inner(root, true);
+}
+
+fn hold_inner(root: &Path, just_spawned: bool) {
     let root = key(root);
     if SELF_DAEMON
         .lock()
@@ -50,6 +61,16 @@ pub fn hold(root: &Path) {
         .spawn({
             let root = root.clone();
             move || {
+                let lock = root.join(".infigraph").join("watch.lock");
+                if just_spawned
+                    && !super::lifecycle::wait_for_daemon_ready(
+                        &lock,
+                        super::read_endpoint::DAEMON_STARTUP_GRACE,
+                    )
+                {
+                    with_held(|h| h.remove(&root));
+                    return;
+                }
                 hold_until_no_daemon(&root);
                 with_held(|h| h.remove(&root));
             }
@@ -81,5 +102,51 @@ fn hold_until_no_daemon(root: &Path) {
         ) {
             return;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    /// A just-spawned daemon has no `watch.lock` yet; `hold_spawned` must
+    /// wait for it rather than give up, or MCP boot's fresh spawn is never
+    /// leased.
+    #[cfg(unix)]
+    #[test]
+    fn hold_spawned_waits_for_the_daemon_to_come_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let graph = root.join(".infigraph").join("graph");
+        std::fs::create_dir_all(graph.parent().unwrap()).unwrap();
+        drop(crate::graph::GraphStore::open(&graph).unwrap());
+        let store = Arc::new(crate::graph::GraphStore::open(&graph).unwrap());
+
+        hold_spawned(&root);
+        std::thread::sleep(std::time::Duration::from_millis(500));
+
+        // The "daemon" comes up only now.
+        let _lock = crate::lockfile::try_acquire(&root.join(".infigraph").join("watch.lock"), "t")
+            .unwrap()
+            .unwrap();
+        let liveness = Arc::new(super::super::liveness::Liveness::new());
+        let _svc = super::super::read_service::ReadService::start_serving(
+            &root,
+            Arc::new(move || Some(store.clone())),
+            None,
+            2,
+            liveness.clone(),
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while liveness.leases() == 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(
+            liveness.leases(),
+            1,
+            "the spawned daemon must be leased once it is up"
+        );
     }
 }
