@@ -299,6 +299,36 @@ impl Read for ReadStream {
     }
 }
 
+/// Ends a parked lease from another thread: `shutdown(2)` wakes the lease
+/// thread's blocking read with EOF and delivers EOF to the client. It never
+/// closes the fd -- the lease thread still owns it -- so callers must stop
+/// using a handle before its stream is dropped (see `LeaseBook`).
+#[cfg(unix)]
+pub(crate) struct LeaseShutdown(std::os::fd::RawFd);
+
+#[cfg(unix)]
+impl LeaseShutdown {
+    pub(crate) fn shutdown(&self) {
+        // SAFETY: the fd is open -- `LeaseBook` removes this handle, under
+        // its lock, before the owning stream is dropped.
+        unsafe {
+            libc::shutdown(self.0, libc::SHUT_RDWR);
+        }
+    }
+}
+
+impl ReadStream {
+    /// `None` where there is no socket fd (Windows named pipes): a daemon's
+    /// exit still closes those, and in-process shutdown there simply leaves
+    /// the lease until its client goes away.
+    #[cfg(unix)]
+    pub(crate) fn lease_shutdown(&self) -> Option<LeaseShutdown> {
+        use std::os::fd::{AsFd as _, AsRawFd as _};
+        let interprocess::local_socket::Stream::UdSocket(s) = &self.inner;
+        Some(LeaseShutdown(s.as_fd().as_raw_fd()))
+    }
+}
+
 impl Write for ReadStream {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.inner.write(buf)

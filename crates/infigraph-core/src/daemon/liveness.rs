@@ -49,6 +49,13 @@ impl Liveness {
         self.last_activity.store(now_secs(), Ordering::SeqCst);
     }
 
+    /// Backdate the last activity -- for tests that need an idle daemon
+    /// without waiting one out.
+    #[doc(hidden)]
+    pub fn last_activity_for_test(&self, secs: u64) {
+        self.last_activity.store(secs, Ordering::SeqCst);
+    }
+
     pub fn leases(&self) -> usize {
         self.leases.load(Ordering::SeqCst)
     }

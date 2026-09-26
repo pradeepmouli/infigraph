@@ -439,3 +439,119 @@ fn client_query(root: &Path, cypher: &str) -> anyhow::Result<Vec<Vec<String>>> {
     )?;
     collect_rows(&mut stream)
 }
+
+// ── leases (#38, #124) ───────────────────────────────────────────────
+
+use infigraph_core::daemon::liveness::{self, Liveness};
+use infigraph_core::daemon::read_protocol::write_attach;
+use infigraph_core::daemon::read_service::{ReadService, StoreSource};
+
+/// A temp project whose graph holds one `File` node, and a `StoreSource`
+/// serving it -- the shape the daemon hands `start_serving`.
+fn indexed_project_and_source() -> (tempfile::TempDir, StoreSource) {
+    let dir = tempfile::tempdir().unwrap();
+    let graph = dir.path().join(".infigraph").join("graph");
+    std::fs::create_dir_all(graph.parent().unwrap()).unwrap();
+    {
+        let store = GraphStore::open(&graph).unwrap();
+        let conn = store.connection().unwrap();
+        conn.query(
+            "CREATE (:File {id: 'a.rs', name: 'a.rs', path: 'a.rs', \
+             language: 'rust', symbol_count: 0})",
+        )
+        .unwrap();
+    }
+    let store = open_shared_store(&graph);
+    let source: StoreSource = Arc::new(move || Some(store.clone()));
+    (dir, source)
+}
+
+fn wait_for(mut cond: impl FnMut() -> bool) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if cond() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    false
+}
+
+fn attach(root: &Path) -> infigraph_core::daemon::read_endpoint::ReadStream {
+    let mut s = ReadEndpoint::for_root(root).connect().unwrap();
+    write_attach(&mut s, std::process::id()).unwrap();
+    s
+}
+
+#[test]
+fn a_lease_is_counted_while_held_and_released_on_drop() {
+    let (project, source) = indexed_project_and_source();
+    let liveness = Arc::new(Liveness::new());
+    let _svc =
+        ReadService::start_serving(project.path(), source, None, 2, liveness.clone()).unwrap();
+    let lease = attach(project.path());
+    assert!(
+        wait_for(|| liveness.leases() == 1),
+        "attach must be counted"
+    );
+    drop(lease);
+    assert!(
+        wait_for(|| liveness.leases() == 0),
+        "EOF must release the lease"
+    );
+}
+
+/// Review Focus 2: leases must never occupy pool workers.
+#[test]
+fn more_leases_than_workers_do_not_starve_reads() {
+    let (project, source) = indexed_project_and_source();
+    let liveness = Arc::new(Liveness::new());
+    let workers = 2;
+    let _svc = ReadService::start_serving(project.path(), source, None, workers, liveness.clone())
+        .unwrap();
+    let leases: Vec<_> = (0..workers + 2).map(|_| attach(project.path())).collect();
+    assert!(wait_for(|| liveness.leases() == workers + 2));
+    let rows = client_query(project.path(), "MATCH (f:File) RETURN count(f)").unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "a read must still be served with every worker's worth of leases held"
+    );
+    drop(leases);
+}
+
+#[test]
+fn a_read_touches_liveness() {
+    let (project, source) = indexed_project_and_source();
+    let liveness = Arc::new(Liveness::new());
+    let _svc =
+        ReadService::start_serving(project.path(), source, None, 2, liveness.clone()).unwrap();
+    liveness.last_activity_for_test(liveness::now_secs() - 500);
+    client_query(project.path(), "MATCH (f:File) RETURN count(f)").unwrap();
+    assert!(liveness.idle_for(liveness::now_secs()).unwrap() < std::time::Duration::from_secs(5));
+}
+
+/// A service going away must end its parked leases, so each client sees EOF
+/// and can follow the daemon to a successor. That matters for an in-process
+/// service (tests, a #187 rebind); a real daemon's exit closes them anyway.
+#[cfg(unix)]
+#[test]
+fn dropping_the_service_releases_its_leases() {
+    let (project, source) = indexed_project_and_source();
+    let liveness = Arc::new(Liveness::new());
+    let svc =
+        ReadService::start_serving(project.path(), source, None, 2, liveness.clone()).unwrap();
+    let mut lease = attach(project.path());
+    assert!(wait_for(|| liveness.leases() == 1));
+    drop(svc);
+    assert!(
+        wait_for(|| liveness.leases() == 0),
+        "shutdown must end parked leases"
+    );
+    let mut buf = [0u8; 1];
+    assert_eq!(
+        std::io::Read::read(&mut lease, &mut buf).unwrap_or(0),
+        0,
+        "the client must see EOF"
+    );
+}
