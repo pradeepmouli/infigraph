@@ -136,6 +136,10 @@ enum Commands {
         /// Sweep every registered project instead of just the current one
         #[arg(long)]
         global: bool,
+        /// On a terminal, list every check (sections that all passed
+        /// otherwise collapse to one line)
+        #[arg(long, short)]
+        verbose: bool,
     },
 
     /// Evict registry entries for projects that no longer exist (R7.1).
@@ -156,7 +160,12 @@ enum Commands {
     /// graph opens cleanly, symbol->file references hold, sidecars parse
     /// and match the graph's generation. Read-only; exit 0/1/2 =
     /// pass/warn/fail for CI use.
-    Verify,
+    Verify {
+        /// On a terminal, list every check (sections that all passed
+        /// otherwise collapse to one line)
+        #[arg(long, short)]
+        verbose: bool,
+    },
 
     /// List all infigraph processes the durable state knows about (MCP
     /// servers, watchers/daemons, in-flight index runs) with liveness,
@@ -1086,12 +1095,12 @@ fn run(command: Commands, root: &Path) -> Result<()> {
         }
         Commands::Stats => cmd_stats(root),
         Commands::Restore { id, yes } => cmd_restore(root, id.as_deref(), yes),
-        Commands::Doctor { global } => cmd_doctor(root, global),
+        Commands::Doctor { global, verbose } => cmd_doctor(root, global, verbose),
         Commands::Gc {
             dry_run,
             stale_days,
         } => cmd_gc(root, dry_run, stale_days),
-        Commands::Verify => cmd_verify(root),
+        Commands::Verify { verbose } => cmd_verify(root, verbose),
         Commands::Ps => cmd_ps(root),
         Commands::Kill { pid, force } => cmd_kill(root, pid, force),
         Commands::Languages => cmd_languages(Some(root)),

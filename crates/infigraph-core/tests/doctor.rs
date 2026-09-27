@@ -5,7 +5,7 @@ use infigraph_core::doctor::{
     check_disk, check_growth_breaker, check_locks, check_registry, check_scip_staleness,
     check_sidecars, check_toolchain, check_wal_integrity, check_watchers, check_worktrees,
     find_repo_entry, format_report, projects_in_scope, run_doctor, CheckResult, CheckStatus,
-    DoctorContext, DoctorReport, DoctorScope,
+    DoctorContext, DoctorReport, DoctorScope, ReportStyle,
 };
 // Only the Linux/macOS-gated tests below use these -- `check_graph_holders`
 // inspects /proc or lsof, neither of which exists on Windows.
@@ -967,9 +967,8 @@ fn run_doctor_passes_registration_for_never_indexed_dir() {
     assert_eq!(registration.status, CheckStatus::Pass);
 }
 
-#[test]
-fn format_report_uses_plain_glyphs_by_color_flag() {
-    let report = DoctorReport {
+fn sample_report() -> DoctorReport {
+    DoctorReport {
         scope: DoctorScope::Project(PathBuf::from("/tmp/x")),
         checks: vec![
             CheckResult {
@@ -981,7 +980,7 @@ fn format_report_uses_plain_glyphs_by_color_flag() {
             },
             CheckResult {
                 category: "locks",
-                name: "graph.lock".to_string(),
+                name: "/tmp/x: graph.lock".to_string(),
                 status: CheckStatus::Warn,
                 message: "stale".to_string(),
                 remediation: Some("delete it".to_string()),
@@ -994,35 +993,68 @@ fn format_report_uses_plain_glyphs_by_color_flag() {
                 remediation: Some("run infigraph index".to_string()),
             },
         ],
-    };
+    }
+}
 
-    let plain = format_report(&report, false);
-    assert!(plain.contains("[✓]"), "plain output:\n{plain}");
-    assert!(plain.contains("[!]"), "plain output:\n{plain}");
-    assert!(plain.contains("[✗]"), "plain output:\n{plain}");
-    assert!(
-        !plain.contains('\x1b'),
-        "color=false must never emit ANSI escapes:\n{plain}"
+/// Plain output (MCP, pipes, NO_COLOR) is unchanged byte for byte: tools
+/// and the MCP dispatch test match on it.
+#[test]
+fn plain_report_is_unchanged() {
+    assert_eq!(
+        format_report(&sample_report(), ReportStyle::Plain),
+        "== disk ==\n[✓] disk: free space: 10 GB free\n\n\
+         == locks ==\n[!] /tmp/x: graph.lock: stale\n  -> delete it\n\n\
+         == registry ==\n[✗] registration: not registered\n  -> run infigraph index\n\n\
+         1 PASS, 1 WARN, 1 FAIL\n"
     );
+}
 
-    let colored = format_report(&report, true);
+#[test]
+fn color_report_uses_icons_tallies_and_styled_names() {
+    let out = format_report(&sample_report(), ReportStyle::Color { verbose: true });
+    // Section header: bold name and its tally.
     assert!(
-        colored.contains("\x1b[32m✓\x1b[0m"),
-        "colored output:\n{colored}"
+        out.contains("\x1b[1m▌locks\x1b[0m  \x1b[33m⚠ 1\x1b[0m"),
+        "{out}"
+    );
+    // Check line: colored icon, dimmed project path, bold check name.
+    assert!(
+        out.contains("  \x1b[33m⚠\x1b[0m \x1b[2m/tmp/x:\x1b[0m \x1b[1mgraph.lock\x1b[0m: stale"),
+        "{out}"
     );
     assert!(
-        colored.contains("\x1b[33m!\x1b[0m"),
-        "colored output:\n{colored}"
+        out.contains("  \x1b[31m✖\x1b[0m \x1b[1mregistration\x1b[0m: not registered"),
+        "{out}"
     );
+    // Remediation.
+    assert!(out.contains("    \x1b[36m↳ delete it\x1b[0m"), "{out}");
+    // Summary with colored counts.
     assert!(
-        colored.contains("\x1b[31m✗\x1b[0m"),
-        "colored output:\n{colored}"
+        out.contains(
+            "\x1b[32m✔ 1 passed\x1b[0m · \x1b[33m⚠ 1 warning\x1b[0m · \x1b[31m✖ 1 failed\x1b[0m"
+        ),
+        "{out}"
     );
+    // Verbose shows passing checks too.
+    assert!(out.contains("10 GB free"), "{out}");
+}
 
-    // Summary line stays plain text regardless of color, so existing
-    // substring-based consumers (e.g. the MCP tool_dispatch test) keep working.
-    assert!(plain.contains("1 PASS, 1 WARN, 1 FAIL"));
-    assert!(colored.contains("1 PASS, 1 WARN, 1 FAIL"));
+#[test]
+fn color_report_collapses_all_passing_sections_unless_verbose() {
+    let out = format_report(&sample_report(), ReportStyle::Color { verbose: false });
+    assert!(
+        out.contains("\x1b[1m▌disk\x1b[0m  \x1b[32m✔ 1 passed\x1b[0m"),
+        "{out}"
+    );
+    assert!(
+        !out.contains("10 GB free"),
+        "an all-pass section collapses: {out}"
+    );
+    // Sections with anything to act on still list every check.
+    assert!(
+        out.contains("stale") && out.contains("not registered"),
+        "{out}"
+    );
 }
 
 /// Serializes tests that mutate a process-global environment variable --

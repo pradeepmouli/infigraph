@@ -1423,12 +1423,18 @@ pub(crate) fn cmd_purge_sessions(root: &Path, days: u32) -> Result<()> {
 /// Color only when stdout is a real terminal and the user hasn't opted out
 /// via `NO_COLOR` (https://no-color.org/) — piped/redirected output (logs,
 /// CI, `| less`) stays plain so it greps and diffs cleanly.
-fn doctor_output_is_colorized() -> bool {
+/// Color on a terminal unless `NO_COLOR` is set; plain text otherwise, so
+/// pipes and scripts keep the stable format.
+fn doctor_report_style(verbose: bool) -> infigraph_core::doctor::ReportStyle {
     use std::io::IsTerminal;
-    std::env::var_os("NO_COLOR").is_none() && std::io::stdout().is_terminal()
+    if std::env::var_os("NO_COLOR").is_none() && std::io::stdout().is_terminal() {
+        infigraph_core::doctor::ReportStyle::Color { verbose }
+    } else {
+        infigraph_core::doctor::ReportStyle::Plain
+    }
 }
 
-pub(crate) fn cmd_doctor(root: &Path, global: bool) -> Result<()> {
+pub(crate) fn cmd_doctor(root: &Path, global: bool, verbose: bool) -> Result<()> {
     use infigraph_core::doctor::{
         assemble_context, format_report, run_doctor, CheckStatus, DoctorScope,
     };
@@ -1441,7 +1447,7 @@ pub(crate) fn cmd_doctor(root: &Path, global: bool) -> Result<()> {
     };
     let ctx = assemble_context(scope);
     let report = run_doctor(ctx);
-    print!("{}", format_report(&report, doctor_output_is_colorized()));
+    print!("{}", format_report(&report, doctor_report_style(verbose)));
 
     match report.worst_status() {
         CheckStatus::Pass => Ok(()),
@@ -1753,7 +1759,7 @@ pub(crate) fn sweep_orphaned_read_endpoints(root: &Path) {
 
 /// `infigraph verify` (R3.4.1): offline consistency check, doctor-style
 /// output, CI-friendly exit codes (0 pass / 1 warn / 2 fail).
-pub(crate) fn cmd_verify(root: &Path) -> Result<()> {
+pub(crate) fn cmd_verify(root: &Path, verbose: bool) -> Result<()> {
     use infigraph_core::doctor::{format_report, CheckStatus, DoctorReport, DoctorScope};
 
     let canonical_root = root.canonicalize().context("invalid project root")?;
@@ -1762,7 +1768,7 @@ pub(crate) fn cmd_verify(root: &Path) -> Result<()> {
         checks,
         scope: DoctorScope::Project(canonical_root),
     };
-    print!("{}", format_report(&report, doctor_output_is_colorized()));
+    print!("{}", format_report(&report, doctor_report_style(verbose)));
     match report.worst_status() {
         CheckStatus::Pass => Ok(()),
         CheckStatus::Warn => anyhow::bail!("verify found warnings"),
