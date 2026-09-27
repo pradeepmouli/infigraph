@@ -1765,3 +1765,57 @@ fn check_watchers_queries_daemons_in_parallel() {
         "three unresponsive daemons took {took:?}"
     );
 }
+
+/// #202 on a real daemon: `cli-watch` never updates its lock heartbeat
+/// (`last_heartbeat == acquired_at`, R2.3.5), so a heartbeat check that ran
+/// before the status query meant doctor never reached the lease verdict for
+/// any real daemon. A daemon answering `Status` has proven itself alive.
+#[test]
+fn check_watchers_judges_a_never_heartbeating_daemon_by_its_status() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::TempDir::new().unwrap();
+    let project = dir.path().join("myproj");
+    std::fs::create_dir_all(project.join(".infigraph")).unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    write_lock_file(
+        &project.join(".infigraph").join("watch.lock"),
+        &LockInfo {
+            pid: std::process::id(),
+            role: "cli-watch".to_string(),
+            build_hash: "any-hash".to_string(),
+            acquired_at: now - 10,
+            last_heartbeat: now - 10, // exactly what a real daemon's lock holds
+            holder_started_at: 0,
+        },
+    );
+    let liveness = std::sync::Arc::new(infigraph_core::daemon::liveness::Liveness::new());
+    liveness.lease_opened();
+    let (port, _rx) = infigraph_core::daemon::control_port::ControlPort::new(1800, 60);
+    let svc = infigraph_core::daemon::read_service::ReadService::start_serving(
+        &project,
+        std::sync::Arc::new(|| None),
+        None,
+        2,
+        liveness,
+        Some(port),
+    )
+    .unwrap();
+
+    let ctx = ctx_for(DoctorScope::Project(project.clone()), Registry::default());
+    let results = check_watchers(&ctx);
+    svc.shutdown();
+
+    let watcher = results
+        .iter()
+        .find(|r| r.name.contains("watcher liveness"))
+        .expect("must produce a watcher liveness result");
+    assert_eq!(watcher.status, CheckStatus::Pass, "{}", watcher.message);
+    assert!(
+        watcher.message.contains("1 clients leasing"),
+        "{}",
+        watcher.message
+    );
+}
