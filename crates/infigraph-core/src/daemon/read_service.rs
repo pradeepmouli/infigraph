@@ -392,6 +392,7 @@ fn park_lease(leases: Arc<LeaseBook>, pid: u32, mut stream: ReadStream) {
     // first and underflow the count, on any platform.
     leases.liveness.lease_opened();
     let owner = leases.clone();
+    let attached_at = std::time::Instant::now();
     let spawned = std::thread::Builder::new()
         .name("infigraph-lease".into())
         .spawn(move || {
@@ -406,10 +407,11 @@ fn park_lease(leases: Arc<LeaseBook>, pid: u32, mut stream: ReadStream) {
             owner.lock().handles.remove(&id);
             drop(stream); // only once its shutdown handle is gone
             owner.liveness.lease_closed();
-            eprintln!(
-                "[lease] released pid {pid} ({} held)",
-                owner.liveness.leases()
-            );
+            if let Some(line) =
+                lease_release_line(pid, attached_at.elapsed(), owner.liveness.leases())
+            {
+                eprintln!("{line}");
+            }
         });
     if spawned.is_err() {
         leases.liveness.lease_closed();
@@ -421,10 +423,18 @@ fn park_lease(leases: Arc<LeaseBook>, pid: u32, mut stream: ReadStream) {
         book.handles.insert(id, handle);
     }
     drop(book);
-    eprintln!(
-        "[lease] attached pid {pid} ({} held)",
-        leases.liveness.leases()
-    );
+}
+
+/// The one `daemon.log` line a lease gets, at release, or none for a lease
+/// under a second: short CLI runs (hook-driven ones especially) would
+/// otherwise add an attach/release pair each (#203 M4).
+fn lease_release_line(pid: u32, held: std::time::Duration, remaining: usize) -> Option<String> {
+    (held >= std::time::Duration::from_secs(1)).then(|| {
+        format!(
+            "[lease] pid {pid} held {}s ({remaining} held)",
+            held.as_secs()
+        )
+    })
 }
 
 /// Runs one control request on its own thread, never a pool worker: it may
@@ -532,5 +542,22 @@ impl Drop for Pool {
         for worker in self.workers.drain(..) {
             let _ = worker.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod lease_log_tests {
+    use super::lease_release_line;
+    use std::time::Duration;
+
+    /// #203 M4: one line per lease, at release, and none for a lease under
+    /// a second -- hook-driven CLI runs otherwise fill daemon.log.
+    #[test]
+    fn a_short_lease_is_not_logged_and_a_long_one_is_one_line() {
+        assert_eq!(lease_release_line(7, Duration::from_millis(300), 0), None);
+        assert_eq!(
+            lease_release_line(7, Duration::from_secs(42), 3).as_deref(),
+            Some("[lease] pid 7 held 42s (3 held)")
+        );
     }
 }

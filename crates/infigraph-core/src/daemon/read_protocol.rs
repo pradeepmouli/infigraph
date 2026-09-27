@@ -273,7 +273,15 @@ pub fn write_attach<W: Write>(w: &mut W, pid: u32) -> Result<()> {
 
 pub fn read_client_frame<R: Read>(r: &mut R) -> Result<ClientFrame> {
     let body = read_len_prefixed(r)?.ok_or_else(|| anyhow::anyhow!("no request"))?;
-    Ok(serde_json::from_slice(&body)?)
+    serde_json::from_slice(&body).map_err(|untagged| {
+        // An untagged enum's own error ("did not match any variant") names
+        // nothing. Most malformed frames are reads, so report the field-level
+        // error a `ReadRequest` parse gives, when there is one (#203 M5).
+        match serde_json::from_slice::<ReadRequest>(&body) {
+            Err(field) => anyhow::anyhow!("malformed request frame: {field}"),
+            Ok(_) => untagged.into(),
+        }
+    })
 }
 
 pub fn write_frame<W: Write>(w: &mut W, frame: &ReadFrame) -> Result<()> {
@@ -462,5 +470,24 @@ mod tests {
 
         let empty: &[u8] = &[];
         assert!(read_reply::<_, ()>(&mut &*empty).unwrap().is_none());
+    }
+}
+
+#[cfg(test)]
+mod malformed_frame_tests {
+    use super::*;
+
+    /// #203 M5: a malformed read reports serde's field-level error, not the
+    /// untagged enum's "did not match any variant".
+    #[test]
+    fn a_malformed_read_reports_the_field_error() {
+        let body = br#"{"store":"Graph","query":1,"params":[],"chunk_size":8}"#;
+        let mut framed = (body.len() as u32).to_le_bytes().to_vec();
+        framed.extend_from_slice(body);
+        let err = read_client_frame(&mut framed.as_slice())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("invalid type"), "{err}");
+        assert!(!err.contains("did not match any variant"), "{err}");
     }
 }

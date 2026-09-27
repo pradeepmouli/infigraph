@@ -3,20 +3,49 @@
 //! fire-and-forget -- a lease is an optimisation over respawning, never a
 //! correctness requirement, so nothing here blocks, errors or panics.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
-static HELD: Mutex<Option<HashSet<PathBuf>>> = Mutex::new(None);
+/// Roots this process holds (or is establishing) a lease on, each with the
+/// deadline its lease thread is currently waiting against for a daemon to
+/// connect to. Shared so a `hold_spawned` for a root still waiting can push
+/// that deadline out rather than being a no-op (#203 M1).
+type Deadline = Arc<Mutex<Instant>>;
+static HELD: Mutex<Option<HashMap<PathBuf, Deadline>>> = Mutex::new(None);
 static SELF_DAEMON: Mutex<Option<PathBuf>> = Mutex::new(None);
+static GRACE_OVERRIDE: Mutex<Option<HashMap<PathBuf, Duration>>> = Mutex::new(None);
+
+/// How long a lease waits for a daemon to come up: the startup grace, or a
+/// per-root test override.
+fn grace_for(root: &Path) -> Duration {
+    GRACE_OVERRIDE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .and_then(|m| m.get(root).copied())
+        .unwrap_or(super::read_endpoint::DAEMON_STARTUP_GRACE)
+}
+
+/// Test-only: shorten `root`'s startup grace so a test can wait one out.
+/// Per root, so it cannot leak into a concurrently running test.
+#[doc(hidden)]
+pub fn set_grace_for_test(root: &Path, grace: Duration) {
+    GRACE_OVERRIDE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(HashMap::new)
+        .insert(key(root), grace);
+}
 
 fn key(root: &Path) -> PathBuf {
     root.canonicalize().unwrap_or_else(|_| root.to_path_buf())
 }
 
-fn with_held<T>(f: impl FnOnce(&mut HashSet<PathBuf>) -> T) -> T {
+fn with_held<T>(f: impl FnOnce(&mut HashMap<PathBuf, Deadline>) -> T) -> T {
     let mut guard = HELD.lock().unwrap_or_else(|e| e.into_inner());
-    f(guard.get_or_insert_with(HashSet::new))
+    f(guard.get_or_insert_with(HashMap::new))
 }
 
 /// Called by `cmd_daemon` before its coordinator starts: a daemon holding a
@@ -27,7 +56,7 @@ pub fn mark_self_daemon(root: &Path) {
 
 /// Whether this process holds, or is establishing, a lease on `root`'s daemon.
 pub fn is_held(root: &Path) -> bool {
-    with_held(|h| h.contains(&key(root)))
+    with_held(|h| h.contains_key(&key(root)))
 }
 
 /// Lease `root`'s daemon for the rest of this process's life. Returns at
@@ -53,15 +82,34 @@ fn hold_inner(root: &Path, just_spawned: bool) {
     {
         return;
     }
-    if !with_held(|h| h.insert(root.clone())) {
+    let grace = grace_for(&root);
+    let deadline = with_held(|h| match h.get(&root) {
+        // Already leased or waiting. A fresh spawn re-arms a wait that may
+        // be about to give up on the daemon it is replacing; otherwise this
+        // is the usual idempotent no-op.
+        Some(existing) => {
+            if just_spawned {
+                let rearmed = Instant::now() + grace;
+                let mut at = existing.lock().unwrap_or_else(|e| e.into_inner());
+                *at = (*at).max(rearmed);
+            }
+            None
+        }
+        None => {
+            let deadline: Deadline = Arc::new(Mutex::new(Instant::now()));
+            h.insert(root.clone(), deadline.clone());
+            Some(deadline)
+        }
+    });
+    let Some(deadline) = deadline else {
         return;
-    }
+    };
     let spawned = std::thread::Builder::new()
         .name("infigraph-lease-hold".into())
         .spawn({
             let root = root.clone();
             move || {
-                hold_until_no_daemon(&root, just_spawned);
+                hold_until_no_daemon(&root, just_spawned, grace, &deadline);
                 with_held(|h| h.remove(&root));
             }
         });
@@ -82,14 +130,14 @@ fn hold_inner(root: &Path, just_spawned: bool) {
 /// read "alive" while no daemon holds it, and could take the lock out from
 /// under a daemon that is starting. A successful connect is the one signal
 /// that is both conclusive and free of side effects.
-fn hold_until_no_daemon(root: &Path, just_spawned: bool) {
+fn hold_until_no_daemon(root: &Path, just_spawned: bool, grace: Duration, deadline: &Deadline) {
     // With no `watch.lock` file no daemon has ever run here: nothing to wait
     // for. Existence is a stat, not a probe. A spawn's trial lock creates the
     // file, but a spawned daemon is waited for regardless.
     let mut budget = if just_spawned || root.join(".infigraph").join("watch.lock").exists() {
-        super::read_endpoint::DAEMON_STARTUP_GRACE
+        grace
     } else {
-        std::time::Duration::ZERO
+        Duration::ZERO
     };
     // Consecutive attaches that ended without an ack. One is ambiguous -- a
     // daemon shutting down (its listener still bound until its accept thread
@@ -98,7 +146,8 @@ fn hold_until_no_daemon(root: &Path, just_spawned: bool) {
     // a row is a daemon that does not support leases: stop.
     let mut unacked = 0;
     loop {
-        let Some(mut stream) = connect_within(root, budget) else {
+        *deadline.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now() + budget;
+        let Some(mut stream) = connect_within(root, deadline) else {
             return;
         };
         if super::read_protocol::write_attach(&mut stream, std::process::id()).is_err() {
@@ -117,39 +166,74 @@ fn hold_until_no_daemon(root: &Path, just_spawned: bool) {
             if unacked >= 2 {
                 return;
             }
-            std::thread::sleep(std::time::Duration::from_secs(1));
-            budget = super::read_endpoint::DAEMON_STARTUP_GRACE;
+            std::thread::sleep(Duration::from_secs(1));
+            budget = grace;
             continue;
         }
         unacked = 0;
         // Blocks until the daemon closes the connection.
         let _ = super::read_protocol::read_len_prefixed(&mut stream);
-        budget = super::read_endpoint::DAEMON_STARTUP_GRACE;
+        budget = grace;
     }
 }
 
-/// Connect to `root`'s read endpoint, retrying until `budget` runs out (one
-/// attempt for a zero budget).
-fn connect_within(
-    root: &Path,
-    budget: std::time::Duration,
-) -> Option<super::read_endpoint::ReadStream> {
+/// Connect to `root`'s read endpoint, retrying until `deadline` passes (one
+/// attempt if it already has). The deadline is re-read on every retry, so a
+/// `hold_spawned` that re-arms it extends this wait.
+fn connect_within(root: &Path, deadline: &Deadline) -> Option<super::read_endpoint::ReadStream> {
     let endpoint = super::read_endpoint::ReadEndpoint::for_root(root);
-    let deadline = std::time::Instant::now() + budget;
     loop {
         if let Ok(stream) = endpoint.connect() {
             return Some(stream);
         }
-        if std::time::Instant::now() >= deadline {
+        if Instant::now() >= *deadline.lock().unwrap_or_else(|e| e.into_inner()) {
             return None;
         }
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(50));
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #203 M1: a lease thread still waiting for a (slow) successor has its
+    /// deadline pushed out by a `hold_spawned` for the same root, instead of
+    /// that call being a no-op and the thread giving up before the successor
+    /// binds.
+    #[test]
+    fn hold_spawned_rearms_a_lease_still_waiting_for_its_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join(".infigraph")).unwrap();
+        std::fs::write(root.join(".infigraph").join("watch.lock"), b"").unwrap();
+        set_grace_for_test(&root, std::time::Duration::from_millis(500));
+
+        hold(&root); // waits up to 500ms for a daemon
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        hold_spawned(&root); // a respawn: re-arm the wait
+        std::thread::sleep(std::time::Duration::from_millis(300)); // past the first deadline
+
+        let liveness = std::sync::Arc::new(super::super::liveness::Liveness::new());
+        let _svc = super::super::read_service::ReadService::start_serving(
+            &root,
+            std::sync::Arc::new(|| None),
+            None,
+            2,
+            liveness.clone(),
+            None,
+        )
+        .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while liveness.leases() == 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(
+            liveness.leases(),
+            1,
+            "the re-armed lease must reach the successor"
+        );
+    }
 
     /// `daemon_is_alive` probes by briefly taking `watch.lock`, so a lease
     /// thread that probed it would make other probers in this process -- the

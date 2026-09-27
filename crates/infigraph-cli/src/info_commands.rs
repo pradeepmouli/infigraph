@@ -817,6 +817,10 @@ impl infigraph_core::daemon::DocsHandle for DocWatchHandle {
     fn is_running(&self) -> bool {
         self.0.lock().unwrap().is_running()
     }
+
+    fn is_busy(&self) -> bool {
+        infigraph_docs::watch::reindex_in_progress()
+    }
 }
 
 impl DocWatchThread {

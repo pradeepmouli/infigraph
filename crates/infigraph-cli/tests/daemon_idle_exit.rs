@@ -154,12 +154,16 @@ fn a_killed_lease_holder_releases_its_lease() {
     let _daemon = spawn_daemon(project.path(), "2");
     // A separate process holding a lease: this test binary, re-exec'd into
     // `lease_holder_helper`, which attaches and sleeps.
-    let mut holder = Command::new(std::env::current_exe().unwrap())
-        .args(["lease_holder_helper", "--exact", "--ignored", "--nocapture"])
-        .env("LEASE_HOLDER_ROOT", project.path())
-        .stdout(Stdio::null())
-        .spawn()
-        .unwrap();
+    // `KillOnDrop` so a failed assertion below cannot leave the helper
+    // asleep for its full 600s (#203 M6).
+    let mut holder = KillOnDrop(
+        Command::new(std::env::current_exe().unwrap())
+            .args(["lease_holder_helper", "--exact", "--ignored", "--nocapture"])
+            .env("LEASE_HOLDER_ROOT", project.path())
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
     std::thread::sleep(Duration::from_secs(6));
     assert!(
         daemon_alive(project.path()),
