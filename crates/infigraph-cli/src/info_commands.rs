@@ -888,6 +888,33 @@ pub(crate) fn stop_via_sentinel(root: &Path) -> Result<()> {
     Ok(())
 }
 
+pub(crate) enum DaemonStop {
+    Stopped,
+    NotRunning,
+    /// The daemon could not take the request; the sentinel was written.
+    ViaSentinel(String),
+}
+
+/// Ask a daemon to stop over its socket, falling back to the `watch.stop`
+/// sentinel whenever it cannot act on the request (#155): an incompatible
+/// build, no answer, or a refusal -- a wedged coordinator refuses rather
+/// than hangs (a full queue, or its own reply timeout), and that is the
+/// case the sentinel exists for. A daemon already shutting down counts as
+/// stopped.
+pub(crate) fn request_daemon_stop(root: &Path) -> Result<DaemonStop> {
+    use infigraph_core::daemon::control::{send_control, ControlError};
+    use infigraph_core::daemon::control_port::SHUTTING_DOWN;
+    match send_control(root, WatchRole::Daemon, WatchAction::Stop) {
+        Ok(()) => Ok(DaemonStop::Stopped),
+        Err(ControlError::Refused(m)) if m == SHUTTING_DOWN => Ok(DaemonStop::Stopped),
+        Err(ControlError::NoDaemon) => Ok(DaemonStop::NotRunning),
+        Err(e) => {
+            stop_via_sentinel(root)?;
+            Ok(DaemonStop::ViaSentinel(e.to_string()))
+        }
+    }
+}
+
 pub(crate) fn cmd_watch_status(root: &Path) -> Result<()> {
     let result = infigraph_core::daemon::control::query_status(root);
     println!(
@@ -905,17 +932,14 @@ pub(crate) fn cmd_daemon_stop(root: &Path) -> Result<()> {
         println!("No daemon running.");
         return Ok(());
     }
-    use infigraph_core::daemon::control::{send_control, ControlError};
-    match send_control(root, WatchRole::Daemon, WatchAction::Stop) {
-        Ok(()) => println!("Daemon stopped."),
-        Err(ControlError::NoDaemon) => println!("No daemon running."),
-        Err(e @ (ControlError::Incompatible | ControlError::Unresponsive)) => {
-            stop_via_sentinel(root)?;
+    match request_daemon_stop(root)? {
+        DaemonStop::Stopped => println!("Daemon stopped."),
+        DaemonStop::NotRunning => println!("No daemon running."),
+        DaemonStop::ViaSentinel(why) => {
             println!(
-                "Daemon did not take the stop request ({e}); wrote the stop sentinel instead."
-            );
+                "Daemon did not take the stop request ({why}); wrote the stop sentinel instead."
+            )
         }
-        Err(e) => return Err(e.into()),
     }
     Ok(())
 }
@@ -928,21 +952,11 @@ pub(crate) fn cmd_daemon_restart(root: &Path) -> Result<()> {
         // Read the holder BEFORE asking it to stop: the lock payload naming
         // it is gone by the time we need it to confirm the exit.
         let holder_pid = infigraph_core::lockfile::read_holder(&lock_path).map(|h| h.pid);
-        // `WatchRole::Daemon`'s `Restart` action (per Task 10's
-        // route_or_serve_request arm) only cancels daemon_token -- the
-        // process exiting means there's nothing left to ask to "start
-        // itself" from inside. Re-spawn from the CLI side instead,
-        // mirroring `ensure_daemon_running`'s existing pattern.
-        use infigraph_core::daemon::control::{send_control, ControlError};
-        match send_control(root, WatchRole::Daemon, WatchAction::Stop) {
-            Ok(()) | Err(ControlError::NoDaemon) => {}
-            // It could not take the request: stop it out of band, then let
-            // the confirmation below decide whether it actually went.
-            Err(ControlError::Incompatible | ControlError::Unresponsive) => {
-                stop_via_sentinel(root)?
-            }
-            Err(e) => return Err(e.into()),
-        }
+        // A daemon can only stop itself (`Control { role: Daemon }` has no
+        // real Restart), so stop it and re-spawn from the CLI side, mirroring
+        // `ensure_daemon_running`. Whatever the stop's outcome, the
+        // confirmation below decides whether the old daemon actually went.
+        request_daemon_stop(root)?;
 
         // Wait for the PROCESS to exit, not merely for the lock to look
         // free. A daemon releases `watch.lock` while it is still draining

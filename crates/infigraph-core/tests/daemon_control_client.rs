@@ -144,6 +144,9 @@ fn describe_status_names_the_holder_of_an_unresponsive_daemons_lock() {
         .unwrap();
     let text = describe_status(dir.path(), &Err(ControlError::Unresponsive));
     assert!(text.contains("role: test-daemon"), "{text}");
+    // Users copy the command it names: it must be one that exists.
+    assert!(text.contains("`infigraph daemon-stop`"), "{text}");
+    assert!(infigraph_core::daemon::control_port::BUSY.contains("`infigraph daemon-stop`"));
     assert!(describe_status(dir.path(), &Err(ControlError::NoDaemon))
         .starts_with("No watcher running for"));
 }

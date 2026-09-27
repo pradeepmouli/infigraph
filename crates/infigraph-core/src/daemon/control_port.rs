@@ -22,7 +22,7 @@ pub const CONTROL_QUEUE: usize = 8;
 pub const CONTROL_REPLY_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub const BUSY: &str = "daemon busy: the coordinator has not taken control requests \
-    for a while; `infigraph daemon stop` falls back to the watch.stop sentinel";
+    for a while; `infigraph daemon-stop` falls back to the watch.stop sentinel";
 pub const SHUTTING_DOWN: &str = "the daemon is shutting down";
 pub const NO_CONTROL: &str = "this read service has no daemon control attached";
 

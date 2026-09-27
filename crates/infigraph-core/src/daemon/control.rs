@@ -97,11 +97,13 @@ pub fn query_status_many(roots: &[PathBuf]) -> Vec<Result<StatusReport, ControlE
 
 /// Send `op` and wait at most `deadline` for its one reply frame.
 ///
-/// The read runs on a helper thread so the deadline holds on every
+/// The read runs on a helper thread so the caller's deadline holds on every
 /// transport. On unix a timed-out read is also woken with `shutdown(2)`, so
 /// a wedged daemon never pins a thread in a long-lived client (MCP). The
 /// handle sits behind a mutex the reader clears before dropping the stream:
-/// never shut down an fd number that may since have been reused.
+/// never shut down an fd number that may since have been reused. On Windows
+/// the timed-out reader thread stays blocked until the daemon closes the
+/// pipe -- a known gap, tracked in #206.
 fn exchange<O: DaemonOp>(
     mut stream: ReadStream,
     op: &O,
@@ -156,7 +158,7 @@ pub fn describe_status(root: &Path, result: &Result<StatusReport, ControlError>)
                 .unwrap_or_else(|| "a process".to_string());
             format!(
                 "Watcher for {shown}: {holder} holds watch.lock but is not answering on its \
-                 socket (starting, or wedged). `infigraph daemon stop` falls back to the stop \
+                 socket (starting, or wedged). `infigraph daemon-stop` falls back to the stop \
                  sentinel."
             )
         }
