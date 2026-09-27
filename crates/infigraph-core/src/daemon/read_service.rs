@@ -437,10 +437,17 @@ fn spawn_control(port: Option<Arc<ControlPort>>, request: ControlRequest, mut st
         return;
     };
     let guard = port.enter();
+    // The stream is handed over only once the thread exists, so a failed
+    // spawn can still answer the client instead of hanging up on it -- a
+    // hang-up would read as an incompatible build.
+    let (hand_over, take) = mpsc::channel::<ReadStream>();
     let spawned = std::thread::Builder::new()
         .name("infigraph-control".into())
         .spawn(move || {
             let _guard = guard;
+            let Ok(mut stream) = take.recv() else {
+                return;
+            };
             let reply = match port.submit(request) {
                 Err(msg) => OpReply::Err(msg),
                 Ok(rx) => match rx.recv_timeout(CONTROL_REPLY_TIMEOUT) {
@@ -457,8 +464,17 @@ fn spawn_control(port: Option<Arc<ControlPort>>, request: ControlRequest, mut st
             };
             let _ = write_reply(&mut stream, &reply);
         });
-    if let Err(e) = spawned {
-        eprintln!("[control] could not start a control thread: {e}");
+    match spawned {
+        Ok(_) => {
+            let _ = hand_over.send(stream);
+        }
+        Err(e) => {
+            eprintln!("[control] could not start a control thread: {e}");
+            let _ = write_reply::<_, ()>(
+                &mut stream,
+                &OpReply::Err(format!("the daemon could not start a control thread: {e}")),
+            );
+        }
     }
 }
 

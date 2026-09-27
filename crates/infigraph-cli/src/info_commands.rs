@@ -806,16 +806,11 @@ impl infigraph_core::daemon::DocsHandle for DocWatchHandle {
         &self,
         action: infigraph_core::daemon_protocol::WatchAction,
     ) -> std::result::Result<(), String> {
-        use infigraph_core::daemon_protocol::WatchAction;
-        let mut doc_watch = self.0.lock().unwrap();
-        match action {
-            WatchAction::Stop | WatchAction::Disable => doc_watch.stop(),
-            WatchAction::Start | WatchAction::Enable => doc_watch.start(),
-            WatchAction::Restart => {
-                doc_watch.stop();
-                doc_watch.start();
-            }
-        }
+        let doc_watch = &self.0;
+        action.drive(
+            || doc_watch.lock().unwrap().stop(),
+            || doc_watch.lock().unwrap().start(),
+        );
         Ok(())
     }
 

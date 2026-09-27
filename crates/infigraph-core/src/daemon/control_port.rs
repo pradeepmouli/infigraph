@@ -49,6 +49,7 @@ fn encode(s: RoleState) -> u8 {
         RoleState::Stopped => 1,
         RoleState::Disabled => 2,
         RoleState::NotOwned => 3,
+        RoleState::Starting => 4,
     }
 }
 
@@ -57,6 +58,7 @@ fn decode(v: u8) -> RoleState {
         0 => RoleState::Running,
         1 => RoleState::Stopped,
         2 => RoleState::Disabled,
+        4 => RoleState::Starting,
         _ => RoleState::NotOwned,
     }
 }
@@ -72,7 +74,7 @@ pub struct DaemonState {
 impl DaemonState {
     fn new(grace_secs: u64, idle_check_secs: u64) -> Self {
         Self {
-            code: AtomicU8::new(encode(RoleState::Stopped)),
+            code: AtomicU8::new(encode(RoleState::Starting)),
             docs: AtomicU8::new(encode(RoleState::NotOwned)),
             work_in_flight: AtomicBool::new(false),
             grace_secs,
@@ -205,10 +207,12 @@ mod tests {
     }
 
     #[test]
-    fn a_fresh_state_reports_code_stopped_and_docs_not_owned() {
+    fn a_fresh_state_reports_code_starting_and_docs_not_owned() {
         let (port, _rx) = ControlPort::new(1800, 60);
         let r = port.state.report(&Liveness::new(), now_secs());
-        assert_eq!(r.code, RoleState::Stopped);
+        // The endpoint binds seconds before the loop first publishes: a
+        // daemon in that window is starting, not stopped.
+        assert_eq!(r.code, RoleState::Starting);
         assert_eq!(r.docs, RoleState::NotOwned);
         assert_eq!((r.grace_secs, r.idle_check_secs), (1800, 60));
         assert_eq!(r.pid, std::process::id());

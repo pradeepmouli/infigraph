@@ -55,6 +55,22 @@ pub enum WatchAction {
     Restart,
 }
 
+impl WatchAction {
+    /// The one mapping from an action to stop/start calls. `Enable`/`Disable`
+    /// differ from `Start`/`Stop` only in whether the *caller* also wrote the
+    /// persisted policy, so their effect on a live loop is the same.
+    pub fn drive(self, mut stop: impl FnMut(), mut start: impl FnMut()) {
+        match self {
+            WatchAction::Stop | WatchAction::Disable => stop(),
+            WatchAction::Start | WatchAction::Enable => start(),
+            WatchAction::Restart => {
+                stop();
+                start();
+            }
+        }
+    }
+}
+
 /// Asks the daemon how it is doing (#155, #202). Answered from memory on the
 /// read service, never through the coordinator, so it answers even while the
 /// coordinator is busy or stuck.
@@ -89,6 +105,9 @@ pub enum OpReply<T> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RoleState {
+    /// The daemon is up but its loop has not published yet (the endpoint
+    /// binds seconds before the registry build finishes).
+    Starting,
     Running,
     /// Stopped over control, or the loop ended by itself; policy still on.
     Stopped,
@@ -101,6 +120,7 @@ pub enum RoleState {
 impl std::fmt::Display for RoleState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
+            RoleState::Starting => "starting",
             RoleState::Running => "running",
             RoleState::Stopped => "stopped",
             RoleState::Disabled => "disabled",

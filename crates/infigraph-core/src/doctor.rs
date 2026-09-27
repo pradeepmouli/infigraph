@@ -664,12 +664,20 @@ fn now_epoch_secs() -> u64 {
 
 const WATCHER_CATEGORY: &str = "watchers";
 
-fn check_one_watcher(project_path: &Path) -> CheckResult {
+/// The part of the watcher check that reads `watch.lock` itself. It must run
+/// before any status query: that query's liveness probe takes the lock when
+/// it is free, which rewrites the payload this reads. `Ok(pid)` means the
+/// lock names a live, heartbeating holder and the daemon must be asked.
+fn watcher_lock_precheck(project_path: &Path) -> std::result::Result<u32, CheckResult> {
     let lock_path = project_path.join(".infigraph").join("watch.lock");
     let label = format!("{}: watcher liveness", project_path.display());
 
     if !lock_path.exists() {
-        return CheckResult::pass(WATCHER_CATEGORY, label, "no watcher running");
+        return Err(CheckResult::pass(
+            WATCHER_CATEGORY,
+            label,
+            "no watcher running",
+        ));
     }
 
     let Some(holder) = lockfile::read_holder(&lock_path) else {
@@ -678,7 +686,7 @@ fn check_one_watcher(project_path: &Path) -> CheckResult {
         let empty = std::fs::metadata(&lock_path)
             .map(|m| m.len() == 0)
             .unwrap_or(false);
-        return if empty {
+        return Err(if empty {
             CheckResult::pass(WATCHER_CATEGORY, label, "watcher released (empty payload)")
         } else {
             CheckResult::warn(
@@ -690,11 +698,11 @@ fn check_one_watcher(project_path: &Path) -> CheckResult {
                     lock_path.display()
                 ),
             )
-        };
+        });
     };
 
     if !is_pid_alive(holder.pid) {
-        return CheckResult::warn(
+        return Err(CheckResult::warn(
             WATCHER_CATEGORY,
             label,
             format!("watch.lock holder PID {} is not running", holder.pid),
@@ -702,14 +710,14 @@ fn check_one_watcher(project_path: &Path) -> CheckResult {
                 "stale lock -- safe to delete if you don't expect a watcher here: rm {}",
                 lock_path.display()
             ),
-        );
+        ));
     }
 
     // last_heartbeat == acquired_at means this lock type has never called
     // LockFile::heartbeat() (true for cli-watch as of this writing) -- report
     // that explicitly rather than treating "never updated" as "just stale."
     if holder.last_heartbeat == holder.acquired_at {
-        return CheckResult::warn(
+        return Err(CheckResult::warn(
             WATCHER_CATEGORY,
             label,
             format!(
@@ -717,7 +725,7 @@ fn check_one_watcher(project_path: &Path) -> CheckResult {
                 holder.pid
             ),
             "no action needed unless the watcher is suspected frozen; this is a known gap (see R2.3.5 in DESIGN-hardening.md)",
-        );
+        ));
     }
 
     if lockfile::is_holder_wedged(
@@ -725,7 +733,7 @@ fn check_one_watcher(project_path: &Path) -> CheckResult {
         now_epoch_secs(),
         WATCHER_HEARTBEAT_STALE_SECS,
     ) {
-        return CheckResult::warn(
+        return Err(CheckResult::warn(
             WATCHER_CATEGORY,
             label,
             format!(
@@ -738,11 +746,24 @@ fn check_one_watcher(project_path: &Path) -> CheckResult {
                 project_path.display(),
                 holder.pid
             ),
-        );
+        ));
     }
 
+    Ok(holder.pid)
+}
+
+/// The watcher verdict once the daemon has been asked (#202).
+fn watcher_status_verdict(
+    project_path: &Path,
+    pid: u32,
+    status: std::result::Result<
+        crate::daemon::read_protocol::StatusReport,
+        crate::daemon::control::ControlError,
+    >,
+) -> CheckResult {
+    let label = format!("{}: watcher liveness", project_path.display());
     let log = project_path.join(".infigraph").join("daemon.log");
-    match crate::daemon::control::query_status(project_path) {
+    match status {
         Ok(report) => watcher_verdict(label, &report, &log),
         Err(e) => CheckResult::warn(
             WATCHER_CATEGORY,
@@ -751,12 +772,12 @@ fn check_one_watcher(project_path: &Path) -> CheckResult {
                 crate::daemon::control::ControlError::NoDaemon => format!(
                     "watch.lock names live PID {}, but no daemon holds the lock or listens on \
                      its socket -- log: {}",
-                    holder.pid,
+                    pid,
                     log.display()
                 ),
                 e => format!(
                     "watcher (PID {}) is alive but did not answer a status query: {e} -- log: {}",
-                    holder.pid,
+                    pid,
                     log.display()
                 ),
             },
@@ -764,7 +785,7 @@ fn check_one_watcher(project_path: &Path) -> CheckResult {
                 "`infigraph daemon-stop` from {} (falls back to the stop sentinel), or \
                  `infigraph kill {}` if that doesn't clear it",
                 project_path.display(),
-                holder.pid
+                pid
             ),
         ),
     }
@@ -827,9 +848,34 @@ fn watcher_verdict(
 
 pub fn check_watchers(ctx: &DoctorContext) -> Vec<CheckResult> {
     let projects = projects_in_scope(ctx);
+    // Every daemon asked at once, so doctor over many projects with wedged
+    // daemons costs about one status deadline, not one each.
+    // The lock payloads are read first, and only the projects whose lock
+    // names a live holder are queried (see `watcher_lock_precheck`).
+    let prechecks: Vec<_> = projects.iter().map(|p| watcher_lock_precheck(p)).collect();
+    let to_ask: Vec<PathBuf> = projects
+        .iter()
+        .zip(&prechecks)
+        .filter(|(_, pre)| pre.is_ok())
+        .map(|(p, _)| p.clone())
+        .collect();
+    let mut statuses = crate::daemon::control::query_status_many(&to_ask).into_iter();
     projects
         .iter()
-        .flat_map(|p| std::iter::once(check_one_watcher(p)).chain(check_one_daemon_fault(p)))
+        .zip(prechecks)
+        .flat_map(|(p, pre)| {
+            let watcher = match pre {
+                Err(done) => done,
+                Ok(pid) => watcher_status_verdict(
+                    p,
+                    pid,
+                    statuses
+                        .next()
+                        .expect("one status per project that needed one"),
+                ),
+            };
+            std::iter::once(watcher).chain(check_one_daemon_fault(p))
+        })
         .collect()
 }
 

@@ -662,6 +662,12 @@ where
     // through. Owned here, like `liveness`, so a #187 rebind keeps it.
     let (control_port, control_rx) =
         control_port::ControlPort::new(idle.grace_secs, idle.check_secs.max(1));
+    if docs_control.is_some() {
+        control_port.state.set_role(
+            WatchRole::Docs,
+            crate::daemon::read_protocol::RoleState::Starting,
+        );
+    }
     let mut bind_read_service: Box<dyn FnMut() -> Option<read_service::ReadService>> =
         if !serve_requests {
             Box::new(|| None)
@@ -900,18 +906,26 @@ where
     let idle_check = Duration::from_secs(idle.check_secs.max(1));
     let mut last_idle_check = std::time::Instant::now();
 
+    // Published at the bottom of every iteration and after every control
+    // request; until the first, `Status` reports the port's `Starting`.
     let mut policy = read_policy(root);
-    publish_roles(
-        &control_port.state,
-        &code_watch,
-        docs_control.as_ref(),
-        policy,
-    );
+    // Test-only: park the loop so tests can observe a busy coordinator.
+    // Resolved once, like `build_hash_check_interval`'s test hook.
+    let stall_file = std::env::var_os("INFIGRAPH_TEST_COORDINATOR_STALL_FILE").map(PathBuf::from);
+    // Work that defers the idle exit and that `Status` reports, stated once:
+    // the idle check and the published state must never disagree on it.
+    macro_rules! work_in_flight {
+        () => {
+            drain_in_flight.is_some()
+                || full_reindex_in_flight.is_some()
+                || scip_in_flight.is_some()
+                || scip_import_in_flight.is_some()
+        };
+    }
 
     loop {
-        // Test-only: park the loop so tests can observe a busy coordinator.
-        if let Ok(stall) = std::env::var("INFIGRAPH_TEST_COORDINATOR_STALL_FILE") {
-            while Path::new(&stall).exists() {
+        if let Some(stall) = &stall_file {
+            while stall.exists() {
                 std::thread::sleep(Duration::from_millis(20));
             }
         }
@@ -951,10 +965,7 @@ where
         // root. Never mid-write: in-flight work defers the exit.
         if serve_requests && last_idle_check.elapsed() >= idle_check {
             last_idle_check = std::time::Instant::now();
-            let work_in_flight = drain_in_flight.is_some()
-                || full_reindex_in_flight.is_some()
-                || scip_in_flight.is_some()
-                || scip_import_in_flight.is_some();
+            let work_in_flight = work_in_flight!();
             let idle_for = liveness.idle_for(liveness::now_secs());
             if liveness::idle_exit_due(idle_for, idle_grace, work_in_flight) {
                 eprintln!(
@@ -1732,12 +1743,7 @@ where
             folded_since_sample = false;
         }
 
-        control_port.state.set_work_in_flight(
-            drain_in_flight.is_some()
-                || full_reindex_in_flight.is_some()
-                || scip_in_flight.is_some()
-                || scip_import_in_flight.is_some(),
-        );
+        control_port.state.set_work_in_flight(work_in_flight!());
         publish_roles(
             &control_port.state,
             &code_watch,
@@ -1779,8 +1785,8 @@ where
             }
             next = control_rx.try_recv().ok();
         }
-        // The loop's own `if shutdown_requested` check sits mid-body, after
-        // work that could start a drain; leave now instead.
+        // A control stop ends the loop here, before another iteration can
+        // start any new work.
         if shutdown_requested {
             eprintln!("[watch] daemon stop requested over control -- shutting down");
             break;
@@ -3475,19 +3481,14 @@ fn apply_watch_control(
     docs: Option<&Arc<dyn DocsHandle>>,
 ) -> std::result::Result<(), String> {
     match role {
-        // `Enable`/`Disable` differ from `Start`/`Stop` only in
-        // whether the *caller* also wrote the persisted flag in
-        // config.toml (Phase 4). Their effect on the live task is
-        // identical, so this arm treats them the same.
         WatchRole::Code => {
-            match action {
-                WatchAction::Stop | WatchAction::Disable => code_watch.stop(),
-                WatchAction::Start | WatchAction::Enable => code_watch.start(),
-                WatchAction::Restart => {
-                    code_watch.stop();
-                    code_watch.start();
-                }
-            }
+            // `drive` takes two closures over one `&mut CodeWatch`; a
+            // `RefCell` lends it to whichever runs.
+            let code_watch = std::cell::RefCell::new(code_watch);
+            action.drive(
+                || code_watch.borrow_mut().stop(),
+                || code_watch.borrow_mut().start(),
+            );
             Ok(())
         }
         WatchRole::Docs => match docs {

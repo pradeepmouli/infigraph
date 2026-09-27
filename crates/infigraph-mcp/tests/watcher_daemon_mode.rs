@@ -352,6 +352,18 @@ fn get_watch_status_by_path_reports_no_watcher_when_none_running() {
     assert!(result.starts_with("No watcher running for"));
 }
 
+/// The report names the path the caller gave, not its canonical form (on
+/// macOS a tempdir's `/var/...` canonicalises to `/private/var/...`).
+#[test]
+fn get_watch_status_by_path_echoes_the_callers_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".infigraph")).unwrap();
+    let given = tmp.path().to_string_lossy().to_string();
+    let args = serde_json::json!({ "path": given });
+    let result = infigraph_mcp::tools::watch::tool_get_watch_status(&args).unwrap();
+    assert_eq!(result, format!("No watcher running for {given}."));
+}
+
 #[test]
 fn get_watch_status_by_path_reports_holder_identity_when_lock_held() {
     let tmp = tempfile::tempdir().unwrap();
@@ -716,9 +728,8 @@ fn stop_watch_docs_by_path_reports_no_watcher_when_lock_free() {
     let args = serde_json::json!({ "path": root.to_string_lossy() });
     let result = infigraph_mcp::tools::docs::tool_stop_watch_docs(&args).unwrap();
 
-    assert!(
-        result.to_lowercase().contains("no"),
-        "expected a no-watcher message, got: {result}"
-    );
+    assert_eq!(result, "No watcher running.");
+    // Goes over control (#155): no stop file of any kind is written.
     assert!(!root.join(".infigraph").join("watch.stop.docs").exists());
+    assert!(!root.join(".infigraph").join("watch.stop").exists());
 }

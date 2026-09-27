@@ -537,8 +537,10 @@ pub fn tool_get_watch_status(args: &Value) -> Result<String> {
             .canonicalize()
             .context("invalid path")?;
         let result = infigraph_core::daemon::control::query_status(&root);
+        // Named as the caller gave it, not canonicalised.
         return Ok(infigraph_core::daemon::control::describe_status(
-            &root, &result,
+            std::path::Path::new(path),
+            &result,
         ));
     }
 
