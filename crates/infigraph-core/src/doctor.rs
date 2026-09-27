@@ -666,9 +666,11 @@ const WATCHER_CATEGORY: &str = "watchers";
 
 /// The part of the watcher check that reads `watch.lock` itself. It must run
 /// before any status query: that query's liveness probe takes the lock when
-/// it is free, which rewrites the payload this reads. `Ok(pid)` means the
-/// lock names a live, heartbeating holder and the daemon must be asked.
-fn watcher_lock_precheck(project_path: &Path) -> std::result::Result<u32, CheckResult> {
+/// it is free, which rewrites the payload this reads. `Ok(holder)` means the
+/// lock names a live holder and the daemon must be asked.
+fn watcher_lock_precheck(
+    project_path: &Path,
+) -> std::result::Result<lockfile::LockInfo, CheckResult> {
     let lock_path = project_path.join(".infigraph").join("watch.lock");
     let label = format!("{}: watcher liveness", project_path.display());
 
@@ -713,11 +715,33 @@ fn watcher_lock_precheck(project_path: &Path) -> std::result::Result<u32, CheckR
         ));
     }
 
+    Ok(holder)
+}
+
+/// The watcher verdict once the daemon has been asked (#202).
+fn watcher_status_verdict(
+    project_path: &Path,
+    holder: lockfile::LockInfo,
+    status: std::result::Result<
+        crate::daemon::read_protocol::StatusReport,
+        crate::daemon::control::ControlError,
+    >,
+) -> CheckResult {
+    let label = format!("{}: watcher liveness", project_path.display());
+    let log = project_path.join(".infigraph").join("daemon.log");
+    // A daemon that answers has proven itself alive -- better evidence than a
+    // lock heartbeat, which `cli-watch` never updates (R2.3.5). The heartbeat
+    // heuristics only diagnose a holder that does not answer.
+    let e = match status {
+        Ok(report) => return watcher_verdict(label, &report, &log),
+        Err(e) => e,
+    };
+    let pid = holder.pid;
     // last_heartbeat == acquired_at means this lock type has never called
     // LockFile::heartbeat() (true for cli-watch as of this writing) -- report
     // that explicitly rather than treating "never updated" as "just stale."
     if holder.last_heartbeat == holder.acquired_at {
-        return Err(CheckResult::warn(
+        return CheckResult::warn(
             WATCHER_CATEGORY,
             label,
             format!(
@@ -725,7 +749,7 @@ fn watcher_lock_precheck(project_path: &Path) -> std::result::Result<u32, CheckR
                 holder.pid
             ),
             "no action needed unless the watcher is suspected frozen; this is a known gap (see R2.3.5 in DESIGN-hardening.md)",
-        ));
+        );
     }
 
     if lockfile::is_holder_wedged(
@@ -733,7 +757,7 @@ fn watcher_lock_precheck(project_path: &Path) -> std::result::Result<u32, CheckR
         now_epoch_secs(),
         WATCHER_HEARTBEAT_STALE_SECS,
     ) {
-        return Err(CheckResult::warn(
+        return CheckResult::warn(
             WATCHER_CATEGORY,
             label,
             format!(
@@ -746,49 +770,32 @@ fn watcher_lock_precheck(project_path: &Path) -> std::result::Result<u32, CheckR
                 project_path.display(),
                 holder.pid
             ),
-        ));
+        );
     }
 
-    Ok(holder.pid)
-}
-
-/// The watcher verdict once the daemon has been asked (#202).
-fn watcher_status_verdict(
-    project_path: &Path,
-    pid: u32,
-    status: std::result::Result<
-        crate::daemon::read_protocol::StatusReport,
-        crate::daemon::control::ControlError,
-    >,
-) -> CheckResult {
-    let label = format!("{}: watcher liveness", project_path.display());
-    let log = project_path.join(".infigraph").join("daemon.log");
-    match status {
-        Ok(report) => watcher_verdict(label, &report, &log),
-        Err(e) => CheckResult::warn(
-            WATCHER_CATEGORY,
-            label,
-            match e {
-                crate::daemon::control::ControlError::NoDaemon => format!(
-                    "watch.lock names live PID {}, but no daemon holds the lock or listens on \
-                     its socket -- log: {}",
-                    pid,
-                    log.display()
-                ),
-                e => format!(
-                    "watcher (PID {}) is alive but did not answer a status query: {e} -- log: {}",
-                    pid,
-                    log.display()
-                ),
-            },
-            format!(
-                "`infigraph daemon-stop` from {} (falls back to the stop sentinel), or \
-                 `infigraph kill {}` if that doesn't clear it",
-                project_path.display(),
-                pid
+    CheckResult::warn(
+        WATCHER_CATEGORY,
+        label,
+        match e {
+            crate::daemon::control::ControlError::NoDaemon => format!(
+                "watch.lock names live PID {}, but no daemon holds the lock or listens on \
+                 its socket -- log: {}",
+                pid,
+                log.display()
             ),
+            e => format!(
+                "watcher (PID {}) is alive but did not answer a status query: {e} -- log: {}",
+                pid,
+                log.display()
+            ),
+        },
+        format!(
+            "`infigraph daemon-stop` from {} (falls back to the stop sentinel), or \
+             `infigraph kill {}` if that doesn't clear it",
+            project_path.display(),
+            pid
         ),
-    }
+    )
 }
 
 /// #202: judge a live daemon by what it says about its own clients, not by
@@ -866,9 +873,9 @@ pub fn check_watchers(ctx: &DoctorContext) -> Vec<CheckResult> {
         .flat_map(|(p, pre)| {
             let watcher = match pre {
                 Err(done) => done,
-                Ok(pid) => watcher_status_verdict(
+                Ok(holder) => watcher_status_verdict(
                     p,
-                    pid,
+                    holder,
                     statuses
                         .next()
                         .expect("one status per project that needed one"),
