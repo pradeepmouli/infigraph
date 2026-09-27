@@ -205,6 +205,7 @@ mod tests {
             None,
             2,
             liveness.clone(),
+            None,
         )
         .unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);

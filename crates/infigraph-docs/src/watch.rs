@@ -159,86 +159,46 @@ fn attach_poll_interval(root: &Path) -> Duration {
     )
 }
 
-/// Drive doc-watching for `root` as part of a merged code+doc watch daemon
-/// (see `infigraph_core::daemon::lifecycle`). Dynamically attaches (starts a
-/// `watch_docs` session) once `.infigraph/docs.kuzu` exists, detaches
-/// (stops it) if that file disappears (e.g. after `clean_docs`) -- eligible
-/// to re-attach once it reappears -- or if `.infigraph/watch.stop.docs` is
-/// found -- NOT eligible to re-attach until docs.kuzu disappears and
-/// reappears, or `resume` is signalled (see below), since that sentinel
-/// represents an explicit stop request, not an index-lifecycle event. Exits
-/// once `shutdown` is observed true. Blocks until then.
+/// Drive doc-watching for `root` as part of the merged code+doc daemon (see
+/// `infigraph_core::daemon::lifecycle`). Attaches a `watch_docs` session once
+/// `.infigraph/docs.kuzu` exists, detaches if that file disappears (e.g.
+/// after `clean_docs`) and re-attaches when it comes back. Exits once
+/// `shutdown` is set. Blocks until then.
 ///
-/// `resume`: an explicit Start/Enable (`DocWatchThread::start()` called
-/// while this loop is already running) has no file-lifecycle event to
-/// react to, so it sets this flag instead -- the one other way (besides
-/// `docs_kuzu` disappearing and reappearing) to clear
-/// `suppressed_until_absent` and let the loop re-attach immediately.
+/// Stopping and starting doc-watching is the daemon's `Control(Docs, ..)`
+/// (#155): stop sets `shutdown` and joins this thread, start spawns a new
+/// one. There is deliberately no stop file: a loop paused by a file is a
+/// state the daemon cannot report.
 pub fn watch_docs_daemon_loop(
     root: &Path,
     debounce_ms: u64,
     shutdown: Arc<AtomicBool>,
-    resume: Arc<AtomicBool>,
 ) -> Result<()> {
     let docs_kuzu = root.join(".infigraph").join("docs.kuzu");
-    let stop_sentinel = root.join(".infigraph").join("watch.stop.docs");
     let poll = attach_poll_interval(root);
-
-    let mut suppressed_until_absent = false;
-
     loop {
         if shutdown.load(Ordering::Relaxed) {
             return Ok(());
         }
-
-        let exists = docs_kuzu.exists();
-
-        if suppressed_until_absent {
-            if !exists || resume.swap(false, Ordering::Relaxed) {
-                suppressed_until_absent = false;
-            }
+        if !docs_kuzu.exists() {
             std::thread::sleep(poll);
             continue;
         }
-        // Consume a stale resume signal that arrived while attached (or
-        // before the first attach) -- it must not linger and immediately
-        // cancel a *future* suppression the moment one starts.
-        resume.store(false, Ordering::Relaxed);
-
-        if !exists {
-            std::thread::sleep(poll);
-            continue;
-        }
-
         let root_owned = root.to_path_buf();
         eprintln!(
             "[doc-watch-daemon] attaching doc watcher for {}",
             root.display()
         );
-        suppressed_until_absent = run_attached_cycle(
-            &docs_kuzu,
-            &stop_sentinel,
-            &shutdown,
-            poll,
-            move |stop_rx| watch_docs(&root_owned, debounce_ms, stop_rx, "doc-watch-daemon"),
-        );
-        if suppressed_until_absent {
-            // A `resume` armed at any point during the attached session just
-            // finished (e.g. a `start()` call while already watching, which
-            // is semantically a no-op) must not be allowed to immediately
-            // cancel the suppression that session's own explicit stop just
-            // requested -- only a resume arriving *after* suppression begins
-            // should count. The store above (before the attach) already
-            // covers the not-yet-attached case; this covers the other one.
-            resume.store(false, Ordering::Relaxed);
-        }
+        run_attached_cycle(&docs_kuzu, &shutdown, poll, move |stop_rx| {
+            watch_docs(&root_owned, debounce_ms, stop_rx, "doc-watch-daemon")
+        });
     }
 }
 
 /// Drives one attach cycle: runs `watch_fn` (normally a `watch_docs` call) on
 /// its own thread and polls, in the CALLING thread, for whichever trips
-/// first: `watch_fn` finishing on its own (unrequested), `shutdown`, the
-/// stop sentinel, or `docs_kuzu` disappearing.
+/// first: `watch_fn` finishing on its own (unrequested), `shutdown`, or
+/// `docs_kuzu` disappearing.
 ///
 /// `handle.is_finished()` is checked before any of the other conditions on
 /// every tick specifically so this function can never block forever: those
@@ -247,17 +207,7 @@ pub fn watch_docs_daemon_loop(
 /// the watcher failed to start), none of them will necessarily ever become
 /// true, and this function must notice that exit directly instead of
 /// waiting on a stop signal nothing will act on.
-///
-/// Returns whether this was a "sticky" detach (explicit stop sentinel,
-/// which suppresses re-attachment until `docs_kuzu` disappears and
-/// reappears) as opposed to any other exit reason.
-fn run_attached_cycle<F>(
-    docs_kuzu: &Path,
-    stop_sentinel: &Path,
-    shutdown: &Arc<AtomicBool>,
-    poll: Duration,
-    watch_fn: F,
-) -> bool
+fn run_attached_cycle<F>(docs_kuzu: &Path, shutdown: &Arc<AtomicBool>, poll: Duration, watch_fn: F)
 where
     F: FnOnce(mpsc::Receiver<()>) -> Result<()> + Send + 'static,
 {
@@ -274,26 +224,19 @@ where
         if handle.is_finished() {
             log_join_result(handle.join());
             eprintln!("[doc-watch-daemon] watch_docs exited unexpectedly, retrying");
-            return false;
+            return;
         }
 
         if shutdown.load(Ordering::Relaxed) {
             let _ = stop_tx.send(());
             log_join_result(handle.join());
-            return false;
-        }
-
-        if stop_sentinel.exists() {
-            let _ = std::fs::remove_file(stop_sentinel);
-            let _ = stop_tx.send(());
-            log_join_result(handle.join());
-            return true;
+            return;
         }
 
         if !docs_kuzu.exists() {
             let _ = stop_tx.send(());
             log_join_result(handle.join());
-            return false;
+            return;
         }
 
         std::thread::sleep(poll);
@@ -429,8 +372,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().canonicalize().unwrap();
         let shutdown = Arc::new(AtomicBool::new(true));
-        let resume = Arc::new(AtomicBool::new(false));
-        watch_docs_daemon_loop(&root, 50, shutdown, resume).unwrap();
+        watch_docs_daemon_loop(&root, 50, shutdown).unwrap();
         // No assertion beyond "returned" -- this test times out (fails) if
         // the loop doesn't check shutdown before ever attaching.
     }
@@ -443,9 +385,7 @@ mod tests {
         std::fs::create_dir_all(root.join(".infigraph")).unwrap();
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_clone = Arc::clone(&shutdown);
-        let resume = Arc::new(AtomicBool::new(false));
-        let handle =
-            std::thread::spawn(move || watch_docs_daemon_loop(&root, 50, shutdown_clone, resume));
+        let handle = std::thread::spawn(move || watch_docs_daemon_loop(&root, 50, shutdown_clone));
 
         std::thread::sleep(Duration::from_millis(150));
         // No docs.kuzu ever appeared -- the loop must still be polling, not
@@ -467,11 +407,9 @@ mod tests {
 
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_clone = Arc::clone(&shutdown);
-        let resume = Arc::new(AtomicBool::new(false));
         let root_clone = root.clone();
-        let handle = std::thread::spawn(move || {
-            watch_docs_daemon_loop(&root_clone, 50, shutdown_clone, resume)
-        });
+        let handle =
+            std::thread::spawn(move || watch_docs_daemon_loop(&root_clone, 50, shutdown_clone));
 
         // Not indexed yet -- give the poll loop a couple of ticks doing
         // nothing, then create a real (empty) doc index so docs.kuzu exists.
@@ -547,238 +485,66 @@ mod tests {
         );
     }
 
+    /// #155 retired the `watch.stop.docs` sentinel: stopping doc-watching is
+    /// the daemon's `Control(Docs, Stop)`. A file left by an older MCP server
+    /// must neither detach the loop nor be consumed by it.
     #[test]
-    fn detaches_on_stop_sentinel_and_does_not_immediately_reattach() {
+    fn a_stray_stop_docs_file_no_longer_detaches_the_loop() {
         let _poll = FastPoll::acquire();
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().canonicalize().unwrap();
         std::fs::create_dir_all(root.join(".infigraph")).unwrap();
         crate::DocIndex::open(&root).unwrap().init().unwrap();
-
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_clone = Arc::clone(&shutdown);
-        let resume = Arc::new(AtomicBool::new(false));
-        let resume_clone = Arc::clone(&resume);
         let root_clone = root.clone();
-        let handle = std::thread::spawn(move || {
-            watch_docs_daemon_loop(&root_clone, 50, shutdown_clone, resume_clone)
-        });
-
-        // Let it attach.
-        std::thread::sleep(Duration::from_millis(100));
-
-        // Request an explicit detach.
-        std::fs::write(root.join(".infigraph").join("watch.stop.docs"), b"").unwrap();
-        std::thread::sleep(Duration::from_millis(150));
-        assert!(
-            !root.join(".infigraph").join("watch.stop.docs").exists(),
-            "sentinel must be consumed (removed) once acted on"
-        );
-
-        // Write a NEW doc while suppressed -- must NOT be indexed, proving
-        // the loop stayed detached instead of immediately re-attaching
-        // (docs.kuzu still exists, so a naive re-poll would re-attach).
-        std::fs::write(root.join("after-stop.md"), "# should not be indexed yet").unwrap();
+        let handle =
+            std::thread::spawn(move || watch_docs_daemon_loop(&root_clone, 50, shutdown_clone));
         std::thread::sleep(Duration::from_millis(300));
-        let chunks_while_suppressed = chunk_count(&root);
-        assert_eq!(
-            chunks_while_suppressed, 0,
-            "must stay detached after an explicit stop until docs.kuzu disappears and reappears"
-        );
-
-        shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
-        handle.join().unwrap().unwrap();
-    }
-
-    /// Regression for the "doc-watcher can't recover from the
-    /// `watch.stop.docs` sentinel" bug: an explicit Start/Enable (modeled
-    /// here directly as setting `resume`, since `DocWatchThread::start()` is
-    /// what sets it in `infigraph-cli`) must be able to un-suppress a loop
-    /// that's parked after an explicit stop, without waiting for
-    /// `docs.kuzu` to disappear and reappear.
-    #[test]
-    fn resume_signal_reattaches_a_suppressed_loop_without_docs_kuzu_cycling() {
-        let _poll = FastPoll::acquire();
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().canonicalize().unwrap();
-        std::fs::create_dir_all(root.join(".infigraph")).unwrap();
-        crate::DocIndex::open(&root).unwrap().init().unwrap();
-
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let shutdown_clone = Arc::clone(&shutdown);
-        let resume = Arc::new(AtomicBool::new(false));
-        let resume_clone = Arc::clone(&resume);
-        let root_clone = root.clone();
-        let handle = std::thread::spawn(move || {
-            watch_docs_daemon_loop(&root_clone, 50, shutdown_clone, resume_clone)
-        });
-
-        // Let it attach, then stop it (same as the sibling test above).
-        std::thread::sleep(Duration::from_millis(100));
         std::fs::write(root.join(".infigraph").join("watch.stop.docs"), b"").unwrap();
-        std::thread::sleep(Duration::from_millis(150));
-
-        // Confirm it's genuinely suppressed before resuming it -- otherwise
-        // this test would pass even if `resume` did nothing.
-        std::fs::write(root.join("while-suppressed.md"), "# not yet").unwrap();
         std::thread::sleep(Duration::from_millis(300));
-        assert_eq!(
-            chunk_count(&root),
-            0,
-            "sanity check: must still be suppressed before signalling resume"
-        );
-
-        // Signal resume -- docs.kuzu never disappeared, so a naive
-        // "disappear and reappear" check alone would never re-attach.
-        resume.store(true, std::sync::atomic::Ordering::Relaxed);
-
-        // A file written before the freshly re-created `notify` watcher has
-        // actually finished registering produces no event (`notify` only
-        // reports changes from the point `watcher.watch()` is (re)called),
-        // and there's no external signal (unlike the initial-attach case)
-        // marking exactly when that registration completes. Rather than
-        // guess a fixed delay, keep re-touching the probe file with new
-        // content until either it gets indexed or the deadline passes --
-        // any one of these writes that lands after registration proves
-        // resume worked, and one that lands before it is simply a miss this
-        // loop recovers from on the next attempt.
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        let mut chunks = 0;
-        let mut attempt = 0;
-        while std::time::Instant::now() < deadline {
-            attempt += 1;
-            std::fs::write(
-                root.join("after-resume.md"),
-                format!("# should be indexed now (attempt {attempt})"),
-            )
-            .unwrap();
-            std::thread::sleep(Duration::from_millis(200));
-            chunks = chunk_count(&root);
-            if chunks > 0 {
-                break;
-            }
-        }
         assert!(
-            chunks > 0,
-            "resume must re-attach the suppressed loop and pick up a post-resume doc change"
+            root.join(".infigraph").join("watch.stop.docs").exists(),
+            "the loop must not consume (or act on) the retired sentinel"
         );
-
-        shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
-        handle.join().unwrap().unwrap();
-    }
-
-    /// Regression for a defect introduced by the fix above: a `resume`
-    /// armed while the loop is attached and running (a `start()`/`enable`
-    /// call arriving when doc-watching is already live -- semantically a
-    /// no-op) must NOT be allowed to silently cancel the *next* explicit
-    /// stop. Before this test's fix, the stale `resume` was consumed the
-    /// instant suppression began (on the suppressed branch's first tick),
-    /// undoing the stop the user just issued.
-    #[test]
-    fn a_resume_armed_while_attached_does_not_cancel_the_next_explicit_stop() {
-        let _poll = FastPoll::acquire();
-        let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().canonicalize().unwrap();
-        std::fs::create_dir_all(root.join(".infigraph")).unwrap();
-        crate::DocIndex::open(&root).unwrap().init().unwrap();
-
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let shutdown_clone = Arc::clone(&shutdown);
-        let resume = Arc::new(AtomicBool::new(false));
-        let resume_clone = Arc::clone(&resume);
-        let root_clone = root.clone();
-        let handle = std::thread::spawn(move || {
-            watch_docs_daemon_loop(&root_clone, 50, shutdown_clone, resume_clone)
-        });
-
-        // Let it attach.
-        std::thread::sleep(Duration::from_millis(100));
-
-        // Arm resume WHILE ATTACHED -- this is the no-op `start()` call the
-        // bug is about. Nothing should observe this until a future
-        // suppression, and even then it must not count.
-        resume.store(true, std::sync::atomic::Ordering::Relaxed);
-        std::thread::sleep(Duration::from_millis(50));
-
-        // Now request an explicit stop, same as the sibling test.
-        std::fs::write(root.join(".infigraph").join("watch.stop.docs"), b"").unwrap();
-        std::thread::sleep(Duration::from_millis(150));
-        assert!(
-            !root.join(".infigraph").join("watch.stop.docs").exists(),
-            "sentinel must still be consumed (removed) once acted on"
-        );
-
-        // The stop must STICK -- a doc written now must not be indexed,
-        // even though `resume` was armed earlier during the attached
-        // session. A single write shortly after a hypothetical re-attach
-        // is not a reliable negative probe: `notify` only reports changes
-        // from the point `watcher.watch()` is (re)called, and a write that
-        // lands too close to that registration can simply be missed --
-        // exactly the same timing sensitivity the sibling
-        // `resume_signal_reattaches_...` test's positive probe works around
-        // with a retry loop. Mirror that here, inverted: keep re-writing
-        // fresh content and re-checking for the whole window, so a bug that
-        // causes even a late, delayed re-attach still gets caught.
-        let deadline = std::time::Instant::now() + Duration::from_secs(3);
-        let mut attempt = 0;
-        while std::time::Instant::now() < deadline {
-            attempt += 1;
-            std::fs::write(
-                root.join("after-stale-resume-stop.md"),
-                format!(
-                    "# must not be indexed -- the stale resume must not have \
-                     cancelled this stop (attempt {attempt})"
-                ),
-            )
-            .unwrap();
-            std::thread::sleep(Duration::from_millis(200));
-            assert_eq!(
-                chunk_count(&root),
-                0,
-                "an explicit stop must not be silently cancelled by a resume signal armed \
-                 earlier during the attached session (a no-op start() call while already \
-                 watching) -- got a non-zero chunk count on attempt {attempt}, meaning the \
-                 loop re-attached and indexed a post-stop write"
-            );
+        // Still attached: a doc edit is still indexed.
+        std::fs::write(root.join("readme.md"), "# hello\n\nsome content").unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while chunk_count(&root) == 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
         }
-
+        assert!(chunk_count(&root) > 0, "the loop must still be attached");
         shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
         handle.join().unwrap().unwrap();
     }
 
     #[test]
-    fn run_attached_cycle_reports_non_sticky_when_watch_fn_exits_unrequested() {
+    fn run_attached_cycle_returns_when_watch_fn_exits_unrequested() {
         // Proves the fix for Finding 1: if the watch invocation returns on
         // its own (e.g. `watch_docs` seeing its internal channel disconnect,
-        // or erroring out before its loop ever starts) -- none of
-        // shutdown/stop_sentinel/docs_kuzu-absent -- `run_attached_cycle`
-        // must still return promptly instead of blocking on a stop signal
-        // the exited thread can no longer act on.
+        // or erroring out before its loop ever starts) -- neither shutdown
+        // nor docs_kuzu-absent -- `run_attached_cycle` must still return
+        // promptly instead of blocking on a stop signal the exited thread
+        // can no longer act on.
         let (result_tx, result_rx) = mpsc::channel();
         std::thread::spawn(move || {
             let tmp = tempfile::tempdir().unwrap();
             let root = tmp.path().canonicalize().unwrap();
             let docs_kuzu = root.join("docs.kuzu");
-            let stop_sentinel = root.join("watch.stop.docs");
             let shutdown = Arc::new(AtomicBool::new(false));
 
-            let sticky = run_attached_cycle(
+            run_attached_cycle(
                 &docs_kuzu,
-                &stop_sentinel,
                 &shutdown,
                 Duration::from_millis(10),
                 |_stop_rx: mpsc::Receiver<()>| -> Result<()> { Ok(()) },
             );
-            let _ = result_tx.send(sticky);
+            let _ = result_tx.send(());
         });
 
-        let sticky = result_rx.recv_timeout(Duration::from_secs(2)).expect(
+        result_rx.recv_timeout(Duration::from_secs(2)).expect(
             "run_attached_cycle must return promptly when watch_fn exits unrequested, \
              not block waiting on a stop condition nothing will ever trip",
-        );
-        assert!(
-            !sticky,
-            "an unrequested watch_fn exit must not be reported as a sticky (explicit-stop) detach"
         );
     }
 }

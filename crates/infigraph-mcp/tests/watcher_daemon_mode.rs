@@ -587,43 +587,9 @@ fn tool_watch_docs_respects_daemon_mode_toggle() {
     std::env::set_var(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND);
 }
 
-/// `tool_stop_watch_docs` must accept a `path` argument (today it only
-/// accepts `watcher_id`, which is meaningless in daemon mode since there is
-/// no in-process DOC_WATCHERS entry to look up) and, when the shared daemon
-/// is alive, write `.infigraph/watch.stop.docs`.
-#[test]
-fn stop_watch_docs_by_path_writes_sentinel_when_daemon_alive() {
-    let tmp = tempfile::tempdir().unwrap();
-    let root = tmp.path().canonicalize().unwrap();
-    let ig = root.join(".infigraph");
-    std::fs::create_dir_all(&ig).unwrap();
-    // No `DocIndex::init()`: `tool_stop_watch_docs` reads only `watch.lock`,
-    // and an init under the default daemon backend (#159) auto-starts a REAL
-    // daemon that takes `watch.lock` before the line below can -- failing
-    // this test on CI (where the backend is unset) and leaking that daemon.
-
-    // Simulate a live daemon: hold watch.lock for the duration of this test.
-    let lock_path = ig.join("watch.lock");
-    let _held = infigraph_core::lockfile::try_acquire(&lock_path, "cli-watch")
-        .unwrap()
-        .expect("free");
-
-    let args = serde_json::json!({ "path": root.to_string_lossy() });
-    let result = infigraph_mcp::tools::docs::tool_stop_watch_docs(&args).unwrap();
-
-    assert!(
-        result.to_lowercase().contains("stop"),
-        "expected a stop-signal message, got: {result}"
-    );
-    assert!(
-        ig.join("watch.stop.docs").exists(),
-        "must write the docs-specific stop sentinel while the shared daemon is alive"
-    );
-}
-
 /// `disable_watch` must respect the daemon-mode toggle the same way
 /// `tool_stop_watch`'s intent does -- but route through the real
-/// `WatchControl` request bridge (Task 11's `submit_watch_control_and_await`)
+/// socket control (`daemon::control::send_control`, #155)
 /// rather than ever touching the in-process WATCHERS map.
 #[test]
 fn tool_disable_watch_respects_daemon_mode_toggle() {

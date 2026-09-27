@@ -190,18 +190,14 @@ fn stop_daemon(project_dir: &Path, daemon: &mut KillOnDrop) {
     // `watch.stop` only stops the watch *thread*, leaving the daemon
     // process itself alive (see `WatchStop`'s doc in
     // infigraph-cli/src/main.rs) -- ending the whole process needs a
-    // `WatchControl { role: Daemon, action: Stop }` request instead, the
+    // `Control { role: Daemon, action: Stop }` instead, the
     // same mechanism `cmd_daemon_stop` uses. Before this fix, every call
     // here silently waited out the full 5s below before falling back to a
     // hard kill, since the process was never going to exit on its own.
-    let staging_dir = project_dir.join(".infigraph").join("requests");
-    let _ = infigraph_core::daemon_protocol::submit_write_request(
-        &staging_dir,
-        &infigraph_core::daemon_protocol::WriteRequest::WatchControl {
-            role: infigraph_core::daemon_protocol::WatchRole::Daemon,
-            action: infigraph_core::daemon_protocol::WatchAction::Stop,
-        },
-        Duration::from_secs(5),
+    let _ = infigraph_core::daemon::control::send_control(
+        project_dir,
+        infigraph_core::daemon_protocol::WatchRole::Daemon,
+        infigraph_core::daemon_protocol::WatchAction::Stop,
     );
     let start = std::time::Instant::now();
     loop {
@@ -1372,17 +1368,13 @@ fn opportunistic_daemon_spawn_writes_a_start_banner_naming_its_pid_to_daemon_log
     // Clean up: `watch.stop` only stops the watch *thread*, leaving the
     // daemon process itself alive (see `WatchStop`'s doc in
     // infigraph-cli/src/main.rs and `watch_action_stop_leaves_the_daemon_process_alive`)
-    // -- ending the whole process needs a `WatchControl { role: Daemon,
+    // -- ending the whole process needs a `Control { role: Daemon,
     // action: Stop }` request, the same mechanism `cmd_daemon_stop` uses.
     // Best-effort: KillPidOnDrop above is the real cleanup guarantee.
-    let staging_dir = project.path().join(".infigraph").join("requests");
-    let _ = infigraph_core::daemon_protocol::submit_write_request(
-        &staging_dir,
-        &infigraph_core::daemon_protocol::WriteRequest::WatchControl {
-            role: infigraph_core::daemon_protocol::WatchRole::Daemon,
-            action: infigraph_core::daemon_protocol::WatchAction::Stop,
-        },
-        Duration::from_secs(10),
+    let _ = infigraph_core::daemon::control::send_control(
+        project.path(),
+        infigraph_core::daemon_protocol::WatchRole::Daemon,
+        infigraph_core::daemon_protocol::WatchAction::Stop,
     );
 }
 
@@ -1448,14 +1440,10 @@ fn plain_index_ignores_no_watch_opt_out_for_the_required_backend_daemon() {
     let lock_path = project.path().join(".infigraph").join("watch.lock");
     if let Some(holder) = infigraph_core::lockfile::read_holder(&lock_path) {
         let _kill_guard = KillPidOnDrop(holder.pid);
-        let staging_dir = project.path().join(".infigraph").join("requests");
-        let _ = infigraph_core::daemon_protocol::submit_write_request(
-            &staging_dir,
-            &infigraph_core::daemon_protocol::WriteRequest::WatchControl {
-                role: infigraph_core::daemon_protocol::WatchRole::Daemon,
-                action: infigraph_core::daemon_protocol::WatchAction::Stop,
-            },
-            Duration::from_secs(10),
+        let _ = infigraph_core::daemon::control::send_control(
+            project.path(),
+            infigraph_core::daemon_protocol::WatchRole::Daemon,
+            infigraph_core::daemon_protocol::WatchAction::Stop,
         );
     }
 }

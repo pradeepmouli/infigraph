@@ -24,7 +24,7 @@ const MAX_RESTARTS: u32 = 3;
 /// Everything a producer needs that is fixed for its whole lifetime. A
 /// struct rather than four more positional parameters because
 /// `run_write_coordinator` both spawns the initial producer and respawns
-/// one per `WatchControl { role: Code, action: Start|Restart }` request, and
+/// one per `Control { role: Code, action: Start|Restart }` request, and
 /// two u64s side by side are exactly the kind of argument pair a respawn
 /// site can silently transpose.
 #[derive(Clone)]

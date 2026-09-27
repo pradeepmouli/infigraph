@@ -19,10 +19,14 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 
-use super::liveness::Liveness;
+use super::control_port::{ControlPort, CONTROL_REPLY_TIMEOUT, NO_CONTROL, SHUTTING_DOWN};
+use super::liveness::{now_secs, Liveness};
 use super::read_endpoint::ReadEndpoint;
 use super::read_endpoint::ReadStream;
-use super::read_protocol::{read_client_frame, write_frame, Attach, ClientFrame, ReadFrame, Store};
+use super::read_protocol::{
+    read_client_frame, write_frame, write_reply, Attach, ClientFrame, ControlFrame, ControlRequest,
+    OpReply, ReadFrame, Store,
+};
 
 /// Resolves the store to serve a request from, at request time.
 ///
@@ -155,11 +159,13 @@ impl ReadService {
         docs: Option<RowSource>,
         workers: usize,
     ) -> Result<Self> {
-        Self::start_serving(root, source, docs, workers, Arc::new(Liveness::new()))
+        Self::start_serving(root, source, docs, workers, Arc::new(Liveness::new()), None)
     }
 
     /// As [`start_with_sources`], counting leases and activity into
-    /// `liveness` -- the daemon's, which outlives any one service (#187).
+    /// `liveness` -- the daemon's, which outlives any one service (#187) --
+    /// and answering `Status`/`Control` through `control` (#155), which the
+    /// coordinator owns for the same reason. `None` refuses both.
     ///
     /// [`start_with_sources`]: ReadService::start_with_sources
     pub fn start_serving(
@@ -168,6 +174,7 @@ impl ReadService {
         docs: Option<RowSource>,
         workers: usize,
         liveness: Arc<Liveness>,
+        control: Option<Arc<ControlPort>>,
     ) -> Result<Self> {
         let leases = Arc::new(LeaseBook::new(liveness));
         let accept_leases = leases.clone();
@@ -188,8 +195,11 @@ impl ReadService {
                 let source = source.clone();
                 let docs = docs.clone();
                 let leases = accept_leases.clone();
+                let control = control.clone();
                 pool.execute(move || {
-                    if let Err(e) = serve_one(&source, docs.as_ref(), &leases, stream) {
+                    if let Err(e) =
+                        serve_one(&source, docs.as_ref(), &leases, control.as_ref(), stream)
+                    {
                         eprintln!("[read] connection failed: {e:#}");
                     }
                 });
@@ -254,16 +264,34 @@ fn serve_one(
     source: &StoreSource,
     docs: Option<&RowSource>,
     leases: &Arc<LeaseBook>,
+    control: Option<&Arc<ControlPort>>,
     mut stream: ReadStream,
 ) -> Result<()> {
-    let req = match read_client_frame(&mut stream)? {
+    let frame = read_client_frame(&mut stream)?;
+    // One place applies the liveness rule for every op (#155): handlers
+    // never touch it themselves.
+    if frame.keeps_alive() == Some(true) {
+        leases.liveness.touch();
+    }
+    let req = match frame {
         ClientFrame::Read(req) => req,
         ClientFrame::Attach(Attach { attach_pid }) => {
             park_lease(leases.clone(), attach_pid, stream);
             return Ok(());
         }
+        ClientFrame::Status(_) => {
+            let reply = match control {
+                Some(port) => OpReply::Ok(port.state.report(&leases.liveness, now_secs())),
+                None => OpReply::Err(NO_CONTROL.to_string()),
+            };
+            write_reply(&mut stream, &reply)?;
+            return Ok(());
+        }
+        ClientFrame::Control(ControlFrame { control: request }) => {
+            spawn_control(control.cloned(), request, stream);
+            return Ok(());
+        }
     };
-    leases.liveness.touch();
 
     // The document store is a separate `Database` with its own lock file and
     // its own wipe-on-open-failure history (#143), reached through a closure
@@ -397,6 +425,41 @@ fn park_lease(leases: Arc<LeaseBook>, pid: u32, mut stream: ReadStream) {
         "[lease] attached pid {pid} ({} held)",
         leases.liveness.leases()
     );
+}
+
+/// Runs one control request on its own thread, never a pool worker: it may
+/// wait up to `CONTROL_REPLY_TIMEOUT` on a busy coordinator, and a few of
+/// those on the pool would stop every read. Never joined by the service --
+/// the coordinator counts it through the port instead (see `InFlightGuard`).
+fn spawn_control(port: Option<Arc<ControlPort>>, request: ControlRequest, mut stream: ReadStream) {
+    let Some(port) = port else {
+        let _ = write_reply::<_, ()>(&mut stream, &OpReply::Err(NO_CONTROL.to_string()));
+        return;
+    };
+    let guard = port.enter();
+    let spawned = std::thread::Builder::new()
+        .name("infigraph-control".into())
+        .spawn(move || {
+            let _guard = guard;
+            let reply = match port.submit(request) {
+                Err(msg) => OpReply::Err(msg),
+                Ok(rx) => match rx.recv_timeout(CONTROL_REPLY_TIMEOUT) {
+                    Ok(Ok(())) => OpReply::Ok(()),
+                    Ok(Err(msg)) => OpReply::Err(msg),
+                    Err(mpsc::RecvTimeoutError::Timeout) => OpReply::Err(format!(
+                        "the coordinator did not answer within {}s",
+                        CONTROL_REPLY_TIMEOUT.as_secs()
+                    )),
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        OpReply::Err(SHUTTING_DOWN.to_string())
+                    }
+                },
+            };
+            let _ = write_reply(&mut stream, &reply);
+        });
+    if let Err(e) = spawned {
+        eprintln!("[control] could not start a control thread: {e}");
+    }
 }
 
 type Job = Box<dyn FnOnce() + Send + 'static>;

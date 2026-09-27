@@ -661,23 +661,14 @@ pub fn tool_stop_watch_docs(args: &Value) -> Result<String> {
     if let Some(path) = args.get("path").and_then(|v| v.as_str()) {
         let root = PathBuf::from(path).canonicalize().context("invalid path")?;
         let root_str = root.to_string_lossy().replace('\\', "/");
-        let lock_path = root.join(".infigraph").join("watch.lock");
-        if !lock_path.exists() {
-            return Ok("No watcher running.".to_string());
-        }
-        let alive = infigraph_core::lockfile::try_acquire(&lock_path, "watch-liveness-probe")
-            .ok()
-            .flatten()
-            .is_none();
-        if !alive {
-            return Ok("No watcher running.".to_string());
-        }
-        let sentinel = root.join(".infigraph").join("watch.stop.docs");
-        std::fs::write(&sentinel, b"")?;
-        return Ok(format!(
-            "Stop signal sent for the doc watcher on {root_str}. It will detach within ~1 second \
-             (the code watcher, if any, is unaffected)."
-        ));
+        use infigraph_core::daemon::control::{send_control, ControlError};
+        return match send_control(&root, WatchRole::Docs, WatchAction::Stop) {
+            Ok(()) => Ok(format!(
+                "Doc watcher on {root_str} stopped (the code watcher, if any, is unaffected)."
+            )),
+            Err(ControlError::NoDaemon) => Ok("No watcher running.".to_string()),
+            Err(e) => Err(e.into()),
+        };
     }
 
     anyhow::bail!("missing 'watcher_id' or 'path'")

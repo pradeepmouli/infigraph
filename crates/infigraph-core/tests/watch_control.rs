@@ -1,5 +1,5 @@
 //! Integration coverage for R2.4.4-R2.4.6 (docs/DESIGN-hardening.md): the
-//! daemon must survive a `WatchControl { role: Code, action: Stop }` request
+//! daemon must survive a `Control { role: Code, action: Stop }` request
 //! without exiting or losing its ability to serve `DaemonKuzu` writes.
 //!
 //! Harness shape (real detached child process, stderr/stdout drained on their
@@ -138,20 +138,11 @@ fn daemon_survives_watch_control_stop_and_keeps_serving_writes() {
 
     let requests_dir = root.join(".infigraph").join("requests");
 
-    // 1. Stop code-watching. Before this task, WatchControl reached
-    //    serve_one_request's placeholder and came back as an error.
-    let stop_reply = submit_write_request(
-        &requests_dir,
-        &WriteRequest::WatchControl {
-            role: WatchRole::Code,
-            action: WatchAction::Stop,
-        },
-        REPLY_TIMEOUT,
-    )
-    .expect("daemon never replied to WatchControl { Code, Stop }");
-    assert!(
-        matches!(stop_reply, WriteResult::Ok { .. }),
-        "WatchControl {{ Code, Stop }} must succeed, got {stop_reply:?}"
+    // 1. Stop code-watching, over the daemon's socket (#155).
+    assert_eq!(
+        infigraph_core::daemon::control::send_control(&root, WatchRole::Code, WatchAction::Stop),
+        Ok(()),
+        "Control {{ Code, Stop }} must succeed"
     );
 
     // 2. The whole premise of R2.4.4: stopping *watching* must not stop the
@@ -183,18 +174,10 @@ fn daemon_survives_watch_control_stop_and_keeps_serving_writes() {
     );
 
     // 5. Restarting code-watching brings reindexing back.
-    let start_reply = submit_write_request(
-        &requests_dir,
-        &WriteRequest::WatchControl {
-            role: WatchRole::Code,
-            action: WatchAction::Start,
-        },
-        REPLY_TIMEOUT,
-    )
-    .expect("daemon never replied to WatchControl { Code, Start }");
-    assert!(
-        matches!(start_reply, WriteResult::Ok { .. }),
-        "WatchControl {{ Code, Start }} must succeed, got {start_reply:?}"
+    assert_eq!(
+        infigraph_core::daemon::control::send_control(&root, WatchRole::Code, WatchAction::Start),
+        Ok(()),
+        "Control {{ Code, Start }} must succeed"
     );
 
     // The freshly-spawned producer registers its notify watcher
@@ -211,7 +194,7 @@ fn daemon_survives_watch_control_stop_and_keeps_serving_writes() {
     let _ = child.kill();
     let _ = child.wait();
     resumed.expect(
-        "after WatchControl { Code, Start } the daemon must reindex file changes again \
+        "after Control { Code, Start } the daemon must reindex file changes again \
          (timed out waiting for a '[watch] modified:' line on its stdout)",
     );
 }

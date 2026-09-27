@@ -741,57 +741,88 @@ fn check_one_watcher(project_path: &Path) -> CheckResult {
         );
     }
 
-    if !project_has_live_mcp_instance(project_path) {
-        return CheckResult::warn(
+    let log = project_path.join(".infigraph").join("daemon.log");
+    match crate::daemon::control::query_status(project_path) {
+        Ok(report) => watcher_verdict(label, &report, &log),
+        Err(e) => CheckResult::warn(
             WATCHER_CATEGORY,
             label,
+            match e {
+                crate::daemon::control::ControlError::NoDaemon => format!(
+                    "watch.lock names live PID {}, but no daemon holds the lock or listens on \
+                     its socket -- log: {}",
+                    holder.pid,
+                    log.display()
+                ),
+                e => format!(
+                    "watcher (PID {}) is alive but did not answer a status query: {e} -- log: {}",
+                    holder.pid,
+                    log.display()
+                ),
+            },
             format!(
-                "watcher (PID {}) is alive and healthy, but no MCP server instance is \
-                 currently serving this project -- log: {}",
-                holder.pid,
-                project_path.join(".infigraph").join("daemon.log").display()
+                "`infigraph daemon-stop` from {} (falls back to the stop sentinel), or \
+                 `infigraph kill {}` if that doesn't clear it",
+                project_path.display(),
+                holder.pid
             ),
-            format!(
-                "likely left running from a closed MCP session -- if you're not also using it \
-                 from a standalone CLI session, run `infigraph watch-stop` from {} to stop it; \
-                 a future MCP session will restart it and catch up automatically",
-                project_path.display()
-            ),
-        );
+        ),
     }
+}
 
-    CheckResult::pass(
+/// #202: judge a live daemon by what it says about its own clients, not by
+/// the MCP instance registry (which misses `path=` reads, group tools and
+/// the CLI). Rows are checked top to bottom.
+fn watcher_verdict(
+    label: String,
+    r: &crate::daemon::read_protocol::StatusReport,
+    log: &Path,
+) -> CheckResult {
+    let log = log.display();
+    let pass = |msg: String| {
+        CheckResult::pass(
+            WATCHER_CATEGORY,
+            label.clone(),
+            format!("{msg} -- log: {log}"),
+        )
+    };
+    if r.leases > 0 {
+        return pass(format!(
+            "daemon (PID {}) has {} clients leasing",
+            r.pid, r.leases
+        ));
+    }
+    if r.grace_secs == 0 {
+        return pass(format!(
+            "daemon (PID {}) has no clients; idle exit disabled",
+            r.pid
+        ));
+    }
+    if r.work_in_flight {
+        return pass(format!(
+            "daemon (PID {}) is idle, exit deferred by in-flight work",
+            r.pid
+        ));
+    }
+    let idle = r.idle_secs.unwrap_or(0);
+    let due = r.grace_secs + r.idle_check_secs;
+    if idle < due {
+        return pass(format!(
+            "daemon (PID {}) idle {idle}s, exits in ~{}s",
+            r.pid,
+            r.grace_secs.saturating_sub(idle)
+        ));
+    }
+    CheckResult::warn(
         WATCHER_CATEGORY,
         label,
         format!(
-            "watcher (PID {}) alive with fresh heartbeat -- log: {}",
-            holder.pid,
-            project_path.join(".infigraph").join("daemon.log").display()
+            "daemon (PID {}) has had no clients for {idle}s and should have exited {}s ago",
+            r.pid,
+            idle - due
         ),
+        format!("check {log} for why the idle exit did not run; `infigraph daemon-stop` stops it"),
     )
-}
-
-/// Whether any live MCP server instance (per the instance registry --
-/// `instances::list_instances`/`classify_instances`) is currently serving
-/// `project_path`. Used to distinguish a watch daemon that's still useful
-/// (some MCP server will query it) from one left spinning for a project no
-/// MCP session is using anymore. `own_pid` is passed as `0` (never a real
-/// PID) since doctor is not itself an MCP instance and must not exclude a
-/// genuine entry.
-fn project_has_live_mcp_instance(project_path: &Path) -> bool {
-    let target = project_path
-        .canonicalize()
-        .unwrap_or_else(|_| project_path.to_path_buf());
-    let entries = instances::list_instances();
-    let classified =
-        instances::classify_instances(&entries, 0, instances::current_process_start_time);
-    classified.iter().any(|(_, info, status)| {
-        *status == instances::InstanceStatus::LivePeer
-            && Path::new(&info.project_path)
-                .canonicalize()
-                .map(|p| p == target)
-                .unwrap_or(false)
-    })
 }
 
 pub fn check_watchers(ctx: &DoctorContext) -> Vec<CheckResult> {
@@ -1598,5 +1629,65 @@ mod sidecar_anchor_tests {
         );
 
         assert!(check_one_sidecar(dir.path(), "docs_embeddings.bin").is_none());
+    }
+}
+
+#[cfg(test)]
+mod watcher_verdict_tests {
+    use super::*;
+    use crate::daemon::read_protocol::{RoleState, StatusReport};
+
+    fn report(leases: usize, idle: Option<u64>, grace: u64, busy: bool) -> StatusReport {
+        StatusReport {
+            pid: 42,
+            build: "b".into(),
+            leases,
+            idle_secs: idle,
+            grace_secs: grace,
+            idle_check_secs: 60,
+            work_in_flight: busy,
+            code: RoleState::Running,
+            docs: RoleState::NotOwned,
+        }
+    }
+
+    fn is_pass(r: &CheckResult) -> bool {
+        matches!(r.status, CheckStatus::Pass)
+    }
+
+    #[test]
+    fn watcher_verdicts_follow_202() {
+        let log = Path::new("/p/.infigraph/daemon.log");
+        let v = |r| watcher_verdict("w".into(), &r, log);
+        let leased = v(report(2, None, 1800, false));
+        assert!(
+            is_pass(&leased) && leased.message.contains("2 clients leasing"),
+            "{}",
+            leased.message
+        );
+        let never = v(report(0, Some(99_999), 0, false));
+        assert!(
+            is_pass(&never) && never.message.contains("idle exit disabled"),
+            "{}",
+            never.message
+        );
+        let deferred = v(report(0, Some(99_999), 1800, true));
+        assert!(
+            is_pass(&deferred) && deferred.message.contains("deferred by in-flight work"),
+            "{}",
+            deferred.message
+        );
+        let waiting = v(report(0, Some(100), 1800, false));
+        assert!(
+            is_pass(&waiting) && waiting.message.contains("exits in ~1700s"),
+            "{}",
+            waiting.message
+        );
+        let overdue = v(report(0, Some(1800 + 60 + 5), 1800, false));
+        assert!(
+            !is_pass(&overdue) && overdue.message.contains("should have exited"),
+            "{}",
+            overdue.message
+        );
     }
 }

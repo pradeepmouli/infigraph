@@ -125,39 +125,11 @@ pub enum WriteRequest {
     /// -- see `docs/superpowers/specs/2026-08-04-daemon-routed-full-reindex-design.md`.
     /// No fields: it always means "rebuild everything."
     FullReindex,
-    /// Control a watch-activity's lifecycle (code-watching, doc-watching,
-    /// or the whole daemon process) from outside the process that owns it.
-    /// See docs/superpowers/specs/2026-08-21-daemon-watch-command-split-design.md
-    /// "Crossing the process boundary: WatchControl requests bridge into
-    /// the token hierarchy" -- CancellationToken is in-process-only, this
-    /// is how an external CLI invocation or MCP tool call reaches an
-    /// already-running daemon's tokens.
-    WatchControl {
-        role: WatchRole,
-        action: WatchAction,
-    },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub enum WatchRole {
-    Code,
-    Docs,
-    /// Full-process stop/restart -- a per-role alternative to the
-    /// undecorated `watch.stop` sentinel, which remains the mechanism the
-    /// legacy `watch-stop` CLI alias and `worktree_commands.rs` use (see
-    /// docs/superpowers/specs/2026-08-21-daemon-watch-command-split-design.md,
-    /// "Crossing the process boundary").
-    Daemon,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub enum WatchAction {
-    Start,
-    Stop,
-    Enable,
-    Disable,
-    Restart,
-}
+/// Moved to the read protocol with #155; re-exported so existing paths keep
+/// working.
+pub use crate::daemon::read_protocol::{WatchAction, WatchRole};
 
 /// Where IngestStructured's data comes from. `Inline` carries no data
 /// itself -- the actual array lives in a sibling `.data.json` file next to
@@ -698,34 +670,6 @@ mod tests {
         let back: WriteResult = serde_json::from_str(&json).unwrap();
         assert_eq!(res, back);
     }
-
-    #[test]
-    fn watch_control_request_round_trips_through_json() {
-        let req = WriteRequest::WatchControl {
-            role: WatchRole::Code,
-            action: WatchAction::Stop,
-        };
-        let json = serde_json::to_string(&req).unwrap();
-        let parsed: WriteRequest = serde_json::from_str(&json).unwrap();
-        assert_eq!(req, parsed);
-    }
-
-    #[test]
-    fn watch_control_covers_all_role_action_combinations_without_panicking_on_serialize() {
-        for role in [WatchRole::Code, WatchRole::Docs, WatchRole::Daemon] {
-            for action in [
-                WatchAction::Start,
-                WatchAction::Stop,
-                WatchAction::Enable,
-                WatchAction::Disable,
-                WatchAction::Restart,
-            ] {
-                let req = WriteRequest::WatchControl { role, action };
-                let json = serde_json::to_string(&req).unwrap();
-                let _: WriteRequest = serde_json::from_str(&json).unwrap();
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -1173,9 +1117,6 @@ pub fn serve_one_request(infigraph: &Infigraph, request_path: &Path) -> anyhow::
             }
             WriteRequest::FullReindex => WriteResult::Err {
                 message: "FullReindex not yet implemented".to_string(),
-            },
-            WriteRequest::WatchControl { .. } => WriteResult::Err {
-                message: "WatchControl not yet implemented".to_string(),
             },
         },
         Err(e) => WriteResult::Err {

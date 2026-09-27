@@ -600,27 +600,11 @@ pub(crate) fn cmd_daemon(root: &Path, debounce: u64) -> Result<()> {
         doc_watch.lock().unwrap().start();
     }
 
-    // Lets `WatchControl { role: Docs, .. }` requests reach this thread from
-    // the coordinator, which lives in infigraph-core and knows nothing about
-    // doc-watching. Doc-watching deliberately stays on its existing
-    // thread + `Arc<AtomicBool>` shape here: only its external control
-    // surface is unified in this pass, not its internals (those live in
-    // infigraph-docs).
-    let doc_watch_for_control = std::sync::Arc::clone(&doc_watch);
-    let docs_control: std::sync::Arc<infigraph_core::daemon::DocsControl> =
-        std::sync::Arc::new(move |action| {
-            use infigraph_core::daemon_protocol::WatchAction;
-            let mut doc_watch = doc_watch_for_control.lock().unwrap();
-            match action {
-                WatchAction::Stop | WatchAction::Disable => doc_watch.stop(),
-                WatchAction::Start | WatchAction::Enable => doc_watch.start(),
-                WatchAction::Restart => {
-                    doc_watch.stop();
-                    doc_watch.start();
-                }
-            }
-            Ok(())
-        });
+    // Lets `Control { role: Docs, .. }` reach this thread from the
+    // coordinator, which lives in infigraph-core and knows nothing about
+    // doc-watching (#155).
+    let docs_control: std::sync::Arc<dyn infigraph_core::daemon::DocsHandle> =
+        std::sync::Arc::new(DocWatchHandle(std::sync::Arc::clone(&doc_watch)));
 
     let on_full_reindex: std::sync::Arc<infigraph_core::daemon::FullReindexCallback> =
         std::sync::Arc::new(
@@ -803,55 +787,72 @@ pub(crate) fn cmd_daemon(root: &Path, debounce: u64) -> Result<()> {
     Ok(())
 }
 
-/// The daemon's doc-watch thread and the shutdown/resume flags it polls,
-/// bundled so a `WatchControl { role: Docs, .. }` request can stop and
-/// restart it. Each start gets *fresh* flags: `watch_docs_daemon_loop` only
-/// ever reads them, and reused ones would still be latched from the last
-/// stop/resume.
+/// The daemon's doc-watch thread and the shutdown flag it polls, bundled so
+/// a `Control { role: Docs, .. }` request can stop and restart it. Each start
+/// gets a *fresh* flag: `watch_docs_daemon_loop` only ever reads it, and a
+/// reused one would still be latched from the last stop.
 struct DocWatchThread {
     root: std::path::PathBuf,
     debounce: u64,
     shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    resume: std::sync::Arc<std::sync::atomic::AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
+/// `cmd_daemon`'s doc-watch thread as the coordinator's `DocsHandle`.
+struct DocWatchHandle(std::sync::Arc<std::sync::Mutex<DocWatchThread>>);
+
+impl infigraph_core::daemon::DocsHandle for DocWatchHandle {
+    fn control(
+        &self,
+        action: infigraph_core::daemon_protocol::WatchAction,
+    ) -> std::result::Result<(), String> {
+        use infigraph_core::daemon_protocol::WatchAction;
+        let mut doc_watch = self.0.lock().unwrap();
+        match action {
+            WatchAction::Stop | WatchAction::Disable => doc_watch.stop(),
+            WatchAction::Start | WatchAction::Enable => doc_watch.start(),
+            WatchAction::Restart => {
+                doc_watch.stop();
+                doc_watch.start();
+            }
+        }
+        Ok(())
+    }
+
+    fn is_running(&self) -> bool {
+        self.0.lock().unwrap().is_running()
+    }
+}
+
 impl DocWatchThread {
+    fn is_running(&self) -> bool {
+        self.handle.as_ref().is_some_and(|h| !h.is_finished())
+    }
+
     fn new(root: std::path::PathBuf, debounce: u64) -> Self {
         DocWatchThread {
             root,
             debounce,
             shutdown: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            resume: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             handle: None,
         }
     }
 
     fn start(&mut self) {
-        // A self-terminated loop (panic; mirrors `CodeWatch::start()`'s
-        // `is_finished()` guard, commit c9dae4b) must be respawned rather
-        // than silently no-op'd forever.
-        if self.handle.as_ref().is_some_and(|h| !h.is_finished()) {
-            // Still running -- but it may be alive-and-suppressed (parked
-            // after an explicit stop via `.infigraph/watch.stop.docs`,
-            // which `watch_docs_daemon_loop` consumes without exiting the
-            // thread). An explicit Start/Enable must be able to un-suppress
-            // that, not silently no-op just because a thread happens to
-            // exist -- see `resume`'s doc comment on `watch_docs_daemon_loop`.
-            self.resume
-                .store(true, std::sync::atomic::Ordering::Relaxed);
+        // Running already: nothing to do -- there is no paused-but-alive
+        // state any more (#155 removed the stop file that created one).
+        if self.is_running() {
             return;
         }
+        // A self-terminated loop (panic) is respawned, mirroring
+        // `CodeWatch::start()`'s `is_finished()` guard (c9dae4b).
         self.handle.take();
         self.shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        self.resume = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let root = self.root.clone();
         let debounce = self.debounce;
         let shutdown = std::sync::Arc::clone(&self.shutdown);
-        let resume = std::sync::Arc::clone(&self.resume);
         self.handle = Some(std::thread::spawn(move || {
-            if let Err(e) =
-                infigraph_docs::watch::watch_docs_daemon_loop(&root, debounce, shutdown, resume)
+            if let Err(e) = infigraph_docs::watch::watch_docs_daemon_loop(&root, debounce, shutdown)
             {
                 eprintln!("[doc-watch-daemon] error: {e}");
             }
@@ -868,7 +869,6 @@ impl DocWatchThread {
 }
 
 pub(crate) fn cmd_watch_stop(root: &Path) -> Result<()> {
-    let sentinel = root.join(".infigraph").join("watch.stop");
     let lock_path = root.join(".infigraph").join("watch.lock");
 
     if !infigraph_core::daemon::lifecycle::daemon_is_alive(&lock_path) {
@@ -876,47 +876,71 @@ pub(crate) fn cmd_watch_stop(root: &Path) -> Result<()> {
         return Ok(());
     }
 
-    std::fs::write(&sentinel, b"")?;
+    stop_via_sentinel(root)?;
     println!("Stop signal sent. Watcher will exit within ~1 second.");
     Ok(())
 }
 
-pub(crate) fn cmd_watch_status(root: &Path) -> Result<()> {
-    let lock_path = root.join(".infigraph").join("watch.lock");
-
-    if infigraph_core::daemon::lifecycle::daemon_is_alive(&lock_path) {
-        println!("Watcher is running.");
-    } else {
-        println!("No watcher running.");
-    }
+/// The out-of-band stop (#155): works when the daemon cannot take a control
+/// frame, because the coordinator checks for this file on its own.
+pub(crate) fn stop_via_sentinel(root: &Path) -> Result<()> {
+    std::fs::write(root.join(".infigraph").join("watch.stop"), b"")?;
     Ok(())
 }
 
-/// How long the CLI waits for a running daemon to reply to a `WatchControl`
-/// request before giving up. The request/reply protocol's round trip is
-/// normally sub-second; this is generous headroom for a daemon that's
-/// mid-write on something else when the request lands.
-const WATCH_CONTROL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+pub(crate) enum DaemonStop {
+    Stopped,
+    NotRunning,
+    /// The daemon could not take the request; the sentinel was written.
+    ViaSentinel(String),
+}
+
+/// Ask a daemon to stop over its socket, falling back to the `watch.stop`
+/// sentinel whenever it cannot act on the request (#155): an incompatible
+/// build, no answer, or a refusal -- a wedged coordinator refuses rather
+/// than hangs (a full queue, or its own reply timeout), and that is the
+/// case the sentinel exists for. A daemon already shutting down counts as
+/// stopped.
+pub(crate) fn request_daemon_stop(root: &Path) -> Result<DaemonStop> {
+    use infigraph_core::daemon::control::{send_control, ControlError};
+    use infigraph_core::daemon::control_port::SHUTTING_DOWN;
+    match send_control(root, WatchRole::Daemon, WatchAction::Stop) {
+        Ok(()) => Ok(DaemonStop::Stopped),
+        Err(ControlError::Refused(m)) if m == SHUTTING_DOWN => Ok(DaemonStop::Stopped),
+        Err(ControlError::NoDaemon) => Ok(DaemonStop::NotRunning),
+        Err(e) => {
+            stop_via_sentinel(root)?;
+            Ok(DaemonStop::ViaSentinel(e.to_string()))
+        }
+    }
+}
+
+pub(crate) fn cmd_watch_status(root: &Path) -> Result<()> {
+    let result = infigraph_core::daemon::control::query_status(root);
+    println!(
+        "{}",
+        infigraph_core::daemon::control::describe_status(root, &result)
+    );
+    Ok(())
+}
 
 pub(crate) fn cmd_daemon_stop(root: &Path) -> Result<()> {
-    // Without this check, submitting into an unattended staging dir just
-    // sits there until WATCH_CONTROL_TIMEOUT and then reports an opaque
-    // protocol error -- an everyday case (no daemon running yet), not a
-    // misconfiguration. Mirrors cmd_watch_stop's existing early-exit and
-    // index.rs's FullReindex path (see its own comment re: incident #100).
+    // The everyday "no daemon running yet" case answers at once rather than
+    // going through the control client's startup grace.
     let lock_path = root.join(".infigraph").join("watch.lock");
     if !infigraph_core::daemon::lifecycle::daemon_is_alive(&lock_path) {
         println!("No daemon running.");
         return Ok(());
     }
-    let registry = bundled_registry()?;
-    let prism = Infigraph::open(root, registry)?;
-    prism.submit_watch_control_and_await(
-        WatchRole::Daemon,
-        WatchAction::Stop,
-        WATCH_CONTROL_TIMEOUT,
-    )?;
-    println!("Daemon stopped.");
+    match request_daemon_stop(root)? {
+        DaemonStop::Stopped => println!("Daemon stopped."),
+        DaemonStop::NotRunning => println!("No daemon running."),
+        DaemonStop::ViaSentinel(why) => {
+            println!(
+                "Daemon did not take the stop request ({why}); wrote the stop sentinel instead."
+            )
+        }
+    }
     Ok(())
 }
 
@@ -928,18 +952,11 @@ pub(crate) fn cmd_daemon_restart(root: &Path) -> Result<()> {
         // Read the holder BEFORE asking it to stop: the lock payload naming
         // it is gone by the time we need it to confirm the exit.
         let holder_pid = infigraph_core::lockfile::read_holder(&lock_path).map(|h| h.pid);
-        let registry = bundled_registry()?;
-        let prism = Infigraph::open(root, registry)?;
-        // `WatchRole::Daemon`'s `Restart` action (per Task 10's
-        // route_or_serve_request arm) only cancels daemon_token -- the
-        // process exiting means there's nothing left to ask to "start
-        // itself" from inside. Re-spawn from the CLI side instead,
-        // mirroring `ensure_daemon_running`'s existing pattern.
-        prism.submit_watch_control_and_await(
-            WatchRole::Daemon,
-            WatchAction::Stop,
-            WATCH_CONTROL_TIMEOUT,
-        )?;
+        // A daemon can only stop itself (`Control { role: Daemon }` has no
+        // real Restart), so stop it and re-spawn from the CLI side, mirroring
+        // `ensure_daemon_running`. Whatever the stop's outcome, the
+        // confirmation below decides whether the old daemon actually went.
+        request_daemon_stop(root)?;
 
         // Wait for the PROCESS to exit, not merely for the lock to look
         // free. A daemon releases `watch.lock` while it is still draining
@@ -1026,10 +1043,8 @@ pub(crate) fn cmd_watch_control(
         return Ok(());
     }
 
-    let registry = bundled_registry()?;
-    let prism = Infigraph::open(root, registry)?;
-    prism.submit_watch_control_and_await(role, watch_action, WATCH_CONTROL_TIMEOUT)?;
-    println!("{role:?}: {watch_action:?} sent.");
+    infigraph_core::daemon::control::send_control(root, role, watch_action)?;
+    println!("{role:?}: {watch_action:?} done.");
     Ok(())
 }
 
@@ -1554,11 +1569,25 @@ pub(crate) fn cmd_ps(root: &Path) -> Result<()> {
         return Ok(());
     }
 
+    // #155: ask every live daemon how it is doing, all at once.
+    let daemon_rows: Vec<(usize, std::path::PathBuf)> = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r.alive && r.evidence.iter().any(|e| e.contains("watch.lock")))
+        .filter_map(|(i, r)| r.projects.first().map(|p| (i, std::path::PathBuf::from(p))))
+        .collect();
+    let roots: Vec<_> = daemon_rows.iter().map(|(_, p)| p.clone()).collect();
+    let statuses: std::collections::HashMap<usize, _> = daemon_rows
+        .iter()
+        .map(|(i, _)| *i)
+        .zip(infigraph_core::daemon::control::query_status_many(&roots))
+        .collect();
+
     println!(
-        "{:<8} {:<6} {:<10} {:<10} {:<28} PROJECT / EVIDENCE",
-        "PID", "STATE", "UPTIME", "RSS", "ROLE"
+        "{:<8} {:<6} {:<10} {:<10} {:<28} {:<12} {:<7} {:<9} {:<9} PROJECT / EVIDENCE",
+        "PID", "STATE", "UPTIME", "RSS", "ROLE", "LEASES", "IDLE", "CODE", "DOCS"
     );
-    for r in &rows {
+    for (i, r) in rows.iter().enumerate() {
         let state = if r.alive { "live" } else { "dead" };
         let uptime = r
             .uptime_secs
@@ -1568,13 +1597,18 @@ pub(crate) fn cmd_ps(root: &Path) -> Result<()> {
             .rss_bytes
             .map(|b| format!("{} MB", b / (1024 * 1024)))
             .unwrap_or_else(|| "-".to_string());
+        let [leases, idle, code, docs] = ps_status_cells(statuses.get(&i));
         println!(
-            "{:<8} {:<6} {:<10} {:<10} {:<28} {} [{}]",
+            "{:<8} {:<6} {:<10} {:<10} {:<28} {:<12} {:<7} {:<9} {:<9} {} [{}]",
             r.pid,
             state,
             uptime,
             rss,
             r.roles.join(","),
+            leases,
+            idle,
+            code,
+            docs,
             r.projects.join(", "),
             r.evidence.join(",")
         );
@@ -1585,6 +1619,39 @@ pub(crate) fn cmd_ps(root: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// `ps`'s LEASES, IDLE, CODE and DOCS cells for one row: `None` for a row
+/// that is not a live daemon.
+fn ps_status_cells(
+    status: Option<
+        &std::result::Result<
+            infigraph_core::daemon::read_protocol::StatusReport,
+            infigraph_core::daemon::control::ControlError,
+        >,
+    >,
+) -> [String; 4] {
+    use infigraph_core::daemon::control::ControlError;
+    use infigraph_core::daemon::read_protocol::RoleState;
+    let role = |s: RoleState| match s {
+        RoleState::NotOwned => "-".to_string(),
+        s => s.to_string(),
+    };
+    match status {
+        None => ["-".into(), "-".into(), "-".into(), "-".into()],
+        Some(Ok(r)) => [
+            r.leases.to_string(),
+            r.idle_secs
+                .map(|s| format!("{s}s"))
+                .unwrap_or_else(|| "-".into()),
+            role(r.code),
+            role(r.docs),
+        ],
+        Some(Err(ControlError::Incompatible)) => {
+            ["incompatible".into(), "".into(), "".into(), "".into()]
+        }
+        Some(Err(_)) => ["no reply".into(), "".into(), "".into(), "".into()],
+    }
 }
 
 /// `infigraph kill` (R2.2.4): guarded terminate, audited (R6.3).
@@ -1891,6 +1958,49 @@ mod daemon_liveness_guard_tests {
             doc["watch"]["enabled"].as_bool(),
             Some(false),
             "expected a persisted watch.enabled = false, got: {contents}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod ps_status_tests {
+    use super::ps_status_cells;
+    use infigraph_core::daemon::control::ControlError;
+    use infigraph_core::daemon::read_protocol::{RoleState, StatusReport};
+
+    fn report() -> StatusReport {
+        StatusReport {
+            pid: 1,
+            build: "b".into(),
+            leases: 3,
+            idle_secs: Some(42),
+            grace_secs: 1800,
+            idle_check_secs: 60,
+            work_in_flight: false,
+            code: RoleState::Running,
+            docs: RoleState::NotOwned,
+        }
+    }
+
+    #[test]
+    fn ps_cells_cover_every_status_outcome() {
+        assert_eq!(ps_status_cells(None), ["-", "-", "-", "-"]);
+        assert_eq!(
+            ps_status_cells(Some(&Ok(report()))),
+            ["3", "42s", "running", "-"]
+        );
+        let leased = StatusReport {
+            idle_secs: None,
+            ..report()
+        };
+        assert_eq!(ps_status_cells(Some(&Ok(leased)))[1], "-");
+        assert_eq!(
+            ps_status_cells(Some(&Err(ControlError::Incompatible)))[0],
+            "incompatible"
+        );
+        assert_eq!(
+            ps_status_cells(Some(&Err(ControlError::Unresponsive)))[0],
+            "no reply"
         );
     }
 }
