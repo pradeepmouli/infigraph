@@ -90,6 +90,10 @@ crate::settings! {
         // How often the coordinator evaluates it. Coarse: the check is
         // cheap, but an exit an extra minute late costs nothing.
         check_secs: u64 = 60,
+        // Client side: how long a process keeps a lease it is not using
+        // before releasing it (`daemon::lease`), so an idle session stops
+        // keeping its daemon alive. 0 never releases.
+        client_release_secs: u64 = 1800,
     }
 }
 

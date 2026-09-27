@@ -888,3 +888,123 @@ fn a_service_without_a_port_refuses_status_and_control() {
     ));
     svc.shutdown();
 }
+
+// ── client-side idle release ─────────────────────────────────────────
+//
+// A client lets go of a lease it has not used for
+// `daemon_idle.client_release_secs`, so a session that sits idle stops
+// keeping its daemon alive. The next use leases again (and, through
+// `ensure_daemon_for_routed_access`, respawns a daemon that has since
+// exited). Unix only: releasing needs the socket's shutdown handle.
+
+#[cfg(unix)]
+fn start_with_short_release(
+    release: std::time::Duration,
+) -> (tempfile::TempDir, Arc<Liveness>, ReadService) {
+    let (project, source) = indexed_project_and_source();
+    lease::set_release_after_for_test(project.path(), release);
+    let liveness = Arc::new(Liveness::new());
+    let svc = ReadService::start_serving(project.path(), source, None, 2, liveness.clone(), None)
+        .unwrap();
+    (project, liveness, svc)
+}
+
+#[cfg(unix)]
+#[test]
+fn an_idle_lease_is_released_and_the_next_use_leases_again() {
+    let (project, liveness, _svc) = start_with_short_release(ms(300));
+    lease::hold(project.path());
+    assert!(wait_for(|| liveness.leases() == 1));
+    assert!(
+        wait_for(|| liveness.leases() == 0),
+        "an unused lease must be released"
+    );
+    assert!(wait_for(|| !lease::is_held(project.path())));
+    std::thread::sleep(ms(400));
+    assert_eq!(
+        liveness.leases(),
+        0,
+        "a released lease must not re-attach on its own"
+    );
+    let _use = lease::in_use(project.path());
+    assert!(
+        wait_for(|| liveness.leases() == 1),
+        "the next use must lease again"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_routed_read_leases_again_after_a_release() {
+    let (project, liveness, _svc) = start_with_short_release(ms(300));
+    lease::hold(project.path());
+    assert!(wait_for(|| liveness.leases() == 1));
+    assert!(wait_for(|| liveness.leases() == 0));
+    let rows = infigraph_core::graph::query_exec::QueryExec::query_rows(
+        &infigraph_core::graph::remote_exec::RemoteExec::new(project.path()),
+        "MATCH (f:File) RETURN f.id",
+    )
+    .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert!(
+        wait_for(|| liveness.leases() == 1),
+        "a routed read is a use, and must lease again"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_lease_in_use_is_not_released() {
+    let (project, liveness, _svc) = start_with_short_release(ms(300));
+    let busy = lease::in_use(project.path());
+    assert!(wait_for(|| liveness.leases() == 1));
+    std::thread::sleep(ms(1200));
+    assert_eq!(
+        liveness.leases(),
+        1,
+        "a use still in progress must keep the lease"
+    );
+    drop(busy);
+    assert!(wait_for(|| liveness.leases() == 0));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_pinned_lease_is_not_released() {
+    let (project, liveness, _svc) = start_with_short_release(ms(300));
+    lease::pin(project.path());
+    lease::hold(project.path());
+    assert!(wait_for(|| liveness.leases() == 1));
+    std::thread::sleep(ms(1200));
+    assert_eq!(liveness.leases(), 1, "a pinned lease must be kept");
+    lease::unpin(project.path());
+    assert!(wait_for(|| liveness.leases() == 0));
+}
+
+#[cfg(unix)]
+static VETOED: std::sync::Mutex<Vec<std::path::PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(unix)]
+fn veto_listed_roots(root: &Path) -> bool {
+    VETOED.lock().unwrap().iter().any(|r| r == root)
+}
+
+#[cfg(unix)]
+#[test]
+fn the_release_guard_can_keep_a_lease() {
+    let (project, liveness, _svc) = start_with_short_release(ms(300));
+    let root = project.path().canonicalize().unwrap();
+    VETOED.lock().unwrap().push(root.clone());
+    lease::set_release_guard(veto_listed_roots);
+    lease::hold(project.path());
+    assert!(wait_for(|| liveness.leases() == 1));
+    std::thread::sleep(ms(1200));
+    assert_eq!(liveness.leases(), 1, "the guard's veto must keep the lease");
+    VETOED.lock().unwrap().retain(|r| r != &root);
+    assert!(wait_for(|| liveness.leases() == 0));
+}
+
+#[cfg(unix)]
+fn ms(n: u64) -> std::time::Duration {
+    std::time::Duration::from_millis(n)
+}

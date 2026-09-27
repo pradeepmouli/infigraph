@@ -328,6 +328,14 @@ fn submit_write_request_named_cancellable(
     if let Some(faulted) = blocking_fault(staging_dir, request) {
         return Err(anyhow::Error::new(faulted));
     }
+    // A routed write is a use of the daemon, for as long as it waits: its
+    // lease must not be released under it (`daemon::lease`). The staging
+    // directory is `<root>/.infigraph/requests`.
+    let _use = staging_dir
+        .parent()
+        .filter(|dot| dot.file_name() == Some(std::ffi::OsStr::new(".infigraph")))
+        .and_then(Path::parent)
+        .map(crate::daemon::lease::in_use);
     std::fs::create_dir_all(staging_dir)?;
     let request_path = staging_dir.join(format!("{name}.request"));
     let result_path = staging_dir.join(format!("{name}.result"));

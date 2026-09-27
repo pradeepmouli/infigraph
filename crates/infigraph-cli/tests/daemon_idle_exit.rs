@@ -196,3 +196,49 @@ fn zero_grace_never_idles_out() {
     std::thread::sleep(Duration::from_secs(4));
     assert!(daemon_alive(project.path()));
 }
+
+/// Client-side idle release, end to end: a lease this process stops using is
+/// released, so the daemon idles out; the next routed use respawns a daemon
+/// and leases it.
+#[cfg(unix)]
+#[test]
+fn a_released_lease_lets_the_daemon_exit_and_the_next_use_respawns_it() {
+    use infigraph_core::daemon::lease;
+    let project = indexed_project();
+    let _daemon = spawn_daemon(project.path(), "2");
+    lease::set_release_after_for_test(project.path(), Duration::from_secs(1));
+    lease::hold(project.path());
+    assert!(
+        wait_until_gone("daemon after its lease was released", || daemon_alive(
+            project.path()
+        ))
+        .is_some(),
+        "an idle client must release its lease, letting the daemon exit"
+    );
+    assert!(!lease::is_held(project.path()));
+
+    lease::pin(project.path()); // keep the respawned daemon's lease for the asserts
+    infigraph_core::daemon::lifecycle::ensure_daemon_for_routed_access(project.path()).unwrap();
+    assert!(
+        daemon_alive(project.path()),
+        "the next use must respawn a daemon"
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let leased = loop {
+        let leases = infigraph_core::daemon::control::query_status(project.path())
+            .map(|s| s.leases)
+            .unwrap_or(0);
+        if leases == 1 || Instant::now() >= deadline {
+            break leases == 1;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    lease::unpin(project.path());
+    let _ = Command::new(cli_binary())
+        .arg("daemon-stop")
+        .current_dir(project.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    assert!(leased, "the respawned daemon must be leased");
+}

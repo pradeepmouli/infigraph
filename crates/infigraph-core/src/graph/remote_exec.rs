@@ -63,6 +63,7 @@ impl RemoteExec {
 
 impl QueryExec for RemoteExec {
     fn query_rows(&self, cypher: &str) -> Result<Vec<Vec<String>>> {
+        let _use = crate::daemon::lease::in_use(&self.root);
         // Two distinct startup windows, both bounded by the same grace and
         // both gated on a daemon actually being alive: not yet listening
         // (handled in `connect_allowing_for_startup`), and listening but

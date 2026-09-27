@@ -110,6 +110,14 @@ pub fn watcher_running(root: &std::path::Path) -> bool {
         .unwrap_or(false)
 }
 
+/// This worker's veto over releasing an idle daemon lease
+/// (`lease::set_release_guard`): keep it while this worker runs a code or
+/// doc watcher of its own on `root`.
+pub fn keeps_daemon_lease(root: &std::path::Path) -> bool {
+    let root_str = root.to_string_lossy().replace('\\', "/");
+    is_watching(&root_str) || super::docs::is_doc_watching(&root_str)
+}
+
 pub fn auto_start_watch(path: &str) -> Option<String> {
     auto_start_watch_inner(path, false)
 }
