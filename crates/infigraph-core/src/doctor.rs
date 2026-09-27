@@ -779,10 +779,18 @@ fn watcher_verdict(
     log: &Path,
 ) -> CheckResult {
     let log = log.display();
-    let pass =
-        |msg: String| CheckResult::pass(WATCHER_CATEGORY, label.clone(), format!("{msg} -- log: {log}"));
+    let pass = |msg: String| {
+        CheckResult::pass(
+            WATCHER_CATEGORY,
+            label.clone(),
+            format!("{msg} -- log: {log}"),
+        )
+    };
     if r.leases > 0 {
-        return pass(format!("daemon (PID {}) has {} clients leasing", r.pid, r.leases));
+        return pass(format!(
+            "daemon (PID {}) has {} clients leasing",
+            r.pid, r.leases
+        ));
     }
     if r.grace_secs == 0 {
         return pass(format!(
@@ -813,9 +821,7 @@ fn watcher_verdict(
             r.pid,
             idle - due
         ),
-        format!(
-            "check {log} for why the idle exit did not run; `infigraph daemon-stop` stops it"
-        ),
+        format!("check {log} for why the idle exit did not run; `infigraph daemon-stop` stops it"),
     )
 }
 

@@ -852,8 +852,7 @@ impl DocWatchThread {
         let debounce = self.debounce;
         let shutdown = std::sync::Arc::clone(&self.shutdown);
         self.handle = Some(std::thread::spawn(move || {
-            if let Err(e) =
-                infigraph_docs::watch::watch_docs_daemon_loop(&root, debounce, shutdown)
+            if let Err(e) = infigraph_docs::watch::watch_docs_daemon_loop(&root, debounce, shutdown)
             {
                 eprintln!("[doc-watch-daemon] error: {e}");
             }

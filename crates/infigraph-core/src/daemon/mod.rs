@@ -1,7 +1,7 @@
 pub(crate) mod backoff;
-pub(crate) mod drain;
 pub mod control;
 pub mod control_port;
+pub(crate) mod drain;
 pub mod fault;
 pub mod lease;
 pub mod lifecycle;
@@ -901,7 +901,12 @@ where
     let mut last_idle_check = std::time::Instant::now();
 
     let mut policy = read_policy(root);
-    publish_roles(&control_port.state, &code_watch, docs_control.as_ref(), policy);
+    publish_roles(
+        &control_port.state,
+        &code_watch,
+        docs_control.as_ref(),
+        policy,
+    );
 
     loop {
         // Test-only: park the loop so tests can observe a busy coordinator.
@@ -1733,7 +1738,12 @@ where
                 || scip_in_flight.is_some()
                 || scip_import_in_flight.is_some(),
         );
-        publish_roles(&control_port.state, &code_watch, docs_control.as_ref(), policy);
+        publish_roles(
+            &control_port.state,
+            &code_watch,
+            docs_control.as_ref(),
+            policy,
+        );
 
         // #155: wait on the control channel instead of sleeping, so a control
         // request wakes the loop at once. Everything queued is served now.
@@ -1750,7 +1760,12 @@ where
             if matches!(request.action, WatchAction::Enable | WatchAction::Disable) {
                 policy = read_policy(root);
             }
-            publish_roles(&control_port.state, &code_watch, docs_control.as_ref(), policy);
+            publish_roles(
+                &control_port.state,
+                &code_watch,
+                docs_control.as_ref(),
+                policy,
+            );
             // Replied before any teardown starts, so the client learns the
             // stop was accepted.
             let _ = reply.send(outcome);
@@ -3477,9 +3492,7 @@ fn apply_watch_control(
         }
         WatchRole::Docs => match docs {
             Some(handle) => handle.control(action),
-            None => {
-                Err("this watcher does not own a doc-watch loop to control".to_string())
-            }
+            None => Err("this watcher does not own a doc-watch loop to control".to_string()),
         },
         // Only the process's own exit is expressible here: `Start`
         // is meaningless (you are talking to a daemon, so one
@@ -3488,9 +3501,7 @@ fn apply_watch_control(
         // is written before cancelling so the caller still gets it.
         WatchRole::Daemon => match action {
             WatchAction::Stop | WatchAction::Restart => Ok(()),
-            _ => {
-                Err("Control { role: Daemon } only supports Stop/Restart".to_string())
-            }
+            _ => Err("Control { role: Daemon } only supports Stop/Restart".to_string()),
         },
     }
 }

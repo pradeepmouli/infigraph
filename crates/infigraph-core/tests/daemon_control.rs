@@ -126,8 +126,7 @@ fn code_state_goes_running_stopped_disabled() {
     send_control(dir.path(), WatchRole::Code, WatchAction::Stop).unwrap();
     assert_eq!(query_status(dir.path()).unwrap().code, RoleState::Stopped);
     // Disable's contract: the caller persists the policy first, then tells the daemon.
-    infigraph_core::watch::config::write_watch_policy(dir.path(), WatchRole::Code, false)
-        .unwrap();
+    infigraph_core::watch::config::write_watch_policy(dir.path(), WatchRole::Code, false).unwrap();
     send_control(dir.path(), WatchRole::Code, WatchAction::Disable).unwrap();
     assert_eq!(query_status(dir.path()).unwrap().code, RoleState::Disabled);
     stop(d);
@@ -210,8 +209,7 @@ fn a_legacy_watch_control_request_file_gets_a_prompt_error() {
     while !result.exists() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(50));
     }
-    let reply =
-        std::fs::read_to_string(&result).expect("a prompt reply, not a 30s client timeout");
+    let reply = std::fs::read_to_string(&result).expect("a prompt reply, not a 30s client timeout");
     assert!(reply.contains("Err"), "{reply}");
     std::thread::sleep(Duration::from_millis(300));
     assert!(

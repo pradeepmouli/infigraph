@@ -12,8 +12,9 @@ fn daemon_stop_against_an_incompatible_daemon_writes_the_sentinel() {
     let _held = infigraph_core::lockfile::try_acquire(&lock, "old-daemon")
         .unwrap()
         .unwrap();
-    let listener =
-        infigraph_core::daemon::read_endpoint::ReadEndpoint::for_root(&root).bind().unwrap();
+    let listener = infigraph_core::daemon::read_endpoint::ReadEndpoint::for_root(&root)
+        .bind()
+        .unwrap();
     let fake = std::thread::spawn(move || {
         // Accept one connection, read its frame as a real daemon's
         // `serve_one` would, and close it unanswered: a build that cannot

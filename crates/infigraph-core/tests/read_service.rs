@@ -487,8 +487,8 @@ fn attach(root: &Path) -> infigraph_core::daemon::read_endpoint::ReadStream {
 fn a_lease_is_counted_while_held_and_released_on_drop() {
     let (project, source) = indexed_project_and_source();
     let liveness = Arc::new(Liveness::new());
-    let _svc =
-        ReadService::start_serving(project.path(), source, None, 2, liveness.clone(), None).unwrap();
+    let _svc = ReadService::start_serving(project.path(), source, None, 2, liveness.clone(), None)
+        .unwrap();
     let lease = attach(project.path());
     assert!(
         wait_for(|| liveness.leases() == 1),
@@ -507,8 +507,15 @@ fn more_leases_than_workers_do_not_starve_reads() {
     let (project, source) = indexed_project_and_source();
     let liveness = Arc::new(Liveness::new());
     let workers = 2;
-    let _svc = ReadService::start_serving(project.path(), source, None, workers, liveness.clone(), None)
-        .unwrap();
+    let _svc = ReadService::start_serving(
+        project.path(),
+        source,
+        None,
+        workers,
+        liveness.clone(),
+        None,
+    )
+    .unwrap();
     let leases: Vec<_> = (0..workers + 2).map(|_| attach(project.path())).collect();
     assert!(wait_for(|| liveness.leases() == workers + 2));
     let rows = client_query(project.path(), "MATCH (f:File) RETURN count(f)").unwrap();
@@ -524,8 +531,8 @@ fn more_leases_than_workers_do_not_starve_reads() {
 fn a_read_touches_liveness() {
     let (project, source) = indexed_project_and_source();
     let liveness = Arc::new(Liveness::new());
-    let _svc =
-        ReadService::start_serving(project.path(), source, None, 2, liveness.clone(), None).unwrap();
+    let _svc = ReadService::start_serving(project.path(), source, None, 2, liveness.clone(), None)
+        .unwrap();
     liveness.last_activity_for_test(liveness::now_secs() - 500);
     client_query(project.path(), "MATCH (f:File) RETURN count(f)").unwrap();
     assert!(liveness.idle_for(liveness::now_secs()).unwrap() < std::time::Duration::from_secs(5));
@@ -539,8 +546,8 @@ fn a_read_touches_liveness() {
 fn dropping_the_service_releases_its_leases() {
     let (project, source) = indexed_project_and_source();
     let liveness = Arc::new(Liveness::new());
-    let svc =
-        ReadService::start_serving(project.path(), source, None, 2, liveness.clone(), None).unwrap();
+    let svc = ReadService::start_serving(project.path(), source, None, 2, liveness.clone(), None)
+        .unwrap();
     let mut lease = attach(project.path());
     assert!(wait_for(|| liveness.leases() == 1));
     drop(svc);
@@ -571,8 +578,8 @@ use infigraph_core::daemon::lease;
 fn hold_attaches_once_and_is_idempotent() {
     let (project, source) = indexed_project_and_source();
     let liveness = Arc::new(Liveness::new());
-    let _svc =
-        ReadService::start_serving(project.path(), source, None, 2, liveness.clone(), None).unwrap();
+    let _svc = ReadService::start_serving(project.path(), source, None, 2, liveness.clone(), None)
+        .unwrap();
     lease::hold(project.path());
     lease::hold(project.path());
     assert!(wait_for(|| liveness.leases() == 1));
@@ -589,8 +596,8 @@ fn hold_attaches_once_and_is_idempotent() {
 fn hold_is_a_noop_for_the_process_own_daemon_root() {
     let (project, source) = indexed_project_and_source();
     let liveness = Arc::new(Liveness::new());
-    let _svc =
-        ReadService::start_serving(project.path(), source, None, 2, liveness.clone(), None).unwrap();
+    let _svc = ReadService::start_serving(project.path(), source, None, 2, liveness.clone(), None)
+        .unwrap();
     lease::mark_self_daemon(project.path());
     lease::hold(project.path());
     std::thread::sleep(std::time::Duration::from_millis(300));
@@ -645,14 +652,21 @@ fn hold_reattaches_to_a_successor_service() {
     // One Liveness across both services, exactly as the coordinator shares it
     // across a #187 rebind -- so this also pins Review Focus 5.
     let liveness = Arc::new(Liveness::new());
-    let svc = ReadService::start_serving(project.path(), source.clone(), None, 2, liveness.clone(), None)
-        .unwrap();
+    let svc = ReadService::start_serving(
+        project.path(),
+        source.clone(),
+        None,
+        2,
+        liveness.clone(),
+        None,
+    )
+    .unwrap();
     lease::hold(project.path());
     assert!(wait_for(|| liveness.leases() == 1));
     drop(svc); // ends its parked leases, so the client sees EOF
     assert!(wait_for(|| liveness.leases() == 0));
-    let _svc2 =
-        ReadService::start_serving(project.path(), source, None, 2, liveness.clone(), None).unwrap();
+    let _svc2 = ReadService::start_serving(project.path(), source, None, 2, liveness.clone(), None)
+        .unwrap();
     assert!(
         wait_for(|| liveness.leases() == 1),
         "the lease must follow the daemon across a restart"

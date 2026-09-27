@@ -2487,8 +2487,8 @@ The final whole-branch review of this plan (`.superpowers/sdd/2026-08-21-daemon-
 
 - [ ] **Step 1:** Root-cause Gap A: confirm whether `tool_watch_project`'s and `group_commands.rs`'s watcher threads still clean up `WATCHERS`/status on a permanent watcher death after this plan's changes, or whether that invariant broke. Write the finding down before touching code.
 - [ ] **Step 2:** If Gap A is real, fix the leak (either restore the old self-cleanup guarantee, or add an explicit `is_finished()`-style check at the relevant status-reporting call sites) and add a regression test pinning it.
-- [ ] **Step 3:** Design and add running/paused/disabled state exposure to `get_watch_status`/`cmd_watch_status` for Gap B, covering both `WatchRole::Code` and `WatchRole::Docs`.
-- [ ] **Step 4:** Add tests covering the new status output for at least: running, explicitly disabled via policy, and paused (stopped without disabling).
+- [x] **Step 3:** Design and add running/paused/disabled state exposure to `get_watch_status`/`cmd_watch_status` for Gap B, covering both `WatchRole::Code` and `WatchRole::Docs`. (done by #155: `StatusReport.code`/`docs`, `RoleState`)
+- [x] **Step 4:** Add tests covering the new status output for at least: running, explicitly disabled via policy, and paused (stopped without disabling). (done by #155: `daemon_control.rs::code_state_goes_running_stopped_disabled`, `docs_without_a_handle_is_refused_and_reported_not_owned`)
 
 ---
 

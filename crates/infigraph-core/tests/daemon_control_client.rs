@@ -128,7 +128,9 @@ fn many_unresponsive_daemons_cost_about_one_deadline_not_one_each() {
     let roots: Vec<_> = dirs.iter().map(|d| d.path().to_path_buf()).collect();
     let started = Instant::now();
     let results = query_status_many(&roots);
-    assert!(results.iter().all(|r| *r == Err(ControlError::Unresponsive)));
+    assert!(results
+        .iter()
+        .all(|r| *r == Err(ControlError::Unresponsive)));
     assert!(started.elapsed() < STATUS_DEADLINE * 2);
 }
 

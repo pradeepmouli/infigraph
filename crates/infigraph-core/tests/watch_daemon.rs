@@ -1212,4 +1212,3 @@ fn scip_enrichment_task_is_cancellable_via_daemon_token() {
     // instead of returning.
     handle.join().unwrap().unwrap();
 }
-

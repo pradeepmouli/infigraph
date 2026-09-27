@@ -1115,7 +1115,9 @@ fn check_watchers_warns_when_a_live_holder_answers_no_status_query() {
         .expect("must produce a watcher liveness result");
     assert_eq!(watcher.status, CheckStatus::Warn);
     assert!(
-        watcher.message.contains("no daemon holds the lock or listens"),
+        watcher
+            .message
+            .contains("no daemon holds the lock or listens"),
         "{}",
         watcher.message
     );
@@ -1159,7 +1161,11 @@ fn check_watchers_passes_for_a_daemon_with_a_client_leasing() {
         .find(|r| r.name.contains("watcher liveness"))
         .expect("must produce a watcher liveness result");
     assert_eq!(watcher.status, CheckStatus::Pass, "{}", watcher.message);
-    assert!(watcher.message.contains("1 clients leasing"), "{}", watcher.message);
+    assert!(
+        watcher.message.contains("1 clients leasing"),
+        "{}",
+        watcher.message
+    );
 }
 
 #[test]

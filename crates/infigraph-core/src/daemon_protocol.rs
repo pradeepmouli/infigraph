@@ -670,7 +670,6 @@ mod tests {
         let back: WriteResult = serde_json::from_str(&json).unwrap();
         assert_eq!(res, back);
     }
-
 }
 
 #[cfg(test)]

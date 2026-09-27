@@ -387,7 +387,10 @@ mod tests {
 
     #[test]
     fn todays_read_and_attach_bytes_still_parse_as_before() {
-        assert!(matches!(parse(br#"{"attach_pid":7}"#), ClientFrame::Attach(_)));
+        assert!(matches!(
+            parse(br#"{"attach_pid":7}"#),
+            ClientFrame::Attach(_)
+        ));
         assert!(matches!(
             parse(br#"{"store":"Graph","query":"RETURN 1","params":[],"chunk_size":8}"#),
             ClientFrame::Read(_)

@@ -151,10 +151,7 @@ impl ControlPort {
     }
 
     /// Queue a request for the coordinator without blocking.
-    pub fn submit(
-        &self,
-        request: ControlRequest,
-    ) -> Result<mpsc::Receiver<ControlReply>, String> {
+    pub fn submit(&self, request: ControlRequest) -> Result<mpsc::Receiver<ControlReply>, String> {
         let (reply, rx) = mpsc::channel();
         match self.tx.try_send(ControlMsg { request, reply }) {
             Ok(()) => Ok(rx),

@@ -207,12 +207,7 @@ pub fn watch_docs_daemon_loop(
 /// the watcher failed to start), none of them will necessarily ever become
 /// true, and this function must notice that exit directly instead of
 /// waiting on a stop signal nothing will act on.
-fn run_attached_cycle<F>(
-    docs_kuzu: &Path,
-    shutdown: &Arc<AtomicBool>,
-    poll: Duration,
-    watch_fn: F,
-)
+fn run_attached_cycle<F>(docs_kuzu: &Path, shutdown: &Arc<AtomicBool>, poll: Duration, watch_fn: F)
 where
     F: FnOnce(mpsc::Receiver<()>) -> Result<()> + Send + 'static,
 {
