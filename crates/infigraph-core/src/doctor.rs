@@ -1547,50 +1547,131 @@ pub fn run_doctor(ctx: DoctorContext) -> DoctorReport {
 /// Callers own the decision of whether color is appropriate for their
 /// output stream (a real TTY vs. a pipe, a file, or MCP tool-call text) —
 /// this function only renders what it's told.
-pub fn format_report(report: &DoctorReport, color: bool) -> String {
-    let mut out = String::new();
+/// How to render a doctor report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReportStyle {
+    /// Bracketed glyphs and a `N PASS, N WARN, N FAIL` summary: stable text
+    /// for MCP, pipes and `NO_COLOR`.
+    Plain,
+    /// Icons, colors and per-section tallies for a terminal. Without
+    /// `verbose`, a section where every check passed collapses to one line.
+    Color { verbose: bool },
+}
+
+pub fn format_report(report: &DoctorReport, style: ReportStyle) -> String {
     let mut by_category: std::collections::BTreeMap<&str, Vec<&CheckResult>> =
         std::collections::BTreeMap::new();
     for check in &report.checks {
         by_category.entry(check.category).or_default().push(check);
     }
+    let count = |checks: &[&CheckResult], status: CheckStatus| {
+        checks.iter().filter(|c| c.status == status).count()
+    };
+    let all: Vec<&CheckResult> = report.checks.iter().collect();
+    let (pass, warn, fail) = (
+        count(&all, CheckStatus::Pass),
+        count(&all, CheckStatus::Warn),
+        count(&all, CheckStatus::Fail),
+    );
 
-    let mut pass = 0;
-    let mut warn = 0;
-    let mut fail = 0;
-
-    for (category, checks) in by_category {
-        out.push_str(&format!("== {category} ==\n"));
-        for check in checks {
-            let (glyph, sgr) = match check.status {
-                CheckStatus::Pass => {
-                    pass += 1;
-                    ("✓", "32")
+    let mut out = String::new();
+    match style {
+        ReportStyle::Plain => {
+            for (category, checks) in by_category {
+                out.push_str(&format!("== {category} ==\n"));
+                for check in checks {
+                    let glyph = match check.status {
+                        CheckStatus::Pass => "✓",
+                        CheckStatus::Warn => "!",
+                        CheckStatus::Fail => "✗",
+                    };
+                    out.push_str(&format!("[{glyph}] {}: {}\n", check.name, check.message));
+                    if let Some(remediation) = &check.remediation {
+                        out.push_str(&format!("  -> {remediation}\n"));
+                    }
                 }
-                CheckStatus::Warn => {
-                    warn += 1;
-                    ("!", "33")
-                }
-                CheckStatus::Fail => {
-                    fail += 1;
-                    ("✗", "31")
-                }
-            };
-            let tag = if color {
-                format!("\x1b[{sgr}m{glyph}\x1b[0m")
-            } else {
-                glyph.to_string()
-            };
-            out.push_str(&format!("[{tag}] {}: {}\n", check.name, check.message));
-            if let Some(remediation) = &check.remediation {
-                out.push_str(&format!("  -> {remediation}\n"));
+                out.push('\n');
             }
+            out.push_str(&format!("{pass} PASS, {warn} WARN, {fail} FAIL\n"));
         }
-        out.push('\n');
+        ReportStyle::Color { verbose } => {
+            for (category, checks) in by_category {
+                let (p, w, f) = (
+                    count(&checks, CheckStatus::Pass),
+                    count(&checks, CheckStatus::Warn),
+                    count(&checks, CheckStatus::Fail),
+                );
+                let header = paint(BOLD, &format!("▌{category}"));
+                if !verbose && w == 0 && f == 0 {
+                    out.push_str(&format!(
+                        "{header}  {}\n",
+                        paint(GREEN, &format!("✔ {p} passed"))
+                    ));
+                    continue;
+                }
+                let tally: Vec<String> = [(GREEN, "✔", p), (YELLOW, "⚠", w), (RED, "✖", f)]
+                    .into_iter()
+                    .filter(|(_, _, n)| *n > 0)
+                    .map(|(sgr, icon, n)| paint(sgr, &format!("{icon} {n}")))
+                    .collect();
+                out.push_str(&format!("{header}  {}\n", tally.join("  ")));
+                for check in checks {
+                    let icon = match check.status {
+                        CheckStatus::Pass => paint(GREEN, "✔"),
+                        CheckStatus::Warn => paint(YELLOW, "⚠"),
+                        CheckStatus::Fail => paint(RED, "✖"),
+                    };
+                    out.push_str(&format!(
+                        "  {icon} {}: {}\n",
+                        styled_check_name(&check.name),
+                        check.message
+                    ));
+                    if let Some(remediation) = &check.remediation {
+                        out.push_str(&format!(
+                            "    {}\n",
+                            paint(CYAN, &format!("↳ {remediation}"))
+                        ));
+                    }
+                }
+                out.push('\n');
+            }
+            let plural = |n: usize, one: &str, many: &str| {
+                format!("{n} {}", if n == 1 { one } else { many })
+            };
+            out.push_str(&format!(
+                "\n{} · {} · {}\n",
+                paint(GREEN, &format!("✔ {}", plural(pass, "passed", "passed"))),
+                paint(
+                    YELLOW,
+                    &format!("⚠ {}", plural(warn, "warning", "warnings"))
+                ),
+                paint(RED, &format!("✖ {}", plural(fail, "failed", "failed"))),
+            ));
+        }
     }
-
-    out.push_str(&format!("{pass} PASS, {warn} WARN, {fail} FAIL\n"));
     out
+}
+
+const BOLD: &str = "1";
+const DIM: &str = "2";
+const RED: &str = "31";
+const GREEN: &str = "32";
+const YELLOW: &str = "33";
+const CYAN: &str = "36";
+
+fn paint(sgr: &str, text: &str) -> String {
+    format!("\x1b[{sgr}m{text}\x1b[0m")
+}
+
+/// A check named `<absolute project path>: <check>` gets its path dimmed and
+/// the check itself bold; any other name is bold whole.
+fn styled_check_name(name: &str) -> String {
+    match name.split_once(": ") {
+        Some((path, check)) if Path::new(path).is_absolute() => {
+            format!("{} {}", paint(DIM, &format!("{path}:")), paint(BOLD, check))
+        }
+        _ => paint(BOLD, name),
+    }
 }
 
 #[cfg(test)]

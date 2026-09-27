@@ -20,5 +20,8 @@ pub fn tool_doctor(args: &Value) -> anyhow::Result<String> {
     let ctx = assemble_context(scope);
     let report = run_doctor(ctx);
     // Never colorize: this text goes back to an LLM as tool-call output, not a terminal.
-    Ok(format_report(&report, false))
+    Ok(format_report(
+        &report,
+        infigraph_core::doctor::ReportStyle::Plain,
+    ))
 }
