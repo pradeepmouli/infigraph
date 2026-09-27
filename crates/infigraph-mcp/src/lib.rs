@@ -646,6 +646,7 @@ pub fn estimate_tokens(text: &str) -> usize {
 
 pub fn handle_initialize(id: &Value, is_primary: bool) -> Value {
     health::HEALTH.mark_initialized();
+    infigraph_core::daemon::lease::set_release_guard(tools::watch::keeps_daemon_lease);
     mcp_log("INFO", &format!("initialize called (primary={is_primary})"));
     if is_primary {
         std::thread::spawn(|| {
