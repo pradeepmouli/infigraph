@@ -1708,3 +1708,60 @@ fn check_one_daemon_fault_reports_a_live_fault_and_nothing_otherwise() {
         "names the command that replaces a stuck daemon"
     );
 }
+
+/// Doctor asks every project's daemon at once: three daemons that never
+/// answer cost about one status deadline, not three (#155 review).
+#[test]
+fn check_watchers_queries_daemons_in_parallel() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut projects = Vec::new();
+    let mut fakes = Vec::new();
+    for i in 0..3 {
+        let project = dir.path().join(format!("p{i}"));
+        std::fs::create_dir_all(project.join(".infigraph")).unwrap();
+        write_alive_watch_lock(&project.join(".infigraph").join("watch.lock"));
+        let listener = infigraph_core::daemon::read_endpoint::ReadEndpoint::for_root(&project)
+            .bind()
+            .unwrap();
+        // Accept and never answer: a wedged daemon.
+        fakes.push(std::thread::spawn(move || {
+            if let Ok(Some(s)) = listener.accept_timeout(std::time::Duration::from_secs(5)) {
+                std::thread::sleep(std::time::Duration::from_secs(3));
+                drop(s);
+            }
+        }));
+        projects.push(project);
+    }
+    let mut registry = Registry::default();
+    for p in &projects {
+        let name = p.file_name().unwrap().to_string_lossy().to_string();
+        registry.repos.insert(
+            name.clone(),
+            infigraph_core::multi::RepoEntry {
+                name,
+                path: p.clone(),
+                languages: vec![],
+                symbol_count: 0,
+                module_count: 0,
+                last_indexed_commit: None,
+            },
+        );
+    }
+    let ctx = ctx_for(DoctorScope::Global, registry);
+    let started = std::time::Instant::now();
+    let results = check_watchers(&ctx);
+    let took = started.elapsed();
+    assert_eq!(
+        results
+            .iter()
+            .filter(|r| r.name.contains("watcher liveness") && r.status == CheckStatus::Warn)
+            .count(),
+        3,
+        "{results:?}"
+    );
+    assert!(
+        took < infigraph_core::daemon::control::STATUS_DEADLINE * 2,
+        "three unresponsive daemons took {took:?}"
+    );
+}
