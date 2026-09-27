@@ -60,6 +60,7 @@ pub fn watch_docs(
         }
 
         if pending && last_reindex.elapsed() >= debounce {
+            let _reindexing = ReindexGuard::enter();
             eprintln!("[{log_prefix}] document change detected, reindexing...");
             let mut idx = match DocIndex::open(root) {
                 Ok(i) => i,
@@ -142,6 +143,31 @@ pub(crate) fn paths_warrant_reindex(
         }
         is_document_file(p) || is_dir
     })
+}
+
+/// Doc reindexes running in this process. The daemon counts one as work in
+/// flight, so its idle exit never cuts a reindex short (#203).
+static REINDEXING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Whether a doc reindex is running in this process right now.
+pub fn reindex_in_progress() -> bool {
+    REINDEXING.load(Ordering::SeqCst) > 0
+}
+
+/// Marks a doc reindex as running for as long as it is held.
+pub(crate) struct ReindexGuard;
+
+impl ReindexGuard {
+    pub(crate) fn enter() -> Self {
+        REINDEXING.fetch_add(1, Ordering::SeqCst);
+        ReindexGuard
+    }
+}
+
+impl Drop for ReindexGuard {
+    fn drop(&mut self) {
+        REINDEXING.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 /// How often the daemon loop polls for `.infigraph/docs.kuzu`'s existence
@@ -246,6 +272,18 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #203: a doc reindex in progress is work in flight, so the daemon's
+    /// idle exit waits for it.
+    #[test]
+    fn a_reindex_guard_marks_a_reindex_in_progress() {
+        assert!(!reindex_in_progress());
+        {
+            let _guard = ReindexGuard::enter();
+            assert!(reindex_in_progress());
+        }
+        assert!(!reindex_in_progress());
+    }
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
     use std::time::Duration;

@@ -230,6 +230,9 @@ impl infigraph_core::daemon::DocsHandle for Recorder {
     fn is_running(&self) -> bool {
         false
     }
+    fn is_busy(&self) -> bool {
+        false
+    }
 }
 
 #[test]

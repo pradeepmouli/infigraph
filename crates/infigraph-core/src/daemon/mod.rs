@@ -288,6 +288,9 @@ pub type FullReindexCallback = dyn Fn(PathBuf, ScipEnrichJob, CancellationToken)
 pub trait DocsHandle: Send + Sync {
     fn control(&self, action: WatchAction) -> std::result::Result<(), String>;
     fn is_running(&self) -> bool;
+    /// Whether a doc reindex is running right now: work in flight, which
+    /// defers the idle exit (#203).
+    fn is_busy(&self) -> bool;
 }
 
 /// A path's identity: `(device, inode)` plus its birth time where the
@@ -920,6 +923,8 @@ where
                 || full_reindex_in_flight.is_some()
                 || scip_in_flight.is_some()
                 || scip_import_in_flight.is_some()
+                || docs_control.as_ref().is_some_and(|d| d.is_busy())
+                || has_pending_request(&root.join(".infigraph").join("requests"))
         };
     }
 
@@ -3522,6 +3527,17 @@ fn is_daemon_stop(
     )
 }
 
+/// Whether a `.request` is waiting in `requests_dir`. A client that wrote one
+/// just before the idle grace ran out must still be served, so it counts as
+/// work in flight (#203 M2).
+fn has_pending_request(requests_dir: &Path) -> bool {
+    std::fs::read_dir(requests_dir).is_ok_and(|entries| {
+        entries
+            .flatten()
+            .any(|e| e.path().extension().is_some_and(|x| x == "request"))
+    })
+}
+
 /// Publish the watch roles' state for `Status`. Cheap: two atomics; the
 /// policy is read by the caller only when it can have changed.
 fn publish_roles(
@@ -4525,6 +4541,25 @@ mod watchable_root_tests {
 /// guarantees will never arrive. sittir logged 15 refusals and answered
 /// every read with "the daemon has no graph open yet", advising a retry
 /// that could not help.
+#[cfg(test)]
+mod pending_request_tests {
+    use super::has_pending_request;
+
+    /// #203 M2: a `.request` waiting in `requests/` defers the idle exit, so
+    /// a client that wrote one just before the grace ran out is still served.
+    #[test]
+    fn only_a_request_file_counts_as_pending() {
+        let dir = tempfile::tempdir().unwrap();
+        let requests = dir.path().join("requests");
+        assert!(!has_pending_request(&requests), "no directory yet");
+        std::fs::create_dir_all(&requests).unwrap();
+        std::fs::write(requests.join("1.result"), b"{}").unwrap();
+        assert!(!has_pending_request(&requests), "a reply is not a request");
+        std::fs::write(requests.join("2.request"), b"{}").unwrap();
+        assert!(has_pending_request(&requests));
+    }
+}
+
 #[cfg(test)]
 mod refused_drain_tests {
     use super::*;
