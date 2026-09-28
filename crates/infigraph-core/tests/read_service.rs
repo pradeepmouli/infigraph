@@ -1018,3 +1018,126 @@ fn the_release_guard_can_keep_a_lease() {
 fn ms(n: u64) -> std::time::Duration {
     std::time::Duration::from_millis(n)
 }
+
+// ---- #204: writes on the read socket ----
+
+use infigraph_core::daemon::read_protocol::WriteFrame;
+use infigraph_core::daemon_protocol::{WriteRequest, WriteResult};
+
+fn send_write(root: &Path) -> infigraph_core::daemon::read_endpoint::ReadStream {
+    let mut s = ReadEndpoint::for_root(root).connect().unwrap();
+    write_op(
+        &mut s,
+        &WriteFrame {
+            write: WriteRequest::FullReindex,
+        },
+    )
+    .unwrap();
+    s
+}
+
+#[test]
+fn a_write_is_admitted_then_answered_with_the_coordinators_result() {
+    let dir = tempfile::tempdir().unwrap();
+    let (svc, _port, rx, _l) = control_service(dir.path());
+    let mut s = send_write(dir.path());
+    assert!(matches!(
+        read_reply::<_, ()>(&mut s).unwrap(),
+        Some(OpReply::Ok(()))
+    ));
+    let PortMsg::Write { request, reply } =
+        rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap()
+    else {
+        panic!("a write")
+    };
+    assert_eq!(request, WriteRequest::FullReindex);
+    reply.send(WriteResult::Ok {
+        total_files: 3,
+        indexed_files: 3,
+    });
+    assert!(matches!(
+        read_reply::<_, WriteResult>(&mut s).unwrap(),
+        Some(OpReply::Ok(WriteResult::Ok { total_files: 3, .. }))
+    ));
+    svc.shutdown();
+}
+
+#[cfg(unix)]
+#[test]
+fn a_client_that_disconnects_marks_its_write_gone() {
+    let dir = tempfile::tempdir().unwrap();
+    let (svc, _port, rx, _l) = control_service(dir.path());
+    let mut s = send_write(dir.path());
+    let _ = read_reply::<_, ()>(&mut s).unwrap();
+    let PortMsg::Write { reply, .. } = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap()
+    else {
+        panic!("a write")
+    };
+    drop(s);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !reply.is_gone() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(reply.is_gone(), "noticed within a few GONE_POLLs");
+    svc.shutdown();
+}
+
+#[cfg(unix)]
+#[test]
+fn a_write_waiting_for_a_slot_gives_up_when_its_client_leaves() {
+    let dir = tempfile::tempdir().unwrap();
+    let (svc, port, rx, _l) = control_service(dir.path());
+    let held: Vec<_> = (0..PORT_QUEUE)
+        .map(|_| {
+            port.submit_control(ControlRequest {
+                role: WatchRole::Code,
+                action: WatchAction::Stop,
+            })
+            .unwrap()
+        })
+        .collect();
+    let s = send_write(dir.path());
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    drop(s);
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    // The queue still holds only the controls: the abandoned write gave up
+    // rather than taking a slot once one frees.
+    let arrived: Vec<_> = rx.try_iter().collect();
+    drop(held);
+    assert_eq!(arrived.len(), PORT_QUEUE);
+    assert!(arrived.iter().all(|m| matches!(m, PortMsg::Control(_))));
+    assert!(
+        port.wait_idle(std::time::Duration::from_secs(2)),
+        "its thread ended"
+    );
+    svc.shutdown();
+}
+
+#[test]
+fn a_write_to_a_shutting_down_coordinator_is_refused_before_admission() {
+    let dir = tempfile::tempdir().unwrap();
+    let (svc, _port, rx, _l) = control_service(dir.path());
+    drop(rx);
+    let mut s = send_write(dir.path());
+    assert!(matches!(
+        read_reply::<_, ()>(&mut s).unwrap(),
+        Some(OpReply::Err(m)) if m.contains("shutting down")
+    ));
+    svc.shutdown();
+}
+
+#[test]
+fn a_malformed_write_frame_is_closed_without_an_answer() {
+    use std::io::Write as _;
+    let dir = tempfile::tempdir().unwrap();
+    let (svc, _port, _rx, _l) = control_service(dir.path());
+    let mut s = ReadEndpoint::for_root(dir.path()).connect().unwrap();
+    let body = br#"{"write":{"NoSuchVariant":null}}"#;
+    s.write_all(&(body.len() as u32).to_le_bytes()).unwrap();
+    s.write_all(body).unwrap();
+    assert!(
+        read_reply::<_, ()>(&mut s).unwrap().is_none(),
+        "EOF: reads as Incompatible"
+    );
+    svc.shutdown();
+}

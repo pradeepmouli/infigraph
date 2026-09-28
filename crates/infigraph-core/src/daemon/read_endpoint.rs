@@ -364,6 +364,32 @@ impl ReadStream {
     }
 }
 
+impl ReadStream {
+    /// Whether the client has hung up. A write's client sends nothing after
+    /// its frame, so any readable state -- EOF, or stray bytes -- means the
+    /// connection is over (#204 D2). Never blocks.
+    #[cfg(unix)]
+    pub(crate) fn peer_closed(&self) -> bool {
+        use std::os::fd::{AsFd as _, AsRawFd as _};
+        let interprocess::local_socket::Stream::UdSocket(s) = &self.inner;
+        let mut pollfd = libc::pollfd {
+            fd: s.as_fd().as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one valid pollfd, borrowed from a stream that outlives the
+        // call.
+        unsafe { libc::poll(&mut pollfd, 1, 0) > 0 }
+    }
+
+    /// Windows named pipes: not detected; the write's work runs and its
+    /// answer is discarded. Tracked with the reader-thread gap in #206.
+    #[cfg(not(unix))]
+    pub(crate) fn peer_closed(&self) -> bool {
+        false
+    }
+}
+
 impl Write for ReadStream {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.inner.write(buf)
