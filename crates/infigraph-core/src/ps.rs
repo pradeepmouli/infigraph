@@ -125,7 +125,7 @@ pub fn list_infigraph_processes(projects: &[&Path]) -> Vec<ProcessRow> {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     for row in rows.values_mut() {
-        if let Some(proc) = sys.process(sysinfo::Pid::from_u32(row.pid)) {
+        if let Some(proc) = running_process(&sys, sysinfo::Pid::from_u32(row.pid)) {
             // R2.1.2 PID-reuse guard: a recorded start time that disagrees
             // with the live process table means this is a DIFFERENT process
             // wearing a recycled pid -- report the recorded holder as dead
@@ -204,14 +204,27 @@ fn is_infigraph_binary_name(name: &str) -> bool {
     )
 }
 
+/// `pid`'s entry in `sys`, unless it has already exited. A zombie has: it
+/// holds no files and no locks, only a process-table slot until its parent
+/// reaps it. Linux lists zombies (`/proc/<pid>` stays until the reap) where
+/// macOS drops them, so without this filter an exited daemon whose parent
+/// has not reaped it yet reads as still running, and `rebuild` reports it
+/// stuck. Every liveness question about another process goes through here.
+pub(crate) fn running_process(
+    sys: &sysinfo::System,
+    pid: sysinfo::Pid,
+) -> Option<&sysinfo::Process> {
+    sys.process(pid)
+        .filter(|p| p.status() != sysinfo::ProcessStatus::Zombie)
+}
+
 /// Name of a live process, if it exists. Used to label a lock holder or a
 /// file holder a doctor check found by pid.
 pub fn process_name(pid: u32) -> Option<String> {
     let spid = sysinfo::Pid::from_u32(pid);
     let mut sys = sysinfo::System::new();
     sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[spid]), true);
-    sys.process(spid)
-        .map(|p| p.name().to_string_lossy().to_string())
+    running_process(&sys, spid).map(|p| p.name().to_string_lossy().to_string())
 }
 
 /// Whether `pid` is a live process running one of our binaries -- the same
@@ -299,7 +312,7 @@ pub fn kill_infigraph_process(pid: u32, force: bool) -> Result<String, KillRefus
     let spid = sysinfo::Pid::from_u32(pid);
     let mut sys = sysinfo::System::new();
     sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[spid]), true);
-    let Some(proc) = sys.process(spid) else {
+    let Some(proc) = running_process(&sys, spid) else {
         return Err(KillRefusal::NoSuchProcess);
     };
     let name = proc.name().to_string_lossy().to_string();

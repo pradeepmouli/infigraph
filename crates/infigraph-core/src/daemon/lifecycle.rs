@@ -621,7 +621,7 @@ fn end_daemon_if(
     let mut sys = sysinfo::System::new();
     sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[spid]), true);
 
-    let Some(proc) = running_process(&sys, spid) else {
+    let Some(proc) = crate::ps::running_process(&sys, spid) else {
         // PID isn't running at all -- the lock is simply stale (the holder
         // crashed or was killed without releasing it). Nothing to signal;
         // the caller's retry-acquire will pick up the now-free lock.
@@ -728,24 +728,12 @@ fn wait_for_pid_exit(
 ) -> bool {
     for _ in 0..attempts {
         sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
-        if running_process(sys, pid).is_none() {
+        if crate::ps::running_process(sys, pid).is_none() {
             return true;
         }
         std::thread::sleep(delay);
     }
     false
-}
-
-/// `pid`'s entry in `sys`, unless it has already exited. A zombie has: it
-/// holds no files and no locks, only a process-table slot until its parent
-/// reaps it. Linux lists zombies (`/proc/<pid>` stays until the reap) where
-/// macOS drops them, so without this filter a daemon whose parent never
-/// waits on it -- `spawn_daemon` drops its `Child`, so a long-lived MCP
-/// server that started one never reaps it -- reads as still running long
-/// after it exited, and `rebuild` reports it stuck.
-fn running_process(sys: &sysinfo::System, pid: sysinfo::Pid) -> Option<&sysinfo::Process> {
-    sys.process(pid)
-        .filter(|p| p.status() != sysinfo::ProcessStatus::Zombie)
 }
 
 /// Build (without spawning) the `Command` used to launch a detached
@@ -809,13 +797,30 @@ pub fn build_daemon_command(root: &Path, tg_dir: &Path, watch_binary: &Path) -> 
     cmd
 }
 
+/// Wait on a spawned daemon from a parked thread, so its exit is collected
+/// at once instead of leaving it as this process's zombie until we exit.
+/// `setsid` detaches the daemon's session, not its parentage: a long-lived
+/// spawner (the MCP server) is still its parent, and on Linux every daemon it
+/// outlived used to linger in the process table. The thread only waits; it
+/// dies with this process, and a daemon outliving us is reparented as usual.
+fn reap_in_background(mut child: std::process::Child) {
+    let _ = std::thread::Builder::new()
+        .name("infigraph-daemon-reaper".into())
+        .spawn(move || {
+            let _ = child.wait();
+        });
+}
+
 fn spawn_daemon(root: &Path, tg_dir: &Path, watch_binary: &Path) -> DaemonStartOutcome {
     // #141: say so up front if the daemon we are about to launch is not the
     // build we are (one subprocess, once per binary path per process).
     crate::daemon::warn_if_cli_build_differs(watch_binary);
     let mut cmd = build_daemon_command(root, tg_dir, watch_binary);
     match cmd.spawn() {
-        Ok(_) => DaemonStartOutcome::Spawned,
+        Ok(child) => {
+            reap_in_background(child);
+            DaemonStartOutcome::Spawned
+        }
         Err(e) => DaemonStartOutcome::Failed(e.to_string()),
     }
 }
@@ -1118,6 +1123,36 @@ mod tests {
             wait_for_pid_exit(pid, &mut sys, 5, std::time::Duration::from_millis(10)),
             "an already-exited (and reaped) PID must be reported as gone on the first check"
         );
+    }
+
+    /// A spawned daemon is reaped when it exits, so it never lingers as its
+    /// spawner's zombie (Linux lists zombies; a long-lived MCP server spawns
+    /// daemons and used to collect one per daemon it outlived).
+    #[test]
+    #[cfg(unix)]
+    fn a_reaped_in_background_child_leaves_no_zombie() {
+        let child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id() as libc::pid_t;
+        super::reap_in_background(child);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            // SAFETY: waitpid with WNOHANG on our own child's pid.
+            let got = unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) };
+            if got == -1 {
+                assert_eq!(
+                    std::io::Error::last_os_error().raw_os_error(),
+                    Some(libc::ECHILD),
+                    "the child is no longer ours to wait on: it was reaped"
+                );
+                return;
+            }
+            assert_ne!(got, pid, "the child was left for us to reap: a zombie");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the child never exited"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
     }
 
     /// An exited child its parent has not reaped yet is gone: Linux still
