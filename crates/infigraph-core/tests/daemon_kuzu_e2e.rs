@@ -744,20 +744,11 @@ fn producers_keep_accepting_work_while_a_drain_is_in_flight() {
          the next drain, not silently dropped"
     );
 
-    // Nothing orphaned: every `.request` the daemon accepted was answered
-    // and removed. A drain that panicked or wedged would leave one behind.
-    let leftover: Vec<_> = std::fs::read_dir(project.path().join(".infigraph").join("requests"))
-        .map(|entries| {
-            entries
-                .flatten()
-                .map(|e| e.path())
-                .filter(|p| p.extension().is_some_and(|ext| ext == "request"))
-                .collect()
-        })
-        .unwrap_or_default();
+    // Writes travel on the socket (#204): nothing is left in, or even
+    // creates, a requests directory.
     assert!(
-        leftover.is_empty(),
-        "the daemon left unanswered requests behind: {leftover:?}"
+        !project.path().join(".infigraph").join("requests").exists(),
+        "writes never touch requests/"
     );
 
     // The second request cannot have taken longer than a whole extra
@@ -1201,7 +1192,7 @@ fn plain_index_on_a_never_indexed_project_bootstraps_under_daemon_backend() {
             panic!(
                 "plain `index` on a never-indexed project under \
                  INFIGRAPH_BACKEND=daemon did not finish within {FAIL_FAST_BUDGET:?} -- \
-                 the ~600s silent block inside submit_write_request is back"
+                 the ~600s silent block inside the write client is back"
             );
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -1509,17 +1500,12 @@ fn a_third_recovery_trigger_inside_the_window_trips_the_crash_loop_breaker_inste
     )
     .unwrap();
 
-    infigraph_core::recovery::drain_recovery_sentinel(&infigraph_dir).unwrap();
-
+    assert!(
+        !infigraph_core::recovery::recovery_rebuild_wanted(&infigraph_dir).unwrap(),
+        "must not ask for another FullReindex once tripped"
+    );
     assert!(
         infigraph_core::recovery::crash_loop_detected(&infigraph_dir).is_some(),
         "breaker must trip at the threshold"
-    );
-    let requests: usize = std::fs::read_dir(infigraph_dir.join("requests"))
-        .map(|d| d.count())
-        .unwrap_or(0);
-    assert_eq!(
-        requests, 0,
-        "must not submit another FullReindex once tripped"
     );
 }

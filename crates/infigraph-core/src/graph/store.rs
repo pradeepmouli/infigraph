@@ -893,7 +893,7 @@ impl GraphStore {
     /// `graph.previous.<ts>` entry (read-only) instead of failing outright
     /// -- see R3.1.4b. Never triggers a write itself; it only quarantines (a
     /// data-safety move, not a write to the live graph) and leaves a
-    /// sentinel for the daemon coordinator (`recovery::drain_recovery_sentinel`)
+    /// sentinel for the daemon coordinator (`recovery::recovery_rebuild_wanted`)
     /// to act on asynchronously.
     ///
     /// Internal/test call sites that want the strict, non-degrading

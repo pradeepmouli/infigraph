@@ -1,14 +1,13 @@
 use infigraph_core::config::ConfigBindingWire;
 use infigraph_core::daemon_protocol::{
-    serve_one_request, write_atomic, write_extractions_json, IngestSource, WriteRequest,
-    WriteResult,
+    serve_write, write_atomic, write_extractions_json, IngestSource, WriteRequest, WriteResult,
 };
 use infigraph_core::manifest::{DepEntry, ManifestResult};
 use infigraph_core::Infigraph;
 use infigraph_languages::bundled_registry;
 
 #[test]
-fn serve_one_request_indexes_and_writes_result_and_removes_request() {
+fn serve_write_indexes_and_writes_result_and_removes_request() {
     let project_dir = tempfile::tempdir().unwrap();
     std::fs::write(
         project_dir.path().join("main.py"),
@@ -19,26 +18,10 @@ fn serve_one_request_indexes_and_writes_result_and_removes_request() {
     let registry = bundled_registry().unwrap();
     let mut infigraph = Infigraph::open(project_dir.path(), registry).unwrap();
     infigraph.init().unwrap();
+    let request = WriteRequest::Index { paths: None };
 
-    let staging_dir = project_dir.path().join(".infigraph").join("requests");
-    std::fs::create_dir_all(&staging_dir).unwrap();
-    let request_path = staging_dir.join("test-1.request");
-    let result_path = staging_dir.join("test-1.result");
-    write_atomic(
-        &request_path,
-        &serde_json::to_string(&WriteRequest::Index { paths: None }).unwrap(),
-    )
-    .unwrap();
+    let result = serve_write(&infigraph, &request);
 
-    serve_one_request(&infigraph, &request_path).unwrap();
-
-    assert!(
-        !request_path.exists(),
-        "request file should be removed after serving"
-    );
-    assert!(result_path.exists(), "result file should have been written");
-    let result: WriteResult =
-        serde_json::from_str(&std::fs::read_to_string(&result_path).unwrap()).unwrap();
     match result {
         WriteResult::Ok { indexed_files, .. } => assert_eq!(indexed_files, 1),
         other => panic!("expected Ok, got {other:?}"),
@@ -46,54 +29,17 @@ fn serve_one_request_indexes_and_writes_result_and_removes_request() {
 }
 
 #[test]
-fn serve_one_request_writes_err_result_on_failure_without_panicking() {
+fn serve_write_writes_err_result_on_failure_without_panicking() {
     let project_dir = tempfile::tempdir().unwrap();
     let registry = bundled_registry().unwrap();
     let mut infigraph = Infigraph::open(project_dir.path(), registry).unwrap();
     infigraph.init().unwrap();
+    let request = WriteRequest::Index {
+        paths: Some(vec!["does/not/exist.py".into()]),
+    };
 
-    let staging_dir = project_dir.path().join(".infigraph").join("requests");
-    std::fs::create_dir_all(&staging_dir).unwrap();
-    let request_path = staging_dir.join("test-2.request");
-    let result_path = staging_dir.join("test-2.result");
-    write_atomic(
-        &request_path,
-        &serde_json::to_string(&WriteRequest::Index {
-            paths: Some(vec!["does/not/exist.py".into()]),
-        })
-        .unwrap(),
-    )
-    .unwrap();
-
-    serve_one_request(&infigraph, &request_path).unwrap();
-    assert!(result_path.exists());
-}
-
-#[test]
-fn serve_one_request_writes_err_result_on_corrupt_request_json() {
-    let project_dir = tempfile::tempdir().unwrap();
-    let registry = bundled_registry().unwrap();
-    let mut infigraph = Infigraph::open(project_dir.path(), registry).unwrap();
-    infigraph.init().unwrap();
-
-    let staging_dir = project_dir.path().join(".infigraph").join("requests");
-    std::fs::create_dir_all(&staging_dir).unwrap();
-    let request_path = staging_dir.join("test-3.request");
-    let result_path = staging_dir.join("test-3.result");
-    write_atomic(&request_path, "not valid json {{{").unwrap();
-
-    serve_one_request(&infigraph, &request_path).unwrap();
-
-    assert!(
-        result_path.exists(),
-        "corrupt request must still produce a result file"
-    );
-    let result: WriteResult =
-        serde_json::from_str(&std::fs::read_to_string(&result_path).unwrap()).unwrap();
-    assert!(
-        matches!(result, WriteResult::Err { .. }),
-        "expected Err for a corrupt request, got {result:?}"
-    );
+    // Returning at all is the assertion: a failed index is a result, not a panic.
+    let _ = serve_write(&infigraph, &request);
 }
 
 /// A `ScipImport` request written by a client that predates the
@@ -123,35 +69,22 @@ fn scip_import_request_without_enriched_generation_still_parses() {
 }
 
 #[test]
-fn serve_one_request_handles_scip_import() {
+fn serve_write_handles_scip_import() {
     let project_dir = tempfile::tempdir().unwrap();
     let registry = bundled_registry().unwrap();
     let mut infigraph = Infigraph::open(project_dir.path(), registry).unwrap();
     infigraph.init().unwrap();
-
-    let staging_dir = project_dir.path().join(".infigraph").join("requests");
-    std::fs::create_dir_all(&staging_dir).unwrap();
-    let request_path = staging_dir.join("test-scip.request");
-    let result_path = staging_dir.join("test-scip.result");
     // A nonexistent scip file is fine for this test -- it exercises the
     // handler routes to import_scip and returns Err cleanly, not that a
     // real SCIP import succeeds (that's covered by existing scip-import
     // integration tests).
-    write_atomic(
-        &request_path,
-        &serde_json::to_string(&WriteRequest::ScipImport {
-            scip_path: "does/not/exist.scip".into(),
-            enriched_ast_generation: None,
-        })
-        .unwrap(),
-    )
-    .unwrap();
+    let request = WriteRequest::ScipImport {
+        scip_path: "does/not/exist.scip".into(),
+        enriched_ast_generation: None,
+    };
 
-    serve_one_request(&infigraph, &request_path).unwrap();
+    let result = serve_write(&infigraph, &request);
 
-    assert!(result_path.exists());
-    let result: WriteResult =
-        serde_json::from_str(&std::fs::read_to_string(&result_path).unwrap()).unwrap();
     assert!(
         matches!(result, WriteResult::Err { .. }),
         "expected Err for a missing scip file, got {result:?}"
@@ -159,7 +92,7 @@ fn serve_one_request_handles_scip_import() {
 }
 
 #[test]
-fn serve_one_request_handles_ingest_structured_file() {
+fn serve_write_handles_ingest_structured_file() {
     let project_dir = tempfile::tempdir().unwrap();
     let schema_dir = project_dir
         .path()
@@ -185,25 +118,13 @@ node_table = "TestNode"
     let registry = bundled_registry().unwrap();
     let mut infigraph = Infigraph::open(project_dir.path(), registry).unwrap();
     infigraph.init().unwrap();
+    let request = WriteRequest::IngestStructured {
+        schema_id: "test_schema".to_string(),
+        source: IngestSource::File("data.json".into()),
+    };
 
-    let staging_dir = project_dir.path().join(".infigraph").join("requests");
-    std::fs::create_dir_all(&staging_dir).unwrap();
-    let request_path = staging_dir.join("test-ingest.request");
-    let result_path = staging_dir.join("test-ingest.result");
-    write_atomic(
-        &request_path,
-        &serde_json::to_string(&WriteRequest::IngestStructured {
-            schema_id: "test_schema".to_string(),
-            source: IngestSource::File("data.json".into()),
-        })
-        .unwrap(),
-    )
-    .unwrap();
+    let result = serve_write(&infigraph, &request);
 
-    serve_one_request(&infigraph, &request_path).unwrap();
-
-    let result: WriteResult =
-        serde_json::from_str(&std::fs::read_to_string(&result_path).unwrap()).unwrap();
     match result {
         WriteResult::Ok { indexed_files, .. } => assert_eq!(indexed_files, 2),
         WriteResult::Err { message } => panic!("expected Ok, got Err: {message}"),
@@ -212,7 +133,7 @@ node_table = "TestNode"
 }
 
 #[test]
-fn serve_one_request_handles_ingest_structured_inline() {
+fn serve_write_handles_ingest_structured_inline() {
     let project_dir = tempfile::tempdir().unwrap();
     let schema_dir = project_dir
         .path()
@@ -234,31 +155,22 @@ node_table = "TestNode"
     let mut infigraph = Infigraph::open(project_dir.path(), registry).unwrap();
     infigraph.init().unwrap();
 
-    let staging_dir = project_dir.path().join(".infigraph").join("requests");
+    let staging_dir = project_dir.path().join(".infigraph").join("write-tmp");
     std::fs::create_dir_all(&staging_dir).unwrap();
-    let request_path = staging_dir.join("test-inline.request");
-    let result_path = staging_dir.join("test-inline.result");
     let sibling_path = staging_dir.join("test-inline.data.json");
 
     write_atomic(&sibling_path, r#"[{"id": "a"}, {"id": "b"}, {"id": "c"}]"#).unwrap();
-    write_atomic(
-        &request_path,
-        &serde_json::to_string(&WriteRequest::IngestStructured {
-            schema_id: "test_schema".to_string(),
-            source: IngestSource::Inline,
-        })
-        .unwrap(),
-    )
-    .unwrap();
+    let request = WriteRequest::IngestStructured {
+        schema_id: "test_schema".to_string(),
+        source: IngestSource::Inline(sibling_path.clone()),
+    };
 
-    serve_one_request(&infigraph, &request_path).unwrap();
+    let result = serve_write(&infigraph, &request);
 
     assert!(
         !sibling_path.exists(),
         "sibling data file should be cleaned up after serving"
     );
-    let result: WriteResult =
-        serde_json::from_str(&std::fs::read_to_string(&result_path).unwrap()).unwrap();
     match result {
         WriteResult::Ok { indexed_files, .. } => assert_eq!(indexed_files, 3),
         WriteResult::Err { message } => panic!("expected Ok, got Err: {message}"),
@@ -267,29 +179,17 @@ node_table = "TestNode"
 }
 
 #[test]
-fn serve_one_request_handles_upsert_repo() {
+fn serve_write_handles_upsert_repo() {
     let project_dir = tempfile::tempdir().unwrap();
     let registry = bundled_registry().unwrap();
     let mut infigraph = Infigraph::open(project_dir.path(), registry).unwrap();
     infigraph.init().unwrap();
+    let request = WriteRequest::UpsertRepo {
+        namespace: "org/repo".to_string(),
+    };
 
-    let staging_dir = project_dir.path().join(".infigraph").join("requests");
-    std::fs::create_dir_all(&staging_dir).unwrap();
-    let request_path = staging_dir.join("test-repo.request");
-    let result_path = staging_dir.join("test-repo.result");
-    write_atomic(
-        &request_path,
-        &serde_json::to_string(&WriteRequest::UpsertRepo {
-            namespace: "org/repo".to_string(),
-        })
-        .unwrap(),
-    )
-    .unwrap();
+    let result = serve_write(&infigraph, &request);
 
-    serve_one_request(&infigraph, &request_path).unwrap();
-
-    let result: WriteResult =
-        serde_json::from_str(&std::fs::read_to_string(&result_path).unwrap()).unwrap();
     assert!(
         matches!(result, WriteResult::Ok { .. }),
         "expected Ok, got {result:?}"
@@ -297,7 +197,7 @@ fn serve_one_request_handles_upsert_repo() {
 }
 
 #[test]
-fn serve_one_request_handles_upsert_similar_edge() {
+fn serve_write_handles_upsert_similar_edge() {
     let project_dir = tempfile::tempdir().unwrap();
     std::fs::write(
         project_dir.path().join("main.py"),
@@ -315,26 +215,14 @@ fn serve_one_request_handles_upsert_similar_edge() {
         .symbols_with_docstring(None)
         .unwrap();
     assert!(symbols.len() >= 2, "expected at least 2 symbols to link");
+    let request = WriteRequest::UpsertSimilarEdge {
+        id_a: symbols[0].id.clone(),
+        id_b: symbols[1].id.clone(),
+        score: 0.9,
+    };
 
-    let staging_dir = project_dir.path().join(".infigraph").join("requests");
-    std::fs::create_dir_all(&staging_dir).unwrap();
-    let request_path = staging_dir.join("test-similar.request");
-    let result_path = staging_dir.join("test-similar.result");
-    write_atomic(
-        &request_path,
-        &serde_json::to_string(&WriteRequest::UpsertSimilarEdge {
-            id_a: symbols[0].id.clone(),
-            id_b: symbols[1].id.clone(),
-            score: 0.9,
-        })
-        .unwrap(),
-    )
-    .unwrap();
+    let result = serve_write(&infigraph, &request);
 
-    serve_one_request(&infigraph, &request_path).unwrap();
-
-    let result: WriteResult =
-        serde_json::from_str(&std::fs::read_to_string(&result_path).unwrap()).unwrap();
     assert!(
         matches!(result, WriteResult::Ok { .. }),
         "expected Ok, got {result:?}"
@@ -342,16 +230,14 @@ fn serve_one_request_handles_upsert_similar_edge() {
 }
 
 #[test]
-fn serve_one_request_handles_write_calls_service_edges() {
+fn serve_write_handles_write_calls_service_edges() {
     let project_dir = tempfile::tempdir().unwrap();
     let registry = bundled_registry().unwrap();
     let mut infigraph = Infigraph::open(project_dir.path(), registry).unwrap();
     infigraph.init().unwrap();
 
-    let staging_dir = project_dir.path().join(".infigraph").join("requests");
+    let staging_dir = project_dir.path().join(".infigraph").join("write-tmp");
     std::fs::create_dir_all(&staging_dir).unwrap();
-    let request_path = staging_dir.join("test-cse.request");
-    let result_path = staging_dir.join("test-cse.result");
     let edges_path = staging_dir.join("test-cse.edges.arrow");
 
     let edges = vec![
@@ -370,23 +256,16 @@ fn serve_one_request_handles_write_calls_service_edges() {
     ];
     infigraph_core::daemon_protocol::write_calls_service_edges_arrow(&edges_path, &edges).unwrap();
 
-    write_atomic(
-        &request_path,
-        &serde_json::to_string(&WriteRequest::WriteCallsServiceEdges {
-            edges_path: edges_path.clone(),
-        })
-        .unwrap(),
-    )
-    .unwrap();
+    let request = WriteRequest::WriteCallsServiceEdges {
+        edges_path: edges_path.clone(),
+    };
 
-    serve_one_request(&infigraph, &request_path).unwrap();
+    let result = serve_write(&infigraph, &request);
 
     assert!(
         !edges_path.exists(),
         "sibling edges file should be cleaned up after serving"
     );
-    let result: WriteResult =
-        serde_json::from_str(&std::fs::read_to_string(&result_path).unwrap()).unwrap();
     assert!(
         matches!(result, WriteResult::Ok { .. }),
         "expected Ok, got {result:?}"
@@ -394,16 +273,14 @@ fn serve_one_request_handles_write_calls_service_edges() {
 }
 
 #[test]
-fn serve_one_request_handles_write_cross_service_edges() {
+fn serve_write_handles_write_cross_service_edges() {
     let project_dir = tempfile::tempdir().unwrap();
     let registry = bundled_registry().unwrap();
     let mut infigraph = Infigraph::open(project_dir.path(), registry).unwrap();
     infigraph.init().unwrap();
 
-    let staging_dir = project_dir.path().join(".infigraph").join("requests");
+    let staging_dir = project_dir.path().join(".infigraph").join("write-tmp");
     std::fs::create_dir_all(&staging_dir).unwrap();
-    let request_path = staging_dir.join("test-xse.request");
-    let result_path = staging_dir.join("test-xse.result");
     let edges_path = staging_dir.join("test-xse.edges.arrow");
 
     let candidates = vec![
@@ -431,23 +308,16 @@ fn serve_one_request_handles_write_cross_service_edges() {
     infigraph_core::daemon_protocol::write_cross_service_edges_arrow(&edges_path, &candidates)
         .unwrap();
 
-    write_atomic(
-        &request_path,
-        &serde_json::to_string(&WriteRequest::WriteCrossServiceEdges {
-            edges_path: edges_path.clone(),
-        })
-        .unwrap(),
-    )
-    .unwrap();
+    let request = WriteRequest::WriteCrossServiceEdges {
+        edges_path: edges_path.clone(),
+    };
 
-    serve_one_request(&infigraph, &request_path).unwrap();
+    let result = serve_write(&infigraph, &request);
 
     assert!(
         !edges_path.exists(),
         "sibling edges file should be cleaned up after serving"
     );
-    let result: WriteResult =
-        serde_json::from_str(&std::fs::read_to_string(&result_path).unwrap()).unwrap();
     assert!(
         matches!(result, WriteResult::Ok { .. }),
         "expected Ok, got {result:?}"
@@ -455,7 +325,7 @@ fn serve_one_request_handles_write_cross_service_edges() {
 }
 
 #[test]
-fn serve_one_request_handles_upsert_dependencies() {
+fn serve_write_handles_upsert_dependencies() {
     let project_dir = tempfile::tempdir().unwrap();
     std::fs::write(
         project_dir.path().join("main.py"),
@@ -466,11 +336,6 @@ fn serve_one_request_handles_upsert_dependencies() {
     let mut infigraph = Infigraph::open(project_dir.path(), registry).unwrap();
     infigraph.init().unwrap();
     infigraph.index().unwrap();
-
-    let staging_dir = project_dir.path().join(".infigraph").join("requests");
-    std::fs::create_dir_all(&staging_dir).unwrap();
-    let request_path = staging_dir.join("test-deps.request");
-    let result_path = staging_dir.join("test-deps.result");
 
     let manifest_result = ManifestResult {
         ecosystem: "pypi".to_string(),
@@ -483,19 +348,12 @@ fn serve_one_request_handles_upsert_dependencies() {
         }],
         doc_urls: vec![],
     };
-    write_atomic(
-        &request_path,
-        &serde_json::to_string(&WriteRequest::UpsertDependencies {
-            result: manifest_result,
-        })
-        .unwrap(),
-    )
-    .unwrap();
+    let request = WriteRequest::UpsertDependencies {
+        result: manifest_result,
+    };
 
-    serve_one_request(&infigraph, &request_path).unwrap();
+    let result = serve_write(&infigraph, &request);
 
-    let result: WriteResult =
-        serde_json::from_str(&std::fs::read_to_string(&result_path).unwrap()).unwrap();
     assert!(
         matches!(result, WriteResult::Ok { .. }),
         "expected Ok, got {result:?}"
@@ -510,7 +368,7 @@ fn serve_one_request_handles_upsert_dependencies() {
 }
 
 #[test]
-fn serve_one_request_handles_store_clusters() {
+fn serve_write_handles_store_clusters() {
     let project_dir = tempfile::tempdir().unwrap();
     std::fs::write(
         project_dir.path().join("main.py"),
@@ -530,26 +388,14 @@ fn serve_one_request_handles_store_clusters() {
     assert!(!symbols.is_empty());
     let idx_to_id: Vec<String> = symbols.iter().map(|s| s.id.clone()).collect();
     let community: Vec<usize> = vec![0; idx_to_id.len()];
+    let request = WriteRequest::StoreClusters {
+        idx_to_id,
+        community,
+        modularity: 0.5,
+    };
 
-    let staging_dir = project_dir.path().join(".infigraph").join("requests");
-    std::fs::create_dir_all(&staging_dir).unwrap();
-    let request_path = staging_dir.join("test-clusters.request");
-    let result_path = staging_dir.join("test-clusters.result");
-    write_atomic(
-        &request_path,
-        &serde_json::to_string(&WriteRequest::StoreClusters {
-            idx_to_id,
-            community,
-            modularity: 0.5,
-        })
-        .unwrap(),
-    )
-    .unwrap();
+    let result = serve_write(&infigraph, &request);
 
-    serve_one_request(&infigraph, &request_path).unwrap();
-
-    let result: WriteResult =
-        serde_json::from_str(&std::fs::read_to_string(&result_path).unwrap()).unwrap();
     assert!(
         matches!(result, WriteResult::ClustersOk(ref stats) if stats.num_clusters == 1),
         "expected ClustersOk with num_clusters == 1, got {result:?}"
@@ -564,7 +410,7 @@ fn serve_one_request_handles_store_clusters() {
 }
 
 #[test]
-fn serve_one_request_handles_store_config_bindings() {
+fn serve_write_handles_store_config_bindings() {
     let project_dir = tempfile::tempdir().unwrap();
     std::fs::write(
         project_dir.path().join("main.py"),
@@ -586,11 +432,6 @@ fn serve_one_request_handles_store_config_bindings() {
         .map(|s| s.id.clone())
         .unwrap_or_else(|| "nonexistent".to_string());
 
-    let staging_dir = project_dir.path().join(".infigraph").join("requests");
-    std::fs::create_dir_all(&staging_dir).unwrap();
-    let request_path = staging_dir.join("test-config-bindings.request");
-    let result_path = staging_dir.join("test-config-bindings.result");
-
     let bindings = vec![ConfigBindingWire {
         symbol_id,
         kind: "EnvVar".to_string(),
@@ -599,16 +440,10 @@ fn serve_one_request_handles_store_config_bindings() {
         profile: "default".to_string(),
         source_file: "main.py".to_string(),
     }];
-    write_atomic(
-        &request_path,
-        &serde_json::to_string(&WriteRequest::StoreConfigBindings { bindings }).unwrap(),
-    )
-    .unwrap();
+    let request = WriteRequest::StoreConfigBindings { bindings };
 
-    serve_one_request(&infigraph, &request_path).unwrap();
+    let result = serve_write(&infigraph, &request);
 
-    let result: WriteResult =
-        serde_json::from_str(&std::fs::read_to_string(&result_path).unwrap()).unwrap();
     assert!(
         matches!(result, WriteResult::Ok { .. }),
         "expected Ok, got {result:?}"
@@ -623,7 +458,7 @@ fn serve_one_request_handles_store_config_bindings() {
 }
 
 #[test]
-fn serve_one_request_handles_derive_tested_by() {
+fn serve_write_handles_derive_tested_by() {
     let project_dir = tempfile::tempdir().unwrap();
     std::fs::write(
         project_dir.path().join("main.py"),
@@ -634,21 +469,10 @@ fn serve_one_request_handles_derive_tested_by() {
     let mut infigraph = Infigraph::open(project_dir.path(), registry).unwrap();
     infigraph.init().unwrap();
     infigraph.index().unwrap();
+    let request = WriteRequest::DeriveTestedBy { files: None };
 
-    let staging_dir = project_dir.path().join(".infigraph").join("requests");
-    std::fs::create_dir_all(&staging_dir).unwrap();
-    let request_path = staging_dir.join("test-tested-by.request");
-    let result_path = staging_dir.join("test-tested-by.result");
-    write_atomic(
-        &request_path,
-        &serde_json::to_string(&WriteRequest::DeriveTestedBy { files: None }).unwrap(),
-    )
-    .unwrap();
+    let result = serve_write(&infigraph, &request);
 
-    serve_one_request(&infigraph, &request_path).unwrap();
-
-    let result: WriteResult =
-        serde_json::from_str(&std::fs::read_to_string(&result_path).unwrap()).unwrap();
     match result {
         WriteResult::Ok { .. } => {}
         WriteResult::Err { message } => panic!("expected Ok, got Err: {message}"),
@@ -673,7 +497,7 @@ fn file_in_graph(infigraph: &Infigraph, file: &str) -> bool {
 /// themselves carry enums and `Option`s, which is exactly why these do not
 /// use the Arrow IPC sibling format the flat edge-writing paths use.
 #[test]
-fn serve_one_request_handles_the_extraction_carrying_writes() {
+fn serve_write_handles_the_extraction_carrying_writes() {
     let project_dir = tempfile::tempdir().unwrap();
     // Deliberately a CROSS-file call: `ResolveStats::total_calls` counts
     // calls still dangling after extraction, and a same-file call is already
@@ -700,39 +524,33 @@ fn serve_one_request_handles_the_extraction_carrying_writes() {
         "expected both files to be parsed"
     );
 
-    let staging_dir = project_dir.path().join(".infigraph").join("requests");
+    let staging_dir = project_dir.path().join(".infigraph").join("write-tmp");
     std::fs::create_dir_all(&staging_dir).unwrap();
 
     // RemoveFiles takes the file back out...
-    let request_path = staging_dir.join("remove.request");
-    write_atomic(
-        &request_path,
-        &serde_json::to_string(&WriteRequest::RemoveFiles {
-            files: vec!["main.py".to_string()],
-        })
-        .unwrap(),
-    )
-    .unwrap();
-    serve_one_request(&infigraph, &request_path).unwrap();
+    let request = WriteRequest::RemoveFiles {
+        files: vec!["main.py".to_string()],
+    };
+    assert!(matches!(
+        serve_write(&infigraph, &request),
+        WriteResult::Ok { .. }
+    ));
     assert!(
         !file_in_graph(&infigraph, "main.py"),
         "RemoveFiles must have deleted the File node"
     );
 
     // ...and UpsertFilesBulk puts it back, from the JSON sibling alone.
-    let request_path = staging_dir.join("bulk.request");
     let extractions_path = staging_dir.join("bulk.extractions.json");
     write_extractions_json(&extractions_path, &indexed.extractions).unwrap();
-    write_atomic(
-        &request_path,
-        &serde_json::to_string(&WriteRequest::UpsertFilesBulk {
-            extractions_path: extractions_path.clone(),
-            existing_hashes_empty: false,
-        })
-        .unwrap(),
-    )
-    .unwrap();
-    serve_one_request(&infigraph, &request_path).unwrap();
+    let request = WriteRequest::UpsertFilesBulk {
+        extractions_path: extractions_path.clone(),
+        existing_hashes_empty: false,
+    };
+    assert!(matches!(
+        serve_write(&infigraph, &request),
+        WriteResult::Ok { .. }
+    ));
     assert!(
         file_in_graph(&infigraph, "main.py"),
         "UpsertFilesBulk must have restored the File node from the sibling file"
@@ -743,22 +561,13 @@ fn serve_one_request_handles_the_extraction_carrying_writes() {
     );
 
     // ResolveCalls must report real stats, not `Ok`'s two lossy counters.
-    let request_path = staging_dir.join("resolve.request");
     let extractions_path = staging_dir.join("resolve.extractions.json");
     write_extractions_json(&extractions_path, &indexed.extractions).unwrap();
-    write_atomic(
-        &request_path,
-        &serde_json::to_string(&WriteRequest::ResolveCalls {
-            extractions_path,
-            use_learned: false,
-        })
-        .unwrap(),
-    )
-    .unwrap();
-    serve_one_request(&infigraph, &request_path).unwrap();
-    let result: WriteResult =
-        serde_json::from_str(&std::fs::read_to_string(staging_dir.join("resolve.result")).unwrap())
-            .unwrap();
+    let request = WriteRequest::ResolveCalls {
+        extractions_path,
+        use_learned: false,
+    };
+    let result = serve_write(&infigraph, &request);
     match result {
         WriteResult::ResolveOk(stats) => assert!(
             stats.total_calls > 0,

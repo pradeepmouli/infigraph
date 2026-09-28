@@ -1,5 +1,5 @@
 use crate::daemon::queue::{DrainedQueue, PendingIndexItem, WaiterKind};
-use crate::daemon_protocol::{write_atomic, WriteResult};
+use crate::daemon_protocol::WriteResult;
 use crate::model::FileExtraction;
 use crate::resolve::ResolveStats;
 use crate::Infigraph;
@@ -14,6 +14,8 @@ use std::path::Path;
 pub(crate) struct DrainOutcome {
     pub extractions: Vec<FileExtraction>,
     pub resolve_stats: ResolveStats,
+    /// Every path this drain removed, for `RemoveFiles` waiters' counts.
+    pub removals: Vec<String>,
 }
 
 /// Runs one combined pass -- extract, upsert, remove, resolve -- against
@@ -23,7 +25,44 @@ pub(crate) struct DrainOutcome {
 /// snapshot, so no operation plans against information another operation
 /// has since made stale.
 #[allow(dead_code)]
-pub(crate) fn execute_drain(infigraph: &Infigraph, drained: DrainedQueue) -> Result<DrainOutcome> {
+pub(crate) fn execute_drain(
+    infigraph: &Infigraph,
+    mut drained: DrainedQueue,
+) -> Result<DrainOutcome> {
+    let waiters = std::mem::take(&mut drained.waiters);
+    let use_learned = waiters
+        .iter()
+        .any(|w| w.kind == WaiterKind::ResolveCalls && w.use_learned);
+    match run_drain(infigraph, drained, use_learned) {
+        Ok(outcome) => {
+            for waiter in waiters {
+                let result = reply_for(&waiter, &outcome);
+                waiter.reply.send(result);
+            }
+            Ok(outcome)
+        }
+        // Answered here, with the real cause: `Drop` would only say the
+        // write was dropped.
+        Err(e) => {
+            let message = format!("daemon drain failed: {e}");
+            for waiter in waiters {
+                waiter.reply.send(WriteResult::Err {
+                    message: message.clone(),
+                });
+            }
+            Err(e)
+        }
+    }
+}
+
+/// One combined pass -- extract, upsert, remove, resolve -- over everything
+/// `drained` accumulated. Its waiters were taken out first, by
+/// `execute_drain`, which answers them.
+fn run_drain(
+    infigraph: &Infigraph,
+    drained: DrainedQueue,
+    use_learned: bool,
+) -> Result<DrainOutcome> {
     let backend = infigraph
         .backend()
         .ok_or_else(|| anyhow::anyhow!("graph not initialized"))?;
@@ -88,10 +127,6 @@ pub(crate) fn execute_drain(infigraph: &Infigraph, drained: DrainedQueue) -> Res
         backend.upsert_files_bulk(&extractions, existing_hashes_empty)?;
     }
 
-    let use_learned = drained
-        .waiters
-        .iter()
-        .any(|w| w.kind == WaiterKind::ResolveCalls && w.use_learned);
     let learned = if use_learned {
         Some(crate::learned::LearnedStore::load(infigraph.root()))
     } else {
@@ -118,46 +153,52 @@ pub(crate) fn execute_drain(infigraph: &Infigraph, drained: DrainedQueue) -> Res
         });
     extractions.truncate(extractions_count);
 
-    for waiter in &drained.waiters {
-        // Scoped to the waiter's own requested paths when it named any --
-        // otherwise a targeted request (e.g. a single-file `Index`) would
-        // report a count that includes unrelated concurrent work folded
-        // into the same drain. `paths: None` means the waiter is inherently
-        // whole-batch scoped (whole-project `Index`), for which the
-        // batch-wide count below is the correct answer.
-        let result = match waiter.kind {
-            WaiterKind::Index | WaiterKind::UpsertFilesBulk => {
-                let count = match &waiter.paths {
-                    Some(paths) => extractions
-                        .iter()
-                        .filter(|&e| paths.contains(&e.file))
-                        .count(),
-                    None => extractions.len(),
-                };
-                WriteResult::Ok {
-                    total_files: count,
-                    indexed_files: count,
-                }
-            }
-            WaiterKind::RemoveFiles => {
-                let count = match &waiter.paths {
-                    Some(paths) => removals.iter().filter(|&r| paths.contains(r)).count(),
-                    None => removals.len(),
-                };
-                WriteResult::Ok {
-                    total_files: count,
-                    indexed_files: count,
-                }
-            }
-            WaiterKind::ResolveCalls => WriteResult::ResolveOk(resolve_stats.clone()),
-        };
-        write_atomic(&waiter.reply_path, &serde_json::to_string(&result)?)?;
-    }
-
     Ok(DrainOutcome {
         extractions,
         resolve_stats,
+        removals,
     })
+}
+
+/// What one waiter is told about a drain it was folded into.
+fn reply_for(waiter: &crate::daemon::queue::Waiter, outcome: &DrainOutcome) -> WriteResult {
+    // Scoped to the waiter's own requested paths when it named any --
+    // otherwise a targeted request (e.g. a single-file `Index`) would
+    // report a count that includes unrelated concurrent work folded
+    // into the same drain. `paths: None` means the waiter is inherently
+    // whole-batch scoped (whole-project `Index`), for which the
+    // batch-wide count below is the correct answer.
+    match waiter.kind {
+        WaiterKind::Index | WaiterKind::UpsertFilesBulk => {
+            let count = match &waiter.paths {
+                Some(paths) => outcome
+                    .extractions
+                    .iter()
+                    .filter(|&e| paths.contains(&e.file))
+                    .count(),
+                None => outcome.extractions.len(),
+            };
+            WriteResult::Ok {
+                total_files: count,
+                indexed_files: count,
+            }
+        }
+        WaiterKind::RemoveFiles => {
+            let count = match &waiter.paths {
+                Some(paths) => outcome
+                    .removals
+                    .iter()
+                    .filter(|&r| paths.contains(r))
+                    .count(),
+                None => outcome.removals.len(),
+            };
+            WriteResult::Ok {
+                total_files: count,
+                indexed_files: count,
+            }
+        }
+        WaiterKind::ResolveCalls => WriteResult::ResolveOk(outcome.resolve_stats.clone()),
+    }
 }
 
 #[cfg(test)]
@@ -167,6 +208,7 @@ mod tests {
     //! process needed to prove the coalescing logic itself is correct. See
     //! docs/superpowers/specs/2026-08-03-daemon-index-work-queue-design.md.
     use super::*;
+    use crate::daemon::coordinator_port::WriteReply;
     use crate::daemon::queue::{IndexWorkQueue, Waiter};
     use crate::lang::{LanguagePack, LanguageRegistry};
     use std::fs;
@@ -222,21 +264,22 @@ mod tests {
     /// that the build runs on `drain_rt`.
     fn drive_full_reindex_sync<MR>(
         root: &std::path::Path,
-        request_path: &std::path::Path,
         queue: &std::sync::Arc<std::sync::Mutex<crate::daemon::queue::IndexWorkQueue>>,
         make_registry: &MR,
         held: &mut crate::daemon::HeldPrism,
-    ) where
+    ) -> WriteResult
+    where
         MR: Fn() -> Result<crate::lang::LanguageRegistry>,
     {
+        let (reply, rx) = WriteReply::channel();
         let drain_rt = tokio::runtime::Runtime::new().unwrap();
         // Fresh, unparented token: none of this file's tests exercise
         // cancellation, so there's no daemon-lifetime token to thread
         // through this synchronous test helper.
         let daemon_token = tokio_util::sync::CancellationToken::new();
-        if let Some(in_flight) = crate::daemon::try_start_full_reindex(
+        if let Ok(Some(in_flight)) = crate::daemon::try_start_full_reindex(
             root,
-            request_path,
+            reply,
             queue,
             make_registry,
             false,
@@ -246,14 +289,14 @@ mod tests {
             let registry = std::sync::Arc::new(make_registry().unwrap());
             let (guard, _) = crate::daemon::finish_full_reindex(
                 root,
-                &in_flight.reply_paths,
+                in_flight.replies,
                 &registry,
                 held,
                 drain_rt.block_on(in_flight.task.join()),
             );
-            std::fs::remove_file(&in_flight.request_path).ok();
             drop(guard);
         }
+        rx.recv().expect("every outcome answers the reply")
     }
 
     #[test]
@@ -276,11 +319,11 @@ mod tests {
         let mut queue = IndexWorkQueue::new();
         queue.add_raw("fourth.py".to_string());
 
-        let result_path = tmp.path().join("waiter.result");
+        let (reply, reply_rx) = WriteReply::channel();
         queue.add_waiter(Waiter {
             kind: WaiterKind::Index,
             use_learned: false,
-            reply_path: result_path.clone(),
+            reply,
             paths: None,
         });
 
@@ -296,8 +339,7 @@ mod tests {
         assert_eq!(outcome.extractions[0].file, "fourth.py");
 
         // The waiter's reply reflects the real combined execution.
-        let reply_contents = fs::read_to_string(&result_path).unwrap();
-        let reply: WriteResult = serde_json::from_str(&reply_contents).unwrap();
+        let reply = reply_rx.recv().unwrap();
         match reply {
             WriteResult::Ok { indexed_files, .. } => {
                 assert_eq!(indexed_files, 1);
@@ -368,17 +410,7 @@ mod tests {
         let mut held = crate::daemon::HeldPrism::new();
         let make_registry = || Ok(python_registry());
 
-        let request_path = root.join(".infigraph").join("fullreindex.request");
-        fs::write(
-            &request_path,
-            serde_json::to_string(&crate::daemon_protocol::WriteRequest::FullReindex).unwrap(),
-        )
-        .unwrap();
-
-        drive_full_reindex_sync(root, &request_path, &queue, &make_registry, &mut held);
-
-        let reply_path = request_path.with_extension("result");
-        serde_json::from_str(&fs::read_to_string(&reply_path).unwrap()).unwrap()
+        drive_full_reindex_sync(root, &queue, &make_registry, &mut held)
     }
 
     /// Names in `.infigraph/` set aside into the retirement or corruption pool.
@@ -528,19 +560,8 @@ mod tests {
         let mut held = crate::daemon::HeldPrism::new();
         let make_registry = || Ok(python_registry());
 
-        let request_path = infigraph_dir.join("fullreindex.request");
-        fs::write(
-            &request_path,
-            serde_json::to_string(&crate::daemon_protocol::WriteRequest::FullReindex).unwrap(),
-        )
-        .unwrap();
+        let reply = drive_full_reindex_sync(root, &queue, &make_registry, &mut held);
 
-        drive_full_reindex_sync(root, &request_path, &queue, &make_registry, &mut held);
-
-        let reply: crate::daemon_protocol::WriteResult = serde_json::from_str(
-            &fs::read_to_string(request_path.with_extension("result")).unwrap(),
-        )
-        .unwrap();
         assert!(
             matches!(
                 reply,
@@ -585,14 +606,11 @@ mod tests {
         let mut held = crate::daemon::HeldPrism::new();
         let make_registry = || Ok(python_registry());
 
-        let request_path = root.join(".infigraph").join("fullreindex.request");
-        fs::write(
-            &request_path,
-            serde_json::to_string(&crate::daemon_protocol::WriteRequest::FullReindex).unwrap(),
-        )
-        .unwrap();
-
-        drive_full_reindex_sync(root, &request_path, &queue, &make_registry, &mut held);
+        let reply = drive_full_reindex_sync(root, &queue, &make_registry, &mut held);
+        assert!(
+            matches!(reply, WriteResult::FullReindexOk { .. }),
+            "{reply:?}"
+        );
 
         let verify =
             crate::graph::KuzuBackend::open_read_only(&root.join(".infigraph").join("graph"))
@@ -637,18 +655,8 @@ mod tests {
         let mut held = crate::daemon::HeldPrism::new();
         let make_registry = || Err(anyhow::anyhow!("injected registry failure"));
 
-        let request_path = root.join(".infigraph").join("fullreindex.request");
-        fs::write(
-            &request_path,
-            serde_json::to_string(&crate::daemon_protocol::WriteRequest::FullReindex).unwrap(),
-        )
-        .unwrap();
+        let reply = drive_full_reindex_sync(root, &queue, &make_registry, &mut held);
 
-        drive_full_reindex_sync(root, &request_path, &queue, &make_registry, &mut held);
-
-        let reply_path = request_path.with_extension("result");
-        let reply: crate::daemon_protocol::WriteResult =
-            serde_json::from_str(&fs::read_to_string(&reply_path).unwrap()).unwrap();
         match reply {
             crate::daemon_protocol::WriteResult::Err { message } => {
                 assert!(
@@ -699,28 +707,24 @@ mod tests {
             crate::daemon::queue::IndexWorkQueue::new(),
         ));
         // A request queued but not yet executing when FullReindex arrives.
-        let superseded_reply = root.join(".infigraph").join("superseded.result");
+        let (superseded_reply, superseded_reply_rx) = WriteReply::channel();
         queue.lock().unwrap().add_waiter(Waiter {
             kind: WaiterKind::Index,
             use_learned: false,
-            reply_path: superseded_reply.clone(),
+            reply: superseded_reply,
             paths: None,
         });
 
         let mut held = crate::daemon::HeldPrism::new();
         let make_registry = || Ok(python_registry());
 
-        let request_path = root.join(".infigraph").join("fullreindex.request");
-        fs::write(
-            &request_path,
-            serde_json::to_string(&crate::daemon_protocol::WriteRequest::FullReindex).unwrap(),
-        )
-        .unwrap();
+        let reply = drive_full_reindex_sync(root, &queue, &make_registry, &mut held);
+        assert!(
+            matches!(reply, WriteResult::FullReindexOk { .. }),
+            "{reply:?}"
+        );
 
-        drive_full_reindex_sync(root, &request_path, &queue, &make_registry, &mut held);
-
-        let reply: crate::daemon_protocol::WriteResult =
-            serde_json::from_str(&fs::read_to_string(&superseded_reply).unwrap()).unwrap();
+        let reply: crate::daemon_protocol::WriteResult = superseded_reply_rx.recv().unwrap();
         match reply {
             crate::daemon_protocol::WriteResult::Err { message } => {
                 assert!(
@@ -822,20 +826,20 @@ mod tests {
         queue.add_raw("b.py".to_string());
 
         // A targeted waiter that only ever asked about a.py.
-        let targeted_reply = tmp.path().join("targeted.result");
+        let (targeted_reply, targeted_reply_rx) = WriteReply::channel();
         queue.add_waiter(Waiter {
             kind: WaiterKind::Index,
             use_learned: false,
-            reply_path: targeted_reply.clone(),
+            reply: targeted_reply,
             paths: Some(vec!["a.py".to_string()]),
         });
 
         // A whole-project waiter, riding along in the same drain.
-        let whole_project_reply = tmp.path().join("whole-project.result");
+        let (whole_project_reply, whole_project_reply_rx) = WriteReply::channel();
         queue.add_waiter(Waiter {
             kind: WaiterKind::Index,
             use_learned: false,
-            reply_path: whole_project_reply.clone(),
+            reply: whole_project_reply,
             paths: None,
         });
 
@@ -847,8 +851,7 @@ mod tests {
             "test setup is wrong: both a.py and b.py should have been re-extracted"
         );
 
-        let targeted: WriteResult =
-            serde_json::from_str(&fs::read_to_string(&targeted_reply).unwrap()).unwrap();
+        let targeted: WriteResult = targeted_reply_rx.recv().unwrap();
         match targeted {
             WriteResult::Ok { indexed_files, .. } => assert_eq!(
                 indexed_files, 1,
@@ -858,8 +861,7 @@ mod tests {
             other => panic!("expected WriteResult::Ok, got {other:?}"),
         }
 
-        let whole_project: WriteResult =
-            serde_json::from_str(&fs::read_to_string(&whole_project_reply).unwrap()).unwrap();
+        let whole_project: WriteResult = whole_project_reply_rx.recv().unwrap();
         match whole_project {
             WriteResult::Ok { indexed_files, .. } => assert_eq!(
                 indexed_files, 2,

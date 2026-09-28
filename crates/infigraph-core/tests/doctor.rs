@@ -1173,7 +1173,7 @@ fn check_watchers_passes_for_a_daemon_with_a_client_leasing() {
 
     let liveness = std::sync::Arc::new(infigraph_core::daemon::liveness::Liveness::new());
     liveness.lease_opened();
-    let (port, _rx) = infigraph_core::daemon::control_port::ControlPort::new(1800, 60);
+    let (port, _rx) = infigraph_core::daemon::coordinator_port::CoordinatorPort::new(1800, 60);
     let svc = infigraph_core::daemon::read_service::ReadService::start_serving(
         &project,
         std::sync::Arc::new(|| None),
@@ -1825,7 +1825,7 @@ fn check_watchers_judges_a_never_heartbeating_daemon_by_its_status() {
     );
     let liveness = std::sync::Arc::new(infigraph_core::daemon::liveness::Liveness::new());
     liveness.lease_opened();
-    let (port, _rx) = infigraph_core::daemon::control_port::ControlPort::new(1800, 60);
+    let (port, _rx) = infigraph_core::daemon::coordinator_port::CoordinatorPort::new(1800, 60);
     let svc = infigraph_core::daemon::read_service::ReadService::start_serving(
         &project,
         std::sync::Arc::new(|| None),

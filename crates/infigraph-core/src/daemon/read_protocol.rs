@@ -172,29 +172,51 @@ pub trait DaemonOp: Serialize + DeserializeOwned {
     /// Whether serving this op counts as the daemon being used. No default:
     /// every op must answer.
     const KEEPS_ALIVE: bool;
+    /// Whether the daemon sends an admission frame before the reply. No
+    /// default, for the same reason as `KEEPS_ALIVE`.
+    const ACKED: bool;
 }
 
 impl DaemonOp for ReadRequest {
     // Streamed as `ReadFrame`s, not one `OpReply`; named for completeness.
     type Reply = Vec<Vec<String>>;
     const KEEPS_ALIVE: bool = true;
+    const ACKED: bool = false;
 }
 
 impl DaemonOp for StatusFrame {
     type Reply = StatusReport;
     const KEEPS_ALIVE: bool = false;
+    const ACKED: bool = false;
 }
 
 impl DaemonOp for ControlFrame {
     type Reply = ();
     const KEEPS_ALIVE: bool = false;
+    const ACKED: bool = false;
+}
+
+/// A data write (#204). Answered with two frames: an admission
+/// `OpReply<()>` once the coordinator has the request, then the
+/// `OpReply<WriteResult>` outcome -- so a client can tell a daemon that could
+/// not parse the frame (EOF before admission) from one that died serving it
+/// (EOF after).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WriteFrame {
+    pub write: crate::daemon_protocol::WriteRequest,
+}
+
+impl DaemonOp for WriteFrame {
+    type Reply = crate::daemon_protocol::WriteResult;
+    const KEEPS_ALIVE: bool = true;
+    const ACKED: bool = true;
 }
 
 /// The first frame of every connection. `untagged` keeps a `ReadRequest`
 /// byte-identical on the wire, so clients from before leases still parse;
 /// `Attach`'s field is one no `ReadRequest` has, so the two never collide.
 /// `Status` and `Control` are single-key objects whose key no other frame
-/// has (#155).
+/// has (#155). `Write` (#204) is the same single-key shape.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ClientFrame {
@@ -202,6 +224,7 @@ pub enum ClientFrame {
     Read(ReadRequest),
     Status(StatusFrame),
     Control(ControlFrame),
+    Write(WriteFrame),
 }
 
 impl ClientFrame {
@@ -214,6 +237,7 @@ impl ClientFrame {
             ClientFrame::Read(_) => Some(ReadRequest::KEEPS_ALIVE),
             ClientFrame::Status(_) => Some(StatusFrame::KEEPS_ALIVE),
             ClientFrame::Control(_) => Some(ControlFrame::KEEPS_ALIVE),
+            ClientFrame::Write(_) => Some(WriteFrame::KEEPS_ALIVE),
         }
     }
 }
@@ -489,5 +513,37 @@ mod malformed_frame_tests {
             .to_string();
         assert!(err.contains("invalid type"), "{err}");
         assert!(!err.contains("did not match any variant"), "{err}");
+    }
+
+    #[test]
+    fn a_write_frame_round_trips_and_is_no_other_frame() {
+        let frame = WriteFrame {
+            write: crate::daemon_protocol::WriteRequest::FullReindex,
+        };
+        let bytes = serde_json::to_vec(&frame).unwrap();
+        assert_eq!(bytes, br#"{"write":"FullReindex"}"#);
+        let mut framed = (bytes.len() as u32).to_le_bytes().to_vec();
+        framed.extend_from_slice(&bytes);
+        match read_client_frame(&mut framed.as_slice()).unwrap() {
+            ClientFrame::Write(w) => {
+                assert_eq!(w.write, crate::daemon_protocol::WriteRequest::FullReindex)
+            }
+            other => panic!("parsed as {other:?}"),
+        }
+    }
+
+    #[test]
+    fn only_writes_are_acked_and_writes_keep_the_daemon_alive() {
+        fn acked<O: DaemonOp>() -> bool {
+            O::ACKED
+        }
+        assert!(acked::<WriteFrame>());
+        assert!(!acked::<ReadRequest>());
+        assert!(!acked::<StatusFrame>());
+        assert!(!acked::<ControlFrame>());
+        let w = ClientFrame::Write(WriteFrame {
+            write: crate::daemon_protocol::WriteRequest::FullReindex,
+        });
+        assert_eq!(w.keeps_alive(), Some(true));
     }
 }

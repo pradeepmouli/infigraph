@@ -1,6 +1,6 @@
 pub(crate) mod backoff;
 pub mod control;
-pub mod control_port;
+pub mod coordinator_port;
 pub(crate) mod drain;
 pub mod fault;
 pub mod lease;
@@ -12,6 +12,7 @@ pub mod read_guard;
 pub mod read_protocol;
 pub mod read_service;
 pub mod task;
+pub mod writes;
 
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
@@ -21,12 +22,14 @@ use anyhow::Result;
 use tokio_util::sync::CancellationToken;
 
 use crate::daemon::backoff::ReopenBackoff;
+use crate::daemon::coordinator_port::WriteReply;
 use crate::daemon::queue::IndexWorkQueue;
 use crate::daemon::task::Task;
-use crate::daemon_protocol::{WatchAction, WatchRole};
+use crate::daemon_protocol::{WatchAction, WatchRole, WriteRequest, WriteResult};
 use crate::ops::{begin_index_op, IndexOpOutcome};
 use crate::watch::{config, producer, CodeWatch, WatchEvent, WatchEventKind};
 use crate::Infigraph;
+use std::collections::VecDeque;
 
 /// How long one coordinator tick waits before looking again. The fsevent
 /// half moved to `producer::run_producer`, so this loop no longer blocks on
@@ -173,10 +176,11 @@ fn spawn_scip_enrich(
     cb: Arc<FullReindexCallback>,
     root: PathBuf,
     job: ScipEnrichJob,
+    submitter: coordinator_port::WriteSubmitter,
 ) -> Task<()> {
     let _guard = drain_rt.enter();
     Task::spawn_blocking(daemon_token, "scip-enrich", move |token| {
-        cb(root, job, token);
+        cb(root, job, token, submitter);
     })
 }
 
@@ -282,7 +286,9 @@ fn current_on_disk_build_hash() -> Option<String> {
 /// so it never needs the graph -- and holding the prism for that long kept
 /// its `Database` alive past `poison_watch_db`, which is how a reopen came to
 /// open a second `Database` on the same file (#166).
-pub type FullReindexCallback = dyn Fn(PathBuf, ScipEnrichJob, CancellationToken) + Send + Sync;
+pub type FullReindexCallback = dyn Fn(PathBuf, ScipEnrichJob, CancellationToken, coordinator_port::WriteSubmitter)
+    + Send
+    + Sync;
 
 /// Caller-supplied handle on doc-watching, which lives in `infigraph-docs`,
 /// a crate this one does not depend on. The coordinator dispatches
@@ -667,10 +673,10 @@ where
     let idle = daemon_idle_settings(root);
     // #155: what `Status` reads, and the channel `Control` reaches this loop
     // through. Owned here, like `liveness`, so a #187 rebind keeps it.
-    let (control_port, control_rx) =
-        control_port::ControlPort::new(idle.grace_secs, idle.check_secs.max(1));
+    let (port, port_rx) =
+        coordinator_port::CoordinatorPort::new(idle.grace_secs, idle.check_secs.max(1));
     if docs_control.is_some() {
-        control_port.state.set_role(
+        port.state.set_role(
             WatchRole::Docs,
             crate::daemon::read_protocol::RoleState::Starting,
         );
@@ -699,10 +705,19 @@ where
             if swept > 0 {
                 eprintln!("[read] swept {swept} read endpoint(s) left by daemons that are gone");
             }
+            // #204: write sidecars whose client died before this daemon read them.
+            let swept = crate::scratch::sweep_older_than(
+                &root.join(".infigraph").join(writes::SIDECAR_DIR),
+                SIDECAR_STALE_AFTER,
+                &["json", "arrow"],
+            );
+            if swept > 0 {
+                eprintln!("[daemon] swept {swept} write sidecar(s) left by clients that are gone");
+            }
 
             let root = root.to_path_buf();
             let liveness = liveness.clone();
-            let control_port = control_port.clone();
+            let port = port.clone();
             Box::new(move || {
                 match read_service::ReadService::start_serving(
                     &root,
@@ -710,7 +725,7 @@ where
                     docs_reads.clone(),
                     READ_SERVICE_WORKERS,
                     liveness.clone(),
-                    Some(control_port.clone()),
+                    Some(port.clone()),
                 ) {
                     Ok(svc) => Some(svc),
                     Err(e) => {
@@ -861,6 +876,13 @@ where
     // direct-callback SCIP-enrichment path's own background task, not this
     // request-driven import.
     let mut scip_import_in_flight: Option<PendingScipImport> = None;
+    // #204: every write that has arrived and not yet started, in order.
+    let mut deferred: std::collections::VecDeque<(
+        crate::daemon_protocol::WriteRequest,
+        coordinator_port::WriteReply,
+    )> = std::collections::VecDeque::new();
+    // The first tick sweeps: a pre-#204 client may be waiting already.
+    let mut last_legacy_sweep = std::time::Instant::now() - LEGACY_SWEEP_INTERVAL;
     // #183: when the per-table compaction drift was last sampled. `None`
     // until the first sample, so the first idle tick measures immediately
     // rather than waiting out a full interval.
@@ -928,7 +950,8 @@ where
                 || scip_in_flight.is_some()
                 || scip_import_in_flight.is_some()
                 || docs_control.as_ref().is_some_and(|d| d.is_busy())
-                || has_pending_request(&root.join(".infigraph").join("requests"))
+                || !deferred.is_empty()
+                || port.in_flight() > 0
         };
     }
 
@@ -1113,11 +1136,9 @@ where
             let InFlightDrain {
                 handle,
                 prism,
-                waiter_replies,
                 removed_in_drain,
             } = drain_in_flight.take().expect("checked is_some just above");
-            let (guard, finish) =
-                finish_drain(&infigraph_dir, drain_rt.block_on(handle), &waiter_replies);
+            let (guard, finish) = finish_drain(&infigraph_dir, drain_rt.block_on(handle));
             match finish {
                 DrainFinish::Completed(outcome) => {
                     fault::clear(&infigraph_dir, None);
@@ -1204,21 +1225,16 @@ where
             .as_ref()
             .is_some_and(|f| f.task.is_finished())
         {
-            let PendingFullReindex {
-                task,
-                request_path,
-                reply_paths,
-            } = full_reindex_in_flight
+            let PendingFullReindex { task, replies } = full_reindex_in_flight
                 .take()
                 .expect("checked is_some just above");
             let (guard, scheduled_languages) = finish_full_reindex(
                 root,
-                &reply_paths,
+                replies,
                 &shared_registry,
                 &mut held_prism,
                 drain_rt.block_on(task.join()),
             );
-            std::fs::remove_file(&request_path).ok();
             drop(guard);
 
             if let Some(languages) = scheduled_languages {
@@ -1269,6 +1285,7 @@ where
                             ast_generation,
                             scip_generation,
                         },
+                        coordinator_port::WriteSubmitter::new(port.clone()),
                     ));
                 }
             }
@@ -1355,6 +1372,7 @@ where
                                         ast_generation: ast,
                                         scip_generation: scip,
                                     },
+                                    coordinator_port::WriteSubmitter::new(port.clone()),
                                 ));
                             }
                             // An empty graph has nothing to enrich; leave the
@@ -1389,20 +1407,18 @@ where
         {
             let PendingScipImport {
                 task,
-                request_path,
-                reply_path,
+                reply,
                 indexer_label,
             } = scip_import_in_flight
                 .take()
                 .expect("checked is_some just above");
             let (guard, touched_files) = finish_scip_import(
                 root,
-                &reply_path,
+                reply,
                 &held_prism,
                 indexer_label.as_deref(),
                 drain_rt.block_on(task.join()),
             );
-            std::fs::remove_file(&request_path).ok();
             drop(guard);
 
             if let Some(prism) = held_prism.as_ref() {
@@ -1468,23 +1484,21 @@ where
             }
         }
 
-        // Serve file-dropped write requests -- daemon-mode only (never from
-        // in-process MCP watcher threads, which always pass
-        // serve_requests=false). Piggybacks on this loop's `COORDINATOR_TICK`
-        // cadence rather than a separate notify-based watch on the requests
-        // directory -- submit_write_request's own poll-with-backoff starts at
-        // 10ms and only reaches 200ms after several rounds, so this cadence
-        // is fine. The spec's event-driven upgrade (a second `notify::Watcher`
-        // scoped to `.infigraph/requests/`) is deferred: it needs a `select!`
-        // arm, and this coordinator is deliberately synchronous.
+        // Serve writes -- daemon-mode only (never from in-process MCP watcher
+        // threads, which always pass serve_requests=false). A write arrives on
+        // the port (#204) and wakes the `recv_timeout` at the bottom of this
+        // loop at once; it is routed here, with everything else deferred.
         if serve_requests {
             // R3.1.4a/c: translate a pending dead-holder-WAL sentinel into a
-            // synthetic FullReindex request (or a crash-loop refusal) before
-            // scanning for requests below, so this same tick's scan picks
-            // the synthetic request up immediately rather than waiting a
-            // full COORDINATOR_TICK.
-            if let Err(e) = crate::recovery::drain_recovery_sentinel(&infigraph_dir) {
-                eprintln!("[watch] recovery-sentinel handling failed: {e}");
+            // queued FullReindex (or a crash-loop refusal) before routing the
+            // deferred writes below, so this same tick starts it rather than
+            // waiting a full COORDINATOR_TICK.
+            match crate::recovery::recovery_rebuild_wanted(&infigraph_dir) {
+                Ok(true) => {
+                    request_internal_rebuild(&mut deferred, full_reindex_in_flight.is_some())
+                }
+                Ok(false) => {}
+                Err(e) => eprintln!("[watch] recovery-sentinel handling failed: {e}"),
             }
 
             // #183: scheduled compaction. Deliberately inside `serve_requests`
@@ -1560,52 +1574,66 @@ where
                                 "[daemon] compaction: requesting a rebuild ({})",
                                 if escalate { "escalated" } else { "drift" }
                             );
-                            if let Err(e) = submit_compaction_rebuild(&infigraph_dir) {
-                                eprintln!("[daemon] compaction: could not submit rebuild: {e}");
-                            }
+                            request_internal_rebuild(
+                                &mut deferred,
+                                full_reindex_in_flight.is_some(),
+                            );
                         }
                         Err(e) => eprintln!("[daemon] compaction: skipped, {e}"),
                     }
                 }
             }
 
-            let requests_dir = infigraph_dir.join("requests");
-            if let Ok(entries) = std::fs::read_dir(&requests_dir) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.extension().is_some_and(|ext| ext == "request") {
-                        // A write is activity (#38): a CLI that only writes
-                        // keeps the daemon up through its grace too.
-                        liveness.touch();
-                        if let Some(started) = route_or_serve_request(
-                            root,
-                            &path,
-                            &queue,
-                            &shared_registry,
-                            &make_registry,
-                            &mut held_prism,
-                            &mut reopen_backoff,
-                            drain_in_flight.is_some(),
-                            &mut full_reindex_in_flight,
-                            &drain_rt,
-                            daemon_token,
-                            scip_import_in_flight.is_some(),
-                        ) {
-                            match started {
-                                PendingWork::FullReindex(p) => full_reindex_in_flight = Some(p),
-                                PendingWork::ScipImport(p) => scip_import_in_flight = Some(p),
-                            }
+            if last_legacy_sweep.elapsed() >= LEGACY_SWEEP_INTERVAL {
+                last_legacy_sweep = std::time::Instant::now();
+                let refused = refuse_legacy_requests(&infigraph_dir);
+                if refused > 0 {
+                    eprintln!(
+                        "[daemon] refused {refused} file-drop request(s) from a pre-#204 client"
+                    );
+                }
+            }
+
+            // #204: every write waits here until it can start, in arrival
+            // order. A write whose client has left is dropped, not started.
+            let dropped = drop_gone(&mut deferred);
+            if dropped > 0 {
+                eprintln!("[daemon] dropped {dropped} write(s): their clients disconnected");
+            }
+            for (request, reply) in std::mem::take(&mut deferred) {
+                match route_write(
+                    root,
+                    request,
+                    reply,
+                    &queue,
+                    &shared_registry,
+                    &make_registry,
+                    &mut held_prism,
+                    &mut reopen_backoff,
+                    drain_in_flight.is_some(),
+                    &mut full_reindex_in_flight,
+                    &drain_rt,
+                    daemon_token,
+                    scip_import_in_flight.is_some(),
+                ) {
+                    Routed::Done => {}
+                    Routed::Started(PendingWork::FullReindex(p)) => {
+                        full_reindex_in_flight = Some(p);
+                        // Any rebuild answers a pending recovery sentinel.
+                        if let Err(e) = crate::recovery::rebuild_started(&infigraph_dir) {
+                            eprintln!("[watch] recovery-sentinel handling failed: {e}");
                         }
                     }
+                    Routed::Started(PendingWork::ScipImport(p)) => scip_import_in_flight = Some(p),
+                    Routed::NotYet(request, reply) => deferred.push_back((request, reply)),
                 }
             }
         } else if crate::recovery::pending_recovery(&infigraph_dir) {
             // A pending sentinel asks for a full reindex, and only the
-            // request-serving branch above can grant it: the drain works by
-            // writing a `FullReindex` request file that nothing else
-            // consumes. Draining it here would clear the sentinel and leave
-            // the request unread -- strictly worse than not draining, since
-            // the signal would be gone.
+            // request-serving branch above can grant it: draining it queues
+            // a `FullReindex` that only a daemon routes. Draining it here
+            // would clear the sentinel and queue nothing -- strictly worse
+            // than not draining, since the signal would be gone.
             //
             // So say so instead of failing silently. A project watched only
             // by an in-process MCP thread otherwise sits with a quarantined
@@ -1637,16 +1665,7 @@ where
                     match watch_db(root, &shared_registry, &mut held_prism) {
                         Ok(prism) => {
                             reopen_backoff.record_success();
-                            // Drained here on the loop thread rather than
-                            // inside the task, so a panicking task can't take
-                            // its waiters down with it -- `waiter_replies`
-                            // survives to be answered by `finish_drain`.
                             let drained = queue.lock().unwrap().drain();
-                            let waiter_replies: Vec<PathBuf> = drained
-                                .waiters
-                                .iter()
-                                .map(|w| w.reply_path.clone())
-                                .collect();
                             // R3.3.5: captured before `drained` moves into the
                             // task -- `DrainOutcome` only reports successful
                             // extractions, not removals, and a removal's
@@ -1665,7 +1684,6 @@ where
                             drain_in_flight = Some(InFlightDrain {
                                 handle,
                                 prism,
-                                waiter_replies,
                                 removed_in_drain,
                             });
                         }
@@ -1752,47 +1770,48 @@ where
             folded_since_sample = false;
         }
 
-        control_port.state.set_work_in_flight(work_in_flight!());
-        publish_roles(
-            &control_port.state,
-            &code_watch,
-            docs_control.as_ref(),
-            policy,
-        );
+        port.state.set_work_in_flight(work_in_flight!());
+        publish_roles(&port.state, &code_watch, docs_control.as_ref(), policy);
 
         // #155: wait on the control channel instead of sleeping, so a control
         // request wakes the loop at once. Everything queued is served now.
-        let mut next = control_rx.recv_timeout(COORDINATOR_TICK).ok();
+        let mut next = port_rx.recv_timeout(COORDINATOR_TICK).ok();
         while let Some(msg) = next.take() {
-            let control_port::ControlMsg { request, reply } = msg;
-            let outcome = apply_watch_control(
-                request.role,
-                request.action,
-                &mut code_watch,
-                docs_control.as_ref(),
-            );
-            let daemon_stop = is_daemon_stop(request.role, request.action, &outcome);
-            if matches!(request.action, WatchAction::Enable | WatchAction::Disable) {
-                policy = read_policy(root);
+            match msg {
+                // #204: routed on the next iteration, with everything else
+                // that is waiting to start.
+                coordinator_port::PortMsg::Write { request, reply } => {
+                    deferred.push_back((request, reply));
+                }
+                coordinator_port::PortMsg::Control(coordinator_port::ControlMsg {
+                    request,
+                    reply,
+                }) => {
+                    let outcome = apply_watch_control(
+                        request.role,
+                        request.action,
+                        &mut code_watch,
+                        docs_control.as_ref(),
+                    );
+                    let daemon_stop = is_daemon_stop(request.role, request.action, &outcome);
+                    if matches!(request.action, WatchAction::Enable | WatchAction::Disable) {
+                        policy = read_policy(root);
+                    }
+                    publish_roles(&port.state, &code_watch, docs_control.as_ref(), policy);
+                    // Replied before any teardown starts, so the client learns the
+                    // stop was accepted.
+                    let _ = reply.send(outcome);
+                    if daemon_stop {
+                        // Two separate signals, deliberately: the token tears down
+                        // background work, the flag ends this loop. See
+                        // `shutdown_requested`'s declaration.
+                        shutdown_requested = true;
+                        daemon_token.cancel();
+                        break;
+                    }
+                }
             }
-            publish_roles(
-                &control_port.state,
-                &code_watch,
-                docs_control.as_ref(),
-                policy,
-            );
-            // Replied before any teardown starts, so the client learns the
-            // stop was accepted.
-            let _ = reply.send(outcome);
-            if daemon_stop {
-                // Two separate signals, deliberately: the token tears down
-                // background work, the flag ends this loop. See
-                // `shutdown_requested`'s declaration.
-                shutdown_requested = true;
-                daemon_token.cancel();
-                break;
-            }
-            next = control_rx.try_recv().ok();
+            next = port_rx.try_recv().ok();
         }
         // A control stop ends the loop here, before another iteration can
         // start any new work.
@@ -1802,30 +1821,20 @@ where
         }
     }
 
-    // Refuse new control requests, and let the ones in flight finish writing
-    // their replies (a Daemon Stop's above all) before teardown and exit.
-    drop(control_rx);
-    if !control_port.wait_idle(Duration::from_secs(2)) {
-        eprintln!(
-            "[control] {} control reply(s) still in flight at shutdown",
-            control_port.in_flight()
-        );
-    }
-
-    // Stop the producer before waiting out the in-flight work below: it
-    // shares `queue`, and anything it adds after this point would be
-    // enqueued for a drain that is never going to run.
+    // Stop the producer before answering the queue and waiting out the
+    // in-flight work below: it shares `queue`, and anything it adds after
+    // this point would be enqueued for a drain that is never going to run.
     code_watch.stop();
+
+    // Refuse new requests, and tell every write that has not started that
+    // it never will (#204).
+    answer_pending_writes(port_rx, &mut deferred, &queue);
 
     // A drain still running when the loop exits holds `index.lock` and a
     // connection to the graph. Wait it out rather than returning into a
     // process teardown that would drop both mid-write.
     if let Some(in_flight) = drain_in_flight.take() {
-        let (guard, _) = finish_drain(
-            &infigraph_dir,
-            drain_rt.block_on(in_flight.handle),
-            &in_flight.waiter_replies,
-        );
+        let (guard, _) = finish_drain(&infigraph_dir, drain_rt.block_on(in_flight.handle));
         drop(guard);
     }
 
@@ -1835,20 +1844,19 @@ where
     if let Some(in_flight) = full_reindex_in_flight.take() {
         let (guard, _) = finish_full_reindex(
             root,
-            &in_flight.reply_paths,
+            in_flight.replies,
             &shared_registry,
             &mut held_prism,
             drain_rt.block_on(in_flight.task.join()),
         );
-        std::fs::remove_file(&in_flight.request_path).ok();
         drop(guard);
     }
     // Cancel before waiting, not just wait: the callback's indexer runner
     // checks its token between launches, so a shutdown that lands mid-run
     // stops starting further multi-minute indexers instead of finishing
-    // the whole set first. (Its `submit_write_request` poll does not yet
-    // observe the token -- an import request it has already dropped for a
-    // loop that no longer serves it still waits out that call's timeout.)
+    // the whole set first. Its import wait (`WriteSubmitter::submit`)
+    // observes the same token, so an import this loop will no longer serve
+    // ends at once instead of holding the join (#138, #204).
     if let Some(in_flight) = scip_in_flight.take() {
         drain_rt.block_on(in_flight.stop());
     }
@@ -1859,13 +1867,22 @@ where
     if let Some(in_flight) = scip_import_in_flight.take() {
         let (guard, _touched_files) = finish_scip_import(
             root,
-            &in_flight.reply_path,
+            in_flight.reply,
             &held_prism,
             in_flight.indexer_label.as_deref(),
             drain_rt.block_on(in_flight.task.join()),
         );
-        std::fs::remove_file(&in_flight.request_path).ok();
         drop(guard);
+    }
+
+    // Last, so the joins above have answered their clients: let every
+    // connection thread finish writing its reply (a Daemon Stop's above
+    // all) before the process exits under it.
+    if !port.wait_idle(Duration::from_secs(2)) {
+        eprintln!(
+            "[control] {} control reply(s) still in flight at shutdown",
+            port.in_flight()
+        );
     }
 
     Ok(())
@@ -1873,13 +1890,11 @@ where
 
 /// A drain executing on the background task, plus everything the loop
 /// thread needs to finish it: the shared graph connection its downstream
-/// steps run against, and the reply paths of the waiters folded into it --
-/// retained here, outside the task, precisely so a panic in the task still
-/// leaves someone able to answer them.
+/// steps run against. Its waiters travel inside the task; `execute_drain`
+/// answers them, and `WriteReply`'s `Drop` answers them if it panics.
 struct InFlightDrain {
     handle: tokio::task::JoinHandle<DrainTaskOutput>,
     prism: Arc<Infigraph>,
-    waiter_replies: Vec<PathBuf>,
     /// R3.3.5: paths this drain's `DrainedQueue.removals` named, captured
     /// before the queue moved into the task -- cleared from the persistent
     /// dirty set alongside `outcome.extractions` once the drain confirms
@@ -1918,15 +1933,12 @@ enum DrainFinish {
 /// (absent if the task panicked, since it was dropped during the unwind)
 /// and what became of the drain.
 ///
-/// Both failure modes -- a panic, and an `execute_drain` error -- answer
-/// every waiter with `WriteResult::Err`. Without that a client blocks until
-/// its own multi-minute timeout with nothing explaining why: `execute_drain`
-/// writes replies as its last step, so a failure anywhere before that
-/// leaves them unwritten.
+/// Neither failure mode leaves a client waiting: `execute_drain` answers
+/// every waiter with its error, and a panic drops them, which answers each
+/// with `DROPPED` (`WriteReply`'s `Drop`).
 fn finish_drain(
     infigraph_dir: &Path,
     joined: std::result::Result<DrainTaskOutput, tokio::task::JoinError>,
-    waiter_replies: &[PathBuf],
 ) -> (Option<crate::ops::IndexOpGuard>, DrainFinish) {
     match joined {
         Ok(DrainTaskOutput {
@@ -1939,7 +1951,6 @@ fn finish_drain(
         }) => {
             eprintln!("[watch] drain failed: {e}");
             fault::record_if_fault(infigraph_dir, &e, fault::FaultClass::of);
-            reply_err_to_waiters(waiter_replies, &format!("daemon drain failed: {e}"));
             let finish = if crate::graph::growth_gate::is_write_refusal(&e) {
                 DrainFinish::Refused
             } else {
@@ -1949,45 +1960,9 @@ fn finish_drain(
         }
         Err(join_err) => {
             eprintln!("[watch] drain task panicked: {join_err}");
-            reply_err_to_waiters(
-                waiter_replies,
-                &format!("daemon drain task panicked: {join_err}"),
-            );
             // A panic can unwind out of anything, including mid-write --
             // assume the handle is suspect.
             (None, DrainFinish::Failed)
-        }
-    }
-}
-
-/// `execute_drain` writes each waiter's reply as the last step of its own
-/// internal loop, using `?` to propagate a `write_atomic` failure -- so an
-/// ordinary `execute_drain` error can still leave some waiters *earlier* in
-/// that loop already answered correctly on disk. Skipping any `reply_path`
-/// that already exists avoids clobbering those real answers with a false
-/// `Err`; `write_atomic` writes to a temp file and renames into place, so an
-/// existing reply file is always a complete, correctly-written one, never a
-/// partial write a caller could race against.
-fn reply_err_to_waiters(waiter_replies: &[PathBuf], message: &str) {
-    let result = crate::daemon_protocol::WriteResult::Err {
-        message: message.to_string(),
-    };
-    let json = match serde_json::to_string(&result) {
-        Ok(j) => j,
-        Err(e) => {
-            eprintln!("[watch] could not encode drain failure reply: {e}");
-            return;
-        }
-    };
-    for reply_path in waiter_replies {
-        if reply_path.exists() {
-            continue;
-        }
-        if let Err(e) = crate::daemon_protocol::write_atomic(reply_path, &json) {
-            eprintln!(
-                "[watch] could not write drain failure reply to {}: {e}",
-                reply_path.display()
-            );
         }
     }
 }
@@ -2207,54 +2182,57 @@ fn settle_idle_fold(
     }
 }
 
-/// Serves a single `.request` file via `serve_one_request`, wrapped in the
-/// same `index.lock` acquisition (`begin_index_op`) the pre-`IndexWorkQueue`
-/// per-request loop used. `route_or_serve_request`'s in-scope `WriteRequest`
-/// variants are coordinated through the shared queue and drain step instead,
-/// but its fallback paths (out-of-scope variants, malformed JSON, corrupt
-/// sibling extractions files) still execute immediately here -- doing so
-/// unlocked would let them race the periodic reindex, the queue's own drain,
-/// or a concurrent CLI `infigraph rebuild`, violating the single-writer
-/// invariant. On contention the `.request` file is left in place (not
-/// deleted) so it's retried on a later tick, matching the old behavior.
+/// Serves one write via `serve_write`, wrapped in the same `index.lock`
+/// acquisition (`begin_index_op`) the pre-`IndexWorkQueue` per-request loop
+/// used. `route_write`'s index-shaped variants are coordinated through the
+/// shared queue and drain step instead, but everything else executes
+/// immediately here -- doing so unlocked would let it race the periodic
+/// reindex, the queue's own drain, or a concurrent CLI `infigraph rebuild`,
+/// violating the single-writer invariant. On contention the reply is handed
+/// back and the write stays deferred, retried on a later tick.
 /// Does nothing while this daemon's own drain is in flight. That drain holds
 /// `index.lock` until the loop thread reaps it -- so blocking here to wait
 /// for that lock would park the only thread that can release it, a
 /// self-deadlock broken only by the 30s acquire timeout. Returning instead
-/// leaves the `.request` file in place, which is already this function's
-/// contention behaviour: a later tick, after the drain is reaped, serves it.
+/// hands the reply back, so the write stays deferred -- already this
+/// function's contention behaviour: a later tick, after the drain is reaped, serves it.
 fn serve_request_locked(
     root: &Path,
-    path: &Path,
+    request: &WriteRequest,
+    reply: WriteReply,
     registry: &Arc<crate::lang::LanguageRegistry>,
     held: &mut HeldPrism,
     reopen_backoff: &mut ReopenBackoff,
     drain_in_flight: bool,
-) {
-    // While backing off, the `.request` file stays in place exactly as it
-    // does under lock contention below -- served on a later tick.
+) -> std::result::Result<(), WriteReply> {
+    // While backing off, or contended below, the reply is handed back and
+    // the write stays deferred -- served on a later tick.
     if drain_in_flight || !reopen_backoff.should_attempt() {
-        return;
+        return Err(reply);
     }
     match begin_index_op(root, "infigraph daemon", Duration::from_secs(30)) {
         Ok(IndexOpOutcome::Acquired(_guard)) => match watch_db(root, registry, held) {
             Ok(prism) => {
                 reopen_backoff.record_success();
-                if let Err(e) = crate::daemon_protocol::serve_one_request(&prism, path) {
-                    eprintln!("[daemon] failed to serve request {}: {e}", path.display());
-                }
+                reply.send(crate::daemon_protocol::serve_write(&prism, request));
+                Ok(())
             }
-            Err(e) => log_reopen_failure("daemon", reopen_backoff, &e),
+            Err(e) => {
+                log_reopen_failure("daemon", reopen_backoff, &e);
+                Err(reply)
+            }
         },
         Ok(o @ IndexOpOutcome::AlreadyRunning(_)) => {
             eprintln!(
                 "[daemon] request-serving busy ({}), retrying next tick",
                 o.skip_note().unwrap_or_default()
             );
+            Err(reply)
         }
         Err(e) => {
             eprintln!("[daemon] request-serving busy ({e}), retrying next tick");
             fault::record_if_fault(&root.join(".infigraph"), &e, fault::FaultClass::of);
+            Err(reply)
         }
     }
 }
@@ -2293,31 +2271,19 @@ struct FullReindexTaskOutput {
     result: Result<FullReindexBuildOutcome>,
 }
 
-/// A full-reindex build executing on the background `Task<T>`, plus what the
-/// loop thread needs to finish it once it completes. `Task<T>` itself
-/// doesn't carry the request/reply paths -- those are this loop's own
-/// bookkeeping, tracked alongside it.
+/// A full-reindex build executing on the background `Task<T>`, plus every
+/// client owed its result.
 struct PendingFullReindex {
     task: Task<FullReindexTaskOutput>,
-    request_path: PathBuf,
     /// Every client owed this rebuild's result: the request that started it,
     /// then each `FullReindex` that arrived while it ran (#164).
-    reply_paths: Vec<PathBuf>,
+    replies: Vec<WriteReply>,
 }
 
 impl PendingFullReindex {
-    /// Answer another `FullReindex` request with this rebuild's result. The
-    /// request file is removed once it is accepted, like a queued waiter's;
-    /// the running rebuild's own file is left for its finish to remove.
-    fn join(&mut self, request_path: &Path) {
-        if request_path == self.request_path {
-            return;
-        }
-        let reply_path = request_path.with_extension("result");
-        if !self.reply_paths.contains(&reply_path) {
-            self.reply_paths.push(reply_path);
-        }
-        std::fs::remove_file(request_path).ok();
+    /// Answer another `FullReindex` with this rebuild's result.
+    fn join(&mut self, reply: WriteReply) {
+        self.replies.push(reply);
     }
 }
 
@@ -2338,8 +2304,7 @@ struct ScipImportTaskOutput {
 /// fixes.
 struct PendingScipImport {
     task: Task<ScipImportTaskOutput>,
-    request_path: PathBuf,
-    reply_path: PathBuf,
+    reply: WriteReply,
     /// The indexer this import came from, recovered from the scratch file's
     /// run-unique name (#139) before the task consumes and deletes it. Rides
     /// here rather than on `ScipImportTaskOutput` so it survives a task
@@ -2349,7 +2314,7 @@ struct PendingScipImport {
     indexer_label: Option<String>,
 }
 
-/// What `route_or_serve_request` hands back to the coordinator's main loop:
+/// What `route_write` starts for the coordinator's main loop to track:
 /// either kind of background work it might have started this tick, so the
 /// loop can track and reap whichever one it is on a later tick. The two
 /// kinds are tracked as separate `Option` fields in the loop's own state
@@ -2441,31 +2406,29 @@ fn build_full_reindex(
 }
 
 /// Loop-thread entry point for a `WriteRequest::FullReindex` when none is
-/// running (`route_or_serve_request` joins one that is, #164). Does the
+/// running (`route_write` joins one that is, #164). Does the
 /// cheap, synchronous gating (never overlap a queue drain -- both write the
 /// same live graph) and, if clear, acquires
 /// `index.lock` and hands the expensive build off to `drain_rt` so this loop
 /// keeps ticking (accepting fsevents, other requests, the stop signal) for
 /// the whole multi-minute rebuild instead of blocking on it. Returns `None`
-/// if nothing was started (busy, or an early failure already replied and
-/// cleaned up the request file itself); `Some` if a build was scheduled --
-/// the caller must track the returned handle and reap it via
-/// `finish_full_reindex` on a later tick.
+/// `Err(reply)` when it cannot start yet (busy), so the caller defers it;
+/// `Ok(None)` when an early failure already answered; `Ok(Some)` when a build
+/// was scheduled -- the caller must track the returned handle and reap it
+/// via `finish_full_reindex` on a later tick.
 #[allow(clippy::too_many_arguments)]
 fn try_start_full_reindex<MR>(
     root: &Path,
-    path: &Path,
+    reply: WriteReply,
     queue: &Arc<Mutex<crate::daemon::queue::IndexWorkQueue>>,
     make_registry: &MR,
     drain_in_flight: bool,
     drain_rt: &tokio::runtime::Runtime,
     daemon_token: &CancellationToken,
-) -> Option<PendingFullReindex>
+) -> std::result::Result<Option<PendingFullReindex>, WriteReply>
 where
     MR: Fn() -> Result<crate::lang::LanguageRegistry>,
 {
-    let reply_path = path.with_extension("result");
-
     // Never overlap a queue drain -- same invariant every locked write path
     // in this loop preserves; both touch the same live graph. (A second full
     // reindex never gets here: it joins the running one, #164.) Deferring here (rather than blocking)
@@ -2484,7 +2447,7 @@ where
     // graph-independent indexer-running phase blocking every other write
     // for its entire duration.
     if drain_in_flight {
-        return None;
+        return Err(reply);
     }
 
     let guard = match begin_index_op(
@@ -2498,12 +2461,12 @@ where
                 "[daemon] full-reindex busy ({}), retrying next tick",
                 o.skip_note().unwrap_or_default()
             );
-            return None;
+            return Err(reply);
         }
         Err(e) => {
             eprintln!("[daemon] full-reindex busy ({e}), retrying next tick");
             fault::record_if_fault(&root.join(".infigraph"), &e, fault::FaultClass::of);
-            return None;
+            return Err(reply);
         }
     };
 
@@ -2511,28 +2474,20 @@ where
     // full reindex is about to re-scan every file from disk regardless of
     // what was pending. Its waiters still get answered, just with a
     // superseded reply rather than silence.
-    let superseded = queue.lock().unwrap().drain();
-    for waiter in &superseded.waiters {
-        let result = crate::daemon_protocol::WriteResult::Err {
+    for waiter in queue.lock().unwrap().drain().waiters {
+        waiter.reply.send(WriteResult::Err {
             message: "superseded by a full reindex; resubmit if still needed".to_string(),
-        };
-        if let Ok(json) = serde_json::to_string(&result) {
-            let _ = crate::daemon_protocol::write_atomic(&waiter.reply_path, &json);
-        }
+        });
     }
 
     let registry = match make_registry() {
         Ok(r) => r,
         Err(e) => {
-            let result = crate::daemon_protocol::WriteResult::Err {
+            reply.send(WriteResult::Err {
                 message: format!("full reindex failed: could not build language registry: {e}"),
-            };
-            if let Ok(json) = serde_json::to_string(&result) {
-                let _ = crate::daemon_protocol::write_atomic(&reply_path, &json);
-            }
-            std::fs::remove_file(path).ok();
+            });
             drop(guard);
-            return None;
+            return Ok(None);
         }
     };
 
@@ -2552,11 +2507,10 @@ where
         })
     };
 
-    Some(PendingFullReindex {
+    Ok(Some(PendingFullReindex {
         task,
-        request_path: path.to_path_buf(),
-        reply_paths: vec![reply_path],
-    })
+        replies: vec![reply],
+    }))
 }
 
 /// How long the coordinator waits between per-table compaction samples
@@ -2591,25 +2545,26 @@ fn escalation_due(infigraph_dir: &Path, graph_path: &Path) -> bool {
             .saturating_mul(cfg.compaction_escalate_pct)
 }
 
-/// Ask the coordinator to rebuild, the same way `drain_recovery_sentinel`
-/// does: drop a `WriteRequest::FullReindex` into the requests directory, for
-/// this same tick's scan to pick up. Submitting no new *kind* of write is
-/// what keeps single-writer true by construction (#183).
+/// Queue a rebuild the daemon asked for itself (compaction, auto-recovery),
+/// unless one is already waiting or running -- the same collapsing the fixed
+/// `compaction.request` file name used to give for free (#204). A client's
+/// waiting `FullReindex` counts: it rebuilds the same tree. Queuing a
+/// `FullReindex` rather than any new *kind* of write is what keeps
+/// single-writer true by construction (#183).
 ///
-/// Deliberately does NOT call `recovery::record_recovery_attempt`. That
-/// budget protects corruption recovery, which is not discretionary; a
-/// compaction rebuild spending it could leave a genuinely corrupt graph
-/// unrecovered. Compaction rate-limits itself through `stamped_at` in its
-/// own sidecar -- see `graph::compaction::MIN_REBUILD_INTERVAL`.
-///
-/// Errors propagate rather than being swallowed, unlike
-/// `stamp_compaction_baseline`: a lost baseline costs one re-measured cycle,
-/// a lost submission costs the rebuild itself, so the caller logs it.
-fn submit_compaction_rebuild(infigraph_dir: &Path) -> Result<()> {
-    let request_path = infigraph_dir.join("requests").join("compaction.request");
-    let serialized = serde_json::to_string(&crate::daemon_protocol::WriteRequest::FullReindex)
-        .expect("WriteRequest::FullReindex always serializes");
-    crate::daemon_protocol::write_atomic(&request_path, &serialized)
+/// Records no `recovery::record_recovery_attempt` for compaction: that
+/// budget protects corruption recovery, which is not discretionary.
+/// Compaction rate-limits itself through `stamped_at` in its own sidecar --
+/// see `graph::compaction::MIN_REBUILD_INTERVAL`.
+fn request_internal_rebuild(deferred: &mut VecDeque<(WriteRequest, WriteReply)>, running: bool) {
+    if running
+        || deferred
+            .iter()
+            .any(|(r, _)| *r == WriteRequest::FullReindex)
+    {
+        return;
+    }
+    deferred.push_back((WriteRequest::FullReindex, WriteReply::internal()));
 }
 
 /// Loop-thread entry point for a `WriteRequest::ScipImport`. Mirrors
@@ -2626,8 +2581,8 @@ fn submit_compaction_rebuild(infigraph_dir: &Path) -> Result<()> {
 #[allow(clippy::too_many_arguments)]
 fn try_start_scip_import(
     root: &Path,
-    path: &Path,
-    scip_path: PathBuf,
+    reply: WriteReply,
+    scip_path: &Path,
     enriched_ast_generation: Option<i64>,
     registry: &Arc<crate::lang::LanguageRegistry>,
     held: &mut HeldPrism,
@@ -2637,9 +2592,7 @@ fn try_start_scip_import(
     scip_import_in_flight: bool,
     drain_rt: &tokio::runtime::Runtime,
     daemon_token: &CancellationToken,
-) -> Option<PendingScipImport> {
-    let reply_path = path.with_extension("result");
-
+) -> std::result::Result<Option<PendingScipImport>, WriteReply> {
     // Same "never overlap" reasoning as `try_start_full_reindex`'s gate --
     // this writes the same live graph a drain or a full reindex writes.
     // Two SCIP imports at once are also refused: `Infigraph::import_scip`
@@ -2655,7 +2608,7 @@ fn try_start_scip_import(
         || scip_import_in_flight
         || !reopen_backoff.should_attempt()
     {
-        return None;
+        return Err(reply);
     }
 
     // Needs the daemon's own already-open connection -- `Infigraph::
@@ -2669,7 +2622,7 @@ fn try_start_scip_import(
         }
         Err(e) => {
             log_reopen_failure("daemon scip-import", reopen_backoff, &e);
-            return None;
+            return Err(reply);
         }
     };
 
@@ -2684,19 +2637,20 @@ fn try_start_scip_import(
                 "[daemon] scip-import busy ({}), retrying next tick",
                 o.skip_note().unwrap_or_default()
             );
-            return None;
+            return Err(reply);
         }
         Err(e) => {
             eprintln!("[daemon] scip-import busy ({e}), retrying next tick");
             fault::record_if_fault(&root.join(".infigraph"), &e, fault::FaultClass::of);
-            return None;
+            return Err(reply);
         }
     };
 
     // Read the indexer off the scratch name before the closure takes
     // ownership -- the task deletes the file, so there is nothing left to
     // derive it from by the time the reap path logs (#186).
-    let indexer_label = crate::scip::scratch_indexer_label(&scip_path).map(str::to_owned);
+    let indexer_label = crate::scip::scratch_indexer_label(scip_path).map(str::to_owned);
+    let scip_path = scip_path.to_path_buf();
 
     let task = {
         let _guard = drain_rt.enter();
@@ -2709,12 +2663,11 @@ fn try_start_scip_import(
         })
     };
 
-    Some(PendingScipImport {
+    Ok(Some(PendingScipImport {
         task,
-        request_path: path.to_path_buf(),
-        reply_path,
+        reply,
         indexer_label,
-    })
+    }))
 }
 
 /// Loop-thread finish for a completed SCIP import: logs one structured
@@ -2725,7 +2678,7 @@ fn try_start_scip_import(
 /// drain gives its extracted files.
 fn finish_scip_import(
     root: &Path,
-    reply_path: &Path,
+    reply: WriteReply,
     held: &HeldPrism,
     indexer_label: Option<&str>,
     joined: std::result::Result<ScipImportTaskOutput, tokio::task::JoinError>,
@@ -2740,12 +2693,9 @@ fn finish_scip_import(
         Ok(output) => output,
         Err(join_err) => {
             eprintln!("[daemon] {} panicked: {join_err}", labelled("import task"));
-            let write_result = crate::daemon_protocol::WriteResult::Err {
+            reply.send(WriteResult::Err {
                 message: format!("daemon scip-import task panicked: {join_err}"),
-            };
-            if let Ok(json) = serde_json::to_string(&write_result) {
-                let _ = crate::daemon_protocol::write_atomic(reply_path, &json);
-            }
+            });
             return (None, Vec::new());
         }
     };
@@ -2773,19 +2723,13 @@ fn finish_scip_import(
                 }
             }
             let touched = stats.touched_files.clone();
-            let write_result = crate::daemon_protocol::WriteResult::ScipImportOk(stats);
-            if let Ok(json) = serde_json::to_string(&write_result) {
-                let _ = crate::daemon_protocol::write_atomic(reply_path, &json);
-            }
+            reply.send(WriteResult::ScipImportOk(stats));
             touched
         }
         Err(e) => {
-            let write_result = crate::daemon_protocol::WriteResult::Err {
+            reply.send(WriteResult::Err {
                 message: format!("SCIP import failed: {e:#}"),
-            };
-            if let Ok(json) = serde_json::to_string(&write_result) {
-                let _ = crate::daemon_protocol::write_atomic(reply_path, &json);
-            }
+            });
             Vec::new()
         }
     };
@@ -2793,17 +2737,10 @@ fn finish_scip_import(
     (Some(guard), touched_files)
 }
 
-/// Write one rebuild's result to every client waiting on it (#164). Unlike
-/// `reply_err_to_waiters`, nothing is skipped: each waiter is owed exactly
-/// this answer.
-fn reply_to_all(reply_paths: &[PathBuf], json: &str) {
-    for reply_path in reply_paths {
-        if let Err(e) = crate::daemon_protocol::write_atomic(reply_path, json) {
-            eprintln!(
-                "[daemon] could not write full-reindex reply to {}: {e}",
-                reply_path.display()
-            );
-        }
+/// Give one rebuild's result to every client waiting on it (#164).
+fn answer_all(replies: Vec<WriteReply>, result: WriteResult) {
+    for reply in replies {
+        reply.send(result.clone());
     }
 }
 
@@ -2822,7 +2759,7 @@ fn reply_to_all(reply_paths: &[PathBuf], json: &str) {
 /// didn't actually land.
 fn finish_full_reindex(
     root: &Path,
-    reply_paths: &[PathBuf],
+    replies: Vec<WriteReply>,
     registry: &Arc<crate::lang::LanguageRegistry>,
     held: &mut HeldPrism,
     joined: std::result::Result<FullReindexTaskOutput, tokio::task::JoinError>,
@@ -2831,12 +2768,12 @@ fn finish_full_reindex(
         Ok(output) => output,
         Err(join_err) => {
             eprintln!("[watch] full-reindex task panicked: {join_err}");
-            let result = crate::daemon_protocol::WriteResult::Err {
-                message: format!("daemon full-reindex task panicked: {join_err}"),
-            };
-            if let Ok(json) = serde_json::to_string(&result) {
-                reply_to_all(reply_paths, &json);
-            }
+            answer_all(
+                replies,
+                WriteResult::Err {
+                    message: format!("daemon full-reindex task panicked: {join_err}"),
+                },
+            );
             return (None, None);
         }
     };
@@ -2845,12 +2782,12 @@ fn finish_full_reindex(
         Ok(outcome) => (outcome.indexed_files, outcome.detected_languages),
         Err(e) => {
             fault::record_if_fault(&root.join(".infigraph"), &e, fault::FaultClass::of);
-            let result = crate::daemon_protocol::WriteResult::Err {
-                message: format!("full reindex failed: {e:#}"),
-            };
-            if let Ok(json) = serde_json::to_string(&result) {
-                reply_to_all(reply_paths, &json);
-            }
+            answer_all(
+                replies,
+                WriteResult::Err {
+                    message: format!("full reindex failed: {e:#}"),
+                },
+            );
             return (Some(guard), None);
         }
     };
@@ -2880,18 +2817,18 @@ fn finish_full_reindex(
     ) {
         Ok(l) => l,
         Err(e) => {
-            let result = crate::daemon_protocol::WriteResult::Err {
-                message: format!(
+            answer_all(
+                replies,
+                WriteResult::Err {
+                    message: format!(
                     "full reindex rebuilt successfully but could not take the graph write lock \
                      to swap it in: {e:#}. The live graph at {} was left untouched; the rebuilt \
                      graph remains at {}",
                     live_path.display(),
                     rebuilding_path.display()
                 ),
-            };
-            if let Ok(json) = serde_json::to_string(&result) {
-                reply_to_all(reply_paths, &json);
-            }
+                },
+            );
             return (Some(guard), None);
         }
     };
@@ -2925,36 +2862,36 @@ fn finish_full_reindex(
                 match crate::quarantine::retire_previous_graph(&infigraph_dir, LIVE_NAME) {
                     Ok(dest) => Some(dest),
                     Err(e) => {
-                        let result = crate::daemon_protocol::WriteResult::Err {
-                            message: format!(
-                                "full reindex rebuilt successfully but could not move the old \
+                        answer_all(
+                            replies,
+                            WriteResult::Err {
+                                message: format!(
+                                    "full reindex rebuilt successfully but could not move the old \
                                  graph aside: {e:#}. The live graph at {} was left untouched; \
                                  the rebuilt graph remains at {}",
-                                live_path.display(),
-                                rebuilding_path.display()
-                            ),
-                        };
-                        if let Ok(json) = serde_json::to_string(&result) {
-                            reply_to_all(reply_paths, &json);
-                        }
+                                    live_path.display(),
+                                    rebuilding_path.display()
+                                ),
+                            },
+                        );
                         drop(graph_lock);
                         return (Some(guard), None);
                     }
                 }
             }
             Err(e) => {
-                let result = crate::daemon_protocol::WriteResult::Err {
-                    message: format!(
+                answer_all(
+                    replies,
+                    WriteResult::Err {
+                        message: format!(
                         "full reindex rebuilt successfully but could not snapshot the old graph \
                          aside: {e:#}. The live graph at {} was left untouched; the rebuilt \
                          graph remains at {}",
                         live_path.display(),
                         rebuilding_path.display()
                     ),
-                };
-                if let Ok(json) = serde_json::to_string(&result) {
-                    reply_to_all(reply_paths, &json);
-                }
+                    },
+                );
                 drop(graph_lock);
                 return (Some(guard), None);
             }
@@ -3012,16 +2949,16 @@ fn finish_full_reindex(
              {rollback_note}; the rebuilt graph is at {} -- check both by hand",
             rebuilding_path.display()
         );
-        let result = crate::daemon_protocol::WriteResult::Err {
-            message: format!(
-                "full reindex rebuilt successfully but the swap failed: {e}. {rollback_note}; \
+        answer_all(
+            replies,
+            WriteResult::Err {
+                message: format!(
+                    "full reindex rebuilt successfully but the swap failed: {e}. {rollback_note}; \
                  the rebuilt graph is at {}",
-                rebuilding_path.display()
-            ),
-        };
-        if let Ok(json) = serde_json::to_string(&result) {
-            reply_to_all(reply_paths, &json);
-        }
+                    rebuilding_path.display()
+                ),
+            },
+        );
         return (Some(guard), None);
     }
     // graph_lock must be released before watch_db below -- it opens a fresh
@@ -3098,14 +3035,14 @@ fn finish_full_reindex(
                     eprintln!("[daemon] full-reindex: embedding update failed: {e}");
                 }
             }
-            let result = crate::daemon_protocol::WriteResult::FullReindexOk {
-                total_files: indexed_files,
-                indexed_files,
-                detected_languages: detected_languages.clone(),
-            };
-            if let Ok(json) = serde_json::to_string(&result) {
-                reply_to_all(reply_paths, &json);
-            }
+            answer_all(
+                replies,
+                WriteResult::FullReindexOk {
+                    total_files: indexed_files,
+                    indexed_files,
+                    detected_languages: detected_languages.clone(),
+                },
+            );
             (Some(guard), Some(detected_languages))
         }
         Err(reopen_err) => {
@@ -3134,15 +3071,15 @@ fn finish_full_reindex(
                 "[daemon] full-reindex: swapped-in graph failed to reopen: {reopen_err:#} -- \
                  {disposition}"
             );
-            let result = crate::daemon_protocol::WriteResult::Err {
-                message: format!(
-                    "full reindex swap completed but the new graph failed to reopen: \
+            answer_all(
+                replies,
+                WriteResult::Err {
+                    message: format!(
+                        "full reindex swap completed but the new graph failed to reopen: \
                      {reopen_err:#}. {disposition}"
-                ),
-            };
-            if let Ok(json) = serde_json::to_string(&result) {
-                reply_to_all(reply_paths, &json);
-            }
+                    ),
+                },
+            );
             (Some(guard), None)
         }
     }
@@ -3256,17 +3193,25 @@ fn roll_back_to_retired(live_path: &Path, retired_path: &Option<PathBuf>) -> Str
     }
 }
 
-/// Parses a `.request` file and either enqueues it (for the four
-/// index-shaped `WriteRequest` variants this design coordinates) or falls
-/// through to `serve_request_locked` (unchanged `serve_one_request`
-/// dispatch, still under `index.lock`) for everything else. Enqueued
-/// requests' `.request` file is deleted immediately (the daemon has already
-/// accepted responsibility for serving it the moment it's queued) -- the
-/// reply arrives later, written by `execute_drain`.
+/// What became of one write the coordinator tried to route.
+enum Routed {
+    /// Queued, joined, served, or already answered.
+    Done,
+    /// Background work the loop must track and reap.
+    Started(PendingWork),
+    /// Cannot start yet (busy, backing off): deferred again, in order.
+    NotYet(WriteRequest, WriteReply),
+}
+
+/// Routes one write (#204): the four index-shaped variants join the shared
+/// queue with their reply as a waiter; `FullReindex` and `ScipImport` start
+/// background work (or join the running rebuild, #164); everything else is
+/// served under `index.lock` on this thread (`serve_request_locked`).
 #[allow(clippy::too_many_arguments)]
-fn route_or_serve_request<MR>(
+fn route_write<MR>(
     root: &Path,
-    path: &Path,
+    request: WriteRequest,
+    reply: WriteReply,
     queue: &Arc<Mutex<crate::daemon::queue::IndexWorkQueue>>,
     registry: &Arc<crate::lang::LanguageRegistry>,
     make_registry: &MR,
@@ -3277,40 +3222,13 @@ fn route_or_serve_request<MR>(
     drain_rt: &tokio::runtime::Runtime,
     daemon_token: &CancellationToken,
     scip_import_in_flight: bool,
-) -> Option<PendingWork>
+) -> Routed
 where
     MR: Fn() -> Result<crate::lang::LanguageRegistry>,
 {
-    // #164: a killed client withdraws nothing, and a request nobody waits
-    // for must not cost a rebuild. Checked before anything is parsed or run.
-    if crate::daemon_protocol::request_client_is_gone(path) {
-        eprintln!(
-            "[daemon] discarding {}: the client that sent it has exited",
-            path.display()
-        );
-        crate::daemon_protocol::discard_request(path);
-        return None;
-    }
-    let reply_path = path.with_extension("result");
-    let contents = match std::fs::read_to_string(path) {
-        Ok(c) => c,
-        Err(_) => return None, // transient; will be retried next tick if the file reappears
-    };
-    let request: crate::daemon_protocol::WriteRequest = match serde_json::from_str(&contents) {
-        Ok(r) => r,
-        Err(_) => {
-            // Malformed request JSON -- not this design's concern to
-            // recover; hand off to serve_one_request, whose existing
-            // corrupt-JSON handling (WriteResult::Err) already covers it.
-            serve_request_locked(root, path, registry, held, reopen_backoff, drain_in_flight);
-            return None;
-        }
-    };
-
     use crate::daemon::queue::{Waiter, WaiterKind};
-    use crate::daemon_protocol::WriteRequest;
 
-    // Each arm holds the queue lock across its work-items-plus-waiter pair
+    // Each queue arm holds the queue lock across its items-plus-waiter pair,
     // so a drain scheduled concurrently can never take the items without
     // the waiter that's blocked on them (which would leave that client
     // waiting for a reply no later drain owes it).
@@ -3321,12 +3239,10 @@ where
             q.add_waiter(Waiter {
                 kind: WaiterKind::Index,
                 use_learned: false,
-                reply_path,
+                reply,
                 paths: None,
             });
-            drop(q);
-            std::fs::remove_file(path).ok();
-            None
+            Routed::Done
         }
         WriteRequest::Index { paths: Some(paths) } => {
             let mut q = queue.lock().unwrap();
@@ -3334,10 +3250,9 @@ where
             for p in paths {
                 // `p` may be absolute -- `Infigraph::index_file`/`index_files`
                 // both forward the caller's path verbatim (absolute paths are
-                // an explicitly documented option), and `extract_paths` below
-                // joins it onto `root` unnormalized, which for an absolute
-                // path is a no-op join that leaves it absolute. Mirrors the
-                // batch-flush block above.
+                // an explicitly documented option), and `extract_paths` joins
+                // it onto `root` unnormalized, which for an absolute path is
+                // a no-op join that leaves it absolute.
                 let rel = p
                     .strip_prefix(root)
                     .map(|r| r.to_string_lossy().replace('\\', "/"))
@@ -3348,48 +3263,42 @@ where
             q.add_waiter(Waiter {
                 kind: WaiterKind::Index,
                 use_learned: false,
-                reply_path,
+                reply,
                 paths: Some(rel_paths),
             });
-            drop(q);
-            std::fs::remove_file(path).ok();
-            None
+            Routed::Done
         }
         WriteRequest::UpsertFilesBulk {
             extractions_path,
             // `existing_hashes_empty` is a snapshot the client captured when
-            // it built this request; it's not threaded through the queue
-            // because `execute_drain` recomputes the same flag itself, at
-            // actual drain time, from the backend's live file-hash state --
-            // strictly fresher than the client's snapshot, especially once
-            // other producers' work has been folded into the same drain.
-            // Dropped deliberately, not an oversight.
+            // it built this request; `execute_drain` recomputes the same
+            // flag at actual drain time, from the backend's live file-hash
+            // state -- strictly fresher, especially once other producers'
+            // work has been folded into the same drain. Dropped
+            // deliberately, not an oversight.
             ..
-        } => match crate::daemon_protocol::read_extractions_json(&extractions_path) {
-            Ok(extractions) => {
-                let mut q = queue.lock().unwrap();
-                let rel_paths: Vec<String> = extractions.iter().map(|e| e.file.clone()).collect();
-                for extraction in extractions {
-                    q.add_structured(extraction);
+        } => {
+            match crate::daemon_protocol::read_extractions_json(&extractions_path) {
+                Ok(extractions) => {
+                    let mut q = queue.lock().unwrap();
+                    let rel_paths: Vec<String> =
+                        extractions.iter().map(|e| e.file.clone()).collect();
+                    for extraction in extractions {
+                        q.add_structured(extraction);
+                    }
+                    q.add_waiter(Waiter {
+                        kind: WaiterKind::UpsertFilesBulk,
+                        use_learned: false,
+                        reply,
+                        paths: Some(rel_paths),
+                    });
+                    drop(q);
+                    std::fs::remove_file(&extractions_path).ok();
                 }
-                q.add_waiter(Waiter {
-                    kind: WaiterKind::UpsertFilesBulk,
-                    use_learned: false,
-                    reply_path,
-                    paths: Some(rel_paths),
-                });
-                drop(q);
-                std::fs::remove_file(&extractions_path).ok();
-                std::fs::remove_file(path).ok();
-                None
+                Err(e) => reply.send(unreadable_sidecar(&extractions_path, &e)),
             }
-            Err(_) => {
-                // Sibling extractions file missing/corrupt -- fall
-                // through to serve_one_request's existing error path.
-                serve_request_locked(root, path, registry, held, reopen_backoff, drain_in_flight);
-                None
-            }
-        },
+            Routed::Done
+        }
         WriteRequest::RemoveFiles { files } => {
             let mut q = queue.lock().unwrap();
             let rel_paths = files.clone();
@@ -3399,67 +3308,66 @@ where
             q.add_waiter(Waiter {
                 kind: WaiterKind::RemoveFiles,
                 use_learned: false,
-                reply_path,
+                reply,
                 paths: Some(rel_paths),
             });
-            drop(q);
-            std::fs::remove_file(path).ok();
-            None
+            Routed::Done
         }
         WriteRequest::ResolveCalls {
             extractions_path,
             use_learned,
-        } => match crate::daemon_protocol::read_extractions_json(&extractions_path) {
-            Ok(extractions) => {
-                let mut q = queue.lock().unwrap();
-                for extraction in extractions {
-                    q.add_resolve_only(extraction);
+        } => {
+            match crate::daemon_protocol::read_extractions_json(&extractions_path) {
+                Ok(extractions) => {
+                    let mut q = queue.lock().unwrap();
+                    for extraction in extractions {
+                        q.add_resolve_only(extraction);
+                    }
+                    q.add_waiter(Waiter {
+                        kind: WaiterKind::ResolveCalls,
+                        use_learned,
+                        reply,
+                        // ResolveCalls replies carry `ResolveStats` (call-edge
+                        // counts), not a file count -- not path-attributable
+                        // the way Index/UpsertFilesBulk/RemoveFiles are.
+                        paths: None,
+                    });
+                    drop(q);
+                    std::fs::remove_file(&extractions_path).ok();
                 }
-                q.add_waiter(Waiter {
-                    kind: WaiterKind::ResolveCalls,
-                    use_learned,
-                    reply_path,
-                    // ResolveCalls replies carry `ResolveStats` (call-edge
-                    // counts), not a file count -- not path-attributable the
-                    // way Index/UpsertFilesBulk/RemoveFiles are.
-                    paths: None,
-                });
-                drop(q);
-                std::fs::remove_file(&extractions_path).ok();
-                std::fs::remove_file(path).ok();
-                None
+                Err(e) => reply.send(unreadable_sidecar(&extractions_path, &e)),
             }
-            Err(_) => {
-                serve_request_locked(root, path, registry, held, reopen_backoff, drain_in_flight);
-                None
-            }
-        },
+            Routed::Done
+        }
         // #164: only one rebuild, ever. One already running answers this
         // request too; a second would rebuild the same tree again, and any
         // file that changes meanwhile reaches the graph through the watcher.
         WriteRequest::FullReindex => match full_reindex_in_flight.as_mut() {
             Some(running) => {
-                running.join(path);
-                None
+                running.join(reply);
+                Routed::Done
             }
-            None => try_start_full_reindex(
+            None => match try_start_full_reindex(
                 root,
-                path,
+                reply,
                 queue,
                 make_registry,
                 drain_in_flight,
                 drain_rt,
                 daemon_token,
-            )
-            .map(PendingWork::FullReindex),
+            ) {
+                Ok(Some(p)) => Routed::Started(PendingWork::FullReindex(p)),
+                Ok(None) => Routed::Done,
+                Err(reply) => Routed::NotYet(WriteRequest::FullReindex, reply),
+            },
         },
         WriteRequest::ScipImport {
             scip_path,
             enriched_ast_generation,
-        } => try_start_scip_import(
+        } => match try_start_scip_import(
             root,
-            path,
-            scip_path,
+            reply,
+            &scip_path,
             enriched_ast_generation,
             registry,
             held,
@@ -3469,13 +3377,111 @@ where
             scip_import_in_flight,
             drain_rt,
             daemon_token,
-        )
-        .map(PendingWork::ScipImport),
-        _ => {
-            serve_request_locked(root, path, registry, held, reopen_backoff, drain_in_flight);
-            None
+        ) {
+            Ok(Some(p)) => Routed::Started(PendingWork::ScipImport(p)),
+            Ok(None) => Routed::Done,
+            Err(reply) => Routed::NotYet(
+                WriteRequest::ScipImport {
+                    scip_path,
+                    enriched_ast_generation,
+                },
+                reply,
+            ),
+        },
+        other => match serve_request_locked(
+            root,
+            &other,
+            reply,
+            registry,
+            held,
+            reopen_backoff,
+            drain_in_flight,
+        ) {
+            Ok(()) => Routed::Done,
+            Err(reply) => Routed::NotYet(other, reply),
+        },
+    }
+}
+
+fn unreadable_sidecar(path: &Path, e: &anyhow::Error) -> WriteResult {
+    WriteResult::Err {
+        message: format!(
+            "could not read the write's sidecar {}: {e:#}",
+            path.display()
+        ),
+    }
+}
+
+/// At shutdown: close the port, and answer every write that has not started
+/// -- still in the channel, deferred, or queued for a drain -- with
+/// `SHUTTING_DOWN`, rather than leaving `Drop` to say `DROPPED` (#204).
+fn answer_pending_writes(
+    port_rx: mpsc::Receiver<coordinator_port::PortMsg>,
+    deferred: &mut VecDeque<(WriteRequest, WriteReply)>,
+    queue: &Arc<Mutex<crate::daemon::queue::IndexWorkQueue>>,
+) {
+    let shutting_down = || WriteResult::Err {
+        message: coordinator_port::SHUTTING_DOWN.to_string(),
+    };
+    for msg in port_rx.try_iter() {
+        // A control message's reply sender drops here, which its thread
+        // already reports as shutting down.
+        if let coordinator_port::PortMsg::Write { reply, .. } = msg {
+            reply.send(shutting_down());
         }
     }
+    drop(port_rx);
+    for (_, reply) in deferred.drain(..) {
+        reply.send(shutting_down());
+    }
+    let queued = queue.lock().unwrap_or_else(|e| e.into_inner()).drain();
+    for waiter in queued.waiters {
+        waiter.reply.send(shutting_down());
+    }
+}
+
+/// Remove deferred writes whose clients have disconnected (#204 D3),
+/// returning how many.
+fn drop_gone(deferred: &mut VecDeque<(WriteRequest, WriteReply)>) -> usize {
+    let before = deferred.len();
+    deferred.retain(|(_, reply)| !reply.is_gone());
+    before - deferred.len()
+}
+
+/// How often the daemon answers file-drop requests from pre-#204 clients.
+/// Well under the 30s those clients wait for control and the minutes they
+/// wait for writes, so they fail fast instead of timing out.
+const LEGACY_SWEEP_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Age past which a write sidecar is assumed orphaned by a client that died
+/// before the daemon read it. Matches the SCIP scratch backstop.
+const SIDECAR_STALE_AFTER: Duration = Duration::from_secs(6 * 3600);
+
+/// Answer every file-drop request a pre-#204 client left in `requests/` with
+/// an error naming this build, and remove it (#204 D5). Remove one release
+/// after #204 ships: by then no such client remains.
+fn refuse_legacy_requests(infigraph_dir: &Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(infigraph_dir.join("requests")) else {
+        return 0;
+    };
+    let result = WriteResult::Err {
+        message: format!(
+            "this daemon (build {}) no longer accepts file-drop requests; restart the client \
+             (MCP: /mcp reconnect)",
+            crate::build_hash()
+        ),
+    };
+    let json = serde_json::to_string(&result).expect("WriteResult::Err always serializes");
+    let mut refused = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_some_and(|ext| ext == "request") {
+            let _ = crate::daemon_protocol::write_atomic(&path.with_extension("result"), &json);
+            std::fs::remove_file(&path).ok();
+            refused += 1;
+        }
+    }
+    refused
 }
 
 /// Answers a `WatchControl` request. Same `write_atomic`/`WriteResult`
@@ -3531,33 +3537,22 @@ fn is_daemon_stop(
     )
 }
 
-/// Whether a `.request` is waiting in `requests_dir`. A client that wrote one
-/// just before the idle grace ran out must still be served, so it counts as
-/// work in flight (#203 M2).
-fn has_pending_request(requests_dir: &Path) -> bool {
-    std::fs::read_dir(requests_dir).is_ok_and(|entries| {
-        entries
-            .flatten()
-            .any(|e| e.path().extension().is_some_and(|x| x == "request"))
-    })
-}
-
 /// Publish the watch roles' state for `Status`. Cheap: two atomics; the
 /// policy is read by the caller only when it can have changed.
 fn publish_roles(
-    state: &control_port::DaemonState,
+    state: &coordinator_port::DaemonState,
     code_watch: &CodeWatch,
     docs: Option<&Arc<dyn DocsHandle>>,
     policy: [bool; 2],
 ) {
     state.set_role(
         WatchRole::Code,
-        control_port::role_state(code_watch.is_running(), policy[0]),
+        coordinator_port::role_state(code_watch.is_running(), policy[0]),
     );
     state.set_role(
         WatchRole::Docs,
         match docs {
-            Some(d) => control_port::role_state(d.is_running(), policy[1]),
+            Some(d) => coordinator_port::role_state(d.is_running(), policy[1]),
             None => crate::daemon::read_protocol::RoleState::NotOwned,
         },
     );
@@ -3607,7 +3602,7 @@ mod tests {
     use super::*;
     use protobuf::Message as _;
 
-    /// Everything `route_or_serve_request` needs, for tests that route
+    /// Everything `route_write` needs, for tests that route
     /// requests without a coordinator loop.
     struct Router {
         root: PathBuf,
@@ -3637,12 +3632,13 @@ mod tests {
             }
         }
 
-        /// Route one request. A `FullReindex` it starts is kept as the
+        /// Route one write. A `FullReindex` it starts is kept as the
         /// in-flight rebuild, exactly as the coordinator loop keeps it.
-        fn route(&mut self, path: &Path) -> Option<PendingWork> {
-            let started = route_or_serve_request(
+        fn route(&mut self, request: WriteRequest, reply: WriteReply) -> Routed {
+            let routed = route_write(
                 &self.root,
-                path,
+                request,
+                reply,
                 &self.queue,
                 &self.registry,
                 &|| Ok(crate::lang::LanguageRegistry::new()),
@@ -3654,13 +3650,22 @@ mod tests {
                 &self.daemon_token,
                 false,
             );
-            match started {
-                Some(PendingWork::FullReindex(p)) => {
+            match routed {
+                Routed::Started(PendingWork::FullReindex(p)) => {
                     self.full_reindex = Some(p);
-                    None
+                    Routed::Done
                 }
                 other => other,
             }
+        }
+
+        /// `route`, with a fresh reply whose receiver the test keeps.
+        fn route_new(
+            &mut self,
+            request: WriteRequest,
+        ) -> (Routed, std::sync::mpsc::Receiver<WriteResult>) {
+            let (reply, rx) = WriteReply::channel();
+            (self.route(request, reply), rx)
         }
     }
 
@@ -3967,18 +3972,16 @@ mod tests {
     }
 
     /// A drain runs on a background task, so a panic inside it unwinds on a
-    /// thread the watch loop never sees. Nothing else would ever answer the
-    /// ad-hoc requests folded into that drain: `execute_drain` writes every
-    /// reply as its final step, so a panic before that point leaves the
-    /// clients blocking on a `.result` file that no longer has an author.
-    /// They'd sit there until their own multi-minute timeout with no
-    /// explanation. `finish_drain` is what turns that silence into a real
-    /// `WriteResult::Err`.
+    /// thread the watch loop never sees. Its waiters travel inside the task
+    /// and drop during the unwind, and `WriteReply`'s `Drop` answers each --
+    /// otherwise those clients would sit until their own multi-minute
+    /// timeout with no explanation (Review Focus 2). `finish_drain` still
+    /// treats the handle as suspect.
     #[test]
-    fn drain_task_panic_surfaces_as_write_result_err_not_a_hang() {
+    fn a_panicking_drain_still_answers_every_waiter() {
         let tmp = tempfile::tempdir().unwrap();
-        let first = tmp.path().join("waiter-a.result");
-        let second = tmp.path().join("waiter-b.result");
+        let (first, first_rx) = WriteReply::channel();
+        let (second, second_rx) = WriteReply::channel();
 
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
@@ -3986,160 +3989,69 @@ mod tests {
             .unwrap();
 
         // The panic is the point of the test, so its default backtrace
-        // message would just look like a failure in the log. Suppressed only
-        // across the join -- by the time `block_on` returns, the panic has
-        // already been caught and reported through the `JoinError`.
+        // message would just look like a failure in the log.
         let previous_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(|_| {}));
-        let joined = rt
-            .block_on(rt.spawn_blocking(|| -> DrainTaskOutput { panic!("simulated drain panic") }));
+        let joined = rt.block_on(rt.spawn_blocking(move || -> DrainTaskOutput {
+            let _waiters = (first, second);
+            panic!("simulated drain panic")
+        }));
         std::panic::set_hook(previous_hook);
-
         assert!(
             joined.is_err(),
             "test setup is wrong: the drain task did not actually panic"
         );
 
-        let (guard, finish) = finish_drain(tmp.path(), joined, &[first.clone(), second.clone()]);
+        let (guard, finish) = finish_drain(tmp.path(), joined);
         assert!(
             guard.is_none(),
-            "a panicking task drops its index-op guard during the unwind, \
-             so there is none left to hand back"
+            "a panicking task drops its index-op guard during the unwind"
         );
         assert!(
             matches!(finish, DrainFinish::Failed),
             "a panic can unwind out of a half-finished write, so the shared \
              read handle must be treated as suspect"
         );
-
-        for reply_path in [&first, &second] {
-            let contents = std::fs::read_to_string(reply_path).unwrap_or_else(|e| {
-                panic!(
-                    "a panicked drain must still answer every waiter folded into it, \
-                     but {} was never written ({e}) -- that client would block until \
-                     its own timeout",
-                    reply_path.display()
-                )
-            });
-            let reply: crate::daemon_protocol::WriteResult =
-                serde_json::from_str(&contents).unwrap();
-            match reply {
-                crate::daemon_protocol::WriteResult::Err { message } => assert!(
-                    message.contains("panic"),
-                    "the reply must say the drain panicked, got: {message}"
-                ),
+        for rx in [first_rx, second_rx] {
+            match rx.recv().expect("every waiter folded into it is answered") {
+                WriteResult::Err { message } => {
+                    assert_eq!(message, crate::daemon::coordinator_port::DROPPED)
+                }
                 other => panic!("expected WriteResult::Err, got {other:?}"),
             }
         }
     }
 
-    /// Regression test for a review finding on `finish_drain`: an *ordinary*
-    /// `execute_drain` failure (not a panic) used to answer every retained
-    /// waiter with `WriteResult::Err`, even though `execute_drain` writes
-    /// each waiter's reply sequentially as its own last step -- so a
-    /// `write_atomic` failure partway through that loop left *earlier*
-    /// waiters already holding a correct, real `Ok` reply on disk.
-    /// `finish_drain`'s blanket overwrite told those already-succeeded
-    /// clients their write had failed, when it had actually succeeded.
+    /// An `execute_drain` failure answers every waiter with the real cause,
+    /// exactly once -- not the generic `DROPPED` a panic gets.
     #[test]
-    fn finish_drain_does_not_overwrite_a_reply_execute_drain_already_wrote() {
+    fn a_failed_drain_answers_its_waiters_with_the_cause() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-
-        let mut prism = Infigraph::open(root, crate::lang::LanguageRegistry::new()).unwrap();
-        prism.init().unwrap();
-
-        let ok_reply = root.join("waiter-ok.result");
-        let fail_dir = root.join("readonly");
-        std::fs::create_dir(&fail_dir).unwrap();
-        let fail_reply = fail_dir.join("waiter-fail.result");
+        // Never initialized: the drain fails at once ("graph not initialized").
+        let prism = Infigraph::open(root, crate::lang::LanguageRegistry::new()).unwrap();
 
         let mut queue = crate::daemon::queue::IndexWorkQueue::new();
-        queue.add_waiter(crate::daemon::queue::Waiter {
-            kind: crate::daemon::queue::WaiterKind::Index,
-            use_learned: false,
-            reply_path: ok_reply.clone(),
-            paths: None,
-        });
-        queue.add_waiter(crate::daemon::queue::Waiter {
-            kind: crate::daemon::queue::WaiterKind::Index,
-            use_learned: false,
-            reply_path: fail_reply.clone(),
-            paths: None,
-        });
-        let drained = queue.drain();
-
-        // `write_atomic` calls `File::create` in the reply's parent
-        // directory -- read-only permissions make that fail for the second
-        // waiter only, after the first waiter's reply has already been
-        // written successfully.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&fail_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
-        }
-        let drain_result = crate::daemon::drain::execute_drain(&prism, drained);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&fail_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
-
-        let err = match drain_result {
-            Err(e) => e,
-            Ok(_) => panic!("test setup is wrong: expected execute_drain to fail on fail_reply"),
-        };
-
-        // Confirm the partial-success setup: the first waiter really did
-        // get a correct Ok reply from execute_drain itself, and the second
-        // was never reached.
-        let ok_before: crate::daemon_protocol::WriteResult =
-            serde_json::from_str(&std::fs::read_to_string(&ok_reply).unwrap()).unwrap();
-        assert!(
-            matches!(ok_before, crate::daemon_protocol::WriteResult::Ok { .. }),
-            "test setup is wrong: execute_drain should have answered the first waiter"
-        );
-        assert!(
-            !fail_reply.exists(),
-            "test setup is wrong: execute_drain should not have reached the second waiter"
-        );
-
-        // Route that failure through the real recovery path a background
-        // drain task uses, and confirm it does not clobber the first
-        // waiter's already-correct reply.
-        let guard = match begin_index_op(root, "test", Duration::ZERO).unwrap() {
-            IndexOpOutcome::Acquired(g) => g,
-            IndexOpOutcome::AlreadyRunning(_) => panic!("test setup is wrong: lock contended"),
-        };
-        let joined: std::result::Result<DrainTaskOutput, tokio::task::JoinError> =
-            Ok(DrainTaskOutput {
-                guard,
-                result: Err(err),
+        let mut receivers = Vec::new();
+        for _ in 0..2 {
+            let (reply, rx) = WriteReply::channel();
+            receivers.push(rx);
+            queue.add_waiter(crate::daemon::queue::Waiter {
+                kind: crate::daemon::queue::WaiterKind::Index,
+                use_learned: false,
+                reply,
+                paths: None,
             });
-        let (guard, finish) =
-            finish_drain(tmp.path(), joined, &[ok_reply.clone(), fail_reply.clone()]);
-        assert!(guard.is_some());
-        assert!(matches!(finish, DrainFinish::Failed));
-
-        // #161: a *refused* drain is a different animal. See
-        // `refused_drain_keeps_the_read_handle` below.
-
-        let ok_after: crate::daemon_protocol::WriteResult =
-            serde_json::from_str(&std::fs::read_to_string(&ok_reply).unwrap()).unwrap();
-        match ok_after {
-            crate::daemon_protocol::WriteResult::Ok { .. } => {}
-            other => panic!(
-                "finish_drain overwrote the first waiter's already-correct Ok reply with {other:?}"
-            ),
         }
-
-        let fail_after: crate::daemon_protocol::WriteResult =
-            serde_json::from_str(&std::fs::read_to_string(&fail_reply).unwrap()).unwrap();
-        match fail_after {
-            crate::daemon_protocol::WriteResult::Err { .. } => {}
-            other => {
-                panic!("expected the never-answered waiter to get WriteResult::Err, got {other:?}")
+        assert!(crate::daemon::drain::execute_drain(&prism, queue.drain()).is_err());
+        for rx in receivers {
+            match rx.recv().unwrap() {
+                WriteResult::Err { message } => {
+                    assert!(message.starts_with("daemon drain failed:"), "{message}")
+                }
+                other => panic!("expected the drain's error, got {other:?}"),
             }
+            assert!(rx.recv().is_err(), "answered exactly once");
         }
     }
 
@@ -4155,20 +4067,17 @@ mod tests {
     /// ended up absolute too: a second `File` node alongside the real
     /// relative one, un-deduplicated and never cleaned up by `remove_file`.
     #[test]
-    fn route_or_serve_index_request_normalizes_an_absolute_path_to_relative_before_enqueuing() {
+    fn route_write_normalizes_an_absolute_index_path_to_relative_before_enqueuing() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().to_path_buf();
         std::fs::write(root.join("foo.py"), "def foo():\n    pass\n").unwrap();
 
         let abs_path = root.join("foo.py");
-        let request = crate::daemon_protocol::WriteRequest::Index {
-            paths: Some(vec![abs_path]),
-        };
-        let request_path = root.join("test.request");
-        std::fs::write(&request_path, serde_json::to_string(&request).unwrap()).unwrap();
-
         let mut router = Router::new(&root);
-        router.route(&request_path);
+        let (routed, _rx) = router.route_new(WriteRequest::Index {
+            paths: Some(vec![abs_path]),
+        });
+        assert!(matches!(routed, Routed::Done));
 
         let drained = router.queue.lock().unwrap().drain();
         assert_eq!(drained.items.len(), 1, "expected exactly one queued item");
@@ -4178,22 +4087,11 @@ mod tests {
              before enqueuing, got keys: {:?}",
             drained.items.keys().collect::<Vec<_>>()
         );
-
         assert_eq!(
             drained.waiters[0].paths,
             Some(vec!["foo.py".to_string()]),
             "the waiter's own scoped paths must also be relative"
         );
-    }
-
-    fn write_request(
-        dir: &Path,
-        name: &str,
-        request: &crate::daemon_protocol::WriteRequest,
-    ) -> PathBuf {
-        let path = dir.join(format!("{name}.request"));
-        std::fs::write(&path, serde_json::to_string(request).unwrap()).unwrap();
-        path
     }
 
     /// #164: a `FullReindex` arriving while one runs joins it -- one
@@ -4205,98 +4103,122 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().to_path_buf();
         std::fs::write(root.join("a.py"), "def a():\n    pass\n").unwrap();
-        let requests = root.join(".infigraph").join("requests");
-        std::fs::create_dir_all(&requests).unwrap();
-        let full = crate::daemon_protocol::WriteRequest::FullReindex;
-        let first = write_request(
-            &requests,
-            &crate::daemon_protocol::generate_request_name(),
-            &full,
-        );
-        let second = write_request(
-            &requests,
-            &crate::daemon_protocol::generate_request_name(),
-            &full,
-        );
 
         let mut router = Router::new(&root);
-        router.route(&first);
+        let (routed, first_rx) = router.route_new(WriteRequest::FullReindex);
+        assert!(matches!(routed, Routed::Done));
         assert!(
             router.full_reindex.is_some(),
             "the first request starts a rebuild"
         );
-        router.route(&second);
-        // The loop re-reads the running rebuild's own request every tick.
-        router.route(&first);
+        let (routed, second_rx) = router.route_new(WriteRequest::FullReindex);
+        assert!(
+            matches!(routed, Routed::Done),
+            "a second request is accepted, not left to run later"
+        );
 
         let running = router.full_reindex.take().expect("still the one rebuild");
         assert_eq!(
-            running.reply_paths,
-            vec![
-                first.with_extension("result"),
-                second.with_extension("result")
-            ],
-            "the second request must join the running rebuild, once"
-        );
-        assert!(
-            !second.exists(),
-            "a joined request is accepted, not left to run later"
+            running.replies.len(),
+            2,
+            "one rebuild, both clients owed its answer"
         );
 
         let joined = router.drain_rt.block_on(running.task.join());
         let (guard, _) = finish_full_reindex(
             &root,
-            &running.reply_paths,
+            running.replies,
             &router.registry,
             &mut router.held,
             joined,
         );
         drop(guard);
-        let replies: Vec<String> = running
-            .reply_paths
-            .iter()
-            .map(|p| std::fs::read_to_string(p).expect("every waiter is answered"))
-            .collect();
-        assert_eq!(replies[0], replies[1], "both get the one rebuild's result");
+        let first = first_rx.recv().expect("every waiter is answered");
+        let second = second_rx.recv().expect("every waiter is answered");
+        assert_eq!(first, second, "both get the one rebuild's result");
     }
 
-    /// #164: a request whose client has exited is owed to nobody. It is
-    /// dropped, sidecars and all, without being served.
+    /// #204 D3: a write that cannot start yet waits in `deferred`; once its
+    /// client has left, it is dropped rather than started.
+    /// Review finding (#204): at shutdown every write that has not started
+    /// -- still in the port's channel, deferred, or queued for a drain --
+    /// is told the daemon is shutting down, not left for `Drop` to answer
+    /// with the generic `DROPPED` as the process exits.
     #[test]
-    fn a_request_whose_client_is_gone_is_discarded_without_being_served() {
+    fn at_shutdown_every_unstarted_write_is_told_the_daemon_is_shutting_down() {
+        let (port, port_rx) = coordinator_port::CoordinatorPort::new(0, 1);
+        let (buffered, buffered_rx) = WriteReply::channel();
+        port.admit_write(WriteRequest::FullReindex, buffered, || false)
+            .unwrap();
+        let (deferred_reply, deferred_rx) = WriteReply::channel();
+        let mut deferred = VecDeque::from([(WriteRequest::FullReindex, deferred_reply)]);
+        let queue = Arc::new(Mutex::new(crate::daemon::queue::IndexWorkQueue::new()));
+        let (queued_reply, queued_rx) = WriteReply::channel();
+        queue
+            .lock()
+            .unwrap()
+            .add_waiter(crate::daemon::queue::Waiter {
+                kind: crate::daemon::queue::WaiterKind::Index,
+                use_learned: false,
+                reply: queued_reply,
+                paths: None,
+            });
+
+        answer_pending_writes(port_rx, &mut deferred, &queue);
+
+        for rx in [buffered_rx, deferred_rx, queued_rx] {
+            match rx.recv().unwrap() {
+                WriteResult::Err { message } => {
+                    assert_eq!(message, coordinator_port::SHUTTING_DOWN)
+                }
+                other => panic!("expected the shutdown answer, got {other:?}"),
+            }
+        }
+        assert!(deferred.is_empty());
+        assert!(queue.lock().unwrap().drain().waiters.is_empty());
+    }
+
+    #[test]
+    fn internal_rebuilds_collapse_while_one_is_waiting_or_running() {
+        let mut deferred = VecDeque::new();
+        request_internal_rebuild(&mut deferred, false);
+        request_internal_rebuild(&mut deferred, false);
+        assert_eq!(
+            deferred.len(),
+            1,
+            "one waiting rebuild absorbs the next request"
+        );
+        let mut deferred = VecDeque::new();
+        request_internal_rebuild(&mut deferred, true);
+        assert!(deferred.is_empty(), "a running rebuild absorbs it too");
+        let (client, _rx) = WriteReply::channel();
+        let mut deferred = VecDeque::from([(WriteRequest::FullReindex, client)]);
+        request_internal_rebuild(&mut deferred, false);
+        assert_eq!(deferred.len(), 1, "a client's waiting rebuild counts");
+    }
+
+    #[test]
+    fn a_deferred_write_whose_client_left_is_dropped_not_started() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().to_path_buf();
-        let requests = root.join(".infigraph").join("requests");
-        std::fs::create_dir_all(&requests).unwrap();
-        let mut child = std::process::Command::new("true").spawn().unwrap();
-        let dead = child.id();
-        child.wait().unwrap();
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let name = format!("{dead}-{nanos}-0");
-        let request = write_request(
-            &requests,
-            &name,
-            &crate::daemon_protocol::WriteRequest::Index { paths: None },
-        );
-        let sidecar = requests.join(format!("{name}.extractions.json"));
-        std::fs::write(&sidecar, "[]").unwrap();
-
         let mut router = Router::new(&root);
-        assert!(router.route(&request).is_none());
-
-        assert!(!request.exists(), "the request must be discarded");
-        assert!(!sidecar.exists(), "and its sidecar with it");
-        assert!(
-            !request.with_extension("result").exists(),
-            "nobody is waiting for a reply"
-        );
-        assert!(
-            router.queue.lock().unwrap().drain().waiters.is_empty(),
-            "nothing may be queued for a client that is gone"
-        );
+        // A reopen backoff makes a synchronous write `NotYet`.
+        router.backoff.record_failure();
+        let (reply, _rx) = WriteReply::channel();
+        let gone = reply.gone_flag();
+        let Routed::NotYet(request, reply) = router.route(
+            WriteRequest::UpsertRepo {
+                namespace: "n".into(),
+            },
+            reply,
+        ) else {
+            panic!("a write that cannot run yet is deferred")
+        };
+        let mut deferred = VecDeque::from([(request, reply)]);
+        assert_eq!(drop_gone(&mut deferred), 0, "its client is still there");
+        gone.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(drop_gone(&mut deferred), 1);
+        assert!(deferred.is_empty());
     }
 
     /// Before the `Task<T>`-based background tracking added here,
@@ -4322,28 +4244,20 @@ mod tests {
             scip::types::Index::default().write_to_bytes().unwrap(),
         )
         .unwrap();
-        let request_path = root.join("test.request");
-        std::fs::write(
-            &request_path,
-            serde_json::to_string(&crate::daemon_protocol::WriteRequest::ScipImport {
-                scip_path,
-                enriched_ast_generation: None,
-            })
-            .unwrap(),
-        )
-        .unwrap();
 
         let mut router = Router::new(&root);
         router.backoff.record_failure();
 
-        let started = router.route(&request_path);
+        let (routed, _rx) = router.route_new(WriteRequest::ScipImport {
+            scip_path,
+            enriched_ast_generation: None,
+        });
 
-        assert!(started.is_none(), "nothing may start while backing off");
-        assert!(router.held.is_none(), "the graph must not have been opened");
         assert!(
-            request_path.exists(),
-            "the request must wait for a later tick"
+            matches!(routed, Routed::NotYet(WriteRequest::ScipImport { .. }, _)),
+            "the import must wait for a later tick"
         );
+        assert!(router.held.is_none(), "the graph must not have been opened");
         assert!(
             !root.join(".infigraph").join("graph").exists(),
             "no graph file may have been created by a reopen attempt"
@@ -4351,51 +4265,40 @@ mod tests {
     }
 
     #[test]
-    fn route_or_serve_scip_import_request_is_background_tracked_not_served_synchronously() {
+    fn route_write_scip_import_is_background_tracked_not_served_synchronously() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().to_path_buf();
 
         // An empty-but-valid SCIP index is enough to exercise the routing
-        // and completion path -- `import_scip_index`'s per-document handling
-        // isn't what this test is about.
+        // and completion path.
         let scip_path = root.join("index.scip");
         let index = scip::types::Index::default();
         std::fs::write(&scip_path, index.write_to_bytes().unwrap()).unwrap();
 
-        let request = crate::daemon_protocol::WriteRequest::ScipImport {
+        let mut router = Router::new(&root);
+        let (routed, rx) = router.route_new(WriteRequest::ScipImport {
             scip_path: scip_path.clone(),
             enriched_ast_generation: None,
-        };
-        let request_path = root.join("test.request");
-        std::fs::write(&request_path, serde_json::to_string(&request).unwrap()).unwrap();
+        });
 
-        let mut router = Router::new(&root);
-
-        let started = router.route(&request_path);
-
-        let pending = match started {
-            Some(PendingWork::ScipImport(p)) => p,
-            Some(PendingWork::FullReindex(_)) => {
-                panic!("expected PendingWork::ScipImport, got PendingWork::FullReindex")
-            }
-            None => panic!(
-                "expected Some(PendingWork::ScipImport(_)) -- a None here means the request \
-                 fell through to the synchronous serve_request_locked path again"
+        let pending = match routed {
+            Routed::Started(PendingWork::ScipImport(p)) => p,
+            _ => panic!(
+                "expected Routed::Started(PendingWork::ScipImport(_)) -- anything else means \
+                 the import fell through to the synchronous serve_request_locked path"
             ),
         };
-
-        // The reply must not exist yet: if the import had run synchronously
-        // on this thread, `serve_one_request` would have already written it
-        // before `route_or_serve_request` returned.
+        // Not answered yet: had it run synchronously on this thread, the
+        // reply would already be here.
         assert!(
-            !pending.reply_path.exists(),
-            "reply was already written -- ScipImport was served synchronously, not backgrounded"
+            rx.try_recv().is_err(),
+            "reply already sent -- ScipImport was served synchronously, not backgrounded"
         );
 
         let joined = router.drain_rt.block_on(pending.task.join());
         let (guard, _touched_files) = finish_scip_import(
             &root,
-            &pending.reply_path,
+            pending.reply,
             &router.held,
             pending.indexer_label.as_deref(),
             joined,
@@ -4404,14 +4307,9 @@ mod tests {
             guard.is_some(),
             "expected the index-op guard back on a successful import"
         );
+        let reply = rx.recv().expect("finish_scip_import must answer");
         assert!(
-            pending.reply_path.exists(),
-            "finish_scip_import must write the .result reply"
-        );
-        let reply: crate::daemon_protocol::WriteResult =
-            serde_json::from_str(&std::fs::read_to_string(&pending.reply_path).unwrap()).unwrap();
-        assert!(
-            matches!(reply, crate::daemon_protocol::WriteResult::ScipImportOk(_)),
+            matches!(reply, WriteResult::ScipImportOk(_)),
             "expected WriteResult::ScipImportOk, got {reply:?}"
         );
     }
@@ -4546,25 +4444,6 @@ mod watchable_root_tests {
 /// every read with "the daemon has no graph open yet", advising a retry
 /// that could not help.
 #[cfg(test)]
-mod pending_request_tests {
-    use super::has_pending_request;
-
-    /// #203 M2: a `.request` waiting in `requests/` defers the idle exit, so
-    /// a client that wrote one just before the grace ran out is still served.
-    #[test]
-    fn only_a_request_file_counts_as_pending() {
-        let dir = tempfile::tempdir().unwrap();
-        let requests = dir.path().join("requests");
-        assert!(!has_pending_request(&requests), "no directory yet");
-        std::fs::create_dir_all(&requests).unwrap();
-        std::fs::write(requests.join("1.result"), b"{}").unwrap();
-        assert!(!has_pending_request(&requests), "a reply is not a request");
-        std::fs::write(requests.join("2.request"), b"{}").unwrap();
-        assert!(has_pending_request(&requests));
-    }
-}
-
-#[cfg(test)]
 mod refused_drain_tests {
     use super::*;
     use crate::ops::{begin_index_op, IndexOpOutcome};
@@ -4580,7 +4459,7 @@ mod refused_drain_tests {
                 guard,
                 result: Err(err),
             });
-        finish_drain(root, joined, &[]).1
+        finish_drain(root, joined).1
     }
 
     #[test]

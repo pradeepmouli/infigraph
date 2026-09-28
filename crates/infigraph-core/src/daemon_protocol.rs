@@ -5,10 +5,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use serde::{Deserialize, Serialize};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
-use tokio_util::sync::CancellationToken;
 
 /// A request for the daemon to perform a write. Carries references (paths),
 /// never pre-computed data -- the daemon does its own parsing/extraction
@@ -127,20 +124,44 @@ pub enum WriteRequest {
     FullReindex,
 }
 
+impl WriteRequest {
+    /// The variant's name, for messages.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            WriteRequest::Index { .. } => "Index",
+            WriteRequest::ScipImport { .. } => "ScipImport",
+            WriteRequest::IngestStructured { .. } => "IngestStructured",
+            WriteRequest::UpsertRepo { .. } => "UpsertRepo",
+            WriteRequest::DeriveTestedBy { .. } => "DeriveTestedBy",
+            WriteRequest::UpsertSimilarEdge { .. } => "UpsertSimilarEdge",
+            WriteRequest::WriteCallsServiceEdges { .. } => "WriteCallsServiceEdges",
+            WriteRequest::WriteCrossServiceEdges { .. } => "WriteCrossServiceEdges",
+            WriteRequest::UpsertDependencies { .. } => "UpsertDependencies",
+            WriteRequest::ReplaceConcerns { .. } => "ReplaceConcerns",
+            WriteRequest::ReplaceTaintFlows { .. } => "ReplaceTaintFlows",
+            WriteRequest::ReplaceResolvesTo { .. } => "ReplaceResolvesTo",
+            WriteRequest::StoreClusters { .. } => "StoreClusters",
+            WriteRequest::StoreConfigBindings { .. } => "StoreConfigBindings",
+            WriteRequest::UpsertFilesBulk { .. } => "UpsertFilesBulk",
+            WriteRequest::RemoveFiles { .. } => "RemoveFiles",
+            WriteRequest::ResolveCalls { .. } => "ResolveCalls",
+            WriteRequest::FullReindex => "FullReindex",
+        }
+    }
+}
+
 /// Moved to the read protocol with #155; re-exported so existing paths keep
 /// working.
 pub use crate::daemon::read_protocol::{WatchAction, WatchRole};
 
-/// Where IngestStructured's data comes from. `Inline` carries no data
-/// itself -- the actual array lives in a sibling `.data.json` file next to
-/// the request (see write_ingest_inline_sibling / read at
-/// `handle_ingest_structured`), following the same reference-not-payload
-/// convention paths already use.
+/// Where IngestStructured's data comes from. `Inline`'s array rides in a
+/// sidecar JSON file (`write_ingest_data`) rather than in the request,
+/// following the reference-not-payload convention paths already use.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum IngestSource {
     File(PathBuf),
     Directory(PathBuf),
-    Inline,
+    Inline(PathBuf),
 }
 
 /// Small summary of what happened -- never the full `IndexResult` (which
@@ -204,92 +225,16 @@ pub fn write_atomic(path: &Path, contents: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Process-local disambiguator: `SystemTime::now()`'s nanosecond field is
-/// not guaranteed nanosecond-*resolution* on every platform, so two
-/// threads in the same process racing this function could otherwise
-/// collide on the same request name -- `write_atomic` overwrites
-/// unconditionally (no existence check), so a collision would silently
-/// drop one caller's request rather than erroring.
-static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-/// Generates a unique request name the same way submit_write_request does
-/// internally, without writing anything -- used by callers that need to
-/// write a sibling file (Arrow IPC edges, inline ingest data) before the
-/// request file itself, using the same generated name.
-pub fn generate_request_name() -> String {
-    let counter = REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!(
-        "{}-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos(),
-        counter
-    )
-}
-
-/// Writes `request` as a `.request` file into `staging_dir` (unique name:
-/// pid + nanosecond timestamp + a process-local counter -- no new
-/// dependency, no UUID crate), then polls for the matching `.result` file
-/// until `timeout` expires. Bounded-wait-with-backoff, same idiom as
-/// `lockfile::acquire`.
-pub fn submit_write_request(
-    staging_dir: &Path,
-    request: &WriteRequest,
-    timeout: Duration,
-) -> anyhow::Result<WriteResult> {
-    let name = generate_request_name();
-    submit_write_request_named(staging_dir, &name, request, timeout)
-}
-
-/// Same as submit_write_request, but the request/result file names are
-/// pre-determined (via generate_request_name) rather than generated
-/// internally -- lets a caller write a sibling file first, using the same
-/// name, before the request file that references it exists.
-pub fn submit_write_request_named(
-    staging_dir: &Path,
-    name: &str,
-    request: &WriteRequest,
-    timeout: Duration,
-) -> anyhow::Result<WriteResult> {
-    submit_write_request_named_cancellable(staging_dir, name, request, timeout, None)
-}
-
-/// [`submit_write_request`] for a caller that can be told to stop waiting:
-/// `cancel` is checked between polls, and once it is cancelled the request
-/// file is withdrawn and a [`WriteRequestCancelled`] error is returned
-/// promptly instead of waiting out `timeout` (#138). The daemon's own
-/// SCIP-enrichment callback uses this: when the coordinator loop exits
-/// (`daemon stop`, the build-hash self-check, the `watch.stop` sentinel),
-/// nothing will ever serve the import it submitted, and the loop's exit
-/// joins that callback -- so a 600s poll here was a 600s shutdown hang, and
-/// the next daemon inherited the orphaned `.request`.
-pub fn submit_write_request_cancellable(
-    staging_dir: &Path,
-    request: &WriteRequest,
-    timeout: Duration,
-    cancel: &CancellationToken,
-) -> anyhow::Result<WriteResult> {
-    let name = generate_request_name();
-    submit_write_request_named_cancellable(staging_dir, &name, request, timeout, Some(cancel))
-}
-
-/// Marker error: the caller's [`CancellationToken`] fired before a daemon
-/// answered, and the request file was withdrawn. Downcast target for callers
-/// that clean up differently on cancellation than on timeout.
+/// Marker error: the caller's cancellation token fired before the daemon
+/// answered, and the write was withdrawn (`daemon::writes::submit`,
+/// `WriteSubmitter::submit`). Downcast target for callers that clean up
+/// differently on cancellation than on timeout.
 #[derive(Debug)]
-pub struct WriteRequestCancelled {
-    pub request_path: PathBuf,
-}
+pub struct WriteRequestCancelled;
 
 impl std::fmt::Display for WriteRequestCancelled {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "write request cancelled before a daemon responded ({})",
-            self.request_path.display()
-        )
+        f.write_str("write request cancelled before the daemon answered")
     }
 }
 
@@ -309,264 +254,6 @@ impl std::fmt::Display for DaemonFaulted {
 }
 
 impl std::error::Error for DaemonFaulted {}
-
-/// The latched fault that should stop `request` from waiting on the daemon
-/// that serves `staging_dir`, if any. The fault record sits beside the
-/// staging directory, in `.infigraph/`.
-fn blocking_fault(staging_dir: &Path, request: &WriteRequest) -> Option<DaemonFaulted> {
-    let fault = crate::daemon::fault::live_fault(staging_dir.parent()?)?;
-    (!fault.class.admits(request)).then_some(DaemonFaulted(fault))
-}
-
-fn submit_write_request_named_cancellable(
-    staging_dir: &Path,
-    name: &str,
-    request: &WriteRequest,
-    timeout: Duration,
-    cancel: Option<&CancellationToken>,
-) -> anyhow::Result<WriteResult> {
-    if let Some(faulted) = blocking_fault(staging_dir, request) {
-        return Err(anyhow::Error::new(faulted));
-    }
-    // A routed write is a use of the daemon, for as long as it waits: its
-    // lease must not be released under it (`daemon::lease`). The staging
-    // directory is `<root>/.infigraph/requests`.
-    let _use = staging_dir
-        .parent()
-        .filter(|dot| dot.file_name() == Some(std::ffi::OsStr::new(".infigraph")))
-        .and_then(Path::parent)
-        .map(crate::daemon::lease::in_use);
-    std::fs::create_dir_all(staging_dir)?;
-    let request_path = staging_dir.join(format!("{name}.request"));
-    let result_path = staging_dir.join(format!("{name}.result"));
-
-    write_atomic(&request_path, &serde_json::to_string(request)?)?;
-
-    let start = Instant::now();
-    let mut delay = Duration::from_millis(10);
-    loop {
-        if result_path.exists() {
-            let contents = std::fs::read_to_string(&result_path)?;
-            std::fs::remove_file(&result_path).ok();
-            return Ok(serde_json::from_str(&contents)?);
-        }
-        if cancel.is_some_and(|t| t.is_cancelled()) {
-            std::fs::remove_file(&request_path).ok();
-            return Err(anyhow::Error::new(WriteRequestCancelled { request_path }));
-        }
-        // Checked while waiting too, not only up front: the daemon may hit
-        // the fault on this very request.
-        if let Some(faulted) = blocking_fault(staging_dir, request) {
-            std::fs::remove_file(&request_path).ok();
-            return Err(anyhow::Error::new(faulted));
-        }
-        if start.elapsed() >= timeout {
-            std::fs::remove_file(&request_path).ok();
-            anyhow::bail!(
-                "no daemon responded to write request within {:?} ({})",
-                timeout,
-                request_path.display()
-            );
-        }
-        std::thread::sleep(delay.min(timeout.saturating_sub(start.elapsed())));
-        delay = (delay * 2).min(Duration::from_millis(200));
-    }
-}
-
-/// Whether the client that submitted `request_path` is gone, so the request
-/// is owed to nobody (#164).
-///
-/// A killed client withdraws nothing: `index_project` killed its timed-out
-/// `infigraph index` children three times per invocation during the sittir
-/// ENOSPC stall, leaving six `FullReindex` requests whose owners were dead,
-/// and the daemon ran every one once space freed. A name from
-/// [`generate_request_name`] carries its submitter's pid and creation time,
-/// so the check is exact: the pid must be running, and must have started no
-/// later than the request was written -- a later start is a recycled pid.
-///
-/// Any other name (`compaction.request`, `auto-recovery.request`, a test's
-/// fixture) is the daemon's own or unattributable, and is never gone.
-pub fn request_client_is_gone(request_path: &Path) -> bool {
-    let Some(name) = request_path.file_stem().and_then(|s| s.to_str()) else {
-        return false;
-    };
-    let mut parts = name.splitn(3, '-');
-    let (Some(pid), Some(nanos), Some(_counter)) = (parts.next(), parts.next(), parts.next())
-    else {
-        return false;
-    };
-    let (Ok(pid), Ok(nanos)) = (pid.parse::<u32>(), nanos.parse::<u128>()) else {
-        return false;
-    };
-    let written_at = (nanos / 1_000_000_000) as u64;
-    match crate::instances::current_process_start_time(pid) {
-        None => true,
-        // Start times are whole seconds, so a process that started within
-        // the same second as the request is still its submitter.
-        Some(started_at) => started_at > written_at,
-    }
-}
-
-/// Remove a request and every file that shares its name -- its sidecars
-/// (`<name>.extractions.json`, `<name>.edges.arrow`) and any reply.
-pub fn discard_request(request_path: &Path) {
-    let (Some(dir), Some(stem)) = (
-        request_path.parent(),
-        request_path.file_stem().and_then(|s| s.to_str()),
-    ) else {
-        return;
-    };
-    let prefix = format!("{stem}.");
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            if entry.file_name().to_string_lossy().starts_with(&prefix) {
-                let _ = std::fs::remove_file(entry.path());
-            }
-        }
-    }
-}
-
-#[cfg(test)]
-mod request_client_tests {
-    use super::*;
-
-    fn named(dir: &Path, name: &str) -> PathBuf {
-        dir.join(format!("{name}.request"))
-    }
-
-    #[test]
-    fn a_request_from_this_live_process_is_not_gone() {
-        let dir = tempfile::tempdir().unwrap();
-        assert!(!request_client_is_gone(&named(
-            dir.path(),
-            &generate_request_name()
-        )));
-    }
-
-    #[test]
-    fn a_request_from_an_exited_process_is_gone() {
-        let mut child = std::process::Command::new("true").spawn().unwrap();
-        let pid = child.id();
-        child.wait().unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        assert!(request_client_is_gone(&named(
-            dir.path(),
-            &format!("{pid}-{nanos}-0")
-        )));
-    }
-
-    #[test]
-    fn a_request_older_than_the_process_holding_its_pid_is_gone() {
-        // Written in 1970 by "this pid": the process running now started
-        // long after, so it cannot be the submitter.
-        let dir = tempfile::tempdir().unwrap();
-        let name = format!("{}-1000000000-0", std::process::id());
-        assert!(request_client_is_gone(&named(dir.path(), &name)));
-    }
-
-    #[test]
-    fn a_name_that_is_not_a_generated_one_is_never_gone() {
-        let dir = tempfile::tempdir().unwrap();
-        for name in ["compaction", "auto-recovery", "test", "1-2"] {
-            assert!(!request_client_is_gone(&named(dir.path(), name)), "{name}");
-        }
-    }
-
-    #[test]
-    fn discarding_a_request_removes_its_sidecars_and_nothing_else() {
-        let dir = tempfile::tempdir().unwrap();
-        let d = dir.path();
-        for f in [
-            "1-2-3.request",
-            "1-2-3.extractions.json",
-            "1-2-3.edges.arrow",
-            "1-2-30.request",
-            "other.request",
-        ] {
-            std::fs::write(d.join(f), "x").unwrap();
-        }
-        discard_request(&d.join("1-2-3.request"));
-        let mut left: Vec<String> = std::fs::read_dir(d)
-            .unwrap()
-            .flatten()
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .collect();
-        left.sort();
-        assert_eq!(left, vec!["1-2-30.request", "other.request"]);
-    }
-}
-
-#[cfg(test)]
-mod cancellation_tests {
-    use super::*;
-
-    /// #138: a cancelled token must end the poll promptly and withdraw the
-    /// request, instead of waiting out the (deliberately huge) timeout.
-    #[test]
-    fn cancelled_submit_returns_promptly_and_withdraws_the_request() {
-        let dir = tempfile::tempdir().unwrap();
-        let token = CancellationToken::new();
-        let waiter = {
-            let staging = dir.path().to_path_buf();
-            let token = token.clone();
-            std::thread::spawn(move || {
-                submit_write_request_cancellable(
-                    &staging,
-                    &WriteRequest::FullReindex,
-                    Duration::from_secs(600),
-                    &token,
-                )
-            })
-        };
-        std::thread::sleep(Duration::from_millis(150));
-        let cancelled_at = Instant::now();
-        token.cancel();
-
-        let err = waiter
-            .join()
-            .unwrap()
-            .expect_err("nothing served the request, so cancellation must surface as an error");
-        assert!(
-            cancelled_at.elapsed() < Duration::from_secs(5),
-            "poll must observe the cancellation within its backoff cap, took {:?}",
-            cancelled_at.elapsed()
-        );
-        let cancelled = err
-            .downcast_ref::<WriteRequestCancelled>()
-            .expect("must be the typed cancellation marker, not the timeout wording");
-        assert!(
-            !cancelled.request_path.exists(),
-            "the withdrawn request file must not be left for the next daemon to inherit"
-        );
-        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .map(|e| e.file_name())
-            .collect();
-        assert!(
-            leftovers.is_empty(),
-            "staging dir must be clean: {leftovers:?}"
-        );
-    }
-
-    /// The non-cancellable entry points keep their exact timeout behavior.
-    #[test]
-    fn uncancellable_submit_still_times_out() {
-        let dir = tempfile::tempdir().unwrap();
-        let err = submit_write_request(
-            dir.path(),
-            &WriteRequest::FullReindex,
-            Duration::from_millis(50),
-        )
-        .expect_err("no daemon, must time out");
-        assert!(err.to_string().contains("no daemon responded"), "{err}");
-        assert!(err.downcast_ref::<WriteRequestCancelled>().is_none());
-    }
-}
 
 #[cfg(test)]
 mod atomic_write_tests {
@@ -680,475 +367,292 @@ mod tests {
     }
 }
 
-#[cfg(test)]
-mod submit_tests {
-    use super::{submit_write_request, write_atomic, DaemonFaulted, WriteRequest, WriteResult};
-    use std::path::Path;
-    use std::time::{Duration, Instant};
-
-    fn staging_with_fault(class: crate::daemon::fault::FaultClass) -> tempfile::TempDir {
-        let dir = tempfile::tempdir().unwrap();
-        // This test process stands in for the daemon: its record is live
-        // for exactly as long as the writer runs.
-        crate::daemon::fault::record(dir.path(), class, "No space left on device (os error 28)");
-        dir
-    }
-
-    fn request_files(staging_dir: &Path) -> usize {
-        std::fs::read_dir(staging_dir)
-            .map(|d| d.filter_map(|e| e.ok()).count())
-            .unwrap_or(0)
-    }
-
-    /// #165: a daemon latched on a full disk fails a submit at once, with its
-    /// own error, instead of letting it wait out the timeout.
-    #[test]
-    fn a_latched_fault_fails_a_submit_fast_with_the_daemons_error() {
-        let dir = staging_with_fault(crate::daemon::fault::FaultClass::DiskFull);
-        let staging_dir = dir.path().join("requests");
-        let start = Instant::now();
-        let err = submit_write_request(
-            &staging_dir,
-            &WriteRequest::FullReindex,
-            Duration::from_secs(600),
-        )
-        .expect_err("a latched fault must fail the submit");
-        assert!(start.elapsed() < Duration::from_secs(5));
-        assert!(err.downcast_ref::<DaemonFaulted>().is_some(), "{err:#}");
-        assert!(
-            err.to_string().contains("No space left on device"),
-            "{err:#}"
-        );
-        assert_eq!(request_files(&staging_dir), 0, "nothing is left behind");
-    }
-
-    /// A fault the daemon latches while a client waits ends the wait too, and
-    /// withdraws the request.
-    #[test]
-    fn a_fault_latched_mid_wait_ends_the_wait_and_withdraws_the_request() {
-        let dir = tempfile::tempdir().unwrap();
-        let staging_dir = dir.path().join("requests");
-        let infigraph_dir = dir.path().to_path_buf();
-        let daemon = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(300));
-            crate::daemon::fault::record(
-                &infigraph_dir,
-                crate::daemon::fault::FaultClass::OpenFailed,
-                "graph will not open",
-            );
-        });
-        let err = submit_write_request(
-            &staging_dir,
-            &WriteRequest::Index { paths: None },
-            Duration::from_secs(30),
-        )
-        .expect_err("the fault must end the wait");
-        daemon.join().unwrap();
-        assert!(err.downcast_ref::<DaemonFaulted>().is_some(), "{err:#}");
-        assert_eq!(request_files(&staging_dir), 0, "the request was withdrawn");
-    }
-
-    /// A growth refusal still lets a full reindex through: it is the remedy.
-    #[test]
-    fn a_growth_refusal_still_admits_a_full_reindex() {
-        let dir = staging_with_fault(crate::daemon::fault::FaultClass::GrowthRefused);
-        let staging_dir = dir.path().join("requests");
-        let err = submit_write_request(
-            &staging_dir,
-            &WriteRequest::FullReindex,
-            Duration::from_millis(300),
-        )
-        .expect_err("no daemon answers in this test");
-        assert!(err.downcast_ref::<DaemonFaulted>().is_none(), "{err:#}");
-        assert!(err.to_string().contains("no daemon responded"), "{err:#}");
-    }
-
-    #[test]
-    fn submit_write_request_writes_request_file_and_returns_matching_result() {
-        let dir = tempfile::tempdir().unwrap();
-        let staging_dir = dir.path().join("requests");
-        std::fs::create_dir_all(&staging_dir).unwrap();
-
-        let request = WriteRequest::Index {
-            paths: Some(vec!["src/main.rs".into()]),
-        };
-
-        // Simulate the server: a background thread watches for the request
-        // file to appear, then writes a matching result file.
-        let staging_dir_clone = staging_dir.clone();
-        let handle = std::thread::spawn(move || {
-            let start = std::time::Instant::now();
-            loop {
-                let entries: Vec<_> = std::fs::read_dir(&staging_dir_clone)
-                    .unwrap()
-                    .filter_map(|e| e.ok())
-                    .filter(|e| e.path().extension().is_some_and(|ext| ext == "request"))
-                    .collect();
-                if let Some(entry) = entries.first() {
-                    let result_path = entry.path().with_extension("result");
-                    let result = WriteResult::Ok {
-                        total_files: 1,
-                        indexed_files: 1,
-                    };
-                    write_atomic(&result_path, &serde_json::to_string(&result).unwrap()).unwrap();
-                    std::fs::remove_file(entry.path()).unwrap();
-                    return;
-                }
-                if start.elapsed() > Duration::from_secs(2) {
-                    panic!("test server never saw a request file appear");
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            }
-        });
-
-        let result = submit_write_request(&staging_dir, &request, Duration::from_secs(2)).unwrap();
-        assert_eq!(
-            result,
-            WriteResult::Ok {
-                total_files: 1,
-                indexed_files: 1,
-            }
-        );
-
-        handle.join().unwrap();
-    }
-
-    #[test]
-    fn submit_write_request_times_out_cleanly_when_no_result_appears() {
-        let dir = tempfile::tempdir().unwrap();
-        let staging_dir = dir.path().join("requests");
-        std::fs::create_dir_all(&staging_dir).unwrap();
-
-        let request = WriteRequest::Index { paths: None };
-        let result = submit_write_request(&staging_dir, &request, Duration::from_millis(200));
-        assert!(
-            result.is_err(),
-            "expected a timeout error when no server ever responds"
-        );
-    }
-}
-
 use crate::Infigraph;
 
-/// Reads the request at `request_path`, executes it against `infigraph`
-/// (an already-open, write-mode `Infigraph` -- the daemon's own persistent
-/// connection), writes the matching `.result` file, then removes the
-/// request file. Never panics on a failed operation -- a request that
-/// fails to index still produces an `Err` result file, so the caller's
-/// `submit_write_request` poll resolves instead of timing out. A request
-/// file that fails to even parse (corrupt/truncated write) also produces
-/// an `Err` result rather than silently leaving the caller to time out.
-///
-/// Assumes the single-daemon invariant this whole design is built on: at
-/// most one process ever calls this function for a given `request_path`.
-/// Under that invariant there's no read-execute-write-remove TOCTOU risk;
-/// this function does not defend against a second concurrent caller (e.g.
-/// via a claim-by-rename step) since that scenario should never arise in
-/// the real architecture -- if it's ever reused somewhere that invariant
-/// doesn't hold, add that defense first.
-pub fn serve_one_request(infigraph: &Infigraph, request_path: &Path) -> anyhow::Result<()> {
-    let result_path = request_path.with_extension("result");
-
-    let result = match std::fs::read_to_string(request_path)
-        .map_err(anyhow::Error::from)
-        .and_then(|contents| Ok(serde_json::from_str::<WriteRequest>(&contents)?))
-    {
-        Ok(request) => match &request {
-            WriteRequest::Index { paths: None } => match infigraph.index() {
+/// Runs one write against `infigraph` (the daemon's own write-mode
+/// connection) and says what happened. Never panics on a failed operation:
+/// every failure is a `WriteResult::Err`, so the client always gets an
+/// answer.
+pub fn serve_write(infigraph: &Infigraph, request: &WriteRequest) -> WriteResult {
+    match request {
+        WriteRequest::Index { paths: None } => match infigraph.index() {
+            Ok(r) => WriteResult::Ok {
+                total_files: r.total_files,
+                indexed_files: r.indexed_files,
+            },
+            Err(e) => WriteResult::Err {
+                message: e.to_string(),
+            },
+        },
+        WriteRequest::Index { paths: Some(paths) } => match infigraph.index_files(paths) {
+            Ok(r) => WriteResult::Ok {
+                total_files: r.total_files,
+                indexed_files: r.indexed_files,
+            },
+            Err(e) => WriteResult::Err {
+                message: e.to_string(),
+            },
+        },
+        WriteRequest::ScipImport {
+            scip_path,
+            enriched_ast_generation,
+        } => match infigraph.import_scip_enriched_at(scip_path, *enriched_ast_generation) {
+            Ok(stats) => WriteResult::ScipImportOk(stats),
+            Err(e) => WriteResult::Err {
+                message: e.to_string(),
+            },
+        },
+        WriteRequest::IngestStructured { schema_id, source } => {
+            match handle_ingest_structured(infigraph, schema_id, source) {
                 Ok(r) => WriteResult::Ok {
-                    total_files: r.total_files,
-                    indexed_files: r.indexed_files,
+                    total_files: r.nodes_created + r.edges_created,
+                    indexed_files: r.nodes_created,
+                },
+                Err(e) => WriteResult::Err {
+                    message: e.to_string(),
+                },
+            }
+        }
+        WriteRequest::UpsertRepo { namespace } => match infigraph.backend() {
+            Some(b) => match b.upsert_repo(namespace) {
+                Ok(()) => WriteResult::Ok {
+                    total_files: 0,
+                    indexed_files: 0,
                 },
                 Err(e) => WriteResult::Err {
                     message: e.to_string(),
                 },
             },
-            WriteRequest::Index { paths: Some(paths) } => match infigraph.index_files(paths) {
-                Ok(r) => WriteResult::Ok {
-                    total_files: r.total_files,
-                    indexed_files: r.indexed_files,
+            None => WriteResult::Err {
+                message: "graph not initialized".to_string(),
+            },
+        },
+        WriteRequest::DeriveTestedBy { files } => {
+            let files_ref: Option<Vec<&str>> = files
+                .as_ref()
+                .map(|f| f.iter().map(String::as_str).collect());
+            match infigraph.backend() {
+                Some(b) => match b.derive_tested_by_edges(files_ref.as_deref()) {
+                    Ok(count) => WriteResult::Ok {
+                        total_files: 0,
+                        indexed_files: count,
+                    },
+                    Err(e) => WriteResult::Err {
+                        message: e.to_string(),
+                    },
+                },
+                None => WriteResult::Err {
+                    message: "graph not initialized".to_string(),
+                },
+            }
+        }
+        WriteRequest::UpsertSimilarEdge { id_a, id_b, score } => match infigraph.backend() {
+            Some(b) => match b.upsert_similar_edge(id_a, id_b, *score) {
+                Ok(()) => WriteResult::Ok {
+                    total_files: 0,
+                    indexed_files: 0,
                 },
                 Err(e) => WriteResult::Err {
                     message: e.to_string(),
                 },
             },
-            WriteRequest::ScipImport {
-                scip_path,
-                enriched_ast_generation,
-            } => match infigraph.import_scip_enriched_at(scip_path, *enriched_ast_generation) {
-                Ok(stats) => WriteResult::ScipImportOk(stats),
-                Err(e) => WriteResult::Err {
-                    message: e.to_string(),
-                },
+            None => WriteResult::Err {
+                message: "graph not initialized".to_string(),
             },
-            WriteRequest::IngestStructured { schema_id, source } => {
-                match handle_ingest_structured(infigraph, schema_id, source, request_path) {
-                    Ok(r) => WriteResult::Ok {
-                        total_files: r.nodes_created + r.edges_created,
-                        indexed_files: r.nodes_created,
-                    },
-                    Err(e) => WriteResult::Err {
-                        message: e.to_string(),
-                    },
-                }
-            }
-            WriteRequest::UpsertRepo { namespace } => match infigraph.backend() {
-                Some(b) => match b.upsert_repo(namespace) {
-                    Ok(()) => WriteResult::Ok {
-                        total_files: 0,
-                        indexed_files: 0,
-                    },
-                    Err(e) => WriteResult::Err {
-                        message: e.to_string(),
-                    },
-                },
-                None => WriteResult::Err {
-                    message: "graph not initialized".to_string(),
-                },
-            },
-            WriteRequest::DeriveTestedBy { files } => {
-                let files_ref: Option<Vec<&str>> = files
-                    .as_ref()
-                    .map(|f| f.iter().map(String::as_str).collect());
-                match infigraph.backend() {
-                    Some(b) => match b.derive_tested_by_edges(files_ref.as_deref()) {
-                        Ok(count) => WriteResult::Ok {
-                            total_files: 0,
-                            indexed_files: count,
-                        },
-                        Err(e) => WriteResult::Err {
-                            message: e.to_string(),
-                        },
-                    },
-                    None => WriteResult::Err {
-                        message: "graph not initialized".to_string(),
-                    },
-                }
-            }
-            WriteRequest::UpsertSimilarEdge { id_a, id_b, score } => match infigraph.backend() {
-                Some(b) => match b.upsert_similar_edge(id_a, id_b, *score) {
-                    Ok(()) => WriteResult::Ok {
-                        total_files: 0,
-                        indexed_files: 0,
-                    },
-                    Err(e) => WriteResult::Err {
-                        message: e.to_string(),
-                    },
-                },
-                None => WriteResult::Err {
-                    message: "graph not initialized".to_string(),
-                },
-            },
-            WriteRequest::WriteCallsServiceEdges { edges_path } => {
-                match read_calls_service_edges_arrow(edges_path).and_then(|edges| {
-                    infigraph
-                        .backend()
-                        .ok_or_else(|| anyhow::anyhow!("graph not initialized"))
-                        .and_then(|b| b.write_calls_service_edges(&edges))
-                }) {
-                    Ok(()) => {
-                        std::fs::remove_file(edges_path).ok();
-                        WriteResult::Ok {
-                            total_files: 0,
-                            indexed_files: 0,
-                        }
-                    }
-                    Err(e) => WriteResult::Err {
-                        message: e.to_string(),
-                    },
-                }
-            }
-            WriteRequest::WriteCrossServiceEdges { edges_path } => {
-                match read_cross_service_edges_arrow(edges_path).and_then(|candidates| {
-                    infigraph
-                        .backend()
-                        .ok_or_else(|| anyhow::anyhow!("graph not initialized"))
-                        .and_then(|b| b.write_cross_service_edges(&candidates))
-                }) {
-                    Ok(created) => {
-                        std::fs::remove_file(edges_path).ok();
-                        WriteResult::Ok {
-                            total_files: 0,
-                            indexed_files: created,
-                        }
-                    }
-                    Err(e) => WriteResult::Err {
-                        message: e.to_string(),
-                    },
-                }
-            }
-            WriteRequest::UpsertDependencies { result } => match infigraph.backend() {
-                Some(b) => match b.upsert_dependencies(result) {
-                    Ok(()) => WriteResult::Ok {
-                        total_files: 0,
-                        indexed_files: 0,
-                    },
-                    Err(e) => WriteResult::Err {
-                        message: e.to_string(),
-                    },
-                },
-                None => WriteResult::Err {
-                    message: "graph not initialized".to_string(),
-                },
-            },
-            WriteRequest::ReplaceTaintFlows { flows } => match infigraph.backend() {
-                Some(b) => match b.replace_taint_flows(flows) {
-                    Ok(()) => WriteResult::Ok {
-                        total_files: 0,
-                        indexed_files: 0,
-                    },
-                    Err(e) => WriteResult::Err {
-                        message: e.to_string(),
-                    },
-                },
-                None => WriteResult::Err {
-                    message: "graph not initialized".to_string(),
-                },
-            },
-            WriteRequest::ReplaceConcerns { concerns } => match infigraph.backend() {
-                Some(b) => match b.replace_concerns(concerns) {
-                    Ok(()) => WriteResult::Ok {
-                        total_files: 0,
-                        indexed_files: 0,
-                    },
-                    Err(e) => WriteResult::Err {
-                        message: e.to_string(),
-                    },
-                },
-                None => WriteResult::Err {
-                    message: "graph not initialized".to_string(),
-                },
-            },
-            WriteRequest::ReplaceResolvesTo { edges } => match infigraph.backend() {
-                Some(b) => match b.replace_resolves_to(edges) {
-                    Ok(()) => WriteResult::Ok {
-                        total_files: 0,
-                        indexed_files: 0,
-                    },
-                    Err(e) => WriteResult::Err {
-                        message: e.to_string(),
-                    },
-                },
-                None => WriteResult::Err {
-                    message: "graph not initialized".to_string(),
-                },
-            },
-            WriteRequest::StoreClusters {
-                idx_to_id,
-                community,
-                modularity,
-            } => match infigraph.backend() {
-                Some(b) => match b.store_clusters(idx_to_id, community, *modularity) {
-                    Ok(stats) => WriteResult::ClustersOk(stats),
-                    Err(e) => WriteResult::Err {
-                        message: e.to_string(),
-                    },
-                },
-                None => WriteResult::Err {
-                    message: "graph not initialized".to_string(),
-                },
-            },
-            WriteRequest::StoreConfigBindings { bindings } => match infigraph.backend() {
-                Some(b) => match b.store_config_bindings(bindings) {
-                    Ok(()) => WriteResult::Ok {
-                        total_files: 0,
-                        indexed_files: 0,
-                    },
-                    Err(e) => WriteResult::Err {
-                        message: e.to_string(),
-                    },
-                },
-                None => WriteResult::Err {
-                    message: "graph not initialized".to_string(),
-                },
-            },
-            WriteRequest::UpsertFilesBulk {
-                extractions_path,
-                existing_hashes_empty,
-            } => match read_extractions_json(extractions_path).and_then(|extractions| {
+        },
+        WriteRequest::WriteCallsServiceEdges { edges_path } => {
+            match read_calls_service_edges_arrow(edges_path).and_then(|edges| {
                 infigraph
                     .backend()
                     .ok_or_else(|| anyhow::anyhow!("graph not initialized"))
-                    .and_then(|b| {
-                        b.upsert_files_bulk(&extractions, *existing_hashes_empty)
-                            .map(|()| extractions.len())
-                    })
+                    .and_then(|b| b.write_calls_service_edges(&edges))
             }) {
-                Ok(written) => {
-                    std::fs::remove_file(extractions_path).ok();
+                Ok(()) => {
+                    std::fs::remove_file(edges_path).ok();
                     WriteResult::Ok {
-                        total_files: written,
-                        indexed_files: written,
+                        total_files: 0,
+                        indexed_files: 0,
                     }
                 }
                 Err(e) => WriteResult::Err {
                     message: e.to_string(),
                 },
-            },
-            WriteRequest::RemoveFiles { files } => match infigraph.backend() {
-                Some(b) => match files.iter().try_for_each(|f| b.remove_file(f)) {
-                    Ok(()) => WriteResult::Ok {
-                        total_files: files.len(),
-                        indexed_files: files.len(),
-                    },
-                    Err(e) => WriteResult::Err {
-                        message: e.to_string(),
-                    },
-                },
-                None => WriteResult::Err {
-                    message: "graph not initialized".to_string(),
-                },
-            },
-            WriteRequest::ResolveCalls {
-                extractions_path,
-                use_learned,
-            } => {
-                // Loaded here, not shipped in the request: the daemon runs in
-                // the same project root, so it reads the same
-                // .infigraph/learned/patterns.json the client would have.
-                let learned =
-                    use_learned.then(|| crate::learned::LearnedStore::load(infigraph.root()));
-                match read_extractions_json(extractions_path).and_then(|extractions| {
-                    infigraph
-                        .backend()
-                        .ok_or_else(|| anyhow::anyhow!("graph not initialized"))
-                        .and_then(|b| b.resolve_calls(&extractions, learned.as_ref()))
-                }) {
-                    Ok(stats) => {
-                        std::fs::remove_file(extractions_path).ok();
-                        WriteResult::ResolveOk(stats)
+            }
+        }
+        WriteRequest::WriteCrossServiceEdges { edges_path } => {
+            match read_cross_service_edges_arrow(edges_path).and_then(|candidates| {
+                infigraph
+                    .backend()
+                    .ok_or_else(|| anyhow::anyhow!("graph not initialized"))
+                    .and_then(|b| b.write_cross_service_edges(&candidates))
+            }) {
+                Ok(created) => {
+                    std::fs::remove_file(edges_path).ok();
+                    WriteResult::Ok {
+                        total_files: 0,
+                        indexed_files: created,
                     }
-                    Err(e) => WriteResult::Err {
-                        message: e.to_string(),
-                    },
+                }
+                Err(e) => WriteResult::Err {
+                    message: e.to_string(),
+                },
+            }
+        }
+        WriteRequest::UpsertDependencies { result } => match infigraph.backend() {
+            Some(b) => match b.upsert_dependencies(result) {
+                Ok(()) => WriteResult::Ok {
+                    total_files: 0,
+                    indexed_files: 0,
+                },
+                Err(e) => WriteResult::Err {
+                    message: e.to_string(),
+                },
+            },
+            None => WriteResult::Err {
+                message: "graph not initialized".to_string(),
+            },
+        },
+        WriteRequest::ReplaceTaintFlows { flows } => match infigraph.backend() {
+            Some(b) => match b.replace_taint_flows(flows) {
+                Ok(()) => WriteResult::Ok {
+                    total_files: 0,
+                    indexed_files: 0,
+                },
+                Err(e) => WriteResult::Err {
+                    message: e.to_string(),
+                },
+            },
+            None => WriteResult::Err {
+                message: "graph not initialized".to_string(),
+            },
+        },
+        WriteRequest::ReplaceConcerns { concerns } => match infigraph.backend() {
+            Some(b) => match b.replace_concerns(concerns) {
+                Ok(()) => WriteResult::Ok {
+                    total_files: 0,
+                    indexed_files: 0,
+                },
+                Err(e) => WriteResult::Err {
+                    message: e.to_string(),
+                },
+            },
+            None => WriteResult::Err {
+                message: "graph not initialized".to_string(),
+            },
+        },
+        WriteRequest::ReplaceResolvesTo { edges } => match infigraph.backend() {
+            Some(b) => match b.replace_resolves_to(edges) {
+                Ok(()) => WriteResult::Ok {
+                    total_files: 0,
+                    indexed_files: 0,
+                },
+                Err(e) => WriteResult::Err {
+                    message: e.to_string(),
+                },
+            },
+            None => WriteResult::Err {
+                message: "graph not initialized".to_string(),
+            },
+        },
+        WriteRequest::StoreClusters {
+            idx_to_id,
+            community,
+            modularity,
+        } => match infigraph.backend() {
+            Some(b) => match b.store_clusters(idx_to_id, community, *modularity) {
+                Ok(stats) => WriteResult::ClustersOk(stats),
+                Err(e) => WriteResult::Err {
+                    message: e.to_string(),
+                },
+            },
+            None => WriteResult::Err {
+                message: "graph not initialized".to_string(),
+            },
+        },
+        WriteRequest::StoreConfigBindings { bindings } => match infigraph.backend() {
+            Some(b) => match b.store_config_bindings(bindings) {
+                Ok(()) => WriteResult::Ok {
+                    total_files: 0,
+                    indexed_files: 0,
+                },
+                Err(e) => WriteResult::Err {
+                    message: e.to_string(),
+                },
+            },
+            None => WriteResult::Err {
+                message: "graph not initialized".to_string(),
+            },
+        },
+        WriteRequest::UpsertFilesBulk {
+            extractions_path,
+            existing_hashes_empty,
+        } => match read_extractions_json(extractions_path).and_then(|extractions| {
+            infigraph
+                .backend()
+                .ok_or_else(|| anyhow::anyhow!("graph not initialized"))
+                .and_then(|b| {
+                    b.upsert_files_bulk(&extractions, *existing_hashes_empty)
+                        .map(|()| extractions.len())
+                })
+        }) {
+            Ok(written) => {
+                std::fs::remove_file(extractions_path).ok();
+                WriteResult::Ok {
+                    total_files: written,
+                    indexed_files: written,
                 }
             }
-            WriteRequest::FullReindex => WriteResult::Err {
-                message: "FullReindex not yet implemented".to_string(),
+            Err(e) => WriteResult::Err {
+                message: e.to_string(),
             },
         },
-        Err(e) => WriteResult::Err {
-            message: format!("failed to read/parse request: {e}"),
+        WriteRequest::RemoveFiles { files } => match infigraph.backend() {
+            Some(b) => match files.iter().try_for_each(|f| b.remove_file(f)) {
+                Ok(()) => WriteResult::Ok {
+                    total_files: files.len(),
+                    indexed_files: files.len(),
+                },
+                Err(e) => WriteResult::Err {
+                    message: e.to_string(),
+                },
+            },
+            None => WriteResult::Err {
+                message: "graph not initialized".to_string(),
+            },
         },
-    };
-
-    write_atomic(&result_path, &serde_json::to_string(&result)?)?;
-    // Tolerate the request file already being gone: a caller that timed
-    // out (submit_write_request) removes its own request file, and this
-    // function may race that removal if it finishes serving right around
-    // the caller's timeout. The result file above is still written either
-    // way -- an accepted, documented gap (unconsumed result files
-    // accumulating in the staging directory) that the watcher-wiring plan
-    // needs to address with a cleanup/TTL pass, not silently ignored here.
-    std::fs::remove_file(request_path).ok();
-    Ok(())
+        WriteRequest::ResolveCalls {
+            extractions_path,
+            use_learned,
+        } => {
+            // Loaded here, not shipped in the request: the daemon runs in
+            // the same project root, so it reads the same
+            // .infigraph/learned/patterns.json the client would have.
+            let learned = use_learned.then(|| crate::learned::LearnedStore::load(infigraph.root()));
+            match read_extractions_json(extractions_path).and_then(|extractions| {
+                infigraph
+                    .backend()
+                    .ok_or_else(|| anyhow::anyhow!("graph not initialized"))
+                    .and_then(|b| b.resolve_calls(&extractions, learned.as_ref()))
+            }) {
+                Ok(stats) => {
+                    std::fs::remove_file(extractions_path).ok();
+                    WriteResult::ResolveOk(stats)
+                }
+                Err(e) => WriteResult::Err {
+                    message: e.to_string(),
+                },
+            }
+        }
+        WriteRequest::FullReindex => WriteResult::Err {
+            message: "FullReindex not yet implemented".to_string(),
+        },
+    }
 }
 
 fn handle_ingest_structured(
     infigraph: &Infigraph,
     schema_id: &str,
     source: &IngestSource,
-    request_path: &Path,
 ) -> anyhow::Result<crate::structured::IngestResult> {
     let backend = infigraph
         .backend()
@@ -1168,37 +672,19 @@ fn handle_ingest_structured(
             let full_path = infigraph.root().join(path);
             backend.ingest_structured_directory(&schema.schema, &full_path)
         }
-        IngestSource::Inline => {
-            let sibling_path = request_path.with_extension("data.json");
-            let contents = std::fs::read_to_string(&sibling_path)?;
+        IngestSource::Inline(data_path) => {
+            let contents = std::fs::read_to_string(data_path)?;
             let data: Vec<serde_json::Value> = serde_json::from_str(&contents)?;
             let result = backend.ingest_structured_data(&schema.schema, &data)?;
-            std::fs::remove_file(&sibling_path).ok();
+            std::fs::remove_file(data_path).ok();
             Ok(result)
         }
     }
 }
 
-/// Writes `data` as a sibling `.data.json` file next to where a request
-/// named `request_path` will be written, using the same atomic-write
-/// guarantee as the request/result files themselves. Returns the path the
-/// server-side handler will read (request_path.with_extension("data.json")).
-///
-/// Note: this helper needs the FINAL request path to derive the sibling
-/// path, but `submit_write_request` currently generates that path
-/// internally and doesn't expose it before writing the request. Task 13's
-/// wrapper will need `submit_write_request` (or a variant of it) to write
-/// the sibling file *before* the request file, using the same generated
-/// name -- this only establishes the naming convention and the
-/// server-side read/cleanup (see `handle_ingest_structured`'s
-/// `IngestSource::Inline` arm).
-pub fn write_ingest_inline_sibling(
-    request_path: &Path,
-    data: &[serde_json::Value],
-) -> anyhow::Result<PathBuf> {
-    let sibling_path = request_path.with_extension("data.json");
-    write_atomic(&sibling_path, &serde_json::to_string(data)?)?;
-    Ok(sibling_path)
+/// Writes an `IngestStructured::Inline` payload to its sidecar `path`.
+pub fn write_ingest_data(path: &Path, data: &[serde_json::Value]) -> anyhow::Result<()> {
+    write_atomic(path, &serde_json::to_string(data)?)
 }
 
 /// Writes `extractions` as a JSON sibling file at `path`, for

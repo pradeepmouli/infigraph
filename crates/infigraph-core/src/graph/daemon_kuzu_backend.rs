@@ -19,7 +19,7 @@ use super::{
     TestCoverage, TypeHierarchy,
 };
 
-/// Routes writes through the DaemonKuzu file-drop protocol instead of
+/// Routes writes to the daemon over its read socket (#204) instead of
 /// opening a direct embedded Kuzu connection. See
 /// docs/superpowers/specs/2026-08-01-daemonkuzu-daemon-wiring-design.md.
 ///
@@ -29,7 +29,7 @@ use super::{
 ///    *fresh per read call* (see `open_read`), not held for the wrapper's
 ///    lifetime.
 /// 2. The write methods covered by WriteRequest (see daemon_protocol.rs)
-///    route through submit_write_request (Task 13).
+///    route through `daemon::writes::submit` over the read socket (#204).
 /// 3. Any other write method returns a clear error rather than silently
 ///    writing through the read connection (which would fail at the DB
 ///    level, per read_only_connection_rejects_write_statements) or
@@ -110,14 +110,54 @@ impl DaemonKuzuBackend {
         )
     }
 
-    fn staging_dir(&self) -> std::path::PathBuf {
-        self.root.join(".infigraph").join("requests")
+    /// Send one write to the daemon over its socket (#204). A
+    /// `WriteResult::Err` becomes an error, so each method matches only the
+    /// success variant it expects.
+    fn write(
+        &self,
+        request: crate::daemon_protocol::WriteRequest,
+        timeout: std::time::Duration,
+    ) -> Result<crate::daemon_protocol::WriteResult> {
+        let opts = crate::daemon::writes::WriteOpts {
+            timeout,
+            cancel: None,
+        };
+        match crate::daemon::writes::submit(&self.root, &request, opts)? {
+            crate::daemon_protocol::WriteResult::Err { message } => Err(anyhow::anyhow!(message)),
+            other => Ok(other),
+        }
+    }
+
+    /// `write`, for a request whose payload rides in a sidecar file: `fill`
+    /// writes it, and it is removed again if the write fails, since the
+    /// daemon removes a sidecar only once it has consumed it.
+    fn write_with_sidecar(
+        &self,
+        ext: &str,
+        fill: impl FnOnce(&Path) -> Result<()>,
+        request: impl FnOnce(std::path::PathBuf) -> crate::daemon_protocol::WriteRequest,
+        timeout: std::time::Duration,
+    ) -> Result<crate::daemon_protocol::WriteResult> {
+        let path = crate::daemon::writes::sidecar_path(&self.root, ext);
+        if let Err(e) = fill(&path) {
+            std::fs::remove_file(&path).ok();
+            return Err(e);
+        }
+        let result = self.write(request(path.clone()), timeout);
+        if result.is_err() {
+            std::fs::remove_file(&path).ok();
+        }
+        result
+    }
+
+    fn unexpected(kind: &str, other: crate::daemon_protocol::WriteResult) -> anyhow::Error {
+        anyhow::anyhow!("unexpected WriteResult for {kind}: {other:?}")
     }
 
     /// Budget for the two whole-index-sized writes (`upsert_files_bulk`,
     /// `resolve_calls`). A full first index of a large repo puts every file's
-    /// extraction through one of these, and the daemon only writes its
-    /// `.result` once the whole batch commits -- matching the 600s
+    /// extraction through one of these, and the daemon only answers once
+    /// the whole batch commits -- matching the 600s
     /// `Infigraph::index()` allows for the same work under the
     /// `INFIGRAPH_WATCH_INDEX_VIA_DAEMON` path.
     const BULK_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
@@ -231,26 +271,18 @@ impl GraphBackend for DaemonKuzuBackend {
         None
     }
 
-    // ── Tier 2: writes covered by WriteRequest route through the daemon
-    //    protocol's submit_write_request(_named). ──
+    // ── Tier 2: writes covered by WriteRequest route through
+    //    `daemon::writes::submit` (#204). ──
 
     fn upsert_similar_edge(&self, id_a: &str, id_b: &str, score: f32) -> Result<()> {
-        let staging_dir = self.staging_dir();
         let request = crate::daemon_protocol::WriteRequest::UpsertSimilarEdge {
             id_a: id_a.to_string(),
             id_b: id_b.to_string(),
             score,
         };
-        match crate::daemon_protocol::submit_write_request(
-            &staging_dir,
-            &request,
-            std::time::Duration::from_secs(30),
-        )? {
+        match self.write(request, std::time::Duration::from_secs(30))? {
             crate::daemon_protocol::WriteResult::Ok { .. } => Ok(()),
-            crate::daemon_protocol::WriteResult::Err { message } => Err(anyhow::anyhow!(message)),
-            other => Err(anyhow::anyhow!(
-                "unexpected WriteResult for UpsertSimilarEdge: {other:?}"
-            )),
+            other => Err(Self::unexpected("UpsertSimilarEdge", other)),
         }
     }
     fn upsert_file(&self, _extraction: &FileExtraction) -> Result<()> {
@@ -267,33 +299,17 @@ impl GraphBackend for DaemonKuzuBackend {
         if extractions.is_empty() {
             return Ok(());
         }
-        let staging_dir = self.staging_dir();
-        std::fs::create_dir_all(&staging_dir)?;
-        let name = crate::daemon_protocol::generate_request_name();
-        let extractions_path = staging_dir.join(format!("{name}.extractions.json"));
-        crate::daemon_protocol::write_extractions_json(&extractions_path, extractions)?;
-
-        let request = crate::daemon_protocol::WriteRequest::UpsertFilesBulk {
-            extractions_path: extractions_path.clone(),
-            existing_hashes_empty,
-        };
-        match crate::daemon_protocol::submit_write_request_named(
-            &staging_dir,
-            &name,
-            &request,
+        match self.write_with_sidecar(
+            "extractions.json",
+            |p| crate::daemon_protocol::write_extractions_json(p, extractions),
+            |extractions_path| crate::daemon_protocol::WriteRequest::UpsertFilesBulk {
+                extractions_path,
+                existing_hashes_empty,
+            },
             Self::BULK_WRITE_TIMEOUT,
-        ) {
-            Ok(crate::daemon_protocol::WriteResult::Ok { .. }) => Ok(()),
-            Ok(crate::daemon_protocol::WriteResult::Err { message }) => {
-                Err(anyhow::anyhow!(message))
-            }
-            Ok(other) => Err(anyhow::anyhow!(
-                "unexpected WriteResult for UpsertFilesBulk: {other:?}"
-            )),
-            Err(e) => {
-                std::fs::remove_file(&extractions_path).ok(); // clean up on timeout -- the daemon never consumed it
-                Err(e)
-            }
+        )? {
+            crate::daemon_protocol::WriteResult::Ok { .. } => Ok(()),
+            other => Err(Self::unexpected("UpsertFilesBulk", other)),
         }
     }
     /// Sends a one-element `RemoveFiles` batch. The trait's per-file
@@ -301,88 +317,48 @@ impl GraphBackend for DaemonKuzuBackend {
     /// itself is already batch-shaped, so a future bulk caller needs no
     /// protocol change.
     fn remove_file(&self, file: &str) -> Result<()> {
-        let staging_dir = self.staging_dir();
         let request = crate::daemon_protocol::WriteRequest::RemoveFiles {
             files: vec![file.to_string()],
         };
-        match crate::daemon_protocol::submit_write_request(
-            &staging_dir,
-            &request,
-            std::time::Duration::from_secs(60),
-        )? {
+        match self.write(request, std::time::Duration::from_secs(60))? {
             crate::daemon_protocol::WriteResult::Ok { .. } => Ok(()),
-            crate::daemon_protocol::WriteResult::Err { message } => Err(anyhow::anyhow!(message)),
-            other => Err(anyhow::anyhow!(
-                "unexpected WriteResult for RemoveFiles: {other:?}"
-            )),
+            other => Err(Self::unexpected("RemoveFiles", other)),
         }
     }
     fn derive_tested_by_edges(&self, changed_files: Option<&[&str]>) -> Result<usize> {
-        let staging_dir = self.staging_dir();
         let request = crate::daemon_protocol::WriteRequest::DeriveTestedBy {
             files: changed_files.map(|files| files.iter().map(|s| s.to_string()).collect()),
         };
-        match crate::daemon_protocol::submit_write_request(
-            &staging_dir,
-            &request,
-            std::time::Duration::from_secs(60),
-        )? {
+        match self.write(request, std::time::Duration::from_secs(60))? {
             crate::daemon_protocol::WriteResult::Ok { indexed_files, .. } => Ok(indexed_files),
-            crate::daemon_protocol::WriteResult::Err { message } => Err(anyhow::anyhow!(message)),
-            other => Err(anyhow::anyhow!(
-                "unexpected WriteResult for DeriveTestedBy: {other:?}"
-            )),
+            other => Err(Self::unexpected("DeriveTestedBy", other)),
         }
     }
     fn upsert_repo(&self, repo_name: &str) -> Result<()> {
         // Deliberately overridden (not left as the trait's no-op default)
         // -- see Task 6's warning about the inherited-default trap.
-        let staging_dir = self.staging_dir();
         let request = crate::daemon_protocol::WriteRequest::UpsertRepo {
             namespace: repo_name.to_string(),
         };
-        match crate::daemon_protocol::submit_write_request(
-            &staging_dir,
-            &request,
-            std::time::Duration::from_secs(30),
-        )? {
+        match self.write(request, std::time::Duration::from_secs(30))? {
             crate::daemon_protocol::WriteResult::Ok { .. } => Ok(()),
-            crate::daemon_protocol::WriteResult::Err { message } => Err(anyhow::anyhow!(message)),
-            other => Err(anyhow::anyhow!(
-                "unexpected WriteResult for UpsertRepo: {other:?}"
-            )),
+            other => Err(Self::unexpected("UpsertRepo", other)),
         }
     }
     fn write_calls_service_edges(&self, edges: &[CallsServiceEdge]) -> Result<()> {
         if edges.is_empty() {
             return Ok(());
         }
-        let staging_dir = self.staging_dir();
-        std::fs::create_dir_all(&staging_dir)?;
-        let name = crate::daemon_protocol::generate_request_name();
-        let edges_path = staging_dir.join(format!("{name}.edges.arrow"));
-        crate::daemon_protocol::write_calls_service_edges_arrow(&edges_path, edges)?;
-
-        let request = crate::daemon_protocol::WriteRequest::WriteCallsServiceEdges {
-            edges_path: edges_path.clone(),
-        };
-        match crate::daemon_protocol::submit_write_request_named(
-            &staging_dir,
-            &name,
-            &request,
+        match self.write_with_sidecar(
+            "edges.arrow",
+            |p| crate::daemon_protocol::write_calls_service_edges_arrow(p, edges),
+            |edges_path| crate::daemon_protocol::WriteRequest::WriteCallsServiceEdges {
+                edges_path,
+            },
             std::time::Duration::from_secs(60),
-        ) {
-            Ok(crate::daemon_protocol::WriteResult::Ok { .. }) => Ok(()),
-            Ok(crate::daemon_protocol::WriteResult::Err { message }) => {
-                Err(anyhow::anyhow!(message))
-            }
-            Ok(other) => Err(anyhow::anyhow!(
-                "unexpected WriteResult for WriteCallsServiceEdges: {other:?}"
-            )),
-            Err(e) => {
-                std::fs::remove_file(&edges_path).ok(); // clean up on timeout -- the daemon never consumed it
-                Err(e)
-            }
+        )? {
+            crate::daemon_protocol::WriteResult::Ok { .. } => Ok(()),
+            other => Err(Self::unexpected("WriteCallsServiceEdges", other)),
         }
     }
     fn resolve_calls(
@@ -393,36 +369,20 @@ impl GraphBackend for DaemonKuzuBackend {
         if extractions.is_empty() {
             return Ok(ResolveStats::default());
         }
-        let staging_dir = self.staging_dir();
-        std::fs::create_dir_all(&staging_dir)?;
-        let name = crate::daemon_protocol::generate_request_name();
-        let extractions_path = staging_dir.join(format!("{name}.extractions.json"));
-        crate::daemon_protocol::write_extractions_json(&extractions_path, extractions)?;
-
-        let request = crate::daemon_protocol::WriteRequest::ResolveCalls {
-            extractions_path: extractions_path.clone(),
-            // Only the caller's intent travels; the daemon loads the store
-            // itself. A caller passing `None` still gets no learned patterns
-            // applied, so this is not a silent behavior change.
-            use_learned: learned.is_some(),
-        };
-        match crate::daemon_protocol::submit_write_request_named(
-            &staging_dir,
-            &name,
-            &request,
+        match self.write_with_sidecar(
+            "extractions.json",
+            |p| crate::daemon_protocol::write_extractions_json(p, extractions),
+            |extractions_path| crate::daemon_protocol::WriteRequest::ResolveCalls {
+                extractions_path,
+                // Only the caller's intent travels; the daemon loads the
+                // store itself. A caller passing `None` still gets no learned
+                // patterns applied, so this is not a silent behavior change.
+                use_learned: learned.is_some(),
+            },
             Self::BULK_WRITE_TIMEOUT,
-        ) {
-            Ok(crate::daemon_protocol::WriteResult::ResolveOk(stats)) => Ok(stats),
-            Ok(crate::daemon_protocol::WriteResult::Err { message }) => {
-                Err(anyhow::anyhow!(message))
-            }
-            Ok(other) => Err(anyhow::anyhow!(
-                "unexpected WriteResult for ResolveCalls: {other:?}"
-            )),
-            Err(e) => {
-                std::fs::remove_file(&extractions_path).ok(); // clean up on timeout -- the daemon never consumed it
-                Err(e)
-            }
+        )? {
+            crate::daemon_protocol::WriteResult::ResolveOk(stats) => Ok(stats),
+            other => Err(Self::unexpected("ResolveCalls", other)),
         }
     }
     fn re_resolve_for_files(
@@ -449,21 +409,13 @@ impl GraphBackend for DaemonKuzuBackend {
         _project_root: Option<&Path>,
         enriched_ast_generation: Option<i64>,
     ) -> Result<crate::scip::ImportStats> {
-        let staging_dir = self.staging_dir();
         let request = crate::daemon_protocol::WriteRequest::ScipImport {
             scip_path: index_path.to_path_buf(),
             enriched_ast_generation,
         };
-        match crate::daemon_protocol::submit_write_request(
-            &staging_dir,
-            &request,
-            std::time::Duration::from_secs(120),
-        )? {
+        match self.write(request, std::time::Duration::from_secs(120))? {
             crate::daemon_protocol::WriteResult::ScipImportOk(stats) => Ok(stats),
-            crate::daemon_protocol::WriteResult::Err { message } => Err(anyhow::anyhow!(message)),
-            other => Err(anyhow::anyhow!(
-                "unexpected WriteResult for ScipImport: {other:?}"
-            )),
+            other => Err(Self::unexpected("ScipImport", other)),
         }
     }
     fn ingest_structured_data(
@@ -471,39 +423,23 @@ impl GraphBackend for DaemonKuzuBackend {
         schema: &crate::structured::SchemaMeta,
         data: &[serde_json::Value],
     ) -> Result<crate::structured::IngestResult> {
-        let staging_dir = self.staging_dir();
-        std::fs::create_dir_all(&staging_dir)?;
-        let name = crate::daemon_protocol::generate_request_name();
-        let request_path = staging_dir.join(format!("{name}.request"));
-        let data_path = crate::daemon_protocol::write_ingest_inline_sibling(&request_path, data)?;
-
-        let request = crate::daemon_protocol::WriteRequest::IngestStructured {
-            schema_id: schema.schema_id.clone(),
-            source: crate::daemon_protocol::IngestSource::Inline,
-        };
-        match crate::daemon_protocol::submit_write_request_named(
-            &staging_dir,
-            &name,
-            &request,
+        match self.write_with_sidecar(
+            "data.json",
+            |p| crate::daemon_protocol::write_ingest_data(p, data),
+            |data_path| crate::daemon_protocol::WriteRequest::IngestStructured {
+                schema_id: schema.schema_id.clone(),
+                source: crate::daemon_protocol::IngestSource::Inline(data_path),
+            },
             std::time::Duration::from_secs(120),
-        ) {
-            Ok(crate::daemon_protocol::WriteResult::Ok {
+        )? {
+            crate::daemon_protocol::WriteResult::Ok {
                 total_files,
                 indexed_files,
-            }) => Ok(crate::structured::IngestResult {
+            } => Ok(crate::structured::IngestResult {
                 nodes_created: indexed_files,
                 edges_created: total_files.saturating_sub(indexed_files),
             }),
-            Ok(crate::daemon_protocol::WriteResult::Err { message }) => {
-                Err(anyhow::anyhow!(message))
-            }
-            Ok(other) => Err(anyhow::anyhow!(
-                "unexpected WriteResult for IngestStructured: {other:?}"
-            )),
-            Err(e) => {
-                std::fs::remove_file(&data_path).ok(); // clean up on timeout -- the daemon never consumed it
-                Err(e)
-            }
+            other => Err(Self::unexpected("IngestStructured", other)),
         }
     }
     fn ingest_structured_file(
@@ -511,16 +447,11 @@ impl GraphBackend for DaemonKuzuBackend {
         schema: &crate::structured::SchemaMeta,
         path: &Path,
     ) -> Result<crate::structured::IngestResult> {
-        let staging_dir = self.staging_dir();
         let request = crate::daemon_protocol::WriteRequest::IngestStructured {
             schema_id: schema.schema_id.clone(),
             source: crate::daemon_protocol::IngestSource::File(path.to_path_buf()),
         };
-        match crate::daemon_protocol::submit_write_request(
-            &staging_dir,
-            &request,
-            std::time::Duration::from_secs(120),
-        )? {
+        match self.write(request, std::time::Duration::from_secs(120))? {
             crate::daemon_protocol::WriteResult::Ok {
                 total_files,
                 indexed_files,
@@ -528,10 +459,7 @@ impl GraphBackend for DaemonKuzuBackend {
                 nodes_created: indexed_files,
                 edges_created: total_files.saturating_sub(indexed_files),
             }),
-            crate::daemon_protocol::WriteResult::Err { message } => Err(anyhow::anyhow!(message)),
-            other => Err(anyhow::anyhow!(
-                "unexpected WriteResult for IngestStructured: {other:?}"
-            )),
+            other => Err(Self::unexpected("IngestStructured", other)),
         }
     }
     fn ingest_structured_directory(
@@ -539,16 +467,11 @@ impl GraphBackend for DaemonKuzuBackend {
         schema: &crate::structured::SchemaMeta,
         dir: &Path,
     ) -> Result<crate::structured::IngestResult> {
-        let staging_dir = self.staging_dir();
         let request = crate::daemon_protocol::WriteRequest::IngestStructured {
             schema_id: schema.schema_id.clone(),
             source: crate::daemon_protocol::IngestSource::Directory(dir.to_path_buf()),
         };
-        match crate::daemon_protocol::submit_write_request(
-            &staging_dir,
-            &request,
-            std::time::Duration::from_secs(120),
-        )? {
+        match self.write(request, std::time::Duration::from_secs(120))? {
             crate::daemon_protocol::WriteResult::Ok {
                 total_files,
                 indexed_files,
@@ -556,79 +479,44 @@ impl GraphBackend for DaemonKuzuBackend {
                 nodes_created: indexed_files,
                 edges_created: total_files.saturating_sub(indexed_files),
             }),
-            crate::daemon_protocol::WriteResult::Err { message } => Err(anyhow::anyhow!(message)),
-            other => Err(anyhow::anyhow!(
-                "unexpected WriteResult for IngestStructured: {other:?}"
-            )),
+            other => Err(Self::unexpected("IngestStructured", other)),
         }
     }
     fn upsert_dependencies(&self, result: &crate::manifest::ManifestResult) -> Result<()> {
-        let staging_dir = self.staging_dir();
         let request = crate::daemon_protocol::WriteRequest::UpsertDependencies {
             result: result.clone(),
         };
-        match crate::daemon_protocol::submit_write_request(
-            &staging_dir,
-            &request,
-            std::time::Duration::from_secs(30),
-        )? {
+        match self.write(request, std::time::Duration::from_secs(30))? {
             crate::daemon_protocol::WriteResult::Ok { .. } => Ok(()),
-            crate::daemon_protocol::WriteResult::Err { message } => Err(anyhow::anyhow!(message)),
-            other => Err(anyhow::anyhow!(
-                "unexpected WriteResult for UpsertDependencies: {other:?}"
-            )),
+            other => Err(Self::unexpected("UpsertDependencies", other)),
         }
     }
     fn replace_taint_flows(&self, flows: &[TaintFlowEdge]) -> Result<()> {
-        let staging_dir = self.staging_dir();
         let request = crate::daemon_protocol::WriteRequest::ReplaceTaintFlows {
             flows: flows.to_vec(),
         };
-        match crate::daemon_protocol::submit_write_request(
-            &staging_dir,
-            &request,
-            std::time::Duration::from_secs(30),
-        )? {
+        match self.write(request, std::time::Duration::from_secs(30))? {
             crate::daemon_protocol::WriteResult::Ok { .. } => Ok(()),
-            crate::daemon_protocol::WriteResult::Err { message } => Err(anyhow::anyhow!(message)),
-            other => Err(anyhow::anyhow!(
-                "unexpected WriteResult for ReplaceTaintFlows: {other:?}"
-            )),
+            other => Err(Self::unexpected("ReplaceTaintFlows", other)),
         }
     }
 
     fn replace_concerns(&self, concerns: &[Concern]) -> Result<()> {
-        let staging_dir = self.staging_dir();
         let request = crate::daemon_protocol::WriteRequest::ReplaceConcerns {
             concerns: concerns.to_vec(),
         };
-        match crate::daemon_protocol::submit_write_request(
-            &staging_dir,
-            &request,
-            std::time::Duration::from_secs(30),
-        )? {
+        match self.write(request, std::time::Duration::from_secs(30))? {
             crate::daemon_protocol::WriteResult::Ok { .. } => Ok(()),
-            crate::daemon_protocol::WriteResult::Err { message } => Err(anyhow::anyhow!(message)),
-            other => Err(anyhow::anyhow!(
-                "unexpected WriteResult for ReplaceConcerns: {other:?}"
-            )),
+            other => Err(Self::unexpected("ReplaceConcerns", other)),
         }
     }
     fn replace_resolves_to(&self, edges: &[ResolvesToEdge]) -> Result<()> {
-        let staging_dir = self.staging_dir();
         let request = crate::daemon_protocol::WriteRequest::ReplaceResolvesTo {
             edges: edges.to_vec(),
         };
-        match crate::daemon_protocol::submit_write_request(
-            &staging_dir,
-            &request,
-            std::time::Duration::from_secs(30),
-        )? {
+        match self.write(request, std::time::Duration::from_secs(30))? {
             crate::daemon_protocol::WriteResult::Ok { .. } => Ok(()),
-            crate::daemon_protocol::WriteResult::Err { message } => Err(anyhow::anyhow!(message)),
-            other => Err(anyhow::anyhow!(
-                "unexpected WriteResult for ReplaceResolvesTo: {other:?}"
-            )),
+            other => Err(Self::unexpected("ReplaceResolvesTo", other)),
         }
     }
     fn store_clusters(
@@ -637,71 +525,39 @@ impl GraphBackend for DaemonKuzuBackend {
         community: &[usize],
         modularity: f64,
     ) -> Result<crate::cluster::ClusterStats> {
-        let staging_dir = self.staging_dir();
         let request = crate::daemon_protocol::WriteRequest::StoreClusters {
             idx_to_id: idx_to_id.to_vec(),
             community: community.to_vec(),
             modularity,
         };
-        match crate::daemon_protocol::submit_write_request(
-            &staging_dir,
-            &request,
-            std::time::Duration::from_secs(30),
-        )? {
+        match self.write(request, std::time::Duration::from_secs(30))? {
             crate::daemon_protocol::WriteResult::ClustersOk(stats) => Ok(stats),
-            crate::daemon_protocol::WriteResult::Err { message } => Err(anyhow::anyhow!(message)),
-            other => Err(anyhow::anyhow!(
-                "unexpected WriteResult for StoreClusters: {other:?}"
-            )),
+            other => Err(Self::unexpected("StoreClusters", other)),
         }
     }
     fn store_config_bindings(&self, bindings: &[crate::config::ConfigBindingWire]) -> Result<()> {
-        let staging_dir = self.staging_dir();
         let request = crate::daemon_protocol::WriteRequest::StoreConfigBindings {
             bindings: bindings.to_vec(),
         };
-        match crate::daemon_protocol::submit_write_request(
-            &staging_dir,
-            &request,
-            std::time::Duration::from_secs(30),
-        )? {
+        match self.write(request, std::time::Duration::from_secs(30))? {
             crate::daemon_protocol::WriteResult::Ok { .. } => Ok(()),
-            crate::daemon_protocol::WriteResult::Err { message } => Err(anyhow::anyhow!(message)),
-            other => Err(anyhow::anyhow!(
-                "unexpected WriteResult for StoreConfigBindings: {other:?}"
-            )),
+            other => Err(Self::unexpected("StoreConfigBindings", other)),
         }
     }
     fn write_cross_service_edges(&self, candidates: &[CrossServiceEdgeCandidate]) -> Result<usize> {
         if candidates.is_empty() {
             return Ok(0);
         }
-        let staging_dir = self.staging_dir();
-        std::fs::create_dir_all(&staging_dir)?;
-        let name = crate::daemon_protocol::generate_request_name();
-        let edges_path = staging_dir.join(format!("{name}.edges.arrow"));
-        crate::daemon_protocol::write_cross_service_edges_arrow(&edges_path, candidates)?;
-
-        let request = crate::daemon_protocol::WriteRequest::WriteCrossServiceEdges {
-            edges_path: edges_path.clone(),
-        };
-        match crate::daemon_protocol::submit_write_request_named(
-            &staging_dir,
-            &name,
-            &request,
+        match self.write_with_sidecar(
+            "edges.arrow",
+            |p| crate::daemon_protocol::write_cross_service_edges_arrow(p, candidates),
+            |edges_path| crate::daemon_protocol::WriteRequest::WriteCrossServiceEdges {
+                edges_path,
+            },
             std::time::Duration::from_secs(60),
-        ) {
-            Ok(crate::daemon_protocol::WriteResult::Ok { indexed_files, .. }) => Ok(indexed_files),
-            Ok(crate::daemon_protocol::WriteResult::Err { message }) => {
-                Err(anyhow::anyhow!(message))
-            }
-            Ok(other) => Err(anyhow::anyhow!(
-                "unexpected WriteResult for WriteCrossServiceEdges: {other:?}"
-            )),
-            Err(e) => {
-                std::fs::remove_file(&edges_path).ok(); // clean up on timeout -- the daemon never consumed it
-                Err(e)
-            }
+        )? {
+            crate::daemon_protocol::WriteResult::Ok { indexed_files, .. } => Ok(indexed_files),
+            other => Err(Self::unexpected("WriteCrossServiceEdges", other)),
         }
     }
 }

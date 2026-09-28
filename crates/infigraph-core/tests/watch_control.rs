@@ -9,9 +9,8 @@
 //! rather than reinvented -- that test already proved this shape works
 //! against a genuine `infigraph daemon`.
 
-use infigraph_core::daemon_protocol::{
-    submit_write_request, WatchAction, WatchRole, WriteRequest, WriteResult,
-};
+use infigraph_core::daemon::writes::{submit, WriteOpts};
+use infigraph_core::daemon_protocol::{WatchAction, WatchRole, WriteRequest, WriteResult};
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -136,8 +135,6 @@ fn daemon_survives_watch_control_stop_and_keeps_serving_writes() {
         std::thread::sleep(Duration::from_millis(100));
     }
 
-    let requests_dir = root.join(".infigraph").join("requests");
-
     // 1. Stop code-watching, over the daemon's socket (#155).
     assert_eq!(
         infigraph_core::daemon::control::send_control(&root, WatchRole::Code, WatchAction::Stop),
@@ -161,9 +158,15 @@ fn daemon_survives_watch_control_stop_and_keeps_serving_writes() {
     }
 
     // 4. Write-serving is untouched by the code-watch stop.
-    let index_reply =
-        submit_write_request(&requests_dir, &WriteRequest::FullReindex, REPLY_TIMEOUT)
-            .expect("daemon stopped serving writes after a code-watch stop");
+    let index_reply = submit(
+        &root,
+        &WriteRequest::FullReindex,
+        WriteOpts {
+            timeout: REPLY_TIMEOUT,
+            cancel: None,
+        },
+    )
+    .expect("daemon stopped serving writes after a code-watch stop");
     assert!(
         matches!(index_reply, WriteResult::FullReindexOk { .. }),
         "a write request must still be served while code-watching is stopped, got {index_reply:?}"

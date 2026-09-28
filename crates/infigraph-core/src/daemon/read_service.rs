@@ -19,14 +19,17 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 
-use super::control_port::{ControlPort, CONTROL_REPLY_TIMEOUT, NO_CONTROL, SHUTTING_DOWN};
+use super::coordinator_port::{
+    CoordinatorPort, WriteReply, CONTROL_REPLY_TIMEOUT, NO_CONTROL, SHUTTING_DOWN,
+};
 use super::liveness::{now_secs, Liveness};
 use super::read_endpoint::ReadEndpoint;
 use super::read_endpoint::ReadStream;
 use super::read_protocol::{
     read_client_frame, write_frame, write_reply, Attach, ClientFrame, ControlFrame, ControlRequest,
-    OpReply, ReadFrame, Store,
+    OpReply, ReadFrame, Store, WriteFrame,
 };
+use crate::daemon_protocol::{WriteRequest, WriteResult};
 
 /// Resolves the store to serve a request from, at request time.
 ///
@@ -174,7 +177,7 @@ impl ReadService {
         docs: Option<RowSource>,
         workers: usize,
         liveness: Arc<Liveness>,
-        control: Option<Arc<ControlPort>>,
+        control: Option<Arc<CoordinatorPort>>,
     ) -> Result<Self> {
         let leases = Arc::new(LeaseBook::new(liveness));
         let accept_leases = leases.clone();
@@ -264,7 +267,7 @@ fn serve_one(
     source: &StoreSource,
     docs: Option<&RowSource>,
     leases: &Arc<LeaseBook>,
-    control: Option<&Arc<ControlPort>>,
+    control: Option<&Arc<CoordinatorPort>>,
     mut stream: ReadStream,
 ) -> Result<()> {
     let frame = read_client_frame(&mut stream)?;
@@ -288,7 +291,21 @@ fn serve_one(
             return Ok(());
         }
         ClientFrame::Control(ControlFrame { control: request }) => {
-            spawn_control(control.cloned(), request, stream);
+            spawn_on_port(
+                control.cloned(),
+                "infigraph-control",
+                stream,
+                move |port, s| serve_control(port, request, s),
+            );
+            return Ok(());
+        }
+        ClientFrame::Write(WriteFrame { write: request }) => {
+            spawn_on_port(
+                control.cloned(),
+                "infigraph-write",
+                stream,
+                move |port, s| serve_socket_write(port, request, s),
+            );
             return Ok(());
         }
     };
@@ -437,11 +454,16 @@ fn lease_release_line(pid: u32, held: std::time::Duration, remaining: usize) -> 
     })
 }
 
-/// Runs one control request on its own thread, never a pool worker: it may
-/// wait up to `CONTROL_REPLY_TIMEOUT` on a busy coordinator, and a few of
-/// those on the pool would stop every read. Never joined by the service --
-/// the coordinator counts it through the port instead (see `InFlightGuard`).
-fn spawn_control(port: Option<Arc<ControlPort>>, request: ControlRequest, mut stream: ReadStream) {
+/// Runs `serve` on its own thread, never a pool worker: control can wait
+/// `CONTROL_REPLY_TIMEOUT` and a write minutes, and a few of those on the
+/// pool would stop every read. Never joined by the service -- the
+/// coordinator counts it through the port instead (see `InFlightGuard`).
+fn spawn_on_port(
+    port: Option<Arc<CoordinatorPort>>,
+    name: &'static str,
+    mut stream: ReadStream,
+    serve: impl FnOnce(&CoordinatorPort, &mut ReadStream) + Send + 'static,
+) {
     let Some(port) = port else {
         let _ = write_reply::<_, ()>(&mut stream, &OpReply::Err(NO_CONTROL.to_string()));
         return;
@@ -452,41 +474,81 @@ fn spawn_control(port: Option<Arc<ControlPort>>, request: ControlRequest, mut st
     // hang-up would read as an incompatible build.
     let (hand_over, take) = mpsc::channel::<ReadStream>();
     let spawned = std::thread::Builder::new()
-        .name("infigraph-control".into())
+        .name(name.into())
         .spawn(move || {
             let _guard = guard;
-            let Ok(mut stream) = take.recv() else {
-                return;
-            };
-            let reply = match port.submit(request) {
-                Err(msg) => OpReply::Err(msg),
-                Ok(rx) => match rx.recv_timeout(CONTROL_REPLY_TIMEOUT) {
-                    Ok(Ok(())) => OpReply::Ok(()),
-                    Ok(Err(msg)) => OpReply::Err(msg),
-                    Err(mpsc::RecvTimeoutError::Timeout) => OpReply::Err(format!(
-                        "the coordinator did not answer within {}s",
-                        CONTROL_REPLY_TIMEOUT.as_secs()
-                    )),
-                    Err(mpsc::RecvTimeoutError::Disconnected) => {
-                        OpReply::Err(SHUTTING_DOWN.to_string())
-                    }
-                },
-            };
-            let _ = write_reply(&mut stream, &reply);
+            if let Ok(mut stream) = take.recv() {
+                serve(&port, &mut stream);
+            }
         });
     match spawned {
         Ok(_) => {
             let _ = hand_over.send(stream);
         }
         Err(e) => {
-            eprintln!("[control] could not start a control thread: {e}");
+            eprintln!("[{name}] could not start a thread: {e}");
             let _ = write_reply::<_, ()>(
                 &mut stream,
-                &OpReply::Err(format!("the daemon could not start a control thread: {e}")),
+                &OpReply::Err(format!("the daemon could not start a thread: {e}")),
             );
         }
     }
 }
+
+fn serve_control(port: &CoordinatorPort, request: ControlRequest, stream: &mut ReadStream) {
+    let reply = match port.submit_control(request) {
+        Err(msg) => OpReply::Err(msg),
+        Ok(rx) => match rx.recv_timeout(CONTROL_REPLY_TIMEOUT) {
+            Ok(Ok(())) => OpReply::Ok(()),
+            Ok(Err(msg)) => OpReply::Err(msg),
+            Err(mpsc::RecvTimeoutError::Timeout) => OpReply::Err(format!(
+                "the coordinator did not answer within {}s",
+                CONTROL_REPLY_TIMEOUT.as_secs()
+            )),
+            Err(mpsc::RecvTimeoutError::Disconnected) => OpReply::Err(SHUTTING_DOWN.to_string()),
+        },
+    };
+    let _ = write_reply(stream, &reply);
+}
+
+/// One socket write (#204): admit it, ack, wait for the coordinator's
+/// answer while watching for the client to leave, then answer.
+fn serve_socket_write(port: &CoordinatorPort, request: WriteRequest, stream: &mut ReadStream) {
+    let (reply, rx) = WriteReply::channel();
+    let gone = reply.gone_flag();
+    if let Err(msg) = port.admit_write(request, reply, || stream.peer_closed()) {
+        let _ = write_reply::<_, ()>(stream, &OpReply::Err(msg));
+        return;
+    }
+    if write_reply(stream, &OpReply::Ok(())).is_err() {
+        gone.store(true, Ordering::SeqCst);
+        return;
+    }
+    loop {
+        match rx.recv_timeout(GONE_POLL) {
+            Ok(result) => {
+                let _ = write_reply(stream, &OpReply::Ok(result));
+                return;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if stream.peer_closed() {
+                    gone.store(true, Ordering::SeqCst);
+                    return;
+                }
+            }
+            // `Drop` answers every unsent reply, so this is unreachable in
+            // practice; answer rather than hang up if it ever is not.
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                let _ =
+                    write_reply::<_, WriteResult>(stream, &OpReply::Err(SHUTTING_DOWN.to_string()));
+                return;
+            }
+        }
+    }
+}
+
+/// How often a waiting write checks that its client is still there (#204 D2).
+pub const GONE_POLL: std::time::Duration = std::time::Duration::from_millis(250);
 
 type Job = Box<dyn FnOnce() + Send + 'static>;
 

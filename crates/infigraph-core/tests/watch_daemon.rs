@@ -807,9 +807,8 @@ fn watch_loop_shuts_down_when_its_root_directory_is_deleted() {
 /// 9 out-of-scope variants, chosen because it's the simplest to construct
 /// (a single string field) and its handler (`GraphBackend::upsert_repo`)
 /// writes to the graph: while `index.lock` is held externally, the request
-/// must NOT be served (no `.result` file appears, and the `.request` file
-/// stays in place so it's retried); once the lock is released, it is
-/// served.
+/// must NOT be served (its client gets no answer while the lock is held --
+/// the write stays deferred); once the lock is released, it is served.
 #[test]
 fn out_of_scope_write_request_contends_with_a_held_index_lock() {
     // Shared with other readers, exclusive against any test mutating
@@ -865,17 +864,10 @@ fn out_of_scope_write_request_contends_with_a_held_index_lock() {
     // Let the loop start ticking before dropping a request file.
     std::thread::sleep(std::time::Duration::from_millis(300));
 
-    let requests_dir = project.path().join(".infigraph").join("requests");
-    let request_path = requests_dir.join("out-of-scope-test.request");
-    let result_path = requests_dir.join("out-of-scope-test.result");
     let request = infigraph_core::daemon_protocol::WriteRequest::UpsertRepo {
         namespace: "test-repo".to_string(),
     };
-    infigraph_core::daemon_protocol::write_atomic(
-        &request_path,
-        &serde_json::to_string(&request).unwrap(),
-    )
-    .unwrap();
+    let client = submit_in_background(project.path(), request);
 
     // Poll rather than a single fixed-sleep-then-check: a one-shot check
     // after a fixed delay can false-pass against the pre-fix (unlocked) bug
@@ -888,17 +880,12 @@ fn out_of_scope_write_request_contends_with_a_held_index_lock() {
     for i in 0..100 {
         std::thread::sleep(std::time::Duration::from_millis(100));
         assert!(
-            !result_path.exists(),
+            !client.is_finished(),
             "out-of-scope request was served after ~{}ms while index.lock is held \
-             externally -- route_or_serve_request's fallback path is bypassing the lock",
+             externally -- route_write's locked path is bypassing the lock",
             (i + 1) * 100
         );
     }
-    assert!(
-        request_path.exists(),
-        ".request file must remain in place (not deleted) while contended, so it's retried \
-         on a later tick"
-    );
 
     // Release the external hold; the next tick's serve_request_locked
     // attempt should now succeed.
@@ -907,7 +894,7 @@ fn out_of_scope_write_request_contends_with_a_held_index_lock() {
     let mut served = false;
     for _ in 0..150 {
         std::thread::sleep(std::time::Duration::from_millis(100));
-        if result_path.exists() {
+        if client.is_finished() {
             served = true;
             break;
         }
@@ -916,6 +903,14 @@ fn out_of_scope_write_request_contends_with_a_held_index_lock() {
         served,
         "expected the watcher to serve the deferred out-of-scope request once \
          index.lock was released"
+    );
+    let reply = client.join().unwrap().unwrap();
+    assert!(
+        matches!(
+            reply,
+            infigraph_core::daemon_protocol::WriteResult::Ok { .. }
+        ),
+        "{reply:?}"
     );
 
     stop_tx.send(()).unwrap();
@@ -1001,15 +996,10 @@ fn full_reindex_build_task_can_be_cancelled_before_it_starts_the_swap() {
     // Let the loop start ticking before dropping a request file.
     std::thread::sleep(std::time::Duration::from_millis(300));
 
-    let requests_dir = project.path().join(".infigraph").join("requests");
-    let request_path = requests_dir.join("full-reindex-cancel-test.request");
-    let result_path = requests_dir.join("full-reindex-cancel-test.result");
-    infigraph_core::daemon_protocol::write_atomic(
-        &request_path,
-        &serde_json::to_string(&infigraph_core::daemon_protocol::WriteRequest::FullReindex)
-            .unwrap(),
-    )
-    .unwrap();
+    let client = submit_in_background(
+        project.path(),
+        infigraph_core::daemon_protocol::WriteRequest::FullReindex,
+    );
 
     // Bounded wait for a reply -- proves the loop didn't hang reaping the
     // cancelled build task (the same false-negative trap the sibling
@@ -1019,7 +1009,7 @@ fn full_reindex_build_task_can_be_cancelled_before_it_starts_the_swap() {
     let mut replied = false;
     for _ in 0..150 {
         std::thread::sleep(std::time::Duration::from_millis(100));
-        if result_path.exists() {
+        if client.is_finished() {
             replied = true;
             break;
         }
@@ -1030,9 +1020,7 @@ fn full_reindex_build_task_can_be_cancelled_before_it_starts_the_swap() {
          reaped -- a missing reply means the loop hung"
     );
 
-    let reply_contents = std::fs::read_to_string(&result_path).unwrap();
-    let reply: infigraph_core::daemon_protocol::WriteResult =
-        serde_json::from_str(&reply_contents).unwrap();
+    let reply = client.join().unwrap().unwrap();
     assert!(
         matches!(
             reply,
@@ -1116,7 +1104,7 @@ fn scip_enrichment_task_is_cancellable_via_daemon_token() {
     let scip_generation = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let scip_generation_for_cb = std::sync::Arc::clone(&scip_generation);
     let on_full_reindex: std::sync::Arc<infigraph_core::daemon::FullReindexCallback> =
-        std::sync::Arc::new(move |_root, _languages, _token| {
+        std::sync::Arc::new(move |_root, _languages, _token, _submit| {
             scip_generation_for_cb.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         });
 
@@ -1145,14 +1133,11 @@ fn scip_enrichment_task_is_cancellable_via_daemon_token() {
     // Let the loop start ticking before dropping a request file.
     std::thread::sleep(std::time::Duration::from_millis(300));
 
-    let requests_dir = project.path().join(".infigraph").join("requests");
-    let request_path = requests_dir.join("scip-cancel-test.request");
-    infigraph_core::daemon_protocol::write_atomic(
-        &request_path,
-        &serde_json::to_string(&infigraph_core::daemon_protocol::WriteRequest::FullReindex)
-            .unwrap(),
-    )
-    .unwrap();
+    // Its answer is not what this test is about.
+    let _client = submit_in_background(
+        project.path(),
+        infigraph_core::daemon_protocol::WriteRequest::FullReindex,
+    );
 
     // Poll for the SCIP-enrichment callback to have run -- this proves the
     // full-reindex swap landed and `on_full_reindex` was scheduled as a
@@ -1211,4 +1196,35 @@ fn scip_enrichment_task_is_cancellable_via_daemon_token() {
     // the right shape, or never actually joined the task), this would hang
     // instead of returning.
     handle.join().unwrap().unwrap();
+}
+
+/// Send `request` over the socket from a thread, once the in-process
+/// coordinator's endpoint is up. In-process it holds no `watch.lock`, which
+/// is what makes a real client wait for a starting daemon (#204).
+fn submit_in_background(
+    root: &std::path::Path,
+    request: infigraph_core::daemon_protocol::WriteRequest,
+) -> std::thread::JoinHandle<anyhow::Result<infigraph_core::daemon_protocol::WriteResult>> {
+    let root = root.to_path_buf();
+    std::thread::spawn(move || {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        while infigraph_core::daemon::read_endpoint::ReadEndpoint::for_root(&root)
+            .connect()
+            .is_err()
+        {
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "the endpoint never bound"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        infigraph_core::daemon::writes::submit(
+            &root,
+            &request,
+            infigraph_core::daemon::writes::WriteOpts {
+                timeout: std::time::Duration::from_secs(180),
+                cancel: None,
+            },
+        )
+    })
 }

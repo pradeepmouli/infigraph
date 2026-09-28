@@ -727,7 +727,9 @@ fn a_daemon_that_rejects_attach_is_not_reconnected_in_a_loop() {
 
 // ---- #155: Status and Control on the read socket ----
 
-use infigraph_core::daemon::control_port::{ControlMsg, ControlPort, BUSY, CONTROL_QUEUE};
+use infigraph_core::daemon::coordinator_port::{
+    ControlMsg, CoordinatorPort, PortMsg, BUSY, PORT_QUEUE,
+};
 use infigraph_core::daemon::read_protocol::{
     read_reply, write_op, ControlFrame, ControlRequest, OpReply, RoleState, StatusFrame,
     StatusReport, WatchAction, WatchRole,
@@ -738,12 +740,12 @@ fn control_service(
     root: &Path,
 ) -> (
     ReadService,
-    Arc<ControlPort>,
-    std::sync::mpsc::Receiver<ControlMsg>,
+    Arc<CoordinatorPort>,
+    std::sync::mpsc::Receiver<PortMsg>,
     Arc<Liveness>,
 ) {
     let liveness = Arc::new(Liveness::new());
-    let (port, rx) = ControlPort::new(1800, 60);
+    let (port, rx) = CoordinatorPort::new(1800, 60);
     let svc = ReadService::start_serving(
         root,
         Arc::new(|| None),
@@ -754,6 +756,14 @@ fn control_service(
     )
     .unwrap();
     (svc, port, rx, liveness)
+}
+
+/// The next message a stub coordinator receives, which must be a control one.
+fn next_control(rx: &std::sync::mpsc::Receiver<PortMsg>) -> ControlMsg {
+    match rx.recv().unwrap() {
+        PortMsg::Control(msg) => msg,
+        PortMsg::Write { request, .. } => panic!("expected control, got a {request:?} write"),
+    }
 }
 
 fn status(root: &Path) -> OpReply<StatusReport> {
@@ -792,7 +802,7 @@ fn status_and_control_do_not_count_as_activity_but_a_read_does() {
     let dir = tempfile::tempdir().unwrap();
     let (svc, _port, rx, liveness) = control_service(dir.path());
     let answer = std::thread::spawn(move || {
-        let msg = rx.recv().unwrap();
+        let msg = next_control(&rx);
         msg.reply.send(Ok(())).unwrap();
     });
     let then = liveness::now_secs() - 100;
@@ -812,10 +822,10 @@ fn a_control_reply_carries_the_coordinators_outcome() {
     let dir = tempfile::tempdir().unwrap();
     let (svc, _port, rx, _l) = control_service(dir.path());
     let answer = std::thread::spawn(move || {
-        let ok = rx.recv().unwrap();
+        let ok = next_control(&rx);
         assert_eq!(ok.request.action, WatchAction::Stop);
         ok.reply.send(Ok(())).unwrap();
-        let err = rx.recv().unwrap();
+        let err = next_control(&rx);
         err.reply.send(Err("no doc-watch loop".into())).unwrap();
     });
     assert!(matches!(
@@ -835,7 +845,7 @@ fn control_beyond_the_queue_is_refused_at_once_and_status_still_answers() {
     let dir = tempfile::tempdir().unwrap();
     let (svc, port, rx, _l) = control_service(dir.path());
     // Nobody drains `rx`: a wedged coordinator. Fill the queue.
-    let streams: Vec<_> = (0..CONTROL_QUEUE)
+    let streams: Vec<_> = (0..PORT_QUEUE)
         .map(|_| {
             let mut s = ReadEndpoint::for_root(dir.path()).connect().unwrap();
             write_op(&mut s, &control_frame(WatchRole::Code, WatchAction::Stop)).unwrap();
@@ -843,7 +853,7 @@ fn control_beyond_the_queue_is_refused_at_once_and_status_still_answers() {
         })
         .collect();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while port.in_flight() < CONTROL_QUEUE && std::time::Instant::now() < deadline {
+    while port.in_flight() < PORT_QUEUE && std::time::Instant::now() < deadline {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     let started = std::time::Instant::now();
@@ -1007,4 +1017,127 @@ fn the_release_guard_can_keep_a_lease() {
 #[cfg(unix)]
 fn ms(n: u64) -> std::time::Duration {
     std::time::Duration::from_millis(n)
+}
+
+// ---- #204: writes on the read socket ----
+
+use infigraph_core::daemon::read_protocol::WriteFrame;
+use infigraph_core::daemon_protocol::{WriteRequest, WriteResult};
+
+fn send_write(root: &Path) -> infigraph_core::daemon::read_endpoint::ReadStream {
+    let mut s = ReadEndpoint::for_root(root).connect().unwrap();
+    write_op(
+        &mut s,
+        &WriteFrame {
+            write: WriteRequest::FullReindex,
+        },
+    )
+    .unwrap();
+    s
+}
+
+#[test]
+fn a_write_is_admitted_then_answered_with_the_coordinators_result() {
+    let dir = tempfile::tempdir().unwrap();
+    let (svc, _port, rx, _l) = control_service(dir.path());
+    let mut s = send_write(dir.path());
+    assert!(matches!(
+        read_reply::<_, ()>(&mut s).unwrap(),
+        Some(OpReply::Ok(()))
+    ));
+    let PortMsg::Write { request, reply } =
+        rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap()
+    else {
+        panic!("a write")
+    };
+    assert_eq!(request, WriteRequest::FullReindex);
+    reply.send(WriteResult::Ok {
+        total_files: 3,
+        indexed_files: 3,
+    });
+    assert!(matches!(
+        read_reply::<_, WriteResult>(&mut s).unwrap(),
+        Some(OpReply::Ok(WriteResult::Ok { total_files: 3, .. }))
+    ));
+    svc.shutdown();
+}
+
+#[cfg(unix)]
+#[test]
+fn a_client_that_disconnects_marks_its_write_gone() {
+    let dir = tempfile::tempdir().unwrap();
+    let (svc, _port, rx, _l) = control_service(dir.path());
+    let mut s = send_write(dir.path());
+    let _ = read_reply::<_, ()>(&mut s).unwrap();
+    let PortMsg::Write { reply, .. } = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap()
+    else {
+        panic!("a write")
+    };
+    drop(s);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while !reply.is_gone() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(reply.is_gone(), "noticed within a few GONE_POLLs");
+    svc.shutdown();
+}
+
+#[cfg(unix)]
+#[test]
+fn a_write_waiting_for_a_slot_gives_up_when_its_client_leaves() {
+    let dir = tempfile::tempdir().unwrap();
+    let (svc, port, rx, _l) = control_service(dir.path());
+    let held: Vec<_> = (0..PORT_QUEUE)
+        .map(|_| {
+            port.submit_control(ControlRequest {
+                role: WatchRole::Code,
+                action: WatchAction::Stop,
+            })
+            .unwrap()
+        })
+        .collect();
+    let s = send_write(dir.path());
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    drop(s);
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    // The queue still holds only the controls: the abandoned write gave up
+    // rather than taking a slot once one frees.
+    let arrived: Vec<_> = rx.try_iter().collect();
+    drop(held);
+    assert_eq!(arrived.len(), PORT_QUEUE);
+    assert!(arrived.iter().all(|m| matches!(m, PortMsg::Control(_))));
+    assert!(
+        port.wait_idle(std::time::Duration::from_secs(2)),
+        "its thread ended"
+    );
+    svc.shutdown();
+}
+
+#[test]
+fn a_write_to_a_shutting_down_coordinator_is_refused_before_admission() {
+    let dir = tempfile::tempdir().unwrap();
+    let (svc, _port, rx, _l) = control_service(dir.path());
+    drop(rx);
+    let mut s = send_write(dir.path());
+    assert!(matches!(
+        read_reply::<_, ()>(&mut s).unwrap(),
+        Some(OpReply::Err(m)) if m.contains("shutting down")
+    ));
+    svc.shutdown();
+}
+
+#[test]
+fn a_malformed_write_frame_is_closed_without_an_answer() {
+    use std::io::Write as _;
+    let dir = tempfile::tempdir().unwrap();
+    let (svc, _port, _rx, _l) = control_service(dir.path());
+    let mut s = ReadEndpoint::for_root(dir.path()).connect().unwrap();
+    let body = br#"{"write":{"NoSuchVariant":null}}"#;
+    s.write_all(&(body.len() as u32).to_le_bytes()).unwrap();
+    s.write_all(body).unwrap();
+    assert!(
+        read_reply::<_, ()>(&mut s).unwrap().is_none(),
+        "EOF: reads as Incompatible"
+    );
+    svc.shutdown();
 }

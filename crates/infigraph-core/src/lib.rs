@@ -44,6 +44,7 @@ pub mod resolve;
 pub mod review;
 pub mod routes;
 pub mod scip;
+pub mod scratch;
 pub mod search;
 pub mod security;
 pub mod sequence;
@@ -526,8 +527,9 @@ impl Infigraph {
                         // a daemon-restart crash-rebuild cascade reaching this path on
                         // its first queued write (before any read ever creates that
                         // path's sentinel) still trips the breaker. Mirrors
-                        // `recovery::drain_recovery_sentinel`'s check-then-record
-                        // sequence (adversarial review finding).
+                        // the coordinator's check-then-record sequence
+                        // (`recovery::recovery_rebuild_wanted`, then
+                        // `recovery::rebuild_started`; adversarial review finding).
                         let infigraph_dir = self.db_path.parent().unwrap_or(&self.root);
                         let attempts = crate::recovery::recent_recovery_attempts(infigraph_dir)
                             .unwrap_or_default();
@@ -620,7 +622,7 @@ impl Infigraph {
                         // graph below is simply the project's new state and
                         // nothing ever refills it. `dead_pid` is 0 because
                         // this path is reached on any durable open failure,
-                        // not only a dead holder -- `drain_recovery_sentinel`
+                        // not only a dead holder -- `recovery_rebuild_wanted`
                         // keys off the sentinel's existence, not that field.
                         let _ =
                             crate::recovery::mark_recovery_needed(infigraph_dir, 0, &self.db_path);
@@ -756,10 +758,10 @@ impl Infigraph {
 
     /// A full reindex is the most expensive operation in the write
     /// protocol -- on a large repo it can legitimately run for many
-    /// minutes. `submit_write_request`'s timeout is a hard deadline (the
-    /// daemon only writes its `.result` once the whole index finishes), so
-    /// a tight budget here would abort a *working* reindex partway and
-    /// report it as "no daemon responded".
+    /// minutes. `daemon::writes::submit`'s timeout is a hard deadline (the
+    /// daemon only answers once the whole index finishes), so a tight budget
+    /// here would abort a *working* reindex partway and report it as a
+    /// timeout.
     const DAEMON_FULL_REINDEX_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
     /// A scoped `index_files` call is normally a watcher-sized batch, so a
     /// shorter budget still can't truncate real work but surfaces a dead
@@ -822,9 +824,12 @@ impl Infigraph {
         paths: Option<Vec<PathBuf>>,
         timeout: std::time::Duration,
     ) -> Result<IndexResult> {
-        let staging_dir = self.root.join(".infigraph").join("requests");
         let request = crate::daemon_protocol::WriteRequest::Index { paths };
-        match crate::daemon_protocol::submit_write_request(&staging_dir, &request, timeout)? {
+        let opts = crate::daemon::writes::WriteOpts {
+            timeout,
+            cancel: None,
+        };
+        match crate::daemon::writes::submit(&self.root, &request, opts)? {
             crate::daemon_protocol::WriteResult::Ok {
                 total_files,
                 indexed_files,

@@ -1,4 +1,5 @@
-use infigraph_core::daemon_protocol::{submit_write_request, WriteRequest, WriteResult};
+use infigraph_core::daemon::writes::{submit, WriteOpts};
+use infigraph_core::daemon_protocol::{WriteRequest, WriteResult};
 use infigraph_languages::bundled_registry;
 use std::sync::mpsc;
 use std::time::Duration;
@@ -33,13 +34,34 @@ fn watch_loop_serves_write_requests_when_serve_requests_is_true() {
         )
     });
 
-    let staging_dir = project_dir.path().join(".infigraph").join("requests");
+    // In-process, the coordinator holds no `watch.lock`, which is what
+    // makes a real client wait for a starting daemon's endpoint -- so wait
+    // for it here.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while infigraph_core::daemon::read_endpoint::ReadEndpoint::for_root(project_dir.path())
+        .connect()
+        .is_err()
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the endpoint never bound"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
     let request = WriteRequest::Index { paths: None };
     // 30s, not 5s: this asserts the WIRING serves requests, not first-reply
     // latency. Debug-build registry construction alone approached the old
     // 5s budget on loaded machines (#58) -- a genuine wiring hang still
     // fails, just without the false negatives.
-    let result = submit_write_request(&staging_dir, &request, Duration::from_secs(30)).unwrap();
+    let result = submit(
+        project_dir.path(),
+        &request,
+        WriteOpts {
+            timeout: Duration::from_secs(30),
+            cancel: None,
+        },
+    )
+    .unwrap();
 
     #[allow(unreachable_patterns)]
     match result {
@@ -76,13 +98,17 @@ fn watch_loop_does_not_serve_requests_when_serve_requests_is_false() {
         )
     });
 
-    let staging_dir = project_dir.path().join(".infigraph").join("requests");
     let request = WriteRequest::Index { paths: None };
-    let result = submit_write_request(&staging_dir, &request, Duration::from_millis(500));
-    assert!(
-        result.is_err(),
-        "expected a timeout -- serve_requests=false must never serve"
+    let result = submit(
+        project_dir.path(),
+        &request,
+        WriteOpts {
+            timeout: Duration::from_millis(500),
+            cancel: None,
+        },
     );
+    // Nothing binds the endpoint: an in-process watcher is not a daemon.
+    assert!(result.is_err(), "serve_requests=false must never serve");
 
     stop_tx.send(()).unwrap();
     handle.join().unwrap().unwrap();

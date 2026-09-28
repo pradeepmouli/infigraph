@@ -610,7 +610,8 @@ pub(crate) fn cmd_daemon(root: &Path, debounce: u64) -> Result<()> {
         std::sync::Arc::new(
             move |root: std::path::PathBuf,
                   job: infigraph_core::daemon::ScipEnrichJob,
-                  token: tokio_util::sync::CancellationToken| {
+                  token: tokio_util::sync::CancellationToken,
+                  submit: infigraph_core::daemon::coordinator_port::WriteSubmitter| {
                 let languages: std::collections::HashSet<String> =
                     job.languages.into_iter().collect();
                 // Part A (running the external indexer binaries) is
@@ -626,20 +627,18 @@ pub(crate) fn cmd_daemon(root: &Path, debounce: u64) -> Result<()> {
                     return;
                 }
                 // Submit each generated `.scip` file as a real
-                // `WriteRequest::ScipImport`, routed through the exact same
+                // `WriteRequest::ScipImport`, through the coordinator's own
+                // port (#204), and so through the exact same
                 // background-task-and-reap machinery
                 // (`try_start_scip_import`/`finish_scip_import`) a
                 // client-submitted import goes through -- no separate
                 // direct-write code path for "the daemon triggered this
                 // itself" vs "an external caller asked for it". Blocking
-                // here on `submit_write_request`'s reply-poll is safe: this
-                // whole closure already runs on its own background
-                // `Task::spawn_blocking("scip-enrich", ...)`, not the
-                // coordinator's own tick thread -- unlike the coordinator
-                // loop, blocking here doesn't stall drains, other requests,
-                // or fsevents.
+                // here on the reply is safe: this whole closure already runs
+                // on its own background `Task::spawn_blocking("scip-enrich",
+                // ...)`, not the coordinator's own tick thread, so it doesn't
+                // stall drains, other requests, or fsevents.
                 let infigraph_dir = root.join(".infigraph");
-                let requests_dir = infigraph_dir.join("requests");
                 for (label, scip_path, success) in results {
                     if !success || !scip_path.exists() {
                         let _ = std::fs::remove_file(&scip_path);
@@ -686,18 +685,10 @@ pub(crate) fn cmd_daemon(root: &Path, debounce: u64) -> Result<()> {
                         scip_path: scip_path.clone(),
                         enriched_ast_generation: Some(job.ast_generation),
                     };
-                    match infigraph_core::daemon_protocol::submit_write_request_cancellable(
-                        &requests_dir,
-                        &request,
-                        // Generous: a large repo's SCIP import (COPY/UNWIND
-                        // against tens of thousands of symbols) can take
-                        // minutes, and this callback is not on the
-                        // coordinator's own tick thread, so waiting doesn't
-                        // stall anything else. The token bounds it instead:
-                        // a daemon shutdown ends the wait within one poll.
-                        std::time::Duration::from_secs(600),
-                        &token,
-                    ) {
+                    // The token bounds the wait, not a timeout: a large repo's import
+                    // (COPY/UNWIND against tens of thousands of symbols) can take
+                    // minutes, and a daemon shutdown ends the wait within one poll.
+                    match submit.submit(request, &token) {
                         Ok(infigraph_core::daemon_protocol::WriteResult::ScipImportOk(_)) => {
                             // The coordinator's own `finish_scip_import` already
                             // logged the structured completion line.
@@ -902,7 +893,7 @@ pub(crate) enum DaemonStop {
 /// stopped.
 pub(crate) fn request_daemon_stop(root: &Path) -> Result<DaemonStop> {
     use infigraph_core::daemon::control::{send_control, ControlError};
-    use infigraph_core::daemon::control_port::SHUTTING_DOWN;
+    use infigraph_core::daemon::coordinator_port::SHUTTING_DOWN;
     match send_control(root, WatchRole::Daemon, WatchAction::Stop) {
         Ok(()) => Ok(DaemonStop::Stopped),
         Err(ControlError::Refused(m)) if m == SHUTTING_DOWN => Ok(DaemonStop::Stopped),

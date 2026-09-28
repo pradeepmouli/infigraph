@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use infigraph_core::daemon::control::{
     describe_status, query_status, query_status_many, send_control, ControlError, STATUS_DEADLINE,
 };
-use infigraph_core::daemon::control_port::ControlPort;
+use infigraph_core::daemon::coordinator_port::{CoordinatorPort, PortMsg};
 use infigraph_core::daemon::liveness::Liveness;
 use infigraph_core::daemon::read_endpoint::{ReadEndpoint, ReadStream};
 use infigraph_core::daemon::read_protocol::{WatchAction, WatchRole};
@@ -85,7 +85,7 @@ fn an_unresponsive_daemon_sees_the_client_hang_up() {
 #[test]
 fn status_and_control_round_trip_against_a_real_service() {
     let dir = tempfile::tempdir().unwrap();
-    let (port, rx) = ControlPort::new(1800, 60);
+    let (port, rx) = CoordinatorPort::new(1800, 60);
     let svc = ReadService::start_serving(
         dir.path(),
         Arc::new(|| None),
@@ -96,11 +96,10 @@ fn status_and_control_round_trip_against_a_real_service() {
     )
     .unwrap();
     let answer = std::thread::spawn(move || {
-        rx.recv()
-            .unwrap()
-            .reply
-            .send(Err("no doc-watch loop".into()))
-            .unwrap();
+        let PortMsg::Control(msg) = rx.recv().unwrap() else {
+            panic!("a control message")
+        };
+        msg.reply.send(Err("no doc-watch loop".into())).unwrap();
     });
     let report = query_status(dir.path()).unwrap();
     assert_eq!(report.pid, std::process::id());
@@ -146,7 +145,7 @@ fn describe_status_names_the_holder_of_an_unresponsive_daemons_lock() {
     assert!(text.contains("role: test-daemon"), "{text}");
     // Users copy the command it names: it must be one that exists.
     assert!(text.contains("`infigraph daemon-stop`"), "{text}");
-    assert!(infigraph_core::daemon::control_port::BUSY.contains("`infigraph daemon-stop`"));
+    assert!(infigraph_core::daemon::coordinator_port::BUSY.contains("`infigraph daemon-stop`"));
     assert!(describe_status(dir.path(), &Err(ControlError::NoDaemon))
         .starts_with("No watcher running for"));
 }

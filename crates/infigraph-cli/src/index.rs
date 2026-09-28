@@ -167,11 +167,13 @@ pub(crate) fn cmd_index(root: &Path, full: bool, no_embed: bool) -> Result<()> {
                 }
             }
 
-            let staging_dir = root.join(".infigraph").join("requests");
-            let result = infigraph_core::daemon_protocol::submit_write_request(
-                &staging_dir,
+            let result = infigraph_core::daemon::writes::submit(
+                root,
                 &infigraph_core::daemon_protocol::WriteRequest::FullReindex,
-                std::time::Duration::from_secs(600),
+                infigraph_core::daemon::writes::WriteOpts {
+                    timeout: std::time::Duration::from_secs(600),
+                    cancel: None,
+                },
             )?;
             match result {
                 infigraph_core::daemon_protocol::WriteResult::FullReindexOk {
@@ -1003,29 +1005,14 @@ const SCIP_SCRATCH_STALE_AFTER: std::time::Duration = std::time::Duration::from_
 /// `scip_tmp`, so a crashed producer does not accumulate files forever.
 /// Anything younger belongs (or may belong) to a run still in progress.
 fn sweep_stale_scip_scratch(scip_tmp: &Path) {
-    let Ok(entries) = std::fs::read_dir(scip_tmp) else {
-        return;
-    };
-    let now = std::time::SystemTime::now();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        // `.partial` too: a run killed mid-write leaves one, and if its pid is
-        // ever recycled `reclaim_dead_scip_runs` will read the producer as
-        // alive and skip it, so age remains the backstop for both kinds.
-        let ext = path.extension().and_then(|e| e.to_str());
-        if ext != Some("scip") && ext != Some("partial") {
-            continue;
-        }
-        let stale = entry
-            .metadata()
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|modified| now.duration_since(modified).ok())
-            .is_some_and(|age| age > SCIP_SCRATCH_STALE_AFTER);
-        if stale {
-            let _ = std::fs::remove_file(&path);
-        }
-    }
+    // `.partial` too: a run killed mid-write leaves one, and if its pid is
+    // ever recycled `reclaim_dead_scip_runs` will read the producer as
+    // alive and skip it, so age remains the backstop for both kinds.
+    infigraph_core::scratch::sweep_older_than(
+        scip_tmp,
+        SCIP_SCRATCH_STALE_AFTER,
+        &["scip", "partial"],
+    );
 }
 
 /// The pid that produced a scratch file, from its run-unique name

@@ -1,70 +1,12 @@
 //! #155: a real write coordinator served over its socket.
 
-use std::path::Path;
 use std::time::{Duration, Instant};
 
 use infigraph_core::daemon::control::{query_status, send_control, ControlError};
 use infigraph_core::daemon::read_protocol::{RoleState, WatchAction, WatchRole};
 
-static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-struct Daemon {
-    handle: std::thread::JoinHandle<anyhow::Result<()>>,
-    token: tokio_util::sync::CancellationToken,
-    stop_tx: std::sync::mpsc::Sender<()>,
-}
-
-fn start(root: &Path) -> Daemon {
-    start_with_docs(root, None)
-}
-
-fn start_with_docs(
-    root: &Path,
-    docs: Option<std::sync::Arc<dyn infigraph_core::daemon::DocsHandle>>,
-) -> Daemon {
-    std::fs::write(root.join("main.py"), "def main():\n    pass\n").unwrap();
-    let (stop_tx, stop_rx) = std::sync::mpsc::channel();
-    let token = tokio_util::sync::CancellationToken::new();
-    let t = token.clone();
-    let r = root.to_path_buf();
-    let handle = std::thread::spawn(move || {
-        infigraph_core::daemon::run_write_coordinator(
-            &r,
-            || Ok(infigraph_languages::bundled_registry().unwrap()),
-            50,
-            stop_rx,
-            |_| {},
-            0,
-            None::<fn(&infigraph_core::IndexResult)>,
-            true,
-            None,
-            &t,
-            docs,
-            None,
-        )
-    });
-    // The endpoint binds before the registry build; control waits until the
-    // loop is taking requests, which is after that build.
-    let deadline = Instant::now() + Duration::from_secs(90);
-    loop {
-        match send_control(root, WatchRole::Code, WatchAction::Start) {
-            Ok(()) => break,
-            Err(e) if Instant::now() > deadline => panic!("daemon never took control: {e}"),
-            Err(_) => std::thread::sleep(Duration::from_millis(100)),
-        }
-    }
-    Daemon {
-        handle,
-        token,
-        stop_tx,
-    }
-}
-
-fn stop(d: Daemon) {
-    d.token.cancel();
-    let _ = d.stop_tx.send(());
-    let _ = d.handle.join();
-}
+mod common;
+use common::daemon::{start, start_with_docs, stop, ENV_LOCK};
 
 #[test]
 fn daemon_stop_over_the_socket_replies_ok_then_exits() {
@@ -164,7 +106,7 @@ fn a_stalled_coordinator_still_answers_status_and_refuses_control_when_full() {
     std::fs::write(&stall, b"").unwrap();
     std::thread::sleep(Duration::from_millis(400)); // let the loop reach the stall
     let root = dir.path().to_path_buf();
-    let queued: Vec<_> = (0..infigraph_core::daemon::control_port::CONTROL_QUEUE)
+    let queued: Vec<_> = (0..infigraph_core::daemon::coordinator_port::PORT_QUEUE)
         .map(|_| {
             let root = root.clone();
             std::thread::spawn(move || send_control(&root, WatchRole::Code, WatchAction::Start))
@@ -211,11 +153,44 @@ fn a_legacy_watch_control_request_file_gets_a_prompt_error() {
     }
     let reply = std::fs::read_to_string(&result).expect("a prompt reply, not a 30s client timeout");
     assert!(reply.contains("Err"), "{reply}");
+    assert!(
+        reply.contains("no longer accepts file-drop requests"),
+        "{reply}"
+    );
     std::thread::sleep(Duration::from_millis(300));
     assert!(
         !d.handle.is_finished(),
         "a legacy stop must not be honoured"
     );
+    stop(d);
+}
+
+/// A pre-#204 client drops any write as a file. The daemon answers it within
+/// one sweep with an error naming its build, and removes it.
+#[test]
+fn a_legacy_write_request_file_gets_a_prompt_error_naming_the_build() {
+    let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let d = start(dir.path());
+    let requests = dir.path().join(".infigraph").join("requests");
+    std::fs::create_dir_all(&requests).unwrap();
+    infigraph_core::daemon_protocol::write_atomic(
+        &requests.join("1-2-3.request"),
+        r#""FullReindex""#,
+    )
+    .unwrap();
+    let result = requests.join("1-2-3.result");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !result.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let reply = std::fs::read_to_string(&result).expect("a reply within one sweep");
+    assert!(
+        reply.contains("no longer accepts file-drop requests"),
+        "{reply}"
+    );
+    assert!(reply.contains(infigraph_core::build_hash()), "{reply}");
+    assert!(!requests.join("1-2-3.request").exists());
     stop(d);
 }
 
