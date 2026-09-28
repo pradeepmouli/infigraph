@@ -368,8 +368,8 @@ enum Commands {
         index: PathBuf,
     },
 
-    /// Run the infigraph daemon: serves file-dropped write requests and
-    /// watches for file changes to auto-reindex
+    /// Run the infigraph daemon: serves reads and writes over its local
+    /// socket and watches for file changes to auto-reindex
     Daemon {
         /// Debounce interval in milliseconds
         #[arg(short, long, default_value = "500")]
