@@ -512,6 +512,7 @@ mod tests {
 
         let file_path = raw_root.join("watched.txt");
         std::fs::write(&file_path, "v1").unwrap();
+        let probe = raw_root.join("probe.txt");
 
         let events: Arc<Mutex<Vec<WatchEvent>>> = Arc::new(Mutex::new(Vec::new()));
         let events_clone = Arc::clone(&events);
@@ -527,11 +528,27 @@ mod tests {
             )
         });
 
-        // Give the watcher time to register before triggering a change. Under
-        // heavy machine load the notify backend can take noticeably longer to
-        // arm; a too-short wait means the remove fires before the watch is live
-        // and the event is missed entirely, so keep this generous.
-        std::thread::sleep(Duration::from_millis(1000));
+        // Wait until the watcher is demonstrably live instead of sleeping a
+        // fixed time: FSEvents can take well over a second to arm (it did on
+        // macOS 27, where a 1s sleep missed the removal every time). A removal
+        // is the probe because, with an empty registry, only removals reach
+        // `on_event` directly.
+        let armed_by = std::time::Instant::now() + Duration::from_secs(30);
+        while events.lock().unwrap().is_empty() {
+            assert!(
+                std::time::Instant::now() < armed_by,
+                "the watcher never delivered a probe event: either it never armed, or \
+                 every event is dropped -- the root.canonicalize() call in \
+                 run_write_coordinator may have regressed"
+            );
+            std::fs::write(&probe, "p").unwrap();
+            std::thread::sleep(Duration::from_millis(100));
+            std::fs::remove_file(&probe).unwrap();
+            std::thread::sleep(Duration::from_millis(400));
+        }
+        // Let any trailing probe events land, then watch only for the real one.
+        std::thread::sleep(Duration::from_millis(500));
+        events.lock().unwrap().clear();
         std::fs::remove_file(&file_path).unwrap();
 
         // Poll rather than a single fixed sleep: fast on a quiet machine,
@@ -539,7 +556,12 @@ mod tests {
         let mut seen = false;
         for _ in 0..100 {
             std::thread::sleep(Duration::from_millis(100));
-            if !events.lock().unwrap().is_empty() {
+            if events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|e| e.path.ends_with("watched.txt"))
+            {
                 seen = true;
                 break;
             }
