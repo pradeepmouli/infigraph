@@ -129,12 +129,22 @@ pub struct WriteReply {
 }
 
 impl WriteReply {
+    pub fn channel() -> (Self, Receiver<WriteResult>);
     pub fn send(self, result: WriteResult);  // consumes (D8); a closed receiver is ignored
     pub fn is_gone(&self) -> bool;           // always false for internal()
     pub fn internal() -> Self;               // compaction, auto-recovery
-    #[cfg(test)] pub fn test_pair() -> (Self, Receiver<WriteResult>);
 }
+
+impl Drop for WriteReply { /* unsent: send Err(DROPPED) */ }
 ```
+
+`Drop` completes D8. An unanswered reply sends
+`Err("the daemon dropped this write without answering it")`, so no path can
+leave a client waiting: a drain task that panics (its waiters drop during
+the unwind), an early return, or teardown. `execute_drain` answers its own
+waiters with its specific error before returning one.
+`reply_err_to_waiters` and `InFlightDrain.waiter_replies` exist only to
+cover those paths, so they are deleted, not ported.
 
 These change from `PathBuf` to `WriteReply`:
 - `Waiter.reply_path`
@@ -142,9 +152,6 @@ These change from `PathBuf` to `WriteReply`:
 - `PendingScipImport.reply_path`
 - `reply_to_all`, `reply_err_to_waiters` and `execute_drain`'s reply write
 
-Because `send` consumes the reply, `execute_drain` hands back the waiters it
-did not answer, and `reply_err_to_waiters` answers exactly those. The
-`reply_path.exists()` guard goes away.
 
 ### Connection thread (`read_service::spawn_write`, next to `spawn_control`)
 
@@ -178,9 +185,12 @@ away:
 - `std::fs::remove_file` of request files.
 
 `serve_one_request(&Infigraph, &Path)` becomes
-`serve_write(&Infigraph, WriteRequest) -> WriteResult`, and
-`serve_request_locked` returns whether it ran. A missing or corrupt sidecar
-becomes an `Err` result.
+`serve_write(&Infigraph, &WriteRequest) -> WriteResult`. A missing or corrupt
+sidecar becomes an `Err` result. `serve_request_locked` takes the reply and
+returns it (`Err(reply)`) when it could not run yet.
+
+`IngestSource::Inline` located its data file next to the request file, which
+no longer exists, so it becomes `Inline(PathBuf)`, naming its sidecar.
 
 ### Deferred work (D7)
 
@@ -198,28 +208,40 @@ port are routed as they arrive. One that cannot start (FullReindex behind a
 drain, ScipImport while busy, a synchronous write during a drain or reopen
 backoff) is appended to `deferred`.
 
-**Dropping at pickup (D3).** Before starting work, each place that starts it
-filters `is_gone()` waiters: the drain scheduler for queue waiters,
-`try_start_full_reindex` and `try_start_scip_import`. A drain whose only
-items came from gone waiters is skipped. Items from the watcher or periodic
-reindex keep it alive. Each drop is logged as
+**Dropping at pickup (D3).** A deferred entry whose reply `is_gone()` is
+removed before it is retried, so a FullReindex, ScipImport or synchronous
+write whose client has left never starts. Each such drop is logged as
 `[daemon] dropped N write(s): their clients disconnected`.
+
+Queue-shaped writes (`Index`, `UpsertFilesBulk`, `RemoveFiles`,
+`ResolveCalls`) are enqueued as soon as they arrive, so they never sit in
+`deferred`. A gone client's waiter just goes unanswered, and the drain still
+runs. It cannot be skipped safely: queue items do not record which request
+added them, so a path a gone client named may also be a real watcher change,
+and skipping it would lose that change. The cost is only the files that
+actually changed.
+
+**The daemon's own rebuilds collapse.** Compaction may ask for a rebuild on
+every tick until one lands, and a fixed file name (`compaction.request`)
+used to collapse those requests silently. `request_internal_rebuild` does
+it explicitly instead: it queues a FullReindex only if none is deferred or
+running.
 
 ### In-process submitters (D6)
 
-- `submit_compaction_rebuild` pushes `(FullReindex, WriteReply::internal())`
-  onto `deferred` and cannot fail. The `Result` and its log line go.
-- `recovery::drain_recovery_sentinel` returns `RecoveryAction::{None,
-  Rebuild}` instead of writing `auto-recovery.request`. The coordinator pushes
-  the rebuild onto `deferred`. The attempts log, the crash-loop breaker and
-  the audit lines are unchanged.
-- The SCIP enrichment callback receives an `Arc<CoordinatorPort>` and does
-  `port.submit_write(ScipImport{..})`. It then waits on the receiver in 100ms
-  slices, checking its token, as #138 requires: a shutdown ends the wait
-  promptly with `WriteRequestCancelled`. How the callback receives the port,
-  whether as an argument to the callback or captured at construction, is
-  settled in the plan by the smallest change to `spawn_scip_enrich`'s
-  signature.
+- `submit_compaction_rebuild` is deleted. Its call site calls
+  `request_internal_rebuild`, which cannot fail.
+- `recovery::drain_recovery_sentinel` returns `Result<bool>` ("a rebuild is
+  wanted") instead of writing `auto-recovery.request`, and the coordinator
+  calls `request_internal_rebuild`. The attempts log, the crash-loop breaker
+  and the audit lines are unchanged.
+- The SCIP enrichment callback gets a fourth argument, `WriteSubmitter` (a
+  cloneable handle on the port):
+  `FullReindexCallback = dyn Fn(PathBuf, ScipEnrichJob, CancellationToken,
+  WriteSubmitter)`. `WriteSubmitter::submit(request, &token)` waits in 100ms
+  slices, as #138 requires. On cancellation it marks its reply gone, so the
+  import is dropped at pickup if it has not started, and returns
+  `WriteRequestCancelled`.
 
 ### Legacy refusal (D5)
 
@@ -269,8 +291,11 @@ pub fn sidecar_path(root: &Path, ext: &str) -> PathBuf;  // .infigraph/write-tmp
      directly instead of derived from the staging directory.
 2. **Connect** with `connect_allowing_for_startup(root)`. Failure maps
    through `not_connected` (`NoDaemon` / `Unresponsive`), as control does.
-3. **Exchange.** #155's `exchange` gains an optional abort check, run every
-   100ms while waiting:
+3. **Exchange.** #155's `exchange` becomes generic over its error type,
+   `E: From<ControlError>`, and takes a stop check,
+   `FnMut() -> Option<E>`, run every 50ms while waiting. Control passes a
+   deadline check that returns `ControlError::Unresponsive`. A write passes
+   one returning `anyhow::Error` for:
    - the cancel token fired → `WriteRequestCancelled`;
    - `blocking_fault` fired → `DaemonFaulted`;
    - the deadline passed → a timeout error.
@@ -291,8 +316,10 @@ data call `sidecar_path` instead of `generate_request_name` plus the
 `requests/` directory:
 - the client removes its sidecar on every error return;
 - the daemon removes it after reading, as today;
-- the daemon's startup removes `write-tmp/` files older than 6h, following the
-  #139 SCIP scratch-file pattern.
+- the daemon's startup removes `write-tmp/` files older than 6h. The age sweep
+  moves from the CLI's `sweep_stale_scip_scratch` into a shared
+  `infigraph_core::scratch::sweep_older_than(dir, age, extensions)`, which the
+  SCIP sweep now calls as well.
 
 **Callers.** All move to `writes::submit`:
 - the 18 `DaemonKuzuBackend` write methods;
@@ -323,8 +350,9 @@ Deleted: `submit_write_request`, `submit_write_request_named`,
   `serve_one_request(&infigraph, &path)` becomes `serve_write(&infigraph,
   request)`, returning the result instead of writing a file.
 - `daemon/mod.rs` and `daemon/drain.rs` unit tests that build reply paths use
-  `WriteReply::test_pair()`. `finish_drain_does_not_overwrite…` asserts the
-  exactly-once handback.
+  `WriteReply::channel()`. `finish_drain_does_not_overwrite…` becomes
+  `a_panicking_drain_still_answers_every_waiter`, pinning the `Drop`
+  default.
 - `tests/watch_daemon.rs`: `out_of_scope…contends_with_a_held_index_lock`
   asserts "deferred, then answered once the lock frees". The FullReindex and
   SCIP cancellation tests call `route_write`.
