@@ -822,9 +822,12 @@ impl Infigraph {
         paths: Option<Vec<PathBuf>>,
         timeout: std::time::Duration,
     ) -> Result<IndexResult> {
-        let staging_dir = self.root.join(".infigraph").join("requests");
         let request = crate::daemon_protocol::WriteRequest::Index { paths };
-        match crate::daemon_protocol::submit_write_request(&staging_dir, &request, timeout)? {
+        let opts = crate::daemon::writes::WriteOpts {
+            timeout,
+            cancel: None,
+        };
+        match crate::daemon::writes::submit(&self.root, &request, opts)? {
             crate::daemon_protocol::WriteResult::Ok {
                 total_files,
                 indexed_files,

@@ -7,7 +7,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 /// Stands up the daemon's read service for `project_dir` -- the read-side
-/// counterpart of `spawn_one_request_server` below.
+/// counterpart of `spawn_one_write_server` below.
 ///
 /// Since reads became daemon-routed, `DaemonKuzuBackend` sends every read
 /// over the local socket instead of opening the graph itself, so a test
@@ -22,38 +22,39 @@ fn start_read_service(project_dir: &Path) -> ReadService {
     ReadService::start(project_dir, store, 2).unwrap()
 }
 
-/// Spawns a background thread that watches `staging_dir` for the next
-/// `.request` file to appear and serves exactly one request against a
-/// fresh write-mode `Infigraph` opened on `project_dir`, then returns.
+/// A read service whose stub coordinator serves exactly one write with
+/// `serve_write`, against a write-mode `Infigraph` opened on `project_dir`.
 /// Shared by every wrapper test below -- each test's `DaemonKuzuBackend`
-/// call submits one request; this is the "daemon side" that answers it.
-fn spawn_one_request_server(project_dir: &Path) -> std::thread::JoinHandle<()> {
+/// call sends one write over the socket; this is the "daemon side" that
+/// answers it.
+fn spawn_one_write_server(project_dir: &Path) -> (ReadService, std::thread::JoinHandle<()>) {
+    let (port, rx) = infigraph_core::daemon::coordinator_port::CoordinatorPort::new(1800, 60);
+    let svc = ReadService::start_serving(
+        project_dir,
+        Arc::new(|| None),
+        None,
+        2,
+        Arc::new(infigraph_core::daemon::liveness::Liveness::new()),
+        Some(port),
+    )
+    .unwrap();
     let project_dir = project_dir.to_path_buf();
-    std::thread::spawn(move || {
+    let server = std::thread::spawn(move || {
+        let infigraph_core::daemon::coordinator_port::PortMsg::Write { request, reply } = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("test daemon never saw a write")
+        else {
+            panic!("expected a write")
+        };
         let registry = bundled_registry().unwrap();
         let mut server_infigraph = Infigraph::open(&project_dir, registry).unwrap();
         server_infigraph.init().unwrap();
-        let staging_dir = project_dir.join(".infigraph").join("requests");
-        let start = std::time::Instant::now();
-        loop {
-            if let Ok(entries) = std::fs::read_dir(&staging_dir) {
-                for entry in entries.flatten() {
-                    if entry.path().extension().is_some_and(|e| e == "request") {
-                        infigraph_core::daemon_protocol::serve_one_request(
-                            &server_infigraph,
-                            &entry.path(),
-                        )
-                        .unwrap();
-                        return;
-                    }
-                }
-            }
-            if start.elapsed() > std::time::Duration::from_secs(5) {
-                panic!("test daemon never saw a request");
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-    })
+        reply.send(infigraph_core::daemon_protocol::serve_write(
+            &server_infigraph,
+            &request,
+        ));
+    });
+    (svc, server)
 }
 
 #[test]
@@ -121,12 +122,13 @@ fn wrapper_upsert_repo_routes_through_daemon_protocol() {
     infigraph.init().unwrap();
     drop(infigraph);
 
-    let handle = spawn_one_request_server(project_dir.path());
+    let (svc, handle) = spawn_one_write_server(project_dir.path());
 
     let dk = DaemonKuzuBackend::open(project_dir.path()).unwrap();
     dk.upsert_repo("org/repo").unwrap();
 
     handle.join().unwrap();
+    svc.shutdown();
 }
 
 #[test]
@@ -137,13 +139,14 @@ fn wrapper_derive_tested_by_edges_routes_through_daemon_protocol() {
     infigraph.init().unwrap();
     drop(infigraph);
 
-    let handle = spawn_one_request_server(project_dir.path());
+    let (svc, handle) = spawn_one_write_server(project_dir.path());
 
     let dk = DaemonKuzuBackend::open(project_dir.path()).unwrap();
     let count = dk.derive_tested_by_edges(None).unwrap();
     assert_eq!(count, 0, "empty graph has no TESTED_BY edges to derive");
 
     handle.join().unwrap();
+    svc.shutdown();
 }
 
 #[test]
@@ -154,12 +157,13 @@ fn wrapper_upsert_similar_edge_routes_through_daemon_protocol() {
     infigraph.init().unwrap();
     drop(infigraph);
 
-    let handle = spawn_one_request_server(project_dir.path());
+    let (svc, handle) = spawn_one_write_server(project_dir.path());
 
     let dk = DaemonKuzuBackend::open(project_dir.path()).unwrap();
     dk.upsert_similar_edge("a::foo", "b::bar", 0.9).unwrap();
 
     handle.join().unwrap();
+    svc.shutdown();
 }
 
 #[test]
@@ -170,7 +174,7 @@ fn wrapper_write_calls_service_edges_cleans_up_arrow_sibling() {
     infigraph.init().unwrap();
     drop(infigraph);
 
-    let handle = spawn_one_request_server(project_dir.path());
+    let (svc, handle) = spawn_one_write_server(project_dir.path());
 
     let dk = DaemonKuzuBackend::open(project_dir.path()).unwrap();
     let edge = infigraph_core::graph::CallsServiceEdge {
@@ -182,8 +186,9 @@ fn wrapper_write_calls_service_edges_cleans_up_arrow_sibling() {
     dk.write_calls_service_edges(&[edge]).unwrap();
 
     handle.join().unwrap();
+    svc.shutdown();
 
-    let staging_dir = project_dir.path().join(".infigraph").join("requests");
+    let staging_dir = project_dir.path().join(".infigraph").join("write-tmp");
     let leftover: Vec<_> = std::fs::read_dir(&staging_dir)
         .unwrap()
         .filter_map(|e| e.ok())
@@ -219,7 +224,7 @@ node_table = "TestNode"
     infigraph.init().unwrap();
     drop(infigraph);
 
-    let handle = spawn_one_request_server(project_dir.path());
+    let (svc, handle) = spawn_one_write_server(project_dir.path());
 
     let dk = DaemonKuzuBackend::open(project_dir.path()).unwrap();
     let schema = SchemaMeta {
@@ -240,8 +245,9 @@ node_table = "TestNode"
     assert_eq!(result.nodes_created, 3);
 
     handle.join().unwrap();
+    svc.shutdown();
 
-    let staging_dir = project_dir.path().join(".infigraph").join("requests");
+    let staging_dir = project_dir.path().join(".infigraph").join("write-tmp");
     let leftover: Vec<_> = std::fs::read_dir(&staging_dir)
         .unwrap()
         .filter_map(|e| e.ok())

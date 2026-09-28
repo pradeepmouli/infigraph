@@ -167,11 +167,13 @@ pub(crate) fn cmd_index(root: &Path, full: bool, no_embed: bool) -> Result<()> {
                 }
             }
 
-            let staging_dir = root.join(".infigraph").join("requests");
-            let result = infigraph_core::daemon_protocol::submit_write_request(
-                &staging_dir,
+            let result = infigraph_core::daemon::writes::submit(
+                root,
                 &infigraph_core::daemon_protocol::WriteRequest::FullReindex,
-                std::time::Duration::from_secs(600),
+                infigraph_core::daemon::writes::WriteOpts {
+                    timeout: std::time::Duration::from_secs(600),
+                    cancel: None,
+                },
             )?;
             match result {
                 infigraph_core::daemon_protocol::WriteResult::FullReindexOk {
