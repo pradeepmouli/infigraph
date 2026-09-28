@@ -3,6 +3,7 @@ mod handlers_chat;
 mod handlers_git;
 mod handlers_symbol;
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -118,6 +119,15 @@ pub fn bind_addr(env_var: &str, port: u16) -> String {
     format!("{host}:{port}")
 }
 
+/// The address `server` actually listens on -- what the ADV-2598 tests assert
+/// is loopback, rather than inferring it from which other binds the OS allows.
+fn bound_addr(server: &Server) -> SocketAddr {
+    server
+        .server_addr()
+        .to_ip()
+        .expect("Server::http listens on an IP address")
+}
+
 /// What a server may do at `addr` (#190).
 #[derive(Debug, PartialEq, Eq)]
 enum BindVerdict {
@@ -172,8 +182,9 @@ fn unauthenticated_exposure(env_var: &str, addr: &str) -> String {
 ///
 /// The UI checks no API key, so beyond loopback it always warns (#190). It
 /// never refuses: it is opted into with `--ui` and serves less than
-/// `--serve`.
-pub fn start_ui_server(port: u16) -> bool {
+/// `--serve`. Returns the address it bound, or `None` for a port already in
+/// use.
+pub fn start_ui_server(port: u16) -> Option<SocketAddr> {
     let addr = bind_addr("INFIGRAPH_UI_BIND", port);
     if bind_verdict(&addr, false, true) == BindVerdict::Warn {
         let message = unauthenticated_exposure("INFIGRAPH_UI_BIND", &addr);
@@ -182,10 +193,8 @@ pub fn start_ui_server(port: u16) -> bool {
         }
     }
     // Pre-check: try binding before spawning thread so caller knows outcome
-    let server = match Server::http(&addr) {
-        Ok(s) => s,
-        Err(_) => return false,
-    };
+    let server = Server::http(&addr).ok()?;
+    let bound = bound_addr(&server);
     thread::spawn(move || {
         let server = server;
 
@@ -230,7 +239,7 @@ pub fn start_ui_server(port: u16) -> bool {
             let _ = request.respond(response);
         }
     });
-    true
+    Some(bound)
 }
 
 /// Binds to loopback by default for the same reason as [`start_ui_server`]
@@ -241,9 +250,13 @@ pub fn start_ui_server(port: u16) -> bool {
 ///
 /// Forgetting the key used to serve the network unauthenticated; now that
 /// refuses to start, before binding, unless
-/// `INFIGRAPH_ALLOW_UNAUTHENTICATED=1` says it is meant (#190). `Ok(false)`
-/// is a port already in use.
-pub fn start_mcp_http_server(port: u16, is_primary: bool, health_path: &str) -> Result<bool> {
+/// `INFIGRAPH_ALLOW_UNAUTHENTICATED=1` says it is meant (#190). `Ok(Some)`
+/// is the address it bound; `Ok(None)` is a port already in use.
+pub fn start_mcp_http_server(
+    port: u16,
+    is_primary: bool,
+    health_path: &str,
+) -> Result<Option<SocketAddr>> {
     let addr = bind_addr("INFIGRAPH_MCP_BIND", port);
     let authenticated = !matches!(api_key(), Ok(None));
     match bind_verdict(&addr, authenticated, allow_unauthenticated()) {
@@ -268,10 +281,10 @@ pub fn start_mcp_http_server(port: u16, is_primary: bool, health_path: &str) -> 
             anyhow::bail!(message);
         }
     }
-    let server = match Server::http(&addr) {
-        Ok(s) => s,
-        Err(_) => return Ok(false),
+    let Ok(server) = Server::http(&addr) else {
+        return Ok(None);
     };
+    let bound = bound_addr(&server);
     let health_path = health_path.to_string();
     thread::spawn(move || {
         for mut request in server.incoming_requests() {
@@ -339,7 +352,7 @@ pub fn start_mcp_http_server(port: u16, is_primary: bool, health_path: &str) -> 
             let _ = request.respond(response);
         }
     });
-    Ok(true)
+    Ok(Some(bound))
 }
 
 fn handle_mcp_post(
@@ -718,7 +731,9 @@ mod tests {
         let _guard = test_lock();
         let port = free_port();
         set_ready(true);
-        assert!(start_mcp_http_server(port, false, "/health").unwrap());
+        assert!(start_mcp_http_server(port, false, "/health")
+            .unwrap()
+            .is_some());
         thread::sleep(std::time::Duration::from_millis(100));
 
         let (status, body) = http_get(port, "/health");
@@ -731,7 +746,9 @@ mod tests {
         let _guard = test_lock();
         let port = free_port();
         set_ready(true);
-        assert!(start_mcp_http_server(port, false, "/health/full").unwrap());
+        assert!(start_mcp_http_server(port, false, "/health/full")
+            .unwrap()
+            .is_some());
         thread::sleep(std::time::Duration::from_millis(100));
 
         let (status, body) = http_get(port, "/health/full");
@@ -744,7 +761,9 @@ mod tests {
         let _guard = test_lock();
         let port = free_port();
         set_ready(false);
-        assert!(start_mcp_http_server(port, false, "/health").unwrap());
+        assert!(start_mcp_http_server(port, false, "/health")
+            .unwrap()
+            .is_some());
         thread::sleep(std::time::Duration::from_millis(100));
 
         let (status, body) = http_get(port, "/health");
@@ -758,7 +777,9 @@ mod tests {
         let _guard = test_lock();
         let port = free_port();
         set_ready(true);
-        assert!(start_mcp_http_server(port, false, "/health/full").unwrap());
+        assert!(start_mcp_http_server(port, false, "/health/full")
+            .unwrap()
+            .is_some());
         thread::sleep(std::time::Duration::from_millis(100));
 
         let (status, _) = http_get(port, "/health");
@@ -1006,7 +1027,9 @@ mod tests {
         REINDEXING.store(false, Ordering::SeqCst);
         let port = free_port();
         set_ready(true);
-        assert!(start_mcp_http_server(port, false, "/health").unwrap());
+        assert!(start_mcp_http_server(port, false, "/health")
+            .unwrap()
+            .is_some());
         thread::sleep(std::time::Duration::from_millis(100));
 
         let body = push_event("test-repo", "refs/heads/main", "main");
@@ -1029,7 +1052,9 @@ mod tests {
         REINDEXING.store(false, Ordering::SeqCst);
         let port = free_port();
         set_ready(true);
-        assert!(start_mcp_http_server(port, false, "/health").unwrap());
+        assert!(start_mcp_http_server(port, false, "/health")
+            .unwrap()
+            .is_some());
         thread::sleep(std::time::Duration::from_millis(100));
 
         let body = push_event("test-repo", "refs/heads/main", "main");
@@ -1053,7 +1078,9 @@ mod tests {
         let _guard = test_lock();
         let port = free_port();
         set_ready(true);
-        assert!(start_mcp_http_server(port, false, "/health").unwrap());
+        assert!(start_mcp_http_server(port, false, "/health")
+            .unwrap()
+            .is_some());
         thread::sleep(std::time::Duration::from_millis(100));
 
         let (status, body) = http_get(port, "/webhook/status");
@@ -1068,19 +1095,19 @@ mod tests {
             std::env::remove_var("INFIGRAPH_UI_BIND");
         }
         let port = free_port();
-        assert!(start_ui_server(port), "UI server should start on loopback");
+        let bound = start_ui_server(port).expect("UI server should start on loopback");
         thread::sleep(std::time::Duration::from_millis(100));
 
-        // Reachable on loopback...
         let (status, _) = http_get(port, "/api/health");
         assert_eq!(status, 200, "UI should be reachable on 127.0.0.1");
 
-        // ...but the wildcard address must still be free, proving the UI server
-        // did NOT bind 0.0.0.0 (all interfaces). If it had, this bind would fail
-        // with AddrInUse — which is exactly the ADV-2598 exposure.
+        // Asserted on the listener's own address, not by probing whether a
+        // second bind of 0.0.0.0 succeeds: Linux refuses that bind beside a
+        // listener on 127.0.0.1 even with SO_REUSEADDR, while macOS allows
+        // it, so the probe failed on a correct server on Linux only.
         assert!(
-            TcpListener::bind(format!("0.0.0.0:{}", port)).is_ok(),
-            "UI server must not bind 0.0.0.0 by default (ADV-2598)"
+            bound.ip().is_loopback(),
+            "UI server must bind loopback by default (ADV-2598), bound {bound}"
         );
     }
 
@@ -1096,10 +1123,9 @@ mod tests {
             std::env::remove_var("INFIGRAPH_MCP_BIND");
         }
         let port = free_port();
-        assert!(
-            start_mcp_http_server(port, false, "/health").unwrap(),
-            "MCP HTTP server should start on loopback"
-        );
+        let bound = start_mcp_http_server(port, false, "/health")
+            .unwrap()
+            .expect("MCP HTTP server should start on loopback");
         thread::sleep(std::time::Duration::from_millis(100));
 
         let (status, _) = http_get(port, "/health");
@@ -1107,9 +1133,10 @@ mod tests {
             status == 200 || status == 503,
             "MCP HTTP server should be reachable on 127.0.0.1, got {status}"
         );
+        // On the listener's own address, as in the UI test above.
         assert!(
-            TcpListener::bind(format!("0.0.0.0:{}", port)).is_ok(),
-            "MCP HTTP server must not bind 0.0.0.0 by default"
+            bound.ip().is_loopback(),
+            "MCP HTTP server must bind loopback by default, bound {bound}"
         );
     }
 
@@ -1188,7 +1215,9 @@ mod tests {
         REINDEXING.store(false, Ordering::SeqCst);
         let port = free_port();
         set_ready(true);
-        assert!(start_mcp_http_server(port, false, "/health").unwrap());
+        assert!(start_mcp_http_server(port, false, "/health")
+            .unwrap()
+            .is_some());
         thread::sleep(std::time::Duration::from_millis(100));
 
         let body = push_event("nonexistent-repo", "refs/heads/main", "main");
