@@ -914,12 +914,50 @@ pub(crate) fn cmd_watch_status(root: &Path) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn cmd_daemon_stop(root: &Path) -> Result<()> {
+/// Ask `root`'s daemon to stop, then wait up to 10s for its PROCESS to exit,
+/// not merely for the lock to look free. A daemon releases `watch.lock`
+/// while it is still draining in-flight work and closing the graph, so
+/// polling liveness alone returns early: `daemon-restart` once spawned a
+/// replacement alongside a daemon that still had the graph open read-write
+/// (sittir, 2026-09-08), and `git worktree remove` fails half-done when a
+/// daemon keeps writing into the directory it is deleting. Errs if the
+/// process has not exited in time.
+pub(crate) fn stop_daemon_and_wait(root: &Path) -> Result<()> {
+    let lock_path = root.join(".infigraph").join("watch.lock");
+    // Read the holder BEFORE asking it to stop: the lock payload naming it
+    // is gone by the time we need it to confirm the exit.
+    let holder_pid = infigraph_core::lockfile::read_holder(&lock_path).map(|h| h.pid);
+    // Whatever the stop's outcome, the confirmation below decides whether
+    // the daemon actually went.
+    request_daemon_stop(root)?;
+    if infigraph_core::daemon::lifecycle::confirm_daemon_exited(
+        &lock_path,
+        holder_pid,
+        std::time::Duration::from_secs(10),
+    ) {
+        return Ok(());
+    }
+    match holder_pid {
+        Some(pid) => anyhow::bail!(
+            "daemon {pid} did not exit within 10s of a stop request, so it may still hold the \
+             graph. Check `infigraph ps` (which will not list it once it has released \
+             watch.lock) and, if it is still running, `infigraph kill {pid}`, then retry."
+        ),
+        None => anyhow::bail!("daemon did not exit within 10s of a stop request"),
+    }
+}
+
+pub(crate) fn cmd_daemon_stop(root: &Path, wait: bool) -> Result<()> {
     // The everyday "no daemon running yet" case answers at once rather than
     // going through the control client's startup grace.
     let lock_path = root.join(".infigraph").join("watch.lock");
     if !infigraph_core::daemon::lifecycle::daemon_is_alive(&lock_path) {
         println!("No daemon running.");
+        return Ok(());
+    }
+    if wait {
+        stop_daemon_and_wait(root)?;
+        println!("Daemon stopped and exited.");
         return Ok(());
     }
     match request_daemon_stop(root)? {
@@ -939,41 +977,11 @@ pub(crate) fn cmd_daemon_restart(root: &Path) -> Result<()> {
     // there is nothing to stop-and-wait-for, so skip straight to spawning.
     let lock_path = root.join(".infigraph").join("watch.lock");
     if infigraph_core::daemon::lifecycle::daemon_is_alive(&lock_path) {
-        // Read the holder BEFORE asking it to stop: the lock payload naming
-        // it is gone by the time we need it to confirm the exit.
-        let holder_pid = infigraph_core::lockfile::read_holder(&lock_path).map(|h| h.pid);
         // A daemon can only stop itself (`Control { role: Daemon }` has no
         // real Restart), so stop it and re-spawn from the CLI side, mirroring
-        // `ensure_daemon_running`. Whatever the stop's outcome, the
-        // confirmation below decides whether the old daemon actually went.
-        request_daemon_stop(root)?;
-
-        // Wait for the PROCESS to exit, not merely for the lock to look
-        // free. A daemon releases `watch.lock` while it is still draining
-        // in-flight work and closing the graph, so polling liveness alone
-        // used to return early and spawn a replacement alongside a daemon
-        // that still had the graph open read-write (sittir, 2026-09-08 --
-        // the orphan was invisible to `infigraph ps`, which enumerates lock
-        // holders, and blocked every doc reindex behind it). Refusing to
-        // spawn is strictly better than quietly creating a second writer.
-        if !infigraph_core::daemon::lifecycle::confirm_daemon_exited(
-            &lock_path,
-            holder_pid,
-            std::time::Duration::from_secs(10),
-        ) {
-            match holder_pid {
-                Some(pid) => anyhow::bail!(
-                    "daemon {pid} did not exit within 10s of a stop request, so it may still \
-                     hold the graph -- refusing to start a second one alongside it. Check \
-                     `infigraph ps` (which will not list it once it has released watch.lock) \
-                     and, if it is still running, `infigraph kill {pid}`, then retry."
-                ),
-                None => anyhow::bail!(
-                    "daemon did not exit within 10s of a stop request -- refusing to start a \
-                     second one alongside it"
-                ),
-            }
-        }
+        // `ensure_daemon_running`. Refusing to spawn when the old one has
+        // not gone is strictly better than quietly creating a second writer.
+        stop_daemon_and_wait(root).context("refusing to start a second daemon alongside it")?;
     }
 
     let watch_binary = std::env::current_exe()?;
@@ -1890,7 +1898,7 @@ mod daemon_liveness_guard_tests {
     fn cmd_daemon_stop_returns_promptly_when_no_daemon_is_running() {
         let tmp = tempfile::tempdir().unwrap();
         let start = std::time::Instant::now();
-        cmd_daemon_stop(tmp.path()).unwrap();
+        cmd_daemon_stop(tmp.path(), false).unwrap();
         assert!(
             start.elapsed() < GUARD_BOUND,
             "cmd_daemon_stop should fail fast on a missing daemon, not wait out the protocol timeout"

@@ -1613,7 +1613,11 @@ resolver = ["./resolve-zed-path.sh"]
             let fake = bin.join("infigraph");
             std::fs::write(
                 &fake,
-                format!("#!/bin/sh\necho \"$*\" >> '{}'\n", calls.display()),
+                // `daemon-stop` acts on the directory it runs in, so log that.
+                format!(
+                    "#!/bin/sh\ncase \"$1\" in daemon-stop) echo \"$* @$(pwd -P)\" ;; *) echo \"$*\" ;; esac >> '{}'\n",
+                    calls.display()
+                ),
             )
             .unwrap();
             make_executable(&fake).unwrap();
@@ -1641,7 +1645,22 @@ resolver = ["./resolve-zed-path.sh"]
         /// Bash tool call with id `id`. Returns once the fake `infigraph` has
         /// logged `worktree reconcile`, the last step of the hook's chain.
         fn run(&self, id: &str, args: &[&str]) -> Vec<String> {
-            let command = format!("git worktree {}", args.join(" "));
+            self.run_as(id, args, false)
+        }
+
+        /// As [`Self::run`]; with `dash_c`, the call is spelled
+        /// `git -C <main> worktree ...` from an unrelated working directory.
+        fn run_as(&self, id: &str, args: &[&str], dash_c: bool) -> Vec<String> {
+            let command = if dash_c {
+                format!("git -C {} worktree {}", self.main.display(), args.join(" "))
+            } else {
+                format!("git worktree {}", args.join(" "))
+            };
+            let cwd = if dash_c {
+                self.tmp.path().to_path_buf()
+            } else {
+                self.main.clone()
+            };
             let input = |event: &str| {
                 serde_json::json!({
                     "hook_event_name": event,
@@ -1649,7 +1668,7 @@ resolver = ["./resolve-zed-path.sh"]
                     "tool_input": { "command": command },
                     "tool_use_id": id,
                     "tool_response": {},
-                    "cwd": self.main,
+                    "cwd": cwd,
                 })
                 .to_string()
             };
@@ -1712,10 +1731,18 @@ resolver = ["./resolve-zed-path.sh"]
             "only the new worktree is initialised, before reconcile"
         );
 
-        let calls = fx.run("toolu_remove", &["remove", wt.to_str().unwrap()]);
+        let wt_real = wt.canonicalize().unwrap();
+        // What a real `worktree init` leaves behind, and what marks a
+        // worktree whose daemon the hook must stop. Untracked in this repo,
+        // hence `--force` (which also checks the hook skips options).
+        std::fs::create_dir_all(wt.join(".infigraph")).unwrap();
+        let calls = fx.run("toolu_remove", &["remove", "--force", wt.to_str().unwrap()]);
         assert_eq!(
             calls,
             vec![
+                // Before git deletes it: a live daemon writing into
+                // .infigraph/ makes `git worktree remove` fail half-done.
+                format!("daemon-stop --wait @{}", wt_real.display()),
                 format!("worktree teardown {}", wt.display()),
                 "worktree reconcile".to_string()
             ],
@@ -1724,6 +1751,25 @@ resolver = ["./resolve-zed-path.sh"]
         assert!(
             fx.main.join(".infigraph/worktree-hook.log").is_file(),
             "the chain's output goes to the main worktree's hook log"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worktree_hook_follows_git_dash_c_to_the_repo_it_names() {
+        if hook_tools_missing() {
+            return;
+        }
+        let fx = WorktreeHookFixture::new(true);
+        let wt = fx.main.parent().unwrap().join("wt1");
+        let calls = fx.run_as("toolu_add_c", &["add", "-q", wt.to_str().unwrap()], true);
+        assert_eq!(
+            calls,
+            vec![
+                format!("worktree init {}", wt.display()),
+                "worktree reconcile".to_string()
+            ],
+            "`git -C <repo>` diffs <repo>'s worktrees, not the session's cwd"
         );
     }
 
