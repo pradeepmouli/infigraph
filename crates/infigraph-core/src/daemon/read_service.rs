@@ -291,6 +291,10 @@ fn serve_one(
             spawn_control(control.cloned(), request, stream);
             return Ok(());
         }
+        ClientFrame::Write(_) => {
+            write_reply::<_, ()>(&mut stream, &OpReply::Err(WRITES_NOT_SERVED.to_string()))?;
+            return Ok(());
+        }
     };
 
     // The document store is a separate `Database` with its own lock file and
@@ -487,6 +491,9 @@ fn spawn_control(port: Option<Arc<ControlPort>>, request: ControlRequest, mut st
         }
     }
 }
+
+/// Until the coordinator serves socket writes (#204, Task 6).
+pub const WRITES_NOT_SERVED: &str = "this daemon does not serve writes over the socket yet";
 
 type Job = Box<dyn FnOnce() + Send + 'static>;
 
