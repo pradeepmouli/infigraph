@@ -164,7 +164,7 @@ fn a_stalled_coordinator_still_answers_status_and_refuses_control_when_full() {
     std::fs::write(&stall, b"").unwrap();
     std::thread::sleep(Duration::from_millis(400)); // let the loop reach the stall
     let root = dir.path().to_path_buf();
-    let queued: Vec<_> = (0..infigraph_core::daemon::control_port::CONTROL_QUEUE)
+    let queued: Vec<_> = (0..infigraph_core::daemon::coordinator_port::PORT_QUEUE)
         .map(|_| {
             let root = root.clone();
             std::thread::spawn(move || send_control(&root, WatchRole::Code, WatchAction::Start))

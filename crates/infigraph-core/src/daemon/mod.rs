@@ -1,6 +1,6 @@
 pub(crate) mod backoff;
 pub mod control;
-pub mod control_port;
+pub mod coordinator_port;
 pub(crate) mod drain;
 pub mod fault;
 pub mod lease;
@@ -668,7 +668,7 @@ where
     // #155: what `Status` reads, and the channel `Control` reaches this loop
     // through. Owned here, like `liveness`, so a #187 rebind keeps it.
     let (control_port, control_rx) =
-        control_port::ControlPort::new(idle.grace_secs, idle.check_secs.max(1));
+        coordinator_port::CoordinatorPort::new(idle.grace_secs, idle.check_secs.max(1));
     if docs_control.is_some() {
         control_port.state.set_role(
             WatchRole::Docs,
@@ -861,6 +861,11 @@ where
     // direct-callback SCIP-enrichment path's own background task, not this
     // request-driven import.
     let mut scip_import_in_flight: Option<PendingScipImport> = None;
+    // #204: every write that has arrived and not yet started, in order.
+    let mut deferred: std::collections::VecDeque<(
+        crate::daemon_protocol::WriteRequest,
+        coordinator_port::WriteReply,
+    )> = std::collections::VecDeque::new();
     // #183: when the per-table compaction drift was last sampled. `None`
     // until the first sample, so the first idle tick measures immediately
     // rather than waiting out a full interval.
@@ -1764,33 +1769,44 @@ where
         // request wakes the loop at once. Everything queued is served now.
         let mut next = control_rx.recv_timeout(COORDINATOR_TICK).ok();
         while let Some(msg) = next.take() {
-            let control_port::ControlMsg { request, reply } = msg;
-            let outcome = apply_watch_control(
-                request.role,
-                request.action,
-                &mut code_watch,
-                docs_control.as_ref(),
-            );
-            let daemon_stop = is_daemon_stop(request.role, request.action, &outcome);
-            if matches!(request.action, WatchAction::Enable | WatchAction::Disable) {
-                policy = read_policy(root);
-            }
-            publish_roles(
-                &control_port.state,
-                &code_watch,
-                docs_control.as_ref(),
-                policy,
-            );
-            // Replied before any teardown starts, so the client learns the
-            // stop was accepted.
-            let _ = reply.send(outcome);
-            if daemon_stop {
-                // Two separate signals, deliberately: the token tears down
-                // background work, the flag ends this loop. See
-                // `shutdown_requested`'s declaration.
-                shutdown_requested = true;
-                daemon_token.cancel();
-                break;
+            match msg {
+                // #204: routed on the next iteration, with everything else
+                // that is waiting to start.
+                coordinator_port::PortMsg::Write { request, reply } => {
+                    deferred.push_back((request, reply));
+                }
+                coordinator_port::PortMsg::Control(coordinator_port::ControlMsg {
+                    request,
+                    reply,
+                }) => {
+                    let outcome = apply_watch_control(
+                        request.role,
+                        request.action,
+                        &mut code_watch,
+                        docs_control.as_ref(),
+                    );
+                    let daemon_stop = is_daemon_stop(request.role, request.action, &outcome);
+                    if matches!(request.action, WatchAction::Enable | WatchAction::Disable) {
+                        policy = read_policy(root);
+                    }
+                    publish_roles(
+                        &control_port.state,
+                        &code_watch,
+                        docs_control.as_ref(),
+                        policy,
+                    );
+                    // Replied before any teardown starts, so the client learns the
+                    // stop was accepted.
+                    let _ = reply.send(outcome);
+                    if daemon_stop {
+                        // Two separate signals, deliberately: the token tears down
+                        // background work, the flag ends this loop. See
+                        // `shutdown_requested`'s declaration.
+                        shutdown_requested = true;
+                        daemon_token.cancel();
+                        break;
+                    }
+                }
             }
             next = control_rx.try_recv().ok();
         }
@@ -3545,19 +3561,19 @@ fn has_pending_request(requests_dir: &Path) -> bool {
 /// Publish the watch roles' state for `Status`. Cheap: two atomics; the
 /// policy is read by the caller only when it can have changed.
 fn publish_roles(
-    state: &control_port::DaemonState,
+    state: &coordinator_port::DaemonState,
     code_watch: &CodeWatch,
     docs: Option<&Arc<dyn DocsHandle>>,
     policy: [bool; 2],
 ) {
     state.set_role(
         WatchRole::Code,
-        control_port::role_state(code_watch.is_running(), policy[0]),
+        coordinator_port::role_state(code_watch.is_running(), policy[0]),
     );
     state.set_role(
         WatchRole::Docs,
         match docs {
-            Some(d) => control_port::role_state(d.is_running(), policy[1]),
+            Some(d) => coordinator_port::role_state(d.is_running(), policy[1]),
             None => crate::daemon::read_protocol::RoleState::NotOwned,
         },
     );

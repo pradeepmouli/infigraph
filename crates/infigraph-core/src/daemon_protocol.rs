@@ -277,17 +277,11 @@ pub fn submit_write_request_cancellable(
 /// answered, and the request file was withdrawn. Downcast target for callers
 /// that clean up differently on cancellation than on timeout.
 #[derive(Debug)]
-pub struct WriteRequestCancelled {
-    pub request_path: PathBuf,
-}
+pub struct WriteRequestCancelled;
 
 impl std::fmt::Display for WriteRequestCancelled {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "write request cancelled before a daemon responded ({})",
-            self.request_path.display()
-        )
+        f.write_str("write request cancelled before the daemon answered")
     }
 }
 
@@ -350,7 +344,7 @@ fn submit_write_request_named_cancellable(
         }
         if cancel.is_some_and(|t| t.is_cancelled()) {
             std::fs::remove_file(&request_path).ok();
-            return Err(anyhow::Error::new(WriteRequestCancelled { request_path }));
+            return Err(anyhow::Error::new(WriteRequestCancelled));
         }
         // Checked while waiting too, not only up front: the daemon may hit
         // the fault on this very request.
@@ -533,13 +527,9 @@ mod cancellation_tests {
             "poll must observe the cancellation within its backoff cap, took {:?}",
             cancelled_at.elapsed()
         );
-        let cancelled = err
-            .downcast_ref::<WriteRequestCancelled>()
+        err.downcast_ref::<WriteRequestCancelled>()
             .expect("must be the typed cancellation marker, not the timeout wording");
-        assert!(
-            !cancelled.request_path.exists(),
-            "the withdrawn request file must not be left for the next daemon to inherit"
-        );
+        // The withdrawn request file must not be left for the next daemon.
         let leftovers: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
             .filter_map(|e| e.ok())

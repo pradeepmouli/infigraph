@@ -902,7 +902,7 @@ pub(crate) enum DaemonStop {
 /// stopped.
 pub(crate) fn request_daemon_stop(root: &Path) -> Result<DaemonStop> {
     use infigraph_core::daemon::control::{send_control, ControlError};
-    use infigraph_core::daemon::control_port::SHUTTING_DOWN;
+    use infigraph_core::daemon::coordinator_port::SHUTTING_DOWN;
     match send_control(root, WatchRole::Daemon, WatchAction::Stop) {
         Ok(()) => Ok(DaemonStop::Stopped),
         Err(ControlError::Refused(m)) if m == SHUTTING_DOWN => Ok(DaemonStop::Stopped),

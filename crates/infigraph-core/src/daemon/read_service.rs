@@ -19,7 +19,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 
-use super::control_port::{ControlPort, CONTROL_REPLY_TIMEOUT, NO_CONTROL, SHUTTING_DOWN};
+use super::coordinator_port::{CoordinatorPort, CONTROL_REPLY_TIMEOUT, NO_CONTROL, SHUTTING_DOWN};
 use super::liveness::{now_secs, Liveness};
 use super::read_endpoint::ReadEndpoint;
 use super::read_endpoint::ReadStream;
@@ -174,7 +174,7 @@ impl ReadService {
         docs: Option<RowSource>,
         workers: usize,
         liveness: Arc<Liveness>,
-        control: Option<Arc<ControlPort>>,
+        control: Option<Arc<CoordinatorPort>>,
     ) -> Result<Self> {
         let leases = Arc::new(LeaseBook::new(liveness));
         let accept_leases = leases.clone();
@@ -264,7 +264,7 @@ fn serve_one(
     source: &StoreSource,
     docs: Option<&RowSource>,
     leases: &Arc<LeaseBook>,
-    control: Option<&Arc<ControlPort>>,
+    control: Option<&Arc<CoordinatorPort>>,
     mut stream: ReadStream,
 ) -> Result<()> {
     let frame = read_client_frame(&mut stream)?;
@@ -445,7 +445,11 @@ fn lease_release_line(pid: u32, held: std::time::Duration, remaining: usize) -> 
 /// wait up to `CONTROL_REPLY_TIMEOUT` on a busy coordinator, and a few of
 /// those on the pool would stop every read. Never joined by the service --
 /// the coordinator counts it through the port instead (see `InFlightGuard`).
-fn spawn_control(port: Option<Arc<ControlPort>>, request: ControlRequest, mut stream: ReadStream) {
+fn spawn_control(
+    port: Option<Arc<CoordinatorPort>>,
+    request: ControlRequest,
+    mut stream: ReadStream,
+) {
     let Some(port) = port else {
         let _ = write_reply::<_, ()>(&mut stream, &OpReply::Err(NO_CONTROL.to_string()));
         return;
@@ -462,7 +466,7 @@ fn spawn_control(port: Option<Arc<ControlPort>>, request: ControlRequest, mut st
             let Ok(mut stream) = take.recv() else {
                 return;
             };
-            let reply = match port.submit(request) {
+            let reply = match port.submit_control(request) {
                 Err(msg) => OpReply::Err(msg),
                 Ok(rx) => match rx.recv_timeout(CONTROL_REPLY_TIMEOUT) {
                     Ok(Ok(())) => OpReply::Ok(()),

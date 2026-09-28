@@ -70,7 +70,7 @@ fn daemon_stop_refused_by_a_wedged_coordinator_writes_the_sentinel() {
             }
             let _ = write_reply::<_, ()>(
                 &mut s,
-                &OpReply::Err(infigraph_core::daemon::control_port::BUSY.to_string()),
+                &OpReply::Err(infigraph_core::daemon::coordinator_port::BUSY.to_string()),
             );
         }
     });
