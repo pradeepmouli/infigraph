@@ -15,11 +15,17 @@ INFIGRAPH_REGISTRY_REAL_HOME_REDIRECT = { value = "target/test-registry-home", r
 # where the linker treats them as hard errors. Allow multiple definitions so the
 # linker picks the first and discards duplicates (matches macOS/Windows behavior).
 # Uses -Wl, prefix since cc is the linker driver (forwards to ld/lld via -fuse-ld).
+# `rustflags` never reaches rustdoc, which links each doctest itself, so the
+# flag is repeated as `rustdocflags`: without it the first doctest that links
+# infigraph-core fails on lbug's bundled zstd colliding with zstd-sys (both
+# zstd 1.5.7).
 [target.x86_64-unknown-linux-gnu]
 rustflags = ["-C", "link-arg=-Wl,--allow-multiple-definition"]
+rustdocflags = ["-C", "link-arg=-Wl,--allow-multiple-definition"]
 
 [target.aarch64-unknown-linux-gnu]
 rustflags = ["-C", "link-arg=-Wl,--allow-multiple-definition"]
+rustdocflags = ["-C", "link-arg=-Wl,--allow-multiple-definition"]
 
 # Windows default main-thread stack is 1MB; tree-sitter/ANTLR parsers
 # recurse deeply during static init and Cli::parse(). Set 32MB default.
