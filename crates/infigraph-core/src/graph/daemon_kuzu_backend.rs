@@ -474,12 +474,12 @@ impl GraphBackend for DaemonKuzuBackend {
         let staging_dir = self.staging_dir();
         std::fs::create_dir_all(&staging_dir)?;
         let name = crate::daemon_protocol::generate_request_name();
-        let request_path = staging_dir.join(format!("{name}.request"));
-        let data_path = crate::daemon_protocol::write_ingest_inline_sibling(&request_path, data)?;
+        let data_path = staging_dir.join(format!("{name}.data.json"));
+        crate::daemon_protocol::write_ingest_data(&data_path, data)?;
 
         let request = crate::daemon_protocol::WriteRequest::IngestStructured {
             schema_id: schema.schema_id.clone(),
-            source: crate::daemon_protocol::IngestSource::Inline,
+            source: crate::daemon_protocol::IngestSource::Inline(data_path.clone()),
         };
         match crate::daemon_protocol::submit_write_request_named(
             &staging_dir,
