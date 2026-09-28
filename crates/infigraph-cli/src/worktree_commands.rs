@@ -3,9 +3,11 @@ use std::path::Path;
 use anyhow::Result;
 use infigraph_core::clone::clone_infigraph_dir;
 use infigraph_core::multi::Registry;
+use infigraph_core::project::canonicalize_lenient;
 use infigraph_core::worktree::{find_worktree_drift, main_worktree_path};
 
 use crate::index::cmd_index;
+use crate::info_commands::{request_daemon_stop, DaemonStop};
 
 pub(crate) fn cmd_worktree_init(path: &Path) -> Result<()> {
     let main = main_worktree_path(path)?;
@@ -28,13 +30,26 @@ pub(crate) fn cmd_worktree_init(path: &Path) -> Result<()> {
 }
 
 pub(crate) fn cmd_worktree_teardown(path: &Path) -> Result<()> {
-    // Stop the watcher, if any, before touching the registry -- mirrors the same
-    // sentinel-based stop cmd_delete_project already uses in info_commands.rs.
-    let lock_path = path.join(".infigraph").join("watch.lock");
-    if infigraph_core::daemon::lifecycle::daemon_is_alive(&lock_path) {
-        let sentinel = path.join(".infigraph").join("watch.stop");
-        let _ = std::fs::write(&sentinel, b"");
-        std::thread::sleep(std::time::Duration::from_millis(500));
+    // `git worktree remove` has usually deleted the directory already, so
+    // work from the path it had -- see `canonicalize_lenient`.
+    let path = &canonicalize_lenient(path);
+
+    // Stop the daemon, if any, before touching the registry. Over its socket,
+    // which lives outside the worktree, so this reaches it after the
+    // directory is gone; the `watch.stop` fallback needs the directory.
+    match request_daemon_stop(path) {
+        Ok(DaemonStop::Stopped) => println!("Stopped the daemon for {}.", path.display()),
+        Ok(DaemonStop::NotRunning) => {}
+        Ok(DaemonStop::ViaSentinel(why)) => println!(
+            "The daemon for {} did not take the stop request ({why}); wrote the stop sentinel instead.",
+            path.display()
+        ),
+        // Only the sentinel write fails, on a directory that is gone; a
+        // daemon whose root is gone exits on its own (#136).
+        Err(e) => eprintln!(
+            "warning: could not stop the daemon for {}: {e:#}",
+            path.display()
+        ),
     }
 
     let mut registry = Registry::load()?;

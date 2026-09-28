@@ -20,8 +20,10 @@ pub struct ReadEndpoint {
 }
 
 impl ReadEndpoint {
-    /// Derive the endpoint for a project root. The root is canonicalised
-    /// when possible so that `.` and a symlinked path reach the same daemon.
+    /// Derive the endpoint for a project root. The root is canonicalised so
+    /// that `.` and a symlinked path reach the same daemon -- leniently, so a
+    /// root that has since been deleted (a removed worktree) still names the
+    /// endpoint its daemon bound while it existed.
     ///
     /// The hash is `embed::fnv1a64`, not `DefaultHasher`: this name is a
     /// cross-process rendezvous, and `DefaultHasher`'s output is only
@@ -30,7 +32,7 @@ impl ReadEndpoint {
     /// routine enough here that `daemon::warn_if_cli_build_differs` exists
     /// for it. FNV-1a's constants are fixed forever.
     pub fn for_root(root: &Path) -> Self {
-        let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+        let canonical = crate::project::canonicalize_lenient(root);
         let hash = crate::embed::fnv1a64(canonical.to_string_lossy().as_bytes());
         Self {
             name: format!("infigraph-read-{hash:016x}"),
@@ -559,6 +561,19 @@ mod tests {
             fresh.exists(),
             "a just-bound endpoint must survive the sweep, or startup races itself"
         );
+    }
+
+    /// A daemon binds while its root exists; `worktree teardown` may ask for
+    /// the endpoint only after `git worktree remove` deleted it, and through a
+    /// non-canonical spelling (macOS's `/var` for `/private/var`).
+    #[test]
+    fn a_deleted_root_names_the_endpoint_it_had_while_it_existed() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("wt");
+        std::fs::create_dir_all(&root).unwrap();
+        let bound = ReadEndpoint::for_root(&root).as_name();
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(ReadEndpoint::for_root(&root).as_name(), bound);
     }
 
     /// Two different roots must not collide onto one endpoint.

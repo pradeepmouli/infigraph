@@ -18,8 +18,8 @@ MCP tools answer questions about code; these commands manage the index and its p
 
 | You want | Run |
 |---|---|
-| A new git worktree, indexed | `git worktree add -b <branch> <path> <base>`, then `infigraph worktree init <path>` (clones the main checkout's index, reindexes only what differs) |
-| To remove a worktree | `infigraph worktree teardown <path>` **first** (stops its daemon via a file inside it), then `git worktree remove <path>`; `infigraph worktree reconcile` fixes the registry after the fact |
+| A new git worktree, indexed | `git worktree add -b <branch> <path> <base>`, then `infigraph worktree init <path>` (clones the main checkout's index, reindexes only what differs). In Claude Code, Infigraph's hook runs `worktree init` for you after `git worktree add` in an Infigraph project; other agents run it by hand |
+| To remove a worktree | `git worktree remove <path>`, then `infigraph worktree teardown <path>` (stops its daemon over its socket and evicts it from the registry; works after the directory is gone, so order does not matter). In Claude Code, Infigraph's hook runs it for you; `infigraph worktree reconcile` fixes the registry after the fact |
 | To catch up the index | `infigraph index` (incremental) |
 | A graph that is corrupt, wedged, or refused as too large | `infigraph rebuild` (builds fresh, swaps it in); if the growth was legitimate, `infigraph restamp-baseline` |
 | To diagnose | `infigraph doctor` (`--global` for every project); `infigraph verify` checks one index offline |

@@ -82,3 +82,140 @@ fn worktree_teardown_evicts_registry_entry_but_keeps_infigraph_dir() {
         ".infigraph/ must survive teardown"
     );
 }
+
+/// Teardown reaches a daemon over its socket, which lives outside the
+/// worktree, so it works after `git worktree remove` deleted the directory
+/// -- and through the path's raw spelling, which on macOS (`/var` for
+/// `/private/var`) differs from the canonical root the daemon bound under.
+/// A stand-in daemon, because a real one exits on its own once its root is
+/// gone (#136) and would race the request this test is about.
+#[test]
+fn worktree_teardown_stops_the_daemon_after_the_directory_is_gone() {
+    use infigraph_core::daemon::read_protocol::{write_reply, OpReply};
+    use std::time::Duration;
+
+    let fake_home = tempfile::tempdir().unwrap();
+    let parent = tempfile::tempdir().unwrap();
+    let wt_path = parent.path().join("wt1");
+    std::fs::create_dir_all(wt_path.join(".infigraph")).unwrap();
+    let listener = infigraph_core::daemon::read_endpoint::ReadEndpoint::for_root(
+        &wt_path.canonicalize().unwrap(),
+    )
+    .bind()
+    .unwrap();
+    let daemon = std::thread::spawn(move || {
+        let mut s = listener
+            .accept_timeout(Duration::from_secs(20))
+            .ok()
+            .flatten()?;
+        use std::io::Read as _;
+        let mut len = [0u8; 4];
+        s.read_exact(&mut len).ok()?;
+        let mut body = vec![0u8; u32::from_le_bytes(len) as usize];
+        s.read_exact(&mut body).ok()?;
+        write_reply::<_, ()>(&mut s, &OpReply::Ok(())).ok()?;
+        Some(String::from_utf8_lossy(&body).into_owned())
+    });
+
+    std::fs::remove_dir_all(&wt_path).unwrap();
+    let out = run_worktree("teardown", &wt_path, fake_home.path());
+    let frame = daemon.join().unwrap();
+
+    assert!(
+        out.status.success(),
+        "teardown failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let frame = frame.expect("teardown never reached the daemon's socket");
+    assert!(
+        frame.contains("control") && frame.contains("Stop"),
+        "teardown must send a control stop, got {frame}"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("Stopped the daemon"), "{stdout}");
+}
+
+/// End to end against a real daemon on a real worktree: after `git worktree
+/// remove`, teardown succeeds, evicts the entry, and the daemon is gone.
+#[test]
+fn worktree_teardown_after_removal_leaves_no_daemon_running() {
+    use std::time::{Duration, Instant};
+
+    let fake_home = tempfile::tempdir().unwrap();
+    let main = tempfile::tempdir().unwrap();
+    git(&["init", "-q"], main.path());
+    git(&["config", "user.email", "t@t.com"], main.path());
+    git(&["config", "user.name", "t"], main.path());
+    std::fs::write(main.path().join("a.py"), "def foo():\n    pass\n").unwrap();
+    git(&["add", "a.py"], main.path());
+    git(&["commit", "-q", "-m", "init"], main.path());
+    let parent = tempfile::tempdir().unwrap();
+    let wt_path = parent.path().join("wt1");
+    git(
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "feature",
+            wt_path.to_str().unwrap(),
+        ],
+        main.path(),
+    );
+    assert!(run_index(&wt_path, fake_home.path()).status.success());
+
+    let mut daemon = Command::new(env!("CARGO_BIN_EXE_infigraph"))
+        .args(["daemon", "--debounce", "50"])
+        .current_dir(&wt_path)
+        .env("HOME", fake_home.path())
+        .env_remove("INFIGRAPH_WATCH_DAEMON")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let reachable = || {
+        infigraph_core::daemon::read_endpoint::ReadEndpoint::for_root(&wt_path)
+            .connect()
+            .is_ok()
+    };
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !reachable() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let listening = reachable();
+
+    git(
+        &["worktree", "remove", "--force", wt_path.to_str().unwrap()],
+        main.path(),
+    );
+    let out = run_worktree("teardown", &wt_path, fake_home.path());
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let exited = loop {
+        if daemon.try_wait().unwrap().is_some() {
+            break true;
+        }
+        if Instant::now() >= deadline {
+            break false;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    if !exited {
+        let _ = daemon.kill();
+        let _ = daemon.wait();
+    }
+
+    assert!(listening, "the daemon never bound its read endpoint");
+    assert!(
+        out.status.success(),
+        "teardown failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(exited, "the daemon must be gone after teardown");
+    let registry =
+        std::fs::read_to_string(fake_home.path().join(".infigraph/registry.json")).unwrap();
+    assert!(
+        !registry.contains("wt1"),
+        "teardown must evict the removed worktree:\n{registry}"
+    );
+}

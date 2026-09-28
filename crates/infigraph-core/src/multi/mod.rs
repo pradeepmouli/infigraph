@@ -117,21 +117,16 @@ impl Registry {
         Ok(())
     }
 
-    /// Remove every entry whose path matches `path` (raw or canonicalized).
+    /// Remove every entry whose path matches `path` (raw or canonicalized,
+    /// leniently, so a path that no longer exists still matches).
     /// Returns the names removed. Does not persist -- call `save()` after.
     pub fn deregister_by_path(&mut self, path: &Path) -> Vec<String> {
-        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let canonical = crate::project::canonicalize_lenient(path);
         let to_remove: Vec<String> = self
             .repos
             .iter()
             .filter(|(_, entry)| {
-                entry.path == path
-                    || entry.path == canonical
-                    || entry
-                        .path
-                        .canonicalize()
-                        .map(|p| p == canonical)
-                        .unwrap_or(false)
+                entry.path == path || crate::project::canonicalize_lenient(&entry.path) == canonical
             })
             .map(|(name, _)| name.clone())
             .collect();
