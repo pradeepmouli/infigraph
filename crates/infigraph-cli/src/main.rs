@@ -386,7 +386,13 @@ enum Commands {
     WatchStatus,
 
     /// Stop the daemon process (write-serving + all watching)
-    DaemonStop,
+    DaemonStop {
+        /// Return only once the daemon process has exited, not merely
+        /// accepted the stop (it releases its lock while still draining).
+        /// Fails after 10s if it has not.
+        #[arg(long)]
+        wait: bool,
+    },
 
     /// Restart the daemon process
     DaemonRestart,
@@ -1165,7 +1171,7 @@ fn run(command: Commands, root: &Path) -> Result<()> {
         Commands::Daemon { debounce } => cmd_daemon(root, debounce),
         Commands::WatchStop => cmd_watch_stop(root),
         Commands::WatchStatus => cmd_watch_status(root),
-        Commands::DaemonStop => cmd_daemon_stop(root),
+        Commands::DaemonStop { wait } => cmd_daemon_stop(root, wait),
         Commands::DaemonRestart => cmd_daemon_restart(root),
         Commands::Watch { action } => cmd_watch_control(
             root,
@@ -1526,7 +1532,10 @@ mod tests {
         ));
         assert!(!should_auto_watch(&Commands::WatchStop, root));
         assert!(!should_auto_watch(&Commands::WatchStatus, root));
-        assert!(!should_auto_watch(&Commands::DaemonStop, root));
+        assert!(!should_auto_watch(
+            &Commands::DaemonStop { wait: false },
+            root
+        ));
         assert!(!should_auto_watch(&Commands::DaemonRestart, root));
         assert!(!should_auto_watch(
             &Commands::Watch {
