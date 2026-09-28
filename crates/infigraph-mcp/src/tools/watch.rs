@@ -297,8 +297,14 @@ pub fn tool_watch_project(args: &Value) -> Result<String> {
 
     let lock_path = root.join(".infigraph").join("watch.lock");
     let watch_lock = acquire_project_watch_lock(&lock_path).map_err(|_| {
+        // Name the holder, as the CLI's `acquire_watch_lock` does:
+        // "another watcher" alone cannot tell a daemon from this worker's
+        // own watcher that was told to stop and is still shutting down.
+        let holder = infigraph_core::lockfile::read_holder(&lock_path)
+            .map(|h| format!(": {} (PID {})", h.role, h.pid))
+            .unwrap_or_default();
         anyhow::anyhow!(
-            "another watcher is already running for {root_str} \
+            "another watcher is already running for {root_str}{holder} \
              (CLI `infigraph watch` or another MCP worker) — \
              use get_watch_status to check, or stop it first"
         )

@@ -134,23 +134,25 @@ pub async fn run_producer(
     )
     .storm_threshold as usize;
 
-    let (mut watcher, mut rx) = match create_watcher(&root, debounce_ms) {
-        Ok(pair) => pair,
-        Err(e) => {
-            eprintln!("[watch-producer] failed to start watcher: {e}");
-            // Same event every other terminal path emits. Without it a
-            // producer whose watcher never started is indistinguishable,
-            // from the coordinator's side, from one that shut down cleanly
-            // on cancellation -- the task just completes and nothing says
-            // watching never actually began.
-            on_event(WatchEvent {
-                kind: WatchEventKind::WatcherDied,
-                path: root.clone(),
-                has_cross_file_calls: false,
-            });
-            return;
-        }
-    };
+    let (mut watcher, mut rx) =
+        match create_watcher_unless_cancelled(&root, debounce_ms, &token).await {
+            None => return,
+            Some(Ok(pair)) => pair,
+            Some(Err(e)) => {
+                eprintln!("[watch-producer] failed to start watcher: {e}");
+                // Same event every other terminal path emits. Without it a
+                // producer whose watcher never started is indistinguishable,
+                // from the coordinator's side, from one that shut down cleanly
+                // on cancellation -- the task just completes and nothing says
+                // watching never actually began.
+                on_event(WatchEvent {
+                    kind: WatchEventKind::WatcherDied,
+                    path: root.clone(),
+                    has_cross_file_calls: false,
+                });
+                return;
+            }
+        };
     let mut restart_count: u32 = 0;
 
     // `Delay` rather than the default `Burst`: these are idle cadences, not a
@@ -297,8 +299,9 @@ pub async fn run_producer(
                             _ = token.cancelled() => break,
                             _ = tokio::time::sleep(backoff) => {}
                         }
-                        match create_watcher(&root, debounce_ms) {
-                            Ok((new_watcher, new_rx)) => {
+                        match create_watcher_unless_cancelled(&root, debounce_ms, &token).await {
+                            None => break,
+                            Some(Ok((new_watcher, new_rx))) => {
                                 watcher = new_watcher;
                                 rx = new_rx;
                                 eprintln!("[watch-producer] watcher restarted successfully");
@@ -308,7 +311,7 @@ pub async fn run_producer(
                                     has_cross_file_calls: false,
                                 });
                             }
-                            Err(e) => {
+                            Some(Err(e)) => {
                                 eprintln!("[watch-producer] watcher restart failed: {e}");
                                 on_event(WatchEvent {
                                     kind: WatchEventKind::WatcherDied,
@@ -334,6 +337,44 @@ fn interval_after(period: Duration) -> tokio::time::Interval {
     interval
 }
 
+/// [`create_watcher`], but a cancelled `token` stops the wait for it.
+/// Registration blocks: on macOS every per-directory `watch()` restarts the
+/// FSEvents stream, an RPC to `fseventsd`, and with `fseventsd` backed up
+/// (dozens of watchers and a build storm on one machine) a single one was
+/// seen stalling for over a minute. Run inline, that stall sat between a
+/// stop and this task's exit, so the coordinator's `code_watch.stop()`
+/// -- and with it `watch.lock` -- was held for as long as `fseventsd` took.
+/// Registration therefore runs on a thread of its own; `None` means the
+/// token was cancelled first, and the thread drops what it built whenever
+/// it finishes.
+async fn create_watcher_unless_cancelled(
+    root: &Path,
+    debounce_ms: u64,
+    token: &CancellationToken,
+) -> Option<
+    anyhow::Result<(
+        RecommendedWatcher,
+        tokio_mpsc::UnboundedReceiver<notify::Result<Event>>,
+    )>,
+> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let thread_root = root.to_path_buf();
+    if let Err(e) = std::thread::Builder::new()
+        .name("infigraph-watch-register".into())
+        .spawn(move || {
+            let _ = tx.send(create_watcher(&thread_root, debounce_ms));
+        })
+    {
+        return Some(Err(e.into()));
+    }
+    tokio::select! {
+        _ = token.cancelled() => None,
+        built = rx => Some(built.unwrap_or_else(|_| {
+            Err(anyhow::anyhow!("watcher registration thread exited without a result"))
+        })),
+    }
+}
+
 /// Builds a watcher registered on every non-ignored directory under `root`,
 /// paired with the receiver for its events.
 ///
@@ -349,6 +390,15 @@ fn create_watcher(
     RecommendedWatcher,
     tokio_mpsc::UnboundedReceiver<notify::Result<Event>>,
 )> {
+    // Test-only: hold registration while `root/<this>` exists, standing in
+    // for a stalled `fseventsd` (see `create_watcher_unless_cancelled`).
+    // Root-relative, so it cannot stall another test's producer.
+    if let Some(stall) = std::env::var_os("INFIGRAPH_TEST_WATCH_REGISTER_STALL_FILE") {
+        let stall = root.join(stall);
+        while stall.exists() {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
     let (tx, rx) = tokio_mpsc::unbounded_channel::<notify::Result<Event>>();
     // An unbounded sender never blocks, so this handler is safe to call from
     // notify's own (synchronous, non-async) backend thread.

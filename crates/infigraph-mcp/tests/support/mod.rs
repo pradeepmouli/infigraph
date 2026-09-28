@@ -197,6 +197,79 @@ fn remove_tree(root: &Path) {
     }
 }
 
+/// How long a stopped in-process code watcher may take to release
+/// `watch.lock`. Its teardown measured ~2s on an idle dev machine and
+/// ~3.5s at load 15. The per-binary copies of this wait used 5s and then
+/// gave up silently, so the next `watch_project` on the root failed with
+/// "another watcher is already running" -- held by this very process's
+/// own stopping watcher. Generous, because running out is a failure,
+/// never a reason to carry on.
+pub const WATCHER_STOP_BUDGET: Duration = Duration::from_secs(60);
+
+/// How long to wait for a freshly started watcher's first reaction to a
+/// change. It covers registering with the OS first: on a loaded macOS
+/// machine that is an RPC to a backed-up `fseventsd`, and a doc watcher
+/// was seen still inside it after 15s, the old budget, before it had even
+/// run its catch-up reindex. A poll returns as soon as the change lands,
+/// so a generous budget costs nothing when the machine is quiet.
+pub const WATCH_EVENT_BUDGET: Duration = Duration::from_secs(60);
+
+/// Stop every in-process code watcher (the WATCHERS map: what
+/// `tool_watch_project` / `auto_start_watch` run on a thread of this
+/// process) and wait for each root's `watch.lock` to be released, so a
+/// test that watches the same root next is not racing the shutdown.
+pub fn stop_all_watchers() {
+    let roots: Vec<String> = {
+        let mut guard = infigraph_mcp::tools::watch::get_watchers();
+        guard
+            .as_mut()
+            .map(|map| {
+                map.drain()
+                    .map(|(_, entry)| {
+                        let _ = entry.stop_tx.send(());
+                        entry.path
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    for root in roots {
+        await_watch_lock_released(Path::new(&root));
+    }
+}
+
+/// Wait for a watcher that was told to stop to release `root`'s
+/// `watch.lock`. Panics naming the holder if it outlives
+/// [`WATCHER_STOP_BUDGET`] (only reports it when already unwinding, e.g.
+/// from a cleanup guard, where a second panic would abort).
+pub fn await_watch_lock_released(root: &Path) {
+    let lock = root.join(".infigraph").join("watch.lock");
+    if wait_until_released(&lock, WATCHER_STOP_BUDGET) {
+        return;
+    }
+    let msg = format!(
+        "a stopped watcher still holds {} after {WATCHER_STOP_BUDGET:?}: {:?}",
+        lock.display(),
+        infigraph_core::lockfile::read_holder(&lock).map(|h| (h.role, h.pid))
+    );
+    if std::thread::panicking() {
+        eprintln!("[support] {msg}");
+    } else {
+        panic!("{msg}");
+    }
+}
+
+/// Stop every in-process doc watcher. Doc watchers do not hold
+/// `watch.lock` (only code watchers do), so there is nothing to wait for.
+pub fn stop_all_doc_watchers() {
+    let mut guard = infigraph_mcp::tools::docs::get_doc_watchers();
+    if let Some(map) = guard.as_mut() {
+        for (_, entry) in map.drain() {
+            let _ = entry.stop_tx.send(());
+        }
+    }
+}
+
 /// Stop every in-process MCP watcher registered for `root` (the ones
 /// `tool_watch_project` / `auto_start_watch` run on a thread of this
 /// process) and wait for `watch.lock` to be released. Returns whether any
@@ -227,7 +300,7 @@ pub fn stop_in_process_watchers_for(root: &Path) -> bool {
     if found {
         wait_until_released(
             &root.join(".infigraph").join("watch.lock"),
-            Duration::from_secs(10),
+            WATCHER_STOP_BUDGET,
         );
     }
     found

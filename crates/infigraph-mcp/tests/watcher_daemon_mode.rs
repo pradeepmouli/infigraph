@@ -1,78 +1,9 @@
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+
+mod support;
+use support::{stop_all_doc_watchers, stop_all_watchers};
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-/// Stop every in-process watcher and block until each one's
-/// `.infigraph/watch.lock` is confirmed released. Mirrors the helper of the
-/// same shape in `watcher_reindex.rs` (not reusable across integration test
-/// binaries, since each `tests/*.rs` file compiles to its own crate) — kept
-/// in sync deliberately rather than factored into a shared `tests/common`
-/// module, matching this test suite's existing convention.
-fn stop_all_watchers() {
-    let mut guard = infigraph_mcp::tools::watch::get_watchers();
-    let stopped_paths: Vec<String> = if let Some(map) = guard.as_mut() {
-        let ids: Vec<String> = map.keys().cloned().collect();
-        let mut paths = Vec::new();
-        for id in ids {
-            if let Some(entry) = map.remove(&id) {
-                paths.push(entry.path.clone());
-                let _ = entry.stop_tx.send(());
-            }
-        }
-        paths
-    } else {
-        Vec::new()
-    };
-    drop(guard);
-    wait_for_watch_locks_released(&stopped_paths);
-}
-
-fn wait_for_watch_locks_released(paths: &[String]) {
-    use fs2::FileExt;
-    for path in paths {
-        let lock_path = std::path::Path::new(path)
-            .join(".infigraph")
-            .join("watch.lock");
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            let file = match std::fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(false)
-                .open(&lock_path)
-            {
-                Ok(f) => f,
-                Err(_) => break,
-            };
-            match file.try_lock_exclusive() {
-                Ok(()) => {
-                    let _ = file.unlock();
-                    break;
-                }
-                Err(_) => {
-                    if Instant::now() >= deadline {
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(20));
-                }
-            }
-        }
-    }
-}
-
-/// Stop every in-process doc watcher. Unlike `stop_all_watchers`, doc
-/// watchers don't hold `.infigraph/watch.lock` (only code watchers do), so
-/// there's no lock-release wait needed -- sending the stop signal and
-/// draining the map is enough.
-fn stop_all_doc_watchers() {
-    let mut guard = infigraph_mcp::tools::docs::get_doc_watchers();
-    if let Some(map) = guard.as_mut() {
-        for (_, entry) in map.drain() {
-            let _ = entry.stop_tx.send(());
-        }
-    }
-}
 
 /// With the toggle OFF (default), auto_start_watch must behave exactly as
 /// before: an in-process thread, tracked in the WATCHERS map, with no
@@ -137,7 +68,7 @@ fn daemon_mode_on_does_not_populate_in_process_watchers_map() {
         );
         let args = serde_json::json!({ "path": path });
         let _ = infigraph_mcp::tools::watch::tool_stop_watch(&args);
-        wait_for_watch_locks_released(std::slice::from_ref(&path));
+        support::await_watch_lock_released(std::path::Path::new(&path));
     }
 
     std::env::set_var(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND);
@@ -175,7 +106,7 @@ fn tool_watch_project_respects_daemon_mode_toggle() {
             "unexpected tool_watch_project outcome under daemon mode: {msg}"
         );
         let _ = infigraph_mcp::tools::watch::tool_stop_watch(&args);
-        wait_for_watch_locks_released(std::slice::from_ref(&path));
+        support::await_watch_lock_released(std::path::Path::new(&path));
     }
 
     std::env::set_var(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND);
@@ -325,7 +256,7 @@ fn doc_watch_daemon_spawn_not_blocked_by_disabled_code_watch_policy() {
              disabled code-watch policy, got: {msg}"
         );
         let _ = infigraph_mcp::tools::watch::tool_stop_watch(&args);
-        wait_for_watch_locks_released(std::slice::from_ref(&path));
+        support::await_watch_lock_released(std::path::Path::new(&path));
     }
 
     std::env::remove_var("INFIGRAPH_WATCH_ENABLED");
