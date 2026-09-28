@@ -978,6 +978,8 @@ mod staleness_banner_tests {
         let tmp = tempfile::tempdir().unwrap();
         let ig = tmp.path().join(".infigraph");
         std::fs::create_dir_all(&ig).unwrap();
+        // The ratio guard proper, not its `growth_min_bytes` floor.
+        std::fs::write(ig.join("config.toml"), "[graph]\ngrowth_min_bytes = 0\n").unwrap();
         infigraph_core::dirty::mark_dirty(&ig, &["a.py".to_string()]).unwrap();
 
         // 20MB graph against a 1MB baseline: 20x, past the 10x default.

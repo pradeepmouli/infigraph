@@ -95,6 +95,7 @@ pub(crate) fn check_disk_headroom(dir: &Path, projected_write_bytes: u64) -> Res
 /// Kept for `check_graph_growth_ratio`'s user-facing "override with ..."
 /// hint; the value itself resolves through the `graph` settings group.
 const GRAPH_GROWTH_MAX_RATIO_ENV: &str = "INFIGRAPH_GRAPH_GROWTH_MAX_RATIO";
+const GRAPH_GROWTH_MIN_BYTES_ENV: &str = "INFIGRAPH_GRAPH_GROWTH_MIN_BYTES";
 const GRAPH_MAX_BYTES_ENV: &str = "INFIGRAPH_GRAPH_MAX_BYTES";
 
 /// Serializes the tests that set, or would be defeated by,
@@ -103,6 +104,18 @@ const GRAPH_MAX_BYTES_ENV: &str = "INFIGRAPH_GRAPH_MAX_BYTES";
 /// consulted outside this module too (the fold guard in `store`).
 #[cfg(test)]
 pub(crate) static MAX_BYTES_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// A `.infigraph` directory under `tmp` whose project config turns the
+/// `growth_min_bytes` floor off, so a test can exercise the ratio guard on
+/// MB-scale files instead of writing hundreds of MB. A config file rather
+/// than the env var, which is process-wide and would race parallel tests.
+#[cfg(test)]
+pub(crate) fn floorless_infigraph_dir(tmp: &Path) -> std::path::PathBuf {
+    let ig = tmp.join(".infigraph");
+    std::fs::create_dir_all(&ig).unwrap();
+    std::fs::write(ig.join("config.toml"), "[graph]\ngrowth_min_bytes = 0\n").unwrap();
+    ig
+}
 
 /// Observed pathological incidents (github.com/pradeepmouli/infigraph#100)
 /// were 40-70x a healthy graph's size; the default 10x gives wide headroom
@@ -113,6 +126,19 @@ pub(crate) static MAX_BYTES_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::n
 fn graph_growth_max_ratio(scope: ConfigScope<'_>) -> u64 {
     crate::graph::Graph::resolve_or_default(crate::graph::RawGraph::default(), scope)
         .growth_max_ratio
+}
+
+/// Size at or below which the ratio breaker never refuses; 0 disables the
+/// floor (`INFIGRAPH_GRAPH_GROWTH_MIN_BYTES`). See `check_graph_growth_ratio`.
+///
+/// The ratio is only as meaningful as its baseline, and the first one is
+/// stamped after a project's very first write -- a few hundred KB is normal,
+/// which puts the 10x trip point at a few MB of entirely ordinary indexing.
+/// The pattern the breaker exists for (#100) is 40-70x a healthy graph, at
+/// GB scale; 128 MiB sits far below that and far above a fresh project.
+fn graph_growth_min_bytes(scope: ConfigScope<'_>) -> u64 {
+    crate::graph::Graph::resolve_or_default(crate::graph::RawGraph::default(), scope)
+        .growth_min_bytes
 }
 
 /// Absolute ceiling on the live graph plus its WAL family; 0 disables it
@@ -304,18 +330,6 @@ pub(crate) fn stamp_healthy_graph_size_if_unset(infigraph_dir: &Path, graph_path
     }
 }
 
-/// Circuit breaker against the runaway-WAL-growth pattern from #100 (a live
-/// graph observed growing 40-70x its healthy size before crashing). This is
-/// NOT a fix for the underlying cause (why Kuzu's WAL isn't checkpointing
-/// under the observed workloads) -- only a refusal before a write can push
-/// the graph further into that pattern. Passes rather than refuses when no
-/// baseline exists yet -- there's nothing to compare against, unless
-/// `graph.health.recorded` says one existed and was lost (#185) -- but
-/// deliberately does NOT establish one itself: this runs as a *preflight*,
-/// before the write it guards, so stamping here would capture the graph's
-/// pre-write size. `stamp_healthy_graph_size_if_unset`, called by the same
-/// write paths *after* their write completes, is what actually bootstraps
-/// the first real baseline.
 /// Bytes of the base image alone, split out only because
 /// `check_graph_growth_ratio`'s message reports the two halves separately.
 fn graph_base_bytes(graph_path: &Path) -> u64 {
@@ -342,6 +356,20 @@ pub(crate) fn graph_family_bytes(graph_path: &Path) -> u64 {
     graph_base_bytes(graph_path).saturating_add(graph_wal_bytes(graph_path))
 }
 
+/// Circuit breaker against the runaway-WAL-growth pattern from #100 (a live
+/// graph observed growing 40-70x its healthy size before crashing). This is
+/// NOT a fix for the underlying cause (why Kuzu's WAL isn't checkpointing
+/// under the observed workloads) -- only a refusal before a write can push
+/// the graph further into that pattern. Passes rather than refuses when no
+/// baseline exists yet -- there's nothing to compare against, unless
+/// `graph.health.recorded` says one existed and was lost (#185) -- but
+/// deliberately does NOT establish one itself: this runs as a *preflight*,
+/// before the write it guards, so stamping here would capture the graph's
+/// pre-write size. `stamp_healthy_graph_size_if_unset`, called by the same
+/// write paths *after* their write completes, is what actually bootstraps
+/// the first real baseline. Neither refusal applies to a graph at or below
+/// `[graph] growth_min_bytes`; the absolute ceiling (`[graph] max_bytes`)
+/// applies at any size.
 pub(crate) fn check_graph_growth_ratio(
     infigraph_dir: &Path,
     graph_path: &Path,
@@ -375,6 +403,17 @@ pub(crate) fn check_graph_growth_ratio(
         ));
     }
 
+    // Below the size floor neither baseline-relative refusal applies: not the
+    // ratio, whose baseline may have been stamped at a few hundred KB, and not
+    // #185's lost baseline, since a graph this small is not a runaway either.
+    // The latter still never re-anchors -- `stamp_healthy_graph_size_if_unset`
+    // honours the marker regardless -- so once the graph passes the floor it
+    // is refused exactly as before.
+    let floor = graph_growth_min_bytes(scope);
+    if current <= floor {
+        return Ok(());
+    }
+
     let Some(healthy) = read_healthy_size(infigraph_dir) else {
         // #185: no baseline is a first index, and passes -- unless the marker
         // says one was recorded, in which case it was lost and this graph's
@@ -403,8 +442,9 @@ pub(crate) fn check_graph_growth_ratio(
     if current > max_allowed {
         return Err(format!(
             "graph at {} is {} MB ({} MB graph + {} MB WAL), {}x its recorded healthy size \
-             ({} MB) -- refusing further growth (cap: {}x, override with \
-             {GRAPH_GROWTH_MAX_RATIO_ENV} or `[graph] growth_max_ratio` in \
+             ({} MB) -- refusing further growth (cap: {}x once past {} MB; override with \
+             {GRAPH_GROWTH_MAX_RATIO_ENV} or `[graph] growth_max_ratio`, and the size \
+             floor with {GRAPH_GROWTH_MIN_BYTES_ENV} or `[graph] growth_min_bytes`, in \
              .infigraph/config.toml); this guards against the runaway-WAL-growth pattern \
              from github.com/pradeepmouli/infigraph#100. ALL indexing is blocked until this is \
              resolved -- run `infigraph rebuild`, which rebuilds the graph compactly and \
@@ -417,6 +457,7 @@ pub(crate) fn check_graph_growth_ratio(
             current / healthy.max(1),
             healthy / (1024 * 1024),
             ratio,
+            floor / (1024 * 1024),
         ));
     }
     Ok(())
@@ -948,10 +989,10 @@ mod tests {
 
     use super::{
         check_disk_headroom, check_graph_growth_ratio, classify_file,
-        copy_edges_with_bad_record_retry, extract_bad_copy_value, graph_growth_ratio, is_lockfile,
-        prefilter_pairs_against_existing, read_healthy_size, resolve_import_candidate,
-        stamp_healthy_graph_size, stamp_healthy_graph_size_if_unset, unwind_edges_from_pairs,
-        GRAPH_MAX_BYTES_ENV, MAX_BAD_RECORD_RETRIES,
+        copy_edges_with_bad_record_retry, extract_bad_copy_value, floorless_infigraph_dir,
+        graph_growth_ratio, is_lockfile, prefilter_pairs_against_existing, read_healthy_size,
+        resolve_import_candidate, stamp_healthy_graph_size, stamp_healthy_graph_size_if_unset,
+        unwind_edges_from_pairs, GRAPH_MAX_BYTES_ENV, MAX_BAD_RECORD_RETRIES,
     };
 
     /// A store holding Symbol nodes `s0..s{n}` and nothing else.
@@ -1045,14 +1086,15 @@ mod tests {
     #[test]
     fn growth_check_passes_rather_than_refuses_with_no_baseline_yet() {
         let tmp = tempfile::tempdir().unwrap();
-        let graph_path = tmp.path().join("graph");
+        let ig = floorless_infigraph_dir(tmp.path());
+        let graph_path = ig.join("graph");
         std::fs::write(&graph_path, vec![0u8; 1024]).unwrap();
 
         // Deliberately does NOT establish a baseline itself -- this is a
         // preflight, run before the write it guards, so stamping here would
         // capture the pre-write size. See `stamp_healthy_graph_size_if_unset`.
-        assert!(check_graph_growth_ratio(tmp.path(), &graph_path).is_ok());
-        assert!(!tmp.path().join("graph.health.json").exists());
+        assert!(check_graph_growth_ratio(&ig, &graph_path).is_ok());
+        assert!(!ig.join("graph.health.json").exists());
     }
 
     #[test]
@@ -1080,13 +1122,14 @@ mod tests {
     #[test]
     fn growth_check_refuses_when_a_recorded_baseline_has_gone_missing() {
         let tmp = tempfile::tempdir().unwrap();
-        let graph_path = tmp.path().join("graph");
+        let ig = floorless_infigraph_dir(tmp.path());
+        let graph_path = ig.join("graph");
         std::fs::write(&graph_path, vec![0u8; 1024]).unwrap();
-        stamp_healthy_graph_size_if_unset(tmp.path(), &graph_path);
-        assert!(check_graph_growth_ratio(tmp.path(), &graph_path).is_ok());
+        stamp_healthy_graph_size_if_unset(&ig, &graph_path);
+        assert!(check_graph_growth_ratio(&ig, &graph_path).is_ok());
 
-        std::fs::remove_file(tmp.path().join("graph.health.json")).unwrap();
-        let err = check_graph_growth_ratio(tmp.path(), &graph_path)
+        std::fs::remove_file(ig.join("graph.health.json")).unwrap();
+        let err = check_graph_growth_ratio(&ig, &graph_path)
             .expect_err("a baseline that once existed and is gone must refuse, not pass");
         assert!(
             err.contains("restamp-baseline") && err.contains("infigraph rebuild"),
@@ -1094,12 +1137,12 @@ mod tests {
         );
 
         // Nor may the post-write bootstrap quietly re-anchor it.
-        stamp_healthy_graph_size_if_unset(tmp.path(), &graph_path);
-        assert!(read_healthy_size(tmp.path()).is_none());
+        stamp_healthy_graph_size_if_unset(&ig, &graph_path);
+        assert!(read_healthy_size(&ig).is_none());
 
         // The explicit restamp is the way back.
-        stamp_healthy_graph_size(tmp.path(), &graph_path);
-        assert!(check_graph_growth_ratio(tmp.path(), &graph_path).is_ok());
+        stamp_healthy_graph_size(&ig, &graph_path);
+        assert!(check_graph_growth_ratio(&ig, &graph_path).is_ok());
     }
 
     /// #185 migration: a project whose baseline predates the marker must
@@ -1108,17 +1151,18 @@ mod tests {
     #[test]
     fn a_baseline_recorded_before_the_marker_existed_gains_one_on_the_next_write() {
         let tmp = tempfile::tempdir().unwrap();
-        let graph_path = tmp.path().join("graph");
+        let ig = floorless_infigraph_dir(tmp.path());
+        let graph_path = ig.join("graph");
         std::fs::write(&graph_path, vec![0u8; 1024]).unwrap();
         std::fs::write(
-            tmp.path().join("graph.health.json"),
+            ig.join("graph.health.json"),
             r#"{"healthy_size_bytes": 1024}"#,
         )
         .unwrap();
 
-        stamp_healthy_graph_size_if_unset(tmp.path(), &graph_path);
-        std::fs::remove_file(tmp.path().join("graph.health.json")).unwrap();
-        assert!(check_graph_growth_ratio(tmp.path(), &graph_path).is_err());
+        stamp_healthy_graph_size_if_unset(&ig, &graph_path);
+        std::fs::remove_file(ig.join("graph.health.json")).unwrap();
+        assert!(check_graph_growth_ratio(&ig, &graph_path).is_err());
     }
 
     /// #185: `infigraph rebuild` is the remedy the refusal names, and under
@@ -1127,14 +1171,15 @@ mod tests {
     #[test]
     fn a_lost_baseline_does_not_refuse_a_rebuild_at_a_side_path() {
         let tmp = tempfile::tempdir().unwrap();
-        let live = tmp.path().join("graph");
+        let ig = floorless_infigraph_dir(tmp.path());
+        let live = ig.join("graph");
         std::fs::write(&live, vec![0u8; 1024]).unwrap();
-        stamp_healthy_graph_size(tmp.path(), &live);
-        std::fs::remove_file(tmp.path().join("graph.health.json")).unwrap();
+        stamp_healthy_graph_size(&ig, &live);
+        std::fs::remove_file(ig.join("graph.health.json")).unwrap();
 
-        let side = tmp.path().join("graph.rebuilding");
+        let side = ig.join("graph.rebuilding");
         std::fs::write(&side, vec![0u8; 1024]).unwrap();
-        assert!(check_graph_growth_ratio(tmp.path(), &side).is_ok());
+        assert!(check_graph_growth_ratio(&ig, &side).is_ok());
     }
 
     /// #183: compaction escalates on *how close to refusal* the graph is, so
@@ -1168,14 +1213,15 @@ mod tests {
     #[test]
     fn the_unwind_fallback_refuses_rather_than_writing_through_runaway_growth() {
         let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("graph");
+        let ig = floorless_infigraph_dir(dir.path());
+        let db_path = ig.join("graph");
         let store = GraphStore::open(&db_path).unwrap();
         let conn = store.connection().unwrap();
 
         // A deliberately tiny baseline, so the real graph is already far past
         // the 10x cap -- honest and cheap, versus staging gigabytes on disk.
         std::fs::write(
-            dir.path().join("graph.health.json"),
+            ig.join("graph.health.json"),
             r#"{"healthy_size_bytes": 1024}"#,
         )
         .unwrap();
@@ -1196,15 +1242,93 @@ mod tests {
         );
     }
 
+    /// The floor bounds the ratio from below, not away: once a graph is past
+    /// it, the ratio refuses as it always did, and the refusal names the
+    /// floor's setting beside the ratio's.
+    #[test]
+    fn past_the_size_floor_the_ratio_still_refuses() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ig = tmp.path().join(".infigraph");
+        std::fs::create_dir_all(&ig).unwrap();
+        std::fs::write(
+            ig.join("config.toml"),
+            "[graph]\ngrowth_min_bytes = 2000000\n",
+        )
+        .unwrap();
+        let graph_path = ig.join("graph");
+        std::fs::write(&graph_path, vec![0u8; 100_000]).unwrap();
+        stamp_healthy_graph_size(&ig, &graph_path); // baseline: 100KB
+
+        std::fs::write(&graph_path, vec![0u8; 1_500_000]).unwrap(); // 15x, under the floor
+        let out = check_graph_growth_ratio(&ig, &graph_path);
+        assert!(
+            out.is_ok(),
+            "under the 2MB floor the ratio must not refuse: {out:?}"
+        );
+
+        std::fs::write(&graph_path, vec![0u8; 3_000_000]).unwrap(); // 30x, past the floor
+        let err = check_graph_growth_ratio(&ig, &graph_path)
+            .expect_err("30x past the floor must be refused at the 10x default");
+        assert!(err.contains("healthy size"), "unexpected message: {err}");
+        assert!(
+            err.contains("`[graph] growth_min_bytes`"),
+            "the refusal must name the floor's setting: {err}"
+        );
+    }
+
+    /// #185 below the floor: a lost baseline on a graph this small passes
+    /// rather than blocking all indexing -- but it is still lost. Nothing
+    /// re-anchors it, so the refusal returns the moment the graph passes the
+    /// floor.
+    #[test]
+    fn a_lost_baseline_under_the_size_floor_passes_without_re_anchoring() {
+        let tmp = tempfile::tempdir().unwrap();
+        let graph_path = tmp.path().join("graph");
+        std::fs::write(&graph_path, vec![0u8; 1024]).unwrap();
+        stamp_healthy_graph_size_if_unset(tmp.path(), &graph_path);
+        std::fs::remove_file(tmp.path().join("graph.health.json")).unwrap();
+
+        let out = check_graph_growth_ratio(tmp.path(), &graph_path);
+        assert!(out.is_ok(), "1KB is under the default floor: {out:?}");
+        stamp_healthy_graph_size_if_unset(tmp.path(), &graph_path);
+        assert!(
+            read_healthy_size(tmp.path()).is_none(),
+            "passing under the floor must not let the bootstrap re-anchor the lost baseline"
+        );
+    }
+
+    /// A baseline stamped while the graph is tiny -- `stamp_healthy_graph_size_if_unset`
+    /// fires after a project's very first write -- put the ratio's trip point
+    /// at a few MB, where growth is ordinary indexing rather than the multi-GB
+    /// runaway the breaker exists for, and a refusal blocks all indexing until
+    /// a rebuild. It flaked `concurrent_writer_reader_raw_query_correctness_under_load`
+    /// on macOS CI: "4 MB (3 MB graph + 0 MB WAL), 10x its recorded healthy
+    /// size (0 MB)". Below `[graph] growth_min_bytes` the ratio does not apply.
+    #[test]
+    fn growth_under_the_size_floor_is_never_refused_by_the_ratio() {
+        let tmp = tempfile::tempdir().unwrap();
+        let graph_path = tmp.path().join("graph");
+        std::fs::write(&graph_path, vec![0u8; 300_000]).unwrap();
+        stamp_healthy_graph_size(tmp.path(), &graph_path); // baseline: ~300KB
+
+        std::fs::write(&graph_path, vec![0u8; 4_000_000]).unwrap(); // ~13x, but 4MB
+        let out = check_graph_growth_ratio(tmp.path(), &graph_path);
+        assert!(
+            out.is_ok(),
+            "4MB is far under the default size floor, so the ratio must not refuse it: {out:?}"
+        );
+    }
+
     #[test]
     fn growth_check_refuses_once_current_size_exceeds_the_ratio() {
         let tmp = tempfile::tempdir().unwrap();
-        let graph_path = tmp.path().join("graph");
+        let ig = floorless_infigraph_dir(tmp.path());
+        let graph_path = ig.join("graph");
         std::fs::write(&graph_path, vec![0u8; 1_000_000]).unwrap();
-        stamp_healthy_graph_size(tmp.path(), &graph_path); // baseline: ~1MB
+        stamp_healthy_graph_size(&ig, &graph_path); // baseline: ~1MB
 
         std::fs::write(&graph_path, vec![0u8; 20_000_000]).unwrap(); // 20x -- over the 10x default
-        let err = check_graph_growth_ratio(tmp.path(), &graph_path)
+        let err = check_graph_growth_ratio(&ig, &graph_path)
             .expect_err("20x growth over a 1MB baseline must be refused at the 10x default");
         assert!(err.contains("healthy size"), "unexpected message: {err}");
     }
@@ -1217,12 +1341,13 @@ mod tests {
     #[test]
     fn growth_refusal_names_the_rebuild_remedy() {
         let tmp = tempfile::tempdir().unwrap();
-        let graph_path = tmp.path().join("graph");
+        let ig = floorless_infigraph_dir(tmp.path());
+        let graph_path = ig.join("graph");
         std::fs::write(&graph_path, vec![0u8; 1_000_000]).unwrap();
-        stamp_healthy_graph_size(tmp.path(), &graph_path);
+        stamp_healthy_graph_size(&ig, &graph_path);
 
         std::fs::write(&graph_path, vec![0u8; 20_000_000]).unwrap();
-        let err = check_graph_growth_ratio(tmp.path(), &graph_path).expect_err("must refuse");
+        let err = check_graph_growth_ratio(&ig, &graph_path).expect_err("must refuse");
         assert!(
             err.contains("infigraph rebuild"),
             "the refusal must name the remedy that actually recovers the graph: {err}"
@@ -1239,12 +1364,13 @@ mod tests {
     #[test]
     fn growth_refusal_offers_an_explicit_restamp_not_a_file_deletion() {
         let tmp = tempfile::tempdir().unwrap();
-        let graph_path = tmp.path().join("graph");
+        let ig = floorless_infigraph_dir(tmp.path());
+        let graph_path = ig.join("graph");
         std::fs::write(&graph_path, vec![0u8; 1_000_000]).unwrap();
-        stamp_healthy_graph_size(tmp.path(), &graph_path);
+        stamp_healthy_graph_size(&ig, &graph_path);
 
         std::fs::write(&graph_path, vec![0u8; 20_000_000]).unwrap();
-        let err = check_graph_growth_ratio(tmp.path(), &graph_path).expect_err("must refuse");
+        let err = check_graph_growth_ratio(&ig, &graph_path).expect_err("must refuse");
         assert!(
             err.contains("restamp-baseline"),
             "the refusal must name the explicit restamp command: {err}"
@@ -1334,12 +1460,13 @@ mod tests {
     #[test]
     fn growth_check_passes_for_ordinary_growth_under_the_ratio() {
         let tmp = tempfile::tempdir().unwrap();
-        let graph_path = tmp.path().join("graph");
+        let ig = floorless_infigraph_dir(tmp.path());
+        let graph_path = ig.join("graph");
         std::fs::write(&graph_path, vec![0u8; 1_000_000]).unwrap();
-        stamp_healthy_graph_size(tmp.path(), &graph_path);
+        stamp_healthy_graph_size(&ig, &graph_path);
 
         std::fs::write(&graph_path, vec![0u8; 3_000_000]).unwrap(); // 3x -- under the 10x default
-        assert!(check_graph_growth_ratio(tmp.path(), &graph_path).is_ok());
+        assert!(check_graph_growth_ratio(&ig, &graph_path).is_ok());
     }
 
     #[test]
@@ -1349,17 +1476,18 @@ mod tests {
         // to ~97GB. Before this fix, check_graph_growth_ratio only ever
         // stat'd `graph_path` and would have passed this case cleanly.
         let tmp = tempfile::tempdir().unwrap();
-        let graph_path = tmp.path().join("graph");
+        let ig = floorless_infigraph_dir(tmp.path());
+        let graph_path = ig.join("graph");
         std::fs::write(&graph_path, vec![0u8; 1_000_000]).unwrap();
-        stamp_healthy_graph_size(tmp.path(), &graph_path); // baseline: ~1MB
+        stamp_healthy_graph_size(&ig, &graph_path); // baseline: ~1MB
 
         // graph stays small...
         std::fs::write(&graph_path, vec![0u8; 1_000_000]).unwrap();
         // ...but its WAL balloons to 20x the baseline.
-        let wal_path = tmp.path().join("graph.wal");
+        let wal_path = ig.join("graph.wal");
         std::fs::write(&wal_path, vec![0u8; 20_000_000]).unwrap();
 
-        let err = check_graph_growth_ratio(tmp.path(), &graph_path)
+        let err = check_graph_growth_ratio(&ig, &graph_path)
             .expect_err("a runaway WAL must be caught even when the checkpointed graph is small");
         assert!(err.contains("MB graph"), "unexpected message: {err}");
         assert!(err.contains("MB WAL"), "unexpected message: {err}");
@@ -1386,17 +1514,18 @@ mod tests {
     #[test]
     fn a_baseline_stamped_while_the_wal_is_pending_still_admits_the_folded_graph() {
         let tmp = tempfile::tempdir().unwrap();
-        let graph_path = tmp.path().join("graph");
-        let wal_path = tmp.path().join("graph.wal");
+        let ig = floorless_infigraph_dir(tmp.path());
+        let graph_path = ig.join("graph");
+        let wal_path = ig.join("graph.wal");
 
         // The state `stamp_healthy_graph_size_if_unset` actually fires in:
         // bare-schema base, real data still pending in the WAL.
         std::fs::write(&graph_path, vec![0u8; 4_096]).unwrap();
         std::fs::write(&wal_path, vec![0u8; 3_000_000]).unwrap();
-        stamp_healthy_graph_size(tmp.path(), &graph_path);
+        stamp_healthy_graph_size(&ig, &graph_path);
 
         assert_eq!(
-            read_healthy_size(tmp.path()),
+            read_healthy_size(&ig),
             Some(4_096 + 3_000_000),
             "the baseline must measure base + WAL -- the same quantity \
              check_graph_growth_ratio compares against"
@@ -1407,7 +1536,7 @@ mod tests {
         std::fs::write(&graph_path, vec![0u8; 3_004_096]).unwrap();
         std::fs::remove_file(&wal_path).unwrap();
         assert!(
-            check_graph_growth_ratio(tmp.path(), &graph_path).is_ok(),
+            check_graph_growth_ratio(&ig, &graph_path).is_ok(),
             "folding a WAL into the base image moves bytes without adding any; \
              a base-only baseline made that look like runaway growth"
         );

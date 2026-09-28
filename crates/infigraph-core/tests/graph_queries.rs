@@ -64,6 +64,23 @@ impl TestGraph {
         let store = GraphStore::open(&dir.path().join("graph")).expect("open store");
         Self { _dir: dir, store }
     }
+
+    /// A store inside a real `.infigraph` whose project config turns the
+    /// growth breaker's `growth_min_bytes` floor off, so a test can trip the
+    /// ratio with a small fixture graph.
+    fn floorless() -> Self {
+        let dir = tempfile::TempDir::new().expect("tmpdir");
+        let store = GraphStore::open(&floorless_infigraph_dir(dir.path()).join("graph"))
+            .expect("open store");
+        Self { _dir: dir, store }
+    }
+}
+
+fn floorless_infigraph_dir(root: &std::path::Path) -> std::path::PathBuf {
+    let ig = root.join(".infigraph");
+    std::fs::create_dir_all(&ig).unwrap();
+    std::fs::write(ig.join("config.toml"), "[graph]\ngrowth_min_bytes = 0\n").unwrap();
+    ig
 }
 
 /// #181: a graph read must not strip a quote that is part of the value.
@@ -1102,7 +1119,7 @@ fn fresh_extraction(tag: &str) -> Vec<FileExtraction> {
 /// such stretch, with the recorded baseline still reading 21MB afterwards.
 #[test]
 fn bulk_parquet_write_rechecks_growth_during_the_call() {
-    let tg = TestGraph::new();
+    let tg = TestGraph::floorless();
     let extractions = fixture_extractions();
 
     // A first write with no baseline recorded yet: nothing to compare
@@ -1147,7 +1164,7 @@ fn bulk_parquet_write_rechecks_growth_during_the_call() {
 /// is reachable directly (`upsert_folders_bulk`), so it needs the same gate.
 #[test]
 fn bulk_folder_write_rechecks_growth_during_the_call() {
-    let tg = TestGraph::new();
+    let tg = TestGraph::floorless();
     tg.store.upsert_all_parquet(&fixture_extractions()).unwrap();
 
     force_tiny_baseline(tg.store.db_dir().unwrap());
@@ -1175,17 +1192,18 @@ fn bulk_folder_write_rechecks_growth_during_the_call() {
 #[test]
 fn a_rebuild_at_a_side_path_is_measured_against_itself_not_the_graph_it_replaces() {
     let dir = tempfile::TempDir::new().unwrap();
+    let ig = floorless_infigraph_dir(dir.path());
 
     // The latched state: a large existing `graph` and a small baseline.
-    std::fs::write(dir.path().join("graph"), vec![0u8; 20_000_000]).unwrap();
+    std::fs::write(ig.join("graph"), vec![0u8; 20_000_000]).unwrap();
     std::fs::write(
-        dir.path().join("graph.health.json"),
+        ig.join("graph.health.json"),
         r#"{"healthy_size_bytes": 1000000}"#,
     )
     .unwrap();
 
     // The rebuild opens its own store beside it and writes there.
-    let store = GraphStore::open(&dir.path().join("graph.rebuilding")).unwrap();
+    let store = GraphStore::open(&ig.join("graph.rebuilding")).unwrap();
     store.upsert_all_parquet(&fixture_extractions()).expect(
         "a rebuild into a side path must be measured against that side path --          refusing it because the graph it replaces is over the cap makes the          documented remedy for a latched breaker impossible to run",
     );
