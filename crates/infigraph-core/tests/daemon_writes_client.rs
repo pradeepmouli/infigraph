@@ -82,6 +82,9 @@ fn a_cancelled_write_returns_promptly_and_its_waiter_goes() {
             )
         })
     };
+    // Held to the end either way: dropping it would answer the write. Only
+    // unix can see the client leave (`peer_closed`), so only unix reads it.
+    #[cfg_attr(not(unix), allow(unused_variables))]
     let reply = next_write(&rx);
     let cancelled_at = Instant::now();
     token.cancel();

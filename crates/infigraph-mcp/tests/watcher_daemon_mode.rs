@@ -399,6 +399,7 @@ fn write_stale_lock_payload(lock_path: &std::path::Path) {
     std::fs::write(lock_path, serde_json::to_string(&stale).unwrap()).unwrap();
 }
 
+#[cfg(unix)]
 fn write_watch_lock_payload(root: &std::path::Path, pid: u32, role: &str) {
     let ig = root.join(".infigraph");
     std::fs::create_dir_all(&ig).unwrap();
