@@ -187,7 +187,10 @@ pub fn current_process_start_time(pid: u32) -> Option<u64> {
     let spid = sysinfo::Pid::from_u32(pid);
     let mut sys = sysinfo::System::new();
     sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[spid]), true);
-    sys.process(spid).map(|p| p.start_time())
+    // A zombie has exited: it holds no lock and serves nothing. Linux still
+    // lists it until its parent reaps it, so without this a dead daemon's
+    // fault record or lock read as live (the ubuntu-only rebuild failure).
+    crate::ps::running_process(&sys, spid).map(|p| p.start_time())
 }
 
 impl InstanceInfo {
