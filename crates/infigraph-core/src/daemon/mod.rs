@@ -175,10 +175,11 @@ fn spawn_scip_enrich(
     cb: Arc<FullReindexCallback>,
     root: PathBuf,
     job: ScipEnrichJob,
+    submitter: coordinator_port::WriteSubmitter,
 ) -> Task<()> {
     let _guard = drain_rt.enter();
     Task::spawn_blocking(daemon_token, "scip-enrich", move |token| {
-        cb(root, job, token);
+        cb(root, job, token, submitter);
     })
 }
 
@@ -284,7 +285,9 @@ fn current_on_disk_build_hash() -> Option<String> {
 /// so it never needs the graph -- and holding the prism for that long kept
 /// its `Database` alive past `poison_watch_db`, which is how a reopen came to
 /// open a second `Database` on the same file (#166).
-pub type FullReindexCallback = dyn Fn(PathBuf, ScipEnrichJob, CancellationToken) + Send + Sync;
+pub type FullReindexCallback = dyn Fn(PathBuf, ScipEnrichJob, CancellationToken, coordinator_port::WriteSubmitter)
+    + Send
+    + Sync;
 
 /// Caller-supplied handle on doc-watching, which lives in `infigraph-docs`,
 /// a crate this one does not depend on. The coordinator dispatches
@@ -1272,6 +1275,7 @@ where
                             ast_generation,
                             scip_generation,
                         },
+                        coordinator_port::WriteSubmitter::new(port.clone()),
                     ));
                 }
             }
@@ -1358,6 +1362,7 @@ where
                                         ast_generation: ast,
                                         scip_generation: scip,
                                     },
+                                    coordinator_port::WriteSubmitter::new(port.clone()),
                                 ));
                             }
                             // An empty graph has nothing to enrich; leave the
@@ -1480,12 +1485,15 @@ where
         // arm, and this coordinator is deliberately synchronous.
         if serve_requests {
             // R3.1.4a/c: translate a pending dead-holder-WAL sentinel into a
-            // synthetic FullReindex request (or a crash-loop refusal) before
-            // scanning for requests below, so this same tick's scan picks
-            // the synthetic request up immediately rather than waiting a
-            // full COORDINATOR_TICK.
-            if let Err(e) = crate::recovery::drain_recovery_sentinel(&infigraph_dir) {
-                eprintln!("[watch] recovery-sentinel handling failed: {e}");
+            // queued FullReindex (or a crash-loop refusal) before routing the
+            // deferred writes below, so this same tick starts it rather than
+            // waiting a full COORDINATOR_TICK.
+            match crate::recovery::drain_recovery_sentinel(&infigraph_dir) {
+                Ok(true) => {
+                    request_internal_rebuild(&mut deferred, full_reindex_in_flight.is_some())
+                }
+                Ok(false) => {}
+                Err(e) => eprintln!("[watch] recovery-sentinel handling failed: {e}"),
             }
 
             // #183: scheduled compaction. Deliberately inside `serve_requests`
@@ -1561,9 +1569,10 @@ where
                                 "[daemon] compaction: requesting a rebuild ({})",
                                 if escalate { "escalated" } else { "drift" }
                             );
-                            if let Err(e) = submit_compaction_rebuild(&infigraph_dir) {
-                                eprintln!("[daemon] compaction: could not submit rebuild: {e}");
-                            }
+                            request_internal_rebuild(
+                                &mut deferred,
+                                full_reindex_in_flight.is_some(),
+                            );
                         }
                         Err(e) => eprintln!("[daemon] compaction: skipped, {e}"),
                     }
@@ -2569,25 +2578,26 @@ fn escalation_due(infigraph_dir: &Path, graph_path: &Path) -> bool {
             .saturating_mul(cfg.compaction_escalate_pct)
 }
 
-/// Ask the coordinator to rebuild, the same way `drain_recovery_sentinel`
-/// does: drop a `WriteRequest::FullReindex` into the requests directory, for
-/// this same tick's scan to pick up. Submitting no new *kind* of write is
-/// what keeps single-writer true by construction (#183).
+/// Queue a rebuild the daemon asked for itself (compaction, auto-recovery),
+/// unless one is already waiting or running -- the same collapsing the fixed
+/// `compaction.request` file name used to give for free (#204). A client's
+/// waiting `FullReindex` counts: it rebuilds the same tree. Queuing a
+/// `FullReindex` rather than any new *kind* of write is what keeps
+/// single-writer true by construction (#183).
 ///
-/// Deliberately does NOT call `recovery::record_recovery_attempt`. That
-/// budget protects corruption recovery, which is not discretionary; a
-/// compaction rebuild spending it could leave a genuinely corrupt graph
-/// unrecovered. Compaction rate-limits itself through `stamped_at` in its
-/// own sidecar -- see `graph::compaction::MIN_REBUILD_INTERVAL`.
-///
-/// Errors propagate rather than being swallowed, unlike
-/// `stamp_compaction_baseline`: a lost baseline costs one re-measured cycle,
-/// a lost submission costs the rebuild itself, so the caller logs it.
-fn submit_compaction_rebuild(infigraph_dir: &Path) -> Result<()> {
-    let request_path = infigraph_dir.join("requests").join("compaction.request");
-    let serialized = serde_json::to_string(&crate::daemon_protocol::WriteRequest::FullReindex)
-        .expect("WriteRequest::FullReindex always serializes");
-    crate::daemon_protocol::write_atomic(&request_path, &serialized)
+/// Records no `recovery::record_recovery_attempt` for compaction: that
+/// budget protects corruption recovery, which is not discretionary.
+/// Compaction rate-limits itself through `stamped_at` in its own sidecar --
+/// see `graph::compaction::MIN_REBUILD_INTERVAL`.
+fn request_internal_rebuild(deferred: &mut VecDeque<(WriteRequest, WriteReply)>, running: bool) {
+    if running
+        || deferred
+            .iter()
+            .any(|(r, _)| *r == WriteRequest::FullReindex)
+    {
+        return;
+    }
+    deferred.push_back((WriteRequest::FullReindex, WriteReply::internal()));
 }
 
 /// Loop-thread entry point for a `WriteRequest::ScipImport`. Mirrors
@@ -4115,6 +4125,25 @@ mod tests {
 
     /// #204 D3: a write that cannot start yet waits in `deferred`; once its
     /// client has left, it is dropped rather than started.
+    #[test]
+    fn internal_rebuilds_collapse_while_one_is_waiting_or_running() {
+        let mut deferred = VecDeque::new();
+        request_internal_rebuild(&mut deferred, false);
+        request_internal_rebuild(&mut deferred, false);
+        assert_eq!(
+            deferred.len(),
+            1,
+            "one waiting rebuild absorbs the next request"
+        );
+        let mut deferred = VecDeque::new();
+        request_internal_rebuild(&mut deferred, true);
+        assert!(deferred.is_empty(), "a running rebuild absorbs it too");
+        let (client, _rx) = WriteReply::channel();
+        let mut deferred = VecDeque::from([(WriteRequest::FullReindex, client)]);
+        request_internal_rebuild(&mut deferred, false);
+        assert_eq!(deferred.len(), 1, "a client's waiting rebuild counts");
+    }
+
     #[test]
     fn a_deferred_write_whose_client_left_is_dropped_not_started() {
         let tmp = tempfile::tempdir().unwrap();

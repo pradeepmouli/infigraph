@@ -1509,17 +1509,12 @@ fn a_third_recovery_trigger_inside_the_window_trips_the_crash_loop_breaker_inste
     )
     .unwrap();
 
-    infigraph_core::recovery::drain_recovery_sentinel(&infigraph_dir).unwrap();
-
+    assert!(
+        !infigraph_core::recovery::drain_recovery_sentinel(&infigraph_dir).unwrap(),
+        "must not ask for another FullReindex once tripped"
+    );
     assert!(
         infigraph_core::recovery::crash_loop_detected(&infigraph_dir).is_some(),
         "breaker must trip at the threshold"
-    );
-    let requests: usize = std::fs::read_dir(infigraph_dir.join("requests"))
-        .map(|d| d.count())
-        .unwrap_or(0);
-    assert_eq!(
-        requests, 0,
-        "must not submit another FullReindex once tripped"
     );
 }

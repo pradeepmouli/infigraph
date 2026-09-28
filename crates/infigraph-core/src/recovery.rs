@@ -204,14 +204,13 @@ pub fn find_most_recent_previous(infigraph_dir: &Path, graph_name: &str) -> Opti
 
 /// The daemon coordinator's one-line integration point (called from
 /// `daemon::run_write_coordinator`'s `serve_requests` tick). No-op when no
-/// sentinel is pending. Otherwise: under the crash-loop threshold, submits
-/// a synthetic `WriteRequest::FullReindex` request file (the SAME request
-/// type and code path `infigraph rebuild` uses) for this same tick's
-/// existing request-directory scan to pick up; at or over the threshold,
-/// writes the crash-loop marker instead and submits nothing.
-pub fn drain_recovery_sentinel(infigraph_dir: &Path) -> Result<()> {
+/// sentinel is pending. Otherwise: under the crash-loop threshold, answers
+/// `true` -- the coordinator then queues a `FullReindex`, the same request
+/// type and code path `infigraph rebuild` uses (#204); at or over the
+/// threshold, writes the crash-loop marker instead and answers `false`.
+pub fn drain_recovery_sentinel(infigraph_dir: &Path) -> Result<bool> {
     if !pending_recovery(infigraph_dir) {
-        return Ok(());
+        return Ok(false);
     }
 
     let attempts = recent_recovery_attempts(infigraph_dir)?;
@@ -223,14 +222,10 @@ pub fn drain_recovery_sentinel(infigraph_dir: &Path) -> Result<()> {
             &format!("{} auto-rebuilds within the last hour", attempts.len()),
             &infigraph_dir.display().to_string(),
         );
-        return clear_recovery_needed(infigraph_dir);
+        clear_recovery_needed(infigraph_dir)?;
+        return Ok(false);
     }
 
-    let requests_dir = infigraph_dir.join("requests");
-    let request_path = requests_dir.join("auto-recovery.request");
-    let serialized = serde_json::to_string(&crate::daemon_protocol::WriteRequest::FullReindex)
-        .expect("WriteRequest::FullReindex always serializes");
-    crate::daemon_protocol::write_atomic(&request_path, &serialized)?;
     record_recovery_attempt(infigraph_dir)?;
     crate::audit::audit_log(
         "recovery",
@@ -238,7 +233,8 @@ pub fn drain_recovery_sentinel(infigraph_dir: &Path) -> Result<()> {
         "dead-holder WAL quarantined; auto-rebuild triggered",
         &infigraph_dir.display().to_string(),
     );
-    clear_recovery_needed(infigraph_dir)
+    clear_recovery_needed(infigraph_dir)?;
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -321,17 +317,12 @@ mod tests {
         let dir = tmp.path();
         mark_recovery_needed(dir, 1, &dir.join("graph.corrupt.1")).unwrap();
 
-        drain_recovery_sentinel(dir).unwrap();
+        assert!(drain_recovery_sentinel(dir).unwrap(), "a rebuild is wanted");
 
         assert!(!pending_recovery(dir), "sentinel must be cleared");
-        let requested: Vec<_> = std::fs::read_dir(dir.join("requests"))
-            .unwrap()
-            .flatten()
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .collect();
         assert!(
-            requested.iter().any(|n| n.ends_with(".request")),
-            "expected a .request file, got {requested:?}"
+            !dir.join("requests").exists(),
+            "and no file is written for it"
         );
         assert_eq!(recent_recovery_attempts(dir).unwrap().len(), 1);
         assert!(crash_loop_detected(dir).is_none());
@@ -346,19 +337,15 @@ mod tests {
         }
         mark_recovery_needed(dir, 1, &dir.join("graph.corrupt.99")).unwrap();
 
-        drain_recovery_sentinel(dir).unwrap();
+        assert!(
+            !drain_recovery_sentinel(dir).unwrap(),
+            "no rebuild once tripped"
+        );
 
         assert!(!pending_recovery(dir), "sentinel must still be cleared");
         assert!(
             crash_loop_detected(dir).is_some(),
             "must trip after CRASH_LOOP_THRESHOLD prior attempts in the window"
-        );
-        let requested = std::fs::read_dir(dir.join("requests"))
-            .map(|d| d.count())
-            .unwrap_or(0);
-        assert_eq!(
-            requested, 0,
-            "must NOT submit another FullReindex once tripped"
         );
     }
 
