@@ -621,7 +621,7 @@ fn end_daemon_if(
     let mut sys = sysinfo::System::new();
     sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[spid]), true);
 
-    let Some(proc) = sys.process(spid) else {
+    let Some(proc) = running_process(&sys, spid) else {
         // PID isn't running at all -- the lock is simply stale (the holder
         // crashed or was killed without releasing it). Nothing to signal;
         // the caller's retry-acquire will pick up the now-free lock.
@@ -728,12 +728,24 @@ fn wait_for_pid_exit(
 ) -> bool {
     for _ in 0..attempts {
         sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
-        if sys.process(pid).is_none() {
+        if running_process(sys, pid).is_none() {
             return true;
         }
         std::thread::sleep(delay);
     }
     false
+}
+
+/// `pid`'s entry in `sys`, unless it has already exited. A zombie has: it
+/// holds no files and no locks, only a process-table slot until its parent
+/// reaps it. Linux lists zombies (`/proc/<pid>` stays until the reap) where
+/// macOS drops them, so without this filter a daemon whose parent never
+/// waits on it -- `spawn_daemon` drops its `Child`, so a long-lived MCP
+/// server that started one never reaps it -- reads as still running long
+/// after it exited, and `rebuild` reports it stuck.
+fn running_process(sys: &sysinfo::System, pid: sysinfo::Pid) -> Option<&sysinfo::Process> {
+    sys.process(pid)
+        .filter(|p| p.status() != sysinfo::ProcessStatus::Zombie)
 }
 
 /// Build (without spawning) the `Command` used to launch a detached
@@ -1105,6 +1117,27 @@ mod tests {
         assert!(
             wait_for_pid_exit(pid, &mut sys, 5, std::time::Duration::from_millis(10)),
             "an already-exited (and reaped) PID must be reported as gone on the first check"
+        );
+    }
+
+    /// An exited child its parent has not reaped yet is gone: Linux still
+    /// lists the zombie, and treating it as running is how `rebuild` called
+    /// a daemon that had exited on its SIGTERM "stuck" whenever the
+    /// daemon's parent had not waited on it (CI, ubuntu only).
+    #[test]
+    #[cfg(unix)]
+    fn wait_for_pid_exit_treats_an_unreaped_child_as_gone() {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = sysinfo::Pid::from_u32(child.id());
+        // Let it exit without reaping it, so it stays a zombie.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let mut sys = sysinfo::System::new();
+
+        let gone = wait_for_pid_exit(pid, &mut sys, 5, std::time::Duration::from_millis(10));
+        child.wait().unwrap();
+        assert!(
+            gone,
+            "an exited but unreaped child must be reported as gone"
         );
     }
 
