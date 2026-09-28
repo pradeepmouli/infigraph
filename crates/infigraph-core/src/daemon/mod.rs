@@ -705,6 +705,15 @@ where
             if swept > 0 {
                 eprintln!("[read] swept {swept} read endpoint(s) left by daemons that are gone");
             }
+            // #204: write sidecars whose client died before this daemon read them.
+            let swept = crate::scratch::sweep_older_than(
+                &root.join(".infigraph").join(writes::SIDECAR_DIR),
+                SIDECAR_STALE_AFTER,
+                &["json", "arrow"],
+            );
+            if swept > 0 {
+                eprintln!("[daemon] swept {swept} write sidecar(s) left by clients that are gone");
+            }
 
             let root = root.to_path_buf();
             let liveness = liveness.clone();
@@ -872,8 +881,8 @@ where
         crate::daemon_protocol::WriteRequest,
         coordinator_port::WriteReply,
     )> = std::collections::VecDeque::new();
-    // #204 transitional: answers owed to file-drop clients, as `.result` files.
-    let mut file_replies: Vec<(mpsc::Receiver<WriteResult>, PathBuf)> = Vec::new();
+    // The first tick sweeps: a pre-#204 client may be waiting already.
+    let mut last_legacy_sweep = std::time::Instant::now() - LEGACY_SWEEP_INTERVAL;
     // #183: when the per-table compaction drift was last sampled. `None`
     // until the first sample, so the first idle tick measures immediately
     // rather than waiting out a full interval.
@@ -1475,15 +1484,10 @@ where
             }
         }
 
-        // Serve file-dropped write requests -- daemon-mode only (never from
-        // in-process MCP watcher threads, which always pass
-        // serve_requests=false). Piggybacks on this loop's `COORDINATOR_TICK`
-        // cadence rather than a separate notify-based watch on the requests
-        // directory -- submit_write_request's own poll-with-backoff starts at
-        // 10ms and only reaches 200ms after several rounds, so this cadence
-        // is fine. The spec's event-driven upgrade (a second `notify::Watcher`
-        // scoped to `.infigraph/requests/`) is deferred: it needs a `select!`
-        // arm, and this coordinator is deliberately synchronous.
+        // Serve writes -- daemon-mode only (never from in-process MCP watcher
+        // threads, which always pass serve_requests=false). A write arrives on
+        // the port (#204) and wakes the `recv_timeout` at the bottom of this
+        // loop at once; it is routed here, with everything else deferred.
         if serve_requests {
             // R3.1.4a/c: translate a pending dead-holder-WAL sentinel into a
             // queued FullReindex (or a crash-loop refusal) before routing the
@@ -1580,48 +1584,13 @@ where
                 }
             }
 
-            // #204 transitional: a `.request` file becomes a deferred write
-            // whose answer goes back as its `.result`. Deleted with the
-            // file-drop path.
-            let requests_dir = infigraph_dir.join("requests");
-            if let Ok(entries) = std::fs::read_dir(&requests_dir) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.extension().is_none_or(|ext| ext != "request") {
-                        continue;
-                    }
-                    // A write is activity (#38): a CLI that only writes
-                    // keeps the daemon up through its grace too.
-                    liveness.touch();
-                    if crate::daemon_protocol::request_client_is_gone(&path) {
-                        eprintln!(
-                            "[daemon] discarding {}: the client that sent it has exited",
-                            path.display()
-                        );
-                        crate::daemon_protocol::discard_request(&path);
-                        continue;
-                    }
-                    let Ok(contents) = std::fs::read_to_string(&path) else {
-                        continue;
-                    };
-                    let result_path = path.with_extension("result");
-                    std::fs::remove_file(&path).ok();
-                    match serde_json::from_str::<WriteRequest>(&contents) {
-                        Ok(request) => {
-                            let (reply, rx) = WriteReply::channel();
-                            file_replies.push((rx, result_path));
-                            deferred.push_back((request, reply));
-                        }
-                        Err(e) => {
-                            let result = WriteResult::Err {
-                                message: format!("failed to read/parse request: {e}"),
-                            };
-                            let _ = crate::daemon_protocol::write_atomic(
-                                &result_path,
-                                &serde_json::to_string(&result).unwrap_or_default(),
-                            );
-                        }
-                    }
+            if last_legacy_sweep.elapsed() >= LEGACY_SWEEP_INTERVAL {
+                last_legacy_sweep = std::time::Instant::now();
+                let refused = refuse_legacy_requests(&infigraph_dir);
+                if refused > 0 {
+                    eprintln!(
+                        "[daemon] refused {refused} file-drop request(s) from a pre-#204 client"
+                    );
                 }
             }
 
@@ -1655,14 +1624,12 @@ where
                     Routed::NotYet(request, reply) => deferred.push_back((request, reply)),
                 }
             }
-            flush_file_replies(&mut file_replies);
         } else if crate::recovery::pending_recovery(&infigraph_dir) {
             // A pending sentinel asks for a full reindex, and only the
-            // request-serving branch above can grant it: the drain works by
-            // writing a `FullReindex` request file that nothing else
-            // consumes. Draining it here would clear the sentinel and leave
-            // the request unread -- strictly worse than not draining, since
-            // the signal would be gone.
+            // request-serving branch above can grant it: draining it queues
+            // a `FullReindex` that only a daemon routes. Draining it here
+            // would clear the sentinel and queue nothing -- strictly worse
+            // than not draining, since the signal would be gone.
             //
             // So say so instead of failing silently. A project watched only
             // by an in-process MCP thread otherwise sits with a quarantined
@@ -1894,9 +1861,9 @@ where
     // Cancel before waiting, not just wait: the callback's indexer runner
     // checks its token between launches, so a shutdown that lands mid-run
     // stops starting further multi-minute indexers instead of finishing
-    // the whole set first. (Its `submit_write_request` poll does not yet
-    // observe the token -- an import request it has already dropped for a
-    // loop that no longer serves it still waits out that call's timeout.)
+    // the whole set first. Its import wait (`WriteSubmitter::submit`)
+    // observes the same token, so an import this loop will no longer serve
+    // ends at once instead of holding the join (#138, #204).
     if let Some(in_flight) = scip_in_flight.take() {
         drain_rt.block_on(in_flight.stop());
     }
@@ -1914,8 +1881,6 @@ where
         );
         drop(guard);
     }
-    // #204 transitional: the last answers file-drop clients are owed.
-    flush_file_replies(&mut file_replies);
 
     Ok(())
 }
@@ -2214,16 +2179,14 @@ fn settle_idle_fold(
     }
 }
 
-/// Serves a single `.request` file via `serve_one_request`, wrapped in the
-/// same `index.lock` acquisition (`begin_index_op`) the pre-`IndexWorkQueue`
-/// per-request loop used. `route_or_serve_request`'s in-scope `WriteRequest`
-/// variants are coordinated through the shared queue and drain step instead,
-/// but its fallback paths (out-of-scope variants, malformed JSON, corrupt
-/// sibling extractions files) still execute immediately here -- doing so
-/// unlocked would let them race the periodic reindex, the queue's own drain,
-/// or a concurrent CLI `infigraph rebuild`, violating the single-writer
-/// invariant. On contention the `.request` file is left in place (not
-/// deleted) so it's retried on a later tick, matching the old behavior.
+/// Serves one write via `serve_write`, wrapped in the same `index.lock`
+/// acquisition (`begin_index_op`) the pre-`IndexWorkQueue` per-request loop
+/// used. `route_write`'s index-shaped variants are coordinated through the
+/// shared queue and drain step instead, but everything else executes
+/// immediately here -- doing so unlocked would let it race the periodic
+/// reindex, the queue's own drain, or a concurrent CLI `infigraph rebuild`,
+/// violating the single-writer invariant. On contention the reply is handed
+/// back and the write stays deferred, retried on a later tick.
 /// Does nothing while this daemon's own drain is in flight. That drain holds
 /// `index.lock` until the loop thread reaps it -- so blocking here to wait
 /// for that lock would park the only thread that can release it, a
@@ -2348,7 +2311,7 @@ struct PendingScipImport {
     indexer_label: Option<String>,
 }
 
-/// What `route_or_serve_request` hands back to the coordinator's main loop:
+/// What `route_write` starts for the coordinator's main loop to track:
 /// either kind of background work it might have started this tick, so the
 /// loop can track and reap whichever one it is on a later tick. The two
 /// kinds are tracked as separate `Option` fields in the loop's own state
@@ -2440,7 +2403,7 @@ fn build_full_reindex(
 }
 
 /// Loop-thread entry point for a `WriteRequest::FullReindex` when none is
-/// running (`route_or_serve_request` joins one that is, #164). Does the
+/// running (`route_write` joins one that is, #164). Does the
 /// cheap, synchronous gating (never overlap a queue drain -- both write the
 /// same live graph) and, if clear, acquires
 /// `index.lock` and hands the expensive build off to `drain_rt` so this loop
@@ -3454,20 +3417,40 @@ fn drop_gone(deferred: &mut VecDeque<(WriteRequest, WriteReply)>) -> usize {
     before - deferred.len()
 }
 
-/// #204 transitional: write out every answer a file-drop client is owed.
-/// Deleted with the file-drop path.
-fn flush_file_replies(file_replies: &mut Vec<(mpsc::Receiver<WriteResult>, PathBuf)>) {
-    file_replies.retain(|(rx, result_path)| match rx.try_recv() {
-        Ok(result) => {
-            let _ = crate::daemon_protocol::write_atomic(
-                result_path,
-                &serde_json::to_string(&result).unwrap_or_default(),
-            );
-            false
+/// How often the daemon answers file-drop requests from pre-#204 clients.
+/// Well under the 30s those clients wait for control and the minutes they
+/// wait for writes, so they fail fast instead of timing out.
+const LEGACY_SWEEP_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Age past which a write sidecar is assumed orphaned by a client that died
+/// before the daemon read it. Matches the SCIP scratch backstop.
+const SIDECAR_STALE_AFTER: Duration = Duration::from_secs(6 * 3600);
+
+/// Answer every file-drop request a pre-#204 client left in `requests/` with
+/// an error naming this build, and remove it (#204 D5). Remove one release
+/// after #204 ships: by then no such client remains.
+fn refuse_legacy_requests(infigraph_dir: &Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(infigraph_dir.join("requests")) else {
+        return 0;
+    };
+    let result = WriteResult::Err {
+        message: format!(
+            "this daemon (build {}) no longer accepts file-drop requests; restart the client \
+             (MCP: /mcp reconnect)",
+            crate::build_hash()
+        ),
+    };
+    let json = serde_json::to_string(&result).expect("WriteResult::Err always serializes");
+    let mut refused = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_some_and(|ext| ext == "request") {
+            let _ = crate::daemon_protocol::write_atomic(&path.with_extension("result"), &json);
+            std::fs::remove_file(&path).ok();
+            refused += 1;
         }
-        Err(mpsc::TryRecvError::Empty) => true,
-        Err(mpsc::TryRecvError::Disconnected) => false,
-    });
+    }
+    refused
 }
 
 /// Answers a `WatchControl` request. Same `write_atomic`/`WriteResult`
@@ -3588,7 +3571,7 @@ mod tests {
     use super::*;
     use protobuf::Message as _;
 
-    /// Everything `route_or_serve_request` needs, for tests that route
+    /// Everything `route_write` needs, for tests that route
     /// requests without a coordinator loop.
     struct Router {
         root: PathBuf,

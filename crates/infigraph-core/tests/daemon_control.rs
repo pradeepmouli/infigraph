@@ -211,11 +211,44 @@ fn a_legacy_watch_control_request_file_gets_a_prompt_error() {
     }
     let reply = std::fs::read_to_string(&result).expect("a prompt reply, not a 30s client timeout");
     assert!(reply.contains("Err"), "{reply}");
+    assert!(
+        reply.contains("no longer accepts file-drop requests"),
+        "{reply}"
+    );
     std::thread::sleep(Duration::from_millis(300));
     assert!(
         !d.handle.is_finished(),
         "a legacy stop must not be honoured"
     );
+    stop(d);
+}
+
+/// A pre-#204 client drops any write as a file. The daemon answers it within
+/// one sweep with an error naming its build, and removes it.
+#[test]
+fn a_legacy_write_request_file_gets_a_prompt_error_naming_the_build() {
+    let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let d = start(dir.path());
+    let requests = dir.path().join(".infigraph").join("requests");
+    std::fs::create_dir_all(&requests).unwrap();
+    infigraph_core::daemon_protocol::write_atomic(
+        &requests.join("1-2-3.request"),
+        r#""FullReindex""#,
+    )
+    .unwrap();
+    let result = requests.join("1-2-3.result");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !result.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let reply = std::fs::read_to_string(&result).expect("a reply within one sweep");
+    assert!(
+        reply.contains("no longer accepts file-drop requests"),
+        "{reply}"
+    );
+    assert!(reply.contains(infigraph_core::build_hash()), "{reply}");
+    assert!(!requests.join("1-2-3.request").exists());
     stop(d);
 }
 

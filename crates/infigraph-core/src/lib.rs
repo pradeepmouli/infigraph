@@ -44,6 +44,7 @@ pub mod resolve;
 pub mod review;
 pub mod routes;
 pub mod scip;
+pub mod scratch;
 pub mod search;
 pub mod security;
 pub mod sequence;
@@ -756,10 +757,10 @@ impl Infigraph {
 
     /// A full reindex is the most expensive operation in the write
     /// protocol -- on a large repo it can legitimately run for many
-    /// minutes. `submit_write_request`'s timeout is a hard deadline (the
-    /// daemon only writes its `.result` once the whole index finishes), so
-    /// a tight budget here would abort a *working* reindex partway and
-    /// report it as "no daemon responded".
+    /// minutes. `daemon::writes::submit`'s timeout is a hard deadline (the
+    /// daemon only answers once the whole index finishes), so a tight budget
+    /// here would abort a *working* reindex partway and report it as a
+    /// timeout.
     const DAEMON_FULL_REINDEX_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
     /// A scoped `index_files` call is normally a watcher-sized batch, so a
     /// shorter budget still can't truncate real work but surfaces a dead
