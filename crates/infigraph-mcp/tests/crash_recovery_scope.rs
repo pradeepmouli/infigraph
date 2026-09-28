@@ -17,6 +17,10 @@ use std::time::{Duration, Instant};
 
 const GRAPH_BYTES: &[u8] = b"a graph the crash must not touch";
 
+/// How long the test waits on any one process transition: a worker
+/// registering, the supervisor exiting, or a SIGSEGV'd worker going away.
+const PATIENCE: Duration = Duration::from_secs(60);
+
 struct Fixture {
     _tmp: tempfile::TempDir,
     startup: PathBuf,
@@ -113,8 +117,8 @@ fn next_worker(f: &mut Fixture, not: Option<u32>) -> Result<u32, ExitStatus> {
             return Err(status);
         }
         assert!(
-            start.elapsed() < Duration::from_secs(60),
-            "neither a new worker nor a supervisor exit within 60s:\n{}",
+            start.elapsed() < PATIENCE,
+            "neither a new worker nor a supervisor exit within {PATIENCE:?}:\n{}",
             std::fs::read_to_string(&f.log).unwrap_or_default()
         );
         std::thread::sleep(Duration::from_millis(100));
@@ -128,15 +132,27 @@ fn next_worker(f: &mut Fixture, not: Option<u32>) -> Result<u32, ExitStatus> {
 /// disposition and returns, relying on the faulting instruction to fault
 /// again. A signal from `kill(2)` has no faulting instruction, so the first
 /// one is swallowed and only the next one kills.
+///
+/// Nor is a fatal signal a prompt exit. SIGSEGV's default action dumps core,
+/// and GitHub's Ubuntu runners install `systemd-coredump`, a pipe
+/// `core_pattern`: the kernel streams the whole image to it and holds the
+/// dying worker -- still a live pid to `kill(2)` -- until the helper has read
+/// it all. So keep signalling until the pid is gone, not for a fixed count;
+/// a signal after the fatal one is discarded.
 fn segfault(pid: u32) {
-    for _ in 0..5 {
-        // SAFETY: plain kill(2) on a worker this test's own supervisor spawned.
-        if unsafe { libc::kill(pid as libc::pid_t, libc::SIGSEGV) } != 0 {
-            return; // gone
+    let start = Instant::now();
+    // SAFETY: plain kill(2) on a worker this test's own supervisor spawned.
+    while unsafe { libc::kill(pid as libc::pid_t, libc::SIGSEGV) } == 0 {
+        if start.elapsed() > PATIENCE {
+            let ps = Command::new("ps")
+                .args(["-o", "stat=", "-p", &pid.to_string()])
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .unwrap_or_default();
+            panic!("worker {pid} survived SIGSEGV for {PATIENCE:?} (ps stat: {ps:?})");
         }
         std::thread::sleep(Duration::from_millis(300));
     }
-    panic!("worker {pid} survived repeated SIGSEGV");
 }
 
 /// Whether `project`'s graph is still exactly the fixture's bytes.
