@@ -2518,6 +2518,7 @@ dependencies = [
  "tree-sitter-rust",
  "ureq 2.12.1",
  "usearch",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
