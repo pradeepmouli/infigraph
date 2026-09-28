@@ -125,27 +125,15 @@ pub enum WriteRequest {
 }
 
 impl WriteRequest {
-    /// The variant's name, for messages.
-    pub fn kind(&self) -> &'static str {
-        match self {
-            WriteRequest::Index { .. } => "Index",
-            WriteRequest::ScipImport { .. } => "ScipImport",
-            WriteRequest::IngestStructured { .. } => "IngestStructured",
-            WriteRequest::UpsertRepo { .. } => "UpsertRepo",
-            WriteRequest::DeriveTestedBy { .. } => "DeriveTestedBy",
-            WriteRequest::UpsertSimilarEdge { .. } => "UpsertSimilarEdge",
-            WriteRequest::WriteCallsServiceEdges { .. } => "WriteCallsServiceEdges",
-            WriteRequest::WriteCrossServiceEdges { .. } => "WriteCrossServiceEdges",
-            WriteRequest::UpsertDependencies { .. } => "UpsertDependencies",
-            WriteRequest::ReplaceConcerns { .. } => "ReplaceConcerns",
-            WriteRequest::ReplaceTaintFlows { .. } => "ReplaceTaintFlows",
-            WriteRequest::ReplaceResolvesTo { .. } => "ReplaceResolvesTo",
-            WriteRequest::StoreClusters { .. } => "StoreClusters",
-            WriteRequest::StoreConfigBindings { .. } => "StoreConfigBindings",
-            WriteRequest::UpsertFilesBulk { .. } => "UpsertFilesBulk",
-            WriteRequest::RemoveFiles { .. } => "RemoveFiles",
-            WriteRequest::ResolveCalls { .. } => "ResolveCalls",
-            WriteRequest::FullReindex => "FullReindex",
+    /// The variant's name, for messages -- read back from serde's own
+    /// externally tagged encoding, so it cannot drift from the variants.
+    pub fn kind(&self) -> String {
+        match serde_json::to_value(self) {
+            Ok(serde_json::Value::String(unit)) => unit,
+            Ok(serde_json::Value::Object(map)) => {
+                map.into_iter().next().map(|(k, _)| k).unwrap_or_default()
+            }
+            _ => "write".to_string(),
         }
     }
 }
@@ -336,6 +324,20 @@ mod atomic_write_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_write_requests_kind_is_its_variant_name() {
+        assert_eq!(WriteRequest::FullReindex.kind(), "FullReindex");
+        assert_eq!(WriteRequest::Index { paths: None }.kind(), "Index");
+        assert_eq!(
+            WriteRequest::ScipImport {
+                scip_path: "i.scip".into(),
+                enriched_ast_generation: None
+            }
+            .kind(),
+            "ScipImport"
+        );
+    }
 
     #[test]
     fn write_request_index_round_trips_through_json() {

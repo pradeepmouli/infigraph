@@ -1586,11 +1586,15 @@ where
 
             if last_legacy_sweep.elapsed() >= LEGACY_SWEEP_INTERVAL {
                 last_legacy_sweep = std::time::Instant::now();
-                let refused = refuse_legacy_requests(&infigraph_dir);
-                if refused > 0 {
+                let sweep = refuse_legacy_requests(&infigraph_dir);
+                if sweep.refused > 0 {
                     eprintln!(
-                        "[daemon] refused {refused} file-drop request(s) from a pre-#204 client"
+                        "[daemon] refused {} file-drop request(s) from a pre-#204 client",
+                        sweep.refused
                     );
+                }
+                if sweep.rebuild_wanted {
+                    request_internal_rebuild(&mut deferred, full_reindex_in_flight.is_some());
                 }
             }
 
@@ -1880,7 +1884,7 @@ where
     // all) before the process exits under it.
     if !port.wait_idle(Duration::from_secs(2)) {
         eprintln!(
-            "[control] {} control reply(s) still in flight at shutdown",
+            "[daemon] {} connection thread(s) still replying at shutdown",
             port.in_flight()
         );
     }
@@ -3457,12 +3461,29 @@ const LEGACY_SWEEP_INTERVAL: Duration = Duration::from_secs(2);
 /// before the daemon read it. Matches the SCIP scratch backstop.
 const SIDECAR_STALE_AFTER: Duration = Duration::from_secs(6 * 3600);
 
+/// What one legacy sweep found.
+#[derive(Debug, Default)]
+struct LegacySweep {
+    /// Pre-#204 client requests answered with an error.
+    refused: usize,
+    /// A pre-#204 daemon left its own rebuild request (compaction or
+    /// auto-recovery), which is kept as a rebuild rather than refused.
+    rebuild_wanted: bool,
+}
+
+/// The names a pre-#204 daemon gave its own rebuild requests.
+const LEGACY_INTERNAL_REQUESTS: [&str; 2] = ["compaction.request", "auto-recovery.request"];
+
 /// Answer every file-drop request a pre-#204 client left in `requests/` with
-/// an error naming this build, and remove it (#204 D5). Remove one release
-/// after #204 ships: by then no such client remains.
-fn refuse_legacy_requests(infigraph_dir: &Path) -> usize {
-    let Ok(entries) = std::fs::read_dir(infigraph_dir.join("requests")) else {
-        return 0;
+/// an error naming this build, and remove it with its sidecars (#204 D5). A
+/// pre-#204 daemon's own rebuild requests are not a client's: they become a
+/// rebuild, so an upgrade does not lose one. Remove one release after #204
+/// ships: by then no such client or daemon remains.
+fn refuse_legacy_requests(infigraph_dir: &Path) -> LegacySweep {
+    let mut sweep = LegacySweep::default();
+    let dir = infigraph_dir.join("requests");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return sweep;
     };
     let result = WriteResult::Err {
         message: format!(
@@ -3472,16 +3493,46 @@ fn refuse_legacy_requests(infigraph_dir: &Path) -> usize {
         ),
     };
     let json = serde_json::to_string(&result).expect("WriteResult::Err always serializes");
-    let mut refused = 0;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().is_some_and(|ext| ext == "request") {
+    let requests: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|ext| ext == "request"))
+        .collect();
+    for path in requests {
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or_default();
+        if LEGACY_INTERNAL_REQUESTS.contains(&name) {
+            sweep.rebuild_wanted = true;
+        } else {
             let _ = crate::daemon_protocol::write_atomic(&path.with_extension("result"), &json);
-            std::fs::remove_file(&path).ok();
-            refused += 1;
+            sweep.refused += 1;
+        }
+        std::fs::remove_file(&path).ok();
+        remove_legacy_sidecars(&dir, &path);
+    }
+    sweep
+}
+
+/// Remove a legacy request's sidecars (`<name>.extractions.json`,
+/// `<name>.edges.arrow`, `<name>.data.json`) -- every file sharing its
+/// name, except the reply its client may still read.
+fn remove_legacy_sidecars(dir: &Path, request: &Path) {
+    let Some(stem) = request.file_stem().and_then(|s| s.to_str()) else {
+        return;
+    };
+    let prefix = format!("{stem}.");
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with(&prefix) && !name.ends_with(".result") {
+            std::fs::remove_file(entry.path()).ok();
         }
     }
-    refused
 }
 
 /// Answers a `WatchControl` request. Same `write_atomic`/`WriteResult`
@@ -4176,6 +4227,42 @@ mod tests {
         }
         assert!(deferred.is_empty());
         assert!(queue.lock().unwrap().drain().waiters.is_empty());
+    }
+
+    /// Review minors (#204): a pre-#204 client's request is refused with its
+    /// sidecars removed; a pre-#204 *daemon's* own rebuild requests are not
+    /// refused but become a rebuild, so an upgrade does not lose them.
+    #[test]
+    fn the_legacy_sweep_refuses_clients_and_keeps_the_daemons_own_rebuilds() {
+        let dir = tempfile::tempdir().unwrap();
+        let requests = dir.path().join("requests");
+        std::fs::create_dir_all(&requests).unwrap();
+        let full = serde_json::to_string(&WriteRequest::FullReindex).unwrap();
+        std::fs::write(requests.join("1-2-3.request"), &full).unwrap();
+        std::fs::write(requests.join("1-2-3.extractions.json"), "[]").unwrap();
+        std::fs::write(requests.join("1-2-3.edges.arrow"), "x").unwrap();
+        std::fs::write(requests.join("compaction.request"), &full).unwrap();
+        std::fs::write(requests.join("auto-recovery.request"), &full).unwrap();
+
+        let sweep = refuse_legacy_requests(dir.path());
+
+        assert_eq!(sweep.refused, 1);
+        assert!(
+            sweep.rebuild_wanted,
+            "the daemon's own requests become a rebuild"
+        );
+        let reply = std::fs::read_to_string(requests.join("1-2-3.result")).unwrap();
+        assert!(
+            reply.contains("no longer accepts file-drop requests"),
+            "{reply}"
+        );
+        let mut left: Vec<String> = std::fs::read_dir(&requests)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(left, vec!["1-2-3.result"], "sidecars and requests are gone");
     }
 
     #[test]

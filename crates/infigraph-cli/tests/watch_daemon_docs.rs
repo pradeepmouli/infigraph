@@ -280,7 +280,7 @@ fn spawn_ready_daemon(
 /// the `WatchControl` protocol. `run_write_coordinator`'s single top-level
 /// loop (crates/infigraph-core/src/watch/mod.rs) treats that sentinel's
 /// mere existence as a full-loop `break` -- the SAME loop that also serves
-/// `.infigraph/requests/` write requests, code-watch, and doc-watch. So,
+/// socket write requests, code-watch, and doc-watch. So,
 /// unlike the newer per-role `WatchControl` protocol, this legacy path has
 /// no way to stop only code-watching: it brings the WHOLE daemon process
 /// down, exactly like `infigraph daemon-stop` does, just via a cruder
