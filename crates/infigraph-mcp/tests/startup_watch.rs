@@ -284,9 +284,8 @@ fn start_daemon_watcher_for_startup_dir_catches_drift_from_before_it_was_running
     // yet, this also auto-starts an ordinary in-process watcher -- stop it
     // and wait for `watch.lock` to be released, so it doesn't sit there
     // holding the lock and starving the real daemon spawn below (the true-up
-    // step's write would otherwise be dropped into `.infigraph/requests/`
-    // with nothing -- no real `infigraph daemon` process -- ever polling
-    // that directory to serve it, hanging until its timeout).
+    // step's write would otherwise find no daemon socket to submit to --
+    // no real `infigraph daemon` process ever binding one -- and fail).
     infigraph_mcp::tools::index::tool_index_project(&serde_json::json!({ "path": &path_str }))
         .expect("initial index");
     std::fs::write(root.join(".infigraph").join("watch.stop"), "").unwrap();

@@ -13,6 +13,31 @@ use super::read_endpoint::connect_allowing_for_startup;
 use super::read_protocol::WriteFrame;
 use crate::daemon_protocol::{DaemonFaulted, WriteRequest, WriteRequestCancelled, WriteResult};
 
+/// How often a waiting write re-reads the daemon's fault record -- a file
+/// read plus a pid-liveness check, so slower than the wait's own poll.
+const FAULT_POLL: Duration = Duration::from_millis(250);
+
+/// True at most once per `period`: a throttle for a check inside a faster
+/// loop.
+struct Every {
+    period: Duration,
+    next: Instant,
+}
+
+impl Every {
+    fn new(period: Duration, now: Instant) -> Self {
+        Self { period, next: now }
+    }
+
+    fn due(&mut self, now: Instant) -> bool {
+        if now < self.next {
+            return false;
+        }
+        self.next = now + self.period;
+        true
+    }
+}
+
 /// Where bulk payloads wait for the daemon, under `.infigraph/`.
 pub const SIDECAR_DIR: &str = "write-tmp";
 
@@ -46,6 +71,7 @@ pub fn submit(root: &Path, request: &WriteRequest, opts: WriteOpts) -> anyhow::R
     let stream =
         connect_allowing_for_startup(root).map_err(|_| anyhow::Error::new(not_connected(root)))?;
     let started = Instant::now();
+    let mut fault_check = Every::new(FAULT_POLL, started);
     exchange(
         stream,
         &WriteFrame {
@@ -55,8 +81,10 @@ pub fn submit(root: &Path, request: &WriteRequest, opts: WriteOpts) -> anyhow::R
             if opts.cancel.is_some_and(|t| t.is_cancelled()) {
                 return Some(anyhow::Error::new(WriteRequestCancelled));
             }
-            if let Some(faulted) = blocking_fault(&infigraph_dir, request) {
-                return Some(anyhow::Error::new(faulted));
+            if fault_check.due(Instant::now()) {
+                if let Some(faulted) = blocking_fault(&infigraph_dir, request) {
+                    return Some(anyhow::Error::new(faulted));
+                }
             }
             (started.elapsed() >= opts.timeout).then(|| {
                 anyhow::anyhow!(
@@ -112,6 +140,19 @@ mod tests {
             "No space left on device (os error 28)",
         );
         dir
+    }
+
+    /// Review minor (#204): the fault record is a file read plus a pid
+    /// check, so the wait checks it on its own slower cadence.
+    #[test]
+    fn a_throttle_is_due_once_per_period() {
+        let t0 = Instant::now();
+        let mut every = Every::new(Duration::from_millis(250), t0);
+        assert!(every.due(t0), "due at once");
+        assert!(!every.due(t0 + Duration::from_millis(100)));
+        assert!(!every.due(t0 + Duration::from_millis(249)));
+        assert!(every.due(t0 + Duration::from_millis(250)));
+        assert!(!every.due(t0 + Duration::from_millis(300)));
     }
 
     #[test]

@@ -35,7 +35,8 @@ pub struct ControlMsg {
     pub reply: mpsc::Sender<ControlReply>,
 }
 
-pub const DROPPED: &str = "the daemon dropped this write without answering it";
+pub const DROPPED: &str =
+    "the daemon dropped this write without answering it; the cause is in .infigraph/daemon.log";
 pub const GAVE_UP: &str = "the client left before the coordinator had room for its write";
 
 /// What the coordinator's one channel carries.
@@ -427,7 +428,14 @@ mod tests {
 
         let (reply, rx) = WriteReply::channel();
         drop(reply);
-        assert!(matches!(rx.recv().unwrap(), WriteResult::Err { message } if message == DROPPED));
+        match rx.recv().unwrap() {
+            WriteResult::Err { message } => {
+                assert_eq!(message, DROPPED);
+                // The cause (a panicked drain, say) is only in the log.
+                assert!(message.contains("daemon.log"), "{message}");
+            }
+            other => panic!("expected an error, got {other:?}"),
+        }
     }
 
     #[test]
