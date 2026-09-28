@@ -1,70 +1,12 @@
 //! #155: a real write coordinator served over its socket.
 
-use std::path::Path;
 use std::time::{Duration, Instant};
 
 use infigraph_core::daemon::control::{query_status, send_control, ControlError};
 use infigraph_core::daemon::read_protocol::{RoleState, WatchAction, WatchRole};
 
-static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-struct Daemon {
-    handle: std::thread::JoinHandle<anyhow::Result<()>>,
-    token: tokio_util::sync::CancellationToken,
-    stop_tx: std::sync::mpsc::Sender<()>,
-}
-
-fn start(root: &Path) -> Daemon {
-    start_with_docs(root, None)
-}
-
-fn start_with_docs(
-    root: &Path,
-    docs: Option<std::sync::Arc<dyn infigraph_core::daemon::DocsHandle>>,
-) -> Daemon {
-    std::fs::write(root.join("main.py"), "def main():\n    pass\n").unwrap();
-    let (stop_tx, stop_rx) = std::sync::mpsc::channel();
-    let token = tokio_util::sync::CancellationToken::new();
-    let t = token.clone();
-    let r = root.to_path_buf();
-    let handle = std::thread::spawn(move || {
-        infigraph_core::daemon::run_write_coordinator(
-            &r,
-            || Ok(infigraph_languages::bundled_registry().unwrap()),
-            50,
-            stop_rx,
-            |_| {},
-            0,
-            None::<fn(&infigraph_core::IndexResult)>,
-            true,
-            None,
-            &t,
-            docs,
-            None,
-        )
-    });
-    // The endpoint binds before the registry build; control waits until the
-    // loop is taking requests, which is after that build.
-    let deadline = Instant::now() + Duration::from_secs(90);
-    loop {
-        match send_control(root, WatchRole::Code, WatchAction::Start) {
-            Ok(()) => break,
-            Err(e) if Instant::now() > deadline => panic!("daemon never took control: {e}"),
-            Err(_) => std::thread::sleep(Duration::from_millis(100)),
-        }
-    }
-    Daemon {
-        handle,
-        token,
-        stop_tx,
-    }
-}
-
-fn stop(d: Daemon) {
-    d.token.cancel();
-    let _ = d.stop_tx.send(());
-    let _ = d.handle.join();
-}
+mod common;
+use common::daemon::{start, start_with_docs, stop, ENV_LOCK};
 
 #[test]
 fn daemon_stop_over_the_socket_replies_ok_then_exits() {
