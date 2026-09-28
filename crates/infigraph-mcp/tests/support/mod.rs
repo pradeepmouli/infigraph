@@ -48,6 +48,11 @@ pub fn isolate_registry() -> &'static Path {
         let home = base.join(format!("{REGISTRY_HOME_PREFIX}{}", std::process::id()));
         std::fs::create_dir_all(&home).expect("registry scratch dir");
         std::env::set_var("INFIGRAPH_REGISTRY_HOME", &home);
+        // In-process tools log their failures (index timeouts, a clone's
+        // failed edges) through `mcp_log`; keep those out of the real
+        // `mcp.log` too (#201). Only the log: the lock stays per-test, via
+        // `McpStateScope` or `isolated_mcp_command`.
+        std::env::set_var("INFIGRAPH_MCP_LOG_PATH", home.join("mcp.log"));
         home
     })
 }
@@ -281,6 +286,58 @@ fn wait_until_released(lock: &Path, budget: Duration) -> bool {
     !daemon_is_alive(lock)
 }
 
+/// The env overrides that move infigraph-mcp's per-user files --
+/// `~/.infigraph/mcp.lock` and `~/.infigraph/mcp.log` -- under `dir`. The
+/// one list every isolation path draws from, spawned or in-process, so a
+/// test can never isolate the lock and still write into the developer's
+/// real log (#201): fabricated takeover/handover lines there sit beside the
+/// real ones and mislead the next lock investigation.
+pub fn mcp_state_env(dir: &Path) -> [(&'static str, PathBuf); 2] {
+    [
+        ("INFIGRAPH_MCP_LOCK_PATH", dir.join("mcp.lock")),
+        ("INFIGRAPH_MCP_LOG_PATH", dir.join("mcp.log")),
+    ]
+}
+
+/// [`mcp_state_env`] under a fresh directory for code running inside the
+/// test process: sets every override on construction and restores the
+/// previous values on drop. The variables are process-global, so callers
+/// serialize on their own env lock.
+pub struct McpStateScope {
+    dir: tempfile::TempDir,
+    previous: Vec<(&'static str, Option<std::ffi::OsString>)>,
+}
+
+impl McpStateScope {
+    pub fn new() -> Self {
+        let dir = tempfile::tempdir().expect("tempdir for mcp state");
+        let previous = mcp_state_env(dir.path())
+            .into_iter()
+            .map(|(key, value)| {
+                let old = std::env::var_os(key);
+                std::env::set_var(key, value);
+                (key, old)
+            })
+            .collect();
+        Self { dir, previous }
+    }
+
+    pub fn path(&self) -> &Path {
+        self.dir.path()
+    }
+}
+
+impl Drop for McpStateScope {
+    fn drop(&mut self) {
+        for (key, old) in &self.previous {
+            match old {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+}
+
 /// The real `infigraph-mcp` binary, unable to touch the developer's own
 /// server (#197). Without its own `INFIGRAPH_MCP_LOCK_PATH` a spawned
 /// worker competes for the live `~/.infigraph/mcp.lock`, and because a test
@@ -297,8 +354,7 @@ pub fn isolated_mcp_command(scratch: &Path) -> std::process::Command {
         std::fs::create_dir_all(dir).expect("scratch dir for an isolated infigraph-mcp");
     }
     let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_infigraph-mcp"));
-    cmd.env("INFIGRAPH_MCP_LOCK_PATH", scratch.join("mcp.lock"))
-        .env("INFIGRAPH_MCP_LOG_PATH", scratch.join("mcp.log"))
+    cmd.envs(mcp_state_env(scratch))
         .env("INFIGRAPH_REGISTRY_INSTANCES_DIR", &instances)
         .env("INFIGRAPH_REGISTRY_HOME", &registry)
         .env("HOME", &home)

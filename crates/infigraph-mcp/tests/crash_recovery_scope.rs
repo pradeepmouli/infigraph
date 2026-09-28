@@ -9,6 +9,8 @@
 
 #![cfg(unix)]
 
+mod support;
+
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
@@ -67,9 +69,8 @@ fn start() -> Fixture {
         .current_dir(&startup)
         .env("HOME", root.join("home"))
         .env("INFIGRAPH_REGISTRY_HOME", &registry_home)
-        .env("INFIGRAPH_MCP_LOCK_PATH", root.join("mcp.lock"))
+        .envs(support::mcp_state_env(&root))
         .env("INFIGRAPH_REGISTRY_INSTANCES_DIR", &instances)
-        .env("INFIGRAPH_MCP_LOG_PATH", &log)
         .env("CI", "true")
         .env(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND)
         .env_remove("INFIGRAPH_WATCH_DAEMON")
