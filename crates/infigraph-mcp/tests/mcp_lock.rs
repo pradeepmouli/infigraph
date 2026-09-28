@@ -1,3 +1,5 @@
+mod support;
+
 use std::time::{Duration, Instant};
 
 /// Serializes tests that mutate the process-global INFIGRAPH_MCP_LOCK_*
@@ -35,8 +37,7 @@ fn wedged_threshold_default_and_override() {
 #[test]
 fn acquire_primary_then_busy_then_free_again() {
     let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let dir = tempfile::tempdir().expect("tempdir");
-    std::env::set_var("INFIGRAPH_MCP_LOCK_PATH", dir.path().join("mcp.lock"));
+    let _state = support::McpStateScope::new();
 
     let first = infigraph_mcp::mcp_lock::acquire_primary();
     assert!(first.is_some(), "lock should be free on first acquire");
@@ -51,15 +52,12 @@ fn acquire_primary_then_busy_then_free_again() {
         third.is_some(),
         "lock must be free again after the holder drops"
     );
-
-    std::env::remove_var("INFIGRAPH_MCP_LOCK_PATH");
 }
 
 #[test]
 fn heartbeat_tick_advances_last_heartbeat() {
     let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let dir = tempfile::tempdir().expect("tempdir");
-    std::env::set_var("INFIGRAPH_MCP_LOCK_PATH", dir.path().join("mcp.lock"));
+    let _state = support::McpStateScope::new();
 
     let mut lock = infigraph_mcp::mcp_lock::acquire_primary().expect("lock should be free");
     let path = infigraph_mcp::mcp_lock::lock_path();
@@ -70,12 +68,12 @@ fn heartbeat_tick_advances_last_heartbeat() {
 
     let after = infigraph_core::lockfile::read_holder(&path).unwrap();
     assert!(after.last_heartbeat > before.last_heartbeat);
-
-    std::env::remove_var("INFIGRAPH_MCP_LOCK_PATH");
 }
 
 #[test]
 fn check_wedged_and_log_does_not_panic_on_fresh_or_stale_heartbeat() {
+    let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _state = support::McpStateScope::new();
     // This function's only observable effect is a log line; there's no
     // return value to assert on directly (mcp_log has no test hook). This
     // test exists to catch a panic (e.g. an integer underflow bug in the
@@ -160,8 +158,7 @@ fn takeover_wait_timeout_default_and_override() {
 #[test]
 fn acquire_with_takeover_wins_immediately_when_lock_is_free() {
     let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let dir = tempfile::tempdir().expect("tempdir");
-    std::env::set_var("INFIGRAPH_MCP_LOCK_PATH", dir.path().join("mcp.lock"));
+    let _state = support::McpStateScope::new();
 
     let outcome = infigraph_mcp::mcp_lock::acquire_with_takeover();
     match outcome {
@@ -170,8 +167,6 @@ fn acquire_with_takeover_wins_immediately_when_lock_is_free() {
             panic!("must win immediately when the lock is free")
         }
     }
-
-    std::env::remove_var("INFIGRAPH_MCP_LOCK_PATH");
 }
 
 /// Two builds with DIFFERENT build_hash would have the challenger request
@@ -196,8 +191,7 @@ fn acquire_with_takeover_wins_immediately_when_lock_is_free() {
 #[test]
 fn takeover_succeeds_when_incumbent_honors_handover_request() {
     let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let dir = tempfile::tempdir().expect("tempdir");
-    std::env::set_var("INFIGRAPH_MCP_LOCK_PATH", dir.path().join("mcp.lock"));
+    let dir = support::McpStateScope::new();
 
     let mut incumbent = infigraph_mcp::mcp_lock::acquire_primary().expect("free");
 
@@ -225,8 +219,6 @@ fn takeover_succeeds_when_incumbent_honors_handover_request() {
         reacquired.is_some(),
         "lock must be free for a challenger to win after the incumbent releases it"
     );
-
-    std::env::remove_var("INFIGRAPH_MCP_LOCK_PATH");
 }
 
 /// The build_hash comparison in `acquire_with_takeover` is what gates
@@ -239,8 +231,7 @@ fn takeover_succeeds_when_incumbent_honors_handover_request() {
 #[test]
 fn no_handover_request_written_when_build_hash_matches() {
     let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let dir = tempfile::tempdir().expect("tempdir");
-    std::env::set_var("INFIGRAPH_MCP_LOCK_PATH", dir.path().join("mcp.lock"));
+    let dir = support::McpStateScope::new();
     std::env::set_var("INFIGRAPH_MCP_LOCK_TAKEOVER_POLL_SECS", "1");
     std::env::set_var("INFIGRAPH_MCP_LOCK_TAKEOVER_TIMEOUT_SECS", "1");
 
@@ -274,7 +265,6 @@ fn no_handover_request_written_when_build_hash_matches() {
         "no handover request should be written or left behind on the same-build path"
     );
 
-    std::env::remove_var("INFIGRAPH_MCP_LOCK_PATH");
     std::env::remove_var("INFIGRAPH_MCP_LOCK_TAKEOVER_POLL_SECS");
     std::env::remove_var("INFIGRAPH_MCP_LOCK_TAKEOVER_TIMEOUT_SECS");
 }
@@ -286,8 +276,7 @@ fn no_handover_request_written_when_build_hash_matches() {
 #[test]
 fn a_session_that_yielded_the_lock_never_requests_it_back() {
     let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let dir = tempfile::tempdir().expect("tempdir");
-    std::env::set_var("INFIGRAPH_MCP_LOCK_PATH", dir.path().join("mcp.lock"));
+    let dir = support::McpStateScope::new();
     std::env::set_var(infigraph_mcp::mcp_lock::YIELDED_ENV, "1");
 
     let _incumbent = infigraph_mcp::mcp_lock::acquire_primary().expect("free");
@@ -296,7 +285,6 @@ fn a_session_that_yielded_the_lock_never_requests_it_back() {
     let outcome = infigraph_mcp::mcp_lock::acquire_with_takeover_using("some-other-build");
     let elapsed = started.elapsed();
     std::env::remove_var(infigraph_mcp::mcp_lock::YIELDED_ENV);
-    std::env::remove_var("INFIGRAPH_MCP_LOCK_PATH");
 
     assert!(
         matches!(outcome, infigraph_mcp::mcp_lock::AcquireOutcome::Secondary),
@@ -405,8 +393,7 @@ fn stale_handover_request_is_discarded_not_honored() {
     let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     std::env::remove_var("INFIGRAPH_MCP_LOCK_HEARTBEAT_SECS");
     std::env::remove_var("INFIGRAPH_MCP_LOCK_TAKEOVER_TIMEOUT_SECS");
-    let dir = tempfile::tempdir().expect("tempdir");
-    std::env::set_var("INFIGRAPH_MCP_LOCK_PATH", dir.path().join("mcp.lock"));
+    let dir = support::McpStateScope::new();
 
     let mut incumbent = infigraph_mcp::mcp_lock::acquire_primary().expect("free");
 
@@ -423,8 +410,6 @@ fn stale_handover_request_is_discarded_not_honored() {
         !dir.path().join("mcp.lock.handover").exists(),
         "the stale request must be cleared, not left to be re-read every tick"
     );
-
-    std::env::remove_var("INFIGRAPH_MCP_LOCK_PATH");
 }
 
 #[test]
@@ -432,8 +417,7 @@ fn handover_request_from_dead_pid_is_discarded() {
     let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     std::env::remove_var("INFIGRAPH_MCP_LOCK_HEARTBEAT_SECS");
     std::env::remove_var("INFIGRAPH_MCP_LOCK_TAKEOVER_TIMEOUT_SECS");
-    let dir = tempfile::tempdir().expect("tempdir");
-    std::env::set_var("INFIGRAPH_MCP_LOCK_PATH", dir.path().join("mcp.lock"));
+    let dir = support::McpStateScope::new();
 
     let mut incumbent = infigraph_mcp::mcp_lock::acquire_primary().expect("free");
 
@@ -450,8 +434,6 @@ fn handover_request_from_dead_pid_is_discarded() {
         !dir.path().join("mcp.lock.handover").exists(),
         "the orphaned request must be cleared, not left to be re-read every tick"
     );
-
-    std::env::remove_var("INFIGRAPH_MCP_LOCK_PATH");
 }
 
 /// Full request -> poll -> win loop, with real threads and real polling. A
@@ -462,8 +444,7 @@ fn handover_request_from_dead_pid_is_discarded() {
 #[test]
 fn takeover_wins_when_incumbent_honors_request_mid_poll() {
     let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let dir = tempfile::tempdir().expect("tempdir");
-    std::env::set_var("INFIGRAPH_MCP_LOCK_PATH", dir.path().join("mcp.lock"));
+    let dir = support::McpStateScope::new();
     std::env::set_var("INFIGRAPH_MCP_LOCK_HEARTBEAT_SECS", "1");
     std::env::set_var("INFIGRAPH_MCP_LOCK_TAKEOVER_POLL_SECS", "1");
     std::env::set_var("INFIGRAPH_MCP_LOCK_TAKEOVER_TIMEOUT_SECS", "1");
@@ -514,7 +495,6 @@ fn takeover_wins_when_incumbent_honors_request_mid_poll() {
          not the poll loop"
     );
 
-    std::env::remove_var("INFIGRAPH_MCP_LOCK_PATH");
     std::env::remove_var("INFIGRAPH_MCP_LOCK_HEARTBEAT_SECS");
     std::env::remove_var("INFIGRAPH_MCP_LOCK_TAKEOVER_POLL_SECS");
     std::env::remove_var("INFIGRAPH_MCP_LOCK_TAKEOVER_TIMEOUT_SECS");
@@ -527,8 +507,7 @@ fn takeover_wins_when_incumbent_honors_request_mid_poll() {
 #[test]
 fn takeover_times_out_to_secondary_and_clears_request() {
     let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let dir = tempfile::tempdir().expect("tempdir");
-    std::env::set_var("INFIGRAPH_MCP_LOCK_PATH", dir.path().join("mcp.lock"));
+    let dir = support::McpStateScope::new();
     std::env::set_var("INFIGRAPH_MCP_LOCK_HEARTBEAT_SECS", "1");
     std::env::set_var("INFIGRAPH_MCP_LOCK_TAKEOVER_POLL_SECS", "1");
     std::env::set_var("INFIGRAPH_MCP_LOCK_TAKEOVER_TIMEOUT_SECS", "1");
@@ -547,8 +526,71 @@ fn takeover_times_out_to_secondary_and_clears_request() {
         "a timed-out challenger must clear its own request instead of leaking it"
     );
 
-    std::env::remove_var("INFIGRAPH_MCP_LOCK_PATH");
     std::env::remove_var("INFIGRAPH_MCP_LOCK_HEARTBEAT_SECS");
     std::env::remove_var("INFIGRAPH_MCP_LOCK_TAKEOVER_POLL_SECS");
     std::env::remove_var("INFIGRAPH_MCP_LOCK_TAKEOVER_TIMEOUT_SECS");
+}
+
+/// #201: every test here drives real `mcp_log` calls (takeover requests for
+/// fake builds, handovers for fake PIDs), so the isolation that moves the
+/// lock must move the log too. A line only this test can produce has to land
+/// in the scratch log and never in the developer's real `~/.infigraph/mcp.log`.
+#[test]
+fn in_process_isolation_keeps_mcp_log_lines_out_of_the_real_log() {
+    let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let real_log = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .expect("HOME")
+        .join(".infigraph")
+        .join("mcp.log");
+    let state = support::McpStateScope::new();
+
+    // A PID no live holder has, so the line is unmistakably this test's.
+    let marker_pid = u32::MAX - (now_epoch_secs() % 1_000_000) as u32;
+    let wedged = infigraph_core::lockfile::LockInfo {
+        pid: marker_pid,
+        role: "mcp-primary".to_string(),
+        build_hash: "abc".to_string(),
+        acquired_at: 1000,
+        last_heartbeat: 1000,
+        holder_started_at: 0,
+    };
+    infigraph_mcp::mcp_lock::check_wedged_and_log(&wedged, 1000 + wedged_secs_for_test() + 1);
+
+    let marker = format!("held by PID {marker_pid} ");
+    let scratch_log = std::fs::read_to_string(state.path().join("mcp.log")).unwrap_or_default();
+    let leaked = std::fs::read(&real_log)
+        .map(|bytes| String::from_utf8_lossy(&bytes).contains(&marker))
+        .unwrap_or(false);
+    assert!(
+        !leaked,
+        "an isolated test wrote into the real {}",
+        real_log.display()
+    );
+    assert!(
+        scratch_log.contains(&marker),
+        "the wedged-holder WARN must land in the scratch log, got: {scratch_log:?}"
+    );
+}
+
+/// #201, spawned side: a real `infigraph-mcp` built by `isolated_mcp_command`
+/// gets the same lock and log overrides the in-process scope sets.
+#[test]
+fn isolated_mcp_command_points_lock_and_log_at_scratch() {
+    let scratch = tempfile::tempdir().expect("tempdir");
+    let cmd = support::isolated_mcp_command(scratch.path());
+    let env: std::collections::HashMap<_, _> = cmd
+        .get_envs()
+        .filter_map(|(k, v)| Some((k.to_owned(), v?.to_owned())))
+        .collect();
+    for (key, file) in [
+        ("INFIGRAPH_MCP_LOCK_PATH", "mcp.lock"),
+        ("INFIGRAPH_MCP_LOG_PATH", "mcp.log"),
+    ] {
+        assert_eq!(
+            env.get(std::ffi::OsStr::new(key)).map(std::path::Path::new),
+            Some(scratch.path().join(file).as_path()),
+            "{key} must point under the scratch dir"
+        );
+    }
 }
