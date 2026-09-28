@@ -948,7 +948,7 @@ resolver = ["./resolve-zed-path.sh"]
         .unwrap();
 
         for (event, expected_count) in [
-            ("PreToolUse", 1),
+            ("PreToolUse", 2),
             ("PostToolUse", 5),
             ("UserPromptSubmit", 3),
             ("SessionStart", 1),
@@ -1562,6 +1562,229 @@ resolver = ["./resolve-zed-path.sh"]
         }
     }
 
+    /// The worktree hook's fixture: a git repo with one commit, a fake
+    /// `infigraph` first on PATH that appends its argv to a log, and a way to
+    /// run one `git worktree` command between the hook's Pre and Post runs.
+    #[cfg(unix)]
+    struct WorktreeHookFixture {
+        _home: tempfile::TempDir,
+        hook: std::path::PathBuf,
+        tmp: tempfile::TempDir,
+        main: std::path::PathBuf,
+        calls: std::path::PathBuf,
+        path_env: std::ffi::OsString,
+    }
+
+    #[cfg(unix)]
+    impl WorktreeHookFixture {
+        fn new(infigraph_project: bool) -> Self {
+            let (home, hook) = install_bundled_claude_hook("infigraph-worktree.sh");
+            let tmp = tempfile::tempdir().unwrap();
+            let main = tmp.path().join("main");
+            std::fs::create_dir_all(&main).unwrap();
+            let main = main.canonicalize().unwrap();
+            for args in [
+                &["init", "-q"][..],
+                &[
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "user.name=t",
+                    "commit",
+                    "-q",
+                    "--allow-empty",
+                    "-m",
+                    "i",
+                ],
+            ] {
+                assert!(std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(&main)
+                    .status()
+                    .unwrap()
+                    .success());
+            }
+            if infigraph_project {
+                std::fs::create_dir_all(main.join(".infigraph")).unwrap();
+            }
+            let bin = tmp.path().join("bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            let calls = tmp.path().join("calls.log");
+            let fake = bin.join("infigraph");
+            std::fs::write(
+                &fake,
+                // `daemon-stop` acts on the directory it runs in, so log that.
+                format!(
+                    "#!/bin/sh\ncase \"$1\" in daemon-stop) echo \"$* @$(pwd -P)\" ;; *) echo \"$*\" ;; esac >> '{}'\n",
+                    calls.display()
+                ),
+            )
+            .unwrap();
+            make_executable(&fake).unwrap();
+            let mut path_env = bin.into_os_string();
+            path_env.push(":");
+            path_env.push(std::env::var_os("PATH").unwrap_or_default());
+            Self {
+                _home: home,
+                hook,
+                tmp,
+                main,
+                calls,
+                path_env,
+            }
+        }
+
+        fn snapshot(&self, id: &str) -> std::path::PathBuf {
+            self.tmp
+                .path()
+                .join("infigraph-worktree-hook")
+                .join(format!("{id}.list"))
+        }
+
+        /// Pre hook, then `git worktree <args>`, then Post hook, all as one
+        /// Bash tool call with id `id`. Returns once the fake `infigraph` has
+        /// logged `worktree reconcile`, the last step of the hook's chain.
+        fn run(&self, id: &str, args: &[&str]) -> Vec<String> {
+            self.run_as(id, args, false)
+        }
+
+        /// As [`Self::run`]; with `dash_c`, the call is spelled
+        /// `git -C <main> worktree ...` from an unrelated working directory.
+        fn run_as(&self, id: &str, args: &[&str], dash_c: bool) -> Vec<String> {
+            let command = if dash_c {
+                format!("git -C {} worktree {}", self.main.display(), args.join(" "))
+            } else {
+                format!("git worktree {}", args.join(" "))
+            };
+            let cwd = if dash_c {
+                self.tmp.path().to_path_buf()
+            } else {
+                self.main.clone()
+            };
+            let input = |event: &str| {
+                serde_json::json!({
+                    "hook_event_name": event,
+                    "tool_name": "Bash",
+                    "tool_input": { "command": command },
+                    "tool_use_id": id,
+                    "tool_response": {},
+                    "cwd": cwd,
+                })
+                .to_string()
+            };
+            let env = [("PATH", self.path_env.as_os_str())];
+            let pre = run_hook_with_env(&self.hook, self.tmp.path(), &input("PreToolUse"), &env);
+            assert!(pre.status.success(), "pre hook must exit 0: {pre:?}");
+            assert!(
+                self.snapshot(id).is_file(),
+                "pre hook must snapshot the list"
+            );
+            assert!(std::process::Command::new("git")
+                .arg("worktree")
+                .args(args)
+                .current_dir(&self.main)
+                .status()
+                .unwrap()
+                .success());
+            let post = run_hook_with_env(&self.hook, self.tmp.path(), &input("PostToolUse"), &env);
+            assert!(post.status.success(), "post hook must exit 0: {post:?}");
+            assert!(
+                !self.snapshot(id).exists(),
+                "post hook must consume the snapshot"
+            );
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                let calls: Vec<String> = std::fs::read_to_string(&self.calls)
+                    .unwrap_or_default()
+                    .lines()
+                    .map(str::to_string)
+                    .collect();
+                if calls.iter().any(|c| c == "worktree reconcile") {
+                    let _ = std::fs::remove_file(&self.calls);
+                    return calls;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the hook never ran `infigraph worktree reconcile`; calls so far: {calls:?}"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worktree_hook_inits_an_added_worktree_and_tears_down_a_removed_one() {
+        if hook_tools_missing() {
+            return;
+        }
+        let fx = WorktreeHookFixture::new(true);
+        let wt = fx.main.parent().unwrap().join("wt1");
+
+        let calls = fx.run("toolu_add", &["add", "-q", wt.to_str().unwrap()]);
+        assert_eq!(
+            calls,
+            vec![
+                format!("worktree init {}", wt.display()),
+                "worktree reconcile".to_string()
+            ],
+            "only the new worktree is initialised, before reconcile"
+        );
+
+        let wt_real = wt.canonicalize().unwrap();
+        // What a real `worktree init` leaves behind, and what marks a
+        // worktree whose daemon the hook must stop. Untracked in this repo,
+        // hence `--force` (which also checks the hook skips options).
+        std::fs::create_dir_all(wt.join(".infigraph")).unwrap();
+        let calls = fx.run("toolu_remove", &["remove", "--force", wt.to_str().unwrap()]);
+        assert_eq!(
+            calls,
+            vec![
+                // Before git deletes it: a live daemon writing into
+                // .infigraph/ makes `git worktree remove` fail half-done.
+                format!("daemon-stop --wait @{}", wt_real.display()),
+                format!("worktree teardown {}", wt.display()),
+                "worktree reconcile".to_string()
+            ],
+            "only the removed worktree is torn down"
+        );
+        assert!(
+            fx.main.join(".infigraph/worktree-hook.log").is_file(),
+            "the chain's output goes to the main worktree's hook log"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worktree_hook_follows_git_dash_c_to_the_repo_it_names() {
+        if hook_tools_missing() {
+            return;
+        }
+        let fx = WorktreeHookFixture::new(true);
+        let wt = fx.main.parent().unwrap().join("wt1");
+        let calls = fx.run_as("toolu_add_c", &["add", "-q", wt.to_str().unwrap()], true);
+        assert_eq!(
+            calls,
+            vec![
+                format!("worktree init {}", wt.display()),
+                "worktree reconcile".to_string()
+            ],
+            "`git -C <repo>` diffs <repo>'s worktrees, not the session's cwd"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worktree_hook_never_inits_a_worktree_of_a_repo_infigraph_does_not_index() {
+        if hook_tools_missing() {
+            return;
+        }
+        let fx = WorktreeHookFixture::new(false);
+        let wt = fx.main.parent().unwrap().join("wt1");
+        let calls = fx.run("toolu_add", &["add", "-q", wt.to_str().unwrap()]);
+        assert_eq!(calls, vec!["worktree reconcile".to_string()]);
+    }
+
     /// Hook behaviour tests need the tools the bundled hooks call.
     #[cfg(unix)]
     fn hook_tools_missing() -> bool {
@@ -1614,10 +1837,22 @@ resolver = ["./resolve-zed-path.sh"]
         tmp: &std::path::Path,
         stdin: &str,
     ) -> std::process::Output {
+        run_hook_with_env(hook, tmp, stdin, &[])
+    }
+
+    /// [`run_hook`] with extra environment variables.
+    #[cfg(unix)]
+    fn run_hook_with_env(
+        hook: &std::path::Path,
+        tmp: &std::path::Path,
+        stdin: &str,
+        env: &[(&str, &std::ffi::OsStr)],
+    ) -> std::process::Output {
         use std::io::Write;
         use std::process::Stdio;
         let mut child = std::process::Command::new(hook)
             .env("TMPDIR", tmp)
+            .envs(env.iter().copied())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())

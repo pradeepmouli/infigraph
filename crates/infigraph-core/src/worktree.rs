@@ -5,6 +5,7 @@ use std::process::Command;
 use anyhow::{Context, Result};
 
 use crate::multi::Registry;
+use crate::project::canonicalize_lenient;
 
 pub fn git_common_dir(path: &Path) -> Result<PathBuf> {
     let output = Command::new("git")
@@ -66,15 +67,6 @@ pub struct WorktreeDrift {
     pub teardown_candidates: Vec<PathBuf>,
 }
 
-/// Canonicalize when possible; fall back to the raw path otherwise. A registry
-/// entry for a worktree that's since been deleted can't be canonicalized (the
-/// path no longer exists) -- the raw form is still safe to compare with, since a
-/// gone path won't spuriously match any live (and therefore canonicalizable)
-/// worktree path.
-fn canon_or_raw(path: &Path) -> PathBuf {
-    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
-}
-
 /// Diff live git worktrees against the registry. When `repo_scope` is `Some`, only
 /// the repo containing that path is considered; `None` sweeps every repo among the
 /// registered projects (the `--global` case).
@@ -114,11 +106,11 @@ pub fn find_worktree_drift(registry: &Registry, repo_scope: Option<&Path>) -> Wo
     let registered_canon: std::collections::HashSet<PathBuf> = registry
         .repos
         .values()
-        .map(|e| canon_or_raw(&e.path))
+        .map(|e| canonicalize_lenient(&e.path))
         .collect();
     for live in live_by_common.values() {
         for live_path in live {
-            let registered = registered_canon.contains(&canon_or_raw(live_path));
+            let registered = registered_canon.contains(&canonicalize_lenient(live_path));
             let has_infigraph = live_path.join(".infigraph").is_dir();
             if !registered && !has_infigraph {
                 drift.bootstrap_candidates.push(live_path.clone());
@@ -135,7 +127,7 @@ pub fn find_worktree_drift(registry: &Registry, repo_scope: Option<&Path>) -> Wo
     let all_live_canon: std::collections::HashSet<PathBuf> = live_by_common
         .values()
         .flatten()
-        .map(|p| canon_or_raw(p))
+        .map(|p| canonicalize_lenient(p))
         .collect();
     let scope_common = repo_scope.and_then(|p| git_common_dir(p).ok());
     for entry in registry.repos.values() {
@@ -146,7 +138,7 @@ pub fn find_worktree_drift(registry: &Registry, repo_scope: Option<&Path>) -> Wo
                 }
             }
         }
-        if !all_live_canon.contains(&canon_or_raw(&entry.path)) {
+        if !all_live_canon.contains(&canonicalize_lenient(&entry.path)) {
             drift.teardown_candidates.push(entry.path.clone());
         }
     }

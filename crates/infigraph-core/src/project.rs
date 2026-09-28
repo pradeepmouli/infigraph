@@ -35,6 +35,38 @@ fn git_root(start: &Path) -> Option<PathBuf> {
     None
 }
 
+/// `path` canonicalised even when it no longer exists: the deepest existing
+/// ancestor is canonicalised and the missing components are joined back on.
+///
+/// A removed worktree is the case this exists for. Plain `canonicalize`
+/// fails on it, and falling back to the raw path gives a different answer
+/// than the path got while it existed whenever an ancestor is a symlink
+/// (macOS's `/var` -> `/private/var`) or the path is relative -- so a daemon
+/// endpoint or registry entry keyed on the canonical form is missed. Falls
+/// back to `path` unchanged only when not even an ancestor resolves.
+pub fn canonicalize_lenient(path: &Path) -> PathBuf {
+    if let Ok(canonical) = path.canonicalize() {
+        return canonical;
+    }
+    let Ok(absolute) = std::path::absolute(path) else {
+        return path.to_path_buf();
+    };
+    let mut missing = Vec::new();
+    let mut current = absolute.as_path();
+    loop {
+        if let Ok(base) = current.canonicalize() {
+            return missing.iter().rev().fold(base, |acc, name| acc.join(name));
+        }
+        match (current.parent(), current.file_name()) {
+            (Some(parent), Some(name)) => {
+                missing.push(name.to_os_string());
+                current = parent;
+            }
+            _ => return path.to_path_buf(),
+        }
+    }
+}
+
 /// Resolve `start` to the project root that should own it.
 ///
 /// In order: `start` itself if it is already a project store; else the
@@ -70,7 +102,24 @@ pub fn resolve_project_root(start: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_project_root;
+    use super::{canonicalize_lenient, resolve_project_root};
+
+    #[test]
+    fn a_deleted_path_canonicalises_to_what_it_was_while_it_existed() {
+        let parent = tempfile::tempdir().unwrap();
+        let gone = parent.path().join("wt").join("nested");
+        std::fs::create_dir_all(&gone).unwrap();
+        let while_alive = canon(&gone);
+        std::fs::remove_dir_all(parent.path().join("wt")).unwrap();
+        // `parent.path()` is the raw, possibly symlinked (macOS `/var`) form.
+        assert_eq!(canonicalize_lenient(&gone), while_alive);
+    }
+
+    #[test]
+    fn a_path_with_no_resolvable_ancestor_is_returned_unchanged() {
+        let p = std::path::Path::new("");
+        assert_eq!(canonicalize_lenient(p), p);
+    }
 
     /// Compare against the canonical form: `resolve_project_root`
     /// canonicalises, and on macOS a tempdir's `/var/...` is a symlink to

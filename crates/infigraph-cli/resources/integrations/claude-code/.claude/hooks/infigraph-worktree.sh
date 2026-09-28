@@ -1,29 +1,143 @@
 #!/usr/bin/env bash
-# Infigraph PostToolUse hook -- git worktree lifecycle.
-# Fires after every Bash tool call; only acts when the command looks like a
-# `git worktree add|remove|prune` invocation that actually succeeded (exit 0).
-# Rather than parse the triggering command's own arguments (which may use a
-# default worktree name, a relative path, or --force flags in any order), it
-# re-runs `git worktree list --porcelain` before and after and diffs the two
-# -- the authoritative source of what actually changed, regardless of how the
-# command was phrased.
+# Infigraph PreToolUse + PostToolUse hook -- git worktree lifecycle.
+# Registered for both events on Bash; only acts when the command looks like a
+# `git worktree add|remove|prune` invocation. Rather than parse the command's
+# own arguments (a default worktree name, a relative path, --force flags in
+# any order), it snapshots `git worktree list --porcelain` before the command
+# (PreToolUse, keyed by the call's tool_use_id) and diffs it against the list
+# after (PostToolUse) -- the authoritative record of what actually changed:
+#   - each added worktree:   `infigraph worktree init <path>`, but only when
+#     the main worktree is an Infigraph project (has .infigraph/), so this
+#     never starts indexing an arbitrary repo;
+#   - each removed worktree: `infigraph worktree teardown <path>`, which
+#     reaches the daemon over its socket, so it works after the directory is
+#     gone;
+#   - and before a `remove` runs, `infigraph daemon-stop --wait` in the
+#     worktree being removed: a daemon still writing into .infigraph/ makes
+#     `git worktree remove` fail half-done ("Directory not empty").
+#   - then `infigraph worktree reconcile`, as before.
+# `git -C <dir> worktree ...` is followed to <dir>. Words are split on
+# whitespace, so paths containing spaces are not recognised.
+# Everything runs detached (init indexes, which takes a while); output goes to
+# <main>/.infigraph/worktree-hook.log when that directory exists. Without a
+# snapshot (PreToolUse did not run) it falls back to reconcile alone. Never
+# fails or blocks the tool call: every path exits 0.
 input=$(cat)
 
 tool=$(echo "$input" | jq -r '.tool_name // empty')
 [ "$tool" = "Bash" ] || exit 0
 
 cmd=$(echo "$input" | jq -r '.tool_input.command // empty')
-echo "$cmd" | grep -qE '(^|\s)git\s+worktree\s+(add|remove|prune)(\s|$)' || exit 0
-
-exit_code=$(echo "$input" | jq -r '.tool_response.exitCode // 0')
-[ "$exit_code" = "0" ] || exit 0
+echo "$cmd" | grep -qE '(^|\s)git(\s+-C\s+\S+)?\s+worktree\s+(add|remove|prune)(\s|$)' || exit 0
 
 cwd=$(echo "$input" | jq -r '.cwd // empty')
 [ -n "$cwd" ] || exit 0
 
-command -v infigraph >/dev/null 2>&1 || exit 0
-git -C "$cwd" rev-parse --is-inside-work-tree >/dev/null 2>&1 || exit 0
+unquote() { local w="${1%\"}"; w="${w#\"}"; w="${w%\'}"; printf '%s' "${w#\'}"; }
+absolute() { case "$2" in /*) printf '%s' "$2" ;; *) printf '%s/%s' "$1" "$2" ;; esac; }
 
-infigraph worktree reconcile >/dev/null 2>&1 &
+# Find `git [-C <dir>] worktree <sub> ...`: the repo it acts on, and for
+# `remove` the worktree it removes (its first non-option argument).
+read -r -a words <<<"$cmd"
+repo="$cwd"
+sub=""
+target=""
+for ((i = 0; i < ${#words[@]}; i++)); do
+  [ "${words[$i]}" = "git" ] || continue
+  j=$((i + 1))
+  dir=""
+  if [ "${words[$j]}" = "-C" ]; then
+    dir=$(unquote "${words[$((j + 1))]}")
+    j=$((j + 2))
+  fi
+  [ "${words[$j]}" = "worktree" ] || continue
+  case "${words[$((j + 1))]}" in add | remove | prune) sub="${words[$((j + 1))]}" ;; *) continue ;; esac
+  [ -n "$dir" ] && repo=$(absolute "$cwd" "$dir")
+  if [ "$sub" = "remove" ]; then
+    for ((k = j + 2; k < ${#words[@]}; k++)); do
+      case "${words[$k]}" in
+        -*) continue ;;
+        '&&' | '||' | ';' | '|') break ;;
+      esac
+      target=$(absolute "$repo" "$(unquote "${words[$k]}")")
+      break
+    done
+  fi
+  break
+done
+[ -n "$sub" ] || exit 0
+
+event=$(echo "$input" | jq -r '.hook_event_name // empty')
+id=$(echo "$input" | jq -r '.tool_use_id // empty' | tr -cd 'A-Za-z0-9_-')
+snap_dir="${TMPDIR:-/tmp}/infigraph-worktree-hook"
+snap=""
+[ -n "$id" ] && snap="$snap_dir/$id.list"
+
+list_worktrees() {
+  git -C "$repo" worktree list --porcelain 2>/dev/null | sed -n 's/^worktree //p'
+}
+
+if [ "$event" = "PreToolUse" ]; then
+  # Stop the doomed worktree's daemon and wait for it to exit, so git is
+  # not racing it for the directory. Synchronous: git runs once this hook
+  # returns. A remove git then refuses leaves only a stopped daemon, which
+  # the next read restarts.
+  if [ "$sub" = "remove" ] && [ -n "$target" ] && [ -d "$target/.infigraph" ] &&
+    command -v infigraph >/dev/null 2>&1; then
+    (cd "$target" && infigraph daemon-stop --wait) </dev/null >/dev/null 2>&1
+  fi
+  [ -n "$snap" ] || exit 0
+  git -C "$repo" rev-parse --is-inside-work-tree >/dev/null 2>&1 || exit 0
+  mkdir -p "$snap_dir" 2>/dev/null || exit 0
+  # A call that failed never reaches PostToolUse, so its snapshot is never
+  # consumed; sweep those after an hour.
+  find "$snap_dir" -name '*.list' -mmin +60 -delete 2>/dev/null
+  list_worktrees >"$snap" 2>/dev/null || rm -f "$snap"
+  exit 0
+fi
+
+before=""
+if [ -n "$snap" ] && [ -f "$snap" ]; then
+  before=$(cat "$snap")
+  rm -f "$snap"
+  have_snapshot=1
+else
+  have_snapshot=0
+  exit_code=$(echo "$input" | jq -r '.tool_response.exitCode // 0')
+  [ "$exit_code" = "0" ] || exit 0
+fi
+
+command -v infigraph >/dev/null 2>&1 || exit 0
+git -C "$repo" rev-parse --is-inside-work-tree >/dev/null 2>&1 || exit 0
+
+after=$(list_worktrees)
+main=$(printf '%s\n' "$after" | head -n 1)
+
+added=""
+removed=""
+if [ "$have_snapshot" = 1 ]; then
+  # Lines in one list but not the other; paths never contain newlines here.
+  added=$(printf '%s\n' "$after" | grep -vxF -f <(printf '%s\n' "$before") | grep -v '^$')
+  removed=$(printf '%s\n' "$before" | grep -vxF -f <(printf '%s\n' "$after") | grep -v '^$')
+  # Never index a repo that is not an Infigraph project.
+  [ -n "$main" ] && [ -d "$main/.infigraph" ] || added=""
+fi
+
+log=/dev/null
+[ -n "$main" ] && [ -d "$main/.infigraph" ] && log="$main/.infigraph/worktree-hook.log"
+
+# One detached, sequential chain, because every step rewrites the registry.
+# Reconcile runs last, so it no longer reports a just-initialised worktree as
+# unindexed.
+(
+  cd "$repo" || exit 0
+  printf '%s\n' "$removed" | while IFS= read -r p; do
+    [ -n "$p" ] && infigraph worktree teardown "$p"
+  done
+  printf '%s\n' "$added" | while IFS= read -r p; do
+    [ -n "$p" ] && infigraph worktree init "$p"
+  done
+  infigraph worktree reconcile
+) </dev/null >>"$log" 2>&1 &
 disown
 exit 0
