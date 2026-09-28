@@ -2,7 +2,6 @@ use std::sync::Mutex;
 
 use serde_json::json;
 
-use infigraph_mcp::tools::docs::get_doc_watchers;
 use infigraph_mcp::tools::graph::*;
 use infigraph_mcp::tools::index::tool_index_project;
 use infigraph_mcp::tools::search::tool_search;
@@ -30,71 +29,10 @@ fn make_project(files: &[(&str, &str)]) -> (support::TestProject, String) {
     (dir, path)
 }
 
+/// Code and doc watchers alike: this binary's tests leave both behind.
 fn stop_all_watchers() {
-    let mut guard = get_watchers();
-    let stopped_paths: Vec<String> = if let Some(map) = guard.as_mut() {
-        let ids: Vec<String> = map.keys().cloned().collect();
-        let mut paths = Vec::new();
-        for id in ids {
-            if let Some(entry) = map.remove(&id) {
-                paths.push(entry.path.clone());
-                let _ = entry.stop_tx.send(());
-            }
-        }
-        paths
-    } else {
-        Vec::new()
-    };
-    drop(guard);
-    let mut doc_guard = get_doc_watchers();
-    if let Some(map) = doc_guard.as_mut() {
-        let ids: Vec<String> = map.keys().cloned().collect();
-        for id in ids {
-            if let Some(entry) = map.remove(&id) {
-                let _ = entry.stop_tx.send(());
-            }
-        }
-    }
-    drop(doc_guard);
-    wait_for_watch_locks_released(&stopped_paths);
-}
-
-/// A stopped watcher's thread notices `stop_rx` on its own poll cadence and
-/// may still be mid-reindex, so it doesn't release `.infigraph/watch.lock`
-/// the instant the stop signal is sent. Block (with a generous bound) until
-/// each path's lock is confirmed free, so tests that immediately re-watch
-/// the same project aren't racing the previous watcher's shutdown.
-fn wait_for_watch_locks_released(paths: &[String]) {
-    use fs2::FileExt;
-    for path in paths {
-        let lock_path = std::path::Path::new(path)
-            .join(".infigraph")
-            .join("watch.lock");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            let file = match std::fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(false)
-                .open(&lock_path)
-            {
-                Ok(f) => f,
-                Err(_) => break,
-            };
-            match file.try_lock_exclusive() {
-                Ok(()) => {
-                    let _ = file.unlock();
-                    break;
-                }
-                Err(_) => {
-                    if std::time::Instant::now() >= deadline {
-                        break;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(20));
-                }
-            }
-        }
-    }
+    support::stop_all_watchers();
+    support::stop_all_doc_watchers();
 }
 
 fn extract_watcher_id(output: &str) -> String {
