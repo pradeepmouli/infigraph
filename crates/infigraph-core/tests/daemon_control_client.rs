@@ -64,7 +64,8 @@ fn a_daemon_that_never_replies_is_unresponsive_within_the_deadline() {
     assert!(started.elapsed() < STATUS_DEADLINE + Duration::from_millis(500));
 }
 
-#[cfg(unix)]
+/// The client's abandoned reader is woken and drops its end, so the daemon
+/// sees the hang-up: `shutdown(2)` on unix, `CancelIoEx` on Windows (#206).
 #[test]
 fn an_unresponsive_daemon_sees_the_client_hang_up() {
     let dir = tempfile::tempdir().unwrap();
@@ -72,7 +73,7 @@ fn an_unresponsive_daemon_sees_the_client_hang_up() {
     let _fake = fake_daemon(dir.path(), move |mut s| {
         let mut buf = [0u8; 1];
         let started = Instant::now();
-        let _ = s.read(&mut buf); // blocks until the client shuts the socket down
+        let _ = s.read(&mut buf); // blocks until the client's end goes away
         tx.send(started.elapsed()).unwrap();
     });
     assert_eq!(query_status(dir.path()), Err(ControlError::Unresponsive));

@@ -6,7 +6,7 @@
 //! never keep it alive.
 
 use std::path::{Path, PathBuf};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::mpsc;
 use std::time::Duration;
 
 use super::read_endpoint::{connect_allowing_for_startup, ReadEndpoint, ReadStream};
@@ -114,13 +114,11 @@ fn by(deadline: Duration) -> impl FnMut() -> Option<ControlError> {
 /// its first `Some` ends the wait with that error.
 ///
 /// The read runs on a helper thread so the caller's deadline holds on every
-/// transport. On unix an abandoned read is also woken with `shutdown(2)`, so
-/// a wedged daemon never pins a thread in a long-lived client (MCP) -- and a
-/// daemon serving a write reads that close as its client leaving (#204). The
-/// handle sits behind a mutex the reader clears before dropping the stream:
-/// never shut down an fd number that may since have been reused. On Windows
-/// the abandoned reader thread stays blocked until the daemon closes the
-/// pipe -- a known gap, tracked in #206.
+/// transport. An abandoned read is also woken through the stream's
+/// [`ReadAbort`](super::read_endpoint::ReadAbort) (`shutdown(2)` on unix,
+/// `CancelIoEx` on Windows, #206), so a wedged daemon never pins a thread in
+/// a long-lived client (MCP) -- and the woken reader drops the stream, which
+/// a daemon serving a write reads as its client leaving (#204).
 pub(crate) fn exchange<O: DaemonOp, E: From<ControlError>>(
     mut stream: ReadStream,
     op: &O,
@@ -130,18 +128,12 @@ where
     O::Reply: Send + 'static,
 {
     write_op(&mut stream, op).map_err(|_| E::from(ControlError::Unresponsive))?;
-    #[cfg(unix)]
-    let hangup = Arc::new(Mutex::new(stream.lease_shutdown()));
-    #[cfg(not(unix))]
-    let hangup = Arc::new(Mutex::new(None::<()>));
-    let reader_hangup = hangup.clone();
+    let abort = stream.read_abort();
+    let reader_abort = abort.clone();
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let got = read_outcome::<O>(&mut stream);
-        reader_hangup
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take();
+        reader_abort.disarm();
         drop(stream);
         let _ = tx.send(got);
     });
@@ -153,12 +145,7 @@ where
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 if let Some(e) = stop() {
-                    #[cfg(unix)]
-                    if let Some(h) = hangup.lock().unwrap_or_else(|e| e.into_inner()).take() {
-                        h.shutdown();
-                    }
-                    #[cfg(not(unix))]
-                    let _ = &hangup;
+                    abort.abort();
                     return Err(e);
                 }
             }

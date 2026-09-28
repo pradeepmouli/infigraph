@@ -362,6 +362,114 @@ impl ReadStream {
         let interprocess::local_socket::Stream::UdSocket(s) = &self.inner;
         Some(LeaseShutdown(s.as_fd().as_raw_fd()))
     }
+
+    /// A handle another thread can use to wake a read blocked on this
+    /// stream. See [`ReadAbort`].
+    pub(crate) fn read_abort(&self) -> ReadAbort {
+        #[cfg(unix)]
+        let target = self.lease_shutdown();
+        #[cfg(windows)]
+        let target = {
+            use std::os::windows::io::{AsHandle as _, AsRawHandle as _};
+            let interprocess::local_socket::Stream::NamedPipe(s) = &self.inner;
+            Some(PipeCancel(s.as_handle().as_raw_handle()))
+        };
+        ReadAbort(std::sync::Arc::new(std::sync::Mutex::new(target)))
+    }
+}
+
+/// Wakes a read blocked on a [`ReadStream`] from the thread that gave up
+/// waiting for it (#206), so an abandoned read never pins a thread in a
+/// long-lived client (MCP) for as long as a daemon stays wedged. The woken
+/// reader drops the stream, which the daemon sees as its client leaving.
+///
+/// It holds a bare fd (unix) or HANDLE (Windows), valid only while the
+/// stream lives: the reader `disarm`s it before dropping the stream, and
+/// `abort` acts only under the same lock, so it never touches a handle
+/// number since reused.
+#[derive(Clone)]
+pub(crate) struct ReadAbort(std::sync::Arc<std::sync::Mutex<Option<AbortTarget>>>);
+
+#[cfg(unix)]
+type AbortTarget = LeaseShutdown;
+#[cfg(windows)]
+type AbortTarget = PipeCancel;
+
+impl ReadAbort {
+    fn target(&self) -> std::sync::MutexGuard<'_, Option<AbortTarget>> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The reader is done with the stream and about to drop it.
+    pub(crate) fn disarm(&self) {
+        self.target().take();
+    }
+
+    /// `shutdown(2)`: sticky, so a read that has not started yet sees EOF
+    /// too, and one call is enough.
+    #[cfg(unix)]
+    pub(crate) fn abort(&self) {
+        if let Some(target) = self.target().take() {
+            target.shutdown();
+        }
+    }
+
+    /// `CancelIoEx`, re-issued until the reader disarms or `ABORT_BUDGET`
+    /// passes.
+    ///
+    /// `interprocess` reads a pipe with an overlapped `ReadFileEx` and waits
+    /// for it in an alertable `SleepEx`, so `CancelSynchronousIo` on the
+    /// reader thread would find no synchronous I/O to cancel; cancelling the
+    /// handle's I/O completes the read with `ERROR_OPERATION_ABORTED`
+    /// instead. Unlike `shutdown(2)` a cancel is not sticky: one that lands
+    /// before the reader issues its `ReadFileEx`, or between two reads of
+    /// one reply, finds nothing pending (`ERROR_NOT_FOUND`) and the next
+    /// read blocks as before. Hence the retry, until the reader has
+    /// returned. Past the budget the reader is left blocked, as before #206.
+    #[cfg(windows)]
+    pub(crate) fn abort(&self) {
+        let started = std::time::Instant::now();
+        loop {
+            match &*self.target() {
+                Some(target) => target.cancel(),
+                None => return,
+            }
+            if started.elapsed() >= ABORT_BUDGET {
+                return;
+            }
+            std::thread::sleep(ABORT_RETRY);
+        }
+    }
+}
+
+/// How long `abort` keeps cancelling a reader that has not returned. A
+/// reader already blocked in its read returns on the first cancel; this
+/// covers one that had not reached it yet.
+#[cfg(windows)]
+const ABORT_BUDGET: std::time::Duration = std::time::Duration::from_millis(200);
+#[cfg(windows)]
+const ABORT_RETRY: std::time::Duration = std::time::Duration::from_millis(1);
+
+/// A named pipe's handle, for `CancelIoEx` from another thread.
+#[cfg(windows)]
+struct PipeCancel(std::os::windows::io::RawHandle);
+
+// SAFETY: a HANDLE is process-wide, usable from any thread; this one is only
+// passed to `CancelIoEx`, and only while its stream lives (see `ReadAbort`).
+#[cfg(windows)]
+unsafe impl Send for PipeCancel {}
+
+#[cfg(windows)]
+impl PipeCancel {
+    fn cancel(&self) {
+        // SAFETY: the handle is open -- `ReadAbort` disarms, under its lock,
+        // before the owning stream is dropped. A null OVERLAPPED cancels
+        // every pending I/O this process has on the handle; a FALSE return
+        // (`ERROR_NOT_FOUND`: nothing pending) is the race `abort` retries.
+        unsafe {
+            windows_sys::Win32::System::IO::CancelIoEx(self.0, std::ptr::null());
+        }
+    }
 }
 
 impl ReadStream {
