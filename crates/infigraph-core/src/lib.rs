@@ -527,8 +527,9 @@ impl Infigraph {
                         // a daemon-restart crash-rebuild cascade reaching this path on
                         // its first queued write (before any read ever creates that
                         // path's sentinel) still trips the breaker. Mirrors
-                        // `recovery::drain_recovery_sentinel`'s check-then-record
-                        // sequence (adversarial review finding).
+                        // the coordinator's check-then-record sequence
+                        // (`recovery::recovery_rebuild_wanted`, then
+                        // `recovery::rebuild_started`; adversarial review finding).
                         let infigraph_dir = self.db_path.parent().unwrap_or(&self.root);
                         let attempts = crate::recovery::recent_recovery_attempts(infigraph_dir)
                             .unwrap_or_default();
@@ -621,7 +622,7 @@ impl Infigraph {
                         // graph below is simply the project's new state and
                         // nothing ever refills it. `dead_pid` is 0 because
                         // this path is reached on any durable open failure,
-                        // not only a dead holder -- `drain_recovery_sentinel`
+                        // not only a dead holder -- `recovery_rebuild_wanted`
                         // keys off the sentinel's existence, not that field.
                         let _ =
                             crate::recovery::mark_recovery_needed(infigraph_dir, 0, &self.db_path);

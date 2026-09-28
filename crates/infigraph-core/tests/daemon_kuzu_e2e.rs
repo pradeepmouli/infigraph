@@ -1501,7 +1501,7 @@ fn a_third_recovery_trigger_inside_the_window_trips_the_crash_loop_breaker_inste
     .unwrap();
 
     assert!(
-        !infigraph_core::recovery::drain_recovery_sentinel(&infigraph_dir).unwrap(),
+        !infigraph_core::recovery::recovery_rebuild_wanted(&infigraph_dir).unwrap(),
         "must not ask for another FullReindex once tripped"
     );
     assert!(

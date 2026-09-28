@@ -3,7 +3,7 @@
 //! `.infigraph/`, mirroring the short-lived-file-then-append-log shape
 //! `dirty.rs`/`audit.rs` already use elsewhere in this crate: a
 //! "recovery needed" sentinel the daemon coordinator polls for
-//! (`drain_recovery_sentinel`, called from `daemon::run_write_coordinator`),
+//! (`recovery_rebuild_wanted`, called from `daemon::run_write_coordinator`),
 //! and a rolling attempts log the coordinator consults before acting on it.
 //!
 //! The read path (`graph::store::open_read_only_or_degrade`) only ever
@@ -202,13 +202,16 @@ pub fn find_most_recent_previous(infigraph_dir: &Path, graph_name: &str) -> Opti
         .map(|p| p.path)
 }
 
-/// The daemon coordinator's one-line integration point (called from
-/// `daemon::run_write_coordinator`'s `serve_requests` tick). No-op when no
-/// sentinel is pending. Otherwise: under the crash-loop threshold, answers
-/// `true` -- the coordinator then queues a `FullReindex`, the same request
-/// type and code path `infigraph rebuild` uses (#204); at or over the
-/// threshold, writes the crash-loop marker instead and answers `false`.
-pub fn drain_recovery_sentinel(infigraph_dir: &Path) -> Result<bool> {
+/// Whether a pending dead-holder-WAL sentinel wants a rebuild -- the
+/// daemon coordinator's integration point, asked every tick. `true` while a
+/// sentinel is pending and under the crash-loop threshold: the coordinator
+/// queues a `FullReindex`, the same request type and code path `infigraph
+/// rebuild` uses. The sentinel is *not* cleared here, only once a rebuild
+/// starts ([`rebuild_started`]): the queued request lives in the
+/// coordinator's memory, so a dropped request or a daemon restart must
+/// leave the sentinel behind to ask again (#204). At or over the threshold,
+/// writes the crash-loop marker, clears the sentinel and answers `false`.
+pub fn recovery_rebuild_wanted(infigraph_dir: &Path) -> Result<bool> {
     if !pending_recovery(infigraph_dir) {
         return Ok(false);
     }
@@ -225,7 +228,17 @@ pub fn drain_recovery_sentinel(infigraph_dir: &Path) -> Result<bool> {
         clear_recovery_needed(infigraph_dir)?;
         return Ok(false);
     }
+    Ok(true)
+}
 
+/// A full reindex has started. If a recovery sentinel is pending, this is
+/// its rebuild: record the attempt (the crash-loop budget counts rebuilds
+/// that ran, not requests) and clear the sentinel. Any rebuild answers it --
+/// a client's included.
+pub fn rebuild_started(infigraph_dir: &Path) -> Result<()> {
+    if !pending_recovery(infigraph_dir) {
+        return Ok(());
+    }
     record_recovery_attempt(infigraph_dir)?;
     crate::audit::audit_log(
         "recovery",
@@ -233,8 +246,7 @@ pub fn drain_recovery_sentinel(infigraph_dir: &Path) -> Result<bool> {
         "dead-holder WAL quarantined; auto-rebuild triggered",
         &infigraph_dir.display().to_string(),
     );
-    clear_recovery_needed(infigraph_dir)?;
-    Ok(true)
+    clear_recovery_needed(infigraph_dir)
 }
 
 #[cfg(test)]
@@ -312,24 +324,41 @@ mod tests {
     }
 
     #[test]
-    fn drain_recovery_sentinel_submits_a_full_reindex_request_under_the_threshold() {
+    fn a_pending_sentinel_asks_for_a_rebuild_until_one_starts() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
         mark_recovery_needed(dir, 1, &dir.join("graph.corrupt.1")).unwrap();
 
-        assert!(drain_recovery_sentinel(dir).unwrap(), "a rebuild is wanted");
-
-        assert!(!pending_recovery(dir), "sentinel must be cleared");
+        // Review finding (#204): asking is not doing. The request lives only
+        // in the coordinator's memory, so the sentinel -- which survives a
+        // restart, and a dropped request -- stays until a rebuild starts.
+        assert!(recovery_rebuild_wanted(dir).unwrap(), "a rebuild is wanted");
+        assert!(pending_recovery(dir), "still pending until one starts");
+        assert!(
+            recovery_rebuild_wanted(dir).unwrap(),
+            "so it is asked again"
+        );
+        assert!(recent_recovery_attempts(dir).unwrap().is_empty());
         assert!(
             !dir.join("requests").exists(),
             "and no file is written for it"
         );
+
+        rebuild_started(dir).unwrap();
+        assert!(!pending_recovery(dir), "a started rebuild clears it");
         assert_eq!(recent_recovery_attempts(dir).unwrap().len(), 1);
+        assert!(!recovery_rebuild_wanted(dir).unwrap());
+        rebuild_started(dir).unwrap();
+        assert_eq!(
+            recent_recovery_attempts(dir).unwrap().len(),
+            1,
+            "a rebuild with no sentinel pending is not a recovery attempt"
+        );
         assert!(crash_loop_detected(dir).is_none());
     }
 
     #[test]
-    fn drain_recovery_sentinel_trips_the_breaker_at_the_threshold() {
+    fn a_pending_sentinel_trips_the_breaker_at_the_threshold() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
         for _ in 0..CRASH_LOOP_THRESHOLD {
@@ -338,7 +367,7 @@ mod tests {
         mark_recovery_needed(dir, 1, &dir.join("graph.corrupt.99")).unwrap();
 
         assert!(
-            !drain_recovery_sentinel(dir).unwrap(),
+            !recovery_rebuild_wanted(dir).unwrap(),
             "no rebuild once tripped"
         );
 

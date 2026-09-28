@@ -1493,7 +1493,7 @@ where
             // queued FullReindex (or a crash-loop refusal) before routing the
             // deferred writes below, so this same tick starts it rather than
             // waiting a full COORDINATOR_TICK.
-            match crate::recovery::drain_recovery_sentinel(&infigraph_dir) {
+            match crate::recovery::recovery_rebuild_wanted(&infigraph_dir) {
                 Ok(true) => {
                     request_internal_rebuild(&mut deferred, full_reindex_in_flight.is_some())
                 }
@@ -1618,7 +1618,11 @@ where
                 ) {
                     Routed::Done => {}
                     Routed::Started(PendingWork::FullReindex(p)) => {
-                        full_reindex_in_flight = Some(p)
+                        full_reindex_in_flight = Some(p);
+                        // Any rebuild answers a pending recovery sentinel.
+                        if let Err(e) = crate::recovery::rebuild_started(&infigraph_dir) {
+                            eprintln!("[watch] recovery-sentinel handling failed: {e}");
+                        }
                     }
                     Routed::Started(PendingWork::ScipImport(p)) => scip_import_in_flight = Some(p),
                     Routed::NotYet(request, reply) => deferred.push_back((request, reply)),
@@ -1817,25 +1821,14 @@ where
         }
     }
 
-    // Refuse new control requests, and let the ones in flight finish writing
-    // their replies (a Daemon Stop's above all) before teardown and exit.
-    drop(port_rx);
-    for (_, reply) in deferred.drain(..) {
-        reply.send(WriteResult::Err {
-            message: coordinator_port::SHUTTING_DOWN.to_string(),
-        });
-    }
-    if !port.wait_idle(Duration::from_secs(2)) {
-        eprintln!(
-            "[control] {} control reply(s) still in flight at shutdown",
-            port.in_flight()
-        );
-    }
-
-    // Stop the producer before waiting out the in-flight work below: it
-    // shares `queue`, and anything it adds after this point would be
-    // enqueued for a drain that is never going to run.
+    // Stop the producer before answering the queue and waiting out the
+    // in-flight work below: it shares `queue`, and anything it adds after
+    // this point would be enqueued for a drain that is never going to run.
     code_watch.stop();
+
+    // Refuse new requests, and tell every write that has not started that
+    // it never will (#204).
+    answer_pending_writes(port_rx, &mut deferred, &queue);
 
     // A drain still running when the loop exits holds `index.lock` and a
     // connection to the graph. Wait it out rather than returning into a
@@ -1880,6 +1873,16 @@ where
             drain_rt.block_on(in_flight.task.join()),
         );
         drop(guard);
+    }
+
+    // Last, so the joins above have answered their clients: let every
+    // connection thread finish writing its reply (a Daemon Stop's above
+    // all) before the process exits under it.
+    if !port.wait_idle(Duration::from_secs(2)) {
+        eprintln!(
+            "[control] {} control reply(s) still in flight at shutdown",
+            port.in_flight()
+        );
     }
 
     Ok(())
@@ -3409,6 +3412,34 @@ fn unreadable_sidecar(path: &Path, e: &anyhow::Error) -> WriteResult {
     }
 }
 
+/// At shutdown: close the port, and answer every write that has not started
+/// -- still in the channel, deferred, or queued for a drain -- with
+/// `SHUTTING_DOWN`, rather than leaving `Drop` to say `DROPPED` (#204).
+fn answer_pending_writes(
+    port_rx: mpsc::Receiver<coordinator_port::PortMsg>,
+    deferred: &mut VecDeque<(WriteRequest, WriteReply)>,
+    queue: &Arc<Mutex<crate::daemon::queue::IndexWorkQueue>>,
+) {
+    let shutting_down = || WriteResult::Err {
+        message: coordinator_port::SHUTTING_DOWN.to_string(),
+    };
+    for msg in port_rx.try_iter() {
+        // A control message's reply sender drops here, which its thread
+        // already reports as shutting down.
+        if let coordinator_port::PortMsg::Write { reply, .. } = msg {
+            reply.send(shutting_down());
+        }
+    }
+    drop(port_rx);
+    for (_, reply) in deferred.drain(..) {
+        reply.send(shutting_down());
+    }
+    let queued = queue.lock().unwrap_or_else(|e| e.into_inner()).drain();
+    for waiter in queued.waiters {
+        waiter.reply.send(shutting_down());
+    }
+}
+
 /// Remove deferred writes whose clients have disconnected (#204 D3),
 /// returning how many.
 fn drop_gone(deferred: &mut VecDeque<(WriteRequest, WriteReply)>) -> usize {
@@ -4109,6 +4140,44 @@ mod tests {
 
     /// #204 D3: a write that cannot start yet waits in `deferred`; once its
     /// client has left, it is dropped rather than started.
+    /// Review finding (#204): at shutdown every write that has not started
+    /// -- still in the port's channel, deferred, or queued for a drain --
+    /// is told the daemon is shutting down, not left for `Drop` to answer
+    /// with the generic `DROPPED` as the process exits.
+    #[test]
+    fn at_shutdown_every_unstarted_write_is_told_the_daemon_is_shutting_down() {
+        let (port, port_rx) = coordinator_port::CoordinatorPort::new(0, 1);
+        let (buffered, buffered_rx) = WriteReply::channel();
+        port.admit_write(WriteRequest::FullReindex, buffered, || false)
+            .unwrap();
+        let (deferred_reply, deferred_rx) = WriteReply::channel();
+        let mut deferred = VecDeque::from([(WriteRequest::FullReindex, deferred_reply)]);
+        let queue = Arc::new(Mutex::new(crate::daemon::queue::IndexWorkQueue::new()));
+        let (queued_reply, queued_rx) = WriteReply::channel();
+        queue
+            .lock()
+            .unwrap()
+            .add_waiter(crate::daemon::queue::Waiter {
+                kind: crate::daemon::queue::WaiterKind::Index,
+                use_learned: false,
+                reply: queued_reply,
+                paths: None,
+            });
+
+        answer_pending_writes(port_rx, &mut deferred, &queue);
+
+        for rx in [buffered_rx, deferred_rx, queued_rx] {
+            match rx.recv().unwrap() {
+                WriteResult::Err { message } => {
+                    assert_eq!(message, coordinator_port::SHUTTING_DOWN)
+                }
+                other => panic!("expected the shutdown answer, got {other:?}"),
+            }
+        }
+        assert!(deferred.is_empty());
+        assert!(queue.lock().unwrap().drain().waiters.is_empty());
+    }
+
     #[test]
     fn internal_rebuilds_collapse_while_one_is_waiting_or_running() {
         let mut deferred = VecDeque::new();
