@@ -48,6 +48,11 @@ pub fn isolate_registry() -> &'static Path {
         let home = base.join(format!("{REGISTRY_HOME_PREFIX}{}", std::process::id()));
         std::fs::create_dir_all(&home).expect("registry scratch dir");
         std::env::set_var("INFIGRAPH_REGISTRY_HOME", &home);
+        // In-process tools log their failures (index timeouts, a clone's
+        // failed edges) through `mcp_log`; keep those out of the real
+        // `mcp.log` too (#201). Only the log: the lock stays per-test, via
+        // `McpStateScope` or `isolated_mcp_command`.
+        std::env::set_var("INFIGRAPH_MCP_LOG_PATH", home.join("mcp.log"));
         home
     })
 }
