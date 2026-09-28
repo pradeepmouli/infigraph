@@ -621,7 +621,7 @@ fn end_daemon_if(
     let mut sys = sysinfo::System::new();
     sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[spid]), true);
 
-    let Some(proc) = sys.process(spid) else {
+    let Some(proc) = crate::ps::running_process(&sys, spid) else {
         // PID isn't running at all -- the lock is simply stale (the holder
         // crashed or was killed without releasing it). Nothing to signal;
         // the caller's retry-acquire will pick up the now-free lock.
@@ -728,7 +728,7 @@ fn wait_for_pid_exit(
 ) -> bool {
     for _ in 0..attempts {
         sys.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
-        if sys.process(pid).is_none() {
+        if crate::ps::running_process(sys, pid).is_none() {
             return true;
         }
         std::thread::sleep(delay);
@@ -797,13 +797,30 @@ pub fn build_daemon_command(root: &Path, tg_dir: &Path, watch_binary: &Path) -> 
     cmd
 }
 
+/// Wait on a spawned daemon from a parked thread, so its exit is collected
+/// at once instead of leaving it as this process's zombie until we exit.
+/// `setsid` detaches the daemon's session, not its parentage: a long-lived
+/// spawner (the MCP server) is still its parent, and on Linux every daemon it
+/// outlived used to linger in the process table. The thread only waits; it
+/// dies with this process, and a daemon outliving us is reparented as usual.
+fn reap_in_background(mut child: std::process::Child) {
+    let _ = std::thread::Builder::new()
+        .name("infigraph-daemon-reaper".into())
+        .spawn(move || {
+            let _ = child.wait();
+        });
+}
+
 fn spawn_daemon(root: &Path, tg_dir: &Path, watch_binary: &Path) -> DaemonStartOutcome {
     // #141: say so up front if the daemon we are about to launch is not the
     // build we are (one subprocess, once per binary path per process).
     crate::daemon::warn_if_cli_build_differs(watch_binary);
     let mut cmd = build_daemon_command(root, tg_dir, watch_binary);
     match cmd.spawn() {
-        Ok(_) => DaemonStartOutcome::Spawned,
+        Ok(child) => {
+            reap_in_background(child);
+            DaemonStartOutcome::Spawned
+        }
         Err(e) => DaemonStartOutcome::Failed(e.to_string()),
     }
 }
@@ -1105,6 +1122,57 @@ mod tests {
         assert!(
             wait_for_pid_exit(pid, &mut sys, 5, std::time::Duration::from_millis(10)),
             "an already-exited (and reaped) PID must be reported as gone on the first check"
+        );
+    }
+
+    /// A spawned daemon is reaped when it exits, so it never lingers as its
+    /// spawner's zombie (Linux lists zombies; a long-lived MCP server spawns
+    /// daemons and used to collect one per daemon it outlived).
+    #[test]
+    #[cfg(unix)]
+    fn a_reaped_in_background_child_leaves_no_zombie() {
+        let child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id() as libc::pid_t;
+        super::reap_in_background(child);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            // SAFETY: waitpid with WNOHANG on our own child's pid.
+            let got = unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) };
+            if got == -1 {
+                assert_eq!(
+                    std::io::Error::last_os_error().raw_os_error(),
+                    Some(libc::ECHILD),
+                    "the child is no longer ours to wait on: it was reaped"
+                );
+                return;
+            }
+            assert_ne!(got, pid, "the child was left for us to reap: a zombie");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the child never exited"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// An exited child its parent has not reaped yet is gone: Linux still
+    /// lists the zombie, and treating it as running is how `rebuild` called
+    /// a daemon that had exited on its SIGTERM "stuck" whenever the
+    /// daemon's parent had not waited on it (CI, ubuntu only).
+    #[test]
+    #[cfg(unix)]
+    fn wait_for_pid_exit_treats_an_unreaped_child_as_gone() {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = sysinfo::Pid::from_u32(child.id());
+        // Let it exit without reaping it, so it stays a zombie.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let mut sys = sysinfo::System::new();
+
+        let gone = wait_for_pid_exit(pid, &mut sys, 5, std::time::Duration::from_millis(10));
+        child.wait().unwrap();
+        assert!(
+            gone,
+            "an exited but unreaped child must be reported as gone"
         );
     }
 
