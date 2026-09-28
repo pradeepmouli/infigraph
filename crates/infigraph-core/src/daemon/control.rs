@@ -32,6 +32,9 @@ pub enum ControlError {
     Unresponsive,
     /// The daemon answered with an error.
     Refused(String),
+    /// The daemon accepted a write, then closed before answering: it exited
+    /// while serving it (#204).
+    Lost,
 }
 
 impl std::fmt::Display for ControlError {
@@ -45,6 +48,9 @@ impl std::fmt::Display for ControlError {
                 f.write_str("the daemon is not responding; run `infigraph daemon-restart`")
             }
             ControlError::Refused(msg) => write!(f, "the daemon refused: {msg}"),
+            ControlError::Lost => f.write_str(
+                "the daemon exited while serving this request; see .infigraph/daemon.log",
+            ),
         }
     }
 }
@@ -55,7 +61,7 @@ fn watch_lock_held(root: &Path) -> bool {
     super::lifecycle::daemon_is_alive(&root.join(".infigraph").join("watch.lock"))
 }
 
-fn not_connected(root: &Path) -> ControlError {
+pub(crate) fn not_connected(root: &Path) -> ControlError {
     if watch_lock_held(root) {
         ControlError::Unresponsive
     } else {
@@ -67,7 +73,7 @@ pub fn query_status(root: &Path) -> Result<StatusReport, ControlError> {
     let stream = ReadEndpoint::for_root(root)
         .connect()
         .map_err(|_| not_connected(root))?;
-    exchange(stream, &StatusFrame::default(), STATUS_DEADLINE)
+    exchange(stream, &StatusFrame::default(), by(STATUS_DEADLINE))
 }
 
 pub fn send_control(root: &Path, role: WatchRole, action: WatchAction) -> Result<(), ControlError> {
@@ -77,7 +83,7 @@ pub fn send_control(root: &Path, role: WatchRole, action: WatchAction) -> Result
         &ControlFrame {
             control: ControlRequest { role, action },
         },
-        CONTROL_DEADLINE,
+        by(CONTROL_DEADLINE),
     )
 }
 
@@ -95,24 +101,35 @@ pub fn query_status_many(roots: &[PathBuf]) -> Vec<Result<StatusReport, ControlE
         .collect()
 }
 
-/// Send `op` and wait at most `deadline` for its one reply frame.
+/// How often a waiting caller's stop check runs.
+const EXCHANGE_POLL: Duration = Duration::from_millis(50);
+
+/// Stops at `deadline` with `Unresponsive`: status and control's wait.
+fn by(deadline: Duration) -> impl FnMut() -> Option<ControlError> {
+    let started = std::time::Instant::now();
+    move || (started.elapsed() >= deadline).then_some(ControlError::Unresponsive)
+}
+
+/// Send `op` and wait for its reply, running `stop` every `EXCHANGE_POLL`;
+/// its first `Some` ends the wait with that error.
 ///
 /// The read runs on a helper thread so the caller's deadline holds on every
-/// transport. On unix a timed-out read is also woken with `shutdown(2)`, so
-/// a wedged daemon never pins a thread in a long-lived client (MCP). The
+/// transport. On unix an abandoned read is also woken with `shutdown(2)`, so
+/// a wedged daemon never pins a thread in a long-lived client (MCP) -- and a
+/// daemon serving a write reads that close as its client leaving (#204). The
 /// handle sits behind a mutex the reader clears before dropping the stream:
 /// never shut down an fd number that may since have been reused. On Windows
-/// the timed-out reader thread stays blocked until the daemon closes the
+/// the abandoned reader thread stays blocked until the daemon closes the
 /// pipe -- a known gap, tracked in #206.
-fn exchange<O: DaemonOp>(
+pub(crate) fn exchange<O: DaemonOp, E: From<ControlError>>(
     mut stream: ReadStream,
     op: &O,
-    deadline: Duration,
-) -> Result<O::Reply, ControlError>
+    mut stop: impl FnMut() -> Option<E>,
+) -> Result<O::Reply, E>
 where
     O::Reply: Send + 'static,
 {
-    write_op(&mut stream, op).map_err(|_| ControlError::Unresponsive)?;
+    write_op(&mut stream, op).map_err(|_| E::from(ControlError::Unresponsive))?;
     #[cfg(unix)]
     let hangup = Arc::new(Mutex::new(stream.lease_shutdown()));
     #[cfg(not(unix))]
@@ -120,7 +137,7 @@ where
     let reader_hangup = hangup.clone();
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let got = read_reply::<_, O::Reply>(&mut stream);
+        let got = read_outcome::<O>(&mut stream);
         reader_hangup
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -128,19 +145,42 @@ where
         drop(stream);
         let _ = tx.send(got);
     });
-    match rx.recv_timeout(deadline) {
-        Ok(Ok(Some(OpReply::Ok(v)))) => Ok(v),
-        Ok(Ok(Some(OpReply::Err(msg)))) => Err(ControlError::Refused(msg)),
-        Ok(Ok(None)) | Ok(Err(_)) => Err(ControlError::Incompatible),
-        Err(_) => {
-            #[cfg(unix)]
-            if let Some(h) = hangup.lock().unwrap_or_else(|e| e.into_inner()).take() {
-                h.shutdown();
+    loop {
+        match rx.recv_timeout(EXCHANGE_POLL) {
+            Ok(got) => return got.map_err(E::from),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(E::from(ControlError::Incompatible))
             }
-            #[cfg(not(unix))]
-            let _ = hangup;
-            Err(ControlError::Unresponsive)
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if let Some(e) = stop() {
+                    #[cfg(unix)]
+                    if let Some(h) = hangup.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                        h.shutdown();
+                    }
+                    #[cfg(not(unix))]
+                    let _ = &hangup;
+                    return Err(e);
+                }
+            }
         }
+    }
+}
+
+/// The reply frames for one op: an admission frame first when `O::ACKED`
+/// (#204), so an EOF after it is `Lost`, not `Incompatible`.
+fn read_outcome<O: DaemonOp>(stream: &mut ReadStream) -> Result<O::Reply, ControlError> {
+    if O::ACKED {
+        match read_reply::<_, ()>(stream) {
+            Ok(Some(OpReply::Ok(()))) => {}
+            Ok(Some(OpReply::Err(m))) => return Err(ControlError::Refused(m)),
+            Ok(None) | Err(_) => return Err(ControlError::Incompatible),
+        }
+    }
+    match read_reply::<_, O::Reply>(stream) {
+        Ok(Some(OpReply::Ok(v))) => Ok(v),
+        Ok(Some(OpReply::Err(m))) => Err(ControlError::Refused(m)),
+        Ok(None) | Err(_) if O::ACKED => Err(ControlError::Lost),
+        Ok(None) | Err(_) => Err(ControlError::Incompatible),
     }
 }
 

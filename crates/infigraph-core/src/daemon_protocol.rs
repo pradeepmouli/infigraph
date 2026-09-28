@@ -127,6 +127,32 @@ pub enum WriteRequest {
     FullReindex,
 }
 
+impl WriteRequest {
+    /// The variant's name, for messages.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            WriteRequest::Index { .. } => "Index",
+            WriteRequest::ScipImport { .. } => "ScipImport",
+            WriteRequest::IngestStructured { .. } => "IngestStructured",
+            WriteRequest::UpsertRepo { .. } => "UpsertRepo",
+            WriteRequest::DeriveTestedBy { .. } => "DeriveTestedBy",
+            WriteRequest::UpsertSimilarEdge { .. } => "UpsertSimilarEdge",
+            WriteRequest::WriteCallsServiceEdges { .. } => "WriteCallsServiceEdges",
+            WriteRequest::WriteCrossServiceEdges { .. } => "WriteCrossServiceEdges",
+            WriteRequest::UpsertDependencies { .. } => "UpsertDependencies",
+            WriteRequest::ReplaceConcerns { .. } => "ReplaceConcerns",
+            WriteRequest::ReplaceTaintFlows { .. } => "ReplaceTaintFlows",
+            WriteRequest::ReplaceResolvesTo { .. } => "ReplaceResolvesTo",
+            WriteRequest::StoreClusters { .. } => "StoreClusters",
+            WriteRequest::StoreConfigBindings { .. } => "StoreConfigBindings",
+            WriteRequest::UpsertFilesBulk { .. } => "UpsertFilesBulk",
+            WriteRequest::RemoveFiles { .. } => "RemoveFiles",
+            WriteRequest::ResolveCalls { .. } => "ResolveCalls",
+            WriteRequest::FullReindex => "FullReindex",
+        }
+    }
+}
+
 /// Moved to the read protocol with #155; re-exported so existing paths keep
 /// working.
 pub use crate::daemon::read_protocol::{WatchAction, WatchRole};
@@ -303,11 +329,10 @@ impl std::fmt::Display for DaemonFaulted {
 impl std::error::Error for DaemonFaulted {}
 
 /// The latched fault that should stop `request` from waiting on the daemon
-/// that serves `staging_dir`, if any. The fault record sits beside the
-/// staging directory, in `.infigraph/`.
+/// that serves `staging_dir`: the one check, in `daemon::writes`, applied to
+/// `.infigraph/` beside the staging directory.
 fn blocking_fault(staging_dir: &Path, request: &WriteRequest) -> Option<DaemonFaulted> {
-    let fault = crate::daemon::fault::live_fault(staging_dir.parent()?)?;
-    (!fault.class.admits(request)).then_some(DaemonFaulted(fault))
+    crate::daemon::writes::blocking_fault(staging_dir.parent()?, request)
 }
 
 fn submit_write_request_named_cancellable(
@@ -670,86 +695,8 @@ mod tests {
 
 #[cfg(test)]
 mod submit_tests {
-    use super::{submit_write_request, write_atomic, DaemonFaulted, WriteRequest, WriteResult};
-    use std::path::Path;
-    use std::time::{Duration, Instant};
-
-    fn staging_with_fault(class: crate::daemon::fault::FaultClass) -> tempfile::TempDir {
-        let dir = tempfile::tempdir().unwrap();
-        // This test process stands in for the daemon: its record is live
-        // for exactly as long as the writer runs.
-        crate::daemon::fault::record(dir.path(), class, "No space left on device (os error 28)");
-        dir
-    }
-
-    fn request_files(staging_dir: &Path) -> usize {
-        std::fs::read_dir(staging_dir)
-            .map(|d| d.filter_map(|e| e.ok()).count())
-            .unwrap_or(0)
-    }
-
-    /// #165: a daemon latched on a full disk fails a submit at once, with its
-    /// own error, instead of letting it wait out the timeout.
-    #[test]
-    fn a_latched_fault_fails_a_submit_fast_with_the_daemons_error() {
-        let dir = staging_with_fault(crate::daemon::fault::FaultClass::DiskFull);
-        let staging_dir = dir.path().join("requests");
-        let start = Instant::now();
-        let err = submit_write_request(
-            &staging_dir,
-            &WriteRequest::FullReindex,
-            Duration::from_secs(600),
-        )
-        .expect_err("a latched fault must fail the submit");
-        assert!(start.elapsed() < Duration::from_secs(5));
-        assert!(err.downcast_ref::<DaemonFaulted>().is_some(), "{err:#}");
-        assert!(
-            err.to_string().contains("No space left on device"),
-            "{err:#}"
-        );
-        assert_eq!(request_files(&staging_dir), 0, "nothing is left behind");
-    }
-
-    /// A fault the daemon latches while a client waits ends the wait too, and
-    /// withdraws the request.
-    #[test]
-    fn a_fault_latched_mid_wait_ends_the_wait_and_withdraws_the_request() {
-        let dir = tempfile::tempdir().unwrap();
-        let staging_dir = dir.path().join("requests");
-        let infigraph_dir = dir.path().to_path_buf();
-        let daemon = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(300));
-            crate::daemon::fault::record(
-                &infigraph_dir,
-                crate::daemon::fault::FaultClass::OpenFailed,
-                "graph will not open",
-            );
-        });
-        let err = submit_write_request(
-            &staging_dir,
-            &WriteRequest::Index { paths: None },
-            Duration::from_secs(30),
-        )
-        .expect_err("the fault must end the wait");
-        daemon.join().unwrap();
-        assert!(err.downcast_ref::<DaemonFaulted>().is_some(), "{err:#}");
-        assert_eq!(request_files(&staging_dir), 0, "the request was withdrawn");
-    }
-
-    /// A growth refusal still lets a full reindex through: it is the remedy.
-    #[test]
-    fn a_growth_refusal_still_admits_a_full_reindex() {
-        let dir = staging_with_fault(crate::daemon::fault::FaultClass::GrowthRefused);
-        let staging_dir = dir.path().join("requests");
-        let err = submit_write_request(
-            &staging_dir,
-            &WriteRequest::FullReindex,
-            Duration::from_millis(300),
-        )
-        .expect_err("no daemon answers in this test");
-        assert!(err.downcast_ref::<DaemonFaulted>().is_none(), "{err:#}");
-        assert!(err.to_string().contains("no daemon responded"), "{err:#}");
-    }
+    use super::{submit_write_request, write_atomic, WriteRequest, WriteResult};
+    use std::time::Duration;
 
     #[test]
     fn submit_write_request_writes_request_file_and_returns_matching_result() {

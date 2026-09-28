@@ -12,6 +12,7 @@ pub mod read_guard;
 pub mod read_protocol;
 pub mod read_service;
 pub mod task;
+pub mod writes;
 
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};
