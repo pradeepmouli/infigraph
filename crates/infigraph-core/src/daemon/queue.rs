@@ -1,6 +1,5 @@
 use crate::model::FileExtraction;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
 
 /// A single file's pending index-shaped work, before it's known whether the
 /// file needs a fresh disk read (`Raw`) or already carries pre-parsed
@@ -28,14 +27,14 @@ pub(crate) enum WaiterKind {
 }
 
 /// An ad-hoc daemon-protocol caller blocked on a reply for the drain this
-/// waiter was folded into.
-#[derive(Debug, Clone)]
+/// waiter was folded into. Not `Clone`: its reply is answered exactly once.
+#[derive(Debug)]
 #[allow(dead_code)]
 pub(crate) struct Waiter {
     pub kind: WaiterKind,
     /// `ResolveCalls` waiters only -- ignored for other kinds.
     pub use_learned: bool,
-    pub reply_path: PathBuf,
+    pub reply: crate::daemon::coordinator_port::WriteReply,
     /// The specific relative paths this waiter's own request named, so its
     /// reply can report a count scoped to what IT asked for rather than the
     /// whole merged drain (a targeted `Index`/`UpsertFilesBulk`/`RemoveFiles`
@@ -311,13 +310,13 @@ mod tests {
         q.add_waiter(Waiter {
             kind: WaiterKind::Index,
             use_learned: false,
-            reply_path: PathBuf::from("/tmp/a.result"),
+            reply: crate::daemon::coordinator_port::WriteReply::internal(),
             paths: None,
         });
         q.add_waiter(Waiter {
             kind: WaiterKind::ResolveCalls,
             use_learned: true,
-            reply_path: PathBuf::from("/tmp/b.result"),
+            reply: crate::daemon::coordinator_port::WriteReply::internal(),
             paths: None,
         });
         let drained = q.drain();

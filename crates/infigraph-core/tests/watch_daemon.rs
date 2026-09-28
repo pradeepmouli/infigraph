@@ -807,9 +807,8 @@ fn watch_loop_shuts_down_when_its_root_directory_is_deleted() {
 /// 9 out-of-scope variants, chosen because it's the simplest to construct
 /// (a single string field) and its handler (`GraphBackend::upsert_repo`)
 /// writes to the graph: while `index.lock` is held externally, the request
-/// must NOT be served (no `.result` file appears, and the `.request` file
-/// stays in place so it's retried); once the lock is released, it is
-/// served.
+/// must NOT be served (no `.result` file appears while the lock is held --
+/// the write stays deferred); once the lock is released, it is served.
 #[test]
 fn out_of_scope_write_request_contends_with_a_held_index_lock() {
     // Shared with other readers, exclusive against any test mutating
@@ -894,11 +893,6 @@ fn out_of_scope_write_request_contends_with_a_held_index_lock() {
             (i + 1) * 100
         );
     }
-    assert!(
-        request_path.exists(),
-        ".request file must remain in place (not deleted) while contended, so it's retried \
-         on a later tick"
-    );
 
     // Release the external hold; the next tick's serve_request_locked
     // attempt should now succeed.

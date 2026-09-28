@@ -38,7 +38,8 @@ fn serve_write_writes_err_result_on_failure_without_panicking() {
         paths: Some(vec!["does/not/exist.py".into()]),
     };
 
-    let result = serve_write(&infigraph, &request);
+    // Returning at all is the assertion: a failed index is a result, not a panic.
+    let _ = serve_write(&infigraph, &request);
 }
 
 /// A `ScipImport` request written by a client that predates the

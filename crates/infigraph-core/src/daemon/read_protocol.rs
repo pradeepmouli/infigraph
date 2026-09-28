@@ -534,11 +534,13 @@ mod malformed_frame_tests {
 
     #[test]
     fn only_writes_are_acked_and_writes_keep_the_daemon_alive() {
-        assert!(WriteFrame::ACKED);
-        assert!(WriteFrame::KEEPS_ALIVE);
-        assert!(!ReadRequest::ACKED);
-        assert!(!StatusFrame::ACKED);
-        assert!(!ControlFrame::ACKED);
+        fn acked<O: DaemonOp>() -> bool {
+            O::ACKED
+        }
+        assert!(acked::<WriteFrame>());
+        assert!(!acked::<ReadRequest>());
+        assert!(!acked::<StatusFrame>());
+        assert!(!acked::<ControlFrame>());
         let w = ClientFrame::Write(WriteFrame {
             write: crate::daemon_protocol::WriteRequest::FullReindex,
         });
