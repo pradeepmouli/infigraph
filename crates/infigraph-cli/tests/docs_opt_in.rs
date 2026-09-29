@@ -1,0 +1,158 @@
+//! Document indexing is opt-in per project
+//! (docs/superpowers/specs/2026-09-29-docs-opt-in-design.md), end to end
+//! against a real `infigraph daemon`.
+
+use std::path::Path;
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
+
+use infigraph_core::docs_switch::{docs_enabled_recorded, docs_store_path};
+
+const DAEMON: &str = "daemon";
+
+/// Kills and reaps the daemon on every exit path, panics included.
+struct Daemon(std::process::Child);
+
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn cli() -> &'static str {
+    env!("CARGO_BIN_EXE_infigraph")
+}
+
+/// A project with one source file and one document, and a scratch `HOME`
+/// so neither the registry nor a developer's `~/.infigraph/config.toml`
+/// leaks in.
+fn project() -> (tempfile::TempDir, tempfile::TempDir) {
+    let project = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    std::fs::write(project.path().join("hello.py"), "def hello():\n    pass\n").unwrap();
+    std::fs::write(
+        project.path().join("README.md"),
+        "# Hello\n\nThe zebra-crossing handbook.\n",
+    )
+    .unwrap();
+    (project, home)
+}
+
+/// Run one CLI command. `INFIGRAPH_NO_WATCH` keeps the pre-dispatch
+/// auto-watch from starting a daemon the test did not ask for.
+fn run(root: &Path, home: &Path, backend: &str, args: &[&str]) -> Output {
+    Command::new(cli())
+        .args(args)
+        .current_dir(root)
+        .env("HOME", home)
+        .env(infigraph_core::BACKEND_ENV, backend)
+        .env("INFIGRAPH_NO_WATCH", "1")
+        .env_remove("INFIGRAPH_DOCS_ENABLED")
+        .env_remove("INFIGRAPH_WATCH_DAEMON")
+        .output()
+        .unwrap()
+}
+
+fn stdout(out: &Output) -> String {
+    String::from_utf8_lossy(&out.stdout).to_string()
+}
+
+fn assert_ok(out: &Output, what: &str) {
+    assert!(
+        out.status.success(),
+        "{what} failed:\nstdout={}\nstderr={}",
+        stdout(out),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// The number after `label` on its line of a report (`Files indexed: 1`).
+fn count(text: &str, label: &str) -> usize {
+    text.lines()
+        .find_map(|line| line.trim().strip_prefix(label))
+        .and_then(|rest| rest.trim().parse().ok())
+        .unwrap_or_else(|| panic!("no `{label}` line in:\n{text}"))
+}
+
+/// Index the code locally, then start a real daemon with a fast doc poll
+/// and wait until it holds `watch.lock`.
+fn start_daemon(root: &Path, home: &Path) -> Daemon {
+    let bootstrap = run(
+        root,
+        home,
+        infigraph_core::LOCAL_BACKEND,
+        &["index", "--no-embed"],
+    );
+    assert_ok(&bootstrap, "bootstrap index");
+    let daemon = Daemon(
+        Command::new(cli())
+            .args(["daemon", "--debounce", "50"])
+            .current_dir(root)
+            .env("HOME", home)
+            .env(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND)
+            .env("INFIGRAPH_WATCH_DOC_DAEMON_POLL_MS", "50")
+            .env_remove("INFIGRAPH_DOCS_ENABLED")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    );
+    assert!(
+        infigraph_core::daemon::lifecycle::wait_for_daemon_ready(
+            &root.join(".infigraph").join("watch.lock"),
+            Duration::from_secs(30)
+        ),
+        "the daemon never took watch.lock"
+    );
+    daemon
+}
+
+/// Poll `check` for up to `budget`.
+fn eventually(budget: Duration, mut check: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + budget;
+    while Instant::now() < deadline {
+        if check() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    check()
+}
+
+/// Spec decision 2: a project that already has a document index keeps it
+/// on. The daemon records the switch at start.
+#[test]
+fn an_existing_index_is_kept_on_when_the_daemon_starts() {
+    let (project, home) = project();
+    let root = project.path();
+    // The code index first: `index` on a project whose `.infigraph/` has no
+    // graph yet auto-promotes to a full rebuild, which wipes `.infigraph/`
+    // -- docs store included -- so a store made before it would be gone by
+    // the time the daemon starts. After this, `start_daemon`'s bootstrap
+    // index is incremental and leaves the store alone.
+    assert_ok(
+        &run(
+            root,
+            home.path(),
+            infigraph_core::LOCAL_BACKEND,
+            &["index", "--no-embed"],
+        ),
+        "code index",
+    );
+    // A real store, created the way every pre-opt-in project got one. The
+    // test process runs with INFIGRAPH_BACKEND=kuzu pinned by the command.
+    infigraph_docs::DocIndex::open(root)
+        .unwrap()
+        .init()
+        .unwrap();
+    assert_eq!(docs_enabled_recorded(root), None);
+
+    let _daemon = start_daemon(root, home.path());
+    assert!(
+        eventually(Duration::from_secs(10), || docs_enabled_recorded(root)
+            == Some(true)),
+        "the daemon must record [docs] enabled = true for an existing index"
+    );
+}

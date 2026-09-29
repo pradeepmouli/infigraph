@@ -92,6 +92,22 @@ pub fn set_docs_enabled(root: &Path, enabled: bool) -> Result<()> {
     settings_file::set_project_setting(root, SECTION, ENABLED, toml_edit::value(enabled))
 }
 
+/// Keep an index that predates the switch on (spec decision 2): a project
+/// with a `docs.kuzu` whose `config.toml` records no `[docs] enabled` is
+/// recorded as on. Any recorded value, including an explicit `false` or one
+/// that does not parse as a boolean, is left alone. Returns whether it
+/// recorded anything. Run once, at daemon start, before the doc thread
+/// first reads the switch; this is the only migration site.
+pub fn migrate_existing_index(root: &Path) -> Result<bool> {
+    if settings_file::project_setting(root, SECTION, ENABLED).is_some()
+        || !docs_store_path(root).exists()
+    {
+        return Ok(false);
+    }
+    set_docs_enabled(root, true)?;
+    Ok(true)
+}
+
 /// Take the docs lock exclusively, waiting up to `timeout`.
 pub fn lock_docs_op(root: &Path, timeout: Duration) -> Result<crate::lockfile::LockFile> {
     crate::lockfile::acquire(&docs_op_lock_path(root), "docs-op", timeout)
@@ -212,5 +228,85 @@ mod tests {
         assert_eq!(DocsNotIndexed.to_string(), DOCS_NOT_INDEXED);
         let err = anyhow::Error::new(DocsNotIndexed);
         assert!(err.is::<DocsNotIndexed>());
+    }
+
+    fn with_store(root: &Path) {
+        let store = docs_store_path(root);
+        std::fs::create_dir_all(store.parent().unwrap()).unwrap();
+        std::fs::write(&store, b"x").unwrap();
+    }
+
+    #[test]
+    fn migration_turns_an_existing_index_on() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _home = PinnedHome::empty();
+        std::env::remove_var(ENV);
+        let tmp = tempfile::tempdir().unwrap();
+        with_store(tmp.path());
+        assert!(migrate_existing_index(tmp.path()).unwrap());
+        assert_eq!(docs_enabled_recorded(tmp.path()), Some(true));
+        assert!(
+            !migrate_existing_index(tmp.path()).unwrap(),
+            "once is enough: a recorded value is left alone"
+        );
+    }
+
+    #[test]
+    fn migration_respects_an_explicit_off() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _home = PinnedHome::empty();
+        std::env::remove_var(ENV);
+        let tmp = tempfile::tempdir().unwrap();
+        with_store(tmp.path());
+        set_docs_enabled(tmp.path(), false).unwrap();
+        assert!(!migrate_existing_index(tmp.path()).unwrap());
+        assert_eq!(docs_enabled_recorded(tmp.path()), Some(false));
+    }
+
+    #[test]
+    fn migration_leaves_a_project_without_an_index_alone() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _home = PinnedHome::empty();
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(!migrate_existing_index(tmp.path()).unwrap());
+        assert!(
+            !settings_file::project_config_path(tmp.path()).exists(),
+            "nothing to keep on, so nothing is written"
+        );
+    }
+
+    /// Review Focus 2: the user's bad value is theirs to fix (doctor's
+    /// settings check names it), never ours to overwrite with `true`.
+    #[test]
+    fn migration_leaves_a_present_but_invalid_value_alone() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _home = PinnedHome::empty();
+        let tmp = tempfile::tempdir().unwrap();
+        with_store(tmp.path());
+        let config = settings_file::project_config_path(tmp.path());
+        std::fs::write(&config, "[docs]\nenabled = \"yes\"\n").unwrap();
+        assert!(!migrate_existing_index(tmp.path()).unwrap());
+        assert_eq!(
+            std::fs::read_to_string(&config).unwrap(),
+            "[docs]\nenabled = \"yes\"\n"
+        );
+    }
+
+    /// Review Focus 1: an unparseable file reads as "records nothing", but
+    /// the write must refuse it rather than replace it.
+    #[test]
+    fn migration_leaves_an_unparseable_config_alone() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _home = PinnedHome::empty();
+        let tmp = tempfile::tempdir().unwrap();
+        with_store(tmp.path());
+        let config = settings_file::project_config_path(tmp.path());
+        std::fs::write(&config, "[docs\nenabled = ").unwrap();
+        let err = migrate_existing_index(tmp.path()).unwrap_err();
+        assert!(err.to_string().contains("invalid TOML"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(&config).unwrap(),
+            "[docs\nenabled = "
+        );
     }
 }

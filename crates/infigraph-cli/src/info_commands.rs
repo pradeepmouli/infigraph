@@ -587,6 +587,17 @@ pub(crate) fn cmd_daemon(root: &Path, debounce: u64) -> Result<()> {
     })
     .ok();
 
+    // Existing document indexes stay on (docs opt-in, decision 2): record
+    // `[docs] enabled = true` for a project that has a `docs.kuzu` and no
+    // recorded choice, before the doc thread first reads the switch. Never
+    // fatal: the graph is the daemon's job.
+    match infigraph_core::docs_switch::migrate_existing_index(root) {
+        Ok(true) => eprintln!(
+            "[daemon-start] documents: kept the existing index on ([docs] enabled = true)"
+        ),
+        Ok(false) => {}
+        Err(e) => eprintln!("[daemon-start] documents: could not record [docs] enabled: {e:#}"),
+    }
     let doc_watch = std::sync::Arc::new(std::sync::Mutex::new(DocWatchThread::new(
         root.to_path_buf(),
         debounce,
