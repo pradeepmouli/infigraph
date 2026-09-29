@@ -395,7 +395,8 @@ fn real_cli_index_against_a_real_daemon_completes_and_writes() {
 /// when it was reindexed, so a `claude_md` `VERSION` bump left every existing
 /// project on the old text -- five on one machine after #168. The daemon now
 /// refreshes the block when it starts, keeping the user's own content around
-/// it.
+/// it. The same goes for a block `infigraph init` wrote into `AGENTS.md`,
+/// which nothing but `init` used to rewrite (#207).
 #[test]
 fn a_starting_daemon_refreshes_a_stale_project_claude_md_block() {
     let project_dir = tempfile::tempdir().unwrap();
@@ -410,12 +411,22 @@ fn a_starting_daemon_refreshes_a_stale_project_claude_md_block() {
     let current = std::fs::read_to_string(&claude_md).unwrap();
     let stale = "<!-- BEGIN INFIGRAPH v1 -->\nFall back to grep.\n<!-- END INFIGRAPH -->\n";
     std::fs::write(&claude_md, format!("# My notes\n\n{stale}\nMore notes\n")).unwrap();
+    let agents_md = project_dir.path().join("AGENTS.md");
+    let marker = "<!-- infigraph-instructions -->";
+    std::fs::write(
+        &agents_md,
+        format!("# Agents\n\n{marker}\nFall back to grep.\n{marker}\n"),
+    )
+    .unwrap();
 
     let mut daemon = spawn_real_daemon(project_dir.path());
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     let refreshed = loop {
         let text = std::fs::read_to_string(&claude_md).unwrap();
-        if !text.contains("v1 -->") || std::time::Instant::now() >= deadline {
+        let agents_done = !std::fs::read_to_string(&agents_md)
+            .unwrap()
+            .contains("Fall back to grep");
+        if (!text.contains("v1 -->") && agents_done) || std::time::Instant::now() >= deadline {
             break text;
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -431,6 +442,11 @@ fn a_starting_daemon_refreshes_a_stale_project_claude_md_block() {
         "content outside the managed block must survive: {refreshed}"
     );
     assert!(!refreshed.contains("Fall back to grep"), "{refreshed}");
+    let agents = std::fs::read_to_string(&agents_md).unwrap();
+    assert!(
+        agents.starts_with("# Agents\n") && !agents.contains("Fall back to grep"),
+        "the daemon must refresh the AGENTS.md block too: {agents}"
+    );
 }
 
 /// End-to-end proof that a real spawned `infigraph daemon` process and a

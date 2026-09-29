@@ -6,11 +6,24 @@ use anyhow::Result;
 /// this version's marker is left alone, so an unbumped edit never reaches it.
 /// A bumped one reaches a project when it is next indexed or its daemon next
 /// starts.
-const VERSION: u32 = 3;
+const VERSION: u32 = 4;
 
 /// Write/update project-level `.claude/CLAUDE.md` with infigraph instructions.
 /// Uses sentinel markers for idempotent managed-block replacement.
+///
+/// The block is a pointer, not the rules themselves: `infigraph install` puts
+/// the rules in the user's global `~/.claude/CLAUDE.md` and the routing in the
+/// `infigraph-tool-routing` skill, and Claude Code loads every ancestor's
+/// CLAUDE.md, so a full copy here was paid for again in every session (#207).
+///
+/// Only a project store gets one ([`crate::project::is_project_store`]). A
+/// daemon started in a directory that holds projects, or in `$HOME` -- whose
+/// `.claude/CLAUDE.md` *is* the global file -- used to write the block there
+/// before anything decided the directory was not a project.
 pub fn ensure_project_claude_md(project_root: &Path) -> Result<()> {
+    if !crate::project::is_project_store(project_root) {
+        return Ok(());
+    }
     let claude_dir = project_root.join(".claude");
     let claude_md = claude_dir.join("CLAUDE.md");
     let begin_marker = format!("<!-- BEGIN INFIGRAPH v{} -->", VERSION);
@@ -19,39 +32,12 @@ pub fn ensure_project_claude_md(project_root: &Path) -> Result<()> {
     let instructions = format!(
         r#"
 {begin_marker}
-## Infigraph — Code Intelligence (auto-generated)
+## Infigraph (auto-generated)
 
-This project is indexed by Infigraph. Use Infigraph MCP tools FIRST for all code tasks.
-Read non-code files directly. If an Infigraph tool is unavailable or errors, tell the user
-(e.g. to reconnect the MCP server) rather than working around the enforcement hook.
-
-### Tool Preferences
-1. **`search`** for ALL code search — ranked symbols plus every line containing the text; **`regex=true`** lists every occurrence (e.g. all call sites). Constants: `get_symbols_in_file`. Full routing: the `infigraph-tool-routing` skill
-2. **`get_doc_context`** before editing any function — returns source+callers+callees
-3. **`trace_callers`** / **`find_all_references`** before refactoring — never grep for callers
-4. **`trace_callees`** / **`transitive_impact`** for blast radius
-5. Read files directly only for non-code files or Edit tool line-number context
-
-### Subagent Rules
-Do NOT spawn these agent types for code tasks — they lack MCP access:
-- **Explore** → use `search` (with `regex=true` to enumerate) and `get_symbols_in_file` directly
-- **Plan** → use `get_architecture`, `get_skeleton`, `get_stats` directly
-- **code-reviewer** → use `get_doc_context`, `get_code_snippet`, `review` directly
-
-For tasks requiring a subagent, use **general-purpose** — it has full MCP/infigraph access.
-
-### Verbose tools — delegate to subagent
-`get_architecture`, `transitive_impact`, `detect_dead_code`, `detect_clusters`,
-`detect_clones`, `export_graph`, `query_graph`, `trace_callers`/`trace_callees` (deep),
-`group_query`, `group_index`
-
-### Context Compression
-Tool outputs are automatically compressed to save context window budget.
-- Compression scales with session length (Off → Summary → Aggressive → Minimal)
-- `search` results are capped at Summary level to preserve result quality
-- Security tools (`detect_security_issues`, `detect_taint_flows`, etc.) are never compressed
-- `get_code_snippet` passes through uncompressed for edit accuracy
-- No action needed — compression is transparent and automatic
+This project is indexed by Infigraph. Use its MCP tools first for code tasks: the
+`infigraph-tool-routing` skill (installed by `infigraph install`) says which tool answers
+which question and how to set up a worktree. If an Infigraph tool is unavailable or errors,
+tell the user (e.g. to reconnect the MCP server) rather than working around the enforcement hook.
 {end_marker}
 "#
     );
@@ -123,4 +109,69 @@ pub fn remove_project_claude_md(project_root: &Path) -> Result<bool> {
         std::fs::write(&claude_md, format!("{}\n", trimmed))?;
     }
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A directory `is_project_store` accepts: `.infigraph/graph` and no
+    /// `registry.json`.
+    fn project() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".infigraph")).unwrap();
+        std::fs::write(tmp.path().join(".infigraph").join("graph"), b"").unwrap();
+        tmp
+    }
+
+    fn block_of(root: &Path) -> Option<String> {
+        std::fs::read_to_string(root.join(".claude").join("CLAUDE.md")).ok()
+    }
+
+    #[test]
+    fn a_project_gets_the_block_pointing_at_the_skill() {
+        let root = project();
+        ensure_project_claude_md(root.path()).unwrap();
+        let text = block_of(root.path()).expect("block written");
+        assert!(text.contains(&format!("<!-- BEGIN INFIGRAPH v{VERSION} -->")));
+        assert!(text.contains("`infigraph-tool-routing` skill"));
+    }
+
+    #[test]
+    fn a_directory_without_a_graph_is_left_alone() {
+        // A container of projects, or any directory a daemon was merely
+        // started in: no graph, so not a project.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".infigraph")).unwrap();
+        ensure_project_claude_md(tmp.path()).unwrap();
+        assert_eq!(block_of(tmp.path()), None);
+    }
+
+    #[test]
+    fn the_global_store_is_left_alone() {
+        // `$HOME` holds the user's global store, and `$HOME/.claude/CLAUDE.md`
+        // is the user's global instructions file.
+        let home = project();
+        std::fs::write(home.path().join(".infigraph").join("registry.json"), b"{}").unwrap();
+        ensure_project_claude_md(home.path()).unwrap();
+        assert_eq!(block_of(home.path()), None);
+    }
+
+    #[test]
+    fn an_older_block_is_replaced_and_the_rest_kept() {
+        let root = project();
+        let dir = root.path().join(".claude");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("CLAUDE.md"),
+            "# Mine\n\n<!-- BEGIN INFIGRAPH v2 -->\nold\n<!-- END INFIGRAPH -->\n\n## After\n",
+        )
+        .unwrap();
+        ensure_project_claude_md(root.path()).unwrap();
+        let text = block_of(root.path()).unwrap();
+        assert!(text.starts_with("# Mine\n"));
+        assert!(text.contains("## After"));
+        assert!(!text.contains("old\n"));
+        assert_eq!(text.matches("<!-- BEGIN INFIGRAPH").count(), 1);
+    }
 }
