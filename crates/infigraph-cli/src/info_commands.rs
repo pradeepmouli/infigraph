@@ -1102,22 +1102,33 @@ pub(crate) fn cmd_scip_import(root: &Path, index_path: &Path) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn cmd_index_docs(root: &Path, namespace: Option<&str>) -> Result<()> {
+pub(crate) fn cmd_index_docs(root: &Path) -> Result<()> {
+    #[cfg(feature = "remote")]
+    if infigraph_core::daemon::lifecycle::is_remote_backend() {
+        let ns = infigraph_core::multi::Registry::load()
+            .ok()
+            .and_then(|reg| reg.resolve_repo_namespace(root));
+        return cmd_index_docs_remote(root, ns.as_deref());
+    }
+    let start = std::time::Instant::now();
+    let stats = infigraph_docs::ops::request_index_docs(root, false)?;
+    println!(
+        "{}",
+        infigraph_docs::ops::stats_report("Document indexing", &stats, start.elapsed())
+    );
+    Ok(())
+}
+
+/// Remote (Neo4j + Postgres) mode keeps its direct write path: the store is
+/// a real client/server database, and embeddings go to pgvector.
+#[cfg(feature = "remote")]
+pub(crate) fn cmd_index_docs_remote(root: &Path, namespace: Option<&str>) -> Result<()> {
     let start = std::time::Instant::now();
     let mut idx = infigraph_docs::DocIndex::open(root)?;
     if let Some(ns) = namespace {
         idx.set_namespace(ns);
     }
-
-    #[cfg(feature = "remote")]
-    let is_remote = infigraph_core::daemon::lifecycle::is_remote_backend();
-    #[cfg(not(feature = "remote"))]
-    let is_remote = false;
-
-    if is_remote {
-        idx.set_skip_file_embeddings(true);
-    }
-
+    idx.set_skip_file_embeddings(true);
     idx.init()?;
     let result = idx.index()?;
     let elapsed = start.elapsed();
@@ -1125,51 +1136,41 @@ pub(crate) fn cmd_index_docs(root: &Path, namespace: Option<&str>) -> Result<()>
         "Document indexing complete in {:.1}s\n  Files scanned: {}\n  Files indexed: {}\n  Chunks created: {}",
         elapsed.as_secs_f64(), result.total_files, result.indexed_files, result.total_chunks
     );
-    if let Some(store) = idx.store() {
-        let stats = store.stats()?;
-        println!(
-            "  Total documents in store: {}\n  Total chunks in store: {}",
-            stats.document_count, stats.chunk_count
-        );
+    let store = idx.store().context("doc store not initialized")?;
+    let stats = store.stats()?;
+    println!(
+        "  Total documents in store: {}\n  Total chunks in store: {}",
+        stats.document_count, stats.chunk_count
+    );
+    let pg = infigraph_core::meta::PostgresMetaStore::connect_from_env_cached()?;
+    pg.init_schema()?;
+    let chunk_refs: Vec<&infigraph_docs::chunk::Chunk> = result.new_chunks.iter().collect();
+    let changed_refs: Vec<&str> = result.changed_files.iter().map(|s| s.as_str()).collect();
+    let count = infigraph_docs::embed::update_doc_embeddings_remote(
+        store,
+        &pg,
+        &chunk_refs,
+        &changed_refs,
+    )?;
+    if count > 0 {
+        println!("Saved {} doc embeddings to Postgres pgvector", count);
     }
-
-    #[cfg(feature = "remote")]
-    if is_remote {
-        let pg = infigraph_core::meta::PostgresMetaStore::connect_from_env_cached()?;
-        pg.init_schema()?;
-        let store = idx.store().context("doc store not initialized")?;
-        let chunk_refs: Vec<&infigraph_docs::chunk::Chunk> = result.new_chunks.iter().collect();
-        let changed_refs: Vec<&str> = result.changed_files.iter().map(|s| s.as_str()).collect();
-        let count = infigraph_docs::embed::update_doc_embeddings_remote(
-            store,
-            &pg,
-            &chunk_refs,
-            &changed_refs,
-        )?;
-        if count > 0 {
-            println!("Saved {} doc embeddings to Postgres pgvector", count);
-        }
-    }
-
     Ok(())
 }
 
 pub(crate) fn cmd_reindex_docs(root: &Path) -> Result<()> {
     let start = std::time::Instant::now();
-    let mut idx = infigraph_docs::DocIndex::open(root)?;
-    let result = idx.reindex()?;
-    let elapsed = start.elapsed();
+    let stats = infigraph_docs::ops::request_index_docs(root, true)?;
     println!(
-        "Document full reindex complete in {:.1}s\n  Files scanned: {}\n  Files indexed: {}\n  Chunks created: {}",
-        elapsed.as_secs_f64(), result.total_files, result.indexed_files, result.total_chunks
+        "{}",
+        infigraph_docs::ops::stats_report("Document full reindex", &stats, start.elapsed())
     );
     Ok(())
 }
 
 pub(crate) fn cmd_clean_docs(root: &Path) -> Result<()> {
-    let mut idx = infigraph_docs::DocIndex::open(root)?;
-    idx.clean()?;
-    println!("Document index cleaned.");
+    infigraph_docs::ops::clean_docs(root)?;
+    println!("Document index cleaned; document indexing is off for this project.");
     Ok(())
 }
 

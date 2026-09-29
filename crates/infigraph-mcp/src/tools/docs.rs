@@ -197,24 +197,14 @@ pub fn tool_index_docs(args: &Value) -> Result<String> {
         return Ok(combined);
     }
 
-    let idx = open_doc_index(args)?;
-    let result = idx.index()?;
-
-    let mut out = format!(
-        "Document indexing complete.\n  Files scanned: {}\n  Files indexed: {}\n  Chunks created: {}\n",
-        result.total_files, result.indexed_files, result.total_chunks
-    );
-
-    if let Some(store) = idx.store() {
-        let stats = store.stats()?;
-        out.push_str(&format!(
-            "  Total documents in store: {}\n  Total chunks in store: {}\n",
-            stats.document_count, stats.chunk_count
-        ));
-    }
-
+    let started = std::time::Instant::now();
+    let stats = infigraph_docs::ops::request_index_docs(std::path::Path::new(path), false)?;
     auto_start_doc_watch(path);
-    Ok(out)
+    Ok(infigraph_docs::ops::stats_report(
+        "Document indexing",
+        &stats,
+        started.elapsed(),
+    ))
 }
 
 pub fn tool_search_docs(args: &Value) -> Result<String> {
@@ -316,12 +306,8 @@ pub fn tool_clean_docs(args: &Value) -> Result<String> {
         return Ok(combined);
     }
 
-    let mut idx = infigraph_docs::DocIndex::open(&PathBuf::from(path))?;
-    idx.clean()?;
-    Ok(
-        "Document index cleaned. Removed: docs.kuzu, docs_embeddings.bin, docs_hnsw_index."
-            .to_string(),
-    )
+    infigraph_docs::ops::clean_docs(&PathBuf::from(path))?;
+    Ok("Document index cleaned; document indexing is off for this project.".to_string())
 }
 
 pub fn tool_reindex_docs(args: &Value) -> Result<String> {
@@ -350,11 +336,12 @@ pub fn tool_reindex_docs(args: &Value) -> Result<String> {
         return Ok(combined);
     }
 
-    let mut idx = infigraph_docs::DocIndex::open(&PathBuf::from(path))?;
-    let result = idx.reindex()?;
-    Ok(format!(
-        "Document full reindex complete.\n  Files scanned: {}\n  Files indexed: {}\n  Chunks created: {}\n",
-        result.total_files, result.indexed_files, result.total_chunks
+    let started = std::time::Instant::now();
+    let stats = infigraph_docs::ops::request_index_docs(&PathBuf::from(path), true)?;
+    Ok(infigraph_docs::ops::stats_report(
+        "Document full reindex",
+        &stats,
+        started.elapsed(),
     ))
 }
 

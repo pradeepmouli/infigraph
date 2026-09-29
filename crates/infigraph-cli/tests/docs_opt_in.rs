@@ -172,3 +172,88 @@ fn a_fresh_daemon_creates_no_document_index() {
     );
     assert_eq!(docs_enabled_recorded(root), None);
 }
+
+#[test]
+fn index_docs_under_the_daemon_backend_indexes_opts_in_and_is_searchable() {
+    let (project, home) = project();
+    let root = project.path();
+    let _daemon = start_daemon(root, home.path());
+
+    let out = run(root, home.path(), DAEMON, &["index-docs"]);
+    assert_ok(&out, "index-docs");
+    let text = stdout(&out);
+    assert!(count(&text, "Files indexed:") >= 1, "{text}");
+    assert!(count(&text, "Total documents in store:") >= 1, "{text}");
+    assert_eq!(docs_enabled_recorded(root), Some(true));
+
+    let found = run(root, home.path(), DAEMON, &["search-docs", "zebra"]);
+    assert_ok(&found, "search-docs");
+    assert!(stdout(&found).contains("README.md"), "{}", stdout(&found));
+}
+
+#[test]
+fn index_docs_with_the_daemon_opted_out_indexes_in_process() {
+    let (project, home) = project();
+    let root = project.path();
+    let local = infigraph_core::LOCAL_BACKEND;
+
+    let out = run(root, home.path(), local, &["index-docs"]);
+    assert_ok(&out, "index-docs");
+    assert!(
+        count(&stdout(&out), "Files indexed:") >= 1,
+        "{}",
+        stdout(&out)
+    );
+    assert_eq!(docs_enabled_recorded(root), Some(true));
+    assert!(docs_store_path(root).exists());
+
+    let found = run(root, home.path(), local, &["search-docs", "zebra"]);
+    assert_ok(&found, "search-docs");
+    assert!(stdout(&found).contains("README.md"), "{}", stdout(&found));
+}
+
+#[test]
+fn reindex_docs_rebuilds_through_the_daemon() {
+    let (project, home) = project();
+    let root = project.path();
+    let _daemon = start_daemon(root, home.path());
+    assert_ok(
+        &run(root, home.path(), DAEMON, &["index-docs"]),
+        "index-docs",
+    );
+
+    let again = run(root, home.path(), DAEMON, &["index-docs"]);
+    assert_ok(&again, "second index-docs");
+    assert_eq!(
+        count(&stdout(&again), "Files indexed:"),
+        0,
+        "an incremental run skips unchanged files"
+    );
+
+    let full = run(root, home.path(), DAEMON, &["reindex-docs"]);
+    assert_ok(&full, "reindex-docs");
+    assert!(stdout(&full).contains("full reindex"), "{}", stdout(&full));
+    assert!(
+        count(&stdout(&full), "Files indexed:") >= 1,
+        "a full rebuild re-indexes every file: {}",
+        stdout(&full)
+    );
+}
+
+/// A code index refreshes documents only for a project that has opted in:
+/// `infigraph index` on a fresh project must not opt it in on its own.
+#[test]
+fn a_code_index_does_not_opt_a_project_in_to_documents() {
+    let (project, home) = project();
+    let root = project.path();
+
+    // Not `--no-embed`: that returns before `index`'s document step.
+    let out = run(root, home.path(), infigraph_core::LOCAL_BACKEND, &["index"]);
+    assert_ok(&out, "index");
+
+    assert_eq!(docs_enabled_recorded(root), None);
+    assert!(
+        !docs_store_path(root).exists(),
+        "a code index created docs.kuzu"
+    );
+}

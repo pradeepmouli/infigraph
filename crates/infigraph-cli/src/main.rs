@@ -1185,19 +1185,7 @@ fn run(command: Commands, root: &Path) -> Result<()> {
             infigraph_core::daemon_protocol::WatchRole::Docs,
             action,
         ),
-        Commands::IndexDocs => {
-            #[cfg(feature = "remote")]
-            let doc_ns = if infigraph_core::daemon::lifecycle::is_remote_backend() {
-                infigraph_core::multi::Registry::load()
-                    .ok()
-                    .and_then(|reg| reg.resolve_repo_namespace(root))
-            } else {
-                None
-            };
-            #[cfg(not(feature = "remote"))]
-            let doc_ns: Option<String> = None;
-            cmd_index_docs(root, doc_ns.as_deref())
-        }
+        Commands::IndexDocs => cmd_index_docs(root),
         Commands::ReindexDocs => cmd_reindex_docs(root),
         Commands::CleanDocs => cmd_clean_docs(root),
         Commands::SearchDocs { query, limit } => cmd_search_docs(root, &query, limit),

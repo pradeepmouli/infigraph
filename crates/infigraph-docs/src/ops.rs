@@ -87,3 +87,17 @@ pub fn request_index_docs_if_enabled(root: &Path) -> Result<Option<DocIndexStats
     }
     request_index_docs(root, false).map(Some)
 }
+
+/// The report `index-docs` and `reindex-docs` print, and MCP's in-process
+/// fallbacks return.
+pub fn stats_report(what: &str, stats: &DocIndexStats, elapsed: std::time::Duration) -> String {
+    format!(
+        "{what} complete in {:.1}s\n  Files scanned: {}\n  Files indexed: {}\n  Chunks created: {}\n  Total documents in store: {}\n  Total chunks in store: {}",
+        elapsed.as_secs_f64(),
+        stats.files_scanned,
+        stats.files_indexed,
+        stats.chunks_created,
+        stats.documents_in_store,
+        stats.chunks_in_store
+    )
+}
