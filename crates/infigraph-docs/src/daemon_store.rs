@@ -44,7 +44,7 @@ impl DaemonDocStore {
     /// any read to drift.
     fn with_reader<T>(&self, f: impl FnOnce(&DocQuery<&dyn QueryExec>) -> Result<T>) -> Result<T> {
         if infigraph_core::graph::daemon_kuzu_backend::direct_reads_enabled() {
-            let store = DocStore::open(&self.root.join(".infigraph").join("docs.kuzu"))?;
+            let store = DocStore::open_for_read(&self.root)?;
             let conn = store.connection()?;
             let local = infigraph_core::graph::query_exec::LocalExec::new(&conn);
             let exec: &dyn QueryExec = &local;

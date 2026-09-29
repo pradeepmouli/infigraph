@@ -224,6 +224,85 @@ fn a_routed_document_write_is_refused_with_an_explanation() {
     );
 }
 
+/// Documents are opt-in: the row source registers without a store, answers
+/// every read with the not-indexed message, and creates nothing.
+#[test]
+fn a_project_without_a_store_is_answered_not_indexed_and_nothing_is_created() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    let docs = infigraph_docs::daemon_source::daemon_row_source(root).unwrap();
+    let svc = ReadService::start_with_sources(root, graph_source(root), Some(docs), 2).unwrap();
+
+    let err = RemoteExec::for_docs(root)
+        .query_rows("MATCH (d:Document) RETURN d.id")
+        .expect_err("no store, no rows");
+    assert!(
+        err.to_string()
+            .contains(infigraph_core::docs_switch::DOCS_NOT_INDEXED),
+        "{err}"
+    );
+    assert!(
+        !infigraph_core::docs_switch::docs_store_path(root).exists(),
+        "a read must never create the store"
+    );
+
+    svc.shutdown();
+}
+
+/// Review Focus 4: the first `index-docs` creates the store while the daemon
+/// runs, and the daemon serves it without a restart.
+#[test]
+fn a_store_created_after_the_source_is_served() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    let docs = infigraph_docs::daemon_source::daemon_row_source(root).unwrap();
+    let svc = ReadService::start_with_sources(root, graph_source(root), Some(docs), 2).unwrap();
+    seed_one_document(root);
+
+    let rows = RemoteExec::for_docs(root)
+        .query_rows("MATCH (d:Document) RETURN d.id")
+        .unwrap();
+    assert_eq!(rows, vec![vec!["a.md".to_string()]]);
+
+    svc.shutdown();
+}
+
+/// Review Focus 4: a daemon that outlived its worktree once brought a
+/// removed `.infigraph/` back. A read of a project with none creates none.
+#[test]
+fn a_read_of_a_project_with_no_infigraph_dir_creates_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+
+    let source = infigraph_docs::daemon_source::daemon_row_source(root).unwrap();
+    let err = source("MATCH (d:Document) RETURN d.id").expect_err("nothing to read");
+    assert!(
+        err.is::<infigraph_core::docs_switch::DocsNotIndexed>(),
+        "{err}"
+    );
+    assert!(!root.join(".infigraph").exists());
+}
+
+/// The explicit direct-read hatch obeys the same rule.
+#[test]
+fn a_direct_read_of_a_project_without_a_store_creates_nothing() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    std::env::set_var("INFIGRAPH_DIRECT_READS", "1");
+    let got = infigraph_docs::backend::DocBackend::get_doc_hashes(
+        &infigraph_docs::daemon_store::DaemonDocStore::new(dir.path()),
+    );
+    std::env::remove_var("INFIGRAPH_DIRECT_READS");
+    let err = got.expect_err("no store, no rows");
+    assert!(
+        err.is::<infigraph_core::docs_switch::DocsNotIndexed>(),
+        "{err}"
+    );
+    assert!(!dir.path().join(".infigraph").exists());
+}
+
 // ── helpers ──────────────────────────────────────────────────────────
 
 /// Seed one document through the docs store's own open path, then drop it:

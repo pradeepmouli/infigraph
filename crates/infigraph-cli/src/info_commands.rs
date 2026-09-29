@@ -747,9 +747,10 @@ pub(crate) fn cmd_daemon(root: &Path, debounce: u64) -> Result<()> {
         );
 
     // The document half of the read service. Opened here because
-    // `infigraph-core` cannot name `DocStore`. A failure is not fatal: the
-    // daemon still serves the code graph, and a document read then gets an
-    // explicit refusal rather than silently opening `docs.kuzu` itself.
+    // `infigraph-core` cannot name `DocStore`. It registers whether or not
+    // the project has documents (they are opt-in; a missing store answers
+    // "not indexed"). Only a store that exists but will not open fails it,
+    // and then the daemon still serves the code graph.
     let docs_reads = match infigraph_docs::daemon_source::daemon_row_source(root) {
         Ok(source) => Some(source),
         Err(e) => {

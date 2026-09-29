@@ -29,14 +29,22 @@ use crate::store::DocStore;
 /// Keeping the store inside the closure also means it never crosses a thread
 /// boundary, which matters because that `MutexGuard` makes `DocStore`
 /// `!Send`.
+///
+/// A missing store is not a failure: documents are opt-in, and opening one
+/// would create it. So the source always registers, and each request checks
+/// for the store, because `index-docs` creates it while the daemon runs.
 pub fn daemon_row_source(root: &Path) -> Result<infigraph_core::daemon::read_service::RowSource> {
-    let path = root.join(".infigraph").join("docs.kuzu");
-    // Fail fast if the store cannot be opened at all, rather than at the
-    // first read: the daemon logs this once and serves the graph only.
-    drop(DocStore::open(&path)?);
+    // Fail fast on a store that exists but cannot be opened: the daemon
+    // logs this once and serves the graph only.
+    match DocStore::open_for_read(root) {
+        Ok(store) => drop(store),
+        Err(e) if e.is::<infigraph_core::docs_switch::DocsNotIndexed>() => {}
+        Err(e) => return Err(e),
+    }
 
+    let root = root.to_path_buf();
     Ok(Arc::new(move |cypher: &str| {
-        let store = DocStore::open(&path)?;
+        let store = DocStore::open_for_read(&root)?;
         let conn = store.connection()?;
         // The guard runs here, where the connection is, so the verdict
         // still comes from the database's own parser.

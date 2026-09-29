@@ -147,6 +147,30 @@ impl DocStore {
         Ok(store)
     }
 
+    /// Open `root`'s document store to read it, never creating one.
+    ///
+    /// `open` creates a store that does not exist, which for a read would
+    /// opt the project back in. So this checks first, and checks again
+    /// under the shared docs lock: `clean-docs` takes that lock exclusively
+    /// to delete, so the store cannot vanish between the check and the open.
+    /// The first check also keeps the lock from creating an `.infigraph/`
+    /// that is gone.
+    pub fn open_for_read(root: &Path) -> Result<DocStoreRead> {
+        use infigraph_core::docs_switch::{docs_store_path, lock_docs_read, DocsNotIndexed};
+        let path = docs_store_path(root);
+        if !path.exists() {
+            return Err(DocsNotIndexed.into());
+        }
+        let lock = lock_docs_read(root)?;
+        if !path.exists() {
+            return Err(DocsNotIndexed.into());
+        }
+        Ok(DocStoreRead {
+            store: DocStore::open(&path)?,
+            _lock: lock,
+        })
+    }
+
     fn init_schema(&self) -> Result<()> {
         let conn = self.connection()?;
         for ddl in CREATE_SCHEMA {
@@ -611,6 +635,20 @@ impl DocStore {
     pub fn get_chunk_details(&self, chunk_ids: &[&str]) -> Result<Vec<ChunkDetail>> {
         let conn = self.connection()?;
         crate::query::DocQuery::new(&conn).get_chunk_details(chunk_ids)
+    }
+}
+
+/// A `DocStore` opened for reading, holding the shared docs lock. Fields
+/// drop in order, so the store closes before the lock is released.
+pub struct DocStoreRead {
+    store: DocStore,
+    _lock: infigraph_core::lockfile::LockFile,
+}
+
+impl std::ops::Deref for DocStoreRead {
+    type Target = DocStore;
+    fn deref(&self) -> &DocStore {
+        &self.store
     }
 }
 

@@ -156,3 +156,19 @@ fn an_existing_index_is_kept_on_when_the_daemon_starts() {
         "the daemon must record [docs] enabled = true for an existing index"
     );
 }
+
+/// The side effect the spec exists for: a daemon on a fresh project creates
+/// no document index, across many doc-thread polls.
+#[test]
+fn a_fresh_daemon_creates_no_document_index() {
+    let (project, home) = project();
+    let root = project.path();
+    let _daemon = start_daemon(root, home.path());
+    // 20 doc-thread polls at 50ms.
+    std::thread::sleep(Duration::from_secs(1));
+    assert!(
+        !docs_store_path(root).exists(),
+        "the daemon created docs.kuzu"
+    );
+    assert_eq!(docs_enabled_recorded(root), None);
+}
