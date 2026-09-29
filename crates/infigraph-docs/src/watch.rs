@@ -112,6 +112,12 @@ enum Reindex {
 /// the lock to delete, so a reindex that gets the lock after it must not
 /// recreate what it deleted.
 fn reindex_if_enabled(root: &Path, log_prefix: &str) -> Reindex {
+    // Before the lock, not only under it: taking the lock creates its
+    // directory, so a project removed while its watcher is attached (the
+    // deletions themselves mark the tree dirty) would be brought back.
+    if !root.join(".infigraph").is_dir() || !infigraph_core::docs_switch::docs_enabled(root) {
+        return Reindex::Done { indexed: false };
+    }
     let _op = match infigraph_core::docs_switch::try_lock_docs_op(root) {
         Ok(Some(guard)) => guard,
         Ok(None) => return Reindex::Busy,
@@ -337,6 +343,25 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
     use std::time::Duration;
+
+    /// A worktree removed while its daemon's watcher is attached: the
+    /// deletions mark the tree dirty, and the next tick must find nothing to
+    /// do, not re-create `.infigraph/` by taking the docs lock first
+    /// (`open_lock_file` creates its directory).
+    #[test]
+    fn a_reindex_in_a_removed_project_creates_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("removed-worktree");
+        let outcome = reindex_if_enabled(&root, "test");
+        assert!(matches!(outcome, Reindex::Done { indexed: false }));
+        assert!(!root.exists(), "the reindex re-created {}", root.display());
+
+        // Present, but without an `.infigraph/`: same.
+        std::fs::create_dir_all(&root).unwrap();
+        let outcome = reindex_if_enabled(&root, "test");
+        assert!(matches!(outcome, Reindex::Done { indexed: false }));
+        assert!(!root.join(".infigraph").exists());
+    }
 
     const POLL_MS_VAR: &str = "INFIGRAPH_WATCH_DOC_DAEMON_POLL_MS";
 

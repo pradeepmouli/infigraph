@@ -1191,6 +1191,15 @@ fn check_one_project_docs(project_path: &Path) -> CheckResult {
             "enabled, but docs.kuzu is missing",
             format!("run `cd {cd} && infigraph index-docs`"),
         ),
+        // Predates the switch: the daemon records it on at its next start
+        // (`migrate_existing_index`), so this is not a leftover to clean.
+        (false, true) if crate::docs_switch::docs_enabled_recorded(project_path).is_none() => {
+            CheckResult::pass(
+                DOCS_CATEGORY,
+                label,
+                "docs.kuzu predates opt-in; kept on when its daemon next starts",
+            )
+        }
         (false, true) => CheckResult::warn(
             DOCS_CATEGORY,
             label,
@@ -1913,6 +1922,16 @@ mod docs_check_tests {
         let r = check(Some(true), false);
         assert_eq!(r.status, CheckStatus::Warn, "{}", r.message);
         assert!(r.remediation.unwrap().contains("index-docs"));
+    }
+
+    /// An index that predates the switch is kept on when its daemon next
+    /// starts; until then doctor must not tell the user to delete it.
+    #[test]
+    fn an_index_that_predates_the_switch_is_not_advised_away() {
+        let _env = isolated();
+        let r = check(None, true);
+        assert_eq!(r.status, CheckStatus::Pass, "{}", r.message);
+        assert!(r.message.contains("predates"), "{}", r.message);
     }
 
     #[test]
