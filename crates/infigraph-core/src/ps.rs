@@ -49,6 +49,7 @@ const PROJECT_LOCKS: &[&str] = &[
     "index.lock",
     "graph.lock",
     "docs.kuzu.lock",
+    crate::docs_switch::DOCS_OP_LOCK,
     "mcp.lock",
 ];
 

@@ -51,6 +51,8 @@
 //! and that server is launched from the project it serves.
 
 use std::collections::HashMap;
+
+use anyhow::Context;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
@@ -110,6 +112,50 @@ pub fn layers(scope: ConfigScope<'_>) -> [Option<Arc<toml_edit::DocumentMut>>; 2
         ConfigScope::User => None,
     };
     [project, user_config_location().and_then(|path| load(&path))]
+}
+
+/// One key as the project's own `config.toml` states it, or `None` when
+/// the file is missing or unparseable, or says nothing about the key. It
+/// reads the raw item, not a resolved value, so a caller can tell "absent"
+/// from "set to something" (the docs migration needs exactly that).
+pub fn project_setting(root: &Path, section: &str, key: &str) -> Option<toml_edit::Item> {
+    load(&project_config_path(root))?
+        .get(section)?
+        .get(key)
+        .cloned()
+}
+
+/// The one writer of a project's `config.toml`: sets `[section] key =
+/// value` and leaves every other section, key, comment and format alone.
+///
+/// A missing file starts from an empty document, since there is nothing to
+/// keep. A file that exists but does not parse, or whose `section` is not a
+/// table, is an error and is left untouched. Writing a fresh document over
+/// it would silently drop every other setting the moment it had a typo.
+pub fn set_project_setting(
+    root: &Path,
+    section: &str,
+    key: &str,
+    value: toml_edit::Item,
+) -> anyhow::Result<()> {
+    let config_path = project_config_path(root);
+    let mut doc: toml_edit::DocumentMut = match std::fs::read_to_string(&config_path) {
+        Ok(contents) => contents
+            .parse()
+            .with_context(|| format!("{} contains invalid TOML", config_path.display()))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => toml_edit::DocumentMut::new(),
+        Err(e) => {
+            return Err(e).with_context(|| format!("reading {}", config_path.display()));
+        }
+    };
+    if doc.get(section).is_some_and(|item| !item.is_table_like()) {
+        anyhow::bail!(
+            "{}: `{section}` is not a table, so [{section}] {key} cannot be set",
+            config_path.display()
+        );
+    }
+    doc[section][key] = value;
+    crate::daemon_protocol::write_atomic(&config_path, &doc.to_string())
 }
 
 /// A file's identity for cache purposes. Length alongside mtime catches a
@@ -238,5 +284,100 @@ mod tests {
             ConfigScope::User
         );
         assert_eq!(ConfigScope::of_infigraph_dir(None), ConfigScope::User);
+    }
+
+    #[test]
+    fn set_project_setting_keeps_comments_and_other_keys() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_config(
+            tmp.path(),
+            "# my settings\n[compression]\nlevel = \"aggressive\" # keep me\n\n[docs]\nother = 1\n",
+        );
+        set_project_setting(tmp.path(), "docs", "enabled", toml_edit::value(true)).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# my settings"), "{text}");
+        assert!(text.contains("level = \"aggressive\" # keep me"), "{text}");
+        assert!(text.contains("other = 1"), "{text}");
+        assert_eq!(
+            project_setting(tmp.path(), "docs", "enabled").and_then(|i| i.as_bool()),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn set_project_setting_creates_the_file_when_there_is_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        set_project_setting(tmp.path(), "docs", "enabled", toml_edit::value(false)).unwrap();
+        assert_eq!(
+            project_setting(tmp.path(), "docs", "enabled").and_then(|i| i.as_bool()),
+            Some(false)
+        );
+    }
+
+    /// Review Focus 1: `toml_edit` panics indexing into a non-table, so a
+    /// `docs = 5` must be refused before the write, and left as it was.
+    #[test]
+    fn set_project_setting_refuses_a_section_that_is_not_a_table() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_config(tmp.path(), "docs = 5\n");
+        let err =
+            set_project_setting(tmp.path(), "docs", "enabled", toml_edit::value(true)).unwrap_err();
+        assert!(err.to_string().contains("not a table"), "{err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "docs = 5\n");
+    }
+
+    #[test]
+    fn project_setting_is_none_for_an_absent_key_or_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(project_setting(tmp.path(), "docs", "enabled").is_none());
+        write_config(tmp.path(), "[docs]\nother = 1\n");
+        assert!(project_setting(tmp.path(), "docs", "enabled").is_none());
+    }
+}
+
+/// One env lock and one `$HOME` pin for every test in this crate that reads
+/// the user layer or sets an `INFIGRAPH_*` variable. A lock per module does
+/// not stop two modules racing on the same process-global `HOME`.
+#[cfg(test)]
+pub(crate) mod test_support {
+    pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Pins `$HOME` at an empty directory for the guard's lifetime. The
+    /// user layer is real config, so a test that does not do this reads
+    /// whatever the developer running it has in `~/.infigraph/config.toml`.
+    pub(crate) struct PinnedHome {
+        _dir: tempfile::TempDir,
+        orig: Option<String>,
+    }
+
+    impl PinnedHome {
+        pub(crate) fn empty() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let orig = std::env::var("HOME").ok();
+            std::env::set_var("HOME", dir.path());
+            Self { _dir: dir, orig }
+        }
+
+        pub(crate) fn with(section: &str, enabled: bool) -> Self {
+            let pinned = Self::empty();
+            let ig = std::path::Path::new(&std::env::var("HOME").unwrap()).join(".infigraph");
+            std::fs::create_dir_all(&ig).unwrap();
+            std::fs::write(
+                ig.join("config.toml"),
+                format!("[{section}]\nenabled = {enabled}\n"),
+            )
+            .unwrap();
+            pinned
+        }
+    }
+
+    impl Drop for PinnedHome {
+        fn drop(&mut self) {
+            match &self.orig {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+        }
     }
 }

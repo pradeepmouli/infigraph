@@ -25,9 +25,9 @@
 
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 
-use crate::daemon_protocol::{write_atomic, WatchRole};
+use crate::daemon_protocol::WatchRole;
 
 fn section_for_role(role: WatchRole) -> Result<&'static str> {
     match role {
@@ -84,72 +84,13 @@ fn enabled_in(config_path: &Path, section: &str) -> Option<bool> {
 /// defaults; a present-but-broken file makes this call fail loudly instead.
 pub fn write_watch_policy(root: &Path, role: WatchRole, enabled: bool) -> Result<()> {
     let section = section_for_role(role)?;
-    let ig_dir = root.join(".infigraph");
-    std::fs::create_dir_all(&ig_dir)?;
-    let config_path = crate::settings_file::project_config_path(root);
-
-    let mut doc: toml_edit::DocumentMut = match std::fs::read_to_string(&config_path) {
-        Ok(contents) => contents
-            .parse()
-            .with_context(|| format!("{} contains invalid TOML", config_path.display()))?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => toml_edit::DocumentMut::new(),
-        Err(e) => {
-            return Err(e).with_context(|| format!("reading {}", config_path.display()));
-        }
-    };
-    doc[section]["enabled"] = toml_edit::value(enabled);
-    write_atomic(&config_path, &doc.to_string())?;
-    Ok(())
+    crate::settings_file::set_project_setting(root, section, "enabled", toml_edit::value(enabled))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-
-    /// Serializes tests that mutate process-global env vars -- `cargo test`
-    /// runs unit tests in threads within one process, so two tests setting
-    /// `INFIGRAPH_*_ENABLED` concurrently would race.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    /// Pins `$HOME` at an empty directory for the guard's lifetime. The
-    /// user layer is real config now, so a test that does not do this reads
-    /// whatever the developer running it happens to have in
-    /// `~/.infigraph/config.toml`.
-    struct PinnedHome {
-        _dir: tempfile::TempDir,
-        orig: Option<String>,
-    }
-
-    impl PinnedHome {
-        fn empty() -> Self {
-            let dir = tempfile::tempdir().unwrap();
-            let orig = std::env::var("HOME").ok();
-            std::env::set_var("HOME", dir.path());
-            Self { _dir: dir, orig }
-        }
-
-        fn with(section: &str, enabled: bool) -> Self {
-            let pinned = Self::empty();
-            let ig = std::path::Path::new(&std::env::var("HOME").unwrap()).join(".infigraph");
-            std::fs::create_dir_all(&ig).unwrap();
-            std::fs::write(
-                ig.join("config.toml"),
-                format!("[{section}]\nenabled = {enabled}\n"),
-            )
-            .unwrap();
-            pinned
-        }
-    }
-
-    impl Drop for PinnedHome {
-        fn drop(&mut self) {
-            match &self.orig {
-                Some(h) => std::env::set_var("HOME", h),
-                None => std::env::remove_var("HOME"),
-            }
-        }
-    }
+    use crate::settings_file::test_support::{PinnedHome, ENV_LOCK};
 
     /// #160: the two readers of `.infigraph/config.toml` disagreed about
     /// whether `~/.infigraph/config.toml` counts. This module's original
