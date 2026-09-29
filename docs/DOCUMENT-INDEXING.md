@@ -8,18 +8,19 @@ This document describes how Infigraph discovers, extracts, chunks, links, and se
 
 1. [Architecture Overview](#architecture-overview)
 2. [Entry Points](#entry-points)
-3. [File Discovery](#file-discovery)
-4. [Document Extraction](#document-extraction)
-5. [Chunking](#chunking)
-6. [Graph Storage (DocStore)](#graph-storage-docstore)
-7. [Link Extraction](#link-extraction)
-8. [BFS Crawling](#bfs-crawling)
-9. [Combined Group Document Store](#combined-group-document-store)
-10. [Manifest Integration](#manifest-integration)
-11. [Incremental Indexing](#incremental-indexing)
-12. [Embeddings](#embeddings)
-13. [Search](#search)
-14. [Watch Mode](#watch-mode)
+3. [Opting In](#opting-in)
+4. [File Discovery](#file-discovery)
+5. [Document Extraction](#document-extraction)
+6. [Chunking](#chunking)
+7. [Graph Storage (DocStore)](#graph-storage-docstore)
+8. [Link Extraction](#link-extraction)
+9. [BFS Crawling](#bfs-crawling)
+10. [Combined Group Document Store](#combined-group-document-store)
+11. [Manifest Integration](#manifest-integration)
+12. [Incremental Indexing](#incremental-indexing)
+13. [Embeddings](#embeddings)
+14. [Search](#search)
+15. [Watch Mode](#watch-mode)
 
 ---
 
@@ -84,17 +85,49 @@ All MCP tools live in `crates/infigraph-mcp/src/tools/docs.rs`:
 
 | Tool | Function | Behavior |
 |------|----------|----------|
-| `index_docs` | `tool_index_docs` | Prefers shelling out to `infigraph index-docs` CLI; falls back to in-process `DocIndex`. Starts doc watcher afterward. |
-| `reindex_docs` | `tool_reindex_docs` | Same CLI-vs-inprocess pattern, calls `idx.reindex()` |
-| `clean_docs` | `tool_clean_docs` | Calls `idx.clean()` |
+| `index_docs` | `tool_index_docs` | Prefers shelling out to `infigraph index-docs` CLI; falls back to `ops::request_index_docs` in-process. Starts doc watcher afterward. |
+| `reindex_docs` | `tool_reindex_docs` | Same CLI-vs-inprocess pattern, with `full: true` (wipe and rebuild) |
+| `clean_docs` | `tool_clean_docs` | Same CLI-vs-inprocess pattern; calls `ops::clean_docs` |
 | `search_docs` | `tool_search_docs` | Hybrid BM25+vector search |
 | `watch_docs` | `tool_watch_docs` | Spawns background watcher thread |
 | `stop_watch_docs` | `tool_stop_watch_docs` | Signals watcher to stop |
 | `index_manifests` | `tool_index_manifests` | Links package manifests to docs |
 
+`index_docs` opts the project in; `clean_docs` opts it out.
+
 ### CLI
 
-The `infigraph` CLI binary (`crates/infigraph-cli/`) exposes `index-docs`, `reindex-docs`, `clean-docs` subcommands that the MCP tools shell out to for process isolation.
+The `infigraph` CLI binary (`crates/infigraph-cli/`) exposes `index-docs`, `reindex-docs`, `clean-docs` subcommands that the MCP tools shell out to for process isolation. `index-docs` opts the project in; `clean-docs` opts it out.
+
+---
+
+## Opting In
+
+Document indexing is **off** for a new project. A project opts in by
+running `infigraph index-docs` (or MCP `index_docs`) once, or by setting
+`[docs] enabled = true` in `.infigraph/config.toml` (env:
+`INFIGRAPH_DOCS_ENABLED`). `infigraph clean-docs` opts it back out and
+deletes the index. A project that already had a `docs.kuzu` when this
+shipped was recorded as opted in at its next daemon start, unless its
+`config.toml` already said otherwise.
+
+- **Where it runs.** Under the default daemon backend, `index-docs` asks
+  the daemon to index (`WriteRequest::IndexDocs`). The daemon runs the one
+  executor, `infigraph_docs::ops::index_docs`, beside the store it owns.
+  With `INFIGRAPH_BACKEND=kuzu` the CLI runs the same executor itself.
+- **The doc watcher** attaches while `[docs] enabled` is on and detaches
+  when it goes off. Its first catch-up reindex creates `docs.kuzu`.
+- **Reads create nothing.** A read of a project without a store answers
+  "documents are not indexed for this project; run `infigraph
+  index-docs`". It never opens (and so never creates) `docs.kuzu`, or even
+  `.infigraph/`.
+- **One operation at a time.** `.infigraph/docs-op.lock` is taken
+  exclusively by anything that may create or delete the store (the
+  watcher's reindex, `index-docs`, `clean-docs`) and shared by reads, across
+  processes.
+- **Groups** include a repository's documents only if that repository has
+  opted in. `infigraph doctor` reports each project's switch and whether
+  `docs.kuzu` agrees with it.
 
 ---
 
