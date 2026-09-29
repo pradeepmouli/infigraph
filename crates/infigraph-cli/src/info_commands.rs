@@ -459,17 +459,12 @@ pub(crate) fn cmd_daemon(root: &Path, debounce: u64) -> Result<()> {
     }
 
     // Indexing is otherwise the only thing that rewrites the project's managed
-    // `.claude/CLAUDE.md` block, so a changed block (a `VERSION` bump) never
-    // reached a project until someone reindexed it. Every indexed project
-    // runs a daemon, so refreshing here delivers it on the next start; a
-    // block already current is left alone. Never fatal: the graph is the
-    // daemon's job.
-    if let Err(e) = infigraph_core::claude_md::ensure_project_claude_md(root) {
-        eprintln!(
-            "[daemon-start] could not refresh {}: {e:#}",
-            root.join(".claude").join("CLAUDE.md").display()
-        );
-    }
+    // instruction blocks, so a changed block never reached a project until
+    // someone reindexed it. Every indexed project runs a daemon, so refreshing
+    // here delivers it on the next start; a block already current is left
+    // alone, and a root that is not a project store gets nothing. Never
+    // fatal: the graph is the daemon's job.
+    crate::agent::refresh_project_instructions(root);
 
     println!(
         "Watching {} (debounce {}ms) — Ctrl-C to stop",

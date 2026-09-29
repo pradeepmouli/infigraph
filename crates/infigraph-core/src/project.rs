@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 /// The user-level `~/.infigraph/` also holds a `graph`, so the discriminator
 /// is `registry.json`, which only the global store has. Without this check a
 /// repo living under `$HOME` resolves to the global store.
-fn is_project_store(dir: &Path) -> bool {
+pub fn is_project_store(dir: &Path) -> bool {
     let ig = dir.join(".infigraph");
     ig.join("graph").exists() && !ig.join("registry.json").exists()
 }
