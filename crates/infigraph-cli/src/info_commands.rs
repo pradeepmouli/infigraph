@@ -418,6 +418,11 @@ pub(crate) fn cmd_daemon(root: &Path, debounce: u64) -> Result<()> {
         );
         return Ok(());
     }
+    // Before the lock, the doc watcher and the read service. The write
+    // coordinator checks the root too, but only once all of those have
+    // started, which in `$HOME` gave the doc watcher time to attach to the
+    // whole home directory (#207).
+    infigraph_core::daemon::ensure_watchable_root(root)?;
     // Hold exclusive lock for lifetime — signals liveness to ensure_watcher_running.
     let lock_path = root.join(".infigraph").join("watch.lock");
     let _lock = acquire_watch_lock(&lock_path)?;

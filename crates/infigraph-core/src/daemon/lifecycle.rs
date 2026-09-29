@@ -339,6 +339,14 @@ fn start_or_find_daemon(root: &Path, watch_binary: &Path) -> DaemonStartOutcome 
         ));
     }
 
+    // Nor to a directory that is not a project at all: `$HOME`, whose
+    // `.infigraph` is the global store, or a folder of several projects. The
+    // daemon refuses these itself, but refusing here means no daemon is
+    // spawned just to be turned away, and the caller hears why (#207).
+    if let Err(e) = crate::daemon::ensure_watchable_root(&canonical) {
+        return DaemonStartOutcome::Failed(e.to_string());
+    }
+
     let tg_dir = root.join(".infigraph");
     if !tg_dir.exists() {
         // Not yet indexed (e.g. the very first `infigraph index` on a fresh
@@ -869,6 +877,27 @@ mod tests {
 
     fn write_lock_info(path: &std::path::Path, info: &LockInfo) {
         std::fs::write(path, serde_json::to_string(info).unwrap()).unwrap();
+    }
+
+    /// `infigraph index` in `$HOME` used to spawn a daemon there, which
+    /// attached a doc watcher to the whole home directory before its own root
+    /// check refused (#207). No spawn is attempted at all now: the binary
+    /// path here does not exist, so any spawn would fail with a different
+    /// message.
+    #[test]
+    fn no_daemon_is_started_for_the_global_store_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".infigraph")).unwrap();
+        std::fs::write(tmp.path().join(".infigraph").join("registry.json"), "{}").unwrap();
+        match super::start_or_find_daemon(
+            tmp.path(),
+            std::path::Path::new("/nonexistent/infigraph"),
+        ) {
+            super::DaemonStartOutcome::Failed(msg) => {
+                assert!(msg.contains("home directory"), "{msg}")
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
     }
 
     #[test]
