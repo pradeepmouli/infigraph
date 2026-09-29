@@ -112,7 +112,8 @@ use graph::store::{
     lock_contention_context, storage_version_mismatch_context,
 };
 
-/// Open the Kùzu graph, retrying briefly on lock contention (AIF3X-331 #36).
+/// Open a Kùzu database -- the graph, or `infigraph-docs`'s `docs.kuzu` --
+/// retrying briefly on lock contention (AIF3X-331 #36).
 ///
 /// The graph is single-writer: while a watcher's per-reindex write holds the
 /// lock (~milliseconds), a concurrent open fails with "Could not set lock on
@@ -128,7 +129,7 @@ use graph::store::{
 /// into an fd leak (7,600 fds on one daemon in the sittir incident). Only
 /// when the probe reports the lock free -- or when the platform has no
 /// probe (`LockProbe::Unsupported`) -- is `open` tried again.
-fn open_kuzu_with_retry<T>(
+pub fn open_kuzu_with_retry<T>(
     mut open: impl FnMut() -> Result<T>,
     mut probe: impl FnMut() -> graph::lock_probe::LockProbe,
     budget: std::time::Duration,
