@@ -138,3 +138,37 @@ fn request_index_docs_without_the_daemon_runs_the_executor_here() {
     assert_eq!(stats.files_indexed, 1);
     assert_eq!(docs_enabled_recorded(&root), Some(true));
 }
+
+/// Review Focus 3: `clean-docs` while the daemon's doc watcher is attached
+/// and has a change pending. The switch goes off before the delete, and the
+/// watcher re-reads it under the docs lock, so nothing brings the store back.
+#[test]
+fn clean_docs_is_not_undone_by_an_attached_watcher() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let _env = Isolated::new();
+    std::env::set_var(POLL_MS_VAR, "20");
+    let (_tmp, root) = project_with_readme();
+    index_docs(&root, false).unwrap();
+
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let loop_root = root.clone();
+    let loop_shutdown = Arc::clone(&shutdown);
+    let watcher = std::thread::spawn(move || {
+        infigraph_docs::watch::watch_docs_daemon_loop(&loop_root, 50, loop_shutdown)
+    });
+    std::thread::sleep(Duration::from_millis(500));
+
+    std::fs::write(root.join("second.md"), "# Second\n\nmore\n").unwrap();
+    clean_docs(&root).unwrap();
+    std::thread::sleep(Duration::from_millis(1500));
+
+    shutdown.store(true, Ordering::Relaxed);
+    watcher.join().unwrap().unwrap();
+    assert!(
+        !docs_store_path(&root).exists(),
+        "the watcher recreated the store clean-docs removed"
+    );
+    assert_eq!(docs_enabled_recorded(&root), Some(false));
+}

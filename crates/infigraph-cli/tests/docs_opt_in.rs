@@ -257,3 +257,28 @@ fn a_code_index_does_not_opt_a_project_in_to_documents() {
         "a code index created docs.kuzu"
     );
 }
+
+#[test]
+fn clean_docs_turns_docs_off_and_the_daemon_does_not_bring_them_back() {
+    let (project, home) = project();
+    let root = project.path();
+    let _daemon = start_daemon(root, home.path());
+    assert_ok(
+        &run(root, home.path(), DAEMON, &["index-docs"]),
+        "index-docs",
+    );
+    assert!(docs_store_path(root).exists());
+
+    let out = run(root, home.path(), DAEMON, &["clean-docs"]);
+    assert_ok(&out, "clean-docs");
+    assert_eq!(docs_enabled_recorded(root), Some(false));
+    assert!(!docs_store_path(root).exists());
+
+    // A new document, then many doc-thread polls: nothing comes back.
+    std::fs::write(root.join("NEW.md"), "# New\n\nanother page\n").unwrap();
+    std::thread::sleep(Duration::from_secs(2));
+    assert!(
+        !docs_store_path(root).exists(),
+        "the daemon re-created docs.kuzu after clean-docs"
+    );
+}

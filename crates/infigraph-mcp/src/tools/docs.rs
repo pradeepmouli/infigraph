@@ -74,7 +74,7 @@ fn auto_start_doc_watch_inner(path: &str, skip_disabled_check: bool) -> Option<S
         return None;
     }
 
-    if !root.join(".infigraph").join("docs.kuzu").exists() {
+    if !infigraph_core::docs_switch::docs_enabled(&root) {
         return None;
     }
 
