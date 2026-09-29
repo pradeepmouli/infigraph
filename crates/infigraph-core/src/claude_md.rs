@@ -56,7 +56,16 @@ tell the user (e.g. to reconnect the MCP server) rather than working around the 
             } else {
                 end
             };
-            format!("{}{}{}", &existing[..start], instructions, &existing[end..])
+            // Exactly one blank line before the block (none at the top of the
+            // file), however many the old one had: `instructions` brings its
+            // own leading newline, so keeping the old gap grew it every bump.
+            let before = existing[..start].trim_end_matches('\n');
+            let block = if before.is_empty() {
+                instructions.trim_start_matches('\n').to_string()
+            } else {
+                format!("{before}\n{instructions}")
+            };
+            format!("{block}{}", &existing[end..])
         } else {
             format!("{}\n{}", existing, instructions)
         }
@@ -155,6 +164,27 @@ mod tests {
         std::fs::write(home.path().join(".infigraph").join("registry.json"), b"{}").unwrap();
         ensure_project_claude_md(home.path()).unwrap();
         assert_eq!(block_of(home.path()), None);
+    }
+
+    /// Each replacement used to keep the blank lines before the old block and
+    /// add one of its own, so every version bump grew the gap by a line.
+    #[test]
+    fn replacing_a_block_does_not_grow_the_blank_lines_before_it() {
+        let root = project();
+        let dir = root.path().join(".claude");
+        std::fs::create_dir_all(&dir).unwrap();
+        let stale = "<!-- BEGIN INFIGRAPH v1 -->\nold\n<!-- END INFIGRAPH -->\n";
+        std::fs::write(dir.join("CLAUDE.md"), format!("\n\n\n{stale}")).unwrap();
+        ensure_project_claude_md(root.path()).unwrap();
+        assert!(block_of(root.path())
+            .unwrap()
+            .starts_with("<!-- BEGIN INFIGRAPH v"));
+
+        std::fs::write(dir.join("CLAUDE.md"), format!("# Mine\n\n\n\n{stale}")).unwrap();
+        ensure_project_claude_md(root.path()).unwrap();
+        assert!(block_of(root.path())
+            .unwrap()
+            .starts_with("# Mine\n\n<!-- BEGIN INFIGRAPH v"));
     }
 
     #[test]

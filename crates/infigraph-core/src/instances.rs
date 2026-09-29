@@ -107,7 +107,7 @@ pub fn infigraph_home() -> PathBuf {
 /// Whether `home` is the account's real home directory, judged by the OS
 /// rather than by `HOME` (which is exactly what a test overrides): the
 /// passwd entry on Unix, the profile known folder on Windows.
-fn is_account_home(home: &Path) -> bool {
+pub(crate) fn is_account_home(home: &Path) -> bool {
     let Some(account) = account_home() else {
         return false;
     };
@@ -119,7 +119,7 @@ fn is_account_home(home: &Path) -> bool {
 }
 
 #[cfg(unix)]
-fn account_home() -> Option<PathBuf> {
+pub(crate) fn account_home() -> Option<PathBuf> {
     use std::os::unix::ffi::OsStrExt as _;
     let mut buf = vec![0 as libc::c_char; 16 * 1024];
     // SAFETY: `passwd` is plain C data, valid zeroed; `getpwuid_r` fills it
@@ -143,7 +143,7 @@ fn account_home() -> Option<PathBuf> {
 }
 
 #[cfg(not(unix))]
-fn account_home() -> Option<PathBuf> {
+pub(crate) fn account_home() -> Option<PathBuf> {
     // `dirs_next` asks Windows for the profile folder; it never reads `HOME`.
     dirs_next::home_dir()
 }
