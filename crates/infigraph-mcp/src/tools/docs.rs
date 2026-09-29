@@ -18,9 +18,7 @@ pub fn open_doc_index(args: &Value) -> Result<infigraph_docs::DocIndex> {
         .get("path")
         .and_then(|p| p.as_str())
         .context("missing 'path' argument")?;
-    let mut idx = infigraph_docs::DocIndex::open(std::path::Path::new(path))?;
-    idx.init()?;
-    Ok(idx)
+    infigraph_docs::DocIndex::open_existing(std::path::Path::new(path))
 }
 
 pub struct DocWatcherEntry {
@@ -218,7 +216,11 @@ pub fn tool_search_docs(args: &Value) -> Result<String> {
         .context("missing 'query'")?;
     let limit = args.get("limit").and_then(|l| l.as_u64()).unwrap_or(10) as usize;
 
-    let idx = open_doc_index(args)?;
+    let idx = match open_doc_index(args) {
+        Ok(idx) => idx,
+        Err(e) if e.is::<infigraph_core::docs_switch::DocsNotIndexed>() => return Ok(e.to_string()),
+        Err(e) => return Err(e),
+    };
     let store = idx.store().context("doc store not initialized")?;
     let root = PathBuf::from(path);
 
@@ -419,8 +421,7 @@ pub fn tool_index_confluence(args: &Value) -> Result<String> {
     let sync = infigraph_confluence::ConfluenceSync::new(client, space);
     let root = PathBuf::from(path);
 
-    let mut idx = infigraph_docs::DocIndex::open(&root)?;
-    idx.init()?;
+    let idx = infigraph_docs::DocIndex::open_existing(&root)?;
     let store = idx.store().context("DocStore not initialized")?;
 
     let ids = page_ids.as_deref();
@@ -453,8 +454,7 @@ pub fn tool_index_confluence_pages(args: &Value) -> Result<String> {
     }
 
     let root = PathBuf::from(path);
-    let mut idx = infigraph_docs::DocIndex::open(&root)?;
-    idx.init()?;
+    let idx = infigraph_docs::DocIndex::open_existing(&root)?;
     let store = idx.store().context("DocStore not initialized")?;
 
     let source_id = format!("confluence::{}", space);

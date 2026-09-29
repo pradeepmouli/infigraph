@@ -3,7 +3,7 @@ use serde_json::Value;
 
 use infigraph_core::embed;
 
-use super::docs::{auto_start_doc_watch_opportunistic as auto_start_doc_watch, open_doc_index};
+use super::docs::auto_start_doc_watch_opportunistic as auto_start_doc_watch;
 use super::helpers::{find_infigraph_cli, open_prism};
 use super::watch::auto_start_watch_opportunistic as auto_start_watch;
 
@@ -281,15 +281,15 @@ pub fn tool_index_project(args: &Value) -> Result<String> {
     if let Some(msg) = auto_start_watch(path) {
         out.push_str(&format!("\n{}", msg));
     }
-    // Index docs before starting the doc watcher: auto_start_doc_watch only starts
-    // watching when .infigraph/docs.kuzu already exists, and this in-process fallback
-    // (unlike the CLI-subprocess path above, whose `infigraph index` invocation already
-    // indexes docs) never created it otherwise -- making the call below a silent no-op.
-    match open_doc_index(args).and_then(|idx| idx.index()) {
-        Ok(doc_result) => out.push_str(&format!(
-            "Document indexing complete.\n  Files scanned: {}\n  Files indexed: {}\n  Chunks created: {}\n",
-            doc_result.total_files, doc_result.indexed_files, doc_result.total_chunks
+    // Documents are opt-in: refresh them only for a project that opted in
+    // (`index_docs`), never opt one in as a side effect of indexing code.
+    let docs_started = std::time::Instant::now();
+    match infigraph_docs::ops::request_index_docs_if_enabled(std::path::Path::new(path)) {
+        Ok(Some(stats)) => out.push_str(&format!(
+            "{}\n",
+            infigraph_docs::ops::stats_report("Document indexing", &stats, docs_started.elapsed())
         )),
+        Ok(None) => {}
         Err(e) => out.push_str(&format!("warning: doc indexing failed: {e}\n")),
     }
     auto_start_doc_watch(path);

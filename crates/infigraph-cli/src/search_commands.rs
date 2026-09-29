@@ -173,8 +173,14 @@ pub(crate) fn cmd_find_refs(root: &Path, symbol: &str) -> Result<()> {
 }
 
 pub(crate) fn cmd_search_docs(root: &Path, query: &str, limit: usize) -> Result<()> {
-    let mut idx = infigraph_docs::DocIndex::open(root)?;
-    idx.init()?;
+    let idx = match infigraph_docs::DocIndex::open_existing(root) {
+        Ok(idx) => idx,
+        Err(e) if e.is::<infigraph_core::docs_switch::DocsNotIndexed>() => {
+            println!("{e}");
+            return Ok(());
+        }
+        Err(e) => return Err(e),
+    };
     let store = idx.store().context("doc store not initialized")?;
 
     let results = infigraph_docs::search::hybrid_doc_search(query, store, root, limit, 0.5)?;

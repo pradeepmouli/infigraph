@@ -172,3 +172,39 @@ fn clean_docs_is_not_undone_by_an_attached_watcher() {
     );
     assert_eq!(docs_enabled_recorded(&root), Some(false));
 }
+
+#[test]
+fn open_existing_refuses_a_project_that_has_not_opted_in_and_creates_nothing() {
+    let _env = Isolated::new();
+    let (_tmp, root) = project_with_readme();
+    let err = infigraph_docs::DocIndex::open_existing(&root)
+        .err()
+        .expect("nothing to open");
+    assert!(
+        err.is::<infigraph_core::docs_switch::DocsNotIndexed>(),
+        "{err}"
+    );
+    assert!(!root.join(".infigraph").exists());
+}
+
+#[test]
+fn open_existing_refuses_an_opted_in_project_whose_store_is_missing() {
+    let _env = Isolated::new();
+    let (_tmp, root) = project_with_readme();
+    infigraph_core::docs_switch::set_docs_enabled(&root, true).unwrap();
+    assert!(infigraph_docs::DocIndex::open_existing(&root).is_err());
+    assert!(
+        !docs_store_path(&root).exists(),
+        "a reader created the store"
+    );
+}
+
+#[test]
+fn open_existing_reads_an_opted_in_store() {
+    let _env = Isolated::new();
+    let (_tmp, root) = project_with_readme();
+    index_docs(&root, false).unwrap();
+    let idx = infigraph_docs::DocIndex::open_existing(&root).unwrap();
+    let hashes = idx.store().unwrap().get_doc_hashes().unwrap();
+    assert!(hashes.contains_key("README.md"), "{hashes:?}");
+}

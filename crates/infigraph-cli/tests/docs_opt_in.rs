@@ -282,3 +282,22 @@ fn clean_docs_turns_docs_off_and_the_daemon_does_not_bring_them_back() {
         "the daemon re-created docs.kuzu after clean-docs"
     );
 }
+
+/// Spec: `search_docs` on a project that is not enabled answers with the
+/// message, and the search itself creates nothing.
+#[test]
+fn search_docs_on_a_fresh_project_says_how_to_opt_in_and_creates_nothing() {
+    let (project, home) = project();
+    let root = project.path();
+    let _daemon = start_daemon(root, home.path());
+
+    let out = run(root, home.path(), DAEMON, &["search-docs", "zebra"]);
+    assert_ok(&out, "search-docs");
+    assert!(
+        stdout(&out).contains(infigraph_core::docs_switch::DOCS_NOT_INDEXED),
+        "{}",
+        stdout(&out)
+    );
+    assert!(!docs_store_path(root).exists());
+    assert_eq!(docs_enabled_recorded(root), None);
+}

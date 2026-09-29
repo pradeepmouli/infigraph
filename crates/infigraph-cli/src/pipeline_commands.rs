@@ -35,8 +35,7 @@ pub(crate) fn cmd_pipeline_plugins(root: &Path) -> Result<()> {
 }
 
 pub(crate) fn cmd_pipeline_deps(root: &Path) -> Result<()> {
-    let mut idx = infigraph_docs::DocIndex::open(root)?;
-    idx.init()?;
+    let idx = infigraph_docs::DocIndex::open_existing(root)?;
     let store = idx.store().context("DocStore not initialized")?;
 
     let deps = store.get_pipeline_deps()?;
@@ -53,8 +52,7 @@ pub(crate) fn cmd_pipeline_deps(root: &Path) -> Result<()> {
 }
 
 pub(crate) fn cmd_pipeline_impact(root: &Path, table_name: &str, max_depth: u32) -> Result<()> {
-    let mut idx = infigraph_docs::DocIndex::open(root)?;
-    idx.init()?;
+    let idx = infigraph_docs::DocIndex::open_existing(root)?;
     let store = idx.store().context("DocStore not initialized")?;
 
     let results = store.impact_analysis(table_name, max_depth)?;
@@ -78,8 +76,7 @@ pub(crate) fn cmd_pipeline_impact(root: &Path, table_name: &str, max_depth: u32)
 }
 
 pub(crate) fn cmd_pipeline_compliance(root: &Path, scope: &str, plugin_id: &str) -> Result<()> {
-    let mut idx = infigraph_docs::DocIndex::open(root)?;
-    idx.init()?;
+    let idx = infigraph_docs::DocIndex::open_existing(root)?;
     let store = idx.store().context("DocStore not initialized")?;
 
     let rows = store.query_plugin_table(plugin_id, "compliance", scope)?;
@@ -109,8 +106,7 @@ pub(crate) fn cmd_pipeline_query(
     field: &str,
     value: &str,
 ) -> Result<()> {
-    let mut idx = infigraph_docs::DocIndex::open(root)?;
-    idx.init()?;
+    let idx = infigraph_docs::DocIndex::open_existing(root)?;
     let store = idx.store().context("DocStore not initialized")?;
 
     let rows = store.query_plugin_table(plugin_id, field, value)?;
