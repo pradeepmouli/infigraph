@@ -167,9 +167,13 @@ fn cmd_watch_daemon_also_indexes_docs_without_restart() {
 
     // Index docs for the same root WITHOUT stopping the watch process --
     // this is what makes docs.kuzu appear mid-run, the exact scenario the
-    // daemon's doc thread must notice on its own. This is a ONE-TIME setup
-    // open before the daemon has ever attached, so it can't race the
-    // daemon's own open the way a repeated polling open would.
+    // daemon's doc thread must notice on its own. It is a ONE-TIME setup
+    // open, but not necessarily before the daemon's first one: the daemon's
+    // read service opens docs.kuzu at startup (creating it), which lets its
+    // doc thread attach and catch up at once. A daemon that got there
+    // within the sleep above held the store when this open ran, and
+    // `init` used to refuse it outright (macOS CI); it now waits out a
+    // brief hold, as the graph's open does.
     infigraph_docs::DocIndex::open(&root)
         .unwrap()
         .init()

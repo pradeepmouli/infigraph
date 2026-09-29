@@ -1,6 +1,7 @@
 pub mod batch;
 pub mod config;
 pub mod producer;
+pub mod registration;
 
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Mutex};

@@ -10,6 +10,7 @@
 //! the daemon process's own lifetime.
 
 use crate::daemon::queue::IndexWorkQueue;
+use crate::watch::registration::Registration;
 use crate::watch::{WatchEvent, WatchEventKind};
 use clap::Parser;
 use notify::{Config, Event, EventKind, RecommendedWatcher, Watcher};
@@ -20,6 +21,12 @@ use tokio::sync::mpsc as tokio_mpsc;
 use tokio_util::sync::CancellationToken;
 
 const MAX_RESTARTS: u32 = 3;
+
+/// The producer's watcher, shared with the thread registering a new
+/// directory on it: a cancel stops the wait for that thread, not the thread,
+/// which drops its handle -- and with the producer gone, the watcher -- when
+/// it finishes.
+type SharedWatcher = Arc<Mutex<RecommendedWatcher>>;
 
 /// Everything a producer needs that is fixed for its whole lifetime. A
 /// struct rather than four more positional parameters because
@@ -240,18 +247,31 @@ pub async fn run_producer(
                                     if path.is_dir() {
                                         // A new subdirectory needs its own
                                         // subscription (these are registered
-                                        // NonRecursive). Log a failure rather
+                                        // NonRecursive), and registering it
+                                        // is the same blocking `fseventsd`
+                                        // call as startup's, so it runs off
+                                        // this task too. Log a failure rather
                                         // than discarding it: silently not
                                         // watching a new directory means
                                         // every later change under it is
                                         // missed with nothing to explain why.
-                                        if let Err(e) =
-                                            crate::watch::register_watch_dirs(&mut watcher, &path)
-                                        {
-                                            eprintln!(
+                                        let shared = Arc::clone(&watcher);
+                                        let dir = path.clone();
+                                        let registered = Registration::start(&root, move || {
+                                            let mut watcher = shared
+                                                .lock()
+                                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                            crate::watch::register_watch_dirs(&mut watcher, &dir)
+                                        })
+                                        .unless_cancelled(&token)
+                                        .await;
+                                        match registered {
+                                            None => break,
+                                            Some(Ok(())) => {}
+                                            Some(Err(e)) => eprintln!(
                                                 "[watch-producer] failed to watch new directory {}: {e}",
                                                 path.display()
-                                            );
+                                            ),
                                         }
                                     } else if !crate::graph::store_util::is_lockfile(&rel)
                                         && registry.for_file(&rel).is_some()
@@ -337,42 +357,22 @@ fn interval_after(period: Duration) -> tokio::time::Interval {
     interval
 }
 
-/// [`create_watcher`], but a cancelled `token` stops the wait for it.
-/// Registration blocks: on macOS every per-directory `watch()` restarts the
-/// FSEvents stream, an RPC to `fseventsd`, and with `fseventsd` backed up
-/// (dozens of watchers and a build storm on one machine) a single one was
-/// seen stalling for over a minute. Run inline, that stall sat between a
-/// stop and this task's exit, so the coordinator's `code_watch.stop()`
-/// -- and with it `watch.lock` -- was held for as long as `fseventsd` took.
-/// Registration therefore runs on a thread of its own; `None` means the
-/// token was cancelled first, and the thread drops what it built whenever
-/// it finishes.
+/// [`create_watcher`] on a thread of its own (see [`Registration`]); `None`
+/// means the token was cancelled first.
 async fn create_watcher_unless_cancelled(
     root: &Path,
     debounce_ms: u64,
     token: &CancellationToken,
 ) -> Option<
     anyhow::Result<(
-        RecommendedWatcher,
+        SharedWatcher,
         tokio_mpsc::UnboundedReceiver<notify::Result<Event>>,
     )>,
 > {
-    let (tx, rx) = tokio::sync::oneshot::channel();
     let thread_root = root.to_path_buf();
-    if let Err(e) = std::thread::Builder::new()
-        .name("infigraph-watch-register".into())
-        .spawn(move || {
-            let _ = tx.send(create_watcher(&thread_root, debounce_ms));
-        })
-    {
-        return Some(Err(e.into()));
-    }
-    tokio::select! {
-        _ = token.cancelled() => None,
-        built = rx => Some(built.unwrap_or_else(|_| {
-            Err(anyhow::anyhow!("watcher registration thread exited without a result"))
-        })),
-    }
+    Registration::start(root, move || create_watcher(&thread_root, debounce_ms))
+        .unless_cancelled(token)
+        .await
 }
 
 /// Builds a watcher registered on every non-ignored directory under `root`,
@@ -387,18 +387,9 @@ fn create_watcher(
     root: &Path,
     debounce_ms: u64,
 ) -> anyhow::Result<(
-    RecommendedWatcher,
+    SharedWatcher,
     tokio_mpsc::UnboundedReceiver<notify::Result<Event>>,
 )> {
-    // Test-only: hold registration while `root/<this>` exists, standing in
-    // for a stalled `fseventsd` (see `create_watcher_unless_cancelled`).
-    // Root-relative, so it cannot stall another test's producer.
-    if let Some(stall) = std::env::var_os("INFIGRAPH_TEST_WATCH_REGISTER_STALL_FILE") {
-        let stall = root.join(stall);
-        while stall.exists() {
-            std::thread::sleep(Duration::from_millis(20));
-        }
-    }
     let (tx, rx) = tokio_mpsc::unbounded_channel::<notify::Result<Event>>();
     // An unbounded sender never blocks, so this handler is safe to call from
     // notify's own (synchronous, non-async) backend thread.
@@ -409,7 +400,7 @@ fn create_watcher(
         Config::default().with_poll_interval(Duration::from_millis(debounce_ms)),
     )?;
     crate::watch::register_watch_dirs(&mut watcher, root)?;
-    Ok((watcher, rx))
+    Ok((Arc::new(Mutex::new(watcher)), rx))
 }
 
 /// Flushes the batch into the shared queue once its debounce window closes.

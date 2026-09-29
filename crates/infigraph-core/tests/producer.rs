@@ -10,6 +10,11 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 
+/// The test stall hook's file name (`INFIGRAPH_TEST_WATCH_REGISTER_STALL_FILE`).
+/// Root-relative, so a producer in another test never stalls, and one value
+/// for every test here because the variable is process-wide.
+const STALL: &str = "register-stall";
+
 fn config(root: PathBuf) -> ProducerConfig {
     ProducerConfig {
         root,
@@ -219,11 +224,9 @@ async fn producer_exits_promptly_on_cancellation() {
 /// on the root failed with "another watcher is already running".
 #[tokio::test]
 async fn producer_exits_promptly_on_cancellation_while_registration_is_stalled() {
-    const STALL: &str = "register-stall";
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_path_buf();
     std::fs::create_dir_all(root.join(".infigraph")).unwrap();
-    // Root-relative, so the other producers in this binary never stall.
     std::env::set_var("INFIGRAPH_TEST_WATCH_REGISTER_STALL_FILE", STALL);
     std::fs::write(root.join(STALL), "").unwrap();
 
@@ -247,6 +250,63 @@ async fn producer_exits_promptly_on_cancellation_while_registration_is_stalled()
     assert!(
         start.elapsed() < std::time::Duration::from_secs(2),
         "cancellation took {:?} with registration stalled",
+        start.elapsed()
+    );
+}
+
+/// The same for a directory created while watching: it gets its own
+/// subscription, registered from inside the event loop through the same
+/// blocking `fseventsd` call as startup's. Multi-threaded so that, were the
+/// loop to block its worker, the test itself could still time the cancel.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn producer_exits_promptly_on_cancellation_while_a_new_directory_registration_is_stalled() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    std::fs::create_dir_all(root.join(".infigraph")).unwrap();
+    std::env::set_var("INFIGRAPH_TEST_WATCH_REGISTER_STALL_FILE", STALL);
+
+    let queue = Arc::new(Mutex::new(IndexWorkQueue::new()));
+    let token = CancellationToken::new();
+    let cfg = config(root.clone());
+    let queue_clone = Arc::clone(&queue);
+    let token_clone = token.clone();
+    let handle = tokio::task::spawn(async move {
+        infigraph_core::watch::producer::run_producer(cfg, queue_clone, |_evt| {}, token_clone)
+            .await;
+    });
+    wait_until_watching(&root, &queue).await;
+
+    std::fs::write(root.join(STALL), "").unwrap();
+    std::fs::create_dir(root.join("new_dir")).unwrap();
+    let stalled = root.join(format!("{STALL}.stalled"));
+    for _ in 0..600 {
+        if stalled.exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(
+        stalled.exists(),
+        "the producer never started registering new_dir"
+    );
+    // A blocked producer must still end, so the failure is an assertion and
+    // not a hung test.
+    let stall = root.join(STALL);
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(10));
+        let _ = std::fs::remove_file(stall);
+    });
+
+    let start = std::time::Instant::now();
+    token.cancel();
+    let exited = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+    let _ = std::fs::remove_file(root.join(STALL));
+    exited
+        .expect("a cancel must not wait out a stalled new-directory registration")
+        .unwrap();
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(2),
+        "cancellation took {:?} with a new-directory registration stalled",
         start.elapsed()
     );
 }
