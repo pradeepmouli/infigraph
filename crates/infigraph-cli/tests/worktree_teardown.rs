@@ -138,7 +138,13 @@ fn worktree_teardown_stops_the_daemon_after_the_directory_is_gone() {
 /// End to end against a real daemon on a real worktree: after `git worktree
 /// remove`, teardown succeeds, evicts the entry, and the daemon is gone.
 #[test]
-fn worktree_teardown_after_removal_leaves_no_daemon_running() {
+/// The removal the worktree hook drives: `daemon-stop --wait` inside the
+/// worktree (PreToolUse), `git worktree remove`, then `worktree teardown`
+/// (PostToolUse). Removing with the daemon still running is not a flow any
+/// more: a daemon writing into .infigraph/ while git deletes it makes the
+/// remove fail half-done ("Directory not empty"), which is how this test
+/// flaked on macOS CI before it followed the hook.
+fn the_hook_flow_removes_a_worktree_with_a_live_daemon_cleanly() {
     use std::time::{Duration, Instant};
 
     let fake_home = tempfile::tempdir().unwrap();
@@ -183,14 +189,22 @@ fn worktree_teardown_after_removal_leaves_no_daemon_running() {
         std::thread::sleep(Duration::from_millis(100));
     }
     let listening = reachable();
+    assert!(listening, "the daemon never bound its read endpoint");
 
-    git(
-        &["worktree", "remove", "--force", wt_path.to_str().unwrap()],
-        main.path(),
+    let stop = Command::new(env!("CARGO_BIN_EXE_infigraph"))
+        .args(["daemon-stop", "--wait"])
+        .current_dir(&wt_path)
+        .env("HOME", fake_home.path())
+        .env_remove("INFIGRAPH_WATCH_DAEMON")
+        .output()
+        .unwrap();
+    assert!(
+        stop.status.success(),
+        "daemon-stop --wait failed: {}",
+        String::from_utf8_lossy(&stop.stderr)
     );
-    let out = run_worktree("teardown", &wt_path, fake_home.path());
-
-    let deadline = Instant::now() + Duration::from_secs(30);
+    // `--wait` returned, so the process has exited: reaping it is immediate.
+    let deadline = Instant::now() + Duration::from_secs(5);
     let exited = loop {
         if daemon.try_wait().unwrap().is_some() {
             break true;
@@ -204,14 +218,22 @@ fn worktree_teardown_after_removal_leaves_no_daemon_running() {
         let _ = daemon.kill();
         let _ = daemon.wait();
     }
+    assert!(
+        exited,
+        "daemon-stop --wait returned before the daemon exited"
+    );
 
-    assert!(listening, "the daemon never bound its read endpoint");
+    git(
+        &["worktree", "remove", "--force", wt_path.to_str().unwrap()],
+        main.path(),
+    );
+    assert!(!wt_path.exists(), "the worktree directory must be gone");
+    let out = run_worktree("teardown", &wt_path, fake_home.path());
     assert!(
         out.status.success(),
         "teardown failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(exited, "the daemon must be gone after teardown");
     let registry =
         std::fs::read_to_string(fake_home.path().join(".infigraph/registry.json")).unwrap();
     assert!(
