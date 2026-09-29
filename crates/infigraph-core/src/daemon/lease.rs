@@ -56,6 +56,7 @@ impl Lease {
         *lock(&self.last_use) = Instant::now();
     }
 
+    #[cfg(unix)]
     fn idle_for(&self) -> Duration {
         lock(&self.last_use).elapsed()
     }
@@ -67,6 +68,8 @@ impl Lease {
     /// Record the parked connection so a release can end it. False if the
     /// lease was released meanwhile: the caller drops the connection.
     fn park(&self, stream: &super::read_endpoint::ReadStream) -> bool {
+        // Mutated only where there is a handle to store (unix).
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut hangup = lock(&self.hangup);
         #[cfg(unix)]
         {
@@ -141,6 +144,7 @@ fn grace_for(root: &Path) -> Duration {
 }
 
 /// How long a lease may go unused before it is released; zero never.
+#[cfg(unix)]
 fn release_after_for(root: &Path) -> Duration {
     overrides(root).release_after.unwrap_or_else(|| {
         Duration::from_secs(super::daemon_idle_settings(root).client_release_secs)
@@ -194,6 +198,7 @@ pub fn unpin(root: &Path) {
     }
 }
 
+#[cfg(unix)]
 fn is_pinned(root: &Path) -> bool {
     lock(&PINNED).as_ref().is_some_and(|p| p.contains(root))
 }
@@ -207,6 +212,7 @@ pub fn set_release_guard(guard: ReleaseGuard) {
     *lock(&RELEASE_GUARD) = Some(guard);
 }
 
+#[cfg(unix)]
 fn guard_keeps(root: &Path) -> bool {
     let guard = *lock(&RELEASE_GUARD);
     guard.is_some_and(|g| g(root))
@@ -291,10 +297,10 @@ fn start_lease(root: PathBuf, lease: Arc<Lease>, just_spawned: bool, grace: Dura
                 forget(&root, &lease);
             }
         });
-    if spawned.is_err() {
+    let Ok(_) = spawned else {
         forget(&root, &lease);
         return;
-    }
+    };
     #[cfg(unix)]
     {
         let after = release_after_for(&root);

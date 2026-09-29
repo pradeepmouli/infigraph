@@ -620,7 +620,7 @@ fn run() -> Result<()> {
         .to_string();
 
     if ui_enabled {
-        if web::start_ui_server(port) {
+        if web::start_ui_server(port).is_some() {
             eprintln!("Infigraph UI running at http://localhost:{}", port);
             eprintln!("Open: http://localhost:{}/?path=/your/project", port);
         } else {
@@ -637,11 +637,8 @@ fn run() -> Result<()> {
     }
 
     if serve_mode {
-        if web::start_mcp_http_server(mcp_port, is_primary, &health_path)? {
-            eprintln!(
-                "Infigraph MCP HTTP server at http://{}",
-                web::bind_addr("INFIGRAPH_MCP_BIND", mcp_port)
-            );
+        if let Some(bound) = web::start_mcp_http_server(mcp_port, is_primary, &health_path)? {
+            eprintln!("Infigraph MCP HTTP server at http://{bound}");
         } else {
             eprintln!("Infigraph MCP HTTP port {} already in use", mcp_port);
         }

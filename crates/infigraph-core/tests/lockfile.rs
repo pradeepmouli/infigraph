@@ -364,6 +364,19 @@ mod holder_is_alive_pid_reuse {
         assert!(!holder_is_alive(&info(999_999, 42)));
     }
 
+    /// An exited holder its parent has not reaped is dead, so its lock (and
+    /// any fault it recorded, via `fault::live_fault`) is not live. Only
+    /// Linux lists zombies; on macOS this passes with or without the fix.
+    #[test]
+    #[cfg(unix)]
+    fn an_unreaped_zombie_holder_is_dead() {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let alive = holder_is_alive(&info(child.id(), 0));
+        child.wait().unwrap();
+        assert!(!alive, "a zombie holder must read as dead");
+    }
+
     #[test]
     fn lock_acquisition_stamps_the_holders_real_start_time() {
         let tmp = tempfile::tempdir().unwrap();

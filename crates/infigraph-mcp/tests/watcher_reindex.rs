@@ -13,6 +13,7 @@ use infigraph_mcp::tools::search::{tool_search, tool_search_symbols};
 use infigraph_mcp::tools::watch::*;
 
 mod support;
+use support::{stop_all_doc_watchers, stop_all_watchers};
 
 static WATCHER_LOCK: Mutex<()> = Mutex::new(());
 
@@ -32,63 +33,6 @@ fn make_project(files: &[(&str, &str)]) -> (support::TestProject, String) {
     let dir = support::TestProject::with_files(files);
     let path = dir.path_string();
     (dir, path)
-}
-
-fn stop_all_watchers() {
-    let mut guard = get_watchers();
-    let stopped_paths: Vec<String> = if let Some(map) = guard.as_mut() {
-        let ids: Vec<String> = map.keys().cloned().collect();
-        let mut paths = Vec::new();
-        for id in ids {
-            if let Some(entry) = map.remove(&id) {
-                paths.push(entry.path.clone());
-                let _ = entry.stop_tx.send(());
-            }
-        }
-        paths
-    } else {
-        Vec::new()
-    };
-    drop(guard);
-    wait_for_watch_locks_released(&stopped_paths);
-}
-
-/// A stopped watcher's thread notices `stop_rx` on its own poll cadence and
-/// may still be mid-reindex, so it doesn't release `.infigraph/watch.lock`
-/// the instant the stop signal is sent. Block (with a generous bound) until
-/// each path's lock is confirmed free, so tests that immediately re-watch
-/// the same project aren't racing the previous watcher's shutdown.
-fn wait_for_watch_locks_released(paths: &[String]) {
-    use fs2::FileExt;
-    for path in paths {
-        let lock_path = std::path::Path::new(path)
-            .join(".infigraph")
-            .join("watch.lock");
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            let file = match std::fs::OpenOptions::new()
-                .create(true)
-                .write(true)
-                .truncate(false)
-                .open(&lock_path)
-            {
-                Ok(f) => f,
-                Err(_) => break,
-            };
-            match file.try_lock_exclusive() {
-                Ok(()) => {
-                    let _ = file.unlock();
-                    break;
-                }
-                Err(_) => {
-                    if Instant::now() >= deadline {
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(20));
-                }
-            }
-        }
-    }
 }
 
 /// The doc ids currently in the project's doc store -- the only witness
@@ -179,7 +123,7 @@ fn test_code_watcher_reindexes_modified_file() {
                 .map(|r| r.contains("brand_new_function"))
                 .unwrap_or(false)
         },
-        Duration::from_secs(15),
+        support::WATCH_EVENT_BUDGET,
         "brand_new_function should be searchable after watcher reindex",
     );
 
@@ -223,7 +167,7 @@ fn test_code_watcher_reindexes_new_file_existing_dir() {
                 .map(|r| r.contains("helper_util"))
                 .unwrap_or(false)
         },
-        Duration::from_secs(15),
+        support::WATCH_EVENT_BUDGET,
         "helper_util should be searchable after watcher reindex",
     );
 
@@ -273,7 +217,7 @@ fn test_code_watcher_reindexes_new_file_new_dir() {
                 .map(|r| r.contains("new_feature"))
                 .unwrap_or(false)
         },
-        Duration::from_secs(15),
+        support::WATCH_EVENT_BUDGET,
         "new_feature should be searchable after watcher reindex",
     );
 
@@ -281,18 +225,6 @@ fn test_code_watcher_reindexes_new_file_new_dir() {
         found,
         "watcher should have reindexed new file in new dir — branch switch scenario"
     );
-}
-
-fn stop_all_doc_watchers() {
-    let mut guard = DOC_WATCHERS.lock().unwrap();
-    if let Some(map) = guard.as_mut() {
-        let ids: Vec<String> = map.keys().cloned().collect();
-        for id in ids {
-            if let Some(entry) = map.remove(&id) {
-                let _ = entry.stop_tx.send(());
-            }
-        }
-    }
 }
 
 /// Doc watcher should detect new .md files and reindex them.
@@ -340,7 +272,7 @@ fn test_doc_watcher_reindexes_new_doc() {
     // Poll the store itself until the watcher's reindex has landed the doc.
     let found = poll_until(
         || doc_store_keys(&path).iter().any(|k| k == "docs/guide.md"),
-        Duration::from_secs(15),
+        support::WATCH_EVENT_BUDGET,
         "docs/guide.md should be in the doc store after the doc watcher reindexes",
     );
     assert!(found, "doc watcher should have reindexed new document");
@@ -440,7 +372,7 @@ fn test_code_watcher_branch_switch_existing_dirs() {
                 .map(|r| r.contains("main_b"))
                 .unwrap_or(false)
         },
-        Duration::from_secs(15),
+        support::WATCH_EVENT_BUDGET,
         "main_b searchable",
     );
     let found_extra = poll_until(
@@ -512,7 +444,7 @@ fn test_code_watcher_branch_switch_new_dirs() {
                 .map(|r| r.contains("branch_b_feature"))
                 .unwrap_or(false)
         },
-        Duration::from_secs(15),
+        support::WATCH_EVENT_BUDGET,
         "branch_b_feature in new dir",
     );
 
@@ -573,7 +505,7 @@ fn test_doc_watcher_reindexes_new_doc_new_dir() {
                 .iter()
                 .any(|k| k == "docs/tutorials/getting-started.md")
         },
-        Duration::from_secs(15),
+        support::WATCH_EVENT_BUDGET,
         "docs/tutorials/getting-started.md should be in the doc store after the watcher picks up the new subdir",
     );
     assert!(
@@ -644,7 +576,7 @@ fn test_code_watcher_handles_dir_removal() {
                 .map(|r| r.contains("after_removal_func"))
                 .unwrap_or(false)
         },
-        Duration::from_secs(15),
+        support::WATCH_EVENT_BUDGET,
         "after_removal_func should be searchable — watcher survived dir removal",
     );
 
@@ -726,7 +658,7 @@ fn test_code_watcher_grammar_plugin_extensions() {
                 .map(|r| r.contains("grammar_control_func"))
                 .unwrap_or(false)
         },
-        Duration::from_secs(15),
+        support::WATCH_EVENT_BUDGET,
         "grammar_control_func (.py) should be searchable",
     );
 
@@ -807,7 +739,7 @@ fn test_code_watcher_cross_file_auto_resolve() {
                 .map(|r| r.contains("extra_resolved_func"))
                 .unwrap_or(false)
         },
-        Duration::from_secs(15),
+        support::WATCH_EVENT_BUDGET,
         "extra_resolved_func should be searchable after auto-resolve reindex",
     );
 
@@ -885,7 +817,7 @@ fn test_code_watcher_ignores_excluded_dirs() {
                 .map(|r| r.contains("legit_not_ignored"))
                 .unwrap_or(false)
         },
-        Duration::from_secs(15),
+        support::WATCH_EVENT_BUDGET,
         "legit_not_ignored should be searchable",
     );
 
@@ -1044,7 +976,7 @@ fn test_doc_watcher_prunes_stale_docs() {
                 .iter()
                 .any(|k| k == "docs/delete_me.md")
         },
-        Duration::from_secs(15),
+        support::WATCH_EVENT_BUDGET,
         "docs/delete_me.md should be pruned once the doc watcher reindexes",
     );
 

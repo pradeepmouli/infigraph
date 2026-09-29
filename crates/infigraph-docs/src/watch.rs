@@ -8,6 +8,8 @@ use anyhow::Result;
 use clap::Parser;
 use notify::{Config, RecursiveMode, Watcher};
 
+use infigraph_core::watch::registration::Registration;
+
 use crate::{is_document_file, DocIndex};
 
 pub fn watch_docs(
@@ -18,8 +20,20 @@ pub fn watch_docs(
 ) -> Result<()> {
     let (tx, rx) = mpsc::channel();
     let config = Config::default().with_poll_interval(Duration::from_millis(debounce_ms));
-    let mut watcher = notify::RecommendedWatcher::new(tx, config)?;
-    watcher.watch(root, RecursiveMode::Recursive)?;
+    // Registration can stall on a backed-up `fseventsd` for over a minute;
+    // a stop must not wait it out (see `Registration`).
+    let watch_root = root.to_path_buf();
+    let registered = Registration::start(root, move || {
+        let mut watcher = notify::RecommendedWatcher::new(tx, config)?;
+        watcher.watch(&watch_root, RecursiveMode::Recursive)?;
+        Ok(watcher)
+    })
+    .unless_stopped(|| stop_rx.try_recv().is_ok());
+    let Some(watcher) = registered else {
+        eprintln!("[{log_prefix}] stopped");
+        return Ok(());
+    };
+    let _watcher = watcher?;
 
     // notify's recursive watch has no directory exclusion of its own -- it
     // subscribes to the entire tree, `.infigraph`/`target`/`node_modules`
@@ -583,6 +597,47 @@ mod tests {
         result_rx.recv_timeout(Duration::from_secs(2)).expect(
             "run_attached_cycle must return promptly when watch_fn exits unrequested, \
              not block waiting on a stop condition nothing will ever trip",
+        );
+    }
+
+    /// A stop must end `watch_docs` even while its watcher registration is
+    /// stalled -- on macOS an RPC to a backed-up `fseventsd`, seen taking
+    /// over a minute on a loaded machine, during which a doc-watch stop (or
+    /// the daemon's shutdown, which joins this thread) waited it out.
+    #[test]
+    fn watch_docs_stops_promptly_while_registration_is_stalled() {
+        const STALL: &str = "register-stall";
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        // Root-relative, so no other watcher in this binary stalls.
+        std::env::set_var("INFIGRAPH_TEST_WATCH_REGISTER_STALL_FILE", STALL);
+        std::fs::write(root.join(STALL), "").unwrap();
+
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let watch_root = root.clone();
+        std::thread::spawn(move || {
+            let _ = done_tx.send(watch_docs(&watch_root, 50, stop_rx, "test"));
+        });
+        let stalled = root.join(format!("{STALL}.stalled"));
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while !stalled.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(stalled.exists(), "watch_docs never started registering");
+
+        let start = std::time::Instant::now();
+        stop_tx.send(()).unwrap();
+        let stopped = done_rx.recv_timeout(Duration::from_secs(5));
+        // Let the registration thread finish and drop its watcher either way.
+        std::fs::remove_file(root.join(STALL)).unwrap();
+        stopped
+            .expect("a stop must not wait out a stalled watcher registration")
+            .unwrap();
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "stopping took {:?} with registration stalled",
+            start.elapsed()
         );
     }
 }

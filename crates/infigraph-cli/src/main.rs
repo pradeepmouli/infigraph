@@ -101,7 +101,9 @@ enum Commands {
     /// Re-record the growth guard's baseline from the graph as it stands now
     ///
     /// The guard (#100) refuses a write once the graph passes a multiple of
-    /// its recorded healthy size. `rebuild` re-records that baseline as one
+    /// its recorded healthy size -- and is past `[graph] growth_min_bytes`
+    /// (128 MiB by default), below which growth is never refused as a
+    /// runaway. `rebuild` re-records that baseline as one
     /// step of its work; this exposes the same step on its own, for when the
     /// current graph is known-good and a stale baseline is the only thing
     /// refusing writes. It rewrites one number in

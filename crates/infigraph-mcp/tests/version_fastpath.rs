@@ -6,6 +6,8 @@
 //! flags must print and exit before ANY lock/registry/handover side
 //! effects.
 
+mod support;
+
 use std::fs;
 use std::process::Command;
 
@@ -34,7 +36,7 @@ fn run_flag(flag: &str) -> (std::process::Output, tempfile::TempDir, String) {
 
     let output = Command::new(env!("CARGO_BIN_EXE_infigraph-mcp"))
         .arg(flag)
-        .env("INFIGRAPH_MCP_LOCK_PATH", &lock_path)
+        .envs(support::mcp_state_env(tmp.path()))
         .env(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND)
         .env_remove("INFIGRAPH_WATCH_DAEMON")
         .output()

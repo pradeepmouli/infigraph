@@ -5,6 +5,8 @@
 
 #![cfg(unix)]
 
+mod support;
+
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -22,7 +24,7 @@ fn sigterm_deregisters_the_instance_and_exits_promptly() {
         .current_dir(&project)
         // Hermetic: never touch the real lock/registry, and CI mode keeps
         // the worker from spawning daemons/watchers for the temp project.
-        .env("INFIGRAPH_MCP_LOCK_PATH", tmp.path().join("mcp.lock"))
+        .envs(support::mcp_state_env(tmp.path()))
         .env("INFIGRAPH_REGISTRY_INSTANCES_DIR", &instances_dir)
         .env("CI", "true")
         .env(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND)
@@ -101,9 +103,8 @@ fn sigterm_to_the_supervisor_logs_why_and_exits_promptly_and_the_worker_follows(
     let mut child = Command::new(env!("CARGO_BIN_EXE_infigraph-mcp"))
         .arg("--mcp")
         .current_dir(&project)
-        .env("INFIGRAPH_MCP_LOCK_PATH", tmp.path().join("mcp.lock"))
+        .envs(support::mcp_state_env(tmp.path()))
         .env("INFIGRAPH_REGISTRY_INSTANCES_DIR", &instances_dir)
-        .env("INFIGRAPH_MCP_LOG_PATH", &log_path)
         .env("CI", "true")
         .env(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND)
         .env_remove("INFIGRAPH_WATCH_DAEMON")

@@ -10,6 +10,7 @@
 //! the daemon process's own lifetime.
 
 use crate::daemon::queue::IndexWorkQueue;
+use crate::watch::registration::Registration;
 use crate::watch::{WatchEvent, WatchEventKind};
 use clap::Parser;
 use notify::{Config, Event, EventKind, RecommendedWatcher, Watcher};
@@ -20,6 +21,12 @@ use tokio::sync::mpsc as tokio_mpsc;
 use tokio_util::sync::CancellationToken;
 
 const MAX_RESTARTS: u32 = 3;
+
+/// The producer's watcher, shared with the thread registering a new
+/// directory on it: a cancel stops the wait for that thread, not the thread,
+/// which drops its handle -- and with the producer gone, the watcher -- when
+/// it finishes.
+type SharedWatcher = Arc<Mutex<RecommendedWatcher>>;
 
 /// Everything a producer needs that is fixed for its whole lifetime. A
 /// struct rather than four more positional parameters because
@@ -134,23 +141,25 @@ pub async fn run_producer(
     )
     .storm_threshold as usize;
 
-    let (mut watcher, mut rx) = match create_watcher(&root, debounce_ms) {
-        Ok(pair) => pair,
-        Err(e) => {
-            eprintln!("[watch-producer] failed to start watcher: {e}");
-            // Same event every other terminal path emits. Without it a
-            // producer whose watcher never started is indistinguishable,
-            // from the coordinator's side, from one that shut down cleanly
-            // on cancellation -- the task just completes and nothing says
-            // watching never actually began.
-            on_event(WatchEvent {
-                kind: WatchEventKind::WatcherDied,
-                path: root.clone(),
-                has_cross_file_calls: false,
-            });
-            return;
-        }
-    };
+    let (mut watcher, mut rx) =
+        match create_watcher_unless_cancelled(&root, debounce_ms, &token).await {
+            None => return,
+            Some(Ok(pair)) => pair,
+            Some(Err(e)) => {
+                eprintln!("[watch-producer] failed to start watcher: {e}");
+                // Same event every other terminal path emits. Without it a
+                // producer whose watcher never started is indistinguishable,
+                // from the coordinator's side, from one that shut down cleanly
+                // on cancellation -- the task just completes and nothing says
+                // watching never actually began.
+                on_event(WatchEvent {
+                    kind: WatchEventKind::WatcherDied,
+                    path: root.clone(),
+                    has_cross_file_calls: false,
+                });
+                return;
+            }
+        };
     let mut restart_count: u32 = 0;
 
     // `Delay` rather than the default `Burst`: these are idle cadences, not a
@@ -238,18 +247,31 @@ pub async fn run_producer(
                                     if path.is_dir() {
                                         // A new subdirectory needs its own
                                         // subscription (these are registered
-                                        // NonRecursive). Log a failure rather
+                                        // NonRecursive), and registering it
+                                        // is the same blocking `fseventsd`
+                                        // call as startup's, so it runs off
+                                        // this task too. Log a failure rather
                                         // than discarding it: silently not
                                         // watching a new directory means
                                         // every later change under it is
                                         // missed with nothing to explain why.
-                                        if let Err(e) =
-                                            crate::watch::register_watch_dirs(&mut watcher, &path)
-                                        {
-                                            eprintln!(
+                                        let shared = Arc::clone(&watcher);
+                                        let dir = path.clone();
+                                        let registered = Registration::start(&root, move || {
+                                            let mut watcher = shared
+                                                .lock()
+                                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                            crate::watch::register_watch_dirs(&mut watcher, &dir)
+                                        })
+                                        .unless_cancelled(&token)
+                                        .await;
+                                        match registered {
+                                            None => break,
+                                            Some(Ok(())) => {}
+                                            Some(Err(e)) => eprintln!(
                                                 "[watch-producer] failed to watch new directory {}: {e}",
                                                 path.display()
-                                            );
+                                            ),
                                         }
                                     } else if !crate::graph::store_util::is_lockfile(&rel)
                                         && registry.for_file(&rel).is_some()
@@ -297,8 +319,9 @@ pub async fn run_producer(
                             _ = token.cancelled() => break,
                             _ = tokio::time::sleep(backoff) => {}
                         }
-                        match create_watcher(&root, debounce_ms) {
-                            Ok((new_watcher, new_rx)) => {
+                        match create_watcher_unless_cancelled(&root, debounce_ms, &token).await {
+                            None => break,
+                            Some(Ok((new_watcher, new_rx))) => {
                                 watcher = new_watcher;
                                 rx = new_rx;
                                 eprintln!("[watch-producer] watcher restarted successfully");
@@ -308,7 +331,7 @@ pub async fn run_producer(
                                     has_cross_file_calls: false,
                                 });
                             }
-                            Err(e) => {
+                            Some(Err(e)) => {
                                 eprintln!("[watch-producer] watcher restart failed: {e}");
                                 on_event(WatchEvent {
                                     kind: WatchEventKind::WatcherDied,
@@ -334,6 +357,24 @@ fn interval_after(period: Duration) -> tokio::time::Interval {
     interval
 }
 
+/// [`create_watcher`] on a thread of its own (see [`Registration`]); `None`
+/// means the token was cancelled first.
+async fn create_watcher_unless_cancelled(
+    root: &Path,
+    debounce_ms: u64,
+    token: &CancellationToken,
+) -> Option<
+    anyhow::Result<(
+        SharedWatcher,
+        tokio_mpsc::UnboundedReceiver<notify::Result<Event>>,
+    )>,
+> {
+    let thread_root = root.to_path_buf();
+    Registration::start(root, move || create_watcher(&thread_root, debounce_ms))
+        .unless_cancelled(token)
+        .await
+}
+
 /// Builds a watcher registered on every non-ignored directory under `root`,
 /// paired with the receiver for its events.
 ///
@@ -346,7 +387,7 @@ fn create_watcher(
     root: &Path,
     debounce_ms: u64,
 ) -> anyhow::Result<(
-    RecommendedWatcher,
+    SharedWatcher,
     tokio_mpsc::UnboundedReceiver<notify::Result<Event>>,
 )> {
     let (tx, rx) = tokio_mpsc::unbounded_channel::<notify::Result<Event>>();
@@ -359,7 +400,7 @@ fn create_watcher(
         Config::default().with_poll_interval(Duration::from_millis(debounce_ms)),
     )?;
     crate::watch::register_watch_dirs(&mut watcher, root)?;
-    Ok((watcher, rx))
+    Ok((Arc::new(Mutex::new(watcher)), rx))
 }
 
 /// Flushes the batch into the shared queue once its debounce window closes.

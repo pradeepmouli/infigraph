@@ -1597,6 +1597,8 @@ fn doctor_fails_when_the_growth_breaker_is_latched() {
     let dir = tempfile::TempDir::new().unwrap();
     let ig = dir.path().join(".infigraph");
     std::fs::create_dir_all(&ig).unwrap();
+    // The ratio guard proper, not its `growth_min_bytes` floor.
+    std::fs::write(ig.join("config.toml"), "[graph]\ngrowth_min_bytes = 0\n").unwrap();
     std::fs::write(ig.join("graph"), vec![0u8; 20_000_000]).unwrap();
     // Baseline 1MB against a 20MB graph: 20x, past the 10x default.
     std::fs::write(
@@ -1638,6 +1640,8 @@ fn doctor_passes_when_the_graph_is_within_the_growth_cap() {
     let dir = tempfile::TempDir::new().unwrap();
     let ig = dir.path().join(".infigraph");
     std::fs::create_dir_all(&ig).unwrap();
+    // The ratio guard proper, not its `growth_min_bytes` floor.
+    std::fs::write(ig.join("config.toml"), "[graph]\ngrowth_min_bytes = 0\n").unwrap();
     std::fs::write(ig.join("graph"), vec![0u8; 3_000_000]).unwrap();
     std::fs::write(
         ig.join("graph.health.json"),

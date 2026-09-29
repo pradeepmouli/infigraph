@@ -99,7 +99,21 @@ impl DocIndex {
             return Ok(());
         }
 
-        match DocStore::open(&self.db_path) {
+        // A daemon's doc watcher and read service open `docs.kuzu` for
+        // moments at a time (the daemon opens it at startup, attaches, and
+        // catches up at once), so a direct open landing in one of those
+        // windows waits it out, as the graph's does, instead of refusing.
+        let opened = infigraph_core::open_kuzu_with_retry(
+            || DocStore::open(&self.db_path),
+            || {
+                infigraph_core::graph::lock_probe::probe_graph_lock(
+                    &self.db_path,
+                    infigraph_core::graph::lock_probe::ProbeFor::Write,
+                )
+            },
+            std::time::Duration::from_secs(3),
+        );
+        match opened {
             Ok(store) => {
                 self.store = Some(Box::new(store));
                 Ok(())
