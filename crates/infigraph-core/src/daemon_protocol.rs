@@ -152,6 +152,18 @@ pub enum IngestSource {
     Inline(PathBuf),
 }
 
+/// What one document index run did, for `index-docs` to print: the counts
+/// `DocIndex::index` returns plus the store's totals afterwards.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DocIndexStats {
+    pub files_scanned: usize,
+    pub files_indexed: usize,
+    pub chunks_created: usize,
+    pub bfs_discovered: usize,
+    pub documents_in_store: usize,
+    pub chunks_in_store: usize,
+}
+
 /// Small summary of what happened -- never the full `IndexResult` (which
 /// carries every file's `FileExtraction`, already written to the graph by
 /// the daemon and not needed again by the caller).
