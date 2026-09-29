@@ -675,7 +675,7 @@ mod tests {
     #[test]
     fn snapshot_omits_a_graph_past_its_growth_guard_and_records_why() {
         let tmp = tempfile::tempdir().unwrap();
-        let tg = tmp.path().join(".infigraph");
+        let tg = crate::graph::store_util::floorless_infigraph_dir(tmp.path());
         write(&tg.join("graph"), "g");
         crate::graph::stamp_healthy_graph_size(&tg, &tg.join("graph"));
         write(&tg.join("graph"), &"g".repeat(4096)); // 4096x its 1-byte baseline

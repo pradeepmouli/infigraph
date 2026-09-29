@@ -14,6 +14,7 @@ fn graph_group_defaults_match_the_pre_migration_values() {
     let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     for var in [
         "INFIGRAPH_GRAPH_GROWTH_MAX_RATIO",
+        "INFIGRAPH_GRAPH_GROWTH_MIN_BYTES",
         "INFIGRAPH_GRAPH_QUARANTINE_MAX_BYTES",
         "INFIGRAPH_GRAPH_SLOW_LOCK_MS",
         "INFIGRAPH_GRAPH_DOC_HNSW_THRESHOLD",
@@ -23,6 +24,7 @@ fn graph_group_defaults_match_the_pre_migration_values() {
     }
     let g = resolve_graph();
     assert_eq!(g.growth_max_ratio, 10);
+    assert_eq!(g.growth_min_bytes, 128 * 1024 * 1024);
     assert_eq!(g.quarantine_max_bytes, 1024 * 1024 * 1024);
     assert_eq!(g.slow_lock_ms, 2000);
     assert_eq!(g.doc_hnsw_threshold, 200_000);
@@ -57,6 +59,16 @@ fn growth_max_ratio_reads_its_env_var() {
     std::env::set_var("INFIGRAPH_GRAPH_GROWTH_MAX_RATIO", "3");
     assert_eq!(resolve_graph().growth_max_ratio, 3);
     std::env::remove_var("INFIGRAPH_GRAPH_GROWTH_MAX_RATIO");
+}
+
+/// The ratio breaker's size floor must be overridable like the ratio
+/// itself, and 0 -- which restores the ratio at any size -- reachable.
+#[test]
+fn growth_min_bytes_reads_its_env_var() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    std::env::set_var("INFIGRAPH_GRAPH_GROWTH_MIN_BYTES", "0");
+    assert_eq!(resolve_graph().growth_min_bytes, 0);
+    std::env::remove_var("INFIGRAPH_GRAPH_GROWTH_MIN_BYTES");
 }
 
 /// #183: automatic compaction ships opt-in. On by default would have the

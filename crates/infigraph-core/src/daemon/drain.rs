@@ -434,7 +434,7 @@ mod tests {
             // The sittir shape: a live graph far past a realistic baseline,
             // while the rebuild itself lands well under it. The extension is
             // sparse, so no page the store reads is rewritten.
-            let tg = root.join(".infigraph");
+            let tg = crate::graph::store_util::floorless_infigraph_dir(root);
             fs::write(
                 tg.join("graph.health.json"),
                 r#"{"healthy_size_bytes": 1048576}"#,

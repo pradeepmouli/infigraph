@@ -2536,6 +2536,12 @@ const COMPACTION_SAMPLE_INTERVAL: Duration = Duration::from_secs(600);
 /// `scip_settings` above. The read is a small TOML and this runs on a 200ms
 /// tick; the trade is that a `compaction_escalate_pct` change takes effect
 /// without a daemon restart, where a SCIP settings change does not.
+///
+/// "Close to refusal" is measured against both of the refusal's conditions:
+/// the ratio, and the `growth_min_bytes` floor below which the ratio never
+/// refuses. The same percentage applies to each, so a graph still well under
+/// the floor is not rebuilt out from under its user for a refusal that
+/// cannot happen yet, while one approaching it escalates ahead of the refusal.
 fn escalation_due(infigraph_dir: &Path, graph_path: &Path) -> bool {
     let scope = crate::settings_file::ConfigScope::of_infigraph_dir(Some(infigraph_dir));
     let cfg = crate::graph::Graph::resolve_or_default(crate::graph::RawGraph::default(), scope);
@@ -2543,10 +2549,10 @@ fn escalation_due(infigraph_dir: &Path, graph_path: &Path) -> bool {
     else {
         return false; // no baseline -- nothing to be close to
     };
-    ratio.saturating_mul(100)
-        >= cfg
-            .growth_max_ratio
-            .saturating_mul(cfg.compaction_escalate_pct)
+    let pct = cfg.compaction_escalate_pct;
+    ratio.saturating_mul(100) >= cfg.growth_max_ratio.saturating_mul(pct)
+        && crate::graph::store_util::graph_family_bytes(graph_path).saturating_mul(100)
+            >= cfg.growth_min_bytes.saturating_mul(pct)
 }
 
 /// Queue a rebuild the daemon asked for itself (compaction, auto-recovery),
@@ -3844,7 +3850,7 @@ mod tests {
     #[test]
     fn escalation_fires_on_the_byte_ratio_alone() {
         let tmp = tempfile::tempdir().unwrap();
-        let infigraph_dir = tmp.path().to_path_buf();
+        let infigraph_dir = crate::graph::store_util::floorless_infigraph_dir(tmp.path());
         let graph_path = infigraph_dir.join("graph");
         std::fs::write(&graph_path, vec![0u8; 4096]).unwrap();
         crate::graph::stamp_healthy_graph_size(&infigraph_dir, &graph_path);
@@ -3859,7 +3865,7 @@ mod tests {
     #[test]
     fn escalation_does_not_fire_below_the_threshold() {
         let tmp = tempfile::tempdir().unwrap();
-        let infigraph_dir = tmp.path().to_path_buf();
+        let infigraph_dir = crate::graph::store_util::floorless_infigraph_dir(tmp.path());
         let graph_path = infigraph_dir.join("graph");
         std::fs::write(&graph_path, vec![0u8; 4096]).unwrap();
         crate::graph::stamp_healthy_graph_size(&infigraph_dir, &graph_path);
@@ -3868,6 +3874,38 @@ mod tests {
         assert!(
             !escalation_due(&infigraph_dir, &graph_path),
             "3x is below the 5x escalation point"
+        );
+    }
+
+    /// Escalation forces a rebuild regardless of idleness because a refusal
+    /// is coming. Under the `growth_min_bytes` floor none is: a baseline
+    /// stamped at a few KB makes any real graph "6x", and rebuilding it out
+    /// from under its user for that would be pure disruption.
+    #[test]
+    fn escalation_does_not_fire_well_under_the_size_floor() {
+        let tmp = tempfile::tempdir().unwrap();
+        let infigraph_dir = tmp.path().join(".infigraph");
+        std::fs::create_dir_all(&infigraph_dir).unwrap();
+        std::fs::write(
+            infigraph_dir.join("config.toml"),
+            "[graph]\ngrowth_min_bytes = 1000000\n",
+        )
+        .unwrap();
+        let graph_path = infigraph_dir.join("graph");
+        std::fs::write(&graph_path, vec![0u8; 4096]).unwrap();
+        crate::graph::stamp_healthy_graph_size(&infigraph_dir, &graph_path);
+
+        std::fs::write(&graph_path, vec![0u8; 4096 * 6]).unwrap();
+        assert!(
+            !escalation_due(&infigraph_dir, &graph_path),
+            "6x, but 24KB against a 1MB floor: no refusal is near"
+        );
+
+        // Half the floor is the same 50% the ratio escalates at.
+        std::fs::write(&graph_path, vec![0u8; 500_000]).unwrap();
+        assert!(
+            escalation_due(&infigraph_dir, &graph_path),
+            "~122x and half the floor: the refusal is near on both counts"
         );
     }
 

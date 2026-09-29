@@ -56,6 +56,10 @@ pub use test_templates::{test_templates_for, TestTemplate};
 // capture, so per-field docs live on each accessor instead:
 // - growth_max_ratio: runaway-growth circuit breaker
 //   (`store_util::graph_growth_max_ratio`, #100)
+// - growth_min_bytes: size below which the growth_max_ratio breaker never
+//   refuses, 0 disables (`store_util::graph_growth_min_bytes`). A baseline
+//   stamped after a project's first write can be a few hundred KB, which put
+//   the 10x trip point at a few MB of ordinary indexing.
 // - checkpoint_idle_secs: how long a WAL must sit unwritten before the
 //   daemon folds it into the base image, 0 disables
 //   (`GraphStore::checkpoint_if_idle`, #149)
@@ -89,6 +93,7 @@ pub use test_templates::{test_templates_for, TestTemplate};
 crate::settings! {
     graph {
         growth_max_ratio: u64 = 10,
+        growth_min_bytes: u64 = 128 * 1024 * 1024,
         max_bytes: u64 = 8 * 1024 * 1024 * 1024,
         checkpoint_idle_secs: u64 = 5,
         copy_retry_max_batch_multiple: u64 = 8,
