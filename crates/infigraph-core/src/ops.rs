@@ -129,6 +129,7 @@ pub fn wipe_infigraph_preserving_index_lock(tg_dir: &Path) -> std::io::Result<()
 /// lock while it is held would also split it.
 fn kept_across_a_code_rebuild(name: &str) -> bool {
     name == "config.toml"
+        || name == "config.lock"
         || name == crate::docs_switch::DOCS_OP_LOCK
         || name.starts_with("docs.kuzu")
         || name.starts_with("docs_")

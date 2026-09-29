@@ -527,9 +527,7 @@ pub fn tool_group_build(args: &Value) -> Result<String> {
         // ones that opted in, through the daemon when it owns the
         // store, and leave the rest alone.
         if !is_remote {
-            if let Some(stats) = infigraph_docs::ops::request_index_docs_if_enabled(&entry.path)? {
-                bfs_discovered += stats.bfs_discovered;
-            }
+            bfs_discovered += infigraph_docs::ops::refresh_docs_if_enabled(&entry.path)?;
             continue;
         }
         let mut idx = infigraph_docs::DocIndex::open(&entry.path)?;

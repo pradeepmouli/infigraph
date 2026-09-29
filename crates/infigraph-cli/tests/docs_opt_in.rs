@@ -301,3 +301,52 @@ fn search_docs_on_a_fresh_project_says_how_to_opt_in_and_creates_nothing() {
     assert!(!docs_store_path(root).exists());
     assert_eq!(docs_enabled_recorded(root), None);
 }
+
+/// The group build's document step (step 5), through the real CLI: a repo that
+/// opted in has its documents refreshed, and a repo that did not is left
+/// with no store and no switch.
+#[test]
+fn group_build_refreshes_only_the_repos_that_opted_in() {
+    let (opted_in, home) = project();
+    let (other, _other_home) = project();
+    let (a, b) = (opted_in.path(), other.path());
+
+    assert_ok(&run(a, home.path(), "kuzu", &["index-docs"]), "index-docs");
+    std::fs::write(a.join("second.md"), "# Second\n\nThe quokka appendix.\n").unwrap();
+
+    assert_ok(
+        &run(a, home.path(), "kuzu", &["group", "create", "g"]),
+        "group create",
+    );
+    for repo in [a, b] {
+        assert_ok(
+            &run(
+                a,
+                home.path(),
+                "kuzu",
+                &["group", "add", "g", repo.to_str().unwrap()],
+            ),
+            "group add",
+        );
+    }
+    assert_ok(
+        &run(a, home.path(), "kuzu", &["group", "build", "g"]),
+        "group build",
+    );
+
+    let found = run(a, home.path(), "kuzu", &["search-docs", "quokka"]);
+    assert_ok(&found, "search-docs");
+    assert!(stdout(&found).contains("quokka"), "{}", stdout(&found));
+    assert!(
+        !b.join(".infigraph/docs.kuzu").exists(),
+        "a repo that never opted in got a document index from the group build"
+    );
+    assert!(
+        !b.join(".infigraph/config.toml").exists()
+            || !{
+                std::fs::read_to_string(b.join(".infigraph/config.toml"))
+                    .unwrap()
+                    .contains("[docs]")
+            }
+    );
+}

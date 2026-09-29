@@ -214,12 +214,16 @@ pub fn write_atomic(path: &Path, contents: &str) -> anyhow::Result<()> {
         .parent()
         .ok_or_else(|| anyhow::anyhow!("path has no parent directory: {}", path.display()))?;
     std::fs::create_dir_all(parent)?;
+    // Unique per call, not just per process: two threads writing the same
+    // file must not share (and clobber) one temp file.
+    static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let tmp_path = parent.join(format!(
-        ".{}.tmp-{}",
+        ".{}.tmp-{}-{}",
         path.file_name()
             .ok_or_else(|| anyhow::anyhow!("path has no file name: {}", path.display()))?
             .to_string_lossy(),
-        std::process::id()
+        std::process::id(),
+        TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     let mut file = std::fs::File::create(&tmp_path)?;
     if let Err(e) = file.write_all(contents.as_bytes()) {

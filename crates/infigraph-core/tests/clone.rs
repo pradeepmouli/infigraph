@@ -81,3 +81,29 @@ fn clone_errors_clearly_when_source_has_no_infigraph_dir() {
         "error should mention .infigraph: {err}"
     );
 }
+
+/// `docs-op.lock`, the document store's identity lock and the config writer's
+/// lock are locks like the rest: a copy would claim the destination is held
+/// by the source's process. `config.toml` and the store itself do travel.
+#[test]
+fn clone_excludes_the_docs_and_config_locks() {
+    let src = tempfile::tempdir().unwrap();
+    let dst = tempfile::tempdir().unwrap();
+
+    write_file(&src.path().join(".infigraph/docs-op.lock"), "pid:123");
+    write_file(&src.path().join(".infigraph/docs.kuzu.lock"), "pid:123");
+    write_file(&src.path().join(".infigraph/config.lock"), "pid:123");
+    write_file(&src.path().join(".infigraph/config.toml"), "[docs]\n");
+    write_file(&src.path().join(".infigraph/docs.kuzu"), "store");
+
+    clone_infigraph_dir(src.path(), dst.path()).unwrap();
+
+    for lock in ["docs-op.lock", "docs.kuzu.lock", "config.lock"] {
+        assert!(
+            !dst.path().join(".infigraph").join(lock).exists(),
+            "{lock} was cloned"
+        );
+    }
+    assert!(dst.path().join(".infigraph/config.toml").exists());
+    assert!(dst.path().join(".infigraph/docs.kuzu").exists());
+}

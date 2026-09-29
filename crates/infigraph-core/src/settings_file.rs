@@ -139,6 +139,15 @@ pub fn set_project_setting(
     value: toml_edit::Item,
 ) -> anyhow::Result<()> {
     let config_path = project_config_path(root);
+    // Read-modify-write under a lock: two writers in one daemon (the docs
+    // executor and a watch-policy control) must not each start from the same
+    // text and drop the other's key.
+    let _rmw = crate::lockfile::acquire(
+        &config_path.with_file_name("config.lock"),
+        "config-write",
+        std::time::Duration::from_secs(10),
+    )
+    .with_context(|| format!("locking {} for writing", config_path.display()))?;
     let mut doc: toml_edit::DocumentMut = match std::fs::read_to_string(&config_path) {
         Ok(contents) => contents
             .parse()
@@ -153,6 +162,12 @@ pub fn set_project_setting(
             "{}: `{section}` is not a table, so [{section}] {key} cannot be set",
             config_path.display()
         );
+    }
+    if doc.get(section).is_none() {
+        // A real `[section]` table, not the inline `section = { .. }` that
+        // indexing a missing key would produce: a later hand-written
+        // `[section]` would then be a duplicate key and the file unparseable.
+        doc[section] = toml_edit::table();
     }
     doc[section][key] = value;
     crate::daemon_protocol::write_atomic(&config_path, &doc.to_string())
@@ -229,6 +244,56 @@ mod tests {
 
     fn port(doc: &toml_edit::DocumentMut) -> Option<i64> {
         doc.get("svc")?.get("port")?.as_integer()
+    }
+
+    /// A section that does not exist yet is written as `[section]`, not an
+    /// inline `section = { key = value }` a later hand-written `[section]`
+    /// would collide with (a duplicate key, so the whole file stops parsing).
+    #[test]
+    fn an_absent_section_is_written_as_a_table() {
+        let tmp = tempfile::tempdir().unwrap();
+        set_project_setting(tmp.path(), "docs", "enabled", toml_edit::value(true)).unwrap();
+        let text = std::fs::read_to_string(project_config_path(tmp.path())).unwrap();
+        assert!(text.contains("[docs]"), "{text}");
+        assert!(!text.contains("docs = {"), "{text}");
+        let mut extended = text;
+        extended.push_str("\n[docs.extra]\nx = 1\n");
+        assert!(extended.parse::<toml_edit::DocumentMut>().is_ok());
+    }
+
+    /// Two writers in one process (the docs executor and a watch-policy
+    /// control, in the daemon) must both land: no lost update, and no shared
+    /// temp file for one to clobber under the other.
+    #[test]
+    fn concurrent_writers_keep_every_update() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let threads: Vec<_> = (0..6)
+            .map(|t| {
+                let root = root.clone();
+                std::thread::spawn(move || {
+                    for i in 0..8 {
+                        set_project_setting(
+                            &root,
+                            "svc",
+                            &format!("k{t}_{i}"),
+                            toml_edit::value(i as i64),
+                        )
+                        .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        let doc = load(&project_config_path(&root)).unwrap();
+        let svc = doc.get("svc").unwrap();
+        for t in 0..6 {
+            for i in 0..8 {
+                assert!(svc.get(format!("k{t}_{i}")).is_some(), "lost k{t}_{i}");
+            }
+        }
     }
 
     #[test]

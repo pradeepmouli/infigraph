@@ -58,6 +58,11 @@ pub const DOCS_OP_LOCK: &str = "docs-op.lock";
 /// embeds every chunk, so this is `FullReindex`'s budget.
 pub const DOCS_OP_WAIT: Duration = Duration::from_secs(600);
 
+/// How long a read waits behind a docs operation before it gives up. Far
+/// shorter than [`DOCS_OP_WAIT`]: a writer may legitimately take minutes, but
+/// a search should tell its caller to retry, not hang.
+pub const DOCS_READ_WAIT: Duration = Duration::from_secs(10);
+
 pub fn docs_store_path(root: &Path) -> PathBuf {
     root.join(".infigraph").join("docs.kuzu")
 }
@@ -120,12 +125,25 @@ pub fn try_lock_docs_op(root: &Path) -> Result<Option<crate::lockfile::LockFile>
     crate::lockfile::try_acquire(&docs_op_lock_path(root), "docs-op")
 }
 
-/// Take the docs lock shared, for a read, waiting up to [`DOCS_OP_WAIT`].
+/// Take the docs lock shared, for a read, waiting up to [`DOCS_READ_WAIT`].
 /// The lock file's directory is created if missing, so a caller checks that
 /// the store exists first: a read must never bring back an `.infigraph/`
 /// someone removed.
 pub fn lock_docs_read(root: &Path) -> Result<crate::lockfile::LockFile> {
-    crate::lockfile::acquire_shared(&docs_op_lock_path(root), DOCS_OP_WAIT)
+    lock_docs_read_within(root, DOCS_READ_WAIT)
+}
+
+/// [`lock_docs_read`] with an explicit wait. A read stuck behind a long
+/// `index-docs` gives up with a message a person can act on, rather than
+/// stalling a whole cross-scope search for the writers' ten minutes.
+pub fn lock_docs_read_within(root: &Path, wait: Duration) -> Result<crate::lockfile::LockFile> {
+    crate::lockfile::acquire_shared(&docs_op_lock_path(root), wait).map_err(|e| {
+        if e.is::<crate::lockfile::Busy>() {
+            e.context("documents are being indexed or cleaned right now; try again shortly")
+        } else {
+            e
+        }
+    })
 }
 
 #[cfg(test)]
@@ -221,6 +239,19 @@ mod tests {
         );
         drop(reader);
         assert!(try_lock_docs_op(tmp.path()).unwrap().is_some());
+    }
+
+    /// A reader behind a long `index-docs` gives up soon and says why; it
+    /// does not sit for the writers' ten minutes.
+    #[test]
+    fn a_read_behind_a_docs_operation_gives_up_and_says_why() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _held = lock_docs_op(tmp.path(), Duration::from_secs(1)).unwrap();
+        let err = lock_docs_read_within(tmp.path(), Duration::from_millis(50))
+            .expect_err("the shared lock was granted under an exclusive holder");
+        let text = format!("{err:#}");
+        assert!(text.contains("try again"), "{text}");
+        assert!(DOCS_READ_WAIT < DOCS_OP_WAIT);
     }
 
     #[test]

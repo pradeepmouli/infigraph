@@ -3,8 +3,10 @@
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
-use infigraph_core::docs_switch::{docs_enabled_recorded, docs_store_path, lock_docs_op};
-use infigraph_docs::ops::{clean_docs, index_docs};
+use infigraph_core::docs_switch::{
+    docs_enabled, docs_enabled_recorded, docs_store_path, lock_docs_op,
+};
+use infigraph_docs::ops::{clean_docs, index_docs, refresh_docs_if_enabled};
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -207,4 +209,82 @@ fn open_existing_reads_an_opted_in_store() {
     let idx = infigraph_docs::DocIndex::open_existing(&root).unwrap();
     let hashes = idx.store().unwrap().get_doc_hashes().unwrap();
     assert!(hashes.contains_key("README.md"), "{hashes:?}");
+}
+
+/// `index-docs` racing `clean-docs`: the switch is recorded once the lock is
+/// held, not before. Otherwise a `clean-docs` that got the lock first would
+/// leave the store deleted and the switch on, and this run would then create
+/// a store nobody asked to keep.
+#[test]
+fn index_docs_records_the_switch_only_once_it_holds_the_lock() {
+    let _env = Isolated::new();
+    let (_tmp, root) = project_with_readme();
+    let held = lock_docs_op(&root, Duration::from_secs(1)).unwrap();
+
+    let r = root.clone();
+    let indexing = std::thread::spawn(move || index_docs(&r, false));
+    std::thread::sleep(Duration::from_millis(400));
+    assert!(
+        !docs_enabled(&root),
+        "index_docs switched documents on before it held the lock"
+    );
+
+    drop(held);
+    indexing.join().unwrap().unwrap();
+    assert!(docs_enabled(&root));
+}
+
+/// A reader never repairs: `open_existing` holds only the shared docs lock,
+/// so a corrupt store is reported, not wiped and rebuilt under it. The
+/// writers (`index-docs`, the watcher) still repair, under the exclusive lock.
+#[test]
+fn a_reader_does_not_wipe_a_corrupt_index() {
+    let _env = Isolated::new();
+    let (_tmp, root) = project_with_readme();
+    infigraph_core::docs_switch::set_docs_enabled(&root, true).unwrap();
+    let store = docs_store_path(&root);
+    std::fs::write(&store, b"not-a-valid-kuzu-database").unwrap();
+
+    let err = match infigraph_docs::DocIndex::open_existing(&root) {
+        Ok(_) => panic!("a corrupt index opened for reading"),
+        Err(e) => format!("{e:#}"),
+    };
+    assert!(err.contains("reindex-docs"), "{err}");
+    assert_eq!(
+        std::fs::read(&store).unwrap(),
+        b"not-a-valid-kuzu-database",
+        "the reader rewrote the store"
+    );
+}
+
+/// The shared step of a group build for one repo: refresh the documents of a
+/// repo that opted in, and leave any other alone (nothing created, nothing
+/// switched on).
+#[test]
+fn a_group_refresh_skips_a_repo_that_has_not_opted_in() {
+    let _env = Isolated::new();
+    let (_tmp, root) = project_with_readme();
+    assert_eq!(refresh_docs_if_enabled(&root).unwrap(), 0);
+    assert!(!root.join(".infigraph").exists());
+    assert!(!docs_enabled(&root));
+}
+
+#[test]
+fn a_group_refresh_indexes_a_repo_that_opted_in() {
+    let _env = Isolated::new();
+    let (_tmp, root) = project_with_readme();
+    index_docs(&root, false).unwrap();
+    std::fs::write(
+        root.join("second.md"),
+        "# Second
+
+A new page.
+",
+    )
+    .unwrap();
+
+    refresh_docs_if_enabled(&root).unwrap();
+
+    let idx = infigraph_docs::DocIndex::open_existing(&root).unwrap();
+    assert_eq!(idx.store().unwrap().stats().unwrap().document_count, 2);
 }

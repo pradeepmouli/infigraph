@@ -301,11 +301,26 @@ fn test_doc_watcher_reindexes_no_concurrent_read() {
 
     tool_index_docs(&json!({"path": &path})).expect("initial doc index");
 
+    // The store's files as the filesystem sees them: a signal that the
+    // watcher wrote, read without opening the store (which is the point of
+    // this test).
+    let store_stamp = || {
+        ["docs.kuzu", "docs.kuzu.wal"]
+            .iter()
+            .map(|name| {
+                std::fs::metadata(std::path::Path::new(&path).join(".infigraph").join(name))
+                    .ok()
+                    .map(|m| (m.modified().ok(), m.len()))
+            })
+            .collect::<Vec<_>>()
+    };
+
     let result = tool_watch_docs(&json!({"path": &path, "debounce_ms": 500})).unwrap();
     eprintln!("watch_docs: {result}");
 
     // Add new doc
     std::thread::sleep(Duration::from_millis(500));
+    let before = store_stamp();
     let new_doc = std::path::PathBuf::from(&path).join("docs/noconcurrent.md");
     std::fs::write(
         &new_doc,
@@ -314,8 +329,18 @@ fn test_doc_watcher_reindexes_no_concurrent_read() {
     .unwrap();
     eprintln!("wrote new doc (no concurrent read)");
 
-    // Wait for watcher to reindex WITHOUT polling search
-    std::thread::sleep(Duration::from_secs(5));
+    // Wait for the watcher to reindex WITHOUT reading the store: a fixed
+    // sleep raced the watcher's registration, which takes seconds under
+    // load. Then let the reindex that touched the store finish.
+    assert!(
+        poll_until(
+            || store_stamp() != before,
+            support::WATCH_EVENT_BUDGET,
+            "the doc store should change after the watcher reindexes",
+        ),
+        "the watcher never wrote to the doc store"
+    );
+    std::thread::sleep(Duration::from_secs(2));
 
     // Now do ONE search
     stop_all_doc_watchers();

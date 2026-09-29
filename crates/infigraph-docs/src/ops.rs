@@ -11,15 +11,18 @@ use infigraph_core::docs_switch;
 
 use crate::DocIndex;
 
-/// The executor: records `[docs] enabled = true`, then indexes against the
-/// local store in this process. `full` wipes and rebuilds (`reindex-docs`).
+/// The executor: under the docs lock, records `[docs] enabled = true` and
+/// indexes against the local store in this process. `full` wipes and rebuilds (`reindex-docs`).
 /// The daemon runs it for `WriteRequest::IndexDocs`. The CLI runs it
 /// directly only when the process opted out of the daemon
 /// (`INFIGRAPH_BACKEND=kuzu`); under the daemon backend `DocIndex::init`
 /// would route, and a routed store cannot write.
 pub fn index_docs(root: &Path, full: bool) -> Result<DocIndexStats> {
-    docs_switch::set_docs_enabled(root, true)?;
     let _op = docs_switch::lock_docs_op(root, docs_switch::DOCS_OP_WAIT)?;
+    // Recorded under the lock, not before it: a `clean-docs` that got the
+    // lock first has already turned the switch off and deleted the store,
+    // and this run then turns it back on for the index it goes on to make.
+    docs_switch::set_docs_enabled(root, true)?;
     // Work in flight for the daemon's idle exit (#203), like a watcher's
     // reindex.
     let _busy = crate::watch::ReindexGuard::enter();
@@ -86,6 +89,13 @@ pub fn request_index_docs_if_enabled(root: &Path) -> Result<Option<DocIndexStats
         return Ok(None);
     }
     request_index_docs(root, false).map(Some)
+}
+
+/// The document step of a group build (CLI and MCP) for one repo: refresh
+/// its documents if it opted in, and touch nothing if it did not. Returns
+/// the files a breadth-first link discovery added.
+pub fn refresh_docs_if_enabled(root: &Path) -> Result<usize> {
+    Ok(request_index_docs_if_enabled(root)?.map_or(0, |stats| stats.bfs_discovered))
 }
 
 /// The report `index-docs` and `reindex-docs` print, and MCP's in-process

@@ -97,7 +97,10 @@ impl DocIndex {
         };
         let mut idx = Self::open(root)?;
         idx.read_lock = read_lock;
-        idx.init()?;
+        // A reader never repairs: it holds only the shared lock, and a wipe
+        // and rebuild is a write. `index-docs` and the watcher repair, under
+        // the exclusive lock.
+        idx.init_inner(false)?;
         Ok(idx)
     }
 
@@ -108,6 +111,13 @@ impl DocIndex {
     }
 
     pub fn init(&mut self) -> Result<()> {
+        self.init_inner(true)
+    }
+
+    /// [`init`](Self::init); `repair` says whether a store that will not open
+    /// because it is corrupt may be wiped and rebuilt. Writers repair,
+    /// readers report.
+    fn init_inner(&mut self, repair: bool) -> Result<()> {
         #[cfg(feature = "remote")]
         if infigraph_core::daemon::lifecycle::is_remote_backend() {
             let neo = neo4j_store::Neo4jDocStore::connect_from_env()?;
@@ -166,6 +176,11 @@ impl DocIndex {
                     infigraph_core::graph::non_corruption_open_context(&first_err, &self.db_path);
                 Err(first_err.context(ctx))
             }
+            Err(first_err) if !repair => Err(first_err.context(format!(
+                "the document index at {} will not open and may be corrupt; \
+                 run `infigraph reindex-docs` to rebuild it",
+                self.db_path.display()
+            ))),
             Err(first_err) => {
                 eprintln!(
                     "[docs] open failed ({first_err}), wiping corrupt doc index and rebuilding..."
