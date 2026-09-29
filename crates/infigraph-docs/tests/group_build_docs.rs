@@ -26,6 +26,7 @@ use std::sync::Mutex;
 static GROUP_BUILD_DOCS_LOCK: Mutex<()> = Mutex::new(());
 
 fn index_doc(root: &std::path::Path, file: &str, text: &str) {
+    infigraph_core::docs_switch::set_docs_enabled(root, true).unwrap();
     let full_path = root.join(file);
     std::fs::create_dir_all(full_path.parent().unwrap()).unwrap();
     std::fs::write(&full_path, text).unwrap();
@@ -152,6 +153,38 @@ fn test_step5_combined_docs_includes_repo_once_its_doc_store_is_built() {
         stats_after.documents, 1,
         "combined docs should include order-service's README once its own doc \
          store is current"
+    );
+
+    if let Some(h) = old_home {
+        std::env::set_var("HOME", h);
+    } else {
+        std::env::remove_var("HOME");
+    }
+}
+
+/// Docs are opt-in per repo: a repo that turned them off contributes
+/// nothing to a combined store, even with its old store still on disk.
+#[test]
+fn test_step5_combined_docs_skips_a_repo_with_documents_turned_off() {
+    let _guard = GROUP_BUILD_DOCS_LOCK.lock().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let old_home = std::env::var_os("HOME");
+    std::env::set_var("HOME", home.path());
+
+    let repo_a = tempfile::tempdir().unwrap();
+    let repo_b = tempfile::tempdir().unwrap();
+    index_doc(
+        repo_a.path(),
+        "README.md",
+        "# Order Service\n\nHandles order payments.",
+    );
+    infigraph_core::docs_switch::set_docs_enabled(repo_a.path(), false).unwrap();
+
+    let registry = two_repo_registry(repo_a.path(), repo_b.path());
+    let stats = build_combined_docs(&registry, "docs-steps-group").unwrap();
+    assert_eq!(
+        stats.documents, 0,
+        "a repo with docs off contributed documents"
     );
 
     if let Some(h) = old_home {

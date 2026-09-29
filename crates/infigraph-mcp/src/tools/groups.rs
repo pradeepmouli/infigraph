@@ -523,6 +523,15 @@ pub fn tool_group_build(args: &Value) -> Result<String> {
             .repos
             .get(repo_name)
             .context(format!("repo '{}' not in registry", repo_name))?;
+        // Documents are opt-in per repo (local mode): refresh the
+        // ones that opted in, through the daemon when it owns the
+        // store, and leave the rest alone.
+        if !is_remote {
+            if let Some(stats) = infigraph_docs::ops::request_index_docs_if_enabled(&entry.path)? {
+                bfs_discovered += stats.bfs_discovered;
+            }
+            continue;
+        }
         let mut idx = infigraph_docs::DocIndex::open(&entry.path)?;
         if is_remote {
             idx.set_skip_file_embeddings(true);

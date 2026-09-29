@@ -78,16 +78,24 @@ pub fn build_combined_docs(registry: &Registry, group_name: &str) -> Result<Comb
             .repos
             .get(repo_name)
             .with_context(|| format!("repo '{}' not in registry", repo_name))?;
-        let source_path = entry.path.join(".infigraph").join("docs.kuzu");
-        if !source_path.exists() {
+        if !infigraph_core::docs_switch::docs_enabled(&entry.path) {
             eprintln!(
-                "  [combined-docs] skip {} — documents not indexed",
+                "  [combined-docs] skip {} — document indexing is off",
                 repo_name
             );
             continue;
         }
-
-        let store = DocStore::open(&source_path)?;
+        let store = match DocStore::open_for_read(&entry.path) {
+            Ok(store) => store,
+            Err(e) if e.is::<infigraph_core::docs_switch::DocsNotIndexed>() => {
+                eprintln!(
+                    "  [combined-docs] skip {} — documents not indexed",
+                    repo_name
+                );
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
         let doc_ids: HashSet<String> = store.get_doc_hashes()?.into_keys().collect();
         let conn = store.connection()?;
         let prefix = format!("[{}]::", repo_name);
@@ -392,13 +400,17 @@ pub fn has_combined_docs(group_name: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn combined_store_not_found(group_name: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "Combined document store not found for group '{}'. Run group_build first.",
+        group_name
+    )
+}
+
 pub fn open_combined_docs(group_name: &str) -> Result<DocStore> {
     let path = combined_docs_path(group_name)?;
     if !path.exists() {
-        anyhow::bail!(
-            "Combined document store not found for group '{}'. Run group_build first.",
-            group_name
-        );
+        return Err(combined_store_not_found(group_name));
     }
     DocStore::open(&path)
 }
@@ -411,6 +423,10 @@ pub fn combined_doc_search(
 ) -> Result<Vec<DocSearchResult>> {
     let artifact_dir = combined_docs_artifact_dir(group_name)?;
     let store_path = artifact_dir.join("docs.kuzu");
+    // Opening a missing store creates it; a search must not.
+    if !store_path.exists() {
+        return Err(combined_store_not_found(group_name));
+    }
     match DocStore::open(&store_path)
         .and_then(|store| hybrid_doc_search_in_dir(query, &store, &artifact_dir, limit, alpha))
     {
