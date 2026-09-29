@@ -118,3 +118,23 @@ fn index_docs_waits_for_a_docs_operation_already_running() {
     drop(held);
     assert_eq!(indexing.join().unwrap().unwrap().files_indexed, 1);
 }
+
+#[test]
+fn request_index_docs_if_enabled_leaves_a_project_that_has_not_opted_in_alone() {
+    let _env = Isolated::new();
+    let (_tmp, root) = project_with_readme();
+    assert_eq!(
+        infigraph_docs::ops::request_index_docs_if_enabled(&root).unwrap(),
+        None
+    );
+    assert!(!root.join(".infigraph").exists());
+}
+
+#[test]
+fn request_index_docs_without_the_daemon_runs_the_executor_here() {
+    let _env = Isolated::new();
+    let (_tmp, root) = project_with_readme();
+    let stats = infigraph_docs::ops::request_index_docs(&root, false).unwrap();
+    assert_eq!(stats.files_indexed, 1);
+    assert_eq!(docs_enabled_recorded(&root), Some(true));
+}

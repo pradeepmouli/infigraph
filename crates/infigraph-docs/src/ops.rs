@@ -50,3 +50,40 @@ pub fn clean_docs(root: &Path) -> Result<()> {
     let _op = docs_switch::lock_docs_op(root, docs_switch::DOCS_OP_WAIT)?;
     DocIndex::open(root)?.clean()
 }
+
+/// How `index-docs` runs, for every caller: under the daemon backend it
+/// asks the daemon (`WriteRequest::IndexDocs`), which runs [`index_docs`]
+/// beside the store it owns; otherwise (`INFIGRAPH_BACKEND=kuzu`, or
+/// remote) it runs [`index_docs`] here. There is no second indexer.
+pub fn request_index_docs(root: &Path, full: bool) -> Result<DocIndexStats> {
+    use infigraph_core::daemon_protocol::{WriteRequest, WriteResult};
+
+    if !infigraph_core::daemon_backend_selected() {
+        return index_docs(root, full);
+    }
+    infigraph_core::daemon::lifecycle::ensure_daemon_for_routed_access(root)?;
+    let result = infigraph_core::daemon::writes::submit(
+        root,
+        &WriteRequest::IndexDocs { full },
+        infigraph_core::daemon::writes::WriteOpts {
+            timeout: docs_switch::DOCS_OP_WAIT,
+            cancel: None,
+        },
+    )?;
+    match result {
+        WriteResult::DocsIndexed(stats) => Ok(stats),
+        WriteResult::Err { message } => anyhow::bail!("document indexing failed: {message}"),
+        other => anyhow::bail!("document indexing returned an unexpected result: {other:?}"),
+    }
+}
+
+/// [`request_index_docs`], but only for a project that has opted in:
+/// `None` for one that has not. A group build and MCP's in-process
+/// `index_project` refresh documents this way, so neither opts a project in
+/// on its owner's behalf.
+pub fn request_index_docs_if_enabled(root: &Path) -> Result<Option<DocIndexStats>> {
+    if !docs_switch::docs_enabled(root) {
+        return Ok(None);
+    }
+    request_index_docs(root, false).map(Some)
+}

@@ -122,6 +122,13 @@ pub enum WriteRequest {
     /// -- see `docs/superpowers/specs/2026-08-04-daemon-routed-full-reindex-design.md`.
     /// No fields: it always means "rebuild everything."
     FullReindex,
+    /// Index this project's documents (docs opt-in). The daemon runs the
+    /// executor (`infigraph_docs::ops::index_docs`) through its
+    /// `DocsHandle` on a background task. It records `[docs] enabled =
+    /// true`, so it is also how a project opts in. `full` wipes and
+    /// rebuilds (`reindex-docs`). There is no document data on the socket:
+    /// the daemon reads the files itself.
+    IndexDocs { full: bool },
 }
 
 impl WriteRequest {
@@ -190,6 +197,9 @@ pub enum WriteResult {
         indexed_files: usize,
         detected_languages: Vec<String>,
     },
+    /// `IndexDocs`'s outcome. A variant of its own: `Ok`'s two fields
+    /// describe code-graph writes.
+    DocsIndexed(DocIndexStats),
     Err {
         message: String,
     },
@@ -348,6 +358,11 @@ mod tests {
             }
             .kind(),
             "ScipImport"
+        );
+        assert_eq!(WriteRequest::IndexDocs { full: true }.kind(), "IndexDocs");
+        assert_eq!(
+            serde_json::to_string(&WriteRequest::IndexDocs { full: false }).unwrap(),
+            r#"{"IndexDocs":{"full":false}}"#
         );
     }
 
@@ -659,6 +674,10 @@ pub fn serve_write(infigraph: &Infigraph, request: &WriteRequest) -> WriteResult
         }
         WriteRequest::FullReindex => WriteResult::Err {
             message: "FullReindex not yet implemented".to_string(),
+        },
+        WriteRequest::IndexDocs { .. } => WriteResult::Err {
+            message: "IndexDocs runs on the daemon's docs handle, never under index.lock"
+                .to_string(),
         },
     }
 }

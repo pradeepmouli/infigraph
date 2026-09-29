@@ -301,7 +301,21 @@ pub trait DocsHandle: Send + Sync {
     /// Whether a doc reindex is running right now: work in flight, which
     /// defers the idle exit (#203).
     fn is_busy(&self) -> bool;
+    /// Index this project's documents for `WriteRequest::IndexDocs`. Called
+    /// on a background task, never the coordinator thread, and blocks until
+    /// done. `Err(msg)` is the reply the client gets. Required, with no
+    /// default: a handle that forgot it would silently refuse every
+    /// `index-docs`.
+    fn index_docs(
+        &self,
+        full: bool,
+    ) -> std::result::Result<crate::daemon_protocol::DocIndexStats, String>;
 }
+
+/// The reply to `IndexDocs` from a coordinator started without a docs
+/// handle: every in-process watcher, which serves no socket writes anyway.
+pub const NO_DOCS_INDEXER: &str =
+    "this daemon does not index documents: it was not started by `infigraph daemon`";
 
 /// A path's identity: `(device, inode)` plus its birth time where the
 /// platform and filesystem report one. `None` if nothing is there or the
@@ -876,6 +890,9 @@ where
     // direct-callback SCIP-enrichment path's own background task, not this
     // request-driven import.
     let mut scip_import_in_flight: Option<PendingScipImport> = None;
+    // A `WriteRequest::IndexDocs` running on `docs_control` (docs opt-in),
+    // reaped by `finish_docs_index` below.
+    let mut docs_index_in_flight: Option<PendingDocsIndex> = None;
     // #204: every write that has arrived and not yet started, in order.
     let mut deferred: std::collections::VecDeque<(
         crate::daemon_protocol::WriteRequest,
@@ -949,6 +966,7 @@ where
                 || full_reindex_in_flight.is_some()
                 || scip_in_flight.is_some()
                 || scip_import_in_flight.is_some()
+                || docs_index_in_flight.is_some()
                 || docs_control.as_ref().is_some_and(|d| d.is_busy())
                 || !deferred.is_empty()
                 || port.in_flight() > 0
@@ -1432,6 +1450,15 @@ where
                 }
             }
         }
+        if docs_index_in_flight
+            .as_ref()
+            .is_some_and(|p| p.task.is_finished())
+        {
+            let PendingDocsIndex { task, reply } = docs_index_in_flight
+                .take()
+                .expect("checked is_some just above");
+            finish_docs_index(reply, drain_rt.block_on(task.join()));
+        }
 
         // R3.3.5: sweep dirty marks whose file no longer exists.
         //
@@ -1619,6 +1646,8 @@ where
                     &drain_rt,
                     daemon_token,
                     scip_import_in_flight.is_some(),
+                    docs_control.as_ref(),
+                    docs_index_in_flight.is_some(),
                 ) {
                     Routed::Done => {}
                     Routed::Started(PendingWork::FullReindex(p)) => {
@@ -1629,6 +1658,7 @@ where
                         }
                     }
                     Routed::Started(PendingWork::ScipImport(p)) => scip_import_in_flight = Some(p),
+                    Routed::Started(PendingWork::DocsIndex(p)) => docs_index_in_flight = Some(p),
                     Routed::NotYet(request, reply) => deferred.push_back((request, reply)),
                 }
             }
@@ -1877,6 +1907,11 @@ where
             drain_rt.block_on(in_flight.task.join()),
         );
         drop(guard);
+    }
+    // A docs index that started finishes and answers its client (#204 D3:
+    // started work is never cancelled).
+    if let Some(PendingDocsIndex { task, reply }) = docs_index_in_flight.take() {
+        finish_docs_index(reply, drain_rt.block_on(task.join()));
     }
 
     // Last, so the joins above have answered their clients: let every
@@ -2318,16 +2353,25 @@ struct PendingScipImport {
     indexer_label: Option<String>,
 }
 
+/// A `WriteRequest::IndexDocs` running on the docs handle, and the client
+/// owed its result. One at a time: a second waits in `deferred`.
+struct PendingDocsIndex {
+    task: Task<std::result::Result<crate::daemon_protocol::DocIndexStats, String>>,
+    reply: WriteReply,
+}
+
 /// What `route_write` starts for the coordinator's main loop to track:
 /// either kind of background work it might have started this tick, so the
 /// loop can track and reap whichever one it is on a later tick. The two
 /// kinds are tracked as separate `Option` fields in the loop's own state
 /// (`full_reindex_in_flight`/`scip_import_in_flight`), not merged into one
 /// slot -- a full reindex and a client-submitted SCIP import are
-/// independent and can be in flight at the same time.
+/// independent and can be in flight at the same time -- or a docs index,
+/// which touches no graph and runs alongside either.
 enum PendingWork {
     FullReindex(PendingFullReindex),
     ScipImport(PendingScipImport),
+    DocsIndex(PendingDocsIndex),
 }
 
 /// The expensive, `held`-independent part of a full reindex: build a fresh
@@ -2678,6 +2722,68 @@ fn try_start_scip_import(
         reply,
         indexer_label,
     }))
+}
+
+/// Loop-thread entry point for `WriteRequest::IndexDocs`: hands it to the
+/// docs handle on a background task, like a SCIP import, so a first index
+/// (embeddings included, minutes on a large tree) never blocks code-graph
+/// writes. It needs no `index.lock`: it writes only the document store,
+/// which the docs lock guards. With no handle there is nothing to run it,
+/// and the client is told why at once. `Err(reply)` means one is already
+/// running: try again next tick.
+fn try_start_docs_index(
+    docs: Option<&Arc<dyn DocsHandle>>,
+    full: bool,
+    reply: WriteReply,
+    in_flight: bool,
+    drain_rt: &tokio::runtime::Runtime,
+    daemon_token: &CancellationToken,
+) -> std::result::Result<Option<PendingDocsIndex>, WriteReply> {
+    let Some(docs) = docs else {
+        reply.send(WriteResult::Err {
+            message: NO_DOCS_INDEXER.to_string(),
+        });
+        return Ok(None);
+    };
+    if in_flight {
+        return Err(reply);
+    }
+    let docs = Arc::clone(docs);
+    let task = {
+        let _guard = drain_rt.enter();
+        Task::spawn_blocking(daemon_token, "docs-index", move |_token| {
+            docs.index_docs(full)
+        })
+    };
+    Ok(Some(PendingDocsIndex { task, reply }))
+}
+
+/// Answers a finished docs index. A panicked task answers too: a client
+/// must never wait out its timeout for a result nobody will send.
+fn finish_docs_index(
+    reply: WriteReply,
+    joined: std::result::Result<
+        std::result::Result<crate::daemon_protocol::DocIndexStats, String>,
+        tokio::task::JoinError,
+    >,
+) {
+    let result = match joined {
+        Ok(Ok(stats)) => {
+            eprintln!(
+                "[daemon] documents indexed: {} of {} files, {} chunks ({} documents in store)",
+                stats.files_indexed,
+                stats.files_scanned,
+                stats.chunks_created,
+                stats.documents_in_store
+            );
+            WriteResult::DocsIndexed(stats)
+        }
+        Ok(Err(message)) => WriteResult::Err { message },
+        Err(e) => WriteResult::Err {
+            message: format!("document indexing task failed: {e}"),
+        },
+    };
+    reply.send(result);
 }
 
 /// Loop-thread finish for a completed SCIP import: logs one structured
@@ -3215,7 +3321,8 @@ enum Routed {
 
 /// Routes one write (#204): the four index-shaped variants join the shared
 /// queue with their reply as a waiter; `FullReindex` and `ScipImport` start
-/// background work (or join the running rebuild, #164); everything else is
+/// background work (or join the running rebuild, #164); `IndexDocs` runs on
+/// the docs handle's background task (one at a time); everything else is
 /// served under `index.lock` on this thread (`serve_request_locked`).
 #[allow(clippy::too_many_arguments)]
 fn route_write<MR>(
@@ -3232,6 +3339,8 @@ fn route_write<MR>(
     drain_rt: &tokio::runtime::Runtime,
     daemon_token: &CancellationToken,
     scip_import_in_flight: bool,
+    docs: Option<&Arc<dyn DocsHandle>>,
+    docs_index_in_flight: bool,
 ) -> Routed
 where
     MR: Fn() -> Result<crate::lang::LanguageRegistry>,
@@ -3397,6 +3506,18 @@ where
                 },
                 reply,
             ),
+        },
+        WriteRequest::IndexDocs { full } => match try_start_docs_index(
+            docs,
+            full,
+            reply,
+            docs_index_in_flight,
+            drain_rt,
+            daemon_token,
+        ) {
+            Ok(Some(p)) => Routed::Started(PendingWork::DocsIndex(p)),
+            Ok(None) => Routed::Done,
+            Err(reply) => Routed::NotYet(WriteRequest::IndexDocs { full }, reply),
         },
         other => match serve_request_locked(
             root,
@@ -3670,6 +3791,8 @@ mod tests {
         registry: Arc<crate::lang::LanguageRegistry>,
         backoff: ReopenBackoff,
         full_reindex: Option<PendingFullReindex>,
+        docs: Option<Arc<dyn DocsHandle>>,
+        docs_index: Option<PendingDocsIndex>,
     }
 
     impl Router {
@@ -3686,7 +3809,15 @@ mod tests {
                 registry,
                 backoff: ReopenBackoff::new(),
                 full_reindex: None,
+                docs: None,
+                docs_index: None,
             }
+        }
+
+        fn with_docs(root: &Path, docs: Arc<dyn DocsHandle>) -> Self {
+            let mut router = Self::new(root);
+            router.docs = Some(docs);
+            router
         }
 
         /// Route one write. A `FullReindex` it starts is kept as the
@@ -3706,10 +3837,16 @@ mod tests {
                 &self.drain_rt,
                 &self.daemon_token,
                 false,
+                self.docs.as_ref(),
+                self.docs_index.is_some(),
             );
             match routed {
                 Routed::Started(PendingWork::FullReindex(p)) => {
                     self.full_reindex = Some(p);
+                    Routed::Done
+                }
+                Routed::Started(PendingWork::DocsIndex(p)) => {
+                    self.docs_index = Some(p);
                     Routed::Done
                 }
                 other => other,
@@ -4479,6 +4616,114 @@ mod tests {
         let s = scip_settings(tempfile::tempdir().unwrap().path());
         assert_eq!(s.index_staleness_threshold, 50);
         assert_eq!(s.index_staleness_check_secs, 300);
+    }
+
+    /// A docs handle whose `index_docs` runs `self.0`.
+    struct FakeDocs(fn(bool) -> std::result::Result<crate::daemon_protocol::DocIndexStats, String>);
+
+    impl DocsHandle for FakeDocs {
+        fn control(&self, _action: WatchAction) -> std::result::Result<(), String> {
+            Ok(())
+        }
+        fn is_running(&self) -> bool {
+            false
+        }
+        fn is_busy(&self) -> bool {
+            false
+        }
+        fn index_docs(
+            &self,
+            full: bool,
+        ) -> std::result::Result<crate::daemon_protocol::DocIndexStats, String> {
+            (self.0)(full)
+        }
+    }
+
+    #[test]
+    fn index_docs_without_a_docs_handle_is_refused_with_a_reason() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut router = Router::new(tmp.path());
+        let (routed, rx) = router.route_new(WriteRequest::IndexDocs { full: false });
+        assert!(matches!(routed, Routed::Done));
+        assert_eq!(
+            rx.recv().unwrap(),
+            WriteResult::Err {
+                message: NO_DOCS_INDEXER.to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn index_docs_runs_on_the_docs_handle_and_answers_with_its_stats() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut router = Router::with_docs(
+            tmp.path(),
+            Arc::new(FakeDocs(|full| {
+                Ok(crate::daemon_protocol::DocIndexStats {
+                    files_indexed: if full { 7 } else { 1 },
+                    ..Default::default()
+                })
+            })),
+        );
+        let (routed, rx) = router.route_new(WriteRequest::IndexDocs { full: true });
+        assert!(matches!(routed, Routed::Done));
+        let running = router
+            .docs_index
+            .take()
+            .expect("started on a background task, not served inline");
+        finish_docs_index(running.reply, router.drain_rt.block_on(running.task.join()));
+        assert_eq!(
+            rx.recv().unwrap(),
+            WriteResult::DocsIndexed(crate::daemon_protocol::DocIndexStats {
+                files_indexed: 7,
+                ..Default::default()
+            })
+        );
+    }
+
+    /// Review Focus 5: one docs index at a time; a second waits in
+    /// `deferred` rather than running alongside.
+    #[test]
+    fn a_second_index_docs_waits_for_the_running_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut router = Router::with_docs(
+            tmp.path(),
+            Arc::new(FakeDocs(|_| {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                Ok(Default::default())
+            })),
+        );
+        let (_, _first_rx) = router.route_new(WriteRequest::IndexDocs { full: false });
+        assert!(router.docs_index.is_some());
+        let (routed, _second_rx) = router.route_new(WriteRequest::IndexDocs { full: false });
+        assert!(
+            matches!(
+                routed,
+                Routed::NotYet(WriteRequest::IndexDocs { full: false }, _)
+            ),
+            "a second docs index must wait, not run alongside"
+        );
+        let running = router.docs_index.take().unwrap();
+        finish_docs_index(running.reply, router.drain_rt.block_on(running.task.join()));
+    }
+
+    /// Review Focus 5: a panicking executor still answers its client.
+    #[test]
+    fn a_panicking_docs_index_still_answers_its_client() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut router = Router::with_docs(
+            tmp.path(),
+            Arc::new(FakeDocs(|_| panic!("indexer blew up"))),
+        );
+        let (_, rx) = router.route_new(WriteRequest::IndexDocs { full: false });
+        let running = router.docs_index.take().unwrap();
+        finish_docs_index(running.reply, router.drain_rt.block_on(running.task.join()));
+        match rx.recv().unwrap() {
+            WriteResult::Err { message } => {
+                assert!(message.contains("document indexing"), "{message}")
+            }
+            other => panic!("expected an error, got {other:?}"),
+        }
     }
 }
 

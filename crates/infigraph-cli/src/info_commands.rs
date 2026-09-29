@@ -824,6 +824,13 @@ impl infigraph_core::daemon::DocsHandle for DocWatchHandle {
     fn is_busy(&self) -> bool {
         infigraph_docs::watch::reindex_in_progress()
     }
+    fn index_docs(
+        &self,
+        full: bool,
+    ) -> std::result::Result<infigraph_core::daemon_protocol::DocIndexStats, String> {
+        let root = self.0.lock().unwrap().root.clone();
+        infigraph_docs::ops::index_docs(&root, full).map_err(|e| format!("{e:#}"))
+    }
 }
 
 impl DocWatchThread {
