@@ -524,20 +524,23 @@ fn is_orphaned_daemon(proc_name: &str, cmd: &[String], cwd: Option<&Path>) -> bo
     }
 }
 
-/// Whether a live process is a detached `infigraph scip-enrich` running for
-/// `root`: the same name-and-argv identity as [`is_orphaned_daemon`], and a
-/// cwd that is `root`. `index` spawns the child with `current_dir(root)`, so
-/// the OS-reported cwd names the root even after the directory is gone,
-/// which is what lets `worktree teardown` find it then. Both sides go
-/// through `canonicalize_lenient`, since the OS reports a resolved path and
-/// a removed directory cannot be canonicalized whole.
-fn scip_enrich_belongs_to(
+/// Whether a live process is `infigraph <subcommand>` running for `root`: the
+/// same name-and-argv identity as [`is_orphaned_daemon`], and a cwd that is
+/// `root`. `index` spawns `scip-enrich`, and `ensure_daemon_running` a
+/// daemon, with `current_dir(root)`, so the OS-reported cwd names the root
+/// even after the directory is gone (which is what lets `worktree teardown`
+/// find them then) and even after the files a daemon is normally found by
+/// (`watch.lock`, its socket) have been unlinked. Both sides go through
+/// `canonicalize_lenient`, since the OS reports a resolved path and a removed
+/// directory cannot be canonicalized whole.
+fn subcommand_belongs_to(
     proc_name: &str,
     cmd: &[String],
     cwd: Option<&Path>,
     root: &Path,
+    subcommand: &str,
 ) -> bool {
-    if !is_infigraph_running(proc_name, cmd, "scip-enrich") {
+    if !is_infigraph_running(proc_name, cmd, subcommand) {
         return false;
     }
     cwd.is_some_and(|cwd| {
@@ -545,11 +548,47 @@ fn scip_enrich_belongs_to(
     })
 }
 
+/// Every live `infigraph <subcommand>` running for `root`.
+fn find_subcommand_for(root: &Path, subcommand: &str) -> Vec<u32> {
+    scan_live_processes(|pid, name, cmd, cwd| {
+        subcommand_belongs_to(name, cmd, cwd, root, subcommand).then_some(pid)
+    })
+}
+
+/// Every live `infigraph daemon` running for `root`, found by what it is
+/// rather than by the lock or socket files it normally answers through.
+pub fn find_daemons_for(root: &Path) -> Vec<u32> {
+    find_subcommand_for(root, "daemon")
+}
+
+/// The subset of `pids` that are still running (zombies do not count).
+pub fn live_pids(pids: &[u32]) -> Vec<u32> {
+    let mut sys = sysinfo::System::new();
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+    pids.iter()
+        .copied()
+        .filter(|pid| crate::ps::running_process(&sys, sysinfo::Pid::from_u32(*pid)).is_some())
+        .collect()
+}
+
+/// SIGTERM every live pid in `pids` (the graceful path [`kill_orphaned_daemon`]
+/// documents), wait up to `budget`, and return those still running.
+pub fn terminate_and_wait(pids: &[u32], budget: std::time::Duration) -> Vec<u32> {
+    let mut alive = live_pids(pids);
+    for pid in &alive {
+        kill_orphaned_daemon(*pid);
+    }
+    let deadline = std::time::Instant::now() + budget;
+    while !alive.is_empty() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        alive = live_pids(&alive);
+    }
+    alive
+}
+
 /// Every live detached `infigraph scip-enrich` running for `root`.
 pub fn find_scip_enrich_for(root: &Path) -> Vec<u32> {
-    scan_live_processes(|pid, name, cmd, cwd| {
-        scip_enrich_belongs_to(name, cmd, cwd, root).then_some(pid)
-    })
+    find_subcommand_for(root, "scip-enrich")
 }
 
 /// Stop every detached `scip-enrich` running for `root`, with everything it
@@ -1421,9 +1460,37 @@ mod tests {
         );
     }
 
-    mod scip_enrich_belongs_to_tests {
-        use super::super::scip_enrich_belongs_to;
+    mod subcommand_belongs_to_tests {
+        use super::super::subcommand_belongs_to;
         use std::path::Path;
+
+        fn scip_enrich_belongs_to(
+            name: &str,
+            cmd: &[String],
+            cwd: Option<&Path>,
+            root: &Path,
+        ) -> bool {
+            subcommand_belongs_to(name, cmd, cwd, root, "scip-enrich")
+        }
+
+        #[test]
+        fn a_daemon_is_found_by_the_same_rule() {
+            let tmp = tempfile::tempdir().unwrap();
+            let daemon = argv("daemon");
+            assert!(subcommand_belongs_to(
+                "infigraph",
+                &daemon,
+                Some(tmp.path()),
+                tmp.path(),
+                "daemon"
+            ));
+            assert!(!scip_enrich_belongs_to(
+                "infigraph",
+                &daemon,
+                Some(tmp.path()),
+                tmp.path()
+            ));
+        }
 
         fn argv(sub: &str) -> Vec<String> {
             vec!["/usr/local/bin/infigraph".to_string(), sub.to_string()]
