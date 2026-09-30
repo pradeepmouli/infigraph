@@ -69,7 +69,12 @@ resources/integrations/
     resolve-vscode-path.py               # referenced via resolver
   shared/
     agents.md                            # referenced via content_file from multiple agents
+    tool-routing.md                      # ditto; the skill's routing tables, inlined where skills aren't supported
+    conventions.md                       # ditto; editing, refactoring, subagent and verbose-tool rules
     skills/infigraph-reindex/SKILL.md    # ditto
+    skills/infigraph-tool-routing/
+      SKILL.md                           # front matter; content_file joins it with tool-routing.md + conventions.md
+      references/tools.md                # generated from tools/list by infigraph-mcp/tests/tool_reference.rs; do not edit
   .gitkeep
 
 ~/.infigraph/integrations/               # user override, same layout, optional
@@ -122,7 +127,7 @@ This is why `gemini-cli`, `opencode`, `aider`, `kiro`, and `github-copilot-cli` 
 | Strategy | Destination shape | Apply | Remove |
 |----------|-------------------|-------|--------|
 | `json_deep_merge` | JSON file, possibly hand-maintained | Deep-merges the fragment in, preserving unrelated keys at any depth. An existing array entry is recognized as "ours" (and replaced, not duplicated) if it either contains the substring `"infigraph"` or exactly equals one of the fragment's own entries — so re-applying never duplicates, even after the entry's shape has drifted. | Strips exactly the keys/array-entries the fragment owns; cascades key deletion when a container becomes empty (`mcpServers.infigraph` disappears entirely, not left behind as `{}`). |
-| `overwrite` | Whole file (scripts, docs, simple JSON) | Replaces the file's bytes exactly. If the destination path has a `hooks` path segment, the written file is also `chmod 0o755` — hook scripts run via shebang through the user's shell and a non-executable one silently never fires. | Deletes the file. |
+| `overwrite` | Whole file (scripts, docs, simple JSON) | Replaces the file's bytes exactly. If the destination path has a `hooks` path segment, the written file is also `chmod 0o755` — hook scripts run via shebang through the user's shell and a non-executable one silently never fires. | Deletes the file, then the folders install created for it, bottom up and only while empty, never above the nearest `*infigraph*`-named folder below the home directory (so `.claude/skills/infigraph-tool-routing/` goes, `.cursor/rules/` stays). |
 | `marker_delimited` | A block inside a larger file the user also edits (e.g. `CLAUDE.md`) | Replaces the region between `start`/`end` markers, inserting it if absent. Refuses to guess if `start` is present but `end` is missing or damaged. | Strips the marked block, leaving the rest of the file untouched. |
 | `toml_section` | A hand-maintained TOML file (e.g. `~/.codex/config.toml`) | Locates a table-header line matching `key_path` exactly (line-based, not a substring search — so a header mentioned inside a comment or a quoted string is never matched), replaces from that line through the next table header or EOF. | Removes only the matched section, preserving every other section and comment. |
 | `json_key_path` | JSON file, single owned key | Sets `content` at the nested path `key_path` describes, creating intermediate objects as needed. | Removes the leaf at `key_path`, keeping siblings. |
@@ -179,8 +184,8 @@ A `resolver` with no prefix (`resolver = ["./resolve.sh"]`) executes the script 
 
 | Agent | Bundled path(s) | Strategy | Manifest? |
 |-------|------------------|----------|-----------|
-| Claude Code | `.claude.json`, `.claude/settings.json`, `.claude/hooks/*.sh`, `.claude/CLAUDE.md`, `.claude/skills/infigraph-reindex/SKILL.md` | `json_deep_merge`, `overwrite` (hooks), `marker_delimited` (CLAUDE.md) | Yes |
-| Codex | `.codex/config.toml`, `.codex/skills/infigraph-reindex/SKILL.md` | `toml_section`, `overwrite` | Yes |
+| Claude Code | `.claude.json`, `.claude/settings.json`, `.claude/hooks/*.sh`, `.claude/CLAUDE.md`, `.claude/skills/infigraph-reindex/SKILL.md`, `.claude/skills/infigraph-tool-routing/{SKILL.md,references/tools.md}` | `json_deep_merge`, `overwrite` (hooks), `marker_delimited` (CLAUDE.md) | Yes |
+| Codex | `.codex/config.toml`, `.codex/skills/infigraph-reindex/SKILL.md`, `.codex/skills/infigraph-tool-routing/{SKILL.md,references/tools.md}` | `toml_section`, `overwrite` | Yes |
 | Cursor | `.cursor/mcp.json`, `.cursor/rules/infigraph.mdc` | `json_deep_merge`, `overwrite` | Yes |
 | Windsurf | `.codeium/windsurf/mcp_config.json`, `.windsurf/rules/infigraph.md` | `json_deep_merge`, `overwrite` | Yes |
 | VS Code | resolver-determined (per-OS user settings path) | `json_deep_merge` | Yes (resolver) |

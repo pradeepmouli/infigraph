@@ -303,13 +303,43 @@ pub(crate) fn remove_json_deep_merge(target_path: &Path, fragment_content: &str)
     Ok(removed)
 }
 
-pub(crate) fn remove_overwrite(target_path: &Path) -> Result<bool> {
+/// Delete an installed file, then the folders install created for it. `base`
+/// is where the artifact's path is rooted (the home directory): folders at or
+/// above it are never touched.
+pub(crate) fn remove_overwrite(target_path: &Path, base: &Path) -> Result<bool> {
     if !target_path.is_file() {
         return Ok(false);
     }
     std::fs::remove_file(target_path)
         .with_context(|| format!("failed to remove {}", target_path.display()))?;
+    prune_empty_infigraph_dirs(target_path, base);
     Ok(true)
+}
+
+/// Remove the folders install created for `removed`, bottom up, stopping at
+/// the first that still holds something. Only folders at or below the nearest
+/// `*infigraph*`-named folder in the path under `base`
+/// (`skills/infigraph-tool-routing/references`) are candidates: a shared
+/// folder such as `.cursor/rules` or `.claude/skills` may be the user's even
+/// when empty, and a checkout that happens to be called `infigraph` lies at or
+/// above `base`. `remove_dir` refuses a non-empty folder.
+fn prune_empty_infigraph_dirs(removed: &Path, base: &Path) {
+    let Some(owned_root) = removed
+        .ancestors()
+        .skip(1)
+        .take_while(|dir| dir.starts_with(base) && *dir != base)
+        .find(|dir| {
+            dir.file_name()
+                .is_some_and(|n| n.to_string_lossy().contains("infigraph"))
+        })
+    else {
+        return;
+    };
+    for dir in removed.ancestors().skip(1) {
+        if std::fs::remove_dir(dir).is_err() || dir == owned_root {
+            return;
+        }
+    }
 }
 
 pub(crate) fn plan_marker_delimited(
@@ -912,16 +942,67 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("infigraph.mdc");
         std::fs::write(&target, "content").unwrap();
-        let removed = remove_overwrite(&target).unwrap();
+        let removed = remove_overwrite(&target, dir.path()).unwrap();
         assert!(removed);
         assert!(!target.exists());
+    }
+
+    #[test]
+    fn remove_overwrite_prunes_the_infigraph_folders_it_empties_and_nothing_above() {
+        let dir = tempfile::tempdir().unwrap();
+        let skills = dir.path().join(".claude/skills");
+        let target = skills.join("infigraph-tool-routing/references/tools.md");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, "content").unwrap();
+        assert!(remove_overwrite(&target, dir.path()).unwrap());
+        assert!(!skills.join("infigraph-tool-routing").exists());
+        assert!(skills.is_dir(), "a shared folder is never removed");
+    }
+
+    #[test]
+    fn remove_overwrite_keeps_a_folder_that_still_holds_something() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill = dir.path().join("infigraph-tool-routing");
+        let target = skill.join("references/tools.md");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, "content").unwrap();
+        std::fs::write(skill.join("SKILL.md"), "the user's").unwrap();
+        assert!(remove_overwrite(&target, dir.path()).unwrap());
+        assert!(!skill.join("references").exists());
+        assert!(skill.join("SKILL.md").is_file());
+    }
+
+    #[test]
+    fn remove_overwrite_leaves_a_non_infigraph_parent_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let rules = dir.path().join(".cursor/rules");
+        std::fs::create_dir_all(&rules).unwrap();
+        let target = rules.join("infigraph.mdc");
+        std::fs::write(&target, "content").unwrap();
+        assert!(remove_overwrite(&target, dir.path()).unwrap());
+        assert!(rules.is_dir());
+    }
+
+    #[test]
+    fn remove_overwrite_ignores_an_infigraph_named_folder_at_or_above_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("infigraph");
+        let rules = base.join(".cursor/rules");
+        std::fs::create_dir_all(&rules).unwrap();
+        let target = rules.join("infigraph.mdc");
+        std::fs::write(&target, "content").unwrap();
+        assert!(remove_overwrite(&target, &base).unwrap());
+        assert!(
+            rules.is_dir(),
+            "the checkout's own name must not anchor the prune"
+        );
     }
 
     #[test]
     fn remove_overwrite_returns_false_when_absent() {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("does-not-exist.mdc");
-        let removed = remove_overwrite(&target).unwrap();
+        let removed = remove_overwrite(&target, dir.path()).unwrap();
         assert!(!removed);
     }
 
