@@ -561,27 +561,39 @@ pub fn find_daemons_for(root: &Path) -> Vec<u32> {
     find_subcommand_for(root, "daemon")
 }
 
-/// The subset of `pids` that are still running (zombies do not count).
-pub fn live_pids(pids: &[u32]) -> Vec<u32> {
+/// The subset of `pids` that are still running AND still an `infigraph
+/// daemon` (zombies do not count). Candidate pids are collected before a
+/// stop request and then waited on for seconds, so "some process has this
+/// pid" is not enough to signal it: the pid may have been reused, or a stale
+/// lock payload may name a process that was never this root's daemon. The
+/// cwd is deliberately not compared -- a daemon started by hand with
+/// `--path` runs elsewhere.
+pub fn live_daemons(pids: &[u32]) -> Vec<u32> {
+    let named = scan_live_processes(|pid, name, cmd, _cwd| {
+        (pids.contains(&pid) && is_infigraph_running(name, cmd, "daemon")).then_some(pid)
+    });
     let mut sys = sysinfo::System::new();
     sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
-    pids.iter()
-        .copied()
+    named
+        .into_iter()
         .filter(|pid| crate::ps::running_process(&sys, sysinfo::Pid::from_u32(*pid)).is_some())
         .collect()
 }
 
-/// SIGTERM every live pid in `pids` (the graceful path [`kill_orphaned_daemon`]
-/// documents), wait up to `budget`, and return those still running.
+/// SIGTERM every pid in `pids` that is still an `infigraph daemon` (the
+/// graceful path [`kill_orphaned_daemon`] documents), wait up to `budget`,
+/// and return those still running as one. Identity is re-checked before the
+/// signal and on every pass, so a pid that has gone and been reused is
+/// neither signalled nor reported as a survivor.
 pub fn terminate_and_wait(pids: &[u32], budget: std::time::Duration) -> Vec<u32> {
-    let mut alive = live_pids(pids);
+    let mut alive = live_daemons(pids);
     for pid in &alive {
         kill_orphaned_daemon(*pid);
     }
     let deadline = std::time::Instant::now() + budget;
     while !alive.is_empty() && std::time::Instant::now() < deadline {
         std::thread::sleep(std::time::Duration::from_millis(100));
-        alive = live_pids(&alive);
+        alive = live_daemons(&alive);
     }
     alive
 }
@@ -1426,17 +1438,7 @@ mod tests {
         );
     }
 
-    /// `is_orphaned_daemon` is the pure decision `find_orphaned_daemons`
-    /// applies per live process -- exercised here directly with synthetic
-    /// facts rather than a real spawned process, since a real daemon's own
-    /// self-check (`run_write_coordinator`'s root-existence check)
-    /// would race this test's own deletion the moment it's spawned.
-    /// `scip_enrich_belongs_to` is the pure decision `find_scip_enrich_for`
-    /// applies per live process, built on the same name-and-argv predicate
-    /// as `is_orphaned_daemon`: the detached child runs with
-    /// `current_dir(root)`, so its OS-reported cwd names the root even after
-    /// the directory is gone.
-    /// The pure decisions above are only as good as the facts they are fed.
+    /// The pure decisions tested below are only as good as the facts they are fed.
     /// `sysinfo` does not load a process's argv or cwd unless asked to, and
     /// the scan once did not ask -- so both finders saw every live process
     /// with an empty command line and no cwd, and matched nothing, while
@@ -1458,6 +1460,34 @@ mod tests {
                 &std::env::current_dir().unwrap()
             ))
         );
+    }
+
+    /// `subcommand_belongs_to` is the pure decision `find_scip_enrich_for` and
+    /// `find_daemons_for` apply per live process, built on the same
+    /// name-and-argv predicate as `is_orphaned_daemon`: `index` spawns
+    /// `scip-enrich` (and `ensure_daemon_running` the daemon) with
+    /// `current_dir(root)`, so the OS-reported cwd names the root even after
+    /// the directory is gone.
+    /// A candidate pid that is alive but is not an `infigraph daemon` (a
+    /// reused pid, a stale lock payload) must be neither signalled nor
+    /// reported as a survivor.
+    #[cfg(unix)]
+    #[test]
+    fn a_live_process_that_is_not_a_daemon_is_left_alone() {
+        let mut other = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = other.id();
+        assert!(super::live_daemons(&[pid]).is_empty());
+        let survivors = super::terminate_and_wait(&[pid], std::time::Duration::from_millis(300));
+        assert!(survivors.is_empty(), "reported as a daemon survivor");
+        assert!(
+            other.try_wait().unwrap().is_none(),
+            "an unrelated process was signalled"
+        );
+        let _ = other.kill();
+        let _ = other.wait();
     }
 
     mod subcommand_belongs_to_tests {
@@ -1554,6 +1584,11 @@ mod tests {
         }
     }
 
+    /// `is_orphaned_daemon` is the pure decision `find_orphaned_daemons`
+    /// applies per live process -- exercised here directly with synthetic
+    /// facts rather than a real spawned process, since a real daemon's own
+    /// self-check (`run_write_coordinator`'s root-existence check)
+    /// would race this test's own deletion the moment it's spawned.
     mod is_orphaned_daemon_tests {
         use super::super::is_orphaned_daemon;
 

@@ -975,7 +975,7 @@ pub(crate) fn stop_daemon_and_wait(root: &Path) -> Result<()> {
     // A daemon that took the request but is unreachable never exits on it,
     // and `confirmed` cannot tell (a missing lock file reads as free):
     // whatever is still running gets the graceful signal.
-    let still_running = lc::live_pids(&candidates);
+    let still_running = lc::live_daemons(&candidates);
     let survivors = lc::terminate_and_wait(&still_running, BUDGET);
     if survivors.is_empty() && (confirmed || !lc::daemon_is_alive(&lock_path)) {
         return Ok(());
