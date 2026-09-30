@@ -12,12 +12,21 @@ use std::path::{Path, PathBuf};
 
 /// A `.infigraph/` that belongs to a project rather than to the user.
 ///
-/// The user-level `~/.infigraph/` also holds a `graph`, so the discriminator
-/// is `registry.json`, which only the global store has. Without this check a
-/// repo living under `$HOME` resolves to the global store.
-fn is_project_store(dir: &Path) -> bool {
-    let ig = dir.join(".infigraph");
-    ig.join("graph").exists() && !ig.join("registry.json").exists()
+/// The user-level `~/.infigraph/` also holds a `graph`, so a graph alone
+/// does not make a project: see [`is_global_store_root`]. Without that check
+/// a repo living under `$HOME` resolves to the global store.
+pub fn is_project_store(dir: &Path) -> bool {
+    dir.join(".infigraph").join("graph").exists() && !is_global_store_root(dir)
+}
+
+/// Whether `dir`'s `.infigraph/` is the user's global store: `dir` is the
+/// account's home (asked of the OS, not `HOME`), or it already holds the
+/// `registry.json` only the global store has -- which is also how a test
+/// that points `HOME` at a temp dir gets the same answer.
+///
+/// Such a directory is never a project, whatever markers it carries.
+pub fn is_global_store_root(dir: &Path) -> bool {
+    dir.join(".infigraph").join("registry.json").exists() || crate::instances::is_account_home(dir)
 }
 
 /// The repo root for `start`, identified by a `.git` entry.

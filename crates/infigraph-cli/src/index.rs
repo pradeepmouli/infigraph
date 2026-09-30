@@ -487,9 +487,7 @@ pub(crate) fn cmd_index(root: &Path, full: bool, no_embed: bool) -> Result<()> {
     // the child re-stamps once the enriched graph is the real one.
     spawn_scip_child_process(root, &detected_languages, full && !remote);
 
-    if let Err(e) = infigraph_core::claude_md::ensure_project_claude_md(root) {
-        eprintln!("warning: failed to update project CLAUDE.md: {e}");
-    }
+    crate::agent::refresh_project_instructions(root);
 
     Ok(())
 }

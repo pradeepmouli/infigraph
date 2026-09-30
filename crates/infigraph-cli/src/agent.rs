@@ -99,7 +99,7 @@ pub(crate) fn cmd_init(root: &Path, group: Option<&str>, quick: bool, yes: bool)
                 })
                 .collect();
             Some(format!(
-                "\n## This Repo's Group: `{}`\n\nThis repo is part of the `{}` microservice group. Other repos in this group:\n{}\n\nUse `group_query` with group name `{}` to query across all repos.\nUse `group_sync` then `group_deps` to find cross-service HTTP dependencies.\n",
+                "{GROUP_HEADING}`{}`\n\nThis repo is part of the `{}` microservice group. Other repos in this group:\n{}\n\nUse `group_query` with group name `{}` to query across all repos.\nUse `group_sync` then `group_deps` to find cross-service HTTP dependencies.\n",
                 group_name, group_name, repo_list.join("\n"), group_name
             ))
         } else {
@@ -338,16 +338,49 @@ pub(crate) const AGENT_INSTRUCTION_TARGETS: &[AgentInstructionTarget] = &[
     },
 ];
 
-pub(crate) fn write_agent_instructions(
-    root: &std::path::Path,
-    group_context: Option<&str>,
-) -> Result<()> {
+/// Delimits the block `init` writes into each [`AGENT_INSTRUCTION_TARGETS`]
+/// file; everything outside it is the project's own.
+const INSTRUCTIONS_MARKER: &str = "<!-- infigraph-instructions -->";
+
+/// Opens the section `init --group` appends to the instructions. A refresh
+/// finds it by this heading and carries it over, since it has no group name.
+const GROUP_HEADING: &str = "\n## This Repo's Group: ";
+
+/// `existing` with its instructions block replaced by `block`, or with
+/// `block` appended when it has none.
+fn splice_block(existing: &str, block: &str) -> String {
+    let marker = INSTRUCTIONS_MARKER;
+    if let Some(start) = existing.find(marker) {
+        let after_first = &existing[start + marker.len()..];
+        let end = after_first
+            .find(marker)
+            .map(|p| start + marker.len() + p + marker.len())
+            .unwrap_or(existing.len());
+        format!("{}{}{}", &existing[..start], block, &existing[end..])
+    } else if existing.is_empty() {
+        block.to_string()
+    } else {
+        format!("{existing}\n\n{block}")
+    }
+}
+
+/// `target`'s file content with the current instructions (plus
+/// `group_context`, if any) spliced into `existing`.
+fn render(target: &AgentInstructionTarget, existing: &str, group_context: Option<&str>) -> String {
     let base = infigraph_instructions();
     let instructions = match group_context {
         Some(ctx) => format!("{base}\n{ctx}"),
         None => base.to_string(),
     };
-    let marker = "<!-- infigraph-instructions -->";
+    let wrapped = (target.wrapper)(&instructions);
+    let block = format!("{INSTRUCTIONS_MARKER}\n{wrapped}\n{INSTRUCTIONS_MARKER}");
+    splice_block(existing, &block)
+}
+
+pub(crate) fn write_agent_instructions(
+    root: &std::path::Path,
+    group_context: Option<&str>,
+) -> Result<()> {
     let mut written = Vec::new();
 
     for target in AGENT_INSTRUCTION_TARGETS {
@@ -357,25 +390,8 @@ pub(crate) fn write_agent_instructions(
             std::fs::create_dir_all(parent)?;
         }
 
-        let wrapped = (target.wrapper)(&instructions);
-        let block = format!("{marker}\n{wrapped}\n{marker}");
-
         let existing = std::fs::read_to_string(&file_path).unwrap_or_default();
-        let new_content = if existing.contains(marker) {
-            let start = existing.find(marker).unwrap();
-            let after_first = &existing[start + marker.len()..];
-            let end = after_first
-                .find(marker)
-                .map(|p| start + marker.len() + p + marker.len())
-                .unwrap_or(existing.len());
-            format!("{}{}{}", &existing[..start], block, &existing[end..])
-        } else if existing.is_empty() {
-            block
-        } else {
-            format!("{existing}\n\n{block}")
-        };
-
-        std::fs::write(&file_path, new_content)?;
+        std::fs::write(&file_path, render(target, &existing, group_context))?;
         written.push(target.label);
     }
 
@@ -384,4 +400,132 @@ pub(crate) fn write_agent_instructions(
     }
 
     Ok(())
+}
+
+/// Bring every instructions block `init` wrote up to date with this build.
+///
+/// Only `init` writes these files, so without this they kept whatever text
+/// the build that ran `init` had, indefinitely (#207). A refresh touches only
+/// a file that already holds a block -- it never creates a target the
+/// project never had -- keeps any group section `init --group` added, and
+/// writes nothing when the block is already current. Like the project
+/// CLAUDE.md block, it applies only to a project store.
+pub(crate) fn refresh_agent_instructions(root: &Path) -> Result<()> {
+    if !infigraph_core::project::is_project_store(root) {
+        return Ok(());
+    }
+    let mut refreshed = Vec::new();
+    for target in AGENT_INSTRUCTION_TARGETS {
+        let file_path = root.join(target.path);
+        let Ok(existing) = std::fs::read_to_string(&file_path) else {
+            continue;
+        };
+        let Some(start) = existing.find(INSTRUCTIONS_MARKER) else {
+            continue;
+        };
+        let inner = &existing[start + INSTRUCTIONS_MARKER.len()..];
+        let inner = inner
+            .find(INSTRUCTIONS_MARKER)
+            .map_or(inner, |end| &inner[..end]);
+        let group_context = inner
+            .find(GROUP_HEADING)
+            .map(|at| inner[at..].strip_suffix('\n').unwrap_or(&inner[at..]));
+        let updated = render(target, &existing, group_context);
+        if updated != existing {
+            std::fs::write(&file_path, updated)?;
+            refreshed.push(target.label);
+        }
+    }
+    if !refreshed.is_empty() {
+        println!(
+            "  Refreshed agent instructions for: {}",
+            refreshed.join(", ")
+        );
+    }
+    Ok(())
+}
+
+/// Refresh every infigraph-managed instructions block in `root`: the project
+/// `.claude/CLAUDE.md` block and the blocks `init` wrote. Never fatal -- a
+/// failure here is reported and indexing or watching carries on.
+pub(crate) fn refresh_project_instructions(root: &Path) {
+    if let Err(e) = infigraph_core::claude_md::ensure_project_claude_md(root) {
+        eprintln!("warning: failed to update project CLAUDE.md: {e:#}");
+    }
+    if let Err(e) = refresh_agent_instructions(root) {
+        eprintln!("warning: failed to refresh agent instructions: {e:#}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn project() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".infigraph")).unwrap();
+        std::fs::write(tmp.path().join(".infigraph").join("graph"), b"").unwrap();
+        tmp
+    }
+
+    #[test]
+    fn refresh_rewrites_a_stale_block_and_keeps_the_rest() {
+        let root = project();
+        let group = format!("{GROUP_HEADING}`g`\n\nOther repos.\n");
+        std::fs::write(
+            root.path().join("AGENTS.md"),
+            format!(
+                "# Mine\n\n{INSTRUCTIONS_MARKER}\nstale text{group}\n{INSTRUCTIONS_MARKER}\n\n## After\n"
+            ),
+        )
+        .unwrap();
+
+        refresh_agent_instructions(root.path()).unwrap();
+
+        let text = std::fs::read_to_string(root.path().join("AGENTS.md")).unwrap();
+        assert!(text.starts_with("# Mine\n"));
+        assert!(text.ends_with("## After\n"));
+        assert!(!text.contains("stale text"));
+        assert!(text.contains(infigraph_instructions()));
+        assert!(
+            text.contains(&group),
+            "the group section init wrote survives"
+        );
+        assert_eq!(text.matches(INSTRUCTIONS_MARKER).count(), 2);
+    }
+
+    #[test]
+    fn refresh_never_creates_a_target() {
+        let root = project();
+        refresh_agent_instructions(root.path()).unwrap();
+        for target in AGENT_INSTRUCTION_TARGETS {
+            assert!(!root.path().join(target.path).exists(), "{}", target.path);
+        }
+    }
+
+    #[test]
+    fn refresh_leaves_a_non_project_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stale = format!("{INSTRUCTIONS_MARKER}\nstale\n{INSTRUCTIONS_MARKER}\n");
+        std::fs::write(tmp.path().join("AGENTS.md"), &stale).unwrap();
+        refresh_agent_instructions(tmp.path()).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("AGENTS.md")).unwrap(),
+            stale
+        );
+    }
+
+    #[test]
+    fn an_unchanged_block_is_not_rewritten() {
+        let root = project();
+        write_agent_instructions(root.path(), None).unwrap();
+        let path = root.path().join("AGENTS.md");
+        let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        refresh_agent_instructions(root.path()).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            before
+        );
+    }
 }

@@ -460,6 +460,17 @@ pub const ALLOW_CONTAINER_ROOT_ENV: &str = "INFIGRAPH_ALLOW_CONTAINER_ROOT";
 /// One child is allowed: a directory holding a single project is an ordinary
 /// way to lay out a checkout, and refusing it would be surprising.
 pub fn ensure_watchable_root(root: &Path) -> Result<()> {
+    // Before the marker check and the container override: `$HOME` is not a
+    // container of projects side by side, a dotfiles repo gives it a marker,
+    // and its `.infigraph/` is the global store every project shares. A
+    // daemon rooted there once parsed 230,498 files into it (#207).
+    if crate::project::is_global_store_root(root) {
+        anyhow::bail!(
+            "refusing to watch {} -- it is your home directory, whose .infigraph/ is the global \
+             store every project shares. Point the watcher at a project.",
+            root.display(),
+        );
+    }
     if std::env::var_os(ALLOW_CONTAINER_ROOT_ENV).is_some() || has_project_marker(root) {
         return Ok(());
     }
@@ -4798,6 +4809,28 @@ mod watchable_root_tests {
     fn an_empty_directory_is_allowed() {
         let tmp = tempfile::tempdir().unwrap();
         ensure_watchable_root(tmp.path()).expect("nothing to conflate");
+    }
+
+    /// `$HOME` passed every check above -- it holds no two projects side by
+    /// side, and a dotfiles repo or a stray manifest makes it "a project" --
+    /// so a daemon rooted there parsed 230,498 files into the global store.
+    #[test]
+    fn the_account_home_is_refused() {
+        let home = crate::instances::account_home().expect("the OS knows this account's home");
+        let err = ensure_watchable_root(&home).expect_err("home is never a project");
+        assert!(err.to_string().contains("home directory"), "{err}");
+    }
+
+    /// A directory holding the global store's `registry.json` is the global
+    /// store's home, whatever `HOME` says -- and a project marker beside it
+    /// does not make it a project.
+    #[test]
+    fn the_global_store_root_is_refused_even_with_a_project_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".infigraph")).unwrap();
+        std::fs::write(tmp.path().join(".infigraph").join("registry.json"), "{}").unwrap();
+        std::fs::write(tmp.path().join("Cargo.toml"), "[package]\n").unwrap();
+        ensure_watchable_root(tmp.path()).expect_err("the global store is never a project");
     }
 }
 
