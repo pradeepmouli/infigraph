@@ -8,7 +8,7 @@
 | A symbol's source, callers or callees | `get_code_snippet` / `get_doc_context` / `find_all_references` |
 | Files matching a glob | `list_files` with `glob` (e.g. `glob="src/**/*.rs"`) |
 | Exact lines for an edit | `Read` with `offset` |
-| A file that is not indexed (config, lockfile, log) | `Read`. Markdown **is** indexed: pass `offset`, or use `search` |
+| A file that is not source code (docs, config, lockfile, log, markup) | `Read` it directly. To find text across many docs, `search` with `scope="docs"` |
 
 **Text.** `search` returns ranked symbols *and* every line containing the query under "Text matches", each naming the symbol it sits in; symbols holding a match rank first. With `regex=true` the query is a regex and every matching line is listed, not just the top `limit` — that is how to enumerate. `search` does not surface constants; `get_symbols_in_file` lists them with line numbers.
 
