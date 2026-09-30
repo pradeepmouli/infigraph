@@ -107,7 +107,9 @@ pub fn begin_index_op(root: &Path, role: &str, wait: Duration) -> Result<IndexOp
 /// convention (a missing directory is a no-op, not an error here).
 pub fn wipe_infigraph_preserving_index_lock(tg_dir: &Path) -> std::io::Result<()> {
     for entry in std::fs::read_dir(tg_dir)?.flatten() {
-        if crate::snapshot::should_skip(&entry.file_name().to_string_lossy()) {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if crate::snapshot::should_skip(&name) || kept_across_a_code_rebuild(&name) {
             continue;
         }
         let path = entry.path();
@@ -118,6 +120,19 @@ pub fn wipe_infigraph_preserving_index_lock(tg_dir: &Path) -> std::io::Result<()
         }
     }
     Ok(())
+}
+
+/// What a from-scratch *code* rebuild leaves alone in `.infigraph/`: the
+/// project's own `config.toml` (`[docs] enabled`, `[index] include`, ...),
+/// which is the user's rather than derived, and the document index with its
+/// sidecars and lock, which the code graph does not feed. Wiping the docs
+/// lock while it is held would also split it.
+fn kept_across_a_code_rebuild(name: &str) -> bool {
+    name == "config.toml"
+        || name == "config.lock"
+        || name == crate::docs_switch::DOCS_OP_LOCK
+        || name.starts_with("docs.kuzu")
+        || name.starts_with("docs_")
 }
 
 /// The full snapshot-then-wipe sequence shared by every full-reindex call

@@ -4,8 +4,8 @@ use std::time::{Duration, Instant};
 use serde_json::json;
 
 use infigraph_mcp::tools::docs::{
-    auto_start_doc_watch, init_doc_watchers, is_doc_watching, open_doc_index, tool_index_docs,
-    tool_search_docs, tool_watch_docs, DOC_WATCHERS,
+    auto_start_doc_watch, init_doc_watchers, is_doc_watching, tool_index_docs, tool_search_docs,
+    tool_watch_docs, DOC_WATCHERS,
 };
 use infigraph_mcp::tools::helpers::open_prism;
 use infigraph_mcp::tools::index::tool_index_project;
@@ -301,11 +301,26 @@ fn test_doc_watcher_reindexes_no_concurrent_read() {
 
     tool_index_docs(&json!({"path": &path})).expect("initial doc index");
 
+    // The store's files as the filesystem sees them: a signal that the
+    // watcher wrote, read without opening the store (which is the point of
+    // this test).
+    let store_stamp = || {
+        ["docs.kuzu", "docs.kuzu.wal"]
+            .iter()
+            .map(|name| {
+                std::fs::metadata(std::path::Path::new(&path).join(".infigraph").join(name))
+                    .ok()
+                    .map(|m| (m.modified().ok(), m.len()))
+            })
+            .collect::<Vec<_>>()
+    };
+
     let result = tool_watch_docs(&json!({"path": &path, "debounce_ms": 500})).unwrap();
     eprintln!("watch_docs: {result}");
 
     // Add new doc
     std::thread::sleep(Duration::from_millis(500));
+    let before = store_stamp();
     let new_doc = std::path::PathBuf::from(&path).join("docs/noconcurrent.md");
     std::fs::write(
         &new_doc,
@@ -314,8 +329,18 @@ fn test_doc_watcher_reindexes_no_concurrent_read() {
     .unwrap();
     eprintln!("wrote new doc (no concurrent read)");
 
-    // Wait for watcher to reindex WITHOUT polling search
-    std::thread::sleep(Duration::from_secs(5));
+    // Wait for the watcher to reindex WITHOUT reading the store: a fixed
+    // sleep raced the watcher's registration, which takes seconds under
+    // load. Then let the reindex that touched the store finish.
+    assert!(
+        poll_until(
+            || store_stamp() != before,
+            support::WATCH_EVENT_BUDGET,
+            "the doc store should change after the watcher reindexes",
+        ),
+        "the watcher never wrote to the doc store"
+    );
+    std::thread::sleep(Duration::from_secs(2));
 
     // Now do ONE search
     stop_all_doc_watchers();
@@ -1092,8 +1117,8 @@ fn test_auto_start_doc_watch_no_duplicates() {
     );
 }
 
-/// auto_start_doc_watch only starts watching once `.infigraph/docs.kuzu` exists (it
-/// gates on that file, per auto_start_doc_watch_inner). tool_index_project's in-process
+/// auto_start_doc_watch only starts watching once the project has opted in to documents
+/// (`[docs] enabled`, per auto_start_doc_watch_inner). tool_index_project's in-process
 /// fallback path relies on this: it must index docs before calling auto_start_doc_watch,
 /// or the call silently no-ops -- this is the exact invariant that regressed when that
 /// fallback path started the doc watcher without ever indexing docs first.
@@ -1124,16 +1149,16 @@ fn test_doc_watch_noop_before_doc_index_then_starts_after() {
         "doc watcher must not be running when docs were never indexed"
     );
 
-    // Index docs directly (bypassing tool_index_docs's own internal auto-start, which
+    // Opt in directly (bypassing tool_index_docs's own internal auto-start, which
     // would otherwise start the watcher itself and mask what this test isolates) --
     // mirrors exactly what tool_index_project's fallback path must do before this call.
-    let idx = open_doc_index(&json!({"path": &path})).expect("open doc index");
-    idx.index().expect("doc index");
+    infigraph_core::docs_switch::set_docs_enabled(std::path::Path::new(&path), true)
+        .expect("opt in");
 
     let result = auto_start_doc_watch(&path);
     assert!(
         result.is_some(),
-        "auto_start_doc_watch should start watching once docs.kuzu exists"
+        "auto_start_doc_watch should start watching once docs are enabled"
     );
     assert!(
         is_doc_watching(&canonical),

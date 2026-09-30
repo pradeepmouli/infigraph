@@ -5,8 +5,16 @@ use anyhow::{Context, Result};
 /// Paths, relative to `.infigraph/`, excluded from a clone: lock files (a copied
 /// lock would falsely claim the destination is held by the source's possibly-live
 /// process) and logs (source-specific, meaningless at the destination).
-const EXCLUDED_RELATIVE_PATHS: &[&str] =
-    &["graph.lock", "watch.lock", "mcp.lock", "index.lock", "logs"];
+const EXCLUDED_RELATIVE_PATHS: &[&str] = &[
+    "graph.lock",
+    "watch.lock",
+    "mcp.lock",
+    "index.lock",
+    "docs-op.lock",
+    "docs.kuzu.lock",
+    "config.lock",
+    "logs",
+];
 
 /// Copy `<src_root>/.infigraph/` to `<dst_root>/.infigraph/`, excluding lock files
 /// and logs. Does not index -- the caller runs `infigraph index` afterward.

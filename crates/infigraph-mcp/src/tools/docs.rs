@@ -18,9 +18,7 @@ pub fn open_doc_index(args: &Value) -> Result<infigraph_docs::DocIndex> {
         .get("path")
         .and_then(|p| p.as_str())
         .context("missing 'path' argument")?;
-    let mut idx = infigraph_docs::DocIndex::open(std::path::Path::new(path))?;
-    idx.init()?;
-    Ok(idx)
+    infigraph_docs::DocIndex::open_existing(std::path::Path::new(path))
 }
 
 pub struct DocWatcherEntry {
@@ -74,7 +72,7 @@ fn auto_start_doc_watch_inner(path: &str, skip_disabled_check: bool) -> Option<S
         return None;
     }
 
-    if !root.join(".infigraph").join("docs.kuzu").exists() {
+    if !infigraph_core::docs_switch::docs_enabled(&root) {
         return None;
     }
 
@@ -197,24 +195,14 @@ pub fn tool_index_docs(args: &Value) -> Result<String> {
         return Ok(combined);
     }
 
-    let idx = open_doc_index(args)?;
-    let result = idx.index()?;
-
-    let mut out = format!(
-        "Document indexing complete.\n  Files scanned: {}\n  Files indexed: {}\n  Chunks created: {}\n",
-        result.total_files, result.indexed_files, result.total_chunks
-    );
-
-    if let Some(store) = idx.store() {
-        let stats = store.stats()?;
-        out.push_str(&format!(
-            "  Total documents in store: {}\n  Total chunks in store: {}\n",
-            stats.document_count, stats.chunk_count
-        ));
-    }
-
+    let started = std::time::Instant::now();
+    let stats = infigraph_docs::ops::request_index_docs(std::path::Path::new(path), false)?;
     auto_start_doc_watch(path);
-    Ok(out)
+    Ok(infigraph_docs::ops::stats_report(
+        "Document indexing",
+        &stats,
+        started.elapsed(),
+    ))
 }
 
 pub fn tool_search_docs(args: &Value) -> Result<String> {
@@ -228,7 +216,11 @@ pub fn tool_search_docs(args: &Value) -> Result<String> {
         .context("missing 'query'")?;
     let limit = args.get("limit").and_then(|l| l.as_u64()).unwrap_or(10) as usize;
 
-    let idx = open_doc_index(args)?;
+    let idx = match open_doc_index(args) {
+        Ok(idx) => idx,
+        Err(e) if e.is::<infigraph_core::docs_switch::DocsNotIndexed>() => return Ok(e.to_string()),
+        Err(e) => return Err(e),
+    };
     let store = idx.store().context("doc store not initialized")?;
     let root = PathBuf::from(path);
 
@@ -316,12 +308,8 @@ pub fn tool_clean_docs(args: &Value) -> Result<String> {
         return Ok(combined);
     }
 
-    let mut idx = infigraph_docs::DocIndex::open(&PathBuf::from(path))?;
-    idx.clean()?;
-    Ok(
-        "Document index cleaned. Removed: docs.kuzu, docs_embeddings.bin, docs_hnsw_index."
-            .to_string(),
-    )
+    infigraph_docs::ops::clean_docs(&PathBuf::from(path))?;
+    Ok("Document index cleaned; document indexing is off for this project.".to_string())
 }
 
 pub fn tool_reindex_docs(args: &Value) -> Result<String> {
@@ -350,11 +338,12 @@ pub fn tool_reindex_docs(args: &Value) -> Result<String> {
         return Ok(combined);
     }
 
-    let mut idx = infigraph_docs::DocIndex::open(&PathBuf::from(path))?;
-    let result = idx.reindex()?;
-    Ok(format!(
-        "Document full reindex complete.\n  Files scanned: {}\n  Files indexed: {}\n  Chunks created: {}\n",
-        result.total_files, result.indexed_files, result.total_chunks
+    let started = std::time::Instant::now();
+    let stats = infigraph_docs::ops::request_index_docs(&PathBuf::from(path), true)?;
+    Ok(infigraph_docs::ops::stats_report(
+        "Document full reindex",
+        &stats,
+        started.elapsed(),
     ))
 }
 
@@ -432,8 +421,7 @@ pub fn tool_index_confluence(args: &Value) -> Result<String> {
     let sync = infigraph_confluence::ConfluenceSync::new(client, space);
     let root = PathBuf::from(path);
 
-    let mut idx = infigraph_docs::DocIndex::open(&root)?;
-    idx.init()?;
+    let idx = infigraph_docs::DocIndex::open_existing(&root)?;
     let store = idx.store().context("DocStore not initialized")?;
 
     let ids = page_ids.as_deref();
@@ -466,8 +454,7 @@ pub fn tool_index_confluence_pages(args: &Value) -> Result<String> {
     }
 
     let root = PathBuf::from(path);
-    let mut idx = infigraph_docs::DocIndex::open(&root)?;
-    idx.init()?;
+    let idx = infigraph_docs::DocIndex::open_existing(&root)?;
     let store = idx.store().context("DocStore not initialized")?;
 
     let source_id = format!("confluence::{}", space);

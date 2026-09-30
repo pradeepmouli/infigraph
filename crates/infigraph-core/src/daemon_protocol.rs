@@ -122,6 +122,13 @@ pub enum WriteRequest {
     /// -- see `docs/superpowers/specs/2026-08-04-daemon-routed-full-reindex-design.md`.
     /// No fields: it always means "rebuild everything."
     FullReindex,
+    /// Index this project's documents (docs opt-in). The daemon runs the
+    /// executor (`infigraph_docs::ops::index_docs`) through its
+    /// `DocsHandle` on a background task. It records `[docs] enabled =
+    /// true`, so it is also how a project opts in. `full` wipes and
+    /// rebuilds (`reindex-docs`). There is no document data on the socket:
+    /// the daemon reads the files itself.
+    IndexDocs { full: bool },
 }
 
 impl WriteRequest {
@@ -152,6 +159,18 @@ pub enum IngestSource {
     Inline(PathBuf),
 }
 
+/// What one document index run did, for `index-docs` to print: the counts
+/// `DocIndex::index` returns plus the store's totals afterwards.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DocIndexStats {
+    pub files_scanned: usize,
+    pub files_indexed: usize,
+    pub chunks_created: usize,
+    pub bfs_discovered: usize,
+    pub documents_in_store: usize,
+    pub chunks_in_store: usize,
+}
+
 /// Small summary of what happened -- never the full `IndexResult` (which
 /// carries every file's `FileExtraction`, already written to the graph by
 /// the daemon and not needed again by the caller).
@@ -178,6 +197,9 @@ pub enum WriteResult {
         indexed_files: usize,
         detected_languages: Vec<String>,
     },
+    /// `IndexDocs`'s outcome. A variant of its own: `Ok`'s two fields
+    /// describe code-graph writes.
+    DocsIndexed(DocIndexStats),
     Err {
         message: String,
     },
@@ -192,12 +214,16 @@ pub fn write_atomic(path: &Path, contents: &str) -> anyhow::Result<()> {
         .parent()
         .ok_or_else(|| anyhow::anyhow!("path has no parent directory: {}", path.display()))?;
     std::fs::create_dir_all(parent)?;
+    // Unique per call, not just per process: two threads writing the same
+    // file must not share (and clobber) one temp file.
+    static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let tmp_path = parent.join(format!(
-        ".{}.tmp-{}",
+        ".{}.tmp-{}-{}",
         path.file_name()
             .ok_or_else(|| anyhow::anyhow!("path has no file name: {}", path.display()))?
             .to_string_lossy(),
-        std::process::id()
+        std::process::id(),
+        TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     let mut file = std::fs::File::create(&tmp_path)?;
     if let Err(e) = file.write_all(contents.as_bytes()) {
@@ -336,6 +362,11 @@ mod tests {
             }
             .kind(),
             "ScipImport"
+        );
+        assert_eq!(WriteRequest::IndexDocs { full: true }.kind(), "IndexDocs");
+        assert_eq!(
+            serde_json::to_string(&WriteRequest::IndexDocs { full: false }).unwrap(),
+            r#"{"IndexDocs":{"full":false}}"#
         );
     }
 
@@ -647,6 +678,10 @@ pub fn serve_write(infigraph: &Infigraph, request: &WriteRequest) -> WriteResult
         }
         WriteRequest::FullReindex => WriteResult::Err {
             message: "FullReindex not yet implemented".to_string(),
+        },
+        WriteRequest::IndexDocs { .. } => WriteResult::Err {
+            message: "IndexDocs runs on the daemon's docs handle, never under index.lock"
+                .to_string(),
         },
     }
 }

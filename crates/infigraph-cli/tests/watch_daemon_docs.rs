@@ -165,23 +165,14 @@ fn cmd_watch_daemon_also_indexes_docs_without_restart() {
     // Give the watcher a moment to acquire watch.lock and start its loops.
     std::thread::sleep(Duration::from_millis(300));
 
-    // Index docs for the same root WITHOUT stopping the watch process --
-    // this is what makes docs.kuzu appear mid-run, the exact scenario the
-    // daemon's doc thread must notice on its own. It is a ONE-TIME setup
-    // open, but not necessarily before the daemon's first one: the daemon's
-    // read service opens docs.kuzu at startup (creating it), which lets its
-    // doc thread attach and catch up at once. A daemon that got there
-    // within the sleep above held the store when this open ran, and
-    // `init` used to refuse it outright (macOS CI); it now waits out a
-    // brief hold, as the graph's open does.
-    infigraph_docs::DocIndex::open(&root)
-        .unwrap()
-        .init()
-        .unwrap();
+    // Opt the project in WITHOUT stopping the watch process -- the daemon's
+    // doc thread must notice the switch on its own, attach, and create the
+    // store on its first catch-up.
+    infigraph_core::docs_switch::set_docs_enabled(&root, true).unwrap();
 
     attach_rx
         .recv_timeout(Duration::from_secs(5))
-        .expect("daemon's doc thread never attached after docs.kuzu appeared");
+        .expect("daemon's doc thread never attached after docs were enabled");
     // The attach log fires before `notify::Watcher::watch()` returns inside
     // `watch_docs`; give it a brief moment to finish registering so the
     // upcoming write is guaranteed to land after the watch is live.
@@ -545,14 +536,9 @@ fn watch_docs_stop_and_start_over_control_are_visible_in_status() {
     let root = tmp.path().canonicalize().unwrap();
     std::fs::create_dir_all(root.join(".infigraph")).unwrap();
     std::fs::write(root.join("main.rs"), "fn main() {}").unwrap();
-    // Pre-create docs.kuzu so the daemon's doc thread attaches on its very
-    // first poll tick, rather than needing a second synchronization point
-    // for "docs.kuzu appeared mid-run" (already covered by
-    // cmd_watch_daemon_also_indexes_docs_without_restart above).
-    infigraph_docs::DocIndex::open(&root)
-        .unwrap()
-        .init()
-        .unwrap();
+    // Opt in before the daemon starts, so its doc thread attaches on its
+    // very first poll tick.
+    infigraph_core::docs_switch::set_docs_enabled(&root, true).unwrap();
 
     let mut daemon = KillOnDrop(
         Command::new(&bin)
@@ -618,7 +604,7 @@ fn watch_docs_stop_and_start_over_control_are_visible_in_status() {
 
     attach_rx
         .recv_timeout(Duration::from_secs(5))
-        .expect("daemon's doc thread never attached on startup (docs.kuzu pre-existed)");
+        .expect("daemon's doc thread never attached on startup (docs were enabled)");
     std::thread::sleep(Duration::from_millis(200));
 
     // Baseline: prove doc-watching genuinely works before touching the

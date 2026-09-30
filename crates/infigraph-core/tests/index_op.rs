@@ -190,6 +190,41 @@ fn test_wipe_infigraph_preserving_index_lock_keeps_lock_removes_rest() {
     drop(guard);
 }
 
+/// A code rebuild has no business with the project's own settings or its
+/// document index: `config.toml` (`[docs] enabled`, `[index] include`, ...)
+/// is the user's, and the document store, its sidecars and its lock are not
+/// derived from the code graph. Wiping them turned documents off (and threw
+/// away every setting) on a local `index --full`, and unlinking a held
+/// `docs-op.lock` would split that lock.
+#[test]
+fn test_wipe_keeps_project_config_and_the_document_index() {
+    let dir = TempDir::new().unwrap();
+    let tg_dir = dir.path().join(".infigraph");
+    std::fs::create_dir_all(&tg_dir).unwrap();
+    let kept = [
+        "config.toml",
+        "docs-op.lock",
+        "docs.kuzu",
+        "docs.kuzu.wal",
+        "docs_embeddings.bin",
+        "docs_hnsw_index.usearch",
+    ];
+    for name in kept {
+        std::fs::write(tg_dir.join(name), name.as_bytes()).unwrap();
+    }
+    std::fs::write(tg_dir.join("registry.json"), b"{}").unwrap();
+
+    wipe_infigraph_preserving_index_lock(&tg_dir).unwrap();
+
+    for name in kept {
+        assert!(tg_dir.join(name).exists(), "{name} must survive the wipe");
+    }
+    assert!(
+        !tg_dir.join("registry.json").exists(),
+        "derived state is still wiped"
+    );
+}
+
 /// `wipe_infigraph_preserving_index_lock` must also preserve the
 /// snapshot/quarantine/retired-previous backup pools (R3.2) alongside
 /// `index.lock` — otherwise a caller that just took a pre-write snapshot of

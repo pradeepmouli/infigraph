@@ -44,7 +44,7 @@ impl DaemonDocStore {
     /// any read to drift.
     fn with_reader<T>(&self, f: impl FnOnce(&DocQuery<&dyn QueryExec>) -> Result<T>) -> Result<T> {
         if infigraph_core::graph::daemon_kuzu_backend::direct_reads_enabled() {
-            let store = DocStore::open(&self.root.join(".infigraph").join("docs.kuzu"))?;
+            let store = DocStore::open_for_read(&self.root)?;
             let conn = store.connection()?;
             let local = infigraph_core::graph::query_exec::LocalExec::new(&conn);
             let exec: &dyn QueryExec = &local;
@@ -56,16 +56,15 @@ impl DaemonDocStore {
         }
     }
 
-    /// Documents have no daemon write protocol, unlike the code graph's
-    /// file-drop `WriteRequest`. Under `INFIGRAPH_BACKEND=daemon` the daemon
-    /// owns document writing through its own doc watcher, so a client-side
-    /// write is refused explicitly rather than silently opening
-    /// `docs.kuzu` beside the daemon's own handle.
+    /// A document write never travels as data (docs opt-in, approach A):
+    /// the daemon indexes documents itself, through `IndexDocs` and its doc
+    /// watcher. A client-side write is refused explicitly rather than
+    /// silently opening `docs.kuzu` beside the daemon's own handle.
     fn writes_not_routed(method: &str) -> anyhow::Error {
         anyhow::anyhow!(
-            "document writes are not routed through the daemon ({method}); the daemon indexes \
-             documents itself via its doc watcher. Run the command without \
-             INFIGRAPH_BACKEND=daemon to write directly."
+            "document writes are not routed through the daemon ({method}); run `infigraph \
+             index-docs`, which asks the daemon to index this project's documents, or set \
+             INFIGRAPH_BACKEND=kuzu to write directly."
         )
     }
 }

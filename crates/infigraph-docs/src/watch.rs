@@ -74,43 +74,20 @@ pub fn watch_docs(
         }
 
         if pending && last_reindex.elapsed() >= debounce {
-            let _reindexing = ReindexGuard::enter();
-            eprintln!("[{log_prefix}] document change detected, reindexing...");
-            let mut idx = match DocIndex::open(root) {
-                Ok(i) => i,
-                Err(e) => {
-                    eprintln!("[{log_prefix}] open error: {e}");
-                    pending = false;
-                    continue;
-                }
+            let indexed = match reindex_if_enabled(root, log_prefix) {
+                // Another docs operation (index-docs, clean-docs, a read)
+                // holds the lock: keep `pending` and try on the next tick
+                // rather than block a stop behind it.
+                Reindex::Busy => continue,
+                Reindex::Done { indexed } => indexed,
             };
-            if let Err(e) = idx.init() {
-                eprintln!("[{log_prefix}] init error: {e}");
-            } else {
-                let indexed = match idx.index() {
-                    Ok(r) => {
-                        eprintln!(
-                            "[{log_prefix}] reindexed: {} files, {} chunks",
-                            r.indexed_files, r.total_chunks
-                        );
-                        true
+            if indexed {
+                match crate::combined::schedule_group_doc_refresh(root) {
+                    Ok(count) if count > 0 => {
+                        eprintln!("[{log_prefix}] refreshing {count} combined document group(s)")
                     }
-                    Err(e) => {
-                        eprintln!("[{log_prefix}] index error: {e}");
-                        false
-                    }
-                };
-                drop(idx);
-                if indexed {
-                    match crate::combined::schedule_group_doc_refresh(root) {
-                        Ok(count) if count > 0 => {
-                            eprintln!(
-                                "[{log_prefix}] refreshing {count} combined document group(s)"
-                            )
-                        }
-                        Ok(_) => {}
-                        Err(e) => eprintln!("[{log_prefix}] combined refresh error: {e}"),
-                    }
+                    Ok(_) => {}
+                    Err(e) => eprintln!("[{log_prefix}] combined refresh error: {e}"),
                 }
             }
             pending = false;
@@ -119,6 +96,65 @@ pub fn watch_docs(
     }
 
     Ok(())
+}
+
+/// What one debounced reindex attempt came to.
+enum Reindex {
+    /// The docs lock is held elsewhere; try again next tick.
+    Busy,
+    /// Ran, or had nothing to do because docs are off. `indexed` is whether
+    /// it wrote anything a combined group should pick up.
+    Done { indexed: bool },
+}
+
+/// One reindex, under the docs lock and only while docs are on. The switch
+/// is re-read *under* the lock: `clean-docs` turns it off before it takes
+/// the lock to delete, so a reindex that gets the lock after it must not
+/// recreate what it deleted.
+fn reindex_if_enabled(root: &Path, log_prefix: &str) -> Reindex {
+    // Before the lock, not only under it: taking the lock creates its
+    // directory, so a project removed while its watcher is attached (the
+    // deletions themselves mark the tree dirty) would be brought back.
+    if !root.join(".infigraph").is_dir() || !infigraph_core::docs_switch::docs_enabled(root) {
+        return Reindex::Done { indexed: false };
+    }
+    let _op = match infigraph_core::docs_switch::try_lock_docs_op(root) {
+        Ok(Some(guard)) => guard,
+        Ok(None) => return Reindex::Busy,
+        Err(e) => {
+            eprintln!("[{log_prefix}] docs lock error: {e}");
+            return Reindex::Done { indexed: false };
+        }
+    };
+    if !infigraph_core::docs_switch::docs_enabled(root) {
+        return Reindex::Done { indexed: false };
+    }
+    let _reindexing = ReindexGuard::enter();
+    eprintln!("[{log_prefix}] document change detected, reindexing...");
+    let mut idx = match DocIndex::open(root) {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("[{log_prefix}] open error: {e}");
+            return Reindex::Done { indexed: false };
+        }
+    };
+    if let Err(e) = idx.init() {
+        eprintln!("[{log_prefix}] init error: {e}");
+        return Reindex::Done { indexed: false };
+    }
+    match idx.index() {
+        Ok(r) => {
+            eprintln!(
+                "[{log_prefix}] reindexed: {} files, {} chunks",
+                r.indexed_files, r.total_chunks
+            );
+            Reindex::Done { indexed: true }
+        }
+        Err(e) => {
+            eprintln!("[{log_prefix}] index error: {e}");
+            Reindex::Done { indexed: false }
+        }
+    }
 }
 
 /// Whether a watch event touching `paths` should schedule a reindex.
@@ -184,8 +220,7 @@ impl Drop for ReindexGuard {
     }
 }
 
-/// How often the daemon loop polls for `.infigraph/docs.kuzu`'s existence
-/// and the per-handler stop sentinel while deciding whether to attach or
+/// How often the daemon loop re-reads `[docs] enabled` while deciding whether to attach or
 /// detach a `watch_docs` session. Overridable via
 /// `INFIGRAPH_WATCH_DOC_DAEMON_POLL_MS` so tests don't wait through a real 1s tick.
 fn attach_poll_interval(root: &Path) -> Duration {
@@ -200,9 +235,11 @@ fn attach_poll_interval(root: &Path) -> Duration {
 }
 
 /// Drive doc-watching for `root` as part of the merged code+doc daemon (see
-/// `infigraph_core::daemon::lifecycle`). Attaches a `watch_docs` session once
-/// `.infigraph/docs.kuzu` exists, detaches if that file disappears (e.g.
-/// after `clean_docs`) and re-attaches when it comes back. Exits once
+/// `infigraph_core::daemon::lifecycle`). Attaches a `watch_docs` session
+/// while `[docs] enabled` is on (`docs_switch::docs_enabled`), detaches when
+/// it goes off, and re-attaches when it comes back. Documents are opt-in:
+/// the switch decides, not whether `docs.kuzu` exists, and the first
+/// catch-up reindex after attaching creates the store. Exits once
 /// `shutdown` is set. Blocks until then.
 ///
 /// Stopping and starting doc-watching is the daemon's `Control(Docs, ..)`
@@ -214,13 +251,13 @@ pub fn watch_docs_daemon_loop(
     debounce_ms: u64,
     shutdown: Arc<AtomicBool>,
 ) -> Result<()> {
-    let docs_kuzu = root.join(".infigraph").join("docs.kuzu");
     let poll = attach_poll_interval(root);
+    let enabled = || infigraph_core::docs_switch::docs_enabled(root);
     loop {
         if shutdown.load(Ordering::Relaxed) {
             return Ok(());
         }
-        if !docs_kuzu.exists() {
+        if !enabled() {
             std::thread::sleep(poll);
             continue;
         }
@@ -229,7 +266,7 @@ pub fn watch_docs_daemon_loop(
             "[doc-watch-daemon] attaching doc watcher for {}",
             root.display()
         );
-        run_attached_cycle(&docs_kuzu, &shutdown, poll, move |stop_rx| {
+        run_attached_cycle(enabled, &shutdown, poll, move |stop_rx| {
             watch_docs(&root_owned, debounce_ms, stop_rx, "doc-watch-daemon")
         });
     }
@@ -238,7 +275,7 @@ pub fn watch_docs_daemon_loop(
 /// Drives one attach cycle: runs `watch_fn` (normally a `watch_docs` call) on
 /// its own thread and polls, in the CALLING thread, for whichever trips
 /// first: `watch_fn` finishing on its own (unrequested), `shutdown`, or
-/// `docs_kuzu` disappearing.
+/// `still_wanted` turning false.
 ///
 /// `handle.is_finished()` is checked before any of the other conditions on
 /// every tick specifically so this function can never block forever: those
@@ -247,8 +284,12 @@ pub fn watch_docs_daemon_loop(
 /// the watcher failed to start), none of them will necessarily ever become
 /// true, and this function must notice that exit directly instead of
 /// waiting on a stop signal nothing will act on.
-fn run_attached_cycle<F>(docs_kuzu: &Path, shutdown: &Arc<AtomicBool>, poll: Duration, watch_fn: F)
-where
+fn run_attached_cycle<F>(
+    still_wanted: impl Fn() -> bool,
+    shutdown: &Arc<AtomicBool>,
+    poll: Duration,
+    watch_fn: F,
+) where
     F: FnOnce(mpsc::Receiver<()>) -> Result<()> + Send + 'static,
 {
     let (stop_tx, stop_rx) = mpsc::channel::<()>();
@@ -273,7 +314,8 @@ where
             return;
         }
 
-        if !docs_kuzu.exists() {
+        if !still_wanted() {
+            eprintln!("[doc-watch-daemon] detaching: document indexing is off");
             let _ = stop_tx.send(());
             log_join_result(handle.join());
             return;
@@ -301,6 +343,25 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
     use std::time::Duration;
+
+    /// A worktree removed while its daemon's watcher is attached: the
+    /// deletions mark the tree dirty, and the next tick must find nothing to
+    /// do, not re-create `.infigraph/` by taking the docs lock first
+    /// (`open_lock_file` creates its directory).
+    #[test]
+    fn a_reindex_in_a_removed_project_creates_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("removed-worktree");
+        let outcome = reindex_if_enabled(&root, "test");
+        assert!(matches!(outcome, Reindex::Done { indexed: false }));
+        assert!(!root.exists(), "the reindex re-created {}", root.display());
+
+        // Present, but without an `.infigraph/`: same.
+        std::fs::create_dir_all(&root).unwrap();
+        let outcome = reindex_if_enabled(&root, "test");
+        assert!(matches!(outcome, Reindex::Done { indexed: false }));
+        assert!(!root.join(".infigraph").exists());
+    }
 
     const POLL_MS_VAR: &str = "INFIGRAPH_WATCH_DOC_DAEMON_POLL_MS";
 
@@ -386,6 +447,12 @@ mod tests {
         std::env::remove_var(POLL_MS_VAR);
         assert_eq!(attach_poll_interval(tmp.path()).as_millis(), 1000);
     }
+    /// How long a test waits for the doc watcher to attach and index. The
+    /// catch-up reindex runs only once the watcher's registration is live,
+    /// and that registration (an RPC to `fseventsd` on macOS) was measured
+    /// at 7.6s on a dev machine at load average 20+. A wait-until deadline,
+    /// so a healthy run never pays it.
+    const ATTACH_BUDGET: Duration = Duration::from_secs(30);
 
     /// `DocIndex` has no `chunk_count()` accessor; the real path is
     /// `DocIndex::store()` (populated only after `init()`) -> `DocBackend::stats()`
@@ -406,6 +473,9 @@ mod tests {
     /// an actual `Err` from `DocStore::open`, ordinary lock contention here
     /// cannot spuriously trip it.
     fn chunk_count(root: &Path) -> usize {
+        if !infigraph_core::docs_switch::docs_store_path(root).exists() {
+            return 0;
+        }
         let mut idx = match crate::DocIndex::open(root) {
             Ok(i) => i,
             Err(_) => return 0,
@@ -430,28 +500,29 @@ mod tests {
     }
 
     #[test]
-    fn does_not_attach_without_docs_kuzu() {
+    fn does_not_attach_or_create_anything_while_docs_are_off() {
         let _poll = FastPoll::acquire();
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().canonicalize().unwrap();
         std::fs::create_dir_all(root.join(".infigraph")).unwrap();
+        std::fs::write(root.join("readme.md"), "# hello\n\nsome content").unwrap();
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_clone = Arc::clone(&shutdown);
-        let handle = std::thread::spawn(move || watch_docs_daemon_loop(&root, 50, shutdown_clone));
+        let loop_root = root.clone();
+        let handle =
+            std::thread::spawn(move || watch_docs_daemon_loop(&loop_root, 50, shutdown_clone));
 
-        std::thread::sleep(Duration::from_millis(150));
-        // No docs.kuzu ever appeared -- the loop must still be polling, not
-        // stuck in an attached watch_docs call. Shutting down must return
-        // promptly (proves it was in the poll loop, not blocked inside
-        // watch_docs's own internal loop, which only checks its stop_rx on
-        // its own ~500ms cadence and would still return promptly here too --
-        // the real proof is the next test, which asserts actual indexing).
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            !infigraph_core::docs_switch::docs_store_path(&root).exists(),
+            "a watcher for a project that has not opted in must create nothing"
+        );
         shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
         handle.join().unwrap().unwrap();
     }
 
     #[test]
-    fn attaches_and_indexes_once_docs_kuzu_appears() {
+    fn attaches_and_indexes_once_docs_are_enabled() {
         let _poll = FastPoll::acquire();
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().canonicalize().unwrap();
@@ -466,14 +537,13 @@ mod tests {
         // Not indexed yet -- give the poll loop a couple of ticks doing
         // nothing, then create a real (empty) doc index so docs.kuzu exists.
         std::thread::sleep(Duration::from_millis(60));
-        crate::DocIndex::open(&root).unwrap().init().unwrap();
-        assert!(root.join(".infigraph").join("docs.kuzu").exists());
+        infigraph_core::docs_switch::set_docs_enabled(&root, true).unwrap();
 
         // Give the daemon loop time to notice and attach, then write a doc.
         std::thread::sleep(Duration::from_millis(100));
         std::fs::write(root.join("readme.md"), "# hello\n\nsome content").unwrap();
 
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + ATTACH_BUDGET;
         let mut chunks = 0;
         while std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(100));
@@ -546,7 +616,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().canonicalize().unwrap();
         std::fs::create_dir_all(root.join(".infigraph")).unwrap();
-        crate::DocIndex::open(&root).unwrap().init().unwrap();
+        infigraph_core::docs_switch::set_docs_enabled(&root, true).unwrap();
         let shutdown = Arc::new(AtomicBool::new(false));
         let shutdown_clone = Arc::clone(&shutdown);
         let root_clone = root.clone();
@@ -561,7 +631,7 @@ mod tests {
         );
         // Still attached: a doc edit is still indexed.
         std::fs::write(root.join("readme.md"), "# hello\n\nsome content").unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + ATTACH_BUDGET;
         while chunk_count(&root) == 0 && std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(100));
         }
@@ -580,13 +650,10 @@ mod tests {
         // can no longer act on.
         let (result_tx, result_rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let tmp = tempfile::tempdir().unwrap();
-            let root = tmp.path().canonicalize().unwrap();
-            let docs_kuzu = root.join("docs.kuzu");
             let shutdown = Arc::new(AtomicBool::new(false));
 
             run_attached_cycle(
-                &docs_kuzu,
+                || true,
                 &shutdown,
                 Duration::from_millis(10),
                 |_stop_rx: mpsc::Receiver<()>| -> Result<()> { Ok(()) },
@@ -598,6 +665,69 @@ mod tests {
             "run_attached_cycle must return promptly when watch_fn exits unrequested, \
              not block waiting on a stop condition nothing will ever trip",
         );
+    }
+
+    /// Turning the switch off stops the attached watcher.
+    #[test]
+    fn run_attached_cycle_stops_the_watcher_once_it_is_no_longer_wanted() {
+        let wanted = Arc::new(AtomicBool::new(true));
+        let (stopped_tx, stopped_rx) = mpsc::channel();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let still = Arc::clone(&wanted);
+        let cycle = std::thread::spawn(move || {
+            run_attached_cycle(
+                move || still.load(Ordering::SeqCst),
+                &shutdown,
+                Duration::from_millis(10),
+                move |stop_rx: mpsc::Receiver<()>| -> Result<()> {
+                    let _ = stop_rx.recv();
+                    let _ = stopped_tx.send(());
+                    Ok(())
+                },
+            );
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        wanted.store(false, Ordering::SeqCst);
+        stopped_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the watcher must be told to stop once docs are off");
+        cycle.join().unwrap();
+    }
+
+    /// With the switch off, a document change indexes nothing, even for a
+    /// watcher that was attached when it went off.
+    #[test]
+    fn a_watcher_indexes_nothing_after_docs_are_turned_off() {
+        let _poll = FastPoll::acquire();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join(".infigraph")).unwrap();
+        infigraph_core::docs_switch::set_docs_enabled(&root, true).unwrap();
+        std::fs::write(root.join("readme.md"), "# hello\n\nsome content").unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_clone = Arc::clone(&shutdown);
+        let loop_root = root.clone();
+        let handle =
+            std::thread::spawn(move || watch_docs_daemon_loop(&loop_root, 50, shutdown_clone));
+        let deadline = std::time::Instant::now() + ATTACH_BUDGET;
+        while chunk_count(&root) == 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(chunk_count(&root) > 0, "precondition: the watcher attached");
+
+        infigraph_core::docs_switch::set_docs_enabled(&root, false).unwrap();
+        std::thread::sleep(Duration::from_millis(1000));
+        let before = chunk_count(&root);
+        std::fs::write(root.join("second.md"), "# second\n\nmore content").unwrap();
+        std::thread::sleep(Duration::from_millis(1500));
+        assert_eq!(
+            chunk_count(&root),
+            before,
+            "a watcher indexed with docs off"
+        );
+
+        shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+        handle.join().unwrap().unwrap();
     }
 
     /// A stop must end `watch_docs` even while its watcher registration is

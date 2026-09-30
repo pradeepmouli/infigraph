@@ -13,6 +13,7 @@ pub mod daemon;
 pub mod daemon_protocol;
 pub mod diff;
 pub mod dirty;
+pub mod docs_switch;
 pub mod doctor;
 pub mod embed;
 pub mod export;

@@ -15,6 +15,7 @@ use infigraph_docs::store::DocStore;
 static COMBINED_DOCS_LOCK: Mutex<()> = Mutex::new(());
 
 fn index_doc(root: &std::path::Path, file: &str, text: &str) {
+    infigraph_core::docs_switch::set_docs_enabled(root, true).unwrap();
     let full_path = root.join(file);
     std::fs::create_dir_all(full_path.parent().unwrap()).unwrap();
     std::fs::write(&full_path, text).unwrap();
@@ -437,6 +438,11 @@ fn combined_docs_nonexistent_group() {
     // search/query on a group that was never built — open_combined_docs errors
     let query_err = combined_doc_query("nonexistent", "MATCH (d:Document) RETURN d.id");
     assert!(query_err.is_err(), "query on unbuilt group should fail");
+
+    // Searching a group that was never built is an error, and must not
+    // create an empty combined store as a side effect.
+    assert!(combined_doc_search("nonexistent", "anything", 5, 0.5).is_err());
+    assert!(!has_combined_docs("nonexistent"));
 
     if let Some(h) = old_home {
         std::env::set_var("HOME", h);

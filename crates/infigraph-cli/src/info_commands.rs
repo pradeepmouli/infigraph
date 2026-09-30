@@ -158,24 +158,22 @@ pub(crate) fn cmd_index_manifests(root: &Path) -> Result<()> {
     }
 
     // Create LINKS_TO edges from manifests to indexed docs via doc_urls
-    if let Ok(mut doc_idx) = infigraph_docs::DocIndex::open(root) {
-        if doc_idx.init().is_ok() {
-            if let Some(doc_store) = doc_idx.store() {
-                let all_doc_ids: std::collections::HashSet<String> = doc_store
-                    .get_doc_hashes()
-                    .unwrap_or_default()
-                    .keys()
-                    .cloned()
-                    .collect();
-                for r in &results {
-                    if !r.doc_urls.is_empty() {
-                        infigraph_docs::links::link_manifest_doc_urls(
-                            doc_store,
-                            &r.manifest_file,
-                            &r.doc_urls,
-                            &all_doc_ids,
-                        );
-                    }
+    if let Ok(doc_idx) = infigraph_docs::DocIndex::open_existing(root) {
+        if let Some(doc_store) = doc_idx.store() {
+            let all_doc_ids: std::collections::HashSet<String> = doc_store
+                .get_doc_hashes()
+                .unwrap_or_default()
+                .keys()
+                .cloned()
+                .collect();
+            for r in &results {
+                if !r.doc_urls.is_empty() {
+                    infigraph_docs::links::link_manifest_doc_urls(
+                        doc_store,
+                        &r.manifest_file,
+                        &r.doc_urls,
+                        &all_doc_ids,
+                    );
                 }
             }
         }
@@ -587,6 +585,17 @@ pub(crate) fn cmd_daemon(root: &Path, debounce: u64) -> Result<()> {
     })
     .ok();
 
+    // Existing document indexes stay on (docs opt-in, decision 2): record
+    // `[docs] enabled = true` for a project that has a `docs.kuzu` and no
+    // recorded choice, before the doc thread first reads the switch. Never
+    // fatal: the graph is the daemon's job.
+    match infigraph_core::docs_switch::migrate_existing_index(root) {
+        Ok(true) => eprintln!(
+            "[daemon-start] documents: kept the existing index on ([docs] enabled = true)"
+        ),
+        Ok(false) => {}
+        Err(e) => eprintln!("[daemon-start] documents: could not record [docs] enabled: {e:#}"),
+    }
     let doc_watch = std::sync::Arc::new(std::sync::Mutex::new(DocWatchThread::new(
         root.to_path_buf(),
         debounce,
@@ -736,9 +745,10 @@ pub(crate) fn cmd_daemon(root: &Path, debounce: u64) -> Result<()> {
         );
 
     // The document half of the read service. Opened here because
-    // `infigraph-core` cannot name `DocStore`. A failure is not fatal: the
-    // daemon still serves the code graph, and a document read then gets an
-    // explicit refusal rather than silently opening `docs.kuzu` itself.
+    // `infigraph-core` cannot name `DocStore`. It registers whether or not
+    // the project has documents (they are opt-in; a missing store answers
+    // "not indexed"). Only a store that exists but will not open fails it,
+    // and then the daemon still serves the code graph.
     let docs_reads = match infigraph_docs::daemon_source::daemon_row_source(root) {
         Ok(source) => Some(source),
         Err(e) => {
@@ -811,6 +821,13 @@ impl infigraph_core::daemon::DocsHandle for DocWatchHandle {
 
     fn is_busy(&self) -> bool {
         infigraph_docs::watch::reindex_in_progress()
+    }
+    fn index_docs(
+        &self,
+        full: bool,
+    ) -> std::result::Result<infigraph_core::daemon_protocol::DocIndexStats, String> {
+        let root = self.0.lock().unwrap().root.clone();
+        infigraph_docs::ops::index_docs(&root, full).map_err(|e| format!("{e:#}"))
     }
 }
 
@@ -1083,22 +1100,33 @@ pub(crate) fn cmd_scip_import(root: &Path, index_path: &Path) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn cmd_index_docs(root: &Path, namespace: Option<&str>) -> Result<()> {
+pub(crate) fn cmd_index_docs(root: &Path) -> Result<()> {
+    #[cfg(feature = "remote")]
+    if infigraph_core::daemon::lifecycle::is_remote_backend() {
+        let ns = infigraph_core::multi::Registry::load()
+            .ok()
+            .and_then(|reg| reg.resolve_repo_namespace(root));
+        return cmd_index_docs_remote(root, ns.as_deref());
+    }
+    let start = std::time::Instant::now();
+    let stats = infigraph_docs::ops::request_index_docs(root, false)?;
+    println!(
+        "{}",
+        infigraph_docs::ops::stats_report("Document indexing", &stats, start.elapsed())
+    );
+    Ok(())
+}
+
+/// Remote (Neo4j + Postgres) mode keeps its direct write path: the store is
+/// a real client/server database, and embeddings go to pgvector.
+#[cfg(feature = "remote")]
+pub(crate) fn cmd_index_docs_remote(root: &Path, namespace: Option<&str>) -> Result<()> {
     let start = std::time::Instant::now();
     let mut idx = infigraph_docs::DocIndex::open(root)?;
     if let Some(ns) = namespace {
         idx.set_namespace(ns);
     }
-
-    #[cfg(feature = "remote")]
-    let is_remote = infigraph_core::daemon::lifecycle::is_remote_backend();
-    #[cfg(not(feature = "remote"))]
-    let is_remote = false;
-
-    if is_remote {
-        idx.set_skip_file_embeddings(true);
-    }
-
+    idx.set_skip_file_embeddings(true);
     idx.init()?;
     let result = idx.index()?;
     let elapsed = start.elapsed();
@@ -1106,51 +1134,41 @@ pub(crate) fn cmd_index_docs(root: &Path, namespace: Option<&str>) -> Result<()>
         "Document indexing complete in {:.1}s\n  Files scanned: {}\n  Files indexed: {}\n  Chunks created: {}",
         elapsed.as_secs_f64(), result.total_files, result.indexed_files, result.total_chunks
     );
-    if let Some(store) = idx.store() {
-        let stats = store.stats()?;
-        println!(
-            "  Total documents in store: {}\n  Total chunks in store: {}",
-            stats.document_count, stats.chunk_count
-        );
+    let store = idx.store().context("doc store not initialized")?;
+    let stats = store.stats()?;
+    println!(
+        "  Total documents in store: {}\n  Total chunks in store: {}",
+        stats.document_count, stats.chunk_count
+    );
+    let pg = infigraph_core::meta::PostgresMetaStore::connect_from_env_cached()?;
+    pg.init_schema()?;
+    let chunk_refs: Vec<&infigraph_docs::chunk::Chunk> = result.new_chunks.iter().collect();
+    let changed_refs: Vec<&str> = result.changed_files.iter().map(|s| s.as_str()).collect();
+    let count = infigraph_docs::embed::update_doc_embeddings_remote(
+        store,
+        &pg,
+        &chunk_refs,
+        &changed_refs,
+    )?;
+    if count > 0 {
+        println!("Saved {} doc embeddings to Postgres pgvector", count);
     }
-
-    #[cfg(feature = "remote")]
-    if is_remote {
-        let pg = infigraph_core::meta::PostgresMetaStore::connect_from_env_cached()?;
-        pg.init_schema()?;
-        let store = idx.store().context("doc store not initialized")?;
-        let chunk_refs: Vec<&infigraph_docs::chunk::Chunk> = result.new_chunks.iter().collect();
-        let changed_refs: Vec<&str> = result.changed_files.iter().map(|s| s.as_str()).collect();
-        let count = infigraph_docs::embed::update_doc_embeddings_remote(
-            store,
-            &pg,
-            &chunk_refs,
-            &changed_refs,
-        )?;
-        if count > 0 {
-            println!("Saved {} doc embeddings to Postgres pgvector", count);
-        }
-    }
-
     Ok(())
 }
 
 pub(crate) fn cmd_reindex_docs(root: &Path) -> Result<()> {
     let start = std::time::Instant::now();
-    let mut idx = infigraph_docs::DocIndex::open(root)?;
-    let result = idx.reindex()?;
-    let elapsed = start.elapsed();
+    let stats = infigraph_docs::ops::request_index_docs(root, true)?;
     println!(
-        "Document full reindex complete in {:.1}s\n  Files scanned: {}\n  Files indexed: {}\n  Chunks created: {}",
-        elapsed.as_secs_f64(), result.total_files, result.indexed_files, result.total_chunks
+        "{}",
+        infigraph_docs::ops::stats_report("Document full reindex", &stats, start.elapsed())
     );
     Ok(())
 }
 
 pub(crate) fn cmd_clean_docs(root: &Path) -> Result<()> {
-    let mut idx = infigraph_docs::DocIndex::open(root)?;
-    idx.clean()?;
-    println!("Document index cleaned.");
+    infigraph_docs::ops::clean_docs(root)?;
+    println!("Document index cleaned; document indexing is off for this project.");
     Ok(())
 }
 
@@ -1189,8 +1207,7 @@ pub(crate) fn cmd_index_confluence(
     let start = std::time::Instant::now();
     let sync = infigraph_confluence::ConfluenceSync::new(client, space);
 
-    let mut idx = infigraph_docs::DocIndex::open(root)?;
-    idx.init()?;
+    let idx = infigraph_docs::DocIndex::open_existing(root)?;
     let store = idx.store().context("DocStore not initialized")?;
 
     let ids = page_ids.as_deref();

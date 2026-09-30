@@ -451,14 +451,19 @@ pub(crate) fn cmd_index(root: &Path, full: bool, no_embed: bool) -> Result<()> {
         }
     }
 
-    // Auto-index documents (PDF, DOCX, XML, Markdown, etc.)
+    // Refresh documents (PDF, DOCX, XML, Markdown, etc.) for a project
+    // that has opted in (docs opt-in): a code index never opts one in.
+    // Remote mode keeps its direct write path.
     #[cfg(feature = "remote")]
-    let doc_ns = remote_ns.as_deref();
+    let docs_refreshed = if infigraph_core::daemon::lifecycle::is_remote_backend() {
+        crate::commands::cmd_index_docs_remote(root, remote_ns.as_deref())
+    } else {
+        refresh_docs_if_enabled(root)
+    };
     #[cfg(not(feature = "remote"))]
-    let doc_ns: Option<&str> = None;
-    match crate::commands::cmd_index_docs(root, doc_ns) {
-        Ok(()) => {}
-        Err(e) => eprintln!("warning: document indexing failed: {e}"),
+    let docs_refreshed = refresh_docs_if_enabled(root);
+    if let Err(e) = docs_refreshed {
+        eprintln!("warning: document indexing failed: {e}");
     }
 
     // Drop prism to release the GraphStore handle before background SCIP
@@ -2662,4 +2667,17 @@ mod tests {
             "build output stays excluded: {walked:?}"
         );
     }
+}
+
+/// `index`'s document step: refreshes an opted-in project's documents and
+/// prints the report; a project that has not opted in is left alone.
+fn refresh_docs_if_enabled(root: &Path) -> Result<()> {
+    let start = std::time::Instant::now();
+    if let Some(stats) = infigraph_docs::ops::request_index_docs_if_enabled(root)? {
+        println!(
+            "{}",
+            infigraph_docs::ops::stats_report("Document indexing", &stats, start.elapsed())
+        );
+    }
+    Ok(())
 }

@@ -7,6 +7,7 @@ pub mod embed;
 pub mod extract;
 #[cfg(feature = "remote")]
 pub mod neo4j_store;
+pub mod ops;
 pub mod query;
 pub mod search;
 pub mod store;
@@ -37,6 +38,10 @@ pub struct DocIndex {
     /// graph — keeps repos sharing one Neo4j instance from colliding on
     /// identical relative paths (e.g. every repo's README.md).
     namespace: Option<String>,
+    /// The shared docs lock, held for this index's lifetime when it opened
+    /// the store locally for reading (`open_existing`). Declared last so
+    /// the store closes before the lock is released.
+    read_lock: Option<infigraph_core::lockfile::LockFile>,
 }
 
 pub struct DocIndexResult {
@@ -61,7 +66,42 @@ impl DocIndex {
             store: None,
             skip_file_embeddings: false,
             namespace: None,
+            read_lock: None,
         })
+    }
+
+    /// Open and initialize the project's existing document index, for a
+    /// reader or for a write into a store that must already exist
+    /// (confluence, manifest links). It never creates one: a project that
+    /// has not opted in, or whose store is missing, is `DocsNotIndexed`, and
+    /// nothing is written. That includes `.infigraph/` itself, which `open`
+    /// would create. Remote mode is unaffected. A local open holds the shared
+    /// docs lock for the index's lifetime, so `clean-docs` cannot delete the
+    /// store under it.
+    pub fn open_existing(root: &Path) -> Result<Self> {
+        use infigraph_core::docs_switch;
+
+        let remote = infigraph_core::daemon::lifecycle::is_remote_backend();
+        if !remote && !docs_switch::docs_indexed(root) {
+            return Err(docs_switch::DocsNotIndexed.into());
+        }
+        // A routed or remote store is not opened in this process.
+        let read_lock = if remote || infigraph_core::daemon_backend_selected() {
+            None
+        } else {
+            let lock = docs_switch::lock_docs_read(root)?;
+            if !docs_switch::docs_indexed(root) {
+                return Err(docs_switch::DocsNotIndexed.into());
+            }
+            Some(lock)
+        };
+        let mut idx = Self::open(root)?;
+        idx.read_lock = read_lock;
+        // A reader never repairs: it holds only the shared lock, and a wipe
+        // and rebuild is a write. `index-docs` and the watcher repair, under
+        // the exclusive lock.
+        idx.init_inner(false)?;
+        Ok(idx)
     }
 
     /// Set a namespace prefix (`org/repo`) for multi-repo doc indexing into a
@@ -71,6 +111,13 @@ impl DocIndex {
     }
 
     pub fn init(&mut self) -> Result<()> {
+        self.init_inner(true)
+    }
+
+    /// [`init`](Self::init); `repair` says whether a store that will not open
+    /// because it is corrupt may be wiped and rebuilt. Writers repair,
+    /// readers report.
+    fn init_inner(&mut self, repair: bool) -> Result<()> {
         #[cfg(feature = "remote")]
         if infigraph_core::daemon::lifecycle::is_remote_backend() {
             let neo = neo4j_store::Neo4jDocStore::connect_from_env()?;
@@ -129,6 +176,11 @@ impl DocIndex {
                     infigraph_core::graph::non_corruption_open_context(&first_err, &self.db_path);
                 Err(first_err.context(ctx))
             }
+            Err(first_err) if !repair => Err(first_err.context(format!(
+                "the document index at {} will not open and may be corrupt; \
+                 run `infigraph reindex-docs` to rebuild it",
+                self.db_path.display()
+            ))),
             Err(first_err) => {
                 eprintln!(
                     "[docs] open failed ({first_err}), wiping corrupt doc index and rebuilding..."

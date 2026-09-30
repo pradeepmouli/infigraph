@@ -208,6 +208,12 @@ impl infigraph_core::daemon::DocsHandle for Recorder {
     fn is_busy(&self) -> bool {
         false
     }
+    fn index_docs(
+        &self,
+        _full: bool,
+    ) -> Result<infigraph_core::daemon_protocol::DocIndexStats, String> {
+        Err("the Recorder test double does not index".to_string())
+    }
 }
 
 #[test]

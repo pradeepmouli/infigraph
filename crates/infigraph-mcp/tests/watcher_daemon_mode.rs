@@ -448,6 +448,7 @@ fn auto_start_doc_watch_respects_daemon_mode_toggle() {
         .unwrap()
         .init()
         .unwrap();
+    infigraph_core::docs_switch::set_docs_enabled(&root, true).unwrap();
     let path = root.to_string_lossy().to_string();
 
     let result = infigraph_mcp::tools::docs::auto_start_doc_watch(&path);
@@ -484,6 +485,7 @@ fn auto_start_doc_watch_respects_watch_docs_enabled_policy() {
         .unwrap()
         .init()
         .unwrap();
+    infigraph_core::docs_switch::set_docs_enabled(&root, true).unwrap();
     let path = root.to_string_lossy().to_string();
 
     let result = infigraph_mcp::tools::docs::auto_start_doc_watch(&path);

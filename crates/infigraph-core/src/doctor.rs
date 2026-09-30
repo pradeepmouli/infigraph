@@ -1169,6 +1169,53 @@ pub fn check_sidecars(ctx: &DoctorContext) -> Vec<CheckResult> {
         .collect()
 }
 
+const DOCS_CATEGORY: &str = "documents";
+
+/// Document indexing is opt-in per project: say whether it is on, and
+/// whether `docs.kuzu` agrees with the switch.
+fn check_one_project_docs(project_path: &Path) -> CheckResult {
+    let enabled = crate::docs_switch::docs_enabled(project_path);
+    let present = crate::docs_switch::docs_store_path(project_path).exists();
+    let label = format!("{}: documents", project_path.display());
+    let cd = project_path.display();
+    match (enabled, present) {
+        (true, true) => CheckResult::pass(DOCS_CATEGORY, label, "enabled; docs.kuzu present"),
+        (false, false) => CheckResult::pass(
+            DOCS_CATEGORY,
+            label,
+            "disabled (opt in with `infigraph index-docs`)",
+        ),
+        (true, false) => CheckResult::warn(
+            DOCS_CATEGORY,
+            label,
+            "enabled, but docs.kuzu is missing",
+            format!("run `cd {cd} && infigraph index-docs`"),
+        ),
+        // Predates the switch: the daemon records it on at its next start
+        // (`migrate_existing_index`), so this is not a leftover to clean.
+        (false, true) if crate::docs_switch::docs_enabled_recorded(project_path).is_none() => {
+            CheckResult::pass(
+                DOCS_CATEGORY,
+                label,
+                "docs.kuzu predates opt-in; kept on when its daemon next starts",
+            )
+        }
+        (false, true) => CheckResult::warn(
+            DOCS_CATEGORY,
+            label,
+            "disabled, but docs.kuzu is still on disk",
+            format!("run `cd {cd} && infigraph clean-docs` to reclaim the space"),
+        ),
+    }
+}
+
+pub fn check_docs(ctx: &DoctorContext) -> Vec<CheckResult> {
+    projects_in_scope(ctx)
+        .iter()
+        .map(|p| check_one_project_docs(p))
+        .collect()
+}
+
 const SCIP_STALENESS_CATEGORY: &str = "scip-staleness";
 
 /// R3.3.4 (docs/DESIGN-hardening.md §3.3.4): compares a project's AST vs.
@@ -1629,6 +1676,7 @@ pub fn run_doctor(ctx: DoctorContext) -> DoctorReport {
     checks.extend(check_instances(&ctx));
     checks.extend(check_disk(&ctx));
     checks.extend(check_sidecars(&ctx));
+    checks.extend(check_docs(&ctx));
     checks.extend(check_scip_staleness(&ctx));
     checks.extend(check_worktrees(&ctx));
     checks.extend(check_recovery(&ctx));
@@ -1925,5 +1973,74 @@ mod watcher_verdict_tests {
             "{}",
             overdue.message
         );
+    }
+}
+
+#[cfg(test)]
+mod docs_check_tests {
+    use super::*;
+    use crate::settings_file::test_support::{PinnedHome, ENV_LOCK};
+
+    fn check(enabled: Option<bool>, store: bool) -> CheckResult {
+        let dir = tempfile::tempdir().unwrap();
+        if let Some(on) = enabled {
+            crate::docs_switch::set_docs_enabled(dir.path(), on).unwrap();
+        }
+        if store {
+            let path = crate::docs_switch::docs_store_path(dir.path());
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, b"x").unwrap();
+        }
+        check_one_project_docs(dir.path())
+    }
+
+    /// `HOME` is restored before the lock is released: a tuple drops its
+    /// fields in order.
+    fn isolated() -> (PinnedHome, std::sync::MutexGuard<'static, ()>) {
+        let guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("INFIGRAPH_DOCS_ENABLED");
+        (PinnedHome::empty(), guard)
+    }
+
+    #[test]
+    fn docs_on_with_an_index_passes() {
+        let _env = isolated();
+        let r = check(Some(true), true);
+        assert_eq!(r.status, CheckStatus::Pass, "{}", r.message);
+        assert!(r.message.contains("enabled"), "{}", r.message);
+    }
+
+    #[test]
+    fn docs_off_with_no_index_passes() {
+        let _env = isolated();
+        let r = check(None, false);
+        assert_eq!(r.status, CheckStatus::Pass, "{}", r.message);
+        assert!(r.message.contains("disabled"), "{}", r.message);
+    }
+
+    #[test]
+    fn docs_on_without_an_index_warns_to_index() {
+        let _env = isolated();
+        let r = check(Some(true), false);
+        assert_eq!(r.status, CheckStatus::Warn, "{}", r.message);
+        assert!(r.remediation.unwrap().contains("index-docs"));
+    }
+
+    /// An index that predates the switch is kept on when its daemon next
+    /// starts; until then doctor must not tell the user to delete it.
+    #[test]
+    fn an_index_that_predates_the_switch_is_not_advised_away() {
+        let _env = isolated();
+        let r = check(None, true);
+        assert_eq!(r.status, CheckStatus::Pass, "{}", r.message);
+        assert!(r.message.contains("predates"), "{}", r.message);
+    }
+
+    #[test]
+    fn an_index_left_while_docs_are_off_warns_to_clean() {
+        let _env = isolated();
+        let r = check(Some(false), true);
+        assert_eq!(r.status, CheckStatus::Warn, "{}", r.message);
+        assert!(r.remediation.unwrap().contains("clean-docs"));
     }
 }
