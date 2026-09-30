@@ -15,4 +15,9 @@ content_file = "../shared/skills/infigraph-reindex/SKILL.md"
 [[artifact]]
 path = ".claude/skills/infigraph-tool-routing/SKILL.md"
 strategy = "overwrite"
-content_file = ["../shared/skills/infigraph-tool-routing/SKILL.md", "../shared/tool-routing.md"]
+content_file = ["../shared/skills/infigraph-tool-routing/SKILL.md", "../shared/tool-routing.md", "../shared/conventions.md"]
+
+[[artifact]]
+path = ".claude/skills/infigraph-tool-routing/references/tools.md"
+strategy = "overwrite"
+content_file = "../shared/skills/infigraph-tool-routing/references/tools.md"

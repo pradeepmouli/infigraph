@@ -286,7 +286,7 @@ pub(crate) fn remove_resolved_artifact(
                 if !ownership::verify_unchanged_and_clear(home, &target_path)? {
                     return Ok(RemoveOutcome::PreservedModified);
                 }
-                strategy::remove_overwrite(&target_path)?
+                strategy::remove_overwrite(&target_path, home)?
             }
             Strategy::MarkerDelimited => {
                 let start = artifact.start.as_deref().ok_or_else(|| {
