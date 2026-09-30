@@ -31,6 +31,20 @@ use std::time::{Duration, Instant};
 pub fn disable_background_watchers() {
     std::env::set_var("INFIGRAPH_NO_WATCH", "1");
     isolate_registry();
+    disable_scip_enrichment();
+}
+
+/// Opt this whole test process out of implicit SCIP enrichment, inherited by
+/// every `infigraph index` child it spawns. Without it each fixture project
+/// with a language that has an indexer leaves a detached `scip-enrich` child
+/// running after `index` returns, writing into a tempdir the fixture is about
+/// to delete and holding `index.lock` meanwhile. The env name comes from the
+/// settings definition, never a literal here. Idempotent.
+pub fn disable_scip_enrichment() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        std::env::set_var(infigraph_core::scip_switch::enabled_env_name(), "0");
+    });
 }
 
 /// Point `INFIGRAPH_REGISTRY_HOME` at a per-process scratch directory so
@@ -132,6 +146,7 @@ pub struct TestProject {
 impl TestProject {
     pub fn new() -> Self {
         isolate_registry();
+        disable_scip_enrichment();
         let dir = tempfile::TempDir::new().expect("tmpdir");
         let root = dir.path().to_path_buf();
         Self {

@@ -2,8 +2,10 @@
 //! (docs/superpowers/specs/2026-09-29-docs-opt-in-design.md), end to end
 //! against a real `infigraph daemon`.
 
+mod support;
+
 use std::path::Path;
-use std::process::{Command, Output, Stdio};
+use std::process::{Output, Stdio};
 use std::time::{Duration, Instant};
 
 use infigraph_core::docs_switch::{docs_enabled_recorded, docs_store_path};
@@ -18,10 +20,6 @@ impl Drop for Daemon {
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
-}
-
-fn cli() -> &'static str {
-    env!("CARGO_BIN_EXE_infigraph")
 }
 
 /// A project with one source file and one document, and a scratch `HOME`
@@ -42,7 +40,7 @@ fn project() -> (tempfile::TempDir, tempfile::TempDir) {
 /// Run one CLI command. `INFIGRAPH_NO_WATCH` keeps the pre-dispatch
 /// auto-watch from starting a daemon the test did not ask for.
 fn run(root: &Path, home: &Path, backend: &str, args: &[&str]) -> Output {
-    Command::new(cli())
+    support::infigraph()
         .args(args)
         .current_dir(root)
         .env("HOME", home)
@@ -86,7 +84,7 @@ fn start_daemon(root: &Path, home: &Path) -> Daemon {
     );
     assert_ok(&bootstrap, "bootstrap index");
     let daemon = Daemon(
-        Command::new(cli())
+        support::infigraph()
             .args(["daemon", "--debounce", "50"])
             .current_dir(root)
             .env("HOME", home)

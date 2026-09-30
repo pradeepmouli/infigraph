@@ -112,6 +112,16 @@ fn cli_binary() -> PathBuf {
     .expect("infigraph CLI binary must already be built (shared target dir)")
 }
 
+/// The CLI under test with implicit SCIP enrichment off: `infigraph index`
+/// otherwise leaves a detached `scip-enrich` child running after it returns,
+/// which would hold `index.lock` and keep writing into the tempdir this test
+/// is about to delete. The env name comes from the settings definition.
+fn cli_command() -> Command {
+    let mut command = Command::new(cli_binary());
+    command.env(infigraph_core::scip_switch::enabled_env_name(), "0");
+    command
+}
+
 /// Bootstrap-index `project_dir` directly (BackendKind::Kuzu, no daemon
 /// involved, so `.infigraph/` exists), then start a real detached
 /// `infigraph daemon` against it and wait until it holds `watch.lock`.
@@ -122,8 +132,6 @@ fn start_real_daemon(project_dir: &Path) -> KillOnDrop {
 
 /// The indexing half of `start_real_daemon`.
 fn bootstrap_index(project_dir: &Path) {
-    let cli = cli_binary();
-
     // INFIGRAPH_NO_WATCH: plain `index` triggers main.rs's pre-dispatch
     // `should_auto_watch` regardless of backend, which opportunistically
     // spawns its own REAL detached watcher via the same
@@ -132,7 +140,7 @@ fn bootstrap_index(project_dir: &Path) {
     // unmanaged daemon process from this bootstrap step alone, entirely
     // separate from (and not cleaned up by) the KillOnDrop guard around
     // the daemon spawned further down. Root cause of pradeepmouli/infigraph#133.
-    let status = Command::new(&cli)
+    let status = cli_command()
         .arg("index")
         .current_dir(project_dir)
         .env(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND)
@@ -146,7 +154,7 @@ fn bootstrap_index(project_dir: &Path) {
 /// indexed.
 fn spawn_real_daemon(project_dir: &Path) -> KillOnDrop {
     let daemon = KillOnDrop(
-        Command::new(cli_binary())
+        cli_command()
             .arg("daemon")
             .current_dir(project_dir)
             .env(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND)
@@ -247,7 +255,7 @@ fn run_cli_index(project_dir: &Path, extra_env: &[(&str, &str)]) -> String {
     let log_path = project_dir.join(".infigraph").join("test-cli-index.log");
     let log = std::fs::File::create(&log_path).unwrap();
 
-    let mut cmd = Command::new(cli_binary());
+    let mut cmd = cli_command();
     cmd.arg("index")
         .current_dir(project_dir)
         .env("INFIGRAPH_BACKEND", "daemon")
@@ -574,12 +582,11 @@ fn ad_hoc_index_request_racing_the_watchers_own_debounce_does_not_duplicate_key(
 
     // Bootstrap: one file already indexed before the race file appears,
     // matching the live repro's setup.
-    let bootstrap = std::process::Command::new(cli_binary())
+    let bootstrap = cli_command()
         .arg("--root")
         .arg(project.path())
         .arg("index")
         .arg("--no-embed")
-        .env(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND)
         .status()
         .unwrap();
     assert!(bootstrap.success());
@@ -593,7 +600,7 @@ fn ad_hoc_index_request_racing_the_watchers_own_debounce_does_not_duplicate_key(
     )
     .unwrap();
 
-    let output = std::process::Command::new(cli_binary())
+    let output = cli_command()
         .arg("--root")
         .arg(project.path())
         .arg("index")
@@ -800,8 +807,6 @@ fn a_queued_request_racing_a_full_reindex_gets_a_superseded_reply_not_a_hang() {
     // a hang.
     std::fs::write(project.path().join("b.py"), "def b():\n    pass\n").unwrap();
 
-    let cli = cli_binary();
-
     // Capture each child's output to FILES rather than inheriting stdio.
     //
     // Both children used to inherit, and the code below then called
@@ -822,7 +827,7 @@ fn a_queued_request_racing_a_full_reindex_gets_a_superseded_reply_not_a_hang() {
     let capture =
         |name: &str| std::process::Stdio::from(std::fs::File::create(out_path(name)).unwrap());
 
-    let mut index_child = std::process::Command::new(&cli)
+    let mut index_child = cli_command()
         .arg("index")
         .arg("--no-embed")
         .current_dir(project.path())
@@ -833,7 +838,7 @@ fn a_queued_request_racing_a_full_reindex_gets_a_superseded_reply_not_a_hang() {
         .spawn()
         .unwrap();
 
-    let mut full_child = std::process::Command::new(&cli)
+    let mut full_child = cli_command()
         .arg("index")
         .arg("--full")
         .arg("--no-embed")
@@ -923,9 +928,8 @@ fn a_read_during_full_reindex_sees_the_old_graph_not_an_error() {
     }
 
     let mut daemon = start_real_daemon(project.path());
-    let cli = cli_binary();
 
-    let mut full = std::process::Command::new(&cli)
+    let mut full = cli_command()
         .arg("index")
         .arg("--full")
         .arg("--no-embed")
@@ -1003,8 +1007,7 @@ fn a_failed_rebuild_leaves_the_live_graph_untouched() {
         std::fs::set_permissions(&unreadable_dir, std::fs::Permissions::from_mode(0o000)).unwrap();
     }
 
-    let cli = cli_binary();
-    let mut child = std::process::Command::new(&cli)
+    let mut child = cli_command()
         .arg("index")
         .arg("--full")
         .arg("--no-embed")
@@ -1080,8 +1083,7 @@ fn full_reindex_with_no_daemon_fails_fast_instead_of_polling_for_ten_minutes() {
     // Bootstrap a `.infigraph/` locally so the failure under test is
     // genuinely "no daemon", not "no project". INFIGRAPH_NO_WATCH: plain,
     // unrelated setup -- must not opportunistically spawn its own watcher.
-    let cli = cli_binary();
-    let status = Command::new(&cli)
+    let status = cli_command()
         .arg("index")
         .current_dir(project.path())
         .env(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND)
@@ -1108,7 +1110,7 @@ fn full_reindex_with_no_daemon_fails_fast_instead_of_polling_for_ten_minutes() {
     // locally every time, miscategorized as "flaky" rather than
     // environment-dependent.
     let start = std::time::Instant::now();
-    let mut child = Command::new(&cli)
+    let mut child = cli_command()
         .arg("index")
         .arg("--full")
         .current_dir(project.path())
@@ -1189,7 +1191,7 @@ fn plain_index_on_a_never_indexed_project_bootstraps_under_daemon_backend() {
     const FAIL_FAST_BUDGET: Duration = Duration::from_secs(30);
 
     let start = std::time::Instant::now();
-    let mut child = Command::new(cli_binary())
+    let mut child = cli_command()
         .arg("index")
         .current_dir(project.path())
         .env("INFIGRAPH_BACKEND", "daemon")
@@ -1247,7 +1249,7 @@ fn plain_index_auto_promotes_to_a_full_rebuild_when_the_graph_is_missing_but_inf
     // second invocation below can't race the bootstrap's own background
     // child for index.lock -- this test is about the auto-promotion logic,
     // not index.lock contention timing.
-    let status = Command::new(cli_binary())
+    let status = cli_command()
         .arg("index")
         .arg("--no-embed")
         .current_dir(project.path())
@@ -1261,7 +1263,7 @@ fn plain_index_auto_promotes_to_a_full_rebuild_when_the_graph_is_missing_but_inf
 
     std::fs::remove_file(project.path().join(".infigraph").join("graph")).unwrap();
 
-    let output = Command::new(cli_binary())
+    let output = cli_command()
         .arg("index")
         .arg("--no-embed")
         .current_dir(project.path())
@@ -1330,7 +1332,7 @@ fn opportunistic_daemon_spawn_writes_a_start_banner_naming_its_pid_to_daemon_log
     // ensure_daemon_running call below ever runs, making the `Spawned`
     // assertion flaky (it would see `AlreadyRunning` instead) and leaking
     // an extra, unmanaged daemon this test never tracks or kills.
-    let status = Command::new(cli_binary())
+    let status = cli_command()
         .arg("index")
         .arg("--no-embed")
         .current_dir(project.path())
@@ -1406,8 +1408,7 @@ fn plain_index_ignores_no_watch_opt_out_for_the_required_backend_daemon() {
     // should not opportunistically spawn its own watcher via main.rs's
     // pre-dispatch should_auto_watch -- that's the mechanism under test
     // below, deliberately, only for the *second* command.
-    let cli = cli_binary();
-    let status = Command::new(&cli)
+    let status = cli_command()
         .arg("index")
         .current_dir(project.path())
         .env(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND)
@@ -1422,7 +1423,7 @@ fn plain_index_ignores_no_watch_opt_out_for_the_required_backend_daemon() {
     )
     .unwrap();
 
-    let output = Command::new(&cli)
+    let output = cli_command()
         .arg("index")
         .current_dir(project.path())
         .env("INFIGRAPH_BACKEND", "daemon")

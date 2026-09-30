@@ -6,7 +6,7 @@
 //! remediation text ("run `infigraph index <path>` to re-register it")
 //! silently does nothing.
 
-use std::process::Command;
+mod support;
 
 #[test]
 fn index_registers_repo_in_local_registry() {
@@ -17,7 +17,7 @@ fn index_registers_repo_in_local_registry() {
     std::fs::write(project.path().join("hello.py"), "def hello():\n    pass\n")
         .expect("failed to write fixture file");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_infigraph"))
+    let output = support::infigraph()
         .arg("--root")
         .arg(project.path())
         .arg("index")
@@ -74,7 +74,7 @@ struct StopDaemonOnDrop {
 
 impl Drop for StopDaemonOnDrop {
     fn drop(&mut self) {
-        let _ = Command::new(env!("CARGO_BIN_EXE_infigraph"))
+        let _ = support::infigraph()
             .arg("--root")
             .arg(&self.root)
             .arg("daemon-stop")
@@ -103,7 +103,7 @@ fn daemon_routed_full_index_registers_repo_in_local_registry() {
     // is gone (a pruned registry.json) and whose next rebuild goes through
     // the daemon. A plain local index first so `.infigraph/` exists, then
     // drop the registry it just wrote.
-    let first = Command::new(env!("CARGO_BIN_EXE_infigraph"))
+    let first = support::infigraph()
         .arg("--root")
         .arg(project.path())
         .arg("index")
@@ -122,7 +122,7 @@ fn daemon_routed_full_index_registers_repo_in_local_registry() {
     let registry_path = fake_home.path().join(".infigraph").join("registry.json");
     let _ = std::fs::remove_file(&registry_path);
 
-    let output = Command::new(env!("CARGO_BIN_EXE_infigraph"))
+    let output = support::infigraph()
         .arg("--root")
         .arg(project.path())
         .arg("index")
