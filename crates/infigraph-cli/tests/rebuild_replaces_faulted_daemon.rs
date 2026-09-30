@@ -3,15 +3,13 @@
 //! under the running daemon's own identity (read from its `watch.lock`), the
 //! same record the daemon writes when its drains hit ENOSPC.
 
+mod support;
+
 use std::path::Path;
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
 use infigraph_core::daemon::fault::{fault_path, DaemonFault, FaultClass};
-
-fn cli() -> &'static str {
-    env!("CARGO_BIN_EXE_infigraph")
-}
 
 /// A bootstrapped project with a real daemon running against it.
 fn project_with_daemon() -> (tempfile::TempDir, tempfile::TempDir, Child) {
@@ -19,7 +17,7 @@ fn project_with_daemon() -> (tempfile::TempDir, tempfile::TempDir, Child) {
     let home = tempfile::tempdir().unwrap();
     std::fs::write(project.path().join("hello.py"), "def hello():\n    pass\n").unwrap();
 
-    let bootstrap = Command::new(cli())
+    let bootstrap = support::infigraph()
         .arg("index")
         .current_dir(project.path())
         .env("HOME", home.path())
@@ -28,7 +26,7 @@ fn project_with_daemon() -> (tempfile::TempDir, tempfile::TempDir, Child) {
         .unwrap();
     assert!(bootstrap.success(), "bootstrap index must succeed");
 
-    let mut daemon = Command::new(cli())
+    let mut daemon = support::infigraph()
         .arg("daemon")
         .current_dir(project.path())
         .env("HOME", home.path())
@@ -73,7 +71,7 @@ fn plant_fault(project: &Path, class: FaultClass) {
 }
 
 fn rebuild(project: &Path, home: &Path) -> std::process::Output {
-    Command::new(cli())
+    support::infigraph()
         .args(["rebuild", "--no-embed"])
         .current_dir(project)
         .env("HOME", home)

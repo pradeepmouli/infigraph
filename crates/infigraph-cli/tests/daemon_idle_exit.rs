@@ -1,6 +1,8 @@
 //! #38/#124: a real `infigraph daemon` exits once nobody holds a lease on it
 //! and nothing has touched it for its idle grace -- and not before.
 
+mod support;
+
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -24,16 +26,6 @@ fn wait_until_gone(what: &str, mut still_alive: impl FnMut() -> bool) -> Option<
         }
         std::thread::sleep(STEP);
     }
-}
-
-fn cli_binary() -> std::path::PathBuf {
-    let exe = std::env::current_exe().unwrap();
-    let deps_dir = exe.parent().unwrap();
-    let candidate = deps_dir.join("infigraph");
-    if candidate.exists() {
-        return candidate;
-    }
-    deps_dir.parent().unwrap().join("infigraph")
 }
 
 /// Kills and reaps the daemon on drop, so a failing assertion never leaves a
@@ -67,21 +59,26 @@ fn indexed_project() -> tempfile::TempDir {
         .unwrap();
     std::fs::create_dir_all(dir.path().join(".git")).unwrap();
     std::fs::write(dir.path().join("a.py"), "def a():\n    pass\n").unwrap();
-    let st = Command::new(cli_binary())
+    let out = support::infigraph()
         .arg("index")
         .current_dir(dir.path())
         .env("INFIGRAPH_BACKEND", "kuzu")
         .env("INFIGRAPH_NO_WATCH", "1")
         .env_remove("INFIGRAPH_WATCH_DAEMON")
-        .stdout(Stdio::null())
-        .status()
+        .output()
         .unwrap();
-    assert!(st.success(), "indexing the fixture failed");
+    assert!(
+        out.status.success(),
+        "indexing the fixture failed ({}):\nstdout={}\nstderr={}",
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
     dir
 }
 
 fn spawn_daemon(root: &std::path::Path, grace: &str) -> KillOnDrop {
-    let child = Command::new(cli_binary())
+    let child = support::infigraph()
         .args(["daemon", "--debounce", "50"])
         .current_dir(root)
         .env_remove("INFIGRAPH_WATCH_DAEMON")
@@ -234,7 +231,7 @@ fn a_released_lease_lets_the_daemon_exit_and_the_next_use_respawns_it() {
         std::thread::sleep(Duration::from_millis(100));
     };
     lease::unpin(project.path());
-    let _ = Command::new(cli_binary())
+    let _ = support::infigraph()
         .arg("daemon-stop")
         .current_dir(project.path())
         .stdout(Stdio::null())

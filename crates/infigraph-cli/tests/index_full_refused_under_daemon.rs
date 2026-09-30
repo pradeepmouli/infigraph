@@ -6,7 +6,7 @@
 //! crates/infigraph-core/tests/daemon_kuzu_e2e.rs (this file only checks
 //! the CLI-level success/failure contract, not the daemon internals).
 
-use std::process::Command;
+mod support;
 
 #[test]
 fn full_reindex_succeeds_under_daemon_backend_with_a_real_running_daemon() {
@@ -16,11 +16,9 @@ fn full_reindex_succeeds_under_daemon_backend_with_a_real_running_daemon() {
     std::fs::write(project.path().join("hello.py"), "def hello():\n    pass\n")
         .expect("failed to write fixture file");
 
-    let cli = env!("CARGO_BIN_EXE_infigraph");
-
     // Bootstrap-index locally first (no daemon involved yet), matching the
     // established pattern in crates/infigraph-core/tests/daemon_kuzu_e2e.rs.
-    let bootstrap = Command::new(cli)
+    let bootstrap = support::infigraph()
         .arg("index")
         .current_dir(project.path())
         .env("HOME", fake_home.path())
@@ -30,7 +28,7 @@ fn full_reindex_succeeds_under_daemon_backend_with_a_real_running_daemon() {
     assert!(bootstrap.success(), "bootstrap index must succeed");
 
     // Start a real daemon against the project.
-    let mut daemon = Command::new(cli)
+    let mut daemon = support::infigraph()
         .arg("daemon")
         .current_dir(project.path())
         .env("HOME", fake_home.path())
@@ -51,7 +49,7 @@ fn full_reindex_succeeds_under_daemon_backend_with_a_real_running_daemon() {
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
 
-    let output = Command::new(cli)
+    let output = support::infigraph()
         .arg("index")
         .arg("--full")
         .arg("--no-embed")

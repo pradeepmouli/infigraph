@@ -451,28 +451,62 @@ pub struct OrphanedDaemon {
 /// cwd) -- the same "don't trust a bare identity match" discipline
 /// `prune_stale_daemon` documents for its own PID-reuse guard.
 pub fn find_orphaned_daemons() -> Vec<OrphanedDaemon> {
-    let mut sys = sysinfo::System::new();
-    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+    scan_live_processes(|pid, name, cmd, cwd| {
+        is_orphaned_daemon(name, cmd, cwd).then(|| OrphanedDaemon {
+            pid,
+            // Checked non-None by `is_orphaned_daemon` just above.
+            cwd: cwd
+                .expect("cwd checked by is_orphaned_daemon")
+                .to_path_buf(),
+        })
+    })
+}
 
-    let mut orphans = Vec::new();
+/// The one scan of live processes that both finders run: each process's pid,
+/// name, argv and OS-reported cwd go to `pick`, and whatever it returns is
+/// collected. Name and argv are the identity signals; see
+/// [`is_infigraph_running`].
+fn scan_live_processes<T>(
+    mut pick: impl FnMut(u32, &str, &[String], Option<&Path>) -> Option<T>,
+) -> Vec<T> {
+    let mut sys = sysinfo::System::new();
+    // Argv and cwd are the identity signals, and `sysinfo` loads neither
+    // unless asked: a plain `refresh_processes` leaves every command line
+    // empty, which matched nothing, silently.
+    sys.refresh_processes_specifics(
+        sysinfo::ProcessesToUpdate::All,
+        true,
+        sysinfo::ProcessRefreshKind::nothing()
+            .with_cmd(sysinfo::UpdateKind::Always)
+            .with_cwd(sysinfo::UpdateKind::Always),
+    );
+
+    let mut found = Vec::new();
     for (pid, proc) in sys.processes() {
         let cmd: Vec<String> = proc
             .cmd()
             .iter()
             .map(|a| a.to_string_lossy().into_owned())
             .collect();
-        if is_orphaned_daemon(&proc.name().to_string_lossy(), &cmd, proc.cwd()) {
-            orphans.push(OrphanedDaemon {
-                pid: pid.as_u32(),
-                // Checked non-None by `is_orphaned_daemon` just above.
-                cwd: proc
-                    .cwd()
-                    .expect("cwd checked by is_orphaned_daemon")
-                    .to_path_buf(),
-            });
+        if let Some(item) = pick(
+            pid.as_u32(),
+            &proc.name().to_string_lossy(),
+            &cmd,
+            proc.cwd(),
+        ) {
+            found.push(item);
         }
     }
-    orphans
+    found
+}
+
+/// Whether a process is an `infigraph <subcommand>`: the binary is named
+/// `infigraph`, and `subcommand` is one of its own argv entries. The identity
+/// half of every decision that has to find a process by what it is rather
+/// than by a file on disk.
+fn is_infigraph_running(proc_name: &str, cmd: &[String], subcommand: &str) -> bool {
+    let lower = proc_name.to_ascii_lowercase();
+    (lower == "infigraph" || lower == "infigraph.exe") && cmd.iter().any(|a| a == subcommand)
 }
 
 /// The three-signal decision `find_orphaned_daemons` applies to each live
@@ -481,19 +515,169 @@ pub fn find_orphaned_daemons() -> Vec<OrphanedDaemon> {
 /// already-observed facts (rather than inline in the `sysinfo` loop above)
 /// so it's directly unit-testable without spawning a real process.
 fn is_orphaned_daemon(proc_name: &str, cmd: &[String], cwd: Option<&Path>) -> bool {
-    let looks_like_infigraph = {
-        let lower = proc_name.to_ascii_lowercase();
-        lower == "infigraph" || lower == "infigraph.exe"
-    };
-    if !looks_like_infigraph {
-        return false;
-    }
-    if !cmd.iter().any(|a| a == "daemon") {
+    if !is_infigraph_running(proc_name, cmd, "daemon") {
         return false;
     }
     match cwd {
         Some(cwd) => !cwd.exists(),
         None => false,
+    }
+}
+
+/// Whether a live process is `infigraph <subcommand>` running for `root`: the
+/// same name-and-argv identity as [`is_orphaned_daemon`], and a cwd that is
+/// `root`. `index` spawns `scip-enrich`, and `ensure_daemon_running` a
+/// daemon, with `current_dir(root)`, so the OS-reported cwd names the root
+/// even after the directory is gone (which is what lets `worktree teardown`
+/// find them then) and even after the files a daemon is normally found by
+/// (`watch.lock`, its socket) have been unlinked. Both sides go through
+/// `canonicalize_lenient`, since the OS reports a resolved path and a removed
+/// directory cannot be canonicalized whole.
+fn subcommand_belongs_to(
+    proc_name: &str,
+    cmd: &[String],
+    cwd: Option<&Path>,
+    root: &Path,
+    subcommand: &str,
+) -> bool {
+    if !is_infigraph_running(proc_name, cmd, subcommand) {
+        return false;
+    }
+    cwd.is_some_and(|cwd| {
+        crate::project::canonicalize_lenient(cwd) == crate::project::canonicalize_lenient(root)
+    })
+}
+
+/// Every live `infigraph <subcommand>` running for `root`.
+fn find_subcommand_for(root: &Path, subcommand: &str) -> Vec<u32> {
+    scan_live_processes(|pid, name, cmd, cwd| {
+        subcommand_belongs_to(name, cmd, cwd, root, subcommand).then_some(pid)
+    })
+}
+
+/// Every live `infigraph daemon` running for `root`, found by what it is
+/// rather than by the lock or socket files it normally answers through.
+pub fn find_daemons_for(root: &Path) -> Vec<u32> {
+    find_subcommand_for(root, "daemon")
+}
+
+/// The subset of `pids` that are still running AND still an `infigraph
+/// daemon` (zombies do not count). Candidate pids are collected before a
+/// stop request and then waited on for seconds, so "some process has this
+/// pid" is not enough to signal it: the pid may have been reused, or a stale
+/// lock payload may name a process that was never this root's daemon. The
+/// cwd is deliberately not compared -- a daemon started by hand with
+/// `--path` runs elsewhere.
+pub fn live_daemons(pids: &[u32]) -> Vec<u32> {
+    let named = scan_live_processes(|pid, name, cmd, _cwd| {
+        (pids.contains(&pid) && is_infigraph_running(name, cmd, "daemon")).then_some(pid)
+    });
+    let mut sys = sysinfo::System::new();
+    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+    named
+        .into_iter()
+        .filter(|pid| crate::ps::running_process(&sys, sysinfo::Pid::from_u32(*pid)).is_some())
+        .collect()
+}
+
+/// SIGTERM every pid in `pids` that is still an `infigraph daemon` (the
+/// graceful path [`kill_orphaned_daemon`] documents), wait up to `budget`,
+/// and return those still running as one. Identity is re-checked before the
+/// signal and on every pass, so a pid that has gone and been reused is
+/// neither signalled nor reported as a survivor.
+pub fn terminate_and_wait(pids: &[u32], budget: std::time::Duration) -> Vec<u32> {
+    let mut alive = live_daemons(pids);
+    for pid in &alive {
+        kill_orphaned_daemon(*pid);
+    }
+    let deadline = std::time::Instant::now() + budget;
+    while !alive.is_empty() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        alive = live_daemons(&alive);
+    }
+    alive
+}
+
+/// Every live detached `infigraph scip-enrich` running for `root`.
+pub fn find_scip_enrich_for(root: &Path) -> Vec<u32> {
+    find_subcommand_for(root, "scip-enrich")
+}
+
+/// Stop every detached `scip-enrich` running for `root`, with everything it
+/// started, and wait up to `wait` for them all to be gone. Returns the pids
+/// of the `scip-enrich` processes it found.
+///
+/// `index` leaves the child running after it returns, and it keeps writing
+/// into `.infigraph/` -- which makes a `git worktree remove` fail half-done
+/// ("Directory not empty"). The worktree hook calls this before the remove
+/// (`daemon-stop --wait`) and again after it (`worktree teardown`).
+///
+/// SIGKILL of the process group, like [`kill_process_group`] is used for
+/// everywhere else (R2.5.1): the child installs no handler, and its
+/// `kill_on_drop` indexers only die on a drop that a signal never runs, so a
+/// gentler signal would be the same kill. It does not clean up its run-unique
+/// scratch files when killed; the next enrichment reclaims them
+/// (`reclaim_dead_scip_runs`), and a torn-down worktree's are gone with it.
+///
+/// `index` spawns the child as its own group leader, so the group reaches the
+/// indexers and their own children (`rust-analyzer` starts `cargo metadata`).
+/// A child spawned by an older binary did not lead a group, so every
+/// descendant found through parent links is signalled individually as well.
+pub fn stop_scip_enrich(root: &Path, wait: std::time::Duration) -> Vec<u32> {
+    #[cfg(unix)]
+    {
+        let found = find_scip_enrich_for(root);
+        if found.is_empty() {
+            return found;
+        }
+        let mut sys = sysinfo::System::new();
+        sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+
+        let mut doomed: Vec<u32> = Vec::new();
+        for pid in &found {
+            doomed.push(*pid);
+            let mut frontier = vec![*pid];
+            while let Some(parent) = frontier.pop() {
+                for (child, proc) in sys.processes() {
+                    if proc.parent().map(|p| p.as_u32()) == Some(parent)
+                        && !doomed.contains(&child.as_u32())
+                    {
+                        doomed.push(child.as_u32());
+                        frontier.push(child.as_u32());
+                    }
+                }
+            }
+        }
+        for pid in &found {
+            kill_process_group(*pid);
+        }
+        for pid in &doomed {
+            if *pid > 1 && *pid != std::process::id() {
+                // SAFETY: a positive pid that is neither reserved nor ours;
+                // one that has already gone fails with ESRCH, a no-op.
+                unsafe {
+                    libc::kill(*pid as libc::pid_t, libc::SIGKILL);
+                }
+            }
+        }
+
+        let deadline = std::time::Instant::now() + wait;
+        loop {
+            sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+            let any_alive = doomed.iter().any(|pid| {
+                crate::ps::running_process(&sys, sysinfo::Pid::from_u32(*pid)).is_some()
+            });
+            if !any_alive || std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        found
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (root, wait);
+        Vec::new()
     }
 }
 
@@ -1252,6 +1436,152 @@ mod tests {
             contents, "previous daemon's output\n",
             "opening the log for a new spawn attempt must not truncate prior content"
         );
+    }
+
+    /// The pure decisions tested below are only as good as the facts they are fed.
+    /// `sysinfo` does not load a process's argv or cwd unless asked to, and
+    /// the scan once did not ask -- so both finders saw every live process
+    /// with an empty command line and no cwd, and matched nothing, while
+    /// their synthetic-fact tests passed. This scans a real process: this one.
+    #[test]
+    fn the_live_scan_reports_a_processs_argv_and_cwd() {
+        let me = std::process::id();
+        let seen = super::scan_live_processes(|pid, _name, cmd, cwd| {
+            (pid == me).then(|| (cmd.to_vec(), cwd.map(|c| c.to_path_buf())))
+        });
+        let (cmd, cwd) = seen
+            .into_iter()
+            .next()
+            .expect("the scan never saw this process");
+        assert!(!cmd.is_empty(), "the scan saw no argv for a live process");
+        assert_eq!(
+            cwd.map(|c| crate::project::canonicalize_lenient(&c)),
+            Some(crate::project::canonicalize_lenient(
+                &std::env::current_dir().unwrap()
+            ))
+        );
+    }
+
+    /// A candidate pid that is alive but is not an `infigraph daemon` (a
+    /// reused pid, a stale lock payload) must be neither signalled nor
+    /// reported as a survivor.
+    #[cfg(unix)]
+    #[test]
+    fn a_live_process_that_is_not_a_daemon_is_left_alone() {
+        let mut other = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = other.id();
+        assert!(super::live_daemons(&[pid]).is_empty());
+        let survivors = super::terminate_and_wait(&[pid], std::time::Duration::from_millis(300));
+        assert!(survivors.is_empty(), "reported as a daemon survivor");
+        assert!(
+            other.try_wait().unwrap().is_none(),
+            "an unrelated process was signalled"
+        );
+        let _ = other.kill();
+        let _ = other.wait();
+    }
+
+    /// `subcommand_belongs_to` is the pure decision `find_scip_enrich_for` and
+    /// `find_daemons_for` apply per live process, built on the same
+    /// name-and-argv predicate as `is_orphaned_daemon`: `index` spawns
+    /// `scip-enrich` (and `ensure_daemon_running` the daemon) with
+    /// `current_dir(root)`, so the OS-reported cwd names the root even after
+    /// the directory is gone.
+    mod subcommand_belongs_to_tests {
+        use super::super::subcommand_belongs_to;
+        use std::path::Path;
+
+        fn scip_enrich_belongs_to(
+            name: &str,
+            cmd: &[String],
+            cwd: Option<&Path>,
+            root: &Path,
+        ) -> bool {
+            subcommand_belongs_to(name, cmd, cwd, root, "scip-enrich")
+        }
+
+        #[test]
+        fn a_daemon_is_found_by_the_same_rule() {
+            let tmp = tempfile::tempdir().unwrap();
+            let daemon = argv("daemon");
+            assert!(subcommand_belongs_to(
+                "infigraph",
+                &daemon,
+                Some(tmp.path()),
+                tmp.path(),
+                "daemon"
+            ));
+            assert!(!scip_enrich_belongs_to(
+                "infigraph",
+                &daemon,
+                Some(tmp.path()),
+                tmp.path()
+            ));
+        }
+
+        fn argv(sub: &str) -> Vec<String> {
+            vec!["/usr/local/bin/infigraph".to_string(), sub.to_string()]
+        }
+
+        #[test]
+        fn matches_a_scip_enrich_running_in_the_root() {
+            let tmp = tempfile::tempdir().unwrap();
+            assert!(scip_enrich_belongs_to(
+                "infigraph",
+                &argv("scip-enrich"),
+                Some(tmp.path()),
+                tmp.path()
+            ));
+        }
+
+        #[test]
+        fn matches_after_the_directory_is_gone() {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().join("wt");
+            std::fs::create_dir_all(&root).unwrap();
+            let cwd = root.canonicalize().unwrap();
+            std::fs::remove_dir_all(&root).unwrap();
+            assert!(scip_enrich_belongs_to(
+                "infigraph",
+                &argv("scip-enrich"),
+                Some(&cwd),
+                &root
+            ));
+        }
+
+        #[test]
+        fn leaves_another_roots_enrichment_alone() {
+            let a = tempfile::tempdir().unwrap();
+            let b = tempfile::tempdir().unwrap();
+            assert!(!scip_enrich_belongs_to(
+                "infigraph",
+                &argv("scip-enrich"),
+                Some(a.path()),
+                b.path()
+            ));
+        }
+
+        #[test]
+        fn is_not_fooled_by_another_subcommand_or_binary() {
+            let tmp = tempfile::tempdir().unwrap();
+            for (name, sub) in [("infigraph", "daemon"), ("python3", "scip-enrich")] {
+                assert!(!scip_enrich_belongs_to(
+                    name,
+                    &argv(sub),
+                    Some(tmp.path()),
+                    tmp.path()
+                ));
+            }
+            assert!(!scip_enrich_belongs_to(
+                "infigraph",
+                &argv("scip-enrich"),
+                None::<&Path>,
+                tmp.path()
+            ));
+        }
     }
 
     /// `is_orphaned_daemon` is the pure decision `find_orphaned_daemons`

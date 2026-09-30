@@ -2,8 +2,10 @@
 //! once nothing is in flight, saying why; the next request starts a fresh
 //! one. A thread ceiling of 1 is breached by any process.
 
+mod support;
+
 use std::io::Read;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 #[test]
@@ -11,9 +13,8 @@ fn a_daemon_over_its_hard_ceiling_shuts_down_and_says_why() {
     let project = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
     std::fs::write(project.path().join("hello.py"), "def hello():\n    pass\n").unwrap();
-    let cli = env!("CARGO_BIN_EXE_infigraph");
 
-    let bootstrap = Command::new(cli)
+    let bootstrap = support::infigraph()
         .arg("index")
         .current_dir(project.path())
         .env("HOME", home.path())
@@ -22,7 +23,7 @@ fn a_daemon_over_its_hard_ceiling_shuts_down_and_says_why() {
         .unwrap();
     assert!(bootstrap.success(), "bootstrap index must succeed");
 
-    let mut daemon = Command::new(cli)
+    let mut daemon = support::infigraph()
         .arg("daemon")
         .current_dir(project.path())
         .env("HOME", home.path())

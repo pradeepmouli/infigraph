@@ -9,7 +9,7 @@
 //! state, not an actionable failure — it must stay silent (matching the
 //! pre-daemon-primitive behavior), not surface as a "Failed" message.
 
-use std::process::Command;
+mod support;
 
 #[test]
 fn first_ever_index_on_fresh_project_does_not_print_watcher_failure() {
@@ -23,7 +23,7 @@ fn first_ever_index_on_fresh_project_does_not_print_watcher_failure() {
     std::fs::write(tmp.path().join("hello.py"), "def hello():\n    pass\n")
         .expect("failed to write fixture file");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_infigraph"))
+    let output = support::infigraph()
         .arg("--root")
         .arg(tmp.path())
         .arg("index")

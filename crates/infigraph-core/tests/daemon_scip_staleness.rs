@@ -48,6 +48,46 @@ fn stale_project() -> tempfile::TempDir {
     project_dir
 }
 
+type Calls = Arc<Mutex<Vec<infigraph_core::daemon::ScipEnrichJob>>>;
+
+/// Runs the write coordinator on `root` in its own thread, with a fake
+/// `on_full_reindex` that only records what it was asked to enrich.
+fn start_coordinator(
+    root: &std::path::Path,
+    calls: &Calls,
+) -> (
+    mpsc::Sender<()>,
+    std::thread::JoinHandle<anyhow::Result<()>>,
+) {
+    let calls_for_cb = Arc::clone(calls);
+    let on_full_reindex: Arc<infigraph_core::daemon::FullReindexCallback> =
+        Arc::new(move |_root, job, _token, _submit| {
+            calls_for_cb.lock().unwrap().push(job);
+        });
+
+    let (stop_tx, stop_rx) = mpsc::channel();
+    let daemon_token = tokio_util::sync::CancellationToken::new();
+    let root = root.to_path_buf();
+
+    let handle = std::thread::spawn(move || {
+        infigraph_core::daemon::run_write_coordinator(
+            &root,
+            || Ok(infigraph_languages::bundled_registry().unwrap()),
+            50,
+            stop_rx,
+            |_evt| {},
+            0,
+            None::<fn(&infigraph_core::IndexResult)>,
+            true,
+            Some(on_full_reindex),
+            &daemon_token,
+            None,
+            None,
+        )
+    });
+    (stop_tx, handle)
+}
+
 #[test]
 fn coordinator_triggers_scip_enrichment_once_when_staleness_exceeds_threshold() {
     let project_dir = stale_project();
@@ -69,35 +109,8 @@ fn coordinator_triggers_scip_enrichment_once_when_staleness_exceeds_threshold() 
     std::env::set_var("INFIGRAPH_SCIP_INDEX_STALENESS_THRESHOLD", "2");
     std::env::set_var("INFIGRAPH_SCIP_INDEX_STALENESS_CHECK_SECS", "1");
 
-    let calls: Arc<Mutex<Vec<infigraph_core::daemon::ScipEnrichJob>>> =
-        Arc::new(Mutex::new(Vec::new()));
-    let calls_for_cb = Arc::clone(&calls);
-    let on_full_reindex: Arc<infigraph_core::daemon::FullReindexCallback> =
-        Arc::new(move |_root, job, _token, _submit| {
-            calls_for_cb.lock().unwrap().push(job);
-        });
-
-    let (stop_tx, stop_rx) = mpsc::channel();
-    let daemon_token = tokio_util::sync::CancellationToken::new();
-    let token_for_thread = daemon_token.clone();
-    let root = project_dir.path().to_path_buf();
-
-    let handle = std::thread::spawn(move || {
-        infigraph_core::daemon::run_write_coordinator(
-            &root,
-            || Ok(infigraph_languages::bundled_registry().unwrap()),
-            50,
-            stop_rx,
-            |_evt| {},
-            0,
-            None::<fn(&infigraph_core::IndexResult)>,
-            true,
-            Some(on_full_reindex),
-            &token_for_thread,
-            None,
-            None,
-        )
-    });
+    let calls: Calls = Arc::new(Mutex::new(Vec::new()));
+    let (stop_tx, handle) = start_coordinator(project_dir.path(), &calls);
 
     // The coordinator builds the full language registry before its loop
     // starts (seconds in a debug build), and the check then waits out one
@@ -143,4 +156,46 @@ fn coordinator_triggers_scip_enrichment_once_when_staleness_exceeds_threshold() 
 
     std::env::remove_var("INFIGRAPH_SCIP_INDEX_STALENESS_THRESHOLD");
     std::env::remove_var("INFIGRAPH_SCIP_INDEX_STALENESS_CHECK_SECS");
+}
+
+/// `[scip] enabled = false`: the same drifted graph, the same coordinator,
+/// and no enrichment request at all. The positive test above sees its
+/// request within 20s, so waiting out 10s here is a real absence, not a
+/// coordinator that never got going.
+#[test]
+fn coordinator_does_not_trigger_scip_enrichment_when_scip_is_off() {
+    let project_dir = stale_project();
+    infigraph_core::settings_file::set_project_setting(
+        project_dir.path(),
+        "scip",
+        "enabled",
+        toml_edit::value(false),
+    )
+    .unwrap();
+
+    std::env::set_var("INFIGRAPH_SCIP_INDEX_STALENESS_THRESHOLD", "2");
+    std::env::set_var("INFIGRAPH_SCIP_INDEX_STALENESS_CHECK_SECS", "1");
+
+    let calls: Calls = Arc::new(Mutex::new(Vec::new()));
+    let (stop_tx, handle) = start_coordinator(project_dir.path(), &calls);
+
+    let until = std::time::Instant::now() + Duration::from_secs(10);
+    while std::time::Instant::now() < until {
+        assert!(!handle.is_finished(), "coordinator exited early");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let recorded = calls.lock().unwrap().len();
+
+    stop_tx.send(()).unwrap();
+    handle
+        .join()
+        .unwrap()
+        .expect("coordinator loop returned an error instead of a clean shutdown");
+    std::env::remove_var("INFIGRAPH_SCIP_INDEX_STALENESS_THRESHOLD");
+    std::env::remove_var("INFIGRAPH_SCIP_INDEX_STALENESS_CHECK_SECS");
+
+    assert_eq!(
+        recorded, 0,
+        "enrichment was requested with [scip] enabled = false"
+    );
 }

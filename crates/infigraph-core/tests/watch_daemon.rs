@@ -1228,3 +1228,80 @@ fn submit_in_background(
         )
     })
 }
+
+/// `[scip] enabled = false` holds back the enrichment a successful full
+/// reindex would otherwise schedule (the daemon's post-full-reindex trigger;
+/// the staleness trigger has its own test in `daemon_scip_staleness.rs`).
+/// The sibling above is the positive control: same harness, switch on, and
+/// the callback runs.
+#[test]
+fn full_reindex_schedules_no_scip_enrichment_when_scip_is_off() {
+    let _env = ENV_LOCK.read().unwrap_or_else(|e| e.into_inner());
+    let project = tempfile::Builder::new()
+        .prefix("infigraph-scip-off-test-")
+        .tempdir()
+        .unwrap();
+    std::fs::write(project.path().join("main.py"), "def main():\n    pass\n").unwrap();
+    {
+        let registry = infigraph_languages::bundled_registry().unwrap();
+        let mut boot = infigraph_core::Infigraph::open(project.path(), registry).unwrap();
+        boot.init().unwrap();
+        boot.index().unwrap();
+    }
+    infigraph_core::settings_file::set_project_setting(
+        project.path(),
+        "scip",
+        "enabled",
+        toml_edit::value(false),
+    )
+    .unwrap();
+
+    let scheduled = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let scheduled_for_cb = std::sync::Arc::clone(&scheduled);
+    let on_full_reindex: std::sync::Arc<infigraph_core::daemon::FullReindexCallback> =
+        std::sync::Arc::new(move |_root, _languages, _token, _submit| {
+            scheduled_for_cb.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        });
+
+    let daemon_token = tokio_util::sync::CancellationToken::new();
+    let token_for_thread = daemon_token.clone();
+    let (stop_tx, stop_rx) = std::sync::mpsc::channel();
+    let root = project.path().to_path_buf();
+    let handle = std::thread::spawn(move || {
+        infigraph_core::daemon::run_write_coordinator(
+            &root,
+            || Ok(infigraph_languages::bundled_registry().unwrap()),
+            50,
+            stop_rx,
+            |_evt| {},
+            0,
+            None::<fn(&infigraph_core::IndexResult)>,
+            true,
+            Some(on_full_reindex),
+            &token_for_thread,
+            None,
+            None,
+        )
+    });
+    std::thread::sleep(std::time::Duration::from_millis(300));
+
+    // The reindex has finished -- swap included, which is where the
+    // enrichment is scheduled -- once its reply arrives.
+    let reply = submit_in_background(
+        project.path(),
+        infigraph_core::daemon_protocol::WriteRequest::FullReindex,
+    )
+    .join()
+    .unwrap();
+    assert!(reply.is_ok(), "full reindex failed: {reply:?}");
+    // The scheduling point is reached on the coordinator's next pass.
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    assert_eq!(
+        scheduled.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "enrichment was scheduled although [scip] enabled = false"
+    );
+
+    stop_tx.send(()).unwrap();
+    handle.join().unwrap().unwrap();
+}

@@ -931,6 +931,17 @@ pub(crate) fn cmd_watch_status(root: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Whether a daemon is running for `root`: the lock says so, or -- for one
+/// whose `watch.lock` was unlinked out from under it -- a live
+/// `infigraph daemon` process has `root` as its cwd. A caller that trusted
+/// the lock alone would report "No daemon running" (stop) or start a second
+/// writer beside the first (restart).
+fn daemon_present(root: &Path) -> bool {
+    use infigraph_core::daemon::lifecycle as lc;
+    lc::daemon_is_alive(&root.join(".infigraph").join("watch.lock"))
+        || !lc::find_daemons_for(root).is_empty()
+}
+
 /// Ask `root`'s daemon to stop, then wait up to 10s for its PROCESS to exit,
 /// not merely for the lock to look free. A daemon releases `watch.lock`
 /// while it is still draining in-flight work and closing the graph, so
@@ -940,35 +951,84 @@ pub(crate) fn cmd_watch_status(root: &Path) -> Result<()> {
 /// daemon keeps writing into the directory it is deleting. Errs if the
 /// process has not exited in time.
 pub(crate) fn stop_daemon_and_wait(root: &Path) -> Result<()> {
+    use infigraph_core::daemon::lifecycle as lc;
+    const BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
     let lock_path = root.join(".infigraph").join("watch.lock");
     // Read the holder BEFORE asking it to stop: the lock payload naming it
     // is gone by the time we need it to confirm the exit.
     let holder_pid = infigraph_core::lockfile::read_holder(&lock_path).map(|h| h.pid);
-    // Whatever the stop's outcome, the confirmation below decides whether
-    // the daemon actually went.
+    // The lock and the socket are how a daemon is normally reached and
+    // judged, and both are plain files that a half-finished `git worktree
+    // remove`, a `git clean` or a hand `rm` can take from a live process. So
+    // the process itself -- `infigraph daemon` with this root as its cwd --
+    // is a second witness, taken before anything is asked of it.
+    let mut candidates: Vec<u32> = holder_pid.into_iter().collect();
+    for pid in lc::find_daemons_for(root) {
+        if !candidates.contains(&pid) {
+            candidates.push(pid);
+        }
+    }
+    // Whatever the stop's outcome, the checks below decide whether the
+    // daemon actually went.
     request_daemon_stop(root)?;
-    if infigraph_core::daemon::lifecycle::confirm_daemon_exited(
-        &lock_path,
-        holder_pid,
-        std::time::Duration::from_secs(10),
-    ) {
+    let confirmed = lc::confirm_daemon_exited(&lock_path, holder_pid, BUDGET);
+    // A daemon that took the request but is unreachable never exits on it,
+    // and `confirmed` cannot tell (a missing lock file reads as free):
+    // whatever is still running gets the graceful signal.
+    let still_running = lc::live_daemons(&candidates);
+    let survivors = lc::terminate_and_wait(&still_running, BUDGET);
+    if survivors.is_empty() && (confirmed || !lc::daemon_is_alive(&lock_path)) {
         return Ok(());
     }
-    match holder_pid {
+    match survivors.first().copied().or(holder_pid) {
         Some(pid) => anyhow::bail!(
-            "daemon {pid} did not exit within 10s of a stop request, so it may still hold the \
-             graph. Check `infigraph ps` (which will not list it once it has released \
-             watch.lock) and, if it is still running, `infigraph kill {pid}`, then retry."
+            "daemon {pid} did not exit within 10s of a stop request and a SIGTERM, so it may \
+             still hold the graph. Check `infigraph ps` (which will not list it once it has \
+             released watch.lock) and, if it is still running, `infigraph kill {pid}`, then retry."
         ),
         None => anyhow::bail!("daemon did not exit within 10s of a stop request"),
     }
 }
 
+/// Stop the detached `scip-enrich` still running for `root`, if any, and say
+/// so. `infigraph index` leaves it running after it returns and it keeps
+/// writing into `.infigraph/`, so a `git worktree remove` racing it fails
+/// half-done. The worktree hook reaches this before the remove
+/// (`daemon-stop --wait`) and after it (`worktree teardown`), which works
+/// once the directory is gone because the child is found by its argv and cwd.
+pub(crate) fn stop_scip_enrich_for(root: &Path) {
+    let root = infigraph_core::project::canonicalize_lenient(root);
+    let stopped = infigraph_core::daemon::lifecycle::stop_scip_enrich(
+        &root,
+        std::time::Duration::from_secs(10),
+    );
+    if !stopped.is_empty() {
+        println!(
+            "Stopped {} scip-enrich process(es) for {}.",
+            stopped.len(),
+            root.display()
+        );
+    }
+}
+
 pub(crate) fn cmd_daemon_stop(root: &Path, wait: bool) -> Result<()> {
+    // Before the "no daemon" early return below: a child can outlive, or
+    // exist without, any daemon. And before the daemon stops, since its
+    // imports are routed to the daemon.
+    if wait {
+        stop_scip_enrich_for(root);
+    }
     // The everyday "no daemon running yet" case answers at once rather than
     // going through the control client's startup grace.
     let lock_path = root.join(".infigraph").join("watch.lock");
-    if !infigraph_core::daemon::lifecycle::daemon_is_alive(&lock_path) {
+    // Under `--wait` the lock file is not the last word (see
+    // `daemon_present`); the everyday no-daemon case stays a single probe.
+    let present = if wait {
+        daemon_present(root)
+    } else {
+        infigraph_core::daemon::lifecycle::daemon_is_alive(&lock_path)
+    };
+    if !present {
         println!("No daemon running.");
         return Ok(());
     }
@@ -992,8 +1052,7 @@ pub(crate) fn cmd_daemon_stop(root: &Path, wait: bool) -> Result<()> {
 pub(crate) fn cmd_daemon_restart(root: &Path) -> Result<()> {
     // Same liveness check as cmd_daemon_stop -- if nothing is running,
     // there is nothing to stop-and-wait-for, so skip straight to spawning.
-    let lock_path = root.join(".infigraph").join("watch.lock");
-    if infigraph_core::daemon::lifecycle::daemon_is_alive(&lock_path) {
+    if daemon_present(root) {
         // A daemon can only stop itself (`Control { role: Daemon }` has no
         // real Restart), so stop it and re-spawn from the CLI side, mirroring
         // `ensure_daemon_running`. Refusing to spawn when the old one has

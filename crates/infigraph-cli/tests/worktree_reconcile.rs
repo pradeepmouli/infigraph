@@ -1,3 +1,5 @@
+mod support;
+
 use std::process::Command;
 
 /// Runs a git command, and on failure reports what git actually said.
@@ -27,7 +29,7 @@ fn git(args: &[&str], cwd: &std::path::Path) {
 }
 
 fn run_index(root: &std::path::Path, fake_home: &std::path::Path) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_infigraph"))
+    support::infigraph()
         .args(["--root", root.to_str().unwrap(), "index"])
         .env("HOME", fake_home)
         .env("INFIGRAPH_NO_WATCH", "1")
@@ -40,7 +42,7 @@ fn run_worktree_reconcile(
     cwd: &std::path::Path,
     fake_home: &std::path::Path,
 ) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_infigraph"))
+    support::infigraph()
         .args(["worktree", "reconcile"])
         .current_dir(cwd)
         .env("HOME", fake_home)
@@ -70,7 +72,7 @@ fn remove_worktree(
     worktree: &std::path::Path,
     fake_home: &std::path::Path,
 ) {
-    let _ = Command::new(env!("CARGO_BIN_EXE_infigraph"))
+    let _ = support::infigraph()
         .args(["--root", worktree.to_str().unwrap(), "daemon-stop"])
         .env("HOME", fake_home)
         .env("INFIGRAPH_NO_WATCH", "1")

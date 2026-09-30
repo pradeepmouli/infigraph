@@ -1,3 +1,5 @@
+mod support;
+
 use std::process::Command;
 
 fn git(args: &[&str], cwd: &std::path::Path) {
@@ -10,7 +12,7 @@ fn git(args: &[&str], cwd: &std::path::Path) {
 }
 
 fn run_index(root: &std::path::Path, fake_home: &std::path::Path) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_infigraph"))
+    support::infigraph()
         .args(["--root", root.to_str().unwrap(), "index"])
         .env("HOME", fake_home)
         .env("INFIGRAPH_NO_WATCH", "1")
@@ -24,7 +26,7 @@ fn run_worktree(
     path: &std::path::Path,
     fake_home: &std::path::Path,
 ) -> std::process::Output {
-    Command::new(env!("CARGO_BIN_EXE_infigraph"))
+    support::infigraph()
         .args(["worktree", action, path.to_str().unwrap()])
         .env("HOME", fake_home)
         .env("INFIGRAPH_NO_WATCH", "1")
@@ -170,7 +172,7 @@ fn the_hook_flow_removes_a_worktree_with_a_live_daemon_cleanly() {
     );
     assert!(run_index(&wt_path, fake_home.path()).status.success());
 
-    let mut daemon = Command::new(env!("CARGO_BIN_EXE_infigraph"))
+    let mut daemon = support::infigraph()
         .args(["daemon", "--debounce", "50"])
         .current_dir(&wt_path)
         .env("HOME", fake_home.path())
@@ -191,7 +193,7 @@ fn the_hook_flow_removes_a_worktree_with_a_live_daemon_cleanly() {
     let listening = reachable();
     assert!(listening, "the daemon never bound its read endpoint");
 
-    let stop = Command::new(env!("CARGO_BIN_EXE_infigraph"))
+    let stop = support::infigraph()
         .args(["daemon-stop", "--wait"])
         .current_dir(&wt_path)
         .env("HOME", fake_home.path())
