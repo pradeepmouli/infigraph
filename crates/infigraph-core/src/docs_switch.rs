@@ -91,9 +91,25 @@ pub fn docs_enabled_recorded(root: &Path) -> Option<bool> {
     settings_file::project_setting(root, SECTION, ENABLED).and_then(|item| item.as_bool())
 }
 
+/// Refuse the account home. Its `.infigraph/` is the global store, and its
+/// `config.toml` is the user layer every project reads: a switch recorded
+/// there is everyone's, not one project's. The executors call this before
+/// they take the docs lock too, since taking it creates its directory.
+pub fn ensure_switchable_root(root: &Path) -> Result<()> {
+    if crate::project::is_global_store_root(root) {
+        anyhow::bail!(
+            "refusing to record [docs] enabled in {} -- it is your home directory, whose \
+             .infigraph/ is the global store every project shares. Run this in a project.",
+            root.display()
+        );
+    }
+    Ok(())
+}
+
 /// Record the switch for `root`. Only the three writers named in the module
 /// doc call this.
 pub fn set_docs_enabled(root: &Path, enabled: bool) -> Result<()> {
+    ensure_switchable_root(root)?;
     settings_file::set_project_setting(root, SECTION, ENABLED, toml_edit::value(enabled))
 }
 
@@ -252,6 +268,23 @@ mod tests {
         let text = format!("{err:#}");
         assert!(text.contains("try again"), "{text}");
         assert!(DOCS_READ_WAIT < DOCS_OP_WAIT);
+    }
+
+    /// `$HOME/.infigraph/` is the global store, and its `config.toml` is the
+    /// user-level layer every project reads. Recording `[docs] enabled` there
+    /// would turn documents on (or off) everywhere, so a switch writer
+    /// refuses such a root and writes nothing.
+    #[test]
+    fn the_switch_is_never_recorded_in_the_global_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = tmp.path().join(".infigraph");
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::write(store.join("registry.json"), b"{}").unwrap();
+
+        let err = set_docs_enabled(tmp.path(), true).unwrap_err();
+        assert!(format!("{err:#}").contains("global store"), "{err:#}");
+        assert!(!store.join("config.toml").exists());
+        assert!(!store.join("config.lock").exists());
     }
 
     #[test]

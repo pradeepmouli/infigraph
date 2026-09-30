@@ -18,6 +18,7 @@ use crate::DocIndex;
 /// (`INFIGRAPH_BACKEND=kuzu`); under the daemon backend `DocIndex::init`
 /// would route, and a routed store cannot write.
 pub fn index_docs(root: &Path, full: bool) -> Result<DocIndexStats> {
+    docs_switch::ensure_switchable_root(root)?;
     let _op = docs_switch::lock_docs_op(root, docs_switch::DOCS_OP_WAIT)?;
     // Recorded under the lock, not before it: a `clean-docs` that got the
     // lock first has already turned the switch off and deleted the store,

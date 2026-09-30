@@ -288,3 +288,23 @@ A new page.
     let idx = infigraph_docs::DocIndex::open_existing(&root).unwrap();
     assert_eq!(idx.store().unwrap().stats().unwrap().document_count, 2);
 }
+
+/// An operation that would record the switch refuses the global-store root
+/// before it takes any lock: taking `docs-op.lock` creates its directory,
+/// and the home directory's `.infigraph/` is the store every project shares.
+#[test]
+fn the_executors_refuse_the_global_store_before_touching_it() {
+    let _env = Isolated::new();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let store = root.join(".infigraph");
+    std::fs::create_dir_all(&store).unwrap();
+    std::fs::write(store.join("registry.json"), b"{}").unwrap();
+    std::fs::write(root.join("README.md"), "# Home\n").unwrap();
+
+    assert!(index_docs(&root, false).is_err());
+    assert!(clean_docs(&root).is_err());
+    for name in ["docs-op.lock", "config.toml", "config.lock", "docs.kuzu"] {
+        assert!(!store.join(name).exists(), "{name} was created");
+    }
+}
