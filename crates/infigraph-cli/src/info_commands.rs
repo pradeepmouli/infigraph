@@ -964,7 +964,34 @@ pub(crate) fn stop_daemon_and_wait(root: &Path) -> Result<()> {
     }
 }
 
+/// Stop the detached `scip-enrich` still running for `root`, if any, and say
+/// so. `infigraph index` leaves it running after it returns and it keeps
+/// writing into `.infigraph/`, so a `git worktree remove` racing it fails
+/// half-done. The worktree hook reaches this before the remove
+/// (`daemon-stop --wait`) and after it (`worktree teardown`), which works
+/// once the directory is gone because the child is found by its argv and cwd.
+pub(crate) fn stop_scip_enrich_for(root: &Path) {
+    let root = infigraph_core::project::canonicalize_lenient(root);
+    let stopped = infigraph_core::daemon::lifecycle::stop_scip_enrich(
+        &root,
+        std::time::Duration::from_secs(10),
+    );
+    if !stopped.is_empty() {
+        println!(
+            "Stopped {} scip-enrich process(es) for {}.",
+            stopped.len(),
+            root.display()
+        );
+    }
+}
+
 pub(crate) fn cmd_daemon_stop(root: &Path, wait: bool) -> Result<()> {
+    // Before the "no daemon" early return below: a child can outlive, or
+    // exist without, any daemon. And before the daemon stops, since its
+    // imports are routed to the daemon.
+    if wait {
+        stop_scip_enrich_for(root);
+    }
     // The everyday "no daemon running yet" case answers at once rather than
     // going through the control client's startup grace.
     let lock_path = root.join(".infigraph").join("watch.lock");

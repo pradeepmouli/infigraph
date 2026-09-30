@@ -584,6 +584,9 @@ fn spawn_scip_child_process(
 ) {
     use crate::scip_download;
 
+    if !infigraph_core::scip_switch::scip_enabled(root) {
+        return;
+    }
     let indexers = scip_download::indexers_for_languages(detected_languages);
     if indexers.is_empty() {
         return;
@@ -613,14 +616,19 @@ fn spawn_scip_child_process(
         Err(_) => std::process::Stdio::null(),
     };
 
-    match std::process::Command::new(exe)
+    let mut command = std::process::Command::new(exe);
+    command
         .args(scip_enrich_args(&langs, restamp_baseline))
         .current_dir(root)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
-        .stderr(stderr_target)
-        .spawn()
-    {
+        .stderr(stderr_target);
+    // Its own process group (pgid == pid, set atomically at spawn), so the
+    // worktree hook's stop (`stop_scip_enrich`) can kill the indexers and
+    // their children as a unit without reaching anything else. R2.5.1.
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut command, 0);
+    match command.spawn() {
         Ok(mut child) => {
             // spawn() only reports failure to launch (missing binary, exec
             // permission). It says nothing about the child crashing or
@@ -769,6 +777,9 @@ pub(crate) fn auto_scip(
     use crate::scip_download;
     use std::collections::HashSet;
 
+    if !infigraph_core::scip_switch::scip_enabled(root) {
+        return Ok(());
+    }
     let detected: HashSet<String> = result
         .extractions
         .iter()

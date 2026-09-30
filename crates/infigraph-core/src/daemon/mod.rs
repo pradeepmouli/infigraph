@@ -1285,6 +1285,12 @@ where
                          enrichment for this reindex (detected languages: {})",
                         languages.join(", ")
                     );
+                } else if !crate::scip_switch::scip_enabled(root) {
+                    // `[scip] enabled = false`: nothing implicit starts.
+                    eprintln!(
+                        "[daemon] SCIP enrichment is off ([scip] enabled); skipping it for \
+                         this reindex"
+                    );
                 } else if let (Some(cb), Some(prism)) =
                     (on_full_reindex.clone(), held_prism.current())
                 {
@@ -1360,26 +1366,31 @@ where
                 match watch_db(root, &shared_registry, &mut held_prism) {
                     Ok(prism) => {
                         reopen_backoff.record_success();
-                        let due = prism.backend().and_then(|backend| {
-                            let ast = backend.current_ast_generation();
-                            let scip = backend.current_scip_generation();
-                            match (ast, scip) {
-                                (Ok(ast), Ok(scip)) => scip_enrichment_due(
-                                    ast,
-                                    scip,
-                                    last_scip_attempt_ast_generation,
-                                    scip_staleness_threshold,
-                                )
-                                .then(|| (ast, scip, backend.distinct_languages())),
-                                (Err(e), _) | (_, Err(e)) => {
-                                    eprintln!(
-                                        "[daemon] SCIP staleness check couldn't read the \
+                        // Off means the staleness check finds nothing due, so
+                        // it neither starts enrichment nor logs about it.
+                        let due = prism
+                            .backend()
+                            .filter(|_| crate::scip_switch::scip_enabled(root))
+                            .and_then(|backend| {
+                                let ast = backend.current_ast_generation();
+                                let scip = backend.current_scip_generation();
+                                match (ast, scip) {
+                                    (Ok(ast), Ok(scip)) => scip_enrichment_due(
+                                        ast,
+                                        scip,
+                                        last_scip_attempt_ast_generation,
+                                        scip_staleness_threshold,
+                                    )
+                                    .then(|| (ast, scip, backend.distinct_languages())),
+                                    (Err(e), _) | (_, Err(e)) => {
+                                        eprintln!(
+                                            "[daemon] SCIP staleness check couldn't read the \
                                          generation counters: {e}"
-                                    );
-                                    None
+                                        );
+                                        None
+                                    }
                                 }
-                            }
-                        });
+                            });
                         match due {
                             Some((ast, scip, Ok(languages))) if !languages.is_empty() => {
                                 eprintln!(

@@ -7,7 +7,7 @@ use infigraph_core::project::canonicalize_lenient;
 use infigraph_core::worktree::{find_worktree_drift, main_worktree_path};
 
 use crate::index::cmd_index;
-use crate::info_commands::{request_daemon_stop, DaemonStop};
+use crate::info_commands::{request_daemon_stop, stop_scip_enrich_for, DaemonStop};
 
 pub(crate) fn cmd_worktree_init(path: &Path) -> Result<()> {
     let main = main_worktree_path(path)?;
@@ -33,6 +33,11 @@ pub(crate) fn cmd_worktree_teardown(path: &Path) -> Result<()> {
     // `git worktree remove` has usually deleted the directory already, so
     // work from the path it had -- see `canonicalize_lenient`.
     let path = &canonicalize_lenient(path);
+
+    // The worktree's detached scip-enrich first (its imports are routed to
+    // the daemon): found by argv and cwd, so it works after the directory
+    // is gone.
+    stop_scip_enrich_for(path);
 
     // Stop the daemon, if any, before touching the registry. Over its socket,
     // which lives outside the worktree, so this reaches it after the
