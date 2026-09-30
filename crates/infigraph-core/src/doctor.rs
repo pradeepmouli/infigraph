@@ -1494,6 +1494,107 @@ pub fn check_settings(ctx: &DoctorContext) -> Vec<CheckResult> {
         .collect()
 }
 
+const INSTRUCTIONS_CATEGORY: &str = "instructions";
+
+/// #207: agent-instruction blocks that nothing refreshes. Index and daemon
+/// start rewrite a project's `.claude/CLAUDE.md` block, but only when they
+/// next run, and never the two places an older build also wrote one: the
+/// repo-root `CLAUDE.md` and the account's global `~/.claude/CLAUDE.md` (a
+/// daemon started in `$HOME`). Claude Code loads every one of them.
+pub fn check_instruction_blocks(ctx: &DoctorContext) -> Vec<CheckResult> {
+    let mut results: Vec<CheckResult> = projects_in_scope(ctx)
+        .iter()
+        .flat_map(|p| check_one_project_instruction_blocks(p))
+        .collect();
+    results.extend(instances::account_home().and_then(|home| check_global_claude_md(&home)));
+    results
+}
+
+/// The project's `.claude/CLAUDE.md` block against this build's version, and
+/// any block in its repo-root `CLAUDE.md`. No block reports nothing: the
+/// writer adds one at the next index, and a project may have opted out by
+/// deleting it.
+pub fn check_one_project_instruction_blocks(root: &Path) -> Vec<CheckResult> {
+    // The account home's `.claude/CLAUDE.md` is the global file, which
+    // `check_global_claude_md` judges by a different rule.
+    if instances::is_account_home(root) {
+        return Vec::new();
+    }
+    let current = crate::claude_md::VERSION;
+    let mut results = Vec::new();
+    let managed = root.join(".claude").join("CLAUDE.md");
+    match read_block_version(&managed) {
+        Some(v) if v >= current => results.push(CheckResult::pass(
+            INSTRUCTIONS_CATEGORY,
+            format!("{}: CLAUDE.md block", root.display()),
+            format!("{} holds the current v{v} block", managed.display()),
+        )),
+        Some(v) => results.push(CheckResult::warn(
+            INSTRUCTIONS_CATEGORY,
+            format!("{}: CLAUDE.md block", root.display()),
+            format!(
+                "{} holds a v{v} block; this build writes v{current}",
+                managed.display()
+            ),
+            format!(
+                "run `cd {} && infigraph index` to rewrite it",
+                root.display()
+            ),
+        )),
+        None => {}
+    }
+    let orphan = root.join("CLAUDE.md");
+    if let Some(v) = read_block_version(&orphan) {
+        results.push(CheckResult::warn(
+            INSTRUCTIONS_CATEGORY,
+            format!("{}: root CLAUDE.md block", root.display()),
+            format!(
+                "{} holds a v{v} block that nothing refreshes; the managed one lives in .claude/CLAUDE.md",
+                orphan.display()
+            ),
+            format!(
+                "delete the lines from `{}` to `<!-- END INFIGRAPH -->` in {}",
+                crate::claude_md::BEGIN_PREFIX,
+                orphan.display()
+            ),
+        ));
+    }
+    results
+}
+
+/// `home/.claude/CLAUDE.md` must not hold a project block: `infigraph
+/// install` already puts the global rules there under its own marker, and
+/// every session loads the file. `None` when the file does not exist.
+pub fn check_global_claude_md(home: &Path) -> Option<CheckResult> {
+    let global = home.join(".claude").join("CLAUDE.md");
+    let content = std::fs::read_to_string(&global).ok()?;
+    let name = "global CLAUDE.md";
+    Some(match crate::claude_md::block_version(&content) {
+        None => CheckResult::pass(
+            INSTRUCTIONS_CATEGORY,
+            name,
+            format!("{} holds no project block", global.display()),
+        ),
+        Some(v) => CheckResult::warn(
+            INSTRUCTIONS_CATEGORY,
+            name,
+            format!(
+                "{} holds a v{v} project block (a daemon or index once ran in the home directory), loaded in every session",
+                global.display()
+            ),
+            format!(
+                "delete the lines from `{}` to `<!-- END INFIGRAPH -->` in {}; keep the `infigraph-primary-search` block",
+                crate::claude_md::BEGIN_PREFIX,
+                global.display()
+            ),
+        ),
+    })
+}
+
+fn read_block_version(path: &Path) -> Option<u32> {
+    crate::claude_md::block_version(&std::fs::read_to_string(path).ok()?)
+}
+
 const TOOLCHAIN_CATEGORY: &str = "toolchain";
 
 pub fn check_toolchain(ctx: &DoctorContext) -> Vec<CheckResult> {
@@ -1532,6 +1633,7 @@ pub fn run_doctor(ctx: DoctorContext) -> DoctorReport {
     checks.extend(check_worktrees(&ctx));
     checks.extend(check_recovery(&ctx));
     checks.extend(check_settings(&ctx));
+    checks.extend(check_instruction_blocks(&ctx));
     checks.extend(check_toolchain(&ctx));
     DoctorReport {
         checks,

@@ -2,10 +2,11 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use infigraph_core::doctor::{
-    check_disk, check_growth_breaker, check_locks, check_registry, check_scip_staleness,
-    check_sidecars, check_toolchain, check_wal_integrity, check_watchers, check_worktrees,
-    find_repo_entry, format_report, projects_in_scope, run_doctor, CheckResult, CheckStatus,
-    DoctorContext, DoctorReport, DoctorScope, ReportStyle,
+    check_disk, check_global_claude_md, check_growth_breaker, check_locks,
+    check_one_project_instruction_blocks, check_registry, check_scip_staleness, check_sidecars,
+    check_toolchain, check_wal_integrity, check_watchers, check_worktrees, find_repo_entry,
+    format_report, projects_in_scope, run_doctor, CheckResult, CheckStatus, DoctorContext,
+    DoctorReport, DoctorScope, ReportStyle,
 };
 // Only the Linux/macOS-gated tests below use these -- `check_graph_holders`
 // inspects /proc or lsof, neither of which exists on Windows.
@@ -1854,4 +1855,100 @@ fn check_watchers_judges_a_never_heartbeating_daemon_by_its_status() {
         "{}",
         watcher.message
     );
+}
+
+// #207: the instruction blocks nothing maintains any more.
+
+fn write_file(path: &std::path::Path, content: &str) {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, content).unwrap();
+}
+
+fn block(version: u32) -> String {
+    format!("<!-- BEGIN INFIGRAPH v{version} -->\n## Infigraph\n<!-- END INFIGRAPH -->\n")
+}
+
+#[test]
+fn a_project_without_instruction_blocks_reports_nothing() {
+    let dir = tempfile::TempDir::new().unwrap();
+    assert!(check_one_project_instruction_blocks(dir.path()).is_empty());
+}
+
+#[test]
+fn a_current_project_block_passes() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let current = infigraph_core::claude_md::VERSION;
+    write_file(&dir.path().join(".claude/CLAUDE.md"), &block(current));
+    let results = check_one_project_instruction_blocks(dir.path());
+    assert_eq!(results.len(), 1, "{results:?}");
+    assert_eq!(results[0].status, CheckStatus::Pass);
+}
+
+#[test]
+fn an_older_project_block_warns_and_names_index_as_the_fix() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let old = infigraph_core::claude_md::VERSION - 1;
+    write_file(
+        &dir.path().join(".claude/CLAUDE.md"),
+        &format!("# mine\n\n{}", block(old)),
+    );
+    let results = check_one_project_instruction_blocks(dir.path());
+    assert_eq!(results.len(), 1, "{results:?}");
+    assert_eq!(results[0].status, CheckStatus::Warn);
+    assert!(
+        results[0].message.contains(&format!("v{old}")),
+        "{results:?}"
+    );
+    assert!(
+        results[0]
+            .remediation
+            .as_deref()
+            .unwrap()
+            .contains("infigraph index"),
+        "{results:?}"
+    );
+}
+
+#[test]
+fn a_block_in_the_repo_root_claude_md_warns_whatever_its_version() {
+    // Nothing writes or refreshes the repo-root file, so even a current
+    // block there is a copy that will go stale.
+    let dir = tempfile::TempDir::new().unwrap();
+    let current = infigraph_core::claude_md::VERSION;
+    write_file(&dir.path().join("CLAUDE.md"), &block(current));
+    let results = check_one_project_instruction_blocks(dir.path());
+    assert_eq!(results.len(), 1, "{results:?}");
+    assert_eq!(results[0].status, CheckStatus::Warn);
+    assert!(results[0].message.contains("CLAUDE.md"), "{results:?}");
+}
+
+#[test]
+fn a_project_block_in_the_global_claude_md_warns() {
+    let home = tempfile::TempDir::new().unwrap();
+    write_file(
+        &home.path().join(".claude/CLAUDE.md"),
+        &format!(
+            "<!-- infigraph-primary-search -->\nrules\n<!-- /infigraph-primary-search -->\n\n{}",
+            block(3)
+        ),
+    );
+    let result = check_global_claude_md(home.path()).expect("the file exists");
+    assert_eq!(result.status, CheckStatus::Warn, "{result:?}");
+}
+
+#[test]
+fn the_installs_own_global_block_passes() {
+    let home = tempfile::TempDir::new().unwrap();
+    write_file(
+        &home.path().join(".claude/CLAUDE.md"),
+        "<!-- infigraph-primary-search -->\nrules\n<!-- /infigraph-primary-search -->\n",
+    );
+    let result = check_global_claude_md(home.path()).expect("the file exists");
+    assert_eq!(result.status, CheckStatus::Pass, "{result:?}");
+}
+
+#[test]
+fn no_global_claude_md_reports_nothing() {
+    let home = tempfile::TempDir::new().unwrap();
+    assert!(check_global_claude_md(home.path()).is_none());
 }
