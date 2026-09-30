@@ -1462,12 +1462,6 @@ mod tests {
         );
     }
 
-    /// `subcommand_belongs_to` is the pure decision `find_scip_enrich_for` and
-    /// `find_daemons_for` apply per live process, built on the same
-    /// name-and-argv predicate as `is_orphaned_daemon`: `index` spawns
-    /// `scip-enrich` (and `ensure_daemon_running` the daemon) with
-    /// `current_dir(root)`, so the OS-reported cwd names the root even after
-    /// the directory is gone.
     /// A candidate pid that is alive but is not an `infigraph daemon` (a
     /// reused pid, a stale lock payload) must be neither signalled nor
     /// reported as a survivor.
@@ -1490,6 +1484,12 @@ mod tests {
         let _ = other.wait();
     }
 
+    /// `subcommand_belongs_to` is the pure decision `find_scip_enrich_for` and
+    /// `find_daemons_for` apply per live process, built on the same
+    /// name-and-argv predicate as `is_orphaned_daemon`: `index` spawns
+    /// `scip-enrich` (and `ensure_daemon_running` the daemon) with
+    /// `current_dir(root)`, so the OS-reported cwd names the root even after
+    /// the directory is gone.
     mod subcommand_belongs_to_tests {
         use super::super::subcommand_belongs_to;
         use std::path::Path;
