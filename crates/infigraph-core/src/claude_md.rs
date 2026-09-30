@@ -6,7 +6,28 @@ use anyhow::Result;
 /// this version's marker is left alone, so an unbumped edit never reaches it.
 /// A bumped one reaches a project when it is next indexed or its daemon next
 /// starts.
-const VERSION: u32 = 4;
+pub const VERSION: u32 = 4;
+
+/// Every managed block starts with this, then ` v<N> -->`; the block's
+/// version is whatever follows. An older generator also wrote it into a
+/// repo-root `CLAUDE.md`, which nothing here manages.
+pub(crate) const BEGIN_PREFIX: &str = "<!-- BEGIN INFIGRAPH";
+const END_MARKER: &str = "<!-- END INFIGRAPH -->";
+
+/// The version of the first managed block in `content`, `None` when it has
+/// none. A block whose marker carries no readable version counts as `0`,
+/// older than any this build writes.
+pub fn block_version(content: &str) -> Option<u32> {
+    let rest = &content[content.find(BEGIN_PREFIX)? + BEGIN_PREFIX.len()..];
+    let digits: String = rest
+        .trim_start()
+        .strip_prefix('v')
+        .unwrap_or("")
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    Some(digits.parse().unwrap_or(0))
+}
 
 /// Write/update project-level `.claude/CLAUDE.md` with infigraph instructions.
 /// Uses sentinel markers for idempotent managed-block replacement.
@@ -26,8 +47,8 @@ pub fn ensure_project_claude_md(project_root: &Path) -> Result<()> {
     }
     let claude_dir = project_root.join(".claude");
     let claude_md = claude_dir.join("CLAUDE.md");
-    let begin_marker = format!("<!-- BEGIN INFIGRAPH v{} -->", VERSION);
-    let end_marker = "<!-- END INFIGRAPH -->";
+    let begin_marker = format!("{BEGIN_PREFIX} v{VERSION} -->");
+    let end_marker = END_MARKER;
 
     let instructions = format!(
         r#"
@@ -48,7 +69,7 @@ tell the user (e.g. to reconnect the MCP server) rather than working around the 
         return Ok(());
     }
 
-    let new_content = if let Some(start) = existing.find("<!-- BEGIN INFIGRAPH") {
+    let new_content = if let Some(start) = existing.find(BEGIN_PREFIX) {
         if let Some(end_pos) = existing[start..].find(end_marker) {
             let end = start + end_pos + end_marker.len();
             let end = if existing[end..].starts_with('\n') {
@@ -86,14 +107,14 @@ tell the user (e.g. to reconnect the MCP server) rather than working around the 
 /// Returns true if a block was removed, false if nothing to do.
 pub fn remove_project_claude_md(project_root: &Path) -> Result<bool> {
     let claude_md = project_root.join(".claude").join("CLAUDE.md");
-    let end_marker = "<!-- END INFIGRAPH -->";
+    let end_marker = END_MARKER;
 
     let existing = match std::fs::read_to_string(&claude_md) {
         Ok(s) => s,
         Err(_) => return Ok(false),
     };
 
-    let start = match existing.find("<!-- BEGIN INFIGRAPH") {
+    let start = match existing.find(BEGIN_PREFIX) {
         Some(s) => s,
         None => return Ok(false),
     };
@@ -203,5 +224,12 @@ mod tests {
         assert!(text.contains("## After"));
         assert!(!text.contains("old\n"));
         assert_eq!(text.matches("<!-- BEGIN INFIGRAPH").count(), 1);
+    }
+
+    #[test]
+    fn block_version_reads_the_marker_and_counts_an_unversioned_one_as_oldest() {
+        assert_eq!(block_version("x\n<!-- BEGIN INFIGRAPH v12 -->\n"), Some(12));
+        assert_eq!(block_version("<!-- BEGIN INFIGRAPH -->\n"), Some(0));
+        assert_eq!(block_version("<!-- infigraph-primary-search -->\n"), None);
     }
 }
