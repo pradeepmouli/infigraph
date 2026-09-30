@@ -1444,6 +1444,16 @@ resolver = ["./resolve-zed-path.sh"]
             .unwrap();
         let project = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(project.path().join(".infigraph")).unwrap();
+        // A git repo whose `target/` is ignored: a `find` there searches no
+        // indexed code (#76).
+        assert!(std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(project.path())
+            .status()
+            .unwrap()
+            .success());
+        std::fs::write(project.path().join(".gitignore"), "target/\n").unwrap();
+        std::fs::create_dir_all(project.path().join("target/debug")).unwrap();
         let cwd = project.path().to_str().unwrap();
 
         // The denial reason, or None when the call is allowed.
@@ -1463,6 +1473,12 @@ resolver = ["./resolve-zed-path.sh"]
         };
         let bash = |cmd: &str| decide("Bash", serde_json::json!({ "command": cmd }));
         let source = format!("{cwd}/src/lib.rs");
+        let read = |rel: &str| {
+            decide(
+                "Read",
+                serde_json::json!({ "file_path": format!("{cwd}/{rel}") }),
+            )
+        };
 
         // (case, decision, what a denial must name -- None means allowed)
         let decisions = [
@@ -1530,6 +1546,35 @@ resolver = ["./resolve-zed-path.sh"]
                     serde_json::json!({ "file_path": source, "offset": 10 }),
                 ),
                 None,
+            ),
+            // #76: the hook fails open for anything it cannot positively call
+            // indexed code. Docs, configs and markup are read directly.
+            ("Read markdown", read("README.md"), None),
+            ("Read toml", read("Cargo.toml"), None),
+            ("Read yaml", read(".github/workflows/ci.yml"), None),
+            ("Read json", read("package.json"), None),
+            ("Read xml", read("pom.xml"), None),
+            ("Read ini", read("setup.cfg"), None),
+            ("Read html", read("docs/index.html"), None),
+            (
+                "Read python",
+                read("app/main.py"),
+                Some("get_symbols_in_file"),
+            ),
+            (
+                "find in an ignored dir",
+                bash("find target -name '*.o' -delete"),
+                None,
+            ),
+            (
+                "find outside the project",
+                bash("find /tmp -name '*.log'"),
+                None,
+            ),
+            (
+                "find over the project and an ignored dir",
+                bash("find target src -name '*.rs'"),
+                Some("list_files"),
             ),
         ];
 

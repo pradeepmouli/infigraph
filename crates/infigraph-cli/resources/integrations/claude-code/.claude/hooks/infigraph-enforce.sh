@@ -67,6 +67,24 @@ deny() {
 routing="Which tool answers which question: the infigraph-tool-routing skill. If that tool is unavailable or errors, tell the user (e.g. to reconnect the infigraph MCP server with /mcp) -- do not work around this hook."
 search_hint="Use mcp__infigraph__search: ranked symbols plus every line containing the text; regex=true lists every matching line (e.g. all call sites)."
 
+# Whether $1 (an absolute path) lies where infigraph indexes no code: outside
+# the project, in a directory infigraph skips, or git-ignored (approximates
+# .gitignore; .infigraphignore is not covered). The hook nudges rather than
+# gates, so anything it cannot place inside indexed code is allowed (#76).
+outside_indexed_code() {
+  case "$1" in
+    "$cwd"|"$cwd"/*) ;;
+    *) return 0 ;;
+  esac
+  case "${1#"$cwd"/}" in
+    .infigraph|.infigraph/*|*/.infigraph/*|.claude|.claude/*|*/.claude/*|node_modules|node_modules/*|*/node_modules/*|__pycache__/*|*/__pycache__/*|.tox/*|*/.tox/*|.git|.git/*|*/.git/*)
+      return 0 ;;
+  esac
+  command -v git >/dev/null 2>&1 &&
+    git -C "$cwd" rev-parse --is-inside-work-tree >/dev/null 2>&1 &&
+    git -C "$cwd" check-ignore -q "$1" 2>/dev/null
+}
+
 # Blank out what the shell never runs as a command: quoted strings (which can
 # span lines, as in a multi-line commit message) and heredoc bodies. A command
 # word inside one -- `gh issue create --title "grep is blocked"`, a commit
@@ -130,7 +148,19 @@ case "$tool" in
       deny "BLOCKED: grep/rg on indexed code. $search_hint $routing"
     fi
     if printf '%s\n' "$scannable" | grep -qE '(^|\s)find\s.*-name\s'; then
-      deny "BLOCKED: Use mcp__infigraph__list_files instead of find -name. $routing"
+      # The start paths are the words after `find` up to its first option;
+      # none means `.`. Allowed only when every one is outside indexed code,
+      # such as a build directory (#76).
+      find_paths=$(printf '%s\n' "$scannable" | grep -oE '(^|\s)find\s[^|;&]*' | head -1 |
+        awk '{for (i = 2; i <= NF; i++) { if ($i ~ /^[-(!]/) exit; print $i }}')
+      [ -n "$find_paths" ] || find_paths=.
+      while IFS= read -r p; do
+        case "$p" in /*) abs=$p ;; .) abs=$cwd ;; *) abs="$cwd/${p#./}" ;; esac
+        outside_indexed_code "${abs%/}" ||
+          deny "BLOCKED: Use mcp__infigraph__list_files instead of find -name. $routing"
+      done <<EOF_FIND_PATHS
+$find_paths
+EOF_FIND_PATHS
     fi
     ;;
   Agent)
@@ -153,24 +183,11 @@ case "$tool" in
     if [ -f "$tracker_file" ] && grep -qF "$file_path" "$tracker_file" 2>/dev/null; then
       exit 0
     fi
-    # Allow if the file isn't inside the current project directory
-    case "$file_path" in
-      "$cwd"/*) ;;
-      *) exit 0 ;;
-    esac
-    # Allow if the file is in a directory infigraph excludes from indexing
-    rel_path="${file_path#"$cwd"/}"
-    case "$rel_path" in
-      .infigraph/*|*/.infigraph/*|.claude/*|*/.claude/*|node_modules/*|*/node_modules/*|__pycache__/*|*/__pycache__/*|.tox/*|*/.tox/*|.git/*|*/.git/*)
-        exit 0 ;;
-    esac
-    # Allow if git considers the file ignored (approximates .gitignore; .infigraphignore not covered)
-    if command -v git >/dev/null 2>&1 && git -C "$cwd" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-      if git -C "$cwd" check-ignore -q "$file_path" 2>/dev/null; then
-        exit 0
-      fi
-    fi
-    # Allow if the file type isn't one infigraph indexes
+    outside_indexed_code "$file_path" && exit 0
+    # Allow unless the file is source code infigraph extracts symbols from.
+    # Docs, configs, data and markup (.md, .toml, .yaml, .json, .xml, .html,
+    # .css, ...) are read directly: nothing better answers "what does this say"
+    # (#76).
     base=$(basename -- "$file_path")
     case "$base" in
       Dockerfile|Containerfile|Makefile|makefile|GNUmakefile|CMakeLists.txt|BUILD|BUILD.bazel|WORKSPACE) ;;
@@ -179,11 +196,11 @@ case "$tool" in
           *.py|*.rs|*.ts|*.tsx|*.js|*.jsx|*.mjs|*.go|*.java|*.c|*.h|*.cpp|*.cc|*.cxx|*.hpp|*.hxx|*.hh|\
           *.rb|*.rake|*.gemspec|*.php|*.swift|*.kt|*.kts|*.cs|*.scala|*.sc|*.lua|*.zig|*.ex|*.exs|*.dart|\
           *.m|*.mm|*.hs|*.lhs|*.pl|*.pm|*.t|*.r|*.R|*.Rmd|*.ml|*.mli|*.sh|*.bash|*.zsh|*.sql|*.jl|*.proto|\
-          *.ps1|*.psm1|*.psd1|*.v|*.sv|*.svh|*.vh|*.hcl|*.tf|*.tfvars|*.toml|*.yml|*.yaml|*.erl|*.hrl|\
-          *.f90|*.f95|*.f03|*.f08|*.f|*.for|*.nix|*.svelte|*.fs|*.fsi|*.fsx|*.groovy|*.gradle|*.css|\
-          *.html|*.htm|*.json|*.xml|*.xsl|*.xsd|*.svg|*.plist|*.graphql|*.gql|*.glsl|*.vert|*.frag|*.geom|\
-          *.comp|*.lisp|*.lsp|*.cl|*.asd|*.elm|*.el|*.ini|*.cfg|*.conf|*.bzl|*.star|*.mlx|*.mat|*.md|\
-          *.markdown|*.clj|*.cljs|*.cljc|*.edn|*.cu|*.cuh|*.pas|*.pp|*.dpr|*.dpk|*.inc|*.lpr|*.bas|*.cls|\
+          *.ps1|*.psm1|*.psd1|*.v|*.sv|*.svh|*.vh|*.hcl|*.tf|*.erl|*.hrl|\
+          *.f90|*.f95|*.f03|*.f08|*.f|*.for|*.nix|*.svelte|*.fs|*.fsi|*.fsx|*.groovy|*.gradle|\
+          *.graphql|*.gql|*.glsl|*.vert|*.frag|*.geom|\
+          *.comp|*.lisp|*.lsp|*.cl|*.asd|*.elm|*.el|*.bzl|*.star|*.mlx|\
+          *.clj|*.cljs|*.cljc|*.cu|*.cuh|*.pas|*.pp|*.dpr|*.dpk|*.inc|*.lpr|*.bas|*.cls|\
           *.frm|*.dockerfile|*.mk|*.cmake) ;;
           *) exit 0 ;;
         esac
