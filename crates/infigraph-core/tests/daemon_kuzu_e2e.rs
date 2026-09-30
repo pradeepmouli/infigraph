@@ -580,16 +580,8 @@ fn ad_hoc_index_request_racing_the_watchers_own_debounce_does_not_duplicate_key(
 
     let mut daemon = start_real_daemon(project.path());
 
-    // Bootstrap: one file already indexed before the race file appears,
-    // matching the live repro's setup.
-    let bootstrap = cli_command()
-        .arg("--root")
-        .arg(project.path())
-        .arg("index")
-        .arg("--no-embed")
-        .status()
-        .unwrap();
-    assert!(bootstrap.success());
+    // One file is already indexed (`start_real_daemon` bootstraps), matching
+    // the live repro's setup, before the race file appears.
 
     // The race: create a new file, then IMMEDIATELY (no settling delay)
     // submit an ad-hoc Index request via the opt-in whole-job-to-daemon
