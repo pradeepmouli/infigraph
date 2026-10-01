@@ -272,6 +272,12 @@ impl DocIndex {
         let total = files.len();
 
         if total == 0 {
+            // No document is left, so every stored one is stale: deleting the
+            // last document must delete its rows too.
+            let existing_hashes = store
+                .get_doc_hashes()
+                .context("doc index: failed to load existing document hashes")?;
+            self.prune_stale_docs(store, &existing_hashes, &files);
             return Ok(DocIndexResult {
                 total_files: 0,
                 indexed_files: 0,
@@ -378,40 +384,7 @@ impl DocIndex {
             embed::update_doc_embeddings(store, &self.root, &all_chunks, &changed_files)?;
         }
 
-        // Prune stale docs: remove entries for files that no longer exist on disk.
-        // Scope both sides to this repo's namespace — `existing_hashes` pools every
-        // repo sharing the store in remote mode, so an unscoped diff would flag
-        // every other repo's docs as "stale" and delete them.
-        {
-            let current_files: std::collections::HashSet<String> = files
-                .iter()
-                .filter_map(|p| {
-                    p.strip_prefix(&self.root).ok().map(|r| {
-                        let raw = r.to_string_lossy().replace('\\', "/");
-                        match ns {
-                            Some(prefix) => format!("{prefix}/{raw}"),
-                            None => raw,
-                        }
-                    })
-                })
-                .collect();
-            let stale: Vec<String> = existing_hashes
-                .keys()
-                .filter(|k| match ns {
-                    Some(prefix) => k.starts_with(&format!("{prefix}/")),
-                    None => true,
-                })
-                .filter(|k| !current_files.contains(k.as_str()))
-                .cloned()
-                .collect();
-            if !stale.is_empty() {
-                eprintln!("Doc pruning: removing {} stale doc(s)", stale.len());
-                let stale_refs: Vec<&str> = stale.iter().map(|s| s.as_str()).collect();
-                if let Err(e) = store.delete_docs_by_ids(&stale_refs) {
-                    eprintln!("warn: doc pruning failed, stale docs remain: {e:#}");
-                }
-            }
-        }
+        self.prune_stale_docs(store, &existing_hashes, &files);
 
         // Extract links from indexed docs and create LINKS_TO edges.
         // Scope to this repo's namespace so cross-repo docs aren't offered as
@@ -456,6 +429,48 @@ impl DocIndex {
             changed_files: result_changed,
             pipeline_warnings,
         })
+    }
+
+    /// Removes the documents of files that no longer exist on disk (and their
+    /// pipelines, with them). Scoped to this repo's namespace on both sides:
+    /// `existing_hashes` pools every repo sharing the store in remote mode, so
+    /// an unscoped diff would flag every other repo's docs as "stale" and
+    /// delete them.
+    fn prune_stale_docs(
+        &self,
+        store: &dyn DocBackend,
+        existing_hashes: &std::collections::HashMap<String, String>,
+        files: &[PathBuf],
+    ) {
+        let ns = self.namespace.as_deref();
+        let current_files: HashSet<String> = files
+            .iter()
+            .filter_map(|p| {
+                p.strip_prefix(&self.root).ok().map(|r| {
+                    let raw = r.to_string_lossy().replace('\\', "/");
+                    match ns {
+                        Some(prefix) => format!("{prefix}/{raw}"),
+                        None => raw,
+                    }
+                })
+            })
+            .collect();
+        let stale: Vec<String> = existing_hashes
+            .keys()
+            .filter(|k| match ns {
+                Some(prefix) => k.starts_with(&format!("{prefix}/")),
+                None => true,
+            })
+            .filter(|k| !current_files.contains(k.as_str()))
+            .cloned()
+            .collect();
+        if !stale.is_empty() {
+            eprintln!("Doc pruning: removing {} stale doc(s)", stale.len());
+            let stale_refs: Vec<&str> = stale.iter().map(|s| s.as_str()).collect();
+            if let Err(e) = store.delete_docs_by_ids(&stale_refs) {
+                eprintln!("warn: doc pruning failed, stale docs remain: {e:#}");
+            }
+        }
     }
 
     fn collect_doc_files(&self) -> Result<Vec<PathBuf>> {

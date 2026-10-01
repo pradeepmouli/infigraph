@@ -6,7 +6,7 @@ use std::time::Duration;
 use infigraph_core::docs_switch::{
     docs_enabled, docs_enabled_recorded, docs_store_path, lock_docs_op,
 };
-use infigraph_docs::ops::{clean_docs, index_docs, refresh_docs_if_enabled};
+use infigraph_docs::ops::{clean_docs, index_docs, refresh_docs_if_enabled, stats_report};
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -33,6 +33,13 @@ impl Isolated {
             _home: home,
             orig_home,
         }
+    }
+}
+
+impl Isolated {
+    /// The pinned `HOME`.
+    fn home(&self) -> &std::path::Path {
+        self._home.path()
     }
 }
 
@@ -307,4 +314,39 @@ fn the_executors_refuse_the_global_store_before_touching_it() {
     for name in ["docs-op.lock", "config.toml", "config.lock", "docs.kuzu"] {
         assert!(!store.join(name).exists(), "{name} was created");
     }
+}
+
+/// A pipeline plugin that fails costs a warning, and the warning has to reach
+/// whoever ran `index-docs`: it is part of the stats the daemon replies with
+/// and of the report both entry points print.
+#[test]
+fn a_failing_pipeline_plugin_is_reported_in_the_stats_and_the_report() {
+    let env = Isolated::new();
+    let dir = env.home().join(".infigraph/pipelines/broken");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("plugin.toml"),
+        "[plugin]\nname = \"broken\"\nplugin_id = \"broken\"\n\
+         command = [\"/nonexistent/infigraph-test-plugin\"]\ndetect_patterns = [\"zebra\"]\n",
+    )
+    .unwrap();
+    let (_tmp, root) = project_with_readme();
+
+    let stats = index_docs(&root, false).unwrap();
+
+    assert_eq!(stats.files_indexed, 1, "{stats:?}");
+    assert_eq!(stats.pipeline_warnings.len(), 1, "{stats:?}");
+    assert!(stats.pipeline_warnings[0].contains("broken"), "{stats:?}");
+    let report = stats_report("Document indexing", &stats, Duration::from_secs(1));
+    assert!(report.contains(&stats.pipeline_warnings[0]), "{report}");
+}
+
+#[test]
+fn a_clean_run_reports_no_warnings() {
+    let _env = Isolated::new();
+    let (_tmp, root) = project_with_readme();
+    let stats = index_docs(&root, false).unwrap();
+    assert!(stats.pipeline_warnings.is_empty(), "{stats:?}");
+    let report = stats_report("Document indexing", &stats, Duration::from_secs(1));
+    assert!(!report.contains("arning"), "{report}");
 }

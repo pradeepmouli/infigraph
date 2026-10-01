@@ -42,6 +42,7 @@ pub fn index_docs(root: &Path, full: bool) -> Result<DocIndexStats> {
         bfs_discovered: result.bfs_discovered,
         documents_in_store: totals.document_count,
         chunks_in_store: totals.chunk_count,
+        pipeline_warnings: result.pipeline_warnings,
     })
 }
 
@@ -102,7 +103,7 @@ pub fn refresh_docs_if_enabled(root: &Path) -> Result<usize> {
 /// The report `index-docs` and `reindex-docs` print, and MCP's in-process
 /// fallbacks return.
 pub fn stats_report(what: &str, stats: &DocIndexStats, elapsed: std::time::Duration) -> String {
-    format!(
+    let mut report = format!(
         "{what} complete in {:.1}s\n  Files scanned: {}\n  Files indexed: {}\n  Chunks created: {}\n  Total documents in store: {}\n  Total chunks in store: {}",
         elapsed.as_secs_f64(),
         stats.files_scanned,
@@ -110,5 +111,15 @@ pub fn stats_report(what: &str, stats: &DocIndexStats, elapsed: std::time::Durat
         stats.chunks_created,
         stats.documents_in_store,
         stats.chunks_in_store
-    )
+    );
+    if !stats.pipeline_warnings.is_empty() {
+        report.push_str(&format!(
+            "\n  Pipeline warnings ({}):",
+            stats.pipeline_warnings.len()
+        ));
+        for warning in &stats.pipeline_warnings {
+            report.push_str(&format!("\n    - {warning}"));
+        }
+    }
+    report
 }

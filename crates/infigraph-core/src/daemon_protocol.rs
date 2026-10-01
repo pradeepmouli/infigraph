@@ -169,6 +169,10 @@ pub struct DocIndexStats {
     pub bfs_discovered: usize,
     pub documents_in_store: usize,
     pub chunks_in_store: usize,
+    /// What pipeline plugins reported during the run. Absent from a reply by
+    /// a daemon that predates the field, which reads as none.
+    #[serde(default)]
+    pub pipeline_warnings: Vec<String>,
 }
 
 /// Small summary of what happened -- never the full `IndexResult` (which
@@ -969,4 +973,36 @@ pub fn read_cross_service_edges_arrow(
         }
     }
     Ok(candidates)
+}
+
+#[cfg(test)]
+mod doc_index_stats_wire_tests {
+    use super::{DocIndexStats, WriteResult};
+
+    /// A reply from a daemon built before `pipeline_warnings` existed has no
+    /// such field; it reads as no warnings, not as a malformed reply.
+    #[test]
+    fn a_reply_without_pipeline_warnings_reads_as_none() {
+        let old = r#"{"DocsIndexed":{"files_scanned":3,"files_indexed":2,"chunks_created":5,"bfs_discovered":0,"documents_in_store":3,"chunks_in_store":5}}"#;
+        match serde_json::from_str::<WriteResult>(old).unwrap() {
+            WriteResult::DocsIndexed(stats) => {
+                assert_eq!(stats.files_indexed, 2);
+                assert!(stats.pipeline_warnings.is_empty());
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pipeline_warnings_survive_the_wire() {
+        let stats = DocIndexStats {
+            pipeline_warnings: vec!["plugin 'x' did not start".to_string()],
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&WriteResult::DocsIndexed(stats.clone())).unwrap();
+        match serde_json::from_str::<WriteResult>(&json).unwrap() {
+            WriteResult::DocsIndexed(back) => assert_eq!(back, stats),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
 }
