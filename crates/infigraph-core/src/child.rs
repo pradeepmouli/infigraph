@@ -214,6 +214,19 @@ impl LineChild {
         }
     }
 
+    /// Waits up to `grace` for the child to exit by itself (after being told
+    /// to shut down), then kills it and its group.
+    pub fn finish(&mut self, grace: Duration) {
+        let deadline = std::time::Instant::now() + grace;
+        while std::time::Instant::now() < deadline {
+            if matches!(self.child.try_wait(), Ok(Some(_))) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        self.kill();
+    }
+
     fn check_alive(&self) -> Result<()> {
         match &self.poisoned {
             Some(first) => bail!(
@@ -405,6 +418,20 @@ mod tests {
             bystander_alive,
             "the kill reached a process outside the group"
         );
+    }
+
+    #[test]
+    fn finish_lets_a_child_exit_by_itself_and_kills_one_that_does_not() {
+        let mut polite = LineChild::spawn(sh("read l; exit 0"), "polite", false).unwrap();
+        polite.write_line("bye").unwrap();
+        let started = std::time::Instant::now();
+        polite.finish(Duration::from_secs(5));
+        assert!(started.elapsed() < Duration::from_secs(2));
+
+        let mut stubborn = LineChild::spawn(sh("sleep 600"), "stubborn", false).unwrap();
+        let pid = stubborn.pid();
+        stubborn.finish(Duration::from_millis(200));
+        assert!(gone_within(pid, Duration::from_secs(5)));
     }
 
     #[test]

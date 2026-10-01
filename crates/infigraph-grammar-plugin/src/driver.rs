@@ -1,11 +1,15 @@
-use std::io::{BufRead, BufReader, Write};
-use std::process::{Child, Command, Stdio};
+use std::process::Command;
 use std::sync::Mutex;
 
 use anyhow::{bail, Context, Result};
+use infigraph_core::child::{ChildTimeouts, LineChild};
 
+/// One JVM serving every grammar plugin. A request that times out poisons it
+/// (the JVM is killed with its group, and every later call fails naming the
+/// first failure): see [`LineChild`].
 pub struct GrammarDriver {
-    inner: Mutex<DriverInner>,
+    child: Mutex<LineChild>,
+    timeouts: ChildTimeouts,
 }
 
 pub struct LoadGrammarOptions<'a> {
@@ -15,28 +19,21 @@ pub struct LoadGrammarOptions<'a> {
     pub pipe_strings: bool,
 }
 
-struct DriverInner {
-    child: Child,
-    reader: BufReader<std::process::ChildStdout>,
-    line_buf: String,
-}
-
 impl GrammarDriver {
     pub fn spawn(driver_jar: &str) -> Result<Self> {
-        let mut child = Command::new("java")
-            .args(["-jar", driver_jar])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
+        let mut command = Command::new("java");
+        command.args(["-jar", driver_jar]);
+        Self::spawn_command(command, infigraph_core::child::ChildTimeouts::DEFAULT)
+    }
+
+    /// Starts the driver from `command`. `spawn` is this with the JVM; the
+    /// seam lets tests stand a script in for it and shorten the deadlines.
+    pub fn spawn_command(command: Command, timeouts: ChildTimeouts) -> Result<Self> {
+        let mut child = LineChild::spawn(command, "JVM grammar driver", false)
             .context("Failed to spawn JVM grammar driver. Is Java installed?")?;
 
-        let stdout = child.stdout.take().context("No stdout from JVM process")?;
-        let mut reader = BufReader::new(stdout);
-
-        let mut line = String::new();
-        reader
-            .read_line(&mut line)
+        let line = child
+            .read_line(timeouts.ready)
             .context("No ready signal from JVM driver")?;
         let ready: serde_json::Value =
             serde_json::from_str(line.trim()).context("Invalid ready signal from JVM driver")?;
@@ -45,11 +42,8 @@ impl GrammarDriver {
         }
 
         Ok(Self {
-            inner: Mutex::new(DriverInner {
-                child,
-                reader,
-                line_buf: String::with_capacity(64 * 1024),
-            }),
+            child: Mutex::new(child),
+            timeouts,
         })
     }
 
@@ -173,46 +167,127 @@ impl GrammarDriver {
     }
 
     fn send_request(&self, req: &serde_json::Value) -> Result<serde_json::Value> {
-        let mut inner = self
-            .inner
+        let mut child = self
+            .child
             .lock()
             .map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
-        let DriverInner {
-            ref mut child,
-            ref mut reader,
-            ref mut line_buf,
-        } = *inner;
-        let stdin = child.stdin.as_mut().context("No stdin")?;
-
-        let mut payload = serde_json::to_string(req)?;
-        payload.push('\n');
-        stdin.write_all(payload.as_bytes())?;
-        stdin.flush()?;
-
-        line_buf.clear();
-        reader.read_line(line_buf)?;
-        let resp: serde_json::Value = serde_json::from_str(line_buf.trim())
-            .with_context(|| format!("Invalid JSON from driver: {}", line_buf.trim()))?;
-        Ok(resp)
+        let line = child.request(&serde_json::to_string(req)?, self.timeouts.request)?;
+        serde_json::from_str(line.trim())
+            .with_context(|| format!("Invalid JSON from driver: {}", line.trim()))
     }
 
     pub fn shutdown(&self) -> Result<()> {
         let req = serde_json::json!({"cmd": "shutdown"});
         let _ = self.send_request(&req);
-        let mut inner = self
-            .inner
+        let mut child = self
+            .child
             .lock()
             .map_err(|e| anyhow::anyhow!("Lock poisoned: {e}"))?;
-        let _ = inner.child.wait();
+        child.finish(std::time::Duration::from_secs(5));
         Ok(())
     }
 }
 
-impl Drop for GrammarDriver {
-    fn drop(&mut self) {
-        if let Ok(mut inner) = self.inner.lock() {
-            let _ = inner.child.kill();
-            let _ = inner.child.wait();
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use infigraph_core::child::ChildTimeouts;
+    use std::time::Duration;
+
+    fn sh(script: &str) -> Command {
+        let mut command = Command::new("sh");
+        command.args(["-c", script]);
+        command
+    }
+
+    const QUICK: ChildTimeouts = ChildTimeouts {
+        ready: Duration::from_millis(600),
+        request: Duration::from_millis(600),
+    };
+
+    fn alive(pid: u32) -> bool {
+        Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .output()
+            .is_ok_and(|o| o.status.success())
+    }
+
+    /// A JVM that starts but never says it is ready (a wedged class load) no
+    /// longer hangs `spawn` forever, and takes its stderr with it into the
+    /// error.
+    #[test]
+    fn a_driver_that_never_sends_ready_fails_spawn_within_the_deadline() {
+        let started = std::time::Instant::now();
+        let err = GrammarDriver::spawn_command(
+            sh("echo 'Error: could not open jar' >&2; sleep 600"),
+            QUICK,
+        )
+        .err()
+        .expect("spawn must fail");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("could not open jar"),
+            "stderr tail missing: {msg}"
+        );
+    }
+
+    /// A request the driver never answers fails within the request deadline,
+    /// poisons the driver (killing its process group), and every later call
+    /// names the first failure instead of reading a stale reply.
+    #[test]
+    fn a_request_that_hangs_poisons_the_driver_and_kills_its_group() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pid_file = tmp.path().join("grandchild.pid");
+        let driver = GrammarDriver::spawn_command(
+            sh(&format!(
+                "echo '{{\"ready\":true}}'; sleep 600 & echo $! > '{}'; read l; wait",
+                pid_file.display()
+            )),
+            QUICK,
+        )
+        .expect("ready handshake");
+        let started = std::time::Instant::now();
+        let first = driver.parse("g", "a.x", "src").unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(format!("{first:#}").contains("sent nothing"), "{first:#}");
+        let later = driver.parse("g", "b.x", "src").unwrap_err();
+        let msg = format!("{later:#}");
+        assert!(msg.contains("first failure"), "{msg}");
+        let grandchild: u32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while alive(grandchild) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
         }
+        assert!(
+            !alive(grandchild),
+            "the driver's grandchild outlived the poison"
+        );
+    }
+
+    /// A healthy conversation still works through the new plumbing.
+    #[test]
+    fn a_healthy_driver_answers_requests() {
+        let driver = GrammarDriver::spawn_command(
+            sh("echo '{\"ready\":true}'; while read l; do echo '{\"ok\":true,\"tree\":{\"n\":1}}'; done"),
+            ChildTimeouts::DEFAULT,
+        )
+        .expect("ready handshake");
+        let tree = driver.parse("g", "a.x", "src").unwrap();
+        assert_eq!(tree["n"], 1);
+        let tree = driver.parse("g", "b.x", "src").unwrap();
+        assert_eq!(tree["n"], 1);
     }
 }
