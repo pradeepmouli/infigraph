@@ -1740,6 +1740,41 @@ async fn run_scip_indexer_cmd_async(
     .succeeded()
 }
 
+/// How often a queued indexer retries for a machine-wide slot.
+const SLOT_POLL: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Waits for a machine-wide indexer slot (`infigraph_core::scip_slots`) and
+/// returns it; the indexer runs only while it is held. `None` means no cap
+/// applies: there is no pool (no home directory), or the slot files cannot
+/// be locked, which is warned about rather than allowed to stop enrichment.
+async fn claim_indexer_slot(
+    pool: Option<&infigraph_core::scip_slots::SlotPool>,
+    label: &str,
+) -> Option<infigraph_core::scip_slots::IndexerSlot> {
+    let pool = pool?;
+    let mut announced = false;
+    loop {
+        match pool.try_claim() {
+            Ok(Some(slot)) => return Some(slot),
+            Ok(None) => {
+                if !announced {
+                    eprintln!(
+                        "Auto-SCIP: {label} is waiting for an indexer slot ({} in use on this \
+                         machine; [scip] max_concurrent_indexers)",
+                        pool.max()
+                    );
+                    announced = true;
+                }
+                tokio::time::sleep(SLOT_POLL).await;
+            }
+            Err(e) => {
+                eprintln!("Auto-SCIP: indexer slots unavailable ({e:#}); running {label} uncapped");
+                return None;
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_indexer(
     root: &Path,
@@ -1751,6 +1786,17 @@ async fn run_indexer(
     output_path: &Path,
     timeout: std::time::Duration,
 ) -> IndexerOutcome {
+    // Queue for a machine-wide slot first, outside `timeout`: the bound is on
+    // the indexer's own run, not on how long others kept the machine busy.
+    // Held until this function returns.
+    // Unit tests' fake indexers stay off the real machine's pool, so they
+    // never queue behind (or delay) a real enrichment.
+    let pool = if cfg!(test) {
+        None
+    } else {
+        infigraph_core::scip_slots::SlotPool::machine()
+    };
+    let _slot = claim_indexer_slot(pool.as_ref(), label).await;
     // `kill_on_drop` reaps the direct child when this future is dropped; the
     // guard below takes the rest of its group.
     let mut command = tokio::process::Command::from(indexer_command(
@@ -2042,6 +2088,29 @@ mod tests {
             ),
             "a full reindex's enrichment must tell the child to re-stamp the baseline"
         );
+    }
+
+    /// An indexer waits for a machine-wide slot before it spawns, so many
+    /// projects enriching at once queue instead of all running together.
+    #[tokio::test]
+    async fn an_indexer_waits_for_a_free_slot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pool = infigraph_core::scip_slots::SlotPool::new(tmp.path().join("slots"), 1);
+        let held = pool.try_claim().unwrap().expect("the only slot");
+
+        let waiting = claim_indexer_slot(Some(&pool), "test-indexer");
+        tokio::pin!(waiting);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(400), &mut waiting)
+                .await
+                .is_err(),
+            "an indexer got a slot while the pool was full"
+        );
+        drop(held);
+        let slot = tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
+            .await
+            .expect("a freed slot was never taken");
+        assert!(slot.is_some());
     }
 
     /// Regression test for review feedback on the scip-enrich fix:

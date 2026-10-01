@@ -69,6 +69,12 @@ pub fn user_config_path() -> Option<PathBuf> {
     user_config_location().filter(|candidate| candidate.exists())
 }
 
+/// The user's own `~/.infigraph/` directory, whether or not it exists; the
+/// directory the user layer's `config.toml` lives in.
+pub fn user_infigraph_dir() -> Option<PathBuf> {
+    user_config_location()?.parent().map(Path::to_path_buf)
+}
+
 /// Where the user layer would be, whether or not it exists. `USERPROFILE`
 /// is the Windows spelling of `HOME`.
 fn user_config_location() -> Option<PathBuf> {
