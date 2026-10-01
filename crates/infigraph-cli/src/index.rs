@@ -2543,6 +2543,10 @@ mod tests {
         assert!(good.exists());
     }
 
+    /// `printf` escapes for a SCIP index with one document, which is what a
+    /// fake indexer must write now that an output with none is refused (#73).
+    const ONE_DOCUMENT_INDEX_PRINTF: &str = "\\012\\000\\022\\003\\012\\001a";
+
     /// A fake `scip-java`: the gradle attempt hangs, the maven attempt
     /// writes its `--output` file and succeeds.
     #[cfg(unix)]
@@ -2551,7 +2555,7 @@ mod tests {
         let script = dir.join("scip-java");
         std::fs::write(
             &script,
-            "#!/bin/sh\ncase \"$*\" in\n*gradle*) exec sleep 600;;\nesac\nfor a; do out=$a; done\necho ok > \"$out\"\n",
+            "#!/bin/sh\ncase \"$*\" in\n*gradle*) exec sleep 600;;\nesac\nfor a; do out=$a; done\nprintf '\\012\\000\\022\\003\\012\\001a' > \"$out\"\n",
         )
         .unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -2626,7 +2630,11 @@ mod tests {
         let sibling_ok = run_scip_indexer_cmd_async(
             &root,
             "sh",
-            &["-c", "echo ok > \"$0\"", &sibling_out.to_string_lossy()],
+            &[
+                "-c",
+                &format!("printf '{ONE_DOCUMENT_INDEX_PRINTF}' > \"$0\""),
+                &sibling_out.to_string_lossy(),
+            ],
             "sibling",
             None,
             None,
