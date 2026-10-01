@@ -61,6 +61,14 @@ pub struct DocIndexResult {
     pub pipeline_warnings: Vec<String>,
 }
 
+/// Whether a stored document id names a local file, which is the only kind
+/// the disk walk can vouch for. A document from an external source carries a
+/// URL-style id (`confluence://SPACE/123`), and a manifest node has no file at
+/// all (the empty key); neither is "gone" because no local file matches.
+fn is_local_document_id(id: &str) -> bool {
+    !id.is_empty() && !id.contains("://")
+}
+
 impl DocIndex {
     pub fn open(root: &Path) -> Result<Self> {
         let tg_dir = root.join(".infigraph");
@@ -435,7 +443,8 @@ impl DocIndex {
     }
 
     /// Removes the documents of files that no longer exist on disk (and their
-    /// pipelines, with them), if the listing of the root was complete. Scoped to this repo's namespace on both sides:
+    /// pipelines, with them), if the listing of the root was complete. Only
+    /// local document ids are candidates ([`is_local_document_id`]). Scoped to this repo's namespace on both sides:
     /// `existing_hashes` pools every repo sharing the store in remote mode, so
     /// an unscoped diff would flag every other repo's docs as "stale" and
     /// delete them.
@@ -474,6 +483,7 @@ impl DocIndex {
                 Some(prefix) => k.starts_with(&format!("{prefix}/")),
                 None => true,
             })
+            .filter(|k| is_local_document_id(k))
             .filter(|k| !current_files.contains(k.as_str()))
             .cloned()
             .collect();
@@ -773,6 +783,16 @@ mod tests {
         let (files, complete) = idx.collect_doc_files().unwrap();
         assert!(files.is_empty());
         assert!(!complete, "a missing root listed as complete");
+    }
+
+    #[test]
+    fn only_file_ids_are_local_document_ids() {
+        for local in ["a.md", "docs/a.md", "../README.md", "org/repo/a.md"] {
+            assert!(is_local_document_id(local), "{local}");
+        }
+        for external in ["", "confluence://SP/1", "https://example.com/x"] {
+            assert!(!is_local_document_id(external), "{external:?}");
+        }
     }
 
     #[test]

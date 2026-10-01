@@ -602,3 +602,62 @@ fn an_unreadable_subdirectory_keeps_the_documents_stored_from_it() {
     result.unwrap();
     assert_eq!(stored_docs(&idx), vec!["a.md", "sub/b.md"]);
 }
+
+// --- externally sourced documents are not pruned for lacking a local file ---
+
+/// A document from an external source (a Confluence page) and a manifest
+/// node, as the real writers make them.
+fn seed_external(idx: &DocIndex) {
+    use infigraph_docs::chunk::{chunk_document, Chunk, ChunkStrategy};
+    let store = idx.store().unwrap();
+    let page = ExtractedDoc {
+        file: "confluence://SP/1".to_string(),
+        title: Some("page".to_string()),
+        content_hash: "hc".to_string(),
+        format: DocFormat::Markdown,
+        text: "page".to_string(),
+        page_count: None,
+    };
+    let chunks = chunk_document(&page, &page.file, "hc", ChunkStrategy::HeadingBounded);
+    let refs: Vec<&Chunk> = chunks.iter().collect();
+    store.upsert_docs(&[&page], &refs).unwrap();
+    store.ensure_document_node("svc/Cargo.toml").unwrap();
+}
+
+/// Whether a stored document is keyed `key` (its `file`; a manifest node has
+/// none, so it keys as the empty string).
+fn has_node(idx: &DocIndex, key: &str) -> bool {
+    stored_docs(idx).iter().any(|k| k == key)
+}
+
+#[test]
+fn a_local_index_run_keeps_external_pages_and_prunes_deleted_local_docs() {
+    let _env = Env::new();
+    let root = tempfile::tempdir().unwrap();
+    write(root.path(), "a.md", "# A\n");
+    write(root.path(), "gone.md", "# Gone\n");
+    let (idx, _) = index_dir(root.path());
+    seed_external(&idx);
+
+    std::fs::remove_file(root.path().join("gone.md")).unwrap();
+    write(root.path(), "a.md", "# A edited\n");
+    idx.index().unwrap();
+
+    assert!(has_node(&idx, "confluence://SP/1"), "external page pruned");
+    assert!(has_node(&idx, ""), "manifest node pruned");
+    assert!(has_node(&idx, "a.md"));
+    assert!(!has_node(&idx, "gone.md"), "a deleted local doc survived");
+}
+
+#[test]
+fn a_project_with_only_external_pages_keeps_them_when_no_local_file_is_found() {
+    let _env = Env::new();
+    let root = tempfile::tempdir().unwrap();
+    let (idx, _) = index_dir(root.path());
+    seed_external(&idx);
+
+    idx.index().unwrap();
+
+    assert!(has_node(&idx, "confluence://SP/1"), "external page pruned");
+    assert!(has_node(&idx, ""), "manifest node pruned");
+}
