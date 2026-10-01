@@ -808,6 +808,19 @@ pub(crate) fn auto_scip(
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
 
+    // The runner is async (timeout, kill-on-drop); this path is synchronous
+    // and not on a runtime, so it drives one indexer at a time on its own.
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("Auto-SCIP: failed to start local runtime for SCIP indexers: {e}");
+            return Ok(());
+        }
+    };
+
     // Sequential run: each indexer produces index.scip, import, cleanup
     for (indexer, bin_path) in &binaries {
         let Some(bin) = bin_path else { continue };
@@ -823,119 +836,31 @@ pub(crate) fn auto_scip(
             Some(extra.as_str())
         };
 
-        if indexer.binary_name == "scip-java" {
-            let has_gradle = root.join("build.gradle").exists()
-                || root.join("build.gradle.kts").exists()
-                || root.join("settings.gradle").exists()
-                || root.join("settings.gradle.kts").exists();
-            let has_maven = root.join("pom.xml").exists();
-
-            if has_gradle && has_maven {
-                let primary = if root.join("settings.gradle").exists()
-                    || root.join("settings.gradle.kts").exists()
-                {
-                    "gradle"
-                } else {
-                    "maven"
-                };
-                let fallback = if primary == "gradle" {
-                    "maven"
-                } else {
-                    "gradle"
-                };
-
-                println!("Auto-SCIP: detected both Maven and Gradle, trying {primary}");
-                let primary_args = ["index", "--build-tool", primary];
-                if run_scip_indexer(
-                    root,
-                    &cmd_str,
-                    &primary_args,
-                    indexer.binary_name,
-                    extra_path,
-                ) {
-                    import_scip_and_cleanup(root, None, backend);
-                } else {
-                    println!("Auto-SCIP: {primary} failed, falling back to {fallback}");
-                    let fallback_args = ["index", "--build-tool", fallback];
-                    if run_scip_indexer(
-                        root,
-                        &cmd_str,
-                        &fallback_args,
-                        indexer.binary_name,
-                        extra_path,
-                    ) {
-                        import_scip_and_cleanup(root, None, backend);
-                    }
-                }
-            } else if run_scip_indexer(
-                root,
-                &cmd_str,
-                indexer.scip_args,
-                indexer.binary_name,
-                extra_path,
-            ) {
-                import_scip_and_cleanup(root, None, backend);
-            }
-            continue;
-        }
-
-        if run_scip_indexer(
+        println!("Auto-SCIP: running {}...", indexer.binary_name);
+        let scip_out = root.join("index.scip");
+        let run = IndexerRun {
             root,
-            &cmd_str,
-            indexer.scip_args,
-            indexer.binary_name,
+            cmd: &cmd_str,
+            label: indexer.binary_name,
             extra_path,
-        ) {
+            output_flag: None,
+            output_path: &scip_out,
+            timeout: SCIP_INDEXER_TIMEOUT,
+        };
+        let produced = rt.block_on(async {
+            if indexer.binary_name == "scip-java" {
+                run.run_scip_java(indexer.scip_args, |m| println!("{m}"))
+                    .await
+            } else {
+                run.run(indexer.scip_args).await
+            }
+        });
+        if produced {
             import_scip_and_cleanup(root, None, backend);
         }
     }
 
     Ok(())
-}
-
-pub(crate) fn run_scip_indexer(
-    root: &Path,
-    cmd: &str,
-    args: &[&str],
-    label: &str,
-    extra_path: Option<&str>,
-) -> bool {
-    println!("Auto-SCIP: running {label}...");
-    let scip_out = root.join("index.scip");
-    let mut command = std::process::Command::new(cmd);
-    command.args(args).current_dir(root);
-    if let Some(extra) = extra_path {
-        let path = std::env::var("PATH").unwrap_or_default();
-        let sep = if cfg!(windows) { ";" } else { ":" };
-        command.env("PATH", format!("{extra}{sep}{path}"));
-    }
-    {
-        let ig = crate::scip_download::infigraph_dir();
-        let java_macos = ig.join("java").join("Contents").join("Home");
-        if java_macos.exists() {
-            command.env("JAVA_HOME", &java_macos);
-        } else {
-            let java_home = ig.join("java");
-            if java_home.join("bin").exists() {
-                command.env("JAVA_HOME", &java_home);
-            }
-        }
-        let dotnet_root = ig.join("dotnet");
-        if dotnet_root.exists() {
-            command.env("DOTNET_ROOT", &dotnet_root);
-        }
-    }
-    match command.status() {
-        Ok(s) if s.success() && scip_out.exists() => true,
-        Ok(s) => {
-            eprintln!("Auto-SCIP: {label} exited with {s}");
-            false
-        }
-        Err(e) => {
-            eprintln!("Auto-SCIP: failed to run {label}: {e}");
-            false
-        }
-    }
 }
 
 /// Entry point for the hidden `scip-enrich` subcommand (spawned by `index`).
@@ -1622,28 +1547,20 @@ async fn run_scip_indexer_to(
     // with fewer documents, and would import silently as partial enrichment.
     let partial = output_path.with_extension("partial");
 
+    let run = IndexerRun {
+        root,
+        cmd: &cmd_str,
+        label,
+        extra_path,
+        output_flag: indexer.output_flag,
+        output_path: &partial,
+        timeout: SCIP_INDEXER_TIMEOUT,
+    };
     let produced = if indexer.binary_name == "scip-java" {
-        // `run_scip_java`'s gradle/maven primary+fallback retry logic is
-        // out of scope for Task 6 and stays on the synchronous
-        // `std::process::Command` path (`run_scip_indexer_cmd` below) -- it
-        // blocks this async task's worker thread for its duration. On the
-        // `current_thread` runtime `run_scip_indexers` wraps itself in, a
-        // scip-java run temporarily starves any other indexer tasks queued
-        // alongside it (no `SCIP_INDEXER_TIMEOUT` bound either). Documented
-        // as a known follow-up rather than silently left inconsistent.
-        run_scip_java(root, &cmd_str, &partial, extra_path)
+        run.run_scip_java(indexer.scip_args, |m| eprintln!("{m}"))
+            .await
     } else {
-        run_scip_indexer_cmd_async(
-            root,
-            &cmd_str,
-            indexer.scip_args,
-            label,
-            extra_path,
-            indexer.output_flag,
-            &partial,
-            SCIP_INDEXER_TIMEOUT,
-        )
-        .await
+        run.run(indexer.scip_args).await
     };
 
     if produced && std::fs::rename(&partial, output_path).is_ok() {
@@ -1654,72 +1571,18 @@ async fn run_scip_indexer_to(
     false
 }
 
-fn run_scip_java(root: &Path, cmd: &str, output_path: &Path, extra_path: Option<&str>) -> bool {
-    let has_gradle = root.join("build.gradle").exists()
-        || root.join("build.gradle.kts").exists()
-        || root.join("settings.gradle").exists()
-        || root.join("settings.gradle.kts").exists();
-    let has_maven = root.join("pom.xml").exists();
-
-    if has_gradle && has_maven {
-        let primary =
-            if root.join("settings.gradle").exists() || root.join("settings.gradle.kts").exists() {
-                "gradle"
-            } else {
-                "maven"
-            };
-        let fallback = if primary == "gradle" {
-            "maven"
-        } else {
-            "gradle"
-        };
-
-        eprintln!("Auto-SCIP: detected both Maven and Gradle, trying {primary}");
-        let primary_args: Vec<&str> = vec!["index", "--build-tool", primary];
-        if run_scip_indexer_cmd(
-            root,
-            cmd,
-            &primary_args,
-            "scip-java",
-            extra_path,
-            Some("--output"),
-            output_path,
-        ) {
-            return true;
-        }
-        eprintln!("Auto-SCIP: {primary} failed, falling back to {fallback}");
-        let fallback_args: Vec<&str> = vec!["index", "--build-tool", fallback];
-        return run_scip_indexer_cmd(
-            root,
-            cmd,
-            &fallback_args,
-            "scip-java",
-            extra_path,
-            Some("--output"),
-            output_path,
-        );
-    }
-
-    run_scip_indexer_cmd(
-        root,
-        cmd,
-        &["index"],
-        "scip-java",
-        extra_path,
-        Some("--output"),
-        output_path,
-    )
-}
-
-fn run_scip_indexer_cmd(
+/// The command for one indexer attempt: arguments, cwd, the extra runtime
+/// directories on PATH, and the JAVA_HOME / DOTNET_ROOT of a toolchain
+/// infigraph downloaded for itself. The one place an indexer process is
+/// built.
+fn indexer_command(
     root: &Path,
     cmd: &str,
     args: &[&str],
-    label: &str,
     extra_path: Option<&str>,
     output_flag: Option<&str>,
     output_path: &Path,
-) -> bool {
+) -> std::process::Command {
     let mut command = std::process::Command::new(cmd);
     command.args(args).current_dir(root);
 
@@ -1733,46 +1596,27 @@ fn run_scip_indexer_cmd(
         command.env("PATH", format!("{extra}{sep}{path}"));
     }
 
-    {
-        let ig = crate::scip_download::infigraph_dir();
-        let java_macos = ig.join("java").join("Contents").join("Home");
-        if java_macos.exists() {
-            command.env("JAVA_HOME", &java_macos);
-        } else {
-            let java_home = ig.join("java");
-            if java_home.join("bin").exists() {
-                command.env("JAVA_HOME", &java_home);
-            }
-        }
-        let dotnet_root = ig.join("dotnet");
-        if dotnet_root.exists() {
-            command.env("DOTNET_ROOT", &dotnet_root);
+    let ig = crate::scip_download::infigraph_dir();
+    let java_macos = ig.join("java").join("Contents").join("Home");
+    if java_macos.exists() {
+        command.env("JAVA_HOME", &java_macos);
+    } else {
+        let java_home = ig.join("java");
+        if java_home.join("bin").exists() {
+            command.env("JAVA_HOME", &java_home);
         }
     }
-
-    match command.status() {
-        Ok(s) if s.success() => {
-            if output_flag.is_none() {
-                let default_out = root.join("index.scip");
-                if default_out.exists() && default_out != output_path {
-                    let _ = std::fs::rename(&default_out, output_path);
-                }
-            }
-            output_path.exists()
-        }
-        Ok(s) => {
-            eprintln!("Auto-SCIP: {label} exited with {s}");
-            false
-        }
-        Err(e) => {
-            eprintln!("Auto-SCIP: failed to run {label}: {e}");
-            false
-        }
+    let dotnet_root = ig.join("dotnet");
+    if dotnet_root.exists() {
+        command.env("DOTNET_ROOT", &dotnet_root);
     }
+    command
 }
 
-/// Async, timeout-bounded equivalent of `run_scip_indexer_cmd` above, used
-/// by every non-`scip-java` indexer path (see `run_scip_indexer_to`).
+/// Runs one indexer attempt, bounded by `timeout`. True when the indexer
+/// exited successfully and left its output at `output_path`. The single
+/// runner behind both the detached `scip-enrich` path (`run_scip_indexer_to`)
+/// and the foreground `index --no-embed` path (`auto_scip`).
 #[allow(clippy::too_many_arguments)]
 async fn run_scip_indexer_cmd_async(
     root: &Path,
@@ -1784,39 +1628,19 @@ async fn run_scip_indexer_cmd_async(
     output_path: &Path,
     timeout: std::time::Duration,
 ) -> bool {
-    let mut command = tokio::process::Command::new(cmd);
     // A timed-out run drops the in-flight `child.wait()` future below,
     // dropping the `Child` itself -- without `kill_on_drop`, tokio leaves
     // the orphaned process running rather than reaping it, which would
     // defeat the point of adding a timeout at all.
-    command.args(args).current_dir(root).kill_on_drop(true);
-
-    if let Some(flag) = output_flag {
-        command.arg(flag).arg(output_path);
-    }
-
-    if let Some(extra) = extra_path {
-        let path = std::env::var("PATH").unwrap_or_default();
-        let sep = if cfg!(windows) { ";" } else { ":" };
-        command.env("PATH", format!("{extra}{sep}{path}"));
-    }
-
-    {
-        let ig = crate::scip_download::infigraph_dir();
-        let java_macos = ig.join("java").join("Contents").join("Home");
-        if java_macos.exists() {
-            command.env("JAVA_HOME", &java_macos);
-        } else {
-            let java_home = ig.join("java");
-            if java_home.join("bin").exists() {
-                command.env("JAVA_HOME", &java_home);
-            }
-        }
-        let dotnet_root = ig.join("dotnet");
-        if dotnet_root.exists() {
-            command.env("DOTNET_ROOT", &dotnet_root);
-        }
-    }
+    let mut command = tokio::process::Command::from(indexer_command(
+        root,
+        cmd,
+        args,
+        extra_path,
+        output_flag,
+        output_path,
+    ));
+    command.kill_on_drop(true);
 
     let run = async {
         match command.status().await {
@@ -1846,6 +1670,81 @@ async fn run_scip_indexer_cmd_async(
             eprintln!("Auto-SCIP: {label} timed out after {timeout:?}");
             false
         }
+    }
+}
+
+/// One indexer invocation's fixed inputs: what to run, where, how it names
+/// its output, and how long it may take. Both indexer paths build one, so
+/// the scip-java gradle/maven chain exists once.
+struct IndexerRun<'a> {
+    root: &'a Path,
+    cmd: &'a str,
+    label: &'a str,
+    extra_path: Option<&'a str>,
+    output_flag: Option<&'a str>,
+    output_path: &'a Path,
+    timeout: std::time::Duration,
+}
+
+impl IndexerRun<'_> {
+    /// One attempt with `args`.
+    async fn run(&self, args: &[&str]) -> bool {
+        run_scip_indexer_cmd_async(
+            self.root,
+            self.cmd,
+            args,
+            self.label,
+            self.extra_path,
+            self.output_flag,
+            self.output_path,
+            self.timeout,
+        )
+        .await
+    }
+
+    /// scip-java over `base_args`: a project with both a Gradle and a Maven
+    /// build tries the one its layout points at, then the other if that
+    /// fails; anything else is a single attempt. `say` carries the two
+    /// chain progress lines (the callers differ in which stream they use).
+    /// Each attempt gets its own timeout.
+    async fn run_scip_java(&self, base_args: &[&str], say: fn(&str)) -> bool {
+        let root = self.root;
+        let has_gradle = root.join("build.gradle").exists()
+            || root.join("build.gradle.kts").exists()
+            || root.join("settings.gradle").exists()
+            || root.join("settings.gradle.kts").exists();
+        let has_maven = root.join("pom.xml").exists();
+
+        if !(has_gradle && has_maven) {
+            return self.run(base_args).await;
+        }
+
+        let primary =
+            if root.join("settings.gradle").exists() || root.join("settings.gradle.kts").exists() {
+                "gradle"
+            } else {
+                "maven"
+            };
+        let fallback = if primary == "gradle" {
+            "maven"
+        } else {
+            "gradle"
+        };
+
+        say(&format!(
+            "Auto-SCIP: detected both Maven and Gradle, trying {primary}"
+        ));
+        if self
+            .run(&[base_args, &["--build-tool", primary]].concat())
+            .await
+        {
+            return true;
+        }
+        say(&format!(
+            "Auto-SCIP: {primary} failed, falling back to {fallback}"
+        ));
+        self.run(&[base_args, &["--build-tool", fallback]].concat())
+            .await
     }
 }
 
