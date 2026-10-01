@@ -36,11 +36,20 @@ pub struct DependencyFields {
 
 const VALID_COL_TYPES: &[&str] = &["STRING", "INT64", "BOOL", "DOUBLE", "STRING[]"];
 
+/// The one rule for a plugin id: it names a table (`Pipeline_<plugin_id>`) and
+/// is interpolated into queries, so it is a lowercase letter followed by up to
+/// 31 lowercase letters, digits or underscores (`^[a-z][a-z0-9_]{0,31}$`).
+pub fn is_valid_plugin_id(id: &str) -> bool {
+    let mut chars = id.chars();
+    chars.next().is_some_and(|c| c.is_ascii_lowercase())
+        && id.len() <= 32
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+}
+
 impl PluginMeta {
     /// Validate the plugin metadata.
     pub fn validate(&self) -> Result<()> {
-        let id_re = Regex::new(r"^[a-z][a-z0-9_]{0,31}$").unwrap();
-        if !id_re.is_match(&self.plugin_id) {
+        if !is_valid_plugin_id(&self.plugin_id) {
             bail!(
                 "Invalid plugin_id '{}': must match ^[a-z][a-z0-9_]{{0,31}}$",
                 self.plugin_id
@@ -293,5 +302,21 @@ command = []
 "#;
         let config: PipelinePluginConfig = toml::from_str(toml_str).unwrap();
         assert!(config.plugin.validate().is_err());
+    }
+}
+
+#[cfg(test)]
+mod plugin_id_tests {
+    use super::is_valid_plugin_id;
+
+    #[test]
+    fn a_plugin_id_is_a_lowercase_letter_then_up_to_31_of_a_z_0_9_underscore() {
+        assert!(is_valid_plugin_id("a"));
+        assert!(is_valid_plugin_id("intuit_2"));
+        assert!(is_valid_plugin_id(&format!("a{}", "b".repeat(31)))); // 32 chars
+        assert!(!is_valid_plugin_id(&format!("a{}", "b".repeat(32)))); // 33 chars
+        for bad in ["", "1a", "_a", "A", "aB", "a-b", "a b", "a;b", "é"] {
+            assert!(!is_valid_plugin_id(bad), "{bad:?} was accepted");
+        }
     }
 }

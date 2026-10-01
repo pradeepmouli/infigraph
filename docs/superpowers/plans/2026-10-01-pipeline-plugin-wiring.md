@@ -30,6 +30,7 @@
 - `DocStore::delete_docs_by_ids` (`store.rs:386`) deletes `Chunk` and `Document` only.
 - `PipelinePluginDriver::start_with` runs `command` with `current_dir(plugin_dir)`.
 - `upsert_plugin_properties` (`store.rs:503`) writes every property as a quoted string, whatever the column's declared type. Unverified whether lbug accepts that for `INT64`/`BOOL`/`DOUBLE`/`STRING[]`; Task 2 measures it.
+- `upsert_docs` replaces a changed document's `Document` node (`store.rs` `MATCH (d:Document) WHERE d.file IN [...] DETACH DELETE d`; `neo4j_store.rs` the same), so a changed document loses its `DEFINED_IN` edge while its `PipelineCore` row survives. A pipeline kept because its plugin failed must be linked to the new node again (Task 3 does, through `link_pipeline_core_to_doc`, which is now a `MERGE` and does not duplicate the edge). Found in brainstorm review of Task 2.
 - `infigraph-pipeline-plugin` depends on `infigraph-core` only. `infigraph-docs` does not yet depend on `infigraph-pipeline-plugin`; adding it creates no cycle.
 
 Not re-verified by brainstorm (peer's greps): the Confluence call sites `crates/infigraph-confluence/src/sync.rs:131` and `crates/infigraph-mcp/src/tools/docs.rs:513`. Task 6 reads them first.

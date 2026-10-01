@@ -394,7 +394,7 @@ impl DocBackend for Neo4jDocStore {
                 by_plugin.entry(plugin).or_default().push(pid);
             }
             for (plugin, pids) in by_plugin {
-                if !crate::store::is_plugin_ident(&plugin) {
+                if !infigraph_pipeline_plugin::is_valid_plugin_id(&plugin) {
                     continue;
                 }
                 let q = query(&format!(
@@ -477,7 +477,7 @@ impl DocBackend for Neo4jDocStore {
     fn link_pipeline_core_to_doc(&self, pipeline_id: &str, doc_id: &str) -> Result<()> {
         let q = query(
             "MATCH (p:PipelineCore {id: $pid}), (d:Document {id: $did}) \
-             CREATE (p)-[:DEFINED_IN]->(d)",
+             MERGE (p)-[:DEFINED_IN]->(d)",
         )
         .param("pid", pipeline_id.to_string())
         .param("did", doc_id.to_string());

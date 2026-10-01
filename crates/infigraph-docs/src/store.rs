@@ -33,6 +33,18 @@ use crate::extract::ExtractedDoc;
 // carry a quote-only copy, which silently dropped backslashes.
 use infigraph_core::escape_str;
 
+/// Whether `table` exists in the catalog. `table` is a `Pipeline_<plugin_id>`
+/// name built from a validated plugin id. The one probe both the schema check
+/// and the delete use, so neither decides by reading an error message.
+fn plugin_table_exists(conn: &Connection, table: &str) -> Result<bool> {
+    let mut rows = conn
+        .query(&format!(
+            "CALL show_tables() WHERE name = '{table}' RETURN name"
+        ))
+        .map_err(|e| anyhow::anyhow!("list tables: {e}"))?;
+    Ok(rows.next().is_some())
+}
+
 /// A plugin property as a backend stores it: text, or -- for a `STRING[]`
 /// column -- the list's elements. Shared by every backend, so they agree on
 /// what a declared type means.
@@ -72,14 +84,6 @@ pub(crate) fn plugin_values(
             Some((col.clone(), shaped))
         })
         .collect()
-}
-
-/// A plugin id is interpolated into a table name, so only the shape
-/// `PluginMeta::validate` enforces is ever used as one.
-pub(crate) fn is_plugin_ident(id: &str) -> bool {
-    let mut chars = id.chars();
-    chars.next().is_some_and(|c| c.is_ascii_lowercase())
-        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
 }
 
 fn fwd_slash_path(p: &Path) -> String {
@@ -487,7 +491,11 @@ impl DocStore {
             by_plugin.entry(plugin).or_default().push(id);
         }
         for (plugin, ids) in by_plugin {
-            if !is_plugin_ident(plugin) {
+            if !infigraph_pipeline_plugin::is_valid_plugin_id(plugin) {
+                continue;
+            }
+            // A plugin whose table was never created has nothing to delete.
+            if !plugin_table_exists(&conn, &format!("Pipeline_{plugin}"))? {
                 continue;
             }
             let ids = ids
@@ -495,14 +503,10 @@ impl DocStore {
                 .map(|id| format!("'{}'", escape_str(id)))
                 .collect::<Vec<_>>()
                 .join(", ");
-            // A plugin whose table was never created has nothing to delete.
-            match conn.query(&format!(
+            conn.query(&format!(
                 "MATCH (x:Pipeline_{plugin}) WHERE x.id IN [{ids}] DELETE x"
-            )) {
-                Ok(_) => {}
-                Err(e) if e.to_string().contains("does not exist") => {}
-                Err(e) => anyhow::bail!("delete Pipeline_{plugin} rows: {e}"),
-            }
+            ))
+            .map_err(|e| anyhow::anyhow!("delete Pipeline_{plugin} rows: {e}"))?;
         }
         conn.query(&format!(
             "MATCH (p:PipelineCore) WHERE p.doc_id IN [{id_list}] DETACH DELETE p"
@@ -559,9 +563,15 @@ impl DocStore {
     /// EXISTS` does not alter a table, so an existing one whose columns are not
     /// the plugin's now is reported rather than written against in its old shape.
     pub fn ensure_plugin_table(&self, plugin_id: &str, columns: &[(String, String)]) -> Result<()> {
+        if !infigraph_pipeline_plugin::is_valid_plugin_id(plugin_id) {
+            anyhow::bail!("'{plugin_id}' is not a valid pipeline plugin id");
+        }
         let conn = self.connection()?;
         let table = format!("Pipeline_{plugin_id}");
-        if let Ok(rows) = conn.query(&format!("CALL table_info('{table}') RETURN *")) {
+        if plugin_table_exists(&conn, &table)? {
+            let rows = conn
+                .query(&format!("CALL table_info('{table}') RETURN *"))
+                .map_err(|e| anyhow::anyhow!("inspect {table}: {e}"))?;
             let mut existing: Vec<(String, String)> = rows
                 .map(|r| (r[1].to_string(), r[2].to_string().to_ascii_uppercase()))
                 .filter(|(name, _)| name != "id")
@@ -665,7 +675,7 @@ impl DocStore {
     pub fn link_pipeline_core_to_doc(&self, pipeline_id: &str, doc_id: &str) -> Result<()> {
         let conn = self.connection()?;
         conn.query(&format!(
-            "MATCH (p:PipelineCore), (d:Document) WHERE p.id = '{}' AND d.id = '{}' CREATE (p)-[:DEFINED_IN]->(d)",
+            "MATCH (p:PipelineCore), (d:Document) WHERE p.id = '{}' AND d.id = '{}' MERGE (p)-[:DEFINED_IN]->(d)",
             escape_str(pipeline_id),
             escape_str(doc_id),
         ))

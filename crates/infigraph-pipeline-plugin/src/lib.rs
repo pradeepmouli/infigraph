@@ -1,7 +1,9 @@
 pub mod config;
 pub mod driver;
 
-pub use config::{generate_ddl, ColumnDef, DependencyFields, PipelinePluginConfig, PluginMeta};
+pub use config::{
+    generate_ddl, is_valid_plugin_id, ColumnDef, DependencyFields, PipelinePluginConfig, PluginMeta,
+};
 pub use driver::{PipelineCoreFields, PipelineData, PipelinePluginDriver, PipelinePluginRegistry};
 
 use std::collections::BTreeMap;

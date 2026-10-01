@@ -522,3 +522,41 @@ fn test_ensure_plugin_table_reports_schema_drift() {
     assert!(msg.contains("intuit"), "{msg}");
     assert!(msg.contains("reindex-docs"), "{msg}");
 }
+
+// ==================== idempotent link, plugin ids ====================
+
+/// `upsert_docs` replaces a changed document's node, so a kept pipeline has to
+/// be linked to the new node again; linking twice must not add a second edge.
+#[test]
+fn test_linking_a_pipeline_to_its_document_twice_keeps_one_edge() {
+    let (_tmp, store) = test_store();
+    insert_document(&store, "doc::w2");
+    store.upsert_pipeline_core(&w2_pipeline()).unwrap();
+    store
+        .link_pipeline_core_to_doc("pipeline::w2", "doc::w2")
+        .unwrap();
+    store
+        .link_pipeline_core_to_doc("pipeline::w2", "doc::w2")
+        .unwrap();
+    let edges: Vec<String> = store
+        .connection()
+        .unwrap()
+        .query("MATCH (:PipelineCore)-[r:DEFINED_IN]->(:Document) RETURN count(r)")
+        .unwrap()
+        .map(|r| r[0].to_string())
+        .collect();
+    assert_eq!(edges, vec!["1"]);
+}
+
+#[test]
+fn test_ensure_plugin_table_refuses_an_id_that_is_not_a_plugin_id() {
+    let (_tmp, store) = test_store();
+    for bad in ["Intuit", "x y", "a-b", "1abc", "", "a)}; DROP"] {
+        assert!(
+            store
+                .ensure_plugin_table(bad, &compliance_columns())
+                .is_err(),
+            "{bad:?} reached the DDL"
+        );
+    }
+}

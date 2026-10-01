@@ -173,6 +173,12 @@ impl LineChild {
         })
     }
 
+    /// Whether a timeout, an exit or a failed write has already killed this
+    /// child; every later call fails.
+    pub fn is_poisoned(&self) -> bool {
+        self.poisoned.is_some()
+    }
+
     pub fn pid(&self) -> u32 {
         self.child.id()
     }
@@ -393,6 +399,7 @@ mod tests {
             .request("hang please", Duration::from_millis(300))
             .unwrap_err();
         assert!(format!("{first:#}").contains("sent nothing"));
+        assert!(child.is_poisoned());
         let later = child.request("again", Duration::from_secs(5)).unwrap_err();
         let msg = format!("{later:#}");
         assert!(msg.contains("first failure"), "{msg}");

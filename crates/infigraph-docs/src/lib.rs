@@ -8,6 +8,7 @@ pub mod extract;
 #[cfg(feature = "remote")]
 pub mod neo4j_store;
 pub mod ops;
+pub mod pipelines;
 pub mod query;
 pub mod search;
 pub mod store;

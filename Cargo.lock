@@ -2532,6 +2532,7 @@ dependencies = [
  "clap",
  "fs2",
  "infigraph-core",
+ "infigraph-pipeline-plugin",
  "lbug",
  "neo4rs",
  "notify",
