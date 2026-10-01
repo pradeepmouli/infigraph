@@ -427,7 +427,9 @@ pub(crate) fn cmd_index(root: &Path, full: bool, no_embed: bool) -> Result<()> {
 
     // Compute and save embeddings — only for new/changed symbols
     if no_embed {
-        auto_scip(root, &result, prism.backend())?;
+        if infigraph_core::scip_switch::index_enriches(root, full) {
+            auto_scip(root, &result, prism.backend())?;
+        }
         return Ok(());
     }
     {
@@ -486,7 +488,10 @@ pub(crate) fn cmd_index(root: &Path, full: bool, no_embed: bool) -> Result<()> {
     // A full reindex is not really finished until its enrichment is: pass
     // the same `full && !remote` condition that gated the stamp above, so
     // the child re-stamps once the enriched graph is the real one.
-    spawn_scip_child_process(root, &detected_languages, full && !remote);
+    // Off, or an incremental index of a linked worktree: see `index_enriches`.
+    if infigraph_core::scip_switch::index_enriches(root, full) {
+        spawn_scip_child_process(root, &detected_languages, full && !remote);
+    }
 
     crate::agent::refresh_project_instructions(root);
 
@@ -585,9 +590,6 @@ fn spawn_scip_child_process(
 ) {
     use crate::scip_download;
 
-    if !infigraph_core::scip_switch::scip_enabled(root) {
-        return;
-    }
     let indexers = scip_download::indexers_for_languages(detected_languages);
     if indexers.is_empty() {
         return;
@@ -778,9 +780,6 @@ pub(crate) fn auto_scip(
     use crate::scip_download;
     use std::collections::HashSet;
 
-    if !infigraph_core::scip_switch::scip_enabled(root) {
-        return Ok(());
-    }
     let detected: HashSet<String> = result
         .extractions
         .iter()

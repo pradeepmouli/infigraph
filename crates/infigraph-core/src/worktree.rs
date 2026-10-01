@@ -61,6 +61,13 @@ pub fn main_worktree_path(path: &Path) -> Result<PathBuf> {
         .context("git worktree list returned no entries")
 }
 
+/// Whether `path` is a linked worktree: inside git, and not the repo's main
+/// worktree. Outside git, or when git cannot say, it is not.
+pub fn is_linked_worktree(path: &Path) -> bool {
+    main_worktree_path(path)
+        .is_ok_and(|main| canonicalize_lenient(&main) != canonicalize_lenient(path))
+}
+
 #[derive(Debug, Default)]
 pub struct WorktreeDrift {
     pub bootstrap_candidates: Vec<PathBuf>,
@@ -144,4 +151,50 @@ pub fn find_worktree_drift(registry: &Registry, repo_scope: Option<&Path>) -> Wo
     }
 
     drift
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+
+    fn git(dir: &Path, args: &[&str]) {
+        let ok = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "git {args:?} failed");
+    }
+
+    /// A repo with one commit and a linked worktree beside it.
+    pub(crate) fn repo_with_linked_worktree() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let main = tmp.path().join("main");
+        std::fs::create_dir_all(&main).unwrap();
+        git(&main, &["init", "-q"]);
+        std::fs::write(main.join("a.txt"), "a").unwrap();
+        git(&main, &["add", "."]);
+        git(&main, &["commit", "-qm", "init"]);
+        let linked = tmp.path().join("linked");
+        git(&main, &["worktree", "add", "-q", linked.to_str().unwrap()]);
+        (tmp, main, linked)
+    }
+
+    #[test]
+    fn a_linked_worktree_is_told_apart_from_the_main_one() {
+        let (_tmp, main, linked) = repo_with_linked_worktree();
+        assert!(is_linked_worktree(&linked));
+        assert!(!is_linked_worktree(&main));
+    }
+
+    #[test]
+    fn a_directory_outside_git_is_not_a_linked_worktree() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(!is_linked_worktree(tmp.path()));
+    }
 }
