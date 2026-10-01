@@ -83,6 +83,196 @@ impl ChildTimeouts {
     };
 }
 
+/// Makes `command` lead a process group of its own (pgid == pid, set
+/// atomically at spawn), so a signal to that group reaches what the child
+/// started and nothing else. The one place a spawn of ours asks for it.
+/// Unix only: elsewhere a child cannot be grouped this way (Job Objects would
+/// be the equivalent, #208).
+pub fn lead_own_group(command: &mut Command) {
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(command, 0);
+    #[cfg(not(unix))]
+    let _ = command;
+}
+
+/// Whether `child` has exited, without reaping it: the exit status stays
+/// pending and the pid stays ours. That is what makes "signal the group, then
+/// reap" possible -- once a leader is reaped its pid is free to be reused, so
+/// a group must be signalled before it. Never call after the child was waited.
+///
+/// Non-unix has no such peek; there it reaps like `try_wait`, and group
+/// signalling is a no-op anyway.
+pub fn exited_unreaped(child: &mut Child) -> std::io::Result<bool> {
+    #[cfg(unix)]
+    {
+        // SAFETY: an all-zero siginfo_t is a valid output buffer for waitid.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: P_PID with this child's pid; WNOWAIT leaves it waitable.
+        let rc = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                child.id() as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: reading the pid out of the siginfo waitid just filled in.
+        #[cfg(target_os = "linux")]
+        let pid = unsafe { info.si_pid() };
+        #[cfg(not(target_os = "linux"))]
+        let pid = info.si_pid;
+        // waitid leaves si_pid 0 when nothing was waitable (WNOHANG).
+        Ok(pid != 0)
+    }
+    #[cfg(not(unix))]
+    {
+        child.try_wait().map(|status| status.is_some())
+    }
+}
+
+/// Kills a process group when dropped before [`disarm`](Self::disarm), for a
+/// leader owned by an async `Child` that cannot be a [`GroupChild`]: on a
+/// timeout, or when the owning future is dropped (a cancelled batch, daemon
+/// shutdown). `kill_on_drop` alone reaches only the direct child.
+///
+/// Safe against pid reuse because it fires while the leader is still
+/// unreaped: a dropped owning future drops this guard before the `Child`
+/// (declared earlier, so dropped later) is reaped, and a run whose `wait()`
+/// completed has already disarmed it.
+///
+/// Unix only: on Windows an indexer's grandchildren still outlive a timeout
+/// and only the direct child dies (Job Objects, #208).
+pub struct GroupKillOnDrop(Option<u32>);
+
+impl GroupKillOnDrop {
+    /// Guards the group led by `pid` (a child spawned with [`lead_own_group`]).
+    pub fn new(pid: Option<u32>) -> Self {
+        Self(pid)
+    }
+
+    pub fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for GroupKillOnDrop {
+    fn drop(&mut self) {
+        if let Some(pid) = self.0 {
+            crate::daemon::lifecycle::kill_process_group(pid);
+        }
+    }
+}
+
+/// A child that leads its own process group *because this type spawned it
+/// so*: the group id it signals is, by construction, one it created, never
+/// the caller's own group or a group inherited from elsewhere (a wrong
+/// `killpg` there takes out the MCP client). Stopping it is TERM, a grace
+/// period, then KILL, and every signal goes out while the leader is still
+/// unreaped. Dropping it kills the group at once.
+pub struct GroupChild {
+    child: Child,
+    reaped: bool,
+    /// How many group signals were sent (test seam).
+    #[cfg(test)]
+    group_signals: usize,
+}
+
+impl GroupChild {
+    /// Spawns `command` as its own group leader.
+    pub fn spawn(mut command: Command) -> std::io::Result<Self> {
+        lead_own_group(&mut command);
+        Ok(Self {
+            child: command.spawn()?,
+            reaped: false,
+            #[cfg(test)]
+            group_signals: 0,
+        })
+    }
+
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// The `Child`, for taking its pipes. Do not wait on it directly.
+    pub fn child_mut(&mut self) -> &mut Child {
+        &mut self.child
+    }
+
+    /// Whether the leader has exited; it stays unreaped until [`reap`] or
+    /// [`stop`](Self::stop).
+    ///
+    /// [`reap`]: Self::reap
+    pub fn exited(&mut self) -> std::io::Result<bool> {
+        if self.reaped {
+            return Ok(true);
+        }
+        exited_unreaped(&mut self.child)
+    }
+
+    /// Reaps a leader that has exited ([`exited`](Self::exited) said so),
+    /// after sweeping what it left in its group. The sweep comes first, while
+    /// the zombie leader still holds the pgid.
+    pub fn reap(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        if !self.reaped {
+            self.signal_group(false);
+        }
+        let status = self.child.wait();
+        self.reaped = true;
+        status
+    }
+
+    /// Terminates the group and reaps the leader. SIGTERM first, then it
+    /// waits up to `grace` for the leader to exit -- returning as soon as it
+    /// does -- and finally KILLs whatever is left in the group, all before
+    /// the leader is reaped. A zero `grace` is an immediate KILL. Only the
+    /// first call does anything.
+    pub fn stop(&mut self, grace: Duration) {
+        if self.reaped {
+            return;
+        }
+        if !grace.is_zero() {
+            self.signal_group(true);
+            let deadline = std::time::Instant::now() + grace;
+            while std::time::Instant::now() < deadline {
+                if matches!(exited_unreaped(&mut self.child), Ok(true)) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        self.signal_group(false);
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        self.reaped = true;
+    }
+
+    fn signal_group(&mut self, polite: bool) {
+        #[cfg(unix)]
+        {
+            #[cfg(test)]
+            {
+                self.group_signals += 1;
+            }
+            if polite {
+                crate::daemon::lifecycle::terminate_process_group(self.child.id());
+            } else {
+                crate::daemon::lifecycle::kill_process_group(self.child.id());
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = polite;
+    }
+}
+
+impl Drop for GroupChild {
+    fn drop(&mut self) {
+        self.stop(Duration::ZERO);
+    }
+}
+
 /// A spawned child that speaks one JSON line per request.
 pub struct LineChild {
     label: String,
@@ -112,8 +302,7 @@ impl LineChild {
             .stderr(Stdio::piped());
         // Its own group (pgid == pid), so the kill below reaches what the
         // child started too.
-        #[cfg(unix)]
-        std::os::unix::process::CommandExt::process_group(&mut command, 0);
+        lead_own_group(&mut command);
         let mut child = command
             .spawn()
             .with_context(|| format!("failed to spawn {label}"))?;
@@ -235,11 +424,12 @@ impl LineChild {
     pub fn finish(&mut self, grace: Duration) {
         let deadline = std::time::Instant::now() + grace;
         while std::time::Instant::now() < deadline {
-            if matches!(self.child.try_wait(), Ok(Some(_))) {
-                // It exited by itself and `try_wait` reaped it. Clear what it
-                // left in its group now, while a member may still hold the
-                // pgid, and never again.
+            if matches!(exited_unreaped(&mut self.child), Ok(true)) {
+                // It exited by itself and is still unreaped, so it still
+                // holds the pgid. Clear what it left in its group now, then
+                // reap it, and never signal again.
                 self.signal_group();
+                let _ = self.child.wait();
                 self.reaped = true;
                 return;
             }
@@ -517,5 +707,162 @@ mod tests {
         let mut tail = StderrTail::default();
         tail.push("y".repeat(100_000));
         assert!(tail.text().len() <= STDERR_TAIL_BYTES);
+    }
+
+    // --- GroupChild: a leader the caller spawned, stopped TERM-then-KILL ---
+
+    fn pgid_of(pid: u32) -> i32 {
+        // SAFETY: getpgid on a pid has no memory-safety requirements.
+        unsafe { libc::getpgid(pid as i32) }
+    }
+
+    fn read_pid(file: &std::path::Path) -> u32 {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !file.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        std::fs::read_to_string(file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap()
+    }
+
+    #[test]
+    fn lead_own_group_makes_the_child_a_group_leader() {
+        let mut command = sh("sleep 30");
+        lead_own_group(&mut command);
+        let mut child = command.spawn().unwrap();
+        assert_eq!(pgid_of(child.id()), child.id() as i32);
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// The peek that makes "signal the group, then reap" possible: it reports
+    /// an exit and leaves the zombie, so the pid is still ours.
+    #[test]
+    fn exited_unreaped_sees_an_exit_without_reaping_it() {
+        let mut command = sh("exit 3");
+        lead_own_group(&mut command);
+        let mut child = command.spawn().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !exited_unreaped(&mut child).unwrap() {
+            assert!(std::time::Instant::now() < deadline, "never saw the exit");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // Still there to be reaped: the pid has not been released.
+        assert!(alive(child.id()), "the peek reaped the child");
+        assert_eq!(child.wait().unwrap().code(), Some(3));
+    }
+
+    #[test]
+    fn exited_unreaped_is_false_while_the_child_runs() {
+        let mut command = sh("sleep 30");
+        lead_own_group(&mut command);
+        let mut child = command.spawn().unwrap();
+        assert!(!exited_unreaped(&mut child).unwrap());
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn stopping_a_group_child_that_exits_on_term_is_quick_and_takes_its_group() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pid_file = tmp.path().join("grandchild.pid");
+        let mut bystander = Command::new("sleep").arg("60").spawn().unwrap();
+        let mut child = GroupChild::spawn(sh(&format!(
+            "sleep 600 & echo $! > '{}'; wait",
+            pid_file.display()
+        )))
+        .unwrap();
+        let grandchild = read_pid(&pid_file);
+
+        let started = std::time::Instant::now();
+        child.stop(Duration::from_secs(5));
+
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "waited {:?} for a child that exits on TERM",
+            started.elapsed()
+        );
+        assert!(gone_within(grandchild, Duration::from_secs(5)));
+        let bystander_alive = bystander.try_wait().unwrap().is_none();
+        let _ = bystander.kill();
+        let _ = bystander.wait();
+        assert!(
+            bystander_alive,
+            "the stop reached a process outside the group"
+        );
+    }
+
+    #[test]
+    fn stopping_a_group_child_that_ignores_term_escalates_to_kill_after_the_grace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pid_file = tmp.path().join("grandchild.pid");
+        let mut child = GroupChild::spawn(sh(&format!(
+            "trap '' TERM; sleep 600 & echo $! > '{}'; wait",
+            pid_file.display()
+        )))
+        .unwrap();
+        let leader = child.pid();
+        let grandchild = read_pid(&pid_file);
+
+        let started = std::time::Instant::now();
+        child.stop(Duration::from_millis(400));
+        let took = started.elapsed();
+
+        assert!(
+            took >= Duration::from_millis(400),
+            "gave up early: {took:?}"
+        );
+        assert!(took < Duration::from_secs(3), "took {took:?}");
+        assert!(gone_within(leader, Duration::from_secs(5)));
+        assert!(gone_within(grandchild, Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn stopping_with_no_grace_kills_at_once() {
+        let mut child = GroupChild::spawn(sh("trap '' TERM; sleep 600")).unwrap();
+        let leader = child.pid();
+        let started = std::time::Instant::now();
+        child.stop(Duration::ZERO);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(gone_within(leader, Duration::from_secs(5)));
+    }
+
+    /// Once the leader is reaped its pid may be someone else's: a second stop
+    /// (or the Drop after one) must not signal the group again.
+    #[test]
+    fn a_stopped_group_child_is_never_signalled_again() {
+        let mut child = GroupChild::spawn(sh("sleep 600")).unwrap();
+        child.stop(Duration::from_millis(100));
+        assert_eq!(child.group_signals, 2, "TERM and KILL, once each");
+        child.stop(Duration::from_millis(100));
+        assert_eq!(child.group_signals, 2, "signalled after the reap");
+    }
+
+    /// A child that exited on its own is swept, then reaped, in that order:
+    /// what it left in its group dies while the leader still holds the pgid.
+    #[test]
+    fn a_group_child_that_exited_by_itself_has_its_group_swept_before_the_reap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pid_file = tmp.path().join("left-behind.pid");
+        let mut child = GroupChild::spawn(sh(&format!(
+            "sleep 600 & echo $! > '{}'; exit 0",
+            pid_file.display()
+        )))
+        .unwrap();
+        let left_behind = read_pid(&pid_file);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !child.exited().unwrap() {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // The leader is a zombie, so the pgid is still ours to signal.
+        assert!(alive(left_behind));
+        let status = child.reap();
+        assert!(status.unwrap().success());
+        assert!(gone_within(left_behind, Duration::from_secs(5)));
     }
 }

@@ -280,26 +280,48 @@ pub fn kill_own_process_group() -> bool {
 pub fn kill_process_group(pid: u32) -> bool {
     #[cfg(unix)]
     {
-        if pid <= 1 || pid == std::process::id() {
-            return false;
-        }
-        // SAFETY: argument-less getter that cannot fail.
-        if unsafe { libc::getpgrp() } == pid as i32 {
-            return false;
-        }
-        // SAFETY: `pid` is a positive group id, and is neither ours nor
-        // reserved -- both checked above. A group that is already gone fails
-        // with ESRCH, which is the no-op case arriving as an error.
-        unsafe {
-            libc::killpg(pid as i32, libc::SIGKILL);
-        }
-        true
+        signal_process_group(pid, libc::SIGKILL)
     }
     #[cfg(not(unix))]
     {
         let _ = pid;
         false
     }
+}
+
+/// SIGTERM to the process group led by `pid`: the polite half of
+/// [`kill_process_group`], with the same refusals. Returns whether a signal
+/// was actually sent.
+pub fn terminate_process_group(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        signal_process_group(pid, libc::SIGTERM)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+/// The one place a group is signalled by pid, so the refusals live once: our
+/// own pid, our own group, and pid 0 or 1.
+#[cfg(unix)]
+fn signal_process_group(pid: u32, signal: libc::c_int) -> bool {
+    if pid <= 1 || pid == std::process::id() {
+        return false;
+    }
+    // SAFETY: argument-less getter that cannot fail.
+    if unsafe { libc::getpgrp() } == pid as i32 {
+        return false;
+    }
+    // SAFETY: `pid` is a positive group id, and is neither ours nor
+    // reserved -- both checked above. A group that is already gone fails
+    // with ESRCH, which is the no-op case arriving as an error.
+    unsafe {
+        libc::killpg(pid as i32, signal);
+    }
+    true
 }
 
 pub fn ensure_daemon_running_required(root: &Path, watch_binary: &Path) -> DaemonStartOutcome {
