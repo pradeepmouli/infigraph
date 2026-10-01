@@ -4553,10 +4553,17 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().to_path_buf();
 
-        // An empty-but-valid SCIP index is enough to exercise the routing
-        // and completion path.
+        // A one-document SCIP index is enough to exercise the routing and
+        // completion path. (Not an empty one: an index with no documents is
+        // refused by the importer, #73.)
         let scip_path = root.join("index.scip");
-        let index = scip::types::Index::default();
+        let index = scip::types::Index {
+            documents: vec![scip::types::Document {
+                relative_path: "a.ts".to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
         std::fs::write(&scip_path, index.write_to_bytes().unwrap()).unwrap();
 
         let mut router = Router::new(&root);

@@ -719,6 +719,9 @@ pub(crate) fn cmd_daemon(root: &Path, debounce: u64) -> Result<()> {
                         }
                         Ok(infigraph_core::daemon_protocol::WriteResult::Err { message }) => {
                             eprintln!("[daemon] SCIP {label} import failed: {message}");
+                            // Keep a good output a transient failure left behind
+                            // (a later run can adopt it); drop an unusable one.
+                            crate::index::discard_output_after_failed_import(label, &scip_path);
                         }
                         Ok(_) => {
                             // ScipImport only ever replies ScipImportOk or Err.
