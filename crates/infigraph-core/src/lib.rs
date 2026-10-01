@@ -33,6 +33,7 @@ pub mod model;
 pub mod multi;
 pub mod ops;
 pub mod patterns;
+pub mod pipelines_trust;
 pub mod probe;
 pub mod proclog;
 pub mod project;

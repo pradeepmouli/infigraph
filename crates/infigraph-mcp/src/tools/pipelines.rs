@@ -10,18 +10,17 @@ pub fn tool_pipeline_plugins(args: &Value) -> Result<String> {
         .get("path")
         .and_then(|p| p.as_str())
         .context("missing 'path'")?;
-    let project_dir = PathBuf::from(path).join("pipelines");
-    let registry = infigraph_pipeline_plugin::load_pipeline_plugins(if project_dir.is_dir() {
-        Some(project_dir.as_path())
-    } else {
-        None
-    })?;
+    let root = PathBuf::from(path);
+    let registry = infigraph_pipeline_plugin::load_pipeline_plugins(Some(&root))?;
+    let note = infigraph_pipeline_plugin::untrusted_project_note(&root)
+        .map(|n| format!("{n}\n\n"))
+        .unwrap_or_default();
 
     if registry.is_empty() {
-        return Ok("No pipeline plugins loaded.\n\nTo add plugins, create directories under ~/.infigraph/pipelines/ or <project>/pipelines/ with a plugin.toml file.".to_string());
+        return Ok(format!("{note}No pipeline plugins loaded.\n\nTo add plugins, create directories under ~/.infigraph/pipelines/ or <project>/pipelines/ with a plugin.toml file."));
     }
 
-    let mut out = String::from("Loaded pipeline plugins:\n\n");
+    let mut out = format!("{note}Loaded pipeline plugins:\n\n");
     for driver in registry.plugins() {
         let cfg = &driver.config().plugin;
         out.push_str(&format!(
