@@ -18,7 +18,7 @@ path = "src/main.rs"
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-scip = "0.7.1"
+scip = "0.10.0"
 protobuf = "3"
 clap = { version = "4", features = ["derive"] }
 

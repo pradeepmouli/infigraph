@@ -31,7 +31,7 @@ glob = "0.3"
 regex = "1"
 dirs-next = "2"
 model2vec-rs = { version = "0.1", default-features = false, features = ["onig"] }
-scip = "0.7.1"
+scip = "0.10.0"
 protobuf = "3"
 tempfile = "3"
 # macos_kqueue enables the kqueue backend on macOS; notify selects inotify on Linux automatically.
