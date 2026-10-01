@@ -269,20 +269,24 @@ pub struct ScipRejected {
     pub reason: Rejection,
 }
 
+/// What the indexer did, as a predicate: "produced an empty file (0 bytes)".
+impl std::fmt::Display for Rejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Rejection::ZeroBytes => write!(f, "produced an empty file (0 bytes)"),
+            Rejection::NoDocuments => write!(
+                f,
+                "produced an index with no documents (metadata only), so there is nothing to import"
+            ),
+            Rejection::Unparseable(e) => write!(f, "produced a file that is not a SCIP index: {e}"),
+        }
+    }
+}
+
 impl std::fmt::Display for ScipRejected {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let who = self.indexer.as_deref().unwrap_or("the SCIP index");
-        match &self.reason {
-            Rejection::ZeroBytes => write!(f, "{who} produced an empty file (0 bytes)"),
-            Rejection::NoDocuments => write!(
-                f,
-                "{who} produced an index with no documents (metadata only), so there is \
-                 nothing to import"
-            ),
-            Rejection::Unparseable(e) => {
-                write!(f, "{who} produced a file that is not a SCIP index: {e}")
-            }
-        }
+        write!(f, "{who} {}", self.reason)
     }
 }
 

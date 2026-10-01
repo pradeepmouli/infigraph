@@ -1668,6 +1668,11 @@ enum IndexerFailure {
     TimedOut(std::time::Duration),
     /// It exited successfully but left no output behind.
     NoOutput,
+    /// It exited successfully and left an output that cannot be imported: no
+    /// bytes, no documents, or not a SCIP index (#73). Exit status 0 is not
+    /// evidence of a result; `scip-python` and `scip-go` exit 0 with a
+    /// metadata-only index for a language they find nothing of.
+    Rejected(infigraph_core::scip::ScipRejected),
 }
 
 /// What one indexer attempt did: how it failed, if it did, and the tail of
@@ -1691,6 +1696,32 @@ impl IndexerOutcome {
 /// tail is not printed a second time; the failure line names the last thing
 /// the indexer said, which is usually the reason.
 fn report_indexer_outcome(label: &str, outcome: &IndexerOutcome) {
+    if let Some(message) = indexer_outcome_message(label, outcome) {
+        eprintln!("{message}");
+    }
+}
+
+/// The cleanup after an import of `scip_path` failed (the daemon's `Err`
+/// reply). Deletes the file only when its content is unusable, decided from
+/// the file by the same rule the importer applies and never from the error
+/// text, and says so. A good file that failed for a transient reason (disk
+/// headroom, growth refused, a lock) is left for a later run to adopt, so
+/// the indexer is not re-run for it. True when the file was deleted.
+pub(crate) fn discard_output_after_failed_import(label: &str, scip_path: &Path) -> bool {
+    match infigraph_core::scip::discard_if_rejected(scip_path) {
+        Some(rejected) => {
+            eprintln!(
+                "[daemon] SCIP {label} output discarded: {}",
+                rejected.reason
+            );
+            true
+        }
+        None => false,
+    }
+}
+
+/// The wording of [`report_indexer_outcome`], so a test can read it.
+fn indexer_outcome_message(label: &str, outcome: &IndexerOutcome) -> Option<String> {
     let last = outcome
         .stderr_tail
         .lines()
@@ -1698,15 +1729,19 @@ fn report_indexer_outcome(label: &str, outcome: &IndexerOutcome) {
         .find(|l| !l.trim().is_empty())
         .map(|l| format!(" (last stderr line: {})", l.trim()))
         .unwrap_or_default();
-    match &outcome.failure {
-        Some(IndexerFailure::Spawn(e)) | Some(IndexerFailure::Wait(e)) => {
-            eprintln!("Auto-SCIP: failed to run {label}: {e}")
+    match outcome.failure.as_ref()? {
+        IndexerFailure::Spawn(e) | IndexerFailure::Wait(e) => {
+            Some(format!("Auto-SCIP: failed to run {label}: {e}"))
         }
-        Some(IndexerFailure::Exited(s)) => eprintln!("Auto-SCIP: {label} exited with {s}{last}"),
-        Some(IndexerFailure::TimedOut(t)) => {
-            eprintln!("Auto-SCIP: {label} timed out after {t:?}{last}")
+        IndexerFailure::Exited(s) => Some(format!("Auto-SCIP: {label} exited with {s}{last}")),
+        IndexerFailure::TimedOut(t) => {
+            Some(format!("Auto-SCIP: {label} timed out after {t:?}{last}"))
         }
-        Some(IndexerFailure::NoOutput) | None => {}
+        IndexerFailure::Rejected(r) => Some(format!(
+            "Auto-SCIP: {label} {}{last}; its output was discarded",
+            r.reason
+        )),
+        IndexerFailure::NoOutput => None,
     }
 }
 
@@ -1832,10 +1867,13 @@ async fn run_indexer(
                                 let _ = std::fs::rename(&default_out, output_path);
                             }
                         }
-                        output_path
-                            .exists()
-                            .then_some(())
-                            .ok_or(IndexerFailure::NoOutput)
+                        if !output_path.exists() {
+                            Err(IndexerFailure::NoOutput)
+                        } else {
+                            // Exit 0 and a file is still not a result.
+                            infigraph_core::scip::rejection_of(output_path)
+                                .map_or(Ok(()), |r| Err(IndexerFailure::Rejected(r)))
+                        }
                     }
                     Ok(s) => Err(IndexerFailure::Exited(s)),
                     Err(e) => Err(IndexerFailure::Wait(e)),
@@ -2398,6 +2436,111 @@ mod tests {
             "waited {elapsed:?} for a pipe held open by a grandchild"
         );
         assert!(outcome.stderr_tail.contains("before-exit"), "{outcome:?}");
+    }
+
+    /// An index with a metadata message and no documents: what `scip-python`
+    /// and `scip-go` write, exiting 0, for a project with none of their
+    /// language.
+    const METADATA_ONLY_INDEX: &[u8] = &[0x0a, 0x00];
+
+    /// Runs a fake indexer that copies `fixture` to its default output
+    /// (`index.scip`, as `scip-ruby` does) and says `stderr` on its way out.
+    #[cfg(unix)]
+    async fn run_fake_indexer(
+        dir: &Path,
+        fixture: &[u8],
+        stderr: &str,
+        name: &str,
+    ) -> (IndexerOutcome, PathBuf) {
+        let fixture_path = dir.join(format!("{name}.fixture"));
+        std::fs::write(&fixture_path, fixture).unwrap();
+        let output_path = dir.join(format!("{name}.1-2.scip"));
+        let outcome = run_indexer(
+            dir,
+            "sh",
+            &[
+                "-c",
+                &format!("cp \"$0\" index.scip; echo '{stderr}' >&2"),
+                &fixture_path.to_string_lossy(),
+            ],
+            name,
+            None,
+            None,
+            &output_path,
+            std::time::Duration::from_secs(30),
+        )
+        .await;
+        (outcome, output_path)
+    }
+
+    /// An indexer that exits 0 having produced an index with nothing in it
+    /// has failed, and says why with the last thing it said on stderr, so the
+    /// person running `index` or `scip-enrich` can see it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_indexer_that_exits_0_with_an_empty_index_has_failed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (outcome, _) = run_fake_indexer(
+            tmp.path(),
+            METADATA_ONLY_INDEX,
+            "no python files found",
+            "scip-python",
+        )
+        .await;
+
+        assert!(!outcome.succeeded(), "{outcome:?}");
+        assert!(
+            matches!(outcome.failure, Some(IndexerFailure::Rejected(_))),
+            "{outcome:?}"
+        );
+        let message = indexer_outcome_message("scip-python", &outcome).unwrap();
+        assert!(message.contains("no documents"), "{message}");
+        assert!(message.contains("no python files found"), "{message}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_indexer_that_exits_0_with_no_bytes_has_failed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (outcome, _) = run_fake_indexer(tmp.path(), b"", "wrote nothing", "scip-go").await;
+        let message = indexer_outcome_message("scip-go", &outcome).unwrap();
+        assert!(message.contains("empty file"), "{message}");
+    }
+
+    /// A sibling indexer's usable output is not held back by one indexer's
+    /// empty one: each is judged on its own file.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_empty_index_from_one_indexer_does_not_fail_its_sibling() {
+        let tmp = tempfile::tempdir().unwrap();
+        let good_fixture: Vec<u8> = {
+            // A document: field 2, length-delimited, holding relative_path "a".
+            vec![0x0a, 0x00, 0x12, 0x03, 0x0a, 0x01, b'a']
+        };
+        let (empty, _) =
+            run_fake_indexer(tmp.path(), METADATA_ONLY_INDEX, "none", "scip-python").await;
+        let (good, good_path) = run_fake_indexer(tmp.path(), &good_fixture, "ok", "scip-go").await;
+        assert!(!empty.succeeded());
+        assert!(good.succeeded(), "{good:?}");
+        assert!(good_path.exists());
+    }
+
+    /// After a failed import the daemon deletes the output only if the output
+    /// itself was the problem. A good file that failed for a transient reason
+    /// (disk headroom, a lock) stays, so a later run adopts it instead of
+    /// re-running the indexer.
+    #[test]
+    fn a_failed_import_discards_an_unusable_output_and_keeps_a_good_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let empty = tmp.path().join("scip-python.1-2.scip");
+        std::fs::write(&empty, METADATA_ONLY_INDEX).unwrap();
+        let good = tmp.path().join("scip-go.1-2.scip");
+        std::fs::write(&good, [0x0a, 0x00, 0x12, 0x03, 0x0a, 0x01, b'a']).unwrap();
+
+        assert!(discard_output_after_failed_import("scip-python", &empty));
+        assert!(!empty.exists());
+        assert!(!discard_output_after_failed_import("scip-go", &good));
+        assert!(good.exists());
     }
 
     /// A fake `scip-java`: the gradle attempt hangs, the maven attempt
