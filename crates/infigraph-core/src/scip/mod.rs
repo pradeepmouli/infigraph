@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use arrow::array::{Int64Array, StringArray};
 use arrow::datatypes::DataType;
 use protobuf::Message;
-use scip::types::{symbol_information, Index, SymbolRole};
+use scip::types::{symbol_information, Index, Occurrence, SymbolRole};
 
 use crate::graph::parquet_loader;
 use crate::graph::store_util::{
@@ -477,7 +477,7 @@ pub fn import_scip_index_enriched_at(
             }
 
             let name = scip_sym_to_name(scip_sym);
-            let span = parse_range(&occ.range, file);
+            let span = occurrence_span(occ, file);
             let si = sym_info_map.get(scip_sym.as_str());
             let docstring = si
                 .and_then(|s| s.documentation.first())
@@ -836,7 +836,7 @@ pub fn import_scip_index_enriched_at(
                 continue;
             }
 
-            let ref_line = scip_line_to_1based(occ.range.first().copied().unwrap_or(0));
+            let ref_line = scip_line_to_1based(occurrence_range(occ).0);
 
             let container_id = if let Some(syms) = file_symbols.get(file.as_str()) {
                 syms.iter()
@@ -1007,12 +1007,33 @@ fn scip_line_to_1based(line: i32) -> u32 {
     (line.max(0) as u32).saturating_add(1)
 }
 
-fn parse_range(range: &[i32], file: &str) -> Span {
-    let (start_line, start_col, end_line, end_col) = match range.len() {
-        4 => (range[0], range[1], range[2], range[3]),
-        3 => (range[0], range[1], range[0], range[2]),
-        _ => (0, 0, 0, 0),
+/// An occurrence's range as `(start_line, start_col, end_line, end_col)`, all
+/// 0-based as SCIP writes them. SCIP 0.10 made `typed_range` the preferred
+/// form and told new producers not to set the legacy `range` array, so the
+/// typed range is read first and the array only when it is absent. A range
+/// that is neither (or a malformed array) reads as all zeros, as it always did.
+/// The one place an occurrence's position is read.
+fn occurrence_range(occ: &Occurrence) -> (i32, i32, i32, i32) {
+    use scip::types::occurrence::Typed_range;
+    let typed = match &occ.typed_range {
+        Some(Typed_range::SingleLineRange(r)) => {
+            Some((r.line, r.start_character, r.line, r.end_character))
+        }
+        Some(Typed_range::MultiLineRange(r)) => {
+            Some((r.start_line, r.start_character, r.end_line, r.end_character))
+        }
+        // A typed form this version does not know: use the legacy array.
+        Some(_) | None => None,
     };
+    typed.unwrap_or(match occ.range.as_slice() {
+        [sl, sc, el, ec] => (*sl, *sc, *el, *ec),
+        [line, sc, ec] => (*line, *sc, *line, *ec),
+        _ => (0, 0, 0, 0),
+    })
+}
+
+fn occurrence_span(occ: &Occurrence, file: &str) -> Span {
+    let (start_line, start_col, end_line, end_col) = occurrence_range(occ);
     Span {
         file: file.to_string(),
         start_line: scip_line_to_1based(start_line),
@@ -1637,6 +1658,47 @@ mod tests {
         assert_eq!(b, ",0");
     }
 
+    /// How an occurrence's range is written: SCIP 0.10 made `typed_range` the
+    /// preferred form and told new producers not to set `range`.
+    #[derive(Clone, Copy)]
+    enum RangeForm {
+        /// Only the legacy `range` array.
+        Legacy,
+        /// Only `typed_range`.
+        Typed,
+        /// Both, the legacy one pointing at the wrong line: the typed one must win.
+        TypedWithStaleLegacy,
+    }
+
+    /// An occurrence (symbol and roles left default) whose range is the
+    /// single-line range `line`:`start`..`end` written in `form`.
+    fn ranged(form: RangeForm, line: i32, start: i32, end: i32) -> Occurrence {
+        use scip::types::{occurrence::Typed_range, SingleLineRange};
+        let typed = || {
+            Some(Typed_range::SingleLineRange(SingleLineRange {
+                line,
+                start_character: start,
+                end_character: end,
+                ..Default::default()
+            }))
+        };
+        match form {
+            RangeForm::Legacy => Occurrence {
+                range: vec![line, start, end],
+                ..Default::default()
+            },
+            RangeForm::Typed => Occurrence {
+                typed_range: typed(),
+                ..Default::default()
+            },
+            RangeForm::TypedWithStaleLegacy => Occurrence {
+                range: vec![line + 100, start, end],
+                typed_range: typed(),
+                ..Default::default()
+            },
+        }
+    }
+
     fn scip_symbol(name: &str, file: &str) -> String {
         format!("scip-test npm test 1.0.0 `{file}`/{name}#")
     }
@@ -2240,6 +2302,11 @@ mod tests {
     /// A caller whose one reference resolves to `B::foo`, beside a same-named
     /// `A::foo` -- the tree-sitter symbols in the graph plus the `.scip` for them.
     fn caller_of_b_foo_fixture() -> (TestEnv, std::path::PathBuf) {
+        caller_of_b_foo_fixture_in(RangeForm::Legacy)
+    }
+
+    /// [`caller_of_b_foo_fixture`] with every occurrence's range written in `form`.
+    fn caller_of_b_foo_fixture_in(form: RangeForm) -> (TestEnv, std::path::PathBuf) {
         let env = TestEnv::new();
         env.add_file("test.ts");
         let conn = env.store.connection().unwrap();
@@ -2282,29 +2349,28 @@ mod tests {
             relative_path: file.to_string(),
             occurrences: vec![
                 Occurrence {
-                    range: vec![1, 4, 7], // 1-based line 2, within A::foo's [1,5]
+                    // 1-based line 2, within A::foo's [1,5]
                     symbol: a_foo_sym.clone(),
                     symbol_roles: SymbolRole::Definition as i32,
-                    ..Default::default()
+                    ..ranged(form, 1, 4, 7)
                 },
                 Occurrence {
-                    range: vec![10, 4, 7], // 1-based line 11, within B::foo's [10,15]
+                    // 1-based line 11, within B::foo's [10,15]
                     symbol: b_foo_sym.clone(),
                     symbol_roles: SymbolRole::Definition as i32,
-                    ..Default::default()
+                    ..ranged(form, 10, 4, 7)
                 },
                 Occurrence {
-                    range: vec![20, 9, 15], // 1-based line 21, within caller's [20,25]
+                    // 1-based line 21, within caller's [20,25]
                     symbol: caller_sym.clone(),
                     symbol_roles: SymbolRole::Definition as i32,
-                    ..Default::default()
+                    ..ranged(form, 20, 9, 15)
                 },
                 // A call to B::foo specifically, from inside caller's body.
                 Occurrence {
-                    range: vec![21, 2, 5],
                     symbol: b_foo_sym.clone(),
                     symbol_roles: 0, // reference, not definition
-                    ..Default::default()
+                    ..ranged(form, 21, 2, 5)
                 },
             ],
             symbols: vec![
@@ -2362,6 +2428,107 @@ mod tests {
             vec![("test.ts::caller".to_string(), "test.ts::B::foo".to_string())],
             "the CALLS edge must resolve to the specific B::foo the reference \
              actually pointed at, not arbitrarily pick A::foo"
+        );
+    }
+
+    /// A reference written only as `typed_range` must still be attributed to
+    /// the method that encloses its line. Read as the (empty) legacy range it
+    /// lands on line 1, inside `A::foo`, and the CALLS edge starts there.
+    #[test]
+    fn a_typed_range_only_occurrence_resolves_to_the_enclosing_symbol() {
+        let (env, index_path) = caller_of_b_foo_fixture_in(RangeForm::Typed);
+
+        import_scip_index(&index_path, &env.store, None).unwrap();
+
+        assert_eq!(
+            edge_pairs(&env, "CALLS", "id"),
+            vec![("test.ts::caller".to_string(), "test.ts::B::foo".to_string())]
+        );
+    }
+
+    /// When both are present the typed range wins (SCIP's rule); the stale
+    /// legacy one would put the reference 100 lines away from its caller.
+    #[test]
+    fn the_typed_range_wins_over_a_legacy_range() {
+        let (env, index_path) = caller_of_b_foo_fixture_in(RangeForm::TypedWithStaleLegacy);
+
+        import_scip_index(&index_path, &env.store, None).unwrap();
+
+        assert_eq!(
+            edge_pairs(&env, "CALLS", "id"),
+            vec![("test.ts::caller".to_string(), "test.ts::B::foo".to_string())]
+        );
+    }
+
+    /// New symbols take their line span from the definition occurrence,
+    /// single- or multi-line, in the typed form.
+    #[test]
+    fn typed_definition_ranges_give_new_symbols_their_lines() {
+        use scip::types::{occurrence::Typed_range, MultiLineRange};
+        let env = TestEnv::new();
+        env.add_file("t.ts");
+        let one = scip_symbol("one", "t.ts");
+        let many = scip_symbol("many", "t.ts");
+        let index = Index {
+            documents: vec![Document {
+                relative_path: "t.ts".to_string(),
+                occurrences: vec![
+                    Occurrence {
+                        symbol: one.clone(),
+                        symbol_roles: SymbolRole::Definition as i32,
+                        ..ranged(RangeForm::Typed, 6, 0, 3)
+                    },
+                    Occurrence {
+                        symbol: many.clone(),
+                        symbol_roles: SymbolRole::Definition as i32,
+                        typed_range: Some(Typed_range::MultiLineRange(MultiLineRange {
+                            start_line: 9,
+                            start_character: 0,
+                            end_line: 14,
+                            end_character: 1,
+                            ..Default::default()
+                        })),
+                        ..Default::default()
+                    },
+                ],
+                symbols: vec![
+                    SymbolInformation {
+                        symbol: one,
+                        ..Default::default()
+                    },
+                    SymbolInformation {
+                        symbol: many,
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let path = env._dir.path().join("index.scip");
+        std::fs::write(&path, index.write_to_bytes().unwrap()).unwrap();
+
+        import_scip_index(&path, &env.store, None).unwrap();
+
+        let conn = env.store.connection().unwrap();
+        let mut lines: Vec<(String, String, String)> = conn
+            .query("MATCH (s:Symbol) RETURN s.name, s.start_line, s.end_line")
+            .unwrap()
+            .map(|r| {
+                (
+                    raw_string(&r[0]).to_string(),
+                    r[1].to_string(),
+                    r[2].to_string(),
+                )
+            })
+            .collect();
+        lines.sort();
+        assert_eq!(
+            lines,
+            vec![
+                ("many".to_string(), "10".to_string(), "15".to_string()),
+                ("one".to_string(), "7".to_string(), "7".to_string()),
+            ]
         );
     }
 
