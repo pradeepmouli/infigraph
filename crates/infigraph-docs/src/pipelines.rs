@@ -53,6 +53,8 @@ pub struct PipelineRun {
     patterns: Vec<Option<Vec<Regex>>>,
     /// Plugins whose `Pipeline_<id>` table this run has already ensured.
     tables_ready: HashSet<String>,
+    /// Pipeline ids already reported as named by two documents.
+    collided: HashSet<String>,
     warnings: Vec<String>,
     touched: bool,
 }
@@ -80,6 +82,7 @@ impl PipelineRun {
             state: vec![State::Idle; n],
             patterns: (0..n).map(|_| None).collect(),
             tables_ready: HashSet::new(),
+            collided: HashSet::new(),
             warnings,
             touched: false,
         }
@@ -215,7 +218,10 @@ impl PipelineRun {
     }
 
     /// Replaces the document's pipeline rows with the extracted one. Returns
-    /// false, with the old rows left in place, when a write failed.
+    /// false when that failed. If the plugin's table could not be ensured the
+    /// old rows are untouched; if a later write failed the document's pipeline
+    /// rows have been removed (a half-written pipeline is worse) and are
+    /// rebuilt on its next change or by `infigraph reindex-docs`.
     fn replace(
         &mut self,
         store: &dyn DocBackend,
@@ -248,6 +254,7 @@ impl PipelineRun {
             inputs: data.core.inputs.clone(),
             outputs: data.core.outputs.clone(),
         };
+        self.warn_if_taken_by_another_document(store, &id, &doc.file);
         let written = store
             .delete_pipelines_for_docs(&[doc.file.as_str()])
             .and_then(|()| store.upsert_pipeline_core(&record))
@@ -259,12 +266,32 @@ impl PipelineRun {
             Ok(()) => true,
             Err(e) => {
                 self.warn(format!(
-                    "pipeline plugin '{plugin_id}': could not store '{}': {e:#}",
+                    "pipeline plugin '{plugin_id}': could not store '{}': {e:#}; its pipeline \
+                     rows were removed and are rebuilt when it next changes or on \
+                     `infigraph reindex-docs`",
                     doc.file
                 ));
                 // Do not leave a half-written pipeline behind.
                 let _ = store.delete_pipelines_for_docs(&[doc.file.as_str()]);
                 false
+            }
+        }
+    }
+
+    /// The id is `pipeline::<plugin_id>::<name>`, so a second document naming
+    /// the same pipeline takes over the first one's core. The id form is
+    /// fixed; say so, once per id per run, naming both documents.
+    fn warn_if_taken_by_another_document(&mut self, store: &dyn DocBackend, id: &str, doc: &str) {
+        if self.collided.contains(id) {
+            return;
+        }
+        if let Ok(Some(existing)) = store.get_pipeline_core(id) {
+            if existing.doc_id != doc {
+                self.collided.insert(id.to_string());
+                self.warn(format!(
+                    "pipeline '{id}' is named by both '{}' and '{doc}'; '{doc}' now owns it",
+                    existing.doc_id
+                ));
             }
         }
     }

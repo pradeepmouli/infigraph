@@ -11,6 +11,7 @@ use infigraph_core::child::ChildTimeouts;
 use infigraph_docs::extract::{DocFormat, ExtractedDoc};
 use infigraph_docs::pipelines::PipelineRun;
 use infigraph_docs::store::DocStore;
+use infigraph_docs::DocIndex;
 
 /// `HOME` and the trust variable are process-global.
 static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -43,14 +44,27 @@ impl Env {
 
     /// A user-level plugin `id` whose command is `script` run by `sh`.
     fn plugin(&self, id: &str, patterns: &[&str], script: &str) {
+        self.plugin_command(id, patterns, "[\"sh\", \"extract.sh\"]");
+        std::fs::write(
+            self.home
+                .path()
+                .join(".infigraph/pipelines")
+                .join(id)
+                .join("extract.sh"),
+            script,
+        )
+        .unwrap();
+    }
+
+    /// A user-level plugin `id` with `command` (a TOML array) as given.
+    fn plugin_command(&self, id: &str, patterns: &[&str], command: &str) {
         let dir = self.home.path().join(".infigraph/pipelines").join(id);
         std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("extract.sh"), script).unwrap();
         let patterns: Vec<String> = patterns.iter().map(|p| format!("{p:?}")).collect();
         std::fs::write(
             dir.join("plugin.toml"),
             format!(
-                "[plugin]\nname = \"{id}\"\nplugin_id = \"{id}\"\ncommand = [\"sh\", \"extract.sh\"]\n\
+                "[plugin]\nname = \"{id}\"\nplugin_id = \"{id}\"\ncommand = {command}\n\
                  detect_patterns = [{}]\n\n[[plugin.schema]]\nname = \"owner\"\ncol_type = \"STRING\"\n",
                 patterns.join(", ")
             ),
@@ -352,4 +366,170 @@ fn a_project_with_no_plugins_touches_nothing() {
     index(&mut run, &store, &[("a.md", "name=alpha")]);
     assert!(run.finish(&store).is_empty());
     assert_eq!(core_ids(&store), vec!["pipeline::x::y"]);
+}
+
+/// `pipeline::<plugin>::<name>` is the id (ruling D3), so two documents that
+/// name the same pipeline share a core and the second takes it. That is
+/// reported, once per id per run, naming both documents.
+#[test]
+fn two_documents_naming_the_same_pipeline_warn_once_naming_both() {
+    let env = Env::new();
+    env.plugin("fake", PATTERNS, SCRIPT);
+    let (_tmp, store) = store();
+    let mut run = run_for(&env);
+
+    index(&mut run, &store, &[("a.md", "name=alpha")]);
+    assert!(run.warnings().is_empty(), "{:?}", run.warnings());
+
+    index(&mut run, &store, &[("b.md", "name=alpha")]);
+    // a.md takes it back later in the same run: a second takeover, but the
+    // id has been reported already.
+    index(&mut run, &store, &[("a.md", "name=alpha again")]);
+
+    let collisions: Vec<&String> = run
+        .warnings()
+        .iter()
+        .filter(|w| w.contains("pipeline::fake::alpha"))
+        .collect();
+    assert_eq!(collisions.len(), 1, "{:?}", run.warnings());
+    assert!(
+        collisions[0].contains("a.md") && collisions[0].contains("b.md"),
+        "{}",
+        collisions[0]
+    );
+    // The last document to write it owns it, as the id form dictates.
+    let core = store
+        .get_pipeline_core("pipeline::fake::alpha")
+        .unwrap()
+        .unwrap();
+    assert_eq!(core.doc_id, "a.md");
+}
+
+#[test]
+fn re_extracting_the_same_document_is_not_a_collision() {
+    let env = Env::new();
+    env.plugin("fake", PATTERNS, SCRIPT);
+    let (_tmp, store) = store();
+    let mut run = run_for(&env);
+
+    index(&mut run, &store, &[("a.md", "name=alpha")]);
+    index(&mut run, &store, &[("a.md", "name=alpha edited")]);
+    assert!(run.warnings().is_empty(), "{:?}", run.warnings());
+}
+
+fn write(root: &std::path::Path, rel: &str, text: &str) {
+    let full = root.join(rel);
+    std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+    std::fs::write(full, text).unwrap();
+}
+
+/// `DocIndex::index` on `root` with the quick timeouts, plugins from `env`.
+fn index_dir(root: &std::path::Path) -> (DocIndex, infigraph_docs::DocIndexResult) {
+    let mut idx = DocIndex::open(root).unwrap();
+    idx.init().unwrap();
+    idx.set_pipeline_timeouts(QUICK);
+    let result = idx.index().unwrap();
+    (idx, result)
+}
+
+#[test]
+fn doc_index_stores_the_pipelines_of_the_documents_it_indexes() {
+    let env = Env::new();
+    env.plugin("fake", PATTERNS, SCRIPT);
+    let project = tempfile::tempdir().unwrap();
+    write(project.path(), "a.md", "name=alpha\nsome text");
+    write(project.path(), "b.md", "plain prose");
+
+    let (idx, result) = index_dir(project.path());
+    assert_eq!(result.indexed_files, 2);
+    assert!(
+        result.pipeline_warnings.is_empty(),
+        "{:?}",
+        result.pipeline_warnings
+    );
+
+    let store = idx.store().unwrap();
+    let cores = store.get_all_pipeline_cores(None).unwrap();
+    assert_eq!(cores.len(), 1);
+    assert_eq!(cores[0].id, "pipeline::fake::alpha");
+    assert_eq!(cores[0].doc_id, "a.md");
+}
+
+/// Link-following indexes documents outside the doc root by a second
+/// `upsert_docs`; those get pipelines too.
+#[test]
+fn doc_index_stores_the_pipelines_of_documents_found_by_following_links() {
+    let env = Env::new();
+    env.plugin("fake", PATTERNS, SCRIPT);
+    let repo = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(repo.path().join(".git")).unwrap();
+    write(
+        repo.path(),
+        "docs/index.md",
+        "# Index\n\nSee [r](../README.md).\n",
+    );
+    write(repo.path(), "README.md", "# Readme\nname=linked\n");
+
+    let (idx, result) = index_dir(&repo.path().join("docs"));
+    assert_eq!(result.bfs_discovered, 1);
+
+    let cores = idx.store().unwrap().get_all_pipeline_cores(None).unwrap();
+    assert_eq!(cores.len(), 1, "{cores:?}");
+    assert_eq!(cores[0].id, "pipeline::fake::linked");
+    assert!(
+        cores[0].doc_id.ends_with("README.md"),
+        "{}",
+        cores[0].doc_id
+    );
+}
+
+/// A plugin that never answers must not fail or stall indexing: the documents
+/// are indexed, the run costs one warning, and the plugin is not asked again.
+#[test]
+fn a_plugin_that_never_answers_costs_one_warning_and_no_documents() {
+    let env = Env::new();
+    env.plugin("fake", PATTERNS, SCRIPT);
+    let project = tempfile::tempdir().unwrap();
+    for n in 1..=3 {
+        write(project.path(), &format!("d{n}.md"), &format!("HANG {n}"));
+    }
+
+    let started = std::time::Instant::now();
+    let (idx, result) = index_dir(project.path());
+    assert_eq!(result.indexed_files, 3);
+    assert_eq!(idx.store().unwrap().get_doc_hashes().unwrap().len(), 3);
+    assert_eq!(
+        result.pipeline_warnings.len(),
+        1,
+        "{:?}",
+        result.pipeline_warnings
+    );
+    assert!(result.pipeline_warnings[0].contains("fake"));
+    // One request timeout, not three.
+    assert!(
+        started.elapsed() < Duration::from_millis(600 * 3),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn a_plugin_command_that_does_not_exist_costs_one_warning_and_no_documents() {
+    let env = Env::new();
+    env.plugin_command("fake", PATTERNS, "[\"/nonexistent/infigraph-test-plugin\"]");
+    let project = tempfile::tempdir().unwrap();
+    for n in 1..=3 {
+        write(project.path(), &format!("d{n}.md"), &format!("name=n{n}"));
+    }
+
+    let (idx, result) = index_dir(project.path());
+    assert_eq!(result.indexed_files, 3);
+    assert_eq!(idx.store().unwrap().get_doc_hashes().unwrap().len(), 3);
+    assert_eq!(
+        result.pipeline_warnings.len(),
+        1,
+        "{:?}",
+        result.pipeline_warnings
+    );
+    assert!(result.pipeline_warnings[0].contains("fake"));
 }

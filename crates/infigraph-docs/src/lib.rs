@@ -25,6 +25,8 @@ use sha2::{Digest, Sha256};
 use backend::DocBackend;
 use chunk::{Chunk, ChunkStrategy};
 use extract::ExtractedDoc;
+use infigraph_core::child::ChildTimeouts;
+use pipelines::PipelineRun;
 use store::DocStore;
 
 pub mod links;
@@ -39,6 +41,8 @@ pub struct DocIndex {
     /// graph — keeps repos sharing one Neo4j instance from colliding on
     /// identical relative paths (e.g. every repo's README.md).
     namespace: Option<String>,
+    /// How long a pipeline plugin may take to start and to answer.
+    pipeline_timeouts: ChildTimeouts,
     /// The shared docs lock, held for this index's lifetime when it opened
     /// the store locally for reading (`open_existing`). Declared last so
     /// the store closes before the lock is released.
@@ -52,6 +56,9 @@ pub struct DocIndexResult {
     pub bfs_discovered: usize,
     pub new_chunks: Vec<Chunk>,
     pub changed_files: Vec<String>,
+    /// What the pipeline plugins reported during this run. A plugin that
+    /// failed never fails indexing; it lands here.
+    pub pipeline_warnings: Vec<String>,
 }
 
 impl DocIndex {
@@ -67,6 +74,7 @@ impl DocIndex {
             store: None,
             skip_file_embeddings: false,
             namespace: None,
+            pipeline_timeouts: ChildTimeouts::DEFAULT,
             read_lock: None,
         })
     }
@@ -205,6 +213,21 @@ impl DocIndex {
         &self.root
     }
 
+    /// Test seam: the timeouts pipeline plugins run under.
+    #[doc(hidden)]
+    pub fn set_pipeline_timeouts(&mut self, timeouts: ChildTimeouts) {
+        self.pipeline_timeouts = timeouts;
+    }
+
+    /// A pipeline run for this index's project. Plugins are looked up for the
+    /// project root, which is not always the doc root.
+    fn pipeline_run(&self) -> PipelineRun {
+        PipelineRun::for_project(
+            &infigraph_core::project::resolve_project_root(&self.root),
+            self.pipeline_timeouts,
+        )
+    }
+
     pub fn set_skip_file_embeddings(&mut self, skip: bool) {
         self.skip_file_embeddings = skip;
     }
@@ -256,6 +279,7 @@ impl DocIndex {
                 bfs_discovered: 0,
                 new_chunks: vec![],
                 changed_files: vec![],
+                pipeline_warnings: vec![],
             });
         }
 
@@ -319,10 +343,17 @@ impl DocIndex {
         let indexed = results.len();
         let total_chunks: usize = results.iter().map(|(_, c)| c.len()).sum();
 
+        // Created when the first document is written, so a run that changes
+        // nothing neither loads the plugin registry nor spawns a plugin.
+        let mut pipelines: Option<PipelineRun> = None;
+
         if !results.is_empty() {
             let docs: Vec<&ExtractedDoc> = results.iter().map(|(d, _)| d).collect();
             let chunks: Vec<&Chunk> = results.iter().flat_map(|(_, c)| c.iter()).collect();
             store.upsert_docs(&docs, &chunks)?;
+            pipelines
+                .get_or_insert_with(|| self.pipeline_run())
+                .apply(store, &docs);
         }
 
         let result_chunks: Vec<Chunk> = results.iter().flat_map(|(_, c)| c.clone()).collect();
@@ -404,7 +435,8 @@ impl DocIndex {
 
         // BFS: follow links to docs outside the doc root but within the repo
         let bfs_discovered = if let Some(repo_root) = find_repo_root(&self.root) {
-            let n = self.bfs_follow_links(store, &mut all_doc_ids, &repo_root, 2, 50)?;
+            let n =
+                self.bfs_follow_links(store, &mut pipelines, &mut all_doc_ids, &repo_root, 2, 50)?;
             if n > 0 {
                 eprintln!("BFS: discovered and indexed {} doc(s) outside root", n);
             }
@@ -413,6 +445,8 @@ impl DocIndex {
             0
         };
 
+        let pipeline_warnings = pipelines.map(|run| run.finish(store)).unwrap_or_default();
+
         Ok(DocIndexResult {
             total_files: total,
             indexed_files: indexed,
@@ -420,6 +454,7 @@ impl DocIndex {
             bfs_discovered,
             new_chunks: result_chunks,
             changed_files: result_changed,
+            pipeline_warnings,
         })
     }
 
@@ -444,6 +479,7 @@ impl DocIndex {
     fn bfs_follow_links(
         &self,
         store: &dyn DocBackend,
+        pipelines: &mut Option<PipelineRun>,
         indexed_docs: &mut HashSet<String>,
         repo_root: &Path,
         max_depth: usize,
@@ -585,6 +621,9 @@ impl DocIndex {
                     let docs_ref = vec![&doc];
                     let chunks_ref: Vec<&Chunk> = chunks.iter().collect();
                     if store.upsert_docs(&docs_ref, &chunks_ref).is_ok() {
+                        pipelines
+                            .get_or_insert_with(|| self.pipeline_run())
+                            .apply(store, &docs_ref);
                         indexed_docs.insert(rel_id.clone());
                         changed_files.push(rel_id);
                         new_chunks.extend(chunks);
