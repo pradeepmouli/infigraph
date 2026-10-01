@@ -581,3 +581,24 @@ fn an_unreadable_root_leaves_the_stored_documents_alone() {
     result.unwrap();
     assert_eq!(stored_docs(&idx), vec!["a.md"]);
 }
+
+/// The same rule on the non-empty path: one unreadable subdirectory shortens
+/// the listing, and the documents stored from it must not be pruned for it.
+#[test]
+fn an_unreadable_subdirectory_keeps_the_documents_stored_from_it() {
+    use std::os::unix::fs::PermissionsExt;
+    let _env = Env::new();
+    let root = tempfile::tempdir().unwrap();
+    write(root.path(), "a.md", "# A\n");
+    write(root.path(), "sub/b.md", "# B\n");
+    let (idx, _) = index_dir(root.path());
+    assert_eq!(stored_docs(&idx), vec!["a.md", "sub/b.md"]);
+
+    let sub = root.path().join("sub");
+    std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let result = idx.index();
+    std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    result.unwrap();
+    assert_eq!(stored_docs(&idx), vec!["a.md", "sub/b.md"]);
+}

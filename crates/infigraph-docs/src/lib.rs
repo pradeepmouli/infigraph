@@ -277,17 +277,10 @@ impl DocIndex {
             // "none" when the whole root could be listed; an unmounted volume,
             // a removed worktree or a permission error is not a reason to
             // delete what was indexed.
-            if listing_complete {
-                let existing_hashes = store
-                    .get_doc_hashes()
-                    .context("doc index: failed to load existing document hashes")?;
-                self.prune_stale_docs(store, &existing_hashes, &files);
-            } else {
-                eprintln!(
-                    "warn: could not list {}; leaving the stored documents alone",
-                    self.root.display()
-                );
-            }
+            let existing_hashes = store
+                .get_doc_hashes()
+                .context("doc index: failed to load existing document hashes")?;
+            self.prune_stale_docs(store, &existing_hashes, &files, listing_complete);
             return Ok(DocIndexResult {
                 total_files: 0,
                 indexed_files: 0,
@@ -394,7 +387,7 @@ impl DocIndex {
             embed::update_doc_embeddings(store, &self.root, &all_chunks, &changed_files)?;
         }
 
-        self.prune_stale_docs(store, &existing_hashes, &files);
+        self.prune_stale_docs(store, &existing_hashes, &files, listing_complete);
 
         // Extract links from indexed docs and create LINKS_TO edges.
         // Scope to this repo's namespace so cross-repo docs aren't offered as
@@ -442,7 +435,7 @@ impl DocIndex {
     }
 
     /// Removes the documents of files that no longer exist on disk (and their
-    /// pipelines, with them). Scoped to this repo's namespace on both sides:
+    /// pipelines, with them), if the listing of the root was complete. Scoped to this repo's namespace on both sides:
     /// `existing_hashes` pools every repo sharing the store in remote mode, so
     /// an unscoped diff would flag every other repo's docs as "stale" and
     /// delete them.
@@ -451,7 +444,17 @@ impl DocIndex {
         store: &dyn DocBackend,
         existing_hashes: &std::collections::HashMap<String, String>,
         files: &[PathBuf],
+        listing_complete: bool,
     ) {
+        // A walk error shortens `files`, and a short list reads as "these
+        // documents were deleted". Only a complete listing may say that.
+        if !listing_complete {
+            eprintln!(
+                "warn: could not list all of {}; leaving the stored documents alone",
+                self.root.display()
+            );
+            return;
+        }
         let ns = self.namespace.as_deref();
         let current_files: HashSet<String> = files
             .iter()
