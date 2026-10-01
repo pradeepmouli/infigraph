@@ -2379,6 +2379,106 @@ mod tests {
         assert!(tail.text().len() <= STDERR_TAIL_BYTES);
     }
 
+    /// A fake `scip-java`: the gradle attempt hangs, the maven attempt
+    /// writes its `--output` file and succeeds.
+    #[cfg(unix)]
+    fn fake_scip_java(dir: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let script = dir.join("scip-java");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\ncase \"$*\" in\n*gradle*) exec sleep 600;;\nesac\nfor a; do out=$a; done\necho ok > \"$out\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        script
+    }
+
+    /// R2.5.1, scip-java: each attempt of the gradle/maven chain has its own
+    /// timeout, and a timeout counts as a failure, so the fallback runs.
+    /// Before the chain was async it had no timeout at all: a hung primary
+    /// hung the whole run.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_hung_scip_java_primary_times_out_and_the_fallback_runs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // Both build files, and settings.gradle: gradle is the primary.
+        std::fs::write(root.join("settings.gradle"), "").unwrap();
+        std::fs::write(root.join("pom.xml"), "<project/>").unwrap();
+        let script = fake_scip_java(root);
+        let output_path = root.join("out.scip");
+        let run = IndexerRun {
+            root,
+            cmd: &script.to_string_lossy(),
+            label: "scip-java",
+            extra_path: None,
+            output_flag: Some("--output"),
+            output_path: &output_path,
+            timeout: std::time::Duration::from_millis(800),
+        };
+        let started = std::time::Instant::now();
+        let ok = run.run_scip_java(&["index"], |_| {}).await;
+        assert!(ok, "the maven fallback should have produced the index");
+        assert!(output_path.exists());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// The chain no longer blocks its runtime: on the `current_thread`
+    /// runtime `run_scip_indexers` uses, a sibling indexer task makes
+    /// progress while scip-java hangs. (The sync path starved it.)
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_hung_scip_java_does_not_starve_a_sibling_indexer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        std::fs::write(root.join("settings.gradle"), "").unwrap();
+        std::fs::write(root.join("pom.xml"), "<project/>").unwrap();
+        let script = fake_scip_java(&root);
+        let java_out = root.join("java.scip");
+        let sibling_out = root.join("sibling.scip");
+
+        let java_root = root.clone();
+        let java = tokio::spawn(async move {
+            let run = IndexerRun {
+                root: &java_root,
+                cmd: &script.to_string_lossy(),
+                label: "scip-java",
+                extra_path: None,
+                output_flag: Some("--output"),
+                output_path: &java_out,
+                timeout: std::time::Duration::from_secs(3),
+            };
+            run.run_scip_java(&["index"], |_| {}).await
+        });
+        // Let the java task start its hung primary attempt first.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let started = std::time::Instant::now();
+        let sibling_ok = run_scip_indexer_cmd_async(
+            &root,
+            "sh",
+            &["-c", "echo ok > \"$0\"", &sibling_out.to_string_lossy()],
+            "sibling",
+            None,
+            None,
+            &sibling_out,
+            std::time::Duration::from_secs(10),
+        )
+        .await;
+        assert!(sibling_ok);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "the sibling waited {:?} behind scip-java",
+            started.elapsed()
+        );
+        assert!(java.await.unwrap());
+    }
+
     /// Part B (scope extension): `run_scip_indexers`' cancellation
     /// checkpoint lives in `run_cancellable_indexer_batch` -- the loop that
     /// launches each indexer job and checks `token` between launches. This
