@@ -626,11 +626,10 @@ fn spawn_scip_child_process(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(stderr_target);
-    // Its own process group (pgid == pid, set atomically at spawn), so the
-    // worktree hook's stop (`stop_scip_enrich`) can kill the indexers and
-    // their children as a unit without reaching anything else. R2.5.1.
-    #[cfg(unix)]
-    std::os::unix::process::CommandExt::process_group(&mut command, 0);
+    // Its own process group, so the worktree hook's stop (`stop_scip_enrich`)
+    // can kill the indexers and their children as a unit without reaching
+    // anything else (R2.5.1).
+    infigraph_core::child::lead_own_group(&mut command);
     match command.spawn() {
         Ok(mut child) => {
             // spawn() only reports failure to launch (missing binary, exec
@@ -1585,11 +1584,9 @@ fn indexer_command(
 ) -> std::process::Command {
     let mut command = std::process::Command::new(cmd);
     command.args(args).current_dir(root);
-    // Its own process group (pgid == pid, set atomically at spawn), so a
-    // timeout or a cancellation can kill the indexer together with what it
-    // started (`kill_process_group`). R2.5.1.
-    #[cfg(unix)]
-    std::os::unix::process::CommandExt::process_group(&mut command, 0);
+    // Its own process group, so a timeout or a cancellation can kill the
+    // indexer together with what it started (R2.5.1).
+    infigraph_core::child::lead_own_group(&mut command);
 
     if let Some(flag) = output_flag {
         command.arg(flag).arg(output_path);
@@ -1850,7 +1847,7 @@ async fn run_indexer(
             stderr_tail: String::new(),
         },
         Ok(mut child) => {
-            let mut group = GroupKillOnDrop(child.id());
+            let mut group = infigraph_core::child::GroupKillOnDrop::new(child.id());
             let (drain, tail) = match child.stderr.take() {
                 Some(stderr) => {
                     let (drain, tail) = drain_stderr(stderr);
@@ -1911,36 +1908,6 @@ async fn run_indexer(
     };
     report_indexer_outcome(label, &outcome);
     outcome
-}
-
-/// Kills an indexer's whole process group when dropped before `disarm`:
-/// on a timeout, or when the owning future is dropped (a cancelled batch,
-/// daemon shutdown). `kill_on_drop` alone reaches only the direct child, and
-/// rust-analyzer starts `cargo metadata`, scip-java starts gradle/maven.
-///
-/// The kill is safe against pid reuse: it fires while the leader is still
-/// unreaped -- on a timeout the `child.wait()` future is dropped unfinished,
-/// and a dropped owning future drops this guard before the `Child` (declared
-/// earlier, so dropped later) is reaped -- and a run whose `wait()` completed
-/// has already disarmed it.
-///
-/// Unix only: `kill_process_group` is a no-op elsewhere, so on Windows an
-/// indexer's grandchildren still outlive a timeout and only the direct
-/// child dies (Job Objects would be the equivalent).
-struct GroupKillOnDrop(Option<u32>);
-
-impl GroupKillOnDrop {
-    fn disarm(&mut self) {
-        self.0 = None;
-    }
-}
-
-impl Drop for GroupKillOnDrop {
-    fn drop(&mut self) {
-        if let Some(pid) = self.0 {
-            infigraph_core::daemon::lifecycle::kill_process_group(pid);
-        }
-    }
 }
 
 /// One indexer invocation's fixed inputs: what to run, where, how it names
