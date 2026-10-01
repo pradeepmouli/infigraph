@@ -1618,6 +1618,137 @@ fn indexer_command(
     command
 }
 
+/// How much of an indexer's stderr is kept for its failure report.
+const STDERR_TAIL_BYTES: usize = 8 * 1024;
+
+/// The newest lines of a stream, within `STDERR_TAIL_BYTES`.
+#[derive(Default)]
+struct StderrTail {
+    lines: std::collections::VecDeque<String>,
+    bytes: usize,
+}
+
+impl StderrTail {
+    fn push(&mut self, mut line: String) {
+        if line.len() > STDERR_TAIL_BYTES {
+            // One enormous line: keep its end, on a char boundary.
+            let mut cut = line.len() - STDERR_TAIL_BYTES;
+            while !line.is_char_boundary(cut) {
+                cut += 1;
+            }
+            line.drain(..cut);
+        }
+        self.bytes += line.len() + 1;
+        self.lines.push_back(line);
+        while self.bytes > STDERR_TAIL_BYTES {
+            match self.lines.pop_front() {
+                Some(old) => self.bytes -= old.len() + 1,
+                None => break,
+            }
+        }
+    }
+
+    fn text(&self) -> String {
+        self.lines
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+/// How long to wait, after the indexer is gone, for what it wrote to
+/// stderr to be drained. A grandchild that inherited the pipe and outlives
+/// the indexer (gradle's daemon) holds it open indefinitely.
+const STDERR_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Reads the child's stderr to its end, teeing every line to our own stderr
+/// as it arrives -- so the terminal, or `.infigraph/scip-enrich.log` for the
+/// detached child, shows what it showed when the child inherited stderr --
+/// and keeping the tail. The drain also keeps a full pipe from blocking the
+/// child.
+fn drain_stderr(
+    stderr: tokio::process::ChildStderr,
+) -> (
+    tokio::task::JoinHandle<()>,
+    std::sync::Arc<std::sync::Mutex<StderrTail>>,
+) {
+    use tokio::io::AsyncBufReadExt;
+    let tail = std::sync::Arc::new(std::sync::Mutex::new(StderrTail::default()));
+    let tail_for_task = std::sync::Arc::clone(&tail);
+    let handle = tokio::spawn(async move {
+        let mut reader = tokio::io::BufReader::new(stderr);
+        let mut buf = Vec::new();
+        loop {
+            buf.clear();
+            match reader.read_until(b'\n', &mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    let line = String::from_utf8_lossy(&buf)
+                        .trim_end_matches(['\n', '\r'])
+                        .to_string();
+                    eprintln!("{line}");
+                    if let Ok(mut tail) = tail_for_task.lock() {
+                        tail.push(line);
+                    }
+                }
+            }
+        }
+    });
+    (handle, tail)
+}
+
+/// How an indexer attempt failed.
+#[derive(Debug)]
+enum IndexerFailure {
+    Spawn(std::io::Error),
+    Wait(std::io::Error),
+    Exited(std::process::ExitStatus),
+    TimedOut(std::time::Duration),
+    /// It exited successfully but left no output behind.
+    NoOutput,
+}
+
+/// What one indexer attempt did: how it failed, if it did, and the tail of
+/// its stderr. The message is built from this value in one place
+/// (`report_indexer_outcome`); the tail is also what a caller or a test can
+/// read back.
+#[derive(Debug)]
+struct IndexerOutcome {
+    failure: Option<IndexerFailure>,
+    stderr_tail: String,
+}
+
+impl IndexerOutcome {
+    fn succeeded(&self) -> bool {
+        self.failure.is_none()
+    }
+}
+
+/// The one place an attempt's failure is worded for the log. The indexer's
+/// own stderr has already been teed line by line as it arrived, so the whole
+/// tail is not printed a second time; the failure line names the last thing
+/// the indexer said, which is usually the reason.
+fn report_indexer_outcome(label: &str, outcome: &IndexerOutcome) {
+    let last = outcome
+        .stderr_tail
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .map(|l| format!(" (last stderr line: {})", l.trim()))
+        .unwrap_or_default();
+    match &outcome.failure {
+        Some(IndexerFailure::Spawn(e)) | Some(IndexerFailure::Wait(e)) => {
+            eprintln!("Auto-SCIP: failed to run {label}: {e}")
+        }
+        Some(IndexerFailure::Exited(s)) => eprintln!("Auto-SCIP: {label} exited with {s}{last}"),
+        Some(IndexerFailure::TimedOut(t)) => {
+            eprintln!("Auto-SCIP: {label} timed out after {t:?}{last}")
+        }
+        Some(IndexerFailure::NoOutput) | None => {}
+    }
+}
+
 /// Runs one indexer attempt, bounded by `timeout`. True when the indexer
 /// exited successfully and left its output at `output_path`. The single
 /// runner behind both the detached `scip-enrich` path (`run_scip_indexer_to`)
@@ -1633,6 +1764,31 @@ async fn run_scip_indexer_cmd_async(
     output_path: &Path,
     timeout: std::time::Duration,
 ) -> bool {
+    run_indexer(
+        root,
+        cmd,
+        args,
+        label,
+        extra_path,
+        output_flag,
+        output_path,
+        timeout,
+    )
+    .await
+    .succeeded()
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_indexer(
+    root: &Path,
+    cmd: &str,
+    args: &[&str],
+    label: &str,
+    extra_path: Option<&str>,
+    output_flag: Option<&str>,
+    output_path: &Path,
+    timeout: std::time::Duration,
+) -> IndexerOutcome {
     // `kill_on_drop` reaps the direct child when this future is dropped; the
     // guard below takes the rest of its group.
     let mut command = tokio::process::Command::from(indexer_command(
@@ -1643,51 +1799,73 @@ async fn run_scip_indexer_cmd_async(
         output_flag,
         output_path,
     ));
-    command.kill_on_drop(true);
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        Err(e) => {
-            eprintln!("Auto-SCIP: failed to run {label}: {e}");
-            return false;
-        }
-    };
-    let mut group = GroupKillOnDrop(child.id());
-
-    let run = async {
-        match child.wait().await {
-            Ok(s) if s.success() => {
-                if output_flag.is_none() {
-                    let default_out = root.join("index.scip");
-                    if default_out.exists() && default_out != output_path {
-                        let _ = std::fs::rename(&default_out, output_path);
-                    }
+    command
+        .kill_on_drop(true)
+        .stderr(std::process::Stdio::piped());
+    let outcome = match command.spawn() {
+        Err(e) => IndexerOutcome {
+            failure: Some(IndexerFailure::Spawn(e)),
+            stderr_tail: String::new(),
+        },
+        Ok(mut child) => {
+            let mut group = GroupKillOnDrop(child.id());
+            let (drain, tail) = match child.stderr.take() {
+                Some(stderr) => {
+                    let (drain, tail) = drain_stderr(stderr);
+                    (Some(drain), tail)
                 }
-                output_path.exists()
+                None => (None, Default::default()),
+            };
+            let run = async {
+                match child.wait().await {
+                    Ok(s) if s.success() => {
+                        if output_flag.is_none() {
+                            let default_out = root.join("index.scip");
+                            if default_out.exists() && default_out != output_path {
+                                let _ = std::fs::rename(&default_out, output_path);
+                            }
+                        }
+                        output_path
+                            .exists()
+                            .then_some(())
+                            .ok_or(IndexerFailure::NoOutput)
+                    }
+                    Ok(s) => Err(IndexerFailure::Exited(s)),
+                    Err(e) => Err(IndexerFailure::Wait(e)),
+                }
+            };
+            let result = match tokio::time::timeout(timeout, run).await {
+                Ok(result) => {
+                    // The indexer finished by itself: whatever it left
+                    // running on purpose (gradle's daemon) is none of ours
+                    // to kill.
+                    group.disarm();
+                    result
+                }
+                // `group` drops at the end of this arm's scope and kills the
+                // whole group.
+                Err(_elapsed) => Err(IndexerFailure::TimedOut(timeout)),
+            };
+            // Dropping the group (below) is what closes the pipe after a
+            // timeout; give the drain a moment to read what is left.
+            drop(group);
+            if let Some(mut drain) = drain {
+                if tokio::time::timeout(STDERR_DRAIN_GRACE, &mut drain)
+                    .await
+                    .is_err()
+                {
+                    drain.abort();
+                }
             }
-            Ok(s) => {
-                eprintln!("Auto-SCIP: {label} exited with {s}");
-                false
-            }
-            Err(e) => {
-                eprintln!("Auto-SCIP: failed to run {label}: {e}");
-                false
+            let stderr_tail = tail.lock().map(|t| t.text()).unwrap_or_default();
+            IndexerOutcome {
+                failure: result.err(),
+                stderr_tail,
             }
         }
     };
-
-    match tokio::time::timeout(timeout, run).await {
-        Ok(succeeded) => {
-            // The indexer finished by itself: whatever it left running on
-            // purpose (gradle's daemon) is none of ours to kill.
-            group.disarm();
-            succeeded
-        }
-        Err(_elapsed) => {
-            eprintln!("Auto-SCIP: {label} timed out after {timeout:?}");
-            // `group` drops here and kills the whole group.
-            false
-        }
-    }
+    report_indexer_outcome(label, &outcome);
+    outcome
 }
 
 /// Kills an indexer's whole process group when dropped before `disarm`:
@@ -2103,6 +2281,102 @@ mod tests {
             bystander_alive,
             "the kill reached a process outside the group"
         );
+    }
+
+    /// R2.5.1: the indexer's stderr is kept -- a bounded tail, not the whole
+    /// stream -- and attached to the failure. 2000 lines of ~40 bytes is
+    /// 80 KB; the tail must hold the end of it and stay within the bound.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_indexers_stderr_tail_is_bounded_and_ends_at_the_last_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let output_path = tmp.path().join("out.scip");
+        let outcome = run_indexer(
+            tmp.path(),
+            "sh",
+            &[
+                "-c",
+                "i=1; while [ $i -le 2000 ]; do echo \"line $i padding padding padding\" >&2; i=$((i+1)); done; exit 3",
+            ],
+            "noisy-indexer",
+            None,
+            None,
+            &output_path,
+            std::time::Duration::from_secs(30),
+        )
+        .await;
+        assert!(
+            matches!(outcome.failure, Some(IndexerFailure::Exited(_))),
+            "{outcome:?}"
+        );
+        let tail = &outcome.stderr_tail;
+        assert!(
+            tail.len() <= STDERR_TAIL_BYTES,
+            "tail is {} bytes",
+            tail.len()
+        );
+        assert!(
+            tail.contains("line 2000 padding"),
+            "the last line is missing"
+        );
+        assert!(
+            !tail.contains("line 1 padding"),
+            "the first line should have rolled off"
+        );
+    }
+
+    /// A grandchild that inherited the stderr pipe and outlives the indexer
+    /// (gradle's daemon) keeps the pipe open forever. The run must not wait
+    /// for an EOF that never comes.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_grandchild_holding_stderr_open_does_not_hang_the_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pid_file = tmp.path().join("holder.pid");
+        let output_path = tmp.path().join("out.scip");
+        let started = std::time::Instant::now();
+        let outcome = run_indexer(
+            tmp.path(),
+            "sh",
+            &[
+                "-c",
+                "echo before-exit >&2; sleep 30 & echo $! > \"$0\"; exit 3",
+                &pid_file.to_string_lossy(),
+            ],
+            "daemonizing-indexer",
+            None,
+            None,
+            &output_path,
+            std::time::Duration::from_secs(60),
+        )
+        .await;
+        let elapsed = started.elapsed();
+        if let Ok(pid) = std::fs::read_to_string(&pid_file) {
+            let _ = std::process::Command::new("kill")
+                .args(["-9", pid.trim()])
+                .output();
+        }
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "waited {elapsed:?} for a pipe held open by a grandchild"
+        );
+        assert!(outcome.stderr_tail.contains("before-exit"), "{outcome:?}");
+    }
+
+    #[test]
+    fn the_stderr_tail_keeps_the_newest_lines_within_its_bound() {
+        let mut tail = StderrTail::default();
+        for i in 0..1000 {
+            tail.push(format!("line {i:04} {}", "x".repeat(40)));
+        }
+        let text = tail.text();
+        assert!(text.len() <= STDERR_TAIL_BYTES);
+        assert!(text.ends_with(&format!("line 0999 {}", "x".repeat(40))));
+        assert!(!text.contains("line 0000"));
+        // One enormous line is cut to its end, not kept whole.
+        let mut tail = StderrTail::default();
+        tail.push("y".repeat(100_000));
+        assert!(tail.text().len() <= STDERR_TAIL_BYTES);
     }
 
     /// Part B (scope extension): `run_scip_indexers`' cancellation
