@@ -125,7 +125,14 @@ fn main() -> Result<()> {
     // request to proxy (R5.7/#36 covers the HTTP transport).
     let mut crashes = infigraph_mcp::recovery::WorkerCrashes::default();
     loop {
-        let status = run_worker_inherited(&args)?;
+        let status = match run_worker_inherited(&args) {
+            Ok(status) => status,
+            Err(e) => {
+                // An error ends the supervisor too: the worker goes with it.
+                infigraph_mcp::worker_slot::stop(infigraph_mcp::worker_slot::STOP_GRACE);
+                return Err(e);
+            }
+        };
         match worker_crash(&status) {
             Some(how) => restart_after_crash(&mut crashes, &how),
             None if planned_restart(&status).is_some() => continue,
