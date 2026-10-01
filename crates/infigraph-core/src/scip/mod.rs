@@ -241,6 +241,102 @@ fn is_member_of_known_symbol(scip_sym: &str, known: &HashMap<String, (String, St
     known.contains_key(&without_group[..open])
 }
 
+/// Why a SCIP output is refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Rejection {
+    /// The file is empty.
+    ZeroBytes,
+    /// A well-formed index with no documents: what `scip-python` and
+    /// `scip-go` write for a language they find nothing of, exiting 0.
+    NoDocuments,
+    /// Not a SCIP index at all.
+    Unparseable(String),
+}
+
+/// An indexer output that must not be imported. The importer returns this as
+/// a typed error (`anyhow::Error::downcast_ref`), so a caller can tell "the
+/// output itself is unusable" from a failure of the import (disk headroom,
+/// a lock) without reading the message.
+///
+/// Nothing is replaced by an import -- it is additive -- but importing an
+/// empty index would stamp the graph as enriched and record the output in
+/// the redundancy ledger, so the daemon would neither retry nor re-run it:
+/// that false "done" is what this refuses (#73).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScipRejected {
+    /// The indexer, when the scratch file name says which.
+    pub indexer: Option<String>,
+    pub reason: Rejection,
+}
+
+impl std::fmt::Display for ScipRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let who = self.indexer.as_deref().unwrap_or("the SCIP index");
+        match &self.reason {
+            Rejection::ZeroBytes => write!(f, "{who} produced an empty file (0 bytes)"),
+            Rejection::NoDocuments => write!(
+                f,
+                "{who} produced an index with no documents (metadata only), so there is \
+                 nothing to import"
+            ),
+            Rejection::Unparseable(e) => {
+                write!(f, "{who} produced a file that is not a SCIP index: {e}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ScipRejected {}
+
+/// The one rule for whether an indexer's output may be imported: it must
+/// have bytes and at least one document. Pure. `path` only names the indexer
+/// in the message (a scratch file says which indexer wrote it).
+///
+/// Zero documents is the right test, measured: indexers that find nothing
+/// of their language either fail (`scip-typescript`, `rust-analyzer`,
+/// `scip-java`: non-zero exit, no file) or exit 0 with a metadata-only index
+/// of 82-148 bytes (`scip-python`, `scip-go`), so a zero-byte test alone
+/// would let exactly the second kind through. An indexer is only launched
+/// for a language with files in the graph, so on those paths no documents
+/// means it ran and found none of files we know are there.
+pub fn validate_index(path: &Path, byte_len: usize, index: &Index) -> Result<(), ScipRejected> {
+    let rejected = |reason| ScipRejected {
+        indexer: scratch_indexer_label(path).map(str::to_string),
+        reason,
+    };
+    if byte_len == 0 {
+        return Err(rejected(Rejection::ZeroBytes));
+    }
+    if index.documents.is_empty() {
+        return Err(rejected(Rejection::NoDocuments));
+    }
+    Ok(())
+}
+
+/// [`validate_index`] on a file. `None` when the file is fine, and also when
+/// it cannot be read (missing, permission): that says nothing about the
+/// output, so it is never a reason to delete it.
+pub fn rejection_of(path: &Path) -> Option<ScipRejected> {
+    let bytes = std::fs::read(path).ok()?;
+    match Index::parse_from_bytes(&bytes) {
+        Ok(index) => validate_index(path, bytes.len(), &index).err(),
+        Err(e) => Some(ScipRejected {
+            indexer: scratch_indexer_label(path).map(str::to_string),
+            reason: Rejection::Unparseable(e.to_string()),
+        }),
+    }
+}
+
+/// Deletes `path` if its content is unusable and says why; leaves a usable
+/// file alone. For the cleanup after a failed import: a good file that failed
+/// for a transient reason must stay, so a later run can adopt it instead of
+/// re-running the indexer. Decided from the file, never from error text.
+pub fn discard_if_rejected(path: &Path) -> Option<ScipRejected> {
+    let rejected = rejection_of(path)?;
+    let _ = std::fs::remove_file(path);
+    Some(rejected)
+}
+
 /// Import a SCIP index.scip file into the Infigraph graph store.
 ///
 /// Matches SCIP definitions to existing tree-sitter symbols by (file, name)
@@ -270,6 +366,9 @@ pub fn import_scip_index_enriched_at(
 
     let index = Index::parse_from_bytes(&bytes)
         .with_context(|| format!("failed to parse SCIP index: {}", index_path.display()))?;
+    // Before the lock and the preflights: an output that cannot enrich
+    // anything must not stamp the graph or reach the redundancy ledger.
+    validate_index(index_path, bytes.len(), &index)?;
 
     let mut stats = ImportStats::default();
     let _lock = store.write_lock()?;
@@ -2936,5 +3035,156 @@ mod tests {
             "no occurrence here is a genuinely new symbol"
         );
         assert_eq!(stats.symbols_enriched, 2, "both symbols must be enriched");
+    }
+
+    // --- the output contract (#73): an index with nothing in it is refused ---
+
+    /// What `scip-python` and `scip-go` write for a project with none of their
+    /// language: a metadata message and no documents. Exit status 0.
+    fn metadata_only_index() -> Vec<u8> {
+        Index {
+            metadata: protobuf::MessageField::some(scip::types::Metadata {
+                project_root: "file:///x".to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+        .write_to_bytes()
+        .unwrap()
+    }
+
+    fn scratch_path(dir: &Path, name: &str) -> std::path::PathBuf {
+        let scratch = dir.join(".infigraph").join(SCIP_SCRATCH_DIR);
+        std::fs::create_dir_all(&scratch).unwrap();
+        scratch.join(name)
+    }
+
+    #[test]
+    fn an_index_with_documents_is_valid() {
+        let bytes = make_scip_index("a.ts", "Child", "Parent");
+        let index = Index::parse_from_bytes(&bytes).unwrap();
+        assert_eq!(
+            validate_index(Path::new("x.scip"), bytes.len(), &index),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn zero_bytes_and_zero_documents_are_refused_with_distinct_messages() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = scratch_path(dir.path(), "scip-python.123-456.scip");
+        let empty = Index::default();
+
+        let zero = validate_index(&path, 0, &empty).unwrap_err();
+        let metadata_only = metadata_only_index();
+        let none = validate_index(
+            &path,
+            metadata_only.len(),
+            &Index::parse_from_bytes(&metadata_only).unwrap(),
+        )
+        .unwrap_err();
+
+        assert_eq!(zero.reason, Rejection::ZeroBytes);
+        assert_eq!(none.reason, Rejection::NoDocuments);
+        assert_ne!(zero.to_string(), none.to_string());
+        // The indexer is named when the scratch file name says which it is.
+        assert!(zero.to_string().contains("scip-python"), "{zero}");
+        assert!(none.to_string().contains("scip-python"), "{none}");
+        // A user's own file has no indexer behind it.
+        let user = validate_index(Path::new("/tmp/mine.scip"), 0, &empty).unwrap_err();
+        assert_eq!(user.indexer, None);
+        assert!(!user.to_string().contains("scip-"), "{user}");
+    }
+
+    /// The harm of an empty output was never a replacement (an import is
+    /// additive): it was the enrichment stamp. A rejected import must leave
+    /// the stamp, and what earlier imports wrote, exactly as they were.
+    #[test]
+    fn a_metadata_only_index_is_refused_before_it_stamps_the_graph() {
+        let env = TestEnv::new();
+        env.add_file("test.ts");
+        env.store
+            .connection()
+            .unwrap()
+            .query(
+                "CREATE (:Symbol {id: 'test.ts::widen', name: 'widen', kind: 'function', \
+                 file: 'test.ts', start_line: 10, end_line: 50, signature_hash: '', \
+                 language: 'typescript', visibility: 'public', parent: '', docstring: '', \
+                 complexity: 0, parameters: '', return_type: ''})",
+            )
+            .unwrap();
+        let good = env._dir.path().join("good.scip");
+        std::fs::write(&good, widen_index("Widens a value.")).unwrap();
+        import_scip_index(&good, &env.store, None).unwrap();
+        let stamped = env.store.current_scip_generation().unwrap();
+        assert!(stamped > 0);
+
+        // The graph moves on, so an import that did stamp would change it.
+        {
+            let lock = env.store.write_lock().unwrap();
+            let conn = env.store.connection().unwrap();
+            env.store.bump_ast_generation_conn(&conn, &lock).unwrap();
+        }
+
+        let empty = env._dir.path().join("scip-python.1-2.scip");
+        std::fs::write(&empty, metadata_only_index()).unwrap();
+        let err = import_scip_index(&empty, &env.store, None).unwrap_err();
+        let rejected = err
+            .downcast_ref::<ScipRejected>()
+            .unwrap_or_else(|| panic!("not a typed rejection: {err:#}"));
+        assert_eq!(rejected.reason, Rejection::NoDocuments);
+
+        assert_eq!(env.store.current_scip_generation().unwrap(), stamped);
+        let rows: Vec<_> = env
+            .store
+            .connection()
+            .unwrap()
+            .query("MATCH (s:Symbol {id: 'test.ts::widen'}) RETURN s.docstring")
+            .unwrap()
+            .collect();
+        assert!(
+            rows[0][0].to_string().contains("Widens a value"),
+            "{rows:?}"
+        );
+    }
+
+    #[test]
+    fn a_zero_byte_file_is_refused_not_imported_as_an_empty_index() {
+        let env = TestEnv::new();
+        let empty = env._dir.path().join("empty.scip");
+        std::fs::write(&empty, b"").unwrap();
+        let err = import_scip_index(&empty, &env.store, None).unwrap_err();
+        let rejected = err.downcast_ref::<ScipRejected>().expect("typed");
+        assert_eq!(rejected.reason, Rejection::ZeroBytes);
+        assert_eq!(env.store.current_scip_generation().unwrap(), 0);
+    }
+
+    /// The daemon's cleanup decides from the file it still holds, not from
+    /// error text: only an output that is itself unusable is deleted, so a
+    /// good file that failed for a transient reason stays adoptable.
+    #[test]
+    fn discard_if_rejected_deletes_only_an_unusable_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let empty = scratch_path(dir.path(), "scip-go.1-2.scip");
+        std::fs::write(&empty, metadata_only_index()).unwrap();
+        let garbage = scratch_path(dir.path(), "scip-java.1-2.scip");
+        std::fs::write(&garbage, b"not a protobuf \xff\xff\xff").unwrap();
+        let good = scratch_path(dir.path(), "scip-rust.1-2.scip");
+        std::fs::write(&good, make_scip_index("a.ts", "C", "P")).unwrap();
+        let missing = scratch_path(dir.path(), "scip-ruby.1-2.scip");
+
+        assert_eq!(
+            discard_if_rejected(&empty).map(|r| r.reason),
+            Some(Rejection::NoDocuments)
+        );
+        assert!(!empty.exists());
+        assert!(matches!(
+            discard_if_rejected(&garbage).map(|r| r.reason),
+            Some(Rejection::Unparseable(_))
+        ));
+        assert!(!garbage.exists());
+        assert_eq!(discard_if_rejected(&good), None);
+        assert!(good.exists(), "a good output must survive for adoption");
+        assert_eq!(discard_if_rejected(&missing), None);
     }
 }
