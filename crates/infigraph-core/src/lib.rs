@@ -46,6 +46,7 @@ pub mod resolve;
 pub mod review;
 pub mod routes;
 pub mod scip;
+pub mod scip_slots;
 pub mod scip_switch;
 pub mod scratch;
 pub mod search;
