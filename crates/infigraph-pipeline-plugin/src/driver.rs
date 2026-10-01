@@ -1,9 +1,9 @@
-use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::Command;
 use std::sync::Mutex;
 
 use anyhow::{bail, Context, Result};
+use infigraph_core::child::{ChildTimeouts, LineChild};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
@@ -25,15 +25,13 @@ pub struct PipelineData {
     pub properties: serde_json::Map<String, serde_json::Value>,
 }
 
-struct DriverProcess {
-    child: Child,
-    reader: BufReader<std::process::ChildStdout>,
-}
-
+/// One plugin subprocess. A request that times out poisons it (the plugin
+/// is killed with its process group, and every later call fails naming the
+/// first failure): see [`LineChild`].
 pub struct PipelinePluginDriver {
     config: PipelinePluginConfig,
     plugin_dir: PathBuf,
-    process: Mutex<Option<DriverProcess>>,
+    process: Mutex<Option<(LineChild, ChildTimeouts)>>,
 }
 
 impl PipelinePluginDriver {
@@ -48,35 +46,33 @@ impl PipelinePluginDriver {
 
     /// Spawn the subprocess and wait for the ready handshake.
     pub fn start(&self) -> Result<()> {
+        self.start_with(ChildTimeouts::DEFAULT)
+    }
+
+    /// `start` with explicit deadlines (the test seam).
+    pub fn start_with(&self, timeouts: ChildTimeouts) -> Result<()> {
         let cmd = &self.config.plugin.command;
         if cmd.is_empty() {
             bail!("Plugin command is empty");
         }
 
-        let mut child = Command::new(&cmd[0])
-            .args(&cmd[1..])
-            .current_dir(&self.plugin_dir)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .with_context(|| {
-                format!(
-                    "Failed to spawn plugin '{}': {:?}",
-                    self.config.plugin.plugin_id, cmd
-                )
-            })?;
+        let mut command = Command::new(&cmd[0]);
+        command.args(&cmd[1..]).current_dir(&self.plugin_dir);
+        // Its stderr used to be inherited, so it keeps showing on ours.
+        let mut child = LineChild::spawn(
+            command,
+            &format!("plugin '{}'", self.config.plugin.plugin_id),
+            true,
+        )
+        .with_context(|| {
+            format!(
+                "Failed to spawn plugin '{}': {:?}",
+                self.config.plugin.plugin_id, cmd
+            )
+        })?;
 
-        let stdout = child
-            .stdout
-            .take()
-            .context("Failed to capture plugin stdout")?;
-        let mut reader = BufReader::new(stdout);
-
-        // Read handshake line
-        let mut line = String::new();
-        reader
-            .read_line(&mut line)
+        let line = child
+            .read_line(timeouts.ready)
             .context("Failed to read ready handshake from plugin")?;
 
         let handshake: serde_json::Value = serde_json::from_str(line.trim())
@@ -91,7 +87,7 @@ impl PipelinePluginDriver {
         }
 
         let mut proc = self.process.lock().unwrap();
-        *proc = Some(DriverProcess { child, reader });
+        *proc = Some((child, timeouts));
         Ok(())
     }
 
@@ -103,7 +99,7 @@ impl PipelinePluginDriver {
         doc_id: &str,
     ) -> Result<Option<PipelineData>> {
         let mut proc_guard = self.process.lock().unwrap();
-        let proc = proc_guard
+        let (child, timeouts) = proc_guard
             .as_mut()
             .context("Plugin process not started — call start() first")?;
 
@@ -114,22 +110,9 @@ impl PipelinePluginDriver {
             "doc_id": doc_id,
         });
 
-        let stdin = proc
-            .child
-            .stdin
-            .as_mut()
-            .context("Plugin stdin unavailable")?;
-        let mut request_bytes = serde_json::to_vec(&request)?;
-        request_bytes.push(b'\n');
-        stdin
-            .write_all(&request_bytes)
-            .context("Failed to write to plugin stdin")?;
-        stdin.flush().context("Failed to flush plugin stdin")?;
-
-        let mut line = String::new();
-        proc.reader
-            .read_line(&mut line)
-            .context("Failed to read plugin response")?;
+        let line = child
+            .request(&serde_json::to_string(&request)?, timeouts.request)
+            .context("Failed to exchange a request with the plugin")?;
 
         let response: serde_json::Value = serde_json::from_str(line.trim())
             .with_context(|| format!("Invalid response JSON: {}", line.trim()))?;
@@ -175,17 +158,6 @@ impl PipelinePluginDriver {
     /// Get the plugin ID.
     pub fn plugin_id(&self) -> &str {
         &self.config.plugin.plugin_id
-    }
-}
-
-impl Drop for PipelinePluginDriver {
-    fn drop(&mut self) {
-        if let Ok(mut proc) = self.process.lock() {
-            if let Some(ref mut dp) = *proc {
-                let _ = dp.child.kill();
-                let _ = dp.child.wait();
-            }
-        }
     }
 }
 
@@ -290,6 +262,97 @@ pub fn matches_detect_patterns(content: &str, patterns: &[String]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use infigraph_core::child::ChildTimeouts;
+    use std::time::Duration;
+
+    const QUICK: ChildTimeouts = ChildTimeouts {
+        ready: Duration::from_millis(600),
+        request: Duration::from_millis(600),
+    };
+
+    fn driver_running(script: &str) -> PipelinePluginDriver {
+        let config: PipelinePluginConfig = toml::from_str(&format!(
+            "[plugin]\nname = \"Fake\"\nplugin_id = \"fake\"\ncommand = [\"sh\", \"-c\", {script:?}]\n"
+        ))
+        .unwrap();
+        PipelinePluginDriver::new(config, std::env::temp_dir())
+    }
+
+    /// A plugin that never sends its ready handshake no longer hangs
+    /// `start` forever; its stderr (which used to be inherited and lost
+    /// from the error) rides on it.
+    #[cfg(unix)]
+    #[test]
+    fn a_plugin_that_never_sends_ready_fails_start_within_the_deadline() {
+        let driver = driver_running("echo 'plugin: missing dependency foo' >&2; sleep 600");
+        let started = std::time::Instant::now();
+        let err = driver.start_with(QUICK).unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(
+            format!("{err:#}").contains("missing dependency foo"),
+            "stderr tail missing: {err:#}"
+        );
+    }
+
+    /// A hung extract fails within the request deadline, kills the plugin's
+    /// process group, and poisons the driver: later calls name the first
+    /// failure.
+    #[cfg(unix)]
+    #[test]
+    fn a_hung_extract_poisons_the_plugin_and_kills_its_group() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pid_file = tmp.path().join("grandchild.pid");
+        let driver = driver_running(&format!(
+            "echo '{{\"ready\":true}}'; sleep 600 & echo $! > '{}'; read l; wait",
+            pid_file.display()
+        ));
+        driver.start_with(QUICK).unwrap();
+        let started = std::time::Instant::now();
+        let first = driver.extract("c", "t", "d").unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(format!("{first:#}").contains("sent nothing"), "{first:#}");
+        let later = driver.extract("c", "t", "d").unwrap_err();
+        assert!(format!("{later:#}").contains("first failure"), "{later:#}");
+        let grandchild: u32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let alive = |pid: u32| {
+            std::process::Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .output()
+                .is_ok_and(|o| o.status.success())
+        };
+        while alive(grandchild) && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            !alive(grandchild),
+            "the plugin's grandchild outlived the poison"
+        );
+    }
+
+    /// A healthy plugin still answers, and a `skip` is still `None`.
+    #[cfg(unix)]
+    #[test]
+    fn a_healthy_plugin_answers_extract_requests() {
+        let driver = driver_running(
+            "echo '{\"ready\":true}'; while read l; do echo '{\"status\":\"ok\",\"data\":{\"core\":{\"name\":\"n\"}}}'; done",
+        );
+        driver.start_with(ChildTimeouts::DEFAULT).unwrap();
+        let data = driver.extract("c", "t", "d").unwrap().unwrap();
+        assert_eq!(data.core.name, "n");
+    }
 
     #[test]
     fn test_pipeline_data_deserialize() {
