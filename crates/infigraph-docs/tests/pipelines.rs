@@ -533,3 +533,51 @@ fn a_plugin_command_that_does_not_exist_costs_one_warning_and_no_documents() {
     );
     assert!(result.pipeline_warnings[0].contains("fake"));
 }
+
+// --- pruning when no document file is left ---
+
+fn stored_docs(idx: &DocIndex) -> Vec<String> {
+    let mut keys: Vec<String> = idx
+        .store()
+        .unwrap()
+        .get_doc_hashes()
+        .unwrap()
+        .into_keys()
+        .collect();
+    keys.sort();
+    keys
+}
+
+/// The last document is deleted and the root is there to say so: its rows go.
+#[test]
+fn deleting_the_last_document_prunes_it() {
+    let _env = Env::new();
+    let project = tempfile::tempdir().unwrap();
+    write(project.path(), "only.md", "# Only\n");
+    let (idx, _) = index_dir(project.path());
+    assert_eq!(stored_docs(&idx), vec!["only.md"]);
+
+    std::fs::remove_file(project.path().join("only.md")).unwrap();
+    idx.index().unwrap();
+    assert!(stored_docs(&idx).is_empty(), "{:?}", stored_docs(&idx));
+}
+
+/// "No file found" is not "no files": a root that cannot be listed (a
+/// permission error here; an unmounted volume or a removed worktree in life)
+/// must leave the stored documents alone. Mode 0o111 keeps `.infigraph/`
+/// reachable, so the prune would succeed if it ran.
+#[test]
+fn an_unreadable_root_leaves_the_stored_documents_alone() {
+    use std::os::unix::fs::PermissionsExt;
+    let _env = Env::new();
+    let root = tempfile::tempdir().unwrap();
+    write(root.path(), "a.md", "# A\n");
+    let (idx, _) = index_dir(root.path());
+
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o111)).unwrap();
+    let result = idx.index();
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    result.unwrap();
+    assert_eq!(stored_docs(&idx), vec!["a.md"]);
+}

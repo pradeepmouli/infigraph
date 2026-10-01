@@ -268,16 +268,26 @@ impl DocIndex {
     pub fn index(&self) -> Result<DocIndexResult> {
         let store = self.store.as_deref().context("call init() first")?;
 
-        let files = self.collect_doc_files()?;
+        let (files, listing_complete) = self.collect_doc_files()?;
         let total = files.len();
 
         if total == 0 {
             // No document is left, so every stored one is stale: deleting the
-            // last document must delete its rows too.
-            let existing_hashes = store
-                .get_doc_hashes()
-                .context("doc index: failed to load existing document hashes")?;
-            self.prune_stale_docs(store, &existing_hashes, &files);
+            // last document must delete its rows too. But "found none" is only
+            // "none" when the whole root could be listed; an unmounted volume,
+            // a removed worktree or a permission error is not a reason to
+            // delete what was indexed.
+            if listing_complete {
+                let existing_hashes = store
+                    .get_doc_hashes()
+                    .context("doc index: failed to load existing document hashes")?;
+                self.prune_stale_docs(store, &existing_hashes, &files);
+            } else {
+                eprintln!(
+                    "warn: could not list {}; leaving the stored documents alone",
+                    self.root.display()
+                );
+            }
             return Ok(DocIndexResult {
                 total_files: 0,
                 indexed_files: 0,
@@ -473,13 +483,20 @@ impl DocIndex {
         }
     }
 
-    fn collect_doc_files(&self) -> Result<Vec<PathBuf>> {
+    /// The document files under the root, and whether the walk could list
+    /// everything it was pointed at (a walk error, such as a missing or
+    /// unreadable directory, makes the list possibly short).
+    fn collect_doc_files(&self) -> Result<(Vec<PathBuf>, bool)> {
         let mut files = Vec::new();
+        let mut complete = true;
         let walker = infigraph_core::ignore_rules::walk_builder(&self.root).build();
         for result in walker {
             let entry = match result {
                 Ok(e) => e,
-                Err(_) => continue,
+                Err(_) => {
+                    complete = false;
+                    continue;
+                }
             };
             if entry.file_type().is_some_and(|ft| ft.is_file()) {
                 let path = entry.path().to_path_buf();
@@ -488,7 +505,7 @@ impl DocIndex {
                 }
             }
         }
-        Ok(files)
+        Ok((files, complete))
     }
 
     fn bfs_follow_links(
@@ -736,4 +753,30 @@ pub fn is_document_file(path: &Path) -> bool {
             | "svg"
             | "plist"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_root_that_is_gone_is_an_incomplete_listing_not_an_empty_one() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        let idx = DocIndex::open(&root).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+
+        let (files, complete) = idx.collect_doc_files().unwrap();
+        assert!(files.is_empty());
+        assert!(!complete, "a missing root listed as complete");
+    }
+
+    #[test]
+    fn a_readable_root_with_no_documents_is_a_complete_listing() {
+        let root = tempfile::tempdir().unwrap();
+        let idx = DocIndex::open(root.path()).unwrap();
+        let (files, complete) = idx.collect_doc_files().unwrap();
+        assert!(files.is_empty() && complete);
+    }
 }
