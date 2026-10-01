@@ -11,6 +11,7 @@ readme.workspace = true
 description = "Runtime pipeline plugin system — load pipeline extractors via subprocess"
 
 [dependencies]
+infigraph-core = { path = "../infigraph-core" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
@@ -18,3 +19,6 @@ toml = "0.8"
 dirs-next = "2"
 regex = "1"
 log = "0.4"
+
+[dev-dependencies]
+tempfile = "3"
