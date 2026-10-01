@@ -1,15 +1,20 @@
 //! Worker/supervisor process lifecycle.
 //!
-//! The MCP binary runs as a supervisor that spawns itself with `--worker`.
-//! If the supervisor dies abnormally (SIGKILL, crash), the worker used to
-//! survive re-parented to launchd/init (PPID 1) while still holding the
-//! instance lock — blocking every future MCP start until killed by hand.
+//! The MCP binary runs as a supervisor that spawns itself with `--worker`
+//! (see `worker_slot`). The worker leads a process group of its own, and the
+//! supervisor stops that group -- TERM, a short grace, then KILL -- on every
+//! way it can end, so the worker and what it started (an `infigraph
+//! index-docs`) go with it at once. A SIGKILLed supervisor runs no code, so
+//! two backstops remain, in the worker: its stdin is the supervisor's pipe, so
+//! an idle worker sees EOF the moment the supervisor dies; and a busy one
+//! (`--ui`/`--serve` read no stdin at all) polls for the supervisor and, once
+//! it is gone, kills its own group before exiting.
 //!
 //! The supervisor passes its PID via `INFIGRAPH_SUPERVISOR_PID`; the worker
-//! polls that PID and exits when it disappears. Stdin EOF alone is not
-//! enough: the worker inherits the client's pipe (so it outlives a dead
-//! supervisor while the client is up), and the `--ui`/`--serve` modes park
-//! in infinite sleep loops that never read stdin at all.
+//! polls it every `PARENT_POLL_INTERVAL`. The group kill fires only when the
+//! worker really leads its group (`kill_own_process_group` refuses
+//! otherwise): a worker started the old way, as a member of the client's own
+//! group, just exits, and nothing else is signalled.
 
 use std::time::Duration;
 
@@ -133,6 +138,12 @@ pub fn spawn_parent_monitor() {
                     "INFO",
                     &format!("supervisor (pid {pid}) is gone — worker exiting to avoid orphan"),
                 );
+                // What this worker started (an `infigraph index-docs`) goes
+                // with it. Fires only when the supervisor spawned us as a
+                // group leader, so it can never reach a group we merely
+                // belong to: a worker started the old way (a newer binary
+                // spawned by an old supervisor) just exits.
+                infigraph_core::daemon::lifecycle::kill_own_process_group();
                 std::process::exit(0);
             }
         });

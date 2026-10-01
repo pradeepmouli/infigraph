@@ -10,6 +10,7 @@ pub mod session_context;
 pub mod signal_sender;
 pub mod tools;
 pub mod web;
+pub mod worker_slot;
 
 use serde_json::{json, Value};
 

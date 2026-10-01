@@ -20,9 +20,14 @@
 
 #![allow(dead_code)] // each test binary uses the subset it needs
 
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStdin, Stdio};
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
+
+use serde_json::{json, Value};
 
 /// Opt this whole test process out of background watchers. The CLI's
 /// auto-watch and the MCP's own auto-start both honour `INFIGRAPH_NO_WATCH`
@@ -435,13 +440,19 @@ impl Drop for McpStateScope {
 /// goes under `scratch`: lock, log, instance registry, registry home and
 /// `HOME`; background watchers are off. Callers may override any of it.
 pub fn isolated_mcp_command(scratch: &Path) -> std::process::Command {
+    isolated_command_for(Path::new(env!("CARGO_BIN_EXE_infigraph-mcp")), scratch)
+}
+
+/// [`isolated_mcp_command`] for `program`, a copy or hard link of the MCP
+/// binary (a test that needs a fake `infigraph` beside it).
+pub fn isolated_command_for(program: &Path, scratch: &Path) -> std::process::Command {
     let instances = scratch.join("instances");
     let registry = scratch.join("registry-home");
     let home = scratch.join("home");
     for dir in [&instances, &registry, &home] {
         std::fs::create_dir_all(dir).expect("scratch dir for an isolated infigraph-mcp");
     }
-    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_infigraph-mcp"));
+    let mut cmd = std::process::Command::new(program);
     cmd.envs(mcp_state_env(scratch))
         .env("INFIGRAPH_REGISTRY_INSTANCES_DIR", &instances)
         .env("INFIGRAPH_REGISTRY_HOME", &registry)
@@ -449,4 +460,135 @@ pub fn isolated_mcp_command(scratch: &Path) -> std::process::Command {
         .env("INFIGRAPH_NO_WATCH", "1")
         .env_remove("INFIGRAPH_WATCH_DAEMON");
     cmd
+}
+
+// --- a real supervisor and worker, driven over stdio ---
+
+/// A real `infigraph-mcp` supervisor (and so its worker) driven over its stdio.
+pub struct Server {
+    pub _tmp: tempfile::TempDir,
+    pub instances: PathBuf,
+    pub child: Child,
+    pub stdin: ChildStdin,
+    pub replies: Receiver<Value>,
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// An isolated supervisor with `extra_env` added.
+pub fn start_supervisor(extra_env: &[(&str, &str)]) -> Server {
+    start_supervisor_with(None, &["--mcp"], extra_env)
+}
+
+/// [`start_supervisor`] with the binary (default: this build's) and the
+/// arguments chosen.
+pub fn start_supervisor_with(
+    program: Option<&Path>,
+    args: &[&str],
+    extra_env: &[(&str, &str)],
+) -> Server {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    let startup = root.join("startup");
+    std::fs::create_dir_all(&startup).unwrap();
+    let instances = root.join("instances");
+
+    let mut cmd = match program {
+        Some(program) => isolated_command_for(program, &root),
+        None => isolated_mcp_command(&root),
+    };
+    cmd.args(args)
+        .current_dir(&startup)
+        .env("CI", "true")
+        .env(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    let mut child = cmd.spawn().expect("spawn infigraph-mcp supervisor");
+    let stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let (tx, replies) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            let Ok(line) = line else { return };
+            if let Ok(v) = serde_json::from_str::<Value>(&line) {
+                if tx.send(v).is_err() {
+                    return;
+                }
+            }
+        }
+    });
+    Server {
+        _tmp: tmp,
+        instances,
+        child,
+        stdin,
+        replies,
+    }
+}
+
+impl Server {
+    pub fn call(&mut self, id: i64, tool: &str) {
+        self.send(json!({"jsonrpc": "2.0", "id": id, "method": "tools/call",
+                         "params": {"name": tool, "arguments": {}}}));
+    }
+
+    /// `tools/list`: answered instantly even by a freshly started debug
+    /// worker, unlike any tool that builds the language registry.
+    pub fn list_tools(&mut self, id: i64) {
+        self.send(json!({"jsonrpc": "2.0", "id": id, "method": "tools/list"}));
+    }
+
+    pub fn send(&mut self, msg: Value) {
+        writeln!(self.stdin, "{msg}").unwrap();
+        self.stdin.flush().unwrap();
+    }
+
+    /// The reply to `id`, within `budget`.
+    pub fn reply(&self, id: i64, budget: Duration) -> Value {
+        let until = Instant::now() + budget;
+        loop {
+            let left = until.saturating_duration_since(Instant::now());
+            match self.replies.recv_timeout(left) {
+                Ok(v) if v["id"] == json!(id) => return v,
+                Ok(_) => {}
+                Err(RecvTimeoutError::Timeout) => panic!("no reply to {id} within {budget:?}"),
+                Err(RecvTimeoutError::Disconnected) => panic!("the supervisor closed stdout"),
+            }
+        }
+    }
+}
+
+fn error_message(reply: &Value) -> &str {
+    reply["error"]["message"]
+        .as_str()
+        .unwrap_or_else(|| panic!("expected an error reply, got {reply}"))
+}
+
+/// A registered worker other than `not`, waiting up to a minute for one.
+pub fn registered_worker(instances: &Path, not: Option<u32>) -> u32 {
+    let until = Instant::now() + Duration::from_secs(60);
+    loop {
+        let found = std::fs::read_dir(instances)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| std::fs::read_to_string(e.path()).ok())
+            .filter_map(|s| serde_json::from_str::<Value>(&s).ok())
+            .filter_map(|v| v["pid"].as_u64().map(|p| p as u32))
+            .find(|p| Some(*p) != not);
+        if let Some(pid) = found {
+            return pid;
+        }
+        assert!(Instant::now() < until, "no worker registered within 60s");
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }

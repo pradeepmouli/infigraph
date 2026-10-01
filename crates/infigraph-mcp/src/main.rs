@@ -85,16 +85,29 @@ fn main() -> Result<()> {
     // reason and exit -- not explicitly clean up the worker.
     install_panic_hook();
     {
+        // A panic in the supervisor must not strand the worker.
+        let log_panic = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            log_panic(info);
+            infigraph_mcp::worker_slot::stop_if_free();
+        }));
+    }
+    {
         let pid = std::process::id();
         ctrlc::set_handler(move || {
             mcp_log(
                 "INFO",
                 &format!(
-                    "supervisor (pid {pid}): termination signal received{} -- exiting",
+                    "supervisor (pid {pid}): termination signal received{} -- stopping the \
+                     worker and exiting",
                     infigraph_mcp::signal_sender::describe()
                 ),
             );
-            std::process::exit(0);
+            // `process::exit` runs no destructors, so the worker (and what it
+            // started) is stopped here, explicitly. The worker leads its own
+            // group, so a terminal's Ctrl-C, which reaches only the
+            // foreground group, no longer reaches it by itself.
+            exit_supervisor(0);
         })
         .ok();
         // #123: after ctrlc, so the sender-capturing handler chains to it.
@@ -102,22 +115,21 @@ fn main() -> Result<()> {
     }
 
     if serves_stdio(&args) {
-        return supervise_stdio(&args);
+        // Whatever ends the supervisor, an error included, stops the worker.
+        let result = supervise_stdio(&args);
+        infigraph_mcp::worker_slot::stop(infigraph_mcp::worker_slot::STOP_GRACE);
+        return result;
     }
 
     // `--serve`/`--ui` only: the worker reads no stdin, so there is no
     // request to proxy (R5.7/#36 covers the HTTP transport).
     let mut crashes = infigraph_mcp::recovery::WorkerCrashes::default();
     loop {
-        let status = worker_command(&args)
-            .stdin(std::process::Stdio::inherit())
-            .stdout(std::process::Stdio::inherit())
-            .stderr(std::process::Stdio::inherit())
-            .status()?;
+        let status = run_worker_inherited(&args)?;
         match worker_crash(&status) {
             Some(how) => restart_after_crash(&mut crashes, &how),
             None if planned_restart(&status).is_some() => continue,
-            None => std::process::exit(status.code().unwrap_or(1)),
+            None => exit_supervisor(status.code().unwrap_or(1)),
         }
     }
 }
@@ -142,6 +154,32 @@ fn worker_command(args: &[String]) -> std::process::Command {
     cmd
 }
 
+/// The `--serve`/`--ui` worker: it inherits our stdio (it reads none of it)
+/// and is waited on through the same slot as the stdio worker, so the
+/// supervisor's exit paths stop it too.
+fn run_worker_inherited(args: &[String]) -> Result<std::process::ExitStatus> {
+    let mut command = worker_command(args);
+    command
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit());
+    infigraph_mcp::worker_slot::spawn(command)?;
+    loop {
+        if let Some(status) = infigraph_mcp::worker_slot::exited()? {
+            return Ok(status);
+        }
+        std::thread::sleep(SUPERVISE_TICK);
+    }
+}
+
+/// Every supervisor exit goes through here: the worker is stopped first
+/// (`process::exit` skips destructors, and the worker leads a group of its
+/// own that nothing else will reach). A no-op once the worker is gone.
+fn exit_supervisor(code: i32) -> ! {
+    infigraph_mcp::worker_slot::stop(infigraph_mcp::worker_slot::STOP_GRACE);
+    std::process::exit(code)
+}
+
 /// #20: a crash restarts the worker and touches no project. It used to wipe
 /// and reindex every registered project (I-14); see `WorkerCrashes` for why
 /// that never repaired anything. Returns only if the worker should restart.
@@ -161,7 +199,7 @@ fn restart_after_crash(crashes: &mut infigraph_mcp::recovery::WorkerCrashes, how
     );
     mcp_log("CRASH", &why);
     eprintln!("infigraph-mcp: {why}");
-    std::process::exit(1);
+    exit_supervisor(1);
 }
 
 /// Whether the worker serves MCP over stdio -- the same branches `run`
@@ -211,13 +249,14 @@ fn supervise_stdio(args: &[String]) -> Result<()> {
 
     loop {
         generation += 1;
-        let mut child = worker_command(args)
+        let mut command = worker_command(args);
+        command
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::inherit())
-            .spawn()?;
-        let mut to_worker = Some(spawn_worker_writer(child.stdin.take().expect("piped")));
-        spawn_worker_reader(child.stdout.take().expect("piped"), generation, tx.clone());
+            .stderr(std::process::Stdio::inherit());
+        let (stdin, stdout) = infigraph_mcp::worker_slot::spawn(command)?;
+        let mut to_worker = Some(spawn_worker_writer(stdin.expect("piped")));
+        spawn_worker_reader(stdout.expect("piped"), generation, tx.clone());
         for line in backlog.drain(..) {
             if let Some(w) = &to_worker {
                 let _ = w.send(line);
@@ -251,7 +290,7 @@ fn supervise_stdio(args: &[String]) -> Result<()> {
                     unreachable!("the supervisor holds a sender")
                 }
             }
-            if let Some(status) = child.try_wait()? {
+            if let Some(status) = infigraph_mcp::worker_slot::exited()? {
                 // Replies the worker wrote before exiting are still in its
                 // pipe; deliver them before failing what is left.
                 let drain_until = std::time::Instant::now() + std::time::Duration::from_secs(2);
@@ -296,7 +335,7 @@ fn supervise_stdio(args: &[String]) -> Result<()> {
                 match crash {
                     Some(how) if client_open => restart_after_crash(&mut crashes, &how),
                     None if client_open && planned_restart(&status).is_some() => {}
-                    _ => std::process::exit(status.code().unwrap_or(1)),
+                    _ => exit_supervisor(status.code().unwrap_or(1)),
                 }
             }
             Ended::Overdue(late) => {
@@ -307,8 +346,8 @@ fn supervise_stdio(args: &[String]) -> Result<()> {
                 );
                 mcp_log("TIMEOUT", &why);
                 eprintln!("infigraph-mcp: {why}");
-                let _ = child.kill();
-                let _ = child.wait();
+                // A hung worker gets no grace: its group goes at once.
+                infigraph_mcp::worker_slot::stop(std::time::Duration::ZERO);
                 for reply in outstanding.fail_all(|c| {
                     if c.id == late.id {
                         format!(
@@ -328,7 +367,7 @@ fn supervise_stdio(args: &[String]) -> Result<()> {
                     write_line(&reply.to_string())?;
                 }
                 if !client_open {
-                    std::process::exit(0);
+                    exit_supervisor(0);
                 }
             }
         }
