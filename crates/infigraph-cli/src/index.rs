@@ -1835,6 +1835,12 @@ async fn run_indexer(
 /// daemon shutdown). `kill_on_drop` alone reaches only the direct child, and
 /// rust-analyzer starts `cargo metadata`, scip-java starts gradle/maven.
 ///
+/// The kill is safe against pid reuse: it fires while the leader is still
+/// unreaped -- on a timeout the `child.wait()` future is dropped unfinished,
+/// and a dropped owning future drops this guard before the `Child` (declared
+/// earlier, so dropped later) is reaped -- and a run whose `wait()` completed
+/// has already disarmed it.
+///
 /// Unix only: `kill_process_group` is a no-op elsewhere, so on Windows an
 /// indexer's grandchildren still outlive a timeout and only the direct
 /// child dies (Job Objects would be the equivalent).

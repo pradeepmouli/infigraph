@@ -91,6 +91,13 @@ pub struct LineChild {
     stderr_tail: Arc<Mutex<StderrTail>>,
     /// The first failure; once set, the child is dead and every call errors.
     poisoned: Option<String>,
+    /// Whether the group leader has been reaped. Its pid is then free for
+    /// the OS to reuse -- possibly by a process that leads its own group,
+    /// which every spawn of ours does -- so nothing may signal it again.
+    reaped: bool,
+    /// How many times the process group was signalled (test seam).
+    #[cfg(test)]
+    group_kills: usize,
 }
 
 impl LineChild {
@@ -160,6 +167,9 @@ impl LineChild {
             lines,
             stderr_tail,
             poisoned: None,
+            reaped: false,
+            #[cfg(test)]
+            group_kills: 0,
         })
     }
 
@@ -220,6 +230,11 @@ impl LineChild {
         let deadline = std::time::Instant::now() + grace;
         while std::time::Instant::now() < deadline {
             if matches!(self.child.try_wait(), Ok(Some(_))) {
+                // It exited by itself and `try_wait` reaped it. Clear what it
+                // left in its group now, while a member may still hold the
+                // pgid, and never again.
+                self.signal_group();
+                self.reaped = true;
                 return;
             }
             std::thread::sleep(Duration::from_millis(20));
@@ -254,11 +269,29 @@ impl LineChild {
         anyhow!(full)
     }
 
+    /// Kills the child and its group and reaps it. Only the first call does
+    /// anything: once the leader is reaped its pid may belong to someone else.
     fn kill(&mut self) {
-        #[cfg(unix)]
-        crate::daemon::lifecycle::kill_process_group(self.child.id());
+        if self.reaped {
+            return;
+        }
+        // The leader is not reaped yet, so even a zombie still holds the
+        // pgid and the signal can only reach our own group.
+        self.signal_group();
         let _ = self.child.kill();
         let _ = self.child.wait();
+        self.reaped = true;
+    }
+
+    fn signal_group(&mut self) {
+        #[cfg(unix)]
+        {
+            #[cfg(test)]
+            {
+                self.group_kills += 1;
+            }
+            crate::daemon::lifecycle::kill_process_group(self.child.id());
+        }
     }
 }
 
@@ -417,6 +450,35 @@ mod tests {
         assert!(
             bystander_alive,
             "the kill reached a process outside the group"
+        );
+    }
+
+    /// Once the leader has been reaped its pid is free to be reused -- by a
+    /// process that leads its own group, which is exactly what our spawns
+    /// create -- so a kill that runs again (the Drop after a poison, or after
+    /// `finish` saw the child exit) must not signal the group a second time.
+    #[test]
+    fn a_reaped_child_is_never_signalled_again() {
+        let mut poisoned = LineChild::spawn(sh("sleep 600"), "poisoned", false).unwrap();
+        let _ = poisoned.read_line(Duration::from_millis(200)).unwrap_err();
+        assert_eq!(poisoned.group_kills, 1);
+        poisoned.kill(); // what Drop runs
+        assert_eq!(
+            poisoned.group_kills, 1,
+            "the group was signalled again after the reap"
+        );
+
+        let mut finished = LineChild::spawn(sh("read l; exit 0"), "finished", false).unwrap();
+        finished.write_line("bye").unwrap();
+        finished.finish(Duration::from_secs(5));
+        assert_eq!(
+            finished.group_kills, 1,
+            "finish must clear the group once, at the exit"
+        );
+        finished.kill();
+        assert_eq!(
+            finished.group_kills, 1,
+            "the group was signalled again after the reap"
         );
     }
 
