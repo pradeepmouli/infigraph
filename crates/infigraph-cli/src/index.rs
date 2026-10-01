@@ -2,6 +2,7 @@ use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use infigraph_core::child::StderrTail;
 #[cfg(feature = "remote")]
 use infigraph_core::graph::GraphBackend;
 use infigraph_core::Infigraph;
@@ -1618,45 +1619,6 @@ fn indexer_command(
     command
 }
 
-/// How much of an indexer's stderr is kept for its failure report.
-const STDERR_TAIL_BYTES: usize = 8 * 1024;
-
-/// The newest lines of a stream, within `STDERR_TAIL_BYTES`.
-#[derive(Default)]
-struct StderrTail {
-    lines: std::collections::VecDeque<String>,
-    bytes: usize,
-}
-
-impl StderrTail {
-    fn push(&mut self, mut line: String) {
-        if line.len() > STDERR_TAIL_BYTES {
-            // One enormous line: keep its end, on a char boundary.
-            let mut cut = line.len() - STDERR_TAIL_BYTES;
-            while !line.is_char_boundary(cut) {
-                cut += 1;
-            }
-            line.drain(..cut);
-        }
-        self.bytes += line.len() + 1;
-        self.lines.push_back(line);
-        while self.bytes > STDERR_TAIL_BYTES {
-            match self.lines.pop_front() {
-                Some(old) => self.bytes -= old.len() + 1,
-                None => break,
-            }
-        }
-    }
-
-    fn text(&self) -> String {
-        self.lines
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-}
-
 /// How long to wait, after the indexer is gone, for what it wrote to
 /// stderr to be drained. A grandchild that inherited the pipe and outlives
 /// the indexer (gradle's daemon) holds it open indefinitely.
@@ -1970,6 +1932,7 @@ impl IndexerRun<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use infigraph_core::child::STDERR_TAIL_BYTES;
     use std::fs;
     use tempfile::TempDir;
 
@@ -2361,22 +2324,6 @@ mod tests {
             "waited {elapsed:?} for a pipe held open by a grandchild"
         );
         assert!(outcome.stderr_tail.contains("before-exit"), "{outcome:?}");
-    }
-
-    #[test]
-    fn the_stderr_tail_keeps_the_newest_lines_within_its_bound() {
-        let mut tail = StderrTail::default();
-        for i in 0..1000 {
-            tail.push(format!("line {i:04} {}", "x".repeat(40)));
-        }
-        let text = tail.text();
-        assert!(text.len() <= STDERR_TAIL_BYTES);
-        assert!(text.ends_with(&format!("line 0999 {}", "x".repeat(40))));
-        assert!(!text.contains("line 0000"));
-        // One enormous line is cut to its end, not kept whole.
-        let mut tail = StderrTail::default();
-        tail.push("y".repeat(100_000));
-        assert!(tail.text().len() <= STDERR_TAIL_BYTES);
     }
 
     /// A fake `scip-java`: the gradle attempt hangs, the maven attempt
