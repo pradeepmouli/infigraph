@@ -60,7 +60,7 @@ Not re-verified by brainstorm (peer's greps): the Confluence call sites `crates/
 
 ## Task 1: One function decides which plugins may run
 
-**Files:** `crates/infigraph-pipeline-plugin/src/lib.rs`, `src/driver.rs`; tests in the same crate.
+**Files:** `crates/infigraph-pipeline-plugin/src/lib.rs`, `src/driver.rs`; `crates/infigraph-core/src/pipelines_trust.rs` (new: the `[pipelines] trusted_projects` group and `is_trusted_project`, in core because `settings!` derives clap/serde in the calling crate); tests in both crates.
 
 - [ ] Add a `settings!` group `pipelines { trusted_projects: PathList = PathList(Vec::new()) }`, resolved with `ConfigScope::User` only, the way `scip_slots` resolves `[scip] max_concurrent_indexers`. Compare canonicalized paths.
 - [ ] Change `load_pipeline_plugins` to take the project root (`Option<&Path>`) instead of a pipelines directory, derive `<root>/pipelines` itself, and load it only when the root is trusted. Update the two listing callers; they now show exactly the plugins that would run, and print one line naming an untrusted project directory that was skipped and the setting that enables it.

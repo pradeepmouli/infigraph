@@ -374,3 +374,151 @@ fn test_cross_plugin_dependency_linking() {
     assert_eq!(deps[0].0, "dbt Transform");
     assert_eq!(deps[0].1, "Intuit ETL");
 }
+
+// ==================== deleting a document deletes its pipeline rows ====================
+
+fn insert_document(store: &DocStore, id: &str) {
+    store
+        .connection()
+        .unwrap()
+        .query(&format!(
+            "CREATE (d:Document {{id: '{id}', file: '{id}', title: 't', content_hash: 'h'}})"
+        ))
+        .unwrap();
+}
+
+fn compliance_columns() -> Vec<(String, String)> {
+    vec![("compliance".to_string(), "STRING".to_string())]
+}
+
+fn compliance_props(value: &str) -> serde_json::Map<String, serde_json::Value> {
+    let mut properties = serde_json::Map::new();
+    properties.insert("compliance".into(), serde_json::json!(value));
+    properties
+}
+
+/// Deleting a document (a stale prune, or a changed file's replacement) used to
+/// leave its `PipelineCore` and `Pipeline_<plugin_id>` rows behind, orphaned.
+#[test]
+fn test_deleting_a_document_deletes_its_pipeline_rows_and_only_its_own() {
+    let (_tmp, store) = test_store();
+    let columns = compliance_columns();
+    store.ensure_plugin_table("intuit", &columns).unwrap();
+    for (pipeline, doc, compliance) in [
+        (w2_pipeline(), "doc::w2", "IRS 7216"),
+        (marketing_pipeline(), "doc::marketing", "SOX"),
+    ] {
+        insert_document(&store, doc);
+        store.upsert_pipeline_core(&pipeline).unwrap();
+        store
+            .upsert_plugin_properties(
+                &pipeline.id,
+                "intuit",
+                &compliance_props(compliance),
+                &columns,
+            )
+            .unwrap();
+        store.link_pipeline_core_to_doc(&pipeline.id, doc).unwrap();
+    }
+
+    store.delete_docs_by_ids(&["doc::w2"]).unwrap();
+
+    assert!(store.get_pipeline_core("pipeline::w2").unwrap().is_none());
+    assert!(
+        store
+            .query_plugin_table("intuit", "compliance", "7216")
+            .unwrap()
+            .is_empty(),
+        "the plugin table kept the deleted document's row"
+    );
+    assert!(
+        store
+            .get_pipeline_core("pipeline::marketing")
+            .unwrap()
+            .is_some(),
+        "another document's pipeline was deleted"
+    );
+    assert_eq!(
+        store
+            .query_plugin_table("intuit", "compliance", "SOX")
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+/// A document with no pipeline rows, and a plugin whose table was never
+/// created, are both fine.
+#[test]
+fn test_deleting_a_document_without_pipelines_is_a_no_op() {
+    let (_tmp, store) = test_store();
+    insert_document(&store, "doc::plain");
+    store.delete_docs_by_ids(&["doc::plain"]).unwrap();
+    store.upsert_pipeline_core(&w2_pipeline()).unwrap();
+    store.delete_docs_by_ids(&["doc::w2"]).unwrap();
+    assert!(store.get_pipeline_core("pipeline::w2").unwrap().is_none());
+}
+
+// ==================== typed plugin columns ====================
+
+/// `upsert_plugin_properties` writes every property as a quoted string, which
+/// is only right for STRING columns. Measured here against every declared type.
+#[test]
+fn test_typed_plugin_columns_round_trip() {
+    let (_tmp, store) = test_store();
+    let columns: Vec<(String, String)> = [
+        ("s", "STRING"),
+        ("n", "INT64"),
+        ("b", "BOOL"),
+        ("d", "DOUBLE"),
+        ("l", "STRING[]"),
+    ]
+    .iter()
+    .map(|(n, t)| (n.to_string(), t.to_string()))
+    .collect();
+    store.ensure_plugin_table("typed", &columns).unwrap();
+
+    let mut properties = serde_json::Map::new();
+    properties.insert("s".into(), serde_json::json!("hello"));
+    properties.insert("n".into(), serde_json::json!(42));
+    properties.insert("b".into(), serde_json::json!(true));
+    properties.insert("d".into(), serde_json::json!(2.5));
+    properties.insert("l".into(), serde_json::json!(["x", "y"]));
+    store
+        .upsert_plugin_properties("pipeline::typed::one", "typed", &properties, &columns)
+        .unwrap();
+
+    let conn = store.connection().unwrap();
+    let mut rows = conn
+        .query("MATCH (p:Pipeline_typed) RETURN p.s, p.n, p.b, p.d, p.l")
+        .unwrap();
+    let row = rows.next().expect("the typed row was not written");
+    let shown: Vec<String> = row.iter().map(|v| v.to_string()).collect();
+    assert_eq!(shown[0], "hello");
+    assert_eq!(shown[1], "42");
+    assert_eq!(shown[2], "True");
+    assert_eq!(shown[3], "2.5");
+    assert_eq!(shown[4], "[x,y]");
+}
+
+// ==================== schema drift ====================
+
+/// `CREATE ... IF NOT EXISTS` does not alter a table, so a plugin that changed
+/// its columns would keep writing against the old shape. That is an error that
+/// says what to do, not a silent partial write.
+#[test]
+fn test_ensure_plugin_table_reports_schema_drift() {
+    let (_tmp, store) = test_store();
+    let one = compliance_columns();
+    store.ensure_plugin_table("intuit", &one).unwrap();
+    store.ensure_plugin_table("intuit", &one).unwrap(); // same shape: fine
+
+    let mut two = one.clone();
+    two.push(("owner".to_string(), "STRING".to_string()));
+    let err = store
+        .ensure_plugin_table("intuit", &two)
+        .expect_err("a changed schema must be reported");
+    let msg = err.to_string();
+    assert!(msg.contains("intuit"), "{msg}");
+    assert!(msg.contains("reindex-docs"), "{msg}");
+}

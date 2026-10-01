@@ -2664,7 +2664,6 @@ name = "infigraph-pipeline-plugin"
 version = "3.2.16"
 dependencies = [
  "anyhow",
- "dirs-next",
  "infigraph-core",
  "log",
  "regex",

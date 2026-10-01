@@ -63,6 +63,11 @@ pub trait DocBackend {
 
     fn ensure_plugin_table(&self, plugin_id: &str, columns: &[(String, String)]) -> Result<()>;
 
+    /// Deletes the pipeline rows (`PipelineCore` and `Pipeline_<plugin_id>`)
+    /// of the given documents. `delete_docs_by_ids` does this itself; the method
+    /// is on the trait for the callers that replace a document's pipelines.
+    fn delete_pipelines_for_docs(&self, doc_ids: &[&str]) -> Result<()>;
+
     fn upsert_pipeline_core(&self, record: &PipelineCoreRecord) -> Result<()>;
 
     fn upsert_plugin_properties(

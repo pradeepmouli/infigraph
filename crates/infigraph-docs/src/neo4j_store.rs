@@ -208,6 +208,7 @@ impl DocBackend for Neo4jDocStore {
         if doc_ids.is_empty() {
             return Ok(());
         }
+        self.delete_pipelines_for_docs(doc_ids)?;
         let ids: Vec<String> = doc_ids.iter().map(|s| s.to_string()).collect();
         for chunk in ids.chunks(BATCH_SIZE) {
             let id_list: Vec<String> = chunk.to_vec();
@@ -378,6 +379,39 @@ impl DocBackend for Neo4jDocStore {
         })
     }
 
+    fn delete_pipelines_for_docs(&self, doc_ids: &[&str]) -> Result<()> {
+        for chunk in doc_ids.chunks(BATCH_SIZE) {
+            let ids: Vec<String> = chunk.iter().map(|s| s.to_string()).collect();
+            let q = query(
+                "UNWIND $ids AS id MATCH (p:PipelineCore {doc_id: id}) \
+                 RETURN p.id AS pid, p.plugin_id AS plugin",
+            )
+            .param("ids", ids.clone());
+            let mut by_plugin: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+            for row in self.run_query(q)? {
+                let pid = row.get::<String>("pid").unwrap_or_default();
+                let plugin = row.get::<String>("plugin").unwrap_or_default();
+                by_plugin.entry(plugin).or_default().push(pid);
+            }
+            for (plugin, pids) in by_plugin {
+                if !crate::store::is_plugin_ident(&plugin) {
+                    continue;
+                }
+                let q = query(&format!(
+                    "MATCH (x:Pipeline_{plugin}) WHERE x.id IN $pids DELETE x"
+                ))
+                .param("pids", pids);
+                self.block_on(self.graph.run(q))
+                    .map_err(|e| anyhow::anyhow!("delete Pipeline_{plugin} rows: {e}"))?;
+            }
+            let q = query("UNWIND $ids AS id MATCH (p:PipelineCore {doc_id: id}) DETACH DELETE p")
+                .param("ids", ids);
+            self.block_on(self.graph.run(q))
+                .map_err(|e| anyhow::anyhow!("delete pipelines of deleted documents: {e}"))?;
+        }
+        Ok(())
+    }
+
     fn ensure_plugin_table(&self, _plugin_id: &str, _columns: &[(String, String)]) -> Result<()> {
         // Neo4j is schemaless — plugin properties are stored as node properties
         // on Pipeline_<plugin_id>-labeled nodes. No DDL needed.
@@ -422,23 +456,18 @@ impl DocBackend for Neo4jDocStore {
 
         // Build property assignments and params individually
         let mut prop_parts = vec!["id: $id".to_string()];
-        let mut param_values: Vec<(String, String)> =
-            vec![("id".to_string(), pipeline_id.to_string())];
-        for (col_name, _col_type) in schema {
-            if let Some(val) = properties.get(col_name.as_str()) {
-                let s = match val {
-                    serde_json::Value::String(s) => s.clone(),
-                    other => other.to_string(),
-                };
-                prop_parts.push(format!("{}: ${}", col_name, col_name));
-                param_values.push((col_name.clone(), s));
-            }
+        let values = crate::store::plugin_values(properties, schema);
+        for (col_name, _) in &values {
+            prop_parts.push(format!("{}: ${}", col_name, col_name));
         }
 
         let cypher = format!("CREATE (p:{} {{{}}})", label, prop_parts.join(", "));
-        let mut q = query(&cypher);
-        for (key, val) in &param_values {
-            q = q.param(key.as_str(), val.clone());
+        let mut q = query(&cypher).param("id", pipeline_id.to_string());
+        for (key, val) in values {
+            q = match val {
+                crate::store::PluginValue::Text(s) => q.param(key.as_str(), s),
+                crate::store::PluginValue::List(items) => q.param(key.as_str(), items),
+            };
         }
         self.block_on(self.graph.run(q))
             .map_err(|e| anyhow::anyhow!("upsert plugin properties: {e}"))?;

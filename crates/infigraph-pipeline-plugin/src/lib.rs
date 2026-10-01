@@ -21,8 +21,10 @@ use anyhow::Result;
 pub fn load_pipeline_plugins(project_root: Option<&Path>) -> Result<PipelinePluginRegistry> {
     let mut by_id: BTreeMap<String, PipelinePluginDriver> = BTreeMap::new();
 
-    if let Some(home) = dirs_next::home_dir() {
-        let global_dir = home.join(".infigraph").join("pipelines");
+    // The same directory the trust list is read from (`user_infigraph_dir`),
+    // so the plugins and the config that vouches for projects cannot disagree.
+    if let Some(user_dir) = infigraph_core::settings_file::user_infigraph_dir() {
+        let global_dir = user_dir.join("pipelines");
         if global_dir.is_dir() {
             for driver in discover(&global_dir)? {
                 by_id.insert(driver.plugin_id().to_string(), driver);
