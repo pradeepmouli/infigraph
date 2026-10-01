@@ -33,6 +33,59 @@ use crate::extract::ExtractedDoc;
 // carry a quote-only copy, which silently dropped backslashes.
 use infigraph_core::escape_str;
 
+/// Whether `table` exists in the catalog. `table` is a `Pipeline_<plugin_id>`
+/// name built from a validated plugin id. The one probe both the schema check
+/// and the delete use, so neither decides by reading an error message.
+fn plugin_table_exists(conn: &Connection, table: &str) -> Result<bool> {
+    let mut rows = conn
+        .query(&format!(
+            "CALL show_tables() WHERE name = '{table}' RETURN name"
+        ))
+        .map_err(|e| anyhow::anyhow!("list tables: {e}"))?;
+    Ok(rows.next().is_some())
+}
+
+/// A plugin property as a backend stores it: text, or -- for a `STRING[]`
+/// column -- the list's elements. Shared by every backend, so they agree on
+/// what a declared type means.
+pub(crate) enum PluginValue {
+    Text(String),
+    List(Vec<String>),
+}
+
+fn json_text(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// The schema's columns that `properties` has a value for, shaped by the
+/// declared type. Scalars go as text (the database casts `'42'` to an
+/// `INT64`, `'true'` to a `BOOL`, `'2.5'` to a `DOUBLE`, and rejects a value
+/// that does not fit). A list must not: its JSON text would be cast into
+/// elements that keep their JSON quotes (`"x"` instead of `x`).
+pub(crate) fn plugin_values(
+    properties: &serde_json::Map<String, serde_json::Value>,
+    schema: &[(String, String)],
+) -> Vec<(String, PluginValue)> {
+    schema
+        .iter()
+        .filter_map(|(col, col_type)| {
+            let value = properties.get(col.as_str())?;
+            let shaped = if col_type.eq_ignore_ascii_case("STRING[]") {
+                PluginValue::List(match value {
+                    serde_json::Value::Array(items) => items.iter().map(json_text).collect(),
+                    other => vec![json_text(other)],
+                })
+            } else {
+                PluginValue::Text(json_text(value))
+            };
+            Some((col.clone(), shaped))
+        })
+        .collect()
+}
+
 fn fwd_slash_path(p: &Path) -> String {
     p.to_string_lossy().replace('\\', "/")
 }
@@ -387,6 +440,7 @@ impl DocStore {
         if doc_ids.is_empty() {
             return Ok(());
         }
+        self.delete_pipelines_for_docs(doc_ids)?;
         let conn = self.connection()?;
         let id_list: String = doc_ids
             .iter()
@@ -403,6 +457,61 @@ impl DocStore {
             id_list
         ))
         .map_err(|e| anyhow::anyhow!("delete stale documents: {e}"))?;
+        Ok(())
+    }
+
+    /// Deletes the pipeline rows of the given documents: each document's
+    /// `PipelineCore` nodes and their `Pipeline_<plugin_id>` detail rows.
+    /// `delete_docs_by_ids` calls it, so every way a document goes away
+    /// (stale prune, a deleted Confluence page) takes its pipelines with it.
+    pub fn delete_pipelines_for_docs(&self, doc_ids: &[&str]) -> Result<()> {
+        if doc_ids.is_empty() {
+            return Ok(());
+        }
+        let _phase =
+            infigraph_core::write_phase::enter(&"docs: delete pipeline rows", doc_ids.len() as u64);
+        let conn = self.connection()?;
+        let id_list = doc_ids
+            .iter()
+            .map(|id| format!("'{}'", escape_str(id)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let cores: Vec<(String, String)> = conn
+            .query(&format!(
+                "MATCH (p:PipelineCore) WHERE p.doc_id IN [{id_list}] RETURN p.id, p.plugin_id"
+            ))
+            .map_err(|e| anyhow::anyhow!("find pipelines of deleted documents: {e}"))?
+            .map(|r| (r[0].to_string(), r[1].to_string()))
+            .collect();
+        if cores.is_empty() {
+            return Ok(());
+        }
+        let mut by_plugin: std::collections::BTreeMap<&str, Vec<&str>> = Default::default();
+        for (id, plugin) in &cores {
+            by_plugin.entry(plugin).or_default().push(id);
+        }
+        for (plugin, ids) in by_plugin {
+            if !infigraph_pipeline_plugin::is_valid_plugin_id(plugin) {
+                continue;
+            }
+            // A plugin whose table was never created has nothing to delete.
+            if !plugin_table_exists(&conn, &format!("Pipeline_{plugin}"))? {
+                continue;
+            }
+            let ids = ids
+                .iter()
+                .map(|id| format!("'{}'", escape_str(id)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            conn.query(&format!(
+                "MATCH (x:Pipeline_{plugin}) WHERE x.id IN [{ids}] DELETE x"
+            ))
+            .map_err(|e| anyhow::anyhow!("delete Pipeline_{plugin} rows: {e}"))?;
+        }
+        conn.query(&format!(
+            "MATCH (p:PipelineCore) WHERE p.doc_id IN [{id_list}] DETACH DELETE p"
+        ))
+        .map_err(|e| anyhow::anyhow!("delete pipelines of deleted documents: {e}"))?;
         Ok(())
     }
 
@@ -450,16 +559,43 @@ impl DocStore {
         crate::query::DocQuery::new(&conn).stats()
     }
 
+    /// Creates `Pipeline_<plugin_id>` for the plugin's columns. `CREATE ... IF NOT
+    /// EXISTS` does not alter a table, so an existing one whose columns are not
+    /// the plugin's now is reported rather than written against in its old shape.
     pub fn ensure_plugin_table(&self, plugin_id: &str, columns: &[(String, String)]) -> Result<()> {
+        if !infigraph_pipeline_plugin::is_valid_plugin_id(plugin_id) {
+            anyhow::bail!("'{plugin_id}' is not a valid pipeline plugin id");
+        }
         let conn = self.connection()?;
+        let table = format!("Pipeline_{plugin_id}");
+        if plugin_table_exists(&conn, &table)? {
+            let rows = conn
+                .query(&format!("CALL table_info('{table}') RETURN *"))
+                .map_err(|e| anyhow::anyhow!("inspect {table}: {e}"))?;
+            let mut existing: Vec<(String, String)> = rows
+                .map(|r| (r[1].to_string(), r[2].to_string().to_ascii_uppercase()))
+                .filter(|(name, _)| name != "id")
+                .collect();
+            let mut wanted: Vec<(String, String)> = columns
+                .iter()
+                .map(|(n, t)| (n.clone(), t.to_ascii_uppercase()))
+                .collect();
+            existing.sort();
+            wanted.sort();
+            if existing != wanted {
+                anyhow::bail!(
+                    "pipeline plugin '{plugin_id}' changed its schema since its table was \
+                     created (table has {existing:?}, plugin declares {wanted:?}); run \
+                     `infigraph reindex-docs` to rebuild the document store"
+                );
+            }
+            return Ok(());
+        }
         let mut col_defs = String::from("id STRING");
         for (name, col_type) in columns {
             col_defs.push_str(&format!(", {} {}", name, col_type));
         }
-        let ddl = format!(
-            "CREATE NODE TABLE IF NOT EXISTS Pipeline_{}({}, PRIMARY KEY(id))",
-            plugin_id, col_defs
-        );
+        let ddl = format!("CREATE NODE TABLE IF NOT EXISTS {table}({col_defs}, PRIMARY KEY(id))");
         conn.query(&ddl)
             .map_err(|e| anyhow::anyhow!("ensure_plugin_table DDL: {e}"))?;
         Ok(())
@@ -517,14 +653,18 @@ impl DocStore {
         ));
         // Build property assignments
         let mut props = format!("id: '{}'", esc_id);
-        for (col_name, _col_type) in schema {
-            if let Some(val) = properties.get(col_name.as_str()) {
-                let s = match val {
-                    serde_json::Value::String(s) => escape_str(s),
-                    other => escape_str(&other.to_string()),
-                };
-                props.push_str(&format!(", {}: '{}'", col_name, s));
-            }
+        for (col_name, value) in plugin_values(properties, schema) {
+            let literal = match value {
+                PluginValue::Text(s) => format!("'{}'", escape_str(&s)),
+                PluginValue::List(items) => {
+                    let items: Vec<String> = items
+                        .iter()
+                        .map(|i| format!("'{}'", escape_str(i)))
+                        .collect();
+                    format!("[{}]", items.join(","))
+                }
+            };
+            props.push_str(&format!(", {col_name}: {literal}"));
         }
         conn.query(&format!("CREATE (p:{} {{{}}})", table, props))
             .map_err(|e| anyhow::anyhow!("upsert plugin properties: {e}"))?;
@@ -535,7 +675,7 @@ impl DocStore {
     pub fn link_pipeline_core_to_doc(&self, pipeline_id: &str, doc_id: &str) -> Result<()> {
         let conn = self.connection()?;
         conn.query(&format!(
-            "MATCH (p:PipelineCore), (d:Document) WHERE p.id = '{}' AND d.id = '{}' CREATE (p)-[:DEFINED_IN]->(d)",
+            "MATCH (p:PipelineCore), (d:Document) WHERE p.id = '{}' AND d.id = '{}' MERGE (p)-[:DEFINED_IN]->(d)",
             escape_str(pipeline_id),
             escape_str(doc_id),
         ))
@@ -700,6 +840,10 @@ impl DocBackend for DocStore {
 
     fn delete_docs_by_ids(&self, doc_ids: &[&str]) -> Result<()> {
         self.delete_docs_by_ids(doc_ids)
+    }
+
+    fn delete_pipelines_for_docs(&self, doc_ids: &[&str]) -> Result<()> {
+        self.delete_pipelines_for_docs(doc_ids)
     }
 
     fn ensure_document_node(&self, doc_id: &str) -> Result<()> {

@@ -135,6 +135,10 @@ impl DocBackend for DaemonDocStore {
         Err(Self::writes_not_routed("delete_docs_by_ids"))
     }
 
+    fn delete_pipelines_for_docs(&self, _doc_ids: &[&str]) -> Result<()> {
+        Err(Self::writes_not_routed("delete_pipelines_for_docs"))
+    }
+
     fn ensure_document_node(&self, _doc_id: &str) -> Result<()> {
         Err(Self::writes_not_routed("ensure_document_node"))
     }

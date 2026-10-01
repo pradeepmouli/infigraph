@@ -150,6 +150,15 @@ impl PipelinePluginDriver {
         }
     }
 
+    /// Whether this plugin's process has been killed after a timeout, an exit
+    /// or a failed write; it then answers nothing for the rest of the run.
+    pub fn is_poisoned(&self) -> bool {
+        self.process
+            .lock()
+            .map(|p| p.as_ref().is_some_and(|(child, _)| child.is_poisoned()))
+            .unwrap_or(true)
+    }
+
     /// Get the plugin configuration.
     pub fn config(&self) -> &PipelinePluginConfig {
         &self.config
@@ -188,39 +197,6 @@ impl PipelinePluginRegistry {
             .get_plugin(plugin_id)
             .with_context(|| format!("No plugin found with id '{}'", plugin_id))?;
         driver.extract(content, title, doc_id)
-    }
-
-    /// Try each plugin's detect_patterns against content; first match wins.
-    pub fn extract_auto(
-        &self,
-        content: &str,
-        title: &str,
-        doc_id: &str,
-    ) -> Result<Option<(String, PipelineData)>> {
-        for driver in &self.plugins {
-            for pattern in &driver.config().plugin.detect_patterns {
-                match Regex::new(pattern) {
-                    Ok(re) => {
-                        if re.is_match(content) {
-                            let result = driver.extract(content, title, doc_id)?;
-                            if let Some(data) = result {
-                                return Ok(Some((driver.plugin_id().to_string(), data)));
-                            }
-                            // Plugin matched pattern but returned skip — continue to next plugin
-                        }
-                    }
-                    Err(e) => {
-                        log::warn!(
-                            "Invalid detect_pattern '{}' in plugin '{}': {}",
-                            pattern,
-                            driver.plugin_id(),
-                            e
-                        );
-                    }
-                }
-            }
-        }
-        Ok(None)
     }
 
     pub fn plugins(&self) -> &[PipelinePluginDriver] {

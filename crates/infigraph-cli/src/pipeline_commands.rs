@@ -3,12 +3,10 @@ use std::path::Path;
 use anyhow::{Context, Result};
 
 pub(crate) fn cmd_pipeline_plugins(root: &Path) -> Result<()> {
-    let project_dir = root.join("pipelines");
-    let registry = infigraph_pipeline_plugin::load_pipeline_plugins(if project_dir.is_dir() {
-        Some(project_dir.as_path())
-    } else {
-        None
-    })?;
+    let registry = infigraph_pipeline_plugin::load_pipeline_plugins(Some(root))?;
+    if let Some(note) = infigraph_pipeline_plugin::untrusted_project_note(root) {
+        println!("{note}\n");
+    }
 
     if registry.is_empty() {
         println!(

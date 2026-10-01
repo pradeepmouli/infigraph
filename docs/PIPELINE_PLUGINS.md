@@ -8,7 +8,7 @@ Infigraph supports runtime-loaded pipeline plugins for extracting data pipeline 
 Document content
     │
     ▼
-PipelinePluginRegistry.extract_auto(content, title, doc_id)
+PipelineRun.apply(docs)   — called right after upsert_docs, in the document index run
     │
     ├── detect_patterns match? ──► Plugin subprocess (JSON IPC)
     │                                    │
@@ -22,7 +22,7 @@ PipelinePluginRegistry.extract_auto(content, title, doc_id)
 DocStore                           DocStore
     ├── upsert_pipeline_core()     ├── upsert_plugin_properties()
     │   → PipelineCore node        │   → Pipeline_<plugin_id> node
-    ├── link_pipeline_to_doc()     └── link_pipeline_dependencies()
+    ├── link_pipeline_core_to_doc()  └── link_pipeline_dependencies()
     │   → DEFINED_IN edge              → DEPENDS_ON edges
     └── impact_analysis()
         → transitive impact
@@ -34,9 +34,32 @@ DocStore                           DocStore
 2. Infigraph discovers plugins at startup from two locations:
    - `~/.infigraph/pipelines/*/plugin.toml` — user-level (all projects)
    - `<project>/pipelines/*/plugin.toml` — project-level (per repo)
-3. When a document is indexed, infigraph tries each plugin's `detect_patterns` against the content
-4. Matching plugin's extractor subprocess receives the document, returns structured pipeline metadata
-5. Metadata is stored in the graph DB: `PipelineCore` shared table + plugin-specific detail table
+3. When a document is indexed, infigraph tries each plugin's `detect_patterns` against the content. This happens inside `infigraph index-docs`, `reindex-docs`, the doc watcher's reindex and link-following, always under the exclusive docs lock, and only for documents that changed: an unchanged run starts no plugin.
+4. The first matching plugin (in plugin-id order) whose extractor does not answer `skip` decides the document. Its subprocess starts on the first matching document of the run and is killed when the run ends.
+5. Metadata is stored in the graph DB: `PipelineCore` shared table + plugin-specific detail table. A changed document's old pipeline rows are replaced, and a deleted document's go with it.
+
+### What is indexed
+
+Plugins run for documents indexed **from files** (including documents found by following links). They do **not** run for Confluence pages: the Confluence sync writes with only a shared docs lock (and does not work under the default daemon backend at all), so it has nowhere safe to run a plugin. A Confluence page that is deleted still takes its pipeline rows with it.
+
+### Trust: whose plugins run
+
+A plugin is a command. User-level plugins (`~/.infigraph/pipelines`) are yours and always run. **Project-level plugins (`<project>/pipelines`) arrive with the repository, so they run only for projects you list** in your own user config, `~/.infigraph/config.toml`:
+
+```toml
+[pipelines]
+trusted_projects = ["/home/me/work/data-platform"]
+```
+
+or in the environment, comma-separated: `INFIGRAPH_PIPELINES_TRUSTED_PROJECTS=/a,/b`. Entries must be absolute; relative ones trust nothing. A project's own `.infigraph/config.toml` can never trust itself. `infigraph pipeline plugins` says when a project has plugins that were skipped for lack of trust.
+
+Trust is by project root path. A linked git worktree is a different root, so it is **untrusted** until listed on its own; list each worktree you want project-level plugins to run in.
+
+### Failure behavior
+
+A plugin that fails never fails indexing. If it will not start, errors, or does not answer within its timeout (30s to become ready, 120s per document; neither is measured against real plugins), the documents are still indexed and the run records one warning, shown in the `index-docs` report (`Pipeline warnings (N)`) and on the daemon's stderr. A plugin that timed out or died is skipped for the rest of that run. A document whose plugin failed keeps its previous pipeline rows, which are re-attached to the document's new node; a document the plugin skipped, or that no plugin matches any more, loses them.
+
+If a plugin's `[[plugin.schema]]` changed after its `Pipeline_<plugin_id>` table was created, writes for that plugin fail with a message naming the plugin: run `infigraph reindex-docs` to rebuild the table.
 
 ## Directory Structure
 
@@ -52,7 +75,7 @@ DocStore                           DocStore
        └── ...
 ```
 
-Plugins in `<project>/pipelines/` override user-level plugins with the same `plugin_id`.
+A trusted project's plugin overrides a user-level plugin with the same `plugin_id`. In a project that is not trusted, only the user-level plugin loads.
 
 ## plugin.toml Format
 
@@ -146,7 +169,7 @@ Infigraph sends to plugin stdin:
 
 ```
 PipelineCore node table:
-  id         STRING (PRIMARY KEY)  — e.g. "pipeline::w2_metrics"
+  id         STRING (PRIMARY KEY)  — "pipeline::<plugin_id>::<name>", e.g. "pipeline::intuit::w2_metrics"
   name       STRING                — human-readable name
   doc_id     STRING                — link to source document
   plugin_id  STRING                — which plugin created this
@@ -169,7 +192,9 @@ Pipeline_intuit node table:
   ...
 ```
 
-Joined via `PipelineCore.id = Pipeline_<plugin_id>.id`.
+Joined via `PipelineCore.id = Pipeline_<plugin_id>.id`. Values are stored with their declared type (`INT64`, `BOOL`, `DOUBLE`, `STRING[]`).
+
+Two documents that give the same plugin the same pipeline name share one id, and the later one takes the pipeline; the run warns, naming both documents.
 
 ### Edge Tables
 

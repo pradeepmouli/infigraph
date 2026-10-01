@@ -4,23 +4,13 @@
 
 mod support;
 
-use std::path::Path;
-use std::process::{Output, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use support::{assert_ok, eventually, run, start_daemon, stdout};
 
 use infigraph_core::docs_switch::{docs_enabled_recorded, docs_store_path};
 
 const DAEMON: &str = "daemon";
-
-/// Kills and reaps the daemon on every exit path, panics included.
-struct Daemon(std::process::Child);
-
-impl Drop for Daemon {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
 
 /// A project with one source file and one document, and a scratch `HOME`
 /// so neither the registry nor a developer's `~/.infigraph/config.toml`
@@ -37,86 +27,12 @@ fn project() -> (tempfile::TempDir, tempfile::TempDir) {
     (project, home)
 }
 
-/// Run one CLI command. `INFIGRAPH_NO_WATCH` keeps the pre-dispatch
-/// auto-watch from starting a daemon the test did not ask for.
-fn run(root: &Path, home: &Path, backend: &str, args: &[&str]) -> Output {
-    support::infigraph()
-        .args(args)
-        .current_dir(root)
-        .env("HOME", home)
-        .env(infigraph_core::BACKEND_ENV, backend)
-        .env("INFIGRAPH_NO_WATCH", "1")
-        .env_remove("INFIGRAPH_DOCS_ENABLED")
-        .env_remove("INFIGRAPH_WATCH_DAEMON")
-        .output()
-        .unwrap()
-}
-
-fn stdout(out: &Output) -> String {
-    String::from_utf8_lossy(&out.stdout).to_string()
-}
-
-fn assert_ok(out: &Output, what: &str) {
-    assert!(
-        out.status.success(),
-        "{what} failed:\nstdout={}\nstderr={}",
-        stdout(out),
-        String::from_utf8_lossy(&out.stderr)
-    );
-}
-
 /// The number after `label` on its line of a report (`Files indexed: 1`).
 fn count(text: &str, label: &str) -> usize {
     text.lines()
         .find_map(|line| line.trim().strip_prefix(label))
         .and_then(|rest| rest.trim().parse().ok())
         .unwrap_or_else(|| panic!("no `{label}` line in:\n{text}"))
-}
-
-/// Index the code locally, then start a real daemon with a fast doc poll
-/// and wait until it holds `watch.lock`.
-fn start_daemon(root: &Path, home: &Path) -> Daemon {
-    let bootstrap = run(
-        root,
-        home,
-        infigraph_core::LOCAL_BACKEND,
-        &["index", "--no-embed"],
-    );
-    assert_ok(&bootstrap, "bootstrap index");
-    let daemon = Daemon(
-        support::infigraph()
-            .args(["daemon", "--debounce", "50"])
-            .current_dir(root)
-            .env("HOME", home)
-            .env(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND)
-            .env("INFIGRAPH_WATCH_DOC_DAEMON_POLL_MS", "50")
-            .env_remove("INFIGRAPH_DOCS_ENABLED")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .unwrap(),
-    );
-    assert!(
-        infigraph_core::daemon::lifecycle::wait_for_daemon_ready(
-            &root.join(".infigraph").join("watch.lock"),
-            Duration::from_secs(30)
-        ),
-        "the daemon never took watch.lock"
-    );
-    daemon
-}
-
-/// Poll `check` for up to `budget`.
-fn eventually(budget: Duration, mut check: impl FnMut() -> bool) -> bool {
-    let deadline = Instant::now() + budget;
-    while Instant::now() < deadline {
-        if check() {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    check()
 }
 
 /// Spec decision 2: a project that already has a document index keeps it

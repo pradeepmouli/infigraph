@@ -8,6 +8,7 @@ pub mod extract;
 #[cfg(feature = "remote")]
 pub mod neo4j_store;
 pub mod ops;
+pub mod pipelines;
 pub mod query;
 pub mod search;
 pub mod store;
@@ -24,6 +25,8 @@ use sha2::{Digest, Sha256};
 use backend::DocBackend;
 use chunk::{Chunk, ChunkStrategy};
 use extract::ExtractedDoc;
+use infigraph_core::child::ChildTimeouts;
+use pipelines::PipelineRun;
 use store::DocStore;
 
 pub mod links;
@@ -38,6 +41,8 @@ pub struct DocIndex {
     /// graph — keeps repos sharing one Neo4j instance from colliding on
     /// identical relative paths (e.g. every repo's README.md).
     namespace: Option<String>,
+    /// How long a pipeline plugin may take to start and to answer.
+    pipeline_timeouts: ChildTimeouts,
     /// The shared docs lock, held for this index's lifetime when it opened
     /// the store locally for reading (`open_existing`). Declared last so
     /// the store closes before the lock is released.
@@ -51,6 +56,17 @@ pub struct DocIndexResult {
     pub bfs_discovered: usize,
     pub new_chunks: Vec<Chunk>,
     pub changed_files: Vec<String>,
+    /// What the pipeline plugins reported during this run. A plugin that
+    /// failed never fails indexing; it lands here.
+    pub pipeline_warnings: Vec<String>,
+}
+
+/// Whether a stored document id names a local file, which is the only kind
+/// the disk walk can vouch for. A document from an external source carries a
+/// URL-style id (`confluence://SPACE/123`), and a manifest node has no file at
+/// all (the empty key); neither is "gone" because no local file matches.
+fn is_local_document_id(id: &str) -> bool {
+    !id.is_empty() && !id.contains("://")
 }
 
 impl DocIndex {
@@ -66,6 +82,7 @@ impl DocIndex {
             store: None,
             skip_file_embeddings: false,
             namespace: None,
+            pipeline_timeouts: ChildTimeouts::DEFAULT,
             read_lock: None,
         })
     }
@@ -204,6 +221,21 @@ impl DocIndex {
         &self.root
     }
 
+    /// Test seam: the timeouts pipeline plugins run under.
+    #[doc(hidden)]
+    pub fn set_pipeline_timeouts(&mut self, timeouts: ChildTimeouts) {
+        self.pipeline_timeouts = timeouts;
+    }
+
+    /// A pipeline run for this index's project. Plugins are looked up for the
+    /// project root, which is not always the doc root.
+    fn pipeline_run(&self) -> PipelineRun {
+        PipelineRun::for_project(
+            &infigraph_core::project::resolve_project_root(&self.root),
+            self.pipeline_timeouts,
+        )
+    }
+
     pub fn set_skip_file_embeddings(&mut self, skip: bool) {
         self.skip_file_embeddings = skip;
     }
@@ -244,10 +276,19 @@ impl DocIndex {
     pub fn index(&self) -> Result<DocIndexResult> {
         let store = self.store.as_deref().context("call init() first")?;
 
-        let files = self.collect_doc_files()?;
+        let (files, listing_complete) = self.collect_doc_files()?;
         let total = files.len();
 
         if total == 0 {
+            // No document is left, so every stored one is stale: deleting the
+            // last document must delete its rows too. But "found none" is only
+            // "none" when the whole root could be listed; an unmounted volume,
+            // a removed worktree or a permission error is not a reason to
+            // delete what was indexed.
+            let existing_hashes = store
+                .get_doc_hashes()
+                .context("doc index: failed to load existing document hashes")?;
+            self.prune_stale_docs(store, &existing_hashes, &files, listing_complete);
             return Ok(DocIndexResult {
                 total_files: 0,
                 indexed_files: 0,
@@ -255,6 +296,7 @@ impl DocIndex {
                 bfs_discovered: 0,
                 new_chunks: vec![],
                 changed_files: vec![],
+                pipeline_warnings: vec![],
             });
         }
 
@@ -318,10 +360,17 @@ impl DocIndex {
         let indexed = results.len();
         let total_chunks: usize = results.iter().map(|(_, c)| c.len()).sum();
 
+        // Created when the first document is written, so a run that changes
+        // nothing neither loads the plugin registry nor spawns a plugin.
+        let mut pipelines: Option<PipelineRun> = None;
+
         if !results.is_empty() {
             let docs: Vec<&ExtractedDoc> = results.iter().map(|(d, _)| d).collect();
             let chunks: Vec<&Chunk> = results.iter().flat_map(|(_, c)| c.iter()).collect();
             store.upsert_docs(&docs, &chunks)?;
+            pipelines
+                .get_or_insert_with(|| self.pipeline_run())
+                .apply(store, &docs);
         }
 
         let result_chunks: Vec<Chunk> = results.iter().flat_map(|(_, c)| c.clone()).collect();
@@ -346,40 +395,7 @@ impl DocIndex {
             embed::update_doc_embeddings(store, &self.root, &all_chunks, &changed_files)?;
         }
 
-        // Prune stale docs: remove entries for files that no longer exist on disk.
-        // Scope both sides to this repo's namespace — `existing_hashes` pools every
-        // repo sharing the store in remote mode, so an unscoped diff would flag
-        // every other repo's docs as "stale" and delete them.
-        {
-            let current_files: std::collections::HashSet<String> = files
-                .iter()
-                .filter_map(|p| {
-                    p.strip_prefix(&self.root).ok().map(|r| {
-                        let raw = r.to_string_lossy().replace('\\', "/");
-                        match ns {
-                            Some(prefix) => format!("{prefix}/{raw}"),
-                            None => raw,
-                        }
-                    })
-                })
-                .collect();
-            let stale: Vec<String> = existing_hashes
-                .keys()
-                .filter(|k| match ns {
-                    Some(prefix) => k.starts_with(&format!("{prefix}/")),
-                    None => true,
-                })
-                .filter(|k| !current_files.contains(k.as_str()))
-                .cloned()
-                .collect();
-            if !stale.is_empty() {
-                eprintln!("Doc pruning: removing {} stale doc(s)", stale.len());
-                let stale_refs: Vec<&str> = stale.iter().map(|s| s.as_str()).collect();
-                if let Err(e) = store.delete_docs_by_ids(&stale_refs) {
-                    eprintln!("warn: doc pruning failed, stale docs remain: {e:#}");
-                }
-            }
-        }
+        self.prune_stale_docs(store, &existing_hashes, &files, listing_complete);
 
         // Extract links from indexed docs and create LINKS_TO edges.
         // Scope to this repo's namespace so cross-repo docs aren't offered as
@@ -403,7 +419,8 @@ impl DocIndex {
 
         // BFS: follow links to docs outside the doc root but within the repo
         let bfs_discovered = if let Some(repo_root) = find_repo_root(&self.root) {
-            let n = self.bfs_follow_links(store, &mut all_doc_ids, &repo_root, 2, 50)?;
+            let n =
+                self.bfs_follow_links(store, &mut pipelines, &mut all_doc_ids, &repo_root, 2, 50)?;
             if n > 0 {
                 eprintln!("BFS: discovered and indexed {} doc(s) outside root", n);
             }
@@ -412,6 +429,8 @@ impl DocIndex {
             0
         };
 
+        let pipeline_warnings = pipelines.map(|run| run.finish(store)).unwrap_or_default();
+
         Ok(DocIndexResult {
             total_files: total,
             indexed_files: indexed,
@@ -419,16 +438,78 @@ impl DocIndex {
             bfs_discovered,
             new_chunks: result_chunks,
             changed_files: result_changed,
+            pipeline_warnings,
         })
     }
 
-    fn collect_doc_files(&self) -> Result<Vec<PathBuf>> {
+    /// Removes the documents of files that no longer exist on disk (and their
+    /// pipelines, with them), if the listing of the root was complete. Only
+    /// local document ids are candidates ([`is_local_document_id`]). Scoped to this repo's namespace on both sides:
+    /// `existing_hashes` pools every repo sharing the store in remote mode, so
+    /// an unscoped diff would flag every other repo's docs as "stale" and
+    /// delete them.
+    fn prune_stale_docs(
+        &self,
+        store: &dyn DocBackend,
+        existing_hashes: &std::collections::HashMap<String, String>,
+        files: &[PathBuf],
+        listing_complete: bool,
+    ) {
+        // A walk error shortens `files`, and a short list reads as "these
+        // documents were deleted". Only a complete listing may say that.
+        if !listing_complete {
+            eprintln!(
+                "warn: could not list all of {}; leaving the stored documents alone",
+                self.root.display()
+            );
+            return;
+        }
+        let ns = self.namespace.as_deref();
+        let current_files: HashSet<String> = files
+            .iter()
+            .filter_map(|p| {
+                p.strip_prefix(&self.root).ok().map(|r| {
+                    let raw = r.to_string_lossy().replace('\\', "/");
+                    match ns {
+                        Some(prefix) => format!("{prefix}/{raw}"),
+                        None => raw,
+                    }
+                })
+            })
+            .collect();
+        let stale: Vec<String> = existing_hashes
+            .keys()
+            .filter(|k| match ns {
+                Some(prefix) => k.starts_with(&format!("{prefix}/")),
+                None => true,
+            })
+            .filter(|k| is_local_document_id(k))
+            .filter(|k| !current_files.contains(k.as_str()))
+            .cloned()
+            .collect();
+        if !stale.is_empty() {
+            eprintln!("Doc pruning: removing {} stale doc(s)", stale.len());
+            let stale_refs: Vec<&str> = stale.iter().map(|s| s.as_str()).collect();
+            if let Err(e) = store.delete_docs_by_ids(&stale_refs) {
+                eprintln!("warn: doc pruning failed, stale docs remain: {e:#}");
+            }
+        }
+    }
+
+    /// The document files under the root, and whether the walk could list
+    /// everything it was pointed at (a walk error, such as a missing or
+    /// unreadable directory, makes the list possibly short).
+    fn collect_doc_files(&self) -> Result<(Vec<PathBuf>, bool)> {
         let mut files = Vec::new();
+        let mut complete = true;
         let walker = infigraph_core::ignore_rules::walk_builder(&self.root).build();
         for result in walker {
             let entry = match result {
                 Ok(e) => e,
-                Err(_) => continue,
+                Err(_) => {
+                    complete = false;
+                    continue;
+                }
             };
             if entry.file_type().is_some_and(|ft| ft.is_file()) {
                 let path = entry.path().to_path_buf();
@@ -437,12 +518,13 @@ impl DocIndex {
                 }
             }
         }
-        Ok(files)
+        Ok((files, complete))
     }
 
     fn bfs_follow_links(
         &self,
         store: &dyn DocBackend,
+        pipelines: &mut Option<PipelineRun>,
         indexed_docs: &mut HashSet<String>,
         repo_root: &Path,
         max_depth: usize,
@@ -584,6 +666,9 @@ impl DocIndex {
                     let docs_ref = vec![&doc];
                     let chunks_ref: Vec<&Chunk> = chunks.iter().collect();
                     if store.upsert_docs(&docs_ref, &chunks_ref).is_ok() {
+                        pipelines
+                            .get_or_insert_with(|| self.pipeline_run())
+                            .apply(store, &docs_ref);
                         indexed_docs.insert(rel_id.clone());
                         changed_files.push(rel_id);
                         new_chunks.extend(chunks);
@@ -681,4 +766,40 @@ pub fn is_document_file(path: &Path) -> bool {
             | "svg"
             | "plist"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_root_that_is_gone_is_an_incomplete_listing_not_an_empty_one() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("proj");
+        std::fs::create_dir_all(&root).unwrap();
+        let idx = DocIndex::open(&root).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+
+        let (files, complete) = idx.collect_doc_files().unwrap();
+        assert!(files.is_empty());
+        assert!(!complete, "a missing root listed as complete");
+    }
+
+    #[test]
+    fn only_file_ids_are_local_document_ids() {
+        for local in ["a.md", "docs/a.md", "../README.md", "org/repo/a.md"] {
+            assert!(is_local_document_id(local), "{local}");
+        }
+        for external in ["", "confluence://SP/1", "https://example.com/x"] {
+            assert!(!is_local_document_id(external), "{external:?}");
+        }
+    }
+
+    #[test]
+    fn a_readable_root_with_no_documents_is_a_complete_listing() {
+        let root = tempfile::tempdir().unwrap();
+        let idx = DocIndex::open(root.path()).unwrap();
+        let (files, complete) = idx.collect_doc_files().unwrap();
+        assert!(files.is_empty() && complete);
+    }
 }

@@ -53,7 +53,9 @@ The pipeline runs in this order:
 6. Extract links from each document, create LINKS_TO edges
 7. BFS-crawl outgoing links to discover docs outside the doc root but inside the git repo
 8. Generate embeddings for new/changed chunks
-9. Prune stale documents no longer on disk
+9. Prune stale documents no longer on disk. When the walk finds no document file at all, this still runs (deleting the last document removes its rows), but only if the whole root could be listed; an unreadable or missing root leaves the store alone
+
+Between steps 5 and 6, and again for each document the BFS step indexes, the changed documents are offered to the project's [pipeline plugins](PIPELINE_PLUGINS.md): the plugin run replaces or removes each document's pipeline rows, and a plugin that fails costs a warning (listed in the `index-docs` report), never the index run.
 
 ---
 
