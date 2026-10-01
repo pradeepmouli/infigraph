@@ -1585,6 +1585,11 @@ fn indexer_command(
 ) -> std::process::Command {
     let mut command = std::process::Command::new(cmd);
     command.args(args).current_dir(root);
+    // Its own process group (pgid == pid, set atomically at spawn), so a
+    // timeout or a cancellation can kill the indexer together with what it
+    // started (`kill_process_group`). R2.5.1.
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut command, 0);
 
     if let Some(flag) = output_flag {
         command.arg(flag).arg(output_path);
@@ -1628,10 +1633,8 @@ async fn run_scip_indexer_cmd_async(
     output_path: &Path,
     timeout: std::time::Duration,
 ) -> bool {
-    // A timed-out run drops the in-flight `child.wait()` future below,
-    // dropping the `Child` itself -- without `kill_on_drop`, tokio leaves
-    // the orphaned process running rather than reaping it, which would
-    // defeat the point of adding a timeout at all.
+    // `kill_on_drop` reaps the direct child when this future is dropped; the
+    // guard below takes the rest of its group.
     let mut command = tokio::process::Command::from(indexer_command(
         root,
         cmd,
@@ -1641,9 +1644,17 @@ async fn run_scip_indexer_cmd_async(
         output_path,
     ));
     command.kill_on_drop(true);
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            eprintln!("Auto-SCIP: failed to run {label}: {e}");
+            return false;
+        }
+    };
+    let mut group = GroupKillOnDrop(child.id());
 
     let run = async {
-        match command.status().await {
+        match child.wait().await {
             Ok(s) if s.success() => {
                 if output_flag.is_none() {
                     let default_out = root.join("index.scip");
@@ -1665,10 +1676,40 @@ async fn run_scip_indexer_cmd_async(
     };
 
     match tokio::time::timeout(timeout, run).await {
-        Ok(succeeded) => succeeded,
+        Ok(succeeded) => {
+            // The indexer finished by itself: whatever it left running on
+            // purpose (gradle's daemon) is none of ours to kill.
+            group.disarm();
+            succeeded
+        }
         Err(_elapsed) => {
             eprintln!("Auto-SCIP: {label} timed out after {timeout:?}");
+            // `group` drops here and kills the whole group.
             false
+        }
+    }
+}
+
+/// Kills an indexer's whole process group when dropped before `disarm`:
+/// on a timeout, or when the owning future is dropped (a cancelled batch,
+/// daemon shutdown). `kill_on_drop` alone reaches only the direct child, and
+/// rust-analyzer starts `cargo metadata`, scip-java starts gradle/maven.
+///
+/// Unix only: `kill_process_group` is a no-op elsewhere, so on Windows an
+/// indexer's grandchildren still outlive a timeout and only the direct
+/// child dies (Job Objects would be the equivalent).
+struct GroupKillOnDrop(Option<u32>);
+
+impl GroupKillOnDrop {
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for GroupKillOnDrop {
+    fn drop(&mut self) {
+        if let Some(pid) = self.0 {
+            infigraph_core::daemon::lifecycle::kill_process_group(pid);
         }
     }
 }
@@ -1986,6 +2027,81 @@ mod tests {
         assert!(
             elapsed < std::time::Duration::from_secs(2),
             "must return promptly on timeout, not wait for the full process duration; took {elapsed:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    fn pid_alive(pid: u32) -> bool {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .output()
+            .is_ok_and(|o| o.status.success())
+    }
+
+    /// R2.5.1: a timed-out indexer takes its whole process group with it.
+    /// `kill_on_drop` alone reaches only the direct child, so a grandchild
+    /// (rust-analyzer's `cargo metadata`, scip-java's gradle) outlived the
+    /// timeout. The fake indexer starts a `sleep` grandchild and waits on it.
+    /// A `sleep` the test itself started, in the test's own group, must
+    /// survive: the kill reaches the indexer's group and nothing else.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_timed_out_indexer_takes_its_grandchildren_and_only_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let pid_file = root.join("grandchild.pid");
+        let output_path = root.join("out.scip");
+
+        let mut bystander = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        let succeeded = run_scip_indexer_cmd_async(
+            root,
+            "sh",
+            &[
+                "-c",
+                "sleep 600 & echo $! > \"$0\"; wait",
+                &pid_file.to_string_lossy(),
+            ],
+            "grandparent-indexer",
+            None,
+            None,
+            &output_path,
+            std::time::Duration::from_millis(1500),
+        )
+        .await;
+        assert!(!succeeded);
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+
+        let grandchild: u32 = std::fs::read_to_string(&pid_file)
+            .expect("the fake indexer never started its grandchild")
+            .trim()
+            .parse()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while pid_alive(grandchild) && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let grandchild_alive = pid_alive(grandchild);
+        let bystander_alive = bystander.try_wait().unwrap().is_none();
+        let _ = bystander.kill();
+        let _ = bystander.wait();
+        if grandchild_alive {
+            // SAFETY: a pid this test just read from its own fake indexer.
+            unsafe {
+                libc::kill(grandchild as i32, libc::SIGKILL);
+            }
+        }
+        assert!(
+            !grandchild_alive,
+            "the indexer's grandchild outlived the timeout"
+        );
+        assert!(
+            bystander_alive,
+            "the kill reached a process outside the group"
         );
     }
 
