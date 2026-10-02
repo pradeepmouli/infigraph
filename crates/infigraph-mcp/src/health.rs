@@ -5,8 +5,11 @@
 //! files, sidecar files) or directly-observed process facts, never from
 //! cached beliefs about what should be running.
 
-use std::path::Path;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use infigraph_core::{degraded, lockfile};
 
@@ -21,7 +24,14 @@ pub struct HealthState {
     /// The restart beacon fires once per incarnation — after the first
     /// warning the client knows, and repeating it is pure token cost.
     restart_emitted: AtomicBool,
+    /// When each degraded mode was last shown in a footer, per project
+    /// (`None`: no project, the process's own modes).
+    degraded_shown: Mutex<BTreeMap<(Option<PathBuf>, String), Instant>>,
 }
+
+/// How long a degraded mode that is still in effect stays out of the footer
+/// after it was shown. `doctor` and `get_stats` list every mode every time.
+pub const FOOTER_REPEAT_AFTER: Duration = Duration::from_secs(600);
 
 pub static HEALTH: HealthState = HealthState::new();
 
@@ -30,6 +40,7 @@ impl HealthState {
         Self {
             initialized: AtomicBool::new(false),
             restart_emitted: AtomicBool::new(false),
+            degraded_shown: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -43,6 +54,40 @@ impl HealthState {
     fn restart_beacon(&self) -> bool {
         !self.initialized.load(Ordering::Relaxed)
             && !self.restart_emitted.swap(true, Ordering::Relaxed)
+    }
+}
+
+impl HealthState {
+    /// The `notices` in effect for `root` that are due in a footer at `now`:
+    /// those not yet shown by this worker, and those last shown at least
+    /// [`FOOTER_REPEAT_AFTER`] ago. The mode's key decides, not its wording.
+    /// A mode missing from `notices` is forgotten, so one that clears and
+    /// comes back is shown at once.
+    pub fn degraded_due(
+        &self,
+        root: Option<&Path>,
+        notices: Vec<degraded::Notice>,
+        now: Instant,
+    ) -> Vec<degraded::Notice> {
+        let root = root.map(Path::to_path_buf);
+        let mut shown = self
+            .degraded_shown
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        shown.retain(|(r, key), _| *r != root || notices.iter().any(|n| n.key == *key));
+        notices
+            .into_iter()
+            .filter(|notice| {
+                let slot = (root.clone(), notice.key.clone());
+                let due = shown
+                    .get(&slot)
+                    .is_none_or(|at| now.saturating_duration_since(*at) >= FOOTER_REPEAT_AFTER);
+                if due {
+                    shown.insert(slot, now);
+                }
+                due
+            })
+            .collect()
     }
 }
 
@@ -108,12 +153,13 @@ pub fn gather_signals(state: &HealthState, tool_name: &str, project: Option<&Pat
         }
     }
     if !DEGRADED_REPORTING_TOOLS.contains(&tool_name) {
-        sig.degraded = match local_project {
+        let in_effect = match local_project {
             // Cached: this runs after every tool call, and the daemon's part
             // is a socket round trip.
             Some(root) => degraded::gather_cached(root),
             None => degraded::process_notices(),
         };
+        sig.degraded = state.degraded_due(local_project, in_effect, Instant::now());
     }
     sig
 }

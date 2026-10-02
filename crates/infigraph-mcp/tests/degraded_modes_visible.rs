@@ -178,6 +178,18 @@ fn a_fallback_inside_the_daemon_is_visible_in_doctor_get_stats_and_the_footer() 
         "the tool footer does not show the daemon's fallback:\n{listing}"
     );
 
+    // The footer says it once; `get_stats`, which was asked, every time.
+    let again = tool_text(&mut server, 4, "list_files", path.clone());
+    assert!(
+        !again.contains(&wanted),
+        "the footer repeats a lasting mode on the next call:\n{again}"
+    );
+    let stats = tool_text(&mut server, 5, "get_stats", path.clone());
+    assert!(
+        stats.contains(&wanted),
+        "get_stats stopped listing it:\n{stats}"
+    );
+
     // What the footer's lookup costs a tool call, against this healthy
     // daemon: asked afresh (what `doctor` and `get_stats` do), and through
     // the cache the footer uses. Printed, and bounded loosely enough for a
