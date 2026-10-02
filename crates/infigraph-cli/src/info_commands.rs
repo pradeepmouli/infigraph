@@ -755,9 +755,13 @@ pub(crate) fn cmd_daemon(root: &Path, debounce: u64) -> Result<()> {
     let docs_reads = match infigraph_docs::daemon_source::daemon_row_source(root) {
         Ok(source) => Some(source),
         Err(e) => {
-            eprintln!(
-                "[read] document reads unavailable for {}: {e:#}",
-                root.display()
+            // Reported to clients through the status socket (#75); `set`
+            // also writes it to this daemon's log, once.
+            infigraph_core::degraded::live::set(
+                root,
+                infigraph_core::degraded::DegradedMode::DocReadsUnavailable {
+                    reason: format!("{e:#}"),
+                },
             );
             None
         }
@@ -2062,6 +2066,8 @@ mod ps_status_tests {
             work_in_flight: false,
             code: RoleState::Running,
             docs: RoleState::NotOwned,
+            degraded: Vec::new(),
+            judged: Vec::new(),
         }
     }
 

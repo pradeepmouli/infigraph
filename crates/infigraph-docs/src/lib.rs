@@ -431,6 +431,16 @@ impl DocIndex {
 
         let pipeline_warnings = pipelines.map(|run| run.finish(store)).unwrap_or_default();
 
+        // #75: with chunks in the store and no embeddings beside it, document
+        // search ranks by keywords only. Only this side knows the count; an
+        // empty index has no embeddings file and is healthy. A run that was
+        // told to skip embeddings does not judge.
+        if !self.skip_file_embeddings && !infigraph_core::daemon::lifecycle::is_remote_backend() {
+            if let Ok(stats) = store.stats() {
+                infigraph_core::degraded::live::note_doc_embeddings(&self.root, stats.chunk_count);
+            }
+        }
+
         Ok(DocIndexResult {
             total_files: total,
             indexed_files: indexed,

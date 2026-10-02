@@ -178,6 +178,11 @@ pub fn mark_self_daemon(root: &Path) {
     *lock(&SELF_DAEMON) = Some(key(root));
 }
 
+/// Whether this process is `root`'s daemon.
+pub fn is_self_daemon(root: &Path) -> bool {
+    lock(&SELF_DAEMON).as_ref() == Some(&key(root))
+}
+
 /// Whether this process holds, or is establishing, a lease on `root`'s daemon.
 pub fn is_held(root: &Path) -> bool {
     with_held(|h| h.contains_key(&key(root)))

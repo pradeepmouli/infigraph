@@ -127,11 +127,14 @@ fn check_embeddings_sidecar(backend: &crate::graph::KuzuBackend, ig: &Path) -> V
     let mut results = Vec::new();
     let emb_path = ig.join("embeddings.bin");
     if !emb_path.exists() {
+        // Worded by the one definition of this mode. (The hint here used to
+        // say search falls back to BM25; it embeds at query time instead.)
+        let mode = crate::degraded::DegradedMode::EmbeddingsMissing;
         results.push(CheckResult::warn(
             CATEGORY,
             "embeddings.bin: parse",
-            "sidecar not present",
-            "run `infigraph index` to build embeddings (search falls back to BM25 without them)",
+            mode.message(),
+            mode.remedy(),
         ));
         return results;
     }

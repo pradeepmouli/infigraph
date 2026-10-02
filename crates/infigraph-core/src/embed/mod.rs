@@ -82,6 +82,58 @@ pub fn read_generation_marker(sidecar_path: &Path) -> Option<i64> {
     Some(i64::from_le_bytes(arr))
 }
 
+/// Sibling marker recording which embedder built a sidecar (#75). A second
+/// file, not a field in the generation marker: that one is 8 bytes read by
+/// every build, and a daemon and an MCP worker can be different builds for a
+/// while, so its format must not move.
+const EMBEDDER_MARKER_SUFFIX: &str = ".embedder";
+
+/// What the marker says when the file holds vectors from more than one
+/// embedder (an incremental update by a different one than built the rest).
+pub const MIXED_EMBEDDERS: &str = "mixed";
+
+fn embedder_marker_path(sidecar_path: &Path) -> PathBuf {
+    let name = sidecar_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("sidecar");
+    sidecar_path.with_file_name(format!("{name}{EMBEDDER_MARKER_SUFFIX}"))
+}
+
+/// Record which embedder built `sidecar_path` ([`EmbedProvider::name`], or
+/// [`MIXED_EMBEDDERS`]).
+pub fn write_embedder_marker(sidecar_path: &Path, embedder: &str) -> Result<()> {
+    atomic_write(&embedder_marker_path(sidecar_path), embedder.as_bytes())
+}
+
+/// The embedder that built `sidecar_path`, if recorded. `None` means unknown
+/// (a file from before the marker existed), never "degraded".
+pub fn read_embedder_marker(sidecar_path: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(embedder_marker_path(sidecar_path)).ok()?;
+    let name = text.trim();
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+/// What the marker should say after a write in which `embedder` produced
+/// `embedded` of the file's `count` vectors and the rest were kept. One name
+/// only when every vector is known to come from it; `None` (leave it
+/// unknown) when kept vectors have no recorded origin.
+pub fn embedder_marker_after(
+    recorded: Option<&str>,
+    embedder: &str,
+    embedded: usize,
+    count: usize,
+) -> Option<String> {
+    if embedded >= count {
+        return Some(embedder.to_string());
+    }
+    match recorded {
+        Some(prior) if prior == embedder => Some(embedder.to_string()),
+        Some(_) => Some(MIXED_EMBEDDERS.to_string()),
+        None => None,
+    }
+}
+
 // `INFIGRAPH_MODEL_DIR` predates the macro and exists upstream, so
 // `embed_settings` seeds it from the legacy name; the canonical
 // `INFIGRAPH_EMBED_MODEL_DIR` also works, legacy wins. Empty means "unset"
@@ -145,6 +197,12 @@ pub fn invalidate_embeddings_cache() {
 
 /// Embedding engine trait. Implementations can use ONNX, API calls, etc.
 pub trait EmbedProvider: Send + Sync {
+    /// A stable name for this embedder, recorded beside what it builds so a
+    /// later reader can tell which one produced the vectors.
+    fn name(&self) -> &'static str {
+        "custom"
+    }
+
     fn dimension(&self) -> usize;
     fn embed_batch(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>>;
 
@@ -279,6 +337,10 @@ impl Default for TrigramEmbedder {
 }
 
 impl EmbedProvider for TrigramEmbedder {
+    fn name(&self) -> &'static str {
+        TRIGRAM_EMBEDDER
+    }
+
     fn dimension(&self) -> usize {
         self.dim
     }
@@ -404,6 +466,10 @@ impl Model2VecEmbedder {
 }
 
 impl EmbedProvider for Model2VecEmbedder {
+    fn name(&self) -> &'static str {
+        MODEL2VEC_EMBEDDER
+    }
+
     fn dimension(&self) -> usize {
         256 // potion-base-8M outputs 256-dim
     }
@@ -426,28 +492,51 @@ pub const HNSW_THRESHOLD: usize = 200_000;
 /// hashing because Model2Vec was unavailable. Read by the MCP health footer.
 static TRIGRAM_FALLBACK: AtomicBool = AtomicBool::new(false);
 
+/// Process-wide latch: set when this process loaded the Model2Vec model.
+static MODEL2VEC_LOADED: AtomicBool = AtomicBool::new(false);
+
+pub const TRIGRAM_EMBEDDER: &str = "trigram";
+pub const MODEL2VEC_EMBEDDER: &str = "model2vec";
+
 /// Record that an embedder was constructed on the trigram fallback path.
 pub fn note_trigram_fallback() {
     TRIGRAM_FALLBACK.store(true, Ordering::Relaxed);
+}
+
+/// The embedder this process embeds with, once it has built one: the name
+/// [`EmbedProvider::name`] gives. `None` before any embedder exists here.
+pub fn process_embedder() -> Option<&'static str> {
+    if trigram_fallback_active() {
+        Some(TRIGRAM_EMBEDDER)
+    } else if MODEL2VEC_LOADED.load(Ordering::Relaxed) {
+        Some(MODEL2VEC_EMBEDDER)
+    } else {
+        None
+    }
 }
 
 pub fn trigram_fallback_active() -> bool {
     TRIGRAM_FALLBACK.load(Ordering::Relaxed)
 }
 
-/// True when this project is above the HNSW threshold but the sidecar index
-/// file is missing — vector search is silently on a linear scan that no
-/// longer pays off at this scale. Below the threshold a missing index is by
-/// design, not degradation.
+/// True when this project is above the HNSW threshold but the index, or the
+/// `.meta` beside it, is missing — vector search is silently on a linear scan
+/// that no longer pays off at this scale. `search_hnsw` answers `None` when
+/// either file is absent, so either one missing is the same degradation.
+/// Below the threshold a missing index is by design, not degradation.
 pub fn hnsw_expected_but_missing(root: &Path) -> bool {
     let hnsw = root.join(".infigraph").join("hnsw_index.usearch");
-    !hnsw.exists() && embedding_count(root) >= HNSW_THRESHOLD
+    let usable = hnsw.exists() && hnsw.with_extension("meta").exists();
+    !usable && embedding_count(root) >= HNSW_THRESHOLD
 }
 
 /// Factory: select Model2Vec if available, otherwise fall back to TrigramEmbedder.
 pub fn init_embedder() -> Arc<dyn EmbedProvider> {
     match Model2VecEmbedder::new() {
-        Ok(m) => Arc::new(m),
+        Ok(m) => {
+            MODEL2VEC_LOADED.store(true, Ordering::Relaxed);
+            Arc::new(m)
+        }
         Err(e) => {
             note_trigram_fallback();
             eprintln!("warning: Model2Vec unavailable ({e}), using trigram fallback");
@@ -469,7 +558,10 @@ pub fn doc_embedder() -> Arc<dyn EmbedProvider> {
 /// Create the best available embedder: Model2Vec if possible, fallback to trigram.
 pub fn best_embedder() -> Box<dyn EmbedProvider> {
     match Model2VecEmbedder::new() {
-        Ok(m) => Box::new(m),
+        Ok(m) => {
+            MODEL2VEC_LOADED.store(true, Ordering::Relaxed);
+            Box::new(m)
+        }
         Err(e) => {
             note_trigram_fallback();
             eprintln!("warning: Model2Vec unavailable ({e}), using trigram fallback");
@@ -745,8 +837,40 @@ pub fn update_embeddings(
     root: &Path,
     changed_files: &[&str],
 ) -> Result<usize> {
+    update_embeddings_with(backend, root, changed_files, &best_embedder)
+}
+
+/// [`update_embeddings`] with the embedder supplied by the caller: the seam
+/// a test uses to exercise an embedder that fails.
+#[doc(hidden)]
+pub fn update_embeddings_with(
+    backend: &dyn crate::graph::GraphBackend,
+    root: &Path,
+    changed_files: &[&str],
+    make_embedder: &dyn Fn() -> Box<dyn EmbedProvider>,
+) -> Result<usize> {
+    let result = update_embeddings_inner(backend, root, changed_files, make_embedder);
+    // #75: whoever holds the graph says whether the embeddings now reflect
+    // it, success or not -- a failed update is exactly when they do not.
+    if let Ok(generation) = backend.current_ast_generation() {
+        crate::degraded::live::note_embeddings_generation(root, generation);
+    }
+    result
+}
+
+fn update_embeddings_inner(
+    backend: &dyn crate::graph::GraphBackend,
+    root: &Path,
+    changed_files: &[&str],
+    make_embedder: &dyn Fn() -> Box<dyn EmbedProvider>,
+) -> Result<usize> {
     use rayon::prelude::*;
     use std::sync::Arc;
+
+    // Read before the symbols, never after: a write that lands in between
+    // then leaves the marker behind the graph (reported as stale, and true)
+    // rather than ahead of what was embedded. 0 = this backend has none.
+    let generation = backend.current_ast_generation().unwrap_or(0);
 
     let rows = backend.raw_query("MATCH (s:Symbol) RETURN s.id, s.name, s.kind, s.file, s.docstring, s.language, s.parameters, s.return_type")?;
 
@@ -788,8 +912,10 @@ pub fn update_embeddings(
     }
 
     let mut embedded = 0usize;
+    let mut embedder_name: Option<&'static str> = None;
     if !to_embed.is_empty() {
-        let embedder: Arc<Box<dyn EmbedProvider>> = Arc::new(best_embedder());
+        let embedder: Arc<Box<dyn EmbedProvider>> = Arc::new(make_embedder());
+        embedder_name = Some(embedder.name());
         const BATCH: usize = 256;
         let results: Vec<Vec<(String, Vec<f32>, u64)>> = to_embed
             .par_chunks(BATCH)
@@ -822,7 +948,19 @@ pub fn update_embeddings(
     // Nothing embedded, nothing pruned: the file's contents would be identical.
     // Skip the write AND the O(n) HNSW rebuild — this is the body-only-edit
     // fast path.
+    // The file reflects `generation` only if every symbol that needed a new
+    // vector got one. An embedder that failed leaves `embedded` short, and
+    // the marker then stays where it was: moving it would call embeddings
+    // fresh that were not updated.
+    let reflects_generation = embedded == to_embed.len();
+
     if embedded == 0 && pruned == 0 {
+        // The file is untouched. If that is because nothing needed
+        // embedding, it now reflects this generation: move the marker, or
+        // every body-only edit leaves it reading as stale.
+        if reflects_generation && emb_path.exists() {
+            let _ = write_generation_marker(&emb_path, generation);
+        }
         return Ok(count);
     }
 
@@ -836,8 +974,16 @@ pub fn update_embeddings(
     // Best-effort: a failed marker write shouldn't fail an otherwise
     // successful embeddings rebuild -- worst case, a later staleness check
     // just can't judge this file (see `read_generation_marker`).
-    if let Ok(generation) = backend.current_ast_generation() {
+    if reflects_generation {
         let _ = write_generation_marker(&emb_path, generation);
+    }
+    // #75: record which embedder these vectors came from, by the same
+    // best-effort rule. A prune-only write embedded nothing and leaves it.
+    if let Some(name) = embedder_name {
+        let recorded = read_embedder_marker(&emb_path);
+        if let Some(marker) = embedder_marker_after(recorded.as_deref(), name, embedded, count) {
+            let _ = write_embedder_marker(&emb_path, &marker);
+        }
     }
 
     let symbol_embeddings: Vec<(String, Vec<f32>)> = entries

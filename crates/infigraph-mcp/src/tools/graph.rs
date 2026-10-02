@@ -62,7 +62,10 @@ pub fn tool_get_symbols_in_file(args: &Value) -> Result<String> {
 pub fn tool_get_stats(args: &Value) -> Result<String> {
     let prism = open_prism_read_only(args)?;
     let stats = prism.stats()?;
-    Ok(format!("{}", stats))
+    // #75: asked directly, so the daemon's part is fetched now, not cached.
+    let degraded =
+        infigraph_core::degraded::render_section(&infigraph_core::degraded::gather(prism.root()));
+    Ok(format!("{stats}\n{degraded}"))
 }
 
 pub fn tool_get_code_snippet(args: &Value) -> Result<String> {

@@ -267,11 +267,24 @@ pub async fn run_producer(
                                         .await;
                                         match registered {
                                             None => break,
-                                            Some(Ok(())) => {}
-                                            Some(Err(e)) => eprintln!(
-                                                "[watch-producer] failed to watch new directory {}: {e}",
-                                                path.display()
-                                            ),
+                                            // A new directory's failures add
+                                            // to the mode; its success says
+                                            // nothing about the rest.
+                                            Some(Ok(registration)) => registration.note(&root, false),
+                                            Some(Err(e)) => {
+                                                eprintln!(
+                                                    "[watch-producer] failed to watch new directory {}: {e}",
+                                                    path.display()
+                                                );
+                                                crate::watch::WatchRegistration {
+                                                    failed: 1,
+                                                    first_error: Some(format!(
+                                                        "{}: {e}",
+                                                        path.display()
+                                                    )),
+                                                }
+                                                .note(&root, false);
+                                            }
                                         }
                                     } else if !crate::graph::store_util::is_lockfile(&rel)
                                         && registry.for_file(&rel).is_some()
@@ -399,7 +412,7 @@ fn create_watcher(
         },
         Config::default().with_poll_interval(Duration::from_millis(debounce_ms)),
     )?;
-    crate::watch::register_watch_dirs(&mut watcher, root)?;
+    crate::watch::register_watch_dirs(&mut watcher, root)?.note(root, true);
     Ok((Arc::new(Mutex::new(watcher)), rx))
 }
 

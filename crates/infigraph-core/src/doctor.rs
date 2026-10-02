@@ -1106,7 +1106,7 @@ pub fn check_disk(ctx: &DoctorContext) -> Vec<CheckResult> {
 }
 
 const SIDECAR_CATEGORY: &str = "sidecars";
-const SIDECAR_STALE_SECS: u64 = 60 * 60; // 1 hour
+pub(crate) const SIDECAR_STALE_SECS: u64 = 60 * 60; // 1 hour
 
 /// The store a sidecar is derived from, i.e. the file whose mtime its
 /// freshness is judged against, and the command that rebuilds it.
@@ -1131,12 +1131,9 @@ fn check_one_sidecar(project_path: &Path, sidecar_name: &str) -> Option<CheckRes
         return None;
     }
 
-    let anchor_mtime = std::fs::metadata(&anchor_path).ok()?.modified().ok()?;
-    let sidecar_mtime = std::fs::metadata(&sidecar_path).ok()?.modified().ok()?;
-
     let label = format!("{}: {}", project_path.display(), sidecar_name);
-    match anchor_mtime.duration_since(sidecar_mtime) {
-        Ok(staleness) if staleness.as_secs() > SIDECAR_STALE_SECS => Some(CheckResult::warn(
+    match sidecar_lag(project_path, sidecar_name) {
+        Some(staleness) if staleness.as_secs() > SIDECAR_STALE_SECS => Some(CheckResult::warn(
             SIDECAR_CATEGORY,
             label,
             format!(
@@ -1154,6 +1151,65 @@ fn check_one_sidecar(project_path: &Path, sidecar_name: &str) -> Option<CheckRes
             format!("fresh relative to {anchor_name}"),
         )),
     }
+}
+
+/// How much older than the store it is derived from a sidecar is: `None`
+/// when either file is missing or the sidecar is the newer one. The one
+/// derivation of sidecar staleness, shared with `degraded::gather`.
+pub(crate) fn sidecar_lag(project_path: &Path, sidecar_name: &str) -> Option<std::time::Duration> {
+    let infigraph_dir = project_path.join(".infigraph");
+    let (anchor_name, _) = sidecar_anchor(sidecar_name);
+    let anchor_mtime = std::fs::metadata(infigraph_dir.join(anchor_name))
+        .ok()?
+        .modified()
+        .ok()?;
+    let sidecar_mtime = std::fs::metadata(infigraph_dir.join(sidecar_name))
+        .ok()?
+        .modified()
+        .ok()?;
+    anchor_mtime.duration_since(sidecar_mtime).ok()
+}
+
+const DEGRADED_CATEGORY: &str = "degraded modes";
+
+/// One warning per degraded mode `degraded::gather` reports for the project
+/// (#75), in that module's wording, or a single pass. File-time staleness of
+/// `embeddings.bin` is left out: [`check_one_sidecar`] reports it from the
+/// same `sidecar_lag`. A live daemon's exact answer for it is kept.
+fn check_one_project_degraded(project_path: &Path) -> Vec<CheckResult> {
+    use crate::degraded::{self, DegradedMode};
+    let from_file_times: Vec<degraded::Notice> = degraded::derived_from_disk(project_path)
+        .iter()
+        .filter(|m| matches!(m, DegradedMode::EmbeddingsStale { .. }))
+        .map(DegradedMode::notice)
+        .collect();
+    let warnings: Vec<CheckResult> = degraded::gather(project_path)
+        .into_iter()
+        .filter(|n| !from_file_times.contains(n))
+        .map(|n| {
+            CheckResult::warn(
+                DEGRADED_CATEGORY,
+                format!("{}: {}", project_path.display(), n.key),
+                n.message,
+                n.remedy,
+            )
+        })
+        .collect();
+    if warnings.is_empty() {
+        return vec![CheckResult::pass(
+            DEGRADED_CATEGORY,
+            project_path.display().to_string(),
+            "none in effect",
+        )];
+    }
+    warnings
+}
+
+pub fn check_degraded(ctx: &DoctorContext) -> Vec<CheckResult> {
+    projects_in_scope(ctx)
+        .iter()
+        .flat_map(|p| check_one_project_degraded(p))
+        .collect()
 }
 
 pub fn check_sidecars(ctx: &DoctorContext) -> Vec<CheckResult> {
@@ -1676,6 +1732,7 @@ pub fn run_doctor(ctx: DoctorContext) -> DoctorReport {
     checks.extend(check_instances(&ctx));
     checks.extend(check_disk(&ctx));
     checks.extend(check_sidecars(&ctx));
+    checks.extend(check_degraded(&ctx));
     checks.extend(check_docs(&ctx));
     checks.extend(check_scip_staleness(&ctx));
     checks.extend(check_worktrees(&ctx));
@@ -1932,6 +1989,8 @@ mod watcher_verdict_tests {
             work_in_flight: busy,
             code: RoleState::Running,
             docs: RoleState::NotOwned,
+            degraded: Vec::new(),
+            judged: Vec::new(),
         }
     }
 
@@ -2042,5 +2101,75 @@ mod docs_check_tests {
         let r = check(Some(false), true);
         assert_eq!(r.status, CheckStatus::Warn, "{}", r.message);
         assert!(r.remediation.unwrap().contains("clean-docs"));
+    }
+}
+
+#[cfg(test)]
+mod degraded_check_tests {
+    use super::*;
+    use crate::settings_file::test_support::{PinnedHome, ENV_LOCK};
+
+    fn project() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".infigraph")).unwrap();
+        std::fs::write(dir.path().join(".infigraph/graph"), b"graph").unwrap();
+        dir
+    }
+
+    fn embeddings(dir: &Path, older_by: std::time::Duration) {
+        let path = dir.join(".infigraph/embeddings.bin");
+        std::fs::write(&path, 10u32.to_le_bytes()).unwrap();
+        let file = std::fs::File::options().write(true).open(&path).unwrap();
+        file.set_modified(std::time::SystemTime::now() - older_by)
+            .unwrap();
+    }
+
+    #[test]
+    fn each_degraded_mode_is_a_warning_with_its_remedy() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _home = PinnedHome::empty();
+        let dir = project();
+        let results = check_one_project_degraded(dir.path());
+        let missing = results
+            .iter()
+            .find(|r| r.name.ends_with("embeddings-missing"))
+            .unwrap_or_else(|| panic!("no embeddings-missing check: {results:?}"));
+        assert_eq!(missing.category, DEGRADED_CATEGORY);
+        assert_eq!(missing.status, CheckStatus::Warn);
+        let mode = crate::degraded::DegradedMode::EmbeddingsMissing;
+        assert_eq!(missing.message, mode.message());
+        assert_eq!(missing.remediation.as_deref(), Some(mode.remedy()));
+    }
+
+    #[test]
+    fn a_project_with_nothing_degraded_passes_once() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _home = PinnedHome::empty();
+        let dir = project();
+        embeddings(dir.path(), std::time::Duration::ZERO);
+        let results = check_one_project_degraded(dir.path());
+        assert_eq!(results.len(), 1, "{results:?}");
+        assert_eq!(results[0].status, CheckStatus::Pass);
+    }
+
+    /// File-time staleness is the sidecars category's finding, by the same
+    /// `sidecar_lag`; reporting it here too would say one thing twice.
+    #[test]
+    fn file_time_staleness_is_left_to_the_sidecars_category() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _home = PinnedHome::empty();
+        let dir = project();
+        embeddings(dir.path(), std::time::Duration::from_secs(3 * 3600));
+        assert_eq!(
+            check_one_sidecar(dir.path(), "embeddings.bin")
+                .unwrap()
+                .status,
+            CheckStatus::Warn
+        );
+        let results = check_one_project_degraded(dir.path());
+        assert!(
+            results.iter().all(|r| r.status == CheckStatus::Pass),
+            "{results:?}"
+        );
     }
 }

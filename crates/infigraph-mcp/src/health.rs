@@ -8,7 +8,7 @@
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use infigraph_core::{embed, lockfile};
+use infigraph_core::{degraded, lockfile};
 
 /// Process-local health flags for this worker incarnation.
 pub struct HealthState {
@@ -58,8 +58,9 @@ impl Default for HealthState {
 pub struct Signals {
     pub worker_restarted: bool,
     pub watcher_missing: bool,
-    pub trigram_fallback: bool,
-    pub hnsw_missing: bool,
+    /// The degraded modes `infigraph_core::degraded` reports (#75): defined
+    /// and worded there, only rendered here.
+    pub degraded: Vec<infigraph_core::degraded::Notice>,
     /// (lock file name, whole seconds waited) per slow acquisition drained
     /// for this call.
     pub slow_waits: Vec<(String, u64)>,
@@ -75,10 +76,13 @@ const WATCHER_LIFECYCLE_TOOLS: &[&str] = &[
     "stop_watch_docs",
 ];
 
+/// Tools whose own output lists the degraded modes: repeating them in the
+/// footer of the same reply is noise.
+const DEGRADED_REPORTING_TOOLS: &[&str] = &["get_stats", "doctor"];
+
 pub fn gather_signals(state: &HealthState, tool_name: &str, project: Option<&Path>) -> Signals {
     let mut sig = Signals {
         worker_restarted: state.restart_beacon(),
-        trigram_fallback: embed::trigram_fallback_active(),
         ..Default::default()
     };
     sig.slow_waits = lockfile::take_slow_waits()
@@ -92,18 +96,24 @@ pub fn gather_signals(state: &HealthState, tool_name: &str, project: Option<&Pat
             (name, w.waited.as_secs())
         })
         .collect();
-    if let Some(root) = project {
-        // Watcher and HNSW are local-filesystem concepts; in remote mode
-        // (Neo4j backend) neither applies. A project without .infigraph
-        // has nothing to be stale against.
-        if !infigraph_core::daemon::lifecycle::is_remote_backend()
-            && root.join(".infigraph").is_dir()
-        {
-            if !WATCHER_LIFECYCLE_TOOLS.contains(&tool_name) {
-                sig.watcher_missing = !crate::tools::watch::watcher_running(root);
-            }
-            sig.hnsw_missing = embed::hnsw_expected_but_missing(root);
+    // Watcher, sidecars and the daemon are local-filesystem concepts; in
+    // remote mode (Neo4j backend) none applies. A project without
+    // .infigraph has nothing to be stale against.
+    let local_project = project.filter(|root| {
+        !infigraph_core::daemon::lifecycle::is_remote_backend() && root.join(".infigraph").is_dir()
+    });
+    if let Some(root) = local_project {
+        if !WATCHER_LIFECYCLE_TOOLS.contains(&tool_name) {
+            sig.watcher_missing = !crate::tools::watch::watcher_running(root);
         }
+    }
+    if !DEGRADED_REPORTING_TOOLS.contains(&tool_name) {
+        sig.degraded = match local_project {
+            // Cached: this runs after every tool call, and the daemon's part
+            // is a socket round trip.
+            Some(root) => degraded::gather_cached(root),
+            None => degraded::process_notices(),
+        };
     }
     sig
 }
@@ -125,19 +135,7 @@ pub fn compose_footer(sig: &Signals) -> Option<String> {
                 .to_string(),
         );
     }
-    if sig.trigram_fallback {
-        lines.push(
-            "⚠ semantic search degraded: Model2Vec model unavailable, using trigram fallback"
-                .to_string(),
-        );
-    }
-    if sig.hnsw_missing {
-        lines.push(
-            "⚠ HNSW index missing — vector search is on a linear scan this \
-             project has outgrown; re-index to rebuild"
-                .to_string(),
-        );
-    }
+    lines.extend(sig.degraded.iter().map(|n| n.warning_line()));
     for (name, secs) in &sig.slow_waits {
         lines.push(format!(
             "⚠ lock contention: waited {secs}s for {name} while serving this call"
