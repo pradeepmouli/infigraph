@@ -267,15 +267,39 @@ pub fn rich_symbol_text_full(
 /// 0 is reserved to mean "unknown", so a genuine hash of 0 maps to 1
 /// (worst case: that one symbol always re-embeds).
 pub fn fnv1a64(bytes: &[u8]) -> u64 {
-    let mut h: u64 = 0xcbf29ce484222325;
+    fnv1a64_finish(fnv1a64_extend(FNV1A64_OFFSET, bytes))
+}
+
+const FNV1A64_OFFSET: u64 = 0xcbf29ce484222325;
+
+fn fnv1a64_extend(mut h: u64, bytes: &[u8]) -> u64 {
     for &b in bytes {
         h ^= b as u64;
         h = h.wrapping_mul(0x0000_0100_0000_01b3);
     }
+    h
+}
+
+fn fnv1a64_finish(h: u64) -> u64 {
     if h == 0 {
         1
     } else {
         h
+    }
+}
+
+/// [`fnv1a64`] of everything `reader` yields, without holding it: the same
+/// value as hashing the whole content at once.
+pub fn fnv1a64_reader(mut reader: impl std::io::Read) -> std::io::Result<u64> {
+    let mut h = FNV1A64_OFFSET;
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => return Ok(fnv1a64_finish(h)),
+            Ok(n) => h = fnv1a64_extend(h, &buf[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
     }
 }
 

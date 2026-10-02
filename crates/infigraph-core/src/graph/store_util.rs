@@ -472,9 +472,27 @@ pub(crate) fn check_graph_growth_ratio(
 pub(crate) fn estimate_extractions_write_bytes(
     extractions: &[crate::model::FileExtraction],
 ) -> u64 {
-    serde_json::to_vec(extractions)
-        .map(|v| v.len() as u64)
-        .unwrap_or(0)
+    // Counted as it is serialized, never buffered (#150): the buffer was a
+    // second image of every extraction, built to take its length.
+    let mut counted = ByteCount(0);
+    match serde_json::to_writer(&mut counted, extractions) {
+        Ok(()) => counted.0,
+        Err(_) => 0,
+    }
+}
+
+/// An `io::Write` that keeps only how many bytes it was given.
+struct ByteCount(u64);
+
+impl std::io::Write for ByteCount {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0 += buf.len() as u64;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// A string property exactly as stored; NULL (or any non-string) reads as "".
@@ -994,6 +1012,57 @@ mod tests {
         resolve_import_candidate, stamp_healthy_graph_size, stamp_healthy_graph_size_if_unset,
         unwind_edges_from_pairs, GRAPH_MAX_BYTES_ENV, MAX_BAD_RECORD_RETRIES,
     };
+
+    /// The estimate is the length of the extractions' JSON, as it always
+    /// was; it is now counted without building that JSON (#150).
+    #[test]
+    fn the_write_estimate_is_the_json_length_of_the_extractions() {
+        use crate::model::{FileExtraction, Relation, RelationKind, Span, Symbol, SymbolKind};
+        let span = Span {
+            file: "a.py".into(),
+            start_line: 1,
+            start_col: 0,
+            end_line: 9,
+            end_col: 4,
+        };
+        let extractions: Vec<FileExtraction> = (0..3)
+            .map(|i| FileExtraction {
+                file: format!("src/f{i}.py"),
+                language: "python".into(),
+                content_hash: "abc".into(),
+                symbols: vec![Symbol {
+                    id: format!("src/f{i}.py::f"),
+                    name: "f \"quoted\" \u{e9}".into(),
+                    kind: SymbolKind::Function,
+                    span: span.clone(),
+                    signature_hash: "h".into(),
+                    parent: None,
+                    language: "python".into(),
+                    visibility: Some("public".into()),
+                    docstring: Some("line one\nline two".into()),
+                    complexity: 3,
+                    parameters: Some("(x, y)".into()),
+                    return_type: None,
+                    scip_id: None,
+                }],
+                relations: vec![Relation {
+                    source_id: format!("src/f{i}.py::f"),
+                    target_id: "src/g.py::g".into(),
+                    kind: RelationKind::Calls,
+                    span: Some(span.clone()),
+                    receiver: Some("self".into()),
+                }],
+                statements: Vec::new(),
+            })
+            .collect();
+        let json_len = serde_json::to_vec(&extractions).unwrap().len() as u64;
+        assert!(json_len > 0);
+        assert_eq!(
+            super::estimate_extractions_write_bytes(&extractions),
+            json_len
+        );
+        assert_eq!(super::estimate_extractions_write_bytes(&[]), 2);
+    }
 
     /// A store holding Symbol nodes `s0..s{n}` and nothing else.
     fn store_with_symbols(dir: &std::path::Path, n: usize) -> super::super::GraphStore {

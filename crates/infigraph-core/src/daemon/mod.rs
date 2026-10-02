@@ -2439,7 +2439,7 @@ fn build_full_reindex(
             let backend = fresh
                 .backend()
                 .ok_or_else(|| anyhow::anyhow!("freshly-opened backend was not initialized"))?;
-            let scan = fresh.scan_changed_files(backend)?;
+            let mut scan = fresh.scan_changed_files(backend)?;
             let detected_languages: std::collections::HashSet<String> = scan
                 .extractions
                 .iter()
@@ -2448,7 +2448,15 @@ fn build_full_reindex(
             if !scan.extractions.is_empty() {
                 backend.upsert_files_bulk(&scan.extractions, true)?;
             }
+            // #150: everything is in the graph now, and resolution reads
+            // only a small part of each extraction. Holding the rest through
+            // it was most of this build's Rust heap.
+            let indexed_files = scan.extractions.len();
+            for extraction in &mut scan.extractions {
+                extraction.reduce_to_resolution_inputs();
+            }
             let _resolve_stats = backend.resolve_calls(&scan.extractions, None)?;
+            drop(scan);
             // The swap replaces the graph wholesale, so whatever TESTED_BY
             // edges the live graph had are about to be discarded -- derive
             // them here or they are gone for good. `None` scope means
@@ -2458,7 +2466,7 @@ fn build_full_reindex(
                 eprintln!("[daemon] full-reindex: TESTED_BY derivation failed: {e}");
             }
             Ok(FullReindexBuildOutcome {
-                indexed_files: scan.extractions.len(),
+                indexed_files,
                 detected_languages: detected_languages.into_iter().collect(),
             })
         });

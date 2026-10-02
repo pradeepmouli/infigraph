@@ -118,7 +118,8 @@ fn scip_ledger_path(infigraph_dir: &Path) -> std::path::PathBuf {
 /// to be unchanged" and import anyway -- never as "unchanged", which would
 /// turn an I/O error into silently skipped enrichment.
 pub fn scip_output_hash(scip_path: &Path) -> Option<u64> {
-    Some(crate::embed::fnv1a64(&std::fs::read(scip_path).ok()?))
+    // Streamed (#150): an indexer's output can be hundreds of megabytes.
+    crate::embed::fnv1a64_reader(std::fs::File::open(scip_path).ok()?).ok()
 }
 
 /// True only when `label`'s output last hashed to `hash` *and* the graph
@@ -304,6 +305,13 @@ impl std::error::Error for ScipRejected {}
 /// for a language with files in the graph, so on those paths no documents
 /// means it ran and found none of files we know are there.
 pub fn validate_index(path: &Path, byte_len: usize, index: &Index) -> Result<(), ScipRejected> {
+    verdict(path, byte_len as u64, !index.documents.is_empty())
+}
+
+/// The rule itself, over the two facts it needs. [`validate_index`] feeds it
+/// from a decoded index and [`rejection_on_arrival`] from a scan of the
+/// file, so the two cannot disagree about what is acceptable.
+fn verdict(path: &Path, byte_len: u64, has_document: bool) -> Result<(), ScipRejected> {
     let rejected = |reason| ScipRejected {
         indexer: scratch_indexer_label(path).map(str::to_string),
         reason,
@@ -311,13 +319,53 @@ pub fn validate_index(path: &Path, byte_len: usize, index: &Index) -> Result<(),
     if byte_len == 0 {
         return Err(rejected(Rejection::ZeroBytes));
     }
-    if index.documents.is_empty() {
+    if !has_document {
         return Err(rejected(Rejection::NoDocuments));
     }
     Ok(())
 }
 
-/// [`validate_index`] on a file. `None` when the file is fine, and also when
+/// The same rule, for an output an indexer has just written, without
+/// decoding it (#150): an index is often hundreds of megabytes decoded, and
+/// the importer decodes it again anyway. This reads only the file's
+/// top-level fields, skipping each one's payload, and stops at the first
+/// document.
+///
+/// What it cannot see is damage below the top level: a file whose framing
+/// is sound but whose documents are corrupt passes here, fails the import's
+/// decode, and is then discarded by [`discard_if_rejected`], which does
+/// decode. A file whose top-level framing is broken is unparseable here, as
+/// it is to a full decode. `None` when the file is fine or cannot be read.
+pub fn rejection_on_arrival(path: &Path) -> Option<ScipRejected> {
+    let file = std::fs::File::open(path).ok()?;
+    let byte_len = file.metadata().ok()?.len();
+    match has_top_level_document(&mut std::io::BufReader::new(file)) {
+        Ok(has_document) => verdict(path, byte_len, has_document).err(),
+        Err(e) => Some(ScipRejected {
+            indexer: scratch_indexer_label(path).map(str::to_string),
+            reason: Rejection::Unparseable(e.to_string()),
+        }),
+    }
+}
+
+/// Whether the serialized `Index` in `reader` has a `documents` entry.
+fn has_top_level_document(reader: &mut dyn std::io::BufRead) -> protobuf::Result<bool> {
+    // `Index.documents` is field 2, length-delimited (wire type 2).
+    const DOCUMENTS_TAG: u32 = (2 << 3) | 2;
+    let mut stream = protobuf::CodedInputStream::from_buf_read(reader);
+    while let Some(tag) = stream.read_raw_tag_or_eof()? {
+        if tag == DOCUMENTS_TAG {
+            return Ok(true);
+        }
+        protobuf::rt::skip_field_for_tag(tag, &mut stream)?;
+    }
+    Ok(false)
+}
+
+/// [`validate_index`] on a file, decoding all of it: what the importer would
+/// say. For the failure path ([`discard_if_rejected`]); an output that has
+/// just arrived is checked by [`rejection_on_arrival`], which does not
+/// decode. `None` when the file is fine, and also when
 /// it cannot be read (missing, permission): that says nothing about the
 /// output, so it is never a reason to delete it.
 pub fn rejection_of(path: &Path) -> Option<ScipRejected> {
@@ -373,6 +421,10 @@ pub fn import_scip_index_enriched_at(
     // Before the lock and the preflights: an output that cannot enrich
     // anything must not stamp the graph or reach the redundancy ledger.
     validate_index(index_path, bytes.len(), &index)?;
+    // Only the length is needed from here on (#150): the decoded index owns
+    // its strings, and the raw file is a second copy of it.
+    let byte_len = bytes.len() as u64;
+    drop(bytes);
 
     let mut stats = ImportStats::default();
     let _lock = store.write_lock()?;
@@ -382,9 +434,7 @@ pub fn import_scip_index_enriched_at(
     // whole process with an uncaught C++ exception on ENOSPC mid-transaction
     // rather than surfacing a Result -- this crashed sittir's SCIP import.
     if let Some(dir) = store.db_dir() {
-        if let Err(shortfall) =
-            crate::graph::store_util::check_disk_headroom(dir, bytes.len() as u64)
-        {
+        if let Err(shortfall) = crate::graph::store_util::check_disk_headroom(dir, byte_len) {
             anyhow::bail!("Auto-SCIP: refusing to import -- {shortfall}");
         }
         // R3.1.4d/#100: circuit breaker against the runaway-graph-growth
@@ -1655,6 +1705,22 @@ mod tests {
             !scip_import_is_redundant(ig, "scip-rust", 1, 5),
             "the rust entry was replaced, not accumulated"
         );
+    }
+
+    #[test]
+    fn the_streamed_output_hash_is_the_hash_of_the_whole_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.scip");
+        // Several read buffers long, and not a multiple of one.
+        let content: Vec<u8> = (0..300_001u32).map(|i| (i * 31 % 251) as u8).collect();
+        std::fs::write(&path, &content).unwrap();
+        assert_eq!(
+            scip_output_hash(&path),
+            Some(crate::embed::fnv1a64(&content))
+        );
+        let empty = dir.path().join("empty.scip");
+        std::fs::write(&empty, b"").unwrap();
+        assert_eq!(scip_output_hash(&empty), Some(crate::embed::fnv1a64(b"")));
     }
 
     #[test]
@@ -3061,6 +3127,53 @@ mod tests {
         let scratch = dir.join(".infigraph").join(SCIP_SCRATCH_DIR);
         std::fs::create_dir_all(&scratch).unwrap();
         scratch.join(name)
+    }
+
+    /// The check on arrival reads the file's top-level fields; the importer
+    /// decodes all of it. They must say the same thing about every kind of
+    /// output, or an output would be judged twice by two rules.
+    #[test]
+    fn the_arrival_scan_and_the_full_decode_give_the_same_verdict() {
+        let dir = tempfile::tempdir().unwrap();
+        let one_document = make_scip_index("a.ts", "Child", "Parent");
+        // The document is not the first field: metadata and an external
+        // symbol come before it on the wire.
+        let mut document_last = Index {
+            external_symbols: Index::parse_from_bytes(&one_document).unwrap().documents[0]
+                .symbols
+                .clone(),
+            ..Default::default()
+        }
+        .write_to_bytes()
+        .unwrap();
+        document_last.splice(0..0, [0x0a, 0x00]); // empty metadata message
+        document_last.extend_from_slice(&one_document);
+
+        let cases: [(&str, Vec<u8>, &str); 5] = [
+            ("zero bytes", Vec::new(), "zero-bytes"),
+            ("metadata only", vec![0x0a, 0x00], "no-documents"),
+            ("one document", one_document.clone(), "ok"),
+            ("a document after other fields", document_last, "ok"),
+            (
+                "garbage",
+                b"this is not a SCIP index".to_vec(),
+                "unparseable",
+            ),
+        ];
+        let kind = |rejected: Option<ScipRejected>| match rejected.map(|r| r.reason) {
+            None => "ok",
+            Some(Rejection::ZeroBytes) => "zero-bytes",
+            Some(Rejection::NoDocuments) => "no-documents",
+            Some(Rejection::Unparseable(_)) => "unparseable",
+        };
+        for (name, bytes, expected) in cases {
+            let path = scratch_path(dir.path(), "scip-python.1-2.scip");
+            std::fs::write(&path, &bytes).unwrap();
+            assert_eq!(kind(rejection_on_arrival(&path)), expected, "scan: {name}");
+            assert_eq!(kind(rejection_of(&path)), expected, "full decode: {name}");
+        }
+        // A file that cannot be read says nothing about the output.
+        assert_eq!(rejection_on_arrival(&dir.path().join("missing.scip")), None);
     }
 
     #[test]

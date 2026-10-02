@@ -1868,7 +1868,7 @@ async fn run_indexer(
                             Err(IndexerFailure::NoOutput)
                         } else {
                             // Exit 0 and a file is still not a result.
-                            infigraph_core::scip::rejection_of(output_path)
+                            infigraph_core::scip::rejection_on_arrival(output_path)
                                 .map_or(Ok(()), |r| Err(IndexerFailure::Rejected(r)))
                         }
                     }
