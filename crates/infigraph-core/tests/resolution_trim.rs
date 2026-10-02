@@ -61,6 +61,9 @@ fn edges_of_a_full_build(reduce_before_resolution: bool) -> BTreeSet<String> {
     edges
 }
 
+/// What this does not reach: the fixtures never exercise the span tie-break
+/// in `resolve_inherits`, so the test would not notice a cleared `span`. The
+/// reduction keeps `span`; this test is not the evidence for that.
 #[test]
 fn reducing_extractions_before_resolution_changes_no_edge() {
     let whole = edges_of_a_full_build(false);
