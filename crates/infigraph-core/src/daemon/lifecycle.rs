@@ -566,8 +566,23 @@ fn subcommand_belongs_to(
         return false;
     }
     cwd.is_some_and(|cwd| {
-        crate::project::canonicalize_lenient(cwd) == crate::project::canonicalize_lenient(root)
+        crate::project::canonicalize_lenient(&without_deleted_suffix(cwd))
+            == crate::project::canonicalize_lenient(root)
     })
+}
+
+/// The path a process's reported cwd names once Linux's removal marker is
+/// taken off. For a process whose directory was removed, `readlink
+/// /proc/<pid>/cwd` is `<path> (deleted)` (macOS reports `<path>`), and
+/// `sysinfo` strips that marker from `exe` but not from `cwd`. Stripped only
+/// when the marked path does not exist, so a live directory that really is
+/// named `... (deleted)` is left alone.
+fn without_deleted_suffix(cwd: &Path) -> PathBuf {
+    const MARK: &str = " (deleted)";
+    match cwd.to_str().and_then(|s| s.strip_suffix(MARK)) {
+        Some(bare) if !cwd.exists() => PathBuf::from(bare),
+        _ => cwd.to_path_buf(),
+    }
 }
 
 /// Every live `infigraph <subcommand>` running for `root`.
@@ -1571,6 +1586,35 @@ mod tests {
                 &argv("scip-enrich"),
                 Some(&cwd),
                 &root
+            ));
+        }
+
+        /// Linux reports the cwd of a process whose directory was removed as
+        /// `<path> (deleted)` (`readlink /proc/<pid>/cwd`); `sysinfo` strips
+        /// that suffix from `exe` but not from `cwd`. macOS reports the bare
+        /// path, which is why the test above passed there while `worktree
+        /// teardown` found nothing to stop on Linux CI.
+        #[test]
+        fn matches_the_cwd_linux_reports_for_a_removed_directory() {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().join("wt");
+            std::fs::create_dir_all(&root).unwrap();
+            let canonical = root.canonicalize().unwrap();
+            std::fs::remove_dir_all(&root).unwrap();
+            let reported = std::path::PathBuf::from(format!("{} (deleted)", canonical.display()));
+            assert!(scip_enrich_belongs_to(
+                "infigraph",
+                &argv("scip-enrich"),
+                Some(&reported),
+                &root
+            ));
+            // Another root's removed directory is still not this one's.
+            let other = tmp.path().join("other");
+            assert!(!scip_enrich_belongs_to(
+                "infigraph",
+                &argv("scip-enrich"),
+                Some(&reported),
+                &other
             ));
         }
 
