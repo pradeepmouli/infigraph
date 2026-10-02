@@ -1774,14 +1774,14 @@ async fn run_scip_indexer_cmd_async(
 /// How often a queued indexer retries for a machine-wide slot.
 const SLOT_POLL: std::time::Duration = std::time::Duration::from_millis(500);
 
-/// Waits for a machine-wide indexer slot (`infigraph_core::scip_slots`) and
+/// Waits for a machine-wide indexer slot (`infigraph_core::slots`) and
 /// returns it; the indexer runs only while it is held. `None` means no cap
 /// applies: there is no pool (no home directory), or the slot files cannot
 /// be locked, which is warned about rather than allowed to stop enrichment.
 async fn claim_indexer_slot(
-    pool: Option<&infigraph_core::scip_slots::SlotPool>,
+    pool: Option<&infigraph_core::slots::SlotPool>,
     label: &str,
-) -> Option<infigraph_core::scip_slots::IndexerSlot> {
+) -> Option<infigraph_core::slots::Slot> {
     let pool = pool?;
     let mut announced = false;
     loop {
@@ -1825,7 +1825,7 @@ async fn run_indexer(
     let pool = if cfg!(test) {
         None
     } else {
-        infigraph_core::scip_slots::SlotPool::machine()
+        infigraph_core::slots::SlotPool::scip_indexers()
     };
     let _slot = claim_indexer_slot(pool.as_ref(), label).await;
     // `kill_on_drop` reaps the direct child when this future is dropped; the
@@ -2099,7 +2099,7 @@ mod tests {
     #[tokio::test]
     async fn an_indexer_waits_for_a_free_slot() {
         let tmp = tempfile::tempdir().unwrap();
-        let pool = infigraph_core::scip_slots::SlotPool::new(tmp.path().join("slots"), 1);
+        let pool = infigraph_core::slots::SlotPool::new(tmp.path().join("slots"), 1);
         let held = pool.try_claim().unwrap().expect("the only slot");
 
         let waiting = claim_indexer_slot(Some(&pool), "test-indexer");
