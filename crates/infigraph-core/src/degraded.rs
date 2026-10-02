@@ -141,8 +141,8 @@ impl DegradedMode {
                  the graph is served as it was until the reindex runs"
             ),
             DegradedMode::HnswMissing => {
-                "HNSW index missing — vector search is on a linear scan this project has \
-                 outgrown"
+                "HNSW index missing or stale — vector search is on a linear scan this project \
+                 has outgrown"
                     .to_string()
             }
             DegradedMode::DocEmbeddingsMissing => {
@@ -546,7 +546,7 @@ pub fn derived_from_disk(root: &Path) -> Vec<DegradedMode> {
             });
         }
     }
-    if crate::embed::hnsw_expected_but_missing(root) {
+    if crate::embed::hnsw_expected_but_unusable(root) {
         modes.push(DegradedMode::HnswMissing);
     }
     // Not here: missing document embeddings. An empty document index has no
@@ -597,6 +597,16 @@ mod tests {
         /// An `embeddings.bin` whose header claims `count` vectors.
         fn embeddings(&self, count: u32) {
             self.write("embeddings.bin", &count.to_le_bytes());
+        }
+
+        fn embeddings_mtime_secs(&self) -> u64 {
+            std::fs::metadata(self.root().join(".infigraph").join("embeddings.bin"))
+                .unwrap()
+                .modified()
+                .unwrap()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
         }
 
         fn age(&self, name: &str, by: Duration) {
@@ -675,8 +685,21 @@ mod tests {
         p.write("hnsw_index.usearch", b"stub");
         assert_eq!(derived_from_disk(p.root()), vec![DegradedMode::HnswMissing]);
 
-        p.write("hnsw_index.meta", b"stub");
+        // A `.meta` naming another `embeddings.bin` is a stale index.
+        p.write("hnsw_index.meta", &meta_header(1));
+        assert_eq!(derived_from_disk(p.root()), vec![DegradedMode::HnswMissing]);
+
+        p.write("hnsw_index.meta", &meta_header(p.embeddings_mtime_secs()));
         assert_eq!(derived_from_disk(p.root()), vec![]);
+    }
+
+    /// The binary sidecar header: [version][count][dim][emb_mtime_secs].
+    fn meta_header(emb_mtime_secs: u64) -> Vec<u8> {
+        let mut bytes = vec![1u8];
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&4u32.to_le_bytes());
+        bytes.extend_from_slice(&emb_mtime_secs.to_le_bytes());
+        bytes
     }
 
     /// An empty document index has no `docs_embeddings.bin` either, so files

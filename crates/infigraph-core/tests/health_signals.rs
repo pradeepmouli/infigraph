@@ -17,15 +17,15 @@ fn hnsw_gap_only_above_threshold() {
     let dir = tempfile::tempdir().unwrap();
 
     // No embeddings at all: not degraded.
-    assert!(!embed::hnsw_expected_but_missing(dir.path()));
+    assert!(!embed::hnsw_expected_but_unusable(dir.path()));
 
     // Below threshold: linear scan is the *designed* fast path, not a gap.
     write_embeddings_header(dir.path(), 1_000);
-    assert!(!embed::hnsw_expected_but_missing(dir.path()));
+    assert!(!embed::hnsw_expected_but_unusable(dir.path()));
 
     // At threshold with no index file: degraded.
     write_embeddings_header(dir.path(), embed::HNSW_THRESHOLD as u32);
-    assert!(embed::hnsw_expected_but_missing(dir.path()));
+    assert!(embed::hnsw_expected_but_unusable(dir.path()));
 
     // The index without its `.meta` is still a linear scan: `search_hnsw`
     // answers `None` when either file is absent (#75).
@@ -34,15 +34,35 @@ fn hnsw_gap_only_above_threshold() {
         b"stub",
     )
     .unwrap();
-    assert!(embed::hnsw_expected_but_missing(dir.path()));
+    assert!(embed::hnsw_expected_but_unusable(dir.path()));
 
-    // Index and `.meta` present: healthy again.
-    std::fs::write(
-        dir.path().join(".infigraph").join("hnsw_index.meta"),
-        b"stub",
-    )
-    .unwrap();
-    assert!(!embed::hnsw_expected_but_missing(dir.path()));
+    // A `.meta` naming some other `embeddings.bin` is a stale index: search
+    // refuses it and scans linearly, so it is the same degradation.
+    write_meta_naming(dir.path(), 1);
+    assert!(embed::hnsw_expected_but_unusable(dir.path()));
+
+    // Index and a `.meta` naming the current `embeddings.bin`: healthy again.
+    write_meta_naming(dir.path(), embeddings_mtime_secs(dir.path()));
+    assert!(!embed::hnsw_expected_but_unusable(dir.path()));
+}
+
+fn embeddings_mtime_secs(dir: &std::path::Path) -> u64 {
+    std::fs::metadata(dir.join(".infigraph").join("embeddings.bin"))
+        .unwrap()
+        .modified()
+        .unwrap()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+/// A binary sidecar header ([version][count][dim][emb_mtime_secs]) and no ids.
+fn write_meta_naming(dir: &std::path::Path, emb_mtime_secs: u64) {
+    let mut bytes = vec![1u8];
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&4u32.to_le_bytes());
+    bytes.extend_from_slice(&emb_mtime_secs.to_le_bytes());
+    std::fs::write(dir.join(".infigraph").join("hnsw_index.meta"), bytes).unwrap();
 }
 
 #[test]
