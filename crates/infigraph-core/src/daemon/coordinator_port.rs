@@ -196,6 +196,7 @@ impl DaemonState {
             work_in_flight: self.work_in_flight.load(Ordering::SeqCst),
             code: self.role(WatchRole::Code),
             docs: self.role(WatchRole::Docs),
+            degraded: crate::degraded::live::all(),
         }
     }
 }
@@ -358,6 +359,33 @@ mod tests {
         assert_eq!(role_state(true, false), RoleState::Running);
         assert_eq!(role_state(false, true), RoleState::Stopped);
         assert_eq!(role_state(false, false), RoleState::Disabled);
+    }
+
+    /// #75: what this daemon reports about itself reaches a client in the
+    /// status reply, and stops being reported once it clears.
+    #[test]
+    fn the_status_report_carries_this_process_s_live_degraded_modes() {
+        let root = tempfile::tempdir().unwrap();
+        let (port, _rx) = CoordinatorPort::new(0, 1);
+        let reported = |key: &str| {
+            port.state
+                .report(&Liveness::new(), now_secs())
+                .degraded
+                .iter()
+                .any(|n| n.key == key && n.message.contains("unique-reason-4711"))
+        };
+        assert!(!reported(crate::degraded::DOC_READS_UNAVAILABLE));
+
+        crate::degraded::live::set(
+            root.path(),
+            crate::degraded::DegradedMode::DocReadsUnavailable {
+                reason: "unique-reason-4711".to_string(),
+            },
+        );
+        assert!(reported(crate::degraded::DOC_READS_UNAVAILABLE));
+
+        crate::degraded::live::clear(root.path(), crate::degraded::DOC_READS_UNAVAILABLE);
+        assert!(!reported(crate::degraded::DOC_READS_UNAVAILABLE));
     }
 
     #[test]

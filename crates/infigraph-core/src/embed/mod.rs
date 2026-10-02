@@ -837,6 +837,20 @@ pub fn update_embeddings(
     root: &Path,
     changed_files: &[&str],
 ) -> Result<usize> {
+    let result = update_embeddings_inner(backend, root, changed_files);
+    // #75: whoever holds the graph says whether the embeddings now reflect
+    // it, success or not -- a failed update is exactly when they do not.
+    if let Ok(generation) = backend.current_ast_generation() {
+        crate::degraded::live::note_embeddings_generation(root, generation);
+    }
+    result
+}
+
+fn update_embeddings_inner(
+    backend: &dyn crate::graph::GraphBackend,
+    root: &Path,
+    changed_files: &[&str],
+) -> Result<usize> {
     use rayon::prelude::*;
     use std::sync::Arc;
 
@@ -917,6 +931,13 @@ pub fn update_embeddings(
     // Skip the write AND the O(n) HNSW rebuild — this is the body-only-edit
     // fast path.
     if embedded == 0 && pruned == 0 {
+        // The file is untouched, and it now reflects this generation: move
+        // the marker, or every body-only edit leaves it reading as stale.
+        if emb_path.exists() {
+            if let Ok(generation) = backend.current_ast_generation() {
+                let _ = write_generation_marker(&emb_path, generation);
+            }
+        }
         return Ok(count);
     }
 

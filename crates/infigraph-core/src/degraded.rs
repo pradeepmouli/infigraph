@@ -18,6 +18,11 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+pub const EMBEDDINGS_STALE: &str = "embeddings-stale";
+pub const UNWATCHED_DIRECTORIES: &str = "unwatched-directories";
+pub const DOC_READS_UNAVAILABLE: &str = "doc-reads-unavailable";
+pub const GRAPH_REOPEN_BACKOFF: &str = "graph-reopen-backoff";
+
 /// One way infigraph is running degraded.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DegradedMode {
@@ -35,8 +40,20 @@ pub enum DegradedMode {
     /// The graph exists but `embeddings.bin` does not, so code search embeds
     /// every symbol at query time.
     EmbeddingsMissing,
-    /// `embeddings.bin` is older than the graph it was built from.
+    /// `embeddings.bin` is older than the graph it was built from, judged by
+    /// file times: the rule a process without the graph open can apply.
     EmbeddingsStale { minutes: u64 },
+    /// `embeddings.bin` reflects an older graph generation than the live one.
+    /// Only the process that holds the graph (the daemon) can say so, and
+    /// its answer replaces the file-time guess.
+    EmbeddingsBehindGraph { recorded: i64, current: i64 },
+    /// The watcher could not watch some directories, so changes under them
+    /// go unnoticed.
+    UnwatchedDirectories { failed: usize, first: String },
+    /// The daemon cannot open the document store, so it serves code only.
+    DocReadsUnavailable { reason: String },
+    /// The daemon cannot reopen the graph and is backing off; writes wait.
+    GraphReopenBackoff { failures: u32, retry_secs: u64 },
     /// The project is past the HNSW threshold but the index (or its `.meta`)
     /// is absent, so vector search is a linear scan.
     HnswMissing,
@@ -55,7 +72,12 @@ impl DegradedMode {
             DegradedMode::EmbeddingsMixed => "embeddings-mixed",
             DegradedMode::EmbedderMismatch { .. } => "embedder-mismatch",
             DegradedMode::EmbeddingsMissing => "embeddings-missing",
-            DegradedMode::EmbeddingsStale { .. } => "embeddings-stale",
+            DegradedMode::EmbeddingsStale { .. } | DegradedMode::EmbeddingsBehindGraph { .. } => {
+                EMBEDDINGS_STALE
+            }
+            DegradedMode::UnwatchedDirectories { .. } => UNWATCHED_DIRECTORIES,
+            DegradedMode::DocReadsUnavailable { .. } => DOC_READS_UNAVAILABLE,
+            DegradedMode::GraphReopenBackoff { .. } => GRAPH_REOPEN_BACKOFF,
             DegradedMode::HnswMissing => "hnsw-missing",
             DegradedMode::DocEmbeddingsMissing => "doc-embeddings-missing",
         }
@@ -90,6 +112,24 @@ impl DegradedMode {
                 "embeddings.bin is {minutes} minutes older than the graph: semantic ranking may \
                  be stale"
             ),
+            DegradedMode::EmbeddingsBehindGraph { recorded, current } => format!(
+                "embeddings.bin was built from graph generation {recorded}, but the graph is \
+                 now at generation {current}: semantic ranking is stale"
+            ),
+            DegradedMode::UnwatchedDirectories { failed, first } => format!(
+                "{failed} director(ies) could not be watched (first: {first}): changes under \
+                 them will not be noticed"
+            ),
+            DegradedMode::DocReadsUnavailable { reason } => {
+                format!("document reads are unavailable, the daemon serves code only: {reason}")
+            }
+            DegradedMode::GraphReopenBackoff {
+                failures,
+                retry_secs,
+            } => format!(
+                "the daemon cannot reopen the graph ({failures} consecutive failures, next \
+                 attempt in {retry_secs}s): writes are waiting"
+            ),
             DegradedMode::HnswMissing => {
                 "HNSW index missing — vector search is on a linear scan this project has \
                  outgrown"
@@ -115,7 +155,18 @@ impl DegradedMode {
             }
             DegradedMode::EmbeddingsMissing
             | DegradedMode::EmbeddingsStale { .. }
+            | DegradedMode::EmbeddingsBehindGraph { .. }
             | DegradedMode::HnswMissing => "run `infigraph index` to rebuild them",
+            DegradedMode::UnwatchedDirectories { .. } => {
+                "fix the cause (on Linux usually `fs.inotify.max_user_watches`), then run \
+                 `infigraph daemon-restart`"
+            }
+            DegradedMode::DocReadsUnavailable { .. } => {
+                "run `infigraph reindex-docs`, then `infigraph daemon-restart`"
+            }
+            DegradedMode::GraphReopenBackoff { .. } => {
+                "see .infigraph/daemon.log for the holder; `infigraph doctor` names it"
+            }
             DegradedMode::DocEmbeddingsMissing => "run `infigraph index-docs` to rebuild them",
         }
     }
@@ -143,6 +194,11 @@ pub struct Notice {
 /// Every degraded mode in effect for the project at `root`, as seen from this
 /// process. Empty for a project with no index, and in remote mode, where the
 /// sidecars this reads do not exist.
+///
+/// Three sources, merged by key: what files on disk establish, what this
+/// process knows about itself, and what the project's live daemon reports
+/// over the status socket. Asking the daemon takes no lease and starts none;
+/// with no daemon its part is simply absent.
 pub fn gather(root: &Path) -> Vec<Notice> {
     let mut modes = Vec::new();
     if crate::embed::trigram_fallback_active() {
@@ -150,7 +206,121 @@ pub fn gather(root: &Path) -> Vec<Notice> {
     }
     modes.extend(embedder_modes(root, crate::embed::process_embedder()));
     modes.extend(derived_from_disk(root));
-    modes.iter().map(DegradedMode::notice).collect()
+    let mut local: Vec<Notice> = modes.iter().map(DegradedMode::notice).collect();
+    local = merge(local, live::for_root(root));
+
+    // The daemon's own process already has its list in `live`.
+    let from_daemon = if crate::daemon::lease::is_self_daemon(root) {
+        None
+    } else {
+        crate::daemon::control::query_status(root)
+            .ok()
+            .map(|report| report.degraded)
+    };
+    merge_with_daemon(local, from_daemon)
+}
+
+/// `local` with the daemon's answer folded in. A daemon that answered knows
+/// the graph's generation, so its word on staleness is final either way: its
+/// notice replaces the local file-time guess, and its silence removes it.
+/// `None` is "no daemon answered", and the local list stands.
+pub fn merge_with_daemon(local: Vec<Notice>, from_daemon: Option<Vec<Notice>>) -> Vec<Notice> {
+    let Some(from_daemon) = from_daemon else {
+        return local;
+    };
+    let local = local
+        .into_iter()
+        .filter(|n| n.key != EMBEDDINGS_STALE)
+        .collect();
+    merge(local, from_daemon)
+}
+
+/// `base` with `over` folded in by key: a notice in `over` replaces the one
+/// with its key in `base` (in place), and the rest of `over` follows.
+pub fn merge(mut base: Vec<Notice>, over: Vec<Notice>) -> Vec<Notice> {
+    for notice in over {
+        match base.iter_mut().find(|n| n.key == notice.key) {
+            Some(slot) => *slot = notice,
+            None => base.push(notice),
+        }
+    }
+    base
+}
+
+/// What a live process reports about itself: modes that exist only while it
+/// runs and that no file records (its watcher's failed registrations, a
+/// store it could not open, a reopen it is backing off from). The daemon's
+/// list travels in `StatusReport::degraded`. Nothing here outlives the
+/// process, by design: a restart re-registers, reopens and recomputes, so
+/// there is no stale entry to trust.
+pub mod live {
+    use super::{DegradedMode, Notice, EMBEDDINGS_STALE};
+    use std::collections::BTreeMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    static LIVE: Mutex<BTreeMap<(PathBuf, String), Notice>> = Mutex::new(BTreeMap::new());
+
+    fn key(root: &Path) -> PathBuf {
+        crate::project::canonicalize_lenient(root)
+    }
+
+    fn lock() -> std::sync::MutexGuard<'static, BTreeMap<(PathBuf, String), Notice>> {
+        LIVE.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Record `mode` for `root`, replacing an earlier report of the same key.
+    pub fn set(root: &Path, mode: DegradedMode) {
+        lock().insert((key(root), mode.key().to_string()), mode.notice());
+    }
+
+    /// The mode with `mode_key` no longer holds for `root`.
+    pub fn clear(root: &Path, mode_key: &str) {
+        lock().remove(&(key(root), mode_key.to_string()));
+    }
+
+    pub fn for_root(root: &Path) -> Vec<Notice> {
+        let root = key(root);
+        lock()
+            .iter()
+            .filter(|((r, _), _)| *r == root)
+            .map(|(_, n)| n.clone())
+            .collect()
+    }
+
+    /// Everything this process reports, for every root. A daemon serves one
+    /// project, so for it this is that project's list.
+    pub fn all() -> Vec<Notice> {
+        lock().values().cloned().collect()
+    }
+
+    /// Set or clear "document embeddings are missing" for `root`, from the
+    /// number of chunks the document store holds. Called by the document
+    /// indexer, which has the store open: with no chunks there is nothing to
+    /// embed, and a missing file is then not a degradation.
+    pub fn note_doc_embeddings(root: &Path, chunks_in_store: usize) {
+        let present = root.join(".infigraph").join("docs_embeddings.bin").exists();
+        if chunks_in_store > 0 && !present {
+            set(root, DegradedMode::DocEmbeddingsMissing);
+        } else {
+            clear(root, DegradedMode::DocEmbeddingsMissing.key());
+        }
+    }
+
+    /// Compare the generation `embeddings.bin` was built from with the graph's
+    /// `current` one, and set or clear the staleness mode. Called by whoever
+    /// holds the graph, after it tried to update the embeddings. No marker
+    /// means it cannot be judged, which is not reported.
+    pub fn note_embeddings_generation(root: &Path, current: i64) {
+        let sidecar = root.join(".infigraph").join("embeddings.bin");
+        match crate::embed::read_generation_marker(&sidecar) {
+            Some(recorded) if current > 0 && recorded < current => set(
+                root,
+                DegradedMode::EmbeddingsBehindGraph { recorded, current },
+            ),
+            _ => clear(root, EMBEDDINGS_STALE),
+        }
+    }
 }
 
 /// What the embedder marker beside `embeddings.bin` establishes, given the
@@ -203,9 +373,10 @@ pub fn derived_from_disk(root: &Path) -> Vec<DegradedMode> {
     if crate::embed::hnsw_expected_but_missing(root) {
         modes.push(DegradedMode::HnswMissing);
     }
-    if crate::docs_switch::docs_indexed(root) && !ig.join("docs_embeddings.bin").exists() {
-        modes.push(DegradedMode::DocEmbeddingsMissing);
-    }
+    // Not here: missing document embeddings. An empty document index has no
+    // `docs_embeddings.bin` either (measured), and telling the two apart
+    // needs the chunk count, which only the indexer has. It reports the mode
+    // through `live::note_doc_embeddings`.
     modes
 }
 
@@ -332,22 +503,31 @@ mod tests {
         assert_eq!(derived_from_disk(p.root()), vec![]);
     }
 
+    /// An empty document index has no `docs_embeddings.bin` either, so files
+    /// alone cannot say the embeddings are missing: the indexer reports it,
+    /// with the chunk count it has.
     #[test]
-    fn indexed_documents_without_embeddings_are_reported_only_when_docs_are_on() {
+    fn missing_document_embeddings_are_reported_only_when_there_are_chunks() {
         let p = Project::new();
         p.embeddings(10);
-        // A leftover store in a project that has not opted in is not ours to judge.
-        p.write("docs.kuzu", b"docs");
-        assert_eq!(derived_from_disk(p.root()), vec![]);
-
         p.enable_docs();
+        assert_eq!(derived_from_disk(p.root()), vec![], "files cannot tell");
+
+        live::note_doc_embeddings(p.root(), 0);
         assert_eq!(
-            derived_from_disk(p.root()),
-            vec![DegradedMode::DocEmbeddingsMissing]
+            live::for_root(p.root()),
+            vec![],
+            "an empty index is healthy"
         );
 
+        live::note_doc_embeddings(p.root(), 12);
+        let notices = live::for_root(p.root());
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].key, DegradedMode::DocEmbeddingsMissing.key());
+
         p.write("docs_embeddings.bin", &1u32.to_le_bytes());
-        assert_eq!(derived_from_disk(p.root()), vec![]);
+        live::note_doc_embeddings(p.root(), 12);
+        assert_eq!(live::for_root(p.root()), vec![]);
     }
 
     #[test]
@@ -360,6 +540,17 @@ mod tests {
                 query: "trigram".to_string(),
             },
             DegradedMode::TrigramEmbedder,
+            DegradedMode::UnwatchedDirectories {
+                failed: 2,
+                first: "x".to_string(),
+            },
+            DegradedMode::DocReadsUnavailable {
+                reason: "r".to_string(),
+            },
+            DegradedMode::GraphReopenBackoff {
+                failures: 3,
+                retry_secs: 20,
+            },
             DegradedMode::EmbeddingsMissing,
             DegradedMode::EmbeddingsStale { minutes: 90 },
             DegradedMode::HnswMissing,
@@ -439,6 +630,104 @@ mod tests {
             embedder_modes(p.root(), Some("model2vec")),
             vec![DegradedMode::EmbeddingsMixed]
         );
+    }
+
+    // --- what a live process reports about itself ---
+
+    #[test]
+    fn a_live_mode_is_set_replaced_and_cleared_by_key_per_root() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        live::set(
+            a.path(),
+            DegradedMode::UnwatchedDirectories {
+                failed: 2,
+                first: "x: denied".to_string(),
+            },
+        );
+        live::set(
+            a.path(),
+            DegradedMode::UnwatchedDirectories {
+                failed: 5,
+                first: "y: denied".to_string(),
+            },
+        );
+        let for_a = live::for_root(a.path());
+        assert_eq!(for_a.len(), 1, "the same key replaces: {for_a:?}");
+        assert!(for_a[0].message.contains('5'), "{}", for_a[0].message);
+        assert_eq!(live::for_root(b.path()), vec![]);
+
+        live::clear(a.path(), UNWATCHED_DIRECTORIES);
+        assert_eq!(live::for_root(a.path()), vec![]);
+    }
+
+    #[test]
+    fn the_embeddings_generation_check_sets_and_clears_the_live_mode() {
+        let p = Project::new();
+        p.embeddings(10);
+        let sidecar = p.root().join(".infigraph/embeddings.bin");
+        crate::embed::write_generation_marker(&sidecar, 3).unwrap();
+
+        live::note_embeddings_generation(p.root(), 7);
+        let notices = live::for_root(p.root());
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert_eq!(notices[0].key, EMBEDDINGS_STALE);
+        assert!(notices[0].message.contains('3') && notices[0].message.contains('7'));
+
+        crate::embed::write_generation_marker(&sidecar, 7).unwrap();
+        live::note_embeddings_generation(p.root(), 7);
+        assert_eq!(live::for_root(p.root()), vec![]);
+
+        // No marker: cannot judge, so it is not reported.
+        std::fs::remove_file(p.root().join(".infigraph/embeddings.bin.generation")).unwrap();
+        live::note_embeddings_generation(p.root(), 9);
+        assert_eq!(live::for_root(p.root()), vec![]);
+    }
+
+    /// The daemon's answer for a key replaces what this process derived for
+    /// it: the daemon compares generations exactly, where the local rule for
+    /// staleness is a file-time heuristic.
+    #[test]
+    fn the_daemons_notice_for_a_key_replaces_the_local_one() {
+        let local = vec![
+            DegradedMode::EmbeddingsStale { minutes: 90 }.notice(),
+            DegradedMode::HnswMissing.notice(),
+        ];
+        let from_daemon = vec![
+            DegradedMode::EmbeddingsBehindGraph {
+                recorded: 3,
+                current: 7,
+            }
+            .notice(),
+            DegradedMode::DocReadsUnavailable {
+                reason: "will not open".to_string(),
+            }
+            .notice(),
+        ];
+        let merged = merge(local, from_daemon.clone());
+        let keys: Vec<&str> = merged.iter().map(|n| n.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec![EMBEDDINGS_STALE, "hnsw-missing", "doc-reads-unavailable"]
+        );
+        assert_eq!(merged[0], from_daemon[0], "the daemon's wording wins");
+    }
+
+    /// When a daemon answers and does not report staleness, the local
+    /// file-time guess is dropped: the daemon knows the generations.
+    #[test]
+    fn a_daemon_that_answers_overrules_the_local_staleness_guess() {
+        let local = vec![
+            DegradedMode::EmbeddingsStale { minutes: 90 }.notice(),
+            DegradedMode::HnswMissing.notice(),
+        ];
+        let keys: Vec<String> = merge_with_daemon(local.clone(), Some(vec![]))
+            .into_iter()
+            .map(|n| n.key)
+            .collect();
+        assert_eq!(keys, vec!["hnsw-missing"]);
+        // No daemon: the local rule stands.
+        assert_eq!(merge_with_daemon(local.clone(), None), local);
     }
 
     /// A notice from a newer build, with a key this build has no variant for,

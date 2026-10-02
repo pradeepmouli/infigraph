@@ -1365,7 +1365,7 @@ where
                 // graph can be stale from before this process started.
                 match watch_db(root, &shared_registry, &mut held_prism) {
                     Ok(prism) => {
-                        reopen_backoff.record_success();
+                        reopen_backoff.succeeded(root);
                         // Off means the staleness check finds nothing due, so
                         // it neither starts enrichment nor logs about it.
                         let due = prism
@@ -1428,7 +1428,7 @@ where
                             None => {}
                         }
                     }
-                    Err(e) => log_reopen_failure("watch", &mut reopen_backoff, &e),
+                    Err(e) => log_reopen_failure(root, "watch", &mut reopen_backoff, &e),
                 }
             }
         }
@@ -1720,7 +1720,7 @@ where
                 Ok(IndexOpOutcome::Acquired(guard)) => {
                     match watch_db(root, &shared_registry, &mut held_prism) {
                         Ok(prism) => {
-                            reopen_backoff.record_success();
+                            reopen_backoff.succeeded(root);
                             let drained = queue.lock().unwrap().drain();
                             // R3.3.5: captured before `drained` moves into the
                             // task -- `DrainOutcome` only reports successful
@@ -1743,7 +1743,7 @@ where
                                 removed_in_drain,
                             });
                         }
-                        Err(e) => log_reopen_failure("watch", &mut reopen_backoff, &e),
+                        Err(e) => log_reopen_failure(root, "watch", &mut reopen_backoff, &e),
                     }
                 }
                 Ok(o @ IndexOpOutcome::AlreadyRunning(_)) => {
@@ -2274,12 +2274,12 @@ fn serve_request_locked(
     match begin_index_op(root, "infigraph daemon", Duration::from_secs(30)) {
         Ok(IndexOpOutcome::Acquired(_guard)) => match watch_db(root, registry, held) {
             Ok(prism) => {
-                reopen_backoff.record_success();
+                reopen_backoff.succeeded(root);
                 reply.send(crate::daemon_protocol::serve_write(&prism, request));
                 Ok(())
             }
             Err(e) => {
-                log_reopen_failure("daemon", reopen_backoff, &e);
+                log_reopen_failure(root, "daemon", reopen_backoff, &e);
                 Err(reply)
             }
         },
@@ -2303,8 +2303,8 @@ fn serve_request_locked(
 /// escalating series rather than an identical line every tick. `{e:#}`
 /// prints the whole context chain, which is where `Infigraph::init`
 /// names the lock holder's pid.
-fn log_reopen_failure(tag: &str, backoff: &mut ReopenBackoff, e: &anyhow::Error) {
-    let delay = backoff.record_failure();
+fn log_reopen_failure(root: &Path, tag: &str, backoff: &mut ReopenBackoff, e: &anyhow::Error) {
+    let delay = backoff.failed(root);
     eprintln!(
         "[{tag}] failed to reopen graph connection (consecutive failures: {}), next attempt in \
          {}s: {e:#}",
@@ -2693,11 +2693,11 @@ fn try_start_scip_import(
     // `Database` object, not across two, even in the same process).
     let prism = match watch_db(root, registry, held) {
         Ok(p) => {
-            reopen_backoff.record_success();
+            reopen_backoff.succeeded(root);
             p
         }
         Err(e) => {
-            log_reopen_failure("daemon scip-import", reopen_backoff, &e);
+            log_reopen_failure(root, "daemon scip-import", reopen_backoff, &e);
             return Err(reply);
         }
     };

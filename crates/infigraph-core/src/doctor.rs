@@ -1946,6 +1946,7 @@ mod watcher_verdict_tests {
             work_in_flight: busy,
             code: RoleState::Running,
             docs: RoleState::NotOwned,
+            degraded: Vec::new(),
         }
     }
 

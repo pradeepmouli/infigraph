@@ -271,3 +271,22 @@ fn update_embeddings_records_which_embedder_built_the_file() {
     );
     assert!(recorded.is_some());
 }
+
+/// The generation marker says which graph generation `embeddings.bin`
+/// reflects. A body-only edit rewrites nothing, but the file still reflects
+/// the new generation, so the marker must move: otherwise every such edit
+/// leaves the embeddings reading as stale forever (#75).
+#[test]
+fn a_body_only_edit_still_moves_the_generation_marker() {
+    let (dir, ig) = setup();
+    write_alpha(dir.path(), "x = 2", "Helper doc."); // body change only
+    ig.index().unwrap();
+    reembed(dir.path(), &ig);
+
+    let current = ig.backend().unwrap().current_ast_generation().unwrap();
+    assert!(current > 0);
+    assert_eq!(
+        infigraph_core::embed::read_generation_marker(&emb_path(dir.path())),
+        Some(current)
+    );
+}

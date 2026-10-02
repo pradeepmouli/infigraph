@@ -350,3 +350,30 @@ fn a_clean_run_reports_no_warnings() {
     let report = stats_report("Document indexing", &stats, Duration::from_secs(1));
     assert!(!report.contains("arning"), "{report}");
 }
+
+/// #75: an empty document index has no `docs_embeddings.bin`, and that is
+/// healthy. Only chunks with no embeddings beside them are a degraded mode.
+#[test]
+fn an_empty_document_index_is_not_reported_as_missing_embeddings() {
+    let _env = Isolated::new();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let missing = |root: &std::path::Path| {
+        infigraph_core::degraded::live::for_root(root)
+            .iter()
+            .any(|n| n.key == "doc-embeddings-missing")
+    };
+
+    let stats = index_docs(&root, false).unwrap();
+    assert_eq!(stats.chunks_in_store, 0);
+    assert!(!root.join(".infigraph/docs_embeddings.bin").exists());
+    assert!(!missing(&root), "an empty index was reported as degraded");
+
+    std::fs::write(root.join("README.md"), "# Hello\n\nThe zebra handbook.\n").unwrap();
+    let stats = index_docs(&root, false).unwrap();
+    assert!(stats.chunks_in_store > 0);
+    assert!(
+        !missing(&root),
+        "indexed documents with embeddings are healthy"
+    );
+}

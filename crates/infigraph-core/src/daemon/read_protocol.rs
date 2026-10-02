@@ -144,6 +144,10 @@ pub struct StatusReport {
     pub work_in_flight: bool,
     pub code: RoleState,
     pub docs: RoleState,
+    /// The degraded modes this daemon is in (#75). Additive: a reply from a
+    /// daemon built before the field has none, which reads as empty.
+    #[serde(default)]
+    pub degraded: Vec<crate::degraded::Notice>,
 }
 
 impl std::fmt::Display for StatusReport {
@@ -469,6 +473,41 @@ mod tests {
         );
     }
 
+    /// #75: `degraded` is additive. A status reply from a daemon built
+    /// before the field has none, and reads as "nothing degraded"; one from a
+    /// newer daemon carries notices an older client can still show.
+    #[test]
+    fn a_status_report_without_the_degraded_list_reads_as_empty() {
+        let old = br#"{"pid":1,"build":"abc","leases":2,"idle_secs":null,"grace_secs":1800,"idle_check_secs":60,"work_in_flight":false,"code":"Running","docs":"NotOwned"}"#;
+        let report: StatusReport = serde_json::from_slice(old).unwrap();
+        assert_eq!(report.pid, 1);
+        assert!(report.degraded.is_empty());
+    }
+
+    #[test]
+    fn a_status_report_carries_degraded_notices_across_the_wire() {
+        let report = StatusReport {
+            pid: 1,
+            build: "abc".into(),
+            leases: 0,
+            idle_secs: None,
+            grace_secs: 0,
+            idle_check_secs: 1,
+            work_in_flight: false,
+            code: RoleState::Running,
+            docs: RoleState::NotOwned,
+            degraded: vec![crate::degraded::Notice {
+                key: "some-future-mode".into(),
+                message: "m".into(),
+                remedy: "r".into(),
+            }],
+        };
+        let mut buf = Vec::new();
+        write_reply(&mut buf, &OpReply::Ok(report.clone())).unwrap();
+        let got: OpReply<StatusReport> = read_reply(&mut buf.as_slice()).unwrap().unwrap();
+        assert!(matches!(got, OpReply::Ok(r) if r == report));
+    }
+
     #[test]
     fn an_op_reply_round_trips_both_ways_and_eof_reads_as_none() {
         let report = StatusReport {
@@ -481,6 +520,7 @@ mod tests {
             work_in_flight: false,
             code: RoleState::Running,
             docs: RoleState::NotOwned,
+            degraded: Vec::new(),
         };
         let mut buf = Vec::new();
         write_reply(&mut buf, &OpReply::Ok(report.clone())).unwrap();

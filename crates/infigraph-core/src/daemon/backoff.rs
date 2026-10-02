@@ -56,6 +56,27 @@ impl ReopenBackoff {
         self.retry_after = None;
     }
 
+    /// [`record_success`](Self::record_success), and `root`'s daemon is no
+    /// longer backing off (#75).
+    pub(crate) fn succeeded(&mut self, root: &std::path::Path) {
+        self.record_success();
+        crate::degraded::live::clear(root, crate::degraded::GRAPH_REOPEN_BACKOFF);
+    }
+
+    /// [`record_failure`](Self::record_failure), reported as a degraded mode
+    /// of `root`'s daemon for as long as it lasts (#75).
+    pub(crate) fn failed(&mut self, root: &std::path::Path) -> Duration {
+        let delay = self.record_failure();
+        crate::degraded::live::set(
+            root,
+            crate::degraded::DegradedMode::GraphReopenBackoff {
+                failures: self.consecutive_failures,
+                retry_secs: delay.as_secs(),
+            },
+        );
+        delay
+    }
+
     pub(crate) fn consecutive_failures(&self) -> u32 {
         self.consecutive_failures
     }
@@ -98,6 +119,28 @@ mod tests {
             last = b.record_failure_at(t0);
         }
         assert_eq!(last, MAX);
+    }
+
+    /// #75: a daemon backing off from a reopen says so for as long as it
+    /// lasts, with the count and the wait, and stops when a reopen succeeds.
+    #[test]
+    fn backing_off_is_a_live_degraded_mode_until_a_reopen_succeeds() {
+        let root = tempfile::tempdir().unwrap();
+        let mut b = ReopenBackoff::new();
+        b.failed(root.path());
+        b.failed(root.path());
+        let live = crate::degraded::live::for_root(root.path());
+        assert_eq!(live.len(), 1, "{live:?}");
+        assert_eq!(live[0].key, crate::degraded::GRAPH_REOPEN_BACKOFF);
+        assert!(
+            live[0].message.contains("2 consecutive") && live[0].message.contains("10s"),
+            "{}",
+            live[0].message
+        );
+
+        b.succeeded(root.path());
+        assert_eq!(crate::degraded::live::for_root(root.path()), vec![]);
+        assert_eq!(b.consecutive_failures(), 0);
     }
 
     #[test]

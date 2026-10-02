@@ -386,7 +386,10 @@ fn get_cross_file_dependents(
 /// fail for every directory at once. macOS's FSEvents has no equivalent
 /// per-user cap, which is why a silent total failure would present as
 /// Linux-only.
-pub(crate) fn register_watch_dirs(watcher: &mut RecommendedWatcher, root: &Path) -> Result<()> {
+pub(crate) fn register_watch_dirs(
+    watcher: &mut RecommendedWatcher,
+    root: &Path,
+) -> Result<WatchRegistration> {
     let mut watched = 0usize;
     let mut failed = 0usize;
     let mut first_err: Option<String> = None;
@@ -416,15 +419,48 @@ pub(crate) fn register_watch_dirs(watcher: &mut RecommendedWatcher, root: &Path)
             first_err.as_deref().unwrap_or("none reported")
         );
     }
-    if failed > 0 {
-        eprintln!(
-            "[watch] warning: watching {watched} director(ies) under {} but {failed} failed \
-             (first: {}) -- changes under those paths will not be noticed",
-            root.display(),
-            first_err.as_deref().unwrap_or("none reported")
-        );
+    Ok(WatchRegistration {
+        watched,
+        failed,
+        first_error: first_err,
+    })
+}
+
+/// What registering the directories under a root achieved. Some failing while
+/// others succeed is not an error (the watcher works for the rest), but it is
+/// a degraded mode: changes under the failed paths go unnoticed.
+#[derive(Debug)]
+pub(crate) struct WatchRegistration {
+    pub watched: usize,
+    pub failed: usize,
+    pub first_error: Option<String>,
+}
+
+impl WatchRegistration {
+    /// Records the outcome against `project_root` (#75): the degraded mode
+    /// when some directories failed, warned about once on stderr in the
+    /// mode's own wording. `clears` says a clean result ends the mode, which
+    /// is true only for a registration of the whole project.
+    pub(crate) fn note(&self, project_root: &Path, clears: bool) {
+        if self.failed > 0 {
+            let mode = crate::degraded::DegradedMode::UnwatchedDirectories {
+                failed: self.failed,
+                first: self
+                    .first_error
+                    .clone()
+                    .unwrap_or_else(|| "none reported".to_string()),
+            };
+            eprintln!(
+                "[watch] warning: watching {} director(ies) under {}, but {}",
+                self.watched,
+                project_root.display(),
+                mode.message()
+            );
+            crate::degraded::live::set(project_root, mode);
+        } else if clears {
+            crate::degraded::live::clear(project_root, crate::degraded::UNWATCHED_DIRECTORIES);
+        }
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -454,6 +490,37 @@ mod tests {
             msg.contains("inotify"),
             "must point at the usual Linux cause so the reader knows what to check: {msg}"
         );
+    }
+
+    /// #75: directories that could not be watched are a degraded mode of the
+    /// project, with the count and the first failure. Only a clean
+    /// registration of the whole project ends it; a new directory that
+    /// registers cleanly says nothing about the others.
+    #[test]
+    fn partly_failed_registration_is_a_live_degraded_mode() {
+        let root = tempfile::tempdir().unwrap();
+        let partial = super::WatchRegistration {
+            watched: 7,
+            failed: 2,
+            first_error: Some("sub: permission denied".to_string()),
+        };
+        let clean = super::WatchRegistration {
+            watched: 9,
+            failed: 0,
+            first_error: None,
+        };
+
+        partial.note(root.path(), true);
+        let live = crate::degraded::live::for_root(root.path());
+        assert_eq!(live.len(), 1, "{live:?}");
+        assert_eq!(live[0].key, crate::degraded::UNWATCHED_DIRECTORIES);
+        assert!(live[0].message.contains('2') && live[0].message.contains("permission denied"));
+
+        clean.note(root.path(), false);
+        assert_eq!(crate::degraded::live::for_root(root.path()).len(), 1);
+
+        clean.note(root.path(), true);
+        assert_eq!(crate::degraded::live::for_root(root.path()), vec![]);
     }
 
     /// The ordinary case still succeeds, so the check above cannot be
