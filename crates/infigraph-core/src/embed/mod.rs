@@ -543,15 +543,15 @@ pub fn trigram_fallback_active() -> bool {
     TRIGRAM_FALLBACK.load(Ordering::Relaxed)
 }
 
-/// True when this project is above the HNSW threshold but the index, or the
-/// `.meta` beside it, is missing — vector search is silently on a linear scan
-/// that no longer pays off at this scale. `search_hnsw` answers `None` when
-/// either file is absent, so either one missing is the same degradation.
-/// Below the threshold a missing index is by design, not degradation.
-pub fn hnsw_expected_but_missing(root: &Path) -> bool {
-    let hnsw = root.join(".infigraph").join("hnsw_index.usearch");
-    let usable = hnsw.exists() && hnsw.with_extension("meta").exists();
-    !usable && embedding_count(root) >= HNSW_THRESHOLD
+/// True when this project is above the HNSW threshold but its index cannot
+/// answer: missing, its `.meta` missing, or the `.meta` naming an older
+/// `embeddings.bin` (see [`hnsw_index_current`]). Vector search is then on a
+/// linear scan that no longer pays off at this scale. Below the threshold
+/// there is no index by design, not degradation.
+pub fn hnsw_expected_but_unusable(root: &Path) -> bool {
+    let ig = root.join(".infigraph");
+    !hnsw_index_current(&ig.join("hnsw_index.usearch"), &ig.join("embeddings.bin"))
+        && embedding_count(root) >= HNSW_THRESHOLD
 }
 
 /// Factory: select Model2Vec if available, otherwise fall back to TrigramEmbedder.
@@ -1015,22 +1015,8 @@ fn update_embeddings_inner(
         .map(|(id, v, _)| (id.clone(), v.clone()))
         .collect();
 
-    // Build/rebuild HNSW only when above threshold OR when an existing index
-    // needs to stay current after incremental updates.
     let hnsw_path = root.join(".infigraph").join("hnsw_index.usearch");
-    let should_build = count >= HNSW_THRESHOLD || hnsw_path.exists();
-    if should_build {
-        invalidate_hnsw_cache();
-        if count == 0 {
-            // build_hnsw_index no-ops on an empty embeddings slice, which
-            // would otherwise leave a stale index -- referencing symbols
-            // that no longer exist -- on disk indefinitely.
-            let _ = std::fs::remove_file(&hnsw_path);
-            let _ = std::fs::remove_file(hnsw_path.with_extension("meta"));
-        } else if let Err(e) = build_hnsw_index(&symbol_embeddings, &hnsw_path, &emb_path) {
-            eprintln!("warning: HNSW index build failed ({e}), vector search will use brute-force");
-        }
-    }
+    sync_hnsw_index(&symbol_embeddings, &hnsw_path, &emb_path, HNSW_THRESHOLD);
 
     Ok(count)
 }
@@ -1231,6 +1217,27 @@ pub fn build_hnsw_index(
     Ok(n)
 }
 
+/// Bring the on-disk HNSW index in line with `embeddings`: rebuilt at or above
+/// `threshold` vectors, absent below it. Below the threshold the linear scan
+/// is the designed fast path and `search` never consults an index, so one on
+/// disk is only a stale file rewritten with every update. The `.meta` goes
+/// first: `search_hnsw` answers `None` when either file is missing, so it
+/// never serves a half-removed pair.
+pub fn sync_hnsw_index(
+    embeddings: &[(String, Vec<f32>)],
+    index_path: &Path,
+    embeddings_path: &Path,
+    threshold: usize,
+) {
+    invalidate_hnsw_cache();
+    if embeddings.len() < threshold {
+        let _ = std::fs::remove_file(index_path.with_extension("meta"));
+        let _ = std::fs::remove_file(index_path);
+    } else if let Err(e) = build_hnsw_index(embeddings, index_path, embeddings_path) {
+        eprintln!("warning: HNSW index build failed ({e}), vector search will use brute-force");
+    }
+}
+
 /// Invalidate the HNSW cache.
 pub fn invalidate_hnsw_cache() {
     if let Ok(mut guard) = hnsw_cache_lock().lock() {
@@ -1261,6 +1268,57 @@ fn write_binary_sidecar(
     }
     atomic_write(path, &buf)?;
     Ok(())
+}
+
+/// Whole seconds since the epoch of `path`'s modification time; 0 when it
+/// cannot be read. The unit the sidecar records `embeddings.bin` in.
+fn mtime_secs(path: &Path) -> u64 {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .unwrap_or(std::time::UNIX_EPOCH)
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// Bytes of a binary sidecar up to and including `emb_mtime_secs`:
+/// `[version:u8][count:u32][dim:u32][emb_mtime_secs:u64]`. The id list that
+/// follows is most of the file (8 MB at 117k symbols) and a freshness check
+/// has no use for it.
+const SIDECAR_HEADER_BYTES: u64 = 1 + 4 + 4 + 8;
+
+/// The `embeddings.bin` modification time the sidecar at `path` records, read
+/// from its header alone. A pre-upgrade JSON sidecar has no fixed header, so
+/// that one is read whole.
+fn sidecar_emb_mtime_secs(path: &Path) -> Option<u64> {
+    use std::io::Read;
+    let mut head = Vec::with_capacity(SIDECAR_HEADER_BYTES as usize);
+    std::fs::File::open(path)
+        .ok()?
+        .take(SIDECAR_HEADER_BYTES)
+        .read_to_end(&mut head)
+        .ok()?;
+    if head.first() == Some(&b'{') {
+        return read_sidecar(&std::fs::read(path).ok()?)
+            .ok()
+            .map(|s| s.emb_mtime_secs);
+    }
+    let mut r = ByteReader::new(&head, "hnsw sidecar header");
+    (r.u8().ok()? == 1).then_some(())?;
+    r.u32().ok()?;
+    r.u32().ok()?;
+    r.u64().ok()
+}
+
+/// True when the HNSW index at `index_path` can answer a query: the index and
+/// its `.meta` both exist and the `.meta` names the current `embeddings.bin`.
+/// The one definition of "usable" -- `search_hnsw` serves only an index this
+/// accepts, and the degraded-mode check reports every index it rejects, so
+/// the two cannot disagree.
+pub fn hnsw_index_current(index_path: &Path, embeddings_path: &Path) -> bool {
+    index_path.exists()
+        && sidecar_emb_mtime_secs(&index_path.with_extension("meta"))
+            == Some(mtime_secs(embeddings_path))
 }
 
 struct SidecarData {
@@ -1362,17 +1420,10 @@ pub fn search_hnsw(
     query: &[f32],
     top_k: usize,
 ) -> Result<Option<Vec<HnswResult>>> {
-    let sidecar_path = index_path.with_extension("meta");
-    if !index_path.exists() || !sidecar_path.exists() {
+    if !hnsw_index_current(index_path, embeddings_path) {
         return Ok(None);
     }
-
-    let emb_mtime_secs = std::fs::metadata(embeddings_path)
-        .and_then(|m| m.modified())
-        .unwrap_or(std::time::UNIX_EPOCH)
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    let sidecar_path = index_path.with_extension("meta");
 
     let canon = index_path
         .canonicalize()
@@ -1395,12 +1446,9 @@ pub fn search_hnsw(
     }
     drop(guard);
 
-    // Cache miss — load sidecar and validate freshness
+    // Cache miss — load the sidecar (freshness was checked above)
     let sidecar_bytes = std::fs::read(&sidecar_path).context("read hnsw sidecar")?;
     let sidecar = read_sidecar(&sidecar_bytes)?;
-    if sidecar.emb_mtime_secs != emb_mtime_secs {
-        return Ok(None);
-    }
     let id_map = sidecar.ids;
 
     let dim = sidecar.dim;
@@ -1500,5 +1548,108 @@ mod corrupt_input_tests {
             read_sidecar(&bytes).is_err(),
             "a sidecar id count beyond its own length must be rejected"
         );
+    }
+}
+
+#[cfg(test)]
+mod hnsw_freshness_tests {
+    use super::*;
+    use std::time::{Duration, SystemTime};
+
+    fn vectors(n: usize) -> Vec<(String, Vec<f32>)> {
+        (0..n)
+            .map(|i| (format!("s{i}"), vec![i as f32 + 1.0, 1.0, 0.0, 0.0]))
+            .collect()
+    }
+
+    /// A project dir holding `n` saved embeddings; returns (index, embeddings) paths.
+    fn project_with(n: usize) -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let emb = dir.path().join("embeddings.bin");
+        save_embeddings(&emb, &vectors(n)).unwrap();
+        let index = dir.path().join("hnsw_index.usearch");
+        (dir, index, emb)
+    }
+
+    fn touch_forward(path: &Path, secs: u64) {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(SystemTime::now() + Duration::from_secs(secs))
+            .unwrap();
+    }
+
+    #[test]
+    fn an_index_built_from_the_current_embeddings_is_current() {
+        let (_d, index, emb) = project_with(4);
+        build_hnsw_index(&vectors(4), &index, &emb).unwrap();
+        assert!(hnsw_index_current(&index, &emb));
+    }
+
+    #[test]
+    fn an_index_is_not_current_once_embeddings_change_or_a_file_is_absent() {
+        let (_d, index, emb) = project_with(4);
+        assert!(!hnsw_index_current(&index, &emb), "no index at all");
+        build_hnsw_index(&vectors(4), &index, &emb).unwrap();
+
+        touch_forward(&emb, 30);
+        assert!(
+            !hnsw_index_current(&index, &emb),
+            "meta names an older embeddings.bin"
+        );
+        assert!(
+            search_hnsw(&index, &emb, &[1.0, 1.0, 0.0, 0.0], 2)
+                .unwrap()
+                .is_none(),
+            "search refuses exactly what the predicate rejects"
+        );
+
+        std::fs::remove_file(index.with_extension("meta")).unwrap();
+        assert!(!hnsw_index_current(&index, &emb), "no meta");
+    }
+
+    #[test]
+    fn the_predicate_reads_only_the_meta_header() {
+        let (_d, index, emb) = project_with(4);
+        build_hnsw_index(&vectors(4), &index, &emb).unwrap();
+        let meta = index.with_extension("meta");
+        // Keep the 17-byte header, drop every id: still judged by the header alone.
+        let bytes = std::fs::read(&meta).unwrap();
+        std::fs::write(&meta, &bytes[..17]).unwrap();
+        assert!(hnsw_index_current(&index, &emb));
+    }
+
+    #[test]
+    fn below_the_threshold_there_is_no_index_and_growing_back_rebuilds_it() {
+        let (_d, index, emb) = project_with(3);
+        sync_hnsw_index(&vectors(3), &index, &emb, 3);
+        assert!(
+            hnsw_index_current(&index, &emb),
+            "at the threshold it builds"
+        );
+
+        save_embeddings(&emb, &vectors(2)).unwrap();
+        sync_hnsw_index(&vectors(2), &index, &emb, 3);
+        assert!(!index.exists(), "index removed below the threshold");
+        assert!(
+            !index.with_extension("meta").exists(),
+            "meta removed with it"
+        );
+        assert!(search_hnsw(&index, &emb, &[1.0, 1.0, 0.0, 0.0], 2)
+            .unwrap()
+            .is_none());
+
+        save_embeddings(&emb, &vectors(3)).unwrap();
+        sync_hnsw_index(&vectors(3), &index, &emb, 3);
+        assert!(hnsw_index_current(&index, &emb), "growing back rebuilds");
+    }
+
+    #[test]
+    fn below_the_threshold_nothing_is_built() {
+        let (_d, index, emb) = project_with(2);
+        sync_hnsw_index(&vectors(2), &index, &emb, 3);
+        assert!(!index.exists());
+        assert!(!index.with_extension("meta").exists());
     }
 }
