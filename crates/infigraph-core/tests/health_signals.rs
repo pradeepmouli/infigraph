@@ -27,9 +27,18 @@ fn hnsw_gap_only_above_threshold() {
     write_embeddings_header(dir.path(), embed::HNSW_THRESHOLD as u32);
     assert!(embed::hnsw_expected_but_missing(dir.path()));
 
-    // Index file present: healthy again.
+    // The index without its `.meta` is still a linear scan: `search_hnsw`
+    // answers `None` when either file is absent (#75).
     std::fs::write(
         dir.path().join(".infigraph").join("hnsw_index.usearch"),
+        b"stub",
+    )
+    .unwrap();
+    assert!(embed::hnsw_expected_but_missing(dir.path()));
+
+    // Index and `.meta` present: healthy again.
+    std::fs::write(
+        dir.path().join(".infigraph").join("hnsw_index.meta"),
         b"stub",
     )
     .unwrap();

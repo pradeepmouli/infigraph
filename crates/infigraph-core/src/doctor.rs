@@ -1106,7 +1106,7 @@ pub fn check_disk(ctx: &DoctorContext) -> Vec<CheckResult> {
 }
 
 const SIDECAR_CATEGORY: &str = "sidecars";
-const SIDECAR_STALE_SECS: u64 = 60 * 60; // 1 hour
+pub(crate) const SIDECAR_STALE_SECS: u64 = 60 * 60; // 1 hour
 
 /// The store a sidecar is derived from, i.e. the file whose mtime its
 /// freshness is judged against, and the command that rebuilds it.
@@ -1131,12 +1131,9 @@ fn check_one_sidecar(project_path: &Path, sidecar_name: &str) -> Option<CheckRes
         return None;
     }
 
-    let anchor_mtime = std::fs::metadata(&anchor_path).ok()?.modified().ok()?;
-    let sidecar_mtime = std::fs::metadata(&sidecar_path).ok()?.modified().ok()?;
-
     let label = format!("{}: {}", project_path.display(), sidecar_name);
-    match anchor_mtime.duration_since(sidecar_mtime) {
-        Ok(staleness) if staleness.as_secs() > SIDECAR_STALE_SECS => Some(CheckResult::warn(
+    match sidecar_lag(project_path, sidecar_name) {
+        Some(staleness) if staleness.as_secs() > SIDECAR_STALE_SECS => Some(CheckResult::warn(
             SIDECAR_CATEGORY,
             label,
             format!(
@@ -1154,6 +1151,23 @@ fn check_one_sidecar(project_path: &Path, sidecar_name: &str) -> Option<CheckRes
             format!("fresh relative to {anchor_name}"),
         )),
     }
+}
+
+/// How much older than the store it is derived from a sidecar is: `None`
+/// when either file is missing or the sidecar is the newer one. The one
+/// derivation of sidecar staleness, shared with `degraded::gather`.
+pub(crate) fn sidecar_lag(project_path: &Path, sidecar_name: &str) -> Option<std::time::Duration> {
+    let infigraph_dir = project_path.join(".infigraph");
+    let (anchor_name, _) = sidecar_anchor(sidecar_name);
+    let anchor_mtime = std::fs::metadata(infigraph_dir.join(anchor_name))
+        .ok()?
+        .modified()
+        .ok()?;
+    let sidecar_mtime = std::fs::metadata(infigraph_dir.join(sidecar_name))
+        .ok()?
+        .modified()
+        .ok()?;
+    anchor_mtime.duration_since(sidecar_mtime).ok()
 }
 
 pub fn check_sidecars(ctx: &DoctorContext) -> Vec<CheckResult> {

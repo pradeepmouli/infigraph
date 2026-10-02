@@ -435,13 +435,15 @@ pub fn trigram_fallback_active() -> bool {
     TRIGRAM_FALLBACK.load(Ordering::Relaxed)
 }
 
-/// True when this project is above the HNSW threshold but the sidecar index
-/// file is missing — vector search is silently on a linear scan that no
-/// longer pays off at this scale. Below the threshold a missing index is by
-/// design, not degradation.
+/// True when this project is above the HNSW threshold but the index, or the
+/// `.meta` beside it, is missing — vector search is silently on a linear scan
+/// that no longer pays off at this scale. `search_hnsw` answers `None` when
+/// either file is absent, so either one missing is the same degradation.
+/// Below the threshold a missing index is by design, not degradation.
 pub fn hnsw_expected_but_missing(root: &Path) -> bool {
     let hnsw = root.join(".infigraph").join("hnsw_index.usearch");
-    !hnsw.exists() && embedding_count(root) >= HNSW_THRESHOLD
+    let usable = hnsw.exists() && hnsw.with_extension("meta").exists();
+    !usable && embedding_count(root) >= HNSW_THRESHOLD
 }
 
 /// Factory: select Model2Vec if available, otherwise fall back to TrigramEmbedder.

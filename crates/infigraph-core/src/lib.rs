@@ -12,6 +12,7 @@ pub mod concerns;
 pub mod config;
 pub mod daemon;
 pub mod daemon_protocol;
+pub mod degraded;
 pub mod diff;
 pub mod dirty;
 pub mod docs_switch;
