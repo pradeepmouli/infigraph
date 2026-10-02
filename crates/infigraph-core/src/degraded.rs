@@ -24,6 +24,14 @@ pub enum DegradedMode {
     /// This process could not load the Model2Vec model, so it embeds with
     /// trigram hashing.
     TrigramEmbedder,
+    /// `embeddings.bin` was built by the trigram embedder (its marker says
+    /// so), whatever this process embeds with.
+    EmbeddingsBuiltWithTrigram,
+    /// `embeddings.bin` holds vectors from more than one embedder.
+    EmbeddingsMixed,
+    /// This process embeds queries with a different embedder than the one
+    /// that built `embeddings.bin`, so it compares unrelated vectors.
+    EmbedderMismatch { built: String, query: String },
     /// The graph exists but `embeddings.bin` does not, so code search embeds
     /// every symbol at query time.
     EmbeddingsMissing,
@@ -43,6 +51,9 @@ impl DegradedMode {
     pub fn key(&self) -> &'static str {
         match self {
             DegradedMode::TrigramEmbedder => "trigram-embedder",
+            DegradedMode::EmbeddingsBuiltWithTrigram => "embeddings-built-with-trigram",
+            DegradedMode::EmbeddingsMixed => "embeddings-mixed",
+            DegradedMode::EmbedderMismatch { .. } => "embedder-mismatch",
             DegradedMode::EmbeddingsMissing => "embeddings-missing",
             DegradedMode::EmbeddingsStale { .. } => "embeddings-stale",
             DegradedMode::HnswMissing => "hnsw-missing",
@@ -57,6 +68,20 @@ impl DegradedMode {
                 "semantic search degraded: Model2Vec model unavailable, using trigram fallback"
                     .to_string()
             }
+            DegradedMode::EmbeddingsBuiltWithTrigram => {
+                "embeddings.bin was built with the trigram fallback, not the Model2Vec model: \
+                 semantic ranking is degraded"
+                    .to_string()
+            }
+            DegradedMode::EmbeddingsMixed => {
+                "embeddings.bin holds vectors from more than one embedder: semantic ranking \
+                 compares unrelated vectors"
+                    .to_string()
+            }
+            DegradedMode::EmbedderMismatch { built, query } => format!(
+                "queries are embedded with {query} but embeddings.bin was built with {built}: \
+                 semantic ranking compares unrelated vectors"
+            ),
             DegradedMode::EmbeddingsMissing => {
                 "embeddings.bin is missing: code search embeds every symbol at query time"
                     .to_string()
@@ -82,6 +107,11 @@ impl DegradedMode {
         match self {
             DegradedMode::TrigramEmbedder => {
                 "run `infigraph install` to install the model, or set INFIGRAPH_MODEL_DIR"
+            }
+            DegradedMode::EmbeddingsBuiltWithTrigram
+            | DegradedMode::EmbeddingsMixed
+            | DegradedMode::EmbedderMismatch { .. } => {
+                "install the model (`infigraph install`), then run `infigraph index --full`"
             }
             DegradedMode::EmbeddingsMissing
             | DegradedMode::EmbeddingsStale { .. }
@@ -118,8 +148,39 @@ pub fn gather(root: &Path) -> Vec<Notice> {
     if crate::embed::trigram_fallback_active() {
         modes.push(DegradedMode::TrigramEmbedder);
     }
+    modes.extend(embedder_modes(root, crate::embed::process_embedder()));
     modes.extend(derived_from_disk(root));
     modes.iter().map(DegradedMode::notice).collect()
+}
+
+/// What the embedder marker beside `embeddings.bin` establishes, given the
+/// embedder this process queries with (`None` if it has built none yet). An
+/// absent marker is unknown and reports nothing.
+pub fn embedder_modes(root: &Path, process_embedder: Option<&str>) -> Vec<DegradedMode> {
+    let mut modes = Vec::new();
+    let sidecar = root.join(".infigraph").join("embeddings.bin");
+    if crate::daemon::lifecycle::is_remote_backend() || !sidecar.exists() {
+        return modes;
+    }
+    let Some(built) = crate::embed::read_embedder_marker(&sidecar) else {
+        return modes;
+    };
+    if built == crate::embed::MIXED_EMBEDDERS {
+        modes.push(DegradedMode::EmbeddingsMixed);
+        return modes;
+    }
+    if built == crate::embed::TRIGRAM_EMBEDDER {
+        modes.push(DegradedMode::EmbeddingsBuiltWithTrigram);
+    }
+    if let Some(query) = process_embedder {
+        if query != built {
+            modes.push(DegradedMode::EmbedderMismatch {
+                built,
+                query: query.to_string(),
+            });
+        }
+    }
+    modes
 }
 
 /// The modes that files on disk alone establish. No process state, no store.
@@ -292,6 +353,12 @@ mod tests {
     #[test]
     fn every_mode_has_its_own_key_and_wording() {
         let modes = [
+            DegradedMode::EmbeddingsBuiltWithTrigram,
+            DegradedMode::EmbeddingsMixed,
+            DegradedMode::EmbedderMismatch {
+                built: "model2vec".to_string(),
+                query: "trigram".to_string(),
+            },
             DegradedMode::TrigramEmbedder,
             DegradedMode::EmbeddingsMissing,
             DegradedMode::EmbeddingsStale { minutes: 90 },
@@ -307,6 +374,71 @@ mod tests {
             assert_eq!(notice.key, mode.key());
             assert!(!notice.message.is_empty() && !notice.remedy.is_empty());
         }
+    }
+
+    fn marker(p: &Project, name: &str) {
+        crate::embed::write_embedder_marker(&p.root().join(".infigraph/embeddings.bin"), name)
+            .unwrap();
+    }
+
+    /// Read from disk alone: this is what a fresh process sees after the
+    /// daemon that indexed with the fallback has gone.
+    #[test]
+    fn embeddings_built_with_the_trigram_embedder_are_reported_from_the_marker() {
+        let p = Project::new();
+        p.embeddings(10);
+        marker(&p, "trigram");
+        assert_eq!(
+            embedder_modes(p.root(), None),
+            vec![DegradedMode::EmbeddingsBuiltWithTrigram]
+        );
+    }
+
+    #[test]
+    fn an_absent_marker_or_a_model2vec_one_reports_nothing() {
+        let p = Project::new();
+        p.embeddings(10);
+        assert_eq!(embedder_modes(p.root(), None), vec![]);
+        assert_eq!(embedder_modes(p.root(), Some("trigram")), vec![]);
+        marker(&p, "model2vec");
+        assert_eq!(embedder_modes(p.root(), None), vec![]);
+        assert_eq!(embedder_modes(p.root(), Some("model2vec")), vec![]);
+    }
+
+    #[test]
+    fn a_query_embedder_that_differs_from_the_one_that_built_the_index_is_reported() {
+        let p = Project::new();
+        p.embeddings(10);
+        marker(&p, "model2vec");
+        assert_eq!(
+            embedder_modes(p.root(), Some("trigram")),
+            vec![DegradedMode::EmbedderMismatch {
+                built: "model2vec".to_string(),
+                query: "trigram".to_string(),
+            }]
+        );
+        marker(&p, "trigram");
+        assert_eq!(
+            embedder_modes(p.root(), Some("model2vec")),
+            vec![
+                DegradedMode::EmbeddingsBuiltWithTrigram,
+                DegradedMode::EmbedderMismatch {
+                    built: "trigram".to_string(),
+                    query: "model2vec".to_string(),
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn embeddings_from_two_embedders_are_reported_as_mixed() {
+        let p = Project::new();
+        p.embeddings(10);
+        marker(&p, "mixed");
+        assert_eq!(
+            embedder_modes(p.root(), Some("model2vec")),
+            vec![DegradedMode::EmbeddingsMixed]
+        );
     }
 
     /// A notice from a newer build, with a key this build has no variant for,

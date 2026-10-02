@@ -254,3 +254,20 @@ fn deleting_every_indexed_file_removes_a_stale_hnsw_index() {
         "a stale HNSW index (referencing deleted symbols) must not survive an empty-graph re-embed"
     );
 }
+
+/// #75: the embedder that built `embeddings.bin` is recorded beside it, so a
+/// daemon that indexed with the trigram fallback is visible after it is gone.
+#[test]
+fn update_embeddings_records_which_embedder_built_the_file() {
+    let (dir, ig) = setup();
+    assert!(reembed(dir.path(), &ig) > 0);
+
+    let sidecar = dir.path().join(".infigraph").join("embeddings.bin");
+    let recorded = infigraph_core::embed::read_embedder_marker(&sidecar);
+    assert_eq!(
+        recorded.as_deref(),
+        infigraph_core::embed::process_embedder(),
+        "the marker must name the embedder this process embedded with"
+    );
+    assert!(recorded.is_some());
+}
