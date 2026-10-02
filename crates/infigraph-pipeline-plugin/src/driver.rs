@@ -238,14 +238,18 @@ pub fn matches_detect_patterns(content: &str, patterns: &[String]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use infigraph_core::child::ChildTimeouts;
+    #[cfg(unix)]
     use std::time::Duration;
 
+    #[cfg(unix)]
     const QUICK: ChildTimeouts = ChildTimeouts {
         ready: Duration::from_millis(600),
         request: Duration::from_millis(600),
     };
 
+    #[cfg(unix)]
     fn driver_running(script: &str) -> PipelinePluginDriver {
         let config: PipelinePluginConfig = toml::from_str(&format!(
             "[plugin]\nname = \"Fake\"\nplugin_id = \"fake\"\ncommand = [\"sh\", \"-c\", {script:?}]\n"

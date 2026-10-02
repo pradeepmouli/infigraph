@@ -175,8 +175,8 @@ impl Drop for GroupKillOnDrop {
 pub struct GroupChild {
     child: Child,
     reaped: bool,
-    /// How many group signals were sent (test seam).
-    #[cfg(test)]
+    /// How many group signals were sent (test seam; read only by the unix tests).
+    #[cfg(all(test, unix))]
     group_signals: usize,
 }
 
@@ -187,7 +187,7 @@ impl GroupChild {
         Ok(Self {
             child: command.spawn()?,
             reaped: false,
-            #[cfg(test)]
+            #[cfg(all(test, unix))]
             group_signals: 0,
         })
     }
@@ -285,8 +285,9 @@ pub struct LineChild {
     /// the OS to reuse -- possibly by a process that leads its own group,
     /// which every spawn of ours does -- so nothing may signal it again.
     reaped: bool,
-    /// How many times the process group was signalled (test seam).
-    #[cfg(test)]
+    /// How many times the process group was signalled (test seam; read only by
+    /// the unix tests).
+    #[cfg(all(test, unix))]
     group_kills: usize,
 }
 
@@ -357,7 +358,7 @@ impl LineChild {
             stderr_tail,
             poisoned: None,
             reaped: false,
-            #[cfg(test)]
+            #[cfg(all(test, unix))]
             group_kills: 0,
         })
     }

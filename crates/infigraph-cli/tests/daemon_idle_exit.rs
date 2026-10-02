@@ -3,7 +3,9 @@
 
 mod support;
 
-use std::process::{Command, Stdio};
+#[cfg(unix)]
+use std::process::Command;
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 /// Polls `still_alive` until it reports false, or the budget runs out.
