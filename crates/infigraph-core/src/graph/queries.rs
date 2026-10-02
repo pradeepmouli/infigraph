@@ -32,6 +32,19 @@ impl<E: crate::graph::query_exec::QueryExec> GraphQuery<E> {
         Self { exec }
     }
 
+    /// A `GraphMeta` generation counter (`ast_generation` or
+    /// `scip_generation`); 0 when the graph has none yet or it cannot be
+    /// read, which every caller treats as "no generation", never as a value.
+    pub fn generation(&self, field: &'static str) -> i64 {
+        self.exec
+            .query_rows(&format!(
+                "MATCH (g:GraphMeta {{id: 'singleton'}}) RETURN g.{field}"
+            ))
+            .ok()
+            .and_then(|rows| rows.first()?.first()?.to_string().parse().ok())
+            .unwrap_or(0)
+    }
+
     /// Find all symbols in a file.
     pub fn symbols_in_file(&self, file: &str) -> Result<Vec<SymbolRow>> {
         let query = format!(

@@ -174,6 +174,12 @@ impl GraphBackend for DaemonKuzuBackend {
     fn stats(&self) -> Result<GraphStats> {
         self.with_reader(|q| q.stats())
     }
+    // Without this a routed client could never record which generation the
+    // embeddings it just wrote reflect, and the daemon would then read its
+    // own older marker as "behind the graph" (#75).
+    fn current_ast_generation(&self) -> Result<i64> {
+        self.with_reader(|q| Ok(q.generation("ast_generation")))
+    }
     fn get_file_hashes(&self) -> Result<HashMap<String, String>> {
         self.with_reader(|q| q.get_file_hashes())
     }

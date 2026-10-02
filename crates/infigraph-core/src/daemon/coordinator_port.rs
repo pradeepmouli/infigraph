@@ -197,6 +197,7 @@ impl DaemonState {
             code: self.role(WatchRole::Code),
             docs: self.role(WatchRole::Docs),
             degraded: crate::degraded::live::all(),
+            judged: crate::degraded::live::judged(),
         }
     }
 }

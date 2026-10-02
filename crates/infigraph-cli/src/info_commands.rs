@@ -755,13 +755,14 @@ pub(crate) fn cmd_daemon(root: &Path, debounce: u64) -> Result<()> {
     let docs_reads = match infigraph_docs::daemon_source::daemon_row_source(root) {
         Ok(source) => Some(source),
         Err(e) => {
-            // Reported to clients through the status socket (#75), and
-            // worded by the one definition of this mode.
-            let mode = infigraph_core::degraded::DegradedMode::DocReadsUnavailable {
-                reason: format!("{e:#}"),
-            };
-            eprintln!("[read] {} ({})", mode.message(), root.display());
-            infigraph_core::degraded::live::set(root, mode);
+            // Reported to clients through the status socket (#75); `set`
+            // also writes it to this daemon's log, once.
+            infigraph_core::degraded::live::set(
+                root,
+                infigraph_core::degraded::DegradedMode::DocReadsUnavailable {
+                    reason: format!("{e:#}"),
+                },
+            );
             None
         }
     };
@@ -2066,6 +2067,7 @@ mod ps_status_tests {
             code: RoleState::Running,
             docs: RoleState::NotOwned,
             degraded: Vec::new(),
+            judged: Vec::new(),
         }
     }
 

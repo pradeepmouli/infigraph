@@ -290,3 +290,70 @@ fn a_body_only_edit_still_moves_the_generation_marker() {
         Some(current)
     );
 }
+
+struct FailingEmbedder;
+
+impl infigraph_core::embed::EmbedProvider for FailingEmbedder {
+    fn embed(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
+        anyhow::bail!("embedder unavailable")
+    }
+    fn embed_batch(&self, _texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
+        anyhow::bail!("embedder unavailable")
+    }
+    fn dimension(&self) -> usize {
+        256
+    }
+}
+
+/// An update whose embedder fails embeds nothing, and with nothing pruned it
+/// takes the same exit as "nothing to do". The marker must not move there:
+/// the vectors do not reflect the new generation, and a marker saying they do
+/// is the false "fresh" #75 exists to prevent.
+#[test]
+fn a_failed_embedding_does_not_move_the_generation_marker() {
+    let (dir, ig) = setup();
+    let backend = ig.backend().unwrap();
+    let before = infigraph_core::embed::read_generation_marker(&emb_path(dir.path()));
+    assert_eq!(before, Some(backend.current_ast_generation().unwrap()));
+
+    write_alpha(dir.path(), "x = 1", "A different docstring."); // must re-embed
+    ig.index().unwrap();
+    let current = backend.current_ast_generation().unwrap();
+    assert!(Some(current) > before);
+    infigraph_core::embed::update_embeddings_with(backend, dir.path(), &[], &|| {
+        Box::new(FailingEmbedder)
+    })
+    .unwrap();
+
+    assert_eq!(
+        infigraph_core::embed::read_generation_marker(&emb_path(dir.path())),
+        before,
+        "the marker moved over embeddings that were not updated"
+    );
+    let live = infigraph_core::degraded::live::for_root(dir.path());
+    assert!(
+        live.iter()
+            .any(|n| n.key == infigraph_core::degraded::EMBEDDINGS_STALE),
+        "the failed update is not reported as stale: {live:?}"
+    );
+}
+
+/// A write to the graph makes the last staleness comparison out of date, so
+/// the process holding the graph stops claiming to have judged it until the
+/// next embedding attempt compares again.
+#[test]
+fn a_graph_write_without_an_embedding_attempt_is_not_a_judgment() {
+    let (dir, ig) = setup();
+    let judged = || {
+        infigraph_core::degraded::live::judged_for(dir.path())
+            .contains(&infigraph_core::degraded::EMBEDDINGS_STALE.to_string())
+    };
+    assert!(judged(), "setup embedded, which compares");
+
+    write_alpha(dir.path(), "x = 3", "Helper doc.");
+    ig.index().unwrap();
+    assert!(!judged(), "the graph moved and nothing compared since");
+
+    reembed(dir.path(), &ig);
+    assert!(judged());
+}

@@ -70,10 +70,16 @@ pub(crate) fn not_connected(root: &Path) -> ControlError {
 }
 
 pub fn query_status(root: &Path) -> Result<StatusReport, ControlError> {
+    query_status_within(root, STATUS_DEADLINE)
+}
+
+/// [`query_status`] with the caller's own `deadline`, for a caller that
+/// would rather go without the answer than wait the full one.
+pub fn query_status_within(root: &Path, deadline: Duration) -> Result<StatusReport, ControlError> {
     let stream = ReadEndpoint::for_root(root)
         .connect()
         .map_err(|_| not_connected(root))?;
-    exchange(stream, &StatusFrame::default(), by(STATUS_DEADLINE))
+    exchange(stream, &StatusFrame::default(), by(deadline))
 }
 
 pub fn send_control(root: &Path, role: WatchRole, action: WatchAction) -> Result<(), ControlError> {

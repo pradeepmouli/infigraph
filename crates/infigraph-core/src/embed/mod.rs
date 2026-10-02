@@ -837,7 +837,19 @@ pub fn update_embeddings(
     root: &Path,
     changed_files: &[&str],
 ) -> Result<usize> {
-    let result = update_embeddings_inner(backend, root, changed_files);
+    update_embeddings_with(backend, root, changed_files, &best_embedder)
+}
+
+/// [`update_embeddings`] with the embedder supplied by the caller: the seam
+/// a test uses to exercise an embedder that fails.
+#[doc(hidden)]
+pub fn update_embeddings_with(
+    backend: &dyn crate::graph::GraphBackend,
+    root: &Path,
+    changed_files: &[&str],
+    make_embedder: &dyn Fn() -> Box<dyn EmbedProvider>,
+) -> Result<usize> {
+    let result = update_embeddings_inner(backend, root, changed_files, make_embedder);
     // #75: whoever holds the graph says whether the embeddings now reflect
     // it, success or not -- a failed update is exactly when they do not.
     if let Ok(generation) = backend.current_ast_generation() {
@@ -850,9 +862,15 @@ fn update_embeddings_inner(
     backend: &dyn crate::graph::GraphBackend,
     root: &Path,
     changed_files: &[&str],
+    make_embedder: &dyn Fn() -> Box<dyn EmbedProvider>,
 ) -> Result<usize> {
     use rayon::prelude::*;
     use std::sync::Arc;
+
+    // Read before the symbols, never after: a write that lands in between
+    // then leaves the marker behind the graph (reported as stale, and true)
+    // rather than ahead of what was embedded. 0 = this backend has none.
+    let generation = backend.current_ast_generation().unwrap_or(0);
 
     let rows = backend.raw_query("MATCH (s:Symbol) RETURN s.id, s.name, s.kind, s.file, s.docstring, s.language, s.parameters, s.return_type")?;
 
@@ -896,7 +914,7 @@ fn update_embeddings_inner(
     let mut embedded = 0usize;
     let mut embedder_name: Option<&'static str> = None;
     if !to_embed.is_empty() {
-        let embedder: Arc<Box<dyn EmbedProvider>> = Arc::new(best_embedder());
+        let embedder: Arc<Box<dyn EmbedProvider>> = Arc::new(make_embedder());
         embedder_name = Some(embedder.name());
         const BATCH: usize = 256;
         let results: Vec<Vec<(String, Vec<f32>, u64)>> = to_embed
@@ -930,13 +948,18 @@ fn update_embeddings_inner(
     // Nothing embedded, nothing pruned: the file's contents would be identical.
     // Skip the write AND the O(n) HNSW rebuild — this is the body-only-edit
     // fast path.
+    // The file reflects `generation` only if every symbol that needed a new
+    // vector got one. An embedder that failed leaves `embedded` short, and
+    // the marker then stays where it was: moving it would call embeddings
+    // fresh that were not updated.
+    let reflects_generation = embedded == to_embed.len();
+
     if embedded == 0 && pruned == 0 {
-        // The file is untouched, and it now reflects this generation: move
-        // the marker, or every body-only edit leaves it reading as stale.
-        if emb_path.exists() {
-            if let Ok(generation) = backend.current_ast_generation() {
-                let _ = write_generation_marker(&emb_path, generation);
-            }
+        // The file is untouched. If that is because nothing needed
+        // embedding, it now reflects this generation: move the marker, or
+        // every body-only edit leaves it reading as stale.
+        if reflects_generation && emb_path.exists() {
+            let _ = write_generation_marker(&emb_path, generation);
         }
         return Ok(count);
     }
@@ -951,7 +974,7 @@ fn update_embeddings_inner(
     // Best-effort: a failed marker write shouldn't fail an otherwise
     // successful embeddings rebuild -- worst case, a later staleness check
     // just can't judge this file (see `read_generation_marker`).
-    if let Ok(generation) = backend.current_ast_generation() {
+    if reflects_generation {
         let _ = write_generation_marker(&emb_path, generation);
     }
     // #75: record which embedder these vectors came from, by the same

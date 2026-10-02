@@ -1,3 +1,4 @@
+use infigraph_core::degraded::DegradedMode;
 use infigraph_mcp::health::{compose_footer, gather_signals, HealthState, Signals};
 
 #[test]
@@ -10,8 +11,10 @@ fn each_condition_renders_one_warning_line() {
     let sig = Signals {
         worker_restarted: true,
         watcher_missing: true,
-        trigram_fallback: true,
-        hnsw_missing: true,
+        degraded: vec![
+            DegradedMode::TrigramEmbedder.notice(),
+            DegradedMode::HnswMissing.notice(),
+        ],
         slow_waits: vec![("graph.lock".to_string(), 5)],
     };
     let footer = compose_footer(&sig).unwrap();
@@ -83,5 +86,48 @@ fn no_project_means_no_project_scoped_beacons() {
     state.mark_initialized();
     let sig = gather_signals(&state, "compress", None);
     assert!(!sig.watcher_missing);
-    assert!(!sig.hnsw_missing);
+    // Only what this process knows about itself, never a project's modes.
+    assert!(
+        sig.degraded
+            .iter()
+            .all(|n| n.key == DegradedMode::TrigramEmbedder.key()),
+        "{:?}",
+        sig.degraded
+    );
+}
+
+fn keys(sig: &Signals) -> Vec<&str> {
+    sig.degraded.iter().map(|n| n.key.as_str()).collect()
+}
+
+/// The project's degraded modes come from core's one definition (#75), so a
+/// mode added there reaches the footer with no change here.
+#[test]
+fn a_projects_degraded_modes_reach_the_footer_from_core() {
+    let state = HealthState::new();
+    state.mark_initialized();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join(".infigraph")).unwrap();
+    std::fs::write(dir.path().join(".infigraph/graph"), b"graph").unwrap();
+
+    let sig = gather_signals(&state, "search", Some(dir.path()));
+    let missing = DegradedMode::EmbeddingsMissing;
+    assert!(keys(&sig).contains(&missing.key()), "{:?}", sig.degraded);
+    let footer = compose_footer(&sig).unwrap();
+    assert!(footer.contains(&missing.message()), "{footer}");
+}
+
+/// `get_stats` and `doctor` list the degraded modes in their own output;
+/// repeating them in the footer of the same reply is noise.
+#[test]
+fn tools_that_list_degraded_modes_themselves_get_none_in_the_footer() {
+    let state = HealthState::new();
+    state.mark_initialized();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join(".infigraph")).unwrap();
+    std::fs::write(dir.path().join(".infigraph/graph"), b"graph").unwrap();
+    for tool in ["get_stats", "doctor"] {
+        let sig = gather_signals(&state, tool, Some(dir.path()));
+        assert!(sig.degraded.is_empty(), "{tool}: {:?}", sig.degraded);
+    }
 }

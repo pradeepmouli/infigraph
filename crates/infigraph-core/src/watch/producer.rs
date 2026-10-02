@@ -277,7 +277,6 @@ pub async fn run_producer(
                                                     path.display()
                                                 );
                                                 crate::watch::WatchRegistration {
-                                                    watched: 0,
                                                     failed: 1,
                                                     first_error: Some(format!(
                                                         "{}: {e}",

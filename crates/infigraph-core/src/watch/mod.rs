@@ -420,7 +420,6 @@ pub(crate) fn register_watch_dirs(
         );
     }
     Ok(WatchRegistration {
-        watched,
         failed,
         first_error: first_err,
     })
@@ -431,16 +430,15 @@ pub(crate) fn register_watch_dirs(
 /// a degraded mode: changes under the failed paths go unnoticed.
 #[derive(Debug)]
 pub(crate) struct WatchRegistration {
-    pub watched: usize,
     pub failed: usize,
     pub first_error: Option<String>,
 }
 
 impl WatchRegistration {
     /// Records the outcome against `project_root` (#75): the degraded mode
-    /// when some directories failed, warned about once on stderr in the
-    /// mode's own wording. `clears` says a clean result ends the mode, which
-    /// is true only for a registration of the whole project.
+    /// when some directories failed, which `live::set` warns about once.
+    /// `clears` says a clean result ends the mode, which is true only for a
+    /// registration of the whole project.
     pub(crate) fn note(&self, project_root: &Path, clears: bool) {
         if self.failed > 0 {
             let mode = crate::degraded::DegradedMode::UnwatchedDirectories {
@@ -450,12 +448,6 @@ impl WatchRegistration {
                     .clone()
                     .unwrap_or_else(|| "none reported".to_string()),
             };
-            eprintln!(
-                "[watch] warning: watching {} director(ies) under {}, but {}",
-                self.watched,
-                project_root.display(),
-                mode.message()
-            );
             crate::degraded::live::set(project_root, mode);
         } else if clears {
             crate::degraded::live::clear(project_root, crate::degraded::UNWATCHED_DIRECTORIES);
@@ -500,12 +492,10 @@ mod tests {
     fn partly_failed_registration_is_a_live_degraded_mode() {
         let root = tempfile::tempdir().unwrap();
         let partial = super::WatchRegistration {
-            watched: 7,
             failed: 2,
             first_error: Some("sub: permission denied".to_string()),
         };
         let clean = super::WatchRegistration {
-            watched: 9,
             failed: 0,
             first_error: None,
         };

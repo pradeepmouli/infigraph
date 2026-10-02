@@ -191,6 +191,41 @@ pub struct Notice {
     pub remedy: String,
 }
 
+impl Notice {
+    /// The notice on one line, remedy included: what the tool footers and
+    /// the process's own log print.
+    pub fn warning_line(&self) -> String {
+        if self.remedy.is_empty() {
+            format!("⚠ {}", self.message)
+        } else {
+            format!("⚠ {}; {}", self.message, self.remedy)
+        }
+    }
+}
+
+/// `notices` as a titled block, for output that reports on a project
+/// (`get_stats`). Says so when there are none: someone asked.
+pub fn render_section(notices: &[Notice]) -> String {
+    if notices.is_empty() {
+        return "Degraded modes: none".to_string();
+    }
+    let mut out = String::from("Degraded modes:");
+    for notice in notices {
+        out.push_str("\n  ");
+        out.push_str(&notice.warning_line());
+    }
+    out
+}
+
+/// What this process knows about itself whatever the project: today, that it
+/// embeds with the trigram fallback.
+pub fn process_notices() -> Vec<Notice> {
+    crate::embed::trigram_fallback_active()
+        .then(|| DegradedMode::TrigramEmbedder.notice())
+        .into_iter()
+        .collect()
+}
+
 /// Every degraded mode in effect for the project at `root`, as seen from this
 /// process. Empty for a project with no index, and in remote mode, where the
 /// sidecars this reads do not exist.
@@ -200,39 +235,118 @@ pub struct Notice {
 /// over the status socket. Asking the daemon takes no lease and starts none;
 /// with no daemon its part is simply absent.
 pub fn gather(root: &Path) -> Vec<Notice> {
-    let mut modes = Vec::new();
-    if crate::embed::trigram_fallback_active() {
-        modes.push(DegradedMode::TrigramEmbedder);
-    }
-    modes.extend(embedder_modes(root, crate::embed::process_embedder()));
-    modes.extend(derived_from_disk(root));
-    let mut local: Vec<Notice> = modes.iter().map(DegradedMode::notice).collect();
+    gather_with(root, DaemonView::Fresh)
+}
+
+/// [`gather`] for a caller on a hot path (the MCP footer runs after every
+/// tool call): the daemon's part is asked for at most once per
+/// [`DAEMON_VIEW_TTL`] and with a short deadline, so a busy or wedged daemon
+/// costs one bounded wait per period. Everything else is re-derived each
+/// time. `doctor` and `get_stats` use [`gather`]: someone asked.
+pub fn gather_cached(root: &Path) -> Vec<Notice> {
+    gather_with(root, DaemonView::Cached)
+}
+
+enum DaemonView {
+    Fresh,
+    Cached,
+}
+
+fn gather_with(root: &Path, daemon: DaemonView) -> Vec<Notice> {
+    let mut local = process_notices();
+    local.extend(
+        embedder_modes(root, crate::embed::process_embedder())
+            .iter()
+            .chain(&derived_from_disk(root))
+            .map(DegradedMode::notice),
+    );
     local = merge(local, live::for_root(root));
 
     // The daemon's own process already has its list in `live`.
     let from_daemon = if crate::daemon::lease::is_self_daemon(root) {
         None
     } else {
-        crate::daemon::control::query_status(root)
-            .ok()
-            .map(|report| report.degraded)
+        match daemon {
+            DaemonView::Fresh => fetch_daemon_view(root, crate::daemon::control::STATUS_DEADLINE),
+            DaemonView::Cached => cached_daemon_view(root, std::time::Instant::now(), || {
+                fetch_daemon_view(root, CACHED_VIEW_DEADLINE)
+            }),
+        }
     };
     merge_with_daemon(local, from_daemon)
 }
 
-/// `local` with the daemon's answer folded in. A daemon that answered knows
-/// the graph's generation, so its word on staleness is final either way: its
-/// notice replaces the local file-time guess, and its silence removes it.
-/// `None` is "no daemon answered", and the local list stands.
-pub fn merge_with_daemon(local: Vec<Notice>, from_daemon: Option<Vec<Notice>>) -> Vec<Notice> {
+/// What a daemon said about its own degraded modes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FromDaemon {
+    pub notices: Vec<Notice>,
+    /// The keys it has an informed answer for ([`live::judged`]).
+    pub judged: Vec<String>,
+}
+
+fn fetch_daemon_view(root: &Path, deadline: std::time::Duration) -> Option<FromDaemon> {
+    crate::daemon::control::query_status_within(root, deadline)
+        .ok()
+        .map(|report| FromDaemon {
+            notices: report.degraded,
+            judged: report.judged,
+        })
+}
+
+/// How long [`gather_cached`] reuses one answer (or one failure to answer)
+/// from the daemon.
+pub const DAEMON_VIEW_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long [`gather_cached`] waits for the daemon. A healthy daemon answers
+/// a status query in about a millisecond; one that has not answered by now
+/// is busy or wedged, and a tool call does not wait on it.
+const CACHED_VIEW_DEADLINE: std::time::Duration = std::time::Duration::from_millis(100);
+
+type CachedView = (std::time::Instant, Option<FromDaemon>);
+static DAEMON_VIEWS: std::sync::Mutex<std::collections::BTreeMap<std::path::PathBuf, CachedView>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// The daemon's view of `root` as of at most [`DAEMON_VIEW_TTL`] before
+/// `now`, calling `fetch` only when there is none that recent. `None` (no
+/// daemon answered) is cached like any answer.
+fn cached_daemon_view(
+    root: &Path,
+    now: std::time::Instant,
+    fetch: impl FnOnce() -> Option<FromDaemon>,
+) -> Option<FromDaemon> {
+    let key = crate::project::canonicalize_lenient(root);
+    let cached = DAEMON_VIEWS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&key)
+        .filter(|(at, _)| now.saturating_duration_since(*at) < DAEMON_VIEW_TTL)
+        .map(|(_, view)| view.clone());
+    if let Some(view) = cached {
+        return view;
+    }
+    // Fetched outside the lock: a slow daemon for one project must not hold
+    // up a tool call on another.
+    let view = fetch();
+    DAEMON_VIEWS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(key, (now, view.clone()));
+    view
+}
+
+/// `local` with the daemon's answer folded in by key. For a key the daemon
+/// has judged its word is final either way: its notice replaces the local
+/// one, and its silence removes it. A key it has not judged keeps the local
+/// notice. `None` is "no daemon answered", and the local list stands.
+pub fn merge_with_daemon(local: Vec<Notice>, from_daemon: Option<FromDaemon>) -> Vec<Notice> {
     let Some(from_daemon) = from_daemon else {
         return local;
     };
     let local = local
         .into_iter()
-        .filter(|n| n.key != EMBEDDINGS_STALE)
+        .filter(|n| !from_daemon.judged.contains(&n.key))
         .collect();
-    merge(local, from_daemon)
+    merge(local, from_daemon.notices)
 }
 
 /// `base` with `over` folded in by key: a notice in `over` replaces the one
@@ -255,11 +369,42 @@ pub fn merge(mut base: Vec<Notice>, over: Vec<Notice>) -> Vec<Notice> {
 /// there is no stale entry to trust.
 pub mod live {
     use super::{DegradedMode, Notice, EMBEDDINGS_STALE};
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
 
     static LIVE: Mutex<BTreeMap<(PathBuf, String), Notice>> = Mutex::new(BTreeMap::new());
+    /// (root, mode key) pairs this process has an informed answer for.
+    static JUDGED: Mutex<BTreeSet<(PathBuf, String)>> = Mutex::new(BTreeSet::new());
+
+    fn judged_lock() -> std::sync::MutexGuard<'static, BTreeSet<(PathBuf, String)>> {
+        JUDGED.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The mode keys this process has judged, for every root: for these, not
+    /// reporting the mode means it checked. Travels in
+    /// `StatusReport::judged`.
+    pub fn judged() -> Vec<String> {
+        judged_lock().iter().map(|(_, k)| k.clone()).collect()
+    }
+
+    pub fn judged_for(root: &Path) -> Vec<String> {
+        let root = key(root);
+        judged_lock()
+            .iter()
+            .filter(|(r, _)| *r == root)
+            .map(|(_, k)| k.clone())
+            .collect()
+    }
+
+    /// The graph's generation moved, so the last comparison with the
+    /// embeddings says nothing about now. Called by the store on every bump;
+    /// the next embedding attempt compares again. Until then this process
+    /// neither reports staleness nor claims to have ruled it out.
+    pub fn embeddings_generation_moved(root: &Path) {
+        judged_lock().remove(&(key(root), EMBEDDINGS_STALE.to_string()));
+        clear(root, EMBEDDINGS_STALE);
+    }
 
     fn key(root: &Path) -> PathBuf {
         crate::project::canonicalize_lenient(root)
@@ -270,8 +415,17 @@ pub mod live {
     }
 
     /// Record `mode` for `root`, replacing an earlier report of the same key.
+    ///
+    /// The first report of a key is also written to this process's stderr
+    /// (the daemon's is `.infigraph/daemon.log`), once per episode and in the
+    /// same words every other surface shows.
     pub fn set(root: &Path, mode: DegradedMode) {
-        lock().insert((key(root), mode.key().to_string()), mode.notice());
+        let notice = mode.notice();
+        let line = notice.warning_line();
+        let earlier = lock().insert((key(root), mode.key().to_string()), notice);
+        if earlier.is_none() {
+            eprintln!("[degraded] {}: {line}", root.display());
+        }
     }
 
     /// The mode with `mode_key` no longer holds for `root`.
@@ -309,17 +463,25 @@ pub mod live {
 
     /// Compare the generation `embeddings.bin` was built from with the graph's
     /// `current` one, and set or clear the staleness mode. Called by whoever
-    /// holds the graph, after it tried to update the embeddings. No marker
-    /// means it cannot be judged, which is not reported.
+    /// holds the graph, after it tried to update the embeddings. With no
+    /// marker, or a graph that has no generation yet, it cannot be judged:
+    /// nothing is reported and nothing is claimed.
     pub fn note_embeddings_generation(root: &Path, current: i64) {
         let sidecar = root.join(".infigraph").join("embeddings.bin");
-        match crate::embed::read_generation_marker(&sidecar) {
-            Some(recorded) if current > 0 && recorded < current => set(
+        let Some(recorded) = crate::embed::read_generation_marker(&sidecar).filter(|_| current > 0)
+        else {
+            embeddings_generation_moved(root);
+            return;
+        };
+        if recorded < current {
+            set(
                 root,
                 DegradedMode::EmbeddingsBehindGraph { recorded, current },
-            ),
-            _ => clear(root, EMBEDDINGS_STALE),
+            );
+        } else {
+            clear(root, EMBEDDINGS_STALE);
         }
+        judged_lock().insert((key(root), EMBEDDINGS_STALE.to_string()));
     }
 }
 
@@ -713,21 +875,101 @@ mod tests {
         assert_eq!(merged[0], from_daemon[0], "the daemon's wording wins");
     }
 
-    /// When a daemon answers and does not report staleness, the local
-    /// file-time guess is dropped: the daemon knows the generations.
+    /// A daemon that has compared the generations and reports no staleness
+    /// overrules the local file-time guess. One that has not compared them
+    /// (it just started, or the graph moved since) says nothing about it, and
+    /// its silence must not erase a true local notice.
     #[test]
-    fn a_daemon_that_answers_overrules_the_local_staleness_guess() {
+    fn a_daemon_overrules_the_local_staleness_guess_only_once_it_has_judged() {
         let local = vec![
             DegradedMode::EmbeddingsStale { minutes: 90 }.notice(),
             DegradedMode::HnswMissing.notice(),
         ];
-        let keys: Vec<String> = merge_with_daemon(local.clone(), Some(vec![]))
+        let judged = FromDaemon {
+            notices: vec![],
+            judged: vec![EMBEDDINGS_STALE.to_string()],
+        };
+        let keys: Vec<String> = merge_with_daemon(local.clone(), Some(judged))
             .into_iter()
             .map(|n| n.key)
             .collect();
         assert_eq!(keys, vec!["hnsw-missing"]);
+
+        let not_judged = FromDaemon {
+            notices: vec![],
+            judged: vec![],
+        };
+        assert_eq!(merge_with_daemon(local.clone(), Some(not_judged)), local);
         // No daemon: the local rule stands.
         assert_eq!(merge_with_daemon(local.clone(), None), local);
+    }
+
+    /// The process that holds the graph has judged staleness once it has
+    /// compared the marker with the graph's generation, and stops having
+    /// judged it the moment the generation moves again.
+    #[test]
+    fn a_generation_comparison_is_a_judgment_until_the_graph_moves() {
+        let p = Project::new();
+        p.embeddings(10);
+        let sidecar = p.root().join(".infigraph/embeddings.bin");
+        let judged = || live::judged_for(p.root()).contains(&EMBEDDINGS_STALE.to_string());
+        assert!(!judged(), "nothing compared yet");
+
+        // No marker: cannot judge.
+        live::note_embeddings_generation(p.root(), 7);
+        assert!(!judged());
+
+        crate::embed::write_generation_marker(&sidecar, 3).unwrap();
+        live::note_embeddings_generation(p.root(), 7);
+        assert!(judged());
+        assert_eq!(live::for_root(p.root()).len(), 1);
+
+        live::embeddings_generation_moved(p.root());
+        assert!(!judged(), "the graph moved: the comparison is out of date");
+        assert_eq!(live::for_root(p.root()), vec![]);
+    }
+
+    /// The footer's view of the daemon is fetched at most once per
+    /// time-to-live, whatever the answer was: a wedged daemon costs one
+    /// deadline per period, not one per tool call.
+    #[test]
+    fn the_cached_daemon_view_is_fetched_once_per_time_to_live() {
+        let root = tempfile::tempdir().unwrap();
+        let calls = std::cell::Cell::new(0u32);
+        let fetch = || {
+            calls.set(calls.get() + 1);
+            None
+        };
+        let t0 = std::time::Instant::now();
+        assert_eq!(cached_daemon_view(root.path(), t0, fetch), None);
+        assert_eq!(
+            cached_daemon_view(root.path(), t0 + DAEMON_VIEW_TTL / 2, fetch),
+            None
+        );
+        assert_eq!(calls.get(), 1, "a failed lookup is cached too");
+        cached_daemon_view(root.path(), t0 + DAEMON_VIEW_TTL, fetch);
+        assert_eq!(calls.get(), 2, "and refetched once the period is over");
+    }
+
+    /// One rendering for every surface: the footer and the daemon's log use
+    /// the line, `get_stats` the section.
+    #[test]
+    fn a_notice_renders_as_one_warning_line_and_a_section_lists_them() {
+        let missing = DegradedMode::EmbeddingsMissing.notice();
+        let line = missing.warning_line();
+        assert!(line.starts_with("⚠ embeddings.bin is missing"), "{line}");
+        assert!(
+            line.ends_with("run `infigraph index` to rebuild them"),
+            "{line}"
+        );
+        assert_eq!(line.lines().count(), 1);
+
+        assert_eq!(render_section(&[]), "Degraded modes: none");
+        let section = render_section(&[missing.clone(), DegradedMode::HnswMissing.notice()]);
+        let lines: Vec<&str> = section.lines().collect();
+        assert_eq!(lines[0], "Degraded modes:");
+        assert_eq!(lines.len(), 3, "{section}");
+        assert_eq!(lines[1].trim(), line);
     }
 
     /// A notice from a newer build, with a key this build has no variant for,

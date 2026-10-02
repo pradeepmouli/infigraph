@@ -1246,7 +1246,17 @@ impl GraphStore {
         conn: &Connection<'_>,
         _witness: &WriteLock,
     ) -> Result<i64> {
-        bump_ast_generation(conn)
+        let generation = bump_ast_generation(conn)?;
+        // #75: whatever was last concluded about the embeddings was about
+        // the generation before this one. Only for the project's own graph:
+        // a rebuild at `graph.rebuilding` counts from 1 in a file that is
+        // not live yet.
+        if self.db_path.file_name().is_some_and(|n| n == "graph") {
+            if let Some(root) = self.db_path.parent().and_then(Path::parent) {
+                crate::degraded::live::embeddings_generation_moved(root);
+            }
+        }
+        Ok(generation)
     }
 
     /// Stamp the graph's SCIP-enrichment generation
@@ -1447,18 +1457,6 @@ impl std::fmt::Display for GraphStats {
     }
 }
 
-fn count_query(conn: &Connection, query: &str) -> Result<u64> {
-    let mut result = conn
-        .query(query)
-        .map_err(|e| anyhow::anyhow!("query failed: {e}"))?;
-    if let Some(row) = result.next() {
-        if let Some(val) = row.first() {
-            return Ok(val.to_string().parse().unwrap_or(0));
-        }
-    }
-    Ok(0)
-}
-
 /// Implementation behind `bump_ast_generation_conn`: `ast_generation + 1`,
 /// creating the singleton row at 1 if it doesn't exist yet.
 ///
@@ -1543,11 +1541,7 @@ fn read_generation_field(store: &GraphStore, field: &'static str) -> Result<i64>
 /// `read_generation_field` on an already-open connection (the stamp path
 /// reads both counters on the write connection it is about to write with).
 fn read_generation_field_conn(conn: &Connection, field: &'static str) -> Result<i64> {
-    Ok(count_query(
-        conn,
-        &format!("MATCH (g:GraphMeta {{id: 'singleton'}}) RETURN g.{field}"),
-    )
-    .unwrap_or(0) as i64)
+    Ok(super::queries::GraphQuery::new(conn).generation(field))
 }
 
 #[cfg(test)]

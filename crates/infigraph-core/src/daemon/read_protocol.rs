@@ -148,6 +148,12 @@ pub struct StatusReport {
     /// daemon built before the field has none, which reads as empty.
     #[serde(default)]
     pub degraded: Vec<crate::degraded::Notice>,
+    /// The mode keys this daemon has an informed answer for, so that not
+    /// listing one in `degraded` means "checked, and fine" rather than "not
+    /// looked at yet" (#75). A client lets the daemon overrule its own guess
+    /// only for these.
+    #[serde(default)]
+    pub judged: Vec<String>,
 }
 
 impl std::fmt::Display for StatusReport {
@@ -482,6 +488,7 @@ mod tests {
         let report: StatusReport = serde_json::from_slice(old).unwrap();
         assert_eq!(report.pid, 1);
         assert!(report.degraded.is_empty());
+        assert!(report.judged.is_empty());
     }
 
     #[test]
@@ -501,6 +508,7 @@ mod tests {
                 message: "m".into(),
                 remedy: "r".into(),
             }],
+            judged: vec!["some-future-mode".into()],
         };
         let mut buf = Vec::new();
         write_reply(&mut buf, &OpReply::Ok(report.clone())).unwrap();
@@ -521,6 +529,7 @@ mod tests {
             code: RoleState::Running,
             docs: RoleState::NotOwned,
             degraded: Vec::new(),
+            judged: Vec::new(),
         };
         let mut buf = Vec::new();
         write_reply(&mut buf, &OpReply::Ok(report.clone())).unwrap();
