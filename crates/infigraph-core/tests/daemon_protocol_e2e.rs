@@ -58,6 +58,7 @@ fn client_and_server_interoperate_end_to_end() {
         WriteOpts {
             timeout: Duration::from_secs(30),
             cancel: None,
+            on_slot_wait: None,
         },
     )
     .unwrap();

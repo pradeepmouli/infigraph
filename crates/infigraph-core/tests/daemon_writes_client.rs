@@ -17,6 +17,7 @@ fn opts(timeout: Duration) -> WriteOpts<'static> {
     WriteOpts {
         timeout,
         cancel: None,
+        on_slot_wait: None,
     }
 }
 
@@ -78,6 +79,7 @@ fn a_cancelled_write_returns_promptly_and_its_waiter_goes() {
                 WriteOpts {
                     timeout: Duration::from_secs(30),
                     cancel: Some(&token),
+                    on_slot_wait: None,
                 },
             )
         })

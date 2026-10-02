@@ -48,7 +48,6 @@ pub mod resolve;
 pub mod review;
 pub mod routes;
 pub mod scip;
-pub mod scip_slots;
 pub mod scip_switch;
 pub mod scratch;
 pub mod search;
@@ -56,6 +55,7 @@ pub mod security;
 pub mod sequence;
 pub mod settings;
 pub mod settings_file;
+pub mod slots;
 pub mod snapshot;
 pub mod structured;
 pub mod taint;
@@ -835,6 +835,7 @@ impl Infigraph {
         let opts = crate::daemon::writes::WriteOpts {
             timeout,
             cancel: None,
+            on_slot_wait: None,
         };
         match crate::daemon::writes::submit(&self.root, &request, opts)? {
             crate::daemon_protocol::WriteResult::Ok {

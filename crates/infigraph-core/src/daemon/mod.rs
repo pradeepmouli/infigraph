@@ -11,6 +11,7 @@ pub mod read_endpoint;
 pub mod read_guard;
 pub mod read_protocol;
 pub mod read_service;
+pub mod reindex_gate;
 pub mod task;
 pub mod writes;
 
@@ -957,6 +958,7 @@ where
     // exists at that path -- see `path_is_gone`.
     let root_identity = path_identity(root);
     let mut self_watch = crate::watchdog::SelfWatch::new("watch");
+    let mut reindex_gate = reindex_gate::ReindexGate::machine();
     let mut restart_for: Option<String> = None;
 
     let idle_grace = Duration::from_secs(idle.grace_secs);
@@ -1254,7 +1256,11 @@ where
             .as_ref()
             .is_some_and(|f| f.task.is_finished())
         {
-            let PendingFullReindex { task, replies } = full_reindex_in_flight
+            let PendingFullReindex {
+                task,
+                replies,
+                _slot: reindex_slot,
+            } = full_reindex_in_flight
                 .take()
                 .expect("checked is_some just above");
             let (guard, scheduled_languages) = finish_full_reindex(
@@ -1265,6 +1271,8 @@ where
                 drain_rt.block_on(task.join()),
             );
             drop(guard);
+            // The swap is done: another daemon may rebuild now.
+            drop(reindex_slot);
 
             if let Some(languages) = scheduled_languages {
                 // The swapped-in graph has fresh counters, so the staleness
@@ -1544,6 +1552,8 @@ where
             // waiting a full COORDINATOR_TICK.
             match crate::recovery::recovery_rebuild_wanted(&infigraph_dir) {
                 Ok(true) => {
+                    // A faulted graph is unusable until rebuilt: no slot wait.
+                    reindex_gate.recovery_is_pending();
                     request_internal_rebuild(&mut deferred, full_reindex_in_flight.is_some())
                 }
                 Ok(false) => {}
@@ -1670,6 +1680,7 @@ where
                     scip_import_in_flight.is_some(),
                     docs_control.as_ref(),
                     docs_index_in_flight.is_some(),
+                    &mut reindex_gate,
                 ) {
                     Routed::Done => {}
                     Routed::Started(PendingWork::FullReindex(p)) => {
@@ -1683,6 +1694,14 @@ where
                     Routed::Started(PendingWork::DocsIndex(p)) => docs_index_in_flight = Some(p),
                     Routed::NotYet(request, reply) => deferred.push_back((request, reply)),
                 }
+            }
+            // A rebuild that was waiting for a slot and whose request is
+            // gone (its client left) is no longer waiting.
+            if !deferred
+                .iter()
+                .any(|(r, _)| *r == WriteRequest::FullReindex)
+            {
+                reindex_gate.stopped_waiting(root);
             }
         } else if crate::recovery::pending_recovery(&infigraph_dir) {
             // A pending sentinel asks for a full reindex, and only the
@@ -2339,6 +2358,9 @@ struct PendingFullReindex {
     /// Every client owed this rebuild's result: the request that started it,
     /// then each `FullReindex` that arrived while it ran (#164).
     replies: Vec<WriteReply>,
+    /// This rebuild's machine-wide slot (#150), when the cap applies. Held
+    /// here, on the coordinator, until the rebuild has been swapped in.
+    _slot: Option<crate::slots::Slot>,
 }
 
 impl PendingFullReindex {
@@ -2503,6 +2525,7 @@ fn try_start_full_reindex<MR>(
     drain_in_flight: bool,
     drain_rt: &tokio::runtime::Runtime,
     daemon_token: &CancellationToken,
+    gate: &mut reindex_gate::ReindexGate,
 ) -> std::result::Result<Option<PendingFullReindex>, WriteReply>
 where
     MR: Fn() -> Result<crate::lang::LanguageRegistry>,
@@ -2527,6 +2550,15 @@ where
     if drain_in_flight {
         return Err(reply);
     }
+
+    // #150: at most `[index] max_concurrent_reindexes` daemons rebuild at
+    // once on this machine. Asked before any lock is taken, so waiting holds
+    // nothing: the request goes back to `deferred` and the graph keeps being
+    // served. Every early return below drops the slot again.
+    let slot = match gate.admit(root, std::time::Instant::now()) {
+        reindex_gate::Admission::Go(slot) => slot,
+        reindex_gate::Admission::Wait => return Err(reply),
+    };
 
     let guard = match begin_index_op(
         root,
@@ -2588,6 +2620,7 @@ where
     Ok(Some(PendingFullReindex {
         task,
         replies: vec![reply],
+        _slot: slot,
     }))
 }
 
@@ -3371,6 +3404,7 @@ fn route_write<MR>(
     scip_import_in_flight: bool,
     docs: Option<&Arc<dyn DocsHandle>>,
     docs_index_in_flight: bool,
+    reindex_gate: &mut reindex_gate::ReindexGate,
 ) -> Routed
 where
     MR: Fn() -> Result<crate::lang::LanguageRegistry>,
@@ -3504,6 +3538,7 @@ where
                 drain_in_flight,
                 drain_rt,
                 daemon_token,
+                reindex_gate,
             ) {
                 Ok(Some(p)) => Routed::Started(PendingWork::FullReindex(p)),
                 Ok(None) => Routed::Done,
@@ -3823,6 +3858,7 @@ mod tests {
         full_reindex: Option<PendingFullReindex>,
         docs: Option<Arc<dyn DocsHandle>>,
         docs_index: Option<PendingDocsIndex>,
+        gate: reindex_gate::ReindexGate,
     }
 
     impl Router {
@@ -3841,6 +3877,7 @@ mod tests {
                 full_reindex: None,
                 docs: None,
                 docs_index: None,
+                gate: reindex_gate::ReindexGate::with(None),
             }
         }
 
@@ -3869,6 +3906,7 @@ mod tests {
                 false,
                 self.docs.as_ref(),
                 self.docs_index.is_some(),
+                &mut self.gate,
             );
             match routed {
                 Routed::Started(PendingWork::FullReindex(p)) => {
@@ -3891,6 +3929,54 @@ mod tests {
             let (reply, rx) = WriteReply::channel();
             (self.route(request, reply), rx)
         }
+    }
+
+    /// #150: with every machine-wide reindex slot taken, a `FullReindex` is
+    /// not started and not refused: it goes back to the deferred queue,
+    /// having taken no lock, and starts once a slot is free. The slot is
+    /// then held for as long as the rebuild is in flight.
+    #[test]
+    fn a_full_reindex_waits_for_a_slot_without_taking_a_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".infigraph")).unwrap();
+        let slots = tempfile::tempdir().unwrap();
+        let pool = crate::slots::SlotPool::new(slots.path().join("slots"), 1);
+        let another_daemon = pool.try_claim().unwrap().unwrap();
+
+        let mut router = Router::new(root);
+        router.gate = reindex_gate::ReindexGate::with(Some(pool.clone()));
+
+        let (routed, _rx) = router.route_new(WriteRequest::FullReindex);
+        assert!(
+            matches!(routed, Routed::NotYet(WriteRequest::FullReindex, _)),
+            "a rebuild with no slot free must wait in the deferred queue"
+        );
+        assert!(router.full_reindex.is_none());
+        // Nothing was locked while it waits: the index operation is free.
+        assert!(
+            matches!(
+                begin_index_op(root, "test", Duration::ZERO),
+                Ok(IndexOpOutcome::Acquired(_))
+            ),
+            "waiting for a slot took index.lock"
+        );
+
+        drop(another_daemon);
+        let (routed, _rx) = router.route_new(WriteRequest::FullReindex);
+        assert!(matches!(routed, Routed::Done), "it did not start");
+        assert!(router.full_reindex.is_some());
+        assert!(
+            pool.try_claim().unwrap().is_none(),
+            "the running rebuild does not hold the slot"
+        );
+
+        // Reaped: the slot goes back with the pending rebuild.
+        let pending = router.full_reindex.take().unwrap();
+        let _ = router.drain_rt.block_on(pending.task.join());
+        drop(pending.replies);
+        drop(pending._slot);
+        assert!(pool.try_claim().unwrap().is_some());
     }
 
     /// #166: a store `clear` released must not be reopened over while

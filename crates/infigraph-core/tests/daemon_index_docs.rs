@@ -41,6 +41,7 @@ fn opts() -> WriteOpts<'static> {
     WriteOpts {
         timeout: Duration::from_secs(120),
         cancel: None,
+        on_slot_wait: None,
     }
 }
 

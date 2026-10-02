@@ -1224,6 +1224,7 @@ fn submit_in_background(
             infigraph_core::daemon::writes::WriteOpts {
                 timeout: std::time::Duration::from_secs(180),
                 cancel: None,
+                on_slot_wait: None,
             },
         )
     })

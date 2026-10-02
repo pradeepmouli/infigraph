@@ -894,3 +894,34 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod shared_index_table_tests {
+    use crate::settings_file::test_support::{PinnedHome, ENV_LOCK};
+
+    /// `[index]` holds this module's project-scoped `include` and the
+    /// user-scoped reindex cap (`crate::slots`), declared as two settings
+    /// groups. Each must resolve with the other's key in the same table.
+    #[test]
+    fn the_include_list_and_the_reindex_cap_share_the_index_table() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _home = PinnedHome::empty();
+        std::env::remove_var(crate::slots::max_concurrent_reindexes_env_name());
+        let dir = std::path::Path::new(&std::env::var("HOME").unwrap()).join(".infigraph");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.toml"),
+            "[index]\ninclude = [\"/somewhere/else\"]\nmax_concurrent_reindexes = 1\n",
+        )
+        .unwrap();
+
+        assert_eq!(crate::slots::SlotPool::full_reindexes().unwrap().max(), 1);
+        let project = tempfile::tempdir().unwrap();
+        let includes = super::configured_includes(project.path());
+        assert!(
+            includes.iter().any(|(entry, _)| entry == "/somewhere/else"),
+            "the include list stopped resolving beside the cap ({} entries)",
+            includes.len()
+        );
+    }
+}
