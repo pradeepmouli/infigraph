@@ -260,7 +260,12 @@ fn a_worker_that_is_not_a_group_leader_exits_and_signals_nobody_else() {
     let mut leader = std::process::Command::new("sh");
     leader
         .arg("-c")
-        .arg("\"$0\" --worker --mcp <&0 & sleep 600 & echo $! > \"$1\"; wait")
+        // Stdin is saved on fd 3 first: a shell that backgrounds a command
+        // with job control off points that command's fd 0 at /dev/null
+        // *before* its own redirections run (dash, Ubuntu's /bin/sh), so a
+        // plain `<&0` hands the worker /dev/null, whose EOF ends it at once.
+        // bash keeps fd 0 there, which is the only reason this ever passed.
+        .arg("exec 3<&0; \"$0\" --worker --mcp <&3 & sleep 600 & echo $! > \"$1\"; wait")
         .arg(&worker_prog)
         .arg(scratch.join("bystander.pid"))
         .current_dir(scratch)

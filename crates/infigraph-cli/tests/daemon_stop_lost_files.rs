@@ -62,10 +62,15 @@ fn start_daemon_then_lose_its_files() -> (tempfile::TempDir, KillOnDrop) {
         "daemon never acquired watch.lock"
     );
 
-    let socket = infigraph_core::daemon::read_endpoint::ReadEndpoint::for_root(root)
-        .socket_path()
-        .expect("a running daemon has a socket file");
-    std::fs::remove_file(&socket).unwrap();
+    // Where the endpoint is a file (macOS: under /tmp), lose it too. On Linux
+    // the socket lives in the abstract namespace and there is no file to
+    // lose (`ReadEndpoint::socket_path` is `None` by design), so only the
+    // lock goes -- the daemon is still alive and unreachable by file.
+    if let Some(socket) =
+        infigraph_core::daemon::read_endpoint::ReadEndpoint::for_root(root).socket_path()
+    {
+        std::fs::remove_file(&socket).unwrap();
+    }
     std::fs::remove_file(&lock).unwrap();
     (dir, daemon)
 }
