@@ -285,6 +285,7 @@ mod tests {
             false,
             &drain_rt,
             &daemon_token,
+            &mut crate::daemon::reindex_gate::ReindexGate::with(None),
         ) {
             let registry = std::sync::Arc::new(make_registry().unwrap());
             let (guard, _) = crate::daemon::finish_full_reindex(

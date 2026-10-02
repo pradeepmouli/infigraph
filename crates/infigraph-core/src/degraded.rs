@@ -22,6 +22,7 @@ pub const EMBEDDINGS_STALE: &str = "embeddings-stale";
 pub const UNWATCHED_DIRECTORIES: &str = "unwatched-directories";
 pub const DOC_READS_UNAVAILABLE: &str = "doc-reads-unavailable";
 pub const GRAPH_REOPEN_BACKOFF: &str = "graph-reopen-backoff";
+pub const REINDEX_WAITING_FOR_SLOT: &str = "reindex-waiting-for-slot";
 
 /// One way infigraph is running degraded.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,6 +55,10 @@ pub enum DegradedMode {
     DocReadsUnavailable { reason: String },
     /// The daemon cannot reopen the graph and is backing off; writes wait.
     GraphReopenBackoff { failures: u32, retry_secs: u64 },
+    /// A full reindex is due but as many daemons as the machine allows are
+    /// already running one, so this daemon waits its turn (#150). The graph
+    /// stays readable and as it was.
+    ReindexWaitingForSlot { limit: usize },
     /// The project is past the HNSW threshold but the index (or its `.meta`)
     /// is absent, so vector search is a linear scan.
     HnswMissing,
@@ -78,6 +83,7 @@ impl DegradedMode {
             DegradedMode::UnwatchedDirectories { .. } => UNWATCHED_DIRECTORIES,
             DegradedMode::DocReadsUnavailable { .. } => DOC_READS_UNAVAILABLE,
             DegradedMode::GraphReopenBackoff { .. } => GRAPH_REOPEN_BACKOFF,
+            DegradedMode::ReindexWaitingForSlot { .. } => REINDEX_WAITING_FOR_SLOT,
             DegradedMode::HnswMissing => "hnsw-missing",
             DegradedMode::DocEmbeddingsMissing => "doc-embeddings-missing",
         }
@@ -130,6 +136,10 @@ impl DegradedMode {
                 "the daemon cannot reopen the graph ({failures} consecutive failures, next \
                  attempt in {retry_secs}s): writes are waiting"
             ),
+            DegradedMode::ReindexWaitingForSlot { limit } => format!(
+                "a full reindex is waiting for a machine-wide slot ({limit} may run at once): \
+                 the graph is served as it was until the reindex runs"
+            ),
             DegradedMode::HnswMissing => {
                 "HNSW index missing — vector search is on a linear scan this project has \
                  outgrown"
@@ -166,6 +176,10 @@ impl DegradedMode {
             }
             DegradedMode::GraphReopenBackoff { .. } => {
                 "see .infigraph/daemon.log for the holder; `infigraph doctor` names it"
+            }
+            DegradedMode::ReindexWaitingForSlot { .. } => {
+                "it starts when another project's reindex ends, or after 10 minutes; \
+                 `[index] max_concurrent_reindexes` in ~/.infigraph/config.toml sets the cap"
             }
             DegradedMode::DocEmbeddingsMissing => "run `infigraph index-docs` to rebuild them",
         }
@@ -713,6 +727,7 @@ mod tests {
                 failures: 3,
                 retry_secs: 20,
             },
+            DegradedMode::ReindexWaitingForSlot { limit: 2 },
             DegradedMode::EmbeddingsMissing,
             DegradedMode::EmbeddingsStale { minutes: 90 },
             DegradedMode::HnswMissing,
