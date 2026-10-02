@@ -1991,6 +1991,7 @@ impl IndexerRun<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use infigraph_core::child::STDERR_TAIL_BYTES;
     use std::fs;
     use tempfile::TempDir;
@@ -2515,6 +2516,7 @@ mod tests {
 
     /// `printf` escapes for a SCIP index with one document, which is what a
     /// fake indexer must write now that an output with none is refused (#73).
+    #[cfg(unix)]
     const ONE_DOCUMENT_INDEX_PRINTF: &str = "\\012\\000\\022\\003\\012\\001a";
 
     /// A fake `scip-java`: the gradle attempt hangs, the maven attempt
