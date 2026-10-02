@@ -249,3 +249,37 @@ pub struct FileExtraction {
     pub relations: Vec<Relation>,
     pub statements: Vec<Statement>,
 }
+
+impl FileExtraction {
+    /// Drop everything cross-file resolution does not read, in place (#150).
+    ///
+    /// A full reindex holds every extraction from the parse to the end of
+    /// resolution; on a large project that is most of a gigabyte, and after
+    /// the graph write most of it is never looked at again. Call this once
+    /// the extraction has been written to the graph.
+    ///
+    /// This is the one list of what `crate::resolve` reads from an
+    /// extraction. It keeps:
+    ///
+    /// - `file`
+    /// - of each symbol: `id`, `name`, `kind`, `span`
+    /// - of each relation: everything (`source_id`, `target_id`, `kind`,
+    ///   `receiver`, and the small `span`)
+    ///
+    /// and clears the statements and every other symbol field. A resolver
+    /// that starts reading another field must stop clearing it here;
+    /// `tests/resolution_trim.rs` fails when an edge depends on a cleared one.
+    pub fn reduce_to_resolution_inputs(&mut self) {
+        self.statements = Vec::new();
+        for symbol in &mut self.symbols {
+            symbol.signature_hash = String::new();
+            symbol.parent = None;
+            symbol.language = String::new();
+            symbol.visibility = None;
+            symbol.docstring = None;
+            symbol.parameters = None;
+            symbol.return_type = None;
+            symbol.scip_id = None;
+        }
+    }
+}
