@@ -174,6 +174,9 @@ pub(crate) fn cmd_index(root: &Path, full: bool, no_embed: bool) -> Result<()> {
                 infigraph_core::daemon::writes::WriteOpts {
                     timeout: std::time::Duration::from_secs(600),
                     cancel: None,
+                    // #150: the daemon may wait for a machine-wide slot
+                    // before it starts; that wait is not the rebuild.
+                    on_slot_wait: Some(&|notice| eprintln!("{}", notice.warning_line())),
                 },
             )?;
             match result {

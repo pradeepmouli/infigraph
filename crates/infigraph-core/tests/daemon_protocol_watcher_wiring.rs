@@ -59,6 +59,7 @@ fn watch_loop_serves_write_requests_when_serve_requests_is_true() {
         WriteOpts {
             timeout: Duration::from_secs(30),
             cancel: None,
+            on_slot_wait: None,
         },
     )
     .unwrap();
@@ -105,6 +106,7 @@ fn watch_loop_does_not_serve_requests_when_serve_requests_is_false() {
         WriteOpts {
             timeout: Duration::from_millis(500),
             cancel: None,
+            on_slot_wait: None,
         },
     );
     // Nothing binds the endpoint: an in-process watcher is not a daemon.

@@ -835,6 +835,7 @@ impl Infigraph {
         let opts = crate::daemon::writes::WriteOpts {
             timeout,
             cancel: None,
+            on_slot_wait: None,
         };
         match crate::daemon::writes::submit(&self.root, &request, opts)? {
             crate::daemon_protocol::WriteResult::Ok {

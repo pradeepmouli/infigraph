@@ -73,6 +73,7 @@ pub fn request_index_docs(root: &Path, full: bool) -> Result<DocIndexStats> {
         infigraph_core::daemon::writes::WriteOpts {
             timeout: docs_switch::DOCS_OP_WAIT,
             cancel: None,
+            on_slot_wait: None,
         },
     )?;
     match result {

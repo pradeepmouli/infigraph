@@ -164,6 +164,7 @@ fn daemon_survives_watch_control_stop_and_keeps_serving_writes() {
         WriteOpts {
             timeout: REPLY_TIMEOUT,
             cancel: None,
+            on_slot_wait: None,
         },
     )
     .expect("daemon stopped serving writes after a code-watch stop");
