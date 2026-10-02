@@ -131,3 +131,114 @@ fn tools_that_list_degraded_modes_themselves_get_none_in_the_footer() {
         assert!(sig.degraded.is_empty(), "{tool}: {:?}", sig.degraded);
     }
 }
+
+fn shown(
+    state: &HealthState,
+    root: &std::path::Path,
+    modes: &[DegradedMode],
+    now: std::time::Instant,
+) -> Vec<String> {
+    state
+        .degraded_due(
+            Some(root),
+            modes.iter().map(DegradedMode::notice).collect(),
+            now,
+        )
+        .into_iter()
+        .map(|n| n.key)
+        .collect()
+}
+
+/// A lasting degraded mode is shown once, then at most once per
+/// `FOOTER_REPEAT_AFTER`: repeating it under every tool call costs tokens
+/// and tells the reader nothing new.
+#[test]
+fn a_lasting_mode_is_shown_once_then_only_after_the_repeat_period() {
+    use infigraph_mcp::health::FOOTER_REPEAT_AFTER;
+    let state = HealthState::new();
+    let root = std::path::Path::new("/project/a");
+    let missing = [DegradedMode::EmbeddingsMissing];
+    let key = DegradedMode::EmbeddingsMissing.key();
+    let t0 = std::time::Instant::now();
+
+    assert_eq!(shown(&state, root, &missing, t0), vec![key]);
+    assert!(shown(&state, root, &missing, t0 + FOOTER_REPEAT_AFTER / 2).is_empty());
+    assert_eq!(
+        shown(&state, root, &missing, t0 + FOOTER_REPEAT_AFTER),
+        vec![key]
+    );
+    // Shown again, so the period starts again.
+    assert!(shown(&state, root, &missing, t0 + FOOTER_REPEAT_AFTER * 3 / 2).is_empty());
+}
+
+#[test]
+fn a_mode_that_appears_while_another_is_quiet_is_shown_alone() {
+    let state = HealthState::new();
+    let root = std::path::Path::new("/project/a");
+    let t0 = std::time::Instant::now();
+    shown(&state, root, &[DegradedMode::EmbeddingsMissing], t0);
+
+    let both = [DegradedMode::EmbeddingsMissing, DegradedMode::HnswMissing];
+    let later = t0 + std::time::Duration::from_secs(1);
+    assert_eq!(
+        shown(&state, root, &both, later),
+        vec![DegradedMode::HnswMissing.key()]
+    );
+}
+
+/// The key decides, not the wording: a count that moved is the same mode.
+#[test]
+fn a_changed_message_under_the_same_key_stays_quiet() {
+    let state = HealthState::new();
+    let root = std::path::Path::new("/project/a");
+    let unwatched = |failed| DegradedMode::UnwatchedDirectories {
+        failed,
+        first: "x: denied".to_string(),
+    };
+    let t0 = std::time::Instant::now();
+    assert_eq!(shown(&state, root, &[unwatched(2)], t0).len(), 1);
+    assert!(shown(&state, root, &[unwatched(5)], t0).is_empty());
+}
+
+/// A mode that cleared and came back is news, whatever the clock says.
+#[test]
+fn a_mode_that_cleared_and_returned_is_shown_at_once() {
+    let state = HealthState::new();
+    let root = std::path::Path::new("/project/a");
+    let missing = [DegradedMode::EmbeddingsMissing];
+    let t0 = std::time::Instant::now();
+    shown(&state, root, &missing, t0);
+    assert!(shown(&state, root, &[], t0).is_empty());
+    assert_eq!(shown(&state, root, &missing, t0).len(), 1);
+}
+
+#[test]
+fn each_project_is_throttled_on_its_own() {
+    let state = HealthState::new();
+    let missing = [DegradedMode::EmbeddingsMissing];
+    let t0 = std::time::Instant::now();
+    shown(&state, std::path::Path::new("/project/a"), &missing, t0);
+    assert_eq!(
+        shown(&state, std::path::Path::new("/project/b"), &missing, t0).len(),
+        1
+    );
+    // Another project's call did not make `a` forget what it had shown.
+    assert!(shown(&state, std::path::Path::new("/project/a"), &missing, t0).is_empty());
+}
+
+/// Through the real entry point: the second tool call on a project that is
+/// still degraded carries no repeat of the line.
+#[test]
+fn the_second_tool_call_does_not_repeat_a_projects_degraded_mode() {
+    let state = HealthState::new();
+    state.mark_initialized();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join(".infigraph")).unwrap();
+    std::fs::write(dir.path().join(".infigraph/graph"), b"graph").unwrap();
+    let key = DegradedMode::EmbeddingsMissing.key();
+
+    assert!(keys(&gather_signals(&state, "search", Some(dir.path()))).contains(&key));
+    // A tool that lists the modes itself neither shows nor resets anything.
+    gather_signals(&state, "get_stats", Some(dir.path()));
+    assert!(!keys(&gather_signals(&state, "search", Some(dir.path()))).contains(&key));
+}
