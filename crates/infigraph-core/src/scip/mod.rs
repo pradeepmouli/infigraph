@@ -413,6 +413,31 @@ pub fn import_scip_index_enriched_at(
     project_root: Option<&Path>,
     enriched_ast_generation: Option<i64>,
 ) -> Result<ImportStats> {
+    with_import_losses(|| {
+        import_scip_index_unrecorded(index_path, store, project_root, enriched_ast_generation)
+    })
+}
+
+/// Run `import` as a `scip` run and put what it noted onto its stats, so
+/// the losses reach the party that writes the `scip` last-run record even
+/// when the import ran in another process (the daemon's coordinator).
+fn with_import_losses(import: impl FnOnce() -> Result<ImportStats>) -> Result<ImportStats> {
+    let run = crate::last_run::begin(crate::last_run::Kind::Scip);
+    let result = import();
+    let tally = run.end();
+    result.map(|mut stats| {
+        stats.losses = tally.losses;
+        stats.overlapped = tally.overlapped;
+        stats
+    })
+}
+
+fn import_scip_index_unrecorded(
+    index_path: &Path,
+    store: &GraphStore,
+    project_root: Option<&Path>,
+    enriched_ast_generation: Option<i64>,
+) -> Result<ImportStats> {
     let bytes = std::fs::read(index_path)
         .with_context(|| format!("failed to read {}", index_path.display()))?;
 
@@ -1333,6 +1358,10 @@ pub struct ImportStats {
     /// `scip` last-run record (#209). Empty for a clean import.
     #[serde(default)]
     pub losses: Vec<crate::last_run::Loss>,
+    /// Another run was active in the importing process, so `losses` may
+    /// include its own.
+    #[serde(default)]
+    pub overlapped: bool,
 }
 
 impl ImportStats {
@@ -1450,6 +1479,42 @@ pub fn scratch_indexer_label(scip_path: &Path) -> Option<&str> {
 pub fn scratch_file_indexer(scip_path: &Path) -> Option<&str> {
     let (binary, _run_id) = scip_path.file_stem()?.to_str()?.rsplit_once('.')?;
     Some(binary)
+}
+
+#[cfg(test)]
+mod import_losses_tests {
+    use super::{with_import_losses, ImportStats};
+
+    /// #209 item 11: what an import loses on its way (edges a COPY drops)
+    /// is noted where it happens, and has to reach whoever writes the `scip`
+    /// record -- the daemon's callback, which sees only the stats.
+    #[test]
+    fn losses_noted_during_an_import_ride_on_its_stats() {
+        let stats = with_import_losses(|| {
+            crate::last_run::note("REFERENCES edges dropped: missing endpoint", 4, "no node");
+            Ok(ImportStats::default())
+        })
+        .unwrap();
+
+        assert_eq!(stats.losses.len(), 1, "{stats:?}");
+        assert_eq!(stats.losses[0].count, 4);
+        assert!(!stats.overlapped);
+    }
+
+    #[test]
+    fn a_clean_import_has_no_losses() {
+        let stats = with_import_losses(|| Ok(ImportStats::default())).unwrap();
+        assert!(stats.losses.is_empty());
+    }
+
+    #[test]
+    fn a_failed_import_is_still_an_error_and_closes_its_run() {
+        let failed = with_import_losses(|| anyhow::bail!("refused"));
+        assert!(failed.is_err());
+        // The run closed with it: a later one is not flagged as overlapping.
+        let next = with_import_losses(|| Ok(ImportStats::default())).unwrap();
+        assert!(!next.overlapped);
+    }
 }
 
 #[cfg(test)]

@@ -1205,6 +1205,44 @@ fn check_one_project_degraded(project_path: &Path) -> Vec<CheckResult> {
     warnings
 }
 
+const LAST_RUNS_CATEGORY: &str = "last runs";
+
+/// One warning per kind of run whose last problem has not been repaired
+/// (#209): edges a COPY dropped, call resolution that failed, an embedding
+/// update that failed, an indexer's output that was refused. These are events,
+/// not states, so they are not degraded modes (#75); the record is what
+/// `index`, the daemon and the detached `scip-enrich` wrote when they ended.
+fn check_one_project_last_runs(project_path: &Path) -> Vec<CheckResult> {
+    use crate::last_run;
+    let now = last_run::now_secs();
+    let warnings: Vec<CheckResult> = last_run::problems(&project_path.join(".infigraph"))
+        .into_iter()
+        .map(|(kind, run)| {
+            CheckResult::warn(
+                LAST_RUNS_CATEGORY,
+                format!("{}: {}", project_path.display(), kind.name()),
+                last_run::problem_line(kind, &run, now),
+                kind.remedy(),
+            )
+        })
+        .collect();
+    if warnings.is_empty() {
+        return vec![CheckResult::pass(
+            LAST_RUNS_CATEGORY,
+            project_path.display().to_string(),
+            "no run lost or refused anything",
+        )];
+    }
+    warnings
+}
+
+pub fn check_last_runs(ctx: &DoctorContext) -> Vec<CheckResult> {
+    projects_in_scope(ctx)
+        .iter()
+        .flat_map(|p| check_one_project_last_runs(p))
+        .collect()
+}
+
 pub fn check_degraded(ctx: &DoctorContext) -> Vec<CheckResult> {
     projects_in_scope(ctx)
         .iter()
@@ -1733,6 +1771,7 @@ pub fn run_doctor(ctx: DoctorContext) -> DoctorReport {
     checks.extend(check_disk(&ctx));
     checks.extend(check_sidecars(&ctx));
     checks.extend(check_degraded(&ctx));
+    checks.extend(check_last_runs(&ctx));
     checks.extend(check_docs(&ctx));
     checks.extend(check_scip_staleness(&ctx));
     checks.extend(check_worktrees(&ctx));
@@ -2101,6 +2140,71 @@ mod docs_check_tests {
         let r = check(Some(false), true);
         assert_eq!(r.status, CheckStatus::Warn, "{}", r.message);
         assert!(r.remediation.unwrap().contains("clean-docs"));
+    }
+}
+
+#[cfg(test)]
+mod last_run_check_tests {
+    use super::*;
+    use crate::last_run::{self, Kind, RunRecord, Tally};
+
+    fn project() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".infigraph")).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_project_with_no_records_passes_once() {
+        let dir = project();
+        let results = check_one_project_last_runs(dir.path());
+        assert_eq!(results.len(), 1, "{results:?}");
+        assert_eq!(results[0].status, CheckStatus::Pass);
+        assert_eq!(results[0].category, LAST_RUNS_CATEGORY);
+    }
+
+    #[test]
+    fn a_clean_last_run_passes() {
+        let dir = project();
+        last_run::record(
+            &dir.path().join(".infigraph"),
+            Kind::Index,
+            RunRecord::new(true, "indexed 2 file(s)", Tally::default()),
+        );
+        let results = check_one_project_last_runs(dir.path());
+        assert!(
+            results.iter().all(|r| r.status == CheckStatus::Pass),
+            "{results:?}"
+        );
+    }
+
+    #[test]
+    fn a_problem_is_a_warning_naming_the_kind_with_its_remedy() {
+        let dir = project();
+        let mut lost = Tally::default();
+        lost.note(
+            "scip-python produced no usable output",
+            1,
+            "produced an index with no documents",
+        );
+        last_run::record(
+            &dir.path().join(".infigraph"),
+            Kind::Scip,
+            RunRecord::new(false, "enrichment incomplete", lost),
+        );
+
+        let results = check_one_project_last_runs(dir.path());
+
+        let warning = results
+            .iter()
+            .find(|r| r.status == CheckStatus::Warn)
+            .unwrap_or_else(|| panic!("no warning: {results:?}"));
+        assert_eq!(warning.category, LAST_RUNS_CATEGORY);
+        assert!(warning.name.ends_with("scip"), "{warning:?}");
+        for part in ["SCIP enrichment", "no documents", "scip-python"] {
+            assert!(warning.message.contains(part), "{part:?} in {warning:?}");
+        }
+        assert_eq!(warning.remediation.as_deref(), Some(Kind::Scip.remedy()));
     }
 }
 

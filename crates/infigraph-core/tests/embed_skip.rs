@@ -357,3 +357,83 @@ fn a_graph_write_without_an_embedding_attempt_is_not_a_judgment() {
     reembed(dir.path(), &ig);
     assert!(judged());
 }
+
+// ---- #209 item 11: the embeddings update leaves a record of what it lost ----
+
+use infigraph_core::last_run::{self, Kind};
+
+/// The tally of runs is process-wide and these tests share a process: the one
+/// that fails an embedder on purpose must not note into another's run.
+static RECORD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn embeddings_record(root: &std::path::Path) -> last_run::KindRecord {
+    last_run::read(&root.join(".infigraph"), Kind::Embeddings).unwrap_or_default()
+}
+
+/// Re-index with a changed docstring so the symbol must re-embed, then update
+/// with an embedder that fails.
+fn fail_an_update(dir: &tempfile::TempDir, ig: &Infigraph) {
+    write_alpha(dir.path(), "x = 1", "A different docstring.");
+    ig.index().unwrap();
+    infigraph_core::embed::update_embeddings_with(ig.backend().unwrap(), dir.path(), &[], &|| {
+        Box::new(FailingEmbedder)
+    })
+    .unwrap();
+}
+
+#[test]
+fn an_embedder_that_fails_is_recorded_with_its_reason() {
+    let _lock = RECORD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (dir, ig) = setup();
+
+    fail_an_update(&dir, &ig);
+
+    let problem = embeddings_record(dir.path())
+        .last_problem
+        .expect("a failed embedder left no record");
+    let loss = problem
+        .losses
+        .iter()
+        .find(|l| l.what == "symbols not embedded")
+        .unwrap_or_else(|| panic!("no loss names the symbols: {problem:?}"));
+    assert!(loss.count >= 1, "{loss:?}");
+    assert!(
+        loss.first_reason.contains("embedder unavailable"),
+        "{loss:?}"
+    );
+}
+
+#[test]
+fn a_good_update_after_a_failed_one_clears_the_embeddings_problem() {
+    let _lock = RECORD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (dir, ig) = setup();
+    fail_an_update(&dir, &ig);
+    assert!(embeddings_record(dir.path()).last_problem.is_some());
+
+    reembed(dir.path(), &ig);
+
+    assert_eq!(embeddings_record(dir.path()).last_problem, None);
+}
+
+#[test]
+fn an_update_that_returns_an_error_is_recorded_as_failed() {
+    let _lock = RECORD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (dir, ig) = setup();
+    // A directory where the file goes: the save cannot replace it.
+    std::fs::remove_file(emb_path(dir.path())).unwrap();
+    std::fs::create_dir(emb_path(dir.path())).unwrap();
+    write_alpha(dir.path(), "x = 1", "Yet another docstring.");
+    ig.index().unwrap();
+
+    let result = infigraph_core::embed::update_embeddings(ig.backend().unwrap(), dir.path(), &[]);
+
+    assert!(result.is_err(), "the update was expected to fail");
+    let problem = embeddings_record(dir.path())
+        .last_problem
+        .expect("a failed update left no record");
+    assert!(!problem.ok, "{problem:?}");
+    assert!(
+        problem.summary.contains("embedding update failed"),
+        "{problem:?}"
+    );
+}

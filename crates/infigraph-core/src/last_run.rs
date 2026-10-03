@@ -69,6 +69,27 @@ impl Kind {
         }
     }
 
+    /// What to do about a problem of this kind.
+    pub fn remedy(self) -> &'static str {
+        match self {
+            Kind::Index => {
+                "run `infigraph index --full` to rebuild the graph; the cause is in \
+                 .infigraph/daemon.log"
+            }
+            Kind::Reindex => {
+                "fix the cause named in .infigraph/daemon.log, then run \
+                 `infigraph index --full` again"
+            }
+            Kind::Scip => {
+                "run `infigraph index` to try again; the indexer's own output is in \
+                 .infigraph/daemon.log or .infigraph/scip-enrich.log"
+            }
+            Kind::Embeddings => {
+                "run `infigraph index` to try again; the cause is in .infigraph/daemon.log"
+            }
+        }
+    }
+
     fn file_name(self) -> String {
         format!("last-run.{}.json", self.name())
     }
@@ -257,17 +278,38 @@ impl Drop for Run<'_> {
     }
 }
 
+#[cfg(not(test))]
 static GLOBAL: Registry = Registry::new();
+
+/// The registry the free functions use. One per process, because the sites
+/// that note a loss may run on any thread (a rayon worker), not the one that
+/// opened the run.
+#[cfg(not(test))]
+fn global() -> &'static Registry {
+    &GLOBAL
+}
+
+/// Under `cargo test` every test is a thread of one process, and a test that
+/// drops edges on purpose would note into another test's run. So a lib test
+/// sees only its own thread's registry; `Registry` itself is tested directly,
+/// including notes from several threads.
+#[cfg(test)]
+fn global() -> &'static Registry {
+    thread_local! {
+        static PER_THREAD: &'static Registry = Box::leak(Box::new(Registry::new()));
+    }
+    PER_THREAD.with(|registry| *registry)
+}
 
 /// Open a run in this process.
 pub fn begin(kind: Kind) -> Run<'static> {
-    GLOBAL.begin(kind)
+    global().begin(kind)
 }
 
 /// Note a loss on the run(s) active in this process: `count` of `what`, with
 /// the reason for the first. A no-op when no run is active.
 pub fn note(what: &str, count: u64, reason: &str) {
-    GLOBAL.note(what, count, reason)
+    global().note(what, count, reason)
 }
 
 /// Record `run` as the latest of `kind`, under `infigraph_dir`.
@@ -285,6 +327,7 @@ pub fn record(infigraph_dir: &Path, kind: Kind, run: RunRecord) {
         return;
     }
     let mut next = read(infigraph_dir, kind).unwrap_or_default();
+    let skip = is_repeat(&next, kind, &run);
     if run.has_problem() {
         next.last_problem = Some(run.clone());
     } else if kind.clean_run_repairs_itself() {
@@ -292,7 +335,9 @@ pub fn record(infigraph_dir: &Path, kind: Kind, run: RunRecord) {
     }
     let landed = run.ok;
     next.last = Some(run);
-    write(infigraph_dir, kind, &next);
+    if !skip {
+        write(infigraph_dir, kind, &next);
+    }
     if landed {
         for repaired in kind.repairs() {
             if let Some(mut other) = read(infigraph_dir, *repaired) {
@@ -302,6 +347,31 @@ pub fn record(infigraph_dir: &Path, kind: Kind, run: RunRecord) {
             }
         }
     }
+}
+
+/// How long a clean run after a clean one leaves the file alone.
+const QUIET_SECS: u64 = 60;
+
+/// Whether `run` adds nothing to what `prev` already says, so the file is not
+/// rewritten (an fsync per drain, every few seconds, for nothing): a clean run
+/// within [`QUIET_SECS`] of a clean one that repairs no problem, or a failure
+/// worded exactly like the last (a daemon retrying a failing drain every
+/// tick). The record keeps the first time.
+fn is_repeat(prev: &KindRecord, kind: Kind, run: &RunRecord) -> bool {
+    let Some(last) = &prev.last else {
+        return false;
+    };
+    if !run.has_problem() {
+        let repairs = kind.clean_run_repairs_itself() && prev.last_problem.is_some();
+        return !repairs
+            && !last.has_problem()
+            && run.finished_at.saturating_sub(last.finished_at) < QUIET_SECS;
+    }
+    !run.ok
+        && run.losses.is_empty()
+        && !last.ok
+        && last.losses.is_empty()
+        && last.summary == run.summary
 }
 
 fn write(infigraph_dir: &Path, kind: Kind, record: &KindRecord) {
@@ -337,6 +407,22 @@ pub fn now_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+/// The section `get_stats` shows: one line per kind with an unrepaired
+/// problem, or nothing at all when there is none (unlike the degraded modes'
+/// "none", a clean project has nothing to say here).
+pub fn render_problems(infigraph_dir: &Path, now_secs: u64) -> String {
+    let problems = problems(infigraph_dir);
+    if problems.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("Last runs with problems:");
+    for (kind, run) in problems {
+        out.push_str("\n  ");
+        out.push_str(&problem_line(kind, &run, now_secs));
+    }
+    out
 }
 
 /// One line for a problem, for `doctor` and `get_stats`: the kind, how long
@@ -557,6 +643,74 @@ mod tests {
         }
     }
 
+    fn at(mut run: RunRecord, finished_at: u64) -> RunRecord {
+        run.finished_at = finished_at;
+        run
+    }
+
+    fn failed_with(summary: &str) -> RunRecord {
+        RunRecord::new(false, summary, Tally::default())
+    }
+
+    fn last_finished(p: &tempfile::TempDir, kind: Kind) -> u64 {
+        read(&ig(p), kind).unwrap().last.unwrap().finished_at
+    }
+
+    #[test]
+    fn a_clean_run_soon_after_a_clean_one_is_not_rewritten() {
+        let p = project();
+        record(&ig(&p), Kind::Index, at(clean(), 1_000));
+        record(&ig(&p), Kind::Index, at(clean(), 1_010));
+        assert_eq!(last_finished(&p, Kind::Index), 1_000);
+    }
+
+    #[test]
+    fn a_clean_run_a_minute_after_a_clean_one_is_written() {
+        let p = project();
+        record(&ig(&p), Kind::Index, at(clean(), 1_000));
+        record(&ig(&p), Kind::Index, at(clean(), 1_061));
+        assert_eq!(last_finished(&p, Kind::Index), 1_061);
+    }
+
+    #[test]
+    fn a_clean_run_that_repairs_a_problem_is_written_at_once() {
+        let p = project();
+        record(&ig(&p), Kind::Scip, at(failed(), 1_000));
+        record(&ig(&p), Kind::Scip, at(clean(), 1_001));
+        assert_eq!(read(&ig(&p), Kind::Scip).unwrap().last_problem, None);
+        assert_eq!(last_finished(&p, Kind::Scip), 1_001);
+    }
+
+    #[test]
+    fn a_problem_after_a_clean_run_is_written_at_once() {
+        let p = project();
+        record(&ig(&p), Kind::Index, at(clean(), 1_000));
+        record(&ig(&p), Kind::Index, at(lossy(), 1_001));
+        assert!(read(&ig(&p), Kind::Index).unwrap().last_problem.is_some());
+        assert_eq!(last_finished(&p, Kind::Index), 1_001);
+    }
+
+    #[test]
+    fn a_run_that_fails_the_same_way_as_the_last_is_not_rewritten() {
+        // A daemon retrying a failing drain every tick would otherwise
+        // rewrite the file every tick; the record keeps the first time.
+        let p = project();
+        record(&ig(&p), Kind::Index, at(failed_with("boom"), 1_000));
+        record(&ig(&p), Kind::Index, at(failed_with("boom"), 1_010));
+        assert_eq!(last_finished(&p, Kind::Index), 1_000);
+        record(&ig(&p), Kind::Index, at(failed_with("other"), 1_020));
+        assert_eq!(last_finished(&p, Kind::Index), 1_020);
+    }
+
+    #[test]
+    fn a_landed_reindex_still_repairs_when_its_own_file_is_not_rewritten() {
+        let p = project();
+        record(&ig(&p), Kind::Reindex, at(clean(), 1_000));
+        record(&ig(&p), Kind::Index, at(lossy(), 1_001));
+        record(&ig(&p), Kind::Reindex, at(clean(), 1_005));
+        assert_eq!(read(&ig(&p), Kind::Index).unwrap().last_problem, None);
+    }
+
     #[test]
     fn kinds_are_separate_files() {
         let p = project();
@@ -597,6 +751,27 @@ mod tests {
         let mut t = tally(&[("edges dropped", 1, "x")]);
         t.overlapped = true;
         assert!(RunRecord::new(true, "ok", t).overlapped);
+    }
+
+    #[test]
+    fn the_stats_section_is_empty_when_nothing_is_wrong() {
+        let p = project();
+        assert_eq!(render_problems(&ig(&p), 5_000), "");
+        record(&ig(&p), Kind::Index, clean());
+        assert_eq!(render_problems(&ig(&p), 5_000), "");
+    }
+
+    #[test]
+    fn the_stats_section_lists_each_kind_with_a_problem() {
+        let p = project();
+        record(&ig(&p), Kind::Index, at(lossy(), 1_000));
+        record(&ig(&p), Kind::Embeddings, at(failed(), 1_000));
+        let section = render_problems(&ig(&p), 1_000 + 2 * 3600);
+        assert!(section.starts_with("Last runs with problems:"), "{section}");
+        assert!(section.contains("incremental index"), "{section}");
+        assert!(section.contains("embeddings update"), "{section}");
+        assert!(section.contains("2h ago"), "{section}");
+        assert_eq!(section.lines().count(), 3, "{section}");
     }
 
     #[test]

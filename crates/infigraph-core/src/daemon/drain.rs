@@ -25,10 +25,19 @@ pub(crate) struct DrainOutcome {
 /// snapshot, so no operation plans against information another operation
 /// has since made stale.
 #[allow(dead_code)]
-pub(crate) fn execute_drain(
-    infigraph: &Infigraph,
-    mut drained: DrainedQueue,
-) -> Result<DrainOutcome> {
+pub(crate) fn execute_drain(infigraph: &Infigraph, drained: DrainedQueue) -> Result<DrainOutcome> {
+    // The run owner for the `index` last-run record (#209): the write paths
+    // below note what they lose (edges a COPY dropped, a removal that failed,
+    // call resolution that failed) and this takes it when the drain ends.
+    let run = crate::last_run::begin(crate::last_run::Kind::Index);
+    let outcome = answer_waiters(infigraph, drained);
+    record_drain_run(infigraph.root(), run, &outcome);
+    outcome
+}
+
+/// [`execute_drain`]'s work: run the drain and answer every waiter folded
+/// into it.
+fn answer_waiters(infigraph: &Infigraph, mut drained: DrainedQueue) -> Result<DrainOutcome> {
     let waiters = std::mem::take(&mut drained.waiters);
     let use_learned = waiters
         .iter()
@@ -53,6 +62,37 @@ pub(crate) fn execute_drain(
             Err(e)
         }
     }
+}
+
+/// Record a finished drain under `root` (see `last_run`). A drain that
+/// changed nothing and lost nothing writes nothing: the watcher drains every
+/// few seconds and an empty one is not news.
+fn record_drain_run(root: &Path, run: crate::last_run::Run<'_>, result: &Result<DrainOutcome>) {
+    let tally = run.end();
+    let (ok, summary) = match result {
+        Ok(outcome) => {
+            if outcome.extractions.is_empty()
+                && outcome.removals.is_empty()
+                && tally.losses.is_empty()
+            {
+                return;
+            }
+            (
+                true,
+                format!(
+                    "indexed {} file(s), removed {}",
+                    outcome.extractions.len(),
+                    outcome.removals.len()
+                ),
+            )
+        }
+        Err(e) => (false, format!("drain failed: {e:#}")),
+    };
+    crate::last_run::record(
+        &root.join(".infigraph"),
+        crate::last_run::Kind::Index,
+        crate::last_run::RunRecord::new(ok, summary, tally),
+    );
 }
 
 /// One combined pass -- extract, upsert, remove, resolve -- over everything
@@ -112,14 +152,21 @@ fn run_drain(
     let mut removals: Vec<String> = drained.removals.into_iter().collect();
     removals.extend(whole_project_stale);
     for path in &removals {
-        let _ = backend.remove_file(path);
+        // A removal that fails leaves the file's symbols in the graph.
+        if let Err(e) = backend.remove_file(path) {
+            eprintln!("warning: could not remove {path} from the graph: {e:#}");
+            crate::last_run::note("file removals failed", 1, &format!("{path}: {e:#}"));
+        }
     }
     // A removal that came from a real filesystem event, where whether the
     // now-gone path was a file or a directory can no longer be determined --
     // also scan for and remove anything still in the graph under it as a
     // directory prefix. A no-op query for a path that was actually a file.
     for prefix in &drained.removal_prefixes {
-        let _ = infigraph.remove_files_by_prefix(Path::new(prefix));
+        if let Err(e) = infigraph.remove_files_by_prefix(Path::new(prefix)) {
+            eprintln!("warning: could not remove files under {prefix} from the graph: {e:#}");
+            crate::last_run::note("file removals failed", 1, &format!("{prefix}/: {e:#}"));
+        }
     }
 
     if !extractions.is_empty() {
@@ -143,6 +190,7 @@ fn run_drain(
         .resolve_calls(&extractions, learned.as_ref())
         .unwrap_or_else(|e| {
             eprintln!("warning: call resolution failed: {e}");
+            crate::last_run::note("call resolution failed", 1, &format!("{e:#}"));
             ResolveStats {
                 total_calls: 0,
                 resolved: 0,
@@ -298,6 +346,91 @@ mod tests {
             drop(guard);
         }
         rx.recv().expect("every outcome answers the reply")
+    }
+
+    // ---- #209 item 11: a drain leaves a record of what it lost ----
+
+    use crate::last_run::{self, Kind};
+
+    fn index_record(root: &std::path::Path) -> last_run::KindRecord {
+        last_run::read(&root.join(".infigraph"), Kind::Index).unwrap_or_default()
+    }
+
+    fn no_outcome() -> DrainOutcome {
+        DrainOutcome {
+            extractions: Vec::new(),
+            resolve_stats: ResolveStats {
+                total_calls: 0,
+                resolved: 0,
+                unresolved: 0,
+                learned_resolved: 0,
+                inherits_resolved: 0,
+            },
+            removals: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_drain_that_indexed_a_file_leaves_an_index_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("existing.py"), "def existing():\n    pass\n").unwrap();
+        let prism = open_project(root);
+        prism.index().unwrap();
+        fs::write(root.join("fourth.py"), "def fourth():\n    pass\n").unwrap();
+        let mut queue = IndexWorkQueue::new();
+        queue.add_raw("fourth.py".to_string());
+
+        execute_drain(&prism, queue.drain()).unwrap();
+
+        let last = index_record(root).last.expect("a drain left no record");
+        assert!(last.ok, "{last:?}");
+        assert!(last.summary.contains("1 file"), "{last:?}");
+    }
+
+    #[test]
+    fn a_drain_with_nothing_to_do_leaves_no_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        let prism = open_project(tmp.path());
+
+        execute_drain(&prism, IndexWorkQueue::new().drain()).unwrap();
+
+        assert_eq!(index_record(tmp.path()).last, None);
+    }
+
+    #[test]
+    fn a_drain_that_fails_is_recorded_as_failed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".infigraph")).unwrap();
+        // Opened and never initialised: the graph is not there to write to.
+        let prism = Infigraph::open(root, python_registry()).unwrap();
+        let mut queue = IndexWorkQueue::new();
+        queue.add_raw("a.py".to_string());
+
+        assert!(execute_drain(&prism, queue.drain()).is_err());
+
+        let problem = index_record(root)
+            .last_problem
+            .expect("a failed drain left no record");
+        assert!(!problem.ok, "{problem:?}");
+        assert!(problem.summary.contains("drain failed"), "{problem:?}");
+    }
+
+    #[test]
+    fn a_loss_noted_during_a_drain_reaches_its_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".infigraph")).unwrap();
+
+        let run = last_run::begin(Kind::Index);
+        last_run::note("CALLS edges dropped: missing endpoint", 3, "no such node");
+        record_drain_run(root, run, &Ok(no_outcome()));
+
+        let problem = index_record(root)
+            .last_problem
+            .expect("the loss was not recorded");
+        assert_eq!(problem.losses[0].count, 3, "{problem:?}");
     }
 
     #[test]
@@ -468,6 +601,37 @@ mod tests {
     /// confirms the old content is genuinely gone and the graph is rebuilt,
     /// and confirms the old graph directory was quarantined (renamed aside),
     /// not deleted.
+    #[test]
+    fn a_landed_full_reindex_is_recorded_and_repairs_the_drains_problem() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        let reply = full_reindex_after_old_py_moves_to_new_py(root, |root| {
+            // A drain earlier lost edges; the rebuild replaces all of them.
+            let mut lost = last_run::Tally::default();
+            lost.note("CALLS edges dropped: missing endpoint", 3, "no such node");
+            last_run::record(
+                &root.join(".infigraph"),
+                Kind::Index,
+                last_run::RunRecord::new(true, "indexed 1 file(s)", lost),
+            );
+        });
+
+        assert!(matches!(
+            reply,
+            crate::daemon_protocol::WriteResult::FullReindexOk { .. }
+        ));
+        let reindex = last_run::read(&root.join(".infigraph"), Kind::Reindex)
+            .and_then(|r| r.last)
+            .expect("a landed reindex left no record");
+        assert!(reindex.ok, "{reindex:?}");
+        assert_eq!(
+            index_record(root).last_problem,
+            None,
+            "a rebuilt graph still carries a drain's loss"
+        );
+    }
+
     #[test]
     fn full_reindex_rebuilds_the_graph_and_quarantines_the_old_one() {
         use crate::graph::GraphBackend;

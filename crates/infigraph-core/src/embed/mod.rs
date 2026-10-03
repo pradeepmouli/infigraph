@@ -873,13 +873,30 @@ pub fn update_embeddings_with(
     changed_files: &[&str],
     make_embedder: &dyn Fn() -> Box<dyn EmbedProvider>,
 ) -> Result<usize> {
+    let run = crate::last_run::begin(crate::last_run::Kind::Embeddings);
     let result = update_embeddings_inner(backend, root, changed_files, make_embedder);
+    // #209: what this update lost, or why it failed, where `doctor` can see
+    // it -- these used to reach only the log of whichever process ran it.
+    record_embeddings_run(root, run, &result);
     // #75: whoever holds the graph says whether the embeddings now reflect
     // it, success or not -- a failed update is exactly when they do not.
     if let Ok(generation) = backend.current_ast_generation() {
         crate::degraded::live::note_embeddings_generation(root, generation);
     }
     result
+}
+
+fn record_embeddings_run(root: &Path, run: crate::last_run::Run<'_>, result: &Result<usize>) {
+    let tally = run.end();
+    let (ok, summary) = match result {
+        Ok(count) => (true, format!("{count} embeddings")),
+        Err(e) => (false, format!("embedding update failed: {e:#}")),
+    };
+    crate::last_run::record(
+        &root.join(".infigraph"),
+        crate::last_run::Kind::Embeddings,
+        crate::last_run::RunRecord::new(ok, summary, tally),
+    );
 }
 
 fn update_embeddings_inner(
@@ -941,12 +958,20 @@ fn update_embeddings_inner(
         let embedder: Arc<Box<dyn EmbedProvider>> = Arc::new(make_embedder());
         embedder_name = Some(embedder.name());
         const BATCH: usize = 256;
+        // The first failure the embedder reports, for the record: a failed
+        // batch used to cost its symbols their vectors without a word.
+        let first_error: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
         let results: Vec<Vec<(String, Vec<f32>, u64)>> = to_embed
             .par_chunks(BATCH)
             .map(|chunk| {
                 let emb = Arc::clone(&embedder);
                 let texts: Vec<&str> = chunk.iter().map(|(_, t, _)| t.as_str()).collect();
-                let vecs = emb.embed_batch(&texts).unwrap_or_default();
+                let vecs = emb.embed_batch(&texts).unwrap_or_else(|e| {
+                    if let Ok(mut first) = first_error.lock() {
+                        first.get_or_insert_with(|| format!("{e:#}"));
+                    }
+                    Vec::new()
+                });
                 chunk
                     .iter()
                     .enumerate()
@@ -959,6 +984,17 @@ fn update_embeddings_inner(
                 existing.insert(id, (v, h));
                 embedded += 1;
             }
+        }
+        if embedded < to_embed.len() {
+            let reason =
+                first_error.into_inner().ok().flatten().unwrap_or_else(|| {
+                    "the embedder returned fewer vectors than asked".to_string()
+                });
+            crate::last_run::note(
+                "symbols not embedded",
+                (to_embed.len() - embedded) as u64,
+                &reason,
+            );
         }
     }
 
@@ -1235,6 +1271,7 @@ pub fn sync_hnsw_index(
         let _ = std::fs::remove_file(index_path);
     } else if let Err(e) = build_hnsw_index(embeddings, index_path, embeddings_path) {
         eprintln!("warning: HNSW index build failed ({e}), vector search will use brute-force");
+        crate::last_run::note("HNSW index not built", 1, &format!("{e:#}"));
     }
 }
 
@@ -1643,6 +1680,23 @@ mod hnsw_freshness_tests {
         save_embeddings(&emb, &vectors(3)).unwrap();
         sync_hnsw_index(&vectors(3), &index, &emb, 3);
         assert!(hnsw_index_current(&index, &emb), "growing back rebuilds");
+    }
+
+    #[test]
+    fn a_failed_hnsw_build_is_noted_on_the_active_run() {
+        let (_d, index, emb) = project_with(3);
+        // A directory where the index goes: the build cannot replace it.
+        std::fs::create_dir(&index).unwrap();
+        let run = crate::last_run::begin(crate::last_run::Kind::Embeddings);
+        sync_hnsw_index(&vectors(3), &index, &emb, 3);
+        let tally = run.end();
+        assert!(
+            tally
+                .losses
+                .iter()
+                .any(|l| l.what == "HNSW index not built"),
+            "{tally:?}"
+        );
     }
 
     #[test]

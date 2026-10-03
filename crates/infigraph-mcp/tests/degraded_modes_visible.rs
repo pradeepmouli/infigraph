@@ -190,6 +190,36 @@ fn a_fallback_inside_the_daemon_is_visible_in_doctor_get_stats_and_the_footer() 
         "get_stats stopped listing it:\n{stats}"
     );
 
+    // #209: what the last runs lost is shown by `doctor` and `get_stats` when
+    // there is something to show -- and not in the footer, which runs after
+    // every tool call.
+    assert!(
+        !stats.contains("Last runs"),
+        "a project with no run problems lists last runs:\n{stats}"
+    );
+    let mut lost = infigraph_core::last_run::Tally::default();
+    lost.note("CALLS edges dropped: missing endpoint", 3, "no such node");
+    infigraph_core::last_run::record(
+        &infigraph_dir,
+        infigraph_core::last_run::Kind::Index,
+        infigraph_core::last_run::RunRecord::new(true, "indexed 1 file(s)", lost),
+    );
+    let stats = tool_text(&mut server, 6, "get_stats", path.clone());
+    assert!(
+        stats.contains("Last runs with problems:") && stats.contains("no such node"),
+        "get_stats does not show the run that lost edges:\n{stats}"
+    );
+    let report = doctor(&cli, &root, home);
+    assert!(
+        report.contains("no such node"),
+        "doctor does not show the run that lost edges:\n{report}"
+    );
+    let listing = tool_text(&mut server, 7, "list_files", path.clone());
+    assert!(
+        !listing.contains("no such node"),
+        "the footer shows a last-run problem:\n{listing}"
+    );
+
     // What the footer's lookup costs a tool call, against this healthy
     // daemon: asked afresh (what `doctor` and `get_stats` do), and through
     // the cache the footer uses. Printed, and bounded loosely enough for a

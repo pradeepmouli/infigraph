@@ -1439,6 +1439,7 @@ impl ScipRun {
     pub(crate) fn imported(&mut self, stats: &infigraph_core::scip::ImportStats) {
         self.ran = true;
         self.imported += 1;
+        self.tally.overlapped |= stats.overlapped;
         for loss in &stats.losses {
             self.tally.note(&loss.what, loss.count, &loss.first_reason);
         }
