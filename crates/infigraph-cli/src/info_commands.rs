@@ -648,8 +648,19 @@ pub(crate) fn cmd_daemon(root: &Path, debounce: u64) -> Result<()> {
                 // ...)`, not the coordinator's own tick thread, so it doesn't
                 // stall drains, other requests, or fsevents.
                 let infigraph_dir = root.join(".infigraph");
-                for (label, scip_path, success) in results {
-                    if !success || !scip_path.exists() {
+                // What this run did, written once the loop is done (#209):
+                // an indexer's refusal used to reach only this daemon's log.
+                let mut record = crate::index::ScipRun::new();
+                for result in &results {
+                    record.indexer_result(result);
+                }
+                for crate::index::IndexerResult {
+                    label,
+                    path: scip_path,
+                    verdict,
+                } in results
+                {
+                    if verdict.is_err() || !scip_path.exists() {
                         let _ = std::fs::remove_file(&scip_path);
                         continue;
                     }
@@ -684,6 +695,7 @@ pub(crate) fn cmd_daemon(root: &Path, debounce: u64) -> Result<()> {
                              import that enriched generation {}",
                             job.scip_generation
                         );
+                        record.unchanged();
                         continue;
                     }
                     // Stamp the generation this run started from, not the
@@ -698,7 +710,8 @@ pub(crate) fn cmd_daemon(root: &Path, debounce: u64) -> Result<()> {
                     // (COPY/UNWIND against tens of thousands of symbols) can take
                     // minutes, and a daemon shutdown ends the wait within one poll.
                     match submit.submit(request, &token) {
-                        Ok(infigraph_core::daemon_protocol::WriteResult::ScipImportOk(_)) => {
+                        Ok(infigraph_core::daemon_protocol::WriteResult::ScipImportOk(stats)) => {
+                            record.imported(&stats);
                             // The coordinator's own `finish_scip_import` already
                             // logged the structured completion line.
                             //
@@ -719,6 +732,7 @@ pub(crate) fn cmd_daemon(root: &Path, debounce: u64) -> Result<()> {
                         }
                         Ok(infigraph_core::daemon_protocol::WriteResult::Err { message }) => {
                             eprintln!("[daemon] SCIP {label} import failed: {message}");
+                            record.import_failed(label, &message);
                             // Keep a good output a transient failure left behind
                             // (a later run can adopt it); drop an unusable one.
                             crate::index::discard_output_after_failed_import(label, &scip_path);
@@ -741,9 +755,11 @@ pub(crate) fn cmd_daemon(root: &Path, debounce: u64) -> Result<()> {
                         }
                         Err(e) => {
                             eprintln!("[daemon] SCIP {label} import request failed: {e}");
+                            record.import_failed(label, &format!("the request failed: {e:#}"));
                         }
                     }
                 }
+                record.finish(&infigraph_dir);
             },
         );
 

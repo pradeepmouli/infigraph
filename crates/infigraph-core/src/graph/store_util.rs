@@ -633,6 +633,10 @@ pub(crate) fn unwind_edges_from_pairs(
     let mut gate = store.growth_gate(1);
     let mut failed = 0usize;
     let mut sent = 0usize;
+    // Edges in the chunks that failed, and the first reason, for the run's
+    // last-run record (#209): "N chunks failed" hid how many edges that was.
+    let mut lost = 0usize;
+    let mut first_error: Option<String> = None;
     for chunk in pairs.chunks(CHUNK) {
         gate.tick()?;
         sent += 1;
@@ -647,20 +651,24 @@ pub(crate) fn unwind_edges_from_pairs(
         // to success today.
         // MERGE: this runs on a batch a failed COPY may already have partly
         // committed ("a failed COPY still commits durable data").
-        if conn
-            .query(&pair_edge_merge_statement(
-                src_label,
-                dst_label,
-                rel_type,
-                &pair_list.join(", "),
-            ))
-            .is_err()
-        {
+        if let Err(e) = conn.query(&pair_edge_merge_statement(
+            src_label,
+            dst_label,
+            rel_type,
+            &pair_list.join(", "),
+        )) {
             failed += 1;
+            lost += chunk.len();
+            first_error.get_or_insert_with(|| e.to_string());
         }
     }
     if failed > 0 {
         eprintln!("warn: UNWIND fallback for {rel_type}: {failed}/{sent} chunk(s) failed");
+        crate::last_run::note(
+            &format!("{rel_type} edges not written"),
+            lost as u64,
+            first_error.as_deref().unwrap_or("a chunk failed"),
+        );
     }
     Ok(())
 }
@@ -834,6 +842,11 @@ pub(crate) fn copy_edges_with_bad_record_retry(
                                 before - pairs.len(),
                                 attempt + 1
                             );
+                            crate::last_run::note(
+                                &format!("{table} edges dropped: missing endpoint"),
+                                (before - pairs.len()) as u64,
+                                "an endpoint names no node in the graph",
+                            );
                             continue;
                         }
                         Ok(()) => {}
@@ -850,6 +863,11 @@ pub(crate) fn copy_edges_with_bad_record_retry(
                             "warn: COPY {table} dropped {} bad-PK record(s) (attempt {}/{MAX_BAD_RECORD_RETRIES}), retrying",
                             before - pairs.len(),
                             attempt + 1
+                        );
+                        crate::last_run::note(
+                            &format!("{table} edges dropped: bad primary key"),
+                            (before - pairs.len()) as u64,
+                            &format!("the engine rejected {bad}"),
                         );
                         continue;
                     }
@@ -1150,6 +1168,59 @@ mod tests {
             good.len(),
             "every good pair must survive, and no ghost edge may be invented"
         );
+    }
+
+    /// #209 item 11: the pairs a COPY drops used to be counted only in a log
+    /// line.
+    #[test]
+    fn edges_dropped_for_a_missing_endpoint_are_noted_on_the_active_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store_with_symbols(tmp.path(), 4);
+        let mut pairs: Vec<(String, String)> = vec![("a.py::s0".into(), "a.py::s1".into())];
+        for i in 0..5 {
+            pairs.push(("a.py::s0".into(), format!("a.py::ghost{i}")));
+        }
+
+        let run = crate::last_run::begin(crate::last_run::Kind::Index);
+        copy_edges_with_bad_record_retry(
+            &store,
+            "CALLS",
+            pairs,
+            "Symbol",
+            "Symbol",
+            &tmp.path().join("edges.parquet"),
+        )
+        .unwrap();
+        let tally = run.end();
+
+        let loss = tally
+            .losses
+            .iter()
+            .find(|l| l.what == "CALLS edges dropped: missing endpoint")
+            .unwrap_or_else(|| panic!("the drop was not noted: {tally:?}"));
+        assert_eq!(loss.count, 5, "{loss:?}");
+    }
+
+    /// A chunk of the UNWIND fallback that fails is edges that were not
+    /// written. A relationship table that does not exist fails every chunk.
+    #[test]
+    fn edges_in_a_failed_unwind_chunk_are_noted_on_the_active_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store_with_symbols(tmp.path(), 4);
+        let conn = store.connection().unwrap();
+        let pairs = [("a.py::s0", "a.py::s1"), ("a.py::s1", "a.py::s2")];
+
+        let run = crate::last_run::begin(crate::last_run::Kind::Index);
+        unwind_edges_from_pairs(&store, &conn, &pairs, "NO_SUCH_REL", "Symbol", "Symbol").unwrap();
+        let tally = run.end();
+
+        let loss = tally
+            .losses
+            .iter()
+            .find(|l| l.what == "NO_SUCH_REL edges not written")
+            .unwrap_or_else(|| panic!("the failed chunk was not noted: {tally:?}"));
+        assert_eq!(loss.count, 2, "{loss:?}");
+        assert!(!loss.first_reason.is_empty());
     }
 
     #[test]

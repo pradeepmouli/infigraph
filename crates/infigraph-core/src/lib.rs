@@ -25,6 +25,7 @@ pub mod graph;
 pub mod ignore_rules;
 pub mod instances;
 pub mod lang;
+pub mod last_run;
 pub mod learned;
 pub mod lockfile;
 pub mod logrotate;

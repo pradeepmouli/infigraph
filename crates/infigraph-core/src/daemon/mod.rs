@@ -2349,6 +2349,9 @@ struct FullReindexBuildOutcome {
 struct FullReindexTaskOutput {
     guard: crate::ops::IndexOpGuard,
     result: Result<FullReindexBuildOutcome>,
+    /// What the build lost while it ran (#209), for the `reindex` record
+    /// `finish_full_reindex` writes once the swap has landed or not.
+    tally: crate::last_run::Tally,
 }
 
 /// A full-reindex build executing on the background `Task<T>`, plus every
@@ -2610,9 +2613,12 @@ where
     let task = {
         let _guard = drain_rt.enter();
         Task::spawn_blocking(daemon_token, "full-reindex-build", move |token| {
+            let run = crate::last_run::begin(crate::last_run::Kind::Reindex);
+            let result = build_full_reindex(&root_buf, registry, &token);
             FullReindexTaskOutput {
-                result: build_full_reindex(&root_buf, registry, &token),
+                result,
                 guard,
+                tally: run.end(),
             }
         })
     };
@@ -2943,7 +2949,57 @@ fn finish_full_reindex(
     held: &mut HeldPrism,
     joined: std::result::Result<FullReindexTaskOutput, tokio::task::JoinError>,
 ) -> (Option<crate::ops::IndexOpGuard>, Option<Vec<String>>) {
-    let FullReindexTaskOutput { guard, result } = match joined {
+    let (tally, build_error) = match &joined {
+        Ok(output) => (
+            output.tally.clone(),
+            output.result.as_ref().err().map(|e| format!("{e:#}")),
+        ),
+        Err(join_err) => (
+            crate::last_run::Tally::default(),
+            Some(format!("the build task panicked: {join_err}")),
+        ),
+    };
+    let finished = swap_in_full_reindex(root, replies, registry, held, joined);
+    // `Some(languages)` only when the swap fully succeeded (see above).
+    record_reindex_run(root, tally, build_error, finished.1.is_some());
+    finished
+}
+
+/// The `reindex` last-run record (#209): written once the outcome is known,
+/// because a build that succeeded and then failed to swap in did not land.
+fn record_reindex_run(
+    root: &Path,
+    tally: crate::last_run::Tally,
+    build_error: Option<String>,
+    landed: bool,
+) {
+    let (ok, summary) = if landed {
+        (true, "full reindex landed".to_string())
+    } else if let Some(error) = build_error {
+        (false, format!("full reindex failed: {error}"))
+    } else {
+        (
+            false,
+            "full reindex was built but did not land; see daemon.log".to_string(),
+        )
+    };
+    crate::last_run::record(
+        &root.join(".infigraph"),
+        crate::last_run::Kind::Reindex,
+        crate::last_run::RunRecord::new(ok, summary, tally),
+    );
+}
+
+/// [`finish_full_reindex`] up to the record: swap the rebuilt graph in and
+/// answer the waiters.
+fn swap_in_full_reindex(
+    root: &Path,
+    replies: Vec<WriteReply>,
+    registry: &Arc<crate::lang::LanguageRegistry>,
+    held: &mut HeldPrism,
+    joined: std::result::Result<FullReindexTaskOutput, tokio::task::JoinError>,
+) -> (Option<crate::ops::IndexOpGuard>, Option<Vec<String>>) {
+    let FullReindexTaskOutput { guard, result, .. } = match joined {
         Ok(output) => output,
         Err(join_err) => {
             eprintln!("[watch] full-reindex task panicked: {join_err}");

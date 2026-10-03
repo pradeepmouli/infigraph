@@ -65,7 +65,17 @@ pub fn tool_get_stats(args: &Value) -> Result<String> {
     // #75: asked directly, so the daemon's part is fetched now, not cached.
     let degraded =
         infigraph_core::degraded::render_section(&infigraph_core::degraded::gather(prism.root()));
-    Ok(format!("{stats}\n{degraded}"))
+    // #209: what the last runs lost or refused, only when there is something
+    // to say. Never in the footer, which runs after every tool call.
+    let last_runs = infigraph_core::last_run::render_problems(
+        &prism.root().join(".infigraph"),
+        infigraph_core::last_run::now_secs(),
+    );
+    if last_runs.is_empty() {
+        Ok(format!("{stats}\n{degraded}"))
+    } else {
+        Ok(format!("{stats}\n{degraded}\n{last_runs}"))
+    }
 }
 
 pub fn tool_get_code_snippet(args: &Value) -> Result<String> {
