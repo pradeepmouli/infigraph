@@ -1329,6 +1329,10 @@ pub struct ImportStats {
     /// `index --full`, and fail `infigraph verify`.
     #[serde(default)]
     pub files_skipped: usize,
+    /// What the import lost on its way (edges the COPY dropped, ...), for the
+    /// `scip` last-run record (#209). Empty for a clean import.
+    #[serde(default)]
+    pub losses: Vec<crate::last_run::Loss>,
 }
 
 impl ImportStats {

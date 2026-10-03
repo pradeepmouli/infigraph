@@ -724,53 +724,55 @@ pub(crate) fn on_path(cmd: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Imports the `.scip` at `scip_path` (default `index.scip` in the root) and
+/// removes it. `None` when there was no file; otherwise what the import came
+/// to, for the `scip` last-run record.
 pub(crate) fn import_scip_and_cleanup(
     root: &Path,
     scip_path: Option<&std::path::Path>,
     existing_backend: Option<&dyn infigraph_core::graph::GraphBackend>,
-) {
+) -> Option<Result<infigraph_core::scip::ImportStats, String>> {
     let scip_out = scip_path
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| root.join("index.scip"));
     if !scip_out.exists() {
-        return;
+        return None;
     }
 
-    if let Some(backend) = existing_backend {
-        match backend.import_scip_index(&scip_out, Some(root)) {
+    let import = |backend: &dyn infigraph_core::graph::GraphBackend| {
+        let outcome = backend.import_scip_index(&scip_out, Some(root));
+        match &outcome {
             Ok(stats) => println!("Auto-SCIP: {stats}"),
             Err(e) => eprintln!("Auto-SCIP: import failed: {e}"),
         }
         let _ = std::fs::remove_file(&scip_out);
-        return;
+        Some(outcome.map_err(|e| format!("{e:#}")))
+    };
+    if let Some(backend) = existing_backend {
+        return import(backend);
     }
 
     let registry = match bundled_registry() {
         Ok(r) => r,
         Err(e) => {
             eprintln!("Auto-SCIP: import failed: {e}");
-            return;
+            return Some(Err(format!("{e:#}")));
         }
     };
     let mut prism = match Infigraph::open(root, registry) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("Auto-SCIP: import failed: {e}");
-            return;
+            return Some(Err(format!("{e:#}")));
         }
     };
-    if prism.init().is_err() {
-        return;
+    if let Err(e) = prism.init() {
+        return Some(Err(format!("could not open the graph: {e:#}")));
     }
-    let backend = match prism.backend() {
-        Some(b) => b,
-        None => return,
-    };
-    match backend.import_scip_index(&scip_out, Some(root)) {
-        Ok(stats) => println!("Auto-SCIP: {stats}"),
-        Err(e) => eprintln!("Auto-SCIP: import failed: {e}"),
+    match prism.backend() {
+        Some(backend) => import(backend),
+        None => Some(Err("the graph is not initialized".to_string())),
     }
-    let _ = std::fs::remove_file(&scip_out);
 }
 
 /// Foreground SCIP execution using scip_download catalog for all detected languages.
@@ -824,11 +826,19 @@ pub(crate) fn auto_scip(
     };
 
     // Sequential run: each indexer produces index.scip, import, cleanup
+    let mut record = ScipRun::new();
     for (indexer, bin_path) in &binaries {
-        let Some(bin) = bin_path else { continue };
         if !should_run_indexer(root, indexer) {
             continue;
         }
+        let Some(bin) = bin_path else {
+            record.indexer_result(&IndexerResult {
+                label: indexer.binary_name,
+                path: PathBuf::new(),
+                verdict: Err("could not be found or installed".to_string()),
+            });
+            continue;
+        };
 
         let cmd_str = bin.to_string_lossy();
         let extra = scip_download::extra_runtime_paths();
@@ -857,10 +867,20 @@ pub(crate) fn auto_scip(
                 run.run(indexer.scip_args).await
             }
         });
-        if produced {
-            import_scip_and_cleanup(root, None, backend);
+        record.indexer_result(&IndexerResult {
+            label: indexer.binary_name,
+            path: scip_out.clone(),
+            verdict: produced.clone(),
+        });
+        if produced.is_ok() {
+            match import_scip_and_cleanup(root, None, backend) {
+                Some(Ok(stats)) => record.imported(&stats),
+                Some(Err(reason)) => record.import_failed(indexer.binary_name, &reason),
+                None => {}
+            }
         }
     }
+    record.finish(&root.join(".infigraph"));
 
     Ok(())
 }
@@ -1216,7 +1236,7 @@ pub(crate) fn run_scip_indexers(
     root: &Path,
     detected_languages: &std::collections::HashSet<String>,
     token: &CancellationToken,
-) -> Vec<(&'static str, PathBuf, bool)> {
+) -> Vec<IndexerResult> {
     use crate::scip_download;
 
     let indexers = scip_download::indexers_for_languages(detected_languages);
@@ -1245,22 +1265,35 @@ pub(crate) fn run_scip_indexers(
     // entry is shaped exactly like a fresh result, so
     // `import_scip_results_and_embed` imports and deletes it on identical
     // terms, under the same lock, with no new plumbing.
-    let mut adopted: Vec<(&'static str, PathBuf, bool)> = Vec::new();
+    // Also holds an indexer that could not be had, which has no output to run
+    // or import: its result is already settled, and still has to be seen.
+    let mut adopted: Vec<IndexerResult> = Vec::new();
 
     let tasks: Vec<_> = binaries
         .into_iter()
         .filter_map(|(indexer, bin_path)| {
-            let bin = bin_path?;
             if !should_run_indexer(root, indexer) {
                 return None;
             }
+            let Some(bin) = bin_path else {
+                adopted.push(IndexerResult {
+                    label: indexer.binary_name,
+                    path: PathBuf::new(),
+                    verdict: Err("could not be found or installed".to_string()),
+                });
+                return None;
+            };
             if let Some(path) = adoptable_scip_output(&scip_tmp, indexer.binary_name) {
                 eprintln!(
                     "Auto-SCIP: adopting {} output from a dead run ({})",
                     indexer.binary_name,
                     path.file_name().unwrap_or_default().to_string_lossy()
                 );
-                adopted.push((indexer.binary_name, path, true));
+                adopted.push(IndexerResult {
+                    label: indexer.binary_name,
+                    path,
+                    verdict: Ok(()),
+                });
                 return None;
             }
             let output_path = scip_tmp.join(infigraph_core::scip::scratch_file_name(
@@ -1309,10 +1342,11 @@ pub(crate) fn run_scip_indexers(
             .map(|(indexer, bin, output_path)| {
                 let root = root.clone();
                 let output_path_for_fut = output_path.clone();
-                let fut: std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>> =
-                    Box::pin(async move {
-                        run_scip_indexer_to(&root, &bin, indexer, &output_path_for_fut).await
-                    });
+                let fut: std::pin::Pin<
+                    Box<dyn std::future::Future<Output = IndexerVerdict> + Send>,
+                > = Box::pin(async move {
+                    run_scip_indexer_to(&root, &bin, indexer, &output_path_for_fut).await
+                });
                 (indexer.binary_name, output_path, fut)
             })
             .collect();
@@ -1324,7 +1358,7 @@ pub(crate) fn run_scip_indexers(
 type IndexerJob = (
     &'static str,
     PathBuf,
-    std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>,
+    std::pin::Pin<Box<dyn std::future::Future<Output = IndexerVerdict> + Send>>,
 );
 
 /// Launches `jobs` as tokio tasks one at a time, checking `token` before
@@ -1335,7 +1369,7 @@ type IndexerJob = (
 async fn run_cancellable_indexer_batch(
     jobs: Vec<IndexerJob>,
     token: &CancellationToken,
-) -> Vec<(&'static str, PathBuf, bool)> {
+) -> Vec<IndexerResult> {
     let mut handles = Vec::with_capacity(jobs.len());
     for (label, output_path, fut) in jobs {
         if token.is_cancelled() {
@@ -1355,10 +1389,98 @@ async fn run_cancellable_indexer_batch(
     }
 
     let mut results = Vec::with_capacity(handles.len());
-    for (label, output_path, handle) in handles {
-        results.push((label, output_path, handle.await.unwrap()));
+    for (label, path, handle) in handles {
+        results.push(IndexerResult {
+            label,
+            path,
+            verdict: handle.await.unwrap(),
+        });
     }
     results
+}
+
+/// What one enrichment run did, for the `scip` last-run record (#209 item 9):
+/// each indexer that left nothing usable, each import that failed, and the
+/// losses an import noted on its way. Written by whoever ran the indexers --
+/// the daemon's callback, the detached `scip-enrich`, the foreground pass.
+pub(crate) struct ScipRun {
+    tally: infigraph_core::last_run::Tally,
+    ok: bool,
+    imported: usize,
+    unchanged: usize,
+    ran: bool,
+}
+
+impl ScipRun {
+    pub(crate) fn new() -> Self {
+        Self {
+            tally: Default::default(),
+            ok: true,
+            imported: 0,
+            unchanged: 0,
+            ran: false,
+        }
+    }
+
+    /// An indexer's verdict: a refusal, a failure and a missing binary all
+    /// mean no enrichment from it.
+    pub(crate) fn indexer_result(&mut self, result: &IndexerResult) {
+        self.ran = true;
+        if let Err(reason) = &result.verdict {
+            self.ok = false;
+            self.tally.note(
+                &format!("{} produced no usable output", result.label),
+                1,
+                reason,
+            );
+        }
+    }
+
+    pub(crate) fn imported(&mut self, stats: &infigraph_core::scip::ImportStats) {
+        self.ran = true;
+        self.imported += 1;
+        for loss in &stats.losses {
+            self.tally.note(&loss.what, loss.count, &loss.first_reason);
+        }
+    }
+
+    /// An output identical to the one already imported: nothing to do, and
+    /// nothing wrong.
+    pub(crate) fn unchanged(&mut self) {
+        self.ran = true;
+        self.unchanged += 1;
+    }
+
+    pub(crate) fn import_failed(&mut self, label: &str, reason: &str) {
+        self.ran = true;
+        self.ok = false;
+        self.tally
+            .note(&format!("{label} import failed"), 1, reason);
+    }
+
+    /// Record the run under `infigraph_dir`; nothing if no indexer result or
+    /// import was seen (a cancelled run, or none to run).
+    pub(crate) fn finish(self, infigraph_dir: &Path) {
+        if !self.ran {
+            return;
+        }
+        let summary = if self.ok {
+            format!(
+                "imported {} indexer output(s), {} unchanged",
+                self.imported, self.unchanged
+            )
+        } else {
+            format!(
+                "enrichment incomplete: {} imported, {} unchanged",
+                self.imported, self.unchanged
+            )
+        };
+        infigraph_core::last_run::record(
+            infigraph_dir,
+            infigraph_core::last_run::Kind::Scip,
+            infigraph_core::last_run::RunRecord::new(self.ok, summary, self.tally),
+        );
+    }
 }
 
 /// Part B+C of SCIP enrichment: import each indexer's `.scip` results into
@@ -1372,27 +1494,37 @@ async fn run_cancellable_indexer_batch(
 pub(crate) fn import_scip_results_and_embed(
     root: &Path,
     prism: &Infigraph,
-    results: &[(&'static str, PathBuf, bool)],
+    results: &[IndexerResult],
 ) {
     let scip_tmp = root.join(".infigraph").join("scip-tmp");
 
     let Some(backend) = prism.backend() else {
-        for (_, scip_path, _) in results {
-            let _ = std::fs::remove_file(scip_path);
+        for result in results {
+            let _ = std::fs::remove_file(&result.path);
         }
         let _ = std::fs::remove_dir(&scip_tmp);
         return;
     };
-    for (label, scip_path, success) in results {
-        if *success && scip_path.exists() {
-            match backend.import_scip_index(scip_path, Some(root)) {
-                Ok(stats) => eprintln!("Auto-SCIP: {label} {stats}"),
-                Err(e) => eprintln!("Auto-SCIP: {label} import failed: {e}"),
+    let mut run = ScipRun::new();
+    for result in results {
+        run.indexer_result(result);
+        if result.verdict.is_ok() && result.path.exists() {
+            let label = result.label;
+            match backend.import_scip_index(&result.path, Some(root)) {
+                Ok(stats) => {
+                    eprintln!("Auto-SCIP: {label} {stats}");
+                    run.imported(&stats);
+                }
+                Err(e) => {
+                    eprintln!("Auto-SCIP: {label} import failed: {e}");
+                    run.import_failed(label, &format!("{e:#}"));
+                }
             }
         }
-        let _ = std::fs::remove_file(scip_path);
+        let _ = std::fs::remove_file(&result.path);
     }
     let _ = std::fs::remove_dir(&scip_tmp);
+    run.finish(&root.join(".infigraph"));
 
     // Embed any new symbols SCIP added (skips existing embeddings)
     let root_buf = root.to_path_buf();
@@ -1524,7 +1656,7 @@ async fn run_scip_indexer_to(
     bin: &Path,
     indexer: &crate::scip_download::ScipIndexer,
     output_path: &Path,
-) -> bool {
+) -> IndexerVerdict {
     let label = indexer.binary_name;
     eprintln!("Auto-SCIP: running {label}...");
 
@@ -1565,12 +1697,14 @@ async fn run_scip_indexer_to(
         run.run(indexer.scip_args).await
     };
 
-    if produced && std::fs::rename(&partial, output_path).is_ok() {
-        return true;
+    if produced.is_ok() && std::fs::rename(&partial, output_path).is_ok() {
+        return Ok(());
     }
     // Failed, timed out, or the rename lost: leave nothing adoptable behind.
     let _ = std::fs::remove_file(&partial);
-    false
+    produced.and(Err(
+        "its finished output could not be moved into place".to_string()
+    ))
 }
 
 /// The command for one indexer attempt: arguments, cwd, the extra runtime
@@ -1675,6 +1809,31 @@ enum IndexerFailure {
     Rejected(infigraph_core::scip::ScipRejected),
 }
 
+impl IndexerFailure {
+    /// Why the attempt left nothing usable, for the `scip` last-run record.
+    fn reason(&self) -> String {
+        match self {
+            IndexerFailure::Spawn(e) | IndexerFailure::Wait(e) => format!("could not run it: {e}"),
+            IndexerFailure::Exited(s) => format!("exited with {s}"),
+            IndexerFailure::TimedOut(t) => format!("timed out after {t:?}"),
+            IndexerFailure::NoOutput => "exited 0 but left no output".to_string(),
+            IndexerFailure::Rejected(r) => r.reason.to_string(),
+        }
+    }
+}
+
+/// An indexer attempt's verdict: `Ok`, or why it left nothing usable.
+type IndexerVerdict = Result<(), String>;
+
+/// One indexer's result in an enrichment run: where its output is (empty when
+/// it has none) and its verdict.
+#[derive(Debug)]
+pub(crate) struct IndexerResult {
+    pub(crate) label: &'static str,
+    pub(crate) path: PathBuf,
+    pub(crate) verdict: IndexerVerdict,
+}
+
 /// What one indexer attempt did: how it failed, if it did, and the tail of
 /// its stderr. The message is built from this value in one place
 /// (`report_indexer_outcome`); the tail is also what a caller or a test can
@@ -1686,8 +1845,26 @@ struct IndexerOutcome {
 }
 
 impl IndexerOutcome {
+    #[cfg(test)]
     fn succeeded(&self) -> bool {
         self.failure.is_none()
+    }
+
+    /// The last thing the indexer said on stderr, worded for a message.
+    fn last_stderr_note(&self) -> String {
+        self.stderr_tail
+            .lines()
+            .rev()
+            .find(|l| !l.trim().is_empty())
+            .map(|l| format!(" (last stderr line: {})", l.trim()))
+            .unwrap_or_default()
+    }
+
+    fn verdict(&self) -> IndexerVerdict {
+        match &self.failure {
+            None => Ok(()),
+            Some(failure) => Err(format!("{}{}", failure.reason(), self.last_stderr_note())),
+        }
     }
 }
 
@@ -1722,13 +1899,7 @@ pub(crate) fn discard_output_after_failed_import(label: &str, scip_path: &Path) 
 
 /// The wording of [`report_indexer_outcome`], so a test can read it.
 fn indexer_outcome_message(label: &str, outcome: &IndexerOutcome) -> Option<String> {
-    let last = outcome
-        .stderr_tail
-        .lines()
-        .rev()
-        .find(|l| !l.trim().is_empty())
-        .map(|l| format!(" (last stderr line: {})", l.trim()))
-        .unwrap_or_default();
+    let last = outcome.last_stderr_note();
     match outcome.failure.as_ref()? {
         IndexerFailure::Spawn(e) | IndexerFailure::Wait(e) => {
             Some(format!("Auto-SCIP: failed to run {label}: {e}"))
@@ -1741,7 +1912,9 @@ fn indexer_outcome_message(label: &str, outcome: &IndexerOutcome) -> Option<Stri
             "Auto-SCIP: {label} {}{last}; its output was discarded",
             r.reason
         )),
-        IndexerFailure::NoOutput => None,
+        IndexerFailure::NoOutput => Some(format!(
+            "Auto-SCIP: {label} exited 0 but left no output{last}"
+        )),
     }
 }
 
@@ -1759,7 +1932,7 @@ async fn run_scip_indexer_cmd_async(
     output_flag: Option<&str>,
     output_path: &Path,
     timeout: std::time::Duration,
-) -> bool {
+) -> IndexerVerdict {
     run_indexer(
         root,
         cmd,
@@ -1771,7 +1944,7 @@ async fn run_scip_indexer_cmd_async(
         timeout,
     )
     .await
-    .succeeded()
+    .verdict()
 }
 
 /// How often a queued indexer retries for a machine-wide slot.
@@ -1928,7 +2101,7 @@ struct IndexerRun<'a> {
 
 impl IndexerRun<'_> {
     /// One attempt with `args`.
-    async fn run(&self, args: &[&str]) -> bool {
+    async fn run(&self, args: &[&str]) -> IndexerVerdict {
         run_scip_indexer_cmd_async(
             self.root,
             self.cmd,
@@ -1947,7 +2120,7 @@ impl IndexerRun<'_> {
     /// fails; anything else is a single attempt. `say` carries the two
     /// chain progress lines (the callers differ in which stream they use).
     /// Each attempt gets its own timeout.
-    async fn run_scip_java(&self, base_args: &[&str], say: fn(&str)) -> bool {
+    async fn run_scip_java(&self, base_args: &[&str], say: fn(&str)) -> IndexerVerdict {
         let root = self.root;
         let has_gradle = root.join("build.gradle").exists()
             || root.join("build.gradle.kts").exists()
@@ -1977,8 +2150,9 @@ impl IndexerRun<'_> {
         if self
             .run(&[base_args, &["--build-tool", primary]].concat())
             .await
+            .is_ok()
         {
-            return true;
+            return Ok(());
         }
         say(&format!(
             "Auto-SCIP: {primary} failed, falling back to {fallback}"
@@ -2197,7 +2371,8 @@ mod tests {
             &output_path,
             std::time::Duration::from_secs(5),
         )
-        .await;
+        .await
+        .is_ok();
         assert!(
             !succeeded,
             "no output_flag and no index.scip produced means false, matching today's contract"
@@ -2217,7 +2392,8 @@ mod tests {
             &output_path,
             std::time::Duration::from_secs(5),
         )
-        .await;
+        .await
+        .is_ok();
         assert!(!failing_succeeded);
     }
 
@@ -2245,7 +2421,8 @@ mod tests {
             &output_path,
             std::time::Duration::from_millis(200),
         )
-        .await;
+        .await
+        .is_ok();
         let elapsed = start.elapsed();
         assert!(!succeeded, "a timed-out indexer must report failure");
         assert!(
@@ -2296,7 +2473,8 @@ mod tests {
             &output_path,
             std::time::Duration::from_millis(1500),
         )
-        .await;
+        .await
+        .is_ok();
         assert!(!succeeded);
         assert!(started.elapsed() < std::time::Duration::from_secs(10));
 
@@ -2558,7 +2736,7 @@ mod tests {
             timeout: std::time::Duration::from_millis(800),
         };
         let started = std::time::Instant::now();
-        let ok = run.run_scip_java(&["index"], |_| {}).await;
+        let ok = run.run_scip_java(&["index"], |_| {}).await.is_ok();
         assert!(ok, "the maven fallback should have produced the index");
         assert!(output_path.exists());
         assert!(
@@ -2613,14 +2791,15 @@ mod tests {
             &sibling_out,
             std::time::Duration::from_secs(10),
         )
-        .await;
+        .await
+        .is_ok();
         assert!(sibling_ok);
         assert!(
             started.elapsed() < std::time::Duration::from_secs(2),
             "the sibling waited {:?} behind scip-java",
             started.elapsed()
         );
-        assert!(java.await.unwrap());
+        assert!(java.await.unwrap().is_ok());
     }
 
     /// Part B (scope extension): `run_scip_indexers`' cancellation
@@ -2711,7 +2890,7 @@ mod tests {
             1,
             "only the first job's result should be present, got {results:?}"
         );
-        assert_eq!(results[0].0, "first");
+        assert_eq!(results[0].label, "first");
         assert!(
             !second_started.load(std::sync::atomic::Ordering::SeqCst),
             "the second indexer must never be launched once the token is cancelled"
