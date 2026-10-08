@@ -1846,7 +1846,7 @@ struct IndexerOutcome {
 }
 
 impl IndexerOutcome {
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn succeeded(&self) -> bool {
         self.failure.is_none()
     }
