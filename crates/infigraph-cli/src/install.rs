@@ -524,13 +524,37 @@ pub(crate) fn self_update(version: &str) -> Result<()> {
     Ok(())
 }
 
+/// Waits between launch attempts while the kernel answers "text file busy".
+/// About 0.6 s in all: the window is the few microseconds between a forked
+/// sibling inheriting the descriptor a binary was just written through and
+/// that sibling's own exec closing it.
+const TEXT_FILE_BUSY_BACKOFF_MS: [u64; 6] = [10, 20, 40, 80, 160, 320];
+
+/// Run `op` (a spawn), retrying with a bounded backoff while it fails with
+/// ETXTBSY. Writing a binary and launching it at once -- exactly what the
+/// R8.2 launch check does to a freshly extracted update -- races any other
+/// thread of the process that forks in between: the child briefly holds the
+/// write descriptor, and exec of a file open for writing is refused. Only
+/// that error is retried; anything else, and a file that stays busy past the
+/// budget, comes back as it is.
+fn retry_while_text_file_busy<T>(mut op: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
+    for delay_ms in TEXT_FILE_BUSY_BACKOFF_MS {
+        match op() {
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            }
+            done => return done,
+        }
+    }
+    op()
+}
+
 /// R8.2: does the binary at `path` start and answer `--version` with exit
 /// 0? Returns its first stdout line on success.
 fn verify_binary_launches(path: &Path) -> Result<String> {
-    let output = std::process::Command::new(path)
-        .arg("--version")
-        .output()
-        .with_context(|| format!("failed to execute {}", path.display()))?;
+    let output =
+        retry_while_text_file_busy(|| std::process::Command::new(path).arg("--version").output())
+            .with_context(|| format!("failed to execute {}", path.display()))?;
     if !output.status.success() {
         anyhow::bail!("exited with {:?}", output.status.code());
     }
@@ -819,6 +843,71 @@ mod tests {
             verify_binary_launches(&tmp.path().join("missing")).is_err(),
             "a binary that is not there did not launch"
         );
+    }
+
+    #[test]
+    fn retry_while_text_file_busy_retries_etxtbsy_then_succeeds() {
+        let mut calls = 0;
+        let result = retry_while_text_file_busy(|| {
+            calls += 1;
+            if calls < 3 {
+                Err(std::io::Error::from(std::io::ErrorKind::ExecutableFileBusy))
+            } else {
+                Ok("launched")
+            }
+        });
+        assert_eq!(result.unwrap(), "launched");
+        assert_eq!(calls, 3, "two busy answers, then the launch");
+    }
+
+    #[test]
+    fn retry_while_text_file_busy_gives_up_after_a_bounded_number_of_tries() {
+        let mut calls = 0;
+        let result: std::io::Result<()> = retry_while_text_file_busy(|| {
+            calls += 1;
+            Err(std::io::Error::from(std::io::ErrorKind::ExecutableFileBusy))
+        });
+        assert_eq!(
+            result.unwrap_err().kind(),
+            std::io::ErrorKind::ExecutableFileBusy,
+            "a file that stays busy is still an error, not a hang"
+        );
+        assert_eq!(calls, TEXT_FILE_BUSY_BACKOFF_MS.len() + 1);
+    }
+
+    #[test]
+    fn retry_while_text_file_busy_does_not_retry_other_errors() {
+        let mut calls = 0;
+        let result: std::io::Result<()> = retry_while_text_file_busy(|| {
+            calls += 1;
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+        });
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(calls, 1, "only ETXTBSY is worth waiting out");
+    }
+
+    /// The real race, on the platform that has it: a script someone still
+    /// holds open for writing cannot be exec'd until they close it.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn verify_binary_launches_waits_out_a_script_still_open_for_writing() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let script = tmp.path().join("just-written");
+        let mut writer = std::fs::File::create(&script).unwrap();
+        writer
+            .write_all(b"#!/bin/sh\necho fake-tool 9.9.9\n")
+            .unwrap();
+        writer.flush().unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // The handle closes shortly after the launch check starts.
+        let closer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            drop(writer);
+        });
+        assert_eq!(verify_binary_launches(&script).unwrap(), "fake-tool 9.9.9");
+        closer.join().unwrap();
     }
 
     #[test]
