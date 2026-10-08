@@ -2,13 +2,19 @@
 # Infigraph UserPromptSubmit hook — nudge /clear when real context usage is high.
 # Reads actual usage from the statusline hook's per-session snapshot (statusline-command.sh
 # writes context_window.{used_percentage,context_window_size,total_input_tokens} on every
-# render, far more often than prompts are submitted); falls back to a transcript-size
-# estimate only when no fresh snapshot exists. Priority: own event's context_window (not
-# present on UserPromptSubmit as of this writing, checked defensively in case that changes)
-# -> fresh (<=10min) statusline snapshot -> transcript-size estimate against this account's
-# real window size (1,000,000 tokens -- NOT the 200k default; using 200k here previously
-# produced nonsensical 191%/310%/387%-style readings). Fires at THRESHOLD_PCT (default 70),
-# then suppresses repeats for REPEAT_TURNS turns (default 5) while still over threshold.
+# render). Priority: own event's context_window (not present on UserPromptSubmit as of this
+# writing, checked defensively in case that changes) -> a fresh (<=10min) snapshot -> a
+# transcript-size estimate, used ONLY when no snapshot was ever written for this session.
+#
+# A snapshot older than 10 minutes means "unknown", not "fall back to the transcript":
+# the statusline renders only while the UI is active, so it goes stale across every long
+# wait between prompts, and the transcript file keeps the whole pre-/compact history, so its
+# size reads as far more than the live context (a session at 17% read as 173% and nudged on
+# every fifth turn). Stale therefore stays silent. The estimate that remains counts from the
+# last compaction boundary: that record's postTokens plus the bytes written since, at ~4
+# bytes/token, against this account's real window (1,000,000 tokens, not the 200k default).
+# Fires at THRESHOLD_PCT (default 70), then suppresses repeats for REPEAT_TURNS turns
+# (default 5) while still over threshold.
 
 input=$(cat)
 session_id=$(echo "$input" | jq -r '.session_id // empty')
@@ -41,29 +47,31 @@ echo "$count" > "$counter_file"
 # (confirmed by watching it fire live), but check first in case that ever changes.
 used_pct=$(echo "$input" | jq -r '.context_window.used_percentage // empty')
 
-# 2) Fresh statusline snapshot -- the accurate common case. statusline-command.sh
-# writes this atomically (temp+rename) on every render.
-if [ -z "$used_pct" ]; then
-  snapshot="$counter_dir/$session_id.statusline_usage.json"
-  if [ -f "$snapshot" ]; then
-    snap_ts=$(jq -r '.ts // empty' "$snapshot" 2>/dev/null)
-    if [ -n "$snap_ts" ]; then
-      now=$(date +%s)
-      snap_ts_int=$(printf '%.0f' "$snap_ts" 2>/dev/null || echo 0)
-      if [ "$snap_ts_int" -gt 0 ] && [ $((now - snap_ts_int)) -lt 600 ]; then
-        used_pct=$(jq -r '.used_percentage // empty' "$snapshot" 2>/dev/null)
-      fi
-    fi
-  fi
+# 2) Statusline snapshot -- the accurate common case. statusline-command.sh writes it
+# atomically (temp+rename) on every render. A stale one is "unknown": exit, do not guess.
+snapshot="$counter_dir/$session_id.statusline_usage.json"
+if [ -z "$used_pct" ] && [ -f "$snapshot" ]; then
+  snap_ts=$(jq -r '.ts // empty' "$snapshot" 2>/dev/null)
+  snap_ts_int=$(printf '%.0f' "${snap_ts:-0}" 2>/dev/null || echo 0)
+  [ $(( $(date +%s) - snap_ts_int )) -lt 600 ] || exit 0
+  used_pct=$(jq -r '.used_percentage // empty' "$snapshot" 2>/dev/null)
 fi
 
-# 3) Last resort: estimate from the transcript's raw size. ~4 bytes/token is a
-# standard rough estimate for English/code text.
-if [ -z "$used_pct" ]; then
+# 3) No snapshot has ever been written (statusline not installed): estimate from the
+# transcript, counting from the last compaction boundary so history that /compact already
+# dropped is not counted again.
+if [ -z "$used_pct" ] && [ ! -f "$snapshot" ]; then
   transcript_path=$(echo "$input" | jq -r '.transcript_path // empty')
   if [ -n "$transcript_path" ] && [ -f "$transcript_path" ]; then
-    bytes=$(wc -c < "$transcript_path" 2>/dev/null | tr -d ' ')
-    [ -n "$bytes" ] && used_pct=$(awk -v b="$bytes" -v w="$WINDOW_TOKENS" 'BEGIN{printf "%.0f", (b/4/w)*100}')
+    boundary=$(awk '/"subtype":"compact_boundary"/{n=NR} END{print n+0}' "$transcript_path")
+    base_tokens=0
+    if [ "$boundary" -gt 0 ]; then
+      base_tokens=$(sed -n "${boundary}p" "$transcript_path" | jq -r '.compactMetadata.postTokens // 0' 2>/dev/null)
+      bytes=$(tail -n +"$boundary" "$transcript_path" | wc -c | tr -d ' ')
+    else
+      bytes=$(wc -c < "$transcript_path" 2>/dev/null | tr -d ' ')
+    fi
+    [ -n "$bytes" ] && used_pct=$(awk -v b="$bytes" -v t="${base_tokens:-0}" -v w="$WINDOW_TOKENS" 'BEGIN{printf "%.0f", ((t + b/4)/w)*100}')
   fi
 fi
 
