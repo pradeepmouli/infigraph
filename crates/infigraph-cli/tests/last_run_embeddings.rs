@@ -57,4 +57,11 @@ fn a_daemon_whose_embeddings_cannot_be_saved_records_why() {
         problem.summary.contains("embedding update failed"),
         "{problem:?}"
     );
+    // The embeddings update runs after the drain's own run has ended, not
+    // inside it: the daemon's one-run-at-a-time assumption holds, and a change
+    // that nests them would flag both records (and log it) rather than pass.
+    assert!(
+        !problem.overlapped,
+        "the update overlapped another run: {problem:?}"
+    );
 }
