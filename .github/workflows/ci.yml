@@ -91,3 +91,88 @@ jobs:
       - name: Test
         if: runner.os != 'Windows'
         run: cargo test --all --no-fail-fast
+
+  # R8.5 (#88): a graph written by the previous release must still open with
+  # this build -- the same query results, or a clean storage-version refusal,
+  # never a wipe. Guards R8.1 (#140) for good. One Linux runner: the open path
+  # is the same code on every platform, and a cold tag build is minutes.
+  #
+  # "Previous release" is the newest `v*` tag reachable from HEAD that is not
+  # HEAD itself (this fork publishes tags, not GitHub releases). Only the tag's
+  # binary is cached, keyed on the tag's commit, so a tag builds once and every
+  # later run restores it in seconds. The newest tag only: while its lbug
+  # matches HEAD's (or HEAD's reads and upgrades its storage version in place,
+  # as 0.16 -> 0.20 does) a second tag adds nothing. The day a tag's lbug
+  # cannot be read by HEAD's, the same test starts exercising the refusal
+  # branch of its checker with no change here.
+  upgrade:
+    name: Upgrade smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # tags and the history `git tag --merged` walks
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/share/swift /usr/local/share/powershell /usr/local/share/chromium \
+            /usr/local/lib/node_modules /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force || true
+      - uses: dtolnay/rust-toolchain@1.98.0
+      - name: Find the previous release
+        id: prev
+        run: |
+          head_sha=$(git rev-parse HEAD)
+          for tag in $(git tag --merged HEAD --sort=-v:refname --list 'v*'); do
+            sha=$(git rev-parse "$tag^{commit}")
+            if [ "$sha" != "$head_sha" ]; then
+              echo "tag=$tag" >> "$GITHUB_OUTPUT"
+              echo "sha=$sha" >> "$GITHUB_OUTPUT"
+              echo "previous release: $tag ($sha)"
+              exit 0
+            fi
+          done
+          echo "::error::no v* tag is an ancestor of HEAD, so there is no previous release to upgrade from"
+          exit 1
+      - name: Restore the previous release's binary
+        id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: old-bin/infigraph
+          key: infigraph-${{ steps.prev.outputs.sha }}-${{ runner.os }}-${{ runner.arch }}
+      # A failed build fails the job: the test below must never be reached
+      # without the binary, and must never be skipped for want of one.
+      - name: Build the previous release
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          git worktree add --detach ../previous "${{ steps.prev.outputs.sha }}"
+          cargo build --release -p infigraph-cli --manifest-path ../previous/Cargo.toml \
+            --target-dir ../previous-target
+          mkdir -p old-bin
+          cp ../previous-target/release/infigraph old-bin/infigraph
+      - name: Save the previous release's binary
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: old-bin/infigraph
+          key: infigraph-${{ steps.prev.outputs.sha }}-${{ runner.os }}-${{ runner.arch }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ci-upgrade
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-on-failure: true
+      # INFIGRAPH_REQUIRE_UPGRADE_TEST makes a missing binary a failure rather
+      # than a skip, and the marker the test prints only after all three
+      # passes judged clean proves it ran: a filtered-out or skipped test
+      # prints nothing and fails the grep.
+      - name: Open the previous release's graph with this build
+        env:
+          OLD_INFIGRAPH_BIN: ${{ github.workspace }}/old-bin/infigraph
+          INFIGRAPH_REQUIRE_UPGRADE_TEST: "1"
+        run: |
+          set -o pipefail
+          "$OLD_INFIGRAPH_BIN" --version
+          cargo test -p infigraph-cli --test upgrade_smoke -- --nocapture --test-threads=1 \
+            2>&1 | tee upgrade.log
+          grep -q 'UPGRADE_SMOKE_RAN passes=3' upgrade.log
+          grep -E 'UPGRADE_SMOKE_RAN pass=' upgrade.log
