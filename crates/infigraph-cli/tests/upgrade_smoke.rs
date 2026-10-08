@@ -10,6 +10,14 @@
 //! missing or unrunnable binary into a failure, so a broken job cannot pass
 //! by skipping.
 //!
+//! A wipe-and-rebuild-from-source would look like success on the symbol ids
+//! alone: the fixture's source is still there to re-index. Two things tell it
+//! apart. `judge` fails any open that printed `OPEN_FAILED_NOTICE`, the line
+//! `init()` prints before it destroys a graph that will not open; and the old
+//! side ingests one structured row (`infigraph ingest`, present since well
+//! before v3.2.16) that no source file can regenerate, which must survive all
+//! three passes.
+//!
 //! Which outcome the real pair of builds gives depends on their lbug
 //! versions. While both read the same storage version (or the newer one reads
 //! the older and upgrades it in place, as lbug 0.16 -> 0.20 does) the outcome
@@ -23,6 +31,7 @@ use std::process::{Command, Output};
 use std::time::Duration;
 
 use infigraph_core::graph::storage_version_mismatch_context;
+use infigraph_core::OPEN_FAILED_NOTICE;
 
 /// Path of the previous release's `infigraph`, set by the workflow.
 const OLD_BIN_ENV: &str = "OLD_INFIGRAPH_BIN";
@@ -33,13 +42,27 @@ const REQUIRE_ENV: &str = "INFIGRAPH_REQUIRE_UPGRADE_TEST";
 const RAN_MARKER: &str = "UPGRADE_SMOKE_RAN";
 /// Every symbol id, in a fixed order: one id per line on stdout.
 const SYMBOL_IDS: &str = "MATCH (s:Symbol) RETURN s.id ORDER BY s.id";
+/// The structured row the old side ingests (below): it lives only in the graph.
+const PROBE_ROWS: &str = "MATCH (p:UpgradeProbe) RETURN p.id, p.note ORDER BY p.id";
+const PROBE_SCHEMA_ID: &str = "upgrade_probe";
+const PROBE_SCHEMA: &str = "[schema]\nschema_id = \"upgrade_probe\"\nname = \"Upgrade probe\"\n\
+                            node_table = \"UpgradeProbe\"\n\n\
+                            [[schema.columns]]\nname = \"note\"\ncol_type = \"STRING\"\n";
+const PROBE_DATA: &str = r#"[{"id": "probe-1", "note": "no source file can regenerate this"}]"#;
+
+/// What a graph answers: every symbol id, and the probe rows.
+#[derive(Debug, Clone, PartialEq)]
+struct Snapshot {
+    ids: Vec<String>,
+    probe: Vec<String>,
+}
 
 /// What this build did when it opened the previous release's graph.
 struct Observed {
     /// The opening command exited zero.
     succeeded: bool,
-    /// Symbol ids a query returned afterwards (empty if nothing could be read).
-    ids: Vec<String>,
+    /// What the graph answered afterwards (empty if nothing could be read).
+    snapshot: Snapshot,
     /// stdout + stderr of the opening command.
     output: String,
     /// The graph file's bytes are identical to before the open.
@@ -55,22 +78,35 @@ enum Outcome {
 }
 
 /// The one place that decides which outcomes R8.1 allows.
-fn judge(baseline: &[String], seen: &Observed) -> Result<Outcome, String> {
+fn judge(baseline: &Snapshot, seen: &Observed) -> Result<Outcome, String> {
     if seen.quarantined {
         return Err(
             "the graph was quarantined: an open must never treat a good graph as corrupt".into(),
         );
     }
     if seen.succeeded {
-        return if seen.ids == baseline {
-            Ok(Outcome::SameResults)
-        } else {
-            Err(format!(
+        // A wipe that re-indexed from source leaves the same symbols behind;
+        // only its notice and the probe row give it away.
+        if seen.output.contains(OPEN_FAILED_NOTICE) {
+            return Err(format!(
+                "the open succeeded only by destroying the graph and starting over:\n{}",
+                seen.output
+            ));
+        }
+        if seen.snapshot.ids != baseline.ids {
+            return Err(format!(
                 "the open succeeded but the symbols differ: {} before, {} after",
-                baseline.len(),
-                seen.ids.len()
-            ))
-        };
+                baseline.ids.len(),
+                seen.snapshot.ids.len()
+            ));
+        }
+        if seen.snapshot.probe != baseline.probe {
+            return Err(format!(
+                "the open succeeded but the ingested row did not survive: {:?} before, {:?} after",
+                baseline.probe, seen.snapshot.probe
+            ));
+        }
+        return Ok(Outcome::SameResults);
     }
     // The text a refusal carries, minus the path it starts with.
     let refusal = storage_version_mismatch_context(Path::new(""));
@@ -156,27 +192,33 @@ fn lock_is_free(root: &Path, name: &str) -> bool {
     file.try_lock_exclusive().is_ok()
 }
 
-/// Open the project with this build through `open_args`, then read every
-/// symbol id back.
+/// Ask a graph both questions through `query` (one cypher string in, the
+/// command's output out). `None` if either fails.
+fn snapshot(query: impl Fn(&str) -> Output) -> Option<Snapshot> {
+    let ids = query(SYMBOL_IDS);
+    let probe = query(PROBE_ROWS);
+    (ids.status.success() && probe.status.success()).then(|| Snapshot {
+        ids: lines(&ids),
+        probe: lines(&probe),
+    })
+}
+
+/// Open the project with this build through `open_args`, then ask it both
+/// questions.
 fn open_with_head(root: &Path, home: &Path, backend: &str, open_args: &[&str]) -> Observed {
     let before = graph_bytes(root);
     let opened = support::run(root, home, backend, open_args);
     let succeeded = opened.status.success();
-    let ids = if !succeeded {
-        Vec::new()
-    } else if open_args[0] == "query" {
-        lines(&opened)
-    } else {
-        let read = support::run(root, home, backend, &["query", SYMBOL_IDS]);
-        if read.status.success() {
-            lines(&read)
-        } else {
-            Vec::new()
-        }
-    };
+    let snapshot = succeeded
+        .then(|| snapshot(|q| support::run(root, home, backend, &["query", q])))
+        .flatten()
+        .unwrap_or(Snapshot {
+            ids: Vec::new(),
+            probe: Vec::new(),
+        });
     Observed {
         succeeded,
-        ids,
+        snapshot,
         output: combined(&opened),
         graph_unchanged: graph_bytes(root) == before,
         quarantined: quarantined(root),
@@ -227,15 +269,33 @@ fn upgrading_from_the_previous_release_keeps_the_graph_readable() {
         .output()
         .unwrap();
     support::assert_ok(&indexed, "previous release: index");
-    let queried = old_command(&old_bin, &root, &home)
-        .args(["query", SYMBOL_IDS])
+    // One row no source file can regenerate: if an open wipes the graph and
+    // re-indexes, the symbols come back and this does not.
+    let schemas = root.join(".infigraph").join("structured-schemas");
+    std::fs::create_dir_all(&schemas).unwrap();
+    std::fs::write(
+        schemas.join(format!("{PROBE_SCHEMA_ID}.toml")),
+        PROBE_SCHEMA,
+    )
+    .unwrap();
+    let data = sandbox.path().join("probe.json");
+    std::fs::write(&data, PROBE_DATA).unwrap();
+    let ingested = old_command(&old_bin, &root, &home)
+        .args(["ingest", "--schema", PROBE_SCHEMA_ID, "--data-file"])
+        .arg(&data)
         .output()
         .unwrap();
-    support::assert_ok(&queried, "previous release: query");
-    let baseline = lines(&queried);
+    support::assert_ok(&ingested, "previous release: ingest");
+    let baseline = snapshot(|q| {
+        old_command(&old_bin, &root, &home)
+            .args(["query", q])
+            .output()
+            .unwrap()
+    })
+    .expect("the previous release could not answer its own queries");
     assert!(
-        !baseline.is_empty(),
-        "the previous release indexed no symbols, so there is nothing to upgrade"
+        !baseline.ids.is_empty() && baseline.probe.len() == 1,
+        "the previous release's graph is not what the test needs: {baseline:?}"
     );
     let stopped = old_command(&old_bin, &root, &home)
         .arg("watch-stop")
@@ -309,10 +369,21 @@ fn ids(names: &[&str]) -> Vec<String> {
     names.iter().map(|s| s.to_string()).collect()
 }
 
+fn snap(symbols: &[&str], probe: &[&str]) -> Snapshot {
+    Snapshot {
+        ids: ids(symbols),
+        probe: ids(probe),
+    }
+}
+
+fn base() -> Snapshot {
+    snap(&["a", "b"], &["p | row"])
+}
+
 fn good() -> Observed {
     Observed {
         succeeded: true,
-        ids: ids(&["a", "b"]),
+        snapshot: base(),
         output: String::new(),
         graph_unchanged: false,
         quarantined: false,
@@ -321,25 +392,25 @@ fn good() -> Observed {
 
 #[test]
 fn judge_accepts_the_same_symbols() {
-    assert_eq!(judge(&ids(&["a", "b"]), &good()), Ok(Outcome::SameResults));
+    assert_eq!(judge(&base(), &good()), Ok(Outcome::SameResults));
 }
 
 #[test]
 fn judge_fails_a_graph_wiped_to_nothing() {
     let wiped = Observed {
-        ids: ids(&[]),
+        snapshot: snap(&[], &[]),
         ..good()
     };
-    assert!(judge(&ids(&["a", "b"]), &wiped).is_err());
+    assert!(judge(&base(), &wiped).is_err());
 }
 
 #[test]
 fn judge_fails_a_graph_that_lost_symbols() {
     let shrunk = Observed {
-        ids: ids(&["a"]),
+        snapshot: snap(&["a"], &["p | row"]),
         ..good()
     };
-    assert!(judge(&ids(&["a", "b"]), &shrunk).is_err());
+    assert!(judge(&base(), &shrunk).is_err());
 }
 
 #[test]
@@ -348,14 +419,14 @@ fn judge_fails_a_quarantined_graph_even_if_it_was_rebuilt_to_match() {
         quarantined: true,
         ..good()
     };
-    assert!(judge(&ids(&["a", "b"]), &rebuilt).is_err());
+    assert!(judge(&base(), &rebuilt).is_err());
 }
 
 #[test]
 fn judge_accepts_a_clean_refusal() {
     let refused = Observed {
         succeeded: false,
-        ids: ids(&[]),
+        snapshot: snap(&[], &[]),
         output: format!(
             "Error: {}: ...",
             storage_version_mismatch_context(Path::new("/p/.infigraph/graph"))
@@ -363,32 +434,50 @@ fn judge_accepts_a_clean_refusal() {
         graph_unchanged: true,
         quarantined: false,
     };
-    assert_eq!(
-        judge(&ids(&["a", "b"]), &refused),
-        Ok(Outcome::CleanRefusal)
-    );
+    assert_eq!(judge(&base(), &refused), Ok(Outcome::CleanRefusal));
 }
 
 #[test]
 fn judge_fails_a_refusal_that_touched_the_graph() {
     let refused = Observed {
         succeeded: false,
-        ids: ids(&[]),
+        snapshot: snap(&[], &[]),
         output: storage_version_mismatch_context(Path::new("/p/.infigraph/graph")),
         graph_unchanged: false,
         quarantined: false,
     };
-    assert!(judge(&ids(&["a", "b"]), &refused).is_err());
+    assert!(judge(&base(), &refused).is_err());
 }
 
 #[test]
 fn judge_fails_a_crash_that_is_not_the_refusal() {
     let crashed = Observed {
         succeeded: false,
-        ids: ids(&[]),
+        snapshot: snap(&[], &[]),
         output: "thread 'main' panicked".into(),
         graph_unchanged: true,
         quarantined: false,
     };
-    assert!(judge(&ids(&["a", "b"]), &crashed).is_err());
+    assert!(judge(&base(), &crashed).is_err());
+}
+
+#[test]
+fn judge_fails_a_wipe_and_rebuild_that_brought_every_symbol_back() {
+    // Same symbols, same probe row (a lucky one), exit zero -- but the open
+    // announced it was destroying the graph first.
+    let rebuilt = Observed {
+        output: format!("{OPEN_FAILED_NOTICE} after 4 attempts (...), quarantining the graph"),
+        ..good()
+    };
+    assert!(judge(&base(), &rebuilt).is_err());
+}
+
+#[test]
+fn judge_fails_a_rebuild_that_lost_the_row_source_cannot_regenerate() {
+    // No notice at all, every symbol present: only the ingested row is gone.
+    let rebuilt = Observed {
+        snapshot: snap(&["a", "b"], &[]),
+        ..good()
+    };
+    assert!(judge(&base(), &rebuilt).is_err());
 }

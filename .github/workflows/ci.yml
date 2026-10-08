@@ -94,20 +94,30 @@ jobs:
 
   # R8.5 (#88): a graph written by the previous release must still open with
   # this build -- the same query results, or a clean storage-version refusal,
-  # never a wipe. Guards R8.1 (#140) for good. One Linux runner: the open path
-  # is the same code on every platform, and a cold tag build is minutes.
+  # never a wipe or a silent rebuild. Guards R8.1 (#140) for good. One Linux
+  # runner: the open path is the same code on every platform.
   #
   # "Previous release" is the newest `v*` tag reachable from HEAD that is not
-  # HEAD itself (this fork publishes tags, not GitHub releases). Only the tag's
-  # binary is cached, keyed on the tag's commit, so a tag builds once and every
-  # later run restores it in seconds. The newest tag only: while its lbug
-  # matches HEAD's (or HEAD's reads and upgrades its storage version in place,
-  # as 0.16 -> 0.20 does) a second tag adds nothing. The day a tag's lbug
-  # cannot be read by HEAD's, the same test starts exercising the refusal
-  # branch of its checker with no change here.
+  # HEAD itself. This fork publishes no releases and carries no v3.x tags, so
+  # the job fetches the upstream project's tags first (public, no auth, tags
+  # only: nothing is pushed anywhere, and pushing a `v*` tag to the fork would
+  # start release.yml). The fetch and the ancestry check fail the job loudly.
+  #
+  # Only the tag's binary is cached, keyed on the tag's commit, so a tag is
+  # built once -- about 30 minutes on a runner -- and every later run restores
+  # it in seconds. Caches are readable only from the branch that saved them,
+  # its base and the default branch, so the first run on each new branch pays
+  # the build again. The newest tag only: while its lbug matches HEAD's (or
+  # HEAD's reads and upgrades its storage version in place, as 0.16 -> 0.20
+  # does) a second tag adds nothing. The day a tag's lbug cannot be read by
+  # HEAD's, the same test starts exercising the refusal branch of its checker
+  # with no change here.
   upgrade:
     name: Upgrade smoke test
     runs-on: ubuntu-latest
+    # A cold build of the previous tag is ~30 minutes; this stops a hung
+    # binary from sitting for the 6 hour default.
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
         with:
@@ -122,10 +132,15 @@ jobs:
       - name: Find the previous release
         id: prev
         run: |
+          set -euo pipefail
+          # Tags only (--no-tags: nothing else rides along); a failed fetch
+          # fails the job rather than quietly leaving only the fork's tags.
+          git fetch --no-tags https://github.com/intuit/infigraph.git 'refs/tags/v*:refs/tags/v*'
           head_sha=$(git rev-parse HEAD)
           for tag in $(git tag --merged HEAD --sort=-v:refname --list 'v*'); do
             sha=$(git rev-parse "$tag^{commit}")
             if [ "$sha" != "$head_sha" ]; then
+              git merge-base --is-ancestor "$sha" HEAD
               echo "tag=$tag" >> "$GITHUB_OUTPUT"
               echo "sha=$sha" >> "$GITHUB_OUTPUT"
               echo "previous release: $tag ($sha)"
