@@ -1956,3 +1956,73 @@ fn no_global_claude_md_reports_nothing() {
     let home = tempfile::TempDir::new().unwrap();
     assert!(check_global_claude_md(home.path()).is_none());
 }
+
+/// Runs `f` with `HOME` pointing at an empty directory, so the developer's own
+/// `~/.infigraph/config.toml` (the user layer) cannot reach the settings check.
+fn with_isolated_home<T>(f: impl FnOnce() -> T) -> T {
+    static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::TempDir::new().unwrap();
+    let old = std::env::var_os("HOME");
+    std::env::set_var("HOME", home.path());
+    let out = f();
+    match old {
+        Some(h) => std::env::set_var("HOME", h),
+        None => std::env::remove_var("HOME"),
+    }
+    out
+}
+
+/// `[daemon_idle]` was renamed `[daemon]` (`idle_grace_secs` and friends). A
+/// config still using the old keys works, and `doctor` says what to change.
+#[test]
+fn check_settings_warns_about_a_deprecated_daemon_idle_key() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path().join("proj");
+    std::fs::create_dir_all(root.join(".infigraph")).unwrap();
+    std::fs::write(
+        root.join(".infigraph").join("config.toml"),
+        "[daemon_idle]\ngrace_secs = 300\n",
+    )
+    .unwrap();
+    let ctx = ctx_for(DoctorScope::Project(root), Registry::default());
+
+    let results = with_isolated_home(|| infigraph_core::doctor::check_settings(&ctx));
+
+    let warn = results
+        .iter()
+        .find(|r| r.status == CheckStatus::Warn && r.name.contains("[daemon_idle] grace_secs"))
+        .unwrap_or_else(|| panic!("no warning about the deprecated key: {results:?}"));
+    assert!(
+        warn.message.contains("[daemon] idle_grace_secs")
+            || warn
+                .remediation
+                .as_deref()
+                .is_some_and(|r| r.contains("[daemon] idle_grace_secs")),
+        "{warn:?}"
+    );
+    assert!(
+        results.iter().any(|r| r.status == CheckStatus::Pass),
+        "the settings themselves are still valid: {results:?}"
+    );
+}
+
+#[test]
+fn check_settings_is_quiet_when_only_the_new_daemon_keys_are_used() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path().join("proj");
+    std::fs::create_dir_all(root.join(".infigraph")).unwrap();
+    std::fs::write(
+        root.join(".infigraph").join("config.toml"),
+        "[daemon]\nidle_grace_secs = 300\n",
+    )
+    .unwrap();
+    let ctx = ctx_for(DoctorScope::Project(root), Registry::default());
+
+    let results = with_isolated_home(|| infigraph_core::doctor::check_settings(&ctx));
+
+    assert!(
+        results.iter().all(|r| r.status == CheckStatus::Pass),
+        "{results:?}"
+    );
+}

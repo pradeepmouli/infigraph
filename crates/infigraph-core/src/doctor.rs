@@ -1638,6 +1638,25 @@ const CONFIG_CATEGORY: &str = "config";
 
 /// #74/#199: a bad setting stops every other command at startup, so doctor
 /// -- exempt from that check -- is where each one gets explained.
+/// A warning per deprecated setting still stated in `config.toml`: it works,
+/// and the replacement is named. Today: the `[daemon_idle]` keys, renamed
+/// `[daemon]` `idle_grace_secs` / `idle_check_secs` / `client_release_secs`.
+fn deprecated_setting_warnings(scope: crate::settings_file::ConfigScope<'_>) -> Vec<CheckResult> {
+    let docs = crate::settings_file::layers(scope);
+    let layers: Vec<&toml_edit::Item> = docs.iter().flatten().map(|doc| doc.as_item()).collect();
+    crate::daemon::deprecated_daemon_idle_keys(&layers)
+        .into_iter()
+        .map(|(old, new)| {
+            CheckResult::warn(
+                CONFIG_CATEGORY,
+                old.clone(),
+                format!("{old} is deprecated and still honoured; {new} replaces it"),
+                format!("rename it to {new} in config.toml (the new key wins if both are set)"),
+            )
+        })
+        .collect()
+}
+
 pub fn check_settings(ctx: &DoctorContext) -> Vec<CheckResult> {
     let scope = match &ctx.scope {
         DoctorScope::Project(root) => crate::settings_file::ConfigScope::Project(root),
@@ -1646,11 +1665,13 @@ pub fn check_settings(ctx: &DoctorContext) -> Vec<CheckResult> {
     let errors = crate::settings::check_all(scope);
     if errors.is_empty() {
         let backend = crate::selected_backend();
-        return vec![CheckResult::pass(
+        let mut results = vec![CheckResult::pass(
             CONFIG_CATEGORY,
             "settings",
             format!("all settings valid (backend: {backend})"),
         )];
+        results.extend(deprecated_setting_warnings(scope));
+        return results;
     }
     errors
         .into_iter()

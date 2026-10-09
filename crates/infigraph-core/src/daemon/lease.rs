@@ -3,7 +3,7 @@
 //! fire-and-forget -- a lease is an optimisation over respawning, never a
 //! correctness requirement, so nothing here blocks, errors or panics.
 //!
-//! A lease this process has not used for `daemon_idle.client_release_secs`
+//! A lease this process has not used for `daemon.client_release_secs`
 //! is released (unix only), so an idle session stops keeping its daemon
 //! alive. The next use -- `hold` on every `Infigraph::init`, [`in_use`]
 //! around every routed read and write -- leases again, and
