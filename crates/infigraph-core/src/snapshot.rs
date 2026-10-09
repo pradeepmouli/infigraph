@@ -849,6 +849,51 @@ mod tests {
         assert_eq!(snapshot_names(&main_ig).len(), SNAPSHOT_RETENTION);
     }
 
+    /// At retention 1 the safety-net snapshot taken by a restore evicts every
+    /// existing snapshot, including the one being restored. The restore stages
+    /// its source aside first, so it still succeeds: the live state becomes the
+    /// snapshot's, and the pool ends with one entry -- the snapshot of the
+    /// pre-restore state.
+    #[test]
+    fn restoring_a_linked_worktrees_only_snapshot_succeeds_and_leaves_the_safety_snapshot() {
+        let (_tmp, _main_ig, linked_ig) = main_and_linked();
+        write(&linked_ig.join("graph"), "state-a");
+        let snap_a = create_snapshot(&linked_ig).unwrap();
+        let ts_a: u64 = snap_a
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        write(&linked_ig.join("graph"), "state-live-before-restore");
+
+        let point = RestorePoint {
+            kind: RestorePointKind::Snapshot,
+            timestamp: ts_a,
+            path: snap_a.clone(),
+        };
+        restore(&linked_ig, &point).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(linked_ig.join("graph")).unwrap(),
+            "state-a",
+            "the restore applied the snapshot's content"
+        );
+        let names = snapshot_names(&linked_ig);
+        assert_eq!(names.len(), 1, "the pool holds one entry: {names:?}");
+        assert_eq!(
+            std::fs::read_to_string(linked_ig.join(SNAPSHOTS_DIR).join(&names[0]).join("graph"))
+                .unwrap(),
+            "state-live-before-restore",
+            "the one entry is the safety snapshot of the pre-restore state"
+        );
+        assert!(
+            !linked_ig.join(RESTORE_STAGING_DIR).exists(),
+            "the staging area is cleaned up"
+        );
+    }
+
     #[test]
     fn list_restore_points_covers_all_three_pools() {
         let tmp = tempfile::tempdir().unwrap();
