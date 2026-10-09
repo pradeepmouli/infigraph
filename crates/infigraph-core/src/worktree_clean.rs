@@ -363,7 +363,15 @@ fn collect_items(plan: &mut WorktreePlan, options: &Options) {
     let infigraph_dir = plan.path.join(".infigraph");
     let mut restore_bytes = 0;
     let mut docs_bytes = 0;
-    if let Ok(entries) = std::fs::read_dir(&infigraph_dir) {
+    // `read_dir` follows a symlink, and what it lists would then be somebody
+    // else's directory.
+    let infigraph_is_link = std::fs::symlink_metadata(&infigraph_dir)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false);
+    if infigraph_is_link {
+        plan.notes
+            .push(".infigraph/ is a symlink; left alone and not followed".into());
+    } else if let Ok(entries) = std::fs::read_dir(&infigraph_dir) {
         let mut entries: Vec<_> = entries.flatten().collect();
         entries.sort_by_key(|e| e.file_name());
         for entry in entries {
@@ -1118,6 +1126,34 @@ mod tests {
         );
         apply(&plan, &repo.main, &options(), &mut no_teardown());
         assert!(outside.join("precious").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_infigraph_dir_is_not_followed() {
+        let repo = Repo::new();
+        let wt = repo.branch("fix-a");
+        repo.merge("fix-a");
+        let exclude = repo.main.join(".git").join("info").join("exclude");
+        std::fs::create_dir_all(exclude.parent().unwrap()).unwrap();
+        std::fs::write(&exclude, ".infigraph\n").unwrap();
+        let outside = repo.dir("elsewhere");
+        seed(&outside);
+        let outside = outside.join(".infigraph");
+        std::os::unix::fs::symlink(&outside, wt.join(".infigraph")).unwrap();
+
+        let plan = plan_for(&repo, &options());
+        let w = find(&plan, &wt);
+        assert!(w.skip.is_none(), "{:?}", w.skip);
+        assert!(w.items.is_empty(), "{:?}", names(w));
+        assert!(
+            w.notes.iter().any(|n| n.contains("symlink")),
+            "{:?}",
+            w.notes
+        );
+        apply(&plan, &repo.main, &options(), &mut no_teardown());
+        assert!(outside.join("graph").exists());
+        assert!(outside.join("embeddings.bin").exists());
     }
 
     #[test]
