@@ -22,10 +22,14 @@
 //!
 //! The counts a run loses are noted deep in write paths that have no run in
 //! hand, so a run is opened as a [`Run`] and the sites call [`note`]. The
-//! registry is process-wide (a thread-local would miss rayon workers) and
-//! checks the assumption that one run is active per process at a time: a
-//! second run beginning while one is active is logged and flagged on both
-//! records, whose counts may then include each other's.
+//! registry is process-wide (a thread-local would miss rayon workers). A
+//! note made on a thread that opened a run belongs to that run -- the
+//! innermost, if it opened several -- so concurrent runs on different threads
+//! (another project's, or a different kind) keep their losses apart. A note
+//! from a thread that opened none cannot be placed and reaches every active
+//! run. A second run beginning while one is active is logged and flagged on
+//! both records either way, since the unplaceable notes may then be
+//! counted in each.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -182,9 +186,18 @@ impl Tally {
     }
 }
 
+/// One open run. **A run belongs to the thread that opened it, so it must be
+/// begun and ended on one thread and never held across an `.await`**: a task
+/// that resumes on another worker would note into a thread that owns no run
+/// (the note then reaches every run) or, worse, into a run another task began
+/// on that worker. [`Run`] is `!Send` so the compiler refuses both. Every
+/// owner today is a plain function or a `spawn_blocking` closure, which run
+/// start to finish on one thread.
 struct Active {
     id: u64,
     kind: Kind,
+    /// The thread that opened the run: a note made there is its own.
+    thread: std::thread::ThreadId,
     tally: Tally,
 }
 
@@ -226,18 +239,36 @@ impl Registry {
         active.push(Active {
             id,
             kind,
+            thread: std::thread::current().id(),
             tally: Tally {
                 losses: Vec::new(),
                 overlapped: overlapping,
             },
         });
-        Run { registry: self, id }
+        Run {
+            registry: self,
+            id,
+            _not_send: std::marker::PhantomData,
+        }
     }
 
-    /// Add to every active run; nothing active drops the note.
+    /// Add a loss to the run it belongs to. A thread that opened a run notes
+    /// into the one it opened last (an update nested inside another run lost
+    /// its own things, not the outer run's), so two runs on two threads never
+    /// take each other's losses. A thread that opened none -- a rayon worker
+    /// -- cannot say which run it works for, so its note goes to every active
+    /// run, which `begin` has already flagged as overlapping. Nothing active
+    /// drops the note.
     pub fn note(&self, what: &str, count: u64, reason: &str) {
-        for run in self.lock().iter_mut() {
-            run.tally.note(what, count, reason);
+        let me = std::thread::current().id();
+        let mut active = self.lock();
+        match active.iter_mut().rev().find(|run| run.thread == me) {
+            Some(own) => own.tally.note(what, count, reason),
+            None => {
+                for run in active.iter_mut() {
+                    run.tally.note(what, count, reason);
+                }
+            }
         }
     }
 
@@ -263,6 +294,8 @@ impl Default for Registry {
 pub struct Run<'a> {
     registry: &'a Registry,
     id: u64,
+    /// `!Send`: the run is owned by the thread that opened it (see `Active`).
+    _not_send: std::marker::PhantomData<*const ()>,
 }
 
 impl Run<'_> {
@@ -545,12 +578,15 @@ mod tests {
     }
 
     #[test]
-    fn overlapping_runs_are_flagged_on_both_and_neither_is_silently_merged() {
+    fn overlapping_runs_are_flagged_on_both_and_a_note_goes_to_the_innermost() {
+        // Two runs opened on one thread: a note made there belongs to the one
+        // begun last (an embeddings update inside a reindex lost embeddings,
+        // not edges), and both records say they overlapped.
         let reg = Registry::new();
         let first = reg.begin(Kind::Index);
         reg.note("before", 1, "only the first was active");
         let second = reg.begin(Kind::Scip);
-        reg.note("during", 1, "both were active");
+        reg.note("during", 1, "the innermost run was active");
         let t2 = second.end();
         let t1 = first.end();
         assert!(
@@ -558,8 +594,61 @@ mod tests {
             "both must say they overlapped"
         );
         let whats = |t: &Tally| t.losses.iter().map(|l| l.what.clone()).collect::<Vec<_>>();
-        assert_eq!(whats(&t1), vec!["before", "during"]);
+        assert_eq!(whats(&t1), vec!["before"]);
         assert_eq!(whats(&t2), vec!["during"]);
+    }
+
+    /// The rule behind thread ownership, enforced by the compiler: a `Run`
+    /// belongs to the thread that opened it, so it cannot be sent to another
+    /// thread or held across an `.await` in a task that may resume on another
+    /// worker (a future holding it is not `Send`). This fails to compile --
+    /// "type annotations needed", the ambiguity of two matching impls -- if
+    /// `Run` ever becomes `Send`.
+    #[allow(dead_code)]
+    fn run_is_not_send() {
+        struct IsSend;
+        trait AmbiguousIfSend<A> {
+            fn check() {}
+        }
+        impl<T: ?Sized> AmbiguousIfSend<()> for T {}
+        impl<T: ?Sized + Send> AmbiguousIfSend<IsSend> for T {}
+        let _ = <Run<'static> as AmbiguousIfSend<_>>::check;
+    }
+
+    #[test]
+    fn a_note_stays_with_the_run_its_own_thread_opened() {
+        // Two runs on two threads at once (two projects in one process, or an
+        // embeddings update beside a drain): each thread's losses are its own
+        // run's, however the two interleave.
+        use std::sync::mpsc::channel;
+        let reg = &Registry::new();
+        let (opened_tx, opened_rx) = channel();
+        let (go_tx, go_rx) = channel::<()>();
+        let (noted_tx, noted_rx) = channel();
+        let (mine, theirs) = std::thread::scope(|s| {
+            let other = s.spawn(move || {
+                let run = reg.begin(Kind::Embeddings);
+                opened_tx.send(()).unwrap();
+                go_rx.recv().unwrap();
+                reg.note("symbols not embedded", 1, "theirs");
+                noted_tx.send(()).unwrap();
+                run.end()
+            });
+            opened_rx.recv().unwrap();
+            let mine = reg.begin(Kind::Embeddings);
+            go_tx.send(()).unwrap();
+            noted_rx.recv().unwrap();
+            (mine.end(), other.join().unwrap())
+        });
+        assert!(
+            mine.losses.is_empty(),
+            "a loss another thread's run noted reached this one: {mine:?}"
+        );
+        assert_eq!(theirs.losses[0].count, 1);
+        assert!(
+            mine.overlapped && theirs.overlapped,
+            "they still ran at the same time"
+        );
     }
 
     #[test]
