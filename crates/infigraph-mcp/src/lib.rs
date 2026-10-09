@@ -645,6 +645,52 @@ pub fn estimate_tokens(text: &str) -> usize {
     ((words as f64) * 1.4).ceil() as usize
 }
 
+/// What the primary instance does about the registered projects when it
+/// initializes. Synchronous so a test can observe it; `handle_initialize` runs
+/// it on a thread.
+///
+/// Daemon mode: nothing. A daemon outlives its client, and the first tool call
+/// that names a project starts it (opportunistically, by `Infigraph::init`),
+/// with its document watcher attached by the daemon itself. Starting one per
+/// registered project here leased every one of them for as long as this process
+/// lived -- ~33 daemons on a repo with many worktrees, none of which could ever
+/// reach zero leases and idle out. Without daemon mode the watchers run inside
+/// this process, so they are armed eagerly, as before.
+pub fn bootstrap_registered_projects() {
+    if infigraph_core::daemon::lifecycle::watch_daemon_mode_enabled() {
+        mcp_log(
+            "INFO",
+            "watch daemon mode active -- not arming registered projects \
+             (a project's daemon starts, and attaches its document watcher, on the \
+             first tool call that names it)",
+        );
+        return;
+    }
+
+    let registry = match infigraph_core::multi::Registry::load() {
+        Ok(r) => {
+            mcp_log(
+                "DEBUG",
+                &format!("registry loaded: {} repos", r.repos.len()),
+            );
+            r
+        }
+        Err(e) => {
+            mcp_log("ERROR", &format!("registry load failed: {e}"));
+            return;
+        }
+    };
+
+    for entry in registry.repos.values() {
+        if !entry.path.join(".infigraph").exists() {
+            continue;
+        }
+        let path = entry.path.to_string_lossy().to_string();
+        tools::watch::auto_start_watch(&path);
+        tools::docs::auto_start_doc_watch(&path);
+    }
+}
+
 pub fn handle_initialize(id: &Value, is_primary: bool) -> Value {
     health::HEALTH.mark_initialized();
     infigraph_core::daemon::lease::set_release_guard(tools::watch::keeps_daemon_lease);
@@ -656,40 +702,7 @@ pub fn handle_initialize(id: &Value, is_primary: bool) -> Value {
             mcp_log("DEBUG", "init_doc_watchers start");
             tools::docs::init_doc_watchers();
 
-            let daemon_mode = infigraph_core::daemon::lifecycle::watch_daemon_mode_enabled();
-            if daemon_mode {
-                mcp_log(
-                    "INFO",
-                    "watch daemon mode active — skipping bulk code-watcher re-arm \
-                     (persistent daemons survive worker restarts, opportunistic per-call \
-                     starts are sufficient); doc-watcher bootstrap still runs eagerly",
-                );
-            }
-
-            let registry = match infigraph_core::multi::Registry::load() {
-                Ok(r) => {
-                    mcp_log(
-                        "DEBUG",
-                        &format!("registry loaded: {} repos", r.repos.len()),
-                    );
-                    r
-                }
-                Err(e) => {
-                    mcp_log("ERROR", &format!("registry load failed: {e}"));
-                    return;
-                }
-            };
-
-            for entry in registry.repos.values() {
-                if !entry.path.join(".infigraph").exists() {
-                    continue;
-                }
-                let path = entry.path.to_string_lossy().to_string();
-                if !daemon_mode {
-                    tools::watch::auto_start_watch(&path);
-                }
-                tools::docs::auto_start_doc_watch(&path);
-            }
+            bootstrap_registered_projects();
         });
     } else {
         mcp_log("INFO", "Skipping watchers — not primary instance");
