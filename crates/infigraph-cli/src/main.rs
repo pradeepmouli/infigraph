@@ -774,7 +774,7 @@ enum Commands {
     /// Delete the project's .infigraph data and deregister from repo list
     Delete,
 
-    /// Copy an existing project's .infigraph/ index into a new location (excludes locks/logs, doesn't index)
+    /// Copy an existing project's .infigraph/ index into a new location (excludes locks, logs and restore pools; doesn't index)
     Clone {
         /// Source project root (must already have an indexed .infigraph/ directory)
         src: PathBuf,

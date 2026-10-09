@@ -107,3 +107,60 @@ fn clone_excludes_the_docs_and_config_locks() {
     assert!(dst.path().join(".infigraph/config.toml").exists());
     assert!(dst.path().join(".infigraph/docs.kuzu").exists());
 }
+
+/// The restore pools are the source graph's history: snapshots, a quarantined
+/// graph and a retired one, each with its WAL. A clone can re-clone from the
+/// source, so it carries none of them (on a 34-worktree repo they were ~2 GiB
+/// in every worktree). Only a *top-level* entry is a pool: a same-named
+/// directory deeper in the tree is somebody's data and is copied.
+#[test]
+fn clone_skips_the_restore_pools_but_keeps_the_graph() {
+    let src = tempfile::tempdir().unwrap();
+    let dst = tempfile::tempdir().unwrap();
+
+    write_file(&src.path().join(".infigraph/graph"), "graph-bytes");
+    write_file(&src.path().join(".infigraph/graph.wal"), "wal-bytes");
+    write_file(&src.path().join(".infigraph/snapshots/1/graph"), "old");
+    write_file(
+        &src.path().join(".infigraph/graph.previous.1791397452"),
+        "old",
+    );
+    write_file(
+        &src.path().join(".infigraph/graph.previous.1791397452.wal"),
+        "old",
+    );
+    write_file(
+        &src.path().join(".infigraph/graph.corrupt.1791226834"),
+        "bad",
+    );
+    write_file(
+        &src.path().join(".infigraph/graph.corrupt.1791226834.wal"),
+        "bad",
+    );
+    write_file(
+        &src.path().join(".infigraph/sessions/snapshots/notes"),
+        "mine",
+    );
+
+    clone_infigraph_dir(src.path(), dst.path()).unwrap();
+
+    let ig = dst.path().join(".infigraph");
+    assert_eq!(fs::read_to_string(ig.join("graph")).unwrap(), "graph-bytes");
+    assert_eq!(
+        fs::read_to_string(ig.join("graph.wal")).unwrap(),
+        "wal-bytes"
+    );
+    for pool in [
+        "snapshots",
+        "graph.previous.1791397452",
+        "graph.previous.1791397452.wal",
+        "graph.corrupt.1791226834",
+        "graph.corrupt.1791226834.wal",
+    ] {
+        assert!(!ig.join(pool).exists(), "{pool} was cloned");
+    }
+    assert!(
+        ig.join("sessions/snapshots/notes").exists(),
+        "a nested directory that happens to be called snapshots is not a pool"
+    );
+}

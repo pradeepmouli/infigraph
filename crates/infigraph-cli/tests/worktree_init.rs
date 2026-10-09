@@ -90,3 +90,77 @@ fn worktree_init_clones_and_incrementally_indexes() {
     let wt_embeddings = std::fs::read(wt_path.join(".infigraph/embeddings.bin")).unwrap();
     assert_eq!(main_embeddings, wt_embeddings);
 }
+
+/// The main graph's restore pools -- snapshots, a quarantined graph, a retired
+/// one -- are its history, not the worktree's: a fresh worktree can re-clone
+/// from main, and carrying them cost ~2 GiB in every one of 34 worktrees. The
+/// graph itself is still cloned and answers queries.
+#[test]
+fn worktree_init_leaves_the_mains_restore_pools_behind() {
+    let fake_home = tempfile::tempdir().unwrap();
+    let main = tempfile::tempdir().unwrap();
+    git(&["init"], main.path());
+    git(&["config", "user.email", "t@t.com"], main.path());
+    git(&["config", "user.name", "t"], main.path());
+    std::fs::write(main.path().join(".gitignore"), ".infigraph/\n.claude/\n").unwrap();
+    std::fs::write(main.path().join("a.py"), "def foo_marker():\n    pass\n").unwrap();
+    git(&["add", "."], main.path());
+    git(&["commit", "-m", "init"], main.path());
+    let out = run_index(main.path(), fake_home.path());
+    support::assert_ok(&out, "index");
+
+    let ig = main.path().join(".infigraph");
+    let pools = [
+        "snapshots/1/graph",
+        "graph.previous.1791397452",
+        "graph.previous.1791397452.wal",
+        "graph.corrupt.1791226834",
+        "graph.corrupt.1791226834.wal",
+    ];
+    for pool in pools {
+        let path = ig.join(pool);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, vec![b'x'; 4096]).unwrap();
+    }
+
+    let parent = tempfile::tempdir().unwrap();
+    let wt_path = parent.path().join("wt1");
+    git(
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "feature",
+            wt_path.to_str().unwrap(),
+        ],
+        main.path(),
+    );
+    let out = run_worktree("init", &wt_path, fake_home.path());
+    support::assert_ok(&out, "worktree init");
+
+    let wt_ig = wt_path.join(".infigraph");
+    assert!(wt_ig.join("graph").exists(), "the graph was not cloned");
+    for pool in pools {
+        assert!(!wt_ig.join(pool).exists(), "{pool} was cloned");
+    }
+    assert!(
+        !wt_ig.join("snapshots").exists(),
+        "an empty snapshots/ was left behind"
+    );
+    let found = support::run(
+        &wt_path,
+        fake_home.path(),
+        infigraph_core::LOCAL_BACKEND,
+        &["search", "foo_marker"],
+    );
+    support::assert_ok(&found, "search in the new worktree");
+    assert!(
+        support::stdout(&found).contains("foo_marker"),
+        "the cloned graph does not answer: {}",
+        support::stdout(&found)
+    );
+    // The source keeps its pools.
+    for pool in pools {
+        assert!(ig.join(pool).exists(), "{pool} vanished from main");
+    }
+}
