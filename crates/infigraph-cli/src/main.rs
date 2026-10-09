@@ -991,6 +991,8 @@ pub(crate) enum WorktreeAction {
     /// another ref (or detached at a reachable commit), not locked -- and nothing
     /// holds it. Only derived files in .infigraph/ are removed; config.toml,
     /// sessions/ and anything unlisted stay.
+    /// A brand-new worktree on a fresh branch with no commits of its own counts as
+    /// finished (its branch is contained in its base); only its derived files go.
     Clean {
         /// Look at every registered project's repo instead of just the current one
         #[arg(long)]
