@@ -44,9 +44,14 @@ fn now_epoch_secs() -> u64 {
 /// like eviction can't touch it -- folding it into a new snapshot or
 /// deleting it mid-wipe would defeat that).
 pub(crate) fn should_skip(name: &str) -> bool {
-    name == "index.lock"
-        || name == SNAPSHOTS_DIR
-        || name == RESTORE_STAGING_DIR
+    name == "index.lock" || name == RESTORE_STAGING_DIR || is_restore_pool_entry(name)
+}
+
+/// An entry of `.infigraph/` that belongs to a restore pool: the snapshots
+/// directory, a quarantined graph (`graph.corrupt.<ts>`) or a retired one
+/// (`graph.previous.<ts>`), each with the WAL siblings that move with it.
+pub(crate) fn is_restore_pool_entry(name: &str) -> bool {
+    name == SNAPSHOTS_DIR
         || name.starts_with("graph.corrupt.")
         || name.starts_with("graph.previous.")
 }

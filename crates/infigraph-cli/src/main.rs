@@ -985,6 +985,29 @@ pub(crate) enum WorktreeAction {
         #[arg(long)]
         global: bool,
     },
+    /// Reclaim the graphs and build directories of finished worktrees (dry run unless --apply)
+    ///
+    /// A worktree is finished when git says so -- clean, on a branch contained in
+    /// another ref (or detached at a reachable commit), not locked -- and nothing
+    /// holds it. Only derived files in .infigraph/ are removed; config.toml,
+    /// sessions/ and anything unlisted stay.
+    Clean {
+        /// Look at every registered project's repo instead of just the current one
+        #[arg(long)]
+        global: bool,
+        /// Delete. Without it, print what would go and change nothing
+        #[arg(long)]
+        apply: bool,
+        /// Also remove node_modules/ (git-ignored ones only)
+        #[arg(long)]
+        deps: bool,
+        /// Also remove the document index and its sidecars
+        #[arg(long)]
+        docs: bool,
+        /// Also remove snapshots and quarantined or retired graphs
+        #[arg(long)]
+        restore_points: bool,
+    },
 }
 
 /// Whether `command` should trigger the pre-dispatch background-watcher
@@ -1381,6 +1404,21 @@ fn run(command: Commands, root: &Path) -> Result<()> {
             WorktreeAction::Reconcile { global } => {
                 worktree_commands::cmd_worktree_reconcile(global)
             }
+            WorktreeAction::Clean {
+                global,
+                apply,
+                deps,
+                docs,
+                restore_points,
+            } => worktree_commands::cmd_worktree_clean(
+                global,
+                apply,
+                infigraph_core::worktree_clean::Options {
+                    deps,
+                    docs,
+                    restore_points,
+                },
+            ),
         },
     }
 }

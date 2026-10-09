@@ -66,6 +66,7 @@ pub mod vuln;
 pub mod watch;
 pub mod watchdog;
 pub mod worktree;
+pub mod worktree_clean;
 pub mod write_phase;
 
 /// Re-exported so a downstream crate's `infigraph_core::settings!` expansion

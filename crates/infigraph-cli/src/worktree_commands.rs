@@ -104,3 +104,33 @@ pub(crate) fn cmd_worktree_reconcile(global: bool) -> Result<()> {
     }
     Ok(())
 }
+
+/// `worktree clean`: plan, print, and with `apply` carry it out. The eviction
+/// of dead registry entries and of each cleaned worktree is the same
+/// `cmd_worktree_teardown` that `reconcile` runs.
+pub(crate) fn cmd_worktree_clean(
+    global: bool,
+    apply: bool,
+    options: infigraph_core::worktree_clean::Options,
+) -> Result<()> {
+    use infigraph_core::worktree_clean::{apply as apply_plan, plan, render};
+
+    let registry = Registry::load()?;
+    let cwd = std::env::current_dir()?;
+    let scope = if global { None } else { Some(cwd.as_path()) };
+    let plan = plan(&registry, scope, &cwd, &options);
+    if !apply {
+        print!("{}", render(&plan, None));
+        return Ok(());
+    }
+    let applied = apply_plan(&plan, &cwd, &options, &mut |path| {
+        cmd_worktree_teardown(path)
+    });
+    print!("{}", render(&plan, Some(&applied)));
+    anyhow::ensure!(
+        applied.failed.is_empty(),
+        "{} step(s) failed; see above",
+        applied.failed.len()
+    );
+    Ok(())
+}

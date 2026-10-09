@@ -44,7 +44,7 @@ pub struct ProcessRow {
 /// normally sub-second, so a row here usually means either "an index run
 /// is in progress" or "a dead holder left a stale lock" -- both worth
 /// showing.
-const PROJECT_LOCKS: &[&str] = &[
+pub(crate) const PROJECT_LOCKS: &[&str] = &[
     "watch.lock",
     "index.lock",
     "graph.lock",
