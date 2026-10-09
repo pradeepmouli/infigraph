@@ -198,6 +198,7 @@ impl DaemonState {
             docs: self.role(WatchRole::Docs),
             degraded: crate::degraded::live::all(),
             judged: crate::degraded::live::judged(),
+            lease_owners: liveness.lease_owners(),
         }
     }
 }

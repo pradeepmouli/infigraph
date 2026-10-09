@@ -1720,8 +1720,35 @@ pub(crate) fn cmd_ps(root: &Path) -> Result<()> {
                 "         ^ stale lock -- holder is gone; `infigraph doctor` explains, deleting the lock file is safe"
             );
         }
+        if let Some(Ok(status)) = statuses.get(&i) {
+            if let Some(line) = ps_lease_owners_line(&status.lease_owners) {
+                println!("         ^ {line}");
+            }
+        }
     }
     Ok(())
+}
+
+/// Who holds the leases that keep a daemon alive, for the row under it in
+/// `ps`. `None` when it reports no owners (no leases, or a daemon built before
+/// it said).
+fn ps_lease_owners_line(
+    owners: &[infigraph_core::daemon::read_protocol::LeaseOwner],
+) -> Option<String> {
+    if owners.is_empty() {
+        return None;
+    }
+    let held: Vec<String> = owners
+        .iter()
+        .map(|o| {
+            if o.name.is_empty() {
+                format!("pid {}", o.pid)
+            } else {
+                format!("pid {} ({})", o.pid, o.name)
+            }
+        })
+        .collect();
+    Some(format!("leased by {}", held.join(", ")))
 }
 
 /// `ps`'s LEASES, IDLE, CODE and DOCS cells for one row: `None` for a row
@@ -2067,7 +2094,28 @@ mod daemon_liveness_guard_tests {
 
 #[cfg(test)]
 mod ps_status_tests {
-    use super::ps_status_cells;
+    use super::{ps_lease_owners_line, ps_status_cells};
+
+    #[test]
+    fn the_lease_owners_line_names_each_holder() {
+        use infigraph_core::daemon::read_protocol::LeaseOwner;
+        assert_eq!(ps_lease_owners_line(&[]), None);
+        let owners = vec![
+            LeaseOwner {
+                pid: 26947,
+                name: "infigraph-mcp".into(),
+            },
+            LeaseOwner {
+                pid: 4,
+                name: String::new(),
+            },
+        ];
+        assert_eq!(
+            ps_lease_owners_line(&owners).as_deref(),
+            Some("leased by pid 26947 (infigraph-mcp), pid 4")
+        );
+    }
+
     use infigraph_core::daemon::control::ControlError;
     use infigraph_core::daemon::read_protocol::{RoleState, StatusReport};
 
@@ -2084,6 +2132,7 @@ mod ps_status_tests {
             docs: RoleState::NotOwned,
             degraded: Vec::new(),
             judged: Vec::new(),
+            lease_owners: Vec::new(),
         }
     }
 

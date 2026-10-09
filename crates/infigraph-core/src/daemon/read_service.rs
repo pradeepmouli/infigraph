@@ -417,9 +417,16 @@ fn park_lease(leases: Arc<LeaseBook>, pid: u32, mut stream: ReadStream) {
             // talking to a daemon without leases (or one that could not park
             // this one) and stops, instead of reconnecting in a loop.
             let _ = write_frame(&mut stream, &ReadFrame::End);
+            // Name the holder, so a daemon that never idles out can be traced
+            // to the process keeping it: the log says who attached, `ps` who
+            // holds it now.
+            let name = crate::ps::process_name(pid).unwrap_or_default();
+            owner.liveness.owner_attached(pid, name.clone());
+            eprintln!("{}", lease_attach_line(pid, &name, owner.liveness.leases()));
             // A lease client never writes after Attach: any frame, EOF or
             // error ends the lease.
             let _ = super::read_protocol::read_len_prefixed(&mut stream);
+            owner.liveness.owner_detached(pid);
             #[cfg(unix)]
             owner.lock().handles.remove(&id);
             drop(stream); // only once its shutdown handle is gone
@@ -445,6 +452,14 @@ fn park_lease(leases: Arc<LeaseBook>, pid: u32, mut stream: ReadStream) {
 /// The one `daemon.log` line a lease gets, at release, or none for a lease
 /// under a second: short CLI runs (hook-driven ones especially) would
 /// otherwise add an attach/release pair each (#203 M4).
+fn lease_attach_line(pid: u32, name: &str, held: usize) -> String {
+    if name.is_empty() {
+        format!("[lease] attached pid {pid} ({held} held)")
+    } else {
+        format!("[lease] attached pid {pid} ({name}) ({held} held)")
+    }
+}
+
 fn lease_release_line(pid: u32, held: std::time::Duration, remaining: usize) -> Option<String> {
     (held >= std::time::Duration::from_secs(1)).then(|| {
         format!(
@@ -609,11 +624,23 @@ impl Drop for Pool {
 
 #[cfg(test)]
 mod lease_log_tests {
-    use super::lease_release_line;
+    use super::{lease_attach_line, lease_release_line};
     use std::time::Duration;
 
     /// #203 M4: one line per lease, at release, and none for a lease under
     /// a second -- hook-driven CLI runs otherwise fill daemon.log.
+    #[test]
+    fn the_attach_line_names_the_process_when_it_is_known() {
+        assert_eq!(
+            lease_attach_line(26947, "infigraph-mcp", 3),
+            "[lease] attached pid 26947 (infigraph-mcp) (3 held)"
+        );
+        assert_eq!(
+            lease_attach_line(26947, "", 1),
+            "[lease] attached pid 26947 (1 held)"
+        );
+    }
+
     #[test]
     fn a_short_lease_is_not_logged_and_a_long_one_is_one_line() {
         assert_eq!(lease_release_line(7, Duration::from_millis(300), 0), None);
