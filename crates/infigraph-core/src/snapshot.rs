@@ -12,9 +12,27 @@
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
-/// How many pre-write snapshots to retain (R7.3: nothing in `.infigraph/`
-/// may grow without a cap). Oldest evicted first.
+/// How many pre-write snapshots a main checkout retains (R7.3: nothing in
+/// `.infigraph/` may grow without a cap). Oldest evicted first.
 const SNAPSHOT_RETENTION: usize = 2;
+
+/// How many a linked git worktree retains. It can be rebuilt from its main
+/// checkout (`worktree init`), so one step back is all the history it needs.
+/// Quarantined graphs (`quarantine::QUARANTINE_RETENTION`) and `graph.previous`
+/// are not changed: a linked worktree keeps at most one snapshot, up to two
+/// quarantined graphs (under their byte cap) and one retired graph.
+const LINKED_WORKTREE_SNAPSHOT_RETENTION: usize = 1;
+
+/// The retention for the project whose `.infigraph/` is `infigraph_dir`: told
+/// apart by `worktree::is_linked_worktree`, the one place that decides it.
+fn snapshot_retention(infigraph_dir: &Path) -> usize {
+    match infigraph_dir.parent() {
+        Some(root) if crate::worktree::is_linked_worktree(root) => {
+            LINKED_WORKTREE_SNAPSHOT_RETENTION
+        }
+        _ => SNAPSHOT_RETENTION,
+    }
+}
 
 const SNAPSHOTS_DIR: &str = "snapshots";
 
@@ -294,11 +312,12 @@ fn evict_oldest_if_at_bound(infigraph_dir: &Path) -> Result<()> {
             }
         }
     }
-    if existing.len() < SNAPSHOT_RETENTION {
+    let retention = snapshot_retention(infigraph_dir);
+    if existing.len() < retention {
         return Ok(());
     }
     existing.sort_by_key(|(ts, _)| *ts);
-    let to_evict = existing.len() - (SNAPSHOT_RETENTION - 1);
+    let to_evict = existing.len() - (retention - 1);
     for (_, path) in existing.into_iter().take(to_evict) {
         let _ = std::fs::remove_dir_all(&path);
     }
@@ -434,7 +453,7 @@ fn restore_from_snapshot(infigraph_dir: &Path, timestamp: u64) -> Result<()> {
     //
     // 1. The safety-net create_snapshot() call below evicts the pool down
     //    to its retention bound as part of adding a new entry. If `src` is
-    //    the oldest of the (at most SNAPSHOT_RETENTION) retained snapshots
+    //    the oldest of the (at most `snapshot_retention`) retained snapshots
     //    -- which is exactly what "restore the oldest one" means -- that
     //    eviction would delete `src` before it's ever read, and the
     //    function would then wipe live state and fail trying to read a
@@ -748,6 +767,86 @@ mod tests {
         assert_eq!(remaining.len(), SNAPSHOT_RETENTION);
         assert!(remaining.contains("300"));
         assert!(!remaining.contains("100"));
+    }
+
+    fn git(dir: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// A repo with a linked worktree; each has a `.infigraph/graph`. Returns
+    /// (tmp, main `.infigraph`, linked `.infigraph`).
+    fn main_and_linked() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(tmp.path()).unwrap();
+        let main = base.join("main");
+        std::fs::create_dir_all(&main).unwrap();
+        git(&main, &["init", "-q", "-b", "main"]);
+        write(&main.join("a.txt"), "a");
+        git(&main, &["add", "."]);
+        git(&main, &["commit", "-qm", "init"]);
+        let linked = base.join("wt");
+        git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feature",
+                linked.to_str().unwrap(),
+            ],
+        );
+        for root in [&main, &linked] {
+            write(&root.join(".infigraph").join("graph"), "v1");
+        }
+        (tmp, main.join(".infigraph"), linked.join(".infigraph"))
+    }
+
+    fn snapshot_names(infigraph_dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(infigraph_dir.join(SNAPSHOTS_DIR))
+            .map(|rd| {
+                rd.flatten()
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.sort();
+        names
+    }
+
+    /// A linked worktree can be rebuilt from its main checkout, so it keeps one
+    /// pre-write snapshot: after two full reindexes the older is gone and the
+    /// newer is kept. A main checkout keeps two.
+    #[test]
+    fn a_linked_worktree_keeps_one_snapshot_and_a_main_checkout_two() {
+        let (_tmp, main_ig, linked_ig) = main_and_linked();
+
+        let first = create_snapshot(&linked_ig).unwrap();
+        let second = create_snapshot(&linked_ig).unwrap();
+        assert_eq!(
+            snapshot_names(&linked_ig),
+            vec![second.file_name().unwrap().to_string_lossy().into_owned()],
+            "the linked worktree kept {:?}, not just the newer {second:?} (first was {first:?})",
+            snapshot_names(&linked_ig)
+        );
+
+        create_snapshot(&main_ig).unwrap();
+        create_snapshot(&main_ig).unwrap();
+        create_snapshot(&main_ig).unwrap();
+        assert_eq!(snapshot_names(&main_ig).len(), SNAPSHOT_RETENTION);
     }
 
     #[test]
