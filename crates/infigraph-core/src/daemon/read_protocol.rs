@@ -129,6 +129,14 @@ impl std::fmt::Display for RoleState {
     }
 }
 
+/// A process holding a lease, as the daemon saw it when it attached: the pid
+/// the client sent, and that process's name then.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeaseOwner {
+    pub pid: u32,
+    pub name: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StatusReport {
     pub pid: u32,
@@ -154,6 +162,10 @@ pub struct StatusReport {
     /// only for these.
     #[serde(default)]
     pub judged: Vec<String>,
+    /// Who holds the leases counted in `leases`. Additive: a daemon built
+    /// before the field reports none, which reads as "not known".
+    #[serde(default)]
+    pub lease_owners: Vec<LeaseOwner>,
 }
 
 impl std::fmt::Display for StatusReport {
@@ -509,6 +521,7 @@ mod tests {
                 remedy: "r".into(),
             }],
             judged: vec!["some-future-mode".into()],
+            lease_owners: Vec::new(),
         };
         let mut buf = Vec::new();
         write_reply(&mut buf, &OpReply::Ok(report.clone())).unwrap();
@@ -530,6 +543,7 @@ mod tests {
             docs: RoleState::NotOwned,
             degraded: Vec::new(),
             judged: Vec::new(),
+            lease_owners: Vec::new(),
         };
         let mut buf = Vec::new();
         write_reply(&mut buf, &OpReply::Ok(report.clone())).unwrap();

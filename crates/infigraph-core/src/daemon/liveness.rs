@@ -17,6 +17,9 @@ pub fn now_secs() -> u64 {
 pub struct Liveness {
     leases: AtomicUsize,
     pub(crate) last_activity: AtomicU64,
+    /// Who holds them, for `ps` and the daemon log. Informational only: the
+    /// count above is what decides anything.
+    owners: std::sync::Mutex<Vec<super::read_protocol::LeaseOwner>>,
 }
 
 impl Default for Liveness {
@@ -31,6 +34,7 @@ impl Liveness {
         Self {
             leases: AtomicUsize::new(0),
             last_activity: AtomicU64::new(now_secs()),
+            owners: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -43,6 +47,26 @@ impl Liveness {
     pub fn lease_closed(&self) {
         self.touch();
         self.leases.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    /// Record who holds a lease, once it is acked. Never affects the count.
+    pub fn owner_attached(&self, pid: u32, name: String) {
+        if let Ok(mut owners) = self.owners.lock() {
+            owners.push(super::read_protocol::LeaseOwner { pid, name });
+        }
+    }
+
+    /// Forget one lease of `pid` (a process can hold more than one).
+    pub fn owner_detached(&self, pid: u32) {
+        if let Ok(mut owners) = self.owners.lock() {
+            if let Some(i) = owners.iter().position(|o| o.pid == pid) {
+                owners.remove(i);
+            }
+        }
+    }
+
+    pub fn lease_owners(&self) -> Vec<super::read_protocol::LeaseOwner> {
+        self.owners.lock().map(|o| o.clone()).unwrap_or_default()
     }
 
     pub fn touch(&self) {
@@ -124,6 +148,27 @@ mod tests {
         assert_eq!(l.leases(), 0);
         let idle = l.idle_for(now_secs() + 5).unwrap();
         assert!(idle >= Duration::from_secs(5) && idle < Duration::from_secs(7));
+    }
+
+    #[test]
+    fn owners_are_recorded_per_lease_and_never_change_the_count() {
+        let l = Liveness::new();
+        l.lease_opened();
+        l.owner_attached(10, "infigraph-mcp".into());
+        l.lease_opened();
+        l.owner_attached(10, "infigraph-mcp".into());
+        l.lease_opened();
+        l.owner_attached(11, "infigraph".into());
+        assert_eq!(l.leases(), 3);
+        assert_eq!(l.lease_owners().len(), 3);
+
+        l.owner_detached(10);
+        l.lease_closed();
+        let pids: Vec<u32> = l.lease_owners().iter().map(|o| o.pid).collect();
+        assert_eq!(pids, vec![10, 11], "one of pid 10's two leases is gone");
+        assert_eq!(l.leases(), 2);
+        l.owner_detached(99); // not an owner: harmless
+        assert_eq!(l.lease_owners().len(), 2);
     }
 
     #[test]

@@ -2088,6 +2088,7 @@ mod watcher_verdict_tests {
             docs: RoleState::NotOwned,
             degraded: Vec::new(),
             judged: Vec::new(),
+            lease_owners: Vec::new(),
         }
     }
 
