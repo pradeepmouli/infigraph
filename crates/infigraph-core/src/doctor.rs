@@ -215,6 +215,15 @@ pub fn check_registry(ctx: &DoctorContext) -> Vec<CheckResult> {
     }
 }
 
+/// Whether `project_path` holds an index -- a graph or a document store --
+/// rather than only the user's files in `.infigraph/` (the `config.toml`,
+/// sessions and restore points `infigraph worktree clean` leaves behind). Only
+/// a project that holds one is expected to be in the registry.
+fn holds_an_index(project_path: &Path) -> bool {
+    let infigraph_dir = project_path.join(".infigraph");
+    infigraph_dir.join("graph").exists() || infigraph_dir.join("docs.kuzu").exists()
+}
+
 fn check_project_registration(registry: &Registry, project_path: &Path) -> CheckResult {
     match find_repo_entry(registry, project_path) {
         Some(entry) => CheckResult::pass(
@@ -225,10 +234,10 @@ fn check_project_registration(registry: &Registry, project_path: &Path) -> Check
                 entry.symbol_count, entry.module_count
             ),
         ),
-        None if !project_path.join(".infigraph").exists() => CheckResult::pass(
+        None if !holds_an_index(project_path) => CheckResult::pass(
             CATEGORY,
             format!("{}: registration", project_path.display()),
-            "not an infigraph project (no .infigraph directory) -- nothing to check",
+            "not an indexed infigraph project (no graph or document index) -- nothing to check",
         ),
         None => CheckResult::fail(
             CATEGORY,
@@ -291,7 +300,7 @@ fn check_unregistered_projects(ctx: &DoctorContext) -> CheckResult {
             if !path.is_dir() {
                 continue;
             }
-            if !path.join(".infigraph").is_dir() {
+            if !holds_an_index(&path) {
                 continue;
             }
             if find_repo_entry(&ctx.registry, &path).is_none() {
@@ -987,6 +996,27 @@ const DISK_CATEGORY: &str = "disk";
 const DISK_FAIL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const DISK_WARN_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 
+/// How much free space `doctor` calls enough. One place for the two floors,
+/// so `infigraph worktree clean` reports the same verdict `doctor` does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiskStatus {
+    Ok,
+    /// Below the 10 GiB warn floor.
+    Low,
+    /// Below the 2 GiB floor.
+    Critical,
+}
+
+pub fn disk_status(free_bytes: u64) -> DiskStatus {
+    if free_bytes < DISK_FAIL_BYTES {
+        DiskStatus::Critical
+    } else if free_bytes < DISK_WARN_BYTES {
+        DiskStatus::Low
+    } else {
+        DiskStatus::Ok
+    }
+}
+
 fn dir_size(path: &Path) -> u64 {
     let Ok(entries) = std::fs::read_dir(path) else {
         return 0;
@@ -1009,7 +1039,7 @@ fn dir_size(path: &Path) -> u64 {
 /// graph store (`.infigraph/graph`) is a single file in the current layout
 /// but a directory in the legacy layout -- `dir_size` alone silently reports
 /// 0 for the (now-common) file case since `read_dir` on a file errors.
-fn path_size(path: &Path) -> u64 {
+pub(crate) fn path_size(path: &Path) -> u64 {
     let Ok(meta) = std::fs::metadata(path) else {
         return 0;
     };
@@ -1037,7 +1067,7 @@ pub fn check_disk(ctx: &DoctorContext) -> Vec<CheckResult> {
             "could not determine free disk space",
             "check filesystem permissions",
         ),
-        Some(free) if free < DISK_FAIL_BYTES => {
+        Some(free) if disk_status(free) == DiskStatus::Critical => {
             let why = format!(
                 "only {} MB free (below the 2GB floor)",
                 free / (1024 * 1024)
@@ -1055,10 +1085,10 @@ pub fn check_disk(ctx: &DoctorContext) -> Vec<CheckResult> {
                 DISK_CATEGORY,
                 "disk: free space",
                 why,
-                "free up disk space immediately -- low disk has already caused a real MCP server crash mid-index (see I-16/I-17 in DESIGN-hardening.md)",
+                "free up disk space immediately (`infigraph worktree clean` lists finished worktrees to reclaim) -- low disk has already caused a real MCP server crash mid-index (see I-16/I-17 in DESIGN-hardening.md)",
             )
         }
-        Some(free) if free < DISK_WARN_BYTES => {
+        Some(free) if disk_status(free) == DiskStatus::Low => {
             let why = format!(
                 "{} MB free (below the 10GB warn floor)",
                 free / (1024 * 1024)
@@ -1068,7 +1098,7 @@ pub fn check_disk(ctx: &DoctorContext) -> Vec<CheckResult> {
                 DISK_CATEGORY,
                 "disk: free space",
                 why,
-                "consider freeing disk space soon",
+                "consider freeing disk space soon (`infigraph worktree clean` lists finished worktrees to reclaim)",
             )
         }
         Some(free) => CheckResult::pass(
@@ -1935,6 +1965,34 @@ mod sidecar_anchor_tests {
 
     /// #64: a code-only reindex moved `graph` (fresh) while `docs.kuzu` and
     /// the doc sidecar built from it stayed put. The doc sidecar is current.
+    // ---- a cleaned worktree is not an unregistered project ----
+
+    #[test]
+    fn a_dir_with_only_the_users_files_is_not_an_unregistered_project() {
+        // What `worktree clean` leaves: config, sessions, restore points.
+        let dir = tempfile::tempdir().unwrap();
+        let ig = dir.path().join(".infigraph");
+        std::fs::create_dir_all(ig.join("sessions")).unwrap();
+        std::fs::write(ig.join("config.toml"), "x = 1").unwrap();
+        std::fs::create_dir_all(ig.join("snapshots")).unwrap();
+
+        let result = check_project_registration(&Registry::default(), dir.path());
+
+        assert_eq!(result.status, CheckStatus::Pass, "{}", result.message);
+    }
+
+    #[test]
+    fn a_dir_with_a_graph_that_is_not_registered_still_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let ig = dir.path().join(".infigraph");
+        std::fs::create_dir_all(&ig).unwrap();
+        std::fs::write(ig.join("graph"), "g").unwrap();
+
+        let result = check_project_registration(&Registry::default(), dir.path());
+
+        assert_eq!(result.status, CheckStatus::Fail);
+    }
+
     #[test]
     fn docs_sidecar_is_judged_against_the_doc_store_not_the_code_graph() {
         let dir = tempfile::tempdir().unwrap();
