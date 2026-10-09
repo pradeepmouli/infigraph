@@ -825,7 +825,9 @@ pub(crate) fn auto_scip(
         }
     };
 
-    // Sequential run: each indexer produces index.scip, import, cleanup
+    // Sequential run: each indexer writes its own scratch file, import, cleanup
+    let scip_tmp = infigraph_core::scip::scip_scratch_dir(root);
+    let run_id = scip_run_id();
     let mut record = ScipRun::new();
     for (indexer, bin_path) in &binaries {
         if !should_run_indexer(root, indexer) {
@@ -840,46 +842,32 @@ pub(crate) fn auto_scip(
             continue;
         };
 
-        let cmd_str = bin.to_string_lossy();
-        let extra = scip_download::extra_runtime_paths();
-        let extra_path = if extra.is_empty() {
-            None
-        } else {
-            Some(extra.as_str())
-        };
-
-        println!("Auto-SCIP: running {}...", indexer.binary_name);
-        let scip_out = root.join("index.scip");
-        let run = IndexerRun {
-            root,
-            cmd: &cmd_str,
-            label: indexer.binary_name,
-            extra_path,
-            output_flag: None,
-            output_path: &scip_out,
-            timeout: SCIP_INDEXER_TIMEOUT,
-        };
-        let produced = rt.block_on(async {
-            if indexer.binary_name == "scip-java" {
-                run.run_scip_java(indexer.scip_args, |m| println!("{m}"))
-                    .await
-            } else {
-                run.run(indexer.scip_args).await
-            }
-        });
+        // The background path's runner, and its scratch file: run-unique under
+        // `.infigraph/scip-tmp` (#139), never a fixed `index.scip` in the
+        // user's tree, and removed on every path out.
+        let scip_out = scip_tmp.join(infigraph_core::scip::scratch_file_name(
+            indexer.binary_name,
+            &run_id,
+        ));
+        if let Err(e) = std::fs::create_dir_all(&scip_tmp) {
+            eprintln!("Auto-SCIP: cannot create {}: {e}", scip_tmp.display());
+            continue;
+        }
+        let produced = rt.block_on(run_scip_indexer_to(root, bin, indexer, &scip_out));
         record.indexer_result(&IndexerResult {
             label: indexer.binary_name,
             path: scip_out.clone(),
             verdict: produced.clone(),
         });
         if produced.is_ok() {
-            match import_scip_and_cleanup(root, None, backend) {
+            match import_scip_and_cleanup(root, Some(&scip_out), backend) {
                 Some(Ok(stats)) => record.imported(&stats),
                 Some(Err(reason)) => record.import_failed(indexer.binary_name, &reason),
                 None => {}
             }
         }
     }
+    let _ = std::fs::remove_dir(&scip_tmp);
     record.finish(&root.join(".infigraph"));
 
     Ok(())
@@ -2005,6 +1993,7 @@ async fn run_indexer(
         infigraph_core::slots::SlotPool::scip_indexers()
     };
     let _slot = claim_indexer_slot(pool.as_ref(), label).await;
+    let started = std::time::SystemTime::now();
     // `kill_on_drop` reaps the direct child when this future is dropped; the
     // guard below takes the rest of its group.
     let mut command = tokio::process::Command::from(indexer_command(
@@ -2083,8 +2072,35 @@ async fn run_indexer(
             }
         }
     };
+    if output_flag.is_none() && outcome.failure.is_some() {
+        discard_stray_default_output(root, output_path, started);
+    }
     report_indexer_outcome(label, &outcome);
     outcome
+}
+
+/// An indexer with no output flag writes `index.scip` into the project root,
+/// and the runner moves it to `output_path` only when the run succeeds. After a
+/// failure or a timeout the file is the run's own leftover, in the user's tree:
+/// remove it. Only one written since `started` goes -- a user's own
+/// `index.scip` from before the run, which a run that failed before writing
+/// anything never touched, stays.
+/// Filesystem timestamps can run a little behind the clock that took `started`
+/// (ext4 stamps with a coarse kernel tick), so a file written a moment after
+/// it can read as older. Far shorter than the gap to any file of the user's.
+const FILE_TIME_SLACK: std::time::Duration = std::time::Duration::from_secs(2);
+
+fn discard_stray_default_output(root: &Path, output_path: &Path, started: std::time::SystemTime) {
+    let default_out = root.join("index.scip");
+    if default_out == output_path {
+        return;
+    }
+    let written_by_this_run = std::fs::metadata(&default_out)
+        .and_then(|m| m.modified())
+        .is_ok_and(|modified| modified >= started - FILE_TIME_SLACK);
+    if written_by_this_run {
+        let _ = std::fs::remove_file(&default_out);
+    }
 }
 
 /// One indexer invocation's fixed inputs: what to run, where, how it names
@@ -2621,6 +2637,187 @@ mod tests {
         )
         .await;
         (outcome, output_path)
+    }
+
+    /// An indexer with no output flag writes `index.scip` into the project
+    /// root (its working directory) and the runner moves it. When the run
+    /// fails, nothing of it may stay behind in the user's tree.
+    #[cfg(unix)]
+    async fn run_leaving_default_output(
+        root: &Path,
+        script: &str,
+        timeout: std::time::Duration,
+    ) -> IndexerOutcome {
+        let output_path = root.join(".infigraph").join("scip-tmp").join("x.1-2.scip");
+        std::fs::create_dir_all(output_path.parent().unwrap()).unwrap();
+        run_indexer(
+            root,
+            "sh",
+            &["-c", script],
+            "scip-x",
+            None,
+            None,
+            &output_path,
+            timeout,
+        )
+        .await
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_indexer_leaves_no_index_scip_in_the_project_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outcome = run_leaving_default_output(
+            tmp.path(),
+            "echo half > index.scip; exit 3",
+            std::time::Duration::from_secs(30),
+        )
+        .await;
+
+        assert!(!outcome.succeeded(), "{outcome:?}");
+        assert!(
+            !tmp.path().join("index.scip").exists(),
+            "a failed run left index.scip in the project root"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_timed_out_indexer_leaves_no_index_scip_in_the_project_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outcome = run_leaving_default_output(
+            tmp.path(),
+            "echo half > index.scip; exec sleep 600",
+            std::time::Duration::from_millis(500),
+        )
+        .await;
+
+        assert!(
+            matches!(outcome.failure, Some(IndexerFailure::TimedOut(_))),
+            "{outcome:?}"
+        );
+        assert!(
+            !tmp.path().join("index.scip").exists(),
+            "a timed-out run left index.scip in the project root"
+        );
+    }
+
+    /// A user's own `index.scip` from before the run is not the indexer's
+    /// leftover: a failed run that never touched it must not delete it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_indexer_keeps_an_index_scip_it_never_wrote() {
+        let tmp = tempfile::tempdir().unwrap();
+        let theirs = tmp.path().join("index.scip");
+        std::fs::write(&theirs, b"the user's own").unwrap();
+        let long_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        std::fs::File::options()
+            .write(true)
+            .open(&theirs)
+            .unwrap()
+            .set_modified(long_ago)
+            .unwrap();
+
+        run_leaving_default_output(tmp.path(), "exit 3", std::time::Duration::from_secs(30)).await;
+
+        assert!(theirs.exists(), "deleted a file the run never wrote");
+    }
+
+    /// A fake indexer binary running `body` in the project root, and the
+    /// catalog entry that names it: no output flag, as `scip-ruby`.
+    #[cfg(unix)]
+    fn fake_default_output_indexer(
+        dir: &Path,
+        body: &str,
+    ) -> (PathBuf, crate::scip_download::ScipIndexer) {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = dir.join("fake-bin").join("scip-x");
+        std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        std::fs::write(&bin, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let indexer = crate::scip_download::ScipIndexer {
+            lang_tags: &[],
+            binary_name: "scip-x",
+            scip_args: &[],
+            output_flag: None,
+            download: crate::scip_download::DownloadStrategy::NpmInstall { package: "x" },
+        };
+        (bin, indexer)
+    }
+
+    /// What the foreground pass leaves, wherever it lands: everything the run
+    /// produced is under `.infigraph/scip-tmp`, nothing in the project root.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_successful_run_lands_in_the_scratch_file_not_the_project_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (bin, indexer) = fake_default_output_indexer(
+            root,
+            &format!("printf '{ONE_DOCUMENT_INDEX_PRINTF}' > index.scip"),
+        );
+        let scratch = infigraph_core::scip::scip_scratch_dir(root);
+        std::fs::create_dir_all(&scratch).unwrap();
+        let out = scratch.join(infigraph_core::scip::scratch_file_name(
+            "scip-x",
+            &scip_run_id(),
+        ));
+
+        let verdict = run_scip_indexer_to(root, &bin, &indexer, &out).await;
+
+        assert_eq!(verdict, Ok(()));
+        assert!(out.exists(), "the output is in the scratch file");
+        assert!(!root.join("index.scip").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_run_leaves_nothing_in_the_project_root_or_the_scratch_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let (bin, indexer) =
+            fake_default_output_indexer(root, "echo half > index.scip; echo boom >&2; exit 3");
+        let scratch = infigraph_core::scip::scip_scratch_dir(root);
+        std::fs::create_dir_all(&scratch).unwrap();
+        let out = scratch.join(infigraph_core::scip::scratch_file_name(
+            "scip-x",
+            &scip_run_id(),
+        ));
+
+        let verdict = run_scip_indexer_to(root, &bin, &indexer, &out).await;
+
+        assert!(verdict.is_err());
+        assert!(
+            !root.join("index.scip").exists(),
+            "left in the project root"
+        );
+        let left: Vec<_> = std::fs::read_dir(&scratch).unwrap().flatten().collect();
+        assert!(left.is_empty(), "left in the scratch dir: {left:?}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_rejected_output_leaves_nothing_in_the_project_root_or_the_scratch_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // Exit 0 with an index that has no documents: refused on arrival.
+        let (bin, indexer) = fake_default_output_indexer(root, "printf '\\012\\000' > index.scip");
+        let scratch = infigraph_core::scip::scip_scratch_dir(root);
+        std::fs::create_dir_all(&scratch).unwrap();
+        let out = scratch.join(infigraph_core::scip::scratch_file_name(
+            "scip-x",
+            &scip_run_id(),
+        ));
+
+        let verdict = run_scip_indexer_to(root, &bin, &indexer, &out).await;
+
+        assert!(verdict.is_err(), "{verdict:?}");
+        assert!(
+            !root.join("index.scip").exists(),
+            "left in the project root"
+        );
+        let left: Vec<_> = std::fs::read_dir(&scratch).unwrap().flatten().collect();
+        assert!(left.is_empty(), "left in the scratch dir: {left:?}");
     }
 
     /// An indexer that exits 0 having produced an index with nothing in it
