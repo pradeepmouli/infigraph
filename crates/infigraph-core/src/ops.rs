@@ -131,8 +131,78 @@ fn kept_across_a_code_rebuild(name: &str) -> bool {
     name == "config.toml"
         || name == "config.lock"
         || name == crate::docs_switch::DOCS_OP_LOCK
-        || name.starts_with("docs.kuzu")
-        || name.starts_with("docs_")
+        || is_docs_store_entry(name)
+}
+
+/// The document index and its sidecars (`docs.kuzu*`, `docs_*`).
+fn is_docs_store_entry(name: &str) -> bool {
+    name.starts_with("docs.kuzu") || name.starts_with("docs_")
+}
+
+/// What `infigraph worktree clean` makes of one entry of `.infigraph/`.
+/// Everything not named here is [`EntryClass::Kept`]: the list is an allow-list,
+/// so a file nobody listed survives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryClass {
+    /// Rebuilt by `infigraph index`: the graph, its sidecars, locks, logs and
+    /// scratch directories, and the last-run records of the runs that built it.
+    Derived,
+    /// The document index and its sidecars: derived, but it can hold Confluence
+    /// pages and manifest nodes that need credentials and a network to bring
+    /// back, and documents are opt-in, so it is removed only on request.
+    DocsStore,
+    /// Snapshots, quarantined and retired graphs: a user's safety nets.
+    RestorePoint,
+    /// The user's: `config.toml`, `sessions/`, `structured-schemas/`, `learned/`,
+    /// and anything else not listed.
+    Kept,
+}
+
+/// Names, exactly, that a rebuild of the graph recreates. The lock files are
+/// [`crate::ps::PROJECT_LOCKS`], not repeated here.
+const DERIVED_NAMES: &[&str] = &[
+    "bm25_cache.bin",
+    "dedup_state.json",
+    "dirty.lock",
+    "logs",
+    "requests",
+    "scip-enrich.log",
+    "scip-imports.json",
+    "scip-tmp",
+    "daemon.log",
+    "worktree-hook.log",
+    crate::daemon::writes::SIDECAR_DIR,
+];
+
+/// Names that start with these are derived too: the embeddings file and the
+/// sidecars written beside it, the vector index, and the last-run records of
+/// the runs that built what is being removed.
+const DERIVED_PREFIXES: &[&str] = &["embeddings.bin", "hnsw_index.usearch", "last-run."];
+
+/// Sort one entry of a project's `.infigraph/`. An allow-list: only what is
+/// named in [`DERIVED_NAMES`], [`DERIVED_PREFIXES`], the lock list, the graph
+/// itself and the two restore/docs predicates is anything but `Kept`.
+pub fn classify_entry(name: &str) -> EntryClass {
+    if crate::snapshot::is_restore_pool_entry(name) {
+        return EntryClass::RestorePoint;
+    }
+    // `docs-op.lock` and `docs.kuzu.lock` are in the lock list *and* part of
+    // the document store: they go with it.
+    if is_docs_store_entry(name) || name == crate::docs_switch::DOCS_OP_LOCK {
+        return EntryClass::DocsStore;
+    }
+    let derived = name == "graph"
+        || name.starts_with("graph.")
+        || crate::ps::PROJECT_LOCKS.contains(&name)
+        || DERIVED_NAMES.contains(&name)
+        || DERIVED_PREFIXES
+            .iter()
+            .any(|prefix| name.starts_with(prefix));
+    if derived {
+        EntryClass::Derived
+    } else {
+        EntryClass::Kept
+    }
 }
 
 /// The full snapshot-then-wipe sequence shared by every full-reindex call
@@ -189,6 +259,103 @@ pub fn full_reindex_wipe(tg_dir: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_graph_and_its_sidecars_are_derived() {
+        for name in [
+            "graph",
+            "graph.wal",
+            "graph.health.json",
+            "graph.health.recorded",
+            "graph.ckpt.lock",
+            "bm25_cache.bin",
+            "embeddings.bin",
+            "embeddings.bin.generation",
+            "hnsw_index.usearch",
+            "hnsw_index.usearch.meta",
+            "write-tmp",
+            "scip-tmp",
+            "scip-imports.json",
+            "scip-enrich.log",
+            "daemon.log",
+            "worktree-hook.log",
+            "dedup_state.json",
+            "dirty.lock",
+            "requests",
+            "logs",
+            "last-run.index.json",
+            "last-run.embeddings.json",
+        ] {
+            assert_eq!(classify_entry(name), EntryClass::Derived, "{name}");
+        }
+    }
+
+    #[test]
+    fn every_lock_a_process_can_hold_is_derived_except_the_configs() {
+        for lock in crate::ps::PROJECT_LOCKS {
+            let class = classify_entry(lock);
+            assert!(
+                class == EntryClass::Derived || class == EntryClass::DocsStore,
+                "{lock} classed {class:?}"
+            );
+        }
+        assert_eq!(classify_entry("config.lock"), EntryClass::Kept);
+    }
+
+    #[test]
+    fn the_docs_store_is_its_own_class() {
+        for name in [
+            "docs.kuzu",
+            "docs.kuzu.wal",
+            "docs.kuzu.lock",
+            "docs_embeddings.bin",
+            "docs_bm25_cache.bin",
+        ] {
+            assert_eq!(classify_entry(name), EntryClass::DocsStore, "{name}");
+        }
+    }
+
+    #[test]
+    fn the_restore_pools_are_their_own_class() {
+        for name in [
+            "snapshots",
+            "graph.corrupt.1790000000",
+            "graph.corrupt.1790000000.wal",
+            "graph.previous.1790000000",
+        ] {
+            assert_eq!(classify_entry(name), EntryClass::RestorePoint, "{name}");
+        }
+    }
+
+    #[test]
+    fn what_nobody_listed_is_kept() {
+        for name in [
+            "config.toml",
+            "sessions",
+            "structured-schemas",
+            "learned",
+            "my-notes.txt",
+            "graph-notes.md",
+            ".infigraph-sessions-backup",
+        ] {
+            assert_eq!(classify_entry(name), EntryClass::Kept, "{name}");
+        }
+    }
+
+    #[test]
+    fn what_a_code_rebuild_keeps_is_never_derived() {
+        // The keep-list of the rebuild wipe and this allow-list must not
+        // overlap, except for the docs store, which a rebuild keeps and a
+        // clean removes only when asked.
+        for name in [
+            "config.toml",
+            "config.lock",
+            crate::docs_switch::DOCS_OP_LOCK,
+        ] {
+            assert!(kept_across_a_code_rebuild(name));
+            assert_ne!(classify_entry(name), EntryClass::Derived, "{name}");
+        }
+    }
 
     #[test]
     fn index_op_held_by_self_is_false_with_no_lock_file() {

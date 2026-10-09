@@ -30,10 +30,24 @@ pub fn git_common_dir(path: &Path) -> Result<PathBuf> {
         .with_context(|| format!("canonicalize git common dir for {}", path.display()))
 }
 
-/// Live worktree paths for the repo containing `path`, in the order `git worktree
-/// list --porcelain` reports them. The first element is always the main worktree
-/// (git's documented, unconditional ordering).
-pub fn list_worktree_paths(path: &Path) -> Result<Vec<PathBuf>> {
+/// One entry of `git worktree list --porcelain`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GitWorktree {
+    pub path: PathBuf,
+    /// The checked-out commit; `None` for a bare repository.
+    pub head: Option<String>,
+    /// `refs/heads/<name>`; `None` when detached.
+    pub branch_ref: Option<String>,
+    /// `git worktree lock`ed, with the reason if one was given.
+    pub locked: Option<String>,
+    /// Git reports its directory as gone (`git worktree prune` would drop it).
+    pub prunable: bool,
+}
+
+/// Every worktree of the repo containing `path`, in the order `git worktree
+/// list --porcelain` reports them. The first is always the main worktree (git's
+/// documented, unconditional ordering).
+pub fn list_worktrees(path: &Path) -> Result<Vec<GitWorktree>> {
     let output = Command::new("git")
         .args(["worktree", "list", "--porcelain"])
         .current_dir(path)
@@ -45,13 +59,44 @@ pub fn list_worktree_paths(path: &Path) -> Result<Vec<PathBuf>> {
         path.display()
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut paths = Vec::new();
+    let mut worktrees: Vec<GitWorktree> = Vec::new();
     for line in stdout.lines() {
         if let Some(p) = line.strip_prefix("worktree ") {
-            paths.push(PathBuf::from(p));
+            worktrees.push(GitWorktree {
+                path: PathBuf::from(p),
+                head: None,
+                branch_ref: None,
+                locked: None,
+                prunable: false,
+            });
+            continue;
+        }
+        let Some(current) = worktrees.last_mut() else {
+            continue;
+        };
+        if let Some(head) = line.strip_prefix("HEAD ") {
+            current.head = Some(head.to_string());
+        } else if let Some(branch) = line.strip_prefix("branch ") {
+            current.branch_ref = Some(branch.to_string());
+        } else if line == "locked" {
+            current.locked = Some(String::new());
+        } else if let Some(reason) = line.strip_prefix("locked ") {
+            current.locked = Some(reason.to_string());
+        } else if line == "prunable" || line.starts_with("prunable ") {
+            current.prunable = true;
         }
     }
-    Ok(paths)
+    Ok(worktrees)
+}
+
+/// Live worktree paths for the repo containing `path`, in the order `git worktree
+/// list --porcelain` reports them. The first element is always the main worktree
+/// (git's documented, unconditional ordering).
+pub fn list_worktree_paths(path: &Path) -> Result<Vec<PathBuf>> {
+    Ok(list_worktrees(path)?
+        .into_iter()
+        .map(|worktree| worktree.path)
+        .collect())
 }
 
 pub fn main_worktree_path(path: &Path) -> Result<PathBuf> {

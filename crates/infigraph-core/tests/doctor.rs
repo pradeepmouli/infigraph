@@ -125,11 +125,13 @@ fn check_registry_project_scope_passes_when_registered() {
 fn check_registry_project_scope_fails_when_unregistered() {
     let dir = tempfile::TempDir::new().unwrap();
     let project = dir.path().join("myproj");
-    // A `.infigraph` directory with no matching registry entry represents a
-    // genuinely orphaned/indexed-but-unregistered project. A bare dir with no
-    // `.infigraph` at all was never indexed and must PASS instead -- see
-    // run_doctor_passes_registration_for_never_indexed_dir.
+    // An `.infigraph` holding a graph, with no matching registry entry,
+    // represents a genuinely orphaned/indexed-but-unregistered project. A dir
+    // with no `.infigraph` at all was never indexed, and one holding only the
+    // user's files (what `worktree clean` leaves) is not an index: both must
+    // PASS instead -- see run_doctor_passes_registration_for_never_indexed_dir.
     std::fs::create_dir_all(project.join(".infigraph")).unwrap();
+    std::fs::write(project.join(".infigraph").join("graph"), b"g").unwrap();
     let registry = Registry {
         repos: HashMap::new(),
         groups: HashMap::new(),
@@ -176,6 +178,7 @@ fn check_registry_global_scope_with_scan_roots_finds_unregistered_project() {
     let scan_root = dir.path().join("projects");
     let unregistered = scan_root.join("orphan-proj");
     std::fs::create_dir_all(unregistered.join(".infigraph")).unwrap();
+    std::fs::write(unregistered.join(".infigraph").join("graph"), b"g").unwrap();
 
     let registry = Registry {
         repos: HashMap::new(),
@@ -925,6 +928,7 @@ fn run_doctor_aggregates_every_check_category() {
     // never-indexed one -- see run_doctor_passes_registration_for_never_indexed_dir
     // for that case), so the registration check should still FAIL here.
     std::fs::create_dir_all(project.join(".infigraph")).unwrap();
+    std::fs::write(project.join(".infigraph").join("graph"), b"g").unwrap();
 
     let ctx = DoctorContext {
         registry: infigraph_core::multi::Registry::default(),
