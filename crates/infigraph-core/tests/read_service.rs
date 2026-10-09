@@ -902,7 +902,7 @@ fn a_service_without_a_port_refuses_status_and_control() {
 // ── client-side idle release ─────────────────────────────────────────
 //
 // A client lets go of a lease it has not used for
-// `daemon_idle.client_release_secs`, so a session that sits idle stops
+// `daemon.client_release_secs`, so a session that sits idle stops
 // keeping its daemon alive. The next use leases again (and, through
 // `ensure_daemon_for_routed_access`, respawns a daemon that has since
 // exited). Unix only: releasing needs the socket's shutdown handle.

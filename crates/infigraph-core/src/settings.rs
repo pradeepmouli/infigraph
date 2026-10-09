@@ -153,6 +153,29 @@ impl FromTomlItem for Toggle {
     }
 }
 
+/// A settings-group field whose absence has to be told apart from any value it
+/// could take: `Optional(None)` is "no layer stated it". The group declares it
+/// `= Optional(None)` and the caller applies the real default (or a
+/// deprecated predecessor's value) after the fact -- which a declared default
+/// cannot do, because once resolved it is indistinguishable from an explicit
+/// setting of that same value.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Deserialize)]
+#[serde(transparent)]
+pub struct Optional<T>(pub Option<T>);
+
+impl<T: std::str::FromStr> std::str::FromStr for Optional<T> {
+    type Err = T::Err;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        s.parse().map(|v| Optional(Some(v)))
+    }
+}
+
+impl<T: FromTomlItem> FromTomlItem for Optional<T> {
+    fn from_toml_item(item: &toml_edit::Item) -> Result<Self, String> {
+        T::from_toml_item(item).map(|v| Optional(Some(v)))
+    }
+}
+
 /// A settings-group list-of-paths field: zero or more root-relative paths.
 /// TOML states it as an array of strings; the env layer has only a flat
 /// string, so there it is comma-separated, with entries trimmed and empty

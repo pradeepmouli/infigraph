@@ -86,28 +86,111 @@ pub fn scip_settings(root: &Path) -> Scip {
     )
 }
 
+const DEFAULT_IDLE_GRACE_SECS: u64 = 1800;
+const DEFAULT_IDLE_CHECK_SECS: u64 = 60;
+const DEFAULT_CLIENT_RELEASE_SECS: u64 = 1800;
+
+// The idle settings. Each field is `Optional` so that "stated" can be told from
+// "left to the default": the defaults are applied in `idle_settings_from_layers`,
+// after the deprecated `[daemon_idle]` keys below have had their say.
 crate::settings! {
-    daemon_idle {
+    daemon {
         // #38: how long a daemon with no lease and no request waits before
         // exiting. 0 disables idle exit -- a watcher that never stops.
-        grace_secs: u64 = 1800,
+        // Default `DEFAULT_IDLE_GRACE_SECS`.
+        idle_grace_secs: crate::settings::Optional<u64> = crate::settings::Optional(None),
         // How often the coordinator evaluates it. Coarse: the check is
-        // cheap, but an exit an extra minute late costs nothing.
-        check_secs: u64 = 60,
+        // cheap, but an exit an extra minute late costs nothing. Default
+        // `DEFAULT_IDLE_CHECK_SECS`.
+        idle_check_secs: crate::settings::Optional<u64> = crate::settings::Optional(None),
         // Client side: how long a process keeps a lease it is not using
         // before releasing it (`daemon::lease`), so an idle session stops
-        // keeping its daemon alive. 0 never releases.
-        client_release_secs: u64 = 1800,
+        // keeping its daemon alive. 0 never releases. Default
+        // `DEFAULT_CLIENT_RELEASE_SECS`.
+        client_release_secs: crate::settings::Optional<u64> = crate::settings::Optional(None),
     }
 }
 
-/// Resolved `daemon_idle` settings. Read once at coordinator start, like
-/// every other daemon-lifetime setting.
-pub fn daemon_idle_settings(root: &Path) -> DaemonIdle {
-    DaemonIdle::resolve_or_default(
-        RawDaemonIdle::default(),
-        crate::settings_file::ConfigScope::Project(root),
-    )
+// DEPRECATED: the pre-`daemon` names of the same three settings. Still read, so
+// an existing `[daemon_idle]` table or `INFIGRAPH_DAEMON_IDLE_CLIENT_RELEASE_SECS`
+// keeps working; a `daemon` key, when stated anywhere, wins. `doctor` reports
+// any `[daemon_idle]` key still set. (The env names of the other two are the
+// same string under both groups, so there is nothing to carry for them.)
+crate::settings! {
+    daemon_idle {
+        grace_secs: crate::settings::Optional<u64> = crate::settings::Optional(None),
+        check_secs: crate::settings::Optional<u64> = crate::settings::Optional(None),
+        client_release_secs: crate::settings::Optional<u64> = crate::settings::Optional(None),
+    }
+}
+
+/// The daemon's idle-exit settings, resolved: how long a daemon with no lease
+/// and no request waits before exiting (`0` disables), how often the
+/// coordinator evaluates it, and how long a client keeps a lease it is not
+/// using (`0` never releases).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DaemonIdleSettings {
+    pub grace_secs: u64,
+    pub check_secs: u64,
+    pub client_release_secs: u64,
+}
+
+/// Resolved idle settings. Read once at coordinator start, like every other
+/// daemon-lifetime setting.
+pub fn daemon_idle_settings(root: &Path) -> DaemonIdleSettings {
+    let docs = crate::settings_file::layers(crate::settings_file::ConfigScope::Project(root));
+    let layers: Vec<&toml_edit::Item> = docs.iter().flatten().map(|doc| doc.as_item()).collect();
+    idle_settings_from_layers(&layers)
+}
+
+/// [`daemon_idle_settings`] over explicit config documents, nearest layer first.
+/// A value that does not parse is warned about once and that group falls back
+/// to stating nothing, so the default applies.
+pub fn idle_settings_from_layers(layers: &[&toml_edit::Item]) -> DaemonIdleSettings {
+    let new = Daemon::resolve_layers(RawDaemon::default(), layers).unwrap_or_else(|e| {
+        crate::settings::warn_once(&format!("{e}; using the defaults"));
+        Daemon::default()
+    });
+    let old = DaemonIdle::resolve_layers(RawDaemonIdle::default(), layers).unwrap_or_else(|e| {
+        crate::settings::warn_once(&format!(
+            "{e}; ignoring the deprecated [daemon_idle] values"
+        ));
+        DaemonIdle::default()
+    });
+    // New name if stated in any layer, else the deprecated one, else the default.
+    let pick = |new: crate::settings::Optional<u64>,
+                old: crate::settings::Optional<u64>,
+                default| { new.0.or(old.0).unwrap_or(default) };
+    DaemonIdleSettings {
+        grace_secs: pick(new.idle_grace_secs, old.grace_secs, DEFAULT_IDLE_GRACE_SECS),
+        check_secs: pick(new.idle_check_secs, old.check_secs, DEFAULT_IDLE_CHECK_SECS),
+        client_release_secs: pick(
+            new.client_release_secs,
+            old.client_release_secs,
+            DEFAULT_CLIENT_RELEASE_SECS,
+        ),
+    }
+}
+
+/// The deprecated `[daemon_idle]` keys a config states, each with its
+/// replacement, for `doctor` to report. Pairs of (deprecated, replacement),
+/// worded as they appear in `config.toml`.
+pub fn deprecated_daemon_idle_keys(layers: &[&toml_edit::Item]) -> Vec<(String, String)> {
+    const RENAMED: [(&str, &str); 3] = [
+        ("grace_secs", "idle_grace_secs"),
+        ("check_secs", "idle_check_secs"),
+        ("client_release_secs", "client_release_secs"),
+    ];
+    let mut found = Vec::new();
+    for (old, new) in RENAMED {
+        let stated = layers
+            .iter()
+            .any(|doc| doc.get("daemon_idle").and_then(|s| s.get(old)).is_some());
+        if stated {
+            found.push((format!("[daemon_idle] {old}"), format!("[daemon] {new}")));
+        }
+    }
+    found
 }
 
 /// The pure decision behind R3.3.4a's automatic SCIP re-enrichment: is the
