@@ -236,6 +236,15 @@ pub const LOCAL_BACKEND: &str = BackendChoice::Kuzu.as_str();
 /// tests for it cannot drift apart.
 pub const DAEMON_BACKEND: &str = BackendChoice::Daemon.as_str();
 
+/// What `init()` prints when it gives up on a graph that will not open and
+/// destroys it to start over ([`Infigraph::init`]'s last branch). The upgrade
+/// smoke test (`infigraph-cli/tests/upgrade_smoke.rs`) fails any open of a
+/// previous release's graph that printed it: a wipe-and-rebuild-from-source
+/// leaves the same symbols behind, so only this notice (and what the source
+/// cannot regenerate) tells it from a clean open. Every build that has had
+/// this branch has begun its message this way.
+pub const OPEN_FAILED_NOTICE: &str = "[graph] open failed";
+
 crate::settings! {
     backend {
         #[legacy = "INFIGRAPH_BACKEND"]
@@ -607,7 +616,7 @@ impl Infigraph {
                             }
                         }
                         eprintln!(
-                            "[graph] open failed after {} attempts ({last_err}), quarantining \
+                            "{OPEN_FAILED_NOTICE} after {} attempts ({last_err}), quarantining \
                              the corrupt graph and starting an EMPTY one -- the project has no \
                              symbols until a full reindex runs",
                             Self::OPEN_RETRY_BACKOFF_MS.len() + 1
