@@ -27,12 +27,13 @@ pub enum ObservedGraph {
 
 impl ObservedGraph {
     /// The daemon-routed view when `root` has a live daemon, else `None`.
-    /// Never starts one. A routed query holds a lease on it while it runs
-    /// (`RemoteExec`, like every routed read), which the process lets go of
-    /// after `client_release_secs`.
+    /// Never starts one, and takes no lease on it: an observer must not keep
+    /// a daemon alive (`doctor --global` would otherwise hold every live
+    /// daemon for `client_release_secs`). A read still counts as activity on
+    /// the daemon's idle clock.
     pub fn via_live_daemon(root: &Path) -> Option<Self> {
         crate::daemon::lifecycle::daemon_is_alive(&root.join(".infigraph").join("watch.lock"))
-            .then(|| Self::Daemon(RemoteExec::new(root)))
+            .then(|| Self::Daemon(RemoteExec::observer(root)))
     }
 
     /// Observe `root`'s graph at `graph_path`: through its live daemon, or

@@ -70,17 +70,50 @@ fn live_project() -> (tempfile::TempDir, KillOnDrop) {
     (tmp, daemon)
 }
 
-/// Whether this process holds a lease on the daemon. A read routed through
-/// `RemoteExec` takes one (`lease::in_use`), a direct open never does, and
-/// `status` itself does not (`KEEPS_ALIVE = false`) -- so it is the proof that
-/// an observer asked the daemon. A direct open beside a live daemon succeeds
-/// on this machine, so "it did not fail" could not tell the two apart.
+/// Whether this process holds a lease on the daemon. An ordinary routed read
+/// takes one (`lease::in_use`); an observer's read, a direct open and
+/// `status` do not.
 fn this_process_leases(root: &Path) -> bool {
     infigraph_core::daemon::control::query_status(root)
         .expect("the daemon answers status")
         .lease_owners
         .iter()
         .any(|o| o.pid == std::process::id())
+}
+
+/// How long the daemon has gone without a request (`None` while anyone
+/// leases it). A read it serves resets this and `status` does not
+/// (`KEEPS_ALIVE = false`), so a drop is the proof that an observer asked the
+/// daemon: a direct open beside a live daemon succeeds on this machine, so
+/// "it did not fail" cannot tell a routed read from a direct one.
+fn idle_secs(root: &Path) -> u64 {
+    infigraph_core::daemon::control::query_status(root)
+        .expect("the daemon answers status")
+        .idle_secs
+        .expect("nobody leases this daemon")
+}
+
+/// Let the daemon sit unasked long enough for a reset to be unmistakable.
+fn settle(root: &Path) -> u64 {
+    let start = Instant::now();
+    loop {
+        let idle = idle_secs(root);
+        if idle >= 3 {
+            return idle;
+        }
+        assert!(start.elapsed() < Duration::from_secs(30), "never idled");
+        std::thread::sleep(Duration::from_millis(500));
+    }
+}
+
+/// An observer asked the daemon (idle clock reset) and left no lease behind.
+fn assert_observed_without_leasing(root: &Path, before: u64, what: &str) {
+    assert!(!this_process_leases(root), "{what} left a lease");
+    let after = idle_secs(root);
+    assert!(
+        after < before,
+        "{what} never reached the daemon (idle {before}s -> {after}s)"
+    );
 }
 
 fn status<'a>(
@@ -96,14 +129,11 @@ fn status<'a>(
 #[test]
 fn verify_of_a_project_with_a_live_daemon_is_answered_by_the_daemon() {
     let (tmp, daemon) = live_project();
-    assert!(!this_process_leases(tmp.path()));
+    let before = settle(tmp.path());
 
     let results = run_verify(tmp.path());
 
-    assert!(
-        this_process_leases(tmp.path()),
-        "verify never reached the daemon"
-    );
+    assert_observed_without_leasing(tmp.path(), before, "verify");
 
     let open = status(&results, "graph: open");
     assert_eq!(open.status, CheckStatus::Pass, "{results:#?}");
@@ -132,14 +162,11 @@ fn the_compaction_drift_check_measures_through_a_live_daemon() {
         ],
     );
 
-    assert!(!this_process_leases(tmp.path()));
+    let before = settle(tmp.path());
     let result = check_one_compaction_drift(tmp.path())
         .expect("a live daemon's graph must be measurable, not skipped");
 
-    assert!(
-        this_process_leases(tmp.path()),
-        "the drift check never reached the daemon"
-    );
+    assert_observed_without_leasing(tmp.path(), before, "the drift check");
     assert_ne!(result.status, CheckStatus::Fail, "{result:#?}");
     assert!(
         !result.message.contains("no table has enough rows") || result.message.contains("drift"),
@@ -161,4 +188,35 @@ fn without_a_daemon_verify_still_opens_the_graph_itself() {
     let open = status(&results, "graph: open");
     assert_eq!(open.status, CheckStatus::Pass, "{results:#?}");
     assert!(!open.message.contains("daemon"), "{open:#?}");
+}
+
+#[test]
+fn an_ordinary_routed_read_still_leases_the_daemon() {
+    use infigraph_core::graph::query_exec::QueryExec;
+    let (tmp, daemon) = live_project();
+    assert!(!this_process_leases(tmp.path()));
+
+    infigraph_core::graph::remote_exec::RemoteExec::new(tmp.path())
+        .query_rows("MATCH (f:File) RETURN count(f)")
+        .unwrap();
+
+    assert!(this_process_leases(tmp.path()));
+    drop(daemon);
+}
+
+#[test]
+fn the_direct_arm_reads_the_same_executor_surface() {
+    use infigraph_core::graph::observe::ObservedGraph;
+    let tmp = tempfile::tempdir().unwrap();
+    let graph = tmp.path().join(".infigraph").join("graph");
+    drop(infigraph_core::graph::GraphStore::open(&graph).unwrap());
+
+    let observed = ObservedGraph::open(tmp.path(), &graph).unwrap();
+
+    assert!(!observed.is_daemon());
+    let rows = observed
+        .with_exec(|e| e.query_rows("MATCH (s:Symbol) RETURN count(s)"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(rows, vec![vec!["0".to_string()]]);
 }

@@ -19,6 +19,9 @@ const CHUNK_SIZE: usize = 1024;
 pub struct RemoteExec {
     root: PathBuf,
     store: Store,
+    /// Hold a lease on the daemon while a query runs. Off only for an
+    /// observer (`ObservedGraph`), which must not keep a daemon alive.
+    leases: bool,
 }
 
 impl RemoteExec {
@@ -27,6 +30,17 @@ impl RemoteExec {
         Self {
             root: root.to_path_buf(),
             store: Store::Graph,
+            leases: true,
+        }
+    }
+
+    /// Read the code graph for `root` through its daemon without leasing it,
+    /// like `query_status`: a read still counts as activity on the daemon's
+    /// idle clock, and a daemon that exits mid-read is a failed read.
+    pub fn observer(root: &Path) -> Self {
+        Self {
+            leases: false,
+            ..Self::new(root)
         }
     }
 
@@ -36,6 +50,7 @@ impl RemoteExec {
         Self {
             root: root.to_path_buf(),
             store: Store::Docs,
+            leases: true,
         }
     }
 }
@@ -63,7 +78,9 @@ impl RemoteExec {
 
 impl QueryExec for RemoteExec {
     fn query_rows(&self, cypher: &str) -> Result<Vec<Vec<String>>> {
-        let _use = crate::daemon::lease::in_use(&self.root);
+        let _use = self
+            .leases
+            .then(|| crate::daemon::lease::in_use(&self.root));
         // Two distinct startup windows, both bounded by the same grace and
         // both gated on a daemon actually being alive: not yet listening
         // (handled in `connect_allowing_for_startup`), and listening but
