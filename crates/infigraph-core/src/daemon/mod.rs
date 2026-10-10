@@ -264,6 +264,12 @@ fn spawn_scip_enrich(
 ) -> Task<()> {
     let _guard = drain_rt.enter();
     Task::spawn_blocking(daemon_token, "scip-enrich", move |token| {
+        // One enrichment per project at a time, whoever started it: the
+        // detached `scip-enrich` child and a foreground `index --no-embed`
+        // hold the same lock. The loser has already logged why it skipped.
+        let Some(_enriching) = crate::scip::try_begin_enrichment(&root, "daemon") else {
+            return;
+        };
         cb(root, job, token, submitter);
     })
 }

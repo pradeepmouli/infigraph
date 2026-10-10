@@ -798,6 +798,11 @@ pub(crate) fn auto_scip(
         return Ok(());
     }
 
+    // One enrichment per project at a time (see `try_begin_enrichment`).
+    let Some(_enriching) = infigraph_core::scip::try_begin_enrichment(root, "index") else {
+        return Ok(());
+    };
+
     println!(
         "Auto-SCIP: found {} applicable indexer(s) for detected languages",
         indexers.len()
@@ -901,6 +906,13 @@ pub(crate) fn cmd_scip_enrich(
                 return;
             }
         }
+    };
+    // One enrichment per project at a time (see `try_begin_enrichment`). Held
+    // alongside `index.lock` on the `INFIGRAPH_BACKEND=kuzu` path too: both are
+    // try-locks, so neither order can deadlock, and a second `scip-enrich`
+    // there is already turned away by `index.lock` before it gets this far.
+    let Some(_enriching) = infigraph_core::scip::try_begin_enrichment(root, "scip-enrich") else {
+        return;
     };
     auto_scip_background(root, detected_languages);
 

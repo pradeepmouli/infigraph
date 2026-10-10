@@ -51,6 +51,7 @@ pub(crate) const PROJECT_LOCKS: &[&str] = &[
     "docs.kuzu.lock",
     crate::docs_switch::DOCS_OP_LOCK,
     "mcp.lock",
+    crate::scip::SCIP_ENRICH_LOCK,
 ];
 
 /// Enumerate infigraph processes recorded by the instance registry plus

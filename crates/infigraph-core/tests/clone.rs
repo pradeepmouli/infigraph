@@ -164,3 +164,18 @@ fn clone_skips_the_restore_pools_but_keeps_the_graph() {
         "a nested directory that happens to be called snapshots is not a pool"
     );
 }
+
+/// A clone must not carry `scip-enrich.lock`: it is a per-project rendezvous
+/// file, meaningless (and misleading) at the destination.
+#[test]
+fn clone_excludes_the_enrichment_lock() {
+    let src = tempfile::tempdir().unwrap();
+    let dst = tempfile::tempdir().unwrap();
+    write_file(&src.path().join(".infigraph/scip-enrich.lock"), "pid:123");
+    write_file(&src.path().join(".infigraph/embeddings.bin"), "emb-bytes");
+
+    clone_infigraph_dir(src.path(), dst.path()).unwrap();
+
+    assert!(!dst.path().join(".infigraph/scip-enrich.lock").exists());
+    assert!(dst.path().join(".infigraph/embeddings.bin").exists());
+}
