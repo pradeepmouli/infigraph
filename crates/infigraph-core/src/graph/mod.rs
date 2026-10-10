@@ -7,6 +7,7 @@ mod kuzu_backend;
 pub mod lock_probe;
 #[cfg(feature = "neo4j")]
 mod neo4j_backend;
+pub mod observe;
 pub mod parquet_loader;
 mod queries;
 pub mod query_exec;
