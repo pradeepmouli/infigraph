@@ -16,6 +16,7 @@ const EXCLUDED_RELATIVE_PATHS: &[&str] = &[
     "docs-op.lock",
     "docs.kuzu.lock",
     "config.lock",
+    crate::scip::SCIP_ENRICH_LOCK,
     "logs",
 ];
 

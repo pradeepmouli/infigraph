@@ -126,10 +126,13 @@ pub fn wipe_infigraph_preserving_index_lock(tg_dir: &Path) -> std::io::Result<()
 /// project's own `config.toml` (`[docs] enabled`, `[index] include`, ...),
 /// which is the user's rather than derived, and the document index with its
 /// sidecars and lock, which the code graph does not feed. Wiping the docs
-/// lock while it is held would also split it.
+/// lock while it is held would also split it. `scip-enrich.lock` stays for the
+/// same reason `index.lock` does: unlinking a lock file a live enrichment has
+/// open lets a second one lock a fresh inode and run beside it.
 fn kept_across_a_code_rebuild(name: &str) -> bool {
     name == "config.toml"
         || name == "config.lock"
+        || name == crate::scip::SCIP_ENRICH_LOCK
         || name == crate::docs_switch::DOCS_OP_LOCK
         || is_docs_store_entry(name)
 }
@@ -340,6 +343,24 @@ mod tests {
         ] {
             assert_eq!(classify_entry(name), EntryClass::Kept, "{name}");
         }
+    }
+
+    /// A rebuild must not unlink `scip-enrich.lock`: a live enrichment holds an
+    /// OS lock on that inode, and a fresh file under the same name would let a
+    /// second enrichment lock it too -- the same reason `index.lock` stays.
+    #[test]
+    fn a_code_rebuild_wipe_keeps_the_enrichment_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ig = tmp.path().join(".infigraph");
+        std::fs::create_dir_all(&ig).unwrap();
+        for name in ["graph", "scip-enrich.lock", "index.lock", "daemon.log"] {
+            std::fs::write(ig.join(name), "x").unwrap();
+        }
+        wipe_infigraph_preserving_index_lock(&ig).unwrap();
+        assert!(ig.join("scip-enrich.lock").exists());
+        assert!(ig.join("index.lock").exists());
+        assert!(!ig.join("graph").exists());
+        assert!(!ig.join("daemon.log").exists());
     }
 
     #[test]

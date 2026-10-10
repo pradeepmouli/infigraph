@@ -993,6 +993,26 @@ mod tests {
         assert_eq!(find(&plan, &wt).skip, Some(Skip::CurrentDirectory));
     }
 
+    /// An enrichment holding `scip-enrich.lock` is a session in the worktree:
+    /// `clean` leaves it alone until the lock is free.
+    #[test]
+    fn a_held_enrichment_lock_skips_the_worktree() {
+        let repo = Repo::new();
+        let wt = repo.branch("fix-a");
+        repo.merge("fix-a");
+        seed(&wt);
+        let _held = crate::scip::try_begin_enrichment(&wt, "test").expect("the lock was free");
+
+        let plan = plan_for(&repo, &options());
+        assert!(
+            matches!(find(&plan, &wt).skip, Some(Skip::Held(ref why)) if why.contains("scip-enrich.lock")),
+            "{:?}",
+            find(&plan, &wt).skip
+        );
+        drop(_held);
+        assert_eq!(find(&plan_for(&repo, &options()), &wt).skip, None);
+    }
+
     #[test]
     fn a_held_infigraph_lock_skips_the_worktree() {
         use fs2::FileExt;

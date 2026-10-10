@@ -1422,6 +1422,61 @@ pub fn scip_import_log_line(label: Option<&str>, stats: &ImportStats) -> String 
     }
 }
 
+/// The per-project lock around one SCIP enrichment (running the indexers and
+/// importing what they wrote).
+pub const SCIP_ENRICH_LOCK: &str = "scip-enrich.lock";
+
+/// What the loser of [`try_begin_enrichment`] says, to whichever log it writes
+/// to. A skipped enrichment is not a failure: it is logged, never recorded as a
+/// problem.
+pub const ENRICHMENT_SKIPPED: &str = "SCIP enrichment already running for this project; skipped";
+
+/// Held for the length of one enrichment. Dropping it frees the project for the
+/// next one; so does the holder dying, since it is an OS lock.
+pub struct EnrichmentGuard {
+    _lock: Option<crate::lockfile::LockFile>,
+}
+
+/// Try to become the one enrichment of `root` that is running. `None` means
+/// another is, and this has already said so ([`ENRICHMENT_SKIPPED`]); the caller
+/// returns without running indexers. It never waits.
+///
+/// Every entry point takes it: the daemon's enrichment task, the detached
+/// `scip-enrich` child, and the foreground `--no-embed` pass. Without it two
+/// of them run the same indexers at once (the deterministic repro in #209 item
+/// 15), one's cleanup removes the shared `scip-tmp/` under the other's output,
+/// and the slot pool queues other projects behind the duplicates. The trade-off
+/// is accepted: the loser does not pick up edits made after the running
+/// enrichment started; the next `index` or the staleness trigger does.
+pub fn try_begin_enrichment(root: &Path, role: &str) -> Option<EnrichmentGuard> {
+    let dir = root.join(".infigraph");
+    // Nothing to enrich without a project directory, and a lock file would
+    // create one.
+    if !dir.is_dir() {
+        return Some(EnrichmentGuard { _lock: None });
+    }
+    let path = dir.join(SCIP_ENRICH_LOCK);
+    match crate::lockfile::try_acquire(&path, role) {
+        Ok(Some(lock)) => Some(EnrichmentGuard { _lock: Some(lock) }),
+        Ok(None) => {
+            match crate::lockfile::read_holder(&path) {
+                Some(holder) => eprintln!(
+                    "{ENRICHMENT_SKIPPED} (held by pid {}, {})",
+                    holder.pid, holder.role
+                ),
+                None => eprintln!("{ENRICHMENT_SKIPPED}"),
+            }
+            None
+        }
+        // A lock that cannot be taken must not stop enrichment: fail open, as
+        // the slot pools do.
+        Err(e) => {
+            eprintln!("warning: could not take {SCIP_ENRICH_LOCK}: {e:#}; enriching without it");
+            Some(EnrichmentGuard { _lock: None })
+        }
+    }
+}
+
 /// The directory SCIP indexers write their scratch output to, under a
 /// project's `.infigraph/`.
 pub const SCIP_SCRATCH_DIR: &str = "scip-tmp";
@@ -3372,5 +3427,49 @@ mod tests {
         assert_eq!(discard_if_rejected(&good), None);
         assert!(good.exists(), "a good output must survive for adoption");
         assert_eq!(discard_if_rejected(&missing), None);
+    }
+}
+
+#[cfg(test)]
+mod enrichment_lock_tests {
+    use super::*;
+
+    #[test]
+    fn one_enrichment_per_project_and_a_drop_frees_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".infigraph")).unwrap();
+
+        let first = try_begin_enrichment(tmp.path(), "first").expect("the lock was free");
+        assert!(
+            try_begin_enrichment(tmp.path(), "second").is_none(),
+            "a second enrichment of the same project must be turned away"
+        );
+        drop(first);
+        assert!(
+            try_begin_enrichment(tmp.path(), "third").is_some(),
+            "dropping the guard frees the project"
+        );
+    }
+
+    #[test]
+    fn projects_do_not_block_each_other() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        for d in [&a, &b] {
+            std::fs::create_dir_all(d.path().join(".infigraph")).unwrap();
+        }
+        let _a = try_begin_enrichment(a.path(), "a").unwrap();
+        assert!(try_begin_enrichment(b.path(), "b").is_some());
+    }
+
+    #[test]
+    fn a_project_without_an_infigraph_dir_is_not_given_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let guard = try_begin_enrichment(tmp.path(), "x");
+        assert!(guard.is_some(), "nothing to guard, nothing to refuse");
+        assert!(
+            !tmp.path().join(".infigraph").exists(),
+            "taking the lock must not create the project directory"
+        );
     }
 }
