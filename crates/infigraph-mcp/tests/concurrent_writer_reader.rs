@@ -223,7 +223,14 @@ fn parse_counts(stdout: &str) -> Option<ReaderCounts> {
     Some(c)
 }
 
+/// Ignored by default (#209 item 12): it covers only the opt-out/direct-read
+/// hatch -- a second process opening the graph beside a live writer. Since
+/// #159 no shipped read does that (reads route through the daemon), and since
+/// item 12 `verify` and `doctor` route too when a daemon is live
+/// (`graph::observe`). Run it when touching that hatch:
+/// `cargo test -p infigraph-mcp --test concurrent_writer_reader -- --ignored`.
 #[test]
+#[ignore = "covers only the INFIGRAPH_BACKEND=kuzu direct-read hatch; run with --ignored"]
 fn concurrent_writer_reader_raw_query_correctness_under_load() {
     let project = tempfile::tempdir().expect("project tmpdir");
     let root = project.path().to_path_buf();

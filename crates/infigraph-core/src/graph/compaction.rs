@@ -7,7 +7,9 @@
 
 use std::path::Path;
 
+use super::query_exec::{LocalExec, QueryExec};
 use super::GraphStore;
+#[cfg(test)]
 use kuzu::Connection;
 
 /// Tables whose page accounting is tracked. Node tables, every one, so a
@@ -52,13 +54,17 @@ pub struct TableStats {
 /// instrument in `store.rs` panics with it, and "the query was malformed"
 /// and "the engine reshaped its output" are different diagnoses. Callers that
 /// only need a yes/no -- the policy path below -- discard it with `.ok()`.
+#[cfg(test)]
 pub(crate) fn scalar_u64(conn: &Connection<'_>, cypher: &str) -> Result<u64, String> {
-    let mut res = conn.query(cypher).map_err(|e| e.to_string())?;
-    let row = res.next().ok_or_else(|| "no rows".to_string())?;
-    let raw = row
-        .first()
-        .ok_or_else(|| "no columns".to_string())?
-        .to_string();
+    scalar_u64_via(&LocalExec::new(conn), cypher)
+}
+
+/// [`scalar_u64`] on any executor -- the daemon's read service as well as a
+/// local connection -- so there is one parse of a one-cell result.
+pub(crate) fn scalar_u64_via(exec: &dyn QueryExec, cypher: &str) -> Result<u64, String> {
+    let rows = exec.query_rows(cypher).map_err(|e| e.to_string())?;
+    let row = rows.first().ok_or_else(|| "no rows".to_string())?;
+    let raw = row.first().ok_or_else(|| "no columns".to_string())?;
     // `sum()` over an empty table is NULL, and that is a real answer here:
     // no pages. Anything else that fails to parse is not.
     if raw.is_empty() || raw.eq_ignore_ascii_case("null") {
@@ -82,16 +88,26 @@ pub(crate) fn scalar_u64(conn: &Connection<'_>, cypher: &str) -> Result<u64, Str
 /// stale or empty rows (#149). Here that would read as "pages never grew".
 pub fn table_page_stats(store: &GraphStore, tables: &[&str]) -> Option<Vec<(String, TableStats)>> {
     let conn = store.connection().ok()?;
+    table_page_stats_via(&LocalExec::new(&conn), tables)
+}
+
+/// [`table_page_stats`] on any executor: `doctor` measures a project whose
+/// daemon holds the graph through that daemon's read service instead of
+/// opening a second handle beside its writer.
+pub fn table_page_stats_via(
+    exec: &dyn QueryExec,
+    tables: &[&str],
+) -> Option<Vec<(String, TableStats)>> {
     tables
         .iter()
         .map(|t| {
-            let pages = scalar_u64(
-                &conn,
+            let pages = scalar_u64_via(
+                exec,
                 &format!("CALL storage_info('{t}') RETURN CAST(sum(num_pages) AS INT64)"),
             )
             .ok()?;
-            let rows = scalar_u64(
-                &conn,
+            let rows = scalar_u64_via(
+                exec,
                 &format!("MATCH (n:{t}) RETURN CAST(count(*) AS INT64)"),
             )
             .ok()?;

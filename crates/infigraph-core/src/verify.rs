@@ -9,7 +9,9 @@
 //! explicitly invoked.
 
 use crate::doctor::CheckResult;
-use crate::graph::GraphBackend;
+use crate::graph::observe::ObservedGraph;
+use crate::graph::query_exec::QueryExec;
+use crate::graph::GraphQuery;
 use std::path::Path;
 
 const CATEGORY: &str = "verify";
@@ -36,10 +38,18 @@ pub fn run_verify(root: &Path) -> Vec<CheckResult> {
     //    preflight for free: the truncation check, and the unreplayed-WAL/
     //    dead-holder guard (R3.1.3) whose refusal shows up here as FAIL
     //    with the guard's own actionable message.
-    let backend = match crate::graph::KuzuBackend::open_read_only(&graph_path) {
-        Ok(b) => {
-            results.push(CheckResult::pass(CATEGORY, "graph: open", "opens cleanly"));
-            b
+    let observed = match ObservedGraph::open(root, &graph_path) {
+        Ok(o) => {
+            results.push(CheckResult::pass(
+                CATEGORY,
+                "graph: open",
+                if o.is_daemon() {
+                    "served by the project's running daemon"
+                } else {
+                    "opens cleanly"
+                },
+            ));
+            o
         }
         Err(e) if crate::graph::is_transient_open_error(&e) => {
             // A live writer mid-transaction, a checkpoint in progress, or
@@ -66,8 +76,22 @@ pub fn run_verify(root: &Path) -> Vec<CheckResult> {
         }
     };
 
-    results.push(check_symbol_file_references(&backend));
-    results.extend(check_embeddings_sidecar(&backend, &ig));
+    // One body for both variants: a routed project and a directly opened one
+    // run the same checks over `GraphQuery`.
+    let checks = observed.with_query(|q| {
+        let mut out = vec![check_symbol_file_references(q)];
+        out.extend(check_embeddings_sidecar(q, &ig));
+        out
+    });
+    match checks {
+        Ok(rows) => results.extend(rows),
+        Err(e) => results.push(CheckResult::warn(
+            CATEGORY,
+            "graph: symbol->file references",
+            format!("could not query the graph: {e:#}"),
+            "if this persists, the graph may be corrupt -- `infigraph rebuild` repairs it",
+        )),
+    }
     results
 }
 
@@ -77,7 +101,7 @@ pub fn run_verify(root: &Path) -> Vec<CheckResult> {
 /// symbols pointing at files the graph no longer knows. Computed
 /// client-side as a set difference: Kuzu's Cypher subset has no reliable
 /// NOT-EXISTS subquery to push this down.
-fn check_symbol_file_references(backend: &crate::graph::KuzuBackend) -> CheckResult {
+fn check_symbol_file_references<E: QueryExec>(backend: &GraphQuery<E>) -> CheckResult {
     let label = "graph: symbol->file references";
     let distinct_symbol_files = backend.raw_query("MATCH (s:Symbol) RETURN DISTINCT s.file");
     let file_ids = backend.raw_query("MATCH (f:File) RETURN f.id");
@@ -123,7 +147,7 @@ fn check_symbol_file_references(backend: &crate::graph::KuzuBackend) -> CheckRes
 
 /// The embeddings sidecar parses, its recorded generation matches the live
 /// graph's, and its entry count is sane relative to the symbol count.
-fn check_embeddings_sidecar(backend: &crate::graph::KuzuBackend, ig: &Path) -> Vec<CheckResult> {
+fn check_embeddings_sidecar<E: QueryExec>(backend: &GraphQuery<E>, ig: &Path) -> Vec<CheckResult> {
     let mut results = Vec::new();
     let emb_path = ig.join("embeddings.bin");
     if !emb_path.exists() {
@@ -182,7 +206,7 @@ fn check_embeddings_sidecar(backend: &crate::graph::KuzuBackend, ig: &Path) -> V
     // Generation match (R3.3.3): the marker records which graph generation
     // the sidecar was built from; 0/absent means "predates generation
     // tracking or backend doesn't track" -- can't judge, stay silent.
-    let current_gen = backend.current_ast_generation().unwrap_or(0);
+    let current_gen = backend.generation("ast_generation");
     let recorded = crate::embed::read_generation_marker(&emb_path);
     match (current_gen, recorded) {
         (0, _) | (_, None) => {}

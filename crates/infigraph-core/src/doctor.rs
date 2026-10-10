@@ -592,9 +592,11 @@ pub fn check_one_compaction_drift(project_path: &Path) -> Option<CheckResult> {
         ));
     }
 
-    let store = crate::graph::GraphStore::open_read_only(&graph_path).ok()?;
+    let observed = crate::graph::observe::ObservedGraph::open(project_path, &graph_path).ok()?;
     let tables: Vec<&str> = crate::graph::compaction::ACCOUNTED_TABLES.to_vec();
-    let now = crate::graph::compaction::table_page_stats(&store, &tables)?;
+    let now = observed
+        .with_exec(|exec| crate::graph::compaction::table_page_stats_via(exec, &tables))
+        .ok()??;
 
     let scope = crate::settings_file::ConfigScope::of_infigraph_dir(Some(&infigraph_dir));
     let cfg = crate::graph::Graph::resolve_or_default(crate::graph::RawGraph::default(), scope);
@@ -1363,9 +1365,15 @@ fn check_one_project_scip_staleness(project_path: &Path) -> Option<CheckResult> 
     if !graph_path.exists() {
         return None;
     }
-    let store = crate::graph::GraphStore::open_read_only(&graph_path).ok()?;
-    let ast_gen = store.current_ast_generation().ok()?;
-    let scip_gen = store.current_scip_generation().ok()?;
+    let observed = crate::graph::observe::ObservedGraph::open(project_path, &graph_path).ok()?;
+    let (ast_gen, scip_gen) = observed
+        .with_query(|q| {
+            (
+                q.generation("ast_generation"),
+                q.generation("scip_generation"),
+            )
+        })
+        .ok()?;
 
     if scip_gen == 0 {
         return None;
@@ -1465,7 +1473,7 @@ fn check_one_project_recovery(project_path: &Path) -> Vec<CheckResult> {
 
     // An empty-but-openable graph is the recovery path's silent outcome, so
     // judge it by content rather than by whether the file opens.
-    if let Ok(symbols) = graph_symbol_count(&infigraph_dir) {
+    if let Ok(symbols) = graph_symbol_count(project_path) {
         if symbols == 0 {
             out.push(CheckResult::fail(
                 RECOVERY_CATEGORY,
@@ -1484,14 +1492,13 @@ fn check_one_project_recovery(project_path: &Path) -> Vec<CheckResult> {
 /// Symbol count from a read-only open, `Err` when the graph is absent or
 /// unopenable -- both of which other checks already report, so this one
 /// stays silent rather than double-reporting them.
-fn graph_symbol_count(infigraph_dir: &Path) -> anyhow::Result<usize> {
-    let graph_path = infigraph_dir.join("graph");
+fn graph_symbol_count(project_path: &Path) -> anyhow::Result<usize> {
+    let graph_path = project_path.join(".infigraph").join("graph");
     if !graph_path.exists() {
         anyhow::bail!("no graph");
     }
-    use crate::graph::GraphBackend;
-    let store = crate::graph::KuzuBackend::open_read_only(&graph_path)?;
-    let rows = store.raw_query("MATCH (s:Symbol) RETURN count(s)")?;
+    let observed = crate::graph::observe::ObservedGraph::open(project_path, &graph_path)?;
+    let rows = observed.with_query(|q| q.raw_query("MATCH (s:Symbol) RETURN count(s)"))??;
     let n = rows
         .first()
         .and_then(|r| r.first())
