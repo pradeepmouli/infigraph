@@ -466,8 +466,12 @@ fn indexed_project_and_source() -> (tempfile::TempDir, StoreSource) {
     (dir, source)
 }
 
-fn wait_for(mut cond: impl FnMut() -> bool) -> bool {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+fn wait_for(cond: impl FnMut() -> bool) -> bool {
+    wait_for_within(std::time::Duration::from_secs(5), cond)
+}
+
+fn wait_for_within(budget: std::time::Duration, mut cond: impl FnMut() -> bool) -> bool {
+    let deadline = std::time::Instant::now() + budget;
     while std::time::Instant::now() < deadline {
         if cond() {
             return true;
@@ -667,8 +671,17 @@ fn hold_reattaches_to_a_successor_service() {
     assert!(wait_for(|| liveness.leases() == 0));
     let _svc2 = ReadService::start_serving(project.path(), source, None, 2, liveness.clone(), None)
         .unwrap();
+    // The reattach is not instant and not load-dependent: the client's first
+    // reconnect usually lands on the dying listener (no ack), which earns the
+    // fixed 1s pause in `hold_until_no_daemon` before the retry reaches this
+    // service. Measured 2026-10-10: 1003..1035ms over 30 runs, also with 84
+    // busy loops on a 14-core machine. The old 5s budget left only a 4s stall
+    // of headroom, which a loaded CI runner exceeded once
+    // (run 38067763823, macOS); 20s keeps the test meaningful (a lease that
+    // never follows still fails) without tying it to runner scheduling.
     assert!(
-        wait_for(|| liveness.leases() == 1),
+        wait_for_within(std::time::Duration::from_secs(20), || liveness.leases()
+            == 1),
         "the lease must follow the daemon across a restart"
     );
 }
