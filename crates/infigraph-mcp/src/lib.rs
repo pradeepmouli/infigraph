@@ -361,6 +361,12 @@ pub fn dispatch_tool(tool_name: &str, args: &Value) -> Result<String, anyhow::Er
     }
 }
 
+/// The `path_prefix` property the graph-wide analysis tools share, so each
+/// says the same thing about what it restricts (#30).
+fn path_prefix_prop() -> Value {
+    json!({"type":"string","description":"Restrict the analysis to files under this directory (or to this one file), relative to the project root, e.g. 'crates/infigraph-core'. Matches whole path components. Default: the whole project."})
+}
+
 fn tool_def(name: &str, description: &str, props: Value, required: &[&str]) -> Value {
     // `path` is optional everywhere it can be defaulted: dispatch fills in
     // this server's project (`scope_to_project`, #196).
@@ -421,8 +427,8 @@ pub fn build_tools_list() -> Vec<Value> {
             p(true,false,true,json!({})), &["path","file"]),
         tool_def("get_stats", "Graph statistics: total symbols, modules, call edges, inheritance edges, contains edges.",
             p(true,false,false,json!({})), &["path"]),
-        tool_def("detect_dead_code", "PRIMARY: Find unreachable functions/methods with zero callers. Use INSTEAD OF manual analysis for dead code cleanup. Excludes entry points and test fixtures.",
-            p(true,false,false,json!({})), &["path"]),
+        tool_def("detect_dead_code", "PRIMARY: Find unreachable functions/methods with zero callers. Use INSTEAD OF manual analysis for dead code cleanup. Excludes entry points and test fixtures. Set path_prefix to report only one subtree; callers outside it still count as callers.",
+            p(true,false,false,json!({"path_prefix":path_prefix_prop()})), &["path"]),
         tool_def("trace_callers", "PRIMARY: Find all direct callers of a symbol. Use INSTEAD OF grep for 'who calls this function'. Returns caller symbol IDs, files, and line numbers. Set include_tests=false to exclude callers that are test functions/methods (useful when auditing production call paths). WARNING: if symbol_id is one method of a multi-method class/interface, callers of SIBLING methods on the same class are NOT included by default — the response will say so when this applies. Set expand_interface=true to aggregate across every sibling method when you actually want the interface-wide blast radius (e.g. before changing the interface itself, not just this one method). The symbol_id is a two-step lookup: first find it via `search` or `search_symbols` (results include the exact id, e.g. 'app/auth.py::login'), then pass that id here.",
             p(true,true,false,json!({"include_tests":{"type":"boolean","default":true,"description":"Include test-function/method callers. Set false to see only non-test callers."},"expand_interface":{"type":"boolean","default":false,"description":"Aggregate callers across every sibling method on the same class/interface, not just symbol_id. Use when assessing the impact of changing the whole interface."}})), &["path","symbol_id"]),
         tool_def("trace_callees", "PRIMARY: Find all symbols called by a given symbol. Use INSTEAD OF reading function body to find calls. Returns callee symbol IDs, files, and line numbers. Set include_tests=false to exclude callees that are test functions/methods. The symbol_id is a two-step lookup: first find it via `search` or `search_symbols` (results include the exact id, e.g. 'app/auth.py::login'), then pass that id here.",
@@ -544,7 +550,7 @@ pub fn build_tools_list() -> Vec<Value> {
         tool_def("get_doc_context", "PRIMARY: Full documentation context for a symbol — signature, docstring, source, callers, callees, file. One call replaces get_code_snippet + trace_callers + trace_callees. Use BEFORE modifying any function. Default returns compact summary (no source); set detail=true for full source. symbol_id is discovered in two steps: run `search`/`search_symbols` first, then pass the exact id from the results (format 'file/path::name', e.g. 'app/auth.py::login').",
             p(true,true,false,json!({"detail":{"type":"boolean","default":false,"description":"If true, return full source code. Default (false) returns signature + callers/callees only."}})), &["path","symbol_id"]),
         tool_def("detect_clones", "PRIMARY: Find near-duplicate functions using vector similarity. Use to identify copy-paste code and refactoring opportunities. Stores SIMILAR_TO edges for later querying.",
-            p(true,false,false,json!({"threshold":{"type":"number","default":0.92,"description":"Similarity threshold 0.0-1.0 (default: 0.92). Lower = more results but more false positives."},"limit":{"type":"integer","default":20,"description":"Max clone pairs to return"},"kinds":{"type":"string","default":"Function,Method","description":"Comma-separated symbol kinds to check (default: Function,Method)"},"store_edges":{"type":"boolean","default":true,"description":"Write SIMILAR_TO edges to graph for later querying"}})), &["path"]),
+            p(true,false,false,json!({"threshold":{"type":"number","default":0.92,"description":"Similarity threshold 0.0-1.0 (default: 0.92). Lower = more results but more false positives."},"limit":{"type":"integer","default":20,"description":"Max clone pairs to return"},"kinds":{"type":"string","default":"Function,Method","description":"Comma-separated symbol kinds to check (default: Function,Method)"},"store_edges":{"type":"boolean","default":true,"description":"Write SIMILAR_TO edges to graph for later querying"},"path_prefix":path_prefix_prop()})), &["path"]),
         tool_def("refactor", "PRIMARY: Analyze code for refactoring opportunities — file size, complexity hotspots, coupling (fan-in/fan-out), near-duplicate functions, dead code. Returns ranked recommendations with impact/effort scores. Use instead of manually running detect_clones + get_complexity + detect_dead_code separately.",
             p(true,false,false,json!({"target":{"type":"string","description":"File path or symbol name to analyze (default: whole project)"},"focus":{"type":"string","enum":["all","complexity","duplication","coupling","size"],"default":"all","description":"Focus area: all, complexity, duplication, coupling, size"},"limit":{"type":"integer","default":10,"description":"Max recommendations to return"}})), &["path"]),
         tool_def("git_summary", "PRIMARY: Symbol-level commit history. Use INSTEAD OF git log for understanding recent changes. Shows which functions were added/removed/modified per commit, not just file names.",

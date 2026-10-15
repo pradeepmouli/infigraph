@@ -1,7 +1,8 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use infigraph_core::graph::filter_dead_code_candidates;
+use infigraph_core::graph::find_dead_code;
+use infigraph_core::path_scope::PathScope;
 use infigraph_core::Infigraph;
 use infigraph_languages::bundled_registry;
 
@@ -93,32 +94,28 @@ pub(crate) fn cmd_callees(root: &Path, symbol: &str) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn cmd_dead_code(root: &Path) -> Result<()> {
+pub(crate) fn cmd_dead_code(root: &Path, path_prefix: Option<&str>) -> Result<()> {
     let registry = bundled_registry()?;
     let mut prism = Infigraph::open(root, registry)?;
     prism.init()?;
 
     let backend = prism.backend().context("graph not initialized")?;
-    let rows = backend.find_uncalled_symbols()?;
-
-    if rows.is_empty() {
-        println!("No dead code found (all functions/methods have callers).");
-        return Ok(());
-    }
-
-    let entry_points = ["main", "__init__", "setUp", "tearDown"];
-    let rows: Vec<_> = rows
-        .into_iter()
-        .filter(|r| !entry_points.contains(&r.name.as_str()))
-        .collect();
-
-    let dead = filter_dead_code_candidates(backend, rows);
+    let scope = PathScope::new(prism.root(), path_prefix);
+    let dead = find_dead_code(backend, &scope)?;
 
     if dead.is_empty() {
-        println!("No dead code found (all non-entry-point, non-vendored functions have callers).");
+        match scope.prefix() {
+            Some(prefix) => println!("No dead code found under {prefix}."),
+            None => println!(
+                "No dead code found (all non-entry-point, non-vendored functions have callers)."
+            ),
+        }
         return Ok(());
     }
 
+    if let Some(prefix) = scope.prefix() {
+        println!("Scope: {prefix}");
+    }
     println!("Potentially dead code ({} symbols):", dead.len());
     let mut current_file = "";
     for r in &dead {

@@ -3,10 +3,22 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 
+use infigraph_core::path_scope::PathScope;
 use infigraph_core::Infigraph;
 use infigraph_languages::bundled_registry;
 
 pub use super::session::{session_date_id, session_epoch};
+
+/// The subtree an analysis tool was asked to restrict itself to: its
+/// `path_prefix` argument, relative to the root of the project `prism` opened
+/// (an absolute path inside that root is accepted too). No argument means the
+/// whole project.
+pub fn path_scope(prism: &Infigraph, args: &Value) -> PathScope {
+    PathScope::new(
+        prism.root(),
+        args.get("path_prefix").and_then(|v| v.as_str()),
+    )
+}
 
 /// Resolve a path argument to a project root containing `.infigraph/`.
 /// 1. If the path itself has `.infigraph/`, use it directly.

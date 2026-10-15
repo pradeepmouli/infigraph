@@ -23,8 +23,9 @@ mod store_write;
 pub mod test_templates;
 
 pub use backend::{
-    filter_dead_code_candidates, CallsServiceEdge, Concern, CrossServiceEdgeCandidate,
-    GraphBackend, ResolvesToEdge, TaintFlowEdge,
+    filter_dead_code_candidates, filter_dead_code_candidates_in, find_dead_code, CallsServiceEdge,
+    Concern, CrossServiceEdgeCandidate, GraphBackend, ResolvesToEdge, TaintFlowEdge,
+    DEAD_CODE_ENTRY_POINTS,
 };
 pub use cozo_store::CozoStore;
 pub use daemon_kuzu_backend::DaemonKuzuBackend;

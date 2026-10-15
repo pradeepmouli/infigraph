@@ -299,11 +299,12 @@ PRIMARY: Generate prioritized test generation context. Finds untested symbols, r
 
 ### `detect_dead_code`
 
-PRIMARY: Find unreachable functions/methods with zero callers. Use INSTEAD OF manual analysis for dead code cleanup. Excludes entry points and test fixtures.
+PRIMARY: Find unreachable functions/methods with zero callers. Use INSTEAD OF manual analysis for dead code cleanup. Excludes entry points and test fixtures. Set path_prefix to report only one subtree; callers outside it still count as callers.
 
 | Parameter | Type | Required | Default | Description |
 |---|---|---|---|---|
 | `path` | string |  |  | see Common parameters |
+| `path_prefix` | string |  |  | Restrict the analysis to files under this directory (or to this one file), relative to the project root, e.g. 'crates/infigraph-core'. Matches whole path components. Default: the whole project. |
 
 ### `detect_clusters`
 
@@ -322,6 +323,7 @@ PRIMARY: Find near-duplicate functions using vector similarity. Use to identify 
 | `kinds` | string |  | `"Function,Method"` | Comma-separated symbol kinds to check (default: Function,Method) |
 | `limit` | integer |  | `20` | Max clone pairs to return |
 | `path` | string |  |  | see Common parameters |
+| `path_prefix` | string |  |  | Restrict the analysis to files under this directory (or to this one file), relative to the project root, e.g. 'crates/infigraph-core'. Matches whole path components. Default: the whole project. |
 | `store_edges` | boolean |  | `true` | Write SIMILAR_TO edges to graph for later querying |
 | `threshold` | number |  | `0.92` | Similarity threshold 0.0-1.0 (default: 0.92). Lower = more results but more false positives. |
 

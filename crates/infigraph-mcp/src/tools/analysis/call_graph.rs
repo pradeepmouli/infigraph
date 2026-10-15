@@ -1,9 +1,9 @@
 use anyhow::{Context, Result};
-use infigraph_core::graph::{filter_dead_code_candidates, GraphBackend};
+use infigraph_core::graph::{find_dead_code, GraphBackend};
 use serde_json::Value;
 use std::path::Path;
 
-use super::super::helpers::{open_prism, save_analysis};
+use super::super::helpers::{open_prism, path_scope, save_analysis};
 
 /// Names referenced anywhere in a `.xaml` file's markup — command bindings
 /// (`Command="{x:Static ...}"`, `{Binding SomeCommand}`) and event-sink
@@ -53,15 +53,10 @@ pub fn tool_detect_dead_code(args: &Value) -> Result<String> {
     let prism = open_prism(args)?;
     let backend = prism.backend().context("not initialized")?;
 
-    let rows = backend.find_uncalled_symbols()?;
-    let entry_points = ["main", "__init__", "setUp", "tearDown"];
-    let rows: Vec<_> = rows
-        .into_iter()
-        .filter(|row| !entry_points.contains(&row.name.as_str()))
-        .collect();
-
-    // Vendor-path suppression + interface/impl-split collapse (backend-agnostic).
-    let filtered = filter_dead_code_candidates(backend, rows);
+    // Entry points, vendored paths and interface/impl splits are dropped by the
+    // one pipeline every surface shares; `path_prefix` limits what it reports.
+    let scope = path_scope(&prism, args);
+    let filtered = find_dead_code(backend, &scope)?;
 
     // XAML markup reachability (filesystem-dependent, MCP-layer only).
     let path = args.get("path").and_then(|p| p.as_str()).unwrap_or(".");
@@ -72,15 +67,31 @@ pub fn tool_detect_dead_code(args: &Value) -> Result<String> {
         .collect();
 
     if dead.is_empty() {
-        return Ok("No dead code found.".to_string());
+        return Ok(match scope.prefix() {
+            Some(prefix) => format!("No dead code found under {prefix}."),
+            None => "No dead code found.".to_string(),
+        });
     }
 
-    let mut out = format!("Potentially dead code ({} symbols):\n", dead.len());
+    let mut out = String::new();
+    if let Some(prefix) = scope.prefix() {
+        out.push_str(&format!("Scope: {prefix}\n"));
+    }
+    out.push_str(&format!(
+        "Potentially dead code ({} symbols):\n",
+        dead.len()
+    ));
     for row in &dead {
         out.push_str(&format!("  {} {} ({})\n", row.kind, row.name, row.file));
     }
 
-    match save_analysis(path, "dead_code", &out) {
+    // A scoped report is saved under its own name, so it never replaces the
+    // whole-project analysis of the same day, nor another scope's.
+    let saved_as = match scope.slug() {
+        Some(slug) => format!("dead_code_{slug}"),
+        None => "dead_code".to_string(),
+    };
+    match save_analysis(path, &saved_as, &out) {
         Ok(receipt) => Ok(receipt),
         Err(_) => Ok(out),
     }

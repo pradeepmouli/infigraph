@@ -3,7 +3,10 @@ use std::sync::OnceLock;
 
 use serde_json::json;
 
-use infigraph_mcp::tools::analysis::call_graph::{tool_trace_callees, tool_trace_callers};
+use infigraph_mcp::tools::analysis::call_graph::{
+    tool_detect_dead_code, tool_trace_callees, tool_trace_callers,
+};
+use infigraph_mcp::tools::analysis::clones::tool_detect_clones;
 use infigraph_mcp::tools::graph::*;
 use infigraph_mcp::tools::helpers::log_activity;
 use infigraph_mcp::tools::index::tool_index_project;
@@ -370,6 +373,74 @@ fn test_graph_tools() {
     assert!(result.contains("python"), "should list python");
     assert!(result.contains("rust"), "should list rust");
     assert!(result.contains("typescript"), "should list typescript");
+
+    // --- detect_dead_code: path_prefix limits the report to one subtree (#30) ---
+    let all_dead = tool_detect_dead_code(&a(json!({}))).unwrap();
+    assert!(
+        all_dead.contains("unused_helper") && all_dead.contains("src/main.py"),
+        "unscoped report lists the orphan: {all_dead}"
+    );
+    assert!(!all_dead.contains("Scope:"), "{all_dead}");
+    let tests_only = tool_detect_dead_code(&a(json!({"path_prefix": "tests"}))).unwrap();
+    assert_eq!(
+        tests_only, "No dead code found under tests.",
+        "the orphan lives under src/, not tests/"
+    );
+    let src_only = tool_detect_dead_code(&a(json!({"path_prefix": "./src/"}))).unwrap();
+    assert!(
+        src_only.contains("Scope: src") && src_only.contains("unused_helper"),
+        "src/ (however spelled) keeps its orphan and names the scope: {src_only}"
+    );
+    let one_file_dead = tool_detect_dead_code(&a(json!({"path_prefix": "src/lib.py"}))).unwrap();
+    assert!(
+        !one_file_dead.contains("unused_helper"),
+        "a file scope reports only that file: {one_file_dead}"
+    );
+    let none = tool_detect_dead_code(&a(json!({"path_prefix": "no/such/dir"}))).unwrap();
+    assert_eq!(none, "No dead code found under no/such/dir.");
+
+    // --- detect_clones: only the scope's symbols are compared ---
+    // The report says how many symbols it compared, whether or not it found
+    // a pair: "across N symbols" with none, "symbols=N," with some.
+    let compared = |out: &str| -> usize {
+        let tail = out
+            .split("across ")
+            .nth(1)
+            .or_else(|| out.split("symbols=").nth(1))
+            .unwrap_or_else(|| panic!("no symbol count in: {out}"));
+        tail.chars()
+            .take_while(char::is_ascii_digit)
+            .collect::<String>()
+            .parse()
+            .unwrap_or_else(|_| panic!("no symbol count in: {out}"))
+    };
+    let unscoped = tool_detect_clones(&a(json!({"store_edges": false}))).unwrap();
+    let one_file = tool_detect_clones(&a(json!({
+        "path_prefix": "src/models.py", "store_edges": false
+    })))
+    .unwrap();
+    let (all, scoped) = (compared(&unscoped), compared(&one_file));
+    assert!(
+        scoped >= 2 && scoped < all,
+        "src/models.py's symbols are a strict subset of the project's: {scoped} of {all}"
+    );
+    assert!(
+        one_file.contains("Scope: src/models.py") || one_file.contains("under src/models.py"),
+        "the report names its scope: {one_file}"
+    );
+    // A scope holding one file must still compare the pairs inside it: with
+    // every symbol in the same file, skipping same-file pairs finds nothing.
+    // Threshold -1.0 admits any pair, so this tests the comparison, not the
+    // embedder.
+    let within_file = tool_detect_clones(&a(json!({
+        "path_prefix": "src/models.py", "threshold": -1.0, "store_edges": false
+    })))
+    .unwrap();
+    assert!(
+        within_file.contains("pairs found")
+            && within_file.contains("src/models.py vs src/models.py"),
+        "the single file's own symbols are compared: {within_file}"
+    );
 
     // --- delete_project (uses separate project, must run last) ---
     support::disable_background_watchers();
