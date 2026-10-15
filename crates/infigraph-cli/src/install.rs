@@ -1045,11 +1045,27 @@ mod tests {
             .outcome
     }
 
+    fn is_claude_md(entry: &InstallEntry) -> bool {
+        Path::new(&entry.target).ends_with(".claude/CLAUDE.md")
+    }
+
+    /// Against an empty `$HOME` every target is created except the user's own
+    /// `CLAUDE.md`, which install never creates: it is reported as skipped.
     fn assert_every_target_is_created(report: &InstallReport) {
+        let claude_md = report
+            .entries
+            .iter()
+            .find(|e| is_claude_md(e))
+            .expect("an entry for the user's CLAUDE.md");
+        assert!(
+            matches!(claude_md.outcome, ApplyOutcome::Skipped { .. }),
+            "install must not create a CLAUDE.md: {:?}",
+            claude_md.outcome
+        );
         let not_created: Vec<_> = report
             .entries
             .iter()
-            .filter(|e| e.outcome != ApplyOutcome::Created)
+            .filter(|e| !is_claude_md(e) && e.outcome != ApplyOutcome::Created)
             .map(|e| (&e.target, &e.outcome))
             .collect();
         assert!(
@@ -1097,11 +1113,13 @@ mod tests {
                 .collect()
         };
         assert_eq!(outcomes(&preview), outcomes(&applied));
+        // The CLAUDE.md install declined to create stays declined.
         assert!(
             install(home_dir.path(), false, Mode::Preview)
                 .entries
                 .iter()
-                .all(|e| e.outcome == ApplyOutcome::Unchanged),
+                .all(|e| e.outcome == ApplyOutcome::Unchanged
+                    || (is_claude_md(e) && matches!(e.outcome, ApplyOutcome::Skipped { .. }))),
             "after an install, a preview finds nothing to change"
         );
     }

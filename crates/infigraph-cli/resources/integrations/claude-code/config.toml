@@ -5,6 +5,9 @@ path = ".claude/CLAUDE.md"
 strategy = "marker_delimited"
 start = "<!-- infigraph-primary-search -->"
 end = "<!-- /infigraph-primary-search -->"
+# A CLAUDE.md is the user's own file: update the block in one that exists,
+# never create one.
+create_if_missing = false
 content_file = "../shared/agents.md"
 
 [[artifact]]

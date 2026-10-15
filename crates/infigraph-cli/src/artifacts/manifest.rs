@@ -18,6 +18,12 @@ pub(crate) struct ArtifactEntry {
     pub start: Option<String>,
     #[serde(default)]
     pub end: Option<String>,
+    /// `marker_delimited` only: `false` updates the block in a file that is
+    /// already there and never creates the file. For a file the user's agent
+    /// owns (a `CLAUDE.md`), whose existence is not infigraph's call to make.
+    /// Absent means `true`.
+    #[serde(default)]
+    pub create_if_missing: Option<bool>,
     #[serde(default)]
     pub content_file: Option<ContentFiles>,
     #[serde(default)]

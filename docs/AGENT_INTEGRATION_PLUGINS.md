@@ -110,6 +110,7 @@ content_file = "../shared/agents.md"      # path relative to this manifest's own
 | `strategy` | Yes | `json_deep_merge`, `overwrite`, `marker_delimited`, `toml_section`, or `json_key_path`. |
 | `content_file` | No | Path to this artifact's content, relative to the manifest's own directory. Omit for artifacts with no static content (rare). |
 | `start` / `end` | `marker_delimited` only | Delimiter strings bounding the managed block. |
+| `create_if_missing` | `marker_delimited` only, default `true` | `false` updates the block in a file that already exists and never creates the file (install reports it as skipped). The bundled Claude Code manifest sets it, since a `CLAUDE.md` is the user's own file. |
 | `key_path` | `toml_section` / `json_key_path` only | Dotted path to the owned section/key, as an array (`["mcp_servers", "infigraph"]`). |
 
 ### Convention-Based Artifacts (No Manifest Needed)

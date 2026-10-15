@@ -29,9 +29,11 @@ pub fn block_version(content: &str) -> Option<u32> {
     Some(digits.parse().unwrap_or(0))
 }
 
-/// Write/update project-level `.claude/CLAUDE.md` with infigraph instructions.
+/// Update the infigraph block in a project's existing `.claude/CLAUDE.md`.
 /// Uses sentinel markers for idempotent managed-block replacement.
 ///
+/// It never creates the file or its `.claude/` directory: a CLAUDE.md is the
+/// user's own, and whether a project has one is not infigraph's call to make.
 /// The block is a pointer, not the rules themselves: `infigraph install` puts
 /// the rules in the user's global `~/.claude/CLAUDE.md` and the routing in the
 /// `infigraph-tool-routing` skill, and Claude Code loads every ancestor's
@@ -63,7 +65,11 @@ tell the user (e.g. to reconnect the MCP server) rather than working around the 
 "#
     );
 
-    let existing = std::fs::read_to_string(&claude_md).unwrap_or_default();
+    // A CLAUDE.md is the user's own file: update the block in one that is
+    // there, never create one.
+    let Ok(existing) = std::fs::read_to_string(&claude_md) else {
+        return Ok(());
+    };
 
     if existing.contains(&begin_marker) {
         return Ok(());
@@ -91,13 +97,11 @@ tell the user (e.g. to reconnect the MCP server) rather than working around the 
             format!("{}\n{}", existing, instructions)
         }
     } else if existing.is_empty() {
-        std::fs::create_dir_all(&claude_dir)?;
         instructions.to_string()
     } else {
         format!("{}\n{}", existing, instructions)
     };
 
-    std::fs::create_dir_all(&claude_dir)?;
     std::fs::write(&claude_md, new_content)?;
     println!("  Updated project CLAUDE.md ({})", claude_md.display());
     Ok(())
@@ -159,12 +163,27 @@ mod tests {
     }
 
     #[test]
-    fn a_project_gets_the_block_pointing_at_the_skill() {
+    fn a_project_with_a_claude_md_gets_the_block_pointing_at_the_skill() {
         let root = project();
+        let dir = root.path().join(".claude");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("CLAUDE.md"), "# Mine\n").unwrap();
         ensure_project_claude_md(root.path()).unwrap();
         let text = block_of(root.path()).expect("block written");
+        assert!(text.starts_with("# Mine\n"));
         assert!(text.contains(&format!("<!-- BEGIN INFIGRAPH v{VERSION} -->")));
         assert!(text.contains("`infigraph-tool-routing` skill"));
+    }
+
+    #[test]
+    fn a_project_without_a_claude_md_is_not_given_one() {
+        let root = project();
+        ensure_project_claude_md(root.path()).unwrap();
+        assert_eq!(block_of(root.path()), None);
+        assert!(
+            !root.path().join(".claude").exists(),
+            "not even the directory"
+        );
     }
 
     #[test]

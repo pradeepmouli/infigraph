@@ -197,7 +197,13 @@ fn settle_strategy(
                 .end
                 .as_deref()
                 .ok_or_else(|| anyhow::anyhow!("marker_delimited artifact missing end marker"))?;
-            let plan = strategy::plan_marker_delimited(target_path, start, end, text)?;
+            let plan = strategy::plan_marker_delimited(
+                target_path,
+                start,
+                end,
+                text,
+                artifact.create_if_missing,
+            )?;
             strategy::settle(target_path, plan, mode)
         }
         Strategy::TomlSection => {
@@ -900,9 +906,16 @@ resolver = ["./resolve-zed-path.sh"]
                 "CLAUDE.md marker_delimited artifact should be discovered from claude-code/config.toml",
             );
         assert_eq!(claude_md.strategy, Strategy::MarkerDelimited);
+        // A CLAUDE.md is the user's own file: with none there, install leaves
+        // it (and `.claude/`) absent; with one, it updates the block in it.
+        let target = home_dir.path().join(".claude/CLAUDE.md");
         apply_resolved_artifact(claude_md, home_dir.path(), mcp_path, false).unwrap();
-        let claude_md_content =
-            std::fs::read_to_string(home_dir.path().join(".claude/CLAUDE.md")).unwrap();
+        assert!(!target.exists(), "install created {}", target.display());
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, "# Mine\n").unwrap();
+        apply_resolved_artifact(claude_md, home_dir.path(), mcp_path, false).unwrap();
+        let claude_md_content = std::fs::read_to_string(&target).unwrap();
+        assert!(claude_md_content.starts_with("# Mine\n"));
         assert!(claude_md_content.contains("## Infigraph — Primary Code Intelligence"));
         assert!(claude_md_content.contains("<!-- infigraph-primary-search -->"));
 
@@ -1099,6 +1112,190 @@ resolver = ["./resolve-zed-path.sh"]
                 "{relative} should contain {expected_substring:?}"
             );
         }
+    }
+
+    /// Session-saving guidance is compact (no per-save full narratives) and
+    /// each piece of it has one source: the shared `agents.md` policy for every
+    /// agent, and `save_fallback_recipe` in the session lib for every hook.
+    #[test]
+    fn session_continuity_guidance_is_compact_and_has_one_source() {
+        let user_dir = tempfile::tempdir().unwrap();
+        let artifacts =
+            discover_artifacts(BUNDLED_INTEGRATIONS, user_dir.path(), "/bin/infigraph-mcp")
+                .unwrap();
+        let claude_md = artifacts
+            .iter()
+            .find(|a| a.target_relative_path.as_deref() == Some(".claude/CLAUDE.md"))
+            .and_then(|a| a.content.clone())
+            .map(|bytes| String::from_utf8(bytes).unwrap())
+            .expect("the bundled CLAUDE.md block");
+        assert!(claude_md.contains("### Session Continuity\n"));
+        for retired in ["MANDATORY", "Narrative dumps", "full session story"] {
+            assert!(
+                !claude_md.contains(retired),
+                "the session policy must not ask for {retired:?} again:\n{claude_md}"
+            );
+        }
+
+        let defining = |needle: &str| -> Vec<&str> {
+            BUNDLED_INTEGRATIONS
+                .iter()
+                .filter(|(_, bytes)| {
+                    std::str::from_utf8(bytes).is_ok_and(|text| text.contains(needle))
+                })
+                .map(|(path, _)| *path)
+                .collect()
+        };
+        let lib = ["claude-code/.claude/hooks/infigraph-session-lib.sh"];
+        assert_eq!(defining("save_fallback_recipe() {"), lib);
+        assert_eq!(
+            defining("do not probe with an empty save"),
+            lib,
+            "the save recipe's wording must live only in the session lib"
+        );
+    }
+
+    /// The periodic reminder hook sources the session lib, so it must work from
+    /// an installed copy of both, say the compact policy, and stay silent on
+    /// the nine exchanges between reminders.
+    #[cfg(unix)]
+    #[test]
+    fn session_save_hook_reminds_every_tenth_exchange_with_the_compact_policy() {
+        if tools_missing(&["jq", "python3"]) {
+            return;
+        }
+        let (_home, hooks) = install_bundled_claude_hooks(&[
+            "infigraph-session-save.sh",
+            "infigraph-session-lib.sh",
+        ]);
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir(project.path().join(".infigraph")).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let input = serde_json::json!({
+            "session_id": "compact-policy",
+            "cwd": project.path(),
+            "prompt": "next",
+        })
+        .to_string();
+
+        for exchange in 1..=9 {
+            let out = run_hook(&hooks[0], tmp.path(), &input);
+            assert!(out.status.success(), "exchange {exchange}: {out:?}");
+            assert!(
+                out.stdout.is_empty(),
+                "exchange {exchange} must not remind: {out:?}"
+            );
+        }
+        let out = run_hook(&hooks[0], tmp.path(), &input);
+        assert!(out.status.success(), "{out:?}");
+        let context = hook_additional_context(&out);
+        assert!(
+            context.contains("save_session once if available"),
+            "{context}"
+        );
+        assert!(context.contains("100 words"), "{context}");
+        for retired in ["MANDATORY", "availability check", "pgrep", "infigraph-mcp"] {
+            assert!(
+                !context.contains(retired),
+                "{retired:?} is back:\n{context}"
+            );
+        }
+    }
+
+    /// Compaction recovery and the startup restore go through the same lib:
+    /// the prior session is read from disk, and the one save recipe is what the
+    /// model is told to follow.
+    #[cfg(unix)]
+    #[test]
+    fn session_start_hook_restores_through_the_shared_lib() {
+        if tools_missing(&["jq", "python3"]) {
+            return;
+        }
+        let (_home, hooks) = install_bundled_claude_hooks(&[
+            "infigraph-session-start.sh",
+            "infigraph-session-lib.sh",
+        ]);
+        let project = tempfile::tempdir().unwrap();
+        let sessions = project.path().join(".infigraph/sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(
+            sessions.join("session_2026-10-15.json"),
+            r#"{"summary":"hooks trimmed","pending_tasks":"walk the backlog"}"#,
+        )
+        .unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let run = |source: &str| {
+            let input = serde_json::json!({
+                "session_id": "restore",
+                "cwd": project.path(),
+                "source": source,
+            })
+            .to_string();
+            run_hook(&hooks[0], tmp.path(), &input)
+        };
+
+        let startup = hook_additional_context(&run("startup"));
+        assert!(
+            startup.contains("PRIOR SESSION (session_2026-10-15): Summary: hooks trimmed."),
+            "{startup}"
+        );
+        assert!(startup.contains("Pending: walk the backlog."), "{startup}");
+
+        let backup = sessions.join("unsaved-transcript-clear.md");
+        std::fs::write(&backup, "# Unsaved session context\n").unwrap();
+        for source in ["clear", "compact"] {
+            let context = hook_additional_context(&run(source));
+            assert!(
+                context.contains(backup.to_str().unwrap()),
+                "{source}: {context}"
+            );
+            assert!(
+                context.contains("do not probe with an empty save"),
+                "{source}: {context}"
+            );
+            assert!(
+                !context.contains("availability check"),
+                "{source}: {context}"
+            );
+        }
+    }
+
+    /// An install made before the cleanup holds the old "MANDATORY" block
+    /// between the markers; re-installing must replace it, and only it.
+    #[test]
+    fn reinstall_replaces_a_retired_session_policy_block_and_keeps_the_rest() {
+        let user_dir = tempfile::tempdir().unwrap();
+        let home_dir = tempfile::tempdir().unwrap();
+        let mcp_path = "/opt/infigraph/bin/infigraph-mcp";
+        let claude_md = home_dir.path().join(".claude/CLAUDE.md");
+        std::fs::create_dir_all(claude_md.parent().unwrap()).unwrap();
+        std::fs::write(
+            &claude_md,
+            "# My notes\n\n<!-- infigraph-primary-search -->\n\
+             ### Session Continuity — MANDATORY\n\
+             - **Narrative dumps:** include `narrative` with the full session story.\n\
+             <!-- /infigraph-primary-search -->\n\nTail kept\n",
+        )
+        .unwrap();
+
+        let artifacts =
+            discover_artifacts(BUNDLED_INTEGRATIONS, user_dir.path(), mcp_path).unwrap();
+        let artifact = artifacts
+            .iter()
+            .find(|a| a.target_relative_path.as_deref() == Some(".claude/CLAUDE.md"))
+            .unwrap();
+        apply_resolved_artifact(artifact, home_dir.path(), mcp_path, false).unwrap();
+
+        let after = std::fs::read_to_string(&claude_md).unwrap();
+        assert!(after.starts_with("# My notes\n"), "{after}");
+        assert!(after.trim_end().ends_with("Tail kept"), "{after}");
+        assert!(after.contains("### Session Continuity\n"), "{after}");
+        assert!(!after.contains("MANDATORY"), "{after}");
+        assert!(!after.contains("Narrative dumps"), "{after}");
+        assert_eq!(
+            after.matches("<!-- infigraph-primary-search -->").count(),
+            1
+        );
     }
 
     #[test]
@@ -1833,7 +2030,14 @@ resolver = ["./resolve-zed-path.sh"]
     /// Hook behaviour tests need the tools the bundled hooks call.
     #[cfg(unix)]
     fn hook_tools_missing() -> bool {
-        let missing = ["jq", "pgrep"].into_iter().find(|tool| {
+        tools_missing(&["jq", "pgrep"])
+    }
+
+    /// Whether any of `tools` is not installed (logging the first), for the
+    /// hooks that need a different set from [`hook_tools_missing`].
+    #[cfg(unix)]
+    fn tools_missing(tools: &[&str]) -> bool {
+        let missing = tools.iter().find(|tool| {
             std::process::Command::new(tool)
                 .arg("--version")
                 .output()
@@ -1849,19 +2053,46 @@ resolver = ["./resolve-zed-path.sh"]
     /// returned directory must outlive the script path.
     #[cfg(unix)]
     fn install_bundled_claude_hook(name: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let (home, mut paths) = install_bundled_claude_hooks(&[name]);
+        (home, paths.remove(0))
+    }
+
+    /// Install several bundled hooks into one fresh home directory, as the
+    /// installer lays them down: a hook that sources a sibling script needs
+    /// that sibling beside it. Paths come back in `names` order.
+    #[cfg(unix)]
+    fn install_bundled_claude_hooks(
+        names: &[&str],
+    ) -> (tempfile::TempDir, Vec<std::path::PathBuf>) {
         let user_dir = tempfile::tempdir().unwrap();
         let home_dir = tempfile::tempdir().unwrap();
         let mcp_path = "/opt/infigraph/bin/infigraph-mcp";
-        let rel = format!(".claude/hooks/{name}");
         let artifacts =
             discover_artifacts(BUNDLED_INTEGRATIONS, user_dir.path(), mcp_path).unwrap();
-        let artifact = artifacts
+        let paths = names
             .iter()
-            .find(|a| a.target_relative_path.as_deref() == Some(rel.as_str()))
-            .unwrap_or_else(|| panic!("{rel} is not a bundled artifact"));
-        apply_resolved_artifact(artifact, home_dir.path(), mcp_path, false).unwrap();
-        let path = home_dir.path().join(rel);
-        (home_dir, path)
+            .map(|name| {
+                let rel = format!(".claude/hooks/{name}");
+                let artifact = artifacts
+                    .iter()
+                    .find(|a| a.target_relative_path.as_deref() == Some(rel.as_str()))
+                    .unwrap_or_else(|| panic!("{rel} is not a bundled artifact"));
+                apply_resolved_artifact(artifact, home_dir.path(), mcp_path, false).unwrap();
+                home_dir.path().join(rel)
+            })
+            .collect();
+        (home_dir, paths)
+    }
+
+    /// The `additionalContext` a hook printed, parsed from its stdout JSON.
+    #[cfg(unix)]
+    fn hook_additional_context(output: &std::process::Output) -> String {
+        let reply: serde_json::Value = serde_json::from_slice(&output.stdout)
+            .unwrap_or_else(|e| panic!("hook stdout is not JSON ({e}): {output:?}"));
+        reply["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap_or_else(|| panic!("no additionalContext in {reply}"))
+            .to_string()
     }
 
     /// A stand-in MCP server: a script named `infigraph-mcp`, which is what

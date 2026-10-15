@@ -342,20 +342,32 @@ fn prune_empty_infigraph_dirs(removed: &Path, base: &Path) {
     }
 }
 
+/// Plan the managed block's insertion into, or replacement within,
+/// `target_path`. With `create_if_missing` false a target that does not exist
+/// is skipped rather than created: the file belongs to the user's agent, not
+/// to infigraph.
 pub(crate) fn plan_marker_delimited(
     target_path: &Path,
     start: &str,
     end: &str,
     content: &str,
+    create_if_missing: bool,
 ) -> Result<Plan> {
+    let block = format!("{start}\n{content}\n{end}");
     let existing = if target_path.is_file() {
         std::fs::read_to_string(target_path)
             .with_context(|| format!("failed to read {}", target_path.display()))?
-    } else {
+    } else if create_if_missing {
         String::new()
+    } else {
+        return Ok(Plan::Skip {
+            reason: format!(
+                "{} does not exist -- not creating it; infigraph only updates its block in a file you already have",
+                target_path.display()
+            ),
+            manual_snippet: String::new(),
+        });
     };
-
-    let block = format!("{start}\n{content}\n{end}");
 
     let start_pos = existing.find(start);
     let end_pos = start_pos.and_then(|sp| existing[sp..].find(end).map(|p| sp + p + end.len()));
@@ -631,7 +643,7 @@ mod tests {
     ) -> Result<ApplyOutcome> {
         settle(
             target,
-            plan_marker_delimited(target, start, end, content)?,
+            plan_marker_delimited(target, start, end, content, true)?,
             Mode::Apply,
         )
     }
@@ -1021,6 +1033,22 @@ mod tests {
         assert!(content.contains("<!-- infigraph-primary-search -->"));
         assert!(content.contains("## Infigraph instructions"));
         assert!(content.contains("<!-- /infigraph-primary-search -->"));
+    }
+
+    #[test]
+    fn marker_delimited_does_not_create_a_missing_file_when_told_not_to() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("CLAUDE.md");
+        let plan =
+            plan_marker_delimited(&target, "<!-- a -->", "<!-- /a -->", "body", false).unwrap();
+        assert!(matches!(plan, Plan::Skip { .. }), "{plan:?}");
+        assert!(!target.exists());
+
+        // The same plan for a file that is there still updates its block.
+        std::fs::write(&target, "# Mine\n").unwrap();
+        let plan =
+            plan_marker_delimited(&target, "<!-- a -->", "<!-- /a -->", "body", false).unwrap();
+        assert!(matches!(plan, Plan::Write(_)), "{plan:?}");
     }
 
     #[test]

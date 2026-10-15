@@ -38,6 +38,9 @@ pub(crate) struct ResolvedArtifact {
     pub content: Option<Vec<u8>>,
     pub start: Option<String>,
     pub end: Option<String>,
+    /// Whether a `marker_delimited` artifact may create a missing target file
+    /// (the manifest's `create_if_missing`; `true` unless it says otherwise).
+    pub create_if_missing: bool,
     pub key_path: Option<Vec<String>>,
     pub resolver: Option<ResolverSpec>,
     pub step: InstallStep,
@@ -299,6 +302,7 @@ pub(crate) fn discover_artifacts(
                 content,
                 start: entry.start.clone(),
                 end: entry.end.clone(),
+                create_if_missing: entry.create_if_missing.unwrap_or(true),
                 key_path: entry.key_path.clone(),
                 resolver: resolver_spec,
                 step,
@@ -358,6 +362,7 @@ pub(crate) fn discover_artifacts(
             content: Some(text_for_template),
             start: None,
             end: None,
+            create_if_missing: true,
             key_path: None,
             resolver: None,
             step: InstallStep::classify(relative_path, strategy),

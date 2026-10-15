@@ -415,9 +415,18 @@ fn a_starting_daemon_refreshes_a_stale_project_claude_md_block() {
     .unwrap();
     bootstrap_index(project_dir.path());
     let claude_md = project_dir.path().join(".claude").join("CLAUDE.md");
-    // What indexing writes is, by definition, the current block.
-    let current = std::fs::read_to_string(&claude_md).unwrap();
+    // A CLAUDE.md is the user's: indexing must not have made one.
+    assert!(
+        !claude_md.exists(),
+        "indexing created {}",
+        claude_md.display()
+    );
+    let current = format!(
+        "<!-- BEGIN INFIGRAPH v{} -->",
+        infigraph_core::claude_md::VERSION
+    );
     let stale = "<!-- BEGIN INFIGRAPH v1 -->\nFall back to grep.\n<!-- END INFIGRAPH -->\n";
+    std::fs::create_dir_all(claude_md.parent().unwrap()).unwrap();
     std::fs::write(&claude_md, format!("# My notes\n\n{stale}\nMore notes\n")).unwrap();
     let agents_md = project_dir.path().join("AGENTS.md");
     let marker = "<!-- infigraph-instructions -->";
@@ -442,7 +451,7 @@ fn a_starting_daemon_refreshes_a_stale_project_claude_md_block() {
     stop_daemon(project_dir.path(), &mut daemon);
 
     assert!(
-        refreshed.contains(current.trim()),
+        refreshed.contains(&current),
         "the stale block must be replaced by the current one: {refreshed}"
     );
     assert!(

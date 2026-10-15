@@ -1711,8 +1711,8 @@ pub fn check_instruction_blocks(ctx: &DoctorContext) -> Vec<CheckResult> {
 
 /// The project's `.claude/CLAUDE.md` block against this build's version, and
 /// any block in its repo-root `CLAUDE.md`. No block reports nothing: the
-/// writer adds one at the next index, and a project may have opted out by
-/// deleting it.
+/// writer only refreshes a file that already exists, so a project without a
+/// `.claude/CLAUDE.md` simply has none.
 pub fn check_one_project_instruction_blocks(root: &Path) -> Vec<CheckResult> {
     // The account home's `.claude/CLAUDE.md` is the global file, which
     // `check_global_claude_md` judges by a different rule.
