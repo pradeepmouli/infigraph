@@ -394,7 +394,8 @@ pub(crate) fn register_watch_dirs(
     let mut failed = 0usize;
     let mut first_err: Option<String> = None;
 
-    for result in crate::ignore_rules::walk_builder(root).build() {
+    for result in crate::ignore_rules::walk_builder(root, crate::ignore_rules::Domain::Code).build()
+    {
         let Ok(entry) = result else { continue };
         if entry.file_type().is_some_and(|ft| ft.is_dir()) {
             match watcher.watch(entry.path(), RecursiveMode::NonRecursive) {

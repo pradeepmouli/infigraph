@@ -512,7 +512,11 @@ impl DocIndex {
     fn collect_doc_files(&self) -> Result<(Vec<PathBuf>, bool)> {
         let mut files = Vec::new();
         let mut complete = true;
-        let walker = infigraph_core::ignore_rules::walk_builder(&self.root).build();
+        let walker = infigraph_core::ignore_rules::walk_builder(
+            &self.root,
+            infigraph_core::ignore_rules::Domain::Docs,
+        )
+        .build();
         for result in walker {
             let entry = match result {
                 Ok(e) => e,

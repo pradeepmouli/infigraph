@@ -955,7 +955,7 @@ where
             ignore_rebuild_secs: if periodic_secs > 0 {
                 periodic_secs
             } else {
-                300
+                crate::ignore_rules::MATCHER_REBUILD_SECS
             },
         },
         Arc::clone(&queue),

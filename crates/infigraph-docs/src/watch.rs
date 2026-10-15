@@ -43,7 +43,10 @@ pub fn watch_docs(
     // forever even though `collect_doc_files` (which respects the same
     // ignore rules) will never actually index anything under `target/` --
     // observed live as an infinite "reindexed: 0 files, 0 chunks" loop.
-    let ignore_matcher = infigraph_core::ignore_rules::IgnoreMatcher::build(root);
+    let mut ignore_matcher = LiveMatcher::new(
+        root,
+        Duration::from_secs(infigraph_core::ignore_rules::MATCHER_REBUILD_SECS),
+    );
 
     let debounce = Duration::from_millis(debounce_ms);
     let mut last_reindex = Instant::now();
@@ -64,7 +67,7 @@ pub fn watch_docs(
 
         match rx.recv_timeout(Duration::from_millis(500)) {
             Ok(Ok(event)) => {
-                if paths_warrant_reindex(&event.paths, &ignore_matcher) {
+                if paths_warrant_reindex(&event.paths, ignore_matcher.current(Instant::now())) {
                     pending = true;
                 }
             }
@@ -96,6 +99,47 @@ pub fn watch_docs(
     }
 
     Ok(())
+}
+
+/// The document watcher's ignore matcher, rebuilt every `every`.
+///
+/// A matcher built once at start answers for the rules as they were then:
+/// an edit to `.gitignore` or `[ignore] docs` would leave a running watcher
+/// more permissive than the next walk, so it would mark files the indexer
+/// never stores (#189). The code producer rebuilds on a tick for the same
+/// reason; this loop has no timer of its own, so it asks on each event.
+struct LiveMatcher {
+    root: std::path::PathBuf,
+    every: Duration,
+    built: Instant,
+    matcher: infigraph_core::ignore_rules::IgnoreMatcher,
+}
+
+impl LiveMatcher {
+    fn new(root: &Path, every: Duration) -> Self {
+        LiveMatcher {
+            root: root.to_path_buf(),
+            every,
+            built: Instant::now(),
+            matcher: Self::build(root),
+        }
+    }
+
+    fn build(root: &Path) -> infigraph_core::ignore_rules::IgnoreMatcher {
+        infigraph_core::ignore_rules::IgnoreMatcher::build(
+            root,
+            infigraph_core::ignore_rules::Domain::Docs,
+        )
+    }
+
+    /// The matcher as of `now`.
+    fn current(&mut self, now: Instant) -> &infigraph_core::ignore_rules::IgnoreMatcher {
+        if now.saturating_duration_since(self.built) >= self.every {
+            self.matcher = Self::build(&self.root);
+            self.built = now;
+        }
+        &self.matcher
+    }
 }
 
 /// What one debounced reindex attempt came to.
@@ -402,7 +446,10 @@ mod tests {
     #[test]
     fn a_new_directory_warrants_a_reindex_even_though_it_is_not_a_document() {
         let tmp = tempfile::tempdir().unwrap();
-        let ignore = infigraph_core::ignore_rules::IgnoreMatcher::build(tmp.path());
+        let ignore = infigraph_core::ignore_rules::IgnoreMatcher::build(
+            tmp.path(),
+            infigraph_core::ignore_rules::Domain::Docs,
+        );
         let new_dir = tmp.path().join("docs").join("tutorials");
         std::fs::create_dir_all(&new_dir).unwrap();
 
@@ -420,7 +467,10 @@ mod tests {
     #[test]
     fn a_document_file_warrants_a_reindex() {
         let tmp = tempfile::tempdir().unwrap();
-        let ignore = infigraph_core::ignore_rules::IgnoreMatcher::build(tmp.path());
+        let ignore = infigraph_core::ignore_rules::IgnoreMatcher::build(
+            tmp.path(),
+            infigraph_core::ignore_rules::Domain::Docs,
+        );
         let doc = tmp.path().join("readme.md");
         std::fs::write(&doc, "# hi\n").unwrap();
         assert!(paths_warrant_reindex(&[doc], &ignore));
@@ -432,7 +482,10 @@ mod tests {
     #[test]
     fn a_non_document_file_still_warrants_nothing() {
         let tmp = tempfile::tempdir().unwrap();
-        let ignore = infigraph_core::ignore_rules::IgnoreMatcher::build(tmp.path());
+        let ignore = infigraph_core::ignore_rules::IgnoreMatcher::build(
+            tmp.path(),
+            infigraph_core::ignore_rules::Domain::Docs,
+        );
         let src = tmp.path().join("main.rs");
         std::fs::write(&src, "fn main() {}\n").unwrap();
         assert!(!paths_warrant_reindex(&[src], &ignore));
@@ -583,7 +636,10 @@ mod tests {
         std::fs::create_dir_all(root.join("target").join("doc")).unwrap();
         std::fs::write(root.join("readme.md"), "# hello\n").unwrap();
 
-        let ignore_matcher = infigraph_core::ignore_rules::IgnoreMatcher::build(&root);
+        let ignore_matcher = infigraph_core::ignore_rules::IgnoreMatcher::build(
+            &root,
+            infigraph_core::ignore_rules::Domain::Docs,
+        );
         let real_doc = root.join("readme.md");
         let build_artifact = root.join("target").join("doc").join("index.html");
 
@@ -768,6 +824,46 @@ mod tests {
             start.elapsed() < Duration::from_secs(2),
             "stopping took {:?} with registration stalled",
             start.elapsed()
+        );
+    }
+}
+
+#[cfg(test)]
+mod live_matcher_tests {
+    use super::*;
+
+    /// A running doc watcher must see an `[ignore] docs` edit made after it
+    /// started, or it marks files the next walk will not index.
+    #[test]
+    fn an_ignore_edit_reaches_a_matcher_that_is_already_built() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join(".infigraph")).unwrap();
+        std::fs::write(root.join(".infigraph/graph"), b"x").unwrap();
+        std::fs::write(root.join("draft.md"), "# Draft").unwrap();
+        let every = Duration::from_secs(300);
+
+        let mut live = LiveMatcher::new(root, every);
+        let started = Instant::now();
+        assert!(!live
+            .current(started)
+            .is_ignored(&root.join("draft.md"), false));
+
+        std::fs::write(
+            root.join(".infigraph/config.toml"),
+            "[ignore]\ndocs = [\"draft.md\"]\n",
+        )
+        .unwrap();
+        assert!(
+            !live
+                .current(started + every / 2)
+                .is_ignored(&root.join("draft.md"), false),
+            "inside the interval the matcher is not rebuilt: it is not rebuilt per event"
+        );
+        assert!(
+            live.current(started + every)
+                .is_ignored(&root.join("draft.md"), false),
+            "once the interval has passed the edit must take effect"
         );
     }
 }

@@ -1334,7 +1334,9 @@ impl Infigraph {
 
     fn collect_files(&self) -> Result<Vec<PathBuf>> {
         let mut files = Vec::new();
-        let walker = crate::ignore_rules::walk_builder(&self.root).build();
+        let walker =
+            crate::ignore_rules::walk_builder(&self.root, crate::ignore_rules::Domain::Code)
+                .build();
 
         for result in walker {
             let entry = match result {

@@ -231,6 +231,44 @@ once. The env var `INFIGRAPH_INDEX_INCLUDE` is comma-separated and
 replaces both. An entry naming no directory warns once per process rather
 than silently indexing nothing.
 
+#### Excluding a path from one index only
+
+`.gitignore`, `.infigraphignore` and the safety list apply to every
+indexer. `[ignore]` adds patterns for one domain — the code graph or the
+document index — on top of them:
+
+```toml
+[ignore]
+code = ["docs/", "*.generated.ts"]   # not in the code graph; still a document
+docs = ["CHANGELOG.md", "/vendor/"]  # not in the document index; code is unaffected
+```
+
+An entry is one `.gitignore` line, read against the project root: `/docs/`
+anchors at the root, `docs/` matches at any depth, `*.md` matches any
+Markdown file. `!` re-includes only within the same list; it cannot
+re-admit what `.gitignore`, the safety list or `.infigraphignore`
+excluded — that is what `[index] include` is for. An entry with a `..`
+component can never match inside the project and warns once instead.
+
+The patterns also hold inside an `[index] include` directory, matched
+against the path below it, as `.infigraphignore` does. The code watcher
+and the document watcher use the same rules as their walk, and rebuild
+them on a timer, so an edit reaches a running watcher within five
+minutes. A file a new pattern excludes leaves the index on its next full
+scan.
+
+Project and user layers **union**, like `include`. The environment
+(`INFIGRAPH_IGNORE_CODE`, `INFIGRAPH_IGNORE_DOCS`, comma-separated, so a
+pattern containing a comma can be written in TOML only) **replaces both**
+files, which makes the walk *more* permissive than the files alone: it
+silences the project's and your own lists. There is no trust difference
+between layers, because a pattern can only remove files, never reach
+outside the project.
+
+Some walkers do not consult these rules yet (manifest and cross-service
+scans among them); see the issue tracking walkers that bypass
+`ignore_rules`.
+
 ### Parallel processing
 
 Files are processed in parallel using `rayon`'s `par_iter` for extraction and hashing.

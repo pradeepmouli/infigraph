@@ -23,7 +23,8 @@ pub fn scan_project(root: &Path) -> Result<ScanStats> {
 }
 
 fn walk_and_scan(root: &Path, stats: &mut ScanStats) -> Result<()> {
-    for result in crate::ignore_rules::walk_builder(root).build() {
+    for result in crate::ignore_rules::walk_builder(root, crate::ignore_rules::Domain::Code).build()
+    {
         let entry = match result {
             Ok(e) => e,
             Err(_) => continue,
