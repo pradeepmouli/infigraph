@@ -906,7 +906,7 @@ Retrieve recent session context from graph DB. Call at START of every new sessio
 
 ### `save_session`
 
-Save session context to a dedicated session DB for cross-session continuity. Stores Session node + semantic embedding. Multiple calls per day merge: summary/pending_tasks/constraints/assumptions/blockers overwrite, decisions append, files_touched union. Use `narrative` for full session story — written to .infigraph/sessions/session_YYYY-MM-DD.md and embedded for semantic search. Use `name` to save a named session that can be recalled later by identity.
+Save compact session context for continuity. Summary/pending_tasks/constraints/assumptions/blockers replace prior values; omitted snapshot fields clear, so retain brief active constraints and unresolved work. Decisions append: send only new decisions. Files_touched unions. Narrative is optional, brief new reasoning only; never repeat saved history. Aim for 100-250 tokens unless essential recovery details need more. Use name for a recallable named session.
 
 | Parameter | Type | Required | Default | Description |
 |---|---|---|---|---|
@@ -914,10 +914,10 @@ Save session context to a dedicated session DB for cross-session continuity. Sto
 | `assumptions` | string |  |  | What current approach depends on: 'Assumes: X. If X changes: Y.' |
 | `blockers` | string |  |  | Stuck items needing human input or external dependency |
 | `constraints` | string |  |  | What was tried and failed: 'Tried: X. Failed because: Y. Do not retry unless: Z.' |
-| `decisions` | string |  |  | Structured decisions: 'Goal: X. Decision: Y. Why: Z. Invalidates-if: W.' Use \| to separate multiple decisions |
+| `decisions` | string |  |  | Only new decisions since the last save; appended to existing decisions. Briefly include the choice and why. Use \| to separate multiple new decisions. |
 | `files_touched` | string |  |  | Comma-separated list of files modified |
 | `name` | string |  |  | Optional name/label for this session (e.g. 'perf-optimization', 'auth-refactor'). Named sessions are stored separately from daily auto-saves and can be recalled by name via get_latest_session. |
-| `narrative` | string |  |  | Full session story: what was explored, found, reasoned, decided, and why. Raw chronological dump. Appended to .infigraph/sessions/session_YYYY-MM-DD.md with timestamp. Use for rich context recovery in future sessions. |
+| `narrative` | string |  |  | Optional new reasoning or recovery context not captured by structured fields, at most 100 words. Appended to the session narrative log. Omit for routine checkpoints; do not repeat the full session story. |
 | `path` | string |  |  | see Common parameters |
 | `pending_tasks` | string |  |  | Tasks remaining / next steps |
 

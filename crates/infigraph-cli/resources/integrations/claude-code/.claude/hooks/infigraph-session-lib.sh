@@ -25,19 +25,9 @@ inject_session_summary() {
   echo "$out"
 }
 
-# pgrep can only rule the MCP tool OUT (no process = definitely unreachable),
-# never confirm it's IN (a running process could be stale/orphaned/another
-# session's) — so it only changes the framing below. The actual gate against
-# wasted work is always a cheap availability check done before composing any
-# narrative, regardless of what pgrep found.
+# Shared write guidance. One real save, not an empty availability probe.
 save_fallback_recipe() {
-  local hint
-  if pgrep -f "infigraph-mcp" >/dev/null 2>&1; then
-    hint="An infigraph-mcp process is running, but that does NOT prove it's connected to this session (could be stale, orphaned, or serving a different session)."
-  else
-    hint="No infigraph-mcp process detected at all -- mcp__infigraph__save_session is essentially guaranteed to fail."
-  fi
-  echo "$hint Regardless of that: before writing ANY summary/narrative content, do a cheap availability check first (ToolSearch for mcp__infigraph__save_session, or attempt the call once with minimal args) -- do NOT compose the full narrative until you've confirmed the tool actually responds. FALLBACK once that check shows the tool is unavailable or it errors: write directly to a file at \$cwd/.infigraph/sessions/session_<YYYY-MM-DD>.json (today's UTC date). It's a JSON object with these string fields: id (value 'session_<YYYY-MM-DD>'), name (empty string unless this is a named session), summary, pending_tasks, decisions, files_touched (comma-separated), constraints, assumptions, blockers -- plus these numeric fields: created_at, updated_at, last_accessed (all unix epoch seconds), and confidence (float). If a file for today already exists, merge into it: decisions appends onto the existing value separated by ' | ', files_touched unions the new files in, everything else replaces the old value, created_at is kept from the existing file, confidence becomes the max of 0.9 and the existing confidence. Also append the narrative to the companion session_<YYYY-MM-DD>.md file as a new section (blank line, '## Save @ HH:MM UTC', blank line, narrative text). Then write '0' to \${TMPDIR:-/tmp}/infigraph-sessions/\$session_id.count and '1' to \${TMPDIR:-/tmp}/infigraph-sessions/\$session_id.saved so /clear keeps working. Only use this fallback once the check has actually shown the tool is unreachable -- never skip the check itself."
+  echo 'Use save_session once if available; do not probe with an empty save or retry an unavailable tool. If unavailable, merge compact state into $cwd/.infigraph/sessions/session_<UTC YYYY-MM-DD>.json: string fields id, name, summary, pending_tasks, decisions, files_touched, constraints, assumptions, blockers; numeric created_at, updated_at, last_accessed (epoch seconds), confidence. Preserve omitted fields and created_at; append only new decisions with " | ", union files_touched, replace supplied snapshot fields, set updated_at/last_accessed to now and confidence to at least 0.9. Append only genuinely new narrative to the companion .md when needed. After a successful tool or fallback save, reset ${TMPDIR:-/tmp}/infigraph-sessions/$session_id.count to 0 and .saved to 1. Do not mark a failed save successful; report failure.'
 }
 
 json_escape() {
