@@ -7,6 +7,7 @@ use std::path::Path;
 use crate::learned::LearnedStore;
 use crate::manifest::ManifestResult;
 use crate::model::FileExtraction;
+use crate::path_scope::PathScope;
 use crate::resolve::ResolveStats;
 use crate::scip::ImportStats;
 use crate::structured::{IngestResult, SchemaMeta};
@@ -501,6 +502,21 @@ pub fn filter_dead_code_candidates(
     backend: &dyn GraphBackend,
     rows: Vec<DeadCodeRow>,
 ) -> Vec<DeadCodeRow> {
+    filter_dead_code_candidates_in(backend, rows, &PathScope::everything())
+}
+
+/// [`filter_dead_code_candidates`] reporting only the rows `scope` contains.
+///
+/// The interface/implementation test still judges a row against the dead set
+/// of *every* row, not just the in-scope ones: a sibling that is dead but
+/// outside the scope must keep this row reported, exactly as in an unscoped
+/// run. So a scoped result is the unscoped one restricted to the scope, and
+/// the per-row `sibling_methods_of` lookups are paid only for rows in it.
+pub fn filter_dead_code_candidates_in(
+    backend: &dyn GraphBackend,
+    rows: Vec<DeadCodeRow>,
+    scope: &PathScope,
+) -> Vec<DeadCodeRow> {
     let non_vendor: Vec<DeadCodeRow> = rows
         .into_iter()
         .filter(|r| !is_vendor_path(&r.file))
@@ -511,6 +527,7 @@ pub fn filter_dead_code_candidates(
 
     non_vendor
         .into_iter()
+        .filter(|row| scope.contains(&row.file))
         .filter(|row| {
             if row.kind != "Method" {
                 return true;
@@ -522,4 +539,27 @@ pub fn filter_dead_code_candidates(
             siblings.iter().all(|s| dead_ids.contains(s))
         })
         .collect()
+}
+
+/// Symbols a dead-code report never lists: the entry points nothing in the
+/// graph calls by design.
+pub const DEAD_CODE_ENTRY_POINTS: [&str; 4] = ["main", "__init__", "setUp", "tearDown"];
+
+/// The dead-code candidates under `scope`: uncalled functions and methods,
+/// minus entry points, vendored paths and interface/implementation splits.
+/// The one pipeline the CLI, the MCP tool and the web API all run, so a report
+/// means the same thing on every surface.
+///
+/// A symbol is dead when *nothing* calls it, so callers outside `scope` still
+/// count: the scope restricts which symbols are reported, not the call graph.
+pub fn find_dead_code(backend: &dyn GraphBackend, scope: &PathScope) -> Result<Vec<DeadCodeRow>> {
+    let rows: Vec<DeadCodeRow> = backend
+        .find_uncalled_symbols()?
+        .into_iter()
+        .filter(|r| !DEAD_CODE_ENTRY_POINTS.contains(&r.name.as_str()))
+        .collect();
+    // A shared remote graph stores `org/repo/<path>`; the scope is spelled
+    // relative to the repo.
+    let scope = scope.clone().within(backend.repo_filter());
+    Ok(filter_dead_code_candidates_in(backend, rows, &scope))
 }

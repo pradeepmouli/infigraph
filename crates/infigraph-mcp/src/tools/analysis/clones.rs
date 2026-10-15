@@ -3,7 +3,7 @@ use serde_json::Value;
 
 use infigraph_core::embed;
 
-use super::super::helpers::open_prism;
+use super::super::helpers::{open_prism, path_scope};
 
 pub fn tool_detect_clones(args: &Value) -> Result<String> {
     let prism = open_prism(args)?;
@@ -24,10 +24,23 @@ pub fn tool_detect_clones(args: &Value) -> Result<String> {
 
     let backend = prism.backend().context("not initialized")?;
 
-    let syms = backend.symbols_with_docstring(Some(&kinds))?;
+    // Pairs are compared within the scope, so the quadratic pass is over the
+    // subtree's symbols only; a clone of in-scope code that lives outside it
+    // is not looked for.
+    let scope = path_scope(&prism, args).within(backend.repo_filter());
+    let syms = scope.retain(backend.symbols_with_docstring(Some(&kinds))?, |s| {
+        s.file.as_str()
+    });
+    // Pairs in one file are skipped, since method-sized look-alikes in a file
+    // are rarely copy-paste. A scope that holds a single file has no other
+    // kind of pair, so there that rule would make every run empty.
+    let single_file = syms.windows(2).all(|pair| pair[0].file == pair[1].file);
 
     if syms.len() < 2 {
-        return Ok("Not enough symbols to compare. Run index_project first.".to_string());
+        return Ok(match scope.prefix() {
+            Some(prefix) => format!("Not enough symbols under {prefix} to compare."),
+            None => "Not enough symbols to compare. Run index_project first.".to_string(),
+        });
     }
 
     let embedder = embed::best_embedder();
@@ -66,7 +79,7 @@ pub fn tool_detect_clones(args: &Value) -> Result<String> {
 
     for i in 0..n {
         for j in (i + 1)..n {
-            if symbol_vecs[i].2 == symbol_vecs[j].2 {
+            if !single_file && symbol_vecs[i].2 == symbol_vecs[j].2 {
                 continue;
             }
             let sim =
@@ -81,8 +94,12 @@ pub fn tool_detect_clones(args: &Value) -> Result<String> {
     pairs.truncate(limit);
 
     if pairs.is_empty() {
+        let under = scope
+            .prefix()
+            .map(|prefix| format!(" under {prefix}"))
+            .unwrap_or_default();
         return Ok(format!(
-            "No clones found above threshold {:.2} across {} symbols ({}).",
+            "No clones found above threshold {:.2} across {} symbols ({}){under}.",
             threshold, n, kinds_str
         ));
     }
@@ -103,13 +120,17 @@ pub fn tool_detect_clones(args: &Value) -> Result<String> {
         }
     }
 
-    let mut out = format!(
+    let mut out = String::new();
+    if let Some(prefix) = scope.prefix() {
+        out.push_str(&format!("Scope: {prefix}\n"));
+    }
+    out.push_str(&format!(
         "Clone detection: {} pairs found (threshold={:.2}, symbols={}, kinds={})\n\n",
         pairs.len(),
         threshold,
         n,
         kinds_str
-    );
+    ));
 
     for (score, i, j) in &pairs {
         let (id_a, name_a, file_a, _) = &symbol_vecs[*i];

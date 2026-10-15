@@ -562,6 +562,116 @@ fn test_filter_dead_code_drops_vendored_paths() {
     assert_eq!(filtered[0].name, "orphan");
 }
 
+/// Four files: `crates/core` (one orphan, one function only `tools/` calls),
+/// a sibling directory that merely shares the `crates/core` string prefix, and
+/// `tools/`, whose own function nothing calls.
+fn scoped_dead_code_fixture() -> Vec<FileExtraction> {
+    let file = |path: &str, hash: &str, names: &[&str], calls: Vec<Relation>| FileExtraction {
+        file: path.to_string(),
+        language: "python".to_string(),
+        content_hash: hash.to_string(),
+        symbols: names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                sym(
+                    &format!("{path}::{name}"),
+                    name,
+                    SymbolKind::Function,
+                    path,
+                    i as u32 * 3 + 1,
+                    i as u32 * 3 + 2,
+                )
+            })
+            .collect(),
+        relations: calls,
+        statements: vec![],
+    };
+    vec![
+        file(
+            "crates/core/src/a.py",
+            "s1",
+            &["unused_a", "called_from_tools"],
+            vec![],
+        ),
+        file("crates/core-extras/src/b.py", "s2", &["unused_b"], vec![]),
+        file(
+            "tools/c.py",
+            "s3",
+            &["unused_c"],
+            vec![rel(
+                "tools/c.py::unused_c",
+                "crates/core/src/a.py::called_from_tools",
+                RelationKind::Calls,
+            )],
+        ),
+    ]
+}
+
+fn dead_names(rows: &[infigraph_core::graph::DeadCodeRow]) -> Vec<&str> {
+    let mut names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
+    names.sort_unstable();
+    names
+}
+
+#[test]
+fn test_find_dead_code_scope_limits_the_report_not_the_call_graph() {
+    use infigraph_core::graph::find_dead_code;
+    use infigraph_core::path_scope::PathScope;
+
+    let (_dir, backend) = make_backend();
+    backend
+        .upsert_files_bulk(&scoped_dead_code_fixture(), true)
+        .expect("bulk");
+
+    let everything = find_dead_code(backend.as_ref(), &PathScope::everything()).expect("query");
+    assert_eq!(
+        dead_names(&everything),
+        ["unused_a", "unused_b", "unused_c"],
+        "called_from_tools is called, so it is not dead"
+    );
+
+    let scope = PathScope::new(std::path::Path::new("/proj"), Some("crates/core/"));
+    let scoped = find_dead_code(backend.as_ref(), &scope).expect("query");
+    assert_eq!(
+        dead_names(&scoped),
+        ["unused_a"],
+        "crates/core-extras shares a string prefix, not a path component; \
+         called_from_tools stays live because a caller outside the scope counts"
+    );
+
+    let ids = |rows: Vec<&infigraph_core::graph::DeadCodeRow>| -> Vec<String> {
+        rows.into_iter().map(|r| r.id.clone()).collect()
+    };
+    assert_eq!(
+        ids(scoped.iter().collect()),
+        ids(everything
+            .iter()
+            .filter(|r| scope.contains(&r.file))
+            .collect()),
+        "a scoped report is the unscoped one restricted to the scope, in order"
+    );
+}
+
+#[test]
+fn test_find_dead_code_scoped_to_a_file_still_drops_an_interface_impl_split() {
+    use infigraph_core::graph::find_dead_code;
+    use infigraph_core::path_scope::PathScope;
+
+    let (_dir, backend) = make_backend();
+    backend
+        .upsert_files_bulk(&interface_impl_split_fixture(), true)
+        .expect("bulk");
+
+    let scope = PathScope::new(std::path::Path::new("/proj"), Some("iface.h"));
+    let dead = find_dead_code(backend.as_ref(), &scope).expect("query");
+    assert!(
+        !dead.iter().any(|r| r.name == "GetFieldTypeFor"),
+        "its sibling GetValueFor is called: {dead:?}"
+    );
+    assert!(dead.iter().any(|r| r.name == "callerA"));
+}
+
 #[test]
 fn test_backend_distinct_languages_lists_each_module_language_once() {
     let (_dir, backend) = make_backend();

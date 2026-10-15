@@ -1,7 +1,7 @@
 use serde_json::{json, Value};
 
 use infigraph_core::embed;
-use infigraph_core::graph::filter_dead_code_candidates;
+use infigraph_core::graph::find_dead_code;
 
 use super::open_prism;
 
@@ -64,17 +64,12 @@ pub(crate) fn api_dead_code(params: &Value) -> Value {
                 Some(b) => b,
                 None => return json!({"error": "not initialized"}),
             };
-            let rows = match backend.find_uncalled_symbols() {
+            let scope = crate::tools::helpers::path_scope(&prism, params);
+            let rows = match find_dead_code(backend, &scope) {
                 Ok(r) => r,
                 Err(e) => return json!({"error": e.to_string()}),
             };
-
-            let entry_points = ["main", "__init__", "setUp", "tearDown"];
-            let rows: Vec<_> = rows
-                .into_iter()
-                .filter(|r| !entry_points.contains(&r.name.as_str()))
-                .collect();
-            let dead: Vec<Value> = filter_dead_code_candidates(backend, rows)
+            let dead: Vec<Value> = rows
                 .iter()
                 .map(|r| json!({"name": r.name, "kind": r.kind, "file": r.file}))
                 .collect();

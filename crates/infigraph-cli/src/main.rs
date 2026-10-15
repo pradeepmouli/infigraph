@@ -246,7 +246,12 @@ enum Commands {
     },
 
     /// Detect potentially dead code (functions/methods with no callers)
-    DeadCode,
+    DeadCode {
+        /// Report only symbols under this directory (or in this file),
+        /// relative to the project root. Callers outside it still count.
+        #[arg(long)]
+        path_prefix: Option<String>,
+    },
 
     /// Show transitive impact of changing a symbol
     Impact {
@@ -1157,7 +1162,7 @@ fn run(command: Commands, root: &Path) -> Result<()> {
         } => cmd_search(root, &query, limit, alpha),
         Commands::Callers { symbol } => cmd_callers(root, &symbol),
         Commands::Callees { symbol } => cmd_callees(root, &symbol),
-        Commands::DeadCode => cmd_dead_code(root),
+        Commands::DeadCode { path_prefix } => cmd_dead_code(root, path_prefix.as_deref()),
         Commands::Impact { symbol, depth } => cmd_impact(root, &symbol, depth),
         Commands::Install { force, dry_run } => cmd_install(force, dry_run),
         Commands::Uninstall => cmd_uninstall(),
@@ -1548,7 +1553,10 @@ mod tests {
             },
             root
         ));
-        assert!(!should_auto_watch(&Commands::DeadCode, root));
+        assert!(!should_auto_watch(
+            &Commands::DeadCode { path_prefix: None },
+            root
+        ));
         assert!(!should_auto_watch(
             &Commands::Impact {
                 symbol: String::new(),
