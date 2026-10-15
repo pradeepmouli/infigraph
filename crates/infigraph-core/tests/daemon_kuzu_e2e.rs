@@ -122,6 +122,20 @@ fn cli_command() -> Command {
     command
 }
 
+/// A file under `dir` to hand a child as its stdout or stderr.
+///
+/// Files rather than `Stdio::piped()` wherever a test polls `try_wait`
+/// without draining: a child that outgrows the pipe buffer blocks in
+/// `write` and never exits, which turns a diagnostic into the hang the test
+/// exists to catch. That buffer is not the ~64KB one might assume --
+/// macOS hands out 512-byte pipes once the kernel's pipe memory is
+/// exhausted, and a plain `infigraph index` prints more than that (its
+/// `.infigraphignore` hint alone is ~600 bytes), so a polling test failed
+/// there at its 30s budget with the child parked in `eprintln!`.
+fn captured(dir: &Path, name: &str) -> std::process::Stdio {
+    std::process::Stdio::from(std::fs::File::create(dir.join(name)).unwrap())
+}
+
 /// Bootstrap-index `project_dir` directly (BackendKind::Kuzu, no daemon
 /// involved, so `.infigraph/` exists), then start a real detached
 /// `infigraph daemon` against it and wait until it holds `watch.lock`.
@@ -820,13 +834,9 @@ fn a_queued_request_racing_a_full_reindex_gets_a_superseded_reply_not_a_hang() {
     // assertion reported from CI -- the child was not silent, nothing was
     // ever captured.
     //
-    // Files rather than `Stdio::piped()` because the loops below poll
-    // `try_wait` without draining: a child that outgrew the pipe buffer
-    // (~64KB) would block on write and never exit, turning a diagnostic into
-    // the hang this test exists to catch.
+    // Files rather than `Stdio::piped()`: see `captured`.
+    let capture = |name: &str| captured(project.path(), name);
     let out_path = |name: &str| project.path().join(name);
-    let capture =
-        |name: &str| std::process::Stdio::from(std::fs::File::create(out_path(name)).unwrap());
 
     let mut index_child = cli_command()
         .arg("index")
@@ -1118,13 +1128,13 @@ fn full_reindex_with_no_daemon_fails_fast_instead_of_polling_for_ten_minutes() {
         .env("INFIGRAPH_BACKEND", "daemon")
         .env("INFIGRAPH_NO_WATCH", "1")
         .env_remove("INFIGRAPH_WATCH_DAEMON")
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+        .stdout(captured(project.path(), "full.out"))
+        .stderr(captured(project.path(), "full.err"))
         .spawn()
         .unwrap();
-    loop {
-        if child.try_wait().unwrap().is_some() {
-            break;
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
         }
         if start.elapsed() > FAIL_FAST_BUDGET {
             let _ = child.kill();
@@ -1134,12 +1144,11 @@ fn full_reindex_with_no_daemon_fails_fast_instead_of_polling_for_ten_minutes() {
             );
         }
         std::thread::sleep(Duration::from_millis(50));
-    }
+    };
 
-    let output = child.wait_with_output().unwrap();
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = std::fs::read_to_string(project.path().join("full.err")).unwrap_or_default();
     assert!(
-        !output.status.success(),
+        !status.success(),
         "must be a hard failure, not a silent success: {stderr}"
     );
     assert!(
@@ -1197,30 +1206,31 @@ fn plain_index_on_a_never_indexed_project_bootstraps_under_daemon_backend() {
         .current_dir(project.path())
         .env("INFIGRAPH_BACKEND", "daemon")
         .env_remove("INFIGRAPH_WATCH_DAEMON")
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+        .stdout(captured(project.path(), "index.out"))
+        .stderr(captured(project.path(), "index.err"))
         .spawn()
         .unwrap();
-    loop {
-        if child.try_wait().unwrap().is_some() {
-            break;
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
         }
         if start.elapsed() > FAIL_FAST_BUDGET {
             let _ = child.kill();
             let _ = child.wait();
+            let stderr =
+                std::fs::read_to_string(project.path().join("index.err")).unwrap_or_default();
             panic!(
                 "plain `index` on a never-indexed project under \
                  INFIGRAPH_BACKEND=daemon did not finish within {FAIL_FAST_BUDGET:?} -- \
-                 the ~600s silent block inside the write client is back"
+                 the ~600s silent block inside the write client is back; its stderr: {stderr}"
             );
         }
         std::thread::sleep(Duration::from_millis(50));
-    }
+    };
 
-    let output = child.wait_with_output().unwrap();
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stderr = std::fs::read_to_string(project.path().join("index.err")).unwrap_or_default();
     assert!(
-        output.status.success(),
+        status.success(),
         "a never-indexed project must bootstrap under the routed backend rather than \
          failing, got: {stderr}"
     );
