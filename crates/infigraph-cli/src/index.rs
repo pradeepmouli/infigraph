@@ -3578,18 +3578,21 @@ mod tests {
             std::fs::create_dir_all(p.parent().unwrap()).unwrap();
             std::fs::write(&p, content).unwrap();
         }
-        let walked: Vec<String> = infigraph_core::ignore_rules::walk_builder(dir.path())
-            .build()
-            .flatten()
-            .filter(|e| e.file_type().is_some_and(|ft| ft.is_file()))
-            .map(|e| {
-                e.path()
-                    .strip_prefix(dir.path())
-                    .unwrap()
-                    .to_string_lossy()
-                    .replace('\\', "/")
-            })
-            .collect();
+        let walked: Vec<String> = infigraph_core::ignore_rules::walk_builder(
+            dir.path(),
+            infigraph_core::ignore_rules::Domain::Code,
+        )
+        .build()
+        .flatten()
+        .filter(|e| e.file_type().is_some_and(|ft| ft.is_file()))
+        .map(|e| {
+            e.path()
+                .strip_prefix(dir.path())
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/")
+        })
+        .collect();
         assert!(
             walked.iter().any(|p| p == "crates/x/src/bin/tool.rs"),
             "a Rust src/bin target must be indexed: {walked:?}"

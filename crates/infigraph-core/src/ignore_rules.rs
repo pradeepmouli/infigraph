@@ -26,6 +26,47 @@ crate::settings! {
     }
 }
 
+// `[ignore] code` / `[ignore] docs`: gitignore-style patterns that apply to
+// ONE indexing domain, on top of everything every domain already skips.
+// They only ever subtract, so unlike `[index] include` they cannot name
+// anything outside the project and have no `Trust` rule.
+//
+// The layered read is shared with `include` (`layered_entries`), so the env
+// layer *replaces* the config files here exactly as it does there --
+// `INFIGRAPH_IGNORE_CODE` / `INFIGRAPH_IGNORE_DOCS` therefore make the walk
+// MORE permissive than the files alone, by silencing the project's and the
+// user's own lists. A value is comma-separated (`PathList`), so a pattern
+// containing a comma can be stated in TOML only.
+crate::settings! {
+    ignore {
+        code: PathList = PathList(Vec::new()),
+        docs: PathList = PathList(Vec::new()),
+    }
+}
+
+/// How often a long-lived watcher rebuilds its `IgnoreMatcher`, so an edit
+/// to `.gitignore`, `.infigraphignore` or `[ignore]` reaches it without a
+/// restart. Both watchers use it as their floor: the code producer when its
+/// caller has no cadence of its own, the document watcher always.
+pub const MATCHER_REBUILD_SECS: u64 = 300;
+
+/// Which indexer a walk or a watcher event is for. Every file source names
+/// its own: the safety list, `.gitignore`, `.infigraphignore` and
+/// `[index] include` are the same for both, and `[ignore] <domain>` adds
+/// the patterns for that one.
+///
+/// There is deliberately no domain-less entry point: a walker that did not
+/// have to say what it is walking would silently skip its domain's rules,
+/// which is the mismatch between walker and watcher (#189) in a new place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Domain {
+    /// The code graph: the indexer, text search, security scan and the
+    /// code watcher.
+    Code,
+    /// The document index and its watcher.
+    Docs,
+}
+
 /// Directories always excluded, regardless of what any .gitignore or
 /// .infigraphignore says. Union of every previously-independent hardcoded
 /// list this module replaces (collect_files, the watcher, doc indexing,
@@ -104,33 +145,37 @@ struct Includes {
     tail_rules: std::sync::Arc<Gitignore>,
 }
 
-/// Every configured `[index] include` entry, paired with the trust of the
-/// layer that stated it.
+/// Every entry of one path-list setting, paired with the trust of the layer
+/// that stated it.
 ///
-/// The layers are read separately rather than through `Index::resolve`
-/// because merging them would lose exactly the provenance `Trust` needs.
-/// They also union rather than override, unlike a scalar setting: a user
-/// saying "always index this dependency" and a project saying "index this
-/// vendored library" are both true at once, and letting either silence the
-/// other would serve nobody.
-fn configured_includes(project_root: &Path) -> Vec<(String, Trust)> {
-    // The environment is this process's own, so it is trusted -- and it
-    // replaces the files entirely, keeping the macro's usual precedence.
-    if let Some(from_env) = Index::env_layer().index_include {
+/// Shared by `[index] include` and `[ignore] <domain>`, so the two cannot
+/// drift apart on how layers combine. `from_env` is that setting's env
+/// layer and `in_layer` reads it out of one config document.
+///
+/// The layers are read separately rather than through the group's
+/// `resolve` because merging them would lose exactly the provenance
+/// `Trust` needs. They also union rather than override, unlike a scalar
+/// setting: a user saying "always index this dependency" and a project
+/// saying "index this vendored library" are both true at once, and letting
+/// either silence the other would serve nobody. The environment is the
+/// exception, and replaces the files entirely -- it is this process's own,
+/// so it is trusted, and it keeps the macro's usual precedence.
+fn layered_entries(
+    project_root: &Path,
+    from_env: Option<PathList>,
+    in_layer: impl Fn(&toml_edit::Item) -> PathList,
+) -> Vec<(String, Trust)> {
+    if let Some(from_env) = from_env {
         return from_env.0.into_iter().map(|e| (e, Trust::User)).collect();
     }
 
     let docs = crate::settings_file::layers(ConfigScope::Project(project_root));
     let [project, user] = docs;
     let entries_of = |doc: Option<std::sync::Arc<toml_edit::DocumentMut>>, trust: Trust| {
-        doc.map(|doc| {
-            Index::resolve_layers_or_default(RawIndex::default(), &[doc.as_item()])
-                .include
-                .0
-        })
-        .unwrap_or_default()
-        .into_iter()
-        .map(move |entry| (entry, trust))
+        doc.map(|doc| in_layer(doc.as_item()).0)
+            .unwrap_or_default()
+            .into_iter()
+            .map(move |entry| (entry, trust))
     };
 
     let mut all: Vec<(String, Trust)> = entries_of(user, Trust::User).collect();
@@ -142,9 +187,16 @@ fn configured_includes(project_root: &Path) -> Vec<(String, Trust)> {
     all
 }
 
-fn include_roots(root: &Path) -> Includes {
-    let project_root = crate::project::resolve_project_root(root);
-    let configured = configured_includes(&project_root);
+/// Every configured `[index] include` entry, paired with the trust of the
+/// layer that stated it.
+fn configured_includes(project_root: &Path) -> Vec<(String, Trust)> {
+    layered_entries(project_root, Index::env_layer().index_include, |item| {
+        Index::resolve_layers_or_default(RawIndex::default(), &[item]).include
+    })
+}
+
+fn include_roots(root: &Path, project_root: &Path) -> Includes {
+    let configured = configured_includes(project_root);
     if configured.is_empty() {
         return Includes {
             roots: Vec::new(),
@@ -156,7 +208,7 @@ fn include_roots(root: &Path) -> Includes {
     let roots = configured
         .iter()
         .filter_map(
-            |(entry, trust)| match classify_include(&project_root, entry, *trust) {
+            |(entry, trust)| match classify_include(project_root, entry, *trust) {
                 Ok(absolute) => Some(absolute),
                 Err(problem) => {
                     warn_about_unusable_include(entry, problem);
@@ -173,7 +225,7 @@ fn include_roots(root: &Path) -> Includes {
         })
         .collect();
 
-    let mut tail = GitignoreBuilder::new(&project_root);
+    let mut tail = GitignoreBuilder::new(project_root);
     let _ = tail.add(project_root.join(".infigraphignore"));
     Includes {
         roots,
@@ -220,23 +272,141 @@ fn classify_include(
 /// nothing looks exactly like the feature not working, and the walkers that
 /// consult this run often enough that warning per call would be noise.
 fn warn_about_unusable_include(entry: &str, problem: IncludeProblem) {
-    static WARNED: std::sync::Mutex<Option<std::collections::HashSet<String>>> =
-        std::sync::Mutex::new(None);
-
-    let mut warned = WARNED.lock().unwrap_or_else(|e| e.into_inner());
-    if !warned
-        .get_or_insert_with(std::collections::HashSet::new)
-        .insert(entry.to_string())
-    {
-        return;
-    }
     let reason = match problem {
         IncludeProblem::OutsideProject => {
             "must be inside the project (an absolute path or `..` is allowed              only from ~/.infigraph/config.toml)"
         }
         IncludeProblem::NotADirectory => "names no directory",
     };
-    eprintln!("warning: [index] include entry {entry:?} {reason}; ignoring it");
+    warn_once(
+        format!("include {entry}"),
+        format!("warning: [index] include entry {entry:?} {reason}; ignoring it"),
+    );
+}
+
+/// Prints `message` the first time `key` is seen in this process. The
+/// walkers that consult these settings run often enough that warning per
+/// call would be noise.
+fn warn_once(key: String, message: String) {
+    static WARNED: std::sync::Mutex<Option<std::collections::HashSet<String>>> =
+        std::sync::Mutex::new(None);
+
+    let mut warned = WARNED.lock().unwrap_or_else(|e| e.into_inner());
+    if warned
+        .get_or_insert_with(std::collections::HashSet::new)
+        .insert(key)
+    {
+        eprintln!("{message}");
+    }
+}
+
+/// The `[ignore] <domain>` patterns for one walk, as one gitignore matcher
+/// anchored at the project root.
+///
+/// It is consulted exactly where the project's `.infigraphignore` tail
+/// rules are, by both the walker's `filter_entry` and
+/// `IgnoreMatcher::is_ignored`, so the two cannot disagree about a file
+/// (#189). A pattern is gitignore syntax and nothing else: `/docs/`
+/// anchors at the project root in every layer, `!` re-includes only within
+/// the same list (it cannot re-admit what `.gitignore`, the safety list or
+/// `.infigraphignore` excluded -- that is `[index] include`'s job), and a
+/// pattern with a `..` component can never match inside the project, so it
+/// is warned about and dropped.
+struct DomainRules {
+    rules: Gitignore,
+    /// The walk root exactly as the walker or the watcher spells it.
+    walk_root: PathBuf,
+    /// Where `walk_root` sits below the project root, so a walk of one
+    /// subdirectory still anchors `/docs/` at the project.
+    prefix: PathBuf,
+}
+
+impl DomainRules {
+    fn for_walk(root: &Path, project_root: &Path, domain: Domain) -> Self {
+        let mut builder = GitignoreBuilder::new(project_root);
+        for (pattern, _) in configured_domain_patterns(project_root, domain) {
+            let leaves_the_project = Path::new(&pattern)
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir));
+            if leaves_the_project {
+                warn_once(
+                    format!("ignore {pattern}"),
+                    format!(
+                        "warning: [ignore] pattern {pattern:?} has a `..` component and can \
+                         never match inside the project; ignoring it"
+                    ),
+                );
+                continue;
+            }
+            if let Err(e) = builder.add_line(None, &pattern) {
+                warn_once(
+                    format!("ignore {pattern}"),
+                    format!("warning: [ignore] pattern {pattern:?} is not valid: {e}; ignoring it"),
+                );
+            }
+        }
+        let canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        let project_canonical = project_root
+            .canonicalize()
+            .unwrap_or_else(|_| project_root.to_path_buf());
+        DomainRules {
+            rules: builder.build().unwrap_or_else(|_| Gitignore::empty()),
+            walk_root: root.to_path_buf(),
+            prefix: canonical
+                .strip_prefix(&project_canonical)
+                .map(Path::to_path_buf)
+                .unwrap_or_default(),
+        }
+    }
+
+    /// True when a domain pattern excludes `path`, or any directory above
+    /// it. Inside an `[index] include` root (`include`) the pattern is
+    /// matched against the tail below that root, exactly as the project's
+    /// `.infigraphignore` is: a re-admitted library is still full of
+    /// generated files the project did not want, and a project-relative
+    /// path would mean nothing there.
+    fn ignores(&self, path: &Path, is_dir: bool, include: Option<&Path>) -> bool {
+        if self.rules.is_empty() {
+            return false;
+        }
+        let relative = match include {
+            Some(include_root) => match path.strip_prefix(include_root) {
+                Ok(tail) => tail.to_path_buf(),
+                Err(_) => return false,
+            },
+            None => match path.strip_prefix(&self.walk_root) {
+                Ok(below) => self.prefix.join(below),
+                Err(_) => return false,
+            },
+        };
+        if relative.as_os_str().is_empty() {
+            return false;
+        }
+        self.rules
+            .matched_path_or_any_parents(&relative, is_dir)
+            .is_ignore()
+    }
+}
+
+/// The `[ignore]` patterns for `domain`, from every layer.
+fn configured_domain_patterns(project_root: &Path, domain: Domain) -> Vec<(String, Trust)> {
+    let field = |ignore: Ignore| match domain {
+        Domain::Code => ignore.code,
+        Domain::Docs => ignore.docs,
+    };
+    let from_env = {
+        let env = Ignore::env_layer();
+        match domain {
+            Domain::Code => env.ignore_code,
+            Domain::Docs => env.ignore_docs,
+        }
+    };
+    layered_entries(project_root, from_env, |item| {
+        field(Ignore::resolve_layers_or_default(
+            RawIgnore::default(),
+            &[item],
+        ))
+    })
 }
 
 /// Installs the shared entry filter on `builder`, plus each include root as
@@ -257,7 +427,11 @@ fn warn_about_unusable_include(entry: &str, problem: IncludeProblem) {
 /// and once as its own root, and duplicate entries mean duplicate indexing.
 /// Reaching it at depth 0 means it *is* the added root; any greater depth
 /// is the ordinary descent arriving, and that arrival is the one to drop.
-fn apply_filter_and_includes(builder: &mut WalkBuilder, includes: Includes) {
+fn apply_filter_and_includes(
+    builder: &mut WalkBuilder,
+    includes: Includes,
+    domain_rules: DomainRules,
+) {
     let Includes { roots, tail_rules } = includes;
     if !roots.is_empty() {
         builder.parents(false);
@@ -271,12 +445,16 @@ fn apply_filter_and_includes(builder: &mut WalkBuilder, includes: Includes) {
         if entry.depth() > 0 && roots.iter().any(|root| root == path) {
             return false;
         }
-        if let Some(root) = roots.iter().find(|root| path.starts_with(root)) {
+        let is_dir = entry.file_type().is_some_and(|ft| ft.is_dir());
+        let include = roots.iter().find(|root| path.starts_with(root));
+        if let Some(root) = include {
             let tail = path.strip_prefix(root).unwrap_or(path);
-            let is_dir = entry.file_type().is_some_and(|ft| ft.is_dir());
             if !tail.as_os_str().is_empty() && tail_rules.matched(tail, is_dir).is_ignore() {
                 return false;
             }
+        }
+        if entry.depth() > 0 && domain_rules.ignores(path, is_dir, include.map(PathBuf::as_path)) {
+            return false;
         }
         !is_safety_excluded(&entry.file_name().to_string_lossy())
     });
@@ -284,16 +462,22 @@ fn apply_filter_and_includes(builder: &mut WalkBuilder, includes: Includes) {
 
 /// A pre-configured `WalkBuilder` for `root`: respects `.gitignore`,
 /// `.infigraphignore`, and the safety list above, minus any directory
-/// `[index] include` opts back in. Callers may add further configuration
-/// (e.g. `.max_depth`) before calling `.build()`.
-pub fn walk_builder(root: &Path) -> WalkBuilder {
+/// `[index] include` opts back in, plus the `[ignore]` patterns of
+/// `domain`. Callers may add further configuration (e.g. `.max_depth`)
+/// before calling `.build()`.
+pub fn walk_builder(root: &Path, domain: Domain) -> WalkBuilder {
+    let project_root = crate::project::resolve_project_root(root);
     let mut builder = WalkBuilder::new(root);
     builder
         .hidden(true)
         .git_ignore(true)
         .require_git(false)
         .add_custom_ignore_filename(".infigraphignore");
-    apply_filter_and_includes(&mut builder, include_roots(root));
+    apply_filter_and_includes(
+        &mut builder,
+        include_roots(root, &project_root),
+        DomainRules::for_walk(root, &project_root, domain),
+    );
     builder
 }
 
@@ -323,6 +507,8 @@ pub struct IgnoreMatcher {
     /// would have the watcher mark files the indexer never stores, which is
     /// the orphaned-dirty-mark failure mode.
     inside_includes: Gitignore,
+    /// `[ignore] <domain>`, the point-wise twin of the walker's check.
+    domain_rules: DomainRules,
 }
 
 impl IgnoreMatcher {
@@ -338,13 +524,14 @@ impl IgnoreMatcher {
     /// still prune any subtree an already-discovered ancestor `.gitignore`
     /// excludes (with `require_git(false)` allowing this even in non-git roots),
     /// so this stays proportional to directory count, not full file count.
-    pub fn build(root: &Path) -> Self {
+    pub fn build(root: &Path, domain: Domain) -> Self {
         let root = root.to_path_buf();
         let mut gi_builder = GitignoreBuilder::new(&root);
 
         let mut inside_builder = GitignoreBuilder::new(&root);
 
-        let includes = include_roots(&root);
+        let project_root = crate::project::resolve_project_root(&root);
+        let includes = include_roots(&root, &project_root);
         let include_roots = includes.roots.clone();
         let tail_rules = includes.tail_rules.clone();
         let mut discovery = WalkBuilder::new(&root);
@@ -353,7 +540,11 @@ impl IgnoreMatcher {
             .git_ignore(true)
             .require_git(false)
             .add_custom_ignore_filename(".infigraphignore");
-        apply_filter_and_includes(&mut discovery, includes);
+        apply_filter_and_includes(
+            &mut discovery,
+            includes,
+            DomainRules::for_walk(&root, &project_root, domain),
+        );
 
         for result in discovery.build() {
             let Ok(entry) = result else { continue };
@@ -374,12 +565,14 @@ impl IgnoreMatcher {
         let inside_includes = inside_builder
             .build()
             .unwrap_or_else(|_| Gitignore::empty());
+        let domain_rules = DomainRules::for_walk(&root, &project_root, domain);
         IgnoreMatcher {
             root,
             gitignore,
             includes: include_roots,
             tail_rules,
             inside_includes,
+            domain_rules,
         }
     }
 
@@ -410,6 +603,14 @@ impl IgnoreMatcher {
         if include.is_some()
             && !checked.as_os_str().is_empty()
             && self.tail_rules.matched(checked, is_dir).is_ignore()
+        {
+            return true;
+        }
+        // A domain pattern is one more "not worth indexing" rule, and like
+        // `.infigraphignore` it holds inside an include root.
+        if self
+            .domain_rules
+            .ignores(path, is_dir, include.map(PathBuf::as_path))
         {
             return true;
         }
@@ -465,7 +666,7 @@ mod tests {
     fn walk_builder_skips_gitignored_scratchpad_and_safety_list() {
         let dir = make_fixture();
         let mut found = Vec::new();
-        for result in walk_builder(dir.path()).build() {
+        for result in walk_builder(dir.path(), Domain::Code).build() {
             let entry = result.unwrap();
             if entry.file_type().is_some_and(|ft| ft.is_file()) {
                 found.push(entry.path().to_path_buf());
@@ -493,7 +694,7 @@ mod tests {
     #[test]
     fn ignore_matcher_agrees_with_walk_builder() {
         let dir = make_fixture();
-        let matcher = IgnoreMatcher::build(dir.path());
+        let matcher = IgnoreMatcher::build(dir.path(), Domain::Code);
 
         assert!(!matcher.is_ignored(&dir.path().join("src/main.rs"), false));
         assert!(matcher.is_ignored(&dir.path().join("scratchpad/wt-foo/README.md"), false));
@@ -510,12 +711,12 @@ mod tests {
         fs::write(dir.path().join("vendored/lib.rs"), "// vendored").unwrap();
         fs::write(dir.path().join("real.rs"), "fn f() {}").unwrap();
 
-        let matcher = IgnoreMatcher::build(dir.path());
+        let matcher = IgnoreMatcher::build(dir.path(), Domain::Code);
         assert!(matcher.is_ignored(&dir.path().join("vendored/lib.rs"), false));
         assert!(!matcher.is_ignored(&dir.path().join("real.rs"), false));
 
         let mut found = Vec::new();
-        for result in walk_builder(dir.path()).build() {
+        for result in walk_builder(dir.path(), Domain::Code).build() {
             let entry = result.unwrap();
             if entry.file_type().is_some_and(|ft| ft.is_file()) {
                 found.push(entry.path().to_path_buf());
@@ -538,7 +739,7 @@ mod tests {
         fs::write(dir.path().join("ignored/file.txt"), "ignored").unwrap();
         fs::write(dir.path().join("kept.txt"), "kept").unwrap();
 
-        let matcher = IgnoreMatcher::build(dir.path());
+        let matcher = IgnoreMatcher::build(dir.path(), Domain::Code);
         assert!(matcher.is_ignored(&dir.path().join("ignored/file.txt"), false));
         assert!(!matcher.is_ignored(&dir.path().join("kept.txt"), false));
     }
@@ -570,7 +771,7 @@ mod tests {
     }
 
     fn walked_files(root: &Path) -> Vec<String> {
-        walk_builder(root)
+        walk_builder(root, Domain::Code)
             .build()
             .filter_map(Result::ok)
             .filter(|entry| entry.file_type().is_some_and(|ft| ft.is_file()))
@@ -614,7 +815,7 @@ mod tests {
     #[test]
     fn the_ignore_matcher_agrees_with_the_walker_about_an_included_directory() {
         let dir = make_include_fixture();
-        let matcher = IgnoreMatcher::build(dir.path());
+        let matcher = IgnoreMatcher::build(dir.path(), Domain::Code);
         assert!(
             !matcher.is_ignored(
                 &dir.path().join("node_modules/reference-lib/src/api.ts"),
@@ -652,7 +853,7 @@ mod tests {
             "the safety list still applies below an include root: {found:?}"
         );
 
-        let matcher = IgnoreMatcher::build(dir.path());
+        let matcher = IgnoreMatcher::build(dir.path(), Domain::Code);
         assert!(matcher.is_ignored(&git_dir.join("HEAD"), false));
         assert!(matcher.is_ignored(&nested.join("index.js"), false));
     }
@@ -702,7 +903,7 @@ mod tests {
             "a .gitignore inside an included directory still applies: {found:?}"
         );
 
-        let matcher = IgnoreMatcher::build(dir.path());
+        let matcher = IgnoreMatcher::build(dir.path(), Domain::Code);
         assert!(
             matcher.is_ignored(&lib.join("generated/bundle.js"), false),
             "the matcher must agree with the walker about rules from within"
@@ -744,7 +945,7 @@ mod tests {
             "hidden(true) still applies to entries *within* an include root: {found:?}"
         );
 
-        let matcher = IgnoreMatcher::build(dir.path());
+        let matcher = IgnoreMatcher::build(dir.path(), Domain::Code);
         assert!(!matcher.is_ignored(&pkg.join("grammar.js"), false));
     }
 
@@ -781,7 +982,7 @@ mod tests {
             "a pnpm-style symlinked include root must still be walked: {found:?}"
         );
 
-        let matcher = IgnoreMatcher::build(dir.path());
+        let matcher = IgnoreMatcher::build(dir.path(), Domain::Code);
         assert!(
             !matcher.is_ignored(
                 &dir.path().join("node_modules/linked-lib/grammar.js"),
@@ -822,7 +1023,7 @@ mod tests {
             "a project .infigraphignore rule must reach inside an include root: {found:?}"
         );
 
-        let matcher = IgnoreMatcher::build(dir.path());
+        let matcher = IgnoreMatcher::build(dir.path(), Domain::Code);
         assert!(matcher.is_ignored(&lib.join("src/parser.c"), false));
         assert!(!matcher.is_ignored(&lib.join("src/api.ts"), false));
     }
@@ -922,6 +1123,294 @@ mod shared_index_table_tests {
             includes.iter().any(|(entry, _)| entry == "/somewhere/else"),
             "the include list stopped resolving beside the cap ({} entries)",
             includes.len()
+        );
+    }
+}
+
+/// `[ignore] code` / `[ignore] docs`: patterns that apply to one indexing
+/// domain only.
+#[cfg(test)]
+mod domain_tests {
+    use super::*;
+    use crate::settings_file::test_support::{PinnedHome, ENV_LOCK};
+    use std::fs;
+
+    const CODE_ENV: &str = "INFIGRAPH_IGNORE_CODE";
+    const DOCS_ENV: &str = "INFIGRAPH_IGNORE_DOCS";
+
+    /// Every file the fixtures below create, spelled relative to the
+    /// project, so the matcher can be asked about each one.
+    const FILES: &[&str] = &[
+        "README.md",
+        "docs/guide.md",
+        "src/main.rs",
+        "src/api.gen.rs",
+        "src/docs/inner.md",
+        "notes.draft.md",
+        "user-only/a.rs",
+        "proj-only/b.rs",
+        "env-only/c.rs",
+    ];
+
+    fn project(config: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join(".infigraph")).unwrap();
+        fs::write(dir.path().join(".infigraph/config.toml"), config).unwrap();
+        for file in FILES {
+            let path = dir.path().join(file);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, "x").unwrap();
+        }
+        dir
+    }
+
+    fn walked(root: &Path, domain: Domain) -> Vec<String> {
+        let mut found: Vec<String> = walk_builder(root, domain)
+            .build()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_some_and(|ft| ft.is_file()))
+            .map(|entry| {
+                entry
+                    .path()
+                    .strip_prefix(root)
+                    .unwrap_or(entry.path())
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .filter(|rel| FILES.contains(&rel.as_str()))
+            .collect();
+        found.sort();
+        found
+    }
+
+    /// The watcher's matcher must answer exactly as the walker does for
+    /// every file, in the same domain: a matcher more permissive than the
+    /// walker has the watcher mark files the indexer never stores (#189).
+    fn assert_matcher_agrees_with_walker(root: &Path, domain: Domain) {
+        let walked = walked(root, domain);
+        let matcher = IgnoreMatcher::build(root, domain);
+        for file in FILES {
+            let admitted_by_walker = walked.iter().any(|w| w == file);
+            let admitted_by_matcher = !matcher.is_ignored(&root.join(file), false);
+            assert_eq!(
+                admitted_by_walker, admitted_by_matcher,
+                "{domain:?}: walker admits {file}={admitted_by_walker} but matcher admits \
+                 it={admitted_by_matcher}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_code_pattern_keeps_a_file_out_of_the_code_walk_but_in_the_docs_walk() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _home = PinnedHome::empty();
+        let dir = project("[ignore]\ncode = [\"docs/\", \"*.gen.rs\"]\n");
+
+        let code = walked(dir.path(), Domain::Code);
+        let docs = walked(dir.path(), Domain::Docs);
+
+        assert!(!code.contains(&"docs/guide.md".into()), "{code:?}");
+        assert!(!code.contains(&"src/docs/inner.md".into()), "{code:?}");
+        assert!(!code.contains(&"src/api.gen.rs".into()), "{code:?}");
+        assert!(code.contains(&"src/main.rs".into()), "{code:?}");
+        for kept in ["docs/guide.md", "src/api.gen.rs", "src/docs/inner.md"] {
+            assert!(
+                docs.contains(&kept.to_string()),
+                "a code-only pattern must not reach the docs walk: {kept} in {docs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_docs_pattern_keeps_a_file_out_of_the_docs_walk_but_in_the_code_walk() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _home = PinnedHome::empty();
+        let dir = project("[ignore]\ndocs = [\"*.draft.md\"]\n");
+
+        let docs = walked(dir.path(), Domain::Docs);
+        let code = walked(dir.path(), Domain::Code);
+
+        assert!(!docs.contains(&"notes.draft.md".into()), "{docs:?}");
+        assert!(docs.contains(&"README.md".into()), "{docs:?}");
+        assert!(
+            code.contains(&"notes.draft.md".into()),
+            "a docs-only pattern must not reach the code walk: {code:?}"
+        );
+    }
+
+    #[test]
+    fn the_matcher_agrees_with_the_walker_in_each_domain() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _home = PinnedHome::empty();
+        let dir = project(
+            "[ignore]\ncode = [\"docs/\", \"*.gen.rs\", \"/proj-only/\"]\n\
+             docs = [\"*.draft.md\", \"src/\"]\n",
+        );
+        assert_matcher_agrees_with_walker(dir.path(), Domain::Code);
+        assert_matcher_agrees_with_walker(dir.path(), Domain::Docs);
+        // And the fixture really does make the two domains differ, or the
+        // agreement above proves nothing.
+        assert_ne!(
+            walked(dir.path(), Domain::Code),
+            walked(dir.path(), Domain::Docs)
+        );
+    }
+
+    #[test]
+    fn project_and_user_layers_union_and_the_environment_replaces_both() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _home = PinnedHome::empty();
+        let user_dir = Path::new(&std::env::var("HOME").unwrap()).join(".infigraph");
+        fs::create_dir_all(&user_dir).unwrap();
+        fs::write(
+            user_dir.join("config.toml"),
+            "[ignore]\ncode = [\"user-only/\"]\n",
+        )
+        .unwrap();
+        let dir = project("[ignore]\ncode = [\"proj-only/\"]\n");
+        std::env::remove_var(CODE_ENV);
+
+        let both = walked(dir.path(), Domain::Code);
+        assert!(!both.contains(&"user-only/a.rs".into()), "{both:?}");
+        assert!(!both.contains(&"proj-only/b.rs".into()), "{both:?}");
+        assert!(both.contains(&"env-only/c.rs".into()), "{both:?}");
+
+        std::env::set_var(CODE_ENV, "env-only/");
+        let from_env = walked(dir.path(), Domain::Code);
+        std::env::remove_var(CODE_ENV);
+        assert!(!from_env.contains(&"env-only/c.rs".into()), "{from_env:?}");
+        assert!(
+            from_env.contains(&"user-only/a.rs".into())
+                && from_env.contains(&"proj-only/b.rs".into()),
+            "the environment replaces the files, so their lists no longer apply: {from_env:?}"
+        );
+    }
+
+    #[test]
+    fn the_docs_environment_variable_is_its_own_domain() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _home = PinnedHome::empty();
+        let dir = project("");
+        std::env::set_var(DOCS_ENV, "env-only/, notes.draft.md");
+        let docs = walked(dir.path(), Domain::Docs);
+        let code = walked(dir.path(), Domain::Code);
+        std::env::remove_var(DOCS_ENV);
+
+        assert!(!docs.contains(&"env-only/c.rs".into()), "{docs:?}");
+        assert!(!docs.contains(&"notes.draft.md".into()), "{docs:?}");
+        assert!(code.contains(&"env-only/c.rs".into()), "{code:?}");
+    }
+
+    #[test]
+    fn a_parent_component_is_dropped_and_a_leading_slash_anchors_at_the_project() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _home = PinnedHome::empty();
+        // `../src/` could only ever mean "outside the project", where
+        // nothing is walked, so it must be inert -- never read as `src/`.
+        let dir = project("[ignore]\ncode = [\"../src/\", \"/docs/\"]\n");
+
+        let code = walked(dir.path(), Domain::Code);
+        assert!(code.contains(&"src/main.rs".into()), "{code:?}");
+        assert!(!code.contains(&"docs/guide.md".into()), "{code:?}");
+        assert!(
+            code.contains(&"src/docs/inner.md".into()),
+            "`/docs/` anchors at the project root, so it must not match src/docs: {code:?}"
+        );
+        assert_matcher_agrees_with_walker(dir.path(), Domain::Code);
+    }
+
+    #[test]
+    fn an_unanchored_directory_pattern_matches_at_any_depth() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _home = PinnedHome::empty();
+        let dir = project("[ignore]\ncode = [\"docs/\"]\n");
+        let code = walked(dir.path(), Domain::Code);
+        assert!(!code.contains(&"docs/guide.md".into()), "{code:?}");
+        assert!(!code.contains(&"src/docs/inner.md".into()), "{code:?}");
+    }
+
+    #[test]
+    fn a_walk_of_a_subdirectory_still_anchors_at_the_project_root() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _home = PinnedHome::empty();
+        let dir = project("[ignore]\ncode = [\"/src/docs/\"]\n");
+        // A directory is a project store only once it holds a graph.
+        fs::write(dir.path().join(".infigraph/graph"), b"x").unwrap();
+        let src = dir.path().join("src");
+
+        let found: Vec<String> = walk_builder(&src, Domain::Code)
+            .build()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_some_and(|ft| ft.is_file()))
+            .map(|entry| {
+                entry
+                    .path()
+                    .strip_prefix(&src)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        assert!(found.contains(&"main.rs".to_string()), "{found:?}");
+        assert!(
+            !found.contains(&"docs/inner.md".to_string()),
+            "a walk rooted at src/ must still read `/src/docs/` against the project: {found:?}"
+        );
+    }
+
+    /// A re-admitted library is still full of generated files the project
+    /// did not want: the pattern holds below an include root, as
+    /// `.infigraphignore` does, and the watcher agrees.
+    #[test]
+    fn a_domain_pattern_still_applies_inside_an_include_root() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _home = PinnedHome::empty();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join(".gitignore"), "node_modules/\n").unwrap();
+        fs::create_dir_all(root.join(".infigraph")).unwrap();
+        fs::write(
+            root.join(".infigraph/config.toml"),
+            "[index]\ninclude = [\"node_modules/lib\"]\n[ignore]\ncode = [\"*.gen.ts\"]\n",
+        )
+        .unwrap();
+        fs::create_dir_all(root.join("node_modules/lib/src")).unwrap();
+        fs::write(root.join("node_modules/lib/src/api.ts"), "x").unwrap();
+        fs::write(root.join("node_modules/lib/src/api.gen.ts"), "x").unwrap();
+
+        let rel = |domain: Domain| -> Vec<String> {
+            walk_builder(root, domain)
+                .build()
+                .filter_map(Result::ok)
+                .filter(|e| e.file_type().is_some_and(|ft| ft.is_file()))
+                .filter_map(|e| {
+                    let r = e.path().strip_prefix(root).ok()?.to_path_buf();
+                    Some(r.to_string_lossy().replace('\\', "/"))
+                })
+                .filter(|p| p.starts_with("node_modules/lib"))
+                .collect()
+        };
+        let code = rel(Domain::Code);
+        assert!(code.contains(&"node_modules/lib/src/api.ts".to_string()));
+        assert!(!code.contains(&"node_modules/lib/src/api.gen.ts".to_string()));
+        assert!(rel(Domain::Docs).contains(&"node_modules/lib/src/api.gen.ts".to_string()));
+
+        let matcher = IgnoreMatcher::build(root, Domain::Code);
+        assert!(matcher.is_ignored(&root.join("node_modules/lib/src/api.gen.ts"), false));
+        assert!(!matcher.is_ignored(&root.join("node_modules/lib/src/api.ts"), false));
+    }
+
+    #[test]
+    fn the_group_is_registered_and_a_lone_string_is_a_reported_error() {
+        assert!(crate::settings::registered_categories().contains(&"ignore"));
+
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _home = PinnedHome::empty();
+        let dir = project("[ignore]\ncode = \"docs/\"\n");
+        let problems = crate::settings::check_all(ConfigScope::Project(dir.path()));
+        assert!(
+            problems.iter().any(|p| p.setting.contains("[ignore] code")),
+            "a bare string is the likely mistake and must not read as no patterns: {problems:?}"
         );
     }
 }

@@ -43,7 +43,10 @@ pub fn watch_docs(
     // forever even though `collect_doc_files` (which respects the same
     // ignore rules) will never actually index anything under `target/` --
     // observed live as an infinite "reindexed: 0 files, 0 chunks" loop.
-    let ignore_matcher = infigraph_core::ignore_rules::IgnoreMatcher::build(root);
+    let ignore_matcher = infigraph_core::ignore_rules::IgnoreMatcher::build(
+        root,
+        infigraph_core::ignore_rules::Domain::Docs,
+    );
 
     let debounce = Duration::from_millis(debounce_ms);
     let mut last_reindex = Instant::now();
@@ -402,7 +405,10 @@ mod tests {
     #[test]
     fn a_new_directory_warrants_a_reindex_even_though_it_is_not_a_document() {
         let tmp = tempfile::tempdir().unwrap();
-        let ignore = infigraph_core::ignore_rules::IgnoreMatcher::build(tmp.path());
+        let ignore = infigraph_core::ignore_rules::IgnoreMatcher::build(
+            tmp.path(),
+            infigraph_core::ignore_rules::Domain::Docs,
+        );
         let new_dir = tmp.path().join("docs").join("tutorials");
         std::fs::create_dir_all(&new_dir).unwrap();
 
@@ -420,7 +426,10 @@ mod tests {
     #[test]
     fn a_document_file_warrants_a_reindex() {
         let tmp = tempfile::tempdir().unwrap();
-        let ignore = infigraph_core::ignore_rules::IgnoreMatcher::build(tmp.path());
+        let ignore = infigraph_core::ignore_rules::IgnoreMatcher::build(
+            tmp.path(),
+            infigraph_core::ignore_rules::Domain::Docs,
+        );
         let doc = tmp.path().join("readme.md");
         std::fs::write(&doc, "# hi\n").unwrap();
         assert!(paths_warrant_reindex(&[doc], &ignore));
@@ -432,7 +441,10 @@ mod tests {
     #[test]
     fn a_non_document_file_still_warrants_nothing() {
         let tmp = tempfile::tempdir().unwrap();
-        let ignore = infigraph_core::ignore_rules::IgnoreMatcher::build(tmp.path());
+        let ignore = infigraph_core::ignore_rules::IgnoreMatcher::build(
+            tmp.path(),
+            infigraph_core::ignore_rules::Domain::Docs,
+        );
         let src = tmp.path().join("main.rs");
         std::fs::write(&src, "fn main() {}\n").unwrap();
         assert!(!paths_warrant_reindex(&[src], &ignore));
@@ -583,7 +595,10 @@ mod tests {
         std::fs::create_dir_all(root.join("target").join("doc")).unwrap();
         std::fs::write(root.join("readme.md"), "# hello\n").unwrap();
 
-        let ignore_matcher = infigraph_core::ignore_rules::IgnoreMatcher::build(&root);
+        let ignore_matcher = infigraph_core::ignore_rules::IgnoreMatcher::build(
+            &root,
+            infigraph_core::ignore_rules::Domain::Docs,
+        );
         let real_doc = root.join("readme.md");
         let build_artifact = root.join("target").join("doc").join("index.html");
 

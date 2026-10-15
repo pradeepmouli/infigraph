@@ -125,7 +125,8 @@ pub async fn run_producer(
         Err(e) => eprintln!("[watch-producer] failed to read dirty set, skipping recovery: {e}"),
     }
 
-    let mut ignore_matcher = crate::ignore_rules::IgnoreMatcher::build(&root);
+    let mut ignore_matcher =
+        crate::ignore_rules::IgnoreMatcher::build(&root, crate::ignore_rules::Domain::Code);
 
     // Batch accumulator: collect file changes over a 1-second window so the
     // consumer indexes them all at once via the bulk write path.
@@ -194,7 +195,7 @@ pub async fn run_producer(
             }
 
             _ = ignore_rebuild.tick() => {
-                ignore_matcher = crate::ignore_rules::IgnoreMatcher::build(&root);
+                ignore_matcher = crate::ignore_rules::IgnoreMatcher::build(&root, crate::ignore_rules::Domain::Code);
             }
 
             maybe_evt = rx.recv() => {

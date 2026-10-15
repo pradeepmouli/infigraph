@@ -444,7 +444,8 @@ fn walk_and_search(
     limit: usize,
     matches: &mut Vec<GrepMatch>,
 ) -> Result<()> {
-    for result in crate::ignore_rules::walk_builder(base).build() {
+    for result in crate::ignore_rules::walk_builder(base, crate::ignore_rules::Domain::Code).build()
+    {
         if matches.len() >= limit {
             return Ok(());
         }
