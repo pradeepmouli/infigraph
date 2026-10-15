@@ -588,9 +588,14 @@ impl IgnoreMatcher {
         // reference library back in says nothing about its own vendored
         // `node_modules/` or `.git/`. Above the include root it is exactly
         // what the entry is opting out of, so only the tail is checked.
+        //
+        // Without an include the check is below this matcher's root, never
+        // the ancestors above it: a project checked out under `~/build/` or
+        // `.../target/` is still a project, and the walker, which never
+        // looks above its root, admits its files.
         let checked = match include {
             Some(root) => path.strip_prefix(root).unwrap_or(path),
-            None => path,
+            None => path.strip_prefix(&self.root).unwrap_or(path),
         };
         if checked
             .components()
@@ -809,6 +814,35 @@ mod tests {
         assert!(
             !found.iter().any(|p| p.contains("other-pkg")),
             "only the named subtree is re-admitted, not the whole of node_modules: {found:?}"
+        );
+    }
+
+    /// The safety list names directories *of the project*. A checkout that
+    /// happens to live under `~/build/` or `.../target/` is still a project,
+    /// and the watcher must not read every one of its files as excluded
+    /// because an ancestor above the root has a listed name.
+    #[test]
+    fn the_matcher_judges_paths_below_its_root_not_the_ancestors_above_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("build").join("target").join("proj");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/main.rs"), "fn main() {}").unwrap();
+        fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
+        fs::write(root.join("node_modules/pkg/index.js"), "//").unwrap();
+
+        let walked = walked_files(&root);
+        assert!(
+            walked.iter().any(|p| p == "src/main.rs"),
+            "the walker admits the project's own source: {walked:?}"
+        );
+        let matcher = IgnoreMatcher::build(&root, Domain::Code);
+        assert!(
+            !matcher.is_ignored(&root.join("src/main.rs"), false),
+            "the matcher must agree: `build/` and `target/` above the root are not the project's"
+        );
+        assert!(
+            matcher.is_ignored(&root.join("node_modules/pkg/index.js"), false),
+            "a listed directory below the root is still excluded"
         );
     }
 

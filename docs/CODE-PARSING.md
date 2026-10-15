@@ -265,6 +265,15 @@ silences the project's and your own lists. There is no trust difference
 between layers, because a pattern can only remove files, never reach
 outside the project.
 
+Link-following in the document index asks the same rules. A document a
+link points at is indexed only if the walk of that directory would have
+listed it: a link into a `.gitignore`d path, an `[ignore] docs` pattern, or
+a safety-listed directory (`vendor/`, `coverage/`, … as well as `target/`)
+does not pull the file in. This is a change: a gitignored document that was
+reachable only by a link used to be indexed, and is not any more. Hidden
+directories (`.github/`, `.idea/`) stay excluded below the repository root,
+as they are for the walk.
+
 Some walkers do not consult these rules yet (manifest and cross-service
 scans among them); see the issue tracking walkers that bypass
 `ignore_rules`.

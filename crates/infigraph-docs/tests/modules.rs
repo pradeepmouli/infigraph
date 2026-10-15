@@ -1262,3 +1262,125 @@ fn test_cross_repo_github_link_no_edge_without_group() {
         "cross-repo link should NOT create edge without group context"
     );
 }
+
+// --- BFS honours the same ignore rules as the walk (#56) ---
+
+/// Indexes `repo/docs` and returns the ids of everything the link-following
+/// pass added, i.e. documents the walk of `docs/` never listed.
+fn bfs_discovered_ids(repo: &Path) -> HashSet<String> {
+    let doc_root = repo.join("docs");
+    let mut idx = DocIndex::open(&doc_root).unwrap();
+    idx.init().unwrap();
+    idx.index().unwrap();
+    let store = idx.store().unwrap();
+    store
+        .get_doc_hashes()
+        .unwrap()
+        .into_keys()
+        .filter(|id| id != "index.md")
+        .collect()
+}
+
+fn repo_linking_to(root: &Path, targets: &[&str]) -> std::path::PathBuf {
+    let repo = root.join("repo");
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    let links: String = targets
+        .iter()
+        .map(|t| format!("- [{t}](../{t})\n"))
+        .collect();
+    create_doc_file(&repo, "docs/index.md", &format!("# Index\n\n{links}"));
+    for target in targets {
+        create_doc_file(&repo, target, &format!("# {target}\n\nBody of {target}.\n"));
+    }
+    repo
+}
+
+#[test]
+fn test_bfs_does_not_follow_a_link_into_a_gitignored_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = repo_linking_to(tmp.path(), &["private/secret.md", "notes/ok.md"]);
+    std::fs::write(repo.join(".gitignore"), "private/\n").unwrap();
+
+    let found = bfs_discovered_ids(&repo);
+    assert!(
+        found.iter().any(|id| id.ends_with("notes/ok.md")),
+        "an ordinary linked doc is still followed: {found:?}"
+    );
+    assert!(
+        !found.iter().any(|id| id.ends_with("private/secret.md")),
+        "a gitignored doc reached only by a link is not indexed: {found:?}"
+    );
+}
+
+#[test]
+fn test_bfs_does_not_follow_a_link_to_a_file_excluded_for_docs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = repo_linking_to(
+        tmp.path(),
+        &["generated/api.md", "CHANGELOG.md", "notes/ok.md"],
+    );
+    std::fs::create_dir_all(repo.join(".infigraph")).unwrap();
+    std::fs::write(
+        repo.join(".infigraph/config.toml"),
+        "[ignore]\ndocs = [\"generated/\", \"CHANGELOG.md\"]\n",
+    )
+    .unwrap();
+
+    let found = bfs_discovered_ids(&repo);
+    assert!(
+        found.iter().any(|id| id.ends_with("notes/ok.md")),
+        "{found:?}"
+    );
+    for excluded in ["generated/api.md", "CHANGELOG.md"] {
+        assert!(
+            !found.iter().any(|id| id.ends_with(excluded)),
+            "`[ignore] docs` holds for link-following too: {excluded} in {found:?}"
+        );
+    }
+}
+
+/// The private list this replaced named ten directories and lacked these:
+/// the walk excluded them, the link-follower did not.
+#[test]
+fn test_bfs_excludes_what_the_walk_excludes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dirs = [
+        "vendor/lib",
+        "coverage/report",
+        ".idea/notes",
+        ".mypy_cache/x",
+        ".pytest_cache/readme",
+        "node_modules/pkg",
+    ];
+    let targets: Vec<String> = dirs.iter().map(|d| format!("{d}.md")).collect();
+    let target_refs: Vec<&str> = targets.iter().map(String::as_str).collect();
+    let repo = repo_linking_to(tmp.path(), &[&target_refs[..], &["notes/ok.md"]].concat());
+
+    let found = bfs_discovered_ids(&repo);
+    assert!(
+        found.iter().any(|id| id.ends_with("notes/ok.md")),
+        "{found:?}"
+    );
+    for target in &targets {
+        assert!(
+            !found.iter().any(|id| id.ends_with(target.as_str())),
+            "{target} is excluded from the walk and must be from link-following: {found:?}"
+        );
+    }
+}
+
+/// A repository that happens to live under a directory named like a safety
+/// list entry is still a repository: the rules judge paths below the repo.
+#[test]
+fn test_bfs_ignores_nothing_for_a_repo_under_a_safety_listed_ancestor() {
+    let tmp = tempfile::tempdir().unwrap();
+    let parent = tmp.path().join("build").join("dist");
+    std::fs::create_dir_all(&parent).unwrap();
+    let repo = repo_linking_to(&parent, &["notes/ok.md"]);
+
+    let found = bfs_discovered_ids(&repo);
+    assert!(
+        found.iter().any(|id| id.ends_with("notes/ok.md")),
+        "{found:?}"
+    );
+}
