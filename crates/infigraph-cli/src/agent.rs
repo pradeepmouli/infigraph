@@ -289,6 +289,11 @@ pub(crate) struct AgentInstructionTarget {
     pub path: &'static str,
     pub wrapper: fn(&str) -> String,
     pub label: &'static str,
+    /// Whether `init` may create the file. `false` for a file the user's agent
+    /// owns (`AGENTS.md`, `GEMINI.md`, Copilot's instructions): `init` adds its
+    /// block to one that exists and leaves a missing one missing. `true` for a
+    /// rules file named for infigraph, which nobody else writes.
+    pub creates: bool,
 }
 
 pub(crate) fn wrap_plain(content: &str) -> String {
@@ -310,31 +315,37 @@ pub(crate) const AGENT_INSTRUCTION_TARGETS: &[AgentInstructionTarget] = &[
         path: ".cursor/rules/infigraph.mdc",
         wrapper: wrap_cursor_mdc,
         label: "Cursor",
+        creates: true,
     },
     AgentInstructionTarget {
         path: ".github/copilot-instructions.md",
         wrapper: wrap_plain,
         label: "GitHub Copilot",
+        creates: false,
     },
     AgentInstructionTarget {
         path: ".windsurf/rules/infigraph.md",
         wrapper: wrap_plain,
         label: "Windsurf",
+        creates: true,
     },
     AgentInstructionTarget {
         path: ".kiro/rules/infigraph.md",
         wrapper: wrap_kiro_rule,
         label: "Kiro",
+        creates: true,
     },
     AgentInstructionTarget {
         path: "AGENTS.md",
         wrapper: wrap_plain,
         label: "Codex/OpenAI",
+        creates: false,
     },
     AgentInstructionTarget {
         path: "GEMINI.md",
         wrapper: wrap_plain,
         label: "Gemini CLI",
+        creates: false,
     },
 ];
 
@@ -382,10 +393,16 @@ pub(crate) fn write_agent_instructions(
     group_context: Option<&str>,
 ) -> Result<()> {
     let mut written = Vec::new();
+    let mut absent = Vec::new();
 
     for target in AGENT_INSTRUCTION_TARGETS {
         let file_path = root.join(target.path);
 
+        // A file the user's agent owns is theirs to create (or not).
+        if !target.creates && !file_path.is_file() {
+            absent.push(target.label);
+            continue;
+        }
         if let Some(parent) = file_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -397,6 +414,12 @@ pub(crate) fn write_agent_instructions(
 
     if !written.is_empty() {
         println!("  Wrote agent instructions for: {}", written.join(", "));
+    }
+    if !absent.is_empty() {
+        println!(
+            "  Left alone (no such file; create it and re-run to add the block): {}",
+            absent.join(", ")
+        );
     }
 
     Ok(())
@@ -516,8 +539,38 @@ mod tests {
     }
 
     #[test]
+    fn init_never_creates_a_file_the_users_agent_owns() {
+        let root = project();
+        write_agent_instructions(root.path(), None).unwrap();
+        for target in AGENT_INSTRUCTION_TARGETS {
+            assert_eq!(
+                root.path().join(target.path).exists(),
+                target.creates,
+                "{}",
+                target.path
+            );
+        }
+        for owned in ["AGENTS.md", "GEMINI.md", ".github"] {
+            assert!(!root.path().join(owned).exists(), "{owned}");
+        }
+        assert!(root.path().join(".cursor/rules/infigraph.mdc").is_file());
+    }
+
+    #[test]
+    fn init_adds_its_block_to_an_existing_user_file_and_keeps_the_rest() {
+        let root = project();
+        std::fs::write(root.path().join("AGENTS.md"), "# Mine\n").unwrap();
+        write_agent_instructions(root.path(), None).unwrap();
+        let text = std::fs::read_to_string(root.path().join("AGENTS.md")).unwrap();
+        assert!(text.starts_with("# Mine\n"), "{text}");
+        assert!(text.contains(infigraph_instructions()), "{text}");
+        assert!(!root.path().join("GEMINI.md").exists());
+    }
+
+    #[test]
     fn an_unchanged_block_is_not_rewritten() {
         let root = project();
+        std::fs::write(root.path().join("AGENTS.md"), "# Mine\n").unwrap();
         write_agent_instructions(root.path(), None).unwrap();
         let path = root.path().join("AGENTS.md");
         let before = std::fs::metadata(&path).unwrap().modified().unwrap();
