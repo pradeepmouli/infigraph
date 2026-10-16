@@ -134,6 +134,41 @@ fn unparseable_embeddings_sidecar_is_a_fail() {
 }
 
 #[test]
+fn clone_bodies_sidecar_is_a_warn_when_missing_and_a_fail_when_unparseable() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (root, graph_path) = project_with_graph(&tmp);
+    drop(GraphStore::open(&graph_path).unwrap());
+
+    let results = run_verify(&root);
+    let missing = status_of(&results, "clone-bodies.bin: parse");
+    assert_eq!(missing.status, CheckStatus::Warn);
+    assert!(
+        missing
+            .remediation
+            .as_deref()
+            .unwrap_or("")
+            .contains("infigraph index"),
+        "{missing:?}"
+    );
+
+    fs::write(root.join(".infigraph").join("clone-bodies.bin"), b"garbage").unwrap();
+    assert_eq!(
+        status_of(&run_verify(&root), "clone-bodies.bin: parse").status,
+        CheckStatus::Fail
+    );
+
+    infigraph_core::clone_detect::bodies::save(
+        &root.join(".infigraph").join("clone-bodies.bin"),
+        &[],
+    )
+    .unwrap();
+    assert_eq!(
+        status_of(&run_verify(&root), "clone-bodies.bin: parse").status,
+        CheckStatus::Pass
+    );
+}
+
+#[test]
 fn stale_generation_marker_is_a_warn_and_matching_one_a_pass() {
     let tmp = tempfile::tempdir().unwrap();
     let (root, graph_path) = project_with_graph(&tmp);

@@ -81,6 +81,7 @@ pub fn run_verify(root: &Path) -> Vec<CheckResult> {
     let checks = observed.with_query(|q| {
         let mut out = vec![check_symbol_file_references(q)];
         out.extend(check_embeddings_sidecar(q, &ig));
+        out.extend(check_clone_bodies_sidecar(&ig));
         out
     });
     match checks {
@@ -143,6 +144,35 @@ fn check_symbol_file_references<E: QueryExec>(backend: &GraphQuery<E>) -> CheckR
             "if this persists, the graph may be corrupt -- `infigraph rebuild` repairs it",
         ),
     }
+}
+
+/// The clone bodies sidecar parses. Absent is the mode `degraded` words; a
+/// file that does not parse is derived data to delete, as for embeddings.
+fn check_clone_bodies_sidecar(ig: &Path) -> Vec<CheckResult> {
+    const LABEL: &str = "clone-bodies.bin: parse";
+    let path = ig.join(crate::clone_detect::bodies::BODIES_FILE);
+    if !path.exists() {
+        let mode = crate::degraded::DegradedMode::CloneBodiesUnavailable;
+        return vec![CheckResult::warn(
+            CATEGORY,
+            LABEL,
+            mode.message(),
+            mode.remedy(),
+        )];
+    }
+    vec![match crate::clone_detect::bodies::load(&path) {
+        Ok(entries) => CheckResult::pass(
+            CATEGORY,
+            LABEL,
+            format!("{} function bodies described", entries.len()),
+        ),
+        Err(e) => CheckResult::fail(
+            CATEGORY,
+            LABEL,
+            format!("sidecar does not parse: {e:#}"),
+            "delete it and run `infigraph index` -- it is derived data, rebuilding is safe",
+        ),
+    }]
 }
 
 /// The embeddings sidecar parses, its recorded generation matches the live

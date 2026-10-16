@@ -23,6 +23,8 @@ pub const UNWATCHED_DIRECTORIES: &str = "unwatched-directories";
 pub const DOC_READS_UNAVAILABLE: &str = "doc-reads-unavailable";
 pub const GRAPH_REOPEN_BACKOFF: &str = "graph-reopen-backoff";
 pub const REINDEX_WAITING_FOR_SLOT: &str = "reindex-waiting-for-slot";
+pub const CLONE_BODIES_UNAVAILABLE: &str = "clone-bodies-unavailable";
+pub const CLONE_BODIES_PARTIAL: &str = "clone-bodies-partial";
 
 /// One way infigraph is running degraded.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,6 +67,12 @@ pub enum DegradedMode {
     /// Documents are indexed but their embeddings are absent, so document
     /// search ranks by keywords only.
     DocEmbeddingsMissing,
+    /// `clone-bodies.bin` is missing, so clone detection compares signature
+    /// text, not function bodies.
+    CloneBodiesUnavailable,
+    /// `clone-bodies.bin` describes only some of the functions, so the rest
+    /// are compared by the weaker signal.
+    CloneBodiesPartial { missing: usize, total: usize },
 }
 
 impl DegradedMode {
@@ -86,6 +94,8 @@ impl DegradedMode {
             DegradedMode::ReindexWaitingForSlot { .. } => REINDEX_WAITING_FOR_SLOT,
             DegradedMode::HnswMissing => "hnsw-missing",
             DegradedMode::DocEmbeddingsMissing => "doc-embeddings-missing",
+            DegradedMode::CloneBodiesUnavailable => CLONE_BODIES_UNAVAILABLE,
+            DegradedMode::CloneBodiesPartial { .. } => CLONE_BODIES_PARTIAL,
         }
     }
 
@@ -149,6 +159,15 @@ impl DegradedMode {
                 "document embeddings are missing: document search ranks by keywords only"
                     .to_string()
             }
+            DegradedMode::CloneBodiesUnavailable => {
+                "clone-bodies.bin is missing: clone detection compares signature text, not \
+                 function bodies"
+                    .to_string()
+            }
+            DegradedMode::CloneBodiesPartial { missing, total } => format!(
+                "{missing} of {total} functions have no body signal in clone-bodies.bin: they are \
+                 compared by a weaker signal, and each pair says which"
+            ),
         }
     }
 
@@ -167,6 +186,9 @@ impl DegradedMode {
             | DegradedMode::EmbeddingsStale { .. }
             | DegradedMode::EmbeddingsBehindGraph { .. }
             | DegradedMode::HnswMissing => "run `infigraph index` to rebuild them",
+            DegradedMode::CloneBodiesUnavailable | DegradedMode::CloneBodiesPartial { .. } => {
+                "run `infigraph index`"
+            }
             DegradedMode::UnwatchedDirectories { .. } => {
                 "fix the cause (on Linux usually `fs.inotify.max_user_watches`), then run \
                  `infigraph daemon-restart`"
@@ -549,6 +571,9 @@ pub fn derived_from_disk(root: &Path) -> Vec<DegradedMode> {
     if crate::embed::hnsw_expected_but_unusable(root) {
         modes.push(DegradedMode::HnswMissing);
     }
+    if !ig.join(crate::clone_detect::bodies::BODIES_FILE).exists() {
+        modes.push(DegradedMode::CloneBodiesUnavailable);
+    }
     // Not here: missing document embeddings. An empty document index has no
     // `docs_embeddings.bin` either (measured), and telling the two apart
     // needs the chunk count, which only the indexer has. It reports the mode
@@ -594,9 +619,11 @@ mod tests {
             std::fs::write(self.root().join(".infigraph").join(name), bytes).unwrap();
         }
 
-        /// An `embeddings.bin` whose header claims `count` vectors.
+        /// An `embeddings.bin` whose header claims `count` vectors, and the
+        /// clone bodies sidecar that is built beside it.
         fn embeddings(&self, count: u32) {
             self.write("embeddings.bin", &count.to_le_bytes());
+            self.write(crate::clone_detect::bodies::BODIES_FILE, b"bodies");
         }
 
         fn embeddings_mtime_secs(&self) -> u64 {
@@ -649,8 +676,28 @@ mod tests {
         let p = Project::new();
         assert_eq!(
             derived_from_disk(p.root()),
-            vec![DegradedMode::EmbeddingsMissing]
+            vec![
+                DegradedMode::EmbeddingsMissing,
+                DegradedMode::CloneBodiesUnavailable
+            ]
         );
+    }
+
+    #[test]
+    fn a_graph_without_clone_bodies_is_reported_on_its_own() {
+        let p = Project::new();
+        p.embeddings(10);
+        std::fs::remove_file(
+            p.root()
+                .join(".infigraph")
+                .join(crate::clone_detect::bodies::BODIES_FILE),
+        )
+        .unwrap();
+        let modes = derived_from_disk(p.root());
+        assert_eq!(modes, vec![DegradedMode::CloneBodiesUnavailable]);
+        let notice = modes[0].notice();
+        assert_eq!(notice.key, "clone-bodies-unavailable");
+        assert!(notice.remedy.contains("infigraph index"), "{notice:?}");
     }
 
     #[test]
