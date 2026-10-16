@@ -33,6 +33,8 @@
 //! failure to find it while the writer churns a SEPARATE file can only be a
 //! concurrent-access artifact, not a fixture bug.
 
+mod support;
+
 use infigraph_core::graph::{GraphBackend, KuzuBackend};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -303,12 +305,16 @@ fn concurrent_writer_reader_raw_query_correctness_under_load() {
 
     // --- Reader: a separate process, started before the writer so its reads
     // straddle the whole write window. ---
-    let reader_child = std::process::Command::new(std::env::current_exe().unwrap())
+    // The child writes thousands of lines while this process churns the graph
+    // and does not read it until the window closes, so its output goes to
+    // files outside the project the writer indexes, not a pipe nobody drains.
+    let out_dir = tempfile::tempdir().expect("reader output tmpdir");
+    let mut reader_child = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["concurrent_reader_helper", "--exact", "--nocapture"])
         .env(READER_ROOT_ENV, &root)
         .env(READER_STOP_ENV, &stop_path)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+        .stdout(support::stdio::captured(out_dir.path(), "reader.out"))
+        .stderr(support::stdio::captured(out_dir.path(), "reader.err"))
         .spawn()
         .expect("spawn reader child");
 
@@ -338,11 +344,9 @@ fn concurrent_writer_reader_raw_query_correctness_under_load() {
         std::fs::write(&stop_path, b"").expect("write stop sentinel");
     }
 
-    let out = reader_child
-        .wait_with_output()
-        .expect("reader child output");
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let stderr_full = String::from_utf8_lossy(&out.stderr);
+    let status = reader_child.wait().expect("reader child status");
+    let stdout = support::stdio::captured_text(out_dir.path(), "reader.out");
+    let stderr_full = support::stdio::captured_text(out_dir.path(), "reader.err");
     // The child emits a READER_AT line per phase per attempt, so its stderr
     // runs to thousands of lines. Only the tail matters: the last surviving
     // line names the attempt and the phase it died in.
@@ -352,7 +356,7 @@ fn concurrent_writer_reader_raw_query_correctness_under_load() {
     let _ = sampler.join();
     let checkpoints = checkpoints.lock().unwrap().clone();
 
-    if !out.status.success() {
+    if !status.success() {
         // Correlate: how close was the reader's last breadcrumb to a
         // checkpoint? If crashes cluster inside checkpoint windows, a shared
         // lock around `Database::new` (writer exclusive only while
@@ -375,7 +379,7 @@ fn concurrent_writer_reader_raw_query_correctness_under_load() {
              nearest checkpoint {} us away\n\
              checkpoints (t, wal_before, wal_after): {:?}\n\
              stdout:\n{stdout}\nstderr:\n{stderr}",
-            out.status,
+            status,
             checkpoints.len(),
             nearest
                 .map(|d| d.to_string())

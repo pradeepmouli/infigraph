@@ -29,6 +29,11 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
+/// `captured` / `captured_text`: a child's output in a file, for a test that
+/// polls it without draining. One file shared by every crate's tests.
+#[path = "../../../infigraph-core/tests/common/stdio.rs"]
+pub mod stdio;
+
 /// Opt this whole test process out of background watchers. The CLI's
 /// auto-watch and the MCP's own auto-start both honour `INFIGRAPH_NO_WATCH`
 /// (through `daemon::lifecycle::is_ci_env`), and the variable is inherited
