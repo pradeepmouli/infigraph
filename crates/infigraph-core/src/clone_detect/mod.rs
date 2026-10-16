@@ -9,5 +9,6 @@
 
 pub mod bodies;
 pub mod build;
+pub mod find;
 pub mod normalize;
 pub mod sketch;
