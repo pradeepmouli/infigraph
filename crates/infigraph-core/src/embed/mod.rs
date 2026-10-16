@@ -875,6 +875,9 @@ pub fn update_embeddings_with(
 ) -> Result<usize> {
     let run = crate::last_run::begin(crate::last_run::Kind::Embeddings);
     let result = update_embeddings_inner(backend, root, changed_files, make_embedder);
+    if result.is_ok() {
+        crate::clone_detect::build::record_update(backend, root, changed_files, make_embedder);
+    }
     // #209: what this update lost, or why it failed, where `doctor` can see
     // it -- these used to reach only the log of whichever process ran it.
     record_embeddings_run(root, run, &result);

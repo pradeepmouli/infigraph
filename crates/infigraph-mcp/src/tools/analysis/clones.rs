@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use serde_json::Value;
 
-use infigraph_core::embed;
+use infigraph_core::clone_detect::find::{find_clones, store_similar_edges, Options};
 
 use super::super::helpers::{open_prism, path_scope};
 
@@ -16,107 +16,48 @@ pub fn tool_detect_clones(args: &Value) -> Result<String> {
         .get("store_edges")
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
-    let kinds_str = args
+    let kinds = args
         .get("kinds")
         .and_then(|v| v.as_str())
         .unwrap_or("Function,Method");
-    let kinds: Vec<&str> = kinds_str.split(',').map(str::trim).collect();
 
     let backend = prism.backend().context("not initialized")?;
 
-    // Pairs are compared within the scope, so the quadratic pass is over the
-    // subtree's symbols only; a clone of in-scope code that lives outside it
-    // is not looked for.
-    let scope = path_scope(&prism, args).within(backend.repo_filter());
-    let syms = scope.retain(backend.symbols_with_docstring(Some(&kinds))?, |s| {
-        s.file.as_str()
-    });
-    // Pairs in one file are skipped, since method-sized look-alikes in a file
-    // are rarely copy-paste. A scope that holds a single file has no other
-    // kind of pair, so there that rule would make every run empty.
-    let single_file = syms.windows(2).all(|pair| pair[0].file == pair[1].file);
+    // Pairs are compared within the scope, so a clone of in-scope code that
+    // lives outside it is not looked for.
+    let scope = path_scope(&prism, args);
+    let options = Options::for_project(prism.root(), threshold, limit, kinds, scope.clone())?;
+    let report = find_clones(backend, prism.root(), &options)?;
 
-    if syms.len() < 2 {
-        return Ok(match scope.prefix() {
+    if report.symbols < 2 {
+        let mut out = match scope.prefix() {
             Some(prefix) => format!("Not enough symbols under {prefix} to compare."),
             None => "Not enough symbols to compare. Run index_project first.".to_string(),
-        });
-    }
-
-    let embedder = embed::best_embedder();
-    let path = args.get("path").and_then(|p| p.as_str()).unwrap_or(".");
-    let emb_path = std::path::PathBuf::from(path)
-        .join(".infigraph")
-        .join("embeddings.bin");
-
-    let cached: std::collections::HashMap<String, Vec<f32>> = if emb_path.exists() {
-        infigraph_core::embed::load_embeddings_cached(&emb_path)?
-            .into_iter()
-            .collect()
-    } else {
-        std::collections::HashMap::new()
-    };
-
-    let symbol_vecs: Vec<(String, String, String, Vec<f32>)> = syms
-        .iter()
-        .map(|s| {
-            let text = if !s.docstring.is_empty() {
-                format!("{} {}: {}", s.kind, s.name, s.docstring)
-            } else {
-                format!("{} {}", s.kind, s.name)
-            };
-            let emb = cached
-                .get(&s.id)
-                .cloned()
-                .unwrap_or_else(|| embedder.embed(&text).unwrap_or_default());
-            (s.id.clone(), s.name.clone(), s.file.clone(), emb)
-        })
-        .filter(|(_, _, _, emb)| !emb.is_empty())
-        .collect();
-
-    let n = symbol_vecs.len();
-    let mut pairs: Vec<(f32, usize, usize)> = Vec::new();
-
-    for i in 0..n {
-        for j in (i + 1)..n {
-            if !single_file && symbol_vecs[i].2 == symbol_vecs[j].2 {
-                continue;
-            }
-            let sim =
-                infigraph_core::embed::cosine_similarity(&symbol_vecs[i].3, &symbol_vecs[j].3);
-            if sim >= threshold {
-                pairs.push((sim, i, j));
-            }
+        };
+        for note in report.caveats() {
+            out.push_str(&format!("\n{note}"));
         }
+        return Ok(out);
     }
 
-    pairs.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-    pairs.truncate(limit);
-
-    if pairs.is_empty() {
+    if report.pairs.is_empty() {
         let under = scope
             .prefix()
             .map(|prefix| format!(" under {prefix}"))
             .unwrap_or_default();
-        return Ok(format!(
+        let mut out = format!(
             "No clones found above threshold {:.2} across {} symbols ({}){under}.",
-            threshold, n, kinds_str
-        ));
+            threshold, report.symbols, kinds
+        );
+        for note in report.caveats() {
+            out.push_str(&format!("\n{note}"));
+        }
+        return Ok(out);
     }
 
-    if store_edges && !pairs.is_empty() {
-        for (score, i, j) in &pairs {
-            if let Err(e) =
-                backend.upsert_similar_edge(&symbol_vecs[*i].0, &symbol_vecs[*j].0, *score)
-            {
-                crate::mcp_log(
-                    "WARN",
-                    &format!(
-                        "failed to store similarity edge {} <-> {}: {e}",
-                        symbol_vecs[*i].0, symbol_vecs[*j].0
-                    ),
-                );
-            }
+    if store_edges {
+        for warning in store_similar_edges(backend, &report.pairs) {
+            crate::mcp_log("WARN", &warning);
         }
     }
 
@@ -125,19 +66,29 @@ pub fn tool_detect_clones(args: &Value) -> Result<String> {
         out.push_str(&format!("Scope: {prefix}\n"));
     }
     out.push_str(&format!(
-        "Clone detection: {} pairs found (threshold={:.2}, symbols={}, kinds={})\n\n",
-        pairs.len(),
+        "Clone detection: {} pairs found (threshold={:.2}, symbols={}, kinds={})\n",
+        report.pairs.len(),
         threshold,
-        n,
-        kinds_str
+        report.symbols,
+        kinds
     ));
+    out.push_str(&format!("({})\n", report.how()));
+    for note in report.caveats() {
+        out.push_str(&format!("{note}\n"));
+    }
+    out.push('\n');
 
-    for (score, i, j) in &pairs {
-        let (id_a, name_a, file_a, _) = &symbol_vecs[*i];
-        let (id_b, name_b, file_b, _) = &symbol_vecs[*j];
+    for pair in &report.pairs {
         out.push_str(&format!(
-            "{:.3}  {} ({}) <-> {} ({})\n       {} vs {}\n",
-            score, name_a, id_a, name_b, id_b, file_a, file_b
+            "{:.3}  {} ({}) <-> {} ({})  [{}]\n       {} vs {}\n",
+            pair.score,
+            pair.a.name,
+            pair.a.id,
+            pair.b.name,
+            pair.b.id,
+            pair.signal.label(),
+            pair.a.file,
+            pair.b.file
         ));
     }
 

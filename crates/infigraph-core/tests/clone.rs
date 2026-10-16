@@ -14,6 +14,10 @@ fn clone_copies_graph_and_sidecars() {
     write_file(&src.path().join(".infigraph/graph/data.kz"), "graph-bytes");
     write_file(&src.path().join(".infigraph/embeddings.bin"), "emb-bytes");
     write_file(
+        &src.path().join(".infigraph/clone-bodies.bin"),
+        "body-bytes",
+    );
+    write_file(
         &src.path().join(".infigraph/docs_embeddings.bin"),
         "doc-emb-bytes",
     );
@@ -27,6 +31,10 @@ fn clone_copies_graph_and_sidecars() {
     assert_eq!(
         fs::read_to_string(dst.path().join(".infigraph/embeddings.bin")).unwrap(),
         "emb-bytes"
+    );
+    assert_eq!(
+        fs::read_to_string(dst.path().join(".infigraph/clone-bodies.bin")).unwrap(),
+        "body-bytes"
     );
     assert_eq!(
         fs::read_to_string(dst.path().join(".infigraph/docs_embeddings.bin")).unwrap(),

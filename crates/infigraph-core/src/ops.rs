@@ -178,9 +178,15 @@ const DERIVED_NAMES: &[&str] = &[
 ];
 
 /// Names that start with these are derived too: the embeddings file and the
-/// sidecars written beside it, the vector index, and the last-run records of
-/// the runs that built what is being removed.
-const DERIVED_PREFIXES: &[&str] = &["embeddings.bin", "hnsw_index.usearch", "last-run."];
+/// sidecars written beside it (the clone bodies file among them), the vector
+/// index, and the last-run records of the runs that built what is being
+/// removed.
+const DERIVED_PREFIXES: &[&str] = &[
+    "embeddings.bin",
+    crate::clone_detect::bodies::BODIES_FILE,
+    "hnsw_index.usearch",
+    "last-run.",
+];
 
 /// Sort one entry of a project's `.infigraph/`. An allow-list: only what is
 /// named in [`DERIVED_NAMES`], [`DERIVED_PREFIXES`], the lock list, the graph
@@ -274,6 +280,8 @@ mod tests {
             "bm25_cache.bin",
             "embeddings.bin",
             "embeddings.bin.generation",
+            "clone-bodies.bin",
+            "clone-bodies.bin.4242.tmp",
             "hnsw_index.usearch",
             "hnsw_index.usearch.meta",
             "write-tmp",

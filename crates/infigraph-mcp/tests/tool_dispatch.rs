@@ -400,6 +400,10 @@ fn test_graph_tools() {
     assert_eq!(none, "No dead code found under no/such/dir.");
 
     // --- detect_clones: only the scope's symbols are compared ---
+    // This project's functions are a few tokens long, under the default
+    // `[clones] min_tokens`; what is tested here is scope and threshold, so
+    // the minimum is lifted (by the settings group's environment name).
+    std::env::set_var("INFIGRAPH_CLONES_MIN_TOKENS", "1");
     // The report says how many symbols it compared, whether or not it found
     // a pair: "across N symbols" with none, "symbols=N," with some.
     let compared = |out: &str| -> usize {

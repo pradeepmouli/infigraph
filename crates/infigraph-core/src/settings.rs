@@ -118,6 +118,23 @@ impl FromTomlItem for u64 {
     }
 }
 
+impl FromTomlItem for f64 {
+    /// A TOML float, or an integer (`min_overlap = 1` is as good as `1.0`).
+    /// Not NaN or infinite: a bound compared against one never holds.
+    fn from_toml_item(item: &toml_edit::Item) -> Result<Self, String> {
+        let value = match (item.as_float(), item.as_integer()) {
+            (Some(f), _) => f,
+            (None, Some(i)) => i as f64,
+            (None, None) => return Err("expected a number".to_string()),
+        };
+        if value.is_finite() {
+            Ok(value)
+        } else {
+            Err(format!("{value} is not a finite number"))
+        }
+    }
+}
+
 impl FromTomlItem for String {
     fn from_toml_item(item: &toml_edit::Item) -> Result<Self, String> {
         item.as_str()
@@ -589,6 +606,16 @@ mod tests {
         toy_group {
             grace_secs: u64 = 300,
         }
+    }
+
+    #[test]
+    fn a_float_field_reads_floats_and_integers_and_refuses_the_rest() {
+        use super::FromTomlItem;
+        let doc: toml_edit::DocumentMut = "a = 0.25\nb = 1\nc = \"x\"\nd = nan".parse().unwrap();
+        assert_eq!(f64::from_toml_item(&doc["a"]), Ok(0.25));
+        assert_eq!(f64::from_toml_item(&doc["b"]), Ok(1.0));
+        assert!(f64::from_toml_item(&doc["c"]).is_err());
+        assert!(f64::from_toml_item(&doc["d"]).is_err());
     }
 
     #[test]

@@ -537,7 +537,7 @@ enum Commands {
         file: Option<String>,
     },
 
-    /// Detect near-duplicate functions via vector similarity
+    /// Detect near-duplicate functions by comparing their bodies
     Clones {
         /// Similarity threshold (0.0-1.0, default 0.92)
         #[arg(short, long, default_value = "0.92")]

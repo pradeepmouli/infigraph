@@ -1288,9 +1288,13 @@ pub fn check_sidecars(ctx: &DoctorContext) -> Vec<CheckResult> {
     projects
         .iter()
         .flat_map(|p| {
-            ["embeddings.bin", "docs_embeddings.bin"]
-                .into_iter()
-                .filter_map(move |name| check_one_sidecar(p, name))
+            [
+                "embeddings.bin",
+                crate::clone_detect::bodies::BODIES_FILE,
+                "docs_embeddings.bin",
+            ]
+            .into_iter()
+            .filter_map(move |name| check_one_sidecar(p, name))
         })
         .collect()
 }
@@ -2081,6 +2085,20 @@ mod sidecar_anchor_tests {
         assert!(result.message.contains("graph"), "{}", result.message);
     }
 
+    #[test]
+    fn the_clone_bodies_sidecar_is_judged_against_the_code_graph() {
+        let dir = tempfile::tempdir().unwrap();
+        let ig = dir.path().join(".infigraph");
+        std::fs::create_dir_all(&ig).unwrap();
+        touch(&ig.join("graph"), Duration::ZERO);
+        let name = crate::clone_detect::bodies::BODIES_FILE;
+        touch(&ig.join(name), Duration::from_secs(2 * HOURS));
+
+        let result = check_one_sidecar(dir.path(), name).unwrap();
+        assert_eq!(result.status, CheckStatus::Warn, "{}", result.message);
+        assert!(result.message.contains("graph"), "{}", result.message);
+    }
+
     /// Without the doc store there is nothing to compare against; the check
     /// stays silent rather than falling back to the wrong anchor.
     #[test]
@@ -2307,12 +2325,15 @@ mod degraded_check_tests {
         dir
     }
 
+    /// `embeddings.bin` and the clone bodies sidecar built beside it.
     fn embeddings(dir: &Path, older_by: std::time::Duration) {
-        let path = dir.join(".infigraph/embeddings.bin");
-        std::fs::write(&path, 10u32.to_le_bytes()).unwrap();
-        let file = std::fs::File::options().write(true).open(&path).unwrap();
-        file.set_modified(std::time::SystemTime::now() - older_by)
-            .unwrap();
+        for name in ["embeddings.bin", crate::clone_detect::bodies::BODIES_FILE] {
+            let path = dir.join(".infigraph").join(name);
+            std::fs::write(&path, 10u32.to_le_bytes()).unwrap();
+            let file = std::fs::File::options().write(true).open(&path).unwrap();
+            file.set_modified(std::time::SystemTime::now() - older_by)
+                .unwrap();
+        }
     }
 
     #[test]

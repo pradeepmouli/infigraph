@@ -7,6 +7,7 @@ pub mod check;
 pub mod child;
 pub mod claude_md;
 pub mod clone;
+pub mod clone_detect;
 pub mod cluster;
 pub mod concerns;
 pub mod config;
