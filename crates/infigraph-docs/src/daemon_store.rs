@@ -20,6 +20,7 @@ use infigraph_core::graph::remote_exec::RemoteExec;
 
 use crate::backend::DocBackend;
 use crate::chunk::Chunk;
+use crate::code_links::{CodeLinkRow, LinkKind};
 use crate::extract::ExtractedDoc;
 use crate::query::DocQuery;
 use crate::store::{ChunkDetail, DocStore, DocStoreStats, ImpactResult, PipelineCoreRecord};
@@ -92,6 +93,18 @@ impl DocBackend for DaemonDocStore {
         self.with_reader(|q| q.get_chunk_details(chunk_ids))
     }
 
+    fn code_links_for(&self, kind: LinkKind, targets: &[String]) -> Result<Vec<CodeLinkRow>> {
+        self.with_reader(|q| q.code_links_for(kind, targets))
+    }
+
+    fn code_link_rows(&self, kind: LinkKind) -> Result<Vec<CodeLinkRow>> {
+        self.with_reader(|q| q.code_link_rows(kind))
+    }
+
+    fn code_link_scans(&self) -> Result<HashMap<String, i64>> {
+        self.with_reader(|q| q.code_link_scans())
+    }
+
     fn stats(&self) -> Result<DocStoreStats> {
         self.with_reader(|q| q.stats())
     }
@@ -133,6 +146,10 @@ impl DocBackend for DaemonDocStore {
 
     fn delete_docs_by_ids(&self, _doc_ids: &[&str]) -> Result<()> {
         Err(Self::writes_not_routed("delete_docs_by_ids"))
+    }
+
+    fn replace_code_links(&self, _doc_file: &str, _rows: &[CodeLinkRow]) -> Result<()> {
+        Err(Self::writes_not_routed("replace_code_links"))
     }
 
     fn delete_pipelines_for_docs(&self, _doc_ids: &[&str]) -> Result<()> {

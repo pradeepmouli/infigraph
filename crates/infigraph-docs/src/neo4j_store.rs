@@ -9,6 +9,7 @@ use tokio::runtime::Handle;
 
 use crate::backend::DocBackend;
 use crate::chunk::Chunk;
+use crate::code_links::{CodeLinkRow, LinkKind, CODE_LINKS_VERSION};
 use crate::extract::ExtractedDoc;
 use crate::store::{ChunkDetail, DocStoreStats, ImpactResult, PipelineCoreRecord};
 
@@ -106,6 +107,39 @@ impl Neo4jDocStore {
         })
     }
 
+    /// Removes the code links and scan rows of `doc_ids`.
+    fn delete_code_links(&self, doc_ids: &[String]) -> Result<()> {
+        for batch in doc_ids.chunks(BATCH_SIZE) {
+            for cypher in [
+                "UNWIND $ids AS id MATCH (l:CodeLink {doc_file: id}) DELETE l",
+                "UNWIND $ids AS id MATCH (s:CodeLinkScan {doc_file: id}) DELETE s",
+            ] {
+                self.block_on(self.graph.run(query(cypher).param("ids", batch.to_vec())))
+                    .map_err(|e| anyhow::anyhow!("delete code links: {e}"))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn code_link_rows_of(&self, q: Query) -> Vec<CodeLinkRow> {
+        self.run_query(q)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|r| {
+                Some(CodeLinkRow {
+                    id: r.get("id").ok()?,
+                    doc_file: r.get("doc_file").ok()?,
+                    kind: LinkKind::parse(&r.get::<String>("kind").ok()?)?,
+                    target: r.get("target").ok()?,
+                    heading: r.get("heading").ok()?,
+                    line_start: r.get::<i64>("start").ok()? as usize,
+                    line_end: r.get::<i64>("end").ok()? as usize,
+                    text: r.get("text").ok()?,
+                })
+            })
+            .collect()
+    }
+
     fn count_query(&self, cypher: &str, key: &str) -> Result<usize> {
         let rows = self.run_query(query(cypher))?;
         if let Some(row) = rows.first() {
@@ -144,8 +178,9 @@ impl DocBackend for Neo4jDocStore {
             let _ = self.block_on(self.graph.run(q));
 
             let q = query("UNWIND $files AS f MATCH (d:Document {file: f}) DETACH DELETE d")
-                .param("files", file_list);
+                .param("files", file_list.clone());
             let _ = self.block_on(self.graph.run(q));
+            self.delete_code_links(&file_list)?;
         }
 
         // Insert documents one at a time (neo4rs doesn't support serde_json in UNWIND maps)
@@ -217,10 +252,76 @@ impl DocBackend for Neo4jDocStore {
             let _ = self.block_on(self.graph.run(q));
 
             let q = query("UNWIND $ids AS id MATCH (d:Document {id: id}) DETACH DELETE d")
-                .param("ids", id_list);
+                .param("ids", id_list.clone());
             let _ = self.block_on(self.graph.run(q));
+            self.delete_code_links(&id_list)?;
         }
         Ok(())
+    }
+
+    fn replace_code_links(&self, doc_file: &str, rows: &[CodeLinkRow]) -> Result<()> {
+        self.delete_code_links(&[doc_file.to_string()])?;
+        for r in rows {
+            let q = query(
+                "CREATE (:CodeLink { id: $id, doc_file: $doc_file, kind: $kind, \
+                 target: $target, heading: $heading, line_start: $start, \
+                 line_end: $end, text: $text })",
+            )
+            .param("id", r.id.clone())
+            .param("doc_file", r.doc_file.clone())
+            .param("kind", r.kind.as_str().to_string())
+            .param("target", r.target.clone())
+            .param("heading", r.heading.clone())
+            .param("start", r.line_start as i64)
+            .param("end", r.line_end as i64)
+            .param("text", r.text.clone());
+            self.block_on(self.graph.run(q))
+                .map_err(|e| anyhow::anyhow!("create CodeLink: {e}"))?;
+        }
+        let q = query("CREATE (:CodeLinkScan {doc_file: $doc_file, version: $version})")
+            .param("doc_file", doc_file.to_string())
+            .param("version", CODE_LINKS_VERSION);
+        self.block_on(self.graph.run(q))
+            .map_err(|e| anyhow::anyhow!("record code link scan: {e}"))?;
+        Ok(())
+    }
+
+    fn code_links_for(&self, kind: LinkKind, targets: &[String]) -> Result<Vec<CodeLinkRow>> {
+        let q = query(
+            "MATCH (l:CodeLink) WHERE l.kind = $kind AND l.target IN $targets \
+             RETURN l.id AS id, l.doc_file AS doc_file, l.kind AS kind, l.target AS target, \
+             l.heading AS heading, l.line_start AS start, l.line_end AS end, l.text AS text \
+             ORDER BY l.doc_file, l.line_start",
+        )
+        .param("kind", kind.as_str().to_string())
+        .param("targets", targets.to_vec());
+        Ok(self.code_link_rows_of(q))
+    }
+
+    fn code_link_rows(&self, kind: LinkKind) -> Result<Vec<CodeLinkRow>> {
+        let q = query(
+            "MATCH (l:CodeLink) WHERE l.kind = $kind \
+             RETURN l.id AS id, l.doc_file AS doc_file, l.kind AS kind, l.target AS target, \
+             l.heading AS heading, l.line_start AS start, l.line_end AS end, l.text AS text \
+             ORDER BY l.doc_file, l.line_start",
+        )
+        .param("kind", kind.as_str().to_string());
+        Ok(self.code_link_rows_of(q))
+    }
+
+    fn code_link_scans(&self) -> Result<HashMap<String, i64>> {
+        let rows = self.run_query(query(
+            "MATCH (s:CodeLinkScan) RETURN s.doc_file AS doc_file, s.version AS version",
+        ))?;
+        Ok(rows
+            .iter()
+            .filter_map(|r| {
+                Some((
+                    r.get::<String>("doc_file").ok()?,
+                    r.get::<i64>("version").ok()?,
+                ))
+            })
+            .collect())
     }
 
     fn ensure_document_node(&self, doc_id: &str) -> Result<()> {

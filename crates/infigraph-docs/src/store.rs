@@ -28,6 +28,7 @@ use parquet::file::properties::WriterProperties;
 
 use crate::backend::DocBackend;
 use crate::chunk::Chunk;
+use crate::code_links::{CodeLinkRow, LinkKind};
 use crate::extract::ExtractedDoc;
 // The one Cypher escaper, shared with infigraph-core: this crate used to
 // carry a quote-only copy, which silently dropped backslashes.
@@ -226,7 +227,10 @@ impl DocStore {
 
     fn init_schema(&self) -> Result<()> {
         let conn = self.connection()?;
-        for ddl in CREATE_SCHEMA {
+        for ddl in CREATE_SCHEMA
+            .iter()
+            .chain(crate::code_link_store::CODE_LINK_DDL.iter())
+        {
             conn.query(ddl)
                 .map_err(|e| anyhow::anyhow!("schema DDL failed: {e}"))?;
         }
@@ -260,6 +264,10 @@ impl DocStore {
                 "MATCH (d:Document) WHERE d.file IN [{}] DETACH DELETE d",
                 files_in
             ));
+            // A re-indexed document's links are replaced, not kept: the caller
+            // records the new ones after this write.
+            let changed: Vec<&str> = docs.iter().map(|d| d.file.as_str()).collect();
+            crate::code_link_store::delete_rows(&conn, &changed)?;
         }
 
         let tmp_dir = tempfile::tempdir().context("create temp dir")?;
@@ -452,6 +460,7 @@ impl DocStore {
             id_list
         ))
         .map_err(|e| anyhow::anyhow!("delete stale chunks: {e}"))?;
+        crate::code_link_store::delete_rows(&conn, doc_ids)?;
         conn.query(&format!(
             "MATCH (d:Document) WHERE d.id IN [{}] DETACH DELETE d",
             id_list
@@ -840,6 +849,25 @@ impl DocBackend for DocStore {
 
     fn delete_docs_by_ids(&self, doc_ids: &[&str]) -> Result<()> {
         self.delete_docs_by_ids(doc_ids)
+    }
+
+    fn replace_code_links(&self, doc_file: &str, rows: &[CodeLinkRow]) -> Result<()> {
+        self.replace_code_links(doc_file, rows)
+    }
+
+    fn code_links_for(&self, kind: LinkKind, targets: &[String]) -> Result<Vec<CodeLinkRow>> {
+        let conn = self.connection()?;
+        crate::query::DocQuery::new(&conn).code_links_for(kind, targets)
+    }
+
+    fn code_link_rows(&self, kind: LinkKind) -> Result<Vec<CodeLinkRow>> {
+        let conn = self.connection()?;
+        crate::query::DocQuery::new(&conn).code_link_rows(kind)
+    }
+
+    fn code_link_scans(&self) -> Result<HashMap<String, i64>> {
+        let conn = self.connection()?;
+        crate::query::DocQuery::new(&conn).code_link_scans()
     }
 
     fn delete_pipelines_for_docs(&self, doc_ids: &[&str]) -> Result<()> {

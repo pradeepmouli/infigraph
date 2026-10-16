@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use anyhow::Result;
 
 use crate::chunk::Chunk;
+use crate::code_links::{CodeLinkRow, LinkKind};
 use crate::extract::ExtractedDoc;
 use crate::store::{ChunkDetail, DocStoreStats, ImpactResult, PipelineCoreRecord};
 
@@ -54,6 +55,22 @@ pub trait DocBackend {
     fn get_chunk_ids(&self) -> Result<std::collections::HashSet<String>>;
 
     fn get_chunk_details(&self, chunk_ids: &[&str]) -> Result<Vec<ChunkDetail>>;
+
+    // ── Code links ───────────────────────────────────────────────────────
+
+    /// Replaces a document's code links and records that it was scanned
+    /// under the current `CODE_LINKS_VERSION` (written last).
+    fn replace_code_links(&self, doc_file: &str, rows: &[CodeLinkRow]) -> Result<()>;
+
+    /// The links of `kind` whose target is one of `targets`, in document
+    /// order.
+    fn code_links_for(&self, kind: LinkKind, targets: &[String]) -> Result<Vec<CodeLinkRow>>;
+
+    /// Every link of `kind`.
+    fn code_link_rows(&self, kind: LinkKind) -> Result<Vec<CodeLinkRow>>;
+
+    /// Document id -> the `CODE_LINKS_VERSION` it was last scanned under.
+    fn code_link_scans(&self) -> Result<HashMap<String, i64>>;
 
     // ── Stats ────────────────────────────────────────────────────────────
 

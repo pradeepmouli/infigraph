@@ -1,5 +1,7 @@
 pub mod backend;
 pub mod chunk;
+mod code_link_store;
+pub mod code_links;
 pub mod combined;
 pub mod daemon_source;
 pub mod daemon_store;
@@ -417,6 +419,15 @@ impl DocIndex {
             }
         }
 
+        // Code links: the documents written this run get theirs replaced, and
+        // a stored document that no build has scanned yet (a store from before
+        // code links existed) is scanned even though its content is unchanged.
+        let written: HashSet<&str> = results.iter().map(|(d, _)| d.file.as_str()).collect();
+        for (doc, _) in &results {
+            code_links::record(store, doc);
+        }
+        self.scan_unscanned_docs(store, &written);
+
         // BFS: follow links to docs outside the doc root but within the repo
         let bfs_discovered = if let Some(repo_root) = find_repo_root(&self.root) {
             let n =
@@ -450,6 +461,28 @@ impl DocIndex {
             changed_files: result_changed,
             pipeline_warnings,
         })
+    }
+
+    /// Scans each stored local document (but those in `written`, which the
+    /// caller has just recorded) that was never scanned under the current
+    /// [`code_links::CODE_LINKS_VERSION`]. A failed listing scans nothing: the
+    /// documents stay unscanned and the next run tries again.
+    fn scan_unscanned_docs(&self, store: &dyn DocBackend, written: &HashSet<&str>) {
+        let (Ok(stored), Ok(scans)) = (store.get_doc_hashes(), store.code_link_scans()) else {
+            return;
+        };
+        let ns = self.namespace.as_deref();
+        for id in stored.keys() {
+            let scanned = scans.get(id).copied().unwrap_or(0) >= code_links::CODE_LINKS_VERSION;
+            if scanned || written.contains(id.as_str()) || !is_local_document_id(id) {
+                continue;
+            }
+            let relative = match ns {
+                Some(prefix) => id.strip_prefix(&format!("{prefix}/")).unwrap_or(id),
+                None => id,
+            };
+            code_links::record_stored(store, &self.root.join(relative), id);
+        }
     }
 
     /// Removes the documents of files that no longer exist on disk (and their
@@ -685,6 +718,7 @@ impl DocIndex {
                         pipelines
                             .get_or_insert_with(|| self.pipeline_run())
                             .apply(store, &docs_ref);
+                        code_links::record(store, &doc);
                         indexed_docs.insert(rel_id.clone());
                         changed_files.push(rel_id);
                         new_chunks.extend(chunks);
