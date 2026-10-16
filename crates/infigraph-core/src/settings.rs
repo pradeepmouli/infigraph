@@ -473,6 +473,17 @@ macro_rules! settings {
                         if let Some(value) = Self::[<env_ $field>]()? {
                             return Ok(Some(value));
                         }
+                        Self::[<layers_ $field>](layers)
+                    }
+
+                    /// The config files alone, nearest layer first: no CLI,
+                    /// no environment. For a caller that combines the
+                    /// environment with the files itself rather than
+                    /// letting it shadow them.
+                    #[allow(dead_code)]
+                    pub fn [<layers_ $field>](
+                        layers: &[&$crate::toml_edit::Item],
+                    ) -> Result<Option<$ty>, $crate::settings::SettingError> {
                         for doc in layers {
                             if let Some(item) = doc
                                 .get(stringify!($category))

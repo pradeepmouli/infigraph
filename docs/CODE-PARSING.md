@@ -259,9 +259,12 @@ scan.
 
 Project and user layers **union**, like `include`. The environment
 (`INFIGRAPH_IGNORE_CODE`, `INFIGRAPH_IGNORE_DOCS`, comma-separated, so a
-pattern containing a comma can be written in TOML only) **replaces both**
-files, which makes the walk *more* permissive than the files alone: it
-silences the project's and your own lists. There is no trust difference
+pattern containing a comma can be written in TOML only) **adds** to both
+files' lists and never replaces them: an ignore only removes files, so a
+stray variable must not be able to re-admit what the project excluded.
+The only way to relax an ignore is to edit the config file. (This is the
+opposite of `INFIGRAPH_INDEX_INCLUDE`, which replaces the `include` list:
+there a replaced list re-admits fewer files.) There is no trust difference
 between layers, because a pattern can only remove files, never reach
 outside the project.
 
