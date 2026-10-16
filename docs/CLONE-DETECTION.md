@@ -33,6 +33,10 @@ Every pair says which signal scored it:
 | `token-fallback` | MinHash Jaccard of the token shingles | a body has no embedding (no model, or it failed) |
 | `signature` | cosine of the signature-text vectors in `embeddings.bin` | a function has no body data yet (not indexed since the upgrade, the file changed since it was indexed) |
 
+`token-fallback` is scored by Jaccard against the same threshold as a cosine,
+and Jaccard of shingles falls faster than a cosine as two bodies diverge, so
+it is the stricter signal: a missing embedding costs recall, not precision.
+
 `signature` is the signal this feature replaced: it compares `kind name:
 docstring`, so two functions with one name and docstring match whatever their
 bodies hold, and a copy under a new name does not. It survives only as a

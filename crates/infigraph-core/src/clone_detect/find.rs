@@ -377,15 +377,15 @@ pub fn compare(candidates: Vec<Candidate>, options: &Options) -> Report {
 
     let mut skipped_families = 0;
     let mut not_compared = 0;
-    let pair_indexes: Vec<(usize, usize)> = match mode {
+    // Exact mode walks every pair lazily: at `exact_below` symbols that is
+    // ~50M pairs, which must never exist as a list. Only Lsh holds its pairs.
+    let pair_indexes: Box<dyn Iterator<Item = (usize, usize)>> = match mode {
         Mode::Exact => {
             not_compared = candidates
                 .iter()
                 .filter(|c| c.body.is_none() && c.signature_vector.is_none())
                 .count();
-            (0..symbols)
-                .flat_map(|i| ((i + 1)..symbols).map(move |j| (i, j)))
-                .collect()
+            Box::new((0..symbols).flat_map(move |i| ((i + 1)..symbols).map(move |j| (i, j))))
         }
         Mode::Lsh => {
             let mut pairs: HashSet<(usize, usize)> = HashSet::new();
@@ -426,7 +426,7 @@ pub fn compare(candidates: Vec<Candidate>, options: &Options) -> Report {
             }
             let mut sorted: Vec<_> = pairs.into_iter().collect();
             sorted.sort_unstable();
-            sorted
+            Box::new(sorted.into_iter())
         }
     };
 
