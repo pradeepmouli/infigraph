@@ -66,7 +66,7 @@ pub(crate) fn scan_file(
 
         for rule in RULES {
             if let Some(exts) = rule.extensions {
-                if !exts.contains(&ext_lower.as_str()) {
+                if !crate::lang::extension_selected(exts, &ext_lower) {
                     continue;
                 }
             }

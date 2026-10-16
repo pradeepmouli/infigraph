@@ -89,6 +89,14 @@ static REFLECTION_PATTERNS: &[ReflectionPattern] = &[
     },
 ];
 
+/// The patterns that apply to a file with extension `ext` (no dot); a pattern
+/// that names `ts` or `js` applies to the module-system variants too.
+fn patterns_for_extension(ext: &str) -> impl Iterator<Item = &'static ReflectionPattern> + '_ {
+    REFLECTION_PATTERNS
+        .iter()
+        .filter(move |rp| crate::lang::extension_selected(rp.extensions, ext))
+}
+
 pub fn detect_reflection_sites(
     backend: &dyn GraphBackend,
     root: &Path,
@@ -111,10 +119,7 @@ pub fn detect_reflection_sites(
 
         let ext = file.rsplit('.').next().unwrap_or("");
 
-        for rp in REFLECTION_PATTERNS {
-            if !rp.extensions.contains(&ext) {
-                continue;
-            }
+        for rp in patterns_for_extension(ext) {
             for &pattern in rp.patterns {
                 if let Some(pos) = docstring.find(pattern) {
                     let raw_arg = extract_string_arg(&docstring[pos + pattern.len()..]);
@@ -662,5 +667,16 @@ mod tests {
             "myapp.handlers.EmailHandler"
         );
         assert_eq!(values.get("DEBUG").unwrap(), "True");
+    }
+
+    #[test]
+    fn dynamic_require_and_import_apply_to_the_module_system_variants() {
+        for ext in ["ts", "mts", "cts", "tsx", "js", "jsx", "mjs", "cjs"] {
+            let mechanisms: Vec<&str> =
+                patterns_for_extension(ext).map(|rp| rp.mechanism).collect();
+            assert_eq!(mechanisms, ["DynamicRequire", "DynamicImport"], "{ext}");
+        }
+        assert_eq!(patterns_for_extension("py").count(), 2, "py keeps its own");
+        assert!(patterns_for_extension("md").next().is_none());
     }
 }

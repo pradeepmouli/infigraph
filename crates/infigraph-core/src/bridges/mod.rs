@@ -386,7 +386,7 @@ fn scan_file(root: &Path, path: &Path, result: &mut BridgeScanResult) {
     // Only scan rules whose extensions match
     let applicable: Vec<&BridgeRule> = BRIDGE_RULES
         .iter()
-        .filter(|r| r.extensions.is_empty() || r.extensions.contains(&ext))
+        .filter(|r| r.extensions.is_empty() || crate::lang::extension_selected(r.extensions, ext))
         .collect();
 
     if applicable.is_empty() {
