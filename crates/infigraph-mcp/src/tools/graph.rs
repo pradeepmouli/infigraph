@@ -594,7 +594,13 @@ pub fn tool_get_doc_context(args: &Value) -> Result<String> {
 
     // The documents that describe this symbol come first: the rationale is
     // what an agent about to edit it needs before the code.
-    let linked = infigraph_docs::linked::lookup(prism.root(), backend, symbol_id, &detail.file);
+    let linked = infigraph_docs::linked::lookup(
+        prism.root(),
+        backend,
+        symbol_id,
+        &detail.file,
+        (detail.start_line as usize, detail.end_line as usize),
+    );
     out.push_str(&linked.render_entries());
 
     let file_path = if std::path::Path::new(&detail.file).is_absolute() {

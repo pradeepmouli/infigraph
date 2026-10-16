@@ -26,6 +26,7 @@ pub const REINDEX_WAITING_FOR_SLOT: &str = "reindex-waiting-for-slot";
 pub const CLONE_BODIES_UNAVAILABLE: &str = "clone-bodies-unavailable";
 pub const CLONE_BODIES_PARTIAL: &str = "clone-bodies-partial";
 pub const DOC_LINKS_UNSCANNED: &str = "doc-links-unscanned";
+pub const DOC_SYNC_UNKNOWN: &str = "doc-sync-unknown";
 
 /// One way infigraph is running degraded.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,6 +79,9 @@ pub enum DegradedMode {
     /// store from before they existed), so a symbol's glossary entry and the
     /// mentions of it may be missing from its doc context.
     DocLinksUnscanned { unscanned: usize, total: usize },
+    /// Git could not say when a documented symbol and its entry last
+    /// changed, so no entry can be called stale or current.
+    DocSyncUnknown { reason: String },
 }
 
 impl DegradedMode {
@@ -102,6 +106,7 @@ impl DegradedMode {
             DegradedMode::CloneBodiesUnavailable => CLONE_BODIES_UNAVAILABLE,
             DegradedMode::CloneBodiesPartial { .. } => CLONE_BODIES_PARTIAL,
             DegradedMode::DocLinksUnscanned { .. } => DOC_LINKS_UNSCANNED,
+            DegradedMode::DocSyncUnknown { .. } => DOC_SYNC_UNKNOWN,
         }
     }
 
@@ -178,6 +183,10 @@ impl DegradedMode {
                 "{unscanned} of {total} documents have not been scanned for code links: a \
                  symbol's glossary entry and mentions may be missing from its doc context"
             ),
+            DegradedMode::DocSyncUnknown { reason } => format!(
+                "git cannot say when documented code and its entry last changed ({reason}): \
+                 no entry is judged stale or current"
+            ),
         }
     }
 
@@ -215,6 +224,10 @@ impl DegradedMode {
             }
             DegradedMode::DocEmbeddingsMissing => "run `infigraph index-docs` to rebuild them",
             DegradedMode::DocLinksUnscanned { .. } => "run `infigraph index-docs`",
+            DegradedMode::DocSyncUnknown { .. } => {
+                "documents are compared with code through git history: use a git checkout where \
+                 `git blame` works on the documented files"
+            }
         }
     }
 
@@ -816,6 +829,9 @@ mod tests {
             DegradedMode::DocLinksUnscanned {
                 unscanned: 3,
                 total: 10,
+            },
+            DegradedMode::DocSyncUnknown {
+                reason: "not a git repository".to_string(),
             },
         ];
         let keys: std::collections::HashSet<_> = modes.iter().map(|m| m.key()).collect();

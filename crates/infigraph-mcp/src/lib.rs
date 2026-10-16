@@ -449,7 +449,7 @@ pub fn build_tools_list() -> Vec<Value> {
             p(true,false,false,json!({})), &["path"]),
         tool_def("list_languages", "List all 60+ supported programming languages and their file extensions.",
             json!({}), &[]),
-        tool_def("doctor", "Health checks for the infigraph installation: registry consistency, lock status, watcher liveness, disk space, sidecar freshness, toolchain validity. Defaults to the current project; set scope='global' to sweep every registered project.",
+        tool_def("doctor", "Health checks for the infigraph installation: registry consistency, lock status, watcher liveness, disk space, sidecar freshness, toolchain validity, and for a project that indexes documents, whether every glossary key resolves to a live symbol (the git-based check of which entries describe code that changed after them is `infigraph doctor --docs-sync` on the command line only). Defaults to the current project; set scope='global' to sweep every registered project.",
             p(true,false,false,json!({"scope":{"type":"string","enum":["project","global"],"default":"project","description":"'project' checks only the current project (default); 'global' sweeps every registered project"}})), &[]),
         tool_def("get_graph_schema", "Show graph schema: node types, edge types, counts, and property names.",
             p(true,false,false,json!({})), &["path"]),

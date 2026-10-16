@@ -22,6 +22,7 @@ pub mod embed;
 pub mod export;
 pub mod extract;
 pub mod gc;
+pub mod git_blame;
 pub mod graph;
 pub mod ignore_rules;
 pub mod instances;

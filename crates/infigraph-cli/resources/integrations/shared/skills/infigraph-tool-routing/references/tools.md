@@ -559,7 +559,7 @@ Ingest structured data (YAML/JSON) into the graph using plug-n-play TOML schemas
 
 ### `doctor`
 
-Health checks for the infigraph installation: registry consistency, lock status, watcher liveness, disk space, sidecar freshness, toolchain validity. Defaults to the current project; set scope='global' to sweep every registered project.
+Health checks for the infigraph installation: registry consistency, lock status, watcher liveness, disk space, sidecar freshness, toolchain validity, and for a project that indexes documents, whether every glossary key resolves to a live symbol (the git-based check of which entries describe code that changed after them is `infigraph doctor --docs-sync` on the command line only). Defaults to the current project; set scope='global' to sweep every registered project.
 
 | Parameter | Type | Required | Default | Description |
 |---|---|---|---|---|

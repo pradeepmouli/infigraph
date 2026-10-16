@@ -15,9 +15,10 @@
 
 use std::path::Path;
 
-use infigraph_core::degraded::{live, DegradedMode, DOC_LINKS_UNSCANNED};
+use infigraph_core::degraded::{live, DegradedMode, DOC_LINKS_UNSCANNED, DOC_SYNC_UNKNOWN};
 use infigraph_core::docs_switch::DocsNotIndexed;
 use infigraph_core::escape_str;
+use infigraph_core::git_blame::{self, BlameError, GIT_TIMEOUT};
 use infigraph_core::graph::GraphBackend;
 
 use crate::code_links::{is_file_form, CodeLinkRow, LinkKind, CODE_LINKS_VERSION};
@@ -42,6 +43,9 @@ pub struct LinkedEntry {
     /// The entry without its key heading, cut to [`ENTRY_CAP_CHARS`].
     pub text: String,
     pub truncated: bool,
+    /// "possibly stale: code changed ..., entry last touched ...", when the
+    /// symbol changed after the entry did. Set for a symbol's own entry.
+    pub stale: Option<String>,
 }
 
 impl LinkedEntry {
@@ -67,6 +71,7 @@ impl LinkedEntry {
             line_end: row.line_end,
             text,
             truncated,
+            stale: None,
         }
     }
 }
@@ -93,6 +98,9 @@ pub struct LinkedDocs {
     pub unscanned: Option<(usize, usize)>,
     /// Why the document store could not be read, when it could not.
     pub unavailable: Option<String>,
+    /// Why git could not judge whether the entry is current, when it could
+    /// not.
+    pub sync_unknown: Option<String>,
 }
 
 /// The strings a document could have used to name `symbol_id` in a code span.
@@ -158,7 +166,16 @@ fn ids_named_by(backend: &dyn GraphBackend, target: &str) -> Vec<String> {
 
 /// Everything the document store links to `symbol_id` (a symbol of `file`),
 /// read against `backend`.
-pub fn lookup(root: &Path, backend: &dyn GraphBackend, symbol_id: &str, file: &str) -> LinkedDocs {
+///
+/// `lines` is the symbol's first and last line in `file`: the code half of
+/// the staleness question, which git answers for just those lines.
+pub fn lookup(
+    root: &Path,
+    backend: &dyn GraphBackend,
+    symbol_id: &str,
+    file: &str,
+    lines: (usize, usize),
+) -> LinkedDocs {
     let index = match DocIndex::open_existing(root) {
         Ok(index) => index,
         Err(e) if e.is::<DocsNotIndexed>() => return LinkedDocs::default(),
@@ -228,6 +245,8 @@ pub fn lookup(root: &Path, backend: &dyn GraphBackend, symbol_id: &str, file: &s
         found.mentions = mentions;
     }
 
+    judge_entries(root, file, lines, &mut found);
+
     found.unscanned = unscanned_documents(store);
     match found.unscanned {
         Some((unscanned, total)) => {
@@ -236,6 +255,46 @@ pub fn lookup(root: &Path, backend: &dyn GraphBackend, symbol_id: &str, file: &s
         None => live::clear(root, DOC_LINKS_UNSCANNED),
     }
     found
+}
+
+/// Marks each of the symbol's entries stale when the symbol's lines changed
+/// after the entry's did. Git is asked for those two ranges only. A failure
+/// is the degraded mode `doc-sync-unknown` for this call: no entry is called
+/// current or stale, and nothing waits longer than the git timeout.
+fn judge_entries(root: &Path, file: &str, lines: (usize, usize), found: &mut LinkedDocs) {
+    if found.entries.is_empty() {
+        return;
+    }
+    let judge = |entry: &LinkedEntry| -> Result<Option<String>, BlameError> {
+        let code = git_blame::blame_ranges_cached(root, file, &[lines], GIT_TIMEOUT)?;
+        let doc = git_blame::blame_ranges_cached(
+            root,
+            &entry.doc_file,
+            &[(entry.line_start, entry.line_end)],
+            GIT_TIMEOUT,
+        )?;
+        Ok(git_blame::compare(&code[0], &doc[0]).label())
+    };
+    let mut failure = None;
+    for entry in &mut found.entries {
+        match judge(entry) {
+            Ok(label) => entry.stale = label,
+            Err(e) => {
+                failure = Some(e.to_string());
+                break;
+            }
+        }
+    }
+    match &failure {
+        Some(reason) => live::set(
+            root,
+            DegradedMode::DocSyncUnknown {
+                reason: reason.clone(),
+            },
+        ),
+        None => live::clear(root, DOC_SYNC_UNKNOWN),
+    }
+    found.sync_unknown = failure;
 }
 
 /// `(unscanned, total)` over the stored local documents, when any was not
@@ -268,8 +327,12 @@ impl LinkedDocs {
             ("File-level notes", &self.file_notes),
         ] {
             for e in entries {
+                let stale = e
+                    .stale
+                    .as_ref()
+                    .map_or(String::new(), |s| format!(" -- {s}"));
                 out.push_str(&format!(
-                    "\n{title} ({}):\n{}\n",
+                    "\n{title} ({}){stale}:\n{}\n",
                     where_is(&e.doc_file, e.line_start, e.line_end),
                     e.text
                 ));
@@ -310,6 +373,11 @@ impl LinkedDocs {
             out.push_str(&format!(
                 "\nDoc links: {unscanned} of {total} documents are not scanned yet; this may be \
                  incomplete (run `infigraph index-docs`)\n"
+            ));
+        }
+        if let Some(reason) = &self.sync_unknown {
+            out.push_str(&format!(
+                "\nDoc/code sync not judged: {reason} (entries are shown without a staleness label)\n"
             ));
         }
         if let Some(reason) = &self.unavailable {

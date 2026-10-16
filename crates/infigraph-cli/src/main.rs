@@ -142,6 +142,11 @@ enum Commands {
         /// otherwise collapse to one line)
         #[arg(long, short)]
         verbose: bool,
+        /// Also judge, from git history, which glossary entries describe code
+        /// that changed after they did. Slow (a blame per file; 120s, then the
+        /// rest is judged per file and said to under-report), so it is opt-in
+        #[arg(long)]
+        docs_sync: bool,
     },
 
     /// Evict registry entries for projects that no longer exist (R7.1).
@@ -1133,7 +1138,11 @@ fn run(command: Commands, root: &Path) -> Result<()> {
         }
         Commands::Stats => cmd_stats(root),
         Commands::Restore { id, yes } => cmd_restore(root, id.as_deref(), yes),
-        Commands::Doctor { global, verbose } => cmd_doctor(root, global, verbose),
+        Commands::Doctor {
+            global,
+            verbose,
+            docs_sync,
+        } => cmd_doctor(root, global, verbose, docs_sync),
         Commands::Gc {
             dry_run,
             stale_days,
