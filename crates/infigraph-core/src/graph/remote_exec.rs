@@ -44,6 +44,15 @@ impl RemoteExec {
         }
     }
 
+    /// Read the document store for `root` through its daemon without leasing
+    /// it: the observer's view of documents (see [`RemoteExec::observer`]).
+    pub fn docs_observer(root: &Path) -> Self {
+        Self {
+            leases: false,
+            ..Self::for_docs(root)
+        }
+    }
+
     /// Read the document store for `root` through its daemon. `search` with
     /// `scope='all'` touches both stores in one call.
     pub fn for_docs(root: &Path) -> Self {

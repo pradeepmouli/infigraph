@@ -15,6 +15,7 @@ use anyhow::Result;
 use infigraph_core::escape_str;
 use infigraph_core::graph::query_exec::QueryExec;
 
+use crate::code_links::{CodeLinkRow, LinkKind};
 use crate::store::{
     parse_string_list, ChunkDetail, DocStoreStats, ImpactResult, PipelineCoreRecord,
 };
@@ -68,6 +69,71 @@ impl<E: QueryExec> DocQuery<E> {
             }
         }
         Ok(hashes)
+    }
+
+    /// The links of `kind` whose target is one of `targets`, in document
+    /// order. The reader resolves a target against the graph itself: nothing
+    /// here knows a symbol.
+    pub fn code_links_for(&self, kind: LinkKind, targets: &[String]) -> Result<Vec<CodeLinkRow>> {
+        if targets.is_empty() {
+            return Ok(Vec::new());
+        }
+        let list = targets
+            .iter()
+            .map(|t| format!("'{}'", escape_str(t)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        self.code_link_query(&format!(
+            "MATCH (l:CodeLink) WHERE l.kind = '{}' AND l.target IN [{list}] ",
+            kind.as_str()
+        ))
+    }
+
+    /// Every link of `kind`.
+    pub fn code_link_rows(&self, kind: LinkKind) -> Result<Vec<CodeLinkRow>> {
+        self.code_link_query(&format!(
+            "MATCH (l:CodeLink) WHERE l.kind = '{}' ",
+            kind.as_str()
+        ))
+    }
+
+    fn code_link_query(&self, matching: &str) -> Result<Vec<CodeLinkRow>> {
+        let rows = self
+            .exec
+            .query_rows(&format!(
+                "{matching}RETURN l.id, l.doc_file, l.kind, l.target, l.heading, \
+                 l.line_start, l.line_end, l.text ORDER BY l.doc_file, l.line_start"
+            ))
+            .map_err(|e| anyhow::anyhow!("query code links: {e}"))?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|r| {
+                let [id, doc_file, kind, target, heading, start, end, text]: [String; 8] =
+                    r.try_into().ok()?;
+                Some(CodeLinkRow {
+                    id,
+                    doc_file,
+                    kind: LinkKind::parse(&kind)?,
+                    target,
+                    heading,
+                    line_start: start.parse().ok()?,
+                    line_end: end.parse().ok()?,
+                    text,
+                })
+            })
+            .collect())
+    }
+
+    /// Document id -> the `CODE_LINKS_VERSION` it was last scanned under.
+    pub fn code_link_scans(&self) -> Result<HashMap<String, i64>> {
+        let rows = self
+            .exec
+            .query_rows("MATCH (s:CodeLinkScan) RETURN s.doc_file, s.version")
+            .map_err(|e| anyhow::anyhow!("query code link scans: {e}"))?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|r| Some((r.first()?.clone(), r.get(1)?.parse().ok()?)))
+            .collect())
     }
 
     pub fn get_docs_by_source(&self, source_id: &str) -> Result<Vec<String>> {

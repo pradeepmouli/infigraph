@@ -100,7 +100,7 @@ PRIMARY: Complete context for a symbol in one call — callers, callees, parent 
 
 ### `get_doc_context`
 
-PRIMARY: Full documentation context for a symbol — signature, docstring, source, callers, callees, file. One call replaces get_code_snippet + trace_callers + trace_callees. Use BEFORE modifying any function. Default returns compact summary (no source); set detail=true for full source. symbol_id is discovered in two steps: run `search`/`search_symbols` first, then pass the exact id from the results (format 'file/path::name', e.g. 'app/auth.py::login').
+PRIMARY: Full documentation context for a symbol — signature, docstring, source, callers, callees, file, and when the project indexes documents, the rationale written for it: its glossary entry (an indexed Markdown section whose heading is the symbol id in backticks, e.g. ### `app/auth.py::login`), its file's notes (the `<file>::module` entry) and the documents that mention it by qualified name. One call replaces get_code_snippet + trace_callers + trace_callees. Use BEFORE modifying any function. Default returns compact summary (no source); set detail=true for full source. symbol_id is discovered in two steps: run `search`/`search_symbols` first, then pass the exact id from the results (format 'file/path::name', e.g. 'app/auth.py::login').
 
 | Parameter | Type | Required | Default | Description |
 |---|---|---|---|---|
@@ -559,7 +559,7 @@ Ingest structured data (YAML/JSON) into the graph using plug-n-play TOML schemas
 
 ### `doctor`
 
-Health checks for the infigraph installation: registry consistency, lock status, watcher liveness, disk space, sidecar freshness, toolchain validity. Defaults to the current project; set scope='global' to sweep every registered project.
+Health checks for the infigraph installation: registry consistency, lock status, watcher liveness, disk space, sidecar freshness, toolchain validity, and for a project that indexes documents, whether every glossary key resolves to a live symbol (the git-based check of which entries describe code that changed after them is `infigraph doctor --docs-sync` on the command line only). Defaults to the current project; set scope='global' to sweep every registered project.
 
 | Parameter | Type | Required | Default | Description |
 |---|---|---|---|---|

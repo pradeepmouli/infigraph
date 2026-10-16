@@ -1536,9 +1536,9 @@ fn doctor_report_style(verbose: bool) -> infigraph_core::doctor::ReportStyle {
     }
 }
 
-pub(crate) fn cmd_doctor(root: &Path, global: bool, verbose: bool) -> Result<()> {
+pub(crate) fn cmd_doctor(root: &Path, global: bool, verbose: bool, docs_sync: bool) -> Result<()> {
     use infigraph_core::doctor::{
-        assemble_context, format_report, run_doctor, CheckStatus, DoctorScope,
+        assemble_context, format_report, projects_in_scope, run_doctor, CheckStatus, DoctorScope,
     };
 
     let scope = if global {
@@ -1548,7 +1548,16 @@ pub(crate) fn cmd_doctor(root: &Path, global: bool, verbose: bool) -> Result<()>
         DoctorScope::Project(canonical_root)
     };
     let ctx = assemble_context(scope);
-    let report = run_doctor(ctx);
+    let projects = projects_in_scope(&ctx);
+    let mut report = run_doctor(ctx);
+    // The document-link checks read the document store, which core cannot.
+    for project in &projects {
+        report
+            .checks
+            .extend(infigraph_docs::link_check::check_project(
+                project, docs_sync,
+            ));
+    }
     print!("{}", format_report(&report, doctor_report_style(verbose)));
 
     match report.worst_status() {
