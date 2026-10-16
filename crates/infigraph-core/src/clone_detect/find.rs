@@ -42,6 +42,16 @@ crate::settings! {
         // proposes the pairs. Brute force is about n^2/2 cosine products: 10k
         // functions is 50M, seconds.
         exact_below: u64 = 10_000,
+        // A body-embedding pair must also share this fraction of its 4-token
+        // shingles (the sketch's Jaccard estimate, 0.0 to 1.0). Embedding
+        // cosines are compressed (on this repository 62% of all pairs reach
+        // 0.92 when every identifier is normalized, 0.7% when callees are
+        // kept, and the 0.92-0.96 band is mostly unrelated code), and the
+        // compression is specific to the model; token overlap is not. 0
+        // disables the gate: the embedding alone, expect noise. The cost: a
+        // clone whose tokens diverge below this is not reported even if the
+        // embedder rates it similar; lower it to see more.
+        min_overlap: f64 = 0.5,
     }
 }
 
@@ -118,6 +128,10 @@ pub struct Side {
 pub struct ClonePair {
     pub score: f32,
     pub signal: Signal,
+    /// The sketch's Jaccard estimate of how many of the two bodies' token
+    /// shingles are shared: 1 for an exact body, `None` for a pair compared
+    /// by signature text, which has no bodies to overlap.
+    pub overlap: Option<f32>,
     pub a: Side,
     pub b: Side,
 }
@@ -134,6 +148,9 @@ pub struct Options {
     /// Up to this many functions every pair is scored; above it LSH proposes
     /// the pairs.
     pub exact_below: usize,
+    /// A [`Signal::BodyEmbedding`] pair must also have a sketch Jaccard of at
+    /// least this; 0 disables the gate.
+    pub min_overlap: f32,
     pub kinds: Vec<String>,
     pub scope: PathScope,
 }
@@ -154,11 +171,17 @@ impl Options {
             RawClones::default(),
             crate::settings_file::ConfigScope::Project(root),
         )?;
+        anyhow::ensure!(
+            (0.0..=1.0).contains(&settings.min_overlap),
+            "[clones] min_overlap is {}: it must be between 0.0 and 1.0 (0 turns the gate off)",
+            settings.min_overlap
+        );
         Ok(Self {
             threshold,
             limit,
             min_tokens: settings.min_tokens as usize,
             exact_below: settings.exact_below as usize,
+            min_overlap: settings.min_overlap as f32,
             kinds: kinds
                 .split(',')
                 .map(|k| k.trim().to_string())
@@ -176,6 +199,7 @@ impl Default for Options {
             limit: 20,
             min_tokens: 30,
             exact_below: 10_000,
+            min_overlap: 0.5,
             kinds: vec!["Function".to_string(), "Method".to_string()],
             scope: PathScope::everything(),
         }
@@ -190,6 +214,13 @@ pub struct Report {
     pub truncated: bool,
     /// Pairs at or above the threshold, before the limit.
     pub total_found: usize,
+    /// Body-embedding pairs that reached the threshold but shared fewer
+    /// tokens than `min_overlap`, and so are not reported.
+    pub below_overlap: usize,
+    /// The options the report was made with that its caveats quote.
+    pub limit: usize,
+    pub min_tokens: usize,
+    pub min_overlap: f32,
     pub mode: Mode,
     /// Pairs that were scored.
     pub candidates_verified: usize,
@@ -209,6 +240,70 @@ pub struct Report {
     pub remote: bool,
 }
 
+impl Report {
+    /// How the search ran, in one line: the mode and the pairs it scored.
+    pub fn how(&self) -> String {
+        format!(
+            "{} mode, {} pairs scored",
+            self.mode.label(),
+            self.candidates_verified
+        )
+    }
+
+    /// What a reader should know about this report that the pairs do not say,
+    /// one sentence each; empty when it is complete and every pair is of
+    /// bodies.
+    pub fn caveats(&self) -> Vec<String> {
+        let mut notes = Vec::new();
+        if self.truncated {
+            notes.push(format!(
+                "Truncated: {} pairs reached the threshold, the best {} are shown.",
+                self.total_found, self.limit
+            ));
+        }
+        if self.remote {
+            notes.push(
+                "Remote graph: it has no clone-bodies sidecar, so every pair is compared by \
+                 signature text (signal `signature`)."
+                    .to_string(),
+            );
+        } else if self.signature_only > 0 {
+            notes.push(format!(
+                "{} of {} functions have no body signal yet and are compared by signature text \
+                 (signal `signature`): run `infigraph index`.",
+                self.signature_only, self.symbols
+            ));
+        }
+        if self.not_compared > 0 {
+            notes.push(format!(
+                "{} functions took part in no comparison: no vector of any kind.",
+                self.not_compared
+            ));
+        }
+        if self.skipped_families > 0 {
+            notes.push(format!(
+                "{} groups of near-identical bodies were skipped as boilerplate.",
+                self.skipped_families
+            ));
+        }
+        if self.below_overlap > 0 {
+            notes.push(format!(
+                "{} more pairs reached the threshold but share fewer than {:.0}% of their \
+                 tokens, so they are not reported (`[clones] min_overlap`; lower it to see more).",
+                self.below_overlap,
+                self.min_overlap * 100.0
+            ));
+        }
+        if self.symbols < 2 {
+            notes.push(format!(
+                "Functions of fewer than {} normalized tokens are skipped (`[clones] min_tokens`).",
+                self.min_tokens
+            ));
+        }
+        notes
+    }
+}
+
 /// A group of equal bodies larger than this is boilerplate, not a clone pair.
 const MAX_FAMILY: usize = 256;
 
@@ -219,19 +314,43 @@ fn same_file_counts(candidates: &[Candidate]) -> bool {
     candidates.windows(2).all(|w| w[0].file == w[1].file)
 }
 
+/// How one pair scored.
+struct Scored {
+    score: f32,
+    signal: Signal,
+    overlap: Option<f32>,
+}
+
 /// Scores `a` against `b`, or `None` if nothing they share can compare them.
-fn score(a: &Candidate, b: &Candidate) -> Option<(f32, Signal)> {
+fn score(a: &Candidate, b: &Candidate) -> Option<Scored> {
     if let (Some(x), Some(y)) = (&a.body, &b.body) {
         if x.hash == y.hash {
-            return Some((1.0, Signal::ExactBody));
+            return Some(Scored {
+                score: 1.0,
+                signal: Signal::ExactBody,
+                overlap: Some(1.0),
+            });
         }
+        let overlap = sketch::jaccard(&x.sketch, &y.sketch);
         return match (&x.embedding, &y.embedding) {
-            (Some(p), Some(q)) => Some((cosine_similarity(p, q), Signal::BodyEmbedding)),
-            _ => Some((sketch::jaccard(&x.sketch, &y.sketch), Signal::TokenFallback)),
+            (Some(p), Some(q)) => Some(Scored {
+                score: cosine_similarity(p, q),
+                signal: Signal::BodyEmbedding,
+                overlap: Some(overlap),
+            }),
+            _ => Some(Scored {
+                score: overlap,
+                signal: Signal::TokenFallback,
+                overlap: Some(overlap),
+            }),
         };
     }
     match (&a.signature_vector, &b.signature_vector) {
-        (Some(p), Some(q)) => Some((cosine_similarity(p, q), Signal::Signature)),
+        (Some(p), Some(q)) => Some(Scored {
+            score: cosine_similarity(p, q),
+            signal: Signal::Signature,
+            overlap: None,
+        }),
         _ => None,
     }
 }
@@ -312,20 +431,28 @@ pub fn compare(candidates: Vec<Candidate>, options: &Options) -> Report {
     };
 
     let mut verified = 0;
+    let mut below_overlap = 0;
     let mut found: Vec<ClonePair> = Vec::new();
     for (i, j) in pair_indexes {
         let (a, b) = (&candidates[i], &candidates[j]);
         if !allow_same_file && a.file == b.file {
             continue;
         }
-        let Some((value, signal)) = score(a, b) else {
+        let Some(scored) = score(a, b) else {
             continue;
         };
         verified += 1;
-        if value >= options.threshold {
+        if scored.score >= options.threshold {
+            let shares_too_little = scored.signal == Signal::BodyEmbedding
+                && scored.overlap.is_some_and(|o| o < options.min_overlap);
+            if shares_too_little {
+                below_overlap += 1;
+                continue;
+            }
             found.push(ClonePair {
-                score: value,
-                signal,
+                score: scored.score,
+                signal: scored.signal,
+                overlap: scored.overlap,
                 a: Side {
                     id: a.id.clone(),
                     name: a.name.clone(),
@@ -352,6 +479,10 @@ pub fn compare(candidates: Vec<Candidate>, options: &Options) -> Report {
         truncated: total_found > found.len(),
         pairs: found,
         total_found,
+        below_overlap,
+        limit: options.limit,
+        min_tokens: options.min_tokens,
+        min_overlap: options.min_overlap,
         mode,
         candidates_verified: verified,
         symbols,
@@ -375,10 +506,18 @@ fn cypher_list(kinds: &[String]) -> String {
 
 /// Finds the near-duplicate functions of the project at `root`.
 ///
-/// `signature_embedder` is for a remote graph only, which has no local
-/// vectors: it embeds the signature text of the functions that have none.
-/// A local graph is passed `None` and never embeds anything here.
-pub fn find_clones(
+/// A local graph never embeds anything here. A remote graph has no local
+/// vectors, so the signature text of its functions is embedded with the best
+/// available embedder, labeled [`Signal::Signature`] and flagged by
+/// [`Report::remote`]: the one place a clone search embeds at query time.
+pub fn find_clones(backend: &dyn GraphBackend, root: &Path, options: &Options) -> Result<Report> {
+    let embedder = crate::daemon::lifecycle::is_remote_backend().then(crate::embed::best_embedder);
+    find_clones_with(backend, root, options, embedder.as_deref())
+}
+
+/// [`find_clones`] with the remote graph's embedder supplied by the caller: the
+/// seam a test uses. `None` embeds nothing.
+pub fn find_clones_with(
     backend: &dyn GraphBackend,
     root: &Path,
     options: &Options,
@@ -578,8 +717,10 @@ mod tests {
     }
 
     #[test]
-    fn bodies_with_close_embeddings_are_a_body_embedding_pair() {
-        let (x, y) = (long(3), long(5));
+    fn bodies_with_close_embeddings_and_shared_tokens_are_a_body_embedding_pair() {
+        let x = long(3);
+        let mut y = x.clone();
+        y.push_str("\nv99 = g(v1)"); // a near copy: one statement added
         let mut near = unit(0);
         near[1] = 0.1;
         let report = compare(
@@ -589,8 +730,58 @@ mod tests {
             ],
             &options(),
         );
-        assert_eq!(report.pairs[0].signal, Signal::BodyEmbedding);
-        assert!(report.pairs[0].score > 0.99);
+        let pair = &report.pairs[0];
+        assert_eq!(pair.signal, Signal::BodyEmbedding);
+        assert!(pair.score > 0.99, "the score stays the cosine");
+        assert!(pair.overlap.unwrap() >= 0.5, "{:?}", pair.overlap);
+    }
+
+    #[test]
+    fn a_close_embedding_without_shared_tokens_is_not_a_clone_unless_the_gate_is_off() {
+        // The embedder rates these identical; their code has nothing in common.
+        let (x, y) = (long(3), long(5));
+        let pair = |min_overlap: f32| {
+            compare(
+                vec![
+                    cand("a", "a.py", Some(body(&x, Some(unit(0)))), None),
+                    cand("b", "b.py", Some(body(&y, Some(unit(0)))), None),
+                ],
+                &Options {
+                    min_overlap,
+                    ..options()
+                },
+            )
+        };
+        let gated = pair(0.5);
+        assert!(gated.pairs.is_empty(), "{:?}", gated.pairs);
+        assert_eq!(gated.below_overlap, 1);
+        assert!(gated.caveats().join(" ").contains("share fewer than"));
+
+        let off = pair(0.0);
+        assert_eq!(off.pairs.len(), 1);
+        assert_eq!(off.pairs[0].signal, Signal::BodyEmbedding);
+        assert_eq!(off.below_overlap, 0);
+    }
+
+    #[test]
+    fn the_gate_does_not_touch_exact_bodies_token_fallbacks_or_signatures() {
+        let x = long(3);
+        let report = compare(
+            vec![
+                cand("a", "a.py", Some(body(&x, Some(unit(0)))), None),
+                cand("b", "b.py", Some(body(&x, Some(unit(1)))), None),
+                cand("s", "s.py", None, Some(unit(2))),
+                cand("t", "t.py", None, Some(unit(2))),
+            ],
+            &Options {
+                min_overlap: 1.0,
+                ..options()
+            },
+        );
+        let signals: Vec<_> = report.pairs.iter().map(|p| p.signal).collect();
+        assert_eq!(signals, vec![Signal::ExactBody, Signal::Signature]);
+        assert_eq!(report.pairs[0].overlap, Some(1.0));
+        assert_eq!(report.pairs[1].overlap, None);
     }
 
     #[test]
@@ -762,6 +953,38 @@ mod tests {
         );
         assert!(report.pairs.is_empty());
         assert!(report.skipped_families >= 1);
+    }
+
+    #[test]
+    fn the_report_explains_what_it_could_not_say_in_pairs() {
+        let code = long(3);
+        let report = compare(
+            vec![
+                cand("a", "a.py", Some(body(&code, None)), None),
+                cand("b", "b.py", Some(body(&code, None)), None),
+                cand("c", "c.py", Some(body(&code, None)), None),
+                cand("bare", "d.py", None, Some(unit(1))),
+                cand("lost", "e.py", None, None),
+            ],
+            &Options {
+                limit: 1,
+                ..options()
+            },
+        );
+        let notes = report.caveats().join("\n");
+        assert!(notes.contains("Truncated: 3 pairs"), "{notes}");
+        assert!(
+            notes.contains("2 of 5 functions have no body signal"),
+            "{notes}"
+        );
+        assert!(
+            notes.contains("1 functions took part in no comparison"),
+            "{notes}"
+        );
+        assert!(report.how().starts_with("exact mode"), "{}", report.how());
+
+        let clean = compare(vec![], &options());
+        assert!(clean.caveats()[0].contains("fewer than 10"));
     }
 
     #[test]

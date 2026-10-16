@@ -2,150 +2,17 @@
 //! finds that the signature-text comparison it replaces could not, and the
 //! pair that comparison reported and a body comparison does not.
 //!
-//! Hermetic: bodies are embedded by a word-hashing embedder defined here.
+//! Hermetic: bodies are embedded by the word-hashing stand-in in
+//! `common/clone_fixture.rs`, so no model is loaded or downloaded.
 
 use std::path::Path;
 
 use infigraph_core::clone_detect::find::{find_clones, Mode, Options, Signal};
-use infigraph_core::embed::EmbedProvider;
 use infigraph_core::path_scope::PathScope;
-use infigraph_core::Infigraph;
-use infigraph_languages::bundled_registry;
 
-/// Embeds a text as its word 4-grams hashed into 512 buckets, so equal texts
-/// have equal vectors and texts of another shape have unlike ones.
-struct WordEmbedder;
-
-impl EmbedProvider for WordEmbedder {
-    fn name(&self) -> &'static str {
-        "test-words"
-    }
-    fn dimension(&self) -> usize {
-        512
-    }
-    fn embed_batch(&self, texts: &[&str]) -> anyhow::Result<Vec<Vec<f32>>> {
-        Ok(texts
-            .iter()
-            .map(|text| {
-                let words: Vec<&str> = text.split_whitespace().collect();
-                let mut v = vec![0f32; 512];
-                for gram in words.windows(4) {
-                    v[infigraph_core::embed::fnv1a64(gram.join(" ").as_bytes()) as usize % 512] +=
-                        1.0;
-                }
-                let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt().max(1.0);
-                v.iter().map(|x| x / norm).collect()
-            })
-            .collect())
-    }
-}
-
-/// One valid Python statement whose shape depends on `seed` and `i`; `callee`
-/// wraps the first operand in a call. (Invalid Python would lose its body to
-/// error recovery and every such function would hash alike.)
-fn statement(seed: u32, i: u32, callee: Option<&str>) -> String {
-    const OPS: [&str; 8] = ["+", "-", "*", "/", "%", "<", ">", "=="];
-    let h = infigraph_core::embed::fnv1a64(format!("{seed}:{i}").as_bytes()) as usize;
-    let a = callee.map_or("a".to_string(), |c| format!("{c}(a)"));
-    let (op1, op2) = (OPS[(h / 8) % 8], OPS[(h / 64) % 8]);
-    let expr = format!("{a} {op1} b {op2} c");
-    match h % 6 {
-        0 => format!("    if {expr}: pass"),
-        1 => format!("    while {expr}: break"),
-        2 => format!("    for q in {expr}: pass"),
-        3 => format!("    assert {expr}"),
-        4 => format!("    return {expr}"),
-        _ => format!("    raise {expr}"),
-    }
-}
-
-/// A function body of `n` statements whose shape depends on `seed`.
-fn body(seed: u32, n: u32) -> String {
-    (0..n)
-        .map(|i| statement(seed, i, None))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// `body`'s shape with a call to `callee` in every statement.
-fn calling(seed: u32, callee: &str) -> String {
-    (0..30)
-        .map(|i| statement(seed, i, Some(callee)))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn function(name: &str, doc: &str, code: &str) -> String {
-    format!("def {name}(a, b):\n    \"\"\"{doc}\"\"\"\n{code}\n")
-}
-
-fn write(root: &Path, file: &str, text: &str) {
-    let path = root.join(file);
-    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    std::fs::write(path, text).unwrap();
-}
-
-/// Four families, each in two files:
-/// - `renamed` / `copied`: the same code under other names and another docstring;
-/// - `process` in a.py and in b.py: the same name, parameters and docstring,
-///   different bodies (the signature-text comparison called these clones);
-/// - `twin_one` / `twin_two`: byte-identical bodies under different
-///   signatures (it could not see these);
-/// - `check_one` / `check_two`: the same shape and the same locals, one calling
-///   `validate` and the other `remove` in every statement: two bodies that do
-///   different things.
-fn project() -> (tempfile::TempDir, Infigraph) {
-    let dir = tempfile::tempdir().unwrap();
-    let r = dir.path();
-    write(
-        r,
-        "src/a.py",
-        &function("process", "Process the batch.", &body(1, 30)),
-    );
-    write(
-        r,
-        "src/b.py",
-        &function("process", "Process the batch.", &body(2, 30)),
-    );
-    write(
-        r,
-        "src/c.py",
-        &function("renamed", "Add things.", &body(3, 30)),
-    );
-    write(
-        r,
-        "src/d.py",
-        &function("copied", "Combine items.", &body(3, 30)),
-    );
-    write(
-        r,
-        "src/e.py",
-        &format!("def twin_one(x, y):\n{}\n", body(4, 30)),
-    );
-    write(
-        r,
-        "src/f.py",
-        &format!("def twin_two(left, right):\n{}\n", body(4, 30)),
-    );
-    write(
-        r,
-        "src/g.py",
-        &format!("def check_one(a, b):\n{}\n", calling(5, "validate")),
-    );
-    write(
-        r,
-        "src/h.py",
-        &format!("def check_two(a, b):\n{}\n", calling(5, "remove")),
-    );
-    let mut ig = Infigraph::open(r, bundled_registry().unwrap()).unwrap();
-    ig.init().unwrap();
-    ig.index().unwrap();
-    infigraph_core::embed::update_embeddings_with(ig.backend().unwrap(), r, &[], &|| {
-        Box::new(WordEmbedder)
-    })
-    .unwrap();
-    (dir, ig)
-}
+#[path = "common/clone_fixture.rs"]
+mod clone_fixture;
+use clone_fixture::{project, write};
 
 fn options(root: &Path) -> Options {
     Options::for_project(root, 0.92, 50, "Function,Method", PathScope::everything()).unwrap()
@@ -169,13 +36,7 @@ fn names(report: &infigraph_core::clone_detect::find::Report) -> Vec<(String, St
 #[test]
 fn bodies_decide_not_names() {
     let (dir, ig) = project();
-    let report = find_clones(
-        ig.backend().unwrap(),
-        dir.path(),
-        &options(dir.path()),
-        None,
-    )
-    .unwrap();
+    let report = find_clones(ig.backend().unwrap(), dir.path(), &options(dir.path())).unwrap();
     let found = names(&report);
 
     // The same code under other names and another docstring: found, by the
@@ -198,9 +59,7 @@ fn bodies_decide_not_names() {
     );
     // The same shape and locals with different callees: different code.
     assert!(
-        !found
-            .iter()
-            .any(|(x, y, _)| x == "check_one" || y == "check_two"),
+        !found.iter().any(|(x, y, _)| x == "check" && y == "check"),
         "{found:?}"
     );
     assert_eq!(report.mode, Mode::Exact);
@@ -219,7 +78,7 @@ fn a_scope_compares_only_pairs_within_it() {
         PathScope::new(dir.path(), Some("src/e.py")),
     )
     .unwrap();
-    let report = find_clones(ig.backend().unwrap(), dir.path(), &scoped, None).unwrap();
+    let report = find_clones(ig.backend().unwrap(), dir.path(), &scoped).unwrap();
     // One file in scope: nothing to pair it with.
     assert!(report.pairs.is_empty(), "{:?}", report.pairs);
 
@@ -231,7 +90,7 @@ fn a_scope_compares_only_pairs_within_it() {
         PathScope::new(dir.path(), Some("src")),
     )
     .unwrap();
-    let report = find_clones(ig.backend().unwrap(), dir.path(), &subtree, None).unwrap();
+    let report = find_clones(ig.backend().unwrap(), dir.path(), &subtree).unwrap();
     assert_eq!(report.pairs.len(), 2, "{:?}", names(&report));
 }
 
@@ -239,13 +98,7 @@ fn a_scope_compares_only_pairs_within_it() {
 fn functions_without_a_body_entry_are_compared_by_signature_and_labeled() {
     let (dir, ig) = project();
     std::fs::remove_file(dir.path().join(".infigraph/clone-bodies.bin")).unwrap();
-    let report = find_clones(
-        ig.backend().unwrap(),
-        dir.path(),
-        &options(dir.path()),
-        None,
-    )
-    .unwrap();
+    let report = find_clones(ig.backend().unwrap(), dir.path(), &options(dir.path())).unwrap();
     assert_eq!(report.signature_only, report.symbols);
     assert!(
         report.pairs.iter().all(|p| p.signal == Signal::Signature),
@@ -270,6 +123,26 @@ fn min_tokens_comes_from_the_projects_config_and_a_bad_value_is_an_error() {
     write(
         dir.path(),
         ".infigraph/config.toml",
+        "[clones]\nmin_overlap = 0.25\n",
+    );
+    assert_eq!(options(dir.path()).min_overlap, 0.25);
+    assert_eq!(options(dir.path()).min_tokens, 30);
+
+    // min_overlap is a fraction: outside 0..=1 is an error naming the key.
+    for bad in ["1.5", "-0.1"] {
+        write(
+            dir.path(),
+            ".infigraph/config.toml",
+            &format!("[clones]\nmin_overlap = {bad}\n"),
+        );
+        let err = Options::for_project(dir.path(), 0.9, 5, "Function", PathScope::everything())
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("min_overlap"), "{err:#}");
+    }
+
+    write(
+        dir.path(),
+        ".infigraph/config.toml",
         "[clones]\nmin_tokens = \"many\"\n",
     );
     assert!(Options::for_project(dir.path(), 0.9, 5, "Function", PathScope::everything()).is_err());
@@ -283,13 +156,7 @@ fn above_exact_below_lsh_runs_and_says_so() {
         ".infigraph/config.toml",
         "[clones]\nexact_below = 2\n",
     );
-    let report = find_clones(
-        ig.backend().unwrap(),
-        dir.path(),
-        &options(dir.path()),
-        None,
-    )
-    .unwrap();
+    let report = find_clones(ig.backend().unwrap(), dir.path(), &options(dir.path())).unwrap();
     assert_eq!(report.mode, Mode::Lsh);
     let found = names(&report);
     assert!(
