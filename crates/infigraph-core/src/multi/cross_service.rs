@@ -920,12 +920,7 @@ fn is_test_or_doc_file(rel_path: &str) -> bool {
     if name.starts_with("test_")
         || name.ends_with("_test.py")
         || name.ends_with("_test.go")
-        || name.ends_with(".test.ts")
-        || name.ends_with(".test.tsx")
-        || name.ends_with(".test.js")
-        || name.ends_with(".test.jsx")
-        || name.ends_with(".spec.ts")
-        || name.ends_with(".spec.js")
+        || crate::lang::is_script_test_name(name)
     {
         return true;
     }
@@ -2151,8 +2146,12 @@ VERSION = "v1.2.3"
         assert!(is_test_or_doc_file("docs/ARCHITECTURE.md"));
         assert!(is_test_or_doc_file("README.md"));
         assert!(is_test_or_doc_file("foo.spec.ts"));
+        assert!(is_test_or_doc_file("foo.test.mts"));
+        assert!(is_test_or_doc_file("foo.spec.cts"));
+        assert!(is_test_or_doc_file("foo.test.cjs"));
 
         assert!(!is_test_or_doc_file("app/adapters/client.py"));
+        assert!(!is_test_or_doc_file("src/services/api.mts"));
         assert!(!is_test_or_doc_file("src/services/api.ts"));
         assert!(!is_test_or_doc_file("ascendskills/tools/ascend_api.py"));
         assert!(!is_test_or_doc_file("app/routers/router.py"));

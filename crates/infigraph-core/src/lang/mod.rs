@@ -1,5 +1,9 @@
+mod extensions;
 mod registry;
 
+pub use extensions::{
+    extension_selected, is_script_test_name, Extensions, JAVASCRIPT, TSX, TYPESCRIPT,
+};
 pub use registry::LanguageRegistry;
 
 use anyhow::Result;

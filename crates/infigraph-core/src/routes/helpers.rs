@@ -1,4 +1,5 @@
 use super::Route;
+use crate::lang;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum Lang {
@@ -18,9 +19,9 @@ pub(crate) enum Lang {
 pub(crate) fn language_from_file(file: &str) -> Lang {
     if file.ends_with(".py") {
         Lang::Python
-    } else if file.ends_with(".js") || file.ends_with(".jsx") || file.ends_with(".mjs") {
+    } else if lang::JAVASCRIPT.matches_path(file) {
         Lang::JavaScript
-    } else if file.ends_with(".ts") || file.ends_with(".tsx") {
+    } else if lang::TYPESCRIPT.matches_path(file) || lang::TSX.matches_path(file) {
         Lang::TypeScript
     } else if file.ends_with(".go") {
         Lang::Go
@@ -267,4 +268,20 @@ pub(crate) fn camel_to_path(s: &str) -> String {
     }
     // Also convert underscores to slashes
     result.replace('_', "/")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn module_system_variants_are_their_language() {
+        for file in ["a.js", "a.jsx", "a.mjs", "a.cjs"] {
+            assert_eq!(language_from_file(file), Lang::JavaScript, "{file}");
+        }
+        for file in ["a.ts", "a.tsx", "a.mts", "a.cts"] {
+            assert_eq!(language_from_file(file), Lang::TypeScript, "{file}");
+        }
+        assert_eq!(language_from_file("a.py"), Lang::Python);
+    }
 }
