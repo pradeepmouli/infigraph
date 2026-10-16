@@ -31,8 +31,12 @@ use crate::embed::{atomic_write, fnv1a64};
 pub const BODIES_FILE: &str = "clone-bodies.bin";
 
 const MAGIC: [u8; 4] = *b"IGB1";
-/// The only version so far; a reader refuses any other rather than guess.
-pub const FORMAT_VERSION: u8 = 1;
+/// A reader refuses any other version rather than guess, and the builder then
+/// rebuilds the file. Bump it whenever the text a body is embedded from, or the
+/// tokens its sketch is made of, would change for an unchanged body: an old
+/// entry would otherwise be compared against new ones. v2: callee, member and
+/// type names are kept in the normalization (v1 replaced every identifier).
+pub const FORMAT_VERSION: u8 = 2;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct BodyEntry {

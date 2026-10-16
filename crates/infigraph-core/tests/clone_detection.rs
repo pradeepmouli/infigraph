@@ -40,17 +40,37 @@ impl EmbedProvider for WordEmbedder {
     }
 }
 
+/// One valid Python statement whose shape depends on `seed` and `i`; `callee`
+/// wraps the first operand in a call. (Invalid Python would lose its body to
+/// error recovery and every such function would hash alike.)
+fn statement(seed: u32, i: u32, callee: Option<&str>) -> String {
+    const OPS: [&str; 8] = ["+", "-", "*", "/", "%", "<", ">", "=="];
+    let h = infigraph_core::embed::fnv1a64(format!("{seed}:{i}").as_bytes()) as usize;
+    let a = callee.map_or("a".to_string(), |c| format!("{c}(a)"));
+    let (op1, op2) = (OPS[(h / 8) % 8], OPS[(h / 64) % 8]);
+    let expr = format!("{a} {op1} b {op2} c");
+    match h % 6 {
+        0 => format!("    if {expr}: pass"),
+        1 => format!("    while {expr}: break"),
+        2 => format!("    for q in {expr}: pass"),
+        3 => format!("    assert {expr}"),
+        4 => format!("    return {expr}"),
+        _ => format!("    raise {expr}"),
+    }
+}
+
 /// A function body of `n` statements whose shape depends on `seed`.
 fn body(seed: u32, n: u32) -> String {
     (0..n)
-        .map(|i| {
-            let h = infigraph_core::embed::fnv1a64(format!("{seed}:{i}").as_bytes()) as usize;
-            let kw = [
-                "if", "while", "for", "return", "await", "yield", "raise", "try",
-            ][h % 8];
-            let op = ["+", "-", "*", "/", "%", "<", ">", "=="][(h / 8) % 8];
-            format!("    {kw} a {op} b")
-        })
+        .map(|i| statement(seed, i, None))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// `body`'s shape with a call to `callee` in every statement.
+fn calling(seed: u32, callee: &str) -> String {
+    (0..30)
+        .map(|i| statement(seed, i, Some(callee)))
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -65,12 +85,15 @@ fn write(root: &Path, file: &str, text: &str) {
     std::fs::write(path, text).unwrap();
 }
 
-/// Three families, each in two files:
+/// Four families, each in two files:
 /// - `renamed` / `copied`: the same code under other names and another docstring;
 /// - `process` in a.py and in b.py: the same name, parameters and docstring,
 ///   different bodies (the signature-text comparison called these clones);
 /// - `twin_one` / `twin_two`: byte-identical bodies under different
-///   signatures (it could not see these).
+///   signatures (it could not see these);
+/// - `check_one` / `check_two`: the same shape and the same locals, one calling
+///   `validate` and the other `remove` in every statement: two bodies that do
+///   different things.
 fn project() -> (tempfile::TempDir, Infigraph) {
     let dir = tempfile::tempdir().unwrap();
     let r = dir.path();
@@ -103,6 +126,16 @@ fn project() -> (tempfile::TempDir, Infigraph) {
         r,
         "src/f.py",
         &format!("def twin_two(left, right):\n{}\n", body(4, 30)),
+    );
+    write(
+        r,
+        "src/g.py",
+        &format!("def check_one(a, b):\n{}\n", calling(5, "validate")),
+    );
+    write(
+        r,
+        "src/h.py",
+        &format!("def check_two(a, b):\n{}\n", calling(5, "remove")),
     );
     let mut ig = Infigraph::open(r, bundled_registry().unwrap()).unwrap();
     ig.init().unwrap();
@@ -161,6 +194,13 @@ fn bodies_decide_not_names() {
         !found
             .iter()
             .any(|(x, y, _)| x == "process" && y == "process"),
+        "{found:?}"
+    );
+    // The same shape and locals with different callees: different code.
+    assert!(
+        !found
+            .iter()
+            .any(|(x, y, _)| x == "check_one" || y == "check_two"),
         "{found:?}"
     );
     assert_eq!(report.mode, Mode::Exact);

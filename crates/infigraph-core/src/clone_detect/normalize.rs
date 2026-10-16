@@ -1,11 +1,26 @@
 //! A function body as a sequence of normalized tokens.
 //!
-//! Two bodies that differ only in what their identifiers and literals are
-//! called, in their comments or in their layout are the same code copied. The
-//! lexer here is deliberately language-agnostic: it cannot tell a type from a
-//! variable, but it does not need to, because every identifier that is not a
-//! keyword becomes one placeholder on both sides of a comparison. Keywords,
-//! operators and punctuation keep their text, so the shape of the code stays.
+//! Two bodies that differ only in what their *locals* are called, in their
+//! literals, their comments or their layout are the same code copied. Two
+//! bodies that call different functions are not, however alike they look, so
+//! the normalization removes what a rename cannot change and keeps what it
+//! cannot hide:
+//!
+//! - normalized: local variables and parameters (one placeholder), numbers and
+//!   strings (one placeholder each), comments and whitespace;
+//! - kept, as their text: keywords, operators and punctuation, and every name
+//!   that is not a local: a callee (a word followed by `(`), a member or path
+//!   segment (a word after `.`, `->` or `::`, or before `::`) and a type name
+//!   (a word starting with a capital).
+//!
+//! The lexer is language-agnostic and does not parse, so "local" is decided by
+//! that heuristic and can be wrong in both directions. The one place it is
+//! corrected is a function's own name: a word before `(` that follows a
+//! defining keyword (`fn`, `def`, `function`, `class`...) or another
+//! non-keyword word (a C-style `int total(`) is a definition, not a call, and
+//! is normalized, so a copy under a new name is still a copy. A lowercase type
+//! name (`u32`, `int`) is read as a local; it reads the same on both sides of
+//! any comparison, which costs precision on that one word and nothing else.
 
 use crate::embed::fnv1a64;
 
@@ -94,6 +109,30 @@ const KEYWORDS: &[&str] = &[
     "begin",
 ];
 
+/// Keywords after which a name is being defined, not called.
+const DEFINERS: &[&str] = &[
+    "fn",
+    "func",
+    "function",
+    "def",
+    "class",
+    "struct",
+    "enum",
+    "trait",
+    "interface",
+    "type",
+];
+
+/// What the last token lexed was, for the next word's sake.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Prev {
+    Start,
+    Keyword(&'static str),
+    /// A word that is not a keyword (a local, a type, a name).
+    Word,
+    Other(char),
+}
+
 /// How a language writes its comments.
 struct Comments {
     line: &'static [&'static str],
@@ -156,30 +195,57 @@ pub fn normalized_text(body: &str, language: &str) -> String {
 fn lex(body: &str, language: &str, mut emit: impl FnMut(&str)) {
     let comments = comments_for(language);
     let mut rest = body;
+    let (mut prev, mut before) = (Prev::Start, Prev::Start);
     while let Some(c) = rest.chars().next() {
-        if c.is_whitespace() {
+        let token = if c.is_whitespace() {
             rest = &rest[c.len_utf8()..];
+            continue;
         } else if let Some(after) = skip_comment(rest, comments) {
             rest = after;
+            continue;
         } else if matches!(c, '"' | '`') || (c == '\'' && closes_on_line(rest)) {
             emit(STR);
             rest = after_string(rest, c);
+            Prev::Other('"')
         } else if c.is_ascii_digit() {
             emit(NUM);
             rest = skip_while(rest, |c| c.is_alphanumeric() || matches!(c, '.' | '_'));
+            Prev::Other('0')
         } else if c.is_alphabetic() || matches!(c, '_' | '$') {
             let word_end = word_len(rest);
-            let lower = rest[..word_end].to_ascii_lowercase();
-            emit(if KEYWORDS.contains(&lower.as_str()) {
-                &lower
-            } else {
-                IDENT
-            });
+            let word = &rest[..word_end];
+            let lower = word.to_ascii_lowercase();
             rest = &rest[word_end..];
+            if let Some(keyword) = KEYWORDS.iter().find(|k| **k == lower) {
+                emit(keyword);
+                Prev::Keyword(keyword)
+            } else {
+                let after = rest.trim_start();
+                let member = matches!(
+                    (before, prev),
+                    (_, Prev::Other('.'))
+                        | (Prev::Other(':'), Prev::Other(':'))
+                        | (Prev::Other('-'), Prev::Other('>'))
+                );
+                let defined = match prev {
+                    Prev::Keyword(k) => DEFINERS.contains(&k),
+                    Prev::Word => true,
+                    _ => false,
+                };
+                let kept = member
+                    || after.starts_with("::")
+                    || word.starts_with(char::is_uppercase)
+                    || (after.starts_with('(') && !defined);
+                emit(if kept { word } else { IDENT });
+                Prev::Word
+            }
         } else {
-            emit(&rest[..c.len_utf8()]);
+            let mut buf = [0u8; 4];
+            emit(c.encode_utf8(&mut buf));
             rest = &rest[c.len_utf8()..];
-        }
+            Prev::Other(c)
+        };
+        (before, prev) = (prev, token);
     }
 }
 
@@ -293,8 +359,74 @@ mod tests {
     fn the_text_spells_the_tokens_and_hides_the_names() {
         let a = normalized_text("fn total(items: u32) -> u32 { items + 41 }", "rust");
         let b = normalized_text("fn grand(rows: u32) -> u32 { rows + 7 }", "rust");
-        assert_eq!(a, "fn _ ( _ : _ ) - > _ { _ + 0 }");
+        assert_eq!(a, "fn _ ( _ : _ ) - > u32 { _ + 0 }");
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn callee_names_are_kept_so_different_calls_are_different_code() {
+        let validate = "fn f(x: u32) { validate(x); }";
+        let purge = "fn f(x: u32) { purge(x); }";
+        let renamed_local = "fn f(y: u32) { validate(y); }";
+        assert_ne!(norm(validate), norm(purge));
+        assert_eq!(norm(validate), norm(renamed_local));
+        // A space before the parenthesis is still a call.
+        assert_eq!(norm("validate (x)"), norm("validate(x)"));
+        assert_ne!(norm("validate (x)"), norm("purge (x)"));
+    }
+
+    #[test]
+    fn member_and_path_names_are_kept() {
+        assert_ne!(norm("a.save(b)"), norm("a.drop(b)"));
+        assert_ne!(norm("self.count + 1"), norm("self.total + 1"));
+        assert_ne!(norm("p->next"), norm("p->prev"));
+        assert_ne!(norm("io::read(x)"), norm("net::read(x)"));
+        assert_ne!(norm("fs::read(x)"), norm("fs::write(x)"));
+        // The receiver is a local and is not.
+        assert_eq!(norm("alpha.save(b)"), norm("beta.save(b)"));
+    }
+
+    #[test]
+    fn type_names_are_kept() {
+        assert_ne!(
+            norm("let a: Vec<String> = x;"),
+            norm("let a: Vec<Count> = x;")
+        );
+        assert_eq!(
+            norm("let a: Vec<String> = x;"),
+            norm("let b: Vec<String> = y;")
+        );
+    }
+
+    #[test]
+    fn the_name_a_function_is_defined_under_is_not_kept() {
+        assert_eq!(
+            norm("fn total(x: u32) { x }"),
+            norm("fn grand(y: u32) { y }")
+        );
+        assert_eq!(
+            normalize("def total(x):\n    return x", "python"),
+            normalize("def grand(y):\n    return y", "python")
+        );
+        // A C-style declaration: a word before the name is its type.
+        assert_eq!(
+            normalize("int total(int x) { return x; }", "c"),
+            normalize("int grand(int y) { return y; }", "c")
+        );
+        // After a keyword that precedes expressions it is a call.
+        assert_ne!(norm("return validate(x)"), norm("return purge(x)"));
+        assert_ne!(norm("await validate(x)"), norm("await purge(x)"));
+    }
+
+    #[test]
+    fn the_text_keeps_the_names_it_keeps() {
+        assert_eq!(
+            normalized_text(
+                "fn f(x: u32) { Vec::new(); validate(x); x.save(); }",
+                "rust"
+            ),
+            "fn _ ( _ : _ ) { Vec : : new ( ) ; validate ( _ ) ; _ . save ( ) ; }"
+        );
     }
 
     #[test]

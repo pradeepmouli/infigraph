@@ -201,3 +201,17 @@ fn deleted_functions_are_pruned() {
     update(&ig, dir.path(), &[]);
     assert!(!entries(dir.path()).contains_key("src/b.py::shout"));
 }
+
+#[test]
+fn a_sidecar_of_an_older_format_is_rebuilt_whole() {
+    let (dir, ig) = project(&[("src/a.py", TOTAL), ("src/b.py", OTHER)]);
+    update(&ig, dir.path(), &[]);
+    let path = dir.path().join(".infigraph").join(BODIES_FILE);
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes[4] = 1; // what the previous normalization wrote
+    std::fs::write(&path, bytes).unwrap();
+    assert!(bodies::load(&path).is_err());
+
+    assert!(update(&ig, dir.path(), &[]) > 0, "nothing was re-embedded");
+    assert_eq!(entries(dir.path()).len(), 2);
+}
