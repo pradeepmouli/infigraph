@@ -3,6 +3,9 @@ use std::process::Command;
 use std::sync::Mutex;
 use std::time::Duration;
 
+mod common;
+
+use common::stdio::captured;
 use infigraph_core::graph::GraphBackend;
 use infigraph_core::Infigraph;
 
@@ -120,20 +123,6 @@ fn cli_command() -> Command {
     let mut command = Command::new(cli_binary());
     command.env(infigraph_core::scip_switch::enabled_env_name(), "0");
     command
-}
-
-/// A file under `dir` to hand a child as its stdout or stderr.
-///
-/// Files rather than `Stdio::piped()` wherever a test polls `try_wait`
-/// without draining: a child that outgrows the pipe buffer blocks in
-/// `write` and never exits, which turns a diagnostic into the hang the test
-/// exists to catch. That buffer is not the ~64KB one might assume --
-/// macOS hands out 512-byte pipes once the kernel's pipe memory is
-/// exhausted, and a plain `infigraph index` prints more than that (its
-/// `.infigraphignore` hint alone is ~600 bytes), so a polling test failed
-/// there at its 30s budget with the child parked in `eprintln!`.
-fn captured(dir: &Path, name: &str) -> std::process::Stdio {
-    std::process::Stdio::from(std::fs::File::create(dir.join(name)).unwrap())
 }
 
 /// Bootstrap-index `project_dir` directly (BackendKind::Kuzu, no daemon

@@ -4,7 +4,6 @@
 
 mod support;
 
-use std::io::Read;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
@@ -32,7 +31,7 @@ fn a_daemon_over_its_hard_ceiling_shuts_down_and_says_why() {
         .env("INFIGRAPH_WATCHDOG_THREADS_HARD", "1")
         .env("INFIGRAPH_WATCHDOG_INTERVAL_SECS", "1")
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
+        .stderr(support::stdio::captured(home.path(), "daemon.err"))
         .spawn()
         .unwrap();
 
@@ -47,13 +46,7 @@ fn a_daemon_over_its_hard_ceiling_shuts_down_and_says_why() {
         }
         std::thread::sleep(Duration::from_millis(200));
     };
-    let mut log = String::new();
-    daemon
-        .stderr
-        .take()
-        .unwrap()
-        .read_to_string(&mut log)
-        .unwrap();
+    let log = support::stdio::captured_text(home.path(), "daemon.err");
     assert!(
         status.success(),
         "a clean shutdown, not a crash: {status:?}\n{log}"

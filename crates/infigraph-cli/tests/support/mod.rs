@@ -7,6 +7,11 @@ use std::path::Path;
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
+/// `captured` / `captured_text`: a child's output in a file, for a test that
+/// polls it without draining. One file shared by every crate's tests.
+#[path = "../../../infigraph-core/tests/common/stdio.rs"]
+pub mod stdio;
+
 /// The `infigraph` binary under test, with implicit SCIP enrichment off.
 ///
 /// `infigraph index` otherwise leaves a detached `scip-enrich` child running

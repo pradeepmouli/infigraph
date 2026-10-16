@@ -2,6 +2,8 @@
 //! work. One started in `$HOME` used to attach a doc watcher to the whole home
 //! directory first, and only the code watcher's later check turned it away.
 
+mod support;
+
 use std::time::{Duration, Instant};
 
 #[test]
@@ -15,12 +17,14 @@ fn a_daemon_at_the_global_store_root_refuses_before_watching_anything() {
     std::fs::create_dir_all(tmp.path().join("docs")).unwrap();
     std::fs::write(tmp.path().join("docs").join("readme.md"), "# Hi\n").unwrap();
 
+    // Outside the root the daemon is asked to refuse.
+    let out_dir = tempfile::tempdir().unwrap();
     let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_infigraph"))
         .current_dir(tmp.path())
         .env_remove("INFIGRAPH_WATCH_DAEMON")
         .arg("daemon")
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
+        .stdout(support::stdio::captured(out_dir.path(), "daemon.out"))
+        .stderr(support::stdio::captured(out_dir.path(), "daemon.err"))
         .spawn()
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(20);
@@ -31,14 +35,14 @@ fn a_daemon_at_the_global_store_root_refuses_before_watching_anything() {
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    let out = child.wait_with_output().unwrap();
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(!out.status.success(), "{stderr}");
+    let status = child.wait().unwrap();
+    let stderr = support::stdio::captured_text(out_dir.path(), "daemon.err");
+    assert!(!status.success(), "{stderr}");
     assert!(stderr.contains("home directory"), "{stderr}");
     // Refused before any startup work: `cmd_daemon` starts its doc watcher
     // before the write coordinator ever checks the root, and in `$HOME` that
     // left long enough for the watcher to attach to the whole home directory.
-    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stdout = support::stdio::captured_text(out_dir.path(), "daemon.out");
     assert!(
         !stdout.contains("Watching"),
         "started watching first: {stdout}"

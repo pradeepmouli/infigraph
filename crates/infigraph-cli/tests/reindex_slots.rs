@@ -42,7 +42,7 @@ fn a_full_reindex_waits_for_the_machines_slot_and_runs_when_it_is_free() {
     let pool = infigraph_core::slots::SlotPool::new(user_dir.join("reindex-slots"), 1);
     let other_daemons_rebuild = pool.try_claim().unwrap().expect("the slot was free");
 
-    let asked = infigraph()
+    let mut asked = infigraph()
         .args(["index", "--full", "--no-embed"])
         .current_dir(&root)
         .env("HOME", &home)
@@ -51,8 +51,8 @@ fn a_full_reindex_waits_for_the_machines_slot_and_runs_when_it_is_free() {
         .env_remove("INFIGRAPH_DOCS_ENABLED")
         .env_remove("INFIGRAPH_WATCH_DAEMON")
         .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdout(support::stdio::captured(&home, "index.out"))
+        .stderr(support::stdio::captured(&home, "index.err"))
         .spawn()
         .unwrap();
 
@@ -79,9 +79,12 @@ fn a_full_reindex_waits_for_the_machines_slot_and_runs_when_it_is_free() {
 
     // The other rebuild ends. This one runs, and says it had waited.
     drop(other_daemons_rebuild);
-    let done = asked.wait_with_output().unwrap();
-    assert_ok(&done, "index --full after the slot was freed");
-    let said = String::from_utf8_lossy(&done.stderr);
+    let done = asked.wait().unwrap();
+    let said = support::stdio::captured_text(&home, "index.err");
+    assert!(
+        done.success(),
+        "index --full after the slot was freed: {done:?}\n{said}"
+    );
     assert!(
         said.contains("waiting for a machine-wide slot"),
         "the client never said it was waiting:\n{said}"
