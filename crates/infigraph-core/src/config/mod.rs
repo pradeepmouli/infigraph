@@ -288,52 +288,35 @@ pub struct ConfigFileInfo {
     pub profile: String,
 }
 
+/// Every file a config scan may look at: the project's ignore rules for the
+/// code domain, to six levels below `root`.
+///
+/// Hidden files are the one place this differs from the shared walk: config
+/// reads `.env` and `.env.<profile>` on purpose, so the walk lets hidden
+/// entries through and this drops what the shared rule would have -- every
+/// hidden directory, and every hidden file but those.
 fn glob_walk(root: &Path) -> Result<Vec<std::path::PathBuf>> {
+    let mut builder = crate::ignore_rules::walk_builder(root, crate::ignore_rules::Domain::Code);
+    builder.hidden(false).max_depth(Some(6));
     let mut files = Vec::new();
-    walk_config_dir(root, root, &mut files, 0)?;
-    Ok(files)
-}
-
-#[allow(clippy::only_used_in_recursion)]
-fn walk_config_dir(
-    root: &Path,
-    dir: &Path,
-    files: &mut Vec<std::path::PathBuf>,
-    depth: usize,
-) -> Result<()> {
-    if depth > 5 {
-        return Ok(());
-    }
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return Ok(()),
-    };
-    for entry in entries {
-        let entry = entry?;
-        let path = entry.path();
-        let name = entry.file_name().to_string_lossy().to_string();
-        if name.starts_with('.') && name != ".env" && !name.starts_with(".env.") {
+    for entry in builder.build().filter_map(std::result::Result::ok) {
+        if !entry.file_type().is_some_and(|ft| ft.is_file()) {
             continue;
         }
-        if path.is_dir() {
-            let skip = [
-                "node_modules",
-                "target",
-                "build",
-                "dist",
-                ".git",
-                "__pycache__",
-                "venv",
-                ".venv",
-            ];
-            if !skip.contains(&name.as_str()) {
-                walk_config_dir(root, &path, files, depth + 1)?;
-            }
-        } else {
+        let path = entry.into_path();
+        let rel = path.strip_prefix(root).unwrap_or(&path);
+        let hidden_dir = rel
+            .parent()
+            .into_iter()
+            .flat_map(Path::components)
+            .any(|c| c.as_os_str().to_string_lossy().starts_with('.'));
+        let name = rel.file_name().unwrap_or_default().to_string_lossy();
+        let hidden_file = name.starts_with('.') && name != ".env" && !name.starts_with(".env.");
+        if !hidden_dir && !hidden_file {
             files.push(path);
         }
     }
-    Ok(())
+    Ok(files)
 }
 
 fn matches_config_pattern(filename: &str, rel_path: &str, pattern: &str) -> bool {
@@ -682,6 +665,67 @@ mod tests {
             key.contains("feature.enabled") || key.contains("name"),
             "key={}",
             key
+        );
+    }
+}
+
+/// Config discovery walks the project through the shared ignore rules, and
+/// keeps the hidden files it deliberately reads (`.env`, `.env.<profile>`).
+#[cfg(test)]
+mod ignore_rules_tests {
+    use super::*;
+    use crate::settings_file::test_support::{PinnedHome, ENV_LOCK};
+
+    #[test]
+    fn config_files_honour_gitignore_and_ignore_code_but_keep_dotenv() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _home = PinnedHome::empty();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join(".gitignore"), "gen/\n").unwrap();
+        std::fs::create_dir_all(root.join(".infigraph")).unwrap();
+        std::fs::write(
+            root.join(".infigraph/config.toml"),
+            "[ignore]\ncode = [\"skipme/\"]\n",
+        )
+        .unwrap();
+        for rel in [
+            "app/application.yml",
+            "gen/application.yml",
+            "skipme/application.yml",
+            ".github/application.yml",
+            ".env",
+            ".env.prod",
+            ".hidden-config.yml",
+            "a/b/c/d/e/application.yml",
+            "a/b/c/d/e/f/application.yml",
+        ] {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "x: 1\n").unwrap();
+        }
+
+        let mut found: Vec<String> = glob_walk(root)
+            .unwrap()
+            .iter()
+            .map(|p| {
+                p.strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .filter(|rel| !rel.starts_with(".infigraph") && rel != ".gitignore")
+            .collect();
+        found.sort();
+        assert_eq!(
+            found,
+            [
+                ".env",
+                ".env.prod",
+                "a/b/c/d/e/application.yml",
+                "app/application.yml"
+            ],
+            "ignored, hidden-directory and too-deep files are out; .env* stays: {found:?}"
         );
     }
 }
