@@ -295,7 +295,10 @@ and none read `.gitignore`. What that changed:
   list, because `bin/` is also where Rust keeps `src/bin/`.
 - Hidden files are not read by the cross-service scans any more (they used
   to skip hidden directories but would read a hidden file). Config
-  discovery keeps `.env` and `.env.<profile>`.
+  discovery still looks at `.env` and `.env.<profile>`, but through the same
+  ignore rules: a `.env` or `.env.local` the project `.gitignore`s -- nearly
+  every project does -- is no longer bound, while a committed `.env.example`
+  or `.env.production` still is.
 
 A directory you name yourself is not discovered, so the rules do not apply:
 `ingest_directory*`, the cozo and neo4j structured ingest and reflection's

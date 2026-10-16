@@ -294,7 +294,10 @@ pub struct ConfigFileInfo {
 /// Hidden files are the one place this differs from the shared walk: config
 /// reads `.env` and `.env.<profile>` on purpose, so the walk lets hidden
 /// entries through and this drops what the shared rule would have -- every
-/// hidden directory, and every hidden file but those.
+/// hidden directory, and every hidden file but those. The ignore rules still
+/// apply to them: `.env*` files are discovered unless the project ignores
+/// them, and nearly every project `.gitignore`s `.env` and `.env.local`, so
+/// those are not bound; a committed `.env.example` or `.env.production` is.
 fn glob_walk(root: &Path) -> Result<Vec<std::path::PathBuf>> {
     let mut builder = crate::ignore_rules::walk_builder(root, crate::ignore_rules::Domain::Code);
     builder.hidden(false).max_depth(Some(6));
@@ -670,19 +673,20 @@ mod tests {
 }
 
 /// Config discovery walks the project through the shared ignore rules, and
-/// keeps the hidden files it deliberately reads (`.env`, `.env.<profile>`).
+/// looks at the hidden files it deliberately reads (`.env`, `.env.<profile>`)
+/// -- which the same rules can still ignore.
 #[cfg(test)]
 mod ignore_rules_tests {
     use super::*;
     use crate::settings_file::test_support::{PinnedHome, ENV_LOCK};
 
     #[test]
-    fn config_files_honour_gitignore_and_ignore_code_but_keep_dotenv() {
+    fn config_discovery_honours_ignore_rules_and_finds_dotenv_files_unless_they_are_ignored() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _home = PinnedHome::empty();
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        std::fs::write(root.join(".gitignore"), "gen/\n").unwrap();
+        std::fs::write(root.join(".gitignore"), "gen/\n.env\n.env.local\n").unwrap();
         std::fs::create_dir_all(root.join(".infigraph")).unwrap();
         std::fs::write(
             root.join(".infigraph/config.toml"),
@@ -695,7 +699,9 @@ mod ignore_rules_tests {
             "skipme/application.yml",
             ".github/application.yml",
             ".env",
+            ".env.local",
             ".env.prod",
+            ".env.example",
             ".hidden-config.yml",
             "a/b/c/d/e/application.yml",
             "a/b/c/d/e/f/application.yml",
@@ -720,12 +726,13 @@ mod ignore_rules_tests {
         assert_eq!(
             found,
             [
-                ".env",
+                ".env.example",
                 ".env.prod",
                 "a/b/c/d/e/application.yml",
                 "app/application.yml"
             ],
-            "ignored, hidden-directory and too-deep files are out; .env* stays: {found:?}"
+            "ignored, hidden-directory and too-deep files are out, and so are the .env files the \
+             project gitignores (.env, .env.local); tracked .env.* files are discovered: {found:?}"
         );
     }
 }
