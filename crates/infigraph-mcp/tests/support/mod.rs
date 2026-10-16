@@ -34,6 +34,9 @@ use serde_json::{json, Value};
 #[path = "../../../infigraph-core/tests/common/stdio.rs"]
 pub mod stdio;
 
+/// A tiny project with a graph, a document index and a git history.
+pub mod docs;
+
 /// Opt this whole test process out of background watchers. The CLI's
 /// auto-watch and the MCP's own auto-start both honour `INFIGRAPH_NO_WATCH`
 /// (through `daemon::lifecycle::is_ci_env`), and the variable is inherited

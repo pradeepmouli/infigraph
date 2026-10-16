@@ -24,13 +24,14 @@ use anyhow::Result;
 use infigraph_core::docs_switch;
 use infigraph_core::doctor::CheckResult;
 use infigraph_core::escape_str;
-use infigraph_core::git_blame::{self, RangeBlame, SyncState};
+use infigraph_core::git_blame::SyncState;
 use infigraph_core::graph::observe::ObservedGraph;
 use infigraph_core::graph::query_exec::{LocalExec, QueryExec};
 use infigraph_core::graph::remote_exec::RemoteExec;
 
 use crate::code_links::{CodeLinkRow, LinkKind, CODE_LINKS_VERSION};
 use crate::query::DocQuery;
+use crate::stale_docs::{judge, rank, Judgement, COARSE_UNDER_REPORTS};
 use crate::store::DocStore;
 
 pub const CATEGORY: &str = "document links";
@@ -38,21 +39,15 @@ pub const CATEGORY: &str = "document links";
 /// `--docs-sync` judges exactly until this much time has passed.
 pub const SYNC_BUDGET: Duration = Duration::from_secs(120);
 
-/// A whole-file blame is slower than the single range `get_doc_context` asks
-/// for, so `doctor` allows each more than [`git_blame::GIT_TIMEOUT`].
-const SYNC_GIT_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Said whenever coarse results are shown: measured on sittir, the per-file
-/// comparison flagged 311 entries where the exact one flagged 821.
-const COARSE_UNDER_REPORTS: &str = "coarse results compare whole files and under-report \
-     (about 62% on the repository this was measured on)";
-
 const BATCH: usize = 400;
 const EXAMPLES: usize = 10;
 const HINT_CAP: usize = 200;
 
 /// The document store as an observer reads it.
-fn with_docs<T>(root: &Path, f: impl FnOnce(&DocQuery<&dyn QueryExec>) -> Result<T>) -> Result<T> {
+pub(crate) fn with_docs<T>(
+    root: &Path,
+    f: impl FnOnce(&DocQuery<&dyn QueryExec>) -> Result<T>,
+) -> Result<T> {
     let watch_lock = root.join(".infigraph").join("watch.lock");
     if infigraph_core::daemon::lifecycle::daemon_is_alive(&watch_lock) {
         let remote = RemoteExec::docs_observer(root);
@@ -69,10 +64,10 @@ fn with_docs<T>(root: &Path, f: impl FnOnce(&DocQuery<&dyn QueryExec>) -> Result
 
 /// A live symbol a key resolved to.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Live {
-    file: String,
-    start: usize,
-    end: usize,
+pub(crate) struct Live {
+    pub file: String,
+    pub start: usize,
+    pub end: usize,
 }
 
 /// Why a key resolves to nothing.
@@ -271,18 +266,6 @@ fn keys_result(
     )
 }
 
-/// One entry judged against its code.
-struct Judged {
-    key: String,
-    doc_file: String,
-    line: usize,
-    state: SyncState,
-    exact: bool,
-}
-
-/// `file` -> the blame of each of `ranges`, or why not.
-type Blamed = HashMap<String, std::result::Result<Vec<RangeBlame>, String>>;
-
 fn sync_result(
     root: &Path,
     entries: &[(CodeLinkRow, Live)],
@@ -290,73 +273,9 @@ fn sync_result(
     budget: Duration,
 ) -> CheckResult {
     let name = format!("{}: doc/code sync", root.display());
-
-    // The ranges each file is asked about, in one git call per file.
-    let mut ranges: BTreeMap<&str, Vec<(usize, usize)>> = BTreeMap::new();
-    for (row, live) in entries {
-        ranges
-            .entry(live.file.as_str())
-            .or_default()
-            .push((live.start, live.end));
-        ranges
-            .entry(row.doc_file.as_str())
-            .or_default()
-            .push((row.line_start, row.line_end));
-    }
-    // Documents first: there are few of them and every entry needs one.
-    let mut order: Vec<&str> = ranges.keys().copied().collect();
-    let doc_files: std::collections::HashSet<&str> =
-        entries.iter().map(|(r, _)| r.doc_file.as_str()).collect();
-    order.sort_by_key(|f| (!doc_files.contains(f), *f));
-
-    let mut exact: Blamed = HashMap::new();
-    for file in order {
-        if started.elapsed() >= budget {
-            continue;
-        }
-        let asked = &ranges[file];
-        let got =
-            git_blame::blame_ranges(root, file, asked, SYNC_GIT_TIMEOUT).map_err(|e| e.to_string());
-        exact.insert(file.to_string(), got);
-    }
-
-    let lookup = |file: &str, range: (usize, usize)| -> Option<RangeBlame> {
-        let blamed = exact.get(file)?.as_ref().ok()?;
-        let at = ranges[file].iter().position(|r| *r == range)?;
-        blamed.get(at).cloned()
-    };
-    let mut coarse_cache: HashMap<String, Option<RangeBlame>> = HashMap::new();
-    let mut coarse = |file: &str| -> Option<RangeBlame> {
-        coarse_cache
-            .entry(file.to_string())
-            .or_insert_with(|| {
-                git_blame::last_commit_of_file(root, file, SYNC_GIT_TIMEOUT)
-                    .ok()
-                    .flatten()
-            })
-            .clone()
-    };
-
-    let mut judged: Vec<Judged> = Vec::new();
-    let mut unknown = 0usize;
-    for (row, live) in entries {
-        let exact_pair = lookup(&live.file, (live.start, live.end))
-            .zip(lookup(&row.doc_file, (row.line_start, row.line_end)));
-        let (pair, is_exact) = match exact_pair {
-            Some(pair) => (Some(pair), true),
-            None => (coarse(&live.file).zip(coarse(&row.doc_file)), false),
-        };
-        match pair {
-            Some((code, entry)) => judged.push(Judged {
-                key: row.target.clone(),
-                doc_file: row.doc_file.clone(),
-                line: row.line_start,
-                state: git_blame::compare(&code, &entry),
-                exact: is_exact,
-            }),
-            None => unknown += 1,
-        }
-    }
+    let Judgement {
+        judged, unknown, ..
+    } = judge(root, entries, started, budget);
 
     let stale = |exact: bool| {
         judged
@@ -388,23 +307,14 @@ fn sync_result(
             "\n  {unknown} entries could not be judged: git gave no answer for their files"
         ));
     }
-    let mut stale_examples: Vec<&Judged> = judged
-        .iter()
-        .filter(|j| j.state != SyncState::InSync)
-        .collect();
-    stale_examples.sort_by_key(|j| {
-        std::cmp::Reverse(match &j.state {
-            SyncState::PossiblyStale { code, entry } => (code.time - entry.time, j.exact),
-            SyncState::InSync => (0, false),
-        })
-    });
+    let stale_examples = rank(&judged);
     for j in stale_examples.iter().take(EXAMPLES) {
         let label = j.state.label().unwrap_or_default();
         message.push_str(&format!(
             "\n    {} ({}:{}){} {label}",
             j.key,
             j.doc_file,
-            j.line,
+            j.doc_lines.0,
             if j.exact { "" } else { " [coarse]" },
         ));
     }
@@ -425,6 +335,14 @@ fn sync_result(
              update the entry, or touch it once it is confirmed current",
         )
     }
+}
+
+/// The live symbols among `keys` (key -> where), read as an observer reads the
+/// graph.
+pub(crate) fn live_symbols(root: &Path, keys: &[&str]) -> Result<HashMap<String, Live>> {
+    let graph_path = root.join(".infigraph").join("graph");
+    let observed = ObservedGraph::open(root, &graph_path)?;
+    observed.with_exec(|exec| resolve(exec, keys).0)
 }
 
 /// Every check of one project's document links; empty when the project has no

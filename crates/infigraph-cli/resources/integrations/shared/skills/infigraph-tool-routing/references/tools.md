@@ -2,7 +2,7 @@
 
 # Infigraph MCP tools
 
-Every tool the Infigraph MCP server advertises (98 in all), grouped by task. Read only the section you need.
+Every tool the Infigraph MCP server advertises (99 in all), grouped by task. Read only the section you need.
 
 - [Find and read code](#find-and-read-code) — search, search_symbols, search_code, semantic_search, get_symbols_in_file, get_code_snippet, symbol_context, get_doc_context, get_skeleton, list_files
 - [Callers, references and change impact](#callers-references-and-change-impact) — trace_callers, trace_callees, find_all_references, transitive_impact, detect_changes, semantic_diff, get_type_hierarchy, get_file_deps, get_dependencies, generate_sequence_diagram
@@ -11,7 +11,7 @@ Every tool the Infigraph MCP server advertises (98 in all), grouped by task. Rea
 - [Graph queries and export](#graph-queries-and-export) — query_graph, export_graph, visualize, visualize_symbol
 - [Indexing and projects](#indexing-and-projects) — index_project, list_projects, delete_project, list_languages, scip_import, index_manifests, ingest_structured, doctor
 - [Watching for changes](#watching-for-changes) — watch_project, stop_watch, restart_watch, enable_watch, disable_watch, get_watch_status
-- [Documents and Confluence](#documents-and-confluence) — index_docs, search_docs, reindex_docs, clean_docs, index_confluence, index_confluence_pages, watch_docs, stop_watch_docs, restart_watch_docs, enable_watch_docs, disable_watch_docs
+- [Documents and Confluence](#documents-and-confluence) — index_docs, search_docs, stale_docs, reindex_docs, clean_docs, index_confluence, index_confluence_pages, watch_docs, stop_watch_docs, restart_watch_docs, enable_watch_docs, disable_watch_docs
 - [Multi-repo groups](#multi-repo-groups) — group_list, group_create, group_add, group_index, group_build, group_sync, group_link, group_link_docs, group_query, group_search, group_search_docs, group_contracts, group_deps
 - [Data pipelines](#data-pipelines) — pipeline_plugins, pipeline_query, pipeline_deps, pipeline_impact, pipeline_compliance
 - [Sessions and memory](#sessions-and-memory) — get_latest_session, save_session, search_sessions, purge_sessions, memory_context, consolidate_memory
@@ -639,6 +639,17 @@ Search indexed documents by meaning or keywords. Returns matching chunks with fi
 | `query` | string | yes |  |  |
 | `limit` | integer |  |  |  |
 | `path` | string |  |  |  |
+
+### `stale_docs`
+
+PRIMARY: Which glossary entries (indexed Markdown sections whose heading is a symbol id) describe code that changed after they did, biggest gap first, and WHAT changed: per entry the document and lines to edit, when the code and the entry were last touched, and the commits (subject, date) and patch lines that changed the symbol since the entry. Read-only: infigraph never writes prose; edit the entry in the Markdown, then the document index refreshes (reindex_docs if no doc watcher runs). Use AFTER changing code that has a glossary entry (get_doc_context shows whether a symbol has one), or to audit a subtree. path_prefix limits to entries whose code or document lies under it; symbol limits to one id (fuller history); limit defaults to 20. Judged from git blame (exact within a time budget, then per file, which under-reports and says so); no git history is the degraded mode doc-sync-unknown, not an error.
+
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `limit` | integer |  | `20` | Most entries to list, ranked by the gap between code and entry (default: 20) |
+| `path` | string |  |  | see Common parameters |
+| `path_prefix` | string |  |  | Restrict the analysis to files under this directory (or to this one file), relative to the project root, e.g. 'crates/infigraph-core'. Matches whole path components. Default: the whole project. |
+| `symbol` | string |  |  | One symbol id, e.g. 'src/app.py::compute_total': only its entry, with more history |
 
 ### `reindex_docs`
 
