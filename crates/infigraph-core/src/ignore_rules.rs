@@ -509,7 +509,18 @@ fn apply_filter_and_includes(
 /// `domain`. Callers may add further configuration (e.g. `.max_depth`)
 /// before calling `.build()`.
 pub fn walk_builder(root: &Path, domain: Domain) -> WalkBuilder {
-    let project_root = crate::project::resolve_project_root(root);
+    walk_builder_in(root, &crate::project::resolve_project_root(root), domain)
+}
+
+/// [`walk_builder`] for a tree that is not the project's own checkout,
+/// judged by the configuration of `project_root`.
+///
+/// `walk_builder` finds a project's `.infigraph/config.toml` from the walk
+/// root. A tree extracted elsewhere -- a git ref `git archive`d into a temp
+/// directory -- has no such file, and its rules must still be the
+/// project's: `[ignore]` patterns anchor at the archive root, which is the
+/// project root of that ref.
+pub fn walk_builder_in(root: &Path, project_root: &Path, domain: Domain) -> WalkBuilder {
     let mut builder = WalkBuilder::new(root);
     builder
         .hidden(true)
@@ -518,8 +529,8 @@ pub fn walk_builder(root: &Path, domain: Domain) -> WalkBuilder {
         .add_custom_ignore_filename(".infigraphignore");
     apply_filter_and_includes(
         &mut builder,
-        include_roots(root, &project_root),
-        DomainRules::for_walk(root, &project_root, domain),
+        include_roots(root, project_root),
+        DomainRules::for_walk(root, project_root, domain),
     );
     builder
 }

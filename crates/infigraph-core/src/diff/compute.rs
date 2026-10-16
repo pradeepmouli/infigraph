@@ -114,9 +114,12 @@ fn extract_ref_symbols(
     }
 
     let is_working_tree = git_ref == "HEAD" || git_ref == "WORKING";
+    // Both sides are judged by the project's rules, the working tree's own
+    // and the ones extracted into a temp directory alike.
+    let rules_root = crate::project::resolve_project_root(project_root);
 
     if is_working_tree {
-        return extract_dir_symbols(project_root, project_root, registry, file_filter);
+        return extract_dir_symbols(project_root, &rules_root, registry, file_filter);
     }
 
     let tmp = tempfile::tempdir().context("failed to create temp dir")?;
@@ -159,16 +162,29 @@ fn extract_ref_symbols(
                 let err2 = String::from_utf8_lossy(&full_output.stderr);
                 anyhow::bail!("git archive {} failed: {}", git_ref, err2.trim());
             }
-            return untar_and_extract(tmp.path(), &full_output.stdout, registry, file_filter);
+            return untar_and_extract(
+                tmp.path(),
+                &rules_root,
+                &full_output.stdout,
+                registry,
+                file_filter,
+            );
         }
         anyhow::bail!("git archive {} failed: {}", git_ref, err.trim());
     }
 
-    untar_and_extract(tmp.path(), &archive_output.stdout, registry, file_filter)
+    untar_and_extract(
+        tmp.path(),
+        &rules_root,
+        &archive_output.stdout,
+        registry,
+        file_filter,
+    )
 }
 
 fn untar_and_extract(
     tmp_dir: &Path,
+    rules_root: &Path,
     tar_data: &[u8],
     registry: &LanguageRegistry,
     file_filter: Option<&HashSet<String>>,
@@ -182,94 +198,79 @@ fn untar_and_extract(
     if let Some(stdin) = tar.stdin.take() {
         use std::io::Write;
         let mut w = stdin;
-        w.write_all(tar_data)?;
+        match w.write_all(tar_data) {
+            Ok(()) => {}
+            // bsdtar stops reading at the archive's end marker, and
+            // `git archive` pads past it: the writer sees a closed pipe for
+            // the padding. That is the extraction having finished, not
+            // failed -- but it is an error to a `write_all` whenever the
+            // padding does not fit in the pipe buffer.
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+            Err(e) => return Err(e.into()),
+        }
     }
     tar.wait().context("tar wait failed")?;
 
-    extract_dir_symbols(tmp_dir, tmp_dir, registry, file_filter)
+    extract_dir_symbols(tmp_dir, rules_root, registry, file_filter)
 }
 
+/// The symbols of every file under `root` the project's code-domain ignore
+/// rules admit. `rules_root` is the project whose configuration applies:
+/// `root` itself for the working tree, the project for an extracted ref.
 fn extract_dir_symbols(
     root: &Path,
-    dir: &Path,
+    rules_root: &Path,
     registry: &LanguageRegistry,
     file_filter: Option<&HashSet<String>>,
 ) -> Result<HashMap<String, FlatSym>> {
     let mut map = HashMap::new();
-    collect_symbols(root, dir, registry, file_filter, &mut map)?;
-    Ok(map)
-}
-
-static SKIP_DIRS: &[&str] = &[
-    ".git",
-    "node_modules",
-    ".venv",
-    "venv",
-    "target",
-    "build",
-    "dist",
-    "__pycache__",
-    ".tox",
-    ".infigraph",
-];
-
-fn collect_symbols(
-    root: &Path,
-    dir: &Path,
-    registry: &LanguageRegistry,
-    file_filter: Option<&HashSet<String>>,
-    map: &mut HashMap<String, FlatSym>,
-) -> Result<()> {
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
+    for entry in
+        crate::ignore_rules::walk_builder_in(root, rules_root, crate::ignore_rules::Domain::Code)
+            .build()
+            .filter_map(std::result::Result::ok)
+    {
+        if !entry.file_type().is_some_and(|ft| ft.is_file()) {
+            continue;
+        }
         let path = entry.path();
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-
-        if path.is_dir() {
-            if !SKIP_DIRS.contains(&name_str.as_ref()) && !name_str.starts_with('.') {
-                collect_symbols(root, &path, registry, file_filter, map)?;
-            }
-        } else if path.is_file() {
-            let rel = path
-                .strip_prefix(root)
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .replace('\\', "/");
-            if let Some(filter) = file_filter {
-                if !filter.contains(&rel) {
-                    continue;
-                }
-            }
-            let Ok(source) = std::fs::read(&path) else {
+        let rel = path
+            .strip_prefix(root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        if let Some(filter) = file_filter {
+            if !filter.contains(&rel) {
                 continue;
-            };
-            let Some(pack) = registry.for_file_with_content(&rel, &source) else {
-                continue;
-            };
-            let Ok(extraction) = extract::extract_file(&rel, &source, pack) else {
-                continue;
-            };
-            let file = extraction.file.clone();
-            for sym in &extraction.symbols {
-                let kind_str = sym.kind.as_str().to_string();
-                // Key: "file::name::kind" — stable across refs
-                let key = format!("{}::{}::{}", file, sym.name, kind_str);
-                map.insert(
-                    key,
-                    FlatSym {
-                        file: file.clone(),
-                        name: sym.name.clone(),
-                        kind: kind_str,
-                        sig_hash: sym.signature_hash.clone(),
-                        params: sym.parameters.clone().unwrap_or_default(),
-                        return_type: sym.return_type.clone().unwrap_or_default(),
-                    },
-                );
             }
         }
+        let Ok(source) = std::fs::read(path) else {
+            continue;
+        };
+        let Some(pack) = registry.for_file_with_content(&rel, &source) else {
+            continue;
+        };
+        let Ok(extraction) = extract::extract_file(&rel, &source, pack) else {
+            continue;
+        };
+        let file = extraction.file.clone();
+        for sym in &extraction.symbols {
+            let kind_str = sym.kind.as_str().to_string();
+            // Key: "file::name::kind" -- stable across refs
+            let key = format!("{}::{}::{}", file, sym.name, kind_str);
+            map.insert(
+                key,
+                FlatSym {
+                    file: file.clone(),
+                    name: sym.name.clone(),
+                    kind: kind_str,
+                    sig_hash: sym.signature_hash.clone(),
+                    params: sym.parameters.clone().unwrap_or_default(),
+                    return_type: sym.return_type.clone().unwrap_or_default(),
+                },
+            );
+        }
     }
-    Ok(())
+    Ok(map)
 }
 
 // ---------------------------------------------------------------------------
