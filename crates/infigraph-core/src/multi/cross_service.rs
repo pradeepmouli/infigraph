@@ -946,6 +946,32 @@ fn is_test_or_doc_file(rel_path: &str) -> bool {
     false
 }
 
+/// Every file under `root` that the project's ignore rules admit for the code
+/// domain, with its `root`-relative, `/`-separated path.
+///
+/// The one walk behind every `scan_for_*` below. They used to be seven
+/// hand-rolled `read_dir` recursions with a private skip list each, none of
+/// which read `.gitignore`, `.infigraphignore` or `[ignore] code`, so a
+/// vendored or generated tree the code graph excludes still produced
+/// cross-service rows. Hidden files are not walked (the shared walker's
+/// rule); the old recursions skipped hidden directories but would read a
+/// hidden file.
+fn walk_source_files(root: &Path) -> impl Iterator<Item = (std::path::PathBuf, String)> + '_ {
+    crate::ignore_rules::walk_builder(root, crate::ignore_rules::Domain::Code)
+        .build()
+        .filter_map(std::result::Result::ok)
+        .filter(|entry| entry.file_type().is_some_and(|ft| ft.is_file()))
+        .map(move |entry| {
+            let path = entry.into_path();
+            let rel = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            (path, rel)
+        })
+}
+
 /// Scan source files for URL strings matching route patterns.
 /// Also resolves named constants (e.g., `DOC_UPLOAD_PATH = "/v1/..."`): the raw
 /// literal appears only at the class/module-level definition line, so the enclosing
@@ -955,20 +981,10 @@ fn is_test_or_doc_file(rel_path: &str) -> bool {
 /// follow-up).
 /// Returns (file, line_hint, url, consumer_http_method).
 fn scan_source_for_urls(root: &Path) -> Vec<(String, String, String, Option<String>)> {
-    const SKIP_DIRS: &[&str] = &[
-        ".infigraph",
-        ".git",
-        "node_modules",
-        "target",
-        "build",
-        "dist",
-        "__pycache__",
-        ".venv",
-    ];
     let mut results = Vec::new();
     let mut url_constants: HashMap<String, Vec<(String, usize, String)>> = HashMap::new();
-    walk_for_urls(root, root, SKIP_DIRS, &mut results, &mut url_constants);
-    credit_constant_references(root, SKIP_DIRS, &url_constants, &mut results);
+    scan_for_urls(root, &mut results, &mut url_constants);
+    credit_constant_references(root, &url_constants, &mut results);
     results
 }
 
@@ -978,7 +994,6 @@ fn scan_source_for_urls(root: &Path) -> Vec<(String, String, String, Option<Stri
 /// Skips the definition line itself. Same-file references only.
 fn credit_constant_references(
     root: &Path,
-    skip: &[&str],
     url_constants: &HashMap<String, Vec<(String, usize, String)>>,
     results: &mut Vec<(String, String, String, Option<String>)>,
 ) {
@@ -995,62 +1010,41 @@ fn credit_constant_references(
                 .push((name.clone(), *def_line, url.clone()));
         }
     }
-    walk_for_constant_refs(root, root, skip, &by_file, results);
+    scan_for_constant_refs(root, &by_file, results);
 }
 
-fn walk_for_constant_refs(
+fn scan_for_constant_refs(
     base: &Path,
-    dir: &Path,
-    skip: &[&str],
     by_file: &HashMap<String, Vec<(String, usize, String)>>,
     results: &mut Vec<(String, String, String, Option<String>)>,
 ) {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-
-        if path.is_dir() {
-            if !skip.contains(&name_str.as_ref()) && !name_str.starts_with('.') {
-                walk_for_constant_refs(base, &path, skip, by_file, results);
-            }
-        } else if path.is_file() {
-            let rel = path
-                .strip_prefix(base)
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .replace('\\', "/");
-            let consts = match by_file.get(rel.as_str()) {
-                Some(c) => c,
-                None => continue,
-            };
-            if is_test_or_doc_file(&rel) {
-                continue;
-            }
-            let content = match std::fs::read_to_string(&path) {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-            for (line_num, line) in content.lines().enumerate() {
-                let line_no = line_num + 1;
-                for (const_name, def_line, url) in consts {
-                    // Skip the definition line itself (already emitted by walk_for_urls).
-                    if line_no == *def_line {
-                        continue;
-                    }
-                    if line_contains_identifier(line, const_name) {
-                        let consumer_method = extract_http_method_from_line(line);
-                        results.push((
-                            rel.clone(),
-                            format!("line:{}", line_no),
-                            url.clone(),
-                            consumer_method,
-                        ));
-                    }
+    for (path, rel) in walk_source_files(base) {
+        let consts = match by_file.get(rel.as_str()) {
+            Some(c) => c,
+            None => continue,
+        };
+        if is_test_or_doc_file(&rel) {
+            continue;
+        }
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        for (line_num, line) in content.lines().enumerate() {
+            let line_no = line_num + 1;
+            for (const_name, def_line, url) in consts {
+                // Skip the definition line itself (already emitted by scan_for_urls).
+                if line_no == *def_line {
+                    continue;
+                }
+                if line_contains_identifier(line, const_name) {
+                    let consumer_method = extract_http_method_from_line(line);
+                    results.push((
+                        rel.clone(),
+                        format!("line:{}", line_no),
+                        url.clone(),
+                        consumer_method,
+                    ));
                 }
             }
         }
@@ -1146,72 +1140,51 @@ fn is_route_decorator(line: &str) -> bool {
     false
 }
 
-fn walk_for_urls(
+fn scan_for_urls(
     base: &Path,
-    dir: &Path,
-    skip: &[&str],
     results: &mut Vec<(String, String, String, Option<String>)>,
     url_constants: &mut HashMap<String, Vec<(String, usize, String)>>,
 ) {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-
-        if path.is_dir() {
-            if !skip.contains(&name_str.as_ref()) && !name_str.starts_with('.') {
-                walk_for_urls(base, &path, skip, results, url_constants);
-            }
-        } else if path.is_file() {
-            let rel = path
-                .strip_prefix(base)
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .replace('\\', "/");
-            if is_test_or_doc_file(&rel) {
+    for (path, rel) in walk_source_files(base) {
+        if is_test_or_doc_file(&rel) {
+            continue;
+        }
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        for (line_num, line) in content.lines().enumerate() {
+            if is_route_decorator(line) || is_non_call_context(line) {
                 continue;
             }
-            let content = match std::fs::read_to_string(&path) {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-            for (line_num, line) in content.lines().enumerate() {
-                if is_route_decorator(line) || is_non_call_context(line) {
-                    continue;
-                }
-                for delim in ['"', '\'', '`'] {
-                    for part in line.split(delim) {
-                        let trimmed = part.trim();
-                        if trimmed.len() < 200 && !trimmed.contains(' ') {
-                            let path_part = if trimmed.starts_with("http") {
-                                trimmed
-                                    .split("//")
-                                    .nth(1)
-                                    .and_then(|s| s.find('/').map(|i| &s[i..]))
-                                    .unwrap_or(trimmed)
-                            } else {
-                                strip_fstring_prefix(trimmed)
-                            };
-                            if is_route_like_path(path_part) {
-                                let consumer_method = extract_http_method_from_line(line);
-                                results.push((
+            for delim in ['"', '\'', '`'] {
+                for part in line.split(delim) {
+                    let trimmed = part.trim();
+                    if trimmed.len() < 200 && !trimmed.contains(' ') {
+                        let path_part = if trimmed.starts_with("http") {
+                            trimmed
+                                .split("//")
+                                .nth(1)
+                                .and_then(|s| s.find('/').map(|i| &s[i..]))
+                                .unwrap_or(trimmed)
+                        } else {
+                            strip_fstring_prefix(trimmed)
+                        };
+                        if is_route_like_path(path_part) {
+                            let consumer_method = extract_http_method_from_line(line);
+                            results.push((
+                                rel.clone(),
+                                format!("line:{}", line_num + 1),
+                                path_part.to_string(),
+                                consumer_method,
+                            ));
+                            // Record as named constant if line is an assignment
+                            if let Some(const_name) = extract_constant_name(line, path_part) {
+                                url_constants.entry(const_name).or_default().push((
                                     rel.clone(),
-                                    format!("line:{}", line_num + 1),
+                                    line_num + 1,
                                     path_part.to_string(),
-                                    consumer_method,
                                 ));
-                                // Record as named constant if line is an assignment
-                                if let Some(const_name) = extract_constant_name(line, path_part) {
-                                    url_constants.entry(const_name).or_default().push((
-                                        rel.clone(),
-                                        line_num + 1,
-                                        path_part.to_string(),
-                                    ));
-                                }
                             }
                         }
                     }
@@ -1249,71 +1222,38 @@ fn extract_constant_name(line: &str, _path: &str) -> Option<String> {
 /// Scan source files for /openapi.json or /swagger.json fetch references.
 /// Returns (file, line_hint, spec_path).
 fn scan_source_for_spec_fetches(root: &Path) -> Vec<(String, String, String)> {
-    const SKIP_DIRS: &[&str] = &[
-        ".infigraph",
-        ".git",
-        "node_modules",
-        "target",
-        "build",
-        "dist",
-        "__pycache__",
-        ".venv",
-    ];
     let mut results = Vec::new();
-    walk_for_spec_fetches(root, root, SKIP_DIRS, &mut results);
+    scan_for_spec_fetches(root, &mut results);
     results
 }
 
-fn walk_for_spec_fetches(
-    base: &Path,
-    dir: &Path,
-    skip: &[&str],
-    results: &mut Vec<(String, String, String)>,
-) {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-        if path.is_dir() {
-            if !skip.contains(&name_str.as_ref()) && !name_str.starts_with('.') {
-                walk_for_spec_fetches(base, &path, skip, results);
-            }
-        } else if path.is_file() {
-            let rel = path
-                .strip_prefix(base)
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .replace('\\', "/");
-            if is_test_or_doc_file(&rel) {
+fn scan_for_spec_fetches(base: &Path, results: &mut Vec<(String, String, String)>) {
+    for (path, rel) in walk_source_files(base) {
+        if is_test_or_doc_file(&rel) {
+            continue;
+        }
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        for (line_num, line) in content.lines().enumerate() {
+            if is_route_decorator(line) || is_non_call_context(line) {
                 continue;
             }
-            let content = match std::fs::read_to_string(&path) {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-            for (line_num, line) in content.lines().enumerate() {
-                if is_route_decorator(line) || is_non_call_context(line) {
-                    continue;
-                }
-                for delim in ['"', '\'', '`'] {
-                    for part in line.split(delim) {
-                        let trimmed = part.trim();
-                        let stripped = strip_fstring_prefix(trimmed);
-                        if (stripped == "/openapi.json" || stripped == "/swagger.json")
-                            && trimmed != stripped
-                        {
-                            // trimmed != stripped means an f-string prefix was present,
-                            // indicating URL construction (fetch), not a bare config value.
-                            results.push((
-                                rel.clone(),
-                                format!("line:{}", line_num + 1),
-                                stripped.to_string(),
-                            ));
-                        }
+            for delim in ['"', '\'', '`'] {
+                for part in line.split(delim) {
+                    let trimmed = part.trim();
+                    let stripped = strip_fstring_prefix(trimmed);
+                    if (stripped == "/openapi.json" || stripped == "/swagger.json")
+                        && trimmed != stripped
+                    {
+                        // trimmed != stripped means an f-string prefix was present,
+                        // indicating URL construction (fetch), not a bare config value.
+                        results.push((
+                            rel.clone(),
+                            format!("line:{}", line_num + 1),
+                            stripped.to_string(),
+                        ));
                     }
                 }
             }
@@ -1332,21 +1272,9 @@ fn scan_source_for_contracts(
     if route_lookup.is_empty() {
         return Vec::new();
     }
-    const SKIP_DIRS: &[&str] = &[
-        ".infigraph",
-        ".git",
-        "node_modules",
-        "target",
-        "build",
-        "dist",
-        "__pycache__",
-        ".venv",
-    ];
     let mut results = Vec::new();
-    walk_for_contracts(
+    scan_for_contracts(
         root,
-        root,
-        SKIP_DIRS,
         route_lookup,
         wildcard_methods,
         caller_repo,
@@ -1355,107 +1283,74 @@ fn scan_source_for_contracts(
     results
 }
 
-fn walk_for_contracts(
+fn scan_for_contracts(
     base: &Path,
-    dir: &Path,
-    skip: &[&str],
     route_lookup: &HashMap<String, Vec<(String, String)>>,
     wildcard_methods: &HashMap<String, (String, Vec<String>)>,
     caller_repo: &str,
     results: &mut Vec<(String, String, String, String, String)>,
 ) {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-
-        if path.is_dir() {
-            if !skip.contains(&name_str.as_ref()) && !name_str.starts_with('.') {
-                walk_for_contracts(
-                    base,
-                    &path,
-                    skip,
-                    route_lookup,
-                    wildcard_methods,
-                    caller_repo,
-                    results,
-                );
-            }
-        } else if path.is_file() {
-            let rel = path
-                .strip_prefix(base)
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .replace('\\', "/");
-            if is_test_or_doc_file(&rel) {
+    for (path, rel) in walk_source_files(base) {
+        if is_test_or_doc_file(&rel) {
+            continue;
+        }
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        for (line_num, line) in content.lines().enumerate() {
+            if is_route_decorator(line) || is_non_call_context(line) {
                 continue;
             }
-            let content = match std::fs::read_to_string(&path) {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-            for (line_num, line) in content.lines().enumerate() {
-                if is_route_decorator(line) || is_non_call_context(line) {
-                    continue;
-                }
-                for delim in ['"', '\'', '`'] {
-                    for part in line.split(delim) {
-                        let trimmed = part.trim();
-                        let stripped = strip_fstring_prefix(trimmed);
-                        if stripped.len() < 200
-                            && !stripped.is_empty()
-                            && !stripped.contains(' ')
-                            && stripped.starts_with('/')
-                        {
-                            let normalized = normalize_route_path(stripped);
-                            let consumer_method = extract_http_method_from_line(line);
-                            // Exact match first — prefer a different service
-                            let hit = if let Some(entries) = route_lookup.get(&normalized) {
-                                entries
-                                    .iter()
-                                    .find(|(svc, _)| svc != caller_repo)
-                                    .map(|(svc, method)| (svc.clone(), method.clone()))
-                            } else {
-                                // Wildcard fallback with proper method resolution
-                                let wc = format!("{}/*", normalized);
-                                wildcard_methods.get(&wc).map(|(svc, methods)| {
-                                    let method = if let Some(ref cm) = consumer_method {
-                                        let cm_upper = cm.to_ascii_uppercase();
-                                        if methods.iter().any(|m| m.eq_ignore_ascii_case(&cm_upper))
-                                        {
-                                            cm_upper
-                                        } else if methods
-                                            .iter()
-                                            .any(|m| m.eq_ignore_ascii_case("GET"))
-                                        {
-                                            "GET".to_string()
-                                        } else {
-                                            methods[0].clone()
-                                        }
+            for delim in ['"', '\'', '`'] {
+                for part in line.split(delim) {
+                    let trimmed = part.trim();
+                    let stripped = strip_fstring_prefix(trimmed);
+                    if stripped.len() < 200
+                        && !stripped.is_empty()
+                        && !stripped.contains(' ')
+                        && stripped.starts_with('/')
+                    {
+                        let normalized = normalize_route_path(stripped);
+                        let consumer_method = extract_http_method_from_line(line);
+                        // Exact match first — prefer a different service
+                        let hit = if let Some(entries) = route_lookup.get(&normalized) {
+                            entries
+                                .iter()
+                                .find(|(svc, _)| svc != caller_repo)
+                                .map(|(svc, method)| (svc.clone(), method.clone()))
+                        } else {
+                            // Wildcard fallback with proper method resolution
+                            let wc = format!("{}/*", normalized);
+                            wildcard_methods.get(&wc).map(|(svc, methods)| {
+                                let method = if let Some(ref cm) = consumer_method {
+                                    let cm_upper = cm.to_ascii_uppercase();
+                                    if methods.iter().any(|m| m.eq_ignore_ascii_case(&cm_upper)) {
+                                        cm_upper
                                     } else if methods.iter().any(|m| m.eq_ignore_ascii_case("GET"))
                                     {
                                         "GET".to_string()
                                     } else {
                                         methods[0].clone()
-                                    };
-                                    (svc.clone(), method)
-                                })
-                            };
-                            if let Some((target_svc, target_method)) = hit {
-                                if target_svc != caller_repo {
-                                    let effective_method = consumer_method.unwrap_or(target_method);
-                                    results.push((
-                                        rel.clone(),
-                                        format!("line:{}", line_num + 1),
-                                        stripped.to_string(),
-                                        target_svc.clone(),
-                                        effective_method,
-                                    ));
-                                }
+                                    }
+                                } else if methods.iter().any(|m| m.eq_ignore_ascii_case("GET")) {
+                                    "GET".to_string()
+                                } else {
+                                    methods[0].clone()
+                                };
+                                (svc.clone(), method)
+                            })
+                        };
+                        if let Some((target_svc, target_method)) = hit {
+                            if target_svc != caller_repo {
+                                let effective_method = consumer_method.unwrap_or(target_method);
+                                results.push((
+                                    rel.clone(),
+                                    format!("line:{}", line_num + 1),
+                                    stripped.to_string(),
+                                    target_svc.clone(),
+                                    effective_method,
+                                ));
                             }
                         }
                     }
@@ -1482,16 +1377,6 @@ fn scan_source_for_grpc_stubs(root: &Path, services: &[String]) -> Vec<(String, 
     if services.is_empty() {
         return Vec::new();
     }
-    const SKIP_DIRS: &[&str] = &[
-        ".infigraph",
-        ".git",
-        "node_modules",
-        "target",
-        "build",
-        "dist",
-        "__pycache__",
-        ".venv",
-    ];
     // Per-language stub tokens (all lower-cased; the scan lower-cases each line).
     // Each is a self-contained substring that only appears at a real client
     // call/type site for the given service — the protoc/tonic/grpc codegen
@@ -1539,93 +1424,54 @@ fn scan_source_for_grpc_stubs(root: &Path, services: &[String]) -> Vec<(String, 
         .map(|svc| (svc.to_lowercase(), svc.clone()))
         .collect();
     let mut results = Vec::new();
-    walk_for_grpc_stubs(
-        root,
-        root,
-        SKIP_DIRS,
-        &token_to_service,
-        &connect_markers,
-        &mut results,
-    );
+    scan_for_grpc_stubs(root, &token_to_service, &connect_markers, &mut results);
     results
 }
 
-fn walk_for_grpc_stubs(
+fn scan_for_grpc_stubs(
     base: &Path,
-    dir: &Path,
-    skip: &[&str],
     token_to_service: &[(String, String)],
     connect_markers: &[(String, String)],
     results: &mut Vec<(String, String, String)>,
 ) {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-
-        if path.is_dir() {
-            if !skip.contains(&name_str.as_ref()) && !name_str.starts_with('.') {
-                walk_for_grpc_stubs(
-                    base,
-                    &path,
-                    skip,
-                    token_to_service,
-                    connect_markers,
-                    results,
-                );
+    for (path, rel) in walk_source_files(base) {
+        // Only scan real source; skip .proto (that's the producer) and
+        // test/doc files (consistent with the HTTP scanners).
+        if rel.ends_with(".proto") || is_test_or_doc_file(&rel) {
+            continue;
+        }
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        // One hit per (file, service) — first reference line is enough to
+        // attach the dependency; dedup keeps the earliest.
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for (line_num, line) in content.lines().enumerate() {
+            let line_lower = line.to_lowercase();
+            for (token, svc) in token_to_service {
+                if seen.contains(svc.as_str()) {
+                    continue;
+                }
+                if line_lower.contains(token.as_str()) {
+                    seen.insert(svc.as_str());
+                    results.push((rel.clone(), format!("line:{}", line_num + 1), svc.clone()));
+                }
             }
-        } else if path.is_file() {
-            // Only scan real source; skip .proto (that's the producer) and
-            // test/doc files (consistent with the HTTP scanners).
-            let rel = path
-                .strip_prefix(base)
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .replace('\\', "/");
-            if rel.ends_with(".proto") || is_test_or_doc_file(&rel) {
-                continue;
-            }
-            let content = match std::fs::read_to_string(&path) {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-            // One hit per (file, service) — first reference line is enough to
-            // attach the dependency; dedup keeps the earliest.
-            let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
-            for (line_num, line) in content.lines().enumerate() {
-                let line_lower = line.to_lowercase();
-                for (token, svc) in token_to_service {
+            // connect-es/connect-web: createPromiseClient(Svc, ...) /
+            // createClient(Svc, ...) — the client is built from the service
+            // symbol, so require both the factory call and the service name
+            // on the same line (bare service name alone is too broad). #33
+            let is_connect_call =
+                line_lower.contains("createpromiseclient") || line_lower.contains("createclient");
+            if is_connect_call {
+                for (svc_lc, svc) in connect_markers {
                     if seen.contains(svc.as_str()) {
                         continue;
                     }
-                    if line_lower.contains(token.as_str()) {
+                    if line_lower.contains(svc_lc.as_str()) {
                         seen.insert(svc.as_str());
                         results.push((rel.clone(), format!("line:{}", line_num + 1), svc.clone()));
-                    }
-                }
-                // connect-es/connect-web: createPromiseClient(Svc, ...) /
-                // createClient(Svc, ...) — the client is built from the service
-                // symbol, so require both the factory call and the service name
-                // on the same line (bare service name alone is too broad). #33
-                let is_connect_call = line_lower.contains("createpromiseclient")
-                    || line_lower.contains("createclient");
-                if is_connect_call {
-                    for (svc_lc, svc) in connect_markers {
-                        if seen.contains(svc.as_str()) {
-                            continue;
-                        }
-                        if line_lower.contains(svc_lc.as_str()) {
-                            seen.insert(svc.as_str());
-                            results.push((
-                                rel.clone(),
-                                format!("line:{}", line_num + 1),
-                                svc.clone(),
-                            ));
-                        }
                     }
                 }
             }
@@ -1640,67 +1486,39 @@ fn scan_source_for_package_imports(
     search_terms: &[&str],
     _repo_name: &str,
 ) -> Vec<(String, usize, String)> {
-    const SKIP_DIRS: &[&str] = &[
-        ".infigraph",
-        ".git",
-        "node_modules",
-        "target",
-        "build",
-        "dist",
-        "__pycache__",
-        ".venv",
-    ];
     let mut results = Vec::new();
-    walk_for_imports(root, root, SKIP_DIRS, search_terms, &mut results);
+    scan_for_imports(root, search_terms, &mut results);
     results
 }
 
-fn walk_for_imports(
-    base: &Path,
-    dir: &Path,
-    skip: &[&str],
-    terms: &[&str],
-    results: &mut Vec<(String, usize, String)>,
-) {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-        if path.is_dir() {
-            if skip.contains(&name_str.as_ref()) {
+fn scan_for_imports(base: &Path, terms: &[&str], results: &mut Vec<(String, usize, String)>) {
+    for (path, rel) in walk_source_files(base) {
+        let name_str = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if !(name_str.ends_with(".py") || name_str.ends_with(".toml")) {
+            continue;
+        }
+        if is_test_or_doc_file(&rel) {
+            continue;
+        }
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        for (line_num, line) in content.lines().enumerate() {
+            let trimmed = line.trim();
+            let is_import = trimmed.starts_with("from ") || trimmed.starts_with("import ");
+            let is_toml_dep = name_str.ends_with(".toml")
+                && (trimmed.contains("dependencies") || trimmed.contains("packages"));
+            if !is_import && !is_toml_dep {
                 continue;
             }
-            walk_for_imports(base, &path, skip, terms, results);
-        } else if name_str.ends_with(".py") || name_str.ends_with(".toml") {
-            let rel = path
-                .strip_prefix(base)
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .replace('\\', "/");
-            if is_test_or_doc_file(&rel) {
-                continue;
-            }
-            let content = match std::fs::read_to_string(&path) {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-            for (line_num, line) in content.lines().enumerate() {
-                let trimmed = line.trim();
-                let is_import = trimmed.starts_with("from ") || trimmed.starts_with("import ");
-                let is_toml_dep = name_str.ends_with(".toml")
-                    && (trimmed.contains("dependencies") || trimmed.contains("packages"));
-                if !is_import && !is_toml_dep {
-                    continue;
-                }
-                for term in terms {
-                    if trimmed.contains(term) {
-                        results.push((rel.clone(), line_num + 1, trimmed.to_string()));
-                        break;
-                    }
+            for term in terms {
+                if trimmed.contains(term) {
+                    results.push((rel.clone(), line_num + 1, trimmed.to_string()));
+                    break;
                 }
             }
         }
@@ -1714,96 +1532,70 @@ fn walk_for_imports(
 ///     - name: qb_reports
 ///       url: ${ASCEND_SVC_URL}/v1/mcp/qb-reports/
 fn scan_source_for_mcp_configs(root: &Path) -> Vec<(String, String, String, String)> {
-    const SKIP_DIRS: &[&str] = &[
-        ".infigraph",
-        ".git",
-        "node_modules",
-        "target",
-        "build",
-        "dist",
-        "__pycache__",
-        ".venv",
-    ];
     let mut results = Vec::new();
-    walk_for_mcp_configs(root, root, SKIP_DIRS, &mut results);
+    scan_for_mcp_configs(root, &mut results);
     results
 }
 
-fn walk_for_mcp_configs(
-    base: &Path,
-    dir: &Path,
-    skip: &[&str],
-    results: &mut Vec<(String, String, String, String)>,
-) {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-        if path.is_dir() {
-            if !skip.contains(&name_str.as_ref()) && !name_str.starts_with('.') {
-                walk_for_mcp_configs(base, &path, skip, results);
-            }
-        } else if path.is_file() && (name_str.ends_with(".yaml") || name_str.ends_with(".yml")) {
-            let rel = path
-                .strip_prefix(base)
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .replace('\\', "/");
-            if is_test_or_doc_file(&rel) {
+fn scan_for_mcp_configs(base: &Path, results: &mut Vec<(String, String, String, String)>) {
+    for (path, rel) in walk_source_files(base) {
+        let name_str = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if !(name_str.ends_with(".yaml") || name_str.ends_with(".yml")) {
+            continue;
+        }
+        if is_test_or_doc_file(&rel) {
+            continue;
+        }
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        // Simple state machine: detect mcp_servers blocks and extract url entries
+        let mut in_mcp_servers = false;
+        let mut current_name: Option<String> = None;
+        for (line_num, line) in content.lines().enumerate() {
+            let trimmed = line.trim();
+            // Detect start of mcp_servers list
+            if trimmed == "mcp_servers:" || trimmed.starts_with("mcp_servers:") {
+                in_mcp_servers = true;
+                current_name = None;
                 continue;
             }
-            let content = match std::fs::read_to_string(&path) {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-            // Simple state machine: detect mcp_servers blocks and extract url entries
-            let mut in_mcp_servers = false;
-            let mut current_name: Option<String> = None;
-            for (line_num, line) in content.lines().enumerate() {
-                let trimmed = line.trim();
-                // Detect start of mcp_servers list
-                if trimmed == "mcp_servers:" || trimmed.starts_with("mcp_servers:") {
-                    in_mcp_servers = true;
+            if in_mcp_servers {
+                // End of mcp_servers block: unindented non-empty line without leading dash/space
+                if !trimmed.is_empty()
+                    && !line.starts_with(' ')
+                    && !line.starts_with('\t')
+                    && !trimmed.starts_with('-')
+                    && !trimmed.starts_with('#')
+                {
+                    in_mcp_servers = false;
                     current_name = None;
                     continue;
                 }
-                if in_mcp_servers {
-                    // End of mcp_servers block: unindented non-empty line without leading dash/space
-                    if !trimmed.is_empty()
-                        && !line.starts_with(' ')
-                        && !line.starts_with('\t')
-                        && !trimmed.starts_with('-')
-                        && !trimmed.starts_with('#')
-                    {
-                        in_mcp_servers = false;
-                        current_name = None;
-                        continue;
-                    }
-                    // Extract name field
-                    if trimmed.starts_with("- name:") || trimmed.starts_with("name:") {
-                        let val = trimmed.split(':').nth(1).map(|s| s.trim().to_string());
-                        current_name = val;
-                    }
-                    // Extract url field — contains the MCP server URL
-                    if trimmed.starts_with("url:") {
-                        if let Some(url_val) = trimmed.strip_prefix("url:") {
-                            let url = url_val.trim().to_string();
-                            // Extract topic from URL: .../v1/mcp/<topic>/
-                            let topic = extract_mcp_topic_from_url(&url)
-                                .or_else(|| current_name.clone())
-                                .unwrap_or_default();
-                            if !topic.is_empty() {
-                                results.push((
-                                    rel.clone(),
-                                    format!("line:{}", line_num + 1),
-                                    topic,
-                                    url,
-                                ));
-                            }
+                // Extract name field
+                if trimmed.starts_with("- name:") || trimmed.starts_with("name:") {
+                    let val = trimmed.split(':').nth(1).map(|s| s.trim().to_string());
+                    current_name = val;
+                }
+                // Extract url field — contains the MCP server URL
+                if trimmed.starts_with("url:") {
+                    if let Some(url_val) = trimmed.strip_prefix("url:") {
+                        let url = url_val.trim().to_string();
+                        // Extract topic from URL: .../v1/mcp/<topic>/
+                        let topic = extract_mcp_topic_from_url(&url)
+                            .or_else(|| current_name.clone())
+                            .unwrap_or_default();
+                        if !topic.is_empty() {
+                            results.push((
+                                rel.clone(),
+                                format!("line:{}", line_num + 1),
+                                topic,
+                                url,
+                            ));
                         }
                     }
                 }
@@ -2356,5 +2148,69 @@ VERSION = "v1.2.3"
             "decorator URL should not be detected as consumer call, got {:?}",
             results
         );
+    }
+}
+
+/// Every cross-service scan walks the project through the shared ignore
+/// rules: a `.gitignore`d or `[ignore] code` file produces no row, an
+/// ordinary one still does.
+#[cfg(test)]
+mod ignore_rules_tests {
+    use super::*;
+    use crate::settings_file::test_support::{PinnedHome, ENV_LOCK};
+
+    fn project() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join(".gitignore"), "gen/\n").unwrap();
+        std::fs::create_dir_all(root.join(".infigraph")).unwrap();
+        std::fs::write(
+            root.join(".infigraph/config.toml"),
+            "[ignore]\ncode = [\"skipme/\"]\n",
+        )
+        .unwrap();
+        let client =
+            "import requests\n\ndef load():\n    return requests.get(\"/api/v1/orders/list\")\n";
+        for rel in ["svc/client.py", "gen/client.py", "skipme/client.py"] {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, client).unwrap();
+        }
+        // The same files for the scanners keyed on other content.
+        std::fs::write(
+            root.join("svc/dep.toml"),
+            "dependencies = [\"acme-shared\"]\n",
+        )
+        .unwrap();
+        for rel in ["gen/dep.toml", "skipme/dep.toml"] {
+            std::fs::write(root.join(rel), "dependencies = [\"acme-shared\"]\n").unwrap();
+        }
+        dir
+    }
+
+    fn files_of(rows: impl Iterator<Item = String>) -> Vec<String> {
+        let mut files: Vec<String> = rows.collect();
+        files.sort();
+        files.dedup();
+        files
+    }
+
+    #[test]
+    fn the_url_scan_skips_ignored_and_gitignored_files() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _home = PinnedHome::empty();
+        let dir = project();
+        let files = files_of(scan_source_for_urls(dir.path()).into_iter().map(|r| r.0));
+        assert_eq!(files, ["svc/client.py"], "{files:?}");
+    }
+
+    #[test]
+    fn the_import_scan_skips_ignored_and_gitignored_files() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _home = PinnedHome::empty();
+        let dir = project();
+        let rows = scan_source_for_package_imports(dir.path(), &["acme-shared"], "repo");
+        let files = files_of(rows.into_iter().map(|r| r.0));
+        assert_eq!(files, ["svc/dep.toml"], "{files:?}");
     }
 }

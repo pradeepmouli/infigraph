@@ -169,58 +169,34 @@ fn detect_languages(root: &Path) -> Vec<(String, usize)> {
     .into_iter()
     .collect();
 
+    // The project's one ignore rule set, not a private skip list: a file
+    // under a .gitignore'd or `[ignore] code` path is not part of the
+    // project's languages. The old walk also skipped `out`, `obj`,
+    // `generated`, `third_party` and `CMakeFiles`; those count unless the
+    // project ignores them, as every other walker now agrees.
     let mut counts: HashMap<String, usize> = HashMap::new();
-    walk_and_count(root, root, &ext_map, &mut counts, 0);
+    let mut walk = infigraph_core::ignore_rules::walk_builder(
+        root,
+        infigraph_core::ignore_rules::Domain::Code,
+    );
+    walk.max_depth(Some(21));
+    for entry in walk.build().filter_map(Result::ok) {
+        if !entry.file_type().is_some_and(|ft| ft.is_file()) {
+            continue;
+        }
+        if let Some(&lang) = entry
+            .path()
+            .extension()
+            .and_then(|e| e.to_str())
+            .and_then(|ext| ext_map.get(ext))
+        {
+            *counts.entry(lang.to_string()).or_insert(0) += 1;
+        }
+    }
 
     let mut sorted: Vec<(String, usize)> = counts.into_iter().collect();
     sorted.sort_by_key(|b| std::cmp::Reverse(b.1));
     sorted
-}
-
-/// Recursively walk directories, counting files by extension.
-/// Skips hidden dirs, node_modules, target, .git, etc.
-fn walk_and_count(
-    dir: &Path,
-    _root: &Path,
-    ext_map: &HashMap<&str, &str>,
-    counts: &mut HashMap<String, usize>,
-    depth: usize,
-) {
-    if depth > 20 {
-        return;
-    }
-
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-
-        if name_str.starts_with('.') {
-            continue;
-        }
-
-        if path.is_dir() {
-            match name_str.as_ref() {
-                "node_modules" | "target" | "dist" | "build" | "vendor" | "__pycache__"
-                | "venv" | ".venv" | "out" | "obj" | "generated" | "third_party" | "CMakeFiles" => {
-                    continue
-                }
-                _ => {}
-            }
-            walk_and_count(&path, _root, ext_map, counts, depth + 1);
-        } else if path.is_file() {
-            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                if let Some(&lang) = ext_map.get(ext) {
-                    *counts.entry(lang.to_string()).or_insert(0) += 1;
-                }
-            }
-        }
-    }
 }
 
 /// Check for common directories/files and suggest .infigraphignore entries.
@@ -489,6 +465,32 @@ mod tests {
         std::fs::create_dir_all(tmp.path().join(".infigraph")).unwrap();
         std::fs::write(tmp.path().join(".infigraph").join("graph"), b"").unwrap();
         tmp
+    }
+
+    /// The language census walks the project through the shared ignore
+    /// rules: files under a `.gitignore`d or `[ignore] code` path are not
+    /// the project's languages, and an ordinary file still counts.
+    #[test]
+    fn language_counts_honour_gitignore_and_ignore_code() {
+        let tmp = project();
+        let root = tmp.path();
+        std::fs::write(root.join(".gitignore"), "gen/\n").unwrap();
+        std::fs::write(
+            root.join(".infigraph").join("config.toml"),
+            "[ignore]\ncode = [\"skipme/\"]\n",
+        )
+        .unwrap();
+        for rel in ["svc/a.py", "gen/b.py", "skipme/c.py", "bin/d.py"] {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "x = 1\n").unwrap();
+        }
+
+        let counts: std::collections::HashMap<String, usize> =
+            detect_languages(root).into_iter().collect();
+        // svc/a.py and bin/d.py: `bin/` is only excluded when the project
+        // says so, which is the behaviour change of using the shared rules.
+        assert_eq!(counts.get("Python"), Some(&2), "{counts:?}");
     }
 
     #[test]

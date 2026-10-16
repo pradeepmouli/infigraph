@@ -679,54 +679,45 @@ fn scan_csproj(
 ) -> Result<()> {
     let re =
         regex::Regex::new(r#"<PackageReference\s+Include="([^"]+)"\s+Version="([^"]+)""#).unwrap();
-    scan_csproj_dir(root, &re, backend, results)
-}
-
-fn scan_csproj_dir(
-    dir: &Path,
-    re: &regex::Regex,
-    backend: &dyn GraphBackend,
-    results: &mut Vec<ManifestResult>,
-) -> Result<()> {
-    let ignore = [".git", "node_modules", "target", "bin", "obj"];
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Ok(());
-    };
-    for entry in entries.flatten() {
+    // The project's one ignore rule set, not a private skip list: a project
+    // file under a .gitignore'd or `[ignore] code` path is not a manifest.
+    for entry in crate::ignore_rules::walk_builder(root, crate::ignore_rules::Domain::Code)
+        .build()
+        .filter_map(std::result::Result::ok)
+    {
         let path = entry.path();
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-        if path.is_dir() && !ignore.contains(&name_str.as_ref()) {
-            scan_csproj_dir(&path, re, backend, results)?;
-        } else if path
-            .extension()
-            .map(|e| e == "csproj" || e == "fsproj" || e == "vbproj")
-            .unwrap_or(false)
-        {
-            if let Ok(content) = std::fs::read_to_string(&path) {
-                let mut deps = Vec::new();
-                for cap in re.captures_iter(&content) {
-                    deps.push(DepEntry {
-                        name: cap[1].to_string(),
-                        version: cap[2].to_string(),
-                        ecosystem: "nuget".to_string(),
-                        is_dev: false,
-                    });
-                }
-                if !deps.is_empty() {
-                    let result = ManifestResult {
-                        ecosystem: "nuget".to_string(),
-                        manifest_file: path.to_string_lossy().replace('\\', "/"),
-                        deps,
-                        doc_urls: Vec::new(),
-                    };
-                    if let Err(e) = store_manifest(backend, &result) {
-                        eprintln!("[manifest] failed to store {}: {e}", result.manifest_file);
-                    }
-                    results.push(result);
-                }
-            }
+        let is_project_file = entry.file_type().is_some_and(|ft| ft.is_file())
+            && path
+                .extension()
+                .is_some_and(|e| e == "csproj" || e == "fsproj" || e == "vbproj");
+        if !is_project_file {
+            continue;
         }
+        let Ok(content) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let deps: Vec<DepEntry> = re
+            .captures_iter(&content)
+            .map(|cap| DepEntry {
+                name: cap[1].to_string(),
+                version: cap[2].to_string(),
+                ecosystem: "nuget".to_string(),
+                is_dev: false,
+            })
+            .collect();
+        if deps.is_empty() {
+            continue;
+        }
+        let result = ManifestResult {
+            ecosystem: "nuget".to_string(),
+            manifest_file: path.to_string_lossy().replace('\\', "/"),
+            deps,
+            doc_urls: Vec::new(),
+        };
+        if let Err(e) = store_manifest(backend, &result) {
+            eprintln!("[manifest] failed to store {}: {e}", result.manifest_file);
+        }
+        results.push(result);
     }
     Ok(())
 }
@@ -747,6 +738,52 @@ fn split_pep508(s: &str) -> (String, String) {
 mod tests {
     use super::*;
     use crate::graph::KuzuBackend;
+
+    /// `*.csproj` discovery asks the project's ignore rules: a project file
+    /// under a `.gitignore`d or `[ignore] code` path must not become a
+    /// manifest row, and an ordinary one still does.
+    #[test]
+    fn csproj_discovery_honours_gitignore_and_ignore_code() {
+        use crate::settings_file::test_support::{PinnedHome, ENV_LOCK};
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _home = PinnedHome::empty();
+        let project = tempfile::TempDir::new().unwrap();
+        let root = project.path();
+        std::fs::write(root.join(".gitignore"), "ignored/\n").unwrap();
+        std::fs::create_dir_all(root.join(".infigraph")).unwrap();
+        std::fs::write(
+            root.join(".infigraph/config.toml"),
+            "[ignore]\ncode = [\"skipme/\"]\n",
+        )
+        .unwrap();
+        let csproj = "<Project><ItemGroup>\n\
+             <PackageReference Include=\"Newtonsoft.Json\" Version=\"13.0.1\" />\n\
+             </ItemGroup></Project>\n";
+        for dir in ["app", "ignored", "skipme"] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+            std::fs::write(root.join(dir).join("Lib.csproj"), csproj).unwrap();
+        }
+
+        let graph = tempfile::TempDir::new().unwrap();
+        let store = crate::graph::GraphStore::open(&graph.path().join("graph")).unwrap();
+        let backend = KuzuBackend::from_store(store);
+        let mut results = Vec::new();
+        scan_csproj(root, &backend, &mut results).unwrap();
+
+        let files: Vec<String> = results.iter().map(|r| r.manifest_file.clone()).collect();
+        assert!(
+            files.iter().any(|f| f.ends_with("app/Lib.csproj")),
+            "{files:?}"
+        );
+        assert!(
+            !files.iter().any(|f| f.contains("/ignored/")),
+            "a gitignored project file is not a manifest: {files:?}"
+        );
+        assert!(
+            !files.iter().any(|f| f.contains("/skipme/")),
+            "`[ignore] code` holds for manifest discovery: {files:?}"
+        );
+    }
 
     #[test]
     fn test_manifest_upsert_updates_version() {

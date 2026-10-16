@@ -345,31 +345,21 @@ static BRIDGE_RULES: &[BridgeRule] = &[
 /// Scan a project directory for cross-language bridge points.
 pub fn detect_bridges(root: &Path) -> Result<BridgeScanResult> {
     let mut result = BridgeScanResult::default();
-    scan_dir(root, root, &mut result)?;
+    scan_dir(root, &mut result)?;
     Ok(result)
 }
 
-fn scan_dir(root: &Path, dir: &Path, result: &mut BridgeScanResult) -> Result<()> {
-    const SKIP_DIRS: &[&str] = &[
-        ".git",
-        ".infigraph",
-        "node_modules",
-        "__pycache__",
-        "target",
-        "build",
-        "dist",
-    ];
-    for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-        if path.is_dir() {
-            if !SKIP_DIRS.contains(&name_str.as_ref()) && !name_str.starts_with('.') {
-                scan_dir(root, &path, result)?;
-            }
-        } else if path.is_file() {
-            scan_file(root, &path, result);
+fn scan_dir(root: &Path, result: &mut BridgeScanResult) -> Result<()> {
+    // An unreadable root is an error, as it was when this read the directory
+    // itself; the walker alone would report it as "no files".
+    std::fs::read_dir(root)?;
+    // The project's one ignore rule set, not a private skip list.
+    for entry in crate::ignore_rules::walk_builder(root, crate::ignore_rules::Domain::Code)
+        .build()
+        .filter_map(std::result::Result::ok)
+    {
+        if entry.file_type().is_some_and(|ft| ft.is_file()) {
+            scan_file(root, entry.path(), result);
         }
     }
     Ok(())
@@ -412,5 +402,38 @@ fn scan_file(root: &Path, path: &Path, result: &mut BridgeScanResult) {
                 });
             }
         }
+    }
+}
+
+/// `detect_bridges` walks the project through the shared ignore rules.
+#[cfg(test)]
+mod ignore_rules_tests {
+    use super::*;
+    use crate::settings_file::test_support::{PinnedHome, ENV_LOCK};
+
+    #[test]
+    fn a_gitignored_or_ignore_code_file_has_no_bridges() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _home = PinnedHome::empty();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join(".gitignore"), "gen/\n").unwrap();
+        std::fs::create_dir_all(root.join(".infigraph")).unwrap();
+        std::fs::write(
+            root.join(".infigraph/config.toml"),
+            "[ignore]\ncode = [\"skipme/\"]\n",
+        )
+        .unwrap();
+        for rel in ["svc/a.bas", "gen/a.bas", "skipme/a.bas"] {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "Declare Sub Beep Lib \"kernel32\" ()\n").unwrap();
+        }
+
+        let found = detect_bridges(root).unwrap();
+        let mut files: Vec<&str> = found.bridges.iter().map(|b| b.file.as_str()).collect();
+        files.sort();
+        files.dedup();
+        assert_eq!(files, ["svc/a.bas"], "{files:?}");
     }
 }
