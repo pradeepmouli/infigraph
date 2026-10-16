@@ -25,6 +25,7 @@ pub const GRAPH_REOPEN_BACKOFF: &str = "graph-reopen-backoff";
 pub const REINDEX_WAITING_FOR_SLOT: &str = "reindex-waiting-for-slot";
 pub const CLONE_BODIES_UNAVAILABLE: &str = "clone-bodies-unavailable";
 pub const CLONE_BODIES_PARTIAL: &str = "clone-bodies-partial";
+pub const DOC_LINKS_UNSCANNED: &str = "doc-links-unscanned";
 
 /// One way infigraph is running degraded.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,6 +74,10 @@ pub enum DegradedMode {
     /// `clone-bodies.bin` describes only some of the functions, so the rest
     /// are compared by the weaker signal.
     CloneBodiesPartial { missing: usize, total: usize },
+    /// Some stored documents were never scanned for code links (a document
+    /// store from before they existed), so a symbol's glossary entry and the
+    /// mentions of it may be missing from its doc context.
+    DocLinksUnscanned { unscanned: usize, total: usize },
 }
 
 impl DegradedMode {
@@ -96,6 +101,7 @@ impl DegradedMode {
             DegradedMode::DocEmbeddingsMissing => "doc-embeddings-missing",
             DegradedMode::CloneBodiesUnavailable => CLONE_BODIES_UNAVAILABLE,
             DegradedMode::CloneBodiesPartial { .. } => CLONE_BODIES_PARTIAL,
+            DegradedMode::DocLinksUnscanned { .. } => DOC_LINKS_UNSCANNED,
         }
     }
 
@@ -168,6 +174,10 @@ impl DegradedMode {
                 "{missing} of {total} functions have no body signal in clone-bodies.bin: they are \
                  compared by a weaker signal, and each pair says which"
             ),
+            DegradedMode::DocLinksUnscanned { unscanned, total } => format!(
+                "{unscanned} of {total} documents have not been scanned for code links: a \
+                 symbol's glossary entry and mentions may be missing from its doc context"
+            ),
         }
     }
 
@@ -204,6 +214,7 @@ impl DegradedMode {
                  `[index] max_concurrent_reindexes` in ~/.infigraph/config.toml sets the cap"
             }
             DegradedMode::DocEmbeddingsMissing => "run `infigraph index-docs` to rebuild them",
+            DegradedMode::DocLinksUnscanned { .. } => "run `infigraph index-docs`",
         }
     }
 
@@ -802,6 +813,10 @@ mod tests {
             DegradedMode::EmbeddingsStale { minutes: 90 },
             DegradedMode::HnswMissing,
             DegradedMode::DocEmbeddingsMissing,
+            DegradedMode::DocLinksUnscanned {
+                unscanned: 3,
+                total: 10,
+            },
         ];
         let keys: std::collections::HashSet<_> = modes.iter().map(|m| m.key()).collect();
         let messages: std::collections::HashSet<_> = modes.iter().map(|m| m.message()).collect();

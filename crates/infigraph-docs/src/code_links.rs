@@ -122,6 +122,11 @@ fn qualified_form() -> &'static Regex {
     RE.get_or_init(|| Regex::new(r"^[A-Za-z_$][\w$]*(?:(?:\.|::)[A-Za-z_$][\w$]*)+$").unwrap())
 }
 
+/// Whether `span` is a `path.ext::name` mention: the form that names a file.
+pub(crate) fn is_file_form(span: &str) -> bool {
+    file_form().is_match(span)
+}
+
 /// A span that is a file name (`tasks.md`), which no symbol is.
 fn names_a_file(span: &str) -> bool {
     const EXTENSIONS: [&str; 18] = [
@@ -136,7 +141,7 @@ fn names_a_file(span: &str) -> bool {
 
 /// Whether a span is shaped like something the reader could resolve.
 fn is_mention_shaped(span: &str) -> bool {
-    file_form().is_match(span) || (qualified_form().is_match(span) && !names_a_file(span))
+    is_file_form(span) || (qualified_form().is_match(span) && !names_a_file(span))
 }
 
 struct Heading {

@@ -592,6 +592,11 @@ pub fn tool_get_doc_context(args: &Value) -> Result<String> {
         }
     }
 
+    // The documents that describe this symbol come first: the rationale is
+    // what an agent about to edit it needs before the code.
+    let linked = infigraph_docs::linked::lookup(prism.root(), backend, symbol_id, &detail.file);
+    out.push_str(&linked.render_entries());
+
     let file_path = if std::path::Path::new(&detail.file).is_absolute() {
         PathBuf::from(&detail.file)
     } else {
@@ -629,6 +634,8 @@ pub fn tool_get_doc_context(args: &Value) -> Result<String> {
             out.push_str(&format!("  {}\n", c));
         }
     }
+
+    out.push_str(&linked.render_mentions());
 
     let path = args.get("path").and_then(|p| p.as_str()).unwrap_or(".");
     auto_inject_session_context(path, &detail.name, &mut out);

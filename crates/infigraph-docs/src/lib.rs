@@ -7,6 +7,7 @@ pub mod daemon_source;
 pub mod daemon_store;
 pub mod embed;
 pub mod extract;
+pub mod linked;
 #[cfg(feature = "remote")]
 pub mod neo4j_store;
 pub mod ops;
