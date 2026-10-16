@@ -544,18 +544,11 @@ impl DocIndex {
         max_depth: usize,
         max_extra: usize,
     ) -> Result<usize> {
-        let ignore_dirs = [
-            ".infigraph",
-            ".git",
-            "node_modules",
-            "__pycache__",
-            ".venv",
-            "venv",
-            "target",
-            "build",
-            "dist",
-            ".tox",
-        ];
+        // The same rules the walk of the doc root applies (the safety list,
+        // .gitignore, .infigraphignore, `[ignore] docs`), asked per link
+        // target and built on the first target that needs it. This used to
+        // be a private ten-name list that had drifted from the walk's.
+        let mut ignore_rules: Option<infigraph_core::ignore_rules::IgnoreMatcher> = None;
         let repo_root = repo_root
             .canonicalize()
             .unwrap_or_else(|_| repo_root.to_path_buf());
@@ -622,17 +615,26 @@ impl DocIndex {
                     if !abs.starts_with(&repo_root) {
                         continue;
                     }
-                    // Check ignored dirs — only check path components relative to repo root
+                    // A hidden component, judged below the repo root so a
+                    // repo under `~/.work/` is still a repo. The walk skips
+                    // hidden entries itself (`.hidden(true)`); the matcher
+                    // answers for watcher events and does not model that, so
+                    // it is kept beside it here.
                     let rel_to_repo = abs.strip_prefix(&repo_root).unwrap_or(&abs);
-                    let in_ignored = rel_to_repo.components().any(|c| {
-                        if let std::path::Component::Normal(s) = c {
-                            let s = s.to_string_lossy();
-                            ignore_dirs.contains(&s.as_ref()) || s.starts_with('.')
-                        } else {
-                            false
-                        }
+                    let hidden = rel_to_repo.components().any(|c| {
+                        matches!(c, std::path::Component::Normal(s)
+                            if s.to_string_lossy().starts_with('.'))
                     });
-                    if in_ignored {
+                    if hidden {
+                        continue;
+                    }
+                    let rules = ignore_rules.get_or_insert_with(|| {
+                        infigraph_core::ignore_rules::IgnoreMatcher::build(
+                            &repo_root,
+                            infigraph_core::ignore_rules::Domain::Docs,
+                        )
+                    });
+                    if rules.is_ignored(&abs, false) {
                         continue;
                     }
 

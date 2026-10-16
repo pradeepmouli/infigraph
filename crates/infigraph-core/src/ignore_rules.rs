@@ -31,12 +31,16 @@ crate::settings! {
 // They only ever subtract, so unlike `[index] include` they cannot name
 // anything outside the project and have no `Trust` rule.
 //
-// The layered read is shared with `include` (`layered_entries`), so the env
-// layer *replaces* the config files here exactly as it does there --
-// `INFIGRAPH_IGNORE_CODE` / `INFIGRAPH_IGNORE_DOCS` therefore make the walk
-// MORE permissive than the files alone, by silencing the project's and the
-// user's own lists. A value is comma-separated (`PathList`), so a pattern
-// containing a comma can be stated in TOML only.
+// The layered read is shared with `include` (`layered_entries`), but the
+// environment combines the other way: `INFIGRAPH_IGNORE_CODE` /
+// `INFIGRAPH_IGNORE_DOCS` ADD to the project's and the user's lists and
+// never replace them. An ignore only subtracts, so replacing would let a
+// stray variable re-admit what the project's config excluded -- the
+// permissive direction is the wrong one to fail in. The only way to relax
+// an ignore is to edit the config file. (`[index] include` keeps its
+// environment-replaces rule: there a replaced list admits FEWER files.) A
+// value is comma-separated (`PathList`), so a pattern containing a comma
+// can be stated in TOML only.
 crate::settings! {
     ignore {
         code: PathList = PathList(Vec::new()),
@@ -150,24 +154,34 @@ struct Includes {
 ///
 /// Shared by `[index] include` and `[ignore] <domain>`, so the two cannot
 /// drift apart on how layers combine. `from_env` is that setting's env
-/// layer and `in_layer` reads it out of one config document.
+/// layer, `env` says how it combines with the files, and `in_layer` reads
+/// the FILES' value out of one config document (never the environment).
 ///
 /// The layers are read separately rather than through the group's
 /// `resolve` because merging them would lose exactly the provenance
 /// `Trust` needs. They also union rather than override, unlike a scalar
 /// setting: a user saying "always index this dependency" and a project
 /// saying "index this vendored library" are both true at once, and letting
-/// either silence the other would serve nobody. The environment is the
-/// exception, and replaces the files entirely -- it is this process's own,
-/// so it is trusted, and it keeps the macro's usual precedence.
+/// either silence the other would serve nobody. The environment is this
+/// process's own, so it is trusted; whether it replaces the files or adds
+/// to them is the caller's `EnvLayer`, because the safe direction differs.
 fn layered_entries(
     project_root: &Path,
     from_env: Option<PathList>,
+    env: EnvLayer,
     in_layer: impl Fn(&toml_edit::Item) -> PathList,
 ) -> Vec<(String, Trust)> {
-    if let Some(from_env) = from_env {
-        return from_env.0.into_iter().map(|e| (e, Trust::User)).collect();
+    let trusted = |list: PathList| -> Vec<(String, Trust)> {
+        list.0.into_iter().map(|e| (e, Trust::User)).collect()
+    };
+    // A variable that is SET replaces, even set to nothing: that is how
+    // `INFIGRAPH_INDEX_INCLUDE=` says "no includes" regardless of the files.
+    if env == EnvLayer::Replaces {
+        if let Some(list) = from_env {
+            return trusted(list);
+        }
     }
+    let from_env = from_env.map(trusted).unwrap_or_default();
 
     let docs = crate::settings_file::layers(ConfigScope::Project(project_root));
     let [project, user] = docs;
@@ -184,15 +198,48 @@ fn layered_entries(
             all.push(entry);
         }
     }
+    // Files first, the environment last; a pattern stated twice counts once.
+    for entry in from_env {
+        if !all.iter().any(|(existing, _)| *existing == entry.0) {
+            all.push(entry);
+        }
+    }
     all
+}
+
+/// How a setting's environment layer combines with its config files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnvLayer {
+    /// A stated variable stands in for the files: `[index] include`, where
+    /// a replaced list re-admits fewer files.
+    Replaces,
+    /// A stated variable is one more list after the files': `[ignore]`,
+    /// where replacing would let a stray variable un-ignore what the
+    /// project excluded.
+    Adds,
+}
+
+/// A files-only read of one list setting, a bad value warned about once
+/// and read as no entries -- these helpers run inside long-lived watchers.
+fn files_list(read: Result<Option<PathList>, crate::settings::SettingError>) -> PathList {
+    match read {
+        Ok(list) => list.unwrap_or_default(),
+        Err(e) => {
+            crate::settings::warn_once(&format!("{e}; ignoring it"));
+            PathList::default()
+        }
+    }
 }
 
 /// Every configured `[index] include` entry, paired with the trust of the
 /// layer that stated it.
 fn configured_includes(project_root: &Path) -> Vec<(String, Trust)> {
-    layered_entries(project_root, Index::env_layer().index_include, |item| {
-        Index::resolve_layers_or_default(RawIndex::default(), &[item]).include
-    })
+    layered_entries(
+        project_root,
+        Index::env_layer().index_include,
+        EnvLayer::Replaces,
+        |item| files_list(Index::layers_include(&[item])),
+    )
 }
 
 fn include_roots(root: &Path, project_root: &Path) -> Includes {
@@ -390,10 +437,6 @@ impl DomainRules {
 
 /// The `[ignore]` patterns for `domain`, from every layer.
 fn configured_domain_patterns(project_root: &Path, domain: Domain) -> Vec<(String, Trust)> {
-    let field = |ignore: Ignore| match domain {
-        Domain::Code => ignore.code,
-        Domain::Docs => ignore.docs,
-    };
     let from_env = {
         let env = Ignore::env_layer();
         match domain {
@@ -401,11 +444,11 @@ fn configured_domain_patterns(project_root: &Path, domain: Domain) -> Vec<(Strin
             Domain::Docs => env.ignore_docs,
         }
     };
-    layered_entries(project_root, from_env, |item| {
-        field(Ignore::resolve_layers_or_default(
-            RawIgnore::default(),
-            &[item],
-        ))
+    layered_entries(project_root, from_env, EnvLayer::Adds, |item| {
+        files_list(match domain {
+            Domain::Code => Ignore::layers_code(&[item]),
+            Domain::Docs => Ignore::layers_docs(&[item]),
+        })
     })
 }
 
@@ -588,9 +631,14 @@ impl IgnoreMatcher {
         // reference library back in says nothing about its own vendored
         // `node_modules/` or `.git/`. Above the include root it is exactly
         // what the entry is opting out of, so only the tail is checked.
+        //
+        // Without an include the check is below this matcher's root, never
+        // the ancestors above it: a project checked out under `~/build/` or
+        // `.../target/` is still a project, and the walker, which never
+        // looks above its root, admits its files.
         let checked = match include {
             Some(root) => path.strip_prefix(root).unwrap_or(path),
-            None => path,
+            None => path.strip_prefix(&self.root).unwrap_or(path),
         };
         if checked
             .components()
@@ -809,6 +857,35 @@ mod tests {
         assert!(
             !found.iter().any(|p| p.contains("other-pkg")),
             "only the named subtree is re-admitted, not the whole of node_modules: {found:?}"
+        );
+    }
+
+    /// The safety list names directories *of the project*. A checkout that
+    /// happens to live under `~/build/` or `.../target/` is still a project,
+    /// and the watcher must not read every one of its files as excluded
+    /// because an ancestor above the root has a listed name.
+    #[test]
+    fn the_matcher_judges_paths_below_its_root_not_the_ancestors_above_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("build").join("target").join("proj");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/main.rs"), "fn main() {}").unwrap();
+        fs::create_dir_all(root.join("node_modules/pkg")).unwrap();
+        fs::write(root.join("node_modules/pkg/index.js"), "//").unwrap();
+
+        let walked = walked_files(&root);
+        assert!(
+            walked.iter().any(|p| p == "src/main.rs"),
+            "the walker admits the project's own source: {walked:?}"
+        );
+        let matcher = IgnoreMatcher::build(&root, Domain::Code);
+        assert!(
+            !matcher.is_ignored(&root.join("src/main.rs"), false),
+            "the matcher must agree: `build/` and `target/` above the root are not the project's"
+        );
+        assert!(
+            matcher.is_ignored(&root.join("node_modules/pkg/index.js"), false),
+            "a listed directory below the root is still excluded"
         );
     }
 
@@ -1257,7 +1334,7 @@ mod domain_tests {
     }
 
     #[test]
-    fn project_and_user_layers_union_and_the_environment_replaces_both() {
+    fn project_and_user_layers_union_and_the_environment_adds_to_both() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _home = PinnedHome::empty();
         let user_dir = Path::new(&std::env::var("HOME").unwrap()).join(".infigraph");
@@ -1276,13 +1353,75 @@ mod domain_tests {
         assert!(both.contains(&"env-only/c.rs".into()), "{both:?}");
 
         std::env::set_var(CODE_ENV, "env-only/");
-        let from_env = walked(dir.path(), Domain::Code);
+        let with_env = walked(dir.path(), Domain::Code);
         std::env::remove_var(CODE_ENV);
-        assert!(!from_env.contains(&"env-only/c.rs".into()), "{from_env:?}");
-        assert!(
-            from_env.contains(&"user-only/a.rs".into())
-                && from_env.contains(&"proj-only/b.rs".into()),
-            "the environment replaces the files, so their lists no longer apply: {from_env:?}"
+        for ignored in ["user-only/a.rs", "proj-only/b.rs", "env-only/c.rs"] {
+            assert!(
+                !with_env.contains(&ignored.to_string()),
+                "an ignore only subtracts: the environment adds to the files' lists, so a \
+                 stray variable can never re-admit {ignored}: {with_env:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_environment_pattern_adds_in_each_domain_and_an_empty_one_adds_nothing() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _home = PinnedHome::empty();
+        let dir = project(
+            "[ignore]\ncode = [\"proj-only/\"]\ndocs = [\"drafts/\", \"notes.draft.md\"]\n",
+        );
+        std::env::remove_var(CODE_ENV);
+        std::env::remove_var(DOCS_ENV);
+        let code_files = walked(dir.path(), Domain::Code);
+        let docs_files = walked(dir.path(), Domain::Docs);
+
+        // An empty variable states nothing: it neither adds nor removes.
+        std::env::set_var(CODE_ENV, "");
+        std::env::set_var(DOCS_ENV, "");
+        let code_empty = walked(dir.path(), Domain::Code);
+        let docs_empty = walked(dir.path(), Domain::Docs);
+
+        std::env::set_var(CODE_ENV, "env-only/");
+        std::env::set_var(DOCS_ENV, "src/");
+        let code_env = walked(dir.path(), Domain::Code);
+        let docs_env = walked(dir.path(), Domain::Docs);
+        std::env::remove_var(CODE_ENV);
+        std::env::remove_var(DOCS_ENV);
+
+        assert_eq!(code_empty, code_files);
+        assert_eq!(docs_empty, docs_files);
+        assert!(!code_env.contains(&"proj-only/b.rs".into()), "{code_env:?}");
+        assert!(!code_env.contains(&"env-only/c.rs".into()), "{code_env:?}");
+        assert!(!docs_env.contains(&"notes.draft.md".into()), "{docs_env:?}");
+        assert!(!docs_env.contains(&"src/main.rs".into()), "{docs_env:?}");
+    }
+
+    /// `[index] include` keeps the environment-replaces rule: a stray
+    /// variable can only re-admit FEWER files there, the safe direction.
+    #[test]
+    fn the_include_environment_variable_still_replaces_the_files() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _home = PinnedHome::empty();
+        let dir = project("[index]\ninclude = [\"from-file\"]\n");
+        let env = "INFIGRAPH_INDEX_INCLUDE";
+
+        std::env::remove_var(env);
+        let from_files = configured_includes(dir.path());
+        std::env::set_var(env, "from-env");
+        let from_env = configured_includes(dir.path());
+        std::env::remove_var(env);
+
+        assert_eq!(
+            from_files
+                .iter()
+                .map(|(e, _)| e.as_str())
+                .collect::<Vec<_>>(),
+            ["from-file"]
+        );
+        assert_eq!(
+            from_env.iter().map(|(e, _)| e.as_str()).collect::<Vec<_>>(),
+            ["from-env"]
         );
     }
 

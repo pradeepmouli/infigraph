@@ -259,11 +259,23 @@ scan.
 
 Project and user layers **union**, like `include`. The environment
 (`INFIGRAPH_IGNORE_CODE`, `INFIGRAPH_IGNORE_DOCS`, comma-separated, so a
-pattern containing a comma can be written in TOML only) **replaces both**
-files, which makes the walk *more* permissive than the files alone: it
-silences the project's and your own lists. There is no trust difference
+pattern containing a comma can be written in TOML only) **adds** to both
+files' lists and never replaces them: an ignore only removes files, so a
+stray variable must not be able to re-admit what the project excluded.
+The only way to relax an ignore is to edit the config file. (This is the
+opposite of `INFIGRAPH_INDEX_INCLUDE`, which replaces the `include` list:
+there a replaced list re-admits fewer files.) There is no trust difference
 between layers, because a pattern can only remove files, never reach
 outside the project.
+
+Link-following in the document index asks the same rules. A document a
+link points at is indexed only if the walk of that directory would have
+listed it: a link into a `.gitignore`d path, an `[ignore] docs` pattern, or
+a safety-listed directory (`vendor/`, `coverage/`, … as well as `target/`)
+does not pull the file in. This is a change: a gitignored document that was
+reachable only by a link used to be indexed, and is not any more. Hidden
+directories (`.github/`, `.idea/`) stay excluded below the repository root,
+as they are for the walk.
 
 Some walkers do not consult these rules yet (manifest and cross-service
 scans among them); see the issue tracking walkers that bypass
