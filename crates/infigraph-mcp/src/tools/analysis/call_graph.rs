@@ -16,27 +16,20 @@ use super::super::helpers::{open_prism, path_scope, save_analysis};
 /// (fewer false "dead") rather than missing a real markup reference.
 fn xaml_referenced_names(project_root: &str) -> std::collections::HashSet<String> {
     let mut names = std::collections::HashSet::new();
-    let root = Path::new(project_root);
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
+    // The project's one ignore rule set, not a private skip list.
+    let walk = infigraph_core::ignore_rules::walk_builder(
+        Path::new(project_root),
+        infigraph_core::ignore_rules::Domain::Code,
+    );
+    for entry in walk.build().filter_map(std::result::Result::ok) {
+        let path = entry.path();
+        let is_xaml = entry.file_type().is_some_and(|ft| ft.is_file())
+            && path.extension().and_then(|e| e.to_str()) == Some("xaml");
+        if !is_xaml {
             continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                let name = entry.file_name().to_string_lossy().to_string();
-                if !name.starts_with('.') && name != "bin" && name != "obj" {
-                    stack.push(path);
-                }
-                continue;
-            }
-            if path.extension().and_then(|e| e.to_str()) != Some("xaml") {
-                continue;
-            }
-            if let Ok(content) = std::fs::read_to_string(&path) {
-                names.insert(content);
-            }
+        }
+        if let Ok(content) = std::fs::read_to_string(path) {
+            names.insert(content);
         }
     }
     // Collapse into a single searchable blob check happens at call site;
@@ -321,4 +314,39 @@ pub fn tool_detect_clusters(args: &Value) -> Result<String> {
 
     let stats = infigraph_core::cluster::detect_clusters(backend)?;
     Ok(format!("{}", stats))
+}
+
+#[cfg(test)]
+mod ignore_rules_tests {
+    use super::*;
+
+    /// The markup scan walks the project through the shared ignore rules: a
+    /// `.xaml` file under a `.gitignore`d or `[ignore] code` path cannot
+    /// keep a symbol "referenced", and an ordinary one still does.
+    #[test]
+    fn xaml_markup_honours_gitignore_and_ignore_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join(".gitignore"), "gen/\n").unwrap();
+        std::fs::create_dir_all(root.join(".infigraph")).unwrap();
+        std::fs::write(
+            root.join(".infigraph/config.toml"),
+            "[ignore]\ncode = [\"skipme/\"]\n",
+        )
+        .unwrap();
+        for (rel, marker) in [
+            ("app/Main.xaml", "RealCommand"),
+            ("gen/Gen.xaml", "GeneratedCommand"),
+            ("skipme/Skip.xaml", "SkippedCommand"),
+        ] {
+            let path = root.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, format!("<Button Command=\"{{Binding {marker}}}\"/>")).unwrap();
+        }
+
+        let blobs = xaml_referenced_names(root.to_str().unwrap());
+        assert!(is_xaml_referenced("RealCommand", &blobs), "{blobs:?}");
+        assert!(!is_xaml_referenced("GeneratedCommand", &blobs), "{blobs:?}");
+        assert!(!is_xaml_referenced("SkippedCommand", &blobs), "{blobs:?}");
+    }
 }
