@@ -435,93 +435,61 @@ pub(crate) fn cmd_clones(root: &Path, threshold: f64, limit: usize) -> Result<()
 
     let backend = prism.backend().context("graph not initialized")?;
 
-    let threshold_f32 = threshold as f32;
-    let kinds: Vec<&str> = vec!["Function", "Method"];
-    let syms = backend.symbols_with_docstring(Some(&kinds))?;
+    let options = infigraph_core::clone_detect::find::Options::for_project(
+        root,
+        threshold as f32,
+        limit,
+        "Function,Method",
+        infigraph_core::path_scope::PathScope::everything(),
+    )?;
+    let report = infigraph_core::clone_detect::find::find_clones(backend, root, &options)?;
 
-    if syms.len() < 2 {
+    if report.symbols < 2 {
         println!("Not enough symbols to compare. Run 'infigraph index' first.");
+        for note in report.caveats() {
+            println!("{note}");
+        }
         return Ok(());
     }
 
-    let embedder = infigraph_core::embed::best_embedder();
-    let emb_path = root.join(".infigraph").join("embeddings.bin");
-
-    let cached: std::collections::HashMap<String, Vec<f32>> = if emb_path.exists() {
-        infigraph_core::embed::load_embeddings_cached(&emb_path)?
-            .into_iter()
-            .collect()
-    } else {
-        std::collections::HashMap::new()
-    };
-
-    let symbol_vecs: Vec<(String, String, String, Vec<f32>)> = syms
-        .iter()
-        .map(|s| {
-            let text = if !s.docstring.is_empty() {
-                format!("{} {}: {}", s.kind, s.name, s.docstring)
-            } else {
-                format!("{} {}", s.kind, s.name)
-            };
-            let emb = cached
-                .get(&s.id)
-                .cloned()
-                .unwrap_or_else(|| embedder.embed(&text).unwrap_or_default());
-            (s.id.clone(), s.name.clone(), s.file.clone(), emb)
-        })
-        .filter(|(_, _, _, emb)| !emb.is_empty())
-        .collect();
-
-    let n = symbol_vecs.len();
-    let mut pairs: Vec<(f32, usize, usize)> = Vec::new();
-
-    for i in 0..n {
-        for j in (i + 1)..n {
-            if symbol_vecs[i].2 == symbol_vecs[j].2 {
-                continue;
-            }
-            let sim =
-                infigraph_core::embed::cosine_similarity(&symbol_vecs[i].3, &symbol_vecs[j].3);
-            if sim >= threshold_f32 {
-                pairs.push((sim, i, j));
-            }
-        }
-    }
-
-    pairs.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-    pairs.truncate(limit);
-
-    if pairs.is_empty() {
+    if report.pairs.is_empty() {
         println!(
             "No clones found above threshold {:.2} across {} symbols.",
-            threshold, n
+            threshold, report.symbols
         );
+        for note in report.caveats() {
+            println!("{note}");
+        }
         return Ok(());
     }
 
-    for (score, i, j) in &pairs {
-        if let Err(e) = backend.upsert_similar_edge(&symbol_vecs[*i].0, &symbol_vecs[*j].0, *score)
-        {
-            eprintln!(
-                "warning: failed to store similarity edge {} <-> {}: {e}",
-                symbol_vecs[*i].0, symbol_vecs[*j].0
-            );
-        }
+    for warning in infigraph_core::clone_detect::find::store_similar_edges(backend, &report.pairs) {
+        eprintln!("warning: {warning}");
     }
 
     println!(
-        "Clone detection: {} pairs found (threshold={:.2}, symbols={})\n",
-        pairs.len(),
+        "Clone detection: {} pairs found (threshold={:.2}, symbols={})",
+        report.pairs.len(),
         threshold,
-        n
+        report.symbols
     );
+    println!("({})", report.how());
+    for note in report.caveats() {
+        println!("{note}");
+    }
+    println!();
 
-    for (score, i, j) in &pairs {
-        let (id_a, name_a, file_a, _) = &symbol_vecs[*i];
-        let (id_b, name_b, file_b, _) = &symbol_vecs[*j];
+    for pair in &report.pairs {
         println!(
-            "  {:.3}  {} ({}) <-> {} ({})\n         {} vs {}",
-            score, name_a, id_a, name_b, id_b, file_a, file_b
+            "  {:.3}  {} ({}) <-> {} ({})  [{}]\n         {} vs {}",
+            pair.score,
+            pair.a.name,
+            pair.a.id,
+            pair.b.name,
+            pair.b.id,
+            pair.signal.label(),
+            pair.a.file,
+            pair.b.file
         );
     }
 

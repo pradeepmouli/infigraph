@@ -1,7 +1,8 @@
 use serde_json::{json, Value};
 
-use infigraph_core::embed;
+use infigraph_core::clone_detect::find::{find_clones, Options};
 use infigraph_core::graph::find_dead_code;
+use infigraph_core::path_scope::PathScope;
 
 use super::open_prism;
 
@@ -354,84 +355,43 @@ pub(crate) fn api_clones(params: &Value) -> Value {
         .get("threshold")
         .and_then(|v| v.as_f64())
         .unwrap_or(0.92) as f32;
-    match open_prism(params) {
-        Ok(prism) => {
-            let backend = match prism.backend() {
-                Some(b) => b,
-                None => return json!({"error":"not initialized"}),
-            };
-
-            let syms = match backend.symbols_with_docstring(Some(&["Function", "Method"])) {
-                Ok(s) => s,
-                Err(e) => return json!({"error": e.to_string()}),
-            };
-
-            if syms.len() < 2 {
-                return json!({"pairs": [], "total": 0});
-            }
-
-            let embedder = embed::best_embedder();
-            let docs: Vec<(String, String)> = syms
+    let prism = match open_prism(params) {
+        Ok(prism) => prism,
+        Err(e) => return json!({"error": e.to_string()}),
+    };
+    let Some(backend) = prism.backend() else {
+        return json!({"error":"not initialized"});
+    };
+    let report = Options::for_project(
+        prism.root(),
+        threshold,
+        50,
+        "Function,Method",
+        PathScope::everything(),
+    )
+    .and_then(|options| find_clones(backend, prism.root(), &options));
+    match report {
+        Ok(report) => {
+            let side = |s: &infigraph_core::clone_detect::find::Side| json!({"id": s.id, "name": s.name, "file": s.file});
+            let pairs: Vec<Value> = report
+                .pairs
                 .iter()
-                .map(|s| {
-                    let text = if !s.docstring.is_empty() {
-                        format!("{} {}: {}", s.kind, s.name, s.docstring)
-                    } else {
-                        format!("{} {}", s.kind, s.name)
-                    };
-                    (s.id.clone(), text)
+                .map(|p| {
+                    json!({
+                        "score": p.score,
+                        "signal": p.signal.label(),
+                        "a": side(&p.a),
+                        "b": side(&p.b),
+                    })
                 })
                 .collect();
-
-            let emb_path = prism.root().join(".infigraph").join("embeddings.bin");
-            let cached: std::collections::HashMap<String, Vec<f32>> = if emb_path.exists() {
-                infigraph_core::embed::load_embeddings_cached(&emb_path)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .collect()
-            } else {
-                std::collections::HashMap::new()
-            };
-
-            let vecs: Vec<(String, String, String, Vec<f32>)> = docs
-                .iter()
-                .map(|(id, text)| {
-                    let emb = cached
-                        .get(id)
-                        .cloned()
-                        .unwrap_or_else(|| embedder.embed(text).unwrap_or_default());
-                    let sym = syms.iter().find(|s| &s.id == id).unwrap();
-                    (id.clone(), sym.name.clone(), sym.file.clone(), emb)
-                })
-                .filter(|(_, _, _, e)| !e.is_empty())
-                .collect();
-
-            let n = vecs.len();
-            let mut pairs: Vec<Value> = Vec::new();
-            for i in 0..n {
-                for j in (i + 1)..n {
-                    if vecs[i].2 == vecs[j].2 {
-                        continue;
-                    }
-                    let sim = infigraph_core::embed::cosine_similarity(&vecs[i].3, &vecs[j].3);
-                    if sim >= threshold {
-                        pairs.push(json!({
-                            "score": sim,
-                            "a": {"id": vecs[i].0, "name": vecs[i].1, "file": vecs[i].2},
-                            "b": {"id": vecs[j].0, "name": vecs[j].1, "file": vecs[j].2},
-                        }));
-                    }
-                }
-            }
-            pairs.sort_by(|a, b| {
-                b["score"]
-                    .as_f64()
-                    .unwrap_or(0.0)
-                    .partial_cmp(&a["score"].as_f64().unwrap_or(0.0))
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-            pairs.truncate(50);
-            json!({"pairs": pairs, "total": pairs.len(), "checked": n})
+            json!({
+                "pairs": pairs,
+                "total": pairs.len(),
+                "checked": report.symbols,
+                "mode": report.mode.label(),
+                "truncated": report.truncated,
+            })
         }
         Err(e) => json!({"error": e.to_string()}),
     }

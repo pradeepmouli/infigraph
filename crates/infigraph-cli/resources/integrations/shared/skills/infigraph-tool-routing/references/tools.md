@@ -316,7 +316,7 @@ Louvain community detection on the call graph to discover functional modules.
 
 ### `detect_clones`
 
-PRIMARY: Find near-duplicate functions using vector similarity. Use to identify copy-paste code and refactoring opportunities. Stores SIMILAR_TO edges for later querying.
+PRIMARY: Find near-duplicate functions by comparing their bodies: renamed locals, changed literals, comments and layout do not hide a copy, and bodies that call different functions do not match. Each pair says which signal scored it (exact-body, body-embedding, token-fallback, or signature for a function the index has no body data for yet). Use to identify copy-paste code and refactoring opportunities. Stores SIMILAR_TO edges for later querying.
 
 | Parameter | Type | Required | Default | Description |
 |---|---|---|---|---|
@@ -325,7 +325,7 @@ PRIMARY: Find near-duplicate functions using vector similarity. Use to identify 
 | `path` | string |  |  | see Common parameters |
 | `path_prefix` | string |  |  | Restrict the analysis to files under this directory (or to this one file), relative to the project root, e.g. 'crates/infigraph-core'. Matches whole path components. Default: the whole project. |
 | `store_edges` | boolean |  | `true` | Write SIMILAR_TO edges to graph for later querying |
-| `threshold` | number |  | `0.92` | Similarity threshold 0.0-1.0 (default: 0.92). Lower = more results but more false positives. |
+| `threshold` | number |  | `0.92` | Similarity threshold 0.0-1.0 (default: 0.92) on the embedding cosine of two bodies. A body-embedding pair must also share `[clones] min_overlap` (default 50%) of its tokens. Lower = more results but more false positives. |
 
 ### `detect_cross_cutting`
 
