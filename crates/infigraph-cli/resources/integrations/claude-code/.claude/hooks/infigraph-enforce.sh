@@ -193,7 +193,7 @@ EOF_FIND_PATHS
       Dockerfile|Containerfile|Makefile|makefile|GNUmakefile|CMakeLists.txt|BUILD|BUILD.bazel|WORKSPACE) ;;
       *)
         case "$file_path" in
-          *.py|*.rs|*.ts|*.tsx|*.js|*.jsx|*.mjs|*.go|*.java|*.c|*.h|*.cpp|*.cc|*.cxx|*.hpp|*.hxx|*.hh|\
+          *.py|*.rs|*.ts|*.mts|*.cts|*.tsx|*.js|*.jsx|*.mjs|*.cjs|*.go|*.java|*.c|*.h|*.cpp|*.cc|*.cxx|*.hpp|*.hxx|*.hh|\
           *.rb|*.rake|*.gemspec|*.php|*.swift|*.kt|*.kts|*.cs|*.scala|*.sc|*.lua|*.zig|*.ex|*.exs|*.dart|\
           *.m|*.mm|*.hs|*.lhs|*.pl|*.pm|*.t|*.r|*.R|*.Rmd|*.ml|*.mli|*.sh|*.bash|*.zsh|*.sql|*.jl|*.proto|\
           *.ps1|*.psm1|*.psd1|*.v|*.sv|*.svh|*.vh|*.hcl|*.tf|*.erl|*.hrl|\

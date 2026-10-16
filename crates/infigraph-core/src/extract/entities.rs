@@ -578,15 +578,7 @@ fn is_test_by_name_and_path(name: &str, file: &str, language: &str) -> bool {
     match language {
         // JS/TS: *.test.ts, *.spec.js, __tests__/ with describe/it/test
         "typescript" | "javascript" => {
-            file_lower.ends_with(".test.ts")
-                || file_lower.ends_with(".test.tsx")
-                || file_lower.ends_with(".test.js")
-                || file_lower.ends_with(".test.jsx")
-                || file_lower.ends_with(".test.mjs")
-                || file_lower.ends_with(".spec.ts")
-                || file_lower.ends_with(".spec.tsx")
-                || file_lower.ends_with(".spec.js")
-                || file_lower.ends_with(".spec.jsx")
+            crate::lang::is_script_test_name(&file_lower)
                 || (in_test_dir && (name == "it" || name == "test" || name == "describe"))
         }
         // Go: func TestXxx in _test.go
@@ -710,7 +702,9 @@ fn is_test_by_name_and_path(name: &str, file: &str, language: &str) -> bool {
         "bash" => file_lower.ends_with(".bats") || (in_test_dir && name.starts_with("test_")),
         // Svelte: same as JS/TS — *.test.ts patterns
         "svelte" => {
-            file_lower.ends_with(".test.ts") || file_lower.ends_with(".spec.ts") || in_test_dir
+            crate::lang::TYPESCRIPT.marked_path(&file_lower, ".test")
+                || crate::lang::TYPESCRIPT.marked_path(&file_lower, ".spec")
+                || in_test_dir
         }
         // C++: GTest TEST/TEST_F/TEST_P, Catch2 TEST_CASE/SCENARIO, Boost test*
         "cpp" => {
@@ -1195,6 +1189,30 @@ mod tests {
             "typescript"
         ));
         assert!(!is_test_by_name_and_path("it", "src/auth.ts", "typescript"));
+    }
+
+    /// `.mts` / `.cts` are TypeScript and `.cjs` is JavaScript, so their
+    /// `.test` / `.spec` files are tests like any other.
+    #[test]
+    fn test_is_test_by_name_and_path_module_system_variants() {
+        for (name, file, language) in [
+            ("it", "src/auth.test.mts", "typescript"),
+            ("describe", "src/auth.spec.cts", "typescript"),
+            ("test", "src/auth.test.cjs", "javascript"),
+            ("test", "src/auth.spec.mjs", "javascript"),
+        ] {
+            assert!(is_test_by_name_and_path(name, file, language), "{file}");
+        }
+        assert!(!is_test_by_name_and_path(
+            "it",
+            "src/auth.mts",
+            "typescript"
+        ));
+        assert!(!is_test_by_name_and_path(
+            "test",
+            "src/test.cjs",
+            "javascript"
+        ));
     }
 
     // AIF3X-331 #20: keyword-less languages must default to a concrete

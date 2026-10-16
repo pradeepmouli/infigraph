@@ -147,6 +147,25 @@ All query files live under `crates/infigraph-languages/languages/<lang>/`.
 
 Rust, Python, JavaScript, TypeScript, Java, Go, C, C++, C#, Ruby, PHP, Swift, Kotlin, Scala, Dart, Elixir, Haskell, Lua, R, Julia, Perl, Bash, PowerShell, Zig, Nim, OCaml, Erlang, Clojure, F#, Groovy, MATLAB, Fortran, COBOL, Ada, Pascal, Verilog, SystemVerilog, VHDL, Assembly, Makefile, CMake, Dockerfile, HCL/Terraform, Nix, YAML, TOML, JSON, XML, HTML, CSS, SCSS, SQL, GraphQL, Protobuf, Thrift, Svelte, Vue, JSX, TSX, Markdown, LaTeX, Typst.
 
+
+#### JavaScript and TypeScript extensions
+
+Three packs share one declaration, `lang::{TYPESCRIPT, TSX, JAVASCRIPT}`
+(`crates/infigraph-core/src/lang/extensions.rs`): `typescript` claims `.ts`,
+`.mts` and `.cts`; `tsx` claims `.tsx`; `javascript` claims `.js`, `.jsx`,
+`.mjs` and `.cjs`. `.mts`, `.cts` and `.cjs` are the module-system variants
+of the same grammars, so they are indexed, watched and listed by
+`infigraph languages` like their siblings.
+
+Every consumer keyed by extension reads that declaration instead of keeping a
+copy: the packs themselves, route language detection, the test-file name
+heuristics (`*.test.mts`, `*.spec.cjs`, ...), the security, bridge and
+reflection rules (a rule whose list names one extension of a pack applies to
+the whole pack, via `lang::extension_selected`), and the `infigraph agent`
+language census (labelled by pack: `.jsx` counts as JavaScript). A new
+member of a pack is added in that one file. The exception is the Claude Code
+hook `infigraph-enforce.sh`, whose source-file glob is a shell literal;
+`crates/infigraph-cli/tests/hook_extensions.rs` fails when it lacks one.
 ---
 
 ## File Discovery

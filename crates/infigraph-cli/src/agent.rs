@@ -130,10 +130,6 @@ fn detect_languages(root: &Path) -> Vec<(String, usize)> {
     let ext_map: HashMap<&str, &str> = [
         ("rs", "Rust"),
         ("py", "Python"),
-        ("js", "JavaScript"),
-        ("ts", "TypeScript"),
-        ("tsx", "TSX"),
-        ("jsx", "JSX"),
         ("java", "Java"),
         ("kt", "Kotlin"),
         ("go", "Go"),
@@ -168,6 +164,17 @@ fn detect_languages(root: &Path) -> Vec<(String, usize)> {
     ]
     .into_iter()
     .collect();
+    // JavaScript and TypeScript come from the one declaration in core, named
+    // for the pack that claims them: `.jsx` is a JavaScript file here, `.tsx`
+    // keeps its own pack's name.
+    let mut ext_map = ext_map;
+    for (pack, label) in [
+        (infigraph_core::lang::TYPESCRIPT, "TypeScript"),
+        (infigraph_core::lang::TSX, "TSX"),
+        (infigraph_core::lang::JAVASCRIPT, "JavaScript"),
+    ] {
+        ext_map.extend(pack.bare.iter().map(|ext| (*ext, label)));
+    }
 
     // The project's one ignore rule set, not a private skip list: a file
     // under a .gitignore'd or `[ignore] code` path is not part of the
@@ -582,5 +589,20 @@ mod tests {
             std::fs::metadata(&path).unwrap().modified().unwrap(),
             before
         );
+    }
+
+    /// `.mts` / `.cts` are TypeScript and `.cjs` is JavaScript to the census,
+    /// like the language packs they belong to.
+    #[test]
+    fn language_census_counts_the_module_system_variants() {
+        let root = project();
+        for name in ["a.ts", "b.mts", "c.cts", "d.js", "e.cjs", "f.mjs", "g.py"] {
+            std::fs::write(root.path().join(name), "x\n").unwrap();
+        }
+        let counts: std::collections::BTreeMap<String, usize> =
+            detect_languages(root.path()).into_iter().collect();
+        assert_eq!(counts.get("TypeScript"), Some(&3), "{counts:?}");
+        assert_eq!(counts.get("JavaScript"), Some(&3), "{counts:?}");
+        assert_eq!(counts.get("Python"), Some(&1), "{counts:?}");
     }
 }

@@ -1,5 +1,5 @@
 use anyhow::Result;
-use infigraph_core::lang::{CustomEdgeDef, LanguagePack, LanguageRegistry};
+use infigraph_core::lang::{self, CustomEdgeDef, LanguagePack, LanguageRegistry};
 
 const PYTHON_ENTITIES: &str = include_str!("../languages/python/entities.scm");
 const PYTHON_RELATIONS: &str = include_str!("../languages/python/relations.scm");
@@ -473,7 +473,7 @@ fn typescript_pack() -> Result<LanguagePack> {
     let grammar = tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into();
     LanguagePack::new(
         "typescript",
-        vec![".ts"],
+        lang::TYPESCRIPT.dotted.to_vec(),
         grammar,
         TYPESCRIPT_ENTITIES,
         TYPESCRIPT_RELATIONS,
@@ -485,7 +485,7 @@ fn javascript_pack() -> Result<LanguagePack> {
     let grammar = tree_sitter_javascript::LANGUAGE.into();
     LanguagePack::new(
         "javascript",
-        vec![".js", ".jsx", ".mjs"],
+        lang::JAVASCRIPT.dotted.to_vec(),
         grammar,
         JAVASCRIPT_ENTITIES,
         JAVASCRIPT_RELATIONS,
@@ -997,7 +997,13 @@ fn ini_pack() -> Result<LanguagePack> {
 
 fn tsx_pack() -> Result<LanguagePack> {
     let grammar = tree_sitter_typescript::LANGUAGE_TSX.into();
-    LanguagePack::new("tsx", vec![".tsx"], grammar, TSX_ENTITIES, TSX_RELATIONS)
+    LanguagePack::new(
+        "tsx",
+        lang::TSX.dotted.to_vec(),
+        grammar,
+        TSX_ENTITIES,
+        TSX_RELATIONS,
+    )
 }
 
 fn starlark_pack() -> Result<LanguagePack> {
