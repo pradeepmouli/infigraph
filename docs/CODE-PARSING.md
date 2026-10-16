@@ -277,9 +277,29 @@ reachable only by a link used to be indexed, and is not any more. Hidden
 directories (`.github/`, `.idea/`) stay excluded below the repository root,
 as they are for the walk.
 
-Some walkers do not consult these rules yet (manifest and cross-service
-scans among them); see the issue tracking walkers that bypass
-`ignore_rules`.
+Every scan of the project's source tree asks these same rules: the code
+indexer, text search, the security scan, the manifest scan (`*.csproj`),
+the cross-service scans, bridge detection, config discovery,
+`semantic_diff` (both refs, judged by the project's configuration) and the
+language census of `infigraph agent`. Each used to carry its own skip list
+and none read `.gitignore`. What that changed:
+
+- A `.gitignore`d, `.infigraphignore`d or `[ignore] code` path no longer
+  contributes manifest rows, cross-service edges, bridges, config bindings,
+  diff entries or language counts.
+- A directory the old private lists skipped by name but the shared rules do
+  not -- `bin/`, `obj/`, `out/`, `generated/`, `third_party/`, `CMakeFiles/`
+  -- is now walked unless the project's `.gitignore` or `.infigraphignore`
+  names it (C# repositories that do not ignore `bin/` and `obj/` will see
+  them in manifest scans and language counts). They are not on the safety
+  list, because `bin/` is also where Rust keeps `src/bin/`.
+- Hidden files are not read by the cross-service scans any more (they used
+  to skip hidden directories but would read a hidden file). Config
+  discovery keeps `.env` and `.env.<profile>`.
+
+A directory you name yourself is not discovered, so the rules do not apply:
+`ingest_directory*`, the cozo and neo4j structured ingest and reflection's
+fixed config-file reads take the path the caller named.
 
 ### Parallel processing
 
