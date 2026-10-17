@@ -197,6 +197,79 @@ pub(crate) fn cmd_search_docs(root: &Path, query: &str, limit: usize) -> Result<
     Ok(())
 }
 
+/// The prose for `replace` and `create`: `--text`, or `--text-file` ('-' is
+/// stdin).
+fn prose(text: Option<String>, file: Option<std::path::PathBuf>) -> Result<String> {
+    match (text, file) {
+        (Some(text), _) => Ok(text),
+        (None, Some(path)) if path.as_os_str() == "-" => {
+            use std::io::Read;
+            let mut buf = String::new();
+            std::io::stdin()
+                .read_to_string(&mut buf)
+                .context("cannot read the text from stdin")?;
+            Ok(buf)
+        }
+        (None, Some(path)) => std::fs::read_to_string(&path)
+            .with_context(|| format!("cannot read {}", path.display())),
+        (None, None) => anyhow::bail!("this needs the prose: --text <TEXT> or --text-file <FILE>"),
+    }
+}
+
+/// `infigraph doc-entry`: the same operations as the MCP `doc_entry` tool.
+pub(crate) fn cmd_doc_entry(root: &Path, op: crate::DocEntryOp, apply: bool) -> Result<()> {
+    use crate::DocEntryOp as O;
+    use infigraph_docs::doc_entry::Op;
+    let op = match op {
+        O::Edit {
+            target,
+            old,
+            new,
+            replace_all,
+        } => Op::Edit {
+            target,
+            old,
+            new,
+            replace_all,
+        },
+        O::Replace {
+            target,
+            text,
+            text_file,
+            section,
+        } => Op::Replace {
+            target,
+            text: prose(text, text_file)?,
+            section,
+        },
+        O::Create {
+            target,
+            text,
+            text_file,
+            doc_file,
+        } => Op::Create {
+            target,
+            text: prose(text, text_file)?,
+            doc_file,
+        },
+        O::Rekey {
+            target,
+            new_target,
+            force,
+            ack,
+        } => Op::Rekey {
+            target,
+            new_target,
+            force,
+            ack,
+        },
+        O::Delete { target, force } => Op::Delete { target, force },
+        O::Ack { targets } => Op::Ack { targets },
+    };
+    print!("{}", infigraph_docs::doc_entry::run(root, &op, apply)?);
+    Ok(())
+}
+
 /// `infigraph stale-docs`: the same report as the MCP `stale_docs` tool.
 pub(crate) fn cmd_stale_docs(
     root: &Path,

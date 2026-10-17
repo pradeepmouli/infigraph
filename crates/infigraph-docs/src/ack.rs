@@ -70,18 +70,38 @@ pub struct AckReport {
     pub refused: Vec<(String, String)>,
 }
 
+/// What [`plan`] would record: the reviews and the targets that cannot be.
+#[derive(Debug, Default)]
+pub struct AckPlan {
+    pub acks: Vec<DocAck>,
+    pub refused: Vec<(String, String)>,
+}
+
 /// Records that the entries keyed to `targets` were reviewed against their
-/// symbols as they are now: the commit that last changed each symbol's lines,
-/// by `git blame`. Refuses a target with no entry, with no symbol, whose lines
-/// have uncommitted edits (a review names a commit, and the next commit would
-/// make it stale again at once), or that git cannot answer for. The write goes
-/// to the store through the daemon like any docs write. Errors only when the
-/// project has no document index or the write fails.
+/// symbols as they are now (see [`plan`]). The write goes to the store through
+/// the daemon like any docs write. Errors only when the project has no
+/// document index or the write fails.
 pub fn acknowledge(root: &Path, targets: &[String]) -> Result<AckReport> {
+    let AckPlan { acks, refused } = plan(root, targets)?;
+    if !acks.is_empty() {
+        crate::ops::request_ack_docs(root, &acks, &[])?;
+    }
+    Ok(AckReport {
+        acked: acks.into_iter().map(|a| a.target).collect(),
+        refused,
+    })
+}
+
+/// What reviewing `targets` now would record: the commit that last changed
+/// each symbol's lines, by `git blame`. A target with no entry, with no
+/// symbol, whose lines have uncommitted edits (a review names a commit, and
+/// the next commit would make it stale again at once), or that git cannot
+/// answer for, is refused with the reason. Reads only.
+pub fn plan(root: &Path, targets: &[String]) -> Result<AckPlan> {
     if !docs_switch::docs_enabled(root) || !docs_switch::docs_store_path(root).exists() {
         return Err(DocsNotIndexed.into());
     }
-    let mut report = AckReport::default();
+    let mut report = AckPlan::default();
     let held = link_check::with_docs(root, |q| q.code_links_for(LinkKind::Documents, targets))?;
     let (with_entry, without): (Vec<&String>, Vec<&String>) = targets
         .iter()
@@ -98,7 +118,6 @@ pub fn acknowledge(root: &Path, targets: &[String]) -> Result<AckReport> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_secs() as i64);
-    let mut acks = Vec::new();
     for target in with_entry {
         let Some(symbol) = live.get(target) else {
             report.refused.push((
@@ -130,13 +149,12 @@ pub fn acknowledge(root: &Path, targets: &[String]) -> Result<AckReport> {
                 ),
             )),
             Some(code) => {
-                acks.push(DocAck {
+                report.acks.push(DocAck {
                     target: target.clone(),
                     commit: code.commit,
                     commit_time: code.time,
                     acked_at: now,
                 });
-                report.acked.push(target.clone());
             }
             None => report.refused.push((
                 target.clone(),
@@ -146,9 +164,6 @@ pub fn acknowledge(root: &Path, targets: &[String]) -> Result<AckReport> {
                 ),
             )),
         }
-    }
-    if !acks.is_empty() {
-        crate::ops::request_ack_docs(root, &acks, &[])?;
     }
     Ok(report)
 }

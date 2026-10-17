@@ -7,6 +7,7 @@ pub mod code_links;
 pub mod combined;
 pub mod daemon_source;
 pub mod daemon_store;
+pub mod doc_entry;
 pub mod embed;
 pub mod extract;
 pub mod link_check;
