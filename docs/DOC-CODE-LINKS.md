@@ -41,7 +41,13 @@ The entry is everything under the heading up to the next heading that is itself
 a key heading, or whose level is the heading's own or higher. So `####`
 sub-entries under a `###` key belong to it, and two keys of one level never
 swallow each other. Fenced code is skipped, so a heading inside a fence starts
-and ends nothing. That is the whole format; nothing is configurable.
+and ends nothing. A fence that is opened and never closed is **not** a fence:
+CommonMark would run it to the end of the file, which hides every entry below it
+from the index, `doctor` and the edit guard, so its lines are read as prose and
+`doctor` lists it (`unclosed code fence at file:line`). A page that documents
+this format with fences inside a fence ends up this way, since the first bare
+fence line closes the outer one. That is the whole format; nothing is
+configurable.
 
 `<file>::module` is an entry for the file itself (`src/billing/invoice.py::module`).
 `get_doc_context` shows it as a separate block, **File-level notes**, on every
@@ -176,7 +182,29 @@ is off), and repeating it is a no-op that says "already done".
   time (`code_links::entries`), never from stored rows, so an op after an
   unindexed edit still lands on the right lines. An op that would change the
   list of entries (an `edit` that adds or drops a key heading) is refused.
-- **Acknowledging.** Most "possibly stale" entries are still true. `ack` stores
+- **One key, several entries.** The same heading twice in a document, or in two
+  documents, makes `edit`, `replace`, `rekey` and `delete` refuse with every
+  `file:line` listed. Choose with `nth` (1-based, in file order within one
+  document), `line` (the entry's key heading line) or `doc_file`. A `delete` of an
+  entry that is already gone ("no 2nd entry (1 found)") is "already done"; any other
+  op says how many entries there are. `nth` and `line` are positions, so after a
+  delete the survivor is the only one: preview before repeating. `doctor` lists a
+  duplicated key with `file:line` of each entry.
+- **The index may be behind.** The stored index names the file that holds a key;
+  whether an entry is there is the file's answer. If the refresh after a write
+  fails (the daemon is down, the growth breaker is tripped), the file is still
+  written, the output says `document index NOT refreshed: <reason>` and the exit
+  code is 0, and asking for the same change again says "already done" for every
+  op (a `rekey` or `delete` whose old key the file no longer has, a `create`
+  whose entry the file already has). `infigraph index-docs` brings the index up to
+  date.
+- **Worktrees.** A linked worktree with its own index (`infigraph worktree init`)
+  is edited and refreshed on its own. One without an index would resolve to the
+  main checkout around it and change its glossary instead, so `doc_entry` refuses,
+  naming the command.
+- **Acknowledging.** Read the changed lines (`stale_docs` shows them) against the
+  entry first, and `ack` only an entry that is still true; never ack in bulk to
+  clear a list. Most "possibly stale" entries are still true. `ack` stores
   `DocAck(target, commit, commit_time, acked_at)` in `docs.kuzu`, one newest row
   per target, and nothing in the Markdown. `stale_docs::verdict` then treats the
   entry as in sync for code up to that commit's time, so a later change to the
@@ -222,6 +250,9 @@ symbol, and the report lists the ones that do not, by reason:
   order, so it cannot be a key);
 - the file is not in the graph (not indexed, or deleted);
 - no such symbol in the file (renamed or removed).
+
+It also lists a key that has more than one entry (with `file:line` of each) and a
+code fence that is never closed.
 
 A rename that leaves a glossary behind shows up here instead of as a silent gap.
 The default `doctor` also says that the sync check was not run.
