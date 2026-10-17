@@ -143,6 +143,27 @@ pub fn run(root: &Path, op: &Op, apply: bool) -> Result<String> {
     })
 }
 
+/// Refuses to act on `root` for a caller standing in a checkout nested inside
+/// it that has no index of its own. A linked worktree (`scratchpad/wt-x`)
+/// without a store resolves to the main checkout's, and an edit would then land
+/// in the main checkout's glossary and refresh its index while the caller
+/// believes it is changing the worktree's.
+pub fn refuse_nested_checkout(root: &Path, start: &Path) -> Result<()> {
+    let start = infigraph_core::project::canonicalize_lenient(start);
+    let root = infigraph_core::project::canonicalize_lenient(root);
+    match infigraph_core::project::git_root(&start) {
+        Some(checkout) if checkout != root && checkout.starts_with(&root) => bail!(
+            "{} is a checkout of its own with no index of its own, so this would change the \
+             glossary of {}: run `infigraph worktree init` in {} first, or name the project you \
+             mean",
+            checkout.display(),
+            root.display(),
+            checkout.display()
+        ),
+        _ => Ok(()),
+    }
+}
+
 /// How an applied write asks the document index to catch up with the file.
 pub type Refresh<'a> = &'a dyn Fn(&Path) -> Result<DocIndexStats>;
 

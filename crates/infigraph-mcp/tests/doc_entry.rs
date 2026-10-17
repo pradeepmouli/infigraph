@@ -980,3 +980,65 @@ mod duplicates {
         assert_eq!(file(dir.path(), "docs/glossary/lib.md"), LIB_DOC);
     }
 }
+
+// ---- a linked worktree is its own project ----------------------------------------
+
+mod worktrees {
+    use super::*;
+
+    /// A committed project and a linked worktree of it inside its directory
+    /// (`scratchpad/wt-x`, as the repo's convention puts them).
+    fn project_and_worktree() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = committed();
+        git(
+            dir.path(),
+            &["worktree", "add", "-q", "-b", "topic", "scratchpad/wt-x"],
+            FIRST,
+        );
+        let wt = dir.path().join("scratchpad/wt-x");
+        assert!(wt.join("docs/glossary/src.md").is_file());
+        (dir, wt)
+    }
+
+    const EDIT: fn(bool) -> Value = |apply| {
+        json!({
+            "op": "edit", "target": TOTAL, "old": "in a loop", "new": "by looping",
+            "apply": apply,
+        })
+    };
+
+    #[test]
+    fn a_worktree_with_its_own_index_is_edited_and_refreshed_on_its_own() {
+        let (main, wt) = project_and_worktree();
+        reindex_code(&wt);
+        index_documents(&wt);
+
+        let out = ok(&wt, EDIT(true));
+
+        assert!(out.contains("document index refreshed"), "{out}");
+        assert!(file(&wt, "docs/glossary/src.md").contains("by looping"));
+        assert_eq!(file(main.path(), "docs/glossary/src.md"), SRC_DOC);
+        assert!(
+            context(&wt, TOTAL).contains("by looping"),
+            "its index was not refreshed"
+        );
+        assert!(
+            !context(main.path(), TOTAL).contains("by looping"),
+            "the main checkout's index was refreshed"
+        );
+    }
+
+    #[test]
+    fn a_worktree_with_no_index_of_its_own_is_refused_rather_than_resolved_to_the_main_checkout() {
+        let (main, wt) = project_and_worktree();
+
+        let why = refused(&wt, EDIT(true));
+
+        assert!(
+            why.contains("no index of its own") && why.contains("worktree init"),
+            "{why}"
+        );
+        assert_eq!(file(main.path(), "docs/glossary/src.md"), SRC_DOC);
+        assert_eq!(file(&wt, "docs/glossary/src.md"), SRC_DOC);
+    }
+}

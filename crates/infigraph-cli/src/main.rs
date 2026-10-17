@@ -1210,6 +1210,7 @@ fn main() -> Result<()> {
     // Resolve to the project that owns the cwd, not the cwd itself. Taking
     // the cwd verbatim is what created a separate store, daemon and socket
     // for every subdirectory anyone ever ran a command from.
+    let root_given = cli.root.is_some();
     let root = cli.root.unwrap_or_else(|| {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         infigraph_core::project::resolve_project_root(&cwd)
@@ -1232,7 +1233,7 @@ fn main() -> Result<()> {
             if should_auto_watch {
                 index::ensure_watcher_running(&root);
             }
-            run(cli.command, &root)
+            run(cli.command, &root, root_given)
         })
         .expect("failed to spawn main worker thread")
         .join()
@@ -1243,7 +1244,7 @@ fn main() -> Result<()> {
     result
 }
 
-fn run(command: Commands, root: &Path) -> Result<()> {
+fn run(command: Commands, root: &Path, root_given: bool) -> Result<()> {
     match command {
         Commands::Init { group, quick, yes } => cmd_init(root, group.as_deref(), quick, yes),
         Commands::Index { full, no_embed } => cmd_index(root, full, no_embed),
@@ -1355,7 +1356,7 @@ fn run(command: Commands, root: &Path) -> Result<()> {
             symbol,
             limit,
         } => cmd_stale_docs(root, path_prefix.as_deref(), symbol, limit),
-        Commands::DocEntry { op, apply } => cmd_doc_entry(root, op, apply),
+        Commands::DocEntry { op, apply } => cmd_doc_entry(root, root_given, op, apply),
         Commands::DocGuard => {
             cmd_doc_guard();
             Ok(())

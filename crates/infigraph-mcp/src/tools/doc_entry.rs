@@ -1,12 +1,12 @@
 //! `doc_entry`: edit a glossary entry's lines, create, rekey, delete or review
 //! one. The report is `infigraph_docs::doc_entry`; this only reads arguments.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Result};
 use serde_json::Value;
 
-use infigraph_docs::doc_entry::{run, Op, Pick};
+use infigraph_docs::doc_entry::{refuse_nested_checkout, run, Op, Pick};
 
 use super::helpers::{resolve_project_path, startup_project};
 
@@ -36,12 +36,14 @@ fn pick(args: &Value) -> Pick {
 }
 
 pub fn tool_doc_entry(args: &Value) -> Result<String> {
-    let root = args
-        .get("path")
-        .and_then(|v| v.as_str())
+    let given = args.get("path").and_then(|v| v.as_str());
+    let root = given
         .map(|p| PathBuf::from(resolve_project_path(p)))
         .unwrap_or_else(startup_project);
     let root = root.canonicalize().unwrap_or(root);
+    if let Some(path) = given {
+        refuse_nested_checkout(&root, Path::new(path))?;
+    }
     let op_name = need(args, "op", "doc_entry")?;
     let op = match op_name.as_str() {
         "replace" => Op::Replace {

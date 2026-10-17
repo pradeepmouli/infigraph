@@ -244,8 +244,18 @@ pub(crate) fn cmd_doc_guard() {
 }
 
 /// `infigraph doc-entry`: the same operations as the MCP `doc_entry` tool.
-pub(crate) fn cmd_doc_entry(root: &Path, op: crate::DocEntryOp, apply: bool) -> Result<()> {
+pub(crate) fn cmd_doc_entry(
+    root: &Path,
+    root_given: bool,
+    op: crate::DocEntryOp,
+    apply: bool,
+) -> Result<()> {
     use crate::DocEntryOp as O;
+    // The root came from the working directory: a nested checkout without its
+    // own index would silently resolve to the project around it.
+    if !root_given {
+        infigraph_docs::doc_entry::refuse_nested_checkout(root, &std::env::current_dir()?)?;
+    }
     use infigraph_docs::doc_entry::{Op, Pick};
     let pick = |p: crate::PickArgs| Pick {
         nth: p.nth,
