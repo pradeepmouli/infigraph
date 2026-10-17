@@ -15,6 +15,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
+use infigraph_core::daemon_protocol::DocAck;
 use infigraph_core::graph::query_exec::QueryExec;
 use infigraph_core::graph::remote_exec::RemoteExec;
 
@@ -103,6 +104,14 @@ impl DocBackend for DaemonDocStore {
 
     fn code_link_scans(&self) -> Result<HashMap<String, i64>> {
         self.with_reader(|q| q.code_link_scans())
+    }
+
+    fn doc_acks(&self, targets: &[String]) -> Result<HashMap<String, DocAck>> {
+        self.with_reader(|q| q.doc_acks(targets))
+    }
+
+    fn all_doc_acks(&self) -> Result<Vec<DocAck>> {
+        self.with_reader(|q| q.all_doc_acks())
     }
 
     fn stats(&self) -> Result<DocStoreStats> {

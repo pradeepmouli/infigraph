@@ -1,3 +1,5 @@
+pub mod ack;
+mod ack_store;
 pub mod backend;
 pub mod chunk;
 mod code_link_store;
@@ -272,9 +274,31 @@ impl DocIndex {
         Ok(())
     }
 
+    /// The acknowledgements the store holds now, for `reindex` to put back
+    /// after the wipe: they are the reviewer's, not derived from the files.
+    /// One that cannot be read is lost with the store, and says so.
+    fn acks_to_carry(&self) -> Vec<infigraph_core::daemon_protocol::DocAck> {
+        let read = match self.store() {
+            Some(store) => store.all_doc_acks(),
+            None if self.db_path.exists() => store::DocStore::open(&self.db_path)
+                .and_then(|s| backend::DocBackend::all_doc_acks(&s)),
+            None => return Vec::new(),
+        };
+        read.unwrap_or_else(|e| {
+            eprintln!("[docs] entry acknowledgements could not be read and are lost in the reindex: {e:#}");
+            Vec::new()
+        })
+    }
+
     pub fn reindex(&mut self) -> Result<DocIndexResult> {
+        let acks = self.acks_to_carry();
         self.clean()?;
         self.init()?;
+        if !acks.is_empty() {
+            if let Some(store) = self.store() {
+                store.upsert_acks(&acks, &[])?;
+            }
+        }
         self.index()
     }
 

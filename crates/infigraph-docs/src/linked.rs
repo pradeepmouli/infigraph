@@ -21,6 +21,8 @@ use infigraph_core::escape_str;
 use infigraph_core::git_blame::{self, BlameError, GIT_TIMEOUT};
 use infigraph_core::graph::GraphBackend;
 
+use crate::ack::Acks;
+use crate::backend::DocBackend;
 use crate::code_links::{is_file_form, CodeLinkRow, LinkKind, CODE_LINKS_VERSION};
 use crate::stale_docs::verdict;
 use crate::DocIndex;
@@ -246,7 +248,7 @@ pub fn lookup(
         found.mentions = mentions;
     }
 
-    judge_entries(root, symbol_id, file, lines, &mut found);
+    judge_entries(root, store, symbol_id, file, lines, &mut found);
 
     found.unscanned = unscanned_documents(store);
     match found.unscanned {
@@ -264,6 +266,7 @@ pub fn lookup(
 /// current or stale, and nothing waits longer than the git timeout.
 fn judge_entries(
     root: &Path,
+    store: &dyn DocBackend,
     symbol_id: &str,
     file: &str,
     lines: (usize, usize),
@@ -272,6 +275,8 @@ fn judge_entries(
     if found.entries.is_empty() {
         return;
     }
+    // A review that cannot be read leaves the entry judged by its history.
+    let acks = Acks::of(store, &[symbol_id.to_string()]).unwrap_or_default();
     let judge = |entry: &LinkedEntry| -> Result<Option<String>, BlameError> {
         let code = git_blame::blame_ranges_cached(root, file, &[lines], GIT_TIMEOUT)?;
         let doc = git_blame::blame_ranges_cached(
@@ -280,7 +285,7 @@ fn judge_entries(
             &[(entry.line_start, entry.line_end)],
             GIT_TIMEOUT,
         )?;
-        Ok(verdict(symbol_id, &code[0], &doc[0]).label())
+        Ok(verdict(symbol_id, &code[0], &doc[0], &acks).state.label())
     };
     let mut failure = None;
     for entry in &mut found.entries {

@@ -6,7 +6,9 @@ use std::time::Duration;
 use infigraph_core::docs_switch::{
     docs_enabled, docs_enabled_recorded, docs_store_path, lock_docs_op,
 };
-use infigraph_docs::ops::{clean_docs, index_docs, refresh_docs_if_enabled, stats_report};
+use infigraph_docs::ops::{
+    ack_docs, clean_docs, index_docs, refresh_docs_if_enabled, stats_report,
+};
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -50,6 +52,15 @@ impl Drop for Isolated {
             Some(h) => std::env::set_var("HOME", h),
             None => std::env::remove_var("HOME"),
         }
+    }
+}
+
+fn an_ack(target: &str) -> infigraph_core::daemon_protocol::DocAck {
+    infigraph_core::daemon_protocol::DocAck {
+        target: target.to_string(),
+        commit: "abc".to_string(),
+        commit_time: 1_700_000_000,
+        acked_at: 1_800_000_000,
     }
 }
 
@@ -376,4 +387,34 @@ fn an_empty_document_index_is_not_reported_as_missing_embeddings() {
         !missing(&root),
         "indexed documents with embeddings are healthy"
     );
+}
+
+#[test]
+fn ack_docs_writes_into_the_store_and_refuses_a_project_without_one() {
+    let _iso = Isolated::new();
+    let (_tmp, root) = project_with_readme();
+
+    let err = ack_docs(&root, &[an_ack("src/a.py::f")], &[]).unwrap_err();
+    assert!(
+        err.is::<infigraph_core::docs_switch::DocsNotIndexed>(),
+        "{err:#}"
+    );
+    assert!(
+        !docs_store_path(&root).exists(),
+        "an ack created the store it needed"
+    );
+
+    index_docs(&root, false).unwrap();
+    let done = ack_docs(&root, &[an_ack("src/a.py::f"), an_ack("src/a.py::g")], &[]).unwrap();
+    assert_eq!(done, (2, 0));
+    let dropped = ack_docs(&root, &[], &["src/a.py::g".to_string()]).unwrap();
+    assert_eq!(dropped, (0, 1));
+
+    let index = infigraph_docs::DocIndex::open_existing(&root).unwrap();
+    let held = index
+        .store()
+        .unwrap()
+        .doc_acks(&["src/a.py::f".to_string(), "src/a.py::g".to_string()])
+        .unwrap();
+    assert_eq!(held.keys().collect::<Vec<_>>(), ["src/a.py::f"]);
 }

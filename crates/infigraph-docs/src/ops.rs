@@ -56,6 +56,65 @@ pub fn clean_docs(root: &Path) -> Result<()> {
     DocIndex::open(root)?.clean()
 }
 
+/// The executor for `AckDocEntries`: records and forgets entry
+/// acknowledgements in the existing store, under the same exclusive docs lock
+/// as an index run so a reindex cannot wipe the store between its read and
+/// its write. It never creates the store, and never opts a project in: with no
+/// store there is nothing a review could be recorded in.
+pub fn ack_docs(
+    root: &Path,
+    acks: &[infigraph_core::daemon_protocol::DocAck],
+    drop: &[String],
+) -> Result<(usize, usize)> {
+    let _op = docs_switch::lock_docs_op(root, docs_switch::DOCS_OP_WAIT)?;
+    if !docs_switch::docs_indexed(root) {
+        return Err(docs_switch::DocsNotIndexed.into());
+    }
+    let _busy = crate::watch::ReindexGuard::enter();
+    let mut idx = DocIndex::open(root)?;
+    idx.init_inner(false)?;
+    idx.store()
+        .context("doc store not initialized")?
+        .upsert_acks(acks, drop)
+}
+
+/// How `ack_docs` runs, for every caller: under the daemon backend it asks
+/// the daemon (`WriteRequest::AckDocEntries`), which runs [`ack_docs`] on its
+/// docs handle; otherwise it runs here. A client never opens the store itself.
+pub fn request_ack_docs(
+    root: &Path,
+    acks: &[infigraph_core::daemon_protocol::DocAck],
+    drop: &[String],
+) -> Result<(usize, usize)> {
+    use infigraph_core::daemon_protocol::{WriteRequest, WriteResult};
+
+    if !infigraph_core::daemon_backend_selected() {
+        return ack_docs(root, acks, drop);
+    }
+    infigraph_core::daemon::lifecycle::ensure_daemon_for_routed_access(root)?;
+    let result = infigraph_core::daemon::writes::submit(
+        root,
+        &WriteRequest::AckDocEntries {
+            acks: acks.to_vec(),
+            drop: drop.to_vec(),
+        },
+        infigraph_core::daemon::writes::WriteOpts {
+            timeout: docs_switch::DOCS_OP_WAIT,
+            cancel: None,
+            on_slot_wait: None,
+        },
+    )?;
+    match result {
+        WriteResult::DocsAcked { stored, dropped } => Ok((stored, dropped)),
+        WriteResult::Err { message } => {
+            anyhow::bail!("recording acknowledgements failed: {message}")
+        }
+        other => {
+            anyhow::bail!("recording acknowledgements returned an unexpected result: {other:?}")
+        }
+    }
+}
+
 /// How `index-docs` runs, for every caller: under the daemon backend it
 /// asks the daemon (`WriteRequest::IndexDocs`), which runs [`index_docs`]
 /// beside the store it owns; otherwise (`INFIGRAPH_BACKEND=kuzu`, or

@@ -274,7 +274,10 @@ fn sync_result(
 ) -> CheckResult {
     let name = format!("{}: doc/code sync", root.display());
     let Judgement {
-        judged, unknown, ..
+        judged,
+        unknown,
+        ack_error,
+        ..
     } = judge(root, entries, started, budget);
 
     let stale = |exact: bool| {
@@ -293,6 +296,16 @@ fn sync_result(
         n_exact,
         n_exact
     );
+    let acknowledged = judged.iter().filter(|j| j.acknowledged).count();
+    if acknowledged > 0 {
+        message.push_str(&format!("; {acknowledged} acknowledged"));
+    }
+    if let Some(why) = ack_error {
+        message.push_str(&format!(
+            "\n  acknowledgements could not be read ({why}): entries a reviewer cleared may be \
+             listed"
+        ));
+    }
     if n_coarse > 0 {
         message.push_str(&format!(
             "\n  plus {} of {} entries judged per file because the {}s budget ran out or git \
