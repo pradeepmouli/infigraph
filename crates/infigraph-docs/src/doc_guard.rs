@@ -197,6 +197,17 @@ mod tests {
     }
 
     #[test]
+    fn it_needs_no_index_at_all() {
+        let (_dir, root) = project();
+        assert!(
+            !infigraph_core::docs_switch::docs_store_path(&root).exists(),
+            "this project has no document store"
+        );
+        assert!(denied(decide(&edit(&root, "Why g."))).contains("src/a.py::g"));
+        assert_eq!(decide(&edit(&root, "Intro text.")), Decision::Allow);
+    }
+
+    #[test]
     fn a_sub_entry_belongs_to_its_entry() {
         let (_dir, root) = project();
         assert!(denied(decide(&edit(&root, "Inside f."))).contains("src/a.py::f"));

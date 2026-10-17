@@ -604,3 +604,198 @@ fn the_guard_still_blocks_an_edit_to_an_entry_the_tool_just_rewrote() {
         "an edit outside every entry must pass"
     );
 }
+
+// ---- an index that cannot be refreshed ---------------------------------------
+
+mod refresh_fails {
+    use super::*;
+    use infigraph_docs::doc_entry::{run_with, Op};
+
+    const WHY: &str = "the graph's growth breaker is tripped";
+
+    /// Applies `op` with a document-index refresh that fails.
+    fn apply(dir: &Path, op: &Op) -> String {
+        run_with(dir, op, true, &|_| anyhow::bail!(WHY))
+            .unwrap_or_else(|e| panic!("{op:?} failed instead of reporting: {e:#}"))
+    }
+
+    fn edit(old: &str, new: &str) -> Op {
+        Op::Edit {
+            target: TOTAL.to_string(),
+            old: old.to_string(),
+            new: new.to_string(),
+            replace_all: false,
+        }
+    }
+
+    fn says_not_refreshed(out: &str) {
+        assert!(
+            out.contains(&format!("document index NOT refreshed: {WHY}")),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn an_edit_is_written_and_says_the_index_is_behind_and_is_then_already_done() {
+        let dir = project();
+        let op = edit("not with sum()", "rather than sum()");
+
+        let first = apply(dir.path(), &op);
+
+        says_not_refreshed(&first);
+        assert!(file(dir.path(), "docs/glossary/src.md").contains("rather than sum()"));
+        assert!(apply(dir.path(), &op).contains("already done"));
+    }
+
+    #[test]
+    fn a_replace_is_written_and_then_already_done() {
+        let dir = project();
+        let op = Op::Replace {
+            target: TOTAL.to_string(),
+            text: "Sums with a loop.".to_string(),
+            section: None,
+        };
+
+        says_not_refreshed(&apply(dir.path(), &op));
+
+        assert!(file(dir.path(), "docs/glossary/src.md").contains("Sums with a loop."));
+        assert!(apply(dir.path(), &op).contains("already done"));
+    }
+
+    #[test]
+    fn a_rekey_is_written_and_then_already_done_though_the_index_still_has_the_old_key() {
+        let dir = project();
+        let op = Op::Rekey {
+            target: "lib/util.py::other".to_string(),
+            new_target: "lib/util.py::third".to_string(),
+            force: false,
+            ack: false,
+        };
+
+        says_not_refreshed(&apply(dir.path(), &op));
+
+        let now = file(dir.path(), "docs/glossary/lib.md");
+        assert!(now.contains("### `lib/util.py::third`\n\nOthers."), "{now}");
+        let again = apply(dir.path(), &op);
+        assert!(again.contains("already done"), "{again}");
+        assert_eq!(file(dir.path(), "docs/glossary/lib.md"), now);
+    }
+
+    #[test]
+    fn a_delete_is_written_and_then_already_done() {
+        let dir = project();
+        let op = Op::Delete {
+            target: TOTAL.to_string(),
+            force: true,
+        };
+
+        says_not_refreshed(&apply(dir.path(), &op));
+
+        let now = file(dir.path(), "docs/glossary/src.md");
+        assert!(!now.contains("compute_total"), "{now}");
+        let again = apply(dir.path(), &op);
+        assert!(again.contains("already done"), "{again}");
+        assert_eq!(file(dir.path(), "docs/glossary/src.md"), now);
+    }
+
+    #[test]
+    fn a_create_is_written_once_though_the_index_never_heard_of_it() {
+        let dir = project();
+        let op = Op::Create {
+            target: "lib/util.py::third".to_string(),
+            text: "Third.".to_string(),
+            doc_file: None,
+        };
+
+        says_not_refreshed(&apply(dir.path(), &op));
+
+        let once = file(dir.path(), "docs/glossary/lib.md");
+        let again = apply(dir.path(), &op);
+        assert!(again.contains("already done"), "{again}");
+        assert_eq!(file(dir.path(), "docs/glossary/lib.md"), once);
+        assert_eq!(
+            once.matches("### `lib/util.py::third`").count(),
+            1,
+            "{once}"
+        );
+    }
+
+    #[test]
+    fn a_refresh_that_works_says_so() {
+        let dir = project();
+        let out = ok(
+            dir.path(),
+            json!({"op": "edit", "target": TOTAL, "old": "in a loop", "new": "by looping", "apply": true}),
+        );
+        assert!(out.contains("document index refreshed"), "{out}");
+        assert!(!out.contains("NOT refreshed"), "{out}");
+    }
+}
+
+// ---- ranges come from the file as it lies, not from the index ---------------
+
+mod live_ranges {
+    use super::*;
+
+    /// `docs/glossary/src.md` with `lines` extra lines above its first entry,
+    /// written by hand: the index still has the old line numbers.
+    fn push_entries_down(dir: &Path, lines: usize) {
+        let text = file(dir, "docs/glossary/src.md");
+        let pad = "A new paragraph above every entry.\n\n".repeat(lines);
+        write(
+            dir,
+            "docs/glossary/src.md",
+            &text.replacen("# Glossary\n\n", &format!("# Glossary\n\n{pad}"), 1),
+        );
+    }
+
+    fn guard(dir: &Path, old: &str) -> infigraph_docs::doc_guard::Decision {
+        infigraph_docs::doc_guard::decide(&json!({
+            "tool_name": "Edit", "cwd": dir,
+            "tool_input": {
+                "file_path": dir.join("docs/glossary/src.md"),
+                "old_string": old, "new_string": "x",
+            },
+        }))
+    }
+
+    #[test]
+    fn the_guard_follows_the_lines_the_file_has_now() {
+        let dir = project();
+        push_entries_down(dir.path(), 8);
+
+        // The entry moved down 16 lines; the index still says it is on line 3.
+        match guard(dir.path(), "Sums the items in a loop") {
+            infigraph_docs::doc_guard::Decision::Deny(why) => {
+                assert!(why.contains(TOTAL) && why.contains("src.md:19-"), "{why}")
+            }
+            other => panic!("an edit inside the moved entry was allowed: {other:?}"),
+        }
+        // The new text sits where the entry used to be in the index: outside.
+        assert_eq!(
+            guard(dir.path(), "A new paragraph above every entry."),
+            infigraph_docs::doc_guard::Decision::Allow
+        );
+    }
+
+    #[test]
+    fn doc_entry_edits_the_lines_the_file_has_now() {
+        let dir = project();
+        push_entries_down(dir.path(), 8);
+
+        ok(
+            dir.path(),
+            json!({
+                "op": "edit", "target": TOTAL, "old": "in a loop", "new": "by looping",
+                "apply": true,
+            }),
+        );
+
+        let now = file(dir.path(), "docs/glossary/src.md");
+        assert!(
+            now.contains("Sums the items by looping, not with sum()"),
+            "{now}"
+        );
+        assert_eq!(now.matches("A new paragraph above every entry.").count(), 8);
+    }
+}

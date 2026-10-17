@@ -15,6 +15,7 @@ use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
+use infigraph_core::daemon_protocol::DocIndexStats;
 use infigraph_core::docs_switch;
 use infigraph_core::git_blame::civil_date;
 
@@ -117,6 +118,18 @@ enum Plan {
 /// Plans `op` and, with `apply`, carries it out. Returns what was (or would
 /// be) done. A refusal is an error that says why.
 pub fn run(root: &Path, op: &Op, apply: bool) -> Result<String> {
+    run_with(root, op, apply, &|root| {
+        ops::request_index_docs(root, false)
+    })
+}
+
+/// How an applied write asks the document index to catch up with the file.
+pub type Refresh<'a> = &'a dyn Fn(&Path) -> Result<DocIndexStats>;
+
+/// [`run`] with the index refresh spelled out, so a refresh that fails can be
+/// exercised: the Markdown is written first and a failing refresh is reported,
+/// never turned into a failed edit.
+pub fn run_with(root: &Path, op: &Op, apply: bool, refresh: Refresh) -> Result<String> {
     let name = op.name();
     let head = format!("doc_entry {name} {}", op.subject());
     match plan(root, op)? {
@@ -141,7 +154,7 @@ pub fn run(root: &Path, op: &Op, apply: bool) -> Result<String> {
             }
             if apply {
                 write_file(root, &change)?;
-                out.push_str(&after_write(root, then));
+                out.push_str(&after_write(root, then, refresh));
             } else if let Then::Ack(target) = &then {
                 out.push_str(&format!(
                     "would also record `{target}` as reviewed against its symbol\n"
@@ -247,14 +260,27 @@ fn indexed_at(root: &Path, target: &str) -> Result<Vec<(String, usize)>> {
         .collect())
 }
 
-/// The entry for `target`, read from its file as it is now. `None` when the
-/// index knows none. An index that has fallen behind the file is an error.
-fn locate(root: &Path, target: &str) -> Result<Option<Located>> {
+/// What the stored index and the file together say about one key.
+enum Lookup {
+    Found(Located),
+    /// No entry. `stale` is the file the index still lists the key in when the
+    /// file no longer has it: an earlier rekey or delete whose index refresh
+    /// did not happen, or a hand edit.
+    Absent {
+        stale: Option<String>,
+    },
+}
+
+/// The entry for `target`, read from its file as it is now. The stored index
+/// only names the file; whether the entry is there is the file's answer, so an
+/// index that has fallen behind (a refresh that failed) reads as absent here,
+/// never as an error.
+fn lookup(root: &Path, target: &str) -> Result<Lookup> {
     let mut at = indexed_at(root, target)?;
     at.sort();
     at.dedup_by(|a, b| a.0 == b.0);
     let file = match at.as_slice() {
-        [] => return Ok(None),
+        [] => return Ok(Lookup::Absent { stale: None }),
         [(file, _)] => file.clone(),
         many => bail!(
             "`{target}` has an entry in more than one document ({}); remove one first",
@@ -270,11 +296,8 @@ fn locate(root: &Path, target: &str) -> Result<Option<Located>> {
         .filter(|e| e.key == target)
         .collect::<Vec<_>>();
     match found.len() {
-        0 => bail!(
-            "the index says `{target}` is in {file}, but the file has no such entry now: refresh \
-             the index (`infigraph index-docs`) and ask again"
-        ),
-        1 => Ok(Some(Located {
+        0 => Ok(Lookup::Absent { stale: Some(file) }),
+        1 => Ok(Lookup::Found(Located {
             file,
             text,
             entry: found.remove(0),
@@ -283,9 +306,25 @@ fn locate(root: &Path, target: &str) -> Result<Option<Located>> {
     }
 }
 
+fn locate(root: &Path, target: &str) -> Result<Option<Located>> {
+    Ok(match lookup(root, target)? {
+        Lookup::Found(located) => Some(located),
+        Lookup::Absent { .. } => None,
+    })
+}
+
 fn require(root: &Path, target: &str) -> Result<Located> {
-    locate(root, target)?
-        .with_context(|| format!("no glossary entry is keyed to `{target}` (create one first)"))
+    match lookup(root, target)? {
+        Lookup::Found(located) => Ok(located),
+        Lookup::Absent { stale: Some(file) } => bail!(
+            "the index lists `{target}` in {file}, but the file has no such entry now (it was \
+             rekeyed, deleted or edited by hand and the index is behind): `infigraph index-docs` \
+             refreshes it"
+        ),
+        Lookup::Absent { stale: None } => {
+            bail!("no glossary entry is keyed to `{target}` (create one first)")
+        }
+    }
 }
 
 /// Whether `target` resolves as `doctor` judges it: a symbol in the graph, or
@@ -550,6 +589,13 @@ fn plan_create(root: &Path, target: &str, text: &str, explicit_doc: Option<&str>
     let file = choose_doc(root, target, explicit_doc)?;
     let before = read_doc(root, &file)?;
     let present = entries(&before);
+    // The index may not know an entry the file already has (a refresh failed).
+    if let Some(e) = present.iter().find(|e| e.key == target) {
+        return Ok(Plan::Done(format!(
+            "`{target}` already has an entry in {file}:{}",
+            e.start
+        )));
+    }
     let mut counts: BTreeMap<usize, usize> = BTreeMap::new();
     for e in &present {
         *counts.entry(e.level).or_default() += 1;
@@ -620,14 +666,37 @@ fn plan_rekey(root: &Path, target: &str, new_target: &str, force: bool, ack: boo
     if !new_target.contains("::") {
         bail!("`{new_target}` is not a symbol id (`file::qualified::name`)");
     }
-    let Some(located) = locate(root, target)? else {
-        if let Some((file, line)) = indexed_at(root, new_target)?.first() {
-            return Ok(Plan::Done(format!(
-                "`{new_target}` already has the entry, at {file}:{line}"
-            )));
+    let located = match lookup(root, target)? {
+        Lookup::Found(located) => located,
+        Lookup::Absent { stale } => {
+            // The old key is gone: done if the new one is there, which the
+            // file says even when the index has not heard of it.
+            if let Some(file) = stale {
+                if let Some(e) = entries(&read_doc(root, &file)?)
+                    .iter()
+                    .find(|e| e.key == new_target)
+                {
+                    return Ok(Plan::Done(format!(
+                        "`{new_target}` already has the entry, at {file}:{}",
+                        e.start
+                    )));
+                }
+            }
+            if let Some((file, line)) = indexed_at(root, new_target)?.first() {
+                return Ok(Plan::Done(format!(
+                    "`{new_target}` already has the entry, at {file}:{line}"
+                )));
+            }
+            bail!("no glossary entry is keyed to `{target}`");
         }
-        bail!("no glossary entry is keyed to `{target}`");
     };
+    if let Some(e) = entries(&located.text).iter().find(|e| e.key == new_target) {
+        bail!(
+            "`{new_target}` already has an entry in {}:{}",
+            located.file,
+            e.start
+        );
+    }
     if let Some((file, line)) = indexed_at(root, new_target)?.first() {
         bail!("`{new_target}` already has an entry in {file}:{line}");
     }
@@ -741,16 +810,17 @@ fn write_file(root: &Path, change: &Change) -> Result<()> {
 /// The rest of an applied operation: refresh the index (a review needs the
 /// entry's new key indexed), then forget or record a review. Each failure is
 /// reported, never silent, and none undoes the edit.
-fn after_write(root: &Path, then: Then) -> String {
+fn after_write(root: &Path, then: Then, refresh: Refresh) -> String {
     let mut out = String::new();
-    match ops::request_index_docs(root, false) {
+    match refresh(root) {
         Ok(stats) => out.push_str(&format!(
             "document index refreshed ({} of {} files indexed)\n",
             stats.files_indexed, stats.files_scanned
         )),
         Err(e) => out.push_str(&format!(
-            "the file was written, but the index could not be refreshed ({e:#}): run `infigraph \
-             index-docs`\n"
+            "document index NOT refreshed: {e:#}\nthe Markdown file is written; searches and \
+             `get_doc_context` read the old text until `infigraph index-docs` has run (asking for \
+             the same change again changes nothing)\n"
         )),
     }
     match then {
