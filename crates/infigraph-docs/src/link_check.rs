@@ -209,18 +209,69 @@ fn classify(exec: &dyn QueryExec, key: &str) -> Miss {
     }
 }
 
+/// What the scan found besides keys that do not resolve.
+#[derive(Default, Clone, Copy)]
+struct Scanned<'a> {
+    /// Headings that start like a key and are not exactly one.
+    near_misses: &'a [CodeLinkRow],
+    /// Code fences opened and never closed.
+    unclosed: &'a [CodeLinkRow],
+    /// The `documents` rows, to find a key that has more than one entry.
+    documents: &'a [CodeLinkRow],
+}
+
+/// The keys with more than one entry, each with `file:line` of every one.
+fn duplicated(documents: &[CodeLinkRow]) -> Vec<(&str, Vec<String>)> {
+    let mut by_key: BTreeMap<&str, Vec<&CodeLinkRow>> = BTreeMap::new();
+    for row in documents {
+        by_key.entry(row.target.as_str()).or_default().push(row);
+    }
+    by_key
+        .into_iter()
+        .filter(|(_, rows)| rows.len() > 1)
+        .map(|(key, mut rows)| {
+            rows.sort_by(|a, b| (&a.doc_file, a.line_start).cmp(&(&b.doc_file, b.line_start)));
+            (
+                key,
+                rows.iter()
+                    .map(|r| format!("{}:{}", r.doc_file, r.line_start))
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
 /// The key-resolution result: how many keys resolve, and the rest by reason
 /// with examples and hints.
 fn keys_result(
     project: &Path,
     total: usize,
     unresolved: &[(String, Miss)],
-    near_misses: &[CodeLinkRow],
-    unclosed: &[CodeLinkRow],
+    scanned: &Scanned,
 ) -> CheckResult {
+    let Scanned {
+        near_misses,
+        unclosed,
+        documents,
+    } = *scanned;
     let name = format!("{}: document keys", project.display());
     let resolved = total - unresolved.len();
     let mut notes = Vec::new();
+    let dups = duplicated(documents);
+    if !dups.is_empty() {
+        let mut note = format!(
+            "{} key(s) have more than one entry; doc_entry refuses to pick one (pass nth, line or \
+             doc_file), and the staleness of each is judged against the same symbol",
+            dups.len()
+        );
+        for (key, at) in dups.iter().take(EXAMPLES) {
+            note.push_str(&format!("\n    {key}  ->  {}", at.join(", ")));
+        }
+        if dups.len() > EXAMPLES {
+            note.push_str(&format!("\n    ... and {} more", dups.len() - EXAMPLES));
+        }
+        notes.push(note);
+    }
     if !unclosed.is_empty() {
         // One line per file: its first fence that nothing closes.
         let mut per_file: BTreeMap<&str, usize> = BTreeMap::new();
@@ -495,8 +546,11 @@ pub fn check_project(root: &Path, docs_sync: bool) -> Vec<CheckResult> {
         root,
         distinct.len(),
         &unresolved,
-        &near_misses,
-        &unclosed,
+        &Scanned {
+            near_misses: &near_misses,
+            unclosed: &unclosed,
+            documents: &documents,
+        },
     ));
 
     if docs_sync {
@@ -539,7 +593,7 @@ mod tests {
     #[test]
     fn all_keys_resolving_is_a_pass_and_anything_else_a_warn_with_examples() {
         let project = Path::new("/p");
-        let pass = keys_result(project, 3, &[], &[], &[]);
+        let pass = keys_result(project, 3, &[], &Scanned::default());
         assert_eq!(pass.status, infigraph_core::doctor::CheckStatus::Pass);
         assert!(pass.message.contains("3 of 3"));
 
@@ -552,11 +606,50 @@ mod tests {
             ),
             ("a.ts::gone".to_string(), Miss::NoSuchSymbol),
         ];
-        let warn = keys_result(project, 5, &miss, &[], &[]);
+        let warn = keys_result(project, 5, &miss, &Scanned::default());
         assert_eq!(warn.status, infigraph_core::doctor::CheckStatus::Warn);
         assert!(warn.message.contains("3 of 5"), "{}", warn.message);
         assert!(warn.message.contains("did you mean a.ts::A::b"));
         assert!(warn.message.contains("a.ts::gone"));
+    }
+
+    fn key_row(key: &str, file: &str, line: usize) -> CodeLinkRow {
+        CodeLinkRow {
+            kind: LinkKind::Documents,
+            target: key.to_string(),
+            ..unclosed(file, line)
+        }
+    }
+
+    #[test]
+    fn a_key_with_two_entries_is_listed_with_the_file_and_line_of_each() {
+        let rows = vec![
+            key_row("a.ts::f", "docs/b.md", 30),
+            key_row("a.ts::g", "docs/a.md", 5),
+            key_row("a.ts::f", "docs/a.md", 12),
+        ];
+        let got = keys_result(
+            Path::new("/p"),
+            2,
+            &[],
+            &Scanned {
+                documents: &rows,
+                ..Default::default()
+            },
+        );
+        assert_eq!(got.status, infigraph_core::doctor::CheckStatus::Warn);
+        assert!(
+            got.message.contains("1 key(s) have more than one entry"),
+            "{}",
+            got.message
+        );
+        assert!(
+            got.message
+                .contains("a.ts::f  ->  docs/a.md:12, docs/b.md:30"),
+            "{}",
+            got.message
+        );
+        assert!(!got.message.contains("a.ts::g  ->"), "{}", got.message);
     }
 
     fn unclosed(file: &str, line: usize) -> CodeLinkRow {
@@ -579,7 +672,15 @@ mod tests {
             unclosed("docs/a.md", 12),
             unclosed("docs/b.md", 7),
         ];
-        let got = keys_result(Path::new("/p"), 0, &[], &[], &rows);
+        let got = keys_result(
+            Path::new("/p"),
+            0,
+            &[],
+            &Scanned {
+                unclosed: &rows,
+                ..Default::default()
+            },
+        );
         assert_eq!(got.status, infigraph_core::doctor::CheckStatus::Warn);
         assert!(got.message.contains("2 document(s)"), "{}", got.message);
         assert!(

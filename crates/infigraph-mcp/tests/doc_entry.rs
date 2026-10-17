@@ -609,7 +609,7 @@ fn the_guard_still_blocks_an_edit_to_an_entry_the_tool_just_rewrote() {
 
 mod refresh_fails {
     use super::*;
-    use infigraph_docs::doc_entry::{run_with, Op};
+    use infigraph_docs::doc_entry::{run_with, Op, Pick};
 
     const WHY: &str = "the graph's growth breaker is tripped";
 
@@ -625,6 +625,7 @@ mod refresh_fails {
             old: old.to_string(),
             new: new.to_string(),
             replace_all: false,
+            pick: Pick::default(),
         }
     }
 
@@ -654,6 +655,7 @@ mod refresh_fails {
             target: TOTAL.to_string(),
             text: "Sums with a loop.".to_string(),
             section: None,
+            pick: Pick::default(),
         };
 
         says_not_refreshed(&apply(dir.path(), &op));
@@ -670,6 +672,7 @@ mod refresh_fails {
             new_target: "lib/util.py::third".to_string(),
             force: false,
             ack: false,
+            pick: Pick::default(),
         };
 
         says_not_refreshed(&apply(dir.path(), &op));
@@ -687,6 +690,7 @@ mod refresh_fails {
         let op = Op::Delete {
             target: TOTAL.to_string(),
             force: true,
+            pick: Pick::default(),
         };
 
         says_not_refreshed(&apply(dir.path(), &op));
@@ -797,5 +801,182 @@ mod live_ranges {
             "{now}"
         );
         assert_eq!(now.matches("A new paragraph above every entry.").count(), 8);
+    }
+}
+
+// ---- one key, several entries --------------------------------------------------
+
+mod duplicates {
+    use super::*;
+
+    const DUP: &str = "docs/glossary/dup.md";
+    const THIRD: &str = "lib/util.py::third";
+    const FIRST_COPY: &str = "# Dup\n\n### `lib/util.py::third`\n\nFirst third.\n\n\
+        ### `lib/util.py::other`\n\nOther, here too.\n\n\
+        ### `lib/util.py::third`\n\nSecond third.\n";
+
+    /// The project plus `dup.md`, where `third` has two entries and `other`
+    /// (which `lib.md` also has) one.
+    fn project_with_duplicates() -> tempfile::TempDir {
+        let dir = project();
+        write(dir.path(), DUP, FIRST_COPY);
+        index_documents(dir.path());
+        dir
+    }
+
+    #[test]
+    fn deleting_the_second_of_two_leaves_the_first_and_the_rest_byte_for_byte() {
+        let dir = project_with_duplicates();
+
+        let out = ok(
+            dir.path(),
+            json!({"op": "delete", "target": THIRD, "nth": 2, "force": true, "apply": true}),
+        );
+
+        assert!(out.contains("applied"), "{out}");
+        assert_eq!(
+            file(dir.path(), DUP),
+            "# Dup\n\n### `lib/util.py::third`\n\nFirst third.\n\n\
+             ### `lib/util.py::other`\n\nOther, here too.\n"
+        );
+        assert_eq!(file(dir.path(), "docs/glossary/lib.md"), LIB_DOC);
+        assert_eq!(file(dir.path(), "docs/glossary/src.md"), SRC_DOC);
+    }
+
+    #[test]
+    fn a_repeated_delete_of_a_second_entry_that_is_gone_is_already_done() {
+        let dir = project_with_duplicates();
+        let args = json!({"op": "delete", "target": THIRD, "nth": 2, "force": true, "apply": true});
+        ok(dir.path(), args.clone());
+        let after_one = file(dir.path(), DUP);
+
+        let again = ok(dir.path(), args);
+
+        assert!(again.contains("already done"), "{again}");
+        assert!(again.contains("no 2nd entry (1 found)"), "{again}");
+        assert_eq!(file(dir.path(), DUP), after_one);
+    }
+
+    #[test]
+    fn without_a_selector_every_entry_is_named_and_so_is_the_way_to_choose() {
+        let dir = project_with_duplicates();
+
+        for op in ["delete", "edit", "replace", "rekey"] {
+            let mut args = json!({
+                "op": op, "target": THIRD, "old": "third", "new": "x", "text": "y",
+                "new_target": "lib/more.py::fresh", "force": true,
+            });
+            args["apply"] = json!(true);
+            let why = refused(dir.path(), args);
+            assert!(
+                why.contains("docs/glossary/dup.md:3") && why.contains("docs/glossary/dup.md:11"),
+                "{op}: {why}"
+            );
+            assert!(why.contains("nth") && why.contains("line"), "{op}: {why}");
+        }
+        assert_eq!(
+            file(dir.path(), DUP),
+            FIRST_COPY,
+            "a refusal wrote something"
+        );
+    }
+
+    #[test]
+    fn an_edit_by_nth_or_by_line_changes_only_that_entry() {
+        let dir = project_with_duplicates();
+
+        ok(
+            dir.path(),
+            json!({"op": "edit", "target": THIRD, "old": "third", "new": "3rd", "nth": 1, "apply": true}),
+        );
+        let first = file(dir.path(), DUP);
+        assert!(
+            first.contains("First 3rd.") && first.contains("Second third."),
+            "{first}"
+        );
+
+        ok(
+            dir.path(),
+            json!({"op": "edit", "target": THIRD, "old": "third", "new": "3rd", "line": 11, "apply": true}),
+        );
+        let both = file(dir.path(), DUP);
+        assert!(
+            both.contains("First 3rd.") && both.contains("Second 3rd."),
+            "{both}"
+        );
+        assert!(both.contains("Other, here too."), "{both}");
+    }
+
+    #[test]
+    fn a_replace_and_a_rekey_pick_their_entry_too() {
+        let dir = project_with_duplicates();
+
+        ok(
+            dir.path(),
+            json!({"op": "replace", "target": THIRD, "text": "Rewritten.", "nth": 2, "apply": true}),
+        );
+        assert!(file(dir.path(), DUP).ends_with("### `lib/util.py::third`\n\nRewritten.\n"));
+
+        ok(
+            dir.path(),
+            json!({
+                "op": "rekey", "target": THIRD, "new_target": "lib/more.py::fresh",
+                "nth": 2, "apply": true,
+            }),
+        );
+        let now = file(dir.path(), DUP);
+        assert!(
+            now.contains("### `lib/more.py::fresh`\n\nRewritten."),
+            "{now}"
+        );
+        assert!(
+            now.contains("### `lib/util.py::third`\n\nFirst third."),
+            "{now}"
+        );
+    }
+
+    #[test]
+    fn a_selector_beyond_the_entries_there_are_is_an_error_naming_the_count() {
+        let dir = project_with_duplicates();
+
+        let nth = refused(
+            dir.path(),
+            json!({"op": "edit", "target": THIRD, "old": "third", "new": "x", "nth": 3}),
+        );
+        assert!(nth.contains("2 entries") && nth.contains("3"), "{nth}");
+        let line = refused(
+            dir.path(),
+            json!({"op": "edit", "target": THIRD, "old": "third", "new": "x", "line": 7}),
+        );
+        assert!(
+            line.contains("line 7") && line.contains("dup.md:3"),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn the_same_key_in_two_documents_needs_doc_file() {
+        let dir = project_with_duplicates();
+        let other = "lib/util.py::other";
+
+        let why = refused(
+            dir.path(),
+            json!({"op": "edit", "target": other, "old": "Others.", "new": "x"}),
+        );
+        assert!(
+            why.contains("docs/glossary/dup.md:7") && why.contains("docs/glossary/lib.md:7"),
+            "{why}"
+        );
+        assert!(why.contains("doc_file"), "{why}");
+
+        ok(
+            dir.path(),
+            json!({
+                "op": "edit", "target": other, "old": "here too", "new": "also here",
+                "doc_file": DUP, "apply": true,
+            }),
+        );
+        assert!(file(dir.path(), DUP).contains("Other, also here."));
+        assert_eq!(file(dir.path(), "docs/glossary/lib.md"), LIB_DOC);
     }
 }

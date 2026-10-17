@@ -153,6 +153,55 @@ fn a_refusal_is_a_failed_command_that_says_why() {
     );
 }
 
+#[test]
+fn one_of_two_entries_with_a_key_is_chosen_with_nth() {
+    let (project, home) = stale_project();
+    let root = project.path();
+    std::fs::write(
+        root.join("docs/g.md"),
+        "# G\n\n### `app.py::f`\n\nWhy f.\n\n### `app.py::f`\n\nWhy f again.\n",
+    )
+    .unwrap();
+    let _daemon = start_daemon(root, home.path());
+    assert_ok(
+        &run(root, home.path(), DAEMON, &["index-docs"]),
+        "index-docs",
+    );
+
+    let both = run(
+        root,
+        home.path(),
+        DAEMON,
+        &["doc-entry", "delete", "app.py::f", "--force"],
+    );
+    assert!(!both.status.success());
+    let why = String::from_utf8_lossy(&both.stderr).into_owned();
+    assert!(
+        why.contains("docs/g.md:3") && why.contains("docs/g.md:7") && why.contains("`nth`"),
+        "{why}"
+    );
+
+    let done = run(
+        root,
+        home.path(),
+        DAEMON,
+        &[
+            "doc-entry",
+            "delete",
+            "app.py::f",
+            "--force",
+            "--nth",
+            "2",
+            "--apply",
+        ],
+    );
+    assert_ok(&done, "doc-entry delete --nth 2 --apply");
+    assert_eq!(
+        std::fs::read_to_string(root.join("docs/g.md")).unwrap(),
+        "# G\n\n### `app.py::f`\n\nWhy f.\n"
+    );
+}
+
 /// The hook script as installed: Markdown edits reach `infigraph doc-guard`,
 /// everything else passes without running it.
 #[cfg(unix)]

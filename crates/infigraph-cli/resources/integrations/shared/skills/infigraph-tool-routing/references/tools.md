@@ -653,17 +653,19 @@ PRIMARY: Which glossary entries (indexed Markdown sections whose heading is a sy
 
 ### `doc_entry`
 
-PRIMARY: Edit a glossary entry (an indexed Markdown section headed by a symbol id) mechanically; you supply the prose, infigraph never writes it. op: edit (old->new inside the entry; old must match once, else refused; replace_all only inside it) for a small fix, replace (the lead text, or section=<sub-heading> block) for a rewrite, create (an entry for a symbol with none; doc_file overrides the choice, never invented), rekey (target -> new_target for a renamed/moved symbol; ack also reviews it), delete (symbol gone; force otherwise), ack (targets: record the entry as reviewed against its symbol as of its newest commit, so it stops being possibly stale until that code changes again; refused with uncommitted edits). Dry-run unless apply=true, which writes only the entry's lines and refreshes the document index. Idempotent. Use after stale_docs says what drifted.
+PRIMARY: Edit a glossary entry (an indexed Markdown section headed by a symbol id) mechanically; you supply the prose, infigraph never writes it. op: edit (old->new inside the entry; old must match once, else refused; replace_all only inside it) for a small fix, replace (the lead text, or section=<sub-heading> block) for a rewrite, create (an entry for a symbol with none; doc_file overrides the choice, never invented), rekey (target -> new_target for a renamed/moved symbol; ack also reviews it), delete (symbol gone; force otherwise), ack (targets: record the entry as reviewed against its symbol as of its newest commit, so it stops being possibly stale until that code changes again; refused with uncommitted edits). A key with several entries is refused with each file:line listed: pick one with nth, line or doc_file. Dry-run unless apply=true, which writes only the entry's lines and refreshes the document index (if that fails the file is still written and the output says "document index NOT refreshed"). Idempotent. Use after stale_docs says what drifted.
 
 | Parameter | Type | Required | Default | Description |
 |---|---|---|---|---|
 | `op` | `edit` \| `replace` \| `create` \| `rekey` \| `delete` \| `ack` | yes |  | The operation |
 | `ack` | boolean |  | `false` | rekey: also record the entry as reviewed |
 | `apply` | boolean |  | `false` | Write it (default: dry run, shows the diff) |
-| `doc_file` | string |  |  | create: the document (relative path) that gets the entry |
+| `doc_file` | string |  |  | create: the document (relative path) that gets the entry; other ops: the document to look in, when one key has entries in several |
 | `force` | boolean |  | `false` | rekey/delete: when the new key does not resolve / the symbol still exists |
+| `line` | integer |  |  | edit/replace/rekey/delete when one key has several entries: the one whose key heading is on this line |
 | `new` | string |  |  | edit: its replacement |
 | `new_target` | string |  |  | rekey: the symbol id to point the entry at |
+| `nth` | integer |  |  | edit/replace/rekey/delete when one key has several entries: the Nth (1-based, in file order within one document) |
 | `old` | string |  |  | edit: exact text inside the entry |
 | `path` | string |  |  | see Common parameters |
 | `replace_all` | boolean |  | `false` | edit: change every match, inside the entry only |

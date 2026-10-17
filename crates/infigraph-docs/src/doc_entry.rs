@@ -33,6 +33,7 @@ pub enum Op {
         target: String,
         text: String,
         section: Option<String>,
+        pick: Pick,
     },
     /// Change `old` to `new` inside the entry, where `old` occurs once (or,
     /// with `replace_all`, however often, but only inside the entry).
@@ -41,6 +42,7 @@ pub enum Op {
         old: String,
         new: String,
         replace_all: bool,
+        pick: Pick,
     },
     /// Add an entry for a symbol that has none.
     Create {
@@ -55,11 +57,29 @@ pub enum Op {
         new_target: String,
         force: bool,
         ack: bool,
+        pick: Pick,
     },
     /// Remove an entry whose symbol is gone.
-    Delete { target: String, force: bool },
+    Delete {
+        target: String,
+        force: bool,
+        pick: Pick,
+    },
     /// Record that entries were read against their symbols as they are now.
     Ack { targets: Vec<String> },
+}
+
+/// Which entry an op means when one key has several (the same heading twice in
+/// a document, or in two documents). Left empty it means "the only one", and an
+/// op on a key with several refuses and lists them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Pick {
+    /// The Nth entry of the key, 1-based, in file order within one document.
+    pub nth: Option<usize>,
+    /// The entry whose key heading is on this line.
+    pub line: Option<usize>,
+    /// The document (relative path) to look in.
+    pub doc_file: Option<String>,
 }
 
 impl Op {
@@ -177,13 +197,15 @@ fn plan(root: &Path, op: &Op) -> Result<Plan> {
             target,
             text,
             section,
-        } => plan_replace(root, target, text, section.as_deref()),
+            pick,
+        } => plan_replace(root, target, text, section.as_deref(), pick),
         Op::Edit {
             target,
             old,
             new,
             replace_all,
-        } => plan_edit(root, target, old, new, *replace_all),
+            pick,
+        } => plan_edit(root, target, old, new, *replace_all, pick),
         Op::Create {
             target,
             text,
@@ -194,8 +216,13 @@ fn plan(root: &Path, op: &Op) -> Result<Plan> {
             new_target,
             force,
             ack,
-        } => plan_rekey(root, target, new_target, *force, *ack),
-        Op::Delete { target, force } => plan_delete(root, target, *force),
+            pick,
+        } => plan_rekey(root, target, new_target, *force, *ack, pick),
+        Op::Delete {
+            target,
+            force,
+            pick,
+        } => plan_delete(root, target, *force, pick),
         Op::Ack { .. } => unreachable!("handled above"),
     }
 }
@@ -262,60 +289,129 @@ fn indexed_at(root: &Path, target: &str) -> Result<Vec<(String, usize)>> {
 
 /// What the stored index and the file together say about one key.
 enum Lookup {
-    Found(Located),
+    /// The entry; `others` more entries with the same key remain.
+    Found { located: Located, others: usize },
     /// No entry. `stale` is the file the index still lists the key in when the
     /// file no longer has it: an earlier rekey or delete whose index refresh
     /// did not happen, or a hand edit.
-    Absent {
-        stale: Option<String>,
+    Absent { stale: Option<String> },
+    /// The key has entries, but not the one that was asked for ("no 2nd
+    /// entry"); `listing` names the ones there are.
+    NoSuchOccurrence {
+        missing: String,
+        found: usize,
+        listing: String,
     },
 }
 
-/// The entry for `target`, read from its file as it is now. The stored index
-/// only names the file; whether the entry is there is the file's answer, so an
-/// index that has fallen behind (a refresh that failed) reads as absent here,
-/// never as an error.
-fn lookup(root: &Path, target: &str) -> Result<Lookup> {
-    let mut at = indexed_at(root, target)?;
-    at.sort();
-    at.dedup_by(|a, b| a.0 == b.0);
-    let file = match at.as_slice() {
-        [] => return Ok(Lookup::Absent { stale: None }),
-        [(file, _)] => file.clone(),
-        many => bail!(
-            "`{target}` has an entry in more than one document ({}); remove one first",
-            many.iter()
-                .map(|(f, l)| format!("{f}:{l}"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
+fn ordinal(n: usize) -> String {
+    let suffix = match (n % 10, n % 100) {
+        (_, 11..=13) => "th",
+        (1, _) => "st",
+        (2, _) => "nd",
+        (3, _) => "rd",
+        _ => "th",
     };
-    let text = read_doc(root, &file)?;
-    let mut found = entries(&text)
-        .into_iter()
-        .filter(|e| e.key == target)
-        .collect::<Vec<_>>();
-    match found.len() {
-        0 => Ok(Lookup::Absent { stale: Some(file) }),
-        1 => Ok(Lookup::Found(Located {
-            file,
-            text,
-            entry: found.remove(0),
-        })),
-        n => bail!("{file} has {n} entries keyed `{target}`; remove the duplicates first"),
-    }
+    format!("{n}{suffix}")
 }
 
-fn locate(root: &Path, target: &str) -> Result<Option<Located>> {
-    Ok(match lookup(root, target)? {
-        Lookup::Found(located) => Some(located),
-        Lookup::Absent { .. } => None,
+/// The entries of `target` that the stored index points at (or in
+/// `pick.doc_file`), as the files hold them now, in document and line order.
+fn entries_of(root: &Path, target: &str, pick: &Pick) -> Result<(Vec<String>, Vec<Located>)> {
+    let mut files: Vec<String> = indexed_at(root, target)?
+        .into_iter()
+        .map(|(file, _)| file)
+        .collect();
+    files.sort();
+    files.dedup();
+    if let Some(file) = &pick.doc_file {
+        files = vec![file.clone()];
+    }
+    let mut found = Vec::new();
+    for file in &files {
+        let text = read_doc(root, file)?;
+        for entry in entries(&text).into_iter().filter(|e| e.key == target) {
+            found.push(Located {
+                file: file.clone(),
+                text: text.clone(),
+                entry,
+            });
+        }
+    }
+    Ok((files, found))
+}
+
+fn listing(found: &[Located]) -> String {
+    found
+        .iter()
+        .map(|l| format!("{}:{}", l.file, l.entry.start))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The entry for `target` that `pick` means, read from its file as it is now.
+/// The stored index only names the files; whether an entry is there is the
+/// file's answer, so an index that has fallen behind (a refresh that failed)
+/// reads as absent here, never as an error.
+fn lookup(root: &Path, target: &str, pick: &Pick) -> Result<Lookup> {
+    let (files, mut found) = entries_of(root, target, pick)?;
+    if found.is_empty() {
+        return Ok(Lookup::Absent {
+            stale: files.into_iter().next(),
+        });
+    }
+    let total = found.len();
+    let ambiguous = |found: &[Located]| {
+        anyhow::anyhow!(
+            "`{target}` has {} entries ({}): say which with `nth` (1-based, in file order within \
+             one document), `line` (its key heading's line) or `doc_file`",
+            found.len(),
+            listing(found)
+        )
+    };
+    let chosen = match (pick.line, pick.nth) {
+        (Some(line), _) => {
+            let at: Vec<usize> = (0..total)
+                .filter(|i| found[*i].entry.start == line)
+                .collect();
+            match at.as_slice() {
+                [one] => *one,
+                [] => {
+                    return Ok(Lookup::NoSuchOccurrence {
+                        missing: format!("no entry with its heading on line {line}"),
+                        found: total,
+                        listing: listing(&found),
+                    })
+                }
+                _ => return Err(ambiguous(&found)),
+            }
+        }
+        (None, Some(0)) => bail!("`nth` counts from 1"),
+        (None, Some(n)) => {
+            if files.len() > 1 && pick.doc_file.is_none() {
+                return Err(ambiguous(&found));
+            }
+            if n > total {
+                return Ok(Lookup::NoSuchOccurrence {
+                    missing: format!("no {} entry", ordinal(n)),
+                    found: total,
+                    listing: listing(&found),
+                });
+            }
+            n - 1
+        }
+        (None, None) if total == 1 => 0,
+        (None, None) => return Err(ambiguous(&found)),
+    };
+    Ok(Lookup::Found {
+        located: found.swap_remove(chosen),
+        others: total - 1,
     })
 }
 
-fn require(root: &Path, target: &str) -> Result<Located> {
-    match lookup(root, target)? {
-        Lookup::Found(located) => Ok(located),
+fn require(root: &Path, target: &str, pick: &Pick) -> Result<Located> {
+    match lookup(root, target, pick)? {
+        Lookup::Found { located, .. } => Ok(located),
         Lookup::Absent { stale: Some(file) } => bail!(
             "the index lists `{target}` in {file}, but the file has no such entry now (it was \
              rekeyed, deleted or edited by hand and the index is behind): `infigraph index-docs` \
@@ -324,6 +420,11 @@ fn require(root: &Path, target: &str) -> Result<Located> {
         Lookup::Absent { stale: None } => {
             bail!("no glossary entry is keyed to `{target}` (create one first)")
         }
+        Lookup::NoSuchOccurrence {
+            missing,
+            found,
+            listing,
+        } => bail!("`{target}` has {found} entries ({listing}): {missing}"),
     }
 }
 
@@ -397,11 +498,17 @@ fn replace_region(entry: &Entry, section: Option<&str>) -> Result<(usize, usize)
     Ok((sub.line + 1, end))
 }
 
-fn plan_replace(root: &Path, target: &str, text: &str, section: Option<&str>) -> Result<Plan> {
+fn plan_replace(
+    root: &Path,
+    target: &str,
+    text: &str,
+    section: Option<&str>,
+    pick: &Pick,
+) -> Result<Plan> {
     if body_lines(text).is_empty() {
         bail!("replace needs `text`: infigraph does not write the prose");
     }
-    let located = require(root, target)?;
+    let located = require(root, target, pick)?;
     let (r0, r1) = replace_region(&located.entry, section)?;
     let mut lines = split_lines(&located.text);
     let new = body_lines(text);
@@ -443,11 +550,18 @@ fn plan_replace(root: &Path, target: &str, text: &str, section: Option<&str>) ->
     })
 }
 
-fn plan_edit(root: &Path, target: &str, old: &str, new: &str, replace_all: bool) -> Result<Plan> {
+fn plan_edit(
+    root: &Path,
+    target: &str,
+    old: &str,
+    new: &str,
+    replace_all: bool,
+    pick: &Pick,
+) -> Result<Plan> {
     if old.is_empty() {
         bail!("edit needs a non-empty `old`");
     }
-    let located = require(root, target)?;
+    let located = require(root, target, pick)?;
     let mut lines = split_lines(&located.text);
     let (first, last) = (located.entry.start + 1, located.entry.end);
     let region = lines[first - 1..last].join("\n");
@@ -659,15 +773,27 @@ fn plural(n: usize, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })
 }
 
-fn plan_rekey(root: &Path, target: &str, new_target: &str, force: bool, ack: bool) -> Result<Plan> {
+fn plan_rekey(
+    root: &Path,
+    target: &str,
+    new_target: &str,
+    force: bool,
+    ack: bool,
+    pick: &Pick,
+) -> Result<Plan> {
     if target == new_target {
         bail!("rekey needs a `new_target` that differs from `target`");
     }
     if !new_target.contains("::") {
         bail!("`{new_target}` is not a symbol id (`file::qualified::name`)");
     }
-    let located = match lookup(root, target)? {
-        Lookup::Found(located) => located,
+    let located = match lookup(root, target, pick)? {
+        Lookup::Found { located, .. } => located,
+        Lookup::NoSuchOccurrence {
+            missing,
+            found,
+            listing,
+        } => bail!("`{target}` has {found} entries ({listing}): {missing}"),
         Lookup::Absent { stale } => {
             // The old key is gone: done if the new one is there, which the
             // file says even when the index has not heard of it.
@@ -746,9 +872,15 @@ fn plan_rekey(root: &Path, target: &str, new_target: &str, force: bool, ack: boo
     })
 }
 
-fn plan_delete(root: &Path, target: &str, force: bool) -> Result<Plan> {
-    let Some(located) = locate(root, target)? else {
-        return Ok(Plan::Done(format!("no entry is keyed to `{target}`")));
+fn plan_delete(root: &Path, target: &str, force: bool, pick: &Pick) -> Result<Plan> {
+    let (located, others) = match lookup(root, target, pick)? {
+        Lookup::Found { located, others } => (located, others),
+        Lookup::Absent { .. } => return Ok(Plan::Done(format!("no entry is keyed to `{target}`"))),
+        // The one asked for is already gone: with duplicates, the first run
+        // removed it and the survivor is the only entry now.
+        Lookup::NoSuchOccurrence { missing, found, .. } => {
+            return Ok(Plan::Done(format!("{missing} ({found} found)")))
+        }
     };
     if !force && symbol_is_live(root, target)? {
         bail!(
@@ -777,7 +909,12 @@ fn plan_delete(root: &Path, target: &str, force: bool) -> Result<Plan> {
             after,
         },
         notes: Vec::new(),
-        then: Then::DropAck(target.to_string()),
+        // A survivor with the same key keeps its review.
+        then: if others == 0 {
+            Then::DropAck(target.to_string())
+        } else {
+            Then::Nothing
+        },
     })
 }
 

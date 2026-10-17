@@ -246,28 +246,37 @@ pub(crate) fn cmd_doc_guard() {
 /// `infigraph doc-entry`: the same operations as the MCP `doc_entry` tool.
 pub(crate) fn cmd_doc_entry(root: &Path, op: crate::DocEntryOp, apply: bool) -> Result<()> {
     use crate::DocEntryOp as O;
-    use infigraph_docs::doc_entry::Op;
+    use infigraph_docs::doc_entry::{Op, Pick};
+    let pick = |p: crate::PickArgs| Pick {
+        nth: p.nth,
+        line: p.line,
+        doc_file: p.doc_file,
+    };
     let op = match op {
         O::Edit {
             target,
             old,
             new,
             replace_all,
+            pick: p,
         } => Op::Edit {
             target,
             old,
             new,
             replace_all,
+            pick: pick(p),
         },
         O::Replace {
             target,
             text,
             text_file,
             section,
+            pick: p,
         } => Op::Replace {
             target,
             text: prose(text, text_file)?,
             section,
+            pick: pick(p),
         },
         O::Create {
             target,
@@ -284,13 +293,23 @@ pub(crate) fn cmd_doc_entry(root: &Path, op: crate::DocEntryOp, apply: bool) -> 
             new_target,
             force,
             ack,
+            pick: p,
         } => Op::Rekey {
             target,
             new_target,
             force,
             ack,
+            pick: pick(p),
         },
-        O::Delete { target, force } => Op::Delete { target, force },
+        O::Delete {
+            target,
+            force,
+            pick: p,
+        } => Op::Delete {
+            target,
+            force,
+            pick: pick(p),
+        },
         O::Ack { targets } => Op::Ack { targets },
     };
     print!("{}", infigraph_docs::doc_entry::run(root, &op, apply)?);
