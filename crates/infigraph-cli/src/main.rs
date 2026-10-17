@@ -60,6 +60,20 @@ struct Cli {
     command: Commands,
 }
 
+/// Which of several entries with one key an op means.
+#[derive(clap::Args, Debug, Default)]
+pub(crate) struct PickArgs {
+    /// The Nth entry of the key (1-based, in file order within one document)
+    #[arg(long)]
+    nth: Option<usize>,
+    /// The entry whose key heading is on this line
+    #[arg(long)]
+    line: Option<usize>,
+    /// The document (relative path) to look in
+    #[arg(long)]
+    doc_file: Option<String>,
+}
+
 /// What `doc-entry` does to an entry.
 #[derive(clap::Subcommand, Debug)]
 pub(crate) enum DocEntryOp {
@@ -74,6 +88,8 @@ pub(crate) enum DocEntryOp {
         /// Change every match, inside the entry only
         #[arg(long)]
         replace_all: bool,
+        #[command(flatten)]
+        pick: PickArgs,
     },
     /// Replace the entry's lead text (or the block under one sub-heading)
     Replace {
@@ -86,6 +102,8 @@ pub(crate) enum DocEntryOp {
         /// A sub-heading of the entry whose block to replace
         #[arg(long)]
         section: Option<String>,
+        #[command(flatten)]
+        pick: PickArgs,
     },
     /// Add an entry for a symbol that has none
     Create {
@@ -108,6 +126,8 @@ pub(crate) enum DocEntryOp {
         /// Also record the entry as reviewed against the new symbol
         #[arg(long)]
         ack: bool,
+        #[command(flatten)]
+        pick: PickArgs,
     },
     /// Remove an entry whose symbol is gone
     Delete {
@@ -115,6 +135,8 @@ pub(crate) enum DocEntryOp {
         /// Delete even though the symbol still exists
         #[arg(long)]
         force: bool,
+        #[command(flatten)]
+        pick: PickArgs,
     },
     /// Record entries as reviewed against their symbols as they are now
     Ack {
@@ -1188,6 +1210,7 @@ fn main() -> Result<()> {
     // Resolve to the project that owns the cwd, not the cwd itself. Taking
     // the cwd verbatim is what created a separate store, daemon and socket
     // for every subdirectory anyone ever ran a command from.
+    let root_given = cli.root.is_some();
     let root = cli.root.unwrap_or_else(|| {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         infigraph_core::project::resolve_project_root(&cwd)
@@ -1210,7 +1233,7 @@ fn main() -> Result<()> {
             if should_auto_watch {
                 index::ensure_watcher_running(&root);
             }
-            run(cli.command, &root)
+            run(cli.command, &root, root_given)
         })
         .expect("failed to spawn main worker thread")
         .join()
@@ -1221,7 +1244,7 @@ fn main() -> Result<()> {
     result
 }
 
-fn run(command: Commands, root: &Path) -> Result<()> {
+fn run(command: Commands, root: &Path, root_given: bool) -> Result<()> {
     match command {
         Commands::Init { group, quick, yes } => cmd_init(root, group.as_deref(), quick, yes),
         Commands::Index { full, no_embed } => cmd_index(root, full, no_embed),
@@ -1333,7 +1356,7 @@ fn run(command: Commands, root: &Path) -> Result<()> {
             symbol,
             limit,
         } => cmd_stale_docs(root, path_prefix.as_deref(), symbol, limit),
-        Commands::DocEntry { op, apply } => cmd_doc_entry(root, op, apply),
+        Commands::DocEntry { op, apply } => cmd_doc_entry(root, root_given, op, apply),
         Commands::DocGuard => {
             cmd_doc_guard();
             Ok(())

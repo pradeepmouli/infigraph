@@ -33,7 +33,7 @@ pub fn is_global_store_root(dir: &Path) -> bool {
 ///
 /// Matches a file as well as a directory: a linked worktree's `.git` is a
 /// file pointing at the real git dir.
-fn git_root(start: &Path) -> Option<PathBuf> {
+pub fn git_root(start: &Path) -> Option<PathBuf> {
     let mut current = Some(start);
     while let Some(dir) = current {
         if dir.join(".git").exists() {

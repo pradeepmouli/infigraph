@@ -604,3 +604,441 @@ fn the_guard_still_blocks_an_edit_to_an_entry_the_tool_just_rewrote() {
         "an edit outside every entry must pass"
     );
 }
+
+// ---- an index that cannot be refreshed ---------------------------------------
+
+mod refresh_fails {
+    use super::*;
+    use infigraph_docs::doc_entry::{run_with, Op, Pick};
+
+    const WHY: &str = "the graph's growth breaker is tripped";
+
+    /// Applies `op` with a document-index refresh that fails.
+    fn apply(dir: &Path, op: &Op) -> String {
+        run_with(dir, op, true, &|_| anyhow::bail!(WHY))
+            .unwrap_or_else(|e| panic!("{op:?} failed instead of reporting: {e:#}"))
+    }
+
+    fn edit(old: &str, new: &str) -> Op {
+        Op::Edit {
+            target: TOTAL.to_string(),
+            old: old.to_string(),
+            new: new.to_string(),
+            replace_all: false,
+            pick: Pick::default(),
+        }
+    }
+
+    fn says_not_refreshed(out: &str) {
+        assert!(
+            out.contains(&format!("document index NOT refreshed: {WHY}")),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn an_edit_is_written_and_says_the_index_is_behind_and_is_then_already_done() {
+        let dir = project();
+        let op = edit("not with sum()", "rather than sum()");
+
+        let first = apply(dir.path(), &op);
+
+        says_not_refreshed(&first);
+        assert!(file(dir.path(), "docs/glossary/src.md").contains("rather than sum()"));
+        assert!(apply(dir.path(), &op).contains("already done"));
+    }
+
+    #[test]
+    fn a_replace_is_written_and_then_already_done() {
+        let dir = project();
+        let op = Op::Replace {
+            target: TOTAL.to_string(),
+            text: "Sums with a loop.".to_string(),
+            section: None,
+            pick: Pick::default(),
+        };
+
+        says_not_refreshed(&apply(dir.path(), &op));
+
+        assert!(file(dir.path(), "docs/glossary/src.md").contains("Sums with a loop."));
+        assert!(apply(dir.path(), &op).contains("already done"));
+    }
+
+    #[test]
+    fn a_rekey_is_written_and_then_already_done_though_the_index_still_has_the_old_key() {
+        let dir = project();
+        let op = Op::Rekey {
+            target: "lib/util.py::other".to_string(),
+            new_target: "lib/util.py::third".to_string(),
+            force: false,
+            ack: false,
+            pick: Pick::default(),
+        };
+
+        says_not_refreshed(&apply(dir.path(), &op));
+
+        let now = file(dir.path(), "docs/glossary/lib.md");
+        assert!(now.contains("### `lib/util.py::third`\n\nOthers."), "{now}");
+        let again = apply(dir.path(), &op);
+        assert!(again.contains("already done"), "{again}");
+        assert_eq!(file(dir.path(), "docs/glossary/lib.md"), now);
+    }
+
+    #[test]
+    fn a_delete_is_written_and_then_already_done() {
+        let dir = project();
+        let op = Op::Delete {
+            target: TOTAL.to_string(),
+            force: true,
+            pick: Pick::default(),
+        };
+
+        says_not_refreshed(&apply(dir.path(), &op));
+
+        let now = file(dir.path(), "docs/glossary/src.md");
+        assert!(!now.contains("compute_total"), "{now}");
+        let again = apply(dir.path(), &op);
+        assert!(again.contains("already done"), "{again}");
+        assert_eq!(file(dir.path(), "docs/glossary/src.md"), now);
+    }
+
+    #[test]
+    fn a_create_is_written_once_though_the_index_never_heard_of_it() {
+        let dir = project();
+        let op = Op::Create {
+            target: "lib/util.py::third".to_string(),
+            text: "Third.".to_string(),
+            doc_file: None,
+        };
+
+        says_not_refreshed(&apply(dir.path(), &op));
+
+        let once = file(dir.path(), "docs/glossary/lib.md");
+        let again = apply(dir.path(), &op);
+        assert!(again.contains("already done"), "{again}");
+        assert_eq!(file(dir.path(), "docs/glossary/lib.md"), once);
+        assert_eq!(
+            once.matches("### `lib/util.py::third`").count(),
+            1,
+            "{once}"
+        );
+    }
+
+    #[test]
+    fn a_refresh_that_works_says_so() {
+        let dir = project();
+        let out = ok(
+            dir.path(),
+            json!({"op": "edit", "target": TOTAL, "old": "in a loop", "new": "by looping", "apply": true}),
+        );
+        assert!(out.contains("document index refreshed"), "{out}");
+        assert!(!out.contains("NOT refreshed"), "{out}");
+    }
+}
+
+// ---- ranges come from the file as it lies, not from the index ---------------
+
+mod live_ranges {
+    use super::*;
+
+    /// `docs/glossary/src.md` with `lines` extra lines above its first entry,
+    /// written by hand: the index still has the old line numbers.
+    fn push_entries_down(dir: &Path, lines: usize) {
+        let text = file(dir, "docs/glossary/src.md");
+        let pad = "A new paragraph above every entry.\n\n".repeat(lines);
+        write(
+            dir,
+            "docs/glossary/src.md",
+            &text.replacen("# Glossary\n\n", &format!("# Glossary\n\n{pad}"), 1),
+        );
+    }
+
+    fn guard(dir: &Path, old: &str) -> infigraph_docs::doc_guard::Decision {
+        infigraph_docs::doc_guard::decide(&json!({
+            "tool_name": "Edit", "cwd": dir,
+            "tool_input": {
+                "file_path": dir.join("docs/glossary/src.md"),
+                "old_string": old, "new_string": "x",
+            },
+        }))
+    }
+
+    #[test]
+    fn the_guard_follows_the_lines_the_file_has_now() {
+        let dir = project();
+        push_entries_down(dir.path(), 8);
+
+        // The entry moved down 16 lines; the index still says it is on line 3.
+        match guard(dir.path(), "Sums the items in a loop") {
+            infigraph_docs::doc_guard::Decision::Deny(why) => {
+                assert!(why.contains(TOTAL) && why.contains("src.md:19-"), "{why}")
+            }
+            other => panic!("an edit inside the moved entry was allowed: {other:?}"),
+        }
+        // The new text sits where the entry used to be in the index: outside.
+        assert_eq!(
+            guard(dir.path(), "A new paragraph above every entry."),
+            infigraph_docs::doc_guard::Decision::Allow
+        );
+    }
+
+    #[test]
+    fn doc_entry_edits_the_lines_the_file_has_now() {
+        let dir = project();
+        push_entries_down(dir.path(), 8);
+
+        ok(
+            dir.path(),
+            json!({
+                "op": "edit", "target": TOTAL, "old": "in a loop", "new": "by looping",
+                "apply": true,
+            }),
+        );
+
+        let now = file(dir.path(), "docs/glossary/src.md");
+        assert!(
+            now.contains("Sums the items by looping, not with sum()"),
+            "{now}"
+        );
+        assert_eq!(now.matches("A new paragraph above every entry.").count(), 8);
+    }
+}
+
+// ---- one key, several entries --------------------------------------------------
+
+mod duplicates {
+    use super::*;
+
+    const DUP: &str = "docs/glossary/dup.md";
+    const THIRD: &str = "lib/util.py::third";
+    const FIRST_COPY: &str = "# Dup\n\n### `lib/util.py::third`\n\nFirst third.\n\n\
+        ### `lib/util.py::other`\n\nOther, here too.\n\n\
+        ### `lib/util.py::third`\n\nSecond third.\n";
+
+    /// The project plus `dup.md`, where `third` has two entries and `other`
+    /// (which `lib.md` also has) one.
+    fn project_with_duplicates() -> tempfile::TempDir {
+        let dir = project();
+        write(dir.path(), DUP, FIRST_COPY);
+        index_documents(dir.path());
+        dir
+    }
+
+    #[test]
+    fn deleting_the_second_of_two_leaves_the_first_and_the_rest_byte_for_byte() {
+        let dir = project_with_duplicates();
+
+        let out = ok(
+            dir.path(),
+            json!({"op": "delete", "target": THIRD, "nth": 2, "force": true, "apply": true}),
+        );
+
+        assert!(out.contains("applied"), "{out}");
+        assert_eq!(
+            file(dir.path(), DUP),
+            "# Dup\n\n### `lib/util.py::third`\n\nFirst third.\n\n\
+             ### `lib/util.py::other`\n\nOther, here too.\n"
+        );
+        assert_eq!(file(dir.path(), "docs/glossary/lib.md"), LIB_DOC);
+        assert_eq!(file(dir.path(), "docs/glossary/src.md"), SRC_DOC);
+    }
+
+    #[test]
+    fn a_repeated_delete_of_a_second_entry_that_is_gone_is_already_done() {
+        let dir = project_with_duplicates();
+        let args = json!({"op": "delete", "target": THIRD, "nth": 2, "force": true, "apply": true});
+        ok(dir.path(), args.clone());
+        let after_one = file(dir.path(), DUP);
+
+        let again = ok(dir.path(), args);
+
+        assert!(again.contains("already done"), "{again}");
+        assert!(again.contains("no 2nd entry (1 found)"), "{again}");
+        assert_eq!(file(dir.path(), DUP), after_one);
+    }
+
+    #[test]
+    fn without_a_selector_every_entry_is_named_and_so_is_the_way_to_choose() {
+        let dir = project_with_duplicates();
+
+        for op in ["delete", "edit", "replace", "rekey"] {
+            let mut args = json!({
+                "op": op, "target": THIRD, "old": "third", "new": "x", "text": "y",
+                "new_target": "lib/more.py::fresh", "force": true,
+            });
+            args["apply"] = json!(true);
+            let why = refused(dir.path(), args);
+            assert!(
+                why.contains("docs/glossary/dup.md:3") && why.contains("docs/glossary/dup.md:11"),
+                "{op}: {why}"
+            );
+            assert!(why.contains("nth") && why.contains("line"), "{op}: {why}");
+        }
+        assert_eq!(
+            file(dir.path(), DUP),
+            FIRST_COPY,
+            "a refusal wrote something"
+        );
+    }
+
+    #[test]
+    fn an_edit_by_nth_or_by_line_changes_only_that_entry() {
+        let dir = project_with_duplicates();
+
+        ok(
+            dir.path(),
+            json!({"op": "edit", "target": THIRD, "old": "third", "new": "3rd", "nth": 1, "apply": true}),
+        );
+        let first = file(dir.path(), DUP);
+        assert!(
+            first.contains("First 3rd.") && first.contains("Second third."),
+            "{first}"
+        );
+
+        ok(
+            dir.path(),
+            json!({"op": "edit", "target": THIRD, "old": "third", "new": "3rd", "line": 11, "apply": true}),
+        );
+        let both = file(dir.path(), DUP);
+        assert!(
+            both.contains("First 3rd.") && both.contains("Second 3rd."),
+            "{both}"
+        );
+        assert!(both.contains("Other, here too."), "{both}");
+    }
+
+    #[test]
+    fn a_replace_and_a_rekey_pick_their_entry_too() {
+        let dir = project_with_duplicates();
+
+        ok(
+            dir.path(),
+            json!({"op": "replace", "target": THIRD, "text": "Rewritten.", "nth": 2, "apply": true}),
+        );
+        assert!(file(dir.path(), DUP).ends_with("### `lib/util.py::third`\n\nRewritten.\n"));
+
+        ok(
+            dir.path(),
+            json!({
+                "op": "rekey", "target": THIRD, "new_target": "lib/more.py::fresh",
+                "nth": 2, "apply": true,
+            }),
+        );
+        let now = file(dir.path(), DUP);
+        assert!(
+            now.contains("### `lib/more.py::fresh`\n\nRewritten."),
+            "{now}"
+        );
+        assert!(
+            now.contains("### `lib/util.py::third`\n\nFirst third."),
+            "{now}"
+        );
+    }
+
+    #[test]
+    fn a_selector_beyond_the_entries_there_are_is_an_error_naming_the_count() {
+        let dir = project_with_duplicates();
+
+        let nth = refused(
+            dir.path(),
+            json!({"op": "edit", "target": THIRD, "old": "third", "new": "x", "nth": 3}),
+        );
+        assert!(nth.contains("2 entries") && nth.contains("3"), "{nth}");
+        let line = refused(
+            dir.path(),
+            json!({"op": "edit", "target": THIRD, "old": "third", "new": "x", "line": 7}),
+        );
+        assert!(
+            line.contains("line 7") && line.contains("dup.md:3"),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn the_same_key_in_two_documents_needs_doc_file() {
+        let dir = project_with_duplicates();
+        let other = "lib/util.py::other";
+
+        let why = refused(
+            dir.path(),
+            json!({"op": "edit", "target": other, "old": "Others.", "new": "x"}),
+        );
+        assert!(
+            why.contains("docs/glossary/dup.md:7") && why.contains("docs/glossary/lib.md:7"),
+            "{why}"
+        );
+        assert!(why.contains("doc_file"), "{why}");
+
+        ok(
+            dir.path(),
+            json!({
+                "op": "edit", "target": other, "old": "here too", "new": "also here",
+                "doc_file": DUP, "apply": true,
+            }),
+        );
+        assert!(file(dir.path(), DUP).contains("Other, also here."));
+        assert_eq!(file(dir.path(), "docs/glossary/lib.md"), LIB_DOC);
+    }
+}
+
+// ---- a linked worktree is its own project ----------------------------------------
+
+mod worktrees {
+    use super::*;
+
+    /// A committed project and a linked worktree of it inside its directory
+    /// (`scratchpad/wt-x`, as the repo's convention puts them).
+    fn project_and_worktree() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = committed();
+        git(
+            dir.path(),
+            &["worktree", "add", "-q", "-b", "topic", "scratchpad/wt-x"],
+            FIRST,
+        );
+        let wt = dir.path().join("scratchpad/wt-x");
+        assert!(wt.join("docs/glossary/src.md").is_file());
+        (dir, wt)
+    }
+
+    const EDIT: fn(bool) -> Value = |apply| {
+        json!({
+            "op": "edit", "target": TOTAL, "old": "in a loop", "new": "by looping",
+            "apply": apply,
+        })
+    };
+
+    #[test]
+    fn a_worktree_with_its_own_index_is_edited_and_refreshed_on_its_own() {
+        let (main, wt) = project_and_worktree();
+        reindex_code(&wt);
+        index_documents(&wt);
+
+        let out = ok(&wt, EDIT(true));
+
+        assert!(out.contains("document index refreshed"), "{out}");
+        assert!(file(&wt, "docs/glossary/src.md").contains("by looping"));
+        assert_eq!(file(main.path(), "docs/glossary/src.md"), SRC_DOC);
+        assert!(
+            context(&wt, TOTAL).contains("by looping"),
+            "its index was not refreshed"
+        );
+        assert!(
+            !context(main.path(), TOTAL).contains("by looping"),
+            "the main checkout's index was refreshed"
+        );
+    }
+
+    #[test]
+    fn a_worktree_with_no_index_of_its_own_is_refused_rather_than_resolved_to_the_main_checkout() {
+        let (main, wt) = project_and_worktree();
+
+        let why = refused(&wt, EDIT(true));
+
+        assert!(
+            why.contains("no index of its own") && why.contains("worktree init"),
+            "{why}"
+        );
+        assert_eq!(file(main.path(), "docs/glossary/src.md"), SRC_DOC);
+        assert_eq!(file(&wt, "docs/glossary/src.md"), SRC_DOC);
+    }
+}

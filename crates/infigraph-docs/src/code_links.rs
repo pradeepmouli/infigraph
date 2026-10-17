@@ -40,7 +40,7 @@ use crate::extract::{DocFormat, ExtractedDoc};
 /// What the index stores about a document's links is a function of this
 /// version: a document recorded under an older one is scanned again, even when
 /// its content has not changed.
-pub const CODE_LINKS_VERSION: i64 = 1;
+pub const CODE_LINKS_VERSION: i64 = 2;
 
 /// A mention's excerpt is cut to this many characters around the span.
 const EXCERPT_CHARS: usize = 240;
@@ -52,6 +52,9 @@ pub enum LinkKind {
     /// A heading that starts like a key but is not exactly one: it links
     /// nothing, and `doctor` lists it.
     NearMiss,
+    /// A code fence that is opened and never closed. It is not treated as a
+    /// fence (see [`prose_lines`]); `doctor` lists it so the author learns of it.
+    UnclosedFence,
 }
 
 impl LinkKind {
@@ -60,6 +63,7 @@ impl LinkKind {
             LinkKind::Documents => "documents",
             LinkKind::Mentions => "mentions",
             LinkKind::NearMiss => "near-miss",
+            LinkKind::UnclosedFence => "unclosed-fence",
         }
     }
 
@@ -68,6 +72,7 @@ impl LinkKind {
             "documents" => Some(LinkKind::Documents),
             "mentions" => Some(LinkKind::Mentions),
             "near-miss" => Some(LinkKind::NearMiss),
+            "unclosed-fence" => Some(LinkKind::UnclosedFence),
             _ => None,
         }
     }
@@ -151,30 +156,75 @@ struct Heading {
     key: Option<String>,
 }
 
-/// The lines of `text` outside fenced code, numbered from 1.
-fn prose_lines(text: &str) -> Vec<(usize, &str)> {
-    let mut lines = Vec::new();
-    let mut fence: Option<(char, usize)> = None;
-    for (i, line) in text.lines().enumerate() {
-        let trimmed = line.trim_start();
-        let marker = trimmed
-            .chars()
-            .next()
-            .filter(|c| *c == '`' || *c == '~')
-            .map(|c| (c, trimmed.chars().take_while(|x| *x == c).count()))
-            .filter(|(_, n)| *n >= 3);
-        match (fence, marker) {
-            (None, Some(open)) => fence = Some(open),
-            (Some((c, n)), Some((mc, mn)))
-                if mc == c && mn >= n && trimmed[mn..].trim().is_empty() =>
-            {
-                fence = None
+/// A run of backticks or tildes opening or closing a fenced code block: its
+/// character, its length, and what follows it on the line.
+fn fence_marker(line: &str) -> Option<(char, usize, &str)> {
+    let trimmed = line.trim_start();
+    let c = trimmed.chars().next().filter(|c| *c == '`' || *c == '~')?;
+    let n = trimmed.chars().take_while(|x| *x == c).count();
+    let rest = &trimmed[n..];
+    // A backtick fence's info string has no backtick: ```x``` is a code span.
+    (n >= 3 && !(c == '`' && rest.contains('`'))).then_some((c, n, rest))
+}
+
+/// Whether `line` closes a fence opened with `n` of `c`.
+fn closes_fence(line: &str, c: char, n: usize) -> bool {
+    fence_marker(line).is_some_and(|(mc, mn, rest)| mc == c && mn >= n && rest.trim().is_empty())
+}
+
+/// What a Markdown document's fences leave: the lines outside them, and the
+/// line of every fence that is opened and never closed.
+struct Prose<'a> {
+    /// Numbered from 1.
+    lines: Vec<(usize, &'a str)>,
+    unclosed: Vec<(usize, &'a str)>,
+}
+
+/// The lines of `text` outside fenced code.
+///
+/// A fence nothing closes is **not a fence**: its lines stay prose and it is
+/// listed in `unclosed`. CommonMark would run it to the end of the file, but
+/// then one stray line (a glossary page documenting its own format, with
+/// fences inside a fence) hides every entry below it from the index, from
+/// `doctor` and from the edit guard without a word. The price is that the
+/// contents of a fence its author really never closed are read as prose.
+fn prose_lines(text: &str) -> Prose<'_> {
+    let all: Vec<&str> = text.lines().collect();
+    let mut prose = Prose {
+        lines: Vec::new(),
+        unclosed: Vec::new(),
+    };
+    // The shortest opener of each character that found no closer: a longer
+    // one finds none either, so the rest of the file is not scanned again.
+    let mut no_closer: [Option<usize>; 2] = [None, None];
+    let mut i = 0;
+    while i < all.len() {
+        let line = all[i];
+        let Some((c, n, _)) = fence_marker(line) else {
+            prose.lines.push((i + 1, line));
+            i += 1;
+            continue;
+        };
+        let slot = usize::from(c == '~');
+        let closer = if no_closer[slot].is_some_and(|min| n >= min) {
+            None
+        } else {
+            all[i + 1..]
+                .iter()
+                .position(|l| closes_fence(l, c, n))
+                .map(|k| i + 1 + k)
+        };
+        match closer {
+            Some(end) => i = end + 1,
+            None => {
+                no_closer[slot] = Some(no_closer[slot].map_or(n, |min| min.min(n)));
+                prose.unclosed.push((i + 1, line.trim()));
+                prose.lines.push((i + 1, line));
+                i += 1;
             }
-            (Some(_), _) => {}
-            (None, None) => lines.push((i + 1, line)),
         }
     }
-    lines
+    prose
 }
 
 fn excerpt(line: &str, span: &str) -> String {
@@ -258,7 +308,7 @@ pub struct Entry {
 /// is.
 pub fn entries(text: &str) -> Vec<Entry> {
     let prose = prose_lines(text);
-    let headings = scan_headings(&prose);
+    let headings = scan_headings(&prose.lines);
     let source_lines: Vec<&str> = text.lines().collect();
     headings
         .iter()
@@ -289,7 +339,7 @@ pub fn entries(text: &str) -> Vec<Entry> {
 /// Every link a Markdown document carries.
 pub fn extract_markdown(doc_file: &str, text: &str) -> Vec<CodeLinkRow> {
     let prose = prose_lines(text);
-    let headings = scan_headings(&prose);
+    let headings = scan_headings(&prose.lines);
 
     let mut rows: Vec<CodeLinkRow> = Vec::new();
     let next_id = |rows: &Vec<CodeLinkRow>| format!("{doc_file}#{}", rows.len());
@@ -332,7 +382,7 @@ pub fn extract_markdown(doc_file: &str, text: &str) -> Vec<CodeLinkRow> {
     let mut seen: std::collections::HashSet<(String, String)> = Default::default();
     let heading_at: std::collections::HashMap<usize, &Heading> =
         headings.iter().map(|h| (h.line, h)).collect();
-    for (line, content) in &prose {
+    for (line, content) in &prose.lines {
         if let Some(h) = heading_at.get(line) {
             section = h.text.clone();
             if h.key.is_some() {
@@ -355,6 +405,18 @@ pub fn extract_markdown(doc_file: &str, text: &str) -> Vec<CodeLinkRow> {
                 text: excerpt(content, span),
             });
         }
+    }
+    for (line, opener) in &prose.unclosed {
+        rows.push(CodeLinkRow {
+            id: next_id(&rows),
+            doc_file: doc_file.to_string(),
+            kind: LinkKind::UnclosedFence,
+            target: opener.to_string(),
+            heading: String::new(),
+            line_start: *line,
+            line_end: *line,
+            text: String::new(),
+        });
     }
     rows
 }
@@ -481,6 +543,62 @@ mod tests {
         assert_eq!(got.len(), 1, "{got:#?}");
         assert_eq!(got[0].target, "a.ts::f");
         assert!(got[0].text.contains("still f"));
+    }
+
+    /// The shape of a glossary README that documents its own format: an outer
+    /// fence holding inner ```text fences. The first bare fence line closes the
+    /// outer one, so the last line below opens a fence nothing ever closes.
+    const NESTED_FENCES: &str = "# Glossary\n\nInside a file:\n\n```\n### `a.ts::fenced`\n\n```text\n<comment>\n```\n\n#### body\n\n```text\n<inner>\n```\n```\n\nAfter.\n\n### `a.ts::real`\n\nWhy real.\n";
+
+    #[test]
+    fn a_fence_nothing_closes_swallows_nothing() {
+        let got = documents(NESTED_FENCES);
+        assert_eq!(
+            got.iter().map(|r| r.target.as_str()).collect::<Vec<_>>(),
+            ["a.ts::real"],
+            "the example inside the fence is not a key, the entry after the stray fence is"
+        );
+        assert_eq!(got[0].line_start, 21);
+        let entries = entries(NESTED_FENCES);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            (entries[0].key.as_str(), entries[0].start),
+            ("a.ts::real", 21)
+        );
+    }
+
+    #[test]
+    fn an_unclosed_fence_is_reported_at_its_opening_line() {
+        let open: Vec<_> = rows(NESTED_FENCES)
+            .into_iter()
+            .filter(|r| r.kind == LinkKind::UnclosedFence)
+            .collect();
+        assert_eq!(open.len(), 1, "{open:#?}");
+        assert_eq!((open[0].line_start, open[0].target.as_str()), (17, "```"));
+        let tilde: Vec<_> = rows("text\n\n~~~ps\n### `a.ts::f`\n\nwhy\n")
+            .into_iter()
+            .filter(|r| r.kind == LinkKind::UnclosedFence)
+            .collect();
+        assert_eq!(tilde.len(), 1);
+        assert_eq!(tilde[0].line_start, 3);
+        // A closed fence reports nothing.
+        assert!(rows("```\ncode\n```\n")
+            .iter()
+            .all(|r| r.kind != LinkKind::UnclosedFence));
+    }
+
+    #[test]
+    fn a_line_that_starts_with_an_inline_span_is_not_a_fence() {
+        let text = "```x``` is a span, not a fence.\n\n### `a.ts::f`\n\nwhy\n";
+        assert_eq!(documents(text).len(), 1);
+        assert!(rows(text).iter().all(|r| r.kind != LinkKind::UnclosedFence));
+    }
+
+    #[test]
+    fn a_longer_closer_closes_and_a_shorter_one_does_not() {
+        let got = documents("````\n```\n### `a.ts::fake`\n```\n````\n\n### `a.ts::f`\n\nwhy\n");
+        assert_eq!(got.len(), 1, "{got:#?}");
+        assert_eq!(got[0].target, "a.ts::f");
     }
 
     #[test]
