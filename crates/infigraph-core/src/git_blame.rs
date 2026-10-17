@@ -331,6 +331,267 @@ pub fn last_commit_of_file(
     }))
 }
 
+/// One commit that touched a range, newest first, with its patch limited to
+/// the range's lines (headers removed, hunks kept).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Change {
+    pub commit: String,
+    /// Committer time, seconds since the epoch.
+    pub time: i64,
+    pub subject: String,
+    pub patch: String,
+}
+
+/// What happened to a range of lines since a commit.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Changes {
+    /// Up to the `max_commits` asked for, newest first.
+    pub commits: Vec<Change>,
+    /// The range has older commits than the ones listed.
+    pub more_commits: bool,
+    /// Hunks of the working tree that touch the range and are not committed.
+    pub uncommitted: Option<String>,
+}
+
+/// One hunk of `git diff -U0`, in old (HEAD) and new (working tree) lines.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Hunk {
+    old_start: usize,
+    old_count: usize,
+    new_start: usize,
+    new_count: usize,
+    text: String,
+}
+
+/// `@@ -a[,b] +c[,d] @@` -> (a, b, c, d), a missing count being 1.
+fn hunk_header(line: &str) -> Option<(usize, usize, usize, usize)> {
+    let rest = line.strip_prefix("@@ -")?;
+    let (old, rest) = rest.split_once(" +")?;
+    let (new, _) = rest.split_once(" @@")?;
+    let span = |s: &str| -> Option<(usize, usize)> {
+        match s.split_once(',') {
+            Some((start, count)) => Some((start.parse().ok()?, count.parse().ok()?)),
+            None => Some((s.parse().ok()?, 1)),
+        }
+    };
+    let (old_start, old_count) = span(old)?;
+    let (new_start, new_count) = span(new)?;
+    Some((old_start, old_count, new_start, new_count))
+}
+
+/// The hunks of a unified diff of one file, headers dropped.
+fn parse_hunks(diff: &str) -> Vec<Hunk> {
+    let mut hunks: Vec<Hunk> = Vec::new();
+    let mut in_header = false;
+    for line in diff.lines() {
+        if line.starts_with("diff --git ") {
+            in_header = true;
+        } else if let Some((old_start, old_count, new_start, new_count)) = hunk_header(line) {
+            in_header = false;
+            hunks.push(Hunk {
+                old_start,
+                old_count,
+                new_start,
+                new_count,
+                text: format!("{line}\n"),
+            });
+        } else if !in_header {
+            if let Some(last) = hunks.last_mut() {
+                last.text.push_str(line);
+                last.text.push('\n');
+            }
+        }
+    }
+    hunks
+}
+
+/// Whether the working-tree lines `range` and `hunk` share a line. A pure
+/// deletion (`new_count` 0) sits between `new_start` and the next line.
+fn touches(hunk: &Hunk, range: (usize, usize)) -> bool {
+    if hunk.new_count == 0 {
+        hunk.new_start >= range.0.saturating_sub(1) && hunk.new_start <= range.1
+    } else {
+        hunk.new_start <= range.1 && hunk.new_start + hunk.new_count > range.0
+    }
+}
+
+/// The lines of HEAD that the working-tree lines `range` came from: the range
+/// shrunk past lines edited and not committed, and shifted by every hunk above
+/// it. `None` when every line of it is uncommitted.
+fn head_range(hunks: &[Hunk], range: (usize, usize)) -> Option<(usize, usize)> {
+    let edited = |line: usize| {
+        hunks
+            .iter()
+            .any(|h| h.new_count > 0 && (h.new_start..h.new_start + h.new_count).contains(&line))
+    };
+    // A hunk is above `line` when it ends before it; a pure deletion sits
+    // after line `new_start`.
+    let above = |h: &Hunk, line: usize| {
+        if h.new_count == 0 {
+            h.new_start < line
+        } else {
+            h.new_start + h.new_count <= line
+        }
+    };
+    let shifted = |line: usize| -> usize {
+        let delta: isize = hunks
+            .iter()
+            .filter(|h| above(h, line))
+            .map(|h| h.old_count as isize - h.new_count as isize)
+            .sum();
+        (line as isize + delta).max(1) as usize
+    };
+    let first = (range.0..=range.1).find(|l| !edited(*l))?;
+    let last = (first..=range.1).rev().find(|l| !edited(*l))?;
+    Some((shifted(first), shifted(last)))
+}
+
+/// Context lines kept on each side of a change in a commit's patch.
+const PATCH_CONTEXT: usize = 1;
+
+/// `git log -L` prints every line of the tracked range, changed or not. Keeps
+/// each hunk's header, its `+`/`-` lines and [`PATCH_CONTEXT`] lines around
+/// them, and marks what it left out with `...`, so a reader sees what changed
+/// instead of the whole function again.
+fn squeeze(hunks: &str) -> String {
+    let lines: Vec<&str> = hunks.lines().collect();
+    let is_change = |l: &str| l.starts_with('+') || l.starts_with('-');
+    let mut show = vec![false; lines.len()];
+    for (i, line) in lines.iter().enumerate() {
+        if line.starts_with("@@") {
+            show[i] = true;
+        } else if is_change(line) {
+            let from = i.saturating_sub(PATCH_CONTEXT);
+            let to = (i + PATCH_CONTEXT).min(lines.len() - 1);
+            for (j, shown) in show.iter_mut().enumerate().take(to + 1).skip(from) {
+                // A hunk header stays a header: context never reaches across it.
+                *shown |= !lines[j].starts_with("@@") || j == i;
+            }
+        }
+    }
+    let mut out = String::new();
+    let mut skipped = false;
+    for (line, shown) in lines.iter().zip(&show) {
+        if *shown {
+            if skipped && !line.starts_with("@@") {
+                out.push_str("...\n");
+            }
+            skipped = false;
+            out.push_str(line);
+            out.push('\n');
+        } else {
+            skipped = true;
+        }
+    }
+    out
+}
+
+/// Marks the start of a commit in the `git log` format below; no subject or
+/// patch line starts with it.
+const COMMIT_MARK: char = '\u{1}';
+
+/// What changed in the lines `lines` of `file` (as they are in the working
+/// tree) since commit `since`: the commits after it that touched them, newest
+/// first and at most `max_commits`, each with its patch limited to those lines
+/// (`git log -L`, which follows the lines as they move), plus the working
+/// tree's own uncommitted edits to them.
+///
+/// `git log -L` reads line numbers at HEAD, so a file with uncommitted edits
+/// is mapped back first. A file git cannot follow (not tracked, absent at
+/// `since`) is an error: the caller says "unknown", never an empty history.
+pub fn changes_since(
+    root: &Path,
+    file: &str,
+    lines: (usize, usize),
+    since: &str,
+    max_commits: usize,
+    timeout: Duration,
+) -> Result<Changes, BlameError> {
+    let diff = run(
+        "git",
+        &[
+            "--no-pager",
+            "diff",
+            "-U0",
+            "--no-color",
+            "--no-ext-diff",
+            "HEAD",
+            "--",
+            file,
+        ]
+        .map(String::from),
+        root,
+        timeout,
+    )?;
+    let hunks = parse_hunks(&diff);
+    let uncommitted: String = hunks
+        .iter()
+        .filter(|h| touches(h, lines))
+        .map(|h| h.text.as_str())
+        .collect();
+    let mut changes = Changes {
+        uncommitted: (!uncommitted.is_empty()).then_some(uncommitted),
+        ..Changes::default()
+    };
+
+    let Some((start, end)) = head_range(&hunks, lines) else {
+        return Ok(changes);
+    };
+    // `git log -L` fails on an empty revision range ("No commit specified?"),
+    // which is the ordinary case of an entry written in HEAD itself.
+    let after = run(
+        "git",
+        &["--no-pager", "rev-list", "-n1"]
+            .map(String::from)
+            .into_iter()
+            .chain([format!("{since}..HEAD")])
+            .collect::<Vec<_>>(),
+        root,
+        timeout,
+    )?;
+    if after.trim().is_empty() {
+        return Ok(changes);
+    }
+    let args: Vec<String> = vec![
+        "--no-pager".into(),
+        "log".into(),
+        "--no-color".into(),
+        "--no-ext-diff".into(),
+        "-U1".into(),
+        format!("-n{}", max_commits + 1),
+        format!("--format={COMMIT_MARK}%H %ct %s"),
+        format!("-L{start},{end}:{file}"),
+        format!("{since}..HEAD"),
+    ];
+    let log = run("git", &args, root, timeout)?;
+    for block in log.split(COMMIT_MARK).skip(1) {
+        let (head, patch) = block.split_once('\n').unwrap_or((block, ""));
+        let mut fields = head.splitn(3, ' ');
+        let (Some(commit), Some(time), subject) = (
+            fields.next(),
+            fields.next().and_then(|t| t.parse().ok()),
+            fields.next().unwrap_or(""),
+        ) else {
+            continue;
+        };
+        let patch: String = parse_hunks(patch)
+            .iter()
+            .map(|h| squeeze(&h.text))
+            .collect();
+        changes.commits.push(Change {
+            commit: commit.to_string(),
+            time,
+            subject: subject.to_string(),
+            patch,
+        });
+    }
+    if changes.commits.len() > max_commits {
+        changes.commits.truncate(max_commits);
+        changes.more_commits = true;
+    }
+    Ok(changes)
+}
+
 /// Whether the content of a range is older than what it describes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SyncState {
@@ -599,6 +860,218 @@ mod tests {
         std::fs::write(dir.path().join("f.txt"), "one\ntwo\nEDITED\n").unwrap();
         let second = blame_ranges_cached(dir.path(), "f.txt", &[(3, 3)], GIT_TIMEOUT).unwrap();
         assert!(second[0].dirty, "a cached answer outlived an edit");
+    }
+
+    fn hunk(old: (usize, usize), new: (usize, usize)) -> Hunk {
+        Hunk {
+            old_start: old.0,
+            old_count: old.1,
+            new_start: new.0,
+            new_count: new.1,
+            text: String::new(),
+        }
+    }
+
+    #[test]
+    fn hunk_headers_default_a_missing_count_to_one() {
+        assert_eq!(hunk_header("@@ -3 +3,2 @@ fn x"), Some((3, 1, 3, 2)));
+        assert_eq!(hunk_header("@@ -10,0 +11,4 @@"), Some((10, 0, 11, 4)));
+        assert_eq!(hunk_header("not a header"), None);
+    }
+
+    #[test]
+    fn a_diffs_headers_are_dropped_and_its_hunks_kept_whole() {
+        let hunks = parse_hunks(
+            "diff --git a/f b/f\nindex 1..2 100644\n--- a/f\n+++ b/f\n@@ -2 +2 @@\n-two\n+TWO\n@@ -9,0 +10 @@\n+ten\n",
+        );
+        assert_eq!(hunks.len(), 2);
+        assert_eq!(hunks[0].text, "@@ -2 +2 @@\n-two\n+TWO\n");
+        assert_eq!(hunks[1].text, "@@ -9,0 +10 @@\n+ten\n");
+    }
+
+    #[test]
+    fn working_tree_lines_map_back_to_head_past_every_hunk_above_them() {
+        // Two lines inserted at 2-3, then line 10 edited, then a line deleted
+        // after line 19 (as `git diff -U0` numbers it: the line before).
+        let hunks = [
+            hunk((1, 0), (2, 2)),
+            hunk((8, 1), (10, 1)),
+            hunk((18, 1), (19, 0)),
+        ];
+        assert_eq!(
+            head_range(&hunks, (5, 7)),
+            Some((3, 5)),
+            "below the insertion"
+        );
+        assert_eq!(
+            head_range(&hunks, (9, 11)),
+            Some((7, 9)),
+            "line 10 is uncommitted"
+        );
+        assert_eq!(
+            head_range(&hunks, (10, 10)),
+            None,
+            "all of it is uncommitted"
+        );
+        assert_eq!(
+            head_range(&hunks, (20, 22)),
+            Some((19, 21)),
+            "below the deleted line"
+        );
+        assert_eq!(
+            head_range(&[], (4, 6)),
+            Some((4, 6)),
+            "a clean file maps to itself"
+        );
+    }
+
+    /// `history()` plus a third commit that rewrites line 1, then one that
+    /// edits line 3, so line 3 has two commits after the first.
+    fn longer_history() -> tempfile::TempDir {
+        let dir = history();
+        let git = |args: &[&str], date: &str| {
+            let out = std::process::Command::new("git")
+                .args(["-c", "commit.gpgsign=false"])
+                .args(args)
+                .current_dir(dir.path())
+                .env("GIT_AUTHOR_DATE", date)
+                .env("GIT_COMMITTER_DATE", date)
+                .env("GIT_AUTHOR_NAME", "t")
+                .env("GIT_AUTHOR_EMAIL", "t@t")
+                .env("GIT_COMMITTER_NAME", "t")
+                .env("GIT_COMMITTER_EMAIL", "t@t")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{args:?}");
+        };
+        std::fs::write(dir.path().join("f.txt"), "ONE\ntwo\nTHREE\n").unwrap();
+        git(
+            &["commit", "-q", "-am", "third: line one"],
+            "2024-07-01T00:00:00Z",
+        );
+        std::fs::write(dir.path().join("f.txt"), "ONE\ntwo\nthree again\n").unwrap();
+        git(
+            &["commit", "-q", "-am", "fourth: line three"],
+            "2024-08-01T00:00:00Z",
+        );
+        dir
+    }
+
+    fn first_commit(dir: &Path) -> String {
+        let out = run(
+            "git",
+            &[
+                "rev-list".to_string(),
+                "--max-parents=0".to_string(),
+                "HEAD".to_string(),
+            ],
+            dir,
+            GIT_TIMEOUT,
+        )
+        .unwrap();
+        out.trim().to_string()
+    }
+
+    #[test]
+    fn only_the_commits_that_touched_the_lines_are_listed_newest_first_with_their_lines() {
+        let dir = longer_history();
+        let first = first_commit(dir.path());
+
+        let got = changes_since(dir.path(), "f.txt", (3, 3), &first, 5, GIT_TIMEOUT).unwrap();
+        let subjects: Vec<&str> = got.commits.iter().map(|c| c.subject.as_str()).collect();
+        assert_eq!(subjects, ["fourth: line three", "second"], "{got:#?}");
+        assert!(got.commits[0].patch.contains("+three again"), "{got:#?}");
+        assert!(got.commits[0].patch.contains("-THREE"), "{got:#?}");
+        assert!(
+            !got.commits[0].patch.contains("diff --git"),
+            "headers stay out"
+        );
+        assert!(!got.more_commits && got.uncommitted.is_none());
+
+        let other = changes_since(dir.path(), "f.txt", (2, 2), &first, 5, GIT_TIMEOUT).unwrap();
+        assert!(
+            other.commits.is_empty(),
+            "line two never changed: {other:#?}"
+        );
+    }
+
+    #[test]
+    fn the_number_of_commits_is_capped_and_the_cap_is_reported() {
+        let dir = longer_history();
+        let first = first_commit(dir.path());
+        let got = changes_since(dir.path(), "f.txt", (3, 3), &first, 1, GIT_TIMEOUT).unwrap();
+        assert_eq!(got.commits.len(), 1);
+        assert!(got.more_commits);
+    }
+
+    #[test]
+    fn an_entry_written_at_head_has_no_history_after_it_and_is_not_an_error() {
+        let dir = longer_history();
+        let head = run(
+            "git",
+            &["rev-parse".to_string(), "HEAD".to_string()],
+            dir.path(),
+            GIT_TIMEOUT,
+        )
+        .unwrap();
+        let got = changes_since(dir.path(), "f.txt", (1, 3), head.trim(), 5, GIT_TIMEOUT).unwrap();
+        assert_eq!(got, Changes::default());
+    }
+
+    #[test]
+    fn uncommitted_edits_are_reported_and_the_log_is_read_at_the_right_lines() {
+        let dir = longer_history();
+        let first = first_commit(dir.path());
+        // Two lines go in above line 3, and line 3 itself is edited again.
+        std::fs::write(
+            dir.path().join("f.txt"),
+            "new a\nnew b\nONE\ntwo\nthree edited\n",
+        )
+        .unwrap();
+
+        // Line 4 ("two") never changed; it moved down by two.
+        let moved = changes_since(dir.path(), "f.txt", (4, 4), &first, 5, GIT_TIMEOUT).unwrap();
+        assert!(
+            moved.commits.is_empty() && moved.uncommitted.is_none(),
+            "{moved:#?}"
+        );
+
+        // The last line: its committed history is found at its HEAD line, and
+        // the edit on top of it is listed apart.
+        let edited = changes_since(dir.path(), "f.txt", (3, 5), &first, 5, GIT_TIMEOUT).unwrap();
+        assert!(
+            edited
+                .uncommitted
+                .as_deref()
+                .is_some_and(|u| u.contains("+three edited")),
+            "{edited:#?}"
+        );
+        assert!(
+            edited
+                .commits
+                .iter()
+                .any(|c| c.subject == "third: line one"),
+            "the committed history of the unedited lines is lost: {edited:#?}"
+        );
+    }
+
+    #[test]
+    fn a_file_git_does_not_track_is_an_error_not_an_empty_history() {
+        let dir = longer_history();
+        let first = first_commit(dir.path());
+        std::fs::write(dir.path().join("loose.txt"), "x\n").unwrap();
+        assert!(changes_since(dir.path(), "loose.txt", (1, 1), &first, 5, GIT_TIMEOUT).is_err());
+    }
+
+    #[test]
+    fn a_patch_keeps_its_changes_and_one_line_around_them_and_marks_the_rest() {
+        let hunk = "@@ -1,9 +1,9 @@ fn f\n a\n b\n c\n-d\n+D\n e\n f\n g\n h\n-i\n+I\n";
+        assert_eq!(
+            squeeze(hunk),
+            "@@ -1,9 +1,9 @@ fn f\n...\n c\n-d\n+D\n e\n...\n h\n-i\n+I\n"
+        );
+        // Nothing to cut: unchanged.
+        assert_eq!(squeeze("@@ -1 +1 @@\n-x\n+y\n"), "@@ -1 +1 @@\n-x\n+y\n");
     }
 
     #[test]

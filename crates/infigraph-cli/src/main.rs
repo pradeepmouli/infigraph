@@ -439,6 +439,20 @@ enum Commands {
         limit: usize,
     },
 
+    /// List the glossary entries whose code changed after they did, and what
+    /// changed (read-only: edit the entry in the Markdown yourself)
+    StaleDocs {
+        /// Only entries whose code or document lies under this path
+        #[arg(long)]
+        path_prefix: Option<String>,
+        /// Only the entry keyed to this symbol id, with more history
+        #[arg(long)]
+        symbol: Option<String>,
+        /// Max entries, biggest gap between code and entry first
+        #[arg(short, long, default_value = "20")]
+        limit: usize,
+    },
+
     /// Index Confluence pages into the document graph (fetch, parse, chunk, embed)
     IndexConfluence {
         /// Confluence base URL (e.g. https://confluence.example.com)
@@ -1228,6 +1242,11 @@ fn run(command: Commands, root: &Path) -> Result<()> {
         Commands::ReindexDocs => cmd_reindex_docs(root),
         Commands::CleanDocs => cmd_clean_docs(root),
         Commands::SearchDocs { query, limit } => cmd_search_docs(root, &query, limit),
+        Commands::StaleDocs {
+            path_prefix,
+            symbol,
+            limit,
+        } => cmd_stale_docs(root, path_prefix.as_deref(), symbol, limit),
         Commands::IndexConfluence {
             base_url,
             space,

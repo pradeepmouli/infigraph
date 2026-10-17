@@ -124,6 +124,7 @@ const SECTIONS: &[(&str, &[&str])] = &[
         &[
             "index_docs",
             "search_docs",
+            "stale_docs",
             "reindex_docs",
             "clean_docs",
             "index_confluence",

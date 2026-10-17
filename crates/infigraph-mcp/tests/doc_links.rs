@@ -14,50 +14,14 @@ use infigraph_mcp::tools::graph::tool_get_doc_context;
 
 mod support;
 
-const APP: &str = "def compute_total(items):\n    total = 0\n    for item in items:\n        total += item\n    return total\n\n\nclass Cart:\n    def add(self, item):\n        self.items.append(item)\n";
+use support::docs::{
+    code_project, commit, git, index_documents, project, reindex_code, write, APP,
+};
 
 const GLOSSARY: &str = "# Glossary\n\n\
 ### `src/app.py::compute_total`\n\nSums the items in a loop, not with sum(): items may be generators.\n\n\
 #### body\n\n```text\naccumulate in place\n```\n\n\
 ### `src/app.py::module`\n\nThe cart helpers live here; nothing in this file may do I/O.\n";
-
-fn write(root: &Path, file: &str, text: &str) {
-    let path = root.join(file);
-    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    std::fs::write(path, text).unwrap();
-}
-
-/// A project with `APP` and `extra` source files indexed, and `docs` (file,
-/// text) written. Documents are not indexed: that is `index_documents`.
-fn code_project(extra: &[(&str, &str)], docs: &[(&str, &str)]) -> tempfile::TempDir {
-    support::disable_background_watchers();
-    std::env::set_var("INFIGRAPH_BACKEND", "kuzu");
-    let dir = tempfile::tempdir().unwrap();
-    write(dir.path(), "src/app.py", APP);
-    for (file, text) in extra.iter().chain(docs) {
-        write(dir.path(), file, text);
-    }
-    let mut ig = infigraph_core::Infigraph::open(
-        dir.path(),
-        infigraph_languages::bundled_registry().unwrap(),
-    )
-    .unwrap();
-    ig.init().unwrap();
-    ig.index().unwrap();
-    drop(ig); // the tool opens the project itself
-    dir
-}
-
-fn index_documents(dir: &Path) {
-    infigraph_docs::ops::index_docs(dir, false).unwrap();
-}
-
-/// [`code_project`] with its documents indexed.
-fn project(docs: &[(&str, &str)]) -> tempfile::TempDir {
-    let dir = code_project(&[], docs);
-    index_documents(dir.path());
-    dir
-}
 
 fn context(dir: &Path, symbol: &str) -> String {
     tool_get_doc_context(&json!({
@@ -206,15 +170,6 @@ fn doctor(dir: &Path) -> String {
     tool_doctor(&json!({ "path": dir.to_string_lossy() })).unwrap()
 }
 
-/// Re-index the code graph of `dir` (after its source changed).
-fn reindex_code(dir: &Path) {
-    let mut ig =
-        infigraph_core::Infigraph::open(dir, infigraph_languages::bundled_registry().unwrap())
-            .unwrap();
-    ig.init().unwrap();
-    ig.index().unwrap();
-}
-
 #[test]
 fn doctor_lists_a_key_whose_symbol_was_renamed() {
     let dir = project(&[("docs/glossary/src.md", GLOSSARY)]);
@@ -286,32 +241,6 @@ fn a_project_with_no_documents_gains_no_document_checks() {
     let dir = code_project(&[], &[]);
     let out = doctor(dir.path());
     assert!(!out.contains("document links"), "{out}");
-}
-
-fn git(dir: &Path, args: &[&str], date: &str) {
-    let out = std::process::Command::new("git")
-        .args(["-c", "commit.gpgsign=false"])
-        .args(args)
-        .current_dir(dir)
-        .env("GIT_AUTHOR_DATE", date)
-        .env("GIT_COMMITTER_DATE", date)
-        .env("GIT_AUTHOR_NAME", "t")
-        .env("GIT_AUTHOR_EMAIL", "t@t")
-        .env("GIT_COMMITTER_NAME", "t")
-        .env("GIT_COMMITTER_EMAIL", "t@t")
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "git {args:?}: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-}
-
-/// Commits the sources and documents (not `.infigraph/`) as of `date`.
-fn commit(dir: &Path, date: &str) {
-    git(dir, &["add", "src", "docs"], date);
-    git(dir, &["commit", "-q", "-m", date], date);
 }
 
 #[test]

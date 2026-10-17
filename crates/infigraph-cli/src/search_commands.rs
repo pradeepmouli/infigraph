@@ -196,3 +196,22 @@ pub(crate) fn cmd_search_docs(root: &Path, query: &str, limit: usize) -> Result<
     }
     Ok(())
 }
+
+/// `infigraph stale-docs`: the same report as the MCP `stale_docs` tool.
+pub(crate) fn cmd_stale_docs(
+    root: &Path,
+    path_prefix: Option<&str>,
+    symbol: Option<String>,
+    limit: usize,
+) -> Result<()> {
+    let options = infigraph_docs::stale_docs::Options::new(
+        infigraph_core::path_scope::PathScope::new(root, path_prefix),
+        symbol,
+        Some(limit),
+    );
+    print!(
+        "{}",
+        infigraph_docs::stale_docs::stale_docs(root, &options).render()
+    );
+    Ok(())
+}

@@ -103,6 +103,56 @@ re-read the entry against the code, never an error.
   git is missing, the project is not a checkout, or the call times out, the entry
   is shown without a label and the degraded mode `doc-sync-unknown` says why.
 
+## What needs updating (`stale_docs`)
+
+`get_doc_context` labels one entry. To find the entries that drifted, and what
+the code did, call the MCP tool `stale_docs` or run `infigraph stale-docs`; it
+reads, it never writes (infigraph does not author prose, and the Markdown is the
+source of truth), so the answer is where to edit and why:
+
+```
+Stale docs: 842 of 4008 entries possibly stale (exact git blame of 4008 entries); showing the 20 ...
+
+1. src/app.py::compute_total -- entry docs/glossary/src.md:3-5
+   possibly stale: code changed 2026-10-11 49fb64ee, entry last touched 2026-09-25 d75b2d88 (code at src/app.py:1-5)
+   what changed since the entry:
+   49fb64ee 2026-10-11 tighten rounding
+     @@ -3,1 +3,1 @@
+     -        total += item
+     +        total += item * 2
+```
+
+- **Arguments.** `path_prefix` keeps the entries whose symbol's file or whose
+  document lies under it (whole path components, as in the other analysis
+  tools: `PathScope`); `symbol` names one id and gets a fuller history; `limit`
+  (default 20) cuts the list, ranked by the gap between the code's newest
+  change and the entry's, biggest first. There is no `since`: the gap already
+  orders the list and the entry's own commit is the baseline.
+- **What changed** is `git log -L start,end:file <entry commit>..HEAD`: the
+  commits after the entry that touched the symbol's lines, with their patches
+  cut to those lines (changed lines and one around them; `...` marks the rest).
+  Uncommitted edits to those lines are listed first. `git log -L` reads line
+  numbers at HEAD, so a file with uncommitted edits is mapped back first
+  (`git diff -U0 HEAD`). Measured on sittir: 0.03s per entry.
+- **Caps.** A list shows 3 commits and 900 characters per entry; one `symbol`
+  shows 10 and 6,000. What is cut says so: `(truncated: older commits not
+  shown)`, `(truncated: patch cut at N chars)`.
+- **Budget.** The whole-project call judges exactly for 30 seconds (`doctor
+  --docs-sync` allows 120) and judges the rest per file, which under-reports and
+  is said to; on sittir the whole project takes 17-27s, a `path_prefix` subtree
+  about 6s and one `symbol` under 2s.
+- **Degraded, not silent.** No document index: the report says so. Not a
+  checkout, git missing or timing out: the entries are listed as not judged and
+  the degraded mode `doc-sync-unknown` is set. A key whose symbol is gone is
+  counted and left to `doctor`.
+- **One judgement.** `doctor --docs-sync` and the tool both call
+  `stale_docs::judge` (and `get_doc_context` the same `git_blame::compare`), so
+  their counts agree. All git access is in `infigraph_core::git_blame`, the one
+  place to replace if history is ever kept in the graph.
+
+After editing an entry, the document watcher refreshes the index, or call
+`reindex_docs`.
+
 ## `infigraph doctor`
 
 `doctor` always checks the keys: every documents key must resolve to a live

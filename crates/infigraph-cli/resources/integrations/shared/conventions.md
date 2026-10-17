@@ -8,6 +8,7 @@
 
 ### Workflows
 - **Find code:** `search`, then `get_code_snippet` or `symbol_context` for one symbol's detail.
+- **Keep docs in step:** `get_doc_context` shows a symbol's glossary entry and a "possibly stale" label. After changing code that has an entry, `stale_docs` (`path_prefix` or `symbol`) lists the entries that drifted and the commits and lines that changed; edit the entry in the Markdown (the tool never writes), then the doc watcher refreshes the index, or call `reindex_docs`.
 - **Onboarding:** `list_projects` (don't re-index what is already indexed), then `index_project`, `get_architecture`, `get_stats`.
 - **Multi-repo:** `group_create`, `group_add` for each repo, `group_index`, `group_sync`, `group_link`.
 

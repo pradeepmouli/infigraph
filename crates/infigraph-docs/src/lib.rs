@@ -15,6 +15,7 @@ pub mod ops;
 pub mod pipelines;
 pub mod query;
 pub mod search;
+pub mod stale_docs;
 pub mod store;
 pub mod watch;
 
