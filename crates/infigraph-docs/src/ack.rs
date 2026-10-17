@@ -120,6 +120,15 @@ pub fn plan(root: &Path, targets: &[String]) -> Result<AckPlan> {
         .map_or(0, |d| d.as_secs() as i64);
     for target in with_entry {
         let Some(symbol) = live.get(target) else {
+            if target.ends_with("::module") {
+                report.refused.push((
+                    target.clone(),
+                    "a file's notes entry has no symbol lines to review against: edit it, or \
+                     leave it"
+                        .to_string(),
+                ));
+                continue;
+            }
             report.refused.push((
                 target.clone(),
                 format!(

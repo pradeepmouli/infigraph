@@ -358,6 +358,17 @@ pub(crate) fn live_symbols(root: &Path, keys: &[&str]) -> Result<HashMap<String,
     observed.with_exec(|exec| resolve(exec, keys).0)
 }
 
+/// Whether `key` resolves the way `doctor` judges it: a symbol the graph has,
+/// or a `<file>::module` key whose file the graph has.
+pub(crate) fn key_is_live(root: &Path, key: &str) -> Result<bool> {
+    let graph_path = root.join(".infigraph").join("graph");
+    let observed = ObservedGraph::open(root, &graph_path)?;
+    observed.with_exec(|exec| {
+        let (live, modules) = resolve(exec, &[key]);
+        live.contains_key(key) || modules.iter().any(|m| m == key)
+    })
+}
+
 /// Every check of one project's document links; empty when the project has no
 /// documents or no links to check. `docs_sync` adds the git-based sync check.
 pub fn check_project(root: &Path, docs_sync: bool) -> Vec<CheckResult> {

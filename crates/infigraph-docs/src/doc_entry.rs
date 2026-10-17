@@ -288,8 +288,10 @@ fn require(root: &Path, target: &str) -> Result<Located> {
         .with_context(|| format!("no glossary entry is keyed to `{target}` (create one first)"))
 }
 
+/// Whether `target` resolves as `doctor` judges it: a symbol in the graph, or
+/// a `<file>::module` key whose file is.
 fn symbol_is_live(root: &Path, target: &str) -> Result<bool> {
-    Ok(link_check::live_symbols(root, &[target])?.contains_key(target))
+    link_check::key_is_live(root, target)
 }
 
 // ---- editing lines ------------------------------------------------------

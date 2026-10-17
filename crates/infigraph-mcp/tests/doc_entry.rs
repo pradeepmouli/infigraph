@@ -525,6 +525,47 @@ fn an_unknown_op_or_a_missing_argument_says_what_is_needed() {
     assert!(refused(dir.path(), json!({"op": "rekey", "target": TOTAL})).contains("new_target"));
 }
 
+/// A `<file>::module` key is live while the graph has the file (the rule
+/// `doctor` applies), so an entry can be created, rekeyed to, and kept for one.
+#[test]
+fn a_module_key_is_live_while_its_file_is_in_the_graph() {
+    let dir = project();
+    let notes = "lib/util.py::module";
+
+    ok(
+        dir.path(),
+        json!({"op": "create", "target": notes, "text": "Helpers.", "apply": true}),
+    );
+    assert!(file(dir.path(), "docs/glossary/lib.md").contains("### `lib/util.py::module`"));
+
+    let gone = refused(
+        dir.path(),
+        json!({"op": "create", "target": "lib/gone.py::module", "text": "Nothing."}),
+    );
+    assert!(
+        gone.contains("not in the graph") && gone.contains("lib/gone.py"),
+        "{gone}"
+    );
+
+    let rekey = ok(
+        dir.path(),
+        json!({"op": "rekey", "target": "lib/util.py::other", "new_target": "lib/more.py::module"}),
+    );
+    assert!(rekey.contains("dry run"), "{rekey}");
+    let nowhere = refused(
+        dir.path(),
+        json!({"op": "rekey", "target": "lib/util.py::other", "new_target": "lib/gone.py::module"}),
+    );
+    assert!(nowhere.contains("not in the graph"), "{nowhere}");
+
+    let delete = refused(dir.path(), json!({"op": "delete", "target": notes}));
+    assert!(delete.contains("still in the graph"), "{delete}");
+
+    // A file's notes have no symbol lines, so there is nothing to review them against.
+    let review = ok(dir.path(), json!({"op": "ack", "target": notes}));
+    assert!(review.contains("no symbol lines"), "{review}");
+}
+
 #[test]
 fn the_guard_still_blocks_an_edit_to_an_entry_the_tool_just_rewrote() {
     let dir = project();
