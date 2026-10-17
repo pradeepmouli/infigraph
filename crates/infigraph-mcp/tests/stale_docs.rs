@@ -9,6 +9,7 @@ use std::path::Path;
 use serde_json::{json, Value};
 
 use infigraph_mcp::tools::doc_sync::tool_stale_docs;
+use infigraph_mcp::tools::graph::tool_get_doc_context;
 
 mod support;
 
@@ -257,4 +258,40 @@ fn doctor_and_the_tool_judge_the_same_entries() {
         "{}\n{out}",
         sync.message
     );
+}
+
+#[test]
+fn get_doc_context_and_the_tool_give_the_same_verdict_for_each_entry() {
+    let dir = committed_project();
+    change_total(
+        dir.path(),
+        "total += item\n",
+        "total += item * 2\n",
+        "2024-06-01T00:00:00Z",
+        "double every item",
+    );
+    let listed = stale_docs(dir.path(), json!({}));
+    let context = |symbol: &str| {
+        tool_get_doc_context(&json!({
+            "path": dir.path().to_string_lossy(),
+            "symbol_id": symbol,
+        }))
+        .unwrap()
+    };
+
+    for (symbol, stale) in [
+        ("src/app.py::compute_total", true),
+        ("src/app.py::Cart::add", false),
+    ] {
+        assert_eq!(
+            context(symbol).contains("possibly stale: code changed 2024-06-01"),
+            stale,
+            "get_doc_context disagrees about {symbol}"
+        );
+        assert_eq!(
+            listed.contains(&format!("{symbol} -- entry")),
+            stale,
+            "stale_docs disagrees about {symbol}:\n{listed}"
+        );
+    }
 }

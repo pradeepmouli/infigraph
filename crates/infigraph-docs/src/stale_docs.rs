@@ -1,10 +1,9 @@
 //! Which glossary entries describe code that changed after they did, and what
 //! changed, so an agent knows what to edit in the markdown.
 //!
-//! This is the one judgement. `get_doc_context` labels a single entry from the
-//! same comparison (`infigraph_core::git_blame::compare`), `doctor --docs-sync`
-//! counts with [`judge`], and the `stale_docs` tool and command list with
-//! [`stale_docs`]; none keeps its own. The tool is read-only: infigraph never
+//! This is the one judgement. `get_doc_context` labels a single entry and
+//! `doctor --docs-sync` counts, both through [`verdict`], and the `stale_docs`
+//! tool and command list with [`stale_docs`]; none keeps its own. The tool is read-only: infigraph never
 //! writes prose, so the report says where the entry is and what the code did,
 //! and the markdown is edited by whoever reads it. The document index then
 //! refreshes through `reindex_docs` or the doc watcher as it does for any edit.
@@ -97,6 +96,16 @@ pub(crate) fn rank(judged: &[Judged]) -> Vec<&Judged> {
     stale
 }
 
+/// Whether the entry for `target` is current, given the newest change to its
+/// code and to its text. The one place the rule lives: [`judge`] (the tool and
+/// `doctor --docs-sync`) and `linked::judge_entries` (`get_doc_context`) both
+/// ask it, so anything that decides an entry is current regardless of git
+/// history belongs here. `target` is the entry's key, which such a decision
+/// would be recorded against.
+pub(crate) fn verdict(_target: &str, code: &RangeBlame, entry: &RangeBlame) -> SyncState {
+    git_blame::compare(code, entry)
+}
+
 /// The outcome of [`judge`].
 pub(crate) struct Judgement {
     pub judged: Vec<Judged>,
@@ -185,7 +194,7 @@ pub(crate) fn judge(
                 doc_file: row.doc_file.clone(),
                 doc_lines: (row.line_start, row.line_end),
                 live: live.clone(),
-                state: git_blame::compare(&code, &entry),
+                state: verdict(&row.target, &code, &entry),
                 exact: is_exact,
             }),
             None => unknown += 1,
@@ -632,6 +641,17 @@ mod tests {
             out.contains("what changed: unknown (git did not answer in time)"),
             "{out}"
         );
+    }
+
+    #[test]
+    fn the_verdict_is_possibly_stale_only_when_the_code_is_newer_than_the_entry() {
+        let (old, new) = (at("a", 100), at("b", 200));
+        assert!(matches!(
+            verdict("src/a.py::f", &new, &old),
+            SyncState::PossiblyStale { .. }
+        ));
+        assert_eq!(verdict("src/a.py::f", &old, &new), SyncState::InSync);
+        assert_eq!(verdict("src/a.py::f", &new, &new), SyncState::InSync);
     }
 
     #[test]

@@ -22,6 +22,7 @@ use infigraph_core::git_blame::{self, BlameError, GIT_TIMEOUT};
 use infigraph_core::graph::GraphBackend;
 
 use crate::code_links::{is_file_form, CodeLinkRow, LinkKind, CODE_LINKS_VERSION};
+use crate::stale_docs::verdict;
 use crate::DocIndex;
 
 /// An entry longer than this many characters is cut, and says so.
@@ -245,7 +246,7 @@ pub fn lookup(
         found.mentions = mentions;
     }
 
-    judge_entries(root, file, lines, &mut found);
+    judge_entries(root, symbol_id, file, lines, &mut found);
 
     found.unscanned = unscanned_documents(store);
     match found.unscanned {
@@ -261,7 +262,13 @@ pub fn lookup(
 /// after the entry's did. Git is asked for those two ranges only. A failure
 /// is the degraded mode `doc-sync-unknown` for this call: no entry is called
 /// current or stale, and nothing waits longer than the git timeout.
-fn judge_entries(root: &Path, file: &str, lines: (usize, usize), found: &mut LinkedDocs) {
+fn judge_entries(
+    root: &Path,
+    symbol_id: &str,
+    file: &str,
+    lines: (usize, usize),
+    found: &mut LinkedDocs,
+) {
     if found.entries.is_empty() {
         return;
     }
@@ -273,7 +280,7 @@ fn judge_entries(root: &Path, file: &str, lines: (usize, usize), found: &mut Lin
             &[(entry.line_start, entry.line_end)],
             GIT_TIMEOUT,
         )?;
-        Ok(git_blame::compare(&code[0], &doc[0]).label())
+        Ok(verdict(symbol_id, &code[0], &doc[0]).label())
     };
     let mut failure = None;
     for entry in &mut found.entries {
