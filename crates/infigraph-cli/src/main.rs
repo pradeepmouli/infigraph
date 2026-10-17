@@ -527,6 +527,11 @@ enum Commands {
         apply: bool,
     },
 
+    /// Pre-edit hook (internal): reads one tool call as JSON on stdin and, when
+    /// it would edit a glossary entry by hand, prints the deny decision
+    #[command(hide = true)]
+    DocGuard,
+
     /// Index Confluence pages into the document graph (fetch, parse, chunk, embed)
     IndexConfluence {
         /// Confluence base URL (e.g. https://confluence.example.com)
@@ -1170,6 +1175,13 @@ fn main() -> Result<()> {
         .stack_size(32 * 1024 * 1024)
         .build_global();
 
+    // A pre-edit hook runs on every Markdown edit: answer at once, with no
+    // update check, no settings validation and no worker thread.
+    if std::env::args().nth(1).as_deref() == Some("doc-guard") {
+        cmd_doc_guard();
+        return Ok(());
+    }
+
     let update_handle = install::check_for_update_background();
 
     let cli = Cli::parse();
@@ -1322,6 +1334,10 @@ fn run(command: Commands, root: &Path) -> Result<()> {
             limit,
         } => cmd_stale_docs(root, path_prefix.as_deref(), symbol, limit),
         Commands::DocEntry { op, apply } => cmd_doc_entry(root, op, apply),
+        Commands::DocGuard => {
+            cmd_doc_guard();
+            Ok(())
+        }
         Commands::IndexConfluence {
             base_url,
             space,

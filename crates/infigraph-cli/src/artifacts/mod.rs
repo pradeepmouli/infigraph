@@ -961,7 +961,7 @@ resolver = ["./resolve-zed-path.sh"]
         .unwrap();
 
         for (event, expected_count) in [
-            ("PreToolUse", 2),
+            ("PreToolUse", 3),
             ("PostToolUse", 5),
             ("UserPromptSubmit", 3),
             ("SessionStart", 1),
@@ -982,6 +982,61 @@ resolver = ["./resolve-zed-path.sh"]
             .as_str()
             .unwrap();
         assert!(enforce_command.contains("infigraph-enforce.sh"));
+    }
+
+    #[test]
+    fn the_doc_guard_hook_installs_beside_the_enforcement_hook_and_uninstalls_with_it() {
+        let user_dir = tempfile::tempdir().unwrap();
+        let home_dir = tempfile::tempdir().unwrap();
+        let home = home_dir.path();
+        let mcp_path = "/opt/infigraph/bin/infigraph-mcp";
+        let artifacts =
+            discover_artifacts(BUNDLED_INTEGRATIONS, user_dir.path(), mcp_path).unwrap();
+        let find = |relative: &str| {
+            artifacts
+                .iter()
+                .find(|a| a.target_relative_path.as_deref() == Some(relative))
+                .unwrap_or_else(|| panic!("{relative} should be discovered"))
+        };
+        let (settings, script) = (
+            find(".claude/settings.json"),
+            find(".claude/hooks/infigraph-doc-guard.sh"),
+        );
+
+        apply_resolved_artifact(settings, home, mcp_path, false).unwrap();
+        apply_resolved_artifact(script, home, mcp_path, false).unwrap();
+
+        let installed: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(home.join(".claude/settings.json")).unwrap(),
+        )
+        .unwrap();
+        let guard = installed["hooks"]["PreToolUse"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| {
+                e["hooks"][0]["command"]
+                    .as_str()
+                    .unwrap()
+                    .contains("doc-guard")
+            })
+            .expect("the doc guard is a PreToolUse entry");
+        assert_eq!(guard["matcher"], "Write|Edit|MultiEdit");
+        let enforce = installed["hooks"]["PreToolUse"][0]["matcher"]
+            .as_str()
+            .unwrap();
+        assert!(
+            !enforce.contains("MultiEdit"),
+            "the guard is its own entry, not a widening of the enforcement hook's matcher"
+        );
+        assert!(home.join(".claude/hooks/infigraph-doc-guard.sh").is_file());
+
+        remove_resolved_artifact(settings, home, mcp_path).unwrap();
+        remove_resolved_artifact(script, home, mcp_path).unwrap();
+
+        let left = std::fs::read_to_string(home.join(".claude/settings.json")).unwrap_or_default();
+        assert!(!left.contains("doc-guard"), "{left}");
+        assert!(!home.join(".claude/hooks/infigraph-doc-guard.sh").exists());
     }
 
     #[cfg(unix)]
@@ -1098,6 +1153,10 @@ resolver = ["./resolve-zed-path.sh"]
             (
                 ".claude/hooks/infigraph-search-fallback-sentinel.sh",
                 "search-fallback-allowed",
+            ),
+            (
+                ".claude/hooks/infigraph-doc-guard.sh",
+                "infigraph doc-guard",
             ),
         ] {
             let artifact = artifacts

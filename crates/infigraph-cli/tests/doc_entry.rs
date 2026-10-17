@@ -152,3 +152,95 @@ fn a_refusal_is_a_failed_command_that_says_why() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+/// The hook script as installed: Markdown edits reach `infigraph doc-guard`,
+/// everything else passes without running it.
+#[cfg(unix)]
+mod hook_script {
+    use super::*;
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    fn jq_available() -> bool {
+        Command::new("jq")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success())
+    }
+
+    /// The script's stdout for `input`, with the freshly built `infigraph` first
+    /// on PATH.
+    fn hook(input: &serde_json::Value) -> String {
+        let script = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/resources/integrations/claude-code/.claude/hooks/infigraph-doc-guard.sh"
+        );
+        let bin_dir = std::path::Path::new(env!("CARGO_BIN_EXE_infigraph"))
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let path = format!(
+            "{}:{}",
+            bin_dir.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let mut child = Command::new("bash")
+            .arg(script)
+            .env("PATH", path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.to_string().as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success(), "the hook must never fail");
+        String::from_utf8_lossy(&out.stdout).to_string()
+    }
+
+    #[test]
+    fn the_script_denies_an_entry_edit_and_passes_everything_else() {
+        if !jq_available() {
+            eprintln!("jq is not installed: the hook script needs it, skipping");
+            return;
+        }
+        let (project, home) = stale_project();
+        let root = project.path();
+        assert_ok(
+            &run(
+                root,
+                home.path(),
+                infigraph_core::LOCAL_BACKEND,
+                &["index-docs"],
+            ),
+            "index-docs",
+        );
+        let edit = |file: &str, old: &str| {
+            serde_json::json!({
+                "tool_name": "Edit", "cwd": root,
+                "tool_input": {"file_path": root.join(file), "old_string": old, "new_string": "x"},
+            })
+        };
+
+        let denied = hook(&edit("docs/g.md", "Why f."));
+        let decision: serde_json::Value = serde_json::from_str(denied.trim())
+            .unwrap_or_else(|e| panic!("not a decision ({e}): {denied:?}"));
+        let out = &decision["hookSpecificOutput"];
+        assert_eq!(out["hookEventName"], "PreToolUse");
+        assert_eq!(out["permissionDecision"], "deny");
+        let why = out["permissionDecisionReason"].as_str().unwrap();
+        assert!(
+            why.contains("app.py::f") && why.contains("doc_entry"),
+            "{why}"
+        );
+
+        assert_eq!(hook(&edit("docs/g.md", "# G")), "", "outside every entry");
+        assert_eq!(hook(&edit("app.py", "return 2")), "", "not Markdown");
+        assert_eq!(hook(&serde_json::json!({"tool_name": "Bash"})), "");
+    }
+}

@@ -216,6 +216,33 @@ fn prose(text: Option<String>, file: Option<std::path::PathBuf>) -> Result<Strin
     }
 }
 
+/// `infigraph doc-guard`: the pre-edit hook's decision. Reads the tool call as
+/// JSON on stdin and prints the deny decision (Claude Code's `PreToolUse`
+/// output) when it would edit a glossary entry by hand. Prints nothing, and
+/// never fails, otherwise: a guard that cannot decide allows.
+pub(crate) fn cmd_doc_guard() {
+    use std::io::Read;
+    let mut input = String::new();
+    if std::io::stdin().read_to_string(&mut input).is_err() {
+        return;
+    }
+    let Ok(call) = serde_json::from_str::<serde_json::Value>(&input) else {
+        return;
+    };
+    if let infigraph_docs::doc_guard::Decision::Deny(reason) =
+        infigraph_docs::doc_guard::decide(&call)
+    {
+        println!(
+            "{}",
+            serde_json::json!({"hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": reason,
+            }})
+        );
+    }
+}
+
 /// `infigraph doc-entry`: the same operations as the MCP `doc_entry` tool.
 pub(crate) fn cmd_doc_entry(root: &Path, op: crate::DocEntryOp, apply: bool) -> Result<()> {
     use crate::DocEntryOp as O;

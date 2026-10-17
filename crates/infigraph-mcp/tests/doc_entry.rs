@@ -524,3 +524,42 @@ fn an_unknown_op_or_a_missing_argument_says_what_is_needed() {
     .contains("new"));
     assert!(refused(dir.path(), json!({"op": "rekey", "target": TOTAL})).contains("new_target"));
 }
+
+#[test]
+fn the_guard_still_blocks_an_edit_to_an_entry_the_tool_just_rewrote() {
+    let dir = project();
+
+    // The tool writes the file itself (a write of the infigraph process, not a
+    // tool call the hook sees), and is not stopped by the guard.
+    ok(
+        dir.path(),
+        json!({
+            "op": "edit", "target": TOTAL, "old": "not with sum()", "new": "rather than sum()",
+            "apply": true,
+        }),
+    );
+    assert!(file(dir.path(), "docs/glossary/src.md").contains("rather than sum()"));
+
+    // An agent's own Edit of that entry is what the guard denies, and it names
+    // the tool to use instead.
+    let call = |old: &str| {
+        infigraph_docs::doc_guard::decide(&json!({
+            "tool_name": "Edit", "cwd": dir.path(),
+            "tool_input": {
+                "file_path": dir.path().join("docs/glossary/src.md"),
+                "old_string": old, "new_string": "x",
+            },
+        }))
+    };
+    match call("rather than sum()") {
+        infigraph_docs::doc_guard::Decision::Deny(why) => {
+            assert!(why.contains(TOTAL) && why.contains("doc_entry"), "{why}")
+        }
+        other => panic!("the entry was editable by hand: {other:?}"),
+    }
+    assert_eq!(
+        call("# Glossary"),
+        infigraph_docs::doc_guard::Decision::Allow,
+        "an edit outside every entry must pass"
+    );
+}
