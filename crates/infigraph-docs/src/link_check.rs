@@ -274,7 +274,10 @@ fn sync_result(
 ) -> CheckResult {
     let name = format!("{}: doc/code sync", root.display());
     let Judgement {
-        judged, unknown, ..
+        judged,
+        unknown,
+        ack_error,
+        ..
     } = judge(root, entries, started, budget);
 
     let stale = |exact: bool| {
@@ -293,6 +296,16 @@ fn sync_result(
         n_exact,
         n_exact
     );
+    let acknowledged = judged.iter().filter(|j| j.acknowledged).count();
+    if acknowledged > 0 {
+        message.push_str(&format!("; {acknowledged} acknowledged"));
+    }
+    if let Some(why) = ack_error {
+        message.push_str(&format!(
+            "\n  acknowledgements could not be read ({why}): entries a reviewer cleared may be \
+             listed"
+        ));
+    }
     if n_coarse > 0 {
         message.push_str(&format!(
             "\n  plus {} of {} entries judged per file because the {}s budget ran out or git \
@@ -343,6 +356,17 @@ pub(crate) fn live_symbols(root: &Path, keys: &[&str]) -> Result<HashMap<String,
     let graph_path = root.join(".infigraph").join("graph");
     let observed = ObservedGraph::open(root, &graph_path)?;
     observed.with_exec(|exec| resolve(exec, keys).0)
+}
+
+/// Whether `key` resolves the way `doctor` judges it: a symbol the graph has,
+/// or a `<file>::module` key whose file the graph has.
+pub(crate) fn key_is_live(root: &Path, key: &str) -> Result<bool> {
+    let graph_path = root.join(".infigraph").join("graph");
+    let observed = ObservedGraph::open(root, &graph_path)?;
+    observed.with_exec(|exec| {
+        let (live, modules) = resolve(exec, &[key]);
+        live.contains_key(key) || modules.iter().any(|m| m == key)
+    })
 }
 
 /// Every check of one project's document links; empty when the project has no

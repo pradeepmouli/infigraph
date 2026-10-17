@@ -197,6 +197,106 @@ pub(crate) fn cmd_search_docs(root: &Path, query: &str, limit: usize) -> Result<
     Ok(())
 }
 
+/// The prose for `replace` and `create`: `--text`, or `--text-file` ('-' is
+/// stdin).
+fn prose(text: Option<String>, file: Option<std::path::PathBuf>) -> Result<String> {
+    match (text, file) {
+        (Some(text), _) => Ok(text),
+        (None, Some(path)) if path.as_os_str() == "-" => {
+            use std::io::Read;
+            let mut buf = String::new();
+            std::io::stdin()
+                .read_to_string(&mut buf)
+                .context("cannot read the text from stdin")?;
+            Ok(buf)
+        }
+        (None, Some(path)) => std::fs::read_to_string(&path)
+            .with_context(|| format!("cannot read {}", path.display())),
+        (None, None) => anyhow::bail!("this needs the prose: --text <TEXT> or --text-file <FILE>"),
+    }
+}
+
+/// `infigraph doc-guard`: the pre-edit hook's decision. Reads the tool call as
+/// JSON on stdin and prints the deny decision (Claude Code's `PreToolUse`
+/// output) when it would edit a glossary entry by hand. Prints nothing, and
+/// never fails, otherwise: a guard that cannot decide allows.
+pub(crate) fn cmd_doc_guard() {
+    use std::io::Read;
+    let mut input = String::new();
+    if std::io::stdin().read_to_string(&mut input).is_err() {
+        return;
+    }
+    let Ok(call) = serde_json::from_str::<serde_json::Value>(&input) else {
+        return;
+    };
+    if let infigraph_docs::doc_guard::Decision::Deny(reason) =
+        infigraph_docs::doc_guard::decide(&call)
+    {
+        println!(
+            "{}",
+            serde_json::json!({"hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": reason,
+            }})
+        );
+    }
+}
+
+/// `infigraph doc-entry`: the same operations as the MCP `doc_entry` tool.
+pub(crate) fn cmd_doc_entry(root: &Path, op: crate::DocEntryOp, apply: bool) -> Result<()> {
+    use crate::DocEntryOp as O;
+    use infigraph_docs::doc_entry::Op;
+    let op = match op {
+        O::Edit {
+            target,
+            old,
+            new,
+            replace_all,
+        } => Op::Edit {
+            target,
+            old,
+            new,
+            replace_all,
+        },
+        O::Replace {
+            target,
+            text,
+            text_file,
+            section,
+        } => Op::Replace {
+            target,
+            text: prose(text, text_file)?,
+            section,
+        },
+        O::Create {
+            target,
+            text,
+            text_file,
+            doc_file,
+        } => Op::Create {
+            target,
+            text: prose(text, text_file)?,
+            doc_file,
+        },
+        O::Rekey {
+            target,
+            new_target,
+            force,
+            ack,
+        } => Op::Rekey {
+            target,
+            new_target,
+            force,
+            ack,
+        },
+        O::Delete { target, force } => Op::Delete { target, force },
+        O::Ack { targets } => Op::Ack { targets },
+    };
+    print!("{}", infigraph_docs::doc_entry::run(root, &op, apply)?);
+    Ok(())
+}
+
 /// `infigraph stale-docs`: the same report as the MCP `stale_docs` tool.
 pub(crate) fn cmd_stale_docs(
     root: &Path,

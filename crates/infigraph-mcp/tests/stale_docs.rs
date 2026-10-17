@@ -8,6 +8,7 @@ use std::path::Path;
 
 use serde_json::{json, Value};
 
+use infigraph_docs::ack::acknowledge;
 use infigraph_mcp::tools::doc_sync::tool_stale_docs;
 use infigraph_mcp::tools::graph::tool_get_doc_context;
 
@@ -294,4 +295,148 @@ fn get_doc_context_and_the_tool_give_the_same_verdict_for_each_entry() {
             "stale_docs disagrees about {symbol}:\n{listed}"
         );
     }
+}
+
+const TOTAL: &str = "src/app.py::compute_total";
+
+fn double_every_item(dir: &Path) {
+    change_total(
+        dir,
+        "total += item\n",
+        "total += item * 2\n",
+        "2024-06-01T00:00:00Z",
+        "double every item",
+    );
+}
+
+fn context(dir: &Path, symbol: &str) -> String {
+    tool_get_doc_context(&json!({
+        "path": dir.to_string_lossy(),
+        "symbol_id": symbol,
+    }))
+    .unwrap()
+}
+
+#[test]
+fn a_reviewed_entry_is_current_until_its_code_changes_again() {
+    let dir = committed_project();
+    double_every_item(dir.path());
+    assert!(stale_docs(dir.path(), json!({})).contains("1 of 2 entries possibly stale"));
+
+    let report = acknowledge(dir.path(), &[TOTAL.to_string()]).unwrap();
+    assert_eq!(report.acked, [TOTAL], "{report:?}");
+    assert!(report.refused.is_empty(), "{report:?}");
+
+    let after = stale_docs(dir.path(), json!({}));
+    assert!(after.contains("0 of 2 entries possibly stale"), "{after}");
+    assert!(after.contains("1 acknowledged"), "{after}");
+    assert!(
+        !context(dir.path(), TOTAL).contains("possibly stale"),
+        "get_doc_context still labels a reviewed entry"
+    );
+
+    // The code moves on after the review: the entry is stale again.
+    change_total(
+        dir.path(),
+        "total += item * 2\n",
+        "total += item * 3\n",
+        "2024-07-01T00:00:00Z",
+        "triple every item",
+    );
+    let again = stale_docs(dir.path(), json!({}));
+    assert!(again.contains("1 of 2 entries possibly stale"), "{again}");
+    assert!(again.contains("triple every item"), "{again}");
+    assert!(context(dir.path(), TOTAL).contains("possibly stale"));
+}
+
+#[test]
+fn doctor_counts_a_reviewed_entry_as_current_too() {
+    let dir = committed_project();
+    double_every_item(dir.path());
+    acknowledge(dir.path(), &[TOTAL.to_string()]).unwrap();
+
+    let report = infigraph_docs::link_check::check_project(dir.path(), true);
+    let sync = report
+        .iter()
+        .find(|c| c.name.ends_with("doc/code sync"))
+        .unwrap();
+
+    assert!(
+        sync.message.contains("0 of 2 entries possibly stale"),
+        "{}",
+        sync.message
+    );
+}
+
+#[test]
+fn a_review_survives_a_full_reindex_of_the_documents() {
+    let dir = committed_project();
+    double_every_item(dir.path());
+    acknowledge(dir.path(), &[TOTAL.to_string()]).unwrap();
+
+    infigraph_docs::ops::index_docs(dir.path(), true).unwrap();
+
+    let out = stale_docs(dir.path(), json!({}));
+    assert!(out.contains("0 of 2 entries possibly stale"), "{out}");
+}
+
+#[test]
+fn a_review_of_code_with_uncommitted_edits_is_refused() {
+    let dir = committed_project();
+    write(
+        dir.path(),
+        "src/app.py",
+        &APP.replace("return total", "return total + 1"),
+    );
+    reindex_code(dir.path());
+
+    let report = acknowledge(dir.path(), &[TOTAL.to_string()]).unwrap();
+
+    assert!(report.acked.is_empty(), "{report:?}");
+    assert_eq!(report.refused.len(), 1, "{report:?}");
+    assert!(
+        report.refused[0].1.contains("uncommitted"),
+        "{:?}",
+        report.refused
+    );
+    assert!(stale_docs(dir.path(), json!({})).contains("1 of 2 entries possibly stale"));
+}
+
+#[test]
+fn a_review_names_why_a_target_cannot_be_recorded() {
+    let dir = committed_project();
+
+    let report = acknowledge(
+        dir.path(),
+        &[
+            "src/app.py::nothing_here".to_string(),
+            "src/app.py::Cart".to_string(),
+        ],
+    )
+    .unwrap();
+
+    assert!(report.acked.is_empty(), "{report:?}");
+    let reasons: Vec<&str> = report.refused.iter().map(|(_, r)| r.as_str()).collect();
+    assert!(
+        reasons.iter().all(|r| r.contains("no glossary entry")),
+        "{reasons:?}"
+    );
+    assert_eq!(report.refused.len(), 2);
+}
+
+#[test]
+fn a_review_of_an_entry_whose_symbol_is_gone_is_refused() {
+    let dir = project(&[(
+        "docs/glossary/src.md",
+        "# G\n\n### `src/app.py::gone`\n\nIt was here.\n",
+    )]);
+
+    let report = acknowledge(dir.path(), &["src/app.py::gone".to_string()]).unwrap();
+
+    assert!(report.acked.is_empty());
+    assert!(
+        report.refused[0].1.contains("no longer"),
+        "{:?}",
+        report.refused
+    );
 }

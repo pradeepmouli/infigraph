@@ -32,6 +32,7 @@ use crate::code_links::{CodeLinkRow, LinkKind};
 use crate::extract::ExtractedDoc;
 // The one Cypher escaper, shared with infigraph-core: this crate used to
 // carry a quote-only copy, which silently dropped backslashes.
+use infigraph_core::daemon_protocol::DocAck;
 use infigraph_core::escape_str;
 
 /// Whether `table` exists in the catalog. `table` is a `Pipeline_<plugin_id>`
@@ -230,6 +231,7 @@ impl DocStore {
         for ddl in CREATE_SCHEMA
             .iter()
             .chain(crate::code_link_store::CODE_LINK_DDL.iter())
+            .chain(std::iter::once(&crate::ack_store::DOC_ACK_DDL))
         {
             conn.query(ddl)
                 .map_err(|e| anyhow::anyhow!("schema DDL failed: {e}"))?;
@@ -868,6 +870,20 @@ impl DocBackend for DocStore {
     fn code_link_scans(&self) -> Result<HashMap<String, i64>> {
         let conn = self.connection()?;
         crate::query::DocQuery::new(&conn).code_link_scans()
+    }
+
+    fn doc_acks(&self, targets: &[String]) -> Result<HashMap<String, DocAck>> {
+        let conn = self.connection()?;
+        crate::query::DocQuery::new(&conn).doc_acks(targets)
+    }
+
+    fn all_doc_acks(&self) -> Result<Vec<DocAck>> {
+        let conn = self.connection()?;
+        crate::query::DocQuery::new(&conn).all_doc_acks()
+    }
+
+    fn upsert_acks(&self, acks: &[DocAck], drop: &[String]) -> Result<(usize, usize)> {
+        self.upsert_acks(acks, drop)
     }
 
     fn delete_pipelines_for_docs(&self, doc_ids: &[&str]) -> Result<()> {

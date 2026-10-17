@@ -60,6 +60,69 @@ struct Cli {
     command: Commands,
 }
 
+/// What `doc-entry` does to an entry.
+#[derive(clap::Subcommand, Debug)]
+pub(crate) enum DocEntryOp {
+    /// Change OLD to NEW inside the entry (OLD must match once)
+    Edit {
+        /// The entry's symbol id, e.g. src/app.py::compute_total
+        target: String,
+        #[arg(long)]
+        old: String,
+        #[arg(long)]
+        new: String,
+        /// Change every match, inside the entry only
+        #[arg(long)]
+        replace_all: bool,
+    },
+    /// Replace the entry's lead text (or the block under one sub-heading)
+    Replace {
+        target: String,
+        /// The prose (or use --text-file; '-' reads stdin)
+        #[arg(long, conflicts_with = "text_file")]
+        text: Option<String>,
+        #[arg(long)]
+        text_file: Option<PathBuf>,
+        /// A sub-heading of the entry whose block to replace
+        #[arg(long)]
+        section: Option<String>,
+    },
+    /// Add an entry for a symbol that has none
+    Create {
+        target: String,
+        #[arg(long, conflicts_with = "text_file")]
+        text: Option<String>,
+        #[arg(long)]
+        text_file: Option<PathBuf>,
+        /// The document (relative path) that gets the entry
+        #[arg(long)]
+        doc_file: Option<String>,
+    },
+    /// Point an entry at another key (a renamed or moved symbol)
+    Rekey {
+        target: String,
+        new_target: String,
+        /// Rekey even when the new key does not resolve
+        #[arg(long)]
+        force: bool,
+        /// Also record the entry as reviewed against the new symbol
+        #[arg(long)]
+        ack: bool,
+    },
+    /// Remove an entry whose symbol is gone
+    Delete {
+        target: String,
+        /// Delete even though the symbol still exists
+        #[arg(long)]
+        force: bool,
+    },
+    /// Record entries as reviewed against their symbols as they are now
+    Ack {
+        #[arg(required = true)]
+        targets: Vec<String>,
+    },
+}
+
 #[derive(Subcommand)]
 enum Commands {
     /// Initialize infigraph in the current project
@@ -452,6 +515,22 @@ enum Commands {
         #[arg(short, long, default_value = "20")]
         limit: usize,
     },
+
+    /// Edit a glossary entry mechanically (you supply the prose): edit, replace,
+    /// create, rekey, delete, or ack (record it as reviewed). Dry run unless
+    /// --apply
+    DocEntry {
+        #[command(subcommand)]
+        op: DocEntryOp,
+        /// Write the change and refresh the document index (default: show the diff)
+        #[arg(long, global = true)]
+        apply: bool,
+    },
+
+    /// Pre-edit hook (internal): reads one tool call as JSON on stdin and, when
+    /// it would edit a glossary entry by hand, prints the deny decision
+    #[command(hide = true)]
+    DocGuard,
 
     /// Index Confluence pages into the document graph (fetch, parse, chunk, embed)
     IndexConfluence {
@@ -1096,6 +1175,13 @@ fn main() -> Result<()> {
         .stack_size(32 * 1024 * 1024)
         .build_global();
 
+    // A pre-edit hook runs on every Markdown edit: answer at once, with no
+    // update check, no settings validation and no worker thread.
+    if std::env::args().nth(1).as_deref() == Some("doc-guard") {
+        cmd_doc_guard();
+        return Ok(());
+    }
+
     let update_handle = install::check_for_update_background();
 
     let cli = Cli::parse();
@@ -1247,6 +1333,11 @@ fn run(command: Commands, root: &Path) -> Result<()> {
             symbol,
             limit,
         } => cmd_stale_docs(root, path_prefix.as_deref(), symbol, limit),
+        Commands::DocEntry { op, apply } => cmd_doc_entry(root, op, apply),
+        Commands::DocGuard => {
+            cmd_doc_guard();
+            Ok(())
+        }
         Commands::IndexConfluence {
             base_url,
             space,

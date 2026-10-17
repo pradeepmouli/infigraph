@@ -2,7 +2,7 @@
 
 # Infigraph MCP tools
 
-Every tool the Infigraph MCP server advertises (99 in all), grouped by task. Read only the section you need.
+Every tool the Infigraph MCP server advertises (100 in all), grouped by task. Read only the section you need.
 
 - [Find and read code](#find-and-read-code) — search, search_symbols, search_code, semantic_search, get_symbols_in_file, get_code_snippet, symbol_context, get_doc_context, get_skeleton, list_files
 - [Callers, references and change impact](#callers-references-and-change-impact) — trace_callers, trace_callees, find_all_references, transitive_impact, detect_changes, semantic_diff, get_type_hierarchy, get_file_deps, get_dependencies, generate_sequence_diagram
@@ -11,7 +11,7 @@ Every tool the Infigraph MCP server advertises (99 in all), grouped by task. Rea
 - [Graph queries and export](#graph-queries-and-export) — query_graph, export_graph, visualize, visualize_symbol
 - [Indexing and projects](#indexing-and-projects) — index_project, list_projects, delete_project, list_languages, scip_import, index_manifests, ingest_structured, doctor
 - [Watching for changes](#watching-for-changes) — watch_project, stop_watch, restart_watch, enable_watch, disable_watch, get_watch_status
-- [Documents and Confluence](#documents-and-confluence) — index_docs, search_docs, stale_docs, reindex_docs, clean_docs, index_confluence, index_confluence_pages, watch_docs, stop_watch_docs, restart_watch_docs, enable_watch_docs, disable_watch_docs
+- [Documents and Confluence](#documents-and-confluence) — index_docs, search_docs, stale_docs, doc_entry, reindex_docs, clean_docs, index_confluence, index_confluence_pages, watch_docs, stop_watch_docs, restart_watch_docs, enable_watch_docs, disable_watch_docs
 - [Multi-repo groups](#multi-repo-groups) — group_list, group_create, group_add, group_index, group_build, group_sync, group_link, group_link_docs, group_query, group_search, group_search_docs, group_contracts, group_deps
 - [Data pipelines](#data-pipelines) — pipeline_plugins, pipeline_query, pipeline_deps, pipeline_impact, pipeline_compliance
 - [Sessions and memory](#sessions-and-memory) — get_latest_session, save_session, search_sessions, purge_sessions, memory_context, consolidate_memory
@@ -650,6 +650,27 @@ PRIMARY: Which glossary entries (indexed Markdown sections whose heading is a sy
 | `path` | string |  |  | see Common parameters |
 | `path_prefix` | string |  |  | Restrict the analysis to files under this directory (or to this one file), relative to the project root, e.g. 'crates/infigraph-core'. Matches whole path components. Default: the whole project. |
 | `symbol` | string |  |  | One symbol id, e.g. 'src/app.py::compute_total': only its entry, with more history |
+
+### `doc_entry`
+
+PRIMARY: Edit a glossary entry (an indexed Markdown section headed by a symbol id) mechanically; you supply the prose, infigraph never writes it. op: edit (old->new inside the entry; old must match once, else refused; replace_all only inside it) for a small fix, replace (the lead text, or section=<sub-heading> block) for a rewrite, create (an entry for a symbol with none; doc_file overrides the choice, never invented), rekey (target -> new_target for a renamed/moved symbol; ack also reviews it), delete (symbol gone; force otherwise), ack (targets: record the entry as reviewed against its symbol as of its newest commit, so it stops being possibly stale until that code changes again; refused with uncommitted edits). Dry-run unless apply=true, which writes only the entry's lines and refreshes the document index. Idempotent. Use after stale_docs says what drifted.
+
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `op` | `edit` \| `replace` \| `create` \| `rekey` \| `delete` \| `ack` | yes |  | The operation |
+| `ack` | boolean |  | `false` | rekey: also record the entry as reviewed |
+| `apply` | boolean |  | `false` | Write it (default: dry run, shows the diff) |
+| `doc_file` | string |  |  | create: the document (relative path) that gets the entry |
+| `force` | boolean |  | `false` | rekey/delete: when the new key does not resolve / the symbol still exists |
+| `new` | string |  |  | edit: its replacement |
+| `new_target` | string |  |  | rekey: the symbol id to point the entry at |
+| `old` | string |  |  | edit: exact text inside the entry |
+| `path` | string |  |  | see Common parameters |
+| `replace_all` | boolean |  | `false` | edit: change every match, inside the entry only |
+| `section` | string |  |  | replace: a sub-heading of the entry whose block to replace |
+| `target` | string |  |  | The entry's symbol id, e.g. 'src/app.py::compute_total' |
+| `targets` | string[] |  |  | ack: symbol ids whose entries were reviewed |
+| `text` | string |  |  | replace/create: the prose (without the key heading) |
 
 ### `reindex_docs`
 

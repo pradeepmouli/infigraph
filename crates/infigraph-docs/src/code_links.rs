@@ -192,13 +192,10 @@ fn excerpt(line: &str, span: &str) -> String {
     format!("…{}…", cut.trim())
 }
 
-/// Every link a Markdown document carries.
-pub fn extract_markdown(doc_file: &str, text: &str) -> Vec<CodeLinkRow> {
-    let prose = prose_lines(text);
-    let total_lines = text.lines().count();
-
+/// The headings of `text` outside fenced code, in order.
+fn scan_headings(prose: &[(usize, &str)]) -> Vec<Heading> {
     let mut headings: Vec<Heading> = Vec::new();
-    for (line, content) in &prose {
+    for (line, content) in prose {
         if let Some(m) = heading_line().captures(content) {
             let level = m[1].len();
             let text = m[2].to_string();
@@ -215,6 +212,84 @@ pub fn extract_markdown(doc_file: &str, text: &str) -> Vec<CodeLinkRow> {
             });
         }
     }
+    headings
+}
+
+/// The last line of the key section that starts at `headings[n]`: up to the
+/// next key heading or a heading of its level or higher, without the blank
+/// lines before it.
+fn section_end(headings: &[Heading], n: usize, source_lines: &[&str]) -> usize {
+    let heading = &headings[n];
+    let end = headings[n + 1..]
+        .iter()
+        .find(|h| h.key.is_some() || h.level <= heading.level)
+        .map_or(source_lines.len() + 1, |h| h.line);
+    let mut last = end - 1;
+    while last > heading.line && source_lines[last - 1].trim().is_empty() {
+        last -= 1;
+    }
+    last
+}
+
+/// A heading inside an entry that is not itself a key; it rides along.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubHeading {
+    pub line: usize,
+    pub level: usize,
+    pub text: String,
+}
+
+/// One entry of a Markdown document, as its lines lie now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Entry {
+    pub key: String,
+    /// The key heading's level (2-4).
+    pub level: usize,
+    /// 1-based, inclusive: the key heading's line to the entry's last
+    /// non-blank line.
+    pub start: usize,
+    pub end: usize,
+    /// The ride-along headings inside the entry, in order.
+    pub subs: Vec<SubHeading>,
+}
+
+/// The entries of a Markdown document, in order. The same scan `extract_markdown`
+/// stores, so an edit made by line range and the index agree on where an entry
+/// is.
+pub fn entries(text: &str) -> Vec<Entry> {
+    let prose = prose_lines(text);
+    let headings = scan_headings(&prose);
+    let source_lines: Vec<&str> = text.lines().collect();
+    headings
+        .iter()
+        .enumerate()
+        .filter_map(|(n, heading)| {
+            let key = heading.key.clone()?;
+            let end = section_end(&headings, n, &source_lines);
+            let subs = headings[n + 1..]
+                .iter()
+                .take_while(|h| h.line <= end)
+                .map(|h| SubHeading {
+                    line: h.line,
+                    level: h.level,
+                    text: h.text.clone(),
+                })
+                .collect();
+            Some(Entry {
+                key,
+                level: heading.level,
+                start: heading.line,
+                end,
+                subs,
+            })
+        })
+        .collect()
+}
+
+/// Every link a Markdown document carries.
+pub fn extract_markdown(doc_file: &str, text: &str) -> Vec<CodeLinkRow> {
+    let prose = prose_lines(text);
+    let headings = scan_headings(&prose);
 
     let mut rows: Vec<CodeLinkRow> = Vec::new();
     let next_id = |rows: &Vec<CodeLinkRow>| format!("{doc_file}#{}", rows.len());
@@ -226,14 +301,7 @@ pub fn extract_markdown(doc_file: &str, text: &str) -> Vec<CodeLinkRow> {
             && heading.text.contains("::");
         match &heading.key {
             Some(key) => {
-                let end = headings[n + 1..]
-                    .iter()
-                    .find(|h| h.key.is_some() || h.level <= heading.level)
-                    .map_or(total_lines + 1, |h| h.line);
-                let mut last = end - 1;
-                while last > heading.line && source_lines[last - 1].trim().is_empty() {
-                    last -= 1;
-                }
+                let last = section_end(&headings, n, &source_lines);
                 rows.push(CodeLinkRow {
                     id: next_id(&rows),
                     doc_file: doc_file.to_string(),

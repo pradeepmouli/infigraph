@@ -3,6 +3,8 @@ use std::collections::HashMap;
 use anyhow::Result;
 
 use crate::chunk::Chunk;
+use infigraph_core::daemon_protocol::DocAck;
+
 use crate::code_links::{CodeLinkRow, LinkKind};
 use crate::extract::ExtractedDoc;
 use crate::store::{ChunkDetail, DocStoreStats, ImpactResult, PipelineCoreRecord};
@@ -71,6 +73,27 @@ pub trait DocBackend {
 
     /// Document id -> the `CODE_LINKS_VERSION` it was last scanned under.
     fn code_link_scans(&self) -> Result<HashMap<String, i64>>;
+
+    // ── Acknowledgements ─────────────────────────────────────────────────
+    //
+    // Kept in the local document store only: a remote store holds none, and
+    // reads as holding none rather than failing.
+
+    /// The acknowledgements of `targets`, by target.
+    fn doc_acks(&self, _targets: &[String]) -> Result<HashMap<String, DocAck>> {
+        Ok(HashMap::new())
+    }
+
+    /// Every acknowledgement.
+    fn all_doc_acks(&self) -> Result<Vec<DocAck>> {
+        Ok(Vec::new())
+    }
+
+    /// Records `acks` and forgets those of `drop`; returns the rows written
+    /// and removed.
+    fn upsert_acks(&self, _acks: &[DocAck], _drop: &[String]) -> Result<(usize, usize)> {
+        anyhow::bail!("acknowledgements are kept in the local document store")
+    }
 
     // ── Stats ────────────────────────────────────────────────────────────
 

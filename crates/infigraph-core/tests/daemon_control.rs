@@ -214,6 +214,13 @@ impl infigraph_core::daemon::DocsHandle for Recorder {
     ) -> Result<infigraph_core::daemon_protocol::DocIndexStats, String> {
         Err("the Recorder test double does not index".to_string())
     }
+    fn ack_docs(
+        &self,
+        _acks: &[infigraph_core::daemon_protocol::DocAck],
+        _drop: &[String],
+    ) -> Result<(usize, usize), String> {
+        Err("the Recorder test double does not store acknowledgements".to_string())
+    }
 }
 
 #[test]

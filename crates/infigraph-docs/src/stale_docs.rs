@@ -20,6 +20,7 @@ use infigraph_core::docs_switch;
 use infigraph_core::git_blame::{self, BlameError, Changes, RangeBlame, SyncState, GIT_TIMEOUT};
 use infigraph_core::path_scope::PathScope;
 
+use crate::ack::{self, Acks};
 use crate::code_links::{CodeLinkRow, LinkKind};
 use crate::link_check::{self, Live};
 
@@ -66,6 +67,9 @@ pub(crate) struct Judged {
     pub doc_lines: (usize, usize),
     pub live: Live,
     pub state: SyncState,
+    /// The code changed after the entry, but the entry was reviewed against
+    /// that change (so `state` is in sync).
+    pub acknowledged: bool,
     /// From the lines' own blame, not from the files' last commits.
     pub exact: bool,
 }
@@ -96,14 +100,30 @@ pub(crate) fn rank(judged: &[Judged]) -> Vec<&Judged> {
     stale
 }
 
+/// What is known of one entry: whether it is current, and whether it is only
+/// because a reviewer said so.
+pub(crate) struct Verdict {
+    pub state: SyncState,
+    pub acknowledged: bool,
+}
+
 /// Whether the entry for `target` is current, given the newest change to its
-/// code and to its text. The one place the rule lives: [`judge`] (the tool and
-/// `doctor --docs-sync`) and `linked::judge_entries` (`get_doc_context`) both
-/// ask it, so anything that decides an entry is current regardless of git
-/// history belongs here. `target` is the entry's key, which such a decision
-/// would be recorded against.
-pub(crate) fn verdict(_target: &str, code: &RangeBlame, entry: &RangeBlame) -> SyncState {
-    git_blame::compare(code, entry)
+/// code and to its text, and the reviews held (`acks`). The one place the rule
+/// lives: [`judge`] (the tool and `doctor --docs-sync`) and
+/// `linked::judge_entries` (`get_doc_context`) both ask it. The history says
+/// stale when the code changed after the entry; a review of the entry against
+/// code at least that new (see `ack`) says it was read and still holds.
+pub(crate) fn verdict(target: &str, code: &RangeBlame, entry: &RangeBlame, acks: &Acks) -> Verdict {
+    match git_blame::compare(code, entry) {
+        SyncState::PossiblyStale { .. } if acks.covers(target, code) => Verdict {
+            state: SyncState::InSync,
+            acknowledged: true,
+        },
+        state => Verdict {
+            state,
+            acknowledged: false,
+        },
+    }
 }
 
 /// The outcome of [`judge`].
@@ -113,6 +133,9 @@ pub(crate) struct Judgement {
     pub unknown: usize,
     /// The first reason git gave, for the report.
     pub first_error: Option<String>,
+    /// Why the reviews could not be read, when they could not: entries a
+    /// reviewer cleared may then be listed.
+    pub ack_error: Option<String>,
 }
 
 /// `file` -> the blame of each of its ranges, or why not.
@@ -127,6 +150,11 @@ pub(crate) fn judge(
     started: Instant,
     budget: Duration,
 ) -> Judgement {
+    let targets: Vec<String> = entries.iter().map(|(row, _)| row.target.clone()).collect();
+    let (acks, ack_error) = match ack::load(root, &targets) {
+        Ok(acks) => (acks, None),
+        Err(e) => (Acks::none(), Some(format!("{e:#}"))),
+    };
     // The ranges each file is asked about, in one git call per file.
     let mut ranges: BTreeMap<&str, Vec<(usize, usize)>> = BTreeMap::new();
     for (row, live) in entries {
@@ -189,14 +217,21 @@ pub(crate) fn judge(
             None => (coarse(&live.file).zip(coarse(&row.doc_file)), false),
         };
         match pair {
-            Some((code, entry)) => judged.push(Judged {
-                key: row.target.clone(),
-                doc_file: row.doc_file.clone(),
-                doc_lines: (row.line_start, row.line_end),
-                live: live.clone(),
-                state: verdict(&row.target, &code, &entry),
-                exact: is_exact,
-            }),
+            Some((code, entry)) => {
+                let Verdict {
+                    state,
+                    acknowledged,
+                } = verdict(&row.target, &code, &entry, &acks);
+                judged.push(Judged {
+                    key: row.target.clone(),
+                    doc_file: row.doc_file.clone(),
+                    doc_lines: (row.line_start, row.line_end),
+                    live: live.clone(),
+                    state,
+                    acknowledged,
+                    exact: is_exact,
+                });
+            }
             None => unknown += 1,
         }
     }
@@ -204,6 +239,7 @@ pub(crate) fn judge(
         judged,
         unknown,
         first_error,
+        ack_error,
     }
 }
 
@@ -266,6 +302,8 @@ pub struct Report {
     pub exact: usize,
     pub coarse: usize,
     pub stale_coarse: usize,
+    /// Of `entries`, current only because a reviewer acknowledged them.
+    pub acknowledged: usize,
     /// Entries git gave no answer for.
     pub unknown: usize,
     pub sync_unknown: Option<String>,
@@ -361,8 +399,15 @@ pub fn stale_docs(root: &Path, options: &Options) -> Report {
         judged,
         unknown,
         first_error,
+        ack_error,
     } = judge(root, &entries, started, options.budget);
     report.unknown = unknown;
+    report.acknowledged = judged.iter().filter(|j| j.acknowledged).count();
+    if let Some(why) = ack_error {
+        report.notes.push(format!(
+            "acknowledgements could not be read ({why}): entries a reviewer cleared may be listed"
+        ));
+    }
     report.exact = judged.iter().filter(|j| j.exact).count();
     report.coarse = judged.len() - report.exact;
     report.stale = judged.iter().filter(|j| j.is_stale()).count();
@@ -509,6 +554,9 @@ impl Report {
                 self.shown.len()
             ));
         }
+        if self.acknowledged > 0 {
+            out.push_str(&format!("; {} acknowledged", self.acknowledged));
+        }
         out.push('\n');
         if self.coarse > 0 {
             out.push_str(&format!(
@@ -643,15 +691,71 @@ mod tests {
         );
     }
 
+    fn acks(rows: &[(&str, i64)]) -> Acks {
+        Acks::from_rows(rows.iter().map(|(target, commit_time)| {
+            infigraph_core::daemon_protocol::DocAck {
+                target: target.to_string(),
+                commit: "r".repeat(40),
+                commit_time: *commit_time,
+                acked_at: 0,
+            }
+        }))
+    }
+
     #[test]
     fn the_verdict_is_possibly_stale_only_when_the_code_is_newer_than_the_entry() {
         let (old, new) = (at("a", 100), at("b", 200));
+        let none = Acks::none();
         assert!(matches!(
-            verdict("src/a.py::f", &new, &old),
+            verdict("src/a.py::f", &new, &old, &none).state,
             SyncState::PossiblyStale { .. }
         ));
-        assert_eq!(verdict("src/a.py::f", &old, &new), SyncState::InSync);
-        assert_eq!(verdict("src/a.py::f", &new, &new), SyncState::InSync);
+        assert_eq!(
+            verdict("src/a.py::f", &old, &new, &none).state,
+            SyncState::InSync
+        );
+        assert_eq!(
+            verdict("src/a.py::f", &new, &new, &none).state,
+            SyncState::InSync
+        );
+    }
+
+    #[test]
+    fn a_review_at_or_after_the_code_clears_the_entry_and_says_why() {
+        let (old, new) = (at("a", 100), at("b", 200));
+        let v = verdict("src/a.py::f", &new, &old, &acks(&[("src/a.py::f", 200)]));
+        assert_eq!(v.state, SyncState::InSync);
+        assert!(v.acknowledged);
+        let v = verdict("src/a.py::f", &new, &old, &acks(&[("src/a.py::f", 900)]));
+        assert!(v.acknowledged, "a later review covers earlier code");
+    }
+
+    #[test]
+    fn a_review_older_than_the_code_or_for_another_target_clears_nothing() {
+        let (old, new) = (at("a", 100), at("b", 200));
+        let v = verdict("src/a.py::f", &new, &old, &acks(&[("src/a.py::f", 150)]));
+        assert!(matches!(v.state, SyncState::PossiblyStale { .. }));
+        assert!(!v.acknowledged);
+        let v = verdict("src/a.py::f", &new, &old, &acks(&[("src/a.py::g", 900)]));
+        assert!(matches!(v.state, SyncState::PossiblyStale { .. }));
+    }
+
+    #[test]
+    fn uncommitted_code_is_never_covered_by_a_review() {
+        let old = at("a", 100);
+        let dirty = RangeBlame {
+            commit: "0".repeat(40),
+            time: 300,
+            dirty: true,
+        };
+        let v = verdict(
+            "src/a.py::f",
+            &dirty,
+            &old,
+            &acks(&[("src/a.py::f", 9_999)]),
+        );
+        assert!(matches!(v.state, SyncState::PossiblyStale { .. }));
+        assert!(!v.acknowledged);
     }
 
     #[test]
@@ -666,6 +770,7 @@ mod tests {
                 end: 2,
             },
             state: git_blame::compare(&at("b", code_time), &at("a", entry_time)),
+            acknowledged: false,
             exact: true,
         };
         let all = [

@@ -12,6 +12,7 @@
 use std::collections::HashMap;
 
 use anyhow::Result;
+use infigraph_core::daemon_protocol::DocAck;
 use infigraph_core::escape_str;
 use infigraph_core::graph::query_exec::QueryExec;
 
@@ -119,6 +120,51 @@ impl<E: QueryExec> DocQuery<E> {
                     line_start: start.parse().ok()?,
                     line_end: end.parse().ok()?,
                     text,
+                })
+            })
+            .collect())
+    }
+
+    /// The acknowledgements of `targets`. A store with no `DocAck` table holds
+    /// none: absence is the right reading, not a failure.
+    pub fn doc_acks(&self, targets: &[String]) -> Result<HashMap<String, DocAck>> {
+        if targets.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let list = targets
+            .iter()
+            .map(|t| format!("'{}'", escape_str(t)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        Ok(self
+            .ack_query(&format!("MATCH (a:DocAck) WHERE a.target IN [{list}] "))?
+            .into_iter()
+            .map(|a| (a.target.clone(), a))
+            .collect())
+    }
+
+    /// Every acknowledgement, for a reindex that carries them across its wipe.
+    pub fn all_doc_acks(&self) -> Result<Vec<DocAck>> {
+        self.ack_query("MATCH (a:DocAck) ")
+    }
+
+    fn ack_query(&self, matching: &str) -> Result<Vec<DocAck>> {
+        let rows = match self.exec.query_rows(&format!(
+            "{matching}RETURN a.target, a.commit, a.commit_time, a.acked_at ORDER BY a.target"
+        )) {
+            Ok(rows) => rows,
+            Err(e) if e.to_string().contains("does not exist") => return Ok(Vec::new()),
+            Err(e) => return Err(anyhow::anyhow!("query acknowledgements: {e}")),
+        };
+        Ok(rows
+            .into_iter()
+            .filter_map(|r| {
+                let [target, commit, commit_time, acked_at]: [String; 4] = r.try_into().ok()?;
+                Some(DocAck {
+                    target,
+                    commit,
+                    commit_time: commit_time.parse().ok()?,
+                    acked_at: acked_at.parse().ok()?,
                 })
             })
             .collect())

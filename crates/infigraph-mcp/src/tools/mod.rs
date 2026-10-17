@@ -1,4 +1,5 @@
 pub mod analysis;
+pub mod doc_entry;
 pub mod doc_sync;
 pub mod docs;
 pub mod doctor;

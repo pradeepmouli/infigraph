@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use infigraph_core::daemon::read_protocol::WatchAction;
 use infigraph_core::daemon::writes::{submit, WriteOpts};
-use infigraph_core::daemon_protocol::{DocIndexStats, WriteRequest, WriteResult};
+use infigraph_core::daemon_protocol::{DocAck, DocIndexStats, WriteRequest, WriteResult};
 
 /// Answers `index_docs` after `delay` with a count that shows `full`.
 struct CannedIndexer {
@@ -34,6 +34,22 @@ impl infigraph_core::daemon::DocsHandle for CannedIndexer {
             files_indexed: if full { 2 } else { 1 },
             ..Default::default()
         })
+    }
+    fn ack_docs(&self, acks: &[DocAck], drop: &[String]) -> Result<(usize, usize), String> {
+        std::thread::sleep(self.delay);
+        Ok((acks.len(), drop.len()))
+    }
+}
+
+fn an_ack() -> WriteRequest {
+    WriteRequest::AckDocEntries {
+        acks: vec![DocAck {
+            target: "src/a.py::f".to_string(),
+            commit: "abc".to_string(),
+            commit_time: 1_700_000_000,
+            acked_at: 1_800_000_000,
+        }],
+        drop: vec!["src/a.py::g".to_string(), "src/a.py::h".to_string()],
     }
 }
 
@@ -63,6 +79,75 @@ fn index_docs_is_answered_with_the_indexers_stats() {
             ..Default::default()
         })
     );
+    stop(d);
+}
+
+#[test]
+fn an_ack_is_answered_with_what_the_docs_handle_stored_and_dropped() {
+    let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let d = start_with_docs(
+        dir.path(),
+        Some(Arc::new(CannedIndexer {
+            delay: Duration::from_millis(50),
+        })),
+    );
+    let reply = submit(dir.path(), &an_ack(), opts()).unwrap();
+    assert_eq!(
+        reply,
+        WriteResult::DocsAcked {
+            stored: 1,
+            dropped: 2
+        }
+    );
+    stop(d);
+}
+
+#[test]
+fn a_daemon_without_a_docs_handle_refuses_an_ack_with_a_reason() {
+    let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let d = start(dir.path());
+    let reply = submit(dir.path(), &an_ack(), opts()).unwrap();
+    assert_eq!(
+        reply,
+        WriteResult::Err {
+            message: infigraph_core::daemon::NO_DOCS_INDEXER.to_string()
+        }
+    );
+    stop(d);
+}
+
+/// One docs write at a time, of either kind: an ack asked for while an index
+/// runs waits for it and is then served.
+#[test]
+fn an_ack_waits_for_the_docs_index_that_is_running() {
+    let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let d = start_with_docs(
+        dir.path(),
+        Some(Arc::new(CannedIndexer {
+            delay: Duration::from_millis(800),
+        })),
+    );
+    let root = dir.path().to_path_buf();
+    let indexing =
+        std::thread::spawn(move || submit(&root, &WriteRequest::IndexDocs { full: false }, opts()));
+    std::thread::sleep(Duration::from_millis(200));
+
+    let t = Instant::now();
+    let reply = submit(dir.path(), &an_ack(), opts()).unwrap();
+
+    assert!(
+        t.elapsed() >= Duration::from_millis(400),
+        "the ack ran alongside the index ({:?})",
+        t.elapsed()
+    );
+    assert!(matches!(reply, WriteResult::DocsAcked { .. }), "{reply:?}");
+    assert!(matches!(
+        indexing.join().unwrap().unwrap(),
+        WriteResult::DocsIndexed(_)
+    ));
     stop(d);
 }
 

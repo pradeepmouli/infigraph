@@ -108,7 +108,8 @@ re-read the entry against the code, never an error.
 `get_doc_context` labels one entry. To find the entries that drifted, and what
 the code did, call the MCP tool `stale_docs` or run `infigraph stale-docs`; it
 reads, it never writes (infigraph does not author prose, and the Markdown is the
-source of truth), so the answer is where to edit and why:
+source of truth), so the answer is where to edit and why (`doc_entry`, below,
+makes the edit):
 
 ```
 Stale docs: 842 of 4008 entries possibly stale (exact git blame of 4008 entries); showing the 20 ...
@@ -153,6 +154,63 @@ Stale docs: 842 of 4008 entries possibly stale (exact git blame of 4008 entries)
 After editing an entry, the document watcher refreshes the index, or call
 `reindex_docs`.
 
+## Changing an entry (`doc_entry`)
+
+`stale_docs` says where to edit; `doc_entry` (MCP tool, `infigraph doc-entry
+<op>`) does the edit, so a glossary change is one call that cannot damage the
+entries around it. Every op **previews by default** (a diff, nothing written) and
+writes only with `apply: true` / `--apply`. An applied op writes the Markdown and
+then refreshes the document index (skipped, with a note, when document indexing
+is off), and repeating it is a no-op that says "already done".
+
+| op | does |
+| --- | --- |
+| `edit` | replaces `old` with `new` once inside the entry (`replace_all` for every match inside it); refuses on no match or on several, with the count |
+| `replace` | rewrites the entry's lead text (or one `section`) |
+| `create` | adds an entry for a key; the file is the document that holds most entries of the same code file, else the nearest ancestor directory's majority (never the project root), else it refuses and asks for `doc_file` |
+| `rekey` | changes an entry's key; refuses when the new key does not resolve unless `force`, and lists the prose mentions of the old key it did not edit |
+| `delete` | removes an entry; refuses while its symbol still resolves unless `force` |
+| `ack` | records that the entry was read against the symbol as it is now (below) |
+
+- **Ranges are re-read.** The entry's lines come from parsing the file at call
+  time (`code_links::entries`), never from stored rows, so an op after an
+  unindexed edit still lands on the right lines. An op that would change the
+  list of entries (an `edit` that adds or drops a key heading) is refused.
+- **Acknowledging.** Most "possibly stale" entries are still true. `ack` stores
+  `DocAck(target, commit, commit_time, acked_at)` in `docs.kuzu`, one newest row
+  per target, and nothing in the Markdown. `stale_docs::verdict` then treats the
+  entry as in sync for code up to that commit's time, so a later change to the
+  symbol makes it stale again; `get_doc_context` shows no label for it and
+  `stale_docs` reports "N acknowledged". An `ack` is refused when the symbol's
+  lines have uncommitted edits (a review names a commit). `rekey` does not carry
+  an ack to the new key (`ack: true` records a fresh one); `delete` drops it. A
+  document reindex exports the acks before it wipes the store and writes them back.
+- **One write path.** The ack write is `WriteRequest::AckDocEntries` on the
+  daemon socket, taken under the same exclusive docs lock as indexing; a client
+  never opens `docs.kuzu` for it. Under `INFIGRAPH_BACKEND=kuzu` it runs in the
+  calling process.
+
+### The edit guard (Claude Code)
+
+`infigraph install` adds a second PreToolUse hook (`infigraph-doc-guard.sh`,
+matcher `Write|Edit|MultiEdit`) that runs `infigraph doc-guard`. It denies an
+`Edit`/`MultiEdit` whose `old_string` lies inside a key-heading entry of a
+Markdown file, and a `Write` over a file that has entries, and the message names
+the op to use (`edit` for a small fix, `replace` for a rewrite, `rekey`,
+`delete`, `create`, `ack`). Limits, on purpose:
+
+- It parses the file and reads one setting (`[docs] enabled`); it opens no
+  database and starts no daemon. Any doubt (no project, no `jq`, unparsable
+  input, docs off) allows the edit.
+- It guards Claude Code's file tools only. A shell redirect, `sed -i` or another
+  editor is not seen; the guard is a nudge toward the tool, not access control.
+  Another agent integration would need its own hook calling `infigraph doc-guard`
+  with the same JSON.
+- The ops' own writes never go through the file tools, so the guard cannot block
+  them; there is no setting to turn the guard off short of uninstalling it.
+- The hook script ships with the CLI. An existing install gets it, and the new
+  skill text, only after `infigraph install` is run again.
+
 ## `infigraph doctor`
 
 `doctor` always checks the keys: every documents key must resolve to a live
@@ -190,4 +248,7 @@ and never reads the code graph. Reading a symbol's context resolves it against
 the graph at that moment, so a renamed symbol is a key that no longer resolves,
 not a dangling reference in either store. A document's links are replaced as a
 unit when the document is re-indexed, deleted with it, and recorded last so an
-interrupted run leaves the document to be scanned again.
+interrupted run leaves the document to be scanned again. `DocAck` is the one
+table that does not belong to a document: it outlives a re-index (carried over a
+`reindex_docs`) and is dropped only by `doc_entry delete`, `clean_docs`, or when
+a newer ack for the same target replaces it.

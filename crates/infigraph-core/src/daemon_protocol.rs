@@ -129,6 +129,15 @@ pub enum WriteRequest {
     /// rebuilds (`reindex-docs`). There is no document data on the socket:
     /// the daemon reads the files itself.
     IndexDocs { full: bool },
+    /// Record that glossary entries were reviewed against their code (`acks`:
+    /// the newest per target wins), and forget the acknowledgements of the
+    /// targets in `drop`. Runs on the same docs handle as `IndexDocs`, one
+    /// docs write at a time: the acknowledgements live in `docs.kuzu`, which a
+    /// client never opens itself.
+    AckDocEntries {
+        acks: Vec<DocAck>,
+        drop: Vec<String>,
+    },
 }
 
 impl WriteRequest {
@@ -157,6 +166,20 @@ pub enum IngestSource {
     File(PathBuf),
     Directory(PathBuf),
     Inline(PathBuf),
+}
+
+/// An entry reviewed against its symbol as of a commit: the entry is not
+/// stale for the code up to `commit_time`. One per `target` (a symbol id).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DocAck {
+    pub target: String,
+    /// The newest commit over the symbol's lines when it was reviewed.
+    pub commit: String,
+    /// That commit's committer time (epoch seconds), so judging an entry
+    /// needs no git call and survives a rewritten history.
+    pub commit_time: i64,
+    /// When the review was recorded (epoch seconds).
+    pub acked_at: i64,
 }
 
 /// What one document index run did, for `index-docs` to print: the counts
@@ -204,6 +227,11 @@ pub enum WriteResult {
     /// `IndexDocs`'s outcome. A variant of its own: `Ok`'s two fields
     /// describe code-graph writes.
     DocsIndexed(DocIndexStats),
+    /// `AckDocEntries`'s outcome: rows written and rows removed.
+    DocsAcked {
+        stored: usize,
+        dropped: usize,
+    },
     Err {
         message: String,
     },
@@ -369,9 +397,41 @@ mod tests {
         );
         assert_eq!(WriteRequest::IndexDocs { full: true }.kind(), "IndexDocs");
         assert_eq!(
+            WriteRequest::AckDocEntries {
+                acks: Vec::new(),
+                drop: Vec::new()
+            }
+            .kind(),
+            "AckDocEntries"
+        );
+        assert_eq!(
             serde_json::to_string(&WriteRequest::IndexDocs { full: false }).unwrap(),
             r#"{"IndexDocs":{"full":false}}"#
         );
+    }
+
+    #[test]
+    fn an_ack_request_and_its_reply_round_trip_through_json() {
+        let request = WriteRequest::AckDocEntries {
+            acks: vec![DocAck {
+                target: "src/a.py::f".to_string(),
+                commit: "abc".to_string(),
+                commit_time: 1_700_000_000,
+                acked_at: 1_800_000_000,
+            }],
+            drop: vec!["src/a.py::g".to_string()],
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert_eq!(
+            serde_json::from_str::<WriteRequest>(&json).unwrap(),
+            request
+        );
+        let reply = WriteResult::DocsAcked {
+            stored: 1,
+            dropped: 1,
+        };
+        let json = serde_json::to_string(&reply).unwrap();
+        assert_eq!(serde_json::from_str::<WriteResult>(&json).unwrap(), reply);
     }
 
     #[test]
@@ -683,9 +743,11 @@ pub fn serve_write(infigraph: &Infigraph, request: &WriteRequest) -> WriteResult
         WriteRequest::FullReindex => WriteResult::Err {
             message: "FullReindex not yet implemented".to_string(),
         },
-        WriteRequest::IndexDocs { .. } => WriteResult::Err {
-            message: "IndexDocs runs on the daemon's docs handle, never under index.lock"
-                .to_string(),
+        WriteRequest::IndexDocs { .. } | WriteRequest::AckDocEntries { .. } => WriteResult::Err {
+            message: format!(
+                "{} runs on the daemon's docs handle, never under index.lock",
+                request.kind()
+            ),
         },
     }
 }
