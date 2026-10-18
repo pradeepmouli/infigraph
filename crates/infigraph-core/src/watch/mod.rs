@@ -363,6 +363,22 @@ fn get_cross_file_dependents(
 
     dependents.into_iter().collect()
 }
+/// `2026-10-18T14:03:22Z` for the time now: the prefix of a watcher log line,
+/// so a loop can be read off `daemon.log` (those lines carried no time).
+pub fn log_stamp() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    format!(
+        "{}T{:02}:{:02}:{:02}Z",
+        crate::git_blame::civil_date(secs),
+        (secs % 86_400) / 3_600,
+        (secs % 3_600) / 60,
+        secs % 60
+    )
+}
+
 /// Subscribe `watcher` to every non-ignored directory under `root`.
 ///
 /// Registers each directory NonRecursive rather than the tree Recursive, so

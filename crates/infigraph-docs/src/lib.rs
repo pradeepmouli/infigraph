@@ -65,6 +65,9 @@ pub struct DocIndexResult {
     pub bfs_discovered: usize,
     pub new_chunks: Vec<Chunk>,
     pub changed_files: Vec<String>,
+    /// Stored documents removed because their file is gone or no longer
+    /// covered by the walk.
+    pub pruned: usize,
     /// What the pipeline plugins reported during this run. A plugin that
     /// failed never fails indexing; it lands here.
     pub pipeline_warnings: Vec<String>,
@@ -319,7 +322,7 @@ impl DocIndex {
             let existing_hashes = store
                 .get_doc_hashes()
                 .context("doc index: failed to load existing document hashes")?;
-            self.prune_stale_docs(store, &existing_hashes, &files, listing_complete);
+            let pruned = self.prune_stale_docs(store, &existing_hashes, &files, listing_complete);
             return Ok(DocIndexResult {
                 total_files: 0,
                 indexed_files: 0,
@@ -327,6 +330,7 @@ impl DocIndex {
                 bfs_discovered: 0,
                 new_chunks: vec![],
                 changed_files: vec![],
+                pruned,
                 pipeline_warnings: vec![],
             });
         }
@@ -426,7 +430,7 @@ impl DocIndex {
             embed::update_doc_embeddings(store, &self.root, &all_chunks, &changed_files)?;
         }
 
-        self.prune_stale_docs(store, &existing_hashes, &files, listing_complete);
+        let pruned = self.prune_stale_docs(store, &existing_hashes, &files, listing_complete);
 
         // Extract links from indexed docs and create LINKS_TO edges.
         // Scope to this repo's namespace so cross-repo docs aren't offered as
@@ -488,6 +492,7 @@ impl DocIndex {
             bfs_discovered,
             new_chunks: result_chunks,
             changed_files: result_changed,
+            pruned,
             pipeline_warnings,
         })
     }
@@ -526,7 +531,7 @@ impl DocIndex {
         existing_hashes: &std::collections::HashMap<String, String>,
         files: &[PathBuf],
         listing_complete: bool,
-    ) {
+    ) -> usize {
         // A walk error shortens `files`, and a short list reads as "these
         // documents were deleted". Only a complete listing may say that.
         if !listing_complete {
@@ -534,7 +539,7 @@ impl DocIndex {
                 "warn: could not list all of {}; leaving the stored documents alone",
                 self.root.display()
             );
-            return;
+            return 0;
         }
         let ns = self.namespace.as_deref();
         let current_files: HashSet<String> = files
@@ -564,37 +569,17 @@ impl DocIndex {
             let stale_refs: Vec<&str> = stale.iter().map(|s| s.as_str()).collect();
             if let Err(e) = store.delete_docs_by_ids(&stale_refs) {
                 eprintln!("warn: doc pruning failed, stale docs remain: {e:#}");
+                return 0;
             }
         }
+        stale.len()
     }
 
     /// The document files under the root, and whether the walk could list
     /// everything it was pointed at (a walk error, such as a missing or
     /// unreadable directory, makes the list possibly short).
     fn collect_doc_files(&self) -> Result<(Vec<PathBuf>, bool)> {
-        let mut files = Vec::new();
-        let mut complete = true;
-        let walker = infigraph_core::ignore_rules::walk_builder(
-            &self.root,
-            infigraph_core::ignore_rules::Domain::Docs,
-        )
-        .build();
-        for result in walker {
-            let entry = match result {
-                Ok(e) => e,
-                Err(_) => {
-                    complete = false;
-                    continue;
-                }
-            };
-            if entry.file_type().is_some_and(|ft| ft.is_file()) {
-                let path = entry.path().to_path_buf();
-                if is_document_file(&path) {
-                    files.push(path);
-                }
-            }
-        }
-        Ok((files, complete))
+        Ok(walk_doc_files(&self.root))
     }
 
     fn bfs_follow_links(
@@ -677,26 +662,14 @@ impl DocIndex {
                     if !abs.starts_with(&repo_root) {
                         continue;
                     }
-                    // A hidden component, judged below the repo root so a
-                    // repo under `~/.work/` is still a repo. The walk skips
-                    // hidden entries itself (`.hidden(true)`); the matcher
-                    // answers for watcher events and does not model that, so
-                    // it is kept beside it here.
-                    let rel_to_repo = abs.strip_prefix(&repo_root).unwrap_or(&abs);
-                    let hidden = rel_to_repo.components().any(|c| {
-                        matches!(c, std::path::Component::Normal(s)
-                            if s.to_string_lossy().starts_with('.'))
-                    });
-                    if hidden {
-                        continue;
-                    }
                     let rules = ignore_rules.get_or_insert_with(|| {
                         infigraph_core::ignore_rules::IgnoreMatcher::build(
                             &repo_root,
                             infigraph_core::ignore_rules::Domain::Docs,
                         )
                     });
-                    if rules.is_ignored(&abs, false) {
+                    // What the walk would not visit (ignored or hidden).
+                    if rules.skips(&abs, false) {
                         continue;
                     }
 
@@ -817,6 +790,35 @@ fn find_repo_root(start: &Path) -> Option<PathBuf> {
             return None;
         }
     }
+}
+
+/// The documents the index covers under `root`, and whether the walk saw
+/// every entry. The one answer to "is this file indexed": the doc watcher's
+/// parity tests hold its event filter to it.
+pub(crate) fn walk_doc_files(root: &Path) -> (Vec<PathBuf>, bool) {
+    let mut files = Vec::new();
+    let mut complete = true;
+    let walker = infigraph_core::ignore_rules::walk_builder(
+        root,
+        infigraph_core::ignore_rules::Domain::Docs,
+    )
+    .build();
+    for result in walker {
+        let entry = match result {
+            Ok(e) => e,
+            Err(_) => {
+                complete = false;
+                continue;
+            }
+        };
+        if entry.file_type().is_some_and(|ft| ft.is_file()) {
+            let path = entry.path().to_path_buf();
+            if is_document_file(&path) {
+                files.push(path);
+            }
+        }
+    }
+    (files, complete)
 }
 
 pub fn is_document_file(path: &Path) -> bool {
