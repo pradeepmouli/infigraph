@@ -202,6 +202,10 @@ is off), and repeating it is a no-op that says "already done".
   is edited and refreshed on its own. One without an index would resolve to the
   main checkout around it and change its glossary instead, so `doc_entry` refuses,
   naming the command.
+  The MCP tool without `path` means the project its server started in, so an
+  `apply` with no `path` is refused when that project has linked worktrees
+  (pass `path`); a dry run is allowed. Every MCP report's first line is
+  `project: <root>`, the root it resolved.
 - **Acknowledging.** Read the changed lines (`stale_docs` shows them) against the
   entry first, and `ack` only an entry that is still true; never ack in bulk to
   clear a list. Most "possibly stale" entries are still true. `ack` stores

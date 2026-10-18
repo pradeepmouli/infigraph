@@ -9,7 +9,7 @@ use std::path::Path;
 
 use serde_json::{json, Value};
 
-use infigraph_mcp::tools::doc_entry::tool_doc_entry;
+use infigraph_mcp::tools::doc_entry::{tool_doc_entry, tool_doc_entry_in};
 use infigraph_mcp::tools::graph::tool_get_doc_context;
 
 mod support;
@@ -1040,5 +1040,80 @@ mod worktrees {
         );
         assert_eq!(file(main.path(), "docs/glossary/src.md"), SRC_DOC);
         assert_eq!(file(&wt, "docs/glossary/src.md"), SRC_DOC);
+    }
+
+    /// A call with no `path`, from a server that was started in `startup`.
+    fn from_server_in(startup: &Path, mut args: Value) -> anyhow::Result<String> {
+        args.as_object_mut().unwrap().remove("path");
+        tool_doc_entry_in(&args, startup)
+    }
+
+    #[test]
+    fn every_report_starts_with_the_project_it_resolved() {
+        let (_main, wt) = project_and_worktree();
+        reindex_code(&wt);
+        index_documents(&wt);
+
+        let dry = ok(&wt, EDIT(false));
+        let applied = ok(&wt, EDIT(true));
+        let again = ok(&wt, EDIT(true));
+
+        let root = wt.canonicalize().unwrap();
+        for report in [&dry, &applied, &again] {
+            let first = report.lines().next().unwrap();
+            assert!(
+                first.contains(&root.display().to_string()),
+                "first line does not name {}:\n{report}",
+                root.display()
+            );
+        }
+        assert!(
+            dry.lines().next().unwrap().ends_with("scratchpad/wt-x"),
+            "{dry}"
+        );
+    }
+
+    #[test]
+    fn an_apply_with_no_path_is_refused_when_the_project_has_worktrees() {
+        let (main, _wt) = project_and_worktree();
+
+        let why = match from_server_in(main.path(), EDIT(true)) {
+            Ok(out) => panic!("not refused:\n{out}"),
+            Err(e) => format!("{e:#}"),
+        };
+
+        let root = main.path().canonicalize().unwrap();
+        assert!(
+            why.contains(&root.display().to_string()) && why.contains("`path`"),
+            "{why}"
+        );
+        assert_eq!(file(main.path(), "docs/glossary/src.md"), SRC_DOC);
+    }
+
+    #[test]
+    fn a_dry_run_with_no_path_is_allowed_and_names_the_root() {
+        let (main, _wt) = project_and_worktree();
+
+        let out = from_server_in(main.path(), EDIT(false)).unwrap();
+
+        let root = main.path().canonicalize().unwrap();
+        assert!(
+            out.lines()
+                .next()
+                .unwrap()
+                .contains(&root.display().to_string()),
+            "{out}"
+        );
+        assert!(out.contains("dry run"), "{out}");
+    }
+
+    #[test]
+    fn an_apply_with_no_path_still_works_in_a_project_without_worktrees() {
+        let dir = project();
+
+        let out = from_server_in(dir.path(), EDIT(true)).unwrap();
+
+        assert!(out.contains("applied"), "{out}");
+        assert!(file(dir.path(), "docs/glossary/src.md").contains("by looping"));
     }
 }

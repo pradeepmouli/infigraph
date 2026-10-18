@@ -6,7 +6,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Result};
 use serde_json::Value;
 
-use infigraph_docs::doc_entry::{refuse_nested_checkout, run, Op, Pick};
+use infigraph_docs::doc_entry::{
+    refuse_nested_checkout, refuse_unnamed_write, run, with_root_line, Op, Pick,
+};
 
 use super::helpers::{resolve_project_path, startup_project};
 
@@ -36,14 +38,21 @@ fn pick(args: &Value) -> Pick {
 }
 
 pub fn tool_doc_entry(args: &Value) -> Result<String> {
+    tool_doc_entry_in(args, &startup_project())
+}
+
+/// `tool_doc_entry` for a server started in `startup`, the project a call
+/// without `path` falls back to.
+pub fn tool_doc_entry_in(args: &Value, startup: &Path) -> Result<String> {
     let given = args.get("path").and_then(|v| v.as_str());
     let root = given
         .map(|p| PathBuf::from(resolve_project_path(p)))
-        .unwrap_or_else(startup_project);
+        .unwrap_or_else(|| startup.to_path_buf());
     let root = root.canonicalize().unwrap_or(root);
     if let Some(path) = given {
         refuse_nested_checkout(&root, Path::new(path))?;
     }
+    refuse_unnamed_write(&root, given.is_some(), flag(args, "apply"))?;
     let op_name = need(args, "op", "doc_entry")?;
     let op = match op_name.as_str() {
         "replace" => Op::Replace {
@@ -98,5 +107,8 @@ pub fn tool_doc_entry(args: &Value) -> Result<String> {
             "unknown op `{other}`: use replace, edit, create, rekey, delete or ack (`op` is required)"
         ),
     };
-    run(&root, &op, flag(args, "apply"))
+    Ok(with_root_line(
+        &root,
+        &run(&root, &op, flag(args, "apply"))?,
+    ))
 }
