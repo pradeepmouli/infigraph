@@ -31,13 +31,26 @@ fn import(defs: &[(String, i32, i32)]) -> Vec<String> {
 }
 
 /// `import` over another `source`, with `existing` symbol rows
-/// `(id, name, start_line, end_line)` already in the graph, as tree-sitter
-/// leaves them.
+/// `(id, name, start_line, end_line, kind)` already in the graph, as
+/// tree-sitter leaves them.
 fn import_in(
     source: &str,
-    existing: &[(&str, &str, u32, u32)],
+    existing: &[(&str, &str, u32, u32, &str)],
     defs: &[(String, i32, i32)],
 ) -> Vec<String> {
+    import_with_refs(source, existing, defs, &[]).1.ids
+}
+
+/// `import_in` plus reference occurrences `(moniker, 0-based line, column)`;
+/// returns the graph after the first import and after the second (an import
+/// that finds its own rows again must change nothing, but a defect of the first
+/// can hide behind the second's repair, so both are checked).
+fn import_with_refs(
+    source: &str,
+    existing: &[(&str, &str, u32, u32, &str)],
+    defs: &[(String, i32, i32)],
+    refs: &[(String, i32, i32)],
+) -> (Snapshot, Snapshot) {
     use_language_registry(Arc::new(infigraph_languages::bundled_registry().unwrap()));
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join("src")).unwrap();
@@ -50,9 +63,9 @@ fn import_in(
     ))
     .unwrap();
 
-    for (id, name, start, end) in existing {
+    for (id, name, start, end, kind) in existing {
         conn.query(&format!(
-            "CREATE (:Symbol {{id: '{id}', name: '{name}', kind: 'function', file: '{FILE}', \
+            "CREATE (:Symbol {{id: '{id}', name: '{name}', kind: '{kind}', file: '{FILE}', \
              start_line: {start}, end_line: {end}, signature_hash: '', language: 'typescript', \
              visibility: 'public', parent: '', docstring: '', complexity: 0, parameters: '', \
              return_type: ''}})"
@@ -70,6 +83,12 @@ fn import_in(
                 symbol_roles: SymbolRole::Definition as i32,
                 ..Default::default()
             })
+            .chain(refs.iter().map(|(sym, line, col)| Occurrence {
+                range: vec![*line, *col, *line, *col + 3],
+                symbol: sym.clone(),
+                symbol_roles: 0,
+                ..Default::default()
+            }))
             .collect(),
         symbols: defs
             .iter()
@@ -87,6 +106,7 @@ fn import_in(
     let path = dir.path().join("index.scip");
     std::fs::write(&path, index.write_to_bytes().unwrap()).unwrap();
     import_scip_index(&path, &store, Some(dir.path())).unwrap();
+    let first = snapshot(&conn);
     // matched rows stay matched: the same index again adds nothing
     let again = import_scip_index(&path, &store, Some(dir.path())).unwrap();
     assert_eq!(
@@ -103,16 +123,38 @@ fn import_in(
             .collect();
         assert_eq!(rows.len(), 1, "exactly one row carries {sym}");
     }
-    conn.query("MATCH (s:Symbol) RETURN s.id, s.name ORDER BY s.start_line, s.id")
-        .unwrap()
-        .map(|r| {
-            format!(
-                "{} | {}",
-                r[0].to_string().trim_matches('"'),
-                r[1].to_string().trim_matches('"')
-            )
-        })
-        .collect()
+    (first, snapshot(&conn))
+}
+/// What the graph holds: ids, CALLS edges and each row's moniker.
+struct Snapshot {
+    ids: Vec<String>,
+    calls: Vec<String>,
+    /// `id => scip_id`
+    monikers: Vec<String>,
+}
+
+fn snapshot(conn: &kuzu::Connection<'_>) -> Snapshot {
+    let strip = |v: &kuzu::Value| v.to_string().trim_matches('"').to_string();
+    let rows = |q: &str, sep: &str| -> Vec<String> {
+        conn.query(q)
+            .unwrap()
+            .map(|r| format!("{}{sep}{}", strip(&r[0]), strip(&r[1])))
+            .collect()
+    };
+    Snapshot {
+        ids: rows(
+            "MATCH (s:Symbol) RETURN s.id, s.name ORDER BY s.start_line, s.id",
+            " | ",
+        ),
+        calls: rows(
+            "MATCH (a:Symbol)-[:CALLS]->(b:Symbol) RETURN a.id, b.id ORDER BY a.id, b.id",
+            " -> ",
+        ),
+        monikers: rows(
+            "MATCH (s:Symbol) RETURN s.id, s.scip_id ORDER BY s.id",
+            " => ",
+        ),
+    }
 }
 
 #[test]
@@ -168,7 +210,7 @@ fn a_symbol_that_only_encloses_a_key_is_not_that_member() {
     // tree-sitter's `value` function spans lines 1-3; the key is on line 2
     let ids = import_in(
         source,
-        &[("src/config.ts::value", "value", 1, 3)],
+        &[("src/config.ts::value", "value", 1, 3, "function")],
         &[(moniker("value0:"), 1, 11)],
     );
     assert_eq!(
@@ -203,7 +245,7 @@ fn a_method_tree_sitter_made_is_enriched_by_its_scip_row_not_duplicated() {
     let source = "export const CONFIG = {\n  helper() {},\n};\n";
     let ids = import_in(
         source,
-        &[("src/config.ts::CONFIG::helper", "helper", 2, 2)],
+        &[("src/config.ts::CONFIG::helper", "helper", 2, 2, "method")],
         &[(moniker("helper0:"), 1, 2)],
     );
     assert_eq!(
@@ -220,4 +262,107 @@ fn a_key_after_non_ascii_text_is_found_by_scips_utf16_column() {
     let source = "export const R = { a: \"é→日\", key: 2 };\n";
     let ids = import_in(source, &[], &[(moniker("key0:"), 0, 29)]);
     assert_eq!(ids, vec!["src/config.ts::R::key | key"], "{ids:?}");
+}
+
+// ---- review of the import's matching ------------------------------------------------
+
+#[test]
+fn a_second_import_keeps_two_same_line_members_on_their_own_rows() {
+    // `Box#empty.` and the `empty` inside its type literal: two non-literal
+    // monikers, one name, one line. The second import must hand each occurrence
+    // the row that carries its moniker, not the first row that contains it.
+    let source = "export class Box { empty = 1; shape: { empty: number } }\n";
+    let ids = import_in(
+        source,
+        &[],
+        &[
+            (moniker("Box#empty."), 0, 19),
+            (moniker("Box#empty.typeLiteral12:empty."), 0, 39),
+        ],
+    );
+    assert_eq!(
+        ids,
+        vec![
+            "src/config.ts::Box::empty | empty",
+            "src/config.ts::Box::empty::empty | empty"
+        ],
+        "{ids:?}"
+    );
+}
+
+#[test]
+fn a_function_that_encloses_a_key_on_one_line_is_not_that_member() {
+    // the same shape as the multi-line case, all on one line: the function
+    // starts on the key's line, so a line match alone would take it
+    let source = "function value() { return { value: 1 }; }\n";
+    let ids = import_in(
+        source,
+        &[("src/config.ts::value", "value", 1, 1, "function")],
+        &[(moniker("value()."), 0, 9), (moniker("value0:"), 0, 28)],
+    );
+    assert_eq!(
+        ids,
+        vec![
+            "src/config.ts::value | value",
+            "src/config.ts::value#2 | value"
+        ],
+        "{ids:?}"
+    );
+}
+
+#[test]
+fn same_line_methods_with_one_name_each_keep_their_own_moniker() {
+    let source = "export const f = { a: { k() {} }, b: { k() {} } };\n";
+    let (first, second) = import_with_refs(
+        source,
+        &[
+            ("src/config.ts::f::a::k", "k", 1, 1, "method"),
+            ("src/config.ts::f::b::k", "k", 1, 1, "method"),
+        ],
+        // the indexer's counters run against source order
+        &[(moniker("k1:"), 0, 39), (moniker("k0:"), 0, 24)],
+        &[],
+    );
+    let expected = vec![
+        format!("src/config.ts::f::a::k => {}", moniker("k0:")),
+        format!("src/config.ts::f::b::k => {}", moniker("k1:")),
+    ];
+    assert_eq!(
+        first.monikers, expected,
+        "each tree-sitter row is enriched by its own member, not both by the first"
+    );
+    assert_eq!(second.monikers, expected);
+}
+
+#[test]
+fn a_key_the_file_no_longer_has_there_keeps_the_indexers_name() {
+    // the file shifted after the indexer ran: (0, 25) now starts `cwd`, the
+    // moniker says `semi`
+    let source = "export const R = { semi: 1, cwd: 2 };\n";
+    let ids = import_in(source, &[], &[(moniker("semi0:"), 0, 28)]);
+    assert_eq!(ids, vec!["src/config.ts::semi0 | semi0"], "{ids:?}");
+}
+
+#[test]
+fn a_call_from_a_renamed_row_keeps_its_container() {
+    // two unowned `k` members get `k#1` and `k#2`; a call on the second's
+    // line is made by `k#2`
+    let source = "call({ k: 1 });\ncall({ k: helper() });\nfunction helper() {}\n";
+    let (first, second) = import_with_refs(
+        source,
+        &[],
+        &[
+            (moniker("k0:"), 0, 7),
+            (moniker("k1:"), 1, 7),
+            (moniker("helper()."), 2, 9),
+        ],
+        &[(moniker("helper()."), 1, 10)],
+    );
+    let edge = vec!["src/config.ts::k#2 -> src/config.ts::helper".to_string()];
+    assert!(second.ids.contains(&"src/config.ts::k#2 | k".to_string()));
+    assert_eq!(
+        first.calls, edge,
+        "the first import's edge, not the second's"
+    );
+    assert_eq!(second.calls, edge);
 }

@@ -536,7 +536,7 @@ fn import_scip_index_unrecorded(
     // `if let Ok(rows) = ...` was treating that failure identically to "this
     // is a brand-new project with no symbols yet".
     let q = "MATCH (s:Symbol) RETURN s.id, s.file, s.name, s.start_line, s.end_line, \
-             s.docstring, s.scip_id";
+             s.docstring, s.scip_id, s.kind";
     let rows = {
         let _phase = crate::write_phase::enter(&"scip-import: preload symbols", 0);
         conn.query(q)
@@ -551,8 +551,11 @@ fn import_scip_index_unrecorded(
     // id -> the moniker it was enriched with, to tell a literal member's row
     // from its same-line siblings (their monikers differ, their names do not).
     let mut existing_scip_ids: HashMap<String, String> = HashMap::new();
+    // id -> kind: a literal member's tree-sitter row is a method, never the
+    // function or class that merely contains its key.
+    let mut existing_kinds: HashMap<String, String> = HashMap::new();
     for row in rows {
-        if row.len() < 7 {
+        if row.len() < 8 {
             continue;
         }
         let sid = raw_string(&row[0]).to_string();
@@ -562,6 +565,7 @@ fn import_scip_index_unrecorded(
             enrichment_hash(raw_string(&row[5]), raw_string(&row[6])),
         );
         existing_scip_ids.insert(sid.clone(), raw_string(&row[6]).to_string());
+        existing_kinds.insert(sid.clone(), raw_string(&row[7]).to_string());
         let sfile = raw_string(&row[1]).to_string();
         let sname = raw_string(&row[2]).to_string();
         let sstart: u32 = row[3].to_string().trim_matches('"').parse().unwrap_or(0);
@@ -671,10 +675,14 @@ fn import_scip_index_unrecorded(
     // moniker is another symbol, whatever it is called and wherever it starts:
     // `Map#empty.` and the `empty` inside its inline type begin on one line.
     let mut made_in_pass: HashMap<(String, u32), String> = HashMap::new();
+    // (id, start line) -> the moniker that enriched that EXISTING row this pass.
+    let mut enriched_in_pass: HashMap<(String, u32), String> = HashMap::new();
+    let mut literals_without_registry = false;
 
     for doc in &documents {
         let file = &doc.relative_path;
         let literal_members = literal_members_of(doc, project_root);
+        literals_without_registry |= literal_members.registry_missing;
 
         let sym_info_map: HashMap<&str, &scip::types::SymbolInformation> = doc
             .symbols
@@ -711,7 +719,8 @@ fn import_scip_index_unrecorded(
                     let (line, col, ..) = occurrence_range(occ);
                     literal_members.at(line, col)
                 })
-                .flatten();
+                .flatten()
+                .filter(|member| names_literal_key(scip_sym, &member.name));
             let name = match literal {
                 Some(member) => member.name.clone(),
                 None => scip_sym_to_name(scip_sym),
@@ -748,31 +757,62 @@ fn import_scip_index_unrecorded(
             } else {
                 &file_name_to_ids
             };
+            // The id a literal member's own tree-sitter row would carry: the
+            // best of several same-line candidates.
+            let own_id = literal
+                .as_ref()
+                .map(|member| qualified_id(file, &member.owners, &name));
+            // Best candidate first: the row an earlier import gave THIS moniker,
+            // then one with no moniker yet, then (a merged declaration, whose
+            // two monikers share a row) one carrying another's. A row this pass
+            // already gave another moniker is never a candidate, so sibling
+            // members never share one.
+            let rank = |s: u32, e: u32, id: &String| -> Option<u8> {
+                if made_in_pass
+                    .get(&(id.clone(), s))
+                    .is_some_and(|moniker| moniker != scip_sym)
+                {
+                    return None;
+                }
+                let moniker = existing_scip_ids.get(id).filter(|m| !m.is_empty());
+                let taken = enriched_in_pass
+                    .get(&(id.clone(), s))
+                    .is_some_and(|m| m != scip_sym);
+                if literal.is_some() {
+                    if taken {
+                        return None;
+                    }
+                    // an earlier import's row for THIS member (its moniker is
+                    // unique in the file), or a method tree-sitter made that
+                    // starts on the key's line
+                    return match moniker {
+                        Some(moniker) => (moniker == scip_sym).then_some(0),
+                        None => (span.start_line == s
+                            && existing_kinds.get(id).is_some_and(|k| k == "method"))
+                        .then_some(if Some(id) == own_id.as_ref() { 1 } else { 2 }),
+                    };
+                }
+                if span.start_line < s || span.start_line > e {
+                    return None;
+                }
+                // a row another moniker took this pass is the last resort: two
+                // monikers of a merged declaration share one, same-line
+                // siblings must not
+                Some(match moniker {
+                    _ if taken => 3,
+                    Some(moniker) if moniker == scip_sym => 0,
+                    None => 1,
+                    Some(_) => 2,
+                })
+            };
             let matched = candidates
                 .get(&key)
                 .and_then(|candidates| {
                     candidates
                         .iter()
-                        .find(|(s, e, id)| {
-                            if made_in_pass
-                                .get(&(id.clone(), *s))
-                                .is_some_and(|moniker| moniker != scip_sym)
-                            {
-                                return false;
-                            }
-                            if literal.is_some() {
-                                // an earlier import's row for THIS member (its
-                                // moniker is unique in the file), or a symbol
-                                // tree-sitter made that starts on the key's line
-                                match existing_scip_ids.get(id).filter(|m| !m.is_empty()) {
-                                    Some(moniker) => moniker == scip_sym,
-                                    None => span.start_line == *s,
-                                }
-                            } else {
-                                span.start_line >= *s && span.start_line <= *e
-                            }
-                        })
-                        .map(|(_, _, id)| id.clone())
+                        .filter_map(|(s, e, id)| rank(*s, *e, id).map(|r| (r, *s, id)))
+                        .min_by_key(|(r, ..)| *r)
+                        .map(|(_, s, id)| (s, id.clone()))
                 })
                 .or_else(|| {
                     if literal.is_some() {
@@ -780,14 +820,15 @@ fn import_scip_index_unrecorded(
                     }
                     preexisting_file_name_to_ids.get(&key).and_then(|c| {
                         if c.len() == 1 {
-                            c.first().map(|(_, _, id)| id.clone())
+                            c.first().map(|(s, _, id)| (*s, id.clone()))
                         } else {
                             None
                         }
                     })
                 });
 
-            if let Some(sid) = matched {
+            if let Some((matched_start, sid)) = matched {
+                enriched_in_pass.insert((sid.clone(), matched_start), scip_sym.clone());
                 if existing_enrichment.get(&sid) != Some(&enrichment_hash(docstring, scip_sym)) {
                     enrichments.push((sid.clone(), docstring.to_string(), scip_sym.clone()));
                     stats.symbols_enriched += 1;
@@ -819,15 +860,23 @@ fn import_scip_index_unrecorded(
                     span.end_line,
                     sym_id.clone(),
                 ));
-                file_symbols.entry(file.clone()).or_default().push((
-                    span.start_line,
-                    span.end_line,
-                    sym_id,
-                ));
             }
         }
 
         stats.files_processed += 1;
+    }
+
+    // Members named without their owners are reported, not silent: the ids
+    // are the counter-suffixed ones until an import that has the packs.
+    if let Some(root) = project_root {
+        if literals_without_registry {
+            crate::degraded::live::set(
+                root,
+                crate::degraded::DegradedMode::ScipLiteralOwnersUnavailable,
+            );
+        } else {
+            crate::degraded::live::clear(root, crate::degraded::SCIP_LITERAL_OWNERS_UNAVAILABLE);
+        }
     }
 
     // Phase 2-style ordinal disambiguation (mirrors entities.rs's
@@ -891,6 +940,17 @@ fn import_scip_index_unrecorded(
             make_ids_unique(new_symbols, &existing_symbol_ids);
         for (moniker, id) in renamed {
             scip_sym_to_ts_id.insert(moniker, id);
+        }
+        // The container of a reference is looked up by span: the new rows join
+        // it under the ids they end up with, not the ones they were made with.
+        for (id, _, _, file, start, end, ..) in &remaining {
+            file_symbols
+                .entry(file.clone())
+                .or_default()
+                .push((*start, *end, id.clone()));
+        }
+        for syms in file_symbols.values_mut() {
+            syms.sort_by_key(|(s, e, _)| *e as i64 - *s as i64);
         }
         if duplicates > 0 {
             crate::last_run::note(
@@ -1448,6 +1508,21 @@ pub fn use_language_registry(registry: Arc<crate::lang::LanguageRegistry>) {
     let _ = LANGUAGES.set(registry);
 }
 
+/// True when `scip_sym` is the object-literal member `key` (its last descriptor
+/// is the key and the indexer's per-file counter). The key is read from the
+/// file as it is now, the index may be older: a shifted line puts the position
+/// on another member, whose name is then not this moniker's.
+fn names_literal_key(scip_sym: &str, key: &str) -> bool {
+    scip_descriptors(scip_sym)
+        .and_then(|mut d| d.pop())
+        .and_then(|last| {
+            last.name
+                .strip_prefix(key)
+                .map(|counter| !counter.is_empty() && counter.bytes().all(|b| b.is_ascii_digit()))
+        })
+        .unwrap_or(false)
+}
+
 /// scip-typescript names an object-literal member `<key><N>:` -- the key and
 /// a per-file counter, with no owner. A meta descriptor ending in a digit is
 /// how the moniker says so; the key itself comes from the source, because
@@ -1468,6 +1543,9 @@ struct FileLiterals {
     source: Vec<u8>,
     /// Byte offset where each line starts.
     line_starts: Vec<usize>,
+    /// The file defines literal members and this process has no language
+    /// registry to ask who owns them (`use_language_registry` never ran).
+    registry_missing: bool,
 }
 
 impl FileLiterals {
@@ -1476,13 +1554,16 @@ impl FileLiterals {
             members: HashMap::new(),
             source: Vec::new(),
             line_starts: Vec::new(),
+            registry_missing: false,
         }
     }
 
     /// The member whose key starts at SCIP's `(line, column)`. SCIP counts the
     /// column in UTF-16 units from the start of the line (scip-typescript) and
     /// tree-sitter in bytes, so a line with non-ASCII text before the key
-    /// would miss it without the conversion.
+    /// would miss it without the conversion. Lines are split at `\n` only: a
+    /// file with a BOM, a lone `\r` or U+2028 counts lines differently from
+    /// the indexer, so its members are not found (they keep the SCIP name).
     fn at(&self, line: i32, utf16_col: i32) -> Option<&crate::extract::LiteralMember> {
         let (line, col) = (line.max(0) as u32, utf16_col.max(0) as u32);
         self.members.get(&(line, self.byte_column(line, col)))
@@ -1522,7 +1603,10 @@ fn literal_members_of(doc: &scip::types::Document, project_root: Option<&Path>) 
             && is_literal_member_moniker(&o.symbol)
     });
     let (true, Some(root), Some(registry)) = (defines_one, project_root, LANGUAGES.get()) else {
-        return FileLiterals::none();
+        return FileLiterals {
+            registry_missing: defines_one && LANGUAGES.get().is_none(),
+            ..FileLiterals::none()
+        };
     };
     let Ok(source) = std::fs::read(root.join(&doc.relative_path)) else {
         return FileLiterals::none();
@@ -1544,6 +1628,7 @@ fn literal_members_of(doc: &scip::types::Document, project_root: Option<&Path>) 
         members,
         source,
         line_starts,
+        registry_missing: false,
     }
 }
 
