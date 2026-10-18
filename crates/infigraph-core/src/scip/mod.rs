@@ -709,7 +709,7 @@ fn import_scip_index_unrecorded(
             let literal = is_literal_member_moniker(scip_sym)
                 .then(|| {
                     let (line, col, ..) = occurrence_range(occ);
-                    literal_members.get(&(line.max(0) as u32, col.max(0) as u32))
+                    literal_members.at(line, col)
                 })
                 .flatten();
             let name = match literal {
@@ -1462,29 +1462,89 @@ fn is_literal_member_moniker(scip_sym: &str) -> bool {
         })
 }
 
-/// The object-literal members of `doc`'s file, by where their key starts,
-/// when the document defines any (`is_literal_member_moniker`): read from the
-/// file as it is now, with the pack's own `@member.*` captures. Empty when
-/// there is nothing to ask, nowhere to read it from, or no pack to ask with.
-fn literal_members_of(
-    doc: &scip::types::Document,
-    project_root: Option<&Path>,
-) -> HashMap<(u32, u32), crate::extract::LiteralMember> {
+/// The object-literal members of one file, as SCIP's positions find them.
+struct FileLiterals {
+    members: HashMap<(u32, u32), crate::extract::LiteralMember>,
+    source: Vec<u8>,
+    /// Byte offset where each line starts.
+    line_starts: Vec<usize>,
+}
+
+impl FileLiterals {
+    fn none() -> Self {
+        Self {
+            members: HashMap::new(),
+            source: Vec::new(),
+            line_starts: Vec::new(),
+        }
+    }
+
+    /// The member whose key starts at SCIP's `(line, column)`. SCIP counts the
+    /// column in UTF-16 units from the start of the line (scip-typescript) and
+    /// tree-sitter in bytes, so a line with non-ASCII text before the key
+    /// would miss it without the conversion.
+    fn at(&self, line: i32, utf16_col: i32) -> Option<&crate::extract::LiteralMember> {
+        let (line, col) = (line.max(0) as u32, utf16_col.max(0) as u32);
+        self.members.get(&(line, self.byte_column(line, col)))
+    }
+
+    fn byte_column(&self, line: u32, utf16_col: u32) -> u32 {
+        let Some(&start) = self.line_starts.get(line as usize) else {
+            return utf16_col;
+        };
+        let end = self
+            .line_starts
+            .get(line as usize + 1)
+            .copied()
+            .unwrap_or(self.source.len());
+        let Ok(text) = std::str::from_utf8(&self.source[start..end]) else {
+            return utf16_col;
+        };
+        let mut units = 0;
+        for (byte, ch) in text.char_indices() {
+            if units >= utf16_col {
+                return byte as u32;
+            }
+            units += ch.len_utf16() as u32;
+        }
+        text.len() as u32
+    }
+}
+
+/// The object-literal members of `doc`'s file, when the document defines any
+/// (`is_literal_member_moniker`): read from the file as it is now, with the
+/// pack's own `@member.*` captures. Empty when there is nothing to ask,
+/// nowhere to read it from, or no pack to ask with.
+fn literal_members_of(doc: &scip::types::Document, project_root: Option<&Path>) -> FileLiterals {
     let defines_one = doc.occurrences.iter().any(|o| {
         (o.symbol_roles & SymbolRole::Definition as i32) != 0
             && !o.symbol.starts_with("local ")
             && is_literal_member_moniker(&o.symbol)
     });
     let (true, Some(root), Some(registry)) = (defines_one, project_root, LANGUAGES.get()) else {
-        return HashMap::new();
+        return FileLiterals::none();
     };
     let Ok(source) = std::fs::read(root.join(&doc.relative_path)) else {
-        return HashMap::new();
+        return FileLiterals::none();
     };
-    registry
-        .for_file_with_content(&doc.relative_path, &source)
-        .map(|pack| crate::extract::literal_members(&source, pack))
-        .unwrap_or_default()
+    let Some(pack) = registry.for_file_with_content(&doc.relative_path, &source) else {
+        return FileLiterals::none();
+    };
+    let members = crate::extract::literal_members(&source, pack);
+    let line_starts = std::iter::once(0)
+        .chain(
+            source
+                .iter()
+                .enumerate()
+                .filter(|(_, b)| **b == b'\n')
+                .map(|(i, _)| i + 1),
+        )
+        .collect();
+    FileLiterals {
+        members,
+        source,
+        line_starts,
+    }
 }
 
 /// One descriptor of a SCIP symbol: a name and what the suffix after it said.

@@ -212,3 +212,12 @@ fn a_method_tree_sitter_made_is_enriched_by_its_scip_row_not_duplicated() {
         "the SCIP row finds the tree-sitter row by its line: {ids:?}"
     );
 }
+
+#[test]
+fn a_key_after_non_ascii_text_is_found_by_scips_utf16_column() {
+    // SCIP counts UTF-16 units from the line start; tree-sitter counts bytes.
+    // `é`, `→` and `日` are 1 unit each and 2, 3 and 3 bytes.
+    let source = "export const R = { a: \"é→日\", key: 2 };\n";
+    let ids = import_in(source, &[], &[(moniker("key0:"), 0, 29)]);
+    assert_eq!(ids, vec!["src/config.ts::R::key | key"], "{ids:?}");
+}
