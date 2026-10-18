@@ -37,6 +37,22 @@ An id is the one `infigraph search` prints: the file path from the project root,
 (`file.py::Class::method`). It is not the `Class.method` spelling a language
 uses, and it is not a symbol with a `#N` suffix (see below).
 
+Which id a member gets does not depend on which indexer found it:
+
+- a member of a type is `file::Owner::member` (nested: `file::Owner::member::inner`),
+  whether tree-sitter or a SCIP indexer found it;
+- a member of an object literal that a module-level `const`/`let`/`var` names is
+  `file::NAME::key`, nested literals `file::NAME::inner::key` (TypeScript);
+- a member of any other object literal (a call argument, an array element,
+  anything inside a function) has no stable owner and is `file::key`, or
+  `file::key#N` when the key repeats in the file, numbered in source order;
+- a type parameter, a parameter, and the members of a parameter's inline type are
+  not symbols and have no id.
+
+An infigraph that names symbols differently rebuilds a graph written by an older
+one (`graph::id_scheme`, the degraded mode `ids-outdated`), so keys written
+against the old ids need `doc_entry rekey`; `doctor` lists them.
+
 The entry is everything under the heading up to the next heading that is itself
 a key heading, or whose level is the heading's own or higher. So `####`
 sub-entries under a `###` key belong to it, and two keys of one level never
@@ -247,7 +263,10 @@ symbol, and the report lists the ones that do not, by reason:
 - written with `.` where the graph uses `::` (`A.b` for `A::b`), with the
   spelling to use;
 - several symbols of that name in the file (`name#N`: the id depends on source
-  order, so it cannot be a key);
+  order, so it cannot be a key). Members of an object literal that no name binds
+  (a call argument, an array element, anything inside a function) and overloads
+  are numbered this way, and so is a counter-style key such as `name0` that an
+  older infigraph used: do not key an entry on any of them;
 - the file is not in the graph (not indexed, or deleted);
 - no such symbol in the file (renamed or removed).
 

@@ -517,6 +517,9 @@ fn import_scip_index_unrecorded(
         std::collections::HashSet::new();
     // What each symbol is already enriched with -- see `enrichment_hash`.
     let mut existing_enrichment: HashMap<String, u64> = HashMap::new();
+    // id -> the moniker it was enriched with, to tell a literal member's row
+    // from its same-line siblings (their monikers differ, their names do not).
+    let mut existing_scip_ids: HashMap<String, String> = HashMap::new();
     for row in rows {
         if row.len() < 7 {
             continue;
@@ -527,6 +530,7 @@ fn import_scip_index_unrecorded(
             sid.clone(),
             enrichment_hash(raw_string(&row[5]), raw_string(&row[6])),
         );
+        existing_scip_ids.insert(sid.clone(), raw_string(&row[6]).to_string());
         let sfile = raw_string(&row[1]).to_string();
         let sname = raw_string(&row[2]).to_string();
         let sstart: u32 = row[3].to_string().trim_matches('"').parse().unwrap_or(0);
@@ -701,14 +705,28 @@ fn import_scip_index_unrecorded(
             // is not it, so it matches only a candidate that starts on the
             // key's line (an object-literal method tree-sitter already
             // extracted), and it never takes the lone-candidate fallback.
-            let matched = file_name_to_ids
+            // Nor does it match a symbol THIS import just made: generated
+            // one-line records repeat a key in sibling literals on one line,
+            // and the second would merge into the first (889 sittir rows).
+            let candidates = if literal.is_some() {
+                &preexisting_file_name_to_ids
+            } else {
+                &file_name_to_ids
+            };
+            let matched = candidates
                 .get(&key)
                 .and_then(|candidates| {
                     candidates
                         .iter()
-                        .find(|(s, e, _)| {
+                        .find(|(s, e, id)| {
                             if literal.is_some() {
-                                span.start_line == *s
+                                // an earlier import's row for THIS member (its
+                                // moniker is unique in the file), or a symbol
+                                // tree-sitter made that starts on the key's line
+                                match existing_scip_ids.get(id).filter(|m| !m.is_empty()) {
+                                    Some(moniker) => moniker == scip_sym,
+                                    None => span.start_line == *s,
+                                }
                             } else {
                                 span.start_line >= *s && span.start_line <= *e
                             }

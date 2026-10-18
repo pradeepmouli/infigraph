@@ -94,6 +94,15 @@ fn import_in(
         "a second import must match what the first made"
     );
 
+    for (sym, ..) in defs {
+        let rows: Vec<_> = conn
+            .query(&format!(
+                "MATCH (s:Symbol) WHERE s.scip_id = '{sym}' RETURN s.id"
+            ))
+            .unwrap()
+            .collect();
+        assert_eq!(rows.len(), 1, "exactly one row carries {sym}");
+    }
     conn.query("MATCH (s:Symbol) RETURN s.id, s.name ORDER BY s.start_line, s.id")
         .unwrap()
         .map(|r| {
@@ -169,5 +178,21 @@ fn a_symbol_that_only_encloses_a_key_is_not_that_member() {
             "src/config.ts::value#2 | value"
         ],
         "the function keeps its row and the member is its own symbol, numbered past it: {ids:?}"
+    );
+}
+
+#[test]
+fn two_members_with_one_key_on_one_line_are_two_symbols() {
+    // generated one-line records: the second `w` starts on the first one's line
+    let source = "export const R = { A: { w: 1 }, B: { w: 2 } };\n";
+    let ids = import_in(
+        source,
+        &[],
+        &[(moniker("w0:"), 0, 24), (moniker("w1:"), 0, 37)],
+    );
+    assert_eq!(
+        ids,
+        vec!["src/config.ts::R::A::w | w", "src/config.ts::R::B::w | w",],
+        "a literal member never merges into one this same import made: {ids:?}"
     );
 }

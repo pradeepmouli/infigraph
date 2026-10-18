@@ -277,5 +277,11 @@ independently without blocking on the others.
 - Phase 2 (SCIP key + `sym_seen` fix) — `pradeepmouli/infigraph#126`. **Closed** — Part A
   (`11ff3f0`) + `scip_id` persistence (`8e5d13c`) + Part B (`d14c982`).
 - Phases 3+4, merged (per-language migration of all remaining hardcoded walks) —
-  `pradeepmouli/infigraph#127`. Open.
+  `pradeepmouli/infigraph#127`. Open. Its TypeScript **fields-and-properties** part
+  is `feat/owner-qualified-ids` (owner-qualified member ids): the same
+  parent-capture-with-fallback idiom (`@method.parent`), as `@member.*` captures
+  in `typescript` and `tsx` `entities.scm` that emit no symbol and qualify the
+  rows SCIP finds (moniker chains for type members, `extract::literal_members`
+  for object literals), plus `graph::id_scheme` so a graph written under the old
+  ids is rebuilt whole.
 - Phase 5 (`IMPLEMENTS` edge) — `pradeepmouli/infigraph#129`. Open.
