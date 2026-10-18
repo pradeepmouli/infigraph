@@ -169,3 +169,35 @@ const dup = { run() {}, other: { run() {} } };
         ]
     );
 }
+
+#[test]
+fn javascript_files_are_read_the_same_way() {
+    let src = "export const cfg = { a: 1, nested: { b: 2 }, m() {} };\nfoo({ anon: 1 });\n";
+    let registry = infigraph_languages::bundled_registry().unwrap();
+    for file in ["a.js", "a.mjs"] {
+        let pack = registry
+            .for_file(file)
+            .unwrap_or_else(|| panic!("no pack for {file}"));
+        let found: Vec<_> = literal_members(src.as_bytes(), pack)
+            .into_values()
+            .map(|m| (m.name, m.owners))
+            .collect();
+        for (name, owners) in [
+            ("a", vec!["cfg"]),
+            ("b", vec!["cfg", "nested"]),
+            ("m", vec!["cfg"]),
+        ] {
+            assert!(
+                found.contains(&(
+                    name.to_string(),
+                    owners.iter().map(|s| s.to_string()).collect()
+                )),
+                "{file}: {name} in {found:?}"
+            );
+        }
+        assert!(
+            found.contains(&("anon".to_string(), vec![])),
+            "{file}: {found:?}"
+        );
+    }
+}

@@ -51,7 +51,10 @@ Which id a member gets does not depend on which indexer found it:
 
 An infigraph that names symbols differently rebuilds a graph written by an older
 one (`graph::id_scheme`, the degraded mode `ids-outdated`), so keys written
-against the old ids need `doc_entry rekey`; `doctor` lists them.
+against the old ids need `doc_entry rekey`; `doctor` lists them. The first
+daemon start with a binary that changed the scheme queues a full rebuild of every
+project it serves, at most two at a time through the reindex slot gate
+(`[index] max_concurrent_reindexes`); reads are served meanwhile.
 
 The entry is everything under the heading up to the next heading that is itself
 a key heading, or whose level is the heading's own or higher. So `####`
