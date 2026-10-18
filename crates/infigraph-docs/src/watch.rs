@@ -30,7 +30,7 @@ pub fn watch_docs(
     })
     .unless_stopped(|| stop_rx.try_recv().is_ok());
     let Some(watcher) = registered else {
-        eprintln!("[{log_prefix}] stopped");
+        log(log_prefix, "stopped");
         return Ok(());
     };
     let _watcher = watcher?;
@@ -50,6 +50,10 @@ pub fn watch_docs(
 
     let debounce = Duration::from_millis(debounce_ms);
     let mut last_reindex = Instant::now();
+    // How long the last reindex took: the next one waits `reindex_gap`.
+    let mut last_run = Duration::ZERO;
+    // What set `pending`, for the log line that follows.
+    let mut trigger = Trigger::default();
     // Start with one catch-up reindex, run once the watch above is live. A
     // document written before then -- while no watcher was attached, or in
     // the gap between attaching and the stream starting -- produced an
@@ -58,39 +62,48 @@ pub fn watch_docs(
     // incremental, so unchanged files cost a hash check. The code watcher
     // catches up the same way (`catches_drift_from_before_it_was_running`).
     let mut pending = true;
+    trigger.note_catch_up();
 
     loop {
         if stop_rx.try_recv().is_ok() {
-            eprintln!("[{log_prefix}] stopped");
+            log(log_prefix, "stopped");
             break;
         }
 
         match rx.recv_timeout(Duration::from_millis(500)) {
             Ok(Ok(event)) => {
-                if paths_warrant_reindex(&event.paths, ignore_matcher.current(Instant::now())) {
+                if let Some(first) =
+                    first_warranting(&event.paths, ignore_matcher.current(Instant::now()))
+                {
                     pending = true;
+                    trigger.note(first);
                 }
             }
-            Ok(Err(e)) => eprintln!("[{log_prefix}] watch error: {e}"),
+            Ok(Err(e)) => log(log_prefix, &format!("watch error: {e}")),
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
 
-        if pending && last_reindex.elapsed() >= debounce {
-            let indexed = match reindex_if_enabled(root, log_prefix) {
+        if pending && last_reindex.elapsed() >= reindex_gap(debounce, last_run) {
+            let started = Instant::now();
+            let wrote = match reindex_if_enabled(root, log_prefix, &trigger) {
                 // Another docs operation (index-docs, clean-docs, a read)
                 // holds the lock: keep `pending` and try on the next tick
                 // rather than block a stop behind it.
                 Reindex::Busy => continue,
-                Reindex::Done { indexed } => indexed,
+                Reindex::Done { wrote } => wrote,
             };
-            if indexed {
+            last_run = started.elapsed();
+            trigger = Trigger::default();
+            // Nothing written means nothing for a combined group to pick up.
+            if wrote {
                 match crate::combined::schedule_group_doc_refresh(root) {
-                    Ok(count) if count > 0 => {
-                        eprintln!("[{log_prefix}] refreshing {count} combined document group(s)")
-                    }
+                    Ok(count) if count > 0 => log(
+                        log_prefix,
+                        &format!("refreshing {count} combined document group(s)"),
+                    ),
                     Ok(_) => {}
-                    Err(e) => eprintln!("[{log_prefix}] combined refresh error: {e}"),
+                    Err(e) => log(log_prefix, &format!("combined refresh error: {e}")),
                 }
             }
             pending = false;
@@ -146,59 +159,163 @@ impl LiveMatcher {
 enum Reindex {
     /// The docs lock is held elsewhere; try again next tick.
     Busy,
-    /// Ran, or had nothing to do because docs are off. `indexed` is whether
-    /// it wrote anything a combined group should pick up.
-    Done { indexed: bool },
+    /// Ran, or had nothing to do because docs are off. `wrote` is whether
+    /// it changed the index: a run that found every document as it was
+    /// leaves a combined group nothing to pick up.
+    Done { wrote: bool },
 }
+
+/// What set `pending`: the first path that warranted a reindex since the last
+/// one and how many events did, so a loop can be named from the log alone.
+#[derive(Debug, Default, Clone)]
+struct Trigger {
+    first: Option<std::path::PathBuf>,
+    events: usize,
+    catch_up: bool,
+}
+
+impl Trigger {
+    fn note(&mut self, path: &Path) {
+        self.events += 1;
+        if self.first.is_none() {
+            self.first = Some(path.to_path_buf());
+        }
+    }
+
+    /// The reindex a watcher starts with, for documents written before it
+    /// was attached (#198).
+    fn note_catch_up(&mut self) {
+        self.catch_up = true;
+    }
+
+    fn describe(&self) -> String {
+        match (&self.first, self.catch_up) {
+            (Some(first), _) => format!(
+                "first: {}, {} event(s) coalesced{}",
+                first.display(),
+                self.events,
+                if self.catch_up {
+                    ", after catch-up"
+                } else {
+                    ""
+                }
+            ),
+            (None, true) => "catch-up after attaching".to_string(),
+            (None, false) => "no path recorded".to_string(),
+        }
+    }
+}
+
+/// A timestamped watcher log line: `daemon.log` lines had no time, so the
+/// rate of a loop could not be read off them.
+fn log(prefix: &str, message: &str) {
+    eprintln!(
+        "{} [{prefix}] {message}",
+        infigraph_core::watch::log_stamp()
+    );
+}
+
+/// How long the next reindex waits after the last started: the debounce, or
+/// ten times what the last one took if that is longer, so a trigger that
+/// never stops can occupy the indexer a tenth of the time at most (and the
+/// daemon's idle check, which counts a reindex as work in flight, finds it
+/// idle the rest). Capped so a single slow run cannot park the watcher.
+fn reindex_gap(debounce: Duration, last_run: Duration) -> Duration {
+    const DUTY: u32 = 10;
+    const CAP: Duration = Duration::from_secs(60);
+    debounce.max((last_run * DUTY).min(CAP))
+}
+
+/// Reindexes run by this process, for the tests that count them.
+static REINDEX_RUNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// How many doc reindexes this process has started.
+pub fn reindex_runs() -> usize {
+    REINDEX_RUNS.load(Ordering::SeqCst)
+}
+
+/// A test pads each reindex by this many milliseconds, so a slow index can be
+/// had without a large fixture.
+const REINDEX_PAD_ENV: &str = "INFIGRAPH_TEST_DOC_REINDEX_PAD_MS";
 
 /// One reindex, under the docs lock and only while docs are on. The switch
 /// is re-read *under* the lock: `clean-docs` turns it off before it takes
 /// the lock to delete, so a reindex that gets the lock after it must not
 /// recreate what it deleted.
-fn reindex_if_enabled(root: &Path, log_prefix: &str) -> Reindex {
+fn reindex_if_enabled(root: &Path, log_prefix: &str, trigger: &Trigger) -> Reindex {
     // Before the lock, not only under it: taking the lock creates its
     // directory, so a project removed while its watcher is attached (the
     // deletions themselves mark the tree dirty) would be brought back.
     if !root.join(".infigraph").is_dir() || !infigraph_core::docs_switch::docs_enabled(root) {
-        return Reindex::Done { indexed: false };
+        return Reindex::Done { wrote: false };
     }
     let _op = match infigraph_core::docs_switch::try_lock_docs_op(root) {
         Ok(Some(guard)) => guard,
         Ok(None) => return Reindex::Busy,
         Err(e) => {
-            eprintln!("[{log_prefix}] docs lock error: {e}");
-            return Reindex::Done { indexed: false };
+            log(log_prefix, &format!("docs lock error: {e}"));
+            return Reindex::Done { wrote: false };
         }
     };
     if !infigraph_core::docs_switch::docs_enabled(root) {
-        return Reindex::Done { indexed: false };
+        return Reindex::Done { wrote: false };
     }
     let _reindexing = ReindexGuard::enter();
-    eprintln!("[{log_prefix}] document change detected, reindexing...");
+    REINDEX_RUNS.fetch_add(1, Ordering::SeqCst);
+    let started = Instant::now();
+    log(
+        log_prefix,
+        &format!(
+            "document change detected ({}), reindexing...",
+            trigger.describe()
+        ),
+    );
+    if let Some(pad) = std::env::var(REINDEX_PAD_ENV)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        std::thread::sleep(Duration::from_millis(pad));
+    }
     let mut idx = match DocIndex::open(root) {
         Ok(i) => i,
         Err(e) => {
-            eprintln!("[{log_prefix}] open error: {e}");
-            return Reindex::Done { indexed: false };
+            log(log_prefix, &format!("open error: {e}"));
+            return Reindex::Done { wrote: false };
         }
     };
     if let Err(e) = idx.init() {
-        eprintln!("[{log_prefix}] init error: {e}");
-        return Reindex::Done { indexed: false };
+        log(log_prefix, &format!("init error: {e}"));
+        return Reindex::Done { wrote: false };
     }
     match idx.index() {
         Ok(r) => {
-            eprintln!(
-                "[{log_prefix}] reindexed: {} files, {} chunks",
-                r.indexed_files, r.total_chunks
+            let wrote = r.indexed_files > 0 || r.bfs_discovered > 0 || r.pruned > 0;
+            log(
+                log_prefix,
+                &format!(
+                    "reindexed: {} files, {} chunks ({}, {}ms)",
+                    r.indexed_files,
+                    r.total_chunks,
+                    if wrote { "changed" } else { "unchanged" },
+                    started.elapsed().as_millis()
+                ),
             );
-            Reindex::Done { indexed: true }
+            Reindex::Done { wrote }
         }
         Err(e) => {
-            eprintln!("[{log_prefix}] index error: {e}");
-            Reindex::Done { indexed: false }
+            log(log_prefix, &format!("index error: {e}"));
+            Reindex::Done { wrote: false }
         }
     }
+}
+
+/// Whether any of `paths` warrants a reindex (the tests' view of [`first_warranting`]).
+#[cfg(test)]
+pub(crate) fn paths_warrant_reindex(
+    paths: &[std::path::PathBuf],
+    ignore_matcher: &infigraph_core::ignore_rules::IgnoreMatcher,
+) -> bool {
+    first_warranting(paths, ignore_matcher).is_some()
 }
 
 /// Whether a watch event touching `paths` should schedule a reindex.
@@ -226,13 +343,16 @@ fn reindex_if_enabled(root: &Path, log_prefix: &str) -> Reindex {
 /// picked up. Ignored directories (`target/`, `node_modules/`) are still
 /// excluded, and directory creation is far rarer than the file writes the
 /// storm guard above worries about.
-pub(crate) fn paths_warrant_reindex(
-    paths: &[std::path::PathBuf],
+///
+/// `skips`, not `is_ignored`: the watcher gives the answer the walk gives,
+/// hidden entries included.
+pub(crate) fn first_warranting<'a>(
+    paths: &'a [std::path::PathBuf],
     ignore_matcher: &infigraph_core::ignore_rules::IgnoreMatcher,
-) -> bool {
-    paths.iter().any(|p| {
+) -> Option<&'a std::path::PathBuf> {
+    paths.iter().find(|p| {
         let is_dir = p.is_dir();
-        if ignore_matcher.is_ignored(p, is_dir) {
+        if ignore_matcher.skips(p, is_dir) {
             return false;
         }
         is_document_file(p) || is_dir
@@ -396,14 +516,14 @@ mod tests {
     fn a_reindex_in_a_removed_project_creates_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("removed-worktree");
-        let outcome = reindex_if_enabled(&root, "test");
-        assert!(matches!(outcome, Reindex::Done { indexed: false }));
+        let outcome = reindex_if_enabled(&root, "test", &Trigger::default());
+        assert!(matches!(outcome, Reindex::Done { wrote: false }));
         assert!(!root.exists(), "the reindex re-created {}", root.display());
 
         // Present, but without an `.infigraph/`: same.
         std::fs::create_dir_all(&root).unwrap();
-        let outcome = reindex_if_enabled(&root, "test");
-        assert!(matches!(outcome, Reindex::Done { indexed: false }));
+        let outcome = reindex_if_enabled(&root, "test", &Trigger::default());
+        assert!(matches!(outcome, Reindex::Done { wrote: false }));
         assert!(!root.join(".infigraph").exists());
     }
 
@@ -415,7 +535,7 @@ mod tests {
     /// That is exactly how `attach_poll_interval_reads_renamed_env_var`
     /// failed on both macOS and ubuntu in CI: it set 77 and read back
     /// whatever a concurrent fast-poll test had just written or removed.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    pub(super) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Holds [`ENV_LOCK`] and sets the fast poll interval for the caller's
     /// scope, clearing it on drop. Replaces the old
@@ -864,6 +984,330 @@ mod live_matcher_tests {
             live.current(started + every)
                 .is_ignored(&root.join("draft.md"), false),
             "once the interval has passed the edit must take effect"
+        );
+    }
+}
+
+/// A "document change detected, reindexing" loop that finds nothing: the doc
+/// watcher marked the tree dirty for a path the walk never indexes. The
+/// watcher must give the same answer as the walk, so each fixture here asks
+/// both about the same file.
+#[cfg(test)]
+mod churn {
+    use super::tests::ENV_LOCK;
+    use super::*;
+    use infigraph_core::ignore_rules::{Domain, IgnoreMatcher};
+    use std::path::PathBuf;
+
+    fn touch(root: &Path, rel: &str, text: &str) -> PathBuf {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, text).unwrap();
+        path
+    }
+
+    fn warrants(root: &Path, paths: &[PathBuf]) -> bool {
+        paths_warrant_reindex(paths, &IgnoreMatcher::build(root, Domain::Docs))
+    }
+
+    /// Candidate: directory events under `.git/` (every `git worktree
+    /// add/remove/prune`, every commit). The safety list already holds
+    /// `.git` and `.infigraph`, so these were expected to be refuted.
+    #[test]
+    fn git_and_index_internals_never_warrant_a_reindex() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        for dir in [
+            ".git/objects/ab",
+            ".git/worktrees/wt-x",
+            ".git/refs/heads",
+            ".infigraph/sessions",
+            ".infigraph/docs.kuzu.d",
+        ] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        let events = [
+            root.join(".git/objects/ab"),
+            root.join(".git/worktrees/wt-x"),
+            root.join(".git/refs/heads"),
+            touch(&root, ".git/worktrees/wt-x/gitdir", "x"),
+            touch(&root, ".git/config", "x"),
+            touch(&root, ".git/COMMIT_EDITMSG", "x"),
+            root.join(".infigraph/sessions"),
+            touch(&root, ".infigraph/sessions/session_x.json", "{}"),
+            touch(&root, ".infigraph/docs_embeddings.bin", "x"),
+        ];
+        for event in &events {
+            assert!(
+                !warrants(&root, std::slice::from_ref(event)),
+                "{} marks the tree dirty",
+                event.display()
+            );
+        }
+    }
+
+    /// Candidate: a nested worktree under a gitignored `scratchpad/`.
+    #[test]
+    fn an_ignored_nested_worktree_never_warrants_a_reindex() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        touch(&root, ".gitignore", "/scratchpad/\n");
+        let events = [
+            touch(&root, "scratchpad/wt-x/docs/a.md", "# a"),
+            root.join("scratchpad/wt-x/docs"),
+            root.join("scratchpad/wt-x"),
+        ];
+        for event in &events {
+            assert!(
+                !warrants(&root, std::slice::from_ref(event)),
+                "{} marks the tree dirty",
+                event.display()
+            );
+        }
+    }
+
+    /// Candidate: hidden directories that are not on the safety list. The
+    /// walk skips every hidden entry (`hidden(true)`); the matcher did not
+    /// model that, and `.claude/**/*.md` or `.github/*.md` is document-shaped.
+    #[test]
+    fn a_hidden_directory_never_warrants_a_reindex() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        let events = [
+            touch(&root, ".claude/notes.md", "# n"),
+            touch(&root, ".github/ISSUE_TEMPLATE/bug.md", "# b"),
+            touch(&root, "docs/.drafts/wip.md", "# w"),
+            root.join(".claude"),
+            root.join(".github/ISSUE_TEMPLATE"),
+            root.join("docs/.drafts"),
+        ];
+        for event in &events {
+            assert!(
+                !warrants(&root, std::slice::from_ref(event)),
+                "{} marks the tree dirty",
+                event.display()
+            );
+        }
+    }
+
+    /// Candidate: the event reaches the watcher spelled differently from the
+    /// root the matcher was built for. FSEvents reports resolved paths; a
+    /// project reached through a symlink (`GitHub` -> `GitHub.nosync`) has
+    /// every event outside the root's spelling, so a rule anchored at the
+    /// root (`/scratchpad/`) cannot match it.
+    #[cfg(unix)]
+    #[test]
+    fn an_event_spelled_through_the_resolved_path_is_judged_like_the_given_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().canonicalize().unwrap().join("real");
+        std::fs::create_dir_all(real.join("proj")).unwrap();
+        let link = tmp.path().canonicalize().unwrap().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let given = link.join("proj");
+        let resolved = real.join("proj");
+        touch(&resolved, ".gitignore", "/scratchpad/\n");
+        touch(&resolved, "scratchpad/wt-x/a.md", "# a");
+        touch(&resolved, ".claude/n.md", "# n");
+        touch(&resolved, "docs/real.md", "# r");
+        let matcher = IgnoreMatcher::build(&given, Domain::Docs);
+
+        for ignored in ["scratchpad/wt-x/a.md", ".claude/n.md"] {
+            for base in [&given, &resolved] {
+                assert!(
+                    !paths_warrant_reindex(&[base.join(ignored)], &matcher),
+                    "{} is judged differently when spelled {}",
+                    ignored,
+                    base.display()
+                );
+            }
+        }
+        for base in [&given, &resolved] {
+            assert!(
+                paths_warrant_reindex(&[base.join("docs/real.md")], &matcher),
+                "a real document is missed when spelled {}",
+                base.display()
+            );
+        }
+    }
+
+    /// The principle: the watcher answers as the walk does. Every file below
+    /// is either indexed by the walk or not, and its event warrants a reindex
+    /// exactly when it is.
+    #[test]
+    fn a_file_event_warrants_a_reindex_exactly_when_the_walk_indexes_the_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        touch(&root, ".gitignore", "/scratchpad/\n/out/\n");
+        let files = [
+            "README.md",
+            "docs/a.md",
+            "docs/deep/b.rst",
+            "scratchpad/wt/c.md",
+            "out/d.md",
+            "target/doc/index.html",
+            "node_modules/p/readme.md",
+            ".claude/e.md",
+            ".github/f.md",
+            "docs/.drafts/g.md",
+            ".git/info/h.md",
+            ".infigraph/i.md",
+            "src/main.rs",
+        ];
+        for f in files {
+            touch(&root, f, "# x");
+        }
+        let (walked, _) = crate::walk_doc_files(&root);
+        let matcher = IgnoreMatcher::build(&root, Domain::Docs);
+
+        let mut wrong = Vec::new();
+        for f in files {
+            let path = root.join(f);
+            let indexed = walked.contains(&path);
+            let warrants = paths_warrant_reindex(std::slice::from_ref(&path), &matcher);
+            if indexed != warrants {
+                wrong.push(format!("{f}: indexed={indexed} warrants={warrants}"));
+            }
+        }
+        assert!(wrong.is_empty(), "watcher and walk disagree: {wrong:#?}");
+    }
+
+    // ---- the running watcher ------------------------------------------
+
+    /// Starts `watch_docs` on `root` (docs on, the debounce small) and waits
+    /// for its catch-up reindex. Returns the stop handle and the thread.
+    fn attach(root: &Path) -> (mpsc::Sender<()>, std::thread::JoinHandle<()>) {
+        std::fs::create_dir_all(root.join(".infigraph")).unwrap();
+        infigraph_core::docs_switch::set_docs_enabled(root, true).unwrap();
+        let (stop_tx, stop_rx) = mpsc::channel();
+        let root_owned = root.to_path_buf();
+        let before = reindex_runs();
+        let handle = std::thread::spawn(move || {
+            watch_docs(&root_owned, 50, stop_rx, "churn-test").unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while reindex_runs() == before && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(reindex_runs() > before, "the catch-up reindex never ran");
+        // Let the registration settle and the catch-up finish.
+        std::thread::sleep(Duration::from_millis(500));
+        (stop_tx, handle)
+    }
+
+    fn detach((stop_tx, handle): (mpsc::Sender<()>, std::thread::JoinHandle<()>)) {
+        let _ = stop_tx.send(());
+        handle.join().unwrap();
+    }
+
+    /// The loop itself: writes to hidden files start no reindex, writes to a
+    /// document do (so the counter is not simply stuck).
+    #[test]
+    fn writes_the_walk_never_indexes_start_no_reindex() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        touch(&root, "docs/real.md", "# real");
+        let watcher = attach(&root);
+
+        let before = reindex_runs();
+        for i in 0..30 {
+            touch(&root, ".claude/notes.md", &format!("# n {i}"));
+            touch(&root, ".github/ISSUE_TEMPLATE/bug.md", &format!("# b {i}"));
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::thread::sleep(Duration::from_millis(1500));
+        let hidden_runs = reindex_runs() - before;
+
+        touch(&root, "docs/real.md", "# real, changed");
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while reindex_runs() == before + hidden_runs && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let real_runs = reindex_runs() - before - hidden_runs;
+        detach(watcher);
+
+        assert_eq!(
+            hidden_runs, 0,
+            "writes under hidden directories started {hidden_runs} reindex(es) the walk would not need"
+        );
+        assert!(real_runs > 0, "a real document change started none");
+    }
+
+    /// A trigger that never stops (a formatter rewriting a document with the
+    /// same bytes) finds nothing every time. It must not keep the indexer,
+    /// and with it the daemon's in-flight accounting, busy: the gap after a
+    /// run scales with what the run cost.
+    #[test]
+    fn a_trigger_that_never_stops_leaves_the_indexer_mostly_idle() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        touch(&root, "docs/real.md", "# real");
+        let watcher = attach(&root);
+
+        std::env::set_var(REINDEX_PAD_ENV, "300");
+        let stop = Arc::new(AtomicBool::new(false));
+        let churn = {
+            let (root, stop) = (root.clone(), stop.clone());
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    touch(&root, "docs/real.md", "# real");
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            })
+        };
+        let (mut busy, mut samples) = (0u32, 0u32);
+        let until = Instant::now() + Duration::from_secs(6);
+        while Instant::now() < until {
+            samples += 1;
+            if reindex_in_progress() {
+                busy += 1;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        stop.store(true, Ordering::Relaxed);
+        churn.join().unwrap();
+        std::env::remove_var(REINDEX_PAD_ENV);
+        detach(watcher);
+
+        let fraction = f64::from(busy) / f64::from(samples);
+        assert!(
+            fraction < 0.25,
+            "the indexer was busy {:.0}% of the time: a daemon would never find itself idle",
+            fraction * 100.0
+        );
+    }
+
+    #[test]
+    fn the_gap_after_a_run_is_ten_times_its_cost_within_a_cap() {
+        let debounce = Duration::from_millis(500);
+        assert_eq!(reindex_gap(debounce, Duration::from_millis(8)), debounce);
+        assert_eq!(
+            reindex_gap(debounce, Duration::from_secs(2)),
+            Duration::from_secs(20)
+        );
+        assert_eq!(
+            reindex_gap(debounce, Duration::from_secs(600)),
+            Duration::from_secs(60)
+        );
+    }
+
+    #[test]
+    fn the_log_names_the_first_path_and_how_many_events_coalesced() {
+        let mut trigger = Trigger::default();
+        assert_eq!(trigger.describe(), "no path recorded");
+        trigger.note_catch_up();
+        assert_eq!(trigger.describe(), "catch-up after attaching");
+        trigger.note(Path::new("/p/docs/a.md"));
+        trigger.note(Path::new("/p/docs/b.md"));
+        assert_eq!(
+            trigger.describe(),
+            "first: /p/docs/a.md, 2 event(s) coalesced, after catch-up"
+        );
+        let stamp = infigraph_core::watch::log_stamp();
+        assert!(
+            stamp.len() == 20 && stamp.ends_with('Z') && stamp.as_bytes()[10] == b'T',
+            "{stamp}"
         );
     }
 }

@@ -209,7 +209,14 @@ pub async fn run_producer(
                         };
 
                         for path in event.paths {
-                            if ignore_matcher.is_ignored(&path, path.is_dir()) {
+                            // Spelled as the root is: a backend that reports
+                            // resolved paths would otherwise fail the
+                            // `strip_prefix` below and drop the event.
+                            let path = ignore_matcher.respelled(&path).into_owned();
+                            // What the walk would not visit, hidden files
+                            // included: a `.foo.py` it never indexes would
+                            // otherwise leave a dirty mark nothing clears.
+                            if ignore_matcher.skips(&path, path.is_dir()) {
                                 continue;
                             }
 

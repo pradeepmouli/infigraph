@@ -563,6 +563,11 @@ pub struct IgnoreMatcher {
     inside_includes: Gitignore,
     /// `[ignore] <domain>`, the point-wise twin of the walker's check.
     domain_rules: DomainRules,
+    /// `root` with symlinks resolved, when that spells it differently. A
+    /// watcher backend reports resolved paths (FSEvents does), so a project
+    /// reached through a symlink gets every event outside `root`'s spelling,
+    /// where no rule anchored at `root` can match it.
+    resolved_root: Option<PathBuf>,
 }
 
 impl IgnoreMatcher {
@@ -620,7 +625,12 @@ impl IgnoreMatcher {
             .build()
             .unwrap_or_else(|_| Gitignore::empty());
         let domain_rules = DomainRules::for_walk(&root, &project_root, domain);
+        let resolved_root = root
+            .canonicalize()
+            .ok()
+            .filter(|resolved| *resolved != root);
         IgnoreMatcher {
+            resolved_root,
             root,
             gitignore,
             includes: include_roots,
@@ -630,12 +640,56 @@ impl IgnoreMatcher {
         }
     }
 
+    /// `path` spelled under `root`, as every rule here expects it, when it
+    /// arrives spelled under the resolved root. Any other path is returned
+    /// as it is.
+    pub fn respelled<'a>(&self, path: &'a Path) -> std::borrow::Cow<'a, Path> {
+        if let Some(resolved) = &self.resolved_root {
+            if !path.starts_with(&self.root) {
+                if let Ok(rest) = path.strip_prefix(resolved) {
+                    return std::borrow::Cow::Owned(self.root.join(rest));
+                }
+            }
+        }
+        std::borrow::Cow::Borrowed(path)
+    }
+
+    /// What the walk would not visit: [`is_ignored`](Self::is_ignored) or a
+    /// hidden component. The walk skips hidden entries (`hidden(true)`),
+    /// which `is_ignored` does not model because the ignore files themselves
+    /// are dot-prefixed and config discovery reads `.env`; a caller that
+    /// must agree with the walk (a watcher deciding whether an event can
+    /// matter, a link target) asks this instead. A component is judged below
+    /// the matcher's root, or below the `[index] include` root the path is
+    /// in, never above it: a repo under `~/.work/` is still a repo, and an
+    /// include root inside a hidden directory is walked.
+    pub fn skips(&self, path: &Path, is_dir: bool) -> bool {
+        let path = self.respelled(path);
+        self.is_ignored(&path, is_dir) || self.hidden_below(&path)
+    }
+
+    fn hidden_below(&self, path: &Path) -> bool {
+        let base = self
+            .includes
+            .iter()
+            .find(|root| path.starts_with(root))
+            .unwrap_or(&self.root);
+        path.strip_prefix(base).is_ok_and(|rel| {
+            rel.components().any(|c| {
+                matches!(c, std::path::Component::Normal(name)
+                    if name.to_string_lossy().starts_with('.'))
+            })
+        })
+    }
+
     /// True if `path` should be excluded -- either via the safety list
     /// (checked against every path component, so a nested occurrence like
     /// `foo/node_modules/bar` is still caught) or via a discovered
     /// `.gitignore`/`.infigraphignore` rule. Inside an `[index] include`
     /// root both checks narrow to the part of the path below that root.
     pub fn is_ignored(&self, path: &Path, is_dir: bool) -> bool {
+        let path = self.respelled(path);
+        let path = path.as_ref();
         let include = self.includes.iter().find(|root| path.starts_with(root));
 
         // The safety list still applies *below* an include root -- opting a
@@ -1035,6 +1089,73 @@ mod tests {
 
         let matcher = IgnoreMatcher::build(dir.path(), Domain::Code);
         assert!(!matcher.is_ignored(&pkg.join("grammar.js"), false));
+    }
+
+    /// `skips` is "what the walk would not visit": the walk's answer for the
+    /// include root under a hidden ancestor (visited), for an entry hidden
+    /// below it (skipped), and for a project that itself sits under a hidden
+    /// directory (its files are visited: ancestors are never judged).
+    #[test]
+    fn skips_agrees_with_the_walk_about_hidden_components() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join(".work/proj");
+        fs::create_dir_all(project.join(".infigraph")).unwrap();
+        fs::write(project.join(".gitignore"), "node_modules/\n").unwrap();
+        fs::write(
+            project.join(".infigraph/config.toml"),
+            "[index]\ninclude = [\"node_modules/.pnpm/pkg@1.0.0/node_modules/pkg\"]\n",
+        )
+        .unwrap();
+        let pkg = project.join("node_modules/.pnpm/pkg@1.0.0/node_modules/pkg");
+        fs::create_dir_all(pkg.join(".sub")).unwrap();
+        fs::write(pkg.join("grammar.js"), "x").unwrap();
+        fs::write(pkg.join(".hidden.js"), "x").unwrap();
+        fs::write(pkg.join(".sub/inner.js"), "x").unwrap();
+        fs::create_dir_all(project.join(".cache")).unwrap();
+        fs::write(project.join(".cache/n.js"), "x").unwrap();
+        fs::write(project.join("main.js"), "x").unwrap();
+
+        let walked = walked_files(&project);
+        let matcher = IgnoreMatcher::build(&project, Domain::Code);
+        for file in [
+            pkg.join("grammar.js"),
+            pkg.join(".hidden.js"),
+            pkg.join(".sub/inner.js"),
+            project.join(".cache/n.js"),
+            project.join("main.js"),
+        ] {
+            let visited = walked.iter().any(|p| project.join(p) == file);
+            assert_eq!(
+                !matcher.skips(&file, false),
+                visited,
+                "skips and the walk disagree about {}: walked {walked:?}",
+                file.display()
+            );
+        }
+    }
+
+    /// An event arrives spelled under the resolved root; every rule here is
+    /// written against the root as given.
+    #[cfg(unix)]
+    #[test]
+    fn a_path_under_the_resolved_root_is_respelled_under_the_given_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().canonicalize().unwrap().join("real");
+        fs::create_dir_all(real.join("proj")).unwrap();
+        let link = dir.path().canonicalize().unwrap().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        fs::write(real.join("proj/.gitignore"), "/out/\n").unwrap();
+        let matcher = IgnoreMatcher::build(&link.join("proj"), Domain::Code);
+
+        assert_eq!(
+            matcher.respelled(&real.join("proj/out/a.js")).as_ref(),
+            link.join("proj/out/a.js")
+        );
+        assert!(matcher.is_ignored(&real.join("proj/out/a.js"), false));
+        assert!(matcher.is_ignored(&link.join("proj/out/a.js"), false));
+        assert!(!matcher.is_ignored(&real.join("proj/src/a.js"), false));
+        let elsewhere = Path::new("/somewhere/else/a.js");
+        assert_eq!(matcher.respelled(elsewhere).as_ref(), elsewhere);
     }
 
     /// pnpm lays `node_modules/<pkg>` out as a symlink into `.pnpm/`, so

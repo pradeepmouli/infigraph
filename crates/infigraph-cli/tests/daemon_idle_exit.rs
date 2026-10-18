@@ -241,3 +241,97 @@ fn a_released_lease_lets_the_daemon_exit_and_the_next_use_respawns_it() {
         .status();
     assert!(leased, "the respawned daemon must be leased");
 }
+
+/// A doc watcher whose trigger never stops (a formatter rewriting a document
+/// with the same bytes) reindexes nothing each time, but a reindex counts as
+/// work in flight, so a daemon that is busy with one nearly all the time
+/// never finds itself idle (a sittir worktree daemon ran 1d16h at ~99% CPU
+/// with no lease and never idled out). The gap after a reindex scales with
+/// its cost, so most checks find the daemon idle.
+#[test]
+fn a_daemon_whose_doc_watcher_keeps_reindexing_nothing_still_idles_out() {
+    let project = indexed_project();
+    let root = project.path();
+    std::fs::write(root.join("README.md"), "# readme\n").unwrap();
+    infigraph_core::docs_switch::set_docs_enabled(root, true).unwrap();
+    let child = support::infigraph()
+        .args(["daemon", "--debounce", "50"])
+        .current_dir(root)
+        .env_remove("INFIGRAPH_WATCH_DAEMON")
+        .env("INFIGRAPH_DAEMON_IDLE_GRACE_SECS", "2")
+        .env("INFIGRAPH_DAEMON_IDLE_CHECK_SECS", "1")
+        // Each doc reindex takes 2s, as a large document set does.
+        .env("INFIGRAPH_TEST_DOC_REINDEX_PAD_MS", "2000")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .unwrap();
+    let mut daemon = KillOnDrop(child);
+    let lock = root.join(".infigraph").join("watch.lock");
+    assert!(
+        infigraph_core::daemon::lifecycle::wait_for_daemon_ready(&lock, Duration::from_secs(30)),
+        "daemon never acquired watch.lock"
+    );
+
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let churn = {
+        let (stop, readme) = (stop.clone(), root.join("README.md"));
+        std::thread::spawn(move || {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                let _ = std::fs::write(&readme, "# readme\n");
+                std::thread::sleep(Duration::from_millis(30));
+            }
+        })
+    };
+    let gone = wait_until_gone("daemon with a churning doc watcher", || daemon_alive(root));
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    churn.join().unwrap();
+
+    assert!(
+        gone.is_some_and(|waited| waited < Duration::from_secs(15)),
+        "a daemon with no lease whose doc watcher reindexes nothing in a loop must idle out \
+         (waited {gone:?})"
+    );
+    assert!(daemon.wait().unwrap().success());
+}
+
+/// A stop (here the out-of-band `watch.stop` file, the one that works when
+/// the daemon cannot take a control frame) must not wait for a doc reindex
+/// that never ends: the join on the doc-watch thread is bounded.
+#[test]
+fn a_stop_is_not_held_up_by_a_doc_reindex_that_never_finishes() {
+    let project = indexed_project();
+    let root = project.path();
+    std::fs::write(root.join("README.md"), "# readme\n").unwrap();
+    infigraph_core::docs_switch::set_docs_enabled(root, true).unwrap();
+    let child = support::infigraph()
+        .args(["daemon", "--debounce", "50"])
+        .current_dir(root)
+        .env_remove("INFIGRAPH_WATCH_DAEMON")
+        .env("INFIGRAPH_DAEMON_IDLE_GRACE_SECS", "0")
+        // The catch-up reindex takes ten minutes.
+        .env("INFIGRAPH_TEST_DOC_REINDEX_PAD_MS", "600000")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .unwrap();
+    let mut daemon = KillOnDrop(child);
+    let lock = root.join(".infigraph").join("watch.lock");
+    assert!(
+        infigraph_core::daemon::lifecycle::wait_for_daemon_ready(&lock, Duration::from_secs(30)),
+        "daemon never acquired watch.lock"
+    );
+    // Let the catch-up reindex start and get stuck in its padding.
+    std::thread::sleep(Duration::from_secs(3));
+
+    std::fs::write(root.join(".infigraph").join("watch.stop"), b"").unwrap();
+    let gone = wait_until_gone("daemon stopped during a doc reindex", || daemon_alive(root));
+
+    assert!(
+        gone.is_some(),
+        "a stop was held up by a doc reindex (waited {gone:?})"
+    );
+    let _ = daemon.wait();
+}

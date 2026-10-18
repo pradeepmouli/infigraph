@@ -901,8 +901,56 @@ impl DocWatchThread {
         self.shutdown
             .store(true, std::sync::atomic::Ordering::Relaxed);
         if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
+            if !join_within(handle, DOC_WATCH_STOP_GRACE) {
+                eprintln!(
+                    "{} [doc-watch-daemon] still reindexing {}s after a stop was asked; not \
+                     waiting for it any longer",
+                    infigraph_core::watch::log_stamp(),
+                    DOC_WATCH_STOP_GRACE.as_secs()
+                );
+            }
         }
+    }
+}
+
+/// How long a stop waits for a doc reindex that is already running. A reindex
+/// cannot be interrupted, so an unbounded join made the whole daemon's
+/// shutdown (SIGTERM, `daemon-stop`) wait for it; a daemon stuck inside one
+/// ignored every stop for minutes and had to be killed with SIGKILL, which
+/// leaves the graph's WAL unreplayed.
+const DOC_WATCH_STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Joins `handle` if it finishes within `grace`; otherwise leaves it running
+/// (it ends with the process) and says so by returning false.
+fn join_within(handle: std::thread::JoinHandle<()>, grace: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + grace;
+    while !handle.is_finished() {
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let _ = handle.join();
+    true
+}
+
+#[cfg(test)]
+mod join_within_tests {
+    use super::join_within;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_thread_that_finishes_in_time_is_joined() {
+        let handle = std::thread::spawn(|| std::thread::sleep(Duration::from_millis(50)));
+        assert!(join_within(handle, Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn a_thread_that_does_not_finish_is_given_up_on_at_the_deadline() {
+        let handle = std::thread::spawn(|| std::thread::sleep(Duration::from_secs(5)));
+        let started = Instant::now();
+        assert!(!join_within(handle, Duration::from_millis(200)));
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 }
 
