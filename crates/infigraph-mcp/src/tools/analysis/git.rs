@@ -119,36 +119,17 @@ pub fn build_detect_changes_report(
     Ok(out)
 }
 
-/// Parse unified diff output (with --unified=0) to extract (file, start_line, end_line) hunks.
+/// The new-side (file, start, end) of every hunk of a `--unified=0` diff; a
+/// hunk that deletes lines at the top of a file has none.
 pub fn parse_diff_hunks(diff: &str) -> Vec<(String, u32, u32)> {
-    let mut hunks = Vec::new();
-    let mut current_file = String::new();
-
-    for line in diff.lines() {
-        if let Some(path) = line.strip_prefix("+++ b/") {
-            current_file = path.to_string();
-            continue;
-        }
-
-        if line.starts_with("@@") && !current_file.is_empty() {
-            if let Some(plus_part) = line.split('+').nth(1) {
-                let range_part = plus_part.split(' ').next().unwrap_or("");
-                let parts: Vec<&str> = range_part.split(',').collect();
-                let start: u32 = parts[0].parse().unwrap_or(0);
-                let count: u32 = if parts.len() > 1 {
-                    parts[1].parse().unwrap_or(1)
-                } else {
-                    1
-                };
-                if start > 0 {
-                    let end = if count == 0 { start } else { start + count - 1 };
-                    hunks.push((current_file.clone(), start, end));
-                }
-            }
-        }
-    }
-
-    hunks
+    infigraph_core::git_blame::parse_hunks(diff)
+        .into_iter()
+        .filter(|h| h.new_start > 0 && !h.file.is_empty())
+        .map(|h| {
+            let end = h.new_end() as u32;
+            (h.file, h.new_start as u32, end)
+        })
+        .collect()
 }
 
 pub fn tool_semantic_diff(args: &Value) -> Result<String> {
@@ -310,4 +291,23 @@ pub fn tool_git_summary(args: &Value) -> Result<String> {
     }
 
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The tuples the pre-`git_blame::parse_hunks` parser gave for this diff
+    /// (a count-less header, a pure deletion, a deleted file, a new file).
+    #[test]
+    fn parse_diff_hunks_gives_what_it_always_gave() {
+        let diff = "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -3 +3 @@ fn f\n-a\n+b\n@@ -10,2 +9,0 @@\n-x\n-y\n@@ -20,0 +20,4 @@\n+1\n+2\n+3\n+4\ndiff --git a/gone.rs b/gone.rs\n--- a/gone.rs\n+++ /dev/null\n@@ -1,3 +0,0 @@\n-q\n-r\n-s\ndiff --git a/new.rs b/new.rs\n--- /dev/null\n+++ b/new.rs\n@@ -0,0 +1,2 @@\n+n\n+m\n";
+        let want: Vec<(String, u32, u32)> = vec![
+            ("a.rs".into(), 3, 3),
+            ("a.rs".into(), 9, 9),
+            ("a.rs".into(), 20, 23),
+            ("new.rs".into(), 1, 2),
+        ];
+        assert_eq!(parse_diff_hunks(diff), want);
+    }
 }
