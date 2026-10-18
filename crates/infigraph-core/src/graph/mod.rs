@@ -43,7 +43,7 @@ pub use queries::{
     ImpactRow, KindCount, LanguageCount, ReferenceRow, SkeletonSymbol, SymbolDetail, SymbolMeta,
     SymbolRow, SymbolWithDocstring, TestContext, TestCoverage, TestTarget, TypeHierarchy,
 };
-pub use session_store::{SessionData, SessionStore};
+pub use session_store::{Scan, SessionData, SessionStore, Skipped};
 pub use store::{
     db_lock_path, is_checkpoint_in_progress_error, is_lock_contention_error,
     is_storage_version_mismatch_error, is_transient_open_error, is_transient_wal_open_race_error,
