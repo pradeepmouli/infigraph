@@ -1301,6 +1301,30 @@ fn occurrence_span(occ: &Occurrence, file: &str) -> Span {
 /// string once the old single-`if` parens handling failed to find any
 /// identifier left to extract).
 fn scip_sym_to_name(scip_sym: &str) -> String {
+    accessor_name(descriptor_name(scip_sym))
+}
+
+/// scip-typescript spells an accessor `<get>x` / `<set>x` and a constructor
+/// `<constructor>`; tree-sitter names the same `method_definition` `x` /
+/// `constructor`, so these are what a SCIP row must be called to find (and be
+/// found by) the row tree-sitter made. A getter and a setter then number as
+/// overloads. A private member `#x` is written that way in source and tree-sitter
+/// extracts none (`private_property_identifier` is not in the method pattern):
+/// kept as written.
+fn accessor_name(name: String) -> String {
+    if let Some(rest) = name
+        .strip_prefix("<get>")
+        .or_else(|| name.strip_prefix("<set>"))
+    {
+        return rest.to_string();
+    }
+    if name == "<constructor>" {
+        return "constructor".to_string();
+    }
+    name
+}
+
+fn descriptor_name(scip_sym: &str) -> String {
     let mut s = scip_sym.trim_end();
 
     // Strip a trailing method terminator.
@@ -3878,6 +3902,71 @@ mod tests {
         assert!(!is_parameter_symbol(
             "rust-analyzer cargo k 0.0.0 impl#[`Foo`][`Tr`]bar()."
         ));
+    }
+
+    #[test]
+    fn an_accessor_or_constructor_is_named_as_tree_sitter_names_it() {
+        for (descriptor, want) in [
+            ("A#`<get>slots`.", "slots"),
+            ("A#`<set>slots`.", "slots"),
+            ("A#`<constructor>`().", "constructor"),
+            // a private member is written `#x` in source: kept as written
+            ("A#`#computing`.", "#computing"),
+            ("A#plain().", "plain"),
+        ] {
+            assert_eq!(
+                scip_sym_to_name(&format!("{TS}`t.ts`/{descriptor}")),
+                want,
+                "{descriptor}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_getter_and_a_setter_enrich_the_two_rows_tree_sitter_made_for_them() {
+        let env = TestEnv::new();
+        env.add_file("t.ts");
+        let conn = env.store.connection().unwrap();
+        for (id, line) in [("t.ts::A::slots#1", 3), ("t.ts::A::slots#2", 4)] {
+            conn.query(&format!(
+                "CREATE (:Symbol {{id: '{id}', name: 'slots', kind: 'method', file: 't.ts', \
+                 start_line: {line}, end_line: {line}, signature_hash: '', language: 'typescript', \
+                 visibility: 'public', parent: '', docstring: '', complexity: 0, parameters: '', \
+                 return_type: ''}})"
+            ))
+            .unwrap();
+        }
+        let get = format!("{TS}`t.ts`/A#`<get>slots`.");
+        let set = format!("{TS}`t.ts`/A#`<set>slots`.");
+        let stats = import_defs(&env, "t.ts", &[(&get, 2), (&set, 3)]);
+        assert_eq!(
+            stats.symbols_added, 0,
+            "no second row beside the tree-sitter one"
+        );
+        assert_eq!(stats.symbols_enriched, 2);
+        let carried: Vec<String> = conn
+            .query("MATCH (s:Symbol) RETURN s.id, s.scip_id ORDER BY s.start_line")
+            .unwrap()
+            .map(|r| {
+                format!(
+                    "{} {}",
+                    r[0].to_string().trim_matches('"'),
+                    r[1].to_string()
+                        .trim_matches('"')
+                        .rsplit('/')
+                        .next()
+                        .unwrap()
+                )
+            })
+            .collect();
+        assert_eq!(
+            carried,
+            vec![
+                "t.ts::A::slots#1 A#`<get>slots`.",
+                "t.ts::A::slots#2 A#`<set>slots`."
+            ],
+            "the moniker lands on the tree-sitter row"
+        );
     }
 
     fn import_defs(env: &TestEnv, file: &str, defs: &[(&str, i32)]) -> ImportStats {
