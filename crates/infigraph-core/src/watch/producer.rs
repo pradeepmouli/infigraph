@@ -162,6 +162,11 @@ pub async fn run_producer(
             }
         };
     let mut restart_count: u32 = 0;
+    // Registered, so nothing can fall between the two: events from here on
+    // are seen, and this pass finds whatever happened before them.
+    let mut dropped = DroppedEvents::default();
+    queue_true_up(&queue, "the watcher started");
+    dropped.queued(std::time::Instant::now());
 
     // `Delay` rather than the default `Burst`: these are idle cadences, not a
     // fixed grid. After a stall (the restart backoff below sleeps for
@@ -178,6 +183,11 @@ pub async fn run_producer(
 
             _ = tick.tick() => {
                 flush_ready_batch(&mut batch, &queue, &root, storm_threshold);
+                let now = std::time::Instant::now();
+                if dropped.due(now) {
+                    queue_true_up(&queue, "the watcher reported dropped events");
+                    dropped.queued(now);
+                }
             }
 
             _ = root_check.tick() => {
@@ -201,6 +211,9 @@ pub async fn run_producer(
             maybe_evt = rx.recv() => {
                 match maybe_evt {
                     Some(Ok(event)) => {
+                        if events_were_dropped(&event) {
+                            dropped.note();
+                        }
                         let watch_kind = match event.kind {
                             EventKind::Create(_) => WatchEventKind::Created,
                             EventKind::Modify(_) => WatchEventKind::Modified,
@@ -346,6 +359,9 @@ pub async fn run_producer(
                                 watcher = new_watcher;
                                 rx = new_rx;
                                 eprintln!("[watch-producer] watcher restarted successfully");
+                                // Whatever changed while it was down.
+                                queue_true_up(&queue, "the watcher restarted");
+                                dropped.queued(std::time::Instant::now());
                                 on_event(WatchEvent {
                                     kind: WatchEventKind::WatcherRestarted,
                                     path: root.clone(),
@@ -366,6 +382,60 @@ pub async fn run_producer(
                 }
             }
         }
+    }
+}
+
+/// Least time between two true-ups asked for by dropped-event reports: a
+/// busy tree can report them in bursts, and one whole-project scan answers
+/// them all.
+const TRUE_UP_DEBOUNCE: Duration = Duration::from_secs(5);
+
+/// Queues one whole-project pass -- the scan `infigraph index` does, which
+/// hash-diffs every file and so costs a read each when nothing changed -- to
+/// find what no event reported: an edit made while no watcher ran, or one
+/// whose event the backend dropped. Logs when it was asked for and why; the
+/// drain logs what the scan found.
+fn queue_true_up(queue: &Arc<Mutex<IndexWorkQueue>>, why: &str) {
+    queue.lock().unwrap().mark_whole_project();
+    eprintln!(
+        "[watch-producer] {} queued a code true-up ({why})",
+        crate::watch::log_stamp()
+    );
+}
+
+/// Whether `event` says events were lost rather than describing one: the
+/// backend's own rescan request (FSEvents `MustScanSubDirs`, inotify queue
+/// overflow) or a kind this producer does not model. Nothing is known about
+/// which paths were lost, so only a whole-project pass can answer it.
+fn events_were_dropped(event: &Event) -> bool {
+    event.need_rescan() || matches!(event.kind, EventKind::Other)
+}
+
+/// Debounces dropped-event reports into at most one true-up per
+/// [`TRUE_UP_DEBOUNCE`]; a report inside the window waits for its end.
+#[derive(Default)]
+struct DroppedEvents {
+    pending: bool,
+    last_true_up: Option<std::time::Instant>,
+}
+
+impl DroppedEvents {
+    fn note(&mut self) {
+        self.pending = true;
+    }
+
+    /// A true-up was queued at `now` for any reason: it answers what was
+    /// pending too.
+    fn queued(&mut self, now: std::time::Instant) {
+        self.pending = false;
+        self.last_true_up = Some(now);
+    }
+
+    fn due(&self, now: std::time::Instant) -> bool {
+        self.pending
+            && self
+                .last_true_up
+                .is_none_or(|at| now.duration_since(at) >= TRUE_UP_DEBOUNCE)
     }
 }
 
@@ -441,4 +511,38 @@ fn flush_ready_batch(
     let paths = batch.drain();
     let mut q = queue.lock().unwrap();
     crate::watch::flush_batch_into_queue(&mut q, paths, root, storm_threshold);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use notify::event::{CreateKind, Flag};
+
+    #[test]
+    fn a_rescan_request_or_an_unmodelled_kind_means_events_were_dropped() {
+        let rescan =
+            Event::new(EventKind::Modify(notify::event::ModifyKind::Any)).set_flag(Flag::Rescan);
+        assert!(events_were_dropped(&rescan));
+        assert!(events_were_dropped(&Event::new(EventKind::Other)));
+        assert!(!events_were_dropped(&Event::new(EventKind::Create(
+            CreateKind::File
+        ))));
+    }
+
+    #[test]
+    fn dropped_event_reports_collapse_into_one_true_up_per_window() {
+        let t0 = std::time::Instant::now();
+        let mut gate = DroppedEvents::default();
+        assert!(!gate.due(t0), "nothing reported, nothing due");
+
+        gate.note();
+        assert!(gate.due(t0), "the first report is due at once");
+        gate.queued(t0);
+        assert!(!gate.due(t0), "queuing answers what was pending");
+
+        gate.note();
+        gate.note();
+        assert!(!gate.due(t0 + Duration::from_secs(1)), "inside the window");
+        assert!(gate.due(t0 + TRUE_UP_DEBOUNCE), "waits only for its end");
+    }
 }
