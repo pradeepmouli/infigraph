@@ -169,6 +169,12 @@ impl IndexWorkQueue {
         self.waiters.push(waiter);
     }
 
+    /// Whether a whole-project pass is queued: the hash-diffing scan that
+    /// finds anything a watcher missed.
+    pub fn wants_whole_project(&self) -> bool {
+        self.whole_project
+    }
+
     #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.items.is_empty()

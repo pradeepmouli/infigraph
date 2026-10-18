@@ -122,6 +122,12 @@ fn run_drain(
     let mut whole_project_stale: Vec<String> = Vec::new();
     if drained.whole_project {
         let scan = infigraph.scan_changed_files(backend)?;
+        eprintln!(
+            "[watch] {} whole-project scan: {} changed file(s), {} gone",
+            crate::watch::log_stamp(),
+            scan.extractions.len(),
+            scan.stale_files.len()
+        );
         for extraction in scan.extractions {
             // A whole-project scan finding a change for a path that ALSO
             // has an explicit pending item takes a back seat to that

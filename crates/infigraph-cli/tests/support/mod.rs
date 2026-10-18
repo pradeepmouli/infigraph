@@ -77,6 +77,12 @@ pub fn start_daemon(root: &Path, home: &Path) -> Daemon {
         &["index", "--no-embed"],
     );
     assert_ok(&bootstrap, "bootstrap index");
+    spawn_daemon(root, home)
+}
+
+/// Start a real daemon on an already-indexed project and wait until it
+/// holds `watch.lock`.
+pub fn spawn_daemon(root: &Path, home: &Path) -> Daemon {
     let daemon = Daemon(
         infigraph()
             .args(["daemon", "--debounce", "50"])

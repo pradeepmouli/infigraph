@@ -70,10 +70,21 @@ fn a_full_reindex_waits_for_the_machines_slot_and_runs_when_it_is_free() {
         !infigraph_dir.join("graph.rebuilding").exists(),
         "a rebuild started without a slot"
     );
-    let index_lock =
-        infigraph_core::lockfile::try_acquire(&infigraph_dir.join("index.lock"), "test").unwrap();
-    assert!(index_lock.is_some(), "waiting for a slot holds index.lock");
-    drop(index_lock);
+    // The daemon's own start-up true-up (a whole-project scan) may still hold
+    // the index operation for a moment; what must not hold it is the wait, so
+    // it has to come free while the rebuild is still waiting.
+    assert!(
+        eventually(BUDGET, || {
+            infigraph_core::lockfile::try_acquire(&infigraph_dir.join("index.lock"), "test")
+                .unwrap()
+                .is_some()
+        }),
+        "waiting for a slot holds index.lock"
+    );
+    assert!(
+        doctor(&root, &home).contains(key),
+        "the rebuild stopped waiting before the slot was freed"
+    );
     let read = run(&root, &home, "daemon", &["stats"]);
     assert_ok(&read, "a read while the rebuild waits");
 

@@ -104,6 +104,42 @@ async fn producer_ignores_dependency_lockfiles_a_language_pack_does_claim() {
     handle.await.unwrap();
 }
 
+/// Edits made while no watcher ran produce no event for a new one to see, so
+/// a producer that has finished registering queues one whole-project pass --
+/// the hash-diffing scan `infigraph index` does -- with no change made at
+/// all. Queued after registration, so nothing can fall between the two.
+#[tokio::test]
+async fn producer_queues_a_true_up_once_it_is_watching() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    std::fs::create_dir_all(root.join(".infigraph")).unwrap();
+    std::fs::write(root.join("main.py"), "def main(): pass").unwrap();
+
+    let queue = Arc::new(Mutex::new(IndexWorkQueue::new()));
+    let token = CancellationToken::new();
+    let (queue_clone, cfg, token_clone) = (Arc::clone(&queue), config(root.clone()), token.clone());
+    let handle = tokio::task::spawn(async move {
+        infigraph_core::watch::producer::run_producer(cfg, queue_clone, |_evt| {}, token_clone)
+            .await;
+    });
+
+    let mut queued = false;
+    for _ in 0..300 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        if queue.lock().unwrap().wants_whole_project() {
+            queued = true;
+            break;
+        }
+    }
+    assert!(
+        queued,
+        "a watcher that finished registering queued no true-up"
+    );
+
+    token.cancel();
+    handle.await.unwrap();
+}
+
 #[tokio::test]
 async fn producer_feeds_the_queue_on_a_real_file_change() {
     let tmp = tempfile::tempdir().unwrap();
