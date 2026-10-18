@@ -2,7 +2,7 @@
 
 # Infigraph MCP tools
 
-Every tool the Infigraph MCP server advertises (100 in all), grouped by task. Read only the section you need.
+Every tool the Infigraph MCP server advertises (101 in all), grouped by task. Read only the section you need.
 
 - [Find and read code](#find-and-read-code) — search, search_symbols, search_code, semantic_search, get_symbols_in_file, get_code_snippet, symbol_context, get_doc_context, get_skeleton, list_files
 - [Callers, references and change impact](#callers-references-and-change-impact) — trace_callers, trace_callees, find_all_references, transitive_impact, detect_changes, semantic_diff, get_type_hierarchy, get_file_deps, get_dependencies, generate_sequence_diagram
@@ -11,7 +11,7 @@ Every tool the Infigraph MCP server advertises (100 in all), grouped by task. Re
 - [Graph queries and export](#graph-queries-and-export) — query_graph, export_graph, visualize, visualize_symbol
 - [Indexing and projects](#indexing-and-projects) — index_project, list_projects, delete_project, list_languages, scip_import, index_manifests, ingest_structured, doctor
 - [Watching for changes](#watching-for-changes) — watch_project, stop_watch, restart_watch, enable_watch, disable_watch, get_watch_status
-- [Documents and Confluence](#documents-and-confluence) — index_docs, search_docs, stale_docs, doc_entry, reindex_docs, clean_docs, index_confluence, index_confluence_pages, watch_docs, stop_watch_docs, restart_watch_docs, enable_watch_docs, disable_watch_docs
+- [Documents and Confluence](#documents-and-confluence) — index_docs, search_docs, stale_docs, missing_docs, doc_entry, reindex_docs, clean_docs, index_confluence, index_confluence_pages, watch_docs, stop_watch_docs, restart_watch_docs, enable_watch_docs, disable_watch_docs
 - [Multi-repo groups](#multi-repo-groups) — group_list, group_create, group_add, group_index, group_build, group_sync, group_link, group_link_docs, group_query, group_search, group_search_docs, group_contracts, group_deps
 - [Data pipelines](#data-pipelines) — pipeline_plugins, pipeline_query, pipeline_deps, pipeline_impact, pipeline_compliance
 - [Sessions and memory](#sessions-and-memory) — get_latest_session, save_session, search_sessions, purge_sessions, memory_context, consolidate_memory
@@ -650,6 +650,20 @@ PRIMARY: Which glossary entries (indexed Markdown sections whose heading is a sy
 | `path` | string |  |  | see Common parameters |
 | `path_prefix` | string |  |  | Restrict the analysis to files under this directory (or to this one file), relative to the project root, e.g. 'crates/infigraph-core'. Matches whole path components. Default: the whole project. |
 | `symbol` | string |  |  | One symbol id, e.g. 'src/app.py::compute_total': only its entry, with more history |
+
+### `missing_docs`
+
+PRIMARY: Which symbols the current work adds that have no glossary entry, limited to directories that already keep a glossary: the counterpart of stale_docs (entries whose code moved), for the entry that was never written. Run it before you commit. Diffs the merge-base of `base` with HEAD against the working tree (committed and uncommitted); `base` defaults to the branch's upstream, then origin/HEAD, main, master, and the report states which it used and how many files and hunks it covered (base=HEAD means uncommitted edits only). Lists public functions, methods, classes, structs, interfaces, traits and enums that are new (include_changed adds changed ones; visibility=all adds non-public; tests, generated files and declarations under min_lines lines, default 3, are left out), grouped by the glossary document `doc_entry create` would write to, each with `file:line` and a ready `doc_entry` create call (a dry run; you supply the text). Read-only. A moved function reads as added; an entry for a type does not cover its new methods.
+
+| Parameter | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `base` | string |  |  | Ref the diff starts from (merge-base with HEAD). Default: the branch's upstream, else origin/HEAD, main, master; 'HEAD' means uncommitted edits only |
+| `include_changed` | boolean |  | `false` | Also list symbols the diff changed but did not add |
+| `limit` | integer |  | `50` | Most symbols to list (default: 50) |
+| `min_lines` | integer |  | `3` | Skip declarations shorter than this many lines |
+| `path` | string |  |  | see Common parameters |
+| `path_prefix` | string |  |  | Restrict the analysis to files under this directory (or to this one file), relative to the project root, e.g. 'crates/infigraph-core'. Matches whole path components. Default: the whole project. |
+| `visibility` | `public` \| `all` |  | `"public"` | public (default) or all |
 
 ### `doc_entry`
 

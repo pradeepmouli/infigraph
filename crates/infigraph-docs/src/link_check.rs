@@ -475,6 +475,58 @@ pub(crate) fn live_symbols(root: &Path, keys: &[&str]) -> Result<HashMap<String,
     observed.with_exec(|exec| resolve(exec, keys).0)
 }
 
+/// A symbol of a file, as `missing_docs` reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FileSymbol {
+    pub id: String,
+    pub kind: String,
+    pub start: usize,
+    pub end: usize,
+    /// `None` when the extractor stored none (the column is empty).
+    pub visibility: Option<String>,
+}
+
+/// Every symbol of each of `files`, as an observer reads the graph. Unlike
+/// the resolution above, a failed read is an error: "no symbols" must not
+/// read as "nothing to document".
+pub(crate) fn symbols_in_files(
+    root: &Path,
+    files: &[&str],
+) -> Result<HashMap<String, Vec<FileSymbol>>> {
+    let graph_path = infigraph_core::graph::names::live_of(root);
+    let observed = ObservedGraph::open(root, &graph_path)?;
+    observed.with_exec(|exec| {
+        let mut out: HashMap<String, Vec<FileSymbol>> = HashMap::new();
+        for batch in files.chunks(BATCH) {
+            let list = batch
+                .iter()
+                .map(|f| format!("'{}'", escape_str(f)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let rows = exec
+                .query_rows(&format!(
+                    "MATCH (s:Symbol) WHERE s.file IN [{list}] \
+                     RETURN s.file, s.id, s.kind, s.start_line, s.end_line, s.visibility"
+                ))
+                .map_err(|e| anyhow::anyhow!("the graph could not be read: {e}"))?;
+            for row in rows {
+                if let [file, id, kind, start, end, visibility] = &row[..] {
+                    if let (Ok(start), Ok(end)) = (start.parse(), end.parse()) {
+                        out.entry(file.clone()).or_default().push(FileSymbol {
+                            id: id.clone(),
+                            kind: kind.clone(),
+                            start,
+                            end,
+                            visibility: Some(visibility.clone()).filter(|v| !v.is_empty()),
+                        });
+                    }
+                }
+            }
+        }
+        Ok(out)
+    })?
+}
+
 /// Whether `key` resolves the way `doctor` judges it: a symbol the graph has,
 /// or a `<file>::module` key whose file the graph has.
 pub(crate) fn key_is_live(root: &Path, key: &str) -> Result<bool> {

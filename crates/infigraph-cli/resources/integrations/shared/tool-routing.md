@@ -7,6 +7,7 @@
 | Constants, statics or fields defined in a file | `get_symbols_in_file` |
 | A symbol's source, callers or callees | `get_code_snippet` / `get_doc_context` / `find_all_references` |
 | Glossary entries that drifted from their code, and what changed | `stale_docs` (read-only) |
+| Symbols this work adds that no glossary entry describes | `missing_docs` (read-only; before you commit) |
 | Change a glossary entry | `doc_entry` |
 | Files matching a glob | `list_files` with `glob` (e.g. `glob="src/**/*.rs"`) |
 | Exact lines for an edit | `Read` with `offset` |

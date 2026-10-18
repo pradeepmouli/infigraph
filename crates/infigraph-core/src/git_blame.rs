@@ -139,6 +139,14 @@ fn run(
     }
 }
 
+/// Runs `git args` in `root`, killing it after `timeout`. For the callers that
+/// need a ref or a revision answered, with the same environment (`LC_ALL=C`, no
+/// optional locks) as the rest of this module.
+pub fn git(root: &Path, args: &[&str], timeout: Duration) -> Result<String, BlameError> {
+    let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+    run("git", &args, root, timeout)
+}
+
 /// One blamed line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Line {

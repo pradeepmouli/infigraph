@@ -541,6 +541,30 @@ enum Commands {
         limit: usize,
     },
 
+    /// List the symbols this work adds that no glossary entry describes, in
+    /// directories that keep a glossary (read-only; run before you commit)
+    MissingDocs {
+        /// Only files under this path
+        #[arg(long)]
+        path_prefix: Option<String>,
+        /// Ref to diff from (merge-base with HEAD); default: the upstream,
+        /// else origin/HEAD, main, master. HEAD means uncommitted edits only
+        #[arg(long)]
+        base: Option<String>,
+        /// Also symbols that were changed, not added
+        #[arg(long)]
+        include_changed: bool,
+        /// public (default) or all
+        #[arg(long)]
+        visibility: Option<String>,
+        /// Skip declarations shorter than this many lines
+        #[arg(long)]
+        min_lines: Option<usize>,
+        /// Max symbols to list
+        #[arg(short, long, default_value = "50")]
+        limit: usize,
+    },
+
     /// Edit a glossary entry mechanically (you supply the prose): edit, replace,
     /// create, rekey, delete, or ack (record it as reviewed). Dry run unless
     /// --apply
@@ -1366,6 +1390,22 @@ fn run(command: Commands, root: &Path, root_given: bool) -> Result<()> {
             symbol,
             limit,
         } => cmd_stale_docs(root, path_prefix.as_deref(), symbol, limit),
+        Commands::MissingDocs {
+            path_prefix,
+            base,
+            include_changed,
+            visibility,
+            min_lines,
+            limit,
+        } => cmd_missing_docs(
+            root,
+            path_prefix.as_deref(),
+            base,
+            include_changed,
+            visibility.as_deref(),
+            min_lines,
+            limit,
+        ),
         Commands::DocEntry { op, apply } => cmd_doc_entry(root, root_given, op, apply),
         Commands::DocGuard => {
             cmd_doc_guard();

@@ -13,6 +13,7 @@ pub mod embed;
 pub mod extract;
 pub mod link_check;
 pub mod linked;
+pub mod missing_docs;
 #[cfg(feature = "remote")]
 pub mod neo4j_store;
 pub mod ops;

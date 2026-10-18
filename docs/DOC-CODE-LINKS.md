@@ -192,6 +192,48 @@ Stale docs: 842 of 4008 entries possibly stale (exact git blame of 4008 entries)
 After editing an entry, the document watcher refreshes the index, or call
 `reindex_docs`.
 
+## What has no entry yet (`missing_docs`)
+
+`stale_docs` finds entries whose code moved; `missing_docs` (MCP tool, or
+`infigraph missing-docs`) finds the entry that was never written, most often
+because the code was created in a commit that carried no entry. Run it before
+you commit. It lists the public functions, methods, classes, structs,
+interfaces, traits and enums your work **adds** that no entry describes, limited
+to directories that already keep a glossary, grouped by the document
+`doc_entry create` would write to, each with `file:line` and that create call
+(a dry run: you supply the text).
+
+- **The diff** is the merge-base of the base ref with HEAD against the working
+  tree, so committed and uncommitted work are both covered and the new-side
+  lines match the graph. The base is, in order: the `base` argument, the
+  branch's upstream (`@{upstream}`), `origin/HEAD`, `main`, `master`; none of
+  them works is an error naming what was tried, never a guess. `base=HEAD`
+  means uncommitted edits only. The report's first line says which base it
+  used and how many files and hunks it covered.
+- **A directory has a glossary** exactly when `doc_entry create` would find one
+  for it (`doc_entry::glossary_for`: the document with most entries for the
+  same code file, else the nearest ancestor directory that has any, never the
+  project root), so a hint cannot disagree with where the entry goes. A nested
+  glossary therefore takes the code below it. Changed files in directories with
+  none are counted, not looked at; a tie between two documents is named, and
+  the hint then needs `doc_file`.
+- **The file wins over the index**: the candidate document is parsed and a
+  symbol it already has an entry for is not listed, whatever the index (not yet
+  refreshed) says.
+- **Which symbols**: new (every line of it is new in the diff), public (the
+  extractor's visibility: `pub`, `public`, `open`, `export`; a declaration with
+  none recorded is counted as unknown and left out), at least `min_lines` long
+  (default 3: getters and stubs), not in a test file or a generated one (by
+  path, or a `@generated` / `DO NOT EDIT` marker in the first lines).
+  `include_changed` adds symbols the diff changed but did not add;
+  `visibility=all` adds the non-public ones. Every symbol left out is counted by
+  its first reason, so the footer's numbers add up.
+- **Limits**: a moved function reads as added (a move is not detected: `rekey`
+  is the right action; on a real 10-commit range 9 of 64 listed symbols were in two renamed files whose old paths had no entries either); a function renamed by editing its `def` line is a change, listed only with `include_changed`, and an entry already rekeyed to the new id counts as documented; an entry for a type does not cover its new methods; the
+  list stops at `limit` (default 50) and says how many more there are.
+- It is read-only and `doctor` does not run it: it is relative to a diff, which
+  a clean tree does not have.
+
 ## Changing an entry (`doc_entry`)
 
 `stale_docs` says where to edit; `doc_entry` (MCP tool, `infigraph doc-entry

@@ -22,6 +22,7 @@ use infigraph_core::path_scope::PathScope;
 
 use crate::ack::{self, Acks};
 use crate::code_links::{CodeLinkRow, LinkKind};
+use crate::doc_entry::code_file_of;
 use crate::link_check::{self, Live};
 
 /// Entries listed when the caller names no limit.
@@ -322,11 +323,6 @@ fn no_index() -> Report {
         ),
         ..Report::default()
     }
-}
-
-/// The code file an entry key names: the part before the first `::`.
-fn code_file_of(key: &str) -> &str {
-    key.split_once("::").map_or(key, |(file, _)| file)
 }
 
 /// Which entries are possibly stale in the project at `root`, and what changed

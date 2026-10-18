@@ -125,6 +125,7 @@ const SECTIONS: &[(&str, &[&str])] = &[
             "index_docs",
             "search_docs",
             "stale_docs",
+            "missing_docs",
             "doc_entry",
             "reindex_docs",
             "clean_docs",
