@@ -323,6 +323,29 @@ A directory you name yourself is not discovered, so the rules do not apply:
 `ingest_directory*`, the cozo and neo4j structured ingest and reflection's
 fixed config-file reads take the path the caller named.
 
+#### Stopping one language
+
+Two different things, two different switches:
+
+- **Not indexing it** — an `[ignore] code` glob. There is no per-language
+  index toggle; the glob is the one way, and it stops the language
+  everywhere at once: the walker never reads the files, the code watcher
+  never marks them, and SCIP has nothing of that language left to enrich.
+
+  ```toml
+  [ignore]
+  code = ["**/*.py"]      # Python is not indexed, watched or enriched
+  ```
+
+  Files already in the graph leave it on the next full scan.
+- **Not enriching it** — `[scip] disable = ["python"]` (or
+  `INFIGRAPH_SCIP_DISABLE=python,tsx`, which adds to the files). The files
+  are still indexed and watched; only the compiler-grade SCIP pass skips
+  that language. An indexer that serves several languages (scip-typescript:
+  typescript, javascript, tsx, jsx) is skipped only when all of them are
+  disabled. A name no indexer serves is refused by `infigraph index` and
+  failed by `infigraph doctor`.
+
 ### Parallel processing
 
 Files are processed in parallel using `rayon`'s `par_iter` for extraction and hashing.

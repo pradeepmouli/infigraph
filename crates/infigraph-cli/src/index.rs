@@ -75,7 +75,9 @@ pub(crate) fn cmd_index(root: &Path, full: bool, no_embed: bool) -> Result<()> {
     let unknown = infigraph_core::scip_switch::unknown_languages(root);
     if !unknown.is_empty() {
         anyhow::bail!(
-            "[scip] disable names no SCIP indexer serves: {}; it disables nothing. Use one of: {}",
+            "[scip] disable names no SCIP indexer serves: {}; it disables nothing. Use one of: {}. \
+             To stop indexing a language altogether use `[ignore] code = [\"**/*.py\"]` \
+             (docs/CODE-PARSING.md, \"Stopping one language\")",
             unknown.join(", "),
             infigraph_core::scip_switch::known_languages().join(", ")
         );
@@ -640,11 +642,7 @@ fn spawn_scip_child_process(
         indexer_names.join(", ")
     );
 
-    let langs: String = detected_languages
-        .iter()
-        .cloned()
-        .collect::<Vec<_>>()
-        .join(",");
+    let langs = languages_arg(detected_languages);
 
     let exe = match std::env::current_exe() {
         Ok(e) => e,
@@ -689,6 +687,20 @@ fn spawn_scip_child_process(
     }
 
     eprintln!("  Log: {}", log_path.display());
+}
+
+/// The detected languages as the child's positional argument, and back: the
+/// two halves of one wire format, so the child runs exactly the indexers the
+/// parent chose.
+fn languages_arg(languages: &std::collections::HashSet<String>) -> String {
+    languages.iter().cloned().collect::<Vec<_>>().join(",")
+}
+
+pub(crate) fn parse_languages_arg(arg: &str) -> std::collections::HashSet<String> {
+    arg.split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
 }
 
 /// Args for respawning this binary as the hidden `scip-enrich` subcommand.
@@ -1447,6 +1459,8 @@ pub(crate) struct ScipRun {
     imported: usize,
     unchanged: usize,
     ran: bool,
+    /// Each indexer that ran, in order, and whether it left usable output.
+    indexers: Vec<(&'static str, bool)>,
 }
 
 impl ScipRun {
@@ -1457,6 +1471,7 @@ impl ScipRun {
             imported: 0,
             unchanged: 0,
             ran: false,
+            indexers: Vec::new(),
         }
     }
 
@@ -1464,6 +1479,7 @@ impl ScipRun {
     /// mean no enrichment from it.
     pub(crate) fn indexer_result(&mut self, result: &IndexerResult) {
         self.ran = true;
+        self.indexers.push((result.label, result.verdict.is_ok()));
         if let Err(reason) = &result.verdict {
             self.ok = false;
             self.tally.note(
@@ -1503,22 +1519,47 @@ impl ScipRun {
         if !self.ran {
             return;
         }
-        let summary = if self.ok {
-            format!(
-                "imported {} indexer output(s), {} unchanged",
-                self.imported, self.unchanged
-            )
-        } else {
-            format!(
-                "enrichment incomplete: {} imported, {} unchanged",
-                self.imported, self.unchanged
-            )
-        };
+        let summary = self.summary();
         infigraph_core::last_run::record(
             infigraph_dir,
             infigraph_core::last_run::Kind::Scip,
             infigraph_core::last_run::RunRecord::new(self.ok, summary, self.tally),
         );
+    }
+
+    fn summary(&self) -> String {
+        if self.ok {
+            format!(
+                "imported {} indexer output(s), {} unchanged",
+                self.imported, self.unchanged
+            )
+        } else {
+            let named = |ok: bool| {
+                self.indexers
+                    .iter()
+                    .filter(|(_, o)| *o == ok)
+                    .map(|(label, _)| *label)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            let mut parts = Vec::new();
+            for (ok, word) in [(false, "failed"), (true, "ok")] {
+                let labels = named(ok);
+                if !labels.is_empty() {
+                    parts.push(format!("{labels} {word}"));
+                }
+            }
+            format!(
+                "enrichment incomplete: {} ({} imported, {} unchanged)",
+                if parts.is_empty() {
+                    "an import failed".to_string()
+                } else {
+                    parts.join("; ")
+                },
+                self.imported,
+                self.unchanged
+            )
+        }
     }
 }
 
@@ -2308,6 +2349,70 @@ mod tests {
         assert!(
             matches!(&cli.command, crate::Commands::ScipEnrich { languages, restamp_baseline: false } if languages == langs),
             "expected Commands::ScipEnrich {{ languages: {langs:?}, restamp_baseline: false }}"
+        );
+    }
+
+    /// A run that lost one indexer says which, and which did well: "scip-python
+    /// failed; scip-typescript, scip-rust ok", not a count that makes the
+    /// reader open the log.
+    #[test]
+    fn a_partly_failed_enrichment_names_each_indexer_and_how_it_went() {
+        let result = |label: &'static str, verdict: Result<(), String>| IndexerResult {
+            label,
+            path: std::path::PathBuf::from("unused.scip"),
+            verdict,
+        };
+        let mut run = ScipRun::new();
+        run.indexer_result(&result("scip-python", Err("no usable output".into())));
+        run.indexer_result(&result("scip-typescript", Ok(())));
+        run.indexer_result(&result("scip-rust", Ok(())));
+        let summary = run.summary();
+        assert!(
+            summary.contains("scip-python failed; scip-typescript, scip-rust ok"),
+            "{summary}"
+        );
+    }
+
+    /// `[scip] disable` is decided once, by the parent, and the detached child
+    /// runs what it is handed: the indexers it would pick from the argument
+    /// must be exactly the ones the parent picked, with the disabled
+    /// language gone from both.
+    #[test]
+    fn parent_and_scip_enrich_child_agree_on_a_disabled_language() {
+        use crate::scip_download::indexers_for_languages;
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join(".infigraph")).unwrap();
+        std::fs::write(
+            project.path().join(".infigraph/config.toml"),
+            "[scip]\ndisable = [\"python\"]\n",
+        )
+        .unwrap();
+        let detected: std::collections::HashSet<String> =
+            ["python", "rust"].iter().map(|s| s.to_string()).collect();
+
+        let parent = infigraph_core::scip_switch::enabled_languages(project.path(), &detected);
+        let mut argv = vec!["infigraph".to_string()];
+        argv.extend(scip_enrich_args(&languages_arg(&parent), false));
+        let cli = <crate::Cli as clap::Parser>::try_parse_from(&argv).unwrap();
+        let crate::Commands::ScipEnrich { languages, .. } = cli.command else {
+            panic!("not a scip-enrich command");
+        };
+        let child = parse_languages_arg(&languages);
+
+        let names = |set: &std::collections::HashSet<String>| {
+            let mut n: Vec<&str> = indexers_for_languages(set)
+                .iter()
+                .map(|i| i.binary_name)
+                .collect();
+            n.sort_unstable();
+            n
+        };
+        assert_eq!(names(&parent), names(&child));
+        assert!(!child.contains("python"), "{child:?}");
+        assert!(
+            !names(&child).contains(&"scip-python"),
+            "{:?}",
+            names(&child)
         );
     }
 

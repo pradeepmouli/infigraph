@@ -651,7 +651,7 @@ macro_rules! settings_enum {
 
 #[cfg(test)]
 mod tests {
-    use super::{PathList, Toggle};
+    use super::{FromTomlItem, LanguageList, PathList, Toggle};
     use clap::Parser;
     use std::sync::Mutex;
 
@@ -815,6 +815,31 @@ mod tests {
         let b = ToyB::resolve_layers(RawToyB::parse_from(["test"]), &[]).unwrap();
         assert_eq!(a.value, 1);
         assert_eq!(b.value, 2);
+    }
+
+    #[test]
+    fn a_language_list_from_the_environment_is_trimmed_lowercased_and_without_empties() {
+        let list: LanguageList = " Python, ,TSX,,rust ".parse().unwrap();
+        assert_eq!(list.0, ["python", "tsx", "rust"]);
+        assert!("".parse::<LanguageList>().unwrap().0.is_empty());
+    }
+
+    #[test]
+    fn a_language_list_from_toml_is_an_array_of_strings() {
+        let doc: toml_edit::DocumentMut = "names = [\" Python \", \"\", \"TSX\"]".parse().unwrap();
+        let list = LanguageList::from_toml_item(&doc["names"]).unwrap();
+        assert_eq!(list.0, ["python", "tsx"]);
+    }
+
+    #[test]
+    fn a_lone_string_or_a_non_string_element_is_an_error_not_an_empty_list() {
+        let doc: toml_edit::DocumentMut = "lone = \"python\"\nmixed = [\"python\", 3]"
+            .parse()
+            .unwrap();
+        for key in ["lone", "mixed"] {
+            let err = LanguageList::from_toml_item(&doc[key]).unwrap_err();
+            assert!(err.contains("array of strings"), "{key}: {err}");
+        }
     }
 
     crate::settings! {

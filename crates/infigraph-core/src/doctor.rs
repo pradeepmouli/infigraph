@@ -1370,11 +1370,13 @@ fn check_one_project_scip_staleness(project_path: &Path) -> Option<CheckResult> 
         return None;
     }
     let observed = crate::graph::observe::ObservedGraph::open(project_path, &graph_path).ok()?;
-    let (ast_gen, scip_gen) = observed
+    let (ast_gen, scip_gen, languages) = observed
         .with_query(|q| {
             (
                 q.generation("ast_generation"),
                 q.generation("scip_generation"),
+                q.raw_query("MATCH (m:Module) RETURN DISTINCT m.language")
+                    .unwrap_or_default(),
             )
         })
         .ok()?;
@@ -1384,6 +1386,20 @@ fn check_one_project_scip_staleness(project_path: &Path) -> Option<CheckResult> 
     }
 
     let label = format!("{}: SCIP enrichment", project_path.display());
+    let detected: std::collections::HashSet<String> = languages
+        .into_iter()
+        .filter_map(|r| r.into_iter().next())
+        .filter(|l| !l.is_empty())
+        .collect();
+    if !crate::scip_switch::enrichment_applies(project_path, &detected) {
+        // Off, or every language an indexer serves is disabled: the SCIP
+        // generation is not expected to follow the AST's.
+        return Some(CheckResult::pass(
+            SCIP_STALENESS_CATEGORY,
+            label,
+            "implicit enrichment is off for this project's languages; generations are not compared",
+        ));
+    }
     if scip_gen < ast_gen {
         let behind = ast_gen - scip_gen;
         Some(CheckResult::warn(
@@ -1435,7 +1451,8 @@ fn check_one_project_scip_languages(project_path: &Path) -> Vec<CheckResult> {
                 unknown.join(", ")
             ),
             format!(
-                "use one of: {}",
+                "use one of: {} (to stop indexing a language, not only enriching it, use \
+                 `[ignore] code = [\"**/*.py\"]`; see docs/CODE-PARSING.md)",
                 crate::scip_switch::known_languages().join(", ")
             ),
         )];
@@ -1466,8 +1483,8 @@ fn check_one_project_scip_languages(project_path: &Path) -> Vec<CheckResult> {
         }
     }
     detail.push_str(
-        "; to keep a language out of the index itself, use `[ignore] code` in \
-         .infigraph/config.toml",
+        "; to keep a language out of the index itself, use `[ignore] code = [\"**/*.py\"]` \
+         in .infigraph/config.toml (docs/CODE-PARSING.md, \"Stopping one language\")",
     );
     vec![CheckResult::pass(SCIP_LANGUAGES_CATEGORY, label, detail)]
 }

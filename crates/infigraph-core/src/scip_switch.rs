@@ -133,6 +133,24 @@ pub fn enabled_languages(root: &Path, detected: &HashSet<String>) -> HashSet<Str
         .collect()
 }
 
+/// Whether an implicit enrichment of `root` would run any indexer for the
+/// languages `detected` in its graph: enrichment is on, and some indexer
+/// serves a language that is not disabled. Where it is false the SCIP
+/// generation is not expected to follow the AST's.
+pub fn enrichment_applies(root: &Path, detected: &HashSet<String>) -> bool {
+    if !scip_enabled(root) {
+        return false;
+    }
+    // No languages known (an empty graph): nothing says otherwise.
+    if detected.is_empty() {
+        return true;
+    }
+    let enabled = enabled_languages(root, detected);
+    crate::scip::INDEXER_LANGUAGES
+        .iter()
+        .any(|(_, tags)| tags.iter().any(|t| enabled.contains(*t)))
+}
+
 /// The indexers that run for `detected` although a language they serve is
 /// present and disabled (they serve another present, enabled one).
 pub fn still_served(root: &Path, detected: &HashSet<String>) -> Vec<StillServed> {
@@ -372,6 +390,24 @@ mod disable_tests {
     }
 
     #[test]
+    fn enrichment_applies_only_while_an_indexer_has_an_enabled_language() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _home = PinnedHome::empty();
+        std::fs::create_dir_all(tmp.path().join(".infigraph")).unwrap();
+        std::fs::write(
+            tmp.path().join(".infigraph/config.toml"),
+            "[scip]\ndisable = [\"python\"]\n",
+        )
+        .unwrap();
+        let set =
+            |names: &[&str]| -> HashSet<String> { names.iter().map(|s| s.to_string()).collect() };
+        assert!(!enrichment_applies(tmp.path(), &set(&["python"])));
+        assert!(enrichment_applies(tmp.path(), &set(&["python", "rust"])));
+        assert!(!enrichment_applies(tmp.path(), &set(&["markdown"])));
+    }
+
+    #[test]
     fn a_lone_string_is_a_mistake_that_disables_nothing_and_does_not_panic() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var(disable_env_name());
@@ -472,5 +508,37 @@ mod disable_tests {
     #[test]
     fn the_env_name_comes_from_the_definition() {
         assert_eq!(disable_env_name(), "INFIGRAPH_SCIP_DISABLE");
+    }
+}
+
+/// A downgraded machine: the build before `disable` existed reads the same
+/// `.infigraph/config.toml`. Its `settings!` reader looks only at declared
+/// keys, so the new key is ignored and `enabled` still works -- replayed here
+/// against the old definition.
+#[cfg(test)]
+mod older_binary {
+    use crate::settings::Toggle;
+    use crate::settings_file::test_support::ENV_LOCK;
+
+    mod old {
+        crate::settings! {
+            scip {
+                enabled: super::Toggle = super::Toggle(true),
+            }
+        }
+    }
+
+    #[test]
+    fn a_config_with_disable_still_reads_for_the_build_that_lacks_it() {
+        use clap::Parser;
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("INFIGRAPH_SCIP_ENABLED");
+        let doc: toml_edit::DocumentMut = "[scip]\nenabled = false\ndisable = [\"python\"]\n"
+            .parse()
+            .unwrap();
+        let resolved =
+            old::Scip::resolve_layers(old::RawScip::parse_from(["test"]), &[doc.as_item()])
+                .expect("an older build must not reject a key it does not know");
+        assert!(!resolved.enabled.0, "the key it knows is still honoured");
     }
 }

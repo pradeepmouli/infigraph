@@ -1461,11 +1461,7 @@ fn run(command: Commands, root: &Path, root_given: bool) -> Result<()> {
             languages,
             restamp_baseline,
         } => {
-            let detected: std::collections::HashSet<String> = languages
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
+            let detected = index::parse_languages_arg(&languages);
             index::cmd_scip_enrich(root, &detected, restamp_baseline);
             Ok(())
         }

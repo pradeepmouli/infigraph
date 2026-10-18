@@ -1306,6 +1306,44 @@ fn check_scip_staleness_warns_when_scip_generation_behind_ast_generation() {
     );
 }
 
+/// A graph whose only language is disabled is not enriched, so a SCIP
+/// generation behind the AST's is expected, not a warning.
+#[test]
+fn check_scip_staleness_does_not_warn_when_every_language_is_disabled() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (project, graph_path) = project_with_graph(dir.path());
+    std::fs::write(
+        project.join(".infigraph/config.toml"),
+        "[scip]\ndisable = [\"python\"]\n",
+    )
+    .unwrap();
+
+    {
+        let store = GraphStore::open(&graph_path).unwrap();
+        let lock = store.write_lock().unwrap();
+        let conn = store.connection().unwrap();
+        conn.query(
+            "CREATE (:Module {id: 'a.py', name: 'a', file: 'a.py', language: 'python', content_hash: 'x'})",
+        )
+        .unwrap();
+        store.bump_ast_generation_conn(&conn, &lock).unwrap();
+        store
+            .stamp_scip_generation_conn(&conn, &lock, None)
+            .unwrap();
+        store.bump_ast_generation_conn(&conn, &lock).unwrap();
+        store.bump_ast_generation_conn(&conn, &lock).unwrap();
+    }
+
+    let ctx = ctx_for(DoctorScope::Project(project), Registry::default());
+    let results = check_scip_staleness(&ctx);
+    let check = results
+        .iter()
+        .find(|r| r.name.contains("SCIP enrichment"))
+        .expect("the check is still reported");
+    assert_eq!(check.status, CheckStatus::Pass, "{}", check.message);
+    assert!(check.message.contains("not compared"), "{}", check.message);
+}
+
 #[test]
 fn check_scip_staleness_passes_when_caught_up() {
     let dir = tempfile::TempDir::new().unwrap();
