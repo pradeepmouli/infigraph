@@ -85,6 +85,52 @@ outside_indexed_code() {
     git -C "$cwd" check-ignore -q "$1" 2>/dev/null
 }
 
+# Whether $1 is source code infigraph extracts symbols from, judged by its
+# file name: docs, configs, data and markup (.md, .toml, .yaml, .json, .xml,
+# .html, .css, ...) are not (#76). The one list, for the Read and the
+# Write/Edit checks alike.
+is_source_code() {
+  case "$(basename -- "$1")" in
+    Dockerfile|Containerfile|Makefile|makefile|GNUmakefile|CMakeLists.txt|BUILD|BUILD.bazel|WORKSPACE) return 0 ;;
+  esac
+  case "$1" in
+    *.py|*.rs|*.ts|*.mts|*.cts|*.tsx|*.js|*.jsx|*.mjs|*.cjs|*.go|*.java|*.c|*.h|*.cpp|*.cc|*.cxx|*.hpp|*.hxx|*.hh|\
+    *.rb|*.rake|*.gemspec|*.php|*.swift|*.kt|*.kts|*.cs|*.scala|*.sc|*.lua|*.zig|*.ex|*.exs|*.dart|\
+    *.m|*.mm|*.hs|*.lhs|*.pl|*.pm|*.t|*.r|*.R|*.Rmd|*.ml|*.mli|*.sh|*.bash|*.zsh|*.sql|*.jl|*.proto|\
+    *.ps1|*.psm1|*.psd1|*.v|*.sv|*.svh|*.vh|*.hcl|*.tf|*.erl|*.hrl|\
+    *.f90|*.f95|*.f03|*.f08|*.f|*.for|*.nix|*.svelte|*.fs|*.fsi|*.fsx|*.groovy|*.gradle|\
+    *.graphql|*.gql|*.glsl|*.vert|*.frag|*.geom|\
+    *.comp|*.lisp|*.lsp|*.cl|*.asd|*.elm|*.el|*.bzl|*.star|*.mlx|\
+    *.clj|*.cljs|*.cljc|*.cu|*.cuh|*.pas|*.pp|*.dpr|*.dpk|*.inc|*.lpr|*.bas|*.cls|\
+    *.frm|*.dockerfile|*.mk|*.cmake) return 0 ;;
+  esac
+  return 1
+}
+
+# Whether $1 is a test the Write/Edit check holds to generate_test_context: a
+# code (or .feature/.karate) file inside the project that a name or a
+# directory says is a test. Judged by path COMPONENT, never by a substring of
+# the whole path: a Claude memory note called feedback_vitest_json_flag.md, or
+# a docs file under contests/, is not a test.
+is_test_file() {
+  outside_indexed_code "$1" && return 1
+  base=$(basename -- "$1")
+  case "$base" in
+    *.feature|*.karate) return 0 ;;
+  esac
+  is_source_code "$1" || return 1
+  case "$base" in
+    test_*.*|*_test.*|*.test.*|*_spec.*|*.spec.*) return 0 ;;
+  esac
+  case "$(basename -- "$(dirname -- "$1")")" in
+    tests) return 0 ;;
+  esac
+  case "/${1#"$cwd"/}" in
+    */__tests__/*) return 0 ;;
+  esac
+  return 1
+}
+
 # Blank out what the shell never runs as a command: quoted strings (which can
 # span lines, as in a multi-line commit message) and heredoc bodies. A command
 # word inside one -- `gh issue create --title "grep is blocked"`, a commit
@@ -184,34 +230,16 @@ EOF_FIND_PATHS
       exit 0
     fi
     outside_indexed_code "$file_path" && exit 0
-    # Allow unless the file is source code infigraph extracts symbols from.
-    # Docs, configs, data and markup (.md, .toml, .yaml, .json, .xml, .html,
-    # .css, ...) are read directly: nothing better answers "what does this say"
-    # (#76).
-    base=$(basename -- "$file_path")
-    case "$base" in
-      Dockerfile|Containerfile|Makefile|makefile|GNUmakefile|CMakeLists.txt|BUILD|BUILD.bazel|WORKSPACE) ;;
-      *)
-        case "$file_path" in
-          *.py|*.rs|*.ts|*.mts|*.cts|*.tsx|*.js|*.jsx|*.mjs|*.cjs|*.go|*.java|*.c|*.h|*.cpp|*.cc|*.cxx|*.hpp|*.hxx|*.hh|\
-          *.rb|*.rake|*.gemspec|*.php|*.swift|*.kt|*.kts|*.cs|*.scala|*.sc|*.lua|*.zig|*.ex|*.exs|*.dart|\
-          *.m|*.mm|*.hs|*.lhs|*.pl|*.pm|*.t|*.r|*.R|*.Rmd|*.ml|*.mli|*.sh|*.bash|*.zsh|*.sql|*.jl|*.proto|\
-          *.ps1|*.psm1|*.psd1|*.v|*.sv|*.svh|*.vh|*.hcl|*.tf|*.erl|*.hrl|\
-          *.f90|*.f95|*.f03|*.f08|*.f|*.for|*.nix|*.svelte|*.fs|*.fsi|*.fsx|*.groovy|*.gradle|\
-          *.graphql|*.gql|*.glsl|*.vert|*.frag|*.geom|\
-          *.comp|*.lisp|*.lsp|*.cl|*.asd|*.elm|*.el|*.bzl|*.star|*.mlx|\
-          *.clj|*.cljs|*.cljc|*.cu|*.cuh|*.pas|*.pp|*.dpr|*.dpk|*.inc|*.lpr|*.bas|*.cls|\
-          *.frm|*.dockerfile|*.mk|*.cmake) ;;
-          *) exit 0 ;;
-        esac
-        ;;
-    esac
+    # Allow unless the file is source code infigraph extracts symbols from
+    # (`is_source_code`): everything else is read directly, nothing better
+    # answers "what does this say".
+    is_source_code "$file_path" || exit 0
     # Block — this file is indexable; use infigraph tools instead. If infigraph search returns nothing, sentinel allows retry.
     deny "BLOCKED: Read on indexed code. A symbol's source: mcp__infigraph__get_code_snippet or get_doc_context. What a file defines, constants included: get_symbols_in_file. Text: search. Read only for exact Edit line numbers (pass offset). $routing"
     ;;
   Write|Edit)
     file_path=$(echo "$input" | jq -r '.tool_input.file_path // empty')
-    if echo "$file_path" | grep -qE '(test_[^/]+\.[^/]+|[^/]+_test\.[^/]+|[^/]+\.test\.[^/]+|[^/]+_spec\.[^/]+|[^/]+\.spec\.[^/]+|tests/[^/]+\.[^/]+|__tests__/|\.feature$|\.karate$)'; then
+    if is_test_file "$file_path"; then
       sentinel="$cwd/.infigraph/.test-context-called"
       if [ -f "$sentinel" ]; then
         # Check freshness — allow if sentinel written within last 30 minutes
