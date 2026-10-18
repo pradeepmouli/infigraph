@@ -143,6 +143,31 @@ pub fn run(root: &Path, op: &Op, apply: bool) -> Result<String> {
     })
 }
 
+/// Refuses a write that names no project when `root` has linked worktrees.
+/// A server started in the main checkout resolves a call without `path` to
+/// that checkout, so a caller working in `scratchpad/wt-x` would change the
+/// main checkout's glossary while believing it changes the worktree's. A dry
+/// run writes nothing and is allowed, and its report names the root.
+pub fn refuse_unnamed_write(root: &Path, named: bool, apply: bool) -> Result<()> {
+    if named || !apply {
+        return Ok(());
+    }
+    match infigraph_core::worktree::list_worktree_paths(root) {
+        Ok(all) if all.len() > 1 => bail!(
+            "no `path` was given, so this would change the glossary of {}, which has {} linked \
+             worktree(s): pass `path` naming the checkout you mean",
+            root.display(),
+            all.len() - 1
+        ),
+        _ => Ok(()),
+    }
+}
+
+/// `report` under a first line naming the project it was produced for.
+pub fn with_root_line(root: &Path, report: &str) -> String {
+    format!("project: {}\n{report}", root.display())
+}
+
 /// Refuses to act on `root` for a caller standing in a checkout nested inside
 /// it that has no index of its own. A linked worktree (`scratchpad/wt-x`)
 /// without a store resolves to the main checkout's, and an edit would then land
