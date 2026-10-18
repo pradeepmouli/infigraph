@@ -28,19 +28,25 @@ use super::GraphStore;
 pub const ID_SCHEME: i64 = 1;
 
 /// The scheme a graph is stamped with: 0 for one that predates the stamp (the
-/// column, the row or the graph itself missing all read as 0).
-pub fn stored(exec: &dyn QueryExec) -> i64 {
-    first_int(
-        exec,
-        "MATCH (g:GraphMeta {id: 'singleton'}) RETURN g.id_scheme",
+/// row missing or NULL reads as 0). `None` when the query itself failed: that is
+/// not knowing, and must not read as "predates the stamp" -- the answer decides
+/// whether a healthy graph is wiped and rebuilt.
+pub fn stored(exec: &dyn QueryExec) -> Option<i64> {
+    let rows = exec
+        .query_rows("MATCH (g:GraphMeta {id: 'singleton'}) RETURN g.id_scheme")
+        .ok()?;
+    Some(
+        rows.first()
+            .and_then(|row| row.first())
+            .and_then(|v| v.trim_matches('"').parse().ok())
+            .unwrap_or(0),
     )
-    .unwrap_or(0)
 }
 
 /// True when the graph holds symbols written under an older scheme. A graph
 /// that cannot be read says no: never act on a state that is not known.
 pub fn outdated(exec: &dyn QueryExec) -> bool {
-    stored(exec) < ID_SCHEME
+    stored(exec).is_some_and(|scheme| scheme < ID_SCHEME)
         && first_int(exec, "MATCH (s:Symbol) RETURN count(*)").is_some_and(|n| n > 0)
 }
 
@@ -127,7 +133,7 @@ mod tests {
         let (_dir, store) = store();
         assert_eq!(
             stored(&LocalExec::new(&store.connection().unwrap())),
-            ID_SCHEME
+            Some(ID_SCHEME)
         );
         add_symbol(&store);
         assert_eq!(outdated_in(&store), Some(false));
@@ -171,6 +177,48 @@ mod tests {
         add_symbol(&store);
         set_scheme(&store, ID_SCHEME + 1);
         assert_eq!(outdated_in(&store), Some(false));
+    }
+
+    /// A graph holding `n` symbols whose stamp query fails (a busy daemon, a
+    /// query cut short) while its other queries answer.
+    struct StampFails(u32);
+
+    impl QueryExec for StampFails {
+        fn query_rows(&self, cypher: &str) -> anyhow::Result<Vec<Vec<String>>> {
+            if cypher.contains("id_scheme") {
+                anyhow::bail!("daemon busy");
+            }
+            Ok(vec![vec![self.0.to_string()]])
+        }
+    }
+
+    /// Answers the stamp query with no rows and the symbol count with `n`.
+    struct NoStamp(u32);
+
+    impl QueryExec for NoStamp {
+        fn query_rows(&self, cypher: &str) -> anyhow::Result<Vec<Vec<String>>> {
+            Ok(if cypher.contains("count(*)") {
+                vec![vec![self.0.to_string()]]
+            } else {
+                vec![]
+            })
+        }
+    }
+
+    #[test]
+    fn a_query_that_fails_is_not_an_outdated_graph() {
+        assert_eq!(stored(&StampFails(5)), None);
+        assert!(
+            !outdated(&StampFails(5)),
+            "a transient error must never wipe a graph"
+        );
+    }
+
+    #[test]
+    fn a_missing_stamp_row_reads_as_the_oldest_scheme() {
+        assert_eq!(stored(&NoStamp(5)), Some(0));
+        assert!(outdated(&NoStamp(5)));
+        assert!(!outdated(&NoStamp(0)), "nothing in it to rename");
     }
 
     #[test]
@@ -221,6 +269,6 @@ mod tests {
             first_int(&LocalExec::new(&conn), "MATCH (s:Symbol) RETURN count(*)"),
             Some(1)
         );
-        assert_eq!(stored(&LocalExec::new(&conn)), ID_SCHEME);
+        assert_eq!(stored(&LocalExec::new(&conn)), Some(ID_SCHEME));
     }
 }
