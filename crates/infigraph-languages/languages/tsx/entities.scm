@@ -47,12 +47,35 @@
 ; is the TypeScript half of the parent-capture idiom (@method.parent) for
 ; fields and properties.
 
-; const X = { ... }  (also `as` / `satisfies` wrappers)
-(variable_declarator
-  name: (identifier) @member.root
-  value: [(object) @member.scope
-          (as_expression . (object) @member.scope)
-          (satisfies_expression . (object) @member.scope)])
+; const X = { ... } at module level (also `as` / `satisfies` wrappers, `var`,
+; and `export`). A literal bound inside a function has no stable owner name --
+; the same `const node = {..}` recurs in every function -- so it gets none.
+(program
+  [(lexical_declaration
+     (variable_declarator
+       name: (identifier) @member.root
+       value: [(object) @member.scope
+                  (as_expression . (object) @member.scope)
+                  (satisfies_expression . (object) @member.scope)]))
+   (variable_declaration
+     (variable_declarator
+       name: (identifier) @member.root
+       value: [(object) @member.scope
+                  (as_expression . (object) @member.scope)
+                  (satisfies_expression . (object) @member.scope)]))
+   (export_statement
+     declaration: [(lexical_declaration
+                     (variable_declarator
+                       name: (identifier) @member.root
+                       value: [(object) @member.scope
+                                  (as_expression . (object) @member.scope)
+                                  (satisfies_expression . (object) @member.scope)]))
+                   (variable_declaration
+                     (variable_declarator
+                       name: (identifier) @member.root
+                       value: [(object) @member.scope
+                                  (as_expression . (object) @member.scope)
+                                  (satisfies_expression . (object) @member.scope)]))])])
 
 ; a key whose value is itself a literal: { b: { ... } }
 (object

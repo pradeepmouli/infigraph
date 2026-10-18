@@ -17,6 +17,11 @@ foo({ anon: 1 });
 const list = [{ inArray: 1 }];
 const wrapped = { a: { b: 1 } } as const;
 const viaArray = { items: [{ x: 1 }] };
+var legacy = { old: 1 };
+export default function f() {
+  const local = { z: 1 };
+}
+export const exported = { e: 1 };
 ";
 
 fn members() -> Vec<(String, Vec<String>)> {
@@ -117,5 +122,15 @@ fn the_captures_emit_no_symbol() {
     assert!(
         names.contains(&"OXFMT_CONFIG"),
         "the binding itself still does: {names:?}"
+    );
+}
+
+#[test]
+fn only_a_module_level_binding_names_a_literal() {
+    assert_eq!(owners_of("old"), ["legacy"], "var counts");
+    assert_eq!(owners_of("e"), ["exported"], "export counts");
+    assert!(
+        owners_of("z").is_empty(),
+        "a literal bound inside a function has no stable owner name"
     );
 }
