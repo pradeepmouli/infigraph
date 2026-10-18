@@ -1228,6 +1228,9 @@ impl GraphStore {
             v = super::schema::SCHEMA_VERSION
         ))
         .map_err(|e| anyhow::anyhow!("failed to stamp schema version: {e}"))?;
+        // Only a graph with nothing in it is stamped with the id scheme: one
+        // that holds symbols keeps the scheme they were written under.
+        super::id_scheme::stamp_if_empty(&conn)?;
         Ok(())
     }
 

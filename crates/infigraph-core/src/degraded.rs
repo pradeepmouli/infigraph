@@ -27,6 +27,8 @@ pub const CLONE_BODIES_UNAVAILABLE: &str = "clone-bodies-unavailable";
 pub const CLONE_BODIES_PARTIAL: &str = "clone-bodies-partial";
 pub const DOC_LINKS_UNSCANNED: &str = "doc-links-unscanned";
 pub const DOC_SYNC_UNKNOWN: &str = "doc-sync-unknown";
+pub const IDS_OUTDATED: &str = "ids-outdated";
+pub const SCIP_LITERAL_OWNERS_UNAVAILABLE: &str = "scip-literal-owners-unavailable";
 
 /// One way infigraph is running degraded.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,6 +84,14 @@ pub enum DegradedMode {
     /// Git could not say when a documented symbol and its entry last
     /// changed, so no entry can be called stale or current.
     DocSyncUnknown { reason: String },
+    /// The graph holds symbols whose ids were written by an older infigraph
+    /// (`graph::id_scheme`). An incremental index cannot adopt it a file at a
+    /// time, so the daemon rebuilds it whole.
+    IdsOutdated,
+    /// A SCIP import met object-literal members in a process that had no
+    /// language registry to ask who owns them, so they got the indexer's
+    /// counter-suffixed names (`semi0`) instead of `file::Const::semi`.
+    ScipLiteralOwnersUnavailable,
 }
 
 impl DegradedMode {
@@ -107,6 +117,8 @@ impl DegradedMode {
             DegradedMode::CloneBodiesPartial { .. } => CLONE_BODIES_PARTIAL,
             DegradedMode::DocLinksUnscanned { .. } => DOC_LINKS_UNSCANNED,
             DegradedMode::DocSyncUnknown { .. } => DOC_SYNC_UNKNOWN,
+            DegradedMode::IdsOutdated => IDS_OUTDATED,
+            DegradedMode::ScipLiteralOwnersUnavailable => SCIP_LITERAL_OWNERS_UNAVAILABLE,
         }
     }
 
@@ -187,6 +199,14 @@ impl DegradedMode {
                 "git cannot say when documented code and its entry last changed ({reason}): \
                  no entry is judged stale or current"
             ),
+            DegradedMode::IdsOutdated => "symbol ids in this graph were written by an older \
+                 infigraph: a full rebuild is queued, and until it ends a saved id or a \
+                 glossary key may name nothing"
+                .to_string(),
+            DegradedMode::ScipLiteralOwnersUnavailable => "a SCIP import named object-literal \
+                 members without knowing their owners (no language registry in this process): \
+                 they carry the indexer's counter, e.g. `semi0`, until the next import"
+                .to_string(),
         }
     }
 
@@ -227,6 +247,13 @@ impl DegradedMode {
             DegradedMode::DocSyncUnknown { .. } => {
                 "documents are compared with code through git history: use a git checkout where \
                  `git blame` works on the documented files"
+            }
+            DegradedMode::IdsOutdated => {
+                "the rebuild starts by itself; `infigraph index --full` starts it now"
+            }
+            DegradedMode::ScipLiteralOwnersUnavailable => {
+                "import through `infigraph scip-enrich` or the daemon, which load the language \
+                 packs"
             }
         }
     }
@@ -833,6 +860,8 @@ mod tests {
             DegradedMode::DocSyncUnknown {
                 reason: "not a git repository".to_string(),
             },
+            DegradedMode::IdsOutdated,
+            DegradedMode::ScipLiteralOwnersUnavailable,
         ];
         let keys: std::collections::HashSet<_> = modes.iter().map(|m| m.key()).collect();
         let messages: std::collections::HashSet<_> = modes.iter().map(|m| m.message()).collect();

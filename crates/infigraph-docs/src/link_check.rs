@@ -98,11 +98,22 @@ impl Miss {
             Miss::Dotted { suggestion } => format!("{key}  ->  did you mean {suggestion}"),
             Miss::Numbered { count } => format!(
                 "{key}  ->  {count} symbols have that name; `#N` ids depend on source order and \
-                 cannot be keys"
+                 cannot be keys (this is how members of an object literal nothing names, and \
+                 overloads, are numbered: do not key an entry on one)"
+            ),
+            Miss::NoSuchSymbol if ends_in_ordinal(key) => format!(
+                "{key}  ->  a `#N` id follows source order and moves when the code does: do not \
+                 key an entry on one"
             ),
             _ => key.to_string(),
         }
     }
+}
+
+/// A key that ends in `#<digits>`.
+fn ends_in_ordinal(key: &str) -> bool {
+    key.rsplit_once('#')
+        .is_some_and(|(_, n)| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
 }
 
 fn rows_of(exec: &dyn QueryExec, cypher: &str) -> Vec<Vec<String>> {
@@ -179,11 +190,20 @@ fn classify(exec: &dyn QueryExec, key: &str) -> Miss {
             return Miss::Dotted { suggestion };
         }
     }
+    // `name0` is the counter an indexer glues onto an object-literal key; the
+    // symbols are `name#N` now, so a key that is a numbered name's base with
+    // digits on it is the same mistake.
+    let base = key.trim_end_matches(|c: char| c.is_ascii_digit());
+    let base = if base.len() < key.len() && base.contains("::") && !base.ends_with("::") {
+        base
+    } else {
+        key
+    };
     let numbered = rows_of(
         exec,
         &format!(
             "MATCH (s:Symbol) WHERE s.id STARTS WITH '{}#' RETURN count(s)",
-            escape_str(key)
+            escape_str(base)
         ),
     );
     let count: usize = numbered
@@ -588,6 +608,22 @@ mod tests {
     fn a_numbered_key_says_how_many_symbols_share_the_name() {
         let hint = Miss::Numbered { count: 5 }.hint("types.ts::rules");
         assert!(hint.contains("5 symbols") && hint.contains("#N"), "{hint}");
+    }
+
+    #[test]
+    fn a_numbered_hint_says_not_to_key_an_entry_on_a_number() {
+        let hint = Miss::Numbered { count: 5 }.hint("a.ts::name");
+        assert!(
+            hint.contains("object literal") && hint.contains("do not key"),
+            "{hint}"
+        );
+        let gone = Miss::NoSuchSymbol.hint("a.ts::name#4");
+        assert!(
+            gone.contains("source order") && gone.contains("do not"),
+            "{gone}"
+        );
+        assert_eq!(Miss::NoSuchSymbol.hint("a.ts::name"), "a.ts::name");
+        assert_eq!(Miss::NoSuchSymbol.hint("a.ts::name#x"), "a.ts::name#x");
     }
 
     #[test]

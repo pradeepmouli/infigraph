@@ -25,7 +25,8 @@ type NameCandidates = HashMap<(String, String), Vec<(u32, u32, String)>>;
 /// kind, file, start_line, end_line, docstring, scip_id.
 type NewSymbolRow = (String, String, String, String, u32, u32, String, String);
 
-/// Drop rows whose id already exists in the graph, in a single pass.
+/// Give every row an id that is free, in a single pass: neither in the graph
+/// nor taken by a row before it in the batch.
 ///
 /// #153: the `COPY Symbol` retry loop drops exactly ONE id per failure,
 /// because Kuzu names one bad value per error. A batch holding N ids that
@@ -40,13 +41,43 @@ type NewSymbolRow = (String, String, String, String, u32, u32, String, String);
 /// (`store_util::prefilter_pairs_against_existing`). This is the node
 /// equivalent, and it costs nothing extra: the ids come from the symbol
 /// preload this import already performs.
-fn drop_ids_already_in_graph(
+///
+/// A colliding row is a different symbol that earned the same id, not a copy
+/// of one, so it is NOT dropped: it takes the next free `#N` (from 2: the
+/// holder of the bare id is #1). The only row dropped is the same definition
+/// seen twice (same id, moniker and line), counted in the third return value.
+/// Returns the rows to write, `(moniker, new id)` for each renamed row so
+/// references follow it, and how many exact duplicates were dropped.
+fn make_ids_unique(
     rows: Vec<NewSymbolRow>,
     existing: &std::collections::HashSet<String>,
-) -> Vec<NewSymbolRow> {
-    rows.into_iter()
-        .filter(|(id, ..)| !existing.contains(id))
-        .collect()
+) -> (Vec<NewSymbolRow>, Vec<(String, String)>, usize) {
+    // id -> (moniker, start line) of the row that holds it in this batch
+    let mut taken: HashMap<String, (String, u32)> = HashMap::with_capacity(rows.len());
+    let mut kept = Vec::with_capacity(rows.len());
+    let mut renamed = Vec::new();
+    let mut duplicates = 0;
+    for mut row in rows {
+        let held_by_batch = taken.get(&row.0);
+        if let Some((moniker, line)) = held_by_batch {
+            if *moniker == row.7 && *line == row.4 {
+                duplicates += 1;
+                continue;
+            }
+        }
+        if held_by_batch.is_some() || existing.contains(&row.0) {
+            let base = row.0.clone();
+            let free = (2..)
+                .map(|n| format!("{base}#{n}"))
+                .find(|id| !existing.contains(id) && !taken.contains_key(id))
+                .expect("an unbounded range has a free ordinal");
+            renamed.push((row.7.clone(), free.clone()));
+            row.0 = free;
+        }
+        taken.insert(row.0.clone(), (row.7.clone(), row.4));
+        kept.push(row);
+    }
+    (kept, renamed, duplicates)
 }
 
 /// Existing `(:Symbol)-[table]->(:Symbol)` pairs, keyed by source id.
@@ -505,20 +536,26 @@ fn import_scip_index_unrecorded(
     // `if let Ok(rows) = ...` was treating that failure identically to "this
     // is a brand-new project with no symbols yet".
     let q = "MATCH (s:Symbol) RETURN s.id, s.file, s.name, s.start_line, s.end_line, \
-             s.docstring, s.scip_id";
+             s.docstring, s.scip_id, s.kind";
     let rows = {
         let _phase = crate::write_phase::enter(&"scip-import: preload symbols", 0);
         conn.query(q)
             .context("SCIP import: failed to preload existing symbols")?
     };
     // Every id already in the graph, gathered from the preload rows this
-    // import is reading anyway -- see `drop_ids_already_in_graph` (#153).
+    // import is reading anyway -- see `make_ids_unique` (#153).
     let mut existing_symbol_ids: std::collections::HashSet<String> =
         std::collections::HashSet::new();
     // What each symbol is already enriched with -- see `enrichment_hash`.
     let mut existing_enrichment: HashMap<String, u64> = HashMap::new();
+    // id -> the moniker it was enriched with, to tell a literal member's row
+    // from its same-line siblings (their monikers differ, their names do not).
+    let mut existing_scip_ids: HashMap<String, String> = HashMap::new();
+    // id -> kind: a literal member's tree-sitter row is a method, never the
+    // function or class that merely contains its key.
+    let mut existing_kinds: HashMap<String, String> = HashMap::new();
     for row in rows {
-        if row.len() < 7 {
+        if row.len() < 8 {
             continue;
         }
         let sid = raw_string(&row[0]).to_string();
@@ -527,6 +564,8 @@ fn import_scip_index_unrecorded(
             sid.clone(),
             enrichment_hash(raw_string(&row[5]), raw_string(&row[6])),
         );
+        existing_scip_ids.insert(sid.clone(), raw_string(&row[6]).to_string());
+        existing_kinds.insert(sid.clone(), raw_string(&row[7]).to_string());
         let sfile = raw_string(&row[1]).to_string();
         let sname = raw_string(&row[2]).to_string();
         let sstart: u32 = row[3].to_string().trim_matches('"').parse().unwrap_or(0);
@@ -632,9 +671,18 @@ fn import_scip_index_unrecorded(
     // so Pass 2/3 can look up a reference's target directly here instead of
     // re-deriving resolution through the lossy (file, name) map.
     let mut scip_sym_to_ts_id: HashMap<String, String> = HashMap::new();
+    // (id, start line) -> the moniker of each row THIS pass made. Another
+    // moniker is another symbol, whatever it is called and wherever it starts:
+    // `Map#empty.` and the `empty` inside its inline type begin on one line.
+    let mut made_in_pass: HashMap<(String, u32), String> = HashMap::new();
+    // (id, start line) -> the moniker that enriched that EXISTING row this pass.
+    let mut enriched_in_pass: HashMap<(String, u32), String> = HashMap::new();
+    let mut literals_without_registry = false;
 
     for doc in &documents {
         let file = &doc.relative_path;
+        let literal_members = literal_members_of(doc, project_root);
+        literals_without_registry |= literal_members.registry_missing;
 
         let sym_info_map: HashMap<&str, &scip::types::SymbolInformation> = doc
             .symbols
@@ -653,9 +701,30 @@ fn import_scip_index_unrecorded(
             if is_member_of_known_symbol(scip_sym, &scip_sym_to_file_name) {
                 continue;
             }
+            // A type parameter or a parameter's own type is not a symbol:
+            // no row, so no id for a reference to it to become an edge to.
+            if is_parameter_symbol(scip_sym) {
+                stats.symbols_skipped += 1;
+                continue;
+            }
 
-            let name = scip_sym_to_name(scip_sym);
             let span = occurrence_span(occ, file);
+            // A member of an object literal: the key and the owners come from
+            // the source (the moniker has the key only with a counter glued
+            // on, and no owner), and are what the name, the match below and
+            // the id are all made from. A literal no name binds has no
+            // owners: `file::key`, numbered below like any repeated id.
+            let literal = is_literal_member_moniker(scip_sym)
+                .then(|| {
+                    let (line, col, ..) = occurrence_range(occ);
+                    literal_members.at(line, col)
+                })
+                .flatten()
+                .filter(|member| names_literal_key(scip_sym, &member.name));
+            let name = match literal {
+                Some(member) => member.name.clone(),
+                None => scip_sym_to_name(scip_sym),
+            };
             let si = sym_info_map.get(scip_sym.as_str());
             let docstring = si
                 .and_then(|s| s.documentation.first())
@@ -674,25 +743,92 @@ fn import_scip_index_unrecorded(
             // this same loop (that candidate is some other occurrence processed
             // moments ago, not this one), and only when pre-existing ambiguity is
             // low enough (a single candidate) to safely guess.
-            let matched = file_name_to_ids
+            //
+            // A literal member is the exception on both counts: a symbol that
+            // merely ENCLOSES its key (`function value() { return { value: 1 } }`)
+            // is not it, so it matches only a candidate that starts on the
+            // key's line (an object-literal method tree-sitter already
+            // extracted), and it never takes the lone-candidate fallback.
+            // Nor does it match a symbol THIS import just made: generated
+            // one-line records repeat a key in sibling literals on one line,
+            // and the second would merge into the first (889 sittir rows).
+            let candidates = if literal.is_some() {
+                &preexisting_file_name_to_ids
+            } else {
+                &file_name_to_ids
+            };
+            // The id a literal member's own tree-sitter row would carry: the
+            // best of several same-line candidates.
+            let own_id = literal
+                .as_ref()
+                .map(|member| qualified_id(file, &member.owners, &name));
+            // Best candidate first: the row an earlier import gave THIS moniker,
+            // then one with no moniker yet, then (a merged declaration, whose
+            // two monikers share a row) one carrying another's. A row this pass
+            // already gave another moniker is never a candidate, so sibling
+            // members never share one.
+            let rank = |s: u32, e: u32, id: &String| -> Option<u8> {
+                if made_in_pass
+                    .get(&(id.clone(), s))
+                    .is_some_and(|moniker| moniker != scip_sym)
+                {
+                    return None;
+                }
+                let moniker = existing_scip_ids.get(id).filter(|m| !m.is_empty());
+                let taken = enriched_in_pass
+                    .get(&(id.clone(), s))
+                    .is_some_and(|m| m != scip_sym);
+                if literal.is_some() {
+                    if taken {
+                        return None;
+                    }
+                    // an earlier import's row for THIS member (its moniker is
+                    // unique in the file), or a method tree-sitter made that
+                    // starts on the key's line
+                    return match moniker {
+                        Some(moniker) => (moniker == scip_sym).then_some(0),
+                        None => (span.start_line == s
+                            && existing_kinds.get(id).is_some_and(|k| k == "method"))
+                        .then_some(if Some(id) == own_id.as_ref() { 1 } else { 2 }),
+                    };
+                }
+                if span.start_line < s || span.start_line > e {
+                    return None;
+                }
+                // a row another moniker took this pass is the last resort: two
+                // monikers of a merged declaration share one, same-line
+                // siblings must not
+                Some(match moniker {
+                    _ if taken => 3,
+                    Some(moniker) if moniker == scip_sym => 0,
+                    None => 1,
+                    Some(_) => 2,
+                })
+            };
+            let matched = candidates
                 .get(&key)
                 .and_then(|candidates| {
                     candidates
                         .iter()
-                        .find(|(s, e, _)| span.start_line >= *s && span.start_line <= *e)
-                        .map(|(_, _, id)| id.clone())
+                        .filter_map(|(s, e, id)| rank(*s, *e, id).map(|r| (r, *s, id)))
+                        .min_by_key(|(r, ..)| *r)
+                        .map(|(_, s, id)| (s, id.clone()))
                 })
                 .or_else(|| {
+                    if literal.is_some() {
+                        return None;
+                    }
                     preexisting_file_name_to_ids.get(&key).and_then(|c| {
                         if c.len() == 1 {
-                            c.first().map(|(_, _, id)| id.clone())
+                            c.first().map(|(s, _, id)| (*s, id.clone()))
                         } else {
                             None
                         }
                     })
                 });
 
-            if let Some(sid) = matched {
+            if let Some((matched_start, sid)) = matched {
+                enriched_in_pass.insert((sid.clone(), matched_start), scip_sym.clone());
                 if existing_enrichment.get(&sid) != Some(&enrichment_hash(docstring, scip_sym)) {
                     enrichments.push((sid.clone(), docstring.to_string(), scip_sym.clone()));
                     stats.symbols_enriched += 1;
@@ -702,7 +838,10 @@ fn import_scip_index_unrecorded(
                 let kind = si
                     .map(|s| scip_kind_to_prism(&s.kind.enum_value_or_default()))
                     .unwrap_or(SymbolKind::Function);
-                let sym_id = format!("{}::{}", file, name);
+                let sym_id = match literal {
+                    Some(member) => qualified_id(file, &member.owners, &name),
+                    None => scip_symbol_id(file, scip_sym, &name),
+                };
                 new_symbols.push((
                     sym_id.clone(),
                     name.clone(),
@@ -714,16 +853,12 @@ fn import_scip_index_unrecorded(
                     scip_sym.clone(),
                 ));
                 stats.symbols_added += 1;
+                made_in_pass.insert((sym_id.clone(), span.start_line), scip_sym.clone());
                 scip_sym_to_ts_id.insert(scip_sym.clone(), sym_id.clone());
                 file_name_to_ids.entry(key).or_default().push((
                     span.start_line,
                     span.end_line,
                     sym_id.clone(),
-                ));
-                file_symbols.entry(file.clone()).or_default().push((
-                    span.start_line,
-                    span.end_line,
-                    sym_id,
                 ));
             }
         }
@@ -731,33 +866,45 @@ fn import_scip_index_unrecorded(
         stats.files_processed += 1;
     }
 
-    // Phase 2-style ordinal disambiguation (mirrors entities.rs's
-    // tree-sitter path) for genuinely-distinct new SCIP symbols that share a
-    // (file, name) key -- e.g. `A#foo()` and `B#foo()` both extract to
-    // "foo". Without this, both would carry the identical unsuffixed id and
-    // the `seen_ids` dedup below would silently keep only one, losing the
-    // other with no warning (confirmed via
-    // `probe_two_new_same_named_symbols_one_file`). Ordinals continue past
-    // whatever count already existed for this key before this import pass,
-    // so a newly-added symbol can never collide with one already in the
-    // graph either.
-    {
-        let mut groups: HashMap<(String, String), Vec<usize>> = HashMap::new();
-        for (i, (_, name, _, file, ..)) in new_symbols.iter().enumerate() {
-            groups
-                .entry((file.clone(), name.clone()))
-                .or_default()
-                .push(i);
+    // Members named without their owners are reported, not silent: the ids
+    // are the counter-suffixed ones until an import that has the packs.
+    if let Some(root) = project_root {
+        if literals_without_registry {
+            crate::degraded::live::set(
+                root,
+                crate::degraded::DegradedMode::ScipLiteralOwnersUnavailable,
+            );
+        } else {
+            crate::degraded::live::clear(root, crate::degraded::SCIP_LITERAL_OWNERS_UNAVAILABLE);
         }
-        for ((file, name), mut idxs) in groups {
-            let existing_count = preexisting_file_name_to_ids
-                .get(&(file.clone(), name.clone()))
-                .map_or(0, |v| v.len());
+    }
+
+    // Phase 2-style ordinal disambiguation (mirrors entities.rs's
+    // tree-sitter path) for genuinely-distinct new SCIP symbols that share
+    // an id -- `scip_symbol_id` puts the owner chain in the id, so what is
+    // left is the real overloads (one moniker defined at several spans) and
+    // owner-less repeats. Without this, both would carry the identical
+    // unsuffixed id and the `seen_ids` dedup below would silently keep only
+    // one, losing the other with no warning (confirmed via
+    // `probe_two_new_same_named_symbols_one_file`). Ordinals continue past
+    // whatever ids already exist for this base, so a newly-added symbol can
+    // never collide with one already in the graph either.
+    {
+        let mut already: HashMap<&str, usize> = HashMap::new();
+        for id in &existing_symbol_ids {
+            *already.entry(without_ordinal(id)).or_default() += 1;
+        }
+        let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
+        for (i, (id, ..)) in new_symbols.iter().enumerate() {
+            groups.entry(id.clone()).or_default().push(i);
+        }
+        for (base, mut idxs) in groups {
+            let existing_count = already.get(base.as_str()).copied().unwrap_or(0);
             // Truly unambiguous: exactly one new occurrence in this batch,
-            // and nothing pre-existing under this key either -- keep the
+            // and nothing pre-existing under this base either -- keep the
             // bare id (matches entities.rs's own single-occurrence case).
             // Otherwise (more than one new occurrence, and/or something
-            // already exists for this key) every one of THIS batch's
+            // already exists for this base) every one of THIS batch's
             // occurrences needs a suffix continuing past `existing_count`,
             // including a solo one -- a lone new occurrence colliding with
             // pre-existing rows is exactly what caused a real
@@ -767,17 +914,17 @@ fn import_scip_index_unrecorded(
             }
             idxs.sort_by_key(|&i| (new_symbols[i].4, new_symbols[i].5));
             for (n, i) in idxs.into_iter().enumerate() {
-                let new_id = format!("{file}::{name}#{}", existing_count + n + 1);
+                let new_id = format!("{base}#{}", existing_count + n + 1);
                 new_symbols[i].0 = new_id.clone();
                 scip_sym_to_ts_id.insert(new_symbols[i].7.clone(), new_id);
             }
         }
     }
 
-    // Bulk insert new SCIP symbols via Parquet COPY FROM. `seen_ids` is now
-    // only a defensive backstop against a literal exact duplicate (the same
-    // definition occurrence observed twice) -- genuinely distinct same-named
-    // symbols are disambiguated above before reaching this point. On a COPY
+    // Bulk insert new SCIP symbols via Parquet COPY FROM. Genuinely distinct
+    // same-named symbols are disambiguated above, and `make_ids_unique` has
+    // made every id free (dropping only a literal duplicate: the same
+    // definition occurrence observed twice) before this point. On a COPY
     // failure against an id that already exists in the graph, drop that one
     // record and retry rather than falling back to UNWIND for the whole
     // batch; only exhausting MAX_SYMBOL_RETRIES falls back.
@@ -786,15 +933,32 @@ fn import_scip_index_unrecorded(
     if !new_symbols.is_empty() {
         let sym_pq = staging_parquet("infigraph_scip_symbols");
 
-        // Collisions with rows already in the graph are removed up front, in
-        // one pass, rather than one-per-failed-COPY (#153) -- `seen_ids`
-        // still guards against a literal duplicate within this batch.
-        let new_symbols = drop_ids_already_in_graph(new_symbols, &existing_symbol_ids);
-        let mut seen_ids = std::collections::HashSet::with_capacity(new_symbols.len());
-        let mut remaining: Vec<_> = new_symbols
-            .into_iter()
-            .filter(|(id, ..)| seen_ids.insert(id.clone()))
-            .collect();
+        // Collisions with rows already in the graph are settled up front, in
+        // one pass, rather than one-per-failed-COPY (#153); a collision renames
+        // the row, and only the same definition seen twice is dropped.
+        let (mut remaining, renamed, duplicates) =
+            make_ids_unique(new_symbols, &existing_symbol_ids);
+        for (moniker, id) in renamed {
+            scip_sym_to_ts_id.insert(moniker, id);
+        }
+        // The container of a reference is looked up by span: the new rows join
+        // it under the ids they end up with, not the ones they were made with.
+        for (id, _, _, file, start, end, ..) in &remaining {
+            file_symbols
+                .entry(file.clone())
+                .or_default()
+                .push((*start, *end, id.clone()));
+        }
+        for syms in file_symbols.values_mut() {
+            syms.sort_by_key(|(s, e, _)| *e as i64 - *s as i64);
+        }
+        if duplicates > 0 {
+            crate::last_run::note(
+                "symbols dropped: the same definition twice",
+                duplicates as u64,
+                "an indexer reported one definition occurrence more than once",
+            );
+        }
 
         // Re-check growth on every attempt (#132 gap 1): each retry is a
         // whole new COPY, and a retry loop is exactly the shape that can
@@ -1245,6 +1409,30 @@ fn occurrence_span(occ: &Occurrence, file: &str) -> Span {
 /// string once the old single-`if` parens handling failed to find any
 /// identifier left to extract).
 fn scip_sym_to_name(scip_sym: &str) -> String {
+    accessor_name(descriptor_name(scip_sym))
+}
+
+/// scip-typescript spells an accessor `<get>x` / `<set>x` and a constructor
+/// `<constructor>`; tree-sitter names the same `method_definition` `x` /
+/// `constructor`, so these are what a SCIP row must be called to find (and be
+/// found by) the row tree-sitter made. A getter and a setter then number as
+/// overloads. A private member `#x` is written that way in source and tree-sitter
+/// extracts none (`private_property_identifier` is not in the method pattern):
+/// kept as written.
+fn accessor_name(name: String) -> String {
+    if let Some(rest) = name
+        .strip_prefix("<get>")
+        .or_else(|| name.strip_prefix("<set>"))
+    {
+        return rest.to_string();
+    }
+    if name == "<constructor>" {
+        return "constructor".to_string();
+    }
+    name
+}
+
+fn descriptor_name(scip_sym: &str) -> String {
     let mut s = scip_sym.trim_end();
 
     // Strip a trailing method terminator.
@@ -1304,6 +1492,366 @@ fn scip_sym_to_name(scip_sym: &str) -> String {
         suffix.trim_start_matches('.').to_string()
     } else {
         scip_sym.to_string()
+    }
+}
+
+/// The language packs the import reads object-literal owners with. Set once
+/// per process by whoever opens a project (`Infigraph::open_shared`), because
+/// the import runs behind `GraphBackend`, which carries no registry, and
+/// every process uses the one bundled set. Without it (a bare store in a
+/// test) a literal member simply keeps the id its moniker gives it.
+static LANGUAGES: std::sync::OnceLock<Arc<crate::lang::LanguageRegistry>> =
+    std::sync::OnceLock::new();
+
+/// Hand the import the process's language registry. The first call wins.
+pub fn use_language_registry(registry: Arc<crate::lang::LanguageRegistry>) {
+    let _ = LANGUAGES.set(registry);
+}
+
+/// True when `scip_sym` is the object-literal member `key` (its last descriptor
+/// is the key and the indexer's per-file counter). The key is read from the
+/// file as it is now, the index may be older: a shifted line puts the position
+/// on another member, whose name is then not this moniker's.
+fn names_literal_key(scip_sym: &str, key: &str) -> bool {
+    scip_descriptors(scip_sym)
+        .and_then(|mut d| d.pop())
+        .and_then(|last| {
+            last.name
+                .strip_prefix(key)
+                .map(|counter| !counter.is_empty() && counter.bytes().all(|b| b.is_ascii_digit()))
+        })
+        .unwrap_or(false)
+}
+
+/// scip-typescript names an object-literal member `<key><N>:` -- the key and
+/// a per-file counter, with no owner. A meta descriptor ending in a digit is
+/// how the moniker says so; the key itself comes from the source, because
+/// `x1` + counter 0 and `x` + counter 10 read the same.
+fn is_literal_member_moniker(scip_sym: &str) -> bool {
+    scip_descriptors(scip_sym)
+        .and_then(|mut d| d.pop())
+        .is_some_and(|last| {
+            last.kind == DescriptorKind::Meta
+                && !is_type_literal(&last.name)
+                && last.name.ends_with(|c: char| c.is_ascii_digit())
+        })
+}
+
+/// The object-literal members of one file, as SCIP's positions find them.
+struct FileLiterals {
+    members: HashMap<(u32, u32), crate::extract::LiteralMember>,
+    source: Vec<u8>,
+    /// Byte offset where each line starts.
+    line_starts: Vec<usize>,
+    /// The file defines literal members and this process has no language
+    /// registry to ask who owns them (`use_language_registry` never ran).
+    registry_missing: bool,
+}
+
+impl FileLiterals {
+    fn none() -> Self {
+        Self {
+            members: HashMap::new(),
+            source: Vec::new(),
+            line_starts: Vec::new(),
+            registry_missing: false,
+        }
+    }
+
+    /// The member whose key starts at SCIP's `(line, column)`. SCIP counts the
+    /// column in UTF-16 units from the start of the line (scip-typescript) and
+    /// tree-sitter in bytes, so a line with non-ASCII text before the key
+    /// would miss it without the conversion. Lines are split at `\n` only: a
+    /// file with a BOM, a lone `\r` or U+2028 counts lines differently from
+    /// the indexer, so its members are not found (they keep the SCIP name).
+    fn at(&self, line: i32, utf16_col: i32) -> Option<&crate::extract::LiteralMember> {
+        let (line, col) = (line.max(0) as u32, utf16_col.max(0) as u32);
+        self.members.get(&(line, self.byte_column(line, col)))
+    }
+
+    fn byte_column(&self, line: u32, utf16_col: u32) -> u32 {
+        let Some(&start) = self.line_starts.get(line as usize) else {
+            return utf16_col;
+        };
+        let end = self
+            .line_starts
+            .get(line as usize + 1)
+            .copied()
+            .unwrap_or(self.source.len());
+        let Ok(text) = std::str::from_utf8(&self.source[start..end]) else {
+            return utf16_col;
+        };
+        let mut units = 0;
+        for (byte, ch) in text.char_indices() {
+            if units >= utf16_col {
+                return byte as u32;
+            }
+            units += ch.len_utf16() as u32;
+        }
+        text.len() as u32
+    }
+}
+
+/// The object-literal members of `doc`'s file, when the document defines any
+/// (`is_literal_member_moniker`): read from the file as it is now, with the
+/// pack's own `@member.*` captures. Empty when there is nothing to ask,
+/// nowhere to read it from, or no pack to ask with.
+fn literal_members_of(doc: &scip::types::Document, project_root: Option<&Path>) -> FileLiterals {
+    let defines_one = doc.occurrences.iter().any(|o| {
+        (o.symbol_roles & SymbolRole::Definition as i32) != 0
+            && !o.symbol.starts_with("local ")
+            && is_literal_member_moniker(&o.symbol)
+    });
+    let (true, Some(root), Some(registry)) = (defines_one, project_root, LANGUAGES.get()) else {
+        return FileLiterals {
+            registry_missing: defines_one && LANGUAGES.get().is_none(),
+            ..FileLiterals::none()
+        };
+    };
+    let Ok(source) = std::fs::read(root.join(&doc.relative_path)) else {
+        return FileLiterals::none();
+    };
+    let Some(pack) = registry.for_file_with_content(&doc.relative_path, &source) else {
+        return FileLiterals::none();
+    };
+    let members = crate::extract::literal_members(&source, pack);
+    let line_starts = std::iter::once(0)
+        .chain(
+            source
+                .iter()
+                .enumerate()
+                .filter(|(_, b)| **b == b'\n')
+                .map(|(i, _)| i + 1),
+        )
+        .collect();
+    FileLiterals {
+        members,
+        source,
+        line_starts,
+        registry_missing: false,
+    }
+}
+
+/// One descriptor of a SCIP symbol: a name and what the suffix after it said.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Descriptor {
+    name: String,
+    kind: DescriptorKind,
+}
+
+/// SCIP's descriptor suffixes: `/` namespace, `#` type, `.` term,
+/// `name(disambiguator).` method, `:` meta, `!` macro, `[name]` type
+/// parameter, `(name)` parameter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DescriptorKind {
+    Namespace,
+    Type,
+    Term,
+    Method,
+    Meta,
+    Macro,
+    TypeParam,
+    Param,
+}
+
+/// The descriptors of `scip_sym`, in order, or `None` when it does not parse
+/// (a symbol from an indexer that bends the grammar keeps its old id).
+///
+/// A symbol is `<scheme> <manager> <package> <version> <descriptors>`; a
+/// field holding a space doubles it.
+fn scip_descriptors(scip_sym: &str) -> Option<Vec<Descriptor>> {
+    let mut rest = scip_sym;
+    for _ in 0..4 {
+        let mut chars = rest.char_indices().peekable();
+        let cut = loop {
+            let (i, c) = chars.next()?;
+            if c != ' ' {
+                continue;
+            }
+            if chars.peek().is_some_and(|&(_, n)| n == ' ') {
+                chars.next();
+                continue;
+            }
+            break i + 1;
+        };
+        rest = &rest[cut..];
+    }
+    let chars: Vec<char> = rest.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    // `` `quoted name` `` (a backtick doubles) or a bare run up to a suffix.
+    let name_at = |i: &mut usize, stop: &[char]| -> Option<String> {
+        let mut name = String::new();
+        if chars.get(*i) == Some(&'`') {
+            *i += 1;
+            loop {
+                let c = *chars.get(*i)?;
+                *i += 1;
+                if c == '`' {
+                    if chars.get(*i) == Some(&'`') {
+                        name.push('`');
+                        *i += 1;
+                        continue;
+                    }
+                    break;
+                }
+                name.push(c);
+            }
+        } else {
+            while let Some(&c) = chars.get(*i) {
+                if stop.contains(&c) {
+                    break;
+                }
+                name.push(c);
+                *i += 1;
+            }
+        }
+        Some(name)
+    };
+    while i < chars.len() {
+        match chars[i] {
+            '(' => {
+                i += 1;
+                let name = name_at(&mut i, &[')'])?;
+                i += 1;
+                if chars.get(i) == Some(&'.') {
+                    i += 1;
+                }
+                out.push(Descriptor {
+                    name,
+                    kind: DescriptorKind::Param,
+                });
+            }
+            '[' => {
+                i += 1;
+                let name = name_at(&mut i, &[']'])?;
+                i += 1;
+                out.push(Descriptor {
+                    name,
+                    kind: DescriptorKind::TypeParam,
+                });
+            }
+            _ => {
+                let name = name_at(&mut i, &['/', '#', '.', ':', '!', '('])?;
+                let kind = match chars.get(i)? {
+                    '/' => DescriptorKind::Namespace,
+                    '#' => DescriptorKind::Type,
+                    '.' => DescriptorKind::Term,
+                    ':' => DescriptorKind::Meta,
+                    '!' => DescriptorKind::Macro,
+                    '(' => {
+                        while *chars.get(i)? != ')' {
+                            i += 1;
+                        }
+                        i += 1;
+                        if chars.get(i) != Some(&'.') {
+                            return None;
+                        }
+                        DescriptorKind::Method
+                    }
+                    _ => return None,
+                };
+                i += 1;
+                out.push(Descriptor { name, kind });
+            }
+        }
+    }
+    Some(out)
+}
+
+/// scip-typescript names an anonymous type literal `typeLiteral<N>:`; the
+/// member path says more than the counter does.
+fn is_type_literal(name: &str) -> bool {
+    name.strip_prefix("typeLiteral")
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// True when `scip_sym` names a type parameter (`Box#[T]`), a parameter
+/// (`f().(x)`), or something inside a parameter's inline type
+/// (`f().(opts)typeLiteral3:key.`): syntax with no stable owner of its own,
+/// which indexers report as definitions. Decided on the descriptors' kinds,
+/// never on a name. rust-analyzer's `impl#[Type]` is no type parameter: the
+/// bracket names the type the block is for.
+fn is_parameter_symbol(scip_sym: &str) -> bool {
+    let Some(descriptors) = scip_descriptors(scip_sym) else {
+        return false;
+    };
+    descriptors.iter().enumerate().any(|(i, d)| match d.kind {
+        DescriptorKind::Param => true,
+        DescriptorKind::TypeParam => {
+            let owner = descriptors[..i]
+                .iter()
+                .rev()
+                .find(|p| p.kind != DescriptorKind::TypeParam);
+            !owner.is_some_and(|o| o.kind == DescriptorKind::Type && o.name == "impl")
+        }
+        _ => false,
+    })
+}
+
+/// The names that own `scip_sym`, outermost first: the types, terms and
+/// methods before its last descriptor. A namespace is the file or module (the
+/// id already has the file), a type parameter or parameter is no owner, and
+/// rust-analyzer's `impl#[Type]` is owned by `Type`.
+fn scip_owner_chain(scip_sym: &str) -> Vec<String> {
+    let Some(descriptors) = scip_descriptors(scip_sym) else {
+        return Vec::new();
+    };
+    let Some((last, before)) = descriptors.split_last() else {
+        return Vec::new();
+    };
+    if matches!(last.kind, DescriptorKind::Param | DescriptorKind::TypeParam) {
+        return Vec::new();
+    }
+    let mut chain = Vec::new();
+    for (i, d) in before.iter().enumerate() {
+        match d.kind {
+            DescriptorKind::Type if d.name == "impl" => {
+                if let Some(ty) = before[i + 1..]
+                    .iter()
+                    .find(|n| n.kind == DescriptorKind::TypeParam)
+                {
+                    chain.push(ty.name.clone());
+                }
+            }
+            DescriptorKind::Type
+            | DescriptorKind::Term
+            | DescriptorKind::Method
+            | DescriptorKind::Macro => chain.push(d.name.clone()),
+            DescriptorKind::Meta if is_type_literal(&d.name) => {}
+            DescriptorKind::Meta
+            | DescriptorKind::Namespace
+            | DescriptorKind::TypeParam
+            | DescriptorKind::Param => {}
+        }
+    }
+    chain
+}
+
+/// The id of a symbol only SCIP knows: `file::Owner::...::name`, the shape
+/// tree-sitter gives a method (`entities.rs`), so one member of a type reads
+/// the same whichever indexer found it. No owner, `file::name`.
+fn scip_symbol_id(file: &str, scip_sym: &str, name: &str) -> String {
+    qualified_id(file, &scip_owner_chain(scip_sym), name)
+}
+
+/// `file::Owner::...::name`.
+fn qualified_id(file: &str, owners: &[String], name: &str) -> String {
+    let mut id = String::from(file);
+    for owner in owners {
+        id.push_str("::");
+        id.push_str(owner);
+    }
+    id.push_str("::");
+    id.push_str(name);
+    id
+}
+
+/// `id` without a trailing `#<digits>` ordinal.
+fn without_ordinal(id: &str) -> &str {
+    match id.rsplit_once('#') {
+        Some((base, n)) if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => base,
+        _ => id,
     }
 }
 
@@ -1389,7 +1937,7 @@ impl std::fmt::Display for ImportStats {
         write!(
             f,
             "enriched {} symbols, {} new symbols, {} references, {} inherits edges, \
-             {} corrections learned ({} files processed, {} skipped: no File node)",
+             {} corrections learned ({} files processed, {} skipped: no File node{})",
             self.symbols_enriched,
             self.symbols_added,
             self.references_added,
@@ -1397,6 +1945,11 @@ impl std::fmt::Display for ImportStats {
             self.corrections_learned,
             self.files_processed,
             self.files_skipped,
+            if self.symbols_skipped > 0 {
+                format!(", {} parameter descriptors left out", self.symbols_skipped)
+            } else {
+                String::new()
+            },
         )
     }
 }
@@ -1694,7 +2247,7 @@ mod scratch_label_tests {
 
 #[cfg(test)]
 mod prefilter_tests {
-    use super::drop_ids_already_in_graph;
+    use super::make_ids_unique;
 
     fn row(id: &str) -> super::NewSymbolRow {
         (
@@ -1721,24 +2274,25 @@ mod prefilter_tests {
     fn a_symbol_batch_is_prefiltered_against_ids_already_in_the_graph() {
         let existing: std::collections::HashSet<String> =
             ["a", "c"].iter().map(|s| s.to_string()).collect();
-        let kept =
-            drop_ids_already_in_graph(vec![row("a"), row("b"), row("c"), row("d")], &existing);
+        let (kept, _, dropped) =
+            make_ids_unique(vec![row("a"), row("b"), row("c"), row("d")], &existing);
 
-        let ids: Vec<&str> = kept.iter().map(|(id, ..)| id.as_str()).collect();
-        assert_eq!(
-            ids,
-            vec!["b", "d"],
-            "every id already in the graph must be gone in ONE pass -- leaving even one \
+        assert!(
+            kept.iter().all(|(id, ..)| !existing.contains(id)),
+            "every id already in the graph must be settled in ONE pass -- leaving even one \
              costs a full re-COPY of the entire batch"
         );
+        let ids: Vec<&str> = kept.iter().map(|(id, ..)| id.as_str()).collect();
+        assert_eq!(ids, vec!["a#2", "b", "c#2", "d"], "renamed, not dropped");
+        assert_eq!(dropped, 0);
     }
 
     /// Nothing to drop must not disturb the batch.
     #[test]
     fn a_batch_with_no_collisions_is_untouched() {
         let existing = std::collections::HashSet::new();
-        let kept = drop_ids_already_in_graph(vec![row("x"), row("y")], &existing);
-        assert_eq!(kept.len(), 2);
+        let (kept, renamed, dropped) = make_ids_unique(vec![row("x"), row("y")], &existing);
+        assert_eq!((kept.len(), renamed.len(), dropped), (2, 0, 0));
     }
 }
 
@@ -3008,15 +3562,15 @@ mod tests {
     /// both extract to the same name via `scip_sym_to_name` (e.g. `A#foo()`
     /// and `B#foo()` -- a realistic same-named-method-on-different-types
     /// collision, no existing graph state at all) must both survive as
-    /// distinct Symbol rows, ordinal-disambiguated like entities.rs's
-    /// tree-sitter path -- not silently collapse into one via the
+    /// distinct Symbol rows, each under its own owner (`A::foo`, `B::foo`)
+    /// -- not silently collapse into one via the
     /// `.first()` enrichment fallback (they used to: confirmed
     /// `symbols_added: 1, symbols_enriched: 1` and only one graph row before
     /// this fix) or via the `seen_ids` bulk-insert dedup (confirmed
     /// `symbols_added: 2` but still only one graph row, before the ordinal
     /// disambiguation half of this fix).
     #[test]
-    fn two_new_same_named_symbols_in_one_file_both_survive_with_distinct_ordinal_ids() {
+    fn two_new_same_named_symbols_in_one_file_both_survive_under_their_own_owner() {
         let env = TestEnv::new();
         env.add_file("test.ts");
         let file = "test.ts";
@@ -3063,10 +3617,10 @@ mod tests {
         assert_eq!(
             ids,
             vec![
-                ("test.ts::foo#1".to_string(), "2".to_string()),
-                ("test.ts::foo#2".to_string(), "11".to_string()),
+                ("test.ts::A::foo".to_string(), "2".to_string()),
+                ("test.ts::B::foo".to_string(), "11".to_string()),
             ],
-            "both symbols must survive as distinct, ordinal-suffixed rows sorted by span position"
+            "both symbols must survive as distinct rows, each under its own type"
         );
     }
 
@@ -3086,14 +3640,14 @@ mod tests {
         env.add_file("test.ts");
         let conn = env.store.connection().unwrap();
         conn.query(
-            "CREATE (:Symbol {id: 'test.ts::foo#1', name: 'foo', kind: 'method', \
+            "CREATE (:Symbol {id: 'test.ts::C::foo#1', name: 'foo', kind: 'method', \
              file: 'test.ts', start_line: 1, end_line: 5, signature_hash: '', \
              language: 'typescript', visibility: 'public', parent: '', \
              docstring: '', complexity: 0, parameters: '', return_type: ''})",
         )
         .unwrap();
         conn.query(
-            "CREATE (:Symbol {id: 'test.ts::foo#2', name: 'foo', kind: 'method', \
+            "CREATE (:Symbol {id: 'test.ts::C::foo#2', name: 'foo', kind: 'method', \
              file: 'test.ts', start_line: 10, end_line: 15, signature_hash: '', \
              language: 'typescript', visibility: 'public', parent: '', \
              docstring: '', complexity: 0, parameters: '', return_type: ''})",
@@ -3138,9 +3692,9 @@ mod tests {
         assert_eq!(
             ids,
             vec![
-                "test.ts::foo#1".to_string(),
-                "test.ts::foo#2".to_string(),
-                "test.ts::foo#3".to_string(),
+                "test.ts::C::foo#1".to_string(),
+                "test.ts::C::foo#2".to_string(),
+                "test.ts::C::foo#3".to_string(),
             ],
             "the new symbol must continue the ordinal sequence, not collide with either \
              pre-existing row"
@@ -3427,6 +3981,379 @@ mod tests {
         assert_eq!(discard_if_rejected(&good), None);
         assert!(good.exists(), "a good output must survive for adoption");
         assert_eq!(discard_if_rejected(&missing), None);
+    }
+
+    // ---- owner-qualified ids for symbols only SCIP knows ----
+
+    const TS: &str = "scip-typescript npm test 1.0.0 ";
+
+    #[test]
+    fn the_owner_chain_is_the_types_and_terms_before_the_last_descriptor() {
+        for (moniker, want) in [
+            ("`test.ts`/View#filter().", vec!["View"]),
+            (
+                "src/`test.ts`/AssembledNodeBase#userFacing.",
+                vec!["AssembledNodeBase"],
+            ),
+            // a type literal's counter is replaced by the member path
+            (
+                "src/`test.ts`/StringIndexRange#start.typeLiteral1:index.",
+                vec!["StringIndexRange", "start"],
+            ),
+            ("src/`test.ts`/helper().", vec![]),
+            ("src/`test.ts`/Thing#", vec![]),
+            // an object-literal member's moniker has no owner at all
+            ("src/`test.ts`/ignorePatterns0:", vec![]),
+            // a parameter or a type parameter is no one's member
+            ("src/`test.ts`/f().(x)", vec![]),
+            ("src/`test.ts`/Box#[T]", vec![]),
+        ] {
+            let sym = format!("{TS}{moniker}");
+            assert_eq!(scip_owner_chain(&sym), want, "{sym}");
+        }
+        // other indexers: a module path is no owner; rust-analyzer's impl
+        // block is owned by its type
+        assert_eq!(
+            scip_owner_chain("rust-analyzer cargo sittir-scm 0.0.0 render/node/AnyNode#Program#"),
+            vec!["AnyNode"]
+        );
+        assert_eq!(
+            scip_owner_chain("rust-analyzer cargo krate 0.0.0 impl#[`Foo`]bar()."),
+            vec!["Foo"]
+        );
+        // a package name with a space (doubled) does not shift the fields
+        assert_eq!(
+            scip_owner_chain("scip-x npm my  pkg 1.0.0 `a.ts`/A#m()."),
+            vec!["A"]
+        );
+        // not a SCIP symbol: no owner, the old id
+        assert!(scip_owner_chain("garbage").is_empty());
+    }
+
+    #[test]
+    fn type_parameters_and_the_types_inside_parameters_are_not_symbols() {
+        let env = TestEnv::new();
+        env.add_file("t.ts");
+        let boxed = format!("{TS}`t.ts`/Box#");
+        let box_t = format!("{TS}`t.ts`/Box#[T]");
+        let fn_f = format!("{TS}`t.ts`/f().");
+        let fn_type_param = format!("{TS}`t.ts`/f().[F]");
+        let param = format!("{TS}`t.ts`/f().(opts)");
+        let in_param_type = format!("{TS}`t.ts`/f().(opts)typeLiteral3:key.");
+        let method = format!("{TS}`t.ts`/Box#get().");
+        let impl_method = "rust-analyzer cargo krate 0.0.0 impl#[`Box`]get().".to_string();
+        let stats = import_defs(
+            &env,
+            "t.ts",
+            &[
+                (&boxed, 1),
+                (&box_t, 2),
+                (&fn_f, 3),
+                (&fn_type_param, 4),
+                (&param, 5),
+                (&in_param_type, 6),
+                (&method, 7),
+                (&impl_method, 8),
+            ],
+        );
+        assert_eq!(
+            ids_in_line_order(&env),
+            vec![
+                "t.ts::Box",
+                "t.ts::f",
+                "t.ts::Box::get#1",
+                "t.ts::Box::get#2"
+            ],
+            "a generic type, a function with parameters and a method stay; the impl block's \
+             type is its owner, not a type parameter"
+        );
+        assert_eq!(
+            stats.symbols_skipped, 3,
+            "the parameter itself was already suppressed"
+        );
+        assert!(stats
+            .to_string()
+            .contains("3 parameter descriptors left out"));
+    }
+
+    #[test]
+    fn a_descriptor_is_a_parameter_by_its_kind_not_by_its_name() {
+        // `T`, `x` and `opts` are ordinary names for a real type and a real term
+        for sym in [
+            "scip-x npm p 1.0.0 `a.ts`/T#",
+            "scip-x npm p 1.0.0 `a.ts`/x.",
+            "scip-x npm p 1.0.0 `a.ts`/opts().",
+        ] {
+            assert!(!is_parameter_symbol(sym), "{sym}");
+        }
+        for sym in [
+            "scip-x npm p 1.0.0 `a.ts`/T#[T]",
+            "scip-x npm p 1.0.0 `a.ts`/f().(x)",
+            "scip-x npm p 1.0.0 `a.ts`/f().(x)typeLiteral1:k.",
+        ] {
+            assert!(is_parameter_symbol(sym), "{sym}");
+        }
+        assert!(!is_parameter_symbol(
+            "rust-analyzer cargo k 0.0.0 impl#[`Foo`][`Tr`]bar()."
+        ));
+    }
+
+    #[test]
+    fn an_accessor_or_constructor_is_named_as_tree_sitter_names_it() {
+        for (descriptor, want) in [
+            ("A#`<get>slots`.", "slots"),
+            ("A#`<set>slots`.", "slots"),
+            ("A#`<constructor>`().", "constructor"),
+            // a private member is written `#x` in source: kept as written
+            ("A#`#computing`.", "#computing"),
+            ("A#plain().", "plain"),
+        ] {
+            assert_eq!(
+                scip_sym_to_name(&format!("{TS}`t.ts`/{descriptor}")),
+                want,
+                "{descriptor}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_getter_and_a_setter_enrich_the_two_rows_tree_sitter_made_for_them() {
+        let env = TestEnv::new();
+        env.add_file("t.ts");
+        let conn = env.store.connection().unwrap();
+        for (id, line) in [("t.ts::A::slots#1", 3), ("t.ts::A::slots#2", 4)] {
+            conn.query(&format!(
+                "CREATE (:Symbol {{id: '{id}', name: 'slots', kind: 'method', file: 't.ts', \
+                 start_line: {line}, end_line: {line}, signature_hash: '', language: 'typescript', \
+                 visibility: 'public', parent: '', docstring: '', complexity: 0, parameters: '', \
+                 return_type: ''}})"
+            ))
+            .unwrap();
+        }
+        let get = format!("{TS}`t.ts`/A#`<get>slots`.");
+        let set = format!("{TS}`t.ts`/A#`<set>slots`.");
+        let stats = import_defs(&env, "t.ts", &[(&get, 2), (&set, 3)]);
+        assert_eq!(
+            stats.symbols_added, 0,
+            "no second row beside the tree-sitter one"
+        );
+        assert_eq!(stats.symbols_enriched, 2);
+        let carried: Vec<String> = conn
+            .query("MATCH (s:Symbol) RETURN s.id, s.scip_id ORDER BY s.start_line")
+            .unwrap()
+            .map(|r| {
+                format!(
+                    "{} {}",
+                    r[0].to_string().trim_matches('"'),
+                    r[1].to_string()
+                        .trim_matches('"')
+                        .rsplit('/')
+                        .next()
+                        .unwrap()
+                )
+            })
+            .collect();
+        assert_eq!(
+            carried,
+            vec![
+                "t.ts::A::slots#1 A#`<get>slots`.",
+                "t.ts::A::slots#2 A#`<set>slots`."
+            ],
+            "the moniker lands on the tree-sitter row"
+        );
+    }
+
+    fn row(id: &str, scip: &str, line: u32) -> super::NewSymbolRow {
+        (
+            id.to_string(),
+            "x".to_string(),
+            "function".to_string(),
+            "a.ts".to_string(),
+            line,
+            line,
+            String::new(),
+            scip.to_string(),
+        )
+    }
+
+    #[test]
+    fn a_row_whose_id_is_taken_gets_the_next_free_ordinal_not_a_silent_drop() {
+        let existing: std::collections::HashSet<String> =
+            ["a.ts::x".to_string(), "a.ts::x#2".to_string()].into();
+        let rows = vec![
+            row("a.ts::x", "m1", 3), // taken by the graph
+            row("a.ts::y", "m2", 4),
+            row("a.ts::y", "m3", 5), // taken by the row before it
+        ];
+        let (kept, renamed, dropped) = super::make_ids_unique(rows, &existing);
+        let ids: Vec<&str> = kept.iter().map(|r| r.0.as_str()).collect();
+        assert_eq!(ids, vec!["a.ts::x#3", "a.ts::y", "a.ts::y#2"]);
+        assert_eq!(dropped, 0);
+        assert_eq!(
+            renamed,
+            vec![
+                ("m1".to_string(), "a.ts::x#3".to_string()),
+                ("m3".to_string(), "a.ts::y#2".to_string())
+            ],
+            "references to a renamed row follow it"
+        );
+    }
+
+    #[test]
+    fn only_the_same_definition_seen_twice_is_dropped_and_counted() {
+        let rows = vec![row("a.ts::z", "m", 3), row("a.ts::z", "m", 3)];
+        let (kept, renamed, dropped) = super::make_ids_unique(rows, &Default::default());
+        assert_eq!((kept.len(), renamed.len(), dropped), (1, 0, 1));
+    }
+
+    #[test]
+    fn two_members_on_one_line_with_the_same_name_both_survive() {
+        // GrammarTypeMap#empty. and the `empty` inside its inline type, one line
+        let env = TestEnv::new();
+        env.add_file("t.ts");
+        let outer = format!("{TS}`t.ts`/GrammarTypeMap#empty.");
+        let inner = format!("{TS}`t.ts`/GrammarTypeMap#empty.typeLiteral12:empty.");
+        let stats = import_defs(&env, "t.ts", &[(&outer, 0), (&inner, 0)]);
+        assert_eq!(stats.symbols_added, 2);
+        assert_eq!(
+            ids_in_line_order(&env)
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec![
+                "t.ts::GrammarTypeMap::empty",
+                "t.ts::GrammarTypeMap::empty::empty"
+            ],
+            "the second definition must not merge into the one this import just made"
+        );
+    }
+
+    fn import_defs(env: &TestEnv, file: &str, defs: &[(&str, i32)]) -> ImportStats {
+        let doc = Document {
+            relative_path: file.to_string(),
+            occurrences: defs
+                .iter()
+                .map(|(sym, line)| Occurrence {
+                    range: vec![*line, 0, *line, 3],
+                    symbol: sym.to_string(),
+                    symbol_roles: SymbolRole::Definition as i32,
+                    ..Default::default()
+                })
+                .collect(),
+            symbols: defs
+                .iter()
+                .map(|(sym, _)| SymbolInformation {
+                    symbol: sym.to_string(),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let index = Index {
+            documents: vec![doc],
+            ..Default::default()
+        };
+        let index_path = env._dir.path().join("index.scip");
+        std::fs::write(&index_path, index.write_to_bytes().unwrap()).unwrap();
+        import_scip_index(&index_path, &env.store, None).unwrap()
+    }
+
+    fn ids_in_line_order(env: &TestEnv) -> Vec<String> {
+        env.store
+            .connection()
+            .unwrap()
+            .query("MATCH (s:Symbol) RETURN s.id ORDER BY s.start_line")
+            .unwrap()
+            .map(|row| row[0].to_string().trim_matches('"').to_string())
+            .collect()
+    }
+
+    #[test]
+    fn a_new_member_of_a_type_is_named_under_its_type() {
+        let env = TestEnv::new();
+        env.add_file("src/t.ts");
+        let user_facing = format!("{TS}src/`t.ts`/AssembledNodeBase#userFacing.");
+        let nested = format!("{TS}src/`t.ts`/Range#start.typeLiteral1:index.");
+        let top = format!("{TS}src/`t.ts`/helper().");
+        import_defs(
+            &env,
+            "src/t.ts",
+            &[(&user_facing, 1), (&nested, 5), (&top, 9)],
+        );
+        assert_eq!(
+            ids_in_line_order(&env),
+            vec![
+                "src/t.ts::AssembledNodeBase::userFacing",
+                "src/t.ts::Range::start::index",
+                "src/t.ts::helper",
+            ]
+        );
+    }
+
+    #[test]
+    fn overloads_of_one_member_keep_an_ordinal_and_other_owners_do_not_need_one() {
+        let env = TestEnv::new();
+        env.add_file("t.ts");
+        let filter = format!("{TS}`t.ts`/View#filter().");
+        let other = format!("{TS}`t.ts`/Other#filter().");
+        // one moniker defined at two spans: the real overload case
+        import_defs(&env, "t.ts", &[(&filter, 1), (&filter, 4), (&other, 8)]);
+        assert_eq!(
+            ids_in_line_order(&env),
+            vec![
+                "t.ts::View::filter#1",
+                "t.ts::View::filter#2",
+                "t.ts::Other::filter"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_new_member_never_takes_the_id_of_a_row_already_in_the_graph() {
+        let env = TestEnv::new();
+        env.add_file("t.ts");
+        let conn = env.store.connection().unwrap();
+        // tree-sitter's own row for A.foo, and an owner-less foo, both far from line 20
+        for (id, line) in [("t.ts::A::foo", 1), ("t.ts::foo", 5)] {
+            conn.query(&format!(
+                "CREATE (:Symbol {{id: '{id}', name: 'foo', kind: 'method', file: 't.ts', \
+                 start_line: {line}, end_line: {line}, signature_hash: '', language: 'typescript', \
+                 visibility: 'public', parent: '', docstring: '', complexity: 0, parameters: '', \
+                 return_type: ''}})"
+            ))
+            .unwrap();
+        }
+        let second_a = format!("{TS}`t.ts`/A#foo().");
+        let b = format!("{TS}`t.ts`/B#foo().");
+        // two candidates for (t.ts, foo): the import cannot guess, so both
+        // definitions are new, and neither may collide
+        import_defs(&env, "t.ts", &[(&second_a, 20), (&b, 30)]);
+        let ids = ids_in_line_order(&env);
+        let unique: std::collections::HashSet<_> = ids.iter().collect();
+        assert_eq!(unique.len(), ids.len(), "{ids:?}");
+        assert!(ids.contains(&"t.ts::A::foo".to_string()), "kept: {ids:?}");
+        assert!(
+            ids.contains(&"t.ts::A::foo#2".to_string()),
+            "continued: {ids:?}"
+        );
+        assert!(
+            ids.contains(&"t.ts::B::foo".to_string()),
+            "no ordinal needed: {ids:?}"
+        );
+    }
+
+    #[test]
+    fn importing_again_adds_nothing_and_matches_every_row_it_made() {
+        let env = TestEnv::new();
+        env.add_file("t.ts");
+        let a = format!("{TS}`t.ts`/A#m.");
+        let b = format!("{TS}`t.ts`/B#m.");
+        let first = import_defs(&env, "t.ts", &[(&a, 1), (&b, 5)]);
+        assert_eq!(first.symbols_added, 2);
+        let again = import_defs(&env, "t.ts", &[(&a, 1), (&b, 5)]);
+        assert_eq!(again.symbols_added, 0, "matched rows stay matched");
+        assert_eq!(ids_in_line_order(&env), vec!["t.ts::A::m", "t.ts::B::m"]);
     }
 }
 

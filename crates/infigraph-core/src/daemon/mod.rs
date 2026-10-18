@@ -1014,6 +1014,12 @@ where
     // until the first sample, so the first idle tick measures immediately
     // rather than waiting out a full interval.
     let mut last_compaction_sample: Option<std::time::Instant> = None;
+    // Symbol ids written under an older scheme (`graph::id_scheme`): when the
+    // held graph was last checked, and whether a rebuild was asked for. Asked
+    // once per daemon lifetime, so a rebuild that somehow leaves the graph
+    // outdated cannot loop; the degraded mode stays visible if it does.
+    let mut last_ids_check: Option<std::time::Instant> = None;
+    let mut ids_rebuild_requested = false;
     // Resolved once, like `scip_settings` below: enabling compaction takes a
     // daemon restart, which is how every other daemon-lifetime setting
     // behaves. The thresholds it consults are re-read per call, because those
@@ -1738,6 +1744,42 @@ where
                         }
                         Err(e) => eprintln!("[daemon] compaction: skipped, {e}"),
                     }
+                }
+            }
+
+            // Ids written by an older infigraph cannot be adopted file by file
+            // (`graph::id_scheme`): rebuild the graph whole, through the same
+            // queue and slot gate as compaction. Only a graph the daemon
+            // already holds open is looked at, and only while nothing else
+            // is writing.
+            if last_ids_check.is_none_or(|t| t.elapsed() >= IDS_SCHEME_CHECK_INTERVAL)
+                && drain_in_flight.is_none()
+                && full_reindex_in_flight.is_none()
+            {
+                last_ids_check = Some(std::time::Instant::now());
+                match held_prism
+                    .as_ref()
+                    .and_then(|p| p.graph_store())
+                    .and_then(|store| crate::graph::id_scheme::outdated_in(&store))
+                {
+                    Some(true) => {
+                        crate::degraded::live::set(
+                            root,
+                            crate::degraded::DegradedMode::IdsOutdated,
+                        );
+                        if !ids_rebuild_requested {
+                            ids_rebuild_requested = true;
+                            eprintln!(
+                                "[daemon] ids: the graph's symbol ids predate this infigraph; \
+                                 requesting a rebuild"
+                            );
+                            request_internal_rebuild(&mut deferred, false);
+                        }
+                    }
+                    Some(false) => {
+                        crate::degraded::live::clear(root, crate::degraded::IDS_OUTDATED)
+                    }
+                    None => {}
                 }
             }
 
@@ -2737,6 +2779,9 @@ where
 /// escalation point inside one interval -- the fastest movement observed is
 /// tens of megabytes per import against hundreds of megabytes of headroom.
 const COMPACTION_SAMPLE_INTERVAL: Duration = Duration::from_secs(600);
+
+/// How often the daemon looks at the held graph's id scheme while it is idle.
+const IDS_SCHEME_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Whether the graph is close enough to refusal that a rebuild should happen
 /// regardless of idleness (#183).
