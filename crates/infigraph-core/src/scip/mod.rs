@@ -656,16 +656,17 @@ fn import_scip_index_unrecorded(
             }
 
             let span = occurrence_span(occ, file);
-            // A member of a named object literal: the key and the owners come
-            // from the source (the moniker has neither), and are what the
-            // name, the match below and the id are all made from.
+            // A member of an object literal: the key and the owners come from
+            // the source (the moniker has the key only with a counter glued
+            // on, and no owner), and are what the name, the match below and
+            // the id are all made from. A literal no name binds has no
+            // owners: `file::key`, numbered below like any repeated id.
             let literal = is_literal_member_moniker(scip_sym)
                 .then(|| {
                     let (line, col, ..) = occurrence_range(occ);
                     literal_members.get(&(line.max(0) as u32, col.max(0) as u32))
                 })
-                .flatten()
-                .filter(|m| !m.owners.is_empty());
+                .flatten();
             let name = match literal {
                 Some(member) => member.name.clone(),
                 None => scip_sym_to_name(scip_sym),
@@ -688,15 +689,30 @@ fn import_scip_index_unrecorded(
             // this same loop (that candidate is some other occurrence processed
             // moments ago, not this one), and only when pre-existing ambiguity is
             // low enough (a single candidate) to safely guess.
+            //
+            // A literal member is the exception on both counts: a symbol that
+            // merely ENCLOSES its key (`function value() { return { value: 1 } }`)
+            // is not it, so it matches only a candidate that starts on the
+            // key's line (an object-literal method tree-sitter already
+            // extracted), and it never takes the lone-candidate fallback.
             let matched = file_name_to_ids
                 .get(&key)
                 .and_then(|candidates| {
                     candidates
                         .iter()
-                        .find(|(s, e, _)| span.start_line >= *s && span.start_line <= *e)
+                        .find(|(s, e, _)| {
+                            if literal.is_some() {
+                                span.start_line == *s
+                            } else {
+                                span.start_line >= *s && span.start_line <= *e
+                            }
+                        })
                         .map(|(_, _, id)| id.clone())
                 })
                 .or_else(|| {
+                    if literal.is_some() {
+                        return None;
+                    }
                     preexisting_file_name_to_ids.get(&key).and_then(|c| {
                         if c.len() == 1 {
                             c.first().map(|(_, _, id)| id.clone())

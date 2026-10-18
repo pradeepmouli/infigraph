@@ -16,6 +16,8 @@ export const CONFIG = {
   nested: { inner: 1 },
 };
 call({ semi: false });
+call({ cwd: 1 });
+call({ cwd: 2 });
 ";
 
 fn moniker(descriptor: &str) -> String {
@@ -25,10 +27,21 @@ fn moniker(descriptor: &str) -> String {
 /// Import definitions `(moniker, 0-based line, 0-based column)` into a fresh
 /// graph over a project whose `src/config.ts` is `SOURCE`; ids by line.
 fn import(defs: &[(String, i32, i32)]) -> Vec<String> {
+    import_in(SOURCE, &[], defs)
+}
+
+/// `import` over another `source`, with `existing` symbol rows
+/// `(id, name, start_line, end_line)` already in the graph, as tree-sitter
+/// leaves them.
+fn import_in(
+    source: &str,
+    existing: &[(&str, &str, u32, u32)],
+    defs: &[(String, i32, i32)],
+) -> Vec<String> {
     use_language_registry(Arc::new(infigraph_languages::bundled_registry().unwrap()));
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join("src")).unwrap();
-    std::fs::write(dir.path().join(FILE), SOURCE).unwrap();
+    std::fs::write(dir.path().join(FILE), source).unwrap();
     let store = GraphStore::open(&dir.path().join("graph")).unwrap();
     let conn = store.connection().unwrap();
     conn.query(&format!(
@@ -36,6 +49,16 @@ fn import(defs: &[(String, i32, i32)]) -> Vec<String> {
          language: 'typescript', symbol_count: 0}})"
     ))
     .unwrap();
+
+    for (id, name, start, end) in existing {
+        conn.query(&format!(
+            "CREATE (:Symbol {{id: '{id}', name: '{name}', kind: 'function', file: '{FILE}', \
+             start_line: {start}, end_line: {end}, signature_hash: '', language: 'typescript', \
+             visibility: 'public', parent: '', docstring: '', complexity: 0, parameters: '', \
+             return_type: ''}})"
+        ))
+        .unwrap();
+    }
 
     let doc = Document {
         relative_path: FILE.to_string(),
@@ -101,10 +124,26 @@ fn a_member_of_a_named_literal_is_named_under_it_without_the_counter() {
 }
 
 #[test]
-fn a_member_of_a_literal_nobody_names_is_left_as_its_moniker_gives_it() {
-    // `call({ semi: false })`: this commit only qualifies named literals
-    let ids = import(&[(moniker("semi1:"), 4, 8)]);
-    assert_eq!(ids, vec!["src/config.ts::semi1 | semi1"]);
+fn a_member_of_a_literal_nobody_names_loses_the_counter_and_keeps_its_key() {
+    // `call({ semi: false })` has no owner, and `CONFIG.semi` is another id
+    let ids = import(&[(moniker("semi0:"), 1, 2), (moniker("semi1:"), 4, 7)]);
+    assert_eq!(
+        ids,
+        vec![
+            "src/config.ts::CONFIG::semi | semi",
+            "src/config.ts::semi | semi",
+        ]
+    );
+}
+
+#[test]
+fn unowned_members_with_one_key_are_numbered_in_source_order_not_by_the_indexers_counter() {
+    // the indexer's counters (here reversed) say nothing about order in the file
+    let ids = import(&[(moniker("cwd5:"), 5, 7), (moniker("cwd2:"), 6, 7)]);
+    assert_eq!(
+        ids,
+        vec!["src/config.ts::cwd#1 | cwd", "src/config.ts::cwd#2 | cwd"]
+    );
 }
 
 #[test]
@@ -112,4 +151,23 @@ fn a_key_the_source_does_not_have_at_that_position_is_left_alone() {
     // the file changed since the indexer ran: no member starts at (0, 0)
     let ids = import(&[(moniker("semi0:"), 0, 0)]);
     assert_eq!(ids, vec!["src/config.ts::semi0 | semi0"]);
+}
+
+#[test]
+fn a_symbol_that_only_encloses_a_key_is_not_that_member() {
+    let source = "function value() {\n  return { value: 1 };\n}\n";
+    // tree-sitter's `value` function spans lines 1-3; the key is on line 2
+    let ids = import_in(
+        source,
+        &[("src/config.ts::value", "value", 1, 3)],
+        &[(moniker("value0:"), 1, 11)],
+    );
+    assert_eq!(
+        ids,
+        vec![
+            "src/config.ts::value | value",
+            "src/config.ts::value#2 | value"
+        ],
+        "the function keeps its row and the member is its own symbol, numbered past it: {ids:?}"
+    );
 }
