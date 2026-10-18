@@ -654,6 +654,12 @@ fn import_scip_index_unrecorded(
             if is_member_of_known_symbol(scip_sym, &scip_sym_to_file_name) {
                 continue;
             }
+            // A type parameter or a parameter's own type is not a symbol:
+            // no row, so no id for a reference to it to become an edge to.
+            if is_parameter_symbol(scip_sym) {
+                stats.symbols_skipped += 1;
+                continue;
+            }
 
             let span = occurrence_span(occ, file);
             // A member of an object literal: the key and the owners come from
@@ -1525,6 +1531,29 @@ fn is_type_literal(name: &str) -> bool {
         .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
 }
 
+/// True when `scip_sym` names a type parameter (`Box#[T]`), a parameter
+/// (`f().(x)`), or something inside a parameter's inline type
+/// (`f().(opts)typeLiteral3:key.`): syntax with no stable owner of its own,
+/// which indexers report as definitions. Decided on the descriptors' kinds,
+/// never on a name. rust-analyzer's `impl#[Type]` is no type parameter: the
+/// bracket names the type the block is for.
+fn is_parameter_symbol(scip_sym: &str) -> bool {
+    let Some(descriptors) = scip_descriptors(scip_sym) else {
+        return false;
+    };
+    descriptors.iter().enumerate().any(|(i, d)| match d.kind {
+        DescriptorKind::Param => true,
+        DescriptorKind::TypeParam => {
+            let owner = descriptors[..i]
+                .iter()
+                .rev()
+                .find(|p| p.kind != DescriptorKind::TypeParam);
+            !owner.is_some_and(|o| o.kind == DescriptorKind::Type && o.name == "impl")
+        }
+        _ => false,
+    })
+}
+
 /// The names that own `scip_sym`, outermost first: the types, terms and
 /// methods before its last descriptor. A namespace is the file or module (the
 /// id already has the file), a type parameter or parameter is no owner, and
@@ -1673,7 +1702,7 @@ impl std::fmt::Display for ImportStats {
         write!(
             f,
             "enriched {} symbols, {} new symbols, {} references, {} inherits edges, \
-             {} corrections learned ({} files processed, {} skipped: no File node)",
+             {} corrections learned ({} files processed, {} skipped: no File node{})",
             self.symbols_enriched,
             self.symbols_added,
             self.references_added,
@@ -1681,6 +1710,11 @@ impl std::fmt::Display for ImportStats {
             self.corrections_learned,
             self.files_processed,
             self.files_skipped,
+            if self.symbols_skipped > 0 {
+                format!(", {} parameter descriptors left out", self.symbols_skipped)
+            } else {
+                String::new()
+            },
         )
     }
 }
@@ -3758,6 +3792,74 @@ mod tests {
         );
         // not a SCIP symbol: no owner, the old id
         assert!(scip_owner_chain("garbage").is_empty());
+    }
+
+    #[test]
+    fn type_parameters_and_the_types_inside_parameters_are_not_symbols() {
+        let env = TestEnv::new();
+        env.add_file("t.ts");
+        let boxed = format!("{TS}`t.ts`/Box#");
+        let box_t = format!("{TS}`t.ts`/Box#[T]");
+        let fn_f = format!("{TS}`t.ts`/f().");
+        let fn_type_param = format!("{TS}`t.ts`/f().[F]");
+        let param = format!("{TS}`t.ts`/f().(opts)");
+        let in_param_type = format!("{TS}`t.ts`/f().(opts)typeLiteral3:key.");
+        let method = format!("{TS}`t.ts`/Box#get().");
+        let impl_method = "rust-analyzer cargo krate 0.0.0 impl#[`Box`]get().".to_string();
+        let stats = import_defs(
+            &env,
+            "t.ts",
+            &[
+                (&boxed, 1),
+                (&box_t, 2),
+                (&fn_f, 3),
+                (&fn_type_param, 4),
+                (&param, 5),
+                (&in_param_type, 6),
+                (&method, 7),
+                (&impl_method, 8),
+            ],
+        );
+        assert_eq!(
+            ids_in_line_order(&env),
+            vec![
+                "t.ts::Box",
+                "t.ts::f",
+                "t.ts::Box::get#1",
+                "t.ts::Box::get#2"
+            ],
+            "a generic type, a function with parameters and a method stay; the impl block's \
+             type is its owner, not a type parameter"
+        );
+        assert_eq!(
+            stats.symbols_skipped, 3,
+            "the parameter itself was already suppressed"
+        );
+        assert!(stats
+            .to_string()
+            .contains("3 parameter descriptors left out"));
+    }
+
+    #[test]
+    fn a_descriptor_is_a_parameter_by_its_kind_not_by_its_name() {
+        // `T`, `x` and `opts` are ordinary names for a real type and a real term
+        for sym in [
+            "scip-x npm p 1.0.0 `a.ts`/T#",
+            "scip-x npm p 1.0.0 `a.ts`/x.",
+            "scip-x npm p 1.0.0 `a.ts`/opts().",
+        ] {
+            assert!(!is_parameter_symbol(sym), "{sym}");
+        }
+        for sym in [
+            "scip-x npm p 1.0.0 `a.ts`/T#[T]",
+            "scip-x npm p 1.0.0 `a.ts`/f().(x)",
+            "scip-x npm p 1.0.0 `a.ts`/f().(x)typeLiteral1:k.",
+        ] {
+            assert!(is_parameter_symbol(sym), "{sym}");
+        }
+        assert!(!is_parameter_symbol(
+            "rust-analyzer cargo k 0.0.0 impl#[`Foo`][`Tr`]bar()."
+        ));
     }
 
     fn import_defs(env: &TestEnv, file: &str, defs: &[(&str, i32)]) -> ImportStats {
