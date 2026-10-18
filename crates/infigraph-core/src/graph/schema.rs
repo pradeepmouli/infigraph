@@ -37,6 +37,10 @@ pub const MIGRATIONS: &[&str] = &[
     // binary's is refused at open ("built by newer infigraph") before any
     // DDL runs.
     "ALTER TABLE GraphMeta ADD schema_version INT64 DEFAULT 0",
+    // Which scheme the symbol ids were written under (graph::id_scheme). 0 =
+    // predates it. Not a SCHEMA_VERSION bump: the tables are the same and an
+    // older binary opens the graph as before.
+    "ALTER TABLE GraphMeta ADD id_scheme INT64 DEFAULT 0",
     // A call whose receiver resolves to a real class/type name but that type
     // has no local Symbol (its source isn't indexed — a statically-linked
     // lib, a vendored dependency, an un-group-linked sibling repo) previously

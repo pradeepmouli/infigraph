@@ -239,6 +239,28 @@ pub(crate) fn cmd_index(root: &Path, full: bool, no_embed: bool) -> Result<()> {
     let mut prism = Infigraph::open(root, registry)?;
     prism.init()?;
 
+    // Symbol ids an older infigraph wrote cannot be adopted a file at a time
+    // (`graph::id_scheme`): an incremental run would leave the rest under the
+    // old names and every edge between the two kinds dangling. Looked at on
+    // the graph this run has open anyway; under the daemon backend there is
+    // none here, and the daemon rebuilds such a graph itself.
+    let ids_outdated = !full
+        && prism.graph_store().is_some_and(|store| {
+            infigraph_core::graph::id_scheme::outdated_in(&store) == Some(true)
+        });
+    let full = full || ids_outdated;
+    if ids_outdated {
+        println!(
+            "The graph's symbol ids were written by an older infigraph; rebuilding it in full."
+        );
+        drop(prism);
+        // `op_guard` above holds .infigraph/index.lock, as the wipe requires.
+        infigraph_core::ops::full_reindex_wipe(&root.join(".infigraph"))?;
+        println!("Cleaned .infigraph/ for full reindex (snapshot saved, sessions preserved)");
+        prism = Infigraph::open(root, crate::full_registry(Some(root))?)?;
+        prism.init()?;
+    }
+
     // In shared Neo4j mode, a repo's identity is defined by the group registry, not by its
     // directory name. Resolve the `org/repo` namespace from the registry so a standalone
     // `infigraph index` writes data consistent with `group build` and the read filters.
