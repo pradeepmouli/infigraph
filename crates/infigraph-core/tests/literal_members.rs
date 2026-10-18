@@ -134,3 +134,38 @@ fn only_a_module_level_binding_names_a_literal() {
         "a literal bound inside a function has no stable owner name"
     );
 }
+
+#[test]
+fn a_method_of_a_named_literal_is_a_symbol_under_its_owner() {
+    let src = "\
+export const api = {
+  helper() {},
+  nested: { deep() {}, value: 1 },
+};
+function f() {
+  const local = { inner() {} };
+}
+const dup = { run() {}, other: { run() {} } };
+";
+    let registry = infigraph_languages::bundled_registry().unwrap();
+    let pack = registry.for_file("a.ts").unwrap();
+    let extraction = infigraph_core::extract::extract_file("a.ts", src.as_bytes(), pack).unwrap();
+    let mut ids: Vec<_> = extraction
+        .symbols
+        .iter()
+        .filter(|s| s.kind == infigraph_core::model::SymbolKind::Method)
+        .map(|s| (s.id.as_str(), s.parent.as_deref()))
+        .collect();
+    ids.sort();
+    assert_eq!(
+        ids,
+        vec![
+            ("a.ts::api::helper", Some("a.ts::api")),
+            ("a.ts::api::nested::deep", Some("a.ts::api::nested")),
+            ("a.ts::dup::other::run", Some("a.ts::dup::other")),
+            ("a.ts::dup::run", Some("a.ts::dup")),
+            // a literal bound inside a function has no owner
+            ("a.ts::inner", None),
+        ]
+    );
+}

@@ -42,6 +42,11 @@ pub fn extract_entities(
     let capture_names = query.capture_names();
 
     let mut symbols = Vec::new();
+    // The `@member.*` captures of this same walk: they emit no symbol, but say
+    // who owns a method written inside an object literal (see `members.rs`).
+    let mut members = super::members::MemberScan::default();
+    // (index in `symbols`, position of the method's name) for each method
+    let mut method_names: Vec<(usize, (u32, u32))> = Vec::new();
 
     while let Some(m) = matches.next() {
         let mut name_text = None;
@@ -56,6 +61,8 @@ pub fn extract_entities(
         let mut route_handler: Option<String> = None;
         let mut route_def_node: Option<Node> = None;
         let mut parent_capture: Option<Node> = None;
+        let mut method_name_at: Option<(u32, u32)> = None;
+        members.add(m.captures, capture_names, source);
 
         for capture in m.captures {
             let idx = capture.index as usize;
@@ -84,6 +91,8 @@ pub fn extract_entities(
                 "method.name" => {
                     name_text = Some(node_text(node, source));
                     kind = Some(SymbolKind::Method);
+                    let p = node.start_position();
+                    method_name_at = Some((p.row as u32, p.column as u32));
                 }
                 "method.def" => {
                     def_node = Some(node);
@@ -251,6 +260,9 @@ pub fn extract_entities(
             let visibility =
                 extract_visibility(node, source).or_else(|| default_visibility(&name, language));
 
+            if let (SymbolKind::Method, Some(at)) = (&sym_kind, method_name_at) {
+                method_names.push((symbols.len(), at));
+            }
             symbols.push(Symbol {
                 id,
                 name,
@@ -306,6 +318,17 @@ pub fn extract_entities(
                 complexity: 1,
                 scip_id: None,
             });
+        }
+    }
+
+    // A method written inside an object literal that a module-level binding
+    // names is that binding's member, as a method of a class is the class's.
+    let literal_members = members.resolve();
+    for (i, at) in method_names {
+        if let Some(member) = literal_members.get(&at).filter(|m| !m.owners.is_empty()) {
+            let owner = member.owners.join("::");
+            symbols[i].id = format!("{file}::{owner}::{}", symbols[i].name);
+            symbols[i].parent = Some(format!("{file}::{owner}"));
         }
     }
 

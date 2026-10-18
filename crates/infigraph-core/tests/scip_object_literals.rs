@@ -196,3 +196,19 @@ fn two_members_with_one_key_on_one_line_are_two_symbols() {
         "a literal member never merges into one this same import made: {ids:?}"
     );
 }
+
+#[test]
+fn a_method_tree_sitter_made_is_enriched_by_its_scip_row_not_duplicated() {
+    // tree-sitter extracted `helper() {}` as CONFIG::helper on line 2
+    let source = "export const CONFIG = {\n  helper() {},\n};\n";
+    let ids = import_in(
+        source,
+        &[("src/config.ts::CONFIG::helper", "helper", 2, 2)],
+        &[(moniker("helper0:"), 1, 2)],
+    );
+    assert_eq!(
+        ids,
+        vec!["src/config.ts::CONFIG::helper | helper"],
+        "the SCIP row finds the tree-sitter row by its line: {ids:?}"
+    );
+}

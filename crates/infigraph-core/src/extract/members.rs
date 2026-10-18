@@ -47,6 +47,88 @@ struct Scope {
     within: Option<ByteRange>,
 }
 
+/// What the `@member.*` captures of a file say, gathered match by match.
+///
+/// One collector serves both users: [`literal_members`] runs the entity query
+/// for nothing else (the SCIP import), and `extract_entities` feeds it the
+/// matches it is walking anyway, to qualify the methods of a named literal.
+#[derive(Default)]
+pub(crate) struct MemberScan {
+    scopes: HashMap<ByteRange, Scope>,
+    /// (key position, key text, the literal it sits in)
+    members: Vec<((u32, u32), String, ByteRange)>,
+}
+
+impl MemberScan {
+    /// Take in one query match; a match with no `@member.*` capture adds nothing.
+    pub(crate) fn add(
+        &mut self,
+        captures: &[tree_sitter::QueryCapture<'_>],
+        names: &[&str],
+        source: &[u8],
+    ) {
+        let (mut name, mut within, mut root, mut owner, mut scope) = (None, None, None, None, None);
+        for c in captures {
+            match names[c.index as usize] {
+                "member.name" => name = Some(c.node),
+                "member.within" => within = Some(c.node),
+                "member.root" => root = Some(c.node),
+                "member.owner" => owner = Some(c.node),
+                "member.scope" => scope = Some(c.node),
+                _ => {}
+            }
+        }
+        let range = |n: tree_sitter::Node| (n.start_byte(), n.end_byte());
+        let text = |n| strip_string_delimiters(&node_text(n, source));
+        if let (Some(name), Some(within)) = (name, within) {
+            let p = name.start_position();
+            self.members
+                .push(((p.row as u32, p.column as u32), text(name), range(within)));
+        } else if let (Some(scope), Some(root)) = (scope, root) {
+            self.scopes.insert(
+                range(scope),
+                Scope {
+                    owner: text(root),
+                    within: None,
+                },
+            );
+        } else if let (Some(scope), Some(owner), Some(within)) = (scope, owner, within) {
+            self.scopes.insert(
+                range(scope),
+                Scope {
+                    owner: text(owner),
+                    within: Some(range(within)),
+                },
+            );
+        }
+    }
+
+    /// Every member, with the names that own it.
+    pub(crate) fn resolve(self) -> HashMap<(u32, u32), LiteralMember> {
+        let Self { scopes, members } = self;
+        members
+            .into_iter()
+            .map(|(at, name, within)| {
+                let mut owners = Vec::new();
+                let mut rooted = false;
+                let mut at_literal = Some(within);
+                while let Some(scope) = at_literal.and_then(|r| scopes.get(&r)) {
+                    owners.push(scope.owner.clone());
+                    at_literal = scope.within;
+                    if at_literal.is_none() {
+                        rooted = true;
+                    }
+                }
+                if !rooted {
+                    owners.clear();
+                }
+                owners.reverse();
+                (at, LiteralMember { name, owners })
+            })
+            .collect()
+    }
+}
+
 /// Every member of every object literal in `source`, keyed by the 0-based
 /// `(line, column)` of its key -- where SCIP puts the definition. Empty for a
 /// pack that gives no `@member.*` captures, or one that is not tree-sitter.
@@ -70,66 +152,11 @@ pub fn literal_members(source: &[u8], pack: &LanguagePack) -> HashMap<(u32, u32)
     let Some(tree) = parser.parse(source, None) else {
         return HashMap::new();
     };
-
-    let mut scopes: HashMap<ByteRange, Scope> = HashMap::new();
-    // (key position, key text, the literal it sits in)
-    let mut members: Vec<((u32, u32), String, ByteRange)> = Vec::new();
+    let mut scan = MemberScan::default();
     let mut cursor = QueryCursor::new();
     let mut matches = cursor.matches(entity_query, tree.root_node(), source);
     while let Some(m) = matches.next() {
-        let (mut name, mut within, mut root, mut owner, mut scope) = (None, None, None, None, None);
-        for c in m.captures {
-            match names[c.index as usize] {
-                "member.name" => name = Some(c.node),
-                "member.within" => within = Some(c.node),
-                "member.root" => root = Some(c.node),
-                "member.owner" => owner = Some(c.node),
-                "member.scope" => scope = Some(c.node),
-                _ => {}
-            }
-        }
-        let range = |n: tree_sitter::Node| (n.start_byte(), n.end_byte());
-        let text = |n| strip_string_delimiters(&node_text(n, source));
-        if let (Some(name), Some(within)) = (name, within) {
-            let p = name.start_position();
-            members.push(((p.row as u32, p.column as u32), text(name), range(within)));
-        } else if let (Some(scope), Some(root)) = (scope, root) {
-            scopes.insert(
-                range(scope),
-                Scope {
-                    owner: text(root),
-                    within: None,
-                },
-            );
-        } else if let (Some(scope), Some(owner), Some(within)) = (scope, owner, within) {
-            scopes.insert(
-                range(scope),
-                Scope {
-                    owner: text(owner),
-                    within: Some(range(within)),
-                },
-            );
-        }
+        scan.add(m.captures, names, source);
     }
-
-    members
-        .into_iter()
-        .map(|(at, name, within)| {
-            let mut owners = Vec::new();
-            let mut rooted = false;
-            let mut at_literal = Some(within);
-            while let Some(scope) = at_literal.and_then(|r| scopes.get(&r)) {
-                owners.push(scope.owner.clone());
-                at_literal = scope.within;
-                if at_literal.is_none() {
-                    rooted = true;
-                }
-            }
-            if !rooted {
-                owners.clear();
-            }
-            owners.reverse();
-            (at, LiteralMember { name, owners })
-        })
-        .collect()
+    scan.resolve()
 }
