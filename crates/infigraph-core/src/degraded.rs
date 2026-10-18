@@ -29,6 +29,7 @@ pub const DOC_LINKS_UNSCANNED: &str = "doc-links-unscanned";
 pub const DOC_SYNC_UNKNOWN: &str = "doc-sync-unknown";
 pub const IDS_OUTDATED: &str = "ids-outdated";
 pub const SCIP_LITERAL_OWNERS_UNAVAILABLE: &str = "scip-literal-owners-unavailable";
+pub const SCIP_UNKNOWN_LANGUAGE: &str = "scip-unknown-language";
 
 /// One way infigraph is running degraded.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,6 +93,9 @@ pub enum DegradedMode {
     /// language registry to ask who owns them, so they got the indexer's
     /// counter-suffixed names (`semi0`) instead of `file::Const::semi`.
     ScipLiteralOwnersUnavailable,
+    /// `[scip] disable` names a language no SCIP indexer serves (a typo): it
+    /// disables nothing, so the indexer the author meant still runs.
+    ScipUnknownLanguage { names: String },
 }
 
 impl DegradedMode {
@@ -119,6 +123,7 @@ impl DegradedMode {
             DegradedMode::DocSyncUnknown { .. } => DOC_SYNC_UNKNOWN,
             DegradedMode::IdsOutdated => IDS_OUTDATED,
             DegradedMode::ScipLiteralOwnersUnavailable => SCIP_LITERAL_OWNERS_UNAVAILABLE,
+            DegradedMode::ScipUnknownLanguage { .. } => SCIP_UNKNOWN_LANGUAGE,
         }
     }
 
@@ -207,6 +212,10 @@ impl DegradedMode {
                  members without knowing their owners (no language registry in this process): \
                  they carry the indexer's counter, e.g. `semi0`, until the next import"
                 .to_string(),
+            DegradedMode::ScipUnknownLanguage { names } => format!(
+                "`[scip] disable` names {names}, which no SCIP indexer serves: it disables \
+                 nothing, so the indexer you meant still runs"
+            ),
         }
     }
 
@@ -254,6 +263,9 @@ impl DegradedMode {
             DegradedMode::ScipLiteralOwnersUnavailable => {
                 "import through `infigraph scip-enrich` or the daemon, which load the language \
                  packs"
+            }
+            DegradedMode::ScipUnknownLanguage { .. } => {
+                "correct the name in `[scip] disable` (`infigraph index` lists the known ones)"
             }
         }
     }
@@ -605,6 +617,17 @@ pub fn embedder_modes(root: &Path, process_embedder: Option<&str>) -> Vec<Degrad
 /// The modes that files on disk alone establish. No process state, no store.
 pub fn derived_from_disk(root: &Path) -> Vec<DegradedMode> {
     let mut modes = Vec::new();
+    // A config file establishes it, whether or not the project is indexed.
+    let unknown = crate::scip_switch::unknown_languages(root);
+    if !unknown.is_empty() {
+        modes.push(DegradedMode::ScipUnknownLanguage {
+            names: unknown
+                .iter()
+                .map(|n| format!("`{n}`"))
+                .collect::<Vec<_>>()
+                .join(", "),
+        });
+    }
     let ig = root.join(".infigraph");
     if crate::daemon::lifecycle::is_remote_backend() || !ig.join("graph").exists() {
         return modes;
@@ -862,6 +885,9 @@ mod tests {
             },
             DegradedMode::IdsOutdated,
             DegradedMode::ScipLiteralOwnersUnavailable,
+            DegradedMode::ScipUnknownLanguage {
+                names: "`pyton`".to_string(),
+            },
         ];
         let keys: std::collections::HashSet<_> = modes.iter().map(|m| m.key()).collect();
         let messages: std::collections::HashSet<_> = modes.iter().map(|m| m.message()).collect();
@@ -1124,5 +1150,26 @@ mod tests {
         let json = r#"{"key":"some-future-mode","message":"m","remedy":"r"}"#;
         let notice: Notice = serde_json::from_str(json).unwrap();
         assert_eq!(notice.key, "some-future-mode");
+    }
+
+    #[test]
+    fn a_misspelled_disabled_language_is_a_mode_a_config_file_establishes() {
+        let p = Project::new();
+        let key = |notices: Vec<Notice>| notices.iter().any(|n| n.key == SCIP_UNKNOWN_LANGUAGE);
+        assert!(!key(gather(p.root())));
+
+        crate::settings_file::set_project_setting(p.root(), "scip", "disable", {
+            let mut names = toml_edit::Array::new();
+            names.push("pyton");
+            toml_edit::value(names)
+        })
+        .unwrap();
+
+        let notices = gather(p.root());
+        let notice = notices
+            .iter()
+            .find(|n| n.key == SCIP_UNKNOWN_LANGUAGE)
+            .unwrap_or_else(|| panic!("no notice: {notices:?}"));
+        assert!(notice.message.contains("`pyton`"), "{notice:?}");
     }
 }

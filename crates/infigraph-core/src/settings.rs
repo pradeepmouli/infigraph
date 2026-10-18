@@ -232,6 +232,64 @@ impl FromTomlItem for PathList {
     }
 }
 
+/// The entries of a list-valued settings field, however it is typed. The
+/// layered reader (`ignore_rules::layered_entries`) is written once against
+/// this, so a new list setting reuses how project, user and environment
+/// layers combine instead of copying it.
+pub trait ListEntries {
+    fn into_entries(self) -> Vec<String>;
+}
+
+impl ListEntries for PathList {
+    fn into_entries(self) -> Vec<String> {
+        self.0
+    }
+}
+
+/// A settings-group list of language names (`[scip] disable = ["python"]`):
+/// zero or more, lowercased, trimmed, empties dropped. TOML states it as an
+/// array of strings; the environment has a flat comma-separated string.
+/// Whether a name is one infigraph knows is the caller's question: this type
+/// only parses.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Deserialize)]
+pub struct LanguageList(pub Vec<String>);
+
+impl ListEntries for LanguageList {
+    fn into_entries(self) -> Vec<String> {
+        self.0
+    }
+}
+
+impl std::str::FromStr for LanguageList {
+    type Err = std::convert::Infallible;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(LanguageList(
+            s.split(',')
+                .map(|name| name.trim().to_lowercase())
+                .filter(|name| !name.is_empty())
+                .collect(),
+        ))
+    }
+}
+
+impl FromTomlItem for LanguageList {
+    /// Anything but an array of strings is an error: a lone string
+    /// (`disable = "python"`) is the likely mistake, and silently reading it
+    /// as no entries would hide it.
+    fn from_toml_item(item: &toml_edit::Item) -> Result<Self, String> {
+        const EXPECTED: &str = "expected an array of strings";
+        let array = item.as_array().ok_or(EXPECTED)?;
+        let mut names = Vec::new();
+        for value in array.iter() {
+            let name = value.as_str().ok_or(EXPECTED)?.trim().to_lowercase();
+            if !name.is_empty() {
+                names.push(name);
+            }
+        }
+        Ok(LanguageList(names))
+    }
+}
+
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __settings_default {

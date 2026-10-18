@@ -264,6 +264,26 @@ fn spawn_scip_enrich(
 ) -> Task<()> {
     let _guard = drain_rt.enter();
     Task::spawn_blocking(daemon_token, "scip-enrich", move |token| {
+        // `[scip] disable`: the languages to enrich are the detected ones
+        // minus the disabled ones, decided here for both triggers.
+        let detected: std::collections::HashSet<String> = job.languages.iter().cloned().collect();
+        let enabled = crate::scip_switch::enabled_languages(&root, &detected);
+        if enabled.is_empty() {
+            eprintln!(
+                "[daemon] SCIP enrichment: every detected language ({}) is disabled by \
+                 [scip] disable; nothing to run",
+                job.languages.join(", ")
+            );
+            return;
+        }
+        let job = ScipEnrichJob {
+            languages: job
+                .languages
+                .into_iter()
+                .filter(|lang| enabled.contains(lang))
+                .collect(),
+            ..job
+        };
         // One enrichment per project at a time, whoever started it: the
         // detached `scip-enrich` child and a foreground `index --no-embed`
         // hold the same lock. The loser has already logged why it skipped.

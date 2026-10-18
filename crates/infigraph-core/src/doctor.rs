@@ -1412,6 +1412,73 @@ pub fn check_scip_staleness(ctx: &DoctorContext) -> Vec<CheckResult> {
         .collect()
 }
 
+const SCIP_LANGUAGES_CATEGORY: &str = "scip-languages";
+
+/// `[scip] disable` for one project: what it switches off, names that
+/// switch nothing off (a typo is a FAIL: the user believes a language is
+/// off and its indexer runs), and indexers that serve several languages
+/// and so still run for the rest. Reads configuration only, so unlike the
+/// staleness check it opens no graph.
+fn check_one_project_scip_languages(project_path: &Path) -> Vec<CheckResult> {
+    let disabled = crate::scip_switch::disabled_languages(project_path);
+    if disabled.is_empty() {
+        return Vec::new();
+    }
+    let label = format!("{}: SCIP languages", project_path.display());
+    let unknown = crate::scip_switch::unknown_languages(project_path);
+    if !unknown.is_empty() {
+        return vec![CheckResult::fail(
+            SCIP_LANGUAGES_CATEGORY,
+            label,
+            format!(
+                "[scip] disable names no SCIP indexer serves: {}; it disables nothing",
+                unknown.join(", ")
+            ),
+            format!(
+                "use one of: {}",
+                crate::scip_switch::known_languages().join(", ")
+            ),
+        )];
+    }
+    let names: Vec<String> = disabled
+        .iter()
+        .map(|d| match d.layer {
+            crate::scip_switch::Layer::Project => format!("{} (project)", d.name),
+            crate::scip_switch::Layer::UserOrEnvironment => format!("{} (user/env)", d.name),
+        })
+        .collect();
+    let mut detail = format!("implicit enrichment skips: {}", names.join(", "));
+    for (indexer, tags) in crate::scip::INDEXER_LANGUAGES {
+        let off: Vec<&str> = tags
+            .iter()
+            .copied()
+            .filter(|t| disabled.iter().any(|d| d.name == *t))
+            .collect();
+        if !off.is_empty() && off.len() < tags.len() {
+            detail.push_str(&format!(
+                "; {indexer} also serves {} and still runs when one of those is present",
+                tags.iter()
+                    .filter(|t| !off.contains(t))
+                    .copied()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+    }
+    detail.push_str(
+        "; to keep a language out of the index itself, use `[ignore] code` in \
+         .infigraph/config.toml",
+    );
+    vec![CheckResult::pass(SCIP_LANGUAGES_CATEGORY, label, detail)]
+}
+
+pub fn check_scip_languages(ctx: &DoctorContext) -> Vec<CheckResult> {
+    projects_in_scope(ctx)
+        .iter()
+        .flat_map(|p| check_one_project_scip_languages(p))
+        .collect()
+}
+
 const WORKTREE_CATEGORY: &str = "worktrees";
 
 /// Diffs the registry against live git worktrees (always a global scan,
@@ -1836,6 +1903,7 @@ pub fn run_doctor(ctx: DoctorContext) -> DoctorReport {
     checks.extend(check_last_runs(&ctx));
     checks.extend(check_docs(&ctx));
     checks.extend(check_scip_staleness(&ctx));
+    checks.extend(check_scip_languages(&ctx));
     checks.extend(check_worktrees(&ctx));
     checks.extend(check_recovery(&ctx));
     checks.extend(check_settings(&ctx));

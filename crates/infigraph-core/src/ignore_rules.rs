@@ -115,7 +115,7 @@ fn is_safety_excluded(name: &str) -> bool {
 /// cargo registry, while a config file inside a repository they merely
 /// cloned must not be able to name anything at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Trust {
+pub(crate) enum Trust {
     /// A project's own `.infigraph/config.toml`.
     Project,
     /// `~/.infigraph/config.toml`, or this process's environment.
@@ -165,14 +165,17 @@ struct Includes {
 /// either silence the other would serve nobody. The environment is this
 /// process's own, so it is trusted; whether it replaces the files or adds
 /// to them is the caller's `EnvLayer`, because the safe direction differs.
-fn layered_entries(
+pub(crate) fn layered_entries<L: crate::settings::ListEntries>(
     project_root: &Path,
-    from_env: Option<PathList>,
+    from_env: Option<L>,
     env: EnvLayer,
-    in_layer: impl Fn(&toml_edit::Item) -> PathList,
+    in_layer: impl Fn(&toml_edit::Item) -> L,
 ) -> Vec<(String, Trust)> {
-    let trusted = |list: PathList| -> Vec<(String, Trust)> {
-        list.0.into_iter().map(|e| (e, Trust::User)).collect()
+    let trusted = |list: L| -> Vec<(String, Trust)> {
+        list.into_entries()
+            .into_iter()
+            .map(|e| (e, Trust::User))
+            .collect()
     };
     // A variable that is SET replaces, even set to nothing: that is how
     // `INFIGRAPH_INDEX_INCLUDE=` says "no includes" regardless of the files.
@@ -186,7 +189,7 @@ fn layered_entries(
     let docs = crate::settings_file::layers(ConfigScope::Project(project_root));
     let [project, user] = docs;
     let entries_of = |doc: Option<std::sync::Arc<toml_edit::DocumentMut>>, trust: Trust| {
-        doc.map(|doc| in_layer(doc.as_item()).0)
+        doc.map(|doc| in_layer(doc.as_item()).into_entries())
             .unwrap_or_default()
             .into_iter()
             .map(move |entry| (entry, trust))
@@ -209,7 +212,7 @@ fn layered_entries(
 
 /// How a setting's environment layer combines with its config files.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EnvLayer {
+pub(crate) enum EnvLayer {
     /// A stated variable stands in for the files: `[index] include`, where
     /// a replaced list re-admits fewer files.
     Replaces,

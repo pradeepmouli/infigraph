@@ -70,6 +70,16 @@ pub(crate) fn cmd_index(root: &Path, full: bool, no_embed: bool) -> Result<()> {
     // raised. Observed doing exactly that: "Cleaned .infigraph/ for full
     // reindex" immediately followed by "refusing to watch ...".
     infigraph_core::daemon::ensure_watchable_root(root)?;
+    // A typo in `[scip] disable` switches nothing off, and the user believes
+    // it did: refuse before any work, naming what is accepted.
+    let unknown = infigraph_core::scip_switch::unknown_languages(root);
+    if !unknown.is_empty() {
+        anyhow::bail!(
+            "[scip] disable names no SCIP indexer serves: {}; it disables nothing. Use one of: {}",
+            unknown.join(", "),
+            infigraph_core::scip_switch::known_languages().join(", ")
+        );
+    }
     // Under the daemon backend this command performs no local graph writes:
     // each one is routed to the daemon, which takes this very
     // .infigraph/index.lock to serve it. Holding the lock here deadlocks --
@@ -495,11 +505,14 @@ pub(crate) fn cmd_index(root: &Path, full: bool, no_embed: bool) -> Result<()> {
     }
 
     // Drop prism to release the GraphStore handle before background SCIP
-    let detected_languages: std::collections::HashSet<String> = result
-        .extractions
-        .iter()
-        .map(|e| e.language.clone())
-        .collect();
+    let detected_languages = infigraph_core::scip_switch::enabled_languages(
+        root,
+        &result
+            .extractions
+            .iter()
+            .map(|e| e.language.clone())
+            .collect(),
+    );
     drop(prism);
 
     // Release the index-op lock before spawning the detached scip-enrich
@@ -806,11 +819,14 @@ pub(crate) fn auto_scip(
     use crate::scip_download;
     use std::collections::HashSet;
 
-    let detected: HashSet<String> = result
-        .extractions
-        .iter()
-        .map(|e| e.language.clone())
-        .collect();
+    let detected: HashSet<String> = infigraph_core::scip_switch::enabled_languages(
+        root,
+        &result
+            .extractions
+            .iter()
+            .map(|e| e.language.clone())
+            .collect(),
+    );
     if detected.is_empty() {
         return Ok(());
     }
@@ -2770,7 +2786,6 @@ mod tests {
         std::fs::write(&bin, format!("#!/bin/sh\n{body}\n")).unwrap();
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
         let indexer = crate::scip_download::ScipIndexer {
-            lang_tags: &[],
             binary_name: "scip-x",
             scip_args: &[],
             output_flag: None,

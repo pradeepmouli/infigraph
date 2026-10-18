@@ -2026,3 +2026,48 @@ fn check_settings_is_quiet_when_only_the_new_daemon_keys_are_used() {
         "{results:?}"
     );
 }
+
+mod scip_languages {
+    use super::*;
+    use infigraph_core::doctor::check_scip_languages;
+
+    fn ctx_with_config(config: &str) -> (tempfile::TempDir, DoctorContext) {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".infigraph")).unwrap();
+        std::fs::write(tmp.path().join(".infigraph/config.toml"), config).unwrap();
+        let ctx = ctx_for(
+            DoctorScope::Project(tmp.path().to_path_buf()),
+            Registry::default(),
+        );
+        (tmp, ctx)
+    }
+
+    #[test]
+    fn nothing_disabled_reports_nothing() {
+        let (_tmp, ctx) = ctx_with_config("");
+        assert!(check_scip_languages(&ctx).is_empty());
+    }
+
+    #[test]
+    fn a_disabled_language_is_listed_with_the_ignore_recipe() {
+        let (_tmp, ctx) = ctx_with_config("[scip]\ndisable = [\"rust\"]\n");
+        let checks = check_scip_languages(&ctx);
+        assert_eq!(checks.len(), 1, "{checks:?}");
+        assert_eq!(checks[0].status, CheckStatus::Pass);
+        assert!(checks[0].message.contains("rust (project)"), "{checks:?}");
+        assert!(checks[0].message.contains("[ignore] code"), "{checks:?}");
+    }
+
+    #[test]
+    fn an_unknown_name_fails_and_lists_the_accepted_ones() {
+        let (_tmp, ctx) = ctx_with_config("[scip]\ndisable = [\"rustt\"]\n");
+        let checks = check_scip_languages(&ctx);
+        assert_eq!(checks.len(), 1, "{checks:?}");
+        assert_eq!(checks[0].status, CheckStatus::Fail);
+        assert!(checks[0].message.contains("rustt"), "{checks:?}");
+        assert!(
+            checks[0].remediation.as_deref().unwrap().contains("rust"),
+            "{checks:?}"
+        );
+    }
+}

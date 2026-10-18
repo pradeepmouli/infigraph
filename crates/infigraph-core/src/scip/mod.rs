@@ -140,6 +140,35 @@ fn scip_ledger_path(infigraph_dir: &Path) -> std::path::PathBuf {
     infigraph_dir.join("scip-imports.json")
 }
 
+/// The language tags each SCIP indexer serves, by indexer binary: the one
+/// table both the CLI's download catalog (`scip_download::CATALOG`) and the
+/// `[scip] disable` check read. A tag is a language name as the extractor
+/// stores it (`Symbol.language`).
+pub const INDEXER_LANGUAGES: &[(&str, &[&str])] = &[
+    (
+        "scip-typescript",
+        &["typescript", "javascript", "tsx", "jsx"],
+    ),
+    ("scip-python", &["python"]),
+    ("rust-analyzer", &["rust"]),
+    ("scip-java", &["java", "kotlin", "scala"]),
+    ("scip-go", &["go"]),
+    ("scip-ruby", &["ruby"]),
+    ("scip-dotnet", &["c_sharp", "fsharp"]),
+    ("scip-clang", &["c", "cpp"]),
+    ("scip-dart", &["dart"]),
+    ("scip-php", &["php"]),
+];
+
+/// The language tags `binary_name` serves, or none for an indexer the table
+/// does not list.
+pub fn indexer_languages(binary_name: &str) -> &'static [&'static str] {
+    INDEXER_LANGUAGES
+        .iter()
+        .find(|(binary, _)| *binary == binary_name)
+        .map_or(&[], |(_, tags)| *tags)
+}
+
 /// A whole-file fingerprint of one indexer's `.scip` output, sitting a layer
 /// *above* `enrichment_hash`: that one asks "is this symbol already
 /// enriched" once the index is parsed and walked, this one decides whether

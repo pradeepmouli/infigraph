@@ -88,8 +88,12 @@ fn start_coordinator(
     (stop_tx, handle)
 }
 
+/// The tests below set process-wide environment variables.
+static ENV: Mutex<()> = Mutex::new(());
+
 #[test]
 fn coordinator_triggers_scip_enrichment_once_when_staleness_exceeds_threshold() {
+    let _env = ENV.lock().unwrap_or_else(|e| e.into_inner());
     let project_dir = stale_project();
 
     // Precondition: the fixture really is what the coordinator will see.
@@ -198,4 +202,37 @@ fn coordinator_does_not_trigger_scip_enrichment_when_scip_is_off() {
         recorded, 0,
         "enrichment was requested with [scip] enabled = false"
     );
+}
+
+/// `[scip] disable = ["rust"]`: the only language the graph holds is off, so
+/// the staleness trigger starts a task that finds nothing to run and never
+/// reaches the callback that runs the indexers. (The test above is the
+/// control: the same project, nothing disabled, is enriched.)
+#[test]
+fn a_disabled_language_is_not_enriched_by_the_staleness_trigger() {
+    let _env = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let project_dir = stale_project();
+    let mut names = toml_edit::Array::new();
+    names.push("rust");
+    infigraph_core::settings_file::set_project_setting(
+        project_dir.path(),
+        "scip",
+        "disable",
+        toml_edit::value(names),
+    )
+    .unwrap();
+    std::env::set_var("INFIGRAPH_SCIP_INDEX_STALENESS_THRESHOLD", "2");
+    std::env::set_var("INFIGRAPH_SCIP_INDEX_STALENESS_CHECK_SECS", "1");
+
+    let calls: Calls = Arc::new(Mutex::new(Vec::new()));
+    let (stop_tx, handle) = start_coordinator(project_dir.path(), &calls);
+    // Long enough for the registry build and several checks.
+    std::thread::sleep(Duration::from_secs(8));
+    let seen = calls.lock().unwrap().len();
+    stop_tx.send(()).unwrap();
+    handle.join().unwrap().expect("clean shutdown");
+    std::env::remove_var("INFIGRAPH_SCIP_INDEX_STALENESS_THRESHOLD");
+    std::env::remove_var("INFIGRAPH_SCIP_INDEX_STALENESS_CHECK_SECS");
+
+    assert_eq!(seen, 0, "a disabled language was handed to the indexers");
 }
