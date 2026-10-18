@@ -4,11 +4,17 @@ use std::path::{Path, PathBuf};
 use crate::index::on_path;
 
 pub(crate) struct ScipIndexer {
-    pub lang_tags: &'static [&'static str],
     pub binary_name: &'static str,
     pub scip_args: &'static [&'static str],
     pub output_flag: Option<&'static str>,
     pub download: DownloadStrategy,
+}
+
+impl ScipIndexer {
+    /// The languages this indexer serves (`infigraph_core::scip::INDEXER_LANGUAGES`).
+    pub fn lang_tags(&self) -> &'static [&'static str] {
+        infigraph_core::scip::indexer_languages(self.binary_name)
+    }
 }
 
 pub(crate) enum DownloadStrategy {
@@ -92,7 +98,6 @@ fn scip_java_asset(_os: &str, _arch: &str) -> Option<String> {
 
 pub(crate) static CATALOG: &[ScipIndexer] = &[
     ScipIndexer {
-        lang_tags: &["typescript", "javascript", "tsx", "jsx"],
         binary_name: "scip-typescript",
         scip_args: &["index", "--infer-tsconfig"],
         output_flag: Some("--output"),
@@ -101,7 +106,6 @@ pub(crate) static CATALOG: &[ScipIndexer] = &[
         },
     },
     ScipIndexer {
-        lang_tags: &["python"],
         binary_name: "scip-python",
         scip_args: &["index", "--cwd", "."],
         output_flag: Some("--output"),
@@ -110,7 +114,6 @@ pub(crate) static CATALOG: &[ScipIndexer] = &[
         },
     },
     ScipIndexer {
-        lang_tags: &["rust"],
         binary_name: "rust-analyzer",
         scip_args: &["scip", "."],
         output_flag: Some("--output"),
@@ -121,7 +124,6 @@ pub(crate) static CATALOG: &[ScipIndexer] = &[
         },
     },
     ScipIndexer {
-        lang_tags: &["java", "kotlin", "scala"],
         binary_name: "scip-java",
         scip_args: &["index"],
         output_flag: Some("--output"),
@@ -132,7 +134,6 @@ pub(crate) static CATALOG: &[ScipIndexer] = &[
         },
     },
     ScipIndexer {
-        lang_tags: &["go"],
         binary_name: "scip-go",
         scip_args: &["index"],
         output_flag: Some("-o"),
@@ -143,7 +144,6 @@ pub(crate) static CATALOG: &[ScipIndexer] = &[
         },
     },
     ScipIndexer {
-        lang_tags: &["ruby"],
         binary_name: "scip-ruby",
         scip_args: &["."],
         output_flag: None,
@@ -154,7 +154,6 @@ pub(crate) static CATALOG: &[ScipIndexer] = &[
         },
     },
     ScipIndexer {
-        lang_tags: &["c_sharp", "fsharp"],
         binary_name: "scip-dotnet",
         scip_args: &["index"],
         output_flag: Some("--output"),
@@ -163,7 +162,6 @@ pub(crate) static CATALOG: &[ScipIndexer] = &[
         },
     },
     ScipIndexer {
-        lang_tags: &["c", "cpp"],
         binary_name: "scip-clang",
         scip_args: &[],
         output_flag: None,
@@ -174,7 +172,6 @@ pub(crate) static CATALOG: &[ScipIndexer] = &[
         },
     },
     ScipIndexer {
-        lang_tags: &["dart"],
         binary_name: "scip-dart",
         scip_args: &["index"],
         output_flag: Some("--output"),
@@ -183,7 +180,6 @@ pub(crate) static CATALOG: &[ScipIndexer] = &[
         },
     },
     ScipIndexer {
-        lang_tags: &["php"],
         binary_name: "scip-php",
         scip_args: &["index"],
         output_flag: Some("--output"),
@@ -281,7 +277,7 @@ pub(crate) fn extra_runtime_paths() -> String {
 pub(crate) fn indexers_for_languages(detected: &HashSet<String>) -> Vec<&'static ScipIndexer> {
     let mut result: Vec<&'static ScipIndexer> = Vec::new();
     for indexer in CATALOG {
-        if indexer.lang_tags.iter().any(|t| detected.contains(*t)) {
+        if indexer.lang_tags().iter().any(|t| detected.contains(*t)) {
             result.push(indexer);
         }
     }
@@ -1317,7 +1313,7 @@ mod tests {
     fn test_catalog_coverage() {
         for indexer in CATALOG {
             assert!(
-                !indexer.lang_tags.is_empty(),
+                !indexer.lang_tags().is_empty(),
                 "{} has no lang_tags",
                 indexer.binary_name
             );
@@ -1418,7 +1414,7 @@ mod tests {
     fn test_no_duplicate_lang_tags() {
         let mut all_tags: Vec<&str> = Vec::new();
         for indexer in CATALOG {
-            for tag in indexer.lang_tags {
+            for tag in indexer.lang_tags() {
                 assert!(
                     !all_tags.contains(tag),
                     "duplicate lang_tag '{}' in {} (already in another indexer)",
@@ -1428,6 +1424,21 @@ mod tests {
                 all_tags.push(tag);
             }
         }
+    }
+
+    /// The language table lives in core (`[scip] disable` is checked there);
+    /// the catalog looks its tags up by binary name, so a row on one side
+    /// only would give an indexer no languages, or a name nothing runs.
+    #[test]
+    fn the_catalog_and_the_core_language_table_name_the_same_indexers() {
+        let mut catalog: Vec<&str> = CATALOG.iter().map(|i| i.binary_name).collect();
+        let mut table: Vec<&str> = infigraph_core::scip::INDEXER_LANGUAGES
+            .iter()
+            .map(|(name, _)| *name)
+            .collect();
+        catalog.sort_unstable();
+        table.sort_unstable();
+        assert_eq!(catalog, table);
     }
 
     #[test]

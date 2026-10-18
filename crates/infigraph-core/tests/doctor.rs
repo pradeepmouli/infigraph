@@ -1306,6 +1306,44 @@ fn check_scip_staleness_warns_when_scip_generation_behind_ast_generation() {
     );
 }
 
+/// A graph whose only language is disabled is not enriched, so a SCIP
+/// generation behind the AST's is expected, not a warning.
+#[test]
+fn check_scip_staleness_does_not_warn_when_every_language_is_disabled() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let (project, graph_path) = project_with_graph(dir.path());
+    std::fs::write(
+        project.join(".infigraph/config.toml"),
+        "[scip]\ndisable = [\"python\"]\n",
+    )
+    .unwrap();
+
+    {
+        let store = GraphStore::open(&graph_path).unwrap();
+        let lock = store.write_lock().unwrap();
+        let conn = store.connection().unwrap();
+        conn.query(
+            "CREATE (:Module {id: 'a.py', name: 'a', file: 'a.py', language: 'python', content_hash: 'x'})",
+        )
+        .unwrap();
+        store.bump_ast_generation_conn(&conn, &lock).unwrap();
+        store
+            .stamp_scip_generation_conn(&conn, &lock, None)
+            .unwrap();
+        store.bump_ast_generation_conn(&conn, &lock).unwrap();
+        store.bump_ast_generation_conn(&conn, &lock).unwrap();
+    }
+
+    let ctx = ctx_for(DoctorScope::Project(project), Registry::default());
+    let results = check_scip_staleness(&ctx);
+    let check = results
+        .iter()
+        .find(|r| r.name.contains("SCIP enrichment"))
+        .expect("the check is still reported");
+    assert_eq!(check.status, CheckStatus::Pass, "{}", check.message);
+    assert!(check.message.contains("not compared"), "{}", check.message);
+}
+
 #[test]
 fn check_scip_staleness_passes_when_caught_up() {
     let dir = tempfile::TempDir::new().unwrap();
@@ -2025,4 +2063,49 @@ fn check_settings_is_quiet_when_only_the_new_daemon_keys_are_used() {
         results.iter().all(|r| r.status == CheckStatus::Pass),
         "{results:?}"
     );
+}
+
+mod scip_languages {
+    use super::*;
+    use infigraph_core::doctor::check_scip_languages;
+
+    fn ctx_with_config(config: &str) -> (tempfile::TempDir, DoctorContext) {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".infigraph")).unwrap();
+        std::fs::write(tmp.path().join(".infigraph/config.toml"), config).unwrap();
+        let ctx = ctx_for(
+            DoctorScope::Project(tmp.path().to_path_buf()),
+            Registry::default(),
+        );
+        (tmp, ctx)
+    }
+
+    #[test]
+    fn nothing_disabled_reports_nothing() {
+        let (_tmp, ctx) = ctx_with_config("");
+        assert!(check_scip_languages(&ctx).is_empty());
+    }
+
+    #[test]
+    fn a_disabled_language_is_listed_with_the_ignore_recipe() {
+        let (_tmp, ctx) = ctx_with_config("[scip]\ndisable = [\"rust\"]\n");
+        let checks = check_scip_languages(&ctx);
+        assert_eq!(checks.len(), 1, "{checks:?}");
+        assert_eq!(checks[0].status, CheckStatus::Pass);
+        assert!(checks[0].message.contains("rust (project)"), "{checks:?}");
+        assert!(checks[0].message.contains("[ignore] code"), "{checks:?}");
+    }
+
+    #[test]
+    fn an_unknown_name_fails_and_lists_the_accepted_ones() {
+        let (_tmp, ctx) = ctx_with_config("[scip]\ndisable = [\"rustt\"]\n");
+        let checks = check_scip_languages(&ctx);
+        assert_eq!(checks.len(), 1, "{checks:?}");
+        assert_eq!(checks[0].status, CheckStatus::Fail);
+        assert!(checks[0].message.contains("rustt"), "{checks:?}");
+        assert!(
+            checks[0].remediation.as_deref().unwrap().contains("rust"),
+            "{checks:?}"
+        );
+    }
 }

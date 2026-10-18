@@ -232,6 +232,64 @@ impl FromTomlItem for PathList {
     }
 }
 
+/// The entries of a list-valued settings field, however it is typed. The
+/// layered reader (`ignore_rules::layered_entries`) is written once against
+/// this, so a new list setting reuses how project, user and environment
+/// layers combine instead of copying it.
+pub trait ListEntries {
+    fn into_entries(self) -> Vec<String>;
+}
+
+impl ListEntries for PathList {
+    fn into_entries(self) -> Vec<String> {
+        self.0
+    }
+}
+
+/// A settings-group list of language names (`[scip] disable = ["python"]`):
+/// zero or more, lowercased, trimmed, empties dropped. TOML states it as an
+/// array of strings; the environment has a flat comma-separated string.
+/// Whether a name is one infigraph knows is the caller's question: this type
+/// only parses.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Deserialize)]
+pub struct LanguageList(pub Vec<String>);
+
+impl ListEntries for LanguageList {
+    fn into_entries(self) -> Vec<String> {
+        self.0
+    }
+}
+
+impl std::str::FromStr for LanguageList {
+    type Err = std::convert::Infallible;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(LanguageList(
+            s.split(',')
+                .map(|name| name.trim().to_lowercase())
+                .filter(|name| !name.is_empty())
+                .collect(),
+        ))
+    }
+}
+
+impl FromTomlItem for LanguageList {
+    /// Anything but an array of strings is an error: a lone string
+    /// (`disable = "python"`) is the likely mistake, and silently reading it
+    /// as no entries would hide it.
+    fn from_toml_item(item: &toml_edit::Item) -> Result<Self, String> {
+        const EXPECTED: &str = "expected an array of strings";
+        let array = item.as_array().ok_or(EXPECTED)?;
+        let mut names = Vec::new();
+        for value in array.iter() {
+            let name = value.as_str().ok_or(EXPECTED)?.trim().to_lowercase();
+            if !name.is_empty() {
+                names.push(name);
+            }
+        }
+        Ok(LanguageList(names))
+    }
+}
+
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __settings_default {
@@ -593,7 +651,7 @@ macro_rules! settings_enum {
 
 #[cfg(test)]
 mod tests {
-    use super::{PathList, Toggle};
+    use super::{FromTomlItem, LanguageList, PathList, Toggle};
     use clap::Parser;
     use std::sync::Mutex;
 
@@ -757,6 +815,31 @@ mod tests {
         let b = ToyB::resolve_layers(RawToyB::parse_from(["test"]), &[]).unwrap();
         assert_eq!(a.value, 1);
         assert_eq!(b.value, 2);
+    }
+
+    #[test]
+    fn a_language_list_from_the_environment_is_trimmed_lowercased_and_without_empties() {
+        let list: LanguageList = " Python, ,TSX,,rust ".parse().unwrap();
+        assert_eq!(list.0, ["python", "tsx", "rust"]);
+        assert!("".parse::<LanguageList>().unwrap().0.is_empty());
+    }
+
+    #[test]
+    fn a_language_list_from_toml_is_an_array_of_strings() {
+        let doc: toml_edit::DocumentMut = "names = [\" Python \", \"\", \"TSX\"]".parse().unwrap();
+        let list = LanguageList::from_toml_item(&doc["names"]).unwrap();
+        assert_eq!(list.0, ["python", "tsx"]);
+    }
+
+    #[test]
+    fn a_lone_string_or_a_non_string_element_is_an_error_not_an_empty_list() {
+        let doc: toml_edit::DocumentMut = "lone = \"python\"\nmixed = [\"python\", 3]"
+            .parse()
+            .unwrap();
+        for key in ["lone", "mixed"] {
+            let err = LanguageList::from_toml_item(&doc[key]).unwrap_err();
+            assert!(err.contains("array of strings"), "{key}: {err}");
+        }
     }
 
     crate::settings! {
