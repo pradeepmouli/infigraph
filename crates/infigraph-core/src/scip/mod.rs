@@ -25,7 +25,8 @@ type NameCandidates = HashMap<(String, String), Vec<(u32, u32, String)>>;
 /// kind, file, start_line, end_line, docstring, scip_id.
 type NewSymbolRow = (String, String, String, String, u32, u32, String, String);
 
-/// Drop rows whose id already exists in the graph, in a single pass.
+/// Give every row an id that is free, in a single pass: neither in the graph
+/// nor taken by a row before it in the batch.
 ///
 /// #153: the `COPY Symbol` retry loop drops exactly ONE id per failure,
 /// because Kuzu names one bad value per error. A batch holding N ids that
@@ -40,13 +41,43 @@ type NewSymbolRow = (String, String, String, String, u32, u32, String, String);
 /// (`store_util::prefilter_pairs_against_existing`). This is the node
 /// equivalent, and it costs nothing extra: the ids come from the symbol
 /// preload this import already performs.
-fn drop_ids_already_in_graph(
+///
+/// A colliding row is a different symbol that earned the same id, not a copy
+/// of one, so it is NOT dropped: it takes the next free `#N` (from 2: the
+/// holder of the bare id is #1). The only row dropped is the same definition
+/// seen twice (same id, moniker and line), counted in the third return value.
+/// Returns the rows to write, `(moniker, new id)` for each renamed row so
+/// references follow it, and how many exact duplicates were dropped.
+fn make_ids_unique(
     rows: Vec<NewSymbolRow>,
     existing: &std::collections::HashSet<String>,
-) -> Vec<NewSymbolRow> {
-    rows.into_iter()
-        .filter(|(id, ..)| !existing.contains(id))
-        .collect()
+) -> (Vec<NewSymbolRow>, Vec<(String, String)>, usize) {
+    // id -> (moniker, start line) of the row that holds it in this batch
+    let mut taken: HashMap<String, (String, u32)> = HashMap::with_capacity(rows.len());
+    let mut kept = Vec::with_capacity(rows.len());
+    let mut renamed = Vec::new();
+    let mut duplicates = 0;
+    for mut row in rows {
+        let held_by_batch = taken.get(&row.0);
+        if let Some((moniker, line)) = held_by_batch {
+            if *moniker == row.7 && *line == row.4 {
+                duplicates += 1;
+                continue;
+            }
+        }
+        if held_by_batch.is_some() || existing.contains(&row.0) {
+            let base = row.0.clone();
+            let free = (2..)
+                .map(|n| format!("{base}#{n}"))
+                .find(|id| !existing.contains(id) && !taken.contains_key(id))
+                .expect("an unbounded range has a free ordinal");
+            renamed.push((row.7.clone(), free.clone()));
+            row.0 = free;
+        }
+        taken.insert(row.0.clone(), (row.7.clone(), row.4));
+        kept.push(row);
+    }
+    (kept, renamed, duplicates)
 }
 
 /// Existing `(:Symbol)-[table]->(:Symbol)` pairs, keyed by source id.
@@ -512,7 +543,7 @@ fn import_scip_index_unrecorded(
             .context("SCIP import: failed to preload existing symbols")?
     };
     // Every id already in the graph, gathered from the preload rows this
-    // import is reading anyway -- see `drop_ids_already_in_graph` (#153).
+    // import is reading anyway -- see `make_ids_unique` (#153).
     let mut existing_symbol_ids: std::collections::HashSet<String> =
         std::collections::HashSet::new();
     // What each symbol is already enriched with -- see `enrichment_hash`.
@@ -636,6 +667,10 @@ fn import_scip_index_unrecorded(
     // so Pass 2/3 can look up a reference's target directly here instead of
     // re-deriving resolution through the lossy (file, name) map.
     let mut scip_sym_to_ts_id: HashMap<String, String> = HashMap::new();
+    // (id, start line) -> the moniker of each row THIS pass made. Another
+    // moniker is another symbol, whatever it is called and wherever it starts:
+    // `Map#empty.` and the `empty` inside its inline type begin on one line.
+    let mut made_in_pass: HashMap<(String, u32), String> = HashMap::new();
 
     for doc in &documents {
         let file = &doc.relative_path;
@@ -719,6 +754,12 @@ fn import_scip_index_unrecorded(
                     candidates
                         .iter()
                         .find(|(s, e, id)| {
+                            if made_in_pass
+                                .get(&(id.clone(), *s))
+                                .is_some_and(|moniker| moniker != scip_sym)
+                            {
+                                return false;
+                            }
                             if literal.is_some() {
                                 // an earlier import's row for THIS member (its
                                 // moniker is unique in the file), or a symbol
@@ -771,6 +812,7 @@ fn import_scip_index_unrecorded(
                     scip_sym.clone(),
                 ));
                 stats.symbols_added += 1;
+                made_in_pass.insert((sym_id.clone(), span.start_line), scip_sym.clone());
                 scip_sym_to_ts_id.insert(scip_sym.clone(), sym_id.clone());
                 file_name_to_ids.entry(key).or_default().push((
                     span.start_line,
@@ -830,10 +872,10 @@ fn import_scip_index_unrecorded(
         }
     }
 
-    // Bulk insert new SCIP symbols via Parquet COPY FROM. `seen_ids` is now
-    // only a defensive backstop against a literal exact duplicate (the same
-    // definition occurrence observed twice) -- genuinely distinct same-named
-    // symbols are disambiguated above before reaching this point. On a COPY
+    // Bulk insert new SCIP symbols via Parquet COPY FROM. Genuinely distinct
+    // same-named symbols are disambiguated above, and `make_ids_unique` has
+    // made every id free (dropping only a literal duplicate: the same
+    // definition occurrence observed twice) before this point. On a COPY
     // failure against an id that already exists in the graph, drop that one
     // record and retry rather than falling back to UNWIND for the whole
     // batch; only exhausting MAX_SYMBOL_RETRIES falls back.
@@ -842,15 +884,21 @@ fn import_scip_index_unrecorded(
     if !new_symbols.is_empty() {
         let sym_pq = staging_parquet("infigraph_scip_symbols");
 
-        // Collisions with rows already in the graph are removed up front, in
-        // one pass, rather than one-per-failed-COPY (#153) -- `seen_ids`
-        // still guards against a literal duplicate within this batch.
-        let new_symbols = drop_ids_already_in_graph(new_symbols, &existing_symbol_ids);
-        let mut seen_ids = std::collections::HashSet::with_capacity(new_symbols.len());
-        let mut remaining: Vec<_> = new_symbols
-            .into_iter()
-            .filter(|(id, ..)| seen_ids.insert(id.clone()))
-            .collect();
+        // Collisions with rows already in the graph are settled up front, in
+        // one pass, rather than one-per-failed-COPY (#153); a collision renames
+        // the row, and only the same definition seen twice is dropped.
+        let (mut remaining, renamed, duplicates) =
+            make_ids_unique(new_symbols, &existing_symbol_ids);
+        for (moniker, id) in renamed {
+            scip_sym_to_ts_id.insert(moniker, id);
+        }
+        if duplicates > 0 {
+            crate::last_run::note(
+                "symbols dropped: the same definition twice",
+                duplicates as u64,
+                "an indexer reported one definition occurrence more than once",
+            );
+        }
 
         // Re-check growth on every attempt (#132 gap 1): each retry is a
         // whole new COPY, and a retry loop is exactly the shape that can
@@ -2054,7 +2102,7 @@ mod scratch_label_tests {
 
 #[cfg(test)]
 mod prefilter_tests {
-    use super::drop_ids_already_in_graph;
+    use super::make_ids_unique;
 
     fn row(id: &str) -> super::NewSymbolRow {
         (
@@ -2081,24 +2129,25 @@ mod prefilter_tests {
     fn a_symbol_batch_is_prefiltered_against_ids_already_in_the_graph() {
         let existing: std::collections::HashSet<String> =
             ["a", "c"].iter().map(|s| s.to_string()).collect();
-        let kept =
-            drop_ids_already_in_graph(vec![row("a"), row("b"), row("c"), row("d")], &existing);
+        let (kept, _, dropped) =
+            make_ids_unique(vec![row("a"), row("b"), row("c"), row("d")], &existing);
 
-        let ids: Vec<&str> = kept.iter().map(|(id, ..)| id.as_str()).collect();
-        assert_eq!(
-            ids,
-            vec!["b", "d"],
-            "every id already in the graph must be gone in ONE pass -- leaving even one \
+        assert!(
+            kept.iter().all(|(id, ..)| !existing.contains(id)),
+            "every id already in the graph must be settled in ONE pass -- leaving even one \
              costs a full re-COPY of the entire batch"
         );
+        let ids: Vec<&str> = kept.iter().map(|(id, ..)| id.as_str()).collect();
+        assert_eq!(ids, vec!["a#2", "b", "c#2", "d"], "renamed, not dropped");
+        assert_eq!(dropped, 0);
     }
 
     /// Nothing to drop must not disturb the batch.
     #[test]
     fn a_batch_with_no_collisions_is_untouched() {
         let existing = std::collections::HashSet::new();
-        let kept = drop_ids_already_in_graph(vec![row("x"), row("y")], &existing);
-        assert_eq!(kept.len(), 2);
+        let (kept, renamed, dropped) = make_ids_unique(vec![row("x"), row("y")], &existing);
+        assert_eq!((kept.len(), renamed.len(), dropped), (2, 0, 0));
     }
 }
 
@@ -3966,6 +4015,72 @@ mod tests {
                 "t.ts::A::slots#2 A#`<set>slots`."
             ],
             "the moniker lands on the tree-sitter row"
+        );
+    }
+
+    fn row(id: &str, scip: &str, line: u32) -> super::NewSymbolRow {
+        (
+            id.to_string(),
+            "x".to_string(),
+            "function".to_string(),
+            "a.ts".to_string(),
+            line,
+            line,
+            String::new(),
+            scip.to_string(),
+        )
+    }
+
+    #[test]
+    fn a_row_whose_id_is_taken_gets_the_next_free_ordinal_not_a_silent_drop() {
+        let existing: std::collections::HashSet<String> =
+            ["a.ts::x".to_string(), "a.ts::x#2".to_string()].into();
+        let rows = vec![
+            row("a.ts::x", "m1", 3), // taken by the graph
+            row("a.ts::y", "m2", 4),
+            row("a.ts::y", "m3", 5), // taken by the row before it
+        ];
+        let (kept, renamed, dropped) = super::make_ids_unique(rows, &existing);
+        let ids: Vec<&str> = kept.iter().map(|r| r.0.as_str()).collect();
+        assert_eq!(ids, vec!["a.ts::x#3", "a.ts::y", "a.ts::y#2"]);
+        assert_eq!(dropped, 0);
+        assert_eq!(
+            renamed,
+            vec![
+                ("m1".to_string(), "a.ts::x#3".to_string()),
+                ("m3".to_string(), "a.ts::y#2".to_string())
+            ],
+            "references to a renamed row follow it"
+        );
+    }
+
+    #[test]
+    fn only_the_same_definition_seen_twice_is_dropped_and_counted() {
+        let rows = vec![row("a.ts::z", "m", 3), row("a.ts::z", "m", 3)];
+        let (kept, renamed, dropped) = super::make_ids_unique(rows, &Default::default());
+        assert_eq!((kept.len(), renamed.len(), dropped), (1, 0, 1));
+    }
+
+    #[test]
+    fn two_members_on_one_line_with_the_same_name_both_survive() {
+        // GrammarTypeMap#empty. and the `empty` inside its inline type, one line
+        let env = TestEnv::new();
+        env.add_file("t.ts");
+        let outer = format!("{TS}`t.ts`/GrammarTypeMap#empty.");
+        let inner = format!("{TS}`t.ts`/GrammarTypeMap#empty.typeLiteral12:empty.");
+        let stats = import_defs(&env, "t.ts", &[(&outer, 0), (&inner, 0)]);
+        assert_eq!(stats.symbols_added, 2);
+        assert_eq!(
+            ids_in_line_order(&env)
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec![
+                "t.ts::GrammarTypeMap::empty",
+                "t.ts::GrammarTypeMap::empty::empty"
+            ],
+            "the second definition must not merge into the one this import just made"
         );
     }
 
