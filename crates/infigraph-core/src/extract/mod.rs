@@ -1,6 +1,8 @@
 mod entities;
+mod members;
 mod relations;
 pub use entities::extract_entities;
+pub use members::{literal_members, LiteralMember};
 pub use relations::{extract_relations, extract_relations_with_custom_edges};
 
 use anyhow::Result;

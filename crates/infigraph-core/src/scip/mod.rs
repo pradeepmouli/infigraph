@@ -635,6 +635,7 @@ fn import_scip_index_unrecorded(
 
     for doc in &documents {
         let file = &doc.relative_path;
+        let literal_members = literal_members_of(doc, project_root);
 
         let sym_info_map: HashMap<&str, &scip::types::SymbolInformation> = doc
             .symbols
@@ -654,8 +655,21 @@ fn import_scip_index_unrecorded(
                 continue;
             }
 
-            let name = scip_sym_to_name(scip_sym);
             let span = occurrence_span(occ, file);
+            // A member of a named object literal: the key and the owners come
+            // from the source (the moniker has neither), and are what the
+            // name, the match below and the id are all made from.
+            let literal = is_literal_member_moniker(scip_sym)
+                .then(|| {
+                    let (line, col, ..) = occurrence_range(occ);
+                    literal_members.get(&(line.max(0) as u32, col.max(0) as u32))
+                })
+                .flatten()
+                .filter(|m| !m.owners.is_empty());
+            let name = match literal {
+                Some(member) => member.name.clone(),
+                None => scip_sym_to_name(scip_sym),
+            };
             let si = sym_info_map.get(scip_sym.as_str());
             let docstring = si
                 .and_then(|s| s.documentation.first())
@@ -702,7 +716,10 @@ fn import_scip_index_unrecorded(
                 let kind = si
                     .map(|s| scip_kind_to_prism(&s.kind.enum_value_or_default()))
                     .unwrap_or(SymbolKind::Function);
-                let sym_id = scip_symbol_id(file, scip_sym, &name);
+                let sym_id = match literal {
+                    Some(member) => qualified_id(file, &member.owners, &name),
+                    None => scip_symbol_id(file, scip_sym, &name),
+                };
                 new_symbols.push((
                     sym_id.clone(),
                     name.clone(),
@@ -1306,6 +1323,58 @@ fn scip_sym_to_name(scip_sym: &str) -> String {
     }
 }
 
+/// The language packs the import reads object-literal owners with. Set once
+/// per process by whoever opens a project (`Infigraph::open_shared`), because
+/// the import runs behind `GraphBackend`, which carries no registry, and
+/// every process uses the one bundled set. Without it (a bare store in a
+/// test) a literal member simply keeps the id its moniker gives it.
+static LANGUAGES: std::sync::OnceLock<Arc<crate::lang::LanguageRegistry>> =
+    std::sync::OnceLock::new();
+
+/// Hand the import the process's language registry. The first call wins.
+pub fn use_language_registry(registry: Arc<crate::lang::LanguageRegistry>) {
+    let _ = LANGUAGES.set(registry);
+}
+
+/// scip-typescript names an object-literal member `<key><N>:` -- the key and
+/// a per-file counter, with no owner. A meta descriptor ending in a digit is
+/// how the moniker says so; the key itself comes from the source, because
+/// `x1` + counter 0 and `x` + counter 10 read the same.
+fn is_literal_member_moniker(scip_sym: &str) -> bool {
+    scip_descriptors(scip_sym)
+        .and_then(|mut d| d.pop())
+        .is_some_and(|last| {
+            last.kind == DescriptorKind::Meta
+                && !is_type_literal(&last.name)
+                && last.name.ends_with(|c: char| c.is_ascii_digit())
+        })
+}
+
+/// The object-literal members of `doc`'s file, by where their key starts,
+/// when the document defines any (`is_literal_member_moniker`): read from the
+/// file as it is now, with the pack's own `@member.*` captures. Empty when
+/// there is nothing to ask, nowhere to read it from, or no pack to ask with.
+fn literal_members_of(
+    doc: &scip::types::Document,
+    project_root: Option<&Path>,
+) -> HashMap<(u32, u32), crate::extract::LiteralMember> {
+    let defines_one = doc.occurrences.iter().any(|o| {
+        (o.symbol_roles & SymbolRole::Definition as i32) != 0
+            && !o.symbol.starts_with("local ")
+            && is_literal_member_moniker(&o.symbol)
+    });
+    let (true, Some(root), Some(registry)) = (defines_one, project_root, LANGUAGES.get()) else {
+        return HashMap::new();
+    };
+    let Ok(source) = std::fs::read(root.join(&doc.relative_path)) else {
+        return HashMap::new();
+    };
+    registry
+        .for_file_with_content(&doc.relative_path, &source)
+        .map(|pack| crate::extract::literal_members(&source, pack))
+        .unwrap_or_default()
+}
+
 /// One descriptor of a SCIP symbol: a name and what the suffix after it said.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Descriptor {
@@ -1483,10 +1552,15 @@ fn scip_owner_chain(scip_sym: &str) -> Vec<String> {
 /// tree-sitter gives a method (`entities.rs`), so one member of a type reads
 /// the same whichever indexer found it. No owner, `file::name`.
 fn scip_symbol_id(file: &str, scip_sym: &str, name: &str) -> String {
+    qualified_id(file, &scip_owner_chain(scip_sym), name)
+}
+
+/// `file::Owner::...::name`.
+fn qualified_id(file: &str, owners: &[String], name: &str) -> String {
     let mut id = String::from(file);
-    for owner in scip_owner_chain(scip_sym) {
+    for owner in owners {
         id.push_str("::");
-        id.push_str(&owner);
+        id.push_str(owner);
     }
     id.push_str("::");
     id.push_str(name);

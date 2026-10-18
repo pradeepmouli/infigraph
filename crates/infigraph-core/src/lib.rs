@@ -359,6 +359,7 @@ impl Infigraph {
     pub fn open_shared(root: &Path, registry: std::sync::Arc<LanguageRegistry>) -> Result<Self> {
         let root = root.canonicalize().context("invalid project root")?;
         let db_path = root.join(".infigraph").join("graph");
+        scip::use_language_registry(registry.clone());
         Ok(Self {
             root,
             db_path,
@@ -384,10 +385,12 @@ impl Infigraph {
     ) -> Result<Self> {
         let root = root.canonicalize().context("invalid project root")?;
         let kb = graph::KuzuBackend::open(&db_path)?;
+        let registry = std::sync::Arc::new(registry);
+        scip::use_language_registry(registry.clone());
         Ok(Self {
             root,
             db_path,
-            registry: std::sync::Arc::new(registry),
+            registry,
             backend_kind: BackendKind::Kuzu(kb),
             namespace: None,
         })

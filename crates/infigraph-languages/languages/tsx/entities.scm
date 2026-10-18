@@ -37,3 +37,33 @@
     arguments: (arguments
       (string) @route.path)) @route.def
   (#match? @route.method "^(get|post|put|delete|patch|options|head|all|use)$"))
+
+; === Object-literal member owners ===
+; These emit NO symbol. extract_entities ignores @member.* captures; the SCIP
+; import re-runs this query over a file (extract::literal_members) to learn who
+; owns an object-literal member, which scip-typescript's monikers do not say
+; (`ignorePatterns0:` has no owner, only a per-file counter). See
+; crates/infigraph-core/src/extract/members.rs for the capture contract. This
+; is the TypeScript half of the parent-capture idiom (@method.parent) for
+; fields and properties.
+
+; const X = { ... }  (also `as` / `satisfies` wrappers)
+(variable_declarator
+  name: (identifier) @member.root
+  value: [(object) @member.scope
+          (as_expression . (object) @member.scope)
+          (satisfies_expression . (object) @member.scope)])
+
+; a key whose value is itself a literal: { b: { ... } }
+(object
+  (pair
+    key: (_) @member.owner
+    value: [(object) @member.scope
+            (as_expression . (object) @member.scope)
+            (satisfies_expression . (object) @member.scope)])) @member.within
+
+; every member of a literal
+(object
+  [(pair key: (_) @member.name)
+   (shorthand_property_identifier) @member.name
+   (method_definition name: (_) @member.name)]) @member.within
