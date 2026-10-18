@@ -1,6 +1,60 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use crate::daemon_protocol::write_atomic;
+use crate::degraded::{live, DegradedMode, SESSIONS_UNREADABLE};
+use crate::lockfile::{self, LockFile};
+
+/// How long a session write waits for `sessions.lock` before giving up.
+pub const SESSION_LOCK_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Reads an epoch field as whole seconds. Another writer (the hook's file
+/// fallback, in Python) may put `time.time()` there, `1792333398.318963`:
+/// that is read, truncated, and written back as an integer by the next save.
+/// Anything that is not a non-negative number is an error naming `field`.
+struct EpochSeconds(&'static str);
+
+impl<'de> serde::de::Visitor<'de> for EpochSeconds {
+    type Value = i64;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "a non-negative number of epoch seconds for `{}`", self.0)
+    }
+
+    fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<i64, E> {
+        if v < 0 {
+            return Err(E::custom(format!("`{}` is negative ({v})", self.0)));
+        }
+        Ok(v)
+    }
+
+    fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<i64, E> {
+        i64::try_from(v).map_err(|_| E::custom(format!("`{}` is out of range ({v})", self.0)))
+    }
+
+    fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<i64, E> {
+        if !v.is_finite() || !(0.0..9.0e18).contains(&v) {
+            return Err(E::custom(format!(
+                "`{}` is not a usable number of seconds ({v})",
+                self.0
+            )));
+        }
+        Ok(v as i64)
+    }
+}
+
+macro_rules! epoch_field {
+    ($name:ident, $field:literal) => {
+        fn $name<'de, D: serde::Deserializer<'de>>(d: D) -> Result<i64, D::Error> {
+            d.deserialize_any(EpochSeconds($field))
+        }
+    };
+}
+epoch_field!(created_at_seconds, "created_at");
+epoch_field!(updated_at_seconds, "updated_at");
+epoch_field!(last_accessed_seconds, "last_accessed");
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionData {
@@ -20,13 +74,13 @@ pub struct SessionData {
     pub assumptions: String,
     #[serde(default)]
     pub blockers: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "created_at_seconds")]
     pub created_at: i64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "updated_at_seconds")]
     pub updated_at: i64,
     #[serde(default)]
     pub confidence: f32,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "last_accessed_seconds")]
     pub last_accessed: i64,
 }
 
@@ -59,6 +113,20 @@ impl SessionData {
     }
 }
 
+/// A session file that did not read, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Skipped {
+    pub file: PathBuf,
+    pub reason: String,
+}
+
+/// What a read of the sessions directory found.
+#[derive(Debug, Clone)]
+pub struct Scan {
+    pub sessions: Vec<SessionData>,
+    pub skipped: Vec<Skipped>,
+}
+
 pub struct SessionStore {
     sessions_dir: PathBuf,
 }
@@ -76,26 +144,50 @@ impl SessionStore {
         &self.sessions_dir
     }
 
+    /// The lock a read-modify-write of a session holds: `save` replaces the
+    /// file atomically, so a reader never needs it, but two writers that each
+    /// load, change and save would lose one update without it. Not reentrant:
+    /// a caller already holding it must not call [`touch_session`].
+    ///
+    /// [`touch_session`]: Self::touch_session
+    pub fn lock(&self) -> Result<LockFile> {
+        lockfile::acquire(
+            &self.sessions_dir.join("sessions.lock"),
+            "session-write",
+            SESSION_LOCK_TIMEOUT,
+        )
+    }
+
+    /// Replaces the session's file in one rename, so a concurrent `load` sees
+    /// the old session or the new one, never an empty or half-written file
+    /// (`save_session` once failed with "failed to parse session" that way).
     pub fn save(&self, session: &SessionData) -> Result<()> {
         let path = self.session_path(&session.id);
         let json = serde_json::to_string_pretty(session)?;
-        std::fs::write(&path, json)?;
-        Ok(())
+        write_atomic(&path, &json)
     }
 
     pub fn load(&self, session_id: &str) -> Result<Option<SessionData>> {
         let path = self.session_path(session_id);
-        if !path.exists() {
-            return Ok(None);
-        }
-        let content = std::fs::read_to_string(&path)?;
+        let content = match std::fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        // The parser's own words go in the message: `with_context` would hide
+        // them from every caller that prints the error with `{}`.
         let session: SessionData = serde_json::from_str(&content)
-            .with_context(|| format!("failed to parse session: {}", path.display()))?;
+            .map_err(|e| anyhow::anyhow!("failed to parse session {}: {e}", path.display()))?;
         Ok(Some(session))
     }
 
-    pub fn list_all(&self) -> Result<Vec<SessionData>> {
+    /// Every session that reads, newest first, and every session file that
+    /// does not, with why. The skipped files are also reported as the degraded
+    /// mode `sessions-unreadable` (and cleared once all read again), so a
+    /// session that vanishes from a list says so where a person looks.
+    pub fn scan(&self) -> Result<Scan> {
         let mut sessions = Vec::new();
+        let mut skipped = Vec::new();
         for entry in std::fs::read_dir(&self.sessions_dir)? {
             let entry = entry?;
             let name = entry.file_name();
@@ -103,15 +195,61 @@ impl SessionStore {
             if (name_str.starts_with("session_") || name_str.starts_with("named_"))
                 && name_str.ends_with(".json")
             {
-                if let Ok(content) = std::fs::read_to_string(entry.path()) {
-                    if let Ok(session) = serde_json::from_str::<SessionData>(&content) {
-                        sessions.push(session);
-                    }
+                let read = std::fs::read_to_string(entry.path())
+                    .map_err(|e| e.to_string())
+                    .and_then(|content| {
+                        serde_json::from_str::<SessionData>(&content).map_err(|e| e.to_string())
+                    });
+                match read {
+                    Ok(session) => sessions.push(session),
+                    Err(reason) => skipped.push(Skipped {
+                        file: entry.path(),
+                        reason,
+                    }),
                 }
             }
         }
         sessions.sort_by_key(|s| std::cmp::Reverse(s.created_at));
-        Ok(sessions)
+        skipped.sort_by(|a, b| a.file.cmp(&b.file));
+        self.report(&skipped);
+        Ok(Scan { sessions, skipped })
+    }
+
+    pub fn list_all(&self) -> Result<Vec<SessionData>> {
+        Ok(self.scan()?.sessions)
+    }
+
+    /// The project this store belongs to, when its directory is
+    /// `<project>/.infigraph/sessions`.
+    fn project_root(&self) -> Option<&Path> {
+        let infigraph = self.sessions_dir.parent()?;
+        (infigraph.file_name()? == ".infigraph")
+            .then(|| infigraph.parent())
+            .flatten()
+    }
+
+    fn report(&self, skipped: &[Skipped]) {
+        let Some(root) = self.project_root() else {
+            return;
+        };
+        match skipped.first() {
+            Some(first) => live::set(
+                root,
+                DegradedMode::SessionsUnreadable {
+                    count: skipped.len(),
+                    first: format!(
+                        "{}: {}",
+                        first
+                            .file
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_default(),
+                        first.reason
+                    ),
+                },
+            ),
+            None => live::clear(root, SESSIONS_UNREADABLE),
+        }
     }
 
     pub fn list_active(&self, now_epoch: i64) -> Result<Vec<SessionData>> {
@@ -135,6 +273,7 @@ impl SessionStore {
     }
 
     pub fn touch_session(&self, session_id: &str) -> Result<()> {
+        let _lock = self.lock()?;
         if let Some(mut session) = self.load(session_id)? {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -265,8 +404,7 @@ impl SessionStore {
             if json_path.exists() {
                 continue;
             }
-            let json = serde_json::to_string_pretty(session)?;
-            std::fs::write(&json_path, json)?;
+            self.save(session)?;
             count += 1;
         }
 

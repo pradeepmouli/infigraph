@@ -29,6 +29,7 @@ pub const DOC_LINKS_UNSCANNED: &str = "doc-links-unscanned";
 pub const DOC_SYNC_UNKNOWN: &str = "doc-sync-unknown";
 pub const IDS_OUTDATED: &str = "ids-outdated";
 pub const SCIP_LITERAL_OWNERS_UNAVAILABLE: &str = "scip-literal-owners-unavailable";
+pub const SESSIONS_UNREADABLE: &str = "sessions-unreadable";
 
 /// One way infigraph is running degraded.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,6 +93,8 @@ pub enum DegradedMode {
     /// language registry to ask who owns them, so they got the indexer's
     /// counter-suffixed names (`semi0`) instead of `file::Const::semi`.
     ScipLiteralOwnersUnavailable,
+    /// Session files that do not parse: every session list leaves them out.
+    SessionsUnreadable { count: usize, first: String },
 }
 
 impl DegradedMode {
@@ -119,6 +122,7 @@ impl DegradedMode {
             DegradedMode::DocSyncUnknown { .. } => DOC_SYNC_UNKNOWN,
             DegradedMode::IdsOutdated => IDS_OUTDATED,
             DegradedMode::ScipLiteralOwnersUnavailable => SCIP_LITERAL_OWNERS_UNAVAILABLE,
+            DegradedMode::SessionsUnreadable { .. } => SESSIONS_UNREADABLE,
         }
     }
 
@@ -207,6 +211,10 @@ impl DegradedMode {
                  members without knowing their owners (no language registry in this process): \
                  they carry the indexer's counter, e.g. `semi0`, until the next import"
                 .to_string(),
+            DegradedMode::SessionsUnreadable { count, first } => format!(
+                "{count} session file(s) cannot be read and are left out of every session \
+                 list, e.g. {first}"
+            ),
         }
     }
 
@@ -254,6 +262,10 @@ impl DegradedMode {
             DegradedMode::ScipLiteralOwnersUnavailable => {
                 "import through `infigraph scip-enrich` or the daemon, which load the language \
                  packs"
+            }
+            DegradedMode::SessionsUnreadable { .. } => {
+                "fix the field the message names in `.infigraph/sessions/<file>.json`, or delete \
+                 the file"
             }
         }
     }
@@ -862,6 +874,10 @@ mod tests {
             },
             DegradedMode::IdsOutdated,
             DegradedMode::ScipLiteralOwnersUnavailable,
+            DegradedMode::SessionsUnreadable {
+                count: 1,
+                first: "session_x.json: expected a string".to_string(),
+            },
         ];
         let keys: std::collections::HashSet<_> = modes.iter().map(|m| m.key()).collect();
         let messages: std::collections::HashSet<_> = modes.iter().map(|m| m.message()).collect();

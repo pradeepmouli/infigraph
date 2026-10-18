@@ -1,12 +1,10 @@
 use std::path::PathBuf;
-use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
 
 use infigraph_core::embed;
 use infigraph_core::graph::{SessionData, SessionStore};
-use infigraph_core::lockfile;
 
 pub fn open_session_store(args: &Value) -> Result<SessionStore> {
     let path = args
@@ -106,8 +104,6 @@ fn score_session_value(
     0.5
 }
 
-const SESSION_LOCK_TIMEOUT: Duration = Duration::from_secs(10);
-
 pub fn tool_save_session(args: &Value) -> Result<String> {
     let store = open_session_store(args)?;
     let path = args
@@ -145,11 +141,7 @@ pub fn tool_save_session(args: &Value) -> Result<String> {
 
     let wrote_narrative;
     let (session_id, session_count) = {
-        let _session_lock = lockfile::acquire(
-            &sessions_dir.join("sessions.lock"),
-            "session-write",
-            SESSION_LOCK_TIMEOUT,
-        )?;
+        let _session_lock = store.lock()?;
 
         let session_id = if session_name.is_empty() {
             session_date_id()
@@ -601,6 +593,9 @@ pub fn tool_purge_sessions(args: &Value) -> Result<String> {
     let now = session_epoch();
     let cutoff = now - (older_than_days as i64 * 86400);
 
+    // Held from the listing to the deletes: a session saved in between would
+    // otherwise be judged on the list as it was.
+    let _session_lock = store.lock()?;
     let all = store.list_all()?;
     let to_purge: Vec<&SessionData> = all.iter().filter(|s| s.created_at < cutoff).collect();
 
@@ -613,12 +608,6 @@ pub fn tool_purge_sessions(args: &Value) -> Result<String> {
     let purged_ids: Vec<String> = to_purge.iter().map(|s| s.id.clone()).collect();
     let root = PathBuf::from(path);
     let sessions_dir = root.join(".infigraph").join("sessions");
-    let _session_lock = lockfile::acquire(
-        &sessions_dir.join("sessions.lock"),
-        "session-write",
-        SESSION_LOCK_TIMEOUT,
-    )?;
-
     for id in &purged_ids {
         store.delete(id)?;
     }
@@ -770,11 +759,7 @@ pub fn tool_consolidate_memory(args: &Value) -> Result<String> {
     let sessions_dir = root.join(".infigraph").join("sessions");
 
     let (consolidated_count, mut out) = {
-        let _session_lock = lockfile::acquire(
-            &sessions_dir.join("sessions.lock"),
-            "session-write",
-            SESSION_LOCK_TIMEOUT,
-        )?;
+        let _session_lock = store.lock()?;
 
         // Purge expired sessions (confidence < 0.1)
         let purged = store.purge_expired(now)?;
