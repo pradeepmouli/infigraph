@@ -702,7 +702,7 @@ fn import_scip_index_unrecorded(
                 let kind = si
                     .map(|s| scip_kind_to_prism(&s.kind.enum_value_or_default()))
                     .unwrap_or(SymbolKind::Function);
-                let sym_id = format!("{}::{}", file, name);
+                let sym_id = scip_symbol_id(file, scip_sym, &name);
                 new_symbols.push((
                     sym_id.clone(),
                     name.clone(),
@@ -732,32 +732,31 @@ fn import_scip_index_unrecorded(
     }
 
     // Phase 2-style ordinal disambiguation (mirrors entities.rs's
-    // tree-sitter path) for genuinely-distinct new SCIP symbols that share a
-    // (file, name) key -- e.g. `A#foo()` and `B#foo()` both extract to
-    // "foo". Without this, both would carry the identical unsuffixed id and
-    // the `seen_ids` dedup below would silently keep only one, losing the
-    // other with no warning (confirmed via
+    // tree-sitter path) for genuinely-distinct new SCIP symbols that share
+    // an id -- `scip_symbol_id` puts the owner chain in the id, so what is
+    // left is the real overloads (one moniker defined at several spans) and
+    // owner-less repeats. Without this, both would carry the identical
+    // unsuffixed id and the `seen_ids` dedup below would silently keep only
+    // one, losing the other with no warning (confirmed via
     // `probe_two_new_same_named_symbols_one_file`). Ordinals continue past
-    // whatever count already existed for this key before this import pass,
-    // so a newly-added symbol can never collide with one already in the
-    // graph either.
+    // whatever ids already exist for this base, so a newly-added symbol can
+    // never collide with one already in the graph either.
     {
-        let mut groups: HashMap<(String, String), Vec<usize>> = HashMap::new();
-        for (i, (_, name, _, file, ..)) in new_symbols.iter().enumerate() {
-            groups
-                .entry((file.clone(), name.clone()))
-                .or_default()
-                .push(i);
+        let mut already: HashMap<&str, usize> = HashMap::new();
+        for id in &existing_symbol_ids {
+            *already.entry(without_ordinal(id)).or_default() += 1;
         }
-        for ((file, name), mut idxs) in groups {
-            let existing_count = preexisting_file_name_to_ids
-                .get(&(file.clone(), name.clone()))
-                .map_or(0, |v| v.len());
+        let mut groups: HashMap<String, Vec<usize>> = HashMap::new();
+        for (i, (id, ..)) in new_symbols.iter().enumerate() {
+            groups.entry(id.clone()).or_default().push(i);
+        }
+        for (base, mut idxs) in groups {
+            let existing_count = already.get(base.as_str()).copied().unwrap_or(0);
             // Truly unambiguous: exactly one new occurrence in this batch,
-            // and nothing pre-existing under this key either -- keep the
+            // and nothing pre-existing under this base either -- keep the
             // bare id (matches entities.rs's own single-occurrence case).
             // Otherwise (more than one new occurrence, and/or something
-            // already exists for this key) every one of THIS batch's
+            // already exists for this base) every one of THIS batch's
             // occurrences needs a suffix continuing past `existing_count`,
             // including a solo one -- a lone new occurrence colliding with
             // pre-existing rows is exactly what caused a real
@@ -767,7 +766,7 @@ fn import_scip_index_unrecorded(
             }
             idxs.sort_by_key(|&i| (new_symbols[i].4, new_symbols[i].5));
             for (n, i) in idxs.into_iter().enumerate() {
-                let new_id = format!("{file}::{name}#{}", existing_count + n + 1);
+                let new_id = format!("{base}#{}", existing_count + n + 1);
                 new_symbols[i].0 = new_id.clone();
                 scip_sym_to_ts_id.insert(new_symbols[i].7.clone(), new_id);
             }
@@ -1304,6 +1303,201 @@ fn scip_sym_to_name(scip_sym: &str) -> String {
         suffix.trim_start_matches('.').to_string()
     } else {
         scip_sym.to_string()
+    }
+}
+
+/// One descriptor of a SCIP symbol: a name and what the suffix after it said.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Descriptor {
+    name: String,
+    kind: DescriptorKind,
+}
+
+/// SCIP's descriptor suffixes: `/` namespace, `#` type, `.` term,
+/// `name(disambiguator).` method, `:` meta, `!` macro, `[name]` type
+/// parameter, `(name)` parameter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DescriptorKind {
+    Namespace,
+    Type,
+    Term,
+    Method,
+    Meta,
+    Macro,
+    TypeParam,
+    Param,
+}
+
+/// The descriptors of `scip_sym`, in order, or `None` when it does not parse
+/// (a symbol from an indexer that bends the grammar keeps its old id).
+///
+/// A symbol is `<scheme> <manager> <package> <version> <descriptors>`; a
+/// field holding a space doubles it.
+fn scip_descriptors(scip_sym: &str) -> Option<Vec<Descriptor>> {
+    let mut rest = scip_sym;
+    for _ in 0..4 {
+        let mut chars = rest.char_indices().peekable();
+        let cut = loop {
+            let (i, c) = chars.next()?;
+            if c != ' ' {
+                continue;
+            }
+            if chars.peek().is_some_and(|&(_, n)| n == ' ') {
+                chars.next();
+                continue;
+            }
+            break i + 1;
+        };
+        rest = &rest[cut..];
+    }
+    let chars: Vec<char> = rest.chars().collect();
+    let mut out = Vec::new();
+    let mut i = 0;
+    // `` `quoted name` `` (a backtick doubles) or a bare run up to a suffix.
+    let name_at = |i: &mut usize, stop: &[char]| -> Option<String> {
+        let mut name = String::new();
+        if chars.get(*i) == Some(&'`') {
+            *i += 1;
+            loop {
+                let c = *chars.get(*i)?;
+                *i += 1;
+                if c == '`' {
+                    if chars.get(*i) == Some(&'`') {
+                        name.push('`');
+                        *i += 1;
+                        continue;
+                    }
+                    break;
+                }
+                name.push(c);
+            }
+        } else {
+            while let Some(&c) = chars.get(*i) {
+                if stop.contains(&c) {
+                    break;
+                }
+                name.push(c);
+                *i += 1;
+            }
+        }
+        Some(name)
+    };
+    while i < chars.len() {
+        match chars[i] {
+            '(' => {
+                i += 1;
+                let name = name_at(&mut i, &[')'])?;
+                i += 1;
+                if chars.get(i) == Some(&'.') {
+                    i += 1;
+                }
+                out.push(Descriptor {
+                    name,
+                    kind: DescriptorKind::Param,
+                });
+            }
+            '[' => {
+                i += 1;
+                let name = name_at(&mut i, &[']'])?;
+                i += 1;
+                out.push(Descriptor {
+                    name,
+                    kind: DescriptorKind::TypeParam,
+                });
+            }
+            _ => {
+                let name = name_at(&mut i, &['/', '#', '.', ':', '!', '('])?;
+                let kind = match chars.get(i)? {
+                    '/' => DescriptorKind::Namespace,
+                    '#' => DescriptorKind::Type,
+                    '.' => DescriptorKind::Term,
+                    ':' => DescriptorKind::Meta,
+                    '!' => DescriptorKind::Macro,
+                    '(' => {
+                        while *chars.get(i)? != ')' {
+                            i += 1;
+                        }
+                        i += 1;
+                        if chars.get(i) != Some(&'.') {
+                            return None;
+                        }
+                        DescriptorKind::Method
+                    }
+                    _ => return None,
+                };
+                i += 1;
+                out.push(Descriptor { name, kind });
+            }
+        }
+    }
+    Some(out)
+}
+
+/// scip-typescript names an anonymous type literal `typeLiteral<N>:`; the
+/// member path says more than the counter does.
+fn is_type_literal(name: &str) -> bool {
+    name.strip_prefix("typeLiteral")
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// The names that own `scip_sym`, outermost first: the types, terms and
+/// methods before its last descriptor. A namespace is the file or module (the
+/// id already has the file), a type parameter or parameter is no owner, and
+/// rust-analyzer's `impl#[Type]` is owned by `Type`.
+fn scip_owner_chain(scip_sym: &str) -> Vec<String> {
+    let Some(descriptors) = scip_descriptors(scip_sym) else {
+        return Vec::new();
+    };
+    let Some((last, before)) = descriptors.split_last() else {
+        return Vec::new();
+    };
+    if matches!(last.kind, DescriptorKind::Param | DescriptorKind::TypeParam) {
+        return Vec::new();
+    }
+    let mut chain = Vec::new();
+    for (i, d) in before.iter().enumerate() {
+        match d.kind {
+            DescriptorKind::Type if d.name == "impl" => {
+                if let Some(ty) = before[i + 1..]
+                    .iter()
+                    .find(|n| n.kind == DescriptorKind::TypeParam)
+                {
+                    chain.push(ty.name.clone());
+                }
+            }
+            DescriptorKind::Type
+            | DescriptorKind::Term
+            | DescriptorKind::Method
+            | DescriptorKind::Macro => chain.push(d.name.clone()),
+            DescriptorKind::Meta if is_type_literal(&d.name) => {}
+            DescriptorKind::Meta
+            | DescriptorKind::Namespace
+            | DescriptorKind::TypeParam
+            | DescriptorKind::Param => {}
+        }
+    }
+    chain
+}
+
+/// The id of a symbol only SCIP knows: `file::Owner::...::name`, the shape
+/// tree-sitter gives a method (`entities.rs`), so one member of a type reads
+/// the same whichever indexer found it. No owner, `file::name`.
+fn scip_symbol_id(file: &str, scip_sym: &str, name: &str) -> String {
+    let mut id = String::from(file);
+    for owner in scip_owner_chain(scip_sym) {
+        id.push_str("::");
+        id.push_str(&owner);
+    }
+    id.push_str("::");
+    id.push_str(name);
+    id
+}
+
+/// `id` without a trailing `#<digits>` ordinal.
+fn without_ordinal(id: &str) -> &str {
+    match id.rsplit_once('#') {
+        Some((base, n)) if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => base,
+        _ => id,
     }
 }
 
@@ -3008,15 +3202,15 @@ mod tests {
     /// both extract to the same name via `scip_sym_to_name` (e.g. `A#foo()`
     /// and `B#foo()` -- a realistic same-named-method-on-different-types
     /// collision, no existing graph state at all) must both survive as
-    /// distinct Symbol rows, ordinal-disambiguated like entities.rs's
-    /// tree-sitter path -- not silently collapse into one via the
+    /// distinct Symbol rows, each under its own owner (`A::foo`, `B::foo`)
+    /// -- not silently collapse into one via the
     /// `.first()` enrichment fallback (they used to: confirmed
     /// `symbols_added: 1, symbols_enriched: 1` and only one graph row before
     /// this fix) or via the `seen_ids` bulk-insert dedup (confirmed
     /// `symbols_added: 2` but still only one graph row, before the ordinal
     /// disambiguation half of this fix).
     #[test]
-    fn two_new_same_named_symbols_in_one_file_both_survive_with_distinct_ordinal_ids() {
+    fn two_new_same_named_symbols_in_one_file_both_survive_under_their_own_owner() {
         let env = TestEnv::new();
         env.add_file("test.ts");
         let file = "test.ts";
@@ -3063,10 +3257,10 @@ mod tests {
         assert_eq!(
             ids,
             vec![
-                ("test.ts::foo#1".to_string(), "2".to_string()),
-                ("test.ts::foo#2".to_string(), "11".to_string()),
+                ("test.ts::A::foo".to_string(), "2".to_string()),
+                ("test.ts::B::foo".to_string(), "11".to_string()),
             ],
-            "both symbols must survive as distinct, ordinal-suffixed rows sorted by span position"
+            "both symbols must survive as distinct rows, each under its own type"
         );
     }
 
@@ -3086,14 +3280,14 @@ mod tests {
         env.add_file("test.ts");
         let conn = env.store.connection().unwrap();
         conn.query(
-            "CREATE (:Symbol {id: 'test.ts::foo#1', name: 'foo', kind: 'method', \
+            "CREATE (:Symbol {id: 'test.ts::C::foo#1', name: 'foo', kind: 'method', \
              file: 'test.ts', start_line: 1, end_line: 5, signature_hash: '', \
              language: 'typescript', visibility: 'public', parent: '', \
              docstring: '', complexity: 0, parameters: '', return_type: ''})",
         )
         .unwrap();
         conn.query(
-            "CREATE (:Symbol {id: 'test.ts::foo#2', name: 'foo', kind: 'method', \
+            "CREATE (:Symbol {id: 'test.ts::C::foo#2', name: 'foo', kind: 'method', \
              file: 'test.ts', start_line: 10, end_line: 15, signature_hash: '', \
              language: 'typescript', visibility: 'public', parent: '', \
              docstring: '', complexity: 0, parameters: '', return_type: ''})",
@@ -3138,9 +3332,9 @@ mod tests {
         assert_eq!(
             ids,
             vec![
-                "test.ts::foo#1".to_string(),
-                "test.ts::foo#2".to_string(),
-                "test.ts::foo#3".to_string(),
+                "test.ts::C::foo#1".to_string(),
+                "test.ts::C::foo#2".to_string(),
+                "test.ts::C::foo#3".to_string(),
             ],
             "the new symbol must continue the ordinal sequence, not collide with either \
              pre-existing row"
@@ -3427,6 +3621,180 @@ mod tests {
         assert_eq!(discard_if_rejected(&good), None);
         assert!(good.exists(), "a good output must survive for adoption");
         assert_eq!(discard_if_rejected(&missing), None);
+    }
+
+    // ---- owner-qualified ids for symbols only SCIP knows ----
+
+    const TS: &str = "scip-typescript npm test 1.0.0 ";
+
+    #[test]
+    fn the_owner_chain_is_the_types_and_terms_before_the_last_descriptor() {
+        for (moniker, want) in [
+            ("`test.ts`/View#filter().", vec!["View"]),
+            (
+                "src/`test.ts`/AssembledNodeBase#userFacing.",
+                vec!["AssembledNodeBase"],
+            ),
+            // a type literal's counter is replaced by the member path
+            (
+                "src/`test.ts`/StringIndexRange#start.typeLiteral1:index.",
+                vec!["StringIndexRange", "start"],
+            ),
+            ("src/`test.ts`/helper().", vec![]),
+            ("src/`test.ts`/Thing#", vec![]),
+            // an object-literal member's moniker has no owner at all
+            ("src/`test.ts`/ignorePatterns0:", vec![]),
+            // a parameter or a type parameter is no one's member
+            ("src/`test.ts`/f().(x)", vec![]),
+            ("src/`test.ts`/Box#[T]", vec![]),
+        ] {
+            let sym = format!("{TS}{moniker}");
+            assert_eq!(scip_owner_chain(&sym), want, "{sym}");
+        }
+        // other indexers: a module path is no owner; rust-analyzer's impl
+        // block is owned by its type
+        assert_eq!(
+            scip_owner_chain("rust-analyzer cargo sittir-scm 0.0.0 render/node/AnyNode#Program#"),
+            vec!["AnyNode"]
+        );
+        assert_eq!(
+            scip_owner_chain("rust-analyzer cargo krate 0.0.0 impl#[`Foo`]bar()."),
+            vec!["Foo"]
+        );
+        // a package name with a space (doubled) does not shift the fields
+        assert_eq!(
+            scip_owner_chain("scip-x npm my  pkg 1.0.0 `a.ts`/A#m()."),
+            vec!["A"]
+        );
+        // not a SCIP symbol: no owner, the old id
+        assert!(scip_owner_chain("garbage").is_empty());
+    }
+
+    fn import_defs(env: &TestEnv, file: &str, defs: &[(&str, i32)]) -> ImportStats {
+        let doc = Document {
+            relative_path: file.to_string(),
+            occurrences: defs
+                .iter()
+                .map(|(sym, line)| Occurrence {
+                    range: vec![*line, 0, *line, 3],
+                    symbol: sym.to_string(),
+                    symbol_roles: SymbolRole::Definition as i32,
+                    ..Default::default()
+                })
+                .collect(),
+            symbols: defs
+                .iter()
+                .map(|(sym, _)| SymbolInformation {
+                    symbol: sym.to_string(),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let index = Index {
+            documents: vec![doc],
+            ..Default::default()
+        };
+        let index_path = env._dir.path().join("index.scip");
+        std::fs::write(&index_path, index.write_to_bytes().unwrap()).unwrap();
+        import_scip_index(&index_path, &env.store, None).unwrap()
+    }
+
+    fn ids_in_line_order(env: &TestEnv) -> Vec<String> {
+        env.store
+            .connection()
+            .unwrap()
+            .query("MATCH (s:Symbol) RETURN s.id ORDER BY s.start_line")
+            .unwrap()
+            .map(|row| row[0].to_string().trim_matches('"').to_string())
+            .collect()
+    }
+
+    #[test]
+    fn a_new_member_of_a_type_is_named_under_its_type() {
+        let env = TestEnv::new();
+        env.add_file("src/t.ts");
+        let user_facing = format!("{TS}src/`t.ts`/AssembledNodeBase#userFacing.");
+        let nested = format!("{TS}src/`t.ts`/Range#start.typeLiteral1:index.");
+        let top = format!("{TS}src/`t.ts`/helper().");
+        import_defs(
+            &env,
+            "src/t.ts",
+            &[(&user_facing, 1), (&nested, 5), (&top, 9)],
+        );
+        assert_eq!(
+            ids_in_line_order(&env),
+            vec![
+                "src/t.ts::AssembledNodeBase::userFacing",
+                "src/t.ts::Range::start::index",
+                "src/t.ts::helper",
+            ]
+        );
+    }
+
+    #[test]
+    fn overloads_of_one_member_keep_an_ordinal_and_other_owners_do_not_need_one() {
+        let env = TestEnv::new();
+        env.add_file("t.ts");
+        let filter = format!("{TS}`t.ts`/View#filter().");
+        let other = format!("{TS}`t.ts`/Other#filter().");
+        // one moniker defined at two spans: the real overload case
+        import_defs(&env, "t.ts", &[(&filter, 1), (&filter, 4), (&other, 8)]);
+        assert_eq!(
+            ids_in_line_order(&env),
+            vec![
+                "t.ts::View::filter#1",
+                "t.ts::View::filter#2",
+                "t.ts::Other::filter"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_new_member_never_takes_the_id_of_a_row_already_in_the_graph() {
+        let env = TestEnv::new();
+        env.add_file("t.ts");
+        let conn = env.store.connection().unwrap();
+        // tree-sitter's own row for A.foo, and an owner-less foo, both far from line 20
+        for (id, line) in [("t.ts::A::foo", 1), ("t.ts::foo", 5)] {
+            conn.query(&format!(
+                "CREATE (:Symbol {{id: '{id}', name: 'foo', kind: 'method', file: 't.ts', \
+                 start_line: {line}, end_line: {line}, signature_hash: '', language: 'typescript', \
+                 visibility: 'public', parent: '', docstring: '', complexity: 0, parameters: '', \
+                 return_type: ''}})"
+            ))
+            .unwrap();
+        }
+        let second_a = format!("{TS}`t.ts`/A#foo().");
+        let b = format!("{TS}`t.ts`/B#foo().");
+        // two candidates for (t.ts, foo): the import cannot guess, so both
+        // definitions are new, and neither may collide
+        import_defs(&env, "t.ts", &[(&second_a, 20), (&b, 30)]);
+        let ids = ids_in_line_order(&env);
+        let unique: std::collections::HashSet<_> = ids.iter().collect();
+        assert_eq!(unique.len(), ids.len(), "{ids:?}");
+        assert!(ids.contains(&"t.ts::A::foo".to_string()), "kept: {ids:?}");
+        assert!(
+            ids.contains(&"t.ts::A::foo#2".to_string()),
+            "continued: {ids:?}"
+        );
+        assert!(
+            ids.contains(&"t.ts::B::foo".to_string()),
+            "no ordinal needed: {ids:?}"
+        );
+    }
+
+    #[test]
+    fn importing_again_adds_nothing_and_matches_every_row_it_made() {
+        let env = TestEnv::new();
+        env.add_file("t.ts");
+        let a = format!("{TS}`t.ts`/A#m.");
+        let b = format!("{TS}`t.ts`/B#m.");
+        let first = import_defs(&env, "t.ts", &[(&a, 1), (&b, 5)]);
+        assert_eq!(first.symbols_added, 2);
+        let again = import_defs(&env, "t.ts", &[(&a, 1), (&b, 5)]);
+        assert_eq!(again.symbols_added, 0, "matched rows stay matched");
+        assert_eq!(ids_in_line_order(&env), vec!["t.ts::A::m", "t.ts::B::m"]);
     }
 }
 
