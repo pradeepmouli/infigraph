@@ -874,9 +874,19 @@ pub fn update_embeddings_with(
     make_embedder: &dyn Fn() -> Box<dyn EmbedProvider>,
 ) -> Result<usize> {
     let run = crate::last_run::begin(crate::last_run::Kind::Embeddings);
+    let mut clock = crate::phase_clock::PhaseClock::start();
     let result = update_embeddings_inner(backend, root, changed_files, make_embedder);
+    clock.lap("embeddings.bin");
     if result.is_ok() {
         crate::clone_detect::build::record_update(backend, root, changed_files, make_embedder);
+        clock.lap("clone-bodies.bin");
+    }
+    if let Ok(n) = &result {
+        eprintln!(
+            "[embeddings] updated ({n} on disk, {} file(s) in scope): {}",
+            changed_files.len(),
+            clock.report()
+        );
     }
     // #209: what this update lost, or why it failed, where `doctor` can see
     // it -- these used to reach only the log of whichever process ran it.
@@ -918,6 +928,8 @@ fn update_embeddings_inner(
 
     let rows = backend.raw_query("MATCH (s:Symbol) RETURN s.id, s.name, s.kind, s.file, s.docstring, s.language, s.parameters, s.return_type")?;
 
+    let mut clock = crate::phase_clock::PhaseClock::start();
+    clock.lap("symbol scan");
     let emb_path = root.join(".infigraph").join("embeddings.bin");
     // id -> (vector, input_hash); hash 0 = unknown (legacy/v2 files).
     let mut existing: std::collections::HashMap<String, (Vec<f32>, u64)> =
@@ -927,6 +939,7 @@ fn update_embeddings_inner(
             .map(|(id, v, h)| (id, (v, h)))
             .collect();
 
+    clock.lap("load vectors");
     let changed_set: std::collections::HashSet<&str> = changed_files.iter().copied().collect();
 
     // Early cutoff: a symbol in scope only re-embeds when its input text hash
@@ -955,6 +968,8 @@ fn update_embeddings_inner(
         }
     }
 
+    clock.lap("hash inputs");
+    let to_embed_len = to_embed.len();
     let mut embedded = 0usize;
     let mut embedder_name: Option<&'static str> = None;
     if !to_embed.is_empty() {
@@ -1001,6 +1016,7 @@ fn update_embeddings_inner(
         }
     }
 
+    clock.lap("embed");
     let all_ids: std::collections::HashSet<String> = rows.iter().map(|r| r[0].clone()).collect();
     let before_prune = existing.len();
     existing.retain(|id, _| all_ids.contains(id));
@@ -1016,6 +1032,7 @@ fn update_embeddings_inner(
     // the marker then stays where it was: moving it would call embeddings
     // fresh that were not updated.
     let reflects_generation = embedded == to_embed.len();
+    clock.lap("prune");
 
     if embedded == 0 && pruned == 0 {
         // The file is untouched. If that is because nothing needed
@@ -1056,6 +1073,11 @@ fn update_embeddings_inner(
 
     let hnsw_path = root.join(".infigraph").join("hnsw_index.usearch");
     sync_hnsw_index(&symbol_embeddings, &hnsw_path, &emb_path, HNSW_THRESHOLD);
+    clock.lap("write+hnsw");
+    eprintln!(
+        "[embeddings] {embedded} of {to_embed_len} in scope re-embedded, {pruned} pruned: {}",
+        clock.report()
+    );
 
     Ok(count)
 }

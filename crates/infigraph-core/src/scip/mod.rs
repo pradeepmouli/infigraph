@@ -48,6 +48,18 @@ type NewSymbolRow = (String, String, String, String, u32, u32, String, String);
 /// seen twice (same id, moniker and line), counted in the third return value.
 /// Returns the rows to write, `(moniker, new id)` for each renamed row so
 /// references follow it, and how many exact duplicates were dropped.
+/// What the import needs to know of a symbol already in the graph, besides
+/// where it is: what it is enriched with (see `enrichment_hash`), the moniker
+/// it was enriched with (to tell a literal member's row from its same-line
+/// siblings, whose monikers differ and names do not) and its kind (a literal
+/// member's tree-sitter row is a method, never the function or class that
+/// merely contains its key).
+struct ExistingSymbol {
+    enrichment: u64,
+    scip_id: String,
+    kind: String,
+}
+
 fn make_ids_unique(
     rows: Vec<NewSymbolRow>,
     existing: &std::collections::HashSet<String>,
@@ -498,6 +510,7 @@ fn import_scip_index_unrecorded(
     project_root: Option<&Path>,
     enriched_ast_generation: Option<i64>,
 ) -> Result<ImportStats> {
+    let mut clock = crate::phase_clock::PhaseClock::start();
     let bytes = std::fs::read(index_path)
         .with_context(|| format!("failed to read {}", index_path.display()))?;
 
@@ -510,6 +523,7 @@ fn import_scip_index_unrecorded(
     // its strings, and the raw file is a second copy of it.
     let byte_len = bytes.len() as u64;
     drop(bytes);
+    clock.lap("read+parse");
 
     let mut stats = ImportStats::default();
     let _lock = store.write_lock()?;
@@ -541,6 +555,7 @@ fn import_scip_index_unrecorded(
     // propagate.
     let existing_calls = preload_symbol_edges(&conn, "CALLS")?;
     let existing_inherits = preload_symbol_edges(&conn, "INHERITS")?;
+    clock.lap("lock+preload edges");
 
     // Pre-load all symbols from graph into memory: (file, name) -> Vec<(start_line,
     // end_line, symbol_id)> -- carries each candidate's span so Pass 1 can pick the
@@ -575,26 +590,22 @@ fn import_scip_index_unrecorded(
     // import is reading anyway -- see `make_ids_unique` (#153).
     let mut existing_symbol_ids: std::collections::HashSet<String> =
         std::collections::HashSet::new();
-    // What each symbol is already enriched with -- see `enrichment_hash`.
-    let mut existing_enrichment: HashMap<String, u64> = HashMap::new();
-    // id -> the moniker it was enriched with, to tell a literal member's row
-    // from its same-line siblings (their monikers differ, their names do not).
-    let mut existing_scip_ids: HashMap<String, String> = HashMap::new();
-    // id -> kind: a literal member's tree-sitter row is a method, never the
-    // function or class that merely contains its key.
-    let mut existing_kinds: HashMap<String, String> = HashMap::new();
+    // What each symbol already is, by id: one map, one copy of each id.
+    let mut existing: HashMap<String, ExistingSymbol> = HashMap::new();
     for row in rows {
         if row.len() < 8 {
             continue;
         }
         let sid = raw_string(&row[0]).to_string();
         existing_symbol_ids.insert(sid.clone());
-        existing_enrichment.insert(
+        existing.insert(
             sid.clone(),
-            enrichment_hash(raw_string(&row[5]), raw_string(&row[6])),
+            ExistingSymbol {
+                enrichment: enrichment_hash(raw_string(&row[5]), raw_string(&row[6])),
+                scip_id: raw_string(&row[6]).to_string(),
+                kind: raw_string(&row[7]).to_string(),
+            },
         );
-        existing_scip_ids.insert(sid.clone(), raw_string(&row[6]).to_string());
-        existing_kinds.insert(sid.clone(), raw_string(&row[7]).to_string());
         let sfile = raw_string(&row[1]).to_string();
         let sname = raw_string(&row[2]).to_string();
         let sstart: u32 = row[3].to_string().trim_matches('"').parse().unwrap_or(0);
@@ -615,6 +626,7 @@ fn import_scip_index_unrecorded(
     for syms in file_symbols.values_mut() {
         syms.sort_by_key(|(s, e, _)| *e as i64 - *s as i64);
     }
+    clock.lap("preload symbols");
 
     // #114: only documents whose file the graph already knows are imported.
     // The File set IS the ignore filter (the AST index applied
@@ -634,6 +646,7 @@ fn import_scip_index_unrecorded(
         .documents
         .iter()
         .partition(|d| known_files.contains(&d.relative_path));
+    clock.lap("preload files");
     stats.files_skipped = skipped.len();
     // Not filtered down to "only files that actually changed" -- SCIP
     // analyzed all of these, so treating the whole imported set as touched
@@ -662,7 +675,11 @@ fn import_scip_index_unrecorded(
     // "enrichment" instead of becoming its own symbol -- confirmed via
     // `probe_two_new_same_named_symbols_one_file`: two distinct new SCIP
     // symbols collapsed into one Symbol row with zero warning.
-    let preexisting_file_name_to_ids = file_name_to_ids.clone();
+    // `file_name_to_ids` is never added to from here on; the symbols this pass
+    // makes go into `made_name_to_ids`, so there is no second copy of the
+    // preloaded map to take the snapshot from (#150: it held a clone of every
+    // symbol's key and id for the whole import).
+    let mut made_name_to_ids: NameCandidates = HashMap::new();
 
     // Build SCIP symbol -> definition file mapping (cross-file resolution)
     let mut scip_sym_to_file_name: HashMap<String, (String, String)> = HashMap::new();
@@ -679,6 +696,8 @@ fn import_scip_index_unrecorded(
             scip_sym_to_file_name.insert(occ.symbol.clone(), (file.clone(), name));
         }
     }
+
+    clock.lap("moniker map");
 
     // Pass 1: collect enrichments and new symbols in memory
     //
@@ -781,11 +800,6 @@ fn import_scip_index_unrecorded(
             // Nor does it match a symbol THIS import just made: generated
             // one-line records repeat a key in sibling literals on one line,
             // and the second would merge into the first (889 sittir rows).
-            let candidates = if literal.is_some() {
-                &preexisting_file_name_to_ids
-            } else {
-                &file_name_to_ids
-            };
             // The id a literal member's own tree-sitter row would carry: the
             // best of several same-line candidates.
             let own_id = literal
@@ -803,7 +817,10 @@ fn import_scip_index_unrecorded(
                 {
                     return None;
                 }
-                let moniker = existing_scip_ids.get(id).filter(|m| !m.is_empty());
+                let moniker = existing
+                    .get(id)
+                    .map(|e| &e.scip_id)
+                    .filter(|m| !m.is_empty());
                 let taken = enriched_in_pass
                     .get(&(id.clone(), s))
                     .is_some_and(|m| m != scip_sym);
@@ -817,7 +834,7 @@ fn import_scip_index_unrecorded(
                     return match moniker {
                         Some(moniker) => (moniker == scip_sym).then_some(0),
                         None => (span.start_line == s
-                            && existing_kinds.get(id).is_some_and(|k| k == "method"))
+                            && existing.get(id).is_some_and(|e| e.kind == "method"))
                         .then_some(if Some(id) == own_id.as_ref() { 1 } else { 2 }),
                     };
                 }
@@ -834,20 +851,25 @@ fn import_scip_index_unrecorded(
                     Some(_) => 2,
                 })
             };
-            let matched = candidates
+            // The preloaded candidates, then (never for a literal member) the
+            // ones this pass made, in the order they were found.
+            let matched = file_name_to_ids
                 .get(&key)
-                .and_then(|candidates| {
-                    candidates
-                        .iter()
-                        .filter_map(|(s, e, id)| rank(*s, *e, id).map(|r| (r, *s, id)))
-                        .min_by_key(|(r, ..)| *r)
-                        .map(|(_, s, id)| (s, id.clone()))
+                .into_iter()
+                .chain(if literal.is_some() {
+                    None
+                } else {
+                    made_name_to_ids.get(&key)
                 })
+                .flatten()
+                .filter_map(|(s, e, id)| rank(*s, *e, id).map(|r| (r, *s, id)))
+                .min_by_key(|(r, ..)| *r)
+                .map(|(_, s, id)| (s, id.clone()))
                 .or_else(|| {
                     if literal.is_some() {
                         return None;
                     }
-                    preexisting_file_name_to_ids.get(&key).and_then(|c| {
+                    file_name_to_ids.get(&key).and_then(|c| {
                         if c.len() == 1 {
                             c.first().map(|(s, _, id)| (*s, id.clone()))
                         } else {
@@ -858,7 +880,9 @@ fn import_scip_index_unrecorded(
 
             if let Some((matched_start, sid)) = matched {
                 enriched_in_pass.insert((sid.clone(), matched_start), scip_sym.clone());
-                if existing_enrichment.get(&sid) != Some(&enrichment_hash(docstring, scip_sym)) {
+                if existing.get(&sid).map(|e| e.enrichment)
+                    != Some(enrichment_hash(docstring, scip_sym))
+                {
                     enrichments.push((sid.clone(), docstring.to_string(), scip_sym.clone()));
                     stats.symbols_enriched += 1;
                 }
@@ -884,7 +908,7 @@ fn import_scip_index_unrecorded(
                 stats.symbols_added += 1;
                 made_in_pass.insert((sym_id.clone(), span.start_line), scip_sym.clone());
                 scip_sym_to_ts_id.insert(scip_sym.clone(), sym_id.clone());
-                file_name_to_ids.entry(key).or_default().push((
+                made_name_to_ids.entry(key).or_default().push((
                     span.start_line,
                     span.end_line,
                     sym_id.clone(),
@@ -949,6 +973,8 @@ fn import_scip_index_unrecorded(
             }
         }
     }
+
+    clock.lap("pass 1 collect");
 
     // Bulk insert new SCIP symbols via Parquet COPY FROM. Genuinely distinct
     // same-named symbols are disambiguated above, and `make_ids_unique` has
@@ -1191,6 +1217,8 @@ fn import_scip_index_unrecorded(
         ));
     }
 
+    clock.lap("symbol COPY+enrich");
+
     // Pass 2: build CALLS edges from references (all in-memory)
     let mut calls_to_create: Vec<(String, String)> = Vec::new();
     let mut seen_edges: std::collections::HashSet<(String, String)> =
@@ -1345,6 +1373,8 @@ fn import_scip_index_unrecorded(
         )?;
     }
 
+    clock.lap("passes 2+3 edges");
+
     // Persist learned corrections (if any were recorded)
     if let Some(root) = project_root {
         if stats.corrections_learned > 0 {
@@ -1362,6 +1392,8 @@ fn import_scip_index_unrecorded(
     if let Some(dir) = store.db_dir() {
         crate::graph::store_util::stamp_healthy_graph_size_if_unset(dir, &dir.join("graph"));
     }
+    clock.lap("stamp");
+    eprintln!("[scip-import] phases: {}", clock.report());
 
     Ok(stats)
 }

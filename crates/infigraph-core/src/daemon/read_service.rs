@@ -371,7 +371,19 @@ fn serve_one(
     // connection + stringify: `raw_query_on` already returns
     // `Vec<Vec<String>>` -- the exact wire shape -- and already handles bare
     // BEGIN/COMMIT/ROLLBACK, which a hand-rolled path here would drop.
-    match crate::graph::raw_query_on(store, &req.query) {
+    let slow = crate::phase_clock::SlowOp::start(|| {
+        format!(
+            "read query `{}`",
+            req.query
+                .chars()
+                .take(80)
+                .collect::<String>()
+                .replace('\n', " ")
+        )
+    });
+    let rows = crate::graph::raw_query_on(store, &req.query);
+    drop(slow);
+    match rows {
         Ok(rows) => {
             for chunk in rows.chunks(req.chunk_size.max(1)) {
                 write_frame(&mut stream, &ReadFrame::Rows(chunk.to_vec()))?;
