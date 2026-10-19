@@ -973,6 +973,8 @@ fn update_embeddings_inner(
 
     clock.lap("hash inputs");
     let mut embedded = 0usize;
+    // The vectors written this run, for patching the HNSW index in place.
+    let mut upserted: Vec<(String, Vec<f32>)> = Vec::new();
     let mut embedder_name: Option<&'static str> = None;
     if !to_embed.is_empty() {
         let embedder: Arc<Box<dyn EmbedProvider>> = Arc::new(make_embedder());
@@ -1001,6 +1003,7 @@ fn update_embeddings_inner(
             .collect();
         for batch in results {
             for (id, v, h) in batch {
+                upserted.push((id.clone(), v.clone()));
                 existing.insert(id, (v, h));
                 embedded += 1;
             }
@@ -1020,6 +1023,11 @@ fn update_embeddings_inner(
 
     clock.lap("embed");
     let all_ids: std::collections::HashSet<String> = rows.iter().map(|r| r[0].clone()).collect();
+    let removed: Vec<String> = existing
+        .keys()
+        .filter(|id| !all_ids.contains(*id))
+        .cloned()
+        .collect();
     let before_prune = existing.len();
     existing.retain(|id, _| all_ids.contains(id));
     let pruned = before_prune - existing.len();
@@ -1050,6 +1058,7 @@ fn update_embeddings_inner(
         .into_iter()
         .map(|(id, (v, h))| (id, v, h))
         .collect();
+    let prior_stamp = EmbStamp::of(&emb_path);
     save_embeddings_hashed(&emb_path, &entries)?;
     // R3.3.3: record which graph generation this embeddings.bin now
     // reflects, so a stale copy can be detected on load rather than served.
@@ -1074,7 +1083,17 @@ fn update_embeddings_inner(
         .collect();
 
     let hnsw_path = root.join(".infigraph").join("hnsw_index.usearch");
-    sync_hnsw_index(&symbol_embeddings, &hnsw_path, &emb_path, HNSW_THRESHOLD);
+    sync_hnsw_index_delta(
+        &symbol_embeddings,
+        &HnswDelta {
+            upserted: &upserted,
+            removed: &removed,
+        },
+        prior_stamp,
+        &hnsw_path,
+        &emb_path,
+        HNSW_THRESHOLD,
+    );
     clock.lap("write+hnsw");
 
     Ok(count)
@@ -1227,15 +1246,39 @@ pub fn build_hnsw_index(
     index_path: &Path,
     embeddings_path: &Path,
 ) -> Result<usize> {
+    build_hnsw_index_with(
+        embeddings,
+        index_path,
+        embeddings_path,
+        hnsw_build_threads(),
+    )
+}
+
+/// Threads an HNSW build may use: this process's budget (`pools`), so the
+/// daemon's rewrite takes its few threads instead of every core; a foreground
+/// command (budget 0 = unbounded) keeps every core.
+fn hnsw_build_threads() -> usize {
+    match crate::pools::max_threads() {
+        0 => std::thread::available_parallelism().map_or(4, |t| t.get()),
+        n => n,
+    }
+}
+
+/// [`build_hnsw_index`] on exactly `threads` threads (measured by `search_perf`).
+#[doc(hidden)]
+pub fn build_hnsw_index_with(
+    embeddings: &[(String, Vec<f32>)],
+    index_path: &Path,
+    embeddings_path: &Path,
+    threads: usize,
+) -> Result<usize> {
     if embeddings.is_empty() {
         return Ok(0);
     }
 
     let dim = embeddings[0].1.len();
     let n = embeddings.len();
-    let threads = std::thread::available_parallelism()
-        .map(|t| t.get())
-        .unwrap_or(4);
+    let threads = threads.max(1);
 
     let index =
         UsearchIndex::new(&hnsw_opts(dim)).map_err(|e| anyhow::anyhow!("usearch create: {e}"))?;
@@ -1270,7 +1313,13 @@ pub fn build_hnsw_index(
         .and_then(|m| m.modified())
         .unwrap_or(std::time::UNIX_EPOCH);
     let sidecar_path = index_path.with_extension("meta");
-    write_binary_sidecar(&sidecar_path, emb_mtime, n, dim, embeddings)?;
+    write_binary_sidecar(
+        &sidecar_path,
+        emb_mtime,
+        EmbStamp::of(embeddings_path),
+        dim,
+        embeddings,
+    )?;
 
     invalidate_hnsw_cache();
     Ok(n)
@@ -1288,14 +1337,175 @@ pub fn sync_hnsw_index(
     embeddings_path: &Path,
     threshold: usize,
 ) {
+    sync_hnsw(embeddings, None, index_path, embeddings_path, threshold);
+}
+
+/// What an update changed since the index on disk was written.
+pub struct HnswDelta<'a> {
+    /// Vectors that are new or replaced.
+    pub upserted: &'a [(String, Vec<f32>)],
+    /// Ids that are gone.
+    pub removed: &'a [String],
+}
+
+/// What a sync did to the on-disk index.
+#[derive(Debug, PartialEq, Eq)]
+pub enum HnswSync {
+    Removed,
+    Rebuilt,
+    Updated,
+}
+
+/// Changes (or holes) beyond 1/this of the live vectors make a full rebuild
+/// cheaper than patching, and bound how far a patched graph drifts from a
+/// fresh one.
+const HNSW_PATCH_LIMIT_DIVISOR: usize = 10;
+
+/// [`sync_hnsw_index`] for an update whose changes are known: when the index
+/// on disk reflects the `embeddings.bin` stamped `prior`
+/// and little changed, the changed keys are removed and added in place (one
+/// edited file costs milliseconds of graph work, not a rebuild of every
+/// vector); otherwise it rebuilds, as `sync_hnsw_index` does.
+pub fn sync_hnsw_index_delta(
+    embeddings: &[(String, Vec<f32>)],
+    delta: &HnswDelta,
+    prior: EmbStamp,
+    index_path: &Path,
+    embeddings_path: &Path,
+    threshold: usize,
+) -> HnswSync {
+    sync_hnsw(
+        embeddings,
+        Some((delta, prior)),
+        index_path,
+        embeddings_path,
+        threshold,
+    )
+}
+
+fn sync_hnsw(
+    embeddings: &[(String, Vec<f32>)],
+    delta: Option<(&HnswDelta, EmbStamp)>,
+    index_path: &Path,
+    embeddings_path: &Path,
+    threshold: usize,
+) -> HnswSync {
     invalidate_hnsw_cache();
     if embeddings.len() < threshold {
         let _ = std::fs::remove_file(index_path.with_extension("meta"));
         let _ = std::fs::remove_file(index_path);
-    } else if let Err(e) = build_hnsw_index(embeddings, index_path, embeddings_path) {
+        return HnswSync::Removed;
+    }
+    if let Some((delta, prior)) = delta {
+        match patch_hnsw_index(embeddings.len(), delta, prior, index_path, embeddings_path) {
+            Ok(true) => return HnswSync::Updated,
+            Ok(false) => {}
+            Err(e) => eprintln!("warning: HNSW index patch failed ({e:#}), rebuilding it"),
+        }
+    }
+    if let Err(e) = build_hnsw_index(embeddings, index_path, embeddings_path) {
         eprintln!("warning: HNSW index build failed ({e}), vector search will use brute-force");
         crate::last_run::note("HNSW index not built", 1, &format!("{e:#}"));
     }
+    HnswSync::Rebuilt
+}
+
+/// Applies `delta` to the index on disk. `Ok(false)` means "not patchable,
+/// rebuild": no index, one that does not reflect the previous
+/// `embeddings.bin`, a different dimension, too many changes or holes, or
+/// live ids that do not add up to `live_after` (so the sidecar and the new
+/// embeddings disagree about what changed).
+///
+/// Keys are positions in the sidecar's id list. A removed or replaced id
+/// leaves an empty hole at its key and an added one takes the next key, so
+/// nothing already stored moves.
+fn patch_hnsw_index(
+    live_after: usize,
+    delta: &HnswDelta,
+    prior: EmbStamp,
+    index_path: &Path,
+    embeddings_path: &Path,
+) -> Result<bool> {
+    let meta_path = index_path.with_extension("meta");
+    if !index_path.exists() {
+        return Ok(false);
+    }
+    let sidecar = read_sidecar(&std::fs::read(&meta_path).context("read hnsw sidecar")?)?;
+    if sidecar.stamp != Some(prior) {
+        return Ok(false);
+    }
+    let dim = sidecar.dim;
+    let mut ids = sidecar.ids;
+    let mut key_of: std::collections::HashMap<String, usize> = ids
+        .iter()
+        .enumerate()
+        .filter(|(_, id)| !id.is_empty())
+        .map(|(key, id)| (id.clone(), key))
+        .collect();
+    let changes = delta.upserted.len() + delta.removed.len();
+    if delta.upserted.iter().any(|(_, v)| v.len() != dim)
+        || changes * HNSW_PATCH_LIMIT_DIVISOR > key_of.len()
+    {
+        return Ok(false);
+    }
+
+    let index = UsearchIndex::new(&hnsw_opts(dim)).map_err(|e| anyhow::anyhow!("usearch: {e}"))?;
+    let path_str = index_path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("non-utf8 index path"))?;
+    index
+        .load(path_str)
+        .map_err(|e| anyhow::anyhow!("usearch load: {e}"))?;
+    index
+        .reserve(index.size() + delta.upserted.len())
+        .map_err(|e| anyhow::anyhow!("usearch reserve: {e}"))?;
+
+    let mut drop_key = |id: &str, ids: &mut Vec<String>| -> Result<()> {
+        if let Some(key) = key_of.remove(id) {
+            index
+                .remove(key as u64)
+                .map_err(|e| anyhow::anyhow!("usearch remove: {e}"))?;
+            ids[key].clear();
+        }
+        Ok(())
+    };
+    for id in delta.removed {
+        drop_key(id, &mut ids)?;
+    }
+    let mut added: Vec<(usize, &str)> = Vec::with_capacity(delta.upserted.len());
+    for (id, vector) in delta.upserted {
+        drop_key(id, &mut ids)?;
+        let key = ids.len();
+        ids.push(id.clone());
+        index
+            .add(key as u64, vector)
+            .map_err(|e| anyhow::anyhow!("usearch add: {e}"))?;
+        added.push((key, id));
+    }
+    for (key, id) in added {
+        key_of.insert(id.to_string(), key);
+    }
+    let holes = ids.len() - key_of.len();
+    if key_of.len() != live_after || holes * HNSW_PATCH_LIMIT_DIVISOR > key_of.len() {
+        return Ok(false);
+    }
+
+    let tmp_index_path = atomic_tmp_path(index_path);
+    let tmp_index_str = tmp_index_path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("non-utf8 temp index path"))?;
+    index
+        .save(tmp_index_str)
+        .map_err(|e| anyhow::anyhow!("usearch save: {e}"))?;
+    std::fs::rename(&tmp_index_path, index_path).context("atomically replace hnsw index file")?;
+    write_sidecar_ids(
+        &meta_path,
+        mtime_secs(embeddings_path),
+        EmbStamp::of(embeddings_path),
+        dim,
+        &ids.iter().map(String::as_str).collect::<Vec<_>>(),
+    )?;
+    Ok(true)
 }
 
 /// Invalidate the HNSW cache.
@@ -1305,10 +1515,43 @@ pub fn invalidate_hnsw_cache() {
     }
 }
 
+/// Which `embeddings.bin` an index reflects, finer than the whole seconds
+/// the freshness predicate compares: two writes inside one second (or a
+/// crash between a write and the index patch that follows it) must not read
+/// as the same file, because a patch applied to an index that missed a write
+/// would keep the miss forever.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EmbStamp {
+    nanos: u64,
+    len: u64,
+    /// The graph generation `embeddings.bin.generation` records (0 = none).
+    /// Not a per-write counter -- it holds still across writes within one
+    /// generation and is not written for an unknown one -- so it narrows the
+    /// identity (a restored or copied file from another generation differs)
+    /// without replacing the mtime and size.
+    generation: i64,
+}
+
+impl EmbStamp {
+    /// The stamp of the file at `path` now; an absent file stamps as nothing.
+    pub fn of(path: &Path) -> EmbStamp {
+        let meta = std::fs::metadata(path).ok();
+        EmbStamp {
+            nanos: meta
+                .as_ref()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_nanos() as u64),
+            len: meta.map_or(0, |m| m.len()),
+            generation: read_generation_marker(path).unwrap_or(0),
+        }
+    }
+}
+
 fn write_binary_sidecar(
     path: &Path,
     emb_mtime: std::time::SystemTime,
-    count: usize,
+    stamp: EmbStamp,
     dim: usize,
     embeddings: &[(String, Vec<f32>)],
 ) -> Result<()> {
@@ -1316,16 +1559,41 @@ fn write_binary_sidecar(
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let mut buf = Vec::with_capacity(1 + 4 + 4 + 8 + count * 40);
+    write_sidecar_ids(
+        path,
+        mtime_secs,
+        stamp,
+        dim,
+        &embeddings
+            .iter()
+            .map(|(id, _)| id.as_str())
+            .collect::<Vec<_>>(),
+    )
+}
+
+/// The sidecar's bytes for `ids` (position = usearch key; an empty id is a
+/// removed key's hole).
+fn write_sidecar_ids(
+    path: &Path,
+    emb_mtime_secs: u64,
+    stamp: EmbStamp,
+    dim: usize,
+    ids: &[&str],
+) -> Result<()> {
+    let mut buf = Vec::with_capacity(1 + 4 + 4 + 8 + ids.len() * 40);
     buf.push(1u8); // version
-    buf.extend_from_slice(&(count as u32).to_le_bytes());
+    buf.extend_from_slice(&(ids.len() as u32).to_le_bytes());
     buf.extend_from_slice(&(dim as u32).to_le_bytes());
-    buf.extend_from_slice(&mtime_secs.to_le_bytes());
-    for (id, _) in embeddings {
+    buf.extend_from_slice(&emb_mtime_secs.to_le_bytes());
+    for id in ids {
         let id_bytes = id.as_bytes();
         buf.extend_from_slice(&(id_bytes.len() as u32).to_le_bytes());
         buf.extend_from_slice(id_bytes);
     }
+    // After the ids, where a reader that stops at `count` ids never looks.
+    buf.extend_from_slice(&stamp.nanos.to_le_bytes());
+    buf.extend_from_slice(&stamp.len.to_le_bytes());
+    buf.extend_from_slice(&stamp.generation.to_le_bytes());
     atomic_write(path, &buf)?;
     Ok(())
 }
@@ -1385,6 +1653,8 @@ struct SidecarData {
     emb_mtime_secs: u64,
     dim: usize,
     ids: Vec<String>,
+    /// Absent in a sidecar written before the stamp existed.
+    stamp: Option<EmbStamp>,
 }
 
 fn read_sidecar(bytes: &[u8]) -> Result<SidecarData> {
@@ -1409,6 +1679,7 @@ fn read_sidecar(bytes: &[u8]) -> Result<SidecarData> {
             emb_mtime_secs: mtime,
             dim,
             ids,
+            stamp: None,
         });
     }
     // Binary format: [version:u8] [count:u32] [dim:u32] [emb_mtime_secs:u64] foreach: [id_len:u32] [id_bytes]
@@ -1434,10 +1705,16 @@ fn read_sidecar(bytes: &[u8]) -> Result<SidecarData> {
     for _ in 0..raw_count {
         ids.push(r.string_u32()?);
     }
+    let stamp = (r.remaining() >= 24).then(|| EmbStamp {
+        nanos: r.u64().unwrap_or(0),
+        len: r.u64().unwrap_or(0),
+        generation: r.u64().unwrap_or(0) as i64,
+    });
     Ok(SidecarData {
         emb_mtime_secs,
         dim,
         ids,
+        stamp,
     })
 }
 
@@ -1463,10 +1740,13 @@ fn query_index(
         .zip(results.distances.iter())
         .filter_map(|(&key, &dist)| {
             let idx = key as usize;
-            id_map.get(idx).map(|id| HnswResult {
-                id: id.clone(),
-                score: 1.0 - dist,
-            })
+            id_map
+                .get(idx)
+                .filter(|id| !id.is_empty())
+                .map(|id| HnswResult {
+                    id: id.clone(),
+                    score: 1.0 - dist,
+                })
         })
         .collect();
     Ok(out)
@@ -1720,6 +2000,298 @@ mod hnsw_freshness_tests {
                 .any(|l| l.what == "HNSW index not built"),
             "{tally:?}"
         );
+    }
+
+    // ---- patching the index in place -----------------------------------
+
+    const PATCH_THRESHOLD: usize = 3;
+
+    type Vectors = Vec<(String, Vec<f32>)>;
+
+    /// Sixty vectors, indexed and current: (project, index, embeddings, the
+    /// stamp of the embeddings.bin the index reflects).
+    fn indexed_sixty() -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        std::path::PathBuf,
+        EmbStamp,
+    ) {
+        let (d, index, emb) = project_with(60);
+        sync_hnsw_index(&vectors(60), &index, &emb, PATCH_THRESHOLD);
+        assert!(hnsw_index_current(&index, &emb));
+        let prior = EmbStamp::of(&emb);
+        (d, index, emb, prior)
+    }
+
+    fn top(index: &Path, emb: &Path, query: &[f32; 4]) -> Vec<String> {
+        search_hnsw(index, emb, query, 1)
+            .unwrap()
+            .expect("index is current")
+            .into_iter()
+            .take(1)
+            .map(|r| r.id)
+            .collect()
+    }
+
+    /// `vectors(60)` with s5 replaced, s7 gone and n1 added, saved as the new
+    /// `embeddings.bin`; returns the list and the delta's parts.
+    fn edited_sixty(emb: &Path) -> (Vectors, Vectors, Vec<String>) {
+        let upserted = vec![
+            ("s5".to_string(), vec![0.0, 0.0, 5.0, 0.0]),
+            ("n1".to_string(), vec![0.0, 0.0, 0.0, 5.0]),
+        ];
+        let mut all: Vec<(String, Vec<f32>)> = vectors(60)
+            .into_iter()
+            .filter(|(id, _)| id != "s7" && id != "s5")
+            .collect();
+        all.extend(upserted.clone());
+        save_embeddings(emb, &all).unwrap();
+        touch_forward(emb, 30);
+        (all, upserted, vec!["s7".to_string()])
+    }
+
+    #[test]
+    fn a_small_change_patches_the_index_in_place() {
+        let (_d, index, emb, prior) = indexed_sixty();
+        let (all, upserted, removed) = edited_sixty(&emb);
+        let delta = HnswDelta {
+            upserted: &upserted,
+            removed: &removed,
+        };
+        let done = sync_hnsw_index_delta(&all, &delta, prior, &index, &emb, PATCH_THRESHOLD);
+        assert_eq!(done, HnswSync::Updated, "not a rebuild");
+        assert!(hnsw_index_current(&index, &emb), "meta names the new file");
+        assert_eq!(top(&index, &emb, &[0.0, 0.0, 1.0, 0.0]), ["s5"], "replaced");
+        assert_eq!(top(&index, &emb, &[0.0, 0.0, 0.0, 1.0]), ["n1"], "added");
+        let near_s7 = search_hnsw(&index, &emb, &[8.0, 1.0, 0.0, 0.0], 5)
+            .unwrap()
+            .unwrap();
+        assert!(
+            near_s7.iter().all(|r| r.id != "s7"),
+            "a removed id is never answered: {:?}",
+            near_s7.iter().map(|r| &r.id).collect::<Vec<_>>()
+        );
+        assert!(
+            near_s7.iter().any(|r| r.id == "s6"),
+            "its neighbours remain"
+        );
+    }
+
+    #[test]
+    fn many_patches_in_a_row_stay_exact() {
+        let (_d, index, emb, mut prior) = indexed_sixty();
+        let mut all = vectors(60);
+        for round in 0..6usize {
+            let id = format!("s{}", round * 3);
+            let v = vec![0.0, 0.0, round as f32 + 2.0, 1.0];
+            all.retain(|(i, _)| *i != id);
+            all.push((id.clone(), v.clone()));
+            save_embeddings(&emb, &all).unwrap();
+            touch_forward(&emb, 30 + round as u64);
+            let upserted = vec![(id.clone(), v)];
+            let delta = HnswDelta {
+                upserted: &upserted,
+                removed: &[],
+            };
+            let done = sync_hnsw_index_delta(&all, &delta, prior, &index, &emb, PATCH_THRESHOLD);
+            assert_eq!(done, HnswSync::Updated, "round {round}");
+            prior = EmbStamp::of(&emb);
+            assert_eq!(
+                top(&index, &emb, &[0.0, 0.0, round as f32 + 2.0, 1.0]),
+                [id]
+            );
+        }
+    }
+
+    #[test]
+    fn what_cannot_be_patched_is_rebuilt() {
+        // An index that was current for some other embeddings.bin.
+        let (_d, index, emb, prior) = indexed_sixty();
+        let (all, upserted, removed) = edited_sixty(&emb);
+        let delta = HnswDelta {
+            upserted: &upserted,
+            removed: &removed,
+        };
+        assert_eq!(
+            sync_hnsw_index_delta(
+                &all,
+                &delta,
+                EmbStamp {
+                    nanos: prior.nanos + 1,
+                    ..prior
+                },
+                &index,
+                &emb,
+                PATCH_THRESHOLD
+            ),
+            HnswSync::Rebuilt,
+            "stale index"
+        );
+        assert!(hnsw_index_current(&index, &emb));
+
+        // Live ids that do not add up: the delta forgot a removal.
+        let (_d, index, emb, prior) = indexed_sixty();
+        let (all, upserted, _) = edited_sixty(&emb);
+        let delta = HnswDelta {
+            upserted: &upserted,
+            removed: &[],
+        };
+        assert_eq!(
+            sync_hnsw_index_delta(&all, &delta, prior, &index, &emb, PATCH_THRESHOLD),
+            HnswSync::Rebuilt,
+            "inconsistent delta"
+        );
+        assert_eq!(top(&index, &emb, &[0.0, 0.0, 1.0, 0.0]), ["s5"]);
+
+        // No index at all.
+        let (_d, index, emb) = project_with(60);
+        let upserted = vec![("n1".to_string(), vec![0.0, 0.0, 0.0, 5.0])];
+        let delta = HnswDelta {
+            upserted: &upserted,
+            removed: &[],
+        };
+        let mut all = vectors(60);
+        all.extend(upserted.clone());
+        save_embeddings(&emb, &all).unwrap();
+        assert_eq!(
+            sync_hnsw_index_delta(
+                &all,
+                &delta,
+                EmbStamp::of(&emb),
+                &index,
+                &emb,
+                PATCH_THRESHOLD
+            ),
+            HnswSync::Rebuilt,
+            "no index"
+        );
+        assert!(hnsw_index_current(&index, &emb));
+    }
+
+    #[test]
+    fn an_embeddings_write_the_index_never_saw_forces_a_rebuild() {
+        // A crash between writing embeddings.bin and patching the index
+        // leaves the index one write behind. The next run's "previous
+        // embeddings.bin" is that write, which the index does not reflect:
+        // patching it would keep the missed change forever. No pause between
+        // the writes, so a whole-second comparison could not tell them apart.
+        let (_d, index, emb, _) = indexed_sixty();
+        let mut lost = vectors(60);
+        lost[3].1 = vec![0.0, 9.0, 0.0, 0.0];
+        save_embeddings(&emb, &lost).unwrap();
+        let after_lost_write = EmbStamp::of(&emb);
+
+        let mut now = lost.clone();
+        now[4].1 = vec![0.0, 0.0, 9.0, 0.0];
+        save_embeddings(&emb, &now).unwrap();
+        let upserted = vec![now[4].clone()];
+        let delta = HnswDelta {
+            upserted: &upserted,
+            removed: &[],
+        };
+        assert_eq!(
+            sync_hnsw_index_delta(
+                &now,
+                &delta,
+                after_lost_write,
+                &index,
+                &emb,
+                PATCH_THRESHOLD
+            ),
+            HnswSync::Rebuilt
+        );
+        assert_eq!(
+            top(&index, &emb, &[0.0, 1.0, 0.0, 0.0]),
+            ["s3"],
+            "the missed write is in"
+        );
+    }
+
+    #[test]
+    fn a_patched_index_answers_like_a_fresh_one() {
+        let (_d, index, emb, prior) = indexed_sixty();
+        let (all, upserted, removed) = edited_sixty(&emb);
+        let delta = HnswDelta {
+            upserted: &upserted,
+            removed: &removed,
+        };
+        assert_eq!(
+            sync_hnsw_index_delta(&all, &delta, prior, &index, &emb, PATCH_THRESHOLD),
+            HnswSync::Updated
+        );
+
+        let (_fd, fresh_index, fresh_emb) = project_with(1);
+        save_embeddings(&fresh_emb, &all).unwrap();
+        build_hnsw_index(&all, &fresh_index, &fresh_emb).unwrap();
+
+        let ids = |index: &Path, emb: &Path, q: &[f32]| -> Vec<String> {
+            let mut ids: Vec<String> = search_hnsw(index, emb, q, 5)
+                .unwrap()
+                .unwrap()
+                .into_iter()
+                .map(|r| r.id)
+                .collect();
+            ids.sort();
+            ids
+        };
+        for q in [
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+            [8.0, 1.0, 0.0, 0.0],
+            [30.0, 1.0, 0.0, 0.0],
+            [1.0, 1.0, 1.0, 1.0],
+        ] {
+            assert_eq!(
+                ids(&index, &emb, &q),
+                ids(&fresh_index, &fresh_emb, &q),
+                "query {q:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_embeddings_file_from_another_graph_generation_is_not_patched() {
+        // Same mtime and size, different generation: a restore or a copy
+        // that kept the file's times but not its place in the graph's history.
+        let (_d, index, emb, prior) = indexed_sixty();
+        let (all, upserted, removed) = edited_sixty(&emb);
+        let delta = HnswDelta {
+            upserted: &upserted,
+            removed: &removed,
+        };
+        let other_generation = EmbStamp {
+            generation: prior.generation + 1,
+            ..prior
+        };
+        assert_eq!(
+            sync_hnsw_index_delta(
+                &all,
+                &delta,
+                other_generation,
+                &index,
+                &emb,
+                PATCH_THRESHOLD
+            ),
+            HnswSync::Rebuilt
+        );
+    }
+
+    #[test]
+    fn a_large_change_is_rebuilt_not_patched() {
+        let (_d, index, emb, prior) = indexed_sixty();
+        let removed: Vec<String> = (0..10).map(|i| format!("s{i}")).collect();
+        let all: Vec<(String, Vec<f32>)> = vectors(60).into_iter().skip(10).collect();
+        save_embeddings(&emb, &all).unwrap();
+        touch_forward(&emb, 30);
+        let delta = HnswDelta {
+            upserted: &[],
+            removed: &removed,
+        };
+        assert_eq!(
+            sync_hnsw_index_delta(&all, &delta, prior, &index, &emb, PATCH_THRESHOLD),
+            HnswSync::Rebuilt
+        );
+        assert!(hnsw_index_current(&index, &emb));
     }
 
     #[test]

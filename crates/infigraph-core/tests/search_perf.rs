@@ -399,3 +399,136 @@ fn bench_full_cold_start_breakdown() {
         docs_elapsed, bm25_elapsed, embedder_elapsed, load_elapsed, query_elapsed
     );
 }
+
+/// The daemon's HNSW rewrite runs on its thread budget, not on every core:
+/// prints the wall time of the same build at each width.
+#[test]
+#[ignore]
+fn bench_hnsw_rewrite_by_thread_budget() {
+    let n: usize = std::env::var("HNSW_BENCH_N")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(100_000);
+    let dim = 384;
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    let embeddings: Vec<(String, Vec<f32>)> = (0..n)
+        .map(|i| {
+            let v: Vec<f32> = (0..dim)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    (state % 2000) as f32 / 1000.0 - 1.0
+                })
+                .collect();
+            (format!("f{i}.rs::s{i}"), v)
+        })
+        .collect();
+    let dir = tempfile::TempDir::new().unwrap();
+    let emb_path = dir.path().join("embeddings.bin");
+    let hnsw_path = dir.path().join("hnsw_index.usearch");
+    embed::save_embeddings(&emb_path, &embeddings).unwrap();
+    let cores = std::thread::available_parallelism().map_or(4, |c| c.get());
+    for threads in [cores, 4, 2] {
+        let start = Instant::now();
+        embed::build_hnsw_index_with(&embeddings, &hnsw_path, &emb_path, threads).unwrap();
+        eprintln!(
+            "[perf] hnsw rewrite {n} vectors on {threads} thread(s): {:?}",
+            start.elapsed()
+        );
+    }
+}
+
+/// A one-file edit (a handful of changed vectors) against an index that is
+/// current: patched in place versus rebuilt. Prints both wall times.
+#[test]
+#[ignore]
+fn bench_hnsw_patch_versus_rebuild() {
+    let n: usize = std::env::var("HNSW_BENCH_N")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(100_000);
+    let dim = 384;
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    let mut next_vector = || -> Vec<f32> {
+        (0..dim)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state % 2000) as f32 / 1000.0 - 1.0
+            })
+            .collect()
+    };
+    let mut embeddings: Vec<(String, Vec<f32>)> = (0..n)
+        .map(|i| (format!("f{i}.rs::s{i}"), next_vector()))
+        .collect();
+    let dir = tempfile::TempDir::new().unwrap();
+    let emb_path = dir.path().join("embeddings.bin");
+    let hnsw_path = dir.path().join("hnsw_index.usearch");
+    embed::save_embeddings(&emb_path, &embeddings).unwrap();
+    let start = Instant::now();
+    embed::sync_hnsw_index(&embeddings, &hnsw_path, &emb_path, 1);
+    eprintln!("[perf] full rebuild of {n}: {:?}", start.elapsed());
+
+    for round in 0..3 {
+        let prior = embed::EmbStamp::of(&emb_path);
+        let upserted: Vec<(String, Vec<f32>)> = (0..5)
+            .map(|k| (format!("f{k}.rs::s{k}"), next_vector()))
+            .collect();
+        for (id, v) in &upserted {
+            embeddings.iter_mut().find(|(i, _)| i == id).unwrap().1 = v.clone();
+        }
+        embed::save_embeddings(&emb_path, &embeddings).unwrap();
+        let start = Instant::now();
+        let done = embed::sync_hnsw_index_delta(
+            &embeddings,
+            &embed::HnswDelta {
+                upserted: &upserted,
+                removed: &[],
+            },
+            prior,
+            &hnsw_path,
+            &emb_path,
+            1,
+        );
+        eprintln!(
+            "[perf] round {round}: 5 changed vectors of {n}: {done:?} in {:?}",
+            start.elapsed()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+    }
+
+    // Recall@10 against exact search, the patched index and a fresh rebuild
+    // of the same vectors.
+    let fresh_dir = tempfile::TempDir::new().unwrap();
+    let fresh_emb = fresh_dir.path().join("embeddings.bin");
+    let fresh_hnsw = fresh_dir.path().join("hnsw_index.usearch");
+    embed::save_embeddings(&fresh_emb, &embeddings).unwrap();
+    embed::sync_hnsw_index(&embeddings, &fresh_hnsw, &fresh_emb, 1);
+    let (mut patched_hits, mut fresh_hits, mut total) = (0usize, 0usize, 0usize);
+    for _ in 0..20 {
+        let q = next_vector();
+        let mut exact: Vec<(f32, &str)> = embeddings
+            .iter()
+            .map(|(id, v)| (v.iter().zip(&q).map(|(a, b)| a * b).sum(), id.as_str()))
+            .collect();
+        exact.sort_by(|a, b| b.0.total_cmp(&a.0));
+        let want: std::collections::HashSet<&str> = exact.iter().take(10).map(|e| e.1).collect();
+        let hits = |index: &std::path::Path, emb: &std::path::Path| {
+            embed::search_hnsw(index, emb, &q, 1)
+                .unwrap()
+                .unwrap()
+                .iter()
+                .take(10)
+                .filter(|r| want.contains(r.id.as_str()))
+                .count()
+        };
+        patched_hits += hits(&hnsw_path, &emb_path);
+        fresh_hits += hits(&fresh_hnsw, &fresh_emb);
+        total += 10;
+    }
+    eprintln!(
+        "[perf] recall@10 over 20 queries: patched {patched_hits}/{total}, fresh rebuild {fresh_hits}/{total}"
+    );
+}
