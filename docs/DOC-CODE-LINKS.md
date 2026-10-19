@@ -65,8 +65,13 @@ CommonMark would run it to the end of the file, which hides every entry below it
 from the index, `doctor` and the edit guard, so its lines are read as prose and
 `doctor` lists it (`unclosed code fence at file:line`). A page that documents
 this format with fences inside a fence ends up this way, since the first bare
-fence line closes the outer one. That is the whole format; nothing is
-configurable.
+fence line closes the outer one. The reverse mistake is a fence that does
+close, but later than its author meant (a ```` ```text ```` opener with no closer
+before the entries, closed by the next bare fence): the headings between are
+inside it and are not entries. `doctor` lists each (`file:line has the key
+heading ..., but it is inside a code fence opened at line N`) and `doc_entry`
+refuses an op on such a key with the same sentence instead of "no such entry". A fence whose info string is `markdown` or `md` shows examples on purpose and is never reported.
+That is the whole format; nothing is configurable.
 
 `<file>::module` is an entry for the file itself (`src/billing/invoice.py::module`).
 `get_doc_context` shows it as a separate block, **File-level notes**, on every

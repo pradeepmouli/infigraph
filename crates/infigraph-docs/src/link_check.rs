@@ -236,6 +236,8 @@ struct Scanned<'a> {
     near_misses: &'a [CodeLinkRow],
     /// Code fences opened and never closed.
     unclosed: &'a [CodeLinkRow],
+    /// Key headings inside a code fence (`line_end` is the fence's opener).
+    fenced: &'a [CodeLinkRow],
     /// The `documents` rows, to find a key that has more than one entry.
     documents: &'a [CodeLinkRow],
 }
@@ -272,6 +274,7 @@ fn keys_result(
     let Scanned {
         near_misses,
         unclosed,
+        fenced,
         documents,
     } = *scanned;
     let name = format!("{}: document keys", project.display());
@@ -309,6 +312,26 @@ fn keys_result(
         }
         if per_file.len() > EXAMPLES {
             note.push_str(&format!("\n    ... and {} more", per_file.len() - EXAMPLES));
+        }
+        notes.push(note);
+    }
+    if !fenced.is_empty() {
+        let mut rows: Vec<&CodeLinkRow> = fenced.iter().collect();
+        rows.sort_by(|a, b| (&a.doc_file, a.line_start).cmp(&(&b.doc_file, b.line_start)));
+        let mut note = format!(
+            "{} key heading(s) sit inside a code fence, so they are not entries",
+            rows.len()
+        );
+        for r in rows.iter().take(EXAMPLES) {
+            note.push_str(&format!(
+                "\n    {}:{} has the key heading `{}`, but it is inside a code fence opened at \
+                 line {} and closed at line {}; close or remove the opener, or make it a \
+                 ```markdown fence if the heading is an example",
+                r.doc_file, r.line_start, r.target, r.line_end, r.text
+            ));
+        }
+        if rows.len() > EXAMPLES {
+            note.push_str(&format!("\n    ... and {} more", rows.len() - EXAMPLES));
         }
         notes.push(note);
     }
@@ -475,11 +498,12 @@ pub fn check_project(root: &Path, docs_sync: bool) -> Vec<CheckResult> {
             q.code_link_rows(LinkKind::Documents)?,
             q.code_link_rows(LinkKind::NearMiss)?,
             q.code_link_rows(LinkKind::UnclosedFence)?,
+            q.code_link_rows(LinkKind::FencedKey)?,
             q.get_doc_hashes()?,
             q.code_link_scans()?,
         ))
     });
-    let (documents, near_misses, unclosed, stored, scans) = match read {
+    let (documents, near_misses, unclosed, fenced, stored, scans) = match read {
         Ok(read) => read,
         Err(e) => {
             return vec![CheckResult::warn(
@@ -511,7 +535,7 @@ pub fn check_project(root: &Path, docs_sync: bool) -> Vec<CheckResult> {
             "run `infigraph index-docs`",
         ));
     }
-    if documents.is_empty() && near_misses.is_empty() && unclosed.is_empty() {
+    if documents.is_empty() && near_misses.is_empty() && unclosed.is_empty() && fenced.is_empty() {
         return results;
     }
 
@@ -569,6 +593,7 @@ pub fn check_project(root: &Path, docs_sync: bool) -> Vec<CheckResult> {
         &Scanned {
             near_misses: &near_misses,
             unclosed: &unclosed,
+            fenced: &fenced,
             documents: &documents,
         },
     ));
@@ -699,6 +724,40 @@ mod tests {
             line_end: line,
             text: String::new(),
         }
+    }
+
+    #[test]
+    fn a_key_heading_inside_a_fence_is_listed_with_its_opener() {
+        let row = |line: usize, opener: usize| CodeLinkRow {
+            id: format!("docs/a.md#{line}"),
+            doc_file: "docs/a.md".to_string(),
+            kind: LinkKind::FencedKey,
+            target: "a.ts::one".to_string(),
+            heading: "`a.ts::one`".to_string(),
+            line_start: line,
+            line_end: opener,
+            text: "13".to_string(),
+        };
+        let rows = vec![row(6, 3), row(10, 3)];
+        let got = keys_result(
+            Path::new("/p"),
+            0,
+            &[],
+            &Scanned {
+                fenced: &rows,
+                ..Default::default()
+            },
+        );
+        assert_eq!(got.status, infigraph_core::doctor::CheckStatus::Warn);
+        assert!(
+            got.message.contains(
+                "docs/a.md:6 has the key heading `a.ts::one`, but it is inside a code fence \
+                 opened at line 3 and closed at line 13"
+            ),
+            "{}",
+            got.message
+        );
+        assert!(got.message.contains("docs/a.md:10"), "{}", got.message);
     }
 
     #[test]
