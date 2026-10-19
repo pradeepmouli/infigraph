@@ -72,9 +72,11 @@ pub fn watch_docs(
 
         match rx.recv_timeout(Duration::from_millis(500)) {
             Ok(Ok(event)) => {
-                if let Some(first) =
-                    first_warranting(&event.paths, ignore_matcher.current(Instant::now()))
-                {
+                if let Some(first) = first_warranting(
+                    &event.kind,
+                    &event.paths,
+                    ignore_matcher.current(Instant::now()),
+                ) {
                     pending = true;
                     trigger.note(first);
                 }
@@ -309,13 +311,19 @@ fn reindex_if_enabled(root: &Path, log_prefix: &str, trigger: &Trigger) -> Reind
     }
 }
 
-/// Whether any of `paths` warrants a reindex (the tests' view of [`first_warranting`]).
+/// Whether a *creation* of any of `paths` warrants a reindex (the tests' view
+/// of [`first_warranting`]; a document file warrants one whatever the kind).
 #[cfg(test)]
 pub(crate) fn paths_warrant_reindex(
     paths: &[std::path::PathBuf],
     ignore_matcher: &infigraph_core::ignore_rules::IgnoreMatcher,
 ) -> bool {
-    first_warranting(paths, ignore_matcher).is_some()
+    first_warranting(
+        &notify::EventKind::Create(notify::event::CreateKind::Any),
+        paths,
+        ignore_matcher,
+    )
+    .is_some()
 }
 
 /// Whether a watch event touching `paths` should schedule a reindex.
@@ -344,9 +352,17 @@ pub(crate) fn paths_warrant_reindex(
 /// excluded, and directory creation is far rarer than the file writes the
 /// storm guard above worries about.
 ///
+/// Only a directory *arriving* counts (`Create`, or a rename into place),
+/// never one merely changing: FSEvents reports the parent directory, and the
+/// project root, as modified whenever anything inside is written, so a
+/// generator rewriting source files (not documents) made one reindex per
+/// burst, each ending "0 files, 0 chunks (unchanged)" -- some 8,000 in a
+/// day on one worktree.
+///
 /// `skips`, not `is_ignored`: the watcher gives the answer the walk gives,
 /// hidden entries included.
 pub(crate) fn first_warranting<'a>(
+    kind: &notify::EventKind,
     paths: &'a [std::path::PathBuf],
     ignore_matcher: &infigraph_core::ignore_rules::IgnoreMatcher,
 ) -> Option<&'a std::path::PathBuf> {
@@ -355,8 +371,18 @@ pub(crate) fn first_warranting<'a>(
         if ignore_matcher.skips(p, is_dir) {
             return false;
         }
-        is_document_file(p) || is_dir
+        is_document_file(p) || (is_dir && directory_arrived(kind))
     })
+}
+
+/// Whether `kind` says a path came into being (created, or renamed in), as
+/// opposed to a path that was already there changing.
+fn directory_arrived(kind: &notify::EventKind) -> bool {
+    use notify::event::ModifyKind;
+    matches!(
+        kind,
+        notify::EventKind::Create(_) | notify::EventKind::Modify(ModifyKind::Name(_))
+    )
 }
 
 /// Doc reindexes running in this process. The daemon counts one as work in
@@ -582,6 +608,93 @@ mod tests {
             paths_warrant_reindex(&[new_dir], &ignore),
             "a new directory may already contain documents whose own events were lost"
         );
+    }
+
+    /// FSEvents reports a directory as modified whenever something inside it
+    /// is written, and the project root with it. Those are not documents and
+    /// not new directories: a generator rewriting `packages/x/src/*.ts`
+    /// caused a reindex per burst that found nothing to index.
+    #[test]
+    fn a_directory_that_merely_changed_warrants_nothing() {
+        use notify::event::{DataChange, MetadataKind, ModifyKind};
+        let tmp = tempfile::tempdir().unwrap();
+        let ignore = infigraph_core::ignore_rules::IgnoreMatcher::build(
+            tmp.path(),
+            infigraph_core::ignore_rules::Domain::Docs,
+        );
+        let pkg = tmp.path().join("packages").join("tools");
+        std::fs::create_dir_all(&pkg).unwrap();
+        for kind in [
+            notify::EventKind::Modify(ModifyKind::Data(DataChange::Any)),
+            notify::EventKind::Modify(ModifyKind::Metadata(MetadataKind::Any)),
+            notify::EventKind::Modify(ModifyKind::Any),
+            notify::EventKind::Any,
+        ] {
+            for dir in [pkg.clone(), tmp.path().to_path_buf()] {
+                assert!(
+                    first_warranting(&kind, std::slice::from_ref(&dir), &ignore).is_none(),
+                    "{kind:?} on {} must not schedule a reindex",
+                    dir.display()
+                );
+            }
+        }
+    }
+
+    /// The case the directory rule exists for: `mkdir docs/new && echo > docs/new/x.md`.
+    /// On Linux only the directory's creation may be reported (the file's
+    /// event races the watch being installed), and on macOS both are; either
+    /// event alone must schedule the reindex.
+    #[test]
+    fn a_document_created_in_a_brand_new_directory_still_schedules_a_reindex() {
+        use notify::event::{CreateKind, ModifyKind, RenameMode};
+        let tmp = tempfile::tempdir().unwrap();
+        let ignore = infigraph_core::ignore_rules::IgnoreMatcher::build(
+            tmp.path(),
+            infigraph_core::ignore_rules::Domain::Docs,
+        );
+        let dir = tmp.path().join("docs").join("new");
+        std::fs::create_dir_all(&dir).unwrap();
+        let doc = dir.join("x.md");
+        std::fs::write(&doc, "# x\n").unwrap();
+
+        let dir_created = notify::EventKind::Create(CreateKind::Folder);
+        assert!(first_warranting(&dir_created, std::slice::from_ref(&dir), &ignore).is_some());
+        let file_created = notify::EventKind::Create(CreateKind::File);
+        assert!(first_warranting(&file_created, std::slice::from_ref(&doc), &ignore).is_some());
+        // The same directory arriving by `mv`/checkout rather than `mkdir`.
+        let renamed = notify::EventKind::Modify(ModifyKind::Name(RenameMode::To));
+        assert!(first_warranting(&renamed, std::slice::from_ref(&dir), &ignore).is_some());
+    }
+
+    /// A directory renamed into place (a `git checkout`, `mv`) brings
+    /// documents with it and no event of their own.
+    #[test]
+    fn a_directory_renamed_into_place_warrants_a_reindex() {
+        use notify::event::{ModifyKind, RenameMode};
+        let tmp = tempfile::tempdir().unwrap();
+        let ignore = infigraph_core::ignore_rules::IgnoreMatcher::build(
+            tmp.path(),
+            infigraph_core::ignore_rules::Domain::Docs,
+        );
+        let dir = tmp.path().join("docs");
+        std::fs::create_dir_all(&dir).unwrap();
+        let kind = notify::EventKind::Modify(ModifyKind::Name(RenameMode::To));
+        assert!(first_warranting(&kind, &[dir], &ignore).is_some());
+    }
+
+    /// A document rewritten is still a reason, whatever the event's kind.
+    #[test]
+    fn a_document_modified_warrants_a_reindex_whatever_the_kind() {
+        use notify::event::{DataChange, ModifyKind};
+        let tmp = tempfile::tempdir().unwrap();
+        let ignore = infigraph_core::ignore_rules::IgnoreMatcher::build(
+            tmp.path(),
+            infigraph_core::ignore_rules::Domain::Docs,
+        );
+        let doc = tmp.path().join("readme.md");
+        std::fs::write(&doc, "# hi\n").unwrap();
+        let kind = notify::EventKind::Modify(ModifyKind::Data(DataChange::Any));
+        assert!(first_warranting(&kind, &[doc], &ignore).is_some());
     }
 
     #[test]
