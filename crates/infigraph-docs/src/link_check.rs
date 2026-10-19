@@ -713,6 +713,37 @@ mod tests {
         assert!(!got.message.contains("a.ts::g  ->"), "{}", got.message);
     }
 
+    #[test]
+    fn entries_with_a_label_count_toward_a_keys_duplicates() {
+        let rows: Vec<CodeLinkRow> = crate::code_links::extract_markdown(
+            "docs/a.md",
+            "## `a.ts::f`\n\nPlain.\n\n## `a.ts::f` \u{2014} watchers\n\nMore.\n\n## `a.ts::g`\n\nOnce.\n",
+        )
+        .into_iter()
+        .filter(|r| r.kind == LinkKind::Documents)
+        .collect();
+        let got = keys_result(
+            Path::new("/p"),
+            0,
+            &[],
+            &Scanned {
+                documents: &rows,
+                ..Default::default()
+            },
+        );
+        assert!(
+            got.message.contains("1 key(s) have more than one entry"),
+            "{}",
+            got.message
+        );
+        assert!(
+            got.message
+                .contains("a.ts::f  ->  docs/a.md:1, docs/a.md:5"),
+            "{}",
+            got.message
+        );
+    }
+
     fn unclosed(file: &str, line: usize) -> CodeLinkRow {
         CodeLinkRow {
             id: format!("{file}#{line}"),

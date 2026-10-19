@@ -33,6 +33,7 @@ fn pick(args: &Value) -> Pick {
     Pick {
         nth: number("nth"),
         line: number("line"),
+        label: text(args, "label").map(str::to_string),
         doc_file: text(args, "doc_file").map(str::to_string),
     }
 }

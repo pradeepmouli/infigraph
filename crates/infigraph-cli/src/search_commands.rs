@@ -260,6 +260,7 @@ pub(crate) fn cmd_doc_entry(
     let pick = |p: crate::PickArgs| Pick {
         nth: p.nth,
         line: p.line,
+        label: p.label,
         doc_file: p.doc_file,
     };
     let op = match op {

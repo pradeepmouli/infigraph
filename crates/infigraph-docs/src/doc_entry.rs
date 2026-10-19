@@ -78,6 +78,9 @@ pub struct Pick {
     pub nth: Option<usize>,
     /// The entry whose key heading is on this line.
     pub line: Option<usize>,
+    /// The entry whose heading carries this label (the text after the key:
+    /// `` ### `a::b` — Why ``).
+    pub label: Option<String>,
     /// The document (relative path) to look in.
     pub doc_file: Option<String>,
 }
@@ -390,7 +393,10 @@ fn entries_of(root: &Path, target: &str, pick: &Pick) -> Result<(Vec<String>, Ve
 fn listing(found: &[Located]) -> String {
     found
         .iter()
-        .map(|l| format!("{}:{}", l.file, l.entry.start))
+        .map(|l| match &l.entry.label {
+            Some(label) => format!("{}:{} \"{label}\"", l.file, l.entry.start),
+            None => format!("{}:{}", l.file, l.entry.start),
+        })
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -406,11 +412,24 @@ fn lookup(root: &Path, target: &str, pick: &Pick) -> Result<Lookup> {
             stale: files.into_iter().next(),
         });
     }
+    if let Some(label) = &pick.label {
+        let before = found.len();
+        let all = listing(&found);
+        found.retain(|l| l.entry.label.as_deref() == Some(label.as_str()));
+        if found.is_empty() {
+            return Ok(Lookup::NoSuchOccurrence {
+                missing: format!("no entry labelled \"{label}\""),
+                found: before,
+                listing: all,
+            });
+        }
+    }
     let total = found.len();
     let ambiguous = |found: &[Located]| {
         anyhow::anyhow!(
             "`{target}` has {} entries ({}): say which with `nth` (1-based, in file order within \
-             one document), `line` (its key heading's line) or `doc_file`",
+             one document), `line` (its key heading's line), `label` (the text after the key) \
+             or `doc_file`",
             found.len(),
             listing(found)
         )
@@ -917,11 +936,11 @@ fn plan_rekey(
     let mut lines = split_lines(&located.text);
     let heading = &lines[located.entry.start - 1];
     let hashes = "#".repeat(located.entry.level);
-    let trailing = heading.len() - heading.trim_end().len();
-    let line = format!(
-        "{hashes} `{new_target}`{}",
-        &heading[heading.len() - trailing..]
-    );
+    // Everything after the key span (a label, trailing blanks) is kept.
+    let after_key = heading
+        .find(&format!("`{target}`"))
+        .map_or("", |at| &heading[at + target.len() + 2..]);
+    let line = format!("{hashes} `{new_target}`{after_key}");
     lines[located.entry.start - 1] = line;
     let after = join_lines(&lines, &located.text);
     let keys = [target.to_string()];
