@@ -775,9 +775,11 @@ impl GraphStore {
                 // So the ladybug#666 race stays open (it is pre-existing, and
                 // tracked separately); losing committed data from readers
                 // would not be.
-                SystemConfig::default()
-                    .buffer_pool_size(write_buffer_pool_bytes())
-                    .auto_checkpoint(true),
+                crate::pools::lbug_config(
+                    SystemConfig::default()
+                        .buffer_pool_size(write_buffer_pool_bytes())
+                        .auto_checkpoint(true),
+                ),
             )
             .map_err(|e| anyhow::anyhow!("failed to open kuzu db: {e}"))?
         };
@@ -855,9 +857,11 @@ impl GraphStore {
         // `throw_on_wal_replay_failure` defaults to true (unset here): a WAL
         // replay failure now surfaces as an error instead of being silently
         // tolerated and served as a torn base image.
-        let config = SystemConfig::default()
-            .read_only(true)
-            .buffer_pool_size(READ_ONLY_BUFFER_POOL_BYTES);
+        let config = crate::pools::lbug_config(
+            SystemConfig::default()
+                .read_only(true)
+                .buffer_pool_size(READ_ONLY_BUFFER_POOL_BYTES),
+        );
         // Shared for the duration of the open only -- not the queries after
         // it. This excludes an in-progress checkpoint and nothing else:
         // other readers hold it concurrently, and a writer that is merely

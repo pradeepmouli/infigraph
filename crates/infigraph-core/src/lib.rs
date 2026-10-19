@@ -39,6 +39,7 @@ pub mod ops;
 pub mod path_scope;
 pub mod patterns;
 pub mod pipelines_trust;
+pub mod pools;
 pub mod probe;
 pub mod proclog;
 pub mod project;
