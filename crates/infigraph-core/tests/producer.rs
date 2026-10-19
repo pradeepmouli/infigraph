@@ -294,6 +294,10 @@ async fn producer_exits_promptly_on_cancellation_while_registration_is_stalled()
 /// subscription, registered from inside the event loop through the same
 /// blocking `fseventsd` call as startup's. Multi-threaded so that, were the
 /// loop to block its worker, the test itself could still time the cancel.
+///
+/// Not on macOS: there the whole tree is one recursive subscription, so a
+/// created directory is never registered and has no call to stall.
+#[cfg(not(target_os = "macos"))]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn producer_exits_promptly_on_cancellation_while_a_new_directory_registration_is_stalled() {
     let tmp = tempfile::tempdir().unwrap();

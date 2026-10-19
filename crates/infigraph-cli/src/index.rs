@@ -2354,6 +2354,8 @@ impl IndexerRun<'_> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn an_indexers_repeated_stderr_lines_are_shown_a_few_times_and_then_counted() {
         let mut repeats = StderrRepeats::default();
@@ -2376,8 +2378,6 @@ mod tests {
             "{summary:?}"
         );
     }
-
-    use super::*;
     #[cfg(unix)]
     use infigraph_core::child::STDERR_TAIL_BYTES;
     use std::fs;

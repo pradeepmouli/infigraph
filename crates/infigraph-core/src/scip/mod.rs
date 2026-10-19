@@ -25,6 +25,18 @@ type NameCandidates = HashMap<(String, String), Vec<(u32, u32, String)>>;
 /// kind, file, start_line, end_line, docstring, scip_id.
 type NewSymbolRow = (String, String, String, String, u32, u32, String, String);
 
+/// What the import needs to know of a symbol already in the graph, besides
+/// where it is: what it is enriched with (see `enrichment_hash`), the moniker
+/// it was enriched with (to tell a literal member's row from its same-line
+/// siblings, whose monikers differ and names do not) and its kind (a literal
+/// member's tree-sitter row is a method, never the function or class that
+/// merely contains its key).
+struct ExistingSymbol {
+    enrichment: u64,
+    scip_id: String,
+    kind: String,
+}
+
 /// Give every row an id that is free, in a single pass: neither in the graph
 /// nor taken by a row before it in the batch.
 ///
@@ -48,18 +60,6 @@ type NewSymbolRow = (String, String, String, String, u32, u32, String, String);
 /// seen twice (same id, moniker and line), counted in the third return value.
 /// Returns the rows to write, `(moniker, new id)` for each renamed row so
 /// references follow it, and how many exact duplicates were dropped.
-/// What the import needs to know of a symbol already in the graph, besides
-/// where it is: what it is enriched with (see `enrichment_hash`), the moniker
-/// it was enriched with (to tell a literal member's row from its same-line
-/// siblings, whose monikers differ and names do not) and its kind (a literal
-/// member's tree-sitter row is a method, never the function or class that
-/// merely contains its key).
-struct ExistingSymbol {
-    enrichment: u64,
-    scip_id: String,
-    kind: String,
-}
-
 fn make_ids_unique(
     rows: Vec<NewSymbolRow>,
     existing: &std::collections::HashSet<String>,

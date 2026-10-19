@@ -379,7 +379,20 @@ pub fn log_stamp() -> String {
     )
 }
 
-/// Subscribe `watcher` to every non-ignored directory under `root`.
+/// Whether a watcher is subscribed to each directory separately. Where the
+/// backend has no such cost to avoid it is: inotify watches directories
+/// anyway, and a per-directory subscription is how `.gitignore` is honoured
+/// (a recursive one fires on `target/` and `node_modules/`). On macOS every
+/// `watch()` rebuilds the FSEvents stream -- an RPC to `fseventsd` -- so
+/// registering N directories was O(N^2) (27s for 1,021, a watcher deaf
+/// throughout), and one recursive subscription on the root is used instead:
+/// the events it delivers for ignored paths are dropped in process by
+/// `IgnoreMatcher::skips`, as every event already is, and a new directory
+/// needs no subscription of its own.
+pub(crate) const WATCHES_EACH_DIRECTORY: bool = !cfg!(target_os = "macos");
+
+/// Subscribe `watcher` to every non-ignored directory under `root` (or, where
+/// [`WATCHES_EACH_DIRECTORY`] is false, to the whole tree at once).
 ///
 /// Registers each directory NonRecursive rather than the tree Recursive, so
 /// `.gitignore`/`.infigraphignore` are honoured -- a recursive subscription
@@ -406,6 +419,20 @@ pub(crate) fn register_watch_dirs(
     watcher: &mut RecommendedWatcher,
     root: &Path,
 ) -> Result<WatchRegistration> {
+    if !WATCHES_EACH_DIRECTORY {
+        watcher.watch(root, RecursiveMode::Recursive).map_err(|e| {
+            anyhow::anyhow!(
+                "failed to watch any directory under {} (one recursive subscription was \
+                 refused) -- a watcher subscribed to nothing silently delivers no events \
+                 forever. First failure: {e}.",
+                root.display()
+            )
+        })?;
+        return Ok(WatchRegistration {
+            failed: 0,
+            first_error: None,
+        });
+    }
     let mut watched = 0usize;
     let mut failed = 0usize;
     let mut first_err: Option<String> = None;
@@ -495,10 +522,12 @@ mod tests {
             msg.contains("failed to watch any directory"),
             "must say plainly that nothing is being watched: {msg}"
         );
-        assert!(
-            msg.contains("inotify"),
-            "must point at the usual Linux cause so the reader knows what to check: {msg}"
-        );
+        if super::WATCHES_EACH_DIRECTORY {
+            assert!(
+                msg.contains("inotify"),
+                "must point at the usual Linux cause so the reader knows what to check: {msg}"
+            );
+        }
     }
 
     /// #75: directories that could not be watched are a degraded mode of the
