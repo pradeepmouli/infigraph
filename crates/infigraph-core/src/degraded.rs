@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 
 pub const EMBEDDINGS_STALE: &str = "embeddings-stale";
 pub const UNWATCHED_DIRECTORIES: &str = "unwatched-directories";
+pub const CODE_WATCHER_DEAF: &str = "code-watcher-deaf";
 pub const DOC_READS_UNAVAILABLE: &str = "doc-reads-unavailable";
 pub const GRAPH_REOPEN_BACKOFF: &str = "graph-reopen-backoff";
 pub const REINDEX_WAITING_FOR_SLOT: &str = "reindex-waiting-for-slot";
@@ -59,6 +60,10 @@ pub enum DegradedMode {
     /// The watcher could not watch some directories, so changes under them
     /// go unnoticed.
     UnwatchedDirectories { failed: usize, first: String },
+    /// The code watcher did not see its own probe write (the canary), so it
+    /// may be receiving no events at all; it rebuilds its subscription each
+    /// time and this ends when a probe is seen again.
+    CodeWatcherDeaf { misses: u32 },
     /// The daemon cannot open the document store, so it serves code only.
     DocReadsUnavailable { reason: String },
     /// The daemon cannot reopen the graph and is backing off; writes wait.
@@ -115,6 +120,7 @@ impl DegradedMode {
                 EMBEDDINGS_STALE
             }
             DegradedMode::UnwatchedDirectories { .. } => UNWATCHED_DIRECTORIES,
+            DegradedMode::CodeWatcherDeaf { .. } => CODE_WATCHER_DEAF,
             DegradedMode::DocReadsUnavailable { .. } => DOC_READS_UNAVAILABLE,
             DegradedMode::GraphReopenBackoff { .. } => GRAPH_REOPEN_BACKOFF,
             DegradedMode::ReindexWaitingForSlot { .. } => REINDEX_WAITING_FOR_SLOT,
@@ -167,6 +173,10 @@ impl DegradedMode {
             DegradedMode::UnwatchedDirectories { failed, first } => format!(
                 "{failed} director(ies) could not be watched (first: {first}): changes under \
                  them will not be noticed"
+            ),
+            DegradedMode::CodeWatcherDeaf { misses } => format!(
+                "the code watcher did not see its own probe write {misses} time(s) in a row: \
+                 edits may go unnoticed until it recovers"
             ),
             DegradedMode::DocReadsUnavailable { reason } => {
                 format!("document reads are unavailable, the daemon serves code only: {reason}")
@@ -248,6 +258,10 @@ impl DegradedMode {
             DegradedMode::UnwatchedDirectories { .. } => {
                 "fix the cause (on Linux usually `fs.inotify.max_user_watches`), then run \
                  `infigraph daemon-restart`"
+            }
+            DegradedMode::CodeWatcherDeaf { .. } => {
+                "run `infigraph daemon-restart` if it does not recover on its own; \
+                 `.infigraph/daemon.log` has the timestamps"
             }
             DegradedMode::DocReadsUnavailable { .. } => {
                 "run `infigraph reindex-docs`, then `infigraph daemon-restart`"
@@ -876,6 +890,7 @@ mod tests {
                 failed: 2,
                 first: "x".to_string(),
             },
+            DegradedMode::CodeWatcherDeaf { misses: 2 },
             DegradedMode::DocReadsUnavailable {
                 reason: "r".to_string(),
             },

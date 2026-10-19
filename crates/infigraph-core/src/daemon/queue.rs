@@ -184,6 +184,12 @@ impl IndexWorkQueue {
             && self.waiters.is_empty()
     }
 
+    /// Whether `rel` is queued to be indexed, for a test measuring how soon
+    /// an edit is seen.
+    pub fn holds_path(&self, rel: &str) -> bool {
+        self.items.contains_key(rel)
+    }
+
     /// Returns and clears the full accumulated state in one shot.
     #[allow(dead_code)]
     pub(crate) fn drain(&mut self) -> DrainedQueue {

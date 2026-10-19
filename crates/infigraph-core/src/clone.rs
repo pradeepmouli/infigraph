@@ -18,6 +18,7 @@ const EXCLUDED_RELATIVE_PATHS: &[&str] = &[
     "config.lock",
     crate::scip::SCIP_ENRICH_LOCK,
     "logs",
+    crate::watch::producer::CANARY_FILE,
 ];
 
 /// Copy `<src_root>/.infigraph/` to `<dst_root>/.infigraph/`, excluding lock files,

@@ -350,3 +350,209 @@ async fn producer_exits_promptly_on_cancellation_while_a_new_directory_registrat
         start.elapsed()
     );
 }
+
+/// A watcher that cannot see its own probe write is deaf, and says so: the
+/// project is degraded (`code-watcher-deaf`) and the subscription rebuilt.
+/// The test hook makes the producer ignore the probe's event, which is what
+/// a stream that delivers nothing looks like from inside.
+#[tokio::test]
+async fn a_watcher_that_never_sees_its_probe_degrades_the_project() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    std::fs::create_dir_all(root.join(".infigraph")).unwrap();
+    std::env::set_var("INFIGRAPH_TEST_WATCH_CANARY_MS", "300,600");
+    std::env::set_var("INFIGRAPH_TEST_WATCH_CANARY_DEAF", "1");
+
+    let queue = Arc::new(Mutex::new(IndexWorkQueue::new()));
+    let token = CancellationToken::new();
+    let (cfg, queue_clone, token_clone) = (config(root.clone()), Arc::clone(&queue), token.clone());
+    let handle = tokio::task::spawn(async move {
+        infigraph_core::watch::producer::run_producer(cfg, queue_clone, |_evt| {}, token_clone)
+            .await;
+    });
+
+    let mut degraded = false;
+    for _ in 0..100 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        degraded = infigraph_core::degraded::live::for_root(&root)
+            .iter()
+            .any(|n| n.key == infigraph_core::degraded::CODE_WATCHER_DEAF);
+        if degraded {
+            break;
+        }
+    }
+    token.cancel();
+    handle.await.unwrap();
+    std::env::remove_var("INFIGRAPH_TEST_WATCH_CANARY_MS");
+    std::env::remove_var("INFIGRAPH_TEST_WATCH_CANARY_DEAF");
+    assert!(
+        degraded,
+        "a watcher blind to its own probe must be reported as degraded"
+    );
+}
+
+/// The healthy case: probes are seen, nothing is degraded, and the probes
+/// cost no extra true-up (the startup one is the only whole-project pass).
+#[tokio::test]
+async fn a_healthy_watcher_sees_its_probes_and_queues_no_true_up_for_them() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    std::fs::create_dir_all(root.join(".infigraph")).unwrap();
+    std::env::set_var("INFIGRAPH_TEST_WATCH_CANARY_MS", "300,3000");
+
+    let queue = Arc::new(Mutex::new(IndexWorkQueue::new()));
+    let token = CancellationToken::new();
+    let before = infigraph_core::watch::producer::true_ups_queued();
+    let (cfg, queue_clone, token_clone) = (config(root.clone()), Arc::clone(&queue), token.clone());
+    let handle = tokio::task::spawn(async move {
+        infigraph_core::watch::producer::run_producer(cfg, queue_clone, |_evt| {}, token_clone)
+            .await;
+    });
+
+    tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+    let degraded = infigraph_core::degraded::live::for_root(&root);
+    let after = infigraph_core::watch::producer::true_ups_queued();
+    token.cancel();
+    handle.await.unwrap();
+    std::env::remove_var("INFIGRAPH_TEST_WATCH_CANARY_MS");
+    assert!(
+        degraded.is_empty(),
+        "a healthy watcher is not degraded: {degraded:?}"
+    );
+    assert_eq!(after - before, 1, "only the startup true-up");
+}
+
+/// What the storm tests do for 30s while a producer watches a 1000-directory
+/// tree: write under a gitignored `target/`, and/or create and `rm -rf`
+/// directories under the watched tree, in a tight loop.
+#[derive(Clone, Copy)]
+struct Storm {
+    ignored_writes: bool,
+    directory_churn: bool,
+}
+
+/// Runs `storm` for 30s, then rewrites one source file every 5s until an
+/// event for it reaches the queue (an empty queue to begin with, so nothing
+/// else can fill it). Returns how long that took (`None`: 90s) and how many
+/// whole-project passes the producer queued meanwhile.
+async fn storm_then_edit(storm: Storm) -> (Option<std::time::Duration>, u64, u64) {
+    const CHURN: std::time::Duration = std::time::Duration::from_secs(30);
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    std::fs::create_dir_all(root.join(".infigraph")).unwrap();
+    std::fs::write(root.join(".gitignore"), "target/\n").unwrap();
+    std::fs::create_dir_all(root.join("target/debug")).unwrap();
+    for i in 0..1000 {
+        let dir = root.join(format!("src/d{i}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("m.py"), "def f(): pass\n").unwrap();
+    }
+
+    let queue = Arc::new(Mutex::new(IndexWorkQueue::new()));
+    let token = CancellationToken::new();
+    let (cfg, queue_clone, token_clone) = (config(root.clone()), Arc::clone(&queue), token.clone());
+    let handle = tokio::task::spawn(async move {
+        infigraph_core::watch::producer::run_producer(cfg, queue_clone, |_evt| {}, token_clone)
+            .await;
+    });
+    wait_until_watching(&root, &queue).await;
+    let before = infigraph_core::watch::producer::true_ups_queued();
+
+    let storm_root = root.clone();
+    let churn = std::thread::spawn(move || {
+        let start = std::time::Instant::now();
+        let mut n = 0u64;
+        while start.elapsed() < CHURN {
+            if storm.ignored_writes {
+                // 20k distinct files under the ignored target/, spread over
+                // the run (a build writes them over minutes; unthrottled this
+                // loop does 20k a second and backs the channel up for 8s).
+                for _ in 0..50 {
+                    let f = storm_root.join(format!("target/debug/f{}.o", n % 20_000));
+                    let _ = std::fs::write(f, b"x");
+                    n += 1;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(75));
+            }
+            if storm.directory_churn {
+                let d = storm_root.join("src/churn/a/b");
+                let _ = std::fs::create_dir_all(&d);
+                let _ = std::fs::write(d.join("c.py"), "def c(): pass\n");
+                let _ = std::fs::remove_dir_all(storm_root.join("src/churn"));
+            }
+        }
+        n
+    });
+    let written = tokio::task::spawn_blocking(move || churn.join().unwrap())
+        .await
+        .unwrap();
+
+    *queue.lock().unwrap() = IndexWorkQueue::new();
+    let edited_at = std::time::Instant::now();
+    let mut seen_after = None;
+    // Rewritten every 5s, not continuously: a write inside the batch's 1s
+    // window restarts it.
+    'wait: for i in 0..18 {
+        std::fs::write(
+            root.join("src/d7/edit.py"),
+            format!("def edited(): return {i}\n"),
+        )
+        .unwrap();
+        for _ in 0..50 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            if queue.lock().unwrap().holds_path("src/d7/edit.py") {
+                seen_after = Some(edited_at.elapsed());
+                break 'wait;
+            }
+        }
+    }
+    let true_ups = infigraph_core::watch::producer::true_ups_queued() - before;
+    token.cancel();
+    handle.await.unwrap();
+    eprintln!(
+        "storm: {written} ignored writes in {CHURN:?}; edit seen after {seen_after:?}; \
+         {true_ups} true-up(s)"
+    );
+    (seen_after, true_ups, CHURN.as_secs())
+}
+
+/// Writes under an ignored path, as a Rust tree under `cargo build` makes on
+/// macOS, where one recursive subscription delivers `target/` too: the
+/// flood is filtered in process, a real edit is still seen promptly, and the
+/// whole-project passes it asks for stay bounded by the debounce. Long, so
+/// run on request: `cargo test -p infigraph-core --test producer -- --ignored storm`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "a minute of file churn; run with --ignored"]
+async fn storm_of_ignored_writes_leaves_the_watcher_responsive() {
+    let (seen, true_ups, secs) = storm_then_edit(Storm {
+        ignored_writes: true,
+        directory_churn: false,
+    })
+    .await;
+    assert!(
+        seen.is_some_and(|t| t < std::time::Duration::from_secs(5)),
+        "an edit after the storm was seen after {seen:?}, not within 5s"
+    );
+    // One per debounce window, plus the one in flight at each end.
+    assert!(true_ups <= secs / 30 + 2, "{true_ups} true-ups in {secs}s");
+}
+
+/// Directory churn (create, write, `rm -rf` in a tight loop for 30s) is what
+/// made the watcher on a recursive macOS subscription go deaf: no event
+/// arrived for any file until the subscription was rebuilt. The canary finds
+/// that, so the edit is seen within its period plus its wait (plus slack),
+/// and the bound is the canary's, not 5s.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "a minute of file churn; run with --ignored"]
+async fn storm_of_directory_churn_is_healed_by_the_canary() {
+    let (seen, true_ups, secs) = storm_then_edit(Storm {
+        ignored_writes: false,
+        directory_churn: true,
+    })
+    .await;
+    assert!(
+        seen.is_some_and(|t| t < std::time::Duration::from_secs(45)),
+        "an edit after the churn was seen after {seen:?}, not within the canary's bound"
+    );
+    assert!(true_ups <= secs / 30 + 3, "{true_ups} true-ups in {secs}s");
+}
