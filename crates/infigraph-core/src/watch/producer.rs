@@ -266,6 +266,12 @@ pub async fn run_producer(
                                 }
                                 WatchEventKind::Created | WatchEventKind::Modified => {
                                     if path.is_dir() {
+                                        // Under a recursive subscription
+                                        // (macOS) a new directory is already
+                                        // watched.
+                                        if !crate::watch::WATCHES_EACH_DIRECTORY {
+                                            continue;
+                                        }
                                         // A new subdirectory needs its own
                                         // subscription (these are registered
                                         // NonRecursive), and registering it
@@ -388,7 +394,7 @@ pub async fn run_producer(
 /// Least time between two true-ups asked for by dropped-event reports: a
 /// busy tree can report them in bursts, and one whole-project scan answers
 /// them all.
-const TRUE_UP_DEBOUNCE: Duration = Duration::from_secs(5);
+const TRUE_UP_DEBOUNCE: Duration = Duration::from_secs(30);
 
 /// Queues one whole-project pass -- the scan `infigraph index` does, which
 /// hash-diffs every file and so costs a read each when nothing changed -- to
@@ -544,5 +550,50 @@ mod tests {
         gate.note();
         assert!(!gate.due(t0 + Duration::from_secs(1)), "inside the window");
         assert!(gate.due(t0 + TRUE_UP_DEBOUNCE), "waits only for its end");
+    }
+    /// 20 directories of 50 subdirectories each, with a source file in every
+    /// one: about the directory count of a large TypeScript monorepo.
+    fn thousand_directories() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        for top in 0..20 {
+            for sub in 0..50 {
+                let d = dir.path().join(format!("pkg{top}/mod{sub}"));
+                std::fs::create_dir_all(&d).unwrap();
+                std::fs::write(d.join("a.ts"), "export const a = 1;\n").unwrap();
+            }
+        }
+        dir
+    }
+
+    /// Registering a watcher is time the watcher is deaf: it was 27s for
+    /// these 1,021 directories on macOS, one FSEvents stream rebuild per
+    /// directory. One recursive subscription is not a function of the count.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn registering_a_thousand_directories_takes_one_subscription_not_a_thousand() {
+        let dir = thousand_directories();
+        let root = dir.path().canonicalize().unwrap();
+        let started = std::time::Instant::now();
+        let _watcher = create_watcher(&root, 100).unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "registration took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// Registering a watcher is time the watcher is deaf. Run by hand for the
+    /// number: `cargo test -p infigraph-core --lib registration_time -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "a measurement, run by hand"]
+    fn registration_time_on_a_thousand_directories() {
+        let dir = thousand_directories();
+        let root = dir.path().canonicalize().unwrap();
+        let started = std::time::Instant::now();
+        let _watcher = create_watcher(&root, 100).unwrap();
+        eprintln!(
+            "registered a watcher over 1021 directories in {:.2}s",
+            started.elapsed().as_secs_f64()
+        );
     }
 }

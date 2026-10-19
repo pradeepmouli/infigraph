@@ -57,6 +57,16 @@ impl PhaseClock {
         self.last = now;
     }
 
+    /// Whether a phase named `name` has been lapped.
+    pub fn has_lap(&self, name: &str) -> bool {
+        self.laps.iter().any(|(lap, ..)| *lap == name)
+    }
+
+    /// Time since the clock started.
+    pub fn elapsed(&self) -> Duration {
+        self.started.elapsed()
+    }
+
     /// `preload 1.2s (peak 900 MB), parse 0.4s (peak 900 MB), ... total 9.9s`.
     pub fn report(&self) -> String {
         let mut parts: Vec<String> = self

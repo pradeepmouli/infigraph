@@ -4118,6 +4118,8 @@ fn has_cross_file_calls(prism: &Infigraph, rel_path: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn scip_embeddings_wait_for_the_imports_of_a_cycle_to_stop() {
         let ago = |secs: u64| {
@@ -4133,8 +4135,6 @@ mod tests {
         // Settled: one reconcile for the whole cycle.
         assert!(scip_embeddings_due(Some(ago(31)), false));
     }
-
-    use super::*;
     use protobuf::Message as _;
 
     /// Everything `route_write` needs, for tests that route
