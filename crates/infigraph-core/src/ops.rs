@@ -174,6 +174,7 @@ const DERIVED_NAMES: &[&str] = &[
     "scip-tmp",
     "daemon.log",
     "worktree-hook.log",
+    crate::watch::producer::CANARY_FILE,
     crate::daemon::writes::SIDECAR_DIR,
 ];
 

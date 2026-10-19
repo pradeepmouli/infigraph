@@ -167,6 +167,10 @@ pub async fn run_producer(
     let mut dropped = DroppedEvents::default();
     queue_true_up(&queue, "the watcher started");
     dropped.queued(std::time::Instant::now());
+    crate::degraded::live::clear(&root, crate::degraded::CODE_WATCHER_DEAF);
+    let canary_path = infigraph_dir.join(CANARY_FILE);
+    let mut canary = Canary::new(std::time::Instant::now());
+    let canary_deaf_for_test = std::env::var_os("INFIGRAPH_TEST_WATCH_CANARY_DEAF").is_some();
 
     // `Delay` rather than the default `Burst`: these are idle cadences, not a
     // fixed grid. After a stall (the restart backoff below sleeps for
@@ -185,8 +189,55 @@ pub async fn run_producer(
                 flush_ready_batch(&mut batch, &queue, &root, storm_threshold);
                 let now = std::time::Instant::now();
                 if dropped.due(now) {
-                    queue_true_up(&queue, "the watcher reported dropped events");
+                    let rate = dropped.report(now);
+                    queue_true_up(&queue, &format!("the watcher reported dropped events: {rate}"));
                     dropped.queued(now);
+                }
+                match canary.step(now) {
+                    CanaryStep::Idle => {}
+                    CanaryStep::Probe => {
+                        // No `.infigraph/` (a removed project) means nothing
+                        // to probe; the root check ends the producer.
+                        if infigraph_dir.is_dir()
+                            && std::fs::write(&canary_path, canary_stamp()).is_ok()
+                        {
+                            canary.probed(now);
+                        } else {
+                            canary.skipped(now);
+                        }
+                    }
+                    CanaryStep::Missed(misses) => {
+                        eprintln!(
+                            "[watch-producer] {} the watcher did not report its own probe write \
+                             within {}s (miss {misses}); it may be deaf, rebuilding its subscription",
+                            crate::watch::log_stamp(),
+                            canary.wait.as_secs_f32()
+                        );
+                        crate::degraded::live::set(
+                            &root,
+                            crate::degraded::DegradedMode::CodeWatcherDeaf { misses },
+                        );
+                        // Whatever it missed is found by the true-up the
+                        // debounce allows, not by one per miss.
+                        dropped.note();
+                        match create_watcher_unless_cancelled(&root, debounce_ms, &token).await {
+                            None => break,
+                            Some(Ok((new_watcher, new_rx))) => {
+                                watcher = new_watcher;
+                                rx = new_rx;
+                            }
+                            Some(Err(e)) => {
+                                eprintln!("[watch-producer] rebuilding the watcher failed: {e}");
+                            }
+                        }
+                    }
+                }
+                if canary.take_recovered() {
+                    eprintln!(
+                        "[watch-producer] {} the watcher reports its own probe write again",
+                        crate::watch::log_stamp()
+                    );
+                    crate::degraded::live::clear(&root, crate::degraded::CODE_WATCHER_DEAF);
                 }
             }
 
@@ -226,6 +277,14 @@ pub async fn run_producer(
                             // resolved paths would otherwise fail the
                             // `strip_prefix` below and drop the event.
                             let path = ignore_matcher.respelled(&path).into_owned();
+                            // Its own probe: proof the stream delivers, and
+                            // nothing to index.
+                            if path == canary_path {
+                                if !canary_deaf_for_test {
+                                    canary.seen();
+                                }
+                                continue;
+                            }
                             // What the walk would not visit, hidden files
                             // included: a `.foo.py` it never indexes would
                             // otherwise leave a dirty mark nothing clears.
@@ -396,12 +455,23 @@ pub async fn run_producer(
 /// them all.
 const TRUE_UP_DEBOUNCE: Duration = Duration::from_secs(30);
 
+/// Whole-project passes this process's producers have queued, for any
+/// reason: a test measures that a storm of events does not turn into a storm
+/// of scans (the log line says why each was queued).
+static TRUE_UPS_QUEUED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// See [`TRUE_UPS_QUEUED`].
+pub fn true_ups_queued() -> u64 {
+    TRUE_UPS_QUEUED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Queues one whole-project pass -- the scan `infigraph index` does, which
 /// hash-diffs every file and so costs a read each when nothing changed -- to
 /// find what no event reported: an edit made while no watcher ran, or one
 /// whose event the backend dropped. Logs when it was asked for and why; the
 /// drain logs what the scan found.
 fn queue_true_up(queue: &Arc<Mutex<IndexWorkQueue>>, why: &str) {
+    TRUE_UPS_QUEUED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     queue.lock().unwrap().mark_whole_project();
     eprintln!(
         "[watch-producer] {} queued a code true-up ({why})",
@@ -423,17 +493,47 @@ fn events_were_dropped(event: &Event) -> bool {
 struct DroppedEvents {
     pending: bool,
     last_true_up: Option<std::time::Instant>,
+    /// Reports since the last true-up, of any kind.
+    reports: u64,
+    /// When each true-up this answered was queued, newest last, for the
+    /// rate in the log line.
+    answered: std::collections::VecDeque<std::time::Instant>,
 }
+
+/// How far back the logged rate of dropped-event true-ups looks.
+const RATE_WINDOW: Duration = Duration::from_secs(600);
 
 impl DroppedEvents {
     fn note(&mut self) {
         self.pending = true;
+        self.reports += 1;
+    }
+
+    /// What to log with the true-up due at `now`: how many reports it
+    /// answers and how many such true-ups the last [`RATE_WINDOW`] held,
+    /// this one included -- the number to read off a busy tree.
+    fn report(&mut self, now: std::time::Instant) -> String {
+        self.answered.push_back(now);
+        while self
+            .answered
+            .front()
+            .is_some_and(|at| now.duration_since(*at) > RATE_WINDOW)
+        {
+            self.answered.pop_front();
+        }
+        format!(
+            "{} report(s) since the last true-up, {} dropped-event true-up(s) in the last {} min",
+            self.reports,
+            self.answered.len(),
+            RATE_WINDOW.as_secs() / 60
+        )
     }
 
     /// A true-up was queued at `now` for any reason: it answers what was
     /// pending too.
     fn queued(&mut self, now: std::time::Instant) {
         self.pending = false;
+        self.reports = 0;
         self.last_true_up = Some(now);
     }
 
@@ -442,6 +542,107 @@ impl DroppedEvents {
             && self
                 .last_true_up
                 .is_none_or(|at| now.duration_since(at) >= TRUE_UP_DEBOUNCE)
+    }
+}
+
+/// The file the producer writes to learn its own subscription still delivers
+/// (under `.infigraph/`, which the walk never registers on inotify, so
+/// `create_watcher` does).
+pub(crate) const CANARY_FILE: &str = "watch-canary";
+
+fn canary_stamp() -> String {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos())
+        .to_string()
+}
+
+/// A watcher can go permanently deaf with nothing reporting it (sittir's did,
+/// after a stretch of directory churn). Every `period` the producer writes
+/// [`CANARY_FILE`]; if the event for it has not arrived `wait` later, the
+/// subscription is rebuilt and the project is degraded until a probe is seen.
+/// Pure state, so the decision is testable without a clock or a filesystem.
+struct Canary {
+    period: Duration,
+    wait: Duration,
+    last_probe: Option<std::time::Instant>,
+    awaiting: Option<std::time::Instant>,
+    misses: u32,
+    recovered: bool,
+}
+
+#[derive(Debug, PartialEq)]
+enum CanaryStep {
+    Idle,
+    Probe,
+    Missed(u32),
+}
+
+impl Canary {
+    /// `INFIGRAPH_TEST_WATCH_CANARY_MS=<period>,<wait>` shortens both for a
+    /// test; nothing else reads it.
+    fn new(now: std::time::Instant) -> Self {
+        let (period, wait) = std::env::var("INFIGRAPH_TEST_WATCH_CANARY_MS")
+            .ok()
+            .and_then(|v| {
+                let (p, w) = v.split_once(',')?;
+                Some((p.parse().ok()?, w.parse().ok()?))
+            })
+            .map_or(
+                (Duration::from_secs(20), Duration::from_secs(10)),
+                |(p, w)| (Duration::from_millis(p), Duration::from_millis(w)),
+            );
+        Canary {
+            period,
+            wait,
+            // The subscription was just made and the true-up covers startup:
+            // the first probe is a period away.
+            last_probe: Some(now),
+            awaiting: None,
+            misses: 0,
+            recovered: false,
+        }
+    }
+
+    fn step(&mut self, now: std::time::Instant) -> CanaryStep {
+        if let Some(at) = self.awaiting {
+            if now.duration_since(at) < self.wait {
+                return CanaryStep::Idle;
+            }
+            self.awaiting = None;
+            self.misses += 1;
+            self.last_probe = Some(now);
+            return CanaryStep::Missed(self.misses);
+        }
+        if self
+            .last_probe
+            .is_none_or(|at| now.duration_since(at) >= self.period)
+        {
+            return CanaryStep::Probe;
+        }
+        CanaryStep::Idle
+    }
+
+    fn probed(&mut self, now: std::time::Instant) {
+        self.last_probe = Some(now);
+        self.awaiting = Some(now);
+    }
+
+    /// The probe could not be written: nothing is awaited, try again later.
+    fn skipped(&mut self, now: std::time::Instant) {
+        self.last_probe = Some(now);
+    }
+
+    fn seen(&mut self) {
+        self.awaiting = None;
+        if self.misses > 0 {
+            self.misses = 0;
+            self.recovered = true;
+        }
+    }
+
+    fn take_recovered(&mut self) -> bool {
+        std::mem::take(&mut self.recovered)
     }
 }
 
@@ -497,6 +698,15 @@ fn create_watcher(
         Config::default().with_poll_interval(Duration::from_millis(debounce_ms)),
     )?;
     crate::watch::register_watch_dirs(&mut watcher, root)?.note(root, true);
+    // The walk skips hidden directories, so inotify never sees the canary
+    // there; one more subscription, and best effort (a project without
+    // `.infigraph/` has no canary to see).
+    if crate::watch::WATCHES_EACH_DIRECTORY {
+        let _ = watcher.watch(
+            &root.join(".infigraph"),
+            notify::RecursiveMode::NonRecursive,
+        );
+    }
     Ok((Arc::new(Mutex::new(watcher)), rx))
 }
 
@@ -553,6 +763,63 @@ mod tests {
     }
     /// 20 directories of 50 subdirectories each, with a source file in every
     /// one: about the directory count of a large TypeScript monorepo.
+    #[test]
+    fn the_log_line_for_a_dropped_event_true_up_carries_its_rate() {
+        let t0 = std::time::Instant::now();
+        let mut gate = DroppedEvents::default();
+        gate.note();
+        gate.note();
+        gate.note();
+        assert_eq!(
+            gate.report(t0),
+            "3 report(s) since the last true-up, 1 dropped-event true-up(s) in the last 10 min"
+        );
+        gate.queued(t0);
+        gate.note();
+        let line = gate.report(t0 + TRUE_UP_DEBOUNCE);
+        assert!(
+            line.starts_with("1 report(s)") && line.contains(" 2 dropped-event"),
+            "{line}"
+        );
+        // The first falls out of the window.
+        gate.queued(t0 + TRUE_UP_DEBOUNCE);
+        gate.note();
+        let line = gate.report(t0 + RATE_WINDOW + Duration::from_secs(1));
+        assert!(line.contains(" 2 dropped-event"), "{line}");
+    }
+
+    #[test]
+    fn a_probe_that_is_never_seen_is_a_miss_and_one_that_is_seen_recovers() {
+        let t0 = std::time::Instant::now();
+        let mut canary = Canary::new(t0);
+        let (period, wait) = (canary.period, canary.wait);
+        assert_eq!(
+            canary.step(t0 + period / 2),
+            CanaryStep::Idle,
+            "not yet due"
+        );
+        assert_eq!(canary.step(t0 + period), CanaryStep::Probe);
+        canary.probed(t0 + period);
+        assert_eq!(canary.step(t0 + period + wait / 2), CanaryStep::Idle);
+        assert_eq!(canary.step(t0 + period + wait), CanaryStep::Missed(1));
+        assert_eq!(
+            canary.step(t0 + period + wait + Duration::from_secs(1)),
+            CanaryStep::Idle,
+            "the next probe is a period after the miss"
+        );
+        let t1 = t0 + period + wait + period;
+        assert_eq!(canary.step(t1), CanaryStep::Probe);
+        canary.probed(t1);
+        assert_eq!(canary.step(t1 + wait), CanaryStep::Missed(2));
+
+        let t2 = t1 + wait + period;
+        canary.probed(t2);
+        canary.seen();
+        assert_eq!(canary.step(t2 + wait), CanaryStep::Idle, "seen in time");
+        assert!(canary.take_recovered());
+        assert!(!canary.take_recovered(), "reported once");
+    }
+
     fn thousand_directories() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         for top in 0..20 {
