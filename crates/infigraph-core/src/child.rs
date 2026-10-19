@@ -95,6 +95,31 @@ pub fn lead_own_group(command: &mut Command) {
     let _ = command;
 }
 
+/// How far a background child's scheduling priority is lowered (nice).
+pub const BACKGROUND_NICE: i32 = 10;
+
+/// Starts `command` at a lower scheduling priority (nice +10), so work the
+/// machine did not ask for -- a SCIP indexer, which runs for minutes at several
+/// cores -- yields to an editor, a compiler and the rest of what is running.
+/// Unix only; a failed `setpriority` leaves the child at the priority it
+/// inherited.
+pub fn run_at_background_priority(command: &mut Command) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // SAFETY: only async-signal-safe `setpriority` runs between fork and
+        // exec, and its failure is deliberately ignored.
+        unsafe {
+            command.pre_exec(|| {
+                libc::setpriority(libc::PRIO_PROCESS as _, 0, BACKGROUND_NICE);
+                Ok(())
+            });
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = command;
+}
+
 /// Whether `child` has exited, without reaping it: the exit status stays
 /// pending and the pid stays ours. That is what makes "signal the group, then
 /// reap" possible -- once a leader is reaped its pid is free to be reused, so
@@ -865,5 +890,27 @@ mod tests {
         let status = child.reap();
         assert!(status.unwrap().success());
         assert!(gone_within(left_behind, Duration::from_secs(5)));
+    }
+    #[cfg(unix)]
+    #[test]
+    fn a_background_child_runs_with_a_raised_nice_value() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "ps -o ni= -p $$"]);
+        run_at_background_priority(&mut command);
+        let out = command.output().expect("sh runs");
+        let nice: i32 = String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse()
+            .expect("ps prints the nice value");
+        assert!(nice >= BACKGROUND_NICE, "nice was {nice}");
+
+        let mut plain = Command::new("sh");
+        plain.args(["-c", "ps -o ni= -p $$"]);
+        let out = plain.output().expect("sh runs");
+        let own: i32 = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap();
+        assert!(
+            nice > own,
+            "the lowered child ({nice}) is not nicer than an ordinary one ({own})"
+        );
     }
 }

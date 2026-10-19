@@ -55,6 +55,20 @@ const IDLE_CHECKPOINT_PROBE: Duration = Duration::from_secs(2);
 /// periodic pass is configured.
 const BUILD_HASH_CHECK_INTERVAL: Duration = Duration::from_secs(300);
 
+/// How long after a SCIP import lands, with no other import arriving, the
+/// daemon reconciles embeddings. One enrichment imports one `.scip` per
+/// indexer; reconciling after each re-read every symbol and rewrote
+/// `embeddings.bin` and `clone-bodies.bin` once per indexer (two full passes in
+/// one cycle on a 220k-symbol graph). Waiting for the imports to stop makes it
+/// one pass per cycle.
+const SCIP_EMBED_SETTLE: Duration = Duration::from_secs(30);
+
+/// Whether the embeddings that SCIP imports left behind are due: the last
+/// import is `SCIP_EMBED_SETTLE` old and none is running.
+fn scip_embeddings_due(last_import: Option<std::time::Instant>, import_running: bool) -> bool {
+    !import_running && last_import.is_some_and(|at| at.elapsed() >= SCIP_EMBED_SETTLE)
+}
+
 fn build_hash_check_interval() -> Duration {
     std::env::var("INFIGRAPH_TEST_BUILD_HASH_CHECK_SECS")
         .ok()
@@ -73,6 +87,12 @@ crate::settings! {
         // coarse cadence as the build-hash self-check, and for the same
         // reason: the check itself is cheap, what it can start is not.
         index_staleness_check_secs: u64 = 300,
+        // How long after the daemon starts the staleness trigger waits before
+        // it may start an enrichment. A restart, the whole-project true-up and
+        // an editing burst all land in the first minutes, and enrichment is
+        // the heaviest thing the daemon does. A `scip-enrich` a person runs is
+        // unaffected, and so is `[scip] index_staleness_threshold`.
+        start_grace_secs: u64 = 180,
     }
 }
 
@@ -1020,6 +1040,9 @@ where
     // direct-callback SCIP-enrichment path's own background task, not this
     // request-driven import.
     let mut scip_import_in_flight: Option<PendingScipImport> = None;
+    // When the last SCIP import landed and its embeddings are not yet
+    // reconciled (see `SCIP_EMBED_SETTLE`).
+    let mut scip_embeddings_pending_since: Option<std::time::Instant> = None;
     // A `WriteRequest::IndexDocs` running on `docs_control` (docs opt-in),
     // reaped by `finish_docs_write` below.
     let mut docs_write_in_flight: Option<PendingDocsWrite> = None;
@@ -1073,6 +1096,8 @@ where
     let scip_staleness_threshold = scip_settings.index_staleness_threshold;
     let scip_staleness_check_interval =
         Duration::from_secs(scip_settings.index_staleness_check_secs);
+    let scip_start_grace = Duration::from_secs(scip_settings.start_grace_secs);
+    let coordinator_started = std::time::Instant::now();
     let mut last_scip_staleness_check = std::time::Instant::now();
     // The AST generation at which the last enrichment attempt (either
     // trigger) started -- see `scip_enrichment_due` for why it gates retries.
@@ -1483,6 +1508,7 @@ where
         if serve_requests
             && on_full_reindex.is_some()
             && scip_staleness_threshold > 0
+            && coordinator_started.elapsed() >= scip_start_grace
             && last_scip_staleness_check.elapsed() >= scip_staleness_check_interval
         {
             last_scip_staleness_check = std::time::Instant::now();
@@ -1585,13 +1611,14 @@ where
                 .take()
                 .expect("checked is_some just above");
             let (guard, touched_files) = finish_scip_import(
-                root,
                 reply,
-                &held_prism,
                 indexer_label.as_deref(),
                 drain_rt.block_on(task.join()),
             );
             drop(guard);
+            if !touched_files.is_empty() {
+                scip_embeddings_pending_since = Some(std::time::Instant::now());
+            }
 
             if let Some(prism) = held_prism.as_ref() {
                 for file in &touched_files {
@@ -1603,6 +1630,13 @@ where
                     });
                 }
             }
+        }
+        if scip_embeddings_due(
+            scip_embeddings_pending_since,
+            scip_import_in_flight.is_some(),
+        ) {
+            scip_embeddings_pending_since = None;
+            reconcile_embeddings_after_scip(root, &held_prism);
         }
         if docs_write_in_flight
             .as_ref()
@@ -2100,14 +2134,20 @@ where
     // here (unlike the tick-time reap block above): the process is already
     // tearing down, nothing is left running to act on the notification.
     if let Some(in_flight) = scip_import_in_flight.take() {
-        let (guard, _touched_files) = finish_scip_import(
-            root,
+        let (guard, touched_files) = finish_scip_import(
             in_flight.reply,
-            &held_prism,
             in_flight.indexer_label.as_deref(),
             drain_rt.block_on(in_flight.task.join()),
         );
         drop(guard);
+        if !touched_files.is_empty() {
+            scip_embeddings_pending_since = Some(std::time::Instant::now());
+        }
+    }
+    // Imports whose embeddings were still waiting to settle are reconciled
+    // now rather than left for the next daemon to find stale.
+    if scip_embeddings_pending_since.take().is_some() {
+        reconcile_embeddings_after_scip(root, &held_prism);
     }
     // A docs index that started finishes and answers its client (#204 D3:
     // started work is never cancelled).
@@ -2454,6 +2494,9 @@ fn serve_request_locked(
         Ok(IndexOpOutcome::Acquired(_guard)) => match watch_db(root, registry, held) {
             Ok(prism) => {
                 reopen_backoff.succeeded(root);
+                let _slow = crate::phase_clock::SlowOp::start(|| {
+                    format!("write request {}", request.kind())
+                });
                 reply.send(crate::daemon_protocol::serve_write(&prism, request));
                 Ok(())
             }
@@ -3031,15 +3074,13 @@ fn finish_docs_write(
 }
 
 /// Loop-thread finish for a completed SCIP import: logs one structured
-/// completion line, refreshes embeddings for anything the import added,
-/// writes the reply, and returns the touched-files list (over-approximated
+/// completion line, writes the reply (embeddings are reconciled later, once
+/// the cycle's imports have settled: `scip_embeddings_due`), and returns the touched-files list (over-approximated
 /// -- every file the SCIP index covered, see `ImportStats::touched_files`)
 /// so the caller can give them the same `on_event` notification an ordinary
 /// drain gives its extracted files.
 fn finish_scip_import(
-    root: &Path,
     reply: WriteReply,
-    held: &HeldPrism,
     indexer_label: Option<&str>,
     joined: std::result::Result<ScipImportTaskOutput, tokio::task::JoinError>,
 ) -> (Option<crate::ops::IndexOpGuard>, Vec<String>) {
@@ -3066,22 +3107,6 @@ fn finish_scip_import(
                 "[daemon] {}",
                 crate::scip::scip_import_log_line(indexer_label, &stats)
             );
-            if let Some(prism) = held.as_ref() {
-                if let Some(backend) = prism.backend() {
-                    // `update_embeddings` returns the total embedding count
-                    // on disk after reconciling, not how many it re-embedded
-                    // (unchanged inputs are skipped by hash) -- log it as
-                    // exactly that, so four imports in a row printing the
-                    // same ~11k don't read as four full re-embeds.
-                    match crate::embed::update_embeddings(backend, root, &[]) {
-                        Ok(n) if n > 0 => {
-                            eprintln!("[daemon] scip-import: embeddings reconciled ({n} symbols)")
-                        }
-                        Ok(_) => {}
-                        Err(e) => eprintln!("[daemon] scip-import: embedding update failed: {e}"),
-                    }
-                }
-            }
             let touched = stats.touched_files.clone();
             reply.send(WriteResult::ScipImportOk(stats));
             touched
@@ -3095,6 +3120,24 @@ fn finish_scip_import(
     };
 
     (Some(guard), touched_files)
+}
+
+/// Reconciles embeddings with the symbols a SCIP enrichment added or enriched,
+/// once its imports have settled (`SCIP_EMBED_SETTLE`).
+fn reconcile_embeddings_after_scip(root: &Path, held: &HeldPrism) {
+    let Some(backend) = held.as_ref().and_then(|prism| prism.backend()) else {
+        return;
+    };
+    // `update_embeddings` returns the total embedding count on disk after
+    // reconciling, not how many it re-embedded (unchanged inputs are skipped
+    // by hash) -- log it as exactly that.
+    match crate::embed::update_embeddings(backend, root, &[]) {
+        Ok(n) if n > 0 => {
+            eprintln!("[daemon] scip-import: embeddings reconciled ({n} symbols)")
+        }
+        Ok(_) => {}
+        Err(e) => eprintln!("[daemon] scip-import: embedding update failed: {e}"),
+    }
 }
 
 /// Give one rebuild's result to every client waiting on it (#164).
@@ -4075,6 +4118,22 @@ fn has_cross_file_calls(prism: &Infigraph, rel_path: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn scip_embeddings_wait_for_the_imports_of_a_cycle_to_stop() {
+        let ago = |secs: u64| {
+            std::time::Instant::now()
+                .checked_sub(Duration::from_secs(secs))
+                .unwrap()
+        };
+        // Nothing imported: nothing is due.
+        assert!(!scip_embeddings_due(None, false));
+        // Just imported, or still importing the next indexer's output: wait.
+        assert!(!scip_embeddings_due(Some(ago(1)), false));
+        assert!(!scip_embeddings_due(Some(ago(3600)), true));
+        // Settled: one reconcile for the whole cycle.
+        assert!(scip_embeddings_due(Some(ago(31)), false));
+    }
+
     use super::*;
     use protobuf::Message as _;
 
@@ -4914,13 +4973,8 @@ mod tests {
         );
 
         let joined = router.drain_rt.block_on(pending.task.join());
-        let (guard, _touched_files) = finish_scip_import(
-            &root,
-            pending.reply,
-            &router.held,
-            pending.indexer_label.as_deref(),
-            joined,
-        );
+        let (guard, _touched_files) =
+            finish_scip_import(pending.reply, pending.indexer_label.as_deref(), joined);
         assert!(
             guard.is_some(),
             "expected the index-op guard back on a successful import"
@@ -4972,6 +5026,7 @@ mod tests {
         let s = scip_settings(tempfile::tempdir().unwrap().path());
         assert_eq!(s.index_staleness_threshold, 50);
         assert_eq!(s.index_staleness_check_secs, 300);
+        assert_eq!(s.start_grace_secs, 180);
     }
 
     /// A docs handle whose `index_docs` runs `self.0`.

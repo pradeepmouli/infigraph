@@ -121,6 +121,7 @@ fn coordinator_triggers_scip_enrichment_once_when_staleness_exceeds_threshold() 
 
     std::env::set_var("INFIGRAPH_SCIP_INDEX_STALENESS_THRESHOLD", "2");
     std::env::set_var("INFIGRAPH_SCIP_INDEX_STALENESS_CHECK_SECS", "1");
+    std::env::set_var("INFIGRAPH_SCIP_START_GRACE_SECS", "0");
 
     let calls: Calls = Arc::new(Mutex::new(Vec::new()));
     let (stop_tx, handle) = start_coordinator(project_dir.path(), &calls);
@@ -169,6 +170,36 @@ fn coordinator_triggers_scip_enrichment_once_when_staleness_exceeds_threshold() 
 
     std::env::remove_var("INFIGRAPH_SCIP_INDEX_STALENESS_THRESHOLD");
     std::env::remove_var("INFIGRAPH_SCIP_INDEX_STALENESS_CHECK_SECS");
+    std::env::remove_var("INFIGRAPH_SCIP_START_GRACE_SECS");
+}
+
+/// The same drifted graph, and the trigger would fire at once -- but the
+/// daemon has just started, and a restart, the true-up and an editing burst
+/// settle first. The positive test above sees its request within 20s with the
+/// grace at 0, so a quiet 6s here is a real wait, not a coordinator that never
+/// got going.
+#[test]
+fn the_staleness_trigger_waits_out_the_start_grace() {
+    let _env = ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let project_dir = stale_project();
+    std::env::set_var("INFIGRAPH_SCIP_INDEX_STALENESS_THRESHOLD", "2");
+    std::env::set_var("INFIGRAPH_SCIP_INDEX_STALENESS_CHECK_SECS", "1");
+    std::env::set_var("INFIGRAPH_SCIP_START_GRACE_SECS", "3600");
+
+    let calls: Calls = Arc::new(Mutex::new(Vec::new()));
+    let (stop_tx, handle) = start_coordinator(project_dir.path(), &calls);
+    std::thread::sleep(Duration::from_secs(6));
+    assert!(
+        calls.lock().unwrap().is_empty(),
+        "enrichment started inside the start grace: {:?}",
+        calls.lock().unwrap()
+    );
+    stop_tx.send(()).unwrap();
+    handle.join().unwrap().unwrap();
+
+    std::env::remove_var("INFIGRAPH_SCIP_INDEX_STALENESS_THRESHOLD");
+    std::env::remove_var("INFIGRAPH_SCIP_INDEX_STALENESS_CHECK_SECS");
+    std::env::remove_var("INFIGRAPH_SCIP_START_GRACE_SECS");
 }
 
 /// `[scip] enabled = false`: the same drifted graph, the same coordinator,
@@ -188,6 +219,7 @@ fn coordinator_does_not_trigger_scip_enrichment_when_scip_is_off() {
 
     std::env::set_var("INFIGRAPH_SCIP_INDEX_STALENESS_THRESHOLD", "2");
     std::env::set_var("INFIGRAPH_SCIP_INDEX_STALENESS_CHECK_SECS", "1");
+    std::env::set_var("INFIGRAPH_SCIP_START_GRACE_SECS", "0");
 
     let calls: Calls = Arc::new(Mutex::new(Vec::new()));
     let (stop_tx, handle) = start_coordinator(project_dir.path(), &calls);
@@ -206,6 +238,7 @@ fn coordinator_does_not_trigger_scip_enrichment_when_scip_is_off() {
         .expect("coordinator loop returned an error instead of a clean shutdown");
     std::env::remove_var("INFIGRAPH_SCIP_INDEX_STALENESS_THRESHOLD");
     std::env::remove_var("INFIGRAPH_SCIP_INDEX_STALENESS_CHECK_SECS");
+    std::env::remove_var("INFIGRAPH_SCIP_START_GRACE_SECS");
 
     assert_eq!(
         recorded, 0,
@@ -232,6 +265,7 @@ fn a_disabled_language_is_not_enriched_by_the_staleness_trigger() {
     .unwrap();
     std::env::set_var("INFIGRAPH_SCIP_INDEX_STALENESS_THRESHOLD", "2");
     std::env::set_var("INFIGRAPH_SCIP_INDEX_STALENESS_CHECK_SECS", "1");
+    std::env::set_var("INFIGRAPH_SCIP_START_GRACE_SECS", "0");
 
     let calls: Calls = Arc::new(Mutex::new(Vec::new()));
     let (stop_tx, handle) = start_coordinator(project_dir.path(), &calls);
@@ -242,6 +276,7 @@ fn a_disabled_language_is_not_enriched_by_the_staleness_trigger() {
     handle.join().unwrap().expect("clean shutdown");
     std::env::remove_var("INFIGRAPH_SCIP_INDEX_STALENESS_THRESHOLD");
     std::env::remove_var("INFIGRAPH_SCIP_INDEX_STALENESS_CHECK_SECS");
+    std::env::remove_var("INFIGRAPH_SCIP_START_GRACE_SECS");
 
     assert_eq!(seen, 0, "a disabled language was handed to the indexers");
 }

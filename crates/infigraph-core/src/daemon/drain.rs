@@ -30,6 +30,7 @@ pub(crate) fn execute_drain(infigraph: &Infigraph, drained: DrainedQueue) -> Res
     // below note what they lose (edges a COPY dropped, a removal that failed,
     // call resolution that failed) and this takes it when the drain ends.
     let run = crate::last_run::begin(crate::last_run::Kind::Index);
+    let _slow = crate::phase_clock::SlowOp::start(|| "drain".to_string());
     let outcome = answer_waiters(infigraph, drained);
     record_drain_run(infigraph.root(), run, &outcome);
     outcome

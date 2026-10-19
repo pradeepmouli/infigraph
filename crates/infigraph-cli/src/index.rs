@@ -1815,6 +1815,9 @@ fn indexer_command(
     // Its own process group, so a timeout or a cancellation can kill the
     // indexer together with what it started (R2.5.1).
     infigraph_core::child::lead_own_group(&mut command);
+    // An indexer runs for minutes at several cores and nobody asked for it:
+    // it yields to the person's editor and compiler.
+    infigraph_core::child::run_at_background_priority(&mut command);
 
     if let Some(flag) = output_flag {
         command.arg(flag).arg(output_path);
@@ -1854,6 +1857,7 @@ const STDERR_DRAIN_GRACE: std::time::Duration = std::time::Duration::from_millis
 /// and keeping the tail. The drain also keeps a full pipe from blocking the
 /// child.
 fn drain_stderr(
+    label: &str,
     stderr: tokio::process::ChildStderr,
 ) -> (
     tokio::task::JoinHandle<()>,
@@ -1862,9 +1866,11 @@ fn drain_stderr(
     use tokio::io::AsyncBufReadExt;
     let tail = std::sync::Arc::new(std::sync::Mutex::new(StderrTail::default()));
     let tail_for_task = std::sync::Arc::clone(&tail);
+    let label = label.to_string();
     let handle = tokio::spawn(async move {
         let mut reader = tokio::io::BufReader::new(stderr);
         let mut buf = Vec::new();
+        let mut repeats = StderrRepeats::default();
         loop {
             buf.clear();
             match reader.read_until(b'\n', &mut buf).await {
@@ -1873,15 +1879,80 @@ fn drain_stderr(
                     let line = String::from_utf8_lossy(&buf)
                         .trim_end_matches(['\n', '\r'])
                         .to_string();
-                    eprintln!("{line}");
+                    if repeats.shown(&line) {
+                        eprintln!("{line}");
+                    }
                     if let Ok(mut tail) = tail_for_task.lock() {
                         tail.push(line);
                     }
                 }
             }
         }
+        for note in repeats.summary(&label) {
+            eprintln!("{note}");
+        }
     });
     (handle, tail)
+}
+
+/// How many lines of one kind an indexer's stderr shows before the rest are
+/// only counted.
+const STDERR_LINES_PER_KIND: usize = 3;
+
+/// What an indexer's stderr says too often to repeat. rust-analyzer prints one
+/// `ERROR Bug: definition at ... should have been in an SCIP document but was
+/// not` per definition it could not place, and `Duplicate symbol ...` per
+/// duplicate: hundreds of thousands of lines, a 9 MB `daemon.log`, on a large
+/// workspace. The first few lines of each kind are shown in full, the rest
+/// counted and summarised when the indexer ends; the tail kept for a failure
+/// message still sees every line.
+///
+/// A line's kind is its first two words that carry no digit or slash (a
+/// timestamp, a path or a position never makes two lines differ): a heuristic,
+/// and a wrong one only costs lines in the log, never a failure message.
+#[derive(Default)]
+struct StderrRepeats {
+    kinds: std::collections::HashMap<String, (usize, String)>,
+}
+
+impl StderrRepeats {
+    fn kind(line: &str) -> String {
+        line.split_whitespace()
+            .filter(|word| !word.contains(|c: char| c.is_ascii_digit() || c == '/' || c == '\\'))
+            .take(2)
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// Whether `line` is shown now.
+    fn shown(&mut self, line: &str) -> bool {
+        let entry = self
+            .kinds
+            .entry(Self::kind(line))
+            .or_insert_with(|| (0, line.to_string()));
+        entry.0 += 1;
+        entry.0 <= STDERR_LINES_PER_KIND
+    }
+
+    /// One line per kind that had lines left out, most frequent first.
+    fn summary(&self, label: &str) -> Vec<String> {
+        let mut left_out: Vec<(&usize, &String)> = self
+            .kinds
+            .values()
+            .filter(|(n, _)| *n > STDERR_LINES_PER_KIND)
+            .map(|(n, first)| (n, first))
+            .collect();
+        left_out.sort_by(|a, b| b.0.cmp(a.0));
+        left_out
+            .into_iter()
+            .map(|(n, first)| {
+                format!(
+                    "Auto-SCIP: {label} printed {} more line(s) like: {first}",
+                    n - STDERR_LINES_PER_KIND
+                )
+            })
+            .collect()
+    }
 }
 
 /// How an indexer attempt failed.
@@ -2118,7 +2189,7 @@ async fn run_indexer(
             let mut group = infigraph_core::child::GroupKillOnDrop::new(child.id());
             let (drain, tail) = match child.stderr.take() {
                 Some(stderr) => {
-                    let (drain, tail) = drain_stderr(stderr);
+                    let (drain, tail) = drain_stderr(label, stderr);
                     (Some(drain), tail)
                 }
                 None => (None, Default::default()),
@@ -2283,6 +2354,29 @@ impl IndexerRun<'_> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_indexers_repeated_stderr_lines_are_shown_a_few_times_and_then_counted() {
+        let mut repeats = StderrRepeats::default();
+        let shown: usize = (0..1000)
+            .map(|n| {
+                repeats.shown(&format!(
+                    "ERROR Bug: definition at /w/src/f{n}.ts:{n}:3 should have been in an SCIP document but was not"
+                ))
+            })
+            .filter(|shown| *shown)
+            .count();
+        assert_eq!(shown, STDERR_LINES_PER_KIND);
+        // Another kind has its own allowance.
+        assert!(repeats.shown("Duplicate symbol foo"));
+        assert!(repeats.shown("Duplicate symbol bar"));
+        let summary = repeats.summary("scip-typescript");
+        assert_eq!(summary.len(), 1, "{summary:?}");
+        assert!(
+            summary[0].contains("997 more line(s) like: ERROR Bug: definition at /w/src/f0.ts:0:3"),
+            "{summary:?}"
+        );
+    }
+
     use super::*;
     #[cfg(unix)]
     use infigraph_core::child::STDERR_TAIL_BYTES;
