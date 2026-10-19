@@ -20,7 +20,7 @@ use infigraph_core::docs_switch;
 use infigraph_core::git_blame::civil_date;
 
 use crate::ack::{self, AckPlan};
-use crate::code_links::{entries, Entry, LinkKind};
+use crate::code_links::{entries, fenced_keys, Entry, LinkKind};
 use crate::link_check;
 use crate::ops;
 
@@ -455,8 +455,43 @@ fn lookup(root: &Path, target: &str, pick: &Pick) -> Result<Lookup> {
     })
 }
 
+/// Where `target`'s heading sits inside a code fence, if it does: the files
+/// to look in are the one the pick names, the ones the index lists it in and
+/// the ones the index recorded a fenced heading for.
+fn fence_hint(root: &Path, target: &str, pick: &Pick) -> Result<Option<String>> {
+    let keys = [target.to_string()];
+    let mut files: Vec<String> = pick.doc_file.iter().cloned().collect();
+    files.extend(indexed_at(root, target)?.into_iter().map(|(f, _)| f));
+    files.extend(
+        link_check::with_docs(root, |q| q.code_links_for(LinkKind::FencedKey, &keys))?
+            .into_iter()
+            .map(|r| r.doc_file),
+    );
+    files.sort();
+    files.dedup();
+    for file in files {
+        let Ok(text) = read_doc(root, &file) else {
+            continue;
+        };
+        if let Some(f) = fenced_keys(&text).into_iter().find(|f| f.key == target) {
+            return Ok(Some(format!(
+                "{file}:{} has that heading, but it is inside a code fence opened at line {} (no \
+                 closing fence before it); close or remove the opener",
+                f.line, f.opener
+            )));
+        }
+    }
+    Ok(None)
+}
+
 fn require(root: &Path, target: &str, pick: &Pick) -> Result<Located> {
-    match lookup(root, target, pick)? {
+    let looked = lookup(root, target, pick)?;
+    if matches!(looked, Lookup::Absent { .. }) {
+        if let Some(hint) = fence_hint(root, target, pick)? {
+            bail!("no entry is keyed to `{target}`: {hint}");
+        }
+    }
+    match looked {
         Lookup::Found { located, .. } => Ok(located),
         Lookup::Absent { stale: Some(file) } => bail!(
             "the index lists `{target}` in {file}, but the file has no such entry now (it was \

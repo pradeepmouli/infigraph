@@ -40,7 +40,7 @@ use crate::extract::{DocFormat, ExtractedDoc};
 /// What the index stores about a document's links is a function of this
 /// version: a document recorded under an older one is scanned again, even when
 /// its content has not changed.
-pub const CODE_LINKS_VERSION: i64 = 2;
+pub const CODE_LINKS_VERSION: i64 = 3;
 
 /// A mention's excerpt is cut to this many characters around the span.
 const EXCERPT_CHARS: usize = 240;
@@ -55,6 +55,9 @@ pub enum LinkKind {
     /// A code fence that is opened and never closed. It is not treated as a
     /// fence (see [`prose_lines`]); `doctor` lists it so the author learns of it.
     UnclosedFence,
+    /// A key heading inside a code fence, so not an entry: `target` is the key,
+    /// `line_start` its line and `line_end` the line of the fence that holds it.
+    FencedKey,
 }
 
 impl LinkKind {
@@ -64,6 +67,7 @@ impl LinkKind {
             LinkKind::Mentions => "mentions",
             LinkKind::NearMiss => "near-miss",
             LinkKind::UnclosedFence => "unclosed-fence",
+            LinkKind::FencedKey => "fenced-key",
         }
     }
 
@@ -73,6 +77,7 @@ impl LinkKind {
             "mentions" => Some(LinkKind::Mentions),
             "near-miss" => Some(LinkKind::NearMiss),
             "unclosed-fence" => Some(LinkKind::UnclosedFence),
+            "fenced-key" => Some(LinkKind::FencedKey),
             _ => None,
         }
     }
@@ -178,6 +183,44 @@ struct Prose<'a> {
     /// Numbered from 1.
     lines: Vec<(usize, &'a str)>,
     unclosed: Vec<(usize, &'a str)>,
+    /// Key-shaped headings inside a fence that closes.
+    fenced_keys: Vec<FencedKey>,
+}
+
+/// A key heading that sits inside a code fence, where it is not an entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FencedKey {
+    pub key: String,
+    /// The heading's line (1-based).
+    pub line: usize,
+    /// The line of the fence's opener.
+    pub opener: usize,
+}
+
+/// The key headings in `lines` (a fence's body, numbered from `first`).
+fn key_headings_in(lines: &[&str], first: usize, opener: usize) -> Vec<FencedKey> {
+    lines
+        .iter()
+        .enumerate()
+        .filter_map(|(k, content)| {
+            let m = heading_line().captures(content)?;
+            if !(2..=4).contains(&m[1].len()) {
+                return None;
+            }
+            let key = key_heading_text().captures(&m[2])?[1].to_string();
+            Some(FencedKey {
+                key,
+                line: first + k,
+                opener,
+            })
+        })
+        .collect()
+}
+
+/// The key headings of `text` that a code fence holds, in order: each reads as
+/// an entry to its author and is none.
+pub fn fenced_keys(text: &str) -> Vec<FencedKey> {
+    prose_lines(text).fenced_keys
 }
 
 /// The lines of `text` outside fenced code.
@@ -193,6 +236,7 @@ fn prose_lines(text: &str) -> Prose<'_> {
     let mut prose = Prose {
         lines: Vec::new(),
         unclosed: Vec::new(),
+        fenced_keys: Vec::new(),
     };
     // The shortest opener of each character that found no closer: a longer
     // one finds none either, so the rest of the file is not scanned again.
@@ -215,7 +259,12 @@ fn prose_lines(text: &str) -> Prose<'_> {
                 .map(|k| i + 1 + k)
         };
         match closer {
-            Some(end) => i = end + 1,
+            Some(end) => {
+                prose
+                    .fenced_keys
+                    .extend(key_headings_in(&all[i + 1..end], i + 2, i + 1));
+                i = end + 1;
+            }
             None => {
                 no_closer[slot] = Some(no_closer[slot].map_or(n, |min| min.min(n)));
                 prose.unclosed.push((i + 1, line.trim()));
@@ -406,6 +455,18 @@ pub fn extract_markdown(doc_file: &str, text: &str) -> Vec<CodeLinkRow> {
             });
         }
     }
+    for f in &prose.fenced_keys {
+        rows.push(CodeLinkRow {
+            id: next_id(&rows),
+            doc_file: doc_file.to_string(),
+            kind: LinkKind::FencedKey,
+            target: f.key.clone(),
+            heading: format!("`{}`", f.key),
+            line_start: f.line,
+            line_end: f.opener,
+            text: String::new(),
+        });
+    }
     for (line, opener) in &prose.unclosed {
         rows.push(CodeLinkRow {
             id: next_id(&rows),
@@ -565,6 +626,38 @@ mod tests {
             (entries[0].key.as_str(), entries[0].start),
             ("a.ts::real", 21)
         );
+    }
+
+    /// The shape that cost an afternoon: a ```text opener that nothing
+    /// closes before the entries, whose first bare ``` closes it later.
+    const SWALLOWED: &str = "# Glossary\n\n```text\n<sketch>\n\n### `a.ts::one`\n\nWhy one.\n\n#### `a.ts::two`\n\nWhy two.\n\n```\n\n### `a.ts::three`\n\nWhy three.\n";
+
+    #[test]
+    fn a_key_heading_inside_a_fence_is_reported_with_the_fence_that_holds_it() {
+        let got = fenced_keys(SWALLOWED);
+        assert_eq!(
+            got.iter()
+                .map(|f| (f.key.as_str(), f.line, f.opener))
+                .collect::<Vec<_>>(),
+            [("a.ts::one", 6, 3), ("a.ts::two", 10, 3)]
+        );
+        // The entry after the closer is an ordinary entry.
+        assert_eq!(entries(SWALLOWED).len(), 1);
+        let rows: Vec<_> = rows(SWALLOWED)
+            .into_iter()
+            .filter(|r| r.kind == LinkKind::FencedKey)
+            .collect();
+        assert_eq!(rows.len(), 2, "{rows:#?}");
+        assert_eq!(
+            (
+                rows[0].target.as_str(),
+                rows[0].line_start,
+                rows[0].line_end
+            ),
+            ("a.ts::one", 6, 3)
+        );
+        // A heading that is not a key, or sits at level 1/5, is not reported.
+        assert!(fenced_keys("```\n### plain\n##### `a.ts::x`\n# `a.ts::y`\n```\n").is_empty());
     }
 
     #[test]

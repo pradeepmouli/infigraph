@@ -153,6 +153,66 @@ fn a_refusal_is_a_failed_command_that_says_why() {
     );
 }
 
+/// An entry inside a code fence is not an entry. The refusal must say the
+/// heading is there and which fence holds it, not that no entry exists --
+/// whether the index was behind (the file was edited after it) or never saw it.
+#[test]
+fn an_entry_swallowed_by_a_fence_is_refused_with_the_fence_named() {
+    let (project, home) = stale_project();
+    let root = project.path();
+    let _daemon = start_daemon(root, home.path());
+    assert_ok(
+        &run(root, home.path(), DAEMON, &["index-docs"]),
+        "index-docs",
+    );
+    let words = |root: &Path| {
+        run(
+            root,
+            home.path(),
+            DAEMON,
+            &[
+                "doc-entry",
+                "edit",
+                "app.py::f",
+                "--old",
+                "Why f.",
+                "--new",
+                "x",
+            ],
+        )
+    };
+
+    // The index lists the entry; the file now holds it inside a fence.
+    std::fs::write(
+        root.join("docs/g.md"),
+        "# G\n\n```text\n<sketch>\n\n### `app.py::f`\n\nWhy f.\n\n```\n",
+    )
+    .unwrap();
+    let behind = words(root);
+    assert!(!behind.status.success());
+    let err = String::from_utf8_lossy(&behind.stderr).into_owned();
+    assert!(
+        err.contains(
+            "docs/g.md:6 has that heading, but it is inside a code fence opened at line 3"
+        ),
+        "{err}"
+    );
+
+    // Indexed that way from the start: the index never listed it.
+    assert_ok(
+        &run(root, home.path(), DAEMON, &["index-docs"]),
+        "index-docs again",
+    );
+    let never = words(root);
+    let err = String::from_utf8_lossy(&never.stderr).into_owned();
+    assert!(
+        err.contains(
+            "docs/g.md:6 has that heading, but it is inside a code fence opened at line 3"
+        ),
+        "{err}"
+    );
+}
+
 #[test]
 fn one_of_two_entries_with_a_key_is_chosen_with_nth() {
     let (project, home) = stale_project();
