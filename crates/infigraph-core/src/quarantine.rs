@@ -136,7 +136,8 @@ impl WalRecovery {
 /// exercise the file shuffling without spawning a process. A test binary must
 /// never reach the real probe: `current_exe()` there is libtest's harness,
 /// which re-runs the whole suite instead of probing.
-pub(crate) fn try_recover_by_setting_wal_aside_with(
+#[doc(hidden)]
+pub fn try_recover_by_setting_wal_aside_with(
     infigraph_dir: &Path,
     graph_name: &str,
     probe: impl Fn(&Path) -> bool,

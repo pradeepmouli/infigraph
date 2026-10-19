@@ -728,6 +728,22 @@ impl GraphStore {
 
     /// Open with a caller-chosen wait budget for the schema-init write lock.
     pub fn open_with_lock_timeout(path: &Path, timeout: std::time::Duration) -> Result<Self> {
+        Self::open_with_recovery(
+            path,
+            timeout,
+            &crate::quarantine::try_recover_by_setting_wal_aside,
+        )
+    }
+
+    /// [`Self::open_with_lock_timeout`] with the recovery after an opener's
+    /// death injected: the real one probes in a child process, which a test
+    /// binary must never spawn (see `probe::PROBE_CAPABLE`).
+    #[doc(hidden)]
+    pub fn open_with_recovery(
+        path: &Path,
+        timeout: std::time::Duration,
+        recover: &dyn Fn(&Path, &str) -> crate::quarantine::WalRecovery,
+    ) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -743,6 +759,19 @@ impl GraphStore {
                 path.display()
             );
         }
+        // A probe child is the one asked whether this file opens: it must
+        // neither be judged by, nor leave, the record of earlier deaths.
+        let window = match path.parent() {
+            Some(dir) if std::env::var_os(crate::probe::PROBE_ENV).is_none() => {
+                crate::recovery::settle_open_deaths(
+                    dir,
+                    &path.file_name().unwrap_or_default().to_string_lossy(),
+                    recover,
+                )?;
+                Some(crate::recovery::OpenWindow::enter(dir))
+            }
+            _ => None,
+        };
         let db = {
             // Opening replays the WAL and may checkpoint -- transaction-
             // manager code with no Rust frame above it to catch anything.
@@ -783,6 +812,9 @@ impl GraphStore {
             )
             .map_err(|e| anyhow::anyhow!("failed to open kuzu db: {e}"))?
         };
+        if let Some(window) = window {
+            window.opened();
+        }
         refuse_newer_schema(&db, path)?;
         let store = Self {
             db,
