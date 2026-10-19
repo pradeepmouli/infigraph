@@ -186,15 +186,23 @@ pub fn scip_enabled(root: &Path) -> bool {
         .0
 }
 
+/// True for a graph SCIP has never enriched: its generation stamp is not
+/// positive. The daemon's staleness trigger skips such a graph (a project
+/// that never opted into SCIP must not start running external indexers), and
+/// so does `doctor`'s staleness check; `infigraph index` is what enriches it.
+pub fn never_enriched(scip_generation: i64) -> bool {
+    scip_generation <= 0
+}
+
 /// Whether `infigraph index` starts SCIP enrichment for `root` when it
-/// finishes. A linked worktree skips it on an incremental index:
-/// `worktree init` copied the main checkout's already-enriched graph, the
-/// indexers re-index the whole project for any change, and the daemon's
-/// staleness check enriches the worktree once it has drifted far enough. A
-/// full rebuild starts from an empty graph that the staleness check would
-/// never enrich (it skips a graph never enriched), so it still does.
-pub fn index_enriches(root: &Path, full: bool) -> bool {
-    scip_enabled(root) && (full || !crate::worktree::is_linked_worktree(root))
+/// finishes: on a full reindex, and on any index of a graph that was never
+/// enriched (`never_enriched`, given the graph's SCIP generation). An
+/// incremental index of an enriched graph does not: the indexers re-index
+/// the whole project for any change, and the daemon's staleness trigger
+/// enriches after enough drift. A graph never enriched is the one that
+/// trigger skips, which is why it must enrich here.
+pub fn index_enriches(root: &Path, full: bool, scip_generation: i64) -> bool {
+    scip_enabled(root) && (full || never_enriched(scip_generation))
 }
 
 /// The env var that overrides [`scip_enabled`], derived from the settings
@@ -264,20 +272,18 @@ mod index_enriches_tests {
     use crate::settings_file::test_support::{PinnedHome, ENV_LOCK};
 
     #[test]
-    fn a_linked_worktree_skips_enrichment_on_an_incremental_index_only() {
+    fn an_incremental_index_enriches_only_a_graph_that_never_was() {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::remove_var(enabled_env_name());
         let _home = PinnedHome::empty();
-        let (_tmp, main, linked) = crate::worktree::tests::repo_with_linked_worktree();
-        assert!(!index_enriches(&linked, false), "incremental in a worktree");
-        assert!(
-            index_enriches(&linked, true),
-            "a full rebuild still enriches"
-        );
-        assert!(
-            index_enriches(&main, false),
-            "the main checkout is unchanged"
-        );
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(index_enriches(tmp.path(), false, 0), "never enriched");
+        assert!(!index_enriches(tmp.path(), false, 3), "already enriched");
+        assert!(index_enriches(tmp.path(), true, 3), "a full index always");
+        // A linked worktree is no special case: it follows its own graph.
+        let (_tmp, _main, linked) = crate::worktree::tests::repo_with_linked_worktree();
+        assert!(!index_enriches(&linked, false, 3));
+        assert!(index_enriches(&linked, false, 0));
     }
 
     #[test]
@@ -286,7 +292,7 @@ mod index_enriches_tests {
         let _home = PinnedHome::empty();
         let tmp = tempfile::tempdir().unwrap();
         std::env::set_var(enabled_env_name(), "0");
-        let full = index_enriches(tmp.path(), true);
+        let full = index_enriches(tmp.path(), true, 0);
         std::env::remove_var(enabled_env_name());
         assert!(!full);
     }

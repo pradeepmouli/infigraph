@@ -464,7 +464,8 @@ pub(crate) fn cmd_index(root: &Path, full: bool, no_embed: bool) -> Result<()> {
 
     // Compute and save embeddings — only for new/changed symbols
     if no_embed {
-        if infigraph_core::scip_switch::index_enriches(root, full) {
+        if infigraph_core::scip_switch::index_enriches(root, full, scip_generation(prism.backend()))
+        {
             auto_scip(root, &result, prism.backend())?;
         }
         return Ok(());
@@ -515,6 +516,8 @@ pub(crate) fn cmd_index(root: &Path, full: bool, no_embed: bool) -> Result<()> {
             .map(|e| e.language.clone())
             .collect(),
     );
+    let enriches =
+        infigraph_core::scip_switch::index_enriches(root, full, scip_generation(prism.backend()));
     drop(prism);
 
     // Release the index-op lock before spawning the detached scip-enrich
@@ -528,8 +531,8 @@ pub(crate) fn cmd_index(root: &Path, full: bool, no_embed: bool) -> Result<()> {
     // A full reindex is not really finished until its enrichment is: pass
     // the same `full && !remote` condition that gated the stamp above, so
     // the child re-stamps once the enriched graph is the real one.
-    // Off, or an incremental index of a linked worktree: see `index_enriches`.
-    if infigraph_core::scip_switch::index_enriches(root, full) {
+    // Not on an incremental index of an enriched graph: see `index_enriches`.
+    if enriches {
         spawn_scip_child_process(root, &detected_languages, full && !remote);
     }
 
@@ -621,6 +624,14 @@ fn format_timestamp(epoch_secs: u64) -> String {
     chrono::DateTime::from_timestamp(epoch_secs as i64, 0)
         .map(|dt| dt.to_rfc3339())
         .unwrap_or_else(|| format!("epoch {epoch_secs}"))
+}
+
+/// The graph's SCIP generation as `index_enriches` wants it; an unreadable
+/// one counts as never enriched, so an index errs toward enriching.
+fn scip_generation(backend: Option<&dyn infigraph_core::graph::GraphBackend>) -> i64 {
+    backend
+        .and_then(|b| b.current_scip_generation().ok())
+        .unwrap_or(0)
 }
 
 fn spawn_scip_child_process(
