@@ -1381,7 +1381,7 @@ fn check_one_project_scip_staleness(project_path: &Path) -> Option<CheckResult> 
         })
         .ok()?;
 
-    if scip_gen == 0 {
+    if crate::scip_switch::never_enriched(scip_gen) {
         return None;
     }
 

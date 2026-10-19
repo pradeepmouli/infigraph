@@ -214,7 +214,7 @@ pub(crate) fn scip_enrichment_due(
     last_attempt_ast_generation: Option<i64>,
     threshold: u64,
 ) -> bool {
-    if threshold == 0 || scip_generation <= 0 {
+    if threshold == 0 || crate::scip_switch::never_enriched(scip_generation) {
         return false;
     }
     let threshold = i64::try_from(threshold).unwrap_or(i64::MAX);

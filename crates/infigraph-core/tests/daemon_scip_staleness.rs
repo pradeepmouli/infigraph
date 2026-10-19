@@ -4,6 +4,7 @@
 //! drives `run_write_coordinator` in-process with a fake `on_full_reindex`
 //! callback that only records what it was asked to enrich.
 
+use sha2::Digest;
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
@@ -18,6 +19,14 @@ fn stale_project() -> tempfile::TempDir {
     std::fs::create_dir_all(&infigraph_dir).unwrap();
     let graph_path = infigraph_dir.join("graph");
 
+    // The file is on disk and the graph holds its real hash: the daemon's
+    // start-up true-up hash-diffs the tree, and a file it found missing
+    // would be dropped from the graph, leaving no language to enrich.
+    let source = b"pub fn f() {}\n";
+    std::fs::create_dir_all(project_dir.path().join("src")).unwrap();
+    std::fs::write(project_dir.path().join("src/lib.rs"), source).unwrap();
+    let content_hash = format!("{:x}", sha2::Sha256::digest(source));
+
     {
         let backend = KuzuBackend::open(&graph_path).unwrap();
         backend
@@ -25,7 +34,7 @@ fn stale_project() -> tempfile::TempDir {
                 &[FileExtraction {
                     file: "src/lib.rs".to_string(),
                     language: "rust".to_string(),
-                    content_hash: "aaa".to_string(),
+                    content_hash: content_hash.clone(),
                     symbols: vec![],
                     relations: vec![],
                     statements: vec![],
