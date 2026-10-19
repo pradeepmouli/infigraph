@@ -325,8 +325,9 @@ fn keys_result(
         for r in rows.iter().take(EXAMPLES) {
             note.push_str(&format!(
                 "\n    {}:{} has the key heading `{}`, but it is inside a code fence opened at \
-                 line {} (no closing fence before it); close or remove the opener",
-                r.doc_file, r.line_start, r.target, r.line_end
+                 line {} and closed at line {}; close or remove the opener, or make it a \
+                 ```markdown fence if the heading is an example",
+                r.doc_file, r.line_start, r.target, r.line_end, r.text
             ));
         }
         if rows.len() > EXAMPLES {
@@ -735,7 +736,7 @@ mod tests {
             heading: "`a.ts::one`".to_string(),
             line_start: line,
             line_end: opener,
-            text: String::new(),
+            text: "13".to_string(),
         };
         let rows = vec![row(6, 3), row(10, 3)];
         let got = keys_result(
@@ -751,7 +752,7 @@ mod tests {
         assert!(
             got.message.contains(
                 "docs/a.md:6 has the key heading `a.ts::one`, but it is inside a code fence \
-                 opened at line 3"
+                 opened at line 3 and closed at line 13"
             ),
             "{}",
             got.message

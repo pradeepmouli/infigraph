@@ -56,7 +56,8 @@ pub enum LinkKind {
     /// fence (see [`prose_lines`]); `doctor` lists it so the author learns of it.
     UnclosedFence,
     /// A key heading inside a code fence, so not an entry: `target` is the key,
-    /// `line_start` its line and `line_end` the line of the fence that holds it.
+    /// `line_start` its line, `line_end` the line of the fence that holds it
+    /// and `text` the line (decimal) where that fence closes.
     FencedKey,
 }
 
@@ -195,10 +196,20 @@ pub struct FencedKey {
     pub line: usize,
     /// The line of the fence's opener.
     pub opener: usize,
+    /// The line of the fence's closer, after the heading.
+    pub closer: usize,
+}
+
+/// Whether a fence's info string names Markdown (```` ```markdown ````, ```` ```md ````).
+fn shows_markdown(info: &str) -> bool {
+    matches!(
+        info.split_whitespace().next(),
+        Some("markdown" | "md" | "mdx")
+    )
 }
 
 /// The key headings in `lines` (a fence's body, numbered from `first`).
-fn key_headings_in(lines: &[&str], first: usize, opener: usize) -> Vec<FencedKey> {
+fn key_headings_in(lines: &[&str], first: usize, opener: usize, closer: usize) -> Vec<FencedKey> {
     lines
         .iter()
         .enumerate()
@@ -212,6 +223,7 @@ fn key_headings_in(lines: &[&str], first: usize, opener: usize) -> Vec<FencedKey
                 key,
                 line: first + k,
                 opener,
+                closer,
             })
         })
         .collect()
@@ -244,7 +256,7 @@ fn prose_lines(text: &str) -> Prose<'_> {
     let mut i = 0;
     while i < all.len() {
         let line = all[i];
-        let Some((c, n, _)) = fence_marker(line) else {
+        let Some((c, n, info)) = fence_marker(line) else {
             prose.lines.push((i + 1, line));
             i += 1;
             continue;
@@ -260,9 +272,15 @@ fn prose_lines(text: &str) -> Prose<'_> {
         };
         match closer {
             Some(end) => {
-                prose
-                    .fenced_keys
-                    .extend(key_headings_in(&all[i + 1..end], i + 2, i + 1));
+                // A fence that shows Markdown holds examples on purpose.
+                if !shows_markdown(info) {
+                    prose.fenced_keys.extend(key_headings_in(
+                        &all[i + 1..end],
+                        i + 2,
+                        i + 1,
+                        end + 1,
+                    ));
+                }
                 i = end + 1;
             }
             None => {
@@ -464,7 +482,7 @@ pub fn extract_markdown(doc_file: &str, text: &str) -> Vec<CodeLinkRow> {
             heading: format!("`{}`", f.key),
             line_start: f.line,
             line_end: f.opener,
-            text: String::new(),
+            text: f.closer.to_string(),
         });
     }
     for (line, opener) in &prose.unclosed {
@@ -637,9 +655,9 @@ mod tests {
         let got = fenced_keys(SWALLOWED);
         assert_eq!(
             got.iter()
-                .map(|f| (f.key.as_str(), f.line, f.opener))
+                .map(|f| (f.key.as_str(), f.line, f.opener, f.closer))
                 .collect::<Vec<_>>(),
-            [("a.ts::one", 6, 3), ("a.ts::two", 10, 3)]
+            [("a.ts::one", 6, 3, 14), ("a.ts::two", 10, 3, 14)]
         );
         // The entry after the closer is an ordinary entry.
         assert_eq!(entries(SWALLOWED).len(), 1);
@@ -656,6 +674,9 @@ mod tests {
             ),
             ("a.ts::one", 6, 3)
         );
+        // A fence that shows Markdown holds its example headings on purpose.
+        assert!(fenced_keys("```markdown\n### `a.ts::x`\n```\n").is_empty());
+        assert!(fenced_keys("```md title\n### `a.ts::x`\n```\n").is_empty());
         // A heading that is not a key, or sits at level 1/5, is not reported.
         assert!(fenced_keys("```\n### plain\n##### `a.ts::x`\n# `a.ts::y`\n```\n").is_empty());
     }

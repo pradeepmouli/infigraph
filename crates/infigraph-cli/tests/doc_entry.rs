@@ -193,7 +193,7 @@ fn an_entry_swallowed_by_a_fence_is_refused_with_the_fence_named() {
     let err = String::from_utf8_lossy(&behind.stderr).into_owned();
     assert!(
         err.contains(
-            "docs/g.md:6 has that heading, but it is inside a code fence opened at line 3"
+            "docs/g.md:6 has that heading, but it is inside a code fence opened at line 3 and closed at line 10"
         ),
         "{err}"
     );
@@ -207,7 +207,7 @@ fn an_entry_swallowed_by_a_fence_is_refused_with_the_fence_named() {
     let err = String::from_utf8_lossy(&never.stderr).into_owned();
     assert!(
         err.contains(
-            "docs/g.md:6 has that heading, but it is inside a code fence opened at line 3"
+            "docs/g.md:6 has that heading, but it is inside a code fence opened at line 3 and closed at line 10"
         ),
         "{err}"
     );

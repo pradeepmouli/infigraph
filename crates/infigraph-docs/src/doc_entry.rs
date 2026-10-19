@@ -475,9 +475,10 @@ fn fence_hint(root: &Path, target: &str, pick: &Pick) -> Result<Option<String>> 
         };
         if let Some(f) = fenced_keys(&text).into_iter().find(|f| f.key == target) {
             return Ok(Some(format!(
-                "{file}:{} has that heading, but it is inside a code fence opened at line {} (no \
-                 closing fence before it); close or remove the opener",
-                f.line, f.opener
+                "{file}:{} has that heading, but it is inside a code fence opened at line {} and \
+                 closed at line {}; close or remove the opener, or make it a ```markdown \
+                 fence if the heading is an example",
+                f.line, f.opener, f.closer
             )));
         }
     }

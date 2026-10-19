@@ -70,7 +70,7 @@ close, but later than its author meant (a ```` ```text ```` opener with no close
 before the entries, closed by the next bare fence): the headings between are
 inside it and are not entries. `doctor` lists each (`file:line has the key
 heading ..., but it is inside a code fence opened at line N`) and `doc_entry`
-refuses an op on such a key with the same sentence instead of "no such entry".
+refuses an op on such a key with the same sentence instead of "no such entry". A fence whose info string is `markdown` or `md` shows examples on purpose and is never reported.
 That is the whole format; nothing is configurable.
 
 `<file>::module` is an entry for the file itself (`src/billing/invoice.py::module`).
