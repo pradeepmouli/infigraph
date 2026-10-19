@@ -160,37 +160,61 @@ pub(crate) fn cmd_index(root: &Path, full: bool, no_embed: bool) -> Result<()> {
             // first; if the daemon still isn't up (auto-watch skipped: CI,
             // current_exe failure), make one explicit start attempt before
             // giving up with the actionable message.
-            let lock_path = root.join(".infigraph").join("watch.lock");
-            // #165: a daemon latched on a fault a fresh process can clear (a
-            // full disk it may be pinning through an unlinked graph, a graph
-            // it cannot reopen) would fail this rebuild the same way. End it
-            // and start a fresh one first; a healthy daemon is left serving
-            // reads throughout the rebuild.
-            if let Some(fault) = infigraph_core::daemon::lifecycle::end_faulted_daemon(root)? {
-                eprintln!("Stopped a daemon that could not recover on its own ({fault}); starting a fresh one.");
-                ensure_watcher_running(root);
-            }
-            if !wait_for_daemon(&lock_path, std::time::Duration::from_secs(10)) {
-                ensure_watcher_running(root);
-                if !wait_for_daemon(&lock_path, std::time::Duration::from_secs(10)) {
-                    return Err(infigraph_core::daemon::lifecycle::no_daemon_came_up(
-                        root,
-                        "a rebuild can only be served by one",
-                    ));
+            // One attempt: end a faulted daemon, wait for one, submit.
+            let attempt = || -> Result<infigraph_core::daemon_protocol::WriteResult> {
+                let lock_path = root.join(".infigraph").join("watch.lock");
+                // #165: a daemon latched on a fault a fresh process can clear (a
+                // full disk it may be pinning through an unlinked graph, a graph
+                // it cannot reopen) would fail this rebuild the same way. End it
+                // and start a fresh one first; a healthy daemon is left serving
+                // reads throughout the rebuild.
+                if let Some(fault) = infigraph_core::daemon::lifecycle::end_faulted_daemon(root)? {
+                    eprintln!("Stopped a daemon that could not recover on its own ({fault}); starting a fresh one.");
+                    ensure_watcher_running(root);
                 }
-            }
+                if !wait_for_daemon(&lock_path, std::time::Duration::from_secs(10)) {
+                    ensure_watcher_running(root);
+                    if !wait_for_daemon(&lock_path, std::time::Duration::from_secs(10)) {
+                        return Err(infigraph_core::daemon::lifecycle::no_daemon_came_up(
+                            root,
+                            "a rebuild can only be served by one",
+                        ));
+                    }
+                }
 
-            let result = infigraph_core::daemon::writes::submit(
-                root,
-                &infigraph_core::daemon_protocol::WriteRequest::FullReindex,
-                infigraph_core::daemon::writes::WriteOpts {
-                    timeout: std::time::Duration::from_secs(600),
-                    cancel: None,
-                    // #150: the daemon may wait for a machine-wide slot
-                    // before it starts; that wait is not the rebuild.
-                    on_slot_wait: Some(&|notice| eprintln!("{}", notice.warning_line())),
-                },
-            )?;
+                infigraph_core::daemon::writes::submit(
+                    root,
+                    &infigraph_core::daemon_protocol::WriteRequest::FullReindex,
+                    infigraph_core::daemon::writes::WriteOpts {
+                        timeout: std::time::Duration::from_secs(600),
+                        cancel: None,
+                        // #150: the daemon may wait for a machine-wide slot
+                        // before it starts; that wait is not the rebuild.
+                        on_slot_wait: Some(&|notice| eprintln!("{}", notice.warning_line())),
+                    },
+                )
+            };
+            // A daemon this command had to start can die by a fatal signal
+            // inside its graph open (a frozen WAL crashes lbug's replay), and
+            // the open window it left behind is the proof: its next start
+            // sets a torn WAL aside and opens. Retry once on that evidence
+            // alone, and say so; a daemon that died any other way is not
+            // retried.
+            let deaths_before =
+                infigraph_core::recovery::open_deaths(&root.join(".infigraph")).len();
+            let result = match attempt() {
+                Err(first)
+                    if infigraph_core::recovery::open_deaths(&root.join(".infigraph")).len()
+                        > deaths_before =>
+                {
+                    eprintln!(
+                        "daemon died opening the graph ({first:#}); retrying once -- its next start \
+                         sets a torn WAL aside"
+                    );
+                    attempt()?
+                }
+                other => other?,
+            };
             match result {
                 infigraph_core::daemon_protocol::WriteResult::FullReindexOk {
                     total_files,
