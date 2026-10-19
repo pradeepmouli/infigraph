@@ -187,6 +187,195 @@ pub fn crash_loop_detected(infigraph_dir: &Path) -> Option<Vec<u64>> {
         .map(|a| a.iter().filter_map(|x| x.as_u64()).collect())
 }
 
+// ---------------------------------------------------------------------------
+// The open window: a process that dies INSIDE `Database::new`
+// ---------------------------------------------------------------------------
+//
+// `write_phase`'s breadcrumb sees only SIGABRT, and the rebuild breaker above
+// counts rebuilds. Neither sees a SIGSEGV in lbug's WAL replay: the daemon
+// dies, the next start opens the same graph and the same WAL, and dies the
+// same way, with nothing in either record. So a process writes a sentinel
+// before it opens the graph and removes it after; a sentinel whose writer is
+// gone is one death of an opener, whatever the signal.
+
+const OPEN_SENTINEL_PREFIX: &str = "graph-opening.";
+const OPEN_DEATHS_LOG: &str = "open-deaths.log";
+
+/// Test hook: while the file this variable names exists, die by SIGSEGV
+/// inside the window, as lbug's replay did. A file holding `once` is removed
+/// by the process that dies on it, so the start after it is healthy.
+#[cfg(unix)]
+pub const TEST_DIE_IN_OPEN_WINDOW_ENV: &str = "INFIGRAPH_TEST_DIE_IN_OPEN_WINDOW";
+
+static OPEN_WINDOW_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The span of one `Database::new` on the main graph's WRITER open. A
+/// read-only open (`GraphStore::open_read_only`, the CLI's and the daemon's
+/// per-request reads) does not enter one: a reader that dies mid-open leaves
+/// no sentinel, so a crash there is invisible to this breaker -- do not assume
+/// a reader is covered. Opens are per request in the daemon, and a sentinel
+/// per read would put a file write on every one. Leaving it by any
+/// return path removes the sentinel; only [`OpenWindow::opened`] also clears
+/// the death log, because only a completed open ends a loop.
+pub struct OpenWindow {
+    sentinel: PathBuf,
+    dir: PathBuf,
+}
+
+impl OpenWindow {
+    /// Enter the window. A process that cannot write the sentinel opens
+    /// anyway: the breaker is a safety net, not a gate.
+    pub fn enter(infigraph_dir: &Path) -> OpenWindow {
+        let seq = OPEN_WINDOW_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let pid = std::process::id();
+        let sentinel = infigraph_dir.join(format!("{OPEN_SENTINEL_PREFIX}{pid}.{seq}"));
+        let payload = serde_json::json!({
+            "pid": pid,
+            "started_at": crate::instances::current_process_start_time(pid).unwrap_or(0),
+            "at": now_epoch_secs(),
+        });
+        let _ = crate::daemon_protocol::write_atomic(&sentinel, &payload.to_string());
+        #[cfg(unix)]
+        if let Some(trigger) =
+            std::env::var_os(TEST_DIE_IN_OPEN_WINDOW_ENV).filter(|f| Path::new(f).exists())
+        {
+            if std::fs::read_to_string(&trigger).is_ok_and(|t| t.trim() == "once") {
+                let _ = std::fs::remove_file(&trigger);
+            }
+            // SAFETY: restores the default action and raises; Rust's own
+            // SIGSEGV handler would otherwise swallow a raise() that is not a
+            // real fault.
+            unsafe {
+                libc::signal(libc::SIGSEGV, libc::SIG_DFL);
+                libc::raise(libc::SIGSEGV);
+            }
+        }
+        OpenWindow {
+            sentinel,
+            dir: infigraph_dir.to_path_buf(),
+        }
+    }
+
+    /// The open returned: the loop, if there was one, is over.
+    pub fn opened(self) {
+        let _ = std::fs::remove_file(self.dir.join(OPEN_DEATHS_LOG));
+    }
+}
+
+impl Drop for OpenWindow {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.sentinel);
+    }
+}
+
+/// Whether the process that wrote an open sentinel is gone. A recorded start
+/// time tells a reused pid from the original (`instances`, as `lockfile`).
+fn opener_is_gone(sentinel: &serde_json::Value) -> bool {
+    let Some(pid) = sentinel
+        .get("pid")
+        .and_then(|p| p.as_u64())
+        .and_then(|p| u32::try_from(p).ok())
+    else {
+        return true;
+    };
+    if pid == std::process::id() {
+        return false;
+    }
+    let recorded = sentinel
+        .get("started_at")
+        .and_then(|s| s.as_u64())
+        .unwrap_or(0);
+    match crate::instances::current_process_start_time(pid) {
+        None => true,
+        Some(actual) => recorded != 0 && actual != recorded,
+    }
+}
+
+/// Timestamps of opener deaths still inside the crash-loop window, after
+/// folding in every sentinel whose writer is gone (each is removed as it is
+/// counted, so two sweepers cannot count one death twice).
+pub fn open_deaths(infigraph_dir: &Path) -> Vec<u64> {
+    use std::io::Write;
+    if let Ok(entries) = std::fs::read_dir(infigraph_dir) {
+        for entry in entries.flatten() {
+            if !entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(OPEN_SENTINEL_PREFIX)
+            {
+                continue;
+            }
+            let gone = std::fs::read_to_string(entry.path())
+                .ok()
+                .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+                .is_none_or(|v| opener_is_gone(&v));
+            if gone && std::fs::remove_file(entry.path()).is_ok() {
+                if let Ok(mut log) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(infigraph_dir.join(OPEN_DEATHS_LOG))
+                {
+                    let _ = writeln!(log, "{}", now_epoch_secs());
+                }
+            }
+        }
+    }
+    let cutoff = now_epoch_secs().saturating_sub(CRASH_LOOP_WINDOW.as_secs());
+    std::fs::read_to_string(infigraph_dir.join(OPEN_DEATHS_LOG))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| l.trim().parse::<u64>().ok())
+        .filter(|&ts| ts >= cutoff)
+        .collect()
+}
+
+/// What to do before opening `graph_name` after earlier openers died inside
+/// the open. None died: nothing. Some did: the WAL is the usual cause, so ask
+/// `recover` (the out-of-process probe in production) to set a torn one aside
+/// -- `graph.torn-wal.<ts>.wal.checkpoint` -- and open without it. A graph
+/// that opens in neither state is `GraphCorruption`, which `Infigraph::init`
+/// answers with its rebuild; one a probe opens fine but that keeps killing
+/// its opener trips the existing crash-loop marker instead of looping.
+pub fn settle_open_deaths(
+    infigraph_dir: &Path,
+    graph_name: &str,
+    recover: &dyn Fn(&Path, &str) -> crate::quarantine::WalRecovery,
+) -> Result<()> {
+    use crate::quarantine::WalRecovery;
+    let deaths = open_deaths(infigraph_dir);
+    if deaths.is_empty() {
+        return Ok(());
+    }
+    eprintln!(
+        "[graph] {} earlier open(s) of {graph_name} died inside the open (a fatal signal, not an \
+         error); checking it before opening again",
+        deaths.len()
+    );
+    match recover(infigraph_dir, graph_name) {
+        WalRecovery::Recovered => Ok(()),
+        WalRecovery::NotRecoverable => {
+            Err(anyhow::Error::new(crate::graph::GraphCorruption {
+                detail: format!(
+                    "opening {graph_name} has killed the process {} time(s) and it does not open                      in a probe process either, with its WAL or without",
+                    deaths.len()
+                ),
+            }))
+        }
+        WalRecovery::AlreadyHealthy if deaths.len() >= CRASH_LOOP_THRESHOLD => {
+            write_crash_loop_marker(infigraph_dir, &deaths)?;
+            let _ = std::fs::remove_file(infigraph_dir.join(OPEN_DEATHS_LOG));
+            anyhow::bail!(
+                "crash-loop detected: opening {graph_name} has killed the process {} times within \
+                 the last hour, though a probe process opens it -- refusing to open it again. \
+                 Look at daemon.log and the crash reports, then delete {} to retry.",
+                deaths.len(),
+                crash_loop_marker_path(infigraph_dir).display()
+            )
+        }
+        WalRecovery::AlreadyHealthy => Ok(()),
+    }
+}
+
 /// Most recent cleanly-retired healthy graph for `graph_name`, if any --
 /// the degrade fallback (R3.1.4b).
 pub fn find_most_recent_previous(infigraph_dir: &Path, graph_name: &str) -> Option<PathBuf> {
