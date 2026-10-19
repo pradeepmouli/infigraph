@@ -1191,12 +1191,6 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    // ANTLR parsers recurse deeply; Rayon's default 2MB stack overflows.
-    // Windows default main-thread stack is 1MB — also too small.
-    let _ = rayon::ThreadPoolBuilder::new()
-        .stack_size(32 * 1024 * 1024)
-        .build_global();
-
     // A pre-edit hook runs on every Markdown edit: answer at once, with no
     // update check, no settings validation and no worker thread.
     if std::env::args().nth(1).as_deref() == Some("doc-guard") {
@@ -1207,6 +1201,17 @@ fn main() -> Result<()> {
     let update_handle = install::check_for_update_background();
 
     let cli = Cli::parse();
+    // The daemon works in the background of a shared machine, so it takes a
+    // bounded share of its cores; every other command is one a person waits
+    // on and keeps them all. Before any pool or `Database` exists. (Also
+    // sets the 32MB stacks ANTLR's deep recursion needs: rayon's default 2MB
+    // overflows, Windows' 1MB main-thread stack too.)
+    infigraph_core::pools::set_role(if matches!(cli.command, Commands::Daemon { .. }) {
+        infigraph_core::pools::Role::Background
+    } else {
+        infigraph_core::pools::Role::Foreground
+    });
+    infigraph_core::pools::init_global_rayon();
     // Resolve to the project that owns the cwd, not the cwd itself. Taking
     // the cwd verbatim is what created a separate store, daemon and socket
     // for every subdirectory anyone ever ran a command from.

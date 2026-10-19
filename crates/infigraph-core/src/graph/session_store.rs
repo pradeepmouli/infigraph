@@ -324,9 +324,11 @@ impl SessionStore {
         // fail here for want of creation. The default pool is auto-detected
         // from system RAM, which is wildly out of proportion for one query
         // against a legacy sessions file.
-        let config = kuzu::SystemConfig::default()
-            .read_only(true)
-            .buffer_pool_size(Self::LEGACY_SESSION_READ_POOL_BYTES);
+        let config = crate::pools::lbug_config(
+            kuzu::SystemConfig::default()
+                .read_only(true)
+                .buffer_pool_size(Self::LEGACY_SESSION_READ_POOL_BYTES),
+        );
         let db = match kuzu::Database::new(db_path, config) {
             Ok(db) => db,
             Err(_) => return Vec::new(),

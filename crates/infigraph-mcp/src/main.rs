@@ -490,9 +490,10 @@ fn run_worker() -> Result<()> {
     // not sufficient: --ui/--serve modes never read stdin.
     infigraph_mcp::lifecycle::spawn_parent_monitor();
 
-    let _ = rayon::ThreadPoolBuilder::new()
-        .stack_size(32 * 1024 * 1024)
-        .build_global();
+    // The MCP server shares the machine with the agent it serves: a bounded
+    // share of its cores, and the stacks the ANTLR parsers need.
+    infigraph_core::pools::set_role(infigraph_core::pools::Role::Background);
+    infigraph_core::pools::init_global_rayon();
 
     std::thread::Builder::new()
         .stack_size(32 * 1024 * 1024)

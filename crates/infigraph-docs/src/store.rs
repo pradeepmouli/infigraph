@@ -190,7 +190,9 @@ impl DocStore {
 
         let db = Database::new(
             path,
-            SystemConfig::default().buffer_pool_size(DOC_POOL_BYTES),
+            infigraph_core::pools::lbug_config(
+                SystemConfig::default().buffer_pool_size(DOC_POOL_BYTES),
+            ),
         )
         .map_err(|e| anyhow::anyhow!("failed to open docs kuzu db: {e}"))?;
         let store = Self {
