@@ -213,6 +213,117 @@ fn an_entry_swallowed_by_a_fence_is_refused_with_the_fence_named() {
     );
 }
 
+/// A heading with text after the key is another entry for the key, and
+/// `--label` picks it by that text.
+#[test]
+fn an_entry_with_a_label_is_chosen_with_label() {
+    let (project, home) = stale_project();
+    let root = project.path();
+    std::fs::write(
+        root.join("docs/g.md"),
+        "# G\n\n### `app.py::f`\n\nPlain.\n\n### `app.py::f` \u{2014} as used in watchers\n\nWatching.\n",
+    )
+    .unwrap();
+    let _daemon = start_daemon(root, home.path());
+    assert_ok(
+        &run(root, home.path(), DAEMON, &["index-docs"]),
+        "index-docs",
+    );
+
+    let both = run(
+        root,
+        home.path(),
+        DAEMON,
+        &["doc-entry", "delete", "app.py::f", "--force"],
+    );
+    assert!(!both.status.success());
+    let why = String::from_utf8_lossy(&both.stderr).into_owned();
+    assert!(
+        why.contains("docs/g.md:3,")
+            && why.contains("docs/g.md:7 \"as used in watchers\"")
+            && why.contains("`label`"),
+        "{why}"
+    );
+
+    let wrong = run(
+        root,
+        home.path(),
+        DAEMON,
+        &[
+            "doc-entry",
+            "edit",
+            "app.py::f",
+            "--old",
+            "Plain.",
+            "--new",
+            "x",
+            "--label",
+            "nope",
+        ],
+    );
+    assert!(!wrong.status.success());
+    assert!(
+        String::from_utf8_lossy(&wrong.stderr).contains("no entry labelled \"nope\""),
+        "{}",
+        String::from_utf8_lossy(&wrong.stderr)
+    );
+
+    let done = run(
+        root,
+        home.path(),
+        DAEMON,
+        &[
+            "doc-entry",
+            "delete",
+            "app.py::f",
+            "--force",
+            "--label",
+            "as used in watchers",
+            "--apply",
+        ],
+    );
+    assert_ok(&done, "doc-entry delete --label --apply");
+    assert_eq!(
+        std::fs::read_to_string(root.join("docs/g.md")).unwrap(),
+        "# G\n\n### `app.py::f`\n\nPlain.\n"
+    );
+}
+
+/// A rekey changes the key and keeps the label after it.
+#[test]
+fn rekeying_a_labelled_entry_keeps_its_label() {
+    let (project, home) = stale_project();
+    let root = project.path();
+    std::fs::write(
+        root.join("docs/g.md"),
+        "# G\n\n### `app.py::f` \u{2014} as used in watchers\n\nWatching.\n",
+    )
+    .unwrap();
+    let _daemon = start_daemon(root, home.path());
+    assert_ok(
+        &run(root, home.path(), DAEMON, &["index-docs"]),
+        "index-docs",
+    );
+    let done = run(
+        root,
+        home.path(),
+        DAEMON,
+        &[
+            "doc-entry",
+            "rekey",
+            "app.py::f",
+            "app.py::g",
+            "--force",
+            "--apply",
+        ],
+    );
+    assert_ok(&done, "doc-entry rekey --apply");
+    assert_eq!(
+        std::fs::read_to_string(root.join("docs/g.md")).unwrap(),
+        "# G\n\n### `app.py::g` \u{2014} as used in watchers\n\nWatching.\n"
+    );
+}
+
 #[test]
 fn one_of_two_entries_with_a_key_is_chosen_with_nth() {
     let (project, home) = stale_project();

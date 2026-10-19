@@ -69,6 +69,9 @@ pub(crate) struct PickArgs {
     /// The entry whose key heading is on this line
     #[arg(long)]
     line: Option<usize>,
+    /// The entry whose heading carries this label (the text after the key)
+    #[arg(long)]
+    label: Option<String>,
     /// The document (relative path) to look in
     #[arg(long)]
     doc_file: Option<String>,

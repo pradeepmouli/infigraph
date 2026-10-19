@@ -40,7 +40,7 @@ use crate::extract::{DocFormat, ExtractedDoc};
 /// What the index stores about a document's links is a function of this
 /// version: a document recorded under an older one is scanned again, even when
 /// its content has not changed.
-pub const CODE_LINKS_VERSION: i64 = 3;
+pub const CODE_LINKS_VERSION: i64 = 4;
 
 /// A mention's excerpt is cut to this many characters around the span.
 const EXCERPT_CHARS: usize = 240;
@@ -104,9 +104,26 @@ pub struct CodeLinkRow {
     pub text: String,
 }
 
+/// A key heading's text: one backtick span holding `file::name`, then
+/// optionally an em dash, an en dash, " - " or ": " and free text without a
+/// backtick (a second span, or text before the first, makes it no key).
 fn key_heading_text() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"^`([^\s`]+::[^\s`]+)`$").unwrap())
+    RE.get_or_init(|| {
+        Regex::new(r"^`([^\s`]+::[^\s`]+)`(?:(?:[ \t]*[—–][ \t]*|[ \t]+-[ \t]+|:[ \t]+)([^`]+?))?$")
+            .unwrap()
+    })
+}
+
+/// The key and the label of a heading's text, when it is a key heading.
+fn key_heading(text: &str) -> Option<(String, Option<String>)> {
+    let m = key_heading_text().captures(text)?;
+    Some((m[1].to_string(), m.get(2).map(|l| l.as_str().to_string())))
+}
+
+/// The label of a key heading's text (`` `a::b` — why `` has "why").
+pub fn heading_label(text: &str) -> Option<String> {
+    key_heading(text)?.1
 }
 
 fn heading_line() -> &'static Regex {
@@ -160,6 +177,7 @@ struct Heading {
     level: usize,
     text: String,
     key: Option<String>,
+    label: Option<String>,
 }
 
 /// A run of backticks or tildes opening or closing a fenced code block: its
@@ -218,7 +236,7 @@ fn key_headings_in(lines: &[&str], first: usize, opener: usize, closer: usize) -
             if !(2..=4).contains(&m[1].len()) {
                 return None;
             }
-            let key = key_heading_text().captures(&m[2])?[1].to_string();
+            let key = key_heading(&m[2])?.0;
             Some(FencedKey {
                 key,
                 line: first + k,
@@ -316,16 +334,17 @@ fn scan_headings(prose: &[(usize, &str)]) -> Vec<Heading> {
         if let Some(m) = heading_line().captures(content) {
             let level = m[1].len();
             let text = m[2].to_string();
-            let key = if (2..=4).contains(&level) {
-                key_heading_text().captures(&text).map(|k| k[1].to_string())
+            let (key, label) = if (2..=4).contains(&level) {
+                key_heading(&text).unzip()
             } else {
-                None
+                (None, None)
             };
             headings.push(Heading {
                 line: *line,
                 level,
                 text,
                 key,
+                label: label.flatten(),
             });
         }
     }
@@ -360,6 +379,9 @@ pub struct SubHeading {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
     pub key: String,
+    /// The free text after the key in the heading (`` ### `a::b` — why ``),
+    /// when there is some: it tells apart several entries for one key.
+    pub label: Option<String>,
     /// The key heading's level (2-4).
     pub level: usize,
     /// 1-based, inclusive: the key heading's line to the entry's last
@@ -394,6 +416,7 @@ pub fn entries(text: &str) -> Vec<Entry> {
                 .collect();
             Some(Entry {
                 key,
+                label: heading.label.clone(),
                 level: heading.level,
                 start: heading.line,
                 end,
@@ -681,6 +704,68 @@ mod tests {
         assert!(fenced_keys("```\n### plain\n##### `a.ts::x`\n# `a.ts::y`\n```\n").is_empty());
     }
 
+    /// The real shape: a plain `pathOf` entry, then a suffixed one for the
+    /// same key.
+    const LABELLED: &str = "# G\n\n## `a.ts::pathOf`\n\nPlain.\n\n## `a.ts::pathOf` \u{2014} as used in watchers\n\nWatching.\n\n### Detail\n\nMore.\n\n## Other\n\nNot an entry.\n";
+
+    #[test]
+    fn a_key_heading_may_carry_free_text_that_becomes_its_label() {
+        let got = entries(LABELLED);
+        assert_eq!(
+            got.iter()
+                .map(|e| (e.key.as_str(), e.label.as_deref(), e.start, e.end))
+                .collect::<Vec<_>>(),
+            [
+                ("a.ts::pathOf", None, 3, 5),
+                ("a.ts::pathOf", Some("as used in watchers"), 7, 13),
+            ],
+            "the second entry owns its sub-heading and stops at the next level-2 heading"
+        );
+        assert_eq!(got[1].subs.len(), 1);
+        let docs = documents(LABELLED);
+        assert_eq!(docs.len(), 2);
+        assert_eq!(docs[1].target, "a.ts::pathOf");
+        assert!(docs[1].text.contains("Watching."), "{:?}", docs[1].text);
+        assert!(!docs[0].text.contains("Watching."));
+    }
+
+    #[test]
+    fn every_separator_makes_a_label_and_the_stray_shapes_stay_non_keys() {
+        let label = |heading: &str| {
+            entries(&format!("{heading}\n\nBody.\n"))
+                .first()
+                .map(|e| e.label.clone())
+        };
+        assert_eq!(
+            label("### `a::b` \u{2014} em"),
+            Some(Some("em".to_string()))
+        );
+        assert_eq!(label("### `a::b`\u{2014}em"), Some(Some("em".to_string())));
+        assert_eq!(
+            label("### `a::b` \u{2013} en"),
+            Some(Some("en".to_string()))
+        );
+        assert_eq!(label("### `a::b` - dash"), Some(Some("dash".to_string())));
+        assert_eq!(label("### `a::b`: colon"), Some(Some("colon".to_string())));
+        assert_eq!(label("### `a::b`"), Some(None));
+        // Two spans, text before the span, no `::`, a bare dash or colon:
+        // none is a key.
+        for non_key in [
+            "### `a::b` \u{2014} see `c`",
+            "### `a::b` `c::d`",
+            "### The `a::b` entry",
+            "### `a.ts` \u{2014} no double colon",
+            "### `a::b`-x",
+            "### `a::b`:x",
+            "### `a::b` \u{2014}",
+        ] {
+            assert_eq!(label(non_key), None, "{non_key}");
+        }
+        // Level 1 and 5 stay non-keys with a label too.
+        assert_eq!(label("# `a::b` \u{2014} x"), None);
+        assert_eq!(label("##### `a::b` \u{2014} x"), None);
+    }
+
     #[test]
     fn an_unclosed_fence_is_reported_at_its_opening_line() {
         let open: Vec<_> = rows(NESTED_FENCES)
@@ -718,7 +803,7 @@ mod tests {
     #[test]
     fn a_heading_that_is_not_exactly_one_key_span_links_nothing_and_is_a_near_miss() {
         let all = rows(
-            "### `a.ts::f` — the first\n\nx\n\n### `a.ts`\n\nx\n\n### Not code\n\nx\n\n### `a b::c`\n\nx\n",
+            "### `a.ts::f` — the `first`\n\nx\n\n### `a.ts`\n\nx\n\n### Not code\n\nx\n\n### `a b::c`\n\nx\n",
         );
         assert!(
             all.iter().all(|r| r.kind != LinkKind::Documents),
@@ -729,7 +814,7 @@ mod tests {
             .filter(|r| r.kind == LinkKind::NearMiss)
             .map(|r| r.target.as_str())
             .collect();
-        assert_eq!(near, ["`a.ts::f` — the first", "`a b::c`"]);
+        assert_eq!(near, ["`a.ts::f` — the `first`", "`a b::c`"]);
     }
 
     #[test]

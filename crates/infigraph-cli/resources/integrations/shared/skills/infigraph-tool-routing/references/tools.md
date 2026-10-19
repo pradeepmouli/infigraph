@@ -662,6 +662,7 @@ PRIMARY: Edit a glossary entry (an indexed Markdown section headed by a symbol i
 | `apply` | boolean |  | `false` | Write it (default: dry run, shows the diff) |
 | `doc_file` | string |  |  | create: the document (relative path) that gets the entry; other ops: the document to look in, when one key has entries in several |
 | `force` | boolean |  | `false` | rekey/delete: when the new key does not resolve / the symbol still exists |
+| `label` | string |  |  | edit/replace/rekey/delete when one key has several entries: the one whose heading carries this label (the text after the key, e.g. `a::b` — Label) |
 | `line` | integer |  |  | edit/replace/rekey/delete when one key has several entries: the one whose key heading is on this line |
 | `new` | string |  |  | edit: its replacement |
 | `new_target` | string |  |  | rekey: the symbol id to point the entry at |

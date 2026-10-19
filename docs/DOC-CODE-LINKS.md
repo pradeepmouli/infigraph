@@ -32,6 +32,14 @@ Sums the lines before tax, in cents, because ...
 The loop is deliberate: ...
 ```
 
+The span may be followed by an em dash, an en dash, ` - ` or `: ` and free text
+(`` ### `src/paths.ts::pathOf` — as used in watchers ``). That text is the entry's
+**label**: the heading is a normal additional entry for the same key (so `doctor`
+counts it among a key's duplicates), `doc_entry` shows the label next to its
+`file:line` and `--label` / `label` picks the entry by it. A heading with a
+second backtick span, text before the span, no `::`, or a dash or colon with no
+text after it is not a key.
+
 An id is the one `infigraph search` prints: the file path from the project root,
 `::`, and the symbol's qualified name, with members joined by `::`
 (`file.py::Class::method`). It is not the `Class.method` spelling a language
