@@ -16,7 +16,7 @@ use tokio_util::sync::CancellationToken;
 use crate::daemon::queue::IndexWorkQueue;
 use crate::daemon::run_write_coordinator;
 use crate::daemon::task::Task;
-use crate::Infigraph;
+use crate::CodeIndex;
 
 crate::settings! {
     watch {
@@ -226,7 +226,7 @@ where
             if evt.has_cross_file_calls {
                 eprintln!("[watch {prefix}] {evt}");
                 if let Ok(reg) = factory_for_event() {
-                    if let Ok(mut p) = Infigraph::open(&root_owned, reg) {
+                    if let Ok(mut p) = CodeIndex::open(&root_owned, reg) {
                         if p.init().is_ok() {
                             let changed_rel = evt
                                 .path

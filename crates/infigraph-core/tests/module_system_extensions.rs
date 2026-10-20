@@ -4,7 +4,7 @@
 //! and every consumer keyed by extension must treat them as the language they
 //! are.
 
-use infigraph_core::Infigraph;
+use infigraph_core::CodeIndex;
 use infigraph_languages::bundled_registry;
 
 #[test]
@@ -53,7 +53,7 @@ fn a_project_of_module_system_files_is_indexed_and_resolves_across_them() {
         "function legacyEntry() {\n  return 3;\n}\nmodule.exports = { legacyEntry };\n",
     );
 
-    let mut ig = Infigraph::open(root, bundled_registry().unwrap()).unwrap();
+    let mut ig = CodeIndex::open(root, bundled_registry().unwrap()).unwrap();
     ig.init().unwrap();
     let result = ig.index().unwrap();
 

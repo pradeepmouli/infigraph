@@ -9,7 +9,7 @@ use infigraph_core::watch::queued::{IndexingSink, Pacing, Queued};
 use infigraph_core::watch::sink::PathChange::{self, Created, Modified, Removed};
 use infigraph_core::watch::sink::{WatchBatch, WatchSink};
 use infigraph_core::watch::WatchEvent;
-use infigraph_core::Infigraph;
+use infigraph_core::CodeIndex;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -19,7 +19,7 @@ type SinkHarness<I> = (
     Arc<Mutex<Vec<String>>>,
 );
 
-fn sink(root: &Path) -> SinkHarness<Infigraph> {
+fn sink(root: &Path) -> SinkHarness<CodeIndex> {
     std::fs::create_dir_all(root.join(".infigraph")).unwrap();
     let queue = Arc::new(Mutex::new(IndexWorkQueue::new()));
     let events = Arc::new(Mutex::new(Vec::new()));
@@ -27,7 +27,7 @@ fn sink(root: &Path) -> SinkHarness<Infigraph> {
     let on_event: EventSink = Arc::new(Mutex::new(Box::new(move |e: WatchEvent| {
         seen.lock().unwrap().push(e.to_string());
     })));
-    let sink = IndexingSink::<Infigraph>::new(
+    let sink = IndexingSink::<CodeIndex>::new(
         "code",
         infigraph_core::ignore_rules::Domain::Code,
         Queued::new(CodeQueue::new(

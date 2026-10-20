@@ -34,7 +34,7 @@ use crate::daemon_protocol::{WriteRequest, WriteResult};
 /// Resolves the store to serve a request from, at request time.
 ///
 /// Deliberately not a captured `Arc<GraphStore>`: the daemon opens its
-/// `Infigraph` lazily and drops it again on `poison_watch_db` (after a full
+/// `CodeIndex` lazily and drops it again on `poison_watch_db` (after a full
 /// reindex swaps the graph file, say), so a service holding the store it saw
 /// at startup would go on serving a replaced `Database`. Resolving per
 /// request is what keeps the "exactly one `Database`" invariant true over

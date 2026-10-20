@@ -333,7 +333,7 @@ pub fn open_deaths(infigraph_dir: &Path) -> Vec<u64> {
 /// the open. None died: nothing. Some did: the WAL is the usual cause, so ask
 /// `recover` (the out-of-process probe in production) to set a torn one aside
 /// -- `graph.torn-wal.<ts>.wal.checkpoint` -- and open without it. A graph
-/// that opens in neither state is `GraphCorruption`, which `Infigraph::init`
+/// that opens in neither state is `GraphCorruption`, which `CodeIndex::init`
 /// answers with its rebuild; one a probe opens fine but that keeps killing
 /// its opener trips the existing crash-loop marker instead of looping.
 pub fn settle_open_deaths(

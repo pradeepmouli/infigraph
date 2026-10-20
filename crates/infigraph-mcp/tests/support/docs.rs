@@ -43,7 +43,7 @@ pub fn project(docs: &[(&str, &str)]) -> tempfile::TempDir {
 /// is dropped on return: the tools open the project themselves.
 pub fn reindex_code(dir: &Path) {
     let mut ig =
-        infigraph_core::Infigraph::open(dir, infigraph_languages::bundled_registry().unwrap())
+        infigraph_core::CodeIndex::open(dir, infigraph_languages::bundled_registry().unwrap())
             .unwrap();
     ig.init().unwrap();
     ig.index().unwrap();

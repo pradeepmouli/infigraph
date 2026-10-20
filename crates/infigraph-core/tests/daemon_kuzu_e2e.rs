@@ -7,7 +7,7 @@ mod common;
 
 use common::stdio::captured;
 use infigraph_core::graph::GraphBackend;
-use infigraph_core::Infigraph;
+use infigraph_core::CodeIndex;
 
 /// `INFIGRAPH_BACKEND` is process-wide, so the set/init/remove window in
 /// `open_daemon_client` must not overlap between the tests in this binary --
@@ -182,9 +182,9 @@ fn spawn_real_daemon(project_dir: &Path) -> KillOnDrop {
 /// Open a `DaemonKuzu`-backed client against `project_dir`. `init()`'s own
 /// `ensure_daemon_running` call resolves to `AlreadyRunning` here, since
 /// `start_real_daemon` already holds the lock.
-fn open_daemon_client(project_dir: &Path) -> Infigraph {
+fn open_daemon_client(project_dir: &Path) -> CodeIndex {
     let registry = infigraph_languages::bundled_registry().unwrap();
-    let mut client = Infigraph::open(project_dir, registry).unwrap();
+    let mut client = CodeIndex::open(project_dir, registry).unwrap();
     let init_result = {
         let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("INFIGRAPH_BACKEND", "daemon");
@@ -247,7 +247,7 @@ const CLI_INDEX_DEADLINE: Duration = Duration::from_secs(240);
 /// Runs the REAL `infigraph index` subcommand against `project_dir` with
 /// `INFIGRAPH_BACKEND=daemon`, and returns its combined output.
 ///
-/// Every other test in this file drives `Infigraph::index()` as a library
+/// Every other test in this file drives `CodeIndex::index()` as a library
 /// call, which is exactly why the deadlock shipped: `cmd_index` acquires
 /// `index.lock` itself, before it ever reaches the library, so no
 /// library-level test could see it. This helper is the whole point -- it
@@ -470,7 +470,7 @@ fn a_starting_daemon_refreshes_a_stale_project_claude_md_block() {
 }
 
 /// End-to-end proof that a real spawned `infigraph daemon` process and a
-/// real `DaemonKuzu`-backed client `Infigraph` genuinely interoperate --
+/// real `DaemonKuzu`-backed client `CodeIndex` genuinely interoperate --
 /// not just the in-process simulated-server pattern (a background thread
 /// calling `serve_one_request` directly) that earlier tasks' tests used.
 #[test]
@@ -520,12 +520,12 @@ fn real_daemon_process_serves_a_daemon_kuzu_client() {
     stop_daemon(project_dir.path(), &mut daemon);
 }
 
-/// `Infigraph::index()`/`index_files()` must work under `BackendKind::
+/// `CodeIndex::index()`/`index_files()` must work under `BackendKind::
 /// DaemonKuzu`. They take the ordinary client-side path there like any other
 /// backend -- parse locally, then let `upsert_files_bulk`, `remove_file` and
 /// `resolve_calls` route themselves to the daemon. Before those three were
 /// implemented they were Tier-3 stubs, and `index()` with changed files
-/// failed with "use Infigraph::index()/index_files() instead", i.e. it told
+/// failed with "use CodeIndex::index()/index_files() instead", i.e. it told
 /// the caller to call the function they were already inside.
 #[test]
 fn index_and_index_files_route_through_the_daemon() {
@@ -1066,7 +1066,7 @@ fn a_failed_rebuild_leaves_the_live_graph_untouched() {
 /// Regression test for the final review's I5. `index --full` under
 /// `INFIGRAPH_BACKEND=daemon` drops a request into `.infigraph/requests` and
 /// polls for a reply for up to 600s. Because that branch returns before
-/// `Infigraph::open`, the usual daemon auto-start never runs either -- so
+/// `CodeIndex::open`, the usual daemon auto-start never runs either -- so
 /// with no daemon around, the command used to sit silently for ten minutes
 /// and then report an opaque timeout. That's a plausible everyday case:
 /// `INFIGRAPH_BACKEND` is commonly exported from a shell profile.
@@ -1152,7 +1152,7 @@ fn full_reindex_with_no_daemon_fails_fast_instead_of_polling_for_ten_minutes() {
 
 /// Regression test for the sibling gap `--full`'s fix above didn't cover:
 /// a plain (non-`--full`) `infigraph index` under `INFIGRAPH_BACKEND=daemon`
-/// had no equivalent guard at all -- `Infigraph::init()`'s
+/// had no equivalent guard at all -- `CodeIndex::init()`'s
 /// `ensure_daemon_for_writes` used to fire-and-forget a daemon spawn attempt
 /// and return unconditionally, so if no daemon ever came up (e.g. the very
 /// first index of a fresh project, before `.infigraph` exists) the first
@@ -1166,12 +1166,12 @@ fn full_reindex_with_no_daemon_fails_fast_instead_of_polling_for_ten_minutes() {
 /// declines to spawn while `.infigraph/` is absent. Since #159 made routing
 /// the default, that answer stopped being good enough: it would have meant
 /// `infigraph index` on any new project failing, and blaming an environment
-/// variable the user never set. `Infigraph::init` now creates the graph
+/// variable the user never set. `CodeIndex::init` now creates the graph
 /// in-process when there is nothing to route to, so the bounded, definite
 /// outcome is a successful index. The budget stays, and still guards the
 /// thing that actually hurt: the ~600s silent block.
 ///
-/// Deliberately runs the real binary (not `cmd_index`/`Infigraph::init()`
+/// Deliberately runs the real binary (not `cmd_index`/`CodeIndex::init()`
 /// directly): `resolve_cli_binary_sibling_of` and the daemon spawn path
 /// both depend on `current_exe()` resolving to the real `infigraph` binary,
 /// which only holds true inside a spawned child process, not this test

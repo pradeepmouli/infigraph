@@ -3,7 +3,7 @@ use crate::daemon_protocol::WriteResult;
 use crate::model::FileExtraction;
 use crate::resolve::ResolveStats;
 use crate::watch::sink::{PathIndexer, PathOutcome};
-use crate::Infigraph;
+use crate::CodeIndex;
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 
@@ -23,7 +23,7 @@ pub(crate) struct DrainOutcome {
 /// Each call builds the queue a watcher would have filled and runs it through
 /// [`execute_drain`], so the contract test exercises the real code path and
 /// there is no second way to index a set of paths.
-impl PathIndexer for Infigraph {
+impl PathIndexer for CodeIndex {
     /// Indexes the paths whose content differs from what the graph holds. A
     /// path that is no longer on disk is a deletion.
     fn index_paths(&self, paths: &[PathBuf]) -> Result<PathOutcome> {
@@ -73,7 +73,7 @@ impl PathIndexer for Infigraph {
     }
 }
 
-impl Infigraph {
+impl CodeIndex {
     fn relative(&self, path: &Path) -> String {
         path.strip_prefix(self.root())
             .unwrap_or(path)
@@ -99,7 +99,7 @@ impl Infigraph {
 /// snapshot, so no operation plans against information another operation
 /// has since made stale.
 #[allow(dead_code)]
-pub(crate) fn execute_drain(infigraph: &Infigraph, drained: DrainedQueue) -> Result<DrainOutcome> {
+pub(crate) fn execute_drain(infigraph: &CodeIndex, drained: DrainedQueue) -> Result<DrainOutcome> {
     // The run owner for the `index` last-run record (#209): the write paths
     // below note what they lose (edges a COPY dropped, a removal that failed,
     // call resolution that failed) and this takes it when the drain ends.
@@ -112,7 +112,7 @@ pub(crate) fn execute_drain(infigraph: &Infigraph, drained: DrainedQueue) -> Res
 
 /// [`execute_drain`]'s work: run the drain and answer every waiter folded
 /// into it.
-fn answer_waiters(infigraph: &Infigraph, mut drained: DrainedQueue) -> Result<DrainOutcome> {
+fn answer_waiters(infigraph: &CodeIndex, mut drained: DrainedQueue) -> Result<DrainOutcome> {
     let waiters = std::mem::take(&mut drained.waiters);
     let use_learned = waiters
         .iter()
@@ -174,7 +174,7 @@ fn record_drain_run(root: &Path, run: crate::last_run::Run<'_>, result: &Result<
 /// `drained` accumulated. Its waiters were taken out first, by
 /// `execute_drain`, which answers them.
 fn run_drain(
-    infigraph: &Infigraph,
+    infigraph: &CodeIndex,
     drained: DrainedQueue,
     use_learned: bool,
 ) -> Result<DrainOutcome> {
@@ -377,8 +377,8 @@ mod tests {
         reg
     }
 
-    fn open_project(root: &std::path::Path) -> Infigraph {
-        let mut prism = Infigraph::open(root, python_registry()).unwrap();
+    fn open_project(root: &std::path::Path) -> CodeIndex {
+        let mut prism = CodeIndex::open(root, python_registry()).unwrap();
         prism.init().unwrap();
         prism
     }
@@ -485,7 +485,7 @@ mod tests {
         let root = tmp.path();
         std::fs::create_dir_all(root.join(".infigraph")).unwrap();
         // Opened and never initialised: the graph is not there to write to.
-        let prism = Infigraph::open(root, python_registry()).unwrap();
+        let prism = CodeIndex::open(root, python_registry()).unwrap();
         let mut queue = IndexWorkQueue::new();
         queue.add_raw("a.py".to_string());
 

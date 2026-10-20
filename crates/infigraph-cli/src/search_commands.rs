@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use infigraph_core::Infigraph;
+use infigraph_core::CodeIndex;
 use infigraph_languages::bundled_registry;
 use std::path::Path;
 
@@ -7,7 +7,7 @@ pub(crate) fn cmd_search(root: &Path, query: &str, limit: usize, alpha: f32) -> 
     use infigraph_core::embed;
 
     let registry = bundled_registry()?;
-    let mut prism = Infigraph::open(root, registry)?;
+    let mut prism = CodeIndex::open(root, registry)?;
     prism.init_read_only()?;
 
     let backend = prism.backend().context("graph not initialized")?;
@@ -131,7 +131,7 @@ pub(crate) fn cmd_search_code(
 
 pub(crate) fn cmd_snippet(root: &Path, symbol_id: &str) -> Result<()> {
     let registry = bundled_registry()?;
-    let mut prism = Infigraph::open(root, registry)?;
+    let mut prism = CodeIndex::open(root, registry)?;
     prism.init_read_only()?;
 
     let backend = prism.backend().context("graph not initialized")?;
@@ -157,7 +157,7 @@ pub(crate) fn cmd_snippet(root: &Path, symbol_id: &str) -> Result<()> {
 
 pub(crate) fn cmd_find_refs(root: &Path, symbol: &str) -> Result<()> {
     let registry = bundled_registry()?;
-    let mut prism = Infigraph::open(root, registry)?;
+    let mut prism = CodeIndex::open(root, registry)?;
     prism.init_read_only()?;
     let backend = prism.backend().context("graph not initialized")?;
     let refs = backend.find_all_references(symbol)?;

@@ -299,7 +299,7 @@ fn test_full_reindex_wipe_snapshot_survives_the_wipe() {
 
 /// `full_reindex_wipe` must serialize against `graph.lock` -- not just
 /// `index.lock` -- because `GraphStore::upsert_file` (reachable from the
-/// public `Infigraph::index_file` API) only takes `graph.lock`, so a
+/// public `CodeIndex::index_file` API) only takes `graph.lock`, so a
 /// concurrent single-file write is never blocked by `index.lock` alone.
 /// Caught by adversarial review before this shipped: without this,
 /// `full_reindex_wipe` could snapshot or delete graph state while another

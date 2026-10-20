@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::graph::CrossServiceEdgeCandidate;
 use crate::lang::LanguageRegistry;
-use crate::Infigraph;
+use crate::CodeIndex;
 
 use super::{ContractKind, Registry};
 
@@ -144,7 +144,7 @@ pub fn detect_cross_service_deps(
         // Only queries the graph below (raw_query) — never parses source, so no
         // language packs are needed. Building the real registry here cost ~850ms/repo
         // (compiling all 62 tree-sitter packs) for zero benefit.
-        let mut prism = Infigraph::open(&entry.path, LanguageRegistry::new())?;
+        let mut prism = CodeIndex::open(&entry.path, LanguageRegistry::new())?;
         prism.init()?;
 
         let backend = match prism.backend() {
@@ -317,7 +317,7 @@ pub fn detect_cross_service_deps(
                 // language packs per spec-fetch match.
                 let caller_id = if let Some(stripped) = symbol_hint.strip_prefix("line:") {
                     let line_num: i32 = stripped.parse().unwrap_or(0);
-                    if let Ok(mut prism) = Infigraph::open(&entry.path, LanguageRegistry::new()) {
+                    if let Ok(mut prism) = CodeIndex::open(&entry.path, LanguageRegistry::new()) {
                         if prism.init().is_ok() {
                             if let Some(backend) = prism.backend() {
                                 let lookup_file = match &ns {
@@ -378,7 +378,7 @@ pub fn detect_cross_service_deps(
         for repo_name in &group.repos {
             if let Some(entry) = registry.repos.get(repo_name) {
                 // Only queries the graph below — empty registry, no parsing needed.
-                if let Ok(mut prism) = Infigraph::open(&entry.path, LanguageRegistry::new()) {
+                if let Ok(mut prism) = CodeIndex::open(&entry.path, LanguageRegistry::new()) {
                     if prism.init().is_ok() {
                         if let Some(backend) = prism.backend() {
                             if let Ok(member_deps) = crate::manifest::query_deps(backend) {
@@ -558,7 +558,7 @@ pub fn detect_cross_service_deps(
                 // Resolve line hints to enclosing symbol ids via the repo graph,
                 // same as the HTTP scan. Namespaced (remote) graphs store
                 // `{ns}/{relative}` file paths, so prefix the lookup to match.
-                let mut prism = match Infigraph::open(&entry.path, LanguageRegistry::new()) {
+                let mut prism = match CodeIndex::open(&entry.path, LanguageRegistry::new()) {
                     Ok(p) => p,
                     Err(_) => continue,
                 };
@@ -677,7 +677,7 @@ pub fn link_cross_service_calls(
         };
 
         // Only queries the graph below — empty registry, no parsing needed.
-        let mut prism = Infigraph::open(&entry.path, LanguageRegistry::new())?;
+        let mut prism = CodeIndex::open(&entry.path, LanguageRegistry::new())?;
         prism.init()?;
 
         let backend = match prism.backend() {
@@ -749,7 +749,7 @@ pub fn link_cross_service_calls(
                 None => continue,
             };
             // Only queries the graph below — empty registry, no parsing needed.
-            let mut prism = Infigraph::open(&entry.path, LanguageRegistry::new())?;
+            let mut prism = CodeIndex::open(&entry.path, LanguageRegistry::new())?;
             prism.init()?;
             let backend = match prism.backend() {
                 Some(b) => b,

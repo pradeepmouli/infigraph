@@ -958,7 +958,7 @@ pub(crate) fn fanout_edge_statement(
 /// dependency data from the manifests these are locked against. sittir's
 /// `pnpm-lock.yaml` alone contributed 3,498 symbols.
 ///
-/// Consulted at file discovery (`Infigraph::collect_files` and the watch
+/// Consulted at file discovery (`CodeIndex::collect_files` and the watch
 /// producer) so these never enter the graph, and still consulted by
 /// [`classify_file`] for anything an older index already stored.
 ///

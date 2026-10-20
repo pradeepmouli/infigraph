@@ -1557,7 +1557,7 @@ fn descriptor_name(scip_sym: &str) -> String {
 }
 
 /// The language packs the import reads object-literal owners with. Set once
-/// per process by whoever opens a project (`Infigraph::open_shared`), because
+/// per process by whoever opens a project (`CodeIndex::open_shared`), because
 /// the import runs behind `GraphBackend`, which carries no registry, and
 /// every process uses the one bundled set. Without it (a bare store in a
 /// test) a literal member simply keeps the id its moniker gives it.

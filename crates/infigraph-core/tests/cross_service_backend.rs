@@ -1,5 +1,5 @@
 use infigraph_core::graph::CrossServiceEdgeCandidate;
-use infigraph_core::Infigraph;
+use infigraph_core::CodeIndex;
 use infigraph_languages::bundled_registry;
 
 #[test]
@@ -11,7 +11,7 @@ fn write_cross_service_edges_creates_target_node_and_edge_once() {
     )
     .unwrap();
     let registry = bundled_registry().unwrap();
-    let mut infigraph = Infigraph::open(project_dir.path(), registry).unwrap();
+    let mut infigraph = CodeIndex::open(project_dir.path(), registry).unwrap();
     infigraph.init().unwrap();
     infigraph.index().unwrap();
 

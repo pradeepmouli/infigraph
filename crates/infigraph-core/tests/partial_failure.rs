@@ -16,7 +16,7 @@ fn unreadable_file_is_reported_not_silently_skipped_and_does_not_abort() {
     std::fs::set_permissions(&bad, std::fs::Permissions::from_mode(0o000)).unwrap();
 
     let mut prism =
-        infigraph_core::Infigraph::open(tmp.path(), bundled_registry().unwrap()).unwrap();
+        infigraph_core::CodeIndex::open(tmp.path(), bundled_registry().unwrap()).unwrap();
     prism.init().unwrap();
     let result = prism.index().expect("one bad file must not abort the run");
 

@@ -4,7 +4,7 @@
 //! lbug's `openFile` leaks the fd it opened whenever `fcntl(F_SETLK)` loses
 //! to another process. The fix is to never poll the lock by re-opening:
 //! `graph::lock_probe` answers "who holds it" with `F_GETLK`, and
-//! `Infigraph::init` waits on that probe instead. These tests hold the
+//! `CodeIndex::init` waits on that probe instead. These tests hold the
 //! graph from a *second OS process* (re-exec of this test binary), because
 //! fcntl locks are per-process and an in-process second open succeeds.
 #![cfg(unix)]
@@ -15,7 +15,7 @@ use std::time::Duration;
 use infigraph_core::graph::lock_probe::{probe_graph_lock, LockProbe, ProbeFor};
 use infigraph_core::graph::GraphStore;
 use infigraph_core::lang::LanguageRegistry;
-use infigraph_core::Infigraph;
+use infigraph_core::CodeIndex;
 
 fn open_fds() -> usize {
     std::fs::read_dir("/dev/fd").unwrap().count()
@@ -135,7 +135,7 @@ fn init_under_contention_waits_on_the_probe_instead_of_reopening() {
 
     let before = open_fds();
     let start = std::time::Instant::now();
-    let mut ig = Infigraph::open(dir.path(), LanguageRegistry::new()).unwrap();
+    let mut ig = CodeIndex::open(dir.path(), LanguageRegistry::new()).unwrap();
     let err = ig
         .init()
         .expect_err("write open must fail while another process holds the graph");

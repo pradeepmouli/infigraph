@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use infigraph_core::Infigraph;
+use infigraph_core::CodeIndex;
 use infigraph_languages::bundled_registry;
 
 use crate::GroupAction;
@@ -60,7 +60,7 @@ pub(crate) fn cmd_group(root: &Path, action: GroupAction) -> Result<()> {
             }
 
             let reg = bundled_registry()?;
-            let mut prism = Infigraph::open(&actual_path, reg)?;
+            let mut prism = CodeIndex::open(&actual_path, reg)?;
             prism.init()?;
             registry.register_repo(&repo_name, &actual_path, &prism)?;
             registry.group_add(&group, &repo_name)?;
@@ -171,7 +171,7 @@ pub(crate) fn cmd_group(root: &Path, action: GroupAction) -> Result<()> {
                     }
                 }
                 let reg = bundled_registry()?;
-                let mut prism = Infigraph::open(&entry.path, reg)?;
+                let mut prism = CodeIndex::open(&entry.path, reg)?;
                 prism.init()?;
                 let result = prism.index()?;
                 if let Some(backend) = prism.backend() {
@@ -352,14 +352,14 @@ pub(crate) fn cmd_group(root: &Path, action: GroupAction) -> Result<()> {
             // link_cross_repo_namespace_calls_for_group: build Infigraph
             // handles first (so they outlive the borrow), then collect
             // (&str, &dyn GraphBackend) refs.
-            let mut opened: Vec<(String, Infigraph)> = Vec::new();
+            let mut opened: Vec<(String, CodeIndex)> = Vec::new();
             for repo_name in &g.repos {
                 let entry = match registry.repos.get(repo_name) {
                     Some(e) => e.clone(),
                     None => continue,
                 };
                 let reg = bundled_registry()?;
-                let mut prism = Infigraph::open(&entry.path, reg)?;
+                let mut prism = CodeIndex::open(&entry.path, reg)?;
                 prism.init()?;
                 opened.push((repo_name.clone(), prism));
             }

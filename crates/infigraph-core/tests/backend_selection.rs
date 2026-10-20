@@ -1,4 +1,4 @@
-use infigraph_core::Infigraph;
+use infigraph_core::CodeIndex;
 use infigraph_languages::bundled_registry;
 use std::sync::Mutex;
 
@@ -26,7 +26,7 @@ fn init_selects_daemon_kuzu_backend_when_env_var_set() {
     // mode.
     std::env::set_var(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND);
     let registry = bundled_registry().unwrap();
-    let mut infigraph = Infigraph::open(project_dir.path(), registry).unwrap();
+    let mut infigraph = CodeIndex::open(project_dir.path(), registry).unwrap();
     infigraph.init().unwrap();
     drop(infigraph);
 
@@ -38,7 +38,7 @@ fn init_selects_daemon_kuzu_backend_when_env_var_set() {
     std::env::set_var("INFIGRAPH_NO_WATCH", "1");
     std::env::set_var("INFIGRAPH_BACKEND", "daemon");
     let registry = bundled_registry().unwrap();
-    let mut infigraph = Infigraph::open(project_dir.path(), registry).unwrap();
+    let mut infigraph = CodeIndex::open(project_dir.path(), registry).unwrap();
     let result = infigraph.init();
     std::env::set_var(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND);
     std::env::remove_var("INFIGRAPH_NO_WATCH");
@@ -62,7 +62,7 @@ fn init_selects_kuzu_backend_when_pinned_local() {
     let project_dir = tempfile::tempdir().unwrap();
     std::env::set_var(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND);
     let registry = bundled_registry().unwrap();
-    let mut infigraph = Infigraph::open(project_dir.path(), registry).unwrap();
+    let mut infigraph = CodeIndex::open(project_dir.path(), registry).unwrap();
     infigraph.init().unwrap();
     assert!(
         infigraph.store().is_some(),
@@ -96,7 +96,7 @@ fn init_bootstraps_a_never_indexed_project_under_the_default_backend() {
     // bootstrap rather than silently becoming a local-mode test.
     std::env::set_var(infigraph_core::BACKEND_ENV, infigraph_core::DAEMON_BACKEND);
     let registry = bundled_registry().unwrap();
-    let mut infigraph = Infigraph::open(project_dir.path(), registry).unwrap();
+    let mut infigraph = CodeIndex::open(project_dir.path(), registry).unwrap();
     let result = infigraph.init();
     std::env::set_var(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND);
 

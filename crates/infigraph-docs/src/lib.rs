@@ -48,7 +48,7 @@ pub struct DocIndex {
     store: Option<Box<dyn DocBackend>>,
     skip_file_embeddings: bool,
     /// When set (remote multi-repo mode only), all doc/chunk IDs are prefixed
-    /// with `{namespace}/`, mirroring `Infigraph::set_namespace` for the code
+    /// with `{namespace}/`, mirroring `CodeIndex::set_namespace` for the code
     /// graph — keeps repos sharing one Neo4j instance from colliding on
     /// identical relative paths (e.g. every repo's README.md).
     namespace: Option<String>,

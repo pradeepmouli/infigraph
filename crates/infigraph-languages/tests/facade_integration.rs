@@ -1,4 +1,4 @@
-use infigraph_core::Infigraph;
+use infigraph_core::CodeIndex;
 use infigraph_languages::bundled_registry;
 use std::path::PathBuf;
 
@@ -6,7 +6,7 @@ use std::path::PathBuf;
 fn test_infigraph_open() {
     let tmp = tempfile::tempdir().unwrap();
     let registry = bundled_registry().unwrap();
-    let tg = Infigraph::open(tmp.path(), registry);
+    let tg = CodeIndex::open(tmp.path(), registry);
     assert!(tg.is_ok());
 }
 
@@ -14,7 +14,7 @@ fn test_infigraph_open() {
 fn test_infigraph_root() {
     let tmp = tempfile::tempdir().unwrap();
     let registry = bundled_registry().unwrap();
-    let tg = Infigraph::open(tmp.path(), registry).unwrap();
+    let tg = CodeIndex::open(tmp.path(), registry).unwrap();
     assert_eq!(tg.root(), tmp.path().canonicalize().unwrap());
 }
 
@@ -22,7 +22,7 @@ fn test_infigraph_root() {
 fn test_infigraph_registry() {
     let tmp = tempfile::tempdir().unwrap();
     let registry = bundled_registry().unwrap();
-    let tg = Infigraph::open(tmp.path(), registry).unwrap();
+    let tg = CodeIndex::open(tmp.path(), registry).unwrap();
     let reg = tg.registry();
     assert!(reg.for_extension(".py").is_some());
 }
@@ -31,7 +31,7 @@ fn test_infigraph_registry() {
 fn test_infigraph_store_none_before_init() {
     let tmp = tempfile::tempdir().unwrap();
     let registry = bundled_registry().unwrap();
-    let tg = Infigraph::open(tmp.path(), registry).unwrap();
+    let tg = CodeIndex::open(tmp.path(), registry).unwrap();
     assert!(tg.store().is_none());
 }
 
@@ -39,7 +39,7 @@ fn test_infigraph_store_none_before_init() {
 fn test_infigraph_init_creates_store() {
     let tmp = tempfile::tempdir().unwrap();
     let registry = bundled_registry().unwrap();
-    let mut tg = Infigraph::open(tmp.path(), registry).unwrap();
+    let mut tg = CodeIndex::open(tmp.path(), registry).unwrap();
     tg.init().unwrap();
     assert!(tg.store().is_some());
 }
@@ -48,7 +48,7 @@ fn test_infigraph_init_creates_store() {
 fn test_infigraph_stats_after_init() {
     let tmp = tempfile::tempdir().unwrap();
     let registry = bundled_registry().unwrap();
-    let mut tg = Infigraph::open(tmp.path(), registry).unwrap();
+    let mut tg = CodeIndex::open(tmp.path(), registry).unwrap();
     tg.init().unwrap();
     let stats = tg.stats().unwrap();
     assert_eq!(stats.symbols, 0);
@@ -59,7 +59,7 @@ fn test_infigraph_stats_after_init() {
 fn test_infigraph_index_empty_dir() {
     let tmp = tempfile::tempdir().unwrap();
     let registry = bundled_registry().unwrap();
-    let mut tg = Infigraph::open(tmp.path(), registry).unwrap();
+    let mut tg = CodeIndex::open(tmp.path(), registry).unwrap();
     tg.init().unwrap();
     let result = tg.index().unwrap();
     assert_eq!(result.indexed_files, 0);
@@ -75,7 +75,7 @@ fn test_infigraph_index_file() {
     )
     .unwrap();
     let registry = bundled_registry().unwrap();
-    let mut tg = Infigraph::open(&root, registry).unwrap();
+    let mut tg = CodeIndex::open(&root, registry).unwrap();
     tg.init().unwrap();
     tg.index_file(&root.join("hello.py")).unwrap();
     let stats = tg.stats().unwrap();
@@ -93,7 +93,7 @@ fn test_infigraph_index_files() {
     std::fs::write(root.join("a.py"), "def foo(): pass\n").unwrap();
     std::fs::write(root.join("b.py"), "def bar(): pass\n").unwrap();
     let registry = bundled_registry().unwrap();
-    let mut tg = Infigraph::open(&root, registry).unwrap();
+    let mut tg = CodeIndex::open(&root, registry).unwrap();
     tg.init().unwrap();
     let paths = vec![root.join("a.py"), root.join("b.py")];
     let result = tg.index_files(&paths).unwrap();
@@ -106,7 +106,7 @@ fn test_infigraph_remove_file() {
     let root = tmp.path().canonicalize().unwrap();
     std::fs::write(root.join("a.py"), "def foo(): pass\n").unwrap();
     let registry = bundled_registry().unwrap();
-    let mut tg = Infigraph::open(&root, registry).unwrap();
+    let mut tg = CodeIndex::open(&root, registry).unwrap();
     tg.init().unwrap();
     tg.index_file(&root.join("a.py")).unwrap();
     let stats_before = tg.stats().unwrap();
@@ -126,7 +126,7 @@ fn test_infigraph_detect_bridges_empty() {
     let root = tmp.path().canonicalize().unwrap();
     std::fs::write(root.join("clean.py"), "def hello(): pass\n").unwrap();
     let registry = bundled_registry().unwrap();
-    let mut tg = Infigraph::open(&root, registry).unwrap();
+    let mut tg = CodeIndex::open(&root, registry).unwrap();
     tg.init().unwrap();
     tg.index().unwrap();
     let bridges = tg.detect_bridges().unwrap();
@@ -139,7 +139,7 @@ fn test_infigraph_index_incremental_skips_unchanged() {
     let root = tmp.path().canonicalize().unwrap();
     std::fs::write(root.join("a.py"), "def foo(): pass\n").unwrap();
     let registry = bundled_registry().unwrap();
-    let mut tg = Infigraph::open(&root, registry).unwrap();
+    let mut tg = CodeIndex::open(&root, registry).unwrap();
     tg.init().unwrap();
 
     let r1 = tg.index().unwrap();

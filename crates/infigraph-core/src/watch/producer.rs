@@ -16,7 +16,7 @@ use crate::watch::queued::{IndexingSink, Pacing, Queued};
 use crate::watch::registration::Registration;
 use crate::watch::sink::{change_of, Dispatcher, WatchSink};
 use crate::watch::{WatchEvent, WatchEventKind};
-use crate::Infigraph;
+use crate::CodeIndex;
 use clap::Parser;
 use notify::{Config, Event, EventKind, RecommendedWatcher, Watcher};
 use std::path::{Path, PathBuf};
@@ -143,7 +143,7 @@ pub async fn run_producer(
     // Every event path is judged once, by the dispatcher, and offered to the
     // sinks whose domain keeps it. The code graph's sink is always attached;
     // others (documents) attach and detach at runtime.
-    let code_sink: Box<dyn WatchSink> = Box::new(IndexingSink::<Infigraph>::new(
+    let code_sink: Box<dyn WatchSink> = Box::new(IndexingSink::<CodeIndex>::new(
         "code",
         Domain::Code,
         Queued::new(CodeQueue::new(

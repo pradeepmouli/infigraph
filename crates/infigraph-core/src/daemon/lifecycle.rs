@@ -125,7 +125,7 @@ pub fn ensure_daemon_running(root: &Path, watch_binary: &Path) -> DaemonStartOut
 /// selected is not optional -- and (b) fails fast with an actionable
 /// message rather than letting the first access discover the problem.
 ///
-/// Shared by `Infigraph::init` (code graph) and `DocIndex::init`
+/// Shared by `CodeIndex::init` (code graph) and `DocIndex::init`
 /// (documents), so both routed stores get the same guarantee.
 pub fn ensure_daemon_for_routed_access(root: &Path) -> anyhow::Result<()> {
     use anyhow::Context;

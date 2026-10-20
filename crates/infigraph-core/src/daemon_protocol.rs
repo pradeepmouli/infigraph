@@ -523,13 +523,13 @@ mod tests {
     }
 }
 
-use crate::Infigraph;
+use crate::CodeIndex;
 
 /// Runs one write against `infigraph` (the daemon's own write-mode
 /// connection) and says what happened. Never panics on a failed operation:
 /// every failure is a `WriteResult::Err`, so the client always gets an
 /// answer.
-pub fn serve_write(infigraph: &Infigraph, request: &WriteRequest) -> WriteResult {
+pub fn serve_write(infigraph: &CodeIndex, request: &WriteRequest) -> WriteResult {
     match request {
         WriteRequest::Index { paths: None } => match infigraph.index() {
             Ok(r) => WriteResult::Ok {
@@ -814,7 +814,7 @@ pub fn serve_write(infigraph: &Infigraph, request: &WriteRequest) -> WriteResult
 }
 
 fn handle_ingest_structured(
-    infigraph: &Infigraph,
+    infigraph: &CodeIndex,
     schema_id: &str,
     source: &IngestSource,
 ) -> anyhow::Result<crate::structured::IngestResult> {

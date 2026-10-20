@@ -12,7 +12,7 @@ use infigraph_core::graph::GraphBackend;
 ///   everyone;
 /// - tests that merely READ one, via any code path that consults
 ///   `INFIGRAPH_BACKEND`/`CI`/`INFIGRAPH_NO_WATCH` (every
-///   `Infigraph::open`/`init` and every watch loop below), take `read()`.
+///   `CodeIndex::open`/`init` and every watch loop below), take `read()`.
 ///
 /// A plain `Mutex` held only by the mutators protected them from each other
 /// and from nobody else, so a long test could bootstrap in the window where
@@ -208,7 +208,7 @@ fn init_daemon_backend_starts_a_daemon() {
     // exist before daemon-mode init() can open it. Bootstrap with the
     // default Kuzu backend and drop it (releasing the write lock) first.
     let registry = infigraph_languages::bundled_registry().unwrap();
-    let mut boot = infigraph_core::Infigraph::open(project_dir.path(), registry).unwrap();
+    let mut boot = infigraph_core::CodeIndex::open(project_dir.path(), registry).unwrap();
     boot.init().unwrap();
     drop(boot);
 
@@ -222,7 +222,7 @@ fn init_daemon_backend_starts_a_daemon() {
 
     std::env::set_var("INFIGRAPH_BACKEND", "daemon");
     let registry = infigraph_languages::bundled_registry().unwrap();
-    let mut client = infigraph_core::Infigraph::open(project_dir.path(), registry).unwrap();
+    let mut client = infigraph_core::CodeIndex::open(project_dir.path(), registry).unwrap();
     let init_result = client.init();
     std::env::set_var(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND);
     init_result.unwrap();
@@ -521,7 +521,7 @@ fn watch_triggered_file_removal_contends_with_a_held_index_lock() {
     // graph before the watcher opens its own connection.
     {
         let registry = infigraph_languages::bundled_registry().unwrap();
-        let mut boot = infigraph_core::Infigraph::open(project.path(), registry).unwrap();
+        let mut boot = infigraph_core::CodeIndex::open(project.path(), registry).unwrap();
         boot.init().unwrap();
         boot.index().unwrap();
     }
@@ -740,7 +740,7 @@ fn watch_loop_shuts_down_when_its_root_directory_is_deleted() {
 
     {
         let registry = infigraph_languages::bundled_registry().unwrap();
-        let mut boot = infigraph_core::Infigraph::open(project.path(), registry).unwrap();
+        let mut boot = infigraph_core::CodeIndex::open(project.path(), registry).unwrap();
         boot.init().unwrap();
         boot.index().unwrap();
     }
@@ -823,7 +823,7 @@ fn out_of_scope_write_request_contends_with_a_held_index_lock() {
     // Bootstrap so the graph exists before the watcher opens its own connection.
     {
         let registry = infigraph_languages::bundled_registry().unwrap();
-        let mut boot = infigraph_core::Infigraph::open(project.path(), registry).unwrap();
+        let mut boot = infigraph_core::CodeIndex::open(project.path(), registry).unwrap();
         boot.init().unwrap();
     }
 
@@ -945,7 +945,7 @@ fn full_reindex_build_task_can_be_cancelled_before_it_starts_the_swap() {
     // Bootstrap so the live graph exists before the watcher opens its own connection.
     {
         let registry = infigraph_languages::bundled_registry().unwrap();
-        let mut boot = infigraph_core::Infigraph::open(project.path(), registry).unwrap();
+        let mut boot = infigraph_core::CodeIndex::open(project.path(), registry).unwrap();
         boot.init().unwrap();
         boot.index().unwrap();
     }
@@ -969,7 +969,7 @@ fn full_reindex_build_task_can_be_cancelled_before_it_starts_the_swap() {
     // `try_start_full_reindex` spawns the build task, its child token is
     // already cancelled, so the build's checkpoint fires at its earliest
     // possible point -- this is the strictest version of "cancel before the
-    // swap," since the build never even reaches `Infigraph::open_local_kuzu_at`.
+    // swap," since the build never even reaches `CodeIndex::open_local_kuzu_at`.
     let daemon_token = tokio_util::sync::CancellationToken::new();
     daemon_token.cancel();
     let token_for_thread = daemon_token.clone();
@@ -1092,7 +1092,7 @@ fn scip_enrichment_task_is_cancellable_via_daemon_token() {
     // Bootstrap so the live graph exists before the watcher opens its own connection.
     {
         let registry = infigraph_languages::bundled_registry().unwrap();
-        let mut boot = infigraph_core::Infigraph::open(project.path(), registry).unwrap();
+        let mut boot = infigraph_core::CodeIndex::open(project.path(), registry).unwrap();
         boot.init().unwrap();
         boot.index().unwrap();
     }
@@ -1245,7 +1245,7 @@ fn full_reindex_schedules_no_scip_enrichment_when_scip_is_off() {
     std::fs::write(project.path().join("main.py"), "def main():\n    pass\n").unwrap();
     {
         let registry = infigraph_languages::bundled_registry().unwrap();
-        let mut boot = infigraph_core::Infigraph::open(project.path(), registry).unwrap();
+        let mut boot = infigraph_core::CodeIndex::open(project.path(), registry).unwrap();
         boot.init().unwrap();
         boot.index().unwrap();
     }

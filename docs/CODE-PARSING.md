@@ -71,7 +71,7 @@ The pipeline runs in this order:
 
 ### Infigraph struct
 
-`Infigraph` is the top-level driver (analogous to `DocIndex` for documents). Key methods:
+`CodeIndex` is the top-level driver (analogous to `DocIndex` for documents). Key methods:
 
 | Method | What it does |
 |--------|-------------|

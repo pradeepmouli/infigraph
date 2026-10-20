@@ -99,7 +99,7 @@ pub fn pending_dirty(infigraph_dir: &Path) -> Result<HashSet<String>> {
 /// was not — macOS FSEvents can coalesce a rapid create-then-delete, so a
 /// short-lived temp file leaves a mark with no removal behind it. Nothing in
 /// the steady-state loop resolves that: the drain only clears what it wrote
-/// or removed, and `Infigraph::index_via_backend` only reconciles against
+/// or removed, and `CodeIndex::index_via_backend` only reconciles against
 /// files it scanned plus graph rows it pruned — a path that is on neither
 /// disk nor in the graph appears in neither list.
 ///

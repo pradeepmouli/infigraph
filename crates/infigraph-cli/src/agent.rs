@@ -3,12 +3,12 @@ use std::io::IsTerminal;
 use std::path::Path;
 
 use anyhow::Result;
-use infigraph_core::Infigraph;
+use infigraph_core::CodeIndex;
 use infigraph_languages::bundled_registry;
 
 pub(crate) fn cmd_init(root: &Path, group: Option<&str>, quick: bool, yes: bool) -> Result<()> {
     let registry = bundled_registry()?;
-    let mut prism = Infigraph::open(root, registry)?;
+    let mut prism = CodeIndex::open(root, registry)?;
     prism.init()?;
     println!("Initialized infigraph in {}", root.display());
     println!("Graph database created at .infigraph/graph/");

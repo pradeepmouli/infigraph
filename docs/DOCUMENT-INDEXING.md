@@ -487,7 +487,7 @@ All four store types auto-recover from corruption:
 |-------|------------------|
 | **Single doc store** (`DocIndex::init`) | Catches open failure, wipes `docs.kuzu`, reopens, reindexes from source files |
 | **Combined doc store** (`combined_doc_search`, `combined_doc_query`) | On query/search failure, wipes the corrupt generation directory and schedules a background `build_combined_docs` rebuild via `REFRESHING_GROUPS` |
-| **Single code graph** (`Infigraph::init`) | Catches `GraphStore::open` failure, wipes `graph/` + `graph.wal`, reopens empty |
+| **Single code graph** (`CodeIndex::init`) | Catches `GraphStore::open` failure, wipes `graph/` + `graph.wal`, reopens empty |
 | **Combined code graph** (`open_combined_graph`) | On open failure, wipes the combined graph directory + WAL. Caller must trigger `build_combined_graph` to rebuild |
 
 Combined doc store recovery is fully automatic (background thread rebuilds). Combined code graph recovery requires an explicit rebuild call (e.g., via `group_build` or `group_index`).

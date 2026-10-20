@@ -11,7 +11,7 @@ use infigraph_core::daemon::liveness::Liveness;
 use infigraph_core::daemon::read_service::ReadService;
 use infigraph_core::daemon::writes::{submit, WriteOpts};
 use infigraph_core::daemon_protocol::{serve_write, WriteRequest, WriteResult};
-use infigraph_core::Infigraph;
+use infigraph_core::CodeIndex;
 use infigraph_languages::bundled_registry;
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,7 +26,7 @@ fn client_and_server_interoperate_end_to_end() {
     .unwrap();
 
     let registry = bundled_registry().unwrap();
-    let mut infigraph = Infigraph::open(project_dir.path(), registry).unwrap();
+    let mut infigraph = CodeIndex::open(project_dir.path(), registry).unwrap();
     infigraph.init().unwrap();
 
     let (port, rx) = CoordinatorPort::new(1800, 60);

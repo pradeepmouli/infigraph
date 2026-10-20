@@ -97,7 +97,7 @@ pub fn try_recover_by_setting_wal_aside(infigraph_dir: &Path, graph_name: &str) 
 /// This is deliberately not a `bool`. It used to be, and two of the three
 /// outcomes collapsed onto `false` -- "the image is fine, leave it alone" and
 /// "the image is beyond saving, go ahead and quarantine", which are opposite
-/// instructions to the caller. `Infigraph::init` compensated by re-probing
+/// instructions to the caller. `CodeIndex::init` compensated by re-probing
 /// after a `false`; `GraphStore::open_read_only_or_degrade` did not, and
 /// quarantined healthy graphs. Splitting the verdict is what stops a third
 /// caller from having to rediscover that.

@@ -3,12 +3,12 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use infigraph_core::graph::find_dead_code;
 use infigraph_core::path_scope::PathScope;
-use infigraph_core::Infigraph;
+use infigraph_core::CodeIndex;
 use infigraph_languages::bundled_registry;
 
 pub(crate) fn cmd_query(root: &Path, cypher: &str) -> Result<()> {
     let registry = bundled_registry()?;
-    let mut prism = Infigraph::open(root, registry)?;
+    let mut prism = CodeIndex::open(root, registry)?;
     // Read-only, matching the `query_graph` MCP tool: `cypher` is arbitrary
     // user input, but rather than inspect it for write statements, this
     // relies on the backend's own read-only enforcement to reject them
@@ -33,7 +33,7 @@ pub(crate) fn cmd_export(
     output: Option<std::path::PathBuf>,
 ) -> Result<()> {
     let registry = bundled_registry()?;
-    let mut prism = Infigraph::open(root, registry)?;
+    let mut prism = CodeIndex::open(root, registry)?;
     prism.init()?;
 
     let backend = prism.backend().context("graph not initialized")?;
@@ -58,7 +58,7 @@ pub(crate) fn cmd_export(
 
 pub(crate) fn cmd_callers(root: &Path, symbol: &str) -> Result<()> {
     let registry = bundled_registry()?;
-    let mut prism = Infigraph::open(root, registry)?;
+    let mut prism = CodeIndex::open(root, registry)?;
     prism.init()?;
 
     let backend = prism.backend().context("graph not initialized")?;
@@ -77,7 +77,7 @@ pub(crate) fn cmd_callers(root: &Path, symbol: &str) -> Result<()> {
 
 pub(crate) fn cmd_callees(root: &Path, symbol: &str) -> Result<()> {
     let registry = bundled_registry()?;
-    let mut prism = Infigraph::open(root, registry)?;
+    let mut prism = CodeIndex::open(root, registry)?;
     prism.init()?;
 
     let backend = prism.backend().context("graph not initialized")?;
@@ -96,7 +96,7 @@ pub(crate) fn cmd_callees(root: &Path, symbol: &str) -> Result<()> {
 
 pub(crate) fn cmd_dead_code(root: &Path, path_prefix: Option<&str>) -> Result<()> {
     let registry = bundled_registry()?;
-    let mut prism = Infigraph::open(root, registry)?;
+    let mut prism = CodeIndex::open(root, registry)?;
     prism.init()?;
 
     let backend = prism.backend().context("graph not initialized")?;
@@ -131,7 +131,7 @@ pub(crate) fn cmd_dead_code(root: &Path, path_prefix: Option<&str>) -> Result<()
 
 pub(crate) fn cmd_impact(root: &Path, symbol: &str, depth: u32) -> Result<()> {
     let registry = bundled_registry()?;
-    let mut prism = Infigraph::open(root, registry)?;
+    let mut prism = CodeIndex::open(root, registry)?;
     prism.init()?;
 
     let backend = prism.backend().context("graph not initialized")?;

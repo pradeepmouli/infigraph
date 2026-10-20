@@ -230,7 +230,7 @@ pub fn classify_entry(name: &str) -> EntryClass {
 /// callers that go through `begin_index_op` (full/incremental `index()`,
 /// group/multi-repo builds) — it does not cover `GraphStore::upsert_file`,
 /// which only takes the finer-grained `graph.lock` and is reachable from the
-/// public `Infigraph::index_file` API. Without also taking `graph.lock`
+/// public `CodeIndex::index_file` API. Without also taking `graph.lock`
 /// here, a concurrent single-file write could run against the graph while
 /// this function is mid-copy or mid-delete (caught by adversarial review
 /// before this shipped). Acquiring it here blocks that class of writer out

@@ -324,7 +324,7 @@ fn gather_code(
 
 fn gather_file_symbols(
     backend: &dyn GraphBackend,
-    prism: &infigraph_core::Infigraph,
+    prism: &infigraph_core::CodeIndex,
     file: &str,
     base_score: f32,
 ) -> Result<Vec<ScoredItem>> {
@@ -371,7 +371,7 @@ fn gather_file_symbols(
 
 fn render_symbol_ids(
     backend: &dyn GraphBackend,
-    prism: &infigraph_core::Infigraph,
+    prism: &infigraph_core::CodeIndex,
     ids: &HashSet<String>,
     base_score: f32,
 ) -> Result<Vec<ScoredItem>> {
@@ -426,7 +426,7 @@ fn render_symbol_ids(
 fn gather_l3_hybrid(
     query: &str,
     backend: &dyn GraphBackend,
-    prism: &infigraph_core::Infigraph,
+    prism: &infigraph_core::CodeIndex,
     path: &str,
     limit: usize,
 ) -> Result<Vec<ScoredItem>> {

@@ -7,7 +7,7 @@
 // growth vastly exceeds the ratio relative to its *original* healthy size.
 
 use infigraph_core::lang::{LanguagePack, LanguageRegistry};
-use infigraph_core::Infigraph;
+use infigraph_core::CodeIndex;
 
 const PYTHON_ENTITIES: &str = r#"
 (module
@@ -41,7 +41,7 @@ fn ordinary_incremental_writes_do_not_move_the_growth_ratio_baseline() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("a.py"), "def a():\n    return 1\n").unwrap();
 
-    let mut ig = Infigraph::open(dir.path(), python_registry()).unwrap();
+    let mut ig = CodeIndex::open(dir.path(), python_registry()).unwrap();
     ig.init().unwrap();
     ig.index().unwrap();
 

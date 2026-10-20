@@ -1,4 +1,4 @@
-//! One contract, two indexers: the code graph (`Infigraph`) and the document
+//! One contract, two indexers: the code graph (`CodeIndex`) and the document
 //! index (`DocIndex`) answer the same `PathIndexer` calls the same way. The
 //! watcher's sinks are written against the trait, so anything one indexer does
 //! that the other does not is a bug in one of them.
@@ -18,7 +18,7 @@ trait Harness {
     fn body(&self, n: u32) -> String;
 }
 
-struct Code(infigraph_core::Infigraph);
+struct Code(infigraph_core::CodeIndex);
 struct Docs(infigraph_docs::DocIndex);
 
 impl Harness for Code {
@@ -145,7 +145,7 @@ fn the_code_graph_keeps_the_path_indexer_contract() {
     pinned_environment();
     let tmp = tempfile::tempdir().unwrap();
     let mut code =
-        infigraph_core::Infigraph::open(tmp.path(), bundled_registry().unwrap()).unwrap();
+        infigraph_core::CodeIndex::open(tmp.path(), bundled_registry().unwrap()).unwrap();
     code.init().unwrap();
     the_path_indexer_contract(tmp.path(), &Code(code));
 }

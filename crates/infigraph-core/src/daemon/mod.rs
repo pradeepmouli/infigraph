@@ -30,7 +30,7 @@ use crate::daemon::task::Task;
 use crate::daemon_protocol::{WatchAction, WatchRole, WriteRequest, WriteResult};
 use crate::ops::{begin_index_op, IndexOpOutcome};
 use crate::watch::{config, producer, CodeWatch, WatchEvent, WatchEventKind};
-use crate::Infigraph;
+use crate::CodeIndex;
 use std::collections::VecDeque;
 
 /// How long one coordinator tick waits before looking again. The fsevent
@@ -394,7 +394,7 @@ fn current_on_disk_build_hash() -> Option<String> {
 
 /// Callback for in-process SCIP enrichment after a successful daemon full
 /// reindex, or when enrichment falls too far behind. It must NOT open an
-/// `Infigraph`/`Database` on the live graph path -- Kuzu only allows safe
+/// `CodeIndex`/`Database` on the live graph path -- Kuzu only allows safe
 /// concurrent access within one process's `Database` object, not across two,
 /// even in the same process -- so it writes by submitting a
 /// `WriteRequest::ScipImport`, which the coordinator serves on its own handle.
@@ -412,7 +412,7 @@ fn current_on_disk_build_hash() -> Option<String> {
 /// checkpoint for whatever synchronous, potentially long-running work the
 /// callback does (e.g. `run_scip_indexers`' between-indexer-launch check).
 ///
-/// It receives the project root, not the daemon's `Infigraph`: enrichment
+/// It receives the project root, not the daemon's `CodeIndex`: enrichment
 /// runs external indexers for minutes and submits its import as a request,
 /// so it never needs the graph -- and holding the prism for that long kept
 /// its `Database` alive past `poison_watch_db`, which is how a reopen came to
@@ -660,14 +660,14 @@ pub fn ensure_watchable_root(root: &Path) -> Result<()> {
     )
 }
 
-/// A read-only view of the coordinator's *current* `Infigraph`, shared with
+/// A read-only view of the coordinator's *current* `CodeIndex`, shared with
 /// the daemon's read service.
 ///
 /// `Option` because the coordinator opens its prism lazily and drops it
 /// again on `poison_watch_db`; the read service must cope with both.
-pub type PrismBeacon = Arc<Mutex<Option<Arc<Infigraph>>>>;
+pub type PrismBeacon = Arc<Mutex<Option<Arc<CodeIndex>>>>;
 
-/// The watch session's shared `Infigraph`, together with the beacon that
+/// The watch session's shared `CodeIndex`, together with the beacon that
 /// publishes it to the read service.
 ///
 /// A newtype rather than a bare `Option<Arc<Infigraph>>` so that publishing
@@ -679,11 +679,11 @@ pub type PrismBeacon = Arc<Mutex<Option<Arc<Infigraph>>>>;
 /// rows, no error. Every mutation here goes through `set`/`clear`, which
 /// update the beacon in the same breath.
 pub(crate) struct HeldPrism {
-    held: Option<Arc<Infigraph>>,
+    held: Option<Arc<CodeIndex>>,
     beacon: PrismBeacon,
     /// The store `clear` let go of, for as long as anything else holds it.
-    /// `GraphStore` rather than `Infigraph` because the store owns the
-    /// `Database` and is shared on its own (`Infigraph::graph_store`).
+    /// `GraphStore` rather than `CodeIndex` because the store owns the
+    /// `Database` and is shared on its own (`CodeIndex::graph_store`).
     retired: Option<std::sync::Weak<crate::graph::GraphStore>>,
     /// The graph file `held` was opened on -- see [`HeldPrism::graph_replaced`].
     graph_identity: Option<PathIdentity>,
@@ -708,11 +708,11 @@ impl HeldPrism {
         self.beacon.clone()
     }
 
-    pub(crate) fn current(&self) -> Option<Arc<Infigraph>> {
+    pub(crate) fn current(&self) -> Option<Arc<CodeIndex>> {
         self.held.clone()
     }
 
-    pub(crate) fn as_ref(&self) -> Option<&Arc<Infigraph>> {
+    pub(crate) fn as_ref(&self) -> Option<&Arc<CodeIndex>> {
         self.held.as_ref()
     }
 
@@ -720,7 +720,7 @@ impl HeldPrism {
         self.held.is_none()
     }
 
-    pub(crate) fn set(&mut self, prism: Arc<Infigraph>, graph_path: &Path) {
+    pub(crate) fn set(&mut self, prism: Arc<CodeIndex>, graph_path: &Path) {
         self.graph_identity = path_identity(graph_path);
         self.held = Some(Arc::clone(&prism));
         *self.beacon.lock().unwrap_or_else(|e| e.into_inner()) = Some(prism);
@@ -936,7 +936,7 @@ where
 
     // Build the registry ONCE for the whole watch session (#58): it serves
     // both file-extension filtering here and every `watch_db` open below
-    // via `Infigraph::open_shared`. It used to be built twice serially
+    // via `CodeIndex::open_shared`. It used to be built twice serially
     // (filter + first drain's open), which alone consumed ~5s in debug
     // builds and pushed the daemon's first request reply past callers'
     // timeouts. The full-reindex side-path build keeps its own fresh
@@ -2231,7 +2231,7 @@ where
 /// answers them, and `WriteReply`'s `Drop` answers them if it panics.
 struct InFlightDrain {
     handle: tokio::task::JoinHandle<DrainTaskOutput>,
-    prism: Arc<Infigraph>,
+    prism: Arc<CodeIndex>,
     /// R3.3.5: paths this drain's `DrainedQueue.removals` named, captured
     /// before the queue moved into the task -- cleared from the persistent
     /// dirty set alongside `outcome.extractions` once the drain confirms
@@ -2306,12 +2306,12 @@ fn finish_drain(
 
 // (open_transient below opens a short-lived Infigraph instance for batch work.)
 
-fn open_transient(root: &Path, registry: &Arc<crate::lang::LanguageRegistry>) -> Result<Infigraph> {
+fn open_transient(root: &Path, registry: &Arc<crate::lang::LanguageRegistry>) -> Result<CodeIndex> {
     // Reuses the watch session's already-built registry (#58): building the
     // 62-pack registry takes seconds in debug builds, and doing it again
     // here put the daemon's first request reply right at the edge of
-    // callers' timeouts. `Infigraph::open_shared` exists for exactly this.
-    let mut prism = Infigraph::open_shared(root, Arc::clone(registry))?;
+    // callers' timeouts. `CodeIndex::open_shared` exists for exactly this.
+    let mut prism = CodeIndex::open_shared(root, Arc::clone(registry))?;
     prism.init()?;
     Ok(prism)
 }
@@ -2326,7 +2326,7 @@ fn open_transient(root: &Path, registry: &Arc<crate::lang::LanguageRegistry>) ->
 /// --full` against a project this watcher is also watching).
 ///
 /// Returns an `Arc` clone rather than a borrow so the background drain task
-/// can hold the *same* `Infigraph` -- and therefore the same in-process
+/// can hold the *same* `CodeIndex` -- and therefore the same in-process
 /// `kuzu::Database` -- that the loop thread keeps using. Each graph
 /// operation opens its own short-lived `Connection` from that shared
 /// `Database` (see `GraphStore::connection`), which is the concurrency
@@ -2336,7 +2336,7 @@ fn watch_db(
     root: &Path,
     registry: &Arc<crate::lang::LanguageRegistry>,
     held: &mut HeldPrism,
-) -> Result<Arc<Infigraph>> {
+) -> Result<Arc<CodeIndex>> {
     if cfg!(windows) {
         return reopen_watch_db(root, registry, held);
     }
@@ -2349,7 +2349,7 @@ fn open_watch_db(
     root: &Path,
     registry: &Arc<crate::lang::LanguageRegistry>,
     held: &mut HeldPrism,
-) -> Result<Arc<Infigraph>> {
+) -> Result<Arc<CodeIndex>> {
     if held.is_none() {
         let opened = held
             .wait_for_retired_store(RETIRED_STORE_WAIT)
@@ -2377,7 +2377,7 @@ fn reopen_watch_db(
     root: &Path,
     registry: &Arc<crate::lang::LanguageRegistry>,
     held: &mut HeldPrism,
-) -> Result<Arc<Infigraph>> {
+) -> Result<Arc<CodeIndex>> {
     poison_watch_db(held);
     open_watch_db(root, registry, held)
 }
@@ -2391,7 +2391,7 @@ fn graph_path(root: &Path) -> PathBuf {
 /// backoff cannot outwait latches an `OpenFailed` fault -- including a
 /// released handle that never lets go, which is how a daemon ends up
 /// pinning a deleted graph -- and a success clears it.
-fn note_open(root: &Path, opened: Result<Infigraph>) -> Result<Infigraph> {
+fn note_open(root: &Path, opened: Result<CodeIndex>) -> Result<CodeIndex> {
     let infigraph_dir = root.join(".infigraph");
     match &opened {
         Ok(_) => fault::clear(&infigraph_dir, Some(fault::FaultClass::OpenFailed)),
@@ -2580,7 +2580,7 @@ fn serve_request_locked(
 /// One log line per failed reopen, carrying the attempt count and the
 /// backoff delay so a stuck holder shows up in the daemon log as an
 /// escalating series rather than an identical line every tick. `{e:#}`
-/// prints the whole context chain, which is where `Infigraph::init`
+/// prints the whole context chain, which is where `CodeIndex::init`
 /// names the lock holder's pid.
 fn log_reopen_failure(root: &Path, tag: &str, backoff: &mut ReopenBackoff, e: &anyhow::Error) {
     let delay = backoff.failed(root);
@@ -2722,7 +2722,7 @@ fn build_full_reindex(
         ));
     }
 
-    let build_result = Infigraph::open_local_kuzu_at(root, registry, rebuilding_path.clone())
+    let build_result = CodeIndex::open_local_kuzu_at(root, registry, rebuilding_path.clone())
         .and_then(|fresh| {
             let backend = fresh
                 .backend()
@@ -2958,7 +2958,7 @@ fn request_internal_rebuild(deferred: &mut VecDeque<(WriteRequest, WriteReply)>,
 
 /// Loop-thread entry point for a `WriteRequest::ScipImport`. Mirrors
 /// `try_start_full_reindex`'s shape, but much simpler: a SCIP import writes
-/// directly into the live graph in place (`Infigraph::import_scip`'s own
+/// directly into the live graph in place (`CodeIndex::import_scip`'s own
 /// bulk COPY/UNWIND, protected by `GraphStore::write_lock`), there is no
 /// build-then-swap -- so no snapshot/retire/rollback machinery is needed
 /// here, only the background-task-plus-reply plumbing.
@@ -2984,7 +2984,7 @@ fn try_start_scip_import(
 ) -> std::result::Result<Option<PendingScipImport>, WriteReply> {
     // Same "never overlap" reasoning as `try_start_full_reindex`'s gate --
     // this writes the same live graph a drain or a full reindex writes.
-    // Two SCIP imports at once are also refused: `Infigraph::import_scip`
+    // Two SCIP imports at once are also refused: `CodeIndex::import_scip`
     // itself serializes via `GraphStore::write_lock`, so a second one would
     // just block inside the background task rather than run concurrently,
     // silently doubling this loop's in-flight bookkeeping for no benefit.
@@ -3000,7 +3000,7 @@ fn try_start_scip_import(
         return Err(reply);
     }
 
-    // Needs the daemon's own already-open connection -- `Infigraph::
+    // Needs the daemon's own already-open connection -- `CodeIndex::
     // import_scip` must not open a second `Database` on the same live graph
     // path (Kuzu only allows safe concurrent access within one process's
     // `Database` object, not across two, even in the same process).
@@ -3854,7 +3854,7 @@ where
             let mut q = queue.lock().unwrap();
             let mut rel_paths = Vec::with_capacity(paths.len());
             for p in paths {
-                // `p` may be absolute -- `Infigraph::index_file`/`index_files`
+                // `p` may be absolute -- `CodeIndex::index_file`/`index_files`
                 // both forward the caller's path verbatim (absolute paths are
                 // an explicitly documented option), and `extract_paths` joins
                 // it onto `root` unnormalized, which for an absolute path is
@@ -4236,7 +4236,7 @@ fn read_policy(root: &Path) -> [bool; 2] {
 }
 
 /// Returns true if the file has any resolved CALLS edges to/from symbols in other files.
-fn has_cross_file_calls(prism: &Infigraph, rel_path: &str) -> bool {
+fn has_cross_file_calls(prism: &CodeIndex, rel_path: &str) -> bool {
     let backend = match prism.backend() {
         Some(b) => b,
         None => return false,
@@ -4814,7 +4814,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         // Never initialized: the drain fails at once ("graph not initialized").
-        let prism = Infigraph::open(root, crate::lang::LanguageRegistry::new()).unwrap();
+        let prism = CodeIndex::open(root, crate::lang::LanguageRegistry::new()).unwrap();
 
         let mut queue = crate::daemon::queue::IndexWorkQueue::new();
         let mut receivers = Vec::new();
@@ -4843,7 +4843,7 @@ mod tests {
     /// Regression test for a final-review Critical finding: `WriteRequest::Index
     /// { paths: Some(paths) }` used to enqueue each path via
     /// `p.to_string_lossy()` without stripping `root` first, so an absolute
-    /// path -- an explicitly documented option on `Infigraph::index_file`/
+    /// path -- an explicitly documented option on `CodeIndex::index_file`/
     /// `index_files`, both of which forward the caller's path verbatim into
     /// this same request type -- ended up keyed by its absolute string in
     /// the queue. `extract_paths` then joins that onto `root`, which for an
@@ -5630,7 +5630,7 @@ mod root_identity_tests {
 /// #148: the full-reindex swap is the last quarantine site that used to
 /// infer a corruption verdict from a single failed open in a single process
 /// -- the defect class fixed for the read path in 5818aa1 and for
-/// `Infigraph::init` in d511a0b. The probe is injected here for the reason
+/// `CodeIndex::init` in d511a0b. The probe is injected here for the reason
 /// [`crate::probe`] documents: in a test binary `current_exe()` is libtest's
 /// harness, so the real probe re-runs the whole suite instead of probing.
 #[cfg(test)]

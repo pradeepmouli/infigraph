@@ -417,7 +417,7 @@ mod tests {
 
     /// A stream that ends without an `End` frame must be an error, never an
     /// empty result. Returning zero rows silently is the "0-symbol graph
-    /// served as healthy" failure `Infigraph::init` already shipped once.
+    /// served as healthy" failure `CodeIndex::init` already shipped once.
     #[test]
     fn a_truncated_stream_is_an_error_not_an_empty_result() {
         let mut buf = Vec::new();

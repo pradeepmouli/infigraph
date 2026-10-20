@@ -1,7 +1,7 @@
 use infigraph_core::daemon::read_service::ReadService;
 use infigraph_core::graph::{DaemonKuzuBackend, GraphBackend, GraphStore};
 use infigraph_core::structured::SchemaMeta;
-use infigraph_core::Infigraph;
+use infigraph_core::CodeIndex;
 use infigraph_languages::bundled_registry;
 use std::path::Path;
 use std::sync::Arc;
@@ -23,7 +23,7 @@ fn start_read_service(project_dir: &Path) -> ReadService {
 }
 
 /// A read service whose stub coordinator serves exactly one write with
-/// `serve_write`, against a write-mode `Infigraph` opened on `project_dir`.
+/// `serve_write`, against a write-mode `CodeIndex` opened on `project_dir`.
 /// Shared by every wrapper test below -- each test's `DaemonKuzuBackend`
 /// call sends one write over the socket; this is the "daemon side" that
 /// answers it.
@@ -47,7 +47,7 @@ fn spawn_one_write_server(project_dir: &Path) -> (ReadService, std::thread::Join
             panic!("expected a write")
         };
         let registry = bundled_registry().unwrap();
-        let mut server_infigraph = Infigraph::open(&project_dir, registry).unwrap();
+        let mut server_infigraph = CodeIndex::open(&project_dir, registry).unwrap();
         server_infigraph.init().unwrap();
         reply.send(infigraph_core::daemon_protocol::serve_write(
             &server_infigraph,
@@ -61,7 +61,7 @@ fn spawn_one_write_server(project_dir: &Path) -> (ReadService, std::thread::Join
 fn read_only_connection_rejects_write_statements() {
     let project_dir = tempfile::tempdir().unwrap();
     let registry = bundled_registry().unwrap();
-    let mut infigraph = Infigraph::open(project_dir.path(), registry).unwrap();
+    let mut infigraph = CodeIndex::open(project_dir.path(), registry).unwrap();
     infigraph.init().unwrap(); // opens direct Kuzu, creates the graph on disk
     drop(infigraph); // release the write connection so the read-only open below can succeed
 
@@ -98,7 +98,7 @@ fn read_methods_pass_through_to_a_real_connection() {
     )
     .unwrap();
     let registry = bundled_registry().unwrap();
-    let mut infigraph = Infigraph::open(project_dir.path(), registry).unwrap();
+    let mut infigraph = CodeIndex::open(project_dir.path(), registry).unwrap();
     infigraph.init().unwrap();
     infigraph.index().unwrap();
     drop(infigraph);
@@ -118,7 +118,7 @@ fn read_methods_pass_through_to_a_real_connection() {
 fn wrapper_upsert_repo_routes_through_daemon_protocol() {
     let project_dir = tempfile::tempdir().unwrap();
     let registry = bundled_registry().unwrap();
-    let mut infigraph = Infigraph::open(project_dir.path(), registry).unwrap();
+    let mut infigraph = CodeIndex::open(project_dir.path(), registry).unwrap();
     infigraph.init().unwrap();
     drop(infigraph);
 
@@ -135,7 +135,7 @@ fn wrapper_upsert_repo_routes_through_daemon_protocol() {
 fn wrapper_derive_tested_by_edges_routes_through_daemon_protocol() {
     let project_dir = tempfile::tempdir().unwrap();
     let registry = bundled_registry().unwrap();
-    let mut infigraph = Infigraph::open(project_dir.path(), registry).unwrap();
+    let mut infigraph = CodeIndex::open(project_dir.path(), registry).unwrap();
     infigraph.init().unwrap();
     drop(infigraph);
 
@@ -153,7 +153,7 @@ fn wrapper_derive_tested_by_edges_routes_through_daemon_protocol() {
 fn wrapper_upsert_similar_edge_routes_through_daemon_protocol() {
     let project_dir = tempfile::tempdir().unwrap();
     let registry = bundled_registry().unwrap();
-    let mut infigraph = Infigraph::open(project_dir.path(), registry).unwrap();
+    let mut infigraph = CodeIndex::open(project_dir.path(), registry).unwrap();
     infigraph.init().unwrap();
     drop(infigraph);
 
@@ -170,7 +170,7 @@ fn wrapper_upsert_similar_edge_routes_through_daemon_protocol() {
 fn wrapper_write_calls_service_edges_cleans_up_arrow_sibling() {
     let project_dir = tempfile::tempdir().unwrap();
     let registry = bundled_registry().unwrap();
-    let mut infigraph = Infigraph::open(project_dir.path(), registry).unwrap();
+    let mut infigraph = CodeIndex::open(project_dir.path(), registry).unwrap();
     infigraph.init().unwrap();
     drop(infigraph);
 
@@ -220,7 +220,7 @@ node_table = "TestNode"
     .unwrap();
 
     let registry = bundled_registry().unwrap();
-    let mut infigraph = Infigraph::open(project_dir.path(), registry).unwrap();
+    let mut infigraph = CodeIndex::open(project_dir.path(), registry).unwrap();
     infigraph.init().unwrap();
     drop(infigraph);
 

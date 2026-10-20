@@ -1,5 +1,5 @@
 use infigraph_core::lang::{LanguagePack, LanguageRegistry};
-use infigraph_core::Infigraph;
+use infigraph_core::CodeIndex;
 
 const PYTHON_ENTITIES: &str = r#"
 (module
@@ -117,22 +117,22 @@ fn write_anchor(root: &std::path::Path) {
     .unwrap();
 }
 
-// `Infigraph::index()` does not itself call `update_embeddings` (that wiring
+// `CodeIndex::index()` does not itself call `update_embeddings` (that wiring
 // is a separate, not-yet-landed task per docs/superpowers/plans/2026-08-04-
 // daemon-routed-full-reindex.md) — so every index step here is paired with
 // an explicit `update_embeddings` call, exactly the shape that future call
 // site uses (`update_embeddings(backend, root, &[])`).
-fn reembed(root: &std::path::Path, ig: &Infigraph) -> usize {
+fn reembed(root: &std::path::Path, ig: &CodeIndex) -> usize {
     let backend = ig.backend().expect("backend available after init/index");
     infigraph_core::embed::update_embeddings(backend, root, &[]).unwrap()
 }
 
-fn setup() -> (tempfile::TempDir, Infigraph) {
+fn setup() -> (tempfile::TempDir, CodeIndex) {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join("src")).unwrap();
     write_alpha(dir.path(), "x = 1", "Helper doc.");
     write_anchor(dir.path());
-    let mut ig = Infigraph::open(dir.path(), python_registry()).unwrap();
+    let mut ig = CodeIndex::open(dir.path(), python_registry()).unwrap();
     ig.init().unwrap();
     ig.index().unwrap();
     reembed(dir.path(), &ig);
@@ -372,7 +372,7 @@ fn embeddings_record(root: &std::path::Path) -> last_run::KindRecord {
 
 /// Re-index with a changed docstring so the symbol must re-embed, then update
 /// with an embedder that fails.
-fn fail_an_update(dir: &tempfile::TempDir, ig: &Infigraph) {
+fn fail_an_update(dir: &tempfile::TempDir, ig: &CodeIndex) {
     write_alpha(dir.path(), "x = 1", "A different docstring.");
     ig.index().unwrap();
     infigraph_core::embed::update_embeddings_with(ig.backend().unwrap(), dir.path(), &[], &|| {

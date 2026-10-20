@@ -54,7 +54,7 @@ impl DaemonKuzuBackend {
         // daemon was busy writing, which is when routing matters most.
         //
         // The eager check that replaces it is reachability, not openability:
-        // `Infigraph::init`/`init_read_only` call
+        // `CodeIndex::init`/`init_read_only` call
         // `lifecycle::ensure_daemon_for_routed_access`, which starts a daemon
         // or fails with an actionable message.
         Ok(Self {
@@ -84,7 +84,7 @@ impl DaemonKuzuBackend {
     /// Reads are daemon-mandatory. The hatch exists so a graph stays
     /// recoverable when the daemon itself is broken, and it is deliberately
     /// explicit rather than an automatic fallback: a silent fallback keeps
-    /// both paths permanently live, which is how `Infigraph::init` and
+    /// both paths permanently live, which is how `CodeIndex::init` and
     /// `GraphStore::open_read_only_or_degrade` drifted apart until one
     /// quarantined healthy graphs (5818aa1).
     fn with_reader<T>(
@@ -159,7 +159,7 @@ impl DaemonKuzuBackend {
     /// `resolve_calls`). A full first index of a large repo puts every file's
     /// extraction through one of these, and the daemon only answers once
     /// the whole batch commits -- matching the 600s
-    /// `Infigraph::index()` allows for the same work under the
+    /// `CodeIndex::index()` allows for the same work under the
     /// `INFIGRAPH_WATCH_INDEX_VIA_DAEMON` path.
     const BULK_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 }
@@ -295,7 +295,7 @@ impl GraphBackend for DaemonKuzuBackend {
     fn upsert_file(&self, _extraction: &FileExtraction) -> Result<()> {
         Err(Self::not_supported(
             "upsert_file",
-            "Infigraph::index()/index_files()",
+            "CodeIndex::index()/index_files()",
         ))
     }
     fn upsert_files_bulk(
@@ -400,7 +400,7 @@ impl GraphBackend for DaemonKuzuBackend {
     ) -> Result<ResolveStats> {
         Err(Self::not_supported(
             "re_resolve_for_files",
-            "Infigraph::index()/index_files() (internal only)",
+            "CodeIndex::index()/index_files() (internal only)",
         ))
     }
     fn import_scip_index(
@@ -588,7 +588,7 @@ mod tests {
     /// Reads are daemon-mandatory. The escape hatch exists so a graph is
     /// recoverable when the daemon itself is broken, and is deliberately
     /// explicit: a silent fallback would keep both paths permanently live,
-    /// which is how `Infigraph::init` and
+    /// which is how `CodeIndex::init` and
     /// `GraphStore::open_read_only_or_degrade` drifted apart until one
     /// quarantined healthy graphs (5818aa1).
     #[test]

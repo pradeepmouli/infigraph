@@ -130,7 +130,7 @@ fn connect_neo4j() -> Neo4jBackend {
     let neo = Neo4jBackend::connect_from_env().expect("Neo4j connection — is Docker running?");
     // Pre-create schema (indexes/constraints) single-threaded before index_group runs.
     // index_group parallelizes indexing across repos on the Neo4j backend (rayon
-    // par_iter), and each repo's Infigraph::init() calls init_schema() independently.
+    // par_iter), and each repo's CodeIndex::init() calls init_schema() independently.
     // `CREATE INDEX/CONSTRAINT ... IF NOT EXISTS` is not atomic under concurrent
     // execution in Neo4j — two threads can both pass the existence check before either
     // commits, causing `Neo.ClientError.Schema.EquivalentSchemaRuleAlreadyExists` (see
@@ -299,7 +299,7 @@ void SetFormMLHandler(int entity, const char* formML) {
 ///
 /// tps-bridge (producer) defines `tps::SetFormML`; tto-engine (consumer) calls it
 /// with no local definition — the same TpsBridge/tto-engine pair the feature's
-/// own commit message names. On the SHARED Neo4j graph, every repo's `Infigraph`
+/// own commit message names. On the SHARED Neo4j graph, every repo's `CodeIndex`
 /// handle is the SAME connection (`Neo4jBackend::connect_from_env()` reads only
 /// global env vars, no per-repo parameter) — so without positive namespace
 /// scoping on both (a) the caller's own EXTERNAL_CALL scan and (b) each

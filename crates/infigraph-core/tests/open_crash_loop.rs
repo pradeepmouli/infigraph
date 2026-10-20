@@ -134,7 +134,7 @@ fn a_graph_no_probe_can_open_is_corruption_for_the_existing_rebuild_not_a_loop()
         .expect("must refuse");
     assert!(
         err.downcast_ref::<GraphCorruption>().is_some(),
-        "routes to Infigraph::init's quarantine and rebuild: {err:#}"
+        "routes to CodeIndex::init's quarantine and rebuild: {err:#}"
     );
     assert!(
         !names(dir.path())

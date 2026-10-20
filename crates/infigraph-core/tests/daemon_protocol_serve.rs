@@ -3,7 +3,7 @@ use infigraph_core::daemon_protocol::{
     serve_write, write_atomic, write_extractions_json, IngestSource, WriteRequest, WriteResult,
 };
 use infigraph_core::manifest::{DepEntry, ManifestResult};
-use infigraph_core::Infigraph;
+use infigraph_core::CodeIndex;
 use infigraph_languages::bundled_registry;
 
 #[test]
@@ -16,7 +16,7 @@ fn serve_write_indexes_and_writes_result_and_removes_request() {
     .unwrap();
 
     let registry = bundled_registry().unwrap();
-    let mut infigraph = Infigraph::open(project_dir.path(), registry).unwrap();
+    let mut infigraph = CodeIndex::open(project_dir.path(), registry).unwrap();
     infigraph.init().unwrap();
     let request = WriteRequest::Index { paths: None };
 
@@ -32,7 +32,7 @@ fn serve_write_indexes_and_writes_result_and_removes_request() {
 fn serve_write_writes_err_result_on_failure_without_panicking() {
     let project_dir = tempfile::tempdir().unwrap();
     let registry = bundled_registry().unwrap();
-    let mut infigraph = Infigraph::open(project_dir.path(), registry).unwrap();
+    let mut infigraph = CodeIndex::open(project_dir.path(), registry).unwrap();
     infigraph.init().unwrap();
     let request = WriteRequest::Index {
         paths: Some(vec!["does/not/exist.py".into()]),
@@ -72,7 +72,7 @@ fn scip_import_request_without_enriched_generation_still_parses() {
 fn serve_write_handles_scip_import() {
     let project_dir = tempfile::tempdir().unwrap();
     let registry = bundled_registry().unwrap();
-    let mut infigraph = Infigraph::open(project_dir.path(), registry).unwrap();
+    let mut infigraph = CodeIndex::open(project_dir.path(), registry).unwrap();
     infigraph.init().unwrap();
     // A nonexistent scip file is fine for this test -- it exercises the
     // handler routes to import_scip and returns Err cleanly, not that a
@@ -116,7 +116,7 @@ node_table = "TestNode"
     .unwrap();
 
     let registry = bundled_registry().unwrap();
-    let mut infigraph = Infigraph::open(project_dir.path(), registry).unwrap();
+    let mut infigraph = CodeIndex::open(project_dir.path(), registry).unwrap();
     infigraph.init().unwrap();
     let request = WriteRequest::IngestStructured {
         schema_id: "test_schema".to_string(),
@@ -152,7 +152,7 @@ node_table = "TestNode"
     .unwrap();
 
     let registry = bundled_registry().unwrap();
-    let mut infigraph = Infigraph::open(project_dir.path(), registry).unwrap();
+    let mut infigraph = CodeIndex::open(project_dir.path(), registry).unwrap();
     infigraph.init().unwrap();
 
     let staging_dir = project_dir.path().join(".infigraph").join("write-tmp");
@@ -182,7 +182,7 @@ node_table = "TestNode"
 fn serve_write_handles_upsert_repo() {
     let project_dir = tempfile::tempdir().unwrap();
     let registry = bundled_registry().unwrap();
-    let mut infigraph = Infigraph::open(project_dir.path(), registry).unwrap();
+    let mut infigraph = CodeIndex::open(project_dir.path(), registry).unwrap();
     infigraph.init().unwrap();
     let request = WriteRequest::UpsertRepo {
         namespace: "org/repo".to_string(),
@@ -205,7 +205,7 @@ fn serve_write_handles_upsert_similar_edge() {
     )
     .unwrap();
     let registry = bundled_registry().unwrap();
-    let mut infigraph = Infigraph::open(project_dir.path(), registry).unwrap();
+    let mut infigraph = CodeIndex::open(project_dir.path(), registry).unwrap();
     infigraph.init().unwrap();
     infigraph.index().unwrap();
 
@@ -233,7 +233,7 @@ fn serve_write_handles_upsert_similar_edge() {
 fn serve_write_handles_write_calls_service_edges() {
     let project_dir = tempfile::tempdir().unwrap();
     let registry = bundled_registry().unwrap();
-    let mut infigraph = Infigraph::open(project_dir.path(), registry).unwrap();
+    let mut infigraph = CodeIndex::open(project_dir.path(), registry).unwrap();
     infigraph.init().unwrap();
 
     let staging_dir = project_dir.path().join(".infigraph").join("write-tmp");
@@ -276,7 +276,7 @@ fn serve_write_handles_write_calls_service_edges() {
 fn serve_write_handles_write_cross_service_edges() {
     let project_dir = tempfile::tempdir().unwrap();
     let registry = bundled_registry().unwrap();
-    let mut infigraph = Infigraph::open(project_dir.path(), registry).unwrap();
+    let mut infigraph = CodeIndex::open(project_dir.path(), registry).unwrap();
     infigraph.init().unwrap();
 
     let staging_dir = project_dir.path().join(".infigraph").join("write-tmp");
@@ -333,7 +333,7 @@ fn serve_write_handles_upsert_dependencies() {
     )
     .unwrap();
     let registry = bundled_registry().unwrap();
-    let mut infigraph = Infigraph::open(project_dir.path(), registry).unwrap();
+    let mut infigraph = CodeIndex::open(project_dir.path(), registry).unwrap();
     infigraph.init().unwrap();
     infigraph.index().unwrap();
 
@@ -376,7 +376,7 @@ fn serve_write_handles_store_clusters() {
     )
     .unwrap();
     let registry = bundled_registry().unwrap();
-    let mut infigraph = Infigraph::open(project_dir.path(), registry).unwrap();
+    let mut infigraph = CodeIndex::open(project_dir.path(), registry).unwrap();
     infigraph.init().unwrap();
     infigraph.index().unwrap();
 
@@ -418,7 +418,7 @@ fn serve_write_handles_store_config_bindings() {
     )
     .unwrap();
     let registry = bundled_registry().unwrap();
-    let mut infigraph = Infigraph::open(project_dir.path(), registry).unwrap();
+    let mut infigraph = CodeIndex::open(project_dir.path(), registry).unwrap();
     infigraph.init().unwrap();
     infigraph.index().unwrap();
 
@@ -466,7 +466,7 @@ fn serve_write_handles_derive_tested_by() {
     )
     .unwrap();
     let registry = bundled_registry().unwrap();
-    let mut infigraph = Infigraph::open(project_dir.path(), registry).unwrap();
+    let mut infigraph = CodeIndex::open(project_dir.path(), registry).unwrap();
     infigraph.init().unwrap();
     infigraph.index().unwrap();
     let request = WriteRequest::DeriveTestedBy { files: None };
@@ -480,7 +480,7 @@ fn serve_write_handles_derive_tested_by() {
     }
 }
 
-fn file_in_graph(infigraph: &Infigraph, file: &str) -> bool {
+fn file_in_graph(infigraph: &CodeIndex, file: &str) -> bool {
     !infigraph
         .backend()
         .unwrap()
@@ -515,7 +515,7 @@ fn serve_write_handles_the_extraction_carrying_writes() {
     .unwrap();
 
     let registry = bundled_registry().unwrap();
-    let mut infigraph = Infigraph::open(project_dir.path(), registry).unwrap();
+    let mut infigraph = CodeIndex::open(project_dir.path(), registry).unwrap();
     infigraph.init().unwrap();
     let indexed = infigraph.index().unwrap();
     assert_eq!(

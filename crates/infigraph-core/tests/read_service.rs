@@ -217,7 +217,7 @@ fn remote_exec_satisfies_query_exec_against_a_live_service() {
 
 /// Killing the service mid-response must surface an error, never a
 /// successful empty result. This is the one failure mode with a precedent
-/// in this codebase: `Infigraph::init` once served a 0-symbol graph as
+/// in this codebase: `CodeIndex::init` once served a 0-symbol graph as
 /// healthy after a "successful" rebuild.
 ///
 /// Note this is the frame-boundary case, not the mid-frame one: the bytes
@@ -620,7 +620,7 @@ fn hold_with_no_daemon_forgets_the_root() {
 /// The case where a synchronous attach would hang its caller: a daemon that
 /// holds `watch.lock` but has not bound its socket yet makes
 /// `connect_allowing_for_startup` wait out its 30s grace. `hold` sits on
-/// every `Infigraph::init`, so it must return regardless.
+/// every `CodeIndex::init`, so it must return regardless.
 #[test]
 fn hold_never_blocks_on_a_daemon_that_is_still_starting() {
     let project = tempfile::tempdir().unwrap();

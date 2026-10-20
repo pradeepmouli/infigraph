@@ -7,7 +7,7 @@
 use std::path::Path;
 
 use infigraph_core::embed::EmbedProvider;
-use infigraph_core::Infigraph;
+use infigraph_core::CodeIndex;
 use infigraph_languages::bundled_registry;
 
 /// A stand-in for a text embedding model, with no model to load or download.
@@ -102,7 +102,7 @@ pub fn write(root: &Path, file: &str, text: &str) {
 ///
 /// Indexed, and embedded with [`WordEmbedder`]. The handle is returned open:
 /// a test that goes on to open the project again must drop it first.
-pub fn project() -> (tempfile::TempDir, Infigraph) {
+pub fn project() -> (tempfile::TempDir, CodeIndex) {
     let dir = tempfile::tempdir().unwrap();
     let r = dir.path();
     write(
@@ -145,7 +145,7 @@ pub fn project() -> (tempfile::TempDir, Infigraph) {
         "src/h.py",
         &function("check", "Check the batch.", &calling(5, "remove")),
     );
-    let mut ig = Infigraph::open(r, bundled_registry().unwrap()).unwrap();
+    let mut ig = CodeIndex::open(r, bundled_registry().unwrap()).unwrap();
     ig.init().unwrap();
     ig.index().unwrap();
     infigraph_core::embed::update_embeddings_with(ig.backend().unwrap(), r, &[], &|| {

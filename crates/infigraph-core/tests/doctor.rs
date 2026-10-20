@@ -1479,7 +1479,7 @@ fn doctor_never_creates_a_watch_lock_as_a_side_effect() {
     std::fs::write(project.join("a.py"), "def a():\n    pass\n").unwrap();
 
     let registry = infigraph_languages::bundled_registry().unwrap();
-    let mut prism = infigraph_core::Infigraph::open(&project, registry).unwrap();
+    let mut prism = infigraph_core::CodeIndex::open(&project, registry).unwrap();
     prism.init().unwrap();
     prism.index().unwrap();
     drop(prism);

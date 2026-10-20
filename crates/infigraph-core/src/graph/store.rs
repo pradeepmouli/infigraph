@@ -93,7 +93,7 @@ const MIN_DB_FILE_SIZE: u64 = 4096;
 /// on some platforms (observed on Linux) or segfaults later at read time
 /// (observed on macOS) — before any `Result` exists to catch it. Rejecting
 /// obviously-invalid files here turns that abort into a normal error that
-/// callers' wipe-and-rebuild recovery (`Infigraph::init`, `DocIndex::init`)
+/// callers' wipe-and-rebuild recovery (`CodeIndex::init`, `DocIndex::init`)
 /// already handles.
 ///
 /// A missing path (fresh create) and a directory (legacy on-disk layout)
@@ -508,7 +508,7 @@ fn refuse_newer_schema(db: &Database, db_path: &Path) -> Result<()> {
 // `Database::new` collapses every failure into one stringified error before
 // it reaches any caller, so the only way to tell "not corruption -- leave the
 // file alone" from "durably unopenable" is the text. These are the classes
-// every wipe-on-open-failure path (`Infigraph::init`, `DocIndex::init`,
+// every wipe-on-open-failure path (`CodeIndex::init`, `DocIndex::init`,
 // `open_combined_graph`, the combined-docs generation) must recognise BEFORE
 // taking a destructive branch. They live here, next to the open itself,
 // precisely so that each of those paths does not grow its own partial list
@@ -563,7 +563,7 @@ pub fn is_storage_version_mismatch_error(err: &anyhow::Error) -> bool {
 /// file is either busy, mid-race with a live writer, or written on a lbug
 /// version this build cannot read. The single guard for callers whose only
 /// choices are "refuse" or "destroy and rebuild" (`DocIndex::init`,
-/// `open_combined_graph`); `Infigraph::init` distinguishes the classes
+/// `open_combined_graph`); `CodeIndex::init` distinguishes the classes
 /// itself because it retries the transient one.
 pub fn open_failure_is_not_corruption(err: &anyhow::Error) -> bool {
     is_transient_open_error(err) || is_storage_version_mismatch_error(err)
@@ -616,7 +616,7 @@ pub fn storage_version_mismatch_context(db_path: &Path) -> String {
 
 /// Context line for any [`open_failure_is_not_corruption`] failure, so a
 /// caller that refuses instead of wiping explains *why* the file was left
-/// alone in the same words `Infigraph::init` uses.
+/// alone in the same words `CodeIndex::init` uses.
 pub fn non_corruption_open_context(err: &anyhow::Error, db_path: &Path) -> String {
     if is_lock_contention_error(err) {
         lock_contention_context(db_path)
@@ -2638,7 +2638,7 @@ mod tests {
     /// `try_recover_by_setting_wal_aside` therefore answers "already healthy"
     /// here -- which used to be the same `false` it returns for "not
     /// recoverable", and this call site quarantined a perfectly good index on
-    /// the strength of it. `Infigraph::init` never showed the bug because it
+    /// the strength of it. `CodeIndex::init` never showed the bug because it
     /// re-probed itself afterwards; this path had no such backstop.
     #[test]
     fn open_read_only_or_degrade_keeps_a_healthy_graph_whose_dead_holder_was_stale() {
@@ -2685,7 +2685,7 @@ mod tests {
     /// `kuzu::Database::new`, which parses a bogus size field from the header
     /// and either aborts the process (Linux) or segfaults later at read time
     /// (macOS, `BufferManager::optimisticRead`). The preflight must turn this
-    /// into a normal `Err` so `Infigraph::init`'s wipe-and-rebuild path runs.
+    /// into a normal `Err` so `CodeIndex::init`'s wipe-and-rebuild path runs.
     #[test]
     fn open_truncated_db_file_returns_err_instead_of_aborting() {
         let dir = tempfile::tempdir().unwrap();

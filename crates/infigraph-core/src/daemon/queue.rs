@@ -158,7 +158,7 @@ impl IndexWorkQueue {
     }
 
     /// The drain step will additionally compute the full changed-file set
-    /// (a whole-project scan + hash-diff), same as `Infigraph::index()`
+    /// (a whole-project scan + hash-diff), same as `CodeIndex::index()`
     /// does today, in addition to whatever's explicitly queued.
     #[allow(dead_code)]
     pub(crate) fn mark_whole_project(&mut self) {

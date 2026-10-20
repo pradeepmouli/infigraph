@@ -182,7 +182,7 @@ pub fn open_kuzu_with_retry<T>(
 }
 
 /// The main entry point for the infigraph framework.
-pub struct Infigraph {
+pub struct CodeIndex {
     root: PathBuf,
     db_path: PathBuf,
     registry: std::sync::Arc<LanguageRegistry>,
@@ -244,7 +244,7 @@ pub const LOCAL_BACKEND: &str = BackendChoice::Kuzu.as_str();
 pub const DAEMON_BACKEND: &str = BackendChoice::Daemon.as_str();
 
 /// What `init()` prints when it gives up on a graph that will not open and
-/// destroys it to start over ([`Infigraph::init`]'s last branch). The upgrade
+/// destroys it to start over ([`CodeIndex::init`]'s last branch). The upgrade
 /// smoke test (`infigraph-cli/tests/upgrade_smoke.rs`) fails any open of a
 /// previous release's graph that printed it: a wipe-and-rebuild-from-source
 /// leaves the same symbols behind, so only this notice (and what the source
@@ -270,7 +270,7 @@ pub fn selected_backend() -> BackendChoice {
 }
 
 /// The active backend, or a Config error naming the bad value and the valid
-/// ones. Called at CLI/MCP startup and by every `Infigraph::init*`.
+/// ones. Called at CLI/MCP startup and by every `CodeIndex::init*`.
 pub fn validated_backend() -> Result<BackendChoice> {
     Backend::resolve(RawBackend::default(), settings_file::ConfigScope::User)
         .map(|backend| backend.selected)
@@ -297,12 +297,12 @@ pub fn check_settings_at_startup(root: &Path) -> Result<BackendChoice> {
 }
 
 /// Whether `INFIGRAPH_BACKEND` selects the daemon backend. This is the exact
-/// condition `Infigraph::init` dispatches `BackendKind::DaemonKuzu` on,
+/// condition `CodeIndex::init` dispatches `BackendKind::DaemonKuzu` on,
 /// exposed for callers that must know *before* `init()` -- notably
 /// `cmd_index`, which otherwise takes `.infigraph/index.lock` and deadlocks
 /// against the daemon that needs that same lock to serve its writes.
 ///
-/// Prefer `Infigraph::is_daemon_backend` once you have an initialized
+/// Prefer `CodeIndex::is_daemon_backend` once you have an initialized
 /// instance; that reports what was actually opened rather than what was
 /// requested.
 pub fn daemon_backend_selected() -> bool {
@@ -345,7 +345,7 @@ pub fn index_via_daemon_mode_enabled() -> bool {
         .0
 }
 
-impl Infigraph {
+impl CodeIndex {
     /// Backoff schedule (ms) for retrying a non-lock-contention graph open
     /// failure before concluding it's genuine corruption. See `init()`.
     const OPEN_RETRY_BACKOFF_MS: [u64; 3] = [200, 500, 1000];
@@ -372,7 +372,7 @@ impl Infigraph {
         })
     }
 
-    /// Opens a plain, non-daemon-routed `Infigraph` at an explicit
+    /// Opens a plain, non-daemon-routed `CodeIndex` at an explicit
     /// `db_path`, bypassing `init()`'s `INFIGRAPH_BACKEND` env-var
     /// branching entirely. Used by the daemon's own full-reindex handler
     /// (`serve_full_reindex_request` in `watch/mod.rs`) to build a fresh
@@ -843,7 +843,7 @@ impl Infigraph {
     /// unconditionally, since `upsert_file` is still a Tier-3 stub.
     ///
     /// This never recurses: the daemon serves the request against its own
-    /// `Infigraph`, which is always `BackendKind::Kuzu` because `cmd_daemon`
+    /// `CodeIndex`, which is always `BackendKind::Kuzu` because `cmd_daemon`
     /// and `spawn_daemon` both strip `INFIGRAPH_BACKEND` from the daemon
     /// process's environment.
     fn index_via_daemon(
@@ -1380,7 +1380,7 @@ pub struct IndexResult {
     pub skipped_errors: Vec<String>,
 }
 
-/// The result of `Infigraph::scan_changed_files`: everything that needs
+/// The result of `CodeIndex::scan_changed_files`: everything that needs
 /// work, without having written anything yet.
 pub(crate) struct ScanResult {
     pub total_files: usize,
@@ -1394,13 +1394,13 @@ pub(crate) struct ScanResult {
 mod tests {
     use super::*;
 
-    /// Regression test for a data-loss bug: `Infigraph::init()` used to
+    /// Regression test for a data-loss bug: `CodeIndex::init()` used to
     /// treat every Kuzu open failure as corruption and wipe the graph --
     /// including plain lock contention from another live process (e.g. a
     /// running `infigraph watch`), destroying its data. `is_lock_contention_error`
     /// is the check that now distinguishes the two. A genuine two-OS-process
     /// reproduction isn't exercised here -- `Database::new()` doesn't
-    /// conflict across two `Infigraph` instances in the *same* process, only
+    /// conflict across two `CodeIndex` instances in the *same* process, only
     /// across separate processes, and this codebase deliberately avoids
     /// fork()-based tests given the tokio/rayon runtime state that would be
     /// undefined in a forked child (same reasoning as `scip_enrich_exit_message`
@@ -1712,7 +1712,7 @@ mod tests {
         });
 
         let registry = LanguageRegistry::new();
-        let mut ig = Infigraph::open(root, registry).unwrap();
+        let mut ig = CodeIndex::open(root, registry).unwrap();
         let result = ig.init();
         healer.join().unwrap();
 
@@ -1764,7 +1764,7 @@ mod tests {
         });
 
         let registry = LanguageRegistry::new();
-        let mut ig = Infigraph::open(root, registry).unwrap();
+        let mut ig = CodeIndex::open(root, registry).unwrap();
         let result = ig.init();
         healer.join().unwrap();
 
@@ -1809,7 +1809,7 @@ mod tests {
         std::fs::write(&db_path, b"not a valid kuzu database file at all").unwrap();
 
         let registry = LanguageRegistry::new();
-        let mut ig = Infigraph::open(root, registry).unwrap();
+        let mut ig = CodeIndex::open(root, registry).unwrap();
         let result = ig.init();
 
         assert!(
@@ -1848,7 +1848,7 @@ mod tests {
         std::fs::write(&db_path, b"not a valid kuzu database file at all").unwrap();
 
         let registry = LanguageRegistry::new();
-        let mut ig = Infigraph::open(root, registry).unwrap();
+        let mut ig = CodeIndex::open(root, registry).unwrap();
         let result = ig.init();
         assert!(result.is_ok(), "init() must still recover: {result:?}");
 
@@ -1919,7 +1919,7 @@ mod tests {
         bytes[4..12].copy_from_slice(&foreign.to_le_bytes());
         std::fs::write(&db_path, &bytes).unwrap();
 
-        let mut ig = Infigraph::open(root, LanguageRegistry::new()).unwrap();
+        let mut ig = CodeIndex::open(root, LanguageRegistry::new()).unwrap();
         let err = ig
             .init()
             .expect_err("a storage-version mismatch must be refused, not wiped and rebuilt");
@@ -1972,7 +1972,7 @@ mod tests {
             }
             std::fs::write(&db_path, b"not a valid kuzu database file at all").unwrap();
 
-            let mut ig = Infigraph::open(root, LanguageRegistry::new()).unwrap();
+            let mut ig = CodeIndex::open(root, LanguageRegistry::new()).unwrap();
             let result = ig.init();
             assert!(
                 result.is_ok(),
@@ -1987,7 +1987,7 @@ mod tests {
         }
         std::fs::write(&db_path, b"not a valid kuzu database file at all").unwrap();
 
-        let mut ig = Infigraph::open(root, LanguageRegistry::new()).unwrap();
+        let mut ig = CodeIndex::open(root, LanguageRegistry::new()).unwrap();
         let err = ig
             .init()
             .expect_err("a third auto-rebuild within the crash-loop window must be refused");
@@ -2017,7 +2017,7 @@ mod tests {
 
         std::env::set_var("INFIGRAPH_BACKEND", "daemon");
         let registry = LanguageRegistry::new();
-        let prism = Infigraph::open_local_kuzu_at(root, registry, custom_db_path.clone()).unwrap();
+        let prism = CodeIndex::open_local_kuzu_at(root, registry, custom_db_path.clone()).unwrap();
         std::env::set_var(crate::BACKEND_ENV, crate::LOCAL_BACKEND);
 
         assert!(

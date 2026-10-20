@@ -1,11 +1,11 @@
-//! The dependency-lockfile skip at file discovery: `Infigraph::collect_files`
+//! The dependency-lockfile skip at file discovery: `CodeIndex::collect_files`
 //! consults `graph::store_util::is_lockfile` alongside `registry.for_file`.
 //!
 //! Named `dependency_lockfiles` deliberately -- `tests/lockfile.rs` covers
 //! this crate's advisory *graph* lock, an unrelated subject with a colliding
 //! name.
 
-use infigraph_core::Infigraph;
+use infigraph_core::CodeIndex;
 
 fn bundled() -> infigraph_core::lang::LanguageRegistry {
     infigraph_languages::bundled_registry().unwrap()
@@ -43,7 +43,7 @@ fn discovery_skips_dependency_lockfiles_but_keeps_real_source() {
     )
     .unwrap();
 
-    let mut ig = Infigraph::open(root, bundled()).unwrap();
+    let mut ig = CodeIndex::open(root, bundled()).unwrap();
     ig.init().unwrap();
     let result = ig.index().unwrap();
 

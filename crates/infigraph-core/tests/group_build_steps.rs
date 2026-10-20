@@ -607,7 +607,7 @@ fn test_local_incremental_build_links_unchanged_caller_to_newly_changed_producer
     // (edges persist on disk in local mode, so a raw count delta can't
     // distinguish "the refunds edge now exists" from an unrelated count change).
     let order_entry = registry.repos.get("order-service").unwrap().clone();
-    let mut order_prism = infigraph_core::Infigraph::open(
+    let mut order_prism = infigraph_core::CodeIndex::open(
         &order_entry.path,
         infigraph_core::lang::LanguageRegistry::new(),
     )

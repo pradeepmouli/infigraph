@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use serde_json::{json, Value};
 
 use infigraph_core::path_scope::PathScope;
-use infigraph_core::Infigraph;
+use infigraph_core::CodeIndex;
 use infigraph_languages::bundled_registry;
 
 pub use super::session::{session_date_id, session_epoch};
@@ -13,7 +13,7 @@ pub use super::session::{session_date_id, session_epoch};
 /// `path_prefix` argument, relative to the root of the project `prism` opened
 /// (an absolute path inside that root is accepted too). No argument means the
 /// whole project.
-pub fn path_scope(prism: &Infigraph, args: &Value) -> PathScope {
+pub fn path_scope(prism: &CodeIndex, args: &Value) -> PathScope {
     PathScope::new(
         prism.root(),
         args.get("path_prefix").and_then(|v| v.as_str()),
@@ -110,27 +110,27 @@ pub fn scope_to_project(tool_name: &str, mut args: Value) -> Value {
     args
 }
 
-pub fn open_prism(args: &Value) -> Result<Infigraph> {
+pub fn open_prism(args: &Value) -> Result<CodeIndex> {
     let raw_path = args
         .get("path")
         .and_then(|p| p.as_str())
         .context("missing 'path' argument")?;
     let path = resolve_project_path(raw_path);
     let registry = bundled_registry()?;
-    let mut prism = Infigraph::open(&PathBuf::from(&path), registry)?;
+    let mut prism = CodeIndex::open(&PathBuf::from(&path), registry)?;
     prism.init()?;
     apply_repo_filter(&mut prism, &path);
     Ok(prism)
 }
 
-pub fn open_prism_read_only(args: &Value) -> Result<Infigraph> {
+pub fn open_prism_read_only(args: &Value) -> Result<CodeIndex> {
     let raw_path = args
         .get("path")
         .and_then(|p| p.as_str())
         .context("missing 'path' argument")?;
     let path = resolve_project_path(raw_path);
     let registry = bundled_registry()?;
-    let mut prism = Infigraph::open(&PathBuf::from(&path), registry)?;
+    let mut prism = CodeIndex::open(&PathBuf::from(&path), registry)?;
     prism.init_read_only()?;
     apply_repo_filter(&mut prism, &path);
     Ok(prism)
@@ -144,14 +144,14 @@ pub fn open_prism_read_only(args: &Value) -> Result<Infigraph> {
 /// this one.
 pub fn open_prism_read_only_or_degrade(
     args: &Value,
-) -> Result<(Infigraph, Option<infigraph_core::graph::DegradeReason>)> {
+) -> Result<(CodeIndex, Option<infigraph_core::graph::DegradeReason>)> {
     let raw_path = args
         .get("path")
         .and_then(|p| p.as_str())
         .context("missing 'path' argument")?;
     let path = resolve_project_path(raw_path);
     let registry = bundled_registry()?;
-    let mut prism = Infigraph::open(&PathBuf::from(&path), registry)?;
+    let mut prism = CodeIndex::open(&PathBuf::from(&path), registry)?;
     let reason = prism.init_read_only_or_degrade()?;
     apply_repo_filter(&mut prism, &path);
     Ok((prism, reason))
@@ -183,7 +183,7 @@ pub fn degrade_banner(reason: &infigraph_core::graph::DegradeReason) -> String {
 /// write key only when the env org equals the group's org, which is exactly why the
 /// registry lookup is preferred.
 #[cfg(feature = "remote")]
-fn apply_repo_filter(prism: &mut Infigraph, raw_path: &str) {
+fn apply_repo_filter(prism: &mut CodeIndex, raw_path: &str) {
     if !infigraph_core::daemon::lifecycle::is_remote_backend() {
         return;
     }
@@ -208,7 +208,7 @@ fn apply_repo_filter(prism: &mut Infigraph, raw_path: &str) {
 }
 
 #[cfg(not(feature = "remote"))]
-fn apply_repo_filter(_prism: &mut Infigraph, _raw_path: &str) {}
+fn apply_repo_filter(_prism: &mut CodeIndex, _raw_path: &str) {}
 
 /// The `infigraph` CLI this server spawns for indexing: a sibling of this
 /// executable (or one directory up, the `cargo test` layout -- the same

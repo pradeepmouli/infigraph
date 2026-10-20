@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 use serde_json::Value;
 
 use infigraph_core::multi::{self, combined, Registry};
-use infigraph_core::Infigraph;
+use infigraph_core::CodeIndex;
 use infigraph_languages::bundled_registry;
 
 use super::watch::auto_start_watch_opportunistic as auto_start_watch;
@@ -73,7 +73,7 @@ pub fn tool_group_add(args: &Value) -> Result<String> {
     if !registry.repos.contains_key(repo_name) {
         if let Some(path_str) = args.get("path").and_then(|p| p.as_str()) {
             let lang_registry = bundled_registry()?;
-            let mut prism = Infigraph::open(&PathBuf::from(path_str), lang_registry)?;
+            let mut prism = CodeIndex::open(&PathBuf::from(path_str), lang_registry)?;
             prism.init()?;
             registry.register_repo(repo_name, &PathBuf::from(path_str), &prism)?;
         }

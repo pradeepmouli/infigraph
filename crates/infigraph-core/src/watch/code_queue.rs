@@ -1,6 +1,6 @@
 //! The code graph as a [`PathQueue`]: how the producer's settled changes get
 //! in line for the daemon's drain, which is the execute side
-//! ([`PathIndexer for Infigraph`](crate::daemon::drain)).
+//! ([`PathIndexer for CodeIndex`](crate::daemon::drain)).
 //!
 //! The producer never opens the graph. It makes a change durable (a dirty mark
 //! that survives a crash), then hands the settled set to the shared
@@ -11,7 +11,7 @@ use crate::pending_paths::PendingPaths;
 use crate::watch::queued::PathQueue;
 use crate::watch::sink::PathChange;
 use crate::watch::{WatchEvent, WatchEventKind};
-use crate::Infigraph;
+use crate::CodeIndex;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -69,7 +69,7 @@ impl CodeQueue {
     }
 }
 
-impl PathQueue for Infigraph {
+impl PathQueue for CodeIndex {
     type Handle = CodeQueue;
 
     fn wants(handle: &CodeQueue, rel: &str) -> bool {

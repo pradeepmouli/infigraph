@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use infigraph_core::child::StderrTail;
 #[cfg(feature = "remote")]
 use infigraph_core::graph::GraphBackend;
-use infigraph_core::Infigraph;
+use infigraph_core::CodeIndex;
 use infigraph_languages::bundled_registry;
 use tokio_util::sync::CancellationToken;
 
@@ -16,7 +16,7 @@ use tokio_util::sync::CancellationToken;
 /// locally, Postgres in remote mode) so `infigraph repos` and `infigraph
 /// doctor` see it, and returns the name it was registered under. Every
 /// index path must reach this -- see `cmd_index`'s daemon-routed branch.
-pub(crate) fn register_project(root: &Path, prism: &Infigraph) -> Result<String> {
+pub(crate) fn register_project(root: &Path, prism: &CodeIndex) -> Result<String> {
     let canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let repo_name = canonical
         .file_name()
@@ -64,7 +64,7 @@ pub(crate) fn restamp_growth_baseline(root: &Path) {
 }
 
 pub(crate) fn cmd_index(root: &Path, full: bool, no_embed: bool) -> Result<()> {
-    // Before ANY destructive work. `Infigraph::init` performs the same check,
+    // Before ANY destructive work. `CodeIndex::init` performs the same check,
     // but `--full` wipes `.infigraph/` here first -- so a root that was going
     // to be refused still had its directory cleared before the refusal was
     // raised. Observed doing exactly that: "Cleaned .infigraph/ for full
@@ -145,7 +145,7 @@ pub(crate) fn cmd_index(root: &Path, full: bool, no_embed: bool) -> Result<()> {
             // real fix (the mitigation this branch used to be is now
             // closed).
             // The daemon is the only thing that serves a FullReindex, and
-            // this branch returns before `Infigraph::open`, so the usual
+            // this branch returns before `CodeIndex::open`, so the usual
             // auto-start path never runs. Without this check, submitting
             // into an unattended staging dir just sits there until the
             // 600s deadline and then reports an opaque timeout -- an
@@ -245,7 +245,7 @@ pub(crate) fn cmd_index(root: &Path, full: bool, no_embed: bool) -> Result<()> {
             // read-only for the stats the registry records; a failure is a
             // warning, the rebuild itself succeeded.
             let registered = bundled_registry()
-                .and_then(|registry| Infigraph::open(root, registry))
+                .and_then(|registry| CodeIndex::open(root, registry))
                 .and_then(|mut prism| {
                     prism.init_read_only()?;
                     register_project(root, &prism)
@@ -272,7 +272,7 @@ pub(crate) fn cmd_index(root: &Path, full: bool, no_embed: bool) -> Result<()> {
 
     let registry = crate::full_registry(Some(root))?;
     #[allow(unused_mut)]
-    let mut prism = Infigraph::open(root, registry)?;
+    let mut prism = CodeIndex::open(root, registry)?;
     prism.init()?;
 
     // Symbol ids an older infigraph wrote cannot be adopted a file at a time
@@ -293,7 +293,7 @@ pub(crate) fn cmd_index(root: &Path, full: bool, no_embed: bool) -> Result<()> {
         // `op_guard` above holds .infigraph/index.lock, as the wipe requires.
         infigraph_core::ops::full_reindex_wipe(&root.join(".infigraph"))?;
         println!("Cleaned .infigraph/ for full reindex (snapshot saved, sessions preserved)");
-        prism = Infigraph::open(root, crate::full_registry(Some(root))?)?;
+        prism = CodeIndex::open(root, crate::full_registry(Some(root))?)?;
         prism.init()?;
     }
 
@@ -792,7 +792,7 @@ pub(crate) fn ensure_watcher_running(root: &Path) {
 /// because daemon startup is asynchronous: `ensure_watcher_running` returns
 /// at spawn time, and the child needs a moment to acquire watch.lock (#100
 /// item 3's race). Thin wrapper over the core primitive shared with
-/// `Infigraph::ensure_daemon_for_writes`'s own wait.
+/// `CodeIndex::ensure_daemon_for_writes`'s own wait.
 pub(crate) fn wait_for_daemon(lock_path: &Path, budget: std::time::Duration) -> bool {
     infigraph_core::daemon::lifecycle::wait_for_daemon_ready(lock_path, budget)
 }
@@ -841,7 +841,7 @@ pub(crate) fn import_scip_and_cleanup(
             return Some(Err(format!("{e:#}")));
         }
     };
-    let mut prism = match Infigraph::open(root, registry) {
+    let mut prism = match CodeIndex::open(root, registry) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("Auto-SCIP: import failed: {e}");
@@ -1608,7 +1608,7 @@ impl ScipRun {
 /// in the same `scip-tmp` are never touched (#139).
 pub(crate) fn import_scip_results_and_embed(
     root: &Path,
-    prism: &Infigraph,
+    prism: &CodeIndex,
     results: &[IndexerResult],
 ) {
     let scip_tmp = root.join(".infigraph").join("scip-tmp");
@@ -1682,7 +1682,7 @@ pub(crate) fn import_scip_results_and_embed(
 }
 
 /// Runs auto-SCIP enrichment (find indexers, run them, import results,
-/// update embeddings) against an already-open `Infigraph` connection, with
+/// update embeddings) against an already-open `CodeIndex` connection, with
 /// **no internal lock acquisition of its own** -- just Part A followed by
 /// Part B+C in sequence. Callers that need `index.lock` serialization
 /// (anything routing through the daemon) must acquire it themselves,
@@ -1697,7 +1697,7 @@ pub(crate) fn import_scip_results_and_embed(
 /// whole duration (unlike the daemon's own request-serving loop).
 pub(crate) fn run_auto_scip_on(
     root: &Path,
-    prism: &Infigraph,
+    prism: &CodeIndex,
     detected_languages: &std::collections::HashSet<String>,
 ) {
     // The standalone CLI path has no daemon-lifetime token to thread through
@@ -1713,7 +1713,7 @@ pub(crate) fn run_auto_scip_on(
 }
 
 /// Background SCIP pipeline for the standalone CLI path: opens its own
-/// `Infigraph` connection (there is no already-open one to reuse here,
+/// `CodeIndex` connection (there is no already-open one to reuse here,
 /// unlike the daemon's in-process path), then delegates the actual
 /// run+import+embed work to `run_auto_scip_on`.
 fn auto_scip_background(root: &Path, detected_languages: &std::collections::HashSet<String>) {
@@ -1732,7 +1732,7 @@ fn auto_scip_background(root: &Path, detected_languages: &std::collections::Hash
             return;
         }
     };
-    let mut prism = match Infigraph::open(root, registry) {
+    let mut prism = match CodeIndex::open(root, registry) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("Auto-SCIP: import failed: {e}");
@@ -3379,7 +3379,7 @@ mod tests {
     }
 
     /// Regression test for the Postgres-connect-on-plain-local-index bug:
-    /// `Infigraph::backend()` became universal (returning `Some` for the
+    /// `CodeIndex::backend()` became universal (returning `Some` for the
     /// default local Kùzu backend too, not just Neo4j), which silently
     /// turned `if let Some(backend) = prism.backend()` into an always-true
     /// check gating the Postgres-embeddings branch — so `infigraph index`

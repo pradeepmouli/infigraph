@@ -8,7 +8,7 @@ use infigraph_core::multi::combined::{
     open_combined_graph,
 };
 use infigraph_core::multi::{Group, Registry, RepoEntry};
-use infigraph_core::Infigraph;
+use infigraph_core::CodeIndex;
 
 // Tests set HOME env var which is process-global, so must run sequentially.
 static COMBINED_LOCK: Mutex<()> = Mutex::new(());
@@ -116,9 +116,9 @@ fn make_repo(dir: &tempfile::TempDir, files: &[(&str, &str)]) -> PathBuf {
     dir.path().to_path_buf()
 }
 
-fn index_repo(path: &std::path::Path) -> Infigraph {
+fn index_repo(path: &std::path::Path) -> CodeIndex {
     let reg = python_registry();
-    let mut ig = Infigraph::open(path, reg).unwrap();
+    let mut ig = CodeIndex::open(path, reg).unwrap();
     ig.init().unwrap();
     ig.index().unwrap();
     ig
@@ -731,7 +731,7 @@ fn test_register_repo_does_not_stamp_commit_without_indexing() {
     };
 
     // `group add`'s path: open + init only, never index().
-    let mut ig = Infigraph::open(&path, python_registry()).unwrap();
+    let mut ig = CodeIndex::open(&path, python_registry()).unwrap();
     ig.init().unwrap();
     registry.register_repo("svc", &path, &ig).unwrap();
 
