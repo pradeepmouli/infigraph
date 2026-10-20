@@ -1055,9 +1055,12 @@ where
     // fsevents, periodic ticks and further requests for its whole duration.
     // One worker is enough -- `drain_in_flight` allows at most one drain at
     // a time, and the drain itself is a `spawn_blocking` task.
+    // Timers on: the shutdown bounds its wait for a started docs write with
+    // `tokio::time::timeout`.
     let drain_rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(1)
         .thread_name("infigraph-drain")
+        .enable_time()
         .build()?;
     let mut drain_in_flight: Option<InFlightDrain> = None;
     let mut full_reindex_in_flight: Option<PendingFullReindex> = None;
@@ -2191,7 +2194,11 @@ where
     // grace it is left to end with the process, and its client is told so.
     let mut abandoned_docs_write = false;
     if let Some(PendingDocsWrite { task, reply, what }) = docs_write_in_flight.take() {
-        match drain_rt.block_on(tokio::time::timeout(DOCS_WRITE_STOP_GRACE, task.join())) {
+        // Built inside the runtime: `tokio::time::timeout` registers its timer
+        // when it is created, and outside a runtime context that panics.
+        match drain_rt
+            .block_on(async { tokio::time::timeout(DOCS_WRITE_STOP_GRACE, task.join()).await })
+        {
             Ok(joined) => finish_docs_write(reply, what, joined),
             Err(_) => {
                 eprintln!(
