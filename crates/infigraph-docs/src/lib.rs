@@ -343,11 +343,78 @@ impl DocIndex {
             .get_doc_hashes()
             .context("doc index: failed to load existing document hashes")?;
 
+        let results = self.extract_documents(&files, &existing_hashes, true);
+
+        let indexed = results.len();
+        let total_chunks: usize = results.iter().map(|(_, c)| c.len()).sum();
+
+        // Created when the first document is written, so a run that changes
+        // nothing neither loads the plugin registry nor spawns a plugin.
+        let mut pipelines: Option<PipelineRun> = None;
+        self.store_documents(store, &results, &mut pipelines)?;
+
+        let result_chunks: Vec<Chunk> = results.iter().flat_map(|(_, c)| c.clone()).collect();
+        let result_changed: Vec<String> = results.iter().map(|(d, _)| d.file.clone()).collect();
+
+        let pruned = self.prune_stale_docs(store, &existing_hashes, &files, listing_complete);
+
+        let mut all_doc_ids = self.link_documents(store, &results);
+
+        // BFS: follow links to docs outside the doc root but within the repo
+        let bfs_discovered = if let Some(repo_root) = find_repo_root(&self.root) {
+            let n =
+                self.bfs_follow_links(store, &mut pipelines, &mut all_doc_ids, &repo_root, 2, 50)?;
+            if n > 0 {
+                eprintln!("BFS: discovered and indexed {} doc(s) outside root", n);
+            }
+            n
+        } else {
+            0
+        };
+
+        let pipeline_warnings = pipelines.map(|run| run.finish(store)).unwrap_or_default();
+
+        self.note_embedding_health(store);
+
+        Ok(DocIndexResult {
+            total_files: total,
+            indexed_files: indexed,
+            total_chunks,
+            bfs_discovered,
+            new_chunks: result_chunks,
+            changed_files: result_changed,
+            pruned,
+            pipeline_warnings,
+        })
+    }
+
+    /// #75: with chunks in the store and no embeddings beside it, document
+    /// search ranks by keywords only. Only this side knows the count; an
+    /// empty index has no embeddings file and is healthy. A run that was
+    /// told to skip embeddings does not judge.
+    fn note_embedding_health(&self, store: &dyn DocBackend) {
+        if !self.skip_file_embeddings && !infigraph_core::daemon::lifecycle::is_remote_backend() {
+            if let Ok(stats) = store.stats() {
+                infigraph_core::degraded::live::note_doc_embeddings(&self.root, stats.chunk_count);
+            }
+        }
+    }
+
+    /// Reads, hashes and extracts `files`, leaving out each whose stored hash
+    /// is the one it has now. The one place a document becomes chunks, for the
+    /// whole-tree index and for the paths a watcher names alike.
+    fn extract_documents(
+        &self,
+        files: &[PathBuf],
+        existing_hashes: &std::collections::HashMap<String, String>,
+        report_progress: bool,
+    ) -> Vec<(ExtractedDoc, Vec<Chunk>)> {
+        let total = files.len();
         let done = AtomicUsize::new(0);
         let root = &self.root;
         let ns = self.namespace.as_deref();
 
-        let results: Vec<(ExtractedDoc, Vec<Chunk>)> = files
+        files
             .par_iter()
             .filter_map(|path| {
                 let raw_rel = path
@@ -369,7 +436,7 @@ impl DocIndex {
                 let n = done.fetch_add(1, Ordering::Relaxed) + 1;
                 let pct = n * 100 / total;
                 let prev_pct = (n - 1) * 100 / total;
-                if (pct / 25) > (prev_pct / 25) || n == total {
+                if report_progress && ((pct / 25) > (prev_pct / 25) || n == total) {
                     eprintln!("Doc indexing: {}/{} ({}%)", n, total, pct);
                 }
 
@@ -390,15 +457,18 @@ impl DocIndex {
                     chunks,
                 ))
             })
-            .collect();
+            .collect()
+    }
 
-        let indexed = results.len();
+    /// Writes extracted documents: their rows, the pipeline plugins' view of
+    /// them, and their embeddings.
+    fn store_documents(
+        &self,
+        store: &dyn DocBackend,
+        results: &[(ExtractedDoc, Vec<Chunk>)],
+        pipelines: &mut Option<PipelineRun>,
+    ) -> Result<()> {
         let total_chunks: usize = results.iter().map(|(_, c)| c.len()).sum();
-
-        // Created when the first document is written, so a run that changes
-        // nothing neither loads the plugin registry nor spawns a plugin.
-        let mut pipelines: Option<PipelineRun> = None;
-
         if !results.is_empty() {
             let docs: Vec<&ExtractedDoc> = results.iter().map(|(d, _)| d).collect();
             let chunks: Vec<&Chunk> = results.iter().flat_map(|(_, c)| c.iter()).collect();
@@ -407,9 +477,6 @@ impl DocIndex {
                 .get_or_insert_with(|| self.pipeline_run())
                 .apply(store, &docs);
         }
-
-        let result_chunks: Vec<Chunk> = results.iter().flat_map(|(_, c)| c.clone()).collect();
-        let result_changed: Vec<String> = results.iter().map(|(d, _)| d.file.clone()).collect();
 
         if total_chunks > 0 && !self.skip_file_embeddings {
             let all_chunks: Vec<&Chunk> = results.iter().flat_map(|(_, c)| c.iter()).collect();
@@ -429,13 +496,21 @@ impl DocIndex {
             #[cfg(not(feature = "remote"))]
             embed::update_doc_embeddings(store, &self.root, &all_chunks, &changed_files)?;
         }
+        Ok(())
+    }
 
-        let pruned = self.prune_stale_docs(store, &existing_hashes, &files, listing_complete);
-
+    /// Links the documents just written to each other and to code. Returns the
+    /// ids of every stored document of this repo, which link-following needs.
+    fn link_documents(
+        &self,
+        store: &dyn DocBackend,
+        results: &[(ExtractedDoc, Vec<Chunk>)],
+    ) -> HashSet<String> {
+        let ns = self.namespace.as_deref();
         // Extract links from indexed docs and create LINKS_TO edges.
         // Scope to this repo's namespace so cross-repo docs aren't offered as
         // link targets that don't actually exist in this repo's tree.
-        let mut all_doc_ids: HashSet<String> = {
+        let all_doc_ids: HashSet<String> = {
             let existing = store.get_doc_hashes().unwrap_or_default();
             existing
                 .keys()
@@ -446,55 +521,19 @@ impl DocIndex {
                 .cloned()
                 .collect()
         };
-        if !results.is_empty() {
-            for (doc, _) in &results {
-                links::extract_and_link_doc(store, doc, &all_doc_ids);
-            }
+        for (doc, _) in results {
+            links::extract_and_link_doc(store, doc, &all_doc_ids);
         }
 
         // Code links: the documents written this run get theirs replaced, and
         // a stored document that no build has scanned yet (a store from before
         // code links existed) is scanned even though its content is unchanged.
         let written: HashSet<&str> = results.iter().map(|(d, _)| d.file.as_str()).collect();
-        for (doc, _) in &results {
+        for (doc, _) in results {
             code_links::record(store, doc);
         }
         self.scan_unscanned_docs(store, &written);
-
-        // BFS: follow links to docs outside the doc root but within the repo
-        let bfs_discovered = if let Some(repo_root) = find_repo_root(&self.root) {
-            let n =
-                self.bfs_follow_links(store, &mut pipelines, &mut all_doc_ids, &repo_root, 2, 50)?;
-            if n > 0 {
-                eprintln!("BFS: discovered and indexed {} doc(s) outside root", n);
-            }
-            n
-        } else {
-            0
-        };
-
-        let pipeline_warnings = pipelines.map(|run| run.finish(store)).unwrap_or_default();
-
-        // #75: with chunks in the store and no embeddings beside it, document
-        // search ranks by keywords only. Only this side knows the count; an
-        // empty index has no embeddings file and is healthy. A run that was
-        // told to skip embeddings does not judge.
-        if !self.skip_file_embeddings && !infigraph_core::daemon::lifecycle::is_remote_backend() {
-            if let Ok(stats) = store.stats() {
-                infigraph_core::degraded::live::note_doc_embeddings(&self.root, stats.chunk_count);
-            }
-        }
-
-        Ok(DocIndexResult {
-            total_files: total,
-            indexed_files: indexed,
-            total_chunks,
-            bfs_discovered,
-            new_chunks: result_chunks,
-            changed_files: result_changed,
-            pruned,
-            pipeline_warnings,
-        })
+        all_doc_ids
     }
 
     /// Scans each stored local document (but those in `written`, which the
