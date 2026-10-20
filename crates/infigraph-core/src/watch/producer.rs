@@ -210,6 +210,7 @@ pub async fn run_producer(
                 if dropped.due(now) {
                     let rate = dropped.report(now);
                     queue_true_up(&queue, &format!("the watcher reported dropped events: {rate}"));
+                    dispatcher.rescan_all_but("code");
                     dropped.queued(now);
                 }
                 match canary.step(now) {
@@ -239,6 +240,7 @@ pub async fn run_producer(
                         // Whatever it missed is found by the true-up the
                         // debounce allows, not by one per miss.
                         dropped.note();
+                        dispatcher.rescan_all_but("code");
                         match create_watcher_unless_cancelled(&root, debounce_ms, &token).await {
                             None => break,
                             Some(Ok((new_watcher, new_rx))) => {
@@ -395,6 +397,7 @@ pub async fn run_producer(
                                 eprintln!("[watch-producer] watcher restarted successfully");
                                 // Whatever changed while it was down.
                                 queue_true_up(&queue, "the watcher restarted");
+                                dispatcher.rescan_all_but("code");
                                 dropped.queued(std::time::Instant::now());
                                 emit(
                                     &on_event,

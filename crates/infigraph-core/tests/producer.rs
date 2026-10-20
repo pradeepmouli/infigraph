@@ -351,6 +351,64 @@ async fn producer_exits_promptly_on_cancellation_while_a_new_directory_registrat
     );
 }
 
+/// A sink that only records the batches it is given.
+struct Recorder(Arc<Mutex<Vec<infigraph_core::watch::sink::WatchBatch>>>);
+
+impl infigraph_core::watch::sink::WatchSink for Recorder {
+    fn name(&self) -> &'static str {
+        "recorder"
+    }
+    fn domain(&self) -> infigraph_core::ignore_rules::Domain {
+        infigraph_core::ignore_rules::Domain::Docs
+    }
+    fn accept(&mut self, batch: infigraph_core::watch::sink::WatchBatch) {
+        self.0.lock().unwrap().push(batch);
+    }
+    fn health(&self) -> infigraph_core::watch::sink::SinkHealth {
+        Default::default()
+    }
+}
+
+/// The canary is the producer's, not the code sink's: a deaf subscription is
+/// rebuilt once and every attached sink, whatever its domain, is told events
+/// were lost.
+#[tokio::test(flavor = "current_thread")]
+async fn a_deaf_subscription_tells_every_attached_sink_to_rescan() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    std::fs::create_dir_all(root.join(".infigraph")).unwrap();
+    std::env::set_var("INFIGRAPH_TEST_WATCH_CANARY_MS", "300,600");
+    std::env::set_var("INFIGRAPH_TEST_WATCH_CANARY_DEAF", "1");
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    infigraph_core::watch::sink::request_attach(&root, Box::new(Recorder(Arc::clone(&seen))));
+
+    let queue = Arc::new(Mutex::new(IndexWorkQueue::new()));
+    let token = CancellationToken::new();
+    let (cfg, queue_clone, token_clone) = (config(root.clone()), Arc::clone(&queue), token.clone());
+    let handle = tokio::task::spawn(async move {
+        infigraph_core::watch::producer::run_producer(cfg, queue_clone, |_evt| {}, token_clone)
+            .await;
+    });
+
+    // One rescan for attaching, then one for each miss.
+    let mut rescans = 0;
+    for _ in 0..100 {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        rescans = seen.lock().unwrap().iter().filter(|b| b.rescan).count();
+        if rescans >= 2 {
+            break;
+        }
+    }
+    token.cancel();
+    handle.await.unwrap();
+    std::env::remove_var("INFIGRAPH_TEST_WATCH_CANARY_MS");
+    std::env::remove_var("INFIGRAPH_TEST_WATCH_CANARY_DEAF");
+    assert!(
+        rescans >= 2,
+        "the attach and the canary miss each tell the sink to rescan, saw {rescans}"
+    );
+}
+
 /// A watcher that cannot see its own probe write is deaf, and says so: the
 /// project is degraded (`code-watcher-deaf`) and the subscription rebuilt.
 /// The test hook makes the producer ignore the probe's event, which is what

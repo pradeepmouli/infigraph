@@ -347,9 +347,11 @@ impl Dispatcher {
         }
     }
 
-    /// Tells every sink events were lost.
-    pub fn rescan_all(&mut self) {
-        for sink in &mut self.sinks {
+    /// Tells every sink but the one called `except` that events were lost.
+    /// The producer asks the code graph's own true-up itself, because it owns
+    /// that pass's debounce and counter; everything else answers a rescan.
+    pub fn rescan_all_but(&mut self, except: &str) {
+        for sink in self.sinks.iter_mut().filter(|s| s.name() != except) {
             sink.accept(WatchBatch::rescan());
         }
     }
