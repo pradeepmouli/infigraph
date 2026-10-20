@@ -35,9 +35,14 @@ impl infigraph_core::daemon::DocsHandle for CannedIndexer {
             ..Default::default()
         })
     }
-    fn index_doc_paths(&self, upserts: &[String], _removals: &[String]) -> Result<bool, String> {
+    fn index_doc_paths(
+        &self,
+        upserts: &[String],
+        _removals: &[String],
+        _whole: bool,
+    ) -> Result<usize, String> {
         std::thread::sleep(self.delay);
-        Ok(!upserts.is_empty())
+        Ok(upserts.len())
     }
     fn ack_docs(&self, acks: &[DocAck], drop: &[String]) -> Result<(usize, usize), String> {
         std::thread::sleep(self.delay);

@@ -53,6 +53,18 @@ pub struct Pacing {
     pub channel_cap: usize,
     /// How often the worker looks at the clock when nothing arrives.
     pub tick: Duration,
+    /// Ask for a whole-project pass this often even when no event was lost,
+    /// because events are never taken as complete. `None` leaves it to the
+    /// loss signals.
+    pub true_up_every: Option<Duration>,
+    /// After a hand-off that took `t` to be answered, wait `t * run_gap_factor`
+    /// (at most `run_gap_cap`) before the next. A hand-off the indexer answers
+    /// when its run is done counts as work in flight for the daemon's idle
+    /// exit; a trigger that never stops (a formatter rewriting a document with
+    /// the same bytes) would otherwise keep a daemon busy nearly all the time.
+    /// Zero turns it off.
+    pub run_gap_factor: u32,
+    pub run_gap_cap: Duration,
 }
 
 impl Default for Pacing {
@@ -62,6 +74,9 @@ impl Default for Pacing {
             whole_gap: Duration::from_secs(30),
             channel_cap: 1024,
             tick: Duration::from_millis(200),
+            true_up_every: None,
+            run_gap_factor: 0,
+            run_gap_cap: Duration::ZERO,
         }
     }
 }
@@ -127,9 +142,11 @@ fn work<I: PathQueue>(
     lost: &AtomicBool,
     pacing: Pacing,
 ) {
+    let started = Instant::now();
     let mut window: PendingPaths = PendingPaths::new();
     let mut last_change: Option<Instant> = None;
     let mut last_whole: Option<Instant> = None;
+    let mut next_run_at = Instant::now();
     loop {
         match rx.recv_timeout(pacing.tick) {
             Ok(batch) => {
@@ -143,21 +160,30 @@ fn work<I: PathQueue>(
             window.mark_whole();
             last_change = Some(Instant::now());
         }
+        if let Some(every) = pacing.true_up_every {
+            if last_whole.unwrap_or(started).elapsed() >= every && !window.wants_whole() {
+                window.mark_whole();
+                last_change = Some(Instant::now());
+            }
+        }
         let settled = last_change.is_some_and(|at| at.elapsed() >= pacing.debounce);
         let whole_allowed =
             last_whole.is_none_or(|at| at.elapsed() >= pacing.whole_gap) || !window.wants_whole();
-        if settled && !window.is_empty() && whole_allowed {
+        if settled && !window.is_empty() && whole_allowed && Instant::now() >= next_run_at {
             if window.wants_whole() {
                 last_whole = Some(Instant::now());
             }
+            let handed_on = Instant::now();
             I::enqueue(&queued.handle, std::mem::take(&mut window));
             last_change = None;
+            next_run_at = Instant::now()
+                + (handed_on.elapsed() * pacing.run_gap_factor).min(pacing.run_gap_cap);
         }
     }
-    // A sink that is dropped hands on what it still holds.
-    if !window.is_empty() {
-        I::enqueue(&queued.handle, window);
-    }
+    // A sink that is dropped (detached, or its producer stopped) discards what
+    // it still holds: it is no longer listening, so the changes it never
+    // handed on are for the next sink to find, which it does with the rescan
+    // it is attached with.
 }
 
 fn absorb<I: PathQueue>(handle: &I::Handle, window: &mut PendingPaths, batch: WatchBatch) {
@@ -216,12 +242,14 @@ impl<I: PathQueue> WatchSink for IndexingSink<I> {
 }
 
 impl<I: PathQueue> Drop for IndexingSink<I> {
+    /// Closing the channel is what ends the worker, which discards what it
+    /// still holds and exits on its own. It is deliberately not joined: its
+    /// hand-off may be waiting on the very thread that is dropping the sink
+    /// (the daemon's coordinator stops the producer, and the producer's sinks
+    /// go with it, while a document run is waiting for that coordinator).
     fn drop(&mut self) {
-        // Closing the channel is what ends the worker.
         self.tx = None;
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
-        }
+        self.worker = None;
     }
 }
 
@@ -241,6 +269,10 @@ pub(crate) mod fakes {
         pub unwanted: Vec<String>,
         /// While set, `enqueue` blocks, as an indexer whose queue is busy does.
         pub stall: Option<Arc<AtomicBool>>,
+        /// How long every `enqueue` takes to be answered.
+        pub delay: Option<Duration>,
+        /// When each `enqueue` began.
+        pub began: Vec<Instant>,
     }
 
     pub struct Fake;
@@ -271,7 +303,14 @@ pub(crate) mod fakes {
         }
 
         fn enqueue(handle: &Self::Handle, pending: PendingPaths) {
-            let stall = handle.lock().unwrap().stall.clone();
+            let (stall, delay) = {
+                let mut record = handle.lock().unwrap();
+                record.began.push(Instant::now());
+                (record.stall.clone(), record.delay)
+            };
+            if let Some(delay) = delay {
+                std::thread::sleep(delay);
+            }
             while stall.as_ref().is_some_and(|s| s.load(Ordering::SeqCst)) {
                 std::thread::sleep(Duration::from_millis(5));
             }
@@ -285,6 +324,9 @@ pub(crate) mod fakes {
             whole_gap: Duration::from_millis(200),
             channel_cap: 4,
             tick: Duration::from_millis(5),
+            true_up_every: None,
+            run_gap_factor: 0,
+            run_gap_cap: Duration::ZERO,
         }
     }
 
@@ -440,15 +482,71 @@ mod tests {
     }
 
     #[test]
-    fn dropping_a_sink_hands_on_what_it_still_holds_and_stops_its_worker() {
+    fn dropping_a_sink_discards_what_it_still_holds_and_does_not_wait_for_its_worker() {
         let (mut sink, handle) = sink(Pacing {
             debounce: Duration::from_secs(60),
             ..quick()
         });
         sink.accept(batch(&[("late.md", Created)]));
 
+        let started = Instant::now();
         drop(sink);
+        std::thread::sleep(Duration::from_millis(100));
 
-        assert_eq!(handle.lock().unwrap().enqueued.len(), 1);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(
+            handle.lock().unwrap().enqueued.is_empty(),
+            "a detached sink indexes nothing more"
+        );
+    }
+
+    #[test]
+    fn a_sink_asks_for_a_whole_project_pass_on_its_own_when_told_to() {
+        let (_sink, handle) = sink(Pacing {
+            true_up_every: Some(Duration::from_millis(80)),
+            ..quick()
+        });
+
+        assert!(wait_for(&handle, |r| r.enqueued.iter().any(|t| t.whole)));
+    }
+
+    #[test]
+    fn a_hand_off_that_took_long_to_answer_is_followed_by_a_proportionate_wait() {
+        let (mut sink, handle) = sink(Pacing {
+            run_gap_factor: 4,
+            run_gap_cap: Duration::from_secs(5),
+            ..quick()
+        });
+        handle.lock().unwrap().delay = Some(Duration::from_millis(100));
+
+        sink.accept(batch(&[("a.md", Created)]));
+        assert!(wait_for(&handle, |r| r.began.len() == 1));
+        sink.accept(batch(&[("b.md", Created)]));
+        assert!(wait_for(&handle, |r| r.began.len() == 2));
+
+        let began = handle.lock().unwrap().began.clone();
+        assert!(
+            began[1] - began[0] >= Duration::from_millis(480),
+            "100ms to answer, four times that to wait, then 100ms more: {:?}",
+            began[1] - began[0]
+        );
+    }
+
+    #[test]
+    fn the_wait_is_capped() {
+        let (mut sink, handle) = sink(Pacing {
+            run_gap_factor: 1000,
+            run_gap_cap: Duration::from_millis(50),
+            ..quick()
+        });
+        handle.lock().unwrap().delay = Some(Duration::from_millis(100));
+
+        sink.accept(batch(&[("a.md", Created)]));
+        assert!(wait_for(&handle, |r| r.began.len() == 1));
+        sink.accept(batch(&[("b.md", Created)]));
+        assert!(wait_for(&handle, |r| r.began.len() == 2));
+
+        let began = handle.lock().unwrap().began.clone();
+        assert!(began[1] - began[0] < Duration::from_secs(1));
     }
 }

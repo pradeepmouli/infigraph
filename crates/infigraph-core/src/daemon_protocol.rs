@@ -138,9 +138,16 @@ pub enum WriteRequest {
     /// edits is one index run. Never sent by a client: the answer is
     /// `Ok { total_files, indexed_files }`, with `indexed_files` zero when
     /// nothing changed.
+    ///
+    /// `whole` asks for the whole-tree pass instead (a watcher's true-up),
+    /// which finds what no event reported and prunes what is gone. Unlike
+    /// `IndexDocs` it never opts a project in or creates a store: it writes
+    /// nothing unless `[docs] enabled` is on, read again under the docs lock.
     IndexDocPaths {
         upserts: Vec<String>,
         removals: Vec<String>,
+        #[serde(default)]
+        whole: bool,
     },
     /// Record that glossary entries were reviewed against their code (`acks`:
     /// the newest per target wins), and forget the acknowledgements of the
@@ -412,7 +419,8 @@ mod tests {
         assert_eq!(
             WriteRequest::IndexDocPaths {
                 upserts: vec![],
-                removals: vec![]
+                removals: vec![],
+                whole: false
             }
             .kind(),
             "IndexDocPaths"
@@ -436,11 +444,24 @@ mod tests {
         let request = WriteRequest::IndexDocPaths {
             upserts: vec!["docs/a.md".to_string()],
             removals: vec!["docs/old".to_string()],
+            whole: true,
         };
         let json = serde_json::to_string(&request).unwrap();
         assert_eq!(
             json,
-            r#"{"IndexDocPaths":{"upserts":["docs/a.md"],"removals":["docs/old"]}}"#
+            r#"{"IndexDocPaths":{"upserts":["docs/a.md"],"removals":["docs/old"],"whole":true}}"#
+        );
+        // `whole` may be left out.
+        assert_eq!(
+            serde_json::from_str::<WriteRequest>(
+                r#"{"IndexDocPaths":{"upserts":[],"removals":["x"]}}"#
+            )
+            .unwrap(),
+            WriteRequest::IndexDocPaths {
+                upserts: vec![],
+                removals: vec!["x".to_string()],
+                whole: false
+            }
         );
         assert_eq!(
             serde_json::from_str::<WriteRequest>(&json).unwrap(),

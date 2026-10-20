@@ -38,7 +38,7 @@ impl DocIndex {
     /// Removes the documents at, or below, each of `targets`: a target that
     /// was a directory removes everything under `target/` and, because of the
     /// slash, nothing beside it (`docs/a` leaves `docs/ab.md` alone).
-    fn delete_targets(&self, targets: &[String]) -> Result<bool> {
+    fn delete_targets(&self, targets: &[String]) -> Result<usize> {
         let store = self.store.as_deref().context("call init() first")?;
         let stored = store
             .get_doc_hashes()
@@ -54,14 +54,14 @@ impl DocIndex {
             .cloned()
             .collect();
         if doomed.is_empty() {
-            return Ok(false);
+            return Ok(0);
         }
         let refs: Vec<&str> = doomed.iter().map(String::as_str).collect();
         store.delete_docs_by_ids(&refs)?;
         if !self.skip_file_embeddings {
             embed::update_doc_embeddings(store, &self.root, &[], &refs)?;
         }
-        Ok(true)
+        Ok(doomed.len())
     }
 }
 
@@ -79,15 +79,13 @@ impl PathIndexer for DocIndex {
                 files.push(abs);
             }
         }
-        let mut wrote = if gone.is_empty() {
-            false
+        let removed = if gone.is_empty() {
+            0
         } else {
             self.delete_targets(&gone)?
         };
         if files.is_empty() {
-            return Ok(PathOutcome {
-                files: usize::from(wrote),
-            });
+            return Ok(PathOutcome { files: removed });
         }
 
         let existing_hashes = store
@@ -95,11 +93,9 @@ impl PathIndexer for DocIndex {
             .context("doc index: failed to load existing document hashes")?;
         let results = self.extract_documents(&files, &existing_hashes, false);
         if results.is_empty() {
-            return Ok(PathOutcome {
-                files: usize::from(wrote),
-            });
+            return Ok(PathOutcome { files: removed });
         }
-        wrote = true;
+        let indexed = results.len();
 
         let mut pipelines = None;
         self.store_documents(store, &results, &mut pipelines)?;
@@ -121,7 +117,7 @@ impl PathIndexer for DocIndex {
         }
         self.note_embedding_health(store);
         Ok(PathOutcome {
-            files: usize::from(wrote),
+            files: removed + indexed,
         })
     }
 
@@ -130,23 +126,19 @@ impl PathIndexer for DocIndex {
             .iter()
             .map(|path| self.id_of(&self.absolute(path)))
             .collect();
-        let wrote = self.delete_targets(&targets)?;
-        if wrote {
+        let files = self.delete_targets(&targets)?;
+        if files > 0 {
             if let Some(store) = self.store.as_deref() {
                 self.note_embedding_health(store);
             }
         }
-        Ok(PathOutcome {
-            files: usize::from(wrote),
-        })
+        Ok(PathOutcome { files })
     }
 
     fn index_all(&self) -> Result<PathOutcome> {
         let result = self.index()?;
         Ok(PathOutcome {
-            files: usize::from(
-                result.indexed_files > 0 || result.bfs_discovered > 0 || result.pruned > 0,
-            ),
+            files: result.indexed_files + result.bfs_discovered + result.pruned,
         })
     }
 }

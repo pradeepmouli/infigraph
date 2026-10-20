@@ -442,12 +442,13 @@ pub trait DocsHandle: Send + Sync {
     ) -> std::result::Result<crate::daemon_protocol::DocIndexStats, String>;
     /// Index and drop the documents named by `WriteRequest::IndexDocPaths`,
     /// with the same calling rules as [`DocsHandle::index_docs`]. Returns
-    /// whether the store changed. Required, for the same reason.
+    /// how many documents it wrote or removed. Required, for the same reason.
     fn index_doc_paths(
         &self,
         upserts: &[String],
         removals: &[String],
-    ) -> std::result::Result<bool, String>;
+        whole: bool,
+    ) -> std::result::Result<usize, String>;
     /// Called once, when the coordinator has its port: the handle through
     /// which the daemon's own document watcher submits `IndexDocPaths` to
     /// this coordinator, the way a client would. A handle with no watcher of
@@ -2173,10 +2174,27 @@ where
     if scip_embeddings_pending_since.take().is_some() {
         reconcile_embeddings_after_scip(root, &held_prism);
     }
-    // A docs index that started finishes and answers its client (#204 D3:
-    // started work is never cancelled).
+    // A docs index that started gets `DOCS_WRITE_STOP_GRACE` to finish and
+    // answer its client (#204 D3: started work is never cancelled). It cannot
+    // be interrupted, so an unbounded wait made the whole daemon's shutdown
+    // (SIGTERM, `daemon-stop`) wait for it: a daemon stuck inside one ignored
+    // every stop for minutes and had to be killed with SIGKILL. Past the
+    // grace it is left to end with the process, and its client is told so.
+    let mut abandoned_docs_write = false;
     if let Some(PendingDocsWrite { task, reply, what }) = docs_write_in_flight.take() {
-        finish_docs_write(reply, what, drain_rt.block_on(task.join()));
+        match drain_rt.block_on(tokio::time::timeout(DOCS_WRITE_STOP_GRACE, task.join())) {
+            Ok(joined) => finish_docs_write(reply, what, joined),
+            Err(_) => {
+                eprintln!(
+                    "[daemon] {} {what} is still running {}s after a stop was asked; not \
+                     waiting for it any longer",
+                    crate::watch::log_stamp(),
+                    DOCS_WRITE_STOP_GRACE.as_secs()
+                );
+                drop(reply);
+                abandoned_docs_write = true;
+            }
+        }
     }
 
     // Last, so the joins above have answered their clients: let every
@@ -2187,6 +2205,12 @@ where
             "[daemon] {} connection thread(s) still replying at shutdown",
             port.in_flight()
         );
+    }
+
+    // Dropping the runtime would wait for the blocking thread of a docs write
+    // that was given up on.
+    if abandoned_docs_write {
+        drain_rt.shutdown_background();
     }
 
     Ok(())
@@ -3026,6 +3050,9 @@ fn try_start_scip_import(
     }))
 }
 
+/// How long a stop waits for a docs write that is already running.
+const DOCS_WRITE_STOP_GRACE: Duration = Duration::from_secs(20);
+
 /// Puts a write that cannot start yet at the back of the line. An
 /// `IndexDocPaths` joins the one already waiting instead (the paths merge, the
 /// newer ask winning, as in `PendingPaths::merge`), so a burst of edits behind
@@ -3037,12 +3064,21 @@ fn defer_write(
     request: WriteRequest,
     reply: WriteReply,
 ) {
-    if let WriteRequest::IndexDocPaths { upserts, removals } = request {
+    if let WriteRequest::IndexDocPaths {
+        upserts,
+        removals,
+        whole,
+    } = request
+    {
         let waiting = deferred.iter_mut().find_map(|(r, _)| match r {
-            WriteRequest::IndexDocPaths { upserts, removals } => Some((upserts, removals)),
+            WriteRequest::IndexDocPaths {
+                upserts,
+                removals,
+                whole,
+            } => Some((upserts, removals, whole)),
             _ => None,
         });
-        if let Some((waiting_upserts, waiting_removals)) = waiting {
+        if let Some((waiting_upserts, waiting_removals, waiting_whole)) = waiting {
             let mut pending = crate::pending_paths::PendingPaths::<()>::new();
             for rel in std::mem::take(waiting_removals) {
                 pending.remove_tree(rel);
@@ -3057,10 +3093,17 @@ fn defer_write(
             for rel in upserts {
                 newer.upsert(rel, ());
             }
+            if whole {
+                newer.mark_whole();
+            }
+            if *waiting_whole {
+                pending.mark_whole();
+            }
             pending.merge(newer);
             let crate::pending_paths::Taken {
                 upserts: merged_upserts,
                 removals: merged_removals,
+                whole: merged_whole,
                 ..
             } = pending.take();
             let mut merged_upserts: Vec<String> = merged_upserts.into_keys().collect();
@@ -3069,13 +3112,21 @@ fn defer_write(
             merged_removals.sort();
             *waiting_upserts = merged_upserts;
             *waiting_removals = merged_removals;
+            *waiting_whole = merged_whole;
             reply.send(WriteResult::Ok {
                 total_files: 0,
                 indexed_files: 0,
             });
             return;
         }
-        deferred.push_back((WriteRequest::IndexDocPaths { upserts, removals }, reply));
+        deferred.push_back((
+            WriteRequest::IndexDocPaths {
+                upserts,
+                removals,
+                whole,
+            },
+            reply,
+        ));
         return;
     }
     deferred.push_back((request, reply));
@@ -3117,15 +3168,16 @@ fn try_start_docs_write(
                 .ack_docs(&acks, &drop)
                 .map(|(stored, dropped)| WriteResult::DocsAcked { stored, dropped }),
             WriteRequest::IndexDocs { full } => docs.index_docs(full).map(WriteResult::DocsIndexed),
-            WriteRequest::IndexDocPaths { upserts, removals } => {
-                docs.index_doc_paths(&upserts, &removals).map(|wrote| {
-                    let named = upserts.len() + removals.len();
-                    WriteResult::Ok {
-                        total_files: named,
-                        indexed_files: if wrote { named } else { 0 },
-                    }
-                })
-            }
+            WriteRequest::IndexDocPaths {
+                upserts,
+                removals,
+                whole,
+            } => docs
+                .index_doc_paths(&upserts, &removals, whole)
+                .map(|files| WriteResult::Ok {
+                    total_files: upserts.len() + removals.len(),
+                    indexed_files: files,
+                }),
             other => Err(format!("{} is not a docs write", other.kind())),
         })
     };
@@ -5142,8 +5194,9 @@ mod tests {
             &self,
             _upserts: &[String],
             _removals: &[String],
-        ) -> std::result::Result<bool, String> {
-            Ok(true)
+            _whole: bool,
+        ) -> std::result::Result<usize, String> {
+            Ok(2)
         }
         fn ack_docs(
             &self,
@@ -5234,6 +5287,7 @@ mod tests {
         WriteRequest::IndexDocPaths {
             upserts: upserts.iter().map(|s| s.to_string()).collect(),
             removals: removals.iter().map(|s| s.to_string()).collect(),
+            whole: false,
         }
     }
 

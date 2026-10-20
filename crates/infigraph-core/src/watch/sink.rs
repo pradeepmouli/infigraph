@@ -264,16 +264,47 @@ pub fn request_attach(root: &Path, sink: Box<dyn WatchSink>) {
         .push((root, SinkCommand::Attach(sink)));
 }
 
-/// Asks the producer watching `root` to detach the sink called `name`.
+/// Asks the producer watching `root` to detach the sink called `name`. An
+/// attach of that name still waiting for a producer is withdrawn: a sink
+/// that was asked for and then not wanted must not appear when a producer
+/// starts later.
 pub fn request_detach(root: &Path, name: &'static str) {
     let root = crate::project::canonicalize_lenient(root);
-    COMMANDS
+    let mut commands = COMMANDS
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .push((root, SinkCommand::Detach(name)));
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    commands.retain(|(r, c)| {
+        !(*r == root && matches!(c, SinkCommand::Attach(sink) if sink.name() == name))
+    });
+    commands.push((root, SinkCommand::Detach(name)));
 }
 
-fn take_commands(root: &Path) -> Vec<SinkCommand> {
+/// Waits until the requests made for `root` have been applied by its
+/// producer, or `timeout` has passed (no producer is running to apply them).
+/// Returns whether they were applied. A sink asked to detach is still
+/// listening until then.
+pub fn wait_applied(root: &Path, timeout: std::time::Duration) -> bool {
+    let root = crate::project::canonicalize_lenient(root);
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let pending = COMMANDS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .any(|(r, _)| *r == root);
+        if !pending {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// The attach and detach requests made for `root` and not yet applied,
+/// oldest first. The producer takes them on its timer; a test reads them.
+pub fn drain_requests(root: &Path) -> Vec<SinkCommand> {
     let root = crate::project::canonicalize_lenient(root);
     let mut all = COMMANDS
         .lock()
@@ -329,7 +360,7 @@ impl Dispatcher {
     /// Applies the attach and detach requests made for `root` since the last
     /// call.
     pub fn apply_requests(&mut self, root: &Path) {
-        for command in take_commands(root) {
+        for command in drain_requests(root) {
             match command {
                 SinkCommand::Attach(sink) => self.attach(sink),
                 SinkCommand::Detach(name) => self.detach(name),
@@ -831,5 +862,24 @@ mod tests {
         request_detach(dir.path(), "fake");
         d.apply_requests(dir.path());
         assert!(d.health().is_empty());
+    }
+
+    #[test]
+    fn a_detach_withdraws_an_attach_still_waiting_for_a_producer() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let (docs, _) = FakeSink::new(Domain::Docs);
+
+        request_attach(dir.path(), Box::new(docs));
+        request_detach(dir.path(), "fake");
+
+        let commands = drain_requests(dir.path());
+        assert!(
+            commands
+                .iter()
+                .all(|c| matches!(c, SinkCommand::Detach("fake"))),
+            "only the detach is left, never a sink nobody wants"
+        );
+        assert_eq!(commands.len(), 1);
     }
 }

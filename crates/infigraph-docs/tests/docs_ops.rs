@@ -159,36 +159,51 @@ fn request_index_docs_without_the_daemon_runs_the_executor_here() {
     assert_eq!(docs_enabled_recorded(&root), Some(true));
 }
 
-/// Review Focus 3: `clean-docs` while the daemon's doc watcher is attached
+/// Review Focus 3: `clean-docs` while the daemon's document sink is attached
 /// and has a change pending. The switch goes off before the delete, and the
-/// watcher re-reads it under the docs lock, so nothing brings the store back.
+/// executor re-reads it under the docs lock, so nothing brings the store back.
 #[test]
-fn clean_docs_is_not_undone_by_an_attached_watcher() {
-    use std::sync::atomic::{AtomicBool, Ordering};
+fn clean_docs_is_not_undone_by_an_attached_sink() {
+    use infigraph_core::daemon_protocol::{WriteRequest, WriteResult};
+    use infigraph_core::watch::sink::{PathChange, WatchBatch, WatchSink};
     use std::sync::Arc;
 
     let _env = Isolated::new();
-    std::env::set_var(POLL_MS_VAR, "20");
     let (_tmp, root) = project_with_readme();
     index_docs(&root, false).unwrap();
 
-    let shutdown = Arc::new(AtomicBool::new(false));
-    let loop_root = root.clone();
-    let loop_shutdown = Arc::clone(&shutdown);
-    let watcher = std::thread::spawn(move || {
-        infigraph_docs::watch::watch_docs_daemon_loop(&loop_root, 50, loop_shutdown)
-    });
-    std::thread::sleep(Duration::from_millis(500));
+    // The sink as the daemon builds it, its coordinator replaced by the
+    // executor the coordinator would run.
+    let run_root = root.clone();
+    let submit = move |request: WriteRequest| {
+        let files = match request {
+            WriteRequest::IndexDocPaths {
+                upserts,
+                removals,
+                whole,
+            } => infigraph_docs::ops::index_doc_paths(&run_root, &upserts, &removals, whole)?,
+            _ => 0,
+        };
+        anyhow::Ok(WriteResult::Ok {
+            total_files: 0,
+            indexed_files: files,
+        })
+    };
+    let mut sink = infigraph_docs::watch::document_sink(&root, Arc::new(submit), 50);
 
     std::fs::write(root.join("second.md"), "# Second\n\nmore\n").unwrap();
+    sink.accept(WatchBatch {
+        changes: vec![("second.md".into(), PathChange::Created)],
+        rescan: false,
+    });
+    // And a whole-tree pass, which is what a sink asks for on attaching.
+    sink.accept(WatchBatch::rescan());
     clean_docs(&root).unwrap();
-    std::thread::sleep(Duration::from_millis(1500));
+    std::thread::sleep(Duration::from_millis(2000));
 
-    shutdown.store(true, Ordering::Relaxed);
-    watcher.join().unwrap().unwrap();
     assert!(
         !docs_store_path(&root).exists(),
-        "the watcher recreated the store clean-docs removed"
+        "the sink recreated the store clean-docs removed"
     );
     assert_eq!(docs_enabled_recorded(&root), Some(false));
 }
@@ -430,14 +445,20 @@ fn index_doc_paths_writes_only_what_it_names_and_only_while_docs_are_on() {
 
     // Docs are off: nothing is written and no store appears.
     std::fs::create_dir_all(root.join(".infigraph")).unwrap();
-    assert!(!infigraph_docs::ops::index_doc_paths(&root, &say(&["docs/a.md"]), &[]).unwrap());
+    assert_eq!(
+        infigraph_docs::ops::index_doc_paths(&root, &say(&["docs/a.md"]), &[], false).unwrap(),
+        0
+    );
     assert!(!docs_store_path(&root).exists());
 
     // On: the paths named are indexed, the others are not.
     index_docs(&root, false).unwrap();
     std::fs::write(root.join("docs/a.md"), "# A\n\nalpha, revised\n").unwrap();
     std::fs::write(root.join("docs/b.md"), "# B\n\nbeta, revised\n").unwrap();
-    assert!(infigraph_docs::ops::index_doc_paths(&root, &say(&["docs/a.md"]), &[]).unwrap());
+    assert_eq!(
+        infigraph_docs::ops::index_doc_paths(&root, &say(&["docs/a.md"]), &[], false).unwrap(),
+        1
+    );
     let idx = infigraph_docs::DocIndex::open_existing(&root).unwrap();
     let hashes = idx.store().unwrap().get_doc_hashes().unwrap();
     let hash_of = |rel: &str| -> String {
@@ -461,7 +482,11 @@ fn index_doc_paths_writes_only_what_it_names_and_only_while_docs_are_on() {
 
     // A removal that names a directory takes everything under it.
     std::fs::remove_dir_all(root.join("docs")).unwrap();
-    assert!(infigraph_docs::ops::index_doc_paths(&root, &[], &say(&["docs"])).unwrap());
+    assert_eq!(
+        infigraph_docs::ops::index_doc_paths(&root, &[], &say(&["docs"]), false).unwrap(),
+        2,
+        "both documents that were still stored under docs/"
+    );
     let idx = infigraph_docs::DocIndex::open_existing(&root).unwrap();
     let ids: Vec<String> = idx
         .store()
@@ -471,4 +496,19 @@ fn index_doc_paths_writes_only_what_it_names_and_only_while_docs_are_on() {
         .into_keys()
         .collect();
     assert_eq!(ids, ["README.md"]);
+}
+
+#[test]
+fn a_whole_tree_pass_from_the_watcher_never_opts_a_project_in() {
+    let _env = Isolated::new();
+    let (_tmp, root) = project_with_readme();
+    std::fs::create_dir_all(root.join(".infigraph")).unwrap();
+
+    assert_eq!(
+        infigraph_docs::ops::index_doc_paths(&root, &[], &[], true).unwrap(),
+        0
+    );
+
+    assert_eq!(docs_enabled_recorded(&root), None);
+    assert!(!docs_store_path(&root).exists());
 }

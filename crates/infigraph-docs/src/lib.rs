@@ -17,6 +17,7 @@ pub mod linked;
 pub mod neo4j_store;
 pub mod ops;
 mod path_indexer;
+pub mod path_queue;
 pub mod pipelines;
 pub mod query;
 pub mod search;
