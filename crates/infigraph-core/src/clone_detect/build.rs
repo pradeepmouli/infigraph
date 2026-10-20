@@ -36,10 +36,14 @@ const SYMBOLS: &str = "MATCH (s:Symbol) WHERE s.kind IN ['Function', 'Method'] \
 /// What one update did.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct BuildReport {
-    /// Function and method symbols in the graph.
+    /// Function and method symbols in the graph that have a body to describe
+    /// ([`bodies::has_body_span`]).
     pub symbols: usize,
     /// Of those, symbols the sidecar describes with a body embedding.
     pub embedded: usize,
+    /// Of those, symbols the sidecar describes with a sketch only (no
+    /// embedder could embed the body): token overlap is their signal.
+    pub sketch_only: usize,
     /// Body texts sent to the embedder this update.
     pub embed_requests: usize,
     /// Files skipped because they changed after they were indexed.
@@ -135,6 +139,10 @@ pub fn update_bodies(
 ) -> Result<BuildReport> {
     let sidecar = root.join(".infigraph").join(BODIES_FILE);
     let wanted = parse(backend.raw_query(SYMBOLS)?);
+    // Symbols with no body span are not described, and not counted missing.
+    let (wanted, spanless): (Vec<Wanted>, Vec<Wanted>) = wanted
+        .into_iter()
+        .partition(|w| bodies::has_body_span(&w.language, w.start_line, w.end_line));
     let recorded_hashes = backend.get_file_hashes()?;
 
     let loaded = if sidecar.exists() {
@@ -213,17 +221,24 @@ pub fn update_bodies(
         embed_into(&mut entries, to_embed, make_embedder);
     }
 
-    let live_ids: HashSet<&str> = wanted.iter().map(|w| w.id.as_str()).collect();
+    let live_ids: HashSet<&str> = wanted
+        .iter()
+        .chain(&spanless)
+        .map(|w| w.id.as_str())
+        .collect();
     entries.retain(|id, _| live_ids.contains(id.as_str()));
 
+    let described = |w: &&Wanted| {
+        entries
+            .get(&w.id)
+            .is_some_and(|e| e.signature == w.signature)
+    };
     report.embedded = wanted
         .iter()
-        .filter(|w| {
-            entries
-                .get(&w.id)
-                .is_some_and(|e| e.signature == w.signature && !e.embedding.is_empty())
-        })
+        .filter(described)
+        .filter(|w| !entries[&w.id].embedding.is_empty())
         .count();
+    report.sketch_only = wanted.iter().filter(described).count() - report.embedded;
     if report.files_changed_since_index > 0 {
         crate::last_run::note(
             "files changed since they were indexed",
@@ -240,11 +255,13 @@ pub fn update_bodies(
         bodies::save(&sidecar, &after)?;
     }
 
-    if report.embedded < report.symbols {
+    let missing = report.symbols - report.embedded - report.sketch_only;
+    if missing + report.sketch_only > 0 {
         live::set(
             root,
             DegradedMode::CloneBodiesPartial {
-                missing: report.symbols - report.embedded,
+                missing,
+                sketch_only: report.sketch_only,
                 total: report.symbols,
             },
         );

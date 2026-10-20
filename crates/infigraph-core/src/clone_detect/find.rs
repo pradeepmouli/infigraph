@@ -526,7 +526,8 @@ pub fn find_clones_with(
     let kinds = cypher_list(&options.kinds);
     let rows = backend.raw_query(&format!(
         "MATCH (s:Symbol) WHERE s.kind IN [{kinds}] \
-         RETURN s.id, s.name, s.kind, s.file, s.docstring, s.signature_hash"
+         RETURN s.id, s.name, s.kind, s.file, s.docstring, s.signature_hash, \
+         s.language, s.start_line, s.end_line"
     ))?;
     let scope = options.scope.clone().within(backend.repo_filter());
     let mut rows = scope.retain(rows, |r| r.get(3).map(String::as_str).unwrap_or(""));
@@ -556,8 +557,15 @@ pub fn find_clones_with(
         }
     };
 
+    // A symbol with no body span has nothing to compare and no entry to wait
+    // for; counting it "without a body signal" is a nag no index run clears.
     let candidates: Vec<Candidate> = rows
         .iter()
+        .filter(|row| {
+            let at = |i: usize| row.get(i).map(String::as_str).unwrap_or("");
+            let line = |i: usize| at(i).parse().unwrap_or(0);
+            bodies::has_body_span(at(6), line(7), line(8))
+        })
         .map(|row| {
             let (id, name, kind, file) = (&row[0], &row[1], &row[2], &row[3]);
             let doc = row.get(4).map(String::as_str).unwrap_or("");
