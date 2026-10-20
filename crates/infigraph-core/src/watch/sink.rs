@@ -239,6 +239,132 @@ impl Triage {
     }
 }
 
+/// The triage and the sinks it feeds: everything the producer does with an
+/// event path after it has been respelled and checked against the canary.
+pub struct Dispatcher {
+    triage: Triage,
+    sinks: Vec<Box<dyn WatchSink>>,
+}
+
+/// A change to the set of sinks, requested from outside the producer.
+pub enum SinkCommand {
+    Attach(Box<dyn WatchSink>),
+    Detach(&'static str),
+}
+
+static COMMANDS: std::sync::Mutex<Vec<(PathBuf, SinkCommand)>> = std::sync::Mutex::new(Vec::new());
+
+/// Asks the producer watching `root` to attach `sink` at its next tick. A
+/// producer that starts later finds the request waiting.
+pub fn request_attach(root: &Path, sink: Box<dyn WatchSink>) {
+    let root = crate::project::canonicalize_lenient(root);
+    COMMANDS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push((root, SinkCommand::Attach(sink)));
+}
+
+/// Asks the producer watching `root` to detach the sink called `name`.
+pub fn request_detach(root: &Path, name: &'static str) {
+    let root = crate::project::canonicalize_lenient(root);
+    COMMANDS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push((root, SinkCommand::Detach(name)));
+}
+
+fn take_commands(root: &Path) -> Vec<SinkCommand> {
+    let root = crate::project::canonicalize_lenient(root);
+    let mut all = COMMANDS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let (mine, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut *all)
+        .into_iter()
+        .partition(|(r, _)| *r == root);
+    *all = rest;
+    mine.into_iter().map(|(_, c)| c).collect()
+}
+
+impl Dispatcher {
+    pub fn new(root: &Path, sinks: Vec<Box<dyn WatchSink>>) -> Self {
+        let mut domains: Vec<Domain> = Vec::new();
+        for sink in &sinks {
+            if !domains.contains(&sink.domain()) {
+                domains.push(sink.domain());
+            }
+        }
+        Self {
+            triage: Triage::new(root, &domains),
+            sinks,
+        }
+    }
+
+    pub fn triage(&self) -> &Triage {
+        &self.triage
+    }
+
+    pub fn triage_mut(&mut self) -> &mut Triage {
+        &mut self.triage
+    }
+
+    /// Adds a sink. It is told to rescan at once: it was not listening, so
+    /// whatever changed before is not in any batch it will see.
+    pub fn attach(&mut self, mut sink: Box<dyn WatchSink>) {
+        self.triage.attach(sink.domain());
+        sink.accept(WatchBatch::rescan());
+        self.sinks.push(sink);
+    }
+
+    /// Removes the sinks called `name`, and stops judging a domain nobody
+    /// listens to any more.
+    pub fn detach(&mut self, name: &str) {
+        self.sinks.retain(|s| s.name() != name);
+        for domain in self.triage.domains() {
+            if !self.sinks.iter().any(|s| s.domain() == domain) {
+                self.triage.detach(domain);
+            }
+        }
+    }
+
+    /// Applies the attach and detach requests made for `root` since the last
+    /// call.
+    pub fn apply_requests(&mut self, root: &Path) {
+        for command in take_commands(root) {
+            match command {
+                SinkCommand::Attach(sink) => self.attach(sink),
+                SinkCommand::Detach(name) => self.detach(name),
+            }
+        }
+    }
+
+    /// Offers one event path (already respelled) to every sink whose domain
+    /// keeps it.
+    pub fn dispatch(&mut self, kind: &EventKind, path: &Path) {
+        for (domain, batch) in self.triage.route(kind, path) {
+            for sink in self.sinks.iter_mut().filter(|s| s.domain() == domain) {
+                sink.accept(batch.clone());
+            }
+        }
+    }
+
+    /// Tells every sink events were lost.
+    pub fn rescan_all(&mut self) {
+        for sink in &mut self.sinks {
+            sink.accept(WatchBatch::rescan());
+        }
+    }
+
+    pub fn tick(&mut self) {
+        for sink in &mut self.sinks {
+            sink.tick();
+        }
+    }
+
+    pub fn health(&self) -> Vec<(&'static str, SinkHealth)> {
+        self.sinks.iter().map(|s| (s.name(), s.health())).collect()
+    }
+}
+
 impl Triage {
     /// The files below an arriving directory that `domain`'s walk visits, each
     /// as `Created`. More than the cap, or a walk error, makes it a rescan:
@@ -325,6 +451,7 @@ mod tests {
     use crate::settings_file::test_support::{PinnedHome, ENV_LOCK};
     use notify::event::{CreateKind, DataChange, ModifyKind, RemoveKind};
     use std::fs;
+    use std::sync::{Arc, Mutex};
 
     fn create() -> EventKind {
         EventKind::Create(CreateKind::File)
@@ -354,15 +481,25 @@ mod tests {
         dir
     }
 
-    /// Offers `path` to every domain of `triage` and delivers each routed
-    /// batch to the fake of its domain, as the producer does.
-    fn dispatch(triage: &Triage, sinks: &mut [FakeSink], kind: &EventKind, path: &Path) {
-        let path = triage.respelled(path).into_owned();
-        for (domain, batch) in triage.route(kind, &path) {
-            for sink in sinks.iter_mut().filter(|s| s.domain() == domain) {
-                sink.accept(batch.clone());
-            }
+    /// A dispatcher over fakes of the given domains, and what each recorded.
+    fn dispatcher(
+        root: &Path,
+        domains: &[Domain],
+    ) -> (Dispatcher, Vec<Arc<Mutex<Vec<WatchBatch>>>>) {
+        let mut seen = Vec::new();
+        let mut sinks: Vec<Box<dyn WatchSink>> = Vec::new();
+        for domain in domains {
+            let (sink, record) = FakeSink::new(*domain);
+            seen.push(record);
+            sinks.push(Box::new(sink));
         }
+        (Dispatcher::new(root, sinks), seen)
+    }
+
+    /// Delivers one event the way the producer does: respelled, then offered.
+    fn deliver(dispatcher: &mut Dispatcher, kind: &EventKind, path: &Path) {
+        let path = dispatcher.triage().respelled(path).into_owned();
+        dispatcher.dispatch(kind, &path);
     }
 
     #[test]
@@ -372,16 +509,13 @@ mod tests {
         let dir = project();
         let code_file = write(dir.path(), "src/main.rs");
         let doc_file = write(dir.path(), "docs/guide.md");
-        let triage = Triage::new(dir.path(), &[Domain::Code, Domain::Docs]);
-        let (code, code_seen) = FakeSink::new(Domain::Code);
-        let (docs, docs_seen) = FakeSink::new(Domain::Docs);
-        let mut sinks = [code, docs];
+        let (mut d, seen) = dispatcher(dir.path(), &[Domain::Code, Domain::Docs]);
 
-        dispatch(&triage, &mut sinks, &create(), &code_file);
-        dispatch(&triage, &mut sinks, &create(), &doc_file);
+        deliver(&mut d, &create(), &code_file);
+        deliver(&mut d, &create(), &doc_file);
 
-        let code_seen = code_seen.lock().unwrap();
-        let docs_seen = docs_seen.lock().unwrap();
+        let code_seen = seen[0].lock().unwrap();
+        let docs_seen = seen[1].lock().unwrap();
         assert_eq!(
             code_seen
                 .iter()
@@ -409,17 +543,14 @@ mod tests {
         let ignored = write(dir.path(), "generated/out.rs");
         let vendored = write(dir.path(), "node_modules/x/index.js");
         let hidden = write(dir.path(), ".hidden/a.rs");
-        let triage = Triage::new(dir.path(), &[Domain::Code, Domain::Docs]);
-        let (code, code_seen) = FakeSink::new(Domain::Code);
-        let (docs, docs_seen) = FakeSink::new(Domain::Docs);
-        let mut sinks = [code, docs];
+        let (mut d, seen) = dispatcher(dir.path(), &[Domain::Code, Domain::Docs]);
 
         for path in [&ignored, &vendored, &hidden] {
-            dispatch(&triage, &mut sinks, &modify(), path);
+            deliver(&mut d, &modify(), path);
         }
 
-        assert!(code_seen.lock().unwrap().is_empty());
-        assert!(docs_seen.lock().unwrap().is_empty());
+        assert!(seen[0].lock().unwrap().is_empty());
+        assert!(seen[1].lock().unwrap().is_empty());
     }
 
     #[test]
@@ -636,5 +767,67 @@ mod tests {
         assert_eq!(routed.len(), 1);
         assert!(routed[0].1.rescan);
         assert!(routed[0].1.changes.is_empty());
+    }
+
+    #[test]
+    fn a_sink_attached_mid_run_gets_a_rescan_then_later_batches_and_a_detached_one_none() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _home = PinnedHome::empty();
+        let dir = project();
+        let before = write(dir.path(), "README.md");
+        let after = write(dir.path(), "GUIDE.md");
+        let (mut d, code_seen) = dispatcher(dir.path(), &[Domain::Code]);
+        deliver(&mut d, &create(), &before);
+
+        let (docs, docs_seen) = FakeSink::new(Domain::Docs);
+        d.attach(Box::new(docs));
+        deliver(&mut d, &create(), &after);
+
+        let seen_after_attach = docs_seen.lock().unwrap().clone();
+        assert!(
+            seen_after_attach[0].rescan,
+            "it was not listening before: {seen_after_attach:?}"
+        );
+        assert_eq!(
+            seen_after_attach[1..]
+                .iter()
+                .flat_map(|b| b
+                    .changes
+                    .iter()
+                    .map(|(p, _)| p.to_string_lossy().into_owned()))
+                .collect::<Vec<_>>(),
+            ["GUIDE.md"],
+            "later batches only, never the one from before it attached"
+        );
+        assert_eq!(code_seen[0].lock().unwrap().len(), 2);
+
+        d.detach("fake");
+        deliver(&mut d, &create(), &write(dir.path(), "MORE.md"));
+        assert_eq!(
+            docs_seen.lock().unwrap().len(),
+            seen_after_attach.len(),
+            "a detached sink hears nothing more"
+        );
+        assert!(
+            !d.triage().domains().contains(&Domain::Docs),
+            "and its domain is no longer judged"
+        );
+    }
+
+    #[test]
+    fn requests_made_from_outside_are_applied_to_the_producers_own_dispatcher() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _home = PinnedHome::empty();
+        let dir = project();
+        let (mut d, _) = dispatcher(dir.path(), &[Domain::Code]);
+        let (docs, _) = FakeSink::new(Domain::Docs);
+
+        request_attach(dir.path(), Box::new(docs));
+        d.apply_requests(dir.path());
+        assert_eq!(d.health().len(), 2);
+
+        request_detach(dir.path(), "fake");
+        d.apply_requests(dir.path());
+        assert!(d.health().is_empty());
     }
 }
