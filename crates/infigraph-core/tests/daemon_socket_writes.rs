@@ -85,7 +85,10 @@ fn a_killed_clients_deferred_rebuild_never_runs() {
     let d = start(dir.path());
     std::env::remove_var("INFIGRAPH_TEST_COORDINATOR_STALL_FILE");
     submit(dir.path(), &WriteRequest::Index { paths: None }, opts()).unwrap();
-    let graph = dir.path().join(".infigraph").join("graph");
+    let graph = dir
+        .path()
+        .join(".infigraph")
+        .join(infigraph_core::graph::names::STEM);
     let inode_before = std::fs::metadata(&graph).unwrap().ino();
     std::fs::write(&stall, b"").unwrap();
 

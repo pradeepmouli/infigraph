@@ -317,8 +317,22 @@ pub fn write_attach<W: Write>(w: &mut W, pid: u32) -> Result<()> {
     write_len_prefixed(w, &serde_json::to_vec(&Attach { attach_pid: pid })?)
 }
 
+/// A connection that closed before its first frame. A liveness probe or a
+/// lease check does exactly this, so it is an event to count, not an error to
+/// log (`read_service` tells the two apart by downcasting to this).
+#[derive(Debug)]
+pub struct NoRequest;
+
+impl std::fmt::Display for NoRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("no request")
+    }
+}
+
+impl std::error::Error for NoRequest {}
+
 pub fn read_client_frame<R: Read>(r: &mut R) -> Result<ClientFrame> {
-    let body = read_len_prefixed(r)?.ok_or_else(|| anyhow::anyhow!("no request"))?;
+    let body = read_len_prefixed(r)?.ok_or_else(|| anyhow::Error::new(NoRequest))?;
     serde_json::from_slice(&body).map_err(|untagged| {
         // An untagged enum's own error ("did not match any variant") names
         // nothing. Most malformed frames are reads, so report the field-level
@@ -403,7 +417,7 @@ mod tests {
 
     /// A stream that ends without an `End` frame must be an error, never an
     /// empty result. Returning zero rows silently is the "0-symbol graph
-    /// served as healthy" failure `Infigraph::init` already shipped once.
+    /// served as healthy" failure `CodeIndex::init` already shipped once.
     #[test]
     fn a_truncated_stream_is_an_error_not_an_empty_result() {
         let mut buf = Vec::new();

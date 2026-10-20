@@ -17,7 +17,7 @@ fn stale_project() -> tempfile::TempDir {
     let project_dir = tempfile::tempdir().unwrap();
     let infigraph_dir = project_dir.path().join(".infigraph");
     std::fs::create_dir_all(&infigraph_dir).unwrap();
-    let graph_path = infigraph_dir.join("graph");
+    let graph_path = infigraph_dir.join(infigraph_core::graph::names::STEM);
 
     // The file is on disk and the graph holds its real hash: the daemon's
     // start-up true-up hash-diffs the tree, and a file it found missing
@@ -107,7 +107,10 @@ fn coordinator_triggers_scip_enrichment_once_when_staleness_exceeds_threshold() 
 
     // Precondition: the fixture really is what the coordinator will see.
     {
-        let graph_path = project_dir.path().join(".infigraph").join("graph");
+        let graph_path = project_dir
+            .path()
+            .join(".infigraph")
+            .join(infigraph_core::graph::names::STEM);
         let backend = KuzuBackend::open_read_only(&graph_path).unwrap();
         assert_eq!(
             backend.distinct_languages().unwrap(),

@@ -93,7 +93,7 @@ const MIN_DB_FILE_SIZE: u64 = 4096;
 /// on some platforms (observed on Linux) or segfaults later at read time
 /// (observed on macOS) — before any `Result` exists to catch it. Rejecting
 /// obviously-invalid files here turns that abort into a normal error that
-/// callers' wipe-and-rebuild recovery (`Infigraph::init`, `DocIndex::init`)
+/// callers' wipe-and-rebuild recovery (`CodeIndex::init`, `DocIndex::init`)
 /// already handles.
 ///
 /// A missing path (fresh create) and a directory (legacy on-disk layout)
@@ -508,7 +508,7 @@ fn refuse_newer_schema(db: &Database, db_path: &Path) -> Result<()> {
 // `Database::new` collapses every failure into one stringified error before
 // it reaches any caller, so the only way to tell "not corruption -- leave the
 // file alone" from "durably unopenable" is the text. These are the classes
-// every wipe-on-open-failure path (`Infigraph::init`, `DocIndex::init`,
+// every wipe-on-open-failure path (`CodeIndex::init`, `DocIndex::init`,
 // `open_combined_graph`, the combined-docs generation) must recognise BEFORE
 // taking a destructive branch. They live here, next to the open itself,
 // precisely so that each of those paths does not grow its own partial list
@@ -563,7 +563,7 @@ pub fn is_storage_version_mismatch_error(err: &anyhow::Error) -> bool {
 /// file is either busy, mid-race with a live writer, or written on a lbug
 /// version this build cannot read. The single guard for callers whose only
 /// choices are "refuse" or "destroy and rebuild" (`DocIndex::init`,
-/// `open_combined_graph`); `Infigraph::init` distinguishes the classes
+/// `open_combined_graph`); `CodeIndex::init` distinguishes the classes
 /// itself because it retries the transient one.
 pub fn open_failure_is_not_corruption(err: &anyhow::Error) -> bool {
     is_transient_open_error(err) || is_storage_version_mismatch_error(err)
@@ -616,7 +616,7 @@ pub fn storage_version_mismatch_context(db_path: &Path) -> String {
 
 /// Context line for any [`open_failure_is_not_corruption`] failure, so a
 /// caller that refuses instead of wiping explains *why* the file was left
-/// alone in the same words `Infigraph::init` uses.
+/// alone in the same words `CodeIndex::init` uses.
 pub fn non_corruption_open_context(err: &anyhow::Error, db_path: &Path) -> String {
     if is_lock_contention_error(err) {
         lock_contention_context(db_path)
@@ -747,6 +747,9 @@ impl GraphStore {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        // A graph stored under the previous name is renamed before anything
+        // else looks at the path: this open must never create a second one.
+        super::migrate::before_open(path)?;
         validate_db_file(path)?;
         let lock_path = db_lock_path(path);
         if let Some(pid) = unclean_shutdown_wal_holder(path, &lock_path) {
@@ -863,6 +866,13 @@ impl GraphStore {
         // this fall through to `Database::new` below produces Kuzu's own
         // confusing "Cannot create an empty database under READ ONLY mode"
         // instead of a clear, actionable message.
+        if let Some(dir) = path.parent().filter(|d| super::migrate::pending(d)) {
+            anyhow::bail!(
+                "the code graph in {} is stored under its old name and has not been renamed yet \
+                 (a read never renames it): any command that writes, e.g. `infigraph index`, does",
+                dir.display()
+            );
+        }
         if !path.exists() {
             anyhow::bail!(
                 "no graph exists yet at {} -- run `infigraph index` first",
@@ -1290,7 +1300,11 @@ impl GraphStore {
         // the generation before this one. Only for the project's own graph:
         // a rebuild at `graph.rebuilding` counts from 1 in a file that is
         // not live yet.
-        if self.db_path.file_name().is_some_and(|n| n == "graph") {
+        if self
+            .db_path
+            .file_name()
+            .is_some_and(|n| n == crate::graph::names::STEM)
+        {
             if let Some(root) = self.db_path.parent().and_then(Path::parent) {
                 crate::degraded::live::embeddings_generation_moved(root);
             }
@@ -1706,7 +1720,7 @@ mod tests {
         const FILE: &str = "src/generated/transport.rs";
 
         let dir = tempfile::tempdir().unwrap();
-        let graph = dir.path().join("graph");
+        let graph = dir.path().join(crate::graph::names::STEM);
 
         // The growth-ratio preflight reads `<db_dir>/graph.health.json`, and
         // `stamp_healthy_graph_size_if_unset` would otherwise anchor the
@@ -1716,7 +1730,7 @@ mod tests {
         // (`max_bytes` defaults to 8GiB, far beyond fixture scale, so the
         // absolute ceiling needs no handling.)
         std::fs::write(
-            dir.path().join("graph.health.json"),
+            dir.path().join(crate::graph::names::HEALTH),
             r#"{"healthy_size_bytes": 999999999}"#,
         )
         .unwrap();
@@ -1943,7 +1957,7 @@ mod tests {
     #[test]
     fn an_idle_wal_is_folded_into_the_base_image() {
         let dir = tempfile::tempdir().unwrap();
-        let graph = dir.path().join("graph");
+        let graph = dir.path().join(crate::graph::names::STEM);
         let store = super::GraphStore::open(&graph).unwrap();
         {
             let conn = store.connection().unwrap();
@@ -1989,7 +2003,7 @@ mod tests {
     #[test]
     fn a_recently_written_wal_is_left_alone() {
         let dir = tempfile::tempdir().unwrap();
-        let graph = dir.path().join("graph");
+        let graph = dir.path().join(crate::graph::names::STEM);
         let store = super::GraphStore::open(&graph).unwrap();
         {
             let conn = store.connection().unwrap();
@@ -2023,7 +2037,7 @@ mod tests {
     #[test]
     fn a_handle_whose_fold_failed_never_folds_again() {
         let dir = tempfile::tempdir().unwrap();
-        let graph = dir.path().join("graph");
+        let graph = dir.path().join(crate::graph::names::STEM);
         let store = super::GraphStore::open(&graph).unwrap();
         store
             .connection()
@@ -2082,7 +2096,7 @@ mod tests {
     #[test]
     fn a_committed_write_whose_fold_failed_stops_and_latches_the_handle() {
         let dir = tempfile::tempdir().unwrap();
-        let store = super::GraphStore::open(&dir.path().join("graph")).unwrap();
+        let store = super::GraphStore::open(&dir.path().join(crate::graph::names::STEM)).unwrap();
         store
             .connection()
             .unwrap()
@@ -2121,7 +2135,7 @@ mod tests {
     #[test]
     fn a_fold_blocked_by_an_open_transaction_is_busy_not_a_failure() {
         let dir = tempfile::tempdir().unwrap();
-        let graph = dir.path().join("graph");
+        let graph = dir.path().join(crate::graph::names::STEM);
         let store = super::GraphStore::open(&graph).unwrap();
         let writer = store.connection().unwrap();
         writer.query("BEGIN TRANSACTION").unwrap();
@@ -2178,7 +2192,10 @@ mod tests {
         // The project layer (#160) applies only to a store inside a real
         // `.infigraph`; one byte is a ceiling any graph exceeds.
         let root = tempfile::tempdir().unwrap();
-        let graph = root.path().join(".infigraph").join("graph");
+        let graph = root
+            .path()
+            .join(".infigraph")
+            .join(crate::graph::names::STEM);
         let store = super::GraphStore::open(&graph).unwrap();
         store
             .connection()
@@ -2244,7 +2261,7 @@ mod tests {
     #[ignore = "research probe for #183: prints engine capabilities, asserts only the controls"]
     fn does_the_engine_accept_a_compaction_statement() {
         let dir = tempfile::tempdir().unwrap();
-        let graph = dir.path().join("graph");
+        let graph = dir.path().join(crate::graph::names::STEM);
         let db = Database::new(&graph, SystemConfig::default()).unwrap();
         let conn = Connection::new(&db).unwrap();
 
@@ -2323,7 +2340,7 @@ mod tests {
     fn repeated_checkpoints_do_not_exhaust_the_database_budget() {
         let dir = tempfile::tempdir().unwrap();
         let db = Database::new(
-            dir.path().join("graph"),
+            dir.path().join(crate::graph::names::STEM),
             SystemConfig::default()
                 .buffer_pool_size(32 * 1024 * 1024)
                 .max_db_size(64 * 1024 * 1024),
@@ -2367,8 +2384,12 @@ mod tests {
     #[test]
     fn unclean_shutdown_wal_holder_flags_wal_plus_dead_holder() {
         let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("graph");
-        std::fs::write(dir.path().join("graph.wal"), b"wal").unwrap();
+        let db_path = dir.path().join(crate::graph::names::STEM);
+        std::fs::write(
+            dir.path().join(crate::graph::names::sibling(".wal")),
+            b"wal",
+        )
+        .unwrap();
         let lock_path = db_lock_path(&db_path);
         write_holder_lock(&lock_path, DEAD_PID);
 
@@ -2381,8 +2402,12 @@ mod tests {
     #[test]
     fn unclean_shutdown_wal_holder_ignores_a_live_holder() {
         let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("graph");
-        std::fs::write(dir.path().join("graph.wal"), b"wal").unwrap();
+        let db_path = dir.path().join(crate::graph::names::STEM);
+        std::fs::write(
+            dir.path().join(crate::graph::names::sibling(".wal")),
+            b"wal",
+        )
+        .unwrap();
         let lock_path = db_lock_path(&db_path);
         write_holder_lock(&lock_path, std::process::id());
 
@@ -2396,7 +2421,7 @@ mod tests {
     #[test]
     fn unclean_shutdown_wal_holder_ignores_no_wal_even_with_a_dead_holder() {
         let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("graph");
+        let db_path = dir.path().join(crate::graph::names::STEM);
         let lock_path = db_lock_path(&db_path);
         write_holder_lock(&lock_path, DEAD_PID);
 
@@ -2410,8 +2435,12 @@ mod tests {
     #[test]
     fn unclean_shutdown_wal_holder_ignores_a_wal_with_no_lock_file() {
         let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("graph");
-        std::fs::write(dir.path().join("graph.wal"), b"wal").unwrap();
+        let db_path = dir.path().join(crate::graph::names::STEM);
+        std::fs::write(
+            dir.path().join(crate::graph::names::sibling(".wal")),
+            b"wal",
+        )
+        .unwrap();
         let lock_path = db_lock_path(&db_path);
 
         assert_eq!(
@@ -2429,11 +2458,15 @@ mod tests {
     #[test]
     fn open_refuses_a_graph_with_an_unreplayed_wal_from_a_dead_process() {
         let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("graph");
+        let db_path = dir.path().join(crate::graph::names::STEM);
         // Large enough to pass `validate_db_file`'s truncation check -- this
         // test is about the WAL-replay guard, not that one.
         std::fs::write(&db_path, vec![0u8; MIN_DB_FILE_SIZE as usize]).unwrap();
-        std::fs::write(dir.path().join("graph.wal"), b"wal").unwrap();
+        std::fs::write(
+            dir.path().join(crate::graph::names::sibling(".wal")),
+            b"wal",
+        )
+        .unwrap();
         write_holder_lock(&db_lock_path(&db_path), DEAD_PID);
 
         let err = GraphStore::open(&db_path)
@@ -2457,18 +2490,22 @@ mod tests {
     fn open_read_only_or_degrade_falls_back_to_the_previous_pool() {
         let dir = tempfile::tempdir().unwrap();
         let infigraph_dir = dir.path();
-        let db_path = infigraph_dir.join("graph");
+        let db_path = infigraph_dir.join(crate::graph::names::STEM);
 
         // Seed a real, openable "previous" graph a full reindex would have
         // retired -- open+init it via the normal write path, then rename it
         // aside exactly as `quarantine::retire_previous_graph` would.
         GraphStore::open(&db_path).unwrap();
-        let previous_path = infigraph_dir.join("graph.previous.111");
+        let previous_path = infigraph_dir.join(crate::graph::names::sibling(".previous.111"));
         std::fs::rename(&db_path, &previous_path).unwrap();
 
         // Recreate the live path as a dead-holder-WAL scenario.
         std::fs::write(&db_path, vec![0u8; MIN_DB_FILE_SIZE as usize]).unwrap();
-        std::fs::write(infigraph_dir.join("graph.wal"), b"stub wal").unwrap();
+        std::fs::write(
+            infigraph_dir.join(crate::graph::names::sibling(".wal")),
+            b"stub wal",
+        )
+        .unwrap();
         write_holder_lock(&db_lock_path(&db_path), DEAD_PID);
 
         let (store, reason) = GraphStore::open_read_only_or_degrade(&db_path).unwrap();
@@ -2495,10 +2532,14 @@ mod tests {
     {
         let dir = tempfile::tempdir().unwrap();
         let infigraph_dir = dir.path();
-        let db_path = infigraph_dir.join("graph");
+        let db_path = infigraph_dir.join(crate::graph::names::STEM);
 
         std::fs::write(&db_path, vec![0u8; MIN_DB_FILE_SIZE as usize]).unwrap();
-        std::fs::write(infigraph_dir.join("graph.wal"), b"stub wal").unwrap();
+        std::fs::write(
+            infigraph_dir.join(crate::graph::names::sibling(".wal")),
+            b"stub wal",
+        )
+        .unwrap();
         write_holder_lock(&db_lock_path(&db_path), DEAD_PID);
 
         let err = GraphStore::open_read_only_or_degrade(&db_path)
@@ -2517,7 +2558,7 @@ mod tests {
         std::fs::create_dir_all(infigraph_dir).unwrap();
         crate::recovery::write_crash_loop_marker(infigraph_dir, &[1, 2]).unwrap();
 
-        let db_path = infigraph_dir.join("graph"); // doesn't need to exist for this path
+        let db_path = infigraph_dir.join(crate::graph::names::STEM); // doesn't need to exist for this path
         let err = GraphStore::open_read_only_or_degrade(&db_path)
             .map(|_| ())
             .expect_err("crash-loop marker must short-circuit to a refusal");
@@ -2563,11 +2604,15 @@ mod tests {
     fn open_read_only_or_degrade_does_not_quarantine_a_graph_a_concurrent_writer_just_healed() {
         let dir = tempfile::tempdir().unwrap();
         let infigraph_dir = dir.path();
-        let db_path = infigraph_dir.join("graph");
+        let db_path = infigraph_dir.join(crate::graph::names::STEM);
 
         // Seed the dead-holder-WAL scenario the initial (pre-lock) peek must see.
         std::fs::write(&db_path, vec![0u8; MIN_DB_FILE_SIZE as usize]).unwrap();
-        std::fs::write(infigraph_dir.join("graph.wal"), b"stub wal").unwrap();
+        std::fs::write(
+            infigraph_dir.join(crate::graph::names::sibling(".wal")),
+            b"stub wal",
+        )
+        .unwrap();
         let lock_path = db_lock_path(&db_path);
         write_holder_lock(&lock_path, DEAD_PID);
 
@@ -2594,7 +2639,8 @@ mod tests {
             // before releasing. Using `GraphStore::open` here would
             // self-deadlock -- it acquires this same lock internally.
             std::fs::remove_file(&db_path_for_writer).unwrap();
-            std::fs::remove_file(infigraph_dir_owned.join("graph.wal")).unwrap();
+            std::fs::remove_file(infigraph_dir_owned.join(crate::graph::names::sibling(".wal")))
+                .unwrap();
             Database::new(&db_path_for_writer, SystemConfig::default()).unwrap();
             fs2::FileExt::unlock(&held_file).unwrap();
         });
@@ -2638,13 +2684,13 @@ mod tests {
     /// `try_recover_by_setting_wal_aside` therefore answers "already healthy"
     /// here -- which used to be the same `false` it returns for "not
     /// recoverable", and this call site quarantined a perfectly good index on
-    /// the strength of it. `Infigraph::init` never showed the bug because it
+    /// the strength of it. `CodeIndex::init` never showed the bug because it
     /// re-probed itself afterwards; this path had no such backstop.
     #[test]
     fn open_read_only_or_degrade_keeps_a_healthy_graph_whose_dead_holder_was_stale() {
         let dir = tempfile::tempdir().unwrap();
         let infigraph_dir = dir.path();
-        let db_path = infigraph_dir.join("graph");
+        let db_path = infigraph_dir.join(crate::graph::names::STEM);
 
         {
             let store = GraphStore::open(&db_path).unwrap();
@@ -2658,7 +2704,11 @@ mod tests {
         // The two signals `unclean_shutdown_wal_holder` requires: a WAL
         // sibling that is present but perfectly readable, and a lock naming a
         // holder that is gone.
-        std::fs::write(infigraph_dir.join("graph.wal"), b"").unwrap();
+        std::fs::write(
+            infigraph_dir.join(crate::graph::names::sibling(".wal")),
+            b"",
+        )
+        .unwrap();
         write_holder_lock(&db_lock_path(&db_path), DEAD_PID);
 
         let (store, _) = GraphStore::open_read_only_or_degrade_with(&db_path, in_process_probe)
@@ -2685,11 +2735,11 @@ mod tests {
     /// `kuzu::Database::new`, which parses a bogus size field from the header
     /// and either aborts the process (Linux) or segfaults later at read time
     /// (macOS, `BufferManager::optimisticRead`). The preflight must turn this
-    /// into a normal `Err` so `Infigraph::init`'s wipe-and-rebuild path runs.
+    /// into a normal `Err` so `CodeIndex::init`'s wipe-and-rebuild path runs.
     #[test]
     fn open_truncated_db_file_returns_err_instead_of_aborting() {
         let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("graph");
+        let db_path = dir.path().join(crate::graph::names::STEM);
         std::fs::write(&db_path, b"garbage, way below one page").unwrap();
 
         let err = GraphStore::open(&db_path)
@@ -2718,7 +2768,7 @@ mod tests {
     #[test]
     fn schema_version_is_stamped_on_open_and_a_newer_one_is_refused() {
         let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("graph");
+        let db_path = dir.path().join(crate::graph::names::STEM);
 
         // Fresh open stamps the current version; reopen proceeds fine.
         drop(GraphStore::open(&db_path).unwrap());
@@ -2756,7 +2806,7 @@ mod tests {
     #[test]
     fn unstamped_or_older_schema_is_migrated_forward_and_restamped() {
         let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("graph");
+        let db_path = dir.path().join(crate::graph::names::STEM);
         {
             let store = GraphStore::open(&db_path).unwrap();
             let conn = store.connection().unwrap();
@@ -2790,7 +2840,11 @@ mod tests {
         std::fs::write(dir.path().join("docs.kuzu.wal"), b"wal").unwrap();
         std::fs::write(dir.path().join("docs.kuzu.wal.checkpoint"), b"ckpt").unwrap();
         // Neither a different db's family nor the base image itself.
-        std::fs::write(dir.path().join("graph.wal"), b"other db").unwrap();
+        std::fs::write(
+            dir.path().join(crate::graph::names::sibling(".wal")),
+            b"other db",
+        )
+        .unwrap();
 
         let mut found: Vec<String> = wal_family_paths(&db_path)
             .iter()
@@ -2804,7 +2858,9 @@ mod tests {
         assert!(!dir.path().join("docs.kuzu.wal.checkpoint").exists());
         assert!(db_path.exists(), "the base image must be left alone");
         assert!(
-            dir.path().join("graph.wal").exists(),
+            dir.path()
+                .join(crate::graph::names::sibling(".wal"))
+                .exists(),
             "another database's WAL must be left alone"
         );
     }
@@ -2838,7 +2894,7 @@ mod tests {
     #[test]
     fn wal_family_of_a_db_that_never_existed_is_empty_and_removal_is_a_no_op() {
         let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("graph.rebuilding");
+        let db_path = dir.path().join(crate::graph::names::REBUILDING);
         assert!(wal_family_paths(&db_path).is_empty());
         remove_wal_family(&db_path);
     }
@@ -2846,7 +2902,7 @@ mod tests {
     #[test]
     fn open_fresh_then_reopen_still_works_with_preflight() {
         let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("graph");
+        let db_path = dir.path().join(crate::graph::names::STEM);
         // Fresh create.
         drop(GraphStore::open(&db_path).expect("fresh create must succeed"));
         // Reopen of a valid db must pass the preflight.
@@ -2856,7 +2912,7 @@ mod tests {
     #[test]
     fn ast_generation_starts_at_zero_and_bumps_monotonically() {
         let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("graph");
+        let db_path = dir.path().join(crate::graph::names::STEM);
         let store = GraphStore::open(&db_path).unwrap();
 
         assert_eq!(
@@ -2880,7 +2936,7 @@ mod tests {
     #[test]
     fn scip_generation_starts_at_zero_and_stamps_to_the_ast_generation_it_enriched() {
         let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("graph");
+        let db_path = dir.path().join(crate::graph::names::STEM);
         let store = GraphStore::open(&db_path).unwrap();
 
         let lock = store.write_lock().unwrap();
@@ -2928,7 +2984,7 @@ mod tests {
         // generation the enrichment started from (captured by the daemon),
         // capped at the current ast_generation and never moving backwards.
         let dir = tempfile::tempdir().unwrap();
-        let store = GraphStore::open(&dir.path().join("graph")).unwrap();
+        let store = GraphStore::open(&dir.path().join(crate::graph::names::STEM)).unwrap();
         let lock = store.write_lock().unwrap();
         let conn = store.connection().unwrap();
         for _ in 0..5 {
@@ -2975,7 +3031,7 @@ mod tests {
         // (doctor, the daemon's staleness trigger). A stamp taken before any
         // AST write must therefore land at 1, not copy ast_generation's 0.
         let dir = tempfile::tempdir().unwrap();
-        let store = GraphStore::open(&dir.path().join("graph")).unwrap();
+        let store = GraphStore::open(&dir.path().join(crate::graph::names::STEM)).unwrap();
         let lock = store.write_lock().unwrap();
         let conn = store.connection().unwrap();
 
@@ -3092,9 +3148,13 @@ mod tests {
     #[test]
     fn a_recorded_hard_exit_explains_itself_in_the_dead_holder_refusal() {
         let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("graph");
+        let db_path = dir.path().join(crate::graph::names::STEM);
         std::fs::write(&db_path, vec![0u8; MIN_DB_FILE_SIZE as usize]).unwrap();
-        std::fs::write(dir.path().join("graph.wal"), b"wal").unwrap();
+        std::fs::write(
+            dir.path().join(crate::graph::names::sibling(".wal")),
+            b"wal",
+        )
+        .unwrap();
         write_holder_lock(&db_lock_path(&db_path), DEAD_PID);
 
         // Without a marker: the bare refusal, as before.
@@ -3151,9 +3211,13 @@ mod tests {
     #[test]
     fn a_hard_exit_marker_for_a_different_pid_is_ignored() {
         let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("graph");
+        let db_path = dir.path().join(crate::graph::names::STEM);
         std::fs::write(&db_path, vec![0u8; MIN_DB_FILE_SIZE as usize]).unwrap();
-        std::fs::write(dir.path().join("graph.wal"), b"wal").unwrap();
+        std::fs::write(
+            dir.path().join(crate::graph::names::sibling(".wal")),
+            b"wal",
+        )
+        .unwrap();
         write_holder_lock(&db_lock_path(&db_path), DEAD_PID);
         std::fs::write(
             crate::recovery::unclean_exit_marker_path(dir.path()),
@@ -3181,7 +3245,7 @@ mod tests {
     #[test]
     fn a_stale_hard_exit_marker_is_cleared_by_an_open_with_no_wal() {
         let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("graph");
+        let db_path = dir.path().join(crate::graph::names::STEM);
         drop(GraphStore::open(&db_path).unwrap());
         let marker = crate::recovery::unclean_exit_marker_path(dir.path());
         std::fs::write(&marker, serde_json::json!({"pid": DEAD_PID}).to_string()).unwrap();
@@ -3193,7 +3257,7 @@ mod tests {
     #[test]
     fn open_read_only_on_missing_graph_gives_a_clear_error() {
         let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("graph");
+        let db_path = dir.path().join(crate::graph::names::STEM);
 
         let err = match GraphStore::open_read_only(&db_path) {
             Ok(_) => panic!("expected an error opening a nonexistent graph read-only"),
@@ -3209,7 +3273,7 @@ mod tests {
     #[test]
     fn open_read_only_succeeds_once_the_graph_has_been_created() {
         let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("graph");
+        let db_path = dir.path().join(crate::graph::names::STEM);
         drop(GraphStore::open(&db_path).unwrap());
 
         GraphStore::open_read_only(&db_path).unwrap();

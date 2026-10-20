@@ -90,7 +90,7 @@ fn init_refuses_an_unknown_backend_instead_of_opening_kuzu() {
     let tmp = tempfile::tempdir().unwrap();
     std::env::set_var("INFIGRAPH_BACKEND", "kuzuu");
     let registry = infigraph_languages::bundled_registry().unwrap();
-    let mut ig = infigraph_core::Infigraph::open(tmp.path(), registry).unwrap();
+    let mut ig = infigraph_core::CodeIndex::open(tmp.path(), registry).unwrap();
     let result = ig.init();
     std::env::set_var(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND);
     assert!(
@@ -98,7 +98,10 @@ fn init_refuses_an_unknown_backend_instead_of_opening_kuzu() {
         "unknown backend must not fall through to Kuzu"
     );
     assert!(
-        !tmp.path().join(".infigraph/graph").exists(),
+        !tmp.path()
+            .join(".infigraph")
+            .join(infigraph_core::graph::names::STEM)
+            .exists(),
         "no graph file may be created"
     );
 }

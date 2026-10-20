@@ -20,7 +20,7 @@ fn literal_members_met_without_a_registry_are_reported_as_degraded() {
         "export const CONFIG = {\n  semi: true,\n};\n",
     )
     .unwrap();
-    let store = GraphStore::open(&dir.path().join("graph")).unwrap();
+    let store = GraphStore::open(&dir.path().join(infigraph_core::graph::names::STEM)).unwrap();
     store
         .connection()
         .unwrap()

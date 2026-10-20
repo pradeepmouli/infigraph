@@ -55,11 +55,11 @@ pub fn ensure_project_claude_md(project_root: &Path) -> Result<()> {
     let instructions = format!(
         r#"
 {begin_marker}
-## Infigraph (auto-generated)
+## CodeIndex (auto-generated)
 
-This project is indexed by Infigraph. Use its MCP tools first for code tasks: the
+This project is indexed by CodeIndex. Use its MCP tools first for code tasks: the
 `infigraph-tool-routing` skill (installed by `infigraph install`) says which tool answers
-which question and how to set up a worktree. If an Infigraph tool is unavailable or errors,
+which question and how to set up a worktree. If an CodeIndex tool is unavailable or errors,
 tell the user (e.g. to reconnect the MCP server) rather than working around the enforcement hook.
 {end_marker}
 "#
@@ -154,7 +154,13 @@ mod tests {
     fn project() -> tempfile::TempDir {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path().join(".infigraph")).unwrap();
-        std::fs::write(tmp.path().join(".infigraph").join("graph"), b"").unwrap();
+        std::fs::write(
+            tmp.path()
+                .join(".infigraph")
+                .join(crate::graph::names::STEM),
+            b"",
+        )
+        .unwrap();
         tmp
     }
 

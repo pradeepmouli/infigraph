@@ -240,6 +240,17 @@ pub fn reindex_runs() -> usize {
 /// had without a large fixture.
 const REINDEX_PAD_ENV: &str = "INFIGRAPH_TEST_DOC_REINDEX_PAD_MS";
 
+/// Test hook: makes every document index run take at least
+/// `INFIGRAPH_TEST_DOC_REINDEX_PAD_MS` longer, as a large document set does.
+pub(crate) fn pad_for_test() {
+    if let Some(pad) = std::env::var(REINDEX_PAD_ENV)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        std::thread::sleep(Duration::from_millis(pad));
+    }
+}
+
 /// One reindex, under the docs lock and only while docs are on. The switch
 /// is re-read *under* the lock: `clean-docs` turns it off before it takes
 /// the lock to delete, so a reindex that gets the lock after it must not
@@ -272,12 +283,7 @@ fn reindex_if_enabled(root: &Path, log_prefix: &str, trigger: &Trigger) -> Reind
             trigger.describe()
         ),
     );
-    if let Some(pad) = std::env::var(REINDEX_PAD_ENV)
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-    {
-        std::thread::sleep(Duration::from_millis(pad));
-    }
+    pad_for_test();
     let mut idx = match DocIndex::open(root) {
         Ok(i) => i,
         Err(e) => {
@@ -424,13 +430,53 @@ fn attach_poll_interval(root: &Path) -> Duration {
     )
 }
 
+/// The name the daemon's document sink goes by when it is attached to, and
+/// detached from, the producer watching the root.
+pub const DOC_SINK_NAME: &str = "docs";
+
+/// How often the document sink asks for a whole-tree pass although no event
+/// was lost: events are never taken as complete.
+const DOC_TRUE_UP_EVERY: Duration = Duration::from_secs(15 * 60);
+
+/// The sink that feeds the document index: an [`IndexingSink`] over
+/// [`DocIndex`](crate::DocIndex) whose index runs go through `submit`.
+/// `debounce_ms` is the quiet time after the last change before a run is
+/// asked for (never less than half a second).
+pub fn document_sink(
+    root: &Path,
+    submit: Arc<dyn crate::path_queue::DocSubmit>,
+    debounce_ms: u64,
+) -> infigraph_core::watch::queued::IndexingSink<crate::DocIndex> {
+    use infigraph_core::watch::queued::{IndexingSink, Pacing, Queued};
+    IndexingSink::new(
+        DOC_SINK_NAME,
+        infigraph_core::ignore_rules::Domain::Docs,
+        Queued::new(crate::path_queue::DocQueue::new(root, submit)),
+        Pacing {
+            debounce: Duration::from_millis(debounce_ms.max(500)),
+            true_up_every: Some(DOC_TRUE_UP_EVERY),
+            // A document run counts as work in flight for the daemon's idle
+            // exit (#203): ten times its cost between runs keeps a trigger
+            // that never stops from keeping a daemon busy nearly all the time.
+            run_gap_factor: 10,
+            run_gap_cap: Duration::from_secs(60),
+            ..Pacing::default()
+        },
+    )
+}
+
 /// Drive doc-watching for `root` as part of the merged code+doc daemon (see
-/// `infigraph_core::daemon::lifecycle`). Attaches a `watch_docs` session
-/// while `[docs] enabled` is on (`docs_switch::docs_enabled`), detaches when
-/// it goes off, and re-attaches when it comes back. Documents are opt-in:
-/// the switch decides, not whether `docs.kuzu` exists, and the first
-/// catch-up reindex after attaching creates the store. Exits once
-/// `shutdown` is set. Blocks until then.
+/// `infigraph_core::daemon::lifecycle`). Documents have no subscription of
+/// their own any more: the code producer owns the one on the root, triages
+/// every event, and offers a document path to the sink this loop attaches.
+/// The loop attaches `make_sink()`'s sink while `[docs] enabled` is on
+/// (`docs_switch::docs_enabled`), detaches it when the switch goes off, and
+/// attaches a fresh one when it comes back. A sink that is not ready
+/// (`make_sink` returns `None`: the coordinator has not bound its port yet) is
+/// asked for again on the next poll. Documents are opt-in: the switch decides,
+/// not whether `docs.kuzu` exists, and the first index run after attaching
+/// creates the store. Exits once `shutdown` is set, detaching on the way out.
+/// Blocks until then.
 ///
 /// Stopping and starting doc-watching is the daemon's `Control(Docs, ..)`
 /// (#155): stop sets `shutdown` and joins this thread, start spawns a new
@@ -438,82 +484,44 @@ fn attach_poll_interval(root: &Path) -> Duration {
 /// state the daemon cannot report.
 pub fn watch_docs_daemon_loop(
     root: &Path,
-    debounce_ms: u64,
     shutdown: Arc<AtomicBool>,
+    make_sink: impl Fn() -> Option<Box<dyn infigraph_core::watch::sink::WatchSink>>,
 ) -> Result<()> {
+    use infigraph_core::watch::sink::{request_attach, request_detach};
     let poll = attach_poll_interval(root);
     let enabled = || infigraph_core::docs_switch::docs_enabled(root);
-    loop {
-        if shutdown.load(Ordering::Relaxed) {
-            return Ok(());
-        }
-        if !enabled() {
-            std::thread::sleep(poll);
-            continue;
-        }
-        let root_owned = root.to_path_buf();
-        eprintln!(
-            "[doc-watch-daemon] attaching doc watcher for {}",
-            root.display()
-        );
-        run_attached_cycle(enabled, &shutdown, poll, move |stop_rx| {
-            watch_docs(&root_owned, debounce_ms, stop_rx, "doc-watch-daemon")
-        });
-    }
-}
-
-/// Drives one attach cycle: runs `watch_fn` (normally a `watch_docs` call) on
-/// its own thread and polls, in the CALLING thread, for whichever trips
-/// first: `watch_fn` finishing on its own (unrequested), `shutdown`, or
-/// `still_wanted` turning false.
-///
-/// `handle.is_finished()` is checked before any of the other conditions on
-/// every tick specifically so this function can never block forever: those
-/// other conditions are things `watch_fn` reacts to via `stop_rx`, so once
-/// `watch_fn` has already returned (e.g. `notify`'s sender was dropped, or
-/// the watcher failed to start), none of them will necessarily ever become
-/// true, and this function must notice that exit directly instead of
-/// waiting on a stop signal nothing will act on.
-fn run_attached_cycle<F>(
-    still_wanted: impl Fn() -> bool,
-    shutdown: &Arc<AtomicBool>,
-    poll: Duration,
-    watch_fn: F,
-) where
-    F: FnOnce(mpsc::Receiver<()>) -> Result<()> + Send + 'static,
-{
-    let (stop_tx, stop_rx) = mpsc::channel::<()>();
-    let handle = std::thread::spawn(move || watch_fn(stop_rx));
-
-    let log_join_result = |res: std::thread::Result<Result<()>>| match res {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => eprintln!("[doc-watch-daemon] watch_docs error: {e}"),
-        Err(_) => eprintln!("[doc-watch-daemon] watch_docs thread panicked"),
-    };
-
-    loop {
-        if handle.is_finished() {
-            log_join_result(handle.join());
-            eprintln!("[doc-watch-daemon] watch_docs exited unexpectedly, retrying");
-            return;
-        }
-
-        if shutdown.load(Ordering::Relaxed) {
-            let _ = stop_tx.send(());
-            log_join_result(handle.join());
-            return;
-        }
-
-        if !still_wanted() {
+    let mut attached = false;
+    while !shutdown.load(Ordering::Relaxed) {
+        let wanted = enabled();
+        if wanted && !attached {
+            if let Some(sink) = make_sink() {
+                eprintln!(
+                    "[doc-watch-daemon] attaching the document sink for {}",
+                    root.display()
+                );
+                request_attach(root, sink);
+                attached = true;
+            }
+        } else if !wanted && attached {
             eprintln!("[doc-watch-daemon] detaching: document indexing is off");
-            let _ = stop_tx.send(());
-            log_join_result(handle.join());
-            return;
+            request_detach(root, DOC_SINK_NAME);
+            attached = false;
         }
-
         std::thread::sleep(poll);
     }
+    if attached {
+        request_detach(root, DOC_SINK_NAME);
+        // Until the producer has applied it, the sink is still listening and a
+        // document written now would be indexed after the stop.
+        infigraph_core::watch::sink::wait_applied(root, DETACH_WAIT);
+    }
+    eprintln!("[doc-watch-daemon] stopped");
+    Ok(())
 }
+
+/// How long a stop waits for the producer to take the sink off. A producer
+/// ticks every 200ms; one that is not running never will.
+const DETACH_WAIT: Duration = Duration::from_secs(2);
 
 #[cfg(test)]
 mod tests {
@@ -775,14 +783,98 @@ mod tests {
             .unwrap_or(0)
     }
 
+    use infigraph_core::watch::queued::{IndexingSink, Pacing, Queued};
+    use infigraph_core::watch::sink::{
+        drain_requests, PathChange, SinkCommand, WatchBatch, WatchSink,
+    };
+
+    /// The document sink as the daemon builds it, with the coordinator
+    /// replaced by the executor it runs: a submitted write is the same call
+    /// `DocWatchHandle` makes.
+    fn docs_sink(root: &Path) -> Box<dyn WatchSink> {
+        let run_root = root.to_path_buf();
+        let submit = move |request: infigraph_core::daemon_protocol::WriteRequest| {
+            use infigraph_core::daemon_protocol::{WriteRequest, WriteResult};
+            let files = match request {
+                WriteRequest::IndexDocPaths {
+                    upserts,
+                    removals,
+                    whole,
+                } => crate::ops::index_doc_paths(&run_root, &upserts, &removals, whole)?,
+                other => anyhow::bail!("unexpected {}", other.kind()),
+            };
+            Ok(WriteResult::Ok {
+                total_files: 0,
+                indexed_files: files,
+            })
+        };
+        Box::new(IndexingSink::<crate::DocIndex>::new(
+            DOC_SINK_NAME,
+            infigraph_core::ignore_rules::Domain::Docs,
+            Queued::new(crate::path_queue::DocQueue::new(root, Arc::new(submit))),
+            Pacing {
+                debounce: Duration::from_millis(50),
+                tick: Duration::from_millis(10),
+                ..Pacing::default()
+            },
+        ))
+    }
+
+    /// Runs the loop on a thread. `sinks` counts how often it asked for one.
+    fn run_loop(
+        root: &Path,
+        sinks: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> (Arc<AtomicBool>, std::thread::JoinHandle<Result<()>>) {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (flag, loop_root) = (Arc::clone(&shutdown), root.to_path_buf());
+        let handle = std::thread::spawn(move || {
+            let sink_root = loop_root.clone();
+            watch_docs_daemon_loop(&loop_root, flag, move || {
+                sinks.fetch_add(1, Ordering::SeqCst);
+                Some(docs_sink(&sink_root))
+            })
+        });
+        (shutdown, handle)
+    }
+
+    /// Waits for the loop's attach request and returns the sink, as the
+    /// producer would take it.
+    fn attached_sink(root: &Path) -> Box<dyn WatchSink> {
+        let deadline = std::time::Instant::now() + ATTACH_BUDGET;
+        while std::time::Instant::now() < deadline {
+            for command in drain_requests(root) {
+                if let SinkCommand::Attach(sink) = command {
+                    return sink;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("the loop never attached a sink");
+    }
+
+    /// What the producer would hand the sink for a changed document.
+    fn changed(rel: &str) -> WatchBatch {
+        WatchBatch {
+            changes: vec![(std::path::PathBuf::from(rel), PathChange::Modified)],
+            rescan: false,
+        }
+    }
+
     #[test]
     fn returns_immediately_when_shutdown_already_set() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().canonicalize().unwrap();
         let shutdown = Arc::new(AtomicBool::new(true));
-        watch_docs_daemon_loop(&root, 50, shutdown).unwrap();
-        // No assertion beyond "returned" -- this test times out (fails) if
-        // the loop doesn't check shutdown before ever attaching.
+        let sinks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&sinks);
+        watch_docs_daemon_loop(&root, shutdown, move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+            None
+        })
+        .unwrap();
+        // The test times out (fails) if the loop does not check shutdown
+        // before ever attaching.
+        assert_eq!(sinks.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -792,43 +884,66 @@ mod tests {
         let root = tmp.path().canonicalize().unwrap();
         std::fs::create_dir_all(root.join(".infigraph")).unwrap();
         std::fs::write(root.join("readme.md"), "# hello\n\nsome content").unwrap();
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let shutdown_clone = Arc::clone(&shutdown);
-        let loop_root = root.clone();
-        let handle =
-            std::thread::spawn(move || watch_docs_daemon_loop(&loop_root, 50, shutdown_clone));
+        let sinks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (shutdown, handle) = run_loop(&root, Arc::clone(&sinks));
 
         std::thread::sleep(Duration::from_millis(300));
         assert!(
             !infigraph_core::docs_switch::docs_store_path(&root).exists(),
             "a watcher for a project that has not opted in must create nothing"
         );
-        shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(sinks.load(Ordering::SeqCst), 0, "nothing was attached");
+        assert!(drain_requests(&root).is_empty());
+        shutdown.store(true, Ordering::Relaxed);
         handle.join().unwrap().unwrap();
     }
 
+    /// A sink that is not ready yet (the coordinator has not bound its port)
+    /// is asked for again, and attached once it is.
     #[test]
-    fn attaches_and_indexes_once_docs_are_enabled() {
+    fn a_sink_that_is_not_ready_is_attached_when_it_is() {
         let _poll = FastPoll::acquire();
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().canonicalize().unwrap();
         std::fs::create_dir_all(root.join(".infigraph")).unwrap();
-
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let shutdown_clone = Arc::clone(&shutdown);
-        let root_clone = root.clone();
-        let handle =
-            std::thread::spawn(move || watch_docs_daemon_loop(&root_clone, 50, shutdown_clone));
-
-        // Not indexed yet -- give the poll loop a couple of ticks doing
-        // nothing, then create a real (empty) doc index so docs.kuzu exists.
-        std::thread::sleep(Duration::from_millis(60));
         infigraph_core::docs_switch::set_docs_enabled(&root, true).unwrap();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let asks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (flag, counted, sink_root) = (Arc::clone(&shutdown), Arc::clone(&asks), root.clone());
+        let handle = std::thread::spawn(move || {
+            let loop_root = sink_root.clone();
+            watch_docs_daemon_loop(&loop_root, flag, move || {
+                // Ready on the third ask.
+                (counted.fetch_add(1, Ordering::SeqCst) >= 2).then(|| docs_sink(&sink_root))
+            })
+        });
 
-        // Give the daemon loop time to notice and attach, then write a doc.
-        std::thread::sleep(Duration::from_millis(100));
+        let sink = attached_sink(&root);
+        assert!(asks.load(Ordering::SeqCst) >= 3);
+        assert_eq!(sink.name(), DOC_SINK_NAME);
+        shutdown.store(true, Ordering::Relaxed);
+        handle.join().unwrap().unwrap();
+    }
+
+    /// The loop attaches the sink once docs are on, and a document handed to
+    /// that sink is indexed through the executor.
+    #[test]
+    fn attaches_a_sink_once_docs_are_enabled_and_what_it_is_given_gets_indexed() {
+        let _poll = FastPoll::acquire();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join(".infigraph")).unwrap();
+        let sinks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (shutdown, handle) = run_loop(&root, Arc::clone(&sinks));
+
+        // Docs are off: nothing attaches. Then they are turned on.
+        std::thread::sleep(Duration::from_millis(60));
+        assert_eq!(sinks.load(Ordering::SeqCst), 0);
+        infigraph_core::docs_switch::set_docs_enabled(&root, true).unwrap();
+        let mut sink = attached_sink(&root);
+
         std::fs::write(root.join("readme.md"), "# hello\n\nsome content").unwrap();
-
+        sink.accept(changed("readme.md"));
         let deadline = std::time::Instant::now() + ATTACH_BUDGET;
         let mut chunks = 0;
         while std::time::Instant::now() < deadline {
@@ -840,10 +955,10 @@ mod tests {
         }
         assert!(
             chunks > 0,
-            "doc daemon loop must have attached and indexed readme.md"
+            "readme.md must have been indexed through the sink"
         );
 
-        shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+        shutdown.store(true, Ordering::Relaxed);
         handle.join().unwrap().unwrap();
     }
 
@@ -898,125 +1013,106 @@ mod tests {
 
     /// #155 retired the `watch.stop.docs` sentinel: stopping doc-watching is
     /// the daemon's `Control(Docs, Stop)`. A file left by an older MCP server
-    /// must neither detach the loop nor be consumed by it.
+    /// must neither detach the sink nor be consumed by the loop.
     #[test]
-    fn a_stray_stop_docs_file_no_longer_detaches_the_loop() {
+    fn a_stray_stop_docs_file_no_longer_detaches_the_sink() {
         let _poll = FastPoll::acquire();
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().canonicalize().unwrap();
         std::fs::create_dir_all(root.join(".infigraph")).unwrap();
         infigraph_core::docs_switch::set_docs_enabled(&root, true).unwrap();
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let shutdown_clone = Arc::clone(&shutdown);
-        let root_clone = root.clone();
-        let handle =
-            std::thread::spawn(move || watch_docs_daemon_loop(&root_clone, 50, shutdown_clone));
-        std::thread::sleep(Duration::from_millis(300));
+        let (shutdown, handle) = run_loop(&root, Arc::default());
+        let _sink = attached_sink(&root);
+
         std::fs::write(root.join(".infigraph").join("watch.stop.docs"), b"").unwrap();
-        std::thread::sleep(Duration::from_millis(300));
+        std::thread::sleep(Duration::from_millis(400));
+
         assert!(
             root.join(".infigraph").join("watch.stop.docs").exists(),
             "the loop must not consume (or act on) the retired sentinel"
         );
-        // Still attached: a doc edit is still indexed.
-        std::fs::write(root.join("readme.md"), "# hello\n\nsome content").unwrap();
-        let deadline = std::time::Instant::now() + ATTACH_BUDGET;
-        while chunk_count(&root) == 0 && std::time::Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        assert!(chunk_count(&root) > 0, "the loop must still be attached");
-        shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            drain_requests(&root).is_empty(),
+            "and must not detach: it asked for nothing since attaching"
+        );
+        shutdown.store(true, Ordering::Relaxed);
         handle.join().unwrap().unwrap();
     }
 
+    /// Turning the switch off detaches the sink; turning it back on attaches
+    /// a fresh one.
     #[test]
-    fn run_attached_cycle_returns_when_watch_fn_exits_unrequested() {
-        // Proves the fix for Finding 1: if the watch invocation returns on
-        // its own (e.g. `watch_docs` seeing its internal channel disconnect,
-        // or erroring out before its loop ever starts) -- neither shutdown
-        // nor docs_kuzu-absent -- `run_attached_cycle` must still return
-        // promptly instead of blocking on a stop signal the exited thread
-        // can no longer act on.
-        let (result_tx, result_rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            let shutdown = Arc::new(AtomicBool::new(false));
+    fn the_sink_is_detached_when_docs_go_off_and_attached_again_when_they_return() {
+        let _poll = FastPoll::acquire();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join(".infigraph")).unwrap();
+        infigraph_core::docs_switch::set_docs_enabled(&root, true).unwrap();
+        let sinks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (shutdown, handle) = run_loop(&root, Arc::clone(&sinks));
+        let _first = attached_sink(&root);
 
-            run_attached_cycle(
-                || true,
-                &shutdown,
-                Duration::from_millis(10),
-                |_stop_rx: mpsc::Receiver<()>| -> Result<()> { Ok(()) },
-            );
-            let _ = result_tx.send(());
-        });
+        infigraph_core::docs_switch::set_docs_enabled(&root, false).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut detached = false;
+        while !detached && std::time::Instant::now() < deadline {
+            detached = drain_requests(&root)
+                .iter()
+                .any(|c| matches!(c, SinkCommand::Detach(DOC_SINK_NAME)));
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(detached, "docs went off but the sink stayed attached");
 
-        result_rx.recv_timeout(Duration::from_secs(2)).expect(
-            "run_attached_cycle must return promptly when watch_fn exits unrequested, \
-             not block waiting on a stop condition nothing will ever trip",
-        );
+        infigraph_core::docs_switch::set_docs_enabled(&root, true).unwrap();
+        let _second = attached_sink(&root);
+        assert_eq!(sinks.load(Ordering::SeqCst), 2, "a fresh sink, not the old");
+        shutdown.store(true, Ordering::Relaxed);
+        handle.join().unwrap().unwrap();
     }
 
-    /// Turning the switch off stops the attached watcher.
+    /// Stopping the loop detaches its sink on the way out.
     #[test]
-    fn run_attached_cycle_stops_the_watcher_once_it_is_no_longer_wanted() {
-        let wanted = Arc::new(AtomicBool::new(true));
-        let (stopped_tx, stopped_rx) = mpsc::channel();
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let still = Arc::clone(&wanted);
-        let cycle = std::thread::spawn(move || {
-            run_attached_cycle(
-                move || still.load(Ordering::SeqCst),
-                &shutdown,
-                Duration::from_millis(10),
-                move |stop_rx: mpsc::Receiver<()>| -> Result<()> {
-                    let _ = stop_rx.recv();
-                    let _ = stopped_tx.send(());
-                    Ok(())
-                },
-            );
-        });
-        std::thread::sleep(Duration::from_millis(50));
-        wanted.store(false, Ordering::SeqCst);
-        stopped_rx
-            .recv_timeout(Duration::from_secs(2))
-            .expect("the watcher must be told to stop once docs are off");
-        cycle.join().unwrap();
+    fn stopping_the_loop_detaches_its_sink() {
+        let _poll = FastPoll::acquire();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        std::fs::create_dir_all(root.join(".infigraph")).unwrap();
+        infigraph_core::docs_switch::set_docs_enabled(&root, true).unwrap();
+        let (shutdown, handle) = run_loop(&root, Arc::default());
+        let _sink = attached_sink(&root);
+
+        shutdown.store(true, Ordering::Relaxed);
+        handle.join().unwrap().unwrap();
+
+        assert!(drain_requests(&root)
+            .iter()
+            .any(|c| matches!(c, SinkCommand::Detach(DOC_SINK_NAME))));
     }
 
     /// With the switch off, a document change indexes nothing, even for a
-    /// watcher that was attached when it went off.
+    /// sink that was attached when it went off.
     #[test]
-    fn a_watcher_indexes_nothing_after_docs_are_turned_off() {
+    fn a_sink_indexes_nothing_after_docs_are_turned_off() {
         let _poll = FastPoll::acquire();
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().canonicalize().unwrap();
         std::fs::create_dir_all(root.join(".infigraph")).unwrap();
         infigraph_core::docs_switch::set_docs_enabled(&root, true).unwrap();
         std::fs::write(root.join("readme.md"), "# hello\n\nsome content").unwrap();
-        let shutdown = Arc::new(AtomicBool::new(false));
-        let shutdown_clone = Arc::clone(&shutdown);
-        let loop_root = root.clone();
-        let handle =
-            std::thread::spawn(move || watch_docs_daemon_loop(&loop_root, 50, shutdown_clone));
+        let mut sink = docs_sink(&root);
+        sink.accept(WatchBatch::rescan());
         let deadline = std::time::Instant::now() + ATTACH_BUDGET;
         while chunk_count(&root) == 0 && std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(100));
         }
-        assert!(chunk_count(&root) > 0, "precondition: the watcher attached");
+        assert!(chunk_count(&root) > 0, "precondition: the sink indexed");
 
         infigraph_core::docs_switch::set_docs_enabled(&root, false).unwrap();
-        std::thread::sleep(Duration::from_millis(1000));
         let before = chunk_count(&root);
         std::fs::write(root.join("second.md"), "# second\n\nmore content").unwrap();
+        sink.accept(changed("second.md"));
         std::thread::sleep(Duration::from_millis(1500));
-        assert_eq!(
-            chunk_count(&root),
-            before,
-            "a watcher indexed with docs off"
-        );
-
-        shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
-        handle.join().unwrap().unwrap();
+        assert_eq!(chunk_count(&root), before, "a sink indexed with docs off");
     }
 
     /// A stop must end `watch_docs` even while its watcher registration is
@@ -1072,7 +1168,12 @@ mod live_matcher_tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         std::fs::create_dir_all(root.join(".infigraph")).unwrap();
-        std::fs::write(root.join(".infigraph/graph"), b"x").unwrap();
+        std::fs::write(
+            root.join(".infigraph")
+                .join(infigraph_core::graph::names::STEM),
+            b"x",
+        )
+        .unwrap();
         std::fs::write(root.join("draft.md"), "# Draft").unwrap();
         let every = Duration::from_secs(300);
 

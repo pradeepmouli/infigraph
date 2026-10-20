@@ -148,7 +148,8 @@ fn run_with_recovery(
     Err(anyhow::anyhow!(
         "infigraph index timed out 3 times in a row (including one --full attempt) after \
          {timeout:?} each -- likely unrecoverable graph corruption. Manually inspect/remove \
-         .infigraph/graph and .infigraph/graph.wal, then retry."
+         .infigraph/{stem} and .infigraph/{stem}.wal, then retry.",
+        stem = infigraph_core::graph::names::STEM
     ))
 }
 
@@ -333,7 +334,7 @@ pub fn tool_get_dependencies(args: &Value) -> Result<String> {
 /// output instead of being dropped: the silent `let _` this replaces was
 /// one way a rebuilt project could vanish from `doctor`'s registry check
 /// for good (#100).
-fn register_project_or_warn(path: &str, prism: &infigraph_core::Infigraph, out: &mut String) {
+fn register_project_or_warn(path: &str, prism: &infigraph_core::CodeIndex, out: &mut String) {
     let project_name = std::path::Path::new(path)
         .file_name()
         .map(|n| n.to_string_lossy().to_string())

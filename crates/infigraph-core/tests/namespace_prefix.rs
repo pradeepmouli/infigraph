@@ -69,7 +69,8 @@ fn fixture_namespaced(ns: &str) -> Vec<FileExtraction> {
 #[test]
 fn test_namespace_prevents_collision() {
     let dir = tempfile::TempDir::new().expect("tmpdir");
-    let backend = KuzuBackend::open(&dir.path().join("graph")).expect("open");
+    let backend =
+        KuzuBackend::open(&dir.path().join(infigraph_core::graph::names::STEM)).expect("open");
 
     let repo_a = fixture_namespaced("repo-a");
     let repo_b = fixture_namespaced("repo-b");
@@ -87,7 +88,8 @@ fn test_namespace_prevents_collision() {
 #[test]
 fn test_namespace_symbols_queryable() {
     let dir = tempfile::TempDir::new().expect("tmpdir");
-    let backend = KuzuBackend::open(&dir.path().join("graph")).expect("open");
+    let backend =
+        KuzuBackend::open(&dir.path().join(infigraph_core::graph::names::STEM)).expect("open");
 
     backend
         .upsert_files_bulk(&fixture_namespaced("svc-auth"), true)
@@ -109,7 +111,8 @@ fn test_namespace_symbols_queryable() {
 #[test]
 fn test_namespace_file_hashes_isolated() {
     let dir = tempfile::TempDir::new().expect("tmpdir");
-    let backend = KuzuBackend::open(&dir.path().join("graph")).expect("open");
+    let backend =
+        KuzuBackend::open(&dir.path().join(infigraph_core::graph::names::STEM)).expect("open");
 
     backend
         .upsert_files_bulk(&fixture_namespaced("repo-x"), true)
@@ -134,7 +137,8 @@ fn test_namespace_file_hashes_isolated() {
 #[test]
 fn test_namespace_remove_one_repo() {
     let dir = tempfile::TempDir::new().expect("tmpdir");
-    let backend = KuzuBackend::open(&dir.path().join("graph")).expect("open");
+    let backend =
+        KuzuBackend::open(&dir.path().join(infigraph_core::graph::names::STEM)).expect("open");
 
     backend
         .upsert_files_bulk(&fixture_namespaced("keep"), true)
@@ -166,7 +170,8 @@ fn test_namespace_remove_one_repo() {
 #[test]
 fn test_namespace_resolve_within_repo() {
     let dir = tempfile::TempDir::new().expect("tmpdir");
-    let backend = KuzuBackend::open(&dir.path().join("graph")).expect("open");
+    let backend =
+        KuzuBackend::open(&dir.path().join(infigraph_core::graph::names::STEM)).expect("open");
 
     let data = fixture_namespaced("my-svc");
     backend.upsert_files_bulk(&data, true).expect("upsert");

@@ -38,6 +38,7 @@ pub mod multi;
 pub mod ops;
 pub mod path_scope;
 pub mod patterns;
+pub mod pending_paths;
 pub mod phase_clock;
 pub mod pipelines_trust;
 pub mod pools;
@@ -181,7 +182,7 @@ pub fn open_kuzu_with_retry<T>(
 }
 
 /// The main entry point for the infigraph framework.
-pub struct Infigraph {
+pub struct CodeIndex {
     root: PathBuf,
     db_path: PathBuf,
     registry: std::sync::Arc<LanguageRegistry>,
@@ -243,7 +244,7 @@ pub const LOCAL_BACKEND: &str = BackendChoice::Kuzu.as_str();
 pub const DAEMON_BACKEND: &str = BackendChoice::Daemon.as_str();
 
 /// What `init()` prints when it gives up on a graph that will not open and
-/// destroys it to start over ([`Infigraph::init`]'s last branch). The upgrade
+/// destroys it to start over ([`CodeIndex::init`]'s last branch). The upgrade
 /// smoke test (`infigraph-cli/tests/upgrade_smoke.rs`) fails any open of a
 /// previous release's graph that printed it: a wipe-and-rebuild-from-source
 /// leaves the same symbols behind, so only this notice (and what the source
@@ -269,7 +270,7 @@ pub fn selected_backend() -> BackendChoice {
 }
 
 /// The active backend, or a Config error naming the bad value and the valid
-/// ones. Called at CLI/MCP startup and by every `Infigraph::init*`.
+/// ones. Called at CLI/MCP startup and by every `CodeIndex::init*`.
 pub fn validated_backend() -> Result<BackendChoice> {
     Backend::resolve(RawBackend::default(), settings_file::ConfigScope::User)
         .map(|backend| backend.selected)
@@ -296,12 +297,12 @@ pub fn check_settings_at_startup(root: &Path) -> Result<BackendChoice> {
 }
 
 /// Whether `INFIGRAPH_BACKEND` selects the daemon backend. This is the exact
-/// condition `Infigraph::init` dispatches `BackendKind::DaemonKuzu` on,
+/// condition `CodeIndex::init` dispatches `BackendKind::DaemonKuzu` on,
 /// exposed for callers that must know *before* `init()` -- notably
 /// `cmd_index`, which otherwise takes `.infigraph/index.lock` and deadlocks
 /// against the daemon that needs that same lock to serve its writes.
 ///
-/// Prefer `Infigraph::is_daemon_backend` once you have an initialized
+/// Prefer `CodeIndex::is_daemon_backend` once you have an initialized
 /// instance; that reports what was actually opened rather than what was
 /// requested.
 pub fn daemon_backend_selected() -> bool {
@@ -344,7 +345,7 @@ pub fn index_via_daemon_mode_enabled() -> bool {
         .0
 }
 
-impl Infigraph {
+impl CodeIndex {
     /// Backoff schedule (ms) for retrying a non-lock-contention graph open
     /// failure before concluding it's genuine corruption. See `init()`.
     const OPEN_RETRY_BACKOFF_MS: [u64; 3] = [200, 500, 1000];
@@ -360,7 +361,7 @@ impl Infigraph {
     /// registry (~62 tree-sitter packs) once per repo.
     pub fn open_shared(root: &Path, registry: std::sync::Arc<LanguageRegistry>) -> Result<Self> {
         let root = root.canonicalize().context("invalid project root")?;
-        let db_path = root.join(".infigraph").join("graph");
+        let db_path = root.join(".infigraph").join(crate::graph::names::STEM);
         scip::use_language_registry(registry.clone());
         Ok(Self {
             root,
@@ -371,7 +372,7 @@ impl Infigraph {
         })
     }
 
-    /// Opens a plain, non-daemon-routed `Infigraph` at an explicit
+    /// Opens a plain, non-daemon-routed `CodeIndex` at an explicit
     /// `db_path`, bypassing `init()`'s `INFIGRAPH_BACKEND` env-var
     /// branching entirely. Used by the daemon's own full-reindex handler
     /// (`serve_full_reindex_request` in `watch/mod.rs`) to build a fresh
@@ -666,7 +667,7 @@ impl Infigraph {
     fn wipe_graph(db_path: &Path) -> Result<()> {
         // A wipe must never race a live writer: take the same per-graph lock
         // writers hold. Busy here means a live process -- refuse, don't destroy.
-        let lock_path = db_path.with_extension("lock");
+        let lock_path = crate::graph::db_lock_path(db_path);
         let _lock =
             crate::lockfile::acquire(&lock_path, "graph-wipe", std::time::Duration::from_secs(5))?;
 
@@ -842,7 +843,7 @@ impl Infigraph {
     /// unconditionally, since `upsert_file` is still a Tier-3 stub.
     ///
     /// This never recurses: the daemon serves the request against its own
-    /// `Infigraph`, which is always `BackendKind::Kuzu` because `cmd_daemon`
+    /// `CodeIndex`, which is always `BackendKind::Kuzu` because `cmd_daemon`
     /// and `spawn_daemon` both strip `INFIGRAPH_BACKEND` from the daemon
     /// process's environment.
     fn index_via_daemon(
@@ -1379,7 +1380,7 @@ pub struct IndexResult {
     pub skipped_errors: Vec<String>,
 }
 
-/// The result of `Infigraph::scan_changed_files`: everything that needs
+/// The result of `CodeIndex::scan_changed_files`: everything that needs
 /// work, without having written anything yet.
 pub(crate) struct ScanResult {
     pub total_files: usize,
@@ -1393,13 +1394,13 @@ pub(crate) struct ScanResult {
 mod tests {
     use super::*;
 
-    /// Regression test for a data-loss bug: `Infigraph::init()` used to
+    /// Regression test for a data-loss bug: `CodeIndex::init()` used to
     /// treat every Kuzu open failure as corruption and wipe the graph --
     /// including plain lock contention from another live process (e.g. a
     /// running `infigraph watch`), destroying its data. `is_lock_contention_error`
     /// is the check that now distinguishes the two. A genuine two-OS-process
     /// reproduction isn't exercised here -- `Database::new()` doesn't
-    /// conflict across two `Infigraph` instances in the *same* process, only
+    /// conflict across two `CodeIndex` instances in the *same* process, only
     /// across separate processes, and this codebase deliberately avoids
     /// fork()-based tests given the tokio/rayon runtime state that would be
     /// undefined in a forked child (same reasoning as `scip_enrich_exit_message`
@@ -1684,7 +1685,7 @@ mod tests {
     fn init_recovers_from_transient_open_failure_without_wiping() {
         let dir = tempfile::TempDir::new().unwrap();
         let root = dir.path();
-        let db_path = root.join(".infigraph").join("graph");
+        let db_path = root.join(".infigraph").join(crate::graph::names::STEM);
 
         // Build a real graph with a marker symbol, then close it.
         {
@@ -1711,7 +1712,7 @@ mod tests {
         });
 
         let registry = LanguageRegistry::new();
-        let mut ig = Infigraph::open(root, registry).unwrap();
+        let mut ig = CodeIndex::open(root, registry).unwrap();
         let result = ig.init();
         healer.join().unwrap();
 
@@ -1740,7 +1741,7 @@ mod tests {
     fn init_recovers_from_slower_transient_failure_via_backoff() {
         let dir = tempfile::TempDir::new().unwrap();
         let root = dir.path();
-        let db_path = root.join(".infigraph").join("graph");
+        let db_path = root.join(".infigraph").join(crate::graph::names::STEM);
 
         {
             let store = GraphStore::open(&db_path).unwrap();
@@ -1763,7 +1764,7 @@ mod tests {
         });
 
         let registry = LanguageRegistry::new();
-        let mut ig = Infigraph::open(root, registry).unwrap();
+        let mut ig = CodeIndex::open(root, registry).unwrap();
         let result = ig.init();
         healer.join().unwrap();
 
@@ -1791,7 +1792,7 @@ mod tests {
     fn init_wipes_and_rebuilds_on_persistent_corruption() {
         let dir = tempfile::TempDir::new().unwrap();
         let root = dir.path();
-        let db_path = root.join(".infigraph").join("graph");
+        let db_path = root.join(".infigraph").join(crate::graph::names::STEM);
 
         {
             let store = GraphStore::open(&db_path).unwrap();
@@ -1808,7 +1809,7 @@ mod tests {
         std::fs::write(&db_path, b"not a valid kuzu database file at all").unwrap();
 
         let registry = LanguageRegistry::new();
-        let mut ig = Infigraph::open(root, registry).unwrap();
+        let mut ig = CodeIndex::open(root, registry).unwrap();
         let result = ig.init();
 
         assert!(
@@ -1830,7 +1831,7 @@ mod tests {
     fn init_quarantines_instead_of_deleting_on_persistent_corruption() {
         let dir = tempfile::TempDir::new().unwrap();
         let root = dir.path();
-        let db_path = root.join(".infigraph").join("graph");
+        let db_path = root.join(".infigraph").join(crate::graph::names::STEM);
 
         {
             let store = GraphStore::open(&db_path).unwrap();
@@ -1847,7 +1848,7 @@ mod tests {
         std::fs::write(&db_path, b"not a valid kuzu database file at all").unwrap();
 
         let registry = LanguageRegistry::new();
-        let mut ig = Infigraph::open(root, registry).unwrap();
+        let mut ig = CodeIndex::open(root, registry).unwrap();
         let result = ig.init();
         assert!(result.is_ok(), "init() must still recover: {result:?}");
 
@@ -1858,7 +1859,7 @@ mod tests {
             .filter(|e| {
                 e.file_name()
                     .to_string_lossy()
-                    .starts_with("graph.corrupt.")
+                    .starts_with(crate::graph::names::CORRUPT_PREFIX)
             })
             .collect();
         assert_eq!(
@@ -1889,7 +1890,7 @@ mod tests {
     fn init_refuses_a_graph_from_a_different_storage_version_instead_of_wiping_it() {
         let dir = tempfile::TempDir::new().unwrap();
         let root = dir.path();
-        let db_path = root.join(".infigraph").join("graph");
+        let db_path = root.join(".infigraph").join(crate::graph::names::STEM);
 
         {
             let store = GraphStore::open(&db_path).unwrap();
@@ -1918,7 +1919,7 @@ mod tests {
         bytes[4..12].copy_from_slice(&foreign.to_le_bytes());
         std::fs::write(&db_path, &bytes).unwrap();
 
-        let mut ig = Infigraph::open(root, LanguageRegistry::new()).unwrap();
+        let mut ig = CodeIndex::open(root, LanguageRegistry::new()).unwrap();
         let err = ig
             .init()
             .expect_err("a storage-version mismatch must be refused, not wiped and rebuilt");
@@ -1939,7 +1940,7 @@ mod tests {
             .filter(|e| {
                 e.file_name()
                     .to_string_lossy()
-                    .starts_with("graph.corrupt.")
+                    .starts_with(crate::graph::names::CORRUPT_PREFIX)
             })
             .collect();
         assert!(
@@ -1960,7 +1961,7 @@ mod tests {
     fn init_trips_the_crash_loop_breaker_after_repeated_wipe_and_rebuild_cycles() {
         let dir = tempfile::TempDir::new().unwrap();
         let root = dir.path();
-        let db_path = root.join(".infigraph").join("graph");
+        let db_path = root.join(".infigraph").join(crate::graph::names::STEM);
 
         // The first two persistent-corruption-then-init cycles must each
         // recover normally, exactly as `init_quarantines_instead_of_deleting_on_persistent_corruption`
@@ -1971,7 +1972,7 @@ mod tests {
             }
             std::fs::write(&db_path, b"not a valid kuzu database file at all").unwrap();
 
-            let mut ig = Infigraph::open(root, LanguageRegistry::new()).unwrap();
+            let mut ig = CodeIndex::open(root, LanguageRegistry::new()).unwrap();
             let result = ig.init();
             assert!(
                 result.is_ok(),
@@ -1986,7 +1987,7 @@ mod tests {
         }
         std::fs::write(&db_path, b"not a valid kuzu database file at all").unwrap();
 
-        let mut ig = Infigraph::open(root, LanguageRegistry::new()).unwrap();
+        let mut ig = CodeIndex::open(root, LanguageRegistry::new()).unwrap();
         let err = ig
             .init()
             .expect_err("a third auto-rebuild within the crash-loop window must be refused");
@@ -2011,12 +2012,14 @@ mod tests {
         let root = dir.path();
         std::fs::create_dir_all(root.join(".infigraph")).unwrap();
 
-        let custom_db_path = root.join(".infigraph").join("graph.rebuilding");
-        let default_db_path = root.join(".infigraph").join("graph");
+        let custom_db_path = root
+            .join(".infigraph")
+            .join(crate::graph::names::REBUILDING);
+        let default_db_path = root.join(".infigraph").join(crate::graph::names::STEM);
 
         std::env::set_var("INFIGRAPH_BACKEND", "daemon");
         let registry = LanguageRegistry::new();
-        let prism = Infigraph::open_local_kuzu_at(root, registry, custom_db_path.clone()).unwrap();
+        let prism = CodeIndex::open_local_kuzu_at(root, registry, custom_db_path.clone()).unwrap();
         std::env::set_var(crate::BACKEND_ENV, crate::LOCAL_BACKEND);
 
         assert!(
@@ -2035,5 +2038,32 @@ mod tests {
         // Confirm it's genuinely usable, not just constructed.
         let backend = prism.backend().unwrap();
         assert!(backend.get_file_hashes().unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod extensioned_db_lock_tests {
+    use super::*;
+
+    /// A wipe must exclude a writer holding the database's own lock. For a
+    /// database with an extension (`x.kuzu`) the lock is `x.kuzu.lock`;
+    /// `with_extension("lock")` named `x.lock`, which nobody holds, so the
+    /// wipe went ahead under a live writer.
+    #[test]
+    fn a_wipe_waits_for_the_lock_of_a_database_with_an_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("x.kuzu");
+        std::fs::write(&db, b"x").unwrap();
+        let _writer = lockfile::acquire(
+            &graph::db_lock_path(&db),
+            "writer",
+            std::time::Duration::from_secs(1),
+        )
+        .unwrap();
+        assert!(
+            CodeIndex::wipe_graph(&db).is_err(),
+            "the wipe took no lock the writer holds"
+        );
+        assert!(db.exists(), "a refused wipe destroys nothing");
     }
 }

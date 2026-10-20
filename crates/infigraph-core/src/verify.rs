@@ -21,16 +21,22 @@ const CATEGORY: &str = "verify";
 /// `doctor`'s remediation hints) decides.
 pub fn run_verify(root: &Path) -> Vec<CheckResult> {
     let ig = root.join(".infigraph");
-    let graph_path = ig.join("graph");
+    let graph_path = ig.join(crate::graph::names::STEM);
     let mut results = Vec::new();
 
     if !graph_path.exists() {
-        results.push(CheckResult::warn(
-            CATEGORY,
-            "graph: open",
-            "no graph database present",
-            "run `infigraph index` to build one",
-        ));
+        let (detail, remedy) = if crate::graph::migrate::pending(&ig) {
+            (
+                "the code graph is stored under its old name; a command that writes renames it",
+                "run `infigraph index` (or any command that writes) to migrate it",
+            )
+        } else {
+            (
+                "no graph database present",
+                "run `infigraph index` to build one",
+            )
+        };
+        results.push(CheckResult::warn(CATEGORY, "graph: open", detail, remedy));
         return results;
     }
 

@@ -59,7 +59,7 @@ fn seed_two_symbols(backend: &KuzuBackend) {
 #[test]
 fn write_calls_service_edges_creates_all_edges_in_one_call() {
     let tmp = tempfile::tempdir().unwrap();
-    let backend = KuzuBackend::open(&tmp.path().join("graph")).unwrap();
+    let backend = KuzuBackend::open(&tmp.path().join(infigraph_core::graph::names::STEM)).unwrap();
     seed_two_symbols(&backend);
 
     let edges = vec![
@@ -101,7 +101,7 @@ fn write_calls_service_edges_creates_all_edges_in_one_call() {
 #[test]
 fn write_calls_service_edges_empty_is_a_noop() {
     let tmp = tempfile::tempdir().unwrap();
-    let backend = KuzuBackend::open(&tmp.path().join("graph")).unwrap();
+    let backend = KuzuBackend::open(&tmp.path().join(infigraph_core::graph::names::STEM)).unwrap();
     backend.write_calls_service_edges(&[]).unwrap();
 }
 
@@ -112,7 +112,7 @@ fn write_calls_service_edges_empty_is_a_noop() {
 #[test]
 fn write_calls_service_edges_twice_does_not_duplicate_edges() {
     let tmp = tempfile::tempdir().unwrap();
-    let backend = KuzuBackend::open(&tmp.path().join("graph")).unwrap();
+    let backend = KuzuBackend::open(&tmp.path().join(infigraph_core::graph::names::STEM)).unwrap();
     seed_two_symbols(&backend);
     let edges = vec![CallsServiceEdge {
         symbol_id: "caller.py::handler".to_string(),

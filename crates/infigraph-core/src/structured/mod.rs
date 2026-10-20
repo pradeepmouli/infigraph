@@ -136,7 +136,8 @@ node_table = "Bad"
 
     fn kuzu_conn() -> (tempfile::TempDir, crate::graph::GraphStore) {
         let dir = tempfile::TempDir::new().unwrap();
-        let store = crate::graph::GraphStore::open(&dir.path().join("graph")).unwrap();
+        let store =
+            crate::graph::GraphStore::open(&dir.path().join(crate::graph::names::STEM)).unwrap();
         (dir, store)
     }
 

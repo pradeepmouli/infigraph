@@ -1609,7 +1609,13 @@ mod domain_tests {
         let _home = PinnedHome::empty();
         let dir = project("[ignore]\ncode = [\"/src/docs/\"]\n");
         // A directory is a project store only once it holds a graph.
-        fs::write(dir.path().join(".infigraph/graph"), b"x").unwrap();
+        fs::write(
+            dir.path()
+                .join(".infigraph")
+                .join(crate::graph::names::STEM),
+            b"x",
+        )
+        .unwrap();
         let src = dir.path().join("src");
 
         let found: Vec<String> = walk_builder(&src, Domain::Code)

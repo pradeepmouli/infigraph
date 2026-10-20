@@ -16,7 +16,7 @@ impl GraphStore {
 
         // Preflight disk headroom before any COPY/UNWIND write (see
         // store_util::check_disk_headroom). This is the single-file write
-        // entry point `Infigraph::index_file` (a public API) reaches --
+        // entry point `CodeIndex::index_file` (a public API) reaches --
         // distinct from, and not covered by, the bulk-path preflight in
         // `KuzuBackend::upsert_files_bulk`.
         if let Some(dir) = self.db_dir() {
@@ -41,7 +41,10 @@ impl GraphStore {
         self.upsert_file_conn(&conn, extraction, &lock)?;
         self.bump_ast_generation_conn(&conn, &lock)?;
         if let Some(dir) = self.db_dir() {
-            super::store_util::stamp_healthy_graph_size_if_unset(dir, &dir.join("graph"));
+            super::store_util::stamp_healthy_graph_size_if_unset(
+                dir,
+                &dir.join(crate::graph::names::STEM),
+            );
         }
         Ok(())
     }

@@ -15,7 +15,7 @@ fn each_condition_renders_one_warning_line() {
             DegradedMode::TrigramEmbedder.notice(),
             DegradedMode::HnswMissing.notice(),
         ],
-        slow_waits: vec![("graph.lock".to_string(), 5)],
+        slow_waits: vec![(infigraph_core::graph::names::LOCK.to_string(), 5)],
     };
     let footer = compose_footer(&sig).unwrap();
     let lines: Vec<&str> = footer.lines().collect();
@@ -25,7 +25,10 @@ fn each_condition_renders_one_warning_line() {
     assert!(footer.contains("No file watcher running — results may be stale"));
     assert!(footer.contains("trigram fallback"));
     assert!(footer.contains("HNSW index missing"));
-    assert!(footer.contains("waited 5s for graph.lock"));
+    assert!(footer.contains(&format!(
+        "waited 5s for {}",
+        infigraph_core::graph::names::LOCK
+    )));
 }
 
 #[test]
@@ -108,7 +111,13 @@ fn a_projects_degraded_modes_reach_the_footer_from_core() {
     state.mark_initialized();
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join(".infigraph")).unwrap();
-    std::fs::write(dir.path().join(".infigraph/graph"), b"graph").unwrap();
+    std::fs::write(
+        dir.path()
+            .join(".infigraph")
+            .join(infigraph_core::graph::names::STEM),
+        b"graph",
+    )
+    .unwrap();
 
     let sig = gather_signals(&state, "search", Some(dir.path()));
     let missing = DegradedMode::EmbeddingsMissing;
@@ -125,7 +134,13 @@ fn tools_that_list_degraded_modes_themselves_get_none_in_the_footer() {
     state.mark_initialized();
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join(".infigraph")).unwrap();
-    std::fs::write(dir.path().join(".infigraph/graph"), b"graph").unwrap();
+    std::fs::write(
+        dir.path()
+            .join(".infigraph")
+            .join(infigraph_core::graph::names::STEM),
+        b"graph",
+    )
+    .unwrap();
     for tool in ["get_stats", "doctor"] {
         let sig = gather_signals(&state, tool, Some(dir.path()));
         assert!(sig.degraded.is_empty(), "{tool}: {:?}", sig.degraded);
@@ -234,7 +249,13 @@ fn the_second_tool_call_does_not_repeat_a_projects_degraded_mode() {
     state.mark_initialized();
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join(".infigraph")).unwrap();
-    std::fs::write(dir.path().join(".infigraph/graph"), b"graph").unwrap();
+    std::fs::write(
+        dir.path()
+            .join(".infigraph")
+            .join(infigraph_core::graph::names::STEM),
+        b"graph",
+    )
+    .unwrap();
     let key = DegradedMode::EmbeddingsMissing.key();
 
     assert!(keys(&gather_signals(&state, "search", Some(dir.path()))).contains(&key));

@@ -45,7 +45,13 @@ fn start() -> Fixture {
     let bystander = root.join("bystander");
     for project in [&startup, &bystander] {
         std::fs::create_dir_all(project.join(".infigraph")).unwrap();
-        std::fs::write(project.join(".infigraph").join("graph"), GRAPH_BYTES).unwrap();
+        std::fs::write(
+            project
+                .join(".infigraph")
+                .join(infigraph_core::graph::names::STEM),
+            GRAPH_BYTES,
+        )
+        .unwrap();
     }
     let registry_home = root.join("registry-home");
     std::fs::create_dir_all(&registry_home).unwrap();
@@ -157,9 +163,13 @@ fn segfault(pid: u32) {
 
 /// Whether `project`'s graph is still exactly the fixture's bytes.
 fn graph_untouched(project: &Path) -> bool {
-    std::fs::read(project.join(".infigraph").join("graph"))
-        .ok()
-        .as_deref()
+    std::fs::read(
+        project
+            .join(".infigraph")
+            .join(infigraph_core::graph::names::STEM),
+    )
+    .ok()
+    .as_deref()
         == Some(GRAPH_BYTES)
 }
 

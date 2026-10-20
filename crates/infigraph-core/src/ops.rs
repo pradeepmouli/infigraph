@@ -164,6 +164,7 @@ pub enum EntryClass {
 /// Names, exactly, that a rebuild of the graph recreates. The lock files are
 /// [`crate::ps::PROJECT_LOCKS`], not repeated here.
 const DERIVED_NAMES: &[&str] = &[
+    crate::graph::migrate::JOURNAL,
     "bm25_cache.bin",
     "dedup_state.json",
     "dirty.lock",
@@ -201,8 +202,8 @@ pub fn classify_entry(name: &str) -> EntryClass {
     if is_docs_store_entry(name) || name == crate::docs_switch::DOCS_OP_LOCK {
         return EntryClass::DocsStore;
     }
-    let derived = name == "graph"
-        || name.starts_with("graph.")
+    let derived = name == crate::graph::names::STEM
+        || name.starts_with(crate::graph::names::sibling(".").as_str())
         || crate::ps::PROJECT_LOCKS.contains(&name)
         || DERIVED_NAMES.contains(&name)
         || DERIVED_PREFIXES
@@ -230,13 +231,14 @@ pub fn classify_entry(name: &str) -> EntryClass {
 /// callers that go through `begin_index_op` (full/incremental `index()`,
 /// group/multi-repo builds) — it does not cover `GraphStore::upsert_file`,
 /// which only takes the finer-grained `graph.lock` and is reachable from the
-/// public `Infigraph::index_file` API. Without also taking `graph.lock`
+/// public `CodeIndex::index_file` API. Without also taking `graph.lock`
 /// here, a concurrent single-file write could run against the graph while
 /// this function is mid-copy or mid-delete (caught by adversarial review
 /// before this shipped). Acquiring it here blocks that class of writer out
 /// for the duration of the snapshot+wipe, same as every other graph writer.
 pub fn full_reindex_wipe(tg_dir: &Path) -> Result<()> {
-    let graph_lock_path = crate::graph::store::db_lock_path(&tg_dir.join("graph"));
+    let graph_lock_path =
+        crate::graph::store::db_lock_path(&tg_dir.join(crate::graph::names::STEM));
     let _graph_lock = crate::lockfile::acquire(
         &graph_lock_path,
         "full-reindex-wipe",
@@ -273,11 +275,11 @@ mod tests {
     #[test]
     fn the_graph_and_its_sidecars_are_derived() {
         for name in [
-            "graph",
-            "graph.wal",
-            "graph.health.json",
-            "graph.health.recorded",
-            "graph.ckpt.lock",
+            crate::graph::names::STEM,
+            crate::graph::names::sibling(".wal").as_str(),
+            crate::graph::names::HEALTH,
+            crate::graph::names::sibling(".health.recorded").as_str(),
+            crate::graph::names::sibling(".ckpt.lock").as_str(),
             "bm25_cache.bin",
             "embeddings.bin",
             "embeddings.bin.generation",
@@ -331,9 +333,9 @@ mod tests {
     fn the_restore_pools_are_their_own_class() {
         for name in [
             "snapshots",
-            "graph.corrupt.1790000000",
-            "graph.corrupt.1790000000.wal",
-            "graph.previous.1790000000",
+            crate::graph::names::sibling(".corrupt.1790000000").as_str(),
+            crate::graph::names::sibling(".corrupt.1790000000.wal").as_str(),
+            crate::graph::names::sibling(".previous.1790000000").as_str(),
         ] {
             assert_eq!(classify_entry(name), EntryClass::RestorePoint, "{name}");
         }
@@ -362,13 +364,18 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let ig = tmp.path().join(".infigraph");
         std::fs::create_dir_all(&ig).unwrap();
-        for name in ["graph", "scip-enrich.lock", "index.lock", "daemon.log"] {
+        for name in [
+            crate::graph::names::STEM,
+            "scip-enrich.lock",
+            "index.lock",
+            "daemon.log",
+        ] {
             std::fs::write(ig.join(name), "x").unwrap();
         }
         wipe_infigraph_preserving_index_lock(&ig).unwrap();
         assert!(ig.join("scip-enrich.lock").exists());
         assert!(ig.join("index.lock").exists());
-        assert!(!ig.join("graph").exists());
+        assert!(!ig.join(crate::graph::names::STEM).exists());
         assert!(!ig.join("daemon.log").exists());
     }
 

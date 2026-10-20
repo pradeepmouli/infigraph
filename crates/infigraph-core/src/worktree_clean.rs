@@ -711,8 +711,8 @@ mod tests {
     /// user's own, a restore point and a docs store.
     fn seed(worktree: &Path) {
         let ig = worktree.join(".infigraph");
-        write(&ig.join("graph"), 4000);
-        write(&ig.join("graph.wal"), 100);
+        write(&ig.join(crate::graph::names::STEM), 4000);
+        write(&ig.join(crate::graph::names::sibling(".wal")), 100);
         write(&ig.join("embeddings.bin"), 2000);
         write(&ig.join("bm25_cache.bin"), 500);
         write(&ig.join("daemon.log"), 300);
@@ -725,8 +725,16 @@ mod tests {
         write(&ig.join("my-notes.txt"), 10);
         write(&ig.join("docs.kuzu"), 900);
         write(&ig.join("docs_embeddings.bin"), 100);
-        write(&ig.join("snapshots").join("1").join("graph"), 700);
-        write(&ig.join("graph.corrupt.1790000000"), 80);
+        write(
+            &ig.join("snapshots")
+                .join("1")
+                .join(crate::graph::names::STEM),
+            700,
+        );
+        write(
+            &ig.join(crate::graph::names::sibling(".corrupt.1790000000")),
+            80,
+        );
     }
 
     fn options() -> Options {
@@ -790,18 +798,22 @@ mod tests {
         let w = find(&plan, &wt);
 
         assert_eq!(w.skip, None, "{w:?}");
-        assert_eq!(
-            names(w),
-            vec![
+        assert_eq!(names(w), {
+            let mut expected: Vec<String> = [
                 "bm25_cache.bin",
                 "daemon.log",
                 "embeddings.bin",
-                "graph",
-                "graph.wal",
+                crate::graph::names::STEM,
                 "last-run.index.json",
-                "write-tmp"
+                "write-tmp",
             ]
-        );
+            .iter()
+            .map(|n| n.to_string())
+            .collect();
+            expected.push(crate::graph::names::sibling(".wal"));
+            expected.sort();
+            expected
+        });
         let kept: Vec<&str> = w.kept.iter().map(|k| k.what).collect();
         assert!(kept.contains(&"restore points"), "{kept:?}");
         assert!(kept.contains(&"docs store"), "{kept:?}");
@@ -857,7 +869,7 @@ mod tests {
             "docs.kuzu",
             "docs_embeddings.bin",
             "snapshots",
-            "graph.corrupt.1790000000",
+            crate::graph::names::sibling(".corrupt.1790000000").as_str(),
         ] {
             assert!(
                 listed.contains(&asked.to_string()),
@@ -1060,7 +1072,7 @@ mod tests {
         let w = find(&plan, &wt);
         assert_eq!(w.skip, None);
         assert!(!names(w).contains(&"target".to_string()), "{:?}", names(w));
-        assert!(names(w).contains(&"graph".to_string()));
+        assert!(names(w).contains(&crate::graph::names::STEM.to_string()));
         assert!(w.notes.iter().any(|n| n.contains("cargo")), "{:?}", w.notes);
         drop(held);
         let plan = plan_for(&repo, &options());
@@ -1172,7 +1184,7 @@ mod tests {
             w.notes
         );
         apply(&plan, &repo.main, &options(), &mut no_teardown());
-        assert!(outside.join("graph").exists());
+        assert!(outside.join(crate::graph::names::STEM).exists());
         assert!(outside.join("embeddings.bin").exists());
     }
 
@@ -1217,8 +1229,8 @@ mod tests {
         assert_eq!(applied.cleaned, vec![(wt.clone(), expected)]);
         assert_eq!(torn_down, vec![wt.clone()]);
         for gone in [
-            "graph",
-            "graph.wal",
+            crate::graph::names::STEM,
+            crate::graph::names::sibling(".wal").as_str(),
             "embeddings.bin",
             "bm25_cache.bin",
             "daemon.log",
@@ -1236,8 +1248,8 @@ mod tests {
             "my-notes.txt",
             "docs.kuzu",
             "docs_embeddings.bin",
-            "snapshots/1/graph",
-            "graph.corrupt.1790000000",
+            format!("snapshots/1/{}", crate::graph::names::STEM).as_str(),
+            crate::graph::names::sibling(".corrupt.1790000000").as_str(),
         ] {
             assert!(ig.join(survivor).exists(), "{survivor} was removed");
         }
@@ -1252,7 +1264,7 @@ mod tests {
         let repo = Repo::new();
         let wt = repo.branch("fix-a");
         repo.merge("fix-a");
-        write(&wt.join(".infigraph").join("graph"), 100);
+        write(&wt.join(".infigraph").join(crate::graph::names::STEM), 100);
         write(&wt.join(".infigraph").join("embeddings.bin"), 100);
 
         let plan = plan_for(&repo, &options());
@@ -1286,7 +1298,10 @@ mod tests {
             applied.changed[0].1.contains("changed since the plan"),
             "{applied:?}"
         );
-        assert!(wt.join(".infigraph").join("graph").exists());
+        assert!(wt
+            .join(".infigraph")
+            .join(crate::graph::names::STEM)
+            .exists());
     }
 
     #[test]

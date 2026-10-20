@@ -2,7 +2,7 @@ use anyhow::Result;
 
 use crate::graph::GraphBackend;
 use crate::lang::LanguageRegistry;
-use crate::Infigraph;
+use crate::CodeIndex;
 
 /// Cross-repo resolution for namespace-qualified C++ calls whose target
 /// isn't defined in the caller's own repo (e.g. `tps::SetFormML(...)` called
@@ -200,13 +200,13 @@ pub fn link_cross_repo_namespace_calls_for_group(
         .get(group_name)
         .ok_or_else(|| anyhow::anyhow!("group '{group_name}' not found"))?;
 
-    let mut opened: Vec<(String, Infigraph, Option<String>)> = Vec::new();
+    let mut opened: Vec<(String, CodeIndex, Option<String>)> = Vec::new();
     for repo_name in &group.repos {
         let entry = match registry.repos.get(repo_name) {
             Some(e) => e,
             None => continue,
         };
-        let mut prism = Infigraph::open(&entry.path, build_registry()?)?;
+        let mut prism = CodeIndex::open(&entry.path, build_registry()?)?;
         prism.init()?;
         // None in local mode (each `prism` is a genuinely separate Kuzu
         // database, no scoping needed); Some("{org}/{repo}") in remote mode,

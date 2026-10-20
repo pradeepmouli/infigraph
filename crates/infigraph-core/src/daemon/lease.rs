@@ -5,7 +5,7 @@
 //!
 //! A lease this process has not used for `daemon.client_release_secs`
 //! is released (unix only), so an idle session stops keeping its daemon
-//! alive. The next use -- `hold` on every `Infigraph::init`, [`in_use`]
+//! alive. The next use -- `hold` on every `CodeIndex::init`, [`in_use`]
 //! around every routed read and write -- leases again, and
 //! `ensure_daemon_for_routed_access` respawns a daemon that has since
 //! exited. A [`pin`], a use in progress, or the process's
@@ -407,7 +407,7 @@ fn release_when_idle(root: &Path, lease: &Arc<Lease>, after: Duration) {
 /// that binds within the startup grace (a `daemon-restart`, a build-mismatch
 /// respawn) -- so a session that never queries keeps its lease across
 /// restarts. Returns once no daemon is left to lease from; the caller's next
-/// `hold` (every `Infigraph::init`) starts over.
+/// `hold` (every `CodeIndex::init`) starts over.
 ///
 /// Never probes `watch.lock`. `daemon_is_alive` probes by briefly *taking*
 /// the lock, so a lease thread that probed would make other probers in this
@@ -590,7 +590,7 @@ mod tests {
     fn hold_spawned_waits_for_the_daemon_to_come_up() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
-        let graph = root.join(".infigraph").join("graph");
+        let graph = root.join(".infigraph").join(crate::graph::names::STEM);
         std::fs::create_dir_all(graph.parent().unwrap()).unwrap();
         drop(crate::graph::GraphStore::open(&graph).unwrap());
         let store = std::sync::Arc::new(crate::graph::GraphStore::open(&graph).unwrap());

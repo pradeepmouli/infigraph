@@ -666,7 +666,7 @@ pub fn estimate_tokens(text: &str) -> usize {
 /// it on a thread.
 ///
 /// Daemon mode: nothing. A daemon outlives its client, and the first tool call
-/// that names a project starts it (opportunistically, by `Infigraph::init`),
+/// that names a project starts it (opportunistically, by `CodeIndex::init`),
 /// with its document watcher attached by the daemon itself. Starting one per
 /// registered project here leased every one of them for as long as this process
 /// lived -- ~33 daemons on a repo with many worktrees, none of which could ever

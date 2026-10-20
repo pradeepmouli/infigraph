@@ -163,7 +163,11 @@ fn copy_tree(from: &Path, to: &Path) {
 }
 
 fn graph_bytes(root: &Path) -> Vec<u8> {
-    std::fs::read(root.join(".infigraph").join("graph")).unwrap_or_default()
+    std::fs::read(
+        root.join(".infigraph")
+            .join(infigraph_core::graph::names::STEM),
+    )
+    .unwrap_or_default()
 }
 
 fn quarantined(root: &Path) -> bool {
@@ -172,7 +176,7 @@ fn quarantined(root: &Path) -> bool {
             dir.filter_map(|e| e.ok()).any(|e| {
                 e.file_name()
                     .to_string_lossy()
-                    .starts_with("graph.corrupt.")
+                    .starts_with(infigraph_core::graph::names::CORRUPT_PREFIX)
             })
         })
         .unwrap_or(false)
@@ -308,7 +312,7 @@ fn upgrading_from_the_previous_release_keeps_the_graph_readable() {
             "watch.lock"
         ) && lock_is_free(
             &root,
-            "graph.lock"
+            infigraph_core::graph::names::LOCK
         )),
         "the previous release's watcher is still running, so this build cannot open the graph"
     );
@@ -355,7 +359,7 @@ fn upgrading_from_the_previous_release_keeps_the_graph_readable() {
             "watch.lock"
         ) && lock_is_free(
             &root,
-            "graph.lock"
+            infigraph_core::graph::names::LOCK
         )),
         "an infigraph process still holds the project's locks"
     );

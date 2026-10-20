@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use infigraph_core::Infigraph;
+use infigraph_core::CodeIndex;
 use infigraph_languages::bundled_registry;
 use infigraph_mcp::tools::analysis::git::parse_diff_hunks;
 
@@ -13,7 +13,7 @@ pub(crate) fn cmd_git_summary(
     file: Option<&str>,
 ) -> Result<()> {
     let registry = bundled_registry()?;
-    let mut prism = Infigraph::open(root, registry)?;
+    let mut prism = CodeIndex::open(root, registry)?;
     prism.init()?;
 
     let backend = prism.backend().context("graph not initialized")?;

@@ -765,7 +765,8 @@ mod tests {
         }
 
         let graph = tempfile::TempDir::new().unwrap();
-        let store = crate::graph::GraphStore::open(&graph.path().join("graph")).unwrap();
+        let store =
+            crate::graph::GraphStore::open(&graph.path().join(crate::graph::names::STEM)).unwrap();
         let backend = KuzuBackend::from_store(store);
         let mut results = Vec::new();
         scan_csproj(root, &backend, &mut results).unwrap();
@@ -788,7 +789,7 @@ mod tests {
     #[test]
     fn test_manifest_upsert_updates_version() {
         let dir = tempfile::TempDir::new().unwrap();
-        let db_path = dir.path().join("graph");
+        let db_path = dir.path().join(crate::graph::names::STEM);
         let store = crate::graph::GraphStore::open(&db_path).unwrap();
         let backend = KuzuBackend::from_store(store);
         let result1 = ManifestResult {

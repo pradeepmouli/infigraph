@@ -183,7 +183,10 @@ pub fn describe_status(root: &Path, result: &Result<StatusReport, ControlError>)
     let shown = root.display();
     match result {
         Ok(report) => format!("Watcher active for {shown}\n{report}"),
-        Err(ControlError::NoDaemon) => format!("No watcher running for {shown}."),
+        Err(ControlError::NoDaemon) => match super::idle_exit::note(root) {
+            Some(why) => format!("No watcher running for {shown}: {why}."),
+            None => format!("No watcher running for {shown}."),
+        },
         Err(ControlError::Unresponsive) => {
             let lock = root.join(".infigraph").join("watch.lock");
             let holder = crate::lockfile::read_holder(&lock)

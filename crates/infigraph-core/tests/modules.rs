@@ -72,7 +72,7 @@ struct TestGraph {
 
 fn setup_graph() -> TestGraph {
     let dir = tempfile::TempDir::new().unwrap();
-    let store = GraphStore::open(&dir.path().join("graph")).unwrap();
+    let store = GraphStore::open(&dir.path().join(infigraph_core::graph::names::STEM)).unwrap();
     let extractions = vec![
         FileExtraction {
             file: "src/app.py".to_string(),
@@ -212,7 +212,7 @@ fn setup_graph() -> TestGraph {
 #[test]
 fn test_cluster_empty_graph() {
     let dir = tempfile::TempDir::new().unwrap();
-    let store = GraphStore::open(&dir.path().join("graph")).unwrap();
+    let store = GraphStore::open(&dir.path().join(infigraph_core::graph::names::STEM)).unwrap();
     let backend = KuzuBackend::from_store(store);
 
     let stats = infigraph_core::cluster::detect_clusters(&backend).unwrap();
@@ -245,7 +245,7 @@ fn test_cluster_stats_display() {
 #[test]
 fn test_cluster_isolated_symbols() {
     let dir = tempfile::TempDir::new().unwrap();
-    let store = GraphStore::open(&dir.path().join("graph")).unwrap();
+    let store = GraphStore::open(&dir.path().join(infigraph_core::graph::names::STEM)).unwrap();
     let extractions = vec![FileExtraction {
         file: "a.py".to_string(),
         language: "python".to_string(),
@@ -283,7 +283,7 @@ fn test_manifest_package_json() {
     )
     .unwrap();
 
-    let store = GraphStore::open(&dir.path().join("graph")).unwrap();
+    let store = GraphStore::open(&dir.path().join(infigraph_core::graph::names::STEM)).unwrap();
     let backend = KuzuBackend::from_store(store);
     let results = infigraph_core::manifest::index_manifests(dir.path(), &backend).unwrap();
 
@@ -316,7 +316,7 @@ tempfile = "3.0"
     )
     .unwrap();
 
-    let store = GraphStore::open(&dir.path().join("graph")).unwrap();
+    let store = GraphStore::open(&dir.path().join(infigraph_core::graph::names::STEM)).unwrap();
     let backend = KuzuBackend::from_store(store);
     let results = infigraph_core::manifest::index_manifests(dir.path(), &backend).unwrap();
 
@@ -341,7 +341,7 @@ fn test_manifest_requirements_txt() {
     )
     .unwrap();
 
-    let store = GraphStore::open(&dir.path().join("graph")).unwrap();
+    let store = GraphStore::open(&dir.path().join(infigraph_core::graph::names::STEM)).unwrap();
     let backend = KuzuBackend::from_store(store);
     let results = infigraph_core::manifest::index_manifests(dir.path(), &backend).unwrap();
 
@@ -361,7 +361,7 @@ fn test_manifest_go_mod() {
         "module example.com/myapp\n\ngo 1.21\n\nrequire (\n\tgithub.com/gin-gonic/gin v1.9.1\n\tgolang.org/x/sync v0.3.0 // indirect\n)\n",
     ).unwrap();
 
-    let store = GraphStore::open(&dir.path().join("graph")).unwrap();
+    let store = GraphStore::open(&dir.path().join(infigraph_core::graph::names::STEM)).unwrap();
     let backend = KuzuBackend::from_store(store);
     let results = infigraph_core::manifest::index_manifests(dir.path(), &backend).unwrap();
 
@@ -403,7 +403,7 @@ fn test_manifest_pom_xml() {
     )
     .unwrap();
 
-    let store = GraphStore::open(&dir.path().join("graph")).unwrap();
+    let store = GraphStore::open(&dir.path().join(infigraph_core::graph::names::STEM)).unwrap();
     let backend = KuzuBackend::from_store(store);
     let results = infigraph_core::manifest::index_manifests(dir.path(), &backend).unwrap();
 
@@ -427,7 +427,7 @@ fn test_manifest_gemfile() {
         "source 'https://rubygems.org'\ngem 'rails', '~> 7.0'\ngem 'puma'\n\ngroup :test do\n  gem 'rspec'\nend\n",
     ).unwrap();
 
-    let store = GraphStore::open(&dir.path().join("graph")).unwrap();
+    let store = GraphStore::open(&dir.path().join(infigraph_core::graph::names::STEM)).unwrap();
     let backend = KuzuBackend::from_store(store);
     let results = infigraph_core::manifest::index_manifests(dir.path(), &backend).unwrap();
 
@@ -451,7 +451,7 @@ fn test_manifest_composer_json() {
         r#"{"require": {"laravel/framework": "^10.0"}, "require-dev": {"phpunit/phpunit": "^10.0"}}"#,
     ).unwrap();
 
-    let store = GraphStore::open(&dir.path().join("graph")).unwrap();
+    let store = GraphStore::open(&dir.path().join(infigraph_core::graph::names::STEM)).unwrap();
     let backend = KuzuBackend::from_store(store);
     let results = infigraph_core::manifest::index_manifests(dir.path(), &backend).unwrap();
 
@@ -470,7 +470,7 @@ fn test_manifest_composer_json() {
 #[test]
 fn test_manifest_empty_dir() {
     let dir = tempfile::TempDir::new().unwrap();
-    let store = GraphStore::open(&dir.path().join("graph")).unwrap();
+    let store = GraphStore::open(&dir.path().join(infigraph_core::graph::names::STEM)).unwrap();
     let backend = KuzuBackend::from_store(store);
     let results = infigraph_core::manifest::index_manifests(dir.path(), &backend).unwrap();
     assert!(results.is_empty());
@@ -485,7 +485,7 @@ fn test_manifest_query_deps() {
     )
     .unwrap();
 
-    let store = GraphStore::open(&dir.path().join("graph")).unwrap();
+    let store = GraphStore::open(&dir.path().join(infigraph_core::graph::names::STEM)).unwrap();
     let backend = KuzuBackend::from_store(store);
     infigraph_core::manifest::index_manifests(dir.path(), &backend).unwrap();
 
@@ -501,7 +501,7 @@ fn test_manifest_gradle() {
         "dependencies {\n    implementation 'com.google.guava:guava:31.1'\n    testImplementation 'junit:junit:4.13'\n}\n",
     ).unwrap();
 
-    let store = GraphStore::open(&dir.path().join("graph")).unwrap();
+    let store = GraphStore::open(&dir.path().join(infigraph_core::graph::names::STEM)).unwrap();
     let backend = KuzuBackend::from_store(store);
     let results = infigraph_core::manifest::index_manifests(dir.path(), &backend).unwrap();
 
@@ -518,7 +518,7 @@ fn test_manifest_pubspec_yaml() {
         "name: myapp\ndependencies:\n  http: ^0.13.0\n  provider: ^6.0.0\ndev_dependencies:\n  flutter_test: any\n",
     ).unwrap();
 
-    let store = GraphStore::open(&dir.path().join("graph")).unwrap();
+    let store = GraphStore::open(&dir.path().join(infigraph_core::graph::names::STEM)).unwrap();
     let backend = KuzuBackend::from_store(store);
     let results = infigraph_core::manifest::index_manifests(dir.path(), &backend).unwrap();
 
@@ -547,7 +547,7 @@ fn test_manifest_packages_config() {
     )
     .unwrap();
 
-    let store = GraphStore::open(&dir.path().join("graph")).unwrap();
+    let store = GraphStore::open(&dir.path().join(infigraph_core::graph::names::STEM)).unwrap();
     let backend = KuzuBackend::from_store(store);
     let results = infigraph_core::manifest::index_manifests(dir.path(), &backend).unwrap();
 
@@ -885,7 +885,7 @@ fn test_check_status_display() {
 #[test]
 fn test_refactor_analyze_empty_graph() {
     let dir = tempfile::TempDir::new().unwrap();
-    let store = GraphStore::open(&dir.path().join("graph")).unwrap();
+    let store = GraphStore::open(&dir.path().join(infigraph_core::graph::names::STEM)).unwrap();
     let backend = KuzuBackend::from_store(store);
 
     let recs = infigraph_core::refactor::analyze(

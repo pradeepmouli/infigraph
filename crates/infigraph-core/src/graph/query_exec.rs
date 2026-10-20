@@ -65,7 +65,8 @@ mod tests {
     #[test]
     fn an_identifier_containing_a_backslash_round_trips_through_a_literal() {
         let dir = tempfile::tempdir().unwrap();
-        let store = crate::graph::GraphStore::open(&dir.path().join("graph")).unwrap();
+        let store =
+            crate::graph::GraphStore::open(&dir.path().join(crate::graph::names::STEM)).unwrap();
         let conn = store.connection().unwrap();
 
         let id = r"src\\win\\a.rs";
@@ -94,7 +95,7 @@ mod tests {
     #[test]
     fn local_exec_returns_the_same_rows_as_a_direct_connection() {
         let dir = tempfile::tempdir().unwrap();
-        let graph = dir.path().join("graph");
+        let graph = dir.path().join(crate::graph::names::STEM);
         let store = crate::graph::GraphStore::open(&graph).unwrap();
         let conn = store.connection().unwrap();
         conn.query(

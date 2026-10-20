@@ -46,7 +46,7 @@ struct TestGraph {
 
 fn setup_graph() -> TestGraph {
     let dir = tempfile::TempDir::new().unwrap();
-    let store = GraphStore::open(&dir.path().join("graph")).unwrap();
+    let store = GraphStore::open(&dir.path().join(infigraph_core::graph::names::STEM)).unwrap();
     let extractions = vec![
         FileExtraction {
             file: "src/api/handler.py".to_string(),
@@ -207,7 +207,7 @@ fn test_export_json() {
 #[test]
 fn test_export_empty_graph() {
     let dir = tempfile::TempDir::new().unwrap();
-    let store = GraphStore::open(&dir.path().join("graph")).unwrap();
+    let store = GraphStore::open(&dir.path().join(infigraph_core::graph::names::STEM)).unwrap();
     let backend = KuzuBackend::from_store(store);
 
     let mut buf = Vec::new();
@@ -344,7 +344,7 @@ fn test_extract_grpc_contracts_one_per_rpc() {
     let ext = infigraph_core::extract::extract_file("user.proto", src, pack).unwrap();
 
     let dir = tempfile::TempDir::new().unwrap();
-    let backend = KuzuBackend::open(&dir.path().join("graph")).unwrap();
+    let backend = KuzuBackend::open(&dir.path().join(infigraph_core::graph::names::STEM)).unwrap();
     backend.upsert_files_bulk(&[ext], true).unwrap();
 
     let contracts = infigraph_core::multi::grpc::extract_grpc_contracts(&backend);

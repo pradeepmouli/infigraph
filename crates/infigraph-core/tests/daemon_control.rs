@@ -214,6 +214,14 @@ impl infigraph_core::daemon::DocsHandle for Recorder {
     ) -> Result<infigraph_core::daemon_protocol::DocIndexStats, String> {
         Err("the Recorder test double does not index".to_string())
     }
+    fn index_doc_paths(
+        &self,
+        _upserts: &[String],
+        _removals: &[String],
+        _whole: bool,
+    ) -> Result<usize, String> {
+        Err("the Recorder test double does not index".to_string())
+    }
     fn ack_docs(
         &self,
         _acks: &[infigraph_core::daemon_protocol::DocAck],

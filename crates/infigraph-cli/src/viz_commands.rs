@@ -1,12 +1,12 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use infigraph_core::Infigraph;
+use infigraph_core::CodeIndex;
 use infigraph_languages::bundled_registry;
 
 pub(crate) fn cmd_visualize(root: &Path) -> Result<()> {
     let registry = bundled_registry()?;
-    let mut prism = Infigraph::open(root, registry)?;
+    let mut prism = CodeIndex::open(root, registry)?;
     prism.init()?;
 
     let backend = prism.backend().context("graph not initialized")?;
@@ -19,7 +19,7 @@ pub(crate) fn cmd_visualize(root: &Path) -> Result<()> {
 
 pub(crate) fn cmd_visualize_symbol(root: &Path, symbol_id: &str, depth: u32) -> Result<()> {
     let registry = bundled_registry()?;
-    let mut prism = Infigraph::open(root, registry)?;
+    let mut prism = CodeIndex::open(root, registry)?;
     prism.init()?;
 
     let backend = prism.backend().context("graph not initialized")?;
@@ -45,7 +45,7 @@ pub(crate) fn cmd_visualize_symbol(root: &Path, symbol_id: &str, depth: u32) -> 
 
 pub(crate) fn cmd_routes(root: &Path) -> Result<()> {
     let registry = bundled_registry()?;
-    let mut prism = Infigraph::open(root, registry)?;
+    let mut prism = CodeIndex::open(root, registry)?;
     prism.init_read_only()?;
 
     let backend = prism.backend().context("graph not initialized")?;

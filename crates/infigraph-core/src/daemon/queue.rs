@@ -1,4 +1,5 @@
 use crate::model::FileExtraction;
+use crate::pending_paths::{PendingPaths, Taken};
 use std::collections::{HashMap, HashSet};
 
 /// A single file's pending index-shaped work, before it's known whether the
@@ -75,10 +76,9 @@ pub(crate) struct DrainedQueue {
 /// create a queue and observe emptiness, nothing more.
 #[derive(Debug, Default)]
 pub struct IndexWorkQueue {
-    items: HashMap<String, PendingIndexItem>,
-    removals: HashSet<String>,
-    removal_prefixes: HashSet<String>,
-    whole_project: bool,
+    /// The coalescing rules every path queue shares; the items it keeps per
+    /// path are this queue's own.
+    paths: PendingPaths<PendingIndexItem>,
     waiters: Vec<Waiter>,
 }
 
@@ -96,8 +96,7 @@ impl IndexWorkQueue {
     /// `DaemonKuzuBackend`'s read-staleness fix.
     #[allow(dead_code)]
     pub(crate) fn add_raw(&mut self, rel_path: String) {
-        self.removals.remove(&rel_path);
-        self.items.insert(rel_path, PendingIndexItem::Raw);
+        self.paths.upsert(rel_path, PendingIndexItem::Raw);
     }
 
     /// Adds a pre-parsed extraction that needs both upsert and resolve
@@ -108,11 +107,15 @@ impl IndexWorkQueue {
     #[allow(dead_code)]
     pub(crate) fn add_structured(&mut self, extraction: FileExtraction) {
         let rel_path = extraction.file.clone();
-        self.removals.remove(&rel_path);
-        if matches!(self.items.get(&rel_path), Some(PendingIndexItem::Raw)) {
+        self.paths.cancel_removal(&rel_path);
+        if matches!(
+            self.paths.upserts().get(&rel_path),
+            Some(PendingIndexItem::Raw)
+        ) {
             return;
         }
-        self.items
+        self.paths
+            .upserts_mut()
             .insert(rel_path, PendingIndexItem::Structured(extraction));
     }
 
@@ -125,8 +128,9 @@ impl IndexWorkQueue {
     #[allow(dead_code)]
     pub(crate) fn add_resolve_only(&mut self, extraction: FileExtraction) {
         let rel_path = extraction.file.clone();
-        self.removals.remove(&rel_path);
-        self.items
+        self.paths.cancel_removal(&rel_path);
+        self.paths
+            .upserts_mut()
             .entry(rel_path)
             .or_insert(PendingIndexItem::ResolveOnly(extraction));
     }
@@ -136,8 +140,7 @@ impl IndexWorkQueue {
     /// sense regardless of what was queued moments before.
     #[allow(dead_code)]
     pub(crate) fn add_removal(&mut self, rel_path: String) {
-        self.items.remove(&rel_path);
-        self.removals.insert(rel_path);
+        self.paths.remove(rel_path);
     }
 
     /// Marks `rel_path` for removal exactly like `add_removal`, and
@@ -151,16 +154,15 @@ impl IndexWorkQueue {
     /// names specific files it already knows are files.
     #[allow(dead_code)]
     pub(crate) fn add_watch_removal(&mut self, rel_path: String) {
-        self.add_removal(rel_path.clone());
-        self.removal_prefixes.insert(rel_path);
+        self.paths.remove_tree(rel_path);
     }
 
     /// The drain step will additionally compute the full changed-file set
-    /// (a whole-project scan + hash-diff), same as `Infigraph::index()`
+    /// (a whole-project scan + hash-diff), same as `CodeIndex::index()`
     /// does today, in addition to whatever's explicitly queued.
     #[allow(dead_code)]
     pub(crate) fn mark_whole_project(&mut self) {
-        self.whole_project = true;
+        self.paths.mark_whole();
     }
 
     /// Registers a reply target for the next drain this queue produces.
@@ -172,32 +174,34 @@ impl IndexWorkQueue {
     /// Whether a whole-project pass is queued: the hash-diffing scan that
     /// finds anything a watcher missed.
     pub fn wants_whole_project(&self) -> bool {
-        self.whole_project
+        self.paths.wants_whole()
     }
 
     #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
-        self.items.is_empty()
-            && self.removals.is_empty()
-            && self.removal_prefixes.is_empty()
-            && !self.whole_project
-            && self.waiters.is_empty()
+        self.paths.is_empty() && self.waiters.is_empty()
     }
 
     /// Whether `rel` is queued to be indexed, for a test measuring how soon
     /// an edit is seen.
     pub fn holds_path(&self, rel: &str) -> bool {
-        self.items.contains_key(rel)
+        self.paths.upserts().contains_key(rel)
     }
 
     /// Returns and clears the full accumulated state in one shot.
     #[allow(dead_code)]
     pub(crate) fn drain(&mut self) -> DrainedQueue {
+        let Taken {
+            upserts,
+            removals,
+            removal_prefixes,
+            whole,
+        } = self.paths.take_in_place();
         DrainedQueue {
-            items: std::mem::take(&mut self.items),
-            removals: std::mem::take(&mut self.removals),
-            removal_prefixes: std::mem::take(&mut self.removal_prefixes),
-            whole_project: std::mem::replace(&mut self.whole_project, false),
+            items: upserts,
+            removals,
+            removal_prefixes,
+            whole_project: whole,
             waiters: std::mem::take(&mut self.waiters),
         }
     }
@@ -348,5 +352,113 @@ mod tests {
             drained.removal_prefixes.contains("sub"),
             "a watch removal must additionally be scanned as a possible directory prefix"
         );
+    }
+
+    /// What the coalescing contract needs from a queue, so one set of
+    /// assertions runs against every instance of it.
+    trait Coalescing {
+        fn upsert(&mut self, rel: &str);
+        fn remove(&mut self, rel: &str);
+        fn remove_tree(&mut self, rel: &str);
+        fn whole(&mut self);
+        /// (pending upserts sorted, removals sorted, whole-project asked)
+        fn state(&mut self) -> (Vec<String>, Vec<String>, bool);
+    }
+
+    impl Coalescing for PendingPaths<()> {
+        fn upsert(&mut self, rel: &str) {
+            PendingPaths::upsert(self, rel.to_string(), ());
+        }
+        fn remove(&mut self, rel: &str) {
+            PendingPaths::remove(self, rel.to_string());
+        }
+        fn remove_tree(&mut self, rel: &str) {
+            PendingPaths::remove_tree(self, rel.to_string());
+        }
+        fn whole(&mut self) {
+            self.mark_whole();
+        }
+        fn state(&mut self) -> (Vec<String>, Vec<String>, bool) {
+            let taken = self.take_in_place();
+            sorted(taken.upserts.into_keys(), taken.removals, taken.whole)
+        }
+    }
+
+    impl Coalescing for IndexWorkQueue {
+        fn upsert(&mut self, rel: &str) {
+            self.add_raw(rel.to_string());
+        }
+        fn remove(&mut self, rel: &str) {
+            self.add_removal(rel.to_string());
+        }
+        fn remove_tree(&mut self, rel: &str) {
+            self.add_watch_removal(rel.to_string());
+        }
+        fn whole(&mut self) {
+            self.mark_whole_project();
+        }
+        fn state(&mut self) -> (Vec<String>, Vec<String>, bool) {
+            let drained = self.drain();
+            sorted(
+                drained.items.into_keys(),
+                drained.removals,
+                drained.whole_project,
+            )
+        }
+    }
+
+    fn sorted(
+        upserts: impl Iterator<Item = String>,
+        removals: HashSet<String>,
+        whole: bool,
+    ) -> (Vec<String>, Vec<String>, bool) {
+        let mut upserts: Vec<String> = upserts.collect();
+        let mut removals: Vec<String> = removals.into_iter().collect();
+        upserts.sort();
+        removals.sort();
+        (upserts, removals, whole)
+    }
+
+    /// The rules a path queue must keep, whichever store it feeds.
+    fn the_coalescing_contract(mut q: impl Coalescing) {
+        // A removal wins over a pending upsert, and an upsert after a removal
+        // cancels it.
+        q.upsert("a.md");
+        q.remove("a.md");
+        q.remove("b.md");
+        q.upsert("b.md");
+        assert_eq!(
+            q.state(),
+            (vec!["b.md".to_string()], vec!["a.md".to_string()], false)
+        );
+
+        // A removed tree takes the pending upserts below `dir/`, not the
+        // siblings that share its prefix.
+        for p in ["dir/a.md", "dir/deep/b.md", "dir2/c.md", "dir.md"] {
+            q.upsert(p);
+        }
+        q.remove_tree("dir");
+        let (upserts, removals, whole) = q.state();
+        assert_eq!(upserts, ["dir.md", "dir2/c.md"]);
+        assert_eq!(removals, ["dir"]);
+        assert!(!whole);
+
+        // A whole-project ask survives later asks and is cleared by taking.
+        q.whole();
+        q.upsert("late.md");
+        let (upserts, _, whole) = q.state();
+        assert!(whole);
+        assert_eq!(upserts, ["late.md"]);
+        assert_eq!(q.state(), (vec![], vec![], false));
+    }
+
+    #[test]
+    fn the_pending_set_keeps_the_coalescing_contract() {
+        the_coalescing_contract(PendingPaths::<()>::new());
+    }
+
+    #[test]
+    fn the_code_queue_keeps_the_coalescing_contract() {
+        the_coalescing_contract(IndexWorkQueue::new());
     }
 }

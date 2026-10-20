@@ -461,7 +461,7 @@ fn test_graph_tools() {
     );
     let dot_tg = Path::new(&del_path).join(".infigraph");
     assert!(
-        !dot_tg.join("graph").exists(),
+        !dot_tg.join(infigraph_core::graph::names::STEM).exists(),
         ".infigraph/graph should be removed"
     );
 }

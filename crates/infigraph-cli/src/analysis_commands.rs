@@ -1,12 +1,12 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use infigraph_core::Infigraph;
+use infigraph_core::CodeIndex;
 use infigraph_languages::bundled_registry;
 
 pub(crate) fn cmd_architecture(root: &Path) -> Result<()> {
     let registry = bundled_registry()?;
-    let mut prism = Infigraph::open(root, registry)?;
+    let mut prism = CodeIndex::open(root, registry)?;
     prism.init()?;
 
     let backend = prism.backend().context("graph not initialized")?;
@@ -76,7 +76,7 @@ pub(crate) fn cmd_architecture(root: &Path) -> Result<()> {
 
 pub(crate) fn cmd_cluster(root: &Path) -> Result<()> {
     let registry = bundled_registry()?;
-    let mut prism = Infigraph::open(root, registry)?;
+    let mut prism = CodeIndex::open(root, registry)?;
     prism.init()?;
 
     let backend = prism.backend().context("graph not initialized")?;
@@ -89,7 +89,7 @@ pub(crate) fn cmd_cluster(root: &Path) -> Result<()> {
 
 pub(crate) fn cmd_detect_changes(root: &Path, base: &str, depth: u32) -> Result<()> {
     let registry = bundled_registry()?;
-    let mut prism = Infigraph::open(root, registry)?;
+    let mut prism = CodeIndex::open(root, registry)?;
     prism.init()?;
 
     let backend = prism.backend().context("graph not initialized")?;
@@ -128,7 +128,7 @@ pub(crate) fn cmd_security(
 
 pub(crate) fn cmd_complexity(root: &Path, threshold: u32, file: Option<&str>) -> Result<()> {
     let registry = bundled_registry()?;
-    let mut prism = Infigraph::open(root, registry)?;
+    let mut prism = CodeIndex::open(root, registry)?;
     prism.init_read_only()?;
 
     let backend = prism.backend().context("graph not initialized")?;
@@ -171,7 +171,7 @@ pub(crate) fn cmd_refactor(
     limit: usize,
 ) -> Result<()> {
     let registry = bundled_registry()?;
-    let mut prism = Infigraph::open(root, registry)?;
+    let mut prism = CodeIndex::open(root, registry)?;
     prism.init()?;
 
     let backend = prism.backend().context("not initialized")?;
@@ -202,7 +202,7 @@ pub(crate) fn cmd_semantic_diff(root: &Path, old_ref: &str, new_ref: &str) -> Re
 
 pub(crate) fn cmd_sequence(root: &Path, symbol_id: &str, depth: u32) -> Result<()> {
     let registry = bundled_registry()?;
-    let mut prism = Infigraph::open(root, registry)?;
+    let mut prism = CodeIndex::open(root, registry)?;
     prism.init_read_only()?;
     let backend = prism.backend().context("not initialized")?;
     let diagram = infigraph_core::sequence::generate_sequence_mermaid(backend, symbol_id, depth)?;
@@ -222,7 +222,7 @@ pub(crate) fn cmd_review(
     group: Option<&str>,
 ) -> Result<()> {
     let registry = bundled_registry()?;
-    let mut prism = Infigraph::open(root, registry)?;
+    let mut prism = CodeIndex::open(root, registry)?;
     prism.init_read_only()?;
     let backend = prism
         .backend()
@@ -278,7 +278,7 @@ pub(crate) fn cmd_check(
     use infigraph_core::check::{self, CheckSelection, CheckStatus};
 
     let registry = bundled_registry()?;
-    let mut prism = Infigraph::open(root, registry)?;
+    let mut prism = CodeIndex::open(root, registry)?;
     prism.init()?;
     let backend = prism
         .backend()
@@ -313,7 +313,7 @@ pub(crate) fn cmd_vulns(
     json: bool,
 ) -> Result<()> {
     let registry = bundled_registry()?;
-    let mut prism = Infigraph::open(root, registry)?;
+    let mut prism = CodeIndex::open(root, registry)?;
     prism.init()?;
     let backend = prism.backend().context("graph not initialized")?;
 
@@ -348,7 +348,7 @@ pub(crate) fn cmd_vulns(
 
 pub(crate) fn cmd_detect_patterns(root: &Path, pattern: Option<&str>, json: bool) -> Result<()> {
     let registry = bundled_registry()?;
-    let mut prism = Infigraph::open(root, registry)?;
+    let mut prism = CodeIndex::open(root, registry)?;
     prism.init()?;
     let backend = prism
         .backend()
@@ -430,7 +430,7 @@ pub(crate) fn cmd_bridges(root: &Path, kind: Option<&str>) -> Result<()> {
 
 pub(crate) fn cmd_clones(root: &Path, threshold: f64, limit: usize) -> Result<()> {
     let registry = bundled_registry()?;
-    let mut prism = Infigraph::open(root, registry)?;
+    let mut prism = CodeIndex::open(root, registry)?;
     prism.init()?;
 
     let backend = prism.backend().context("graph not initialized")?;
@@ -498,7 +498,7 @@ pub(crate) fn cmd_clones(root: &Path, threshold: f64, limit: usize) -> Result<()
 
 pub(crate) fn cmd_concerns(root: &Path, kind: Option<&str>) -> Result<()> {
     let registry = bundled_registry()?;
-    let mut prism = Infigraph::open(root, registry)?;
+    let mut prism = CodeIndex::open(root, registry)?;
     prism.init()?;
 
     let backend = prism.backend().context("graph not initialized")?;
@@ -525,7 +525,7 @@ pub(crate) fn cmd_config_bindings(
     profile: Option<&str>,
 ) -> Result<()> {
     let registry = bundled_registry()?;
-    let mut prism = Infigraph::open(root, registry)?;
+    let mut prism = CodeIndex::open(root, registry)?;
     prism.init()?;
 
     let backend = prism.backend().context("graph not initialized")?;
@@ -554,7 +554,7 @@ pub(crate) fn cmd_config_bindings(
 
 pub(crate) fn cmd_reflection(root: &Path, mechanism: Option<&str>) -> Result<()> {
     let registry = bundled_registry()?;
-    let mut prism = Infigraph::open(root, registry)?;
+    let mut prism = CodeIndex::open(root, registry)?;
     prism.init()?;
 
     let backend = prism.backend().context("graph not initialized")?;
@@ -587,7 +587,7 @@ pub(crate) fn cmd_taint(
     depth: u32,
 ) -> Result<()> {
     let registry = bundled_registry()?;
-    let mut prism = Infigraph::open(root, registry)?;
+    let mut prism = CodeIndex::open(root, registry)?;
     prism.init()?;
 
     let backend = prism.backend().context("graph not initialized")?;
@@ -635,7 +635,7 @@ pub(crate) fn cmd_taint(
 
 pub(crate) fn cmd_dynamic_urls(root: &Path) -> Result<()> {
     let registry = bundled_registry()?;
-    let mut prism = Infigraph::open(root, registry)?;
+    let mut prism = CodeIndex::open(root, registry)?;
     prism.init()?;
 
     let backend = prism.backend().context("graph not initialized")?;
@@ -651,7 +651,7 @@ pub(crate) fn cmd_dynamic_urls(root: &Path) -> Result<()> {
 
 pub(crate) fn cmd_path_traversal(root: &Path, depth: u32) -> Result<()> {
     let registry = bundled_registry()?;
-    let mut prism = Infigraph::open(root, registry)?;
+    let mut prism = CodeIndex::open(root, registry)?;
     prism.init()?;
 
     let backend = prism.backend().context("graph not initialized")?;
@@ -668,7 +668,7 @@ pub(crate) fn cmd_path_traversal(root: &Path, depth: u32) -> Result<()> {
 
 pub(crate) fn cmd_bridges_promote(root: &Path) -> Result<()> {
     let registry = bundled_registry()?;
-    let mut prism = Infigraph::open(root, registry)?;
+    let mut prism = CodeIndex::open(root, registry)?;
     prism.init()?;
     let backend = prism
         .backend()
@@ -710,7 +710,7 @@ mod tests {
     }
 
     fn index_project(root: &Path) {
-        let mut ig = Infigraph::open(root, bundled_registry().unwrap()).unwrap();
+        let mut ig = CodeIndex::open(root, bundled_registry().unwrap()).unwrap();
         ig.init().unwrap();
         ig.index().unwrap();
     }

@@ -80,7 +80,7 @@ struct TestEnv {
 impl TestEnv {
     fn new(extractions: &[FileExtraction]) -> Self {
         let dir = tempfile::TempDir::new().unwrap();
-        let store = GraphStore::open(&dir.path().join("graph")).unwrap();
+        let store = GraphStore::open(&dir.path().join(infigraph_core::graph::names::STEM)).unwrap();
         {
             let conn = store.connection().unwrap();
             let lock = store.write_lock().unwrap();

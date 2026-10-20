@@ -346,7 +346,9 @@ fn stop_daemon(root: &Path) {
 /// The graph half of the service. These tests are about the docs half, but
 /// the service requires a graph source.
 fn graph_source(root: &Path) -> infigraph_core::daemon::read_service::StoreSource {
-    let graph = root.join(".infigraph").join("graph");
+    let graph = root
+        .join(".infigraph")
+        .join(infigraph_core::graph::names::STEM);
     let store = Arc::new(GraphStore::open(&graph).unwrap());
     Arc::new(move || Some(store.clone()))
 }

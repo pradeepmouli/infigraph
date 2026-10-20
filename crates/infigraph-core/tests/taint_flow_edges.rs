@@ -58,7 +58,7 @@ fn edge(symbol: &str, sink: &str) -> TaintFlowEdge {
 #[test]
 fn replace_taint_flows_writes_every_flow_in_one_call() {
     let tmp = tempfile::tempdir().unwrap();
-    let backend = KuzuBackend::open(&tmp.path().join("graph")).unwrap();
+    let backend = KuzuBackend::open(&tmp.path().join(infigraph_core::graph::names::STEM)).unwrap();
     seed(&backend);
 
     let flows = vec![
@@ -83,7 +83,7 @@ fn replace_taint_flows_writes_every_flow_in_one_call() {
 #[test]
 fn replace_taint_flows_replaces_previous_flows() {
     let tmp = tempfile::tempdir().unwrap();
-    let backend = KuzuBackend::open(&tmp.path().join("graph")).unwrap();
+    let backend = KuzuBackend::open(&tmp.path().join(infigraph_core::graph::names::STEM)).unwrap();
     seed(&backend);
 
     backend
@@ -110,7 +110,7 @@ fn replace_taint_flows_replaces_previous_flows() {
 #[test]
 fn replace_taint_flows_with_no_flows_clears_previous_ones() {
     let tmp = tempfile::tempdir().unwrap();
-    let backend = KuzuBackend::open(&tmp.path().join("graph")).unwrap();
+    let backend = KuzuBackend::open(&tmp.path().join(infigraph_core::graph::names::STEM)).unwrap();
     seed(&backend);
 
     backend

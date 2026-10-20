@@ -1,5 +1,5 @@
 use infigraph_core::manifest::{DepEntry, ManifestResult};
-use infigraph_core::Infigraph;
+use infigraph_core::CodeIndex;
 use infigraph_languages::bundled_registry;
 
 #[test]
@@ -11,7 +11,7 @@ fn upsert_dependencies_creates_dependency_node_and_edge() {
     )
     .unwrap();
     let registry = bundled_registry().unwrap();
-    let mut infigraph = Infigraph::open(project_dir.path(), registry).unwrap();
+    let mut infigraph = CodeIndex::open(project_dir.path(), registry).unwrap();
     infigraph.init().unwrap();
     infigraph.index().unwrap();
 
@@ -50,7 +50,7 @@ fn upsert_dependencies_twice_keeps_one_depends_on_edge_and_updates_it() {
     )
     .unwrap();
     let registry = bundled_registry().unwrap();
-    let mut infigraph = Infigraph::open(project_dir.path(), registry).unwrap();
+    let mut infigraph = CodeIndex::open(project_dir.path(), registry).unwrap();
     infigraph.init().unwrap();
     infigraph.index().unwrap();
     let backend = infigraph.backend().unwrap();

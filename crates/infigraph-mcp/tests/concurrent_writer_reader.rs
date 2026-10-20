@@ -95,7 +95,9 @@ fn concurrent_reader_helper() {
     let stop = PathBuf::from(
         std::env::var_os(READER_STOP_ENV).expect("reader child needs a stop-sentinel path"),
     );
-    let db_path = root.join(".infigraph").join("graph");
+    let db_path = root
+        .join(".infigraph")
+        .join(infigraph_core::graph::names::STEM);
 
     let mut counts = ReaderCounts::default();
     let mut samples: Vec<String> = Vec::new();
@@ -236,7 +238,9 @@ fn parse_counts(stdout: &str) -> Option<ReaderCounts> {
 fn concurrent_writer_reader_raw_query_correctness_under_load() {
     let project = tempfile::tempdir().expect("project tmpdir");
     let root = project.path().to_path_buf();
-    let db_path = root.join(".infigraph").join("graph");
+    let db_path = root
+        .join(".infigraph")
+        .join(infigraph_core::graph::names::STEM);
     let stop_path = root.join(".infigraph").join("reader.stop");
 
     write_fixture(
@@ -247,7 +251,7 @@ fn concurrent_writer_reader_raw_query_correctness_under_load() {
     write_fixture(&root, "mod_churn.py", "def churn_fn_0():\n    pass\n");
     {
         let registry = infigraph_languages::bundled_registry().expect("bundled registry");
-        let mut prism = infigraph_core::Infigraph::open(&root, registry).expect("open initial");
+        let mut prism = infigraph_core::CodeIndex::open(&root, registry).expect("open initial");
         prism.init().expect("init initial");
         prism.index().expect("index");
     }
@@ -325,7 +329,7 @@ fn concurrent_writer_reader_raw_query_correctness_under_load() {
     // short window. ---
     {
         let registry = infigraph_languages::bundled_registry().expect("bundled registry writer");
-        let mut prism = infigraph_core::Infigraph::open(&root, registry).expect("open writer");
+        let mut prism = infigraph_core::CodeIndex::open(&root, registry).expect("open writer");
         prism.init().expect("init writer");
         let deadline = Instant::now() + WRITE_WINDOW;
         let mut i = 0usize;

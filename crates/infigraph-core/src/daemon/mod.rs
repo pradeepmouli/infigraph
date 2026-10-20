@@ -3,6 +3,7 @@ pub mod control;
 pub mod coordinator_port;
 pub(crate) mod drain;
 pub mod fault;
+pub mod idle_exit;
 pub mod lease;
 pub mod lifecycle;
 pub mod liveness;
@@ -29,7 +30,7 @@ use crate::daemon::task::Task;
 use crate::daemon_protocol::{WatchAction, WatchRole, WriteRequest, WriteResult};
 use crate::ops::{begin_index_op, IndexOpOutcome};
 use crate::watch::{config, producer, CodeWatch, WatchEvent, WatchEventKind};
-use crate::Infigraph;
+use crate::CodeIndex;
 use std::collections::VecDeque;
 
 /// How long one coordinator tick waits before looking again. The fsevent
@@ -393,7 +394,7 @@ fn current_on_disk_build_hash() -> Option<String> {
 
 /// Callback for in-process SCIP enrichment after a successful daemon full
 /// reindex, or when enrichment falls too far behind. It must NOT open an
-/// `Infigraph`/`Database` on the live graph path -- Kuzu only allows safe
+/// `CodeIndex`/`Database` on the live graph path -- Kuzu only allows safe
 /// concurrent access within one process's `Database` object, not across two,
 /// even in the same process -- so it writes by submitting a
 /// `WriteRequest::ScipImport`, which the coordinator serves on its own handle.
@@ -411,7 +412,7 @@ fn current_on_disk_build_hash() -> Option<String> {
 /// checkpoint for whatever synchronous, potentially long-running work the
 /// callback does (e.g. `run_scip_indexers`' between-indexer-launch check).
 ///
-/// It receives the project root, not the daemon's `Infigraph`: enrichment
+/// It receives the project root, not the daemon's `CodeIndex`: enrichment
 /// runs external indexers for minutes and submits its import as a request,
 /// so it never needs the graph -- and holding the prism for that long kept
 /// its `Database` alive past `poison_watch_db`, which is how a reopen came to
@@ -440,6 +441,25 @@ pub trait DocsHandle: Send + Sync {
         &self,
         full: bool,
     ) -> std::result::Result<crate::daemon_protocol::DocIndexStats, String>;
+    /// Index and drop the documents named by `WriteRequest::IndexDocPaths`,
+    /// with the same calling rules as [`DocsHandle::index_docs`]. Returns
+    /// how many documents it wrote or removed. Required, for the same reason.
+    fn index_doc_paths(
+        &self,
+        upserts: &[String],
+        removals: &[String],
+        whole: bool,
+    ) -> std::result::Result<usize, String>;
+    /// Called once, when the coordinator has its port: the handle through
+    /// which the daemon's own document watcher submits `IndexDocPaths` to
+    /// this coordinator, the way a client would. A handle with no watcher of
+    /// its own ignores it.
+    fn bind_submitter(
+        &self,
+        _submitter: coordinator_port::WriteSubmitter,
+        _cancel: CancellationToken,
+    ) {
+    }
     /// Record and forget entry acknowledgements for
     /// `WriteRequest::AckDocEntries`, with the same calling rules as
     /// [`DocsHandle::index_docs`]. Returns `(stored, dropped)`. Required, for
@@ -543,7 +563,7 @@ fn looks_like_a_project(dir: &Path) -> bool {
     // so a root that failed this check once would pass it forever after.
     // That is not hypothetical -- it let a test index 33,683 files across 57
     // sibling repositories, the exact outcome the check exists to prevent.
-    has_project_marker(dir) || dir.join(".infigraph").join("graph").exists()
+    has_project_marker(dir) || crate::graph::names::store_present(&dir.join(".infigraph"))
 }
 
 /// The durable markers only: a VCS root in any form, or a build manifest.
@@ -640,14 +660,14 @@ pub fn ensure_watchable_root(root: &Path) -> Result<()> {
     )
 }
 
-/// A read-only view of the coordinator's *current* `Infigraph`, shared with
+/// A read-only view of the coordinator's *current* `CodeIndex`, shared with
 /// the daemon's read service.
 ///
 /// `Option` because the coordinator opens its prism lazily and drops it
 /// again on `poison_watch_db`; the read service must cope with both.
-pub type PrismBeacon = Arc<Mutex<Option<Arc<Infigraph>>>>;
+pub type PrismBeacon = Arc<Mutex<Option<Arc<CodeIndex>>>>;
 
-/// The watch session's shared `Infigraph`, together with the beacon that
+/// The watch session's shared `CodeIndex`, together with the beacon that
 /// publishes it to the read service.
 ///
 /// A newtype rather than a bare `Option<Arc<Infigraph>>` so that publishing
@@ -659,11 +679,11 @@ pub type PrismBeacon = Arc<Mutex<Option<Arc<Infigraph>>>>;
 /// rows, no error. Every mutation here goes through `set`/`clear`, which
 /// update the beacon in the same breath.
 pub(crate) struct HeldPrism {
-    held: Option<Arc<Infigraph>>,
+    held: Option<Arc<CodeIndex>>,
     beacon: PrismBeacon,
     /// The store `clear` let go of, for as long as anything else holds it.
-    /// `GraphStore` rather than `Infigraph` because the store owns the
-    /// `Database` and is shared on its own (`Infigraph::graph_store`).
+    /// `GraphStore` rather than `CodeIndex` because the store owns the
+    /// `Database` and is shared on its own (`CodeIndex::graph_store`).
     retired: Option<std::sync::Weak<crate::graph::GraphStore>>,
     /// The graph file `held` was opened on -- see [`HeldPrism::graph_replaced`].
     graph_identity: Option<PathIdentity>,
@@ -688,11 +708,11 @@ impl HeldPrism {
         self.beacon.clone()
     }
 
-    pub(crate) fn current(&self) -> Option<Arc<Infigraph>> {
+    pub(crate) fn current(&self) -> Option<Arc<CodeIndex>> {
         self.held.clone()
     }
 
-    pub(crate) fn as_ref(&self) -> Option<&Arc<Infigraph>> {
+    pub(crate) fn as_ref(&self) -> Option<&Arc<CodeIndex>> {
         self.held.as_ref()
     }
 
@@ -700,7 +720,7 @@ impl HeldPrism {
         self.held.is_none()
     }
 
-    pub(crate) fn set(&mut self, prism: Arc<Infigraph>, graph_path: &Path) {
+    pub(crate) fn set(&mut self, prism: Arc<CodeIndex>, graph_path: &Path) {
         self.graph_identity = path_identity(graph_path);
         self.held = Some(Arc::clone(&prism));
         *self.beacon.lock().unwrap_or_else(|e| e.into_inner()) = Some(prism);
@@ -839,10 +859,20 @@ where
     // through. Owned here, like `liveness`, so a #187 rebind keeps it.
     let (port, port_rx) =
         coordinator_port::CoordinatorPort::new(idle.grace_secs, idle.check_secs.max(1));
-    if docs_control.is_some() {
+    if serve_requests {
+        // A daemon is running again: the last one's idle exit is history.
+        idle_exit::clear(root);
+    }
+    if let Some(docs) = &docs_control {
         port.state.set_role(
             WatchRole::Docs,
             crate::daemon::read_protocol::RoleState::Starting,
+        );
+        // The document watcher submits its index runs to this coordinator
+        // like any client, so a docs run and a code run share one door.
+        docs.bind_submitter(
+            coordinator_port::WriteSubmitter::new(port.clone()),
+            daemon_token.clone(),
         );
     }
     let mut bind_read_service: Box<dyn FnMut() -> Option<read_service::ReadService>> =
@@ -906,7 +936,7 @@ where
 
     // Build the registry ONCE for the whole watch session (#58): it serves
     // both file-extension filtering here and every `watch_db` open below
-    // via `Infigraph::open_shared`. It used to be built twice serially
+    // via `CodeIndex::open_shared`. It used to be built twice serially
     // (filter + first drain's open), which alone consumed ~5s in debug
     // builds and pushed the daemon's first request reply past callers'
     // timeouts. The full-reindex side-path build keeps its own fresh
@@ -956,7 +986,7 @@ where
     let mut last_fold_skip: Option<String> = None;
     // What the graph weighed at the last growth sample, and whether a fold
     // was attempted since -- see `growth_note` (#166).
-    let live_graph = root.join(".infigraph").join("graph");
+    let live_graph = root.join(".infigraph").join(crate::graph::names::STEM);
     let mut growth_sample = (
         std::time::Instant::now(),
         crate::graph::store_util::graph_family_bytes(&live_graph),
@@ -978,7 +1008,7 @@ where
     // #183: the live graph file, for the compaction escalation check below.
     // Derived once rather than per tick -- it is two `join`s, but the check
     // runs every `COORDINATOR_TICK`.
-    let graph_path = infigraph_dir.join("graph");
+    let graph_path = infigraph_dir.join(crate::graph::names::STEM);
 
     // R3.3.5's dirty-set recovery now runs inside `run_producer` (once per
     // producer start), not here -- it is watch-side recovery, and keeping a
@@ -1025,9 +1055,12 @@ where
     // fsevents, periodic ticks and further requests for its whole duration.
     // One worker is enough -- `drain_in_flight` allows at most one drain at
     // a time, and the drain itself is a `spawn_blocking` task.
+    // Timers on: the shutdown bounds its wait for a started docs write with
+    // `tokio::time::timeout`.
     let drain_rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(1)
         .thread_name("infigraph-drain")
+        .enable_time()
         .build()?;
     let mut drain_in_flight: Option<InFlightDrain> = None;
     let mut full_reindex_in_flight: Option<PendingFullReindex> = None;
@@ -1180,11 +1213,15 @@ where
             let work_in_flight = work_in_flight!();
             let idle_for = liveness.idle_for(liveness::now_secs());
             if liveness::idle_exit_due(idle_for, idle_grace, work_in_flight) {
+                let idle_secs = idle_for.map(|d| d.as_secs()).unwrap_or(0);
                 eprintln!(
                     "[watch] idle for {}s with no lease on {} -- shutting down",
-                    idle_for.map(|d| d.as_secs()).unwrap_or(0),
+                    idle_secs,
                     root.display()
                 );
+                // So "no watcher running" afterwards says why (it left on
+                // purpose), until the next daemon clears it.
+                idle_exit::record(root, idle_secs);
                 break;
             }
         }
@@ -1886,7 +1923,7 @@ where
                     }
                     Routed::Started(PendingWork::ScipImport(p)) => scip_import_in_flight = Some(p),
                     Routed::Started(PendingWork::DocsWrite(p)) => docs_write_in_flight = Some(p),
-                    Routed::NotYet(request, reply) => deferred.push_back((request, reply)),
+                    Routed::NotYet(request, reply) => defer_write(&mut deferred, request, reply),
                 }
             }
             // A rebuild that was waiting for a slot and whose request is
@@ -2050,7 +2087,7 @@ where
                 // #204: routed on the next iteration, with everything else
                 // that is waiting to start.
                 coordinator_port::PortMsg::Write { request, reply } => {
-                    deferred.push_back((request, reply));
+                    defer_write(&mut deferred, request, reply);
                 }
                 coordinator_port::PortMsg::Control(coordinator_port::ControlMsg {
                     request,
@@ -2149,10 +2186,31 @@ where
     if scip_embeddings_pending_since.take().is_some() {
         reconcile_embeddings_after_scip(root, &held_prism);
     }
-    // A docs index that started finishes and answers its client (#204 D3:
-    // started work is never cancelled).
+    // A docs index that started gets `DOCS_WRITE_STOP_GRACE` to finish and
+    // answer its client (#204 D3: started work is never cancelled). It cannot
+    // be interrupted, so an unbounded wait made the whole daemon's shutdown
+    // (SIGTERM, `daemon-stop`) wait for it: a daemon stuck inside one ignored
+    // every stop for minutes and had to be killed with SIGKILL. Past the
+    // grace it is left to end with the process, and its client is told so.
+    let mut abandoned_docs_write = false;
     if let Some(PendingDocsWrite { task, reply, what }) = docs_write_in_flight.take() {
-        finish_docs_write(reply, what, drain_rt.block_on(task.join()));
+        // Built inside the runtime: `tokio::time::timeout` registers its timer
+        // when it is created, and outside a runtime context that panics.
+        match drain_rt
+            .block_on(async { tokio::time::timeout(DOCS_WRITE_STOP_GRACE, task.join()).await })
+        {
+            Ok(joined) => finish_docs_write(reply, what, joined),
+            Err(_) => {
+                eprintln!(
+                    "[daemon] {} {what} is still running {}s after a stop was asked; not \
+                     waiting for it any longer",
+                    crate::watch::log_stamp(),
+                    DOCS_WRITE_STOP_GRACE.as_secs()
+                );
+                drop(reply);
+                abandoned_docs_write = true;
+            }
+        }
     }
 
     // Last, so the joins above have answered their clients: let every
@@ -2165,6 +2223,12 @@ where
         );
     }
 
+    // Dropping the runtime would wait for the blocking thread of a docs write
+    // that was given up on.
+    if abandoned_docs_write {
+        drain_rt.shutdown_background();
+    }
+
     Ok(())
 }
 
@@ -2174,7 +2238,7 @@ where
 /// answers them, and `WriteReply`'s `Drop` answers them if it panics.
 struct InFlightDrain {
     handle: tokio::task::JoinHandle<DrainTaskOutput>,
-    prism: Arc<Infigraph>,
+    prism: Arc<CodeIndex>,
     /// R3.3.5: paths this drain's `DrainedQueue.removals` named, captured
     /// before the queue moved into the task -- cleared from the persistent
     /// dirty set alongside `outcome.extractions` once the drain confirms
@@ -2249,12 +2313,12 @@ fn finish_drain(
 
 // (open_transient below opens a short-lived Infigraph instance for batch work.)
 
-fn open_transient(root: &Path, registry: &Arc<crate::lang::LanguageRegistry>) -> Result<Infigraph> {
+fn open_transient(root: &Path, registry: &Arc<crate::lang::LanguageRegistry>) -> Result<CodeIndex> {
     // Reuses the watch session's already-built registry (#58): building the
     // 62-pack registry takes seconds in debug builds, and doing it again
     // here put the daemon's first request reply right at the edge of
-    // callers' timeouts. `Infigraph::open_shared` exists for exactly this.
-    let mut prism = Infigraph::open_shared(root, Arc::clone(registry))?;
+    // callers' timeouts. `CodeIndex::open_shared` exists for exactly this.
+    let mut prism = CodeIndex::open_shared(root, Arc::clone(registry))?;
     prism.init()?;
     Ok(prism)
 }
@@ -2269,7 +2333,7 @@ fn open_transient(root: &Path, registry: &Arc<crate::lang::LanguageRegistry>) ->
 /// --full` against a project this watcher is also watching).
 ///
 /// Returns an `Arc` clone rather than a borrow so the background drain task
-/// can hold the *same* `Infigraph` -- and therefore the same in-process
+/// can hold the *same* `CodeIndex` -- and therefore the same in-process
 /// `kuzu::Database` -- that the loop thread keeps using. Each graph
 /// operation opens its own short-lived `Connection` from that shared
 /// `Database` (see `GraphStore::connection`), which is the concurrency
@@ -2279,7 +2343,7 @@ fn watch_db(
     root: &Path,
     registry: &Arc<crate::lang::LanguageRegistry>,
     held: &mut HeldPrism,
-) -> Result<Arc<Infigraph>> {
+) -> Result<Arc<CodeIndex>> {
     if cfg!(windows) {
         return reopen_watch_db(root, registry, held);
     }
@@ -2292,7 +2356,7 @@ fn open_watch_db(
     root: &Path,
     registry: &Arc<crate::lang::LanguageRegistry>,
     held: &mut HeldPrism,
-) -> Result<Arc<Infigraph>> {
+) -> Result<Arc<CodeIndex>> {
     if held.is_none() {
         let opened = held
             .wait_for_retired_store(RETIRED_STORE_WAIT)
@@ -2320,21 +2384,21 @@ fn reopen_watch_db(
     root: &Path,
     registry: &Arc<crate::lang::LanguageRegistry>,
     held: &mut HeldPrism,
-) -> Result<Arc<Infigraph>> {
+) -> Result<Arc<CodeIndex>> {
     poison_watch_db(held);
     open_watch_db(root, registry, held)
 }
 
 /// The live graph file the daemon's prism opens.
 fn graph_path(root: &Path) -> PathBuf {
-    root.join(".infigraph").join("graph")
+    root.join(".infigraph").join(crate::graph::names::STEM)
 }
 
 /// Publish how an open of the daemon's graph went (#165): a failure the
 /// backoff cannot outwait latches an `OpenFailed` fault -- including a
 /// released handle that never lets go, which is how a daemon ends up
 /// pinning a deleted graph -- and a success clears it.
-fn note_open(root: &Path, opened: Result<Infigraph>) -> Result<Infigraph> {
+fn note_open(root: &Path, opened: Result<CodeIndex>) -> Result<CodeIndex> {
     let infigraph_dir = root.join(".infigraph");
     match &opened {
         Ok(_) => fault::clear(&infigraph_dir, Some(fault::FaultClass::OpenFailed)),
@@ -2523,7 +2587,7 @@ fn serve_request_locked(
 /// One log line per failed reopen, carrying the attempt count and the
 /// backoff delay so a stuck holder shows up in the daemon log as an
 /// escalating series rather than an identical line every tick. `{e:#}`
-/// prints the whole context chain, which is where `Infigraph::init`
+/// prints the whole context chain, which is where `CodeIndex::init`
 /// names the lock holder's pid.
 fn log_reopen_failure(root: &Path, tag: &str, backoff: &mut ReopenBackoff, e: &anyhow::Error) {
     let delay = backoff.failed(root);
@@ -2646,7 +2710,7 @@ fn build_full_reindex(
     registry: crate::lang::LanguageRegistry,
     token: &CancellationToken,
 ) -> Result<FullReindexBuildOutcome> {
-    const REBUILDING_NAME: &str = "graph.rebuilding";
+    const REBUILDING_NAME: &str = crate::graph::names::REBUILDING;
     let rebuilding_path = root.join(".infigraph").join(REBUILDING_NAME);
 
     // Clean up any stale leftover from a previously-interrupted rebuild
@@ -2665,7 +2729,7 @@ fn build_full_reindex(
         ));
     }
 
-    let build_result = Infigraph::open_local_kuzu_at(root, registry, rebuilding_path.clone())
+    let build_result = CodeIndex::open_local_kuzu_at(root, registry, rebuilding_path.clone())
         .and_then(|fresh| {
             let backend = fresh
                 .backend()
@@ -2901,7 +2965,7 @@ fn request_internal_rebuild(deferred: &mut VecDeque<(WriteRequest, WriteReply)>,
 
 /// Loop-thread entry point for a `WriteRequest::ScipImport`. Mirrors
 /// `try_start_full_reindex`'s shape, but much simpler: a SCIP import writes
-/// directly into the live graph in place (`Infigraph::import_scip`'s own
+/// directly into the live graph in place (`CodeIndex::import_scip`'s own
 /// bulk COPY/UNWIND, protected by `GraphStore::write_lock`), there is no
 /// build-then-swap -- so no snapshot/retire/rollback machinery is needed
 /// here, only the background-task-plus-reply plumbing.
@@ -2927,7 +2991,7 @@ fn try_start_scip_import(
 ) -> std::result::Result<Option<PendingScipImport>, WriteReply> {
     // Same "never overlap" reasoning as `try_start_full_reindex`'s gate --
     // this writes the same live graph a drain or a full reindex writes.
-    // Two SCIP imports at once are also refused: `Infigraph::import_scip`
+    // Two SCIP imports at once are also refused: `CodeIndex::import_scip`
     // itself serializes via `GraphStore::write_lock`, so a second one would
     // just block inside the background task rather than run concurrently,
     // silently doubling this loop's in-flight bookkeeping for no benefit.
@@ -2943,7 +3007,7 @@ fn try_start_scip_import(
         return Err(reply);
     }
 
-    // Needs the daemon's own already-open connection -- `Infigraph::
+    // Needs the daemon's own already-open connection -- `CodeIndex::
     // import_scip` must not open a second `Database` on the same live graph
     // path (Kuzu only allows safe concurrent access within one process's
     // `Database` object, not across two, even in the same process).
@@ -3002,6 +3066,88 @@ fn try_start_scip_import(
     }))
 }
 
+/// How long a stop waits for a docs write that is already running.
+const DOCS_WRITE_STOP_GRACE: Duration = Duration::from_secs(20);
+
+/// Puts a write that cannot start yet at the back of the line. An
+/// `IndexDocPaths` joins the one already waiting instead (the paths merge, the
+/// newer ask winning, as in `PendingPaths::merge`), so a burst of edits behind
+/// a running index is one run when its turn comes, not one per edit. The
+/// joined request's client is told at once that it was merged: it asked the
+/// daemon to look at those paths, and the waiting request will.
+fn defer_write(
+    deferred: &mut std::collections::VecDeque<(WriteRequest, WriteReply)>,
+    request: WriteRequest,
+    reply: WriteReply,
+) {
+    if let WriteRequest::IndexDocPaths {
+        upserts,
+        removals,
+        whole,
+    } = request
+    {
+        let waiting = deferred.iter_mut().find_map(|(r, _)| match r {
+            WriteRequest::IndexDocPaths {
+                upserts,
+                removals,
+                whole,
+            } => Some((upserts, removals, whole)),
+            _ => None,
+        });
+        if let Some((waiting_upserts, waiting_removals, waiting_whole)) = waiting {
+            let mut pending = crate::pending_paths::PendingPaths::<()>::new();
+            for rel in std::mem::take(waiting_removals) {
+                pending.remove_tree(rel);
+            }
+            for rel in std::mem::take(waiting_upserts) {
+                pending.upsert(rel, ());
+            }
+            let mut newer = crate::pending_paths::PendingPaths::<()>::new();
+            for rel in removals {
+                newer.remove_tree(rel);
+            }
+            for rel in upserts {
+                newer.upsert(rel, ());
+            }
+            if whole {
+                newer.mark_whole();
+            }
+            if *waiting_whole {
+                pending.mark_whole();
+            }
+            pending.merge(newer);
+            let crate::pending_paths::Taken {
+                upserts: merged_upserts,
+                removals: merged_removals,
+                whole: merged_whole,
+                ..
+            } = pending.take();
+            let mut merged_upserts: Vec<String> = merged_upserts.into_keys().collect();
+            let mut merged_removals: Vec<String> = merged_removals.into_iter().collect();
+            merged_upserts.sort();
+            merged_removals.sort();
+            *waiting_upserts = merged_upserts;
+            *waiting_removals = merged_removals;
+            *waiting_whole = merged_whole;
+            reply.send(WriteResult::Ok {
+                total_files: 0,
+                indexed_files: 0,
+            });
+            return;
+        }
+        deferred.push_back((
+            WriteRequest::IndexDocPaths {
+                upserts,
+                removals,
+                whole,
+            },
+            reply,
+        ));
+        return;
+    }
+    deferred.push_back((request, reply));
+}
+
 /// Loop-thread entry point for `WriteRequest::IndexDocs` and
 /// `AckDocEntries`: hands it to the docs handle on a background task, like a
 /// SCIP import, so a first index (embeddings included, minutes on a large
@@ -3038,6 +3184,16 @@ fn try_start_docs_write(
                 .ack_docs(&acks, &drop)
                 .map(|(stored, dropped)| WriteResult::DocsAcked { stored, dropped }),
             WriteRequest::IndexDocs { full } => docs.index_docs(full).map(WriteResult::DocsIndexed),
+            WriteRequest::IndexDocPaths {
+                upserts,
+                removals,
+                whole,
+            } => docs
+                .index_doc_paths(&upserts, &removals, whole)
+                .map(|files| WriteResult::Ok {
+                    total_files: upserts.len() + removals.len(),
+                    indexed_files: files,
+                }),
             other => Err(format!("{} is not a docs write", other.kind())),
         })
     };
@@ -3245,8 +3401,8 @@ fn swap_in_full_reindex(
         }
     };
 
-    const LIVE_NAME: &str = "graph";
-    const REBUILDING_NAME: &str = "graph.rebuilding";
+    const LIVE_NAME: &str = crate::graph::names::STEM;
+    const REBUILDING_NAME: &str = crate::graph::names::REBUILDING;
     let infigraph_dir = root.join(".infigraph");
     let rebuilding_path = infigraph_dir.join(REBUILDING_NAME);
     let live_path = infigraph_dir.join(LIVE_NAME);
@@ -3264,7 +3420,7 @@ fn swap_in_full_reindex(
     // down re-acquires this same lock through `GraphStore`, so holding it
     // any wider would deadlock against ourselves.
     let graph_lock = match crate::lockfile::acquire(
-        &live_path.with_extension("lock"),
+        &crate::graph::db_lock_path(&live_path),
         "full-reindex-swap",
         Duration::from_secs(5),
     ) {
@@ -3592,7 +3748,7 @@ fn recover_or_quarantine_swapped_in_graph_with(
     probe: impl Fn(&Path) -> bool,
 ) -> SwapReopen {
     match crate::lockfile::acquire(
-        &live_path.with_extension("lock"),
+        &crate::graph::db_lock_path(live_path),
         "full-reindex-rollback",
         std::time::Duration::from_secs(5),
     ) {
@@ -3705,7 +3861,7 @@ where
             let mut q = queue.lock().unwrap();
             let mut rel_paths = Vec::with_capacity(paths.len());
             for p in paths {
-                // `p` may be absolute -- `Infigraph::index_file`/`index_files`
+                // `p` may be absolute -- `CodeIndex::index_file`/`index_files`
                 // both forward the caller's path verbatim (absolute paths are
                 // an explicitly documented option), and `extract_paths` joins
                 // it onto `root` unnormalized, which for an absolute path is
@@ -3846,7 +4002,9 @@ where
                 reply,
             ),
         },
-        docs_write @ (WriteRequest::IndexDocs { .. } | WriteRequest::AckDocEntries { .. }) => {
+        docs_write @ (WriteRequest::IndexDocs { .. }
+        | WriteRequest::IndexDocPaths { .. }
+        | WriteRequest::AckDocEntries { .. }) => {
             match try_start_docs_write(
                 docs,
                 docs_write,
@@ -4085,7 +4243,7 @@ fn read_policy(root: &Path) -> [bool; 2] {
 }
 
 /// Returns true if the file has any resolved CALLS edges to/from symbols in other files.
-fn has_cross_file_calls(prism: &Infigraph, rel_path: &str) -> bool {
+fn has_cross_file_calls(prism: &CodeIndex, rel_path: &str) -> bool {
     let backend = match prism.backend() {
         Some(b) => b,
         None => return false,
@@ -4294,7 +4452,7 @@ mod tests {
 
         // What a local-backend `index --full` amounts to: another file now
         // answers to the same path.
-        let aside = root.join("graph.aside");
+        let aside = root.join(crate::graph::names::ASIDE);
         std::fs::rename(&graph, &aside).unwrap();
         std::fs::copy(&aside, &graph).unwrap();
         assert!(held.graph_replaced(&graph));
@@ -4309,7 +4467,9 @@ mod tests {
     #[test]
     fn a_released_store_still_held_elsewhere_blocks_a_reopen_until_dropped() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(crate::graph::GraphStore::open(&dir.path().join("graph")).unwrap());
+        let store = Arc::new(
+            crate::graph::GraphStore::open(&dir.path().join(crate::graph::names::STEM)).unwrap(),
+        );
         let mut held = HeldPrism::new();
         held.retired = Some(Arc::downgrade(&store));
 
@@ -4396,7 +4556,7 @@ mod tests {
     fn escalation_fires_on_the_byte_ratio_alone() {
         let tmp = tempfile::tempdir().unwrap();
         let infigraph_dir = crate::graph::store_util::floorless_infigraph_dir(tmp.path());
-        let graph_path = infigraph_dir.join("graph");
+        let graph_path = infigraph_dir.join(crate::graph::names::STEM);
         std::fs::write(&graph_path, vec![0u8; 4096]).unwrap();
         crate::graph::stamp_healthy_graph_size(&infigraph_dir, &graph_path);
         std::fs::write(&graph_path, vec![0u8; 4096 * 6]).unwrap();
@@ -4411,7 +4571,7 @@ mod tests {
     fn escalation_does_not_fire_below_the_threshold() {
         let tmp = tempfile::tempdir().unwrap();
         let infigraph_dir = crate::graph::store_util::floorless_infigraph_dir(tmp.path());
-        let graph_path = infigraph_dir.join("graph");
+        let graph_path = infigraph_dir.join(crate::graph::names::STEM);
         std::fs::write(&graph_path, vec![0u8; 4096]).unwrap();
         crate::graph::stamp_healthy_graph_size(&infigraph_dir, &graph_path);
         std::fs::write(&graph_path, vec![0u8; 4096 * 3]).unwrap();
@@ -4436,7 +4596,7 @@ mod tests {
             "[graph]\ngrowth_min_bytes = 1000000\n",
         )
         .unwrap();
-        let graph_path = infigraph_dir.join("graph");
+        let graph_path = infigraph_dir.join(crate::graph::names::STEM);
         std::fs::write(&graph_path, vec![0u8; 4096]).unwrap();
         crate::graph::stamp_healthy_graph_size(&infigraph_dir, &graph_path);
 
@@ -4663,7 +4823,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         // Never initialized: the drain fails at once ("graph not initialized").
-        let prism = Infigraph::open(root, crate::lang::LanguageRegistry::new()).unwrap();
+        let prism = CodeIndex::open(root, crate::lang::LanguageRegistry::new()).unwrap();
 
         let mut queue = crate::daemon::queue::IndexWorkQueue::new();
         let mut receivers = Vec::new();
@@ -4692,7 +4852,7 @@ mod tests {
     /// Regression test for a final-review Critical finding: `WriteRequest::Index
     /// { paths: Some(paths) }` used to enqueue each path via
     /// `p.to_string_lossy()` without stripping `root` first, so an absolute
-    /// path -- an explicitly documented option on `Infigraph::index_file`/
+    /// path -- an explicitly documented option on `CodeIndex::index_file`/
     /// `index_files`, both of which forward the caller's path verbatim into
     /// this same request type -- ended up keyed by its absolute string in
     /// the queue. `extract_paths` then joins that onto `root`, which for an
@@ -4929,7 +5089,10 @@ mod tests {
         );
         assert!(router.held.is_none(), "the graph must not have been opened");
         assert!(
-            !root.join(".infigraph").join("graph").exists(),
+            !root
+                .join(".infigraph")
+                .join(crate::graph::names::STEM)
+                .exists(),
             "no graph file may have been created by a reopen attempt"
         );
     }
@@ -5048,6 +5211,14 @@ mod tests {
         ) -> std::result::Result<crate::daemon_protocol::DocIndexStats, String> {
             (self.0)(full)
         }
+        fn index_doc_paths(
+            &self,
+            _upserts: &[String],
+            _removals: &[String],
+            _whole: bool,
+        ) -> std::result::Result<usize, String> {
+            Ok(2)
+        }
         fn ack_docs(
             &self,
             acks: &[crate::daemon_protocol::DocAck],
@@ -5130,6 +5301,96 @@ mod tests {
             running.reply,
             running.what,
             router.drain_rt.block_on(running.task.join()),
+        );
+    }
+
+    fn doc_paths(upserts: &[&str], removals: &[&str]) -> WriteRequest {
+        WriteRequest::IndexDocPaths {
+            upserts: upserts.iter().map(|s| s.to_string()).collect(),
+            removals: removals.iter().map(|s| s.to_string()).collect(),
+            whole: false,
+        }
+    }
+
+    /// Requests for paths that wait behind a running docs write are one
+    /// request when their turn comes: the paths merge, a removal beats an
+    /// older upsert of the same path, and the client of a merged request is
+    /// answered at once.
+    #[test]
+    fn index_doc_paths_requests_waiting_their_turn_coalesce_into_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut router = Router::with_docs(
+            tmp.path(),
+            Arc::new(FakeDocs(|_| {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                Ok(Default::default())
+            })),
+        );
+        let (_, _running_rx) = router.route_new(WriteRequest::IndexDocs { full: false });
+        assert!(router.docs_write.is_some());
+
+        let mut deferred = std::collections::VecDeque::new();
+        let mut merged_rxs = Vec::new();
+        for request in [
+            doc_paths(&["a.md", "dir/b.md"], &[]),
+            doc_paths(&["c.md"], &["a.md"]),
+            doc_paths(&["dir2/d.md"], &["dir"]),
+        ] {
+            let (routed, rx) = router.route_new(request);
+            let Routed::NotYet(request, reply) = routed else {
+                panic!("a docs write behind a running one must wait");
+            };
+            defer_write(&mut deferred, request, reply);
+            merged_rxs.push(rx);
+        }
+
+        assert_eq!(deferred.len(), 1, "three waiting asks, one request");
+        assert_eq!(
+            deferred[0].0,
+            doc_paths(&["c.md", "dir2/d.md"], &["a.md", "dir"]),
+            "the newer asks win: a.md and dir/b.md are gone, c.md and dir2/d.md are in"
+        );
+        for rx in &merged_rxs[1..] {
+            assert_eq!(
+                rx.try_recv().unwrap(),
+                WriteResult::Ok {
+                    total_files: 0,
+                    indexed_files: 0
+                },
+                "a request folded into a waiting one is answered at once"
+            );
+        }
+        assert!(
+            merged_rxs[0].try_recv().is_err(),
+            "the request that stayed in line is answered when it runs"
+        );
+        let running = router.docs_write.take().unwrap();
+        finish_docs_write(
+            running.reply,
+            running.what,
+            router.drain_rt.block_on(running.task.join()),
+        );
+    }
+
+    #[test]
+    fn index_doc_paths_runs_on_the_docs_handle_and_reports_whether_it_wrote() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut router =
+            Router::with_docs(tmp.path(), Arc::new(FakeDocs(|_| Ok(Default::default()))));
+        let (routed, rx) = router.route_new(doc_paths(&["a.md"], &["old"]));
+        assert!(matches!(routed, Routed::Done));
+        let running = router.docs_write.take().expect("a background docs write");
+        finish_docs_write(
+            running.reply,
+            running.what,
+            router.drain_rt.block_on(running.task.join()),
+        );
+        assert_eq!(
+            rx.recv().unwrap(),
+            WriteResult::Ok {
+                total_files: 2,
+                indexed_files: 2
+            }
         );
     }
 
@@ -5381,7 +5642,7 @@ mod root_identity_tests {
 /// #148: the full-reindex swap is the last quarantine site that used to
 /// infer a corruption verdict from a single failed open in a single process
 /// -- the defect class fixed for the read path in 5818aa1 and for
-/// `Infigraph::init` in d511a0b. The probe is injected here for the reason
+/// `CodeIndex::init` in d511a0b. The probe is injected here for the reason
 /// [`crate::probe`] documents: in a test binary `current_exe()` is libtest's
 /// harness, so the real probe re-runs the whole suite instead of probing.
 #[cfg(test)]
@@ -5395,9 +5656,9 @@ mod swapped_in_graph_reopen_tests {
         let dir = tempfile::tempdir().unwrap();
         let infigraph_dir = dir.path().join(".infigraph");
         std::fs::create_dir_all(&infigraph_dir).unwrap();
-        let live = infigraph_dir.join("graph");
+        let live = infigraph_dir.join(crate::graph::names::STEM);
         std::fs::write(&live, b"the freshly rebuilt graph").unwrap();
-        let retired = infigraph_dir.join("graph.previous.1");
+        let retired = infigraph_dir.join(crate::graph::names::sibling(".previous.1"));
         std::fs::write(&retired, b"the stale prior graph").unwrap();
         (dir, infigraph_dir, live, retired)
     }
@@ -5406,7 +5667,7 @@ mod swapped_in_graph_reopen_tests {
         std::fs::read_dir(infigraph_dir)
             .unwrap()
             .filter_map(|e| Some(e.ok()?.file_name().to_string_lossy().into_owned()))
-            .filter(|n| n.starts_with("graph.corrupt."))
+            .filter(|n| n.starts_with(crate::graph::names::CORRUPT_PREFIX))
             .collect()
     }
 
@@ -5416,7 +5677,7 @@ mod swapped_in_graph_reopen_tests {
 
         let outcome = recover_or_quarantine_swapped_in_graph_with(
             &infigraph_dir,
-            "graph",
+            crate::graph::names::STEM,
             &live,
             &Some(retired.clone()),
             |_| true,
@@ -5447,7 +5708,7 @@ mod swapped_in_graph_reopen_tests {
 
         let outcome = recover_or_quarantine_swapped_in_graph_with(
             &infigraph_dir,
-            "graph",
+            crate::graph::names::STEM,
             &live,
             &Some(retired.clone()),
             |_| false,
@@ -5471,5 +5732,39 @@ mod swapped_in_graph_reopen_tests {
             b"the stale prior graph",
             "the prior live graph is back in place"
         );
+    }
+}
+
+#[cfg(test)]
+mod extensioned_swap_lock_tests {
+    use super::*;
+
+    /// The rollback after a failed reopen takes the live graph's lock. For a
+    /// graph with an extension that is `<name>.lock`, not what
+    /// `with_extension("lock")` computed, so a writer holding the real one
+    /// did not stop the rollback.
+    #[test]
+    fn the_rollback_waits_for_the_lock_of_a_graph_with_an_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        let live = dir.path().join("live.kuzu");
+        std::fs::write(&live, b"live").unwrap();
+        let _writer = crate::lockfile::acquire(
+            &crate::graph::db_lock_path(&live),
+            "writer",
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let outcome = recover_or_quarantine_swapped_in_graph_with(
+            dir.path(),
+            "live.kuzu",
+            &live,
+            &None,
+            |_| false,
+        );
+        assert!(
+            matches!(outcome, SwapReopen::Undecided { .. }),
+            "a held lock must leave the rollback undecided, got {outcome:?}"
+        );
+        assert!(live.exists(), "nothing was quarantined under a live writer");
     }
 }

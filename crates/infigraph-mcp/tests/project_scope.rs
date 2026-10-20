@@ -13,7 +13,12 @@ fn project_with_subdir() -> (tempfile::TempDir, PathBuf, PathBuf) {
     let root = dir.path().canonicalize().unwrap();
     std::fs::create_dir_all(root.join(".git")).unwrap();
     std::fs::create_dir_all(root.join(".infigraph")).unwrap();
-    std::fs::write(root.join(".infigraph").join("graph"), b"").unwrap();
+    std::fs::write(
+        root.join(".infigraph")
+            .join(infigraph_core::graph::names::STEM),
+        b"",
+    )
+    .unwrap();
     let sub = root.join("packages").join("codegen").join("src");
     std::fs::create_dir_all(&sub).unwrap();
     (dir, root, sub)

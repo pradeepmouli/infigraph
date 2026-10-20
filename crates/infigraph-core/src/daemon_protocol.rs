@@ -129,6 +129,26 @@ pub enum WriteRequest {
     /// rebuilds (`reindex-docs`). There is no document data on the socket:
     /// the daemon reads the files itself.
     IndexDocs { full: bool },
+    /// Index only the documents at `upserts` and drop those at, or under,
+    /// `removals` (root-relative, `/`-separated; a removal that named a
+    /// directory removes `path/...` and not a sibling that shares the
+    /// prefix). What the daemon's own document watcher asks for; the same docs
+    /// handle, lock and one-at-a-time rule as `IndexDocs`. Requests waiting
+    /// their turn coalesce into one (`PendingPaths::merge`), so a burst of
+    /// edits is one index run. Never sent by a client: the answer is
+    /// `Ok { total_files, indexed_files }`, with `indexed_files` zero when
+    /// nothing changed.
+    ///
+    /// `whole` asks for the whole-tree pass instead (a watcher's true-up),
+    /// which finds what no event reported and prunes what is gone. Unlike
+    /// `IndexDocs` it never opts a project in or creates a store: it writes
+    /// nothing unless `[docs] enabled` is on, read again under the docs lock.
+    IndexDocPaths {
+        upserts: Vec<String>,
+        removals: Vec<String>,
+        #[serde(default)]
+        whole: bool,
+    },
     /// Record that glossary entries were reviewed against their code (`acks`:
     /// the newest per target wins), and forget the acknowledgements of the
     /// targets in `drop`. Runs on the same docs handle as `IndexDocs`, one
@@ -397,6 +417,15 @@ mod tests {
         );
         assert_eq!(WriteRequest::IndexDocs { full: true }.kind(), "IndexDocs");
         assert_eq!(
+            WriteRequest::IndexDocPaths {
+                upserts: vec![],
+                removals: vec![],
+                whole: false
+            }
+            .kind(),
+            "IndexDocPaths"
+        );
+        assert_eq!(
             WriteRequest::AckDocEntries {
                 acks: Vec::new(),
                 drop: Vec::new()
@@ -407,6 +436,36 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&WriteRequest::IndexDocs { full: false }).unwrap(),
             r#"{"IndexDocs":{"full":false}}"#
+        );
+    }
+
+    #[test]
+    fn an_index_doc_paths_request_round_trips_through_json() {
+        let request = WriteRequest::IndexDocPaths {
+            upserts: vec!["docs/a.md".to_string()],
+            removals: vec!["docs/old".to_string()],
+            whole: true,
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert_eq!(
+            json,
+            r#"{"IndexDocPaths":{"upserts":["docs/a.md"],"removals":["docs/old"],"whole":true}}"#
+        );
+        // `whole` may be left out.
+        assert_eq!(
+            serde_json::from_str::<WriteRequest>(
+                r#"{"IndexDocPaths":{"upserts":[],"removals":["x"]}}"#
+            )
+            .unwrap(),
+            WriteRequest::IndexDocPaths {
+                upserts: vec![],
+                removals: vec!["x".to_string()],
+                whole: false
+            }
+        );
+        assert_eq!(
+            serde_json::from_str::<WriteRequest>(&json).unwrap(),
+            request
         );
     }
 
@@ -464,13 +523,13 @@ mod tests {
     }
 }
 
-use crate::Infigraph;
+use crate::CodeIndex;
 
 /// Runs one write against `infigraph` (the daemon's own write-mode
 /// connection) and says what happened. Never panics on a failed operation:
 /// every failure is a `WriteResult::Err`, so the client always gets an
 /// answer.
-pub fn serve_write(infigraph: &Infigraph, request: &WriteRequest) -> WriteResult {
+pub fn serve_write(infigraph: &CodeIndex, request: &WriteRequest) -> WriteResult {
     match request {
         WriteRequest::Index { paths: None } => match infigraph.index() {
             Ok(r) => WriteResult::Ok {
@@ -743,7 +802,9 @@ pub fn serve_write(infigraph: &Infigraph, request: &WriteRequest) -> WriteResult
         WriteRequest::FullReindex => WriteResult::Err {
             message: "FullReindex not yet implemented".to_string(),
         },
-        WriteRequest::IndexDocs { .. } | WriteRequest::AckDocEntries { .. } => WriteResult::Err {
+        WriteRequest::IndexDocs { .. }
+        | WriteRequest::IndexDocPaths { .. }
+        | WriteRequest::AckDocEntries { .. } => WriteResult::Err {
             message: format!(
                 "{} runs on the daemon's docs handle, never under index.lock",
                 request.kind()
@@ -753,7 +814,7 @@ pub fn serve_write(infigraph: &Infigraph, request: &WriteRequest) -> WriteResult
 }
 
 fn handle_ingest_structured(
-    infigraph: &Infigraph,
+    infigraph: &CodeIndex,
     schema_id: &str,
     source: &IngestSource,
 ) -> anyhow::Result<crate::structured::IngestResult> {

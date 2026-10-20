@@ -3,15 +3,18 @@ use std::io::IsTerminal;
 use std::path::Path;
 
 use anyhow::Result;
-use infigraph_core::Infigraph;
+use infigraph_core::CodeIndex;
 use infigraph_languages::bundled_registry;
 
 pub(crate) fn cmd_init(root: &Path, group: Option<&str>, quick: bool, yes: bool) -> Result<()> {
     let registry = bundled_registry()?;
-    let mut prism = Infigraph::open(root, registry)?;
+    let mut prism = CodeIndex::open(root, registry)?;
     prism.init()?;
     println!("Initialized infigraph in {}", root.display());
-    println!("Graph database created at .infigraph/graph/");
+    println!(
+        "Graph database created at .infigraph/{}",
+        infigraph_core::graph::names::STEM
+    );
 
     // --- Wizard steps (skipped with --quick) ---
     if !quick {
@@ -470,7 +473,13 @@ mod tests {
     fn project() -> tempfile::TempDir {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path().join(".infigraph")).unwrap();
-        std::fs::write(tmp.path().join(".infigraph").join("graph"), b"").unwrap();
+        std::fs::write(
+            tmp.path()
+                .join(".infigraph")
+                .join(infigraph_core::graph::names::STEM),
+            b"",
+        )
+        .unwrap();
         tmp
     }
 

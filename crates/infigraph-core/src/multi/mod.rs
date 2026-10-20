@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use crate::lang::LanguageRegistry;
 use crate::lockfile;
 use crate::ops::{begin_index_op, full_reindex_wipe, IndexOpGuard, IndexOpOutcome};
-use crate::Infigraph;
+use crate::CodeIndex;
 
 #[cfg(feature = "neo4j")]
 use crate::graph::GraphBackend;
@@ -138,7 +138,7 @@ impl Registry {
     }
 
     /// Register a repository after indexing.
-    pub fn register_repo(&mut self, name: &str, path: &Path, prism: &Infigraph) -> Result<()> {
+    pub fn register_repo(&mut self, name: &str, path: &Path, prism: &CodeIndex) -> Result<()> {
         let stats = prism.stats()?;
         let langs: Vec<String> = prism
             .registry()
@@ -300,7 +300,7 @@ impl Registry {
             // Runs arbitrary user-supplied Cypher via raw_query below — never parses
             // source, so an empty registry avoids rebuilding all 62 language packs
             // per repo in the group.
-            let mut prism = Infigraph::open(&entry.path, LanguageRegistry::new())?;
+            let mut prism = CodeIndex::open(&entry.path, LanguageRegistry::new())?;
             prism.init()?;
 
             let backend = prism.backend().context("graph not initialized")?;
@@ -328,7 +328,7 @@ impl Registry {
 /// 2. Decorated functions — docstring contains route decorator (@app.route, #[get], etc.)
 /// 3. Heuristic detect_routes fallback
 pub fn extract_contracts(
-    prism: &Infigraph,
+    prism: &CodeIndex,
     service_name: &str,
     namespace: Option<&str>,
 ) -> Result<Vec<Contract>> {
@@ -602,7 +602,7 @@ pub fn sync_group_contracts(
         // extract_contracts (below) and the dependency scan after it only run
         // raw_query against the already-built graph — never parse source — so an
         // empty registry avoids rebuilding all 62 language packs per repo.
-        let mut prism = Infigraph::open(&entry.path, LanguageRegistry::new())?;
+        let mut prism = CodeIndex::open(&entry.path, LanguageRegistry::new())?;
         prism.init()?;
 
         // Same repo/org namespace `index_group` stamps onto `s.file` when writing
@@ -664,7 +664,7 @@ enum MemberOutcome {
     /// through this member's post-processing (manifest indexing +
     /// registry registration) in the caller's post-index loop, not just
     /// through `index_one` itself.
-    Indexed(String, usize, usize, Box<Infigraph>, IndexOpGuard),
+    Indexed(String, usize, usize, Box<CodeIndex>, IndexOpGuard),
     /// The member's own index operation lock was already held by another
     /// in-flight run — skipped without touching its graph. Carries the
     /// skip reason (no trailing "— skipped"; callers compose their own).
@@ -816,7 +816,7 @@ pub fn index_group(
         // Shared across all members — bundled_registry() compiles ~62 tree-sitter
         // packs from scratch on every call; building it once up front (see
         // `shared_registry` above) avoids doing that per repo on `--full`/large-group runs.
-        let mut prism = Infigraph::open_shared(&entry.path, shared_registry.clone())?;
+        let mut prism = CodeIndex::open_shared(&entry.path, shared_registry.clone())?;
         prism.init()?;
         // Only namespace in remote/shared-graph mode. In local mode each repo has its
         // own embedded DB, so prefixing file keys with the repo name just changes them
@@ -984,7 +984,7 @@ pub fn git_head_commit(repo_path: &Path) -> Option<String> {
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
 }
 
-fn raw_query_prism(prism: &Infigraph, cypher: &str) -> Result<Vec<Vec<String>>> {
+fn raw_query_prism(prism: &CodeIndex, cypher: &str) -> Result<Vec<Vec<String>>> {
     prism
         .backend()
         .context("graph not initialized")?

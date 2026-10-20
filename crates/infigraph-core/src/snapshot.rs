@@ -42,7 +42,7 @@ const RESTORE_STAGING_DIR: &str = "restore.staging";
 /// Base name of the live graph file within `.infigraph/` (matches
 /// `watch::mod::LIVE_NAME`; duplicated rather than shared because that
 /// constant is private to the daemon's swap logic).
-const LIVE_GRAPH_NAME: &str = "graph";
+const LIVE_GRAPH_NAME: &str = crate::graph::names::STEM;
 
 fn now_epoch_secs() -> u64 {
     std::time::SystemTime::now()
@@ -70,8 +70,14 @@ pub(crate) fn should_skip(name: &str) -> bool {
 /// (`graph.previous.<ts>`), each with the WAL siblings that move with it.
 pub(crate) fn is_restore_pool_entry(name: &str) -> bool {
     name == SNAPSHOTS_DIR
-        || name.starts_with("graph.corrupt.")
-        || name.starts_with("graph.previous.")
+        || [
+            crate::graph::names::CORRUPT_PREFIX,
+            crate::graph::names::PREVIOUS_PREFIX,
+            crate::graph::names::legacy::CORRUPT_PREFIX,
+            crate::graph::names::legacy::PREVIOUS_PREFIX,
+        ]
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
 }
 
 /// Below this many bytes a WAL is never judged pathological, so a fresh
@@ -82,12 +88,12 @@ const PATHOLOGICAL_WAL_FLOOR_BYTES: u64 = 64 * 1024 * 1024;
 /// Written into a snapshot in place of a WAL the snapshot deliberately left
 /// out, so `restore` users can see the snapshot holds the last checkpoint
 /// rather than the live WAL's uncheckpointed tail.
-pub(crate) const WAL_OMITTED_NOTE: &str = "graph.wal.omitted.json";
+pub(crate) const WAL_OMITTED_NOTE: &str = crate::graph::names::WAL_OMITTED_NOTE;
 
 /// Written into a snapshot in place of a live graph (and its WAL) that was
 /// past its growth guard (#175), so `restore` users can see the snapshot holds
 /// the sidecars but no graph.
-pub(crate) const GRAPH_OMITTED_NOTE: &str = "graph.omitted.json";
+pub(crate) const GRAPH_OMITTED_NOTE: &str = crate::graph::names::GRAPH_OMITTED_NOTE;
 
 /// The runaway-WAL pattern (#100, #130, #132): a healthy WAL is bounded by
 /// lbug's auto-checkpoint threshold, so one that has outgrown the
@@ -233,9 +239,10 @@ fn create_snapshot_with_wal_floor(infigraph_dir: &Path, wal_floor: u64) -> Resul
 
     if let Some((graph_bytes, wal_bytes)) = plan.omitted_wal {
         let reason = format!(
-            "graph.wal ({} MB) had outgrown the checkpointed graph ({} MB): the runaway-WAL \
+            "{} ({} MB) had outgrown the checkpointed graph ({} MB): the runaway-WAL \
              pattern (github.com/pradeepmouli/infigraph#130); this snapshot holds the last \
              checkpoint, not the WAL's uncheckpointed tail",
+            crate::graph::names::sibling(".wal"),
             wal_bytes / (1024 * 1024),
             graph_bytes / (1024 * 1024)
         );
@@ -384,8 +391,23 @@ pub fn list_restore_points(infigraph_dir: &Path) -> Vec<RestorePoint> {
         for e in entries.flatten() {
             let name = e.file_name().to_string_lossy().into_owned();
             for (prefix, kind) in [
-                ("graph.previous.", RestorePointKind::Previous),
-                ("graph.corrupt.", RestorePointKind::Corrupt),
+                (
+                    crate::graph::names::PREVIOUS_PREFIX,
+                    RestorePointKind::Previous,
+                ),
+                (
+                    crate::graph::names::CORRUPT_PREFIX,
+                    RestorePointKind::Corrupt,
+                ),
+                // Entries filed by the build before the stem moved.
+                (
+                    crate::graph::names::legacy::PREVIOUS_PREFIX,
+                    RestorePointKind::Previous,
+                ),
+                (
+                    crate::graph::names::legacy::CORRUPT_PREFIX,
+                    RestorePointKind::Corrupt,
+                ),
             ] {
                 // Only an exact "<prefix><digits>" match, so WAL-family
                 // siblings (e.g. "graph.corrupt.<ts>.wal") aren't listed as
@@ -535,7 +557,15 @@ fn restore_from_graph_pool(
         RestorePointKind::Corrupt => "corrupt",
         RestorePointKind::Snapshot => unreachable!("handled by restore_from_snapshot"),
     };
-    let src_stem = format!("{LIVE_GRAPH_NAME}.{infix}.{timestamp}");
+    // Filed under the current stem, or under the old one by the build before.
+    let named = |stem: &str| format!("{stem}.{infix}.{timestamp}");
+    let src_stem = [
+        named(LIVE_GRAPH_NAME),
+        named(crate::graph::names::legacy::STEM),
+    ]
+    .into_iter()
+    .find(|stem| infigraph_dir.join(stem).exists())
+    .unwrap_or_else(|| named(LIVE_GRAPH_NAME));
     let src = infigraph_dir.join(&src_stem);
     if !src.exists() {
         anyhow::bail!(
@@ -553,7 +583,7 @@ fn restore_from_graph_pool(
     // restoring from (caught by
     // `restore_from_previous_pool_retires_current_live_graph_first` before
     // this shipped).
-    const STAGING_STEM: &str = "graph.restoring";
+    const STAGING_STEM: &str = crate::graph::names::RESTORING;
     let staging = infigraph_dir.join(STAGING_STEM);
     std::fs::rename(&src, &staging)
         .with_context(|| format!("restore: stage {} to {}", src.display(), staging.display()))?;
@@ -603,16 +633,19 @@ mod tests {
     fn snapshot_copies_live_state_and_skips_pools() {
         let tmp = tempfile::tempdir().unwrap();
         let tg = tmp.path().join(".infigraph");
-        write(&tg.join("graph"), "graph-data");
+        write(&tg.join(crate::graph::names::STEM), "graph-data");
         write(&tg.join("embeddings.bin"), "embed-data");
         write(&tg.join("sessions").join("s1.json"), "session-data");
         write(&tg.join("index.lock"), "");
-        write(&tg.join("graph.corrupt.111"), "old-corrupt");
+        write(
+            &tg.join(crate::graph::names::sibling(".corrupt.111")),
+            "old-corrupt",
+        );
 
         let dest = create_snapshot(&tg).unwrap();
 
         assert_eq!(
-            std::fs::read_to_string(dest.join("graph")).unwrap(),
+            std::fs::read_to_string(dest.join(crate::graph::names::STEM)).unwrap(),
             "graph-data"
         );
         assert_eq!(
@@ -624,7 +657,9 @@ mod tests {
             "session-data"
         );
         assert!(!dest.join("index.lock").exists());
-        assert!(!dest.join("graph.corrupt.111").exists());
+        assert!(!dest
+            .join(crate::graph::names::sibling(".corrupt.111"))
+            .exists());
     }
 
     #[test]
@@ -647,21 +682,29 @@ mod tests {
     fn snapshot_omits_a_pathological_wal_and_records_why() {
         let tmp = tempfile::tempdir().unwrap();
         let tg = tmp.path().join(".infigraph");
-        write(&tg.join("graph"), "graph");
-        write(&tg.join("graph.wal"), &"w".repeat(4096));
-        write(&tg.join("graph.wal.checkpoint"), "ckpt");
+        write(&tg.join(crate::graph::names::STEM), "graph");
+        write(
+            &tg.join(crate::graph::names::sibling(".wal")),
+            &"w".repeat(4096),
+        );
+        write(
+            &tg.join(crate::graph::names::sibling(".wal.checkpoint")),
+            "ckpt",
+        );
         write(&tg.join("embeddings.bin"), "embed");
 
         let dest = create_snapshot_with_wal_floor(&tg, 0).unwrap();
 
-        assert!(dest.join("graph").exists());
+        assert!(dest.join(crate::graph::names::STEM).exists());
         assert!(dest.join("embeddings.bin").exists());
         assert!(
-            !dest.join("graph.wal").exists(),
+            !dest.join(crate::graph::names::sibling(".wal")).exists(),
             "the runaway WAL is not copied"
         );
         assert!(
-            !dest.join("graph.wal.checkpoint").exists(),
+            !dest
+                .join(crate::graph::names::sibling(".wal.checkpoint"))
+                .exists(),
             "nor its siblings"
         );
         let note: serde_json::Value =
@@ -676,18 +719,22 @@ mod tests {
     fn snapshot_keeps_a_wal_that_is_smaller_than_its_graph() {
         let tmp = tempfile::tempdir().unwrap();
         let tg = tmp.path().join(".infigraph");
-        write(&tg.join("graph"), &"g".repeat(4096));
-        write(&tg.join("graph.wal"), "wal");
-        write(&tg.join("graph.wal.checkpoint"), "ckpt");
+        write(&tg.join(crate::graph::names::STEM), &"g".repeat(4096));
+        write(&tg.join(crate::graph::names::sibling(".wal")), "wal");
+        write(
+            &tg.join(crate::graph::names::sibling(".wal.checkpoint")),
+            "ckpt",
+        );
 
         let dest = create_snapshot_with_wal_floor(&tg, 0).unwrap();
 
         assert_eq!(
-            std::fs::read_to_string(dest.join("graph.wal")).unwrap(),
+            std::fs::read_to_string(dest.join(crate::graph::names::sibling(".wal"))).unwrap(),
             "wal"
         );
         assert_eq!(
-            std::fs::read_to_string(dest.join("graph.wal.checkpoint")).unwrap(),
+            std::fs::read_to_string(dest.join(crate::graph::names::sibling(".wal.checkpoint")))
+                .unwrap(),
             "ckpt"
         );
         assert!(!dest.join(WAL_OMITTED_NOTE).exists());
@@ -700,20 +747,23 @@ mod tests {
     fn snapshot_omits_a_graph_past_its_growth_guard_and_records_why() {
         let tmp = tempfile::tempdir().unwrap();
         let tg = crate::graph::store_util::floorless_infigraph_dir(tmp.path());
-        write(&tg.join("graph"), "g");
-        crate::graph::stamp_healthy_graph_size(&tg, &tg.join("graph"));
-        write(&tg.join("graph"), &"g".repeat(4096)); // 4096x its 1-byte baseline
-        write(&tg.join("graph.wal"), "wal");
+        write(&tg.join(crate::graph::names::STEM), "g");
+        crate::graph::stamp_healthy_graph_size(&tg, &tg.join(crate::graph::names::STEM));
+        write(&tg.join(crate::graph::names::STEM), &"g".repeat(4096)); // 4096x its 1-byte baseline
+        write(&tg.join(crate::graph::names::sibling(".wal")), "wal");
         write(&tg.join("embeddings.bin"), "embed");
 
         let dest = create_snapshot_with_wal_floor(&tg, 0).unwrap();
 
         assert!(dest.join("embeddings.bin").exists());
         assert!(
-            !dest.join("graph").exists(),
+            !dest.join(crate::graph::names::STEM).exists(),
             "the bloated graph is not copied"
         );
-        assert!(!dest.join("graph.wal").exists(), "nor its WAL");
+        assert!(
+            !dest.join(crate::graph::names::sibling(".wal")).exists(),
+            "nor its WAL"
+        );
         assert!(!dest.join(WAL_OMITTED_NOTE).exists());
         let note: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(dest.join(GRAPH_OMITTED_NOTE)).unwrap())
@@ -726,11 +776,14 @@ mod tests {
     fn snapshot_plan_projects_exactly_the_bytes_it_will_copy() {
         let tmp = tempfile::tempdir().unwrap();
         let tg = tmp.path().join(".infigraph");
-        write(&tg.join("graph"), "12345"); // 5
-        write(&tg.join("graph.wal"), "123456789"); // 9, pathological at floor 0 -> omitted
+        write(&tg.join(crate::graph::names::STEM), "12345"); // 5
+        write(&tg.join(crate::graph::names::sibling(".wal")), "123456789"); // 9, pathological at floor 0 -> omitted
         write(&tg.join("sessions").join("a.json"), "1234567"); // 7
         write(&tg.join("index.lock"), "xxxx"); // skipped
-        write(&tg.join("graph.corrupt.1"), "xxxxxxxx"); // skipped
+        write(
+            &tg.join(crate::graph::names::sibling(".corrupt.1")),
+            "xxxxxxxx",
+        ); // skipped
 
         let plan = plan_snapshot(&tg, 0).unwrap();
         assert_eq!(plan.projected_bytes, 12, "graph + sessions/a.json only");
@@ -748,7 +801,7 @@ mod tests {
     fn snapshot_retention_evicts_oldest() {
         let tmp = tempfile::tempdir().unwrap();
         let tg = tmp.path().join(".infigraph");
-        write(&tg.join("graph"), "v1");
+        write(&tg.join(crate::graph::names::STEM), "v1");
 
         for ts in [100u64, 200, 300] {
             std::fs::create_dir_all(tg.join(SNAPSHOTS_DIR).join(ts.to_string())).unwrap();
@@ -810,7 +863,10 @@ mod tests {
             ],
         );
         for root in [&main, &linked] {
-            write(&root.join(".infigraph").join("graph"), "v1");
+            write(
+                &root.join(".infigraph").join(crate::graph::names::STEM),
+                "v1",
+            );
         }
         (tmp, main.join(".infigraph"), linked.join(".infigraph"))
     }
@@ -857,7 +913,7 @@ mod tests {
     #[test]
     fn restoring_a_linked_worktrees_only_snapshot_succeeds_and_leaves_the_safety_snapshot() {
         let (_tmp, _main_ig, linked_ig) = main_and_linked();
-        write(&linked_ig.join("graph"), "state-a");
+        write(&linked_ig.join(crate::graph::names::STEM), "state-a");
         let snap_a = create_snapshot(&linked_ig).unwrap();
         let ts_a: u64 = snap_a
             .file_name()
@@ -866,7 +922,10 @@ mod tests {
             .unwrap()
             .parse()
             .unwrap();
-        write(&linked_ig.join("graph"), "state-live-before-restore");
+        write(
+            &linked_ig.join(crate::graph::names::STEM),
+            "state-live-before-restore",
+        );
 
         let point = RestorePoint {
             kind: RestorePointKind::Snapshot,
@@ -876,15 +935,20 @@ mod tests {
         restore(&linked_ig, &point).unwrap();
 
         assert_eq!(
-            std::fs::read_to_string(linked_ig.join("graph")).unwrap(),
+            std::fs::read_to_string(linked_ig.join(crate::graph::names::STEM)).unwrap(),
             "state-a",
             "the restore applied the snapshot's content"
         );
         let names = snapshot_names(&linked_ig);
         assert_eq!(names.len(), 1, "the pool holds one entry: {names:?}");
         assert_eq!(
-            std::fs::read_to_string(linked_ig.join(SNAPSHOTS_DIR).join(&names[0]).join("graph"))
-                .unwrap(),
+            std::fs::read_to_string(
+                linked_ig
+                    .join(SNAPSHOTS_DIR)
+                    .join(&names[0])
+                    .join(crate::graph::names::STEM)
+            )
+            .unwrap(),
             "state-live-before-restore",
             "the one entry is the safety snapshot of the pre-restore state"
         );
@@ -899,9 +963,18 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let tg = tmp.path().join(".infigraph");
         std::fs::create_dir_all(tg.join(SNAPSHOTS_DIR).join("500")).unwrap();
-        write(&tg.join("graph.previous.400"), "prev");
-        write(&tg.join("graph.corrupt.300"), "corrupt");
-        write(&tg.join("graph.corrupt.300.wal"), "wal-sibling");
+        write(
+            &tg.join(crate::graph::names::sibling(".previous.400")),
+            "prev",
+        );
+        write(
+            &tg.join(crate::graph::names::sibling(".corrupt.300")),
+            "corrupt",
+        );
+        write(
+            &tg.join(crate::graph::names::sibling(".corrupt.300.wal")),
+            "wal-sibling",
+        );
 
         let points = list_restore_points(&tg);
         let ids: Vec<String> = points.iter().map(|p| p.id()).collect();
@@ -913,11 +986,14 @@ mod tests {
     fn restore_from_snapshot_replaces_live_state_and_self_snapshots_first() {
         let tmp = tempfile::tempdir().unwrap();
         let tg = tmp.path().join(".infigraph");
-        write(&tg.join("graph"), "old-live");
+        write(&tg.join(crate::graph::names::STEM), "old-live");
         let snap = create_snapshot(&tg).unwrap();
         let ts: u64 = snap.file_name().unwrap().to_str().unwrap().parse().unwrap();
 
-        write(&tg.join("graph"), "newer-live-to-be-discarded");
+        write(
+            &tg.join(crate::graph::names::STEM),
+            "newer-live-to-be-discarded",
+        );
 
         let point = RestorePoint {
             kind: RestorePointKind::Snapshot,
@@ -927,7 +1003,7 @@ mod tests {
         restore(&tg, &point).unwrap();
 
         assert_eq!(
-            std::fs::read_to_string(tg.join("graph")).unwrap(),
+            std::fs::read_to_string(tg.join(crate::graph::names::STEM)).unwrap(),
             "old-live"
         );
         // The pre-restore state was itself snapshotted before being wiped,
@@ -940,7 +1016,8 @@ mod tests {
             .collect();
         assert_eq!(snapshots_after.len(), 1);
         assert_eq!(
-            std::fs::read_to_string(snapshots_after[0].path().join("graph")).unwrap(),
+            std::fs::read_to_string(snapshots_after[0].path().join(crate::graph::names::STEM))
+                .unwrap(),
             "newer-live-to-be-discarded",
             "the safety-net snapshot must hold the state that was live just before the restore"
         );
@@ -951,7 +1028,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let tg = tmp.path().join(".infigraph");
 
-        write(&tg.join("graph"), "state-a");
+        write(&tg.join(crate::graph::names::STEM), "state-a");
         let snap_a = create_snapshot(&tg).unwrap();
         let ts_a: u64 = snap_a
             .file_name()
@@ -961,7 +1038,7 @@ mod tests {
             .parse()
             .unwrap();
 
-        write(&tg.join("graph"), "state-b");
+        write(&tg.join(crate::graph::names::STEM), "state-b");
         let snap_b = create_snapshot(&tg).unwrap();
         let ts_b: u64 = snap_b
             .file_name()
@@ -973,7 +1050,7 @@ mod tests {
 
         // Pool is now at exactly SNAPSHOT_RETENTION (2) entries: snap_a
         // (oldest), snap_b.
-        write(&tg.join("graph"), "state-c-current-live");
+        write(&tg.join(crate::graph::names::STEM), "state-c-current-live");
 
         // Restoring the OLDEST snapshot must succeed even with the pool
         // already at its retention bound. Adversarial review found that
@@ -990,7 +1067,7 @@ mod tests {
         restore(&tg, &point).unwrap();
 
         assert_eq!(
-            std::fs::read_to_string(tg.join("graph")).unwrap(),
+            std::fs::read_to_string(tg.join(crate::graph::names::STEM)).unwrap(),
             "state-a",
             "restoring the oldest snapshot at the retention bound must succeed and apply its content"
         );
@@ -1004,18 +1081,21 @@ mod tests {
     fn restore_from_previous_pool_retires_current_live_graph_first() {
         let tmp = tempfile::tempdir().unwrap();
         let tg = tmp.path().join(".infigraph");
-        write(&tg.join("graph"), "current-live");
-        write(&tg.join("graph.previous.999"), "older-graph");
+        write(&tg.join(crate::graph::names::STEM), "current-live");
+        write(
+            &tg.join(crate::graph::names::sibling(".previous.999")),
+            "older-graph",
+        );
 
         let point = RestorePoint {
             kind: RestorePointKind::Previous,
             timestamp: 999,
-            path: tg.join("graph.previous.999"),
+            path: tg.join(crate::graph::names::sibling(".previous.999")),
         };
         restore(&tg, &point).unwrap();
 
         assert_eq!(
-            std::fs::read_to_string(tg.join("graph")).unwrap(),
+            std::fs::read_to_string(tg.join(crate::graph::names::STEM)).unwrap(),
             "older-graph"
         );
         // The graph that was live before the restore is now in the
@@ -1026,13 +1106,66 @@ mod tests {
             .filter(|e| {
                 e.file_name()
                     .to_string_lossy()
-                    .starts_with("graph.previous.")
+                    .starts_with(crate::graph::names::PREVIOUS_PREFIX)
             })
             .collect();
         assert_eq!(previous_entries.len(), 1);
         assert_eq!(
             std::fs::read_to_string(previous_entries[0].path()).unwrap(),
             "current-live"
+        );
+    }
+
+    #[test]
+    fn a_snapshot_taken_before_the_rename_restores_to_one_store_the_next_open_migrates() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tg = tmp.path().join(".infigraph");
+        // What the previous build's snapshot holds, under its names.
+        let old = tg.join(SNAPSHOTS_DIR).join("1000");
+        write(&old.join("graph"), "snapshotted-graph");
+        write(&old.join("graph.wal"), "snapshotted-wal");
+        write(&old.join("embeddings.bin"), "embed");
+        // The live store has since been migrated and moved on.
+        write(&tg.join(crate::graph::names::STEM), "newer-live");
+        let point = list_restore_points(&tg)
+            .into_iter()
+            .find(|p| p.timestamp == 1000)
+            .expect("the old snapshot is listed");
+        restore(&tg, &point).unwrap();
+
+        crate::graph::migrate::migrate(&tg).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(tg.join(crate::graph::names::STEM)).unwrap(),
+            "snapshotted-graph",
+            "one store, and it is the restored one"
+        );
+        assert_eq!(
+            std::fs::read_to_string(tg.join(crate::graph::names::sibling(".wal"))).unwrap(),
+            "snapshotted-wal"
+        );
+        assert!(!tg.join(crate::graph::names::legacy::STEM).exists());
+    }
+
+    #[test]
+    fn a_graph_the_previous_build_retired_is_still_a_restore_point() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tg = tmp.path().join(".infigraph");
+        write(&tg.join("graph.previous.777"), "retired");
+        write(&tg.join("graph.previous.777.wal"), "retired-wal");
+        write(&tg.join(crate::graph::names::STEM), "live");
+        let point = list_restore_points(&tg)
+            .into_iter()
+            .find(|p| p.timestamp == 777)
+            .expect("listed");
+        restore(&tg, &point).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(tg.join(crate::graph::names::STEM)).unwrap(),
+            "retired"
+        );
+        assert_eq!(
+            std::fs::read_to_string(tg.join(crate::graph::names::sibling(".wal"))).unwrap(),
+            "retired-wal"
         );
     }
 }

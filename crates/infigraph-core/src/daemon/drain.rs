@@ -1,10 +1,11 @@
-use crate::daemon::queue::{DrainedQueue, PendingIndexItem, WaiterKind};
+use crate::daemon::queue::{DrainedQueue, IndexWorkQueue, PendingIndexItem, WaiterKind};
 use crate::daemon_protocol::WriteResult;
 use crate::model::FileExtraction;
 use crate::resolve::ResolveStats;
-use crate::Infigraph;
+use crate::watch::sink::{PathIndexer, PathOutcome};
+use crate::CodeIndex;
 use anyhow::Result;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// What the unified drain actually did, for the batch-flush path's
 /// existing downstream steps (embedding updates, cross-file-call event
@@ -18,6 +19,79 @@ pub(crate) struct DrainOutcome {
     pub removals: Vec<String>,
 }
 
+/// The execute side of the sink contract: the same drain, asked for by path.
+/// Each call builds the queue a watcher would have filled and runs it through
+/// [`execute_drain`], so the contract test exercises the real code path and
+/// there is no second way to index a set of paths.
+impl PathIndexer for CodeIndex {
+    /// Indexes the paths whose content differs from what the graph holds. A
+    /// path that is no longer on disk is a deletion.
+    fn index_paths(&self, paths: &[PathBuf]) -> Result<PathOutcome> {
+        let backend = self
+            .backend()
+            .ok_or_else(|| anyhow::anyhow!("graph not initialized"))?;
+        let stored = backend.get_file_hashes()?;
+        let mut queue = IndexWorkQueue::new();
+        let mut present = Vec::new();
+        for path in paths {
+            let rel = self.relative(path);
+            if self.root().join(&rel).exists() {
+                present.push(rel);
+            } else {
+                queue.add_watch_removal(rel);
+            }
+        }
+        for extraction in self.extract_paths(&present) {
+            if stored.get(&extraction.file) != Some(&extraction.content_hash) {
+                queue.add_structured(extraction);
+            }
+        }
+        self.run_queue(queue)
+    }
+
+    /// Removes the files at, or under, each path, and nothing beside them.
+    fn delete_paths(&self, paths: &[PathBuf]) -> Result<PathOutcome> {
+        let backend = self
+            .backend()
+            .ok_or_else(|| anyhow::anyhow!("graph not initialized"))?;
+        let stored = backend.get_file_hashes()?;
+        let mut queue = IndexWorkQueue::new();
+        for path in paths {
+            let rel = self.relative(path);
+            let below = format!("{rel}/");
+            if stored.keys().any(|f| *f == rel || f.starts_with(&below)) {
+                queue.add_watch_removal(rel);
+            }
+        }
+        self.run_queue(queue)
+    }
+
+    fn index_all(&self) -> Result<PathOutcome> {
+        let mut queue = IndexWorkQueue::new();
+        queue.mark_whole_project();
+        self.run_queue(queue)
+    }
+}
+
+impl CodeIndex {
+    fn relative(&self, path: &Path) -> String {
+        path.strip_prefix(self.root())
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/")
+    }
+
+    fn run_queue(&self, mut queue: IndexWorkQueue) -> Result<PathOutcome> {
+        if queue.is_empty() {
+            return Ok(PathOutcome::default());
+        }
+        let outcome = execute_drain(self, queue.drain())?;
+        Ok(PathOutcome {
+            files: outcome.extractions.len() + outcome.removals.len(),
+        })
+    }
+}
+
 /// Runs one combined pass -- extract, upsert, remove, resolve -- against
 /// everything a `DrainedQueue` accumulated, and replies to every waiter
 /// folded into it. This is the fix for the coalescing bug: there is
@@ -25,7 +99,7 @@ pub(crate) struct DrainOutcome {
 /// snapshot, so no operation plans against information another operation
 /// has since made stale.
 #[allow(dead_code)]
-pub(crate) fn execute_drain(infigraph: &Infigraph, drained: DrainedQueue) -> Result<DrainOutcome> {
+pub(crate) fn execute_drain(infigraph: &CodeIndex, drained: DrainedQueue) -> Result<DrainOutcome> {
     // The run owner for the `index` last-run record (#209): the write paths
     // below note what they lose (edges a COPY dropped, a removal that failed,
     // call resolution that failed) and this takes it when the drain ends.
@@ -38,7 +112,7 @@ pub(crate) fn execute_drain(infigraph: &Infigraph, drained: DrainedQueue) -> Res
 
 /// [`execute_drain`]'s work: run the drain and answer every waiter folded
 /// into it.
-fn answer_waiters(infigraph: &Infigraph, mut drained: DrainedQueue) -> Result<DrainOutcome> {
+fn answer_waiters(infigraph: &CodeIndex, mut drained: DrainedQueue) -> Result<DrainOutcome> {
     let waiters = std::mem::take(&mut drained.waiters);
     let use_learned = waiters
         .iter()
@@ -100,7 +174,7 @@ fn record_drain_run(root: &Path, run: crate::last_run::Run<'_>, result: &Result<
 /// `drained` accumulated. Its waiters were taken out first, by
 /// `execute_drain`, which answers them.
 fn run_drain(
-    infigraph: &Infigraph,
+    infigraph: &CodeIndex,
     drained: DrainedQueue,
     use_learned: bool,
 ) -> Result<DrainOutcome> {
@@ -303,8 +377,8 @@ mod tests {
         reg
     }
 
-    fn open_project(root: &std::path::Path) -> Infigraph {
-        let mut prism = Infigraph::open(root, python_registry()).unwrap();
+    fn open_project(root: &std::path::Path) -> CodeIndex {
+        let mut prism = CodeIndex::open(root, python_registry()).unwrap();
         prism.init().unwrap();
         prism
     }
@@ -411,7 +485,7 @@ mod tests {
         let root = tmp.path();
         std::fs::create_dir_all(root.join(".infigraph")).unwrap();
         // Opened and never initialised: the graph is not there to write to.
-        let prism = Infigraph::open(root, python_registry()).unwrap();
+        let prism = CodeIndex::open(root, python_registry()).unwrap();
         let mut queue = IndexWorkQueue::new();
         queue.add_raw("a.py".to_string());
 
@@ -539,7 +613,10 @@ mod tests {
         fs::write(root.join("old.py"), "def old_symbol():\n    pass\n").unwrap();
         let prism = open_project(root);
         prism.index().unwrap();
-        assert!(root.join(".infigraph").join("graph").exists());
+        assert!(root
+            .join(".infigraph")
+            .join(crate::graph::names::STEM)
+            .exists());
 
         fs::remove_file(root.join("old.py")).unwrap();
         fs::write(root.join("new.py"), "def new_symbol():\n    pass\n").unwrap();
@@ -560,7 +637,10 @@ mod tests {
             .unwrap()
             .flatten()
             .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|n| n.starts_with("graph.previous.") || n.starts_with("graph.corrupt."))
+            .filter(|n| {
+                n.starts_with(crate::graph::names::PREVIOUS_PREFIX)
+                    || n.starts_with(crate::graph::names::CORRUPT_PREFIX)
+            })
             .collect()
     }
 
@@ -577,13 +657,13 @@ mod tests {
             // sparse, so no page the store reads is rewritten.
             let tg = crate::graph::store_util::floorless_infigraph_dir(root);
             fs::write(
-                tg.join("graph.health.json"),
+                tg.join(crate::graph::names::HEALTH),
                 r#"{"healthy_size_bytes": 1048576}"#,
             )
             .unwrap();
             fs::OpenOptions::new()
                 .write(true)
-                .open(tg.join("graph"))
+                .open(tg.join(crate::graph::names::STEM))
                 .unwrap()
                 .set_len(64 * 1024 * 1024)
                 .unwrap();
@@ -645,7 +725,7 @@ mod tests {
 
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        let old_graph_path = root.join(".infigraph").join("graph");
+        let old_graph_path = root.join(".infigraph").join(crate::graph::names::STEM);
         let reply = full_reindex_after_old_py_moves_to_new_py(root, |_| {});
         match reply {
             crate::daemon_protocol::WriteResult::FullReindexOk { indexed_files, .. } => {
@@ -679,8 +759,8 @@ mod tests {
         let base_entries: Vec<&String> = aside
             .iter()
             .filter(|n| {
-                n.strip_prefix("graph.previous.")
-                    .or_else(|| n.strip_prefix("graph.corrupt."))
+                n.strip_prefix(crate::graph::names::PREVIOUS_PREFIX)
+                    .or_else(|| n.strip_prefix(crate::graph::names::CORRUPT_PREFIX))
                     .is_some_and(|rest| {
                         !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit())
                     })
@@ -692,7 +772,9 @@ mod tests {
             "the old graph must be moved aside (renamed), not deleted: {aside:?}"
         );
         assert!(
-            aside.iter().all(|n| n.starts_with("graph.previous.")),
+            aside
+                .iter()
+                .all(|n| n.starts_with(crate::graph::names::PREVIOUS_PREFIX)),
             "a healthy superseded graph (and its WAL siblings) must go to the rollback \
              pool, not the corruption-evidence pool: {aside:?}"
         );
@@ -717,12 +799,13 @@ mod tests {
         prism.index().unwrap();
 
         let infigraph_dir = root.join(".infigraph");
-        let stale_wal = infigraph_dir.join("graph.rebuilding.wal");
-        let stale_checkpoint = infigraph_dir.join("graph.rebuilding.wal.checkpoint");
+        let stale_wal = infigraph_dir.join(crate::graph::names::sibling(".rebuilding.wal"));
+        let stale_checkpoint =
+            infigraph_dir.join(crate::graph::names::sibling(".rebuilding.wal.checkpoint"));
         fs::write(&stale_wal, b"a dead database's write-ahead log").unwrap();
         fs::write(&stale_checkpoint, b"and its checkpoint temp file").unwrap();
         assert!(
-            !infigraph_dir.join("graph.rebuilding").exists(),
+            !infigraph_dir.join(crate::graph::names::REBUILDING).exists(),
             "the interesting case is a WAL sibling with no base image"
         );
 
@@ -784,9 +867,10 @@ mod tests {
             "{reply:?}"
         );
 
-        let verify =
-            crate::graph::KuzuBackend::open_read_only(&root.join(".infigraph").join("graph"))
-                .unwrap();
+        let verify = crate::graph::KuzuBackend::open_read_only(
+            &root.join(".infigraph").join(crate::graph::names::STEM),
+        )
+        .unwrap();
         let rows = verify
             .raw_query("MATCH (s:Symbol)-[:TESTED_BY]->(t:Symbol) RETURN s.name, t.name")
             .unwrap();
@@ -818,7 +902,7 @@ mod tests {
         let prism = open_project(root);
         prism.index().unwrap();
 
-        let live_graph_path = root.join(".infigraph").join("graph");
+        let live_graph_path = root.join(".infigraph").join(crate::graph::names::STEM);
         assert!(live_graph_path.exists());
 
         let queue = std::sync::Arc::new(std::sync::Mutex::new(
@@ -850,7 +934,9 @@ mod tests {
             "a registry-build failure must leave the live graph's original content untouched"
         );
 
-        let rebuilding_path = root.join(".infigraph").join("graph.rebuilding");
+        let rebuilding_path = root
+            .join(".infigraph")
+            .join(crate::graph::names::REBUILDING);
         assert!(
             !rebuilding_path.exists(),
             "a registry-build failure must not leave graph.rebuilding behind"

@@ -165,7 +165,7 @@ pub(crate) fn copy_retry_max_batch_multiple(scope: ConfigScope<'_>) -> u64 {
 }
 
 fn graph_health_path(infigraph_dir: &Path) -> std::path::PathBuf {
-    infigraph_dir.join("graph.health.json")
+    infigraph_dir.join(crate::graph::names::HEALTH)
 }
 
 /// Written beside `graph.health.json` the first time a baseline lands, and
@@ -175,7 +175,7 @@ fn graph_health_path(infigraph_dir: &Path) -> std::path::PathBuf {
 /// never recorded, and the guard must pass the second (a first index) while
 /// refusing the first.
 fn baseline_marker_path(infigraph_dir: &Path) -> std::path::PathBuf {
-    infigraph_dir.join("graph.health.recorded")
+    infigraph_dir.join(crate::graph::names::sibling(".health.recorded"))
 }
 
 fn mark_baseline_recorded(infigraph_dir: &Path) {
@@ -419,7 +419,8 @@ pub(crate) fn check_graph_growth_ratio(
         // says one was recorded, in which case it was lost and this graph's
         // size is unvouched for. Only the live graph is held to that: a rebuild
         // at a side path is fresh from source, and is the remedy named below.
-        if baseline_marker_path(infigraph_dir).exists() && graph_path == infigraph_dir.join("graph")
+        if baseline_marker_path(infigraph_dir).exists()
+            && graph_path == infigraph_dir.join(crate::graph::names::STEM)
         {
             return Err(format!(
                 "graph at {} is {} MB, and its growth baseline ({}) is missing or \
@@ -958,7 +959,7 @@ pub(crate) fn fanout_edge_statement(
 /// dependency data from the manifests these are locked against. sittir's
 /// `pnpm-lock.yaml` alone contributed 3,498 symbols.
 ///
-/// Consulted at file discovery (`Infigraph::collect_files` and the watch
+/// Consulted at file discovery (`CodeIndex::collect_files` and the watch
 /// producer) so these never enter the graph, and still consulted by
 /// [`classify_file`] for anything an older index already stored.
 ///
@@ -1084,7 +1085,7 @@ mod tests {
 
     /// A store holding Symbol nodes `s0..s{n}` and nothing else.
     fn store_with_symbols(dir: &std::path::Path, n: usize) -> super::super::GraphStore {
-        let store = super::super::GraphStore::open(&dir.join("graph")).unwrap();
+        let store = super::super::GraphStore::open(&dir.join(crate::graph::names::STEM)).unwrap();
         {
             let conn = store.connection().unwrap();
             for i in 0..n {
@@ -1227,20 +1228,20 @@ mod tests {
     fn growth_check_passes_rather_than_refuses_with_no_baseline_yet() {
         let tmp = tempfile::tempdir().unwrap();
         let ig = floorless_infigraph_dir(tmp.path());
-        let graph_path = ig.join("graph");
+        let graph_path = ig.join(crate::graph::names::STEM);
         std::fs::write(&graph_path, vec![0u8; 1024]).unwrap();
 
         // Deliberately does NOT establish a baseline itself -- this is a
         // preflight, run before the write it guards, so stamping here would
         // capture the pre-write size. See `stamp_healthy_graph_size_if_unset`.
         assert!(check_graph_growth_ratio(&ig, &graph_path).is_ok());
-        assert!(!ig.join("graph.health.json").exists());
+        assert!(!ig.join(crate::graph::names::HEALTH).exists());
     }
 
     #[test]
     fn stamp_if_unset_establishes_a_baseline_once_and_never_again() {
         let tmp = tempfile::tempdir().unwrap();
-        let graph_path = tmp.path().join("graph");
+        let graph_path = tmp.path().join(crate::graph::names::STEM);
         std::fs::write(&graph_path, vec![0u8; 1024]).unwrap();
 
         stamp_healthy_graph_size_if_unset(tmp.path(), &graph_path);
@@ -1263,12 +1264,12 @@ mod tests {
     fn growth_check_refuses_when_a_recorded_baseline_has_gone_missing() {
         let tmp = tempfile::tempdir().unwrap();
         let ig = floorless_infigraph_dir(tmp.path());
-        let graph_path = ig.join("graph");
+        let graph_path = ig.join(crate::graph::names::STEM);
         std::fs::write(&graph_path, vec![0u8; 1024]).unwrap();
         stamp_healthy_graph_size_if_unset(&ig, &graph_path);
         assert!(check_graph_growth_ratio(&ig, &graph_path).is_ok());
 
-        std::fs::remove_file(ig.join("graph.health.json")).unwrap();
+        std::fs::remove_file(ig.join(crate::graph::names::HEALTH)).unwrap();
         let err = check_graph_growth_ratio(&ig, &graph_path)
             .expect_err("a baseline that once existed and is gone must refuse, not pass");
         assert!(
@@ -1292,16 +1293,16 @@ mod tests {
     fn a_baseline_recorded_before_the_marker_existed_gains_one_on_the_next_write() {
         let tmp = tempfile::tempdir().unwrap();
         let ig = floorless_infigraph_dir(tmp.path());
-        let graph_path = ig.join("graph");
+        let graph_path = ig.join(crate::graph::names::STEM);
         std::fs::write(&graph_path, vec![0u8; 1024]).unwrap();
         std::fs::write(
-            ig.join("graph.health.json"),
+            ig.join(crate::graph::names::HEALTH),
             r#"{"healthy_size_bytes": 1024}"#,
         )
         .unwrap();
 
         stamp_healthy_graph_size_if_unset(&ig, &graph_path);
-        std::fs::remove_file(ig.join("graph.health.json")).unwrap();
+        std::fs::remove_file(ig.join(crate::graph::names::HEALTH)).unwrap();
         assert!(check_graph_growth_ratio(&ig, &graph_path).is_err());
     }
 
@@ -1312,12 +1313,12 @@ mod tests {
     fn a_lost_baseline_does_not_refuse_a_rebuild_at_a_side_path() {
         let tmp = tempfile::tempdir().unwrap();
         let ig = floorless_infigraph_dir(tmp.path());
-        let live = ig.join("graph");
+        let live = ig.join(crate::graph::names::STEM);
         std::fs::write(&live, vec![0u8; 1024]).unwrap();
         stamp_healthy_graph_size(&ig, &live);
-        std::fs::remove_file(ig.join("graph.health.json")).unwrap();
+        std::fs::remove_file(ig.join(crate::graph::names::HEALTH)).unwrap();
 
-        let side = ig.join("graph.rebuilding");
+        let side = ig.join(crate::graph::names::REBUILDING);
         std::fs::write(&side, vec![0u8; 1024]).unwrap();
         assert!(check_graph_growth_ratio(&ig, &side).is_ok());
     }
@@ -1327,7 +1328,7 @@ mod tests {
     #[test]
     fn growth_ratio_is_none_without_a_baseline() {
         let tmp = tempfile::tempdir().unwrap();
-        let graph_path = tmp.path().join("graph");
+        let graph_path = tmp.path().join(crate::graph::names::STEM);
         std::fs::write(&graph_path, vec![0u8; 4096]).unwrap();
         assert_eq!(graph_growth_ratio(tmp.path(), &graph_path), None);
     }
@@ -1335,7 +1336,7 @@ mod tests {
     #[test]
     fn growth_ratio_reports_how_far_past_the_baseline_the_graph_is() {
         let tmp = tempfile::tempdir().unwrap();
-        let graph_path = tmp.path().join("graph");
+        let graph_path = tmp.path().join(crate::graph::names::STEM);
         std::fs::write(&graph_path, vec![0u8; 4096]).unwrap();
         stamp_healthy_graph_size(tmp.path(), &graph_path);
         std::fs::write(&graph_path, vec![0u8; 4096 * 5]).unwrap();
@@ -1354,14 +1355,14 @@ mod tests {
     fn the_unwind_fallback_refuses_rather_than_writing_through_runaway_growth() {
         let dir = tempfile::tempdir().unwrap();
         let ig = floorless_infigraph_dir(dir.path());
-        let db_path = ig.join("graph");
+        let db_path = ig.join(crate::graph::names::STEM);
         let store = GraphStore::open(&db_path).unwrap();
         let conn = store.connection().unwrap();
 
         // A deliberately tiny baseline, so the real graph is already far past
         // the 10x cap -- honest and cheap, versus staging gigabytes on disk.
         std::fs::write(
-            ig.join("graph.health.json"),
+            ig.join(crate::graph::names::HEALTH),
             r#"{"healthy_size_bytes": 1024}"#,
         )
         .unwrap();
@@ -1395,7 +1396,7 @@ mod tests {
             "[graph]\ngrowth_min_bytes = 2000000\n",
         )
         .unwrap();
-        let graph_path = ig.join("graph");
+        let graph_path = ig.join(crate::graph::names::STEM);
         std::fs::write(&graph_path, vec![0u8; 100_000]).unwrap();
         stamp_healthy_graph_size(&ig, &graph_path); // baseline: 100KB
 
@@ -1423,10 +1424,10 @@ mod tests {
     #[test]
     fn a_lost_baseline_under_the_size_floor_passes_without_re_anchoring() {
         let tmp = tempfile::tempdir().unwrap();
-        let graph_path = tmp.path().join("graph");
+        let graph_path = tmp.path().join(crate::graph::names::STEM);
         std::fs::write(&graph_path, vec![0u8; 1024]).unwrap();
         stamp_healthy_graph_size_if_unset(tmp.path(), &graph_path);
-        std::fs::remove_file(tmp.path().join("graph.health.json")).unwrap();
+        std::fs::remove_file(tmp.path().join(crate::graph::names::HEALTH)).unwrap();
 
         let out = check_graph_growth_ratio(tmp.path(), &graph_path);
         assert!(out.is_ok(), "1KB is under the default floor: {out:?}");
@@ -1447,7 +1448,7 @@ mod tests {
     #[test]
     fn growth_under_the_size_floor_is_never_refused_by_the_ratio() {
         let tmp = tempfile::tempdir().unwrap();
-        let graph_path = tmp.path().join("graph");
+        let graph_path = tmp.path().join(crate::graph::names::STEM);
         std::fs::write(&graph_path, vec![0u8; 300_000]).unwrap();
         stamp_healthy_graph_size(tmp.path(), &graph_path); // baseline: ~300KB
 
@@ -1463,7 +1464,7 @@ mod tests {
     fn growth_check_refuses_once_current_size_exceeds_the_ratio() {
         let tmp = tempfile::tempdir().unwrap();
         let ig = floorless_infigraph_dir(tmp.path());
-        let graph_path = ig.join("graph");
+        let graph_path = ig.join(crate::graph::names::STEM);
         std::fs::write(&graph_path, vec![0u8; 1_000_000]).unwrap();
         stamp_healthy_graph_size(&ig, &graph_path); // baseline: ~1MB
 
@@ -1482,7 +1483,7 @@ mod tests {
     fn growth_refusal_names_the_rebuild_remedy() {
         let tmp = tempfile::tempdir().unwrap();
         let ig = floorless_infigraph_dir(tmp.path());
-        let graph_path = ig.join("graph");
+        let graph_path = ig.join(crate::graph::names::STEM);
         std::fs::write(&graph_path, vec![0u8; 1_000_000]).unwrap();
         stamp_healthy_graph_size(&ig, &graph_path);
 
@@ -1505,7 +1506,7 @@ mod tests {
     fn growth_refusal_offers_an_explicit_restamp_not_a_file_deletion() {
         let tmp = tempfile::tempdir().unwrap();
         let ig = floorless_infigraph_dir(tmp.path());
-        let graph_path = ig.join("graph");
+        let graph_path = ig.join(crate::graph::names::STEM);
         std::fs::write(&graph_path, vec![0u8; 1_000_000]).unwrap();
         stamp_healthy_graph_size(&ig, &graph_path);
 
@@ -1533,7 +1534,7 @@ mod tests {
     fn an_absolute_ceiling_refuses_even_with_no_baseline_recorded() {
         let _g = MAX_BYTES_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
-        let graph_path = tmp.path().join("graph");
+        let graph_path = tmp.path().join(crate::graph::names::STEM);
         std::fs::write(&graph_path, vec![0u8; 4_000_000]).unwrap();
         // No graph.health.json at all: the ratio check has nothing to say.
         assert!(read_healthy_size(tmp.path()).is_none());
@@ -1554,7 +1555,7 @@ mod tests {
     fn an_absolute_ceiling_of_zero_is_disabled() {
         let _g = MAX_BYTES_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().unwrap();
-        let graph_path = tmp.path().join("graph");
+        let graph_path = tmp.path().join(crate::graph::names::STEM);
         std::fs::write(&graph_path, vec![0u8; 4_000_000]).unwrap();
 
         std::env::set_var(GRAPH_MAX_BYTES_ENV, "0");
@@ -1577,7 +1578,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let infigraph_dir = tmp.path().join(".infigraph");
         std::fs::create_dir_all(&infigraph_dir).unwrap();
-        let graph_path = infigraph_dir.join("graph");
+        let graph_path = infigraph_dir.join(crate::graph::names::STEM);
         std::fs::write(&graph_path, vec![0u8; 4_000_000]).unwrap();
         assert!(
             check_graph_growth_ratio(&infigraph_dir, &graph_path).is_ok(),
@@ -1601,7 +1602,7 @@ mod tests {
     fn growth_check_passes_for_ordinary_growth_under_the_ratio() {
         let tmp = tempfile::tempdir().unwrap();
         let ig = floorless_infigraph_dir(tmp.path());
-        let graph_path = ig.join("graph");
+        let graph_path = ig.join(crate::graph::names::STEM);
         std::fs::write(&graph_path, vec![0u8; 1_000_000]).unwrap();
         stamp_healthy_graph_size(&ig, &graph_path);
 
@@ -1617,14 +1618,14 @@ mod tests {
         // stat'd `graph_path` and would have passed this case cleanly.
         let tmp = tempfile::tempdir().unwrap();
         let ig = floorless_infigraph_dir(tmp.path());
-        let graph_path = ig.join("graph");
+        let graph_path = ig.join(crate::graph::names::STEM);
         std::fs::write(&graph_path, vec![0u8; 1_000_000]).unwrap();
         stamp_healthy_graph_size(&ig, &graph_path); // baseline: ~1MB
 
         // graph stays small...
         std::fs::write(&graph_path, vec![0u8; 1_000_000]).unwrap();
         // ...but its WAL balloons to 20x the baseline.
-        let wal_path = ig.join("graph.wal");
+        let wal_path = ig.join(crate::graph::names::sibling(".wal"));
         std::fs::write(&wal_path, vec![0u8; 20_000_000]).unwrap();
 
         let err = check_graph_growth_ratio(&ig, &graph_path)
@@ -1655,8 +1656,8 @@ mod tests {
     fn a_baseline_stamped_while_the_wal_is_pending_still_admits_the_folded_graph() {
         let tmp = tempfile::tempdir().unwrap();
         let ig = floorless_infigraph_dir(tmp.path());
-        let graph_path = ig.join("graph");
-        let wal_path = ig.join("graph.wal");
+        let graph_path = ig.join(crate::graph::names::STEM);
+        let wal_path = ig.join(crate::graph::names::sibling(".wal"));
 
         // The state `stamp_healthy_graph_size_if_unset` actually fires in:
         // bare-schema base, real data still pending in the WAL.
@@ -1854,7 +1855,8 @@ mod tests {
     #[test]
     fn edge_statements_plan_as_primary_key_lookups_not_cross_products() {
         let tmp = tempfile::tempdir().unwrap();
-        let store = super::super::GraphStore::open(&tmp.path().join("graph")).unwrap();
+        let store =
+            super::super::GraphStore::open(&tmp.path().join(crate::graph::names::STEM)).unwrap();
         let conn = store.connection().unwrap();
         let plan = |statement: &str| -> String {
             conn.query(&format!("EXPLAIN {statement}"))
@@ -1952,7 +1954,8 @@ mod tests {
     #[test]
     fn copy_does_not_maintain_art_indexes_so_they_cannot_be_added_yet() {
         let tmp = tempfile::tempdir().unwrap();
-        let store = super::super::GraphStore::open(&tmp.path().join("graph")).unwrap();
+        let store =
+            super::super::GraphStore::open(&tmp.path().join(crate::graph::names::STEM)).unwrap();
         let conn = store.connection().unwrap();
         conn.query("CREATE ART INDEX ix_probe_file FOR (n:Symbol) ON (n.file)")
             .unwrap();

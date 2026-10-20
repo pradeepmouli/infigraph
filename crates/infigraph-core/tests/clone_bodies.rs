@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use infigraph_core::clone_detect::bodies::{self, BodyEntry, BODIES_FILE};
 use infigraph_core::embed::EmbedProvider;
-use infigraph_core::Infigraph;
+use infigraph_core::CodeIndex;
 use infigraph_languages::bundled_registry;
 
 /// Embeds a text as its normalized word counts, hashed into 64 buckets:
@@ -63,19 +63,19 @@ fn write(root: &Path, file: &str, text: &str) {
     std::fs::write(path, text).unwrap();
 }
 
-fn project(files: &[(&str, &str)]) -> (tempfile::TempDir, Infigraph) {
+fn project(files: &[(&str, &str)]) -> (tempfile::TempDir, CodeIndex) {
     let dir = tempfile::tempdir().unwrap();
     for (file, text) in files {
         write(dir.path(), file, text);
     }
-    let mut ig = Infigraph::open(dir.path(), bundled_registry().unwrap()).unwrap();
+    let mut ig = CodeIndex::open(dir.path(), bundled_registry().unwrap()).unwrap();
     ig.init().unwrap();
     ig.index().unwrap();
     (dir, ig)
 }
 
 /// One embeddings update with the counting embedder; returns the embed calls.
-fn update(ig: &Infigraph, root: &Path, changed: &[&str]) -> usize {
+fn update(ig: &CodeIndex, root: &Path, changed: &[&str]) -> usize {
     let calls = Arc::new(AtomicUsize::new(0));
     infigraph_core::embed::update_embeddings_with(ig.backend().unwrap(), root, changed, &|| {
         Box::new(WordEmbedder(Arc::clone(&calls)))

@@ -4,7 +4,7 @@ use infigraph_core::extract::extract_file;
 use infigraph_core::graph::GraphStore;
 use infigraph_core::lang::{LanguagePack, LanguageRegistry};
 use infigraph_core::model::FileExtraction;
-use infigraph_core::Infigraph;
+use infigraph_core::CodeIndex;
 use tempfile::TempDir;
 
 const PYTHON_ENTITIES: &str = r#"
@@ -150,7 +150,7 @@ fn make_store() -> (TempDir, GraphStore) {
 }
 
 /// Create a temp project dir with N Python files, return (dir, Infigraph).
-fn make_project(file_count: usize) -> (TempDir, Infigraph) {
+fn make_project(file_count: usize) -> (TempDir, CodeIndex) {
     let dir = TempDir::new().unwrap();
     let src_dir = dir.path().join("src");
     std::fs::create_dir_all(&src_dir).unwrap();
@@ -161,7 +161,7 @@ fn make_project(file_count: usize) -> (TempDir, Infigraph) {
     }
 
     let registry = python_registry();
-    let mut ig = Infigraph::open(dir.path(), registry).unwrap();
+    let mut ig = CodeIndex::open(dir.path(), registry).unwrap();
     ig.init().unwrap();
     (dir, ig)
 }
@@ -257,7 +257,7 @@ fn test_upsert_all_parquet_throughput() {
     );
 }
 
-// ---------- End-to-end Infigraph::index() benchmarks ----------
+// ---------- End-to-end CodeIndex::index() benchmarks ----------
 
 #[test]
 fn test_full_index_throughput() {

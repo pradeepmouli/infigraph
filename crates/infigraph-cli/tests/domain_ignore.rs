@@ -32,7 +32,7 @@ fn a_code_pattern_drops_a_file_from_the_code_graph_and_not_from_the_docs_index()
         std::fs::write(full, content).unwrap();
     }
 
-    let mut code = infigraph_core::Infigraph::open(root, bundled_registry().unwrap()).unwrap();
+    let mut code = infigraph_core::CodeIndex::open(root, bundled_registry().unwrap()).unwrap();
     code.init().unwrap();
     let indexed = code.index().unwrap();
     let code_files: Vec<&str> = indexed

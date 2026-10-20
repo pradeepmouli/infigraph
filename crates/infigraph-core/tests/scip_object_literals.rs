@@ -55,7 +55,7 @@ fn import_with_refs(
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join("src")).unwrap();
     std::fs::write(dir.path().join(FILE), source).unwrap();
-    let store = GraphStore::open(&dir.path().join("graph")).unwrap();
+    let store = GraphStore::open(&dir.path().join(infigraph_core::graph::names::STEM)).unwrap();
     let conn = store.connection().unwrap();
     conn.query(&format!(
         "CREATE (:File {{id: '{FILE}', name: '{FILE}', path: '{FILE}', \

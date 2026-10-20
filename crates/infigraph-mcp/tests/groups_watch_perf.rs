@@ -17,6 +17,7 @@ struct GroupFixture {
     svc_b_path: String,
     orig_home: String,
     orig_watch_daemon: Option<String>,
+    orig_index_threads: Option<String>,
 }
 
 static GROUP_FIXTURE: OnceLock<GroupFixture> = OnceLock::new();
@@ -37,6 +38,16 @@ fn group_fixture() -> &'static GroupFixture {
         // is controlled solely by INFIGRAPH_BACKEND=daemon now.)
         let orig_watch_daemon = std::env::var("INFIGRAPH_BACKEND").ok();
         std::env::set_var(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND);
+
+        // One thread for every indexer this fixture starts (the spawned
+        // `infigraph index`, the in-process watcher). The test compares the
+        // wall-clock time of an incremental re-index with a full one; with all
+        // cores free a parallel full index is fast, and on a busy machine the
+        // two timings stop being comparable (21.20s incremental against
+        // 13.54s full at load 66). Sequential work on both sides is. The
+        // bound below is unchanged.
+        let orig_index_threads = std::env::var("INFIGRAPH_INDEX_MAX_THREADS").ok();
+        std::env::set_var("INFIGRAPH_INDEX_MAX_THREADS", "1");
 
         let home_dir = tempfile::TempDir::new().expect("tmpdir for home");
         support::remove_at_exit(home_dir.path()); // static fixture: never dropped (#136)
@@ -162,6 +173,7 @@ def create_user(data):
             svc_b_path,
             orig_home,
             orig_watch_daemon,
+            orig_index_threads,
         }
     })
 }
@@ -484,6 +496,11 @@ fn test_groups_watch_perf() {
     // Restore HOME
     std::env::set_var("HOME", &fix.orig_home);
     std::env::remove_var("INFIGRAPH_REGISTRY_HOME");
+
+    match &fix.orig_index_threads {
+        Some(v) => std::env::set_var("INFIGRAPH_INDEX_MAX_THREADS", v),
+        None => std::env::remove_var("INFIGRAPH_INDEX_MAX_THREADS"),
+    }
 
     // Restore INFIGRAPH_BACKEND
     match &fix.orig_watch_daemon {

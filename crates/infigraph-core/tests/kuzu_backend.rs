@@ -41,7 +41,8 @@ fn rel(src: &str, tgt: &str, kind: RelationKind) -> Relation {
 
 fn make_backend() -> (tempfile::TempDir, Box<dyn GraphBackend>) {
     let dir = tempfile::TempDir::new().expect("tmpdir");
-    let backend = KuzuBackend::open(&dir.path().join("graph")).expect("open");
+    let backend =
+        KuzuBackend::open(&dir.path().join(infigraph_core::graph::names::STEM)).expect("open");
     (dir, Box::new(backend))
 }
 

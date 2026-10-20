@@ -2,13 +2,13 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use infigraph_core::daemon_protocol::{WatchAction, WatchRole};
-use infigraph_core::Infigraph;
+use infigraph_core::CodeIndex;
 use infigraph_languages::bundled_registry;
 use serde_json::json;
 
 pub(crate) fn cmd_stats(root: &Path) -> Result<()> {
     let registry = bundled_registry()?;
-    let mut prism = Infigraph::open(root, registry)?;
+    let mut prism = CodeIndex::open(root, registry)?;
     prism.init_read_only()?;
     let stats = prism.stats()?;
     println!("{}", stats);
@@ -35,7 +35,7 @@ pub(crate) fn cmd_languages(project_root: Option<&Path>) -> Result<()> {
 
 pub(crate) fn cmd_symbols(root: &Path, file: &str) -> Result<()> {
     let registry = bundled_registry()?;
-    let mut prism = Infigraph::open(root, registry)?;
+    let mut prism = CodeIndex::open(root, registry)?;
     prism.init_read_only()?;
 
     let backend = prism.backend().context("graph not initialized")?;
@@ -60,7 +60,7 @@ pub(crate) fn cmd_symbols(root: &Path, file: &str) -> Result<()> {
 
 pub(crate) fn cmd_skeleton(root: &Path, file: &str) -> Result<()> {
     let registry = bundled_registry()?;
-    let mut prism = Infigraph::open(root, registry)?;
+    let mut prism = CodeIndex::open(root, registry)?;
     prism.init_read_only()?;
 
     let backend = prism.backend().context("graph not initialized")?;
@@ -76,7 +76,7 @@ pub(crate) fn cmd_ingest(
     source_dir: Option<&str>,
 ) -> Result<()> {
     let registry = bundled_registry()?;
-    let mut prism = Infigraph::open(root, registry)?;
+    let mut prism = CodeIndex::open(root, registry)?;
     prism.init()?;
 
     let schemas = infigraph_core::structured::discover_schemas(root)?;
@@ -134,7 +134,7 @@ pub(crate) fn cmd_ingest(
 
 pub(crate) fn cmd_index_manifests(root: &Path) -> Result<()> {
     let registry = bundled_registry()?;
-    let mut prism = Infigraph::open(root, registry)?;
+    let mut prism = CodeIndex::open(root, registry)?;
     prism.init()?;
     let backend = prism.backend().context("graph not initialized")?;
     let results = infigraph_core::manifest::index_manifests(root, backend)?;
@@ -184,7 +184,7 @@ pub(crate) fn cmd_index_manifests(root: &Path) -> Result<()> {
 
 pub(crate) fn cmd_dependencies(root: &Path, ecosystem: Option<&str>) -> Result<()> {
     let registry = bundled_registry()?;
-    let mut prism = Infigraph::open(root, registry)?;
+    let mut prism = CodeIndex::open(root, registry)?;
     prism.init()?;
     let backend = prism.backend().context("graph not initialized")?;
     let mut deps = infigraph_core::manifest::query_deps(backend)?;
@@ -210,7 +210,7 @@ pub(crate) fn cmd_dependencies(root: &Path, ecosystem: Option<&str>) -> Result<(
 
 pub(crate) fn cmd_api_surface(root: &Path, file_filter: Option<&str>) -> Result<()> {
     let registry = bundled_registry()?;
-    let mut prism = Infigraph::open(root, registry)?;
+    let mut prism = CodeIndex::open(root, registry)?;
     prism.init_read_only()?;
     let backend = prism.backend().context("graph not initialized")?;
     let mut syms = backend.get_api_surface()?;
@@ -232,7 +232,7 @@ pub(crate) fn cmd_api_surface(root: &Path, file_filter: Option<&str>) -> Result<
 
 pub(crate) fn cmd_file_deps(root: &Path, file: &str) -> Result<()> {
     let registry = bundled_registry()?;
-    let mut prism = Infigraph::open(root, registry)?;
+    let mut prism = CodeIndex::open(root, registry)?;
     prism.init_read_only()?;
     let backend = prism.backend().context("graph not initialized")?;
     let deps = backend.get_file_deps(file)?;
@@ -256,7 +256,7 @@ pub(crate) fn cmd_file_deps(root: &Path, file: &str) -> Result<()> {
 
 pub(crate) fn cmd_type_hierarchy(root: &Path, symbol: &str, depth: u32) -> Result<()> {
     let registry = bundled_registry()?;
-    let mut prism = Infigraph::open(root, registry)?;
+    let mut prism = CodeIndex::open(root, registry)?;
     prism.init_read_only()?;
     let backend = prism.backend().context("graph not initialized")?;
     let hier = backend.get_type_hierarchy(symbol, depth)?;
@@ -280,7 +280,7 @@ pub(crate) fn cmd_type_hierarchy(root: &Path, symbol: &str, depth: u32) -> Resul
 
 pub(crate) fn cmd_test_coverage(root: &Path, file_filter: Option<&str>) -> Result<()> {
     let registry = bundled_registry()?;
-    let mut prism = Infigraph::open(root, registry)?;
+    let mut prism = CodeIndex::open(root, registry)?;
     prism.init_read_only()?;
     let backend = prism.backend().context("graph not initialized")?;
     let mut cov = backend.get_test_coverage()?;
@@ -376,7 +376,7 @@ pub(crate) fn cmd_daemon(root: &Path, debounce: u64) -> Result<()> {
     // INFIGRAPH_BACKEND when it spawns this process normally. This
     // covers the case where someone runs `infigraph daemon` directly
     // from a shell that happens to have INFIGRAPH_BACKEND=daemon set --
-    // without this, the daemon's own Infigraph::open (reached via
+    // without this, the daemon's own CodeIndex::open (reached via
     // watch_project -> open_transient) would select DaemonKuzu on
     // itself and deadlock waiting on a request nothing serves.
     std::env::set_var(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND);
@@ -818,8 +818,36 @@ pub(crate) fn cmd_daemon(root: &Path, debounce: u64) -> Result<()> {
 struct DocWatchThread {
     root: std::path::PathBuf,
     debounce: u64,
+    /// The coordinator's door, once it has one (`DocsHandle::bind_submitter`):
+    /// the document sink submits its index runs through it.
+    submitter: DocSubmitterSlot,
     shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
+}
+
+type DocSubmitterSlot = std::sync::Arc<
+    std::sync::Mutex<
+        Option<(
+            infigraph_core::daemon::coordinator_port::WriteSubmitter,
+            tokio_util::sync::CancellationToken,
+        )>,
+    >,
+>;
+
+/// The coordinator as the document sink's submit target: a write goes to it
+/// as a client's would, and the sink's worker thread waits for the answer.
+struct CoordinatorSubmit(
+    infigraph_core::daemon::coordinator_port::WriteSubmitter,
+    tokio_util::sync::CancellationToken,
+);
+
+impl infigraph_docs::path_queue::DocSubmit for CoordinatorSubmit {
+    fn submit(
+        &self,
+        request: infigraph_core::daemon_protocol::WriteRequest,
+    ) -> anyhow::Result<infigraph_core::daemon_protocol::WriteResult> {
+        self.0.submit(request, &self.1)
+    }
 }
 
 /// `cmd_daemon`'s doc-watch thread as the coordinator's `DocsHandle`.
@@ -845,12 +873,30 @@ impl infigraph_core::daemon::DocsHandle for DocWatchHandle {
     fn is_busy(&self) -> bool {
         infigraph_docs::watch::reindex_in_progress()
     }
+    fn bind_submitter(
+        &self,
+        submitter: infigraph_core::daemon::coordinator_port::WriteSubmitter,
+        cancel: tokio_util::sync::CancellationToken,
+    ) {
+        let slot = self.0.lock().unwrap().submitter.clone();
+        *slot.lock().unwrap() = Some((submitter, cancel));
+    }
     fn index_docs(
         &self,
         full: bool,
     ) -> std::result::Result<infigraph_core::daemon_protocol::DocIndexStats, String> {
         let root = self.0.lock().unwrap().root.clone();
         infigraph_docs::ops::index_docs(&root, full).map_err(|e| format!("{e:#}"))
+    }
+    fn index_doc_paths(
+        &self,
+        upserts: &[String],
+        removals: &[String],
+        whole: bool,
+    ) -> std::result::Result<usize, String> {
+        let root = self.0.lock().unwrap().root.clone();
+        infigraph_docs::ops::index_doc_paths(&root, upserts, removals, whole)
+            .map_err(|e| format!("{e:#}"))
     }
     fn ack_docs(
         &self,
@@ -871,6 +917,7 @@ impl DocWatchThread {
         DocWatchThread {
             root,
             debounce,
+            submitter: DocSubmitterSlot::default(),
             shutdown: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             handle: None,
         }
@@ -889,8 +936,20 @@ impl DocWatchThread {
         let root = self.root.clone();
         let debounce = self.debounce;
         let shutdown = std::sync::Arc::clone(&self.shutdown);
+        let submitter = self.submitter.clone();
         self.handle = Some(std::thread::spawn(move || {
-            if let Err(e) = infigraph_docs::watch::watch_docs_daemon_loop(&root, debounce, shutdown)
+            // The document sink, once the coordinator has a port to submit to.
+            let sink_root = root.clone();
+            let make_sink = move || -> Option<Box<dyn infigraph_core::watch::sink::WatchSink>> {
+                let (submitter, cancel) = submitter.lock().unwrap().clone()?;
+                Some(Box::new(infigraph_docs::watch::document_sink(
+                    &sink_root,
+                    std::sync::Arc::new(CoordinatorSubmit(submitter, cancel)),
+                    debounce,
+                )))
+            };
+            if let Err(e) =
+                infigraph_docs::watch::watch_docs_daemon_loop(&root, shutdown, make_sink)
             {
                 eprintln!("[doc-watch-daemon] error: {e}");
             }
@@ -1222,7 +1281,7 @@ pub(crate) fn acquire_watch_lock(lock_path: &Path) -> Result<infigraph_core::loc
 
 pub(crate) fn cmd_scip_import(root: &Path, index_path: &Path) -> Result<()> {
     let registry = bundled_registry()?;
-    let mut prism = Infigraph::open(root, registry)?;
+    let mut prism = CodeIndex::open(root, registry)?;
     prism.init()?;
 
     let backend = prism.backend().context("graph not initialized")?;
@@ -1372,7 +1431,7 @@ pub(crate) fn cmd_index_confluence(
 
 pub(crate) fn cmd_list_files(root: &Path, glob: Option<&str>) -> Result<()> {
     let registry = bundled_registry()?;
-    let mut prism = Infigraph::open(root, registry)?;
+    let mut prism = CodeIndex::open(root, registry)?;
     prism.init_read_only()?;
 
     let backend = prism.backend().context("graph not initialized")?;
@@ -1404,7 +1463,7 @@ pub(crate) fn cmd_generate_test_context(
     limit: usize,
 ) -> Result<()> {
     let registry = bundled_registry()?;
-    let mut prism = Infigraph::open(root, registry)?;
+    let mut prism = CodeIndex::open(root, registry)?;
     prism.init_read_only()?;
 
     let backend = prism.backend().context("graph not initialized")?;

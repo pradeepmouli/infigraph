@@ -198,7 +198,7 @@ pub fn crash_loop_detected(infigraph_dir: &Path) -> Option<Vec<u64>> {
 // before it opens the graph and removes it after; a sentinel whose writer is
 // gone is one death of an opener, whatever the signal.
 
-const OPEN_SENTINEL_PREFIX: &str = "graph-opening.";
+const OPEN_SENTINEL_PREFIX: &str = crate::graph::names::OPEN_SENTINEL_PREFIX;
 const OPEN_DEATHS_LOG: &str = "open-deaths.log";
 
 /// Test hook: while the file this variable names exists, die by SIGSEGV
@@ -333,7 +333,7 @@ pub fn open_deaths(infigraph_dir: &Path) -> Vec<u64> {
 /// the open. None died: nothing. Some did: the WAL is the usual cause, so ask
 /// `recover` (the out-of-process probe in production) to set a torn one aside
 /// -- `graph.torn-wal.<ts>.wal.checkpoint` -- and open without it. A graph
-/// that opens in neither state is `GraphCorruption`, which `Infigraph::init`
+/// that opens in neither state is `GraphCorruption`, which `CodeIndex::init`
 /// answers with its rebuild; one a probe opens fine but that keeps killing
 /// its opener trips the existing crash-loop marker instead of looping.
 pub fn settle_open_deaths(
@@ -495,7 +495,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
         assert!(!pending_recovery(dir));
-        mark_recovery_needed(dir, 4242, &dir.join("graph.corrupt.1")).unwrap();
+        mark_recovery_needed(
+            dir,
+            4242,
+            &dir.join(crate::graph::names::sibling(".corrupt.1")),
+        )
+        .unwrap();
         assert!(pending_recovery(dir));
         clear_recovery_needed(dir).unwrap();
         assert!(!pending_recovery(dir));
@@ -516,7 +521,12 @@ mod tests {
     fn a_pending_sentinel_asks_for_a_rebuild_until_one_starts() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
-        mark_recovery_needed(dir, 1, &dir.join("graph.corrupt.1")).unwrap();
+        mark_recovery_needed(
+            dir,
+            1,
+            &dir.join(crate::graph::names::sibling(".corrupt.1")),
+        )
+        .unwrap();
 
         // Review finding (#204): asking is not doing. The request lives only
         // in the coordinator's memory, so the sentinel -- which survives a
@@ -553,7 +563,12 @@ mod tests {
         for _ in 0..CRASH_LOOP_THRESHOLD {
             record_recovery_attempt(dir).unwrap();
         }
-        mark_recovery_needed(dir, 1, &dir.join("graph.corrupt.99")).unwrap();
+        mark_recovery_needed(
+            dir,
+            1,
+            &dir.join(crate::graph::names::sibling(".corrupt.99")),
+        )
+        .unwrap();
 
         assert!(
             !recovery_rebuild_wanted(dir).unwrap(),
@@ -571,9 +586,20 @@ mod tests {
     fn find_most_recent_previous_prefers_the_newest_entry() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
-        std::fs::write(dir.join("graph.previous.100"), b"old").unwrap();
-        std::fs::write(dir.join("graph.previous.200"), b"new").unwrap();
-        let found = find_most_recent_previous(dir, "graph").unwrap();
-        assert_eq!(found.file_name().unwrap(), "graph.previous.200");
+        std::fs::write(
+            dir.join(crate::graph::names::sibling(".previous.100")),
+            b"old",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join(crate::graph::names::sibling(".previous.200")),
+            b"new",
+        )
+        .unwrap();
+        let found = find_most_recent_previous(dir, crate::graph::names::STEM).unwrap();
+        assert_eq!(
+            found.file_name().unwrap(),
+            crate::graph::names::sibling(".previous.200").as_str()
+        );
     }
 }

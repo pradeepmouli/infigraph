@@ -5,7 +5,7 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use infigraph_core::Infigraph;
+use infigraph_core::CodeIndex;
 use infigraph_languages::bundled_registry;
 
 fn copy_tree(from: &Path, to: &Path) {
@@ -27,14 +27,14 @@ fn edges_of_a_full_build(reduce_before_resolution: bool) -> BTreeSet<String> {
     let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/microservices");
     let source = tempfile::tempdir().unwrap();
     copy_tree(&fixtures, source.path());
-    let mut parsed = Infigraph::open(source.path(), bundled_registry().unwrap()).unwrap();
+    let mut parsed = CodeIndex::open(source.path(), bundled_registry().unwrap()).unwrap();
     parsed.init().unwrap();
     let mut extractions = parsed.index().unwrap().extractions;
     assert!(extractions.len() > 10, "the fixtures were not indexed");
 
     // A second, empty graph, written the way the daemon's rebuild writes it.
     let project = tempfile::tempdir().unwrap();
-    let mut infigraph = Infigraph::open(project.path(), bundled_registry().unwrap()).unwrap();
+    let mut infigraph = CodeIndex::open(project.path(), bundled_registry().unwrap()).unwrap();
     infigraph.init().unwrap();
     let backend = infigraph.backend().unwrap();
     backend.upsert_files_bulk(&extractions, true).unwrap();

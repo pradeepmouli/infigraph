@@ -90,7 +90,7 @@ impl Drop for KillOnDrop {
 ///    `notify` watcher registers -- there's no initial full scan on attach.
 ///    readme.md must not be written until the daemon has actually attached,
 ///    or the file-create event fires before anything is listening and is
-///    silently missed. We wait for the "attaching doc watcher" log line.
+///    silently missed. We wait for the "attaching the document sink" log line.
 ///
 /// 2. Verifying the reindex happened is done by watching for the daemon's
 ///    "reindexed: N files, M chunks" line, NOT by opening `docs.kuzu` a
@@ -153,7 +153,7 @@ fn cmd_watch_daemon_also_indexes_docs_without_restart() {
     std::thread::spawn(move || {
         for line in BufReader::new(stderr).lines().map_while(Result::ok) {
             eprintln!("[watch stderr] {line}");
-            if line.contains("attaching doc watcher") {
+            if line.contains("attaching the document sink") {
                 let _ = attach_tx.send(());
             }
             if line.contains("reindexed:") {
@@ -581,7 +581,7 @@ fn watch_docs_stop_and_start_over_control_are_visible_in_status() {
     std::thread::spawn(move || {
         for line in BufReader::new(stderr).lines().map_while(Result::ok) {
             eprintln!("[daemon stderr] {line}");
-            if line.contains("attaching doc watcher") {
+            if line.contains("attaching the document sink") {
                 let _ = attach_tx.send(());
             }
             if line.contains("[doc-watch-daemon] stopped") {

@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use infigraph_core::lang::LanguageRegistry;
-use infigraph_core::Infigraph;
+use infigraph_core::CodeIndex;
 use infigraph_languages::bundled_registry;
 
 use agent::cmd_init;
@@ -1263,7 +1263,9 @@ fn run(command: Commands, root: &Path, root_given: bool) -> Result<()> {
             index::restamp_growth_baseline(root);
             println!(
                 "Growth-guard baseline re-recorded from the current graph ({}).",
-                root.join(".infigraph").join("graph.health.json").display()
+                root.join(".infigraph")
+                    .join(infigraph_core::graph::names::HEALTH)
+                    .display()
             );
             Ok(())
         }
@@ -1308,7 +1310,7 @@ fn run(command: Commands, root: &Path, root_given: bool) -> Result<()> {
         Commands::Uninstall => cmd_uninstall(),
         Commands::Bench { n } => {
             let registry = bundled_registry()?;
-            let mut prism = Infigraph::open(root, registry)?;
+            let mut prism = CodeIndex::open(root, registry)?;
             prism.init()?;
             let store = prism.store().context("not initialized")?;
             store.test_parquet_quality()?;
@@ -1316,7 +1318,7 @@ fn run(command: Commands, root: &Path, root_given: bool) -> Result<()> {
         }
         Commands::BenchParquet => {
             let registry = bundled_registry()?;
-            let mut prism = Infigraph::open(root, registry)?;
+            let mut prism = CodeIndex::open(root, registry)?;
             prism.init()?;
             let store = prism.store().context("not initialized")?;
             store.benchmark_parquet_vs_csv()
@@ -1484,7 +1486,7 @@ fn run(command: Commands, root: &Path, root_given: bool) -> Result<()> {
         }
         Commands::BenchQuality { save } => {
             let registry = bundled_registry()?;
-            let mut prism = infigraph_core::Infigraph::open(root, registry)?;
+            let mut prism = infigraph_core::CodeIndex::open(root, registry)?;
             prism.init()?;
             let backend = prism
                 .backend()

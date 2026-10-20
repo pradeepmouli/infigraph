@@ -114,6 +114,7 @@ fn attach_lease(root: &std::path::Path) -> infigraph_core::daemon::read_endpoint
 fn an_unleased_daemon_exits_after_its_grace() {
     let project = indexed_project();
     let mut daemon = spawn_daemon(project.path(), "2");
+    let daemon_pid = daemon.0.id();
     assert!(
         wait_until_gone("idle daemon", || daemon_alive(project.path())).is_some(),
         "a daemon with no lease and no requests must exit after its grace"
@@ -127,6 +128,24 @@ fn an_unleased_daemon_exits_after_its_grace() {
             .connect()
             .is_err(),
         "the read endpoint must be released on idle exit"
+    );
+
+    // It left on purpose, and says so, until a daemon is running again.
+    let exit = infigraph_core::daemon::idle_exit::last(project.path())
+        .expect("an idle exit leaves its breadcrumb");
+    assert_eq!(exit.pid, daemon_pid);
+    let status = infigraph_core::daemon::control::describe_status(
+        project.path(),
+        &infigraph_core::daemon::control::query_status(project.path()),
+    );
+    assert!(
+        status.contains("as designed"),
+        "no watcher running reads as a death, not an exit: {status}"
+    );
+    let _restarted = spawn_daemon(project.path(), "0");
+    assert!(
+        infigraph_core::daemon::idle_exit::last(project.path()).is_none(),
+        "a running daemon clears the last one's idle-exit breadcrumb"
     );
 }
 

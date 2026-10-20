@@ -522,11 +522,19 @@ fn write_dead_holder_lock(lock_path: &std::path::Path, pid: u32) {
 /// back to, and the bootstrap graph already has real symbol content.
 fn demote_live_graph_to_previous_and_seed_dead_holder_wal(project_path: &str) {
     let infigraph_dir = std::path::PathBuf::from(project_path).join(".infigraph");
-    let graph_path = infigraph_dir.join("graph");
-    std::fs::rename(&graph_path, infigraph_dir.join("graph.previous.111")).unwrap();
+    let graph_path = infigraph_dir.join(infigraph_core::graph::names::STEM);
+    std::fs::rename(
+        &graph_path,
+        infigraph_dir.join(infigraph_core::graph::names::sibling(".previous.111")),
+    )
+    .unwrap();
 
     std::fs::write(&graph_path, vec![0u8; 4096]).unwrap();
-    std::fs::write(infigraph_dir.join("graph.wal"), b"stub wal").unwrap();
+    std::fs::write(
+        infigraph_dir.join(infigraph_core::graph::names::sibling(".wal")),
+        b"stub wal",
+    )
+    .unwrap();
     write_dead_holder_lock(
         &infigraph_core::graph::db_lock_path(&graph_path),
         999_999_999,

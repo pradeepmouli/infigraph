@@ -5,13 +5,18 @@ use std::fs;
 fn quarantine_renames_instead_of_deleting() {
     let dir = tempfile::tempdir().unwrap();
     let ig = dir.path().join(".infigraph");
-    fs::create_dir_all(ig.join("graph")).unwrap();
-    fs::write(ig.join("graph").join("catalog.kz"), b"fake db content").unwrap();
+    fs::create_dir_all(ig.join(infigraph_core::graph::names::STEM)).unwrap();
+    fs::write(
+        ig.join(infigraph_core::graph::names::STEM)
+            .join("catalog.kz"),
+        b"fake db content",
+    )
+    .unwrap();
 
-    let quarantine_path = quarantine_graph(&ig, "graph").unwrap();
+    let quarantine_path = quarantine_graph(&ig, infigraph_core::graph::names::STEM).unwrap();
 
     assert!(
-        !ig.join("graph").exists(),
+        !ig.join(infigraph_core::graph::names::STEM).exists(),
         "original graph dir must be gone from its live path"
     );
     assert!(quarantine_path.exists(), "quarantine dir must exist");
@@ -33,19 +38,25 @@ fn quarantine_evicts_oldest_beyond_bound_of_two() {
 
     // Pre-seed two quarantine dirs with distinct, ordered timestamps so
     // eviction order is deterministic regardless of wall-clock speed.
-    fs::create_dir_all(ig.join("graph.corrupt.100")).unwrap();
-    fs::create_dir_all(ig.join("graph.corrupt.200")).unwrap();
+    fs::create_dir_all(ig.join(infigraph_core::graph::names::sibling(".corrupt.100"))).unwrap();
+    fs::create_dir_all(ig.join(infigraph_core::graph::names::sibling(".corrupt.200"))).unwrap();
 
-    fs::create_dir_all(ig.join("graph")).unwrap();
-    fs::write(ig.join("graph").join("marker"), b"third").unwrap();
-    let third = quarantine_graph(&ig, "graph").unwrap();
+    fs::create_dir_all(ig.join(infigraph_core::graph::names::STEM)).unwrap();
+    fs::write(
+        ig.join(infigraph_core::graph::names::STEM).join("marker"),
+        b"third",
+    )
+    .unwrap();
+    let third = quarantine_graph(&ig, infigraph_core::graph::names::STEM).unwrap();
 
     assert!(
-        !ig.join("graph.corrupt.100").exists(),
+        !ig.join(infigraph_core::graph::names::sibling(".corrupt.100"))
+            .exists(),
         "oldest quarantine dir (100) must be evicted to keep the bound at N=2"
     );
     assert!(
-        ig.join("graph.corrupt.200").exists(),
+        ig.join(infigraph_core::graph::names::sibling(".corrupt.200"))
+            .exists(),
         "newer pre-existing quarantine dir (200) must survive"
     );
     assert!(third.exists(), "the newly quarantined dir must exist");
@@ -56,7 +67,7 @@ fn quarantine_evicts_oldest_beyond_bound_of_two() {
         .filter(|e| {
             e.file_name()
                 .to_string_lossy()
-                .starts_with("graph.corrupt.")
+                .starts_with(infigraph_core::graph::names::CORRUPT_PREFIX)
         })
         .collect();
     assert_eq!(remaining.len(), 2, "quarantine pool must never exceed N=2");
@@ -77,18 +88,28 @@ fn quarantine_evicts_oldest_file_type_beyond_bound_of_two() {
 
     // Pre-seed two FILE-type quarantine entries with distinct, ordered
     // timestamps so eviction order is deterministic.
-    fs::write(ig.join("graph.corrupt.100"), b"old-1").unwrap();
-    fs::write(ig.join("graph.corrupt.200"), b"old-2").unwrap();
+    fs::write(
+        ig.join(infigraph_core::graph::names::sibling(".corrupt.100")),
+        b"old-1",
+    )
+    .unwrap();
+    fs::write(
+        ig.join(infigraph_core::graph::names::sibling(".corrupt.200")),
+        b"old-2",
+    )
+    .unwrap();
 
-    fs::write(ig.join("graph"), b"third").unwrap();
-    let third = quarantine_graph(&ig, "graph").unwrap();
+    fs::write(ig.join(infigraph_core::graph::names::STEM), b"third").unwrap();
+    let third = quarantine_graph(&ig, infigraph_core::graph::names::STEM).unwrap();
 
     assert!(
-        !ig.join("graph.corrupt.100").exists(),
+        !ig.join(infigraph_core::graph::names::sibling(".corrupt.100"))
+            .exists(),
         "oldest quarantine FILE (100) must be evicted to keep the bound at N=2"
     );
     assert!(
-        ig.join("graph.corrupt.200").exists(),
+        ig.join(infigraph_core::graph::names::sibling(".corrupt.200"))
+            .exists(),
         "newer pre-existing quarantine file (200) must survive"
     );
     assert!(third.exists(), "the newly quarantined file must exist");
@@ -103,7 +124,7 @@ fn quarantine_evicts_oldest_file_type_beyond_bound_of_two() {
         .filter(|e| {
             e.file_name()
                 .to_string_lossy()
-                .starts_with("graph.corrupt.")
+                .starts_with(infigraph_core::graph::names::CORRUPT_PREFIX)
         })
         .collect();
     assert_eq!(
@@ -124,25 +145,39 @@ fn quarantine_moves_wal_family_siblings_with_content_intact() {
     let ig = dir.path().join(".infigraph");
     fs::create_dir_all(&ig).unwrap();
 
-    fs::write(ig.join("graph"), b"base graph content").unwrap();
-    fs::write(ig.join("graph.wal"), b"wal content").unwrap();
-    fs::write(ig.join("graph.wal.checkpoint"), b"checkpoint content").unwrap();
+    fs::write(
+        ig.join(infigraph_core::graph::names::STEM),
+        b"base graph content",
+    )
+    .unwrap();
+    fs::write(
+        ig.join(infigraph_core::graph::names::sibling(".wal")),
+        b"wal content",
+    )
+    .unwrap();
+    fs::write(
+        ig.join(infigraph_core::graph::names::sibling(".wal.checkpoint")),
+        b"checkpoint content",
+    )
+    .unwrap();
 
-    let quarantine_path = quarantine_graph(&ig, "graph").unwrap();
+    let quarantine_path = quarantine_graph(&ig, infigraph_core::graph::names::STEM).unwrap();
 
     // Originals must be gone from their live paths -- otherwise a caller's
     // unconditional post-quarantine cleanup would delete them there,
     // destroying evidence rather than preserving it.
     assert!(
-        !ig.join("graph").exists(),
+        !ig.join(infigraph_core::graph::names::STEM).exists(),
         "base graph must be gone from its live path"
     );
     assert!(
-        !ig.join("graph.wal").exists(),
+        !ig.join(infigraph_core::graph::names::sibling(".wal"))
+            .exists(),
         "wal sibling must be gone from its live path"
     );
     assert!(
-        !ig.join("graph.wal.checkpoint").exists(),
+        !ig.join(infigraph_core::graph::names::sibling(".wal.checkpoint"))
+            .exists(),
         "wal checkpoint sibling must be gone from its live path"
     );
 
@@ -197,18 +232,30 @@ fn retiring_a_superseded_graph_does_not_touch_the_corruption_pool() {
     let ig = dir.path().join(".infigraph");
     fs::create_dir_all(&ig).unwrap();
 
-    fs::write(ig.join("graph.corrupt.100"), b"real corruption evidence").unwrap();
-    fs::write(ig.join("graph"), b"superseded but healthy").unwrap();
-    fs::write(ig.join("graph.wal"), b"its wal").unwrap();
+    fs::write(
+        ig.join(infigraph_core::graph::names::sibling(".corrupt.100")),
+        b"real corruption evidence",
+    )
+    .unwrap();
+    fs::write(
+        ig.join(infigraph_core::graph::names::STEM),
+        b"superseded but healthy",
+    )
+    .unwrap();
+    fs::write(
+        ig.join(infigraph_core::graph::names::sibling(".wal")),
+        b"its wal",
+    )
+    .unwrap();
 
-    let retired = retire_previous_graph(&ig, "graph").unwrap();
+    let retired = retire_previous_graph(&ig, infigraph_core::graph::names::STEM).unwrap();
 
     assert!(
         retired
             .file_name()
             .unwrap()
             .to_string_lossy()
-            .starts_with("graph.previous."),
+            .starts_with(infigraph_core::graph::names::PREVIOUS_PREFIX),
         "a superseded graph must not be labelled `.corrupt.`, got {}",
         retired.display()
     );
@@ -220,7 +267,8 @@ fn retiring_a_superseded_graph_does_not_touch_the_corruption_pool() {
         "the retired graph's WAL family must travel with it"
     );
     assert!(
-        ig.join("graph.corrupt.100").exists(),
+        ig.join(infigraph_core::graph::names::sibling(".corrupt.100"))
+            .exists(),
         "retiring a healthy graph must not evict corruption evidence"
     );
 }
@@ -234,18 +282,28 @@ fn retirement_pool_keeps_only_the_most_recent_superseded_graph() {
     let ig = dir.path().join(".infigraph");
     fs::create_dir_all(&ig).unwrap();
 
-    fs::write(ig.join("graph.previous.100"), b"older").unwrap();
-    fs::write(ig.join("graph.previous.100.wal"), b"older wal").unwrap();
-    fs::write(ig.join("graph"), b"newest").unwrap();
+    fs::write(
+        ig.join(infigraph_core::graph::names::sibling(".previous.100")),
+        b"older",
+    )
+    .unwrap();
+    fs::write(
+        ig.join(infigraph_core::graph::names::sibling(".previous.100.wal")),
+        b"older wal",
+    )
+    .unwrap();
+    fs::write(ig.join(infigraph_core::graph::names::STEM), b"newest").unwrap();
 
-    let retired = retire_previous_graph(&ig, "graph").unwrap();
+    let retired = retire_previous_graph(&ig, infigraph_core::graph::names::STEM).unwrap();
 
     assert!(
-        !ig.join("graph.previous.100").exists(),
+        !ig.join(infigraph_core::graph::names::sibling(".previous.100"))
+            .exists(),
         "the previously-retired graph must be evicted"
     );
     assert!(
-        !ig.join("graph.previous.100.wal").exists(),
+        !ig.join(infigraph_core::graph::names::sibling(".previous.100.wal"))
+            .exists(),
         "an evicted entry's WAL siblings must go with it, not leak"
     );
     assert!(retired.exists());
@@ -256,7 +314,7 @@ fn retirement_pool_keeps_only_the_most_recent_superseded_graph() {
         .filter(|e| {
             e.file_name()
                 .to_string_lossy()
-                .starts_with("graph.previous.")
+                .starts_with(infigraph_core::graph::names::PREVIOUS_PREFIX)
         })
         .count();
     assert_eq!(remaining, 1, "retirement pool must never exceed N=1");
@@ -277,11 +335,19 @@ fn same_second_quarantines_land_on_distinct_entries_without_data_loss() {
     let ig = dir.path().join(".infigraph");
     fs::create_dir_all(&ig).unwrap();
 
-    fs::write(ig.join("graph"), b"first corrupt graph").unwrap();
-    let first = quarantine_graph(&ig, "graph").unwrap();
+    fs::write(
+        ig.join(infigraph_core::graph::names::STEM),
+        b"first corrupt graph",
+    )
+    .unwrap();
+    let first = quarantine_graph(&ig, infigraph_core::graph::names::STEM).unwrap();
 
-    fs::write(ig.join("graph"), b"second corrupt graph").unwrap();
-    let second = quarantine_graph(&ig, "graph").unwrap();
+    fs::write(
+        ig.join(infigraph_core::graph::names::STEM),
+        b"second corrupt graph",
+    )
+    .unwrap();
+    let second = quarantine_graph(&ig, infigraph_core::graph::names::STEM).unwrap();
 
     assert_ne!(
         first, second,

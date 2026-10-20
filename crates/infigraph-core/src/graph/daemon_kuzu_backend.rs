@@ -41,7 +41,7 @@ pub struct DaemonKuzuBackend {
 
 impl DaemonKuzuBackend {
     pub fn open(root: &Path) -> Result<Self> {
-        let db_path = root.join(".infigraph").join("graph");
+        let db_path = root.join(".infigraph").join(crate::graph::names::STEM);
         // No validation probe here any more.
         //
         // This used to `drop(KuzuBackend::open_read_only(&db_path)?)` so a
@@ -54,7 +54,7 @@ impl DaemonKuzuBackend {
         // daemon was busy writing, which is when routing matters most.
         //
         // The eager check that replaces it is reachability, not openability:
-        // `Infigraph::init`/`init_read_only` call
+        // `CodeIndex::init`/`init_read_only` call
         // `lifecycle::ensure_daemon_for_routed_access`, which starts a daemon
         // or fails with an actionable message.
         Ok(Self {
@@ -84,7 +84,7 @@ impl DaemonKuzuBackend {
     /// Reads are daemon-mandatory. The hatch exists so a graph stays
     /// recoverable when the daemon itself is broken, and it is deliberately
     /// explicit rather than an automatic fallback: a silent fallback keeps
-    /// both paths permanently live, which is how `Infigraph::init` and
+    /// both paths permanently live, which is how `CodeIndex::init` and
     /// `GraphStore::open_read_only_or_degrade` drifted apart until one
     /// quarantined healthy graphs (5818aa1).
     fn with_reader<T>(
@@ -159,7 +159,7 @@ impl DaemonKuzuBackend {
     /// `resolve_calls`). A full first index of a large repo puts every file's
     /// extraction through one of these, and the daemon only answers once
     /// the whole batch commits -- matching the 600s
-    /// `Infigraph::index()` allows for the same work under the
+    /// `CodeIndex::index()` allows for the same work under the
     /// `INFIGRAPH_WATCH_INDEX_VIA_DAEMON` path.
     const BULK_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 }
@@ -295,7 +295,7 @@ impl GraphBackend for DaemonKuzuBackend {
     fn upsert_file(&self, _extraction: &FileExtraction) -> Result<()> {
         Err(Self::not_supported(
             "upsert_file",
-            "Infigraph::index()/index_files()",
+            "CodeIndex::index()/index_files()",
         ))
     }
     fn upsert_files_bulk(
@@ -400,7 +400,7 @@ impl GraphBackend for DaemonKuzuBackend {
     ) -> Result<ResolveStats> {
         Err(Self::not_supported(
             "re_resolve_for_files",
-            "Infigraph::index()/index_files() (internal only)",
+            "CodeIndex::index()/index_files() (internal only)",
         ))
     }
     fn import_scip_index(
@@ -588,7 +588,7 @@ mod tests {
     /// Reads are daemon-mandatory. The escape hatch exists so a graph is
     /// recoverable when the daemon itself is broken, and is deliberately
     /// explicit: a silent fallback would keep both paths permanently live,
-    /// which is how `Infigraph::init` and
+    /// which is how `CodeIndex::init` and
     /// `GraphStore::open_read_only_or_degrade` drifted apart until one
     /// quarantined healthy graphs (5818aa1).
     #[test]
@@ -597,7 +597,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let graph = root.join(".infigraph").join("graph");
+        let graph = root.join(".infigraph").join(crate::graph::names::STEM);
         std::fs::create_dir_all(graph.parent().unwrap()).unwrap();
         drop(crate::graph::GraphStore::open(&graph).unwrap());
 
@@ -630,7 +630,12 @@ mod tests {
 
         let backend = DaemonKuzuBackend::open(dir.path()).unwrap();
 
-        assert_eq!(backend.db_path, dir.path().join(".infigraph").join("graph"));
+        assert_eq!(
+            backend.db_path,
+            dir.path()
+                .join(".infigraph")
+                .join(crate::graph::names::STEM)
+        );
         assert!(
             !backend.db_path.exists(),
             "open must not create the graph itself -- that's the daemon's write path's job"
@@ -640,7 +645,10 @@ mod tests {
     #[test]
     fn open_still_validates_an_existing_graph() {
         let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join(".infigraph").join("graph");
+        let db_path = dir
+            .path()
+            .join(".infigraph")
+            .join(crate::graph::names::STEM);
         drop(super::super::store::GraphStore::open(&db_path).unwrap());
 
         DaemonKuzuBackend::open(dir.path()).unwrap();

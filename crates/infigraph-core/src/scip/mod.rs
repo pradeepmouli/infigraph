@@ -1390,7 +1390,10 @@ fn import_scip_index_unrecorded(
     store.stamp_scip_generation_conn(&conn, &_lock, enriched_ast_generation)?;
 
     if let Some(dir) = store.db_dir() {
-        crate::graph::store_util::stamp_healthy_graph_size_if_unset(dir, &dir.join("graph"));
+        crate::graph::store_util::stamp_healthy_graph_size_if_unset(
+            dir,
+            &dir.join(crate::graph::names::STEM),
+        );
     }
     clock.lap("stamp");
     eprintln!("[scip-import] phases: {}", clock.report());
@@ -1557,7 +1560,7 @@ fn descriptor_name(scip_sym: &str) -> String {
 }
 
 /// The language packs the import reads object-literal owners with. Set once
-/// per process by whoever opens a project (`Infigraph::open_shared`), because
+/// per process by whoever opens a project (`CodeIndex::open_shared`), because
 /// the import runs behind `GraphBackend`, which carries no registry, and
 /// every process uses the one bundled set. Without it (a bare store in a
 /// test) a literal member simply keeps the id its moniker gives it.
@@ -2666,7 +2669,7 @@ mod tests {
     impl TestEnv {
         fn new() -> Self {
             let dir = tempfile::TempDir::new().unwrap();
-            let store = GraphStore::open(&dir.path().join("graph")).unwrap();
+            let store = GraphStore::open(&dir.path().join(crate::graph::names::STEM)).unwrap();
             Self { _dir: dir, store }
         }
 

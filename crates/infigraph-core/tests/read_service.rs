@@ -12,7 +12,9 @@ use infigraph_core::graph::GraphStore;
 fn a_client_reads_rows_over_the_socket() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    let graph = root.join(".infigraph").join("graph");
+    let graph = root
+        .join(".infigraph")
+        .join(infigraph_core::graph::names::STEM);
     std::fs::create_dir_all(graph.parent().unwrap()).unwrap();
     {
         let store = GraphStore::open(&graph).unwrap();
@@ -38,7 +40,9 @@ fn a_client_reads_rows_over_the_socket() {
 fn a_write_sent_to_the_read_service_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    let graph = root.join(".infigraph").join("graph");
+    let graph = root
+        .join(".infigraph")
+        .join(infigraph_core::graph::names::STEM);
     std::fs::create_dir_all(graph.parent().unwrap()).unwrap();
     drop(GraphStore::open(&graph).unwrap());
     let store = open_shared_store(&graph);
@@ -73,7 +77,9 @@ fn a_write_sent_to_the_read_service_is_refused() {
 fn a_bare_commit_returns_an_empty_result_exactly_as_the_local_backend_does() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    let graph = root.join(".infigraph").join("graph");
+    let graph = root
+        .join(".infigraph")
+        .join(infigraph_core::graph::names::STEM);
     std::fs::create_dir_all(graph.parent().unwrap()).unwrap();
     let store = open_shared_store(&graph);
     let svc = infigraph_core::daemon::read_service::ReadService::start(root, store, 2).unwrap();
@@ -95,7 +101,9 @@ fn a_bare_commit_returns_an_empty_result_exactly_as_the_local_backend_does() {
 fn reads_are_served_concurrently_while_an_index_operation_holds_the_lock() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    let graph = root.join(".infigraph").join("graph");
+    let graph = root
+        .join(".infigraph")
+        .join(infigraph_core::graph::names::STEM);
     std::fs::create_dir_all(graph.parent().unwrap()).unwrap();
     {
         let store = GraphStore::open(&graph).unwrap();
@@ -146,7 +154,9 @@ fn reads_are_served_concurrently_while_an_index_operation_holds_the_lock() {
 fn a_write_is_visible_to_the_next_read_through_the_service() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    let graph = root.join(".infigraph").join("graph");
+    let graph = root
+        .join(".infigraph")
+        .join(infigraph_core::graph::names::STEM);
     std::fs::create_dir_all(graph.parent().unwrap()).unwrap();
 
     let store = open_shared_store(&graph);
@@ -187,7 +197,9 @@ fn remote_exec_satisfies_query_exec_against_a_live_service() {
 
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    let graph = root.join(".infigraph").join("graph");
+    let graph = root
+        .join(".infigraph")
+        .join(infigraph_core::graph::names::STEM);
     std::fs::create_dir_all(graph.parent().unwrap()).unwrap();
     {
         let store = GraphStore::open(&graph).unwrap();
@@ -217,7 +229,7 @@ fn remote_exec_satisfies_query_exec_against_a_live_service() {
 
 /// Killing the service mid-response must surface an error, never a
 /// successful empty result. This is the one failure mode with a precedent
-/// in this codebase: `Infigraph::init` once served a 0-symbol graph as
+/// in this codebase: `CodeIndex::init` once served a 0-symbol graph as
 /// healthy after a "successful" rebuild.
 ///
 /// Note this is the frame-boundary case, not the mid-frame one: the bytes
@@ -312,7 +324,9 @@ fn a_running_daemon_answers_reads_on_its_endpoint() {
 fn a_service_notices_its_socket_file_was_removed_and_still_shuts_down() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
-    let graph = root.join(".infigraph").join("graph");
+    let graph = root
+        .join(".infigraph")
+        .join(infigraph_core::graph::names::STEM);
     std::fs::create_dir_all(graph.parent().unwrap()).unwrap();
     drop(GraphStore::open(&graph).unwrap());
     let svc = infigraph_core::daemon::read_service::ReadService::start(
@@ -450,7 +464,10 @@ use infigraph_core::daemon::read_service::{ReadService, StoreSource};
 /// serving it -- the shape the daemon hands `start_serving`.
 fn indexed_project_and_source() -> (tempfile::TempDir, StoreSource) {
     let dir = tempfile::tempdir().unwrap();
-    let graph = dir.path().join(".infigraph").join("graph");
+    let graph = dir
+        .path()
+        .join(".infigraph")
+        .join(infigraph_core::graph::names::STEM);
     std::fs::create_dir_all(graph.parent().unwrap()).unwrap();
     {
         let store = GraphStore::open(&graph).unwrap();
@@ -620,7 +637,7 @@ fn hold_with_no_daemon_forgets_the_root() {
 /// The case where a synchronous attach would hang its caller: a daemon that
 /// holds `watch.lock` but has not bound its socket yet makes
 /// `connect_allowing_for_startup` wait out its 30s grace. `hold` sits on
-/// every `Infigraph::init`, so it must return regardless.
+/// every `CodeIndex::init`, so it must return regardless.
 #[test]
 fn hold_never_blocks_on_a_daemon_that_is_still_starting() {
     let project = tempfile::tempdir().unwrap();

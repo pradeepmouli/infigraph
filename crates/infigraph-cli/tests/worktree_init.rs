@@ -54,7 +54,11 @@ fn worktree_init_clones_and_incrementally_indexes() {
         "index failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(main.path().join(".infigraph/graph").exists());
+    assert!(main
+        .path()
+        .join(".infigraph")
+        .join(infigraph_core::graph::names::STEM)
+        .exists());
     let main_embeddings = std::fs::read(main.path().join(".infigraph/embeddings.bin")).unwrap();
 
     // Create a linked worktree with identical content (no new commits on it yet).
@@ -78,7 +82,10 @@ fn worktree_init_clones_and_incrementally_indexes() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    assert!(wt_path.join(".infigraph/graph").exists());
+    assert!(wt_path
+        .join(".infigraph")
+        .join(infigraph_core::graph::names::STEM)
+        .exists());
 
     // Content-correctness check: since the new worktree has zero file differences
     // from main at creation time, its cloned-then-incrementally-reindexed
@@ -110,14 +117,15 @@ fn worktree_init_leaves_the_mains_restore_pools_behind() {
     support::assert_ok(&out, "index");
 
     let ig = main.path().join(".infigraph");
+    use infigraph_core::graph::names::{sibling, STEM};
     let pools = [
-        "snapshots/1/graph",
-        "graph.previous.1791397452",
-        "graph.previous.1791397452.wal",
-        "graph.corrupt.1791226834",
-        "graph.corrupt.1791226834.wal",
+        format!("snapshots/1/{STEM}"),
+        sibling(".previous.1791397452"),
+        sibling(".previous.1791397452.wal"),
+        sibling(".corrupt.1791226834"),
+        sibling(".corrupt.1791226834.wal"),
     ];
-    for pool in pools {
+    for pool in &pools {
         let path = ig.join(pool);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, vec![b'x'; 4096]).unwrap();
@@ -139,8 +147,11 @@ fn worktree_init_leaves_the_mains_restore_pools_behind() {
     support::assert_ok(&out, "worktree init");
 
     let wt_ig = wt_path.join(".infigraph");
-    assert!(wt_ig.join("graph").exists(), "the graph was not cloned");
-    for pool in pools {
+    assert!(
+        wt_ig.join(infigraph_core::graph::names::STEM).exists(),
+        "the graph was not cloned"
+    );
+    for pool in &pools {
         assert!(!wt_ig.join(pool).exists(), "{pool} was cloned");
     }
     assert!(
@@ -160,7 +171,7 @@ fn worktree_init_leaves_the_mains_restore_pools_behind() {
         support::stdout(&found)
     );
     // The source keeps its pools.
-    for pool in pools {
+    for pool in &pools {
         assert!(ig.join(pool).exists(), "{pool} vanished from main");
     }
 }

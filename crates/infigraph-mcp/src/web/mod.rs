@@ -98,7 +98,7 @@ pub fn is_ready() -> bool {
     READY.load(Ordering::SeqCst)
 }
 
-use infigraph_core::Infigraph;
+use infigraph_core::CodeIndex;
 use infigraph_languages::bundled_registry;
 
 use handlers_analysis::*;
@@ -659,10 +659,10 @@ fn validate_webhook_signature(body: &str, signature: Option<&str>) -> bool {
     mac.verify_slice(&expected).is_ok()
 }
 
-pub(super) fn open_prism(params: &Value) -> Result<Infigraph> {
+pub(super) fn open_prism(params: &Value) -> Result<CodeIndex> {
     let path = params.get("path").and_then(|p| p.as_str()).unwrap_or(".");
     let registry = bundled_registry()?;
-    let mut prism = Infigraph::open(&PathBuf::from(path), registry)?;
+    let mut prism = CodeIndex::open(&PathBuf::from(path), registry)?;
     prism.init()?;
     Ok(prism)
 }
