@@ -38,6 +38,7 @@ pub mod multi;
 pub mod ops;
 pub mod path_scope;
 pub mod patterns;
+pub mod pending_paths;
 pub mod phase_clock;
 pub mod pipelines_trust;
 pub mod pools;
