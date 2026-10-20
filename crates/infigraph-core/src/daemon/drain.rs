@@ -1,10 +1,11 @@
-use crate::daemon::queue::{DrainedQueue, PendingIndexItem, WaiterKind};
+use crate::daemon::queue::{DrainedQueue, IndexWorkQueue, PendingIndexItem, WaiterKind};
 use crate::daemon_protocol::WriteResult;
 use crate::model::FileExtraction;
 use crate::resolve::ResolveStats;
+use crate::watch::sink::{PathIndexer, PathOutcome};
 use crate::Infigraph;
 use anyhow::Result;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// What the unified drain actually did, for the batch-flush path's
 /// existing downstream steps (embedding updates, cross-file-call event
@@ -16,6 +17,50 @@ pub(crate) struct DrainOutcome {
     pub resolve_stats: ResolveStats,
     /// Every path this drain removed, for `RemoveFiles` waiters' counts.
     pub removals: Vec<String>,
+}
+
+/// The execute side of the sink contract: the same drain, asked for by path.
+/// Each call builds the queue a watcher would have filled and runs it through
+/// [`execute_drain`], so the contract test exercises the real code path and
+/// there is no second way to index a set of paths.
+impl PathIndexer for Infigraph {
+    fn index_paths(&self, paths: &[PathBuf]) -> Result<PathOutcome> {
+        let mut queue = IndexWorkQueue::new();
+        for path in paths {
+            queue.add_raw(self.relative(path));
+        }
+        self.run_queue(queue)
+    }
+
+    fn delete_paths(&self, paths: &[PathBuf]) -> Result<PathOutcome> {
+        let mut queue = IndexWorkQueue::new();
+        for path in paths {
+            queue.add_watch_removal(self.relative(path));
+        }
+        self.run_queue(queue)
+    }
+
+    fn index_all(&self) -> Result<PathOutcome> {
+        let mut queue = IndexWorkQueue::new();
+        queue.mark_whole_project();
+        self.run_queue(queue)
+    }
+}
+
+impl Infigraph {
+    fn relative(&self, path: &Path) -> String {
+        path.strip_prefix(self.root())
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/")
+    }
+
+    fn run_queue(&self, mut queue: IndexWorkQueue) -> Result<PathOutcome> {
+        let outcome = execute_drain(self, queue.drain())?;
+        Ok(PathOutcome {
+            files: outcome.extractions.len() + outcome.removals.len(),
+        })
+    }
 }
 
 /// Runs one combined pass -- extract, upsert, remove, resolve -- against

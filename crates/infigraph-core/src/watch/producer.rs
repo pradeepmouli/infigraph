@@ -11,10 +11,12 @@
 
 use crate::daemon::queue::IndexWorkQueue;
 use crate::ignore_rules::Domain;
-use crate::watch::code_sink::{emit, CodeSink, EventSink};
+use crate::watch::code_queue::{emit, CodeQueue, EventSink};
+use crate::watch::queued::{IndexingSink, Pacing, Queued};
 use crate::watch::registration::Registration;
-use crate::watch::sink::{change_of, Triage, WatchSink};
+use crate::watch::sink::{change_of, Dispatcher, WatchSink};
 use crate::watch::{WatchEvent, WatchEventKind};
+use crate::Infigraph;
 use clap::Parser;
 use notify::{Config, Event, EventKind, RecommendedWatcher, Watcher};
 use std::path::{Path, PathBuf};
@@ -129,10 +131,6 @@ pub async fn run_producer(
         Err(e) => eprintln!("[watch-producer] failed to read dirty set, skipping recovery: {e}"),
     }
 
-    // Every event path is judged once here and offered to the sinks whose
-    // domain keeps it.
-    let mut triage = Triage::new(&root, &[Domain::Code]);
-
     // R7.4 (#84): above this many files in one debounce window, the batch
     // coalesces into a single whole-project pass instead of per-file
     // updates. Overridable via INFIGRAPH_WATCH_STORM_THRESHOLD for tests/tuning.
@@ -142,13 +140,22 @@ pub async fn run_producer(
         crate::settings_file::ConfigScope::Project(&root),
     )
     .storm_threshold as usize;
-    let mut sinks: Vec<Box<dyn WatchSink>> = vec![Box::new(CodeSink::new(
-        &root,
-        Arc::clone(&registry),
-        Arc::clone(&queue),
-        storm_threshold,
-        Arc::clone(&on_event),
-    ))];
+    // Every event path is judged once, by the dispatcher, and offered to the
+    // sinks whose domain keeps it. The code graph's sink is always attached;
+    // others (documents) attach and detach at runtime.
+    let code_sink: Box<dyn WatchSink> = Box::new(IndexingSink::<Infigraph>::new(
+        "code",
+        Domain::Code,
+        Queued::new(CodeQueue::new(
+            &root,
+            Arc::clone(&registry),
+            Arc::clone(&queue),
+            storm_threshold,
+            Arc::clone(&on_event),
+        )),
+        Pacing::default(),
+    ));
+    let mut dispatcher = Dispatcher::new(&root, vec![code_sink]);
 
     let (mut watcher, mut rx) =
         match create_watcher_unless_cancelled(&root, debounce_ms, &token).await {
@@ -197,9 +204,8 @@ pub async fn run_producer(
             _ = token.cancelled() => break,
 
             _ = tick.tick() => {
-                for sink in &mut sinks {
-                    sink.tick();
-                }
+                dispatcher.apply_requests(&root);
+                dispatcher.tick();
                 let now = std::time::Instant::now();
                 if dropped.due(now) {
                     let rate = dropped.report(now);
@@ -269,7 +275,7 @@ pub async fn run_producer(
             }
 
             _ = ignore_rebuild.tick() => {
-                triage.rebuild();
+                dispatcher.triage_mut().rebuild();
             }
 
             maybe_evt = rx.recv() => {
@@ -287,7 +293,7 @@ pub async fn run_producer(
                             // resolved paths would otherwise fail the
                             // `strip_prefix` the sinks rely on and drop the
                             // event.
-                            let path = triage.respelled(&path).into_owned();
+                            let path = dispatcher.triage().respelled(&path).into_owned();
                             // Its own probe: proof the stream delivers, and
                             // nothing to index.
                             if path == canary_path {
@@ -300,7 +306,7 @@ pub async fn run_producer(
                             // What the walk would not visit, hidden files
                             // included: a `.foo.py` it never indexes would
                             // otherwise leave a dirty mark nothing clears.
-                            if !triage.keeps(&path, is_dir) {
+                            if !dispatcher.triage().keeps(&path, is_dir) {
                                 continue;
                             }
 
@@ -349,11 +355,7 @@ pub async fn run_producer(
                                 }
                             }
 
-                            for (domain, batch) in triage.route(&event.kind, &path) {
-                                for sink in sinks.iter_mut().filter(|s| s.domain() == domain) {
-                                    sink.accept(batch.clone());
-                                }
-                            }
+                            dispatcher.dispatch(&event.kind, &path);
                         }
                     }
                     Some(Err(e)) => eprintln!("[watch-producer] watch error: {e}"),
