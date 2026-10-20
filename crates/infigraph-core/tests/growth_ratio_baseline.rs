@@ -30,8 +30,11 @@ fn python_registry() -> LanguageRegistry {
 }
 
 fn health_json_bytes(root: &std::path::Path) -> Option<u64> {
-    let content =
-        std::fs::read_to_string(root.join(".infigraph").join("graph.health.json")).ok()?;
+    let content = std::fs::read_to_string(
+        root.join(".infigraph")
+            .join(infigraph_core::graph::names::HEALTH),
+    )
+    .ok()?;
     let v: serde_json::Value = serde_json::from_str(&content).ok()?;
     v.get("healthy_size_bytes")?.as_u64()
 }
@@ -56,7 +59,10 @@ fn ordinary_incremental_writes_do_not_move_the_growth_ratio_baseline() {
     // many bytes any one write happens to add (Kuzu allocates in pages, so
     // comparing real before/after sizes directly is not reliable).
     const FORCED_BASELINE: u64 = 999_999_999;
-    let health_path = dir.path().join(".infigraph").join("graph.health.json");
+    let health_path = dir
+        .path()
+        .join(".infigraph")
+        .join(infigraph_core::graph::names::HEALTH);
     std::fs::write(
         &health_path,
         format!(r#"{{"healthy_size_bytes": {FORCED_BASELINE}}}"#),
@@ -111,7 +117,10 @@ fn a_full_reindex_does_refresh_the_growth_ratio_baseline() {
         .unwrap();
     assert!(status.success(), "bootstrap index failed");
 
-    let health_path = dir.path().join(".infigraph").join("graph.health.json");
+    let health_path = dir
+        .path()
+        .join(".infigraph")
+        .join(infigraph_core::graph::names::HEALTH);
     assert!(
         health_path.exists(),
         "bootstrap index must establish a baseline"

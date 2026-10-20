@@ -157,8 +157,14 @@ fn test_group_index_skips_locked_member() {
 fn test_wipe_infigraph_preserving_index_lock_keeps_lock_removes_rest() {
     let dir = TempDir::new().unwrap();
     let tg_dir = dir.path().join(".infigraph");
-    std::fs::create_dir_all(tg_dir.join("graph")).unwrap();
-    std::fs::write(tg_dir.join("graph").join("data.bin"), b"graph-data").unwrap();
+    std::fs::create_dir_all(tg_dir.join(infigraph_core::graph::names::STEM)).unwrap();
+    std::fs::write(
+        tg_dir
+            .join(infigraph_core::graph::names::STEM)
+            .join("data.bin"),
+        b"graph-data",
+    )
+    .unwrap();
     std::fs::write(tg_dir.join("registry.json"), b"{}").unwrap();
 
     // A live op holding the lock — its guard must survive the wipe.
@@ -173,7 +179,10 @@ fn test_wipe_infigraph_preserving_index_lock_keeps_lock_removes_rest() {
         tg_dir.join("index.lock").exists(),
         "index.lock must survive the wipe"
     );
-    assert!(!tg_dir.join("graph").exists(), "graph dir should be wiped");
+    assert!(
+        !tg_dir.join(infigraph_core::graph::names::STEM).exists(),
+        "graph dir should be wiped"
+    );
     assert!(
         !tg_dir.join("registry.json").exists(),
         "registry.json should be wiped"
@@ -236,29 +245,51 @@ fn test_wipe_preserves_backup_pools() {
     let tg_dir = dir.path().join(".infigraph");
     std::fs::create_dir_all(tg_dir.join("snapshots").join("111")).unwrap();
     std::fs::write(
-        tg_dir.join("snapshots").join("111").join("graph"),
+        tg_dir
+            .join("snapshots")
+            .join("111")
+            .join(infigraph_core::graph::names::STEM),
         b"snapshotted",
     )
     .unwrap();
-    std::fs::write(tg_dir.join("graph.corrupt.222"), b"corrupt").unwrap();
-    std::fs::write(tg_dir.join("graph.previous.333"), b"previous").unwrap();
-    std::fs::write(tg_dir.join("graph"), b"live").unwrap();
+    std::fs::write(
+        tg_dir.join(infigraph_core::graph::names::sibling(".corrupt.222")),
+        b"corrupt",
+    )
+    .unwrap();
+    std::fs::write(
+        tg_dir.join(infigraph_core::graph::names::sibling(".previous.333")),
+        b"previous",
+    )
+    .unwrap();
+    std::fs::write(tg_dir.join(infigraph_core::graph::names::STEM), b"live").unwrap();
 
     wipe_infigraph_preserving_index_lock(&tg_dir).unwrap();
 
     assert!(
-        tg_dir.join("snapshots").join("111").join("graph").exists(),
+        tg_dir
+            .join("snapshots")
+            .join("111")
+            .join(infigraph_core::graph::names::STEM)
+            .exists(),
         "pre-write snapshots must survive the wipe"
     );
     assert!(
-        tg_dir.join("graph.corrupt.222").exists(),
+        tg_dir
+            .join(infigraph_core::graph::names::sibling(".corrupt.222"))
+            .exists(),
         "corruption quarantine must survive the wipe"
     );
     assert!(
-        tg_dir.join("graph.previous.333").exists(),
+        tg_dir
+            .join(infigraph_core::graph::names::sibling(".previous.333"))
+            .exists(),
         "retired-previous graph must survive the wipe"
     );
-    assert!(!tg_dir.join("graph").exists(), "live graph should be wiped");
+    assert!(
+        !tg_dir.join(infigraph_core::graph::names::STEM).exists(),
+        "live graph should be wiped"
+    );
 }
 
 /// `full_reindex_wipe` must snapshot the live state before wiping it, and
@@ -271,7 +302,11 @@ fn test_full_reindex_wipe_snapshot_survives_the_wipe() {
     let dir = TempDir::new().unwrap();
     let tg_dir = dir.path().join(".infigraph");
     std::fs::create_dir_all(&tg_dir).unwrap();
-    std::fs::write(tg_dir.join("graph"), b"pre-reindex-live").unwrap();
+    std::fs::write(
+        tg_dir.join(infigraph_core::graph::names::STEM),
+        b"pre-reindex-live",
+    )
+    .unwrap();
     std::fs::write(tg_dir.join("index.lock"), b"").unwrap();
 
     full_reindex_wipe(&tg_dir).unwrap();
@@ -283,12 +318,13 @@ fn test_full_reindex_wipe_snapshot_survives_the_wipe() {
         .collect();
     assert_eq!(entries.len(), 1, "exactly one snapshot should exist");
     assert_eq!(
-        std::fs::read_to_string(entries[0].path().join("graph")).unwrap(),
+        std::fs::read_to_string(entries[0].path().join(infigraph_core::graph::names::STEM))
+            .unwrap(),
         "pre-reindex-live",
         "the snapshot must hold the pre-wipe graph content"
     );
     assert!(
-        !tg_dir.join("graph").exists(),
+        !tg_dir.join(infigraph_core::graph::names::STEM).exists(),
         "the live graph should be wiped"
     );
     assert!(
@@ -309,12 +345,14 @@ fn test_full_reindex_wipe_serializes_against_graph_lock_holder() {
     let dir = TempDir::new().unwrap();
     let tg_dir = dir.path().join(".infigraph");
     std::fs::create_dir_all(&tg_dir).unwrap();
-    std::fs::write(tg_dir.join("graph"), b"live").unwrap();
+    std::fs::write(tg_dir.join(infigraph_core::graph::names::STEM), b"live").unwrap();
 
     // Simulate a concurrent single-file writer holding the same graph.lock
     // that GraphStore::upsert_file/upsert_files_bulk take for every real
     // write.
-    let graph_lock_path = infigraph_core::graph::store::db_lock_path(&tg_dir.join("graph"));
+    let graph_lock_path = infigraph_core::graph::store::db_lock_path(
+        &tg_dir.join(infigraph_core::graph::names::STEM),
+    );
     let held =
         infigraph_core::lockfile::acquire(&graph_lock_path, "simulated-writer", Duration::ZERO)
             .unwrap();

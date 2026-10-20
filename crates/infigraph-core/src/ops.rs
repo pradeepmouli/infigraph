@@ -201,8 +201,8 @@ pub fn classify_entry(name: &str) -> EntryClass {
     if is_docs_store_entry(name) || name == crate::docs_switch::DOCS_OP_LOCK {
         return EntryClass::DocsStore;
     }
-    let derived = name == "graph"
-        || name.starts_with("graph.")
+    let derived = name == crate::graph::names::STEM
+        || name.starts_with(crate::graph::names::sibling(".").as_str())
         || crate::ps::PROJECT_LOCKS.contains(&name)
         || DERIVED_NAMES.contains(&name)
         || DERIVED_PREFIXES
@@ -236,7 +236,8 @@ pub fn classify_entry(name: &str) -> EntryClass {
 /// before this shipped). Acquiring it here blocks that class of writer out
 /// for the duration of the snapshot+wipe, same as every other graph writer.
 pub fn full_reindex_wipe(tg_dir: &Path) -> Result<()> {
-    let graph_lock_path = crate::graph::store::db_lock_path(&tg_dir.join("graph"));
+    let graph_lock_path =
+        crate::graph::store::db_lock_path(&tg_dir.join(crate::graph::names::STEM));
     let _graph_lock = crate::lockfile::acquire(
         &graph_lock_path,
         "full-reindex-wipe",
@@ -273,11 +274,11 @@ mod tests {
     #[test]
     fn the_graph_and_its_sidecars_are_derived() {
         for name in [
-            "graph",
-            "graph.wal",
-            "graph.health.json",
-            "graph.health.recorded",
-            "graph.ckpt.lock",
+            crate::graph::names::STEM,
+            crate::graph::names::sibling(".wal").as_str(),
+            crate::graph::names::HEALTH,
+            crate::graph::names::sibling(".health.recorded").as_str(),
+            crate::graph::names::sibling(".ckpt.lock").as_str(),
             "bm25_cache.bin",
             "embeddings.bin",
             "embeddings.bin.generation",
@@ -331,9 +332,9 @@ mod tests {
     fn the_restore_pools_are_their_own_class() {
         for name in [
             "snapshots",
-            "graph.corrupt.1790000000",
-            "graph.corrupt.1790000000.wal",
-            "graph.previous.1790000000",
+            crate::graph::names::sibling(".corrupt.1790000000").as_str(),
+            crate::graph::names::sibling(".corrupt.1790000000.wal").as_str(),
+            crate::graph::names::sibling(".previous.1790000000").as_str(),
         ] {
             assert_eq!(classify_entry(name), EntryClass::RestorePoint, "{name}");
         }
@@ -362,13 +363,18 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let ig = tmp.path().join(".infigraph");
         std::fs::create_dir_all(&ig).unwrap();
-        for name in ["graph", "scip-enrich.lock", "index.lock", "daemon.log"] {
+        for name in [
+            crate::graph::names::STEM,
+            "scip-enrich.lock",
+            "index.lock",
+            "daemon.log",
+        ] {
             std::fs::write(ig.join(name), "x").unwrap();
         }
         wipe_infigraph_preserving_index_lock(&ig).unwrap();
         assert!(ig.join("scip-enrich.lock").exists());
         assert!(ig.join("index.lock").exists());
-        assert!(!ig.join("graph").exists());
+        assert!(!ig.join(crate::graph::names::STEM).exists());
         assert!(!ig.join("daemon.log").exists());
     }
 

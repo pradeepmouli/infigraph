@@ -31,7 +31,12 @@ fn profile_a_scip_import_on_a_graph_of_100k_symbols() {
     use_language_registry(Arc::new(infigraph_languages::bundled_registry().unwrap()));
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join(".infigraph")).unwrap();
-    let store = GraphStore::open(&dir.path().join(".infigraph").join("graph")).unwrap();
+    let store = GraphStore::open(
+        &dir.path()
+            .join(".infigraph")
+            .join(infigraph_core::graph::names::STEM),
+    )
+    .unwrap();
     let conn = store.connection().unwrap();
 
     let built = Instant::now();

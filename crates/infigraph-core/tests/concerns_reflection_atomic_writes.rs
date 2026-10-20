@@ -53,7 +53,7 @@ fn seed_two_symbols(backend: &KuzuBackend) {
 #[test]
 fn replace_concerns_creates_all_concerns_and_edges() {
     let tmp = tempfile::tempdir().unwrap();
-    let backend = KuzuBackend::open(&tmp.path().join("graph")).unwrap();
+    let backend = KuzuBackend::open(&tmp.path().join(infigraph_core::graph::names::STEM)).unwrap();
     seed_two_symbols(&backend);
 
     let concerns = vec![
@@ -83,7 +83,7 @@ fn replace_concerns_creates_all_concerns_and_edges() {
 #[test]
 fn replace_concerns_replaces_rather_than_accumulates() {
     let tmp = tempfile::tempdir().unwrap();
-    let backend = KuzuBackend::open(&tmp.path().join("graph")).unwrap();
+    let backend = KuzuBackend::open(&tmp.path().join(infigraph_core::graph::names::STEM)).unwrap();
     seed_two_symbols(&backend);
 
     backend
@@ -124,7 +124,7 @@ fn replace_concerns_replaces_rather_than_accumulates() {
 #[test]
 fn replace_concerns_rolls_back_atomically_on_mid_batch_failure() {
     let tmp = tempfile::tempdir().unwrap();
-    let backend = KuzuBackend::open(&tmp.path().join("graph")).unwrap();
+    let backend = KuzuBackend::open(&tmp.path().join(infigraph_core::graph::names::STEM)).unwrap();
     seed_two_symbols(&backend);
 
     backend
@@ -174,7 +174,7 @@ fn replace_concerns_rolls_back_atomically_on_mid_batch_failure() {
 #[test]
 fn replace_resolves_to_creates_edges_and_skips_unresolved() {
     let tmp = tempfile::tempdir().unwrap();
-    let backend = KuzuBackend::open(&tmp.path().join("graph")).unwrap();
+    let backend = KuzuBackend::open(&tmp.path().join(infigraph_core::graph::names::STEM)).unwrap();
     seed_two_symbols(&backend);
 
     let edges = vec![ResolvesToEdge {
@@ -195,7 +195,7 @@ fn replace_resolves_to_creates_edges_and_skips_unresolved() {
 #[test]
 fn replace_resolves_to_empty_still_clears_old_edges() {
     let tmp = tempfile::tempdir().unwrap();
-    let backend = KuzuBackend::open(&tmp.path().join("graph")).unwrap();
+    let backend = KuzuBackend::open(&tmp.path().join(infigraph_core::graph::names::STEM)).unwrap();
     seed_two_symbols(&backend);
 
     backend
@@ -224,7 +224,7 @@ fn replace_resolves_to_empty_still_clears_old_edges() {
 #[test]
 fn graph_store_transaction_commits_on_ok() {
     let tmp = tempfile::tempdir().unwrap();
-    let store = GraphStore::open(&tmp.path().join("graph")).unwrap();
+    let store = GraphStore::open(&tmp.path().join(infigraph_core::graph::names::STEM)).unwrap();
 
     store
         .transaction(|conn| {
@@ -245,7 +245,7 @@ fn graph_store_transaction_commits_on_ok() {
 #[test]
 fn graph_store_transaction_rolls_back_on_err() {
     let tmp = tempfile::tempdir().unwrap();
-    let store = GraphStore::open(&tmp.path().join("graph")).unwrap();
+    let store = GraphStore::open(&tmp.path().join(infigraph_core::graph::names::STEM)).unwrap();
 
     let result: anyhow::Result<()> = store.transaction(|conn| {
         conn.query("CREATE (:Concern {id: 'x', kind: 'k', detail: 'd'})")

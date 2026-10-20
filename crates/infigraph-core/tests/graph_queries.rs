@@ -61,7 +61,8 @@ struct TestGraph {
 impl TestGraph {
     fn new() -> Self {
         let dir = tempfile::TempDir::new().expect("tmpdir");
-        let store = GraphStore::open(&dir.path().join("graph")).expect("open store");
+        let store = GraphStore::open(&dir.path().join(infigraph_core::graph::names::STEM))
+            .expect("open store");
         Self { _dir: dir, store }
     }
 
@@ -70,8 +71,10 @@ impl TestGraph {
     /// ratio with a small fixture graph.
     fn floorless() -> Self {
         let dir = tempfile::TempDir::new().expect("tmpdir");
-        let store = GraphStore::open(&floorless_infigraph_dir(dir.path()).join("graph"))
-            .expect("open store");
+        let store = GraphStore::open(
+            &floorless_infigraph_dir(dir.path()).join(infigraph_core::graph::names::STEM),
+        )
+        .expect("open store");
         Self { _dir: dir, store }
     }
 }
@@ -546,7 +549,7 @@ fn test_get_api_surface_filtered_excludes_test_symbols() {
     };
 
     let dir = tempfile::TempDir::new().unwrap();
-    let backend = KuzuBackend::open(&dir.path().join("graph")).unwrap();
+    let backend = KuzuBackend::open(&dir.path().join(infigraph_core::graph::names::STEM)).unwrap();
     backend
         .upsert_files_bulk(std::slice::from_ref(&extraction), true)
         .unwrap();
@@ -1088,7 +1091,7 @@ fn test_upsert_folders_bulk() {
 /// `stamp_healthy_graph_size` writes, without needing a real healthy graph.
 fn force_tiny_baseline(dir: &std::path::Path) {
     std::fs::write(
-        dir.join("graph.health.json"),
+        dir.join(infigraph_core::graph::names::HEALTH),
         r#"{"healthy_size_bytes": 1024}"#,
     )
     .unwrap();
@@ -1195,15 +1198,19 @@ fn a_rebuild_at_a_side_path_is_measured_against_itself_not_the_graph_it_replaces
     let ig = floorless_infigraph_dir(dir.path());
 
     // The latched state: a large existing `graph` and a small baseline.
-    std::fs::write(ig.join("graph"), vec![0u8; 20_000_000]).unwrap();
     std::fs::write(
-        ig.join("graph.health.json"),
+        ig.join(infigraph_core::graph::names::STEM),
+        vec![0u8; 20_000_000],
+    )
+    .unwrap();
+    std::fs::write(
+        ig.join(infigraph_core::graph::names::HEALTH),
         r#"{"healthy_size_bytes": 1000000}"#,
     )
     .unwrap();
 
     // The rebuild opens its own store beside it and writes there.
-    let store = GraphStore::open(&ig.join("graph.rebuilding")).unwrap();
+    let store = GraphStore::open(&ig.join(infigraph_core::graph::names::REBUILDING)).unwrap();
     store.upsert_all_parquet(&fixture_extractions()).expect(
         "a rebuild into a side path must be measured against that side path --          refusing it because the graph it replaces is over the cap makes the          documented remedy for a latched breaker impossible to run",
     );
@@ -1738,7 +1745,7 @@ fn test_detect_cross_cutting_surfaces_middleware_and_dependency_edges() {
     let extractions = vec![middleware_ext, deps_ext, main_ext];
 
     let dir = tempfile::TempDir::new().unwrap();
-    let backend = KuzuBackend::open(&dir.path().join("graph")).unwrap();
+    let backend = KuzuBackend::open(&dir.path().join(infigraph_core::graph::names::STEM)).unwrap();
     backend.upsert_files_bulk(&extractions, true).unwrap();
     backend.resolve_calls(&extractions, None).unwrap();
 

@@ -470,7 +470,13 @@ mod tests {
     fn project() -> tempfile::TempDir {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path().join(".infigraph")).unwrap();
-        std::fs::write(tmp.path().join(".infigraph").join("graph"), b"").unwrap();
+        std::fs::write(
+            tmp.path()
+                .join(".infigraph")
+                .join(infigraph_core::graph::names::STEM),
+            b"",
+        )
+        .unwrap();
         tmp
     }
 

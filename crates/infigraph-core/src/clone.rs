@@ -9,7 +9,7 @@ use anyhow::{Context, Result};
 /// (the one list `worktree clean` and a snapshot's own copy use): they are the
 /// source graph's history, and a clone can always re-clone from the source.
 const EXCLUDED_RELATIVE_PATHS: &[&str] = &[
-    "graph.lock",
+    crate::graph::names::LOCK,
     "watch.lock",
     "mcp.lock",
     "index.lock",

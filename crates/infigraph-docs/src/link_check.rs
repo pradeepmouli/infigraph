@@ -468,7 +468,9 @@ fn sync_result(
 /// The live symbols among `keys` (key -> where), read as an observer reads the
 /// graph.
 pub(crate) fn live_symbols(root: &Path, keys: &[&str]) -> Result<HashMap<String, Live>> {
-    let graph_path = root.join(".infigraph").join("graph");
+    let graph_path = root
+        .join(".infigraph")
+        .join(infigraph_core::graph::names::STEM);
     let observed = ObservedGraph::open(root, &graph_path)?;
     observed.with_exec(|exec| resolve(exec, keys).0)
 }
@@ -476,7 +478,9 @@ pub(crate) fn live_symbols(root: &Path, keys: &[&str]) -> Result<HashMap<String,
 /// Whether `key` resolves the way `doctor` judges it: a symbol the graph has,
 /// or a `<file>::module` key whose file the graph has.
 pub(crate) fn key_is_live(root: &Path, key: &str) -> Result<bool> {
-    let graph_path = root.join(".infigraph").join("graph");
+    let graph_path = root
+        .join(".infigraph")
+        .join(infigraph_core::graph::names::STEM);
     let observed = ObservedGraph::open(root, &graph_path)?;
     observed.with_exec(|exec| {
         let (live, modules) = resolve(exec, &[key]);
@@ -539,7 +543,9 @@ pub fn check_project(root: &Path, docs_sync: bool) -> Vec<CheckResult> {
         return results;
     }
 
-    let graph_path = root.join(".infigraph").join("graph");
+    let graph_path = root
+        .join(".infigraph")
+        .join(infigraph_core::graph::names::STEM);
     let observed = match ObservedGraph::open(root, &graph_path) {
         Ok(observed) => observed,
         Err(e) => {

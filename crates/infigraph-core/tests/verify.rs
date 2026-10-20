@@ -11,7 +11,9 @@ use std::path::{Path, PathBuf};
 
 fn project_with_graph(tmp: &tempfile::TempDir) -> (PathBuf, PathBuf) {
     let root = tmp.path().join("proj");
-    let graph_path = root.join(".infigraph").join("graph");
+    let graph_path = root
+        .join(".infigraph")
+        .join(infigraph_core::graph::names::STEM);
     (root, graph_path)
 }
 

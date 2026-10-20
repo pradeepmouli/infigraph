@@ -89,7 +89,12 @@ fn never_enriched_project() -> (tempfile::TempDir, tempfile::TempDir) {
 
 /// Stamp the graph as enriched once, as a successful import does.
 fn mark_enriched(root: &Path) {
-    let store = infigraph_core::graph::GraphStore::open(&root.join(".infigraph/graph")).unwrap();
+    let store = infigraph_core::graph::GraphStore::open(
+        &root
+            .join(".infigraph")
+            .join(infigraph_core::graph::names::STEM),
+    )
+    .unwrap();
     let lock = store.write_lock().unwrap();
     let conn = store.connection().unwrap();
     store.bump_ast_generation_conn(&conn, &lock).unwrap();

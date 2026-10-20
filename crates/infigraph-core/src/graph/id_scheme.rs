@@ -63,7 +63,7 @@ pub fn outdated_in(store: &GraphStore) -> Option<bool> {
 /// or by a read-only open, never starting a daemon. `false` when there is no
 /// graph or it cannot be read.
 pub fn outdated_at(root: &Path) -> bool {
-    let graph = root.join(".infigraph").join("graph");
+    let graph = root.join(".infigraph").join(crate::graph::names::STEM);
     if !graph.exists() {
         return false;
     }
@@ -101,7 +101,7 @@ mod tests {
 
     fn store() -> (tempfile::TempDir, GraphStore) {
         let dir = tempfile::tempdir().unwrap();
-        let store = GraphStore::open(&dir.path().join("graph")).unwrap();
+        let store = GraphStore::open(&dir.path().join(crate::graph::names::STEM)).unwrap();
         (dir, store)
     }
 
@@ -157,7 +157,7 @@ mod tests {
     #[test]
     fn opening_an_unstamped_graph_with_symbols_leaves_it_unstamped() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("graph");
+        let path = dir.path().join(crate::graph::names::STEM);
         {
             let store = GraphStore::open(&path).unwrap();
             add_symbol(&store);
@@ -229,7 +229,10 @@ mod tests {
     #[test]
     fn a_project_on_disk_is_judged_without_a_daemon_or_a_write() {
         let root = tempfile::tempdir().unwrap();
-        let graph = root.path().join(".infigraph").join("graph");
+        let graph = root
+            .path()
+            .join(".infigraph")
+            .join(crate::graph::names::STEM);
         std::fs::create_dir_all(graph.parent().unwrap()).unwrap();
         {
             let store = GraphStore::open(&graph).unwrap();

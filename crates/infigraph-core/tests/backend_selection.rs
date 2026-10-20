@@ -106,7 +106,11 @@ fn init_bootstraps_a_never_indexed_project_under_the_default_backend() {
          got: {result:?}"
     );
     assert!(
-        project_dir.path().join(".infigraph").join("graph").exists(),
+        project_dir
+            .path()
+            .join(".infigraph")
+            .join(infigraph_core::graph::names::STEM)
+            .exists(),
         "bootstrap must leave a real graph on disk for the daemon to serve"
     );
 }

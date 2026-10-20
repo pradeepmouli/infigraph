@@ -35,7 +35,8 @@ mod tests {
     #[test]
     fn a_write_statement_is_refused_by_the_database_not_by_string_matching() {
         let dir = tempfile::tempdir().unwrap();
-        let store = crate::graph::GraphStore::open(&dir.path().join("graph")).unwrap();
+        let store =
+            crate::graph::GraphStore::open(&dir.path().join(crate::graph::names::STEM)).unwrap();
         let conn = store.connection().unwrap();
 
         let err = ensure_read_only(
@@ -55,7 +56,8 @@ mod tests {
     #[test]
     fn a_read_statement_is_accepted() {
         let dir = tempfile::tempdir().unwrap();
-        let store = crate::graph::GraphStore::open(&dir.path().join("graph")).unwrap();
+        let store =
+            crate::graph::GraphStore::open(&dir.path().join(crate::graph::names::STEM)).unwrap();
         let conn = store.connection().unwrap();
         assert!(ensure_read_only(&conn, "MATCH (f:File) RETURN f.id").is_ok());
     }
@@ -66,7 +68,8 @@ mod tests {
     #[test]
     fn a_read_whose_text_contains_a_write_keyword_is_still_accepted() {
         let dir = tempfile::tempdir().unwrap();
-        let store = crate::graph::GraphStore::open(&dir.path().join("graph")).unwrap();
+        let store =
+            crate::graph::GraphStore::open(&dir.path().join(crate::graph::names::STEM)).unwrap();
         let conn = store.connection().unwrap();
         assert!(ensure_read_only(
             &conn,

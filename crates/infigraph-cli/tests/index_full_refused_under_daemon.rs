@@ -77,6 +77,9 @@ fn full_reindex_succeeds_under_daemon_backend_with_a_real_running_daemon() {
 
     // Verify the graph genuinely has real content (a real rebuild
     // happened, not a silent no-op).
-    let graph_path = project.path().join(".infigraph").join("graph");
+    let graph_path = project
+        .path()
+        .join(".infigraph")
+        .join(infigraph_core::graph::names::STEM);
     assert!(graph_path.exists(), "graph must exist after a full reindex");
 }

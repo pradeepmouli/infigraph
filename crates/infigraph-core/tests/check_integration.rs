@@ -3,7 +3,7 @@ use infigraph_core::graph::{GraphStore, KuzuBackend};
 
 fn empty_backend() -> (tempfile::TempDir, KuzuBackend) {
     let dir = tempfile::TempDir::new().unwrap();
-    let store = GraphStore::open(&dir.path().join("graph")).unwrap();
+    let store = GraphStore::open(&dir.path().join(infigraph_core::graph::names::STEM)).unwrap();
     (dir, KuzuBackend::from_store(store))
 }
 

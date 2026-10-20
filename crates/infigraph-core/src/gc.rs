@@ -92,7 +92,10 @@ pub fn plan_registry_gc(registry: &Registry, stale_days: Option<u64>, now: Syste
             // A registered path with no graph file can't be dated -- skip it
             // rather than guess (conservative: a false eviction here is the
             // failure mode, not a false keep).
-            let graph_path = entry.path.join(".infigraph").join("graph");
+            let graph_path = entry
+                .path
+                .join(".infigraph")
+                .join(crate::graph::names::STEM);
             let Ok(meta) = std::fs::metadata(&graph_path) else {
                 continue;
             };
@@ -183,7 +186,7 @@ mod tests {
     fn live_project(tmp: &tempfile::TempDir, name: &str) -> (PathBuf, SystemTime) {
         let path = tmp.path().join(name);
         std::fs::create_dir_all(path.join(".infigraph")).unwrap();
-        let graph = path.join(".infigraph").join("graph");
+        let graph = path.join(".infigraph").join(crate::graph::names::STEM);
         std::fs::write(&graph, b"graph").unwrap();
         let mtime = std::fs::metadata(&graph).unwrap().modified().unwrap();
         (path, mtime)

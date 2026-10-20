@@ -131,7 +131,13 @@ fn check_registry_project_scope_fails_when_unregistered() {
     // user's files (what `worktree clean` leaves) is not an index: both must
     // PASS instead -- see run_doctor_passes_registration_for_never_indexed_dir.
     std::fs::create_dir_all(project.join(".infigraph")).unwrap();
-    std::fs::write(project.join(".infigraph").join("graph"), b"g").unwrap();
+    std::fs::write(
+        project
+            .join(".infigraph")
+            .join(infigraph_core::graph::names::STEM),
+        b"g",
+    )
+    .unwrap();
     let registry = Registry {
         repos: HashMap::new(),
         groups: HashMap::new(),
@@ -178,7 +184,13 @@ fn check_registry_global_scope_with_scan_roots_finds_unregistered_project() {
     let scan_root = dir.path().join("projects");
     let unregistered = scan_root.join("orphan-proj");
     std::fs::create_dir_all(unregistered.join(".infigraph")).unwrap();
-    std::fs::write(unregistered.join(".infigraph").join("graph"), b"g").unwrap();
+    std::fs::write(
+        unregistered
+            .join(".infigraph")
+            .join(infigraph_core::graph::names::STEM),
+        b"g",
+    )
+    .unwrap();
 
     let registry = Registry {
         repos: HashMap::new(),
@@ -291,7 +303,9 @@ fn check_locks_passes_for_live_holder_matching_build_hash() {
     let dir = tempfile::TempDir::new().unwrap();
     let project = dir.path().join("myproj");
     std::fs::create_dir_all(&project).unwrap();
-    let lock_path = project.join(".infigraph").join("graph.lock");
+    let lock_path = project
+        .join(".infigraph")
+        .join(infigraph_core::graph::names::LOCK);
     write_lock_file(
         &lock_path,
         &LockInfo {
@@ -315,7 +329,7 @@ fn check_locks_passes_for_live_holder_matching_build_hash() {
     let results = check_locks(&ctx);
     let graph_lock = results
         .iter()
-        .find(|r| r.name.contains("graph.lock"))
+        .find(|r| r.name.contains(infigraph_core::graph::names::LOCK))
         .expect("must check graph.lock");
     assert_eq!(graph_lock.status, CheckStatus::Pass);
 }
@@ -325,7 +339,9 @@ fn check_locks_warns_on_build_hash_mismatch() {
     let dir = tempfile::TempDir::new().unwrap();
     let project = dir.path().join("myproj");
     std::fs::create_dir_all(&project).unwrap();
-    let lock_path = project.join(".infigraph").join("graph.lock");
+    let lock_path = project
+        .join(".infigraph")
+        .join(infigraph_core::graph::names::LOCK);
     write_lock_file(
         &lock_path,
         &LockInfo {
@@ -348,7 +364,7 @@ fn check_locks_warns_on_build_hash_mismatch() {
     let results = check_locks(&ctx);
     let graph_lock = results
         .iter()
-        .find(|r| r.name.contains("graph.lock"))
+        .find(|r| r.name.contains(infigraph_core::graph::names::LOCK))
         .expect("must check graph.lock");
     assert_eq!(graph_lock.status, CheckStatus::Warn);
     assert!(
@@ -408,7 +424,9 @@ fn check_locks_stale_graph_lock_held_by_watch_role_names_watch_stop() {
     let dir = tempfile::TempDir::new().unwrap();
     let project = dir.path().join("myproj");
     std::fs::create_dir_all(&project).unwrap();
-    let lock_path = project.join(".infigraph").join("graph.lock");
+    let lock_path = project
+        .join(".infigraph")
+        .join(infigraph_core::graph::names::LOCK);
     write_lock_file(
         &lock_path,
         &LockInfo {
@@ -431,7 +449,7 @@ fn check_locks_stale_graph_lock_held_by_watch_role_names_watch_stop() {
     let results = check_locks(&ctx);
     let graph_lock = results
         .iter()
-        .find(|r| r.name.contains("graph.lock"))
+        .find(|r| r.name.contains(infigraph_core::graph::names::LOCK))
         .expect("must check graph.lock");
     let remediation = graph_lock
         .remediation
@@ -451,7 +469,9 @@ fn check_locks_stale_graph_lock_non_watch_role_names_kill() {
     let dir = tempfile::TempDir::new().unwrap();
     let project = dir.path().join("myproj");
     std::fs::create_dir_all(&project).unwrap();
-    let lock_path = project.join(".infigraph").join("graph.lock");
+    let lock_path = project
+        .join(".infigraph")
+        .join(infigraph_core::graph::names::LOCK);
     write_lock_file(
         &lock_path,
         &LockInfo {
@@ -474,7 +494,7 @@ fn check_locks_stale_graph_lock_non_watch_role_names_kill() {
     let results = check_locks(&ctx);
     let graph_lock = results
         .iter()
-        .find(|r| r.name.contains("graph.lock"))
+        .find(|r| r.name.contains(infigraph_core::graph::names::LOCK))
         .expect("must check graph.lock");
     let remediation = graph_lock
         .remediation
@@ -558,7 +578,7 @@ fn check_locks_passes_when_lock_file_absent() {
     let results = check_locks(&ctx);
     let graph_lock = results
         .iter()
-        .find(|r| r.name.contains("graph.lock"))
+        .find(|r| r.name.contains(infigraph_core::graph::names::LOCK))
         .expect("must still report a result for an absent lock file");
     assert_eq!(graph_lock.status, CheckStatus::Pass);
 }
@@ -828,7 +848,7 @@ fn check_sidecars_warns_when_embeddings_older_than_graph_by_over_an_hour() {
     let infigraph_dir = project.join(".infigraph");
     std::fs::create_dir_all(&infigraph_dir).unwrap();
 
-    let graph_path = infigraph_dir.join("graph");
+    let graph_path = infigraph_dir.join(infigraph_core::graph::names::STEM);
     std::fs::write(&graph_path, b"graph-data").unwrap();
     let embeddings_path = infigraph_dir.join("embeddings.bin");
     std::fs::write(&embeddings_path, b"stale-embeddings").unwrap();
@@ -879,7 +899,7 @@ fn check_disk_graph_size_uses_canonicalized_path_lookup() {
     // The graph store is a *file* in the current layout, not a directory --
     // it must be a file here so the fix (path_size, which handles files) is
     // actually exercised; a directory would silently mask the bug it fixes.
-    let graph_path = infigraph_dir.join("graph");
+    let graph_path = infigraph_dir.join(infigraph_core::graph::names::STEM);
     let graph_bytes = 3 * 1024 * 1024; // exact, non-zero expected size: 3 MB
     std::fs::write(&graph_path, vec![b'x'; graph_bytes]).unwrap();
 
@@ -928,7 +948,13 @@ fn run_doctor_aggregates_every_check_category() {
     // never-indexed one -- see run_doctor_passes_registration_for_never_indexed_dir
     // for that case), so the registration check should still FAIL here.
     std::fs::create_dir_all(project.join(".infigraph")).unwrap();
-    std::fs::write(project.join(".infigraph").join("graph"), b"g").unwrap();
+    std::fs::write(
+        project
+            .join(".infigraph")
+            .join(infigraph_core::graph::names::STEM),
+        b"g",
+    )
+    .unwrap();
 
     let ctx = DoctorContext {
         registry: infigraph_core::multi::Registry::default(),
@@ -1270,7 +1296,7 @@ fn project_with_graph(dir: &std::path::Path) -> (PathBuf, PathBuf) {
     let project = dir.join("myproj");
     let infigraph_dir = project.join(".infigraph");
     std::fs::create_dir_all(&infigraph_dir).unwrap();
-    let graph_path = infigraph_dir.join("graph");
+    let graph_path = infigraph_dir.join(infigraph_core::graph::names::STEM);
     (project, graph_path)
 }
 
@@ -1417,11 +1443,15 @@ fn check_wal_integrity_warns_on_a_wal_left_by_a_dead_holder() {
     let project = dir.path().join("myproj");
     let infigraph_dir = project.join(".infigraph");
     std::fs::create_dir_all(&infigraph_dir).unwrap();
-    std::fs::write(infigraph_dir.join("graph.wal"), b"wal").unwrap();
+    std::fs::write(
+        infigraph_dir.join(infigraph_core::graph::names::sibling(".wal")),
+        b"wal",
+    )
+    .unwrap();
 
     const DEAD_PID: u32 = 999_999;
     write_lock_file(
-        &infigraph_dir.join("graph.lock"),
+        &infigraph_dir.join(infigraph_core::graph::names::LOCK),
         &LockInfo {
             pid: DEAD_PID,
             role: "graph-write".to_string(),
@@ -1518,14 +1548,18 @@ fn check_graph_holders_warns_when_a_quarantined_graph_is_still_held_open() {
     let project = dir.path().join("myproj");
     let infigraph_dir = project.join(".infigraph");
     std::fs::create_dir_all(&infigraph_dir).unwrap();
-    let quarantined = infigraph_dir.join("graph.corrupt.1787856394");
+    let quarantined =
+        infigraph_dir.join(infigraph_core::graph::names::sibling(".corrupt.1787856394"));
     std::fs::write(&quarantined, vec![0u8; 4096]).unwrap();
     let _held = std::fs::File::open(&quarantined).unwrap();
 
     let results = check_graph_holders(&project_ctx(&project));
     let hit = results
         .iter()
-        .find(|r| r.name.ends_with("graph.corrupt.1787856394"))
+        .find(|r| {
+            r.name
+                .ends_with(infigraph_core::graph::names::sibling(".corrupt.1787856394").as_str())
+        })
         .expect("must report the held quarantined file");
     assert_eq!(hit.status, CheckStatus::Warn);
     assert!(
@@ -1550,7 +1584,11 @@ fn check_graph_holders_is_quiet_for_an_unheld_quarantined_graph() {
     let project = dir.path().join("myproj");
     let infigraph_dir = project.join(".infigraph");
     std::fs::create_dir_all(&infigraph_dir).unwrap();
-    std::fs::write(infigraph_dir.join("graph.corrupt.1787856394"), b"x").unwrap();
+    std::fs::write(
+        infigraph_dir.join(infigraph_core::graph::names::sibling(".corrupt.1787856394")),
+        b"x",
+    )
+    .unwrap();
 
     let results = check_graph_holders(&project_ctx(&project));
     assert!(
@@ -1579,7 +1617,9 @@ fn check_graph_holders_passes_for_a_free_live_graph_and_names_a_held_one() {
 
     let dir = tempfile::TempDir::new().unwrap();
     let project = dir.path().join("myproj");
-    let graph = project.join(".infigraph").join("graph");
+    let graph = project
+        .join(".infigraph")
+        .join(infigraph_core::graph::names::STEM);
     drop(GraphStore::open(&graph).unwrap());
 
     let free = check_graph_holders(&project_ctx(&project));
@@ -1642,10 +1682,14 @@ fn doctor_fails_when_the_growth_breaker_is_latched() {
     std::fs::create_dir_all(&ig).unwrap();
     // The ratio guard proper, not its `growth_min_bytes` floor.
     std::fs::write(ig.join("config.toml"), "[graph]\ngrowth_min_bytes = 0\n").unwrap();
-    std::fs::write(ig.join("graph"), vec![0u8; 20_000_000]).unwrap();
+    std::fs::write(
+        ig.join(infigraph_core::graph::names::STEM),
+        vec![0u8; 20_000_000],
+    )
+    .unwrap();
     // Baseline 1MB against a 20MB graph: 20x, past the 10x default.
     std::fs::write(
-        ig.join("graph.health.json"),
+        ig.join(infigraph_core::graph::names::HEALTH),
         r#"{"healthy_size_bytes": 1000000}"#,
     )
     .unwrap();
@@ -1685,9 +1729,13 @@ fn doctor_passes_when_the_graph_is_within_the_growth_cap() {
     std::fs::create_dir_all(&ig).unwrap();
     // The ratio guard proper, not its `growth_min_bytes` floor.
     std::fs::write(ig.join("config.toml"), "[graph]\ngrowth_min_bytes = 0\n").unwrap();
-    std::fs::write(ig.join("graph"), vec![0u8; 3_000_000]).unwrap();
     std::fs::write(
-        ig.join("graph.health.json"),
+        ig.join(infigraph_core::graph::names::STEM),
+        vec![0u8; 3_000_000],
+    )
+    .unwrap();
+    std::fs::write(
+        ig.join(infigraph_core::graph::names::HEALTH),
         r#"{"healthy_size_bytes": 1000000}"#,
     )
     .unwrap();
@@ -1716,7 +1764,11 @@ fn doctor_warns_when_no_growth_baseline_is_recorded() {
     let ig = dir.path().join(".infigraph");
     std::fs::create_dir_all(&ig).unwrap();
     // A real graph, deliberately with no `graph.health.json` beside it.
-    std::fs::write(ig.join("graph"), vec![0u8; 3_000_000]).unwrap();
+    std::fs::write(
+        ig.join(infigraph_core::graph::names::STEM),
+        vec![0u8; 3_000_000],
+    )
+    .unwrap();
 
     let ctx = ctx_for(
         DoctorScope::Project(dir.path().to_path_buf()),

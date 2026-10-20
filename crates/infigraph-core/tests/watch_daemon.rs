@@ -467,7 +467,9 @@ fn ensure_daemon_running_prunes_a_dead_stale_holder_and_spawns_fresh() {
 /// later commits, matching `DaemonKuzuBackend`'s own read path.
 fn file_present_in_graph(project_dir: &std::path::Path, file: &str) -> bool {
     let backend = infigraph_core::graph::KuzuBackend::open_read_only(
-        &project_dir.join(".infigraph").join("graph"),
+        &project_dir
+            .join(".infigraph")
+            .join(infigraph_core::graph::names::STEM),
     )
     .unwrap();
     !backend
@@ -950,7 +952,10 @@ fn full_reindex_build_task_can_be_cancelled_before_it_starts_the_swap() {
         boot.index().unwrap();
     }
 
-    let live_graph = project.path().join(".infigraph").join("graph");
+    let live_graph = project
+        .path()
+        .join(".infigraph")
+        .join(infigraph_core::graph::names::STEM);
     // "Untouched" means not swapped, and a swap replaces the file -- so the
     // file's identity is the evidence, not its mtime. The coordinator writes
     // the live graph in place for legitimate reasons (the idle WAL fold,
@@ -1043,7 +1048,7 @@ fn full_reindex_build_task_can_be_cancelled_before_it_starts_the_swap() {
         .unwrap()
         .filter_map(|e| e.ok())
         .map(|e| e.file_name().to_string_lossy().into_owned())
-        .filter(|n| n.starts_with("graph.previous"))
+        .filter(|n| n.starts_with(infigraph_core::graph::names::sibling(".previous").as_str()))
         .collect();
     assert!(
         swap_leftovers.is_empty(),

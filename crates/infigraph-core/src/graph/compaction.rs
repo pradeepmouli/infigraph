@@ -133,7 +133,7 @@ pub struct CompactionBaseline {
 }
 
 fn compaction_baseline_path(infigraph_dir: &Path) -> std::path::PathBuf {
-    infigraph_dir.join("graph.compaction.json")
+    infigraph_dir.join(crate::graph::names::sibling(".compaction.json"))
 }
 
 fn now_epoch_secs() -> u64 {
@@ -242,7 +242,8 @@ mod measurement_tests {
     #[test]
     fn an_empty_graph_measures_zero_rows_without_failing() {
         let dir = tempfile::tempdir().unwrap();
-        let store = crate::graph::GraphStore::open(&dir.path().join("graph")).unwrap();
+        let store =
+            crate::graph::GraphStore::open(&dir.path().join(crate::graph::names::STEM)).unwrap();
         let stats = table_page_stats(&store, &["Symbol"]).expect("measurable");
         assert_eq!(stats.len(), 1);
         assert_eq!(stats[0].0, "Symbol");

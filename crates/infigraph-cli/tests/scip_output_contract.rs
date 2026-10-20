@@ -41,10 +41,14 @@ fn indexed_project() -> (tempfile::TempDir, tempfile::TempDir) {
 /// The graph's SCIP generation, read after the processes have gone (the
 /// daemon variant stops its daemon first by dropping it).
 fn scip_generation(root: &Path) -> i64 {
-    infigraph_core::graph::GraphStore::open(&root.join(".infigraph").join("graph"))
-        .unwrap()
-        .current_scip_generation()
-        .unwrap()
+    infigraph_core::graph::GraphStore::open(
+        &root
+            .join(".infigraph")
+            .join(infigraph_core::graph::names::STEM),
+    )
+    .unwrap()
+    .current_scip_generation()
+    .unwrap()
 }
 
 fn import(root: &Path, home: &Path, backend: &str, index: &Path) -> std::process::Output {

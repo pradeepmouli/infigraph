@@ -68,7 +68,10 @@ impl Drop for Holder {
 
 fn fresh_graph() -> (tempfile::TempDir, std::path::PathBuf) {
     let dir = tempfile::TempDir::new().unwrap();
-    let db_path = dir.path().join(".infigraph").join("graph");
+    let db_path = dir
+        .path()
+        .join(".infigraph")
+        .join(infigraph_core::graph::names::STEM);
     drop(GraphStore::open(&db_path).expect("create"));
     (dir, db_path)
 }

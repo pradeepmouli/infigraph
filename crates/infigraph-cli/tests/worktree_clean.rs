@@ -99,7 +99,9 @@ fn the_default_is_a_dry_run_that_changes_nothing() {
     assert!(text.contains("eligible"), "{text}");
     assert!(text.contains("skipped: the main worktree"), "{text}");
     assert!(
-        f.wt.join(".infigraph").join("graph").exists(),
+        f.wt.join(".infigraph")
+            .join(infigraph_core::graph::names::STEM)
+            .exists(),
         "a dry run deleted the graph"
     );
 }
@@ -127,7 +129,7 @@ fn apply_cleans_the_worktree_and_doctor_stays_quiet_about_it() {
 
     support::assert_ok(&out, "worktree clean --apply");
     assert!(
-        !ig.join("graph").exists(),
+        !ig.join(infigraph_core::graph::names::STEM).exists(),
         "the graph survived:\n{}\ngit status:\n{}",
         support::stdout(&out),
         String::from_utf8_lossy(
@@ -181,7 +183,11 @@ fn a_cleaned_worktree_can_be_bootstrapped_again() {
         &run(&f.main, &f.home, &["worktree", "clean", "--apply"]),
         "clean",
     );
-    assert!(!f.wt.join(".infigraph").join("graph").exists());
+    assert!(!f
+        .wt
+        .join(".infigraph")
+        .join(infigraph_core::graph::names::STEM)
+        .exists());
 
     let out = run(
         &f.main,
@@ -191,7 +197,9 @@ fn a_cleaned_worktree_can_be_bootstrapped_again() {
 
     support::assert_ok(&out, "worktree init on a cleaned worktree");
     assert!(
-        f.wt.join(".infigraph").join("graph").exists(),
+        f.wt.join(".infigraph")
+            .join(infigraph_core::graph::names::STEM)
+            .exists(),
         "init did not rebuild the graph"
     );
 }
@@ -207,7 +215,9 @@ fn a_worktree_with_a_live_daemon_is_left_alone() {
     let text = support::stdout(&out);
     assert!(text.contains("in use"), "{text}");
     assert!(
-        f.wt.join(".infigraph").join("graph").exists(),
+        f.wt.join(".infigraph")
+            .join(infigraph_core::graph::names::STEM)
+            .exists(),
         "the graph a live daemon holds was deleted"
     );
 }

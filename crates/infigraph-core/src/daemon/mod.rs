@@ -563,7 +563,11 @@ fn looks_like_a_project(dir: &Path) -> bool {
     // so a root that failed this check once would pass it forever after.
     // That is not hypothetical -- it let a test index 33,683 files across 57
     // sibling repositories, the exact outcome the check exists to prevent.
-    has_project_marker(dir) || dir.join(".infigraph").join("graph").exists()
+    has_project_marker(dir)
+        || dir
+            .join(".infigraph")
+            .join(crate::graph::names::STEM)
+            .exists()
 }
 
 /// The durable markers only: a VCS root in any form, or a build manifest.
@@ -986,7 +990,7 @@ where
     let mut last_fold_skip: Option<String> = None;
     // What the graph weighed at the last growth sample, and whether a fold
     // was attempted since -- see `growth_note` (#166).
-    let live_graph = root.join(".infigraph").join("graph");
+    let live_graph = root.join(".infigraph").join(crate::graph::names::STEM);
     let mut growth_sample = (
         std::time::Instant::now(),
         crate::graph::store_util::graph_family_bytes(&live_graph),
@@ -1008,7 +1012,7 @@ where
     // #183: the live graph file, for the compaction escalation check below.
     // Derived once rather than per tick -- it is two `join`s, but the check
     // runs every `COORDINATOR_TICK`.
-    let graph_path = infigraph_dir.join("graph");
+    let graph_path = infigraph_dir.join(crate::graph::names::STEM);
 
     // R3.3.5's dirty-set recovery now runs inside `run_producer` (once per
     // producer start), not here -- it is watch-side recovery, and keeping a
@@ -2384,7 +2388,7 @@ fn reopen_watch_db(
 
 /// The live graph file the daemon's prism opens.
 fn graph_path(root: &Path) -> PathBuf {
-    root.join(".infigraph").join("graph")
+    root.join(".infigraph").join(crate::graph::names::STEM)
 }
 
 /// Publish how an open of the daemon's graph went (#165): a failure the
@@ -2703,7 +2707,7 @@ fn build_full_reindex(
     registry: crate::lang::LanguageRegistry,
     token: &CancellationToken,
 ) -> Result<FullReindexBuildOutcome> {
-    const REBUILDING_NAME: &str = "graph.rebuilding";
+    const REBUILDING_NAME: &str = crate::graph::names::REBUILDING;
     let rebuilding_path = root.join(".infigraph").join(REBUILDING_NAME);
 
     // Clean up any stale leftover from a previously-interrupted rebuild
@@ -3394,8 +3398,8 @@ fn swap_in_full_reindex(
         }
     };
 
-    const LIVE_NAME: &str = "graph";
-    const REBUILDING_NAME: &str = "graph.rebuilding";
+    const LIVE_NAME: &str = crate::graph::names::STEM;
+    const REBUILDING_NAME: &str = crate::graph::names::REBUILDING;
     let infigraph_dir = root.join(".infigraph");
     let rebuilding_path = infigraph_dir.join(REBUILDING_NAME);
     let live_path = infigraph_dir.join(LIVE_NAME);
@@ -4445,7 +4449,7 @@ mod tests {
 
         // What a local-backend `index --full` amounts to: another file now
         // answers to the same path.
-        let aside = root.join("graph.aside");
+        let aside = root.join(crate::graph::names::ASIDE);
         std::fs::rename(&graph, &aside).unwrap();
         std::fs::copy(&aside, &graph).unwrap();
         assert!(held.graph_replaced(&graph));
@@ -4460,7 +4464,9 @@ mod tests {
     #[test]
     fn a_released_store_still_held_elsewhere_blocks_a_reopen_until_dropped() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Arc::new(crate::graph::GraphStore::open(&dir.path().join("graph")).unwrap());
+        let store = Arc::new(
+            crate::graph::GraphStore::open(&dir.path().join(crate::graph::names::STEM)).unwrap(),
+        );
         let mut held = HeldPrism::new();
         held.retired = Some(Arc::downgrade(&store));
 
@@ -4547,7 +4553,7 @@ mod tests {
     fn escalation_fires_on_the_byte_ratio_alone() {
         let tmp = tempfile::tempdir().unwrap();
         let infigraph_dir = crate::graph::store_util::floorless_infigraph_dir(tmp.path());
-        let graph_path = infigraph_dir.join("graph");
+        let graph_path = infigraph_dir.join(crate::graph::names::STEM);
         std::fs::write(&graph_path, vec![0u8; 4096]).unwrap();
         crate::graph::stamp_healthy_graph_size(&infigraph_dir, &graph_path);
         std::fs::write(&graph_path, vec![0u8; 4096 * 6]).unwrap();
@@ -4562,7 +4568,7 @@ mod tests {
     fn escalation_does_not_fire_below_the_threshold() {
         let tmp = tempfile::tempdir().unwrap();
         let infigraph_dir = crate::graph::store_util::floorless_infigraph_dir(tmp.path());
-        let graph_path = infigraph_dir.join("graph");
+        let graph_path = infigraph_dir.join(crate::graph::names::STEM);
         std::fs::write(&graph_path, vec![0u8; 4096]).unwrap();
         crate::graph::stamp_healthy_graph_size(&infigraph_dir, &graph_path);
         std::fs::write(&graph_path, vec![0u8; 4096 * 3]).unwrap();
@@ -4587,7 +4593,7 @@ mod tests {
             "[graph]\ngrowth_min_bytes = 1000000\n",
         )
         .unwrap();
-        let graph_path = infigraph_dir.join("graph");
+        let graph_path = infigraph_dir.join(crate::graph::names::STEM);
         std::fs::write(&graph_path, vec![0u8; 4096]).unwrap();
         crate::graph::stamp_healthy_graph_size(&infigraph_dir, &graph_path);
 
@@ -5080,7 +5086,10 @@ mod tests {
         );
         assert!(router.held.is_none(), "the graph must not have been opened");
         assert!(
-            !root.join(".infigraph").join("graph").exists(),
+            !root
+                .join(".infigraph")
+                .join(crate::graph::names::STEM)
+                .exists(),
             "no graph file may have been created by a reopen attempt"
         );
     }
@@ -5644,9 +5653,9 @@ mod swapped_in_graph_reopen_tests {
         let dir = tempfile::tempdir().unwrap();
         let infigraph_dir = dir.path().join(".infigraph");
         std::fs::create_dir_all(&infigraph_dir).unwrap();
-        let live = infigraph_dir.join("graph");
+        let live = infigraph_dir.join(crate::graph::names::STEM);
         std::fs::write(&live, b"the freshly rebuilt graph").unwrap();
-        let retired = infigraph_dir.join("graph.previous.1");
+        let retired = infigraph_dir.join(crate::graph::names::sibling(".previous.1"));
         std::fs::write(&retired, b"the stale prior graph").unwrap();
         (dir, infigraph_dir, live, retired)
     }
@@ -5655,7 +5664,7 @@ mod swapped_in_graph_reopen_tests {
         std::fs::read_dir(infigraph_dir)
             .unwrap()
             .filter_map(|e| Some(e.ok()?.file_name().to_string_lossy().into_owned()))
-            .filter(|n| n.starts_with("graph.corrupt."))
+            .filter(|n| n.starts_with(crate::graph::names::CORRUPT_PREFIX))
             .collect()
     }
 
@@ -5665,7 +5674,7 @@ mod swapped_in_graph_reopen_tests {
 
         let outcome = recover_or_quarantine_swapped_in_graph_with(
             &infigraph_dir,
-            "graph",
+            crate::graph::names::STEM,
             &live,
             &Some(retired.clone()),
             |_| true,
@@ -5696,7 +5705,7 @@ mod swapped_in_graph_reopen_tests {
 
         let outcome = recover_or_quarantine_swapped_in_graph_with(
             &infigraph_dir,
-            "graph",
+            crate::graph::names::STEM,
             &live,
             &Some(retired.clone()),
             |_| false,

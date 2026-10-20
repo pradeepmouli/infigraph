@@ -41,7 +41,7 @@ pub struct DaemonKuzuBackend {
 
 impl DaemonKuzuBackend {
     pub fn open(root: &Path) -> Result<Self> {
-        let db_path = root.join(".infigraph").join("graph");
+        let db_path = root.join(".infigraph").join(crate::graph::names::STEM);
         // No validation probe here any more.
         //
         // This used to `drop(KuzuBackend::open_read_only(&db_path)?)` so a
@@ -597,7 +597,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        let graph = root.join(".infigraph").join("graph");
+        let graph = root.join(".infigraph").join(crate::graph::names::STEM);
         std::fs::create_dir_all(graph.parent().unwrap()).unwrap();
         drop(crate::graph::GraphStore::open(&graph).unwrap());
 
@@ -630,7 +630,12 @@ mod tests {
 
         let backend = DaemonKuzuBackend::open(dir.path()).unwrap();
 
-        assert_eq!(backend.db_path, dir.path().join(".infigraph").join("graph"));
+        assert_eq!(
+            backend.db_path,
+            dir.path()
+                .join(".infigraph")
+                .join(crate::graph::names::STEM)
+        );
         assert!(
             !backend.db_path.exists(),
             "open must not create the graph itself -- that's the daemon's write path's job"
@@ -640,7 +645,10 @@ mod tests {
     #[test]
     fn open_still_validates_an_existing_graph() {
         let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join(".infigraph").join("graph");
+        let db_path = dir
+            .path()
+            .join(".infigraph")
+            .join(crate::graph::names::STEM);
         drop(super::super::store::GraphStore::open(&db_path).unwrap());
 
         DaemonKuzuBackend::open(dir.path()).unwrap();

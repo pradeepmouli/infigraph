@@ -47,7 +47,7 @@ pub struct ProcessRow {
 pub(crate) const PROJECT_LOCKS: &[&str] = &[
     "watch.lock",
     "index.lock",
-    "graph.lock",
+    crate::graph::names::LOCK,
     "docs.kuzu.lock",
     crate::docs_switch::DOCS_OP_LOCK,
     "mcp.lock",
@@ -399,7 +399,7 @@ mod tests {
         let project = tmp.path().join("proj");
         let ig = project.join(".infigraph");
         write_lock(&ig, "watch.lock", std::process::id(), "infigraph daemon");
-        write_lock(&ig, "graph.lock", DEAD_PID, "graph-write");
+        write_lock(&ig, crate::graph::names::LOCK, DEAD_PID, "graph-write");
 
         let rows = list_infigraph_processes(&[&project]);
 
@@ -414,7 +414,7 @@ mod tests {
             !dead.alive,
             "a stale lock's dead holder must still be listed"
         );
-        assert_eq!(dead.evidence, vec!["graph.lock".to_string()]);
+        assert_eq!(dead.evidence, vec![crate::graph::names::LOCK.to_string()]);
     }
 
     #[test]

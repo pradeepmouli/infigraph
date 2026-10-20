@@ -655,7 +655,8 @@ pub fn derived_from_disk(root: &Path) -> Vec<DegradedMode> {
         });
     }
     let ig = root.join(".infigraph");
-    if crate::daemon::lifecycle::is_remote_backend() || !ig.join("graph").exists() {
+    if crate::daemon::lifecycle::is_remote_backend() || !ig.join(crate::graph::names::STEM).exists()
+    {
         return modes;
     }
 
@@ -707,7 +708,7 @@ mod tests {
                 _home: home,
                 _guard: guard,
             };
-            project.write("graph", b"graph");
+            project.write(crate::graph::names::STEM, b"graph");
             project
         }
 

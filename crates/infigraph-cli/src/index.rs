@@ -60,7 +60,10 @@ const SCIP_INDEXER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 /// never after an ordinary incremental write.
 pub(crate) fn restamp_growth_baseline(root: &Path) {
     let dir = root.join(".infigraph");
-    infigraph_core::graph::stamp_healthy_graph_size(&dir, &dir.join("graph"));
+    infigraph_core::graph::stamp_healthy_graph_size(
+        &dir,
+        &dir.join(infigraph_core::graph::names::STEM),
+    );
 }
 
 pub(crate) fn cmd_index(root: &Path, full: bool, no_embed: bool) -> Result<()> {
@@ -124,7 +127,9 @@ pub(crate) fn cmd_index(root: &Path, full: bool, no_embed: bool) -> Result<()> {
     let tg_dir_for_promotion_check = root.join(".infigraph");
     let full = full
         || (tg_dir_for_promotion_check.exists()
-            && !tg_dir_for_promotion_check.join("graph").exists());
+            && !tg_dir_for_promotion_check
+                .join(infigraph_core::graph::names::STEM)
+                .exists());
 
     if full {
         if remote {

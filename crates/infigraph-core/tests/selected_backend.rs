@@ -98,7 +98,10 @@ fn init_refuses_an_unknown_backend_instead_of_opening_kuzu() {
         "unknown backend must not fall through to Kuzu"
     );
     assert!(
-        !tmp.path().join(".infigraph/graph").exists(),
+        !tmp.path()
+            .join(".infigraph")
+            .join(infigraph_core::graph::names::STEM)
+            .exists(),
         "no graph file may be created"
     );
 }

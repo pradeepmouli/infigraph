@@ -1263,7 +1263,9 @@ fn run(command: Commands, root: &Path, root_given: bool) -> Result<()> {
             index::restamp_growth_baseline(root);
             println!(
                 "Growth-guard baseline re-recorded from the current graph ({}).",
-                root.join(".infigraph").join("graph.health.json").display()
+                root.join(".infigraph")
+                    .join(infigraph_core::graph::names::HEALTH)
+                    .display()
             );
             Ok(())
         }

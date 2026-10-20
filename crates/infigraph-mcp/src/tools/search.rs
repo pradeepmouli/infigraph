@@ -69,7 +69,7 @@ fn graph_needs_recovery(infigraph_dir: &std::path::Path) -> bool {
     if infigraph_core::recovery::crash_loop_detected(infigraph_dir).is_some() {
         return true;
     }
-    let graph_path = infigraph_dir.join("graph");
+    let graph_path = infigraph_dir.join(infigraph_core::graph::names::STEM);
     let lock_path = infigraph_core::graph::db_lock_path(&graph_path);
     infigraph_core::graph::unclean_shutdown_wal_holder(&graph_path, &lock_path).is_some()
 }
@@ -983,9 +983,13 @@ mod staleness_banner_tests {
         infigraph_core::dirty::mark_dirty(&ig, &["a.py".to_string()]).unwrap();
 
         // 20MB graph against a 1MB baseline: 20x, past the 10x default.
-        std::fs::write(ig.join("graph"), vec![0u8; 20_000_000]).unwrap();
         std::fs::write(
-            ig.join("graph.health.json"),
+            ig.join(infigraph_core::graph::names::STEM),
+            vec![0u8; 20_000_000],
+        )
+        .unwrap();
+        std::fs::write(
+            ig.join(infigraph_core::graph::names::HEALTH),
             r#"{"healthy_size_bytes": 1000000}"#,
         )
         .unwrap();

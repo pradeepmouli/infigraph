@@ -16,7 +16,10 @@ use std::path::{Path, PathBuf};
 /// does not make a project: see [`is_global_store_root`]. Without that check
 /// a repo living under `$HOME` resolves to the global store.
 pub fn is_project_store(dir: &Path) -> bool {
-    dir.join(".infigraph").join("graph").exists() && !is_global_store_root(dir)
+    dir.join(".infigraph")
+        .join(crate::graph::names::STEM)
+        .exists()
+        && !is_global_store_root(dir)
 }
 
 /// Whether `dir`'s `.infigraph/` is the user's global store: `dir` is the
@@ -140,7 +143,7 @@ mod tests {
     fn make_store(dir: &std::path::Path) {
         let ig = dir.join(".infigraph");
         std::fs::create_dir_all(&ig).unwrap();
-        std::fs::write(ig.join("graph"), b"x").unwrap();
+        std::fs::write(ig.join(crate::graph::names::STEM), b"x").unwrap();
     }
 
     #[test]
@@ -172,7 +175,7 @@ mod tests {
         let home = tmp.path();
         let ig = home.join(".infigraph");
         std::fs::create_dir_all(&ig).unwrap();
-        std::fs::write(ig.join("graph"), b"x").unwrap();
+        std::fs::write(ig.join(crate::graph::names::STEM), b"x").unwrap();
         std::fs::write(ig.join("registry.json"), b"{}").unwrap();
         let repo = home.join("code/myrepo");
         std::fs::create_dir_all(&repo).unwrap();

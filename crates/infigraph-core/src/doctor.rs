@@ -221,7 +221,8 @@ pub fn check_registry(ctx: &DoctorContext) -> Vec<CheckResult> {
 /// a project that holds one is expected to be in the registry.
 fn holds_an_index(project_path: &Path) -> bool {
     let infigraph_dir = project_path.join(".infigraph");
-    infigraph_dir.join("graph").exists() || infigraph_dir.join("docs.kuzu").exists()
+    infigraph_dir.join(crate::graph::names::STEM).exists()
+        || infigraph_dir.join("docs.kuzu").exists()
 }
 
 fn check_project_registration(registry: &Registry, project_path: &Path) -> CheckResult {
@@ -452,7 +453,7 @@ pub fn check_locks(ctx: &DoctorContext) -> Vec<CheckResult> {
     for project in &projects {
         results.push(check_one_lock(
             project,
-            "graph.lock",
+            crate::graph::names::LOCK,
             &ctx.installed_build_hash,
         ));
         results.push(check_one_lock(
@@ -479,7 +480,9 @@ const WAL_CATEGORY: &str = "graph-integrity";
 /// mid-write -- see `kill`'s and `gc`'s own post-kill call into this same
 /// check.
 pub fn check_one_wal_integrity(project_path: &Path) -> CheckResult {
-    let db_path = project_path.join(".infigraph").join("graph");
+    let db_path = project_path
+        .join(".infigraph")
+        .join(crate::graph::names::STEM);
     let lock_path = crate::graph::db_lock_path(&db_path);
     let label = format!("{}: graph WAL integrity", project_path.display());
 
@@ -517,7 +520,7 @@ const GROWTH_CATEGORY: &str = "graph growth";
 /// recorded baseline, and opens nothing.
 pub fn check_one_growth_breaker(project_path: &Path) -> Option<CheckResult> {
     let infigraph_dir = project_path.join(".infigraph");
-    let graph_path = infigraph_dir.join("graph");
+    let graph_path = infigraph_dir.join(crate::graph::names::STEM);
     if !graph_path.exists() {
         return None; // nothing indexed here -- not this check's business
     }
@@ -576,7 +579,7 @@ const COMPACTION_CATEGORY: &str = "graph compaction";
 /// on it.
 pub fn check_one_compaction_drift(project_path: &Path) -> Option<CheckResult> {
     let infigraph_dir = project_path.join(".infigraph");
-    let graph_path = infigraph_dir.join("graph");
+    let graph_path = infigraph_dir.join(crate::graph::names::STEM);
     if !graph_path.exists() {
         return None; // nothing indexed here -- not this check's business
     }
@@ -1126,7 +1129,10 @@ pub fn check_disk(ctx: &DoctorContext) -> Vec<CheckResult> {
         DoctorScope::Global => ctx.registry.repos.values().collect(),
     };
     for entry in projects {
-        let graph_dir = entry.path.join(".infigraph").join("graph");
+        let graph_dir = entry
+            .path
+            .join(".infigraph")
+            .join(crate::graph::names::STEM);
         if graph_dir.exists() {
             let size_mb = path_size(&graph_dir) / (1024 * 1024);
             results.push(CheckResult::pass(
@@ -1368,7 +1374,9 @@ const SCIP_STALENESS_CATEGORY: &str = "scip-staleness";
 /// read `GraphMeta`'s counters. Bounded by `projects_in_scope`, same as
 /// every other per-project check.
 fn check_one_project_scip_staleness(project_path: &Path) -> Option<CheckResult> {
-    let graph_path = project_path.join(".infigraph").join("graph");
+    let graph_path = project_path
+        .join(".infigraph")
+        .join(crate::graph::names::STEM);
     if !graph_path.exists() {
         return None;
     }
@@ -1584,7 +1592,9 @@ fn check_one_project_recovery(project_path: &Path) -> Vec<CheckResult> {
 /// unopenable -- both of which other checks already report, so this one
 /// stays silent rather than double-reporting them.
 fn graph_symbol_count(project_path: &Path) -> anyhow::Result<usize> {
-    let graph_path = project_path.join(".infigraph").join("graph");
+    let graph_path = project_path
+        .join(".infigraph")
+        .join(crate::graph::names::STEM);
     if !graph_path.exists() {
         anyhow::bail!("no graph");
     }
@@ -1634,7 +1644,8 @@ fn check_one_project_graph_holders(project_path: &Path) -> Vec<CheckResult> {
                 .filter(|p| {
                     p.is_file()
                         && p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
-                            n.starts_with("graph.corrupt.") || n.starts_with("graph.previous.")
+                            n.starts_with(crate::graph::names::CORRUPT_PREFIX)
+                                || n.starts_with(crate::graph::names::PREVIOUS_PREFIX)
                         })
                 })
                 .collect()
@@ -1682,7 +1693,7 @@ fn check_one_project_graph_holders(project_path: &Path) -> Vec<CheckResult> {
     }
 
     // 2. Live graph lock holder.
-    let graph = infigraph_dir.join("graph");
+    let graph = infigraph_dir.join(crate::graph::names::STEM);
     if graph.is_file() {
         let label = format!("{}: graph lock", project_path.display());
         results.push(match probe_graph_lock(&graph, ProbeFor::Write) {
@@ -2106,7 +2117,7 @@ mod sidecar_anchor_tests {
         let dir = tempfile::tempdir().unwrap();
         let ig = dir.path().join(".infigraph");
         std::fs::create_dir_all(&ig).unwrap();
-        std::fs::write(ig.join("graph"), "g").unwrap();
+        std::fs::write(ig.join(crate::graph::names::STEM), "g").unwrap();
 
         let result = check_project_registration(&Registry::default(), dir.path());
 
@@ -2118,7 +2129,7 @@ mod sidecar_anchor_tests {
         let dir = tempfile::tempdir().unwrap();
         let ig = dir.path().join(".infigraph");
         std::fs::create_dir_all(&ig).unwrap();
-        touch(&ig.join("graph"), Duration::ZERO);
+        touch(&ig.join(crate::graph::names::STEM), Duration::ZERO);
         touch(&ig.join("docs.kuzu"), Duration::from_secs(3 * HOURS));
         touch(
             &ig.join("docs_embeddings.bin"),
@@ -2165,7 +2176,7 @@ mod sidecar_anchor_tests {
         let dir = tempfile::tempdir().unwrap();
         let ig = dir.path().join(".infigraph");
         std::fs::create_dir_all(&ig).unwrap();
-        touch(&ig.join("graph"), Duration::ZERO);
+        touch(&ig.join(crate::graph::names::STEM), Duration::ZERO);
         touch(&ig.join("embeddings.bin"), Duration::from_secs(2 * HOURS));
 
         let result = check_one_sidecar(dir.path(), "embeddings.bin").unwrap();
@@ -2178,7 +2189,7 @@ mod sidecar_anchor_tests {
         let dir = tempfile::tempdir().unwrap();
         let ig = dir.path().join(".infigraph");
         std::fs::create_dir_all(&ig).unwrap();
-        touch(&ig.join("graph"), Duration::ZERO);
+        touch(&ig.join(crate::graph::names::STEM), Duration::ZERO);
         let name = crate::clone_detect::bodies::BODIES_FILE;
         touch(&ig.join(name), Duration::from_secs(2 * HOURS));
 
@@ -2194,7 +2205,7 @@ mod sidecar_anchor_tests {
         let dir = tempfile::tempdir().unwrap();
         let ig = dir.path().join(".infigraph");
         std::fs::create_dir_all(&ig).unwrap();
-        touch(&ig.join("graph"), Duration::ZERO);
+        touch(&ig.join(crate::graph::names::STEM), Duration::ZERO);
         touch(
             &ig.join("docs_embeddings.bin"),
             Duration::from_secs(2 * HOURS),
@@ -2409,7 +2420,13 @@ mod degraded_check_tests {
     fn project() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join(".infigraph")).unwrap();
-        std::fs::write(dir.path().join(".infigraph/graph"), b"graph").unwrap();
+        std::fs::write(
+            dir.path()
+                .join(".infigraph")
+                .join(crate::graph::names::STEM),
+            b"graph",
+        )
+        .unwrap();
         dir
     }
 

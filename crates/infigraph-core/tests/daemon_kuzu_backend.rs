@@ -17,7 +17,9 @@ use std::sync::Arc;
 /// is the documented escape hatch, but it has its own unit test and would
 /// bypass the very routing these tests exist to exercise.
 fn start_read_service(project_dir: &Path) -> ReadService {
-    let graph = project_dir.join(".infigraph").join("graph");
+    let graph = project_dir
+        .join(".infigraph")
+        .join(infigraph_core::graph::names::STEM);
     let store = Arc::new(GraphStore::open(&graph).unwrap());
     ReadService::start(project_dir, store, 2).unwrap()
 }

@@ -37,7 +37,12 @@ pub fn resolve_project_path(path: &str) -> String {
     // The registry fallback stays here: it answers "an indexed project lives
     // *below* the path I was given", which is a lookup against global state
     // rather than a property of the path itself.
-    if resolved == start && !start.join(".infigraph").join("graph").exists() {
+    if resolved == start
+        && !start
+            .join(".infigraph")
+            .join(infigraph_core::graph::names::STEM)
+            .exists()
+    {
         if let Ok(registry) = infigraph_core::multi::Registry::load() {
             for entry in registry.repos.values() {
                 if entry.path.starts_with(&start) {

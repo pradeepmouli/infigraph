@@ -590,7 +590,7 @@ mod tests {
     fn hold_spawned_waits_for_the_daemon_to_come_up() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
-        let graph = root.join(".infigraph").join("graph");
+        let graph = root.join(".infigraph").join(crate::graph::names::STEM);
         std::fs::create_dir_all(graph.parent().unwrap()).unwrap();
         drop(crate::graph::GraphStore::open(&graph).unwrap());
         let store = std::sync::Arc::new(crate::graph::GraphStore::open(&graph).unwrap());

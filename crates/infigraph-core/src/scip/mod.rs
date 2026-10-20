@@ -1390,7 +1390,10 @@ fn import_scip_index_unrecorded(
     store.stamp_scip_generation_conn(&conn, &_lock, enriched_ast_generation)?;
 
     if let Some(dir) = store.db_dir() {
-        crate::graph::store_util::stamp_healthy_graph_size_if_unset(dir, &dir.join("graph"));
+        crate::graph::store_util::stamp_healthy_graph_size_if_unset(
+            dir,
+            &dir.join(crate::graph::names::STEM),
+        );
     }
     clock.lap("stamp");
     eprintln!("[scip-import] phases: {}", clock.report());
@@ -2666,7 +2669,7 @@ mod tests {
     impl TestEnv {
         fn new() -> Self {
             let dir = tempfile::TempDir::new().unwrap();
-            let store = GraphStore::open(&dir.path().join("graph")).unwrap();
+            let store = GraphStore::open(&dir.path().join(crate::graph::names::STEM)).unwrap();
             Self { _dir: dir, store }
         }
 

@@ -12,7 +12,7 @@ fn backend_with(files: &[(&str, &[u8])]) -> (tempfile::TempDir, KuzuBackend) {
         extractions.push(extract_file(path, src, pack).unwrap());
     }
     let dir = tempfile::TempDir::new().unwrap();
-    let backend = KuzuBackend::open(&dir.path().join("graph")).unwrap();
+    let backend = KuzuBackend::open(&dir.path().join(infigraph_core::graph::names::STEM)).unwrap();
     backend.upsert_files_bulk(&extractions, true).unwrap();
     // upsert_files_bulk only writes raw nodes/edges from extraction — it does
     // not run call resolution. Namespace-qualified calls that don't resolve

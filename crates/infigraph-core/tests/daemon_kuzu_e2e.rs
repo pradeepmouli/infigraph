@@ -231,7 +231,9 @@ fn stop_daemon(project_dir: &Path, daemon: &mut KillOnDrop) {
 /// with the daemon's -- exactly what this design exists to prevent.
 fn verify_conn(project_dir: &Path) -> infigraph_core::graph::KuzuBackend {
     infigraph_core::graph::KuzuBackend::open_read_only(
-        &project_dir.join(".infigraph").join("graph"),
+        &project_dir
+            .join(".infigraph")
+            .join(infigraph_core::graph::names::STEM),
     )
     .unwrap()
 }
@@ -1054,7 +1056,10 @@ fn a_failed_rebuild_leaves_the_live_graph_untouched() {
         "the live graph must survive regardless of whether the rebuild succeeded or failed"
     );
 
-    let rebuilding_path = project.path().join(".infigraph").join("graph.rebuilding");
+    let rebuilding_path = project
+        .path()
+        .join(".infigraph")
+        .join(infigraph_core::graph::names::REBUILDING);
     assert!(
         !rebuilding_path.exists(),
         "an incomplete rebuild attempt must not leave graph.rebuilding behind"
@@ -1224,7 +1229,11 @@ fn plain_index_on_a_never_indexed_project_bootstraps_under_daemon_backend() {
          failing, got: {stderr}"
     );
     assert!(
-        project.path().join(".infigraph").join("graph").exists(),
+        project
+            .path()
+            .join(".infigraph")
+            .join(infigraph_core::graph::names::STEM)
+            .exists(),
         "bootstrap must leave a real graph on disk for the daemon to serve, got: {stderr}"
     );
 }
@@ -1259,9 +1268,19 @@ fn plain_index_auto_promotes_to_a_full_rebuild_when_the_graph_is_missing_but_inf
         .status()
         .unwrap();
     assert!(status.success(), "bootstrap index failed");
-    assert!(project.path().join(".infigraph").join("graph").exists());
+    assert!(project
+        .path()
+        .join(".infigraph")
+        .join(infigraph_core::graph::names::STEM)
+        .exists());
 
-    std::fs::remove_file(project.path().join(".infigraph").join("graph")).unwrap();
+    std::fs::remove_file(
+        project
+            .path()
+            .join(".infigraph")
+            .join(infigraph_core::graph::names::STEM),
+    )
+    .unwrap();
 
     let output = cli_command()
         .arg("index")
@@ -1277,7 +1296,11 @@ fn plain_index_auto_promotes_to_a_full_rebuild_when_the_graph_is_missing_but_inf
         output.status.success(),
         "plain index must auto-promote to a full rebuild, not fail: {stderr}"
     );
-    assert!(project.path().join(".infigraph").join("graph").exists());
+    assert!(project
+        .path()
+        .join(".infigraph")
+        .join(infigraph_core::graph::names::STEM)
+        .exists());
 
     // A `.infigraph/index.lock` FILE persisting after a clean run is normal
     // (this codebase's lockfile convention releases the OS-level flock but
@@ -1473,7 +1496,7 @@ fn a_dead_holder_wal_sentinel_triggers_an_automatic_full_reindex_via_the_real_da
     infigraph_core::recovery::mark_recovery_needed(
         &infigraph_dir,
         999_999_999,
-        &infigraph_dir.join("graph.corrupt.stub"),
+        &infigraph_dir.join(infigraph_core::graph::names::sibling(".corrupt.stub")),
     )
     .unwrap();
 
@@ -1513,7 +1536,7 @@ fn a_third_recovery_trigger_inside_the_window_trips_the_crash_loop_breaker_inste
     infigraph_core::recovery::mark_recovery_needed(
         &infigraph_dir,
         1,
-        &infigraph_dir.join("graph.corrupt.stub"),
+        &infigraph_dir.join(infigraph_core::graph::names::sibling(".corrupt.stub")),
     )
     .unwrap();
 

@@ -528,7 +528,7 @@ mod tests {
     #[test]
     fn a_torn_wal_over_an_intact_base_image_is_recovered_not_quarantined() {
         let dir = tempfile::tempdir().unwrap();
-        let graph = dir.path().join("graph");
+        let graph = dir.path().join(crate::graph::names::STEM);
         {
             let store = crate::graph::GraphStore::open(&graph).unwrap();
             let conn = store.connection().unwrap();
@@ -539,11 +539,19 @@ mod tests {
             .unwrap();
         }
         // Garbage where a WAL record header belongs.
-        std::fs::write(dir.path().join("graph.wal"), b"not a wal record at all").unwrap();
+        std::fs::write(
+            dir.path().join(crate::graph::names::sibling(".wal")),
+            b"not a wal record at all",
+        )
+        .unwrap();
 
         let before = std::fs::metadata(&graph).unwrap().len();
         assert_eq!(
-            try_recover_by_setting_wal_aside_with(dir.path(), "graph", in_process_probe),
+            try_recover_by_setting_wal_aside_with(
+                dir.path(),
+                crate::graph::names::STEM,
+                in_process_probe
+            ),
             WalRecovery::Recovered,
             "the base image opens without the WAL, so this must recover"
         );
@@ -580,9 +588,13 @@ mod tests {
     #[test]
     fn a_healthy_graph_with_no_wal_reports_already_healthy() {
         let dir = tempfile::tempdir().unwrap();
-        let graph = dir.path().join("graph");
+        let graph = dir.path().join(crate::graph::names::STEM);
         drop(crate::graph::GraphStore::open(&graph).unwrap());
-        let verdict = try_recover_by_setting_wal_aside_with(dir.path(), "graph", in_process_probe);
+        let verdict = try_recover_by_setting_wal_aside_with(
+            dir.path(),
+            crate::graph::names::STEM,
+            in_process_probe,
+        );
         assert_eq!(verdict, WalRecovery::AlreadyHealthy);
         assert!(
             !verdict.permits_quarantine(),
@@ -595,8 +607,16 @@ mod tests {
     #[test]
     fn an_unopenable_graph_with_no_wal_is_not_recoverable() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("graph"), b"not a database").unwrap();
-        let verdict = try_recover_by_setting_wal_aside_with(dir.path(), "graph", in_process_probe);
+        std::fs::write(
+            dir.path().join(crate::graph::names::STEM),
+            b"not a database",
+        )
+        .unwrap();
+        let verdict = try_recover_by_setting_wal_aside_with(
+            dir.path(),
+            crate::graph::names::STEM,
+            in_process_probe,
+        );
         assert_eq!(verdict, WalRecovery::NotRecoverable);
         assert!(verdict.permits_quarantine());
     }
@@ -605,7 +625,7 @@ mod tests {
     fn next_free_aside_ts_returns_start_when_nothing_collides() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(
-            next_free_aside_ts(dir.path(), "graph", "corrupt", 1000),
+            next_free_aside_ts(dir.path(), crate::graph::names::STEM, "corrupt", 1000),
             1000
         );
     }
@@ -613,9 +633,14 @@ mod tests {
     #[test]
     fn next_free_aside_ts_walks_past_an_existing_base_entry() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("graph.corrupt.1000"), b"earlier entry").unwrap();
+        std::fs::write(
+            dir.path()
+                .join(crate::graph::names::sibling(".corrupt.1000")),
+            b"earlier entry",
+        )
+        .unwrap();
         assert_eq!(
-            next_free_aside_ts(dir.path(), "graph", "corrupt", 1000),
+            next_free_aside_ts(dir.path(), crate::graph::names::STEM, "corrupt", 1000),
             1001
         );
     }
@@ -624,10 +649,15 @@ mod tests {
     fn next_free_aside_ts_walks_past_a_run_of_occupied_seconds() {
         let dir = tempfile::tempdir().unwrap();
         for ts in 1000..1003u64 {
-            std::fs::write(dir.path().join(format!("graph.corrupt.{ts}")), b"x").unwrap();
+            std::fs::write(
+                dir.path()
+                    .join(crate::graph::names::sibling(&format!(".corrupt.{ts}"))),
+                b"x",
+            )
+            .unwrap();
         }
         assert_eq!(
-            next_free_aside_ts(dir.path(), "graph", "corrupt", 1000),
+            next_free_aside_ts(dir.path(), crate::graph::names::STEM, "corrupt", 1000),
             1003
         );
     }
@@ -638,9 +668,14 @@ mod tests {
         // Only the sibling exists (partial earlier move) -- the stem must
         // still count as taken, or move_wal_sibling's copy fallback would
         // silently overwrite it.
-        std::fs::write(dir.path().join("graph.corrupt.1000.wal"), b"stray").unwrap();
+        std::fs::write(
+            dir.path()
+                .join(crate::graph::names::sibling(".corrupt.1000.wal")),
+            b"stray",
+        )
+        .unwrap();
         assert_eq!(
-            next_free_aside_ts(dir.path(), "graph", "corrupt", 1000),
+            next_free_aside_ts(dir.path(), crate::graph::names::STEM, "corrupt", 1000),
             1001
         );
     }
@@ -649,24 +684,35 @@ mod tests {
     fn next_free_aside_ts_does_not_false_match_a_longer_timestamp_prefix() {
         let dir = tempfile::tempdir().unwrap();
         // "graph.corrupt.100" must not be blocked by "graph.corrupt.1000".
-        std::fs::write(dir.path().join("graph.corrupt.1000"), b"other entry").unwrap();
-        assert_eq!(next_free_aside_ts(dir.path(), "graph", "corrupt", 100), 100);
+        std::fs::write(
+            dir.path()
+                .join(crate::graph::names::sibling(".corrupt.1000")),
+            b"other entry",
+        )
+        .unwrap();
+        assert_eq!(
+            next_free_aside_ts(dir.path(), crate::graph::names::STEM, "corrupt", 100),
+            100
+        );
     }
 
     #[test]
     fn discarding_a_set_aside_graph_takes_its_wal_family_and_nothing_else() {
         let dir = tempfile::tempdir().unwrap();
         for name in [
-            "graph",
-            "graph.previous.100",
-            "graph.previous.100.wal",
-            "graph.previous.100.wal.checkpoint",
-            "graph.previous.1000",
+            crate::graph::names::STEM,
+            crate::graph::names::sibling(".previous.100").as_str(),
+            crate::graph::names::sibling(".previous.100.wal").as_str(),
+            crate::graph::names::sibling(".previous.100.wal.checkpoint").as_str(),
+            crate::graph::names::sibling(".previous.1000").as_str(),
         ] {
             std::fs::write(dir.path().join(name), b"x").unwrap();
         }
 
-        discard_set_aside(&dir.path().join("graph.previous.100"));
+        discard_set_aside(
+            &dir.path()
+                .join(crate::graph::names::sibling(".previous.100")),
+        );
 
         let mut left: Vec<String> = std::fs::read_dir(dir.path())
             .unwrap()
@@ -676,7 +722,7 @@ mod tests {
         left.sort();
         assert_eq!(
             left,
-            vec!["graph", "graph.previous.1000"],
+            vec![crate::graph::names::STEM, "graph.previous.1000"],
             "neither the live graph nor a longer timestamp sharing the prefix"
         );
     }
@@ -684,9 +730,14 @@ mod tests {
     #[test]
     fn next_free_aside_ts_pools_do_not_block_each_other() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("graph.previous.1000"), b"retired").unwrap();
+        std::fs::write(
+            dir.path()
+                .join(crate::graph::names::sibling(".previous.1000")),
+            b"retired",
+        )
+        .unwrap();
         assert_eq!(
-            next_free_aside_ts(dir.path(), "graph", "corrupt", 1000),
+            next_free_aside_ts(dir.path(), crate::graph::names::STEM, "corrupt", 1000),
             1000
         );
     }
@@ -703,7 +754,7 @@ mod tests {
     #[test]
     fn a_graph_that_already_opens_keeps_its_wal_untouched() {
         let dir = tempfile::tempdir().unwrap();
-        let graph = dir.path().join("graph");
+        let graph = dir.path().join(crate::graph::names::STEM);
         {
             let store = crate::graph::GraphStore::open(&graph).unwrap();
             let conn = store.connection().unwrap();
@@ -715,7 +766,7 @@ mod tests {
         }
         // A WAL that is present and perfectly readable -- the state a graph is
         // in whenever a writer checkpointed and left the file behind.
-        let wal = dir.path().join("graph.wal");
+        let wal = dir.path().join(crate::graph::names::sibling(".wal"));
         std::fs::write(&wal, b"").unwrap();
         assert!(
             in_process_probe(&graph),
@@ -724,7 +775,11 @@ mod tests {
         );
 
         assert_eq!(
-            try_recover_by_setting_wal_aside_with(dir.path(), "graph", in_process_probe),
+            try_recover_by_setting_wal_aside_with(
+                dir.path(),
+                crate::graph::names::STEM,
+                in_process_probe
+            ),
             WalRecovery::AlreadyHealthy,
             "a graph that already opens needs no recovery, so this must decline -- \
              and must say WHY it declined, or the caller cannot tell this apart \

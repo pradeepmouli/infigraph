@@ -21,7 +21,7 @@ const CATEGORY: &str = "verify";
 /// `doctor`'s remediation hints) decides.
 pub fn run_verify(root: &Path) -> Vec<CheckResult> {
     let ig = root.join(".infigraph");
-    let graph_path = ig.join("graph");
+    let graph_path = ig.join(crate::graph::names::STEM);
     let mut results = Vec::new();
 
     if !graph_path.exists() {

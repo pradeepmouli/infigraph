@@ -1168,7 +1168,12 @@ mod live_matcher_tests {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         std::fs::create_dir_all(root.join(".infigraph")).unwrap();
-        std::fs::write(root.join(".infigraph/graph"), b"x").unwrap();
+        std::fs::write(
+            root.join(".infigraph")
+                .join(infigraph_core::graph::names::STEM),
+            b"x",
+        )
+        .unwrap();
         std::fs::write(root.join("draft.md"), "# Draft").unwrap();
         let every = Duration::from_secs(300);
 

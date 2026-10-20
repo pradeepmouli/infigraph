@@ -67,7 +67,9 @@ fn a_full_reindex_waits_for_the_machines_slot_and_runs_when_it_is_free() {
     // free, and the graph still answers.
     let infigraph_dir = root.join(".infigraph");
     assert!(
-        !infigraph_dir.join("graph.rebuilding").exists(),
+        !infigraph_dir
+            .join(infigraph_core::graph::names::REBUILDING)
+            .exists(),
         "a rebuild started without a slot"
     );
     // The daemon's own start-up true-up (a whole-project scan) may still hold

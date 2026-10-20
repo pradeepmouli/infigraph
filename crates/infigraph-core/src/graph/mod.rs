@@ -6,6 +6,7 @@ pub(crate) mod growth_gate;
 pub mod id_scheme;
 mod kuzu_backend;
 pub mod lock_probe;
+pub mod names;
 #[cfg(feature = "neo4j")]
 mod neo4j_backend;
 pub mod observe;

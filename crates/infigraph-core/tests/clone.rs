@@ -11,7 +11,13 @@ fn clone_copies_graph_and_sidecars() {
     let src = tempfile::tempdir().unwrap();
     let dst = tempfile::tempdir().unwrap();
 
-    write_file(&src.path().join(".infigraph/graph/data.kz"), "graph-bytes");
+    write_file(
+        &src.path().join(format!(
+            ".infigraph/{}/data.kz",
+            infigraph_core::graph::names::STEM
+        )),
+        "graph-bytes",
+    );
     write_file(&src.path().join(".infigraph/embeddings.bin"), "emb-bytes");
     write_file(
         &src.path().join(".infigraph/clone-bodies.bin"),
@@ -25,7 +31,11 @@ fn clone_copies_graph_and_sidecars() {
     clone_infigraph_dir(src.path(), dst.path()).unwrap();
 
     assert_eq!(
-        fs::read_to_string(dst.path().join(".infigraph/graph/data.kz")).unwrap(),
+        fs::read_to_string(dst.path().join(format!(
+            ".infigraph/{}/data.kz",
+            infigraph_core::graph::names::STEM
+        )))
+        .unwrap(),
         "graph-bytes"
     );
     assert_eq!(
@@ -47,7 +57,12 @@ fn clone_excludes_lock_files_and_logs() {
     let src = tempfile::tempdir().unwrap();
     let dst = tempfile::tempdir().unwrap();
 
-    write_file(&src.path().join(".infigraph/graph.lock"), "pid:123");
+    write_file(
+        &src.path()
+            .join(".infigraph")
+            .join(infigraph_core::graph::names::sibling(".lock")),
+        "pid:123",
+    );
     write_file(&src.path().join(".infigraph/watch.lock"), "pid:123");
     write_file(&src.path().join(".infigraph/mcp.lock"), "pid:123");
     write_file(&src.path().join(".infigraph/index.lock"), "pid:123");
@@ -56,7 +71,11 @@ fn clone_excludes_lock_files_and_logs() {
 
     clone_infigraph_dir(src.path(), dst.path()).unwrap();
 
-    assert!(!dst.path().join(".infigraph/graph.lock").exists());
+    assert!(!dst
+        .path()
+        .join(".infigraph")
+        .join(infigraph_core::graph::names::sibling(".lock"))
+        .exists());
     assert!(!dst.path().join(".infigraph/watch.lock").exists());
     assert!(!dst.path().join(".infigraph/mcp.lock").exists());
     assert!(!dst.path().join(".infigraph/index.lock").exists());
@@ -126,23 +145,47 @@ fn clone_skips_the_restore_pools_but_keeps_the_graph() {
     let src = tempfile::tempdir().unwrap();
     let dst = tempfile::tempdir().unwrap();
 
-    write_file(&src.path().join(".infigraph/graph"), "graph-bytes");
-    write_file(&src.path().join(".infigraph/graph.wal"), "wal-bytes");
+    write_file(
+        &src.path()
+            .join(".infigraph")
+            .join(infigraph_core::graph::names::STEM),
+        "graph-bytes",
+    );
+    write_file(
+        &src.path()
+            .join(".infigraph")
+            .join(infigraph_core::graph::names::sibling(".wal")),
+        "wal-bytes",
+    );
     write_file(&src.path().join(".infigraph/snapshots/1/graph"), "old");
     write_file(
-        &src.path().join(".infigraph/graph.previous.1791397452"),
+        &src.path()
+            .join(".infigraph")
+            .join(infigraph_core::graph::names::sibling(
+                ".previous.1791397452",
+            )),
         "old",
     );
     write_file(
-        &src.path().join(".infigraph/graph.previous.1791397452.wal"),
+        &src.path()
+            .join(".infigraph")
+            .join(infigraph_core::graph::names::sibling(
+                ".previous.1791397452.wal",
+            )),
         "old",
     );
     write_file(
-        &src.path().join(".infigraph/graph.corrupt.1791226834"),
+        &src.path()
+            .join(".infigraph")
+            .join(infigraph_core::graph::names::sibling(".corrupt.1791226834")),
         "bad",
     );
     write_file(
-        &src.path().join(".infigraph/graph.corrupt.1791226834.wal"),
+        &src.path()
+            .join(".infigraph")
+            .join(infigraph_core::graph::names::sibling(
+                ".corrupt.1791226834.wal",
+            )),
         "bad",
     );
     write_file(
@@ -153,19 +196,22 @@ fn clone_skips_the_restore_pools_but_keeps_the_graph() {
     clone_infigraph_dir(src.path(), dst.path()).unwrap();
 
     let ig = dst.path().join(".infigraph");
-    assert_eq!(fs::read_to_string(ig.join("graph")).unwrap(), "graph-bytes");
     assert_eq!(
-        fs::read_to_string(ig.join("graph.wal")).unwrap(),
+        fs::read_to_string(ig.join(infigraph_core::graph::names::STEM)).unwrap(),
+        "graph-bytes"
+    );
+    assert_eq!(
+        fs::read_to_string(ig.join(infigraph_core::graph::names::sibling(".wal"))).unwrap(),
         "wal-bytes"
     );
     for pool in [
-        "snapshots",
-        "graph.previous.1791397452",
-        "graph.previous.1791397452.wal",
-        "graph.corrupt.1791226834",
-        "graph.corrupt.1791226834.wal",
+        "snapshots".to_string(),
+        infigraph_core::graph::names::sibling(".previous.1791397452"),
+        infigraph_core::graph::names::sibling(".previous.1791397452.wal"),
+        infigraph_core::graph::names::sibling(".corrupt.1791226834"),
+        infigraph_core::graph::names::sibling(".corrupt.1791226834.wal"),
     ] {
-        assert!(!ig.join(pool).exists(), "{pool} was cloned");
+        assert!(!ig.join(&pool).exists(), "{pool} was cloned");
     }
     assert!(
         ig.join("sessions/snapshots/notes").exists(),

@@ -95,7 +95,9 @@ fn concurrent_reader_helper() {
     let stop = PathBuf::from(
         std::env::var_os(READER_STOP_ENV).expect("reader child needs a stop-sentinel path"),
     );
-    let db_path = root.join(".infigraph").join("graph");
+    let db_path = root
+        .join(".infigraph")
+        .join(infigraph_core::graph::names::STEM);
 
     let mut counts = ReaderCounts::default();
     let mut samples: Vec<String> = Vec::new();
@@ -236,7 +238,9 @@ fn parse_counts(stdout: &str) -> Option<ReaderCounts> {
 fn concurrent_writer_reader_raw_query_correctness_under_load() {
     let project = tempfile::tempdir().expect("project tmpdir");
     let root = project.path().to_path_buf();
-    let db_path = root.join(".infigraph").join("graph");
+    let db_path = root
+        .join(".infigraph")
+        .join(infigraph_core::graph::names::STEM);
     let stop_path = root.join(".infigraph").join("reader.stop");
 
     write_fixture(

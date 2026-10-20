@@ -179,8 +179,12 @@ fn the_compaction_drift_check_measures_through_a_live_daemon() {
 fn without_a_daemon_verify_still_opens_the_graph_itself() {
     let tmp = tempfile::tempdir().unwrap();
     drop(
-        infigraph_core::graph::GraphStore::open(&tmp.path().join(".infigraph").join("graph"))
-            .unwrap(),
+        infigraph_core::graph::GraphStore::open(
+            &tmp.path()
+                .join(".infigraph")
+                .join(infigraph_core::graph::names::STEM),
+        )
+        .unwrap(),
     );
 
     let results = run_verify(tmp.path());
@@ -208,7 +212,10 @@ fn an_ordinary_routed_read_still_leases_the_daemon() {
 fn the_direct_arm_reads_the_same_executor_surface() {
     use infigraph_core::graph::observe::ObservedGraph;
     let tmp = tempfile::tempdir().unwrap();
-    let graph = tmp.path().join(".infigraph").join("graph");
+    let graph = tmp
+        .path()
+        .join(".infigraph")
+        .join(infigraph_core::graph::names::STEM);
     drop(infigraph_core::graph::GraphStore::open(&graph).unwrap());
 
     let observed = ObservedGraph::open(tmp.path(), &graph).unwrap();

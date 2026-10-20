@@ -967,7 +967,7 @@ fn test_extract_to_graph_roundtrip() {
     let ext = extract_file("service.py", src, &pack).unwrap();
 
     let dir = tempfile::TempDir::new().unwrap();
-    let store = GraphStore::open(&dir.path().join("graph")).unwrap();
+    let store = GraphStore::open(&dir.path().join(infigraph_core::graph::names::STEM)).unwrap();
     store.upsert_file(&ext).unwrap();
 
     let conn = store.connection().unwrap();

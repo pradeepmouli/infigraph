@@ -361,7 +361,7 @@ impl CodeIndex {
     /// registry (~62 tree-sitter packs) once per repo.
     pub fn open_shared(root: &Path, registry: std::sync::Arc<LanguageRegistry>) -> Result<Self> {
         let root = root.canonicalize().context("invalid project root")?;
-        let db_path = root.join(".infigraph").join("graph");
+        let db_path = root.join(".infigraph").join(crate::graph::names::STEM);
         scip::use_language_registry(registry.clone());
         Ok(Self {
             root,
@@ -1685,7 +1685,7 @@ mod tests {
     fn init_recovers_from_transient_open_failure_without_wiping() {
         let dir = tempfile::TempDir::new().unwrap();
         let root = dir.path();
-        let db_path = root.join(".infigraph").join("graph");
+        let db_path = root.join(".infigraph").join(crate::graph::names::STEM);
 
         // Build a real graph with a marker symbol, then close it.
         {
@@ -1741,7 +1741,7 @@ mod tests {
     fn init_recovers_from_slower_transient_failure_via_backoff() {
         let dir = tempfile::TempDir::new().unwrap();
         let root = dir.path();
-        let db_path = root.join(".infigraph").join("graph");
+        let db_path = root.join(".infigraph").join(crate::graph::names::STEM);
 
         {
             let store = GraphStore::open(&db_path).unwrap();
@@ -1792,7 +1792,7 @@ mod tests {
     fn init_wipes_and_rebuilds_on_persistent_corruption() {
         let dir = tempfile::TempDir::new().unwrap();
         let root = dir.path();
-        let db_path = root.join(".infigraph").join("graph");
+        let db_path = root.join(".infigraph").join(crate::graph::names::STEM);
 
         {
             let store = GraphStore::open(&db_path).unwrap();
@@ -1831,7 +1831,7 @@ mod tests {
     fn init_quarantines_instead_of_deleting_on_persistent_corruption() {
         let dir = tempfile::TempDir::new().unwrap();
         let root = dir.path();
-        let db_path = root.join(".infigraph").join("graph");
+        let db_path = root.join(".infigraph").join(crate::graph::names::STEM);
 
         {
             let store = GraphStore::open(&db_path).unwrap();
@@ -1859,7 +1859,7 @@ mod tests {
             .filter(|e| {
                 e.file_name()
                     .to_string_lossy()
-                    .starts_with("graph.corrupt.")
+                    .starts_with(crate::graph::names::CORRUPT_PREFIX)
             })
             .collect();
         assert_eq!(
@@ -1890,7 +1890,7 @@ mod tests {
     fn init_refuses_a_graph_from_a_different_storage_version_instead_of_wiping_it() {
         let dir = tempfile::TempDir::new().unwrap();
         let root = dir.path();
-        let db_path = root.join(".infigraph").join("graph");
+        let db_path = root.join(".infigraph").join(crate::graph::names::STEM);
 
         {
             let store = GraphStore::open(&db_path).unwrap();
@@ -1940,7 +1940,7 @@ mod tests {
             .filter(|e| {
                 e.file_name()
                     .to_string_lossy()
-                    .starts_with("graph.corrupt.")
+                    .starts_with(crate::graph::names::CORRUPT_PREFIX)
             })
             .collect();
         assert!(
@@ -1961,7 +1961,7 @@ mod tests {
     fn init_trips_the_crash_loop_breaker_after_repeated_wipe_and_rebuild_cycles() {
         let dir = tempfile::TempDir::new().unwrap();
         let root = dir.path();
-        let db_path = root.join(".infigraph").join("graph");
+        let db_path = root.join(".infigraph").join(crate::graph::names::STEM);
 
         // The first two persistent-corruption-then-init cycles must each
         // recover normally, exactly as `init_quarantines_instead_of_deleting_on_persistent_corruption`
@@ -2012,8 +2012,10 @@ mod tests {
         let root = dir.path();
         std::fs::create_dir_all(root.join(".infigraph")).unwrap();
 
-        let custom_db_path = root.join(".infigraph").join("graph.rebuilding");
-        let default_db_path = root.join(".infigraph").join("graph");
+        let custom_db_path = root
+            .join(".infigraph")
+            .join(crate::graph::names::REBUILDING);
+        let default_db_path = root.join(".infigraph").join(crate::graph::names::STEM);
 
         std::env::set_var("INFIGRAPH_BACKEND", "daemon");
         let registry = LanguageRegistry::new();

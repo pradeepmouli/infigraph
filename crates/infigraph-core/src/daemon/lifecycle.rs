@@ -1179,7 +1179,7 @@ mod tests {
         let root = dir.path().canonicalize().unwrap();
         std::fs::create_dir_all(root.join(".git")).unwrap();
         std::fs::create_dir_all(root.join(".infigraph")).unwrap();
-        std::fs::write(root.join(".infigraph").join("graph"), b"").unwrap();
+        std::fs::write(root.join(".infigraph").join(crate::graph::names::STEM), b"").unwrap();
         let sub = root.join("packages").join("src");
         std::fs::create_dir_all(sub.join(".infigraph")).unwrap();
 

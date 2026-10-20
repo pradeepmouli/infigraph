@@ -108,7 +108,10 @@ pub fn build_combined_graph(registry: &Registry, group_name: &str) -> Result<Com
             .get(repo_name)
             .context(format!("repo '{}' not in registry", repo_name))?;
 
-        let repo_db_path = entry.path.join(".infigraph").join("graph");
+        let repo_db_path = entry
+            .path
+            .join(".infigraph")
+            .join(crate::graph::names::STEM);
         if !repo_db_path.exists() {
             eprintln!("  [skip] {} — not indexed", repo_name);
             continue;
@@ -1045,7 +1048,7 @@ pub fn combined_graph_path(group_name: &str) -> Result<PathBuf> {
         .join("groups")
         .join(group_name)
         .join(".infigraph")
-        .join("graph"))
+        .join(crate::graph::names::STEM))
 }
 
 pub fn has_combined_graph(group_name: &str) -> bool {

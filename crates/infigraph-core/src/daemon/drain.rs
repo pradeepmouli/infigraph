@@ -613,7 +613,10 @@ mod tests {
         fs::write(root.join("old.py"), "def old_symbol():\n    pass\n").unwrap();
         let prism = open_project(root);
         prism.index().unwrap();
-        assert!(root.join(".infigraph").join("graph").exists());
+        assert!(root
+            .join(".infigraph")
+            .join(crate::graph::names::STEM)
+            .exists());
 
         fs::remove_file(root.join("old.py")).unwrap();
         fs::write(root.join("new.py"), "def new_symbol():\n    pass\n").unwrap();
@@ -634,7 +637,10 @@ mod tests {
             .unwrap()
             .flatten()
             .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|n| n.starts_with("graph.previous.") || n.starts_with("graph.corrupt."))
+            .filter(|n| {
+                n.starts_with(crate::graph::names::PREVIOUS_PREFIX)
+                    || n.starts_with(crate::graph::names::CORRUPT_PREFIX)
+            })
             .collect()
     }
 
@@ -651,13 +657,13 @@ mod tests {
             // sparse, so no page the store reads is rewritten.
             let tg = crate::graph::store_util::floorless_infigraph_dir(root);
             fs::write(
-                tg.join("graph.health.json"),
+                tg.join(crate::graph::names::HEALTH),
                 r#"{"healthy_size_bytes": 1048576}"#,
             )
             .unwrap();
             fs::OpenOptions::new()
                 .write(true)
-                .open(tg.join("graph"))
+                .open(tg.join(crate::graph::names::STEM))
                 .unwrap()
                 .set_len(64 * 1024 * 1024)
                 .unwrap();
@@ -719,7 +725,7 @@ mod tests {
 
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
-        let old_graph_path = root.join(".infigraph").join("graph");
+        let old_graph_path = root.join(".infigraph").join(crate::graph::names::STEM);
         let reply = full_reindex_after_old_py_moves_to_new_py(root, |_| {});
         match reply {
             crate::daemon_protocol::WriteResult::FullReindexOk { indexed_files, .. } => {
@@ -753,8 +759,8 @@ mod tests {
         let base_entries: Vec<&String> = aside
             .iter()
             .filter(|n| {
-                n.strip_prefix("graph.previous.")
-                    .or_else(|| n.strip_prefix("graph.corrupt."))
+                n.strip_prefix(crate::graph::names::PREVIOUS_PREFIX)
+                    .or_else(|| n.strip_prefix(crate::graph::names::CORRUPT_PREFIX))
                     .is_some_and(|rest| {
                         !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit())
                     })
@@ -766,7 +772,9 @@ mod tests {
             "the old graph must be moved aside (renamed), not deleted: {aside:?}"
         );
         assert!(
-            aside.iter().all(|n| n.starts_with("graph.previous.")),
+            aside
+                .iter()
+                .all(|n| n.starts_with(crate::graph::names::PREVIOUS_PREFIX)),
             "a healthy superseded graph (and its WAL siblings) must go to the rollback \
              pool, not the corruption-evidence pool: {aside:?}"
         );
@@ -791,12 +799,13 @@ mod tests {
         prism.index().unwrap();
 
         let infigraph_dir = root.join(".infigraph");
-        let stale_wal = infigraph_dir.join("graph.rebuilding.wal");
-        let stale_checkpoint = infigraph_dir.join("graph.rebuilding.wal.checkpoint");
+        let stale_wal = infigraph_dir.join(crate::graph::names::sibling(".rebuilding.wal"));
+        let stale_checkpoint =
+            infigraph_dir.join(crate::graph::names::sibling(".rebuilding.wal.checkpoint"));
         fs::write(&stale_wal, b"a dead database's write-ahead log").unwrap();
         fs::write(&stale_checkpoint, b"and its checkpoint temp file").unwrap();
         assert!(
-            !infigraph_dir.join("graph.rebuilding").exists(),
+            !infigraph_dir.join(crate::graph::names::REBUILDING).exists(),
             "the interesting case is a WAL sibling with no base image"
         );
 
@@ -858,9 +867,10 @@ mod tests {
             "{reply:?}"
         );
 
-        let verify =
-            crate::graph::KuzuBackend::open_read_only(&root.join(".infigraph").join("graph"))
-                .unwrap();
+        let verify = crate::graph::KuzuBackend::open_read_only(
+            &root.join(".infigraph").join(crate::graph::names::STEM),
+        )
+        .unwrap();
         let rows = verify
             .raw_query("MATCH (s:Symbol)-[:TESTED_BY]->(t:Symbol) RETURN s.name, t.name")
             .unwrap();
@@ -892,7 +902,7 @@ mod tests {
         let prism = open_project(root);
         prism.index().unwrap();
 
-        let live_graph_path = root.join(".infigraph").join("graph");
+        let live_graph_path = root.join(".infigraph").join(crate::graph::names::STEM);
         assert!(live_graph_path.exists());
 
         let queue = std::sync::Arc::new(std::sync::Mutex::new(
@@ -924,7 +934,9 @@ mod tests {
             "a registry-build failure must leave the live graph's original content untouched"
         );
 
-        let rebuilding_path = root.join(".infigraph").join("graph.rebuilding");
+        let rebuilding_path = root
+            .join(".infigraph")
+            .join(crate::graph::names::REBUILDING);
         assert!(
             !rebuilding_path.exists(),
             "a registry-build failure must not leave graph.rebuilding behind"

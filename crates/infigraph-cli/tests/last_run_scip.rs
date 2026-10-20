@@ -143,10 +143,13 @@ fn a_refused_automatic_enrichment_is_recorded_with_its_reason() {
     );
 
     // The record explains why nothing was enriched; it must not have stamped.
-    let generation =
-        infigraph_core::graph::GraphStore::open(&root.join(".infigraph").join("graph"))
-            .unwrap()
-            .current_scip_generation()
-            .unwrap();
+    let generation = infigraph_core::graph::GraphStore::open(
+        &root
+            .join(".infigraph")
+            .join(infigraph_core::graph::names::STEM),
+    )
+    .unwrap()
+    .current_scip_generation()
+    .unwrap();
     assert_eq!(generation, 0, "a refused output stamped the graph");
 }
