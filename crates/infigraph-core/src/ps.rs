@@ -48,6 +48,8 @@ pub(crate) const PROJECT_LOCKS: &[&str] = &[
     "watch.lock",
     "index.lock",
     crate::graph::names::LOCK,
+    crate::graph::names::legacy::LOCK,
+    crate::graph::migrate::MIGRATION_LOCK,
     "docs.kuzu.lock",
     crate::docs_switch::DOCS_OP_LOCK,
     "mcp.lock",

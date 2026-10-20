@@ -563,11 +563,7 @@ fn looks_like_a_project(dir: &Path) -> bool {
     // so a root that failed this check once would pass it forever after.
     // That is not hypothetical -- it let a test index 33,683 files across 57
     // sibling repositories, the exact outcome the check exists to prevent.
-    has_project_marker(dir)
-        || dir
-            .join(".infigraph")
-            .join(crate::graph::names::STEM)
-            .exists()
+    has_project_marker(dir) || crate::graph::names::store_present(&dir.join(".infigraph"))
 }
 
 /// The durable markers only: a VCS root in any form, or a build manifest.

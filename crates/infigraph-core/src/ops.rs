@@ -164,6 +164,7 @@ pub enum EntryClass {
 /// Names, exactly, that a rebuild of the graph recreates. The lock files are
 /// [`crate::ps::PROJECT_LOCKS`], not repeated here.
 const DERIVED_NAMES: &[&str] = &[
+    crate::graph::migrate::JOURNAL,
     "bm25_cache.bin",
     "dedup_state.json",
     "dirty.lock",

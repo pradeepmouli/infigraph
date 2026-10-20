@@ -25,7 +25,10 @@ fn each_condition_renders_one_warning_line() {
     assert!(footer.contains("No file watcher running — results may be stale"));
     assert!(footer.contains("trigram fallback"));
     assert!(footer.contains("HNSW index missing"));
-    assert!(footer.contains("waited 5s for graph.lock"));
+    assert!(footer.contains(&format!(
+        "waited 5s for {}",
+        infigraph_core::graph::names::LOCK
+    )));
 }
 
 #[test]

@@ -221,8 +221,7 @@ pub fn check_registry(ctx: &DoctorContext) -> Vec<CheckResult> {
 /// a project that holds one is expected to be in the registry.
 fn holds_an_index(project_path: &Path) -> bool {
     let infigraph_dir = project_path.join(".infigraph");
-    infigraph_dir.join(crate::graph::names::STEM).exists()
-        || infigraph_dir.join("docs.kuzu").exists()
+    crate::graph::names::store_present(&infigraph_dir) || infigraph_dir.join("docs.kuzu").exists()
 }
 
 fn check_project_registration(registry: &Registry, project_path: &Path) -> CheckResult {
@@ -1158,7 +1157,7 @@ pub(crate) const SIDECAR_STALE_SECS: u64 = 60 * 60; // 1 hour
 fn sidecar_anchor(sidecar_name: &str) -> (&'static str, &'static str) {
     match sidecar_name {
         "docs_embeddings.bin" => ("docs.kuzu", "index-docs"),
-        _ => ("graph", "index"),
+        _ => (crate::graph::names::STEM, "index"),
     }
 }
 
@@ -2181,7 +2180,11 @@ mod sidecar_anchor_tests {
 
         let result = check_one_sidecar(dir.path(), "embeddings.bin").unwrap();
         assert_eq!(result.status, CheckStatus::Warn, "{}", result.message);
-        assert!(result.message.contains("graph"), "{}", result.message);
+        assert!(
+            result.message.contains(crate::graph::names::STEM),
+            "{}",
+            result.message
+        );
     }
 
     #[test]
@@ -2195,7 +2198,11 @@ mod sidecar_anchor_tests {
 
         let result = check_one_sidecar(dir.path(), name).unwrap();
         assert_eq!(result.status, CheckStatus::Warn, "{}", result.message);
-        assert!(result.message.contains("graph"), "{}", result.message);
+        assert!(
+            result.message.contains(crate::graph::names::STEM),
+            "{}",
+            result.message
+        );
     }
 
     /// Without the doc store there is nothing to compare against; the check

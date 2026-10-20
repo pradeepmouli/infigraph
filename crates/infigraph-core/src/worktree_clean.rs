@@ -798,18 +798,22 @@ mod tests {
         let w = find(&plan, &wt);
 
         assert_eq!(w.skip, None, "{w:?}");
-        assert_eq!(
-            names(w),
-            vec![
+        assert_eq!(names(w), {
+            let mut expected: Vec<String> = [
                 "bm25_cache.bin",
                 "daemon.log",
                 "embeddings.bin",
                 crate::graph::names::STEM,
-                crate::graph::names::sibling(".wal").as_str(),
                 "last-run.index.json",
-                "write-tmp"
+                "write-tmp",
             ]
-        );
+            .iter()
+            .map(|n| n.to_string())
+            .collect();
+            expected.push(crate::graph::names::sibling(".wal"));
+            expected.sort();
+            expected
+        });
         let kept: Vec<&str> = w.kept.iter().map(|k| k.what).collect();
         assert!(kept.contains(&"restore points"), "{kept:?}");
         assert!(kept.contains(&"docs store"), "{kept:?}");
@@ -1244,7 +1248,7 @@ mod tests {
             "my-notes.txt",
             "docs.kuzu",
             "docs_embeddings.bin",
-            "snapshots/1/graph",
+            format!("snapshots/1/{}", crate::graph::names::STEM).as_str(),
             crate::graph::names::sibling(".corrupt.1790000000").as_str(),
         ] {
             assert!(ig.join(survivor).exists(), "{survivor} was removed");

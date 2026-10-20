@@ -10,6 +10,9 @@ use anyhow::{Context, Result};
 /// source graph's history, and a clone can always re-clone from the source.
 const EXCLUDED_RELATIVE_PATHS: &[&str] = &[
     crate::graph::names::LOCK,
+    crate::graph::names::legacy::LOCK,
+    crate::graph::migrate::MIGRATION_LOCK,
+    crate::graph::migrate::JOURNAL,
     "watch.lock",
     "mcp.lock",
     "index.lock",

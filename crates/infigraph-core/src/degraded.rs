@@ -75,6 +75,9 @@ pub enum DegradedMode {
     /// The project is past the HNSW threshold but the index (or its `.meta`)
     /// is absent, so vector search is a linear scan.
     HnswMissing,
+    /// The code graph is stored under the name the previous build gave it and
+    /// has not been renamed: only a process that may write renames it.
+    StoreMigrationPending,
     /// Documents are indexed but their embeddings are absent, so document
     /// search ranks by keywords only.
     DocEmbeddingsMissing,
@@ -125,6 +128,7 @@ impl DegradedMode {
             DegradedMode::GraphReopenBackoff { .. } => GRAPH_REOPEN_BACKOFF,
             DegradedMode::ReindexWaitingForSlot { .. } => REINDEX_WAITING_FOR_SLOT,
             DegradedMode::HnswMissing => "hnsw-missing",
+            DegradedMode::StoreMigrationPending => "store-migration-pending",
             DegradedMode::DocEmbeddingsMissing => "doc-embeddings-missing",
             DegradedMode::CloneBodiesUnavailable => CLONE_BODIES_UNAVAILABLE,
             DegradedMode::CloneBodiesPartial { .. } => CLONE_BODIES_PARTIAL,
@@ -192,6 +196,9 @@ impl DegradedMode {
                 "a full reindex is waiting for a machine-wide slot ({limit} may run at once): \
                  the graph is served as it was until the reindex runs"
             ),
+            DegradedMode::StoreMigrationPending => "the code graph is stored under its old name \
+                 and has not been renamed yet: reads of it wait for the first command that writes"
+                .to_string(),
             DegradedMode::HnswMissing => {
                 "HNSW index missing or stale — vector search is on a linear scan this project \
                  has outgrown"
@@ -254,6 +261,10 @@ impl DegradedMode {
             | DegradedMode::HnswMissing => "run `infigraph index` to rebuild them",
             DegradedMode::CloneBodiesUnavailable | DegradedMode::CloneBodiesPartial { .. } => {
                 "run `infigraph index`"
+            }
+            DegradedMode::StoreMigrationPending => {
+                "run `infigraph index`; if it reports the old name is held, run `infigraph \
+                 daemon-stop --wait` first"
             }
             DegradedMode::UnwatchedDirectories { .. } => {
                 "fix the cause (on Linux usually `fs.inotify.max_user_watches`), then run \
@@ -655,6 +666,10 @@ pub fn derived_from_disk(root: &Path) -> Vec<DegradedMode> {
         });
     }
     let ig = root.join(".infigraph");
+    if crate::graph::migrate::pending(&ig) {
+        modes.push(DegradedMode::StoreMigrationPending);
+        return modes;
+    }
     if crate::daemon::lifecycle::is_remote_backend() || !ig.join(crate::graph::names::STEM).exists()
     {
         return modes;

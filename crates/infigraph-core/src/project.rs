@@ -16,10 +16,7 @@ use std::path::{Path, PathBuf};
 /// does not make a project: see [`is_global_store_root`]. Without that check
 /// a repo living under `$HOME` resolves to the global store.
 pub fn is_project_store(dir: &Path) -> bool {
-    dir.join(".infigraph")
-        .join(crate::graph::names::STEM)
-        .exists()
-        && !is_global_store_root(dir)
+    crate::graph::names::store_present(&dir.join(".infigraph")) && !is_global_store_root(dir)
 }
 
 /// Whether `dir`'s `.infigraph/` is the user's global store: `dir` is the

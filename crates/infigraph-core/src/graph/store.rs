@@ -747,6 +747,9 @@ impl GraphStore {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
+        // A graph stored under the previous name is renamed before anything
+        // else looks at the path: this open must never create a second one.
+        super::migrate::before_open(path)?;
         validate_db_file(path)?;
         let lock_path = db_lock_path(path);
         if let Some(pid) = unclean_shutdown_wal_holder(path, &lock_path) {
@@ -863,6 +866,13 @@ impl GraphStore {
         // this fall through to `Database::new` below produces Kuzu's own
         // confusing "Cannot create an empty database under READ ONLY mode"
         // instead of a clear, actionable message.
+        if let Some(dir) = path.parent().filter(|d| super::migrate::pending(d)) {
+            anyhow::bail!(
+                "the code graph in {} is stored under its old name and has not been renamed yet \
+                 (a read never renames it): any command that writes, e.g. `infigraph index`, does",
+                dir.display()
+            );
+        }
         if !path.exists() {
             anyhow::bail!(
                 "no graph exists yet at {} -- run `infigraph index` first",

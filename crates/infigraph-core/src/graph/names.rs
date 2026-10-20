@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 /// it). The one place the code graph's file name is spelled.
 macro_rules! stem {
     () => {
-        "graph"
+        "code.kuzu"
     };
 }
 
@@ -56,12 +56,49 @@ pub fn live_of(root: &Path) -> PathBuf {
     live(&root.join(".infigraph"))
 }
 
-/// Whether `name` is the live graph or one of its derived files.
+/// What the live graph was called before the stem moved, and the derived
+/// names that went with it. The one place the old literals are spelled;
+/// `graph::migrate` is the only code that acts on them, everything else asks
+/// [`is_code_store_entry`] / [`store_present`].
+pub mod legacy {
+    pub const STEM: &str = "graph";
+    /// The lock the previous build takes around a write. The migration holds
+    /// it so a previous-build writer excludes it and is excluded.
+    pub const LOCK: &str = "graph.lock";
+    pub const CORRUPT_PREFIX: &str = "graph.corrupt.";
+    pub const PREVIOUS_PREFIX: &str = "graph.previous.";
+    pub const OPEN_SENTINEL_PREFIX: &str = "graph-opening.";
+    /// Files that start with the old stem and are not the store: the
+    /// visualisation output and the experimental Cozo export.
+    const NOT_THE_STORE: [&str; 2] = ["graph.html", "graph.cozo"];
+
+    /// Whether `name` is the old graph or one of its derived files.
+    pub fn is_entry(name: &str) -> bool {
+        if NOT_THE_STORE.iter().any(|n| name.starts_with(n)) {
+            return false;
+        }
+        name == STEM || name.starts_with("graph.") || name.starts_with(OPEN_SENTINEL_PREFIX)
+    }
+}
+
+/// Whether `name` is the live graph or one of its derived files, under the
+/// current stem or the one before it (a store the migration has not reached).
 pub fn is_code_store_entry(name: &str) -> bool {
     name == STEM
         || name
             .strip_prefix(STEM)
-            .is_some_and(|rest| rest.starts_with('.'))
+            .is_some_and(|rest| rest.starts_with('.') || rest.starts_with("-opening."))
+        || legacy::is_entry(name)
+}
+
+/// Whether `infigraph_dir` holds a code graph: the live one, or an older one
+/// the migration has yet to rename. Existence checks ask this, never
+/// `live(..).exists()`, so a store waiting for its migration is not mistaken
+/// for no store (and then created afresh beside it).
+pub fn store_present(infigraph_dir: &Path) -> bool {
+    live(infigraph_dir).exists()
+        || (legacy::STEM != STEM && infigraph_dir.join(legacy::STEM).exists())
+        || super::migrate::journal_exists(infigraph_dir)
 }
 
 #[cfg(test)]
@@ -83,6 +120,21 @@ mod tests {
         ] {
             assert!(is_code_store_entry(name), "{name}");
         }
+    }
+
+    #[test]
+    fn the_old_stem_is_still_recognised_as_the_store_it_was() {
+        for name in [
+            legacy::STEM,
+            legacy::LOCK,
+            legacy::CORRUPT_PREFIX,
+            "graph.wal",
+            "graph-opening.1.0",
+        ] {
+            assert!(is_code_store_entry(name), "{name}");
+        }
+        assert!(!is_code_store_entry("graph.html"));
+        assert!(!is_code_store_entry("graph.cozo"));
     }
 
     #[test]

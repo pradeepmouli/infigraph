@@ -148,7 +148,8 @@ fn run_with_recovery(
     Err(anyhow::anyhow!(
         "infigraph index timed out 3 times in a row (including one --full attempt) after \
          {timeout:?} each -- likely unrecoverable graph corruption. Manually inspect/remove \
-         .infigraph/graph and .infigraph/graph.wal, then retry."
+         .infigraph/{stem} and .infigraph/{stem}.wal, then retry.",
+        stem = infigraph_core::graph::names::STEM
     ))
 }
 

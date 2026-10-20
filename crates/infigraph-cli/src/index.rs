@@ -125,6 +125,9 @@ pub(crate) fn cmd_index(root: &Path, full: bool, no_embed: bool) -> Result<()> {
     // outcome -- a full rebuild is what a human would run anyway -- only
     // removes a confusing dead end.
     let tg_dir_for_promotion_check = root.join(".infigraph");
+    // A graph stored under its old name is a graph: rename it before judging
+    // whether one exists, or the promotion below forks the store.
+    infigraph_core::graph::migrate::ensure_migrated(&tg_dir_for_promotion_check)?;
     let full = full
         || (tg_dir_for_promotion_check.exists()
             && !tg_dir_for_promotion_check

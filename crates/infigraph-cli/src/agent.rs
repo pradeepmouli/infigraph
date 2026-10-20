@@ -11,7 +11,10 @@ pub(crate) fn cmd_init(root: &Path, group: Option<&str>, quick: bool, yes: bool)
     let mut prism = CodeIndex::open(root, registry)?;
     prism.init()?;
     println!("Initialized infigraph in {}", root.display());
-    println!("Graph database created at .infigraph/graph/");
+    println!(
+        "Graph database created at .infigraph/{}",
+        infigraph_core::graph::names::STEM
+    );
 
     // --- Wizard steps (skipped with --quick) ---
     if !quick {

@@ -722,7 +722,10 @@ mod tests {
         left.sort();
         assert_eq!(
             left,
-            vec![crate::graph::names::STEM, "graph.previous.1000"],
+            vec![
+                crate::graph::names::STEM.to_string(),
+                crate::graph::names::sibling(".previous.1000")
+            ],
             "neither the live graph nor a longer timestamp sharing the prefix"
         );
     }
