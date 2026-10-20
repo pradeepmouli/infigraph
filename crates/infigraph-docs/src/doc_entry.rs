@@ -20,7 +20,7 @@ use infigraph_core::docs_switch;
 use infigraph_core::git_blame::civil_date;
 
 use crate::ack::{self, AckPlan};
-use crate::code_links::{entries, fenced_keys, Entry, LinkKind};
+use crate::code_links::{entries, fenced_keys, CodeLinkRow, Entry, LinkKind};
 use crate::link_check;
 use crate::ops;
 
@@ -715,7 +715,7 @@ fn plan_edit(
 // ---- create -------------------------------------------------------------
 
 /// `src/app.py` of `src/app.py::Cart::add`.
-fn code_file_of(key: &str) -> &str {
+pub(crate) fn code_file_of(key: &str) -> &str {
     key.split("::").next().unwrap_or(key)
 }
 
@@ -723,29 +723,66 @@ fn parent_dir(path: &str) -> Option<&str> {
     path.rsplit_once('/').map(|(dir, _)| dir)
 }
 
-/// The document with the most entries among `rows`, or why there is no single
-/// answer.
-fn majority(counts: &BTreeMap<&str, usize>) -> Result<Option<String>> {
-    let Some(&best) = counts.values().max() else {
-        return Ok(None);
-    };
-    let top: Vec<&str> = counts
-        .iter()
-        .filter(|(_, n)| **n == best)
-        .map(|(f, _)| *f)
-        .collect();
-    match top.as_slice() {
-        [one] => Ok(Some((*one).to_string())),
-        many => bail!(
-            "these documents hold equally many neighbouring entries: {}; pass doc_file to choose",
-            many.join(", ")
-        ),
-    }
+/// Which glossary document holds the entries nearest a code file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Glossary {
+    /// No document has an entry for the file or for any directory above it
+    /// (below the project root).
+    None,
+    One(String),
+    /// Several documents hold equally many neighbouring entries.
+    Tie(Vec<String>),
 }
 
-/// The document a new entry for `target` belongs in: the one already holding
-/// most entries for the same code file, else most entries below the nearest
-/// directory that has any (never the project root: that is every document).
+/// The document with the most entries among `counts`.
+fn majority(counts: &BTreeMap<&str, usize>) -> Option<Glossary> {
+    let best = *counts.values().max()?;
+    let mut top: Vec<String> = counts
+        .iter()
+        .filter(|(_, n)| **n == best)
+        .map(|(f, _)| (*f).to_string())
+        .collect();
+    Some(if top.len() == 1 {
+        Glossary::One(top.remove(0))
+    } else {
+        Glossary::Tie(top)
+    })
+}
+
+/// The glossary a new entry for a symbol of `code_file` belongs in: the
+/// document already holding most entries for the same code file, else most
+/// entries below the nearest directory that has any (never the project root:
+/// that is every document). The one rule of "which glossary" and "does this
+/// directory have one": `doc_entry create` writes where it points and
+/// `missing_docs` lists only code it points somewhere for.
+pub fn glossary_for(rows: &[CodeLinkRow], code_file: &str) -> Glossary {
+    let mut same: BTreeMap<&str, usize> = BTreeMap::new();
+    for row in rows.iter().filter(|r| code_file_of(&r.target) == code_file) {
+        *same.entry(row.doc_file.as_str()).or_default() += 1;
+    }
+    if let Some(found) = majority(&same) {
+        return found;
+    }
+    let mut dir = parent_dir(code_file);
+    while let Some(d) = dir {
+        let prefix = format!("{d}/");
+        let mut below: BTreeMap<&str, usize> = BTreeMap::new();
+        for row in rows
+            .iter()
+            .filter(|r| code_file_of(&r.target).starts_with(&prefix))
+        {
+            *below.entry(row.doc_file.as_str()).or_default() += 1;
+        }
+        if let Some(found) = majority(&below) {
+            return found;
+        }
+        dir = parent_dir(d);
+    }
+    Glossary::None
+}
+
+/// The document a new entry for `target` belongs in: `explicit` if given (it
+/// must exist), else [`glossary_for`] its code file.
 fn choose_doc(root: &Path, target: &str, explicit: Option<&str>) -> Result<String> {
     if let Some(file) = explicit {
         let path = doc_path(root, file)?;
@@ -759,32 +796,17 @@ fn choose_doc(root: &Path, target: &str, explicit: Option<&str>) -> Result<Strin
     }
     let rows = link_check::with_docs(root, |q| q.code_link_rows(LinkKind::Documents))?;
     let code_file = code_file_of(target);
-    let mut same: BTreeMap<&str, usize> = BTreeMap::new();
-    for row in rows.iter().filter(|r| code_file_of(&r.target) == code_file) {
-        *same.entry(row.doc_file.as_str()).or_default() += 1;
+    match glossary_for(&rows, code_file) {
+        Glossary::One(file) => Ok(file),
+        Glossary::Tie(many) => bail!(
+            "these documents hold equally many neighbouring entries: {}; pass doc_file to choose",
+            many.join(", ")
+        ),
+        Glossary::None => bail!(
+            "no glossary document is known for `{code_file}` or the directories above it: pass \
+             doc_file to say where the entry goes"
+        ),
     }
-    if let Some(found) = majority(&same)? {
-        return Ok(found);
-    }
-    let mut dir = parent_dir(code_file);
-    while let Some(d) = dir {
-        let prefix = format!("{d}/");
-        let mut below: BTreeMap<&str, usize> = BTreeMap::new();
-        for row in rows
-            .iter()
-            .filter(|r| code_file_of(&r.target).starts_with(&prefix))
-        {
-            *below.entry(row.doc_file.as_str()).or_default() += 1;
-        }
-        if let Some(found) = majority(&below)? {
-            return Ok(found);
-        }
-        dir = parent_dir(d);
-    }
-    bail!(
-        "no glossary document is known for `{code_file}` or the directories above it: pass \
-         doc_file to say where the entry goes"
-    )
 }
 
 fn plan_create(root: &Path, target: &str, text: &str, explicit_doc: Option<&str>) -> Result<Plan> {

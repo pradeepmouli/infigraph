@@ -139,6 +139,14 @@ fn run(
     }
 }
 
+/// Runs `git args` in `root`, killing it after `timeout`. For the callers that
+/// need a ref or a revision answered, with the same environment (`LC_ALL=C`, no
+/// optional locks) as the rest of this module.
+pub fn git(root: &Path, args: &[&str], timeout: Duration) -> Result<String, BlameError> {
+    let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+    run("git", &args, root, timeout)
+}
+
 /// One blamed line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Line {
@@ -353,14 +361,27 @@ pub struct Changes {
     pub uncommitted: Option<String>,
 }
 
-/// One hunk of `git diff -U0`, in old (HEAD) and new (working tree) lines.
+/// One hunk of `git diff -U0`, in old (base) and new (working tree) lines.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Hunk {
-    old_start: usize,
-    old_count: usize,
-    new_start: usize,
-    new_count: usize,
+pub struct Hunk {
+    /// The new-side path (`+++ b/<file>`); empty when the diff names none.
+    pub file: String,
+    pub old_start: usize,
+    pub old_count: usize,
+    pub new_start: usize,
+    pub new_count: usize,
     text: String,
+}
+
+impl Hunk {
+    /// The last new-side line, or the line a pure deletion sits after.
+    pub fn new_end(&self) -> usize {
+        if self.new_count == 0 {
+            self.new_start
+        } else {
+            self.new_start + self.new_count - 1
+        }
+    }
 }
 
 /// `@@ -a[,b] +c[,d] @@` -> (a, b, c, d), a missing count being 1.
@@ -379,16 +400,24 @@ fn hunk_header(line: &str) -> Option<(usize, usize, usize, usize)> {
     Some((old_start, old_count, new_start, new_count))
 }
 
-/// The hunks of a unified diff of one file, headers dropped.
-fn parse_hunks(diff: &str) -> Vec<Hunk> {
+/// The hunks of a unified diff, headers dropped, each naming its file. The one
+/// parser of `git diff` output: `detect_changes`, `missing_docs` and this
+/// module's own patches all read hunks through it.
+pub fn parse_hunks(diff: &str) -> Vec<Hunk> {
     let mut hunks: Vec<Hunk> = Vec::new();
     let mut in_header = false;
+    let mut file = String::new();
     for line in diff.lines() {
         if line.starts_with("diff --git ") {
             in_header = true;
+        } else if in_header && line.starts_with("+++ ") {
+            if let Some(path) = line.strip_prefix("+++ b/") {
+                file = path.to_string();
+            }
         } else if let Some((old_start, old_count, new_start, new_count)) = hunk_header(line) {
             in_header = false;
             hunks.push(Hunk {
+                file: file.clone(),
                 old_start,
                 old_count,
                 new_start,
@@ -403,6 +432,27 @@ fn parse_hunks(diff: &str) -> Vec<Hunk> {
         }
     }
     hunks
+}
+
+/// The hunks that turn `base` into the working tree, committed or not.
+pub fn diff_hunks(root: &Path, base: &str, timeout: Duration) -> Result<Vec<Hunk>, BlameError> {
+    let diff = run(
+        "git",
+        &[
+            "--no-pager",
+            "diff",
+            "-U0",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-renames",
+            base,
+            "--",
+        ]
+        .map(String::from),
+        root,
+        timeout,
+    )?;
+    Ok(parse_hunks(&diff))
 }
 
 /// Whether the working-tree lines `range` and `hunk` share a line. A pure
@@ -864,12 +914,45 @@ mod tests {
 
     fn hunk(old: (usize, usize), new: (usize, usize)) -> Hunk {
         Hunk {
+            file: String::new(),
             old_start: old.0,
             old_count: old.1,
             new_start: new.0,
             new_count: new.1,
             text: String::new(),
         }
+    }
+
+    #[test]
+    fn hunks_name_their_file_and_a_deleted_file_names_none() {
+        let diff = "diff --git a/a.rs b/a.rs\nindex 1..2 100644\n--- a/a.rs\n+++ b/a.rs\n@@ -1,0 +2,3 @@\n+x\n+y\n+z\ndiff --git a/gone.rs b/gone.rs\ndeleted file mode 100644\n--- a/gone.rs\n+++ /dev/null\n@@ -1,2 +0,0 @@\n-a\n-b\n";
+        let got = parse_hunks(diff);
+        assert_eq!(got.len(), 2);
+        assert_eq!(
+            (got[0].file.as_str(), got[0].new_start, got[0].new_end()),
+            ("a.rs", 2, 4)
+        );
+        assert_eq!(
+            got[1].file, "a.rs",
+            "a deleted file's hunk is not given a path of its own"
+        );
+        assert_eq!((got[1].new_start, got[1].new_count), (0, 0));
+    }
+
+    #[test]
+    fn diff_hunks_covers_commits_and_uncommitted_edits_since_the_base() {
+        let dir = history();
+        let base = last_commit_of_file(dir.path(), "f.txt", GIT_TIMEOUT)
+            .unwrap()
+            .unwrap()
+            .commit;
+        std::fs::write(dir.path().join("f.txt"), "one\ntwo\nEDITED\nfour\nfive\n").unwrap();
+        let got = diff_hunks(dir.path(), &base, GIT_TIMEOUT).unwrap();
+        assert!(
+            !got.is_empty() && got.iter().all(|h| h.file == "f.txt"),
+            "{got:?}"
+        );
+        assert!(diff_hunks(dir.path(), "no-such-ref", GIT_TIMEOUT).is_err());
     }
 
     #[test]

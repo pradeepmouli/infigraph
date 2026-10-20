@@ -327,6 +327,32 @@ pub(crate) fn cmd_doc_entry(
     Ok(())
 }
 
+/// `infigraph missing-docs`: the same report as the MCP `missing_docs` tool.
+pub(crate) fn cmd_missing_docs(
+    root: &Path,
+    path_prefix: Option<&str>,
+    base: Option<String>,
+    include_changed: bool,
+    visibility: Option<&str>,
+    min_lines: Option<usize>,
+    limit: usize,
+) -> Result<()> {
+    let options = infigraph_docs::missing_docs::Options::from_args(
+        infigraph_core::path_scope::PathScope::new(root, path_prefix),
+        base,
+        include_changed,
+        visibility,
+        min_lines,
+        Some(limit),
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
+    print!(
+        "{}",
+        infigraph_docs::missing_docs::missing_docs(root, &options).render()
+    );
+    Ok(())
+}
+
 /// `infigraph stale-docs`: the same report as the MCP `stale_docs` tool.
 pub(crate) fn cmd_stale_docs(
     root: &Path,
