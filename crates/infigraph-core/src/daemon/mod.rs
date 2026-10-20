@@ -440,6 +440,24 @@ pub trait DocsHandle: Send + Sync {
         &self,
         full: bool,
     ) -> std::result::Result<crate::daemon_protocol::DocIndexStats, String>;
+    /// Index and drop the documents named by `WriteRequest::IndexDocPaths`,
+    /// with the same calling rules as [`DocsHandle::index_docs`]. Returns
+    /// whether the store changed. Required, for the same reason.
+    fn index_doc_paths(
+        &self,
+        upserts: &[String],
+        removals: &[String],
+    ) -> std::result::Result<bool, String>;
+    /// Called once, when the coordinator has its port: the handle through
+    /// which the daemon's own document watcher submits `IndexDocPaths` to
+    /// this coordinator, the way a client would. A handle with no watcher of
+    /// its own ignores it.
+    fn bind_submitter(
+        &self,
+        _submitter: coordinator_port::WriteSubmitter,
+        _cancel: CancellationToken,
+    ) {
+    }
     /// Record and forget entry acknowledgements for
     /// `WriteRequest::AckDocEntries`, with the same calling rules as
     /// [`DocsHandle::index_docs`]. Returns `(stored, dropped)`. Required, for
@@ -839,10 +857,16 @@ where
     // through. Owned here, like `liveness`, so a #187 rebind keeps it.
     let (port, port_rx) =
         coordinator_port::CoordinatorPort::new(idle.grace_secs, idle.check_secs.max(1));
-    if docs_control.is_some() {
+    if let Some(docs) = &docs_control {
         port.state.set_role(
             WatchRole::Docs,
             crate::daemon::read_protocol::RoleState::Starting,
+        );
+        // The document watcher submits its index runs to this coordinator
+        // like any client, so a docs run and a code run share one door.
+        docs.bind_submitter(
+            coordinator_port::WriteSubmitter::new(port.clone()),
+            daemon_token.clone(),
         );
     }
     let mut bind_read_service: Box<dyn FnMut() -> Option<read_service::ReadService>> =
@@ -1886,7 +1910,7 @@ where
                     }
                     Routed::Started(PendingWork::ScipImport(p)) => scip_import_in_flight = Some(p),
                     Routed::Started(PendingWork::DocsWrite(p)) => docs_write_in_flight = Some(p),
-                    Routed::NotYet(request, reply) => deferred.push_back((request, reply)),
+                    Routed::NotYet(request, reply) => defer_write(&mut deferred, request, reply),
                 }
             }
             // A rebuild that was waiting for a slot and whose request is
@@ -2050,7 +2074,7 @@ where
                 // #204: routed on the next iteration, with everything else
                 // that is waiting to start.
                 coordinator_port::PortMsg::Write { request, reply } => {
-                    deferred.push_back((request, reply));
+                    defer_write(&mut deferred, request, reply);
                 }
                 coordinator_port::PortMsg::Control(coordinator_port::ControlMsg {
                     request,
@@ -3002,6 +3026,61 @@ fn try_start_scip_import(
     }))
 }
 
+/// Puts a write that cannot start yet at the back of the line. An
+/// `IndexDocPaths` joins the one already waiting instead (the paths merge, the
+/// newer ask winning, as in `PendingPaths::merge`), so a burst of edits behind
+/// a running index is one run when its turn comes, not one per edit. The
+/// joined request's client is told at once that it was merged: it asked the
+/// daemon to look at those paths, and the waiting request will.
+fn defer_write(
+    deferred: &mut std::collections::VecDeque<(WriteRequest, WriteReply)>,
+    request: WriteRequest,
+    reply: WriteReply,
+) {
+    if let WriteRequest::IndexDocPaths { upserts, removals } = request {
+        let waiting = deferred.iter_mut().find_map(|(r, _)| match r {
+            WriteRequest::IndexDocPaths { upserts, removals } => Some((upserts, removals)),
+            _ => None,
+        });
+        if let Some((waiting_upserts, waiting_removals)) = waiting {
+            let mut pending = crate::pending_paths::PendingPaths::<()>::new();
+            for rel in std::mem::take(waiting_removals) {
+                pending.remove_tree(rel);
+            }
+            for rel in std::mem::take(waiting_upserts) {
+                pending.upsert(rel, ());
+            }
+            let mut newer = crate::pending_paths::PendingPaths::<()>::new();
+            for rel in removals {
+                newer.remove_tree(rel);
+            }
+            for rel in upserts {
+                newer.upsert(rel, ());
+            }
+            pending.merge(newer);
+            let crate::pending_paths::Taken {
+                upserts: merged_upserts,
+                removals: merged_removals,
+                ..
+            } = pending.take();
+            let mut merged_upserts: Vec<String> = merged_upserts.into_keys().collect();
+            let mut merged_removals: Vec<String> = merged_removals.into_iter().collect();
+            merged_upserts.sort();
+            merged_removals.sort();
+            *waiting_upserts = merged_upserts;
+            *waiting_removals = merged_removals;
+            reply.send(WriteResult::Ok {
+                total_files: 0,
+                indexed_files: 0,
+            });
+            return;
+        }
+        deferred.push_back((WriteRequest::IndexDocPaths { upserts, removals }, reply));
+        return;
+    }
+    deferred.push_back((request, reply));
+}
+
 /// Loop-thread entry point for `WriteRequest::IndexDocs` and
 /// `AckDocEntries`: hands it to the docs handle on a background task, like a
 /// SCIP import, so a first index (embeddings included, minutes on a large
@@ -3038,6 +3117,15 @@ fn try_start_docs_write(
                 .ack_docs(&acks, &drop)
                 .map(|(stored, dropped)| WriteResult::DocsAcked { stored, dropped }),
             WriteRequest::IndexDocs { full } => docs.index_docs(full).map(WriteResult::DocsIndexed),
+            WriteRequest::IndexDocPaths { upserts, removals } => {
+                docs.index_doc_paths(&upserts, &removals).map(|wrote| {
+                    let named = upserts.len() + removals.len();
+                    WriteResult::Ok {
+                        total_files: named,
+                        indexed_files: if wrote { named } else { 0 },
+                    }
+                })
+            }
             other => Err(format!("{} is not a docs write", other.kind())),
         })
     };
@@ -3846,7 +3934,9 @@ where
                 reply,
             ),
         },
-        docs_write @ (WriteRequest::IndexDocs { .. } | WriteRequest::AckDocEntries { .. }) => {
+        docs_write @ (WriteRequest::IndexDocs { .. }
+        | WriteRequest::IndexDocPaths { .. }
+        | WriteRequest::AckDocEntries { .. }) => {
             match try_start_docs_write(
                 docs,
                 docs_write,
@@ -5048,6 +5138,13 @@ mod tests {
         ) -> std::result::Result<crate::daemon_protocol::DocIndexStats, String> {
             (self.0)(full)
         }
+        fn index_doc_paths(
+            &self,
+            _upserts: &[String],
+            _removals: &[String],
+        ) -> std::result::Result<bool, String> {
+            Ok(true)
+        }
         fn ack_docs(
             &self,
             acks: &[crate::daemon_protocol::DocAck],
@@ -5130,6 +5227,95 @@ mod tests {
             running.reply,
             running.what,
             router.drain_rt.block_on(running.task.join()),
+        );
+    }
+
+    fn doc_paths(upserts: &[&str], removals: &[&str]) -> WriteRequest {
+        WriteRequest::IndexDocPaths {
+            upserts: upserts.iter().map(|s| s.to_string()).collect(),
+            removals: removals.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    /// Requests for paths that wait behind a running docs write are one
+    /// request when their turn comes: the paths merge, a removal beats an
+    /// older upsert of the same path, and the client of a merged request is
+    /// answered at once.
+    #[test]
+    fn index_doc_paths_requests_waiting_their_turn_coalesce_into_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut router = Router::with_docs(
+            tmp.path(),
+            Arc::new(FakeDocs(|_| {
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                Ok(Default::default())
+            })),
+        );
+        let (_, _running_rx) = router.route_new(WriteRequest::IndexDocs { full: false });
+        assert!(router.docs_write.is_some());
+
+        let mut deferred = std::collections::VecDeque::new();
+        let mut merged_rxs = Vec::new();
+        for request in [
+            doc_paths(&["a.md", "dir/b.md"], &[]),
+            doc_paths(&["c.md"], &["a.md"]),
+            doc_paths(&["dir2/d.md"], &["dir"]),
+        ] {
+            let (routed, rx) = router.route_new(request);
+            let Routed::NotYet(request, reply) = routed else {
+                panic!("a docs write behind a running one must wait");
+            };
+            defer_write(&mut deferred, request, reply);
+            merged_rxs.push(rx);
+        }
+
+        assert_eq!(deferred.len(), 1, "three waiting asks, one request");
+        assert_eq!(
+            deferred[0].0,
+            doc_paths(&["c.md", "dir2/d.md"], &["a.md", "dir"]),
+            "the newer asks win: a.md and dir/b.md are gone, c.md and dir2/d.md are in"
+        );
+        for rx in &merged_rxs[1..] {
+            assert_eq!(
+                rx.try_recv().unwrap(),
+                WriteResult::Ok {
+                    total_files: 0,
+                    indexed_files: 0
+                },
+                "a request folded into a waiting one is answered at once"
+            );
+        }
+        assert!(
+            merged_rxs[0].try_recv().is_err(),
+            "the request that stayed in line is answered when it runs"
+        );
+        let running = router.docs_write.take().unwrap();
+        finish_docs_write(
+            running.reply,
+            running.what,
+            router.drain_rt.block_on(running.task.join()),
+        );
+    }
+
+    #[test]
+    fn index_doc_paths_runs_on_the_docs_handle_and_reports_whether_it_wrote() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut router =
+            Router::with_docs(tmp.path(), Arc::new(FakeDocs(|_| Ok(Default::default()))));
+        let (routed, rx) = router.route_new(doc_paths(&["a.md"], &["old"]));
+        assert!(matches!(routed, Routed::Done));
+        let running = router.docs_write.take().expect("a background docs write");
+        finish_docs_write(
+            running.reply,
+            running.what,
+            router.drain_rt.block_on(running.task.join()),
+        );
+        assert_eq!(
+            rx.recv().unwrap(),
+            WriteResult::Ok {
+                total_files: 2,
+                indexed_files: 2
+            }
         );
     }
 

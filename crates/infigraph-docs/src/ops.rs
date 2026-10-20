@@ -8,6 +8,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use infigraph_core::daemon_protocol::DocIndexStats;
 use infigraph_core::docs_switch;
+use infigraph_core::watch::sink::PathIndexer;
 
 use crate::DocIndex;
 
@@ -44,6 +45,49 @@ pub fn index_docs(root: &Path, full: bool) -> Result<DocIndexStats> {
         chunks_in_store: totals.chunk_count,
         pipeline_warnings: result.pipeline_warnings,
     })
+}
+
+/// The executor for `IndexDocPaths`: indexes the documents at `upserts` and
+/// removes those at, or under, `removals`, under the same exclusive docs lock
+/// and with the same two guards as the watcher's reindex had. Documents are
+/// opt-in, so a run never turns them on or creates a store: it returns
+/// `false`, having written nothing, when the project has no `.infigraph/`
+/// (taking the lock would create one) or `[docs] enabled` is off, and the
+/// switch is read again under the lock because `clean-docs` turns it off
+/// before it takes the lock to delete. Returns whether the store changed.
+pub fn index_doc_paths(root: &Path, upserts: &[String], removals: &[String]) -> Result<bool> {
+    if !root.join(".infigraph").is_dir() || !docs_switch::docs_enabled(root) {
+        return Ok(false);
+    }
+    let _op = docs_switch::lock_docs_op(root, docs_switch::DOCS_OP_WAIT)?;
+    if !docs_switch::docs_enabled(root) {
+        return Ok(false);
+    }
+    // Work in flight for the daemon's idle exit (#203).
+    let _busy = crate::watch::ReindexGuard::enter();
+    let mut idx = DocIndex::open(root)?;
+    idx.init()?;
+    let paths = |rels: &[String]| -> Vec<std::path::PathBuf> {
+        rels.iter().map(std::path::PathBuf::from).collect()
+    };
+    let mut wrote = false;
+    if !removals.is_empty() {
+        wrote |= idx.delete_paths(&paths(removals))?.wrote();
+    }
+    if !upserts.is_empty() {
+        wrote |= idx.index_paths(&paths(upserts))?.wrote();
+    }
+    // Nothing written means nothing for a combined group to pick up.
+    if wrote {
+        match crate::combined::schedule_group_doc_refresh(root) {
+            Ok(count) if count > 0 => {
+                eprintln!("[docs] refreshing {count} combined document group(s)")
+            }
+            Ok(_) => {}
+            Err(e) => eprintln!("[docs] combined refresh error: {e}"),
+        }
+    }
+    Ok(wrote)
 }
 
 /// `clean-docs`: turns the switch off *first*, so a watcher stops wanting

@@ -852,6 +852,14 @@ impl infigraph_core::daemon::DocsHandle for DocWatchHandle {
         let root = self.0.lock().unwrap().root.clone();
         infigraph_docs::ops::index_docs(&root, full).map_err(|e| format!("{e:#}"))
     }
+    fn index_doc_paths(
+        &self,
+        upserts: &[String],
+        removals: &[String],
+    ) -> std::result::Result<bool, String> {
+        let root = self.0.lock().unwrap().root.clone();
+        infigraph_docs::ops::index_doc_paths(&root, upserts, removals).map_err(|e| format!("{e:#}"))
+    }
     fn ack_docs(
         &self,
         acks: &[infigraph_core::daemon_protocol::DocAck],

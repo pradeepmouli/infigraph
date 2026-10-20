@@ -418,3 +418,57 @@ fn ack_docs_writes_into_the_store_and_refuses_a_project_without_one() {
         .unwrap();
     assert_eq!(held.keys().collect::<Vec<_>>(), ["src/a.py::f"]);
 }
+
+#[test]
+fn index_doc_paths_writes_only_what_it_names_and_only_while_docs_are_on() {
+    let _env = Isolated::new();
+    let (_tmp, root) = project_with_readme();
+    std::fs::create_dir_all(root.join("docs")).unwrap();
+    std::fs::write(root.join("docs/a.md"), "# A\n\nalpha\n").unwrap();
+    std::fs::write(root.join("docs/b.md"), "# B\n\nbeta\n").unwrap();
+    let say = |items: &[&str]| -> Vec<String> { items.iter().map(|s| s.to_string()).collect() };
+
+    // Docs are off: nothing is written and no store appears.
+    std::fs::create_dir_all(root.join(".infigraph")).unwrap();
+    assert!(!infigraph_docs::ops::index_doc_paths(&root, &say(&["docs/a.md"]), &[]).unwrap());
+    assert!(!docs_store_path(&root).exists());
+
+    // On: the paths named are indexed, the others are not.
+    index_docs(&root, false).unwrap();
+    std::fs::write(root.join("docs/a.md"), "# A\n\nalpha, revised\n").unwrap();
+    std::fs::write(root.join("docs/b.md"), "# B\n\nbeta, revised\n").unwrap();
+    assert!(infigraph_docs::ops::index_doc_paths(&root, &say(&["docs/a.md"]), &[]).unwrap());
+    let idx = infigraph_docs::DocIndex::open_existing(&root).unwrap();
+    let hashes = idx.store().unwrap().get_doc_hashes().unwrap();
+    let hash_of = |rel: &str| -> String {
+        use sha2::{Digest, Sha256};
+        format!(
+            "{:x}",
+            Sha256::digest(std::fs::read(root.join(rel)).unwrap())
+        )
+    };
+    assert_eq!(
+        hashes["docs/a.md"],
+        hash_of("docs/a.md"),
+        "the named one is current"
+    );
+    assert_ne!(
+        hashes["docs/b.md"],
+        hash_of("docs/b.md"),
+        "the other one was not touched"
+    );
+    drop(idx);
+
+    // A removal that names a directory takes everything under it.
+    std::fs::remove_dir_all(root.join("docs")).unwrap();
+    assert!(infigraph_docs::ops::index_doc_paths(&root, &[], &say(&["docs"])).unwrap());
+    let idx = infigraph_docs::DocIndex::open_existing(&root).unwrap();
+    let ids: Vec<String> = idx
+        .store()
+        .unwrap()
+        .get_doc_hashes()
+        .unwrap()
+        .into_keys()
+        .collect();
+    assert_eq!(ids, ["README.md"]);
+}

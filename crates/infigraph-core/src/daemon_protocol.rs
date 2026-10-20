@@ -129,6 +129,19 @@ pub enum WriteRequest {
     /// rebuilds (`reindex-docs`). There is no document data on the socket:
     /// the daemon reads the files itself.
     IndexDocs { full: bool },
+    /// Index only the documents at `upserts` and drop those at, or under,
+    /// `removals` (root-relative, `/`-separated; a removal that named a
+    /// directory removes `path/...` and not a sibling that shares the
+    /// prefix). What the daemon's own document watcher asks for; the same docs
+    /// handle, lock and one-at-a-time rule as `IndexDocs`. Requests waiting
+    /// their turn coalesce into one (`PendingPaths::merge`), so a burst of
+    /// edits is one index run. Never sent by a client: the answer is
+    /// `Ok { total_files, indexed_files }`, with `indexed_files` zero when
+    /// nothing changed.
+    IndexDocPaths {
+        upserts: Vec<String>,
+        removals: Vec<String>,
+    },
     /// Record that glossary entries were reviewed against their code (`acks`:
     /// the newest per target wins), and forget the acknowledgements of the
     /// targets in `drop`. Runs on the same docs handle as `IndexDocs`, one
@@ -397,6 +410,14 @@ mod tests {
         );
         assert_eq!(WriteRequest::IndexDocs { full: true }.kind(), "IndexDocs");
         assert_eq!(
+            WriteRequest::IndexDocPaths {
+                upserts: vec![],
+                removals: vec![]
+            }
+            .kind(),
+            "IndexDocPaths"
+        );
+        assert_eq!(
             WriteRequest::AckDocEntries {
                 acks: Vec::new(),
                 drop: Vec::new()
@@ -407,6 +428,23 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&WriteRequest::IndexDocs { full: false }).unwrap(),
             r#"{"IndexDocs":{"full":false}}"#
+        );
+    }
+
+    #[test]
+    fn an_index_doc_paths_request_round_trips_through_json() {
+        let request = WriteRequest::IndexDocPaths {
+            upserts: vec!["docs/a.md".to_string()],
+            removals: vec!["docs/old".to_string()],
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert_eq!(
+            json,
+            r#"{"IndexDocPaths":{"upserts":["docs/a.md"],"removals":["docs/old"]}}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<WriteRequest>(&json).unwrap(),
+            request
         );
     }
 
@@ -743,7 +781,9 @@ pub fn serve_write(infigraph: &Infigraph, request: &WriteRequest) -> WriteResult
         WriteRequest::FullReindex => WriteResult::Err {
             message: "FullReindex not yet implemented".to_string(),
         },
-        WriteRequest::IndexDocs { .. } | WriteRequest::AckDocEntries { .. } => WriteResult::Err {
+        WriteRequest::IndexDocs { .. }
+        | WriteRequest::IndexDocPaths { .. }
+        | WriteRequest::AckDocEntries { .. } => WriteResult::Err {
             message: format!(
                 "{} runs on the daemon's docs handle, never under index.lock",
                 request.kind()
