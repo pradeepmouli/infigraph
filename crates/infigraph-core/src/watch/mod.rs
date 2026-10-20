@@ -1,4 +1,5 @@
 pub mod batch;
+pub mod code_sink;
 pub mod config;
 pub mod producer;
 pub mod registration;

@@ -10,7 +10,10 @@
 //! the daemon process's own lifetime.
 
 use crate::daemon::queue::IndexWorkQueue;
+use crate::ignore_rules::Domain;
+use crate::watch::code_sink::{emit, CodeSink, EventSink};
 use crate::watch::registration::Registration;
+use crate::watch::sink::{change_of, Triage, WatchSink};
 use crate::watch::{WatchEvent, WatchEventKind};
 use clap::Parser;
 use notify::{Config, Event, EventKind, RecommendedWatcher, Watcher};
@@ -83,6 +86,7 @@ pub async fn run_producer(
     on_event: impl Fn(WatchEvent) + Send + 'static,
     token: CancellationToken,
 ) {
+    let on_event: EventSink = Arc::new(Mutex::new(Box::new(on_event)));
     let ProducerConfig {
         root,
         registry,
@@ -125,12 +129,9 @@ pub async fn run_producer(
         Err(e) => eprintln!("[watch-producer] failed to read dirty set, skipping recovery: {e}"),
     }
 
-    let mut ignore_matcher =
-        crate::ignore_rules::IgnoreMatcher::build(&root, crate::ignore_rules::Domain::Code);
-
-    // Batch accumulator: collect file changes over a 1-second window so the
-    // consumer indexes them all at once via the bulk write path.
-    let mut batch = crate::watch::batch::ChangeBatch::new(1000);
+    // Every event path is judged once here and offered to the sinks whose
+    // domain keeps it.
+    let mut triage = Triage::new(&root, &[Domain::Code]);
 
     // R7.4 (#84): above this many files in one debounce window, the batch
     // coalesces into a single whole-project pass instead of per-file
@@ -141,6 +142,13 @@ pub async fn run_producer(
         crate::settings_file::ConfigScope::Project(&root),
     )
     .storm_threshold as usize;
+    let mut sinks: Vec<Box<dyn WatchSink>> = vec![Box::new(CodeSink::new(
+        &root,
+        Arc::clone(&registry),
+        Arc::clone(&queue),
+        storm_threshold,
+        Arc::clone(&on_event),
+    ))];
 
     let (mut watcher, mut rx) =
         match create_watcher_unless_cancelled(&root, debounce_ms, &token).await {
@@ -153,11 +161,14 @@ pub async fn run_producer(
                 // from the coordinator's side, from one that shut down cleanly
                 // on cancellation -- the task just completes and nothing says
                 // watching never actually began.
-                on_event(WatchEvent {
-                    kind: WatchEventKind::WatcherDied,
-                    path: root.clone(),
-                    has_cross_file_calls: false,
-                });
+                emit(
+                    &on_event,
+                    WatchEvent {
+                        kind: WatchEventKind::WatcherDied,
+                        path: root.clone(),
+                        has_cross_file_calls: false,
+                    },
+                );
                 return;
             }
         };
@@ -186,7 +197,9 @@ pub async fn run_producer(
             _ = token.cancelled() => break,
 
             _ = tick.tick() => {
-                flush_ready_batch(&mut batch, &queue, &root, storm_threshold);
+                for sink in &mut sinks {
+                    sink.tick();
+                }
                 let now = std::time::Instant::now();
                 if dropped.due(now) {
                     let rate = dropped.report(now);
@@ -256,7 +269,7 @@ pub async fn run_producer(
             }
 
             _ = ignore_rebuild.tick() => {
-                ignore_matcher = crate::ignore_rules::IgnoreMatcher::build(&root, crate::ignore_rules::Domain::Code);
+                triage.rebuild();
             }
 
             maybe_evt = rx.recv() => {
@@ -265,18 +278,16 @@ pub async fn run_producer(
                         if events_were_dropped(&event) {
                             dropped.note();
                         }
-                        let watch_kind = match event.kind {
-                            EventKind::Create(_) => WatchEventKind::Created,
-                            EventKind::Modify(_) => WatchEventKind::Modified,
-                            EventKind::Remove(_) => WatchEventKind::Removed,
-                            _ => continue,
-                        };
+                        if change_of(&event.kind).is_none() {
+                            continue;
+                        }
 
                         for path in event.paths {
                             // Spelled as the root is: a backend that reports
                             // resolved paths would otherwise fail the
-                            // `strip_prefix` below and drop the event.
-                            let path = ignore_matcher.respelled(&path).into_owned();
+                            // `strip_prefix` the sinks rely on and drop the
+                            // event.
+                            let path = triage.respelled(&path).into_owned();
                             // Its own probe: proof the stream delivers, and
                             // nothing to index.
                             if path == canary_path {
@@ -285,110 +296,63 @@ pub async fn run_producer(
                                 }
                                 continue;
                             }
+                            let is_dir = path.is_dir();
                             // What the walk would not visit, hidden files
                             // included: a `.foo.py` it never indexes would
                             // otherwise leave a dirty mark nothing clears.
-                            if ignore_matcher.skips(&path, path.is_dir()) {
+                            if !triage.keeps(&path, is_dir) {
                                 continue;
                             }
 
-                            let rel = match path.strip_prefix(&root) {
-                                Ok(r) => r.to_string_lossy().replace('\\', "/"),
-                                Err(_) => continue,
-                            };
+                            // A new subdirectory needs its own subscription
+                            // where the watch is per directory (inotify;
+                            // these are registered NonRecursive), and
+                            // registering it is the same blocking
+                            // `fseventsd` call as startup's, so it runs off
+                            // this task too. Log a failure rather than
+                            // discarding it: silently not watching a new
+                            // directory means every later change under it is
+                            // missed with nothing to explain why. Under a
+                            // recursive subscription (macOS) a new directory
+                            // is already watched.
+                            if is_dir
+                                && crate::watch::WATCHES_EACH_DIRECTORY
+                                && !matches!(event.kind, EventKind::Remove(_))
+                            {
+                                let shared = Arc::clone(&watcher);
+                                let dir = path.clone();
+                                let registered = Registration::start(&root, move || {
+                                    let mut watcher = shared
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                    crate::watch::register_watch_dirs(&mut watcher, &dir)
+                                })
+                                .unless_cancelled(&token)
+                                .await;
+                                match registered {
+                                    None => break,
+                                    // A new directory's failures add
+                                    // to the mode; its success says
+                                    // nothing about the rest.
+                                    Some(Ok(registration)) => registration.note(&root, false),
+                                    Some(Err(e)) => {
+                                        eprintln!(
+                                            "[watch-producer] failed to watch new directory {}: {e}",
+                                            path.display()
+                                        );
+                                        crate::watch::WatchRegistration {
+                                            failed: 1,
+                                            first_error: Some(format!("{}: {e}", path.display())),
+                                        }
+                                        .note(&root, false);
+                                    }
+                                }
+                            }
 
-                            match watch_kind {
-                                WatchEventKind::Removed => {
-                                    // R3.3.5: persisted before the in-memory
-                                    // queue add below, so a crash between the
-                                    // two still leaves this path recoverable
-                                    // at next startup.
-                                    if let Err(e) = crate::dirty::mark_dirty(
-                                        &infigraph_dir,
-                                        std::slice::from_ref(&rel),
-                                    ) {
-                                        eprintln!("[watch-producer] failed to persist dirty mark for {rel}: {e}");
-                                    }
-                                    // `add_watch_removal` (not `add_removal`)
-                                    // because this is a real filesystem
-                                    // removal: `path` is already gone from
-                                    // disk, so there is no way to tell here
-                                    // whether it named a file or a directory
-                                    // -- the drain scans for and removes
-                                    // anything nested under it too.
-                                    queue.lock().unwrap().add_watch_removal(rel);
-                                    on_event(WatchEvent {
-                                        kind: watch_kind.clone(),
-                                        path,
-                                        has_cross_file_calls: false,
-                                    });
+                            for (domain, batch) in triage.route(&event.kind, &path) {
+                                for sink in sinks.iter_mut().filter(|s| s.domain() == domain) {
+                                    sink.accept(batch.clone());
                                 }
-                                WatchEventKind::Created | WatchEventKind::Modified => {
-                                    if path.is_dir() {
-                                        // Under a recursive subscription
-                                        // (macOS) a new directory is already
-                                        // watched.
-                                        if !crate::watch::WATCHES_EACH_DIRECTORY {
-                                            continue;
-                                        }
-                                        // A new subdirectory needs its own
-                                        // subscription (these are registered
-                                        // NonRecursive), and registering it
-                                        // is the same blocking `fseventsd`
-                                        // call as startup's, so it runs off
-                                        // this task too. Log a failure rather
-                                        // than discarding it: silently not
-                                        // watching a new directory means
-                                        // every later change under it is
-                                        // missed with nothing to explain why.
-                                        let shared = Arc::clone(&watcher);
-                                        let dir = path.clone();
-                                        let registered = Registration::start(&root, move || {
-                                            let mut watcher = shared
-                                                .lock()
-                                                .unwrap_or_else(std::sync::PoisonError::into_inner);
-                                            crate::watch::register_watch_dirs(&mut watcher, &dir)
-                                        })
-                                        .unless_cancelled(&token)
-                                        .await;
-                                        match registered {
-                                            None => break,
-                                            // A new directory's failures add
-                                            // to the mode; its success says
-                                            // nothing about the rest.
-                                            Some(Ok(registration)) => registration.note(&root, false),
-                                            Some(Err(e)) => {
-                                                eprintln!(
-                                                    "[watch-producer] failed to watch new directory {}: {e}",
-                                                    path.display()
-                                                );
-                                                crate::watch::WatchRegistration {
-                                                    failed: 1,
-                                                    first_error: Some(format!(
-                                                        "{}: {e}",
-                                                        path.display()
-                                                    )),
-                                                }
-                                                .note(&root, false);
-                                            }
-                                        }
-                                    } else if !crate::graph::store_util::is_lockfile(&rel)
-                                        && registry.for_file(&rel).is_some()
-                                    {
-                                        // R3.3.5: persisted before this event
-                                        // enters `batch` -- the in-memory
-                                        // accumulator a crash could still lose
-                                        // between now and the flush below.
-                                        if let Err(e) = crate::dirty::mark_dirty(
-                                            &infigraph_dir,
-                                            std::slice::from_ref(&rel),
-                                        ) {
-                                            eprintln!("[watch-producer] failed to persist dirty mark for {rel}: {e}");
-                                        }
-                                        batch.add(path);
-                                    }
-                                }
-                                WatchEventKind::WatcherRestarted | WatchEventKind::WatcherDied => {}
                             }
                         }
                     }
@@ -402,11 +366,14 @@ pub async fn run_producer(
                         restart_count += 1;
                         if restart_count > MAX_RESTARTS {
                             eprintln!("[watch-producer] watcher died {restart_count} times, giving up");
-                            on_event(WatchEvent {
-                                kind: WatchEventKind::WatcherDied,
-                                path: root.clone(),
-                                has_cross_file_calls: false,
-                            });
+                            emit(
+                                &on_event,
+                                WatchEvent {
+                                    kind: WatchEventKind::WatcherDied,
+                                    path: root.clone(),
+                                    has_cross_file_calls: false,
+                                },
+                            );
                             break;
                         }
                         let backoff = Duration::from_secs(restart_count as u64);
@@ -427,19 +394,25 @@ pub async fn run_producer(
                                 // Whatever changed while it was down.
                                 queue_true_up(&queue, "the watcher restarted");
                                 dropped.queued(std::time::Instant::now());
-                                on_event(WatchEvent {
-                                    kind: WatchEventKind::WatcherRestarted,
-                                    path: root.clone(),
-                                    has_cross_file_calls: false,
-                                });
+                                emit(
+                                    &on_event,
+                                    WatchEvent {
+                                        kind: WatchEventKind::WatcherRestarted,
+                                        path: root.clone(),
+                                        has_cross_file_calls: false,
+                                    },
+                                );
                             }
                             Some(Err(e)) => {
                                 eprintln!("[watch-producer] watcher restart failed: {e}");
-                                on_event(WatchEvent {
-                                    kind: WatchEventKind::WatcherDied,
-                                    path: root.clone(),
-                                    has_cross_file_calls: false,
-                                });
+                                emit(
+                                    &on_event,
+                                    WatchEvent {
+                                        kind: WatchEventKind::WatcherDied,
+                                        path: root.clone(),
+                                        has_cross_file_calls: false,
+                                    },
+                                );
                                 break;
                             }
                         }
@@ -470,7 +443,7 @@ pub fn true_ups_queued() -> u64 {
 /// find what no event reported: an edit made while no watcher ran, or one
 /// whose event the backend dropped. Logs when it was asked for and why; the
 /// drain logs what the scan found.
-fn queue_true_up(queue: &Arc<Mutex<IndexWorkQueue>>, why: &str) {
+pub(crate) fn queue_true_up(queue: &Arc<Mutex<IndexWorkQueue>>, why: &str) {
     TRUE_UPS_QUEUED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     queue.lock().unwrap().mark_whole_project();
     eprintln!(
@@ -711,24 +684,6 @@ fn create_watcher(
 }
 
 /// Flushes the batch into the shared queue once its debounce window closes.
-/// Runs on a timer rather than off the back of an event: the window only
-/// elapses *after* the last event, so an event-triggered check would leave
-/// a batch stranded whenever changes stop arriving -- which is the common
-/// case (someone saves a file and pauses).
-fn flush_ready_batch(
-    batch: &mut crate::watch::batch::ChangeBatch,
-    queue: &Arc<Mutex<IndexWorkQueue>>,
-    root: &Path,
-    storm_threshold: usize,
-) {
-    if batch.is_empty() || !batch.is_ready() {
-        return;
-    }
-    let paths = batch.drain();
-    let mut q = queue.lock().unwrap();
-    crate::watch::flush_batch_into_queue(&mut q, paths, root, storm_threshold);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

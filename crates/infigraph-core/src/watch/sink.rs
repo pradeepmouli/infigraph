@@ -194,6 +194,11 @@ impl Triage {
         }
     }
 
+    /// Whether any attached domain's walk would visit `path`.
+    pub fn keeps(&self, path: &Path, is_dir: bool) -> bool {
+        self.matchers.iter().any(|(_, m)| !m.skips(path, is_dir))
+    }
+
     /// The batch each domain gets for one path of one event. A domain whose
     /// rules skip the path (ignored, or a hidden component the walk would not
     /// visit) gets nothing, and neither does a directory that merely changed.
