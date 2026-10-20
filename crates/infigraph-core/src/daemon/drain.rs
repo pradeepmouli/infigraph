@@ -24,18 +24,44 @@ pub(crate) struct DrainOutcome {
 /// [`execute_drain`], so the contract test exercises the real code path and
 /// there is no second way to index a set of paths.
 impl PathIndexer for Infigraph {
+    /// Indexes the paths whose content differs from what the graph holds. A
+    /// path that is no longer on disk is a deletion.
     fn index_paths(&self, paths: &[PathBuf]) -> Result<PathOutcome> {
+        let backend = self
+            .backend()
+            .ok_or_else(|| anyhow::anyhow!("graph not initialized"))?;
+        let stored = backend.get_file_hashes()?;
         let mut queue = IndexWorkQueue::new();
+        let mut present = Vec::new();
         for path in paths {
-            queue.add_raw(self.relative(path));
+            let rel = self.relative(path);
+            if self.root().join(&rel).exists() {
+                present.push(rel);
+            } else {
+                queue.add_watch_removal(rel);
+            }
+        }
+        for extraction in self.extract_paths(&present) {
+            if stored.get(&extraction.file) != Some(&extraction.content_hash) {
+                queue.add_structured(extraction);
+            }
         }
         self.run_queue(queue)
     }
 
+    /// Removes the files at, or under, each path, and nothing beside them.
     fn delete_paths(&self, paths: &[PathBuf]) -> Result<PathOutcome> {
+        let backend = self
+            .backend()
+            .ok_or_else(|| anyhow::anyhow!("graph not initialized"))?;
+        let stored = backend.get_file_hashes()?;
         let mut queue = IndexWorkQueue::new();
         for path in paths {
-            queue.add_watch_removal(self.relative(path));
+            let rel = self.relative(path);
+            let below = format!("{rel}/");
+            if stored.keys().any(|f| *f == rel || f.starts_with(&below)) {
+                queue.add_watch_removal(rel);
+            }
         }
         self.run_queue(queue)
     }
@@ -56,6 +82,9 @@ impl Infigraph {
     }
 
     fn run_queue(&self, mut queue: IndexWorkQueue) -> Result<PathOutcome> {
+        if queue.is_empty() {
+            return Ok(PathOutcome::default());
+        }
         let outcome = execute_drain(self, queue.drain())?;
         Ok(PathOutcome {
             files: outcome.extractions.len() + outcome.removals.len(),

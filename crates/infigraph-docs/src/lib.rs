@@ -16,6 +16,7 @@ pub mod linked;
 #[cfg(feature = "remote")]
 pub mod neo4j_store;
 pub mod ops;
+mod path_indexer;
 pub mod pipelines;
 pub mod query;
 pub mod search;
@@ -362,8 +363,15 @@ impl DocIndex {
 
         // BFS: follow links to docs outside the doc root but within the repo
         let bfs_discovered = if let Some(repo_root) = find_repo_root(&self.root) {
-            let n =
-                self.bfs_follow_links(store, &mut pipelines, &mut all_doc_ids, &repo_root, 2, 50)?;
+            let n = self.bfs_follow_links(
+                store,
+                &mut pipelines,
+                &mut all_doc_ids,
+                None,
+                &repo_root,
+                2,
+                50,
+            )?;
             if n > 0 {
                 eprintln!("BFS: discovered and indexed {} doc(s) outside root", n);
             }
@@ -621,11 +629,13 @@ impl DocIndex {
         Ok(walk_doc_files(&self.root))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn bfs_follow_links(
         &self,
         store: &dyn DocBackend,
         pipelines: &mut Option<PipelineRun>,
         indexed_docs: &mut HashSet<String>,
+        seeds: Option<&HashSet<String>>,
         repo_root: &Path,
         max_depth: usize,
         max_extra: usize,
@@ -655,7 +665,10 @@ impl DocIndex {
                 None => id.to_string(),
             }
         };
-        let mut frontier: Vec<PathBuf> = indexed_docs
+        // Every stored document, or only the ones just written: the links of
+        // a document nobody touched were followed when it was.
+        let mut frontier: Vec<PathBuf> = seeds
+            .unwrap_or(indexed_docs)
             .iter()
             .filter_map(|rel| {
                 let p = self.root.join(strip_ns(rel));
