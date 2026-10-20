@@ -835,7 +835,7 @@ pub(crate) fn import_scip_and_cleanup(
             Ok(stats) => println!("Auto-SCIP: {stats}"),
             Err(e) => eprintln!("Auto-SCIP: import failed: {e}"),
         }
-        let _ = std::fs::remove_file(&scip_out);
+        infigraph_core::scip::remove_scratch(&scip_out);
         Some(outcome.map_err(|e| format!("{e:#}")))
     };
     if let Some(backend) = existing_backend {
@@ -1065,7 +1065,7 @@ fn sweep_stale_scip_scratch(scip_tmp: &Path) {
     infigraph_core::scratch::sweep_older_than(
         scip_tmp,
         SCIP_SCRATCH_STALE_AFTER,
-        &["scip", "partial"],
+        &["scip", "partial", "stat"],
     );
 }
 
@@ -1623,7 +1623,7 @@ pub(crate) fn import_scip_results_and_embed(
 
     let Some(backend) = prism.backend() else {
         for result in results {
-            let _ = std::fs::remove_file(&result.path);
+            infigraph_core::scip::remove_scratch(&result.path);
         }
         let _ = std::fs::remove_dir(&scip_tmp);
         return;
@@ -1644,7 +1644,7 @@ pub(crate) fn import_scip_results_and_embed(
                 }
             }
         }
-        let _ = std::fs::remove_file(&result.path);
+        infigraph_core::scip::remove_scratch(&result.path);
     }
     let _ = std::fs::remove_dir(&scip_tmp);
     run.finish(&root.join(".infigraph"));
@@ -1804,6 +1804,13 @@ async fn run_scip_indexer_to(
     // with fewer documents, and would import silently as partial enrichment.
     let partial = output_path.with_extension("partial");
 
+    // What the tree looks like before the indexer reads it: the import skips
+    // any document whose file has changed since (see `scip::snapshot_path`).
+    // Failing to take it only costs that protection.
+    if let Err(e) = infigraph_core::scip::write_snapshot(root, output_path) {
+        eprintln!("Auto-SCIP: {label}: no source snapshot taken: {e:#}");
+    }
+
     let run = IndexerRun {
         root,
         cmd: &cmd_str,
@@ -1825,6 +1832,7 @@ async fn run_scip_indexer_to(
     }
     // Failed, timed out, or the rename lost: leave nothing adoptable behind.
     let _ = std::fs::remove_file(&partial);
+    let _ = std::fs::remove_file(infigraph_core::scip::snapshot_path(output_path));
     produced.and(Err(
         "its finished output could not be moved into place".to_string()
     ))

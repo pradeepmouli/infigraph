@@ -16,6 +16,9 @@ use crate::graph::store_util::{
 use crate::graph::GraphStore;
 use crate::model::{Span, SymbolKind};
 
+mod snapshot;
+pub use snapshot::{changed_since, remove_scratch, snapshot_path, write_snapshot};
+
 /// (file, name) -> candidate (start_line, end_line, symbol_id) tuples --
 /// see `file_name_to_ids` in `import_scip_index` for how this disambiguates
 /// same-named symbols by containment.
@@ -646,8 +649,26 @@ fn import_scip_index_unrecorded(
         .documents
         .iter()
         .partition(|d| known_files.contains(&d.relative_path));
+    // A file edited since the indexer started is described by an output older
+    // than the graph (a tree-sitter reindex may have dropped symbols this
+    // document still names), so it waits for the next enrichment. Judged by
+    // the snapshot beside the output; none = nothing is held back.
+    let stale: std::collections::HashSet<String> = match project_root {
+        Some(root) => {
+            let names: Vec<&str> = documents.iter().map(|d| d.relative_path.as_str()).collect();
+            snapshot::changed_since(root, index_path, &names)
+                .into_iter()
+                .collect()
+        }
+        None => Default::default(),
+    };
+    let documents: Vec<_> = documents
+        .into_iter()
+        .filter(|d| !stale.contains(&d.relative_path))
+        .collect();
     clock.lap("preload files");
     stats.files_skipped = skipped.len();
+    stats.files_stale = stale.len();
     // Not filtered down to "only files that actually changed" -- SCIP
     // analyzed all of these, so treating the whole imported set as touched
     // is the safe over-approximation for a caller that just wants to notify
@@ -1966,6 +1987,11 @@ pub struct ImportStats {
     /// `index --full`, and fail `infigraph verify`.
     #[serde(default)]
     pub files_skipped: usize,
+    /// Documents whose file changed after the indexer started (see
+    /// [`snapshot_path`]): skipped whole, because the output describes a file
+    /// the graph has since seen differently. The next enrichment covers them.
+    #[serde(default)]
+    pub files_stale: usize,
     /// What the import lost on its way (edges the COPY dropped, ...), for the
     /// `scip` last-run record (#209). Empty for a clean import.
     #[serde(default)]
@@ -1982,10 +2008,11 @@ impl ImportStats {
     pub fn report(&self) -> String {
         format!(
             "SCIP import complete:\n  files processed: {}\n  files skipped (no File node): {}\n  \
-             symbols added: {}\n  symbols enriched: {}\n  relations added: {}\n  \
+             files skipped (changed since the indexer ran): {}\n  symbols added: {}\n  symbols enriched: {}\n  relations added: {}\n  \
              references added: {}\n  corrections learned: {}",
             self.files_processed,
             self.files_skipped,
+            self.files_stale,
             self.symbols_added,
             self.symbols_enriched,
             self.relations_added,
@@ -2001,7 +2028,7 @@ impl std::fmt::Display for ImportStats {
         write!(
             f,
             "enriched {} symbols, {} new symbols, {} references, {} inherits edges, \
-             {} corrections learned ({} files processed, {} skipped: no File node{})",
+             {} corrections learned ({} files processed, {} skipped: no File node{}{})",
             self.symbols_enriched,
             self.symbols_added,
             self.references_added,
@@ -2009,6 +2036,14 @@ impl std::fmt::Display for ImportStats {
             self.corrections_learned,
             self.files_processed,
             self.files_skipped,
+            if self.files_stale > 0 {
+                format!(
+                    ", {} left for the next run: changed since the indexer ran",
+                    self.files_stale
+                )
+            } else {
+                String::new()
+            },
             if self.symbols_skipped > 0 {
                 format!(", {} parameter descriptors left out", self.symbols_skipped)
             } else {
