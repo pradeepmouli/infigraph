@@ -1117,3 +1117,156 @@ mod worktrees {
         assert!(file(dir.path(), "docs/glossary/src.md").contains("by looping"));
     }
 }
+
+// ---- the bytes outside the entry are the file's own ----------------------
+
+/// A glossary of three entries; `ending` is what follows the last one, so the
+/// file can end in a blank line, several, or no newline at all.
+fn glossary_ending_in(ending: &str) -> String {
+    let mut text = "# Lib\n\n\
+### `lib/util.py::helper`\n\nHelps.\n\n\
+### `lib/util.py::other`\n\nOthers.\n\n\
+### `other/x.py::lonely`\n\nLonely."
+        .to_string();
+    text.push_str(ending);
+    text
+}
+
+/// `(label, ending)`: a normal file, a blank line at the end, two, and no
+/// final newline.
+const ENDINGS: [(&str, &str); 4] = [
+    ("plain", "\n"),
+    ("one blank line at the end", "\n\n"),
+    ("two blank lines at the end", "\n\n\n"),
+    ("no final newline", ""),
+];
+
+fn project_with_glossary(text: &str) -> tempfile::TempDir {
+    let dir = code_project(
+        &[("lib/util.py", UTIL), ("other/x.py", ELSEWHERE)],
+        &[("docs/glossary/lib.md", text)],
+    );
+    index_documents(dir.path());
+    dir
+}
+
+/// How `after` differs from `before` as bytes: the common prefix and suffix
+/// (never overlapping) and what each side has between them.
+fn changed_region<'a>(before: &'a str, after: &'a str) -> (&'a str, &'a str) {
+    let (b, a) = (before.as_bytes(), after.as_bytes());
+    let prefix = b.iter().zip(a).take_while(|(x, y)| x == y).count();
+    let suffix = b[prefix..]
+        .iter()
+        .rev()
+        .zip(a[prefix..].iter().rev())
+        .take_while(|(x, y)| x == y)
+        .count();
+    (
+        &before[prefix..before.len() - suffix],
+        &after[prefix..after.len() - suffix],
+    )
+}
+
+#[test]
+fn a_create_adds_the_entry_and_leaves_every_other_byte_of_the_file_alone() {
+    for (label, ending) in ENDINGS {
+        let before = glossary_ending_in(ending);
+        let dir = project_with_glossary(&before);
+
+        ok(
+            dir.path(),
+            json!({
+                "op": "create", "target": "lib/util.py::third",
+                "text": "Third.", "apply": true,
+            }),
+        );
+
+        let after = file(dir.path(), "docs/glossary/lib.md");
+        let (removed, added) = changed_region(&before, &after);
+        assert_eq!(removed, "", "{label}: a create removed text:\n{after:?}");
+        assert!(!added.is_empty(), "{label}: nothing was added");
+        assert!(
+            after.contains("### `lib/util.py::third`\n\nThird."),
+            "{label}: {after:?}"
+        );
+        assert!(
+            after.ends_with(&before[before.rfind("Lonely.").unwrap()..]),
+            "{label}: the tail of the file changed: {after:?}"
+        );
+    }
+}
+
+#[test]
+fn a_rekey_changes_only_the_heading_line() {
+    for (label, ending) in ENDINGS {
+        let before = glossary_ending_in(ending);
+        let dir = project_with_glossary(&before);
+
+        ok(
+            dir.path(),
+            json!({
+                "op": "rekey", "target": "lib/util.py::other",
+                "new_target": "lib/util.py::third", "apply": true,
+            }),
+        );
+
+        let after = file(dir.path(), "docs/glossary/lib.md");
+        let (removed, added) = changed_region(&before, &after);
+        assert!(
+            removed.contains("other") && !removed.contains('\n'),
+            "{label}: {removed:?}"
+        );
+        assert!(
+            added.contains("third") && !added.contains('\n'),
+            "{label}: {added:?}"
+        );
+        assert!(
+            after.ends_with(&before[before.rfind("Lonely.").unwrap()..]),
+            "{label}: {after:?}"
+        );
+    }
+}
+
+#[test]
+fn a_delete_removes_the_entry_and_leaves_every_other_byte_of_the_file_alone() {
+    for (label, ending) in ENDINGS {
+        let before = glossary_ending_in(ending);
+        let dir = project_with_glossary(&before);
+
+        ok(
+            dir.path(),
+            json!({
+                "op": "delete", "target": "lib/util.py::other",
+                "force": true, "apply": true,
+            }),
+        );
+
+        let after = file(dir.path(), "docs/glossary/lib.md");
+        let (removed, added) = changed_region(&before, &after);
+        assert_eq!(added, "", "{label}: a delete added text: {after:?}");
+        assert!(removed.contains("Others."), "{label}: {removed:?}");
+        assert!(
+            after.ends_with(&before[before.rfind("Lonely.").unwrap()..]),
+            "{label}: {after:?}"
+        );
+    }
+}
+
+/// The create at the very end of the file: the blank lines the file ended
+/// with are still the last lines after it.
+#[test]
+fn a_create_at_the_end_keeps_the_files_trailing_blank_lines_last() {
+    let before = format!("{}\n\n", "# Lib\n\n### `lib/util.py::other`\n\nOthers.");
+    let dir = project_with_glossary(&before);
+
+    ok(
+        dir.path(),
+        json!({
+            "op": "create", "target": "lib/util.py::third",
+            "text": "Third.", "apply": true,
+        }),
+    );
+
+    let after = file(dir.path(), "docs/glossary/lib.md");
+    assert!(after.ends_with("Third.\n\n"), "{after:?}");
+}

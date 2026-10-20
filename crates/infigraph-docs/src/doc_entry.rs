@@ -11,7 +11,7 @@
 //! carrying a key heading of its own) is refused: that is `create`, `rekey` or
 //! `delete`. Each operation is idempotent: asked again, it says it is done.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
@@ -842,8 +842,11 @@ fn plan_create(root: &Path, target: &str, text: &str, explicit_doc: Option<&str>
         .max_by_key(|(level, n)| (**n, std::cmp::Reverse(**level)))
         .map_or(3, |(level, _)| *level);
     let mut lines = split_lines(&before);
+    // The file's own trailing blank lines are not part of the last entry: take
+    // them off to place the new one, and put them back last.
+    let mut trailing_blank = Vec::new();
     while lines.last().is_some_and(|l| is_blank(l)) {
-        lines.pop();
+        trailing_blank.extend(lines.pop());
     }
     let code_file = code_file_of(target);
     let after_line = present
@@ -860,10 +863,11 @@ fn plan_create(root: &Path, target: &str, text: &str, explicit_doc: Option<&str>
     ];
     put.extend(body);
     lines.splice(after_line..after_line, put);
-    let mut after = join_lines(&lines, &before);
-    if !after.ends_with('\n') {
-        after.push_str(eol_of(&before));
-    }
+    trailing_blank.reverse();
+    lines.extend(trailing_blank);
+    // Like every other op, the file keeps its own line endings and whether it
+    // ends in a newline.
+    let after = join_lines(&lines, &before);
     refuse_structural_change_added(&before, &after, target)?;
     Ok(Plan::Write {
         change: Change {
@@ -1152,30 +1156,194 @@ fn finish_review(root: &Path, head: &str, review: AckPlan, apply: bool) -> Resul
 const DIFF_CONTEXT: usize = 2;
 const DIFF_MAX_LINES: usize = 60;
 
-/// The changed lines of `before` -> `after` with a little context, as a
-/// unified-diff-like block. Every operation here changes one contiguous run
-/// of lines (or `replace_all` several, shown from the first to the last).
-fn diff(file: &str, before: &str, after: &str) -> String {
-    let old: Vec<&str> = before.lines().collect();
-    let new: Vec<&str> = after.lines().collect();
-    let prefix = old.iter().zip(&new).take_while(|(a, b)| a == b).count();
+/// One line of an edit script.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Edit {
+    Same,
+    Del,
+    Add,
+}
+
+/// Region sizes up to which the exact longest-common-subsequence table is
+/// built when a region has no line that is unique to both sides.
+const LCS_MAX_CELLS: usize = 1_000_000;
+
+/// The edit script turning `old` into `new`, line by line. Common ends are
+/// peeled off, then lines that occur exactly once on both sides anchor the
+/// rest (the patience method), so unchanged lines between two far-apart
+/// changes stay unchanged however the file's ends differ.
+fn edit_script(old: &[&str], new: &[&str], out: &mut Vec<(Edit, usize)>, base: (usize, usize)) {
+    let prefix = old.iter().zip(new).take_while(|(a, b)| a == b).count();
     let suffix = old[prefix..]
         .iter()
         .rev()
         .zip(new[prefix..].iter().rev())
         .take_while(|(a, b)| a == b)
         .count();
-    let (old_end, new_end) = (old.len() - suffix, new.len() - suffix);
-    let from = prefix.saturating_sub(DIFF_CONTEXT);
-    let to_old = (old_end + DIFF_CONTEXT).min(old.len());
+    out.extend((0..prefix).map(|k| (Edit::Same, base.0 + k)));
+    let (o, n) = (
+        &old[prefix..old.len() - suffix],
+        &new[prefix..new.len() - suffix],
+    );
+    let (ob, nb) = (base.0 + prefix, base.1 + prefix);
+    if o.is_empty() || n.is_empty() {
+        out.extend((0..o.len()).map(|k| (Edit::Del, ob + k)));
+        out.extend((0..n.len()).map(|k| (Edit::Add, nb + k)));
+    } else {
+        let anchors = unique_anchors(o, n);
+        if anchors.is_empty() {
+            lcs_script(o, n, out, (ob, nb));
+        } else {
+            let (mut po, mut pn) = (0, 0);
+            for (io, jn) in anchors {
+                edit_script(&o[po..io], &n[pn..jn], out, (ob + po, nb + pn));
+                out.push((Edit::Same, ob + io));
+                (po, pn) = (io + 1, jn + 1);
+            }
+            edit_script(&o[po..], &n[pn..], out, (ob + po, nb + pn));
+        }
+    }
+    let tail = old.len() - suffix;
+    out.extend((0..suffix).map(|k| (Edit::Same, base.0 + tail + k)));
+}
+
+/// Pairs `(old index, new index)` of lines that occur once in each side, kept
+/// in the order both sides share (the longest such chain).
+fn unique_anchors(old: &[&str], new: &[&str]) -> Vec<(usize, usize)> {
+    let mut seen: HashMap<&str, (usize, usize, Option<usize>)> = HashMap::new();
+    for (i, line) in old.iter().enumerate() {
+        let e = seen.entry(line).or_insert((0, 0, None));
+        e.0 += 1;
+        e.2 = Some(i);
+    }
+    let mut at_new: HashMap<&str, usize> = HashMap::new();
+    for (j, line) in new.iter().enumerate() {
+        if let Some(e) = seen.get_mut(line) {
+            e.1 += 1;
+            at_new.insert(line, j);
+        }
+    }
+    let mut pairs: Vec<(usize, usize)> = seen
+        .iter()
+        .filter(|(_, (a, b, _))| *a == 1 && *b == 1)
+        .map(|(line, (_, _, i))| (i.unwrap_or(0), at_new[line]))
+        .collect();
+    pairs.sort_unstable();
+    // Longest strictly increasing run of new indexes (patience sorting).
+    let mut tails: Vec<usize> = Vec::new();
+    let mut prev: Vec<Option<usize>> = vec![None; pairs.len()];
+    let mut tail_at: Vec<usize> = Vec::new();
+    for (k, (_, j)) in pairs.iter().enumerate() {
+        let slot = tails.partition_point(|t| t < j);
+        if slot == tails.len() {
+            tails.push(*j);
+            tail_at.push(k);
+        } else {
+            tails[slot] = *j;
+            tail_at[slot] = k;
+        }
+        prev[k] = slot.checked_sub(1).map(|s| tail_at[s]);
+    }
+    let mut chain = Vec::new();
+    let mut cur = tail_at.last().copied();
+    while let Some(k) = cur {
+        chain.push(pairs[k]);
+        cur = prev[k];
+    }
+    chain.reverse();
+    chain
+}
+
+/// Exact script for a region with no anchors: the longest common subsequence
+/// when the table is small enough, else the whole region changed.
+fn lcs_script(old: &[&str], new: &[&str], out: &mut Vec<(Edit, usize)>, base: (usize, usize)) {
+    let (n, m) = (old.len(), new.len());
+    if n * m > LCS_MAX_CELLS {
+        out.extend((0..n).map(|k| (Edit::Del, base.0 + k)));
+        out.extend((0..m).map(|k| (Edit::Add, base.1 + k)));
+        return;
+    }
+    let mut table = vec![0u32; (n + 1) * (m + 1)];
+    let at = |i: usize, j: usize| i * (m + 1) + j;
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            table[at(i, j)] = if old[i] == new[j] {
+                table[at(i + 1, j + 1)] + 1
+            } else {
+                table[at(i + 1, j)].max(table[at(i, j + 1)])
+            };
+        }
+    }
+    let (mut i, mut j) = (0, 0);
+    let (mut dels, mut adds) = (Vec::new(), Vec::new());
+    let flush = |out: &mut Vec<(Edit, usize)>, dels: &mut Vec<usize>, adds: &mut Vec<usize>| {
+        out.extend(dels.drain(..).map(|k| (Edit::Del, k)));
+        out.extend(adds.drain(..).map(|k| (Edit::Add, k)));
+    };
+    while i < n || j < m {
+        if i < n && j < m && old[i] == new[j] {
+            flush(out, &mut dels, &mut adds);
+            out.push((Edit::Same, base.0 + i));
+            (i, j) = (i + 1, j + 1);
+        } else if j < m && (i == n || table[at(i, j + 1)] >= table[at(i + 1, j)]) {
+            adds.push(base.1 + j);
+            j += 1;
+        } else {
+            dels.push(base.0 + i);
+            i += 1;
+        }
+    }
+    flush(out, &mut dels, &mut adds);
+}
+
+/// The changed lines of `before` -> `after` with a little context, as
+/// unified-diff-like hunks (`@@ file:line @@`, the line being the first old
+/// line shown). Changes closer than the context share a hunk. Every hunk is
+/// real: a line is shown as changed only if the edit script changes it.
+fn diff(file: &str, before: &str, after: &str) -> String {
+    let old: Vec<&str> = before.lines().collect();
+    let new: Vec<&str> = after.lines().collect();
+    let mut script = Vec::new();
+    edit_script(&old, &new, &mut script, (0, 0));
+    // Where the changes are, as positions in the script.
+    let changed: Vec<usize> = script
+        .iter()
+        .enumerate()
+        .filter(|(_, (e, _))| *e != Edit::Same)
+        .map(|(k, _)| k)
+        .collect();
+    let mut groups: Vec<(usize, usize)> = Vec::new();
+    for k in changed {
+        match groups.last_mut() {
+            Some((_, end)) if k <= *end + 2 * DIFF_CONTEXT + 1 => *end = k,
+            _ => groups.push((k, k)),
+        }
+    }
     let mut lines: Vec<String> = Vec::new();
-    lines.extend(old[from..prefix].iter().map(|l| format!(" {l}")));
-    lines.extend(old[prefix..old_end].iter().map(|l| format!("-{l}")));
-    lines.extend(new[prefix..new_end].iter().map(|l| format!("+{l}")));
-    lines.extend(old[old_end..to_old].iter().map(|l| format!(" {l}")));
-    let mut out = format!("@@ {file}:{} @@\n", from + 1);
+    let mut headers = Vec::new();
+    for (first, last) in groups {
+        let from = first.saturating_sub(DIFF_CONTEXT);
+        let to = (last + 1 + DIFF_CONTEXT).min(script.len());
+        let old_line = script[from..to]
+            .iter()
+            .find(|(e, _)| *e != Edit::Add)
+            .map_or(old.len(), |(_, k)| *k);
+        headers.push((lines.len(), format!("@@ {file}:{} @@", old_line + 1)));
+        for (edit, k) in &script[from..to] {
+            lines.push(match edit {
+                Edit::Same => format!(" {}", old[*k]),
+                Edit::Del => format!("-{}", old[*k]),
+                Edit::Add => format!("+{}", new[*k]),
+            });
+        }
+    }
     let total = lines.len();
-    for line in lines.iter().take(DIFF_MAX_LINES) {
+    let mut out = String::new();
+    for (at, line) in lines.iter().enumerate().take(DIFF_MAX_LINES) {
+        if let Some((_, header)) = headers.iter().find(|(h, _)| *h == at) {
+            out.push_str(header);
+            out.push('\n');
+        }
         out.push_str(line);
         out.push('\n');
     }
@@ -1195,6 +1363,112 @@ mod tests {
         let after = "a\nb\nc\nD\ne\nf\ng\n";
         let shown = diff("f.md", before, after);
         assert_eq!(shown, "@@ f.md:2 @@\n b\n c\n-d\n+D\n e\n f\n");
+    }
+
+    /// A change in the middle and another at the end of the file, with
+    /// unchanged lines between: the diff shows those two and nothing between
+    /// (it used to show every line after the first change, because the last
+    /// lines differed and the common suffix was empty).
+    #[test]
+    fn two_separate_changes_are_two_hunks_and_the_lines_between_are_not_shown() {
+        let lines: Vec<String> = (0..30).map(|n| format!("l{n}")).collect();
+        let before = format!("{}\n\n", lines.join("\n"));
+        let mut changed = lines.clone();
+        changed[10] = "L10".to_string();
+        let after = format!("{}\n", changed.join("\n"));
+
+        let shown = diff("f.md", &before, &after);
+
+        assert!(shown.contains("-l10\n+L10\n"), "{shown}");
+        assert!(
+            shown.contains(" l29\n-\n"),
+            "the dropped last blank line:\n{shown}"
+        );
+        assert!(!shown.contains("l15"), "{shown}");
+        assert!(!shown.contains("more lines"), "{shown}");
+        assert_eq!(shown.matches("@@").count() / 2, 2, "two hunks:\n{shown}");
+    }
+
+    /// The script is a faithful one: its unchanged and added lines are the new
+    /// text, its unchanged and deleted lines the old, for texts with repeated
+    /// lines (no anchors) and unique ones alike.
+    #[test]
+    fn the_edit_script_reproduces_both_texts() {
+        let mut seed = 12345u64;
+        let mut next = |n: u64| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) % n
+        };
+        for round in 0..200 {
+            let alphabet = if round % 2 == 0 { 3 } else { 40 };
+            let old: Vec<String> = (0..next(30))
+                .map(|_| format!("x{}", next(alphabet)))
+                .collect();
+            let new: Vec<String> = (0..next(30))
+                .map(|_| format!("x{}", next(alphabet)))
+                .collect();
+            let (o, n): (Vec<&str>, Vec<&str>) = (
+                old.iter().map(String::as_str).collect(),
+                new.iter().map(String::as_str).collect(),
+            );
+            let mut script = Vec::new();
+            edit_script(&o, &n, &mut script, (0, 0));
+            let (mut from_old, mut from_new) = (Vec::new(), Vec::new());
+            let (mut oi, mut ni) = (0, 0);
+            for (edit, k) in &script {
+                match edit {
+                    Edit::Same => {
+                        assert_eq!((oi, o[*k]), (*k, n[ni]), "round {round}");
+                        from_old.push(o[*k]);
+                        from_new.push(n[ni]);
+                        (oi, ni) = (oi + 1, ni + 1);
+                    }
+                    Edit::Del => {
+                        assert_eq!(oi, *k, "round {round}");
+                        from_old.push(o[*k]);
+                        oi += 1;
+                    }
+                    Edit::Add => {
+                        assert_eq!(ni, *k, "round {round}");
+                        from_new.push(n[*k]);
+                        ni += 1;
+                    }
+                }
+            }
+            assert_eq!(
+                (from_old, from_new),
+                (o.clone(), n.clone()),
+                "round {round}"
+            );
+        }
+    }
+
+    /// A big glossary with a change in the middle and one at the end diffs
+    /// without a quadratic table.
+    #[test]
+    fn a_large_file_with_two_changes_far_apart_diffs_to_two_hunks() {
+        let lines: Vec<String> = (0..20_000).map(|n| format!("line {n}")).collect();
+        let before = format!("{}\n\n", lines.join("\n"));
+        let mut changed = lines.clone();
+        changed[9_000] = "changed".to_string();
+        let after = format!("{}\n", changed.join("\n"));
+
+        let shown = diff("big.md", &before, &after);
+
+        assert_eq!(shown.matches("@@").count() / 2, 2, "{shown}");
+        assert!(shown.contains("-line 9000\n+changed\n"), "{shown}");
+    }
+
+    /// Changes close together share one hunk rather than repeating context.
+    #[test]
+    fn changes_within_the_context_distance_are_one_hunk() {
+        let before = "a\nb\nc\nd\ne\nf\ng\nh\n";
+        let after = "a\nB\nc\nd\nE\nf\ng\nh\n";
+        let shown = diff("f.md", before, after);
+        assert_eq!(shown.matches("@@").count() / 2, 1, "{shown}");
+        assert!(shown.contains("-b\n+B\n c\n d\n-e\n+E\n"), "{shown}");
     }
 
     #[test]
