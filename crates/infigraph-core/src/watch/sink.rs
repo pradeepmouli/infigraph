@@ -139,13 +139,20 @@ pub fn directory_arrived(kind: &EventKind) -> bool {
 pub struct Triage {
     root: PathBuf,
     matchers: Vec<(Domain, IgnoreMatcher)>,
+    expansion_cap: usize,
 }
+
+/// Files a single arriving directory is expanded into before the sink is told
+/// to rescan instead: a `git checkout` that moves a whole tree in is a rescan's
+/// job, not a list of tens of thousands of paths.
+const EXPANSION_CAP: usize = 20_000;
 
 impl Triage {
     pub fn new(root: &Path, domains: &[Domain]) -> Self {
         let mut triage = Self {
             root: root.to_path_buf(),
             matchers: Vec::new(),
+            expansion_cap: EXPANSION_CAP,
         };
         for domain in domains {
             triage.attach(*domain);
@@ -205,7 +212,14 @@ impl Triage {
                 continue;
             }
             if is_dir {
-                // Filled in with the directory's files by the next change.
+                // A directory that merely changed says nothing. One that
+                // arrived (created, or renamed into place) may hold files that
+                // never get an event of their own: inotify registers a new
+                // directory only after the files in it were written, and a
+                // directory moved in carries its children with it.
+                if directory_arrived(kind) {
+                    routed.push((*domain, self.expand(path, *domain)));
+                }
                 continue;
             }
             routed.push((
@@ -217,6 +231,44 @@ impl Triage {
             ));
         }
         routed
+    }
+}
+
+impl Triage {
+    /// The files below an arriving directory that `domain`'s walk visits, each
+    /// as `Created`. More than the cap, or a walk error, makes it a rescan:
+    /// the list would be short.
+    fn expand(&self, dir: &Path, domain: Domain) -> WatchBatch {
+        let mut batch = WatchBatch::default();
+        // Judged by the project the matchers were built for, not by whatever
+        // project a bare subdirectory resolves to.
+        let project_root = crate::project::resolve_project_root(&self.root);
+        for entry in crate::ignore_rules::walk_builder_in(dir, &project_root, domain).build() {
+            let Ok(entry) = entry else {
+                batch.rescan = true;
+                continue;
+            };
+            if !entry.file_type().is_some_and(|ft| ft.is_file()) {
+                continue;
+            }
+            if batch.changes.len() >= self.expansion_cap {
+                return WatchBatch::rescan();
+            }
+            if let Ok(rel) = entry.path().strip_prefix(&self.root) {
+                batch.changes.push((
+                    PathBuf::from(rel.to_string_lossy().replace('\\', "/")),
+                    PathChange::Created,
+                ));
+            }
+        }
+        batch
+    }
+
+    /// For tests: a smaller cap than [`EXPANSION_CAP`].
+    #[cfg(test)]
+    pub(crate) fn with_expansion_cap(mut self, cap: usize) -> Self {
+        self.expansion_cap = cap;
+        self
     }
 }
 
@@ -482,5 +534,102 @@ mod tests {
             .route(&create(), &file)
             .iter()
             .any(|(d, _)| *d == Domain::Docs));
+    }
+
+    fn files_of(batch: &WatchBatch) -> Vec<String> {
+        let mut files: Vec<String> = batch
+            .changes
+            .iter()
+            .map(|(p, c)| {
+                assert_eq!(*c, PathChange::Created);
+                p.to_string_lossy().into_owned()
+            })
+            .collect();
+        files.sort();
+        files
+    }
+
+    fn renamed_in() -> EventKind {
+        EventKind::Modify(ModifyKind::Name(notify::event::RenameMode::Any))
+    }
+
+    #[test]
+    fn a_directory_moved_in_with_files_already_inside_yields_those_files() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _home = PinnedHome::empty();
+        let dir = project();
+        write(dir.path(), "moved/a.md");
+        write(dir.path(), "moved/deep/b.md");
+        write(dir.path(), "moved/deep/c.rs");
+        let triage = Triage::new(dir.path(), &[Domain::Code, Domain::Docs]);
+
+        let routed = triage.route(&renamed_in(), &dir.path().join("moved"));
+
+        for (domain, batch) in &routed {
+            assert_eq!(
+                files_of(batch),
+                vec!["moved/a.md", "moved/deep/b.md", "moved/deep/c.rs"],
+                "{domain:?}: every file inside, none of them with an event of its own"
+            );
+            assert!(!batch.rescan);
+        }
+        assert_eq!(routed.len(), 2);
+    }
+
+    #[test]
+    fn a_new_directory_holding_a_doc_routes_the_doc_by_domain() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _home = PinnedHome::empty();
+        let dir = project();
+        // `docs/` is out of the code walk and `src/` out of the docs walk.
+        write(dir.path(), "pkg/docs/guide.md");
+        write(dir.path(), "pkg/src/lib.rs");
+        let triage = Triage::new(dir.path(), &[Domain::Code, Domain::Docs]);
+
+        let routed = triage.route(&create(), &dir.path().join("pkg"));
+        let of = |wanted: Domain| {
+            routed
+                .iter()
+                .find(|(d, _)| *d == wanted)
+                .map(|(_, b)| files_of(b))
+                .unwrap()
+        };
+
+        assert_eq!(of(Domain::Code), vec!["pkg/src/lib.rs"]);
+        assert_eq!(of(Domain::Docs), vec!["pkg/docs/guide.md"]);
+    }
+
+    #[test]
+    fn an_arriving_directory_expands_only_what_the_walk_visits() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _home = PinnedHome::empty();
+        let dir = project();
+        fs::write(dir.path().join(".gitignore"), "skipped/\n").unwrap();
+        write(dir.path(), "new/keep.md");
+        write(dir.path(), "new/skipped/no.md");
+        write(dir.path(), "new/node_modules/x.md");
+        write(dir.path(), "new/.hidden/h.md");
+        let triage = Triage::new(dir.path(), &[Domain::Docs]);
+
+        let routed = triage.route(&create(), &dir.path().join("new"));
+
+        assert_eq!(files_of(&routed[0].1), vec!["new/keep.md"]);
+    }
+
+    #[test]
+    fn a_directory_past_the_cap_asks_for_a_rescan_instead_of_a_short_list() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _home = PinnedHome::empty();
+        let dir = project();
+        for i in 0..5 {
+            write(dir.path(), &format!("big/f{i}.md"));
+        }
+        let triage = Triage::new(dir.path(), &[Domain::Docs]).with_expansion_cap(3);
+
+        let routed = triage.route(&create(), &dir.path().join("big"));
+
+        assert_eq!(routed.len(), 1);
+        assert!(routed[0].1.rescan);
+        assert!(routed[0].1.changes.is_empty());
     }
 }
