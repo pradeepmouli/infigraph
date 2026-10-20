@@ -215,3 +215,72 @@ fn a_sidecar_of_an_older_format_is_rebuilt_whole() {
     assert!(update(&ig, dir.path(), &[]) > 0, "nothing was re-embedded");
     assert_eq!(entries(dir.path()).len(), 2);
 }
+
+/// A symbol only a SCIP indexer found has the line of its identifier and no
+/// body: sittir's graph holds one per file (named after the file, 1-1), and no
+/// update can ever give them an entry.
+fn add_scip_namespace(ig: &CodeIndex, file: &str) {
+    ig.backend()
+        .unwrap()
+        .raw_query(&format!(
+            "CREATE (:Symbol {{id: '{file}::{file}', name: '{file}', kind: 'Function', \
+             file: '{file}', start_line: 1, end_line: 1, signature_hash: '', language: 'scip', \
+             visibility: '', parent: '', docstring: '', complexity: 0, parameters: '', \
+             return_type: ''}})"
+        ))
+        .unwrap();
+}
+
+#[test]
+fn a_symbol_with_no_body_span_is_not_counted_as_missing_its_body_signal() {
+    let (dir, ig) = project(&[("src/a.py", TOTAL), ("src/b.py", OTHER)]);
+    // A file the indexer analysed that tree-sitter never stored (a types-only
+    // module): the graph has its namespace symbol and no content hash for it.
+    write(
+        dir.path(),
+        "src/types.ts",
+        "export interface Item { id: number }\n",
+    );
+    add_scip_namespace(&ig, "src/types.ts");
+    let report = infigraph_core::clone_detect::build::update_bodies(
+        ig.backend().unwrap(),
+        dir.path(),
+        &[],
+        &|| Box::new(WordEmbedder(Arc::new(AtomicUsize::new(0)))),
+    )
+    .unwrap();
+    // Denominator: the functions that can have a body. The namespace cannot,
+    // so "0 of 2 functions have no body signal", not "1 of 3".
+    assert_eq!((report.symbols, report.embedded), (2, 2), "{report:?}");
+    assert_eq!(entries(dir.path()).len(), 2);
+    let live = infigraph_core::degraded::live::for_root(dir.path());
+    assert!(
+        !live.iter().any(|n| n.key == "clone-bodies-partial"),
+        "{live:?}"
+    );
+}
+
+#[test]
+fn the_clone_report_leaves_a_symbol_with_no_body_span_out_of_its_counts() {
+    let (dir, ig) = project(&[("src/a.py", TOTAL), ("src/b.py", OTHER)]);
+    write(
+        dir.path(),
+        "src/types.ts",
+        "export interface Item { id: number }\n",
+    );
+    add_scip_namespace(&ig, "src/types.ts");
+    update(&ig, dir.path(), &[]);
+    let report = infigraph_core::clone_detect::find::find_clones_with(
+        ig.backend().unwrap(),
+        dir.path(),
+        &infigraph_core::clone_detect::find::Options {
+            min_tokens: 1,
+            ..Default::default()
+        },
+        None,
+    )
+    .unwrap();
+    let notes = report.caveats().join("\n");
+    assert!(!notes.contains("no body signal"), "{notes}");
+    assert_eq!(report.symbols, 2, "{notes}");
+}

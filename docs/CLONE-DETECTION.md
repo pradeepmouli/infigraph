@@ -73,8 +73,12 @@ file still hashes to what the graph was written from: a file edited since it
 was indexed yields no entries until the next index.
 
 Degraded modes: `clone-bodies-unavailable` (no sidecar) and
-`clone-bodies-partial` (some functions lack a body embedding); the remedy for
-both is `infigraph index`.
+`clone-bodies-partial` (some functions lack an entry, or have a sketch but no
+embedding); the remedy for both is `infigraph index`. The counts cover the
+functions that have a body to describe (`bodies::has_body_span`): a symbol only
+a SCIP indexer found, which has its identifier's line and no span (one per
+file, named after it), can never get an entry, so it is in neither number and
+`find_clones` leaves it out of the candidates.
 
 A local graph never embeds anything when you ask for clones. The one exception
 is a **remote** graph (Neo4j and Postgres), which has no local sidecar: it

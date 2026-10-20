@@ -456,7 +456,8 @@ pub fn tool_search(args: &Value) -> Result<String> {
         });
     }
 
-    let symbol_results = rank_with_text_hits(symbol_results, &text_hits, &rows, limit, use_regex);
+    let symbol_results =
+        rank_with_text_hits(symbol_results, &text_hits, &rows, query, limit, use_regex);
 
     // Build row lookup
     let row_map: std::collections::HashMap<&str, &Vec<String>> =
@@ -616,6 +617,7 @@ fn rank_with_text_hits(
     mut results: Vec<infigraph_core::search::SearchResult>,
     hits: &[TextHit<'_>],
     rows: &[Vec<String>],
+    query: &str,
     limit: usize,
     regex: bool,
 ) -> Vec<infigraph_core::search::SearchResult> {
@@ -643,8 +645,44 @@ fn rank_with_text_hits(
         }
     }
     ranked.extend(results);
+    if !regex {
+        lead_with_exact_names(&mut ranked, rows, query);
+    }
     ranked.truncate(limit);
     ranked
+}
+
+/// Puts the symbols whose name is the whole query first, ahead of every
+/// literal hit and semantic neighbour, and adds one that did not rank at all.
+/// A name typed in full is the strongest evidence a query can carry: without
+/// this, `record_or_write` came back behind `write` whenever its name occurred
+/// on more lines than `limit`, because only a specific literal is promoted.
+fn lead_with_exact_names(
+    ranked: &mut Vec<infigraph_core::search::SearchResult>,
+    rows: &[Vec<String>],
+    query: &str,
+) {
+    let query = query.trim();
+    let mut named: Vec<infigraph_core::search::SearchResult> = Vec::new();
+    for row in rows
+        .iter()
+        .filter(|row| row[1] == query && !row[2].eq_ignore_ascii_case("module"))
+    {
+        match ranked.iter().position(|r| r.symbol_id == row[0]) {
+            Some(pos) => named.push(ranked.remove(pos)),
+            None => named.push(infigraph_core::search::SearchResult {
+                symbol_id: row[0].clone(),
+                name: row[1].clone(),
+                kind: row[2].clone(),
+                file: row[3].clone(),
+                score: 1.0,
+                bm25_score: 0.0,
+                vector_score: 0.0,
+                docstring: row.get(4).filter(|d| !d.is_empty()).cloned(),
+            }),
+        }
+    }
+    ranked.splice(0..0, named);
 }
 
 /// How many text matches a search lists: every one it collected for a `regex`
@@ -1225,6 +1263,7 @@ mod text_match_tests {
             semantic,
             &attribute_text_hits(&rows, &hits),
             &rows,
+            "",
             5,
             false,
         );
@@ -1249,11 +1288,44 @@ mod text_match_tests {
             semantic,
             &attribute_text_hits(&rows, &hits),
             &rows,
+            "",
             5,
             false,
         );
 
         assert_eq!(ids(&ranked), ["a.rs::f", "b.rs::g"]);
+    }
+
+    /// The reported case: the query is a symbol's whole name, the symbol is in
+    /// the index, and its name also appears on more lines than `limit` (call
+    /// sites), so no text hit is promoted and the semantic neighbour `write`
+    /// leads. A name typed in full is the strongest evidence there is.
+    #[test]
+    fn a_query_that_is_a_symbols_whole_name_ranks_that_symbol_first() {
+        let rows = vec![
+            row("w.rs::write", "Function", "w.rs", 1, 9),
+            row("d.rs::record_or_write", "Function", "d.rs", 10, 40),
+        ];
+        let hits: Vec<GrepMatch> = (0..30)
+            .map(|i| hit("c.rs", i + 1, "record_or_write(entry);"))
+            .collect();
+        let semantic = vec![result("w.rs::write", 0.97), result("z.rs::other", 0.85)];
+
+        let ranked = rank_with_text_hits(
+            semantic,
+            &attribute_text_hits(&rows, &hits),
+            &rows,
+            "record_or_write",
+            5,
+            false,
+        );
+
+        assert_eq!(
+            ids(&ranked)[0],
+            "d.rs::record_or_write",
+            "{:?}",
+            ids(&ranked)
+        );
     }
 
     /// A literal matching more lines than the caller asked for is not specific
@@ -1276,6 +1348,7 @@ mod text_match_tests {
             semantic,
             &attribute_text_hits(&rows, &hits),
             &rows,
+            "",
             2,
             false,
         );
@@ -1299,8 +1372,14 @@ mod text_match_tests {
         ];
         let semantic = vec![result("b.rs::best", 0.9), result("b.rs::next", 0.8)];
 
-        let ranked =
-            rank_with_text_hits(semantic, &attribute_text_hits(&rows, &hits), &rows, 2, true);
+        let ranked = rank_with_text_hits(
+            semantic,
+            &attribute_text_hits(&rows, &hits),
+            &rows,
+            "",
+            2,
+            true,
+        );
 
         assert_eq!(ids(&ranked), ["a.rs::f", "a.rs::g"]);
     }

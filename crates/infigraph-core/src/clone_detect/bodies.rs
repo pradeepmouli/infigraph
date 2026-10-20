@@ -51,6 +51,15 @@ pub struct BodyEntry {
     pub embedding: Vec<f32>,
 }
 
+/// Whether a function symbol has a body to describe. A symbol only a SCIP
+/// indexer found (`language == "scip"`) carries the line of its identifier and
+/// no span: sittir's graph holds one per file, named after the file at line 1,
+/// and no update can ever give it an entry. Everything that counts functions
+/// "without a body signal" leaves these out, so that count can reach zero.
+pub fn has_body_span(language: &str, start_line: usize, end_line: usize) -> bool {
+    !(language == "scip" && end_line <= start_line)
+}
+
 /// The value `BodyEntry::signature` holds for a graph `signature_hash`.
 pub fn signature_of(signature_hash: &str) -> u64 {
     fnv1a64(signature_hash.as_bytes())

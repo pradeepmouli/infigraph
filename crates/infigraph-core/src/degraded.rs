@@ -84,9 +84,14 @@ pub enum DegradedMode {
     /// `clone-bodies.bin` is missing, so clone detection compares signature
     /// text, not function bodies.
     CloneBodiesUnavailable,
-    /// `clone-bodies.bin` describes only some of the functions, so the rest
-    /// are compared by the weaker signal.
-    CloneBodiesPartial { missing: usize, total: usize },
+    /// `clone-bodies.bin` describes only some of the functions that have a
+    /// body (`missing` have no entry; `sketch_only` have no embedding), so
+    /// those are compared by a weaker signal.
+    CloneBodiesPartial {
+        missing: usize,
+        sketch_only: usize,
+        total: usize,
+    },
     /// Some stored documents were never scanned for code links (a document
     /// store from before they existed), so a symbol's glossary entry and the
     /// mentions of it may be missing from its doc context.
@@ -213,10 +218,27 @@ impl DegradedMode {
                  function bodies"
                     .to_string()
             }
-            DegradedMode::CloneBodiesPartial { missing, total } => format!(
-                "{missing} of {total} functions have no body signal in clone-bodies.bin: they are \
-                 compared by a weaker signal, and each pair says which"
-            ),
+            DegradedMode::CloneBodiesPartial {
+                missing,
+                sketch_only,
+                total,
+            } => {
+                let mut parts = Vec::new();
+                if *missing > 0 {
+                    parts.push(format!(
+                        "{missing} of {total} functions have no entry in clone-bodies.bin"
+                    ));
+                }
+                if *sketch_only > 0 {
+                    parts.push(format!(
+                        "{sketch_only} of {total} have a body sketch but no embedding"
+                    ));
+                }
+                format!(
+                    "{}: they are compared by a weaker signal, and each pair says which",
+                    parts.join("; ")
+                )
+            }
             DegradedMode::DocLinksUnscanned { unscanned, total } => format!(
                 "{unscanned} of {total} documents have not been scanned for code links: a \
                  symbol's glossary entry and mentions may be missing from its doc context"
@@ -702,6 +724,21 @@ mod tests {
     use super::*;
     use crate::settings_file::test_support::{PinnedHome, ENV_LOCK};
     use std::time::{Duration, SystemTime};
+
+    #[test]
+    fn the_partial_clone_message_names_each_count_it_has() {
+        let said = |missing, sketch_only| {
+            DegradedMode::CloneBodiesPartial {
+                missing,
+                sketch_only,
+                total: 10,
+            }
+            .message()
+        };
+        assert!(said(2, 0).starts_with("2 of 10 functions have no entry in clone-bodies.bin:"));
+        assert!(said(0, 3).starts_with("3 of 10 have a body sketch but no embedding:"));
+        assert!(said(2, 3).contains("no entry in clone-bodies.bin; 3 of 10 have a body sketch"));
+    }
 
     /// A project with a graph file, and `HOME` and the docs switch pinned so a
     /// developer's own config cannot turn documents on.
