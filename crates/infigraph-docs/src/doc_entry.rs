@@ -842,8 +842,11 @@ fn plan_create(root: &Path, target: &str, text: &str, explicit_doc: Option<&str>
         .max_by_key(|(level, n)| (**n, std::cmp::Reverse(**level)))
         .map_or(3, |(level, _)| *level);
     let mut lines = split_lines(&before);
+    // The file's own trailing blank lines are not part of the last entry: take
+    // them off to place the new one, and put them back last.
+    let mut trailing_blank = Vec::new();
     while lines.last().is_some_and(|l| is_blank(l)) {
-        lines.pop();
+        trailing_blank.extend(lines.pop());
     }
     let code_file = code_file_of(target);
     let after_line = present
@@ -860,10 +863,11 @@ fn plan_create(root: &Path, target: &str, text: &str, explicit_doc: Option<&str>
     ];
     put.extend(body);
     lines.splice(after_line..after_line, put);
-    let mut after = join_lines(&lines, &before);
-    if !after.ends_with('\n') {
-        after.push_str(eol_of(&before));
-    }
+    trailing_blank.reverse();
+    lines.extend(trailing_blank);
+    // Like every other op, the file keeps its own line endings and whether it
+    // ends in a newline.
+    let after = join_lines(&lines, &before);
     refuse_structural_change_added(&before, &after, target)?;
     Ok(Plan::Write {
         change: Change {
