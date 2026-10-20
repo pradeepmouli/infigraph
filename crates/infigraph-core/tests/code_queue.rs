@@ -141,3 +141,27 @@ fn a_rescan_queues_a_whole_project_pass() {
     assert!(wait_for_queue(&queue));
     assert!(queue.lock().unwrap().wants_whole_project());
 }
+
+#[test]
+fn a_path_whose_last_event_is_a_modify_but_which_is_gone_is_a_removal() {
+    // FSEvents reports a file that was created and deleted inside one window as
+    // Create, Remove, Modify, in that order. Merged in event order the last
+    // word is an upsert of a file that does not exist, and the graph keeps its
+    // rows (watch_daemon::watch_triggered_file_removal_contends_with_a_held_index_lock).
+    let dir = tempfile::tempdir().unwrap();
+    let (mut sink, queue, _) = sink(dir.path());
+
+    sink.accept(batch(&[
+        ("gone.py", Created),
+        ("gone.py", Removed),
+        ("gone.py", Modified),
+    ]));
+
+    assert!(wait_for_queue(&queue), "the settled window is handed on");
+    let queue = queue.lock().unwrap();
+    assert!(
+        !queue.holds_path("gone.py"),
+        "a file that no longer exists must not be queued for indexing"
+    );
+    assert!(!queue.is_empty(), "its removal is what is queued");
+}

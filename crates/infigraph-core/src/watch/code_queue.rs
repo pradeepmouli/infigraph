@@ -116,8 +116,18 @@ impl PathQueue for CodeIndex {
         for rel in removals {
             q.add_watch_removal(rel);
         }
-        let paths = upserts
+        // An upsert of a path that is gone is a removal. FSEvents folds the
+        // flags of a short-lived path into one report and unfolds them in no
+        // particular order (Create, Remove, Modify), so the last event of a
+        // window says nothing about whether the file exists; the disk does.
+        let (present, gone): (Vec<String>, Vec<String>) = upserts
             .into_keys()
+            .partition(|rel| handle.root.join(rel).exists());
+        for rel in gone {
+            q.add_watch_removal(rel);
+        }
+        let paths = present
+            .into_iter()
             .map(|rel| handle.root.join(rel))
             .collect();
         crate::watch::flush_batch_into_queue(&mut q, paths, &handle.root, handle.storm_threshold);
