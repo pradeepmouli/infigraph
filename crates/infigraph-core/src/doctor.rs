@@ -689,7 +689,10 @@ fn watcher_lock_precheck(
         return Err(CheckResult::pass(
             WATCHER_CATEGORY,
             label,
-            "no watcher running",
+            match crate::daemon::idle_exit::note(project_path) {
+                Some(why) => format!("no watcher running: {why}"),
+                None => "no watcher running".to_string(),
+            },
         ));
     }
 

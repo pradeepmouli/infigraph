@@ -3,6 +3,7 @@ pub mod control;
 pub mod coordinator_port;
 pub(crate) mod drain;
 pub mod fault;
+pub mod idle_exit;
 pub mod lease;
 pub mod lifecycle;
 pub mod liveness;
@@ -858,6 +859,10 @@ where
     // through. Owned here, like `liveness`, so a #187 rebind keeps it.
     let (port, port_rx) =
         coordinator_port::CoordinatorPort::new(idle.grace_secs, idle.check_secs.max(1));
+    if serve_requests {
+        // A daemon is running again: the last one's idle exit is history.
+        idle_exit::clear(root);
+    }
     if let Some(docs) = &docs_control {
         port.state.set_role(
             WatchRole::Docs,
@@ -1205,11 +1210,15 @@ where
             let work_in_flight = work_in_flight!();
             let idle_for = liveness.idle_for(liveness::now_secs());
             if liveness::idle_exit_due(idle_for, idle_grace, work_in_flight) {
+                let idle_secs = idle_for.map(|d| d.as_secs()).unwrap_or(0);
                 eprintln!(
                     "[watch] idle for {}s with no lease on {} -- shutting down",
-                    idle_for.map(|d| d.as_secs()).unwrap_or(0),
+                    idle_secs,
                     root.display()
                 );
+                // So "no watcher running" afterwards says why (it left on
+                // purpose), until the next daemon clears it.
+                idle_exit::record(root, idle_secs);
                 break;
             }
         }

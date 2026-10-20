@@ -27,7 +27,7 @@ use super::read_endpoint::ReadEndpoint;
 use super::read_endpoint::ReadStream;
 use super::read_protocol::{
     read_client_frame, write_frame, write_reply, Attach, ClientFrame, ControlFrame, ControlRequest,
-    OpReply, ReadFrame, Store, WriteFrame,
+    NoRequest, OpReply, ReadFrame, Store, WriteFrame,
 };
 use crate::daemon_protocol::{WriteRequest, WriteResult};
 
@@ -200,10 +200,10 @@ impl ReadService {
                 let leases = accept_leases.clone();
                 let control = control.clone();
                 pool.execute(move || {
-                    if let Err(e) =
-                        serve_one(&source, docs.as_ref(), &leases, control.as_ref(), stream)
-                    {
-                        eprintln!("[read] connection failed: {e:#}");
+                    let served =
+                        serve_one(&source, docs.as_ref(), &leases, control.as_ref(), stream);
+                    if let Some(failure) = note_connection(served) {
+                        eprintln!("[read] connection failed: {failure}");
                     }
                 });
             }
@@ -260,6 +260,28 @@ impl ReadService {
 impl Drop for ReadService {
     fn drop(&mut self) {
         self.stop_and_join();
+    }
+}
+
+/// Connections that closed before sending anything, in this process: a
+/// probe, a lease check, a client that gave up. Counted and not logged.
+static EMPTY_CONNECTIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many connections closed before their first frame.
+pub fn empty_connections() -> u64 {
+    EMPTY_CONNECTIONS.load(Ordering::Relaxed)
+}
+
+/// What to log about a finished connection, if anything: a real failure, never
+/// a connection that simply said nothing.
+fn note_connection(served: Result<()>) -> Option<String> {
+    match served {
+        Ok(()) => None,
+        Err(e) if e.is::<NoRequest>() => {
+            EMPTY_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
+            None
+        }
+        Err(e) => Some(format!("{e:#}")),
     }
 }
 
@@ -660,5 +682,38 @@ mod lease_log_tests {
             lease_release_line(7, Duration::from_secs(42), 3).as_deref(),
             Some("[lease] pid 7 held 42s (3 held)")
         );
+    }
+}
+
+#[cfg(test)]
+mod empty_connection_tests {
+    use super::*;
+
+    /// A client that connects and closes without a word (a liveness probe, a
+    /// lease check) is counted and never logged; a real failure still is.
+    #[test]
+    fn a_connection_that_sent_nothing_is_counted_and_not_logged() {
+        let before = empty_connections();
+
+        let silent = note_connection(Err(anyhow::Error::new(NoRequest)));
+        let real = note_connection(Err(anyhow::anyhow!("malformed request frame: eof")));
+        let fine = note_connection(Ok(()));
+
+        assert_eq!(silent, None, "an empty connection is not a failure");
+        assert_eq!(empty_connections(), before + 1);
+        assert_eq!(real.as_deref(), Some("malformed request frame: eof"));
+        assert_eq!(fine, None);
+        assert_eq!(
+            empty_connections(),
+            before + 1,
+            "only the empty one counted"
+        );
+    }
+
+    #[test]
+    fn the_frame_reader_names_an_empty_stream_as_no_request() {
+        let err = read_client_frame(&mut std::io::empty()).unwrap_err();
+        assert!(err.is::<NoRequest>(), "{err:#}");
+        assert_eq!(format!("{err:#}"), "no request");
     }
 }
