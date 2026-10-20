@@ -667,7 +667,7 @@ impl CodeIndex {
     fn wipe_graph(db_path: &Path) -> Result<()> {
         // A wipe must never race a live writer: take the same per-graph lock
         // writers hold. Busy here means a live process -- refuse, don't destroy.
-        let lock_path = db_path.with_extension("lock");
+        let lock_path = crate::graph::db_lock_path(db_path);
         let _lock =
             crate::lockfile::acquire(&lock_path, "graph-wipe", std::time::Duration::from_secs(5))?;
 
@@ -2038,5 +2038,32 @@ mod tests {
         // Confirm it's genuinely usable, not just constructed.
         let backend = prism.backend().unwrap();
         assert!(backend.get_file_hashes().unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod extensioned_db_lock_tests {
+    use super::*;
+
+    /// A wipe must exclude a writer holding the database's own lock. For a
+    /// database with an extension (`x.kuzu`) the lock is `x.kuzu.lock`;
+    /// `with_extension("lock")` named `x.lock`, which nobody holds, so the
+    /// wipe went ahead under a live writer.
+    #[test]
+    fn a_wipe_waits_for_the_lock_of_a_database_with_an_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("x.kuzu");
+        std::fs::write(&db, b"x").unwrap();
+        let _writer = lockfile::acquire(
+            &graph::db_lock_path(&db),
+            "writer",
+            std::time::Duration::from_secs(1),
+        )
+        .unwrap();
+        assert!(
+            CodeIndex::wipe_graph(&db).is_err(),
+            "the wipe took no lock the writer holds"
+        );
+        assert!(db.exists(), "a refused wipe destroys nothing");
     }
 }

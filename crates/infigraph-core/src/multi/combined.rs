@@ -75,18 +75,7 @@ pub fn build_combined_graph(registry: &Registry, group_name: &str) -> Result<Com
     };
 
     let combined_path = combined_graph_path(group_name)?;
-    if combined_path.exists() {
-        if combined_path.is_dir() {
-            std::fs::remove_dir_all(&combined_path)?;
-        } else {
-            std::fs::remove_file(&combined_path)?;
-        }
-    }
-    // Also clean WAL file if present
-    let wal_path = combined_path.with_extension("wal");
-    if wal_path.exists() {
-        let _ = std::fs::remove_file(&wal_path);
-    }
+    clear_db_files(&combined_path);
 
     let combined_store = GraphStore::open(&combined_path)?;
     let _lock = combined_store.write_lock()?;
@@ -1021,12 +1010,21 @@ pub fn open_combined_graph(group_name: &str) -> Result<GraphStore> {
     }
 }
 
+/// Removes a database file or directory and its whole WAL family.
+///
+/// The family is `<file>.wal` and `<file>.wal.*`: `Path::with_extension("wal")`
+/// on an extensioned name ("code.kuzu") computes "code.wal", a file the
+/// database never wrote, and left a stale `code.kuzu.wal` to replay into the
+/// next build.
+fn clear_db_files(path: &Path) {
+    let _ = std::fs::remove_dir_all(path);
+    let _ = std::fs::remove_file(path);
+    crate::graph::store::remove_wal_family(path);
+}
+
 fn wipe_combined_graph(group_name: &str) {
     if let Ok(path) = combined_graph_path(group_name) {
-        let _ = std::fs::remove_dir_all(&path);
-        let _ = std::fs::remove_file(&path);
-        let wal = path.with_extension("wal");
-        let _ = std::fs::remove_file(&wal);
+        clear_db_files(&path);
     }
 }
 
@@ -1633,4 +1631,39 @@ pub fn combined_search_deep(
     }
 
     Ok(out)
+}
+
+#[cfg(test)]
+mod db_files_tests {
+    use super::*;
+
+    /// The combined graph is rebuilt from scratch: a stale WAL left beside a
+    /// database with an extension (`x.kuzu.wal`) replays into the new build
+    /// ("duplicated primary key"). `with_extension("wal")` named `x.wal`.
+    #[test]
+    fn clearing_a_database_with_an_extension_takes_its_wal_family_and_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("combined.kuzu");
+        for name in [
+            "combined.kuzu",
+            "combined.kuzu.wal",
+            "combined.kuzu.wal.checkpoint",
+            "combined.wal",
+            "combined.kuzu.lock",
+        ] {
+            std::fs::write(dir.path().join(name), name).unwrap();
+        }
+        clear_db_files(&db);
+        let mut left: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            ["combined.kuzu.lock", "combined.wal"],
+            "the database and its own WAL family go; other files stay"
+        );
+    }
 }

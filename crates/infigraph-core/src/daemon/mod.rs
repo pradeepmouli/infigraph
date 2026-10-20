@@ -3417,7 +3417,7 @@ fn swap_in_full_reindex(
     // down re-acquires this same lock through `GraphStore`, so holding it
     // any wider would deadlock against ourselves.
     let graph_lock = match crate::lockfile::acquire(
-        &live_path.with_extension("lock"),
+        &crate::graph::db_lock_path(&live_path),
         "full-reindex-swap",
         Duration::from_secs(5),
     ) {
@@ -3745,7 +3745,7 @@ fn recover_or_quarantine_swapped_in_graph_with(
     probe: impl Fn(&Path) -> bool,
 ) -> SwapReopen {
     match crate::lockfile::acquire(
-        &live_path.with_extension("lock"),
+        &crate::graph::db_lock_path(live_path),
         "full-reindex-rollback",
         std::time::Duration::from_secs(5),
     ) {
@@ -5729,5 +5729,39 @@ mod swapped_in_graph_reopen_tests {
             b"the stale prior graph",
             "the prior live graph is back in place"
         );
+    }
+}
+
+#[cfg(test)]
+mod extensioned_swap_lock_tests {
+    use super::*;
+
+    /// The rollback after a failed reopen takes the live graph's lock. For a
+    /// graph with an extension that is `<name>.lock`, not what
+    /// `with_extension("lock")` computed, so a writer holding the real one
+    /// did not stop the rollback.
+    #[test]
+    fn the_rollback_waits_for_the_lock_of_a_graph_with_an_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        let live = dir.path().join("live.kuzu");
+        std::fs::write(&live, b"live").unwrap();
+        let _writer = crate::lockfile::acquire(
+            &crate::graph::db_lock_path(&live),
+            "writer",
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        let outcome = recover_or_quarantine_swapped_in_graph_with(
+            dir.path(),
+            "live.kuzu",
+            &live,
+            &None,
+            |_| false,
+        );
+        assert!(
+            matches!(outcome, SwapReopen::Undecided { .. }),
+            "a held lock must leave the rollback undecided, got {outcome:?}"
+        );
+        assert!(live.exists(), "nothing was quarantined under a live writer");
     }
 }
