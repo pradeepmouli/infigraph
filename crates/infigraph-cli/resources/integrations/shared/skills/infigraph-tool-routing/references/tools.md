@@ -556,6 +556,7 @@ Ingest structured data (YAML/JSON) into the graph using plug-n-play TOML schemas
 | `data_file` | string |  |  | Path to .json or .yaml/.yml data file |
 | `path` | string |  |  | see Common parameters |
 | `schema_id` | string |  |  | Schema ID to use for ingestion |
+| `source` | string |  |  | Directory of data files to ingest in place of data_file or data |
 
 ### `doctor`
 
@@ -586,6 +587,7 @@ Stop a running file watcher started by watch_project.
 | Parameter | Type | Required | Default | Description |
 |---|---|---|---|---|
 | `watcher_id` | string | yes |  | Watcher ID returned by watch_project |
+| `path` | string |  |  | see Common parameters |
 
 ### `restart_watch`
 
@@ -617,6 +619,7 @@ Check the status of running watchers. Shows pending files that need a full reind
 
 | Parameter | Type | Required | Default | Description |
 |---|---|---|---|---|
+| `path` | string |  |  | see Common parameters |
 | `watcher_id` | string |  |  | Specific watcher ID to check (optional — omit to list all) |
 
 
@@ -748,6 +751,7 @@ Stop a running document file watcher.
 | Parameter | Type | Required | Default | Description |
 |---|---|---|---|---|
 | `watcher_id` | string | yes |  |  |
+| `path` | string |  |  | see Common parameters |
 
 ### `restart_watch_docs`
 

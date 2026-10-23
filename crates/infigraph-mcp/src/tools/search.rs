@@ -384,10 +384,7 @@ pub fn tool_search(args: &Value) -> Result<String> {
         .canonicalize()
         .unwrap_or_else(|_| PathBuf::from(path));
     let grep_pattern = if use_regex {
-        args.get("pattern")
-            .and_then(|p| p.as_str())
-            .unwrap_or(query)
-            .to_string()
+        query.to_string()
     } else {
         query
             .chars()

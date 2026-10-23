@@ -537,15 +537,15 @@ pub fn build_tools_list() -> Vec<Value> {
         tool_def("detect_path_traversal", "Multi-layer path traversal detection. Combines intra and inter-procedural taint analysis focused on file path operations. Checks for sanitizers (realpath, canonicalize, secure_filename) across call chains.",
             p(true,false,false,json!({"max_depth":{"type":"integer","default":5,"description":"Max call chain depth for inter-procedural analysis (default: 5)"}})), &["path"]),
         tool_def("ingest_structured", "Ingest structured data (YAML/JSON) into the graph using plug-n-play TOML schemas. Schemas define node tables, columns, edges. Discovers schemas from .infigraph/structured-schemas/ and ~/.infigraph/structured-schemas/. Call without schema_id to list available schemas.",
-            p(true,false,false,json!({"schema_id":{"type":"string","description":"Schema ID to use for ingestion"},"data_file":{"type":"string","description":"Path to .json or .yaml/.yml data file"},"data":{"type":"array","description":"Inline JSON array of records to ingest"}})), &["path"]),
+            p(true,false,false,json!({"schema_id":{"type":"string","description":"Schema ID to use for ingestion"},"data_file":{"type":"string","description":"Path to .json or .yaml/.yml data file"},"data":{"type":"array","description":"Inline JSON array of records to ingest"},"source":{"type":"string","description":"Directory of data files to ingest in place of data_file or data"}})), &["path"]),
         tool_def("semantic_diff", "PRIMARY: Symbol-level diff between git refs. Use INSTEAD OF git diff for understanding what changed. Shows added/removed/moved/signature-changed symbols, not line noise.",
             p(true,false,false,json!({"old_ref":{"type":"string","default":"HEAD~1","description":"Old git ref (commit, branch, tag)"},"new_ref":{"type":"string","default":"HEAD","description":"New git ref (default: HEAD)"}})), &["path"]),
         tool_def("watch_project", "Start a background file watcher that auto-reindexes changed files. Returns immediately with a watcher ID. Detects when changed files have cross-file call edges and warns (or auto-resolves with auto_resolve=true) so call resolution stays accurate. Use get_watch_status to check for pending reindexes.",
             p(true,false,false,json!({"debounce_ms":{"type":"integer","default":500,"description":"Debounce interval in ms before reindexing a changed file"},"auto_resolve":{"type":"boolean","default":false,"description":"If true, automatically runs full index_project when cross-file call edges are affected by a change"}})), &["path"]),
         tool_def("stop_watch", "Stop a running file watcher started by watch_project.",
-            p(false,false,false,json!({"watcher_id":{"type":"string","description":"Watcher ID returned by watch_project"}})), &["watcher_id"]),
+            p(true,false,false,json!({"watcher_id":{"type":"string","description":"Watcher ID returned by watch_project"}})), &["watcher_id"]),
         tool_def("get_watch_status", "Check the status of running watchers. Shows pending files that need a full reindex due to cross-file call edge changes. Omit watcher_id to list all watchers: this worker's own (by ID) plus watcher daemons and CLI watchers in other processes (by PID), and any dead holder that left a stale watch.lock.",
-            p(false,false,false,json!({"watcher_id":{"type":"string","description":"Specific watcher ID to check (optional — omit to list all)"}})), &[]),
+            p(true,false,false,json!({"watcher_id":{"type":"string","description":"Specific watcher ID to check (optional — omit to list all)"}})), &[]),
         tool_def("enable_watch", "Enable code-watching for a project: persists the enabled policy to .infigraph/config.toml and starts a watcher if none is running. Works whether a daemon is running or not.",
             p(true,false,false,json!({})), &["path"]),
         tool_def("disable_watch", "Disable code-watching for a project: persists the disabled policy to .infigraph/config.toml and stops the running watcher, if any. Works whether a daemon is running or not.",
@@ -616,7 +616,7 @@ pub fn build_tools_list() -> Vec<Value> {
         tool_def("watch_docs", "Start background watcher that auto-reindexes changed documents.",
             json!({"path": {"type": "string"}, "debounce_ms": {"type": "integer"}}), &["path"]),
         tool_def("stop_watch_docs", "Stop a running document file watcher.",
-            json!({"watcher_id": {"type": "string"}}), &["watcher_id"]),
+            p(true,false,false,json!({"watcher_id": {"type": "string"}})), &["watcher_id"]),
         tool_def("enable_watch_docs", "Enable doc-watching for a project: persists the enabled policy to .infigraph/config.toml and starts a doc watcher if none is running. Works whether a daemon is running or not.",
             p(true,false,false,json!({})), &["path"]),
         tool_def("disable_watch_docs", "Disable doc-watching for a project: persists the disabled policy to .infigraph/config.toml and stops the running doc watcher, if any. Works whether a daemon is running or not.",
@@ -759,10 +759,22 @@ pub fn handle_tools_list(id: &Value) -> Value {
 pub fn handle_tools_call(id: &Value, request: &Value) -> Value {
     let params = request.get("params").cloned().unwrap_or(Value::Null);
     let tool_name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
-    let args = tools::helpers::scope_to_project(
-        tool_name,
-        params.get("arguments").cloned().unwrap_or(json!({})),
-    );
+    let raw_args = params.get("arguments").cloned().unwrap_or(json!({}));
+    let ignored = match tools::helpers::check_args(tool_name, &raw_args) {
+        Ok(ignored) => ignored,
+        Err(refusal) => {
+            return json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {
+                    "content": [{ "type": "text", "text": format!("Error: {refusal}") }],
+                    "isError": true
+                }
+            });
+        }
+    };
+    let ignored_note = tools::helpers::ignored_args_note(tool_name, &ignored);
+    let args = tools::helpers::scope_to_project(tool_name, raw_args);
 
     tools::helpers::log_activity(tool_name, &args);
     let _serving = lifecycle::SERVING.read().unwrap_or_else(|e| e.into_inner());
@@ -795,6 +807,10 @@ pub fn handle_tools_call(id: &Value, request: &Value) -> Value {
             if let Some(footer) = health::health_footer(tool_name, &args) {
                 compressed.push('\n');
                 compressed.push_str(&footer);
+            }
+            if let Some(note) = &ignored_note {
+                compressed.push('\n');
+                compressed.push_str(note);
             }
             let comp_tokens = estimate_tokens(&compressed);
             let level_used = session_context::get_compression_level();

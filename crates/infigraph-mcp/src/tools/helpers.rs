@@ -70,20 +70,91 @@ pub fn startup_project() -> PathBuf {
 /// project's index.
 pub const EXPLICIT_PATH_TOOLS: &[&str] = &["delete_project"];
 
-/// Whether `tool_name`'s schema takes a `path`, from the advertised tool
-/// list itself so the two cannot drift.
-fn takes_path(tool_name: &str) -> bool {
-    static WITH_PATH: std::sync::OnceLock<std::collections::HashSet<String>> =
+/// Tools whose `path`, when given, is resolved like any other, but which do
+/// something else when it is omitted (they take a `watcher_id`, or list every
+/// watcher), so an omitted one is not defaulted to this server's project.
+pub const OPTIONAL_PATH_TOOLS: &[&str] = &["stop_watch", "stop_watch_docs", "get_watch_status"];
+
+/// Each advertised tool's parameter names, from the advertised tool list
+/// itself so the schemas are the one source of what a tool accepts.
+fn advertised_keys(tool_name: &str) -> Option<&'static Vec<String>> {
+    static KEYS: std::sync::OnceLock<std::collections::HashMap<String, Vec<String>>> =
         std::sync::OnceLock::new();
-    WITH_PATH
-        .get_or_init(|| {
-            crate::build_tools_list()
-                .iter()
-                .filter(|t| t["inputSchema"]["properties"].get("path").is_some())
-                .filter_map(|t| t["name"].as_str().map(str::to_string))
-                .collect()
-        })
-        .contains(tool_name)
+    KEYS.get_or_init(|| {
+        crate::build_tools_list()
+            .iter()
+            .filter_map(|t| {
+                let keys = t["inputSchema"]["properties"]
+                    .as_object()?
+                    .keys()
+                    .cloned()
+                    .collect();
+                Some((t["name"].as_str()?.to_string(), keys))
+            })
+            .collect()
+    })
+    .get(tool_name)
+}
+
+/// Whether `tool_name`'s schema takes a `path`.
+fn takes_path(tool_name: &str) -> bool {
+    advertised_keys(tool_name).is_some_and(|k| k.iter().any(|k| k == "path"))
+}
+
+/// Keys the dispatcher itself reads for every tool (compression bypass,
+/// focus tracking), so no schema need list them.
+pub const DISPATCH_KEYS: &[&str] = &["detail", "for_edit"];
+
+/// Names agents send for the project a call is about, when the parameter is
+/// `path`. With no `path` beside them the call would silently be answered
+/// from the server's own project.
+const PATH_NEAR_MISSES: &[&str] = &["project", "root", "repo", "cwd", "dir", "project_path"];
+
+/// Checks a call's arguments against its tool's advertised schema. `Err` is
+/// a near-miss of `path` with no `path` (the call must not run: it would
+/// answer about the wrong project); `Ok` lists the other keys the tool will
+/// ignore. A tool the list does not know is left to the dispatcher.
+pub fn check_args(tool_name: &str, args: &Value) -> Result<Vec<String>, String> {
+    let (Some(valid), Some(given)) = (advertised_keys(tool_name), args.as_object()) else {
+        return Ok(Vec::new());
+    };
+    let listed = |k: &str| valid.iter().any(|v| v == k) || DISPATCH_KEYS.contains(&k);
+    let mut unknown: Vec<String> = given.keys().filter(|k| !listed(k)).cloned().collect();
+    unknown.sort();
+    let valid_list = || {
+        let mut v: Vec<&str> = valid.iter().map(String::as_str).collect();
+        v.sort();
+        v.join(", ")
+    };
+    if takes_path(tool_name) && !given.contains_key("path") {
+        if let Some(key) = unknown
+            .iter()
+            .find(|k| PATH_NEAR_MISSES.contains(&k.as_str()))
+        {
+            return Err(format!(
+                "unknown argument `{key}` for `{tool_name}`; did you mean `path`? \
+                 Valid arguments: {}",
+                valid_list()
+            ));
+        }
+    }
+    Ok(unknown)
+}
+
+/// The footer line for the keys `check_args` reported as ignored.
+pub fn ignored_args_note(tool_name: &str, ignored: &[String]) -> Option<String> {
+    if ignored.is_empty() {
+        return None;
+    }
+    let valid = advertised_keys(tool_name).map_or_else(String::new, |v| {
+        let mut v: Vec<&str> = v.iter().map(String::as_str).collect();
+        v.sort();
+        v.join(", ")
+    });
+    Some(format!(
+        "⚠ ignored unknown argument(s) for `{tool_name}`: {}. Valid arguments: {valid}",
+        ignored.join(", ")
+    ))
 }
 
 /// Scope a tool call to its project, once, before anything acts on it
@@ -100,6 +171,7 @@ pub fn scope_to_project(tool_name: &str, mut args: Value) -> Value {
     }
     let resolved = match args.get("path").and_then(|p| p.as_str()) {
         Some(path) => resolve_project_path(path),
+        None if OPTIONAL_PATH_TOOLS.contains(&tool_name) => return args,
         None => startup_project().to_string_lossy().to_string(),
     };
     if args.is_null() {
