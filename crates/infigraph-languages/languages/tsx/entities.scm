@@ -8,6 +8,10 @@
 (class_declaration
   name: (type_identifier) @class.name) @class.def
 
+; Abstract class declarations (tree-sitter-typescript's own node kind)
+(abstract_class_declaration
+  name: (type_identifier) @class.name) @class.def
+
 ; Interface declarations
 (interface_declaration
   name: (type_identifier) @class.name) @class.def
