@@ -1132,3 +1132,62 @@ fn typescript_properties_are_owned_symbols_of_kind_variable() {
         assert!(has(&ids, &format!("{file}::f::alsoSkipped")), "{ids:?}");
     }
 }
+
+const LOCALS_SRC: &str = r#"
+const top = 1;
+function f() { const x = 1; return x; }
+function g() { const x = 2; return x; }
+function h(flag: boolean) {
+  if (flag) { const x = 1; return x; }
+  const x = 2;
+  return x;
+}
+class C {
+  m() { const local = 1; return local; }
+}
+const run = () => { const t = 1; return t; };
+function process(items: number[]) {
+  return items.map((i) => { const doubled = i * 2; return doubled; });
+}
+"#;
+
+#[test]
+fn a_local_variable_is_owned_by_its_enclosing_function() {
+    let ids = ts_ids("l.ts", LOCALS_SRC);
+    for want in [
+        "l.ts::top",
+        "l.ts::f::x",
+        "l.ts::g::x",
+        "l.ts::C::m::local",
+        "l.ts::run::t",
+        "l.ts::process::doubled",
+    ] {
+        assert!(has(&ids, want), "{want} not in {ids:?}");
+    }
+    assert!(
+        !has(&ids, "l.ts::x") && !has(&ids, "l.ts::x#1"),
+        "no bare `x` left: {ids:?}"
+    );
+}
+
+#[test]
+fn two_locals_of_one_name_in_one_function_still_disambiguate() {
+    let ids = ts_ids("l.ts", LOCALS_SRC);
+    assert!(
+        has(&ids, "l.ts::h::x#1") && has(&ids, "l.ts::h::x#2"),
+        "{ids:?}"
+    );
+    assert!(!has(&ids, "l.ts::f::x#1"), "a lone local gets no ordinal");
+}
+
+#[test]
+fn a_locals_id_does_not_depend_on_where_the_function_is() {
+    let before = ts_ids("l.ts", LOCALS_SRC);
+    let after = ts_ids("l.ts", &format!("// a\n// b\n\n\n{LOCALS_SRC}"));
+    let sorted = |v: &[(String, SymbolKind)]| {
+        let mut ids: Vec<String> = v.iter().map(|(i, _)| i.clone()).collect();
+        ids.sort();
+        ids
+    };
+    assert_eq!(sorted(&before), sorted(&after));
+}

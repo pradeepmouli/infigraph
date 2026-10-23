@@ -18,7 +18,10 @@
 //!    member is `file::Const::key`, or `file::key#N` when no name binds its
 //!    literal; no parameter or type parameter is a symbol.
 //! 2: a TypeScript `abstract class` is a class symbol and owns its members
-//!    (`file::Base::name`, not a bare `file::name` or `#N`).
+//!    (`file::Base::name`, not a bare `file::name` or `#N`); an interface,
+//!    type-literal or class property is a tree-sitter symbol `file::Owner::name`
+//!    (through nested literals, as scip-typescript names it); a local variable
+//!    is `file::fn::name`, owned by its nearest enclosing named function.
 
 use std::path::Path;
 

@@ -190,13 +190,9 @@ pub(super) fn ts_member_owner(node: Node, source: &[u8]) -> Option<String> {
                         })
                         .and_then(name_of)
                 });
-                // a type literal in a return type is owned by the function;
-                // a variable inside one is not owned by it yet
-                name.filter(|_| in_type_literal).map(|name| {
-                    match find_parent_class(n, source, None) {
-                        Some(class) => format!("{class}::{name}"),
-                        None => name,
-                    }
+                name.map(|name| match find_parent_class(n, source, None) {
+                    Some(class) => format!("{class}::{name}"),
+                    None => name,
                 })
             }
             _ => None,
