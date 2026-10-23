@@ -92,3 +92,15 @@ fn path_is_optional_in_every_schema_but_delete_projects() {
         );
     }
 }
+
+#[test]
+fn a_watch_tool_keeps_its_omitted_path_omitted_and_resolves_a_given_one() {
+    // `watcher_id` or "list every watcher" is what no `path` means for these.
+    for tool in ["stop_watch", "stop_watch_docs", "get_watch_status"] {
+        let args = scope_to_project(tool, json!({"watcher_id": "w1"}));
+        assert!(path_of(&args).is_none(), "{tool}: {args}");
+    }
+    let (_dir, root, sub) = project_with_subdir();
+    let args = scope_to_project("get_watch_status", json!({"path": sub}));
+    assert_eq!(path_of(&args), Some(root.to_str().unwrap()));
+}
