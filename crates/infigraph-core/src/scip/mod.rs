@@ -1976,7 +1976,9 @@ fn scip_kind_to_prism(kind: &symbol_information::Kind) -> SymbolKind {
         Trait | TypeClass => SymbolKind::Trait,
         Enum | EnumMember => SymbolKind::Enum,
         Module | Namespace | Package => SymbolKind::Module,
-        Variable | StaticVariable | Field | SelfParameter | Parameter => SymbolKind::Variable,
+        Variable | StaticVariable | Field | Property | SelfParameter | Parameter => {
+            SymbolKind::Variable
+        }
         Constant => SymbolKind::Constant,
         _ => SymbolKind::Function,
     }
@@ -2423,6 +2425,18 @@ mod prefilter_tests {
 mod tests {
     use super::*;
     use scip::types::{Document, Occurrence, Relationship, SymbolInformation};
+
+    #[test]
+    fn a_scip_property_is_a_variable_like_a_field() {
+        assert_eq!(
+            scip_kind_to_prism(&symbol_information::Kind::Property),
+            SymbolKind::Variable
+        );
+        assert_eq!(
+            scip_kind_to_prism(&symbol_information::Kind::Field),
+            SymbolKind::Variable
+        );
+    }
 
     #[test]
     fn an_unchanged_scip_is_redundant_only_while_the_graph_keeps_that_generation() {
