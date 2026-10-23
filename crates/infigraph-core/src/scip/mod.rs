@@ -1913,6 +1913,30 @@ fn scip_owner_chain(scip_sym: &str) -> Vec<String> {
     chain
 }
 
+/// The id the import gives each definition of `relative_path` in a SCIP index
+/// that it would make a symbol of, for a test to hold against what tree-sitter
+/// extracts from the same file: a member both find must read the same, or the
+/// import makes a second symbol instead of enriching the first.
+#[doc(hidden)]
+pub fn definition_ids(index_bytes: &[u8], relative_path: &str) -> Result<Vec<String>> {
+    let index = Index::parse_from_bytes(index_bytes).context("not a SCIP index")?;
+    let Some(doc) = index
+        .documents
+        .iter()
+        .find(|d| d.relative_path == relative_path)
+    else {
+        return Ok(Vec::new());
+    };
+    Ok(doc
+        .occurrences
+        .iter()
+        .filter(|o| (o.symbol_roles & SymbolRole::Definition as i32) != 0)
+        .filter(|o| !o.symbol.starts_with("local ") && !o.symbol.starts_with('<'))
+        .filter(|o| !is_parameter_symbol(&o.symbol))
+        .map(|o| scip_symbol_id(relative_path, &o.symbol, &scip_sym_to_name(&o.symbol)))
+        .collect())
+}
+
 /// The id of a symbol only SCIP knows: `file::Owner::...::name`, the shape
 /// tree-sitter gives a method (`entities.rs`), so one member of a type reads
 /// the same whichever indexer found it. No owner, `file::name`.

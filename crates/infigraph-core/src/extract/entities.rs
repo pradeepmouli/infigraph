@@ -1,7 +1,7 @@
 use sha2::{Digest, Sha256};
 use tree_sitter::{Node, Query, QueryCursor, StreamingIterator};
 
-use super::{find_parent_class, node_text, resolve_compound_node_text};
+use super::{find_parent_class, node_text, resolve_compound_node_text, ts_member_owner};
 use crate::analysis::cyclomatic_complexity;
 use crate::model::{Span, Symbol, SymbolKind};
 
@@ -61,6 +61,8 @@ pub fn extract_entities(
         let mut route_handler: Option<String> = None;
         let mut route_def_node: Option<Node> = None;
         let mut parent_capture: Option<Node> = None;
+        // `@field.def`: a symbol only when something owns it.
+        let mut owned_only = false;
         let mut method_name_at: Option<(u32, u32)> = None;
         members.add(m.captures, capture_names, source);
 
@@ -171,6 +173,19 @@ pub fn extract_entities(
                         kind = Some(SymbolKind::Variable);
                     }
                 }
+                "field.name" => {
+                    name_text = Some(node_text(node, source));
+                    if kind.is_none() {
+                        kind = Some(SymbolKind::Variable);
+                    }
+                }
+                "field.def" => {
+                    def_node = Some(node);
+                    owned_only = true;
+                    if kind.is_none() {
+                        kind = Some(SymbolKind::Variable);
+                    }
+                }
                 "section.name" => {
                     name_text = Some(node_text(node, source));
                     if kind.is_none() {
@@ -233,9 +248,19 @@ pub fn extract_entities(
             // Prefer an explicit @method.parent/@func.parent capture (needed when a
             // grammar's enclosing node has no generic "name" field to walk up to,
             // e.g. Rust's impl_item) over the generic ancestor walk.
+            let in_typescript = matches!(language, "typescript" | "tsx");
             let parent_class = parent_capture
                 .map(|n| resolve_compound_node_text(n, source, decompose_query))
-                .or_else(|| find_parent_class(node, source, decompose_query));
+                .or_else(|| {
+                    if in_typescript && matches!(sym_kind, SymbolKind::Variable) {
+                        ts_member_owner(node, source)
+                    } else {
+                        find_parent_class(node, source, decompose_query)
+                    }
+                });
+            if owned_only && parent_class.is_none() {
+                continue;
+            }
             let id = if let Some(ref cls) = parent_class {
                 format!("{}::{}::{}", file, cls, name)
             } else {

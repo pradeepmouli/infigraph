@@ -1066,3 +1066,69 @@ fn an_abstract_class_is_a_class_symbol() {
     let base = ext.symbols.iter().find(|s| s.name == "Base").unwrap();
     assert_eq!(base.kind, SymbolKind::Class);
 }
+
+// ---- TypeScript: properties and function-local variables are owned ----
+
+fn ts_ids(file: &str, src: &str) -> Vec<(String, SymbolKind)> {
+    let registry = infigraph_languages::bundled_registry().unwrap();
+    let ext = if file.ends_with(".tsx") {
+        ".tsx"
+    } else {
+        ".ts"
+    };
+    let pack = registry.for_extension(ext).unwrap();
+    let ext = extract_file(file, src.as_bytes(), pack).unwrap();
+    ext.symbols.into_iter().map(|s| (s.id, s.kind)).collect()
+}
+
+fn has(ids: &[(String, SymbolKind)], id: &str) -> bool {
+    ids.iter().any(|(i, _)| i == id)
+}
+
+const PROPERTIES_SRC: &str = r#"
+export interface EmitConfig {
+  strict?: boolean;
+  generatedIdTables: string;
+  nested: { inner: number; optInner?: string };
+}
+interface SerializedBase { factoryShape: string; unresolved?: boolean }
+export type Lit = { k: string; m?: number };
+export namespace NS { export interface InNs { p: number } }
+export class Holder { prop = 1; typed: { a: number } = { a: 1 }; }
+export const table: { rows: number } = { rows: 1 };
+export function f(opts: { skipped: number }): { alsoSkipped: number } { return { alsoSkipped: 1 }; }
+"#;
+
+#[test]
+fn typescript_properties_are_owned_symbols_of_kind_variable() {
+    for file in ["p.ts", "p.tsx"] {
+        let ids = ts_ids(file, PROPERTIES_SRC);
+        for want in [
+            "EmitConfig::strict",
+            "EmitConfig::generatedIdTables",
+            "EmitConfig::nested",
+            "EmitConfig::nested::inner",
+            "EmitConfig::nested::optInner",
+            "SerializedBase::factoryShape",
+            "SerializedBase::unresolved",
+            "Lit::k",
+            "Lit::m",
+            "InNs::p",
+            "Holder::prop",
+            "Holder::typed",
+            "Holder::typed::a",
+            "table::rows",
+        ] {
+            let id = format!("{file}::{want}");
+            let kind = ids.iter().find(|(i, _)| *i == id).map(|(_, k)| k.clone());
+            assert_eq!(kind, Some(SymbolKind::Variable), "{id} in {ids:?}");
+        }
+        // A parameter's inline literal is no symbol, as for SCIP
+        // (`is_parameter_symbol`); a return type's is owned by the function.
+        assert!(
+            ids.iter().all(|(i, _)| !i.ends_with("::skipped")),
+            "a parameter's literal is no symbol: {ids:?}"
+        );
+        assert!(has(&ids, &format!("{file}::f::alsoSkipped")), "{ids:?}");
+    }
+}
