@@ -397,10 +397,9 @@ fn find_field_type_in_enclosing_class(
     source: &[u8],
     field_name: &str,
 ) -> Option<String> {
-    let class_kinds = ["class_specifier", "struct_specifier", "class_declaration"];
     let mut current = node.parent();
     while let Some(n) = current {
-        if class_kinds.contains(&n.kind()) {
+        if super::CLASS_KINDS.contains(&n.kind()) {
             if let Some(body) = n.child_by_field_name("body") {
                 let mut cursor = body.walk();
                 for child in body.children(&mut cursor) {

@@ -33,6 +33,20 @@ pub(super) fn find_qualified_identifier(node: Node) -> Option<Node> {
         .and_then(find_qualified_identifier)
 }
 
+/// Node kinds that own the members declared inside them. The one list: the
+/// owner walk and the field-type lookup in `relations` both ask it.
+pub(super) const CLASS_KINDS: &[&str] = &[
+    "class_definition",           // Python
+    "class_declaration",          // Java, TS, JS, C#, Kotlin, Swift
+    "abstract_class_declaration", // TS, TSX
+    "class",                      // Ruby
+    "class_specifier",            // C/C++
+    "struct_specifier",           // C/C++ struct
+    "impl_item",                  // Rust
+    "struct_item",                // Rust
+    "defmodule",                  // Elixir
+];
+
 /// Walk up the AST to find the enclosing class/impl/namespace and return its name.
 ///
 /// Consolidated from what used to be two independently-drifted copies
@@ -45,16 +59,6 @@ pub(super) fn find_parent_class(
     source: &[u8],
     decompose_query: Option<&Query>,
 ) -> Option<String> {
-    const CLASS_KINDS: &[&str] = &[
-        "class_definition",  // Python
-        "class_declaration", // Java, TS, JS, C#, Kotlin, Swift
-        "class",             // Ruby
-        "class_specifier",   // C/C++
-        "struct_specifier",  // C/C++ struct
-        "impl_item",         // Rust
-        "struct_item",       // Rust
-        "defmodule",         // Elixir
-    ];
     let mut current = node.parent();
     while let Some(n) = current {
         // Rust's impl_item has no "name" field (only body/trait/type/type_parameters —

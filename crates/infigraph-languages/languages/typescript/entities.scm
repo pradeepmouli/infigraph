@@ -18,6 +18,10 @@
 (method_definition
   name: (property_identifier) @method.name) @method.def
 
+; Abstract class declarations (tree-sitter-typescript's own node kind)
+(abstract_class_declaration
+  name: (type_identifier) @class.name) @class.def
+
 ; Interface declarations
 (interface_declaration
   name: (type_identifier) @class.name) @class.def

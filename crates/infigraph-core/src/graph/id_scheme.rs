@@ -17,6 +17,8 @@
 //! 1: a member only SCIP finds is `file::Owner::...::name`; an object-literal
 //!    member is `file::Const::key`, or `file::key#N` when no name binds its
 //!    literal; no parameter or type parameter is a symbol.
+//! 2: a TypeScript `abstract class` is a class symbol and owns its members
+//!    (`file::Base::name`, not a bare `file::name` or `#N`).
 
 use std::path::Path;
 
@@ -25,7 +27,7 @@ use super::query_exec::{LocalExec, QueryExec};
 use super::GraphStore;
 
 /// The scheme this binary writes.
-pub const ID_SCHEME: i64 = 1;
+pub const ID_SCHEME: i64 = 2;
 
 /// The scheme a graph is stamped with: 0 for one that predates the stamp (the
 /// row missing or NULL reads as 0). `None` when the query itself failed: that is
@@ -169,6 +171,17 @@ mod tests {
             Some(true),
             "reopening must not claim the old ids as new"
         );
+    }
+
+    #[test]
+    fn a_graph_written_before_abstract_class_members_were_owned_is_rebuilt_once() {
+        // Scheme 1 named an abstract class's members bare; scheme 2 owns them.
+        let (_dir, store) = store();
+        add_symbol(&store);
+        set_scheme(&store, 1);
+        assert_eq!(outdated_in(&store), Some(true));
+        set_scheme(&store, ID_SCHEME);
+        assert_eq!(outdated_in(&store), Some(false), "stamped once rebuilt");
     }
 
     #[test]

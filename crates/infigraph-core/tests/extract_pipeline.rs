@@ -1010,3 +1010,59 @@ namespace tps
         .expect("SetFormML symbol not extracted");
     assert_eq!(set_form_ml.id, "zhaSetFormML.cpp::tps::SetFormML");
 }
+
+/// tree-sitter-typescript's node for `abstract class` is
+/// `abstract_class_declaration`, not `class_declaration`: it was neither a
+/// symbol nor an owner, so its members had bare ids or collided as `#N`.
+const ABSTRACT_CLASS_SRC: &[u8] = br#"
+export abstract class Base {
+    abstract run(): void;
+    get label(): string { return "x"; }
+    describe(): string { return "base"; }
+    kind = 1;
+}
+
+export class Concrete {
+    describe(): string { return "concrete"; }
+}
+"#;
+
+fn ids_of(ext: &infigraph_core::model::FileExtraction) -> Vec<String> {
+    ext.symbols.iter().map(|s| s.id.clone()).collect()
+}
+
+#[test]
+fn members_of_a_typescript_abstract_class_are_owned_by_it() {
+    for (file, extension) in [("node-map.ts", ".ts"), ("node-map.tsx", ".tsx")] {
+        let registry = infigraph_languages::bundled_registry().unwrap();
+        let pack = registry.for_extension(extension).unwrap();
+        let ext = extract_file(file, ABSTRACT_CLASS_SRC, pack).unwrap();
+        let ids = ids_of(&ext);
+
+        for want in [
+            format!("{file}::Base"),
+            format!("{file}::Base::label"),
+            format!("{file}::Base::describe"),
+            format!("{file}::Concrete::describe"),
+        ] {
+            assert!(ids.contains(&want), "{extension}: {want} not in {ids:?}");
+        }
+        assert!(
+            ids.iter().all(|id| !id.contains('#')),
+            "{extension}: a same-named method in another class must not make `#N` ids: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&format!("{file}::describe")) && !ids.contains(&format!("{file}::label")),
+            "{extension}: no bare member ids: {ids:?}"
+        );
+    }
+}
+
+#[test]
+fn an_abstract_class_is_a_class_symbol() {
+    let registry = infigraph_languages::bundled_registry().unwrap();
+    let pack = registry.for_extension(".ts").unwrap();
+    let ext = extract_file("a.ts", ABSTRACT_CLASS_SRC, pack).unwrap();
+    let base = ext.symbols.iter().find(|s| s.name == "Base").unwrap();
+    assert_eq!(base.kind, SymbolKind::Class);
+}
