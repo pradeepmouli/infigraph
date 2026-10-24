@@ -1053,3 +1053,54 @@ fn self_call_resolves_to_the_method_on_its_own_type_not_a_same_named_sibling() {
         beta_callees
     );
 }
+
+/// What a function calls, as the ids the graph holds.
+fn callees_of(env: &TestEnv, id: &str) -> Vec<String> {
+    let conn = env.store.connection().unwrap();
+    infigraph_core::graph::GraphQuery::new(&conn)
+        .callees_of(id)
+        .unwrap()
+        .iter()
+        .map(|c| format!("{c:?}"))
+        .collect()
+}
+
+#[test]
+fn an_unqualified_call_reaches_the_local_function_variable_of_its_own_function_only() {
+    // `read(1)` calls the `const read = load()` beside it. A method call that
+    // merely shares a name with another function's local (`spans.slice(…)`
+    // against `fourth`'s `const slice`) is no call to it. Locals are owned by
+    // their function (`outer::read`), so neither is found by the bare name any
+    // more: the first is resolved by scope, the second stays unresolved.
+    let src = br#"
+function outer() { const read = load(); return read(1); }
+function third(spans: any) { return spans.slice(1); }
+function fourth() { const slice = 1; return slice; }
+"#;
+    let registry = bundled_registry().unwrap();
+    let pack = registry.for_extension(".ts").unwrap();
+    let extraction = extract_file("a.ts", src, pack).unwrap();
+    assert!(
+        extraction
+            .symbols
+            .iter()
+            .any(|s| s.id == "a.ts::outer::read"),
+        "{:?}",
+        extraction.symbols.iter().map(|s| &s.id).collect::<Vec<_>>()
+    );
+    let extractions = vec![extraction];
+
+    let env = TestEnv::new(&extractions);
+    resolve::resolve_calls(&env.store, &extractions, None).unwrap();
+
+    let from_outer = callees_of(&env, "a.ts::outer");
+    assert!(
+        from_outer.iter().any(|c| c.contains("a.ts::outer::read")),
+        "outer calls its own local: {from_outer:?}"
+    );
+    let from_third = callees_of(&env, "a.ts::third");
+    assert!(
+        !from_third.iter().any(|c| c.contains("slice")),
+        "a method call is no call to another function's local: {from_third:?}"
+    );
+}

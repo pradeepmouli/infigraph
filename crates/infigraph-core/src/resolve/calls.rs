@@ -374,6 +374,17 @@ pub(crate) fn resolve_pairs(
                     .push(s.id.as_str());
             }
 
+            // The variables a function owns (`outer::read` for `const read = …`
+            // inside `outer`): a language that owns its locals names them by
+            // scope, so a call is matched to one by the caller's id, never by
+            // the bare name that another function's local may share.
+            let local_variables: std::collections::HashSet<&str> = ext
+                .symbols
+                .iter()
+                .filter(|s| s.kind == crate::model::SymbolKind::Variable)
+                .map(|s| s.id.as_str())
+                .collect();
+
             let imported_stems: std::collections::HashSet<String> = ext
                 .relations
                 .iter()
@@ -419,6 +430,20 @@ pub(crate) fn resolve_pairs(
                 }
 
                 let target_name = rel.target_id.rsplit("::").next().unwrap_or(&rel.target_id);
+
+                // `read(1)` after `const read = load()` in the same function:
+                // a call to that function's own local, which shadows anything
+                // else of the name. Only an unqualified call can be one --
+                // `spans.slice(…)` is a method of `spans`, whatever a local of
+                // another function is called.
+                if rel.receiver.is_none() {
+                    let local = format!("{}::{target_name}", rel.source_id);
+                    if local_variables.contains(local.as_str()) {
+                        res.pairs.push((rel.source_id.clone(), local));
+                        res.resolved += 1;
+                        continue;
+                    }
+                }
 
                 // Same-class fast path only applies when the call is unqualified
                 // (`method()`) or explicitly self-referential (`this.method()`,
