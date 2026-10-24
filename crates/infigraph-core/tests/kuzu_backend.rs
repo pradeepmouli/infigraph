@@ -684,3 +684,44 @@ fn test_backend_distinct_languages_lists_each_module_language_once() {
     languages.sort();
     assert_eq!(languages, vec!["python".to_string(), "rust".to_string()]);
 }
+
+#[test]
+fn test_typescript_properties_are_never_dead_code() {
+    // Properties used to be made only by SCIP, as kind Function, so every one
+    // that nothing "called" was listed as dead code.
+    let src = b"export interface Cfg { strict?: boolean; nested: { inner: number } }\n\
+                export class Holder { prop = 1; }\n";
+    let registry = infigraph_languages::bundled_registry().unwrap();
+    let pack = registry.for_extension(".ts").unwrap();
+    let extraction = infigraph_core::extract::extract_file("a.ts", src, pack).unwrap();
+    assert!(
+        extraction
+            .symbols
+            .iter()
+            .any(|s| s.id == "a.ts::Cfg::nested::inner"),
+        "the fixture has a property: {:?}",
+        extraction.symbols.iter().map(|s| &s.id).collect::<Vec<_>>()
+    );
+
+    let (_dir, backend) = make_backend();
+    backend
+        .upsert_files_bulk(&[extraction], true)
+        .expect("bulk");
+    let dead: Vec<String> = backend
+        .find_uncalled_symbols()
+        .expect("query")
+        .into_iter()
+        .map(|r| r.id)
+        .collect();
+    for property in [
+        "Cfg::strict",
+        "Cfg::nested",
+        "Cfg::nested::inner",
+        "Holder::prop",
+    ] {
+        assert!(
+            !dead.contains(&format!("a.ts::{property}")),
+            "{property} is a property, not a function: {dead:?}"
+        );
+    }
+}

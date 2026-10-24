@@ -168,6 +168,15 @@ pub fn ensure_daemon_for_routed_access(root: &Path) -> anyhow::Result<()> {
 /// an explicit local backend: since #159 an *unset* `INFIGRAPH_BACKEND` is
 /// the daemon backend, so "unset it to work locally" is wrong advice.
 pub fn no_daemon_came_up(root: &Path, consequence: &str) -> anyhow::Error {
+    let unindexed_worktree = crate::project::is_linked_worktree_root(root)
+        && !crate::graph::names::store_present(&root.join(".infigraph"));
+    if unindexed_worktree {
+        return anyhow::anyhow!(
+            "{} is a linked worktree with no index of its own, so {consequence}. Run \
+             `infigraph worktree init` there (it never reads the checkout's graph).",
+            root.display()
+        );
+    }
     anyhow::anyhow!(
         "no daemon came up for {} (auto-start attempted), and {consequence}. Check \
          `infigraph ps` / the daemon log, start one with `infigraph daemon`, or set {}={} \
@@ -370,7 +379,14 @@ fn start_or_find_daemon(root: &Path, watch_binary: &Path) -> DaemonStartOutcome 
     }
 
     let tg_dir = root.join(".infigraph");
-    if !tg_dir.exists() {
+    // A linked worktree whose code store is gone (reclaimed by `worktree
+    // clean`, never made) is not indexed, however much else its `.infigraph/`
+    // holds: a read must not start a daemon there that would make an empty
+    // graph. `infigraph worktree init` / `index` makes the store.
+    if !tg_dir.exists()
+        || (crate::project::is_linked_worktree_root(&canonical)
+            && !crate::graph::names::store_present(&tg_dir))
+    {
         // Not yet indexed (e.g. the very first `infigraph index` on a fresh
         // project, called before `.infigraph` is created). This is an
         // expected precondition-not-met state, not a failure — treat it the

@@ -1226,6 +1226,10 @@ fn check_one_project_degraded(project_path: &Path) -> Vec<CheckResult> {
     let warnings: Vec<CheckResult> = degraded::gather(project_path)
         .into_iter()
         .filter(|n| !from_file_times.contains(n))
+        // A worktree `worktree clean` reclaimed has no index on purpose and
+        // can be bootstrapped again: not a fault to sweep for. The mode is
+        // for the reads that would otherwise land in it.
+        .filter(|n| n.key != DegradedMode::WorktreeHasNoIndex.key())
         .map(|n| {
             CheckResult::warn(
                 DEGRADED_CATEGORY,

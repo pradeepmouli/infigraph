@@ -1066,3 +1066,156 @@ fn an_abstract_class_is_a_class_symbol() {
     let base = ext.symbols.iter().find(|s| s.name == "Base").unwrap();
     assert_eq!(base.kind, SymbolKind::Class);
 }
+
+// ---- TypeScript: properties and function-local variables are owned ----
+
+fn ts_ids(file: &str, src: &str) -> Vec<(String, SymbolKind)> {
+    let registry = infigraph_languages::bundled_registry().unwrap();
+    let ext = if file.ends_with(".tsx") {
+        ".tsx"
+    } else {
+        ".ts"
+    };
+    let pack = registry.for_extension(ext).unwrap();
+    let ext = extract_file(file, src.as_bytes(), pack).unwrap();
+    ext.symbols.into_iter().map(|s| (s.id, s.kind)).collect()
+}
+
+fn has(ids: &[(String, SymbolKind)], id: &str) -> bool {
+    ids.iter().any(|(i, _)| i == id)
+}
+
+const PROPERTIES_SRC: &str = r#"
+export interface EmitConfig {
+  strict?: boolean;
+  generatedIdTables: string;
+  nested: { inner: number; optInner?: string };
+}
+interface SerializedBase { factoryShape: string; unresolved?: boolean }
+export type Lit = { k: string; m?: number };
+export namespace NS { export interface InNs { p: number } }
+export class Holder { prop = 1; typed: { a: number } = { a: 1 }; }
+export const table: { rows: number } = { rows: 1 };
+export function f(opts: { skipped: number }): { alsoSkipped: number } { return { alsoSkipped: 1 }; }
+"#;
+
+#[test]
+fn typescript_properties_are_owned_symbols_of_kind_variable() {
+    for file in ["p.ts", "p.tsx"] {
+        let ids = ts_ids(file, PROPERTIES_SRC);
+        for want in [
+            "EmitConfig::strict",
+            "EmitConfig::generatedIdTables",
+            "EmitConfig::nested",
+            "EmitConfig::nested::inner",
+            "EmitConfig::nested::optInner",
+            "SerializedBase::factoryShape",
+            "SerializedBase::unresolved",
+            "Lit::k",
+            "Lit::m",
+            "InNs::p",
+            "Holder::prop",
+            "Holder::typed",
+            "Holder::typed::a",
+            "table::rows",
+        ] {
+            let id = format!("{file}::{want}");
+            let kind = ids.iter().find(|(i, _)| *i == id).map(|(_, k)| k.clone());
+            assert_eq!(kind, Some(SymbolKind::Variable), "{id} in {ids:?}");
+        }
+        // A parameter's inline literal is no symbol, as for SCIP
+        // (`is_parameter_symbol`); a return type's is owned by the function.
+        assert!(
+            ids.iter().all(|(i, _)| !i.ends_with("::skipped")),
+            "a parameter's literal is no symbol: {ids:?}"
+        );
+        assert!(has(&ids, &format!("{file}::f::alsoSkipped")), "{ids:?}");
+    }
+}
+
+const LOCALS_SRC: &str = r#"
+const top = 1;
+function f() { const x = 1; return x; }
+function g() { const x = 2; return x; }
+function h(flag: boolean) {
+  if (flag) { const x = 1; return x; }
+  const x = 2;
+  return x;
+}
+class C {
+  m() { const local = 1; return local; }
+}
+const run = () => { const t = 1; return t; };
+function process(items: number[]) {
+  return items.map((i) => { const doubled = i * 2; return doubled; });
+}
+"#;
+
+#[test]
+fn a_local_variable_is_owned_by_its_enclosing_function() {
+    let ids = ts_ids("l.ts", LOCALS_SRC);
+    for want in [
+        "l.ts::top",
+        "l.ts::f::x",
+        "l.ts::g::x",
+        "l.ts::C::m::local",
+        "l.ts::run::t",
+        "l.ts::process::doubled",
+    ] {
+        assert!(has(&ids, want), "{want} not in {ids:?}");
+    }
+    assert!(
+        !has(&ids, "l.ts::x") && !has(&ids, "l.ts::x#1"),
+        "no bare `x` left: {ids:?}"
+    );
+}
+
+#[test]
+fn two_locals_of_one_name_in_one_function_still_disambiguate() {
+    let ids = ts_ids("l.ts", LOCALS_SRC);
+    assert!(
+        has(&ids, "l.ts::h::x#1") && has(&ids, "l.ts::h::x#2"),
+        "{ids:?}"
+    );
+    assert!(!has(&ids, "l.ts::f::x#1"), "a lone local gets no ordinal");
+}
+
+#[test]
+fn a_locals_id_does_not_depend_on_where_the_function_is() {
+    let before = ts_ids("l.ts", LOCALS_SRC);
+    let after = ts_ids("l.ts", &format!("// a\n// b\n\n\n{LOCALS_SRC}"));
+    let sorted = |v: &[(String, SymbolKind)]| {
+        let mut ids: Vec<String> = v.iter().map(|(i, _)| i.clone()).collect();
+        ids.sort();
+        ids
+    };
+    assert_eq!(sorted(&before), sorted(&after));
+}
+
+#[test]
+fn a_function_valued_local_is_one_symbol_with_the_id_it_always_had() {
+    // `const helper = () => …` is captured as a function and as a variable
+    // declarator; the two are one symbol only while they share an id, and the
+    // merged symbol has always been a Variable (as at module level).
+    for (file, src, want) in [
+        (
+            "h.ts",
+            "function outer() { const helper = () => 1; return helper(); }\n",
+            ("h.ts::helper", SymbolKind::Variable),
+        ),
+        (
+            "h.tsx",
+            "function outer() { const helper = () => 1; return helper(); }\n",
+            ("h.tsx::helper", SymbolKind::Variable),
+        ),
+        (
+            "h.ts",
+            "class C { m() { const helper = function () { return 1; }; return helper(); } }\n",
+            ("h.ts::C::helper", SymbolKind::Variable),
+        ),
+    ] {
+        let ids = ts_ids(file, src);
+        let helpers: Vec<_> = ids.iter().filter(|(id, _)| id.contains("helper")).collect();
+        assert_eq!(helpers, vec![&(want.0.to_string(), want.1)], "{file} {src}");
+    }
+}

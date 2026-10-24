@@ -12,6 +12,15 @@
 (abstract_class_declaration
   name: (type_identifier) @class.name) @class.def
 
+; Properties of an interface or a type literal, and class fields. The owner
+; (and whether there is one) comes from extract::ts_member_owner; a property
+; with none -- a parameter's inline type -- is no symbol.
+(property_signature
+  name: (property_identifier) @field.name) @field.def
+
+(public_field_definition
+  name: (property_identifier) @field.name) @field.def
+
 ; Interface declarations
 (interface_declaration
   name: (type_identifier) @class.name) @class.def

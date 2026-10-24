@@ -122,6 +122,121 @@ pub(super) fn find_parent_class(
     None
 }
 
+/// Whether the binding named `name` in `node` (a `variable_declarator`, or the
+/// `lexical_declaration` holding it) is given a function. Such a binding is
+/// captured twice, as a function and as a variable, and the two are one symbol
+/// only while they share an id, so it keeps the function's (the class walk).
+pub(super) fn ts_binds_function(node: Node, name: &str, source: &[u8]) -> bool {
+    let is_function = |declarator: Node| {
+        declarator.child_by_field_name("value").is_some_and(|v| {
+            matches!(
+                v.kind(),
+                "arrow_function" | "function_expression" | "function" | "generator_function"
+            )
+        })
+    };
+    if node.kind() == "variable_declarator" {
+        return is_function(node);
+    }
+    let mut cursor = node.walk();
+    let found = node.named_children(&mut cursor).any(|d| {
+        d.kind() == "variable_declarator"
+            && d.child_by_field_name("name")
+                .is_some_and(|n| node_text(n, source) == name)
+            && is_function(d)
+    });
+    found
+}
+
+/// The owner path of a TypeScript/TSX variable or property, `None` when
+/// nothing owns it. The path is the id's middle (`file::<path>::name`).
+///
+/// - A property of an interface or type literal is owned by the declaration
+///   that holds it, through the properties between: `EmitConfig::nested` owns
+///   `inner` in `interface EmitConfig { nested: { inner: number } }`, the name
+///   scip-typescript gives it, so SCIP enriches the same symbol. A class field
+///   is owned by its class. A type literal in a parameter or return type is
+///   owned by nothing (no symbol, as `is_parameter_symbol` does for SCIP).
+/// - A variable declared inside a function is owned by the nearest enclosing
+///   *named* function -- a function or method declaration, or a function
+///   expression bound to a variable or field -- under the id that function's
+///   own symbol has (`Class::method`): an anonymous callback falls to the
+///   named function around it. A module-level variable has no owner.
+///
+/// The class part is `find_parent_class`'s answer; this adds the kinds it
+/// does not own: interfaces and aliases (only here, since other languages'
+/// interface members keep their ids), functions, and type literals.
+pub(super) fn ts_member_owner(node: Node, source: &[u8]) -> Option<String> {
+    let name_of = |n: Node| {
+        n.child_by_field_name("name")
+            .filter(|name| {
+                matches!(
+                    name.kind(),
+                    "identifier" | "type_identifier" | "property_identifier"
+                )
+            })
+            .map(|name| node_text(name, source))
+    };
+    // names of properties between the node and its declaration, innermost first
+    let mut between: Vec<String> = Vec::new();
+    let mut in_type_literal = false;
+    let mut current = node.parent();
+    while let Some(n) = current {
+        let base = match n.kind() {
+            "object_type" => {
+                in_type_literal = true;
+                None
+            }
+            "property_signature" | "public_field_definition" => {
+                between.extend(name_of(n));
+                None
+            }
+            "interface_declaration" | "type_alias_declaration" => name_of(n),
+            kind if CLASS_KINDS.contains(&kind) => name_of(n),
+            // a parameter's inline type is no symbol, as for SCIP
+            "required_parameter" | "optional_parameter" if in_type_literal => return None,
+            // `const table: { rows: number }`: a module-level binding owns what
+            // its type says; a local's type is no symbol (SCIP's is `local N`)
+            "variable_declarator" if in_type_literal => {
+                if ts_member_owner(n, source).is_some() {
+                    return None;
+                }
+                name_of(n)
+            }
+            "function_declaration"
+            | "generator_function_declaration"
+            | "method_definition"
+            | "function_expression"
+            | "generator_function"
+            | "arrow_function" => {
+                let name = name_of(n).or_else(|| {
+                    n.parent()
+                        .filter(|p| {
+                            matches!(p.kind(), "variable_declarator" | "public_field_definition")
+                        })
+                        .and_then(name_of)
+                });
+                name.map(|name| match find_parent_class(n, source, None) {
+                    Some(class) => format!("{class}::{name}"),
+                    None => name,
+                })
+            }
+            _ => None,
+        };
+        if let Some(base) = base {
+            between.reverse();
+            return Some(
+                std::iter::once(base)
+                    .chain(between)
+                    .collect::<Vec<_>>()
+                    .join("::"),
+            );
+        }
+        current = n.parent();
+    }
+    None
+}
+
 /// Resolve a captured compound node (generic type, qualified/scoped identifier,
 /// member expression) down to its base identifier text. If `decompose_query` is
 /// present, iteratively re-applies it to descend through wrapper nodes (e.g.
