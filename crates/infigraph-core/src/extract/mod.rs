@@ -122,6 +122,32 @@ pub(super) fn find_parent_class(
     None
 }
 
+/// Whether the binding named `name` in `node` (a `variable_declarator`, or the
+/// `lexical_declaration` holding it) is given a function. Such a binding is
+/// captured twice, as a function and as a variable, and the two are one symbol
+/// only while they share an id, so it keeps the function's (the class walk).
+pub(super) fn ts_binds_function(node: Node, name: &str, source: &[u8]) -> bool {
+    let is_function = |declarator: Node| {
+        declarator.child_by_field_name("value").is_some_and(|v| {
+            matches!(
+                v.kind(),
+                "arrow_function" | "function_expression" | "function" | "generator_function"
+            )
+        })
+    };
+    if node.kind() == "variable_declarator" {
+        return is_function(node);
+    }
+    let mut cursor = node.walk();
+    let found = node.named_children(&mut cursor).any(|d| {
+        d.kind() == "variable_declarator"
+            && d.child_by_field_name("name")
+                .is_some_and(|n| node_text(n, source) == name)
+            && is_function(d)
+    });
+    found
+}
+
 /// The owner path of a TypeScript/TSX variable or property, `None` when
 /// nothing owns it. The path is the id's middle (`file::<path>::name`).
 ///

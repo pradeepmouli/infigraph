@@ -1191,3 +1191,31 @@ fn a_locals_id_does_not_depend_on_where_the_function_is() {
     };
     assert_eq!(sorted(&before), sorted(&after));
 }
+
+#[test]
+fn a_function_valued_local_is_one_symbol_with_the_id_it_always_had() {
+    // `const helper = () => …` is captured as a function and as a variable
+    // declarator; the two are one symbol only while they share an id, and the
+    // merged symbol has always been a Variable (as at module level).
+    for (file, src, want) in [
+        (
+            "h.ts",
+            "function outer() { const helper = () => 1; return helper(); }\n",
+            ("h.ts::helper", SymbolKind::Variable),
+        ),
+        (
+            "h.tsx",
+            "function outer() { const helper = () => 1; return helper(); }\n",
+            ("h.tsx::helper", SymbolKind::Variable),
+        ),
+        (
+            "h.ts",
+            "class C { m() { const helper = function () { return 1; }; return helper(); } }\n",
+            ("h.ts::C::helper", SymbolKind::Variable),
+        ),
+    ] {
+        let ids = ts_ids(file, src);
+        let helpers: Vec<_> = ids.iter().filter(|(id, _)| id.contains("helper")).collect();
+        assert_eq!(helpers, vec![&(want.0.to_string(), want.1)], "{file} {src}");
+    }
+}

@@ -1,7 +1,9 @@
 use sha2::{Digest, Sha256};
 use tree_sitter::{Node, Query, QueryCursor, StreamingIterator};
 
-use super::{find_parent_class, node_text, resolve_compound_node_text, ts_member_owner};
+use super::{
+    find_parent_class, node_text, resolve_compound_node_text, ts_binds_function, ts_member_owner,
+};
 use crate::analysis::cyclomatic_complexity;
 use crate::model::{Span, Symbol, SymbolKind};
 
@@ -252,7 +254,10 @@ pub fn extract_entities(
             let parent_class = parent_capture
                 .map(|n| resolve_compound_node_text(n, source, decompose_query))
                 .or_else(|| {
-                    if in_typescript && matches!(sym_kind, SymbolKind::Variable) {
+                    if in_typescript
+                        && matches!(sym_kind, SymbolKind::Variable)
+                        && !ts_binds_function(node, &name, source)
+                    {
                         ts_member_owner(node, source)
                     } else {
                         find_parent_class(node, source, decompose_query)
