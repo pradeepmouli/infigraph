@@ -78,6 +78,10 @@ pub enum DegradedMode {
     /// The code graph is stored under the name the previous build gave it and
     /// has not been renamed: only a process that may write renames it.
     StoreMigrationPending,
+    /// The project is a linked git worktree with no code store of its own:
+    /// nothing is indexed here, and a read does not fall back to the checkout
+    /// that holds it.
+    WorktreeHasNoIndex,
     /// Documents are indexed but their embeddings are absent, so document
     /// search ranks by keywords only.
     DocEmbeddingsMissing,
@@ -134,6 +138,7 @@ impl DegradedMode {
             DegradedMode::ReindexWaitingForSlot { .. } => REINDEX_WAITING_FOR_SLOT,
             DegradedMode::HnswMissing => "hnsw-missing",
             DegradedMode::StoreMigrationPending => "store-migration-pending",
+            DegradedMode::WorktreeHasNoIndex => "worktree-has-no-index",
             DegradedMode::DocEmbeddingsMissing => "doc-embeddings-missing",
             DegradedMode::CloneBodiesUnavailable => CLONE_BODIES_UNAVAILABLE,
             DegradedMode::CloneBodiesPartial { .. } => CLONE_BODIES_PARTIAL,
@@ -203,6 +208,9 @@ impl DegradedMode {
             ),
             DegradedMode::StoreMigrationPending => "the code graph is stored under its old name \
                  and has not been renamed yet: reads of it wait for the first command that writes"
+                .to_string(),
+            DegradedMode::WorktreeHasNoIndex => "this linked worktree has no index of its own: \
+                 nothing here is searchable, and it does not read the checkout's graph"
                 .to_string(),
             DegradedMode::HnswMissing => {
                 "HNSW index missing or stale — vector search is on a linear scan this project \
@@ -284,6 +292,7 @@ impl DegradedMode {
             DegradedMode::CloneBodiesUnavailable | DegradedMode::CloneBodiesPartial { .. } => {
                 "run `infigraph index`"
             }
+            DegradedMode::WorktreeHasNoIndex => "run `infigraph worktree init` in this worktree",
             DegradedMode::StoreMigrationPending => {
                 "run `infigraph index`; if it reports the old name is held, run `infigraph \
                  daemon-stop --wait` first"
@@ -688,6 +697,10 @@ pub fn derived_from_disk(root: &Path) -> Vec<DegradedMode> {
         });
     }
     let ig = root.join(".infigraph");
+    if crate::project::is_linked_worktree_root(root) && !crate::graph::names::store_present(&ig) {
+        modes.push(DegradedMode::WorktreeHasNoIndex);
+        return modes;
+    }
     if crate::graph::migrate::pending(&ig) {
         modes.push(DegradedMode::StoreMigrationPending);
         return modes;

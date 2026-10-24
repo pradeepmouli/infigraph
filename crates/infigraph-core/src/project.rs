@@ -76,10 +76,25 @@ pub fn canonicalize_lenient(path: &Path) -> PathBuf {
     }
 }
 
+/// Whether `dir` is the root of a linked git worktree: its `.git` is a file
+/// pointing into the main repository's `worktrees/` directory (a submodule's
+/// points elsewhere, a clone's or the main checkout's is a directory).
+pub fn is_linked_worktree_root(dir: &Path) -> bool {
+    std::fs::read_to_string(dir.join(".git")).is_ok_and(|text| {
+        text.strip_prefix("gitdir:").is_some_and(|gitdir| {
+            Path::new(gitdir.trim())
+                .components()
+                .any(|c| c.as_os_str() == "worktrees")
+        })
+    })
+}
+
 /// Resolve `start` to the project root that should own it.
 ///
 /// In order: `start` itself if it is already a project store; else the
-/// nearest ancestor that is; else the git root, so that a *first* index run
+/// nearest ancestor that is, never passing the root of a linked worktree
+/// (which is its own project, indexed or not: resolving past it answered from
+/// the checkout that holds it, silently); else the git root, so that a *first* index run
 /// from a subdirectory still lands at the repo root rather than creating a
 /// store wherever the command happened to be typed; else `start` unchanged.
 ///
@@ -95,7 +110,13 @@ pub fn resolve_project_root(start: &Path) -> PathBuf {
     }
 
     let mut current = start.as_path();
-    while let Some(parent) = current.parent() {
+    loop {
+        if is_linked_worktree_root(current) {
+            return current.to_path_buf();
+        }
+        let Some(parent) = current.parent() else {
+            break;
+        };
         if is_project_store(parent) {
             return parent.to_path_buf();
         }

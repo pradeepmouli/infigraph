@@ -171,14 +171,24 @@ pub fn with_root_line(root: &Path, report: &str) -> String {
     format!("project: {}\n{report}", root.display())
 }
 
-/// Refuses to act on `root` for a caller standing in a checkout nested inside
-/// it that has no index of its own. A linked worktree (`scratchpad/wt-x`)
-/// without a store resolves to the main checkout's, and an edit would then land
-/// in the main checkout's glossary and refresh its index while the caller
-/// believes it is changing the worktree's.
+/// Refuses to act on `root` when the caller stands in a checkout with no index
+/// of its own. A linked worktree (`scratchpad/wt-x`) without a store is its own
+/// project now and `root` is that worktree; a plain nested repository still
+/// resolves to the project around it. Either way an edit would land in a
+/// glossary the caller did not mean (or in one with no index to refresh), so
+/// it is refused with the cure.
 pub fn refuse_nested_checkout(root: &Path, start: &Path) -> Result<()> {
     let start = infigraph_core::project::canonicalize_lenient(start);
     let root = infigraph_core::project::canonicalize_lenient(root);
+    if infigraph_core::project::is_linked_worktree_root(&root)
+        && !infigraph_core::graph::names::store_present(&root.join(".infigraph"))
+    {
+        bail!(
+            "{} is a linked worktree with no index of its own: run `infigraph worktree init` \
+             there first, or name the project you mean",
+            root.display()
+        );
+    }
     match infigraph_core::project::git_root(&start) {
         Some(checkout) if checkout != root && checkout.starts_with(&root) => bail!(
             "{} is a checkout of its own with no index of its own, so this would change the \
