@@ -22,8 +22,7 @@ pub(crate) fn register_project(root: &Path, prism: &CodeIndex) -> Result<String>
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "unknown".to_string());
-    let mut registry = infigraph_core::multi::Registry::load()?;
-    registry.register_repo(&repo_name, root, prism)?;
+    infigraph_core::multi::Registry::register(&repo_name, root, prism)?;
     Ok(repo_name)
 }
 

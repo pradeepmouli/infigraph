@@ -15,8 +15,7 @@ pub(crate) fn cmd_group(root: &Path, action: GroupAction) -> Result<()> {
         GroupAction::Create { name, org } => {
             let org = org.unwrap_or_else(infigraph_core::multi::default_org);
             let key = infigraph_core::multi::qualified_group_name(&org, &name);
-            registry.create_group_with_org(&name, &org)?;
-            registry.save()?;
+            Registry::update(|registry| registry.create_group_with_org(&name, &org))?;
             println!("Created group '{}'", key);
         }
         GroupAction::Add { group, repo } => {
@@ -62,14 +61,9 @@ pub(crate) fn cmd_group(root: &Path, action: GroupAction) -> Result<()> {
             let reg = bundled_registry()?;
             let mut prism = CodeIndex::open(&actual_path, reg)?;
             prism.init()?;
-            registry.register_repo(&repo_name, &actual_path, &prism)?;
-            registry.group_add(&group, &repo_name)?;
-            registry.save()?;
-            let resolved = registry
-                .repos
-                .get(&repo_name)
-                .map(|e| e.path.display().to_string())
-                .unwrap_or_else(|| actual_path.display().to_string());
+            let entry = Registry::register(&repo_name, &actual_path, &prism)?;
+            Registry::update(|registry| registry.group_add(&group, &repo_name))?;
+            let resolved = entry.path.display().to_string();
             println!(
                 "Added repo '{}' ({}) to group '{}'",
                 repo_name, resolved, group
@@ -77,8 +71,7 @@ pub(crate) fn cmd_group(root: &Path, action: GroupAction) -> Result<()> {
         }
         GroupAction::Remove { group, repo } => {
             let group = registry.resolve_group_key(&group);
-            registry.group_remove(&group, &repo)?;
-            registry.save()?;
+            Registry::update(|registry| registry.group_remove(&group, &repo))?;
             println!("Removed repo '{}' from group '{}'", repo, group);
         }
         GroupAction::List => {
@@ -423,7 +416,6 @@ pub(crate) fn cmd_group(root: &Path, action: GroupAction) -> Result<()> {
                 &group,
                 bundled_registry,
             )?;
-            registry.save()?;
             println!("  {} contracts", contract_count);
 
             // Step 3: Link cross-service calls

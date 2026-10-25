@@ -76,6 +76,9 @@ pub enum ContractKind {
 
 impl Registry {
     /// Load registry — from Postgres in remote mode, JSON file otherwise.
+    ///
+    /// A snapshot: to change the registry, never `load` → mutate → `save`
+    /// (another process's update between the two is lost); use [`Registry::update`].
     pub fn load() -> Result<Self> {
         #[cfg(feature = "postgres")]
         {
@@ -85,16 +88,22 @@ impl Registry {
                 return pg.load_registry();
             }
         }
-        let path = registry_path()?;
+        Self::read_file(&registry_path()?)
+    }
+
+    fn read_file(path: &Path) -> Result<Self> {
         if !path.exists() {
             return Ok(Self::default());
         }
-        let data = std::fs::read_to_string(&path)?;
-        let registry: Registry = serde_json::from_str(&data)?;
-        Ok(registry)
+        let data = std::fs::read_to_string(path)?;
+        Ok(serde_json::from_str(&data)?)
     }
 
-    /// Save registry — to Postgres in remote mode, JSON file otherwise.
+    /// Write `self` over the registry — to Postgres in remote mode, the JSON
+    /// file otherwise (under `registry-write`, atomically).
+    ///
+    /// Replaces whatever is stored with this snapshot, so it is for seeding a
+    /// registry; a change to an existing one goes through [`Registry::update`].
     pub fn save(&self) -> Result<()> {
         #[cfg(feature = "postgres")]
         {
@@ -104,22 +113,45 @@ impl Registry {
                 return pg.save_registry(self);
             }
         }
-        let path = registry_path()?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let lock_path = registry_lock_path()?;
-        let _lock = lockfile::acquire(&lock_path, "registry-write", REGISTRY_LOCK_TIMEOUT)?;
+        let _lock = lock_registry()?;
+        self.write_file(&registry_path()?)
+    }
+
+    fn write_file(&self, path: &Path) -> Result<()> {
         let tmp_path = path.with_file_name("registry.json.tmp");
         let data = serde_json::to_string_pretty(self)?;
         std::fs::write(&tmp_path, &data)?;
-        std::fs::rename(&tmp_path, &path)?;
+        std::fs::rename(&tmp_path, path)?;
         Ok(())
+    }
+
+    /// The one way to change the registry: hold `registry-write`, load what is
+    /// stored *now*, apply `change`, save, release. Two processes updating at
+    /// once both land; nothing is saved when `change` fails, and a lock that
+    /// cannot be had in `REGISTRY_LOCK_TIMEOUT` is the error (`lockfile::Busy`).
+    /// `change` runs under the lock, so it must be quick: compute anything
+    /// slow (graph stats, a walk) before calling.
+    pub fn update<T>(change: impl FnOnce(&mut Registry) -> Result<T>) -> Result<T> {
+        #[cfg(feature = "postgres")]
+        {
+            if crate::daemon::lifecycle::is_remote_backend() {
+                let mut registry = Self::load()?;
+                let out = change(&mut registry)?;
+                registry.save()?;
+                return Ok(out);
+            }
+        }
+        let _lock = lock_registry()?;
+        let path = registry_path()?;
+        let mut registry = Self::read_file(&path)?;
+        let out = change(&mut registry)?;
+        registry.write_file(&path)?;
+        Ok(out)
     }
 
     /// Remove every entry whose path matches `path` (raw or canonicalized,
     /// leniently, so a path that no longer exists still matches).
-    /// Returns the names removed. Does not persist -- call `save()` after.
+    /// Returns the names removed. Does not persist -- run it inside [`Registry::update`].
     pub fn deregister_by_path(&mut self, path: &Path) -> Vec<String> {
         let canonical = crate::project::canonicalize_lenient(path);
         let to_remove: Vec<String> = self
@@ -137,8 +169,10 @@ impl Registry {
         to_remove
     }
 
-    /// Register a repository after indexing.
-    pub fn register_repo(&mut self, name: &str, path: &Path, prism: &CodeIndex) -> Result<()> {
+    /// Register a repository after indexing: persists the entry through
+    /// [`Registry::update`] (the stats are read before the lock is taken).
+    /// Returns the entry stored.
+    pub fn register(name: &str, path: &Path, prism: &CodeIndex) -> Result<RepoEntry> {
         let stats = prism.stats()?;
         let langs: Vec<String> = prism
             .registry()
@@ -158,21 +192,29 @@ impl Registry {
             None
         };
 
-        self.repos.insert(
-            name.to_string(),
-            RepoEntry {
-                name: name.to_string(),
-                path: abs_path,
-                languages: langs,
-                symbol_count: stats.symbols,
-                module_count: stats.modules,
-                last_indexed_commit: commit,
-            },
-        );
-        self.save()
+        let entry = RepoEntry {
+            name: name.to_string(),
+            path: abs_path,
+            languages: langs,
+            symbol_count: stats.symbols,
+            module_count: stats.modules,
+            last_indexed_commit: commit,
+        };
+        Self::update(|registry| {
+            registry.repos.insert(name.to_string(), entry.clone());
+            Ok(())
+        })?;
+        Ok(entry)
     }
 
-    /// Create a new group. If `org` is non-empty, the group key becomes `org/name`
+    /// [`Registry::register`], and the entry in this in-memory copy too.
+    pub fn register_repo(&mut self, name: &str, path: &Path, prism: &CodeIndex) -> Result<()> {
+        let entry = Self::register(name, path, prism)?;
+        self.repos.insert(name.to_string(), entry);
+        Ok(())
+    }
+
+    /// Create a new group (in memory: run it inside [`Registry::update`]). If `org` is non-empty, the group key becomes `org/name`
     /// to prevent collisions when multiple teams share one Postgres/Neo4j instance.
     pub fn create_group(&mut self, name: &str) -> Result<()> {
         self.create_group_with_org(name, &default_org())
@@ -192,7 +234,7 @@ impl Registry {
                 contracts: Vec::new(),
             },
         );
-        self.save()
+        Ok(())
     }
 
     /// Resolve a user-supplied group name to the actual stored key.
@@ -250,7 +292,7 @@ impl Registry {
         Some(qualified_group_name(&org, &repo_name))
     }
 
-    /// Add a repo to a group.
+    /// Add a repo to a group (in memory: run it inside [`Registry::update`]).
     pub fn group_add(&mut self, group_name: &str, repo_name: &str) -> Result<()> {
         let group = self
             .groups
@@ -263,17 +305,17 @@ impl Registry {
             return Ok(());
         }
         group.repos.push(repo_name.to_string());
-        self.save()
+        Ok(())
     }
 
-    /// Remove a repo from a group.
+    /// Remove a repo from a group (in memory: run it inside [`Registry::update`]).
     pub fn group_remove(&mut self, group_name: &str, repo_name: &str) -> Result<()> {
         let group = self
             .groups
             .get_mut(group_name)
             .context(format!("group '{}' not found", group_name))?;
         group.repos.retain(|r| r != repo_name);
-        self.save()
+        Ok(())
     }
 
     /// Search across all repos in a group.
@@ -651,8 +693,15 @@ pub fn sync_group_contracts(
         .groups
         .get_mut(group_name)
         .context("group not found")?;
-    group.contracts = all_contracts;
-    registry.save()?;
+    group.contracts = all_contracts.clone();
+    Registry::update(|stored| {
+        stored
+            .groups
+            .get_mut(group_name)
+            .context(format!("group '{}' not found", group_name))?
+            .contracts = all_contracts;
+        Ok(())
+    })?;
 
     Ok(count)
 }
@@ -936,6 +985,18 @@ fn registry_lock_path() -> Result<PathBuf> {
     Ok(crate::instances::infigraph_home().join("registry.lock"))
 }
 
+/// `registry-write`, with the directory it lives in made.
+fn lock_registry() -> Result<lockfile::LockFile> {
+    if let Some(parent) = registry_path()?.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    lockfile::acquire(
+        &registry_lock_path()?,
+        "registry-write",
+        REGISTRY_LOCK_TIMEOUT,
+    )
+}
+
 const REGISTRY_LOCK_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Default org (`registry` settings group: legacy `INFIGRAPH_ORG`, or
@@ -995,52 +1056,6 @@ fn raw_query_prism(prism: &CodeIndex, cypher: &str) -> Result<Vec<Vec<String>>> 
 mod tests {
     use super::*;
 
-    /// Serializes the tests below that persist a `Registry`, since
-    /// `INFIGRAPH_REGISTRY_HOME` is process-global and cargo runs this
-    /// binary's tests on parallel threads.
-    static REGISTRY_HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// Points `INFIGRAPH_REGISTRY_HOME` at a throwaway directory for the
-    /// caller's scope, restoring the previous value on drop.
-    ///
-    /// `create_group_with_org` ends in `self.save()`, and `save()` falls back
-    /// to `$HOME/.infigraph/registry.json` when this variable is unset. So a
-    /// test that looks purely in-memory -- build a `Registry::default()`, add
-    /// a group, assert on the map -- actually writes that default, with its
-    /// EMPTY `repos`, straight over the developer's real registry. Running
-    /// `cargo test -p infigraph-core --lib` deregistered every project on
-    /// this machine and left two `team-*/backend` fixture groups behind,
-    /// which `infigraph doctor` then reported as "project has .infigraph
-    /// state but is not in the instance registry".
-    struct IsolatedRegistryHome {
-        _lock: std::sync::MutexGuard<'static, ()>,
-        _dir: tempfile::TempDir,
-        prev: Option<std::ffi::OsString>,
-    }
-
-    impl IsolatedRegistryHome {
-        fn acquire() -> Self {
-            let lock = REGISTRY_HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            let prev = std::env::var_os("INFIGRAPH_REGISTRY_HOME");
-            let dir = tempfile::tempdir().expect("registry scratch dir");
-            std::env::set_var("INFIGRAPH_REGISTRY_HOME", dir.path());
-            Self {
-                _lock: lock,
-                _dir: dir,
-                prev,
-            }
-        }
-    }
-
-    impl Drop for IsolatedRegistryHome {
-        fn drop(&mut self) {
-            match self.prev.take() {
-                Some(v) => std::env::set_var("INFIGRAPH_REGISTRY_HOME", v),
-                None => std::env::remove_var("INFIGRAPH_REGISTRY_HOME"),
-            }
-        }
-    }
-
     #[test]
     fn test_qualified_group_name_no_org() {
         assert_eq!(qualified_group_name("", "backend"), "backend");
@@ -1056,7 +1071,6 @@ mod tests {
 
     #[test]
     fn test_create_group_with_org_stores_qualified_key() {
-        let _home = IsolatedRegistryHome::acquire();
         let mut registry = Registry::default();
         registry.create_group_with_org("backend", "team-a").unwrap();
         assert!(registry.groups.contains_key("team-a/backend"));
@@ -1067,7 +1081,6 @@ mod tests {
 
     #[test]
     fn test_create_group_with_empty_org_stores_plain_key() {
-        let _home = IsolatedRegistryHome::acquire();
         let mut registry = Registry::default();
         registry.create_group_with_org("backend", "").unwrap();
         assert!(registry.groups.contains_key("backend"));
@@ -1077,7 +1090,6 @@ mod tests {
 
     #[test]
     fn test_org_isolation_different_orgs_same_name() {
-        let _home = IsolatedRegistryHome::acquire();
         let mut registry = Registry::default();
         registry.create_group_with_org("backend", "team-a").unwrap();
         registry.create_group_with_org("backend", "team-b").unwrap();
@@ -1088,7 +1100,6 @@ mod tests {
 
     #[test]
     fn test_create_group_duplicate_with_org_fails() {
-        let _home = IsolatedRegistryHome::acquire();
         let mut registry = Registry::default();
         registry.create_group_with_org("backend", "team-a").unwrap();
         let result = registry.create_group_with_org("backend", "team-a");
@@ -1097,7 +1108,6 @@ mod tests {
 
     #[test]
     fn test_default_create_group_uses_default_org() {
-        let _home = IsolatedRegistryHome::acquire();
         let mut registry = Registry::default();
         registry.create_group("my-group").unwrap();
         assert!(registry.groups.contains_key("my-group"));

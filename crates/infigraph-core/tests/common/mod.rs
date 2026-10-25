@@ -3,4 +3,5 @@
 #![allow(dead_code)]
 
 pub mod daemon;
+pub mod registry;
 pub mod stdio;

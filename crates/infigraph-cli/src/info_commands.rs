@@ -1573,9 +1573,7 @@ pub(crate) fn cmd_delete_project(root: &Path) -> Result<()> {
 
     // Unregister from the global registry
     use infigraph_core::multi::Registry;
-    let mut registry = Registry::load()?;
-    let to_remove = registry.deregister_by_path(&project_path);
-    registry.save()?;
+    let to_remove = Registry::update(|registry| Ok(registry.deregister_by_path(&project_path)))?;
 
     if to_remove.is_empty() {
         println!(
@@ -1689,7 +1687,7 @@ pub(crate) fn cmd_doctor(root: &Path, global: bool, verbose: bool, docs_sync: bo
 /// audit lines -- written only AFTER the registry save succeeds, so the
 /// audit never records an eviction that didn't actually persist.
 pub(crate) fn cmd_gc(root: &Path, dry_run: bool, stale_days: Option<u64>) -> Result<()> {
-    let mut registry = infigraph_core::multi::Registry::load()?;
+    let registry = infigraph_core::multi::Registry::load()?;
     let plan =
         infigraph_core::gc::plan_registry_gc(&registry, stale_days, std::time::SystemTime::now());
 
@@ -1732,8 +1730,10 @@ pub(crate) fn cmd_gc(root: &Path, dry_run: bool, stale_days: Option<u64>) -> Res
         return Ok(());
     }
 
-    infigraph_core::gc::execute_registry_gc(&mut registry, &plan);
-    registry.save()?;
+    infigraph_core::multi::Registry::update(|stored| {
+        infigraph_core::gc::execute_registry_gc(stored, &plan);
+        Ok(())
+    })?;
 
     for c in &plan.evictions {
         infigraph_core::audit::audit_log(

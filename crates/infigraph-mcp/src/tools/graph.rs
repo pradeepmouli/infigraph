@@ -158,27 +158,7 @@ pub fn tool_delete_project(args: &Value) -> Result<String> {
     }
 
     // Unregister from the global registry
-    let mut registry = Registry::load()?;
-    let canonical = project_path.canonicalize().unwrap_or(project_path.clone());
-    let to_remove: Vec<String> = registry
-        .repos
-        .iter()
-        .filter(|(_, entry)| {
-            entry.path == project_path
-                || entry.path == canonical
-                || entry
-                    .path
-                    .canonicalize()
-                    .map(|p| p == canonical)
-                    .unwrap_or(false)
-        })
-        .map(|(name, _)| name.clone())
-        .collect();
-
-    for name in &to_remove {
-        registry.repos.remove(name);
-    }
-    registry.save()?;
+    let to_remove = Registry::update(|registry| Ok(registry.deregister_by_path(&project_path)))?;
 
     if to_remove.is_empty() {
         Ok(format!(

@@ -146,7 +146,15 @@ pub fn plan_registry_gc(registry: &Registry, stale_days: Option<u64>, now: Syste
 /// the registry disagreeing about what happened.
 pub fn execute_registry_gc(registry: &mut Registry, plan: &GcPlan) {
     for candidate in &plan.evictions {
-        registry.repos.remove(&candidate.name);
+        // The plan was made from an older snapshot: an entry re-registered
+        // since (same name, another path) is alive and stays.
+        if registry
+            .repos
+            .get(&candidate.name)
+            .is_some_and(|entry| entry.path == candidate.path)
+        {
+            registry.repos.remove(&candidate.name);
+        }
     }
     for (group_name, repo_name) in &plan.dangling_group_members {
         if let Some(group) = registry.groups.get_mut(group_name) {
@@ -295,5 +303,23 @@ mod tests {
     fn empty_registry_yields_an_empty_plan() {
         let plan = plan_registry_gc(&Registry::default(), Some(1), SystemTime::now());
         assert!(plan.is_empty());
+    }
+
+    #[test]
+    fn execute_keeps_an_entry_re_registered_since_the_plan_was_made() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gone = tmp.path().join("gone");
+        let plan = plan_registry_gc(
+            &registry_with(vec![entry("proj", gone)]),
+            None,
+            SystemTime::now(),
+        );
+        assert_eq!(plan.evictions.len(), 1);
+
+        // another process registered `proj` at a live path before we applied
+        let (live, _) = live_project(&tmp, "proj-live");
+        let mut stored = registry_with(vec![entry("proj", live)]);
+        execute_registry_gc(&mut stored, &plan);
+        assert!(stored.repos.contains_key("proj"));
     }
 }

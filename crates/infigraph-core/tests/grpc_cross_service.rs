@@ -24,6 +24,8 @@ use std::sync::Mutex;
 
 use infigraph_core::extract::extract_file;
 use infigraph_core::graph::{GraphBackend, KuzuBackend};
+mod common;
+
 use infigraph_core::multi::combined::{build_combined_graph, combined_query};
 use infigraph_core::multi::grpc::extract_grpc_contracts;
 use infigraph_core::multi::{self, ContractKind, Group, Registry, RepoEntry};
@@ -96,7 +98,7 @@ fn two_repo_group(producer: (&str, &Path), consumer: (&str, &Path), group: &str)
             contracts: vec![],
         },
     );
-    registry
+    common::registry::stored(registry)
 }
 
 const SINGLE_RPC_PROTO: &str =

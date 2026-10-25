@@ -51,9 +51,8 @@ pub fn tool_group_create(args: &Value) -> Result<String> {
         .map(|s| s.to_string())
         .unwrap_or_else(infigraph_core::multi::default_org);
 
-    let mut registry = Registry::load()?;
     let key = infigraph_core::multi::qualified_group_name(&org, name);
-    registry.create_group_with_org(name, &org)?;
+    Registry::update(|registry| registry.create_group_with_org(name, &org))?;
 
     Ok(format!("Group '{}' created.", key))
 }
@@ -69,17 +68,16 @@ pub fn tool_group_add(args: &Value) -> Result<String> {
         .context("missing 'repo_name' argument")?;
 
     // If the repo isn't registered yet and a path is given, register it first
-    let mut registry = Registry::load()?;
-    if !registry.repos.contains_key(repo_name) {
+    if !Registry::load()?.repos.contains_key(repo_name) {
         if let Some(path_str) = args.get("path").and_then(|p| p.as_str()) {
             let lang_registry = bundled_registry()?;
             let mut prism = CodeIndex::open(&PathBuf::from(path_str), lang_registry)?;
             prism.init()?;
-            registry.register_repo(repo_name, &PathBuf::from(path_str), &prism)?;
+            Registry::register(repo_name, &PathBuf::from(path_str), &prism)?;
         }
     }
 
-    registry.group_add(group_name, repo_name)?;
+    Registry::update(|registry| registry.group_add(group_name, repo_name))?;
 
     Ok(format!(
         "Added repo '{}' to group '{}'.",
