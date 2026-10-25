@@ -339,9 +339,11 @@ fn register_project_or_warn(path: &str, prism: &infigraph_core::CodeIndex, out: 
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| path.to_string());
-    let result = infigraph_core::multi::Registry::load().and_then(|mut registry| {
-        registry.register_repo(&project_name, &std::path::PathBuf::from(path), prism)
-    });
+    let result = infigraph_core::multi::Registry::register(
+        &project_name,
+        &std::path::PathBuf::from(path),
+        prism,
+    );
     if let Err(e) = result {
         out.push_str(&format!(
             "\nwarning: could not register {path} in the registry: {e:#}"

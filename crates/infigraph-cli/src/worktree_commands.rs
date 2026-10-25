@@ -57,9 +57,7 @@ pub(crate) fn cmd_worktree_teardown(path: &Path) -> Result<()> {
         ),
     }
 
-    let mut registry = Registry::load()?;
-    let removed = registry.deregister_by_path(path);
-    registry.save()?;
+    let removed = Registry::update(|registry| Ok(registry.deregister_by_path(path)))?;
 
     if removed.is_empty() {
         println!(

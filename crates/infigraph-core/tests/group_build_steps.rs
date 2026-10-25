@@ -14,6 +14,8 @@
 // full replace (sync_group_contracts), and route_lookup is built from ALL contracts, so an
 // unchanged caller must still be rescanned whenever any OTHER repo's routes change.
 
+mod common;
+
 use infigraph_core::multi::{self, Group, Registry, RepoEntry};
 use std::collections::HashMap;
 use std::path::Path;
@@ -222,7 +224,7 @@ fn shared_package_group(publisher_dir: &Path, consumer_dir: &Path) -> Registry {
             contracts: vec![],
         },
     );
-    registry
+    common::registry::stored(registry)
 }
 
 fn local_group(order_dir: &Path, payment_dir: &Path) -> Registry {
@@ -247,7 +249,7 @@ fn local_group(order_dir: &Path, payment_dir: &Path) -> Registry {
             contracts: vec![],
         },
     );
-    registry
+    common::registry::stored(registry)
 }
 
 // ---------------------------------------------------------------------------
@@ -417,7 +419,7 @@ fn namespace_link_group(producer_dir: &Path, consumer_dir: &Path) -> Registry {
             contracts: vec![],
         },
     );
-    registry
+    common::registry::stored(registry)
 }
 
 /// Step 3b: tto-engine calls tps::SetFormML, a namespace-qualified C++ symbol
