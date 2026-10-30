@@ -1113,7 +1113,7 @@ fn typescript_properties_are_owned_symbols_of_kind_variable() {
             "SerializedBase::unresolved",
             "Lit::k",
             "Lit::m",
-            "InNs::p",
+            "NS::InNs::p",
             "Holder::prop",
             "Holder::typed",
             "Holder::typed::a",

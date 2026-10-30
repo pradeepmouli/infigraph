@@ -3,6 +3,7 @@ use tree_sitter::{Node, Query, QueryCursor, StreamingIterator};
 
 use super::{
     find_parent_class, node_text, resolve_compound_node_text, ts_binds_function, ts_member_owner,
+    ts_with_namespaces,
 };
 use crate::analysis::cyclomatic_complexity;
 use crate::model::{Span, Symbol, SymbolKind};
@@ -263,6 +264,11 @@ pub fn extract_entities(
                         find_parent_class(node, source, decompose_query)
                     }
                 });
+            let parent_class = if in_typescript {
+                ts_with_namespaces(node, source, parent_class)
+            } else {
+                parent_class
+            };
             if owned_only && parent_class.is_none() {
                 continue;
             }

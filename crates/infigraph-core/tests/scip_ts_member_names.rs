@@ -61,3 +61,40 @@ fn a_quoted_member_name_is_named_without_its_quotes() {
         "no quote is part of a member's name: {scip_ids:?}"
     );
 }
+
+#[test]
+fn a_member_of_a_nested_namespace_is_named_under_each_namespace() {
+    let (tree_sitter, scip_ids) = ids("scip_ts_namespace");
+    for want in [
+        "a.ts::Pattern::Map",
+        "a.ts::Literal::String::C",
+        "a.ts::Outer::Inner::K",
+        "a.ts::Outer::Inner::K::m",
+    ] {
+        assert!(
+            scip_ids.iter().any(|id| id == want),
+            "SCIP names {want}: {scip_ids:?}"
+        );
+        assert!(
+            tree_sitter.contains(want),
+            "tree-sitter names {want}: {tree_sitter:?}"
+        );
+    }
+}
+
+#[test]
+fn every_owned_member_of_the_namespace_fixture_is_a_tree_sitter_symbol() {
+    // a namespace is a symbol only SCIP makes: its definition is not a member
+    let namespaces = ["a.ts::Literal::String", "a.ts::Outer::Inner"];
+    let (tree_sitter, scip_ids) = ids("scip_ts_namespace");
+    let missing: Vec<&String> = scip_ids
+        .iter()
+        .filter(|id| id.trim_start_matches("a.ts::").contains("::"))
+        .filter(|id| !namespaces.contains(&id.as_str()))
+        .filter(|id| !tree_sitter.contains(*id))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "SCIP-only members {missing:?} vs {tree_sitter:?}"
+    );
+}
