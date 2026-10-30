@@ -909,9 +909,14 @@ fn import_scip_index_unrecorded(
                 }
                 scip_sym_to_ts_id.insert(scip_sym.clone(), sid);
             } else {
-                let kind = si
-                    .map(|s| scip_kind_to_prism(&s.kind.enum_value_or_default()))
-                    .unwrap_or(SymbolKind::Function);
+                let kind = match si.map(|s| s.kind.enum_value_or_default()) {
+                    Some(indexer_kind)
+                        if indexer_kind != symbol_information::Kind::UnspecifiedKind =>
+                    {
+                        scip_kind_to_prism(&indexer_kind)
+                    }
+                    _ => scip_kind_from_moniker(scip_sym),
+                };
                 let sym_id = match literal {
                     Some(member) => qualified_id(file, &member.owners, &name),
                     None => scip_symbol_id(file, scip_sym, &name),
@@ -1987,6 +1992,33 @@ fn without_ordinal(id: &str) -> &str {
     match id.rsplit_once('#') {
         Some((base, n)) if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => base,
         _ => id,
+    }
+}
+
+/// The kind of a symbol the indexer reports no kind for (scip-typescript
+/// reports none at all), read from the last descriptor of its moniker: a
+/// namespace is a module, a term (a property or variable) a variable, and a
+/// type a class (a moniker cannot tell a class from an interface or a type
+/// alias). A method is a method when a type owns it, else a function.
+fn scip_kind_from_moniker(scip_sym: &str) -> SymbolKind {
+    let Some(descriptors) = scip_descriptors(scip_sym) else {
+        return SymbolKind::Function;
+    };
+    let Some((last, before)) = descriptors.split_last() else {
+        return SymbolKind::Function;
+    };
+    match last.kind {
+        DescriptorKind::Namespace => SymbolKind::Module,
+        DescriptorKind::Term => SymbolKind::Variable,
+        DescriptorKind::Type => SymbolKind::Class,
+        DescriptorKind::Method
+            if before
+                .last()
+                .is_some_and(|d| d.kind == DescriptorKind::Type) =>
+        {
+            SymbolKind::Method
+        }
+        _ => SymbolKind::Function,
     }
 }
 
@@ -3636,6 +3668,72 @@ mod tests {
             edge_exists(&edges, &(a.to_string(), b.to_string())),
             "the preload must hold the ids exactly: {edges:?}"
         );
+    }
+
+    fn kind_of(env: &TestEnv, id: &str) -> String {
+        let conn = env.store.connection().unwrap();
+        conn.query(&format!(
+            "MATCH (s:Symbol) WHERE s.id = '{id}' RETURN s.kind"
+        ))
+        .unwrap()
+        .map(|row| raw_string(&row[0]).to_string())
+        .next()
+        .unwrap_or_else(|| panic!("no symbol {id}"))
+    }
+
+    /// scip-typescript reports no symbol kind: a namespace, a property, a method
+    /// and a type are each the kind their moniker says, not all a function.
+    #[test]
+    fn a_symbol_the_indexer_gives_no_kind_takes_its_kind_from_the_moniker() {
+        let env = TestEnv::new();
+        env.add_file("a.ts");
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/scip_ts_namespace/scip.bin");
+        import_scip_index(&fixture, &env.store, None).unwrap();
+        for (id, want) in [
+            ("a.ts::Pattern", "Module"),
+            ("a.ts::Pattern::Map", "Class"),
+            ("a.ts::Outer::Inner::K::m", "Method"),
+            ("a.ts::Literal::String", "Module"),
+        ] {
+            assert_eq!(kind_of(&env, id), want, "{id}");
+        }
+    }
+
+    /// Re-enrichment writes a symbol's kind only when it creates the symbol: a
+    /// symbol an earlier import stored as a function keeps that kind until the
+    /// graph is rebuilt, which is why the new kinds need `index --full`.
+    #[test]
+    fn a_reimport_does_not_rewrite_the_kind_of_a_stored_symbol() {
+        let env = TestEnv::new();
+        env.add_file("a.ts");
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/scip_ts_namespace/scip.bin");
+        import_scip_index(&fixture, &env.store, None).unwrap();
+        {
+            let conn = env.store.connection().unwrap();
+            conn.query("MATCH (s:Symbol) WHERE s.id = 'a.ts::Pattern' SET s.kind = 'Function'")
+                .unwrap();
+        }
+        import_scip_index(&fixture, &env.store, None).unwrap();
+        assert_eq!(kind_of(&env, "a.ts::Pattern"), "Function");
+    }
+
+    #[test]
+    fn scip_kind_from_moniker_reads_the_last_descriptor() {
+        let ts = "scip-typescript npm t 1.0.0 `a.ts`/";
+        for (sym, want) in [
+            (format!("{ts}Pattern/"), SymbolKind::Module),
+            (format!("{ts}Flags#`'c-strings'`."), SymbolKind::Variable),
+            (format!("{ts}As#$kind."), SymbolKind::Variable),
+            (format!("{ts}As#m()."), SymbolKind::Method),
+            (format!("{ts}f()."), SymbolKind::Function),
+            (format!("{ts}N/f()."), SymbolKind::Function),
+            (format!("{ts}N/Map#"), SymbolKind::Class),
+        ] {
+            assert_eq!(scip_kind_from_moniker(&sym), want, "{sym}");
+        }
+        assert_eq!(scip_kind_from_moniker("garbage"), SymbolKind::Function);
     }
 
     /// #176: INHERITS is keyless too.
