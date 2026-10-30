@@ -1230,6 +1230,18 @@ impl GraphStore {
             return IdleFold::NotDue; // still being written
         }
 
+        // Fold only while no write is in flight. The WAL's mtime says nothing
+        // about a write that has opened a transaction and has not flushed yet:
+        // CHECKPOINT then waits for that transaction to end, which took 16+
+        // minutes on sittir (18137). Every write path takes this lock, and it is
+        // held for the whole fold, so no writer can open a transaction meanwhile:
+        // it waits on the lock instead. A write in flight is NotDue, and the
+        // daemon's next coarse probe asks again.
+        let _writer = match self.try_write_lock() {
+            Ok(Some(lock)) => lock,
+            Ok(None) => return IdleFold::NotDue,
+            Err(e) => return IdleFold::NotFolded(FoldError::Busy(e)),
+        };
         match self.checkpoint_now(&db_path) {
             Ok(()) => IdleFold::Folded,
             Err(e) => IdleFold::NotFolded(e),
@@ -2157,6 +2169,46 @@ mod tests {
         assert!(
             store.checkpoint_now(&graph).is_ok(),
             "once the transaction is gone the same handle must fold"
+        );
+    }
+
+    /// A write in flight holds the writer lock and has an open transaction. The
+    /// fold must not start: CHECKPOINT would wait for that transaction, which
+    /// is what hung sittir's daemon for 16+ minutes. The answer is `NotDue` (the
+    /// daemon asks again), and once the write is over the same handle folds.
+    #[test]
+    fn a_fold_is_not_due_while_a_write_is_in_flight_and_folds_after() {
+        let dir = tempfile::tempdir().unwrap();
+        let graph = dir.path().join(crate::graph::names::STEM);
+        let store = super::GraphStore::open(&graph).unwrap();
+        let writer_lock = store.write_lock().unwrap();
+        let writer = store.connection().unwrap();
+        writer.query("BEGIN TRANSACTION").unwrap();
+        writer
+            .query(
+                "CREATE (:File {id: 'a.rs', name: 'a.rs', path: 'a.rs', \
+                 language: 'rust', symbol_count: 0})",
+            )
+            .unwrap();
+        assert!(
+            super::super::store_util::graph_wal_bytes(&graph) > 0,
+            "the test needs a WAL to fold, or NotDue would prove nothing"
+        );
+
+        let in_flight = store.checkpoint_if_idle(std::time::Duration::ZERO);
+        assert!(
+            matches!(in_flight, super::IdleFold::NotDue),
+            "a fold during a write must not run CHECKPOINT: {in_flight:?}"
+        );
+
+        writer.query("ROLLBACK").unwrap();
+        drop(writer_lock);
+        assert!(
+            matches!(
+                store.checkpoint_if_idle(std::time::Duration::ZERO),
+                super::IdleFold::Folded
+            ),
+            "the same handle must fold once the write is over"
         );
     }
 

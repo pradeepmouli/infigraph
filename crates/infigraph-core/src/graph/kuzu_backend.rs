@@ -411,6 +411,7 @@ impl GraphBackend for KuzuBackend {
         if edges.is_empty() {
             return Ok(());
         }
+        let _lock = self.store.write_lock()?;
         self.store.transaction(|conn| {
             for edge in edges {
                 let src_esc = crate::escape_str(&edge.symbol_id);
@@ -430,6 +431,7 @@ impl GraphBackend for KuzuBackend {
     }
 
     fn replace_taint_flows(&self, flows: &[TaintFlowEdge]) -> Result<()> {
+        let _lock = self.store.write_lock()?;
         self.store.transaction(|conn| {
             conn.query("MATCH ()-[r:TAINT_FLOW]->() DELETE r")
                 .map_err(|e| anyhow::anyhow!("failed to clear existing taint flows: {e}"))?;
@@ -449,6 +451,7 @@ impl GraphBackend for KuzuBackend {
     }
 
     fn replace_concerns(&self, concerns: &[Concern]) -> Result<()> {
+        let _lock = self.store.write_lock()?;
         self.store.transaction(|conn| {
             conn.query("MATCH (c:Concern) DETACH DELETE c")
                 .map_err(|e| anyhow::anyhow!("failed to clear existing concerns: {e}"))?;
@@ -472,6 +475,7 @@ impl GraphBackend for KuzuBackend {
     }
 
     fn replace_resolves_to(&self, edges: &[ResolvesToEdge]) -> Result<()> {
+        let _lock = self.store.write_lock()?;
         self.store.transaction(|conn| {
             conn.query("MATCH ()-[r:RESOLVES_TO]->() DELETE r")
                 .map_err(|e| anyhow::anyhow!("failed to clear existing RESOLVES_TO edges: {e}"))?;
@@ -491,6 +495,7 @@ impl GraphBackend for KuzuBackend {
     }
 
     fn write_cross_service_edges(&self, candidates: &[CrossServiceEdgeCandidate]) -> Result<usize> {
+        let _lock = self.store.write_lock()?;
         let mut created = 0;
         for c in candidates {
             let target_id = crate::escape_str(&c.target_id);
@@ -591,6 +596,7 @@ impl GraphBackend for KuzuBackend {
         community: &[usize],
         modularity: f64,
     ) -> Result<crate::cluster::ClusterStats> {
+        let _lock = self.store.write_lock()?;
         self.raw_query("MATCH (s:Symbol)-[r:MEMBER_OF]->(c:Cluster) DELETE r")?;
         self.raw_query("MATCH (c:Cluster) DELETE c")?;
 
@@ -650,6 +656,7 @@ impl GraphBackend for KuzuBackend {
     }
 
     fn store_config_bindings(&self, bindings: &[crate::config::ConfigBindingWire]) -> Result<()> {
+        let _lock = self.store.write_lock()?;
         self.raw_query("MATCH (c:ConfigBinding) DETACH DELETE c")?;
 
         for b in bindings {
