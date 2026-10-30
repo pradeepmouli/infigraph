@@ -1517,6 +1517,19 @@ fn accessor_name(name: String) -> String {
     name
 }
 
+/// A quoted member name keeps the source's own spelling, not the quotes the
+/// indexer wraps a non-identifier name in: `'c-strings'` is `c-strings`, as
+/// tree-sitter names a member it has. A name that is a single quote (`'`)
+/// keeps it, as it has no pair to strip.
+fn unquote_name(name: &str) -> &str {
+    for quote in ['\'', '"'] {
+        if name.len() >= 2 && name.starts_with(quote) && name.ends_with(quote) {
+            return &name[1..name.len() - 1];
+        }
+    }
+    name
+}
+
 fn descriptor_name(scip_sym: &str) -> String {
     let mut s = scip_sym.trim_end();
 
@@ -1561,14 +1574,17 @@ fn descriptor_name(scip_sym: &str) -> String {
     for quote in ['`', '"'] {
         if let Some(rest) = s.strip_suffix(quote) {
             if let Some(start) = rest.rfind(quote) {
-                return format!("{}{disambiguator}{suffix}", &rest[start + 1..]);
+                let name = unquote_name(&rest[start + 1..]);
+                return format!("{name}{disambiguator}{suffix}");
             }
         }
     }
 
     // Bare identifier: trailing run of alphanumeric/underscore characters.
+    // `$` is an identifier character in JavaScript and TypeScript (`$kind`),
+    // and tree-sitter names the member with it, so the SCIP name keeps it.
     let ident_start = s
-        .rfind(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .rfind(|c: char| !(c.is_alphanumeric() || c == '_' || c == '$'))
         .map(|i| i + 1)
         .unwrap_or(0);
     if ident_start < s.len() {
@@ -1782,6 +1798,7 @@ fn scip_descriptors(scip_sym: &str) -> Option<Vec<Descriptor>> {
                 }
                 name.push(c);
             }
+            name = unquote_name(&name).to_string();
         } else {
             while let Some(&c) = chars.get(*i) {
                 if stop.contains(&c) {
@@ -1878,7 +1895,7 @@ fn is_parameter_symbol(scip_sym: &str) -> bool {
 /// methods before its last descriptor. A namespace is the file or module (the
 /// id already has the file), a type parameter or parameter is no owner, and
 /// rust-analyzer's `impl#[Type]` is owned by `Type`.
-fn scip_owner_chain(scip_sym: &str) -> Vec<String> {
+fn scip_owner_chain(file: &str, scip_sym: &str) -> Vec<String> {
     let Some(descriptors) = scip_descriptors(scip_sym) else {
         return Vec::new();
     };
@@ -1888,6 +1905,14 @@ fn scip_owner_chain(scip_sym: &str) -> Vec<String> {
     if matches!(last.kind, DescriptorKind::Param | DescriptorKind::TypeParam) {
         return Vec::new();
     }
+    // scip-typescript writes the file's path as namespace descriptors, the
+    // last one being the file itself; a `namespace` declared in the file comes
+    // after it and owns what it declares. Anything before is the path.
+    let file_name = file.rsplit('/').next().unwrap_or(file);
+    let declared_from = match before.iter().position(|d| d.name == file_name) {
+        Some(file_at) if scip_sym.starts_with("scip-typescript ") => file_at + 1,
+        _ => before.len(),
+    };
     let mut chain = Vec::new();
     for (i, d) in before.iter().enumerate() {
         match d.kind {
@@ -1904,6 +1929,7 @@ fn scip_owner_chain(scip_sym: &str) -> Vec<String> {
             | DescriptorKind::Method
             | DescriptorKind::Macro => chain.push(d.name.clone()),
             DescriptorKind::Meta if is_type_literal(&d.name) => {}
+            DescriptorKind::Namespace if i >= declared_from => chain.push(d.name.clone()),
             DescriptorKind::Meta
             | DescriptorKind::Namespace
             | DescriptorKind::TypeParam
@@ -1941,7 +1967,7 @@ pub fn definition_ids(index_bytes: &[u8], relative_path: &str) -> Result<Vec<Str
 /// tree-sitter gives a method (`entities.rs`), so one member of a type reads
 /// the same whichever indexer found it. No owner, `file::name`.
 fn scip_symbol_id(file: &str, scip_sym: &str, name: &str) -> String {
-    qualified_id(file, &scip_owner_chain(scip_sym), name)
+    qualified_id(file, &scip_owner_chain(file, scip_sym), name)
 }
 
 /// `file::Owner::...::name`.
@@ -2616,6 +2642,30 @@ mod tests {
         assert_eq!(
             scip_sym_to_name("scip-python python test-pkg 1.0.0 `test`/Animal#"),
             "Animal"
+        );
+    }
+
+    #[test]
+    fn scip_sym_to_name_drops_the_quotes_round_a_quoted_member() {
+        // scip-typescript wraps a non-identifier property name in its quotes
+        // (`'c-strings'`); the member is named as the source spells it.
+        assert_eq!(
+            scip_sym_to_name("scip-typescript npm t 1.0.0 `a.ts`/Flags#`'c-strings'`."),
+            "c-strings"
+        );
+        assert_eq!(
+            scip_sym_to_name("scip-typescript npm t 1.0.0 `a.ts`/Flags#`\"x\"`."),
+            "x"
+        );
+    }
+
+    #[test]
+    fn scip_sym_to_name_keeps_a_dollar_in_an_identifier() {
+        // scip-typescript writes `readonly $kind` as a bare `$kind.`; tree-sitter
+        // names the member `$kind`, so the two must agree.
+        assert_eq!(
+            scip_sym_to_name("scip-typescript npm t 1.0.0 `a.ts`/As#$kind."),
+            "$kind"
         );
     }
 
@@ -4146,25 +4196,28 @@ mod tests {
             ("src/`test.ts`/Box#[T]", vec![]),
         ] {
             let sym = format!("{TS}{moniker}");
-            assert_eq!(scip_owner_chain(&sym), want, "{sym}");
+            assert_eq!(scip_owner_chain("a.ts", &sym), want, "{sym}");
         }
         // other indexers: a module path is no owner; rust-analyzer's impl
         // block is owned by its type
         assert_eq!(
-            scip_owner_chain("rust-analyzer cargo sittir-scm 0.0.0 render/node/AnyNode#Program#"),
+            scip_owner_chain(
+                "a.ts",
+                "rust-analyzer cargo sittir-scm 0.0.0 render/node/AnyNode#Program#"
+            ),
             vec!["AnyNode"]
         );
         assert_eq!(
-            scip_owner_chain("rust-analyzer cargo krate 0.0.0 impl#[`Foo`]bar()."),
+            scip_owner_chain("a.ts", "rust-analyzer cargo krate 0.0.0 impl#[`Foo`]bar()."),
             vec!["Foo"]
         );
         // a package name with a space (doubled) does not shift the fields
         assert_eq!(
-            scip_owner_chain("scip-x npm my  pkg 1.0.0 `a.ts`/A#m()."),
+            scip_owner_chain("a.ts", "scip-x npm my  pkg 1.0.0 `a.ts`/A#m()."),
             vec!["A"]
         );
         // not a SCIP symbol: no owner, the old id
-        assert!(scip_owner_chain("garbage").is_empty());
+        assert!(scip_owner_chain("a.ts", "garbage").is_empty());
     }
 
     #[test]

@@ -1100,6 +1100,58 @@ export function f(opts: { skipped: number }): { alsoSkipped: number } { return {
 "#;
 
 #[test]
+fn a_namespace_does_not_make_an_unowned_literal_member_a_symbol() {
+    // `a` and `x` belong to an object literal and a parameter's type: no owner,
+    // so no symbol, inside a namespace as outside one.
+    let src = "namespace N { const o = { a: 1 }; function f(p: { x: number }) {} }\n";
+    let ids = ts_ids("n.ts", src);
+    assert!(
+        ids.iter()
+            .all(|(i, _)| !i.ends_with("::a") && !i.ends_with("::x")),
+        "an unowned literal member is no symbol inside a namespace: {ids:?}"
+    );
+    let outside = ts_ids(
+        "n.ts",
+        "const o = { a: 1 }; function f(p: { x: number }) {}\n",
+    );
+    assert!(
+        outside
+            .iter()
+            .all(|(i, _)| !i.ends_with("::a") && !i.ends_with("::x")),
+        "{outside:?}"
+    );
+}
+
+#[test]
+fn a_namespace_is_no_parent_only_a_symbol_is() {
+    // `Outer::Inner` is a namespace, which tree-sitter makes no symbol of: a
+    // member it owns has no parent. A class in it is the parent of its method.
+    let src = "export namespace Outer.Inner { export class K { m(): void {} } export function g(): number { return 1; } }\n";
+    let registry = infigraph_languages::bundled_registry().unwrap();
+    let pack = registry.for_extension(".ts").unwrap();
+    let ext = extract_file("n.ts", src.as_bytes(), pack).unwrap();
+    let parent_of = |id: &str| {
+        ext.symbols
+            .iter()
+            .find(|s| s.id == id)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{id} in {:?}",
+                    ext.symbols.iter().map(|s| &s.id).collect::<Vec<_>>()
+                )
+            })
+            .parent
+            .clone()
+    };
+    assert_eq!(parent_of("n.ts::Outer::Inner::g"), None);
+    assert_eq!(parent_of("n.ts::Outer::Inner::K"), None);
+    assert_eq!(
+        parent_of("n.ts::Outer::Inner::K::m").as_deref(),
+        Some("n.ts::Outer::Inner::K")
+    );
+}
+
+#[test]
 fn typescript_properties_are_owned_symbols_of_kind_variable() {
     for file in ["p.ts", "p.tsx"] {
         let ids = ts_ids(file, PROPERTIES_SRC);
@@ -1113,7 +1165,7 @@ fn typescript_properties_are_owned_symbols_of_kind_variable() {
             "SerializedBase::unresolved",
             "Lit::k",
             "Lit::m",
-            "InNs::p",
+            "NS::InNs::p",
             "Holder::prop",
             "Holder::typed",
             "Holder::typed::a",

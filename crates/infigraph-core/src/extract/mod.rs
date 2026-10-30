@@ -237,6 +237,44 @@ pub(super) fn ts_member_owner(node: Node, source: &[u8]) -> Option<String> {
     None
 }
 
+/// The TypeScript namespaces a node is declared in, outermost first:
+/// `namespace Outer.Inner { … }` is `Outer` then `Inner`. scip-typescript names
+/// a member of a namespace under the namespace, so its id has them too.
+pub(super) fn ts_namespace_owners(node: Node, source: &[u8]) -> Vec<String> {
+    let mut declared: Vec<Vec<String>> = Vec::new();
+    let mut current = node.parent();
+    while let Some(n) = current {
+        if n.kind() == "internal_module" {
+            if let Some(name) = n.child_by_field_name("name") {
+                declared.push(
+                    node_text(name, source)
+                        .split('.')
+                        .map(str::to_string)
+                        .collect(),
+                );
+            }
+        }
+        current = n.parent();
+    }
+    declared.into_iter().rev().flatten().collect()
+}
+
+/// Puts a TypeScript node's namespaces in front of its owner (`find_parent_class`'s
+/// answer, or `ts_member_owner`'s): `namespace N { class C { m() {} } }` names
+/// `m` as `N::C::m`, and a namespace-level `f` as `N::f`.
+pub(super) fn ts_with_namespaces(
+    node: Node,
+    source: &[u8],
+    owner: Option<String>,
+) -> Option<String> {
+    let mut path = ts_namespace_owners(node, source);
+    if path.is_empty() {
+        return owner;
+    }
+    path.extend(owner);
+    Some(path.join("::"))
+}
+
 /// Resolve a captured compound node (generic type, qualified/scoped identifier,
 /// member expression) down to its base identifier text. If `decompose_query` is
 /// present, iteratively re-applies it to descend through wrapper nodes (e.g.
