@@ -237,6 +237,21 @@ pub fn classify_entry(name: &str) -> EntryClass {
 /// before this shipped). Acquiring it here blocks that class of writer out
 /// for the duration of the snapshot+wipe, same as every other graph writer.
 pub fn full_reindex_wipe(tg_dir: &Path) -> Result<()> {
+    // Refuse before anything moves. The graph lock taken below is the lockfile
+    // of this process's own writers; a graph another process holds open (a
+    // daemon, a watcher) is locked by lbug itself, and the wipe would remove
+    // it under that process and then fail its own open. A lock is not
+    // corruption, so the probe (non-destructive, `F_GETLK`) says "busy" and
+    // the store is left exactly as it was.
+    let graph = tg_dir.join(crate::graph::names::STEM);
+    if let crate::graph::lock_probe::LockProbe::Locked(_) =
+        crate::graph::lock_probe::probe_graph_lock(
+            &graph,
+            crate::graph::lock_probe::ProbeFor::Write,
+        )
+    {
+        anyhow::bail!("{}", crate::graph::store::lock_contention_context(&graph));
+    }
     let graph_lock_path =
         crate::graph::store::db_lock_path(&tg_dir.join(crate::graph::names::STEM));
     let _graph_lock = crate::lockfile::acquire(

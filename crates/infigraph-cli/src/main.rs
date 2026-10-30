@@ -1199,6 +1199,31 @@ pub(crate) fn should_auto_watch(command: &Commands, root: &Path) -> bool {
     )
 }
 
+/// When the auto-watch starts for a command `should_auto_watch` allows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AutoWatch {
+    /// Before the command: its writes go through the daemon, which is the
+    /// watcher, so the daemon has to be up first.
+    Before,
+    /// After the command succeeds. Under the local backend the command is the
+    /// graph's writer and opens it in-process; a watcher started ahead of it
+    /// takes the graph's lock first, and the command then fails to open it.
+    After,
+}
+
+/// The one decision for when the auto-watch runs, for every command it
+/// applies to: the daemon backend starts it first, the local backend after.
+pub(crate) fn auto_watch_timing(command: &Commands, root: &Path) -> Option<AutoWatch> {
+    if !should_auto_watch(command, root) {
+        return None;
+    }
+    Some(if infigraph_core::daemon_backend_selected() {
+        AutoWatch::Before
+    } else {
+        AutoWatch::After
+    })
+}
+
 /// See `Commands::PrintBuildHash`'s doc comment for why this exists.
 fn cmd_print_build_hash() {
     if let Ok(path) = std::env::var("INFIGRAPH_TEST_BUILD_HASH_OVERRIDE_FILE") {
@@ -1257,15 +1282,24 @@ fn main() -> Result<()> {
         infigraph_core::check_settings_at_startup(&root)?;
     }
 
-    let should_auto_watch = should_auto_watch(&cli.command, &root);
+    let auto_watch = auto_watch_timing(&cli.command, &root);
+    // A watcher that starts after a first index would watch a graph nobody
+    // asked to watch yet: only a project that had a store before this command
+    // gets the after-run start (the same rule `ensure_daemon_running` applies).
+    let indexed_before = root.join(".infigraph").exists();
 
     let result = std::thread::Builder::new()
         .stack_size(32 * 1024 * 1024)
         .spawn(move || {
-            if should_auto_watch {
+            if auto_watch == Some(AutoWatch::Before) {
                 index::ensure_watcher_running(&root);
             }
-            run(cli.command, &root, root_given)
+            let result = run(cli.command, &root, root_given);
+            // Not after a failed command: a failure leaves nothing to watch.
+            if auto_watch == Some(AutoWatch::After) && result.is_ok() && indexed_before {
+                index::ensure_watcher_running(&root);
+            }
+            result
         })
         .expect("failed to spawn main worker thread")
         .join()
@@ -1805,6 +1839,40 @@ mod tests {
             },
             root
         ));
+    }
+
+    /// The local backend's command is the graph's writer, so the auto-watch
+    /// starts after it; the daemon backend's writes go through the watcher,
+    /// so it starts first. A command the auto-watch does not apply to has no
+    /// timing at all.
+    #[test]
+    fn auto_watch_timing_follows_the_backend() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let index = Commands::Index {
+            full: false,
+            no_embed: false,
+        };
+        std::env::set_var(infigraph_core::BACKEND_ENV, infigraph_core::LOCAL_BACKEND);
+        assert_eq!(
+            auto_watch_timing(&index, tmp.path()),
+            Some(AutoWatch::After)
+        );
+        std::env::set_var(infigraph_core::BACKEND_ENV, "daemon");
+        assert_eq!(
+            auto_watch_timing(&index, tmp.path()),
+            Some(AutoWatch::Before)
+        );
+        assert_eq!(
+            auto_watch_timing(
+                &Commands::Query {
+                    cypher: String::new()
+                },
+                tmp.path()
+            ),
+            None
+        );
+        std::env::remove_var(infigraph_core::BACKEND_ENV);
     }
 
     /// With the persisted watch policy disabled, `should_auto_watch` must
