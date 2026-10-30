@@ -542,6 +542,77 @@ pub(crate) fn key_is_live(root: &Path, key: &str) -> Result<bool> {
 
 /// Every check of one project's document links; empty when the project has no
 /// documents or no links to check. `docs_sync` adds the git-based sync check.
+/// The keys that resolve to no live symbol and no module, each with why. Only
+/// the first `hint_cap` are classified; the rest are `NoSuchSymbol` without a
+/// look. The summary check caps this (`HINT_CAP`); the listing does not.
+fn unresolved_keys(
+    exec: &dyn QueryExec,
+    keys: &[&str],
+    hint_cap: usize,
+) -> (HashMap<String, Live>, Vec<(String, Miss)>) {
+    let (live, modules) = resolve(exec, keys);
+    let mut unresolved: Vec<(String, Miss)> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for key in keys {
+        if live.contains_key(*key) || modules.iter().any(|m| m == key) || !seen.insert(*key) {
+            continue;
+        }
+        let miss = if unresolved.len() < hint_cap {
+            classify(exec, key)
+        } else {
+            Miss::NoSuchSymbol
+        };
+        unresolved.push((key.to_string(), miss));
+    }
+    (live, unresolved)
+}
+
+/// One place a key is written and does not resolve: what it names, where, and
+/// why it links nothing.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct MissingKey {
+    pub key: String,
+    pub document: String,
+    pub line: usize,
+    pub reason: &'static str,
+    pub hint: String,
+}
+
+/// Every key that resolves to no live symbol, one row per place it is written,
+/// sorted by document and line. Unlike the summary check, every key is
+/// classified. Empty when documents are not enabled.
+pub fn missing_symbols(root: &Path) -> Result<Vec<MissingKey>> {
+    if !docs_switch::docs_enabled(root) || !docs_switch::docs_store_path(root).exists() {
+        return Ok(Vec::new());
+    }
+    let documents = with_docs(root, |q| q.code_link_rows(LinkKind::Documents))?;
+    if documents.is_empty() {
+        return Ok(Vec::new());
+    }
+    let graph_path = root
+        .join(".infigraph")
+        .join(infigraph_core::graph::names::STEM);
+    let observed = ObservedGraph::open(root, &graph_path)?;
+    let keys: Vec<&str> = documents.iter().map(|r| r.target.as_str()).collect();
+    let (_, unresolved) = observed.with_exec(|exec| unresolved_keys(exec, &keys, usize::MAX))?;
+    let misses: HashMap<&str, &Miss> = unresolved.iter().map(|(k, m)| (k.as_str(), m)).collect();
+    let mut rows: Vec<MissingKey> = documents
+        .iter()
+        .filter_map(|r| {
+            let miss = misses.get(r.target.as_str())?;
+            Some(MissingKey {
+                key: r.target.clone(),
+                document: r.doc_file.clone(),
+                line: r.line_start,
+                reason: miss.reason(),
+                hint: miss.hint(&r.target),
+            })
+        })
+        .collect();
+    rows.sort_by(|a, b| (&a.document, a.line, &a.key).cmp(&(&b.document, b.line, &b.key)));
+    Ok(rows)
+}
+
 pub fn check_project(root: &Path, docs_sync: bool) -> Vec<CheckResult> {
     if !docs_switch::docs_enabled(root) || !docs_switch::docs_store_path(root).exists() {
         return Vec::new();
@@ -614,23 +685,7 @@ pub fn check_project(root: &Path, docs_sync: bool) -> Vec<CheckResult> {
         }
     };
     let keys: Vec<&str> = documents.iter().map(|r| r.target.as_str()).collect();
-    let outcome = observed.with_exec(|exec| {
-        let (live, modules) = resolve(exec, &keys);
-        let mut unresolved: Vec<(String, Miss)> = Vec::new();
-        let mut seen = std::collections::HashSet::new();
-        for key in &keys {
-            if live.contains_key(*key) || modules.iter().any(|m| m == key) || !seen.insert(*key) {
-                continue;
-            }
-            let miss = if unresolved.len() < HINT_CAP {
-                classify(exec, key)
-            } else {
-                Miss::NoSuchSymbol
-            };
-            unresolved.push((key.to_string(), miss));
-        }
-        (live, unresolved)
-    });
+    let outcome = observed.with_exec(|exec| unresolved_keys(exec, &keys, HINT_CAP));
     let (live, unresolved) = match outcome {
         Ok(outcome) => outcome,
         Err(e) => {

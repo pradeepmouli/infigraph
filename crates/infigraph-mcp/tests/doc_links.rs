@@ -196,6 +196,25 @@ fn doctor_lists_a_key_whose_symbol_was_renamed() {
 }
 
 #[test]
+fn missing_symbols_lists_the_renamed_key_with_its_document_line_and_reason() {
+    let dir = project(&[("docs/glossary/src.md", GLOSSARY)]);
+    write(
+        dir.path(),
+        "src/app.py",
+        &APP.replace("compute_total", "compute_sum"),
+    );
+    reindex_code(dir.path());
+
+    let rows = infigraph_docs::link_check::missing_symbols(dir.path()).unwrap();
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    let row = &rows[0];
+    assert_eq!(row.key, "src/app.py::compute_total");
+    assert_eq!(row.document, "docs/glossary/src.md");
+    assert!(row.line >= 1, "{row:?}");
+    assert!(row.reason.contains("no such symbol"), "{row:?}");
+}
+
+#[test]
 fn doctor_says_what_to_write_instead_of_a_dotted_key() {
     let dir = project(&[(
         "docs/glossary/src.md",
