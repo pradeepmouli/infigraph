@@ -1,5 +1,8 @@
-//! A full rebuild wiped `.infigraph/` before its open could fail, so a refused
-//! open (another process held the graph) left the live store gone.
+//! The local backend's command is the graph's writer, so nothing may take the
+//! graph's lock before the command opens it: an auto-watch daemon started
+//! ahead of the command did, and the command then failed "locked by another
+//! infigraph process". A full rebuild also wiped `.infigraph/` before its open
+//! could fail, so a refused open left the live store gone.
 
 mod support;
 
@@ -29,6 +32,25 @@ fn project() -> (tempfile::TempDir, tempfile::TempDir) {
     let root = tempfile::tempdir().unwrap();
     std::fs::write(root.path().join("hello.py"), "def hello():\n    pass\n").unwrap();
     (root, tempfile::tempdir().unwrap())
+}
+
+/// A second `index` on an indexed project, local backend, nothing running:
+/// it must succeed, not lose the lock to a watcher it just started.
+#[test]
+fn a_second_local_index_does_not_lose_the_graph_to_its_own_watcher() {
+    let (root, home) = project();
+    let first = local_command(root.path(), home.path(), &["index", "--no-embed"]);
+    support::assert_ok(&first, "first index");
+
+    let second = local_command(root.path(), home.path(), &["index", "--no-embed"]);
+    let stderr = String::from_utf8_lossy(&second.stderr).to_string();
+    // Stop whatever the command started, on every exit path.
+    let _ = local_command(root.path(), home.path(), &["daemon-stop", "--wait"]);
+    assert!(second.status.success(), "second index failed: {stderr}");
+    assert!(
+        !stderr.contains("locked by another infigraph process"),
+        "{stderr}"
+    );
 }
 
 /// A rebuild whose graph is held by another process is refused before anything
