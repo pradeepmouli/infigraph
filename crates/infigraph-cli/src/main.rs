@@ -235,6 +235,14 @@ enum Commands {
         /// rest is judged per file and said to under-report), so it is opt-in
         #[arg(long)]
         docs_sync: bool,
+        /// List every document key that resolves to no live symbol, one row
+        /// per place it is written (key, document, line, reason), instead of
+        /// the summary. Runs on the current project only.
+        #[arg(long)]
+        missing_symbols: bool,
+        /// With --missing-symbols: print the rows as a JSON array
+        #[arg(long, requires = "missing_symbols")]
+        json: bool,
     },
 
     /// Evict registry entries for projects that no longer exist (R7.1).
@@ -1333,7 +1341,9 @@ fn run(command: Commands, root: &Path, root_given: bool) -> Result<()> {
             global,
             verbose,
             docs_sync,
-        } => cmd_doctor(root, global, verbose, docs_sync),
+            missing_symbols,
+            json,
+        } => cmd_doctor(root, global, verbose, docs_sync, missing_symbols, json),
         Commands::Gc {
             dry_run,
             stale_days,

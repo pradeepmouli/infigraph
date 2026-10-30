@@ -1649,7 +1649,17 @@ fn doctor_report_style(verbose: bool) -> infigraph_core::doctor::ReportStyle {
     }
 }
 
-pub(crate) fn cmd_doctor(root: &Path, global: bool, verbose: bool, docs_sync: bool) -> Result<()> {
+pub(crate) fn cmd_doctor(
+    root: &Path,
+    global: bool,
+    verbose: bool,
+    docs_sync: bool,
+    missing_symbols: bool,
+    json: bool,
+) -> Result<()> {
+    if missing_symbols {
+        return print_missing_symbols(root, global, json);
+    }
     use infigraph_core::doctor::{
         assemble_context, format_report, projects_in_scope, run_doctor, CheckStatus, DoctorScope,
     };
@@ -1678,6 +1688,33 @@ pub(crate) fn cmd_doctor(root: &Path, global: bool, verbose: bool, docs_sync: bo
         CheckStatus::Warn => anyhow::bail!("doctor found warnings"),
         CheckStatus::Fail => std::process::exit(2),
     }
+}
+
+/// `doctor --missing-symbols`: every document key that resolves to no live
+/// symbol, one line per place it is written (or a JSON array of the same rows).
+/// It is a listing, not a check, so it exits 0 whatever it finds.
+fn print_missing_symbols(root: &Path, global: bool, json: bool) -> Result<()> {
+    if global {
+        anyhow::bail!("--missing-symbols lists one project: run it from the project root");
+    }
+    let canonical_root = root.canonicalize().context("invalid project root")?;
+    let rows = infigraph_docs::link_check::missing_symbols(&canonical_root)?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+        return Ok(());
+    }
+    if rows.is_empty() {
+        println!("every document key resolves to a live symbol");
+        return Ok(());
+    }
+    println!("{} key(s) resolve to no live symbol:", rows.len());
+    for row in &rows {
+        println!(
+            "{}:{}  {}  -- {}",
+            row.document, row.line, row.hint, row.reason
+        );
+    }
+    Ok(())
 }
 
 /// `infigraph gc` (R7.1): evict registry entries for deleted projects,
